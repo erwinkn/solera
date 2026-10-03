@@ -3,12 +3,12 @@ between, and what each output must hold once the system is quiet: every
 producer is a pure function of its inputs, so the oracle computes every
 output from the sources alone.
 
-    feed (keyed source) ──Incremental──▶ items ──Incremental(page 2)──▶ copy
+    feed (keyed source) ──Incremental──▶ items ──Incremental(batch 2)──▶ copy
     knob (version) ──dep──▶ per_site[site ∈ sites] ──AllPartitions──▶ summary
-    knob ──dep──▶ log (batches) ──Incremental──▶ tally
-    items ──Each(page 2)──▶ checks (fails while a key is flaky, by error class)
-    items ──Incremental(page 2)──▶ split ──▶ odd (table store), even (FileStore); on a pool
-    items ──Incremental(page 2)──▶ seen (a job: its cursor holds what it read)
+    knob ──dep──▶ log (appends) ──Incremental──▶ tally
+    items ──Each(batch 2)──▶ checks (fails while a key is flaky, by error class)
+    items ──Incremental(batch 2)──▶ split ──▶ odd (table store), even (FileStore); on a pool
+    items ──Incremental(batch 2)──▶ seen (a job: its cursor holds what it read)
     outside (keyed source) ◀── watch (a sensor over an external map; runs per_site when it changed)
 
 Variants (`Variant`): `items` on a FileStore or the simulation's fenced
@@ -55,7 +55,7 @@ class Variant:
     items_version: str = "1"
     copy_name: str = "copy"  # "copy" | "mirror" (renamed, aliases=["copy"])
     summary: bool = True
-    exclude: str | None = None  # copy's edge: keys it leaves out
+    exclude: str | None = None  # copy's input: keys it leaves out
 
     def label(self) -> str:
         return (
@@ -118,8 +118,8 @@ class SourceStore(FileStore):
 
 
 def rebuild(changes, rows: list[dict]):
-    """A keyed consumer's write for one page: a full pass (a reset) starts
-    the output over on its first page (architecture.md §5), then patches."""
+    """A keyed consumer's write for one batch: a full pass (a reset) starts
+    the output over on its first batch (architecture.md §5), then patches."""
 
     if changes.full and changes.first:
         return rows

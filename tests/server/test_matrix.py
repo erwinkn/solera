@@ -1,6 +1,6 @@
 """Engine-level scenarios across boundaries (review round 4): each row
 crosses two features that are tested apart elsewhere — a write's reset and
-its payload, a fan-in and its edge shape, registration and queued work, a
+its payload, a fan-in and its input shape, registration and queued work, a
 firing and work already queued — through the real engine and stores."""
 
 import asyncio
@@ -217,8 +217,8 @@ async def test_a_change_waits_for_work_already_queued(state):  # noqa: F811
 
 async def test_a_change_is_kept_until_its_delivery_completes(state):  # noqa: F811
     """An AllPartitions read excludes a partition whose pass is under way: a
-    change made by its first page waits until the last page drains it — even
-    when that page writes nothing — then fires once, over complete data."""
+    change made by its first batch waits until the last batch drains it — even
+    when that batch writes nothing — then fires once, over complete data."""
     observed = []
 
     @asset(outputs=Output("files", key="id"))
@@ -273,7 +273,7 @@ def test_an_explicit_selection_is_linear():
 async def test_a_removed_consumer_lets_go_of_its_upstreams_log(state):  # noqa: F811
     """Review round 5, engine #3 and system #2: `gone` and `keep` read
     `feed` incrementally. `gone` is removed: its bookmark goes with it, so
-    the log of `feed`'s later batches is kept only as long as `keep` needs
+    the log of `feed`'s later commits is kept only as long as `keep` needs
     it."""
 
     rows = [{"id": "a"}]
@@ -312,7 +312,7 @@ async def test_a_value_written_again_is_a_new_version_its_readers_reread(state):
     """docs/versions.md §7, identical rewrites: `settings` is written again
     with the same content — a new version, at a new generation. A reader of
     `feed` that also reads it reads under another interpretation, so its
-    `feed` edge starts over: accepted, and avoided by a producer that writes
+    `feed` input starts over: accepted, and avoided by a producer that writes
     nothing when nothing changed."""
 
     calls = []
@@ -345,7 +345,7 @@ async def test_a_value_written_again_is_a_new_version_its_readers_reread(state):
 
 
 async def test_an_each_delivery_resumed_by_a_firing_takes_its_change(state):  # noqa: F811
-    """As test_sim_found's keyed case, for an Each edge: a full pass cut
+    """As test_sim_found's keyed case, for an Each input: a full pass cut
     short after its first key, the upstream changing, the firing resuming it
     — the change is delivered, and only then is the partition drained."""
     from solera.sdk import AutoRefresh, Each
@@ -371,7 +371,7 @@ async def test_an_each_delivery_resumed_by_a_firing_takes_its_change(state):  # 
     await engine.set_automation("out.onchange.0", False)
     await drive(engine, await engine.submit(["items"]))
     run = await engine.submit(["out"])
-    while (state.model.bookmark("out", "item", "") or {}).get("pass", {}).get("page") != 1:
+    while (state.model.bookmark("out", "item", "") or {}).get("pass", {}).get("batch") != 1:
         await engine.tick()
         await asyncio.sleep(0.01)
     await engine.cancel(run["id"])

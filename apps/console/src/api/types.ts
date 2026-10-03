@@ -333,7 +333,7 @@ export interface Explain {
   verdict: "ok" | "failing" | "excluded" | "not_matched" | "pending" | "removed" | "absent";
 }
 
-export type InputState = "never" | "caught_up" | "behind" | "paging" | "full" | "pattern_change" | "reconcile";
+export type InputState = "never" | "caught_up" | "behind" | "delta" | "full" | "pattern_change" | "reconcile";
 
 /** An input's bookmark (python/solera_server/bookmarks.py): `next`,
  * the first upstream commit not yet delivered; `pass`, one under way —
@@ -351,8 +351,8 @@ export interface Bookmark {
     from?: number;
     to?: number;
     at: string | number | null;
-    page: number;
-    pages: number;
+    batch: number;
+    batches: number;
     pin?: number | null;
     reconcile?: boolean;
   };

@@ -111,7 +111,7 @@ async def test_lineage_says_what_a_current_read_saw(state):
     await run(engine, ["report", "changes"])
 
     # A read of a write no commit installed: flagged; the pin in `detail`.
-    for param in ("report", "changes"):  # a whole read, and a page of keys
+    for param in ("report", "changes"):  # a whole read, and a batch of keys
         edge = (await edges(engine, state, param))["sites"]
         assert edge["from"]["generation"] == newer
         assert edge["uncommitted"] == {"attempt": None, "run": None}  # written outside the engine

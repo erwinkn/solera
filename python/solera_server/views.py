@@ -1,5 +1,5 @@
 """The console's read models (§8, §10): per-asset rollups, an `Each` asset's
-failed keys and `explain`, every partition of every edge, and what holds
+failed keys and `explain`, every partition of every input, and what holds
 partitions back. Reads only: they record nothing, and never scan a run's tasks.
 A mixin of the engine, as `Attempts` and `Sensors` are."""
 
@@ -197,7 +197,7 @@ class Views:
         as a short page with a `next`."""
 
         if self._each_input(asset) is None:
-            raise ValueError(f"{asset} has no Each edge: it keeps no failing keys")
+            raise ValueError(f"{asset} has no Each input: it keeps no failing keys")
         unknown = set(outcomes) - set(NAMES.values())
         if unknown:
             raise ValueError(f"unknown key classes: {sorted(unknown)}")
@@ -247,24 +247,24 @@ class Views:
             "next": json.dumps(nxt) if nxt else None,
         }
 
-    # -- edges (§6; per-key-processing.md §11) -----------------------------------------------
+    # -- inputs (§6; per-key-processing.md §11) -----------------------------------------------
 
     def _input_partition(self, asset: str, param: str, input: dict, partition: str) -> dict:
-        """One partition of an Incremental edge: its bookmark and how far it is
+        """One partition of an Incremental input: its bookmark and how far it is
         behind the upstream head.
 
-        `bookmark.next` is the first upstream batch the edge has not yet
+        `bookmark.next` is the first upstream commit the input has not yet
         delivered (`pass`, a pass under way, keeps its boundary and
-        position until its last page — see `pass`). So `lag` = head
-        batch + 1 − `next`: the upstream batches committed and not yet
+        position until its last batch — see `pass`). So `lag` = head
+        commit + 1 − `next`: the upstream commits not yet
         delivered in full — counted from the head's `base` for an unkeyed
-        upstream, which starts over there; every batch without a bookmark.
+        upstream, which starts over there; every commit without a bookmark.
         A change of fingerprint (the asset's version, its run config, a
-        pinned input) resets the edge at its next run: not shown here.
+        pinned input) resets the input at its next run: not shown here.
 
         `state`: `never` (no bookmark), `pattern change` (a pattern change,
         per-key §11), `full` (a full pass under way), `reconcile` (the
-        cleanup after a full Each pass), `paging` (a delta delivered over
+        cleanup after a full Each pass), `delta` (a delta pass delivered over
         several attempts), `behind` (lag), else `caught_up`."""
 
         wm = self.m.bookmark(asset, param, partition)
@@ -296,7 +296,7 @@ class Views:
         elif wm.get("reconcile") is not None:
             state = "reconcile"
         elif mode is not None:
-            state = "paging"
+            state = "delta"
         else:
             state = "behind" if lag else "caught_up"
         view = None
@@ -314,8 +314,8 @@ class Views:
         }
 
     async def asset_inputs(self, asset: str) -> dict:
-        """Every input edge of an asset, deps included (kind `dep`); for an
-        Incremental or Each edge, each partition's bookmark and lag — the
+        """Every input of an asset, deps included (kind `dep`); for an
+        Incremental or Each input, each partition's bookmark and lag — the
         asset's current partitions and every partition with a bookmark."""
 
         info = self.manifest["assets"][asset]
@@ -370,10 +370,10 @@ class Views:
 
     async def explain(self, asset: str, key: str, partition: str = "", input: str | None = None) -> dict:
         """Why `key` is, or is not, in an asset's output (§10), through one
-        Incremental edge: `edge`, else its Each edge, else its one keyed
-        Incremental edge. The verdict is the first of these that holds:
+        Incremental input: `input`, else its Each input, else its one keyed
+        Incremental input. The verdict is the first of these that holds:
 
-        - `not_matched`: no `include` pattern of the edge matches it;
+        - `not_matched`: no `include` pattern of the input matches it;
         - `excluded`: an `exclude` pattern does (`patterns.excluded_by`);
         - `failing`: the asset's failed keys holds it (`failure`);
         - `removed`: the upstream no longer holds it, and it was processed
@@ -381,12 +381,12 @@ class Views:
         - `absent`: the upstream does not hold it, and nothing shows it did;
         - `ok`: processed at the upstream key's current generation — its
           newest `ok`, `removed` or `unmatched` row is an `ok` at it, or the
-          edge is caught up (a row expires with its run, and a plain
-          Incremental edge records none);
-        - `pending`: the upstream holds a write of it the edge has not
+          input is caught up (a row expires with its run, and a plain
+          Incremental input records none);
+        - `pending`: the upstream holds a write of it the input has not
           delivered yet.
 
-        The patterns are those the edge delivers under — its bookmark's,
+        The patterns are those the input delivers under — its bookmark's,
         else the manifest's; `pending` the manifest's, when a transition to
         them has yet to run."""
 
@@ -404,7 +404,7 @@ class Views:
                 )
             input = each[0] if each is not None else next(iter(keyed))
         if input not in keyed:
-            raise ValueError(f"{asset} has no keyed Incremental edge {input!r}")
+            raise ValueError(f"{asset} has no keyed Incremental input {input!r}")
         spec, is_each = keyed[input], keyed[input].get("each") is not None
         if (
             partition not in self.planner().partitions(asset, [partition])

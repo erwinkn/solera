@@ -291,7 +291,7 @@ def test_demo_postgres_migrations_and_ondeploy(tmp_path):
         logged = {r[0] for r in conn.execute("SELECT output FROM demo_migrations").fetchall()}
     assert {"site_events", "site_files", "file_index"} <= logged
 
-    # Boot the real server; the OnDeploy job fires once for the revision.
+    # Boot the real server; the OnDeploy job fires once for the deploy.
     sock = socket.socket()
     sock.bind(("127.0.0.1", 0))
     port = sock.getsockname()[1]

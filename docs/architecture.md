@@ -108,7 +108,7 @@ store-specific config validated by `can_store` at registration.
 |---|---|
 | `keyed` | The output is a `dict[str, Any]`: its keys are the keys, its values the content. Excludes `key`. |
 | `key` | Column identifying what was materialized. Declared once, here; consumers never name columns. A key holds every row that carries it — one, or the many rows parsed from one file. Independent of `primary_key` (storage identity). |
-| `incremental` | The output is committed in engine-numbered commits: a keyed output's changes land in its key index (object-store-state.md §6), an unkeyed one's batches in its store; `Incremental()` consumers read what arrived after their bookmark. `key=` implies it. Default false — a value output is one object per version. |
+| `incremental` | The output is committed in engine-numbered commits: a keyed output's changes land in its key index (object-store-state.md §6), an unkeyed one's rows in its store; `Incremental()` consumers read what arrived after their bookmark. `key=` implies it. Default false — a value output is one object per version. |
 | `migrations` | Ordered `Migration(name, payload)` list owned by this output. The store applies pending ones before its first write to the output in an attempt (§4). Payload type is store-defined (`can_store`). The applied set travels in the handle (§3) and the declared list is in the fingerprint (§6). |
 | `**config` | Store-specific: `schema`, `primary_key`, `columns`, `indexes`, `partition_column`, … |
 
@@ -205,9 +205,9 @@ it is what each kind can promise.
   row, changed in place: a load returns the rows as they are now. A consumer pinned to
   generation 12 that loads after generation 13 committed reads generation 13's
   rows, and lineage records 13 (`versions.md` §6), so one run can see different outputs at different moments. An
-  `Incremental` input still delivers the keys of its pinned window; a row
+  `Incremental` input still delivers the keys of its pinned batch; a row
   changed since is read in its newer form (and delivered again with the
-  window that changed it: a harmless repeat), and a row deleted since may
+  batch that changed it: a harmless repeat), and a row deleted since may
   be missing. Writers are safe all the same: a fenced store refuses an
   older attempt's writes (`stores.md`).
 
@@ -248,7 +248,7 @@ Commits = (lo: int, hi: int)  # load rows of commits in [lo, hi]
 | `can_load(t, selection)` | Registration. Can you produce `t`, filtered by `Keys` when `selection` is given? `can_load(R, None)` for a `Ref` subclass `R` means "are your refs `R`". |
 | `can_store(t, output)` | Registration. Can you take values of type `t` for this `Output` declaration, and extract its declared key from them? `t` is `None` when the producer is unannotated. |
 | `store(write, prior, context)` | Apply the write; return the new ref (the worker stamps its generation, §3). `context.commit_number` is the engine-assigned commit number. A keyed output's `write` is a `KeyedWrite`, which a store reads three ways: `reset` (clear the partition first), `removes`, and `chunks()` — the keys to write a chunk at a time, each with its group, only that chunk taken from the write (`iter_chunks()` for a store writing on a thread of its own); `value` is what the producer returned. `prior` is the committed head, where the content is; on a `full` run `context.reset` says nothing of it is kept. Duplicate keys are a write error. For `partition_column` outputs, stamp the column with `context.partition` and reject rows that disagree. |
-| `load(ref, t, selection)` | Materialize `t` from what the store holds now; under `Keys`, only the selected keys; under `Commits`, only batches in the range. |
+| `load(ref, t, selection)` | Materialize `t` from what the store holds now; under `Keys`, only the selected keys; under `Commits`, only the commits in the range. |
 | `migrate(output, migrations)` | Optional. Apply, in declared order, every migration not yet in the store's own ledger for this output; return the applied names. Must be safe under concurrent attempts of one output (partitions share tables): take a store-level lock and re-read the ledger inside it. Where the backend is transactional, a migration and its ledger row commit together. A store without `migrate` rejects `migrations=` at registration. |
 
 Every store declares `writes`: `"immutable"`, implementing `cleanup(partition,
@@ -397,7 +397,7 @@ client.commit("uploads", upsert=["u-91"], remove=["u-12"])  # DynamicPartitions:
 # POST /api/projects/{p}/sources/{name}/commit
 ```
 
-For a keyed source the server applies the commit as one delta batch against
+For a keyed source the server applies the commit as one delta against
 the source's key index, at a generation of its own (`versions.md` §2): a key
 given the version its entry holds is unchanged, so an identical map is not
 a change; a key given no version (a list) is always one. `upsert` inserts
@@ -446,25 +446,25 @@ a **key index** — an engine-owned log-structured merge tree of `(key,
 generation)` files (object-store-state.md §6): the worker resolves each
 write against it, skips the store entirely when the write changes nothing
 (an empty patch, a set listed again), and otherwise writes the keys it
-writes and removes, at the attempt's generation, as the commit's delta file. An unkeyed output's batches
-are its store's; `head.base` is the first batch after its last reset (for a
+writes and removes, at the attempt's generation, as the commit's delta file. An unkeyed output's commits
+are its store's; `head.base` is the first commit after its last reset (for a
 keyed output, its last move to another store, which starts its index over). The
 engine keeps a per-input **bookmark** — the consumer's position: `next`,
 the first upstream commit not yet delivered, and while a pass is under
-way, `pass` `{mode, from, to, at, page, pages}`: `full` or `delta`, its
-boundary, and its position (the last key delivered, or the next batch),
-all decided when it starts and kept until its last page. For a keyed
-upstream the spec pins the index and a window — the delta log from `next`
+way, `pass` `{mode, from, to, at, batch, batches}`: `full` or `delta`, its
+boundary, and its position (the last key delivered, or the next commit),
+all decided when it starts and kept until its last batch. For a keyed
+upstream the spec pins the index and a range — the delta log from `next`
 to the head, or the whole index for a full pass — and the worker reads
-one page of it (`batch_size` keys), loads those keys with `Keys(…)`, and
-reports where the page ended (`after`); for an unkeyed one the engine plans
-a `Commits(lo, hi)` range. Each page's commit advances the bookmark by
+one batch of it (`batch_size` keys), loads those keys with `Keys(…)`, and
+reports where the batch ended (`after`); for an unkeyed one the engine plans
+a `Commits(lo, hi)` range. Each batch's commit advances the bookmark by
 what it delivered (`pass.advance`); `more` re-queues the task. A
 pass's boundary is fixed when it starts, so one that ends behind the
-head its last page was planned against — interrupted, then resumed after
+head its last batch was planned against — interrupted, then resumed after
 the upstream moved — goes on in the same task to what was committed
 meanwhile: the partition drains only once it has caught up. Whether the pass drained is the partition's
-(`drained := not more` on its progress), not its outputs': a last page may
+(`drained := not more` on its progress), not its outputs': a last batch may
 write none of them, and the partition is complete all the same. A partition is
 **complete** when each of its outputs has a head and its pass drained —
 a job, once a run of it succeeded. Selection (`"missing"`), `AllPartitions`
@@ -766,7 +766,7 @@ while not finished:                           # the worker's `finished`, the pro
     if canceled or past_timeout or not reported and past_provisioning:
         cancel = latch(requested, reason)     # answered to the worker's next beat
         if not reported or past(cancel_grace):
-            writes = await take_gate(attempt, "aborted")   # none, or uncertain if `writing`
+            writes = await take_gate(attempt, "aborted")   # none, or `writing` if it finds the gate taken
             await placement.cancel(run)
             return fail(reason, writes)
 result = await objects.get(f"runs/{run_id}/{attempt}.result")
@@ -811,8 +811,8 @@ code.
 ```
 
 - `inputs` holds every pin by input name, including `deps`; the manifest
-  says which bind parameters. `changes` is what to deliver — for a keyed
-  upstream a window of its pinned key index (the delta log `from`–`to`, or
+  says which bind parameters. `batch` is what to deliver — for a keyed
+  upstream a range of its pinned key index (the delta log `from`–`to`, or
   the whole index when `full`), read `limit` keys at a time from `after`; for
   an unkeyed one the `[lo, hi]` `Commits` range; a run's `keys=` override
   names its keys outright. `full` marks a reset pass.
@@ -839,12 +839,12 @@ code.
 
 The result is the attempt's commit request: per returned output its ref
 (or `unchanged`), a keyed output's delta files (`keys`) and a partition
-set's `elements`; per keyed Incremental input the page it `delivered`;
+set's `elements`; per keyed Incremental input the batch it `delivered`;
 `cursor` if set; or an error. `retryable=false` for deploy mismatch and version-mismatch without a full run. No result means
 the worker died. The engine validates the attempt id, that every ref names
 a known output and this partition, and that a keyed output reports its delta,
 then commits against its own record of the pins. Inputs that moved since
-they were pinned do not void the commit: the attempt delivered the window
+they were pinned do not void the commit: the attempt delivered the batch
 it was given.
 
 **Worker** (`python -m solera_worker run --objects URL --attempt ID`; the
@@ -911,7 +911,7 @@ project must agree on it — an image without `.git` should set
 `RAILWAY_GIT_COMMIT_SHA`). A worker or sensor worker whose deploy differs
 because it was computed by another method (git against a file hash) makes
 the engine log a warning that says so. The engine counts the deploys it serves: the **deploy
-epoch**.
+number**.
 
 Registering a project reconciles the work outstanding under the last one: a
 task not yet launched of a renamed asset carries on under its new name; one

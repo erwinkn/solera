@@ -319,8 +319,8 @@ async def test_an_onchange_firing_is_one_run_in_order(state):  # noqa: F811
 
 
 def test_linking_a_run_is_linear():
-    """Review round 3 (P1): a one-to-one edge links each task by lookup, a
-    fan-in through one grouping per edge shape — not by scanning every
+    """Review round 3 (P1): a one-to-one input links each task by lookup, a
+    fan-in through one grouping per input shape — not by scanning every
     upstream partition for every task."""
     keys = StaticPartitions([f"k{i:05d}" for i in range(4000)])
     sites = StaticPartitions(["east", "west"])

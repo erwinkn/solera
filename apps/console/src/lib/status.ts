@@ -46,7 +46,7 @@ const TONES: Record<string, Tone> = {
   // inputs and explain
   caught_up: "ok",
   behind: "warn",
-  paging: "run",
+  delta: "run",
   full: "run",
   pattern_change: "wait",
   reconcile: "wait",

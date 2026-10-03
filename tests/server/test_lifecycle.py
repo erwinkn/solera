@@ -234,7 +234,7 @@ async def test_a_restarted_engine_binds_the_claims_owner(tmp_path):
     await engine.initialize()
     try:
         await engine.attempt_beat(attempt, {"worker_id": "other", "seq": 1})
-        raise AssertionError("another invocation was accepted")
+        raise AssertionError("another worker was accepted")
     except Ended as error:
         assert error.reason == "not_owner"
     assert await engine.attempt_beat(attempt, {"worker_id": "own", "seq": 7}) == {"cancel": None}

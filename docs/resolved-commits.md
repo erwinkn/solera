@@ -4,7 +4,7 @@ Status: **built** (decision D4); §14 lists where the code departs from the
 text. How a keyed write learns what it changed (`object-store-state.md` §6,
 "Compute a delta"): the engine answers from a warm cache of the key index,
 and the worker resolves locally when it cannot. Also how an attempt's
-index reads — its input pages — are answered from the same cache at
+index reads — its input batches — are answered from the same cache at
 `start`.
 
 It depends on two other designs, and says where:
@@ -13,7 +13,7 @@ It depends on two other designs, and says where:
   claim that admits one worker (§4), and the store kinds `immutable`
   and `fenced` (§9.6, `stores.md`), which decide the repair rules of §3.
 - `per-key-processing.md` — the failed keys, whose one v1 reader here
-  (retry pages, read at `start`) follows that doc's eligibility predicate and
+  (retry batches, read at `start`) follows that doc's eligibility predicate and
   transition table (§8). Its own semantics (rescoping, cancellation, retry
   pacing, sensors) belong to that doc.
 - `key-index-format.md` — entries carrying the generation that wrote
@@ -605,8 +605,8 @@ of magnitude fewer:
 ## 7. Engine-served reads
 
 Everything an attempt reads from an index before it computes — a full
-pass's page, a delta pass, a pattern change's diff, a `keys=` selection,
-an `Each` page's failure records and retry walk, an immutable store's
+pass's batch, a delta pass, a pattern change's diff, a `keys=` selection,
+an `Each` batch's failure records and retry walk, an immutable store's
 generations for a whole read — a worker alone pages from the store, cold: at
 100M keys, 20 to 37 GETs a page (`bench/keys/results.md`). The engine holds those indexes warm. So, mirroring
 `resolve` for writes, the worker asks once, at `start`, and the engine
@@ -653,15 +653,15 @@ request per step: `start` for reads, `resolve` before writing.
   memory (an attempt launched before a restart), a timeout: no record, and
   the worker reads the store as before. So does a start that comes before
   the commit it reads has been installed: the read is cold, and fills it.
-- **One mechanism.** An earlier design also put a small window's first
-  page in the spec, merged at prepare from in-memory summaries of small
+- **One mechanism.** An earlier design also put a small delta pass's first
+  batch in the spec, merged at prepare from in-memory summaries of small
   deltas. Recorded reads made it redundant, and it is gone: prepare reads
-  nothing, and a window is answered at `start` when its index is warm —
-  an index refused admission is read from the store, small windows
+  nothing, and a delta pass's batch is answered at `start` when its index is warm —
+  an index refused admission is read from the store, small deltas
   included.
 - **Delta files stay while logged.** A delta pass reads delta files
   that compaction has merged out of the levels; the cache retires a delta
-  only when collection deletes it, so a warm index answers its windows
+  only when collection deletes it, so a warm index answers its delta passes
   locally, and a fill fetches its logged deltas too.
 
 ## 8. Readers for per-key processing
@@ -669,14 +669,14 @@ request per step: `start` for reads, `resolve` before writing.
 `per-key-processing.md` is authoritative for everything about failures:
 the entry format, the **transition table** (interrupted keys follow the
 cancel record's `reason`, `lifecycle.md` §2.2), the **one
-eligibility predicate** `eligible(entry, now, epoch, forced)`, the
+eligibility predicate** `eligible(entry, now, deploy, forced)`, the
 outcome counts moved by transitions, the conservative minima maintained
 from each commit and made exact by completed retry passes, and retry-pass
 identity. This doc implements none of that differently; it calls the same
 SDK predicate.
 
 In v1 the cache's per-key reader is the start read (§7): an `Each`
-attempt's retry page — the walk of its failed keys from the pass
+attempt's retry batch — the walk of its failed keys from the pass
 position, keeping the keys `eligible` says are due, then their upstream
 entries — is the worker's own read code, recorded over local copies like
 any input read, and bound the same way to the failed keys the spec
@@ -785,9 +785,9 @@ reports both.
 - **Unknown writes.** A dead `Sql` writer that deleted `a` and inserted
   `b`: the next patch acquires, reads the store's key map, reconciles both
   keys and only then clears the intent; a replacement overwrites instead.
-- **Retry pages.** Recorded against the pinned failed keys only;
+- **Retry batches.** Recorded against the pinned failed keys only;
   canceled keys are never selected by themselves (the per-key predicate).
-- **Start reads.** Local pages, windows and lookups equal the store's from
+- **Start reads.** Local pages, deltas and lookups equal the store's from
   any cursor; a record answers only its own calls on its own pinned
   snapshot; its bounds stop it; a cold or corrupt index stops it and is
   filled.
@@ -828,7 +828,7 @@ The follow-up review agrees with all three.
    `resolve_max_keys`, `resolve_max_entries` and `resolve_timeout` still
    come from the warm grid; the absolute caps stay regardless.
 2. **Engine capacity.** No rate threshold is credible before the local
-   form is measured. Resolves, retry pages and compaction have separate
+   form is measured. Resolves, retry batches and compaction have separate
    threads; if offloading becomes necessary, the cache and all its readers
    move together into `engine_executor` (`object-store-state.md` §6),
    rather than a second cache-owning service.

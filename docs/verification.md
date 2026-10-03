@@ -1,7 +1,7 @@
 # Verification: the deterministic simulation
 
 Solera's bugs live where two features meet: a rename while an attempt is in
-flight, a cancel in the middle of a paged pass, a new engine opening while
+flight, a cancel in the middle of a pass, a new engine opening while
 the old one still writes. Hand-written tests check one feature at a time; the
 simulation in `tests/sim` checks them together. It runs the real engine and the
 real worker against a real `file://` object store, lets
@@ -50,12 +50,12 @@ stop where they are, and their `finally` blocks find the store gone.
 **The project** (`tests/sim/project.py`) is small and covers every input kind:
 
 ```
-feed (keyed source) ──Incremental──▶ items ──Incremental(page 2)──▶ copy
-items ──Each(page 2)──▶ checks              (fails while a key is "flaky")
-items ──Incremental(page 2)──▶ split ──▶ odd (table store), even (FileStore); on a pool
-items ──Incremental(page 2)──▶ seen (a job: no output, its cursor holds what it read)
+feed (keyed source) ──Incremental──▶ items ──Incremental(batch 2)──▶ copy
+items ──Each(batch 2)──▶ checks              (fails while a key is "flaky")
+items ──Incremental(batch 2)──▶ split ──▶ odd (table store), even (FileStore); on a pool
+items ──Incremental(batch 2)──▶ seen (a job: no output, its cursor holds what it read)
 knob (version) ──dep──▶ per_site[site ∈ sites] ──AllPartitions──▶ summary
-knob ──dep──▶ log (batches) ──Incremental──▶ tally
+knob ──dep──▶ log (appends) ──Incremental──▶ tally
 outside (keyed source) ◀── watch (a sensor over an external map; runs per_site when it changed)
 ```
 
@@ -189,9 +189,9 @@ the engine for one output per run: attempts with growing generations
 (acquiring first on a fenced store), writes that commit or are abandoned,
 calls retried, stale writers and duplicate workers, readers that pin and
 read later, by-key loads as `Each` does them, cleanups of what nothing
-references, and an incremental output's batches — appended, retried, reset,
+references, and an incremental output's commits — appended, retried, reset,
 rewritten by a stale writer. After every step the committed content, every
-pinned read and every batch range must read back as the engine's key index
+pinned read and every commit range must read back as the engine's key index
 says. Example: `begin; write(commits=False); begin; stale_write` — the
 second attempt holds the partition, so a fenced store must refuse the first.
 
@@ -766,11 +766,11 @@ spec/tla/check-journal.sh object-big   # three engines, six writes: ~9 min
 | F1 | `Incremental(exclude="k1*")` with a string is split into characters: `*` excludes every key (`include=` wraps a string) | P3 | fixed in c521d9b — `test_one_exclude_pattern_is_a_pattern_not_its_characters` |
 | F2 | A keyed output moved to another store keeps its key index: the next write stores only the changed keys there, and the others become unreadable | P1 | fixed in 59812c4 — `test_a_keyed_output_moved_to_another_store_stays_readable` |
 | F3 | `Each` loads its upstream as `dict[str, T]`; the store contract, the conformance kit and `examples/json_table_store.py` do not say or do so, and `Each` over such a store fails every key | P2 | doc and example fixed in 217c8f4; by-key loads checked by the store machine (`read_by_key`) |
-| F4 | A removed asset's launched attempt that asks for more pages, or fails retryably, re-queues a task no manifest can place: its run never ends | P1 | fixed in 59812c4 — `test_a_removed_assets_last_attempt_ends_its_run` |
+| F4 | A removed asset's launched attempt that asks for more batches, or fails retryably, re-queues a task no manifest can place: its run never ends | P1 | fixed in 59812c4 — `test_a_removed_assets_last_attempt_ends_its_run` |
 | F5 | An attempt launched before a rename settles into a head that moved and an output the manifest no longer names: its claim is never released, its run never ends | P1 | fixed in 59812c4 — `test_an_attempt_launched_before_a_rename_settles` |
 | F6 | A run that finishes an interrupted full pass ends there though the upstream moved: the `OnChange` firing it ran for delivers nothing of its change | P1 | fixed in 1cad0bd — `test_a_change_made_during_a_full_delivery_reaches_downstream` |
 | F7 | Journal cleanup deletes segments a writer still opening has not read; its fence lands in the hole and it serves a state without acknowledged events | P1 | fixed in 3c23397 — `test_a_slow_new_writer_never_fences_into_a_deleted_segment` |
-| F8 | A `full` run resets an unkeyed incremental output at a new `base`; a consumer whose next batch is exactly that base gets the reset as a delta and keeps the rows the upstream let go (`next < base`, not `<=`) | P1 | fixed in 2af00fc — `test_a_batch_upstream_reset_right_after_a_delivery_is_delivered_in_full` |
+| F8 | A `full` run resets an unkeyed incremental output at a new `base`; a consumer whose next commit is exactly that base gets the reset as a delta and keeps the rows the upstream let go (`next < base`, not `<=`) | P1 | fixed in 2af00fc — `test_a_batch_upstream_reset_right_after_a_delivery_is_delivered_in_full` |
 | F9 | A keyed output moved to another store starts over with an index of its own; a consumer then keeps a key the move's first write dropped (seen when the consumer's first pass and the moved write run together) | P1 | fixed: a move sets the head's `base`, and a pass begun at or before it starts over — `test_f9_a_key_dropped_by_a_moved_output_leaves_its_consumers`, `test_a_key_a_moved_output_dropped_leaves_its_consumer` |
 | F10 | A full pass (a reset) whose patterns take none of the upstream's keys is skipped without calling the producer, so the consumer never starts over: keys it held stay, though the upstream dropped them — also after a `full` run | P1 | open — `test_a_full_delivery_that_takes_no_key_still_starts_over` |
 | F11 | A delta file a pending cleanup entry reads is deleted while an attempt that was handed the entry runs: the attempt cannot read it, the superseded objects it names leak, and the entry ends `stuck` | P2 | fixed in ffe6921 — `test_f11_a_discard_entrys_delta_outlives_the_attempt_reading_it`, `test_a_discard_entrys_delta_outlives_the_attempt_holding_it` |

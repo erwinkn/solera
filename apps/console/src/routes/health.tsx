@@ -181,7 +181,7 @@ function Cleanups({
                   </Button>
                 }
                 title={`Clear stuck cleanups of ${r.output}?`}
-                description="The engine forgets these entries; their objects stay where they are. Same as `solera partitions cleanups OUTPUT SCOPE --clear`."
+                description="The engine forgets these entries; their objects stay where they are. Same as `solera cleanups OUTPUT PARTITION --clear`."
                 action="Clear"
                 onConfirm={() => clear.mutate({ output: r.output, partition: r.partition })}
               />

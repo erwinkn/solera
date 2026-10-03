@@ -1,5 +1,5 @@
-"""Key patterns on edges (docs/per-key-processing.md §11): which keys of a
-keyed upstream an `Incremental` or `Each` edge takes.
+"""Key patterns on inputs (docs/per-key-processing.md §11): which keys of a
+keyed upstream an `Incremental` or `Each` input takes.
 
     Each("sharepoint_files", include="ICP/Results/**/*.csv",
          exclude={"archive": "**/archive/**"})
@@ -78,7 +78,7 @@ def _compiled(p: dict) -> re.Pattern:
 
 
 class Matcher:
-    """Whether an edge takes a key, from its manifest spec (`None`: every key)."""
+    """Whether an input takes a key, from its manifest spec (`None`: every key)."""
 
     def __init__(self, patterns: dict | None):
         patterns = patterns or {}

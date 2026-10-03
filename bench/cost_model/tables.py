@@ -88,8 +88,8 @@ row("read time", lambda n: sec(full_replace(n, n // 100)["io_s"]))
 row("compare, native", lambda n: sec(full_replace(n, n // 100)["cpu_native_s"]))
 
 for pg in (10_000, 100_000):
-    print(f"\n### Full delivery to a consumer (pages of {pg // 1000}K keys, one attempt per page)\n")
+    print(f"\n### Full pass to a consumer (batches of {pg // 1000}K keys, one attempt per batch)\n")
     print(hdr)
-    row("pages / attempts", lambda n: num(full_delivery(n, pg)["pages"]))
-    row("GETs", lambda n: num(full_delivery(n, pg)["gets"]))
-    row("cost (index + attempt overhead)", lambda n: usd(full_delivery(n, pg)["usd"]))
+    row("batches / attempts", lambda n: num(full_pass(n, pg)["batches"]))
+    row("GETs", lambda n: num(full_pass(n, pg)["gets"]))
+    row("cost (index + attempt overhead)", lambda n: usd(full_pass(n, pg)["usd"]))

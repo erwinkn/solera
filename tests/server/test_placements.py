@@ -110,9 +110,9 @@ async def test_a_dead_pool_claim_expires_into_a_new_attempt(state):
     assert [s["attempt"] for s in await engine.pool_work("ingest", {}, "w2", 0)] == [second]
 
 
-async def test_a_dead_pool_claim_that_took_its_gate_is_uncertain(state):
+async def test_a_dead_pool_claim_that_took_its_gate_is_still_writing(state):
     """The claimant took its gate and entered a store call before it could
-    report again: the engine finds `writing`, so the writes are uncertain
+    report again: the engine finds `writing`, so its write is `writing`
     and the intents stay owing a repair — whatever `.worker` showed."""
 
     from solera import lifecycle

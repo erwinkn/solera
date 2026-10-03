@@ -18,7 +18,7 @@ Local MinIO with injected S3-like latency; reproduce with `uv run python bench/k
 | 1K new keys inserted | 475 ms · 2 GET 0 PUT · 29.0 MB | 247 ms · 3 GET 0 PUT · 35.1 MB | 495 ms · 29 GET 0 PUT · 350.9 MB |
 | 100K random keys changed | 868 ms · 2 GET 0 PUT · 29.0 MB | 2.6 s · 17 GET 0 PUT · 281.4 MB | 1.3 s · 376 GET 0 PUT · 372.7 MB |
 | 1K random keys changed, disk cache warm | 163 ms · 0 GET 0 PUT · 0.0 MB | 28 ms · 0 GET 0 PUT · 0.0 MB | 227 ms · 0 GET 0 PUT · 0.0 MB |
-| full-delivery page of 10K keys | 80 ms · 2 GET 0 PUT · 0.3 MB | 81 ms · 2 GET 0 PUT · 0.3 MB | 83 ms · 2 GET 0 PUT · 0.3 MB |
+| full-pass batch of 10K keys | 80 ms · 2 GET 0 PUT · 0.3 MB | 81 ms · 2 GET 0 PUT · 0.3 MB | 83 ms · 2 GET 0 PUT · 0.3 MB |
 | commit: 1K random changes + delta write | 485 ms · 2 GET 1 PUT · 29.0 MB | 321 ms · 6 GET 1 PUT · 35.3 MB | 733 ms · 36 GET 1 PUT · 351.3 MB |
 | compaction: 8 delta files into level 1 | 1.4 s · 10 GET 1 PUT · 29.3 MB | 92 ms · 8 GET 1 PUT · 0.3 MB | 91 ms · 8 GET 1 PUT · 0.3 MB |
 | full replacement, 1% changed | 805 ms · 2 GET 0 PUT · 29.0 MB | 5.9 s · 17 GET 0 PUT · 281.4 MB | — |
@@ -136,7 +136,7 @@ encodes 40% faster (`cargo run --release --example bench`).
 | 1K new keys inserted | 471 ms · 2 GET 0 PUT · 29.0 MB | 259 ms · 3 GET 0 PUT · 35.1 MB | 434 ms · 29 GET 0 PUT · 350.9 MB |
 | 100K random keys changed | 836 ms · 2 GET 0 PUT · 29.0 MB | 2.5 s · 17 GET 0 PUT · 281.4 MB | 1.3 s · 376 GET 0 PUT · 372.7 MB |
 | 1K random keys changed, disk cache warm | 156 ms · 0 GET 0 PUT · 0.0 MB | 34 ms · 0 GET 0 PUT · 0.0 MB | 299 ms · 0 GET 0 PUT · 0.0 MB |
-| full-delivery page of 10K keys | 80 ms · 2 GET 0 PUT · 0.3 MB | 80 ms · 2 GET 0 PUT · 0.3 MB | 83 ms · 2 GET 0 PUT · 0.3 MB |
+| full-pass batch of 10K keys | 80 ms · 2 GET 0 PUT · 0.3 MB | 80 ms · 2 GET 0 PUT · 0.3 MB | 83 ms · 2 GET 0 PUT · 0.3 MB |
 | commit: 1K random changes + delta write | 491 ms · 2 GET 1 PUT · 29.0 MB | 312 ms · 6 GET 1 PUT · 35.3 MB | 560 ms · 36 GET 1 PUT · 351.3 MB |
 | compaction: 8 delta files into level 1 | 1.4 s · 10 GET 1 PUT · 29.3 MB ↑29.0 MB | 91 ms · 8 GET 1 PUT · 0.3 MB ↑0.2 MB | 90 ms · 8 GET 1 PUT · 0.3 MB ↑0.2 MB |
 | full replacement, 1% changed | 728 ms · 2 GET 0 PUT · 29.0 MB | 6.9 s · 17 GET 0 PUT · 281.4 MB | — |
@@ -144,7 +144,7 @@ encodes 40% faster (`cargo run --release --example bench`).
 | full scan (recount), 100K-key pages | 1.4 s · 12 GET 0 PUT · 26.1 MB | 14.1 s · 105 GET 0 PUT · 252.6 MB | 118.8 s · 1077 GET 0 PUT · 2433.3 MB |
 | steady: 1K random keys changed | 766 ms · 9 GET 0 PUT · 29.2 MB | 1.2 s · 17 GET 0 PUT · 100.4 MB | 1.5 s · 65 GET 0 PUT · 501.5 MB |
 | steady: 1K random keys, half unchanged | 762 ms · 9 GET 0 PUT · 29.2 MB | 1.5 s · 364 GET 0 PUT · 124.1 MB | 2.3 s · 857 GET 0 PUT · 552.9 MB |
-| steady: full-delivery page of 10K keys | 334 ms · 16 GET 0 PUT · 0.5 MB | 359 ms · 18 GET 0 PUT · 0.8 MB | 421 ms · 20 GET 0 PUT · 1.1 MB |
+| steady: full-pass batch of 10K keys | 334 ms · 16 GET 0 PUT · 0.5 MB | 359 ms · 18 GET 0 PUT · 0.8 MB | 421 ms · 20 GET 0 PUT · 1.1 MB |
 | steady: full scan (recount), 100K-key pages | 4.3 s · 96 GET 0 PUT · 28.3 MB | 52.7 s · 929 GET 0 PUT · 528.4 MB | 615.5 s · 10518 GET 0 PUT · 7789.6 MB |
 | steady: commit: 1K random changes + delta write | 821 ms · 9 GET 1 PUT · 29.2 MB | 1.2 s · 15 GET 1 PUT · 100.3 MB | 1.5 s · 58 GET 1 PUT · 501.1 MB |
 | steady: compaction: 8 delta files + level 1 into level 1 | 1.4 s · 10 GET 1 PUT · 29.3 MB ↑29.0 MB | 2.7 s · 12 GET 1 PUT · 65.2 MB ↑65.1 MB | 2.8 s · 12 GET 1 PUT · 67.3 MB ↑67.3 MB |
@@ -200,7 +200,7 @@ Read strategy, forced each way (cold; wall · GETs · MB read):
 | 1K new keys inserted | 1.2 s · 2 GET 0 PUT · 27.1 MB |
 | 100K random keys changed | 1.6 s · 2 GET 0 PUT · 27.1 MB |
 | 1K random keys changed, disk cache warm | 841 ms · 0 GET 0 PUT · 0.0 MB |
-| full-delivery page of 10K keys | 89 ms · 2 GET 0 PUT · 0.3 MB |
+| full-pass batch of 10K keys | 89 ms · 2 GET 0 PUT · 0.3 MB |
 | commit: 1K random changes + delta write | 1.2 s · 2 GET 1 PUT · 27.1 MB |
 | compaction: 8 delta files into level 1 | 8.3 s · 10 GET 1 PUT · 27.3 MB ↑27.1 MB |
 | full replacement, 1% changed | 1.8 s · 2 GET 0 PUT · 27.1 MB |
@@ -208,7 +208,7 @@ Read strategy, forced each way (cold; wall · GETs · MB read):
 | full scan (recount), 100K-key pages | 2.2 s · 12 GET 0 PUT · 24.1 MB |
 | steady: 1K random keys changed | 1.5 s · 9 GET 0 PUT · 27.3 MB |
 | steady: 1K random keys, half unchanged | 1.4 s · 9 GET 0 PUT · 27.3 MB |
-| steady: full-delivery page of 10K keys | 371 ms · 16 GET 0 PUT · 0.5 MB |
+| steady: full-pass batch of 10K keys | 371 ms · 16 GET 0 PUT · 0.5 MB |
 | steady: full scan (recount), 100K-key pages | 5.4 s · 96 GET 0 PUT · 26.1 MB |
 | steady: commit: 1K random changes + delta write | 1.5 s · 9 GET 1 PUT · 27.3 MB |
 | steady: compaction: 8 delta files + level 1 into level 1 | 8.8 s · 10 GET 1 PUT · 27.3 MB ↑27.1 MB |
@@ -286,7 +286,7 @@ joins level 1 (1.7 / 3.6 / 3.9 MB), where before it held seven deltas.
 | steady: 1K random keys changed | 792 ms · 9 GET → **544 ms · 9 GET** | 1.2 s · 17 GET → **500 ms · 13 GET** | 1.5 s · 65 GET → **765 ms · 48 GET** |
 | steady: 1K random keys, half unchanged | 771 ms · 9 GET → **565 ms · 9 GET** | 1.7 s · 364 GET → **1.0 s · 32 GET** | 2.3 s · 857 GET → **1.1 s · 291 GET** |
 | steady: commit, 1K random changes + delta write | 811 ms · 9 GET → **571 ms · 9 GET** | 1.3 s · 15 GET → **543 ms · 12 GET** | 1.5 s · 58 GET → **817 ms · 50 GET** |
-| steady: full-delivery page of 10K keys | 331 ms · 16 GET → **108 ms · 9 GET** | 392 ms · 18 GET → **105 ms · 12 GET** | 421 ms · 20 GET → **102 ms · 14 GET** |
+| steady: full-pass batch of 10K keys | 331 ms · 16 GET → **108 ms · 9 GET** | 392 ms · 18 GET → **105 ms · 12 GET** | 421 ms · 20 GET → **102 ms · 14 GET** |
 | steady: full scan (recount), 100K-key pages | 4.4 s · 96 GET → **1.7 s · 19 GET** | 53.2 s · 929 GET → **21.6 s · 219 GET** | 615.5 s · 10,518 GET → **241.7 s · 3,029 GET** |
 | steady: level 0 compacted | 1.4 s, ↑29.0 MB for 0.23 MB of deltas | 2.8 s, ↑65.1 MB | 2.8 s, ↑67.3 MB |
 | → now, 8 files merged in level 0 | **176 ms, ↑1.7 MB** | **307 ms, ↑3.5 MB** | **272 ms, ↑3.7 MB** |
@@ -392,7 +392,7 @@ Filters are unchanged: 3.5 B per entry, 0.35% false positives per check.
 | 1K new keys inserted | 474 ms · 2 GET 0 PUT · 29.0 MB | 250 ms · 3 GET 0 PUT · 35.1 MB | 458 ms · 29 GET 0 PUT · 350.9 MB |
 | 100K random keys changed | 883 ms · 2 GET 0 PUT · 29.0 MB | 1.4 s · 20 GET 0 PUT · 281.4 MB | 1.3 s · 376 GET 0 PUT · 372.7 MB |
 | 1K random keys changed, disk cache warm | 164 ms · 0 GET 0 PUT · 0.0 MB | 28 ms · 0 GET 0 PUT · 0.0 MB | 311 ms · 0 GET 0 PUT · 0.0 MB |
-| full-delivery page of 10K keys | 84 ms · 2 GET 0 PUT · 0.3 MB | 82 ms · 2 GET 0 PUT · 0.3 MB | 97 ms · 2 GET 0 PUT · 0.3 MB |
+| full-pass batch of 10K keys | 84 ms · 2 GET 0 PUT · 0.3 MB | 82 ms · 2 GET 0 PUT · 0.3 MB | 97 ms · 2 GET 0 PUT · 0.3 MB |
 | commit: 1K random changes + delta write | 512 ms · 2 GET 1 PUT · 29.0 MB | 332 ms · 6 GET 1 PUT · 35.3 MB | 720 ms · 36 GET 1 PUT · 351.3 MB |
 | compaction: 8 delta files | 91 ms · 8 GET 1 PUT · 0.3 MB ↑0.2 MB | 97 ms · 8 GET 1 PUT · 0.3 MB ↑0.2 MB | 87 ms · 8 GET 1 PUT · 0.3 MB ↑0.2 MB |
 | full replacement, 1% changed | 762 ms · 2 GET 0 PUT · 29.0 MB | 6.1 s · 17 GET 0 PUT · 281.4 MB | — |
@@ -401,7 +401,7 @@ Filters are unchanged: 3.5 B per entry, 0.35% false positives per check.
 | full scan (recount), disk cache warm | 698 ms · 0 GET 0 PUT · 0.0 MB | 7.2 s · 0 GET 0 PUT · 0.0 MB | 42.6 s · 0 GET 0 PUT · 0.0 MB |
 | steady: 1K random keys changed | 544 ms · 9 GET 0 PUT · 30.7 MB | 500 ms · 13 GET 0 PUT · 46.8 MB | 765 ms · 48 GET 0 PUT · 445.4 MB |
 | steady: 1K random keys, half unchanged | 565 ms · 9 GET 0 PUT · 30.7 MB | 1.0 s · 32 GET 0 PUT · 349.9 MB | 1.1 s · 291 GET 0 PUT · 519.3 MB |
-| steady: full-delivery page of 10K keys | 108 ms · 9 GET 0 PUT · 2.0 MB | 105 ms · 12 GET 0 PUT · 1.1 MB | 102 ms · 14 GET 0 PUT · 1.4 MB |
+| steady: full-pass batch of 10K keys | 108 ms · 9 GET 0 PUT · 2.0 MB | 105 ms · 12 GET 0 PUT · 1.1 MB | 102 ms · 14 GET 0 PUT · 1.4 MB |
 | steady: full scan (recount), 100K-key pages | 1.7 s · 19 GET 0 PUT · 27.2 MB | 21.6 s · 219 GET 0 PUT · 306.6 MB | 241.7 s · 3029 GET 0 PUT · 2999.4 MB |
 | steady: commit: 1K random changes + delta write | 571 ms · 9 GET 1 PUT · 30.7 MB | 543 ms · 12 GET 1 PUT · 46.7 MB | 817 ms · 50 GET 1 PUT · 445.6 MB |
 | steady: compaction: level 0, 8 files | 176 ms · 8 GET 1 PUT · 1.7 MB ↑1.7 MB | 307 ms · 8 GET 1 PUT · 3.7 MB ↑3.5 MB | 272 ms · 8 GET 1 PUT · 3.9 MB ↑3.7 MB |
@@ -831,7 +831,7 @@ processes), so only part of the local files stayed in the page cache.
   152–438 ms and no GETs. 100K keys at 100M: 23–34 s and 480 GETs either
   way; the cache saved requests, not the CPU, which dominates.
 - **Other cold readers**, from the follow-up's tables above: a
-  full-delivery page of 10K keys, 80–110 ms and 2–14 GETs; `Each`'s and
+  full-pass batch of 10K keys, 80–110 ms and 2–14 GETs; `Each`'s and
   failure indexes' lookups, a sparse read like the 1K-key rows.
 - **The engine's recount and compaction** read the cache's local copies
   when it holds the index warm (one warm copy serves every engine
@@ -862,19 +862,19 @@ and parsed, and the worker's same call is answered from it.
 
 | Keys | Read | Cold worker | Engine-served (reply MB) |
 |---|---|---|---|
-| 1,000,000 | full delivery: first page, 10K keys | 150 ms · 29 GET · 5.7 MB · CPU 92 ms | 24 ms · 0 GET · 0.4 MB · CPU 18 ms |
-| 1,000,000 | full delivery: a page of 100K keys, mid-index | 230 ms · 29 GET · 8.0 MB · CPU 130 ms | 139 ms · 0 GET · 3.9 MB · CPU 125 ms |
+| 1,000,000 | full pass: first batch, 10K keys | 150 ms · 29 GET · 5.7 MB · CPU 92 ms | 24 ms · 0 GET · 0.4 MB · CPU 18 ms |
+| 1,000,000 | full pass: a batch of 100K keys, mid-index | 230 ms · 29 GET · 8.0 MB · CPU 130 ms | 139 ms · 0 GET · 3.9 MB · CPU 125 ms |
 | 1,000,000 | change window of 20 commits (100K entries): a page of 50K | 119 ms · 20 GET · 5.0 MB · CPU 84 ms | 77 ms · 0 GET · 2.0 MB · CPU 80 ms |
-| 10,000,000 | full delivery: first page, 10K keys | 206 ms · 31 GET · 4.5 MB · CPU 94 ms | 20 ms · 0 GET · 0.4 MB · CPU 16 ms |
-| 10,000,000 | full delivery: a page of 100K keys, mid-index | 295 ms · 33 GET · 11.4 MB · CPU 217 ms | 121 ms · 0 GET · 3.8 MB · CPU 134 ms |
+| 10,000,000 | full pass: first batch, 10K keys | 206 ms · 31 GET · 4.5 MB · CPU 94 ms | 20 ms · 0 GET · 0.4 MB · CPU 16 ms |
+| 10,000,000 | full pass: a batch of 100K keys, mid-index | 295 ms · 33 GET · 11.4 MB · CPU 217 ms | 121 ms · 0 GET · 3.8 MB · CPU 134 ms |
 | 10,000,000 | change window of 20 commits (100K entries): a page of 50K | 126 ms · 20 GET · 3.6 MB · CPU 86 ms | 110 ms · 0 GET · 2.0 MB · CPU 110 ms |
-| 100,000,000 | full delivery: first page, 10K keys | 189 ms · 33 GET · 4.8 MB · CPU 127 ms | 30 ms · 0 GET · 0.4 MB · CPU 28 ms |
-| 100,000,000 | full delivery: a page of 100K keys, mid-index | 441 ms · 37 GET · 16.4 MB · CPU 424 ms | 118 ms · 0 GET · 3.7 MB · CPU 131 ms |
+| 100,000,000 | full pass: first batch, 10K keys | 189 ms · 33 GET · 4.8 MB · CPU 127 ms | 30 ms · 0 GET · 0.4 MB · CPU 28 ms |
+| 100,000,000 | full pass: a batch of 100K keys, mid-index | 441 ms · 37 GET · 16.4 MB · CPU 424 ms | 118 ms · 0 GET · 3.7 MB · CPU 131 ms |
 | 100,000,000 | change window of 20 commits (100K entries): a page of 50K | 135 ms · 20 GET · 3.6 MB · CPU 79 ms | 65 ms · 0 GET · 2.0 MB · CPU 67 ms |
 
 - **No GETs.** A page costs the worker no index reads; the cold worker's
   20–37 are a page's index parts and blocks, fetched in parallel.
-- **A full-delivery page** of 10K keys takes 20–30 ms instead of 150–206
+- **A full-pass batch** of 10K keys takes 20–30 ms instead of 150–206
   ms at every size; a page of 100K keys 118–139 ms instead of 230–441 ms,
   most of it encoding the reply (3.7–3.9 MB of `.kx` in base64 JSON) and
   decoding it.
@@ -951,13 +951,13 @@ needs `sudo` to drop the page cache, which the container has not.)
 
 | Keys | Read | Cold worker | Engine-served |
 |---|---|---|---|
-| 1,000,000 | full delivery, first 10K-key page | 200 ms · 29 GET | 25 ms · 0 GET |
+| 1,000,000 | full pass, first 10K-key batch | 200 ms · 29 GET | 25 ms · 0 GET |
 | 1,000,000 | 100K-key page, mid-index | 160 ms · 29 GET | 89 ms · 0 GET |
 | 1,000,000 | 50K page of a 20-commit window | 111 ms · 20 GET | 56 ms · 0 GET |
-| 10,000,000 | full delivery, first 10K-key page | 360 ms · 31 GET | 21 ms · 0 GET |
+| 10,000,000 | full pass, first 10K-key batch | 360 ms · 31 GET | 21 ms · 0 GET |
 | 10,000,000 | 100K-key page, mid-index | 534 ms · 33 GET | 111 ms · 0 GET |
 | 10,000,000 | 50K page of a 20-commit window | 120 ms · 20 GET | 64 ms · 0 GET |
-| 100,000,000 | full delivery, first 10K-key page | 357 ms · 33 GET | 25 ms · 0 GET |
+| 100,000,000 | full pass, first 10K-key batch | 357 ms · 33 GET | 25 ms · 0 GET |
 | 100,000,000 | 100K-key page, mid-index | 1.0 s · 37 GET | 151 ms · 0 GET |
 | 100,000,000 | 50K page of a 20-commit window | 129 ms · 20 GET | 101 ms · 0 GET |
 
@@ -975,7 +975,7 @@ shape matches the follow-up's above):
 | build (initial index) | 1.6 s | 11.6 s | 136 s, 4.6 GB peak RSS |
 | 1K random keys changed | 206 ms · 2 GET | 206 ms · 5 GET | 977 ms · 34 GET |
 | steady: 1K random keys, half unchanged | 253 ms · 9 GET | 1.0 s · 229 GET | 5.5 s · 308 GET |
-| steady: full-delivery page of 10K keys | 67 ms · 9 GET | 210 ms · 14 GET | 350 ms · 18 GET |
+| steady: full-pass batch of 10K keys | 67 ms · 9 GET | 210 ms · 14 GET | 350 ms · 18 GET |
 | steady: commit, 1K changes + delta write | 384 ms · 9 GET · 1 PUT | 348 ms · 12 GET · 1 PUT | 964 ms · 52 GET · 1 PUT |
 | steady: full scan (recount) | 173 ms · 12 GET | 1.8 s · 49 GET | 17.6 s · 436 GET |
 | steady: compaction into the deepest level | — | 2.0 s · 11 GET | 4.8 s · 49 GET |
@@ -990,7 +990,7 @@ shape matches the follow-up's above):
   decodes them. The 100K-key write at 100M is 29 s either way — CPU.
 - **Requests are free here**, so GET counts cost latency only: the
   engine's advantage on Railway is time (an order of magnitude on writes
-  and on full-delivery pages) and load on the bucket, not money. A change
+  and on full-pass batchs) and load on the bucket, not money. A change
   window's page gains least (101 ms against 129 ms at 100M): its delta
   files are small and read in parallel.
 
@@ -1122,7 +1122,7 @@ latency model (30 ms per request, 80 MB/s per connection, 64 in parallel).
 | 1K clustered keys changed | 312 ms · 2G · 29.2 MB | 164 ms · 1G · 8.8 MB | 271 ms · 2G · 26.8 MB |
 | 1K new keys inserted | 454 ms · 2G · 29.2 MB | 246 ms · 1G · 8.8 MB | 398 ms · 2G · 26.8 MB |
 | 100K random keys changed | 717 ms · 2G · 29.2 MB | 468 ms · 1G · 8.8 MB | 767 ms · 2G · 26.8 MB |
-| full-delivery page of 10K keys | 79 ms · 2G · 0.3 MB | 74 ms · 2G · 0.1 MB | 83 ms · 2G · 0.3 MB |
+| full-pass batch of 10K keys | 79 ms · 2G · 0.3 MB | 74 ms · 2G · 0.1 MB | 83 ms · 2G · 0.3 MB |
 | commit: 1K random changes + delta write | 528 ms · 2G · 29.2 MB | 274 ms · 1G · 8.8 MB | 468 ms · 2G · 26.8 MB |
 | compaction: 8 delta files | 92 ms · 8G · 0.4 MB | 85 ms · 8G · 0.1 MB | 80 ms · 8G · 0.2 MB |
 | full replacement, 1% changed | 701 ms · 5G · 25.7 MB | 682 ms · 2G · 7.1 MB | 664 ms · 4G · 25.1 MB |
@@ -1130,7 +1130,7 @@ latency model (30 ms per request, 80 MB/s per connection, 64 in parallel).
 | full scan (recount), 100K-key pages | 293 ms · 5G · 25.7 MB | 226 ms · 2G · 7.1 MB | 327 ms · 4G · 25.1 MB |
 | steady: 1K random keys changed | 452 ms · 9G · 31.1 MB | 335 ms · 8G · 9.4 MB | 466 ms · 9G · 28.4 MB |
 | steady: 1K random keys, half unchanged | 491 ms · 9G · 31.1 MB | — | 494 ms · 9G · 28.4 MB |
-| steady: full-delivery page of 10K keys | 108 ms · 9G · 2.1 MB | 83 ms · 9G · 0.7 MB | 105 ms · 9G · 1.9 MB |
+| steady: full-pass batch of 10K keys | 108 ms · 9G · 2.1 MB | 83 ms · 9G · 0.7 MB | 105 ms · 9G · 1.9 MB |
 | steady: full scan (recount), 100K-key pages | 357 ms · 12G · 27.6 MB | 299 ms · 9G · 7.6 MB | 389 ms · 11G · 26.6 MB |
 | steady: commit: 1K random changes + delta write | 518 ms · 9G · 31.1 MB | 361 ms · 8G · 9.4 MB | 512 ms · 9G · 28.4 MB |
 | steady: compaction: level 0, 8 files | 153 ms · 8G · 1.9 MB | 118 ms · 8G · 0.6 MB | 154 ms · 8G · 1.6 MB |
@@ -1150,7 +1150,7 @@ latency model (30 ms per request, 80 MB/s per connection, 64 in parallel).
 | 1K clustered keys changed | 252 ms · 2G · 12.5 MB | 126 ms · 1G · 6.2 MB | 158 ms · 2G · 6.3 MB |
 | 1K new keys inserted | 229 ms · 3G · 35.1 MB | 133 ms · 3G · 17.5 MB | 172 ms · 4G · 17.7 MB |
 | 100K random keys changed | 890 ms · 346G · 58.4 MB | 462 ms · 3G · 17.5 MB | 2.0 s · 20G · 257.6 MB |
-| full-delivery page of 10K keys | 87 ms · 4G · 0.7 MB | 78 ms · 4G · 0.2 MB | 87 ms · 4G · 0.7 MB |
+| full-pass batch of 10K keys | 87 ms · 4G · 0.7 MB | 78 ms · 4G · 0.2 MB | 87 ms · 4G · 0.7 MB |
 | commit: 1K random changes + delta write | 305 ms · 6G · 35.3 MB | 167 ms · 3G · 17.5 MB | 888 ms · 711G · 69.5 MB |
 | compaction: 8 delta files | 91 ms · 8G · 0.3 MB | 80 ms · 8G · 0.1 MB | 95 ms · 8G · 0.2 MB |
 | full replacement, 1% changed | 4.6 s · 34G · 248.8 MB | 3.7 s · 12G · 62.1 MB | 4.6 s · 34G · 240.1 MB |
@@ -1158,7 +1158,7 @@ latency model (30 ms per request, 80 MB/s per connection, 64 in parallel).
 | full scan (recount), 100K-key pages | 1.3 s · 34G · 248.8 MB | 662 ms · 12G · 62.1 MB | 1.3 s · 34G · 240.1 MB |
 | steady: 1K random keys changed | 487 ms · 11G · 46.7 MB | 183 ms · 7G · 1.9 MB | 812 ms · 404G · 50.8 MB |
 | steady: 1K random keys, half unchanged | 773 ms · 229G · 60.2 MB | — | 790 ms · 390G · 49.7 MB |
-| steady: full-delivery page of 10K keys | 104 ms · 14G · 1.6 MB | 116 ms · 15G · 2.3 MB | 93 ms · 14G · 1.4 MB |
+| steady: full-pass batch of 10K keys | 104 ms · 14G · 1.6 MB | 116 ms · 15G · 2.3 MB | 93 ms · 14G · 1.4 MB |
 | steady: full scan (recount), 100K-key pages | 2.3 s · 49G · 309.5 MB | 2.6 s · 28G · 114.5 MB | 2.2 s · 50G · 304.5 MB |
 | steady: commit: 1K random changes + delta write | 559 ms · 12G · 46.7 MB | 204 ms · 7G · 1.9 MB | 753 ms · 407G · 50.7 MB |
 | steady: compaction: level 0, 8 files | 261 ms · 8G · 3.7 MB | 196 ms · 8G · 2.0 MB | 237 ms · 8G · 3.7 MB |

@@ -28,7 +28,7 @@ event-position garbage pins, recorded placement handles, per-placement
 worker's first report.
 
 Its companions: `resolved-commits.md` (the resolver on this channel, and
-the write phases of a keyed output), `per-key-processing.md` (pages,
+the write phases of a keyed output), `per-key-processing.md` (batches,
 failed keys, sensors' sources).
 
 **This doc is the authority for four records the others use:** the cancel
@@ -152,20 +152,20 @@ What the engine decided to stop, latched, and what the worker acts on:
 ### 2.3 Write-completion evidence
 
 Whether an ended attempt's writes can still land: `none`, `complete` or
-`uncertain`. The release rules of §9.6 read nothing else.
+`writing`. The release rules of §9.6 read nothing else.
 
 | Source | Establishes |
 |---|---|
-| the worker, in `.result` | `none` if it made no store call; `complete` if every `store.store()` call returned; `uncertain` if one raised, was cancelled or abandoned — **any store exception after the gate is uncertain**: a client timeout may hide a backend that completed |
+| the worker, in `.result` | `none` if it made no store call; `complete` if every `store.store()` call returned; `writing` if one raised, was cancelled or abandoned — **any store exception after the gate leaves it `writing`**: a client timeout may hide a backend that completed |
 | the engine, ending an attempt without a result: a create-only `aborted` gate | **wins** → `none`: the worker never took the gate, and now never can |
-| | **finds `writing`** and no conclusive result → `uncertain` |
+| | **finds `writing`** and no conclusive result → `writing` |
 | | **finds `aborted` or `closed`** → what the attempt that wrote it recorded |
-| | **cannot get an answer** (S3 unreachable) → not established: the engine retries, and treats the attempt as `uncertain` until it can |
+| | **cannot get an answer** (S3 unreachable) → not established: the engine retries, and treats the attempt as `writing` until it can |
 
 Never from progress, silence or provider state: a worker can take the gate
 and enter a store call before its next report. Attempts whose outputs are
 all on `immutable` stores take no gate; their evidence is the result's, or
-`uncertain`, which their release rule ignores (§9.6).
+`writing`, which their release rule ignores (§9.6).
 
 ### 2.4 Gates outlive their runs
 
@@ -406,14 +406,14 @@ happens to the work left undone.
 
 1. **Cancel requested.** The engine latches `{phase: requested, reason}`
    and answers it to the next beat (≤ 10 s). The worker stops starting new
-   work: a per-key page stops scheduling keys and cancels calls in flight
+   work: a per-key batch stops scheduling keys and cancels calls in flight
    (`per-key-processing.md` §5); a plain asset's producer is cancelled. Then
    it **drains**, within `cancel_grace` (60 s by default, per asset):
-   - work that finished is written and published — for a per-key page, the
+   - work that finished is written and published — for a per-key batch, the
      finished keys' outputs plus the interrupted holes in its failure
      index — as one result with `status: canceled`, which the engine
      commits as one journal decision (outputs, failure delta, bookmark
-     past the whole page);
+     past the whole batch);
    - a plain asset that had not reached its writes publishes `canceled`
      with no outputs and `writes: none`; one that had taken the gate
      completes its writes and publishes them, and the commit stands, as
@@ -563,10 +563,10 @@ change what a newer one committed.
 ### 9.5 Knowing whether writes completed
 
 What the next attempt must repair reads one thing: the attempt's
-write-completion evidence, `none`, `complete` or `uncertain`, defined in
+write-completion evidence, `none`, `complete` or `writing`, defined in
 §2.3. Two of its
-rules carry the weight here. **Any store exception after the gate is
-uncertain**: a client that timed out after one second may see its request
+rules carry the weight here. **Any store exception after the gate leaves
+it `writing`**: a client that timed out after one second may see its request
 finish at the backend five seconds later, and a store author cannot be
 asked to tell the two apart; so a failed result after the gate leaves its
 intents for the next attempt to repair. And **the engine classifies an
@@ -670,7 +670,7 @@ Internal to the store; the engine supplies one number.
   Postgres 17.)
 - **Every write transaction** starts by locking the row and checking that
   it still holds `(g, worker)`; otherwise it raises before changing
-  anything (a store exception after the gate: `uncertain`, §2.3).
+  anything (a store exception after the gate: `writing`, §2.3).
 - **Equal generation, other worker** is refused, so a duplicate of the
   newest attempt cannot write. An attempt the engine ended before it
   acquired is stopped by its retained gate (§2.4), not by the database,
@@ -776,10 +776,10 @@ still need it. The pins, all by event counter (`object-store-state.md`
 - **durable multi-attempt reads**, recorded with their pin in the
   bookmark state, so the pin holds in the gaps between attempts and
   across engine restarts, until the read ends:
-  - a **paged delta pass**: an `Incremental` input delivering one pinned
-    window `from…to` over several attempts (`after` set). A later commit
-    may supersede a key inside the window, and an attempt launched after
-    that commit would not otherwise cover the version the window still
+  - a **delta pass over several batches**: an `Incremental` input delivering one pinned
+    range `from…to` over several attempts (`after` set). A later commit
+    may supersede a key inside the range, and an attempt launched after
+    that commit would not otherwise cover the version the pass still
     delivers;
   - a **pattern change drain** and a **retry pass** (`per-key-processing.md`),
     each reading one pinned snapshot across many attempts.
@@ -831,8 +831,8 @@ Deleting a name twice is no harm, and only the index files an
 acknowledged entry names become garbage. Due means no reader pin that
 may read the entry's output partition predates it: pins are per output partition,
 each named by its index prefix. An attempt's claim names the partitions it
-reads and writes (every partition, while it is still preparing); a paged
-window or a pattern change drain its upstream; a sensor tick its sources; an
+reads and writes (every partition, while it is still preparing); a delta
+pass or a pattern change drain its upstream; a sensor tick its sources; an
 engine reader what it reads (`history/` for a history query). Index and
 history files are collected by the same rule, by their paths, so one slow
 reader holds back only what it reads. A delta file
@@ -849,7 +849,7 @@ deltas are uploaded before data), not from a sweep; those delta files and
 consumed compaction sidecars then go through the ordinary index garbage.
 A pattern change drain's snapshot pin (`bookmark.pattern change.pin`) holds both
 index-file garbage and data cleanups, as a live claim does; a retry pass
-needs none, since each of its pages reads the state of its own prepare
+needs none, since each of its batches reads the state of its own prepare
 (`per-key-processing.md` §20). Not built: the sweep, so a worker that
 writes after its attempt ended leaves orphans.
 
@@ -898,7 +898,7 @@ memory and rebuilds them after a restart from the journal and `.worker`:
   attempt, with its own spec and claim. Its writes are classified from its
   gate (§2.3), never from what `.worker` showed: the claimant may have
   taken the gate and entered a store call without reporting again. The
-  engine's `aborted` create wins → `none`; it finds `writing` → `uncertain`,
+  engine's `aborted` create wins → `none`; it finds `writing` → `writing`,
   and its intents wait for the next attempt's repair; S3 cannot answer →
   the engine cannot establish `none`, and retries before releasing
   anything.
@@ -1139,7 +1139,7 @@ on an old deploy gets no ticks.
   local one running, with backoff, beside a served engine (one with an
   engine URL), and authenticates it with a token signed by the engine
   secret. Pool hosts use the pool token.
-- **Reader pins.** A tick's pin joins the claims' and the paged windows'
+- **Reader pins.** A tick's pin joins the claims' and the delta passes'
   in one floor, which both data and index garbage respect.
 
 ## 12. Engine restart, attempt by attempt
@@ -1218,7 +1218,7 @@ sources).
 | Pool: register, claim, renew, complete; in-memory leases; `AttemptClaimed` | long-poll discovery; `.worker` claim; four states; claim expiry into a new attempt |
 | cancel read from the fence by every beat; engine aborts at once | two-phase cancel: requested and drained, then forced |
 | any presumed death releases the partition (R1) | every store is `immutable` or `fenced`: released at once, the older writer unable to write |
-| a failed result releases the partition | a failure after the gate is uncertain completion; an attempt without a result is classified from its gate (§2.3) |
+| a failed result releases the partition | a failure after the gate leaves its write `writing`; an attempt without a result is classified from its gate (§2.3) |
 | gates deleted with their run | gates retained `gate_days` beyond it as tombstones; an attempt that took none gets a `closed` one (§2.4) |
 | cancel and timeout indistinguishable to the worker | a latched cancel record with phase and reason, carried into the result (§2.2) |
 | repair before the store is fenced | `Store.acquire` before repair, for fenced stores |
@@ -1229,7 +1229,7 @@ sources).
 
 ## 15. Open questions
 
-1. **`cancel_grace`.** 60 s by default; per asset, since a page of
+1. **`cancel_grace`.** 60 s by default; per asset, since a batch of
    16 concurrent calls into a slow API may need longer to drain.
 2. **`sensor_map_max`.** Where a key map stops being posted to the engine
    and is resolved on the host instead; from the resolver's grid

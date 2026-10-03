@@ -358,7 +358,7 @@ class Result:
 
 
 # ---------------------------------------------------------------------------
-# Edges (§5)
+# Inputs (§5)
 # ---------------------------------------------------------------------------
 
 
@@ -368,14 +368,14 @@ class In:
     kind = "in"
 
     def __init__(self, output: str | None = None, *, meta: dict | None = None):
-        self.output, self.meta = output, _jsonable(meta, "edge meta") if meta is not None else None
+        self.output, self.meta = output, _jsonable(meta, "input meta") if meta is not None else None
 
     def spec(self, param: str) -> dict:
         return {"kind": self.kind, "output": self.output or param, "meta": self.meta}
 
 
 class Incremental(In):
-    """Delta edge: the bookmark-planned changes since last pass (§5, §6).
+    """Delta input: the bookmark-planned changes since last pass (§5, §6).
     On a keyed upstream, `include` and `exclude` select the keys it takes
     by name (`solera.patterns`, docs/per-key-processing.md §11)."""
 
@@ -443,9 +443,9 @@ class AllPartitions(In):
 
 @dataclass(frozen=True)
 class Upstream:
-    """Facts about the upstream a page came from (§5.1): its `output`, and —
-    for a batch-mode upstream — the range of its `batches`, the upstream
-    commits the page covers."""
+    """Facts about the upstream a batch came from (§5.1): its `output`, and —
+    for an unkeyed upstream — the range of upstream `commits` the batch
+    covers."""
 
     output: str | None = None
     commits: range | None = None
@@ -753,7 +753,7 @@ class OnChange:
 
 @dataclass(frozen=True)
 class OnDeploy:
-    """Once per new project revision, for the latest revision only (§9)."""
+    """Once per new deploy, for the latest deploy only (§9)."""
 
     def spec(self) -> dict:
         return {"kind": "ondeploy"}
@@ -1113,7 +1113,7 @@ def hints(name: str, fn: Callable) -> dict[str, Any]:
 
 def dict_arg(t: Any) -> Any | None:
     """`X` of a `dict[str, X]` or `Mapping[str, X]` annotation — an input by
-    partition (`AllPartitions`) or by key (`Each`'s page) — else None."""
+    partition (`AllPartitions`) or by key (`Each`'s batch) — else None."""
 
     if typing.get_origin(t) in (dict, Mapping):
         args = typing.get_args(t)
@@ -1160,7 +1160,7 @@ class Project:
         `$SOLERA_DATA`. `errors` classifies exceptions user code cannot
         subclass: `{httpx.TimeoutException: Transient}` (`solera.errors`).
         `build` names the code explicitly (else `$SOLERA_BUILD`, else the
-        work tree's content: `solera.build`); it is part of the revision."""
+        work tree's content: `solera.build`); it is part of the deploy."""
 
         from .errors import check_mapping
         from .stores import FileStore
@@ -1305,12 +1305,12 @@ class Project:
 
     @staticmethod
     def _check_each(name: str, asset: Asset, info: dict, param: str, upstream: dict) -> None:
-        """An Each edge (docs/per-key-processing.md §5): one per asset, over a
-        keyed upstream, the asset's only Incremental edge, and every output
+        """An Each input (docs/per-key-processing.md §5): one per asset, over a
+        keyed upstream, the asset's only Incremental input, and every output
         keyed by the input's key."""
 
         if upstream["key"] is None:
-            raise RegistrationError(f"{name}: Each edge {param!r} needs a keyed upstream")
+            raise RegistrationError(f"{name}: Each input {param!r} needs a keyed upstream")
         others = [p for p, e in info["inputs"].items() if p != param and isinstance(e, Incremental)]
         if others:
             raise RegistrationError(
@@ -1342,7 +1342,7 @@ class Project:
                     )
                 claimed[alias] = asset.name
 
-        # Resolve every asset's inputs/deps/partitions and validate edges.
+        # Resolve every asset's inputs/deps/partitions and validate inputs.
         assets = {}
         for asset in self.assets.values():
             name = asset.name
@@ -1378,7 +1378,7 @@ class Project:
             dims = self._dim_spec(asset.partitions, name)
             assets[name] = {"inputs": inputs, "deps": deps, "dims": dims}
 
-        # Edge validity: output exists, projection rule, store checks.
+        # Input validity: output exists, projection rule, store checks.
         hints_by_asset = self.hints = {n: hints(n, a.fn) for n, a in self.assets.items()}
         for name, info in assets.items():
             asset = self.assets[name]
@@ -1408,11 +1408,11 @@ class Project:
                 if isinstance(input, Incremental):
                     if missing:
                         raise RegistrationError(
-                            f"{name}: Incremental edge {param!r} cannot have upstream-only dimensions (§7)"
+                            f"{name}: Incremental input {param!r} cannot have upstream-only dimensions (§7)"
                         )
                     if not upstream["incremental"]:
                         raise RegistrationError(
-                            f"{name}: Incremental edge {param!r} upstream {output_name} "
+                            f"{name}: Incremental input {param!r} upstream {output_name} "
                             "is not incremental (declare incremental=True) (§2.1)"
                         )
                     if input.patterns is not None and upstream["key"] is None:
@@ -1421,7 +1421,7 @@ class Project:
                         )
                     if is_ref_type(annotation):
                         raise RegistrationError(
-                            f"{name}: Incremental edge {param!r} cannot be ref-annotated (§5)"
+                            f"{name}: Incremental input {param!r} cannot be ref-annotated (§5)"
                         )
                     if annotation is None:
                         raise RegistrationError(f"{name}: store-bound input {param!r} is unannotated (§11)")

@@ -96,10 +96,10 @@ class Sensors:
     async def sensor_next(
         self, executor: str, deploy: str, host: str, slots: int, wait: float, build: str | None = None
     ) -> dict:
-        """Due ticks for a host of `executor` on `revision`, up to `slots`;
-        waits up to `wait` seconds for one. A host on another revision gets
+        """Due ticks for a host of `executor` on `deploy`, up to `slots`;
+        waits up to `wait` seconds for one. A host on another deploy gets
         none: it is told the current one — and warned, once, when `build`
-        says it computed its revision another way than the engine did."""
+        says it computed its deploy another way than the engine did."""
 
         self._serving()
         loop = asyncio.get_running_loop()

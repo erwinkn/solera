@@ -217,7 +217,7 @@ async def test_6_a_forced_retry_during_the_last_retry_page_is_taken(state):  # n
     while len(calls) < 2:
         await engine.tick()
         await asyncio.sleep(0.02)
-    engine.retry_keys("parse", ["rejected"])  # arrives while the pass's last page runs
+    engine.retry_keys("parse", ["rejected"])  # arrives while the pass's last batch runs
     assert await engine.submit_retries("parse", [""], "test") == []  # the partition is active
     gate["event"].set()
     await engine.run_until(run["id"], 10)

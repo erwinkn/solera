@@ -1,5 +1,5 @@
 """The engine (§6–§10): control-plane only. It plans runs into per-(asset,
-partition) tasks, resolves inputs to pinned heads, plans Incremental edges over
+partition) tasks, resolves inputs to pinned heads, plans Incremental inputs over
 per-input bookmarks, dispatches attempts through placements, and commits
 their results.
 
@@ -79,8 +79,8 @@ class NonRetryable(RuntimeError):
     """A dispatch-time failure no retry will fix (§8: full run required, …)."""
 
 
-def _pages(keys: int, limit: int) -> int:
-    """Pages of `limit` a pass of `keys` is planned to take: at least one."""
+def _batches(keys: int, limit: int) -> int:
+    """Batches of `limit` a pass of `keys` is planned to take: at least one."""
 
     return max(1, -(-int(keys) // max(1, int(limit))))
 
@@ -671,9 +671,9 @@ class Engine(Attempts, Sensors, Views):
     # -- input resolution + Incremental plans (§5, §6, §8) --------------------------
 
     def _prepare(self, task: dict, run: dict, attempt: str | None = None) -> dict:
-        """Pin heads at attempt start; plan Incremental edges; decide skip (§8).
+        """Pin heads at attempt start; plan Incremental inputs; decide skip (§8).
 
-        Each output the attempt may write is pinned with its batch number and,
+        Each output the attempt may write is pinned with its commit number and,
         when keyed, its key index: the worker works out the delta against
         exactly that state (§6)."""
 
@@ -701,7 +701,7 @@ class Engine(Attempts, Sensors, Views):
             inputs = planner.inputs(task["asset"], partition)
         except planning.UpstreamOnly as error:
             raise Conflict(str(error)) from None
-        # Pass 1: pin every non-Incremental edge; their refs enter the fingerprint (§6).
+        # Pass 1: pin every non-Incremental input; their refs enter the fingerprint (§6).
         pins, pinned = {}, {}
         incremental = []
         for input in inputs:
@@ -737,7 +737,7 @@ class Engine(Attempts, Sensors, Views):
                 pinned[param] = self._logical(output, pins[param]["ref"])
         fingerprint = self._fingerprint(asset, run, pinned)
         if full and run["mode"] == "full" and incremental:
-            # This run's reset began the pass every edge is on: resume it, page by page.
+            # This run's reset began the pass every input is on: resume it, batch by batch.
             started = [
                 (self.m.bookmark(task["asset"], e.param, partition) or {}).get("reset_by")
                 for e in incremental
@@ -780,7 +780,7 @@ class Engine(Attempts, Sensors, Views):
         # An Each asset whose keys all failed so far has no head yet: nothing to wait for.
         if skip and each_page is None and not planner.materialized(task["asset"], partition):
             skip = False
-        # A full run's write is the whole content. An Each page's is not: it
+        # A full run's write is the whole content. An Each batch's is not: it
         # patches by key, and a key that fails keeps its last good output (§5).
         reset = full and each_page is None
         cursor = None if reset else self.m.partition(task["asset"], partition).get("cursor")
@@ -839,7 +839,7 @@ class Engine(Attempts, Sensors, Views):
             "cursor": cursor,
             "fingerprint": fingerprint,
             "outputs": outputs,
-            # An Each page's failure delta, for cleaning up if it never commits.
+            # An Each batch's failure delta, for cleaning up if it never commits.
             "failures": None
             if each_page is None
             else {
@@ -850,7 +850,7 @@ class Engine(Attempts, Sensors, Views):
 
     def _prefixes(self, inputs: dict, outputs: dict, task: dict) -> list[str]:
         """What an attempt reads, as reader pins name it: the index prefix of
-        every output partition it reads or writes — a value's or a batch
+        every output partition it reads or writes — a value's or an unkeyed incremental
         output's too, whose data its partition's garbage names — and of any index
         its pins name (a failed keys). Collection elsewhere waits for no
         attempt that reads none of it."""
@@ -944,39 +944,39 @@ class Engine(Attempts, Sensors, Views):
     def _incremental_plan(
         self, task, param, input, ref, upstream_partition, fingerprint, run, full, claim_generation=None
     ):
-        """Plan one Incremental edge's page from its bookmark (`pass`):
+        """Plan one Incremental input's batch from its bookmark (`pass`):
         returns the pin for the spec, the plan its commit `advance`s the
         bookmark by, and whether nothing is pending.
 
         A pass under way goes on from its position. Otherwise one starts:
         `full` for a missing bookmark, a fingerprint change, a `full` run or a
-        keys='full' override; else a `delta` of the batches since `next`. A
+        keys='full' override; else a `delta` of the commits since `next`. A
         keyed upstream is read through its key index by the worker — a delta
         through the index's log, or the whole index if the log no longer holds
-        the window — `batch_size` keys at a time, and the worker reports where
-        the page ended (`after`). A batch upstream is planned here,
-        `batch_size` batches a page. A keyed edge whose patterns changed
+        the delta — `batch_size` keys at a time, and the worker reports where
+        the batch ended (`after`). An unkeyed upstream is planned here,
+        `batch_size` commits a batch. A keyed input whose patterns changed
         finishes its old changes up to a pattern change, then diffs membership
         (per-key §11)."""
 
         output = input["output"]
         keyed = self.manifest["outputs"][output].get("key") is not None
         limit = int(input.get("batch_size") or 100)
-        # The generation of the head a page is planned against. A pass that
-        # reads a fixed snapshot over its pages — a delta pass, a pattern change's
-        # diff, a range of batches — keeps the one it started at: what its
-        # pages read, and what lineage says they read (docs/versions.md §6).
+        # The generation of the head a batch is planned against. A pass that
+        # reads a fixed snapshot over its batches — a delta pass, a pattern change's
+        # diff, a range of commits — keeps the one it started at: what its
+        # batches read, and what lineage says they read (docs/versions.md §6).
         latest_generation = int(ref.get("generation") or 0)
         head = self.m.heads.get((output, upstream_partition)) or {}
         head_commit = latest = int(
             head.get("commit_number", -1)
-        )  # `latest`: the head this page is planned against
+        )  # `latest`: the head this batch is planned against
         override = (run.get("keys") or {}).get(output)
         wm = self.m.bookmark(task["asset"], param, task["partition"])
         if isinstance(override, dict) and "keys" in override:
             # A keys= selection reads the keys it names, whatever the bookmark — none
             # yet, a pass under way, a reset due — and moves neither it nor the
-            # partition's progress. The edge's patterns still decide which it takes (§11).
+            # partition's progress. The input's patterns still decide which it takes (§11).
             keys = sorted({str(k) for k in override["keys"]})
             pin = {"ref": ref, "batch": {"keys": keys, "full": False}}
             pin["index"] = self.m.index(output, upstream_partition).pinned().to_json()  # the keys' locators
@@ -986,9 +986,9 @@ class Engine(Attempts, Sensors, Views):
         first = int(head.get("base", 0))
         # A `full` run or a keys="full" override starts one pass per run, which the
         # run's later attempts resume (`pass` on the bookmark) instead of restarting;
-        # a batch upstream that started over since the edge last read it (its `base`
+        # an unkeyed upstream that started over since the input last read it (its `base`
         # past a pass's start, or at or past `next`: a reset always lands past the
-        # batches that existed) is delivered again in full.
+        # commits that existed) is delivered again in full.
         again = override == "full" and (wm or {}).get("reset_by") != run["id"]
         reset = full or wm is None or wm.get("fingerprint") != fingerprint or again
         if not reset and not keyed:
@@ -996,7 +996,7 @@ class Engine(Attempts, Sensors, Views):
             reset = int(under_way["from"]) < first if under_way else int(wm["next"]) <= first
         elif not reset and first:
             # A keyed upstream that moved store started its index over at `base`, the
-            # move's batch, whose delta holds only upserts: a pass begun at or
+            # move's commit, whose delta holds only upserts: a pass begun at or
             # before it — planned against the old index — starts over (F9).
             under_way = wm.get("pass") or {}
             start = under_way.get("from", wm.get("next"))
@@ -1014,21 +1014,21 @@ class Engine(Attempts, Sensors, Views):
             if current is None:
                 lo = first if reset else int(wm["next"])
                 mode = "full" if reset else "delta"
-                current = {"mode": mode, "from": lo, "to": head_commit, "at": lo, "page": 0}
-                current["pages"] = _pages(head_commit - lo + 1, limit)
+                current = {"mode": mode, "from": lo, "to": head_commit, "at": lo, "batch": 0}
+                current["batches"] = _batches(head_commit - lo + 1, limit)
                 current["generation"] = latest_generation
             lo = int(current["at"])
             hi = min(current["to"], lo + limit - 1)
-            changes = {
+            batch = {
                 "commits": [lo, hi],
                 "full": current["mode"] == "full",
                 "more": hi < current["to"],
-                "index": current["page"],
-                "count": current["pages"],
+                "index": current["batch"],
+                "count": current["batches"],
             }
             carried["next"] = current["from"] if reset else int(wm["next"])
             plan = {"kind": "commits", "bookmark": carried, "pass": current, "hi": hi, "head": latest}
-            return {"ref": {**ref, "generation": current["generation"]}, "batch": changes}, plan, hi < lo
+            return {"ref": {**ref, "generation": current["generation"]}, "batch": batch}, plan, hi < lo
 
         index = self.m.index(output, upstream_partition)
         patterns = input.get("patterns")
@@ -1036,7 +1036,7 @@ class Engine(Attempts, Sensors, Views):
         carried["patterns"] = patterns
         pattern_change = None if reset else wm.get("pattern_change")
         if not reset and pattern_change is None and wm.get("patterns") != patterns:
-            # The edge's patterns changed: cut over at the upstream's head (per-key §11).
+            # The input's patterns changed: cut over at the upstream's head (per-key §11).
             # Changes up to it finish under the old patterns, then membership is
             # diffed against the index as of the pattern change, pinned until the diff ends.
             pattern_change = {
@@ -1052,7 +1052,7 @@ class Engine(Attempts, Sensors, Views):
             if (current is None or current["mode"] == "diff") and carried["next"] > pattern_change["at"]:
                 if current is None:
                     count = IndexState.from_json(pattern_change["snapshot"]).count
-                    current = {"mode": "diff", "at": None, "page": 0, "pages": _pages(count, limit)}
+                    current = {"mode": "diff", "at": None, "batch": 0, "batches": _batches(count, limit)}
                 pin = {
                     "ref": {**ref, "generation": pattern_change["generation"]},
                     "index": pattern_change["snapshot"],
@@ -1060,8 +1060,8 @@ class Engine(Attempts, Sensors, Views):
                         "pattern_change": {"from": pattern_change["old"], "to": pattern_change["new"]},
                         "after": current["at"],
                         "limit": limit,
-                        "index": current["page"],
-                        "count": current["pages"],
+                        "index": current["batch"],
+                        "count": current["batches"],
                     },
                 }
                 if carried["patterns"] is None:
@@ -1073,7 +1073,7 @@ class Engine(Attempts, Sensors, Views):
         held = [o["name"] for o in self.manifest["assets"][task["asset"]]["outputs"]] + [f"@{task['asset']}"]
         empty = False
         if current is None and reset:
-            # A full pass of an Each edge ends with a cleanup of the keys it no
+            # A full pass of an Each input ends with a cleanup of the keys it no
             # longer names — needed only if the asset held keys when it began (§11).
             current = {"mode": "full", "from": head_commit + 1, "at": None}
             if each:
@@ -1089,7 +1089,7 @@ class Engine(Attempts, Sensors, Views):
             }
             empty = carried["next"] > head_commit
         if current["mode"] == "delta" and not index.covers(current["from"], current["to"]):
-            # The log no longer holds this window: deliver everything again. What it held
+            # The log no longer holds this delta: deliver everything again. What it held
             # — deletions, keys the patterns now leave out — the cleanup after finds (§11).
             current = {
                 "mode": "full",
@@ -1107,35 +1107,35 @@ class Engine(Attempts, Sensors, Views):
             carried["next"] = current["from"]
         whole = current["mode"] == "full"
         pinned = index.pinned() if whole else index.pinned(current["from"], current["to"])
-        if "page" not in current:
-            # Where each page sits in the pass (§5), planned when it starts: the keys
-            # in the whole index or in the window's delta files, by `batch_size` — an
+        if "batch" not in current:
+            # Where each batch sits in the pass (§5), planned when it starts: the keys
+            # in the whole index or in the delta's files, by `batch_size` — an
             # estimate when patterns filter or a count is inexact.
             keys = pinned.count if whole else sum(f.entries for _, files in pinned.log for f in files)
-            current = {**current, "page": 0, "pages": _pages(keys, limit)}
-            if not whole:  # a window paged over attempts holds its first page's reader pin
+            current = {**current, "batch": 0, "batches": _batches(keys, limit)}
+            if not whole:  # a delta pass over several attempts holds its first batch's reader pin
                 current["pin"] = claim_generation
-        window = {"full": whole, "from": current["from"], "after": current["at"]}
+        span = {"full": whole, "from": current["from"], "after": current["at"]}
         if not whole:
-            window["to"] = current["to"]
-        changes = {**window, "limit": limit, "index": current["page"], "count": current["pages"]}
+            span["to"] = current["to"]
+        batch = {**span, "limit": limit, "index": current["batch"], "count": current["batches"]}
         read = current["generation"] if not whole else latest_generation  # a full pass reads the head
-        pin = {"ref": {**ref, "generation": read}, "index": pinned.to_json(), "batch": changes}
+        pin = {"ref": {**ref, "generation": read}, "index": pinned.to_json(), "batch": batch}
         if carried["patterns"] is not None:
-            pin["patterns"] = carried["patterns"]  # the worker filters the page
+            pin["patterns"] = carried["patterns"]  # the worker filters the batch
         else:
             carried.pop("patterns")
         return pin, {"kind": "keys", "bookmark": carried, "pass": current, "head": latest}, empty
 
-    # -- Each pages (docs/per-key-processing.md §5, §9) ------------------------------
+    # -- Each batches (docs/per-key-processing.md §5, §9) ------------------------------
 
     def _forced_pos(self, record: dict) -> int:
         return max((record.get("forced") or {}).values(), default=0)
 
     def _has_retries(self, record: dict | None) -> bool:
         """Whether a partition's failure record has keys to retry now: a pass in
-        progress, a key due, a failed key not yet tried under this revision
-        epoch, or a forced request newer than the last pass completed. The
+        progress, a key due, a failed key not yet tried under this deploy,
+        or a forced request newer than the last pass completed. The
         bounds are conservative: a pass may find nothing, which makes them
         exact (§9)."""
 
@@ -1150,7 +1150,7 @@ class Engine(Attempts, Sensors, Views):
         )
 
     def _each_plan(self, task, asset, param, input, ref, upstream_partition, pin, plan, empty):
-        """An Each edge's page: the changes of its window, or the keys its
+        """An Each input's batch: the changes of its pass, or the keys its
         failed keys has due again. When both are pending they alternate —
         neither starves, and there is no fraction to tune (§9). A full
         pass reprocesses every key anyway, so retries wait for it."""
@@ -1163,7 +1163,7 @@ class Engine(Attempts, Sensors, Views):
         # After a full pass, the output's keys it no longer names go first (§11).
         reconcile = None if whole else (wm or {}).get("reconcile")
         # A full pass reprocesses every key, a pattern change and its cleanup
-        # decide which keys are the edge's: retries wait for them to end.
+        # decide which keys are the input's: retries wait for them to end.
         transition = whole or "pattern_change" in (plan or {}).get("bookmark", {}) or reconcile is not None
         retries = not transition and self._has_retries(record)
         if reconcile is not None:
@@ -1222,7 +1222,7 @@ class Engine(Attempts, Sensors, Views):
                 "each": each,
             }
             if (wm or {}).get("patterns") is not None:
-                pin["patterns"] = wm["patterns"]  # a due key the edge no longer takes goes
+                pin["patterns"] = wm["patterns"]  # a due key the input no longer takes goes
             plan = {
                 "kind": "held",
                 "bookmark": wm,
@@ -1230,19 +1230,19 @@ class Engine(Attempts, Sensors, Views):
             }
             return pin, plan, False
         pin = {**pin, "each": each}
-        page = {"kind": "changes", "retries": retries, "pass": retry}
-        plan = {**plan, "each": page}
+        batch = {"kind": "changes", "retries": retries, "pass": retry}
+        plan = {**plan, "each": batch}
         return pin, plan, empty
 
     def _each_commit(self, task, plan: dict, result: dict) -> tuple[dict, bool, dict | None]:
-        """What an Each page commits to its failure record, and whether the
-        task has more to do (§9): the outcome counts move by the page's
+        """What an Each batch commits to its failure record, and whether the
+        task has more to do (§9): the outcome counts move by the batch's
         transitions; the bounds are lowered by the records it wrote; a retry
-        page advances its pass and folds the range it walked into the pass's
+        batch advances its pass and folds the range it walked into the pass's
         accumulators, which become the exact bounds when the pass completes;
-        a change page folds what it wrote behind the pass's position; a
-        reconcile page moves the cleanup on. Returns the record's commit, the
-        `more`, and the bookmark a reconcile page leaves (else None)."""
+        a change batch folds what it wrote behind the pass's position; a
+        reconcile batch moves the cleanup on. Returns the record's commit, the
+        `more`, and the bookmark a reconcile batch leaves (else None)."""
 
         record = self.m.partition(task["asset"], task["partition"]).get("failures") or {}
         run = self.m.runs.get(task["run"]) or {}
@@ -1253,23 +1253,23 @@ class Engine(Attempts, Sensors, Views):
         counts = {k: v for k, v in counts.items() if v}
         due = lower(record.get("due"), report.get("due"))
         deploy_min = lower(record.get("deploy_min"), report.get("deploy_min"))
-        page = plan["each"]
+        batch = plan["each"]
         commit = {
             "keys": report.get("keys") or {"files": []},
             "commit_number": int(record.get("commit_number", -1)) + 1,
             "counts": counts,
-            "last": page["kind"],
+            "last": batch["kind"],
             # The configuration the partition runs under, for the runs retries start (§9).
             "config": run.get("config") or {},
         }
-        retry, more, bookmark = page.get("pass"), False, None
+        retry, more, bookmark = batch.get("pass"), False, None
         delivered = (result.get("delivered") or {}).get(plan.get("param") or "", {})
         # A forced request newer than the pass in progress, or than the last one done,
         # is owed a pass: this run takes it rather than waiting for unrelated activity.
         forced_after = self._forced_pos(record) > int(
             (retry or {}).get("forced_pos", record.get("done_forced") or 0)
         )
-        if page["kind"] == "reconcile":
+        if batch["kind"] == "reconcile":
             after = delivered.get("after")
             wm = dict(bookmarks.advance(plan))
             if after is None:
@@ -1277,8 +1277,8 @@ class Engine(Attempts, Sensors, Views):
             else:
                 wm["reconcile"] = {"after": after}
             bookmark = wm
-            more = after is not None or bool(page.get("changes")) or forced_after
-        elif page["kind"] == "retry":
+            more = after is not None or bool(batch.get("changes")) or forced_after
+        elif batch["kind"] == "retry":
             walked = report.get("range") or {}
             retry = {
                 **retry,
@@ -1289,7 +1289,7 @@ class Engine(Attempts, Sensors, Views):
             if after is None:  # the pass is complete: its accumulators are the exact bounds
                 due, deploy_min = retry["due_acc"], retry["deploy_acc"]
                 commit.update({"passes": retry["pass"], "done_forced": retry["forced_pos"], "retry": None})
-                more = bool(page.get("changes")) or forced_after
+                more = bool(batch.get("changes")) or forced_after
             else:
                 commit["retry"] = {**retry, "after": after}
                 more = True
@@ -1301,9 +1301,9 @@ class Engine(Attempts, Sensors, Views):
                     "due_acc": lower(retry.get("due_acc"), fold.get("due")),
                     "deploy_acc": lower(retry.get("deploy_acc"), fold.get("deploy_min")),
                 }
-            # Keys this page left due at once are retried in the same run.
+            # Keys this batch left due at once are retried in the same run.
             more = (
-                bool(page.get("retries"))
+                bool(batch.get("retries"))
                 or (report.get("due") is not None and report["due"] <= self.clock())
                 or forced_after
             )
@@ -1333,7 +1333,7 @@ class Engine(Attempts, Sensors, Views):
     def _fingerprint(self, asset, run, pinned):
         """H(version, store versions of input+output stores, run config,
         the non-Incremental inputs and deps, as `_logical` sees them) —
-        per-key interpretation state; a change resets the edge's bookmark
+        per-key interpretation state; a change resets the input's bookmark
         (§2.2, §6)."""
 
         stores = set()
@@ -1368,8 +1368,8 @@ class Engine(Attempts, Sensors, Views):
         retryable: bool = False,
         delay: float = 0.0,
     ) -> dict:
-        """Install an attempt's result: heads, cursor, edge bookmarks (§8).
-        A drained Each page commits as the attempt it ended as: `canceled`, or
+        """Install an attempt's result: heads, cursor, input bookmarks (§8).
+        A drained Each batch commits as the attempt it ended as: `canceled`, or
         `failed` (a timeout, retryable)."""
 
         from solera.sdk import UNSET
@@ -1380,7 +1380,7 @@ class Engine(Attempts, Sensors, Views):
         task = self.m.task(self.m.attempts[attempt])
         # Inputs may have moved since they were pinned: the attempt's output
         # derives from what it read (the spec records it), its bookmarks
-        # cover only the window it was given, and a moved input changes the
+        # cover only the batch it was given, and a moved input changes the
         # next attempt's fingerprint. Refusing here would only strand a write
         # a shared-table store has already made.
         # Output heads must be unchanged since the claim.
@@ -1390,7 +1390,7 @@ class Engine(Attempts, Sensors, Views):
         outputs = current_names(prepared, result.get("outputs") or {})
         # Settled under the contract it was launched with, not today's manifest.
         declared = {name: info["contract"] for name, info in (prepared.get("outputs") or {}).items()}
-        # Where each keyed Incremental page ended decides the next bookmark.
+        # Where each keyed Incremental batch ended decides the next bookmark.
         delivered = result.get("delivered") or {}
         marks, more = {}, bool(prepared.get("more"))
         failures = None
@@ -1404,9 +1404,9 @@ class Engine(Attempts, Sensors, Views):
                     marks[param] = reconciled
                     continue
             after = None
-            if plan["kind"] == "keys":  # a key page reports where it stopped
+            if plan["kind"] == "keys":  # a key batch reports where it stopped
                 if param not in delivered:
-                    raise Conflict(f"input {param}: the result reports no delivery", retryable=False)
+                    raise Conflict(f"input {param}: the result reports nothing delivered", retryable=False)
                 after = delivered[param].get("after")
             if (wm := bookmarks.advance(plan, after)) is not None:
                 marks[param] = wm
@@ -1435,8 +1435,8 @@ class Engine(Attempts, Sensors, Views):
                     if delta["files"] or moved(info):
                         head["commit_number"] = int(info["commit_number"])
                     keys[name] = {**delta, "commit_number": head["commit_number"]}
-                # A move starts the index over at its batch, as a reset starts a batch
-                # output over: no pass begun before it reads it as a delta (F9).
+                # A move starts the index over at its commit, as a reset starts an
+                # unkeyed output over: no pass begun before it reads it as a delta (F9).
                 if moved(info):
                     head["base"] = head["commit_number"]
                 elif (before or {}).get("base"):
@@ -1444,7 +1444,7 @@ class Engine(Attempts, Sensors, Views):
                 if "partitions" in info:
                     head["partitions"] = entry.get("partitions", info["partitions"])
             elif decl.get("incremental"):
-                if info["reset"]:  # starts over at its batch, whatever its content
+                if info["reset"]:  # starts over at its commit, whatever its content
                     head["commit_number"] = head["base"] = int(info["commit_number"])
                 elif before["ref"].get("generation") == ref.get("generation"):  # appended nothing
                     head["commit_number"], head["base"] = (
@@ -1455,14 +1455,14 @@ class Engine(Attempts, Sensors, Views):
                     head["commit_number"], head["base"] = int(info["commit_number"]), before.get("base", 0)
             heads[name] = head
         for name in set(declared) - set(outputs):
-            # An Each page whose keys all failed writes nothing, and makes no head yet;
-            # nor does a page whose keys the edge's patterns all left out.
+            # An Each batch whose keys all failed writes nothing, and makes no head yet;
+            # nor does a batch whose keys the input's patterns all left out.
             if prepared["outputs"][name]["head"] is None and failures is None and not result.get("skipped"):
                 raise Conflict(f"omitted output {name} has no head to keep (§2)", retryable=False)
         commit = {"heads": heads, "bookmarks": marks}
         if not bookmarks.selects(prepared.get("plans") or {}):
-            # Whether the pass is done is the partition's, not its outputs' — a last page
-            # may write none of them (§7) — and every edge's: one still delivering, its
+            # Whether the pass is done is the partition's, not its outputs' — a last batch
+            # may write none of them (§7) — and every input's: one still delivering, its
             # bookmark untouched by this attempt, keeps the partition from draining.
             after = [
                 marks.get(p) or self.m.bookmark(task["asset"], p, task["partition"])
@@ -1820,7 +1820,7 @@ class Engine(Attempts, Sensors, Views):
         if not any(
             e.get("each") for e in (self.manifest["assets"].get(asset) or {}).get("inputs", {}).values()
         ):
-            raise ValueError(f"{asset} has no Each edge: it keeps no failing keys")
+            raise ValueError(f"{asset} has no Each input: it keeps no failing keys")
         classes = sorted(set(NAMES.values()) if "all" in classes else set(classes))
         unknown = set(classes) - set(NAMES.values())
         if unknown or not classes:
@@ -1877,7 +1877,7 @@ class Engine(Attempts, Sensors, Views):
         self._fired(auto, run)
 
     def _fire_ondeploy(self, auto):
-        """§9: fire once for the served revision, then record it. A planning
+        """§9: fire once for the served deploy, then record it. A planning
         error leaves last_deploy unset so the next tick retries."""
 
         try:
@@ -1979,7 +1979,7 @@ class Engine(Attempts, Sensors, Views):
                 partitions.setdefault(task["asset"], []).append(task["partition"])
         if not partitions:
             raise Conflict(f"run {run_id} has nothing to retry", retryable=False)
-        # The request is the selected work's: key overrides only for the edges it reads.
+        # The request is the selected work's: key overrides only for the inputs it reads.
         read = {
             e["output"]
             for asset in partitions

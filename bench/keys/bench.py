@@ -444,7 +444,7 @@ async def steady(n, prefix, state, sample, opts, cold, with_grid=False) -> tuple
     after = key_of(sorted(current)[len(current) // 3])
     rows.append(
         await measure(
-            "steady: full-delivery page of 10K keys",
+            "steady: full-pass batch of 10K keys",
             io,
             lambda io=io: KeyIndex(io, prefix, st, opts).page(after, 10_000),
         )
@@ -601,7 +601,7 @@ async def _run_size(n: int, prefix: str, args) -> dict:
         after = key_of(sample[len(sample) // 3][0])
         rows.append(
             await measure(
-                "full-delivery page of 10K keys",
+                "full-pass batch of 10K keys",
                 io,
                 lambda io=io: KeyIndex(io, prefix, state, opts).page(after, 10_000),
             )

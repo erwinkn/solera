@@ -1,6 +1,6 @@
 """Versions are generations (docs/versions.md): the sequences its review
-asked for, end to end through the engine — provenance of a paged
-pass, a failure record kept in its entry across a restart, and repair
+asked for, end to end through the engine — provenance of a pass
+over several batches, a failure record kept in its entry across a restart, and repair
 by presence after a writer died."""
 
 from solera import Transient
@@ -13,9 +13,9 @@ from .test_fence import LiveStore
 
 
 async def test_a_paged_delta_window_says_the_generation_it_read(state):  # noqa: F811
-    """Review finding 3: a delta pass delivered over pages reads the index
-    as of its start. The upstream writes `b` again (g3) after the window's
-    first page; its second page reads `b` as of g2 — the object it was
+    """Review finding 3: a delta pass delivered over batches reads the index
+    as of its start. The upstream writes `b` again (g3) after the pass's
+    first batch; its second batch reads `b` as of g2 — the object it was
     pinned to — and lineage says g2, not the head's g3. The change then
     arrives as a delta of its own, read at g3."""
 
@@ -31,7 +31,7 @@ async def test_a_paged_delta_window_says_the_generation_it_read(state):  # noqa:
         changes = ctx.batch["items"]
         seen.append((changes.full, [(r["id"], r["v"]) for r in items]))
         if not changes.full and changes.first and not moved["done"]:
-            moved["done"] = True  # the upstream moves while the window is half delivered
+            moved["done"] = True  # the upstream moves while the pass is half delivered
             content["rows"] = [{"id": "b", "v": 3}]
             assert status_of(await drive(engine, await engine.submit(["items"]))) == "succeeded"
         return Patch(items, remove=list(changes.removed))
@@ -50,7 +50,7 @@ async def test_a_paged_delta_window_says_the_generation_it_read(state):  # noqa:
     assert seen == [(False, [("a", 2)]), (False, [("b", 2)]), (False, [("b", 3)])]
 
     made = (await engine.history.commits(outputs=["copy"]))["commits"]
-    pages = sorted(m["generation"] for m in made)[-3:]  # the three pages of the second run
+    pages = sorted(m["generation"] for m in made)[-3:]  # the three batches of the second run
     read = []
     for generation in pages:
         [edge] = (await engine.history.lineage("copy", "", generation))["edges"]

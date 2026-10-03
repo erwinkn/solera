@@ -121,10 +121,10 @@ committing is enough once a pool worker is running.
 uv run solera run site_feed --partitions all --upstream
 ```
 
-Each site partition writes a `site_events` incremental batch and a `site_files` keyed
+Each site partition writes a `site_events` incremental commit and a `site_files` keyed
 patch, and stores the feed's cursor as its cursor. **Runs** shows the run; click a
 task to see its attempt spec — `inputs.site_files` carries the pinned ref, the
-pinned key index and the window to read (a delta-log range, or the whole index
+pinned key index and the batch to read (a delta-log range, or the whole index
 for a first pass); the attempt's result records the keys it delivered.
 
 Run it again inside the same feed tick: the cursor is already there, the feed

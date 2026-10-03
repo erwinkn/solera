@@ -25,7 +25,7 @@ class Database:
 
     tables: dict[str, dict[str, list[tuple]]] = field(
         default_factory=dict
-    )  # table -> part -> [(k, batch, row)]
+    )  # table -> part -> [(k, commit, row)]
     fences: dict[tuple[str, str], tuple[int, str]] = field(default_factory=dict)
     locks: dict[tuple[str, str], asyncio.Lock] = field(default_factory=dict)
     commits: int = 0
@@ -108,7 +108,7 @@ class TableStore:
 
         def body(box):
             rows = box["rows"]
-            if out.key is None:  # an unkeyed incremental output: a batch of rows
+            if out.key is None:  # an unkeyed incremental output: the commit's rows
                 commit_number = list(write.rows)
                 if base is None:
                     rows.clear()

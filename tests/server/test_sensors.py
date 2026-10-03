@@ -535,7 +535,7 @@ def test_a_served_engine_keeps_its_own_sensor_host(tmp_path, monkeypatch):
 
 
 async def test_a_host_on_old_code_waits_then_starts_afresh(tmp_path):
-    """The engine serves another revision: the host takes no ticks, waits,
+    """The engine serves another deploy: the host takes no ticks, waits,
     and returns, for its process to start again with the code on disk."""
 
     project = feed_project()

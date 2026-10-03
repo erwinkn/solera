@@ -391,7 +391,7 @@ async def test_a_value_the_journal_cannot_hold_changes_nothing(state, clock):
 
 async def test_a_paged_task_keeps_no_list_of_its_pages(state, clock):
     """Engine review #6 (D4): a task paging through a backlog holds counts
-    and its last attempt, not one summary per page; every attempt's row is
+    and its last attempt, not one summary per batch; every attempt's row is
     in the history as it ends, and the run's detail lists them all."""
 
     from solera.stores import Patch
@@ -430,8 +430,8 @@ async def test_a_paged_task_keeps_no_list_of_its_pages(state, clock):
                 assert "attempts" not in task
                 sizes.append(len(json.dumps({k: v for k, v in task.items() if k != "launched"})))
         detail = await engine.run_detail(run["id"])
-        assert len(detail["attempts"][task_id]) == 6  # one page a key, all in the history
-    assert max(sizes) < min(sizes) + 400  # flat, however many pages
+        assert len(detail["attempts"][task_id]) == 6  # one batch a key, all in the history
+    assert max(sizes) < min(sizes) + 400  # flat, however many batches
 
 
 async def test_a_recount_meanwhile_does_not_refuse_a_commit(state, clock):
@@ -494,7 +494,7 @@ def test_a_rename_moves_a_scopes_record_whole():
     """§2, §5: a partition's cursor, outcome, completeness, bookmarks and
     failing keys are one record, and `aliases=` moves it as one. A name
     that already has a record keeps its own: two assets' states never mix.
-    A bookmark of an edge the project no longer declares goes."""
+    A bookmark of an input the project no longer declares goes."""
 
     wm = {"kind": "keys", "output": "feed", "upstream_partition": "", "next": 3}
     whole = {

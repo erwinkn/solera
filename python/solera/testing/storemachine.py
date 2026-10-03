@@ -25,13 +25,13 @@ the machine plays the engine for it:
 - **collection** (immutable stores). The names no committed index and no
   pinned reader references — superseded, abandoned, or never written —
   are cleaned up, twice over.
-- **batches.** An unkeyed incremental output appends engine-numbered
-  batches, retries one, starts over, and a stale writer rewrites one.
+- **commits.** An unkeyed incremental output appends engine-numbered
+  commits, retries one, starts over, and a stale writer rewrites one.
 
 After every step: the committed content reads back exactly (an immutable
 store through the index's keys; a fenced one whole, but for rows a dead
 writer left that the next commit settles); every pinned reader reads what
-it pinned; the batches read back whole and by range. Unlike the scenarios,
+it pinned; the commits read back whole and by range. Unlike the scenarios,
 a step here assumes no particular store: what it expects follows from the
 kind."""
 
@@ -68,8 +68,10 @@ class Pin:
 class CommitModel:
     head: Ref | None = None
     commit_number: int = -1  # the last committed
-    rows: dict[int, list[tuple[str, str]]] = field(default_factory=dict)  # committed batches
-    last: tuple | None = None  # (write, prior, generation, batch, reset): the last call, to retry
+    rows: dict[int, list[tuple[str, str]]] = field(
+        default_factory=dict
+    )  # the committed rows, by commit number
+    last: tuple | None = None  # (write, prior, generation, commit, reset): the last call, to retry
 
 
 def stateful(make_harness: Callable[[], Harness]):
@@ -214,11 +216,11 @@ def stateful(make_harness: Callable[[], Harness]):
             acquire and to write, once the attempt holds the partition."""
 
             twin = Attempt(self.current.generation, self.current.worker_id + "-twin")
-            with _refused("a duplicate invocation's acquire"):
+            with _refused("a duplicate worker's acquire"):
                 self.run(self.store.acquire(self._context(twin), self.head))
             rows = [{"id": "a", "v": "0"}]
             keyed, _, _, _ = self._resolve("patch", rows, [])
-            with _refused("a duplicate invocation's write"):
+            with _refused("a duplicate worker's write"):
                 self.run(self.store.store(keyed, self.head, self._context(twin)))
 
         # -- readers and collection ---------------------------------------------------
@@ -268,11 +270,11 @@ def stateful(make_harness: Callable[[], Harness]):
             if got != want:
                 raise AssertionError(f"a by-key load gave {got}; the index holds {want}")
 
-        # -- batches --------------------------------------------------------------------
+        # -- commits --------------------------------------------------------------------
 
         @rule(n=st.integers(1, 3), retried=st.booleans(), reset=st.booleans())
         def append(self, n, retried, reset):
-            """The next batch of an unkeyed incremental output: appended, or
+            """The next commit of an unkeyed incremental output: appended, or
             (reset) starting the output over; maybe sent twice."""
 
             if self.commits_out is None:
@@ -300,9 +302,9 @@ def stateful(make_harness: Callable[[], Harness]):
         @precondition(lambda self: self.commits.last is not None)
         @rule()
         def stale_commit(self):
-            """An attempt the engine gave up on rewrites the last batch with
-            other rows; then the next batch is written as usual. A fenced
-            store refuses the stale write; an immutable one keeps, per batch,
+            """An attempt the engine gave up on rewrites the last commit with
+            other rows; then the next commit is written as usual. A fenced
+            store refuses the stale write; an immutable one keeps, per commit,
             what the highest generation wrote."""
 
             model = self.commits
@@ -339,19 +341,19 @@ def stateful(make_harness: Callable[[], Harness]):
                     raise AssertionError(f"a pinned reader reads {got}; it pinned {want}")
 
         @invariant()
-        def batches_read_back(self):
+        def commits_read_back(self):
             model = self.commits
             if model.head is None:
                 return
             want = sorted(p for rows in model.rows.values() for p in rows)
             got = self._rows(model.head, None)
             if got != want:
-                raise AssertionError(f"the batches read {got}; committed were {want}")
+                raise AssertionError(f"the commits read {got}; committed were {want}")
             lo = min(model.rows)
             for b in (lo, model.commit_number):
                 got = self._rows(model.head, Commits(b, b))
                 if got != model.rows[b]:
-                    raise AssertionError(f"batch {b} reads {got}; committed was {model.rows[b]}")
+                    raise AssertionError(f"commit {b} reads {got}; committed was {model.rows[b]}")
 
         # -- helpers ----------------------------------------------------------------------
 

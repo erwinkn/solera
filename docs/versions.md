@@ -142,8 +142,8 @@ refuses values its database would round: Postgres may coerce a data
 column, and declared columns are the user's contract. **A key is the one
 exception**: a stored key's canonical text must equal the indexed key,
 or the write fails (`key '1.0' would be stored as another key in column
-id`). PostgresStore checks it after each keyed page, by counting the
-page's distinct `key::text`; nothing is hashed. *Edge case:* an index
+id`). PostgresStore checks it after each chunk of a keyed write, by counting
+the chunk's distinct `key::text`; nothing is hashed. *Edge case:* an index
 listing `1.0` over a row stored as `1` would hand every reader a key the
 store cannot find. Kind inference for a table a write creates stays: it
 types columns, it does not version them.
@@ -201,10 +201,10 @@ Lineage records **the generation read**, per input partition:
   snapshot (`reads()`);
 - `uncommitted` when no commit of the partition has that generation;
   *Edge case:* a reader saw a dead attempt's write;
-- a fixed paged pass (a delta pass, a pattern change) records the
+- a fixed pass over several batches (a delta pass, a pattern change) records the
   generation the pass was cut at, persisted with the pass, not
-  the head's when a later page is read. *Edge case:* a window cut at g2
-  whose second page is read after g3 committed read g2's content;
+  the head's when a later batch is read. *Edge case:* a delta pass cut at g2
+  whose second batch is read after g3 committed read g2's content;
 - an external source, read current with no fence, records the generation
   of the tick the attempt was pinned to. No new marker: external
   sources are read current by definition.
@@ -227,9 +227,9 @@ lineage:  B ← A, generation 12                    (g12 committed)
 | Case | What happens | Holds |
 |---|---|---|
 | A rewrites `k` while B reads it | Immutable: B reads the pinned object, then `k` again with A's delta. Fenced: B may read A's new rows and records generation 12; A's commit, or the repair of its dead attempt, puts `k` in a delta B receives later, and B rereads | yes |
-| Identical rewrites | Every key rewritten is a change; consumers reprocess. A whole input rewritten identically changes its ref's generation, so it resets its consumers' incremental edges (the fingerprint holds input refs): a full redelivery | accepted |
+| Identical rewrites | Every key rewritten is a change; consumers reprocess. A whole input rewritten identically changes its ref's generation, so it resets its consumers' incremental inputs (the fingerprint holds input refs): a full redelivery | accepted |
 | `version=` bump | The fingerprint changes, the asset's inputs reset, every key is reprocessed and written at a new generation, so consumers reprocess too. (Revision outputs used to hide this; they are gone.) A cursor producer with no inputs reprocesses nothing, as today | yes |
-| Deploys | The epoch moves; only failed `Each` keys get their one try, and those that succeed are written at a new generation | yes |
+| Deploys | The deploy number moves; only failed `Each` keys get their one try, and those that succeed are written at a new generation | yes |
 | Retries | A new attempt has a new generation; an uncommitted attempt's delta files and objects are cleaned up. A store call retried inside one attempt rewrites the same names with the same bytes | yes |
 | `Each` full redelivery (truncated log, reset) | Every key is processed and written again; its consumers reprocess everything | accepted |
 | Pattern change | Newly matched keys are delivered at their generation; unmatched ones removed | yes |
@@ -316,7 +316,7 @@ One implementation worker, in this order, merged when `tests/` and
    upstream `generation`); the simulation's invariants.
 
 Tests for the review's four sequences, `tests/server/test_versions.py`
-and `test_lineage_reads.py`: a paged delta pass's lineage across a
+and `test_lineage_reads.py`: a delta pass's lineage across batches and a
 later commit; a failure record across an engine restart with a skewed
 clock; repair keeping or dropping a dead writer's key; an external
 table's lineage at its tick. Postgres key identity:

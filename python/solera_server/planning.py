@@ -164,7 +164,7 @@ def select_partitions(
 
 
 class UpstreamOnly(ValueError):
-    """An edge reads an upstream dimension its consumer lacks without
+    """An input reads an upstream dimension its consumer lacks without
     AllPartitions (§7)."""
 
 
@@ -182,7 +182,7 @@ def check_tags(tags) -> dict[str, str]:
     return dict(sorted(tags.items()))
 
 
-COLLAPSING = frozenset({"all_partitions", "dep"})  # edge kinds that may read across free dimensions
+COLLAPSING = frozenset({"all_partitions", "dep"})  # input kinds that may read across free dimensions
 
 
 @dataclass(frozen=True)
@@ -192,7 +192,7 @@ class Input:
     fingerprint). Of the owner's dimensions `dims`, the consumer shares
     `pinned` — at its partition's keys — and lacks `free`. A fan-in (an
     `AllPartitions` or a dep with free dimensions) reads the heads that
-    exist across them; any other edge reads its one projected `partition`."""
+    exist across them; any other input reads its one projected `partition`."""
 
     param: str
     kind: str
@@ -264,7 +264,7 @@ class Planner:
 
     def materialized(self, asset: str, partition: str) -> bool:
         """Whether a partition is complete (§7): each of its outputs has a head,
-        and its pass drained — however many of them its last pages wrote.
+        and its pass drained — however many of them its last batches wrote.
         A job, which has no output, once a run of it succeeded. The one answer
         for selection, fan-in and the views."""
 
@@ -356,11 +356,11 @@ class Planner:
             what=f"a change reaching {target}",
         )
 
-    # -- edges -------------------------------------------------------------------
+    # -- inputs -------------------------------------------------------------------
 
     def inputs(self, asset: str, partition: str) -> list[Input]:
         """What (asset, partition) reads: its inputs, its deps, then the partition
-        sets its dimensions are bound to. An edge that is no fan-in may not
+        sets its dimensions are bound to. An input that is no fan-in may not
         lack an upstream dimension (`UpstreamOnly`)."""
 
         info = self.manifest["assets"][asset]
@@ -413,7 +413,7 @@ class Planner:
         return {s: h for s, h in heads.items() if not materialized or self.head_materialized(input.output, s)}
 
     def spread(self, input: Input) -> list[str]:
-        """Every upstream partition an edge could read: for a fan-in, the domain
+        """Every upstream partition an input could read: for a fan-in, the domain
         across its free dimensions, enumerated — only to build upstream work,
         and bounded by `MAX_SCOPES`."""
 
@@ -535,7 +535,7 @@ class Planner:
             }
             unknown = set(keys) - incremental_outputs
             if unknown:
-                raise ValueError(f"keys= names no Incremental edge: {sorted(unknown)}")
+                raise ValueError(f"keys= names no Incremental input: {sorted(unknown)}")
             for output, override in keys.items():
                 if not isinstance(override, dict):
                     continue
@@ -597,7 +597,7 @@ class Planner:
         }
 
     def _order(self, tasks: dict, assets: Mapping[str, set[str]]) -> None:
-        """A task waits for the run's tasks it reads: the one partition an edge
+        """A task waits for the run's tasks it reads: the one partition an input
         projects to, looked up; or — a fan-in — the owner's partitions in this run
         that agree with its shared keys, grouped by them once per owner and
         set of shared dimensions. Linear in tasks plus links."""

@@ -78,7 +78,7 @@ class CountingStore(FileStore):
 async def test_every_write_is_a_change_and_an_empty_patch_none(state):
     """docs/versions.md §1: writing a key changes it — the same rows written
     again are a new version, at the attempt's generation — while a patch
-    of nothing is never stored, and the head, its batch and its count stay."""
+    of nothing is never stored, and the head, its commit number and its count stay."""
 
     store = CountingStore()
     rows = {"v": [{"id": "a", "v": 1}, {"id": "b", "v": 1}]}
@@ -325,7 +325,7 @@ def test_a_recount_stays_inexact_if_a_later_commit_was():
 
 
 async def test_a_consumer_without_a_log_starts_over(state):
-    """§6: a bookmark whose window the log no longer holds gets a full pass."""
+    """§6: a bookmark whose delta the log no longer holds gets a full pass."""
 
     @asset(outputs=Output("items", key="id"))
     def items():
@@ -469,7 +469,7 @@ async def test_renamed_asset_keeps_its_state(state):
 async def test_small_writes_resolve_in_the_engine_and_pages_come_with_start(state, monkeypatch):
     """docs/resolved-commits.md §4, §7: once the engine's cache holds an index,
     a small patch's delta comes from the engine — the worker reads no index
-    file — and a consumer's pending page comes with its start reply."""
+    file — and a consumer's pending batch comes with its start reply."""
 
     from solera.keys.io import ObjectIO as IO
 
@@ -526,16 +526,16 @@ async def test_small_writes_resolve_in_the_engine_and_pages_come_with_start(stat
         monkeypatch.setattr(IO, "read", real_read)
         assert seen == await _stored(engine, state)
     assert set(answers[-3:]) == {"delta"}  # warm: the engine answers
-    assert served[-3:] == [True] * 3  # and the consumer's pages come with its start
+    assert served[-3:] == [True] * 3  # and the consumer's batches come with its start
     assert not [p for p in reads if p.endswith(".kx")]  # so nothing reads an index file
     await engine.keys.stop()
 
 
 async def test_input_reads_come_from_the_engine_once_warm(state, monkeypatch):
     """docs/resolved-commits.md §7: once the engine's cache holds an index, a
-    consumer's pages — a full pass, delta passes — come with its start
+    consumer's batches — a full pass, delta passes — come with its start
     reply, and its worker reads no index file to find
-    them; what it delivers is what the store's pages would have."""
+    them; what it delivers is what the store's batches would have."""
 
     from solera.keys.io import ObjectIO as IO
 
@@ -590,7 +590,7 @@ async def test_input_reads_come_from_the_engine_once_warm(state, monkeypatch):
         truth = await _stored(engine, state)
         assert seen["mirror"] == truth
     assert seen["copy"] == truth
-    assert not [p for p in index_reads if p.endswith(".kx")]  # every page came with its start
+    assert not [p for p in index_reads if p.endswith(".kx")]  # every batch came with its start
     await engine.keys.stop()
 
 

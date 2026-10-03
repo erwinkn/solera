@@ -89,7 +89,7 @@ def test_input_names_unknown_output():
 
 
 def test_upstream_only_dimension_requires_all_partitions():
-    """§7/§11: an edge with upstream-only dimensions needs AllPartitions."""
+    """§7/§11: an input with upstream-only dimensions needs AllPartitions."""
 
     upstream_partitions = StaticPartitions(["a", "b"])
 
@@ -106,7 +106,7 @@ def test_upstream_only_dimension_requires_all_partitions():
 
 
 def test_incremental_rejects_upstream_only_dimensions():
-    """§11: an Incremental edge cannot have upstream-only dimensions."""
+    """§11: an Incremental input cannot have upstream-only dimensions."""
 
     upstream_partitions = StaticPartitions(["a", "b"])
 
@@ -123,7 +123,7 @@ def test_incremental_rejects_upstream_only_dimensions():
 
 
 def test_incremental_rejects_ref_annotation():
-    """§11: an Incremental edge cannot be ref-annotated."""
+    """§11: an Incremental input cannot be ref-annotated."""
 
     @asset(outputs=Output("up", key="id"))
     def up():
@@ -138,7 +138,7 @@ def test_incremental_rejects_ref_annotation():
 
 
 def test_incremental_requires_incremental_upstream():
-    """§11: an Incremental edge's upstream output must be incremental."""
+    """§11: an Incremental input's upstream output must be incremental."""
 
     @asset
     def up():
@@ -153,7 +153,7 @@ def test_incremental_requires_incremental_upstream():
 
 
 def test_incremental_requires_selection_capable_store():
-    """§11: the upstream store must serve the edge's selection type."""
+    """§11: the upstream store must serve the input's selection type."""
 
     class NoSelection(FileStore):
         def can_load(self, t, selection):

@@ -228,5 +228,5 @@ async def commit_rows(engine, project, output: str, partition: str = "") -> list
         return await store.load(ref, list[dict], None)
     except Exception as error:
         raise Violation(
-            f"{output}[{partition!r}]: its batches cannot be read: {type(error).__name__}: {error}"
+            f"{output}[{partition!r}]: its commits cannot be read: {type(error).__name__}: {error}"
         ) from error

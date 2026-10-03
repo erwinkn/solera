@@ -1,5 +1,5 @@
 """The project's build identity (docs/per-key-processing.md §13): what the
-project revision says about the code, beyond the manifest.
+deploy says about the code, beyond the manifest.
 
 In order:
 
@@ -116,8 +116,8 @@ METHODS = {
 
 
 def method_note(served: dict | None, reported: dict | None) -> str | None:
-    """Why two revisions differ when it is the method, not the code: the
-    engine serves a revision computed one way and a worker or sensor worker
+    """Why two deploys differ when it is the method, not the code: the
+    engine serves a deploy computed one way and a worker or sensor worker
     computed its own another way — a build with `.git` against an image
     without it — so they never agree. `None` when the methods match."""
 
@@ -125,7 +125,7 @@ def method_note(served: dict | None, reported: dict | None) -> str | None:
     if not a or not b or a == b:
         return None
     return (
-        f"the engine's revision comes from {METHODS.get(a, a)}, this host's from {METHODS.get(b, b)}: "
+        f"the engine's deploy comes from {METHODS.get(a, a)}, this host's from {METHODS.get(b, b)}: "
         "they will never match — set SOLERA_BUILD (e.g. the git commit) wherever the project is "
         "registered and wherever workers and sensor hosts import it"
     )

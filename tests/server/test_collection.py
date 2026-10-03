@@ -159,7 +159,7 @@ async def test_compaction_garbage_is_collected(tmp_path, data):
 
 async def test_a_reader_pin_holds_collection_back(tmp_path):
     """Cleanup is due only once every reader pin has passed it: the
-    claims of attempts in flight, and a delta pass paged over attempts."""
+    claims of attempts in flight, and a delta pass in batches over attempts."""
 
     @asset(outputs=Output("scores", keyed=True))
     def scores():
@@ -180,7 +180,7 @@ async def test_a_reader_pin_holds_collection_back(tmp_path):
             "output": "scores",
             "upstream_partition": "",
             "next": 0,
-            "pass": {"mode": "delta", "from": 0, "to": 1, "at": "k", "page": 1, "pages": 2, "pin": 8},
+            "pass": {"mode": "delta", "from": 0, "to": 1, "at": "k", "batch": 1, "batches": 2, "pin": 8},
         }
     }
     assert engine._due_cleanups("scores", "", "me") == []

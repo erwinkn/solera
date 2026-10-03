@@ -81,7 +81,7 @@ project = Project(assets=[feed, consumer])
 
 
 async def test_revision_mismatch_writes_failed_result(state, tmp_path):
-    """§10: a spec pinned to a different revision fails as a result, not a crash."""
+    """§10: a spec pinned to a different deploy fails as a result, not a crash."""
     entrypoint = write_project(
         tmp_path,
         """
@@ -96,7 +96,7 @@ project = Project(assets=[job])
     )
     engine = make_engine(state, entrypoint, heartbeat_seconds=30)
     await engine.initialize()
-    # Rewrite the project so the subprocess computes a different revision.
+    # Rewrite the project so the subprocess computes a different deploy.
     (tmp_path / "proj.py").write_text(
         """
 from solera.sdk import Project, asset
@@ -112,7 +112,7 @@ project = Project(assets=[job])
     assert detail["request"]["status"] == "failed"
     attempt = detail["attempts"][detail["tasks"][0]["id"]][0]["id"]
     result = await state.attempt_result(detail["request"]["id"], attempt)
-    assert result["status"] == "failed" and "revision mismatch" in result["error"]["message"]
+    assert result["status"] == "failed" and "deploy mismatch" in result["error"]["message"]
 
 
 async def test_killed_harness_retries(state, tmp_path, monkeypatch):
@@ -195,10 +195,10 @@ class MigStore(FileStore):
             m.payload(None, "")
         return [m.name for m in migrations]
 
-    async def store(self, write, prior, scope):
+    async def store(self, write, prior, context):
         with open(os.environ["MIGRATE_LOG"], "a") as f:
             f.write("store\\n")
-        return await super().store(write, prior, scope)
+        return await super().store(write, prior, context)
 
 @asset(outputs=Output("migrated", store="mig",
                       migrations=[Migration("m1", lambda objects, prefix: None)]))

@@ -56,7 +56,7 @@ class Keys:
 
 @dataclass(frozen=True)
 class Commits:
-    """An inclusive `[lo, hi]` batch-range selection passed to `store.load`
+    """An inclusive `[lo, hi]` commit-range selection passed to `store.load`
     on an unkeyed incremental output (§2.2)."""
 
     lo: int
@@ -65,10 +65,10 @@ class Commits:
 
 @dataclass(frozen=True)
 class WriteContext:
-    """A write partition (§9): `batch` is the engine-assigned batch number for
+    """A write partition (§9): `commit_number` is the engine-assigned commit number for
     incremental outputs, `attempt` the writing attempt's id. `reset` says the write starts the content over
     (a full run): `prior` still says where the content is, but nothing of
-    it is kept — a store's batches start over at `batch`. What a keyed write
+    it is kept — a store's commits start over at `commit_number`. What a keyed write
     changes is the write's own (`KeyedWrite`)."""
 
     output: Output

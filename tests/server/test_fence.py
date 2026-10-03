@@ -331,9 +331,9 @@ async def test_a_cancel_waits_for_a_worker_that_is_writing(tmp_path):
     await state.close()
 
 
-async def test_a_drain_that_outlives_its_grace_is_forced_and_uncertain(tmp_path):
+async def test_a_drain_that_outlives_its_grace_is_forced_and_still_writing(tmp_path):
     """A worker that took the gate and does not finish within the grace is
-    forced: its gate is found `writing`, so its writes are uncertain (§2.3)
+    forced: its gate is found `writing`, so its write is `writing` (§2.3)
     and its intents stay owing a repair for the next attempt to repair."""
 
     state = await State.open(tmp_path.as_uri(), "test", flush_interval=0.001)

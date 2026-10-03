@@ -340,9 +340,9 @@ function Heads({
                     {head.materialized ? (
                       <StatusBadge status="materialized" />
                     ) : (
-                      <Tooltip content="An incremental delivery is still paging: more attempts will complete this head.">
+                      <Tooltip content="An incremental pass is still under way: more attempts will complete this head.">
                         <span>
-                          <StatusBadge status="paging" text="incomplete" />
+                          <StatusBadge status="delta" text="incomplete" />
                         </span>
                       </Tooltip>
                     )}

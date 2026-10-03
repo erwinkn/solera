@@ -16,7 +16,7 @@ connection but runs on, it paused (GC, a VM migration), a request it sent
 is still queued at the backend, or it was started twice. Meanwhile its
 retry W2 commits. If W1's late write lands, the store holds something the
 engine never committed — a key regressed to older rows, a deleted key
-back, a batch replaced.
+back, a commit replaced.
 
 Waiting longer only makes that less likely. So every store guarantees it
 cannot happen, in one of two ways — its **kind**:
@@ -102,7 +102,7 @@ last wrote it: only those keys) or `Commits(lo, hi)`. An immutable store
 needs `Keys` to find a keyed output's objects, which it names by those
 generations. With `Keys`, `t` may be `dict[str, T]`
 (`solera.stores.by_key_type(t)` is `T`): each key's rows on their own, as
-`T` — how `Each` reads a page — and a key with no rows absent, since it
+`T` — how `Each` reads a batch — and a key with no rows absent, since it
 does not exist. `can_load` says which `t` a store loads, by key or not;
 say only what `load` does.
 
@@ -126,8 +126,8 @@ keys it meant to change landed), and so does the reconciliation of a
 
 **Errors.** Raise `WriteError` for a malformed write (duplicate keys, a
 wrong shape), `StoreError` for anything else the store refuses. A store
-call that raises after the attempt began writing leaves its writes
-*uncertain*: the next attempt repairs them (fenced stores keep the
+call that raises after the attempt began writing leaves its write
+`writing`: the next attempt repairs them (fenced stores keep the
 attempt's intents for that).
 
 ## Values a store takes
@@ -308,7 +308,7 @@ parse; only a function the query calls could still write, and
 `sql_read_only=True` reads the query in a READ ONLY transaction, which no
 function can turn back (a `SET ROLE` can: a function may `RESET ROLE`).
 
-Write a keyed output page by page: for `reset`, clear the partition first;
+Write a keyed output chunk by chunk: for `reset`, clear the partition first;
 then for each of `write.chunks()`, delete its keys and insert their rows
 (or `MERGE`); then delete `removes`. `keys(ref, among)` is a `SELECT
 DISTINCT` of the key column over the partition, through a server-side cursor. A complete
@@ -345,7 +345,7 @@ after a newer attempt took over.
 ### Append-only sinks
 
 A sink that can only append (a log, a stream) is immutable when each
-record carries `(batch, generation)` and readers keep, per batch, the
+record carries `(commit, generation)` and readers keep, per commit, the
 highest generation: an abandoned attempt's records are then never read.
 
 ## Scenarios
@@ -360,7 +360,7 @@ the exact outcome. (`gN` is generation N; content is `{key: v}`, a row
 | all | a patch changes only its keys | g1 writes {a:1, b:1, d:1}; g2 patches b:2, c:1, removes a | b:2, c:1, d:1 |
 | all | an empty replacement holds no key | g1 writes {a:1}; g2 replaces with zero rows | nothing |
 | all | a write repeated by its attempt lands once | g4 writes {a:1, b:1}; g4 (same worker) writes it again | same ref; a:1, b:1 |
-| all | batches append and load by range | g1 appends commit 3 {a}; g2 commit 4 {b} | whole: a, b; `Commits(4, 4)`: b |
+| all | commits append and load by range | g1 appends commit 3 {a}; g2 commit 4 {b} | whole: a, b; `Commits(4, 4)`: b |
 | all | a replacement resolved writes its keys and removes the rest | g1 writes {a:1, b:1, c:1}; g2 replaces with {a:1, b:2}, resolved against the index | a and b at g2; c removed; a:1, b:2 |
 | immutable | a pinned read returns its version | g5 writes {a:1}, pin; g9 writes {a:2} | the pin reads a:1; the new ref a:2 |
 | immutable | cleaning up never takes what is read | g5 writes {a:1}; g7 writes b (never committed); g9 writes {a:2}; clean up a@g5, b@g7 and a name never written, twice | the new ref reads a:2 |
@@ -399,7 +399,7 @@ async def test_my_store_conforms(worker, scenario):
 `output(**decl)` must return a fresh output on your store each call
 (scenarios never share data), accepting the declarations the scenarios use:
 `key="id"` (rows `{"id", "v"}` keyed by `id`),
-`incremental=True` (batches of rows), or none. The scenarios drive the
+`incremental=True` (commits of rows), or none. The scenarios drive the
 store as the engine does — keyed writes as `KeyedWrite`s resolved against a
 key index the kit keeps, keyed loads through `Keys` — and raise
 `AssertionError` with the scenario's expectation when the store answers

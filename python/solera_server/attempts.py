@@ -65,7 +65,7 @@ def cleanup_report(body) -> dict:
     it deleted (`discarded_files`)."""
 
     if not isinstance(body, dict) or not isinstance(body.get("partition"), str):
-        raise ValueError("a discard report names its partition")
+        raise ValueError("a cleanup report names its partition")
     out = {"partition": body["partition"]}
     for name in ("cleaned_up", "cleanup_unresolved"):
         value = body.get(name)
@@ -685,7 +685,7 @@ class Attempts:
             return
         status = result.get("status")
         if status == "canceled" and "failures" in result:
-            # A drained Each page (docs/lifecycle.md §7): what finished commits, as one
+            # A drained Each batch (docs/lifecycle.md §7): what finished commits, as one
             # decision with its interrupted keys and its bookmark.
             reason = (result.get("cancel") or {}).get("reason") or "user"
             user = reason == "user"
@@ -891,7 +891,7 @@ class Attempts:
             with contextlib.suppress(Exception):
                 await self.state.delete_objects(await self.state.list_objects(prefix))
         failures = prepared.get("failures")
-        if failures is not None:  # an Each page's failure delta (docs/per-key-processing.md §9)
+        if failures is not None:  # an Each batch's failure delta (docs/per-key-processing.md §9)
             prefix = f"{failures['prefix']}{int(failures['commit_number']):012d}-{attempt}"
             self._authority()
             with contextlib.suppress(Exception):

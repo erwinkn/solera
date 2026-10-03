@@ -61,8 +61,8 @@ add(
     30,
     lambda: commit(100_000_000, 1_000_000),
     extra=lambda: (
-        full_delivery(100_000_000, 100_000)["usd"],
-        "+ one full delivery to a new consumer (100K pages)",
+        full_pass(100_000_000, 100_000)["usd"],
+        "+ one full pass to a new consumer (batches of 100K keys)",
     ),
 )
 add(

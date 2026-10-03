@@ -78,8 +78,8 @@ async def served_reads(n, state, cache, sample, window, opts, cold) -> list[dict
     lo, hi = window
     pinned = state.pinned(lo, hi)
     calls = [
-        ("full delivery: first page, 10K keys", state, lambda ix: ix.page(None, 10_000)),
-        ("full delivery: a page of 100K keys, mid-index", state, lambda ix: ix.page(middle, 100_000)),
+        ("full pass: first batch, 10K keys", state, lambda ix: ix.page(None, 10_000)),
+        ("full pass: a batch of 100K keys, mid-index", state, lambda ix: ix.page(middle, 100_000)),
         (
             f"change window of {hi - lo + 1} commits (100K entries): a page of 50K",
             pinned,

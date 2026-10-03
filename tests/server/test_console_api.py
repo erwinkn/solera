@@ -1,5 +1,5 @@
 """The console's read models over the API (§8, §10): asset rollups, an Each
-asset's failing keys, key outcomes, explain, edges with their bookmarks,
+asset's failing keys, key outcomes, explain, inputs with their bookmarks,
 holds, and when schedules next fire."""
 
 import json
@@ -127,7 +127,7 @@ async def test_assets_status_rolls_up_every_asset(world):
     assert parse["partitioned"] is False and parse["failures"] == {"rejected": 1, "failed": 1}
     assert parse["last"]["outcome"] == "succeeded" and parse["last"]["attempt"].count("/") == 1
     assert parse["repairs"] == 0 and parse["updated_at"]
-    assert status["files"]["failures"] is None  # no Each edge
+    assert status["files"]["failures"] is None  # no Each input
     consume = status["consume"]
     assert consume["partitioned"] and consume["partitions"]["total"] == 2
     assert (consume["partitions"]["materialized"], consume["partitions"]["missing"]) == (1, 1)
@@ -182,7 +182,7 @@ async def test_failures_list_page_and_filter(world, monkeypatch):
     assert [k["key"] for k in rest["keys"]] == ["bug.csv"] and rest["next"] is None
     monkeypatch.undo()
 
-    assert (await client.get(f"{base}/assets/files/failed-keys")).status_code == 400  # no Each edge
+    assert (await client.get(f"{base}/assets/files/failed-keys")).status_code == 400  # no Each input
     assert (
         await client.get(f"{base}/assets/parse/failed-keys", params={"outcome": "odd"})
     ).status_code == 400
@@ -279,7 +279,7 @@ async def test_explain_says_why_a_key_is_or_is_not_there(world):
         f"{base}/assets/parse/explain", params={"key": "a.csv", "partition": "x"}
     )
     assert bad_partition.status_code == 404
-    await run(engine, ["parted"], partitions=["y"])  # a plain Incremental edge never delivered
+    await run(engine, ["parted"], partitions=["y"])  # a plain Incremental input never delivered
     consume = await client.get(f"{base}/assets/consume/explain", params={"key": "k1", "partition": "y"})
     assert consume.json()["verdict"] == "pending" and consume.json()["input_state"] == "never"
     assert consume.json()["last"] is None and consume.json()["outputs"] == {}

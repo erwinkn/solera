@@ -240,10 +240,10 @@ def file_index(ctx, site_files: list[dict]):
 
 
 # ---------------------------------------------------------------------------
-# Per-file processing: an Each edge runs one call per changed file, four at a
+# Per-file processing: an Each input runs one call per changed file, four at a
 # time; every file's rows go to the store in one write per page, and a file
 # that raises is kept in the asset's failed keys, per key, while the others
-# commit (docs/per-key-processing.md §5, §9). The edge's patterns leave each
+# commit (docs/per-key-processing.md §5, §9). The input's patterns leave each
 # site's third file — a draft — out entirely (§11).
 # ---------------------------------------------------------------------------
 
@@ -267,7 +267,7 @@ class Unreadable(Rejected):
 async def file_checks(ctx, file: list[dict]):
     """One changed file: a row per check. The fourth file of a site is
     unreadable on odd feed ticks — watch it come and go as a rejected key.
-    The third is a draft: excluded by the edge, never called (`explain` says
+    The third is a draft: excluded by the input, never called (`explain` says
     which rule)."""
     [row] = file
     if row["file_id"].endswith("-file-3") and int(row["version"].lstrip("t")) % 2:
@@ -416,7 +416,7 @@ def weekly_digest(ctx, fleet_index: list, mailer: Mailer):
 
 @job(automations=Automation(trigger=OnDeploy()))
 def deploy_notice(ctx):
-    """§9: fires once per served project revision — watch it run on boot."""
+    """§9: fires once per served deploy — watch it run on boot."""
 
     ctx.log("project deployed", run=ctx.run_id)
 

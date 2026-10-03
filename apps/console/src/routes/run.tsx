@@ -701,7 +701,7 @@ function SpecTab({ run, attempt }: { run: string; attempt: Attempt }) {
                     {plural(Object.keys(pin.refs).length, "partition")} (all partitions)
                   </span>
                 )}
-                {pin.batch && <span className="text-fg-subtle">{windowOf(pin.batch)}</span>}
+                {pin.batch && <span className="text-fg-subtle">{describeBatch(pin.batch)}</span>}
               </li>
             ))}
           </ul>
@@ -712,21 +712,21 @@ function SpecTab({ run, attempt }: { run: string; attempt: Attempt }) {
   );
 }
 
-/** What an incremental pin delivers, in the spec's own terms: pages of keys, or a commit range. */
-function windowOf(changes: Record<string, Json>): string {
-  const page =
-    typeof changes.index === "number"
-      ? `batch ${changes.index + 1}${typeof changes.count === "number" ? ` of ${changes.count}` : ""}`
+/** What an incremental pin delivers, in the spec's own terms: batches of keys, or a commit range. */
+function describeBatch(batch: Record<string, Json>): string {
+  const position =
+    typeof batch.index === "number"
+      ? `batch ${batch.index + 1}${typeof batch.count === "number" ? ` of ${batch.count}` : ""}`
       : null;
   const parts: string[] = [];
-  if (changes.full) parts.push("full pass");
-  else if (changes.retry) parts.push("retry page");
-  else if (changes.reconcile) parts.push("cleanup page");
-  else if (changes.keys) parts.push("explicit keys");
-  else if (Array.isArray(changes.commits)) parts.push(`commits ${changes.commits.join("–")}`);
-  else if (changes.from !== undefined) parts.push(`commits ${String(changes.from)}–${String(changes.to)}`);
-  if (page) parts.push(page);
-  if (typeof changes.limit === "number") parts.push(`${changes.limit} keys a batch`);
+  if (batch.full) parts.push("full pass");
+  else if (batch.retry) parts.push("retry batch");
+  else if (batch.reconcile) parts.push("cleanup batch");
+  else if (batch.keys) parts.push("explicit keys");
+  else if (Array.isArray(batch.commits)) parts.push(`commits ${batch.commits.join("–")}`);
+  else if (batch.from !== undefined) parts.push(`commits ${String(batch.from)}–${String(batch.to)}`);
+  if (position) parts.push(position);
+  if (typeof batch.limit === "number") parts.push(`${batch.limit} keys a batch`);
   return parts.join(" · ");
 }
 

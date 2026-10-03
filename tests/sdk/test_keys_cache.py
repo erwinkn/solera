@@ -1056,8 +1056,8 @@ async def test_a_page_reads_one_entry_past_itself(io, tmp_path):
     with cache.held(state) as pin:
         reads = Reads(recording=True, max_entries=10**6, max_bytes=2**24)
         spec_pin = {"index": state.to_json(), "batch": {"full": True, "after": None, "limit": 100}}
-        window = await each.read_window(spec_pin, ObjectIO(None, local=pin.handles, served=reads))
-    assert len(window.upserted) == 100 and window.after is not None
+        read = await each.read_batch(spec_pin, ObjectIO(None, local=pin.handles, served=reads))
+    assert len(read.upserted) == 100 and read.after is not None
     assert reads.entries == 101
 
 

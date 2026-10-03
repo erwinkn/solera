@@ -1,4 +1,4 @@
-"""Key patterns on edges (docs/per-key-processing.md §11)."""
+"""Key patterns on inputs (docs/per-key-processing.md §11)."""
 
 import pytest
 from hypothesis import given, settings

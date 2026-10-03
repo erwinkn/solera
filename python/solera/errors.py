@@ -81,7 +81,7 @@ def seconds(value: float | int | str) -> float:
 
 def describe(errors: Mapping[type, type]) -> list[list]:
     """The error policy as the manifest records it, so that changing it changes
-    the project revision: `[raised, class, retry_for]` per mapping entry, by
+    the deploy: `[raised, class, retry_for]` per mapping entry, by
     qualified name, with the transient budget a mapped class carries."""
 
     def name(t: type) -> str:

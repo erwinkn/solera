@@ -148,16 +148,18 @@ def initial_load(n):
     }
 
 
-def full_delivery(n, page):
-    """A consumer re-reads everything in pages of `page` keys, one attempt per page (cold)."""
-    pages = math.ceil(n / page)
-    # A page covers a narrow key range: per level, one or two files overlap it (their footer + block
-    # index, then the blocks covering the page); the small level-0 files are read whole.
-    per_level = 2 + max(1, math.ceil(page * E_ZIP / RANGE))  # consecutive blocks: one range read
-    per_page_gets = 2 * per_level + L0_MAX / 2 if size(n) > WHOLE else math.ceil(size(n) / RANGE) + L0_MAX / 2
-    gets = pages * (per_page_gets + ATTEMPT_GET)
-    puts = pages * (ATTEMPT_PUT + JOURNAL_PUT)
-    return {"pages": pages, "gets": gets, "puts": puts, "usd": gets * GET + puts * PUT}
+def full_pass(n, batch):
+    """A consumer re-reads everything in batches of `batch` keys, one attempt per batch (cold)."""
+    batches = math.ceil(n / batch)
+    # A batch covers a narrow key range: per level, one or two files overlap it (their footer + block
+    # index, then the blocks covering the batch); the small level-0 files are read whole.
+    per_level = 2 + max(1, math.ceil(batch * E_ZIP / RANGE))  # consecutive blocks: one range read
+    per_batch_gets = (
+        2 * per_level + L0_MAX / 2 if size(n) > WHOLE else math.ceil(size(n) / RANGE) + L0_MAX / 2
+    )
+    gets = batches * (per_batch_gets + ATTEMPT_GET)
+    puts = batches * (ATTEMPT_PUT + JOURNAL_PUT)
+    return {"batches": batches, "gets": gets, "puts": puts, "usd": gets * GET + puts * PUT}
 
 
 def storage(n):

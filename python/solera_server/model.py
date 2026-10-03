@@ -191,7 +191,7 @@ class Model:
         # (asset, partition) -> the partition's record (§5): its `cursor`; `last`, its last
         # terminal outcome; `drained`, whether its last commit finished the pass
         # it was on — its completeness, whatever its outputs wrote; `bookmarks`
-        # {edge: Bookmark}; and an Each asset's `failures` record
+        # {input: Bookmark}; and an Each asset's `failures` record
         # (docs/per-key-processing.md §9), whose index lives in `indexes` under
         # ("@asset", partition). A rename moves it, retirement trims it: one record.
         self.partitions = Grouped(_flatten(snap.get("partitions"), 2))
@@ -281,7 +281,7 @@ class Model:
 
     @staticmethod
     def _consumed_outputs(manifest) -> set[str]:
-        """Outputs some asset reads through an Incremental edge: only their
+        """Outputs some asset reads through an Incremental input: only their
         indexes keep a delta log (§6)."""
 
         return {
@@ -321,7 +321,7 @@ class Model:
         return (self.partition(asset, partition).get("bookmarks") or {}).get(input)
 
     def bookmarks(self):
-        """Every Incremental edge's bookmark, of every partition."""
+        """Every Incremental input's bookmark, of every partition."""
 
         for record in self.partitions.values():
             yield from (record.get("bookmarks") or {}).values()
@@ -608,7 +608,7 @@ class Model:
         self._finished(run, task, "canceled", None, at)
 
     def _subscribed(self, asset: str, input: str, wm: dict) -> bool:
-        """Whether the project still declares the Incremental edge a
+        """Whether the project still declares the Incremental input a
         bookmark keeps the pass of: the same asset, parameter and
         upstream output."""
 
@@ -616,7 +616,7 @@ class Model:
         return spec.get("kind") == "incremental" and spec.get("output") == wm.get("output")
 
     def _unsubscribe(self, asset: str | None = None, partition: str | None = None) -> None:
-        """Retire the pass obligations of edges the project no longer
+        """Retire the pass obligations of inputs the project no longer
         declares (a removed consumer, a renamed parameter, another
         upstream): their bookmarks, which would keep the upstream's delta
         log and pin its files for good. A partition with an attempt in flight
@@ -836,7 +836,7 @@ class Model:
         if task is None:
             return None
         self._release_claim(task["id"], e["attempt"])
-        self._unsubscribe(task["asset"], task["partition"])  # what it read under an edge since removed
+        self._unsubscribe(task["asset"], task["partition"])  # what it read under an input since removed
         outcome, at = e["outcome"], e["finished_at"]
         prepared, execution = {}, {}
         launched = task.get("launched")
@@ -880,7 +880,7 @@ class Model:
             summary["keys"] = e["keys"]
         self._tried(run, task, summary)
         if commit and outcome in ("canceled", "failed"):
-            # A drained Each page: what finished commits (docs/lifecycle.md §7).
+            # A drained Each batch: what finished commits (docs/lifecycle.md §7).
             self._install(task, commit, e, prepared)
         if task["status"] in TERMINAL_TASK:
             # Its run was canceled while it ran. An attempt that was already
@@ -914,7 +914,7 @@ class Model:
                 task["status"] = "failed"
                 self._finished(run, task, "failed", e["attempt"], at)
         elif outcome == "canceled" and commit:
-            task["status"] = "canceled"  # a drained page the user stopped: it does not resume
+            task["status"] = "canceled"  # a drained batch the user stopped: it does not resume
             self._finished(run, task, "canceled", e["attempt"], at)
         elif outcome == "canceled":
             self._ready(run, task, at)
@@ -925,7 +925,7 @@ class Model:
     def _tried(self, run: dict, task: dict, summary: dict) -> None:
         """An ended attempt: its row goes to the history now, and its task
         keeps only what scheduling and the task's own row need — however
-        many pages a task runs, it holds no list of them."""
+        many batches a task runs, it holds no list of them."""
 
         task["tries"] = task.get("tries", 0) + 1
         outcomes = task.setdefault("outcomes", {})
@@ -1003,7 +1003,7 @@ class Model:
             else:
                 record["cursor"] = commit["cursor"]
         for input, wm in commit.get("bookmarks", {}).items():
-            if self._subscribed(asset, input, wm):  # an edge removed while it ran keeps no pass
+            if self._subscribed(asset, input, wm):  # an input removed while it ran keeps no pass
                 record.setdefault("bookmarks", {})[input] = wm
         if "failures" in commit:
             self._failures(asset, partition, commit["failures"])
@@ -1039,7 +1039,7 @@ class Model:
         self._pend_onchange(asset, partition, changed)
 
     def _failures(self, asset: str, partition: str, f: dict) -> None:
-        """An Each page's commit to its failure record: the failed keys's
+        """An Each batch's commit to its failure record: the failed keys's
         delta, and the counts, bounds and retry-pass state the engine worked
         out from it (docs/per-key-processing.md §9)."""
 
@@ -1082,7 +1082,7 @@ class Model:
     def _ready(self, run: dict, task: dict, at: float, delay: float = 0.0) -> None:
         """Queue a task to run from `at + delay`: its wait starts then,
         unless its run is paused. A task whose asset left the project while
-        its attempt ran — a retry, a next page — is retired instead."""
+        its attempt ran — a retry, a next batch — is retired instead."""
 
         if self.manifest is not None and task["asset"] not in self.manifest["assets"]:
             self._retire(run, task, at)
@@ -1218,7 +1218,7 @@ class Model:
         """What a commit on an immutable store let go of: each changed key's
         predecessor (named in its delta files, under `prefix`), a value's
         previous object, or — when an append output starts over — its
-        earlier batches."""
+        earlier commits."""
 
         if keys and keys.get("files"):
             prefix = prefix or self.index(output, partition).prefix

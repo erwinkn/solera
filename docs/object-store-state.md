@@ -253,9 +253,9 @@ State
 |---|---|---|
 | `Head` | `ref` (from the store), `run`, `attempt` (may point at a deleted run), `commit_number` (incremental outputs: the last commit that changed it, −1 before any), `base` (the first batch after the last reset of an unkeyed incremental output, or a keyed output's move to another store, which starts its index over), `count` (keyed: live keys), `elements?` (dynamic partitions and set dimensions), `complete`, `version` (declared asset version), `asset`, `at` | outputs × partitions |
 | `PartitionRecord` | `cursor?` (json), `last?` (`Outcome`: its last terminal result), `drained?` (whether its last commit finished the pass it was on — the partition's completeness, whatever its outputs wrote), `bookmarks?` {input: `Bookmark`}, `failures?` (`Failures`: an Each asset's failing keys, per-key-processing.md §9). Registration moves it whole under a rename and drops the bookmarks of inputs the project no longer declares. | assets × partitions |
-| `Failures` | `batch` (the failed keys's last batch), `counts` {outcome: keys}, `due` and `epoch_min` (lower bounds), `retry?` {`pass`, `epoch`, `forced_pos`, `after`, `due_acc`, `epoch_acc`}, `passes`, `done_forced`, `last` (`changes` or `retry`), `forced` {class: position} — its index is `indexes["@asset"][partition]` (per-key-processing.md §9) | Each assets × partitions |
+| `Failures` | `commit_number` (the record's last commit), `counts` {outcome: keys}, `due` and `deploy_min` (lower bounds), `retry?` {`pass`, `deploy`, `forced_pos`, `after`, `due_acc`, `deploy_acc`}, `passes`, `done_forced`, `last` (`changes` or `retry`), `forced` {class: position} — its index is `indexes["@asset"][partition]` (per-key-processing.md §9) | Each assets × partitions |
 | `KeyIndex` | `prefix` (where its files live — kept across renames), `count`, `inexact` (commits since the last recount whose count came from filters; the count is exact at 0), `files` [{`name`, `level`, `min`, `max`, `entries`, `size`, `tail`, `index`}], `log` [[`batch`, [file]], …] — see §6 | a few dozen files per index |
-| `Bookmark` | `kind` (`keys` or `commits`), `next` (the first upstream commit not yet delivered), `pass` (one under way: its `mode` — `full`, `delta`, or a pattern change's `diff` — its boundary `from`..`to`, its position `at` — the last key delivered, or the next batch — its `page` of `pages`, a delta pass's reader `pin`; a full keyed pass's `from` is the head's commit number + 1 when it began, so changes made meanwhile arrive afterwards as deltas), `fingerprint`, `output` and `up` (the upstream index it reads), and per-key `patterns`, `pattern change`, `reconcile` (`python/solera_server/bookmarks.py`) | edges × partitions |
+| `Bookmark` | `kind` (`keys` or `commits`), `next` (the first upstream commit not yet delivered), `pass` (one under way: its `mode` — `full`, `delta`, or a pattern change's `diff` — its boundary `from`..`to`, its position `at` — the last key delivered, or the next batch — its `page` of `pages`, a delta pass's reader `pin`; a full keyed pass's `from` is the head's commit number + 1 when it began, so changes made meanwhile arrive afterwards as deltas), `fingerprint`, `output` and `up` (the upstream index it reads), and per-key `patterns`, `pattern change`, `reconcile` (`python/solera_server/bookmarks.py`) | inputs × partitions |
 | `Outcome` | `outcome`, `run`, `attempt`, `at` | assets × partitions |
 | `AutomationState` | `enabled`, `last_fired`, `last_run`, `last_revision`, `pending` (set of `[asset, partition]` for OnChange) | automations × partitions |
 | `Run` | `id`, `request` {targets, partitions, mode, config, keys, automation, tags}, `status`, `paused`, `created_at`, `events` (how many it has recorded), `tasks` {task: `Task`} | in-flight work |
@@ -366,8 +366,8 @@ Deltas themselves are always exact; only the count is approximate.
 offered to the engine over the attempt's channel: it answers from a cache
 of the index files on its local disk — exact, no requests — or declines,
 and the worker resolves the write itself as below. The same cache answers
-an attempt's input reads — its pages of a full pass or a pending
-window — with its `start` reply, so a consumer reads no index file when
+an attempt's input reads — its batches of a full pass or of a
+delta — with its `start` reply, so a consumer reads no index file when
 the index is warm.
 
 **Read strategy** (`resolved-commits.md` §6). A patch whose run holds
@@ -416,7 +416,7 @@ None)`), and the replacement streams them, so nothing is sorted or held.
 | Deliver pending deltas | worker, for an `Incremental` input | Read the `log` files from the bookmark to the head; chunk by `batch_size` in key order; ask the upstream store for those rows with `Keys(…)`. |
 | Full pass | worker | Page through the merged view of all levels from `after`, `batch_size` keys at a time, and ask the store for them with `Keys(…)`. Per level, only the files covering the page are opened, and only their index parts are read — or the whole file, once, when it is small (below one request's latency worth of transfer, ~2.4 MB). A multi-page scan keeps each file's last fetched blocks for the next page, so it reads every block once. |
 | Compaction | the engine's machine by default (§6, *Engine work*) | Once level 0 holds ~8 files, merge them into one level-0 file — or, once level 0 holds a tenth of level 1's bytes, into level 1 with the level-1 files it overlaps (all of them, for random keys). A level over its target pushes one file down, merging it with the files it overlaps there. A merge streams, a few segments per input and one output file at a time. Commit with `IndexCompacted`. Each merge into a level rewrites about ten times the bytes it brings: ~20–30× over an entry's life with random keys (`bench/keys/amplification.py`). |
-| Truncate the log | engine | Drop `log` entries below the lowest consumer bookmark and below every window an in-flight attempt was given (`IndexTruncated`); an output with no `Incremental` consumers keeps none. A consumer whose window the log no longer holds gets a full pass. |
+| Truncate the log | engine | Drop `log` entries below the lowest consumer bookmark and below every delta an in-flight attempt was given (`IndexTruncated`); an output with no `Incremental` consumers keeps none. A consumer whose delta the log no longer holds gets a full pass. |
 | Delete files | engine | A file in neither `files` nor `log` joins `garbage`, and is deleted once every attempt that could have pinned it has finished (`FilesCleanedUp`): every attempt claimed before the event that let go of it. Both are positions in event order (`applied`), the same in every engine that replays the journal — never wall clocks, which two engines may disagree on. A delta file of an attempt that never committed is deleted when the attempt ends, unless it is an repair intent (§8). |
 
 Writes that never pass through the worker as rows — `Sql` materialized
@@ -443,7 +443,7 @@ never stale. The one cache of them is the engine's (`resolved-commits.md`
 §5): it answers small writes from local copies before a worker reads
 anything, and answers attempts' input reads at `start`. Workers keep
 no cache: what they read — a write the engine declines or that is too big
-for it, a full pass's pages, `Each`'s lookups — comes from the store
+for it, a full pass's batches, `Each`'s lookups — comes from the store
 (the costs are in `bench/keys/results.md`, "Without a worker cache").
 
 **Implementation.** The file format is ours (no Parquet). The per-key
@@ -564,7 +564,7 @@ retried. Retries inside a running task are its attempts.
 
 **Where rows come from.** Rows are born inside `apply`, from the events
 that finish things: `AttemptFinished` yields the attempt's `attempts` row
-(a task paging through a backlog holds counts, not one summary per page);
+(a task working through a backlog holds counts, not one summary per batch);
 `RunArchived` yields a run's `runs` and `tasks` rows; `AttemptFinished`
 with a commit also yields a
 `commits` row per changed output, plus `lineage` rows from the
@@ -660,7 +660,7 @@ count of a keyed output, else the length of a returned list.
 | an asset's versions and their metadata | `GET /assets/{name}/history?output=&partition=&before=` | |
 | what a version was built from, or what was built from it | `GET /outputs/{name}/lineage?partition=&generation=&direction=upstream\|downstream&depth=5` | each edge's `from` is what was read: its `generation` and the writer's `run`, `attempt` and `at`. Flag: `uncommitted` (`{attempt, run}`: a write no attempt committed). `detail` keeps the pin (`pinned_generation`) for debugging |
 | every asset at a glance: partitions by status, newest outcome, failing keys, partitions owing a repair | `GET /assets:status` → `{assets: {name: {partitions, partitioned, last, failures, owing a repair, updated_at}}}` | |
-| an `Each` asset's failing keys, and each partition's failure record | `GET /assets/{name}/failures?partition=&outcome=&after=&limit=100` → `{partitions, keys, epoch, now, next}` | |
+| an `Each` asset's failing keys, and each partition's failure record | `GET /assets/{name}/failed-keys?partition=&outcome=&after=&limit=100` → `{partitions, keys, deploy, now, next}` | |
 | what an `Each` asset's keys came to, newest first | `GET /assets/{name}/key-outcomes?partition=&key=&q=&outcome=&run=&before=&limit=100` → `{outcomes, next}` | |
 | why a key is, or is not, in an asset's output (per-key-processing.md §10) | `GET /assets/{name}/explain?key=&partition=&input=` → `{verdict, patterns, failure, last, last_ok, …}` | |
 | an asset's input inputs, with every partition's bookmark, lag and state | `GET /assets/{name}/inputs` | |
@@ -761,8 +761,8 @@ of the keys it will change; finding one already there — `aborted` or
 `closed` — it writes nothing. The engine ending an attempt without a
 result creates it `aborted`, and what it finds is the attempt's
 write-completion evidence: winning means `none`; finding `writing` means
-`uncertain`. A result says its own: `none` (no store call), `complete`
-(every store call returned) or `uncertain` (one raised, or was
+`writing`. A result says its own: `none` (no store call), `complete`
+(every store call returned) or `writing` (one raised, or was
 abandoned). An attempt that ends with nothing written and no gate gets one
 `closed`.
 

@@ -1,4 +1,4 @@
-"""`Each` edges (docs/per-key-processing.md §5–§10): one call per key, by-key
+"""`Each` inputs (docs/per-key-processing.md §5–§10): one call per key, by-key
 writes, the failed keys, retry passes, forced retries, key outcomes."""
 
 import asyncio
@@ -195,7 +195,7 @@ async def test_failed_keys_get_one_try_per_deploy(state):  # noqa: F811
     assert tries["n"] == 1
     detail = await drive(engine, await engine.submit(["parse"]))
     assert tries["n"] == 1 and task_statuses(detail)["parse"] == "skipped"
-    # A new revision: one more try, and only one.
+    # A new deploy: one more try, and only one.
     manifest = {**engine.manifest, "deploy": "next"}
     engine.state.record({"type": "ProjectRegistered", "deploy": "next", "manifest": manifest, "at": 0.0})
     await drive(engine, await engine.submit(["parse"]))
@@ -259,14 +259,14 @@ async def test_abort_fails_the_attempt_and_commits_nothing(state):  # noqa: F811
 
 async def test_concurrency_and_batches(state):  # noqa: F811
     live = {"now": 0, "max": 0}
-    pages = []
+    batches = []
 
     async def parse(ctx, file: dict):
         live["now"] += 1
         live["max"] = max(live["max"], live["now"])
         await asyncio.sleep(0.02)
         live["now"] -= 1
-        pages.append(ctx.attempt if hasattr(ctx, "attempt") else ctx.run_id)
+        batches.append(ctx.attempt if hasattr(ctx, "attempt") else ctx.run_id)
         return [{"value": file["n"]}]
 
     project = files_project({f"k{i}": {"n": i} for i in range(7)}, parse, batch_size=3, concurrency=2)
@@ -327,7 +327,7 @@ def test_registration():
 async def test_a_user_cancel_commits_finished_keys_and_leaves_the_rest_dormant(tmp_path):
     """Cancel requested: no key starts, the calls in flight are cancelled, the
     keys that finished commit with the interrupted ones' records and the
-    bookmark past the whole page (§5); canceled keys never come due by
+    bookmark past the whole batch (§5); canceled keys never come due by
     themselves (§9)."""
 
     from solera.failed_keys import CANCELED
@@ -364,7 +364,7 @@ async def test_a_user_cancel_commits_finished_keys_and_leaves_the_rest_dormant(t
     assert set(await rows_of(engine, project, "rows")) == {"a"}
     found = await records(engine, "parse")
     assert {k: r.outcome for k, r in found.items()} == {"b": CANCELED, "c": CANCELED}
-    assert "pass" not in engine.m.bookmark("parse", "file", "")  # past the whole page
+    assert "pass" not in engine.m.bookmark("parse", "file", "")  # past the whole batch
     # Dormant: a later run finds nothing to do.
     release.set()
     detail = await engine.run_until((await engine.submit(["parse"]))["id"], 10)
@@ -380,8 +380,8 @@ async def test_a_user_cancel_commits_finished_keys_and_leaves_the_rest_dormant(t
 
 
 async def test_a_retry_pass_spans_pages_and_accumulates_its_bounds(state):  # noqa: F811
-    """Retry pages walk the failed keys `batch_size` keys at a time,
-    alternating with change pages; the pass's accumulators become the exact
+    """Retry batches walk the failed keys `batch_size` keys at a time,
+    alternating with change batches; the pass's accumulators become the exact
     bounds when it completes (§9)."""
 
     content = {f"k{i}": {"n": i} for i in range(5)}
@@ -501,12 +501,12 @@ async def test_patterns_select_keys_and_a_page_of_none_is_skipped(state):  # noq
     await engine.initialize()
     await drive(engine, await engine.submit(["parse"], upstream=True))
     assert seen == ["ICP/a.csv"] and set(await rows_of(engine, project, "samples")) == {"ICP/a.csv"}
-    # A change the patterns leave out: the page is read, nothing is called, the task skips.
+    # A change the patterns leave out: the batch is read, nothing is called, the task skips.
     content["XRF/c.csv"] = {"n": 4}
     detail = await drive(engine, await engine.submit(["parse"], upstream=True))
     assert seen == ["ICP/a.csv"] and task_statuses(detail)["parse"] == "skipped"
 
-    # The same on a plain Incremental edge.
+    # The same on a plain Incremental input.
     @asset(outputs=Output("files2", keyed=True))
     def files2():
         return Patch({k: content[k] for k in written2.pop("keys", content)})
@@ -601,7 +601,7 @@ async def test_a_rescope_pins_its_snapshot_between_attempts(state):  # noqa: F81
             "upstream_partition": "",
             "next": 3,
             "pattern_change": {"pin": engine.m.event_counter, "at": 2},
-            "pass": {"mode": "diff", "at": "k", "page": 1, "pages": 2},
+            "pass": {"mode": "diff", "at": "k", "batch": 1, "batches": 2},
         }
     }
     await engine.upkeep.collect()
@@ -645,10 +645,10 @@ async def test_none_is_no_change_and_removal_is_explicit(state):  # noqa: F811
 
 
 async def test_a_last_page_that_writes_nothing_still_completes_the_scope(state):  # noqa: F811
-    """Review round 3 (system B1): one key a page, `a` writes rows, `b`
-    fails — so the last page writes no output. The pass drained all the
+    """Review round 3 (system B1): one key a batch, `a` writes rows, `b`
+    fails — so the last batch writes no output. The pass drained all the
     same: the partition is complete, kept out of `missing`, and its head is
-    unchanged — the version and provenance `a`'s page installed."""
+    unchanged — the version and provenance `a`'s batch installed."""
 
     def parse(ctx, file: dict):
         if ctx.key == "b.csv":
@@ -662,7 +662,7 @@ async def test_a_last_page_that_writes_nothing_still_completes_the_scope(state):
     assert status_of(detail) == "succeeded"
     written = engine.m.heads[("samples", "")]
     task = next(t for t in detail["tasks"] if t["asset"] == "parse")
-    assert written["attempt"] == detail["attempts"][task["id"]][0]["id"]  # a's page wrote it
+    assert written["attempt"] == detail["attempts"][task["id"]][0]["id"]  # a's batch wrote it
     assert engine.m.partition("parse", "")["caught_up"] is True
     planner = engine.planner()
     assert planner.materialized("parse", "") and planner.partitions("parse", "missing") == []

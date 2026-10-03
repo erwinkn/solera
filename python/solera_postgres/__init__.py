@@ -397,7 +397,7 @@ class PostgresStore:
     async def store(self, write, prior: Ref | None, context: WriteContext) -> Written:
         """The write, in one transaction on a thread of its own: the worker's
         event loop goes on meanwhile. Canceled, the transaction still ends as
-        it would have — under its fence, and counted as uncertain until then."""
+        it would have — under its fence, and counted as `writing` until then."""
 
         import psycopg
 
@@ -468,9 +468,9 @@ class PostgresStore:
         self._insert(cur, output, table, rows, self._stamps(output, context))
 
     def _apply_commit(self, cur, output, write: Patch, context, table, slice_where, prior, commit_number):
-        """An unkeyed incremental output's batch: its rows stamped with the
-        batch columns, in place of this batch's (a retry's) — or, with no
-        prior (a first write, or a reset), of every batch."""
+        """An unkeyed incremental output's commit: its rows stamped with the
+        commit columns, in place of this commit's (a retry's) — or, with no
+        prior (a first write, or a reset), of every commit."""
 
         if not output.incremental:
             raise WriteError(f"{output.name}: Patch requires an incremental output")

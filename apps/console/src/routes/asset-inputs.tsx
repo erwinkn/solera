@@ -39,13 +39,13 @@ const KIND: Record<Input["kind"], { name: string; means: string }> = {
 };
 
 const STATE_HINT: Record<InputState, string> = {
-  never: "Nothing delivered yet: the first delivery is the whole head.",
+  never: "Nothing delivered yet: the first pass reads the whole head.",
   caught_up: "Every commit delivered.",
-  behind: "Batches committed upstream wait to be delivered.",
-  paging: "A window is being delivered over several attempts.",
-  full: "A full delivery (a reset or a full run) is in progress.",
+  behind: "Commits upstream wait to be delivered.",
+  delta: "A delta pass is being delivered over several attempts.",
+  full: "A full pass (a reset or a full run) is under way.",
   pattern_change: "The input's patterns changed: finishing old deltas, then diffing membership.",
-  reconcile: "After a full delivery: removing keys the upstream no longer names.",
+  reconcile: "After a full pass: removing keys the upstream no longer names.",
 };
 
 export function AssetInputs() {
@@ -122,7 +122,7 @@ function EdgeCard({ input, partition }: { input: Input; partition?: string }) {
             <thead>
               <tr>
                 <Th>Partition</Th>
-                <Th>Delivery</Th>
+                <Th>Pass</Th>
                 <Th className="text-right">Delivered to</Th>
                 <Th className="text-right">Upstream head</Th>
                 <Th>Lag</Th>
@@ -150,7 +150,7 @@ function PartitionRow({ s }: { s: InputPartition }) {
   const d = wm?.pass;
   const at =
     typeof d?.at === "string" ? `after ${d.at}` : typeof d?.at === "number" ? `commit ${count(d.at)}` : null;
-  const position = d ? [d.mode, at, `page ${d.page + 1} of ${d.pages}`].filter(Boolean).join(" · ") : null;
+  const position = d ? [d.mode, at, `batch ${d.batch + 1} of ${d.batches}`].filter(Boolean).join(" · ") : null;
   return (
     <Tr>
       <Td className="font-mono text-xs">

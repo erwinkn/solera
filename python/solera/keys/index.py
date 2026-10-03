@@ -139,7 +139,7 @@ class FileInfo:
 @dataclass(frozen=True)
 class IndexState:
     """What the engine holds per index: `count` live keys, the files by level,
-    and the delta log consumers read — `(batch, files)`, oldest first. A delta
+    and the delta log consumers read — `(commit, files)`, oldest first. A delta
     file stays in the log after compaction merges it out of the levels, until
     no consumer needs it. `inexact` counts the commits since the last recount
     whose count change came from filters (§6): the count is exact when it is 0."""
@@ -188,7 +188,7 @@ class IndexState:
         return replace(self, log=tuple(e for e in self.log if log_from <= e[0] <= hi))
 
     def covers(self, first: int, last: int) -> bool:
-        """Whether the log still holds every batch in `[first, last]`."""
+        """Whether the log still holds every commit in `[first, last]`."""
 
         logged = {b for b, _ in self.log}
         return all(b in logged for b in range(first, last + 1))
@@ -492,7 +492,7 @@ class KeyIndex:
         collect: int = 0,
     ) -> tuple[DeltaFiles, tuple[list[bytes], list[bytes]] | None]:
         """A patch's delta — `run`'s upserts and removes, at `generation` —
-        written as the batch's files (docs/resolved-commits.md §6). A small
+        written as the commit's files (docs/resolved-commits.md §6). A small
         patch reads only what it must — the sparse reader; a dense one, or
         one whose exact reads would touch too many blocks, streams the whole
         index instead; an empty index reads nothing. With `exact`, every live
@@ -614,7 +614,7 @@ class KeyIndex:
         that column). Every key is written at `generation` — unless it
         carries a payload equal to its live entry's — carrying the key's
         predecessor, and live keys not in `rows` are deleted. The delta goes
-        out as the batch's files as they fill. Returns them and, up to
+        out as the commit's files as they fill. Returns them and, up to
         `collect` keys, the written keys and the deleted keys (None past
         it). Streamed chunks may have a run laid over them (`overlay`): its
         upserts in place of their entries of its keys, its removes gone — a
@@ -739,8 +739,8 @@ class KeyIndex:
     # -- writing ------------------------------------------------------------------------
 
     async def write(self, commit_number: int, attempt: str, delta: Delta) -> DeltaFiles:
-        """Write a patch's delta as the batch's files, `{batch}-{attempt}.{n}`:
-        the attempt id keeps a retried batch from colliding with its own upload."""
+        """Write a patch's delta as the commit's files, `{commit}-{attempt}.{n}`:
+        the attempt id keeps a retried commit from colliding with its own upload."""
 
         files = [
             FileInfo.describe(f"{commit_number:012d}-{attempt}.{n:04d}", 0, d)
@@ -832,8 +832,8 @@ class KeyIndex:
         logged = dict(self.state.log)
         missing = [b for b in range(first_commit, last_commit + 1) if b not in logged]
         if missing:
-            raise LookupError(f"delta log no longer holds batches {missing[:5]}")
-        # Each batch is a level of its own: its files (a split delta) never overlap.
+            raise LookupError(f"delta log no longer holds commits {missing[:5]}")
+        # Each commit is a level of its own: its files (a split delta) never overlap.
         levels = [list(logged[b]) for b in range(last_commit, first_commit - 1, -1)]
 
         async def store():
@@ -916,7 +916,7 @@ class KeyIndex:
             runs += [[f] for f in group] if lv == 0 else [group]
         job = Merge.compact(len(runs), drop_deleted=drop, garbage=garbage, **self._writer())
         # A level-0 file is as recent as its newest input: level 0 orders by name, and delta
-        # names start with their batch.
+        # names start with their commit.
         stamp = ulid() if out_level else f"{inputs[0].name.split('-', 1)[0]}-c{ulid()}"
         dropped: dict[int, GarbageFile] = {}
 

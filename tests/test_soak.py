@@ -1,8 +1,8 @@
 """Soak: the demo project runs in-process on `file://` state with a fake clock
-for >= 500 batches per site, and nothing may grow faster than the work does.
+for >= 500 commits per site, and nothing may grow faster than the work does.
 
 - the demo's data (FileStore, under `$SOLERA_DATA`) grows linearly in
-  committed batches: one object per event batch, and per changed key;
+  commits: one object per commit of events, and per changed key;
 - `control/` — the journal and checkpoints — stays bounded however many runs
   happen: at most two checkpoints, and the journal since the older one;
 - finished runs leave memory and land under `runs/`;
@@ -154,7 +154,7 @@ async def test_soak(tmp_path, monkeypatch):
     assert sizes[-1] > sizes[0], "the soak must actually write data"
     assert late_rate <= max(2.0 * early_rate, early_rate + 16384), (
         f"data growth is superlinear ({early_rate:.0f} -> {late_rate:.0f} B/run) — "
-        "batch writes must not rewrite history"
+        "appends must not rewrite history"
     )
     # Object requests per run stay flat: nothing reads or rewrites history.
     assert max(requests[len(requests) // 2 :]) <= 1.25 * max(requests[: len(requests) // 2]) + 5, requests

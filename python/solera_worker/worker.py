@@ -1,8 +1,8 @@
 """User code runs here, never in the API process (§10 worker protocol).
 
 `python -m solera_worker run --objects URL --run RUN --attempt ID`:
-read the spec from the attempt file -> refuse on revision mismatch -> resolve `env:` -> load inputs per
-annotation (Incremental edges through the upstream key index) -> build ctx ->
+read the spec from the attempt file -> refuse on deploy mismatch -> resolve `env:` -> load inputs per
+annotation (Incremental inputs through the upstream key index) -> build ctx ->
 run the producer -> for each returned output, work out what changed against
 its key index and write the delta file -> take the write fence -> store()
 each output unless nothing changed -> rewrite the attempt file with the spec,
@@ -326,20 +326,20 @@ class Ctx:
 async def _resolve_inputs(spec, project, asset, keys_io, timeline, observed: Observed):
     """Load each pin by annotation; build call args + ctx.batch (§5, §10).
 
-    An Incremental edge over a keyed upstream reads its page from the pinned
+    An Incremental input over a keyed upstream reads its batch from the pinned
     key index — the pending deltas in `[from, to]`, or the whole index for a
     full pass — and loads just those keys. `delivered` reports where the
-    page ended, for the engine's bookmark (§6). Each input loaded is a
+    batch ended, for the engine's bookmark (§6). Each input loaded is a
     `loaded` event; `observed` records what each read saw."""
 
     manifest_asset = project.manifest["assets"][asset.name]
     inputs = manifest_asset["inputs"]
     hints = project.hints[asset.name]  # resolved once, at registration
     args, batch, delivered = {}, {}, {}
-    windows = []
+    reads = []
     for name, pin in spec["inputs"].items():
         input = inputs.get(name)
-        if input is None or "each" in pin:  # a dep pin: recorded, never bound; an Each page: per key
+        if input is None or "each" in pin:  # a dep pin: recorded, never bound; an Each batch: per key
             continue
         param = name
         t = hints.get(param)
@@ -376,11 +376,11 @@ async def _resolve_inputs(spec, project, asset, keys_io, timeline, observed: Obs
                 )
                 timeline.add("loaded", param, _rows(args[param]))
                 continue
-            # The page — a keys= override, inlined by the engine, or read from the
-            # pinned index — filtered by the edge's patterns (per-key §11).
-            window = await each.read_window(pin, keys_io)
-            windows.append(window)
-            upserted, deleted, after = window.upserted, window.deleted, window.after
+            # The batch — a keys= override, inlined by the engine, or read from the
+            # pinned index — filtered by the input's patterns (per-key §11).
+            read = await each.read_batch(pin, keys_io)
+            reads.append(read)
+            upserted, deleted, after = read.upserted, (*read.deleted, *read.unmatched), read.after
             args[param] = await observed.load(store, ref, t, Keys(upserted))
             batch[param] = Batch(
                 rows=args[param],
@@ -400,10 +400,10 @@ async def _resolve_inputs(spec, project, asset, keys_io, timeline, observed: Obs
         else:
             args[param] = await _load_whole(observed.load, store, ref, t, keys_io, pin.get("index"))
             timeline.add("loaded", param, _rows(args[param]))
-    # Every keyed page held keys, and the edges' patterns took none of them: nothing
+    # Every keyed batch held keys, and the inputs' patterns took none of them: nothing
     # to call the producer with.
-    filtered = bool(windows) and all(not w.upserted and not w.deleted for w in windows)
-    delivered["*filtered"] = filtered and any(w.read for w in windows)
+    filtered = bool(reads) and all(not r.upserted and not r.deleted and not r.unmatched for r in reads)
+    delivered["*filtered"] = filtered and any(r.read for r in reads)
     return args, batch, delivered
 
 
@@ -462,7 +462,7 @@ async def _store_outputs(
     """Store each returned output (§4, §6, §8, §9), in two phases.
 
     Planning compares each keyed output's write with its key index as pinned
-    in the spec, and writes the changes as the batch's delta file: every key
+    in the spec, and writes the changes as the commit's delta file: every key
     written is one, at the attempt's generation (docs/versions.md), and a
     write that changes nothing — an empty patch, a set listed again — is
     not stored at all and keeps the head. Then
@@ -501,7 +501,7 @@ async def _store_outputs(
             await store.acquire(o.context(spec, worker_id), o.prior)
 
     # Prepare and resolve: each keyed write read once, and compared with its key
-    # index as pinned in the spec; its changes are the batch's delta file. Small
+    # index as pinned in the spec; its changes are the commit's delta file. Small
     # writes are resolved by the engine from its cache, all of an attempt's in one
     # request (docs/resolved-commits.md §4); the rest, and any it declines, here.
     for o in outs.values():
@@ -967,7 +967,7 @@ async def run_attempt(
         if record.phase == "forced":
             on_ended()
         elif control.get("drain") is not None:
-            # An Each page drains (per-key §5): no key starts, finished ones are stored.
+            # An Each batch drains (per-key §5): no key starts, finished ones are stored.
             loop.call_soon_threadsafe(control["drain"].set)
         elif not control["writing"] and not control["stopped"]:
             control["stopped"] = True  # requested: stop computing; a writer drains instead
@@ -1091,7 +1091,7 @@ async def _publish(objects, base, result, worker_id, writes, cancel, timeline, s
 
     def seal(result: dict) -> bytes:
         body = {"worker_id": worker_id, **result, "write": writes.state, **timeline.report(), "log": log}
-        if cancel is not None and "cancel" not in body:  # an Each page sealed its own record
+        if cancel is not None and "cancel" not in body:  # an Each batch sealed its own record
             body["cancel"] = cancel.to_json()
         return json.dumps(body, allow_nan=False).encode()
 
@@ -1141,11 +1141,9 @@ async def _execute(
         return _failed(error, False)
     timeline.add("imported")
     if project.manifest["deploy"] != spec["deploy"]:
-        mismatch = (
-            f"revision mismatch: spec {spec['deploy'][:12]} != project {project.manifest['deploy'][:12]}"
-        )
+        mismatch = f"deploy mismatch: spec {spec['deploy'][:12]} != project {project.manifest['deploy'][:12]}"
         failed = _failed(StoreError(mismatch), False)
-        failed["error"]["build"] = project.manifest.get("build")  # how this host computed its revision
+        failed["error"]["build"] = project.manifest.get("build")  # how this host computed its deploy
         return failed
     asset = project.assets[spec["asset"]]
     observed = Observed()
@@ -1162,18 +1160,18 @@ async def _execute(
         for name, resource in project.resources.items():
             if name in signature.parameters:
                 args[name] = resolve_env(resource)  # env: secrets resolve in the worker (§5)
-        page = next(((p, pin) for p, pin in spec["inputs"].items() if "each" in pin), None)
-        if page is not None:
+        each_input = next(((p, pin) for p, pin in spec["inputs"].items() if "each" in pin), None)
+        if each_input is not None:
             control["drain"] = asyncio.Event()
-            ran = await each.run(spec, project, asset, *page, args, ctx, keys_io, timeline, control)
+            ran = await each.run(spec, project, asset, *each_input, args, ctx, keys_io, timeline, control)
             await observed.close()
             if "abort" in ran:
                 return _user_failed(ran["abort"], project)
             value = Result(outputs=ran["values"])
-            delivered[page[0]] = ran["delivered"]
+            delivered[each_input[0]] = ran["delivered"]
         elif filtered:
-            # The edges' patterns took none of the page's keys: the producer has
-            # nothing to see, and the page commits only its bookmark (per-key §11).
+            # The inputs' patterns took none of the batch's keys: the producer has
+            # nothing to see, and the batch commits only its bookmark (per-key §11).
             return {"status": "succeeded", "skipped": True, "outputs": {}, "delivered": delivered}
         else:
             await observed.close()  # the inputs' moment ends: a long producer holds no snapshot
@@ -1202,8 +1200,8 @@ async def _execute(
         result = {"status": "succeeded", "outputs": outputs, "delivered": delivered}
         if read := observed.report():
             result["read"] = read
-        if page is not None:
-            # A drained page commits what finished (docs/lifecycle.md §7). Its interrupted
+        if each_input is not None:
+            # A drained batch commits what finished (docs/lifecycle.md §7). Its interrupted
             # keys follow the cancel record it is sealed with, as latched now — after its
             # store writes — and the result carries that record, not a later one (§2.2).
             cancel = control.get("cancel")

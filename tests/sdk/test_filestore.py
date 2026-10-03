@@ -1,4 +1,4 @@
-"""§4: FileStore and S3Store — one object per value, key or batch, each
+"""§4: FileStore and S3Store — one object per value, key or commit, each
 written once under a name that carries the writing attempt's generation
 (docs/lifecycle.md §9.8, docs/versions.md); JSON when it round-trips,
 pickle otherwise. The store never works out what changed; the worker
@@ -173,7 +173,7 @@ async def test_rows_by_key_column(store):
         await store.store([{"v": 1}], None, context(out, generation=4))
 
 
-async def test_unkeyed_incremental_is_one_object_per_batch(store):
+async def test_unkeyed_incremental_is_one_object_per_commit(store):
     out = Output("events", incremental=True)
     with pytest.raises(WriteError, match="Patch"):
         await store.store([{"e": 0}], None, context(out, commit_number=0))
@@ -189,10 +189,10 @@ async def test_unkeyed_incremental_is_one_object_per_batch(store):
     ).ref is second.ref
 
 
-async def test_a_batchs_committed_object_is_its_highest_generation(store):
-    """Retries reuse a batch number: a dead attempt's batch 4 (generation 11)
+async def test_a_commits_object_is_its_highest_generation(store):
+    """Retries reuse a commit number: a dead attempt's commit 4 (generation 11)
     and its retry's (generation 12) are both there, and the retry, which
-    committed, is the one read. A full run starts over at a later batch."""
+    committed, is the one read. A full run starts over at a later commit."""
 
     out = Output("events", incremental=True)
     first = await store.store(Patch([{"e": 1}]), None, context(out, commit_number=3, generation=10))
@@ -244,11 +244,11 @@ def test_the_default_path(tmp_path, monkeypatch):
     assert Path(store._objects().prefix) == tmp_path / "elsewhere"
 
 
-async def test_one_batch_is_read_without_listing_the_history(store, monkeypatch):
-    """A consumer reading one batch — the newest, or the first of a long
-    history — lists that batch's objects, not the output's whole history
+async def test_one_commit_is_read_without_listing_the_history(store, monkeypatch):
+    """A consumer reading one commit — the newest, or the first of a long
+    history — lists that commit's objects, not the output's whole history
     (§6: hot-path work does not grow with history). A range past the ref's
-    last batch stops at it: a batch no commit wrote yet is not read."""
+    last commit stops at it: a commit number not committed yet is not read."""
 
     import obstore
 

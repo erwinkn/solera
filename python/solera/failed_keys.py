@@ -38,7 +38,7 @@ KINDS = {
 
 @dataclass(frozen=True)
 class Record:
-    """One failing key. Times are whole seconds; `epoch` and `forced` are the
+    """One failing key. Times are whole seconds; `deploy` and `forced` are the
     engine's positions the last try ran under, copied from the spec — never a
     worker's clock — so whether a key had its deploy or forced retry is
     decided causally. `last`, `next_at` and `until` are worker times, for
@@ -105,8 +105,8 @@ def transition(
     prior: Record | None, outcome: Outcome, *, now: float, deploy: int, forced: int, retries: int
 ) -> Record | None:
     """The key's record after `outcome` (§9's transition table): `None` for
-    no record — nothing, or a tombstone where `prior` existed. `epoch` and
-    `forced` are the page's positions; `retries` the asset's `retries=`,
+    no record — nothing, or a tombstone where `prior` existed. `deploy` and
+    `forced` are the batch's positions; `retries` the asset's `retries=`,
     which bounds timeouts."""
 
     if outcome.kind in GONE:
@@ -137,7 +137,7 @@ def transition(
 
 def eligible(record: Record, now: float, deploy: int, forced: dict[str, int]) -> bool:
     """Whether a retry pass takes `record`'s key (§9). Each clause retires
-    itself: a retried key's `next_at` moves on, its `epoch` becomes the
+    itself: a retried key's `next_at` moves on, its `deploy` becomes the
     pass's, its `forced` the pass's position. A canceled key matches only a
     forced request."""
 
@@ -149,8 +149,8 @@ def eligible(record: Record, now: float, deploy: int, forced: dict[str, int]) ->
 
 
 def minima(records) -> tuple[int | None, int | None]:
-    """`(due, epoch)`: the earliest `next_at` of retrying and timed-out
-    records, and the lowest `epoch` of failed ones — `None` where there are
+    """`(due, deploy)`: the earliest `next_at` of retrying and timed-out
+    records, and the lowest `deploy` of failed ones — `None` where there are
     none."""
 
     due = deploy = None

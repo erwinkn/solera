@@ -1,7 +1,7 @@
-"""`Each`: an asset written for one key, run over a page of keys
+"""`Each`: an asset written for one key, run over a batch of keys
 (docs/per-key-processing.md §5, §9).
 
-A page is either the changes of the edge's window (`changes`) or the
+A batch is either the changes of the input's pass (`changes`) or the
 failed keys's keys that are due again (`retry`). Each key is one call,
 `concurrency` at a time; its outcome is classified (`solera.errors`), the
 outputs of the keys that succeeded become one `Patch({key: value})` per
@@ -27,20 +27,28 @@ from solera.patterns import Matcher
 from solera.sdk import UNSET, Ref, Result
 from solera.stores import Keys, Patch
 
-WALK = 100  # failure records walked per retry page, at most, for each key it may take
+WALK = 100  # failure records walked per retry batch, at most, for each key it may take
 INTERRUPTED = "interrupted"  # a key a drain stopped: canceled or timed out once the result is sealed
-LOOKAHEAD = 100_000  # index entries a page examines at most, to fill itself and to prove it final
+LOOKAHEAD = 100_000  # index entries a batch examines at most, to fill itself and to prove it final
 
 
 @dataclass
-class Page:
-    kind: str  # "changes" or "retry"
+class Batch:
+    """The keys one attempt reads from a keyed incremental input, filtered
+    by its patterns. `deleted` are keys gone upstream and `unmatched` keys
+    that stopped matching the patterns: the consumer's outputs drop both.
+    An `Each` batch also has a `kind` (§9) — the input's `changes`, a
+    `retry` of failed keys, or the `reconcile` after a full pass — and the
+    failure records it read."""
+
     upserted: dict[str, int]  # key -> the generation of its upstream entry: its version
     deleted: list[str]
-    after: str | None  # where the window's page, or the retry walk, ended (None: done)
-    unmatched: list[str] = field(default_factory=list)  # keys that stopped matching the edge's patterns
+    after: str | None  # where the batch, or the retry walk, ended (None: the pass is done)
+    read: int = 0  # keys examined before the patterns filtered them
+    unmatched: list[str] = field(default_factory=list)
+    kind: str = "changes"
     walked: dict[str, Record] = field(default_factory=dict)  # retry: every record walked
-    priors: dict[str, Record] = field(default_factory=dict)
+    priors: dict[str, Record] = field(default_factory=dict)  # the touched keys' failure records
 
 
 class _Abort(Exception):
@@ -48,63 +56,49 @@ class _Abort(Exception):
         self.error = error
 
 
-@dataclass
-class Window:
-    """An Incremental page of a keyed upstream, its keys filtered by the
-    edge's patterns: `read` says how many keys the page held before, and
-    `unmatched` that its deletions are keys that stopped matching (a
-    pattern change's diff) rather than keys gone upstream."""
-
-    upserted: dict[str, int]  # key -> generation
-    deleted: tuple
-    after: str | None
-    read: int
-    unmatched: bool = False
-
-
 async def _fill(chunk, start: bytes | None, limit: int, kind) -> tuple[list, str | None, int]:
-    """A page of `limit` entries that `kind` takes, read ahead past the ones
+    """A batch of `limit` entries that `kind` takes, read ahead past the ones
     it does not: `chunk(after, n)` returns `(entries, next)` — at most `n`
     entries as `(key, generation, deleted)` in key order past `after`,
-    and where to go on (None: exhausted). Past a full page it looks on for
-    one more entry it takes, so that a page is `final` exactly when nothing
-    follows and no pass ends on an empty page (§5).
+    and where to go on (None: exhausted). Past a full batch it looks on for
+    one more entry it takes, so that a batch is `final` exactly when nothing
+    follows and no pass ends on an empty batch (§5).
 
-    Entries are read a page's worth and one more at a time — never just what
-    the page still lacks, so a sparse pattern costs scans in proportion to
-    the entries it passes over, divided by the page — and at most
-    `LOOKAHEAD` of them: past that the page goes as it is — not
+    Entries are read a batch's worth and one more at a time — never just what
+    the batch still lacks, so a sparse pattern costs scans in proportion to
+    the entries it passes over, divided by the batch — and at most
+    `LOOKAHEAD` of them: past that the batch goes as it is — not
     final, not full, perhaps empty (then its attempt is skipped, the producer
-    not called). The next page starts after the last entry examined, so no
-    entry is read twice. Returns the page's entries, where the next page
+    not called). The next batch starts after the last entry examined, so no
+    entry is read twice. Returns the batch's entries, where the next batch
     starts (None: this one is final), and how many entries were read."""
 
-    page, cursor, read, last = [], start, 0, None
+    batch, cursor, read, last = [], start, 0, None
     while True:
         entries, nxt = await chunk(cursor, limit + 1)
         for n, entry in enumerate(entries, 1):
             taken = kind(entry)
             if taken is not None:
-                if len(page) == limit:  # one more is taken: the page is full, not final
-                    return page, key_str(last), read
-                page.append((taken, entry))
+                if len(batch) == limit:  # one more is taken: the batch is full, not final
+                    return batch, key_str(last), read
+                batch.append((taken, entry))
             read, last = read + 1, entry[0]
             if read >= LOOKAHEAD and (n < len(entries) or nxt is not None):
-                return page, key_str(last), read  # examined enough: the rest is the next page's
+                return batch, key_str(last), read  # examined enough: the rest is the next batch's
         if nxt is None:
-            return page, None, read
+            return batch, None, read
         cursor = nxt
 
 
-async def read_window(pin: dict, keys_io) -> Window:
-    """An Incremental page of a keyed upstream, as the spec pins it: the
-    keys= override, a full pass's page, a window of pending deltas — all
-    filtered by the edge's patterns (per-key §11), read ahead past keys they
-    leave out until the page holds `batch_size` keys or the pass runs
+async def read_batch(pin: dict, keys_io) -> Batch:
+    """An Incremental batch of a keyed upstream, as the spec pins it: the
+    keys= override, a full pass's batch, a delta pass's pending deltas — all
+    filtered by the input's patterns (per-key §11), read ahead past keys they
+    leave out until the batch holds `batch_size` keys or the pass runs
     out — or a pattern change's diff of the index as of its pattern change: the keys whose
     membership changed. A pure function of the pin: it reads the index
     through `KeyIndex.page`, `pending` and `lookup` only, so the engine can
-    run it on its own copies to serve the same page."""
+    run it on its own copies to serve the same batch."""
 
     ch = pin["batch"]
     index = KeyIndex(keys_io, None, IndexState.from_json(pin["index"]))
@@ -115,7 +109,7 @@ async def read_window(pin: dict, keys_io) -> Window:
         keys, generations, _, nxt = await index.page(after, n)
         return list(zip(keys, generations, bytes(len(keys)), strict=True)), nxt
 
-    async def window(after, n):
+    async def delta(after, n):
         keys, generations, flags, _, nxt = await index.pending(int(ch["from"]), int(ch["to"]), after, n)
         return list(zip(keys, generations, flags, strict=True)), nxt
 
@@ -129,41 +123,35 @@ async def read_window(pin: dict, keys_io) -> Window:
 
         page, after, read = await _fill(whole, start, limit, changed)
         upserted = {key_str(e[0]): e[1] for kind, e in page if kind == "upsert"}
-        deleted = tuple(key_str(e[0]) for kind, e in page if kind == "delete")
-        return Window(upserted, deleted, after, read, unmatched=True)
+        unmatched = [key_str(e[0]) for kind, e in page if kind == "delete"]
+        return Batch(upserted, [], after, read, unmatched=unmatched)
     taken = Matcher(pin.get("patterns"))
     if "keys" in ch:  # a run's keys= override: a one-off selection, of the keys that exist
         found = await index.lookup([key_bytes(str(k)) for k in ch["keys"]])
         upserted = {key_str(k): generation for k, (generation, _) in found.items()}
-        return Window({k: e for k, e in upserted.items() if taken(k)}, (), None, len(upserted))
+        return Batch({k: e for k, e in upserted.items() if taken(k)}, [], None, len(upserted))
 
     def kind(entry):
         return ("delete" if entry[2] else "upsert") if taken(key_str(entry[0])) else None
 
-    page, after, read = await _fill(whole if ch.get("full") else window, start, limit, kind)
+    page, after, read = await _fill(whole if ch.get("full") else delta, start, limit, kind)
     upserted = {key_str(e[0]): e[1] for k, e in page if k == "upsert"}
-    deleted = tuple(key_str(e[0]) for k, e in page if k == "delete")
-    return Window(upserted, deleted, after, read)
+    deleted = [key_str(e[0]) for k, e in page if k == "delete"]
+    return Batch(upserted, deleted, after, read)
 
 
-async def read_page(spec: dict, pin: dict, keys_io) -> Page:
+async def read_each_batch(spec: dict, pin: dict, keys_io) -> Batch:
     each = pin["each"]
     failures = KeyIndex(keys_io, None, IndexState.from_json(each["failures"]))
     if each["kind"] == "reconcile":
-        return await _reconcile_page(spec, pin, keys_io, failures)
+        return await _reconcile_batch(spec, pin, keys_io, failures)
     if each["kind"] != "retry":
-        window = await read_window(pin, keys_io)
-        touched = [key_bytes(k) for k in [*window.upserted, *window.deleted]]
+        batch = await read_batch(pin, keys_io)
+        touched = [key_bytes(k) for k in [*batch.upserted, *batch.deleted, *batch.unmatched]]
         priors = await failures.lookup(touched) if touched else {}
-        return Page(
-            "changes",
-            window.upserted,
-            [] if window.unmatched else list(window.deleted),
-            window.after,
-            unmatched=list(window.deleted) if window.unmatched else [],
-            priors={key_str(k): Record.decode(p) for k, (_, p) in priors.items()},
-        )
-    # A retry page: walk the failed keys from the pass's position, taking the
+        batch.priors = {key_str(k): Record.decode(p) for k, (_, p) in priors.items()}
+        return batch
+    # A retry batch: walk the failed keys from the pass's position, taking the
     # keys that are due, `limit` at most (§9).
     limit = int(pin["batch"]["limit"])
     after = pin["batch"]["retry"].get("after")
@@ -195,26 +183,26 @@ async def read_page(spec: dict, pin: dict, keys_io) -> Page:
     for key in due:
         entry = current.get(key_bytes(key))
         if not taken(key):
-            unmatched.append(key)  # no longer one of the edge's keys: its outputs and record go
+            unmatched.append(key)  # no longer one of the input's keys: its outputs and record go
         elif entry is None:
             deleted.append(key)  # gone upstream: its outputs and its record go
         elif entry[0] == walked[key].upstream:
             upserted[key] = entry[0]
         # else: its upstream was written since — the delta pass brings it, at its new generation
-    return Page(
-        "retry",
+    return Batch(
         upserted,
         deleted,
         end,
         unmatched=unmatched,
+        kind="retry",
         walked=walked,
         priors={k: walked[k] for k in due},
     )
 
 
-async def _reconcile_page(spec: dict, pin: dict, keys_io, failures: KeyIndex) -> Page:
+async def _reconcile_batch(spec: dict, pin: dict, keys_io, failures: KeyIndex) -> Batch:
     """After a full pass: the next `limit` keys the asset's outputs or its
-    failed keys hold, and which of them the edge no longer has — gone
+    failed keys hold, and which of them the input no longer has — gone
     upstream, or left out by its patterns. Those go (§11); the rest stay."""
 
     limit = int(pin["batch"]["limit"])
@@ -247,18 +235,18 @@ async def _reconcile_page(spec: dict, pin: dict, keys_io, failures: KeyIndex) ->
             deleted.append(key)
     touched = [key_bytes(k) for k in [*deleted, *unmatched]]
     priors = await failures.lookup(touched) if touched else {}
-    return Page(
-        "reconcile",
+    return Batch(
         {},
         deleted,
         end,
         unmatched=unmatched,
+        kind="reconcile",
         priors={key_str(k): Record.decode(p) for k, (_, p) in priors.items()},
     )
 
 
 async def run(spec, project, asset, param: str, pin: dict, args: dict, ctx, keys_io, timeline, control):
-    """Run one page: returns what to store (`values`), the result's parts,
+    """Run one batch: returns what to store (`values`), the result's parts,
     and — when a key raised `Abort` — the error that fails the attempt.
 
     `control["drain"]` is set when a cancel is requested (docs/lifecycle.md
@@ -271,12 +259,14 @@ async def run(spec, project, asset, param: str, pin: dict, args: dict, ctx, keys
 
     drain = control["drain"]
     each = pin["each"]
-    page = await read_page(spec, pin, keys_io)
-    timeline.add("loaded", param, len(page.upserted))
+    batch = await read_each_batch(spec, pin, keys_io)
+    timeline.add("loaded", param, len(batch.upserted))
     ref = Ref.from_json(pin["ref"])
     store = project.stores[ref.store]
     t = project.hints[asset.name].get(param)
-    loaded = await ctx._observed.load(store, ref, dict[str, t], Keys(page.upserted)) if page.upserted else {}
+    loaded = (
+        await ctx._observed.load(store, ref, dict[str, t], Keys(batch.upserted)) if batch.upserted else {}
+    )
     await ctx._observed.close()  # the inputs' moment ends before the calls
     decls = {o.name or asset.name: o for o in asset.outputs}
     is_async = inspect.iscoroutinefunction(asset.fn)
@@ -297,7 +287,7 @@ async def run(spec, project, asset, param: str, pin: dict, args: dict, ctx, keys
 
         if isinstance(value, Result):
             if value.cursor is not UNSET:
-                raise errors.Failed("an Each asset keeps no cursor: its edge is its iteration")
+                raise errors.Failed("an Each asset keeps no cursor: its input is its iteration")
             unknown = set(value.outputs) - set(decls)
             if unknown:
                 raise errors.Failed(f"returned undeclared output {sorted(unknown)[0]!r}")
@@ -314,7 +304,7 @@ async def run(spec, project, asset, param: str, pin: dict, args: dict, ctx, keys
         return values
 
     async def one(key: str):
-        generation = page.upserted[key]
+        generation = batch.upserted[key]
         try:
             async with gate:  # a cancel may reach a key still waiting here: it is interrupted too
                 if drain.is_set() or abort:
@@ -359,7 +349,7 @@ async def run(spec, project, asset, param: str, pin: dict, args: dict, ctx, keys
             durations[key] = time.monotonic() - start
 
     timeline.add("computing")
-    tasks = {key: asyncio.create_task(one(key)) for key in page.upserted}
+    tasks = {key: asyncio.create_task(one(key)) for key in batch.upserted}
     stopper = asyncio.create_task(drain.wait())
     try:
         pending = set(tasks.values())
@@ -383,17 +373,17 @@ async def run(spec, project, asset, param: str, pin: dict, args: dict, ctx, keys
     timeline.add("computed")
     if abort:
         return {"abort": abort[0]}
-    for key, generation in page.upserted.items():
-        # Every key of the page has an outcome before its bookmark moves past it.
+    for key, generation in batch.upserted.items():
+        # Every key of the batch has an outcome before its bookmark moves past it.
         outcomes.setdefault(key, Outcome(INTERRUPTED, generation))
-    for key in page.deleted:
+    for key in batch.deleted:
         outcomes[key] = Outcome(REMOVED)
-    for key in page.unmatched:
+    for key in batch.unmatched:
         outcomes[key] = Outcome(UNMATCHED)
 
     # What to store: the keys that succeeded, by output; removed keys go.
     groups = {name: {} for name in decls}
-    removes = {name: {*page.deleted, *page.unmatched} for name in decls}
+    removes = {name: {*batch.deleted, *batch.unmatched} for name in decls}
     for key, values in outputs.items():
         for name in decls:
             value = values.get(name)
@@ -409,13 +399,13 @@ async def run(spec, project, asset, param: str, pin: dict, args: dict, ctx, keys
     }
 
     async def finish(cancel) -> dict:
-        """The page's failure delta, key outcomes and counts, with interrupted
+        """The batch's failure delta, key outcomes and counts, with interrupted
         keys made what `cancel` — the record the result is sealed with — says:
         timed out for a timeout, canceled otherwise (lifecycle.md §2.2)."""
 
         made = "timed_out" if cancel is not None and cancel.reason == "timeout" else "canceled"
         final = {k: Outcome(made, o.upstream) if o.kind == INTERRUPTED else o for k, o in outcomes.items()}
-        failures = await _failures(spec, each, page, final, keys_io)
+        failures = await _failures(spec, each, batch, final, keys_io)
         rows, counts = [], Counter()
         for key, outcome in sorted(final.items()):
             record = failures["records"].get(key)
@@ -434,21 +424,21 @@ async def run(spec, project, asset, param: str, pin: dict, args: dict, ctx, keys
         return {"failures": report, "key_outcomes": rows, "keys": dict(counts)}
 
     delivered = {
-        "kind": page.kind,
-        "after": page.after,
-        "upserted": sorted(page.upserted),
-        "deleted": [*page.deleted, *page.unmatched],
+        "kind": batch.kind,
+        "after": batch.after,
+        "upserted": sorted(batch.upserted),
+        "deleted": [*batch.deleted, *batch.unmatched],
     }
     return {
         "values": values,
         "delivered": delivered,
         "finish": finish,
         "drained": drain.is_set(),
-        "skipped": not outcomes and page.kind != "reconcile",  # nothing on the page was the edge's
+        "skipped": not outcomes and batch.kind != "reconcile",  # nothing on the batch was the input's
     }
 
 
-async def _failures(spec, each: dict, page: Page, outcomes: dict, keys_io) -> dict:
+async def _failures(spec, each: dict, batch: Batch, outcomes: dict, keys_io) -> dict:
     """Move each touched key's record (§9's transition table), write the
     failed keys's delta, and report the outcome counts' transitions and
     the bounds the commit lowers or accumulates."""
@@ -458,7 +448,7 @@ async def _failures(spec, each: dict, page: Page, outcomes: dict, keys_io) -> di
     records, transitions = {}, Counter()
     upsert_keys, upsert_records, removes = [], [], []
     for key, outcome in sorted(outcomes.items()):
-        prior = page.priors.get(key)
+        prior = batch.priors.get(key)
         record = transition(prior, outcome, now=time.time(), deploy=deploy, forced=forced, retries=retries)
         records[key] = record
         if prior is not None:
@@ -487,9 +477,9 @@ async def _failures(spec, each: dict, page: Page, outcomes: dict, keys_io) -> di
         "records": records,
     }
     pass_after = each.get("pass_after")
-    if page.kind == "retry":
-        # The walked range's records, as this page leaves them: the pass's accumulators (§9).
-        walked = [records[k] if k in records else r for k, r in page.walked.items()]
+    if batch.kind == "retry":
+        # The walked range's records, as this batch leaves them: the pass's accumulators (§9).
+        walked = [records[k] if k in records else r for k, r in batch.walked.items()]
         report["range"] = dict(zip(("due", "deploy_min"), minima(walked), strict=True))
     elif pass_after is not None:
         bound = key_bytes(pass_after)

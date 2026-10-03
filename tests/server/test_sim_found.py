@@ -50,7 +50,7 @@ def _ref(head):
 
 async def test_a_removed_assets_last_attempt_ends_its_run(state, monkeypatch):  # noqa: F811
     """§11: an attempt launched before its asset was removed settles under
-    the contract it was launched with. When it commits a page and asks for
+    the contract it was launched with. When it commits a batch and asks for
     more, the asset is gone: its task cannot run again, and its run must
     end rather than hold the task forever."""
 
@@ -64,22 +64,22 @@ async def test_a_removed_assets_last_attempt_ends_its_run(state, monkeypatch):  
         return [{"id": "a"}, {"id": "b"}]
 
     @asset(inputs={"files": Incremental(batch_size=1)})
-    async def pages(files: list):
+    async def batches(files: list):
         entered.set()
         await release.wait()
         return []
 
-    first = Project(assets=[files, pages])
+    first = Project(assets=[files, batches])
     engine = make_engine(state, first)
     await engine.initialize()
     await drive(engine, await engine.submit(["files"]))
-    run = await engine.submit(["pages"])
+    run = await engine.submit(["batches"])
     while not entered.is_set():
         await engine.tick()
         await asyncio.sleep(0.01)
     await engine.stop()  # the attempt runs on; the next engine adopts it
 
-    second = Project(assets=[files])  # `pages` is gone
+    second = Project(assets=[files])  # `batches` is gone
     engine = make_engine(state, second)
     await engine.initialize()
     release.set()
@@ -89,7 +89,7 @@ async def test_a_removed_assets_last_attempt_ends_its_run(state, monkeypatch):  
         tasks = state.model.runs[run["id"]]["tasks"].values()
         raise AssertionError(f"the run never ends: {[(t['status'], t.get('held')) for t in tasks]}") from None
     assert status_of(detail) in {"succeeded", "failed", "canceled"}
-    assert not state.model.partition("pages", "").get("bookmarks")  # its pass ends with it
+    assert not state.model.partition("batches", "").get("bookmarks")  # its pass ends with it
 
 
 async def test_an_attempt_launched_before_a_rename_settles(state, monkeypatch):  # noqa: F811
@@ -140,8 +140,8 @@ async def test_an_attempt_launched_before_a_rename_settles(state, monkeypatch): 
 
 
 async def test_a_change_made_during_a_full_delivery_reaches_downstream(state):  # noqa: F811
-    """§6, §9: a full keyed pass begun at batch 0 delivers what changed
-    meanwhile afterwards, as a delta. Interrupted after its first page, then
+    """§6, §9: a full keyed pass begun at commit 0 delivers what changed
+    meanwhile afterwards, as a delta. Interrupted after its first batch, then
     the upstream changes: the firing for that change resumes the pass —
     and must also deliver the change, since nothing else will fire for it."""
 
@@ -168,10 +168,10 @@ async def test_a_change_made_during_a_full_delivery_reaches_downstream(state):  
     await engine.set_automation("out.onchange.0", False)
     await drive(engine, await engine.submit(["items"]))
     run = await engine.submit(["out"])
-    while (state.model.bookmark("out", "items", "") or {}).get("pass", {}).get("page") != 1:
+    while (state.model.bookmark("out", "items", "") or {}).get("pass", {}).get("batch") != 1:
         await engine.tick()
         await asyncio.sleep(0.01)
-    await engine.cancel(run["id"])  # after its first page: `a` delivered at 1
+    await engine.cancel(run["id"])  # after its first batch: `a` delivered at 1
     await drive(engine, run)
     await engine.set_automation("out.onchange.0", True)
     content.update({"a": "2", "b": "2"})
@@ -232,8 +232,8 @@ async def test_a_slow_new_writer_never_fences_into_a_deleted_segment(tmp_path):
 
 async def test_a_batch_upstream_reset_right_after_a_delivery_is_delivered_in_full(state):  # noqa: F811
     """§6: a `full` run starts an unkeyed incremental output over at a new
-    `base`; a consumer that read batches before it must be told (`full`),
-    or it keeps rows the upstream let go — also when the reset batch is
+    `base`; a consumer that read commits before it must be told (`full`),
+    or it keeps rows the upstream let go — also when the reset commit is
     exactly the consumer's next one."""
 
     from solera.sdk import Result
@@ -254,9 +254,9 @@ async def test_a_batch_upstream_reset_right_after_a_delivery_is_delivered_in_ful
 
     engine = make_engine(state, Project(assets=[log, tally]))
     await engine.initialize()
-    await drive(engine, await engine.submit(["log"]))  # batch 0
+    await drive(engine, await engine.submit(["log"]))  # commit 0
     await drive(engine, await engine.submit(["tally"]))  # delivered through 0: next = 1
-    await drive(engine, await engine.submit(["log"], mode="full"))  # starts over at batch 1
+    await drive(engine, await engine.submit(["log"], mode="full"))  # starts over at commit 1
     await drive(engine, await engine.submit(["tally"]))
     assert state.model.heads[("log", "")]["base"] == 1
     assert seen[-1][0], f"the reset was delivered as a delta: {seen}"
@@ -268,7 +268,7 @@ async def test_a_batch_upstream_reset_right_after_a_delivery_is_delivered_in_ful
 )
 async def test_a_full_delivery_that_takes_no_key_still_starts_over(state):  # noqa: F811
     """§5, §8: a full run makes the output equal to exactly its write, and a
-    full pass starts its consumer over. When the edge's patterns take
+    full pass starts its consumer over. When the input's patterns take
     none of the upstream's keys, the pass is skipped without calling
     the producer — so nothing starts over, and keys the consumer holds from
     before stay, though its upstream holds them no longer."""
@@ -347,7 +347,7 @@ async def test_a_key_a_moved_output_dropped_leaves_its_consumer(state, tmp_path)
     """F9: a keyed output moved to another store starts its index over, and
     the move's first write holds only upserts. `copy`, planned under the new
     project but against the old index, commits its pass after the move
-    landed: its bookmark then reaches the move's batch, and the move must
+    landed: its bookmark then reaches the move's commit, and the move must
     not be read as a plain delta — `k11`, which the move dropped, goes."""
 
     rows = {"items": [{"id": "k10"}, {"id": "k11"}]}

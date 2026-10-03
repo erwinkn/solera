@@ -1,4 +1,4 @@
-"""FileStore and S3Store (§4): one object per value, key or batch, each
+"""FileStore and S3Store (§4): one object per value, key or commit, each
 written once under a name no other attempt writes. They take plain
 Python, pandas DataFrames and Arrow data (`frames`)."""
 
@@ -34,7 +34,7 @@ from . import (
 
 class FileStore:
     """The default store (§4): what an asset returns, as files — one per
-    value, per key, or per batch — each written once, under a name no other
+    value, per key, or per commit — each written once, under a name no other
     attempt writes (docs/lifecycle.md §9.8):
 
         {root}/rollup@184467.json               a value, by generation 184467
@@ -42,15 +42,15 @@ class FileStore:
         {root}/uploads/u-7/184467.pkl           a keyed output: one object per key and generation
         {root}/site_files/alpha/f-1/184467.json keyed and partitioned: the key's rows
         {root}/site_events/alpha/000000000042/184467.json
-                                                an unkeyed incremental output: one per batch
+                                                an unkeyed incremental output: one per commit
 
     A name carries the writing attempt's generation (`WriteContext.generation`) —
     a key's version (docs/versions.md) — and a write is create-only: a dead
     writer only ever leaves objects nothing references, and a reader gets
     exactly what it was pinned to. A keyed read names its objects from the
-    generations the key index holds (`Keys`); a range of batches keeps, per
-    batch, the highest generation, which committed it — listed batch by
-    batch, so reading one never lists the others. Superseded objects
+    generations the key index holds (`Keys`); a range of commits keeps, per
+    commit, the highest generation, which committed it — listed commit by
+    commit, so reading one never lists the others. Superseded objects
     are deleted by `cleanup`, once nothing can read them.
 
     Content is JSON when it round-trips exactly, pickle otherwise. `path`
@@ -146,9 +146,9 @@ class FileStore:
         return Written(self._ref(context, {"mode": "keyed", "path": base, "key": context.output.key}))
 
     async def _store_commit(self, write: Patch, prior, context, base, generation) -> Written:
-        """An unkeyed incremental write: its items, as one object per batch.
+        """An unkeyed incremental write: its items, as one object per commit.
         With no prior (a first write, or a reset) the output starts over at
-        this batch; earlier ones are no longer read, and go with `cleanup`."""
+        this commit; earlier ones are no longer read, and go with `cleanup`."""
 
         output = context.output
         if write.remove:
@@ -157,7 +157,7 @@ class FileStore:
         if not isinstance(items, list):
             items = frames.rows_of(items, output.name)
         if not isinstance(items, list):
-            raise WriteError(f"{output.name}: a batch is a list, got {type(items).__name__}")
+            raise WriteError(f"{output.name}: a commit is a list, got {type(items).__name__}")
         if not items and prior is not None:
             return Written(prior)
         if context.commit_number is not None:
@@ -196,7 +196,7 @@ class FileStore:
             elif kind == "commits":
                 ranges.append((int(item[1]), int(item[2])))
             else:
-                raise StoreError(f"{context.output.name}: cannot discard {item!r}")
+                raise StoreError(f"{context.output.name}: cannot clean up {item!r}")
         if ranges:
             import obstore
 
@@ -226,9 +226,9 @@ class FileStore:
                 else (first, last)
             )
             names = await self._commits(base, lo, hi)
-            # The ref's batches run first..last without a gap: every one a commit wrote.
+            # The ref's commits run first..last without a gap: every one was committed.
             if missing := [b for b in range(lo, hi + 1) if b not in names]:
-                raise StoreError(f"{ref.output}: batch {missing[0]} of {base} is gone")
+                raise StoreError(f"{ref.output}: commit {missing[0]} of {base} is gone")
             commits = await self._many(self._found, [names[b] for b in sorted(names)])
             return frames.materialize([item for b in commits for item in b], t)
         if mode == "keyed":
@@ -272,10 +272,10 @@ class FileStore:
         return value
 
     async def _commits(self, base: str, lo: int, hi: int) -> dict[int, str]:
-        """Batch `n` -> its committed object, in `[lo, hi]`: of the objects
+        """Commit `n` -> its committed object, in `[lo, hi]`: of the objects
         under `n`'s name, the highest generation's. The attempts that used
-        batch `n` all ran between the commits of `n - 1` and `n`, one at a
-        time, and the one that committed `n` was the last of them."""
+        commit number `n` all ran one at a time, after commit `n - 1`, and
+        the one that committed `n` was the last of them."""
 
         import obstore
 
@@ -294,7 +294,7 @@ class FileStore:
                         best[commit_number] = generation
 
         if type(objects).__name__ == "LocalStore":
-            # A directory lists in any order, to its end: each batch's own, then.
+            # A directory lists in any order, to its end: each commit's own, then.
             await self._many(lambda b: scan(f"{base}/{b:012d}/"), range(lo, hi + 1))
         else:
             # An object store lists in key order, from `lo`: it stops past `hi`.
@@ -369,8 +369,8 @@ class FileStore:
 
 
 def _commit_of(base: str, path: str) -> tuple[int, int] | None:
-    """A batch object's `(batch, generation)`, from its name under `base`:
-    `{batch:012d}/{generation}.{format}`. None for any other object."""
+    """An object's `(commit, generation)`, from its name under `base`:
+    `{commit:012d}/{generation}.{format}`. None for any other object."""
 
     commit_number, _, name = path[len(base) + 1 :].partition("/")
     generation, _, fmt = name.partition(".")

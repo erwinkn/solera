@@ -150,7 +150,7 @@ def keyed(h: Harness) -> Output:
 # -- every store ---------------------------------------------------------------------------
 
 
-async def a_replacement_is_the_scopes_whole_content(h: Harness) -> None:
+async def a_replacement_is_the_partitions_whole_content(h: Harness) -> None:
     """Write {a, b}, then replace it with {b, c}: the partition holds b and c; a
     replacement drops the keys it does not name."""
 
@@ -195,8 +195,8 @@ async def a_write_repeated_by_its_attempt_lands_once(h: Harness) -> None:
     assert await now(h, again, ledger) == [("a", "1"), ("b", "1")]
 
 
-async def batches_append_and_load_by_range(h: Harness) -> None:
-    """An unkeyed incremental output: batch 3, then batch 4, read whole and
+async def commits_append_and_load_by_range(h: Harness) -> None:
+    """An unkeyed incremental output: commit 3, then commit 4, read whole and
     by range."""
 
     out = h.output(incremental=True)
@@ -206,8 +206,8 @@ async def batches_append_and_load_by_range(h: Harness) -> None:
     assert await rows(h, second.ref, Commits(4, 4)) == [("b", "1")]
 
 
-async def a_batch_written_again_lands_once(h: Harness) -> None:
-    """Batch 3, written twice by its attempt (a retried call): its rows once."""
+async def a_commit_written_again_lands_once(h: Harness) -> None:
+    """Commit 3, written twice by its attempt (a retried call): its rows once."""
 
     out = h.output(incremental=True)
     first = await h.store.store(Patch([{"id": "a", "v": "1"}]), None, context(out, 1, commit_number=3))
@@ -218,8 +218,8 @@ async def a_batch_written_again_lands_once(h: Harness) -> None:
     assert await rows(h, second.ref, None) == [("a", "1"), ("b", "1")]
 
 
-async def a_full_run_starts_the_batches_over(h: Harness) -> None:
-    """Batch 3, then batch 4 reset (a full run): only batch 4."""
+async def a_full_run_starts_the_commits_over(h: Harness) -> None:
+    """Commit 3, then commit 4 reset (a full run): only commit 4."""
 
     out = h.output(incremental=True)
     first = await h.store.store(Patch([{"id": "a", "v": "1"}]), None, context(out, 1, commit_number=3))
@@ -286,7 +286,7 @@ async def a_pinned_read_returns_its_version(h: Harness) -> None:
     assert await now(h, second, ledger) == [("a", "2")]
 
 
-async def discarding_never_takes_what_is_read(h: Harness) -> None:
+async def cleanup_never_takes_what_is_read(h: Harness) -> None:
     """a at 1 is superseded by a at 2, and an abandoned attempt (generation
     7) wrote b. Cleaning up the superseded and the abandoned names — twice,
     and names never written — leaves the current content whole."""
@@ -318,7 +318,7 @@ async def a_stale_writer_is_refused(h: Harness) -> None:
     assert await now(h, second, ledger) == [("a", "2")]
 
 
-async def one_generation_admits_one_invocation(h: Harness) -> None:
+async def one_generation_admits_one_worker(h: Harness) -> None:
     """Generation 9 acquired by worker x: worker y of the same
     generation (a duplicate) can neither acquire nor write; x acquiring
     again is its own retry."""
@@ -362,7 +362,7 @@ async def the_next_attempt_replaces_what_a_dead_writer_left(h: Harness) -> None:
         await write(h, out, [{"id": "c", "v": "2"}], 5, Ledger(), first, patch=True)
 
 
-async def a_scope_says_which_keys_it_holds(h: Harness) -> None:
+async def a_partition_says_which_keys_it_holds(h: Harness) -> None:
     """`keys(ref, among)`: the keys the partition holds, sorted by their bytes —
     among those given, or all of them — never a value (docs/versions.md
     §5). Writer 5's patch of c landed and it died: the partition holds c."""
@@ -436,24 +436,24 @@ def _refused():
 
 
 EVERY = [
-    a_replacement_is_the_scopes_whole_content,
+    a_replacement_is_the_partitions_whole_content,
     a_patch_changes_only_its_keys,
     an_empty_replacement_holds_no_key,
     a_write_repeated_by_its_attempt_lands_once,
-    batches_append_and_load_by_range,
-    a_batch_written_again_lands_once,
-    a_full_run_starts_the_batches_over,
+    commits_append_and_load_by_range,
+    a_commit_written_again_lands_once,
+    a_full_run_starts_the_commits_over,
     a_replacement_resolved_writes_its_keys_and_removes_the_rest,
     an_unkeyed_output_is_its_plain_rows,
     partitions_never_touch_each_other,
 ]
-IMMUTABLE = [a_pinned_read_returns_its_version, discarding_never_takes_what_is_read]
+IMMUTABLE = [a_pinned_read_returns_its_version, cleanup_never_takes_what_is_read]
 FENCED = [
     a_stale_writer_is_refused,
-    one_generation_admits_one_invocation,
+    one_generation_admits_one_worker,
     a_first_write_acquires,
     the_next_attempt_replaces_what_a_dead_writer_left,
-    a_scope_says_which_keys_it_holds,
+    a_partition_says_which_keys_it_holds,
     a_newer_writer_waits_for_an_open_older_one,
 ]
 READS = [a_read_reports_the_generation_it_saw]

@@ -110,7 +110,7 @@ class Upkeep:
     # -- key indexes (§6) --------------------------------------------------------------
 
     def truncate(self) -> None:
-        """Drop the delta log batches no consumer's bookmark and no attempt
+        """Drop the delta log commits no consumer's bookmark and no attempt
         in progress still reads."""
 
         needed: dict[tuple, int] = {}
@@ -243,7 +243,7 @@ class Upkeep:
 
     async def collect(self) -> None:
         """Delete the files nothing references, once no reader pinned before
-        they were let go of — an attempt, a paged delta pass, a sensor
+        they were let go of — an attempt, a delta pass over several batches, a sensor
         tick — still reads. Both are positions in the model's event order,
         never wall clocks: two engines' clocks may disagree, the order they
         replay may not."""

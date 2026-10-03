@@ -1,4 +1,4 @@
-"""The build identity in the project revision (docs/per-key-processing.md §13)."""
+"""The build identity in the deploy (docs/per-key-processing.md §13)."""
 
 import subprocess
 
@@ -114,7 +114,7 @@ def test_a_method_mismatch_is_named():
 
 
 async def test_the_engine_warns_when_a_worker_computed_its_revision_another_way(tmp_path, caplog):
-    """A worker whose revision differs because it hashed files while the engine
+    """A worker whose deploy differs because it hashed files while the engine
     used git fails its attempt as before, and the engine says why."""
 
     import logging

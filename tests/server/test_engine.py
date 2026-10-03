@@ -177,8 +177,8 @@ async def test_omitted_output_without_head_fails(state):
 
 
 async def test_rename_and_meta_edges(state):
-    """§5: a str edge renames the bound output; In(meta=) is recorded on the
-    edge in the manifest."""
+    """§5: a str input renames the bound output; In(meta=) is recorded on the
+    input in the manifest."""
     seen = {}
 
     @asset(outputs=Output("raw", key="id"))
@@ -248,7 +248,7 @@ async def test_incremental_filters_input_and_changes(state):
 
 async def test_config_change_reprocesses_everything(state):
     """§6/§2.2: run config is part of the fingerprint —
-    changing it forces full=True on the edge and reprocesses every key."""
+    changing it forces full=True on the input and reprocesses every key."""
     seen = {}
 
     @asset(outputs=Output("files", key="id"))
@@ -271,8 +271,8 @@ async def test_config_change_reprocesses_everything(state):
 
 
 async def test_full_run_resets_watermark(state):
-    """§2.2: a `full` run resets the edge bookmark — the consumer re-reads
-    the whole head (not a diff) and the bookmark lands past the head batch."""
+    """§2.2: a `full` run resets the input bookmark — the consumer re-reads
+    the whole head (not a diff) and the bookmark lands past the head commit."""
     seen = []
 
     @asset(outputs=Output("files", key="id"))
@@ -291,7 +291,7 @@ async def test_full_run_resets_watermark(state):
     first = state.model.bookmark("consumer", "files", "")
     assert first == {
         "kind": "keys",
-        "next": 1,  # the head's next batch: nothing under way
+        "next": 1,  # the head's next commit: nothing under way
         "fingerprint": first["fingerprint"],
         "output": "files",
         "upstream_partition": "",
@@ -401,7 +401,7 @@ async def test_a_selection_reads_its_keys_and_moves_nothing(state):
     it names — on a consumer never run, or one whose full pass stopped
     half-way — and moves neither its bookmark nor its partition's progress: the
     interrupted pass still owes `b`, and resumes."""
-    calls, broken = [], {"page": 1}
+    calls, broken = [], {"batch": 1}
 
     @asset(outputs=Output("files", key="id"))
     def files():
@@ -409,7 +409,7 @@ async def test_a_selection_reads_its_keys_and_moves_nothing(state):
 
     @asset(inputs={"files": Incremental(batch_size=1)}, retries=Retry(n=0))
     def consumer(ctx, files: list):
-        if ctx.batch["files"].index == broken["page"]:
+        if ctx.batch["files"].index == broken["batch"]:
             raise RuntimeError("stopped half-way")
         calls.append(sorted(r["id"] for r in files))
         return []
@@ -431,7 +431,7 @@ async def test_a_selection_reads_its_keys_and_moves_nothing(state):
     await drive(engine, await engine.submit(["consumer"], keys={"files": {"keys": ["c"]}}))
     assert calls == [["c"]] and state.model.bookmark("consumer", "files", "") == stopped
     assert state.model.partition("consumer", "")["caught_up"] is False  # `b` is still owed
-    broken["page"] = None
+    broken["batch"] = None
     calls.clear()
     await drive(engine, await engine.submit(["consumer"]))
     assert calls == [["b"], ["c"]] and state.model.partition("consumer", "")["caught_up"] is True
@@ -441,7 +441,7 @@ async def test_a_selection_reads_its_keys_and_moves_nothing(state):
 
 async def test_a_paged_full_override_resumes_its_pass(state):
     """Engine review round 2 #2: `keys={"files": "full"}` starts one pass per
-    run and its later pages resume it — the first page is not served again."""
+    run and its later batches resume it — the first batch is not served again."""
     seen = []
 
     @asset(outputs=Output("files", key="id"))
@@ -1152,7 +1152,7 @@ async def test_migration_changes_fingerprint_and_marks_handle(state):
 
 
 async def test_ondeploy_fires_once_per_revision(state):
-    """§9: OnDeploy fires when the served revision differs from
+    """§9: OnDeploy fires when the served deploy differs from
     last_deploy, then records it; further ticks stay quiet."""
     calls = []
 
@@ -1178,7 +1178,7 @@ async def test_ondeploy_fires_once_per_revision(state):
 
 
 async def test_ondeploy_silent_on_restart_same_revision(state):
-    """§9: a re-registration of the same revision does not refire."""
+    """§9: a re-registration of the same deploy does not refire."""
     calls = []
 
     @job(automations=Automation(trigger=OnDeploy()))
@@ -1193,7 +1193,7 @@ async def test_ondeploy_silent_on_restart_same_revision(state):
     await engine.run_until(auto["last_run"], 30)
     assert calls == [1]
 
-    engine2 = make_engine(state, project)  # same manifest, same revision
+    engine2 = make_engine(state, project)  # same manifest, same deploy
     await engine2.initialize()
     await engine2.tick()
     auto = state.model.automations["deployed.ondeploy.0"]
@@ -1203,7 +1203,7 @@ async def test_ondeploy_silent_on_restart_same_revision(state):
 
 async def test_ondeploy_two_registrations_fire_latest_once(state):
     """§9: two registrations before a tick fire once, for the latest
-    revision only."""
+    deploy only."""
     calls = []
 
     @job(automations=Automation(trigger=OnDeploy()))
@@ -1214,7 +1214,7 @@ async def test_ondeploy_two_registrations_fire_latest_once(state):
     await make_engine(state, project_a).initialize()
 
     @job(automations=Automation(trigger=OnDeploy()), version="2")
-    def deployed():  # noqa: F811 — redeployed with a new revision
+    def deployed():  # noqa: F811 — redeployed: a new deploy
         calls.append(1)
 
     project_b = Project(assets=[deployed])
@@ -1230,10 +1230,10 @@ async def test_ondeploy_two_registrations_fire_latest_once(state):
 
 
 async def test_a_delivery_says_where_each_page_sits(state):
-    """A pass spans pages of `batch_size`: `page` is the page's index,
-    `pages` the plan, `first` is page 0, `final` the pass running out,
-    and `full` holds on every page of a full pass — for keyed full
-    passes, delta passes and batch-mode upstreams (§5; review round 3,
+    """A pass spans batches of `batch_size`: `index` is the batch's index,
+    `count` the plan, `first` is batch 0, `final` the pass running out,
+    and `full` holds on every batch of a full pass — for keyed full
+    passes, delta passes and unkeyed upstreams (§5; review round 3,
     system B5)."""
 
     from solera.stores import Patch
@@ -1273,7 +1273,7 @@ async def test_a_delivery_says_where_each_page_sits(state):
     await drive(engine, await engine.submit(["consumer"], upstream=True))
     assert pages == [(0, 3, True, False, True), (1, 3, False, False, True), (2, 3, False, True, True)]
     assert sorted(rebuilt["keys"]) == [f"k{i}" for i in range(7)]
-    # A delta pass of four changed keys: two pages.
+    # A delta pass of four changed keys: two batches.
     pages.clear()
     for key in ("k0", "k2", "k4", "k6"):
         content[key] = 2
@@ -1295,8 +1295,8 @@ async def test_a_delivery_says_where_each_page_sits(state):
 
 
 async def test_the_page_plan_is_an_estimate_but_final_is_not(state):
-    """Patterns filter keys after the plan is made: pages are formed from the
-    keys they take, read ahead past the rest, so the pass takes the pages
+    """Patterns filter keys after the plan is made: batches are formed from the
+    keys they take, read ahead past the rest, so the pass takes the batches
     it takes, none is empty, and `final` is on the last real one (§5)."""
 
     pages = []
@@ -1317,12 +1317,12 @@ async def test_the_page_plan_is_an_estimate_but_final_is_not(state):
     await drive(engine, await engine.submit(["consumer"], upstream=True))
     assert pages == [
         (0, 3, False, ["k0", "k1", "k2"]),
-        (1, 3, True, ["k3"]),  # k4..k6 read past: nothing follows, so this page is final
+        (1, 3, True, ["k3"]),  # k4..k6 read past: nothing follows, so this batch is final
     ]
 
 
 async def test_pages_read_ahead_past_keys_the_patterns_leave_out(state):
-    """Every page holds `batch_size` taken keys, however sparse they are in the
+    """Every batch holds `batch_size` taken keys, however sparse they are in the
     upstream; a pass that takes none never calls the producer."""
 
     calls = []
@@ -1351,14 +1351,14 @@ async def test_pages_read_ahead_past_keys_the_patterns_leave_out(state):
 
 
 async def test_a_page_looks_ahead_a_bounded_way(state, monkeypatch):
-    """Review round 5 (system #5): a page reads the index in chunks, whatever
+    """Review round 5 (system #5): a batch reads the index in chunks, whatever
     it still lacks, and examines at most `LOOKAHEAD` entries — past them it
-    goes as it is, not final; a page left with nothing is skipped without
+    goes as it is, not final; a batch left with nothing is skipped without
     calling the producer, and the pass still completes."""
     from solera.keys.index import key_bytes
     from solera_worker import each
 
-    # The reviewer's case: 100 matches at the head of 10,000 keys, a page of 100.
+    # The reviewer's case: 100 matches at the head of 10,000 keys, a batch of 100.
     keys = [key_bytes(f"a/{i:05d}") for i in range(10_000)]
     scans = []
 

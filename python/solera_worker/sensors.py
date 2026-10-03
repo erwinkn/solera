@@ -42,7 +42,7 @@ class HttpSensorChannel:
     async def next(self, executor: str, deploy: str, host: str, slots: int, build: str | None = None) -> dict:
         params = {"executor": executor, "deploy": deploy, "host": host, "slots": slots, "wait": 30}
         if build:
-            params["build"] = build  # how this host computed its revision, for the engine's warning
+            params["build"] = build  # how this host computed its deploy, for the engine's warning
         response = await self.client.get(f"{self.base}/next", params=params)
         response.raise_for_status()
         return response.json()
@@ -91,7 +91,7 @@ async def run_sensor_host(
     watch: float = 1.0,
 ) -> int:
     """Run ticks until `max_ticks` ran, one overran, or the engine serves
-    another revision (then after `stale_wait`: a host started afresh loads
+    another deploy (then after `stale_wait`: a host started afresh loads
     the code as it is now); returns the exit code. Ticks still running
     `drain` seconds after it stops asking are left: their claims expire,
     and the sensors tick again on the next host. An engine's own host is
