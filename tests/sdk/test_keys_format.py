@@ -340,6 +340,44 @@ def test_a_compaction_names_every_object_it_drops():
     assert job.garbage == 3
 
 
+def _zlib_bomb(payload_bytes: int) -> bytes:
+    """One well-formed block entry, key `a`, with a payload of zeros, zlib
+    compressed: a few KB that inflate a thousandfold."""
+
+    import zlib
+
+    head = bytearray(b"\x00\x01a\x04\x01")  # shared 0, suffix "a", flags: payload, generation 1
+    _python.put_varint(head, payload_bytes)
+    z = zlib.compressobj(9)
+    out = z.compress(bytes(head))
+    chunk = bytes(1 << 20)
+    for _ in range(payload_bytes >> 20):
+        out += z.compress(chunk)
+    return out + z.flush()
+
+
+@pytest.mark.xfail(strict=True, reason="F29: open")
+@pytest.mark.parametrize(
+    "read",
+    [
+        lambda b: _native.lookup([b], 1, [b"a"]),
+        lambda b: _native.merge_range([[b]], [1], None, None, False),
+        lambda b: _native.decode_block(b, 1),
+    ],
+    ids=["lookup", "merge_range", "decode_block"],
+)
+def test_a_block_that_inflates_past_its_bound_is_refused(read):
+    """F29: the readers that take a block without a limit inflated whatever
+    its zlib stream held: here 32 KB to 32 MiB; a 64 MB block could ask for
+    gigabytes. A block's decoded size is bounded by what its file declares,
+    and one past it fails fast, before it is inflated whole."""
+
+    bomb = _zlib_bomb(32 << 20)
+    assert len(bomb) < 64 << 10
+    with pytest.raises(ValueError):
+        read(bomb)
+
+
 def test_malformed_input_raises_errors_never_panics():
     """Whatever the bytes — mutated files and blocks, truncations, noise —
     every parser and kernel raises a `ValueError` (`FormatError`), never a
