@@ -13,7 +13,6 @@ python/solera/_native*.so
 spec/tla/.tools/
 spec/tla/states/
 spec/tla/*_TTrace_*
-native/kani/target/
 native/fuzz/target/
 native/fuzz/corpus/
 native/fuzz/artifacts/

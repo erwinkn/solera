@@ -243,44 +243,24 @@ with Hypothesis drawing the inputs (in CI, a few seconds each):
   until the design is built. One part runs now: on FileStore, PostgresStore
   and S3Store, a `keys=` run never touches a key it does not name.
 
-## Kani: bounded proofs on the native readers
+## Kani: tried, then dropped
 
-`native/kani` holds Kani proofs on the `.kx` readers: for every input
-within a bound, not a sample of them. Run `cargo kani -Z stubbing` there
-(Kani 0.68, CBMC 6.11): four harnesses, about 40 s, a few hundred MB.
-
-| Harness | What it proves | Time |
-|---|---|---|
-| `a_varint_read_stays_in_bounds` | any 12 bytes, any start: an error, or a read of at most 10 bytes inside them | 7 s |
-| `a_varint_round_trips` | every `u64` written reads back, using exactly its bytes | 7 s |
-| `a_varint_read_loses_no_bits` | a varint the reader accepts is its bytes' exact LEB128 value. On the code before F23's fix (ab0c346^) it fails in 11 s with F23's counterexample | 4 s |
-| `any_filters_parse_or_err` | 16 bytes of filters and a footer with any offsets, lengths and file size: an error, or filters of exactly `nbits / 8` bytes, nothing read outside | 19 s |
-
-What it could not do, on the M5 Max with a 16 GB cap:
-
-- **Block decoding** (`Block::decode`), even at 6 bytes: CBMC passed 16 GB
-  in 5 minutes. The decoder grows two vectors by symbolic amounts.
-- **The block index** (`parse_index_at_most`, 16 bytes) and **garbage
-  files** (12-byte body): no answer in 10 minutes (8–10 GB).
-- **A footer with any version**: the error message formats the version,
-  and Rust's formatting machinery on a symbolic value did not finish in 25
-  minutes. The other harnesses fix magic, version and codec for this reason.
-- **zlib** (codec 1), and **the writer, merges and compactions**: they run
-  on rayon's threads, which Kani does not model, so file round trips and
-  merge invariants are out of reach without restructuring the code.
-
-CRC-32 is stubbed: its SIMD path is out of Kani's reach, and a hostile
-file carries a matching checksum anyway.
-
-**Verdict.** Kani adds proof for all inputs where the property tests and
-fuzzers sample, and it is cheap where it works: 40 s, one small crate. It
-found F23 in seconds on the old code, but only once someone wrote the
-property ("no bits lost"). The same property as a differential test,
-native against the reference on arbitrary bytes, would likely have found
-it too. Where the risk is (block, index, merge), CBMC runs out of memory or
-time at a few bytes, so the fuzzers carry that. Keep the four harnesses as
-a check to run when `format.rs`'s varints or filters change. Write a new
-one only for small, allocation-free parsing functions.
+Kani (0.68, with CBMC) was tried on the native readers in October 2026.
+It proved, for every input within its bound, that the varint reader stays
+in bounds, round-trips every `u64` and drops no bits, and that the filters'
+parser reads nothing outside its bytes whatever its offsets. On the code
+before ab0c346 it found F23 in 11 s. Everything else ran out of memory or
+time at a few bytes (block, index and garbage-file decoding), or was out of
+its reach (zlib, and the writer and merges, which run on rayon's threads).
+It was dropped because only small, allocation-free parsers were in reach,
+and those are covered without its toolchain: `test_varints_read_alike_and_whole`
+compares native and the reference on every varint length from 1 to 11
+bytes and every pattern of the ninth and tenth bytes (it fails on the code
+before ab0c346), `test_generations_at_the_varint_edges_round_trip` writes
+every u64 edge, `test_filters_read_alike_whatever_they_hold` reads any
+filter bytes both ways, and the `kx-file` fuzz target reaches the filters
+with any offsets (in its corpus, 478 inputs parse whole and every refusal
+of the filters' parser occurs).
 
 ## Fuzzing: bytes that may be corrupt or hostile
 
