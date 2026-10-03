@@ -12,7 +12,7 @@ Each (asset, input, partition) keeps a **position**:
       "pass": {                     # a pass under way, in batches over attempts
         "mode": "full" | "delta" | "diff",
         "from": int, "to": int,     # its boundary, decided when it starts
-        "at": key | commit | None,  # its cursor: the last key delivered, the next commit
+        "at": key | commit | None,  # its place: the last key delivered, the next commit
         "batch": int, "batches": int,  # the next batch's index, and how many are planned
         "pin": int,                 # a delta pass's reader pin (lifecycle.md §9.8)
         "reconcile": bool,          # a full Each pass owes a reconcile after (§11)

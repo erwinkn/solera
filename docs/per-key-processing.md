@@ -571,7 +571,7 @@ on its next run.
 
 **Every eligible key is retried**; the only question is pacing. Retries
 form **batches of their own**, up to `batch_size` keys, in a **retry pass**:
-a walk over the failed keys in key order, with its cursor in the
+a walk over the failed keys in key order, with its place in the
 position:
 
 ```
@@ -929,7 +929,7 @@ is below the current one.
   superseded: a key's version is a generation (`versions.md`), and the
   grammar is gone.
 - `Rows` must group natively, and patches must move onto `Rows` (§7).
-- The position gains two cursors: the pattern change drain (§11) and the retry
+- The position gains two places: the pattern change drain (§11) and the retry
   pass (§9).
 - Cancel commits a partial batch (§5): it needs the lifecycle's two-phase
   cancel, with a drain before any forced abort.
@@ -976,7 +976,7 @@ is below the current one.
   outcomes, the failure delta, retry and pattern change batches, partial commits on
   cancel.
 - `python/solera_server/engine.py`: the `Failures` record, the due clock,
-  deploy numbers, pattern change and retry cursors on the
+  deploy numbers, pattern change and retry places on the
   position, alternation of retry and change batches, the cancel drain.
 - `python/solera_server/history.py`: `key_outcomes`; per-key counts on
   `attempts`.
@@ -1109,7 +1109,7 @@ Where the implementation (`solera/errors.py`, `solera/build.py`,
 - **The pattern change pattern change** lives on the position: `patterns` (what it
   delivers under) and, during a transition, `pattern change` {`old`, `new`,
   `pattern change`, `snapshot` (the upstream index as of the pattern change), `pin`};
-  the diff is a pass of mode `diff`, its cursor the position's
+  the diff is a pass of mode `diff`, its place the position's
   `pass.at`. The diff reads the whole snapshot (`batch_size` keys
   read per batch), not only the key ranges the patterns' prefixes cover.
   A newer pattern change waits for the transition to end, then cuts over

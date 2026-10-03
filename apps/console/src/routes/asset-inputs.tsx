@@ -126,7 +126,7 @@ function EdgeCard({ input, partition }: { input: Input; partition?: string }) {
                 <Th className="text-right">Delivered to</Th>
                 <Th className="text-right">Upstream head</Th>
                 <Th>Lag</Th>
-                <Th>Progress</Th>
+                <Th>Pass under way</Th>
               </tr>
             </thead>
             <tbody>
@@ -150,7 +150,7 @@ function PartitionRow({ s }: { s: InputPartition }) {
   const d = position?.pass;
   const at =
     typeof d?.at === "string" ? `after ${d.at}` : typeof d?.at === "number" ? `commit ${count(d.at)}` : null;
-  const progress = d ? [d.mode, at, `batch ${d.batch + 1} of ${d.batches}`].filter(Boolean).join(" · ") : null;
+  const underWay = d ? [d.mode, at, `batch ${d.batch + 1} of ${d.batches}`].filter(Boolean).join(" · ") : null;
   return (
     <Tr>
       <Td className="font-mono text-xs">
@@ -191,7 +191,7 @@ function PartitionRow({ s }: { s: InputPartition }) {
           </span>
         )}
       </Td>
-      <Td className="max-w-64 truncate font-mono text-xs text-fg-muted">{progress ?? "—"}</Td>
+      <Td className="max-w-64 truncate font-mono text-xs text-fg-muted">{underWay ?? "—"}</Td>
     </Tr>
   );
 }

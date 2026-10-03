@@ -151,7 +151,7 @@ async def read_each_batch(spec: dict, pin: dict, keys_io) -> Batch:
         priors = await failures.lookup(touched) if touched else {}
         batch.priors = {key_str(k): Record.decode(p) for k, (_, p) in priors.items()}
         return batch
-    # A retry batch: walk the failed keys from the pass's cursor, taking the
+    # A retry batch: walk the failed keys from the pass's place, taking the
     # keys that are due, `limit` at most (§9).
     limit = int(pin["batch"]["limit"])
     after = pin["batch"]["retry"].get("after")

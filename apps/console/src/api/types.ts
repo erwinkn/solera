@@ -337,7 +337,7 @@ export type InputState = "never" | "caught_up" | "behind" | "delta" | "full" | "
 
 /** An input's position (python/solera_server/positions.py): `next`,
  * the first upstream commit not yet delivered; `pass`, one under way —
- * its mode, boundary (`from`..`to`) and cursor (`at`: the last key
+ * its mode, boundary (`from`..`to`) and place (`at`: the last key
  * delivered, or the next commit). */
 export interface Position {
   kind: "keys" | "commits";

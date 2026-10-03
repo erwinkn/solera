@@ -458,7 +458,7 @@ store resets the output altogether (object-store-state.md §2). The
 engine keeps a per-input **position** — how far the consumer has read: `next`,
 the first upstream commit not yet delivered, and while a pass is under
 way, `pass` `{mode, from, to, at, batch, batches}`: `full` or `delta`, its
-boundary, and its cursor (the last key delivered, or the next commit),
+boundary, and its place (the last key delivered, or the next commit),
 all decided when it starts and kept until its last batch. For a keyed
 upstream the spec pins the index and a range — the delta log from `next`
 to the head, or the whole index for a full pass — and the worker reads

@@ -260,7 +260,7 @@ class Views:
 
         `position.next` is the first upstream commit the input has not yet
         delivered (`pass`, a pass under way, keeps its boundary and
-        cursor until its last batch — see `pass`). So `lag` = head
+        place until its last batch — see `pass`). So `lag` = head
         commit + 1 − `next`: the upstream commits not yet
         delivered in full — counted from the head's `base` for an unkeyed
         upstream, which starts over there; every commit without a position.

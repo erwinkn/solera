@@ -988,7 +988,7 @@ class Engine(Attempts, Sensors, Views):
         returns the pin for the spec, the plan its commit `advance`s the
         position by, and whether nothing is pending.
 
-        A pass under way goes on from its cursor. Otherwise one starts:
+        A pass under way goes on from its place. Otherwise one starts:
         `full` for a missing position, a fingerprint change, a `full` run or a
         keys='full' override; else a `delta` of the commits since `next`. A
         keyed upstream is read through its key index by the worker — a delta
@@ -1281,7 +1281,7 @@ class Engine(Attempts, Sensors, Views):
         transitions; the bounds are lowered by the records it wrote; a retry
         batch advances its pass and folds the range it walked into the pass's
         accumulators, which become the exact bounds when the pass completes;
-        a change batch folds what it wrote behind the pass's cursor; a
+        a change batch folds what it wrote behind the pass's place; a
         reconcile batch moves the cleanup on. Returns the record's commit, the
         `more`, and the position a reconcile batch leaves (else None)."""
 
