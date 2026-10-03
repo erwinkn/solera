@@ -980,3 +980,31 @@ async def test_a_migration_it_cannot_run_is_refused_when_it_runs(store):
     out = output(key="id", migrations=[Migration("odd", 42)])
     with pytest.raises(StoreError, match="SQL string or a callable"):
         await store.migrate(out, out.migrations)
+
+
+@pytest.mark.xfail(strict=True, reason="F18: the migration ledger is keyed by output name, not by table")
+async def test_a_migration_applies_to_each_schemas_table_of_one_name(store):
+    """F18: two projects (or a staging and a production namespace) on one
+    database each write an output `orders`, in schemas of their own. A
+    migration applied to the first table is applied to the second too: the
+    ledger knows which table it changed."""
+
+    from solera.sdk import Migration
+
+    name, tables = f"t_{uuid.uuid4().hex[:12]}", []
+    for side in ("a", "b"):
+        schema = f"{name}_{side}"
+        with store._connect() as conn, conn.cursor() as cur:
+            cur.execute(f'CREATE SCHEMA "{schema}"')
+        out = Output(name, key="id", store="postgres", schema=schema, columns={"id": "text", "v": "text"})
+        written = await store.store([{"id": "x", "v": "1"}], None, context(out))
+        out.migrations = (Migration("note", f'ALTER TABLE "{schema}"."{name}" ADD COLUMN note text'),)
+        assert await store.migrate(out, out.migrations, prior=written.ref) == ["note"]
+        tables.append(schema)
+    with store._connect() as conn, conn.cursor() as cur:
+        for schema in tables:
+            columns = cur.execute(
+                "SELECT column_name FROM information_schema.columns WHERE table_schema = %s AND table_name = %s",
+                (schema, name),
+            ).fetchall()
+            assert "note" in {r["column_name"] for r in columns}, schema
