@@ -438,3 +438,105 @@ async def test_a_key_a_moved_output_dropped_leaves_its_consumer(state, tmp_path)
     assert status_of(await drive(engine, held)) == "succeeded"
     assert status_of(await drive(engine, await engine.submit(["copy"]))) == "succeeded"
     assert sorted((await engine.list_keys("copy"))["keys"]) == ["k10", "k12"]
+
+
+F19 = pytest.mark.xfail(strict=True, reason="F19: an asset added back resumes its first life")
+
+
+@pytest.mark.parametrize("ends", [pytest.param("succeeds", marks=F19), "fails", "lost"])
+@pytest.mark.parametrize("when", ["before", "during"])
+async def test_an_attempt_of_a_removed_and_readded_asset_stays_in_its_life(state, monkeypatch, ends, when):  # noqa: F811
+    """Execution spec review: an asset removed and added back under its name
+    starts a new life (F12), and an attempt of its first life, launched
+    before the removal, ends after the re-add — committing, failing or
+    lost, before the new life's first run or while it waits. It must not
+    write into the new `copy`, settle into it, nor hold its claim: no head
+    of the new life is that attempt's, the new life's content is what its
+    own code wrote, and both runs end. (The first life's run may carry on
+    with a fresh attempt of the new life's code, as a renamed asset's does.)"""
+
+    await _first_life_across_a_readd(state, monkeypatch, ends, when)
+
+
+@F19
+async def test_a_name_removed_while_its_attempt_runs_and_added_back_starts_over(state, monkeypatch):  # noqa: F811
+    """F19, F12's rule across a live attempt: removing `copy` while its
+    attempt runs defers retiring its state until the attempt settles;
+    adding it back before then must still start it over — no head, no
+    bookmarks of the first life."""
+
+    await _first_life_across_a_readd(state, monkeypatch, "fails", "before", fresh=True)
+
+
+async def _first_life_across_a_readd(state, monkeypatch, ends: str, when: str, fresh: bool = False):  # noqa: F811
+    from solera_server import attempts
+    from solera_server.executors.inline import InlinePlacement
+
+    monkeypatch.setattr(attempts, "AFTER_COMMIT_WAIT", 0.2)  # the stopped engine's answer to `finished`
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    @asset(outputs=Output("items", key="id"))
+    def items():
+        return [{"id": "a"}, {"id": "b"}]
+
+    def project(life: str | None):
+        if life is None:
+            return Project(assets=[items])
+
+        @asset(outputs=Output("copy", key="id"), inputs={"items": Incremental()}, version=life)
+        async def copy(ctx, items: list):
+            if life == "1" and ctx.run_id != first["id"]:  # the first life's second run: held
+                entered.set()
+                await release.wait()
+                if ends == "fails":
+                    raise RuntimeError("the first life fails")
+            return [{"id": r["id"], "life": life} for r in items]
+
+        return Project(assets=[items, copy])
+
+    async def content():
+        head = state.model.heads.get(("copy", ""))
+        assert head is None or head["attempt"] != held, "the first life's attempt settled into the second"
+        if head is None:
+            return None
+        rows = await FileStore().load(_ref(head), list[dict], await whole(state, "copy"))
+        return sorted((r["id"], r["life"]) for r in rows)
+
+    first: dict = {}
+    engine = make_engine(state, project("1"))
+    await engine.initialize()
+    first.update(await engine.submit(["copy"], upstream=True))
+    assert status_of(await drive(engine, first)) == "succeeded"
+    old = await engine.submit(["copy"], mode="full")
+    while not entered.is_set():
+        await engine.tick()
+        await asyncio.sleep(0.01)
+    (held,) = [c["attempt"] for c in state.model.claims.values()]
+    await engine.stop()
+
+    engine = make_engine(state, project(None))  # `copy` removed
+    await engine.initialize()
+    await engine.stop()
+
+    engine = make_engine(state, project("2"))  # and added back
+    await engine.initialize()
+    if fresh:
+        release.set()  # the held worker goes on; what it does is the other test's
+        assert ("copy", "") not in state.model.heads, "the second life starts with the first's head"
+        assert not state.model.partition("copy", "").get("bookmarks"), "and its bookmarks"
+        return
+    new = await engine.submit(["copy"], mode="full") if when == "during" else None
+    if ends == "lost":
+        InlinePlacement._tasks[held].cancel()
+    release.set()
+    try:
+        await drive(engine, old, timeout=10)
+        assert await content() in (None, [("a", "2"), ("b", "2")])
+        new = new or await engine.submit(["copy"], mode="full")
+        assert status_of(await drive(engine, new, timeout=10)) == "succeeded"
+    except TimeoutError:
+        raise AssertionError(f"a run never ends: claims {state.model.claims}") from None
+    assert await content() == [("a", "2"), ("b", "2")]
+    assert not state.model.claims
+    commits = (await engine.history.commits(outputs=["copy"]))["commits"]
+    assert held not in {c["attempt"] for c in commits}, "the first life's attempt committed into the second"
