@@ -475,7 +475,7 @@ class Batch:
     batch, and swaps or finalizes on `final`. One that keeps a total moves it
     by the changes, starting from what it holds (`ctx.load()`):
 
-        before = 0 if batch.full and batch.first else ctx.load()["count"]
+        before = 0 if batch.full and batch.first else (await ctx.load())["count"]
         return {"count": before + len(batch.added) - len(batch.removed)}"""
 
     rows: Any = ()

@@ -752,3 +752,134 @@ async def test_a_reset_of_the_input_drops_the_failed_keys(state, tmp_path):
     await engine.initialize()
     assert "failures" not in state.model.partition("checks", "")
     assert ("@checks", "") not in state.model.indexes
+
+
+# -- A19 -------------------------------------------------------------------------------------
+
+
+def a19(finding: str):
+    return pytest.mark.xfail(strict=True, raises=AssertionError, reason=f"A19 {finding}")
+
+
+def fed(tmp_path, outside, *assets, extra=()):
+    from solera.sdk import Source
+    from solera.stores import FileStore
+
+    from tests.sim.project import SourceStore
+
+    return Project(
+        assets=[*extra, *assets],
+        sources=[Source("feed", key="id", store="ext")],
+        stores={"ext": SourceStore(tmp_path / "ext", outside)},
+        default_store=FileStore(tmp_path / "default"),
+    )
+
+
+@a19("R6")
+async def test_a_keys_selection_runs_batch_size_keys_at_a_time(state, tmp_path):
+    """A19 R6, D80: batch_size bounds a per-key asset's keys at once, a
+    keys= selection's too: five named keys in batches of two make three
+    attempts, never more than two calls at once."""
+
+    from tests.sim.project import External
+
+    outside, live = External(), {"now": 0, "max": 0}
+
+    @asset(inputs={"row": Incremental("feed", each=True, batch_size=2)}, outputs=Output("checks", key="id"))
+    async def checks(ctx, row: list):
+        live["now"] += 1
+        live["max"] = max(live["max"], live["now"])
+        await asyncio.sleep(0.01)
+        live["now"] -= 1
+        return [{"v": row[0]["v"]}]
+
+    engine = make_engine(state, fed(tmp_path, outside, checks))
+    await engine.initialize()
+    outside.feed.update({f"k{i}": "1" for i in range(5)})
+    await engine.commit_source("feed", upsert=dict(outside.feed))
+    detail = await drive(engine, await engine.submit(["checks"], keys={"feed": {"keys": list(outside.feed)}}))
+    assert status_of(detail) == "succeeded"
+    assert live["max"] <= 2 and sum(len(a) for a in detail["attempts"].values()) == 3, live
+
+
+@a19("R7")
+async def test_binding_a_whole_input_to_another_head_rebuilds_every_key(state, tmp_path):
+    """A19 R7: `checks` reads factor=In(low) (1); a deploy binds it to
+    In(high) (10), committed before the last pass began. The binding is the
+    definition's, so every key is rebuilt under 10, not only the next one
+    its upstream changes."""
+
+    from solera import In
+
+    from tests.sim.oracle import keyed_content
+    from tests.sim.project import External
+
+    outside = External()
+    outside.feed.update({"k1": "1", "k2": "1"})
+
+    def project(which):
+        @asset
+        def low():
+            return 1
+
+        @asset
+        def high():
+            return 10
+
+        @asset(
+            inputs={"row": Incremental("feed", each=True), "factor": In(which)},
+            outputs=Output("checks", key="id"),
+        )
+        async def checks(ctx, row: list, factor: int):
+            return [{"v": str(factor)}]
+
+        return fed(tmp_path, outside, checks, extra=(low, high))
+
+    engine = make_engine(state, project("low"))
+    await engine.initialize()
+    await engine.commit_source("feed", upsert=dict(outside.feed))
+    for name in ("low", "high", "checks"):
+        await drive(engine, await engine.submit([name]))
+    await engine.stop()
+    p = project("high")
+    engine = make_engine(state, p)
+    await engine.initialize()
+    await drive(engine, await engine.submit(["checks"]))
+    outside.feed["k1"] = "2"
+    await engine.commit_source("feed", upsert={"k1": "2"})
+    await drive(engine, await engine.submit(["checks"]))
+    assert await keyed_content(engine, p, "checks") == {"k1": "10", "k2": "10"}
+    assert await engine.stale_reasons("checks", "") == []
+
+
+@a19("R8")
+async def test_a_forced_retry_runs_after_its_source_reverts(state, tmp_path):
+    """A19 R8: `checks` rejects k1 at version 1; the source goes to 2 and back
+    to 1 (the net delta: nothing). A forced retry of rejected keys still calls
+    it: a due retry is not handed to a delta that will never deliver it."""
+
+    from tests.sim.project import External
+
+    outside, calls, failing = External(), [], [True]
+
+    @asset(inputs={"row": Incremental("feed", each=True)}, outputs=Output("checks", key="id"))
+    async def checks(ctx, row: list):
+        calls.append(ctx.key)
+        if failing[0]:
+            raise Rejected("reject once")
+        return [{"v": row[0]["v"]}]
+
+    engine = make_engine(state, fed(tmp_path, outside, checks))
+    await engine.initialize()
+    outside.feed["k1"] = "1"
+    await engine.commit_source("feed", upsert={"k1": "1"})
+    await drive(engine, await engine.submit(["checks"]))
+    failing[0] = False
+    for v in ("2", "1"):
+        outside.feed["k1"] = v
+        await engine.commit_source("feed", upsert={"k1": v})
+    calls.clear()
+    engine.retry_keys("checks", ["rejected"])
+    await drive(engine, await engine.submit(["checks"]))
+    assert calls == ["k1"]
+    assert not engine.m.partition("checks", "")["failures"]["counts"]

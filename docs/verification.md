@@ -286,9 +286,11 @@ with Hypothesis drawing the inputs (in CI, a few seconds each):
   incremental asset is delivered exactly what its record lacks, nothing
   twice. The read-ahead, its cap, full passes, transitive reasons, R2,
   the net delta and K44's classes pass on every store (the reference's
-  switch for the build before the net delta is gone with it); what waits
-  for each=True per-key records is a strict xfail naming it. One part runs now: on FileStore, PostgresStore
-  and S3Store, a `keys=` run never touches a key it does not name.
+  switch for the build before the net delta is gone with it), each=True on
+  the same record as every asset (K47). A19's histories of delivery
+  accounting are strict xfails naming each finding until its fix (D93). On
+  FileStore, PostgresStore and S3Store, a `keys=` run never touches a key
+  it does not name.
 
 **Staleness, by example.** The machine found these histories while K47
 was built. Each was an engine bug then, fixed in K47; the first failed

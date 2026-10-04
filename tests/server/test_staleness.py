@@ -1,13 +1,12 @@
 """Staleness at every level (K43, K45, K46; tests/staleness.py states the rules):
 the engine's stale keys, partition and asset statuses against a reference
 model, over random histories; worked examples and calibrations; and R2 on
-every built-in store. Strict xfails until W22 builds the rules
-(`staleness.LANDED`)."""
+every built-in store."""
 
 import asyncio
 
 import pytest
-from hypothesis import HealthCheck, Phase, settings
+from hypothesis import HealthCheck, settings
 from hypothesis import strategies as st
 from hypothesis.stateful import RuleBasedStateMachine, initialize, invariant, precondition, rule
 from solera.sdk import Incremental, Output, Project, Source, asset
@@ -21,17 +20,6 @@ from tests.sim.project import External, SourceStore, rebuild
 from .engines import drive, make_engine
 
 KEYS = ["k1", "k2", "k3", "x1"]  # `x*`: what `checks` and `copy` exclude
-
-
-def pending(why: str):
-    """A strict xfail for what the build (8666748, 3c4ade0) does not have yet."""
-
-    return pytest.mark.xfail(
-        strict=True, raises=(staleness.NotBuilt, AssertionError, pytest.fail.Exception), reason=why
-    )
-
-
-per_key = pending("each=True staleness from the one record, position + read-ahead (K47): W22's next step")
 
 
 def taken(key: str) -> bool:
@@ -318,7 +306,6 @@ Staleness.TestCase.settings = settings(
     deadline=None,
     derandomize=True,  # the same histories every run: CI never flakes on a rare one (as the simulation's)
     suppress_health_check=list(HealthCheck),
-    phases=list(Phase) if staleness.LANDED else [Phase.explicit, Phase.generate],
 )
 
 
@@ -666,7 +653,6 @@ async def test_keys_runs_past_the_read_ahead_cap_are_refused_until_a_default_run
     await drive(engine, await engine.submit(["copy"], keys={"items": {"keys": ["k1"]}}))
 
 
-@per_key
 async def test_keys_runs_on_an_each_asset_count_toward_the_cap_too(state, tmp_path):
     """K47: an each=True asset keeps the same record, so its keys= runs are
     read-ahead entries, and the cap (2 here) counts the ones that leave
@@ -1115,13 +1101,11 @@ async def _keys_run(kind, tmp_path, reset, case):
 
 
 STORES = ["file", "postgres", "s3"]
-# Each example runs an engine: few of them, and while the rules are not built, no
-# shrinking of the failure the strict xfail expects.
+# Each example runs an engine: few of them.
 MERGE_SETTINGS = settings(
     max_examples=6,
     deadline=None,
     suppress_health_check=list(HealthCheck),
-    phases=list(Phase) if staleness.LANDED else [Phase.explicit, Phase.generate],
 )
 
 
@@ -1187,3 +1171,77 @@ async def test_a_dep_change_is_an_input_change_and_a_full_pass(state, tmp_path):
     after = {k: g for k, (g, _) in (await index_entries(state, "checks", "")).items()}
     assert all(after[k] > written[k] for k in written), "every key reprocessed"
     assert not await staleness.partition_stale(engine, "checks")
+
+
+# -- A19: staleness from the finest keys -----------------------------------------------------
+
+
+def a19(finding: str):
+    return pytest.mark.xfail(strict=True, raises=AssertionError, reason=f"A19 {finding}")
+
+
+def chain(root, outside, include=None):
+    """`feed` -> `items` -> `checks` (each=True, `include`) -> `filtered`
+    (each=True over `checks`, include=(k1))."""
+
+    @asset(inputs={"feed": Incremental()}, outputs=Output("items", key="id"))
+    def items(ctx, feed: list):
+        return rebuild(ctx.batch["feed"], [{"id": r["id"], "v": r["v"]} for r in feed])
+
+    @asset(
+        inputs={"row": Incremental("items", each=True, include=include)}, outputs=Output("checks", key="id")
+    )
+    async def checks(ctx, row: list):
+        return [{"v": row[0]["v"]}]
+
+    @asset(
+        inputs={"row": Incremental("checks", each=True, include=["k1"])}, outputs=Output("filtered", key="id")
+    )
+    async def filtered(ctx, row: list):
+        return [{"v": row[0]["v"]}]
+
+    return Project(
+        assets=[items, checks, filtered],
+        sources=[Source("feed", key="id", store="ext")],
+        stores={"ext": SourceStore(root / "ext", outside)},
+        default_store=FileStore(root / "default"),
+    )
+
+
+async def _chain(state, tmp_path, keys, include=None):
+    outside = External()
+    outside.feed.update(keys)
+    engine = make_engine(state, chain(tmp_path, outside, include))
+    await engine.initialize()
+    await engine.commit_source("feed", upsert=dict(keys))
+    for name in ("items", "checks", "filtered"):
+        await drive(engine, await engine.submit([name]))
+    return engine, outside
+
+
+@a19("R9")
+async def test_a_pattern_change_that_excludes_every_held_key_leaves_it_stale(state, tmp_path):
+    """A19 R9: `checks` holds k1; a deploy narrows it to include=(k2), which
+    the upstream lacks. k1 is still held and its removal owed: `checks` is
+    stale, and k1 is its stale key."""
+
+    engine, outside = await _chain(state, tmp_path, {"k1": "1"})
+    await engine.stop()
+    engine = make_engine(state, chain(tmp_path, outside, include=["k2"]))
+    await engine.initialize()
+    assert await staleness.stale_keys(engine, "checks") == {"k1"}
+    assert await staleness.partition_stale(engine, "checks")
+
+
+@a19("R10")
+async def test_an_each_consumer_is_not_upstream_stale_for_a_key_it_excludes(state, tmp_path):
+    """A19 R10: `filtered` takes k1 of `checks`. Only k2 changes upstream,
+    and `checks` is stale for k2 alone: `filtered` depends on nothing stale,
+    so it is fresh, its stale keys none."""
+
+    engine, outside = await _chain(state, tmp_path, {"k1": "1", "k2": "1"})
+    outside.feed["k2"] = "2"
+    await engine.commit_source("feed", upsert={"k2": "2"})
+    await drive(engine, await engine.submit(["items"]))
+    assert await staleness.stale_keys(engine, "filtered") == set()
+    assert await staleness.stale_reasons(engine, "filtered") == set()

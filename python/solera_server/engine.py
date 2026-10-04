@@ -427,8 +427,9 @@ class Engine(Attempts, Sensors, Staleness, Views):
         **options,
     ) -> dict | None:
         """The run a request becomes, without submitting it (`planning.Planner.plan_run`).
-        A `keys=` selection of a plain incremental input is refused where its
-        partition's read-ahead is full (K45): that partition must run first."""
+        A `keys=` selection of an incremental input, `each=True` included
+        (K47: one record), is refused where its partition's read-ahead is
+        full (K45): that partition must run first."""
 
         run = self.planner(projected).plan_run(
             targets, partitions, mode, upstream, config, keys, active=self._partition_active, **options
@@ -436,11 +437,7 @@ class Engine(Attempts, Sensors, Staleness, Views):
         selected = {o for o, override in (keys or {}).items() if isinstance(override, dict)}
         for task in (run or {}).get("tasks", {}).values() if selected else ():
             for param, spec in self.manifest["assets"][task["asset"]]["inputs"].items():
-                if (
-                    spec.get("kind") != "incremental"
-                    or spec.get("output") not in selected
-                    or spec.get("each")
-                ):
+                if spec.get("kind") != "incremental" or spec.get("output") not in selected:
                     continue
                 position = self.m.position(task["asset"], param, task["partition"]) or {}
                 if len(position.get("ahead", ())) >= self.read_ahead_cap:

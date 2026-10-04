@@ -69,13 +69,6 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
-LANDED = False  # every piece of K43–K46 built: True also shrinks their failures
-
-
-class NotBuilt(NotImplementedError):
-    """The engine has no such answer yet: what the strict xfails expect."""
-
-
 # -- the engine's answers --------------------------------------------------------------
 
 
@@ -84,12 +77,9 @@ async def stale_keys(engine, asset: str, partition: str = "") -> set[str] | None
     (a non-each output's are all its keys, or none); None for an unkeyed
     output, which has no keys."""
 
-    listing = getattr(engine, "stale_keys", None)
-    if listing is None:
-        raise NotBuilt("Engine.stale_keys (K37)")
     keys, after = set(), None
     while True:
-        page = await listing(asset, partition, after=after)
+        page = await engine.stale_keys(asset, partition, after=after)
         if not page.get("tracked", True):
             return None
         keys.update(page["keys"])
@@ -116,21 +106,14 @@ async def stale_reasons(engine, asset: str, partition: str = "") -> set[str]:
     rows = (await engine.partition_statuses([asset], every=False))[asset]
     for row in rows:
         if row["partition"] == partition:
-            if row["status"] != "stale":
-                return set()
-            if "reasons" not in row:
-                raise NotBuilt("partition_statuses rows' `reasons` (K46)")
-            return set(row["reasons"])
+            return set(row["reasons"]) if row["status"] == "stale" else set()
     return set()
 
 
 async def asset_stale(engine, asset: str) -> bool:
     """The asset rollup's own flag (asset_statuses, the console's graph)."""
 
-    rollup = (await engine.asset_statuses())[asset]
-    if "stale" not in rollup:
-        raise NotBuilt("asset_statuses()[asset]['stale'] (K38)")
-    return bool(rollup["stale"])
+    return bool((await engine.asset_statuses())[asset]["stale"])
 
 
 def engine_with_read_ahead_cap(state, project, cap: int):
