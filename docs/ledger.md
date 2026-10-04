@@ -1,180 +1,214 @@
-# The ledger: incremental reads from state, not history (draft)
+# The seen-set: incremental reads from one encoded state (draft)
 
-Status: **draft** for Erwin's state-based model. Docs only; nothing is
-built. If the model is not confirmed, this note is dropped.
+Status: **draft** for Erwin's model. Docs only; nothing is built. If the
+model is not confirmed, this note is dropped.
 
-## The model in one paragraph
+## The model
 
-Each consumer partition keeps, per keyed incremental input, a **ledger**:
-key → the upstream version it actually processed — the version it was
-**served**, which on a current-only store may be newer than the one the
-index named when the batch was planned. Every run records what it
-processed, whatever started it: a default run, a `keys=` run, a retry.
-What a partition **owes** is a comparison, made on demand, of the
-upstream's keys and versions under the input's current patterns with its
-ledger:
+Each consumer partition has, per keyed incremental input, a **seen-set**
+`S`: key → the upstream version it processed (the version it was
+**served**, which on a current-only store may differ from the one the
+index named), whatever the upstream holds now. Nothing stores `S` key by
+key. It is kept as an **encoding** `E`:
 
-| Upstream (under the patterns) | Ledger | Owed |
+- a **position** `P`: an endpoint of the upstream's key index, with the
+  patterns, and the whole and dep versions, in force when it was taken;
+- **exceptions**: where `S` differs from what `P` decodes to. A **point**
+  exception is `key → version`, or `key → absent`; a **range** exception
+  is "the keys in `(…, c]` are as upstream had them at endpoint `T`" — a
+  pass part done (below).
+
+**Decode.** `decode(E)(k)` is the first that applies: a point exception
+for `k`; a range exception whose range holds `k` (`k` as of `T`, under the
+range's patterns); else `k` as of `P` if `P`'s patterns take it, else
+absent.
+
+**The invariant.** After every commit, `decode(E) = S`. An exception
+folds into `P` only when `P` already decodes `k` to its value. Every
+endpoint the encoding names (`P`, each range's `T`) is reserved in the
+key index while it names it.
+
+**The computation.** What a partition owes is the difference between the
+upstream now, under its current patterns, and `decode(E)`:
+
+| Upstream now | `decode(E)` | Owed |
 |---|---|---|
-| has `k` | lacks `k` | an **add** |
-| has `k` at `v2` | has `k` at `v1` | an **update** |
-| lacks `k`, or `k` no longer matches the patterns | has `k` | a **removal** |
+| has `k` | lacks `k` | an add |
+| has `k` at `v2` | has `k` at `v1` | an update |
+| lacks `k`, or its patterns no longer take `k` | has `k` | a removal |
 | has `k` at `v` | has `k` at `v` | nothing |
 
-A default run processes exactly what is owed, and a batch's `added`,
-`updated` and `removed` are those three sets. `keys=` only narrows a run
-to the named keys of what is owed. A partition is stale for its input
-exactly when something is owed. Patterns are applied when the comparison
-is made; nothing is kept about how they changed.
+That difference is the staleness, and exactly what a default run loads,
+as `added`, `updated` and `removed`. A `keys=` run loads the named keys of
+it. Its candidates are `changes(P, head)`'s keys and the exceptions' keys:
+a key in neither is as `P` decodes it and has not changed since, so it
+owes nothing. A **full compare** — the upstream now merged with `decode(E)`
+in key order — is needed only when the patterns, or the definition, differ
+from those recorded with `P`.
+
+**A run updates `E`.** Each batch sets `S` for the keys it processed: to
+the version it was served, or absent. Its commit records that as
+exceptions (point ones for scattered keys; one range exception for a pass
+in key order), with its outputs, in one `AttemptFinished`. A run that
+leaves nothing owed moves `P` to the head it reached, with today's
+patterns and whole and dep versions, and folds every exception the new
+`P` implies; those it does not imply stay.
 
 ## Worked examples
 
-`feed` → `items` (keyed) → `tally`, a count kept as `before + len(added) −
-len(removed)`, and `checks`, a per-key asset over `items`. Versions are
-written `k1@3` (key `k1`, generation 3).
+`feed` → `items` (keyed) → `tally`, a count `before + len(added) −
+len(removed)`, and `checks`, per-key over `items`. `k1@3` is key `k1` at
+generation 3. `⊥` is the empty position: it decodes to nothing.
 
-**`keys=` before a default run.** `items` holds `k1@1 k2@1`, `tally`'s
-ledger is empty. `keys=(k1)`: `k1` is owed an add; the run processes it
-(`added=[k1]`, count 1) and its commit writes `k1@1` to the ledger. `k1`
-is then updated to `k1@4`. The default run compares: `k1` is owed an
-update (`@4` against `@1`), `k2` an add. It processes both (`added=[k2]`,
-`updated=[k1]`, count 2) and records `k1@4 k2@1`. Nothing is delivered
-twice and nothing is missed, with no read-ahead and no cap: the ledger is
-the record of what the `keys=` run did.
+**`keys=` before a default run.** `items` holds `k1@1 k2@1`; `tally` has
+`E = (⊥)`. `keys=(k1)`: owed an add, processed, `S = {k1@1}`, encoded as
+`(⊥, k1→@1)`. `k1` is updated to `@4`. The default run's candidates are
+everything changed since `⊥` and `k1`: `k1` owes an update (`@4` against
+`@1`), `k2` an add. Processed, `S = {k1@4, k2@1}`, which the head decodes
+to: `E = (P=head)`, the exception folded. (Today: K45's read-ahead.)
 
-**A pattern widening.** `tally` reads `include=k1`; its ledger is `k1@1`.
-The deploy widens to `k*`. The next comparison sees `k2@1` upstream,
-matching now and missing from the ledger: an add. One run delivers
-`added=[k2]`. A `keys=(k2)` run first instead does the same, and the
-default run after it finds nothing owed. A `keys=(k9)` for a key that
-never existed finds nothing owed and delivers nothing (A26 N2's case).
+**A pattern widening.** `E = (P, include=k1)`, decoding to `{k1@1}`. The
+deploy widens to `k*`: the patterns differ from `P`'s, so a full compare.
+`k2@1` is upstream, taken now, and decodes to absent: an add. A
+`keys=(k2)` first instead leaves `(P, include=k1; k2→@1)`, and the
+compare then finds nothing. A `keys=(k9)`, a key that never existed,
+processes nothing and records nothing.
 
-**A pattern narrowing.** `include=k*` narrowed to `k1`; the ledger is
-`k1@1 k2@1`. `k2` no longer matches and is in the ledger: a removal. The
-run delivers `removed=[k2]` and drops it from the ledger.
+**A pattern narrowing.** `E = (P, include=k*)` decodes to `{k1@1, k2@1}`;
+the deploy narrows to `k1`. Full compare: `k2` decodes to `@1` and is no
+longer taken: a removal. The run removes it, and `E = (head, include=k1)`.
 
-**A definition change.** `tally`'s version is bumped. Its ledger is set
-aside: the partition reconciles against an empty one, so everything
-upstream is owed an add, and the first batch is `full` and `first`, so the
-consumer starts over. A per-key asset keeps its outputs through the start
-over, as now, and the keys its output still holds that the new pass does
-not name are removed after it — read from its output index, since the
-ledger no longer says what it held.
+**A definition change.** The asset's version is bumped: `S` is what the
+old definition processed, which the new one has not, so `E` resets to
+`(⊥)` and everything upstream is owed an add; the first batch is `full`
+and `first`, and the consumer starts over. A per-key asset keeps its
+outputs through it; what they hold that upstream lacks is found in its
+output index and removed after the pass, as today.
+
+**A full pass, part done.** From `(⊥)`, a default run plans a pass at
+endpoint `T` over `k1 k2 k3`; batch 1 commits `k1`: `E = (⊥; (…, k1] at
+T)`. `k2` is updated meanwhile. Batch 2 continues from `k1`, still at
+`T`: `k2` at `T`'s version, `E = (⊥; (…, k2] at T)`. The run ends with
+`(⊥; (…, k3] at T)` = `(P=T)`. The update after `T` is a candidate of
+`changes(T, head)`: owed once, by the next run. (Today: D93's snapshot,
+whose pin is this range's reserved `T`.)
 
 **A current-only revert.** `items` lives in a current-only store. A batch
-planned at `k2@2` loads `k2`'s row, and the store is already at `@3`. The
-worker records what it was served, `k2@3`. The source then restores
-`k2@2`. The next comparison sees `@2` upstream against `@3` in the
-ledger: an update, and `k2` is processed again at `@2`. Under positions
-this case nets out to nothing and leaves `v3` data behind (A26 N4).
+at `T` names `k2@2`, and the store already serves `@3`: the worker reads
+the served version from the head index when it loads the row, and the
+commit records `k2→@3`. The source restores `k2@2` (a new generation, or
+`v2`'s payload). The candidates include `k2` (an exception): `@3` against
+the upstream's `@2`, an update, processed again. (Today it nets to
+nothing and leaves `v3`'s data: A26 N4.)
 
-**A same-version re-arrival.** A per-key batch finds no row for `k2`: it
-was removed since the batch was planned, so its outputs go and the ledger
-drops `k2`. `k2` comes back at the same version before the next run. The
-comparison sees `k2` upstream and not in the ledger: an add, and `checks`
-rebuilds it. Under positions the delta nets this to nothing and `k2`
-stays missing (A26 N4).
+**A same-version re-arrival.** A per-key batch at `T` finds no row for
+`k2`, removed since: its outputs go, and the commit records `k2→absent`
+(`T` decodes `k2` live). `k2` returns at the same version. The candidate
+`k2` decodes to absent and is upstream: an add, and `checks` rebuilds it.
+(Today it nets to nothing and `k2` stays missing: A26 N4.)
 
-**A takeover mid-run.** A run has committed batches 1 and 2 when its
-engine is replaced; batch 3's attempt dies uncommitted. Batches 1 and 2's
-ledger entries were committed with their outputs; batch 3's were not. The
-next engine compares again and finds batch 3's keys still owed. Where a
-run stopped is only a hint (its cursor); the ledger decides.
+**A takeover mid-run.** Batches 1 and 2 committed, each with its
+exceptions; batch 3's attempt dies uncommitted, recording nothing. The
+next engine decodes `E`, which is `S` exactly, and finds batch 3's keys
+still owed.
 
-**Per-key versus plain.** For `checks` (per-key) the ledger is, per key,
-the upstream version its output for that key was built from: a key with
-a failure record counts as processed at the version it failed at, so a
-key is retried by its failure record, not re-owed. For `tally` (plain,
-unkeyed output) the ledger is the only record of which upstream keys the
-count holds, and that is what makes the count exact: `added` is never a
-key it holds, `removed` always one.
+**Per-key versus plain.** One encoding for both. For `checks`, `S` is per
+key the version its output was built from, and a key that failed counts
+as seen at the version it failed at: its retry is its failure record's,
+not an owed update. For `tally`, `S` is the only record of which upstream
+keys its count holds — and that is what makes the count exact: `added` is
+never a key it holds, `removed` always one.
 
-## Where the ledger lives, and how it commits
+## Keeping exceptions bounded
 
-A ledger is a key index of its own, in the same format (key → payload,
-here the served upstream generation), one per consumer partition and
-keyed incremental input, under the consumer's index prefix
-(`@ledger/{asset}/{input}`). A batch writes its ledger delta beside its
-output deltas before its result is sealed; the engine installs the
-ledger's new state in the same `AttemptFinished` that installs the
-outputs' heads and indexes. So the ledger and the outputs commit together
-or not at all, and an abandoned attempt's ledger delta is cleaned up like
-its other delta files.
+Point exceptions come from `keys=` runs (as many as they name), from a
+current-only store serving another version than the index named (as many
+as change while being read), and from keys found gone. Range exceptions
+come from a pass under way: one each, since a pass goes in key order. A
+default run that completes folds every exception its new `P` implies, so
+they last only until the partition next catches up.
 
-For a per-key asset the ledger could instead be the payload of its own
-output index. I recommend a ledger of its own for both kinds: a per-key
-call may write no output for a key (it returned nothing, or removed its
-own key) and still have processed it; a multi-output asset has no single
-index to carry it; and one shape for both keeps staleness and planning to
-one code path. Its cost is one more delta file per commit.
+Up to a bound (1,000 point exceptions, say) they live in the partition's
+record. Past it they **spill** to an exceptions index: the key index
+format, key → version or a tombstone for absent, under the consumer's
+index prefix, written as a delta with the run's commit and installed in
+the same `AttemptFinished`. Nothing is refused: today's 10,000-run cap
+goes. Reading them costs what reading a small index costs; a fold
+rewrites it, and an empty one is dropped.
 
-Whole and dep inputs are not per key: the partition keeps their versions
-beside the ledger (`seen`, as today). When one moves, every ledger entry
-is owed an update, not an add: the consumer does not start over (semantic
-change (d)'s rule, unchanged).
+## Each past finding is a decode mismatch
 
-## Keeping staleness cheap
+Every one of them was a delivery classed against a history — a position,
+a read-ahead entry, a pass — that no longer said what the consumer had
+seen. Under the invariant the class is always `upstream now` against
+`decode(E) = S`:
 
-The ledger also keeps a **checked point** `C`: the upstream commit up to
-which it has been compared in full. Only a key changed after `C` can be
-owed, so the usual comparison reads `changes(C, head)` — the same span
-read as today's delta — and looks those keys up in the ledger, and the
-next comparison starts from the head the last one reached. A `keys=` run
-records entries but leaves `C` as it is.
-
-A **full compare** — a merge of the upstream index, under the patterns,
-with the ledger, both in key order — is due only when the candidates
-cannot tell: after a pattern change (a key's membership can change with
-no upstream commit), after a definition change (against an empty ledger,
-which is just the upstream's keys) and when the log no longer holds
-`(C, head]`. It is two index reads and a merge. From the measured full
-replacement compare (`key-index-costs.md`, one index read whole and
-compared), two of them:
-
-| Keys | Full compare | Usual comparison (1K changed) |
-|---|---|---|
-| 1M | ~10 GETs, ~0.2 s, ~55 MB | ~9 GETs, <0.1 s |
-| 100M | ~300 GETs, ~10–15 s, ~5.4 GB | ~50 GETs, ~0.8 s (cold) |
-
-At 100M a full compare is a run's work, not a status page's: it runs when
-the next run plans, and until then the partition reports `definition
-changed`, without listing its keys.
+- **A key already held is never added** (A19 R1, R2, R4; A26 N2 repeated
+  selections and the partial full pass): `decode(E)` holds it, so it is an
+  update or nothing.
+- **A key never held is never removed** (A26 N2's `k9`; the "never held"
+  traces): `decode(E)` lacks it.
+- **A removal is never lost** (A19 R3): the removed key stays in
+  `decode(E)` until a run processes the removal.
+- **A served version is what decodes** (A19 R5, A26 N4, F38): a newer
+  row, or none, is recorded as an exception, so the next comparison sees
+  the difference instead of netting it out.
+- **A pattern change keeps what was delivered** (A26 N3): exceptions fold
+  only when `P` implies them, so no transition can collapse one early.
+- **A pass's endpoint is reserved because the encoding names it** (A26
+  N1): the reservation follows `T`, whoever started the pass.
+- **Nothing is capped** (A26 N5): exceptions spill.
+- **Staleness and loading cannot disagree** (F35, A19 R9, R10): they are
+  the same difference. Transitive staleness for an each chain intersects
+  the upstream's owed keys with the consumer's patterns, key by key.
+- **Whole and dep versions** (F37, A19 R7): they are recorded with `P`; at
+  others, every seen key owes an update, and no pass continues under the
+  old ones.
 
 ## What it replaces
 
-| Today | With the ledger |
+| Today | With the seen-set |
 |---|---|
-| Position: `next`, a `pass` (`from`, `at`, `batch`, `pin`), `fingerprint` | The ledger and its checked point `C`; a run's cursor is a hint. `fingerprint` stays: a change resets the ledger |
-| K45 read-ahead (`ahead`), its 10,000-run cap, paged selections' shared entries | Gone: a `keys=` run writes ledger entries like any run |
-| D93: a full pass reads a pinned snapshot; selections record entries, are classed via `lower=`; a covering selection collapses the record | Gone: a first run processes keys at their current version and records what it was served; what changes meanwhile is owed by the next comparison |
-| D100: classes follow the index, rows the store; rowless deliveries | The class is the comparison with the ledger; the ledger records the served version, so no row is ever delivered for a key the store no longer has |
-| The pattern change: old patterns' delta, a membership diff over a pinned snapshot, the old/new split | Gone: patterns apply when the comparison is made |
-| `caught_up`, `caught_up_at` | Derived: nothing owed. `seen` stays for whole and dep inputs |
-| Staleness: three predicates over position, read-ahead and pass state; K38's filter-then-confirm for `each` | One comparison, for both kinds |
-| F35, F37, F38's early removal, A19 R1–R5, A26 N2–N5 | Cannot arise: they are disagreements between a history (position, read-ahead, pass) and the state it summarises |
+| Position: `next`, `pass` (`from`, `at`, `batch`, `pin`), `fingerprint`, `seen` | `P` with its patterns and whole and dep versions; a pass is a range exception; `fingerprint` stays: a change resets `E` |
+| K45 read-ahead (`ahead`), its cap, paged selections' shared entries | Point exceptions, spilling past a bound; no cap |
+| D93: a full pass reads a pinned snapshot; selections recorded and classed via `lower=` | A pass is a range exception at its `T`; a selection's keys are point exceptions; `decode` replaces `lower=` |
+| D100: classes follow the index, rows the store; rowless deliveries | The class is the comparison with `decode(E)`; a served version that differs is an exception, so no key is delivered rowless |
+| The pattern change: old patterns' delta, a membership diff over a pinned snapshot | Patterns recorded with `P`; a full compare when they differ |
+| `caught_up`, `caught_up_at`, `began`, `seen` on the position | Derived: nothing owed; `P`'s whole and dep versions |
+| Staleness: three predicates over position, read-ahead and pass; K38's filter-then-confirm for `each` | One difference, for both kinds and every level |
 
-Deleted from the code: `positions.py` but for the checked point;
-`_selection` and its branches; `_read_ahead`, `_read_ahead_of` and
-`changes(lower=)`; the full-pass snapshot and its pin; `walked`,
-`read_from`, `held_at`, `pattern_change`; `_dep_restart`'s pass
-bookkeeping; most of `staleness.py`. Kept: the key index, `changes()`,
-the failure index, per-key reconcile against the output index, and
-positions by commit for unkeyed upstreams (no keys, no ledger).
+Deleted from the code: `_selection` and its branches, `held_at`,
+`walked`, `read_from`, `pattern_change` and the `diff` mode,
+`_read_ahead` and `_read_ahead_of`, `changes(lower=)`, `READ_AHEAD_FULL`
+and the cap, `_dep_restart`, `caught_up`, most of `staleness.py` and of
+`positions.py`. Kept: the key index and `changes()`, endpoint
+reservation, the failure index and per-key retries, per-key reconcile
+against the output index, positions by commit for unkeyed upstreams (no
+keys, no seen-set).
+
+## Testing
+
+The staleness reference keeps a literal seen-set: a dict, key → version,
+updated by each step exactly as the model says. A property test runs
+random histories — upstream commits and resets, current-only rows that
+run ahead or vanish, `keys=` and default runs, pattern and definition
+changes, takeovers — and after every step checks that the engine's `E`
+decodes to that dict, and that its staleness and a default run's load
+equal the dict's comparison with the upstream. The A19 and A26 histories
+stay as named examples.
 
 ## What gets harder
 
-- **Storage and writes.** A ledger is as large as the keys its consumer
-  processed: ~27 B a key, so ~2.7 GB at 100M keys, for each consumer of
-  each big upstream, and one more delta per commit. Today a position
-  stores nothing per key.
+- **Decoding at `P` and `T`** needs their states readable: the key index
+  must keep every endpoint the encoding names, as it does today for
+  positions and passes; a long-lived exception pins nothing extra.
 - **Served versions on a current-only store** are read from the head
-  index when the row is loaded. A store behind its index while still
-  holding a row (an older row, not a missing one, which F33 already
-  catches) records a version newer than the row: the one gap left.
-- **A full compare at 100M** takes seconds and reads both indexes whole,
-  so staleness after a pattern or definition change is reported without
-  keys until a run makes it.
-- **A per-key definition change** needs the output index to find what to
-  remove, since the ledger starts empty.
-- **Moving off positions** is a reset for every consumer: its ledger
-  starts empty, and its first run is a full one.
+  index when a row is loaded. A store behind its index that still holds
+  an older row would record a version newer than the row: the one gap
+  left (a missing row is already F33's `SourceBehind`).
+- **A full compare at 100M keys** reads the upstream index at `P` and now,
+  merged with the exceptions: seconds, and run when a run plans; until
+  then, staleness after a pattern or definition change is reported
+  without its keys.
+- **Moving to it** resets every consumer's encoding once: `(⊥)`, and a
+  full first run.
