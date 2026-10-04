@@ -603,14 +603,36 @@ async def read(root: Path, what: str, at: int | None) -> dict:
     }
 
 
+QUIET_LOAD = float(os.environ.get("QUIET_LOAD", "6"))
+QUIET_FILE = Path(os.environ.get("QUIET_FILE", "/tmp/w53-quiet.json"))  # waiting so far, over the whole pass
+QUIET_MAX = 3 * 3600
+
+
+def quiet() -> dict:
+    """Before a timed read: wait until the 1-minute load average is below
+    QUIET_LOAD, checking every minute; once the whole pass has waited 3 hours,
+    stop waiting (and flag every later read). Returns what to record."""
+
+    st = json.loads(QUIET_FILE.read_text()) if QUIET_FILE.exists() else {"waited": 0.0}
+    waited = 0.0
+    while os.getloadavg()[0] >= QUIET_LOAD and st["waited"] + waited < QUIET_MAX:
+        time.sleep(60)
+        waited += 60
+    st["waited"] += waited
+    QUIET_FILE.write_text(json.dumps(st))
+    load = os.getloadavg()[0]
+    return {"load": round(load, 1), "quiet": load < QUIET_LOAD, "waited_s": waited}
+
+
 def isolated(root: Path, what: str, at: int | None) -> dict:
+    q = quiet() if os.environ.get("QUIET") else {}
     out = subprocess.run(
         [sys.executable, __file__, "--read", str(root), what, str(at if at is not None else -1)],
         check=True,
         capture_output=True,
         text=True,
     )
-    return json.loads(out.stdout.strip().splitlines()[-1])
+    return json.loads(out.stdout.strip().splitlines()[-1]) | q | ({"load_after": round(os.getloadavg()[0], 1)} if q else {})
 
 
 def main():
