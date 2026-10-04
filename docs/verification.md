@@ -182,10 +182,28 @@ shrinks the printed case by delta debugging: each candidate in a capped process
 of its own, keeping a step's invariant calls with it, until no step can go
 (`replay_min.py`). An F16 run of 55 steps went to 8 this way.
 
-Determinism has one limit: Python randomizes string hashing per process, so a
-set iterated by product code may order differently in another process. A
-replay in the same process is exact; across processes it is the same run with
-possibly another interleaving of equal-time events.
+**A run is deterministic.** One program runs the same callbacks in the
+same order every time: twice in one process (as Hypothesis re-runs an
+example), in fresh processes, under any `PYTHONHASHSEED`, with the garbage
+collector off or eager, with pytest imported or DEBUG logging on. It once
+was not: the simulation cancelled a killed actor's tasks in
+`asyncio.all_tasks()` order, a set ordered by the tasks' addresses, so the
+order changed with whatever the process had allocated before. Z11 could
+not be replayed, and F31's replay passed or failed with the file's
+location. Tasks are now cancelled in creation order.
+`tests/sim/test_determinism.py` holds it in CI (it fails on the old
+order). When a run seems to change:
+
+```bash
+uv run python -m tests.sim.determinism replay.py                # two fresh processes
+uv run python -m tests.sim.determinism --in-process replay.py   # twice in one process
+```
+
+Each run records every callback the simulation's loop runs and
+schedules, with who scheduled it, labelled by coroutine and line, never
+an address. The report shows the first place the two runs part. A
+compaction's own loop, which runs real threads while the simulation
+waits, is not traced: its order does not reach the simulation's.
 
 ## Stores: the generated kit
 

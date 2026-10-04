@@ -61,6 +61,20 @@ class Fate:
 CONTROL_POINTS = {lifecycle.OWNED: "claim", lifecycle.WRITING: "gate", lifecycle.SEALED: "result"}
 
 
+def _in_creation_order(tasks) -> list[asyncio.Task]:
+    """`asyncio.all_tasks()` is a set, ordered by the tasks' addresses: cancelling
+    in its order resumed them in an order that changed with whatever the process
+    had allocated before (an earlier example, an import, the GC's timing), so one
+    program could run two ways. Tasks are named `Task-<n>` in creation order."""
+
+    def key(task):
+        name = task.get_name()
+        _, _, n = name.rpartition("-")
+        return (0, int(n), "") if n.isdigit() else (1, 0, name)
+
+    return sorted(tasks, key=key)
+
+
 def point_of(full: str, kind: str, data_root: str, data: bytes | None = None) -> str | None:
     """Which lifecycle step a worker's request is (`POINTS`), if any: its
     control file's swaps own the attempt, take the gate and seal the result."""
@@ -402,7 +416,11 @@ class World:
     # -- actors -------------------------------------------------------------------------
 
     def tasks_of(self, who: tuple) -> list[asyncio.Task]:
-        return [t for t in asyncio.all_tasks(self.loop) if t.get_context().get(actor) == who and not t.done()]
+        return [
+            t
+            for t in _in_creation_order(asyncio.all_tasks(self.loop))
+            if t.get_context().get(actor) == who and not t.done()
+        ]
 
     async def kill(self, who: tuple) -> None:
         """SIGKILL: the actor makes no request from now on, and its tasks end.
@@ -664,7 +682,9 @@ class World:
             for worker in list(self.workers.values()):
                 if not worker.task.done():
                     await self.kill(worker.who)
-            rest = [t for t in asyncio.all_tasks(self.loop) if t is not asyncio.current_task()]
+            rest = [
+                t for t in _in_creation_order(asyncio.all_tasks(self.loop)) if t is not asyncio.current_task()
+            ]
             for t in rest:
                 t.cancel()
             await asyncio.gather(*rest, return_exceptions=True)
