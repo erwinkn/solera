@@ -94,7 +94,7 @@ class Sim:
         self.spans: list[Span] = [Span(-1, -1, [Seg(-1, 1.0, 0.0)])]
         self.written = self.committed = 0.0
         self.busy: tuple[int, list[Span], Span] | None = None  # (commit it publishes at, inputs, output)
-        self.credit = 0.0
+        self.lanes = {"base": [0.0, None], "tail": [0.0, None]}
         self.waits = 0
 
     # -- entries -------------------------------------------------------------------------
@@ -124,7 +124,7 @@ class Sim:
 
     def allowed(self, rs: list[Span], live: set[int]) -> bool:
         sizes = [self.entries(r) for r in rs]
-        if max(sizes) > 4 * (sum(sizes) - max(sizes)):
+        if len(rs) > 1 and max(sizes) > 4 * (sum(sizes) - max(sizes)):
             return False
         if self.policy == "blocked":
             return not any(r.a in live for r in rs[1:])
@@ -140,26 +140,64 @@ class Sim:
             before += e
         return True
 
-    def plan(self, live: set[int]) -> tuple[int, int] | None:
+    def plan(
+        self, live: set[int], lane: str = "any", frozen: frozenset = frozenset()
+    ) -> tuple[int, int] | None:
+        """The next merge (start, count). `lane`: "base" plans only merges into the
+        oldest span, "tail" only the others; `frozen` spans belong to a merge under way."""
+
         sp = self.spans
+        if frozen:
+            if lane == "base":  # it may reach only up to the first span the tail lane holds
+                cut = next((i for i, r in enumerate(sp) if id(r) in frozen), len(sp))
+                sp = sp[:cut]
         sizes = [self.entries(r) for r in sp]
+        if lane == "tail":
+            out = self._tail(sp, sizes, live, frozen)
+            return out
         # The oldest span absorbs what follows, as far as it may reach.
-        if (sum(sizes) - sizes[0]) * 4 >= sizes[0]:
+        if len(sp) > 1 and (sum(sizes) - sizes[0]) * 4 >= sizes[0]:
             acc, j0 = 0.0, len(sp)
             for j in range(1, len(sp)):
                 acc += sizes[j]
                 if acc * 4 >= sizes[0]:
                     j0 = j
                     break
-            # Candidates: everything, or up to just before a span that starts at a live endpoint.
-            ends = [len(sp) - 1] + [j - 1 for j in range(len(sp) - 1, 0, -1) if sp[j].a in live]
+            # Candidates: everything, or up to just before a span a live endpoint falls in.
+            ends = [len(sp) - 1] + [
+                j - 1 for j in range(len(sp) - 1, 0, -1) if any(sp[j].a <= e <= sp[j].b for e in live)
+            ]
             for j in ends:
                 if j >= j0 and self.allowed(sp[: j + 1], live):
                     return 0, j + 1
+        if lane == "base":
+            return None
+        return self._tail(sp, sizes, live, frozen)
+
+    def _tail(self, sp, sizes, live, frozen) -> tuple[int, int] | None:
+        def free(lo, w):
+            return not any(id(r) in frozen for r in sp[lo : lo + w])
+
         for j in range(len(sp) - 4, -1, -1):
             w = sizes[j : j + 4]
-            if max(w) <= sum(w) - max(w) and self.allowed(sp[j : j + 4], live):
+            if j >= 1 and max(w) <= sum(w) - max(w) and free(j, 4) and self.allowed(sp[j : j + 4], live):
                 return j, 4
+        # A span smaller than its newer neighbour (left behind by an endpoint that went away)
+        # joins the shortest guarded window around it.
+        for j in range(1, len(sp) - 1):
+            if sizes[j] < sizes[j + 1]:
+                for w in range(2, 5):
+                    for lo in range(max(1, j + 2 - w), min(j, len(sp) - w) + 1):
+                        if free(lo, w) and self.allowed(sp[lo : lo + w], live):
+                            return lo, w
+        # A span whose versions no live endpoint sees any more are a quarter of it is rewritten alone.
+        for j in range(1, len(sp)):
+            if (
+                len(sp[j].segs) > 1
+                and free(j, 1)
+                and self.entries(self.merged([sp[j]], live)) * 4 <= sizes[j] * 3
+            ):
+                return j, 1
         return None
 
     def apply(self, lo: int, count: int, live: set[int]) -> None:
@@ -172,25 +210,31 @@ class Sim:
             while (p := self.plan(live)) is not None:
                 self.apply(*p, live)
             return
-        self.credit += self.rate
-        while True:
-            if self.busy is None:
-                p = self.plan(live)
-                if p is None:
-                    self.credit = min(self.credit, self.rate)
-                    return
-                lo, count = p
-                ins = self.spans[lo : lo + count]
-                self.busy = (lo, ins, sum(self.entries(r) for r in ins))
-            lo, ins, cost = self.busy
-            if self.credit < cost:
-                self.waits += 1
-                return
-            self.credit -= cost
-            # Its inputs are still in place: spans only change by merges, and this is the only one.
-            i = self.spans.index(ins[0])
-            self.apply(i, len(ins), live)
-            self.busy = None
+        # Two lanes, each one merge at a time at `rate`: merges into the oldest span, and the rest.
+        waited = False
+        for lane in ("base", "tail"):
+            self.lanes[lane][0] += self.rate
+            while True:
+                credit, busy = self.lanes[lane]
+                if busy is None:
+                    other = self.lanes["tail" if lane == "base" else "base"][1]
+                    frozen = frozenset(id(r) for r in other) if other else frozenset()
+                    p = self.plan(live, lane, frozen)
+                    if p is None:
+                        self.lanes[lane][0] = min(credit, self.rate)
+                        break
+                    lo, count = p
+                    busy = self.spans[lo : lo + count]
+                    self.lanes[lane][1] = busy
+                cost = sum(self.entries(r) for r in busy)
+                if credit < cost:
+                    waited = True
+                    break
+                self.lanes[lane][0] -= cost
+                i = self.spans.index(busy[0])  # its inputs are still adjacent: no other merge touched them
+                self.apply(i, len(busy), live)
+                self.lanes[lane][1] = None
+        self.waits += waited
 
     # -- the run -------------------------------------------------------------------------
 
@@ -318,6 +362,8 @@ def main():
     ap.add_argument("--rates", default="instant,2e6", help="upkeep: instant, or entries per commit")
     ap.add_argument("--cap", type=float, default=math.inf)
     ap.add_argument("--only", default="")
+    ap.add_argument("--skip", default="", help="scenarios to leave out (substring, ;-separated)")
+    ap.add_argument("--blocked-max", type=int, default=101, help="consumers past which `blocked` is not run")
     args = ap.parse_args()
     print(
         "| Keys | Scenario | Policy | Upkeep | Written per entry committed | Spans, mean (max) | "
@@ -329,7 +375,11 @@ def main():
         for name, w in scenarios(n).items():
             if args.only and args.only not in name:
                 continue
+            if any(x and x in name for x in args.skip.split(";")):
+                continue
             for policy in args.policies.split(","):
+                if policy == "blocked" and len(w.periods) > args.blocked_max:
+                    continue
                 for rate in args.rates.split(","):
                     r = run(w, policy, args.lam, args.z, None if rate == "instant" else float(rate), args.cap)
                     print(

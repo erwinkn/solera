@@ -1,416 +1,482 @@
-# Key index design: one tiling of spans
+# Key index design: spans with endpoint versions
 
-Status: **proposal**, for Erwin. It follows `presence-at-position.md` and
-`delta-log-ranges.md` (branch `bb/design-study-exact-presence-at-a-position`)
-and keeps their baseline: every delta entry records exactly whether its key
-was live before it. The numbers come from `bench/keys/tiling.py` (a replay
-of the compaction policy on file metadata) and `bench/keys/tiling_reads.py`
-(real files, today's reader, cold). Everything else is reused from the
-earlier studies and says where it comes from.
+Status: **proposal, revised after review**, for Erwin. The first version
+(cc54fcc) was reviewed: build with changes. Its span representation and
+exact writes stay. Its boundary lifecycle and merge policy change here,
+because endpoints that block merges make the span count grow with the
+number of observers, and an observer retiring forced a large rewrite. The
+review's findings and where each is answered are listed at the end. Every
+number says where it comes from: **measured** (real files, today's
+reader: `bench/keys/catchup.py`, `layouts.py`, `tiling_reads.py`),
+**replayed** (the merge policy on metadata, with the density model of
+`amplification.py`: `spans.py`, `retention.py`), or **proved** (Lean,
+`experiments/lean/KeyIndex/WriteBound.lean` on branch
+`bb/experiment-bend-2-for-the-key-index-s-delta-alge-thr_dqc6iaviun`).
+Replayed numbers are preliminary until the implementation replaces them.
+
+What is not measured on real files yet: spans holding several versions of
+a key (format v4) have no native merge. The real catch-up runs on spans
+that do not cross the consumers' positions, and the matched layouts have no
+endpoint inside a span. So the span count under many observers, and the
+cost of reading inner versions, are replayed only; the read bound caps the
+latter at 2× or 10 MB per catch-up.
+
+It follows `presence-at-position.md` and `delta-log-ranges.md` (branch
+`bb/design-study-exact-presence-at-a-position`), and keeps their baseline:
+every delta entry records exactly whether its key was live before it.
 
 ## The answer in brief
 
-Today the index is three structures. A leveled LSM serves lookups and full
-reads. The delta log, one file per commit kept for consumers, serves
-catch-up. The proposed range tree would make far catch-ups cheap. Each one
-has its own merge rule and its own deletion rule.
+Today the index is three structures: a leveled LSM for lookups and full
+reads, the delta log (one file per commit, kept for consumers) for
+catch-up, and a proposed range tree to make far catch-ups cheap. Two
+orderings are needed (key order for lookups and scans, commit order for
+catch-up), but one structure gives both: **a list of key-sorted file sets
+("spans"), each covering a stretch of commits**. Lookups read the spans
+newest first, like LSM levels. A consumer reads the spans from its
+position on, like the delta log.
 
-The working hypothesis was that two orderings are needed: key order (lookup,
-scan) and time order (changes). That holds, but it doesn't take two
-structures. **One list of key-sorted file sets, each covering a stretch of
-commits, gives both**: key order inside each set, time order across them.
-Lookups read the list newest first, the way an LSM reads its levels. A
-consumer reads the part of the list after its position, the way it reads
-the delta log today. One merge rule and one compaction policy maintain it.
-One constraint keeps it correct: a merge never joins two sets across a
-commit some reader starts from.
+The commits observers read from are **endpoints**. A merge may cross an
+endpoint: it then keeps, per key, the version that endpoint sees (the key's
+state just before it), as an LSM keeps the versions its snapshots see. So
+observers cost retained versions, never extra spans, and an observer that
+goes away costs nothing until a merge would rewrite its span anyway.
 
-Measured against today, at 100M keys:
-
-- compaction writes 10–17× the committed bytes, against 30× for today's
-  leveled planner on the same workload;
-- an exact cold lookup of 1K keys takes 1,117 GETs and 285 MB, against
-  1,851 GETs and 425 MB for the previous study's steady state;
-- a catch-up of 10,000 commits reads ~5 spans (about 10 GETs), holding
-  only the keys that changed;
-- the separate log, the range tree, log truncation, the leveled planner,
-  the inexact count and recount, the tombstone filter and the `.kg` garbage
-  files are all deleted.
+- **Writes are bounded**, whatever order observers come and go in:
+  written ≤ (16 + 10 log₂ K) × committed, K the most entries a span holds
+  (proved in Lean for guarded merges; the two kinds that drop versions, a
+  span rewritten alone and a merge coalescing a retired endpoint's segments,
+  are being added to the proof). Replayed under the review's churn
+  scenarios: 7–10× at 1M keys, 12–14× at 100M. On real files from one
+  trace by the real compactions: 13× against 50× for today's leveled
+  planner at 100M keys (8× against 17× at 1M).
+- **Spans stay few** whatever the number of observers: 22 or fewer on
+  average and 30 at most, from 1 to 1,000 distinct endpoints (replayed),
+  against 546 at 100 endpoints when endpoints block merges.
+- **Catch-up reads only what changed**: measured over real spans, paged,
+  10,000 commits behind at 100M keys takes 16 spans, 259 GETs, 65 MB and
+  7.7 s, against 10,000 deltas today, or one packed object (6 GETs, but
+  97 MB, 12.9 s and 420 MB of merge memory).
+- **Lookups and appends cost what they cost today**, measured on layouts
+  built from the same trace: 901 against 907 GETs for 1K cold exact lookups
+  at 100M, 10 ms warm. The first version's 40% saving compared against a
+  leveled layout holding twice the entries; it is withdrawn.
+- **Deleted**: the separate log, the range tree, log truncation, the leveled
+  planner, the inexact count and recount, the tombstone filter and the
+  `.kg` garbage files.
 
 ## The structure
 
 **Span.** A span covers commits `[a, b]` and is a key-sorted set of `.kx`
-files with non-overlapping key ranges, like a level today. For each key that
-commits `a..b` changed, it holds one entry:
+files with non-overlapping key ranges. A commit's delta is the span
+`[c, c]`. A span is split into **segments** by the endpoints that were live
+when it was written. For each key it holds:
 
-- the key's **newest** entry in the range: its generation, the deleted
-  flag, its payload;
-- its **predecessor**: the key's generation just before `a`, or none if
-  the key was not live then.
+- one **version** (generation, deleted flag, payload) per segment the key
+  changed in: the newest one in that segment. The last is the key's newest
+  version in the span; each earlier one is what the next endpoint sees;
+- its **predecessor**, on its oldest version: the key's generation before
+  `a`, or none if it was not live.
 
-That is a delta entry, with "before this commit" widened to "before this
-span". A commit's delta is the span `[c, c]`, exactly today's delta file.
+So a key's entries in a file run newest first, and a lookup takes the
+first. The format lets a key appear several times in a file, in that order
+(format v4). The span from commit 0, the **base**, holds no predecessors
+and drops tombstones that would be its oldest version (no entry means
+absent there).
 
-**Tiling.** The spans tile commit time with no gap and no overlap, from 0 to
-the head. The first span is the **base**. Nothing reads from inside it or
-before it, so it keeps live keys only, with no tombstones and no
-predecessors: it is today's bottom level. `IndexState` becomes the live
-count plus a list of spans `(a, b, files)`.
+**Tiling.** The spans tile commit time from 0 to the head, without gaps or
+overlaps. `IndexState` holds the live count and a list of spans
+`(a, b, segment starts, files)`.
 
-**Boundaries.** A boundary is a commit that some reader needs to be the
-start of a span. Each **observer** contributes one:
+**Endpoints**, and who holds them. An endpoint is a commit some reader will
+start from or read at. Each is born at the head + 1, past every span, so
+adding one never cuts a span.
 
-| Observer | Its boundary | Lives |
-|---|---|---|
-| a consumer's position | `next` | until the position moves or is dropped |
-| a pass under way (delta, full or diff; one attempt or several) over commits up to `to`, the head when it started | its landing point `to + 1`, where the position will move | until the pass ends |
-| a pattern-change drain | its split commit | until the drain ends |
-| an attempt in flight | none of its own: it reads the state it was handed, under its pin, and belongs to its pass, if any | |
-| a read-ahead entry | none (see changes, below) | |
+| Holder | Endpoint | Reserved | Released |
+|---|---|---|---|
+| a consumer's position | `next` | when the position is set | when it moves or is dropped |
+| an attempt that may advance a position: a pass's batch, a keys= selection (a covering one collapses the record to its head + 1), a pattern-change drain | the head + 1 at its claim: its landing point | at the claim or preparation, before its record is installed | when its result is durably part of the position or pass; on failure |
+| a pass under way (delta, full or diff) over commits up to `to` | `to + 1` | when the pass starts | when it ends |
+| a pattern change | its split commit + 1 | at the change | when its drain ends |
 
-**Every boundary is born at the head + 1**, past every span that exists, so
-adding one never cuts a span, and no alignment scheme is needed: that one
-fact replaces the range tree's alignment rules. A position is born at a
-pass's landing point. A keyed pass pages by key over commits fixed when it
-starts (`positions.py`, kind `keys`), so it lands at the head + 1 of that
-moment. Commit-by-commit batches exist only for unkeyed upstreams, which
-have no key index.
+Read-ahead entries hold no endpoint (see changes, below).
 
-A picture: 100M live keys, a daily consumer, an hourly consumer, and a
-third consumer's pass under way.
+**One merge.** Merging adjacent spans concatenates their segments, then
+coalesces the segments whose dividing endpoint is no longer live: per key,
+the newer version survives. A version is kept iff it is the key's newest,
+or some live endpoint sees it. The oldest predecessor survives. Nothing
+else is dropped: a key added and removed inside a span stays as a
+tombstone naming no predecessor, since a read-ahead may have delivered it
+in between. For a fixed set of live endpoints the merge is associative
+(proved for one segment in Bend, `LAWS.bend`), and later merges see fewer
+endpoints inside old spans, never more.
 
-```
-commits  0 … 1,047,551   1,047,552 … 1,055,831              1,055,832 … 1,056,191 (head)
-spans    [ base: 100M ]  [6.3M][1.1M][300K][64K][16K][4K]   [290K][48K][16K][4K][1K][1K]
-                         ^ daily consumer's position         ^ hourly consumer's position  ^ 1,056,192: a pass's landing point
-```
+## The merge policy
 
-(Entries per span. Within each group of spans, sizes fall toward the head,
-and the newer spans hold less than a quarter of the oldest: the policy
-below.)
+Every merge obeys two conditions:
 
-A lookup reads every span, newest first. The daily consumer reads every span
-after its marker; the hourly one, the spans after its own.
+1. **The guard** (bounds writes). The largest input holds at most 4× the
+   other inputs combined, in entries. Under it, written ≤ (16 + 10 log₂ K)
+   × committed for any sequence of commits, endpoint births and releases,
+   K the most entries a span holds (Lean, for merges whose output is at
+   least their largest input). One kind of merge takes a single input: a
+   span rewritten alone, allowed only when at least a quarter of its
+   entries are versions no live endpoint sees. Its cost is paid by the
+   entries it drops, each dropped once. That case, and merges whose output
+   shrinks below their largest input when a retired endpoint's versions
+   coalesce, are being added to the Lean proof.
+2. **The read bound** (keeps catch-up local). A merge may put a live
+   endpoint `e` inside its output only if, in the output, the entries before
+   `e` are at most max(λ × the entries from `e` on, Z), with λ = 1 and Z = 1M
+   entries (~10 MB). The reader at `e` then reads at most twice what it
+   must, or 10 MB more. So the base never swallows the spans after an old
+   endpoint, while small recent spans merge across endpoints freely.
 
-**One merge.** Merging adjacent spans keeps, per key, the newest entry of
-the newer span that has the key, and the predecessor of the older one.
-Both are "last" and "first" over a sequence, so the merge is associative
-and any grouping gives the same span (`delta-log-ranges.md` checked this
-key for key). A key added and then removed inside the span stays, as a
-tombstone naming no predecessor: a read-ahead key may have been delivered
-in between (the worked example shows the case). Merging into the base also
-drops tombstones and predecessors.
+Upkeep runs these triggers, in order:
 
-**One policy**, run by upkeep like compaction today. The spans between two
-consecutive boundaries form a group (the first group starts with the base),
-and merges stay within a group:
+- **Into the base.** Once the spans after the base, as far as the read bound
+  lets it reach, hold a quarter of it, they merge into it.
+- **Four alike.** The newest window of 4 adjacent spans whose largest holds
+  at most the other three combined.
+- **Stragglers.** A span smaller than its newer neighbour (left behind when
+  an endpoint went away) joins the shortest window around it that satisfies
+  both conditions. Without this rule, a stalled pass plus hourly readers at
+  100M left 282 spans on average, 714 at most (replayed).
+- **Stale versions.** A span whose dead versions reach a quarter of it is
+  rewritten alone.
 
-1. **Into the oldest.** Once the other spans of a group hold at least a
-   quarter of its oldest span's entries, the whole group merges into one
-   span. In the first group, that is the base merge: today's compaction
-   into the bottom level and today's log truncation, at once.
-2. **By size.** Otherwise, four adjacent spans of the same size class
-   (`⌊log₄(entries / 1,000)⌋`) merge into one. A span older than a bigger
-   neighbour merges with it first. That keeps sizes falling toward the
-   head, which a vanished boundary can break: without this rule, an hourly
-   consumer at 100M left 176 spans on average, up to 354.
-
-The engine derives the boundaries from its model when it plans a merge, as
-`Upkeep.truncate` derives the commits still needed today. A merge planned
-before a boundary was born is still valid, since that boundary lies past
-every input.
+Upkeep has two lanes, each one merge at a time: merges into the base, and
+the rest. Their inputs never overlap. With one lane, a 100M base merge
+(~60 commits of upkeep at 2M entries per commit) let 70–117 spans pile up
+behind it (replayed); with two, at most 18–24.
 
 ## How each operation runs
 
-Costs are cold, from the object store (30 ms per request, 80 MB/s per
-connection, 64 in parallel, as `bench.py`). "Today" is the previous study's
-steady state at 100M: levels of 72, 640 and 704 MB plus 7 deltas, 2.0
-entries per live key, 53 files. "Tiling" is 22 spans: a base, then 4-way
-size classes of 1K to 4M entries, three each (1.16 entries per live key).
-That is near the most the policy leaves with a daily and an hourly
-consumer (15 spans on average, 24 at most, in the replay). The
-43-span variant doubles the classes, standing for two such groups.
-
 ### 1. append(changes)
 
-Resolve every written key against the spans, newest first: key filters,
-then a block read for every key a filter matches, as `KeyIndex._find`
-already does across levels. That gives each key's current entry exactly:
-its predecessor (the replaced version, which is the object to clean up)
-and whether it was live (the batch class, the live count). Write the span
-`[c, c]`, one PUT, and add `added − removed` to the count.
+Resolve each written key against the spans newest first: key filters, then
+a block read for every key a filter matches (`KeyIndex._find`, as today
+across levels); within a span, a key's first entry is its newest. That
+gives each key's current version exactly: its predecessor (the replaced
+version: the object to clean up) and whether it was live (the batch class,
+the live count). Write the span `[c, c]`, one PUT, and add
+`added − removed` to the count.
 
-| 1K random updates, cold, exact | 1M keys | 100M keys |
-|---|---|---|
-| Today | 8 GETs, 9 MB, 0.19 s | 1,851 GETs, 425 MB, 2.7 s |
-| Tiling, 22 spans | 13 GETs, 11 MB, 0.20 s | **1,117 GETs, 285 MB, 1.5 s** |
-| Tiling, 43 spans | 25 GETs, 14 MB, 0.21 s | 1,163 GETs, 343 MB, 1.7 s |
-| Engine cache warm (`resolved-commits.md`) | 0 GETs | 0 GETs, ~113 ms |
+Measured (`layouts.py`): one trace of 30,000 commits of 1K keys (20,000 at
+1M) applied to both layouts, today's leveled index by its real planner and
+compaction, the spans by the policy (real `merge_ranges` merges, the base
+merge through `KeyIndex.compact`), one consumer reading every commit; then
+1K keys drawn from the whole key space; cold is 30 ms per request, 80 MB/s
+per connection, 64 in parallel; warm is the engine cache filled
+(`EngineCache`):
 
-At 1M every span is read whole, so the cost is one GET per span. At 100M,
-the block reads dominate: about one per key in the base, plus one per key
-that a newer span also holds. The tiling holds fewer duplicate entries
-(1.16 against 2.0 per live key), so it reads fewer blocks and smaller
-filters. In fairness: the planner's own replay ends near 1.24 entries per
-live key (`amplification.py`), so a better-tuned leveled layout would
-narrow the gap. The span count costs little: 43 spans cost 4% more GETs
-than 22 (each span adds one 0.35% false positive per key). Inserts are
-cleared by the filters, as today (65 GETs at 100M in the previous study).
+| | 1M: leveled | 1M: spans | 100M: leveled | 100M: spans |
+|---|---|---|---|---|
+| written per entry committed | 17.2 | 8.0 | 50.3 | 13.0 |
+| sorted runs · files · entries per live key (at the end) | 3 · 3 · 1.03 | 3 · 3 · 1.10 | 5 · 11 · 1.01 | 9 · 14 · 1.02 |
+| lookup 1K, exact, cold | 3 GETs, 10 MB, 0.21 s | 3 GETs, 11 MB, 0.29 s | 907 GETs, 200 MB, 1.13 s | 901 GETs, 207 MB, 1.20 s |
+| append 1K updates, exact, cold | 3 GETs, 1 PUT, 0.24 s | 3 GETs, 1 PUT, 0.31 s | 58 GETs, 409 MB, 5.9 s (streamed) | 65 GETs, 417 MB, 7.7 s (streamed) |
+| page 100K, mid-index, cold | 4 GETs, 0.9 MB, 0.10 s | 4 GETs, 2.0 MB, 0.14 s | 9 GETs, 1.6 MB, 0.09 s | 13 GETs, 4.8 MB, 0.11 s |
+| lookup 1K, warm | 0 GETs, 0.01 s | 0 GETs, 0.01 s | 0 GETs, 0.01 s | 0 GETs, 0.01 s |
+| page 100K, warm | 0 GETs, 0.01 s | 0 GETs, 0.02 s | 0 GETs, 0.01 s | 0 GETs, 0.01 s |
+
+The 100M snapshot came just after the spans' base merge (writes 9.8× before
+it, 13.0× after); on average the replay holds 1.12–1.16 entries per live
+key for spans, so filters and blocks cost ~10–15% more between base
+merges. The warm append is the engine's resolver (`resolved-commits.md`):
+the same local reads plus a PUT. Today's leveled planner writes 50× on real
+v3 entries at 100M, above `amplification.py`'s 30× (which assumed 29-byte
+entries): byte-sized level targets hold 3× more entries than it modelled.
+`tiling_reads.py`'s hand-built layouts, quoted by the first version, are
+superseded by these.
 
 ### 2. lookup(keys, at = c)
 
-The same read without the write. At the head it reads every span. A
-lookup at an older `c` comes from an attempt reading its pinned head: it
-reads the spans it was handed, which ended at `c` then, kept by its pin.
-(A pass reading at `c` over several attempts holds `c + 1` as a boundary,
-so the current spans serve it too.) Same costs as append, less the PUT.
+At the head: the first entry of each key, newest span first. At an older
+`c`, only for a reserved endpoint (`c + 1` reserved) or for an attempt
+reading the manifest it was handed while its pin keeps those files: per
+key, the newest version older than commit `c + 1`'s generation.
 
 ### 3. scan(at = c, range or pattern)
 
-Merge the spans up to `c` in key order, page by page with a key cursor
-(`KeyIndex._scan`, unchanged: it already merges "levels newest first").
-Prefix globs are key-range seeks; other patterns filter the merged stream.
-A count is a scan. A pattern change's difference is one scan at the head,
-testing each key against both patterns.
+Merge the spans in key order, page by page with a key cursor
+(`KeyIndex._scan`, which merges sorted runs newest first and fetches only
+the blocks a page needs). At the head, each key's newest version; at a
+reserved `c`, its newest version older than commit `c + 1`'s generation.
+Prefix globs are key-range seeks; other patterns filter the stream. A count
+is a scan.
 
-**Stability while commits arrive.** `c + 1` is a boundary, so no merge ever
-mixes commits after `c` into the spans before it. A merge inside `[0, c]`
-leaves the view at `c` unchanged. So a pass that pages over hours can read
-each page from whatever spans exist when that page runs, and needs no pin
-on index files for its duration. Each attempt still pins the files of the
-state it was handed, for its own lifetime, as today.
-
-| 100K-key page, mid-index | 1M keys | 100M keys |
-|---|---|---|
-| Today | 9 GETs, 1 MB, 0.09 s | 19 GETs, 4 MB, 0.15 s |
-| Tiling, 22 spans | 14 GETs, 3 MB, 0.10 s | 37 GETs, 13 MB, 0.13 s |
-| Tiling, 43 spans | 26 GETs, 6 MB, 0.12 s | 70 GETs, 25 MB, 0.16 s |
-
-Scans pay for the extra spans in requests, at the same wall time. Small
-spans are read whole: files under 2 MB, today's `small_file` rule. A full
-scan reads 1.16 entries per live key, against 1.24–2.0 today.
+**Stable while commits arrive.** Every merge keeps the versions `c + 1`
+sees, so the view at `c` is the same from any spans that exist later. A
+pass that pages over hours reads each page from the spans current when the
+page runs. Its index files need no pin for the whole pass; each attempt
+pins the manifest it was handed, for its own lifetime. The pass's data
+versions are another matter: it keeps its original data pin (see
+lifecycles).
 
 ### 4. changes(P → N, keys or range, per-key lower bounds)
 
-`P` is a boundary (the position) and `N + 1` is one too (the pass's
-landing point), so the spans between them tile `[P, N]` exactly. Merge
-them. For each key, the newest entry and the oldest predecessor give its
-class:
+`P` and `N + 1` are reserved endpoints. Read the spans overlapping
+`[P, N]`. For each key: its state at `N` is its newest version; its state
+before `P` is its newest version older than `P`'s generation or, if it has
+none in these spans, its oldest predecessor. A key with no version at or
+after `P` did not change and is skipped.
 
-| Live before P (predecessor) | Live at N (newest entry) | Class |
+| Live before P | Live at N | Class |
 |---|---|---|
 | no | yes | added |
 | yes | yes | updated |
 | yes | no | removed |
 | no | no | neither: not delivered |
 
-- **keys=**: point lookups in those spans (filters, then blocks). **Range
-  or prefix**: a seek in each span.
-- **Read-ahead** (per-key lower bounds). An entry names an upstream commit
-  `r`, and the attempt's spec lists its keys and how each was delivered
-  (upserted or removed). For such a key, the bound is commit `r`'s
-  generation (K47: "versions from the commit"): generations rise with
-  commit numbers, so the key changed after `r` exactly when its newest
-  entry is newer. If it didn't, skip it. If it did, its class is (its
-  state delivered at `r`, its state at `N`). No span needs to start at `r`,
-  which is why read-ahead entries are not boundaries.
-- **Staleness** runs the same merge and stops at the first key that is not
-  neither and not covered by the read-ahead. Transitive staleness asks the
+- **keys=**: point lookups in those spans. **Range or prefix**: a seek in
+  each span.
+- **Staleness** runs the same merge and stops at the first key that is
+  delivered and not covered by the read-ahead. Transitive staleness asks the
   same of the upstream.
-- **Paged and resumable** by key cursor. `P` and `N + 1` stay boundaries
-  while the pass lives, so every page reads a tiling of `[P, N]`, even if
-  its spans were merged in between.
+- **Paged and resumable** by key cursor: every page reads a tiling of
+  `[P, N]` that keeps the versions `P` and `N + 1` see, whatever merges ran
+  in between.
 
-| Behind | Today: per-commit deltas | Tiling (spans: the replay; bytes: the range tree's measurements) |
-|---|---|---|
-| 1 commit | 1 GET, 14 KB, 34 ms | same: the span `[c, c]` |
-| 100 | 100 GETs, 1.0 MB, 0.1 s | ~6 spans, ~1 MB, ~0.1 s |
-| 360 (hourly) | 360 GETs | 6 (1M) to 8 (100M) spans: 312K–360K entries |
-| 10,000 (daily), 1M keys | 10,000 GETs, 101 MB, 11 s (one merge; 100 s paged today) | 5 spans, 1.24M entries: ~37 MB, ~1.2 s |
-| 10,000 (daily), 100M keys | 10,000 GETs, 97 MB, 11 s (308 s paged today) | 5 spans, 8.3M entries: ~84 MB, ~2.4 s |
-| keys= of 100 keys, 10,000 behind | 10,000 GETs, 6.5 s | ~10 GETs (1M) to ~110 GETs, 23 MB (100M), 0.2 s |
+**Read-ahead.** An entry `[r, run, attempt]` says a keys= selection read
+some keys as of upstream commit `r`. Classing such a key needs its state at
+`r`, which neither the key, `r`, nor its newest version can tell once the
+history in between is merged. If `k` is live now at a newer generation, it
+is added if the consumer was given `k` as removed at `r`, and updated if it
+was given `k` live. So:
 
-The merge is the range tree's, over fewer files: that study measured 10–14
-files, 37–84 MB and 1.2–2.4 s for 10,000 behind, and checked every class
-against the per-commit merge. CPU is one streaming k-way merge over a
-handful of spans. Today's `pending` restarts a 10,000-way merge for every
-page; that cost goes away.
+- the **delivered state comes from the attempt's sealed result**
+  (`state.attempt_result`), read with its spec (`engine._read_ahead` reads
+  only the spec today): the keys it delivered as upserted, and as removed. A
+  key the selection named but did not deliver (unchanged past `next`) is not
+  part of the entry;
+- per key, the **latest read wins**: the entry with the newest `r` that
+  delivered it;
+- the key is skipped if its newest version is no newer than commit `r`'s
+  generation (generations rise with commit numbers within an output
+  partition); otherwise its class is (its delivered state, its state at
+  `N`);
+- entries before `next` collapse into the snapshot, as today
+  (`positions.collapse`). A covering selection collapses the record to its
+  head + 1, its reserved landing point.
 
-## Write amplification and storage
+Spans keep added-then-removed tombstones outside the base for this rule.
 
-From `tiling.py` (the second half of a long run: 40,000 commits of 1K keys
-at 1M, 200,000 at 100M, mixed 90% updates, 5% removes, 5% adds). "Today" is
-`amplification.py` replaying the real leveled planner on the same commits
-(16.3× and 29.8×). Consumers read every period, in commits; at one commit
-every 10 s, 360 is hourly, 8,640 daily and 60,480 weekly.
+**Measured catch-up** (`catchup.py`: 12,000 commits of 1K keys, four
+consumers 1, 100, 360 and 10,000 behind; spans built by the policy on real
+files with `merge_ranges`, blocking at the four positions; paged 100K keys
+at a time through `KeyIndex._scan`; every layout's classes checked against
+the per-commit merge; 30 ms per request, 80 MB/s per connection, 64 in
+parallel):
 
-| Consumers | Written per entry committed, 1M · 100M | Spans, mean (max), 1M · 100M | Entries per live key, mean (max), 1M · 100M |
+| Behind | Spans | Aligned blocks (range tree, fanout 8) | Packed deltas, one merge |
 |---|---|---|---|
-| Today, any | 16 · 30 (range files would add ~3) | 5 · 7–10 sorted levels (each level-0 file counts one) | 1.03 · 1.24–2.0, plus the retained log |
-| one, every commit | 7.1 · 10.3 | 6 (11) · 11 (21) | 1.13 (1.25) · 1.12 (1.25) |
-| + hourly | 8.9 · 15.9 | 5 (9) · 13 (22) | 1.16 (1.31) · 1.13 (1.25) |
-| + hourly + daily | 9.0 · 17.2 | 10 (15) · 15 (24) | 2.15 (2.54) · 1.17 (1.33) |
-| ten, periods 1 to 8,640 | 10.0 · 16.8 | 12 (16) · 15 (20) | 3.43 (4.31) · 1.16 (1.29) |
-| + weekly | 7.2 · 10.4 | 8 (14) · 10 (20) | 2.87 (4.11) · 1.24 (1.49) |
+| 1 | 1 GET, 10 KB, 30 ms | same | same |
+| 100 | 4 GETs, 0.9 MB, 0.06 s | 9 GETs, 0.9 MB, 0.07 s | 1 GET, 1.0 MB, 0.08 s |
+| 360 | 9 GETs, 3.3 MB, 0.18 s | 10 GETs, 3.4 MB, 0.17 s | 1 GET, 3.5 MB, 0.24 s |
+| 10,000, 1M keys | 13 spans: 27 GETs, 14 MB, 1.2 s, +21 MB RSS | 25 blocks: 159 GETs, 41 MB, 2.2 s | 7 GETs, 101 MB, 11.7 s, +494 MB RSS |
+| 10,000, 100M keys | 16 spans: 259 GETs, 65 MB, 7.7 s, +20 MB RSS | 25 blocks: 965 GETs, 68 MB, 8.1 s | 6 GETs, 97 MB, 12.9 s, +419 MB RSS |
 
-At 100M with 10K-key commits: 8.6×, 10.5× and 13.1× for the first, third
-and fourth rows.
+The 100M catch-up is dominated by paging: ~85 pages of 100K keys, each
+fetching a block range from each span. Building the spans wrote 6.2× (1M)
+and 8.7× (100M) the committed entries past the oldest consumer; the aligned
+blocks 3.5× and 4.4×, on top of whatever the LSM writes. Spans crossed by an
+endpoint (the versions policy) add at most the read bound to these.
 
-- **Writes.** Compaction writes 35–60% of what today's planner writes on
-  the same commits, before counting the range files today would add.
-  The base absorbs the newer spans once they reach a quarter of it. At 100M
-  that is a streaming rewrite of ~1 GB, ~27 s on 8 cores (today's measured
-  full-level compaction), every ~25,000 commits of 1K keys (about 3 days at
-  one commit per 10 s). Estimated rather than measured: small merges come
-  about once per 3 commits, 4 GETs and 1 PUT each, so ~1.3 GETs and ~0.3
-  PUTs per commit, against 1.2 and 0.14 today.
-- **Storage** is the base plus the keys changed since the oldest boundary,
-  once per group of spans. At 100M, nothing a day or a week behind saturates:
-  1.12–1.24 entries per live key. A small, hot index is different. At 1M
-  keys with 10M changes a day, a daily consumer's group holds nearly every
-  key again (2.15). Ten consumers spread over a day keep several such groups
-  (3.43): each boundary keeps its own record of what changed after it. The
-  storage cap bounds it. Per-boundary bits (rejected alternatives, below)
-  would shrink that record to a bit per key, at the price of reading more
-  per catch-up.
-- **Today's** steady state also keeps every per-commit delta any consumer
-  still needs, on top of its levels. The tiling keeps no copy: its recent
-  spans are those deltas.
+## Bounds, and costs as a function of observers
 
-## Observers, trimming and compaction
+An entry cap bounds neither the span count nor reader memory (the review's
+P1-4). Each resource has its own bound:
 
-**The one rule** ("no file is deleted while some observer needs it") holds
-in two halves:
+| Resource | Bound | How |
+|---|---|---|
+| Bytes written | (16 + 10 log₂ K) × committed | the guard on every merge (Lean; version-dropping merges pending) |
+| Spans: scan fan-in, filters probed, cold tail GETs | set by the policy, not by observers | merges cross endpoints |
+| Decoded bytes per reader | about one block range per span per page, plus the page | fan-in × 64 KB × a few, plus the page's entries |
+| Extra read per catch-up | 2× its own changes, or 10 MB | the read bound |
+| Maintenance backlog | one merge per lane | two lanes |
+| Retained versions | the distinct keys changed between consecutive endpoints, summed | the budgets below |
 
-1. **Compaction keeps every boundary a span start.** The current spans then
-   serve every long-lived observer: a consumer, a pass, a drain. Nothing
-   older needs keeping for them.
-2. **A file a merge replaced is deleted once no pin predates the merge.**
-   Pins are short: an attempt holds the state it was handed for its own
-   lifetime, and the engine pins its own reads, as today.
+Replayed (`spans.py`; commits of 1K keys, 90% updates, 5% removes, 5%
+adds; the second half of 40,000–200,000 commits measured; consumers read
+every `period` commits, at one commit per 10 s 360 is hourly and 8,640
+daily). Each cell: written per entry committed · spans, mean (max) ·
+entries per live key. `versions` is this design; `blocked` the reviewed
+one, with the same triggers and guard:
 
-**Trimming** is not a separate operation: it is rule 1 of the policy on
-the first group. When the oldest boundary moves on, the spans before its
-new place may join the base.
+| Observers | 1M keys, versions | 1M, blocked | 100M keys, versions | 100M, blocked |
+|---|---|---|---|---|
+| 1 daily (+ one every commit) | 8.4 · 5.7 (10) · 2.28 | 6.3 · 7.2 (12) · 2.48 | 12.6 · 8.9 (18) · 1.16 | 13.1 · 16 (32) · 1.12 |
+| 10 daily, spread over the day | 7.4 · 12 (17) · 7.42 | 6.8 · 33 (38) · 7.20 | 13.8 · 17 (28) · 1.22 | 15.5 · 41 (52) · 1.22 |
+| 100 daily, spread | 7.6 · 18 (23) · 9.56 | 7.4 · 543 (548) · 9.59 | 14.4 · 21 (29) · 1.24 | 15.4 · 546 (558) · 1.23 |
+| 1,000 daily, spread | 7.9 · 19 (24) · 9.92 | not run (≥ 1,000 spans) | 13.6 · 22 (30) · 1.24 | not run |
+| an endpoint at every commit (1,000 readers, period 1,000) | 9.4 · 7.3 (12) · 2.37 | ≥ 1,000 spans | 13.9 · 10 (17) · 1.13 | ≥ 1,000 spans |
+| a full pass stalled 20,000 commits, + hourly | 8.0 · 6.0 (10) · 2.59 | 7.2 · 12 (17) · 3.06 | 12.5 · 8.9 (17) · 1.16 | 13.6 · 16 (28) · 1.17 |
+| 60 hourly readers, staggered | 7.4 · 6.5 (11) · 1.65 | 9.2 · 183 (188) · 1.49 | 13.0 · 9.4 (18) · 1.13 | 14.8 · 187 (196) · 1.12 |
+| temporary keys (half of each commit, removed 100 commits later), hourly + daily | 9.5 · 6.4 (12) · 7.56 | 9.5 · 13 (19) · 10.5 | 12.6 · 8.6 (15) · 1.13 | 13.1 · 13 (21) · 1.13 |
+| a 1M-key commit after 1K ones, hourly + daily | 7.3 · 6.0 (14) · 2.35 | 6.9 · 11 (18) · 2.55 | 12.4 · 8.8 (18) · 1.15 | 13.2 · 16 (28) · 1.15 |
 
-**The storage cap.** When the spans after the oldest position hold more
-than C × the live keys in entries, the engine drops that position: its next
-run does a full pass, as after a reset. The default is C = 2. Past that,
-the catch-up reads more than twice what a full read does, and the
-consumer's work is no longer much smaller than a full pass. A position
-with a pass under way is never dropped, since that pass is catching up. The cap measures entries, not commits, so it costs nothing at 100M (a
-consumer a week behind holds 0.24 extra entries per live key). At 1M with
-ten consumers it drops the daily ones (9 drops over 20,000 commits), and
-storage stays under 3.0 entries per live key. With C = 1, a weekly consumer
-at 1M holds 2.05 at most.
+Each cell is the worse of instant upkeep and budgeted upkeep (one merge per
+lane at 2M entries per commit, about one core); they differ by at most 4
+spans at the peak.
 
-**How compaction meets observers.**
+- **Writes stay at 7–10× (1M) and 12–14× (100M) under every churn pattern**,
+  well inside the bound (16 + 10 log₂ K ≈ 290× at 100M: loose, but
+  independent of the order observers come and go in).
+- **Spans stay at 22 or fewer on average, 30 at most**, from 1 to 1,000
+  distinct endpoints. Blocking endpoints gives one group of spans per
+  endpoint: 543–546 at 100 readers, 183–187 for 60 staggered hourly ones.
+- **What observers cost is storage.** Each endpoint keeps the keys changed
+  between it and the next: free at 100M (1.13–1.24 entries per live key),
+  ~10× at 1M keys with a reader every 15 minutes of a 10-second source, and
+  7.6× with heavy temporary-key churn. The per-position budget below turns
+  such readers into full passes; the table runs with no budget, to show the
+  cost.
+- **A catch-up reads 1.07–1.24× what changed** for daily readers at 100M,
+  and up to 2× for staggered hourly ones (the read bound at work).
 
-- A merge is planned against the boundaries that exist when it is planned.
-  A boundary born later is past every input.
-- A boundary that disappears (a position moves, a pass ends) only allows
-  more merging. The next plan uses it.
-- A position never moves backwards: it advances, or it is dropped and its
-  full pass lands at the head + 1. A reset, move or removal of the output
-  drops the whole index.
-- Outputs are written under names unique to their merge, as compaction's
-  are today, so a retried or duplicated merge is harmless. Installing one is
-  one event (spans in, span out), and applying it can assert that no
-  current boundary lies strictly inside the new span.
-- Cleanups need nothing from compaction. A commit's delta lists the version
-  it replaced for every key (exact predecessors). The cleanup reads those
-  from the delta file, which `cleanup_reads` keeps alive until the cleanup
-  is done, whether or not a merge has absorbed the span. Store objects stay
-  protected by pins, as today.
+## Retention: each lifetime on its own
+
+| Lifetime | Keeps | Ends |
+|---|---|---|
+| endpoint reservations | versions in spans | its holder releases it |
+| index pins | an attempt's manifest: files a merge has since replaced | the attempt settles |
+| data pins | replaced store objects (immutable stores) | the oldest reader pinned before their replacement settles; a pass keeps its original data pin across attempts |
+| cleanup-delta retention | a commit's delta file, which lists the objects it replaced | its cleanup is acknowledged (`cleanup_reads`) |
+| conditional publication | a merge's uploaded output | published through the journal, or reclaimed if abandoned |
+
+Replayed (`retention.py`, 100M keys, the versions policy with budgeted
+upkeep, hourly and daily readers; per commit an attempt pinning its
+manifest for 6 commits, one in 1,000 for 600; cleanups done 6 commits
+later, one in 1,000 stuck for 2,000; one merge in 20 uploaded but never
+published, reclaimed 360 commits later; 10 B per entry):
+
+| Lifetime | Mean | Peak |
+|---|---|---|
+| current spans | 1,141 MB | 1,278 MB |
+| replaced files kept by attempt pins | 4 MB | 1,279 MB |
+| deltas kept for cleanups | 0.1 MB | 0.1 MB |
+| unpublished or abandoned merge outputs | 6 MB | 1,000 MB |
+| replaced data objects kept by pins | 170K | 585K |
+
+At 1M keys: 24 MB of spans; 5 MB (peak 32) pinned; 1 MB (peak 6)
+unpublished. The means are small. The peaks are single events that each
+cost about one more copy of the index: a slow attempt pinned across a base
+merge keeps the old base, and an abandoned base merge holds its output
+until it is reclaimed. The physical budget must leave room for one of
+each, or reclaim abandoned outputs sooner.
+
+**Budgets**, in bytes and requests rather than entries:
+
+- **Per position: incremental or full.** When a position's catch-up would
+  read more bytes than a full read of the index, or its retained versions
+  pass the per-position budget, the position is dropped and its next run
+  does a full pass. The consumer pays a rebuild, which the engine weighs
+  from the asset's last full run where it has one. A position with a pass
+  under way is not dropped by this rule.
+- **The physical budget** covers all five lifetimes. Past it, the engine
+  applies backpressure (new attempts on the partition wait), then cancels
+  and restarts the oldest protected reader (a stalled pass), releasing its
+  endpoint and pins. It never deletes what a holder still needs.
+
+## Lifecycles the implementation must honour
+
+- **Passes.** A pass between attempts keeps its endpoints and its original
+  data-version pin; each attempt pins the index manifest it was handed,
+  separately. Index-file retention and data-object retention are distinct.
+- **Merges.** A merge records its input spans (identities, digests) and the
+  index's life. Publishing re-checks both against the current state; a
+  retried or duplicate merge whose inputs are gone, or which belongs to an
+  earlier life, is discarded. Outputs have names unique to the merge.
+- **Crash after upload, before publication.** Readers keep using the old
+  state. Abandoned outputs (files under the index prefix that no state and
+  no merge in progress references) are found and reclaimed.
+- **Publication and deletion.** A merge is published through the journal.
+  Its inputs are deleted only once the publication is durable and no pin
+  older than it remains.
+- **Reset, store move, remove and recreate.** A new index life fences old
+  claims and merge jobs: their results are refused. Nothing merges across a
+  reset by commit numbers.
+- **Rename** follows the index's identity (its prefix), as today.
+- **Pattern change.** Reserve split + 1. The membership diff (which keys
+  changed match) stays separate from ordinary classification.
+- **Empty commits, empty base.** An empty delta is still a span, so
+  coverage has no holes. A read that finds a hole fails loudly.
+- **No inferred history.** Every index must have been written exactly from
+  its first commit. There are no deployments, so a fresh index is a
+  precondition, not a migration.
+- **The count invariant** compares against the consumer's effective
+  baseline: live(P − 1) adjusted by what its read-ahead entries delivered.
 
 ## What changes, and what is deleted
 
-Deleted, each because none of the four operations needs it once writes are
-exact and the spans exist:
+Deleted:
 
 | Today | Why it goes |
 |---|---|
-| Levels and the leveled planner: `FileInfo.level`, `l0_max_files`, `level_base`, `fanout`, the "push the least-overlapping file" rule | spans, and the policy above |
-| The delta log as a second list: `IndexState.log`, `keep_log`, `_consumed`, `covers`, `slice`, `truncated`, the `IndexTruncated` event and the truncation in `Upkeep.truncate` | the spans are the log; trimming is the base merge |
-| The range tree (proposed, never built) | spans give catch-up its few files |
-| The inexact count and the recount: `inexact`, `count_exact`, `Delta.exact`, `DeltaFiles.exact`, the recount job and `recount_interval`, `Known::Other`, `Old::Other`, `Sparse.inferred`, `resolve(exact=)` | writes are exact (the first study's option A) |
-| The tombstone Bloom filter (format v4 keeps one filter) | it only served the inferred shortcut: under exact writes, a key-filter hit reads the block anyway, for the predecessor |
-| `.kg` garbage files: `Merge.compact(garbage=)`, `GarbageFile`, `decode_garbage`, the `sidecar` cleanup kind, `native/src/garbage.rs` | they listed the objects inexact deltas missed; exact deltas list every replaced version |
-| Compaction dropping predecessors outside the bottom level | one merge rule: the oldest predecessor survives, and only the base drops them |
+| Levels and the leveled planner (`FileInfo.level`, `l0_max_files`, `level_base`, `fanout`) | spans and the policy above |
+| The delta log as a second list (`IndexState.log`, `keep_log`, `_consumed`, `covers`, `slice`, `truncated`, `IndexTruncated`, the truncation in `Upkeep.truncate`) | the spans are the log; trimming is the base merge |
+| The range tree (proposed) | spans give catch-up its few files, with fewer GETs (measured) |
+| The inexact count and the recount (`inexact`, `count_exact`, `Delta.exact`, `DeltaFiles.exact`, recount, `recount_interval`, `Known::Other`, `Old::Other`, `Sparse.inferred`, `resolve(exact=)`) | writes are exact |
+| The tombstone Bloom filter | under exact writes, a key-filter hit reads the block anyway |
+| `.kg` garbage files (`Merge.compact(garbage=)`, `GarbageFile`, `decode_garbage`, the `sidecar` cleanup kind, `native/src/garbage.rs`) | exact deltas list every replaced version |
 | `pending`'s per-page restart of a merge over thousands of deltas | a catch-up merges a handful of spans |
-| Index-file pins held for the whole of a multi-batch pass or a pattern-change drain (`pass.pin`) | their boundary keeps their view readable from current files; pins remain for attempts and store objects |
 | Per-key consumer payloads in the index (K47) | consumer records are a position plus read-ahead entries |
 
 Changed:
 
-- `IndexState`: `count`, `spans: [(a, b, files)]`, `prefix`. A file
-  belongs to one span.
-- One native merge with a `base` flag replaces the compaction merge and the
-  range merge (`Merge.compact`, `merge_ranges`).
-- Readers: `_find`, `_scan` and `pending` already take a list of sorted
-  file sets, newest first (today's levels), so they take spans.
-  `pending(P, N)` reads the spans of `[P, N]` and reports each key's oldest
-  predecessor beside its newest entry (the first study's `Merge::existed`).
-- Upkeep plans with the policy above, against boundaries derived from
-  positions, passes and drains: what `Upkeep.truncate` computes today as
-  `needed`, from positions and claims.
-- The read-ahead's per-key bound is the generation of the upstream commit it
-  read at. The state it delivered comes from the attempt's spec.
+- `.kx` format v4: one filter; a key may repeat in a file, newest first,
+  one entry per segment, the predecessor on the oldest.
+- `IndexState`: `count`, `spans: [(a, b, segment starts, files)]`,
+  `prefix`.
+- One native merge (versions kept per live endpoint, the oldest
+  predecessor kept, the base dropping what means absent) replaces the
+  compaction merge and the range merge.
+- Readers (`_find`, `_scan`, `pending`) take spans and an optional endpoint
+  generation; `pending(P, N)` reports each key's state before `P` beside its
+  newest entry.
+- Upkeep: the policy and two lanes above, planned against endpoints derived
+  from positions, claims, passes and drains.
+- The read-ahead reads attempt results as well as specs.
 
-Kept: the `.kx` format (blocks, key filter, payloads for source versions
-and failure records), the engine cache and engine-served reads, `DeltaKeys`,
-cleanups driven by delta predecessors, pins for attempts.
+Kept: blocks, the key filter, payloads for source versions and failure
+records, the engine cache, engine-served reads, `DeltaKeys`, cleanups driven
+by delta predecessors, pins.
 
-New words for the glossary: **span** (replacing level, delta log and range
-file; "run" is taken), **boundary**, **base**. "Observer" names the four
-kinds of reader in the table above. "Delta" stays: a commit's span.
+New words for the glossary: **span**, **endpoint**, **base** ("run" was
+taken). "Delta" stays: a commit's span.
 
-## Rejected alternatives
+## Alternatives, compared
 
-- **Today plus the range tree** (two orderings, three structures). It works
-  (the range tree study measured it), but it keeps two merge rules, two
-  deletion rules, a leveled planner writing 16–31× and range files writing
-  3× more. The tiling gives the same catch-up and both orderings with one
-  structure, and writes less.
-- **A key-sorted multiversion LSM**: each key keeps its versions across
-  levels, and compaction keeps the versions observers need. Catch-up loses
-  time locality. With random writes, every bottom-level block holds some
-  key changed after `P`. So `changes(P → N)` from a day back reads about the
-  whole index: ~0.7 GB at 100M, against 84 MB from the spans. The tiling is
-  this structure restricted to time-contiguous files, and that restriction
-  is what buys the locality. One idea survives as an escape hatch: a span
-  merged across a boundary could keep one "live before" bit per key per
-  inner boundary. That would bound the span count with very many observers.
-  It isn't needed at the counts measured.
-- **A persistent or prolly tree** (Dolt): one structure for "live now",
-  "live at N" and the N..H diff. On random keys, each changed key rewrites
-  its leaf. 1K random updates at 100M rewrite ~1K leaves, 4–64 MB per
-  commit, against a ~15 KB delta plus 10–17× compaction. A consumer a day
-  behind diffs two trees in which nearly every leaf differs: with 400-key
-  leaves and 8.6% of keys changed, a leaf stays untouched with probability
-  0.914^400 ≈ e^−36. That reads ~2× the index, against 84 MB. A consumer
-  one commit behind reads ~1K leaves, against one delta. Retained roots need chunk
-  garbage collection. It wins on clustered keys and many cheap snapshots,
-  neither of which is this workload.
-- **Pinned snapshots at each position** (the first study's option B). With
-  boundaries, the state at `P − 1` is readable for free. But the consumer
-  would still look up every changed key there: 1,758 GETs per 1K keys at
-  100M, on every pass, where the writer paid once.
-- **Resolution deferred to compaction or to readers** (blind writes). The
-  live count and the cleanups wait for resolution. In the tiling, a blind
-  entry resolves only at its group's merge into the oldest span, or by
-  each consumer's lookup at `P − 1` (option B's cost). Exact writes cost
-  only cold writers (an engine with its cache answers in ~113 ms with no
-  GETs), so they stay. The structure doesn't rule out adding blind writes
-  later for cold, write-heavy outputs.
-- **Aligned spans** (the range tree's blocks applied to the tiling). The
-  tiling would then be a pure function of the head and the boundaries, but
-  a decomposition costs up to 2(f − 1) spans per level per boundary: the
-  range tree study counted 25 files (43 worst) at fanout 8 for one
-  catch-up, against ~5 here. Alignment is needed only when a boundary can
-  fall inside an existing span, and boundaries are born at the head + 1.
-- **Capping spans per group by merging the smallest neighbours.** Measured:
-  the newest span absorbs every commit, 540–1,300× written at 100M.
+- **Blocking endpoints** (the reviewed version: a merge never crosses an
+  endpoint). One version per key per span, a simpler merge. But the span
+  count grows with distinct endpoints (543–546 spans at 100 daily readers,
+replayed), and each
+  retirement forced a rewrite of the spans after it (the review's 265×
+  case). Versions cost a format change and a version-aware reader.
+- **Today's LSM plus a packed, resumable log.** Lookups keep the leveled
+  layout; catch-up reads one packed object in a few range GETs and merges
+  every delta once, holding a cursor per delta. Measured 10,000 behind: 6–7
+  GETs, but 97–101 MB, 11.7–12.9 s of merge and 420–490 MB of memory,
+  against 13–16 spans, 14–65 MB, 1.2–7.7 s and ~20 MB. It keeps today's
+  leveled compaction and two structures.
+- **Aligned tiers** (the range tree). Measured on the same log: 25 blocks
+  and 159–965 GETs for 10,000 behind, against 27–259 for spans, at similar
+  bytes, and 3.5–4.4× written on top of the LSM's compaction.
+- **Presence bits instead of versions** at inner endpoints: enough for a
+  consumer's classes, not for a pass pinned at a middle endpoint, which
+  reads the versions there.
+- **A key-sorted multiversion LSM without time order.** A catch-up from a
+  day back reads about the whole index (every bottom block holds a key
+  changed since), ~0.7 GB at 100M against 65 MB. The read bound is what
+  keeps the spans' time locality.
+- **A persistent or prolly tree** (Dolt). Random writes rewrite one leaf
+  per changed key (4–64 MB per 1K-key commit at 100M); a day-behind diff
+  reads both trees, since nearly every leaf differs (0.914^400 ≈ e^−36
+  untouched).
+- **Pinned snapshots per position, and blind writes resolved later.** Each
+  moves the exact lookup from the writer, who pays once, to every consumer
+  pass, or leaves the count and the cleanups unresolved.
 
 ## A worked example
 
@@ -421,7 +487,7 @@ Commit `c` writes at generation `10c` after that.
 |---|---|---|
 | 1 | add c | c g10 |
 | 2 | remove a | a tombstone g20, pred 1 |
-| 3 | re-add a, update b | a g30 (no pred: a was a tombstone); b g30, pred 1 |
+| 3 | re-add a, update b | a g30 (no pred); b g30, pred 1 |
 | 4 | add d, update c | d g40; c g40, pred 10 |
 | 5 | remove d | d tombstone g50, pred 40 |
 
@@ -429,112 +495,99 @@ Two consumers keep `tally = ctx.load() + len(added) − len(removed)`.
 
 - **X** sits at position 1, with tally 2 (`a`, `b`).
 - **Y** read through commit 2 and sits at position 3, with tally 2 (`b`,
-  `c`). Then a keys= run named `d` and read it at head 4. Y's record is now
-  position 3 plus the read-ahead entry `[4, run, attempt]`: `d` was
-  delivered upserted, and its bound is commit 4's generation, 40. Y's tally
-  is 3.
+  `c`). A keys= selection then read `d` at head 4; its sealed result says `d`
+  was delivered upserted. Y's record is position 3 plus `[4, run,
+  attempt]`; its bound for `d` is commit 4's generation, 40. Its tally is 3.
 
-The boundaries are 1 (X) and 3 (Y). Compaction may merge `[1,1]` with
-`[2,2]` (no boundary at 2), and `[3,3]`, `[4,4]`, `[5,5]` together (none at
-4 or 5), but never across 3:
+The endpoints are 1 (X) and 3 (Y). Suppose upkeep merges all five deltas
+into one span `[1, 5]` (the read bound allows it: everything is tiny).
+Endpoint 3 is live inside it, so the span has two segments, `[1, 2]` and
+`[3, 5]`, and keeps the version endpoint 3 sees for each key that changed
+on both sides:
 
 ```
-base  [0, 0]  a g1 · b g1
-span  [1, 2]  a tombstone g20 pred 1 · c g10
-span  [3, 5]  a g30 · b g30 pred 1 · c g40 pred 10 · d tombstone g50
+base  [0, 0]   a g1 · b g1
+span  [1, 5]   a: g30 | tombstone g20, pred 1     (newest | seen by 3)
+               b: g30, pred 1
+               c: g40 | g10                        (newest | seen by 3, no pred)
+               d: tombstone g50, no pred
 ```
 
-In `[3, 5]`, `d` keeps its oldest predecessor (none, from commit 4) and its
-newest entry (the tombstone), so it is a tombstone naming no predecessor.
+- **Lookup at the head:** each key's first entry: `a` g30, `b` g30, `c` g40
+  live, `d` gone. The count is 3.
+- **X, `changes(1 → 5)`:** the state before 1 is each key's oldest
+  predecessor. `a` was live (pred 1) and is live: updated. `b`: updated. `c`
+  names none: added. `d` names none and is gone: neither. Tally 2 + 1 = 3.
+- **Y, `changes(3 → 5)`:** the state before 3 is each key's newest version
+  older than commit 3. `a`: the tombstone g20, absent; live now: added. `b`
+  has no version before 3, so its predecessor: live; updated. `c`: g10,
+  live: updated. `d` is in the read-ahead: its newest generation, 50, is
+  past the bound 40, so it changed after Y read it; it was delivered
+  upserted and is gone: removed. Tally 3 + 1 − 1 = 3: `a`, `b`, `c`.
 
-- **Lookup at the head:** `a` live (g30, found in `[3, 5]`), `b` and `c`
-  live, `d` absent. The count went 2 → 3 → 2 → 3 → 4 → 3, and it is 3.
-- **X's catch-up, `changes(1 → 5)`,** merges both spans. `a`: newest g30,
-  live; oldest predecessor 1, from `[1, 2]`; so updated. `b`: updated. `c`:
-  newest g40; oldest entry in `[1, 2]` names no predecessor; so added.
-  `d`: a tombstone naming none, so neither, not delivered. Tally 2 + 1 − 0
-  = 3: `a`, `b`, `c`.
-- **Y's catch-up, `changes(3 → 5)`,** reads `[3, 5]`. `a` names no
-  predecessor and is live: added. `b` and `c`: updated. `d` is in the
-  read-ahead: its newest generation, 50, is past the bound 40, so it
-  changed after Y read it. It was delivered upserted and is now gone:
-  removed. Tally 3 + 1 − 1 = 3: `a`, `b`, `c`.
+Had the merge dropped the version endpoint 3 sees for `a`, Y would read
+`a`'s oldest predecessor (live) and class it updated, though Y never had it.
+Had it dropped `d` as added-and-removed, Y would keep `d` forever. Once Y
+moves past 5, endpoint 3 retires: the next merge touching `[1, 5]`
+coalesces its segments (`a: g30, pred 1`, `c: g40`), or the span is
+rewritten alone once such dead versions reach a quarter of it. When X moves
+on too, the span joins the base: `a g30 · b g30 · c g40`, with `d`'s
+tombstone and the predecessors gone. The replaced versions (`a` g1, `b` g1,
+`c` g10, `d` g40) were cleaned up from the deltas of commits 2–5.
 
-Two counterfactuals show why the rules exist:
+## What must be checked
 
-- **Merging across Y's boundary** would make `[1, 5]`. There `a`'s oldest
-  predecessor is 1 and `c`'s oldest entry names none, so Y would be told
-  `a` was updated (it never had `a`) and `c` was added (it already had
-  `c`). Its tally happens to land on 3, but an `each=True` consumer would
-  never build `a` and would build `c` twice.
-- **Dropping `d`** as "added and removed inside `[3, 5]`" would hide its
-  removal from Y, and Y would keep `d` forever.
+**Lean** (proposed by the coordinator; the write bound for guarded merges is done):
 
-Once Y's next pass lands at 6, boundary 3 goes and the two spans may merge.
-Once X moves past 5 too, the first group merges into the base: `a g30 · b
-g30 · c g40`. `d`'s tombstone and every predecessor are dropped. The
-versions that dropped out (`a` g1, `b` g1, `c` g10, `d` g40) were already
-cleaned up, from the predecessors in deltas 2–5. No `.kg` file is
-involved.
+- the write bound under the guard, for any order of commits, endpoint births
+  and releases, including single-input rewrites and merges whose output is
+  smaller than their largest input (versions dropped);
+- the tiling: after any sequence of guarded, read-bounded merges, for every
+  live endpoint `P` and reserved `N + 1`, the versions kept give the same
+  classes as the per-commit fold, and an endpoint born at the head + 1 never
+  falls inside an existing span;
+- the read-ahead rule: with generations strictly increasing in commit order
+  and the delivered state from the result, the class equals the presence
+  change from `r` to `N`; and the counterexample when tombstones outside
+  the base are dropped.
 
-## What the TLA+ spec and the sim must check
+**TLA+** (`KeyIndex.tla`): spans with segments; endpoint holders with the
+reservation lifetimes above, a selection's landing point included; pins;
+two upkeep lanes; publication through the journal; a crash after upload; a
+reset fencing old merges. Invariants: reads agree with the full history
+(`Execution.tla`'s log) at every reserved endpoint; no file deleted while a
+pin or a pending cleanup needs it; no published merge from an old life or
+with changed inputs; the count against the effective baseline. Calibrations,
+each must fail with its fix off: a selection without a reserved landing
+point (its position lands inside a merged span); a merge dropping a version
+a live endpoint sees; tombstones dropped outside the base; deletion before
+durable publication.
 
-**TLA+, a new `KeyIndex.tla`** (Positions.tla keeps the records, and per
-K47 an `each=True` consumer uses the same record). Model: two or three keys,
-about six commits, the spans as `(a, b, key → [newest, pred])`, observers
-(positions, passes with landing points, a drain, the cap), pins and
-file deletion. Actions: `Commit` (exact: a predecessor iff live),
-`Merge(i)` and `MergeIntoBase`, guarded by the boundary rule, the observer
-actions, and `Delete` after pins. Invariants:
+**The sim** (`tests/sim`): exact deltas through every writer, in the cold
+mode (resolver off, `bits_per_item=1`, `whole_threshold=0`,
+`small_file=0`); compaction interleaved anywhere, with endpoints derived
+from the model and every reader checked against the oracle; the tally with
+read-ahead entries read from results, batches split anywhere, positions
+dropped; cleanups exactly once and never under a pin; injected upload and
+publication failures; spans and written bytes reported against the bounds.
 
-- **Tiling**: the spans cover `0..head` contiguously, and every live
-  boundary starts a span.
-- **Reads agree with history**, from `Execution.tla`'s full log: for every
-  observer, `changes(P → N)` from the spans equals the classes computed
-  from the log, `scan(c)` equals the live set at `c`, and a lookup at the
-  head equals the live set.
-- **Read-ahead**: for a key read at `r`, the class from (delivered state,
-  newest generation against `r`'s generation) equals the truth relative to
-  `r`.
-- **Count**: over a pass, added − removed = live(N) − live(P − 1).
-- **No dangling read**: every file an in-flight reader holds exists.
-- **The cap never drops a position with a pass under way.**
-- **Calibration**, each fix switched off must fail: merging across a
-  boundary (reads disagree); dropping neither-entries outside the base
-  (read-ahead fails); a boundary born before the head (a span gets cut);
-  deleting without pins (dangling read).
+## The review, finding by finding
 
-**The sim** (`tests/sim`):
-
-- **Exact deltas as a property.** Every committed entry of key k at commit
-  c names a predecessor iff k was live after c − 1, through every writer:
-  warm engine, cold sparse, streamed patch, replacement, source commit,
-  repair, retry. That needs the cold mode the first study asked for:
-  resolver off, `bits_per_item=1`, `whole_threshold=0`, `small_file=0`,
-  streaming off.
-- **Compaction anywhere.** Random merges interleaved between pages, passes
-  and commits, with boundaries derived from the model, checking after every
-  step that each boundary starts a span and each reader's answer equals the
-  oracle's.
-- **The tally.** Each consumer's sum of added − removed tracks the live
-  count under its patterns, with read-ahead entries, batches split
-  anywhere, and positions dropped by a small cap. A dropped consumer's full
-  pass rebuilds to the oracle.
-- **Cleanups.** Every replaced object is cleaned up once, never while a pin
-  could read it, and with no `.kg` files.
-- **Bounds**, reported rather than asserted: spans, and entries per live
-  key, against the replay's numbers.
+| Finding | Answer |
+|---|---|
+| P1-1 landing points | every attempt that may advance a position reserves the head + 1 at its claim (selections, a pass's first attempt, drains), kept until durable transfer, released on failure; a TLA+ calibration |
+| P1-2 read-ahead state | delivered state from the sealed attempt result; latest read wins; tombstones kept |
+| P1-3 retirement rewrites | merges cross endpoints, so retirement forces nothing; the guard bounds writes in any order (Lean); replayed under the review's churn scenarios |
+| P1-4 span count, memory | spans set by the policy, not by observers; a bound per resource; versions, not bits |
+| P2-1 retention | five lifetimes accounted separately; byte budgets with backpressure and cancel-restart |
+| P2-2 mixed models | numbers labelled; catch-up measured on real spans against packed deltas and aligned blocks; both layouts built from one trace by real compactions |
+| P2-3 cap exemption at 0 | removed (`tiling.py`); only positions with a pass under way are exempt, and the physical budget covers them |
 
 ## Open questions
 
-- **C = 2** for the cap, and **4** for both the size classes and the
-  merge-into-oldest ratio, are the replay's choices. Size classes of 8
-  write 0–13% less at 1M and about the same at 100M (−18% to +6%), for up
-  to ~50% more spans.
-- **A 100M base merge takes ~27 s.** It can stream in key slices over
-  several upkeep steps, since nothing observes the commits it absorbs. That
-  isn't needed now.
-- **Very many observers on one partition.** Spans grow with distinct
-  boundaries (one per consumer position, at least). Dozens cost one more
-  GET per span on cold reads, in the same parallel round. Hundreds would
-  call for the per-boundary bits above.
+- λ = 1 and Z = 1M entries for the read bound, 4 for the guard and the
+  window: chosen on the replay; the implementation should re-measure.
+- The physical budget's default, and whether cancel-restart of a stalled
+  pass needs the user's consent.
+- Format v4 lets a key repeat within a file; the reference implementation
+  (`tests/sdk/keys_reference.py`) changes with it.

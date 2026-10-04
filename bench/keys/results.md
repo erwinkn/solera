@@ -1279,3 +1279,65 @@ each (R spans).
 | 100,000,000 | tiling 43 | 83 | 1.33 | 985 MB | 233 MB | 1,163 GETs, 343 MB, 1.72 s | 70 GETs, 25 MB, 0.16 s |
 
 The 100M run took 308 s (44 s of it the build) and 5.2 GB peak RSS.
+
+## Spans after review: churn, real catch-up, matched layouts, retention (2026-10-05)
+
+`docs/key-index-design.md`, revised: merges may cross endpoints, keeping
+the version each endpoint sees. Apple M5 Max, ≤ 3 cores.
+
+**Observer churn** (`spans.py`, replayed; full tables in the doc):
+`versions` writes 7.3–9.5× (1M) and 12.3–14.4× (100M) in every scenario
+(1 to 1,000 daily readers, an endpoint at every commit, a stalled full
+pass, 60 staggered hourly readers, temporary-key churn, a 1M-key commit),
+with 6–22 spans on average and 30 at most; `blocked` (merges never cross
+an endpoint) has 543–546 spans at 100 daily readers and 183–187 for 60
+staggered hourly ones. Budgeted upkeep (two lanes, 2M entries per commit
+each) moves the peak by at most 4 spans; one lane let 70–117 spans pile up
+behind a 100M base merge.
+
+    uv run python bench/keys/spans.py --sizes 1e6,1e8
+
+**Catch-up over real spans** (`catchup.py`; 12,000 commits of 1K keys;
+paged 100K keys at a time; classes checked against the per-commit merge;
+30 ms per request, 80 MB/s per connection, 64 in parallel):
+
+| Keys | Behind | Spans | Aligned (fanout 8) | Packed, one merge |
+|---|---|---|---|---|
+| 1M | 100 | 4 GETs, 0.9 MB, 0.06 s | 9 GETs, 1.0 MB, 0.06 s | 1 GET, 1.0 MB, 0.08 s |
+| 1M | 360 | 9 GETs, 3.2 MB, 0.15 s | 10 GETs, 3.4 MB, 0.15 s | 1 GET, 3.7 MB, 0.23 s |
+| 1M | 10,000 | 13 spans, 27 GETs, 13.6 MB, 1.22 s, +21 MB RSS | 159 GETs, 41.2 MB, 2.24 s | 7 GETs, 101 MB, 11.7 s, +494 MB RSS |
+| 100M | 100 | 4 GETs, 0.9 MB, 0.06 s | 9 GETs, 0.9 MB, 0.07 s | 1 GET, 1.0 MB, 0.08 s |
+| 100M | 360 | 9 GETs, 3.3 MB, 0.18 s | 10 GETs, 3.4 MB, 0.17 s | 1 GET, 3.5 MB, 0.24 s |
+| 100M | 10,000 | 16 spans, 259 GETs, 65.3 MB, 7.69 s, +20 MB RSS | 965 GETs, 68.0 MB, 8.08 s | 6 GETs, 97.1 MB, 12.9 s, +419 MB RSS |
+
+One commit behind is 1 GET, 10 KB, 30 ms in every layout. Building the
+spans wrote 6.2× (1M) and 8.7× (100M) the committed entries past the
+oldest consumer; the aligned blocks 3.5× and 4.4×.
+
+    uv run python bench/keys/catchup.py --sizes 1e6,1e8 --commits 12000
+
+**Retention** (`retention.py`, replayed, 100M): current spans 1,141 MB
+mean (1,278 peak); kept by attempt pins 4 MB (1,279); cleanup deltas
+0.1 MB; unpublished or abandoned merge outputs 6 MB (1,000); data objects
+kept by pins 170K (585K). The peaks are one slow attempt pinned across a
+base merge and one abandoned base merge.
+
+    uv run python bench/keys/retention.py --sizes 1e6,1e8
+
+**Matched layouts** (`layouts.py`, measured; one trace applied to today's
+leveled index by its real planner and to the spans by the policy):
+
+| | 1M: leveled | 1M: spans | 100M: leveled | 100M: spans |
+|---|---|---|---|---|
+| written per entry committed | 17.2 | 8.0 | 50.3 | 13.0 |
+| runs · files · entries per live key | 3 · 3 · 1.03 | 3 · 3 · 1.10 | 5 · 11 · 1.01 | 9 · 14 · 1.02 |
+| lookup 1K exact, cold | 3 GETs, 10 MB, 0.21 s | 3 GETs, 11 MB, 0.29 s | 907 GETs, 200 MB, 1.13 s | 901 GETs, 207 MB, 1.20 s |
+| append 1K exact, cold | 3 GETs, 0.24 s | 3 GETs, 0.31 s | 58 GETs, 409 MB, 5.86 s | 65 GETs, 417 MB, 7.65 s |
+| page 100K, cold | 4 GETs, 0.9 MB, 0.10 s | 4 GETs, 2.0 MB, 0.14 s | 9 GETs, 1.6 MB, 0.09 s | 13 GETs, 4.8 MB, 0.11 s |
+| lookup 1K / page 100K, warm | 0.01 / 0.01 s | 0.01 / 0.02 s | 0.01 / 0.01 s | 0.01 / 0.01 s |
+
+20,000 commits at 1M, 30,000 at 100M (8 min, 3.9 GB RSS). Lookups cost the
+same on matched layouts; the first version's 1,117-vs-1,851 GETs compared
+against a leveled layout with 2.0 entries per live key and is withdrawn.
+
+    RAYON_NUM_THREADS=2 uv run python bench/keys/layouts.py --sizes 1e6,1e8 --commits 30000

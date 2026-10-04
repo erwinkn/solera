@@ -275,7 +275,9 @@ async def size_run(n: int, commits: int, root: Path, opts: Options) -> list[dict
         for mode in ("cold", "warm"):
             ops = {
                 "lookup 1K": lambda idx: idx.lookup(look),
-                "append 1K updates": lambda idx: idx.resolve(
+                "append 1K updates": None
+                if mode == "warm"
+                else lambda idx: idx.resolve(
                     K.SortedEntries.of(upd),
                     commit_number=10**9,
                     attempt="m",
@@ -285,6 +287,8 @@ async def size_run(n: int, commits: int, root: Path, opts: Options) -> list[dict
                 "page 100K, mid-index": lambda idx: idx.page(mid, 100_000),
             }
             for op, fn in ops.items():
+                if fn is None:  # the engine's warm resolve is its own path (resolved-commits.md)
+                    continue
                 c = cold(root)
                 if mode == "warm":
                     opened = cache.open(st)
