@@ -76,7 +76,7 @@ from solera.stores import (
     prepare_for,
     resolve_env,
 )
-from solera.tasks import Tasks
+from solera.tasks import Tasks, retrying
 
 from . import each
 from .observed import Observed
@@ -1190,13 +1190,9 @@ async def _publish(control_file, result, writes, cancel, timeline, shipper) -> b
         body = seal(result)
     except (TypeError, ValueError) as error:  # the result cannot be told as it is
         body = seal(_failed(error, True))
-    for attempt in range(PUBLISH_TRIES):
-        try:
-            return await control_file.move(lifecycle.SEALED, result=body)
-        except Exception:
-            if attempt == PUBLISH_TRIES - 1:
-                raise
-            await asyncio.sleep(0.2 * 2**attempt)
+    return await retrying(
+        lambda: control_file.move(lifecycle.SEALED, result=body), tries=PUBLISH_TRIES, base=0.2
+    )
 
 
 async def _execute(

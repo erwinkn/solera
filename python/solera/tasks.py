@@ -17,6 +17,22 @@ from collections.abc import Awaitable, Callable, Coroutine, Hashable, Iterator
 log = logging.getLogger(__name__)
 
 
+async def retrying(fn: Callable[[], Awaitable], *, tries: int, base: float, unless: tuple = ()):
+    """`await fn()`, tried up to `tries` times, waiting `base` seconds, then
+    twice as long each time; the last failure is raised. An exception in
+    `unless` is no failure to retry: it is raised at once."""
+
+    for attempt in range(tries):
+        try:
+            return await fn()
+        except unless:
+            raise
+        except Exception:
+            if attempt == tries - 1:
+                raise
+            await asyncio.sleep(base * 2**attempt)
+
+
 class Tasks:
     def __init__(self, name: str):
         self.name = name

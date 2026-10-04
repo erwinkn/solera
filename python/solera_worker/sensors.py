@@ -17,7 +17,7 @@ import traceback
 from solera.lifecycle import Ended
 from solera.sdk import Project, Tick
 from solera.stores import resolve_env
-from solera.tasks import Tasks
+from solera.tasks import Tasks, retrying
 
 OVERRAN = 3  # the exit code of a host that gave up on a tick
 ORPHANED = 4  # the exit code of an engine's own host whose engine is gone
@@ -122,14 +122,13 @@ async def run_sensor_host(
             return
         except Exception as error:
             outcome = {"error": "".join(traceback.format_exception_only(error)).strip()}
-        for attempt in range(3):
-            try:
-                await channel.post(tick["sensor"], tick["tick"], outcome)
-                return
-            except Ended:
-                return  # refused, or decided already
-            except Exception:
-                await asyncio.sleep(0.5 * 2**attempt)
+        with contextlib.suppress(Exception):  # Ended too: refused, or decided already
+            await retrying(
+                lambda: channel.post(tick["sensor"], tick["tick"], outcome),
+                tries=3,
+                base=0.5,
+                unless=(Ended,),
+            )
 
     async def watch_parent() -> None:
         nonlocal orphaned

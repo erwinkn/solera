@@ -21,6 +21,7 @@ from solera import errors, lifecycle
 from solera.build import method_note
 from solera.lifecycle import Cancel, Ended
 from solera.objects import Conflict, swap
+from solera.tasks import retrying
 
 from .state import LostOwnership, Unavailable
 
@@ -818,31 +819,25 @@ class Attempts:
         establishes nothing: retried, then raised."""
 
         path = f"{lifecycle.base(run_id, attempt)}{lifecycle.CONTROL}"
-        for retry in range(6):
-            try:
-                found = await self._control_file(run_id, attempt)
-                while found is not None and found[0]["state"] not in lifecycle.FINAL:
-                    body, version = found
-                    end = {"engine": self.state.journal.engine, "write": lifecycle.NONE}
-                    if body["state"] == lifecycle.WRITING:
-                        end.update(write=lifecycle.WRITING, intents=body.get("intents") or {})
-                    elif body["state"] is None:  # malformed: whether it took the gate is unknown
-                        end.update(write=lifecycle.WRITING)
-                    self._authority()
-                    try:
-                        await swap(
-                            self.state.objects, path, lifecycle.control(lifecycle.ENDED, **end), version
-                        )
-                        return {"state": lifecycle.ENDED, **end}
-                    except Conflict:  # the worker moved on, or another engine ended it
-                        found = await self._control_file(run_id, attempt)
-                return found[0] if found is not None else None
-            except LostOwnership:
-                raise
-            except Exception:
-                if retry == 5:
-                    raise
-                await asyncio.sleep(0.2 * 2**retry)
+
+        async def once():
+            found = await self._control_file(run_id, attempt)
+            while found is not None and found[0]["state"] not in lifecycle.FINAL:
+                body, version = found
+                end = {"engine": self.state.journal.engine, "write": lifecycle.NONE}
+                if body["state"] == lifecycle.WRITING:
+                    end.update(write=lifecycle.WRITING, intents=body.get("intents") or {})
+                elif body["state"] is None:  # malformed: whether it took the gate is unknown
+                    end.update(write=lifecycle.WRITING)
+                self._authority()
+                try:
+                    await swap(self.state.objects, path, lifecycle.control(lifecycle.ENDED, **end), version)
+                    return {"state": lifecycle.ENDED, **end}
+                except Conflict:  # the worker moved on, or another engine ended it
+                    found = await self._control_file(run_id, attempt)
+            return found[0] if found is not None else None
+
+        return await retrying(once, tries=6, base=0.2, unless=(LostOwnership,))
 
     async def _control_file(self, run_id: str, attempt: str) -> tuple[dict, str] | None:
         """The control file and its version; a malformed one as state None,

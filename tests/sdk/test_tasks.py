@@ -115,3 +115,35 @@ async def test_a_woken_ticker_ticks_before_its_interval():
     await asyncio.sleep(0.01)
     assert len(ticks) == 2, "and again when woken, not 60 s later"
     await tasks.close()
+
+
+async def test_retrying_doubles_its_waits_and_raises_the_last_failure(monkeypatch):
+    from solera import tasks as module
+    from solera.tasks import retrying
+
+    waits, calls = [], []
+
+    async def sleep(seconds):
+        waits.append(seconds)
+
+    monkeypatch.setattr(module.asyncio, "sleep", sleep)
+
+    async def flaky():
+        calls.append(1)
+        if len(calls) < 3:
+            raise OSError("not yet")
+        return "done"
+
+    assert await retrying(flaky, tries=3, base=0.2) == "done" and waits == [0.2, 0.4]
+    calls.clear()
+    with pytest.raises(OSError):
+        await retrying(flaky, tries=2, base=0.2)
+
+    async def refused():
+        calls.append(1)
+        raise LookupError("decided")
+
+    calls.clear()
+    with pytest.raises(LookupError):
+        await retrying(refused, tries=5, base=0.2, unless=(LookupError,))
+    assert len(calls) == 1, "an exception in `unless` is not retried"
