@@ -53,7 +53,7 @@ from .attempts import POOL_OFFERED_GRACE, Attempts, Live, current_names, worker_
 from .executors import PlacementContext, Registry
 from .history import MAX_METADATA, History, RunFilter
 from .keyservice import KeyService, cache_root
-from .model import TERMINAL_RUN, commit_of
+from .model import TERMINAL_RUN, _delta_files, commit_of
 from .positions import advance, continues, outstanding, reads, selects
 from .sensors import Sensors
 from .staleness import Staleness
@@ -930,6 +930,12 @@ class Engine(Attempts, Sensors, Staleness, Views):
             if due := self._due_cleanups(name, partition, attempt):
                 info["cleanup"] = due
             outputs[name] = info
+        if claim is not None:
+            # What its spec hands it is read from now, not from `AttemptLaunched` on: another
+            # attempt's acknowledgement meanwhile must not let collection take it (F36).
+            claim["cleanups"] = _delta_files(
+                d for info in outputs.values() for d in info.get("cleanup") or ()
+            )
         # The input versions its outputs will be built from, for the history (§7):
         # each pinned ref's generation (docs/versions.md §6).
         lineage = []

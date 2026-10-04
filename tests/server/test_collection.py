@@ -6,7 +6,6 @@ import asyncio
 import json
 import random
 
-import pytest
 from solera.keys.index import Options
 from solera.sdk import Incremental, Output, Project, Retry, asset
 from solera.stores import FileStore, Patch
@@ -498,7 +497,6 @@ async def test_a_pool_job_with_no_inputs_pins_only_its_output(tmp_path):
     await state.close()
 
 
-@pytest.mark.xfail(strict=True, raises=AssertionError, reason="F36: open")
 async def test_a_delta_a_launching_attempt_was_handed_outlives_its_acknowledgement(
     tmp_path, data, monkeypatch
 ):
