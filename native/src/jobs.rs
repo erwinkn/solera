@@ -134,6 +134,9 @@ struct Gather {
     key: Option<Vec<u8>>,
     at: usize,
     prev: Option<u64>,
+    /// Run order alone says which version is newer (W53: a snapshot laid
+    /// over the head, its generations older): no order check.
+    unordered: bool,
 }
 
 enum Gathered {
@@ -192,7 +195,7 @@ impl Gather {
                         predecessor: b.predecessor(i),
                         prior: b.prior(i).and_then(|(_, p)| p).map(<[u8]>::to_vec),
                     };
-                    if self.prev.is_some_and(|p| v.generation >= p) {
+                    if !self.unordered && self.prev.is_some_and(|p| v.generation >= p) {
                         return Err(Error::Format(format!(
                             "versions of {:?} out of order",
                             String::from_utf8_lossy(key)
@@ -223,6 +226,7 @@ pub struct SpanMerge {
     retainer: Retainer,
     gather: Gather,
     done: bool,
+    before: bool,
 }
 
 impl SpanMerge {
@@ -241,6 +245,7 @@ impl SpanMerge {
             retainer,
             gather: Gather::default(),
             done: false,
+            before: false,
         }
     }
 
@@ -249,6 +254,18 @@ impl SpanMerge {
     /// dropped, not kept as a tombstone.
     pub fn drop_absent(&mut self) {
         self.retainer.drop_absent();
+    }
+
+    /// Write each key's state before the runs instead of after (W53: a
+    /// lagging reader's snapshot, laid over the key view at the head): its
+    /// oldest predecessor, live, or a tombstone if it had none.
+    pub fn before(&mut self) {
+        self.before = true;
+    }
+
+    /// Newest by run order alone, whatever the generations (no endpoints).
+    pub fn unordered(&mut self) {
+        self.gather.unordered = true;
     }
 
     fn write(&mut self, v: Version) -> Result<()> {
@@ -283,7 +300,16 @@ impl SpanMerge {
                     }
                 }
                 Gathered::KeyDone(key) => {
-                    if let Some(kept) = self.retainer.finish() {
+                    if let Some(mut kept) = self.retainer.finish() {
+                        if self.before {
+                            kept = Version {
+                                generation: kept.predecessor.unwrap_or(0),
+                                deleted: kept.predecessor.is_none(),
+                                payload: kept.prior.take(),
+                                predecessor: None,
+                                prior: None,
+                            };
+                        }
                         self.gather.key = Some(key); // the key `write` names
                         self.write(kept)?;
                         self.gather.key = None;

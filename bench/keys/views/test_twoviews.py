@@ -48,11 +48,13 @@ async def history(
     unpin_at: int | None = None,
     retention: str = "floor",
     fixed: list[tuple[int, int | None]] = (),
+    window: int = 0,
 ):
     rng = random.Random(seed)
     o = Options(block_size=512, codec=codec, max_file_bytes=4096)
     io = PackIO(MemoryStore())
     v = TwoViews(io, "t/", o, b=b, top=5, retention=retention)
+    v.window = window
     folds = []
     base = sorted(rng.sample(KEYS, 30))
     files, _ = await KeyIndex(io, "t/", v.k().state, v.base_o).replace(
@@ -102,6 +104,25 @@ async def history(
                 continue
             # A floor keeps every N; covers keep the reserved ends only.
             ends = range(p, c + 1) if retention == "floor" else (c if end is None else min(end, c),)
+            if p in v.snaps:  # behind the window: the snapshot, merge-joined with the head
+                want = classes(folds[p - 1], folds[c])
+                got, after, st = {}, None, {}
+                while True:
+                    page = await v.snapshot_changes(p, after, 7, st)
+                    for i, k in enumerate(page.keys):
+                        got[k] = page.classes[i]
+                        state = 0 if page.deleted[i] else page.generations[i]
+                        assert page.deleted[i] or state == folds[c].get(k, 0), (seed, c, p, k)
+                    if page.cursor is None:
+                        break
+                    after = page.cursor
+                assert got == want, (seed, c, p, "snapshot")
+                some = sorted(rng.sample(KEYS, 10))
+                one = await v.snapshot_changes_of(p, some)
+                assert dict(zip(one.keys, one.classes, strict=True)) == {k: x for k, x in want.items() if k in some}
+                continue
+            if retention == "window":
+                ends = (c,)
             for n in ends:
                 want = classes(folds[p - 1], folds[n])
                 got, after = {}, None
@@ -130,6 +151,13 @@ def test_two_views_follow_the_fold(seed, b):
 @pytest.mark.parametrize("seed", range(6))
 def test_cover_retention_follows_the_fold(seed):
     asyncio.run(history(200 + seed, b=2, commits=40, codec=2, retention="cover"))
+
+
+@pytest.mark.parametrize("seed", range(6))
+def test_window_snapshots_follow_the_fold(seed):
+    # T keeps 6 commits; readers that fall behind it catch up from snapshots.
+    v = asyncio.run(history(400 + seed, b=2, commits=50, codec=2, retention="window", window=6))
+    assert v.written["snapshot"].entries, "some reader fell behind the window"
 
 
 @pytest.mark.parametrize("seed", range(4))
