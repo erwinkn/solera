@@ -1,7 +1,11 @@
 # Positions from what was read (design note, K43, K45–K47)
 
-Status: **approved** by Erwin (K43, amended by K45 and its read-ahead
-entries, K46, K47, and semantic change d).
+Status: **superseded** by `observed-set.md` (D153). The observed-set
+rebuild replaces what this note designed — positions, read-ahead entries
+and their cap, passes, and staleness as three predicates — with one
+observation record and one comparison. Until the rebuild lands, this note
+still describes the code; it was approved by Erwin (K43, amended by K45
+and its read-ahead entries, K46, K47, and semantic change d).
 
 **Built:** one record shape for every asset, `each=True` included: a
 position plus read-ahead entries, no per-key payloads (K47); `keys=` on

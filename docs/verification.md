@@ -996,9 +996,9 @@ wait longer; the read-ahead's entries (`Positions.tla`'s).
 
 ## Formal model: the observed set (`spec/tla/ObservedSet.tla`)
 
-*The design of `docs/observed-set.md` (D126, D133; on `docs/ledger-draft`
-at 67b85eb, which dropped passes: a run keeps only its cursor, in
-memory).* A
+*The design of `docs/observed-set.md` (D126, D133, D153; modelled at
+67b85eb on `docs/ledger-draft`, which dropped passes: a run keeps only its
+cursor, in memory).* A
 consumer partition's **observed set** `S` is, per key of a keyed
 incremental input, what it processed: present or not, its version, the
 context (whole and dep versions) and the upstream's life. Its stored
