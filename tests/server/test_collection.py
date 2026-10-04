@@ -3,8 +3,10 @@ commit, a compaction or an abandoned attempt let go of is cleaned up by the
 partition's next attempt, once no reader can still need it."""
 
 import asyncio
+import json
 import random
 
+import pytest
 from solera.keys.index import Options
 from solera.sdk import Incremental, Output, Project, Retry, asset
 from solera.stores import FileStore, Patch
@@ -494,3 +496,58 @@ async def test_a_pool_job_with_no_inputs_pins_only_its_output(tmp_path):
     [claim] = state.model.claims.values()
     assert claim["prefixes"] == (state.model.index("made", "").prefix,)
     await state.close()
+
+
+@pytest.mark.xfail(strict=True, raises=AssertionError, reason="F36: open")
+async def test_a_delta_a_launching_attempt_was_handed_outlives_its_acknowledgement(
+    tmp_path, data, monkeypatch
+):
+    """F36. The engine hands the partition's next attempt a pending delta
+    entry in its spec; before `AttemptLaunched` lands (the spec and the
+    control file are being written), another attempt acknowledges the entry.
+    The attempt's claim names the entry's files only from `AttemptLaunched`
+    on, so for that while nothing holds the delta file: collection deletes
+    it, and the worker then reads a file that is gone (simulation, seed 11:
+    a `checks` delta file deleted 6 s before its reader came)."""
+
+    @asset(outputs=Output("scores", keyed=True))
+    def scores():
+        return {"a": 1}
+
+    state = await State.open(tmp_path.as_uri(), "test", flush_interval=0.001)
+    engine = engine_for(state, Project(assets=[scores]))
+    await engine.initialize()
+    await run(engine, ["scores"])
+    m = state.model
+    index = m.indexes[("scores", "")]
+    real = await state.get_object(index.path(sorted(index.referenced())[0]))  # a real delta file's bytes
+    path = f"{index.prefix}held.kx"
+    await state.create_object(path, real)
+    m.cleanups[("scores", "")] = [
+        {"n": 1, "id": "1.0", "kind": "delta", "prefix": index.prefix, "files": ["held"]}
+    ]
+    m.garbage.append([path, 1])  # the index let go of it: the pending entry alone holds it
+
+    create, at_control, go, specs = state.create_object, asyncio.Event(), asyncio.Event(), []
+
+    async def held(name, body, *args, **kw):
+        if name.endswith(".spec"):
+            specs.append(json.loads(body))
+        if name.endswith(".control"):  # the spec is written; `AttemptLaunched` is not recorded yet
+            at_control.set()
+            await go.wait()
+        return await create(name, body, *args, **kw)
+
+    monkeypatch.setattr(state, "create_object", held)
+    running = asyncio.create_task(engine.run_until((await engine.submit(["scores"]))["id"], 20))
+    await asyncio.wait_for(at_control.wait(), 20)
+    assert specs[-1]["outputs"]["scores"]["cleanup"][0]["files"] == ["held"]  # handed the entry
+    del m.cleanups[("scores", "")]  # another attempt acknowledged the entry meanwhile
+    await engine.upkeep.collect()
+    survived = await state.get_object(path) is not None
+    go.set()
+    await running
+    await worker_finished()
+    await engine.stop()
+    await state.close()
+    assert survived, "collection deleted the delta file a launching attempt's spec hands it"
