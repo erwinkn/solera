@@ -86,3 +86,28 @@ async def test_an_each_page_missing_a_key_fails_alike(state, tmp_path):
     assert len(attempts) == 2
     assert f"k1@{generation} but the source has no k1" in attempts[-1]["error"]
     await engine.stop()
+
+
+async def test_a_partition_whose_retries_ran_out_is_failing_not_stale(state, tmp_path):
+    """F38's second part: `items` is built, then `feed` commits k3, which the
+    outside lacks. The run fails past its retries and nothing schedules it
+    again: the partition is stale (an input changed) and failed, and it
+    reports failed, its last outcome and the error to see, its reasons
+    kept, never quietly stale."""
+
+    outside = External()
+    engine = make_engine(state, p := project(tmp_path, outside, Retry(n=1, delay=0)))
+    engine.p = p
+    await engine.initialize()
+    outside.feed.update({"k1": "1"})
+    await engine.commit_source("feed", upsert={"k1": "1"})
+    assert status_of(await drive(engine, await engine.submit(["items"]))) == "succeeded"
+    await engine.commit_source("feed", upsert={"k3": "1"})  # the outside never got k3
+    detail = await drive(engine, await engine.submit(["items"]))
+    assert status_of(detail) == "failed"
+    (row,) = (await engine.partition_statuses(["items"], every=False))["items"]
+    assert row["status"] == "failed" and row["last_outcome"] == "failed"
+    assert row["reasons"] == ["input changed"], "stale too, and says so"
+    (task,) = detail["tasks"]
+    assert "the source has no k3" in detail["attempts"][task["id"]][-1]["error"]
+    await engine.stop()

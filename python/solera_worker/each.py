@@ -25,7 +25,7 @@ from solera.keys import SortedEntries
 from solera.keys.index import IndexState, KeyIndex, key_bytes, key_str
 from solera.patterns import Matcher
 from solera.sdk import UNSET, Ref, Result
-from solera.stores import Keys, Patch, check_loaded
+from solera.stores import Keys, Patch, SourceBehind, missing_keys
 from solera.tasks import Tasks
 
 WALK = 100  # failure records walked per retry batch, at most, for each key it may take
@@ -231,6 +231,26 @@ async def _holds_only(held, index, taken, named: set[str]) -> bool:
             return True
 
 
+async def gone_since(output: str, key: str | None, value, expected: dict, pin: dict, keys_io) -> list[str]:
+    """The keys of a batch a load by `Keys(expected)` did not answer, decided
+    against the source's head index, not the pass's commit (F38): a store of
+    current rows serves only its newest state. A key the head still names
+    the store lacks: the store is behind its index, `SourceBehind`,
+    retryable and bounded (F33). One the head lacks too was removed since:
+    returned, for the batch to take as removed — a later commit's delta
+    carries the removal anyway."""
+
+    missing = missing_keys(key, value, expected)
+    if not missing:
+        return []
+    head = KeyIndex(keys_io, None, IndexState.from_json(pin.get("head") or pin["index"]))
+    held = await head.lookup([key_bytes(k) for k in missing])
+    for k in missing:
+        if key_bytes(k) in held:
+            raise SourceBehind(f"{output}: the source index says {k}@{expected[k]} but the source has no {k}")
+    return missing
+
+
 async def read_each_batch(spec: dict, pin: dict, keys_io) -> Batch:
     each = pin["each"]
     failures = KeyIndex(keys_io, None, IndexState.from_json(each["failures"]))
@@ -383,7 +403,11 @@ async def run(spec, project, asset, param: str, pin: dict, args: dict, ctx, keys
     loaded = (
         await ctx._observed.load(store, ref, dict[str, t], Keys(batch.upserted)) if batch.upserted else {}
     )
-    check_loaded(ref.output, None, loaded, batch.upserted)  # by key: its keys are the mapping's
+    for key in await gone_since(
+        ref.output, None, loaded, batch.upserted, pin, keys_io
+    ):  # by key: the mapping's
+        del batch.upserted[key]
+        batch.deleted.append(key)
     await ctx._observed.close()  # the inputs' moment ends before the calls
     decls = {o.name or asset.name: o for o in asset.outputs}
     is_async = inspect.iscoroutinefunction(asset.fn)

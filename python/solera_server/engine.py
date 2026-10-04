@@ -1162,6 +1162,7 @@ class Engine(Attempts, Sensors, Staleness, Views):
             pin["batch"].update({"from": lo, "to": head_commit})  # nothing past `next` when lo > head
             if lo <= head_commit:
                 pin["index"] = index.slice(lo, head_commit).to_json()
+                pin["head"] = index.slice().to_json()  # what a missing key is decided against (F38)
             plan["position"] = position
             return pin, plan, not keys or lo > head_commit
         if fresh:  # a full pass under way: continued, never started over
@@ -1405,6 +1406,8 @@ class Engine(Attempts, Sensors, Staleness, Views):
         batch = {**span, "limit": limit, "index": current["batch"], "count": current["batches"]}
         read = current["generation"] if not whole else latest_generation  # a full pass reads the head
         pin = {"ref": {**ref, "generation": read}, "index": pinned.to_json(), "batch": batch}
+        if not whole:  # a delta's slice: a key missing from the store is decided against the head (F38)
+            pin["head"] = index.slice().to_json()
         if ahead and not reset:  # what keys= runs read ahead, past `next` or within this pass: skipped (K45)
             pin["ahead"] = ahead
         if whole and "read_from" not in current:  # the pass's own batches read at or after this

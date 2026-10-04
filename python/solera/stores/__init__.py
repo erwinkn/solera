@@ -32,19 +32,20 @@ class SourceBehind(StoreError):
     retryable = True
 
 
-def check_loaded(output: str, key: str | None, value: Any, expected: Mapping[str, int]) -> None:
-    """Raise `SourceBehind` if a load by `Keys(expected)` lacks one of them.
+def missing_keys(key: str | None, value: Any, expected: Mapping[str, int]) -> list[str]:
+    """Which of `expected` a load by `Keys(expected)` did not answer, sorted.
     Keys are read from what it answered: a by-key mapping's keys, a rows
     list's or a frame's `key` column; a type it cannot read is not checked."""
 
-    if not expected:
-        return
-    got = _loaded_keys(value, key)
-    if got is None:
-        return
-    for k, generation in sorted(expected.items()):
-        if k not in got:
-            raise SourceBehind(f"{output}: the source index says {k}@{generation} but the source has no {k}")
+    got = _loaded_keys(value, key) if expected else None
+    return [] if got is None else sorted(k for k in expected if k not in got)
+
+
+def check_loaded(output: str, key: str | None, value: Any, expected: Mapping[str, int]) -> None:
+    """Raise `SourceBehind` if a load by `Keys(expected)` lacks one of them."""
+
+    for k in missing_keys(key, value, expected)[:1]:
+        raise SourceBehind(f"{output}: the source index says {k}@{expected[k]} but the source has no {k}")
 
 
 def _loaded_keys(value: Any, key: str | None) -> set[str] | None:

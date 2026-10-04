@@ -385,9 +385,12 @@ async def _resolve_inputs(spec, project, asset, keys_io, timeline, observed: Obs
             read = await each.read_batch(pin, keys_io)
             if not (full and int(ch.get("index") or 0) == 0):
                 reads.append(read)  # a full pass's first batch starts its consumer over, keys or none
-            upserted, deleted, after = read.upserted, (*read.deleted, *read.unmatched), read.after
+            upserted, deleted, after = dict(read.upserted), [*read.deleted, *read.unmatched], read.after
             args[param] = await observed.load(store, ref, t, Keys(upserted))
-            check_loaded(ref.output, _key_column(project, ref.output), args[param], upserted)
+            key = _key_column(project, ref.output)
+            for gone in await each.gone_since(ref.output, key, args[param], upserted, pin, keys_io):
+                del upserted[gone]  # removed since the pass's commit: delivered as removed (F38)
+                deleted.append(gone)
             batch[param] = Batch(
                 rows=args[param],
                 removed=deleted,

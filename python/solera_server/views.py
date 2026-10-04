@@ -28,7 +28,8 @@ class Views:
         `stale` (materialized, but due a rebuild: its `reasons` say why — an
         input changed since it read it, an upstream it reads is itself stale,
         or its definition changed; `staleness.py`), `running` (a task is pending),
-        `failed` (its last outcome failed, was canceled or blocked), `missing`,
+        `failed` (its last outcome failed, was canceled or blocked, and nothing
+        is pending: failing, not stale — F38; its `reasons` too if stale), `missing`,
         or `removed` (no longer a current key). A job has no head: it is
         materialized when its last outcome succeeded. `every` lists every
         current partition, enumerated — refused past `MAX_PARTITIONS`; else
@@ -67,14 +68,14 @@ class Views:
                 status = (
                     "removed"
                     if not current(partition)
-                    else "stale"
-                    if reasons
-                    else "materialized"
-                    if done
                     else "running"
                     if partition in pending
                     else "failed"
                     if last in BAD_OUTCOME
+                    else "stale"
+                    if reasons
+                    else "materialized"
+                    if done
                     else "missing"
                 )
                 view = self.outcome_view(record) if record else {}
@@ -84,7 +85,7 @@ class Views:
                     "last_outcome": view.get("last_outcome"),
                     "last_attempt": view.get("last_attempt"),
                 }
-                if status == "stale":
+                if reasons:
                     row["reasons"] = reasons
                 rows.append(row)
         return out

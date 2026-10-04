@@ -2,10 +2,7 @@
 xfail while its finding is open (docs/verification.md, "Findings"), an
 ordinary test once fixed."""
 
-import pytest
-
 from .machine import Simulation
-from .oracle import Violation
 from .world import Fate
 
 
@@ -564,7 +561,6 @@ def test_f34_a_rename_onto_an_earlier_lifes_name_keeps_its_attempt_settleable():
     state.teardown()
 
 
-@pytest.mark.xfail(strict=True, raises=Violation, reason="F38: open")
 def test_f38_a_consumer_of_a_current_only_output_finishes_a_pass_its_upstream_outran():
     """F38 (sweep Z14): `items` lives in the table store, which holds its
     current rows only. `copy` is in a delta pass over `items`' commit 1
