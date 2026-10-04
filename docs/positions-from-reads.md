@@ -207,7 +207,9 @@ reported reasons are exactly those that hold (Erwin's ruling); nothing is
 kept of earlier causes, and each clears on its own condition:
 
 - `definition_changed`: the asset changed since the partition last caught
-  up. A pass under the new definition clears it.
+  up. A pass under the new definition clears it. For an `each=True`
+  asset, by key: a key it holds written before the change, or one its
+  patterns no longer take, whose removal the pattern change owes (A19 R9).
 - `input_changed`: an upstream reset replaced its input's content since it
   caught up (the model records when it dropped the position); or an
   incremental input has a key its patterns take changed past `next`, not
@@ -220,7 +222,9 @@ kept of earlier causes, and each clears on its own condition:
   did not make that pass due: a full pass due only to an asset change is
   `definition changed` alone, until commits land past its base. A pass
   that reads the new upstream clears it.
-- `upstream_stale`: a partition it reads is itself stale.
+- `upstream_stale`: a partition it reads is itself stale. Along an
+  `each=True` chain, only through a stale upstream key its patterns take:
+  a key depends on its own upstream key and nothing else (A19 R10).
 
 So an upstream reset followed by the asset's own change reports both.
 A key's last read is its read-ahead entry's, else the snapshot's, and the

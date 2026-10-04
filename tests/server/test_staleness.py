@@ -1219,7 +1219,6 @@ async def _chain(state, tmp_path, keys, include=None):
     return engine, outside
 
 
-@a19("R9")
 async def test_a_pattern_change_that_excludes_every_held_key_leaves_it_stale(state, tmp_path):
     """A19 R9: `checks` holds k1; a deploy narrows it to include=(k2), which
     the upstream lacks. k1 is still held and its removal owed: `checks` is
@@ -1233,7 +1232,6 @@ async def test_a_pattern_change_that_excludes_every_held_key_leaves_it_stale(sta
     assert await staleness.partition_stale(engine, "checks")
 
 
-@a19("R10")
 async def test_an_each_consumer_is_not_upstream_stale_for_a_key_it_excludes(state, tmp_path):
     """A19 R10: `filtered` takes k1 of `checks`. Only k2 changes upstream,
     and `checks` is stale for k2 alone: `filtered` depends on nothing stale,
