@@ -50,8 +50,9 @@ Three things in Solera force that shape:
 ## 2. The design in one paragraph
 
 An asset declares how to process **one key**; per-key incremental runs it over every
-changed key of a keyed upstream, `batch_size` keys per attempt, all at
-once, and hands each output's store one `Patch({key: value})`.
+changed key of a keyed upstream, `batch_size` keys per attempt, run by
+`concurrency` workers that each pull the next key from the batch, and
+hands each output's store one `Patch({key: value})`.
 Every key is a group: it holds all the rows that carry it, one or many,
 and its version is the generation of the write that last wrote it
 (`versions.md`). Errors raised for one key are classified by the
@@ -231,8 +232,9 @@ two-phase cancel (`lifecycle.md` §7); for a per-key batch the phases are:
    evidence (`lifecycle.md` §2.3), and repair follows from it. Only a
    worker that cannot drain in time loses finished work.
 
-Finished keys need not be a key-order prefix of the batch — its keys
-all run at once, and `a c d` may finish while `b` is still reading. So the
+Finished keys need not be a key-order prefix of the batch — its
+`concurrency` workers run several keys at a time, and `a c d` may finish
+while `b` is still reading. So the
 position does not stop at the first unfinished key: it moves past the
 whole batch, exactly as on success, and the holes are carried by the
 failed keys instead.
