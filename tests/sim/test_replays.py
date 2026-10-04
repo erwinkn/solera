@@ -2,7 +2,10 @@
 xfail while its finding is open (docs/verification.md, "Findings"), an
 ordinary test once fixed."""
 
+import pytest
+
 from .machine import Simulation
+from .oracle import Violation
 from .world import Fate
 
 
@@ -558,4 +561,68 @@ def test_f34_a_rename_onto_an_earlier_lifes_name_keeps_its_attempt_settleable():
     state.no_state_broke()
     state.nothing_read_after_collection()
     state.one_attempt_per_partition()
+    state.teardown()
+
+
+@pytest.mark.xfail(strict=True, raises=Violation, reason="F38: open")
+def test_f38_a_consumer_of_a_current_only_output_finishes_a_pass_its_upstream_outran():
+    """F38 (sweep Z14): `items` lives in the table store, which holds its
+    current rows only. `copy` is in a delta pass over `items`' commit 1
+    (k1, k10, k2; batch 1 of 2 delivered) when `items`, its version bumped,
+    rebuilds as commit 2 without k2. Batch 2 loads k2 by key: the store has
+    no k2, so the load raises SourceBehind (F33's check) and retries. But
+    the commit that removed k2 already exists, and the pass stays on commit
+    1: every retry fails the same way, the budget runs out, and `copy`
+    (and `checks`) stay stale for good."""
+
+    state = Simulation()
+    state.boot(seed=15510, store="table", cache=None)
+    state.commit_feed(keys={"k10", "k2", "k1"}, op="upsert", version="3")
+    state.a_fenced_scope_at_rest_holds_its_index_keys()
+    state.a_life_is_its_own()
+    state.a_ticks_runs_are_submitted_once()
+    state.committed_keys_are_readable()
+    state.fenced_writes_hold_their_gate()
+    state.index_levels_never_overlap()
+    state.no_state_broke()
+    state.nothing_read_after_collection()
+    state.one_attempt_per_partition()
+    state.one_end_per_attempt()
+    state.reads_say_what_they_read()
+    state.readd_live(clean=False, ends="succeeds")
+    state.a_fenced_scope_at_rest_holds_its_index_keys()
+    state.a_life_is_its_own()
+    state.a_ticks_runs_are_submitted_once()
+    state.committed_keys_are_readable()
+    state.fenced_writes_hold_their_gate()
+    state.index_levels_never_overlap()
+    state.no_state_broke()
+    state.nothing_read_after_collection()
+    state.one_attempt_per_partition()
+    state.one_end_per_attempt()
+    state.reads_say_what_they_read()
+    state.takeover(change="bump", zombie=0.0)
+    state.a_fenced_scope_at_rest_holds_its_index_keys()
+    state.a_life_is_its_own()
+    state.a_ticks_runs_are_submitted_once()
+    state.committed_keys_are_readable()
+    state.fenced_writes_hold_their_gate()
+    state.index_levels_never_overlap()
+    state.no_state_broke()
+    state.nothing_read_after_collection()
+    state.one_attempt_per_partition()
+    state.one_end_per_attempt()
+    state.reads_say_what_they_read()
+    state.commit_feed(keys={"k11", "k1"}, op="replace", version="1")
+    state.a_fenced_scope_at_rest_holds_its_index_keys()
+    state.a_life_is_its_own()
+    state.a_ticks_runs_are_submitted_once()
+    state.committed_keys_are_readable()
+    state.fenced_writes_hold_their_gate()
+    state.index_levels_never_overlap()
+    state.no_state_broke()
+    state.nothing_read_after_collection()
+    state.one_attempt_per_partition()
+    state.one_end_per_attempt()
+    state.reads_say_what_they_read()
     state.teardown()

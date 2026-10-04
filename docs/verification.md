@@ -291,8 +291,8 @@ with Hypothesis drawing the inputs (in CI, a few seconds each):
   and S3Store, a `keys=` run never touches a key it does not name.
 
 **Staleness, by example.** The machine found these histories while K47
-was built. Each was an engine bug then, fixed in K47; the first fails
-again since semantic change (d), as F37. Each
+was built. Each was an engine bug then, fixed in K47; the first failed
+again after semantic change (d), as F37 (fixed in fc29101). Each
 is now a test that takes the machine's steps one at a time and states, at
 every step, the stale keys and why the partition and asset are stale; the
 machine checks the engine against the same answers after every step. All
@@ -306,7 +306,7 @@ nothing downstream run. `checks` is each=True over `items` (excluding
    completed, so the record holds no `knob` version to say which one k2
    saw. `knob` moves: still k1 and k2. A default run is the full pass:
    it writes k1 and k2, k2 again under the new `knob`, and `checks` is
-   fresh. (F37: the engine kept the pass k2 began before the move.)
+   fresh. (F37: the engine had kept the pass k2 began before the move.)
 2. *A key rewritten after an asset change is no longer stale for it.*
    keys=[k2, k3] writes k2 (k3 is not upstream). `checks`' definition
    changes: k1 and k2 are stale, for input and definition. keys=[x1, k2,
@@ -439,6 +439,8 @@ New sweeps since that summary:
 | Z11 | F31, F32 and the reasons ruling fixed (bf17f26) | 981 | 250 runs × 50 steps | default | two attempts claimed `mirror` at once; Hypothesis could not replay it (the simulation's task-order leak): F34, see Z11b |
 | Z12 | as Z11 | 982 | 250 runs × 50 steps | pg | `items` missed a feed key (`k1`) after automations: F33 (the case replays; an early extraction of mine mangled it) |
 | Z11b | Z11 again, on the deterministic simulation (3a965b9) | 981 | 250 runs × 50 steps | default | F34, replayable (Hypothesis shrank it to 9 steps) |
+| Z13 | semantic change (d) (fae165c), seeded interleavings | 991 | 241 runs, 12,514 steps, 28 h | pg | a worker read a `checks` delta file collection had deleted: F36 (fixed since, 0720b87) |
+| Z14 | as Z13, asyncio's order (`SOLERA_SIM_ORDER=fifo`) | 991 | 250 runs × 50 steps | pg | F36 again, and `copy` and `checks` never converge after automations: F38 |
 
 ## Formal model: execution semantics (`spec/tla/Execution.tla`)
 
@@ -1077,3 +1079,4 @@ asset) and comes last.
 | F35 | An each=True partition is stale with no stale key: `fchecks` (each=True over `feed`) runs with `keys=[k1]`; `feed` then removes `k2`, which `fchecks` never held. `stale_keys` lists nothing, as K43 says (`k2` is on neither side: no output unit), yet the partition status, which rolls up as "any key", reports `stale` (found by the Staleness machine at 300 examples; its CI run is now derandomized, as the simulation's is, so a rare history cannot make CI flaky) | P3 | fixed, K38's rule: for an each=True asset, the partition is stale for an input change exactly when one of its keys is. The partition's own records (a reset, an unrecorded or moved `seen`, the position behind) filter, cheaply, and the keys confirm: the per-key scan runs only when the filter says stale, so roll-ups stay cheap. Here the pass under way had made the filter say stale, while the per-key view, which counts a removal only where the output holds the key, said nothing — `tests/server/test_staleness.py::test_a_key_neither_side_holds_leaves_an_each_partition_fresh` |
 | F36 | Collection deletes a delta file a launching attempt was handed: the engine prepares `checks`' next attempt, whose spec hands it pending delta entry 283 (it names level-4 delta file `…7JH0`, which compaction had let go of). While `_launch` writes the spec and the control file, another attempt acknowledges the entry; the launching attempt's claim names the entry's files only once `AttemptLaunched` is applied, so for that while `cleanup_reads()` holds nothing, and collection deletes the file (t=1041.70, between the spec at 1041.38 and the control file at 1041.98). The worker reads it at 1047.15: gone. Today the worker counts the entry unresolved and the other attempt has done it, so nothing is lost, but `cleanup_reads`' promise ("acknowledged by another meanwhile, it is still being read") breaks (sweep of the interleavings measurement, seed 11, under asyncio's order; it replays on a6db1a4 and stops at 2eb0e0b, which moved the timing, not the window) | P3 | fixed: the claim names the cleanup files its spec hands the attempt from `_prepare` on, as it does the delta log it reads (`reads`), not from `AttemptLaunched` on; `cleanup_reads()` holds them through the launch, so another attempt's acknowledgement meanwhile no longer lets collection take them — `tests/server/test_collection.py::test_a_delta_a_launching_attempt_was_handed_outlives_its_acknowledgement` |
 | F37 | A full pass begun before a dep moved continues after it: `checks` has never run; keys=[k2] writes k2 (generation 10), which begins the full pass it owes (`began` 10, `seen` none). `knob` moves; engine and reference agree that k1 and k2 are stale. The default run calls `checks` on k1 alone, so k2 keeps what the old `knob` gave it, and the engine reports no stale key while `seen` is still none (found writing W22's K47 histories as examples, on fae165c) | P2 | fixed: the move point (the whole and dep inputs' latest commit) is taken whenever the partition record's `seen` is absent or differs, not only when it differs, so a full pass begun before the move starts over and redoes what it wrote under the old version; and a backstop: an each=True partition is never fresh while its record says no whole and dep versions, or old ones — `tests/server/test_staleness.py::test_a_keys_run_on_a_never_built_output_leaves_it_owing_a_full_pass` |
+| F38 | A consumer of an output in a current-only store stalls for good: `items` lives in the table store (its current rows only). `copy` is in a delta pass over `items`' commit 1 (k1, k10, k2; batch 1 of 2 delivered) when `items`, its version bumped, rebuilds as commit 2 without k2. Batch 2 loads k2 by key; the store has none, so F33's check raises SourceBehind ("items: the source index says k2@106 but the source has no k2"), 28 times: the pass stays on commit 1, and the commit that removed k2 already exists, so no retry can pass. The budget runs out, no automation fires again, and `copy` and `checks` stay stale (sweep Z14, shrunk from 52 steps to 4; bisected to ba357e5, F33's fix) | P1 | open — `tests/sim/test_replays.py::test_f38_a_consumer_of_a_current_only_output_finishes_a_pass_its_upstream_outran` (strict xfail) |
