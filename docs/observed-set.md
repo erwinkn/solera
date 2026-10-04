@@ -1,14 +1,15 @@
 # The observed set: incremental reads from one observation record (draft)
 
 Status: **draft**, revised after review A27 ("build with listed
-changes") and W36's model of it (`ObservedSet.tla`: three
-counterexamples, each fix checked in the model). Docs only; nothing is
-built. Names (D133): the **observed set** is what a consumer partition
+changes"), W36's model of it (`ObservedSet.tla`: three counterexamples),
+and Erwin's removal of the pass: a run keeps its cursor in memory, and
+each batch records what it observed at its own head. Docs only; nothing
+is built. Names (D133): the **observed set** is what a consumer partition
 has processed, key → upstream version; its stored form is the
 **observation record** — a **base**, explicit **points** and compressed
 **ranges**, with disjoint overwrites and prefix membership queries —
-which decodes to it. The two earlier encodings it
-replaces are on this branch's history (`fb56cbe`, `bdf8962`).
+which decodes to it. The earlier encodings it replaces are on this
+branch's history (`fb56cbe`, `bdf8962`, and the pass-based `89ac81b`).
 
 ## The principle
 
@@ -36,8 +37,8 @@ run loads, as `added`, `updated` and `removed`. A `keys=` run is a filter
 on it. A pattern change stores nothing: it only changes the "new" side.
 
 **The invariant.** After every commit, `decode(R) = S`. Every override is
-written by a committed batch, and folded only when removing it decodes
-to the same value.
+written by a committed batch, and every fold leaves the decoded value
+unchanged.
 
 ## The observation record
 
@@ -45,15 +46,16 @@ The observation record `R` is three layers, the first that holds `k`
 deciding:
 
 1. **Points**: `k → observation`, explicit — presence, version, payload,
-   the patterns it was read under, context, life, and the head it was
-   read at (`observed_at`). Written where a batch's observation of `k` is
-   not what a range or the base would decode: a `keys=` run's keys, and a
-   current-only store serving a row other than the batch's version named,
-   or none. A point pins nothing (A27 R11).
-2. **Ranges**: disjoint key ranges `[lo, hi] → (T, patterns, context,
-   life)`: every key in it as upstream had it at endpoint `T`, if those
-   patterns take it, else absent. A pass's committed prefix. Compressed:
-   one range stands for every key of it.
+   the patterns it was read under, context, life. Written where an
+   observation of `k` is not what a range or the base would decode: a
+   `keys=` run's keys; a current-only store serving a row other than the
+   version at the batch's head, or none; and a key that changed under a
+   range as the range folds (below). A point pins nothing (A27 R11).
+2. **Ranges**: disjoint key ranges `[lo, hi] → (H, patterns, context,
+   life)`: every key in it as upstream had it at head `H`, if those
+   patterns take it, else absent. A batch's commit writes one: the key
+   range it covered, **observed at** the head it read at. Compressed: one
+   range stands for every key of it.
 3. **The base**: `(P, patterns, context, life)`: every key as at endpoint
    `P`, if those patterns take it, else absent. One per partition, in one
    of two forms (below): a **commit** `P`, or a commit `C` with a
@@ -63,25 +65,34 @@ Patterns are stored normalised: no `include` is the universal include,
 never an empty list (A27 R3). Contexts are stored once per partition, in
 a small table that layers refer to by id.
 
-**Overwrite.** A batch's commit overwrites exactly the keys it committed:
-a range write `[a, c] @ T` splits every range it overlaps — their parts
-outside `[a, c]` stay, so a replanned pass never discards an old tail —
-and drops the points inside observed at or before `T`, which it
-supersedes; then the batch's own points go on top. A point observed
-after `T` stays over the range: the pass leaves its key alone — it is
-neither delivered nor reclassified — so a pass at an older `T` never sends
-a key back to a version older than one a `keys=` run already delivered.
-One `AttemptFinished` carries the batch's outputs and its overwrite,
+**Overwrite.** A batch's commit overwrites exactly the keys it covered: a
+range write `(a, c] @ H` splits every range it overlaps — their parts
+outside it stay — and drops the points inside, which the batch classed
+again at `H`; then the batch's own points go on top. One
+`AttemptFinished` carries the batch's outputs and its overwrite,
 atomically (A27 R8).
 
+**Fold**, at each batch commit, after the overwrite:
+
+- **An older range relabels to `H`.** Its keys that changed between its
+  own head and `H` — found with `changes` restricted to its key range —
+  first become points at the version it observed; nothing left under it
+  then changed, so it decodes the same at `H`. Points are therefore
+  bounded by the keys that changed during the run.
+- Adjacent ranges at the same head, patterns, context and life merge.
+  When one range spans every key, it **becomes the base**.
+- **An override drops** when the value decoded *with it removed* equals
+  its own. So `P = k1@1`, a range `k1@2`, and a newer selection `k1@1`:
+  removing the point would reveal the range's `@2`, so it stays.
+
+A completed default run thus ends as a base at its last head, plus points
+for the keys that changed behind its batches — which the next run owes.
+
 **The commit check.** A batch commits only if, at its commit, its
-input's life is still current, no start-over is owed (an upstream reset's
-rebuild, or a definition change that reset `R`), and — for a pass's
-batch — the pass it was planned under is still the partition's active
-scan plan. Otherwise it is refused and writes nothing: its keys stay
-owed. A `keys=` batch that starts no pass has no plan to check: its
-points are exact at the head they were read at. The engine's commit has
-the life check today; the observed set adds the other two.
+input's life is still current and no start-over is owed (an upstream
+reset's rebuild, or a definition change that reset `R`). Otherwise it is
+refused and writes nothing: its keys stay owed. The engine's commit has
+the life check today; the observed set adds the other.
 
 **Outcomes.** A failed or abandoned attempt writes nothing: its keys stay
 owed. A per-key batch's failed keys are processed — seen at the version
@@ -89,15 +100,27 @@ they failed at, and retried by their failure record (A19 R8), not owed. A
 drained, canceled per-key batch commits its finished keys as points; its
 interrupted keys are not seen, so they stay owed.
 
-**Fold.** An override folds when the value decoded *with it removed*
-equals its own. So `P = k1@1`, a range `k1@2`, and a newer selection
-`k1@1`: removing the point would reveal the range's `@2`, so it stays.
+## A run
 
-**Rebase.** A default run that leaves nothing owed moves the base to the
-endpoint `T` it read at, with the current patterns and context, and drops
-every override that the new base, with that override removed, decodes
-to. Decided by decode equality at that fixed `T`, so updates arriving
-meanwhile do not hold an old base forever; they are owed next.
+A run computes what is owed by comparing upstream now, under the current
+patterns and context, with `decode(R)`. It processes the owed keys in key
+order, `batch_size` keys a commit. Its **cursor lives in the run's memory
+only**: nothing about the run is stored but what its batches commit.
+
+**Each batch reads at its own head `H`**, pinned for that batch only by
+the claim's existing reader pin (A27 R6). It covers the key range from
+the previous batch's last key to its own, `(prev, c]` — from the first
+key for the first batch, to the last for the final one. At `H` it classes
+every candidate in that range: the run's owed keys there, plus whatever
+changed in the range since the run compared. So its range write
+`(prev, c] @ H` holds for every key in it, owed or not. It loads the keys
+it owes, calls the producer, and commits its outputs, the range and its
+points.
+
+A cancelled or failed run leaves its committed batches' ranges and
+points. The next run compares again: keys under those ranges decode at
+their heads, so the unchanged ones are not owed. No plan, cursor, pass or
+scan pin is stored, and none can be left stranded.
 
 ## Two forms of base: a commit, or a commit with a before-image
 
@@ -110,34 +133,27 @@ payload at `P`. A key added in `(P, C]` is in it as absent; one removed,
 as present at its old version. Upkeep writes it once, from the index
 while `P` is still readable (index metadata, no store code), and one
 journal event installs it before the cut: `P` is released, `C` becomes
-the base's endpoint. Points stay as they are; a range older than the cut
-is folded in the same way.
+the base's endpoint. Points stay as they are. A range older than the cut
+folds to `C` as at a batch commit: the keys changed in its range become
+points, and it relabels. The before-image is the base's fold, kept as a
+file because the base's changed keys can be many.
 
 Decode reads the before-image for its keys and the key view at `C` for
 everything else — the same answer `P` gave. Classify is unchanged.
 Candidates: the before-image's keys, `changes(C, now)`, and a membership
 query if the patterns differ from the base's. If retention later cuts
 past `C` too, the next before-image adds the keys changed in `(C, C′]`,
-keeping each existing key's entry at `P`. After a completed default run
-the base is a plain commit again, and the file is deleted.
+keeping each existing key's entry at `P`. When a run's ranges become the
+base, the file is deleted.
 
 Its size is proportional to the keys changed in `(P, C]`, not to the
 index: a reader that lags while a few keys churn holds a few entries
 (~27 B each). A full file — the whole observed set — is only the degenerate
 case where nearly every key changed.
 
-The index stays reader-agnostic: retention asks for every base older
-than its cut to be given a before-image first, and keeps no per-reader
-snapshot. The reader owns its before-image through its observation record.
-
-**A cut past an active pass's `T`.** The pass's committed ranges get
-before-images like any range; its scan plan cannot, since its next
-batches need the key view at `T` itself. So the cut **replans** the pass
-at the head: a new scan plan, `T` the head, the cursor at the start (the
-overwrite keeps the old ranges' tails, as in any replan). A batch in
-flight on the old plan is refused at its commit by the commit check, and
-its keys stay owed. A pass therefore never holds retention: one paused
-for weeks is replanned, not kept.
+The index stays reader-agnostic: retention asks for every base and range
+older than its cut to be folded first, and keeps no per-reader snapshot.
+The reader owns its before-image through its observation record.
 
 ## Observations: what was served (A27 R2)
 
@@ -152,8 +168,8 @@ The batch's classes are then decided from the observations, before the
 producer is called: planned as an update, served absent — a removal if
 the key was held, nothing if not; served a version equal to what was
 seen — nothing. So an aggregate's count follows what it was actually
-given (a tally of 2 cannot be left holding one member). A served row the
-batch's version did not name becomes a point.
+given (a tally of 2 cannot be left holding one member). A served row
+other than the version at the batch's head becomes a point.
 
 ## Context and lives (A27 R1, R7)
 
@@ -164,7 +180,7 @@ writes `k1` under `w2` — fresh — while `k2`, decoded from a base under
 `w1`, is owed; if `factor` returns to `w1`, it reverses. When the base's
 context differs from now, every key the base decodes present is a
 candidate, enumerated by a scan of the base even with no keyed change. A
-pass records the context it reads under, and its range carries it.
+batch records the context it read under, and its range carries it.
 
 **Lives.** Each layer names the upstream index's **life**: its output
 home and reset count, never a name or a commit number, which repeat
@@ -183,13 +199,14 @@ For a decode-equal state with unchanged patterns and context, the
 candidates are complete:
 
 - `changes(P, now)`'s keys, outside the ranges and points;
-- for each range, `changes(T, now)` within it — which also finds a key
-  absent at `T` and restored since, absent at `P` too (A27 R9);
+- for each range, `changes(H, now)` within it — which also finds a key
+  absent at `H` and restored since, absent at `P` too (A27 R9);
 - every point's key.
 
 Outside them a key's old and new states are the base's, unchanged. Each
 is classed once. A base with a before-image adds the before-image's keys
-to `changes(C, now)`'s.
+to `changes(C, now)`'s. A batch takes the same candidates within its key
+range, at its head.
 
 **When the patterns changed**, the keys whose membership may differ are
 added: those a changed pattern can match. After normalisation, each glob
@@ -209,16 +226,17 @@ A changed prefix pattern costs the keys under the prefix in each view. A
 full compare reads the upstream at `P` and now, merged with the
 overrides: two key views, streamed (bounded memory, not bounded reads);
 at 100M keys several GB, run when a run plans. Endpoints retained: `P`
-and each range's `T` — one per range, and ranges are few (a pass, its
-replans until a rebase); points add none. Each range is one `changes`
-call over its key range; points are one key-list call.
+and each range's `H`. The fold relabels older ranges to the newest head
+at every batch commit, so a run in progress holds two: `P` and its latest
+`H`; points add none. Each range is one `changes` call over its key range;
+points are one key-list call.
 
 **Freshness is exact or pending** (A27 R10). Staleness is the comparison,
 computed and cached per observation record revision and upstream head; where a
 full compare is due and not yet made, the partition reports **pending**,
 never `stale` or fresh on a guess: widening `include` to a key that
 never existed changes no debt. Shared, definition, retry, reconcile and
-rebuild debt are explicit, an empty first pass included. An `each` chain
+rebuild debt are explicit, an empty first run included. An `each` chain
 intersects the upstream's owed keys with the consumer's patterns, key by
 key, and rolls up with "any".
 
@@ -230,21 +248,9 @@ consumer's index prefix, committed with the batch: each entry the whole
 override — kind, presence, version, payload, the patterns and context it
 was observed under (by id), life. Absence is a live, tagged payload, not
 an index tombstone, which lookups skip and merges drop; an index deletion
-only removes an override. Nothing is refused. Folding streams, and a
-rebase rewrites the spill once, not once per batch. The worst case is
-explicit: `M` `keys=` keys left behind by a moving source are `M`
+only removes an override. Nothing is refused. Folding streams. The worst
+case is explicit: `M` `keys=` keys left behind by a moving source are `M`
 points, `M` values, and no retained endpoint.
-
-## The active pass and its pin (A27 R6)
-
-A pass under way has a **scan plan** apart from its committed prefix: its
-identity, its `T`, its cursor, and a durable reader pin on the row objects
-it reads (a range kept only for decoding needs `T`'s metadata, not its
-rows). The pin is taken when the pass starts — a `keys=` run that starts
-one included, before its first prefix commits — and held through claim
-ends, takeovers and renames until the pass ends, is reset, or is
-replanned by a retention cut past its `T` (above). The pin protects the
-rows the plan reads; it never holds the index's retention.
 
 ## Worked examples
 
@@ -254,8 +260,10 @@ generation 3; `⊥` an empty base.
 
 **`keys=` before a default run.** `R = ⊥`. `keys=(k1)` at head `H1`:
 point `k1@1`. `k1` updated to `@4`. Candidates: everything since `⊥`, and
-`k1`: `k1` is owed an update (`@4` against `@1`), `k2` an add. The run
-rebases at its `T`: `R = (T)`, the point folded.
+`k1`: `k1` is owed an update (`@4` against `@1`), `k2` an add. The run's
+one batch reads at `H`, delivers both, and writes `(−∞, +∞) @ H`, which
+becomes the base `(H)`; the point is dropped with the rest of the
+overwrite.
 
 **Widening.** Base `(P, include=k1)`; the deploy widens to `k*`. The
 membership query over prefix `k` finds `k2`: decoded absent, present and
@@ -282,38 +290,38 @@ would have owed an add of an excluded key.
 is owed an add, and the first batch starts the consumer over; a per-key
 asset's leftover outputs are found in its output index.
 
-**A full pass, part done.** From `⊥`, a pass at `T` commits `k1`: a range
-`[−∞, k1] @ T` over the base. `k2` changes meanwhile; the pass reads it
-at `T`, held by its pin. Done: the range spans everything and rebases to
-`(T)`. The change after `T` is in `changes(T, now)`: owed once.
+**A run in two batches.** From `⊥`, `batch_size=1` over `k1`, `k2`. Batch
+1 reads at `H1`, delivers `k1`, and writes `(−∞, k1] @ H1`. `k2` changes
+at `H2`. Batch 2 reads at `H2`, delivers `k2` at its new version, and
+writes `(k1, +∞) @ H2`. Fold: `changes(H1, H2)` within `(−∞, k1]` is
+empty, so that range relabels to `H2`; the two merge and span every key:
+the base is `(H2)`. Had `k1` changed too, it would keep its `H1` version
+as a point, owed by the next run.
 
-**A replan.** A pass committed `[−∞, k2] @ T1`, then is replanned at `T2`
-and commits `[−∞, k1] @ T2`: the overwrite splits the old range, keeping
-`(k1, k2] @ T1`. The tail is never lost.
+**A cancelled run.** Batches 1 and 2 committed `(−∞, k1] @ H1` and
+`(k1, k2] @ H2` (the first relabelled to `H2` at the second's commit, the
+two merged); the run is cancelled before batch 3. The next run compares
+again: keys up to `k2` decode at `H2`, so only what changed there since
+is owed, and the rest is owed from the base. Nothing about the cancelled
+run is left to resume or to release.
 
-**A cut during a pass.** A pass at `T = 1` has committed `k1`: a range
-`[−∞, k1] @ 1`. `k2` changes at commit 2, and retention cuts at 2. The
-range gets its before-image (empty: nothing in it changed), and the pass
-is replanned at the head, 2. A batch for `k2` planned at 1 and still in
-flight is refused at its commit; the replanned pass delivers `k2` at 2.
-Kept at 1, its next batch would have needed the key view at 1, gone.
-
-**A selection ahead of a pass.** A pass is at `T = 1`; `k1` is updated to
-`@2`, and `keys=(k1)` delivers `@2`: a point `k1@2`, observed at 2. The
-pass then reaches `k1`. The point was observed after its `T`, so the pass
-leaves `k1` alone, and its range write keeps the point. Without the
-`observed_at` test it would deliver `k1@1`, sending the consumer back.
+**A selection during a run.** A run's batch for `k1` has not come yet;
+`k1` is updated to `@2`, and `keys=(k1)` delivers `@2`: a point `k1@2`.
+When the run's batch covering `k1` reads at its head (`@2` or later), it
+classes `k1` from the point: equal at `@2`, nothing. It cannot send the
+consumer back to `@1`: every batch reads at its own head, never at an
+older one.
 
 **A shared input moves (A27 R1).** Base under `factor=w1`; `factor`
 becomes `w2`. Every key the base decodes present is owed an update.
 `keys=(k1)` writes `k1` under `w2`: fresh, `k2` still owed. `factor`
 back to `w1`: `k1` owed, `k2` fresh.
 
-**The current-only revert (A27 R2).** A batch names `k2@2`; the store
-serves the row `@3`, saying so: the class is decided from `@3`, and a
-point `k2@3` is written. Restored to `@2`: `@3` against `@2`, an update.
-A row served ahead of every commit is a point all the same: no commit has
-to describe it.
+**The current-only revert (A27 R2).** A batch reads at a head where `k2`
+is `@2`; the store serves the row `@3`, saying so: the class is decided
+from `@3`, and a point `k2@3` is written. Restored to `@2`: `@3` against
+`@2`, an update. A row served ahead of every commit is a point all the
+same: no commit has to describe it.
 
 **The same-version re-arrival.** The store has no row for a planned `k2`:
 for a plain batch, a removal if `k2` was held; for a per-key one, its
@@ -321,31 +329,38 @@ outputs go. Point `k2 absent`. `k2` returns at the same version: decoded
 absent, present now: an add.
 
 **A reader paused 40 days, a 30-day window.** `tally`'s base is commit
-`P`, day 0, holding `k1@1 k2@1 k3@1`; its automation is disabled, and
-the index keeps 30 days of history. Upstream: `k2` updated on day 10,
-`k3` removed on day 20, `k4` added on day 35. On day 29, retention's next
-cut `C` would pass `P`: upkeep writes the before-image of what changed in
-`(P, C]` — `k2@1`, `k3@1` (present), two entries, not the whole set —
-installs it, and the base is `C` with it; `P` is released. On day 40
-`tally` runs. Candidates: the before-image's `k2` and `k3`, and
-`changes(C, now)`'s `k4`. Classed as always: `k2` `@1` against `@7`, an
-update; `k3` present against absent, a removal; `k4` absent at `C`
-against present, an add; `k1`, in neither, unchanged. The run completes:
-the base is the commit it read at, and the file is deleted. Without it,
-day 40 would find `P` gone and owe a start-over.
+`P`, day 0, holding `k1@1 k2@1 k3@1`. `k0` is added just after, at `P′`;
+a run that day delivers it in its first batch, writing `(−∞, k0] @ P′`,
+and is cancelled. Its automation is then disabled, and the index keeps 30
+days of history. Upstream: `k2` updated on day 10, `k3` removed on day
+20, `k4` added on day 35. On day 29, retention's next cut `C` would pass
+`P` and `P′`. Upkeep folds the range — nothing in `(−∞, k0]` changed, so
+it relabels to `C` — and writes the base's before-image of what changed in
+`(P, C]` outside it: `k2@1`, `k3@1` (present), two entries, not the whole
+set. One event installs both; the base is `C` with the before-image, and
+`P` and `P′` are released. On day 40 `tally` runs. Candidates: the
+before-image's `k2` and `k3`, and `changes(C, now)`'s `k4`. Classed as
+always: `k2` `@1` against `@7`, an update; `k3` present against absent, a
+removal; `k4` absent at `C` against present, an add. `k0`, in the range
+at `C`, and `k1`, in the base, are unchanged: nothing. The run completes:
+its ranges become the base at its last head, and the file is deleted.
+Without the fold and the before-image, day 40 would find `P` gone and owe
+a start-over.
 
 **An upstream reset (A27 R7).** `items` is moved to another store; its
 old index goes. `tally` records a rebuild: owed a start-over, not a
-decode it can no longer make.
+decode it can no longer make. A batch in flight across the reset is
+refused by the commit check.
 
 **A takeover mid-run.** Batches 1 and 2 committed their overwrites;
-batch 3's attempt dies, writing none. The next engine decodes `R` to `S`,
-and batch 3's keys are owed; the pass's pin and `T` held throughout.
+batch 3's attempt dies, writing none. The next engine decodes `R` to `S`;
+its next run owes batch 3's keys and whatever changed since, and needs
+nothing of the old run's cursor.
 
-**Per-key versus plain.** One observation record for both. For `checks`, failed keys are
-seen, retried by their failure records. For `tally`, `S` is the only
-record of what the count holds: `added` is never a key it holds,
-`removed` always one.
+**Per-key versus plain.** One observation record for both. For `checks`,
+failed keys are seen, retried by their failure records. For `tally`, `S`
+is the only record of what the count holds: `added` is never a key it
+holds, `removed` always one.
 
 ## Each past finding is a decode mismatch
 
@@ -358,12 +373,12 @@ record of what the count holds: `added` is never a key it holds,
 | A19 R7, F37: shared inputs | context per layer; scanned when it moves |
 | A19 R9, R10, F35: staleness | one comparison, exact or pending; `each` chains intersect key by key |
 | F41: a position past a removal it never delivered (`items` over a current-only `feed` going `{…, k11}` → `{k11}` → `{k1, k3}`: read through commit 2, still holding `k11`, fresh) | nothing moves past an observation: `k11` stays in `S` as served until a batch delivers its removal, and the next comparison classes it from that decoded state against upstream now — an owed removal |
-| A26 N1: the pass's rows | the scan plan holds its pin from its start |
+| A26 N1: the pass's rows | impossible: there is no pass; each batch reads at its own head, pinned by its claim |
 | A26 N5: the cap | there is none: overrides spill |
 | A27 R3, R4, R8, R9 | normalised patterns; candidates classed once; disjoint overwrite and decode-equal fold; per-range changes |
-| `ObservedSet.tla` 1 (P1, W36): a retention cut past an active pass's `T` (a pass at `T = 1` commits `k1`; `k2` changes at 2; the cut at 2 gives the base and ranges their before-images, and the pass's next batch, `k2`, needs the key view at 1, gone) | the cut replans the pass at the head; a batch in flight on the old plan is refused by the commit check, its keys owed; no pass holds retention |
-| `ObservedSet.tla` 2 (P2, W36): a pass sends a key back (the pass is at `T = 1`; `k1` is updated to `@2`; `keys=(k1)` delivers `@2`; the pass reaches `k1` and would deliver `@1`) | points record `observed_at`; a pass leaves alone a key whose point was observed after its `T`, and its range write keeps that point |
-| `ObservedSet.tla` 3 (P1, W36): a batch committing across a change it was not planned under (its pass replanned or ended, an upstream reset, a definition change) | the commit check: the active scan plan, the current life, no start-over owed |
+| `ObservedSet.tla` 1 (P1, W36): a retention cut past an active pass's `T` (a pass at `T = 1` commits `k1`; `k2` changes at 2; the cut at 2 folds the base and ranges, and the pass's next batch, `k2`, needs the key view at 1, gone) | impossible: there is no pass; the next batch reads at its own head |
+| `ObservedSet.tla` 2 (P2, W36): a pass sends a key back (the pass is at `T = 1`; `k1` is updated to `@2`; `keys=(k1)` delivers `@2`; the pass reaches `k1` and would deliver `@1`) | impossible: there is no pass; the batch covering `k1` reads at its own head and finds the point equal |
+| `ObservedSet.tla` 3 (P1, W36): a batch committing across a change it was not planned under (an upstream reset, a definition change) | the commit check: the current life, no start-over owed |
 
 A19 R6 (`keys=` bounded by `batch_size` and `concurrency`) and R8 (a
 forced retry) are kept as they are, outside the observation record.
@@ -372,22 +387,22 @@ forced retry) are kept as they are, outside the observation record.
 
 | Today | With the observed set |
 |---|---|
-| Position: `next`, `pass` (`from`, `at`, `batch`, `pin`), `fingerprint`, `began`, `seen` | The base; a pass's committed prefix as ranges, its scan plan apart; `fingerprint` stays: a change resets `R` |
+| Position: `next`, `pass` (`from`, `at`, `batch`, `pin`), `fingerprint`, `began`, `seen` | The base and ranges, each observed at a head; no pass, cursor or scan pin is stored; `fingerprint` stays: a change resets `R` |
 | K45 read-ahead (`ahead`), its cap, paged selections' shared entries | Points, spilling past a bound |
-| D93: snapshot passes; selections classed via `lower=` | A pass reads at its `T`, held by its pin; selections write points; `decode` replaces `lower=` |
+| D93: snapshot passes; selections classed via `lower=` | Each batch reads at its own head, pinned by its claim; selections write points; `decode` replaces `lower=` |
 | D100: classes from the index, rows from the store; rowless deliveries | Classes from what was served, decided before the callback |
 | The pattern change: old patterns' delta, membership diff, old/new split | Normalised patterns per layer; prefix membership queries; one classification |
 | `caught_up`, `caught_up_at`, `_dep_restart` | Derived: nothing owed; context per layer |
 | Staleness: three predicates; K38's filter-then-confirm | One comparison, exact or pending |
 
-Deleted: `_selection` and its branches, `held_at`, `walked`, `read_from`,
-`pattern_change` and the `diff` mode, `_read_ahead`, `_read_ahead_of`,
-`changes(lower=)`, `READ_AHEAD_FULL` and the cap, `_dep_restart`,
-`caught_up`, most of `staleness.py` and `positions.py`, D100's rowless
-deliveries and `gone_since`'s early removal. Kept: the key index and
-`changes()`, endpoint reservation and reader pins, the failure index and
-retries, per-key reconcile, D111's bounds, positions by commit for
-unkeyed upstreams.
+Deleted: `_selection` and its branches, the pass and its pin, `held_at`,
+`walked`, `read_from`, `pattern_change` and the `diff` mode,
+`_read_ahead`, `_read_ahead_of`, `changes(lower=)`, `READ_AHEAD_FULL` and
+the cap, `_dep_restart`, `caught_up`, most of `staleness.py` and
+`positions.py`, D100's rowless deliveries and `gone_since`'s early
+removal. Kept: the key index and `changes()`, endpoint reservation and
+the claim's reader pin, the failure index and retries, per-key reconcile,
+D111's bounds, positions by commit for unkeyed upstreams.
 
 ## Testing
 
@@ -396,13 +411,14 @@ updated by each step as the model says. A property test runs random
 histories — upstream commits and resets, current-only rows served ahead,
 behind or not at all, `keys=` and default runs, cancels and failures,
 pattern changes (first include, prefixless globs) and definition and
-shared-input changes, replans, takeovers, renames — and after **every
-commit** checks that `R` decodes to the dict, and that staleness and a
-default run's load equal the dict's comparison with the upstream. The
-A19, A26 and A27 histories are named examples, and so are
-`ObservedSet.tla`'s three counterexamples and F41 (W38's
-replay in `tests/sim/test_replays.py`, a strict xfail in the old model). Before relying on the
-bounds: measure a large spill and a pattern change at 100M.
+shared-input changes, retention cuts, takeovers, renames — and after
+**every commit** checks that `R` decodes to the dict, and that staleness
+and a default run's load equal the dict's comparison with the upstream.
+The A19, A26 and A27 histories are named examples, and so are
+`ObservedSet.tla`'s three counterexamples and F41 (W38's replay in
+`tests/sim/test_replays.py`, a strict xfail in the old model). Before
+relying on the bounds: measure a large spill and a pattern change at
+100M.
 
 ## What gets harder
 
@@ -424,11 +440,10 @@ Context   = {id, whole_and_dep_versions}
 Layer     = {endpoint, patterns (normalised), context: id, life}
 Base      = Layer                                   # endpoint P: a commit
           | Layer + {before_image}                  # endpoint C; the keys changed in (P, C], as at P
-Range     = Layer + {lo, hi}                        # endpoint T; disjoint, sorted
-Point     = {key, present, version, payload, patterns, context: id, life, observed_at}
-ScanPlan  = {id, T, cursor, patterns, context: id, pin}  # the active pass only
+Range     = Layer + {lo, hi}                        # endpoint H, the head observed at; disjoint, sorted
+Point     = {key, present, version, payload, patterns, context: id, life}
 ObservationRecord = {base, ranges[], points{}, contexts[], spill: index state | None,
-                     scan_plan: ScanPlan | None, rebuild: life | None}
+                     rebuild: life | None}
 ```
 
 **Decode** — the observed set, from an observation record (the old
@@ -467,16 +482,35 @@ owed(R, now) = {k: c for k in candidates(R, now) if (c := classify(R, k, now)) !
 # point keys, membership and context scans
 ```
 
-A batch then loads its keys — less any whose point was observed after
-its plan's `T` — turns each served row into an observation, re-runs
-`classify` with the observation as `new`, calls the producer with those
-classes, and commits its overwrite — ranges and points — with its
-outputs, if the commit check passes:
+**A run** — the owed keys in key order, `batch_size` a commit, its cursor
+in memory:
 
 ```text
+run(R):
+    todo = sorted(owed(R, now))                    # the comparison
+    prev = FIRST
+    while prev is not LAST:
+        keys = the next batch_size keys of todo after prev
+        c = keys[-1] if todo goes on past it else LAST
+        H = the head now, pinned by the batch's claim
+        owed_here = {k: classify(R, k, at H) for k in candidates(R, H) within (prev, c]}
+        load the keys owed_here owes; reclassify each from what was served
+        call the producer
+        if not may_commit(batch, R, now):
+            return                                 # refused: its keys stay owed
+        commit outputs, the range (prev, c] @ H, a point per key served otherwise
+        fold(R, H)
+        prev = c
+
 may_commit(batch, R, now):
-    if batch.life != now.life:                        return False   # the input's life is current
-    if R.rebuild or now.start_over_owed:              return False   # no start-over owed
-    if batch.plan is None:                            return True    # a selection's points
-    return R.scan_plan is not None and R.scan_plan.id == batch.plan  # still the active pass
+    return batch.life == now.life and not R.rebuild and not now.start_over_owed
+
+fold(R, H):                                        # at each batch commit
+    for range in R.ranges with range.endpoint < H:
+        for k in changes(range.endpoint, H, within=[range.lo, range.hi]).keys:
+            if k not in R.points: R.points[k] = decode(R, k)   # as observed, before relabelling
+        range.endpoint = H
+    merge adjacent ranges with equal (endpoint, patterns, context, life)
+    if a range spans every key: R.base, R.ranges = that range, []
+    drop each override that decodes the same without it
 ```
