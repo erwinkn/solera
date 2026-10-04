@@ -1,7 +1,8 @@
 """How a worker reaches the engine (docs/lifecycle.md §5): over HTTPS, or in
-process for workers the engine runs itself. Every call is a signal, never
-the only copy of a fact: a failed call costs latency, and the worker falls
-back to its `.beat` object and its control file (§6, §2.4).
+process for workers the engine runs itself; and how a pool host asks for
+work (§10). Every call is a signal, never the only copy of a fact: a failed
+call costs latency, and the worker falls back to its `.beat` object and its
+control file (§6, §2.4).
 
 A channel answers `start` and `beat` with `{"cancel": record | None}`,
 raises `Ended` when the engine says the attempt is over for this
@@ -65,6 +66,26 @@ class HttpChannel:
 
     def close(self) -> None:
         self.client.close()
+
+
+class HttpPoolChannel:
+    """Pool discovery (docs/lifecycle.md §10): which attempts wait on a pool
+    that fit this host, with the pool token."""
+
+    def __init__(self, server: str, project: str, pool: str, token: str | None):
+        import httpx
+
+        headers = {"Authorization": f"Bearer {token}"} if token else {}
+        self.path = f"/api/projects/{project}/pools/{pool}/work"
+        self.client = httpx.AsyncClient(base_url=server, headers=headers, timeout=60)
+
+    async def work(self, host: str, capacity: dict) -> list[dict]:
+        response = await self.client.get(self.path, params={"wait": 30, "host": host, **capacity})
+        response.raise_for_status()
+        return response.json()["work"]
+
+    async def close(self) -> None:
+        await self.client.aclose()
 
 
 class LocalChannel:

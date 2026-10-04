@@ -1472,21 +1472,18 @@ async def run_pool(pool: str, server: str, token: str | None = None, *, project:
 
     import httpx
 
-    headers = {"Authorization": f"Bearer {token}"} if token else {}
+    from .channel import HttpPoolChannel
+
     capacity = {"cpu": os.cpu_count(), "memory": None, "gpu": None}
     host = f"{socket.gethostname()}:{os.getpid()}"
     project = project or load_project(os.environ["SOLERA_PROJECT"]).manifest["name"]
     context = _attempts()
-    async with httpx.AsyncClient(base_url=server, headers=headers, timeout=60) as client:
+    channel = HttpPoolChannel(server, project, pool, token)
+    try:
         print(f"[pool] {host} polls pool {pool!r}", flush=True)
         while True:
             try:
-                response = await client.get(
-                    f"/api/projects/{project}/pools/{pool}/work",
-                    params={"wait": 30, "host": host, **{k: v for k, v in capacity.items() if v is not None}},
-                )
-                response.raise_for_status()
-                stages = response.json()["work"]
+                stages = await channel.work(host, {k: v for k, v in capacity.items() if v is not None})
             except httpx.HTTPError:
                 # The server may be briefly unreachable (a restart): a pool worker polls on.
                 await asyncio.sleep(1.0)
@@ -1496,6 +1493,8 @@ async def run_pool(pool: str, server: str, token: str | None = None, *, project:
                 print(f"[pool] {stage['attempt']} exited {code}", flush=True)
                 if code != LOST:  # it ran: ask again, what waits has changed
                     break
+    finally:
+        await channel.close()
 
 
 LOST = 4  # the exit code of an attempt that could not publish: the engine treats it as dead
