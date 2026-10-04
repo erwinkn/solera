@@ -179,6 +179,7 @@ needs is `k`'s state at `N`:
 
 | Delivered at r | At N | Class |
 |---|---|---|
+| any, with r ≥ N | any | skip: read at or after this pass's end (A25 R3) |
 | live | live, generation ≤ g(r) | skip: unchanged since it was read |
 | live | live, generation > g(r) | updated (neither if a payload-bearing key's payload is equal) |
 | live | absent | removed |
@@ -198,6 +199,13 @@ need to.
 T's node for `[4, 5]` drops `d` (absent before 4, absent after 5). K at 5
 has no `d`: delivered live, absent now: removed. Without the K lookup the
 consumer would keep `d` forever.
+
+*The guard (A25 R3).* A pass paused at `N = 4` resumes after a keys=
+selection read `d` at `r = 5` and delivered it live (added at 5). K at 4 has
+no `d`; without the first row the resumed pass would class `d` removed and
+undo the selection. An entry read at or after N is newer than anything the
+pass delivers, so the pass leaves the key to the next one (tested,
+`test_twoviews.py::test_read_ahead_guard`).
 
 ### Retention
 
@@ -388,10 +396,14 @@ node, and writes a new base: newest wins, tombstones dropped. With clustered
 keys, base files whose key range the node does not touch are kept as they
 are.
 
-Replayed (b = 4, r = 4): K opens 10.5 runs on average, 19 at most, at 100M
-(8.5 and 16 at 1M), and holds 1.31 entries per live key at 100M (1.46 at
-1M). Spans hold 1.13–1.24 at 100M and 1.65–9.9 at 1M with lagging readers
-(cited, replayed), since every reader's position keeps versions.
+Replayed (b = 4, r = 4), every head of a base cycle enumerated (A25 R7:
+phase 1 sampled every 32nd head and reported 10.5 and 19): K reads 13.0 runs
+on average and 25 at most at 100M (8.5 and 16 at 1M) as merge inputs, a
+pack's sections counted apart; 12.3 and 23 objects (7.8 and 14) when a
+small pack is one GET. It holds 1.31 entries per live key at 100M (1.46 at
+1M) on average over the cycle. Spans hold 1.13–1.24 at 100M and 1.65–9.9 at
+1M with lagging readers (cited, replayed), since every reader's position
+keeps versions.
 
 ### Reads
 
@@ -451,9 +463,18 @@ block indexes already prune prefix seeks. Not used.
 Every key in a block lies between its first and last keys (or the next
 block's first key, all format v4 records). A block can be skipped if no
 string in that interval matches the glob. The test walks the glob's
-automaton down both interval bounds and stops as soon as it is free of both
-(`globs.py`, `intersects`). It needs no stored bytes and runs on the block
-index the reader fetches anyway.
+automaton down both interval bounds, accepts a complete match wherever it
+lies inside both, and stops as soon as it is free of both (`globs.py`,
+`intersects`). It needs no stored bytes and runs on the block index the
+reader fetches anyway.
+
+The review found two holes in phase 1's version (A25 R1, R2): it skipped
+`b` between `aa` and `ca` for the glob `?` (a short match between longer
+bounds), and it read a terminal `**` as two `*`, which cannot cross `/`.
+The automaton now follows Solera's grammar (`**/`, `**`, `*`, `?`) and a
+property test checks it against Solera's own matcher on random short keys
+and globs (`test_globs.py`, 40 seeds × 60 globs, both bound forms). The
+measurements below were re-run with it and did not change.
 
 Measured on 1M path-shaped keys (`tenant/site/date/file.ext`) and 1M
 12-digit ids: the share of blocks each method reads, at 64 KiB / 16 KiB

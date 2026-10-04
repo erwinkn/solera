@@ -15,3 +15,10 @@
 100m-views-large-zstd16-w8640 --index views --size 1e8 --scenario base --large 1000000 --large-every 3000 --codec zstd --block-size 16384 --window 8640
 100m-spans-large-zlib64 --index spans --size 1e8 --scenario base --large 1000000 --large-every 3000
 100m-views-base-zlib64-w8640 --index views --size 1e8 --scenario base --window 8640
+1m-views-base-zstd16-w8640 --index views --size 1e6 --scenario base --codec zstd --block-size 16384 --window 8640
+1m-views-stall-zstd16-w8640-v2 --index views --size 1e6 --scenario stall --codec zstd --block-size 16384 --window 8640
+100m-views-base-zstd16-w8640 --index views --size 1e8 --scenario base --codec zstd --block-size 16384 --window 8640
+1m-views-base-zlib64-w8640 --index views --size 1e6 --scenario base --window 8640
+1m-views-daily100-zstd16-w8640 --index views --size 1e6 --scenario daily100 --codec zstd --block-size 16384 --window 8640
+1m-views-large-zstd16-w8640 --index views --size 1e6 --scenario base --large 1000000 --large-every 3000 --codec zstd --block-size 16384 --window 8640
+1m-spans-large-zlib64 --index spans --size 1e6 --scenario base --large 1000000 --large-every 3000
