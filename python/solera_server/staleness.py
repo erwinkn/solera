@@ -86,6 +86,14 @@ class Staleness:
         cheap = await self._input_changed_here(asset, partition, planner, inputs, definition)
         if self._each_input(asset) is None:
             return cheap
+        # Never fresh while its record is behind its whole and dep inputs, or says none: the
+        # keys then all owe the full pass, whatever a scan finds (F37's backstop).
+        seen = self.m.partition(asset, partition).get("seen")
+        versioned = [i for i in inputs if self._versioned(i)]
+        if versioned and (
+            seen is None or any(seen.get(i.param) != self._input_version(planner, i) for i in versioned)
+        ):
+            return True
         # K38: an each=True partition is stale exactly when one of its keys is. The partition's
         # own records filter (a pass its definition made due excuses them, so it is checked
         # too); the keys confirm, the scan run only then, so roll-ups stay cheap (F35).

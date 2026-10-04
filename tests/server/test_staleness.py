@@ -374,7 +374,6 @@ def history():
     h.close()
 
 
-@pytest.mark.xfail(strict=True, raises=AssertionError, reason="F37: open")
 def test_a_keys_run_on_a_never_built_output_leaves_it_owing_a_full_pass(history):
     """`checks` has never run. keys=[k2] writes k2; k1 is missing, and k2
     is stale too: no pass has completed, so the record holds no `knob`

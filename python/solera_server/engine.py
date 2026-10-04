@@ -835,11 +835,13 @@ class Engine(Attempts, Sensors, Staleness, Views):
         fingerprint = self._fingerprint(asset, run)
         # The whole and dep inputs as pinned now, against those the partition last caught
         # up to: one moved since makes a full pass due (semantic change d), from its commit.
+        # Never caught up, no record says what it saw: their latest commit, so a pass begun
+        # before it starts over and redoes what it wrote under the old ones (F37).
         seen = {i.param: self._input_version(planner, i) for i in inputs if self._versioned(i)}
         recorded = self.m.partition(task["asset"], partition).get("seen")
         moved_at = (
             max(self._committed(planner, i) for i in inputs if self._versioned(i))
-            if recorded is not None and recorded != seen
+            if seen and recorded != seen
             else None
         )
         if full and run["mode"] == "full" and incremental:
