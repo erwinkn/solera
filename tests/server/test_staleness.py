@@ -66,6 +66,7 @@ def project(
         version=checks_v,
     )
     async def checks(ctx, item: list):
+        outside.checked.add(item[0]["id"])
         return [{"v": f"{item[0]['v']}.{checks_v}"}]
 
     @asset(
@@ -97,6 +98,7 @@ def project(
         return [{"v": row[0]["v"]}]
 
     outside.delivered = getattr(outside, "delivered", set())
+    outside.checked = getattr(outside, "checked", set())  # the keys `checks` was called on
     outside.started_over = getattr(outside, "started_over", False)
     return Project(
         assets=[items, checks, copy, count, tally, fchecks],
@@ -239,9 +241,24 @@ class Staleness(RuleBasedStateMachine):
     def run_default(self, name):
         if name == "copy":
             self._delivered_as(self.ref.run_default("copy"), ["copy"])
+        elif name == "checks":
+            self._checked_as(self.ref.run_default, mode="incremental")
         else:
             self._submit([name])
             self.ref.run_default(name)
+
+    @rule()
+    def run_full(self):
+        self._checked_as(lambda name: self.ref.run_full(), mode="full")
+
+    def _checked_as(self, reference, mode):
+        """Run `checks`, and check it was called on just the keys the
+        reference says the run writes."""
+
+        self.outside.checked.clear()
+        self._submit(["checks"], mode=mode)
+        want = reference("checks")
+        assert self.outside.checked == want, f"checks ran on {self.outside.checked}, not {want}"
 
     def _delivered_as(self, want, assets, **kw):
         """Run, and check what reached `copy`: nothing twice, a start-over
@@ -301,6 +318,7 @@ Staleness.TestCase.settings = settings(
     max_examples=25,
     stateful_step_count=12,
     deadline=None,
+    derandomize=True,  # the same histories every run: CI never flakes on a rare one (as the simulation's)
     suppress_health_check=list(HealthCheck),
     phases=list(Phase) if staleness.LANDED else [Phase.explicit, Phase.generate],
 )
@@ -414,14 +432,17 @@ async def test_a_commit_of_excluded_keys_alone_leaves_their_consumers_fresh(stat
 
 async def test_a_shared_input_change_makes_every_key_stale(state, tmp_path):
     """`knob`, a dep every key of `checks` shares, changes: every key is
-    stale, though no upstream key changed; keys= runs covering them all
-    leave `checks` fresh."""
+    stale, though no upstream key changed, and a full pass is due: keys=
+    runs may write part of it (after semantic change (d), every key stays
+    stale until the pass completes), and covering every key completes it."""
 
     engine, outside = await _built(state, tmp_path, {"k1": "1", "k2": "1"})
     await engine.commit_source("knob", version="1")
     assert await staleness.stale_keys(engine, "checks") == {"k1", "k2"}
     assert await staleness.partition_stale(engine, "checks") and await staleness.asset_stale(engine, "checks")
-    await drive(engine, await engine.submit(["checks"], keys={"items": {"keys": ["k1", "k2"]}}))
+    await drive(engine, await engine.submit(["checks"], keys={"items": {"keys": ["k1"]}}))
+    assert await staleness.stale_keys(engine, "checks") == ({"k2"} if staleness.DEP_RESETS else {"k1", "k2"})
+    await drive(engine, await engine.submit(["checks"], keys={"items": {"keys": ["k2"]}}))
     assert not await staleness.partition_stale(engine, "checks")
 
 
@@ -603,6 +624,21 @@ async def test_a_stale_status_carries_every_reason_that_holds(state, tmp_path):
     assert await staleness.stale_reasons(engine, "copy") == {staleness.DEFINITION, staleness.UPSTREAM}
 
 
+@pytest.mark.xfail(strict=True, raises=AssertionError, reason="F35: open")
+async def test_a_key_neither_side_holds_leaves_an_each_partition_fresh(state, tmp_path):
+    """F35. `fchecks` (each=True over `feed`) runs for k1 alone; `feed` then
+    removes k2, which `fchecks` never held. k2 is no output unit, so
+    nothing is stale: the keys say so, and the partition, their "any",
+    must agree."""
+
+    engine, outside = await _built(state, tmp_path, {"k1": "1", "k2": "1"})
+    await drive(engine, await engine.submit(["fchecks"], upstream=False, keys={"feed": {"keys": ["k1"]}}))
+    outside.feed.pop("k2")
+    await engine.commit_source("feed", remove=["k2"])
+    assert await staleness.stale_keys(engine, "fchecks") == set()
+    assert not await staleness.partition_stale(engine, "fchecks"), "stale, with no stale key"
+
+
 @net_delta
 async def test_a_key_added_and_removed_past_the_read_changes_nothing(state, tmp_path):
     """The net delta, through `items`: k4 is added and removed again past
@@ -688,7 +724,8 @@ def test_the_reference_reads_the_worked_examples():
     ref.reset_checks()
     assert not ref.stale("checks")  # no head: missing, not stale
     ref.run_keys({"k2"})
-    assert ref.stale_keys() == {"k3", "k4"}
+    # (d): a reset leaves no full pass behind, and `knob` waits for one: k2 too
+    assert ref.stale_keys() == {"k3", "k4"} | ({"k2"} if not staleness.DEP_RESETS else set())
 
     ref = staleness.Reference(takes=taken)  # K39
     ref.change_knob()
@@ -794,6 +831,26 @@ def test_the_reference_reads_the_worked_examples():
     assert capped.run_keys({"k3"}) == "refused"
     capped.run_default("checks")
     assert capped.run_keys({"k1"}) is None
+
+    for per_key in (True, False):  # before semantic change (d), and after
+        d = staleness.Reference(takes=taken, dep_resets=per_key)
+        d.change_knob()
+        d.commit({"k1", "k2"}, set())
+        assert d.run_default("checks") == {"k1", "k2"}  # the first run: every key
+        d.commit({"k1"}, set())
+        assert d.run_default("checks") == {"k1"}  # no pass due: the delta
+        d.change_knob()
+        assert d.stale_keys() == {"k1", "k2"} and d.reasons("checks") == {IN}  # and a pass due
+        d.run_keys({"k1"})
+        assert d.stale_keys() == ({"k2"} if per_key else {"k1", "k2"})  # one `knob` version per partition
+        assert d.run_default("checks") == {"k2"} and not d.stale("checks")  # what the pass had not
+        d.change_knob()
+        d.run_keys({"k1", "k2"})
+        assert not d.stale("checks")  # keys= runs that complete the pass
+        d.reset_checks()
+        d.run_keys({"k2"})
+        assert d.stale_keys() == ({"k1"} if per_key else {"k1", "k2"})  # over-reported after (d): accepted
+        assert d.run_full() == {"k1", "k2"} and not d.stale("checks")
 
 
 # -- the keyed merge on every built-in store (R2) ----------------------------------------

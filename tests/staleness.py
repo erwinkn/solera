@@ -46,6 +46,13 @@ that use this module are strict xfails or off):
   pass is due and unfinished; its keys share the partition's answer.
 - "Changed" is the net delta: a key added and removed again past a read,
   or updated and reverted, has not changed.
+- A whole or dep input moving (`knob`) makes every key stale ("input
+  changed") and a full pass due: the next default run writes every key
+  the pass has not (keys= runs may have written some). With no pass due,
+  a default run writes the keys whose upstream changed. Until semantic
+  change (d) a key the pass rewrote is fresh; after it, the partition
+  record holds one `knob` version, so every key stays stale until the
+  pass completes (the coordinator's ruling).
 - Staleness is transitive (K46): a unit is also stale when an upstream unit
   it depends on is. Each stale status says why: "input changed", "upstream
   stale", "definition changed", one or more.
@@ -63,6 +70,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 
 NET = False  # the engine counts the net delta (K44's range scan, on hold): until then the machine models it as built
+DEP_RESETS = True  # knob staleness per key; (d) keeps it per partition: W22 sets False
 LANDED = False  # every piece of K43–K46 built: True also shrinks their failures
 
 
@@ -158,6 +166,7 @@ class EachAsset:
     built: bool = False
     held: dict[str, tuple[int, int]] = field(default_factory=dict)
     changed_at: int = 0
+    seen: int = -1  # its last completed pass: `knob` as of then (-1: none)
     entries: int = 0  # keys= runs since the last default run: the cap counts them (K47)
 
 
@@ -192,8 +201,17 @@ class Reference:
     its resets, `knob` changes, `checks`' own resets, asset changes, keys=
     runs and default runs: what each run delivers, and what is stale, why."""
 
-    def __init__(self, takes: Callable[[str], bool] = everything, cap: int = 10_000, net: bool = True):
+    def __init__(
+        self,
+        takes: Callable[[str], bool] = everything,
+        cap: int = 10_000,
+        net: bool = True,
+        dep_resets: bool = DEP_RESETS,
+    ):
         self.cap = cap  # keys= runs a plain incremental partition takes between default runs
+        # `checks`' knob staleness per key (a key the pass rewrote is fresh), or, after
+        # semantic change (d), per partition (every key, until the pass completes).
+        self.dep_resets = dep_resets
         # What "changed" means: the net delta (the design), or, with net=False, any change
         # since a read, a key brought back included (the build until K44's range scan).
         self.net = net
@@ -331,8 +349,8 @@ class Reference:
                     self.checks.held[k] = (self.up[k], t)
                 else:
                     self.checks.held.pop(k, None)
-            if not self.direct_stale_keys():  # nothing left uncovered: the record collapses
-                self.checks.entries = 0
+            if not self.direct_stale_keys(per_key=True):  # nothing left uncovered: the record collapses
+                self.checks.entries, self.checks.seen = 0, t  # and any pass due is complete
             return None
         o = self.others[name]
         if len(o.entries) >= self.cap:
@@ -350,14 +368,21 @@ class Reference:
     def run_default(self, name: str):
         """A default run: (what it delivers, whether it starts over) on a
         plain incremental asset; it finishes any pass due, and collapses the
-        record into its snapshot."""
+        record into its snapshot. On `checks`, the keys it writes."""
 
         t = self._tick()
         if name == "checks":
             c = self.checks
-            c.built, c.entries = True, 0
-            c.held = {k: (v, t) for k, v in self.up.items() if c.takes(k)}
-            return None
+            behind = set(
+                self.direct_stale_keys(per_key=True)
+            )  # what a pass due has not written, or the delta
+            c.built, c.entries, c.seen = True, 0, t
+            for k in behind:
+                if k in self.up:
+                    c.held[k] = (self.up[k], t)
+                else:
+                    c.held.pop(k, None)
+            return behind & set(self.up)
         o = self.others[name]
         delivered = self.pending(name)
         start_over = self._deliver(o, delivered)
@@ -366,6 +391,15 @@ class Reference:
         else:
             o.snapshot, o.entries = self.last_commit, []
         return delivered, start_over
+
+    def run_full(self) -> set[str]:
+        """A full run of `checks` (`mode="full"`): every key rewritten,
+        `knob` caught up. Returns the keys it writes."""
+
+        t, c = self._tick(), self.checks
+        c.built, c.entries, c.seen = True, 0, t
+        c.held = {k: (v, t) for k, v in self.up.items() if c.takes(k)}
+        return set(c.held)
 
     def _deliver(self, o: ByPartition, delivered: set[str]) -> bool:
         start_over = o.snapshot is None and not o.started
@@ -426,11 +460,15 @@ class Reference:
             or (not self.net and self.feed_changed.get(k, -1) > f.held[k][1])
         }
 
-    def direct_stale_keys(self) -> dict[str, set[str]]:
-        """`checks`' stale keys by its own inputs, with why."""
+    def direct_stale_keys(self, per_key: bool | None = None) -> dict[str, set[str]]:
+        """`checks`' stale keys by its own inputs, with why. `per_key`: each
+        key by its own write (what a pass has yet to write), as the engine
+        reports it until semantic change (d)."""
 
         c, out = self.checks, {}
-        for k in {k for k in self.up if c.takes(k)} | set(c.held):
+        per_key = self.dep_resets if per_key is None else per_key
+        keys = {k for k in self.up if c.takes(k)} | set(c.held)
+        for k in keys:
             why = set()
             if k not in c.held or k not in self.up:
                 why.add(INPUT)
@@ -442,6 +480,9 @@ class Reference:
                     why.add(DEFINITION)
             if why:
                 out[k] = why
+        if not per_key and c.built and self.knob > c.seen:  # (d): one `knob` version per partition
+            for k in keys:
+                out.setdefault(k, set()).add(INPUT)
         return out
 
     def stale_keys(self) -> set[str]:
