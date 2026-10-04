@@ -244,13 +244,13 @@ result.
 
 ## Effort
 
-About an hour of agent time, 01:31 to 02:35 CEST, after the Bend
+About an hour of agent time, 01:31 to 02:23 CEST, after the Bend
 experiment (`../bend/REPORT.md`). Failing check rounds, per file:
 
 | File | Rounds | What failed |
 |---|---|---|
 | WriteBound, first version | 3 | missing core lemmas (`List.le_sum_of_mem`, `Nat.log2_one`); `simp [Nat.log2]` unfolds the definition; one coefficient rewrite |
-| WriteBound, shrinking merges and retries (02:15 to 02:35) | 5 | a muddled case split, rethought before it ran; `Nat.succ_mul` rewrote `4 * K`; a structure field `M` that `omega` saw as an unknown; an implicit size in a `rw`; ring identities, which `grind` proves where `omega` can't |
+| WriteBound, shrinking merges and retries (02:13 to 02:23) | 5 | a muddled case split, rethought before it ran; `Nat.succ_mul` rewrote `4 * K`; a structure field `M` that `omega` saw as an unknown; an implicit size in a `rw`; ring identities, which `grind` proves where `omega` can't |
 | Tiling | 3 | `seg_append`'s index arithmetic; `cover` of an append; a misplaced doc comment |
 | Keys, lookup | 3 | the base's normalisation: `st` can tell a tombstone from no entry, so the last step had to go through `live`; `mergeAll`'s equation lemma |
 | Keys, read-ahead | 2 | `if` on a `Prop` needs `Classical`; one `le_refl` |
