@@ -253,7 +253,7 @@ All 222,066 summary entries were equal.
 `Vectors.lean` (`lake build vectors`, then `.lake/build/bin/vectors
 HISTORIES SEED`) prints one history per line as JSON.
 `vectors/span-model-seed1-100.jsonl.gz` holds 100 of them, generated with
-seed 1. The output is deterministic, so any seed regenerates the same
+seed 1. The output is deterministic: the same seed regenerates the same
 lines. Each history:
 
 - `gen_rule`: `gen(c) = 10 * (c + 1)`; `keys`: `a` to `d`.
