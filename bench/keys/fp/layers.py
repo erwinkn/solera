@@ -186,6 +186,12 @@ class Index:
         return bisect.bisect_right(self.first, key) - 1
 
 
+def newest(x: Layer, ix: Index, i: int) -> int:
+    """Block i's newest stamp: a delta's blocks carry none (its generation is
+    the commit's, from the state)."""
+    return x.stamp if x.stamp is not None else ix.max[i]
+
+
 class Reader:
     """Reads one manifest (the state a batch pinned) through `io`. Caches
     what a reader fetched (indexes, small parts, block windows), as the
@@ -279,7 +285,7 @@ class Reader:
                     continue  # small: in hand whole, it costs nothing to read further
                 ix = self._ix[part.index]
                 rng = ix.blocks(after, None)
-                streams.append([(ix.first[i], ix.count[i] * share, ix.max[i]) for i in rng])
+                streams.append([(ix.first[i], ix.count[i] * share, newest(x, ix, i)) for i in rng])
         if not streams:
             return None
         acc = 0.0
@@ -313,7 +319,7 @@ class Reader:
                     blocks = [
                         i
                         for i in ix.blocks(after, upto)
-                        if (g_p is None or ix.max[i] > g_p)
+                        if (g_p is None or newest(x, ix, i) > g_p)
                         and (pattern is None or pattern(ix.first[i], ix.first[i + 1] if i + 1 < len(ix.first) else None))
                     ]
                     inputs.append((await self.chunks(part, blocks), x.stamp or 0))

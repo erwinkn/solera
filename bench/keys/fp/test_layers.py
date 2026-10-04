@@ -12,6 +12,7 @@ removed inside) all occur within a few hundred commits.
 from __future__ import annotations
 
 import asyncio
+import os
 import random
 import sys
 from pathlib import Path
@@ -63,7 +64,8 @@ async def history(rng: random.Random, commits: int, readers: int, window: int = 
     for c in range(1, commits + 1):
         state = dict(fold.states[-1])
         live = sorted(state)
-        ups = {key(rng.randrange(400)) for _ in range(rng.randint(0, 12))}
+        big = rng.random() < 0.05  # a large commit: its delta gets an index (and read by blocks)
+        ups = {key(rng.randrange(400)) for _ in range(rng.randint(100, 200) if big else rng.randint(0, 12))}
         rms = set(rng.sample(live, min(len(live), rng.randint(0, 4)))) - ups
         rms |= {key(rng.randrange(400)) for _ in range(rng.randint(0, 1))} - ups  # removes of absent keys: nothing
         g = c + 1
@@ -112,7 +114,7 @@ def test_layers_against_the_fold():
     async def go():
         rng = random.Random(57)
         total = 0
-        for _ in range(6):
+        for _ in range(int(os.environ.get("LAYERS_SOAK", "6"))):
             async for ix, fold, c, positions in history(rng, 160, 3):
                 if c % 7 == 0:
                     total += await check_reads(ix, fold, c, positions, rng)
@@ -131,6 +133,7 @@ def test_merges_happen_and_side_parts_hold_what_only_straddlers_need():
             seen["side above the base"] |= any(x.side is not None and x.side.entries > 0 for x in ix.s.layers[1:])
             seen["index"] |= any(x.main.index for x in ix.s.layers)
             seen["straddle"] |= any(x.a <= min(positions) < x.b for x in ix.s.layers if x.stamp is None)
+            seen["indexed delta"] = seen.get("indexed delta", False) or any(x.stamp is not None and x.main.index for x in ix.s.layers)
         assert all(seen.values()), seen
         assert ix.written["base"].merges and ix.written["tier"].merges
 

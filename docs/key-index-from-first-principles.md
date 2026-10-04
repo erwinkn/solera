@@ -846,20 +846,101 @@ Open:
    prototype has none (its cold readers would not use them); phase 2's
    numbers say whether a held filter is worth adding.
 
-## Phase 2 plan, for the go
+## Phase 2: the prototype
 
-- **Prototype** on W53's harness (`viewbench.py`, branch
-  `exp/key-index-two-views`), as bench code: the minimal delta writer
-  (W53's codec), layers and layer indexes, the merge (native, a k-way merge with
-  flip union, reusing `stream.rs`'s newest-wins merge), the policy, the
-  cut, and Δ in its forms over `ObjectIO` with injected latency.
-- **Traces**: the baseline's (1M and 100M, 12,000 commits of 1K keys; readers
-  1, 100, 360, 8,640, 10,000 behind; 100 daily readers; churn; a 1M-key
-  commit), plus a long trace at 1M (≥ 70,000 commits) so a 7-day window and
-  base merges are reached.
-- **Checked** key by key against the fold for every read, including pages
-  resumed across merges and reads with P inside a merged layer.
-- **Measured against** spans and two views where the baseline has them: cold
-  lookups, write resolution, near and far catch-ups (first page and full),
-  full-scan pages with prefix and non-prefix patterns, writes per entry,
-  PUTs, storage, dollars.
+Built on this branch as bench code (D151), on W53's harness, ready for
+W53's measurement campaign.
+
+### What is built
+
+| Piece | Where | What |
+|---|---|---|
+| the minimal delta and stamped layers | `native/src/layers.rs` | blocks: a 13-byte header (compressed length, CRC-32, raw length, format) and zstd-1; a delta block holds key, kind and payload; a layer block key, presence, start bit, stamp, flips and payload. A writer hands back the block boundaries (the layer index): no index, filter or footer in any file |
+| merge | `layers_merge` | a k-way merge over the layers' blocks, streamed block by block: newest state, oldest start bit, flips united and those at or below the cut dropped; main and side parts |
+| Δ(P, H, after c, first N) | `layers_scan` | the read rule of "Reading Δ", with an optional glob (Solera's grammar), filtered while walking blocks: only matching keys are built |
+| lookups | `layers_lookup` | the newest entry per key, walking blocks without building entries |
+| the index | `bench/keys/fp/layers.py` | state (layers, cut, generations, publication sequence, garbage, pins, attempts); the writer (lookup at the head, then the delta); upkeep (tiers, base, reader bound, cut); readers (cursor walk with 1 MB windows, lookups by the stream-or-seek rule, sliced full scans); publication, pins, garbage and orphan collection |
+| harness | `bench/keys/views/viewbench.py --index layers` | W53's trace generation unchanged; the layers class has its interface (commit, upkeep, stored, save, built, and the reads) |
+| forced base merge | `bench/keys/fp/rebase.py` | the shape after a base merge, which 12,000 commits at 100M never reach |
+| tests | `bench/keys/fp/test_layers.py`, `cargo test layers` | below |
+
+Deviations from the design, all deliberate for a prototype:
+
+- **No Bloom filters.** The harness's readers are cold, and a cold reader
+  would not use them (query form 1). A held filter is a later option.
+- **Merges hold their inputs in memory** (whole files read, then merged as
+  streams). At 100M a base merge holds ~1 GB of input. A product merge
+  would stream by key range.
+- **One engine.** The harness runs a single engine; the zombie, pin and
+  attempt rules are exercised by tests, not by the build.
+- **The stalled pass has no pinned snapshot** (`pinned` is skipped): the
+  design reads only at heads. Its catch-up is measured.
+
+### Correctness
+
+- **The per-commit fold, at 1M, under caps** (four builds in parallel, each
+  one core and 2 GB; `viewbench.py --index layers --size 1e6`, 12,000
+  commits): every read of the base, churn, stall and 100-daily-reader
+  scenarios matched the fold key by key, **0 mismatches**: catch-ups 1, 100,
+  360, 8,640 and 10,000 behind, the stalled pass's catch-up, 1K lookups, a
+  write resolution, a 100K page, and three full scans under patterns
+  (`*4242*`, `*template*`, `cust-00042*`).
+- **Random histories** (`test_layers.py`): 200 histories of 160 commits
+  with merges under a moving cut, every Δ(P, H) from the cut to the head
+  and P = −∞ paged with random limits, and random lookups, against the
+  fold; layer side parts, the graveyard, indexed parts and straddled layers
+  all occur.
+- **Globs** against Solera's own matcher (`glob_regex`): 600 random globs of
+  `a`, `b`, `/`, `*`, `?`, `**`, `**/` over random keys, plus A25's two
+  counterexamples.
+- **A17's lifecycle checklist, where it applies**, each a test:
+  - publication refuses replaced inputs and another life;
+  - files a pin holds outlive the merge that replaced them, and are
+    deleted after the unpin;
+  - a fenced engine's collector deletes nothing (its barrier fails), and
+    its orphan collector spares a newer epoch's outputs;
+  - attempts are counted in the state, so a successor sees a failing input
+    set stopped after three;
+  - a P below the cut fails loudly (`CutError`).
+
+PHASE2_MEASUREMENTS
+
+### Running it (for W53)
+
+```bash
+git fetch && git checkout design/key-index-fp     # REVISION
+uv sync --all-extras                              # builds solera._native, layers.rs included
+uv run pytest bench/keys/fp/test_layers.py -q     # 9 tests, ~10 s
+(cd native && cargo test --release --lib layers)  # 3 tests
+
+# Builds: the baseline's traces, call for call (seed 11). Same flags as spans
+# and two views, plus --index layers; no --codec/--block-size (zstd-1, 16 KiB).
+bench/keys/views/run.sh 1m-layers-base     --index layers --size 1e6 --scenario base
+bench/keys/views/run.sh 1m-layers-daily100 --index layers --size 1e6 --scenario daily100
+bench/keys/views/run.sh 1m-layers-stall    --index layers --size 1e6 --scenario stall
+bench/keys/views/run.sh 1m-layers-churn    --index layers --size 1e6 --scenario churn
+bench/keys/views/run.sh 1m-layers-large    --index layers --size 1e6 --large 1000000 --large-every 3000
+bench/keys/views/run.sh 100m-layers-base   --index layers --size 1e8 --scenario base
+
+# The steady shape at 100M (a base merge forced at the end), then its reads:
+uv run python bench/keys/fp/rebase.py /tmp/viewbench/layers-base-100000000-12000-0x0-zlib-64k-h0 \
+    /tmp/viewbench/layers-base-100000000-12000-0x0-zlib-64k-h0-rebased
+uv run python bench/keys/views/viewbench.py --reads /tmp/viewbench/layers-base-100000000-12000-0x0-zlib-64k-h0-rebased
+
+# What the churn split saves: the churn build's reads with every side part read
+LAYERS_SIDE=always uv run python bench/keys/views/viewbench.py --reads /tmp/viewbench/layers-churn-1000000-12000-0x0-zlib-64k-h0
+
+bench/keys/views/final_reads.sh                   # cold readers alone, one build at a time
+python3 bench/keys/views/report.py                # tables and dollars
+```
+
+Notes for the campaign:
+
+- The reads add three full scans for layers (`scan *4242*`, `scan
+  *template*`, `scan cust-00042*`); the baselines have no equivalent.
+- A full scan decodes its slices on up to 4 threads (`scan_all(parallel=4)`);
+  everything else is one thread. `run.sh`'s `RAYON_NUM_THREADS` does not
+  apply (no rayon here).
+- The build directory names carry `zlib-64k` from the harness's defaults;
+  layers ignore them.
+- Build times on the server (loaded, one core each): ~36 minutes at 1M.
