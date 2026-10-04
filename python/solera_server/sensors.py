@@ -208,6 +208,15 @@ class Sensors:
             claim["deciding"].set_result(None)
 
     async def _apply_tick(self, name: str, claim: dict, outcome: dict) -> dict:
+        sources = [c["source"] for c in outcome.get("commits") or []]
+        if not sources:
+            return await self._apply(name, claim, outcome)
+        # The deltas it prepares are named by nothing until recorded: their indexes
+        # are held as read meanwhile, so the orphan collector leaves them be.
+        with self.m.reading(*(self.m.index(s, "").prefix for s in sources)):
+            return await self._apply(name, claim, outcome)
+
+    async def _apply(self, name: str, claim: dict, outcome: dict) -> dict:
         sensor = self._sensors()[name]
         commits, runs = outcome.get("commits") or [], outcome.get("runs") or []
         sources = [c["source"] for c in commits]

@@ -146,9 +146,7 @@ def _delta(keys: dict, generation: int | None) -> DeltaFiles:
 def _delta_files(entries) -> frozenset[str]:
     """The index files clean up entries of kind `delta` read."""
 
-    return frozenset(
-        f"{d['prefix']}{name}" for d in entries if d["kind"] == "delta" for name in d["files"]
-    )
+    return frozenset(f"{d['prefix']}{name}" for d in entries if d["kind"] == "delta" for name in d["files"])
 
 
 class Model:
@@ -1172,7 +1170,9 @@ class Model:
                 # their intent files are no longer needed.
                 index = self.index(name, partition)
                 for intent in self.repairs.pop((name, partition), ()):
-                    self.garbage.extend([index.path(name), self.event_counter] for name in delta_names(intent))
+                    self.garbage.extend(
+                        [index.path(name), self.event_counter] for name in delta_names(intent)
+                    )
         record = self._partition(asset, partition)
         for field in ("definition", "config", "context"):  # what it was made under: staleness compares
             if field in commit:
@@ -1466,11 +1466,8 @@ class Model:
                     "kind": "abandoned",
                     "attempt": attempt,
                     "generation": launched["generation"],
-                    "commit_number": info.get("commit_number"),
                     "after": after,
                 }
-                if info.get("prefix") is not None:
-                    entry["prefix"] = info["prefix"]
                 self._collect(name, partition, entry)
 
     def _cleaned_up(self, partition: str, e: dict, prepared: dict | None = None) -> None:
@@ -1495,11 +1492,7 @@ class Model:
                             output: [*((e.get("cleanup_unresolved") or {}).get(output) or ()), *silent],
                         },
                     }
-        named = set()  # the index-side files the acknowledged entries read: only those become garbage
         for output, done in (e.get("cleaned_up") or {}).items():
-            for d in self.cleanups.get((output, partition), []):
-                if d["id"] in done and d["kind"] == "abandoned" and "prefix" in d:
-                    named.add(f"{d['prefix']}{int(d['commit_number']):012d}-{d['attempt']}")
             self._drop_cleanups(output, partition, done)
         for output, missed in (e.get("cleanup_unresolved") or {}).items():
             for d in self.cleanups.get((output, partition), []):
@@ -1507,9 +1500,6 @@ class Model:
                     d["misses"] = d.get("misses", 0) + 1
                     if d["misses"] >= STUCK_AFTER:
                         d["stuck"] = True
-        for path in e.get("cleaned_files") or ():
-            if path in named or any(path.startswith(stem) for stem in named):
-                self.garbage.append([path, self.event_counter])
 
     def _on_RepairRunSubmitted(self, e):
         """The repair clock ran a partition again for its repair: its intents count
@@ -1616,6 +1606,13 @@ class Model:
         index = self.indexes.get(key)
         if index is not None and index.life == e["life"]:
             self.indexes[key] = index.with_cut(int(e["cut"]))
+
+    def _on_OrphansFound(self, e):
+        """Index files nothing names (`Upkeep.collect_orphans`): garbage now,
+        deleted once no pin predates this event."""
+
+        known = {g[0] for g in self.garbage}
+        self.garbage.extend([p, self.event_counter] for p in e["paths"] if p not in known)
 
     def _on_FilesCleanedUp(self, e):
         gone = set(e["paths"])

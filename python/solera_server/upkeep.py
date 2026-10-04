@@ -23,7 +23,7 @@ import logging
 import math
 
 from solera.keys.io import ObjectIO
-from solera.keys.layers import LayerIndex, LayerState, epoch_of
+from solera.keys.layers import LayerIndex, LayerState, delta_names, epoch_of
 from solera.tasks import Tasks
 
 from . import history
@@ -37,15 +37,19 @@ MERGE_ATTEMPTS = 3  # attempts per input set before merging an index stops, alar
 ORPHAN_SECONDS = 600.0
 
 
-def _span_of(path: str) -> tuple[int, int] | None:
-    """The commits a merge output's name says it covers: `…/l{a}-{b}-e…`."""
+def _attempt_of(name: str) -> str | None:
+    """The attempt a commit's delta file names (`{commit:012d}-{attempt}-{n}.lay`,
+    `{commit:012d}-{attempt}.lix`), or None: not a delta's."""
 
-    name = path.rsplit("/", 1)[-1]
-    try:
-        a, b = name[1:].split("-", 2)[:2]
-        return int(a), int(b)
-    except ValueError:
+    stem, _, ext = name.rpartition(".")
+    parts = stem.split("-")
+    if ext == "lay" and len(parts) == 3 and parts[2].isdigit():
+        commit, attempt = parts[0], parts[1]
+    elif ext == "lix" and len(parts) == 2:
+        commit, attempt = parts
+    else:
         return None
+    return attempt if len(commit) == 12 and commit.isdigit() and attempt else None
 
 
 class Upkeep:
@@ -242,55 +246,61 @@ class Upkeep:
             self.keys.retired(due)
 
     async def collect_orphans(self) -> None:
-        """Every `ORPHAN_SECONDS`, delete the merge outputs nothing names
-        (docs/key-index-design.md § Lifecycles): no index's current layers,
-        no file let go of and still awaiting its readers, no pending cleanup,
-        and no merge running here — of this engine's epoch or an earlier one,
-        never a later one's (a takeover: the engine that fenced this one).
-        A merge output's name carries its index's life and its engine's epoch
-        (`{life}/l{a}-{b}-e{epoch}-{id}…`); a commit's delta is not one: a
-        dead attempt's are its repair intent's."""
+        """Every `ORPHAN_SECONDS`, find the index files nothing names
+        (docs/key-index-design.md § Lifecycles) and record them as garbage
+        (`OrphansFound`): deleted like any garbage, after a journal write — a
+        fenced engine's fails, and it deletes nothing — and past every pin.
+        Nothing names a file when no index's layers, garbage, pending cleanup
+        or repair intent does, and:
+
+        - a merge output (`{life}/l{a}-{b}-e{epoch}-{id}…`): of this engine's
+          epoch or an earlier one, never a later one's (a takeover), and no
+          merge running here writes it;
+        - a commit's delta (`{commit}-{attempt}-{n}.lay`): its attempt holds
+          no claim (it ended without committing), and no reader here holds
+          its index (a source commit resolving)."""
 
         now = self.clock()
         if now - self._orphans_at < ORPHAN_SECONDS:
             return
         self._orphans_at = now
         listed = await self.state.list_objects("keys/")
-        # Judged after the listing, with no await before the delete: a merge of
+        # Judged after the listing, with no await before the record: a merge of
         # this engine's that published meanwhile is named, one still running is.
-        named = {index.path(n) for index in self.m.indexes.values() for n in index.referenced()}
-        named |= {path for path, _ in self.m.garbage} | set(self.m.cleanup_reads())
-        running = {
-            f"{self.m.indexes[key].prefix}{self.m.indexes[key].life}/l{min(ids)}"
-            for (key, _), ids in self._running()
-            if key in self.m.indexes
-        }
-        own, orphans = self.state.journal.epoch, []
+        m = self.m
+        named = {index.path(n) for index in m.indexes.values() for n in index.referenced()}
+        named |= {path for path, _ in m.garbage} | set(m.cleanup_reads())
+        for key, intents in m.repairs.items():
+            index = m.indexes.get(key)
+            if index is not None:
+                named |= {index.path(n) for intent in intents for n in delta_names(intent)}
+        own, running = self.state.journal.epoch, set()
+        for (key, _), ids in self._running():
+            index = m.indexes.get(key)
+            held = [x for x in index.layers if x.id in ids] if index is not None else []
+            if held:
+                running.add(f"{index.prefix}{index.life}/l{held[0].a:012d}-{held[-1].b:012d}-e{own}-")
+        claimed = {c.get("attempt") for c in m.claims.values()}
+        read = [prefixes for _, prefixes in m.readers.values()]
+        orphans = []
         for path in listed:
-            epoch = epoch_of(path)
-            if epoch is None or path in named or epoch > own:
+            if path in named:
                 continue
-            if any(path.startswith(r.rsplit("/l", 1)[0] + "/l") and _span_of(path) in self._spans() for r in running):
+            epoch = epoch_of(path)
+            if epoch is not None:
+                if epoch <= own and not any(path.startswith(r) for r in running):
+                    orphans.append(path)
+                continue
+            prefix, name = path.rsplit("/", 1)
+            attempt = _attempt_of(name)
+            if attempt is None or attempt in claimed:
+                continue
+            if any(ps is None or f"{prefix}/" in ps for ps in read):
                 continue
             orphans.append(path)
         if orphans:
-            log.info("deleting %d orphaned merge outputs", len(orphans))
-            await self._delete(orphans)
-            if self.keys is not None:
-                self.keys.retired(orphans)
-
-    def _spans(self) -> set[tuple[int, int]]:
-        """The commits each merge running here covers."""
-
-        out = set()
-        for (key, _), ids in self._running():
-            index = self.m.indexes.get(key)
-            if index is None:
-                continue
-            held = [x for x in index.layers if x.id in ids]
-            if held:
-                out.add((held[0].a, held[-1].b))
-        return out
+            log.info("found %d orphaned index files", len(orphans))
+            self.state.record({"type": "OrphansFound", "paths": orphans})
 
     def _running(self):
         """The merges running here: `((index key, lane), input layer ids)`."""

@@ -534,8 +534,6 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
         for field in ("cleaned_up", "cleanup_unresolved"):  # cleanup (§9.8)
             if worker.get(field):
                 event[field] = current_names(prepared, worker[field])
-        if worker.get("cleaned_files"):
-            event["cleaned_files"] = worker["cleaned_files"]
         if worker.get("read"):
             event["read"] = worker["read"]  # what its inputs' reads saw, for lineage
         if keys:
@@ -1618,14 +1616,17 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
         for an unkeyed source. `by` says where the commit came from."""
 
         head = self.m.heads.get((name, ""))
-        event, ref = await self._prepare_commit(name, version, keys, upsert, remove, by)
-        if event is None:
-            return {"changed": False, "ref": ref}
-        if commit_of(self.m.heads.get((name, ""))) != commit_of(head):
-            await self._drop_prepared([event])
-            raise Conflict(f"source {name!r} moved while committing; retry")
-        event["at"] = self.clock()
-        self.state.record(event)
+        # Its delta is named by nothing until recorded: its index is held as read
+        # meanwhile, so the orphan collector leaves it be.
+        with self.m.reading(self.m.index(name, "").prefix):
+            event, ref = await self._prepare_commit(name, version, keys, upsert, remove, by)
+            if event is None:
+                return {"changed": False, "ref": ref}
+            if commit_of(self.m.heads.get((name, ""))) != commit_of(head):
+                await self._drop_prepared([event])
+                raise Conflict(f"source {name!r} moved while committing; retry")
+            event["at"] = self.clock()
+            self.state.record(event)
         self._committed_keys([event])
         return {"changed": True, "ref": ref, "run": event["run"]["id"]}
 
