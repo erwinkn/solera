@@ -40,7 +40,7 @@ Most of the 445 MB is the tail of every file — its filters — fetched again
 on every commit to answer a question about 1,000 keys. A warm worker
 removes the requests but still decodes a 64 KB block per lookup, and only
 `Local` placements and workers with a volume can be warm. The engine sees
-every index file come into existence: it writes compaction outputs and
+every index file come into existence: it writes merge outputs and
 commits every delta. Index files are immutable, so a copy it keeps is
 never stale. The question this design must answer by measurement is how
 much a warm engine beats both rows above, not only the first. It does
@@ -277,11 +277,11 @@ filters, so `added` and `removed` are exact (and so, since exact writes,
 does every resolver: `key-index-design.md`).
 
 **Which snapshot.** While an attempt is live it holds its claim: no
-other commit can change that index, and compaction changes its files but
+other commit can change that index, and a merge changes its files but
 not its content. The engine therefore resolves
 against the file set it currently holds for that partition, once validation
 passed, and pins that file set before any asynchronous work (§5); the
-content is the pinned snapshot's even if compaction swapped files since
+content is the pinned snapshot's even if a merge swapped files since
 prepare.
 
 **Mixed attempts.** Each output is independent: one may be resolved by
@@ -304,7 +304,7 @@ are §6's:
 | `resolve_max_decoded` | 64 MB | a run decoded: its index, its decompressed blocks, its keys and versions — one budget |
 | `resolve_max_entries` | 2M physical entries in the snapshot | replacements: the engine merges the run with every entry |
 | `resolve_queue_bytes` | 64 MB of queued payloads | admission; beyond it, `busy` at once |
-| `resolve_concurrency` | 2 | resolves in flight, on their own threads, apart from compaction's |
+| `resolve_concurrency` | 2 | resolves in flight, on their own threads, apart from merges' |
 
 The worker sends a patch only under `resolve_max_keys` and a replacement
 only when the pinned count plus its run is under `resolve_max_entries`;
@@ -332,16 +332,16 @@ the engine checks again.
 | Worker dies after the response, before the gate | Nothing to clean on the engine; the uploaded delta is the worker's and is cleaned up at attempt end as today |
 | Worker dies after the gate | Repair intents and repair (fenced); nothing for immutable stores |
 | Attempt canceled while a resolve runs | By the cancel record (`lifecycle.md` §2.2): a draining attempt still resolves; once the record is `forced`, or the attempt ended, a resolve checks that when it starts and between chunks, and stops, releasing its pins |
-| Compaction commits during a resolve | The resolve keeps the file set it pinned; garbage collection waits for the pin |
+| A merge publishes during a resolve | The resolve keeps the file set it pinned; garbage collection waits for the pin |
 | A second worker of the attempt | `409`: the engine admits one worker (lifecycle §4) |
 | Local copy corrupt | Dropped, refetched from S3 and rebuilt; the request is declined `cold` meanwhile |
 
 ## 5. The engine cache
 
 One cache serves every reader on the engine: resolves, input reads at `start`,
-compaction (which reads what it just wrote), recounts, and the per-key
+span merges (which read what the cache just installed), and the per-key
 readers (§8). It runs on maintenance threads, never on the engine's event
-loop. A compaction or a recount of an index the cache holds warm pins its
+loop. A merge of an index the cache holds warm pins its
 local copies and streams them (`Job.local`), reading nothing from the
 store; otherwise, or if a copy fails its check mid-way, it reads the
 store. Any reader of local copies — a resolve, a start read, maintenance —
@@ -355,7 +355,7 @@ never reused, so an entry is never stale, only evicted. An index is
 
 **Identity of a file.** `FileInfo` gains `digest`: the XXH3-128 of the
 file's bytes, computed by whoever writes it (the worker for deltas, the
-engine for compaction outputs) and recorded with the file in the commit.
+engine for merge outputs) and recorded with the file in the commit.
 The cache checks a fill against it, and candidates (below) are matched by
 it.
 
@@ -403,9 +403,10 @@ read fails with `corrupt`.
 **Budgets, separate:**
 
 - `cache_disk` (default 16 GB): local files, candidates, temporary files
-  and reservations. A 100M-key index in steady state holds ~125M physical
-  entries across its levels — not 100M — at ~40 B decompressed: ~5 GB
-  (estimated from the steady-state level sizes).
+  and reservations. A 100M-key index holds more physical entries than
+  live keys — the versions its spans keep for live endpoints, and what
+  later spans shadow: ~125M at 100M on the leveled index this replaced, at
+  ~40 B decompressed: ~5 GB.
 - memory: directories of every local file (~0.01 B per entry: ~1.3 MB
   at 100M). Blocks are read through the
   OS page cache — no block LRU of our own; §9 measures both warmths.
@@ -414,7 +415,7 @@ read fails with `corrupt`.
 **Pins.** A reader pins the file set it reads; eviction skips pinned
 files. A reader that fetches from S3 is also a reader pin in the garbage
 order of `object-store-state.md` (pins and deletions by event counter),
-so compaction cannot delete a file under a fill.
+so a merge cannot delete a file under a fill.
 
 **Reservations.** Every operation that adds bytes reserves them first,
 against `cache_disk`:
@@ -422,12 +423,12 @@ against `cache_disk`:
 | Operation | Reserves | Released |
 |---|---|---|
 | fill of a file | its local size: what it built to before, else estimated from its compressed data | when installed, or when the fill fails or is canceled (its temporary file deleted) |
-| compaction | its outputs' estimated size, while readers still have its inputs open | when the outputs are installed and the inputs closed and evicted |
+| merge | its outputs' estimated size, while readers still have its inputs open | when the outputs are installed and the inputs closed and evicted |
 | candidate | its delta's decompressed size (below) | when installed, dropped or evicted |
 
 A reservation that cannot be met evicts first (below). If eviction cannot
 make room, the operation runs without the cache: a fill is not started; a
-compaction installs nothing, and its index is **demoted** — marked cold,
+merge installs nothing, and its index is **demoted** — marked cold,
 its files evictable like an inactive index's — so its writers decline
 `cold` until it is admitted again.
 
@@ -441,7 +442,7 @@ next commit is warm.
 
 **Write-through.** The engine does not read back what it produced or saw:
 
-- compaction outputs are installed from the bytes the engine has in hand;
+- merge outputs are installed from the bytes the engine has in hand;
   waiting to be built they hold those bytes, so at most 128 MB of them
   wait: past that, one is skipped and its index demoted, and a fill
   fetches it once there is room;
@@ -471,15 +472,15 @@ LRU: every commit evicts the other index and refills its own — 5 GB of GETs pe
 So the cache admits by index and evicts by file, with hysteresis:
 
 - An index is **admitted** when its snapshot, plus a reservation for one
-  compaction's overlap (its largest level's size), fits beside the indexes
+  merge's output (the largest span's size), fits beside the indexes
   **active** within `cache_window` (15 minutes) — those that served a
   reader in that window. Otherwise it stays cold: its writers resolve
   locally, without thrash.
 - Eviction order: candidates past their budget, then files of inactive or
   demoted indexes (least recently used), then superseded files (inputs of
-  a finished compaction, no longer open). Never open files, never files of an
+  a published merge, no longer open). Never open files, never files of an
   active index.
-- An admitted index whose new snapshot no longer fits after a compaction
+- An admitted index whose new snapshot no longer fits after a merge
   or growth is demoted, as above, and re-admitted under the same rule.
   Admission counts a file at the size its local form built to once one
   was built, so a file shown not to fit is not fetched again until the
@@ -502,14 +503,14 @@ replaces them.
 **Sparse reader**, for small patches — today's filtered path minus the
 planner:
 
-1. read every level small enough (≤ 32 MB) and every level-0 file whole,
-   all at once, and resolve newest first;
-2. for the larger levels, read the tails of the files whose key range
+1. read every span small enough (≤ 32 MB) whole, all at once, and
+   resolve newest first;
+2. for the larger spans, read the tails of the files whose key range
    covers a written key, all at once;
 3. classify each key with the filters: absent (no key filter matched), or
    maybe;
 4. read the blocks of the maybe keys, only in files whose key filter
-   matched, all levels at once; each key takes its newest entry.
+   matched, all spans at once; each key takes its newest entry.
 
 **Its contract:** the delta and the count are exact, and every written key
 that was live names its predecessor (exact writes, `key-index-design.md`).
@@ -525,45 +526,22 @@ the engine's warm cache answers instead whenever it holds the index.
 
 **Predecessors of immutable outputs.** An immutable store collects a
 superseded object by name, `{key}/{generation}`, so someone must learn
-each changed or deleted key's previous generation. The filter shortcut
-cannot: for a write of `k` it knows that `k` is live, not whether it was
-`k/17` or `k/93`. The design uses two triggers, each with one rule:
-
-- **At resolution, whenever the old entry was read.** The delta names
-  the predecessor of every changed or deleted key whose resolution read
-  its old entry: always on the engine, always in the streaming merge-join,
-  and for the sparse reader's maybe keys. The commit's data-garbage entry
-  collects those names once no reader pins them (`lifecycle.md` §9.8).
-- **At compaction, for the rest.** A key the filters counted live has no
-  named predecessor, but its old entry is still in the index, shadowed.
-  Every merge that drops a shadowed entry — or the entry under a
-  tombstone at the bottom level — emits that entry's `(key, generation)`
-  as cleanup at the compaction's event counter, under the
-  same reader-pin rule. Compaction emits every entry it drops, named
-  before or not: names are never reused, so cleaning up a name twice is a
-  no-op (`cleanup` ignores missing names), and no "already collected" bit
-  has to survive compaction.
-
-The alternatives, priced at 100M keys, 1K random changes per commit:
-
-| Choice | Cold sparse path | Collection |
-|---|---|---|
-| exact predecessors only, at resolution | the filters no longer decide: ~1.25 block reads per changed key, ~1,300 GETs instead of ~50, ~$0.0005 per commit | prompt |
-| deferred only, at compaction | ~50 GETs | every superseded object waits until its new entry merges over the old one — for random keys mostly at the bottom level, so ~20% of keys (the upper levels' share in steady state) keep a second object, hours to days |
-| **both (chosen)** | ~50 GETs | prompt wherever the old entry was read (warm and streaming: every key); deferred only for keys the cold path's filters cleared |
-
-An index over the cache budget takes the cold path on every commit, so
-the first row would cost scenario E ~$130 a month; the second gives up
-prompt collection that the warm path gets for free. Outputs on `fenced`
-stores carry generations too but collect nothing by them.
+each changed or deleted key's previous generation. Writes are exact, so
+one rule covers it: the delta names the predecessor of every changed or
+deleted key, on the engine, in the streaming merge-join and in the sparse
+reader alike, and the commit's data-garbage entry collects those names
+once no reader pins them (`lifecycle.md` §9.8). A merge needs no cleanup
+of its own: every version it drops was named by the delta that replaced
+it. Before exact writes, a key the filters counted live had no named
+predecessor and its old entry was emitted when compaction dropped it;
+exact writes cost ~1,300 GETs instead of ~50 for 1K random changes on a
+cold 100M-key index, and made that second path unnecessary.
 
 **Streaming merge-join**, for replacements and dense patches: the native
-job that full replacement, compaction and recount already use, extended to
-patches — it streams every level in 8 MB segments, merges them with the
-sorted run, and emits the delta as it goes. Measured for a recount of a
-fresh 100M index (one level): 2.4 GB in 371 GETs, 14.1 s. A steady-state
-snapshot (~3.4 GB over three levels) and a patch merge are not measured
-yet; the patch merge adds a lookup per run key to the recount's work.
+job full replacement uses, extended to patches — it streams every span in
+8 MB segments, merges them with the sorted run, and emits the delta as it
+goes. Measured on the leveled index, streaming a fresh 100M index (one
+level): 2.4 GB in 371 GETs, 14.1 s.
 
 The sparse reader, this join and the engine's cache (§5) decide each key
 by one rule (`native/src/delta.rs`): what the index holds — absent, live
@@ -582,8 +560,9 @@ physical snapshot size and distinct block reads:
   stream instead. The tails already read are not repeated: streaming reads
   index parts and data segments.
 
-Both constants come from one grid (`bench/keys/bench.py --suites
-crossover,steady`, `bench/keys/results.md`): indexes of 1M, 10M and 100M
+Both constants come from one grid, measured on the leveled index that
+spans replaced (`bench/keys/bench.py --suites crossover,steady`, at commit
+`0d09fc4`; `bench/keys/results.md`): indexes of 1M, 10M and 100M
 keys, fresh and in steady state; patches of 1K–1M keys with 0%, 50% and
 100% rewritten unchanged; each route forced. The objective is wall time,
 with requests tipping close calls toward streaming, which issues an order
@@ -657,10 +636,10 @@ request per step: `start` for reads, `resolve` before writing.
   nothing, and a delta pass's batch is answered at `start` when its index is warm —
   an index refused admission is read from the store, small deltas
   included.
-- **Delta files stay while logged.** A delta pass reads delta files
-  that compaction has merged out of the levels; the cache retires a delta
-  only when collection deletes it, so a warm index answers its delta passes
-  locally, and a fill fetches its logged deltas too.
+- **A delta pass reads the spans.** `changes(P → N)` reads the spans
+  overlapping the range — local copies of the same files a full pass reads
+  — so a warm index answers its delta passes locally, with nothing kept
+  beside its current spans.
 
 ## 8. Readers for per-key processing
 
@@ -701,7 +680,7 @@ month, steady state, per commit:
 | Worker index GETs | 50 | 0 |
 | Worker index PUTs | 1 (delta) | 1 (delta) |
 | Engine index GETs | 0 | 0 (write-through; an evicted candidate costs 1) |
-| Compaction (simulated, `amplification.py`) | 1.18 GET + 0.144 PUT | same |
+| Compaction (simulated, `amplification.py`, leveled; at `0d09fc4`) | 1.18 GET + 0.144 PUT | same |
 | GET-equivalents | **65.5** | **15.5** |
 | Key index requests / month | $6.79 | **$1.60** |
 
@@ -716,16 +695,15 @@ to re-estimate, not this one's.
   GETs and ~3.4 GB at 100M in steady state (projected from the snapshot
   size; the measured streaming read is the fresh index's 371 GETs and
   2.4 GB).
-- **The cold path when declined.** Today's figures: ~50 GETs per 1K-key
-  commit at 100M, immutable outputs included, since predecessors the
-  filters skip are collected at compaction (§6); a streaming patch reads
-  the snapshot.
+- **The cold path when declined.** ~1,300 GETs per 1K-key commit of
+  random updates at 100M, since writes are exact (§6: ~50 before); a
+  streaming patch reads the snapshot.
 - **Generations and predecessors.** A varint generation per entry, and a
-  predecessor generation per changed key in deltas until compaction drops
-  it: 8 B per entry in all at 10M random ids without payloads, 26 B with
-  16-byte versions (`bench/keys/results.md`). Cleanups are DELETEs, free on S3, batched
-  by 1,000; keys collected at commit are cleaned up a second time, as a
-  no-op, when compaction drops their old entry.
+  predecessor generation per changed key, kept on a key's oldest version
+  in a span and dropped by merges into the base: 8 B per entry in all at
+  10M random ids without payloads, 26 B with 16-byte versions
+  (`bench/keys/results.md`). Cleanups are DELETEs, free on S3, batched
+  by 1,000.
 - **Network.** Requests and responses are ~40 KB and ~27 KB per 1K-key
   commit. Within one availability zone that is free; across zones EC2
   charges per GB in each direction (about $0.01/GB each way at today's
@@ -754,7 +732,7 @@ reports both.
 - **Equivalence.** Engine-resolved and locally resolved deltas decode to
   the same entries (compressed bytes may differ); engine counts equal an
   oracle's exact counts, on every path. Over random patches, removes,
-  replacements, repairs and compactions between prepare and resolve.
+  replacements, repairs and merges between prepare and resolve.
 - **Repair.** The `a=1 → a=2 → a=1` sequence rewrites the store with an
   empty delta; a replacement with repair intents rewrites the partition;
   "unchanged" only without intents; for a fenced store, an older writer's
@@ -770,14 +748,12 @@ reports both.
   reopen after a restart; a corrupted source fails `corrupt`; a candidate
   is installed without a GET at commit, and an evicted one costs one GET;
   fills are deduplicated; failed and canceled fills release their
-  reservations; a compaction that cannot reserve demotes its index;
+  reservations; a merge that cannot reserve demotes its index;
   open files survive eviction and garbage collection.
 - **Generations.** Resolver deltas, cold deltas, recorded reads and `Keys`
   carry generations; every superseded object of an immutable output is
-  cleaned up — by its commit when the old entry was read, by the
-  compaction that drops it otherwise, including keys the filters counted
-  live and keys deleted at the bottom level — and none while a reader
-  pins it; a second cleanup is a no-op.
+  cleaned up by the commit that superseded it (writes are exact), and
+  none while a reader pins it; a second cleanup is a no-op.
 - **Unknown writes.** A dead opaque writer that deleted `a` and inserted
   `b`: the next patch acquires, reads the store's key map, reconciles both
   keys and only then clears the intent; a replacement overwrites instead.
@@ -825,7 +801,7 @@ The follow-up review agrees with all three.
    `resolve_max_keys`, `resolve_max_entries` and `resolve_timeout` still
    come from the warm grid; the absolute caps stay regardless.
 2. **Engine capacity.** No rate threshold is credible before the local
-   form is measured. Resolves, retry batches and compaction have separate
+   form is measured. Resolves, retry batches and merges have separate
    threads; if offloading becomes necessary, the cache and all its readers
    move together into `engine_executor` (`object-store-state.md` §6),
    rather than a second cache-owning service.
@@ -835,7 +811,7 @@ The follow-up review agrees with all three.
 4. **With `lifecycle.md`:** settled there — the route (§5.1),
    `Store.acquire` (§9.7), and failure deltas staying out of the gate's
    intents (§9.6); sensors (§11 there) need no attempt validation. Its
-   §9.8 collection gains the compaction trigger of §6 here.
+   §9.8 collection follows §6 here: every predecessor named at resolution.
 
 ## 14. As built
 

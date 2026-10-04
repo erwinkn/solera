@@ -1,5 +1,12 @@
 # K0 benchmark results
 
+Measured on the leveled index that spans replaced (`key-index-design.md`):
+the sections from `bench.py`, `warm.py`, `bulk.py`, `amplification.py`,
+`f16.py` and `pending.py` — retired with levels — run at commit `0d09fc4`.
+The span replays (`spans.py`, `adversarial.py`, `retention.py`,
+`tiling.py`) are in this directory; their numbers are in
+`key-index-design.md`.
+
 Local MinIO with injected S3-like latency; reproduce with `uv run python bench/keys/bench.py --sizes 1e6,1e7,1e8 --latency 0.03` (a MinIO at 127.0.0.1:9100, see the script). Machine: 8 cores, native extension, 2026-09-23.
 ### Key index benchmark (native, 30 ms per request, 80 MB/s per connection, 64 in parallel)
 

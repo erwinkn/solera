@@ -621,7 +621,7 @@ key's generation in the pinned upstream index — and arrives with the
 delta pass instead, so it is processed once, at its new generation.
 
 **Bounds.** State is constant per partition. A systemic failure of 1M keys is a
-1M-entry index on the object store, compacted like any other. Each batch
+1M-entry index on the object store, merged like any other. Each batch
 does O(`batch_size`) lookups and O(`batch_size`) bound updates; nothing
 rescans the index per commit. Its recovery — a deploy that fixes the bug,
 or `solera retry --failed` — is a pass in batches on workers, off the engine's
@@ -918,7 +918,7 @@ is below the current one.
   adds readers, not a cache.
 - Observable sources are sugar for sensors (`lifecycle.md` §11): no
   launch path, result route or retention class of their own.
-- The failed keys are an ordinary key index: format, compaction, cache,
+- The failed keys are an ordinary key index: format, merges, cache,
   delta naming, garbage collection — none new.
 - Indexes count keys, not rows: a file of 40 samples is one entry.
 - Per-key progress and key-tagged logs are live events on the HTTP
@@ -958,7 +958,7 @@ is below the current one.
 
 | Work | What this proposal needs from it |
 |---|---|
-| Key index (`object-store-state.md` §6) | No format change. A new kind of index (`keys/@{asset}/{partition}/`, the failed keys) compacted like the others; `Rows` groups every key (§6), read once as the prepared write (§7); patches build `Rows`. |
+| Key index (`object-store-state.md` §6) | No format change. A new kind of index (`keys/@{asset}/{partition}/`, the failed keys) merged like the others; `Rows` groups every key (§6), read once as the prepared write (§7); patches build `Rows`. |
 | Engine cache (`resolved-commits.md`) | New readers: retry batches, read at `start`, in v1; pattern counts at commit and failure-summary recomputation later. No new cached content beyond failed keys. |
 | HTTP resolver (`resolved-commits.md`) | per-key batches' output deltas are small resolves when the index is admitted; failure deltas are resolved locally, not by the resolver (§9 here is authoritative for the record, transitions, eligibility, pass state and forced-request identity; the engine's start reads run the same SDK functions, and its v1 has no pattern hints or summary recomputation); the worker uploads both. A sensor's full key map is resolved in-process (small) or on the host (big), not through an attempt's resolve. |
 | Attempt lifecycle (`lifecycle.md`) | The cancel record (§2.2) and write-completion evidence (§2.3), authoritative there; the two-phase cancel of §7, which §5 follows; live per-key events and key-tagged logs; per-key outcomes in the sealed result. Sensors (§11) carry observable sources: `Source.observe` declares one. |
@@ -1131,7 +1131,8 @@ Where the implementation (`solera/errors.py`, `solera/build.py`,
     after the store writes; the result carries that record.
   - A full pass of a per-key input keeps patch semantics: a key that
     fails keeps its last good output. If the asset held keys when the
-    pass began (or the delta log was lost mid-pattern change), the pass
+    pass began (or the boundary it started from was lost mid-pattern
+    change), the pass
     ends with a **cleanup** (`reconcile` on the position): the outputs'
     and failed keys's keys, a batch at a time, against the current
     upstream and patterns; those it no longer has are removed. Retries

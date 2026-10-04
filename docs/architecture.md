@@ -463,7 +463,7 @@ the first upstream commit not yet delivered, and while a pass is under
 way, `pass` `{mode, from, to, at, batch, batches}`: `full` or `delta`, its
 boundary, and its place (the last key delivered, or the next commit),
 all decided when it starts and kept until its last batch. For a keyed
-upstream the spec pins the index and a range — the delta log from `next`
+upstream the spec pins the index and a range — its changes from `next`
 to the head, or the whole index for a full pass — and the worker reads
 one batch of it (`batch_size` keys), loads those keys with `Keys(…)`, and
 reports where the batch ended (`after`); for an unkeyed one the engine plans
@@ -497,7 +497,7 @@ version of each input per partition, not per key. A whole input written
 again, even with the same content, is a new generation, so it does the
 same (`versions.md` §7).
 
-A head written before the output was incremental has no delta log: "no keys
+A head written before the output was incremental has no key index: "no keys
 known"; the consumer's position starts empty and the next write upserts
 everything. A `version` bump is an asset change like any other: the next
 attempt of each partition starts over, and the full pass it begins may be
@@ -517,7 +517,7 @@ partitions = {"site": sites, "day": TimePartitions(start="2024-01-01", every="1d
 |---|---|---|
 | `StaticPartitions([...])` | fixed list | none |
 | `TimePartitions(start, every, *, end=None, end_offset=None, timezone="UTC", format=None)` | half-open windows `[start, start+every)` aligned in `timezone`; `every` is a duration (`"15m"`, `"1h"`, `"1d"`, `"1w"`) or a cron expression for calendar partitions; the set ends at the newest complete window unless `end`/`end_offset` (a duration) say otherwise; `format` is the key's strftime, defaulted from `every`, required for cron | none |
-| a `DynamicPartitions`, or any keyed output or source | `meta.partitions` on the head ref (a dynamic partitions), else the fold of its delta log | its head |
+| a `DynamicPartitions`, or any keyed output or source | `meta.partitions` on the head ref (a dynamic partitions), else its key index | its head |
 
 There is no separate partition-set mechanism. A dynamic set is an asset
 producing a `DynamicPartitions` (with its own inputs, automations and placement); an
@@ -568,7 +568,7 @@ complete one — counts as missing, so `report` is skipped until one exists.
 Without the flag it runs over nothing.
 
 `Incremental` requires no upstream-only dimensions (a broadcast `Incremental`
-diffs the same delta log per consumer key).
+diffs the same changes per consumer key).
 
 **Fan-out.** A run's `partitions` (§8) selects keys from the current set:
 `"latest"`, `"missing"`, `"all"` or a list. `OnChange` automations default
@@ -830,8 +830,8 @@ code.
 
 - `inputs` holds every pin by input name, including `deps`; the manifest
   says which bind parameters. `batch` is what to deliver — for a keyed
-  upstream a range of its pinned key index (the delta log `from`–`to`, or
-  the whole index when `full`), read `limit` keys at a time from `after`; for
+  upstream a range of its pinned key index (its changes over commits
+  `from`–`to`, or the whole index when `full`), read `limit` keys at a time from `after`; for
   an unkeyed one the `[lo, hi]` `Commits` range; a run's `keys=` override
   names its keys outright. `full` marks a reset pass.
 - `outputs` is each output's one launch record: its committed head
@@ -965,7 +965,7 @@ A bare `DataFrame` to a `primary_key` output is replace, not a `Patch`.
 
 **Later** (specified when a workload demands it): `route=` broadcast
 optimization for `Incremental`; checks and conditions (`when=`); `OnRunStatus`;
-trigger composition; delta-log compaction for very long histories; data preview, a read-only SQL
+trigger composition; data preview, a read-only SQL
 page and a DuckDB store (object-store-state.md §13).
 
 **Non-goals:** cycles (DAG only, including self-triggers; loop inside a

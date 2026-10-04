@@ -3,6 +3,19 @@
 Companion to `object-store-state.md` §6. What the engine-owned key index
 costs on S3, per operation and per month, from 1K to 100M keys per index.
 
+**Status: these costs are the leveled index's.** The index is now spans
+tiling commit time, merged under the policy of `key-index-design.md`;
+levels, compaction and the delta log are gone. The per-commit read and
+write costs below still describe the read strategy, which spans kept; the
+compaction rows and the level structure do not. The span index's costs
+are in `key-index-design.md` — replayed on metadata (`bench/keys/spans.py`,
+`retention.py`) and measured on prototype files (`v4bench.py`,
+`catchup.py`, `layouts.py`, on branch
+`bb/key-index-design-first-principles-thr_xvgqnrw2kr` at `42c4b69`).
+They are re-measured over the implementation next, and this document
+then follows. The leveled benches cited here (`bench.py`, `warm.py`,
+`bulk.py`, `amplification.py`) run at commit `0d09fc4`.
+
 The per-operation and per-month tables come from `bench/cost_model/`
 (`model.py` holds the assumptions and formulas; `tables.py` and
 `scenarios.py` print them). They are **estimates**, left at the model's

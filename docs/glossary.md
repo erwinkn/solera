@@ -423,7 +423,7 @@ written by generation 184467.
 
 **commit number**. The n-th commit of an incremental output partition:
 0, 1, 2… with no gaps, since a failed attempt's number goes to its retry.
-The delta log and positions count in it. *Why, beside the generation:*
+Spans and positions count in it. *Why, beside the generation:*
 `site_events` appends rows tagged with their commit number; an attempt
 writes half of commit 42 and dies; its retry writes commit 42 again and
 the store keeps only the retry's, so a reader of commits 40–42 never sees
@@ -434,16 +434,34 @@ listing. *Was:* batch (output side). *Example:* commit 57 of
 
 **key index**. The engine's index of an output partition's keys: per
 key its generation, whether it was removed (a **tombstone**), and its
-version for source keys. A log-structured merge tree of `.kx` files on
-the object store, compacted in the background. Writes are exact: every
-delta entry names its key's predecessor when the key was live, so the
-count is exact and the replaced versions are listed for cleanup.
-*Was:* pair filter, locator (removed by `versions.md`); inexact counts and
-recounts (removed by exact writes, `key-index-design.md`).
+version for source keys. A tiling of commit time by **spans** of `.kx`
+files on the object store, merged in the background
+(`key-index-design.md`). Writes are exact: every delta entry names its
+key's predecessor when the key was live, so the count is exact and the
+replaced versions are listed for cleanup. *Was:* pair filter, locator
+(removed by `versions.md`); inexact counts and recounts (removed by exact
+writes); levels, compaction and the delta log (replaced by spans).
 
 **delta**. The keys one commit changed: upserted and removed, one delta
-file per commit number. The **delta log** is the deltas from the furthest
-position behind to the head.
+file per commit number. Installed as the span `[c, c]`.
+
+**span**. The key-sorted files that hold what commits `[a, b]` changed:
+per key, one version per segment, newest first, with the predecessor on
+the oldest. The spans of an index tile its commits from 0 to the head;
+the one from commit 0 is the **base**. Segments are split at the
+endpoints live when the span was written. *Example:* `site_files`/`alpha`
+holds the base `[0, 812]` and the spans `[813, 840]`, `[841, 841]`.
+
+**endpoint**. A commit a reader starts from or lands at: a position's
+`next`, a pass's `from` and `to + 1`, a pattern change's split + 1, an
+attempt's reads. Merges keep the versions some live endpoint sees, so
+`changes(P → N)` between endpoints reads exactly. A boundary merged away
+while no reader held it is no endpoint: a position there gets a full pass.
+
+**merge**. Upkeep's rewrite of adjacent spans into one, under the merge
+policy, published by `IndexMerged` only if the index is still the
+**life** it was planned against (a reset, move or removal starts another)
+and still holds its inputs. *Was:* compaction, truncation.
 
 **fence**. A newer writer's mark that refuses an older writer's
 writes. A fenced store keeps one per output partition, by generation
@@ -568,7 +586,7 @@ them. *Was:* unsettled.
 **pin**. A reader's hold on the state as of one event counter value:
 nothing let go of after that value is deleted until the reader is done.
 *Example:* an attempt pinned at 184467 loads `site_files`/`alpha`'s key
-index while compaction replaces its `.kx` files; the old files stay until
+index while a merge replaces its `.kx` files; the old files stay until
 the attempt settles. Attempts pin at their claim; multi-batch passes,
 pattern changes, ticks and the engine's own reads pin too. Internal:
 lineage shows what was read, not what was pinned. *Was:* reader floor (the

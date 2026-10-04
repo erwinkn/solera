@@ -204,7 +204,7 @@ uv run python -m tests.sim.determinism --in-process replay.py   # twice in one p
 Each run records every callback the simulation's loop runs and
 schedules, with who scheduled it, labelled by coroutine and line, never
 an address. The report shows the first place the two runs part. A
-compaction's own loop, which runs real threads while the simulation
+merge's own loop, which runs real threads while the simulation
 waits, is not traced: its order does not reach the simulation's.
 
 **Interleavings come from the seed.** asyncio runs ready callbacks in the
@@ -262,7 +262,7 @@ with Hypothesis drawing the inputs (in CI, a few seconds each):
 
 - **The key index format** (`tests/sdk/test_keys_properties.py`): files
   the native extension or the Python reference wrote, the other reads back;
-  lookups, range merges and compactions are newest-wins over a dict; a
+  lookups and range merges are newest-wins over a dict; a
   resolve writes exactly the keys a write changes, with their prior
   generations (`native/src/delta.rs`); sorted entries round-trip. Inputs
   reach the inputs: empty, 600-byte and shared-prefix keys, generations up
@@ -389,9 +389,9 @@ Known gaps, most valuable first; each says what would close it.
   reconnects are not simulated. Closing it: run `run_sensor_host` on the
   simulation's loop with a seeded channel.
 - **Faults in the middle of an executor call.** A call run on a thread
-  (`asyncio.to_thread`: a compaction, a Postgres transaction) runs to its end
+  (`asyncio.to_thread`: a span merge, a Postgres transaction) runs to its end
   at one virtual instant, so no fault, kill or other actor's step falls
-  inside it. A compaction cannot meet a takeover halfway. Closing it: split
+  inside it. A merge cannot meet a takeover halfway. Closing it: split
   the calls the simulation cares about at their object requests.
 - **Migrations** in the simulation: no rule runs `migrate` yet. Nothing
   blocks one since F18's fix; it would run on `pg`.
@@ -402,8 +402,9 @@ Known gaps, most valuable first; each says what would close it.
   simulation does not purge runs within its hours yet, so it cannot
   resume a stale worker after one.
 
-Closed in this round: the key index format, merges, compactions and
-resolves against a dict (property tests, and F16); glob patterns; resolve
+Closed in this round: the key index format, merges and resolves against
+a dict (property tests, and F16; span merges and `changes` at live
+endpoints in `tests/sdk/test_keys_index.py` and `test_keys_spans.py`); glob patterns; resolve
 framing; claims (one attempt per asset partition); the gate under worker
 death, pause and duplicates; rolling deploys with three or more engines;
 per-key errors by class and forced retries; runs with `keys=`; an asset
@@ -1057,7 +1058,7 @@ asset) and comes last.
 | F13 | `items` moved from the table store to FileStore by a crash redeploy; the feed then removes `k11`: `copy` keeps it (F9's territory, the deletion after the move). Also with no crash: `k0`, `k11` committed; a takeover moves `items` from FileStore to the table store; the feed removes both; `copy` and `split`'s `odd` keep them, `checks` drops them | P1 | fixed by the reset rule (object-store-state.md §2): a move resets the output, its consumers re-read it from scratch — `tests/sim/test_replays.py::test_f13_a_key_removed_after_a_store_move_leaves_its_consumers`, `test_f13_a_key_removed_after_a_takeover_moved_its_upstream_leaves_its_consumers`, `tests/server/test_sim_found.py::test_a_key_a_moved_output_dropped_leaves_its_consumer` |
 | F14 | An engine that created its fence finds a checkpoint at or past it and deletes the fence as a hole's, but a newer engine had read it and checkpointed past it: the old engine's next append lands in the freed slot, is acknowledged, and no replay sees it (the segment journal's spec, retired in cfdc723 with its code; three engines, or two with an unreadable checkpoint) | P1 | fixed: the hole test (`object-store-state.md` §10), run by the engine that created the fence — `tests/server/test_journal.py::test_a_fence_a_newer_engine_moved_past_stays` |
 | F15 | A fence created in a hole stays readable until its engine deletes it: another opener replays it in place of the event cleanup deleted, and serves without that acknowledged event (the segment journal's spec, retired in cfdc723 with its code; three engines) | P1 | fixed: the hole test (`object-store-state.md` §10), run by every opener that reads a fence — `tests/server/test_journal.py::test_an_opener_never_replays_a_fence_created_in_a_hole` |
-| F16 | A key index compaction moves level-0 files into an empty level 1 without merging them, so level 1 holds overlapping files and a read takes an older entry: `k0` written (level 1); rewritten (level 0); the output replaced by nothing (a level-0 tombstone); a background compaction that empties the index lands only after `k0`, `k1` are written again (level 0, level 1 now empty); `k1` removed (level 0); the next compaction "moves the deepest level down whole" — level 1 holds `{k0, k1}` and `{k1 removed}` — and `k1` reads live. In the simulation `items` kept a key the feed dropped, kept `k3` at an old value, or named an object already collected (`KeyIndex.compact`: `out_level > depth` also holds for level 0 at depth 0) | P1 | fixed: level 0 is always merged, never moved down whole (its files overlap) — `tests/sdk/test_keys_index.py::test_any_workload_of_a_few_keys_matches_a_dict`, `tests/sim/test_replays.py::test_f16_*` |
+| F16 | A key index compaction moves level-0 files into an empty level 1 without merging them, so level 1 holds overlapping files and a read takes an older entry: `k0` written (level 1); rewritten (level 0); the output replaced by nothing (a level-0 tombstone); a background compaction that empties the index lands only after `k0`, `k1` are written again (level 0, level 1 now empty); `k1` removed (level 0); the next compaction "moves the deepest level down whole" — level 1 holds `{k0, k1}` and `{k1 removed}` — and `k1` reads live. In the simulation `items` kept a key the feed dropped, kept `k3` at an old value, or named an object already collected (`KeyIndex.compact`: `out_level > depth` also holds for level 0 at depth 0) | P1 | fixed: level 0 is always merged, never moved down whole (its files overlap); levels are gone since spans (`key-index-design.md`), and the case stays the explicit example of `tests/sdk/test_keys_index.py::test_any_workload_of_a_few_keys_matches_a_dict`, over span merges — and `tests/sim/test_replays.py::test_f16_*` |
 | F17 | An output moved to another store and back loses keys when nothing moved its position in between: `items` commits `k10` on FileStore; a takeover moves it to the table store, where only a `keys=('k1', 'k10')` run writes (a fresh index there; a selection moves no position, which keeps FileStore's fingerprint); a takeover moves it back; the feed adds `k3`: the fingerprint matches, so `items` reads a delta, and the move starts its index over with `k3` alone — `k10` is gone. A move that starts the index over has to make the asset read a full pass | P1 | fixed by the reset rule (object-store-state.md §2): each move resets the output and takes its asset's positions, so it reads full passes — `tests/sim/test_replays.py::test_f17_an_output_moved_away_and_back_keeps_its_keys`, `tests/server/test_sim_found.py::test_a_move_and_back_with_no_write_between_resets` |
 | F18 | PostgresStore's migration ledger (`public.solera_migrations`) is keyed by output name, not by the table a migration changes: two projects (or a staging and a production namespace) on one database each write `orders` in a schema of their own; migration `note` adds a column to the first's table; the second's `migrate` finds the ledger row, skips it and reports it applied — its table never gets the column | P2 | fixed: the ledger (`solera_migration_ledger`) and its lock are keyed by the schema-qualified table — `tests/sdk/test_postgres.py::test_a_migration_applies_to_each_schemas_table_of_one_name` |
 | F19 | An asset removed while its attempt runs and added back before that attempt ends resumes its first life (F12's rule, across a live attempt): `copy` (version 1) has an attempt running; a deploy removes `copy`, which defers retiring its head and positions until the attempt settles; a deploy adds `copy` back (version 2) — its first life's head and positions are still there; the old attempt then succeeds and its commit installs into the new `copy`: rows written by version 1's code become version 2's head, under version 1's position (found by the execution spec's review; a failed or lost attempt installs nothing, and its run carries on with a fresh attempt of the new code) | P2 | fixed by the reset rule (object-store-state.md §2): a removal resets at its deploy, and an attempt launched before commits nothing — `tests/server/test_sim_found.py::test_a_name_removed_while_its_attempt_runs_and_added_back_starts_over`, `test_an_attempt_of_a_removed_and_readded_asset_stays_in_its_life` |

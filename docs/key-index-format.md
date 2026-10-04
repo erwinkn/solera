@@ -23,9 +23,12 @@ optional bytes the index's kind interprets: a source key's version
 (`versions.md` §2; empty for a dynamic partitions's element), or a failure
 index's failure record (`per-key-processing.md` §9). An entry of a delta
 file may also hold its key's **predecessor** generation: what the commit
-superseded, for the store to clean up. Compaction drops predecessors.
-Entries are strictly increasing by `key` (byte-wise comparison); a file
-never holds the same key twice.
+superseded, for the store to clean up. A merge keeps the predecessor on
+a key's oldest kept version; a merge into the base drops it. Entries are
+increasing by `key` (byte-wise comparison). A commit's delta holds each
+key once; a span's files may hold several versions of a key, newest
+generation first, and a key's versions may cross from one block or file
+into the next (`key-index-design.md`).
 
 ## Blocks
 

@@ -1,11 +1,18 @@
 # Key index design: spans with endpoint versions
 
-Status: **approved for building** (coordinator, D53), being built in steps on
-`main`: step 1, exact writes and format v4 (one filter, bounded blocks), is
-in; spans, the version-keeping merge and the read API follow. Until then the
-leveled index and its delta log described in `object-store-state.md` §6 run.
-The measurements and prototypes it cites live on branch
-`bb/key-index-design-first-principles-thr_xvgqnrw2kr`.
+Status: **built** (coordinator, D53), in steps on `main`. Step 1, exact
+writes and format v4 (one filter, bounded blocks), and step 2, spans —
+the version-keeping merge and its policy, endpoints, `changes`, the index
+life and the lifecycles (upkeep's two lanes, publication, the attempt cap,
+the orphan collector, writer backpressure) — replace the leveled index and
+its delta log (`object-store-state.md` §6). The read API's remaining parts
+and re-measurement over the implementation follow. The replays it cites
+(`spans.py`, `adversarial.py`, `retention.py`, `tiling.py`) are in
+`bench/keys/`; the measured benches and prototypes (`catchup.py`,
+`layouts.py`, `tiling_reads.py`, `v4bench.py`, `native/src/v4.rs`) live on
+branch `bb/key-index-design-first-principles-thr_xvgqnrw2kr` at `42c4b69`;
+`amplification.py`, whose density model `spans.py` carries, runs at
+`0d09fc4`.
 
 Revised after review, for Erwin. The first version
 (cc54fcc) was reviewed: build with changes. Its span representation and

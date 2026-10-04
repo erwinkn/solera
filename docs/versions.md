@@ -112,7 +112,7 @@ v3       (key, generation, deleted, payload?)    + predecessor generation
   key-filter match with no tombstone match counted as an update with no
   read).
 
-The resolver, the engine cache, compaction and `.kg` garbage files keep
+The resolver, the engine cache, merges and `.kg` garbage files keep
 their roles with the smaller entry. A delta needs the index only to tell
 added from updated (the count), to find predecessors, and, for a
 replacement, which live keys it leaves out.
@@ -235,7 +235,7 @@ lineage:  B ← A, generation 12                    (g12 committed)
 | `version=` bump | The fingerprint changes, the asset's inputs reset, every key is reprocessed and written at a new generation, so consumers reprocess too. (Revision outputs used to hide this; they are gone.) A cursor producer with no inputs reprocesses nothing, as today | yes |
 | Deploys | The deploy number moves; only failed per-key incremental keys get their one try, and those that succeed are written at a new generation | yes |
 | Retries | A new attempt has a new generation; an uncommitted attempt's delta files and objects are cleaned up. A store call retried inside one attempt rewrites the same names with the same bytes | yes |
-| Per-key full redelivery (truncated log, reset) | Every key is processed and written again; its consumers reprocess everything | accepted |
+| Per-key full redelivery (a boundary merged away, reset) | Every key is processed and written again; its consumers reprocess everything | accepted |
 | Pattern change | Newly matched keys are delivered at their generation; unmatched ones removed | yes |
 | Unknown opaque writes | §5: a rewrite, or a key scan before a patch | yes |
 | Store move | A reset: the moved output is a new one (object-store-state.md §2) — no head, a fresh index, a whole first write, every key at a new generation; its consumers and its own inputs start over | yes |

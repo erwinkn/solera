@@ -838,8 +838,9 @@ they can go at once. It costs the same one integer per index entry.
   compression; neighbouring entries share generations and compress
   well): its version and its object's name at once.
 - **Delta entry:** the same, plus an optional **predecessor** generation
-  — the entry it replaces or deletes — when the writer read it.
-  Compaction drops predecessors.
+  — the entry it replaces or deletes. Writes are exact, so a writer always
+  names it. A merge keeps it on a key's oldest kept version; a merge into
+  the base drops it.
 - **Everywhere an entry travels, the generation travels with it:**
   resolver responses (the delta file), reads answered at `start`
   (`resolved-commits.md` §7: `.kx` files), and the `Keys` selection a
@@ -856,20 +857,12 @@ of `n − 1` and `n`, one at a time, and the one that committed `n` was the
 last of them.
 
 **Predecessors.** Collecting a superseded object needs its exact name,
-so its predecessor's generation. `resolved-commits.md` §6
-chooses two triggers, and this section's collection follows them:
-
-- **At resolution, whenever the old entry was read** — always on the
-  engine and in the streaming merge-join, and for the sparse reader's
-  maybe keys — the delta names the predecessor.
-- **At compaction, for the rest.** A key the filters counted live has no
-  named predecessor, but its old entry is still in the index, shadowed.
-  Every merge that drops an entry (shadowed, or under a bottom-level
-  tombstone) emits it as cleanup, named before or not: names are
-  never reused, so cleaning up one twice is a no-op.
-
-So the cold path keeps its cost, and collection is prompt wherever the old
-entry was read, deferred to compaction elsewhere.
+so its predecessor's generation. Writes are exact
+(`key-index-design.md`): every key a filter holds has its entry read, so
+every delta names the predecessor of each key it writes or removes, on
+the engine, in the streaming merge-join and in the sparse reader alike.
+Collection is prompt for every superseded version, and a merge never
+needs to emit cleanup of its own.
 
 **Reader pins.** An object or index file may go only when no reader can
 still need it. The pins, all by event counter (`object-store-state.md`
@@ -895,9 +888,9 @@ shows.
   pin predates it, the engine calls `store.cleanup(context, prior, names)`
   with the delta's predecessors, in batches of 1,000; then the entry goes.
   A superseded value is one name from the previous head's ref.
-- **Entries dropped by compaction** need nothing of their own: writes are
-  exact, so every version a compaction drops was named as a predecessor by
-  the delta that replaced it, and is cleaned up through that delta
+- **Versions dropped by a merge** need nothing of their own: writes are
+  exact, so every version a merge drops was named as a predecessor by the
+  delta that replaced it, and is cleaned up through that delta
   (docs/key-index-design.md).
 - **Attempts that ended without committing.** Their names carry their own
   generation, which no other attempt uses, and their `AttemptFinished`
