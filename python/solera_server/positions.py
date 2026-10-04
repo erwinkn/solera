@@ -14,7 +14,7 @@ Each (asset, input, partition) keeps a **position**:
         "from": int, "to": int,     # its boundary, decided when it starts
         "at": key | commit | None,  # its place: the last key delivered, the next commit
         "batch": int, "batches": int,  # the next batch's index, and how many are planned
-        "pin": int,                 # a delta pass's reader pin (lifecycle.md §9.8)
+        "pin": int,                 # its reader pin: a delta's files, a full pass's snapshot (lifecycle.md §9.8)
         "reconcile": bool,          # a full per-key pass owes a reconcile after (§11)
         "began": int,               # a full pass: the claim generation that started it
       },

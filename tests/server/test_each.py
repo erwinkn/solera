@@ -757,10 +757,6 @@ async def test_a_reset_of_the_input_drops_the_failed_keys(state, tmp_path):
 # -- A19 -------------------------------------------------------------------------------------
 
 
-def a19(finding: str):
-    return pytest.mark.xfail(strict=True, raises=AssertionError, reason=f"A19 {finding}")
-
-
 def fed(tmp_path, outside, *assets, extra=()):
     from solera.sdk import Source
     from solera.stores import FileStore

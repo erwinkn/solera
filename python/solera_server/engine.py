@@ -102,6 +102,14 @@ def _dep_restart(position: dict | None, shared: dict | None) -> bool:
     return position.get("seen") != shared["now"]
 
 
+def _snapshot_read(index, at: int, latest: int) -> int:
+    """The generation a read at reserved endpoint `at` (the state after
+    commit `at - 1`) has read: just below commit `at`'s first, or, with no
+    commit since, the `latest` the head holds."""
+
+    return latest if at > index.head else int(index.generation(at)) - 1
+
+
 class Engine(Attempts, Sensors, Staleness, Views):
     Conflict = Conflict
     GRACE_SECONDS = GRACE_SECONDS
@@ -1206,6 +1214,14 @@ class Engine(Attempts, Sensors, Staleness, Views):
                 base["patterns"] = input["patterns"]
         d = base["pass"]
         pin["batch"].update({"full": True, "scan": True, "index": d["batch"], "count": d.get("batches", 1)})
+        # The pass reads its snapshot (D93): its start, a reserved endpoint. What changed
+        # after reaches the next delta, and the selection lands at the snapshot.
+        pin["batch"]["snapshot"] = int(d["from"])
+        pin["ref"] = {
+            **ref,
+            "generation": _snapshot_read(index, int(d["from"]), int(ref.get("generation") or 0)),
+        }
+        plan["head"] = int(d["from"]) - 1
         if each:  # a per-key output keeps its keys through a start-over: a named key gone upstream goes (R2)
             pin["batch"]["removes"] = True
             if d.get("reconcile"):  # what its reconcile would walk: the pass covers only once none is left
@@ -1419,20 +1435,27 @@ class Engine(Attempts, Sensors, Staleness, Views):
             # estimate when patterns filter.
             keys = pinned.count if whole else sum(s.entries for s in pinned.spans)
             current = {**current, "batch": 0, "batches": _batches(keys, limit)}
-            if not whole:  # a delta pass over several attempts holds its first batch's reader pin
-                current["pin"] = claim_generation
+            # A pass over several attempts holds its first batch's reader pin: a delta's
+            # files, and a full pass's snapshot, whose versions a commit meanwhile lets go.
+            current["pin"] = claim_generation
         span = {"full": whole, "from": current["from"], "after": current["at"]}
         if not whole:
             span["to"] = current["to"]
+        else:  # a full pass reads its snapshot, its start (D93): later changes are the next delta's
+            span["snapshot"] = int(current["from"])
         batch = {**span, "limit": limit, "index": current["batch"], "count": current["batches"]}
-        read = current["generation"] if not whole else latest_generation  # a full pass reads the head
+        read = (
+            current["generation"]
+            if not whole
+            else _snapshot_read(index, int(current["from"]), latest_generation)
+        )
         pin = {"ref": {**ref, "generation": read}, "index": pinned.to_json(), "batch": batch}
         if not whole:  # a delta's slice: a key missing from the store is decided against the head (F38)
             pin["head"] = index.slice().to_json()
         if ahead and not reset:  # what keys= runs read ahead, past `next` or within this pass: skipped (K45)
             pin["ahead"] = ahead
-        if whole and "read_from" not in current:  # the pass's own batches read at or after this
-            current["read_from"] = latest_generation
+        if whole and "read_from" not in current:  # the generation of what the pass's batches read
+            current["read_from"] = read
         if carried["patterns"] is not None:
             pin["patterns"] = carried["patterns"]  # the worker filters the batch
         else:

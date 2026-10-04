@@ -490,7 +490,9 @@ though one run may name any number of keys.
 **pass**. One read of an upstream, fixed when it starts, done in batches
 over one or more attempts:
 
-- **full**: the whole head (first read, full run, fingerprint change,
+- **full**: the whole head as of its start, its snapshot — what changes
+  after arrives as the next delta, so every delivery in it is added
+  (first read, full run, fingerprint change,
   `keys=full`);
 - **delta**: the commits since the position, removed keys included: an
   `each` asset drops them from its outputs;

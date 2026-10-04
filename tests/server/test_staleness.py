@@ -1176,10 +1176,6 @@ async def test_a_dep_change_is_an_input_change_and_a_full_pass(state, tmp_path):
 # -- A19: staleness from the finest keys -----------------------------------------------------
 
 
-def a19(finding: str):
-    return pytest.mark.xfail(strict=True, raises=AssertionError, reason=f"A19 {finding}")
-
-
 def chain(root, outside, include=None):
     """`feed` -> `items` -> `checks` (each=True, `include`) -> `filtered`
     (each=True over `checks`, include=(k1))."""

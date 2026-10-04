@@ -90,12 +90,6 @@ def test_a_total_kept_from_the_changes_stays_exact(kind, tmp_path):
 # -- A19: delivery accounting (D93: one rule) ----------------------------------------------
 
 
-def a19(finding: str):
-    """A strict xfail for an A19 finding until its fix (D93)."""
-
-    return pytest.mark.xfail(strict=True, raises=AssertionError, reason=f"A19 {finding}")
-
-
 class Holdings:
     """What the consumer holds, from its batches alone: each batch's classes
     must agree with it — `added` a key it lacks, `updated` and `removed` one
@@ -191,7 +185,7 @@ class Tally:
 
 @pytest.mark.parametrize(
     "change",
-    [pytest.param("update", marks=a19("R1")), pytest.param("add", marks=a19("R2")), "remove"],
+    ["update", "add", "remove"],
 )
 async def test_a_change_during_a_full_pass_is_counted_once(tmp_path, change):
     """A19 R1, R2: keys=(k1) starts `tally`'s full pass; the upstream then
@@ -215,7 +209,6 @@ async def test_a_change_during_a_full_pass_is_counted_once(tmp_path, change):
         await t.close()
 
 
-@a19("R3")
 async def test_a_selection_completes_a_full_pass_only_with_the_removals_it_owes(tmp_path):
     """A19 R3: keys=(k1) starts the full pass and delivers k1; k1 is removed
     upstream; keys=(k2) then delivers the rest of the snapshot. k1's removal
@@ -297,7 +290,6 @@ async def test_an_early_removal_from_a_current_only_source_is_delivered_once(tmp
         await state.close()
 
 
-@a19("R1-R3: a full pass reads its snapshot (page/lookup at= through _read)")
 async def test_a_key_removed_during_a_full_pass_is_counted_out_once(tmp_path):
     """D100, the full pass: the snapshot holds k1 and k2, a key a batch.
     After k1's batch the source removes k2 (commit c). k2's batch reads the

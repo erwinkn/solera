@@ -97,16 +97,20 @@ them), and stores no per-key version. The record is snapshot
 - **A full pass due runs across runs** (Erwin's correction). After an
   asset change or a reset (no position, a fingerprint change, a log that
   no longer holds the delta), a full pass is due, and any mix of runs may
-  complete it. Its first delivery starts over, whether a `keys=` run or a
+  complete it. It reads one snapshot, the upstream as of its start — a
+  reserved endpoint of the key index (D93) — so every delivery in it, by
+  any run, is truly added, and what changes after it reaches the next
+  delta (A19 R1, R2). Its first delivery starts over, whether a `keys=` run or a
   default run: its first batch is full and first, so the consumer
   rebuilds (a count restarts from 0). Later `keys=` runs continue the same
   pass with their named keys, recorded like any read-ahead entry, with the
   pass as their base instead of a snapshot. A default run delivers only
   the keys the pass has not delivered and finishes it, never starting over
   again, so nothing earlier `keys=` runs wrote is dropped. Once every key
-  under the patterns has been delivered within the pass at its current
-  version, the asset is fresh, whichever run delivered the last piece, and
-  the record collapses to a snapshot. Nothing is delivered twice within a
+  of the snapshot under the patterns has been delivered within the pass,
+  whichever run delivered the last piece, the record collapses to the
+  snapshot, and the next delta brings what changed since — a delivered
+  key's removal included (A19 R3). Nothing is delivered twice within a
   pass, and K44's added, updated and removed are relative to its start:
   everything is added. *Example:* `copy` holds k1, k2, k3, and its version
   is bumped. keys=(k1) starts over with k1; keys=(k2, k3) continues, and

@@ -1031,7 +1031,7 @@ acknowledged entry names become garbage. Due means no reader pin that
 may read the entry's output partition predates it: pins are per output partition,
 each named by its index prefix. An attempt's claim pins what it reads and
 writes (§3.1); a delta
-pass or a pattern change drain its upstream; a sensor tick its sources; an
+pass or a full pass (its snapshot), or a pattern change drain, its upstream; a sensor tick its sources; an
 engine reader what it reads (`history/` for a history query). Index and
 history files are collected by the same rule, by their paths, so one slow
 reader holds back only what it reads. A delta file

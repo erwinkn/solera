@@ -360,7 +360,7 @@ be ref-annotated.
 filtered to the delivered keys or commits; `ctx.batch[name]` carries the
 rest. A pass comes in **batches** of `batch_size` keys (or upstream
 commits). The `Batch` says what changed and where it sits: `added`,
-`updated` and `removed` keys, `full` on every batch of a full pass (the whole head, after a
+`updated` and `removed` keys, `full` on every batch of a full pass (the whole head as of the pass's start, its snapshot — later changes come as the next delta — after a
 reset), `index` — the batch's 0-based index, exact — `count`, how many
 batches the pass was planned to take when it started (exact without
 patterns and with an exact key count, else an estimate), `first`

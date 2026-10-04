@@ -458,7 +458,9 @@ class Batch:
       may come without a row if it was removed since — its removal follows
       in a later batch — and a key changed after the pass's version may
       arrive once more as updated (D100);
-    - `full`: the batch is part of a full pass — the whole head after a
+    - `full`: the batch is part of a full pass — the whole head as of the
+      pass's start (its snapshot: what changes after comes as the next
+      delta) after a
       reset, not a delta;
     - `index`: this batch's 0-based index in its pass, exact;
     - `count`: how many batches the pass was planned to take when it

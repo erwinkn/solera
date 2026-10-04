@@ -130,8 +130,10 @@ async def read_batch(pin: dict, keys_io) -> Batch:
     ahead = pin.get("ahead") or {}
     read_at = {k: int(g) for k, (g, _) in ahead.items()}
 
+    snapshot = ch.get("snapshot")  # a full pass reads its start, a reserved endpoint (D93)
+
     async def whole(after, n):
-        keys, generations, _, nxt = await index.page(after, n)
+        keys, generations, _, nxt = await index.page(after, n, at=snapshot)
         return [(k, g, 0, 0) for k, g in zip(keys, generations, strict=True)], nxt
 
     async def delta(after, n):
@@ -180,7 +182,7 @@ async def read_batch(pin: dict, keys_io) -> Batch:
         return batch
     if "keys" in ch:  # a run's keys= override: each named key as the upstream holds it, or removed (R2)
         named = sorted({str(k) for k in ch["keys"]})
-        found = await index.lookup([key_bytes(k) for k in named])
+        found = await index.lookup([key_bytes(k) for k in named], at=snapshot)
         upserted = {key_str(k): generation for k, (generation, _) in found.items()}
         # A named key the upstream has not is removed (R2) — but not within a full pass,
         # whose consumer holds only what the pass delivered: never there, never removed.
@@ -205,7 +207,7 @@ async def read_batch(pin: dict, keys_io) -> Batch:
             updated = {key_str(k) for k in was}
         batch = Batch(upserted, gone, None, len(named), updated=updated)
         if ch.get("scan"):  # a full pass's delivery: whether it leaves any key undelivered (K45)
-            batch.covers = await _covers(index, taken, set(named), read_at, ch.get("walked"))
+            batch.covers = await _covers(index, taken, set(named), read_at, ch.get("walked"), snapshot)
             for held in ch.get("held") or ():  # and leaves nothing its reconcile would remove
                 if not batch.covers:
                     break
@@ -226,15 +228,16 @@ async def read_batch(pin: dict, keys_io) -> Batch:
     return batch_of(page, after, read)
 
 
-async def _covers(index, taken, named: set[str], read_at: dict, walked: dict | None) -> bool:
-    """Whether every key under the patterns has been delivered within a full
-    pass at its current version: named now, read ahead at or after it, or
-    walked by the pass's own batches (at or before `at`, at a generation
-    they read)."""
+async def _covers(index, taken, named: set[str], read_at: dict, walked: dict | None, at=None) -> bool:
+    """Whether every key of the pass's snapshot (`at`) under the patterns has
+    been delivered within it: named now, read ahead at or after its version,
+    or walked by the pass's own batches (at or before `walked["at"]`, at a
+    generation they read). A key removed after the snapshot is the next
+    delta's, which delivers its removal (A19 R3)."""
 
     after = None
     while True:
-        keys, generations, _, after = await index.page(after, 1000)
+        keys, generations, _, after = await index.page(after, 1000, at=at)
         for k, generation in zip(keys, generations, strict=True):
             key = key_str(k)
             if not taken(key) or key in named or read_at.get(key, -1) >= generation:
