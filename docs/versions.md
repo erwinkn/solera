@@ -84,8 +84,8 @@ without this, each run would wake every consumer of the set.
 
 ## 3. The index entry
 
-The `.kx` entry collapses (format version 3; no deployment, so no
-migration):
+The `.kx` entry collapsed in format version 3 (`key-index-format.md` has
+today's, v4):
 
 ```
 before   (key, version, deleted, locator)        + predecessor (version, locator)
@@ -119,7 +119,7 @@ replacement, which live keys it leaves out.
 
 ## 4. Writes and stores
 
-`Store.prepare` reads a keyed write once, as today, but only its key
+`Store.prepare` reads a keyed write once, but only its key
 column: natively from Python rows, DataFrames and Arrow, sorted and
 grouped by key (`Rows`). Nothing else of a row reaches native code.
 
@@ -232,7 +232,7 @@ lineage:  B ← A, generation 12                    (g12 committed)
 |---|---|---|
 | A rewrites `k` while B reads it | Immutable: B reads the pinned object, then `k` again with A's delta. Fenced: B may read A's new rows and records generation 12; A's commit, or the repair of its dead attempt, puts `k` in a delta B receives later, and B rereads | yes |
 | Identical rewrites | Every key rewritten is a change; consumers reprocess. A whole input rewritten identically changes its ref's generation: an input change, so its consumers owe a full pass (the partition record's `seen`): a full redelivery | accepted |
-| `version=` bump | The fingerprint changes, the asset's inputs reset, every key is reprocessed and written at a new generation, so consumers reprocess too. (Revision outputs used to hide this; they are gone.) A cursor producer with no inputs reprocesses nothing, as today | yes |
+| `version=` bump | The fingerprint changes, the asset's inputs reset, every key is reprocessed and written at a new generation, so consumers reprocess too. (Revision outputs used to hide this; they are gone.) A cursor producer with no inputs reprocesses nothing | yes |
 | Deploys | The deploy number moves; only failed per-key incremental keys get their one try, and those that succeed are written at a new generation | yes |
 | Retries | A new attempt has a new generation; an uncommitted attempt's delta files and objects are cleaned up. A store call retried inside one attempt rewrites the same names with the same bytes | yes |
 | Per-key full redelivery (a boundary merged away, reset) | Every key is processed and written again; its consumers reprocess everything | accepted |
@@ -258,30 +258,15 @@ lineage:  B ← A, generation 12                    (g12 committed)
    transaction, stamping `written = 15`. It adds no state: `fence(...,
    write=True)` exists.
 
-## 8. What is deleted
+## 8. Hashing that stays
 
-| What | Where |
-|---|---|
-| The row-digest grammar and doc | `docs/row-digest.md`, `native/src/digest.rs`, `tests/sdk/test_row_digest.py` |
-| Value encoders | `native/src/pyvalue.rs` and `arrow.rs`, all but reading a key (`str` or `int`) |
-| Group and content digests | `rows.rs` (`content`, digest `Versions`), `group_digest`, `Rows.digest`, `Rows.values`' hashing |
-| `revision=` | `Output`, `Rows`, `TableRef`'s handle, the `Sql` revision path, `Engine._rendered`, demo's `site_files` |
-| Store-computed versions | `Prepared.version`, `KeyedWrite.version`, `stores._digest`, FileStore's value hash and batch chain, PostgresStore `_rows_version` and its `Sql` statement digest; `Ref.version` |
-| `exclude` and `stamped` | `prepare`, `prepare_for`, `Rows`, PostgresStore |
-| Postgres exactness checks | `_check_types`, `_kept`, `_digested`, their tests |
-| Read-backs | `_sorted_rows`' every-column branch; `worker._repair`'s load and hash; `_reconcile`'s row scan |
-| Read-time hashing | `observed.py`'s per-key versions; lineage `keys` and `key_count` |
-| The pair filter and the version field | `.kx` format, `.kxl` local form, `_python.py`, the sparse reader's pair step |
-| Lineage `mixed`, per-read pinning | `observed.py` |
-| Benchmarks of digesting | `bench/keys/digest.py`, `bench/keys/pyrows.py` |
-
-Hashing that stays, none of it over user data: key and tombstone
-filters, file and payload checksums, the fingerprint, the project
-revision.
+None of it over user data: key filters, file and payload checksums, the
+fingerprint, and a deploy's build identity.
 
 ## 9. Tests
 
-- **Unit.** Entry format v3 round trips in Rust and `_python.py`; every
+- **Unit.** The entry format round trips in Rust and the Python reference
+  (`tests/sdk/keys_reference.py`); every
   write is a change; a retried store call in one attempt gives the same
   delta bytes; source versions: equal unchanged, different changed, absent
   changed; set elements re-listed unchanged; immutable names and
@@ -289,51 +274,14 @@ revision.
   kit; the repair example of §5 both ways; a dead opaque writer then a
   replacement, then a patch.
 - **The simulation** (`tests/sim`, `verification.md`). Its invariant
-  "Reads say what they read" drops the per-key part: a read reports the
-  generation that wrote the partition. Add one invariant and one check:
-  - after every step, for a fenced partition with nothing owing a repair, the
-    index's live keys are exactly the store's present keys;
-  - at convergence, every lineage generation that some commit settled is
-    not reported `uncommitted` (break 1).
+  "Reads say what they read" holds a read to the generation that wrote the
+  partition, and after every step a fenced partition with nothing owing a
+  repair holds exactly the keys its index lists. Its oracle checks every
+  output's convergence, with every producer rewriting whole. Not built: a
+  convergence check that no generation a commit settled reads
+  `uncommitted` (break 1).
 
-  The simulation's own oracle already checks convergence of every
-  output; it must keep passing with every producer rewriting whole.
-
-## 10. How it was built
-
-One implementation worker, in this order, merged when `tests/` and
-`tests/sim` passed. Interfaces first: the v3 entry, `Rows` (keys only),
-`Store.keys`, `Ref.generation`.
-
-1. **Key index and sources:** format v3 and the pair filter's removal
-   (Rust, `_python.py`, `.kxl`); the delta rule (written means changed,
-   versions compared); source commits' generation and versions; sets' empty
-   version; rendering a version as its generation.
-2. **Stores and native:** `Rows` keys-only; delete digests and encoders;
-   FileStore and S3Store names by generation; PostgresStore without
-   exactness checks or `stamped`, `scan` becoming `keys`, `Sql` reporting
-   keys; `revision=` out of `Output`; the conformance kit.
-3. **Lifecycle and lineage:** `_store_outputs` and `Ref.generation`;
-   repair by presence and the always-write rule; unknown opaque writes;
-   `observed.py` and lineage `{generation, uncommitted?}`; per-key incremental
-   (`ctx.revision` and the failure entry's `revision` become the
-   upstream `generation`); the simulation's invariants.
-
-Tests for the review's four sequences, `tests/server/test_versions.py`
-and `test_lineage_reads.py`: a delta pass's lineage across batches and a
-later commit; a failure record across an engine restart with a skewed
-clock; repair keeping or dropping a dead writer's key; an external
-table's lineage at its tick. Postgres key identity:
-`tests/sdk/test_postgres.py`.
-
-Then the docs: delete `row-digest.md`; update `architecture.md` §3,
-`object-store-state.md` §5–§7 and §9, `stores.md`, `per-key-processing.md`
-§6–§7 and §9, `resolved-commits.md` §3 and §6, `lifecycle.md` §9.6 and
-§9.8, `key-index-format.md`, `verification.md`, and the README's "an
-unchanged commit wakes nothing" (true now only for sources with versions,
-sets, and producers that write nothing).
-
-## 11. Notes
+## 10. Notes
 
 1. **Source versions in patches.** §2 compares a version wherever one
    comes, full map or patch: one rule, confirmed by Erwin.

@@ -703,9 +703,9 @@ Each line: what goes, what replaces it, and why it does not earn a name.
 | rescope, pattern transition, cutover | **pattern change** | One procedure, four names |
 | cleanup (pass flag) | **reconcile** | |
 | unsettled, settled (outputs) | **repair**, owes a repair | "settle" stays the engine's decision on an attempt |
-| landed, `writes`, `uncertain` | **`write`**: `none`, `writing`, `complete` | Model change 5 |
+| landed, `writes`, `uncertain` | **`write`**: `none`, `writing`, `complete` | One field says how far an attempt's writes got |
 | garbage, discard, data garbage | **cleanup** | One rule (delete once no pin predates it), two places |
-| mixed (lineage) | two reads | Model change 6 |
+| mixed (lineage) | the generation read | One moment reads a partition once: lineage records its first read |
 | failure index | **failed keys** | |
 | timeline, `run_events` | **run timeline** | |
 | spec, handle, `RunHandle` | **attempt spec**, **attempt handle** | Both belong to one attempt, not to a run (open question 1) |
@@ -752,6 +752,3 @@ Each line: what goes, what replaces it, and why it does not earn a name.
 3. **`missing` as a selection value.** It names "not materialized" in
    `partitions="missing"`; `"unmaterialized"` is the strict alternative.
    Recommended: keep `missing`.
-4. **Fresh namespaces.** Renamed persisted fields (events, checkpoint,
-   history columns, manifest) make existing state unreadable. Assumed
-   acceptable, as for `versions.md`.

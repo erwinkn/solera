@@ -4,7 +4,7 @@ Status: **built** (coordinator, D53), in steps on `main`. Step 1, exact
 writes and format v4 (one filter, bounded blocks), and step 2, spans —
 the version-keeping merge and its policy, endpoints, `changes`, the index
 life and the lifecycles (upkeep's two lanes, publication, the attempt cap,
-the orphan collector, writer backpressure) — replace the leveled index and
+the orphan collector, writer backpressure) — replaced the leveled index and
 its delta log (`object-store-state.md` §6). The read API's remaining parts
 and re-measurement over the implementation follow. The replays it cites
 (`spans.py`, `adversarial.py`, `retention.py`, `tiling.py`) are in
@@ -14,14 +14,8 @@ branch `bb/key-index-design-first-principles-thr_xvgqnrw2kr` at `42c4b69`;
 `amplification.py`, whose density model `spans.py` carries, runs at
 `0d09fc4`.
 
-Revised after review, for Erwin. The first version
-(cc54fcc) was reviewed: build with changes. Its span representation and
-exact writes stay. Its boundary lifecycle and merge policy change here,
-because endpoints that block merges make the span count grow with the
-number of observers, and an observer retiring forced a large rewrite. The
-review's findings and where each is answered are listed at the end. Every
-number says where it comes from: **measured** (real files, today's
-reader: `bench/keys/catchup.py`, `layouts.py`, `tiling_reads.py`),
+Every number says where it comes from: **measured** (real files, the
+reader of the time: `bench/keys/catchup.py`, `layouts.py`, `tiling_reads.py`),
 **replayed** (the merge policy on metadata, with the density model of
 `amplification.py`: `spans.py`, `retention.py`), or **proved** (Lean,
 `experiments/lean/KeyIndex/WriteBound.lean` and `Segments.lean` at 5a34e6e on branch
@@ -59,7 +53,7 @@ key needs every delta's first block, so its first page is its full read):
 | 10,000, 100M (12M keys changed) | 0.11 s · 8.5 s · 633 · 79 · 554 MB | 6.6 s · 7 · 116 · 1,553 MB |
 
 At the head: 1K exact lookups take 18–42 GETs, 21–61 MB and 0.48–0.88 s at
-1M (today's leveled layout on a matched trace: 3 GETs, 10 MB, 0.21 s), and
+1M (the leveled layout's on a matched trace: 3 GETs, 10 MB, 0.21 s), and
 1,166 GETs, 242 MB and 1.8 s at 100M (leveled, matched trace with other
 keys: 907 GETs, 200 MB, 1.13 s). A 100K-key scan page takes 0.08–0.10 s.
 
@@ -76,7 +70,8 @@ What this says:
   cost more requests and bytes than one object holding exactly the deltas.
 - **Lookups pay for retained versions**: at 1M with lagging readers the
   index holds 3–8× the live keys and a cold lookup reads them; at 100M the
-  versions are a small share and lookups cost about what they cost today.
+  versions are a small share and lookups cost about what they cost on the
+  leveled layout.
   The engine's warm cache answers lookups locally either way.
 
 Limits: keys in the v4 runs are evenly spaced (they compress to ~3.4 B per
@@ -94,9 +89,9 @@ every delta entry records exactly whether its key was live before it.
 
 ## The answer in brief
 
-Today the index is three structures: a leveled LSM for lookups and full
-reads, the delta log (one file per commit, kept for consumers) for
-catch-up, and a proposed range tree to make far catch-ups cheap. Two
+Before spans, the index was two structures: a leveled LSM for lookups and
+full reads, and the delta log (one file per commit, kept for consumers)
+for catch-up; a range tree was proposed to make far catch-ups cheap. Two
 orderings are needed (key order for lookups and scans, commit order for
 catch-up), but one structure gives both: **a list of key-sorted file sets
 ("spans"), each covering a stretch of commits**. Lookups read the spans
@@ -120,7 +115,7 @@ inside a forced merge pay with extra reads.
   and single-span rewrites; R = 3 and K = 10⁹ give 1,870×: loose, but a
   guarantee). Replayed under the reviews' churn scenarios: 7–10× compaction
   writes at 1M keys, 12–14× at 100M. On real files, one trace through the
-  real compactions: 14.0× total entry writes against 51.3× for today's
+  real compactions: 14.0× total entry writes against 51.3× for the
   leveled planner at 100M keys (9.0× against 18.2× at 1M).
 - **Spans are capped at 32.** Under the replayed patterns (1 to 1,000
   distinct endpoints, stalled passes, churn) they stay at 9–22 on average
@@ -129,12 +124,11 @@ inside a forced merge pay with extra reads.
   across endpoints. Blocking endpoints instead gives 546 spans at 100.
 - **Catch-up reads what changed in its range**: measured over real spans,
   paged, 10,000 commits behind at 100M keys takes 16 spans, 259 GETs, 65 MB
-  and 7.7 s, against 10,000 deltas today, or one packed object merged at
+  and 7.7 s, against 10,000 deltas under the delta log, or one packed object merged at
   once (6 GETs, 97 MB, 12.9 s). No reader ever reads more than a full read.
-- **Lookups and appends cost what they cost today**, measured on layouts
-  built from the same trace: 901 against 907 GETs for 1K cold exact lookups
-  at 100M, 10 ms warm. The first version's 40% saving compared against a
-  leveled layout holding twice the entries; it is withdrawn.
+- **Lookups and appends cost what they cost on the leveled layout**,
+  measured on layouts built from the same trace: 901 against 907 GETs for
+  1K cold exact lookups at 100M, 10 ms warm.
 - **Deleted**: the separate log, the range tree, log truncation, the leveled
   planner, the inexact count and recount, the tombstone filter and the
   `.kg` garbage files.
@@ -248,15 +242,15 @@ behind it (replayed); with two, at most 18–24.
 ### 1. append(changes)
 
 Resolve each written key against the spans newest first: key filters, then
-a block read for every key a filter matches (`KeyIndex._find`, as today
-across levels); within a span, a key's first entry is its newest. That
+a block read for every key a filter matches (`KeyIndex._find`); within a
+span, a key's first entry is its newest. That
 gives each key's current version exactly: its predecessor (the replaced
 version: the object to clean up) and whether it was live (the batch class,
 the live count). Write the span `[c, c]`, one PUT, and add
 `added − removed` to the count.
 
 Measured (`layouts.py`): one trace of 30,000 commits of 1K keys (20,000 at
-1M) applied to both layouts, today's leveled index by its real planner and
+1M) applied to both layouts, the leveled index by its real planner and
 compaction, the spans by the policy (real `merge_ranges` merges, the base
 merge through `KeyIndex.compact`), one consumer reading every commit; then
 1K keys drawn from the whole key space; cold is 30 ms per request, 80 MB/s
@@ -277,7 +271,7 @@ The 100M snapshot came just after the spans' base merge (writes 9.8× before
 it, 13.0× after); on average the replay holds 1.12–1.16 entries per live
 key for spans, so filters and blocks cost ~10–15% more between base
 merges. The warm append is the engine's resolver (`resolved-commits.md`):
-the same local reads plus a PUT. Today's leveled planner writes 50× on real
+the same local reads plus a PUT. The leveled planner wrote 50× on real
 v3 entries at 100M, above `amplification.py`'s 30× (which assumed 29-byte
 entries): byte-sized level targets hold 3× more entries than it modelled.
 `tiling_reads.py`'s hand-built layouts, quoted by the first version, are
@@ -372,7 +366,7 @@ was given `k` live. So:
   generation (generations rise with commit numbers within an output
   partition); otherwise its class is (its delivered state, its state at
   `N`);
-- entries before `next` collapse into the snapshot, as today
+- entries before `next` collapse into the snapshot
   (`positions.collapse`). A covering selection collapses the record to its
   head + 1, its reserved landing point.
 
@@ -534,7 +528,7 @@ each, or reclaim abandoned outputs sooner.
   and restarts the oldest protected reader (a stalled pass), releasing its
   endpoint and pins. It never deletes what a holder still needs.
 
-## Lifecycles the implementation must honour
+## Lifecycles
 
 - **Passes.** A pass between attempts keeps its endpoints and its original
   data-version pin; each attempt pins the index manifest it was handed,
@@ -552,14 +546,14 @@ each, or reclaim abandoned outputs sooner.
 - **Reset, store move, remove and recreate.** A new index life fences old
   claims and merge jobs: their results are refused. Nothing merges across a
   reset by commit numbers.
-- **Rename** follows the index's identity (its prefix), as today.
+- **Rename** follows the index's identity (its prefix).
 - **Pattern change.** Reserve split + 1. The membership diff (which keys
   changed match) stays separate from ordinary classification.
 - **Empty commits, empty base.** An empty delta is still a span, so
   coverage has no holes. A read that finds a hole fails loudly.
 - **Read-ahead results outlive their entries.** A sealed attempt result
   referenced by a read-ahead entry is kept until the entry collapses, as
-  run retention keeps named runs today (`upkeep.py:307-309`); manual
+  run retention keeps named runs; manual
   pruning refuses it, or drops the entry and makes the next pass deliver
   its keys again. A missing result is never reconstructed silently.
 - **Orphans and pins.** The orphan collector's roots are every file of the
@@ -572,11 +566,11 @@ each, or reclaim abandoned outputs sooner.
 - **The count invariant** compares against the consumer's effective
   baseline: live(P − 1) adjusted by what its read-ahead entries delivered.
 
-## What changes, and what is deleted
+## What spans replaced
 
-Deleted:
+Gone:
 
-| Today | Why it goes |
+| Was | Why it went |
 |---|---|
 | Levels and the leveled planner (`FileInfo.level`, `l0_max_files`, `level_base`, `fanout`) | spans and the policy above |
 | The delta log as a second list (`IndexState.log`, `keep_log`, `_consumed`, `covers`, `slice`, `truncated`, `IndexTruncated`, the truncation in `Upkeep.truncate`) | the spans are the log; trimming is the base merge |
@@ -607,9 +601,6 @@ Kept: blocks, the key filter, payloads for source versions and failure
 records, the engine cache, engine-served reads, `DeltaKeys`, cleanups driven
 by delta predecessors, pins.
 
-New words for the glossary: **span**, **endpoint**, **base** ("run" was
-taken). "Delta" stays: a commit's span.
-
 ## Alternatives, compared
 
 - **Blocking endpoints** (the reviewed version: a merge never crosses an
@@ -618,11 +609,11 @@ taken). "Delta" stays: a commit's span.
 replayed), and each
   retirement forced a rewrite of the spans after it (the review's 265×
   case). Versions cost a format change and a version-aware reader.
-- **Today's LSM plus a packed, resumable log.** Lookups keep the leveled
+- **The leveled LSM plus a packed, resumable log.** Lookups keep the leveled
   layout; catch-up reads one packed object in a few range GETs and merges
   every delta once, holding a cursor per delta. Measured 10,000 behind: 6–7
   GETs, but 97–101 MB and 11.7–12.9 s for the merge, against 13–16 spans,
-  14–65 MB and 1.2–7.7 s. It keeps today's leveled compaction (51.3× total
+  14–65 MB and 1.2–7.7 s. It keeps the leveled compaction (51.3× total
   entry writes at 100M, measured) and two structures. It stays the control
   for the v4 measurements, with a paged, resumable merge.
 - **Aligned tiers** (the range tree). Measured on the same log: 25 blocks
@@ -700,9 +691,9 @@ on too, the span joins the base: `a g30 · b g30 · c g40`, with `d`'s
 tombstone and the predecessors gone. The replaced versions (`a` g1, `b` g1,
 `c` g10, `d` g40) were cleaned up from the deltas of commits 2–5.
 
-## What must be checked
+## What is checked
 
-**Lean** (proposed by the coordinator):
+**Lean**:
 
 - done (5a34e6e): the write bound, every merge guarded or dropping a
   quarter of its inputs (the single-span rewrite), for any order of
@@ -730,50 +721,13 @@ standard axioms only (`experiments/lean/REPORT.md`). What they leave to
 TLA+ and the sim: where the delivered state comes from (the sealed
 result), endpoint reservation lifetimes, pins, publication and crashes.
 
-**TLA+** (`Spans.tla`): spans with segments; endpoint holders with the
-reservation lifetimes above, a selection's landing point included; pins;
-two upkeep lanes; publication through the journal; a crash after upload; a
-reset fencing old merges. Invariants: reads agree with the full history
-(`Execution.tla`'s log) at every reserved endpoint; no file deleted while a
-pin or a pending cleanup needs it; no published merge from an old life or
-with changed inputs; the count against the effective baseline. Calibrations,
-each must fail with its fix off: a selection without a reserved landing
-point (its position lands inside a merged span); a merge dropping a version
-a live endpoint sees; tombstones dropped outside the base; deletion before
-durable publication.
-
-**The sim** (`tests/sim`): exact deltas through every writer, in the cold
-mode (resolver off, `bits_per_item=1`, `whole_threshold=0`,
-`small_file=0`); compaction interleaved anywhere, with endpoints derived
-from the model and every reader checked against the oracle; the tally with
-read-ahead entries read from results, batches split anywhere, positions
-dropped; cleanups exactly once and never under a pin; injected upload and
-publication failures; spans and written bytes reported against the bounds.
-
-## The review, finding by finding
-
-| Finding | Answer |
-|---|---|
-| P1-1 landing points | every attempt that may advance a position reserves the head + 1 at its claim (selections, a pass's first attempt, drains), kept until durable transfer, released on failure; a TLA+ calibration |
-| P1-2 read-ahead state | delivered state from the sealed attempt result; latest read wins; tombstones kept |
-| P1-3 retirement rewrites | merges cross endpoints, so retirement forces nothing; the guard bounds writes in any order (Lean, 5a34e6e); replayed under the review's churn scenarios |
-| P1-4 span count, memory | spans set by the policy, not by observers; a bound per resource; versions, not bits |
-| P2-1 retention | five lifetimes accounted separately; byte budgets with backpressure and cancel-restart |
-| P2-2 mixed models | numbers labelled; catch-up measured on real spans against packed deltas and aligned blocks; both layouts built from one trace by real compactions |
-| P2-3 cap exemption at 0 | removed (`tiling.py`); only positions with a pass under way are exempt, and the physical budget covers them |
-
-The second review (A12), on a7fc05f:
-
-| Finding | Answer |
-|---|---|
-| A12-1 base normalization | only the base's initial segment, before the oldest live endpoint inside it, keeps live keys only; later segments keep tombstones |
-| A12-2 clip changes at `N` | every key clipped to `[g(P), g(N + 1))`: the "changed" test, the state at `N`, staleness and resumed pages |
-| A12-3 an old pass facing newer data | the read rule checks both ends, in bytes, and is a preference; the universal 2×/10 MB bound is withdrawn; a reader's read is bounded by a full read (replayed: the merge is refused, the pass reads 1 entry, not 1,990,001) |
-| A12-4 many large pinned commits | a hard cap of 32 spans, by forced guarded merges; readers inside pay up to 2× (replayed: 41 spans become 32); explicit limits and backpressure in the resource table |
-| A12-5 the theorem | entries, not bytes: (1 + 43R + 20R ⌊log₂ K⌋), deltas included; single-span rewrites covered (5a34e6e); every attempt charged, R = 3 |
-| A12-6 amplification labels | compaction entry writes and total entry writes labelled; 14.0× against 51.3× total at 100M; bytes with the v4 measurements |
-| A12-7 RSS | relabelled as process high-water increases; the memory comparison is dropped; isolated reader processes in the v4 measurements |
-| key-by-key checks; sealed result retention | the v4 prototype compares every key and class; results kept until their entries collapse |
+**TLA+ and the simulation.** `spec/tla/Spans.tla` models the lifecycle —
+endpoints and their reservations, pins, upkeep's two lanes, publication
+through the journal, a crash after upload, a reset fencing old merges —
+with calibrations that each fail with their fix off; the simulation runs
+exact deltas through every writer with compaction anywhere, every reader
+checked against the oracle (`verification.md`, "Formal model: the span
+key index's lifecycle", and "What it models").
 
 ## Open questions
 
@@ -782,5 +736,3 @@ The second review (A12), on a7fc05f:
   the replay; the v4 measurements re-check them.
 - The physical budget's default, and whether cancel-restart of a stalled
   pass needs the user's consent.
-- Format v4 lets a key repeat within a file; the reference implementation
-  (`tests/sdk/keys_reference.py`) changes with it.

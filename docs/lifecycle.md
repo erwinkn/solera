@@ -83,7 +83,7 @@ writes anything but the spec and the control file's `open` and `ended`
 
 | Object | Written by | Mode | Meaning |
 |---|---|---|---|
-| `{attempt}.spec` | engine, before `AttemptLaunched` | create-only, immutable | what to run: today's `spec`, plus `engine` (HTTPS URL), `token` (§5.2), `generation` (§9.7) |
+| `{attempt}.spec` | engine, before `AttemptLaunched` | create-only, immutable | what to run, with `engine` (HTTPS URL), `token` (§5.2), `generation` (§9.7) |
 | `{attempt}.control` | the engine creates it before the launch; then the owner and the engine | created once, then only swapped (`If-Match`) | who owns the attempt, whether writing began and its intents, the sealed result, or the engine's end (§2.4) |
 | `{attempt}.beat` | the owner, only while HTTP fails (§6) | overwritten | `{"worker", "seq", "timeline", "usage"}`: evidence the worker lives, never a decision |
 | `{attempt}.log.{n:06d}` | worker | create-only, immutable | a gzip member of the log, flushed every 30 s or 1 MB; a short log has none (§13) |
@@ -92,8 +92,8 @@ Gone: the two-write `{attempt}.json`, the fence-reading `.beat` and its
 done marker, the joined `.log`, chunk deletion, `AttemptClaimed`; with
 the control file, `.worker`, `.writing` and `.result`.
 
-**The result**, sealed into the control file, carries today's result,
-plus the worker, the timeline, usage, the log index, and what is known of
+**The result**, sealed into the control file, carries the attempt's
+outcome and outputs, plus the worker, the timeline, usage, the log index, and what is known of
 the attempt's writes:
 
 ```json
@@ -501,7 +501,7 @@ Gone: `POST /api/workers/register`, `/api/tasks/claim`,
 ### 5.2 Authentication and bootstrap
 
 - **Bootstrap.** A placement hands the worker the stage — `attempt`, `run`,
-  `objects` — as today. The worker reads the spec with the environment's
+  `objects`. The worker reads the spec with the environment's
   own object-store credentials; the spec gives it the engine's URL and its
   token. Pool workers get the stage from discovery (§10). Sensor workers
   need no spec: a remote host is configured with its pool token, and the
@@ -590,7 +590,8 @@ Proposal for Erwin's question, decided: **HTTP heartbeats every 10 s; the
   still land: that is the store kind's rule (§9.6).
 
 Costs: per attempt-minute, 6 HTTP requests and no object request, against
-today's 2 PUTs and 2 GETs (beat and fence read); during an engine outage,
+the 2 PUTs and 2 GETs (beat and fence read) of the object-only protocol
+before it; during an engine outage,
 3 PUTs per attempt-minute.
 
 ## 7. Settling, canceling, timing out
@@ -611,7 +612,9 @@ happens to the work left undone.
    and answers it to the next beat (≤ 10 s). The worker stops starting new
    work: a per-key batch stops scheduling keys and cancels calls in flight
    (`per-key-processing.md` §5); a plain asset's producer is cancelled. Then
-   it **drains**, within `cancel_grace` (60 s by default, per asset):
+   it **drains**, within `cancel_grace` (the engine's, 60 s by default:
+   one for every asset, no per-asset knob until a real need shows up, so
+   the late-cleanup sweep of §9.8 needs only the asset's timeout plus it):
    - work that finished is written and published — for a per-key batch, the
      finished keys' outputs plus the interrupted holes in its failure
      index — as one result with `status: canceled`, which the engine
@@ -619,8 +622,7 @@ happens to the work left undone.
      past the whole batch);
    - a plain asset that had not reached its writes publishes `canceled`
      with no outputs and `write: none`; one that had taken the gate
-     completes its writes and publishes them, and the commit stands, as
-     today;
+     completes its writes and publishes them, and the commit stands;
    - either way the result carries the cancel record it sealed with.
 
    Result submission stays authorized throughout: the attempt is live
@@ -645,7 +647,7 @@ happens to the work left undone.
   the asset's retry backoff, and each timeout interruption counts as a try
   (`tries` + 1): a key whose processing always outlives the timeout ends
   `failed` after the retry limit instead of cycling forever. An attempt
-  timeout is retryable as today, within `retries`.
+  timeout is retryable, within `retries`.
 
 ## 8. Provisioning and the runtime clock
 
@@ -667,7 +669,7 @@ like a timeout (`reason: provisioning`).
 **The runtime clock** (the asset's `timeout`) starts at the first evidence
 that the worker runs: `start`, a beat, or — with HTTP down — the engine
 observing `.beat`. A 20-minute image pull does not eat a 30-second
-timeout. Built today: the first report starts it.
+timeout. As built, the first report starts it.
 
 **Adopted attempts.** Neither clock's start is persisted. An adopted
 attempt still provisioning keeps what the launching engine's clock says is
@@ -828,8 +830,7 @@ deleted. Consumers take everything again. A full replacement may instead rewrite
 which settles it too. `resolved-commits.md` §3 carries the same branch for
 the resolver's write phases.
 
-**Failure deltas do not join the gate's intents** (the question of
-`resolved-commits.md` §14.4). Intents name store writes a dead attempt may
+**Failure deltas do not join the gate's intents.** Intents name store writes a dead attempt may
 have half-done, so that the next attempt can read them back. A failure
 delta is a key-index file, engine metadata: it takes effect only through
 the commit that names it, and an uncommitted one is cleaned up with the
@@ -840,7 +841,7 @@ attempt like any delta file. There is nothing to repair.
 Internal to the store; the engine supplies one number.
 
 - **The generation** is the event counter (`applied`) of the attempt's
-  claim, carried on `AttemptLaunched` as `pin` today and written into the
+  claim, carried on `AttemptLaunched` as `pin` and written into the
   spec. It is chosen before the spec and needs no allocation. A
   generation reaches the database only once its `AttemptLaunched` is
   durable, and that event itself moves `applied` past it: every later
@@ -881,7 +882,7 @@ Internal to the store; the engine supplies one number.
   acquired is stopped by its control file (§2.4), not by the database,
   which never saw its generation.
 - **A table that does not exist yet.** The first write establishes the
-  table's shape from the rows the producer returned (today's `_ensure`),
+  table's shape from the rows the producer returned (`_ensure`),
   so acquisition cannot happen earlier. Creation is serialized: under a
   transaction-level advisory lock on the table's name, the store creates
   the table from the rows, then acquires in the same transaction, so the
@@ -1078,7 +1079,7 @@ Writing the same content again (`v1 → v2 → v1`) writes a new name
 GC lock, the dequeue-on-reuse rule and the DELETE timing assumption of the
 alternative.
 
-**Costs.** Per changed key: one PUT, as today, and one DELETE (free on
+**Costs.** Per changed key: one PUT, and one DELETE (free on
 S3) when superseded, batched. Per commit: the delta's predecessor
 generations (a few bytes per changed key). Per full load of a keyed input: a
 read of its pinned index. In return: no gate, intents or repair for these
@@ -1308,28 +1309,12 @@ replacement every five minutes.
   is acceptable for a log of checks. Kept a day; ticks that did something
   are kept as long as the runs they caused.
 - **What a tick caused is a run like any other**: a source commit is a
-  run with no tasks (as API commits are today), a requested run is a run,
+  run with no tasks (as API commits are), a requested run is a run,
   tagged with the sensor and tick.
 
-### 11.6 What this removes
+### 11.6 Risks
 
-Compared with the spec-less tick attempt of the previous draft:
-
-- no launch path without a spec, and no attempt that is not journaled;
-- no per-launch bootstrap credential, no in-memory worker ownership per
-  tick, no tick result route;
-- no process start per check: a 300-second sensor on `Local` cost a
-  subprocess and an import every tick;
-- no `skipped` runs, attempts and `kind: observe` retention class: checks
-  that found nothing are tick rows, not runs;
-- no resolve route validated against an tick claim: small maps
-  resolve in the engine, big ones on the host.
-
-What it adds: the sensor worker (one long-lived process kind, which Pool
-workers resemble), two routes, a cursor per sensor in the engine's state,
-and the `ticks` table.
-
-**Risks.** User code in a long-lived process can leak memory or state
+User code in a long-lived process can leak memory or state
 between ticks, and a body that hangs holds a host thread: hosts are
 restarted when ticks overrun or after `host_max_ticks` (10,000). A host
 on an old deploy gets no ticks.
@@ -1398,7 +1383,7 @@ Two choices of this design keep a short attempt cheap:
   chunk. An attempt shorter than 30 s that logs a little writes no log
   object at all; its lines were live over HTTP meanwhile.
 
-| Per attempt | Today (counted from the code) | Target, `immutable` store | Target, `fenced` |
+| Per attempt | Before the control file (counted from that code) | `immutable` store | `fenced` |
 |---|---|---|---|
 | Engine PUTs | spec · journal: launch, placed, finished = 4 | spec, control file · journal: launch, finished = 4 | 4 |
 | Engine GETs | beats while provisioning ~1, result 1 = 2 | control file 1 | 1 |
@@ -1413,8 +1398,8 @@ file per table per minute, ~6 PUTs a minute: ~$1.30 a month, merges
 extra), `engine/alive.json` every 30 s while runs are live (~$0.43), and
 checkpoints (negligible here). The older model's $6.69 (4 PUT + 2 GET +
 one journal PUT) left out the beats, the gate, `AttemptPlaced` and the
-done beat: today really costs about twice it, and the target lands on it
-as a count rather than an underestimate. The control file adds one PUT
+done beat: that protocol really cost about twice it, and this one lands
+on it as a count rather than an underestimate. The control file adds one PUT
 per attempt (the engine's `open`, $1.30 a month here; requests are free
 on Railway), and saves the `closed` tombstone an attempt on a gated
 store paid when it ended without taking its gate. A longer attempt adds
@@ -1429,36 +1414,8 @@ answer and a post, with no object request and no journal write; one that
 commits pays the source commit (a journal PUT, and a delta file for keyed
 sources).
 
-## 14. What changes from today
+## 14. Open questions
 
-| Today | Target |
-|---|---|
-| `{attempt}.json`: spec, then overwritten with spec + result + log index | `.spec`, immutable, and the control file, swapped (§2.4) |
-| `.beat` every 30 s with a fence GET, then a done beat | HTTP beat every 10 s; `.beat` only while HTTP fails; `sealed` means done |
-| no worker identity; duplicates overwrite each other (R3) | the first swap to `owned` wins; losers write nothing and wait for the owner |
-| log chunks joined at the end, chunks deleted | immutable chunks every 30 s / 1 MB, indexed from the result; live lines over HTTP |
-| Pool: register, claim, renew, complete; in-memory leases; `AttemptClaimed` | long-poll discovery; ownership by the control file; four states; a dead owner expires into a new attempt |
-| cancel read from the fence by every beat; engine aborts at once | two-phase cancel: requested and drained, then forced |
-| any presumed death releases the partition (R1) | every store is `immutable` or `fenced`: released at once, the older writer unable to write |
-| a failed result releases the partition | a failure after the gate leaves its write `writing`; an attempt without a result is classified from its gate (§2.3) |
-| gates deleted with their run | the gate is the control file's `writing`, created by the engine before launch and only ever swapped: deleted with its run, a worker finding it gone stops (§2.4). (Built before K18: create-only gates retained `gate_days` as tombstones.) |
-| cancel and timeout indistinguishable to the worker | a latched cancel record with phase and reason, carried into the result (§2.2) |
-| repair before the store is fenced | `Store.acquire` before repair, for fenced stores |
-| resolve through `.ask` objects (proposal) | binary `resolve` route, nothing persisted |
-| observable sources as proposed attempts without a spec | sensors: ticks in a warm host, applied through the commit and run APIs, `SensorAdvanced` for the cursor, a lossy `ticks` table |
-| `{key}.json` overwritten in place (FileStore, S3Store) | `{key}/{generation}.json`, create-only; superseded and abandoned names collected without a lock |
-| one API token | admin token; per-attempt HMAC token from a stable secret; per-pool token |
-
-## 15. Open questions
-
-1. **`cancel_grace`.** 60 s by default; per asset, since a batch of
-   16 concurrent calls into a slow API may need longer to drain.
-2. **`sensor_map_max`.** Where a key map stops being posted to the engine
+1. **`sensor_map_max`.** Where a key map stops being posted to the engine
    and is resolved on the host instead; from the resolver's grid
    (`resolved-commits.md` §6), like its other thresholds.
-3. **Generation size.** Settled by format v3: one varint per entry, 8 B
-   per entry in all at 10M random ids without payloads
-   (`bench/keys/results.md`).
-4. **`gate_days`.** Settled by the control file (§2.4): there is no
-   retention to bound. A worker that finds its control file deleted
-   stops, however long it paused.

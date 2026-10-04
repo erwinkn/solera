@@ -508,9 +508,7 @@ class Engine(Attempts, Sensors, Staleness, Views):
             # What it wrote is cleaned up once a worker that outlives it can no longer add to
             # it: the asset's timeout and cancel grace after its end (the sweep, §9.8).
             info = self.manifest["assets"][task["asset"]]
-            event["late_writes"] = float(info.get("timeout") or 3600) + float(
-                info.get("cancel_grace") or self.cancel_grace
-            )
+            event["late_writes"] = float(info.get("timeout") or 3600) + self.cancel_grace
         if more:
             event["more"] = True
         if repairs:

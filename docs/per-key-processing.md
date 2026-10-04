@@ -4,12 +4,11 @@ Status: **§5–§11 and §13 built** (error classes, build identity, per-key in
 groups by key, the failed keys, retry passes, forced retries, the drain on
 cancel, `key_outcomes`, key patterns and pattern changes); the engine's
 match-count hints (§11) and summary recomputation (§9) are deferred, and
-`solera explain` (§10) is not built; §12 follows `lifecycle.md` §11
-(sensors). §20 records where the build departs from this
-text. It adds a per-key input (an asset written
-for one key, run over every changed key), keys that hold many rows,
-per-key outcomes with user-classified errors, key patterns on inputs, and
-observable sources. It builds on the engine cache, the HTTP resolver,
+`solera explain` (§10) is an API, not a CLI; §12 follows `lifecycle.md`
+§11 (sensors). §16 records where the build departs from this text. It
+covers a per-key input (an asset written for one key, run over every
+changed key), keys that hold many rows, per-key outcomes with
+user-classified errors, key patterns on inputs, and observable sources. It builds on the engine cache, the HTTP resolver,
 engine-served reads of `resolved-commits.md`, the versions of
 `versions.md`, and on the worker → engine HTTP channel and attempt
 objects of `lifecycle.md`: `{attempt}.spec` and the control file
@@ -33,19 +32,19 @@ async def icp(ctx, files: list[dict], sharepoint: SharePointClient):
     return Patch(pd.concat([f for f in frames if f is not None]), remove=ctx.batch["files"].removed)
 ```
 
-Three things in Solera force that shape:
+Three things in Solera forced that shape:
 
-1. **One key, one row.** A keyed write rejects a second row with the same
-   key ("duplicate key in write"), so a file that yields 40 samples cannot
-   be the key of its rows. `example/brimstone.py`'s `qaqc_samples` returns
-   exactly this and cannot run today.
-2. **No per-key failure.** One bad file fails the batch; the position stays
-   where it was, and every retry hits the same file first — a poison pill.
-   The only escape is to swallow the error, and then nothing ever retries
-   the file or shows that it failed.
+1. **One key, one row.** A keyed write rejected a second row with the same
+   key ("duplicate key in write"), so a file that yields 40 samples could
+   not be the key of its rows. `example/brimstone.py`'s `qaqc_samples`
+   returns exactly this.
+2. **No per-key failure.** One bad file failed the batch; the position
+   stayed where it was, and every retry hit the same file first — a poison
+   pill. The only escape was to swallow the error, and then nothing ever
+   retried the file or showed that it failed.
 3. **No filters on inputs.** Each asset wants one folder and a few name
-   patterns. Today the poller filters for its consumers, which couples it
-   to every one of them.
+   patterns. The poller filtered for its consumers, which coupled it to
+   every one of them.
 
 ## 2. The design in one paragraph
 
@@ -190,7 +189,7 @@ Incremental(output=None, *, include=None, exclude=None, batch_size=10_000, concu
   output.
 - **Deleted keys never call the function**: their rows are removed.
 - **Other inputs are whole and shared**: loaded once per attempt, given to
-  every call. A change to one resets the input, as today: every key is
+  every call. A change to one resets the input: every key is
   processed again. Joins with slowly changing tables belong downstream
   (§14).
 - **One per-key incremental per asset**, and no cursor (`Result(cursor=)` is rejected):
@@ -218,7 +217,7 @@ two-phase cancel (`lifecycle.md` §7); for a per-key batch the phases are:
 1. **Cancel requested** — the cancel record (`lifecycle.md` §2.2) reaches
    the worker with phase `requested`. The worker stops starting keys and cancels the calls in flight (an `async` call is
    cancelled; a thread is abandoned and its result ignored). Then, within
-   `cancel_grace` (60 s by default, per asset), it **drains**: it writes
+   `cancel_grace` (the engine's, 60 s by default), it **drains**: it writes
    the keys that finished — one store write per output, as for a whole
    batch — records the keys it did not finish as **interrupted** in the
    failure delta by the record's `reason` (table below), and publishes
@@ -253,8 +252,7 @@ What happens to the holes depends on the record's `reason`:
 | `timeout` | `timed out`, `tries + 1`, due after the retry backoff (§8) | by the retry clock (§9); once `tries` passes the asset's `retries=`, the key becomes `failed`, so a key that always outlives the timeout stops cycling |
 
 The attempt ends `canceled` or `timed out`, with the outputs it
-committed; an attempt timeout stays retryable within `retries=`, as
-today.
+committed; an attempt timeout stays retryable within `retries=`.
 
 **A store of current rows (D100).** A batch's classes follow the key
 index, at its pass's version — a full pass's snapshot, a delta's end —
@@ -431,10 +429,10 @@ does not, because the file is the problem. Failed is red and alertable;
 rejected is expected noise. Every automatic retry is bounded — none loops.
 
 **Outside the per-key call** — loading the batch, writing to a store — an
-exception fails the attempt as today. On a non-per-key incremental asset the classes
+exception fails the attempt. On a non-per-key incremental asset the classes
 apply to the attempt: `Rejected` fails the task without retries,
 `Transient` is retried after `retry_after` or the backoff, `Failed` and
-`Abort` follow `retries=` (today's behaviour).
+`Abort` follow `retries=`.
 
 **Stale** means a key's output does not reflect its current input
 revision. That has two causes: an upstream change not yet processed — in
@@ -801,7 +799,7 @@ word rules to segment-anchored patterns (`**/old/**`, `**/old *`,
 
 ## 12. Observable sources
 
-A `Source` today is an output with no producer, advanced from outside
+A `Source` is an output with no producer, advanced from outside
 through the commit API. An **observable source** adds `observe()`, which
 Solera calls on a schedule and commits like a commit-API call. It is sugar
 for a **sensor** (`lifecycle.md` §11): `Source(name, observe=Every(300))`
@@ -899,15 +897,15 @@ long-lived process, Temporal polls inside long activities.
 
 ## 13. Deploy from a build identity
 
-The deploy is today a digest of the manifest, which includes a
-`code_hash` per asset: a hash of the asset's whole source file. That is
-both noisy and blind — a cosmetic edit in `icp.py` makes a new deploy,
-a real fix in a helper `parsers.py` does not, so `OnDeploy()` misses
-helper-only deploys. Nothing invalidates on it; invalidation is the
-explicit `version=` and the fingerprint.
+The deploy was a digest of the manifest, which included a `code_hash`
+per asset: a hash of the asset's whole source file. That was both noisy
+and blind — a cosmetic edit in `icp.py` made a new deploy, a real fix in a
+helper `parsers.py` did not, so `OnDeploy()` missed helper-only deploys.
+Nothing invalidates on it; invalidation is the explicit `version=` and the
+fingerprint.
 
-Proposal: drop `code_hash` from the manifest; the deploy is
-`H(manifest, build)`, where `build` must identify the code exactly:
+So the manifest has no `code_hash`; the deploy is `H(manifest, build)`,
+where `build` identifies the code exactly:
 
 - `SOLERA_BUILD` when set — an immutable identifier from CI or the image
   (a commit SHA of a clean checkout, an image digest);
@@ -943,143 +941,14 @@ is below the current one.
   builds one `Incremental` asset maintaining `trace.ticks`. Solera
   sees only metadata.
 
-## 15. What the newer design changes in this proposal
-
-**Simpler.**
-
-- per-key incremental batches are small writes — `batch_size` keys — so their output
-  deltas take the HTTP resolver whenever the engine has the output's index
-  admitted to its cache (exact counts, no index reads on the worker), and
-  the cold path otherwise. Failure deltas are always resolved by the
-  worker itself (§9). The worker uploads both.
-- Retry batches, at `start`, and later pattern hints are answered from the one
-  warm engine cache, which `resolved-commits` builds anyway; this proposal
-  adds readers, not a cache.
-- Observable sources are sugar for sensors (`lifecycle.md` §11): no
-  launch path, result route or retention class of their own.
-- The failed keys are an ordinary key index: format, merges, cache,
-  delta naming, garbage collection — none new.
-- Indexes count keys, not rows: a file of 40 samples is one entry.
-- Per-key progress and key-tagged logs are live events on the HTTP
-  channel, not objects.
-
-**Harder.**
-
-- The canonical digest grammar must define the group production, which
-  is now every key's version, and be versioned (§6) — done, then
-  superseded: a key's version is a generation (`versions.md`), and the
-  grammar is gone.
-- `Rows` must group natively, and patches must move onto `Rows` (§7).
-- The position gains two places: the pattern change drain (§11) and the retry
-  pass (§9).
-- Cancel commits a partial batch (§5): it needs the lifecycle's two-phase
-  cancel, with a drain before any forced abort.
-
-**Obsolete**, from the earlier draft of this proposal.
-
-- `Store.keys(write, output) -> dict[str, str]`: replaced by the prepared
-  write (§7). A dict per write is the Python-object path that cost ~45 GB
-  at 100M keys.
-- "The engine reads small delta files to filter": replaced by evaluation
-  at commit from the cache (§11).
-- A failing set as a map in engine state: replaced by the failed keys
-  (§9).
-- Retrying failed keys when an asset's code hash changes: replaced by the
-  deploy number (§13).
-- A `rows` count per key in `key_outcomes`: dropped.
-- Filters in the poller (`example/brimstone.py`'s `is_qaqc_workbook`):
-  replaced by patterns on the consumer's input.
-- Ticks as attempts or runs, `skipped` tick runs and their
-  retention class: replaced by sensor ticks (§12).
-- `grouped=True` and the duplicate-key error: every key is a group (§6).
-
-## 16. Interactions with work in flight
-
-| Work | What this proposal needs from it |
-|---|---|
-| Key index (`object-store-state.md` §6) | No format change. A new kind of index (`keys/@{asset}/{partition}/`, the failed keys) merged like the others; `Rows` groups every key (§6), read once as the prepared write (§7); patches build `Rows`. |
-| Engine cache (`resolved-commits.md`) | New readers: retry batches, read at `start`, in v1; pattern counts at commit and failure-summary recomputation later. No new cached content beyond failed keys. |
-| HTTP resolver (`resolved-commits.md`) | per-key batches' output deltas are small resolves when the index is admitted; failure deltas are resolved locally, not by the resolver (§9 here is authoritative for the record, transitions, eligibility, pass state and forced-request identity; the engine's start reads run the same SDK functions, and its v1 has no pattern hints or summary recomputation); the worker uploads both. A sensor's full key map is resolved in-process (small) or on the host (big), not through an attempt's resolve. |
-| Attempt lifecycle (`lifecycle.md`) | The cancel record (§2.2) and write-completion evidence (§2.3), authoritative there; the two-phase cancel of §7, which §5 follows; live per-key events and key-tagged logs; per-key outcomes in the sealed result. Sensors (§11) carry observable sources: `Source.observe` declares one. |
-
-## 17. What changes in the code
-
-- `python/solera/sdk.py`: per-key incremental; `include`/`exclude` on `Incremental`;
-  `Output(meta=…)`; `Rejected`, `Failed`, `Transient(retry_after,
-  retry_for)`, `Abort`, `Project(errors=…)`; `Source.observe` as a sensor, `Observed`;
-  `ctx.key`, `ctx.generation`, `ctx.keys(output, prefix=)`; the deploy from
-  a build identity; `code_hash` removed.
-- `python/solera/stores.py`: `Patch({key: value})`; `prepare` and
-  `Prepared`; no duplicate-key error.
-- `python/solera_postgres`: group writes from the prepared write,
-  keyed loads as `dict[str, T]`.
-- `python/solera_worker/worker.py`: the per-key loop, classification,
-  outcomes, the failure delta, retry and pattern change batches, partial commits on
-  cancel.
-- `python/solera_server/engine.py`: the `Failures` record, the due clock,
-  deploy numbers, pattern change and retry places on the
-  position, alternation of retry and change batches, the cancel drain.
-- `python/solera_server/history.py`: `key_outcomes`; per-key counts on
-  `attempts`.
-- `native/`: the group digest and grouping in `Rows` (in progress), the
-  pattern matcher.
-- `example/brimstone.py`: the §4 shape; `qaqc_samples` becomes an
-  per-key incremental.
-- Docs: architecture §2 (outputs), §4 (writes, store hook), §5 (inputs,
-  sources), §6 (incrementality), §8 (runs and errors), §9 (observable sources as sensors),
-  §11 (deploy); `object-store-state.md` §5–7.
-
-## 18. Tests
-
-- per-key incremental delivers exactly what an equivalent batch asset returning
-  `Patch({key: …})` writes, over random batches, deletes and failures.
-- Groups: flat rows and the by-key form write the same keys; a key given
-  no rows is removed; an opaque write's keys are the partition's. (Group
-  versions were tested here until `versions.md` replaced them.)
-- Each error class in and out of the per-key call; `errors=` mapping;
-  `Transient` turning failed after its `retry_for`; failed keys retried
-  once per deploy and never more.
-- Cancel: the failure delta follows the `reason` of the record the worker
-  sealed with; a drain within `cancel_grace` commits finished keys whatever
-  their order, the interrupted holes and the position as one decision;
-  canceled keys never come due by themselves; timed-out keys count a try
-  and end `failed` past `retries=`; a forced abort commits nothing, or
-  ends with the evidence `lifecycle.md` §2.3 assigns; a late drain result is
-  refused.
-- Failed keys: a 1M-key systemic failure leaves state constant and no
-  commit rescans the index; every row of the transition table, with exact
-  outcome counts; the engine's and worker's eligibility agree; a deploy or
-  a forced retry mid-pass restarts the pass and misses no key; a worker
-  clock minutes off neither skips nor repeats a forced retry; a retry
-  request for one class leaves a pending one for another intact; pass
-  accumulators over several batches give the exact minima at completion,
-  with change batches committed in between; retry
-  passes answered at `start` when warm and read from the store when not; retry and change batches
-  alternate when both are pending; a due key changed upstream is
-  processed once.
-- Patterns: a batch with no matching key ends `skipped` with its
-  position advanced; a pattern change with
-  pending deletions of newly excluded keys removes their rows; the drain
-  delivers exactly the symmetric difference at the pattern change snapshot,
-  whatever is committed meanwhile; a second pattern change waits for the
-  first.
-- Build identity: an uncommitted edit, deployed twice with different
-  content, gives two deploys.
-- Observable sources: each `observe()` return shape becomes the right
-  `Tick`; unchanged ticks write nothing durable; a cursor-only tick
-  records `SensorAdvanced` without a new version or a wake-up; a tick whose
-  head identity is no longer current is refused — including an unkeyed
-  source whose version an API client changed — whether resolved by the
-  engine or on the host; a restart mid-tick drops it harmlessly.
-
-## 19. Open questions
+## 15. Open questions
 
 1. When a few keys at a time come due while new changes keep arriving,
    alternation runs small retry attempts between full change batches. Each
    costs a whole attempt; acceptable as is, or should a retry batch wait
    until it is full or its oldest key has waited long enough?
 
-## 20. As built
+## 16. As built
 
 Where the implementation (`solera/errors.py`, `solera/build.py`,
 `solera/failures.py`, `solera_worker/each.py`, the engine's `_each_plan` and

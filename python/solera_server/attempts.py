@@ -580,7 +580,7 @@ class Attempts:
         heartbeat = self.heartbeat_seconds
         info = self.manifest["assets"].get(task["asset"]) or {}
         limit = info.get("timeout") or 3600
-        grace = info.get("cancel_grace") or self.cancel_grace
+        grace = self.cancel_grace
         provision = getattr(placement, "provision_seconds", self.provision_seconds)
         is_pool = launched.get("pool") is not None
         began = loop.time()

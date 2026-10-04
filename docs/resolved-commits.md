@@ -109,7 +109,7 @@ through their predecessors' generations (§6).
 6. write         under the store's checks: fenced, every transaction checks the generation
 ```
 
-Repair reads before acquisition — what `_store_outputs` does today — would
+Repair reads before acquisition — what `_store_outputs` did before — would
 read `k=1` while an older transaction is about to commit `k=2`, and the new
 commit would then clear the intents with the index still saying `k=1`.
 Acquisition is a new store phase (`Store.acquire(context)`, a no-op for
@@ -259,7 +259,7 @@ freeze, no response to recover and no engine-written file to clean up.
   `removed`, `exact: true`, and the file's `digest` (§5, candidates). A
   response is capped at `resolve_max_bytes` (16 MB), so it is one file,
   below the 64 MB split. The `.kx` format version travels in the file's
-  footer as today; the worker refuses a version it cannot read and
+  footer; the worker refuses a version it cannot read and
   resolves locally.
 - `empty`: the write changes nothing in the index. No file;
   `DeltaFiles([], 0, 0, exact=True)`. §3 decides whether that means
@@ -314,7 +314,7 @@ the engine checks again.
 
 - **Source commits** (`commit_source`) run in the engine: they call the
   same warm resolver in-process, with the same local fallback, and keep
-  today's optimistic head check before recording.
+  the optimistic head check before recording.
 - **Sensor ticks** (`lifecycle.md` §11) post a small key map in this
   framing to their tick route, and the engine resolves it in-process as it
   does for source commits; a map over `sensor_map_max` is resolved on the
@@ -329,7 +329,7 @@ the engine checks again.
 | Case | Outcome |
 |---|---|
 | Engine unreachable, restarting, or slow | Local resolve after the timeout; same delta, possibly an inexact count (§6) |
-| Worker dies after the response, before the gate | Nothing to clean on the engine; the uploaded delta is the worker's and is cleaned up at attempt end as today |
+| Worker dies after the response, before the gate | Nothing to clean on the engine; the uploaded delta is the worker's and is cleaned up at attempt end |
 | Worker dies after the gate | Repair intents and repair (fenced); nothing for immutable stores |
 | Attempt canceled while a resolve runs | By the cancel record (`lifecycle.md` §2.2): a draining attempt still resolves; once the record is `forced`, or the attempt ended, a resolve checks that when it starts and between chunks, and stops, releasing its pins |
 | A merge publishes during a resolve | The resolve keeps the file set it pinned; garbage collection waits for the pin |
@@ -500,8 +500,8 @@ chosen by one rule each; `_plan_reads`, `_read_options`, `Cost`, the
 estimate and the CPU-rate options are deleted, and no other cost model
 replaces them.
 
-**Sparse reader**, for small patches — today's filtered path minus the
-planner:
+**Sparse reader**, for small patches — the filtered read path, without
+the planner:
 
 1. read every span small enough (≤ 32 MB) whole, all at once, and
    resolve newest first;
@@ -675,7 +675,7 @@ rule.
 Scenario E: 1K random changes every 10 s into 100M keys, 259,200 commits a
 month, steady state, per commit:
 
-| | Today (measured) | Resolver, warm (projected) |
+| | Worker-resolved (measured) | Resolver, warm (projected) |
 |---|---|---|
 | Worker index GETs | 50 | 0 |
 | Worker index PUTs | 1 (delta) | 1 (delta) |
@@ -685,9 +685,8 @@ month, steady state, per commit:
 | Key index requests / month | $6.79 | **$1.60** |
 
 That is $5.18 a month saved on scenario E's requests, before the engine's
-added disk, CPU and network. Earlier drafts added today's $6.69 of attempt
-and journal overhead to both columns; that figure is the lifecycle doc's
-to re-estimate, not this one's.
+added disk, CPU and network. An attempt's own requests are in
+`lifecycle.md` §13.
 
 **Elsewhere:**
 
@@ -779,9 +778,7 @@ reports both.
 - **Later, not v1:** pattern skip hints and coalesced recomputation of
   failure minima (§8).
 
-## 12. Where this departs from the reviews
-
-The follow-up review agrees with all three.
+## 12. Three choices
 
 - **No frozen request per attempt.** The resolver persists nothing and
   decides nothing, so a retried request needs no stored answer: it is
@@ -808,10 +805,6 @@ The follow-up review agrees with all three.
 3. **Page cache vs SSD.** Whether a 100M-key index needs its hot blocks in
    RAM (a bigger `cache_ram`) to stay well ahead of a cold worker, or SSD
    reads suffice.
-4. **With `lifecycle.md`:** settled there — the route (§5.1),
-   `Store.acquire` (§9.7), and failure deltas staying out of the gate's
-   intents (§9.6); sensors (§11 there) need no attempt validation. Its
-   §9.8 collection follows §6 here: every predecessor named at resolution.
 
 ## 14. As built
 
