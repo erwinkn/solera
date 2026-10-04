@@ -665,3 +665,72 @@ def test_pages_with_small_limits_see_every_key_whose_versions_cross_blocks(
                 assert paged == list(zip(point.keys, point.classes, point.generations, strict=True))
 
     asyncio.run(run())
+
+
+async def _one_key(gens, options, endpoints):
+    """One key written at each of `gens`, every commit's span merged into one keeping `endpoints`."""
+
+    io, state = ObjectIO(MemoryStore()), IndexState(prefix="keys/x/_/", life="1")
+    for c, g in enumerate(gens):
+        delta, _ = await KeyIndex(io, None, state, options).resolve(
+            SortedEntries.of([b"k"]), commit_number=c, attempt=str(c), generation=g
+        )
+        state = state.committed(c, delta)
+    merged = await KeyIndex(io, None, state, options).merge((0, len(gens)), endpoints)
+    return io, state.merged(merged.inputs, merged.span)
+
+
+async def test_a17_r2_a_page_finishes_a_key_whose_versions_fill_its_blocks():
+    """A17 R2, as reproduced: 20 versions of one key in blocks of a few
+    entries. A page of one key returned nothing and no cursor, or, from a
+    cursor before the key, the same cursor forever."""
+
+    io, state = await _one_key(range(1, 21), Options(block_size=16), set(range(1, 20)))
+    idx = KeyIndex(io, None, state)
+    assert await idx.lookup([b"k"]) == {b"k": (20, None)}
+    assert await idx.page(None, 1) == ([b"k"], [20], [None], None)
+    assert await idx.page(b"j", 1) == ([b"k"], [20], [None], None)
+    page = await idx.changes_page(1, 19, None, 1)
+    assert (page.keys, page.generations, page.cursor) == ([b"k"], [20], None)
+
+
+async def test_a17_r9_an_explicit_maximum_generation_is_a_bound():
+    """A17 R9: `k` at 2**64 - 2 (commit 0), then 2**64 - 1 (commit 1), endpoint
+    1 kept. At endpoint 1 the key is the first; `2**64 - 1` meant "no bound"."""
+
+    top = 2**64 - 1
+    io, state = await _one_key([top - 1, top], Options(), {1})
+    idx = KeyIndex(io, None, state)
+    assert await idx.lookup([b"k"], at=1) == {b"k": (top - 1, None)}
+    assert (await idx.page(None, 10, at=1))[:2] == ([b"k"], [top - 1])
+    assert (await idx.changes_page(0, 0, None, 10)).generations == [top - 1]
+    assert await idx.lookup([b"k"]) == {b"k": (top, None)}
+
+
+async def test_a17_r7_a_rewrite_that_drops_too_little_uploads_nothing():
+    """A17 R7, as reproduced: a tail span of two segments of 100 different
+    keys each, its boundary retired, looks stale but drops nothing. Its
+    rewrite was uploaded and deleted again before every commit; now it is
+    counted without uploading, and, once remembered, not planned again."""
+
+    io, state = ObjectIO(MemoryStore()), IndexState(prefix="keys/x/_/", life="1")
+    batches = (
+        [b"b%04d" % i for i in range(1000)],
+        [b"x%04d" % i for i in range(100)],
+        [b"y%04d" % i for i in range(100)],
+    )
+    for c, ks in enumerate(batches):
+        d, _ = await KeyIndex(io, None, state).resolve(
+            SortedEntries.of(ks), commit_number=c, attempt=str(c), generation=c + 1
+        )
+        state = state.committed(c, d)
+    merged = await KeyIndex(io, None, state).merge((1, 2), {2})
+    state = state.merged(merged.inputs, merged.span)
+    idx = KeyIndex(io, None, state)
+    plan = idx.plan_merge(set())
+    assert plan == (1, 1)  # the tail, alone: it looks stale
+    puts = io.metrics.puts
+    assert await idx.merge(plan, set()) is None and io.metrics.puts == puts  # nothing uploaded
+    rejected = frozenset({KeyIndex.rewrite_key(state.spans[1], set())})
+    assert idx.plan_merge(set(), rejected=rejected) is None
+    assert KeyIndex.rewrite_key(state.spans[1], {2}) not in rejected  # an endpoint coming back changes it

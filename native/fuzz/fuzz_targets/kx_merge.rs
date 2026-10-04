@@ -32,6 +32,6 @@ fuzz_target!(|input: Input| {
         input.upto,
         input.limit as usize,
         input.drop_deleted,
-        u64::MAX,
+        None,
     );
 });

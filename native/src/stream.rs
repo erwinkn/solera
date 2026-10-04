@@ -392,16 +392,17 @@ pub struct Merge {
     /// The key last returned: a run's further entries of it are older versions.
     prev: Vec<u8>,
     started: bool,
-    below: u64,
+    below: Option<u64>,
 }
 
 impl Merge {
     pub fn new(runs: usize) -> Merge {
-        Merge::below(runs, u64::MAX)
+        Merge::below(runs, None)
     }
 
-    /// The merge as of a reserved endpoint: each key's newest entry older than `below`.
-    pub fn below(runs: usize, below: u64) -> Merge {
+    /// The merge as of a reserved endpoint: each key's newest entry older than
+    /// `below` (None: the head).
+    pub fn below(runs: usize, below: Option<u64>) -> Merge {
         Merge {
             runs: (0..runs).map(|_| Stream::default()).collect(),
             heap: Vec::with_capacity(runs),

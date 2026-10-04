@@ -62,8 +62,6 @@ class Upkeep:
         self.jobs = Tasks("upkeep jobs")  # merges running, by (index key, lane)
         self.failing = {} if failing is None else failing  # what fails now, by name: the engine's
         self._checked: dict[tuple, IndexState] = {}  # the state last found needing nothing
-        self._attempts: dict[tuple, int] = {}  # merge attempts, by index key and input spans
-        self.stopped: set[tuple] = set()  # indexes whose merges failed `MERGE_ATTEMPTS` times
         self._busy: dict[tuple, frozenset] = {}  # the input spans of each merge running, by (key, lane)
         self._swept = -math.inf
         self._alive = -math.inf
@@ -102,13 +100,26 @@ class Upkeep:
 
     def maintain(self) -> None:
         """Start span merges, `concurrency` at a time: per index, one into the
-        base and one among the other spans, whose inputs never overlap."""
+        base and one among the other spans, whose inputs never overlap. An
+        index whose merges of one input set were uploaded `MERGE_ATTEMPTS`
+        times in its current life, none published, merges no more, alarmed:
+        the count is durable (`Model.merges`), so neither a restart nor a
+        takeover resets it, and a new life starts afresh (A17 R8)."""
 
         for key, index in list(self.m.indexes.items()):
             if len(self.jobs) >= self.concurrency:
                 break
-            if self._checked.get(key) is index or key in self.stopped:
+            if self._checked.get(key) is index:
                 continue
+            rec = self.m.merge_record(key, index.life)
+            spent = [k for k, n in rec["attempts"].items() if n >= MERGE_ATTEMPTS]
+            if spent:
+                self.failing[f"key index {key[0]}/{key[1]} merges"] = (
+                    f"a merge of {spent[0]!r} was uploaded {MERGE_ATTEMPTS} times, none published: "
+                    "this index merges no more in its life"
+                )
+                continue
+            self.failing.pop(f"key index {key[0]}/{key[1]} merges", None)
             endpoints = self.m.endpoints(*key)
             planned = False
             for lane in ("base", "tail"):
@@ -116,21 +127,12 @@ class Upkeep:
                     continue
                 other = self._busy.get((key, "tail" if lane == "base" else "base"), frozenset())
                 plan = KeyIndex(None, None, index, self.key_options).plan_merge(
-                    endpoints, lane=lane, busy=other
+                    endpoints, lane=lane, busy=other, rejected=frozenset(rec["rejected"])
                 )
                 if plan is None:
                     continue
                 lo, count = plan
-                inputs = tuple((sp.a, sp.b) for sp in index.spans[lo : lo + count])
-                tries = self._attempts.get((key, inputs), 0)
-                if tries >= MERGE_ATTEMPTS:
-                    self.stopped.add(key)
-                    self.failing[f"key index {key[0]}/{key[1]} merges"] = (
-                        f"merging spans {inputs} failed {tries} times: this index merges no more until restart"
-                    )
-                    break
-                self._attempts[(key, inputs)] = tries + 1
-                self._busy[(key, lane)] = frozenset(inputs)
+                self._busy[(key, lane)] = frozenset((sp.a, sp.b) for sp in index.spans[lo : lo + count])
                 self.jobs.spawn(self._merge(key, lane, index, plan, endpoints), key=(key, lane))
                 planned = True
             if not planned and not any((key, lane) in self.jobs for lane in ("base", "tail")):
@@ -140,18 +142,23 @@ class Upkeep:
         """One span merge, run on a worker thread with its own event loop so
         merging never blocks the engine, then published through the journal
         if the index is still the life it was planned against and holds its
-        inputs; else its output is deleted. Writes are exact, so a merge lets
-        go of no object the deltas did not already list."""
+        inputs; else its output is deleted. A span rewritten alone is first
+        counted without uploading: if it would drop too little, that is
+        remembered and nothing is uploaded (A17 R7). Every upload is counted,
+        durably, before it starts. Writes are exact, so a merge lets go of no
+        object the deltas did not already list."""
 
         options, objects, service = self.key_options, self.state.objects, self.keys
         epoch = self.state.journal.epoch
+        output, partition = key
+        lo, count = plan
 
-        def work():
+        def work(call):
             async def go(local):
                 keys = KeyIndex(ObjectIO(objects, local=local), None, index, options)
                 if service is not None:
                     keys.on_write = lambda path, f, data: service.installed(index.prefix, f, path, data)
-                return await keys.merge(plan, endpoints, epoch=epoch)
+                return await call(keys)
 
             # One warm copy serves every engine reader: an index the engine's cache
             # holds is read from its local files, the store otherwise.
@@ -165,20 +172,41 @@ class Upkeep:
 
         try:
             try:
-                merged = await asyncio.to_thread(work)
+                if count == 1 and not await asyncio.to_thread(
+                    work, lambda keys: keys.drops_enough(plan, endpoints)
+                ):
+                    rewrite = KeyIndex.rewrite_key(index.spans[lo], endpoints)
+                    self.state.record(
+                        {
+                            "type": "MergeRejected",
+                            "output": output,
+                            "partition": partition,
+                            "life": index.life,
+                            "rewrite": rewrite,
+                            "at": self.clock(),
+                        }
+                    )
+                    return
+                inputs = ";".join(",".join(f.name for f in sp.files) for sp in index.spans[lo : lo + count])
+                self.state.record(
+                    {
+                        "type": "MergeAttempted",
+                        "output": output,
+                        "partition": partition,
+                        "life": index.life,
+                        "inputs": inputs,
+                        "at": self.clock(),
+                    }
+                )
+                await self.state.durable()  # counted before anything is uploaded
+                merged = await asyncio.to_thread(
+                    work, lambda keys: keys.merge(plan, endpoints, epoch=epoch, checked=True)
+                )
             except Exception as error:
                 self.failing[f"key index {key[0]}/{key[1]}"] = f"{type(error).__name__}: {error}"
                 log.exception("key index merge failed for %s", key)
                 return
             self.failing.pop(f"key index {key[0]}/{key[1]}", None)
-            if merged is None:  # a rewrite that would not drop a quarter: nothing to publish,
-                self._attempts.pop(
-                    (key, tuple((sp.a, sp.b) for sp in index.spans[plan[0] : plan[0] + plan[1]])), None
-                )
-                if self.m.indexes.get(key) is index:  # nor to plan again until the index changes
-                    self._checked[key] = index
-                return
-            output, partition = key
             current = self.m.indexes.get(key)
             if (
                 current is None
@@ -202,7 +230,6 @@ class Upkeep:
                     "at": self.clock(),
                 }
             )
-            self._attempts.pop((key, tuple(merged.inputs)), None)
             if self.keys is not None:  # published: no new snapshot reads its inputs
                 kept = (self.m.indexes.get(key) or current).referenced()
                 self.keys.retired([index.path(n) for names in merged.names for n in names if n not in kept])

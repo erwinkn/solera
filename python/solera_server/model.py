@@ -169,6 +169,7 @@ class Model:
             "project": self.project,
             "heads": _nest(self.heads, 2),
             "indexes": _nest({k: v.to_json() for k, v in self.indexes.items()}, 2),
+            "merges": _nest(self.merges, 2),
             "garbage": self.garbage,
             "deleted": self.deleted,
             "partitions": _nest(self.partitions, 2),
@@ -199,6 +200,11 @@ class Model:
         self.indexes: dict[tuple, IndexState] = {
             k: IndexState.from_json(v) for k, v in _flatten(snap.get("indexes"), 2).items()
         }
+        # (output, partition) -> what merges of the index's current life tried
+        # (docs/key-index-design.md § The write bound): `life`, `attempts` by
+        # input files (uploads, failed or abandoned, none published) and the
+        # span rewrites found to drop too little (`rejected`).
+        self.merges: dict[tuple, dict] = _flatten(snap.get("merges"), 2)
         # [path, n]: files nothing references since the n-th event applied
         self.garbage: list[list] = snap.get("garbage") or []
         # deleted runs whose directories are still to be deleted (§11)
@@ -1468,6 +1474,55 @@ class Model:
         for name in sorted(before.referenced() - index.referenced()):
             self.garbage.append([before.path(name), self.event_counter])
 
+    def merge_record(self, key: tuple, life: str) -> dict:
+        """What merges of this index's life `life` tried: another life's count
+        for nothing (A17 R8)."""
+
+        rec = self.merges.get(key)
+        return (
+            rec if rec is not None and rec["life"] == life else {"life": life, "attempts": {}, "rejected": []}
+        )
+
+    def _merge_record(self, key: tuple, life: str) -> dict:
+        rec = self.merge_record(key, life)
+        self.merges[key] = rec
+        return rec
+
+    def _on_MergeAttempted(self, e):
+        """A merge of these input files is about to upload: counted before it
+        does, whatever comes of it."""
+
+        rec = self._merge_record((e["output"], e["partition"]), e["life"])
+        rec["attempts"][e["inputs"]] = rec["attempts"].get(e["inputs"], 0) + 1
+
+    def _on_MergeRejected(self, e):
+        """A span rewrite found, without uploading, to drop too little: not
+        tried again until its files or the endpoints inside it change."""
+
+        rec = self._merge_record((e["output"], e["partition"]), e["life"])
+        if e["rewrite"] not in rec["rejected"]:
+            rec["rejected"].append(e["rewrite"])
+
+    def _prune_merges(self, key: tuple) -> None:
+        """Forget what merges tried of files the index no longer holds, and
+        another life's record."""
+
+        rec, index = self.merges.get(key), self.indexes.get(key)
+        if rec is None:
+            return
+        if index is None or rec["life"] != index.life:
+            del self.merges[key]
+            return
+        held = index.referenced()
+        rec["attempts"] = {
+            k: n
+            for k, n in rec["attempts"].items()
+            if all(f in held for f in k.replace(";", ",").split(",") if f)
+        }
+        rec["rejected"] = [
+            r for r in rec["rejected"] if all(f in held for f in r.split("|")[0].split(",") if f)
+        ]
+
     def _on_IndexMerged(self, e):
         """A merge of adjacent spans published: installed if the index is the
         life it was planned against and still holds exactly its inputs; else
@@ -1484,8 +1539,10 @@ class Model:
         if index is None or index.life != e["life"] or not index.holds(e["inputs"], e["names"]):
             prefix = e.get("prefix") or (index.prefix if index is not None else "")
             self.garbage.extend([f"{prefix}{f.name}.kx", self.event_counter] for f in span.files)
+            self._prune_merges(key)
             return
         self._replace_index(key, index.merged([tuple(r) for r in e["inputs"]], span))
+        self._prune_merges(key)
 
     def _on_FilesCleanedUp(self, e):
         gone = set(e["paths"])

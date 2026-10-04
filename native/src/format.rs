@@ -563,7 +563,7 @@ pub fn merge_page(
     bound: Option<&[u8]>,
     limit: usize,
     drop_deleted: bool,
-    below: u64,
+    below: Option<u64>,
 ) -> Result<Page> {
     if codecs.len() != runs.len() {
         return Err(Error::Value("a codec per run".into()));

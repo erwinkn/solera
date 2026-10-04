@@ -77,8 +77,33 @@ impl<'a> Run<'a> {
     }
 }
 
-/// Runs merged by key: each key once, with every version the runs hold,
-/// newest first.
+/// One key's versions, newest first, taken one at a time: what a reader
+/// or a merge keeps of a key is its fold's state, never every version the
+/// key holds (A17 R10: one hot key may hold a version per live endpoint).
+pub trait Fold {
+    fn push(&mut self, v: Version) -> Result<()>;
+}
+
+/// Versions passed over: a key a page skips.
+pub struct Skip;
+
+impl Fold for Skip {
+    fn push(&mut self, _: Version) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// Every version, collected: tests, and folds over a key's whole history.
+pub struct Collect(pub Vec<Version>);
+
+impl Fold for Collect {
+    fn push(&mut self, v: Version) -> Result<()> {
+        self.0.push(v);
+        Ok(())
+    }
+}
+
+/// Runs merged by key: each key once, its versions streamed newest first.
 pub struct Groups<'a> {
     runs: Vec<Run<'a>>,
 }
@@ -107,74 +132,121 @@ impl<'a> Groups<'a> {
         Ok(Groups { runs })
     }
 
-    pub fn next_group(&mut self) -> Result<Option<(Vec<u8>, Vec<Version>)>> {
-        let Some(key) = self
-            .runs
+    /// The next key, or None at the end.
+    pub fn peek(&self) -> Option<Vec<u8>> {
+        self.runs
             .iter()
             .filter_map(Run::key)
             .min()
             .map(<[u8]>::to_vec)
-        else {
+    }
+
+    /// The next key, its versions pushed into `fold` newest first across the
+    /// runs (their order checked); None at the end.
+    pub fn next_into(&mut self, fold: &mut impl Fold) -> Result<Option<Vec<u8>>> {
+        let Some(key) = self.peek() else {
             return Ok(None);
         };
-        let mut versions = Vec::new();
+        let mut prev: Option<u64> = None;
         for r in &mut self.runs {
             while r.key() == Some(key.as_slice()) {
                 let v = r.take()?;
-                if let Some(prev) = versions.last().map(|p: &Version| p.generation) {
-                    if v.generation >= prev {
-                        return Err(Error::Format(format!(
-                            "versions of {:?} out of order: {} after {}",
-                            String::from_utf8_lossy(&key),
-                            v.generation,
-                            prev
-                        )));
-                    }
+                if let Some(p) = prev.filter(|&p| v.generation >= p) {
+                    return Err(Error::Format(format!(
+                        "versions of {:?} out of order: {} after {}",
+                        String::from_utf8_lossy(&key),
+                        v.generation,
+                        p
+                    )));
                 }
-                versions.push(v);
+                prev = Some(v.generation);
+                fold.push(v)?;
             }
         }
-        Ok(Some((key, versions)))
+        Ok(Some(key))
+    }
+
+    /// The next key and every version of it.
+    pub fn next_group(&mut self) -> Result<Option<(Vec<u8>, Vec<Version>)>> {
+        let mut all = Collect(Vec::new());
+        Ok(self.next_into(&mut all)?.map(|k| (k, all.0)))
     }
 }
 
 /// The versions a merge keeps of one key (newest first): the newest, and
 /// each one a live endpoint sees (an endpoint generation `g` with
 /// `version < g <= next newer version`). The predecessor, with its payload,
-/// goes on the oldest kept version. With `base` (the output starts at commit 0), its initial
-/// segment, before the first live endpoint, keeps live keys only, and no
-/// version keeps a predecessor; later segments keep their tombstones.
+/// goes on the oldest kept version. With `base` (the output starts at commit
+/// 0), its initial segment, before the first live endpoint, keeps live keys
+/// only, and no version keeps a predecessor; later segments keep their
+/// tombstones. One version at a time: only the last kept one waits, for the
+/// predecessor only the key's end can tell.
+pub struct Retainer {
+    endpoints: Vec<u64>,
+    base: bool,
+    newer: Option<u64>,
+    pending: Option<Version>,
+    oldest: (Option<u64>, Option<Vec<u8>>),
+}
+
+impl Retainer {
+    pub fn new(mut endpoints: Vec<u64>, base: bool) -> Retainer {
+        endpoints.sort_unstable();
+        endpoints.dedup();
+        Retainer {
+            endpoints,
+            base,
+            newer: None,
+            pending: None,
+            oldest: (None, None),
+        }
+    }
+
+    /// The (sorted) endpoints it keeps versions for.
+    pub fn endpoints(&self) -> &[u64] {
+        &self.endpoints
+    }
+
+    /// The next version (newest first): a kept version now final, if any.
+    pub fn push(&mut self, mut v: Version) -> Option<Version> {
+        let seen = match self.newer {
+            None => true,
+            Some(n) => {
+                // An endpoint g with v < g <= n: the first endpoint above v.
+                let i = self.endpoints.partition_point(|&g| g <= v.generation);
+                self.endpoints.get(i).is_some_and(|&g| g <= n)
+            }
+        };
+        self.newer = Some(v.generation);
+        self.oldest = (v.predecessor.take(), v.prior.take());
+        if !seen {
+            return None;
+        }
+        self.pending.replace(v)
+    }
+
+    /// The key's last kept version, with the predecessor of its oldest.
+    pub fn finish(&mut self) -> Option<Version> {
+        let mut v = self.pending.take()?;
+        let oldest = std::mem::take(&mut self.oldest);
+        self.newer = None;
+        if self.base {
+            let first = self.endpoints.first().copied();
+            if v.deleted && first.is_none_or(|f| v.generation < f) {
+                return None;
+            }
+        } else {
+            (v.predecessor, v.prior) = oldest;
+        }
+        Some(v)
+    }
+}
+
+/// `Retainer` over a key's whole history (`endpoints` in any order).
 pub fn retain(versions: &[Version], endpoints: &[u64], base: bool) -> Vec<Version> {
-    let Some(oldest) = versions.last() else {
-        return Vec::new();
-    };
-    let (span_predecessor, span_prior) = (oldest.predecessor, oldest.prior.clone());
-    let mut kept: Vec<Version> = Vec::new();
-    for (i, v) in versions.iter().enumerate() {
-        let seen = i > 0
-            && endpoints
-                .iter()
-                .any(|&g| v.generation < g && g <= versions[i - 1].generation);
-        if i == 0 || seen {
-            kept.push(Version {
-                predecessor: None,
-                prior: None,
-                ..v.clone()
-            });
-        }
-    }
-    if base {
-        let first = endpoints.iter().copied().min().unwrap_or(u64::MAX);
-        if kept
-            .last()
-            .is_some_and(|v| v.generation < first && v.deleted)
-        {
-            kept.pop();
-        }
-    } else if let Some(v) = kept.last_mut() {
-        v.predecessor = span_predecessor;
-        v.prior = span_prior;
-    }
+    let mut r = Retainer::new(endpoints.to_vec(), base);
+    let mut kept: Vec<Version> = versions.iter().filter_map(|v| r.push(v.clone())).collect();
+    kept.extend(r.finish());
     kept
 }
 
@@ -227,46 +299,106 @@ pub const REMOVED: u8 = 2;
 pub const NEITHER: u8 = 3;
 
 /// One key's change over `[P, N]`, from the versions of the spans
-/// overlapping it (newest first), clipped to generations `[g_p, g_n1)`:
-/// None if it has no version in the range; else its class, and its newest
-/// version in the range (its state at N). Classes are by presence at the
-/// two ends — the net rule: a key absent at both is neither, and so is one
-/// live at both with equal payloads (a source key back at the version it
-/// had before P). Without payloads, live at both ends is updated: every
-/// write of a derived output is a change.
-pub fn change(versions: &[Version], g_p: u64, g_n1: u64) -> Option<(u8, &Version)> {
-    let at_n = versions.iter().find(|v| older(v.generation, g_n1))?;
-    if at_n.generation < g_p {
-        return None; // nothing in the range
+/// overlapping it (newest first), clipped to generations `[g_p, g_n1)`
+/// (`g_n1` None: the head): None if it has no version in the range; else
+/// its class, and its newest version in the range (its state at N). Classes
+/// are by presence at the two ends — the net rule: a key absent at both is
+/// neither, and so is one live at both with equal payloads (a source key
+/// back at the version it had before P). Without payloads, live at both
+/// ends is updated: every write of a derived output is a change. One version
+/// at a time: it keeps the state at N, the state before P, and what the
+/// oldest version replaced.
+pub struct Changed {
+    g_p: u64,
+    g_n1: Option<u64>,
+    at_n: Option<Version>,
+    before: Option<(bool, Option<Vec<u8>>)>,
+    oldest: (Option<u64>, Option<Vec<u8>>),
+}
+
+impl Changed {
+    pub fn new(g_p: u64, g_n1: Option<u64>) -> Changed {
+        Changed {
+            g_p,
+            g_n1,
+            at_n: None,
+            before: None,
+            oldest: (None, None),
+        }
     }
-    // The state before P: its version, else what the oldest version replaced.
-    let (before, payload) = match versions.iter().find(|v| v.generation < g_p) {
-        Some(v) => (!v.deleted, v.payload.as_deref()),
-        None => match versions.last() {
-            Some(v) if v.predecessor.is_some() => (true, v.prior.as_deref()),
-            _ => (false, None),
-        },
-    };
-    let class = match (before, !at_n.deleted) {
-        (false, true) => ADDED,
-        (true, true) if payload.is_some() && payload == at_n.payload.as_deref() => NEITHER,
-        (true, true) => UPDATED,
-        (true, false) => REMOVED,
-        (false, false) => NEITHER,
-    };
-    Some((class, at_n))
+
+    pub fn finish(self) -> Option<(u8, Version)> {
+        let at_n = self.at_n?;
+        if at_n.generation < self.g_p {
+            return None; // nothing in the range
+        }
+        // The state before P: its version, else what the oldest version replaced.
+        let (before, payload) = match self.before {
+            Some(b) => b,
+            None => match self.oldest {
+                (Some(_), prior) => (true, prior),
+                _ => (false, None),
+            },
+        };
+        let class = match (before, !at_n.deleted) {
+            (false, true) => ADDED,
+            (true, true) if payload.is_some() && payload == at_n.payload => NEITHER,
+            (true, true) => UPDATED,
+            (true, false) => REMOVED,
+            (false, false) => NEITHER,
+        };
+        Some((class, at_n))
+    }
+}
+
+impl Fold for Changed {
+    fn push(&mut self, mut v: Version) -> Result<()> {
+        self.oldest = (v.predecessor, v.prior.take());
+        if self.before.is_none() && v.generation < self.g_p {
+            self.before = Some((!v.deleted, v.payload.clone()));
+        }
+        if self.at_n.is_none() && older(v.generation, self.g_n1) {
+            self.at_n = Some(v);
+        }
+        Ok(())
+    }
+}
+
+/// `Changed` over a key's whole history.
+pub fn change(versions: &[Version], g_p: u64, g_n1: Option<u64>) -> Option<(u8, Version)> {
+    let mut c = Changed::new(g_p, g_n1);
+    for v in versions {
+        c.push(v.clone()).expect("a fold");
+    }
+    c.finish()
 }
 
 /// A key's state at a reserved endpoint: its newest version older than
-/// `g_bound` (`u64::MAX`: the head).
-pub fn at(versions: &[Version], g_bound: u64) -> Option<&Version> {
-    versions.iter().find(|v| older(v.generation, g_bound))
+/// `bound` (None: the head), one version at a time.
+pub struct At {
+    bound: Option<u64>,
+    pub found: Option<Version>,
 }
 
-/// Whether generation `g` lies below `bound`; `u64::MAX` bounds nothing (the
-/// head), not even a generation of `u64::MAX`.
-pub fn older(g: u64, bound: u64) -> bool {
-    bound == u64::MAX || g < bound
+impl At {
+    pub fn new(bound: Option<u64>) -> At {
+        At { bound, found: None }
+    }
+}
+
+impl Fold for At {
+    fn push(&mut self, v: Version) -> Result<()> {
+        if self.found.is_none() && older(v.generation, self.bound) {
+            self.found = Some(v);
+        }
+        Ok(())
+    }
+}
+
+/// Whether generation `g` lies below `bound`; None bounds nothing (the
+/// head). `Some(u64::MAX)` is an exclusive bound like any other (A17 R9).
+pub fn older(g: u64, bound: Option<u64>) -> bool {
+    bound.is_none_or(|b| g < b)
 }
 
 pub struct Page<T> {
@@ -279,27 +411,29 @@ pub struct Page<T> {
     pub skipped: u64,
 }
 
-/// A page of keys in `(after, bound)`, each mapped by `f` (None: skipped).
-/// Every run must hold all of its blocks for that key window: below `bound`,
-/// nothing a run holds is missing.
-pub fn page<T>(
+/// A page of keys in `(after, bound)`, each folded by a fold from `new`
+/// and mapped by `finish` (None: skipped). Every run must hold all of its
+/// blocks for that key window: below `bound`, nothing a run holds is missing.
+pub fn page<T, F: Fold>(
     runs: &[Vec<&[u8]>],
     codecs: &[u8],
     after: Option<&[u8]>,
     bound: Option<&[u8]>,
     limit: usize,
-    f: impl FnMut(&[Version]) -> Option<T>,
+    new: impl FnMut() -> F,
+    finish: impl FnMut(F) -> Option<T>,
 ) -> Result<Page<T>> {
-    page_of(Groups::new(runs, codecs)?, after, bound, limit, f)
+    page_of(Groups::new(runs, codecs)?, after, bound, limit, new, finish)
 }
 
 /// `page`, over any runs.
-pub fn page_of<T>(
+pub fn page_of<T, F: Fold>(
     mut g: Groups<'_>,
     after: Option<&[u8]>,
     bound: Option<&[u8]>,
     limit: usize,
-    mut f: impl FnMut(&[Version]) -> Option<T>,
+    mut new: impl FnMut() -> F,
+    mut finish: impl FnMut(F) -> Option<T>,
 ) -> Result<Page<T>> {
     let mut out = Page {
         items: Vec::new(),
@@ -307,8 +441,9 @@ pub fn page_of<T>(
         more: false,
         skipped: 0,
     };
-    while let Some((key, versions)) = g.next_group()? {
+    while let Some(key) = g.peek() {
         if after.is_some_and(|a| key.as_slice() <= a) {
+            g.next_into(&mut Skip)?;
             continue;
         }
         if bound.is_some_and(|b| key.as_slice() >= b) {
@@ -318,7 +453,9 @@ pub fn page_of<T>(
             out.more = true;
             return Ok(out);
         }
-        match f(&versions) {
+        let mut f = new();
+        g.next_into(&mut f)?;
+        match finish(f) {
             Some(t) => out.items.push((key.clone(), t)),
             None => out.skipped += 1,
         }
@@ -407,24 +544,24 @@ mod tests {
     fn change_is_clipped_to_its_range() {
         // A12-2: k added at 10 (no pred), removed at 20; changes over [10, 20).
         let vs = vec![v(20, true, None), v(10, false, None)];
-        assert_eq!(change(&vs, 10, 20).map(|c| c.0), Some(ADDED));
-        assert_eq!(change(&vs, 10, u64::MAX).map(|c| c.0), Some(NEITHER));
-        assert_eq!(change(&vs, 20, u64::MAX).map(|c| c.0), Some(REMOVED));
+        assert_eq!(change(&vs, 10, Some(20)).map(|c| c.0), Some(ADDED));
+        assert_eq!(change(&vs, 10, None).map(|c| c.0), Some(NEITHER));
+        assert_eq!(change(&vs, 20, None).map(|c| c.0), Some(REMOVED));
         // First touched after N: not in the range.
-        assert_eq!(change(&vs, 0, 10), None);
+        assert_eq!(change(&vs, 0, Some(10)), None);
     }
 
     #[test]
     fn a_source_key_back_at_its_version_is_neither() {
         // k: v1 before P (commit 0, gen 1); v2 at gen 10, v1 again at gen 20.
         let held = [p(20, b"v1", None), p(10, b"v2", None), p(1, b"v1", None)];
-        assert_eq!(change(&held, 5, u64::MAX).unwrap().0, NEITHER);
-        assert_eq!(change(&held, 5, 15).unwrap().0, UPDATED); // at N it is v2
-                                                              // The version before P merged out of the spans read: its payload rides the predecessor.
+        assert_eq!(change(&held, 5, None).unwrap().0, NEITHER);
+        assert_eq!(change(&held, 5, Some(15)).unwrap().0, UPDATED); // at N it is v2
+                                                                    // The version before P merged out of the spans read: its payload rides the predecessor.
         let merged = [p(20, b"v1", None), p(10, b"v2", Some(b"v1"))];
-        assert_eq!(change(&merged, 5, u64::MAX).unwrap().0, NEITHER);
+        assert_eq!(change(&merged, 5, None).unwrap().0, NEITHER);
         let moved = [p(20, b"v3", None), p(10, b"v2", Some(b"v1"))];
-        assert_eq!(change(&moved, 5, u64::MAX).unwrap().0, UPDATED);
+        assert_eq!(change(&moved, 5, None).unwrap().0, UPDATED);
         // A merge keeps the payload with the oldest kept version's predecessor.
         let kept = retain(&merged, &[], false);
         assert_eq!(kept.len(), 1);
@@ -434,7 +571,69 @@ mod tests {
         );
         // Derived outputs carry no payload: live at both ends is updated.
         let derived = [v(20, false, None), v(10, false, Some(1))];
-        assert_eq!(change(&derived, 5, u64::MAX).unwrap().0, UPDATED);
+        assert_eq!(change(&derived, 5, None).unwrap().0, UPDATED);
+    }
+
+    #[test]
+    fn an_explicit_maximum_bound_is_not_the_head() {
+        // A17 R9: k at u64::MAX - 1 (commit 0), then at u64::MAX (commit 1):
+        // below the bound u64::MAX lies the first, at the head the second.
+        let vs = [v(u64::MAX, false, None), v(u64::MAX - 1, false, None)];
+        assert!(!older(u64::MAX, Some(u64::MAX)) && older(u64::MAX, None));
+        let mut at = At::new(Some(u64::MAX));
+        for x in &vs {
+            at.push(x.clone()).unwrap();
+        }
+        assert_eq!(at.found.map(|x| x.generation), Some(u64::MAX - 1));
+        assert_eq!(
+            change(&vs, 0, Some(u64::MAX)).map(|c| c.1.generation),
+            Some(u64::MAX - 1)
+        );
+        assert_eq!(change(&vs, 0, None).map(|c| c.1.generation), Some(u64::MAX));
+    }
+
+    #[test]
+    fn retaining_a_version_at_a_time_keeps_what_the_whole_history_would() {
+        // 300 versions, endpoints at every 7th generation: the streamed
+        // retention holds one pending version, and keeps what a pass over the
+        // whole history keeps.
+        let vs: Vec<Version> = (1..=300u64)
+            .rev()
+            .map(|g| v(g * 10, g % 5 == 0, if g == 1 { Some(3) } else { None }))
+            .collect();
+        let ends: Vec<u64> = (1..=300u64)
+            .filter(|g| g % 7 == 0)
+            .map(|g| g * 10 + 5)
+            .collect();
+        for base in [false, true] {
+            let kept = retain(&vs, &ends, base);
+            let mut want: Vec<Version> = Vec::new();
+            for (i, x) in vs.iter().enumerate() {
+                if i == 0
+                    || ends
+                        .iter()
+                        .any(|&e| x.generation < e && e <= vs[i - 1].generation)
+                {
+                    want.push(Version {
+                        predecessor: None,
+                        prior: None,
+                        ..x.clone()
+                    });
+                }
+            }
+            if base {
+                let first = ends.iter().min().copied().unwrap();
+                if want
+                    .last()
+                    .is_some_and(|x| x.deleted && x.generation < first)
+                {
+                    want.pop();
+                }
+            } else {
+                want.last_mut().unwrap().predecessor = Some(3);
+            }
+            assert_eq!(kept, want);
+        }
     }
 
     #[test]
