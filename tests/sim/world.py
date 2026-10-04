@@ -91,6 +91,58 @@ def point_of(full: str, kind: str, data_root: str, data: bytes | None = None) ->
     return None
 
 
+# A window's budget per kind of engine activity: (burst, rate per virtual second).
+# Calibrated on ordinary runs and F20 (docs/verification.md, "Calibration").
+PACE = {"ticks": (200, 10.0), "events": (500, 5.0), "requests": (500, 5.0)}
+
+
+class Pace:
+    """The engines' pace between external inputs (Erwin's D60 ruling: no
+    wake floor, so hot loops are the simulation's to catch). Every input — a
+    step, a client or worker request, an engine start — opens a window; in
+    it, each kind of engine activity (ticks, journal events, store requests)
+    may reach `burst + rate × the window's virtual seconds`, no more. A hot
+    loop at one virtual instant spends the burst; a slower one, the rate.
+    Without `bounds` it only measures: each window's length and counts."""
+
+    KINDS = ("ticks", "events", "requests")
+
+    def __init__(self, now: Callable[[], float], bounds: dict | None):
+        self.now, self.bounds = now, bounds  # kind -> (burst, rate per virtual second)
+        self.since = 0.0
+        self.counts = dict.fromkeys(self.KINDS, 0)
+        self.windows: list[tuple[float, dict]] = []  # measuring: (seconds, counts) of each closed window
+        self.over: str | None = None  # the first window over its bound
+        self.again = 0  # past it: the count at which the loop is stopped once more
+
+    def input(self) -> None:
+        if self.bounds is None and any(self.counts.values()):
+            self.windows.append((self.now() - self.since, dict(self.counts)))
+        self.since, self.counts = self.now(), dict.fromkeys(self.KINDS, 0)
+
+    def bump(self, kind: str, n: int = 1) -> bool:
+        """Count `n`; True the first time a window goes over its bound."""
+
+        self.counts[kind] += n
+        if self.bounds is None:
+            return False
+        if self.over is not None:  # the loop still spins (a shutdown runs it): stop it at each doubling
+            if self.counts[kind] <= self.again:
+                return False
+            self.again = 2 * self.counts[kind]
+            return True
+        burst, rate = self.bounds[kind]
+        elapsed = self.now() - self.since
+        if self.counts[kind] <= burst + rate * elapsed:
+            return False
+        self.again = 2 * self.counts[kind]
+        self.over = (
+            f"a hot loop: {self.counts[kind]} engine {kind} in {elapsed:g} virtual seconds with no input "
+            f"(bound {burst} + {rate}/s)"
+        )
+        return True
+
+
 @dataclass
 class Worker:
     who: tuple
@@ -110,6 +162,7 @@ class EngineSlot:
     engine: object = None
     project: object = None
     dead: bool = False
+    stopping: bool = False  # a clean stop has begun
 
 
 # -- the channel ----------------------------------------------------------------------------
@@ -329,6 +382,16 @@ class World:
         self.workers: dict[tuple, Worker] = {}
         self.by_attempt: dict[str, list[Worker]] = {}
         self.fates: deque[Fate] = deque()
+        # The serving engine's next launch (a pool attempt's, with `pool`) stalls `seconds`
+        # at `point`, then goes on or, with `crash`, the engine crashes there:
+        # (point, seconds, pool, crash) or None.
+        self.launch_fate: tuple[str, float, bool, bool] | None = None
+        self.pace = Pace(self.now, None if os.environ.get("SOLERA_SIM_PACE") == "measure" else PACE)
+        self.project_now: Callable | None = None  # the project the platform restarts an engine on
+        self.restarting: asyncio.Task | None = None  # that restart, while it runs
+        self.calm = False  # converging: no fate strikes any more, one already stalled included
+        self.observing = False  # an invariant reads: no fate strikes meanwhile
+        self._launching: dict[int, str] = {}  # engine -> how far its doomed launch has come
         self.exits: list[tuple[int, int]] = []  # (engine, code): a State that broke
         self.launched = 0
         self.steps = 0
@@ -358,8 +421,15 @@ class World:
 
         def recording(state, *events, lazy=False):
             record(state, *events, lazy=lazy)
+            world._paced("events", len(events))
             if world.on_record is not None:
                 world.on_record(events)
+
+        tick = engine_mod.Engine.tick
+
+        async def ticking(engine):
+            world._paced("ticks")
+            return await tick(engine)
 
         patches = []
         if self.pg is not None:
@@ -371,6 +441,7 @@ class World:
             (engine_mod, "KeyService", keys),
             (State, "_exit", staticmethod(exit_)),
             (State, "record", recording),
+            (engine_mod.Engine, "tick", ticking),
         ]
         for owner, name, value in patches:
             self._saved.append((owner, name, getattr(owner, name)))
@@ -384,6 +455,7 @@ class World:
     def run(self, coro, *, timeout: float | None = None):
         """Run `coro` (as the simulation itself) to its end on virtual time."""
 
+        self.pace.input()  # a step: a new window
         self._install()
         quiet = [logging.getLogger(n) for n in ("solera_server", "solera_worker", "asyncio")]
         levels = [q.level for q in quiet]
@@ -394,6 +466,12 @@ class World:
                 if timeout is not None:
                     coro = asyncio.wait_for(coro, timeout)
                 return self.loop.run_until_complete(coro)
+        except RuntimeError:
+            if self.pace.over is None:
+                raise
+            from .oracle import Violation
+
+            raise Violation(self.pace.over) from None
         finally:
             for q, level in zip(quiet, levels, strict=True):
                 q.setLevel(level)
@@ -458,6 +536,8 @@ class World:
         before), register `project`, start. Clients and workers reach it
         from here on; an older live engine is now a zombie."""
 
+        self.pace.input()
+
         from solera_server.engine import Engine
         from solera_server.state import State
 
@@ -516,6 +596,7 @@ class World:
         slot = slot or self.slot
         if slot is None or slot.dead:
             return
+        slot.stopping = True  # what it still writes while it stops is no launch the fate takes
 
         async def down():
             await slot.engine.stop()
@@ -531,6 +612,8 @@ class World:
         the handler, then — if it recorded anything — durability, else 503."""
 
         from solera_server.state import Unavailable
+
+        self.pace.input()
 
         slot = slot or self.slot
         if slot is None or slot.dead or slot.engine is None:
@@ -623,7 +706,15 @@ class World:
             worker.paused_until = self.loop._now + fate.seconds
             await asyncio.sleep(fate.seconds)
 
+    def _paced(self, kind: str, n: int = 1) -> None:
+        if self.pace.bump(kind, n):
+            self.loop.stop()  # the step ends here, with `pace.over`: the loop may never yield
+
     async def _hook(self, who, kind: str, full: str, when: str, data: bytes | None = None) -> None:
+        if who is not None and who[0] == "engine" and when == "before":
+            self._paced("requests")
+        if who is not None and who[0] == "engine" and when == "before" and self.launch_fate is not None:
+            await self._launch_point(who, kind, full, data)
         if who is None or who[0] != "worker":
             return
         worker = self.workers.get(who)
@@ -636,6 +727,43 @@ class World:
             and point_of(full, kind, self.data_root, data) == fate.point
         ):
             await self._strike(worker)
+
+    async def _launch_point(self, who: tuple, kind: str, full: str, data: bytes | None) -> None:
+        """A launch writes its spec, then its control file, then records
+        `AttemptLaunched` and waits for the journal flush that makes it
+        durable. The engine stalls at the chosen one of the three (pool
+        hosts and workers go on meanwhile), then goes on or crashes there."""
+
+        point, seconds, pool, crash = self.launch_fate
+        n, reached = who[1], self._launching.get(who[1])
+        if self.slot is None or self.slot.n != n or self.slot.stopping:  # the serving engine's, running
+            return
+        if kind == "create" and full.endswith(".spec"):
+            if pool and b'"Pool"' not in (data or b""):
+                return
+            here = "spec"
+        elif reached == "spec" and kind == "create" and full.endswith(".control"):
+            here = "control"
+        elif reached == "control" and kind == "swap" and full.endswith("journal.json"):
+            here = "flush"
+        else:
+            return
+        self._launching[n] = here
+        if here != point or self.observing:  # observed: it waits for a launch in a step
+            return
+        self.launch_fate, self._launching = None, {}
+        await asyncio.sleep(seconds)
+        if not crash or self.calm or self.observing or self.slots[n].stopping:
+            return  # it goes on: stalled only, or converging, observed, stopping
+        serving = self.slot is self.slots[n]  # not replaced while it stalled
+        await self.crash(self.slots[n])
+        if serving and self.project_now is not None:  # the platform starts another at once
+            self.restarting = self._spawn(None, self._restart(self.project_now()))
+        raise Killed(f"{who} crashed mid-launch, at its {point}")
+
+    async def _restart(self, project) -> None:
+        with contextlib.suppress(Exception, Killed):  # a start that fails is retried at the next step
+            await self.start_engine(project)
 
     async def channel_point(self, who: tuple, point: str) -> None:
         worker = self.workers.get(who)

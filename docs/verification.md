@@ -53,7 +53,7 @@ stop where they are, and their `finally` blocks find the store gone.
 
 ```
 feed (keyed source) ──Incremental──▶ items ──Incremental(batch 2)──▶ copy
-items ──Incremental(batch 2, each=True)──▶ checks              (fails while a key is "flaky")
+items ──Incremental(batch 2, each=True)──▶ checks              (fails while a key is "flaky"; knob a dep: each row says which knob it ran under)
 items ──Incremental(batch 2)──▶ split ──▶ odd (table store), even (FileStore); on a pool
 items ──Incremental(batch 2)──▶ seen (a job: no output, its cursor holds what it read)
 knob (version) ──dep──▶ per_site[site ∈ sites] ──whole (fan-in)──▶ summary
@@ -95,7 +95,9 @@ arguments, up to 40 per run.
 | `doom_next_worker(fate)` | `doom_next_worker(Fate('die', 'gate', 'after'))` | the next launched worker dies or pauses before or after owning its attempt (point `claim`), start, delta upload, gate, store write, result or `finished`; is muted (cannot reach the engine); or is started twice |
 | `store_weather(error, lost, delay)` | `store_weather(error=0.1, lost=0.02, delay=15)` | the fault plan from now on |
 | `restart(clean, down)` | `restart(clean=False, down=120)` | a crash or a clean restart, and an outage |
-| `takeover(zombie, change)` | `takeover(zombie=600, change='bump')` | a new engine while the old one still runs (a rolling deploy), optionally on a new variant; two takeovers within `zombie` seconds leave three engines running |
+| `takeover(zombie, change)` | `takeover(zombie=600, change='bump')` | a new engine while the old one still runs (a rolling deploy), optionally on a new variant (a rename twice as often as any other); two takeovers within `zombie` seconds leave three engines running |
+| `rename_burst(count, zombie)` | `rename_burst(3, zombie=0)` | renames in quick succession, no time between: one life's attempt still runs while its name goes away and comes back (F34) |
+| `stall_launch(point, seconds, pool, crash)` | `stall_launch('flush', 30, pool=True, crash=True)` | the serving engine's next launch (a pool attempt's, with `pool`) stalls at its spec, its control file, or the flush that makes `AttemptLaunched` durable, while pool hosts and workers go on; then it carries on or crashes there, and the platform starts another at once (F26, F36) |
 | `redeploy(change, clean)` | `redeploy('summary', clean=True)` | re-registration |
 | `prune(keep)` | `prune(keep=0)` | deleting runs by hand |
 
@@ -114,6 +116,7 @@ Checked after every step:
 | **A life is its own.** No attempt launched before its asset was added back (no alias carrying it) installs a commit after (F12's rule, F19). | `seen`'s first life's attempt committing its cursor into the `seen` a deploy added back |
 | **One attempt per asset partition.** No attempt launches on an asset partition another launched attempt holds — in the journal, in order, and in the serving engine's claims. A task follows its asset through a rename (an alias); `mirror` renamed back to `copy` without one is another asset. | the hourly run and a manual run both launching `copy` before either ends |
 | **A tick's runs are submitted once.** Each run a sensor tick requests is submitted at most once, however late, often, or across restarts the tick's outcome is posted. | a retried post of tick `T` submitting its `per_site` run a second time |
+| **No hot loop.** Between external inputs (a step, a client or worker request, an engine start), each kind of engine activity — ticks, journal events, store requests — stays within `burst + rate × the virtual seconds since`: ticks 200 + 10/s, events and requests 500 + 5/s (`PACE` in `tests/sim/world.py`). Erwin's ruling (D60): no wake floor between ticks, the simulation catches hot loops. Counted as they happen, so a loop that never yields virtual time still ends the step. | F20's retry clock resubmitting an unplannable retry at every tick: 201 ticks at one virtual instant |
 | **A fenced write holds its gate.** Every write a worker makes to a fenced store (the table store, Postgres) comes after its attempt's gate was created `writing` with that worker's id (`lifecycle.md` §2.4, §3). | a worker paused before its gate, whose attempt the engine closed meanwhile, writing `items` when it wakes; the twin of a `twice` worker writing beside the owner |
 
 Checked once the system is quiet, at the end of every run (`_converge`): faults
@@ -413,6 +416,72 @@ per-key errors by class and forced retries; runs with `keys=`; an asset
 with two outputs on two kinds of store; a `Pool` with racing hosts; a
 sensor that requests runs, and one that fails; a job; the key cache
 under tight budgets and with its files deleted or corrupted under it.
+
+## Calibration: does it find what we know?
+
+Each finding below was put back on main (ebaffaa): its fix reverse-applied to
+a copy of the Python packages, first on `PYTHONPATH`, so no product code
+changed. Then the simulation ran as a sweep runs, with Hypothesis seeds of 150
+examples × 40 steps, in each order (`SOLERA_SIM_ORDER`). After a failure,
+the seed's search goes on from the next Hypothesis seed, so one finding
+cannot hide another. Each cell gives how many examples ran before the
+finding's own signature first showed, counted across seeds in order. The
+seeds that found it are in brackets. "Before" is the simulation as it was;
+"after" is with the changes below.
+
+| Finding (its fix) | Before: seeded / asyncio's order | After: seeded | After: asyncio's order |
+|---|---|---|---|
+| F20, retry storm (b6d9968) | the process ran out of memory (3 GB in 48 s), nothing reported | 14 of 450 (3/3) | 9 of 60 (1/1) |
+| F26, pool offer before durable (4979e26) | not found in 600 / 750 | 44 of 450 (1/3) | not found in 450; 192 of 450 (1/3) while every stall crashed |
+| F34, rename onto an earlier life (0d77890) | not found in 600 / 600 | 27 of 900 (5/6) | 27 of 900 (5/6) |
+| F36, collection under a launching attempt (0720b87) | not found in 600 / 600 | 360 of 900 (1/6) | 93 of 900 (3/6) |
+| F37, pass begun before a dep moved (fc29101) | not found in 600 / 600 | 131 of 450 (2/3) | 371 of 450 (1/3) |
+| F38, current-only output outrun (083ca73) | 91 of 450 (1/3) / 91 of 450 (2/3) | 365 of 450 (1/3) | 233 of 450 (2/3) |
+
+Before: F26–F37 on the code they were found in (7599798), F20 and F38 on
+ebaffaa. Main itself, with the changes, failed in none of its 900 examples
+per order; the hot-loop bound never fired on it.
+
+What changed, and why each finding needed it:
+
+- **`stall_launch`** (F26, F36). A launch writes its spec, then its control
+  file, records `AttemptLaunched`, and waits for the flush that makes it
+  durable. F26 needs a pool host to be offered the attempt inside that wait,
+  and then the engine to die before the flush. F36 needs a cleanup the
+  attempt was handed to be acknowledged by another inside it. Both windows
+  are a fraction of a virtual second, and nothing held them open. The rule
+  stalls the next launch at one of the three points. Then the engine goes
+  on (F36: the attempt must live to read the file) or crashes there and the
+  platform starts another at once (F26: the orphan's rows must meet a
+  serving engine). It never strikes while an invariant reads, a clean stop
+  runs, or the run converges, and never restarts an engine already replaced.
+- **`checks` depends on `knob`, and says so in its rows** (F37). F37 left a
+  key computed under an old `knob`; with `checks` blind to `knob`, the
+  stale key looked like a fresh one. Now each row carries the `knob` it ran
+  under, and convergence expects the last one. F37 also needs a pass left
+  open, which flaky keys already provide.
+- **Renames weigh double, and `rename_burst`** (F34). F34 is three renames
+  with no time between, so that an earlier life's attempt is still running
+  when its name comes back. Random steps put waits in between, and that
+  attempt finishes first. Weighing renames double alone did not find it in
+  900 examples per order; the burst finds it in 27.
+- **The hot-loop bound** (F20). See the invariant above. Before it, F20 was a
+  process that ran out of memory: no failing case, nothing to shrink. Now
+  it is a violation at the step that started it. The bound comes from
+  43,881 windows of ordinary runs (200 examples per order). There, ticks
+  ran steady at 2.1 per virtual second (the eval loop's cadence), and no
+  window held more than 40 events or 45 requests (0.3 per second on
+  windows of a minute or more). The bound leaves 5× the tick rate and
+  more than 10× every observed burst. F20 breaks it within the same
+  virtual instant.
+- F38 needed nothing: it was found before. It is found later now (365 and
+  233 examples, against 91): the new rules take a share of every run's 40
+  steps.
+
+Ordinary runs are not slower. `tests/sim` took 45.8 s on average with the
+changes against 55.1 s without. That is three pairs, run back to back on
+the same base while other work shared the machine: 0.72×, 0.96× and 0.83×
+per pair. The CI budget makes 1,202 steps in 33 runs, against 1,168 in 35.
 
 ## Sweeps
 
@@ -1277,3 +1346,4 @@ partition per asset) and comes last.
 | F38 | A consumer of an output in a current-only store stalls for good: `items` lives in the table store (its current rows only). `copy` is in a delta pass over `items`' commit 1 (k1, k10, k2; batch 1 of 2 delivered) when `items`, its version bumped, rebuilds as commit 2 without k2. Batch 2 loads k2 by key; the store has none, so F33's check raises SourceBehind ("items: the source index says k2@106 but the source has no k2"), 28 times: the pass stays on commit 1, and the commit that removed k2 already exists, so no retry can pass. The budget runs out, no automation fires again, and `copy` and `checks` stay stale (sweep Z14, shrunk from 52 steps to 4; bisected to ba357e5, F33's fix) | P1 | fixed (the coordinator's ruling): a key missing from a current-only store is decided against the source's head index, not the pass's commit (`each.gone_since`; a delta pin carries the head). The head still names it: the store is behind its index, `SourceBehind`, retryable and bounded (F33). The head lacks it too: removed since, so the batch takes it as removed and the pass goes on. And a partition whose last outcome failed with nothing pending reports `failed`, its reasons kept, never quietly stale — `tests/sim/test_replays.py::test_f38_a_consumer_of_a_current_only_output_finishes_a_pass_its_upstream_outran`, `tests/server/test_source_behind.py::test_a_partition_whose_retries_ran_out_is_failing_not_stale` |
 | F39 | A removed asset's attempt still owns its partition when a later life claims it: `seen`'s attempt 2 runs, its worker dead before its result; a redeploy removes `seen`, the next declares it again. Attempt 2 is an earlier life's, which since F34 holds no name, and nothing ended it: the new life's attempt 3 creates its control file at t=47 while attempt 2's is still owned, a request no behaviour of the attempt spec makes; attempt 2 is ended only at t=251 (trace validation of simulation example 2, seed 65535: `check-trace.py attempt`, "30 of 147 requests explained") | P2 | fixed (the coordinator's ruling: no exception): retiring with the asset ends the attempt as every other end does, `_end` first. The engine that adopts an attempt launched before its asset was removed fails it at once, retryable (`removed`), and its task carries on in the new life. Until it is ended it keeps its partition: dispatch holds a new-life task on it (`claim`), and the journal check counts it as holding the partition — `tests/sim/test_replays.py::test_f39_a_removed_assets_attempt_is_ended_before_its_partition_is_claimed_again` |
 | F40 | After a takeover, the old engine's orphan collector deletes the new engine's span files: it runs every `ORPHAN_SECONDS` with the model it last knew and writes nothing to the journal first, so nothing tells it it is fenced. Engine A commits; B takes over, merges and publishes `m…-…kx`; A's `collect_orphans` lists `keys/`, finds the output its model does not name, and deletes it. B's index then names a file that is gone, and every read of that span fails; deleted before publication, B publishes a file that is gone (`Spans.tla`, calibrations `epoch`, `epoch-state`) | P1 | fixed in c4eb4f7 (found independently by review A17, its R1): each engine takes an epoch, one past its predecessor's, written by the journal swap that fences it; merge outputs are named `m{a}-{b}-{epoch}-{ULID}`, and a collector deletes an unreferenced output only if its epoch is at most its own, judging what is named and running after its listing — `tests/server/test_keys.py::test_f40_a_zombies_orphan_collector_spares_the_serving_engines_spans`, `test_a_fenced_engine_never_collects_its_successors_merge_outputs` |
+| F41 | A consumer that read a removal keeps the key: `items` (keyed, incremental over `feed`, a source read as it is now; in the table store) goes through two rename takeovers, `seen` re-added while live, 2% errors and lost answers, and a redeploy; `feed` is then replaced by {k11}, then by {k1, k3}. After convergence `feed`'s index is {k1, k3} at its head, and `items`' position says it read through that commit, the one that removed k11; yet `items`' index still lists k11, written in the same pass as k1 and k3, and `items` reports itself fresh. A regression from 083ca73 (F38's fix): with it reverted, the same run converges. Found by the calibration run on ebaffaa, in asyncio's order; it shows with the simulation's changed timing (`checks` now a dependent of `knob`), its steps all older rules | P1 | no longer reproduces from acc65f3: its replay converges there (not bisected; 22 product commits since ebaffaa, K44's net delta and key-index step 3a among them; reverting 0f985de alone does not bring it back). Routed to the engine's seen-set rebuild (D126) to confirm — `tests/sim/test_replays.py::test_f41_a_consumer_that_read_a_removal_does_not_keep_the_key` (asyncio's order), an ordinary test |

@@ -88,6 +88,7 @@ class External:
         self.flaky: dict[str, str] = {}
         self.seen: dict[str, str] | None = None  # what `watch` saw on its last tick
         self.broken = False  # `watch` raises
+        self.knob = "0"  # `knob`'s version as the outside sets it: `checks` reads it as it runs
 
 
 # How `checks` fails on a flaky key, by error class (docs/per-key-processing.md):
@@ -204,6 +205,7 @@ def build(variant: Variant, data_root, db: Database, outside: External, pg: str 
 
     @asset(
         inputs={"item": Incremental("items", batch_size=2, each=True)},
+        deps=["knob"],
         outputs=Output("checks", key="id"),
         automations=OnChange(),
         retries=Retry(3, delay=1.0),
@@ -212,7 +214,7 @@ def build(variant: Variant, data_root, db: Database, outside: External, pg: str 
     async def checks(ctx, item: list):
         if ctx.key in outside.flaky:
             raise FLAKY[outside.flaky[ctx.key]](ctx.key)
-        return [{"w": f"x{item[0]['v']}"}]
+        return [{"w": f"x{item[0]['v']}@{outside.knob}"}]  # under the `knob` of its moment
 
     @asset(
         outputs=[Output("odd", key="id", store="db"), Output("even", key="id")],
@@ -299,8 +301,11 @@ def expected_split(items: dict[str, str]) -> tuple[dict[str, str], dict[str, str
     return odd, {k: v for k, v in items.items() if k not in odd}
 
 
-def expected_checks(items: dict[str, str]) -> dict[str, str]:
-    return {k: f"x{v}" for k, v in items.items()}
+def expected_checks(items: dict[str, str], knob: str) -> dict[str, str]:
+    """Every key of `items`, written under `knob`: a moving dep reprocesses
+    every key (the coordinator's (d) ruling), so none is left from before."""
+
+    return {k: f"x{v}@{knob}" for k, v in items.items()}
 
 
 def expected_copy(items: dict[str, str], variant: Variant) -> dict[str, str]:

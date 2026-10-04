@@ -9,6 +9,8 @@ regression test that replays it would spell it."""
 from __future__ import annotations
 
 import asyncio
+import dataclasses
+import functools
 import json
 import logging
 import os
@@ -97,6 +99,7 @@ class Simulation(RuleBasedStateMachine):
             store = "table"
             self.trace.append("  # no Postgres: 'pg' runs on the table store")
         self.world = world = World(self.tmp, seed, key_options=Options(window=2))
+        world.project_now = lambda: self.project
         world.cache_budget = CACHE[cache]
         self.journal = Journal(now=world.now)
         world.objects.tap = self.journal.landed
@@ -161,10 +164,21 @@ class Simulation(RuleBasedStateMachine):
     def _run(self, coro, timeout: float = 3600.0):
         return self.world.run(coro, timeout=timeout)
 
+    def _restarted(self) -> None:
+        """The platform's own restart after a crash (`stall_launch`), if
+        one is under way, finishes before anything else replaces the serving
+        engine: what it replaces must be the engine that serves."""
+
+        world = self.world
+        if world.restarting is not None:
+            self._run(asyncio.wait([world.restarting]))
+            world.restarting = None
+
     def _ensure_engine(self, project=None) -> None:
         """The platform keeps one engine serving: start one if none is."""
 
         world = self.world
+        self._restarted()
         if world.engine is not None and project is None:
             return
         project = project or self.project
@@ -231,7 +245,7 @@ class Simulation(RuleBasedStateMachine):
     def commit_knob(self):
         self.knob = str(int(self.knob) + 1)
         self.trace.append(f"commit_knob({self.knob!r})")
-        version = self.knob
+        version = self.outside.knob = self.knob
         self._request(lambda e: e.commit_source("knob", version=version), "commit")
 
     @rule(keys=st.dictionaries(st.sampled_from(KEYS), st.sampled_from(["1", "2"]), max_size=3))
@@ -409,6 +423,22 @@ class Simulation(RuleBasedStateMachine):
         self.world.fates.append(fate)
 
     @rule(
+        point=st.sampled_from(["spec", "control", "flush"]),
+        seconds=st.sampled_from([0.0, 5.0, 30.0]),
+        pool=st.booleans(),
+        crash=st.booleans(),
+    )
+    def stall_launch(self, point, seconds, pool, crash):
+        """The serving engine stalls `seconds` in the middle of its next
+        launch (a pool attempt's, with `pool`) — writing the spec, the
+        control file, or waiting for the flush that makes `AttemptLaunched`
+        durable — while pool hosts, workers and its own other work go on;
+        then it carries on, or, with `crash`, crashes there."""
+
+        self.trace.append(f"stall_launch({point!r}, {seconds:g}s, pool={pool}, crash={crash})")
+        self.world.launch_fate = (point, seconds, pool, crash)
+
+    @rule(
         error=st.sampled_from([0.0, 0.02, 0.1]),
         lost=st.sampled_from([0.0, 0.02, 0.1]),
         delay=st.sampled_from([0.0, 1.0, 15.0]),
@@ -422,12 +452,14 @@ class Simulation(RuleBasedStateMachine):
     def restart(self, clean, down):
         self.trace.append(f"restart(clean={clean}, down={down})")
         world = self.world
+        self._restarted()
         self._run(world.stop() if clean else world.crash())
         if down:
             self._run(asyncio.sleep(down))
         self._ensure_engine(self.project)
 
-    @rule(zombie=st.sampled_from([0.0, 5.0, 60.0, 600.0]), change=st.sampled_from([None, *CHANGES]))
+    # A rename twice as often as any other change: it alone interleaves an asset's lives (F34).
+    @rule(zombie=st.sampled_from([0.0, 5.0, 60.0, 600.0]), change=st.sampled_from([None, *CHANGES, "rename"]))
     def takeover(self, zombie, change):
         """A second engine starts while the first still runs (a rolling
         deploy, a split brain); the platform kills the first `zombie`
@@ -436,6 +468,7 @@ class Simulation(RuleBasedStateMachine):
 
         self.trace.append(f"takeover(zombie={zombie}, change={change!r})")
         world = self.world
+        self._restarted()
         old = world.slot
         if change is not None:
             self._change(change)
@@ -451,6 +484,14 @@ class Simulation(RuleBasedStateMachine):
             else:
                 self._run(world.crash(old))
 
+    @rule(count=st.sampled_from([2, 3]), zombie=st.sampled_from([0.0, 5.0]))
+    def rename_burst(self, count, zombie):
+        """Renames in quick succession, no time between: an attempt of one
+        life still runs while its name goes away and comes back (F34)."""
+
+        for _ in range(count):
+            self.takeover(zombie, "rename")
+
     def _change(self, change: str) -> None:
         """The project moves to another variant (`VARIANTS`)."""
 
@@ -464,6 +505,7 @@ class Simulation(RuleBasedStateMachine):
         self.trace.append(f"redeploy({change!r}, clean={clean})")
         self._change(change)
         world = self.world
+        self._restarted()
         self._run(world.stop() if clean else world.crash())
         self._ensure_engine(self.project)
 
@@ -666,7 +708,8 @@ class Simulation(RuleBasedStateMachine):
         world = self.world
         if world is None or world.engine is None:
             return
-        m = world.engine.m
+        engine = world.engine  # the one checked, should another replace it meanwhile
+        m = engine.m
 
         async def check():
             for (output, partition), head in list(m.heads.items()):
@@ -676,9 +719,7 @@ class Simulation(RuleBasedStateMachine):
                 if (output, partition) in m.repairs or (head.get("asset"), partition) in m.claimed_partitions:
                     continue
                 if (output, partition) in m.indexes:
-                    await keyed_content(
-                        world.engine, self.project, output, partition, whole=True, column=None
-                    )
+                    await keyed_content(engine, self.project, output, partition, whole=True, column=None)
                 if head["ref"]["store"] == "pg":
                     ref = Ref.from_json(head["ref"])
                     with store._connect() as conn, conn.cursor() as cur:
@@ -763,6 +804,7 @@ class Simulation(RuleBasedStateMachine):
         self.trace.append("# converge")
         world.plan.enabled = False
         world.fates.clear()
+        world.launch_fate, world.calm = None, True
         self.outside.flaky, self.outside.broken = {}, False
         world.pool_hosts = max(world.pool_hosts, 1)
         for slot in world.slots:
@@ -772,7 +814,7 @@ class Simulation(RuleBasedStateMachine):
         # A fresh change to every source: what automations deliver from here
         # on covers everything before it.
         self.feed["k3"] = str(int(self.feed.get("k3", "0")) + 10)
-        self.knob = str(int(self.knob) + 1)
+        self.knob = self.outside.knob = str(int(self.knob) + 1)
         for name, kw in (
             ("feed", {"keys": dict(self.feed)}),
             ("sites", {"keys": sorted(self.sites)}),
@@ -831,8 +873,8 @@ class Simulation(RuleBasedStateMachine):
                 if seen != want:
                     raise Violation(f"the job seen's cursor {stage}: {seen} != {want}")
             checks = await keyed_content(engine, project, "checks", whole=True, column="w")
-            if checks != expected_checks(want):
-                raise Violation(f"checks {stage}: {checks} != {expected_checks(want)}")
+            if checks != expected_checks(want, self.knob):
+                raise Violation(f"checks {stage}: {checks} != {expected_checks(want, self.knob)}")
             outside = {  # each key at the version its last tick gave it
                 k: p.decode() for k, (_, p) in (await index_entries(engine.state, "outside", "")).items()
             }
@@ -895,6 +937,31 @@ def _first_diff(a, b, path="") -> str:
             if x != y:
                 return _first_diff(x, y, f"{path}[{i}]")
     return f"{path}: {str(a)[:300]} != {str(b)[:300]}"
+
+
+def _observing(check):
+    """An invariant observes: a platform restart under way finishes first,
+    and no fate strikes while it reads (`World.observing`)."""
+
+    @functools.wraps(check)
+    def observed(self):
+        if self.world is None:
+            return check(self)
+        self._restarted()
+        self.world.observing = True
+        try:
+            return check(self)
+        finally:
+            self.world.observing = False
+
+    # Hypothesis calls the function its marker holds: the marker must hold this one.
+    marker = check.hypothesis_stateful_invariant
+    observed.hypothesis_stateful_invariant = dataclasses.replace(marker, function=observed)
+    return observed
+
+
+for _name in [n for n, v in vars(Simulation).items() if getattr(v, "hypothesis_stateful_invariant", None)]:
+    setattr(Simulation, _name, _observing(getattr(Simulation, _name)))
 
 
 def _drop(schema: str) -> None:
