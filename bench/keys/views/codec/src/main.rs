@@ -505,7 +505,132 @@ fn verify(entries: &[Entry]) {
     }
 }
 
+/// Erwin's minimal delta (W53 follow-up): sorted (key, change kind,
+/// payload?) in self-delimiting compressed blocks (length + CRC each), no
+/// generation, no predecessor, no index, filter or footer. Against today's
+/// `.kx` delta: the same keys with their flags, the commit's generation,
+/// each key's predecessor generation, and the file's index, filter (14 bits
+/// per key) and footer.
+fn deltas(per: usize, n_deltas: usize, block: usize) {
+    let mut r = Rng(99);
+    let mul: u128 = 2_654_435_761;
+    let modulo: u128 = 10_000_000_000_000;
+    let (mut kx_bytes, mut min_bytes, mut entries) = (0usize, 0usize, 0usize);
+    let (mut kx_dec, mut min_dec) = (0f64, 0f64);
+    for c in 0..n_deltas {
+        let mut keys: Vec<Vec<u8>> = (0..per)
+            .map(|_| format!("cust-{:013}", (r.below(100_000_000) as u128 * mul % modulo) as u64).into_bytes())
+            .collect();
+        keys.sort_unstable();
+        keys.dedup();
+        let gen = 2 + 11_000 + c as u64;
+        let entries_kx: Vec<Entry> = keys
+            .iter()
+            .map(|k| {
+                let roll = r.below(100);
+                let added = roll < 5;
+                let deleted = (5..10).contains(&roll);
+                Entry {
+                    key: k.clone(),
+                    flags: if deleted { DELETED } else { 0 } | if added { 0 } else { PRED },
+                    gen,
+                    payload: None,
+                    pred: if added { 0 } else { 1 + r.below(gen - 1) },
+                    prior: None,
+                }
+            })
+            .collect();
+        // today's .kx: blocks of row entries, zstd-1, plus index, filter and footer
+        let mut kx = 0usize;
+        let mut index = Vec::new();
+        let mut stored = Vec::new();
+        for b in blocks(&entries_kx, block) {
+            let raw = encode_row(b);
+            let comp = Codec::Zstd1.compress(&raw);
+            put_bytes_len(&mut index, &b[0].key);
+            put_varint(&mut index, kx as u64);
+            put_varint(&mut index, comp.len() as u64);
+            put_varint(&mut index, b.len() as u64);
+            index.extend_from_slice(&[0u8; 4]);
+            kx += comp.len();
+            stored.push((comp, raw.len()));
+        }
+        let filter = 64 * ((keys.len() * 14 + 511) / 512);
+        let idx = Codec::Zstd1.compress(&index);
+        kx += filter + 4 + idx.len() + 48 + 2 * 20; // filters + crc, index, footer, min/max keys
+        // the minimal delta: key, kind; blocks length + crc
+        let mut minimal = Vec::new();
+        let mut min_stored = Vec::new();
+        for b in blocks(&entries_kx, block) {
+            let mut raw = Vec::new();
+            put_varint(&mut raw, b.len() as u64);
+            let mut prev: &[u8] = &[];
+            for e in b {
+                let s = shared(prev, &e.key);
+                put_varint(&mut raw, s as u64);
+                put_varint(&mut raw, (e.key.len() - s) as u64);
+                raw.extend_from_slice(&e.key[s..]);
+                raw.push(if e.flags & DELETED != 0 { 2 } else if e.flags & PRED != 0 { 1 } else { 0 });
+                prev = &e.key;
+            }
+            let comp = Codec::Zstd1.compress(&raw);
+            minimal.extend_from_slice(&(comp.len() as u32).to_le_bytes());
+            minimal.extend_from_slice(&[0u8; 4]);
+            minimal.extend_from_slice(&comp);
+            min_stored.push((comp, raw.len()));
+        }
+        kx_bytes += kx;
+        min_bytes += minimal.len();
+        entries += keys.len();
+        // decode speed: every block to keys and fields, 200 times
+        let t = Instant::now();
+        let mut d = Decoded::default();
+        let mut buf = Vec::new();
+        for _ in 0..200 {
+            for (c, len) in &stored {
+                Codec::Zstd1.decompress(c, *len, &mut buf);
+                decode_row(&buf, &mut d);
+            }
+        }
+        kx_dec += t.elapsed().as_secs_f64();
+        let t = Instant::now();
+        let mut kinds = Vec::new();
+        for _ in 0..200 {
+            for (c, len) in &min_stored {
+                Codec::Zstd1.decompress(c, *len, &mut buf);
+                d.clear();
+                kinds.clear();
+                let mut pos = 0;
+                let n = get_varint(&buf, &mut pos) as usize;
+                for _ in 0..n {
+                    let s = get_varint(&buf, &mut pos) as usize;
+                    let l = get_varint(&buf, &mut pos) as usize;
+                    d.push_key(s, &buf[pos..pos + l]);
+                    pos += l;
+                    kinds.push(buf[pos]);
+                    pos += 1;
+                }
+            }
+        }
+        min_dec += t.elapsed().as_secs_f64();
+    }
+    let e = entries as f64;
+    println!("delta of {per} keys at 100M density, {} KiB blocks, zstd-1, {n_deltas} deltas", block / 1024);
+    println!("kx\t{:.2} B/entry\t{:.0} B/delta\tdecode {:.1} M entries/s", kx_bytes as f64 / e, kx_bytes as f64 / n_deltas as f64, e * 200.0 / kx_dec / 1e6);
+    println!("minimal\t{:.2} B/entry\t{:.0} B/delta\tdecode {:.1} M entries/s", min_bytes as f64 / e, min_bytes as f64 / n_deltas as f64, e * 200.0 / min_dec / 1e6);
+}
+
+fn put_bytes_len(out: &mut Vec<u8>, b: &[u8]) {
+    put_varint(out, b.len() as u64);
+    out.extend_from_slice(b);
+}
+
 fn main() {
+    if std::env::args().nth(1).as_deref() == Some("deltas") {
+        deltas(1000, 200, 16 * 1024);
+        deltas(1_000_000, 2, 16 * 1024);
+        return;
+    }
     let n: usize = std::env::args().nth(1).map(|s| s.parse().unwrap()).unwrap_or(400_000);
     let sets: Vec<(&str, Vec<Vec<u8>>)> = vec![
         ("ids@1M", ids(n, 1_000_000, 1)),
