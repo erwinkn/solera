@@ -4,7 +4,9 @@
 docs/key-index-design.md (span design, policy "versions" in
 bench/keys/spans.py at 9e8183d): spans tile commit time, and upkeep merges
 adjacent spans. Every merge obeys the balance guard: its largest input
-holds at most 4x the others combined, counting the inputs' actual entries.
+holds at most 4x the others combined, counting the inputs' actual entries;
+the one exception, a single span rewritten alone, must drop at least a
+quarter of its entries, and so may any merge in place of the guard.
 A merge's output has at most as many entries as its inputs. It can have
 fewer than its largest input: versions superseded once an endpoint retires
 are dropped, and the base drops tombstones and predecessors.
@@ -63,12 +65,15 @@ theorem pot_ge (c : Nat) : ∀ (l : List Nat), (∀ x ∈ l, x * c ≤ x * w.ℓ
     omega
 
 /-- One merge pays for itself. Inputs `l1 ++ m :: l2`, with `m` the largest
-and `S` entries in all; output `u ≤ S` entries. The cost `M u`, plus the
+and `S` entries in all; output `u ≤ S` entries. The merge obeys the guard,
+or drops at least a quarter of its inputs (`4u ≤ 3S`): the single-span
+rewrite that drops a retired endpoint's versions is the latter, with
+`l1 = l2 = []`. The cost `M u`, plus the
 weight the output carries, is covered by the inputs' weight and `23 M`
 per input entry, less `23 M` per output entry. -/
 theorem merge_pays (l1 l2 : List Nat) (m u : Nat)
     (hmax : ∀ x ∈ l1 ++ l2, x ≤ m) (hmK : m ≤ K)
-    (hguard : 5 * m ≤ 4 * (l1 ++ m :: l2).sum)
+    (hguard : 5 * m ≤ 4 * (l1 ++ m :: l2).sum ∨ 4 * u ≤ 3 * (l1 ++ m :: l2).sum)
     (huS : u ≤ (l1 ++ m :: l2).sum) (huK : u ≤ K) :
     w.M * u + 5 * (u * w.ℓ u) + 23 * (w.M * u) ≤
       23 * (w.M * (l1 ++ m :: l2).sum) + 5 * pot w (l1 ++ m :: l2) := by
@@ -87,9 +92,6 @@ theorem merge_pays (l1 l2 : List Nat) (m u : Nat)
   generalize hP : pot w (l1 ++ l2) = P
   have hMS : w.M * (m + T) = w.M * m + w.M * T := Nat.mul_add _ _ _
   have hMu : w.M * u ≤ w.M * (m + T) := Nat.mul_le_mul_left _ huS
-  have hMm : w.M * m ≤ 4 * (w.M * T) := by
-    have := Nat.mul_le_mul_left w.M (show m ≤ 4 * T by omega)
-    rw [Nat.mul_left_comm] at this; exact this
   have hQ : u * w.ℓ u ≤ m * w.ℓ u + T * w.ℓ u := by
     rw [← Nat.add_mul]; exact Nat.mul_le_mul_right _ huS
   -- In general: the largest input covers the output's weight, plus 4M per
@@ -117,6 +119,11 @@ theorem merge_pays (l1 l2 : List Nat) (m u : Nat)
         have := hhalf x hx
         exact w.grow (by omega) huK (by omega)
     rw [Nat.mul_comm T w.M] at hR
+    -- Here the guard holds: a merge that keeps more than 3/4 needs it.
+    have hg : m ≤ 4 * T := by rcases hguard with h | h <;> omega
+    have hMm : w.M * m ≤ 4 * (w.M * T) := by
+      have := Nat.mul_le_mul_left w.M hg
+      rw [Nat.mul_left_comm] at this; exact this
     have hL' : u * w.ℓ u + w.M * T + 4 * (w.M * u) ≤
         m * w.ℓ m + P + 4 * (w.M * m) + 4 * (w.M * T) := by
       by_cases hmu : m ≤ u
@@ -150,12 +157,13 @@ inductive Step : St → St → Prop
   /-- A commit writes its delta, a span of `n ≤ K` entries, at the head. -/
   | commit (b : Nat) (sp : List Nat) (W C I n : Nat) (hn : n ≤ K) :
       Step ⟨b, sp, W, C, I⟩ ⟨b, sp ++ [n], W + n, C + n, I + n * w.ℓ n⟩
-  /-- A merge of adjacent spans, the largest input `m` at most 4x the
-  others; it may drop superseded versions, so its output is any size up to
-  its inputs'. -/
+  /-- A merge of adjacent spans: the largest input `m` at most 4x the
+  others, or the output at most 3/4 of the inputs (a single span rewritten
+  to drop a retired endpoint's versions is this, with one input). It may
+  drop superseded versions, so its output is any size up to its inputs'. -/
   | merge (b : Nat) (pre l1 l2 post : List Nat) (m u a W C I : Nat)
       (hmax : ∀ x ∈ l1 ++ l2, x ≤ m) (hmK : m ≤ K)
-      (hguard : 5 * m ≤ 4 * (l1 ++ m :: l2).sum)
+      (hguard : 5 * m ≤ 4 * (l1 ++ m :: l2).sum ∨ 4 * u ≤ 3 * (l1 ++ m :: l2).sum)
       (huS : u ≤ (l1 ++ m :: l2).sum) (huK : u ≤ K) (ha : a ≤ R) :
       Step ⟨b, pre ++ (l1 ++ m :: l2) ++ post, W, C, I⟩ ⟨b, pre ++ u :: post, W + a * u, C, I⟩
   /-- A merge of the oldest spans into the base, under the guard (only its
