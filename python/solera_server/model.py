@@ -1139,6 +1139,14 @@ class Model:
         for input, position in commit.get("positions", {}).items():
             if self._subscribed(asset, input, position):  # an input removed while it ran keeps no pass
                 record.setdefault("positions", {})[input] = position
+        for output, at in (commit.get("selected") or {}).items():  # a paged keys= selection's place
+            places = task.setdefault("selected", {})
+            if at is None:
+                places.pop(output, None)
+            else:
+                places[output] = at
+            if not places:
+                del task["selected"]
         if "failures" in commit:
             self._failures(asset, partition, commit["failures"])
         for row in commit.get("key_outcomes") or ():

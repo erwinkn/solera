@@ -243,7 +243,7 @@ class Staleness:
         `since` are left out; one whose files are gone is lost, and the next
         pass delivers its keys again."""
 
-        listed = [(run, attempt) for _, run, attempt in entries]
+        listed = [(entry[1], attempt) for entry in entries for attempt in entry[2:]]
         specs, results = await asyncio.gather(
             asyncio.gather(*(self.state.attempt_spec(r, a) for r, a in listed)),
             asyncio.gather(*(self.state.attempt_result(r, a) for r, a in listed)),

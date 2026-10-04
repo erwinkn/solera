@@ -171,7 +171,9 @@ Incremental(output=None, *, include=None, exclude=None, batch_size=16, meta=None
   keys all run at once — a task each for an `async` function, a thread
   each for a plain one. It bounds how much work a crash throws away. The
   asset's `concurrency=` caps its partitions at once, so `concurrency=4`
-  with `batch_size=16` runs up to 64 keys.
+  with `batch_size=16` runs up to 64 keys. A `keys=` run is bounded the
+  same way: its named keys go `batch_size` at a time, an attempt and a
+  commit each (A19 R6).
 - **It does not bound row memory.** It counts keys: a batch of 16 keys
   holds whatever rows those keys produce, and one 2 GB workbook is still
   one key. A per-key function that can produce huge groups needs a

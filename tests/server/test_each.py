@@ -775,7 +775,6 @@ def fed(tmp_path, outside, *assets, extra=()):
     )
 
 
-@a19("R6")
 async def test_a_keys_selection_runs_batch_size_keys_at_a_time(state, tmp_path):
     """A19 R6, D80: batch_size bounds a per-key asset's keys at once, a
     keys= selection's too: five named keys in batches of two make three

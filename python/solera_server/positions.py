@@ -22,7 +22,7 @@ Each (asset, input, partition) keeps a **position**:
       "patterns": ...,              # keys: the patterns it delivers under (per-key §11)
       "pattern_change": {"old", "new", "at", "snapshot", "pin"},
       "reconcile": {"after": key},  # a per-key output's cleanup after a full pass
-      "ahead": [[commit, run, attempt], ...],  # keys: the read-ahead (below)
+      "ahead": [[commit, run, attempt, ...], ...],  # keys: the read-ahead (below)
     }
 
 The modes:
@@ -44,7 +44,8 @@ names as of one upstream commit and moves neither `next` nor the
 partition's progress.
 
 **The read-ahead** (docs/positions-from-reads.md, K45, K47). A selection
-adds `[commit, run, attempt]` to `ahead`: it delivered, as of upstream
+adds `[commit, run, attempt]` to `ahead` — a paged selection's later
+attempts join its run's entry, so the cap counts runs: it delivered, as of upstream
 commit `commit`, the keys the attempt's sealed result lists, live or
 removed. The next pass skips a changed key some entry read at or after
 its last change, classes one changed since by what was delivered (K44),
@@ -68,8 +69,13 @@ def advance(plan: dict, after: str | None = None) -> dict | None:
         if plan.get("covers"):  # nothing is left undelivered: the record collapses to a new snapshot
             done = {k: v for k, v in position.items() if k not in ("pass", "ahead")}
             return {**done, "next": max(int(position["next"]), int(plan["head"]) + 1)}
-        entry = [plan["head"], plan["run"], plan["attempt"]]
-        position = {**position, "ahead": [*position.get("ahead", ()), entry]}
+        ahead = list(position.get("ahead", ()))
+        if ahead and ahead[-1][1] == plan["run"]:  # a paged selection's next page: its run's entry
+            commit, run, *attempts = ahead.pop()
+            entry = [max(int(commit), int(plan["head"])), run, *attempts, plan["attempt"]]
+        else:
+            entry = [plan["head"], plan["run"], plan["attempt"]]
+        position = {**position, "ahead": [*ahead, entry]}
         if (
             "pass" in position
         ):  # a full pass this run started or continued: its next delivery is not its first

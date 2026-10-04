@@ -16,9 +16,9 @@ from tests.sim.project import External, SourceStore, rebuild
 from .engines import drive, make_engine
 
 
-def project(root, outside, seen, retention=None, version="1", exclude=None):
+def project(root, outside, seen, retention=None, version="1", exclude=None, batch_size=100):
     @asset(
-        inputs={"feed": Incremental(exclude=exclude)},
+        inputs={"feed": Incremental(exclude=exclude, batch_size=batch_size)},
         outputs=Output("copy", key="id"),
         retention=retention,
         version=version,
@@ -252,3 +252,26 @@ async def test_a_keys_run_while_a_pattern_change_decides_membership_runs(state, 
     detail = await drive(engine, await engine.submit(["copy"], keys={"feed": {"keys": ["x1"]}}))
     assert detail["request"]["status"] == "succeeded", detail["request"]
     assert seen == [(["x1"], [])]
+
+
+async def test_a_paged_selection_is_one_read_ahead_entry(state, tmp_path):
+    """A19 R6: a keys= selection goes batch_size keys at a time — here two,
+    over three named keys: two attempts, one entry of its run naming both
+    (the cap counts runs), and the next pass delivers none of the three again."""
+
+    outside, seen = External(), []
+    engine = make_engine(state, project(tmp_path, outside, seen, batch_size=2))
+    await engine.initialize()
+    outside.feed.update(k1="1", k2="1", k3="1", k4="1")
+    await engine.commit_source("feed", upsert=["k1", "k2", "k3", "k4"])
+    await drive(engine, await engine.submit(["copy"]))
+    outside.feed.update(k1="2", k2="2", k3="2", k4="2")
+    await engine.commit_source("feed", upsert=["k1", "k2", "k3", "k4"])
+    seen.clear()
+    detail = await drive(engine, await engine.submit(["copy"], keys={"feed": {"keys": ["k1", "k2", "k3"]}}))
+    assert seen == [(["k1", "k2"], []), (["k3"], [])]
+    assert sum(len(a) for a in detail["attempts"].values()) == 2
+    [entry] = ahead(engine)
+    assert len(entry) == 4  # [commit, run, attempt, attempt]
+    await drive(engine, await engine.submit(["copy"]))
+    assert seen[2:] == [(["k4"], [])]

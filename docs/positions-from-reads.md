@@ -66,16 +66,17 @@ per-key outcomes.
 |---|---|---|---|
 | upstream key (`each=True`) | nothing of its own: derived from the position and the read-ahead (K47) | — | — |
 | upstream partition, incremental input | the position: `next`, the pass under way, the patterns | partition record | yes, but moved by the plan (below) |
-| upstream partition, incremental input, keys read ahead | the read-ahead: `[commit, run, attempt]` per `keys=` run since the last pass (K45) | the position, capped at 10,000 entries | yes |
+| upstream partition, incremental input, keys read ahead | the read-ahead: `[commit, run, attempt, …]` per `keys=` run since the last pass (K45), the attempts of its pages | the position, capped at 10,000 entries | yes |
 | upstream partition, whole or dep input | the head generation read (a digest of the refs, for a fan-in) | partition record (`seen`) | yes, since semantic change (d) |
 | the declaration | the asset change it last caught up to | partition record | yes: `caught_up_at`, against `changed_at` |
 
 **The read-ahead** (K45 and its amendment). A `keys=` run of a plain
 incremental input is delivered the delta past `next`, filtered to the keys
 it names and to what the read-ahead lacks, as of one upstream commit, the
-head its attempt pinned; its attempt's immutable spec already lists the
-keys. So the position records only `[commit, run, attempt]` (the run
-locates the spec), and stores no per-key version. The record is snapshot
+head its attempt pinned; its attempts' specs and sealed results already
+say what it read and delivered (it goes `batch_size` keys an attempt). So
+the position records only `[commit, run, attempt, …]` (the run locates
+them), and stores no per-key version. The record is snapshot
 `next` plus that list:
 
 - The next pass reads the delta past `next`. A changed key is skipped if

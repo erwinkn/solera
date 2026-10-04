@@ -1131,11 +1131,18 @@ class Engine(Attempts, Sensors, Staleness, Views):
         each = input.get("each") is not None
         index = self.m.index(output, upstream_partition)
         head_commit = int((self.m.heads.get((output, upstream_partition)) or {}).get("commit_number", -1))
-        keys = sorted({str(k) for k in override["keys"]})
+        # Paged by batch_size (A19 R6, D80): one attempt, one commit and its keys at
+        # once per page; the task keeps where the selection is.
+        named = sorted({str(k) for k in override["keys"]})
+        done = (task.get("selected") or {}).get(output)
+        left = [k for k in named if done is None or k > done]
+        keys = left[: int(input.get("batch_size") or 100)]
         pin = {"ref": ref, "batch": {"keys": keys, "full": False}, "index": index.slice().to_json()}
         if input.get("patterns") is not None:
             pin["patterns"] = input["patterns"]
         plan = {"kind": "selection", "output": output, "position": None, "head": head_commit}
+        if len(left) > len(keys):
+            plan["rest"] = keys[-1]  # where the next page starts
         fresh = (
             position is not None
             and position.get("fingerprint") == fingerprint
@@ -1732,6 +1739,7 @@ class Engine(Attempts, Sensors, Staleness, Views):
         delivered = result.get("delivered") or {}
         positions, more = {}, bool(prepared.get("more"))
         covered: dict[str, bool] = {}  # a selection's: nothing left undelivered (K45)
+        selected: dict[str, str | None] = {}  # a paged selection's place: its last key, None when done
         failures = None
         for param, plan in (prepared.get("plans") or {}).items():
             if plan is None:
@@ -1744,8 +1752,11 @@ class Engine(Attempts, Sensors, Staleness, Views):
                     continue
             after = None
             if plan["kind"] == "selection":  # whether it left anything undelivered (K45)
-                covered[param] = bool((delivered.get(param) or {}).get("covers"))
+                # Only its last page may: an earlier one leaves the selection's own keys.
+                covered[param] = "rest" not in plan and bool((delivered.get(param) or {}).get("covers"))
                 plan = {**plan, "covers": covered[param]}
+                selected[plan["output"]] = plan.get("rest")
+                more = more or "rest" in plan
             elif plan["kind"] == "held" and "head" in plan and (delivered.get(param) or {}).get("covers"):
                 # A retry pass that left nothing past the snapshot undelivered collapses the
                 # record, as a default run does (K47).
@@ -1801,6 +1812,8 @@ class Engine(Attempts, Sensors, Staleness, Views):
             if prepared["outputs"][name]["head"] is None and failures is None and not result.get("skipped"):
                 raise Conflict(f"omitted output {name} has no head to keep (§2)", retryable=False)
         commit = {"heads": heads, "positions": positions}
+        if selected:
+            commit["selected"] = selected
         # A selection that delivered all that was left catches its partition up, as
         # a pass's last batch does; one that did not leaves its progress as it was.
         if not selects(prepared.get("plans") or {}) or (covered and all(covered.values())):
