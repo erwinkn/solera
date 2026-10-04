@@ -351,6 +351,83 @@ async def test_a_worker_that_dies_writing_leaves_its_output_unsettled_and_the_re
     await state.close()
 
 
+async def clock_runs(engine) -> list[dict]:
+    """Runs the repair clock submitted, live or settled."""
+
+    return [r for r in (await engine.list_runs())["runs"] if r.get("by") == "repair clock"]
+
+
+async def dead_writer(tmp_path, store, writes):
+    """`items` committed once, then its second attempt died writing, out of retries:
+    its partition owes a repair, and nothing will run it."""
+
+    @asset(outputs=Output("items", key="id", store="live"), retries=Retry(0))
+    def items():
+        return writes.pop(0)
+
+    state = await State.open(tmp_path.as_uri(), "test", flush_interval=0.001)
+    engine = engine_for(state, Project(assets=[items], stores={"live": store}), placement="inline")
+    await engine.initialize()
+    assert (await engine.run_until((await engine.submit(["items"]))["id"], 10))["request"][
+        "status"
+    ] == "succeeded"
+    store.die = 1
+    assert (await engine.run_until((await engine.submit(["items"]))["id"], 20))["request"][
+        "status"
+    ] == "failed"
+    assert list(state.model.repairs) == [("items", "")]
+    return state, engine
+
+
+async def test_the_repair_clock_repairs_a_dead_writers_partition_on_its_own(tmp_path):
+    """docs/lifecycle.md §9.6: on the next tick the repair clock runs the
+    partition again — no user run — and the repair's commit settles it."""
+
+    live = LiveStore()
+    writes = [
+        [{"id": "a", "v": 1}],
+        Patch([{"id": "c", "v": 1}, {"id": "a", "v": 2}]),
+        Patch([{"id": "a", "v": 2}]),
+    ]
+    state, engine = await dead_writer(tmp_path, live, writes)
+    await engine.tick()
+    [run] = await clock_runs(engine)
+    assert (await engine.run_until(run["id"], 20))["request"]["status"] == "succeeded"
+    assert state.model.repairs == {}
+    assert live.rows == {"a": {"id": "a", "v": 2}, "c": {"id": "c", "v": 1}}
+    await engine.stop()
+    await state.close()
+
+
+async def test_a_repair_that_always_fails_stops_after_its_budget(tmp_path, monkeypatch):
+    """Each repair run fails, so its task is out of retries each time: the
+    clock gives it `REPAIR_RUNS` runs, then leaves it stuck and visible
+    rather than starting a run every tick."""
+
+    from solera_server import engine as engine_module
+    from solera_server.model import REPAIR_RUNS
+
+    class Unreadable(LiveStore):
+        def keys(self, ref, among=None):  # what a repair reads back
+            raise OSError("the store cannot list its keys")
+
+    monkeypatch.setattr(engine_module, "REPAIR_SPACING", 0.0)
+    repairs = [Patch([{"id": "a", "v": 3}])] * 9  # each reads `c` back, and cannot
+    writes = [[{"id": "a", "v": 1}], Patch([{"id": "c", "v": 1}, {"id": "a", "v": 2}]), *repairs]
+    state, engine = await dead_writer(tmp_path, Unreadable(), writes)
+    for _ in range(2 * REPAIR_RUNS):
+        await engine.tick()
+        for run in await clock_runs(engine):
+            await engine.run_until(run["id"], 20)
+    runs = await clock_runs(engine)
+    assert len(runs) == REPAIR_RUNS and {r["status"] for r in runs} == {"failed"}
+    [entry] = engine.repairs_view()
+    assert entry["stuck"] and entry["repair_runs"] == REPAIR_RUNS
+    assert (await engine.asset_statuses())["items"]["repairs_stuck"] == 1
+    await engine.stop()
+    await state.close()
+
+
 async def test_an_aborted_worker_writes_nothing(tmp_path):
     """A worker the engine cannot reach learns of the end from its control
     file, which its reports read while its channel fails (§6), and stops

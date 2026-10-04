@@ -779,6 +779,15 @@ intents for the next attempt to repair. And **the engine classifies an
 attempt without a result from its gate**, never from progress or
 silence.
 
+**The next attempt comes on its own.** Within its retries, the task's own
+retry repairs. Past them (or canceled), the **repair clock** runs the
+partition again — its consumers' reads of a fenced store wait on the
+repair — even when nothing upstream changed, and launches the attempt even
+if it has nothing to deliver: at most 3 runs, 60 s apart and doubling,
+counted on the intents. Then the partition stays owing its repair,
+`stuck` in `/repairs` and counted in the status, until a run of a user's
+or a trigger's.
+
 ### 9.6 Store kinds
 
 ```python

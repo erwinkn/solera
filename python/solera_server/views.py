@@ -14,7 +14,7 @@ from solera.keys.index import KeyIndex, key_bytes, key_str
 from solera.patterns import Matcher
 
 from . import planning
-from .model import BAD_OUTCOME
+from .model import BAD_OUTCOME, REPAIR_RUNS
 
 SCAN = 100  # a failure listing reads at most this many entries per key it returns
 PAGE = 1000  # entries read from a failed keys at a time
@@ -119,6 +119,7 @@ class Views:
                 "last": None,
                 "failures": {} if self._each_input(name) else None,
                 "repairs": 0,
+                "repairs_stuck": 0,  # the repair clock gave up: waiting for a run of a user's or a trigger's
                 "updated_at": None,
             }
         for (output, _), head in self.m.heads.items():
@@ -140,9 +141,10 @@ class Views:
             if (failures := (out.get(asset) or {}).get("failures")) is not None:
                 for name, n in ((state.get("failures") or {}).get("counts") or {}).items():
                     failures[name] = failures.get(name, 0) + n
-        for output, _ in self.m.repairs:
+        for output, partition in self.m.repairs:
             if (entry := out.get(owner.get(output))) is not None:
                 entry["repairs"] += 1
+                entry["repairs_stuck"] += self.m.repair_runs(output, partition)[0] >= REPAIR_RUNS
         return out
 
     # -- failing keys (docs/per-key-processing.md §9) -------------------------------------
@@ -508,12 +510,15 @@ class Views:
 
     def repairs_view(self) -> list[dict]:
         """Output partitions a writer that died left owing a repair, with each
-        intent's files, for the next attempt (docs/lifecycle.md §9.6)."""
+        intent's files, for the next attempt (docs/lifecycle.md §9.6): how many
+        runs the repair clock gave it, and whether it gave up (`stuck`)."""
 
         return [
             {
                 "output": output,
                 "partition": partition,
+                "repair_runs": self.m.repair_runs(output, partition)[0],
+                "stuck": self.m.repair_runs(output, partition)[0] >= REPAIR_RUNS,
                 "intents": [
                     {
                         "run": i.get("run"),

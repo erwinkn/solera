@@ -43,6 +43,8 @@ CLEANUP = "@cleanup"  # a cleanup task's asset: none of the project's (K25)
 BAD_OUTCOME = frozenset({"failed", "blocked", "canceled"})
 MAX_RECEIPTS = 10_000  # idempotency receipts kept for replayed submissions
 STUCK_AFTER = 3  # misses before a clean up entry is stuck (docs/lifecycle.md §9.8)
+REPAIR_RUNS = 3  # runs the repair clock gives a partition a dead writer left owing a repair
+REPAIR_SPACING = 60.0  # seconds between them: 60, then 120 (the spacing doubles)
 
 
 def _nest(flat: dict, depth: int) -> dict:
@@ -398,6 +400,15 @@ class Model:
 
     def is_pending(self, asset: str, partition: str) -> bool:
         return bool(self.pending.get((asset, partition)))
+
+    def repair_runs(self, output: str, partition: str) -> tuple[int, float | None]:
+        """How many runs the repair clock gave this partition's repair, and when
+        the last began. Kept on the intents, so a rename carries it and the
+        repair's commit drops it."""
+
+        intents = self.repairs.get((output, partition)) or ()
+        runs = max((int(i.get("runs", 0)) for i in intents), default=0)
+        return runs, max((i["tried_at"] for i in intents if "tried_at" in i), default=None)
 
     def due(self, now: float) -> list[str]:
         """Queued, unclaimed tasks ready by `now`, oldest first."""
@@ -1507,6 +1518,14 @@ class Model:
         for path in e.get("cleaned_files") or ():
             if path in named or any(path.startswith(stem) for stem in named):
                 self.garbage.append([path, self.event_counter])
+
+    def _on_RepairRunSubmitted(self, e):
+        """The repair clock ran a partition again for its repair: its intents count
+        the run, so the clock stops after `REPAIR_RUNS` (`Engine._repair_tick`)."""
+
+        runs, _ = self.repair_runs(e["output"], e["partition"])
+        for intent in self.repairs.get((e["output"], e["partition"]), ()):
+            intent["runs"], intent["tried_at"] = runs + 1, e["at"]
 
     def _on_CleanupsDone(self, e):
         """A worker cleaned up cleanup right after its own commit (D8):

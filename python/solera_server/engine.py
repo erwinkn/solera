@@ -53,7 +53,7 @@ from .attempts import POOL_OFFERED_GRACE, Attempts, Live, current_names, worker_
 from .executors import PlacementContext, Registry
 from .history import MAX_METADATA, History, RunFilter
 from .keyservice import KeyService, cache_root
-from .model import CLEANUP, TERMINAL_RUN, _delta_files, commit_of, declaration
+from .model import CLEANUP, REPAIR_RUNS, REPAIR_SPACING, TERMINAL_RUN, _delta_files, commit_of, declaration
 from .positions import advance, continues, outstanding, reads, selects
 from .sensors import Sensors
 from .staleness import Staleness
@@ -344,6 +344,7 @@ class Engine(Attempts, Sensors, Staleness, Views):
         self._sensor_sweep()
         self._automation_tick()
         await self._retry_tick()
+        await self._repair_tick()
         self._archive_due()
 
     async def run_until(self, run_id: str, timeout: float = 120.0):
@@ -1000,6 +1001,12 @@ class Engine(Attempts, Sensors, Staleness, Views):
         skip = bool(incremental) and all_empty and not more and not full
         # A per-key asset whose keys all failed so far has no head yet: nothing to wait for.
         if skip and each_page is None and not planner.materialized(task["asset"], partition):
+            skip = False
+        # A partition a dead writer left owing a repair launches all the same: its attempt repairs first.
+        if skip and any(
+            (o["name"], partition) in self.m.repairs
+            for o in self.manifest["assets"][task["asset"]]["outputs"]
+        ):
             skip = False
         # A full run's write is the whole content. A per-key batch's is not: it
         # patches by key, and a key that fails keeps its last good output (§5).
@@ -2291,6 +2298,34 @@ class Engine(Attempts, Sensors, Staleness, Views):
                 continue
             if self._has_retries(state["failures"]):
                 await self.submit_retries(asset, [partition], "retry clock", skip_missing_inputs=True)
+
+    async def _repair_tick(self):
+        """The repair clock (docs/lifecycle.md §9.6): a partition a dead writer left
+        owing a repair, once nothing else will run it (its task out of retries,
+        or canceled), runs again on its own — its consumers' reads wait on the
+        repair. At most `REPAIR_RUNS` runs, `REPAIR_SPACING` apart and doubling;
+        then it waits, stuck and visible (`repairs_view`), for a run of a
+        user's or a trigger's."""
+
+        owner = {o["name"]: a for a, info in self.manifest["assets"].items() for o in info["outputs"]}
+        now = self.clock()
+        for output, partition in list(self.m.repairs):
+            asset = owner.get(output)
+            if (
+                asset is None
+                or self._partition_active(asset, partition)
+                or self.m.is_pending(asset, partition)
+            ):
+                continue
+            runs, at = self.m.repair_runs(output, partition)
+            if runs >= REPAIR_RUNS or (at is not None and now < at + REPAIR_SPACING * 2 ** (runs - 1)):
+                continue
+            self.state.record(
+                {"type": "RepairRunSubmitted", "output": output, "partition": partition, "at": now}
+            )
+            await self.submit(
+                [asset], partitions=[partition], skip_active=True, skip_missing_inputs=True, by="repair clock"
+            )
 
     async def submit_retries(
         self, asset: str, partitions, by: str | None, skip_missing_inputs: bool = False
