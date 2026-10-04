@@ -697,6 +697,31 @@ guards it, does not exist in two views.
 | R8 a forced retry after a revert | `changes(keys=)` with the net rule | T keeps the after generation of equal-payload reverts; "neither" decided at read |
 | R9, R10 staleness roll-ups | a merge that stops at the first delivered key | T's paged merge |
 
+## Concepts, counted against spans
+
+What each design has to know, and where that knowledge lives. "Reserve"
+means: some record must exist before a background step runs, or a reader
+loses its answer (and falls back to a full pass).
+
+| | Spans | Two views, window + materialized bases | Two views, cover retention |
+|---|---|---|---|
+| file kinds | span files (several versions of a key, segments) | deltas, packs, nodes, the base, materialized bases: all one version per key | the same, without materialized bases |
+| merges know readers? | yes: every merge keeps the versions each live endpoint sees | no | no |
+| what must be reserved, and before what | every endpoint (positions, every attempt's landing point, a pass's start and end + 1, pattern-change splits), before the next merge that would cross it | the bases older than the window (positions, passes' starts, in-flight claims' landing points), before the cut passes them; nothing younger than the window | every reader interval (starts, ends, landing points), before the next collection |
+| a missed reservation costs | a full pass (the version is gone) | a full pass (T no longer holds the commit) | a full pass (the node is gone) |
+| per-reader cost | ≤ one version per key per lagging reader, inside shared files (D85) | one materialized base per reader older than the window: ≤ one entry per key changed since its base | its cover: ~log_b(lag) nodes, shared with other readers |
+| merge policy | guard, fan-in cap 32, two-ended read rule (λ, Z), four triggers, two lanes, forced merges, stale-version rewrites | aligned builds (no choice), one base trigger (a quarter), the window's cut | aligned builds, one base trigger |
+| read paths | version folds clipped to [g(P), g(N + 1)) (`Changed`, `At`, `Retainer`) | newest wins (K); before from oldest, after from newest (T); no bounds | the same |
+| A12/A17 machinery | added-then-removed tombstones outside the base (A12-1), clipping at N (A12-2), pages that finish a key (R2), first file holding a key (R3), `Option` bounds (R9), streamed folds (R10), rejected rewrites remembered (R7) | none of these arise | none arise |
+| durable upload accounting (D109) | needed | needed | needed |
+| index life in names, the barrier before deletion | needed | needed | needed |
+
+The window keeps the "no reader awareness inside the index" claim: the
+engine already knows its observation records, and only bases older than the
+window need materializing. The cover policy does not: it moves spans'
+endpoint set from the files into the collector, a smaller surface (no
+versions, no merge policy) but the same reservations.
+
 ## What this design gives up
 
 - **Storage, and a lifetime gated by the slowest reader.** T keeps all
