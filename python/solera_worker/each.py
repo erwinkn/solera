@@ -25,7 +25,7 @@ from solera.keys import SortedEntries
 from solera.keys.index import IndexState, KeyIndex, key_bytes, key_str
 from solera.patterns import Matcher
 from solera.sdk import UNSET, Ref, Result
-from solera.stores import Keys, Patch
+from solera.stores import Keys, Patch, check_loaded
 
 WALK = 100  # failure records walked per retry batch, at most, for each key it may take
 INTERRUPTED = "interrupted"  # a key a drain stopped: canceled or timed out once the result is sealed
@@ -382,6 +382,7 @@ async def run(spec, project, asset, param: str, pin: dict, args: dict, ctx, keys
     loaded = (
         await ctx._observed.load(store, ref, dict[str, t], Keys(batch.upserted)) if batch.upserted else {}
     )
+    check_loaded(ref.output, None, loaded, batch.upserted)  # by key: its keys are the mapping's
     await ctx._observed.close()  # the inputs' moment ends before the calls
     decls = {o.name or asset.name: o for o in asset.outputs}
     is_async = inspect.iscoroutinefunction(asset.fn)

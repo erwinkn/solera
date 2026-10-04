@@ -23,6 +23,49 @@ class WriteError(StoreError):
     """Malformed write: duplicate keys, wrong shape, disallowed op."""
 
 
+class SourceBehind(StoreError):
+    """A load by `Keys` answered without a key the index names (F33): a
+    source read as it is now no longer holds a key its commits say it has.
+    Nothing is delivered; the attempt retries under its budget, and the
+    source's next commit, removing or restoring the key, settles it."""
+
+    retryable = True
+
+
+def check_loaded(output: str, key: str | None, value: Any, expected: Mapping[str, int]) -> None:
+    """Raise `SourceBehind` if a load by `Keys(expected)` lacks one of them.
+    Keys are read from what it answered: a by-key mapping's keys, a rows
+    list's or a frame's `key` column; a type it cannot read is not checked."""
+
+    if not expected:
+        return
+    got = _loaded_keys(value, key)
+    if got is None:
+        return
+    for k, generation in sorted(expected.items()):
+        if k not in got:
+            raise SourceBehind(f"{output}: the source index says {k}@{generation} but the source has no {k}")
+
+
+def _loaded_keys(value: Any, key: str | None) -> set[str] | None:
+    if isinstance(value, Mapping):
+        return {str(k) for k in value}
+    if key is None:
+        return None
+    if isinstance(value, (list, tuple)):
+        if not all(isinstance(r, Mapping) and key in r for r in value):
+            return None  # rows without their key column: not readable here
+        return {str(r[key]) for r in value}
+    try:  # a frame: its key column
+        column = value[key]
+    except Exception:
+        return None
+    for to_list in ("to_pylist", "tolist", "to_list"):
+        if hasattr(column, to_list):
+            return {str(k) for k in getattr(column, to_list)()}
+    return None
+
+
 @dataclass(frozen=True)
 class Patch:
     """Partial write: replace the named keys, delete `remove` (§4). For a

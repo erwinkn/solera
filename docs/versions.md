@@ -207,7 +207,10 @@ Lineage records **the generation read**, per input partition:
   whose second batch is read after g3 committed read g2's content;
 - an external source, read current with no fence, records the generation
   of the tick the attempt was pinned to. No new marker: external
-  sources are read current by definition.
+  sources are read current by definition. A key its index names that the
+  source no longer holds fails the load, retryably, with the key and its
+  version (F33): nothing is delivered until the source's next commit
+  removes or restores it.
 
 `ctx.load` reads are not lineage edges: they read no input of the
 attempt's. One moment reads a partition once, so the first read of a partition is

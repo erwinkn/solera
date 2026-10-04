@@ -72,6 +72,7 @@ from solera.stores import (
     StoreError,
     WriteContext,
     WriteError,
+    check_loaded,
     prepare_for,
     resolve_env,
 )
@@ -347,7 +348,15 @@ async def _resolve_inputs(spec, project, asset, keys_io, timeline, observed: Obs
                     out[key] = ref
                     continue
                 store = project.stores[ref.store]
-                out[key] = await _load_whole(observed.load, store, ref, inner, keys_io, indexes.get(key))
+                out[key] = await _load_whole(
+                    observed.load,
+                    store,
+                    ref,
+                    inner,
+                    keys_io,
+                    indexes.get(key),
+                    _key_column(project, ref.output),
+                )
             args[param] = out
             timeline.add("loaded", param)
             continue
@@ -376,6 +385,7 @@ async def _resolve_inputs(spec, project, asset, keys_io, timeline, observed: Obs
                 reads.append(read)  # a full pass's first batch starts its consumer over, keys or none
             upserted, deleted, after = read.upserted, (*read.deleted, *read.unmatched), read.after
             args[param] = await observed.load(store, ref, t, Keys(upserted))
+            check_loaded(ref.output, _key_column(project, ref.output), args[param], upserted)
             batch[param] = Batch(
                 rows=args[param],
                 removed=deleted,
@@ -394,7 +404,9 @@ async def _resolve_inputs(spec, project, asset, keys_io, timeline, observed: Obs
         if pin.get("load", "data") == "ref":  # decided at registration, as the engine read for it
             args[param] = ref
         else:
-            args[param] = await _load_whole(observed.load, store, ref, t, keys_io, pin.get("index"))
+            args[param] = await _load_whole(
+                observed.load, store, ref, t, keys_io, pin.get("index"), _key_column(project, ref.output)
+            )
             timeline.add("loaded", param, _rows(args[param]))
     # Every keyed batch held keys, and the inputs' patterns took none of them: nothing
     # to call the producer with — unless one starts a full pass (architecture.md §5).
@@ -407,11 +419,24 @@ async def _unobserved(store, ref, t, selection):
     return await store.load(ref, t, selection)
 
 
-async def _load_whole(load, store, ref, t, keys_io, index_json):
+def _key_column(project, output: str) -> str | None:
+    """The key column of an output an attempt reads: a source's or an asset's."""
+
+    if output in project.sources:
+        return project.sources[output].key
+    for asset in project.assets.values():
+        for o in asset.outputs:
+            if o.name == output:
+                return o.key
+    return None
+
+
+async def _load_whole(load, store, ref, t, keys_io, index_json, key: str | None = None):
     """A whole read. From an immutable store, a keyed one names its objects
     from the live entries of its pinned index (`Keys`), since a listing would
     also show superseded and abandoned ones (docs/lifecycle.md §9.8): it is
-    loaded a page of the index at a time, and the pages put together."""
+    loaded a page of the index at a time, and the pages put together. Every
+    key the index names must come back (`check_loaded`, F33)."""
 
     if index_json is None or store.writes != "immutable":
         return await load(store, ref, t, None)
@@ -423,11 +448,14 @@ async def _load_whole(load, store, ref, t, keys_io, index_json):
         entries.update(zip(map(key_str, keys), generations, strict=True))
         if paged:
             parts.append(await store.load(ref, t, Keys(entries)))
+            check_loaded(ref.output, key, parts[-1], entries)
             entries = {}
         if after is None:
             break
     if not paged:
-        return await store.load(ref, t, Keys(entries))
+        value = await store.load(ref, t, Keys(entries))
+        check_loaded(ref.output, key, value, entries)
+        return value
     if len(parts) == 1:
         return parts[0]
     if all(isinstance(p, Mapping) for p in parts):

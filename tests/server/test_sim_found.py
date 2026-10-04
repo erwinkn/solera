@@ -1054,7 +1054,6 @@ async def test_a_pool_attempt_is_offered_only_once_its_launch_is_durable(state, 
     assert offered == [], "a launch that is not durable is offered to pool workers"
 
 
-@pytest.mark.xfail(strict=True, reason="F33: open (D56)")
 async def test_a_key_a_current_read_missed_reaches_its_consumer_once_restored(state, tmp_path):
     """F33: `feed` is a keyed source read current (a load answers with the
     outside as it is now). `feed` commits k1 at version 3; before `items`
