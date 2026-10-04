@@ -34,6 +34,19 @@ async def pool_attempt(engine, state, count=1):
     raise AssertionError("no pool attempt")
 
 
+async def offer(engine, worker, needs=None):
+    """What discovery offers `worker`, polled until it offers something: a
+    launch is offered only once it is durable (F26), which a loaded machine
+    flushes late."""
+
+    for _ in range(3000):
+        if offered := await engine.pool_work("ingest", needs or {}, worker, 0):
+            return offered
+        await engine.tick()
+        await asyncio.sleep(0.02)
+    raise AssertionError(f"nothing offered to {worker}")
+
+
 async def test_pool_workers_race_for_a_claim(state):
     """docs/lifecycle.md §10: discovery offers a launched pool attempt to the
     workers it fits; they race for its claim. The winner runs it and the
@@ -51,12 +64,7 @@ async def test_pool_workers_race_for_a_claim(state):
     run = await engine.submit(["job"])
     [attempt] = await pool_attempt(engine, state)
     assert state.model.pool[attempt]["needs"] == {"cpu": 2}
-    for _ in range(3000):  # offered once its launch is durable (F26): a loaded machine flushes late
-        if offered := await engine.pool_work("ingest", {"cpu": 4}, "w1", 0):
-            break
-        await engine.tick()
-        await asyncio.sleep(0.02)
-    [stage] = offered
+    [stage] = await offer(engine, "w1", {"cpu": 4})
     assert await engine.pool_work("ingest", {"cpu": 1}, "w-small", 0) == []  # does not fit
     assert [s["attempt"] for s in await engine.pool_work("ingest", {"cpu": 4}, "w2", 0)] == [attempt]
 
@@ -123,7 +131,7 @@ async def test_a_dead_pool_claim_expires_into_a_new_attempt(state):
     await engine.initialize()
     run = await engine.submit(["job"])
     [first] = await pool_attempt(engine, state)
-    await engine.pool_work("ingest", {}, "w1", 0)
+    await offer(engine, "w1")
     await own(state, run["id"], first, "dead")
     deadline = asyncio.get_running_loop().time() + 15  # a margin that holds under load
     while asyncio.get_running_loop().time() < deadline:
@@ -137,7 +145,7 @@ async def test_a_dead_pool_claim_expires_into_a_new_attempt(state):
     ended = (await engine.history.attempts(task["run"]))[task["id"]][0]
     assert ended["id"] == first and ended["outcome"] == "failed"
     assert await fence(state, run["id"], first) == ("ended", "none")
-    assert [s["attempt"] for s in await engine.pool_work("ingest", {}, "w2", 0)] == [second]
+    assert [s["attempt"] for s in await offer(engine, "w2")] == [second]
 
 
 async def test_a_dead_pool_claim_that_took_its_gate_is_still_writing(state):
@@ -156,7 +164,7 @@ async def test_a_dead_pool_claim_that_took_its_gate_is_still_writing(state):
     await engine.initialize()
     run = await engine.submit(["job"])
     [first] = await pool_attempt(engine, state)
-    await engine.pool_work("ingest", {}, "w1", 0)
+    await offer(engine, "w1")
     await own(state, run["id"], first, "dead")
     intents = {"job": {"files": [], "added": 0, "removed": 0}}
     await as_worker(state, run["id"], first, lifecycle.WRITING, "dead", intents=intents)
