@@ -326,6 +326,20 @@ multi-segment spans, 660 tombstones in later segments of the commit-0 span,
 5,255 `changes` queries with all four classes, and 51,500 read-ahead
 expectations.
 
+**Used.** The design worker's native format v4 prototype replays all 100
+histories of `vectors/span-model-seed1-100.jsonl.gz` with no disagreement,
+across 57,353 checks. After every step it compares per-key kept versions
+and predecessors, lookups at the head and at every live endpoint, every
+`changes` class and every read-ahead expectation. The test is
+`tests/sdk/test_keys_v4_vectors.py` on the design branch, at commit 42c4b699
+on origin. Its own calibration fails as it should:
+
+| Native code with | Histories that fail |
+|---|---|
+| merges blind to endpoints | 55 of 100 |
+| no base rule | 97 of 100 |
+| endpoints born one commit late | 53 of 100 |
+
 ## What the Rust implementation must be checked against
 
 These are the theorems' hypotheses. Each one the Rust breaks voids a
