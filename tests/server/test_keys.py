@@ -647,7 +647,11 @@ async def test_collection_waits_for_the_engines_own_readers(state):
     await engine.upkeep.collect()
     assert await state.get_object(path) == b"x"
     engine.upkeep.keys = keys
-    await engine.upkeep.collect()
+    for _ in range(600):  # the engine's own cache may still be filling from the run: it pins too
+        await engine.upkeep.collect()
+        if await state.get_object(path) is None:
+            break
+        await asyncio.sleep(0.05)
     assert await state.get_object(path) is None
     if engine.keys is not None:
         await engine.keys.stop()
