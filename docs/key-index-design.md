@@ -10,7 +10,7 @@ number says where it comes from: **measured** (real files, today's
 reader: `bench/keys/catchup.py`, `layouts.py`, `tiling_reads.py`),
 **replayed** (the merge policy on metadata, with the density model of
 `amplification.py`: `spans.py`, `retention.py`), or **proved** (Lean,
-`experiments/lean/KeyIndex/WriteBound.lean` at 2e60ddc on branch
+`experiments/lean/KeyIndex/WriteBound.lean` and `Segments.lean` at 5a34e6e on branch
 `bb/experiment-bend-2-for-the-key-index-s-delta-alge-thr_dqc6iaviun`).
 Replayed numbers are preliminary until the implementation replaces them.
 
@@ -127,8 +127,8 @@ Every merge obeys two conditions:
      R and reclaims abandoned outputs.
    One kind of merge takes a single input: a span rewritten alone, allowed
    only when at least a quarter of its entries are versions no live
-   endpoint sees. Its cost (at most 3× what it drops) is paid by the dropped
-   entries; whether the theorem covers it as stated is being checked.
+   endpoint sees. The theorem covers it: a merge needs the guard or must
+   drop a quarter of its inputs (4u ≤ 3S), with the same constant.
 2. **The read bound** (keeps catch-up local). A merge may put a live
    endpoint `e` inside its output only if, in the output, the entries before
    `e` are at most max(λ × the entries from `e` on, Z), with λ = 1 and Z = 1M
@@ -543,10 +543,16 @@ tombstone and the predecessors gone. The replaced versions (`a` g1, `b` g1,
 
 **Lean** (proposed by the coordinator):
 
-- done (2e60ddc): the write bound under the guard, for any order of
-  commits, endpoint births and retirements, with outputs of any size up to
-  the inputs' total and R attempts per merge; still to check: the
-  single-input rewrite;
+- done (5a34e6e): the write bound, every merge guarded or dropping a
+  quarter of its inputs (the single-span rewrite), for any order of
+  commits, endpoint births and retirements, outputs of any size up to the
+  inputs' total, R attempts per merge;
+- done (5a34e6e, `Segments.decode_encode`): a key's kept versions in a
+  span, decoded into per-segment (newest, predecessor) pairs, equal the
+  model's segments; so the tiling, catch-up and read-ahead results hold at
+  segment level. The implementation's check: a reader at `P` gets each
+  key's state before `P` as its newest kept version older than `P`'s
+  generation, else the span's predecessor;
 - the tiling: after any sequence of guarded, read-bounded merges, for every
   live endpoint `P` and reserved `N + 1`, the versions kept give the same
   classes as the per-commit fold, and an endpoint born at the head + 1 never
@@ -582,7 +588,7 @@ publication failures; spans and written bytes reported against the bounds.
 |---|---|
 | P1-1 landing points | every attempt that may advance a position reserves the head + 1 at its claim (selections, a pass's first attempt, drains), kept until durable transfer, released on failure; a TLA+ calibration |
 | P1-2 read-ahead state | delivered state from the sealed attempt result; latest read wins; tombstones kept |
-| P1-3 retirement rewrites | merges cross endpoints, so retirement forces nothing; the guard bounds writes in any order (Lean, 2e60ddc); replayed under the review's churn scenarios |
+| P1-3 retirement rewrites | merges cross endpoints, so retirement forces nothing; the guard bounds writes in any order (Lean, 5a34e6e); replayed under the review's churn scenarios |
 | P1-4 span count, memory | spans set by the policy, not by observers; a bound per resource; versions, not bits |
 | P2-1 retention | five lifetimes accounted separately; byte budgets with backpressure and cancel-restart |
 | P2-2 mixed models | numbers labelled; catch-up measured on real spans against packed deltas and aligned blocks; both layouts built from one trace by real compactions |
