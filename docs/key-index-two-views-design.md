@@ -3,6 +3,8 @@
 Status: **phase 1 design** (W53, T26; D105), for Erwin and the coordinator.
 No product code. Phase 2 prototypes both views and measures them against
 spans (`key-index-design.md`) on the same harness; the plan is at the end.
+Written against main at dff5077; spans' later fixes (d880955) are noted
+where they change a comparison.
 
 The brief: design a key-ordered view and a time-ordered view, each for its
 own workload alone, and reuse existing code or formats only where the
@@ -563,7 +565,7 @@ where it does not:
 | `spans.rs`: `Groups` collecting a key's versions, `retain`, `change` with generation bounds `g_p`, `g_n1`, `older`, `at` | **replaced** by a two-ended net merge (before from the oldest run, after from the newest; no bounds) | no versions, no clipping |
 | `jobs::SpanMerge`, `Merge.spans` | **replaced** by `NetMerge` (T builds) and a pack copier | |
 | `local.rs` (engine cache copies, `Snapshot`) | **reuse** | its file selection fix (R3) becomes unnecessary: one entry per key |
-| `KeyIndex._window`, `_scan`, `page`, `_key_blocks` | **reuse**, simplified: `_windowed`'s widening for a key's versions goes | |
+| cold pages: `Merge.read` (d880955, D108), a native job fed segment by segment from the block holding the cursor; `_key_blocks` | **reuse the streaming job**, without its version folds (`Changed`, `At`): with one entry per key per run it is a plain newest-wins merge for K and a two-ended net merge for T | a page fed by segments is what a from-scratch reader wants too: fewer GETs per page than a window per file |
 | `KeyIndex.changes_page`, `_range`, `_lowered` | **replaced**: the cover, the net merge, read-ahead from K at N | |
 | `IndexState`, `Span`, `committed`, `merged`, `holds`, `covers`, `generation` | **replaced** by `{count, base: {w, files}, t: {floor, built per level, epochs, hints, skips}, unpacked deltas}` | |
 | `_Policy` (guard, read rule, fan-in cap, triggers), `plan_merge`, stale rewrites, `MERGE_ATTEMPTS` per input set | **deleted**; T builds are scheduled by alignment, the base merge by one trigger | |
@@ -572,6 +574,12 @@ where it does not:
 | `ObjectIO` with injected latency (`io.py`), `EngineCache`, `Reads` | **reuse** | |
 
 ## A17, finding by finding
+
+Spans fixed R2, R7, R8, R9 and R10 on main after this design began
+(d880955: streamed version folds, a native page job `Merge.read`, durable
+merge accounting; D108, D109). So "cannot arise" below no longer means
+"spans are broken there". It means the mechanism, and the code that now
+guards it, does not exist in two views.
 
 | Finding | Here |
 |---|---|
@@ -600,9 +608,19 @@ where it does not:
 
 ## What this design gives up
 
-- **Storage.** T keeps all levels back to the floor: ~41 entries per live
-  key per day of reader lag at 1M, ~0.5 at 100M. Spans keep ~one version per
-  key per lagging reader. Cents a month, but more.
+- **Storage, and a lifetime gated by the slowest reader.** T keeps all
+  levels back to the floor: ~41 entries per live key per day of reader lag at
+  1M, ~0.5 at 100M. Spans keep at most one version per key per lagging
+  reader (D85), which is bounded by the key count. T's floor is not: a
+  stalled reader makes T grow by a day's worth of every level each day. D110
+  rejected per-commit deltas kept back to the oldest reader for exactly this
+  reason. The bound T needs is a compaction anchored on positions: below the
+  second-oldest reader's position, the oldest reader is the only one left,
+  so everything between its position and the next can be merged into one
+  node starting at its position. That caps T at about one node per reader
+  (≤ one entry per key each), as spans are capped. It reserves positions,
+  which are durable records, but never landing points. Phase 2 measures the
+  stalled pass with and without it.
 - **Far readers of small indexes read ~4× what changed.** Above.
 - **Two kinds of background work** (T builds, base merges) and a pack format.
   But no merge policy: builds follow alignment, the base one trigger.
@@ -665,8 +683,9 @@ the runs.
 1. **Railway writes.** Uploads from Railway services are billed at $0.05 per
    GB (public networking only). Should write amplification weigh more than
    the brief assumed?
-2. **The floor and the physical budget.** A reader a week behind makes T
-   keep a week of every level. Is the per-position "full pass if catch-up
-   costs more" rule the right cap, or should the floor have a byte budget?
+2. **The floor under a stalled reader.** Without the position-anchored
+   compaction above, a reader a week behind makes T keep a week of every
+   level. Is the compaction worth its extra rule, or is a byte budget on the
+   floor (past it, the oldest reader does a full pass) enough?
 3. **Spans with the format levers.** Ask W42 whether measuring spans with
    zstd and 16 KiB blocks is in scope for phase 2.
