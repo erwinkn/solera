@@ -445,7 +445,7 @@ New sweeps since that summary:
 
 ## Formal models: which spec owns which rules
 
-Four TLA+ specs, checked by `spec/tla/check.sh` (`check.sh` alone is CI).
+Five TLA+ specs, checked by `spec/tla/check.sh` (`check.sh` alone is CI).
 Each rule has one owner, so none falls between them:
 
 | Spec | Owns | Leaves to |
@@ -454,6 +454,7 @@ Each rule has one owner, so none falls between them:
 | `Positions.tla` | partition records: snapshots, K45's read-ahead and its cap, `each=True`'s per-key records, the full pass completed across runs; `keys=` runs; staleness, exact and transitive (K39, K46); and the concurrency that can break them: a batch planned at the claim and committed later, upstream commits between, a commit refused after a reset or an asset change | workers, faults and engines to `Execution.tla` |
 | `Attempt.tla` | the attempt control file: who owns an attempt, the gate, the sealed result or the engine's end; duplicates, zombies, retention; nobody learns of an attempt before its launch is durable (F26) | what an attempt computes to `Execution.tla` |
 | `JournalObject.tla` | the journal: fencing, appends, checkpoints and their cleanup, lost answers, failed requests | what the events mean to the others |
+| `KeyIndex.tla` | the span key index's lifecycle: endpoint reservations (positions, an attempt's landing point), merge upload and publication, pins with their manifests, deletion, the orphan collector, resets fencing claims and merges | what a span holds, and why reads at its boundaries are exact, to the Lean proofs (`experiments/lean/KeyIndex`) |
 
 ## Formal model: execution semantics (`spec/tla/Execution.tla`)
 
@@ -779,6 +780,65 @@ record (K47).
   status as in the truth; and a batch fails only keys it hands the asset
   (under the patterns, held upstream), not a removal or a start-over's
   drop, which the engine writes.
+
+## Formal model: the span key index's lifecycle (`spec/tla/KeyIndex.tla`)
+
+*The design of `key-index-design.md` (approved for integration), its
+"Lifecycles the implementation must honour" and "What must be checked".*
+What a span holds is the Lean proofs' (`WriteBound`, `Segments`, `Tiling`,
+`Keys`), taken as given: a read at commit `e` from spans that keep `e` as a
+boundary (a span's first commit, or a segment start inside it) agrees with
+the full history. So a span here is its commits `[a, b]`, the segment
+starts it keeps and the index's life it was written in, and a read is
+exact iff its endpoints are boundaries of the spans it reads.
+
+```bash
+spec/tla/check.sh keyindex    # base, concurrent, the calibrations: ~3 min
+```
+
+**Model.** One index. Commits append delta spans. A consumer's position
+holds an endpoint; its attempt reserves the landing point (the head + 1)
+at its claim, takes the manifest with its pin, and at settle moves the
+position there, releasing both; a failed attempt releases them. Upkeep
+uploads a merge of adjacent spans (or a span alone) under a fresh name,
+keeping a segment start at every reserved endpoint inside it, then
+publishes it through the journal, re-checking that its inputs are the
+current spans and that its life is the index's; or its process crashes
+after the upload. A published merge's inputs are deleted once no pin holds
+them; an orphan collector reclaims files nothing references. A reset
+starts a new, empty life and drops every position.
+
+| Property | Says |
+|---|---|
+| `Tiling` | the published spans tile this life's commits exactly |
+| `ReadsExact` | every reserved endpoint is a boundary of the published spans |
+| `StateStored` | every file the state names is stored |
+| `ReadersStored` | every file of a manifest a reader holds is stored |
+
+| Rule off | TLC finds |
+|---|---|
+| `FixLanding`: an attempt reserves its landing point at its claim (P1-1, A10) | `ReadsExact`, 7 steps: commit 1; an attempt claims, landing at 2, unreserved; commit 2; a merge of 1 and 2 keeps no segment start at 2; the attempt settles, and its position lands inside the merged span |
+| `FixBounds`: a merge keeps a segment start at every live endpoint inside it | `ReadsExact`, 6 steps |
+| `FixInputs`: publication re-checks the merge's inputs | `Tiling`, 7 steps: two merges over one span; the second publishes over inputs the first replaced |
+| `FixLife`: an attempt's commit re-checks the index's life | `ReadsExact`, 5 steps: an attempt claimed before a reset lands its position in the new life |
+| `FixPinFloor`: inputs are deleted only once no pin holds them | `ReadersStored`, 6 steps |
+| `FixDurable`: inputs are deleted only after the publication | `StateStored`, 3 steps |
+| `FixAtomicPin`: a reader takes its manifest and its pin in one step | `ReadersStored`, 5 steps |
+
+Not modelled: renames, which keep the index's identity (its prefix);
+a pass's `to + 1` and a pattern change's split, endpoints held as a
+position's is; read-ahead results and their retention (`Positions.tla`'s);
+the merge policy's thresholds and the write bound (Lean's).
+
+The life check on publication is redundant while file identities never
+repeat: with it off TLC finds nothing, as the input check already refuses
+a merge whose inputs an earlier life wrote. It stays, against names that
+could repeat (derived from commit numbers, say).
+
+| Model | Merges in flight | Commits per life | Distinct states | Time |
+|---|---|---|---|---|
+| `base`: one consumer, six span files, one reset | 1 | 3 | 5,240,770 | 32 s |
+| `concurrent` | 2 | 2 | 6,986,297 | ~40 s |
 
 ## Formal model: the journal object (`spec/tla/JournalObject.tla`)
 

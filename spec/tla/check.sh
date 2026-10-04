@@ -11,6 +11,7 @@
 #   attempt    ci: small, dup, live and the calibrations; big: two attempts with a
 #              duplicate worker each (too large to finish)
 #   positions  ci: base, each and the calibrations; three: three keys
+#   keyindex   ci: base, concurrent (two merges in flight) and the calibrations
 #   every spec: calibrate (each rule switched off: TLC must find its bug), all
 #
 # A model is its spec's base config ({Spec}.cfg) with changes (`model` below):
@@ -93,6 +94,16 @@ model() {
         positions/continue) changes=(FixContinue=FALSE) ;;
         positions/collapse) changes=(FixCollapse=FALSE) ;;
         positions/retry-collapse) changes=(Each=TRUE FixRetryCollapse=FALSE) ;;
+        # KeyIndex.tla: one consumer, three commits, one merge at a time, one reset.
+        keyindex/base) changes=() ;;
+        keyindex/concurrent) changes=(MaxJobs=2 MaxCommits=2 MaxFiles=6) ;;
+        keyindex/landing) changes=(FixLanding=FALSE) ;;
+        keyindex/bounds) changes=(FixBounds=FALSE) ;;
+        keyindex/inputs) changes=(MaxJobs=2 MaxCommits=2 FixInputs=FALSE) ;;
+        keyindex/life) changes=(FixLife=FALSE) ;;
+        keyindex/pin-floor) changes=(FixPinFloor=FALSE) ;;
+        keyindex/durable) changes=(FixDurable=FALSE) ;;
+        keyindex/atomic-pin) changes=(FixAtomicPin=FALSE) ;;
         *) echo "no model $2 of $1" >&2; exit 2 ;;
     esac
 }
@@ -141,6 +152,27 @@ calibration() {
             calibrate collapse StatusExact
             # K47: a retry pass that leaves nothing behind keeps its entries.
             calibrate retry-collapse Collapsed
+            ;;
+        keyindex)
+            # P1-1, A10: a selection without a reserved landing point; a merge
+            # covers it before the attempt settles, and the position lands
+            # inside a span.
+            calibrate landing ReadsExact
+            # A merge that drops the segment start a live endpoint needs.
+            calibrate bounds ReadsExact
+            # Two merges over one span: the second publishes over inputs the
+            # first replaced.
+            calibrate inputs Tiling
+            # An attempt claimed before a reset lands its position in the new
+            # life, at a point that is no boundary there.
+            calibrate life ReadsExact
+            # Inputs deleted while a reader's pin still holds them.
+            calibrate pin-floor ReadersStored
+            # Inputs deleted before the publication is durable: a refused or
+            # crashed merge leaves the state naming deleted files.
+            calibrate durable StateStored
+            # A manifest read before its pin: a merge and its deletion between.
+            calibrate atomic-pin ReadersStored
             ;;
         attempt)
             # A create-if-absent gate with nothing retained: a worker that read its
@@ -236,7 +268,8 @@ run() {  # run SPEC GROUP
         journal) module=JournalObject ;;
         attempt) module=Attempt ;;
         positions) module=Positions ;;
-        *) echo "usage: $0 [ci | execution|journal|attempt|positions [GROUP|MODEL]]" >&2; exit 2 ;;
+        keyindex) module=KeyIndex ;;
+        *) echo "usage: $0 [ci | execution|journal|attempt|positions|keyindex [GROUP|MODEL]]" >&2; exit 2 ;;
     esac
     case $spec/$2 in
         execution/ci) check smoke; calibration execution ;;
@@ -249,6 +282,7 @@ run() {  # run SPEC GROUP
         attempt/ci) check small; check dup; check live; calibration attempt ;;
         positions/ci) check base; check each; calibration positions ;;
         positions/all) run positions ci; check three ;;
+        keyindex/ci) check base; check concurrent; calibration keyindex ;;
         attempt/all) run attempt ci; check big ;;
         */calibrate) calibration "$spec" ;;
         *) check "$2" ;;
@@ -256,6 +290,6 @@ run() {  # run SPEC GROUP
 }
 
 case ${1:-ci} in
-    ci) for s in execution journal attempt positions; do echo "# $s"; run $s ci; done ;;
+    ci) for s in execution journal attempt positions keyindex; do echo "# $s"; run $s ci; done ;;
     *) run "$1" "${2:-ci}" ;;
 esac
