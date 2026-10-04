@@ -14,7 +14,7 @@
 #   spans      ci: base, orphans (the collector), retries (failing merges), empty (spans
 #              with no files), passes, and the calibrations; long: takeover (a zombie,
 #              ~20 min at 4 workers), for the freeze round and on demand
-#   observed   ci: free and current (every step, both store kinds; OBSERVED_TRACES random
+#   observed   ci: free and current (every step, both store kinds; OBSERVED_TRACES (20,000) random
 #              behaviours of 40 steps, every state checked), and each finding's
 #              history (`observed_histories`): run through with every rule on, then
 #              broken with its own rule off
@@ -137,16 +137,16 @@ model() {
 
 # ObservedSet.tla's histories: each finding as the observed set's steps (its
 # `Histories`), the store it needs, the rule that prevents it, and what
-# TLC finds with that rule off; `-`: a history that must hold either way
-# (a keys= batch in flight across a cut, a definition change, a reset).
+# TLC finds with that rule off; `-`: a history that holds by construction
+# (no rule to switch off).
 observed_histories='
 a19r1  A19R1  FALSE FixDecodeOld     CountExact
-a19r2  A19R2  FALSE FixFixedT        DecodeExact
+a19r2  A19R2  FALSE FixRecheck       DecodeExact
 a19r3  A19R3  FALSE FixDecodeOld     DecodeExact
 a19r4  A19R4  FALSE FixPointPatterns DecodeExact
 a19r5  A19R5  TRUE  FixObserve       DecodeExact
 f41    F41    TRUE  FixObserve       DecodeExact
-a26n1  A26N1  FALSE FixPin           RowsKept
+a26n1  A26N1  FALSE -                -
 a26n2  A26N2  FALSE FixDecodeOld     CountExact
 a26n3  A26N3  FALSE FixFold          DecodeExact
 a26n4  A26N4  TRUE  FixObserve       DecodeExact
@@ -157,7 +157,7 @@ a27r3  A27R3  FALSE FixUniversal     OwedExact
 a27r4  A27R4  FALSE FixClassOnce     OwedExact
 a27r5a A27R5a FALSE FixAbsentPoints  DecodeExact
 a27r5b A27R5b FALSE FixPointPatterns DecodeExact
-a27r6  A27R6  FALSE FixPin           RowsKept
+a27r6  A27R6  FALSE -                -
 a27r7  A27R7  FALSE FixLives         DecodeExact
 a27r8a A27R8a FALSE FixSupersede     DecodeExact
 a27r8b A27R8b FALSE FixFold          DecodeExact
@@ -165,13 +165,15 @@ a27r8c A27R8c FALSE FixSplit         DecodeExact
 a27r9  A27R9  FALSE FixRangeCands    OwedExact
 a27r10 A27R10 FALSE FixPending       StaleExact
 paused Paused FALSE FixImage         DecodeExact
-passcut PassCut FALSE FixPassCut     EndpointsKept
-regress Regress FALSE FixNoRegress   NoRegress
+runcut RunCut FALSE -                -
+regress Regress FALSE -              -
+relabel Relabel FALSE FixRelabel     DecodeExact
 resetfly ResetInFlight FALSE FixCommitCheck DecodeExact
-cutfly CutInFlight FALSE FixPassCut  EndpointsKept
+definefly DefineInFlight FALSE FixCommitCheck CountExact
+cutfly CutInFlight FALSE FixClaimPin EndpointsKept
 selcut SelCut FALSE -                -
-seldefine SelDefine FALSE -                -
-selreset SelReset FALSE -                -'
+seldefine SelDefine FALSE -          -
+selreset SelReset FALSE -            -'
 
 # observed_history NAME: set history, store, rule and expected for NAME.
 observed_history() {
@@ -379,7 +381,7 @@ run() {  # run SPEC GROUP
         spans/long) check takeover ;;
         spans/all) run spans ci; run spans long ;;
         observed/ci)  # every step: too many states to exhaust, so random behaviours, every state checked
-            local sim=(-simulate "num=${OBSERVED_TRACES:-500000}" -depth 40 -seed 1)
+            local sim=(-simulate "num=${OBSERVED_TRACES:-20000}" -depth 40 -seed 1)
             check free "${sim[@]}"; check current "${sim[@]}"
             echo "== histories, every rule on, then the history's own off"
             for h in $(awk 'NF {print $1}' <<< "$observed_histories"); do

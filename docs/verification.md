@@ -525,7 +525,7 @@ Each rule has one owner, so none falls between them:
 |---|---|---|
 | `Execution.tla` | the engine: runs, claims, attempts, passes and batches of default runs; positions as default runs move them; resets and the reset rule; asset changes and `OnChange` (K34); fenced stores, gates and repairs; engine crash, restart and takeover; worker crashes, timeouts, cancels | `keys=` runs and staleness to `Positions.tla`; the attempt's control file to `Attempt.tla`; the journal to `JournalObject.tla` |
 | `Positions.tla` | partition records: snapshots, K45's read-ahead and its cap, `each=True`'s per-key records, the full pass completed across runs; `keys=` runs; staleness, exact and transitive (K39, K46); and the concurrency that can break them: a batch planned at the claim and committed later, upstream commits between, a commit refused after a reset or an asset change | workers, faults and engines to `Execution.tla`; superseded by `ObservedSet.tla` with the rebuild (below) |
-| `ObservedSet.tla` | the observed set (D126, D133) and its observation record: decode, candidates and classify-once, batches reclassified from what was served, points, ranges and the base with its before-image, folds and rebases, every run kind (default passes in batches, replans, `keys=`, per-key cancels, start-overs), pattern, context and definition changes, upstream resets, retention cuts, the window between a batch's plan and its commit | what an attempt is to `Execution.tla`; the index and its endpoints to `Spans.tla` |
+| `ObservedSet.tla` | the observed set (D126, D133) and its observation record: decode, candidates and classify-once, batches reclassified from what was served, points, ranges at each batch's head and their fold, the base with its before-image, rebases, every run kind (default runs in batches, `keys=`, per-key cancels, start-overs, dropped runs), pattern, context and definition changes, upstream resets, retention cuts, a batch in flight between dispatch and commit | what an attempt is to `Execution.tla`; the index and its endpoints to `Spans.tla` |
 | `Attempt.tla` | the attempt control file: who owns an attempt, the gate, the sealed result or the engine's end; duplicates, zombies, retention; nobody learns of an attempt before its launch is durable (F26) | what an attempt computes to `Execution.tla` |
 | `JournalObject.tla` | the journal: fencing, appends, checkpoints and their cleanup, lost answers, failed requests | what the events mean to the others |
 | `Spans.tla` | the span key index's lifecycle as built: endpoints (positions, passes, an attempt's reads and landing point), the merge lanes, upload and publication in two steps, pins and garbage, empty spans, the orphan collector and its epochs, merge retries, crashes, takeovers, resets; trace-validated against the simulation | what a span holds, and why reads at its boundaries are exact, to the Lean proofs (`experiments/lean/KeyIndex`) |
@@ -960,15 +960,16 @@ wait longer; the read-ahead's entries (`Positions.tla`'s).
 
 ## Formal model: the observed set (`spec/tla/ObservedSet.tla`)
 
-*The design of `docs/observed-set.md` (D126, D133; on `docs/ledger-draft`,
-389fcfb), checked before the rebuild leans on it.* A consumer partition's
-**observed set** `S` is, per key of a keyed incremental input, what it
-processed: present or not, its version, the context (whole and dep
-versions) and the upstream's life. Its stored form, the **observation
-record** `E`, is a base (a commit, or a commit with a before-image of
-what changed since), disjoint ranges (a pass's committed prefixes, each
-at its `T`) and points (explicit observations). The model keeps `S`
-literally beside `E` and checks, after every commit:
+*The design of `docs/observed-set.md` (D126, D133; on `docs/ledger-draft`
+at 67b85eb, which dropped passes: a run keeps only its cursor, in
+memory).* A
+consumer partition's **observed set** `S` is, per key of a keyed
+incremental input, what it processed: present or not, its version, the
+context (whole and dep versions) and the upstream's life. Its stored
+form, the **observation record** `E`, is a base (a commit, or a commit
+with a before-image of what changed since), disjoint ranges (keys
+observed at one head) and points (explicit observations). The model
+keeps `S` literally beside `E` and checks, after every commit:
 
 | Property | Says |
 |---|---|
@@ -978,47 +979,53 @@ literally beside `E` and checks, after every commit:
 | `OwedExact` | what the design owes (candidates, each classified once from its decoded state to upstream now) is exactly `S` against upstream now |
 | `StaleExact` | stale iff something is owed, a start-over included |
 | `RowsKept` | a batch never loads a row its store has deleted |
-| `EndpointsKept` | a batch never needs the key view at a `T` retention has cut |
+| `EndpointsKept` | a batch never records a range at an `H` retention has cut |
 | `Admitted` | no run is refused (A26 N5) |
 | `NoRegress` | an action property, for histories whose versions only grow: no output goes back to an older version |
 
 ```bash
-spec/tla/check.sh observed    # free and current, then every history: ~8 min at 4 workers
+spec/tla/check.sh observed    # free and current, then every history: ~10 min at 4 workers
 ```
 
 **Model.** Three keys in key order, in prefix groups `a`, `b`, `c` (glob
 `d` matches none); patterns are sets of globs, `{}` the universal
 include; two contexts; versions to 2 (3 in histories), 0 absent. Upstream
 is an index (commits of one life) and a store's rows: a **versioned**
-store serves the rows a commit names, which cleanup deletes unless
-pinned; a **current-only** store serves its rows as they are now, ahead
-of the index or reverted. A **default run** is a pass at the head `T`,
-in batches over key ranges: a batch is planned (its attempt holds the
-partition, one at a time), reads the index at `T` and the rows served,
-and commits, unless its pass was replanned or ended, its life reset or a
-start-over owed since. Its commit classifies what it owes at `T` from the
-decoded old state, reclassifies from what was served, writes a range at
-`T` and points where the store served what `T` does not say; the last
-batch rebases. A **`keys=` run** takes one key, if owed, and writes a
-point. A **per-key batch** canceled part done commits its finished keys
-as points. Deploys change patterns, context, or the definition (a
-start-over); upstream commits, resets (a new life: a start-over);
-retention cuts the index's history (a base or range it passes keeps a
-before-image); upkeep folds points. A failed attempt writes nothing.
+store serves the rows a commit names, which cleanup deletes unless a
+claim pins them; a **current-only** store serves its rows as they are
+now, ahead of the index or reverted. A **default run** computes what is
+owed (everything, for a start-over) and processes it in key order, a
+batch at a time; its cursor and owed set live in its memory, which a
+cancel, a failure or a takeover drops. A batch is dispatched at the head
+`H` (its attempt holds the partition, one at a time; its claim pins `H`)
+and commits unless its life or definition changed since. Its commit
+classifies every key of its range from the decoded old state to `H`,
+reclassifies from what was served, and records a range `(prev, c]` at
+`H` and points where the store served something else; an older range
+relabels to `H` where nothing in it changed, a changed key keeping its
+decoded value as a point; a run's last batch rebases. A **`keys=` run**
+takes one key, if owed, and writes a point. A **per-key batch** canceled
+part done commits its finished keys as points. Deploys change patterns,
+context, or the definition (a start-over); upstream commits, resets (a
+new life: a start-over); retention cuts the index's history (the base
+takes a before-image; an older range folds to the cut, its changed keys
+becoming points); upkeep folds points. A run's last batch makes the base;
+the design also makes one whenever ranges at one head span every key,
+which only differs when an earlier, dropped run left the tail covered.
 
 **Each finding as a history.** Every finding the rebuild answers is a
 history of these steps (`ObservedSet.tla`'s `Histories`), checked twice:
 with every rule on it runs through and holds; with the rule that
-prevents it off, TLC finds it. 32 histories, 29 of them calibrated:
+prevents it off, TLC finds it. 34 histories: 27 calibrated, and 7 that
+hold by construction (no rule prevents them; nothing can break them):
 
 | Finding | Rule that prevents it | Off: TLC finds |
 |---|---|---|
 | A19 R1, R3; A26 N2 | classes from the whole decoded old state, not the base alone (`FixDecodeOld`) | `CountExact`, 9 and 10 steps; `DecodeExact`, 10 |
-| A19 R2 | a pass reads at its `T` (`FixFixedT`) | `DecodeExact`, 9 |
+| A19 R2 | a batch classifies every key of its range at its `H`, not just those owed when its run began (`FixRecheck`) | `DecodeExact`, 9 |
 | A19 R4; A27 R5 (the label) | a point keeps the patterns it was read under (`FixPointPatterns`) | `DecodeExact`, 9 |
 | A27 R5 (absence) | an absent point is a live value, not a tombstone (`FixAbsentPoints`) | `DecodeExact`, 8 |
 | A19 R5; A26 N4; A27 R2; F41 | classes and points follow the row served (`FixObserve`) | `DecodeExact`, 10 to 15 |
-| A26 N1; A27 R6 | a pass pins its rows from its start (`FixPin`) | `RowsKept`, 10 |
 | A26 N3; A27 R8 (fold) | a point folds only if decoding without it gives its value (`FixFold`) | `DecodeExact`, 12 and 13 |
 | A26 N5 | points spill, nothing is refused (`FixNoCap`) | `Admitted`, 6 |
 | A27 R1 | layers carry their context, and a moved context is a candidate (`FixContext`) | `OwedExact`, 7 |
@@ -1026,57 +1033,59 @@ prevents it off, TLC finds it. 32 histories, 29 of them calibrated:
 | A27 R4 | net changes are candidates, not classes (`FixClassOnce`) | `OwedExact`, 9 |
 | A27 R7 | an upstream reset owes a rebuild (`FixLives`) | `DecodeExact`, 6 |
 | A27 R8 (supersede, split) | a range write drops the points inside it and keeps other ranges' parts (`FixSupersede`, `FixSplit`) | `DecodeExact`, 8 and 10 |
-| A27 R9 | each range's changes since its own `T` are candidates (`FixRangeCands`) | `OwedExact`, 12 |
+| A27 R9 | each range's changes since its own endpoint are candidates (`FixRangeCands`) | `OwedExact`, 12 |
 | A27 R10 | staleness is the comparison, not a pattern label (`FixPending`) | `StaleExact`, 2 |
 | a reader paused past the window (the doc's example) | a cut leaves a before-image (`FixImage`) | `DecodeExact`, 11 |
-| **a cut past an active pass** (found here) | the cut replans the pass and refuses its batch in flight (`FixPassCut`) | `EndpointsKept`, 10 and 11 |
-| **a pass going back** (found here) | a pass leaves alone a key observed after its `T` (`FixNoRegress`) | `NoRegress`, 9 |
-| **a batch across a reset** (found here) | a batch commits only if its pass, life and definition hold (`FixCommitCheck`) | `DecodeExact`, 10 |
+| the fold (the revised design) | an older range relabels to `H` only where nothing changed; a changed key becomes a point (`FixRelabel`) | `DecodeExact`, 9 |
+| a batch in flight across a reset or a definition change | a batch commits only if its life and definition hold (`FixCommitCheck`) | `DecodeExact`, 10; `CountExact`, 12 |
+| a batch in flight when the cut passes its `H` | its claim pins `H` against the cut (`FixClaimPin`) | `EndpointsKept`, 13 |
 
-A19 R6 and R8, D111's bounds and the failure retries, are outside the
-record and kept as they are. F41's history is its replay's end state
-(`tests/sim/test_replays.py`): `items` holds k11; `feed` becomes {k11},
-then {k1, k3}; the store still serves k11 when `items` reads through
-that commit. Without `FixObserve` its range says k11 is gone while it
-still holds it, and it is fresh.
+Hold by construction: A26 N1 and A27 R6 (a batch reads at the head,
+whose rows no cleanup deletes); a run under way when the cut passes its
+earlier batches (each batch reads at its own head); a run reaching a key
+that a newer `keys=` run delivered (no regression: the batch reads at a
+head at least as new); and a `keys=` batch in flight across a cut, a
+definition change or a reset (it writes a point, which needs no
+endpoint; it never clears the start-over that follows, and the
+start-over discards it). A19 R6 and R8, D111's bounds and the failure
+retries, are outside the record and kept as they are. F41's history is
+its replay's end state (`tests/sim/test_replays.py`): `items` holds k11;
+`feed` becomes {k11}, then {k1, k3}; the store still serves k11 when
+`items` reads through that commit. Without `FixObserve` its range says
+k11 is gone while it still holds it, and it is fresh.
 
-**Found on the design** (reported with these histories; W22 folded the
-fixes into `docs/observed-set.md` at 89ac81b):
-
-1. A retention cut past an active pass's `T` loses the key view the pass
-   still needs, for its next batch or for one in flight. The cut now
-   replans the pass at the head (its committed ranges get before-images
-   like any range) and refuses its batch in flight.
-2. A pass at an older `T` sends a key back to that `T`'s version after a
-   `keys=` run delivered a newer one: exact, but the output regresses.
-   The pass now leaves alone a key whose point was observed after its `T`.
-3. A batch in flight across an upstream reset or a definition change
-   must not commit: a pass's batch would clear the start-over it owes.
-   The engine already refuses such commits; the design now says so.
-
-**A `keys=` batch in flight** (W22's rule: it starts no pass, so its
-commit checks only its life and that no start-over is owed): safe across a
-cut, the replan the cut makes and a definition change. It writes a point,
-which needs no endpoint, under the patterns and context it read with. The
-model shows more: even with no check, a `keys=` commit across a reset or a
-definition change breaks nothing, because it never clears the start-over
-that follows, and the start-over discards what it wrote. The check saves
-that wasted write.
+**Found on the design.** On the design with passes (389fcfb; the model
+then: 73eb893), three counterexamples, each with a fix checked there: a
+retention cut past an active pass's `T`; a pass at an older `T` sending a
+key back after a newer `keys=` delivery; a batch committing across an
+upstream reset or definition change. W22 folded the fixes in (89ac81b);
+Erwin then dropped passes. On the revised design the first two cannot
+happen (`runcut`, `regress` hold with no rule); the third still needs
+its check (`resetfly`, `definefly`), and so does the remainder of the
+first: a single batch in flight, whose claim must hold the cut back
+from its `H` (`cutfly`). The revised doc (67b85eb) has the batch's rows
+pinned by its claim, but retention folds only bases and ranges before a
+cut, and an in-flight batch's `H` is neither yet: its commit would write
+a range at a head the index no longer has. The fold needs its own check (`relabel`), and
+a batch must classify every key of its range at its head, not only what
+was owed when its run began (`a19r2`): a key that changed meanwhile
+would otherwise be recorded at `H` without being delivered.
 
 **Free exploration.** Every step above, interleaved: too many states to
 exhaust (a two-key scope still grew past 8.7M states at depth 14), so
 random behaviours of 40 steps, every state checked. With every rule on:
-168,131,768 states (versioned store) and 146,548,545 (current-only), no
-violation. Each rule off, the free search finds its violation unaided, in
-13 to 31 steps: the free model reaches every guarded case. CI runs
-500,000 behaviours of each, seeded.
+71,884,258 states (versioned store) and 82,462,123 (current-only), no
+violation. Each rule off, the free search finds its violation unaided
+(`FixNoCap` aside, which needs two `keys=` points at once): the free
+model reaches every guarded case. CI runs 20,000 behaviours of each,
+seeded: about 56M states each.
 
 **Not modelled:** an `each` chain's transitive staleness (A19 R10: the
 doc intersects owed keys key by key, then rolls up); several keyed
 inputs, and payloads apart from versions; the spill's bounds and cost
 (A27 R11); prefix scans by byte order (a glob is its group here); a
 before-image written over several cuts beyond one key's first entry;
-takeovers and renames, which change nothing the record holds (it is
+takeovers and renames beyond dropping a run's memory (the record is
 durable; a rename keeps the life).
 
 **What to delete.** `Positions.tla` models today's positions: `next`
