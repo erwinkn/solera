@@ -328,7 +328,8 @@ async def test_automation_state_survives_reregistration(state, clock):
 
 
 async def test_replay_reproduces_the_live_model(tmp_path, clock):
-    """Checkpoint + journal tail, replayed on restart, equals the live model."""
+    """A checkpoint and the journal tail after it, replayed on restart,
+    equal the live model."""
 
     state = await State.open(
         tmp_path.as_uri(), "test", clock=clock, flush_interval=0.001, min_checkpoint=2000
@@ -341,10 +342,15 @@ async def test_replay_reproduces_the_live_model(tmp_path, clock):
         clock.now += 61
         await engine.tick()
     await engine.tick()  # archive what finished
-    await engine.stop()  # an OnChange run it fired may still be going: nothing may record past here
+    await engine.stop()
+    # Workers outlive the engine's stop: each records its cleanups after its commit (D8).
+    # Snapshot only once they are done, or replay holds events the snapshot missed.
+    await worker_finished()
     live = durable(state.model)
-    await state.close()
+    await state.journal.close(checkpoint=False)  # no final checkpoint: replay applies the tail
+    assert durable(state.model) == live, "something recorded after the snapshot"
     again = await State.open(tmp_path.as_uri(), "test", clock=clock, writer=False)
+    assert again.journal.checkpoint is not None and again.journal._events, "a checkpoint and a tail"
     history = again.model
     finished = len(history.history.rows.get("runs", ())) + sum(
         f["rows"] for f in history.history.files.get("runs", ())
