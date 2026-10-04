@@ -1,9 +1,123 @@
 # The seen-set: incremental reads from one encoded state (draft)
 
 Status: **draft** for Erwin's model. Docs only; nothing is built. If the
-model is not confirmed, this note is dropped.
+model is not confirmed, this note is dropped. The **interval map** (next
+section) is the proposed encoding; position plus exceptions, which the
+rest of the note describes, is kept as the comparison. The seen-set, the
+invariant and the computation are the same for both.
 
-## The model
+## Proposed encoding: the interval map
+
+A consumer partition's **seen-set**, per keyed incremental input, is key →
+the upstream version it processed, as it was served (below, "The
+seen-set"). The interval map encodes it as a piecewise map over key space: each key range → the
+**commit it was observed at**, and the **patterns it was observed under**.
+No interval carries a version or an "absent": both are derived from its
+commit. Decoded, an interval `[lo, hi] @ (c, π)` means "each key in
+`[lo, hi]` as upstream had it after commit `c − 1` — its version, or
+absent — if `π` takes it; else absent".
+
+| State | Intervals |
+|---|---|
+| A partition caught up | one: `(−∞, +∞) @ P` |
+| A full pass part done | two: `(…, c] @ T` (its snapshot), the rest `@ P` |
+| A `keys=` run, or a current-only read | a point `[k, k] @` the commit the read reflected: the head at which `k` had the served version, or was gone |
+| After a default run that leaves nothing owed | one again: everything re-based to the head it reached |
+
+**The diff, per interval.** `changes(c, now)` restricted to its key range
+gives each key's net change since it was seen: an add, an update, a
+removal, or nothing — classed under the interval's patterns `π`. Where the
+current patterns `π′` differ from `π`, a **membership query** adds the
+keys whose membership changed: one newly included is owed an add unless
+the interval saw it (it did not, `π` excluding it), one newly excluded
+that the interval saw is owed a removal. Then the run re-bases the
+interval: `@ (now, π′)`. The union over intervals is the staleness, and
+exactly a default run's load.
+
+**Exactness, on the same examples.** `⊥` is the empty commit: it decodes
+to nothing.
+
+- *`keys=` before a default run.* `(−∞, +∞) @ ⊥`; `keys=(k1)` at head
+  `H1` splits it: `(…, k1) @ ⊥`, `[k1, k1] @ H1`, `(k1, …) @ ⊥`. `k1` is
+  updated at `H2`. The default run: `changes(⊥, now)` on the outer two
+  gives `k2` an add; `changes(H1, now)` on `[k1, k1]` gives `k1` an update.
+  Everything re-bases: `(−∞, +∞) @ now`.
+- *A widening.* `(−∞, +∞) @ (P, include=k1)`, widened to `k*`. The
+  membership query over `k*` but not `k1` finds `k2` upstream and unseen:
+  an add. After `keys=(k2)` at `H` the map holds `[k2, k2] @ (H, k*)`,
+  under the new patterns already: no membership change there, and
+  `changes(H, now)` says nothing — not added twice. `keys=(k9)`, a key
+  that never existed, leaves `[k9, k9] @ H`, which decodes to absent:
+  nothing owed (or the run records nothing at all).
+- *A narrowing.* `@ (P, k*)` narrowed to `k1`: the membership query over
+  `k*` but not `k1` finds `k2`, present at `P`: a removal.
+- *A definition change.* The map resets to `(−∞, +∞) @ ⊥`: everything
+  upstream is owed an add, and the consumer starts over.
+- *A full pass part done.* `(…, c] @ T`, the rest `@ P`: keys up to `c`
+  are seen as at `T`; an update after `T` is in `changes(T, now)`, owed
+  once.
+- *The current-only revert.* A batch at `T` names `k2@2`; the store serves
+  `@3`, which the head `H` holds: `[k2, k2] @ H`. Restored to `@2` (a new
+  generation, or `v2`'s payload): `changes(H, now)` on `k2` says updated.
+  A store ahead of its index (a row no commit has named yet) is recorded
+  at the head too, and the commit that catches the index up arrives as an
+  update: one redundant rewrite, never a missed one. A store behind its
+  index that still holds an older row is the one case no commit
+  describes (as for exceptions).
+- *The same-version re-arrival.* `k2` gone when a per-key batch loads it:
+  `[k2, k2] @ H`, `H` the head where it was gone. It returns:
+  `changes(H, now)` says added.
+- *A takeover.* Each batch's intervals commit with its outputs; an
+  attempt that dies records nothing, and the map still decodes to `S`.
+
+**Membership queries for globs.** A key's membership can only change
+under a pattern that changed: one added to, or removed from, `include` or
+`exclude`. So the keys to look at are those matching one of those
+patterns. Each glob has a **literal prefix**, the characters before its
+first wildcard (`ICP/Results/**/*.csv` → `ICP/Results/`), which bounds the
+keys it can match to one key range. The query scans that range, clipped
+to the interval: in the index at `c` for what was seen under `π`, and at
+`now` for what `π′` takes. A prefix pattern costs the keys under its
+prefix, not the index. A glob with no literal prefix (`**/archive/**`,
+`*template*`), or an unanchored regex, bounds nothing: its query is the
+interval's whole range — a full compare of that interval, which is what
+position plus exceptions does for every pattern change.
+
+**Size and folding.** One interval normally; one more for a pass under
+way; one point per key a `keys=` run named, or a current-only read found
+other than its batch's commit said. Adjacent intervals with the same
+`(c, π)` merge. A point re-bases to a later commit `c′` when its key did
+not change in between (`changes(c, c′, keys=…)`, batched), so a default
+run that completes folds every point to the head it reached, and the map
+is one interval again — but for current-only reads made during that very
+run. Past a bound (1,000 intervals, say) the points spill to a small
+index, key → commit, under the consumer's index prefix, committed with
+the run; nothing is refused. A `keys=` run's points can share one commit
+(the head it pinned), so its keys spill as one list.
+
+**Can the index serve it?** `changes(first, last)` already takes a key
+range (`after`, `until`) and a key list (`keys=`): it reads the spans
+overlapping `[first, last]` and, in each, only the blocks covering the
+range — a prefix's worth, not the index. Two limits:
+
+- `first` must be a reserved endpoint (or 0). Every distinct commit in the
+  map stays reserved while an interval names it; that is what retains
+  versions, so points are re-based, and a run's points share its head, to
+  keep the distinct commits few.
+- One call takes one `first`. Intervals at different commits are
+  separate calls, grouped by commit: a call per distinct commit, each a
+  few seeks per span. A per-key `first` in one call would need the index
+  to take it — `lower=` is close, but it carries a delivered presence the
+  map derives from the commit instead.
+
+**Against position plus exceptions.** The interval map stores no
+version and no absent, so a point is a key and a commit; a pass and a
+point are the same shape; and a pattern change costs a prefix's scan,
+not a full compare. Its price: every commit it names must stay a reserved
+endpoint, where an exception carries its version and pins nothing. The
+seen-set, the invariant, the computation and the testing are the same.
+
+## The seen-set, and the comparison encoding: position plus exceptions
 
 Each consumer partition has, per keyed incremental input, a **seen-set**
 `S`: key → the upstream version it processed (the version it was
