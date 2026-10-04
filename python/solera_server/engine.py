@@ -504,6 +504,13 @@ class Engine(Attempts, Sensors, Staleness, Views):
                 event["retry_for"] = float(retry_for)
         if commit is not None:
             event["commit"] = commit
+        elif task["asset"] in self.manifest["assets"]:
+            # What it wrote is cleaned up once a worker that outlives it can no longer add to
+            # it: the asset's timeout and cancel grace after its end (the sweep, §9.8).
+            info = self.manifest["assets"][task["asset"]]
+            event["late_writes"] = float(info.get("timeout") or 3600) + float(
+                info.get("cancel_grace") or self.cancel_grace
+            )
         if more:
             event["more"] = True
         if repairs:
@@ -1774,7 +1781,10 @@ class Engine(Attempts, Sensors, Staleness, Views):
         if not entries:
             return []
         floor = self.m.pin_floor(but=attempt, path=self.m.index(output, partition).prefix)
-        return [e for e in entries if e["n"] <= floor and not e.get("stuck")][:DISCARDS]
+        now = self.clock()
+        return [e for e in entries if e["n"] <= floor and e.get("after", 0) <= now and not e.get("stuck")][
+            :DISCARDS
+        ]
 
     def _fingerprint(self, asset: str, run) -> str:
         """H(the definition — `model.declaration`, its inputs' bindings

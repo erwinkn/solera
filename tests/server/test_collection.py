@@ -76,18 +76,21 @@ async def test_superseded_versions_go_right_after_the_commit(tmp_path, data):
 
 async def test_an_abandoned_attempts_objects_go(tmp_path, data, monkeypatch):
     """An attempt dies after its first object landed: everything it wrote
-    carries its generation, and its delta file names it all. The retry, the
-    partition's next attempt, cleanups it and its delta file."""
+    carries its generation. Its cleanup runs late (the sweep, §9.8): due its
+    asset's timeout and the cancel grace after its end, by when a worker
+    that outlived it has written its last — so the retry, right after,
+    leaves the object, and the partition's next attempt past the window
+    cleans it up, and its delta file."""
 
     values = [{"a": 1, "b": 1}, {"a": 2, "c": 1}, {"a": 2, "c": 1}, {"a": 2, "c": 1}]
 
-    @asset(outputs=Output("scores", keyed=True), retries=Retry(1, delay=0))
+    @asset(outputs=Output("scores", keyed=True), retries=Retry(1, delay=0), timeout=1)
     def scores():
         return values.pop(0)
 
     project = Project(assets=[scores])
     state = await State.open(tmp_path.as_uri(), "test", flush_interval=0.001)
-    engine = engine_for(state, project)
+    engine = engine_for(state, project, cancel_grace=0)
     await engine.initialize()
     await run(engine, ["scores"])
     put, puts = FileStore._put, []
@@ -102,8 +105,13 @@ async def test_an_abandoned_attempts_objects_go(tmp_path, data, monkeypatch):
     detail = await run(engine, ["scores"])
     first, _ = detail["attempts"][detail["tasks"][0]["id"]]
     assert first["outcome"] == "failed"
-    assert not (data / f"{puts[0]}.json").exists()  # the retry collected it
-    await run(engine, ["scores"])  # and what the retry's commit superseded goes next
+    assert (data / f"{puts[0]}.json").exists()  # a late writer might still add to it: not yet
+    late = data / "scores" / "zz" / f"{puts[0].rsplit('/', 1)[1]}.json"  # and one does, after its end
+    late.parent.mkdir(parents=True, exist_ok=True)
+    late.write_text("{}")
+    await asyncio.sleep(1.1)  # the window passes
+    await run(engine, ["scores"])  # the next attempt cleans it up, and what the retry superseded
+    assert not (data / f"{puts[0]}.json").exists() and not late.exists()  # one cleanup takes both
     assert objects(data, "scores") == await named(state, "scores")
     prefix = state.model.indexes[("scores", "")].prefix
     await engine.upkeep.collect()

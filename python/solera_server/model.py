@@ -1037,7 +1037,7 @@ class Model:
             intents.append({**intent, "run": e["run"], "attempt": e["attempt"]})
         self._cleaned_up(task["partition"], e)
         if launched is not None and not e.get("commit"):
-            self._abandoned(task["partition"], e["attempt"], launched)
+            self._abandoned(task["partition"], e["attempt"], launched, at + float(e.get("late_writes") or 0))
         usage = (e.get("worker") or {}).get("usage") or {}
         summary = {
             "id": e["attempt"],
@@ -1466,9 +1466,12 @@ class Model:
                     {"kind": "commits", "from": int(first), "to": int(new["commits"][0]) - 1},
                 )
 
-    def _abandoned(self, partition: str, attempt: str, launched: dict) -> None:
+    def _abandoned(self, partition: str, attempt: str, launched: dict, after: float) -> None:
         """An attempt that ended without committing: whatever it wrote on an
-        immutable store carries its generation, which no other attempt uses."""
+        immutable store carries its generation, which no other attempt uses.
+        One cleanup takes it all, run late (the sweep, §9.8): due `after`, its
+        end plus the asset's timeout and cancel grace, by when a worker that
+        outlives it and honours cancellation has written its last."""
 
         for name, info in (launched["prepared"].get("outputs") or {}).items():
             if info["contract"]["writes"] == "immutable":
@@ -1477,6 +1480,7 @@ class Model:
                     "attempt": attempt,
                     "generation": launched["generation"],
                     "commit_number": info.get("commit_number"),
+                    "after": after,
                 }
                 if info.get("prefix") is not None:
                     entry["prefix"] = info["prefix"]

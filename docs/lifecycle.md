@@ -1,8 +1,7 @@
 # The attempt lifecycle
 
-Status: **built** (milestones 1, 2 and 5), but for the §9.8 sweep of what a
-worker writes after its attempt ended, and sensors' host-side resolution
-of bigger maps (§11.7). Where the build departs from the text, it says so
+Status: **built** (milestones 1, 2 and 5), but for sensors' host-side
+resolution of bigger maps (§11.7). Where the build departs from the text, it says so
 in place. In order: the records of §2 (`solera/lifecycle.py`), attempt
 objects and ownership (§2–§4), the channel (§5: `solera_server/attempts.py`,
 `solera_worker/channel.py`), heartbeats as evidence (§6), the two-phase
@@ -1000,14 +999,16 @@ shows.
   generation, which no other attempt uses, and their `AttemptFinished`
   without a commit is durable: one pattern, `(partition, generation)`,
   takes all they wrote — keys, value or commit.
-- **The sweep**, occasional, for what a worker still running after its
-  attempt ended (given up on, or a duplicate) wrote later. It lists a
-  partition and deletes a name only if its generation belongs to an attempt
-  with a durable end and no commit (the history records each attempt's
-  generation). A name with any other generation — committed, in flight,
-  unknown — is never swept: "not current in the index" is not garbage (an
-  attempt about to commit has uploaded names the index does not hold yet;
-  a pinned reader needs superseded ones).
+- **The sweep**: what a worker still running after its attempt ended
+  (given up on, or a duplicate) wrote later. It is the same cleanup, run
+  late: an abandoned attempt's entry is due its end plus the asset's
+  timeout and cancel grace (and no pin predating it), by when a worker
+  that honours cancellation has written its last — once the control file
+  is ended it can neither take the gate nor seal, so all it can add is the
+  store calls already in flight. Its one call, `store.cleanup(output,
+  home, partition, generation=G)`, takes what the attempt wrote, early and
+  late. Nothing reads those objects meanwhile (the index never named
+  them): the wait costs storage only.
 
 **As built.** The engine holds no store credentials and runs no user
 code, so workers clean up, twice over:
@@ -1061,8 +1062,16 @@ ordinary index garbage.
 A pattern change drain's snapshot pin (`position.pattern change.pin`) holds both
 index-file garbage and data cleanups, as a live claim does; a retry pass
 needs none, since each of its batches reads the state of its own prepare
-(`per-key-processing.md` §20). Not built: the sweep, so a worker that
-writes after its attempt ended leaves orphans.
+(`per-key-processing.md` §20).
+
+**Remaining orphans.** Two cases leave objects behind, harmless but for
+the storage they take: the index never names them, and they are
+collected when their output is removed or moved (the cleanup task's
+`before=G`). A partition that never runs again hands its due entries to
+no attempt. And the sweep's bound holds for workers that honour
+cancellation: one whose machine pauses (a suspended VM) can resume after
+the window and complete a write it had already started. Storage is the
+cheap resource: no periodic task chases them.
 
 Writing the same content again (`v1 → v2 → v1`) writes a new name
 (`f-1/{g3}`): deleting the old `f-1/{g1}` cannot touch it. That is what removes the
