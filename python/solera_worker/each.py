@@ -3,7 +3,7 @@
 
 A batch is either the changes of the input's pass (`changes`) or the
 failed keys's keys that are due again (`retry`). Each key is one call,
-all of a batch's at once; its outcome is classified (`solera.errors`), the
+`concurrency` at a time; its outcome is classified (`solera.errors`), the
 outputs of the keys that succeeded become one `Patch({key: value})` per
 output, and every key's outcome moves its failure record (`solera.failed_keys`)
 — all of it committed together.
@@ -460,8 +460,9 @@ async def run(spec, project, asset, param: str, pin: dict, args: dict, ctx, keys
     decls = {o.name or asset.name: o for o in asset.outputs}
     is_async = inspect.iscoroutinefunction(asset.fn)
     signature = inspect.signature(asset.fn)
-    # Every key of the batch runs at once (D80): `batch_size` is the one knob.
-    pool = None if is_async else ThreadPoolExecutor(max_workers=max(1, len(batch.upserted)))
+    # `concurrency` keys at once within the partition (D111): that many workers.
+    at_once = max(1, min(int(each["concurrency"]), len(batch.upserted)))
+    pool = None if is_async else ThreadPoolExecutor(max_workers=at_once)
     loop = asyncio.get_running_loop()
     outputs: dict[str, dict] = {}
     outcomes: dict[str, Outcome] = {}
@@ -492,16 +493,23 @@ async def run(spec, project, asset, param: str, pin: dict, args: dict, ctx, keys
                 )
         return values
 
-    async def one(key: str, generation: int):
-        """One key's call; a drain or another key's abort interrupts it."""
+    todo = iter(batch.upserted.items())
 
-        try:
-            await call(key, generation)
-        except asyncio.CancelledError:
-            if not (drain.is_set() or abort):
+    async def worker():
+        """Calls key after key — `concurrency` workers pulling from the batch,
+        never a task per key — until the keys run out, a drain begins, or a
+        key aborts the batch. Keys never started are interrupted (below)."""
+
+        for key, generation in todo:
+            if drain.is_set() or abort:
+                return
+            try:
+                await call(key, generation)
+            except asyncio.CancelledError:
+                if not (drain.is_set() or abort):
+                    raise
+                outcomes[key] = Outcome(INTERRUPTED, generation)
                 raise
-            outcomes[key] = Outcome(INTERRUPTED, generation)
-            raise
 
     async def call(key: str, generation: int):
         kwargs = dict(args)
@@ -537,9 +545,7 @@ async def run(spec, project, asset, param: str, pin: dict, args: dict, ctx, keys
 
     timeline.add("computing")
     running = Tasks("each")  # their failures are raised here: awaited
-    workers = [
-        running.spawn(one(key, generation), awaited=True) for key, generation in batch.upserted.items()
-    ]
+    workers = [running.spawn(worker(), awaited=True) for _ in range(at_once)]
     stopper = running.spawn(drain.wait(), awaited=True)
     try:
         pending = set(workers)

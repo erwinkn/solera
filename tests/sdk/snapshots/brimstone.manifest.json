@@ -451,11 +451,13 @@
       ],
       "concurrency": null,
       "deps": [],
-      "doc": "One changed workbook of this site: its samples. Solera runs it for every\nfile_id written since, a batch of sixteen at once, writes all of them in one\nstore write, and removes the samples of deleted workbooks; the store\nstamps `file_id` and `site`. A workbook that raises is recorded as a\nfailing key, and the others still commit.",
+      "doc": "One changed workbook of this site: its samples. Solera runs it for every\nfile_id written since, 64 at a time, writes all of them in one\nstore write, and removes the samples of deleted workbooks; the store\nstamps `file_id` and `site`. A workbook that raises is recorded as a\nfailing key, and the others still commit.",
       "inputs": {
         "workbook": {
-          "batch_size": 16,
-          "each": true,
+          "batch_size": 10000,
+          "each": {
+            "concurrency": 64
+          },
           "kind": "incremental",
           "load": "data",
           "meta": null,
@@ -1013,7 +1015,7 @@
     "id": "snapshot",
     "source": "explicit"
   },
-  "deploy": "ae190ccaffb035abb25f0a73c6228827adbe4d5ce2fabd13cb4bb5cf7f777a5e",
+  "deploy": "f4be0b53df2b98d3d1455b47c7d27d998b0064b0638c6582ea7e5a33c9e23f4e",
   "errors": [],
   "executors": {
     "ingest": {

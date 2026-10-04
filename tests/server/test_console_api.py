@@ -341,7 +341,7 @@ async def test_edges_report_every_scope_and_its_lag(world):
     assert (behind["x"]["state"], behind["x"]["lag"]) == ("behind", 2)
 
     each = {e["param"]: e for e in (await client.get(f"{base}/assets/parse/inputs")).json()["inputs"]}["file"]
-    assert each["kind"] == "each" and each["batch_size"] == 16  # D80: a per-key input's default
+    assert each["kind"] == "each" and (each["batch_size"], each["concurrency"]) == (10_000, 64)  # D111
     assert each["patterns"]["exclude"] == [["drafts", {"glob": "draft-*"}]]
     assert [s["state"] for s in each["partitions"]] == ["never"]
 

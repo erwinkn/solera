@@ -164,7 +164,7 @@ window", which are passes.
   across upstream-only dimensions.
   - **per-key incremental** (`each=True`): an incremental input over a
     keyed upstream whose asset is written for one key: one call per
-    changed key (`ctx.key`), a batch's keys all at once, failures kept per
+    changed key (`ctx.key`), `concurrency` at once (64) in batches of `batch_size` (10,000) a commit, failures kept per
     key. *Why:* a failure on one file must not block the other 999.
 - **dep** (`deps=`): an input bound to no parameter: planned, pinned,
   watched by `OnChange`, never loaded; it fans in as a whole input does.

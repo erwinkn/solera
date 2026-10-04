@@ -92,7 +92,7 @@ async def qaqc_samples(ctx, qaqc_files: pd.DataFrame, sharepoint): ...
 | `partitions` | partition declaration (§7) | unpartitioned |
 | `executor` | placement (§10) | `Local()()` |
 | `retries` / `timeout` | `Retry(n, delay, backoff)` / seconds | `Retry(3)` / `3600` |
-| `concurrency` | at most this many of the asset's partitions run at once, across runs: the engine holds the rest, queued (`held: concurrency`), and dispatches them as running ones end. A per-key asset runs a batch's keys all at once, so `concurrency=4` with `batch_size=16` runs up to 64 keys (D80) | `None` (no cap) |
+| `concurrency` | at most this many of the asset's partitions run at once, across runs: the engine holds the rest, queued (`held: concurrency`), and dispatches them as running ones end. A per-key input's own `concurrency=` caps keys at once within a partition; each cap counts its own unit (D111) | `None` (no cap) |
 | `version` | opaque string; bump to rebuild: an asset change, so what the old version built is stale and the next run starts over (§6) | `"1"` |
 | `automations` | attached automations (§9) | `()` |
 
@@ -326,7 +326,7 @@ earlier versions.
 
 ```python
 inputs = {
-    "qaqc_files": Incremental(batch_size=100),  # incremental input, same-named output
+    "qaqc_files": Incremental(batch_size=1_000),  # incremental input, same-named output
     "site_health": In(),  # a whole input: fans in over upstream-only dimensions
     "sites": In("site_index", all_partitions=True),  # every partition, shared dimensions too
     "feed": "station_feed",  # rename, same as In("station_feed")
@@ -347,8 +347,8 @@ input in the manifest. An input is one of three kinds: **whole** (`In`, a
 | Value | Meaning |
 |---|---|
 | `In(output=None, meta=None, all_partitions=False)` | whole: the value (or ref) of the output at its pinned head. Over upstream dimensions this asset lacks it fans in: `dict[partition, T]` over them, complete heads only (§7). `all_partitions=True` reads every partition of the upstream so — the shared dimensions too, with no projection of this asset's partition: `site_report` for `alpha` compares alpha's index with every other site's |
-| `Incremental(output=None, batch_size=100, meta=None, *, include=None, exclude=None)` | receive only what changed since this consumer's position — keys added, updated and removed on a keyed upstream, new batches on an unkeyed one (§6). On a keyed upstream, `include`/`exclude` globs (or `Regex`) select keys by name; pages are formed from the keys they take — read ahead past the others, at most 100,000 keys a page — so no page is empty, a pass they take nothing from is `skipped` without calling the producer, and a change of patterns cuts over: pending changes finish under the old ones, membership is diffed against the index at the pattern change (pinned until the diff ends), then deltas continue under the new (per-key-processing.md §11) |
-| `Incremental(…, each=True)` | Per-key incremental: an incremental input on a keyed upstream whose producer is written for **one key**: the parameter is that key's value (a rows upstream: its group), `ctx.key` its key. The worker calls it for every changed key of a batch, all at once — `batch_size`, 16 by default, is the one knob (D80) — stores the keys that succeeded as one `Patch({key: value})` per output, and keeps the ones that raised in the asset's failed keys, retried by their error class; deleted keys lose their rows without a call. One per asset, its other inputs whole, every output keyed. per-key-processing.md §5–§10 |
+| `Incremental(output=None, batch_size=10_000, meta=None, *, include=None, exclude=None)` | receive only what changed since this consumer's position — keys added, updated and removed on a keyed upstream, new batches on an unkeyed one (§6). On a keyed upstream, `include`/`exclude` globs (or `Regex`) select keys by name; pages are formed from the keys they take — read ahead past the others, at most 100,000 keys a page — so no page is empty, a pass they take nothing from is `skipped` without calling the producer, and a change of patterns cuts over: pending changes finish under the old ones, membership is diffed against the index at the pattern change (pinned until the diff ends), then deltas continue under the new (per-key-processing.md §11) |
+| `Incremental(…, each=True, concurrency=64)` | Per-key incremental: an incremental input on a keyed upstream whose producer is written for **one key**: the parameter is that key's value (a rows upstream: its group), `ctx.key` its key. The worker calls it for every changed key of a batch, `concurrency` at once (64 by default; `batch_size`, 10,000 by default, is keys per commit, D111), stores the keys that succeeded as one `Patch({key: value})` per output, and keeps the ones that raised in the asset's failed keys, retried by their error class; deleted keys lose their rows without a call. One per asset, its other inputs whole, every output keyed. per-key-processing.md §5–§10 |
 
 **By value or by reference.** The annotation decides. `T` loads through the
 upstream store (`store.load(ref, T, selection)`); a `Ref` subclass hands

@@ -31,7 +31,7 @@ export interface InputDecl {
   meta: Json;
   all_partitions?: boolean;
   batch_size?: number;
-  each?: boolean | null;
+  each?: { concurrency: number } | null;
   patterns?: Patterns | null;
 }
 
@@ -391,6 +391,7 @@ export interface Input {
   upstream_asset: string | null;
   source: boolean;
   batch_size: number | null;
+  concurrency: number | null;
   patterns: Patterns | null;
   partitions: InputPartition[];
 }

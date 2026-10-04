@@ -124,7 +124,7 @@ def sharepoint_files(ctx, events: pd.DataFrame):
     inputs={"file": Incremental("sharepoint_files",
                          include="ICP/Results/**/*.csv",
                          exclude={"archive": "**/archive/**", "templates": "**/*template*"},
-                         batch_size=16, each=True)},
+                         batch_size=10_000, concurrency=64, each=True)},
     automations=OnChange(),
 )
 async def icp(ctx, file: dict, sharepoint: SharePointClient) -> Result:
@@ -157,7 +157,7 @@ its path. `item_id` stays a column.
 ## 5. Per-key incremental
 
 ```python
-Incremental(output=None, *, include=None, exclude=None, batch_size=16, meta=None, each=True)
+Incremental(output=None, *, include=None, exclude=None, batch_size=10_000, concurrency=64, meta=None, each=True)
 ```
 
 - **The upstream must be keyed** — a keyed output or keyed source; keys
@@ -166,19 +166,20 @@ Incremental(output=None, *, include=None, exclude=None, batch_size=16, meta=None
   as part of a batch: the worker asks `store.load(ref, dict[str, T],
   Keys(batch))` and the store splits the batch by key. `ctx.key` and
   `ctx.generation` name the key and its upstream version.
-- **`batch_size`** (16 by default) is the one knob (D80): keys per
-  attempt, which is keys per commit, and keys in flight, since a batch's
-  keys all run at once — a task each for an `async` function, a thread
-  each for a plain one. It bounds how much work a crash throws away. The
-  asset's `concurrency=` caps its partitions at once, so `concurrency=4`
-  with `batch_size=16` runs up to 64 keys. A `keys=` run is bounded the
-  same way: its named keys go `batch_size` at a time, an attempt and a
-  commit each (A19 R6).
-- **It does not bound row memory.** It counts keys: a batch of 16 keys
+- **Two knobs** (D111). **`batch_size`** (10,000 by default) is keys per
+  attempt, which is keys per commit: it bounds how much work a crash
+  throws away. **`concurrency`** (64 by default) is the most keys running
+  at once within a partition: that many workers pull keys from the batch
+  — awaited for an `async` function, on as many threads for a plain one.
+  The asset's `concurrency=` caps its partitions at once; each cap counts
+  its own unit, so `@asset(concurrency=4)` runs up to 4 × 64 keys. A
+  `keys=` run is bounded the same way: its named keys go `batch_size` at a
+  time, an attempt and a commit each, `concurrency` at once (A19 R6).
+- **Neither bounds row memory.** Both count keys: a batch of 10,000 keys
   holds whatever rows those keys produce, and one 2 GB workbook is still
   one key. A per-key function that can produce huge groups needs a
-  smaller `batch_size`, chosen by its author; Solera does not measure
-  rows.
+  smaller `batch_size` and `concurrency`, chosen by its author; Solera
+  does not measure rows.
 - **Every output of the asset is keyed by the input's key** — `key=`
   (the rows the call returns, any number) or `keyed=True` (one value).
   Unkeyed outputs are rejected at registration. The call returns a value

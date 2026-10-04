@@ -390,10 +390,11 @@ class Incremental(In):
 
     `each=True` makes it per-key incremental (docs/per-key-processing.md
     §5): the asset is written for one key, the parameter receives one key's
-    value, `ctx.key` names it, and every output is keyed by it. `batch_size`
-    keys (16 by default) make one attempt and one commit, and all of them
-    run at once: the one knob. The asset's `concurrency=` caps its
-    partitions, so `concurrency=4` with `batch_size=16` runs up to 64 keys.
+    value, `ctx.key` names it, and every output is keyed by it. Two knobs
+    (D111): `batch_size` keys (10,000 by default) make one attempt and one
+    commit, and `concurrency` of them (64 by default) run at once within a
+    partition. The asset's `concurrency=` caps its partitions at once, each
+    cap counting its own unit.
     A key whose call raises is recorded in the asset's failure index and
     retried by its class (§8, §9); it never blocks the others."""
 
@@ -402,20 +403,26 @@ class Incremental(In):
     def __init__(
         self,
         output: str | None = None,
-        batch_size: int | None = None,
+        batch_size: int = 10_000,
         meta: dict | None = None,
         *,
         include=None,
         exclude=None,
         each: bool = False,
+        concurrency: int | None = None,
     ):
         from . import patterns
 
         super().__init__(output, meta=meta)
-        if batch_size is not None and batch_size < 1:
+        if batch_size < 1:
             raise RegistrationError("Incremental batch_size must be positive")
-        self.batch_size = batch_size if batch_size is not None else 16 if each else 100
+        if concurrency is not None and not each:
+            raise RegistrationError("concurrency= is for a per-key incremental input (each=True)")
+        if concurrency is not None and concurrency < 1:
+            raise RegistrationError("Incremental concurrency must be positive")
+        self.batch_size = batch_size
         self.each = bool(each)
+        self.concurrency = (64 if concurrency is None else concurrency) if each else None
         try:
             self.patterns = patterns.spec(include, exclude)
         except (ValueError, TypeError) as error:
@@ -426,7 +433,7 @@ class Incremental(In):
         if self.patterns is not None:
             spec["patterns"] = self.patterns
         if self.each:
-            spec["each"] = True
+            spec["each"] = {"concurrency": self.concurrency}
         return spec
 
 

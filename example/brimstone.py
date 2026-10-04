@@ -180,7 +180,7 @@ class Unprocessable(Rejected):
 )
 async def qaqc_samples(ctx, workbook: list[dict], sharepoint: SharePointClient) -> pd.DataFrame:
     """One changed workbook of this site: its samples. Solera runs it for every
-    file_id written since, a batch of sixteen at once, writes all of them in one
+    file_id written since, 64 at a time, writes all of them in one
     store write, and removes the samples of deleted workbooks; the store
     stamps `file_id` and `site`. A workbook that raises is recorded as a
     failing key, and the others still commit."""

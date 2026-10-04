@@ -1144,7 +1144,7 @@ class Engine(Attempts, Sensors, Staleness, Views):
         named = sorted({str(k) for k in override["keys"]})
         done = (task.get("selected") or {}).get(output)
         left = [k for k in named if done is None or k > done]
-        keys = left[: int(input.get("batch_size") or 100)]
+        keys = left[: int(input["batch_size"])]
         pin = {"ref": ref, "batch": {"keys": keys, "full": False}, "index": index.slice().to_json()}
         if input.get("patterns") is not None:
             pin["patterns"] = input["patterns"]
@@ -1191,7 +1191,7 @@ class Engine(Attempts, Sensors, Staleness, Views):
         if fresh:  # a full pass under way: continued, never started over
             base = position
         else:  # a full pass due: this delivery starts it over
-            limit = int(input.get("batch_size") or 100)
+            limit = int(input["batch_size"])
             base = {
                 "kind": "keys",
                 "output": output,
@@ -1266,7 +1266,7 @@ class Engine(Attempts, Sensors, Staleness, Views):
 
         output = input["output"]
         keyed = self.manifest["outputs"][output].get("key") is not None
-        limit = int(input.get("batch_size") or 100)
+        limit = int(input["batch_size"])
         # The generation of the head a batch is planned against. A pass that
         # reads a fixed snapshot over its batches — a delta pass, a pattern change's
         # diff, a range of commits — keeps the one it started at: what its
@@ -1517,6 +1517,7 @@ class Engine(Attempts, Sensors, Staleness, Views):
             retry = None  # its predicate's inputs moved: the pass starts over (§9)
         each = {
             "kind": kind,
+            "concurrency": input["each"]["concurrency"],
             "deploy": self.m.deploy_number,
             "forced": forced,
             "forced_at": current,
@@ -1526,7 +1527,7 @@ class Engine(Attempts, Sensors, Staleness, Views):
             "commit_number": int(record.get("commit_number", -1)) + 1,
             "pass_after": (retry or {}).get("after"),
         }
-        limit = int(input.get("batch_size") or 100)
+        limit = int(input["batch_size"])
         if kind == "reconcile":
             pin = {
                 "ref": ref,
