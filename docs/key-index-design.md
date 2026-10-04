@@ -331,9 +331,18 @@ neither.
 | Live before P | Live at N | Class |
 |---|---|---|
 | no | yes | added |
-| yes | yes | updated |
+| yes | yes | updated; neither if both carry equal payloads |
 | yes | no | removed |
 | no | no | neither: not delivered |
+
+**The net rule.** Classes are by presence at the two ends. On a
+payload-bearing index (a source's versions), a key live at both ends with
+equal payloads is neither: a feed taking `k1` from `v1` to `v2` and back
+to `v1` inside `[P, N]` delivers nothing. The payload before `P` is its
+version's when the spans read hold one; otherwise it rides the
+predecessor (format bit 3, `key-index-format.md`), so no other read is
+needed. Derived outputs carry no payload and every write of theirs is a
+change (`versions.md`), so updated stays updated there.
 
 - **keys=**: point lookups in those spans. **Range or prefix**: a seek in
   each span.

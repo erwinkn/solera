@@ -91,8 +91,9 @@ impl Delta {
     /// A write of `key` over `old`. Keys come strictly increasing.
     pub fn apply(&mut self, key: &[u8], new: Write, old: Old) -> Result<()> {
         let g = self.generation;
+        // What it replaces: its generation, and its payload on a payload-bearing index.
         let before = match old {
-            Old::Live(was, _) => Some(was),
+            Old::Live(was, payload) => Some((was, payload)),
             _ => None,
         };
         match (new, old) {

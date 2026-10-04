@@ -21,6 +21,8 @@ pub struct Version {
     pub deleted: bool,
     pub payload: Option<Vec<u8>>,
     pub predecessor: Option<u64>,
+    /// The predecessor's payload, on a payload-bearing index.
+    pub prior: Option<Vec<u8>>,
 }
 
 /// A run's blocks in key order, decoded one at a time; None at its end.
@@ -67,6 +69,7 @@ impl<'a> Run<'a> {
             deleted: b.deleted(self.i),
             payload: b.payload(self.i).map(<[u8]>::to_vec),
             predecessor: b.predecessor(self.i),
+            prior: b.prior(self.i).and_then(|(_, p)| p).map(<[u8]>::to_vec),
         };
         self.i += 1;
         self.fill()?;
@@ -137,15 +140,15 @@ impl<'a> Groups<'a> {
 
 /// The versions a merge keeps of one key (newest first): the newest, and
 /// each one a live endpoint sees (an endpoint generation `g` with
-/// `version < g <= next newer version`). The predecessor goes on the oldest
-/// kept version. With `base` (the output starts at commit 0), its initial
+/// `version < g <= next newer version`). The predecessor, with its payload,
+/// goes on the oldest kept version. With `base` (the output starts at commit 0), its initial
 /// segment, before the first live endpoint, keeps live keys only, and no
 /// version keeps a predecessor; later segments keep their tombstones.
 pub fn retain(versions: &[Version], endpoints: &[u64], base: bool) -> Vec<Version> {
     let Some(oldest) = versions.last() else {
         return Vec::new();
     };
-    let span_predecessor = oldest.predecessor;
+    let (span_predecessor, span_prior) = (oldest.predecessor, oldest.prior.clone());
     let mut kept: Vec<Version> = Vec::new();
     for (i, v) in versions.iter().enumerate() {
         let seen = i > 0
@@ -155,6 +158,7 @@ pub fn retain(versions: &[Version], endpoints: &[u64], base: bool) -> Vec<Versio
         if i == 0 || seen {
             kept.push(Version {
                 predecessor: None,
+                prior: None,
                 ..v.clone()
             });
         }
@@ -169,6 +173,7 @@ pub fn retain(versions: &[Version], endpoints: &[u64], base: bool) -> Vec<Versio
         }
     } else if let Some(v) = kept.last_mut() {
         v.predecessor = span_predecessor;
+        v.prior = span_prior;
     }
     kept
 }
@@ -224,18 +229,27 @@ pub const NEITHER: u8 = 3;
 /// One key's change over `[P, N]`, from the versions of the spans
 /// overlapping it (newest first), clipped to generations `[g_p, g_n1)`:
 /// None if it has no version in the range; else its class, and its newest
-/// version in the range (its state at N).
+/// version in the range (its state at N). Classes are by presence at the
+/// two ends — the net rule: a key absent at both is neither, and so is one
+/// live at both with equal payloads (a source key back at the version it
+/// had before P). Without payloads, live at both ends is updated: every
+/// write of a derived output is a change.
 pub fn change(versions: &[Version], g_p: u64, g_n1: u64) -> Option<(u8, &Version)> {
     let at_n = versions.iter().find(|v| older(v.generation, g_n1))?;
     if at_n.generation < g_p {
         return None; // nothing in the range
     }
-    let before = match versions.iter().find(|v| v.generation < g_p) {
-        Some(v) => !v.deleted,
-        None => versions.last().is_some_and(|v| v.predecessor.is_some()),
+    // The state before P: its version, else what the oldest version replaced.
+    let (before, payload) = match versions.iter().find(|v| v.generation < g_p) {
+        Some(v) => (!v.deleted, v.payload.as_deref()),
+        None => match versions.last() {
+            Some(v) if v.predecessor.is_some() => (true, v.prior.as_deref()),
+            _ => (false, None),
+        },
     };
     let class = match (before, !at_n.deleted) {
         (false, true) => ADDED,
+        (true, true) if payload.is_some() && payload == at_n.payload.as_deref() => NEITHER,
         (true, true) => UPDATED,
         (true, false) => REMOVED,
         (false, false) => NEITHER,
@@ -333,6 +347,17 @@ mod tests {
             deleted,
             payload: None,
             predecessor,
+            prior: None,
+        }
+    }
+
+    fn p(generation: u64, payload: &[u8], prior: Option<&[u8]>) -> Version {
+        Version {
+            generation,
+            deleted: false,
+            payload: Some(payload.to_vec()),
+            predecessor: prior.map(|_| 1),
+            prior: prior.map(<[u8]>::to_vec),
         }
     }
 
@@ -390,6 +415,42 @@ mod tests {
     }
 
     #[test]
+    fn a_source_key_back_at_its_version_is_neither() {
+        // k: v1 before P (commit 0, gen 1); v2 at gen 10, v1 again at gen 20.
+        let held = [p(20, b"v1", None), p(10, b"v2", None), p(1, b"v1", None)];
+        assert_eq!(change(&held, 5, u64::MAX).unwrap().0, NEITHER);
+        assert_eq!(change(&held, 5, 15).unwrap().0, UPDATED); // at N it is v2
+                                                              // The version before P merged out of the spans read: its payload rides the predecessor.
+        let merged = [p(20, b"v1", None), p(10, b"v2", Some(b"v1"))];
+        assert_eq!(change(&merged, 5, u64::MAX).unwrap().0, NEITHER);
+        let moved = [p(20, b"v3", None), p(10, b"v2", Some(b"v1"))];
+        assert_eq!(change(&moved, 5, u64::MAX).unwrap().0, UPDATED);
+        // A merge keeps the payload with the oldest kept version's predecessor.
+        let kept = retain(&merged, &[], false);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(
+            (kept[0].predecessor, kept[0].prior.as_deref()),
+            (Some(1), Some(&b"v1"[..]))
+        );
+        // Derived outputs carry no payload: live at both ends is updated.
+        let derived = [v(20, false, None), v(10, false, Some(1))];
+        assert_eq!(change(&derived, 5, u64::MAX).unwrap().0, UPDATED);
+    }
+
+    #[test]
+    fn prior_payloads_round_trip_through_blocks() {
+        let mut w = Writer::new(O, usize::MAX);
+        w.push(b"a", 9, false, Some(b"v2"), Some((3, Some(b"v1"))))
+            .unwrap();
+        w.push(b"b", 9, true, None, Some((4, None))).unwrap();
+        w.finish(true).unwrap();
+        let files: Vec<Vec<u8>> = w.files.into_iter().collect();
+        let b = Block::decode(blocks(&files)[0], O.codec).unwrap();
+        assert_eq!(b.prior(0), Some((3, Some(&b"v1"[..]))));
+        assert_eq!(b.prior(1), Some((4, None)));
+    }
+
+    #[test]
     fn versions_split_across_blocks_and_files() {
         // One key with many versions, written with tiny blocks and files.
         let o = O;
@@ -400,7 +461,7 @@ mod tests {
                 g * 10,
                 g % 3 == 0,
                 None,
-                if g == 1 { Some(1) } else { None },
+                if g == 1 { Some((1, None)) } else { None },
             )
             .unwrap();
         }

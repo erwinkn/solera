@@ -562,8 +562,8 @@ class KeyIndex:
         keys = sorted(set(keys))
         if at is not None and at <= self.state.head:
             below = self._endpoint(at)
-            levels = [list(s.files) for s in reversed(self.state.spans) if s.a < at]
-            runs, codecs = await self._key_blocks(levels, keys)
+            spans = [list(s.files) for s in reversed(self.state.spans) if s.a < at]
+            runs, codecs = await self._key_blocks(spans, keys)
             found, generations, deleted, payloads = await in_thread(
                 _native.span_lookup, runs, codecs, keys, below
             )
@@ -593,22 +593,22 @@ class KeyIndex:
             self._identity = digest(json.dumps(self.state.to_json(), sort_keys=True).encode())
         return self._identity
 
-    def _snapshot(self, levels: list[list[FileInfo]]):
-        """The local copies of `levels` as a snapshot, if the `io` holds them all."""
+    def _snapshot(self, spans: list[list[FileInfo]]):
+        """The local copies of `spans` as a snapshot, if the `io` holds them all."""
 
         local = getattr(self.io, "local", None)
-        if not local or not all(self.path(f.name) in local for level in levels for f in level):
+        if not local or not all(self.path(f.name) in local for span in spans for f in span):
             return None
-        return _native.Snapshot([[local[self.path(f.name)] for f in level] for level in levels])
+        return _native.Snapshot([[local[self.path(f.name)] for f in span] for span in spans])
 
-    async def _read(self, call: str, args: tuple, levels, local, store):
+    async def _read(self, call: str, args: tuple, spans, local, store):
         served = getattr(self.io, "served", None)
         if served is not None and not served.recording:
             hit = served.answer(self.identity, call, args)
             if hit is not None:
                 return hit
         recording = served is not None and served.recording
-        snap = self._snapshot(levels)
+        snap = self._snapshot(spans)
         if recording and snap is None:
             raise Cold(call)  # first: a cold index is fetched for the next start
         if recording:
@@ -713,23 +713,23 @@ class KeyIndex:
         Python object."""
 
         sparse = _native.Sparse(run)
-        levels = self.state.newest_first()
-        n = next((i for i, level in enumerate(levels) if not self._read_whole(level)), len(levels))
-        whole, filtered = levels[:n], levels[n:]
+        spans = self.state.newest_first()
+        n = next((i for i, span in enumerate(spans) if not self._read_whole(span)), len(spans))
+        whole, filtered = spans[:n], spans[n:]
 
         # 1. The whole spans, fetched at once and then consulted newest first.
-        spans = {f.name: sparse.span(f.min, f.max) for level in levels for f in level}
+        ranges = {f.name: sparse.span(f.min, f.max) for span in spans for f in span}
         await asyncio.gather(
             *(
                 self._open(f, data=True)
-                for level in whole
-                for f in level
-                if spans[f.name][0] < spans[f.name][1]
+                for span in whole
+                for f in span
+                if ranges[f.name][0] < ranges[f.name][1]
             )
         )
-        for level in whole:
-            for f in level:
-                lo, hi = spans[f.name]
+        for span in whole:
+            for f in span:
+                lo, hi = ranges[f.name]
                 if lo == hi or not sparse.unknown:
                     continue
                 p = self._parsed[f.name]
@@ -739,11 +739,11 @@ class KeyIndex:
             return sparse
 
         # 2. The rest through their filters.
-        files = [f for level in filtered for f in level if spans[f.name][0] < spans[f.name][1]]
+        files = [f for span in filtered for f in span if ranges[f.name][0] < ranges[f.name][1]]
         parsed = await asyncio.gather(*(self._open(f) for f in files))
         for i, p in enumerate(parsed):
             tail = p.tail
-            sparse.filter(i, *spans[p.info.name], tail["key_filter"])
+            sparse.filter(i, *ranges[p.info.name], tail["key_filter"])
         sparse.classify()
         if not sparse.maybe:
             return sparse
@@ -761,10 +761,10 @@ class KeyIndex:
             await in_thread(sparse.read, list(got.items()), p.tail["codec"], p.firsts, file=i)
         return sparse
 
-    def _read_whole(self, level: list[FileInfo]) -> bool:
+    def _read_whole(self, span: list[FileInfo]) -> bool:
         """Whether a span is small enough to read whole without looking at its filters."""
 
-        return sum(f.size for f in level) <= self.o.whole_threshold
+        return sum(f.size for f in span) <= self.o.whole_threshold
 
     # -- writing ------------------------------------------------------------------------
 
@@ -782,9 +782,9 @@ class KeyIndex:
 
     # -- scans: full pass and pending deltas ----------------------------------------------
 
-    async def _window(self, levels: list[list[FileInfo]], after: bytes | None, limit: int):
+    async def _window(self, spans: list[list[FileInfo]], after: bytes | None, limit: int):
         """The blocks a page of keys > `after` needs from each sorted run of
-        `levels` (newest first), and the bound below which they hold every
+        `spans` (newest first), and the bound below which they hold every
         entry of every run: `(runs, codecs, bound)`, `bound` None at the end.
 
         Files are chosen from their metadata before anything is read — per
@@ -794,9 +794,9 @@ class KeyIndex:
         the bound is exclusive, so a key it equals is left to the next page."""
 
         chosen, bound = [], None
-        for level in levels:
+        for span in spans:
             got = 0
-            for f in sorted(level, key=lambda f: f.min):
+            for f in sorted(span, key=lambda f: f.min):
                 if after is not None and f.max <= after:
                     continue
                 if got > limit:
@@ -807,7 +807,7 @@ class KeyIndex:
                 # A file the cursor falls inside may have nothing left past it: count only whole files.
                 got += f.entries if after is None or f.min > after else 0
         parsed = await asyncio.gather(*(self._open(f, filters=False) for f in chosen))
-        spans = []
+        windows = []
         for p in parsed:
             blocks = p.tail["blocks"]
             start = max(0, bisect.bisect_right(p.firsts, after) - 1) if after is not None and blocks else 0
@@ -817,16 +817,16 @@ class KeyIndex:
             while end < len(blocks) and (got < limit + 1 or end - start < 2):
                 got += blocks[end][3]
                 end += 1
-            spans.append(range(start, end))
+            windows.append(range(start, end))
             if end < len(blocks):
                 nxt = blocks[end][0]  # everything below the next unfetched block is complete
                 bound = nxt if bound is None else min(bound, nxt)
         fetched = await asyncio.gather(
-            *(self._blocks(p, span) for p, span in zip(parsed, spans, strict=True))
+            *(self._blocks(p, window) for p, window in zip(parsed, windows, strict=True))
         )
         runs = []
-        for p, span, got in zip(parsed, spans, fetched, strict=True):
-            runs.append([got[i] for i in span])
+        for p, window, got in zip(parsed, windows, fetched, strict=True):
+            runs.append([got[i] for i in window])
             if p.data is None:
                 p.window = got  # the next page starts in it: a file never pays for the same block twice
         return runs, [p.tail["codec"] for p in parsed], bound
@@ -841,14 +841,14 @@ class KeyIndex:
         return cursor if bound is not None else None
 
     async def _scan(
-        self, levels: list[list[FileInfo]], after: bytes | None, limit: int, drop_deleted: bool, below=None
+        self, spans: list[list[FileInfo]], after: bytes | None, limit: int, drop_deleted: bool, below=None
     ):
         """Up to `limit` entries of the merged view with keys > `after` —
         each key's newest version, or its newest older than generation
         `below` (the view at a reserved endpoint) — and the cursor to
         continue from (`None` when the view is exhausted)."""
 
-        runs, codecs, bound = await self._window(levels, after, limit)
+        runs, codecs, bound = await self._window(spans, after, limit)
         # Natively, off the loop: the merge stops at the page, never building the rest.
         keys, generations, deleted, payloads, last, more = await in_thread(
             merge_page, runs, codecs, after, bound, limit, drop_deleted, 2**64 - 1 if below is None else below
@@ -873,13 +873,13 @@ class KeyIndex:
 
         if at is not None and at <= self.state.head:
             below = self._endpoint(at)
-            levels = [list(s.files) for s in reversed(self.state.spans) if s.a < at]
-            keys, generations, _, payloads, nxt = await self._scan(levels, after, limit, True, below)
+            spans = [list(s.files) for s in reversed(self.state.spans) if s.a < at]
+            keys, generations, _, payloads, nxt = await self._scan(spans, after, limit, True, below)
             return keys, generations, payloads, nxt
-        levels = self.state.newest_first()
+        spans = self.state.newest_first()
 
         async def store():
-            keys, generations, _, payloads, nxt = await self._scan(levels, after, limit, drop_deleted=True)
+            keys, generations, _, payloads, nxt = await self._scan(spans, after, limit, drop_deleted=True)
             return keys, generations, payloads, nxt
 
         async def local(snap, ceiling):
@@ -887,7 +887,7 @@ class KeyIndex:
             keys, generations, _, payloads = page.entries()
             return (keys, generations, payloads, nxt), page
 
-        return await self._read("page", (after, limit), levels, local, store)
+        return await self._read("page", (after, limit), spans, local, store)
 
     # -- changes(P -> N) --------------------------------------------------------------------
 
@@ -910,13 +910,13 @@ class KeyIndex:
         (`None` when done). `first` and `last + 1` are reserved endpoints, or
         `last` is the head (docs/key-index-design.md § changes)."""
 
-        levels, g_p, g_n1 = self._range(first, last)
-        if not levels:
+        spans, g_p, g_n1 = self._range(first, last)
+        if not spans:
             return [], b"", [], b"", [], None
-        snap = self._snapshot(levels)
+        snap = self._snapshot(spans)
         if snap is not None:  # the engine's local copies
             return await self._changes_local(snap, after, limit, g_p, g_n1)
-        runs, codecs, bound = await self._window(levels, after, limit)
+        runs, codecs, bound = await self._window(spans, after, limit)
         keys, classes, generations, deleted, payloads, last_key, more = await in_thread(
             _native.span_changes, runs, codecs, after, bound, limit, g_p, g_n1
         )
@@ -982,8 +982,8 @@ class KeyIndex:
         """`changes` of named keys: in each span overlapping the range, the
         blocks that may hold each key's versions, read whole for the keys."""
 
-        levels, g_p, g_n1 = self._range(first, last)
-        runs, codecs = await self._key_blocks(levels, keys)
+        spans, g_p, g_n1 = self._range(first, last)
+        runs, codecs = await self._key_blocks(spans, keys)
         ks, cs, gs, ds, ps, _, _ = await in_thread(
             _native.span_changes, runs, codecs, None, None, 2**62, g_p, g_n1
         )
@@ -998,14 +998,14 @@ class KeyIndex:
             None,
         )
 
-    async def _key_blocks(self, levels: list[list[FileInfo]], keys: list[bytes]):
-        """The blocks of `levels` (spans, newest first) that may hold the
+    async def _key_blocks(self, spans: list[list[FileInfo]], keys: list[bytes]):
+        """The blocks of `spans` (spans, newest first) that may hold the
         versions of `keys`, as runs and their codecs: each file a run of its
         own, in key order, so a key's versions still come newest first when
         they cross from one file into the next."""
 
         runs, codecs = [], []
-        for files in levels:
+        for files in spans:
             parsed = await asyncio.gather(*(self._open(f, filters=False) for f in files))
             for p in parsed:
                 wanted = set()
@@ -1060,7 +1060,7 @@ class KeyIndex:
         over `changes_page` while consumers move to `changes`, recorded for
         the worker like `page` and `lookup`."""
 
-        levels, g_p, g_n1 = self._range(first_commit, last_commit)
+        spans, g_p, g_n1 = self._range(first_commit, last_commit)
 
         async def store():
             ks, _, gs, ds, ps, cursor = await self.changes_page(first_commit, last_commit, after, limit)
@@ -1070,7 +1070,7 @@ class KeyIndex:
             ks, _, gs, ds, ps, cursor = await self._changes_local(snap, after, limit, g_p, g_n1, ceiling)
             return (ks, gs, ds, ps, cursor), None
 
-        return await self._read("pending", (first_commit, last_commit, after, limit), levels, local, store)
+        return await self._read("pending", (first_commit, last_commit, after, limit), spans, local, store)
 
     async def pending_pages(
         self, first_commit: int, last_commit: int, after: bytes | None = None, limit=100_000

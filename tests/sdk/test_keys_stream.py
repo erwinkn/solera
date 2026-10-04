@@ -195,14 +195,14 @@ def test_streamed_rows_group_by_their_key():
     assert content(arrow) == content(files)
 
 
-def test_compact_many_files():
+def test_a_span_merge_of_many_files():
     rng = random.Random(3)
     levels = []
     for lv in range(4):
         levels.append(
             {
                 b"k%05d" % rng.randrange(20000): (
-                    lv,
+                    4 - lv,  # the first run is the newest span
                     int(rng.random() < 0.1),
                     b"p%d" % lv if lv % 2 else None,
                 )
@@ -214,8 +214,8 @@ def test_compact_many_files():
     want = {}
     for e in reversed(levels):
         want.update(e)
-    for drop in (False, True):
-        job = _native.Merge.compact(len(runs), drop_deleted=drop, max_file_bytes=4096, **OPTS)
+    for drop in (False, True):  # into the base: deleted keys go
+        job = _native.Merge.spans(len(runs), endpoints=[], base=drop, max_file_bytes=4096, **OPTS)
         files = drive(job, runs, per=2)
         got = content(files)
         assert got == [(k, g, d, p) for k, (g, d, p) in sorted(want.items()) if not (drop and d)]

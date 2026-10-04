@@ -32,10 +32,10 @@ def timed(label, n, fn, *args, **kw):
     return out
 
 
-def compact(files, drop_deleted):
-    """The native merge: a compaction job fed each whole file as one segment."""
+def merge_spans(files, base):
+    """The native span merge, no endpoint inside, each whole file fed as one segment."""
 
-    job = _native.Merge.compact(len(files), drop_deleted=drop_deleted)
+    job = _native.Merge.spans(len(files), endpoints=[], base=base)
     fed, out = set(), []
     while (step := job.step()) is not None:
         kind, x = step
@@ -84,5 +84,5 @@ for name, impl in (("native", _native), ("python", _python)):
     timed("key filter check", len(probe), impl.bloom_check_keys, bits, nb, kk, probe)
     half_a = impl.encode_file(keys[::2], gens[::2], dele[::2], payloads=half(payloads, 0))
     half_b = impl.encode_file(keys[1::2], gens[1::2], dele[1::2], payloads=half(payloads, 1))
-    merge = _python.merge_files if impl is _python else compact
-    timed("merge two files into one", n, merge, [half_a, half_b], drop_deleted=True)
+    merge = _python.merge_spans if impl is _python else merge_spans
+    timed("merge two files into one", n, merge, [half_a, half_b], base=True)

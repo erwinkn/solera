@@ -3,7 +3,7 @@
 //! Two kinds of functions. Kernels over byte strings the caller holds —
 //! encoding, decoding, filter checks, lookups, bounded scans — mirror
 //! `solera/keys/_python.py`, the format's reference. Jobs stream over a whole
-//! index — a full replacement, a compaction, a recount: a `Merge` asks for the
+//! index — a patch, a full replacement, a span merge, a scan: a `Merge` asks for the
 //! file segments it needs and hands back the files it writes, and Python does
 //! the I/O in between. Keys, payloads and file contents cross the boundary
 //! as `bytes` (a payload `None` where an entry carries none), generations
@@ -32,7 +32,7 @@ use pyo3::pybacked::PyBackedBytes;
 use pyo3::types::{PyBool, PyBytes, PyCapsule, PyDict, PyInt, PyList, PyString};
 
 use format::{Error, Options};
-use jobs::{Compact, Join, Scan, SpanMerge, Step};
+use jobs::{Join, Scan, SpanMerge, Step};
 use rayon::prelude::*;
 use rows::{Arena, Constant, Cursor, Overlay, Payloads, Source, Stream, Table};
 use stream::Segment;
@@ -224,7 +224,7 @@ fn write_files<'py>(
                         generations[i],
                         deleted[i] != 0,
                         opt(&payloads[i]),
-                        predecessors[i],
+                        predecessors[i].map(|g| (g, None)),
                     )?;
                 }
                 w.finish(false)?;
@@ -1363,7 +1363,6 @@ impl Sparse {
 
 enum Kind {
     Join(Box<Join>),
-    Compact(Box<Compact>),
     Scan(Scan),
     Spans(Box<SpanMerge>),
 }
@@ -1384,7 +1383,6 @@ struct Merge {
 fn merge_of(kind: &mut Kind) -> &mut stream::Merge {
     match kind {
         Kind::Join(j) => &mut j.merge,
-        Kind::Compact(j) => &mut j.merge,
         Kind::Scan(j) => &mut j.merge,
         Kind::Spans(j) => &mut j.merge,
     }
@@ -1537,38 +1535,6 @@ impl Merge {
         })
     }
 
-    /// Merges `runs` (newest first) into new files; `drop_deleted` when
-    /// nothing older lies below.
-    #[staticmethod]
-    #[pyo3(signature = (runs, *, drop_deleted, block_size=65536, level=1, bits_per_item=14, k=10, codec=1, max_file_bytes=67108864))]
-    #[allow(clippy::too_many_arguments)]
-    fn compact(
-        runs: usize,
-        drop_deleted: bool,
-        block_size: usize,
-        level: u32,
-        bits_per_item: u64,
-        k: u8,
-        codec: u8,
-        max_file_bytes: usize,
-    ) -> PyResult<Merge> {
-        guard(|| {
-            Ok({
-                let o = options(block_size, level, bits_per_item, k, codec);
-                Merge {
-                    key: None,
-                    local: None,
-                    kind: Kind::Compact(Box::new(Compact::new(
-                        runs,
-                        drop_deleted,
-                        o,
-                        max_file_bytes,
-                    ))),
-                }
-            })
-        })
-    }
-
     /// Every merged entry of `runs` (newest first) past `after`, newest
     /// winning, deleted ones included: `step` returns `("page", (keys,
     /// generations, deleted, payloads))` every `limit` entries, and once for
@@ -1657,7 +1623,6 @@ impl Merge {
                     let step = loop {
                         let step = match kind {
                             Kind::Join(j) => j.step()?,
-                            Kind::Compact(j) => j.step()?,
                             Kind::Scan(j) => j.step()?,
                             Kind::Spans(j) => j.step()?,
                         };
@@ -1670,7 +1635,6 @@ impl Merge {
                     };
                     let file = match (&step, kind) {
                         (Step::File, Kind::Join(j)) => j.delta.writer.files.pop_front(),
-                        (Step::File, Kind::Compact(j)) => j.writer.files.pop_front(),
                         (Step::File, Kind::Spans(j)) => j.writer.files.pop_front(),
                         _ => None,
                     };

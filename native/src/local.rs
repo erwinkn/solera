@@ -81,7 +81,7 @@ impl LocalBlock {
         generation: u64,
         deleted: bool,
         payload: Option<&[u8]>,
-        predecessor: Option<u64>,
+        prior: crate::stream::Prior,
     ) {
         if self.entries == 0 {
             self.first = key.to_vec();
@@ -99,7 +99,7 @@ impl LocalBlock {
             generation,
             deleted,
             payload,
-            predecessor,
+            prior,
         );
         self.prev.clear();
         self.prev.extend_from_slice(key);
@@ -197,7 +197,7 @@ pub fn build(kx: &[u8], source: &str, digest: &[u8], out: &Path, max_bytes: u64)
                 f.generation,
                 f.deleted(),
                 f.payload(&data),
-                f.predecessor,
+                f.prior(&data),
             );
             if local.buf.len() >= LOCAL_BLOCK {
                 let (bytes, d) = local.close(w.written);

@@ -246,7 +246,7 @@ pub fn encode_file(
             generations[i],
             deleted[i] != 0,
             payloads[i],
-            predecessors[i],
+            predecessors[i].map(|g| (g, None)),
         )?;
     }
     w.finish(true)?;

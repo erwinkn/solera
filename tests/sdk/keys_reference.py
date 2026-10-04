@@ -1,8 +1,9 @@
 """Pure-Python implementation of the `.kx` key index format (docs/key-index-format.md).
 
 The reference for `solera._native`: its kernels have the same signatures,
-its jobs must produce the same content (`merge_files` is a compaction), and
-each must decode the other's files to identical content. Tests only.
+its jobs must produce the same content (`merge_spans` is a span merge with
+no endpoint inside), and each must decode the other's files to identical
+content. Tests only.
 """
 
 from __future__ import annotations
@@ -17,7 +18,7 @@ import xxhash
 MAGIC = b"CKX1"
 FORMAT_VERSION = 4
 MAX_BLOCK_BYTES = 16 << 20  # what a block may decode to at most (F29)
-DELETED, PREDECESSOR, PAYLOAD = 1, 2, 4  # entry flags
+DELETED, PREDECESSOR, PAYLOAD, PRIOR_PAYLOAD = 1, 2, 4, 8  # entry flags
 CODEC_NONE, CODEC_ZLIB = 0, 1
 FOOTER = struct.Struct("<4sHBBQQIQII4s")
 FOOTER_SIZE = FOOTER.size  # 48
@@ -258,14 +259,18 @@ def decode_block(data, codec: int):
         suffix, pos = _get_bytes(raw, pos)
         flag = raw[pos]
         pos += 1
-        if flag & ~(DELETED | PREDECESSOR | PAYLOAD):
+        if flag & ~(DELETED | PREDECESSOR | PAYLOAD | PRIOR_PAYLOAD):
             raise FormatError("unknown entry flags")
+        if flag & PRIOR_PAYLOAD and not flag & PREDECESSOR:
+            raise FormatError("a predecessor's payload without the predecessor")
         generation, pos = get_varint(raw, pos)
         payload = before = None
         if flag & PAYLOAD:
             payload, pos = _get_bytes(raw, pos)
         if flag & PREDECESSOR:
             before, pos = get_varint(raw, pos)
+        if flag & PRIOR_PAYLOAD:
+            _, pos = _get_bytes(raw, pos)  # the predecessor's payload: the net rule's, not a decode's
         key = prev[:shared] + suffix
         keys.append(key)
         generations.append(generation)
@@ -370,36 +375,34 @@ def iter_file(data) -> iter:
         yield from zip(*decode_block(blk, tail["codec"]), strict=True)
 
 
-def merge_files(
+def merge_spans(
     files: list,
     *,
-    drop_deleted: bool,
+    base: bool,
     block_size: int = 64 * 1024,
     level: int = 1,
     bits_per_item: int = 14,
     k: int = 10,
     max_file_bytes: int = 64 * 2**20,
 ) -> list[bytes]:
-    """Merge whole files, newest first: for each key the newest entry wins,
-    with its generation and payload; predecessors are dropped.
+    """Adjacent spans merged with no live endpoint inside, as the native span
+    merge does it: files newest first, each key's versions newest first
+    across them, and only the newest kept. It carries the predecessor of the
+    key's oldest version; with `base` (the output starts at commit 0) a
+    deleted key goes, and no predecessor stays. Output is split into files
+    of about `max_file_bytes`."""
 
-    `drop_deleted` removes deleted entries from the output (merging into the
-    bottom level). Output is split into files of about `max_file_bytes`."""
-
-    heap = []
-    iters = [iter_file(f) for f in files]
-    for rank, it in enumerate(iters):
-        for key, gen, flag, payload, _ in it:
-            heap.append((key, rank, gen, flag, payload, it))
-            break
-    heapq.heapify(heap)
+    versions: dict[bytes, list] = {}
+    for f in files:  # newest first: a key's versions come newest first
+        for key, gen, flag, payload, before in iter_file(f):
+            versions.setdefault(key, []).append((gen, flag, payload, before))
     out: list[bytes] = []
-    keys, generations, flags, payloads = [], [], bytearray(), []
+    keys, generations, flags, payloads, predecessors = [], [], bytearray(), [], []
     approx = 0
     raw_budget = 2 * max_file_bytes  # blocks compress about 2x
 
     def flush():
-        nonlocal keys, generations, flags, payloads, approx
+        nonlocal keys, generations, flags, payloads, predecessors, approx
         if keys:
             out.append(
                 encode_file(
@@ -407,29 +410,27 @@ def merge_files(
                     generations,
                     bytes(flags),
                     payloads=payloads,
+                    predecessors=predecessors,
                     block_size=block_size,
                     level=level,
                     bits_per_item=bits_per_item,
                     k=k,
                 )
             )
-        keys, generations, flags, payloads, approx = [], [], bytearray(), [], 0
+        keys, generations, flags, payloads, predecessors, approx = [], [], bytearray(), [], [], 0
 
-    last = None
-    while heap:
-        key, rank, gen, flag, payload, it = heapq.heappop(heap)
-        nxt = next(it, None)
-        if nxt is not None:
-            heapq.heappush(heap, (nxt[0], rank, nxt[1], nxt[2], nxt[3], it))
-        if key == last:
-            continue  # an older entry for a key already taken from a newer file
-        last = key
-        if flag and drop_deleted:
+    for key in sorted(versions):
+        vs = versions[key]
+        if any(older[0] >= newer[0] for newer, older in zip(vs, vs[1:], strict=False)):
+            raise ValueError(f"versions of {key!r} out of order")
+        gen, flag, payload, _ = vs[0]
+        if base and flag:
             continue
         keys.append(key)
         generations.append(gen)
         flags.append(flag)
         payloads.append(payload)
+        predecessors.append(None if base else vs[-1][3])
         approx += len(key) + len(payload or b"") + 8
         if approx >= raw_budget:
             flush()

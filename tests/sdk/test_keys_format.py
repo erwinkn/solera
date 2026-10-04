@@ -163,12 +163,14 @@ def test_detects_corruption(impl):
         impl.parse_footer(b"XXXX" + bytes(data[-44:]))
 
 
-def merge(impl, files, **kw):
-    """Merge whole files, newest first: the reference's `merge_files`, or a native compaction."""
+def merge(impl, files, *, drop_deleted, **kw):
+    """Merge whole files, newest first, with no endpoint inside — into the
+    base with `drop_deleted`: the reference's `merge_spans`, or the native
+    span merge."""
 
     if impl is _python:
-        return _python.merge_files(files, **kw)
-    job = _native.Merge.compact(len(files), **kw)
+        return _python.merge_spans(files, base=drop_deleted, **kw)
+    job = _native.Merge.spans(len(files), endpoints=[], base=drop_deleted, **kw)
     return drive(job, [[f] for f in files])
 
 
@@ -261,7 +263,8 @@ def test_detects_filter_corruption_and_reads_the_index_alone(impl):
 def test_generations_payloads_and_predecessors(writer, reader):
     """Every entry has the generation that wrote it, and may carry a
     payload; a delta entry may also have the generation its key had
-    before, which a compaction drops — keeping each entry's payload."""
+    before, which a merge into the base drops — keeping each entry's
+    payload — and any other merge keeps on a key's oldest version."""
 
     keys, generations, deleted, payloads = entries(3000, deleted_every=7)
     predecessors = [i if i % 3 else None for i in range(len(keys))]
@@ -279,7 +282,11 @@ def test_generations_payloads_and_predecessors(writer, reader):
     assert reader.merge_range([blocks], [tail["codec"]], None, None, False)[1] == generations
     [merged] = merge(reader, [data], drop_deleted=False)
     assert [(e[1], e[3], e[4]) for e in _python.iter_file(merged)] == [
-        (g, p, None) for g, p in zip(generations, payloads, strict=True)
+        (g, p, b) for g, p, b in zip(generations, payloads, predecessors, strict=True)
+    ]
+    [based] = merge(reader, [data], drop_deleted=True)
+    assert [(e[1], e[3], e[4]) for e in _python.iter_file(based)] == [
+        (g, p, None) for g, p, d in zip(generations, payloads, deleted, strict=True) if not d
     ]
 
 

@@ -1,7 +1,7 @@
 //! Encode and merge throughput without Python: `cargo run --release --example bench`.
 
 use solera_native::format::{self, Options, CODEC_NONE, CODEC_ZLIB};
-use solera_native::jobs::{Compact, Step};
+use solera_native::jobs::{SpanMerge, Step};
 use solera_native::stream::{Bytes, Segment, Writer};
 use std::sync::Arc;
 use std::time::Instant;
@@ -77,7 +77,7 @@ fn main() {
     let (codec, blocks) = format::file_blocks(&f).unwrap();
     let data: Bytes = Arc::new(f);
     let t = Instant::now();
-    let mut job = Compact::new(1, true, o, 64 << 20);
+    let mut job = SpanMerge::new(1, Vec::new(), true, o, 64 << 20);
     let mut fed = false;
     let mut files = 0;
     loop {
@@ -104,7 +104,7 @@ fn main() {
     }
     println!(
         "{:32} {:6.3} s  {files} files",
-        "compact (decode + re-encode)",
+        "span merge (decode + re-encode)",
         t.elapsed().as_secs_f64(),
     );
 }

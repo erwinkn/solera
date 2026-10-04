@@ -242,7 +242,9 @@ class Harness:
         for k in then.keys() | self.model.keys():
             was, now = then.get(k), self.model.get(k)
             if was != now:
-                expect[k] = (CLASSES[(was is not None, now is not None)], now)
+                # The net rule: live at both ends at one version (a payload) is neither.
+                same = was is not None and now is not None and was[1] is not None and was[1] == now[1]
+                expect[k] = (3 if same else CLASSES[(was is not None, now is not None)], now)
         # A key written and put back since `e` may be listed too, as "neither"
         # or "updated" at its old state: it changed in between.
         extra = {k: v for k, v in got.items() if k not in expect}

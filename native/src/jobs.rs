@@ -1,5 +1,5 @@
 //! The streaming jobs over an index: the merge-join of written content with
-//! it — a patch, or a full replacement — a compaction, and a scan. Each is
+//! it — a patch, or a full replacement — a span merge, and a scan. Each is
 //! driven by `step`, which runs until it needs input or has a file to hand
 //! over; the caller does the I/O.
 
@@ -118,53 +118,6 @@ impl Join {
                     self.delta.apply(self.src.key(), self.src.write(), was)?;
                     self.src.advance();
                     self.old = None;
-                }
-            }
-        }
-    }
-}
-
-/// Merges runs into new files, newest entry winning; with `drop_deleted`
-/// (nothing older below), deletions go. The objects the dropped entries name
-/// need no list of their own: exact deltas name each one as a predecessor.
-pub struct Compact {
-    pub merge: Merge,
-    pub writer: Writer,
-    drop_deleted: bool,
-    done: bool,
-}
-
-impl Compact {
-    pub fn new(runs: usize, drop_deleted: bool, o: Options, max_file_bytes: usize) -> Compact {
-        Compact {
-            merge: Merge::new(runs),
-            writer: Writer::new(o, max_file_bytes),
-            drop_deleted,
-            done: false,
-        }
-    }
-
-    pub fn step(&mut self) -> Result<Step> {
-        loop {
-            if !self.writer.files.is_empty() {
-                return Ok(Step::File);
-            }
-            if self.done {
-                return Ok(Step::Done);
-            }
-            match self.merge.next_key()? {
-                Next::Entry => {
-                    let m = &self.merge;
-                    let (k, gen, deleted) = (m.key(), m.generation(), m.deleted());
-                    if !(deleted && self.drop_deleted) {
-                        // Predecessors belong to delta files only.
-                        self.writer.push(k, gen, deleted, m.payload(), None)?;
-                    }
-                }
-                Next::Need(r) => return Ok(Step::Run(r)),
-                Next::End => {
-                    self.writer.finish(false)?;
-                    self.done = true;
                 }
             }
         }
@@ -315,6 +268,7 @@ impl SpanMerge {
                             deleted: b.deleted(i),
                             payload: b.payload(i).map(<[u8]>::to_vec),
                             predecessor: b.predecessor(i),
+                            prior: b.prior(i).and_then(|(_, p)| p).map(<[u8]>::to_vec),
                         };
                         if self
                             .versions
@@ -338,7 +292,7 @@ impl SpanMerge {
                     v.generation,
                     v.deleted,
                     v.payload.as_deref(),
-                    v.predecessor,
+                    v.predecessor.map(|g| (g, v.prior.as_deref())),
                 )?;
             }
             self.key = None;

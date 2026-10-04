@@ -126,38 +126,46 @@ def test_a_range_merge_is_newest_wins(writer, reader, files, bounds, drop_delete
     assert list(zip(g, f, p, strict=True)) == [want[key] for key in k]
 
 
-def compact(impl, files: list[bytes], **kw) -> list[bytes]:
+def merge_spans(impl, files: list[bytes], *, base: bool, **kw) -> list[bytes]:
     if impl is _python:
-        return _python.merge_files(files, **kw)
-    return drive(_native.Merge.compact(len(files), **kw), [[f] for f in files])
+        return _python.merge_spans(files, base=base, **kw)
+    return drive(_native.Merge.spans(len(files), endpoints=[], base=base, **kw), [[f] for f in files])
 
 
 @pytest.mark.parametrize("writer,reader", CROSS)
 @SETTINGS
 @given(
     files=st.lists(entry_maps(max_size=25), min_size=1, max_size=4),
-    drop_deleted=st.booleans(),
+    base=st.booleans(),
     max_file_bytes=st.sampled_from([1, 2_000, 64 * 2**20]),
 )
-def test_a_compaction_is_newest_wins_in_consecutive_files(
-    writer, reader, files, drop_deleted, max_file_bytes
+def test_a_span_merge_without_endpoints_keeps_the_newest_in_consecutive_files(
+    writer, reader, files, base, max_file_bytes
 ):
-    """The merged files hold the newest entry of every key, without its
-    predecessor, split into consecutive key ranges."""
+    """With no live endpoint inside, merged spans hold every key's newest
+    version, carrying its oldest version's predecessor — into the base, live
+    keys only and no predecessor — split into consecutive key ranges. A
+    file's generations sit above every older file's, as spans' do."""
 
+    files = [
+        {k: ((len(files) - i) << 40 | g % (1 << 40), d, p, b) for k, (g, d, p, b) in f.items()}
+        for i, f in enumerate(files)
+    ]
     encoded = [encode(writer, f, block_size=256) for f in files]
-    out = compact(reader, encoded, drop_deleted=drop_deleted, block_size=256, max_file_bytes=max_file_bytes)
-    keys, rest = [], []
+    out = merge_spans(reader, encoded, base=base, block_size=256, max_file_bytes=max_file_bytes)
+    keys, rest, preds = [], [], []
     for data in out:
         _, k, g, f, p = decode_all(reader, data)
-        assert k, "a compaction writes no empty file"
+        assert k, "a merge writes no empty file"
         keys += k
         rest += zip(g, f, p, strict=True)
         _, blocks = blocks_of(data)
-        assert all(x is None for b in blocks for x in reader.decode_block(b, 1)[4])
-    want = newest_wins(files, drop_deleted)
+        preds += [x for b in blocks for x in reader.decode_block(b, 1)[4]]
+    want = newest_wins(files, base)
     assert keys == sorted(want)  # consecutive and non-overlapping, in order
     assert rest == [want[k] for k in keys]
+    oldest = {k: e[3] for f in files for k, e in f.items()}  # the last file holding a key is its oldest
+    assert preds == [None if base else oldest[k] for k in keys]
 
 
 @SETTINGS

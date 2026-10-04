@@ -24,6 +24,13 @@ pub type Bytes = Arc<dyn AsRef<[u8]> + Send + Sync>;
 const DELETED: u8 = 1;
 const PREDECESSOR: u8 = 2;
 const PAYLOAD: u8 = 4;
+/// The predecessor's payload follows its generation: a payload-bearing
+/// index's net rule compares it with the payload at the far end.
+const PRIOR_PAYLOAD: u8 = 8;
+
+/// What an entry replaced: its generation and, on a payload-bearing index,
+/// its payload.
+pub type Prior<'a> = Option<(u64, Option<&'a [u8]>)>;
 
 /// One encoded entry, its byte strings as ranges of the block.
 pub(crate) struct Fields {
@@ -33,6 +40,7 @@ pub(crate) struct Fields {
     pub generation: u64,
     pub payload: Option<(usize, usize)>,
     pub predecessor: Option<u64>,
+    pub prior: Option<(usize, usize)>,
 }
 
 impl Fields {
@@ -42,6 +50,12 @@ impl Fields {
 
     pub fn payload<'a>(&self, raw: &'a [u8]) -> Option<&'a [u8]> {
         self.payload.map(|(a, b)| &raw[a..b])
+    }
+
+    /// The predecessor, with its payload when the entry holds it.
+    pub fn prior<'a>(&self, raw: &'a [u8]) -> Prior<'a> {
+        self.predecessor
+            .map(|g| (g, self.prior.map(|(a, b)| &raw[a..b])))
     }
 }
 
@@ -65,8 +79,11 @@ pub(crate) fn read_entry(raw: &[u8], pos: &mut usize) -> Result<Fields> {
         return fmt_err("truncated entry");
     };
     *pos += 1;
-    if flags & !(DELETED | PREDECESSOR | PAYLOAD) != 0 {
+    if flags & !(DELETED | PREDECESSOR | PAYLOAD | PRIOR_PAYLOAD) != 0 {
         return fmt_err("unknown entry flags");
+    }
+    if flags & PRIOR_PAYLOAD != 0 && flags & PREDECESSOR == 0 {
+        return fmt_err("a predecessor's payload without the predecessor");
     }
     let generation = get_varint(raw, pos)?;
     let payload = if flags & PAYLOAD != 0 {
@@ -79,6 +96,11 @@ pub(crate) fn read_entry(raw: &[u8], pos: &mut usize) -> Result<Fields> {
     } else {
         None
     };
+    let prior = if flags & PRIOR_PAYLOAD != 0 {
+        Some(range(raw, pos)?)
+    } else {
+        None
+    };
     Ok(Fields {
         shared,
         suffix,
@@ -86,6 +108,7 @@ pub(crate) fn read_entry(raw: &[u8], pos: &mut usize) -> Result<Fields> {
         generation,
         payload,
         predecessor,
+        prior,
     })
 }
 
@@ -97,25 +120,29 @@ pub(crate) fn write_entry(
     generation: u64,
     deleted: bool,
     payload: Option<&[u8]>,
-    predecessor: Option<u64>,
+    prior: Prior,
 ) {
     put_varint(out, shared as u64);
     put_bytes(out, suffix);
     out.push(
         if deleted { DELETED } else { 0 }
-            | if predecessor.is_some() {
-                PREDECESSOR
+            | if prior.is_some() { PREDECESSOR } else { 0 }
+            | if payload.is_some() { PAYLOAD } else { 0 }
+            | if matches!(prior, Some((_, Some(_)))) {
+                PRIOR_PAYLOAD
             } else {
                 0
-            }
-            | if payload.is_some() { PAYLOAD } else { 0 },
+            },
     );
     put_varint(out, generation);
     if let Some(p) = payload {
         put_bytes(out, p);
     }
-    if let Some(g) = predecessor {
+    if let Some((g, p)) = prior {
         put_varint(out, g);
+        if let Some(p) = p {
+            put_bytes(out, p);
+        }
     }
 }
 
@@ -127,6 +154,7 @@ struct Ent {
     deleted: bool,
     payload: Option<(u32, u32)>,
     predecessor: Option<u64>,
+    prior: Option<(u32, u32)>,
 }
 
 /// A decoded block: whole keys in one arena, payloads in place in the raw bytes.
@@ -170,6 +198,7 @@ impl Block {
                 deleted: f.deleted(),
                 payload: f.payload.map(r),
                 predecessor: f.predecessor,
+                prior: f.prior.map(r),
             });
         }
         Ok(Block { raw, keys, ents })
@@ -224,6 +253,13 @@ impl Block {
     /// The generation the key had before this entry (delta files only).
     pub fn predecessor(&self, i: usize) -> Option<u64> {
         self.ents[i].predecessor
+    }
+
+    /// The predecessor, with its payload when the entry holds it.
+    pub fn prior(&self, i: usize) -> Prior<'_> {
+        let e = &self.ents[i];
+        e.predecessor
+            .map(|g| (g, e.prior.map(|(a, b)| &self.raw[a as usize..b as usize])))
     }
 }
 
@@ -680,7 +716,7 @@ impl Writer {
         generation: u64,
         deleted: bool,
         payload: Option<&[u8]>,
-        predecessor: Option<u64>,
+        prior: Prior,
     ) -> Result<()> {
         let out_of_order = if self.repeats {
             key < self.prev.as_slice()
@@ -704,7 +740,8 @@ impl Writer {
         // A block closes before an entry would push what it decodes to past
         // the bound (its key unshared, at most 32 bytes of lengths and
         // flags): only an entry past it alone is refused.
-        let entry = 2 * key.len() + payload.map_or(0, <[u8]>::len) + 32;
+        let prior_len = prior.and_then(|(_, p)| p).map_or(0, <[u8]>::len);
+        let entry = 2 * key.len() + payload.map_or(0, <[u8]>::len) + prior_len + 32;
         if self.count > 0
             && self.block.len() as u64 + self.block_keys + entry as u64 > MAX_BLOCK_BYTES
         {
@@ -724,7 +761,7 @@ impl Writer {
             generation,
             deleted,
             payload,
-            predecessor,
+            prior,
         );
         self.prev.clear();
         self.prev.extend_from_slice(key);

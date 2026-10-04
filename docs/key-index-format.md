@@ -42,13 +42,21 @@ Encoded entry:
 ```
 shared      varint     bytes shared with the previous key in this block (0 for the first)
 suffix      varint len + bytes
-flags       u8         bit 0: deleted; bit 1: predecessor follows; bit 2: payload follows; other bits 0
+flags       u8         bit 0: deleted; bit 1: predecessor follows; bit 2: payload follows;
+                       bit 3: the predecessor's payload follows; other bits 0
 generation  varint
 payload     varint len + bytes    only with flag bit 2
 predecessor varint                only with flag bit 1: the key's generation before
+prior       varint len + bytes    only with flag bit 3 (and bit 1): the predecessor's payload
 ```
 
-Readers reject an entry with other flag bits set. Neighbouring entries
+Readers reject an entry with other flag bits set, or with bit 3 and not
+bit 1. A writer sets bit 3 whenever the entry it replaces had a payload —
+on a payload-bearing index (a source's versions, a failure index's
+records); a merge keeps it with the predecessor on a key's oldest kept
+version. It lets `changes` apply the net rule without another read: a key
+live at both ends of the range with equal payloads is neither
+(`key-index-design.md` § changes). Neighbouring entries
 usually share a generation (one attempt wrote them), which the block's
 compression absorbs. A payload is present or not, never implied: an
 empty payload (a set's element) is flag bit 2 and a zero length.
