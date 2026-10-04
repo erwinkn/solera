@@ -8,12 +8,13 @@ of it in about 5 seconds.
 
 | # | Question | Answer | File |
 |---|---|---|---|
-| 1 | Does the balance guard bound writes when merged spans share keys, or drop superseded versions? | Yes: at most `(1 + 43R + 20R log₂ K)` entries written per committed entry (R attempts per merge), for any adversarial order | `KeyIndex/WriteBound.lean` |
+| 1 | Does the balance guard bound writes when merged spans share keys, drop superseded versions, or rewrite one span alone? | Yes: at most `(1 + 43R + 20R log₂ K)` entries written per committed entry (R attempts per merge), for any adversarial order | `KeyIndex/WriteBound.lean` |
 | 2 | Do merges that respect boundaries keep every catch-up range exactly tiled? | Yes, and a catch-up's spans merge to the per-commit fold | `KeyIndex/Tiling.lean` |
 | 3 | Is the read-ahead rule right with increasing generations? | Yes; and dropping added-then-removed entries breaks it (counterexample) | `KeyIndex/Keys.lean` |
 | 4 | Does a newest-first lookup over spans equal the fold at the head? | Yes | `KeyIndex/Keys.lean` |
 
-`KeyIndex/Delta.lean` ties the per-key model to the actual sorted-list
+`KeyIndex/Segments.lean` proves the physical encoding of segments decodes
+to the model. `KeyIndex/Delta.lean` ties the per-key model to the actual sorted-list
 merge. The compiled model matched the native `stream::Merge` on 2,000
 random histories.
 
@@ -57,9 +58,12 @@ also drop tombstones and versions.
 of keys and versions. Steps:
 
 - `commit n`: a span of `n ≤ K` entries at the head, written once;
-- `merge`: any run of adjacent spans `l1 ++ m :: l2`, with `m` the largest
-  and `5m ≤ 4·S` (the guard), and an output of any `u ≤ S`, `u ≤ K`,
-  attempted `a ≤ R` times, each attempt writing `u`;
+- `merge`: any run of adjacent spans `l1 ++ m :: l2`, with `m` the largest,
+  and an output of any `u ≤ S`, `u ≤ K`, attempted `a ≤ R` times, each
+  attempt writing `u`. It must obey the guard `5m ≤ 4·S`, or else drop at
+  least a quarter of its inputs, `4u ≤ 3·S`. A single span rewritten alone
+  to drop a retired endpoint's versions is the second kind, with one input
+  (`l1 = l2 = []`); the guard can't hold for it.
 - `base`: the base and the oldest spans, with `5·base ≤ 4·(base + Σ)` and
   any output up to `base + Σ`, attempted `a ≤ R` times.
 
@@ -99,10 +103,13 @@ big span rewritten once per released boundary.
 
 **Hypotheses to keep true.**
 
-- Every merge obeys the guard, on the inputs' actual entries before dedup.
-  The design thread confirmed this: `Sim.allowed` checks it before every
-  merge (oldest-absorbs, the window of 4, the base). There are no forced or
-  cap-driven merges.
+- Every merge obeys the guard, on the inputs' actual entries before dedup,
+  or drops at least a quarter of its inputs. The design thread confirmed
+  that the base merge, the window of 4, the straggler windows and the
+  into-the-base merge are guarded; the single-span rewrite is the one
+  unguarded merge, and its own condition (`u ≤ 3S/4`) is the second case.
+  Nothing is cap-driven. The proof needs no new constant: the case where a
+  quarter was dropped never used the guard.
 - Attempts per published merge are bounded by R. Work on merges that never
   publish (an upload that is abandoned, not retried) isn't covered. The
   engine has to cap it, or count it against a merge that does publish.
@@ -153,8 +160,20 @@ that changes no contents. The span starting at commit 0, live keys only
 before its first inner endpoint, is this model's base merge. Results 2–4
 therefore hold for "versions" with "span" read as "segment". The grouping
 into files affects only cost, which result 1 covers, including merges that
-shrink. One thing the Rust must then check: a reader at `P` reads exactly
-the segments starting at or after `P`, from whichever files hold them.
+shrink. What the Rust must then check: a reader at `P` gets exactly the
+model's segments starting at or after `P`. Each key's state before `P` is
+its newest kept version older than `P`'s generation, else the span's
+predecessor (`decode_encode`).
+
+**The encoding** (`Segments.lean`). The physical span doesn't store a
+predecessor per segment. It holds, per key, its kept versions newest
+first and one predecessor, the span's. `decode_encode` proves that, under
+exact writes, decoding gives exactly the model's segments. A segment's
+entry is its newest version, and its predecessor is the newest kept
+version of an earlier segment of the span (none if that version is a
+tombstone), else the span's predecessor. The theorem depends only on
+`propext`. The design's example is a computed check: `k` changed in
+segments 1 and 3, not 2, so segment 3's predecessor is segment 1's version.
 
 ## 3. The read-ahead rule
 
@@ -240,7 +259,8 @@ result.
    predecessor. Check it differentially against the Lean model, as above.
    Results 2–4 depend on it.
 2. **The guard on every merge.** Largest input ≤ 4 × the others, on actual
-   entries before dedup, for every kind of merge. Assert it when planning,
+   entries before dedup, for every kind of merge, or else at least a
+   quarter of the inputs dropped (the single-span rewrite). Assert it when planning,
    and again when installing. Bound the attempts per merge, and don't let
    abandoned merges write without limit. Result 1 depends on it.
 3. **Boundaries.** Born only at head + 1, and an attempt's reservation is
