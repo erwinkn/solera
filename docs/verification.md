@@ -290,6 +290,49 @@ with Hypothesis drawing the inputs (in CI, a few seconds each):
   it. One part runs now: on FileStore, PostgresStore
   and S3Store, a `keys=` run never touches a key it does not name.
 
+**Staleness, by example.** The machine found these histories while K47
+was built. Each was an engine bug then, fixed in K47; the first fails
+again since semantic change (d), as F37. Each
+is now a test that takes the machine's steps one at a time and states, at
+every step, the stale keys and why the partition and asset are stale; the
+machine checks the engine against the same answers after every step. All
+start with `feed` holding k1 and k2, `items` having read them, and
+nothing downstream run. `checks` is each=True over `items` (excluding
+`x*`) with the source `knob` a dep; `copy` is a keyed copy of `items`;
+`fchecks` is each=True over `feed`.
+
+1. *A keys= run on a never-built output leaves it owing a full pass.*
+   keys=[k2] writes k2. k1 is missing, and k2 is stale too: no pass has
+   completed, so the record holds no `knob` version to say which one k2
+   saw. `knob` moves: still k1 and k2. A default run is the full pass:
+   it writes k1 and k2, k2 again under the new `knob`, and `checks` is
+   fresh. (F37: the engine kept the pass k2 began before the move.)
+2. *A key rewritten after an asset change is no longer stale for it.*
+   keys=[k2, k3] writes k2 (k3 is not upstream). `checks`' definition
+   changes: k1 and k2 are stale, for input and definition. keys=[x1, k2,
+   k3] rewrites k2 under the new definition: k1 and k2 are still stale,
+   for input only (k1 missing, k2 with no `knob` version on record). A
+   default run completes the pass.
+3. *A key gone upstream stays stale through a keys= run that does not
+   name it.* `checks` is reset; `feed` removes k2 and k3, which `items`
+   has not read. A default run of `checks` writes k1 and k2 and is stale
+   behind `items`. `items` is rebuilt: k1 at a new version, k2 gone.
+   keys=[k1, x1, k3] rewrites k1; k2, held but gone upstream, stays stale,
+   and the record keeps the keys= run (the reconcile is owed). A default
+   run drops k2: fresh.
+4. *keys= runs that rewrite every key after a `knob` move complete the
+   pass.* keys= naming every key completes `checks`' first pass: fresh.
+   `knob` moves: k1 and k2 are stale. keys=[k1, k2]: fresh again.
+5. *A full pass spread over keys= runs delivers each key once.* `copy`
+   runs; its definition changes, and its keys are stale. keys=[k1] starts
+   the pass over and delivers k1 (`copy` now holds k1 alone). keys=[k1,
+   k2] delivers k2 alone and completes the pass: fresh. A default run
+   then delivers nothing.
+6. *A key neither side holds is never stale.* `fchecks` runs: fresh.
+   `feed` adds k3: stale, since `fchecks` lacks it. `feed` removes k3:
+   fresh. Likewise after keys=[k1], with k2 missing, stale: `feed`
+   removing k2 leaves `fchecks` fresh (F35).
+
 ## Kani: tried, then dropped
 
 Kani (0.68, with CBMC) was tried on the native readers in October 2026.
@@ -1033,3 +1076,4 @@ asset) and comes last.
 | F34 | A rename onto an earlier life's name loses that life's claim: `copy` renamed to `mirror`; `mirror`'s attempt runs; `copy` comes back without an alias (`mirror` removed, a new life); `copy`'s attempt runs; `copy` is renamed to `mirror` again. The rename re-keys `copy`'s claim over the earlier life's, still running (`claimed_partitions[(mirror, "")]`), so the engine no longer finds that attempt's claim, cannot settle it, and its run never ends (sweep Z11, unreplayable until the determinism fix) | P1 | fixed: a claim decides whether its attempt is live (`Model.claimed`), not the claim index, which gates dispatch for an asset's current life only. A removed asset's attempt in flight is an earlier life's (launched before the deploy that removed it: the commit's rule, `Model.earlier_life`): the reset drops it from the index, and so does a snapshot load, which had put it back. It still settles, its commit refused, and its task carries on in the new life (F21), behind whatever holds the name now. A rename never overwrites a claim still held: the simulation checks that every current-life claim is its partition's holder, and the journal check no longer counts a removed asset's attempts as holding the name — `tests/sim/test_replays.py::test_f34_a_rename_onto_an_earlier_lifes_name_keeps_its_attempt_settleable` |
 | F35 | An each=True partition is stale with no stale key: `fchecks` (each=True over `feed`) runs with `keys=[k1]`; `feed` then removes `k2`, which `fchecks` never held. `stale_keys` lists nothing, as K43 says (`k2` is on neither side: no output unit), yet the partition status, which rolls up as "any key", reports `stale` (found by the Staleness machine at 300 examples; its CI run is now derandomized, as the simulation's is, so a rare history cannot make CI flaky) | P3 | fixed, K38's rule: for an each=True asset, the partition is stale for an input change exactly when one of its keys is. The partition's own records (a reset, an unrecorded or moved `seen`, the position behind) filter, cheaply, and the keys confirm: the per-key scan runs only when the filter says stale, so roll-ups stay cheap. Here the pass under way had made the filter say stale, while the per-key view, which counts a removal only where the output holds the key, said nothing — `tests/server/test_staleness.py::test_a_key_neither_side_holds_leaves_an_each_partition_fresh` |
 | F36 | Collection deletes a delta file a launching attempt was handed: the engine prepares `checks`' next attempt, whose spec hands it pending delta entry 283 (it names level-4 delta file `…7JH0`, which compaction had let go of). While `_launch` writes the spec and the control file, another attempt acknowledges the entry; the launching attempt's claim names the entry's files only once `AttemptLaunched` is applied, so for that while `cleanup_reads()` holds nothing, and collection deletes the file (t=1041.70, between the spec at 1041.38 and the control file at 1041.98). The worker reads it at 1047.15: gone. Today the worker counts the entry unresolved and the other attempt has done it, so nothing is lost, but `cleanup_reads`' promise ("acknowledged by another meanwhile, it is still being read") breaks (sweep of the interleavings measurement, seed 11, under asyncio's order; it replays on a6db1a4 and stops at 2eb0e0b, which moved the timing, not the window) | P3 | fixed: the claim names the cleanup files its spec hands the attempt from `_prepare` on, as it does the delta log it reads (`reads`), not from `AttemptLaunched` on; `cleanup_reads()` holds them through the launch, so another attempt's acknowledgement meanwhile no longer lets collection take them — `tests/server/test_collection.py::test_a_delta_a_launching_attempt_was_handed_outlives_its_acknowledgement` |
+| F37 | A full pass begun before a dep moved continues after it: `checks` has never run; keys=[k2] writes k2 (generation 10), which begins the full pass it owes (`began` 10, `seen` none). `knob` moves; engine and reference agree that k1 and k2 are stale. The default run calls `checks` on k1 alone, so k2 keeps what the old `knob` gave it, and the engine reports no stale key while `seen` is still none (found writing W22's K47 histories as examples, on fae165c) | P2 | open — `tests/server/test_staleness.py::test_a_keys_run_on_a_never_built_output_leaves_it_owing_a_full_pass` (strict xfail) |

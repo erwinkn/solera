@@ -328,6 +328,174 @@ def test_staleness_matches_the_reference_over_any_history():
     Staleness.TestCase().runTest()
 
 
+# -- histories the machine found (K47): each step stated, the engine held to it ----------
+
+IN, UP, DEF = staleness.INPUT, staleness.UPSTREAM, staleness.DEFINITION
+
+
+class History:
+    """One history of the Staleness machine, step by step: after each step
+    the machine checks the engine against the reference, and `expect`
+    holds the reference (so the engine too) to what the example states.
+    Every history starts from the machine's own start: `feed` holds k1 and
+    k2, `items` has read them, and nothing downstream has run."""
+
+    def __init__(self):
+        self.m = Staleness()
+        self.m.start()
+        self.m.statuses_match_the_reference()
+
+    def __getattr__(self, rule):
+        def step(*args, **kw):
+            getattr(self.m, rule)(*args, **kw)
+            self.m.statuses_match_the_reference()
+
+        return step
+
+    def expect(self, name: str, keys: set[str] | None = None, why: set[str] = frozenset()):
+        """`name`'s stale keys (keyed outputs) and why it is stale: its
+        partition and its asset are stale exactly when there is a reason."""
+
+        ref = self.m.ref
+        if keys is not None:
+            got = ref.fchecks_stale_keys() if name == "fchecks" else ref.stale_keys_of(name)
+            assert got == keys, f"{name}: stale keys {got}, not {keys}"
+        assert ref.reasons(name) == set(why), f"{name}: stale for {ref.reasons(name)}, not {set(why)}"
+        assert ref.stale(name) == bool(why)
+
+    def close(self):
+        self.m.teardown()
+
+
+@pytest.fixture
+def history():
+    h = History()
+    yield h
+    h.close()
+
+
+@pytest.mark.xfail(strict=True, raises=AssertionError, reason="F37: open")
+def test_a_keys_run_on_a_never_built_output_leaves_it_owing_a_full_pass(history):
+    """`checks` has never run. keys=[k2] writes k2; k1 is missing, and k2
+    is stale too: no pass has completed, so the record holds no `knob`
+    version to say which one k2 saw. `knob` moves: nothing changes. A
+    default run is the full pass that owes: it writes k1 and k2 (k2 again,
+    under the new `knob`), and `checks` is fresh. F37: the engine kept the
+    pass k2 began before the move, wrote k1 alone and said fresh."""
+
+    h = history
+    h.run_keys({"k2"})
+    h.expect("checks", keys={"k1", "k2"}, why={IN})
+    h.change_knob()
+    h.expect("checks", keys={"k1", "k2"}, why={IN})
+    h.run_default("checks")
+    h.expect("checks", keys=set(), why=set())
+
+
+def test_a_key_rewritten_after_an_asset_change_is_no_longer_stale_for_it(history):
+    """keys=[k2, k3] on a never-built `checks` writes k2 (k3 is not
+    upstream). `checks`' definition changes; keys=[x1, k2, k3] rewrites k2
+    under it (x1 is excluded, k3 still absent). Only input reasons remain:
+    k1 is missing, and k2, written after the change, is stale only because
+    no pass has completed (no `knob` version on record). A default run
+    completes it."""
+
+    h = history
+    h.run_keys({"k2", "k3"})
+    h.change_asset("checks")
+    h.expect("checks", keys={"k1", "k2"}, why={IN, DEF})
+    h.run_keys({"x1", "k2", "k3"})
+    h.expect("checks", keys={"k1", "k2"}, why={IN})
+    h.run_default("checks")
+    h.expect("checks", keys=set(), why=set())
+
+
+def test_a_key_gone_upstream_stays_stale_through_a_keys_run_that_does_not_name_it(history):
+    """`checks` is reset (empty) and `feed` removes k2 and k3; `items` has
+    not read that yet. A default run of `checks` writes what `items` holds,
+    k1 and k2, and is stale behind `items` (upstream stale). `items` is
+    rebuilt from `feed`: k1 at a new version, k2 gone. keys=[k1, x1, k3]
+    rewrites k1; k2, held but gone upstream, stays stale, and the record
+    keeps the keys run (the reconcile is still owed). A default run drops
+    k2: fresh."""
+
+    h = history
+    h.reset_checks()
+    h.commit_feed(upserts={}, removes={"k2", "k3"})
+    h.run_default("checks")
+    h.expect("items", why={IN})
+    h.expect("checks", keys={"k1", "k2"}, why={UP})
+    h.reset_upstream()
+    h.expect("checks", keys={"k1", "k2"}, why={IN})
+    h.run_keys({"k1", "x1", "k3"})
+    h.expect("checks", keys={"k2"}, why={IN})
+    assert h.m.ref.checks.entries == 1, "the keys run is kept while k2 is owed"
+    h.run_default("checks")
+    h.expect("checks", keys=set(), why=set())
+
+
+def test_keys_runs_that_rewrite_every_key_after_a_knob_move_complete_the_pass(history):
+    """keys= naming every key completes `checks`' first pass: fresh.
+    `knob` moves: every key is stale (input changed), and a full pass is
+    due. keys=[k1, k2] rewrites every key: that completes the pass, and
+    `checks` is fresh again."""
+
+    h = history
+    h.run_items()
+    h.run_keys({"k1", "k2", "k3", "x1"})
+    h.expect("checks", keys=set(), why=set())
+    h.change_knob()
+    h.expect("checks", keys={"k1", "k2"}, why={IN})
+    h.run_keys({"k1", "k2"})
+    h.expect("checks", keys=set(), why=set())
+
+
+def test_a_full_pass_spread_over_keys_runs_delivers_each_key_once(history):
+    """`copy` runs (fresh), then its definition changes: a full pass is
+    due, and all its keys are stale for it. keys=[k1] starts the pass over
+    and delivers k1 (`copy` now holds k1 alone, stale); keys=[k1, k2] delivers k2 alone (k1 was delivered in
+    this pass) and completes it: fresh. A default run then delivers
+    nothing."""
+
+    h = history
+    h.run_default("copy")
+    h.expect("copy", keys=set(), why=set())
+    h.change_asset("copy")
+    h.expect("copy", keys={"k1", "k2"}, why={DEF})
+    h.run_keys_on_copy({"k1"})  # the machine checks: {k1} delivered, starting over
+    h.expect("copy", keys={"k1"}, why={DEF})  # rebuilt from k1: what it holds goes stale together
+    h.run_keys_on_copy({"k1", "k2"})  # {k2} alone
+    h.expect("copy", keys=set(), why=set())
+    h.run_default("copy")  # nothing
+    h.expect("copy", keys=set(), why=set())
+
+
+def test_a_key_neither_side_holds_is_never_stale(history):
+    """`fchecks` (each=True over `feed`) runs: fresh. `feed` adds k3:
+    `fchecks` lacks it, so k3 is stale. `feed` removes k3 again: neither
+    side holds it, and `fchecks` is fresh."""
+
+    h = history
+    h.run_fchecks(None)
+    h.expect("fchecks", keys=set(), why=set())
+    h.commit_feed(upserts={"k3": "1"}, removes=set())
+    h.expect("fchecks", keys={"k3"}, why={IN})
+    h.commit_feed(upserts={}, removes={"k3"})
+    h.expect("fchecks", keys=set(), why=set())
+
+
+def test_a_key_a_keys_run_never_held_leaves_fchecks_fresh_when_it_goes(history):
+    """F35's history: `fchecks` runs for k1 alone; k2 is missing, so it is
+    stale. `feed` removes k2: neither side holds it, and `fchecks` is
+    fresh."""
+
+    h = history
+    h.run_fchecks({"k1"})
+    h.expect("fchecks", keys={"k2"}, why={IN})
+    h.commit_feed(upserts={}, removes={"k2"})
+    h.expect("fchecks", keys=set(), why=set())
+
+
 # -- worked examples and calibrations ---------------------------------------------------
 
 
@@ -388,8 +556,7 @@ async def test_a_reset_output_holds_only_what_keys_runs_wrote_until_a_default_ru
     await engine.initialize()
     await drive(engine, await engine.submit(["checks"], keys={"items": {"keys": ["k1"]}}))
     assert set(await keyed_content(engine, p, "checks", column=None)) == {"k1"}
-    want = {"k2", "k3"} if staleness.DEP_RESETS else {"k1", "k2", "k3"}
-    assert await staleness.stale_keys(engine, "checks") == want
+    assert await staleness.stale_keys(engine, "checks") == {"k1", "k2", "k3"}
     await drive(engine, await engine.submit(["checks"]))
     assert set(await keyed_content(engine, p, "checks", column=None)) == {"k1", "k2", "k3"}
     assert not await staleness.partition_stale(engine, "checks")
@@ -444,7 +611,7 @@ async def test_a_shared_input_change_makes_every_key_stale(state, tmp_path):
     assert await staleness.stale_keys(engine, "checks") == {"k1", "k2"}
     assert await staleness.partition_stale(engine, "checks") and await staleness.asset_stale(engine, "checks")
     await drive(engine, await engine.submit(["checks"], keys={"items": {"keys": ["k1"]}}))
-    assert await staleness.stale_keys(engine, "checks") == ({"k2"} if staleness.DEP_RESETS else {"k1", "k2"})
+    assert await staleness.stale_keys(engine, "checks") == {"k1", "k2"}
     await drive(engine, await engine.submit(["checks"], keys={"items": {"keys": ["k2"]}}))
     assert not await staleness.partition_stale(engine, "checks")
 
@@ -727,7 +894,7 @@ def test_the_reference_reads_the_worked_examples():
     assert not ref.stale("checks")  # no head: missing, not stale
     ref.run_keys({"k2"})
     # (d): a reset leaves no full pass behind, and `knob` waits for one: k2 too
-    assert ref.stale_keys() == {"k3", "k4"} | ({"k2"} if not staleness.DEP_RESETS else set())
+    assert ref.stale_keys() == {"k2", "k3", "k4"}
 
     ref = staleness.Reference(takes=taken)  # K39
     ref.change_knob()
@@ -834,25 +1001,24 @@ def test_the_reference_reads_the_worked_examples():
     capped.run_default("checks")
     assert capped.run_keys({"k1"}) is None
 
-    for per_key in (True, False):  # before semantic change (d), and after
-        d = staleness.Reference(takes=taken, dep_resets=per_key)
-        d.change_knob()
-        d.commit({"k1", "k2"}, set())
-        assert d.run_default("checks") == {"k1", "k2"}  # the first run: every key
-        d.commit({"k1"}, set())
-        assert d.run_default("checks") == {"k1"}  # no pass due: the delta
-        d.change_knob()
-        assert d.stale_keys() == {"k1", "k2"} and d.reasons("checks") == {IN}  # and a pass due
-        d.run_keys({"k1"})
-        assert d.stale_keys() == ({"k2"} if per_key else {"k1", "k2"})  # one `knob` version per partition
-        assert d.run_default("checks") == {"k2"} and not d.stale("checks")  # what the pass had not
-        d.change_knob()
-        d.run_keys({"k1", "k2"})
-        assert not d.stale("checks")  # keys= runs that complete the pass
-        d.reset_checks()
-        d.run_keys({"k2"})
-        assert d.stale_keys() == ({"k1"} if per_key else {"k1", "k2"})  # over-reported after (d): accepted
-        assert d.run_full() == {"k1", "k2"} and not d.stale("checks")
+    d = staleness.Reference(takes=taken)  # a dep moving (semantic change (d))
+    d.change_knob()
+    d.commit({"k1", "k2"}, set())
+    assert d.run_default("checks") == {"k1", "k2"}  # the first run: every key
+    d.commit({"k1"}, set())
+    assert d.run_default("checks") == {"k1"}  # no pass due: the delta
+    d.change_knob()
+    assert d.stale_keys() == {"k1", "k2"} and d.reasons("checks") == {IN}  # and a pass due
+    d.run_keys({"k1"})
+    assert d.stale_keys() == {"k1", "k2"}  # one `knob` version per partition
+    assert d.run_default("checks") == {"k2"} and not d.stale("checks")  # what the pass had not
+    d.change_knob()
+    d.run_keys({"k1", "k2"})
+    assert not d.stale("checks")  # keys= runs that complete the pass
+    d.reset_checks()
+    d.run_keys({"k2"})
+    assert d.stale_keys() == {"k1", "k2"}  # no `knob` version after a reset: over-reported, accepted
+    assert d.run_full() == {"k1", "k2"} and not d.stale("checks")
 
 
 # -- the keyed merge on every built-in store (R2) ----------------------------------------
