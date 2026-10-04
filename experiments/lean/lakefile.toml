@@ -1,0 +1,5 @@
+name = "keyindex"
+defaultTargets = ["KeyIndex"]
+
+[[lean_lib]]
+name = "KeyIndex"
