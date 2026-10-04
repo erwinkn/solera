@@ -46,6 +46,7 @@ READER_BOUND = 4.0  # a layer reaching past the cut holds at most this x the byt
 SLACK = 1 * 2**20  # ... plus this
 BASE_SHARE = 4.0  # the base absorbs the layers above it once they hold 1/this of it
 ATTEMPTS = 3  # attempts of one merge (life and inputs) before upkeep stops trying it
+MAX_LAYERS = 64  # past this, commits wait for upkeep (backpressure)
 DELTA_GROWTH = 1.45  # a stamped entry's size over a delta entry's, to bound a merge's output
 
 # The cold reader's plan (§ Query forms): request round trips, requests in
@@ -331,6 +332,13 @@ class LayerState:
 
         return self if cut <= self.cut else replace(self, cut=cut)
 
+    def backlogged(self) -> bool:
+        """Upkeep is behind (failing, or slower than commits): the layers pile
+        up. Commits to the partition then wait, from every writer of the
+        index (outputs, sources, failure indexes alike)."""
+
+        return len(self.layers) > MAX_LAYERS
+
     # -- the merge rule ---------------------------------------------------------------------
 
     def plan(
@@ -376,6 +384,20 @@ class LayerState:
         """A merge's identity across engines: the life and its inputs."""
 
         return f"{self.life}|" + ",".join(x.id for x in ins)
+
+
+def epoch_of(name: str) -> int | None:
+    """The epoch a merge output's name carries (`{life}/l…-e{epoch}-{id}…`),
+    for the orphan collector: an engine judges only its own epoch's outputs
+    and older ones. None: not a merge output (a commit's delta)."""
+
+    base = name.rsplit("/", 1)[-1]
+    if not base.startswith("l"):
+        return None
+    for part in base.split("-"):
+        if part.startswith("e") and part[1:].isdigit():
+            return int(part[1:])
+    return None
 
 
 def tier(size: int) -> int:

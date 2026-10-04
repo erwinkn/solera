@@ -372,3 +372,17 @@ async def test_the_delta_interface_over_layers(seed):
     pinned = max(c for c in h.pinned if c < head and h.pinned[c].cut <= c - 1)
     idx = h.index(h.pinned[pinned])
     assert (await delta(idx, pinned - 1, pinned)).diffs == want(pinned - 1, pinned)
+
+
+async def test_merge_outputs_carry_their_epoch_and_a_backlog_holds_commits():
+    h = History(random.Random(13))
+    for c in range(6):
+        await h.commit({key(c): None}, [])
+    _, out = await h.index().merge(1, 3, epoch=7)
+    assert {L.epoch_of(n) for n in out.names()} == {7}
+    assert L.epoch_of("d000000000004-a-0.lay") is None  # a commit's delta
+    assert not h.state.backlogged()
+    many = L.LayerState(
+        layers=tuple(L.Layer(i, i, L.Part(), generation=i + 1) for i in range(L.MAX_LAYERS + 1))
+    )
+    assert many.backlogged()
