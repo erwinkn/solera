@@ -76,9 +76,8 @@ def advance(plan: dict, after: str | None = None) -> dict | None:
         else:
             entry = [plan["head"], plan["run"], plan["attempt"]]
         position = {**position, "ahead": [*ahead, entry]}
-        if (
-            "pass" in position
-        ):  # a full pass this run started or continued: its next delivery is not its first
+        if "pass" in position and not plan.get("merge"):
+            # a full pass this run started or continued: its next delivery is not its first
             position["pass"] = {**position["pass"], "batch": position["pass"]["batch"] + 1}
         return position
     if plan["kind"] == "held":

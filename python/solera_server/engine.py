@@ -1122,7 +1122,9 @@ class Engine(Attempts, Sensors, Staleness, Views):
           reset, a log that no longer holds the delta) or under way: it starts
           that pass over with the named keys, or continues it; recorded like
           any read-ahead entry, with the pass as its base.
-        - A pattern change under way: the named keys merged, recorded nowhere.
+        - A pattern change under way: the named keys merged, recorded like any
+          read-ahead entry, which the old patterns' delta and the membership diff
+          consult (A19 R4).
 
         Either plain kind collapses the record once nothing under the patterns
         is left undelivered (`covers`, the worker's)."""
@@ -1154,17 +1156,22 @@ class Engine(Attempts, Sensors, Staleness, Views):
             )
         )
         pass_ = (position or {}).get("pass") or {}
+        if position is not None and len(position.get("ahead", ())) >= self.read_ahead_cap:
+            raise NonRetryable(f"{task['asset']}: {self.READ_AHEAD_FULL}")
         if fresh and (position.get("patterns") != input.get("patterns") or "pattern_change" in position):
-            # A pattern change decides membership first: merged, recorded nowhere. A named
-            # key is updated if the consumer held it: the old patterns took it at `next` (K44).
+            # A pattern change decides membership first: the named keys merged, and recorded
+            # like any read-ahead, so neither the old patterns' delta nor the membership diff
+            # delivers them again (A19 R4, D93); the change goes on as it was. A named key is
+            # updated if the consumer held it: the old patterns took it at `next` (K44).
             held_at = position.get("next")
             pin["batch"]["held_at"] = {
                 "next": int(held_at) if held_at is not None else None,
                 "patterns": position.get("patterns"),
             }
+            if ahead:
+                pin["ahead"] = ahead
+            plan = {**plan, "position": position, "merge": True}
             return pin, plan, not keys
-        if position is not None and len(position.get("ahead", ())) >= self.read_ahead_cap:
-            raise NonRetryable(f"{task['asset']}: {self.READ_AHEAD_FULL}")
         if ahead and fresh:  # a start-over owes every key again: what was read before is not of it
             pin["ahead"] = ahead
         if fresh and pass_.get("mode") != "full":
@@ -1357,6 +1364,8 @@ class Engine(Attempts, Sensors, Staleness, Views):
                         "count": current["batches"],
                     },
                 }
+                if ahead:  # what selections merged meanwhile: not delivered again (A19 R4)
+                    pin["ahead"] = ahead
                 if carried["patterns"] is None:
                     carried.pop("patterns")
                 return pin, {"kind": "keys", "position": carried, "pass": current, "head": latest}, False

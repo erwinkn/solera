@@ -149,6 +149,8 @@ async def read_batch(pin: dict, keys_io) -> Batch:
         def changed(entry):
             key = key_str(entry[0])
             before, now = old(key), new(key)
+            if now and not before and read_at.get(key, -1) >= entry[1]:
+                return None  # a selection merged it meanwhile, at this version (A19 R4)
             return "added" if now and not before else "removed" if before and not now else None
 
         page, after, read = await _fill(whole, start, limit, changed)

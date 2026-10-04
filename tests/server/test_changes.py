@@ -233,7 +233,6 @@ async def test_a_selection_completes_a_full_pass_only_with_the_removals_it_owes(
         await t.close()
 
 
-@a19("R4")
 async def test_a_selection_during_a_pattern_change_is_counted_once(tmp_path):
     """A19 R4: `tally` counts include=(k1); the patterns widen to k*; before
     the membership diff, keys=(k2) delivers k2. It is recorded (D93), so the
