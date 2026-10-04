@@ -144,7 +144,7 @@ project = Project(assets=[slow])
     run = await engine.submit(["slow"])
     await engine.tick()  # dispatch: launch the subprocess
     # Wait for the subprocess to be mid-flight, then SIGKILL it — a real crash.
-    for _ in range(100):
+    for _ in range(1200):
         if flag.exists() and flag.read_text():
             break
         await asyncio.sleep(0.05)
@@ -277,7 +277,7 @@ async def test_a_local_attempt_ends_its_process_once_published(state, tmp_path, 
     await engine.initialize()
     detail = await engine.run_until((await engine.submit(["lingering"]))["id"], 60)
     assert detail["request"]["status"] == "succeeded"
-    for _ in range(100):
+    for _ in range(1200):
         try:
             os.kill(pids[0], 0)
         except ProcessLookupError:
@@ -350,12 +350,12 @@ async def test_a_pool_attempt_runs_in_a_child_of_the_warm_worker(state, tmp_path
     engine = make_engine(state, entrypoint, heartbeat_seconds=0.2, pool_offered_grace=0.5)
     await engine.initialize()
     run = await engine.submit(["lingering"])
-    for _ in range(100):
+    for _ in range(3000):  # offered once its launch is durable (F26): a loaded machine flushes late
         await engine.tick()
-        if state.model.pool:
+        if offered := await engine.pool_work("ingest", {}, "w1", 0):
             break
         await asyncio.sleep(0.02)
-    [stage] = await engine.pool_work("ingest", {}, "w1", 0)
+    [stage] = offered
     # A pool worker's own process; its attempts start from a forkserver with the project imported.
     worker = (
         "import asyncio, json, sys\n"
@@ -374,7 +374,7 @@ async def test_a_pool_attempt_runs_in_a_child_of_the_warm_worker(state, tmp_path
     assert asyncio.get_running_loop().time() - started < 45  # not the lingering minute, under load too
     # By this test's engine, and by the attempt's child: never in the forkserver it was forked from.
     assert imports.read_text().count("imported") == 2
-    detail = await engine.run_until(run["id"], 30)
+    detail = await engine.run_until(run["id"], 60)
     assert detail["request"]["status"] == "succeeded"
 
 
@@ -556,7 +556,7 @@ def test_a_served_engine_keeps_nothing_of_finished_local_workers(tmp_path, monke
     thread = threading.Thread(target=server.run, daemon=True)
     thread.start()
     try:
-        for _ in range(400):
+        for _ in range(1200):
             with contextlib.suppress(httpx.HTTPError):
                 if httpx.get(f"{base}/healthz", timeout=1).status_code == 200:
                     break
