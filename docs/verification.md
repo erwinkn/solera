@@ -513,6 +513,8 @@ New sweeps since that summary:
 | Z11b | Z11 again, on the deterministic simulation (3a965b9) | 981 | 250 runs × 50 steps | default | F34, replayable (Hypothesis shrank it to 9 steps) |
 | Z13 | semantic change (d) (fae165c), seeded interleavings | 991 | 241 runs, 12,514 steps, 28 h | pg | a worker read a `checks` delta file collection had deleted: F36 (fixed since, 0720b87) |
 | Z14 | as Z13, asyncio's order (`SOLERA_SIM_ORDER=fifo`) | 991 | 250 runs × 50 steps | pg | F36 again, and `copy` and `checks` never converge after automations: F38 |
+| Z15 | F38 fixed, the calibrated simulation (974dd1f): stalled launches, rename bursts, `checks` a dependent of `knob`, the hot-loop bound | 1001 | 260 runs, 15,210 steps, 71 h | pg | green |
+| Z16 | as Z15, asyncio's order (`SOLERA_SIM_ORDER=fifo`) | 1001 | 260 runs, 15,203 steps, 70 h | pg | green |
 
 ## Formal models: which spec owns which rules
 
