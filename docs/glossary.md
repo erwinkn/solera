@@ -536,11 +536,16 @@ head at all). *Example:* `copy` after its version bump: definition
 changed, until a run delivers every key under the new definition.
 
 **fingerprint**. The digest of what an asset's incremental reads depend
-on: its version, its stores' versions, its outputs' migrations and the
-run's config — the declaration and the configuration, nothing of its
-inputs. When it changes, every incremental input reads its upstream in a
-full pass. A whole input or dep that moves is an input change: the
-partition record's versions (`seen`) make a full pass due instead.
+on: its definition — its version, what each input and dep is bound to
+(by the output's home, so a rename changes nothing) and its store's
+version, its outputs' declarations — without patterns and batch size, and
+the run's config. One canonical definition serves the asset-change rule
+too, which also counts patterns (A19 R7). When it changes, every
+incremental input reads its upstream in a full pass: binding a whole
+input to another output does. A whole input or dep that moves is an input
+change: the partition record's versions (`seen`) make a full pass due,
+unless the last full pass began under the versions as they are now (the
+position's own `seen`), never judged by the order of commits.
 *Was:* interpretation fingerprint; it held its whole inputs' and deps'
 versions until semantic change (d).
 
