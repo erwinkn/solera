@@ -328,3 +328,47 @@ async def test_the_engine_installs_what_it_writes_and_evicts_within_budget(tmp_p
         assert cache.has(held)
     found = await L.LayerIndex(h.io, h.state, cache=cache).lookup([key(i) for i in range(200)])
     assert found == h.fold[-1]
+
+
+@pytest.mark.parametrize("seed", range(3))
+async def test_the_delta_interface_over_layers(seed):
+    """`solera.keys.delta.delta`, the interface the observed set calls, over
+    layers: the same answers as the fold, a key list and pages, to the head
+    and to a pinned head (the state then)."""
+
+    from solera.keys.delta import Diff, delta
+
+    rng = random.Random(100 + seed)
+    h = History(rng)
+    for _ in range(50):
+        live = list(h.fold[-1]) if h.fold else []
+        await h.commit({key(rng.randrange(300)): None for _ in range(6)}, rng.sample(live, min(len(live), 2)))
+        await h.merge_some(max(0, h.state.head - 8))
+    head = h.state.head
+
+    def want(p, at, keys=None, take=None):
+        return [
+            Diff(k.decode(), a, b, g, pl)
+            for k, a, b, g, pl in h.expected(
+                p, at, keys, None if take is None else (lambda k: take(k.decode()))
+            )
+        ]
+
+    def take(k: str) -> bool:
+        return k.endswith(("3", "8"))
+
+    names = sorted({key(rng.randrange(300)).decode() for _ in range(40)})
+    for p in [None, *range(h.state.cut, head)]:
+        page = await delta(h.index(), p, keys=names)
+        assert page.diffs == want(p, head, {n.encode() for n in names}), p
+        got, after = [], None
+        while True:
+            page = await delta(h.index(), p, after=after, first=rng.choice([1, 5, 1000]), take=take)
+            got += page.diffs
+            if page.cursor is None:
+                break
+            after = page.cursor
+        assert got == want(p, head, take=take), p
+    pinned = max(c for c in h.pinned if c < head and h.pinned[c].cut <= c - 1)
+    idx = h.index(h.pinned[pinned])
+    assert (await delta(idx, pinned - 1, pinned)).diffs == want(pinned - 1, pinned)

@@ -1,7 +1,8 @@
 """Δ(P, H, keys): every key whose state differs between P and H, with its
 presence at P and at H and its version at H (docs/observed-set.md; the
-interface of docs/key-index-from-first-principles.md). A thin adapter over
-today's `KeyIndex`; a new index replaces it behind the same interface.
+interface of docs/key-index-from-first-principles.md), over either index:
+today's `KeyIndex` (spans), or a `LayerIndex` (stamped layers, which
+replaces it behind this interface).
 
 - P is None (−∞: every key live at H is added) or a commit an observation
   was made at: the state after commit P.
@@ -9,9 +10,11 @@ today's `KeyIndex`; a new index replaces it behind the same interface.
 - keys is a sorted list, or a range — the first `first` keys after `after`
   that differ; either may carry a pattern filter (`take`).
 
-Today's index reads a change between commits only at endpoints it keeps:
-P + 1 must be one (and H + 1, unless H is the head), as the records that
-hold those commits reserve them."""
+Spans read a change between commits only at endpoints they keep: P + 1
+must be one (and H + 1, unless H is the head), as the records that hold
+those commits reserve them. Layers answer any P at or after the index's cut
+(below it, `CutError`), and an H the state holds a layer boundary at: a
+batch passes the state it pinned at its H (else `NotHeld`)."""
 
 from __future__ import annotations
 
@@ -19,6 +22,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 from .index import KeyIndex, key_bytes, key_str
+from .layers import LayerIndex
 
 
 @dataclass(frozen=True)
@@ -54,6 +58,8 @@ async def delta(
     """Δ(P, H, keys): `keys` named outright, else the first `first` keys after
     `after` that differ, both filtered by `take`."""
 
+    if isinstance(index, LayerIndex):
+        return await _layers(index, p, h, keys=keys, after=after, first=first, take=take)
     head = index.state.head
     h = head if h is None else h
     at = None if h == head else h + 1  # the state after commit h
@@ -96,6 +102,26 @@ def version_of(generation: int | None, payload) -> object:
     if isinstance(payload, bytes):
         return payload.decode()
     return payload if payload is not None else generation
+
+
+async def _layers(index: LayerIndex, p, h, *, keys, after, first, take) -> DeltaPage:
+    """Δ over stamped layers: one read for a key list and a range (A31 R1)."""
+
+    state = index.state.at(h)
+    if state is not index.state:
+        index = LayerIndex(index.io, state, cache=index._small)
+    if p is not None and p >= state.head:
+        return DeltaPage([])
+    pick = None if take is None else (lambda k: take(key_str(k)))
+    rows, cursor = await index.delta(
+        p,
+        keys=None if keys is None else [key_bytes(k) for k in keys],
+        after=None if after is None else key_bytes(after),
+        first=first,
+        take=pick,
+    )
+    diffs = [Diff(key_str(k), before, now, g, pl) for k, before, now, g, pl in rows]
+    return DeltaPage(diffs, None if cursor is None else key_str(cursor))
 
 
 def _added(key: str, generation: int, payload) -> Diff:
