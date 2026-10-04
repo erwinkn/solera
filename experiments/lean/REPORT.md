@@ -231,6 +231,31 @@ nothing otherwise. A tombstone found in a span correctly hides an older
 live entry. The base's dropped tombstones and predecessors change nothing a
 reader sees.
 
+## The second review's reader rules (A12)
+
+`Review.lean`:
+
+- **A12-1**, normalise only the base's initial segment.
+  `boundaries_after_base`: in every reachable state, every live boundary
+  lies past the base, so normalising the base never touches anything a
+  catch-up reads. `lookup_head` already shows lookups don't notice it.
+  `a12_1_counterexample` (by computation) is the review's case. A consumer
+  sits at endpoint 1; `d` is added at 1 and delivered live by a selection;
+  it is removed at 2; a base merge crosses endpoint 1. Normalising the
+  segment after the endpoint drops `d`'s tombstone, so the read-ahead skips
+  `d` and the consumer keeps it forever. Kept, the tombstone gives
+  "removed", the truth.
+- **A12-2**, clip changes to the pinned N. `catch_up` and
+  `read_ahead_spans` already read exactly the segments of `[P, N]`.
+  `a12_2_counterexample` (by computation) is the review's case: `k` is added
+  at 1 and removed at 2, and `changes(1, 1)` reads the span `[1, 2]`.
+  Clipped to `[g(1), g(2))`, the answer is "added", the truth; unclipped,
+  the span's newest version gives "nothing". Clipping works only because
+  `N + 1 = 2` is a reserved endpoint, which the tiling requires: it keeps
+  `k`'s generation-20 version in its own segment. Without that boundary,
+  the span would hold only the tombstone, and no clipping could recover
+  "added".
+
 ## Differential test
 
 `lake build run` compiles the Lean list merge (`Main.lean`).
