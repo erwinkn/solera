@@ -2,7 +2,10 @@
 xfail while its finding is open (docs/verification.md, "Findings"), an
 ordinary test once fixed."""
 
+import pytest
+
 from .machine import Simulation
+from .oracle import Violation
 from .world import Fate
 
 
@@ -962,5 +965,61 @@ def test_f41_a_consumer_that_read_a_removal_does_not_keep_the_key(monkeypatch):
     state.nothing_read_after_collection()
     state.one_attempt_per_partition()
     state.one_end_per_attempt()
+    state.reads_say_what_they_read()
+    state.teardown()
+
+
+@pytest.mark.xfail(strict=True, raises=Violation, reason="F42: open")
+def test_f42_a_full_run_finishes_its_pass():
+    """F42 (main's seed 5000, out of memory): two full runs of `copy`, with
+    a commit of `feed` between them. The first finishes its two-batch pass.
+    Every attempt of the second starts the pass over (batch 0, a new
+    `began`), delivers batch 1 of 2, and succeeds; the next one starts over
+    again. The task relaunches without end: thousands of attempts, a cleanup
+    run each, memory without bound."""
+
+    state = Simulation()
+    state.boot(seed=337, store="table", cache="starved")
+    state.submit("copy", mode="full", upstream=True, partitions="all")
+    state.a_fenced_scope_at_rest_holds_its_index_keys()
+    state.a_life_is_its_own()
+    state.a_ticks_runs_are_submitted_once()
+    state.attempts_are_bounded()
+    state.committed_keys_are_readable()
+    state.fenced_writes_hold_their_gate()
+    state.index_spans_tile()
+    state.no_state_broke()
+    state.nothing_read_after_collection()
+    state.one_attempt_per_partition()
+    state.one_end_per_attempt()
+    state.reads_at_endpoints_are_exact()
+    state.reads_say_what_they_read()
+    state.commit_feed(op="replace", keys={"k10", "k1"}, version="3")
+    state.a_fenced_scope_at_rest_holds_its_index_keys()
+    state.a_life_is_its_own()
+    state.a_ticks_runs_are_submitted_once()
+    state.attempts_are_bounded()
+    state.committed_keys_are_readable()
+    state.fenced_writes_hold_their_gate()
+    state.index_spans_tile()
+    state.no_state_broke()
+    state.nothing_read_after_collection()
+    state.one_attempt_per_partition()
+    state.one_end_per_attempt()
+    state.reads_at_endpoints_are_exact()
+    state.reads_say_what_they_read()
+    state.submit("copy", mode="full", upstream=True, partitions="all")
+    state.a_fenced_scope_at_rest_holds_its_index_keys()
+    state.a_life_is_its_own()
+    state.a_ticks_runs_are_submitted_once()
+    state.attempts_are_bounded()
+    state.committed_keys_are_readable()
+    state.fenced_writes_hold_their_gate()
+    state.index_spans_tile()
+    state.no_state_broke()
+    state.nothing_read_after_collection()
+    state.one_attempt_per_partition()
+    state.one_end_per_attempt()
+    state.reads_at_endpoints_are_exact()
     state.reads_say_what_they_read()
     state.teardown()

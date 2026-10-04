@@ -9,6 +9,7 @@ regression test that replays it would spell it."""
 from __future__ import annotations
 
 import asyncio
+import collections
 import dataclasses
 import functools
 import json
@@ -67,7 +68,10 @@ CACHE = {None: None, "tight": (6 * 1024, 2 * 1024), "starved": (2 * 1024, 512)}
 # Where `items` lives. Always the same three, so a seed draws the same runs with or
 # without Postgres: without SOLERA_TEST_DATABASE_URL, "pg" runs on the table store.
 STORES = ["file", "table", "pg"]
-CHANGES = sorted(VARIANTS)  # re-registrations the rules make
+CHANGES = sorted(VARIANTS)
+MAX_ATTEMPTS = (
+    100  # attempts one task may launch (calibrated: docs/verification.md)  # re-registrations the rules make
+)
 
 
 fates = st.one_of(
@@ -583,6 +587,19 @@ class Simulation(RuleBasedStateMachine):
             raise Violation(f"a first life's attempt committed into the second: {crossed}")
 
     @invariant()
+    def attempts_are_bounded(self):
+        """No task launches more than `MAX_ATTEMPTS` attempts, counted from
+        the durable journal: retries, batches and passes all end. A task that
+        relaunches without end (F42) is a loop that runs through its workers,
+        which the hot-loop bound cannot see, since every worker request opens
+        a window."""
+
+        counts = collections.Counter(e["task"] for e in self.journal.launched.values())
+        task, n = max(counts.items(), key=lambda kv: kv[1], default=(None, 0))
+        if n > MAX_ATTEMPTS:
+            raise Violation(f"task {task} launched {n} attempts")
+
+    @invariant()
     def reads_at_endpoints_are_exact(self):
         """Every key-index read at an endpoint — `page` and `lookup` at a
         position, pin or snapshot, `changes` between two — equals the fold of
@@ -806,6 +823,7 @@ class Simulation(RuleBasedStateMachine):
             self._ensure_engine()
             self._run(asyncio.sleep(30.0))
             waited += 30.0
+            self.attempts_are_bounded()  # a relaunching task never quiets: it ends here
         del world
 
     def _converge(self) -> None:
