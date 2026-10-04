@@ -41,6 +41,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import resource
 import shutil
 import subprocess
@@ -504,9 +505,33 @@ async def read(root: Path, what: str, at: int | None) -> dict:
         else:
             bad += int(np.count_nonzero((then != now) & ~seen))
         out = {"keys": n_got, "mismatches": bad}
-    elif what in SCANS:  # layers: a full scan under a pattern, checked against the fold
+    elif what in SCANS:  # a full scan under a pattern, checked against the fold
         pattern, prefix = SCANS[what]
-        got = await idx.r.scan_all(pattern, prefix=prefix)
+        if layers:
+            got = await idx.r.scan_all(pattern, prefix=prefix)
+        else:  # spans and two views: their full pass, page() 100K keys at a time, filtered
+            from solera.patterns import glob_regex as _gr
+
+            rxp = "^(?:" + _gr(pattern.decode()) + ")$"
+            k = v.k() if views else idx
+            after = prefix[:-1] + bytes([prefix[-1] - 1]) + b"\xff" * 8 if prefix else None
+            matches = pages = 0
+            while True:
+                keys, _, _, nxt = await k.page(after, PAGE)
+                pages += 1
+                if keys:
+                    arr = pa.array(keys, type=pa.binary())
+                    if prefix:
+                        inside = pc.starts_with(arr.cast(pa.string()), prefix.decode())
+                        matches += int(pc.sum(inside).as_py() or 0)
+                        if not pc.all(inside).as_py():
+                            break  # past the prefix's range
+                    else:
+                        matches += int(pc.sum(pc.match_substring_regex(arr.cast(pa.string()), rxp)).as_py() or 0)
+                if nxt is None:
+                    break
+                after = nxt
+            got = {"matches": matches, "slices": pages}
         wall = time.perf_counter() - t
         m, pk = io.metrics.snapshot(), max(0, peak_bytes() - base) / 1e6  # before the check
         from solera.patterns import glob_regex
@@ -644,6 +669,7 @@ def main():
     if built["index"] == "layers":
         if built["scenario"] == "stall" and rd["stall"] is not None:  # no pinned snapshot: its catch-up only
             rows.append(isolated(root, "changes", rd["stall"]) | {"behind": "stalled pass: catch-up"})
+    if built["index"] == "layers" or os.environ.get("SCANS_ALL"):  # the baselines: through page()
         rows += [isolated(root, w, None) | {"behind": w} for w in SCANS]
     (root / "reads.json").write_text(json.dumps(rows))
     print(json.dumps({"built": built, "reads": rows}))
