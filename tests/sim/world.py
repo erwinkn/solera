@@ -25,6 +25,8 @@ from solera import lifecycle
 from solera.lifecycle import Ended
 
 from .core import EPOCH, Determinism, FaultPlan, Killed, Objects, SimLoop, actor
+from .reads import Reads
+from .reads import patches as reads_patches
 
 log = logging.getLogger("sim")
 
@@ -387,6 +389,7 @@ class World:
         # (point, seconds, pool, crash) or None.
         self.launch_fate: tuple[str, float, bool, bool] | None = None
         self.pace = Pace(self.now, None if os.environ.get("SOLERA_SIM_PACE") == "measure" else PACE)
+        self.reads = Reads(root / "state" / "sim")  # every read at an endpoint, against its commits' fold
         self.project_now: Callable | None = None  # the project the platform restarts an engine on
         self.restarting: asyncio.Task | None = None  # that restart, while it runs
         self.calm = False  # converging: no fate strikes any more, one already stalled included
@@ -442,6 +445,7 @@ class World:
             (State, "_exit", staticmethod(exit_)),
             (State, "record", recording),
             (engine_mod.Engine, "tick", ticking),
+            *reads_patches(self.reads),
         ]
         for owner, name, value in patches:
             self._saved.append((owner, name, getattr(owner, name)))

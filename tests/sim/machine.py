@@ -583,6 +583,15 @@ class Simulation(RuleBasedStateMachine):
             raise Violation(f"a first life's attempt committed into the second: {crossed}")
 
     @invariant()
+    def reads_at_endpoints_are_exact(self):
+        """Every key-index read at an endpoint — `page` and `lookup` at a
+        position, pin or snapshot, `changes` between two — equals the fold of
+        the commits its index holds up to there (`tests/sim/reads.py`)."""
+
+        if self.world is not None and self.world.reads.wrong:
+            raise Violation(f"a read at an endpoint is not exact: {self.world.reads.wrong[0]}")
+
+    @invariant()
     def one_attempt_per_partition(self):
         """A claim holds an asset partition for one attempt at a time: no
         attempt launches on one another launched attempt holds, in the
@@ -855,6 +864,8 @@ class Simulation(RuleBasedStateMachine):
         self.index_spans_tile()  # convergence ran no invariant
         engine, project, variant = self.world.engine, self.project, self.variant
         stage = "after automations alone" if automated else "after a catch-up run"
+        # A read at an endpoint that went wrong is the cause; contents that differ, its effect.
+        self.reads_at_endpoints_are_exact()
 
         async def check():
             items = await keyed_content(engine, project, "items", whole=True)

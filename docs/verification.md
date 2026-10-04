@@ -117,6 +117,7 @@ Checked after every step:
 | **One attempt per asset partition.** No attempt launches on an asset partition another launched attempt holds — in the journal, in order, and in the serving engine's claims. A task follows its asset through a rename (an alias); `mirror` renamed back to `copy` without one is another asset. | the hourly run and a manual run both launching `copy` before either ends |
 | **A tick's runs are submitted once.** Each run a sensor tick requests is submitted at most once, however late, often, or across restarts the tick's outcome is posted. | a retried post of tick `T` submitting its `per_site` run a second time |
 | **No hot loop.** Between external inputs (a step, a client or worker request, an engine start), each kind of engine activity — ticks, journal events, store requests — stays within `burst + rate × the virtual seconds since`: ticks 200 + 10/s, events and requests 500 + 5/s (`PACE` in `tests/sim/world.py`). Erwin's ruling (D60): no wake floor between ticks, the simulation catches hot loops. Counted as they happen, so a loop that never yields virtual time still ends the step. | F20's retry clock resubmitting an unplannable retry at every tick: 201 ticks at one virtual instant |
+| **Reads at endpoints are exact.** Every key-index read at an endpoint — `page` and `lookup` at a position, pin or snapshot, `changes` between two — equals the fold of the commits its index holds, up to there. A slice (a catch-up's pin) is checked for which keys changed and how they stand, not their class, which needs what came before it. A read the index cannot serve counts as wrong. So does a merge that drops an endpoint some reader holds, because no read at that endpoint can be exact. The fold never touches the spans or merges under test. Each commit's entries are read from its own delta files when it is installed, and each merge's inputs are recorded when it is published, so any index state traces back to its commits (`tests/sim/reads.py`). Which endpoints readers hold comes from the events, not from the engine's own list: attempts in flight from their launches to their ends, so that a claim the engine forgot is still checked. Positions come from the model's records, their life (resets, renames, pattern changes) being the model's to fold; an engine restored from a checkpoint has not seen launches before it. | W36's planted bug: merges planned with no endpoints, so a reader's position falls inside a merged span; "keys/items/_/: a merge dropped endpoint 1, which a reader of ('items', '') holds" |
 | **A fenced write holds its gate.** Every write a worker makes to a fenced store (the table store, Postgres) comes after its attempt's gate was created `writing` with that worker's id (`lifecycle.md` §2.4, §3). | a worker paused before its gate, whose attempt the engine closed meanwhile, writing `items` when it wakes; the twin of a `twice` worker writing beside the owner |
 
 Checked once the system is quiet, at the end of every run (`_converge`): faults
@@ -482,6 +483,39 @@ Ordinary runs are not slower. `tests/sim` took 45.8 s on average with the
 changes against 55.1 s without. That is three pairs, run back to back on
 the same base while other work shared the machine: 0.72×, 0.96× and 0.83×
 per pair. The CI budget makes 1,202 steps in 33 runs, against 1,168 in 35.
+
+**Reads at endpoints (T30).** W36's planted span bug is one line in
+`Upkeep.maintain`, `endpoints = set()`: every merge plans and writes as if
+no reader held an endpoint (branch `calib/spans-endpoint-bug`, 293957b,
+never merged). Before the invariant, the simulation's own checks passed it.
+On 293957b the CI run reported "1 passed" over 12 runs, and only the trace
+check (`check-trace.py spans`) rejected it. The bug's reads are not wrong as
+such: a merge drops the segment start a reader's position needs, and the
+engine then plans that reader's next read from the wrong place, consistently.
+So the invariant checks both that reads are exact and that merges keep the
+endpoints readers hold.
+
+| | Seeded | asyncio's order |
+|---|---|---|
+| The planted bug: examples to the first find | 10 of 905 (6/6 seeds) | 4 of 900 (6/6 seeds) |
+| Main: failures | none in 750 | none in 750 |
+| The CI run (12 examples, derandomized) with the bug | fails: "a merge dropped endpoint 1, which a reader of ('items', '') holds" | |
+
+Main ran 750 examples per order, not 900: its sixth Hypothesis seed (5000)
+runs out of memory (3 GB, the harness's cap) in both orders. It does so on
+the simulation without this invariant too (974dd1f), so it is older than it.
+It is being looked into separately.
+
+Two rules of `changes` had to be learned from false alarms on main. A key
+live at neither end, or at both with equal payloads, is neither (the net
+rule). And a merge that folds a neither's versions away drops it from the
+page, harmlessly: no consumer is delivered one. So a neither may be listed,
+while every added, updated or removed key must be.
+
+`tests/sim` takes 1.42× as long with the invariant: 31.6 s against 22.3 s,
+three interleaved pairs on the same product code. That is within the 1.5×
+bound. The read checks themselves take about 0.1 % of a run; the rest is the
+hooks around every install, event and read, which could be trimmed.
 
 ## Sweeps
 
