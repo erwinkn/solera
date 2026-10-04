@@ -880,7 +880,7 @@ Deviations from the design, all deliberate for a prototype:
 
 - **The per-commit fold, at 1M, under caps** (four builds in parallel, each
   one core and 2 GB; `viewbench.py --index layers --size 1e6`, 12,000
-  commits): every read of the base, churn, stall and 100-daily-reader
+  commits; logs in `bench/keys/fp/runs-phase2/`): every read of the base, churn, stall and 100-daily-reader
   scenarios matched the fold key by key, **0 mismatches**: catch-ups 1, 100,
   360, 8,640 and 10,000 behind, the stalled pass's catch-up, 1K lookups, a
   write resolution, a 100K page, and three full scans under patterns
@@ -903,12 +903,114 @@ Deviations from the design, all deliberate for a prototype:
     set stopped after three;
   - a P below the cut fails loudly (`CutError`).
 
-PHASE2_MEASUREMENTS
+### Measured so far (1M, server under load)
+
+The server was heavily loaded by other projects throughout (load average
+14–46 on 8 cores), so **wall times below are indicative only**; GETs and
+bytes are exact. Cold readers, each in its own process: 30 ms per request,
+80 MB/s per connection, 64 in parallel, every layer index fetched. Two views
+and spans are cited from W53's baseline (`exp/key-index-two-views`,
+`bench/keys/views/results.md`, zstd-1 16 KiB, measured on the Mac).
+
+| 1M keys, base trace | Layers: wall · GETs · MB | Two views (cited) | Spans (cited) |
+|---|---|---|---|
+| 100 behind | 0.17 s · 7 · 0.9 | 0.29 s · 5 · 1.2 | 0.32 s · 6 · 2.6 |
+| 360 behind | 0.72 s · 15 · 5.2 | 0.87 s · 10 · 4.3 | 0.71 s · 11 · 5.4 |
+| 8,640 behind | 2.79 s · 33 · 21.0 | 2.78 s · 16 · 13.9 | 5.05 s · 78 · 42.7 |
+| 10,000 behind | 2.86 s · 33 · 21.0 | 6.08 s · 71 · 27.0 | 6.36 s · 97 · 51.1 |
+| 1K cold lookups | 0.56 s · 17 · 17.0 | 0.18 s · 7 · 9.1 | 0.34 s · 13 · 71.3 |
+| 100K-key page | 0.41 s · 16 · 4.5 | 0.33 s · 8 · 1.8 | 1.13 s · 23 · 13.6 |
+| stored, mean | 15.5 MB | 293 MB (window), 55 MB (cover) | 42 MB |
+| background entry writes per entry committed | 6.2 | 8.5 | 6.7 |
+| PUTs per commit | 1.39 | 1.34 | 1.45 |
+
+Cold lookups are the one row where layers trail: the reader streams the
+small layers whole (17 MB) and fetches the indexes first, two round trips.
+A held layer index (the engine's case) removes one.
+
+**(1) A full non-prefix pattern scan.** At 1M (all main parts, 17 MB, 16
+GETs): `*4242*` 0.59 s and `*template*` 0.60 s wall under load (1.56 s
+before the kernel work); the prefix `cust-00042*` 0.24 s and 0.2 MB (a
+seek). The native scan, re-timed in CPU
+seconds after the kernel work, runs **0.04 s of CPU per 1M entries** for a
+non-prefix glob (~25M entries per second per core: a literal prefilter, then
+the automaton; only matches are built). **At 100M it is unmeasured** (the
+server run was stopped). Estimate for a cold scan: two round trips (indexes,
+then data), the bytes at a worker's NIC (1.25 GB/s; the harness's 64 × 80
+MB/s is more generous), and decoding on 4 cores (~100M entries/s): about
+**1.9 s per GB** of main parts at ~9 B per entry.
+
+- **Proposed threshold** for building accelerators: a declared non-prefix
+  pattern **and main parts above 500 MB**, where a cold full scan crosses
+  ~1 s. Below it (a 1M-key index is ~10–20 MB) a full scan stays well under
+  a second. To be confirmed by W53's 100M scans.
+- **Accelerators, sketched (not built)**, each maintained by the merges of
+  the outputs that need one:
+  - *A reversed-key layer set* (every key reversed, so a suffix is a prefix):
+    serves `**/*.pdf`, `*7`; not infixes. A second copy of every main part:
+    ~1× storage and ~1× merge writes more (reversed keys share fewer
+    prefixes, so up to ~1.5–2× for sequential ids).
+  - *Trigram filters per block*: 0.5–2.5 B per key (cited, W53), so 1–7% of
+    the index; serve selective infixes on text-like keys, never random ids
+    (98–100% of blocks read for `*4242*`).
+  - *A segment index* (path segment → blocks holding it), built with each
+    layer index: per block its distinct segments, ~tens of bytes per block,
+    under 1% of the index; serves `**/archive/**`-style patterns at block
+    granularity; not substrings inside a segment (`*template*`).
+
+**(2) The cold writer.** At 1M: 17 GETs, 17 MB, 0.6 s wall (under load) per
+1K-key commit. **At 100M it is unmeasured**; the replay's ~1,000 GETs per
+1K-key commit (~$105 a month on S3 at one commit per 10 s) stands until W53
+measures it. Why ~1 GET per key: 1K random keys fall in ~1K distinct blocks
+of a ~22K–50K-block base. Options:
+
+| Option | Saves | Costs |
+|---|---|---|
+| a key-hash-partitioned filter on the base | GETs for absent keys only (adds, ~5% of a commit); updates still need their block (the writer needs the replaced version for cleanup) | 10 bits per key (~125 MB at 100M), rewritten by every base merge; a filter page per key cold, unless held |
+| the base's layer index held warm (~1.5 MB at 100M) | one round trip (the index fetch) | memory per partition |
+| base blocks cached on the engine's disk | every GET (0 per commit) | ~0.4–0.8 GB of disk per 100M-key partition; a refill (one streamed read, ~1 s) after a restart |
+| larger commits | GETs per key: 10K keys touch ~0.9 blocks each, 100K keys stream the base (~25 GETs) | freshness |
+
+The cache is what makes writes cheap; the filter is not worth its cost.
+
+**(3) Churn at 1M** (half of each commit temporary, removed 100 commits
+later), a reader 10,000 behind: **35.1 MB read with side parts, 39.0 MB
+without** (`LAYERS_SIDE=always`), for 1.26M keys delivered: 3.1× against
+3.4× what it delivers. The replay's 6.6× was an overestimate (its density
+model counts a temporary key's add and remove twice across merges).
+Replayed, k (1–8) and Z (0.25–4 MB) change it by ±25%, never below 6×: the
+waste is the temporary keys' own entries, not the layer sizes. What remains
+after the split is in the base's side part: at 1M the base reaches close to
+the head, so a day-behind reader straddles it and reads every temporary
+key's tombstone since the cut. **A next step, not built**: keep the base's
+side part in sub-parts by each entry's oldest flip, so that a reader at P
+reads only entries whose oldest flip is at or before P (a temporary key
+added after P is absent at P and needs nothing). Estimated to bring the
+churn reader near the base trace's 1.7×.
+
+### Not yet measured
+
+- **Everything at 100M**: builds, catch-ups, cold lookups and the cold
+  writer, pattern scans (and so the threshold), the forced base merge
+  (`rebase.py`). W53's campaign on the Mac.
+- **Timings on an idle machine** at 1M (the server was loaded); dollars
+  through W53's `report.py`.
+- **The 1M large-commit scenario** (`--large 1000000 --large-every 3000`):
+  only a 100K-key smoke run (0 mismatches, after fixing a reader bug it
+  found: an indexed delta's blocks carried no stamp).
+- **The final merge kernel at 1M**: the four 1M builds ran before the
+  kernels were reworked for speed (abe283e and 5516d62: a heap-free merge,
+  one allocation per key, the pattern filter while walking). The reworked
+  kernels pass every test, including 200 random histories against the
+  fold, and every read of the four 1M builds was re-run on them at abe283e
+  (56 reads, 0 mismatches; `bench/keys/fp/runs-phase2/`); a 1M build with
+  them has not run. W53's 1M builds are the first.
+
 
 ### Running it (for W53)
 
 ```bash
-git fetch && git checkout design/key-index-fp     # REVISION
+git fetch && git checkout design/key-index-fp     # at the revision in W57's report
 uv sync --all-extras                              # builds solera._native, layers.rs included
 uv run pytest bench/keys/fp/test_layers.py -q     # 9 tests, ~10 s
 (cd native && cargo test --release --lib layers)  # 3 tests
@@ -944,3 +1046,5 @@ Notes for the campaign:
 - The build directory names carry `zlib-64k` from the harness's defaults;
   layers ignore them.
 - Build times on the server (loaded, one core each): ~36 minutes at 1M.
+- `--large` runs: the delta of a 1M-key commit is indexed (multi-block);
+  its reads exercise the fix in abe283e.
