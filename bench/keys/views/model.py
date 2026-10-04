@@ -1,24 +1,26 @@
-"""W53 phase 1: the two views' structure, replayed on metadata.
+"""W53: the two views' structure on metadata (corrected after A25 R7, R8).
 
-The time view (T) is an aligned tree over commit numbers: a level-j node
-covers commits [i * b^j, (i + 1) * b^j - 1] and holds each key's net change
-there. Level 1 is a pack of b commits' deltas (copied, not merged); levels 2
-and up are merged. The key view (K) is a base (every live key, as of commit
-w) plus T's nodes from w + 1 to the head: the "head chain". The base absorbs
-the chain once the chain holds a 1/r share of the base's entries.
+The time view (T) is an aligned tree over commit numbers, fanout b: level 1
+packs of b deltas, level j >= 2 nodes over b^j commits. The key view (K) is
+a base as of commit w plus T's cover of [w + 1, head] (its chain); the base
+absorbs the chain when a node at the base level jb (the smallest whose node
+holds a quarter of the base) completes. Keys are uniform: n changes over
+`keys` live keys touch keys * (1 - exp(-n / keys)) distinct ones, the
+density model of the span replays (`bench/keys/spans.py`).
 
-Keys are uniform: n changes over `keys` live keys touch
-keys * (1 - exp(-n / keys)) distinct ones. That is the density model the span
-replays (`bench/keys/spans.py`) use too, so the numbers compare with
-`key-index-design.md`'s replayed tables, not with its measured ones.
+Prints:
 
-Prints, per index size, fanout b and base ratio r:
-- background writes per entry committed (the delta itself not counted), for T
-  (packs and merged nodes) and for K (base merges);
-- K's runs (the base's files count as one run) and entries per live key;
-- per reader lag: the nodes its catch-up opens and what it reads relative to
-  what changed;
-- T's stored entries with a reader a day behind (the floor).
+1. K's runs, every head of a base cycle enumerated (A25 R7: sampling every
+   32nd head hid the low levels): files opened (a pack's sections are one
+   object) and merge inputs (each section a run), mean and max.
+2. Storage over a whole base cycle (A25 R8), entries per live key, mean and
+   peak: the base, K's chain, and T under each retention:
+   - window W: T keeps every level of the last W commits (Erwin's policy;
+     the same as a commit horizon X = W with the floor rule);
+   - cover: T keeps the covers of the readers' intervals (here 100 daily
+     readers spread over the day, one hourly, one every commit) and K's chain;
+   plus, for the window, each laggard's snapshot (about one live index each).
+   The base watermark holds K's chain only, never every level since it.
 
 Usage: python3 bench/keys/views/model.py
 """
@@ -26,116 +28,107 @@ Usage: python3 bench/keys/views/model.py
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+import random
 
-COMMIT = 1_000  # keys per commit
-DAY = 8_640  # commits a day at one per 10 s
+COMMIT = 1_000
+DAY = 8_640
 
 
 def distinct(n: float, keys: int) -> float:
-    """Distinct keys among n uniform changes over `keys` keys."""
-
     return keys * -math.expm1(-n / keys)
 
 
-@dataclass
 class Shape:
-    keys: int
-    b: int
-    r: float
+    def __init__(self, keys: int, b: int = 4, r: float = 4, top: int = 10):
+        self.keys, self.b, self.r, self.top = keys, b, r, top
+        self.jb = next(j for j in range(2, 40) if self.entries(j) * r >= keys)
 
-    def entries(self, level: int) -> float:
-        """Entries in one node of `level` (level 0: a delta)."""
+    def entries(self, j: int) -> float:
+        n = self.b**j * COMMIT
+        return n if j <= 1 else distinct(n, self.keys)
 
-        n = self.b**level * COMMIT
-        return n if level <= 1 else distinct(n, self.keys)
+    def cover(self, first: int, last: int, top: int | None = None) -> list[tuple[int, int]]:
+        """(level, start) units tiling [first, last], every level built."""
 
-    def base_level(self) -> int:
-        """The lowest level whose node holds a 1/r share of the base: the base
-        merges once a node of it completes (so the chain never reaches it)."""
-
-        j = 1
-        while self.chain_entries_full(j) < self.keys / self.r:
-            j += 1
-        return j
-
-    def chain_entries_full(self, j: int) -> float:
-        return self.entries(j)
-
-    def cover(self, first: int, last: int, top: int) -> list[int]:
-        """The canonical cover of commits [first, last]: node levels, largest
-        aligned nodes first, never above `top`."""
-
-        levels = []
-        c = first
+        top = self.top if top is None else top
+        out, c, b = [], first, self.b
         while c <= last:
-            j = 0
-            while j < top and c % self.b ** (j + 1) == 0 and c + self.b ** (j + 1) - 1 <= last:
-                j += 1
-            levels.append(j)
-            c += self.b**j
-        return levels
+            j = next((j for j in range(top, 0, -1) if c % b**j == 0 and c + b**j - 1 <= last), 0)
+            out.append((j, c))
+            c += b**j
+        return out
 
-    def chain(self, head: int, top: int) -> list[int]:
-        """K's runs above the base at `head`: the cover from the last base
-        merge (at a multiple of b^top) to the head."""
-
-        w = (head // self.b**top) * self.b**top
-        return self.cover(w, head, top) if head >= w else []
+    def unit_entries(self, unit) -> float:
+        return self.entries(unit[0]) if unit[0] >= 1 else COMMIT
 
 
-def replay(keys: int, b: int, r: float, top_reader: int = 40_000):
-    s = Shape(keys, b, r)
-    jb = s.base_level()
-    # Levels a reader may use: up to the lag the per-position budget allows
-    # (a full read once a catch-up would read more), here top_reader commits.
-    jt = max(jb, math.ceil(math.log(top_reader, b)))
+def k_runs(s: Shape):
+    """Every head of one base cycle: files opened, merge inputs."""
 
-    # Background writes per entry committed: packs copy every entry once,
-    # merged levels write their distinct keys; levels above the base's are
-    # built only while a reader is far enough behind to use them.
-    t_k = 1.0 + sum(s.entries(j) / (b**j * COMMIT) for j in range(2, jb + 1))
-    t_readers = sum(s.entries(j) / (b**j * COMMIT) for j in range(jb + 1, jt + 1))
-    base = keys / (b**jb * COMMIT)  # a full base rewrite every b^jb commits
+    period = s.b**s.jb
+    objs, inputs = [], []
+    for h in range(period):  # the base holds commits up to the cycle's start; the chain is [0, h]
+        cv = s.cover(0, h, s.jb - 1)
+        packs = {c - c % s.b for j, c in cv if j == 0}
+        objs.append(1 + sum(1 for j, _ in cv if j >= 1) + len(packs))
+        inputs.append(1 + len(cv))
+    return sum(objs) / period, max(objs), sum(inputs) / period, max(inputs)
 
-    # K's runs over a base-merge cycle.
-    runs, live = [], []
-    period = b**jb
-    for head in range(0, period, max(1, period // 2_000)):
-        ch = s.chain(head, jb)
-        runs.append(1 + len(ch))
-        live.append((keys + sum(s.entries(j) for j in ch)) / keys)
 
-    # Catch-ups: a reader `lag` commits behind the head, over many alignments.
-    readers = {}
-    for lag in (1, 100, 360, 8_640, 10_000):
-        nodes, ratio = [], []
-        for start in range(10_000, 10_000 + 4 * b**jt, max(1, (4 * b**jt) // 997)):
-            cv = s.cover(start, start + lag - 1, jt)
-            nodes.append(len(cv))
-            ratio.append(sum(s.entries(j) for j in cv) / distinct(lag * COMMIT, keys))
-        readers[lag] = (sum(nodes) / len(nodes), max(nodes), sum(ratio) / len(ratio))
+def chain_entries(s: Shape, h: int) -> float:
+    return sum(s.unit_entries(u) for u in s.cover(0, h, s.jb - 1))
 
-    # T's stored entries with the floor a day back: every node from it on.
-    stored = sum((DAY / b**j) * s.entries(j) for j in range(1, jt + 1) if b**j <= DAY)
-    return jb, jt, t_k, t_readers, base, runs, live, readers, stored
+
+def window_entries(s: Shape, w: int) -> float:
+    """T's entries for a window of w commits: every level's complete nodes in it."""
+
+    total = 0.0
+    for j in range(1, s.top + 1):
+        if s.b**j > w:
+            break
+        total += (w / s.b**j) * s.entries(j)
+    return total
+
+
+def cover_entries(s: Shape, head: int, starts: list[int]) -> float:
+    units = set()
+    for p in starts:
+        units |= set(s.cover(p, head))
+    return sum(s.unit_entries(u) for u in units)
 
 
 def main():
-    print("keys\tb\tr\tbase level\ttop\tT for K\tT for readers\tbase\tK runs mean (max)\t"
-          "K entries/live key\t" + "\t".join(f"lag {x}: nodes mean (max), read x changed" for x in
-                                             (1, 100, 360, 8640, 10000)) + "\tT stored, floor a day back (entries / live key)")
-    for keys in (1_000_000, 100_000_000):
-        for b in (2, 4, 8, 16):
-            for r in (2, 4, 8):
-                jb, jt, tk, tr, base, runs, live, readers, stored = replay(keys, b, r)
-                cells = [f"{keys:,}", str(b), str(r), str(jb), str(jt), f"{tk:.2f}", f"{tr:.2f}", f"{base:.2f}",
-                         f"{sum(runs) / len(runs):.1f} ({max(runs)})", f"{sum(live) / len(live):.2f}"]
-                for lag in (1, 100, 360, 8_640, 10_000):
-                    m, x, q = readers[lag]
-                    cells.append(f"{m:.1f} ({x}) {q:.2f}x")
-                cells.append(f"{stored / keys:.2f}")
-                print("\t".join(cells))
+    rng = random.Random(1)
+    print("1. K's runs over a whole base cycle, b = 4, r = 4 (every head)")
+    print("keys\tbase level\tcycle (commits)\tfiles opened mean (max)\tmerge inputs mean (max)")
+    shapes = {k: Shape(k) for k in (1_000_000, 100_000_000)}
+    for k, s in shapes.items():
+        om, ox, im, ix = k_runs(s)
+        print(f"{k:,}\t{s.jb}\t{s.b**s.jb:,}\t{om:.1f} ({ox})\t{im:.1f} ({ix})")
+
+    print("\n2. Storage over a whole base cycle, entries per live key: mean (peak)")
+    print("keys\tpolicy\tbase\tK chain\tT\tsnapshots per laggard\ttotal")
+    for k, s in shapes.items():
+        period = s.b**s.jb
+        heads = range(0, period, max(1, period // 4096))
+        chain = [chain_entries(s, h) / k for h in heads]
+        cm, cx = sum(chain) / len(chain), max(chain)
+        for name, w in (("window 1 day", DAY), ("window 7 days", 7 * DAY), ("window 30 days", 30 * DAY)):
+            t = window_entries(s, w) / k
+            print(f"{k:,}\t{name}\t1.00\t{cm:.2f} ({cx:.2f})\t{t:.2f}\t~1 each (a live index)\t{1 + cm + t:.2f} ({1 + cx + t:.2f})")
+        # cover: 100 daily readers spread over the day, an hourly one, one every commit
+        vals = []
+        for _ in range(60):
+            head = rng.randrange(10 * DAY, 20 * DAY)
+            starts = [head - rng.randrange(DAY) for _ in range(100)] + [head - rng.randrange(360), head]
+            vals.append(cover_entries(s, head, starts) / k)
+        print(f"{k:,}\tcover, 100 daily + hourly\t1.00\t{cm:.2f} ({cx:.2f})\t{sum(vals) / len(vals):.2f} ({max(vals):.2f})\tnone\t"
+              f"{1 + cm + sum(vals) / len(vals):.2f} ({1 + cx + max(vals):.2f})")
+        one = []
+        for lag in (10_000, 100_000):
+            head = 400_000
+            one.append(f"{lag:,} behind: {cover_entries(s, head, [head - lag]) / k:.2f}")
+        print(f"{k:,}\tcover, one laggard alone\t\t\t{'; '.join(one)}")
 
 
 if __name__ == "__main__":

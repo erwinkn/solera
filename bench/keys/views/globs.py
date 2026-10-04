@@ -25,13 +25,22 @@ import os
 import random
 import re
 
+from solera.patterns import glob_regex
+
 
 def tokens(glob: str):
+    """Solera's glob grammar (`solera.patterns.glob_regex`): `**/` (whole
+    directories or none), `**` (anything, `/` included), `*` and `?` (within a
+    segment), literals."""
+
     out, i = [], 0
     while i < len(glob):
         if glob.startswith("**/", i):
             out.append(("dirs",))
             i += 3
+        elif glob.startswith("**", i):
+            out.append(("any",))
+            i += 2
         elif glob[i] == "*":
             out.append(("star",))
             i += 1
@@ -45,60 +54,30 @@ def tokens(glob: str):
 
 
 def regex(glob: str) -> re.Pattern:
-    parts = []
-    for t in tokens(glob):
-        parts.append({"dirs": "(?:.*/)?", "star": "[^/]*", "one": "[^/]"}.get(t[0]) or re.escape(t[1]))
-    return re.compile("".join(parts), re.S)
+    """Solera's own matcher: the oracle."""
+
+    return re.compile(glob_regex(glob), re.S)
 
 
-def closure(toks, states: set[int]) -> set[int]:
-    """States reachable without consuming: a `*` or `**/` may match nothing."""
+# The automaton: a state is (token index, inside) where `inside` matters only
+# for `dirs`: 1 once it has read part of a directory not yet closed by "/".
+
+
+def closure(toks, states: set) -> set:
+    """States reachable without reading: `*`, `**` and `**/` may match nothing."""
 
     todo, seen = list(states), set(states)
     while todo:
-        s = todo.pop()
-        if s < len(toks) and toks[s][0] in ("star", "dirs") and s + 1 not in seen:
-            seen.add(s + 1)
-            todo.append(s + 1)
+        s, inside = todo.pop()
+        if s < len(toks) and inside == 0 and toks[s][0] in ("star", "any", "dirs") and (s + 1, 0) not in seen:
+            seen.add((s + 1, 0))
+            todo.append((s + 1, 0))
     return seen
 
 
-def alive(toks, prefix: str) -> bool:
-    """Whether some string starting with `prefix` can match: the glob's NFA
-    still has a live state after reading it (every glob can be completed)."""
-
-    # A `dirs` state carries a substate: 0 at a segment start, 1 inside a segment.
-    states = {(s, 0) for s in closure(toks, {0})}
-    for ch in prefix:
-        nxt = set()
-        for s, inside in states:
-            if s >= len(toks):
-                continue
-            kind = toks[s][0]
-            if kind == "lit" and toks[s][1] == ch:
-                nxt.add((s + 1, 0))
-            elif kind == "one" and ch != "/":
-                nxt.add((s + 1, 0))
-            elif kind == "star" and ch != "/":
-                nxt.add((s, 0))
-            elif kind == "dirs":
-                nxt.add((s, 0 if ch == "/" else 1))  # consume a directory's characters
-        states = set()
-        for s, inside in nxt:
-            states.add((s, inside))
-            if inside == 0:
-                for c in closure(toks, {s}):
-                    states.add((c, 0))
-        if not states:
-            return False
-    return True
-
-
 def step(toks, states: set, ch: str) -> set:
-    """The NFA's states after reading `ch` (see `alive`)."""
-
     nxt = set()
-    for s, _inside in states:
+    for s, inside in states:
         if s >= len(toks):
             continue
         kind = toks[s][0]
@@ -106,46 +85,74 @@ def step(toks, states: set, ch: str) -> set:
             nxt.add((s + 1, 0))
         elif kind == "star" and ch != "/":
             nxt.add((s, 0))
-        elif kind == "dirs":
-            nxt.add((s, 0 if ch == "/" else 1))
-    out = set()
-    for s, inside in nxt:
-        out.add((s, inside))
-        if inside == 0:
-            out |= {(c, 0) for c in closure(toks, {s})}
-    return out
+        elif kind == "any":
+            nxt.add((s, 0))
+        elif kind == "dirs":  # (?:.*/)?: any characters, closed by a "/"
+            nxt.add((s, 1))
+            if ch == "/":
+                nxt.add((s, 0))
+    return closure(toks, nxt)
+
+
+def start(toks) -> set:
+    return closure(toks, {(0, 0)})
+
+
+def accepts(toks, states: set) -> bool:
+    return (len(toks), 0) in states
+
+
+def alive(toks, prefix: str) -> bool:
+    """Whether some string starting with `prefix` can match (every live
+    state can be completed)."""
+
+    states = start(toks)
+    for ch in prefix:
+        states = step(toks, states, ch)
+        if not states:
+            return False
+    return True
 
 
 def intersects(toks, lo: str, hi: str | None) -> bool:
     """Whether some match lies in [lo, hi] (hi None: no upper bound): a walk
-    down the keys, tight on either bound, that stops as soon as it is free
-    of both (then any live state can be completed). What a skip-scan reader
-    tests per block from the block index alone."""
+    down the strings between the bounds, tight on either, that accepts a
+    complete match wherever it lies inside both, and stops as soon as it is
+    free of both (any live state can then be completed). What a skip-scan
+    reader tests per block from the block index alone."""
 
     lits = {t[1] for t in toks if t[0] == "lit"} | {"/"}
+    top = 0x10FFFF
 
     def walk(i: int, states: set, tlo: bool, thi: bool) -> bool:
         if not states:
             return False
-        if tlo and i == len(lo):
-            tlo = False  # past lo whatever follows
+        # The string read so far, if it ends here: >= lo unless a proper
+        # prefix of lo; <= hi always (a prefix of hi, or already below it).
+        if accepts(toks, states) and not (tlo and i < len(lo)):
+            return True
+        if tlo and i >= len(lo):
+            tlo = False  # any longer string is past lo
         if not tlo and not thi:
             return True
-        if thi and i == len(hi):
-            return (len(toks), 0) in states  # equal to hi: only the empty continuation
+        if thi and i >= len(hi):
+            return False  # equal to hi: anything longer is past it
         low = ord(lo[i]) if tlo else 0
-        high = ord(hi[i]) if thi else 0x10FFFF
+        high = ord(hi[i]) if thi else top
         cands = {low, high} | {ord(c) for c in lits if low <= ord(c) <= high}
-        other = next((x for x in range(low, min(high, low + 300) + 1) if chr(x) not in lits), None)
-        if other is not None:
-            cands.add(other)
+        # One character strictly inside both bounds that is no literal: it
+        # frees the walk of both bounds at once.
+        inner = next((x for x in range(low + 1, min(high, low + 400)) if chr(x) not in lits), None)
+        if inner is not None:
+            cands.add(inner)
         for x in sorted(cands):
-            if low <= x <= high and walk(i + 1, step(toks, states, chr(x)), tlo and x == low, thi and x == high):
+            if low <= x <= high and walk(
+                i + 1, step(toks, states, chr(x)), tlo and x == low, thi and x == high
+            ):
                 return True
         return False
 
-    start = {(s, 0) for s in closure(toks, {0})}
-    return walk(0, start, True, hi is not None)
+    return walk(0, start(toks), True, hi is not None)
 
 
 def lcp(a: str, b: str) -> str:
