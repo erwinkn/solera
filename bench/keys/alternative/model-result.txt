@@ -1,0 +1,2 @@
+Running as unit: solera-a20-model.scope; invocation ID: 5d87b73982d04158bf1229fcb5420e42
+31706 mapping/lookup checks passed; explicit byte-key, u64, read-ahead and hot-key cases passed

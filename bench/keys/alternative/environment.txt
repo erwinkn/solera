@@ -1,0 +1,11 @@
+Running as unit: solera-a20-verify.scope; invocation ID: 757f8722345f465f86c9c61f7b82541f
+CPUQuotaPerSecUSec=4s
+MemoryMax=8589934592
+Sun Oct  4 08:46:21 UTC 2026
+Linux erwins-bb 6.12.93 #1 SMP Wed Jul 22 19:44:49 UTC 2026 x86_64 x86_64 x86_64 GNU/Linux
+rustc 1.97.1 (8bab26f4f 2026-07-14)
+Python 3.12.3
+c036d59324faf15471ed7c80d85f882c021c77286930d2d5f31a92b8f3d5dd46  bench/keys/alternative/snapshot.rs
+9362cdbd25172378928cb4674faf09501e1978e714931294022a201dd50572c6  bench/keys/alternative/model.py
+b34ee9794256a89280974c34640c3427bc9d083b2a46b310ff2b4b5a46ef66c8  bench/keys/alternative/analyze.py
+31706 mapping/lookup checks passed; explicit byte-key, u64, read-ahead and hot-key cases passed

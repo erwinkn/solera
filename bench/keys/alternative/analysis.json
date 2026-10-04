@@ -1,0 +1,633 @@
+{
+  "history.jsonl": [
+    {
+      "kind": "write",
+      "n": 1000000,
+      "page_rows": 256,
+      "commits": 12000,
+      "batch": 1000,
+      "mode": "history-churn",
+      "copied_rows": 2690042688,
+      "pages": 10508556,
+      "estimated_metadata_bytes": 2268288000,
+      "local_s": 8.890584326999985,
+      "p50_ms": 0.642543,
+      "p95_ms": 1.3536100000000002,
+      "rss_hwm_bytes": 1705492480,
+      "leaf_write_amplification": 224.170224,
+      "estimated_total_raw_amplification": 235.984224
+    },
+    {
+      "kind": "warm",
+      "points": 1000,
+      "local_ms": 0.054909360000000004
+    },
+    {
+      "kind": "retention",
+      "roots": 1,
+      "leaf_pages": 3907,
+      "raw_bytes": 16000000,
+      "estimated_metadata_bytes": 191952,
+      "retained_pack_raw_leaf_bytes": 114689024
+    },
+    {
+      "kind": "retention",
+      "roots": 2,
+      "leaf_pages": 7814,
+      "raw_bytes": 32000000,
+      "estimated_metadata_bytes": 383904,
+      "retained_pack_raw_leaf_bytes": 218573824
+    },
+    {
+      "kind": "retention",
+      "roots": 11,
+      "leaf_pages": 42977,
+      "raw_bytes": 176000000,
+      "estimated_metadata_bytes": 2111472,
+      "retained_pack_raw_leaf_bytes": 1158673408
+    },
+    {
+      "kind": "retention",
+      "roots": 101,
+      "leaf_pages": 394606,
+      "raw_bytes": 1615998976,
+      "estimated_metadata_bytes": 19387152,
+      "retained_pack_raw_leaf_bytes": 10721125376
+    },
+    {
+      "kind": "verification",
+      "status": "passed",
+      "rss_hwm_bytes": 1712291840
+    }
+  ],
+  "remote_estimates": [
+    {
+      "name": "diff_10000_first100k",
+      "latency_s": 0.006,
+      "gap": 1048576,
+      "gets": 45,
+      "raw_bytes": 9125888,
+      "estimated_s": 0.036251776
+    },
+    {
+      "name": "diff_10000_first100k",
+      "latency_s": 0.03,
+      "gap": 1048576,
+      "gets": 45,
+      "raw_bytes": 9125888,
+      "estimated_s": 0.108251776
+    },
+    {
+      "name": "diff_10000_full",
+      "latency_s": 0.006,
+      "gap": 65536,
+      "gets": 435,
+      "raw_bytes": 74201088,
+      "estimated_s": 0.202402176
+    },
+    {
+      "name": "diff_10000_full",
+      "latency_s": 0.03,
+      "gap": 1048576,
+      "gets": 72,
+      "raw_bytes": 144410624,
+      "estimated_s": 0.40882124799999997
+    },
+    {
+      "name": "diff_1000_first100k",
+      "latency_s": 0.006,
+      "gap": 65536,
+      "gets": 80,
+      "raw_bytes": 11767808,
+      "estimated_s": 0.047535616
+    },
+    {
+      "name": "diff_1000_first100k",
+      "latency_s": 0.03,
+      "gap": 1048576,
+      "gets": 46,
+      "raw_bytes": 16781312,
+      "estimated_s": 0.123562624
+    },
+    {
+      "name": "diff_1000_full",
+      "latency_s": 0.006,
+      "gap": 65536,
+      "gets": 417,
+      "raw_bytes": 74811392,
+      "estimated_s": 0.203622784
+    },
+    {
+      "name": "diff_1000_full",
+      "latency_s": 0.03,
+      "gap": 1048576,
+      "gets": 70,
+      "raw_bytes": 144472064,
+      "estimated_s": 0.408944128
+    },
+    {
+      "name": "diff_10_first100k",
+      "latency_s": 0.006,
+      "gap": 65536,
+      "gets": 253,
+      "raw_bytes": 66564096,
+      "estimated_s": 0.169128192
+    },
+    {
+      "name": "diff_10_first100k",
+      "latency_s": 0.03,
+      "gap": 1048576,
+      "gets": 42,
+      "raw_bytes": 105992192,
+      "estimated_s": 0.301984384
+    },
+    {
+      "name": "diff_10_full",
+      "latency_s": 0.006,
+      "gap": 65536,
+      "gets": 253,
+      "raw_bytes": 66564096,
+      "estimated_s": 0.169128192
+    },
+    {
+      "name": "diff_10_full",
+      "latency_s": 0.03,
+      "gap": 1048576,
+      "gets": 42,
+      "raw_bytes": 105992192,
+      "estimated_s": 0.301984384
+    },
+    {
+      "name": "head_points1000",
+      "latency_s": 0.006,
+      "gap": 65536,
+      "gets": 200,
+      "raw_bytes": 17076224,
+      "estimated_s": 0.070152448
+    },
+    {
+      "name": "head_points1000",
+      "latency_s": 0.03,
+      "gap": 1048576,
+      "gets": 29,
+      "raw_bytes": 51437568,
+      "estimated_s": 0.192875136
+    },
+    {
+      "name": "head_scan100k",
+      "latency_s": 0.006,
+      "gap": 65536,
+      "gets": 33,
+      "raw_bytes": 4067328,
+      "estimated_s": 0.026134656000000003
+    },
+    {
+      "name": "head_scan100k",
+      "latency_s": 0.03,
+      "gap": 65536,
+      "gets": 33,
+      "raw_bytes": 4067328,
+      "estimated_s": 0.098134656
+    },
+    {
+      "name": "points_10",
+      "latency_s": 0.006,
+      "gap": 65536,
+      "gets": 179,
+      "raw_bytes": 16658432,
+      "estimated_s": 0.063316864
+    },
+    {
+      "name": "points_10",
+      "latency_s": 0.03,
+      "gap": 65536,
+      "gets": 179,
+      "raw_bytes": 16658432,
+      "estimated_s": 0.183316864
+    },
+    {
+      "name": "points_1000",
+      "latency_s": 0.006,
+      "gap": 65536,
+      "gets": 192,
+      "raw_bytes": 17104896,
+      "estimated_s": 0.064209792
+    },
+    {
+      "name": "points_1000",
+      "latency_s": 0.03,
+      "gap": 65536,
+      "gets": 192,
+      "raw_bytes": 17104896,
+      "estimated_s": 0.18420979199999998
+    },
+    {
+      "name": "points_10000",
+      "latency_s": 0.006,
+      "gap": 65536,
+      "gets": 200,
+      "raw_bytes": 16089088,
+      "estimated_s": 0.06817817600000001
+    },
+    {
+      "name": "points_10000",
+      "latency_s": 0.03,
+      "gap": 1048576,
+      "gets": 29,
+      "raw_bytes": 49037312,
+      "estimated_s": 0.188074624
+    }
+  ],
+  "sweep.jsonl": [
+    {
+      "kind": "write",
+      "n": 1000000,
+      "page_rows": 16,
+      "commits": 1000,
+      "batch": 1000,
+      "mode": "uniform",
+      "copied_rows": 15878800,
+      "pages": 992425,
+      "estimated_metadata_bytes": 2637569664,
+      "local_s": 1.0472959499999992,
+      "p50_ms": 0.941015,
+      "p95_ms": 1.593153,
+      "rss_hwm_bytes": 32972800,
+      "leaf_write_amplification": 15.8788,
+      "estimated_total_raw_amplification": 180.726904
+    },
+    {
+      "kind": "warm",
+      "points": 1000,
+      "local_ms": 0.06613015
+    },
+    {
+      "kind": "verification",
+      "status": "passed",
+      "rss_hwm_bytes": 32972800
+    },
+    {
+      "kind": "write",
+      "n": 1000000,
+      "page_rows": 64,
+      "commits": 1000,
+      "batch": 1000,
+      "mode": "uniform",
+      "copied_rows": 62021504,
+      "pages": 969086,
+      "estimated_metadata_bytes": 755476032,
+      "local_s": 0.6151249650000001,
+      "p50_ms": 0.567159,
+      "p95_ms": 0.965812,
+      "rss_hwm_bytes": 29339648,
+      "leaf_write_amplification": 62.021504,
+      "estimated_total_raw_amplification": 109.238756
+    },
+    {
+      "kind": "warm",
+      "points": 1000,
+      "local_ms": 0.06798926
+    },
+    {
+      "kind": "verification",
+      "status": "passed",
+      "rss_hwm_bytes": 29339648
+    },
+    {
+      "kind": "write",
+      "n": 1000000,
+      "page_rows": 256,
+      "commits": 1000,
+      "batch": 1000,
+      "mode": "uniform",
+      "copied_rows": 226029376,
+      "pages": 882976,
+      "estimated_metadata_bytes": 189024000,
+      "local_s": 0.6230287139999999,
+      "p50_ms": 0.5454159999999999,
+      "p95_ms": 1.011252,
+      "rss_hwm_bytes": 30810112,
+      "leaf_write_amplification": 226.029376,
+      "estimated_total_raw_amplification": 237.843376
+    },
+    {
+      "kind": "warm",
+      "points": 1000,
+      "local_ms": 0.04796773
+    },
+    {
+      "kind": "verification",
+      "status": "passed",
+      "rss_hwm_bytes": 30810112
+    },
+    {
+      "kind": "write",
+      "n": 1000000,
+      "page_rows": 1024,
+      "commits": 1000,
+      "batch": 1000,
+      "mode": "uniform",
+      "copied_rows": 641405184,
+      "pages": 626563,
+      "estimated_metadata_bytes": 47280000,
+      "local_s": 1.0265610860000003,
+      "p50_ms": 0.896397,
+      "p95_ms": 1.5887769999999999,
+      "rss_hwm_bytes": 37605376,
+      "leaf_write_amplification": 641.405184,
+      "estimated_total_raw_amplification": 644.360184
+    },
+    {
+      "kind": "warm",
+      "points": 1000,
+      "local_ms": 0.04114311
+    },
+    {
+      "kind": "verification",
+      "status": "passed",
+      "rss_hwm_bytes": 37605376
+    },
+    {
+      "kind": "write",
+      "n": 1000000,
+      "page_rows": 256,
+      "commits": 256,
+      "batch": 16,
+      "mode": "uniform",
+      "copied_rows": 1046272,
+      "pages": 4087,
+      "estimated_metadata_bytes": 19943280,
+      "local_s": 0.006300421,
+      "p50_ms": 0.01986,
+      "p95_ms": 0.048033,
+      "rss_hwm_bytes": 26763264,
+      "leaf_write_amplification": 255.4375,
+      "estimated_total_raw_amplification": 559.747802734375
+    },
+    {
+      "kind": "warm",
+      "points": 1000,
+      "local_ms": 0.05061064
+    },
+    {
+      "kind": "verification",
+      "status": "passed",
+      "rss_hwm_bytes": 26763264
+    },
+    {
+      "kind": "write",
+      "n": 1000000,
+      "page_rows": 256,
+      "commits": 256,
+      "batch": 100000,
+      "mode": "uniform",
+      "copied_rows": 256000000,
+      "pages": 1000192,
+      "estimated_metadata_bytes": 48390144,
+      "local_s": 2.8970949489999995,
+      "p50_ms": 10.500873,
+      "p95_ms": 15.168470999999998,
+      "rss_hwm_bytes": 48709632,
+      "leaf_write_amplification": 10.0,
+      "estimated_total_raw_amplification": 10.11814
+    },
+    {
+      "kind": "warm",
+      "points": 1000,
+      "local_ms": 0.054046750000000005
+    },
+    {
+      "kind": "verification",
+      "status": "passed",
+      "rss_hwm_bytes": 48709632
+    },
+    {
+      "kind": "write",
+      "n": 1000000,
+      "page_rows": 256,
+      "commits": 1000,
+      "batch": 1000,
+      "mode": "hot",
+      "copied_rows": 228177600,
+      "pages": 891342,
+      "estimated_metadata_bytes": 189024000,
+      "local_s": 0.6210004699999991,
+      "p50_ms": 0.556022,
+      "p95_ms": 0.82552,
+      "rss_hwm_bytes": 30851072,
+      "leaf_write_amplification": 228.1776,
+      "estimated_total_raw_amplification": 239.9916
+    },
+    {
+      "kind": "warm",
+      "points": 1000,
+      "local_ms": 0.04507456
+    },
+    {
+      "kind": "verification",
+      "status": "passed",
+      "rss_hwm_bytes": 30851072
+    },
+    {
+      "kind": "write",
+      "n": 1000000,
+      "page_rows": 64,
+      "commits": 12000,
+      "batch": 1000,
+      "mode": "history",
+      "copied_rows": 744325120,
+      "pages": 11630080,
+      "estimated_metadata_bytes": 9065569056,
+      "local_s": 10.15214209600001,
+      "p50_ms": 0.749675,
+      "p95_ms": 1.244424,
+      "rss_hwm_bytes": 1798336512,
+      "leaf_write_amplification": 62.02709333333333,
+      "estimated_total_raw_amplification": 109.24359883333334
+    },
+    {
+      "kind": "warm",
+      "points": 1000,
+      "local_ms": 0.08990234999999999
+    },
+    {
+      "kind": "retention",
+      "roots": 1,
+      "leaf_pages": 15625,
+      "raw_bytes": 16000000,
+      "estimated_metadata_bytes": 761616,
+      "retained_pack_raw_leaf_bytes": 109189120
+    },
+    {
+      "kind": "retention",
+      "roots": 2,
+      "leaf_pages": 31238,
+      "raw_bytes": 31987712,
+      "estimated_metadata_bytes": 1523232,
+      "retained_pack_raw_leaf_bytes": 212380672
+    },
+    {
+      "kind": "retention",
+      "roots": 11,
+      "leaf_pages": 171657,
+      "raw_bytes": 175776768,
+      "estimated_metadata_bytes": 8377776,
+      "retained_pack_raw_leaf_bytes": 1094799360
+    },
+    {
+      "kind": "retention",
+      "roots": 101,
+      "leaf_pages": 1575531,
+      "raw_bytes": 1613343744,
+      "estimated_metadata_bytes": 76923216,
+      "retained_pack_raw_leaf_bytes": 9940210688
+    },
+    {
+      "kind": "verification",
+      "status": "passed",
+      "rss_hwm_bytes": 1831432192
+    }
+  ],
+  "scale_estimates": [
+    {
+      "n": 1000000,
+      "page_rows": 16,
+      "dirty_pages_per_commit": 992.0503696467166,
+      "leaf_write_amplification": 15.872805914347465,
+      "raw_leaf_bytes_per_commit": 253964.89462955945,
+      "estimated_directory_bytes_per_commit": 2642449.4789141174
+    },
+    {
+      "n": 1000000,
+      "page_rows": 64,
+      "dirty_pages_per_commit": 968.7018997423486,
+      "leaf_write_amplification": 61.99692158351031,
+      "raw_leaf_bytes_per_commit": 991950.745336165,
+      "estimated_directory_bytes_per_commit": 761413.7151580221
+    },
+    {
+      "n": 1000000,
+      "page_rows": 256,
+      "dirty_pages_per_commit": 882.3570398678921,
+      "leaf_write_amplification": 225.8834022061804,
+      "raw_leaf_bytes_per_commit": 3614134.435298886,
+      "estimated_directory_bytes_per_commit": 191951.99999999936
+    },
+    {
+      "n": 1000000,
+      "page_rows": 1024,
+      "dirty_pages_per_commit": 626.0087292806527,
+      "leaf_write_amplification": 641.0329387833883,
+      "raw_leaf_bytes_per_commit": 10256527.020534214,
+      "estimated_directory_bytes_per_commit": 49536.0
+    },
+    {
+      "n": 100000000,
+      "page_rows": 16,
+      "dirty_pages_per_commit": 999.9200842537055,
+      "leaf_write_amplification": 15.998721348059288,
+      "raw_leaf_bytes_per_commit": 255979.5415689486,
+      "estimated_directory_bytes_per_commit": 8277230.6144539295
+    },
+    {
+      "n": 100000000,
+      "page_rows": 64,
+      "dirty_pages_per_commit": 999.6803880511475,
+      "leaf_write_amplification": 63.97954483527344,
+      "raw_leaf_bytes_per_commit": 1023672.717364375,
+      "estimated_directory_bytes_per_commit": 6494191.70312558
+    },
+    {
+      "n": 100000000,
+      "page_rows": 256,
+      "dirty_pages_per_commit": 998.7223682975413,
+      "leaf_write_amplification": 255.67292628417056,
+      "raw_leaf_bytes_per_commit": 4090766.820546729,
+      "estimated_directory_bytes_per_commit": 5388619.837385993
+    },
+    {
+      "n": 100000000,
+      "page_rows": 1024,
+      "dirty_pages_per_commit": 994.9024994920793,
+      "leaf_write_amplification": 1018.7801594798892,
+      "raw_leaf_bytes_per_commit": 16300482.551678227,
+      "estimated_directory_bytes_per_commit": 3462138.725732373
+    }
+  ],
+  "catchup_100m_estimates": [
+    {
+      "behind": 10,
+      "changed_keys": 9999.500066661252,
+      "changed_leaf_fraction": 0.02527513033804562,
+      "two_root_leaf_raw_bytes": 80880417.08174598
+    },
+    {
+      "behind": 1000,
+      "changed_keys": 995016.6300334439,
+      "changed_leaf_fraction": 0.9226955128688911,
+      "two_root_leaf_raw_bytes": 2952625641.1804514
+    },
+    {
+      "behind": 10000,
+      "changed_keys": 9516258.241645914,
+      "changed_leaf_fraction": 0.9999999999923784,
+      "two_root_leaf_raw_bytes": 3199999999.975611
+    }
+  ],
+  "codec_measurements": [
+    {
+      "shape": "even_ids",
+      "payload_bytes": 0,
+      "sample_slots": 32768,
+      "live_rows": 29459,
+      "compressed_bytes": 150808,
+      "compressed_bytes_per_slot": 4.602294921875,
+      "python_encode_s": 0.07058925786986947
+    },
+    {
+      "shape": "even_ids",
+      "payload_bytes": 16,
+      "sample_slots": 32768,
+      "live_rows": 29459,
+      "compressed_bytes": 686950,
+      "compressed_bytes_per_slot": 20.96405029296875,
+      "python_encode_s": 0.0986398858949542
+    },
+    {
+      "shape": "random_ids",
+      "payload_bytes": 0,
+      "sample_slots": 32768,
+      "live_rows": 29459,
+      "compressed_bytes": 252331,
+      "compressed_bytes_per_slot": 7.700531005859375,
+      "python_encode_s": 0.08278813003562391
+    },
+    {
+      "shape": "random_ids",
+      "payload_bytes": 16,
+      "sample_slots": 32768,
+      "live_rows": 29459,
+      "compressed_bytes": 789530,
+      "compressed_bytes_per_slot": 24.09454345703125,
+      "python_encode_s": 0.09390467498451471
+    },
+    {
+      "shape": "uuid_hex",
+      "payload_bytes": 0,
+      "sample_slots": 32768,
+      "live_rows": 29459,
+      "compressed_bytes": 703227,
+      "compressed_bytes_per_slot": 21.460784912109375,
+      "python_encode_s": 0.09359011892229319
+    },
+    {
+      "shape": "uuid_hex",
+      "payload_bytes": 16,
+      "sample_slots": 32768,
+      "live_rows": 29459,
+      "compressed_bytes": 1295590,
+      "compressed_bytes_per_slot": 39.53826904296875,
+      "python_encode_s": 0.09555935091339052
+    }
+  ]
+}
