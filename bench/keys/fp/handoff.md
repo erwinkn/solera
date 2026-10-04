@@ -24,6 +24,24 @@ Branch `design/key-index-fp`. Design: `docs/key-index-from-first-principles.md`.
 3. A 1M-key commit and churn through real merges (flip lists, the graveyard).
 4. Cold lookups at 100M with and without filters held; the warm engine path.
 
+## Phase 2 (D151)
+
+Prototype: `native/src/layers.rs` (blocks, merge, Δ scan with globs, lookups),
+`bench/keys/fp/layers.py` (state, writer, upkeep, readers, lifecycle),
+`viewbench.py --index layers`, `rebase.py`, `test_layers.py`. Commands and
+what is measured or not: the doc's "Phase 2" section.
+
+Choices made in phase 2:
+
+| Choice | Alternative | Why |
+|---|---|---|
+| side parts per layer (keys absent at both ends), from a start bit | the base's graveyard only | readers after a layer and head reads skip temporary keys; churn 3.4x -> 3.1x at 1M, measured |
+| no Bloom filters in the prototype | filters in layer indexes | the harness's readers are cold and would not use them |
+| merges hold inputs in memory | streaming by key range | prototype simplicity; ~1 GB at a 100M base merge |
+| glob filter applied while walking blocks, literal prefilter | build every entry, then match | a 1M-entry non-prefix scan from 0.28 to 0.04 s of CPU |
+
 ## State
 
-No dirty files at the report. No background jobs. Scratch: `~/.solera-t31/` (replay logs before they were copied to `runs/`).
+Branch `design/key-index-fp`, clean and pushed. No background jobs (the 100M
+server build was stopped at Erwin's request). Scratch: `~/.solera-t31/`
+(1M build directories under `vb/`, replay logs).
