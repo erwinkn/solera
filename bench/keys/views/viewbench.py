@@ -71,6 +71,13 @@ PREFIX = "keys/bench/_/"
 MUL, MOD = 2_654_435_761, 10**13
 INV = pow(MUL, -1, MOD)
 CODECS = {"zlib": 1, "zstd": 2}
+# Full scans under a pattern (layers only): a non-prefix pattern with some
+# matches, one with none, and a prefix one (a seek).
+SCANS = {
+    "scan *4242*": (b"*4242*", None),
+    "scan *template*": (b"*template*", None),
+    "scan cust-00042*": (b"cust-00042*", b"cust-00042"),
+}
 
 
 def key(i: int) -> bytes:
@@ -231,7 +238,8 @@ class LayersRead:
     block through the store)."""
 
     def __init__(self, io, state):
-        self.r, self.head = LY.Reader(io, state), state.head
+        side = __import__("os").environ.get("LAYERS_SIDE") == "always"
+        self.r, self.head = LY.Reader(io, state, side_always=side), state.head
 
     async def page(self, after, limit):
         keys, _, _, stamps, _, nxt = await self.r.page(None, after, limit)
@@ -496,8 +504,32 @@ async def read(root: Path, what: str, at: int | None) -> dict:
         else:
             bad += int(np.count_nonzero((then != now) & ~seen))
         out = {"keys": n_got, "mismatches": bad}
-    elif what == "pinned" and layers:  # no snapshot of an old commit, by design
-        return {"what": what, "at": at, "unsupported": True, "keys": 0, "mismatches": 0, "first_s": 0, "wall_s": 0, "gets": 0, "mb_in": 0, "peak_mb": 0}
+    elif what in SCANS:  # layers: a full scan under a pattern, checked against the fold
+        pattern, prefix = SCANS[what]
+        got = await idx.r.scan_all(pattern, prefix=prefix)
+        wall = time.perf_counter() - t
+        m, pk = io.metrics.snapshot(), max(0, peak_bytes() - base) / 1e6  # before the check
+        from solera.patterns import glob_regex
+
+        rx = glob_regex(pattern.decode())
+        live = np.flatnonzero(now)
+        want = 0
+        for lo in range(0, len(live), 10_000_000):  # the fold's matches, vectorized
+            digits = pc.utf8_lpad(pc.cast(pa.array(values(live[lo : lo + 10_000_000])), pa.string()), 13, "0")
+            ks = pc.binary_join_element_wise("cust-", digits, "")
+            want += int(pc.sum(pc.match_substring_regex(ks, "^(?:" + rx + ")$")).as_py() or 0)
+        return {
+            "keys": got["matches"],
+            "mismatches": abs(got["matches"] - want),
+            "slices": got["slices"],
+            "what": what,
+            "at": at,
+            "first_s": wall,
+            "wall_s": wall,
+            "gets": m["gets"],
+            "mb_in": m["bytes_in"] / 1e6,
+            "peak_mb": pk,
+        }
     elif what == "pinned":  # the stalled pass's snapshot: a first page
         then = np.load(root / f"before-{at}.npy")
         if views:
@@ -605,10 +637,14 @@ def main():
     rows = []
     for d, p in sorted(rd["readers"].items(), key=lambda kv: int(kv[0])):
         rows.append(isolated(root, "full" if int(d) in rd["dropped"] else "changes", p) | {"behind": int(d)})
-    if built["scenario"] == "stall" and rd["stall"] is not None:
+    if built["scenario"] == "stall" and rd["stall"] is not None and built["index"] != "layers":
         rows.append(isolated(root, "pinned", rd["stall"]) | {"behind": "stalled pass: its snapshot"})
         rows.append(isolated(root, "changes", rd["stall"]) | {"behind": "stalled pass: catch-up"})
     rows += [isolated(root, w, None) | {"behind": w} for w in ("write", "lookups", "page")]
+    if built["index"] == "layers":
+        if built["scenario"] == "stall" and rd["stall"] is not None:  # no pinned snapshot: its catch-up only
+            rows.append(isolated(root, "changes", rd["stall"]) | {"behind": "stalled pass: catch-up"})
+        rows += [isolated(root, w, None) | {"behind": w} for w in SCANS]
     (root / "reads.json").write_text(json.dumps(rows))
     print(json.dumps({"built": built, "reads": rows}))
 

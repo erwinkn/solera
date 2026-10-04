@@ -191,8 +191,9 @@ class Reader:
     what a reader fetched (indexes, small parts, block windows), as the
     engine does across a run's batches; nothing else."""
 
-    def __init__(self, io, state: State, window: int = 1 << 20, seek_only: bool = False):
+    def __init__(self, io, state: State, window: int = 1 << 20, seek_only: bool = False, side_always: bool = False):
         self.io, self.s = io, state
+        self.side_always = side_always  # read every side part (measures what the split saves)
         self.window = window
         self.seek_only = seek_only  # the engine on its own files: no request costs to weigh
         self._ix: dict[str, Index] = {}
@@ -257,7 +258,8 @@ class Reader:
         for x in reversed(self.s.layers):
             if p is not None and x.b <= p:
                 break
-            parts = [x.main] + ([x.side] if x.side and p is not None and x.a <= p else [])
+            inside = p is not None and (x.a <= p or self.side_always)
+            parts = [x.main] + ([x.side] if x.side and inside else [])
             out.append((x, parts))
         return out
 
@@ -326,6 +328,59 @@ class Reader:
             if upto is None:
                 return keys, bytes(at_p), bytes(at_h), stamps, payloads, None
             after = upto  # short of `limit`: read on (another round trip)
+
+    # -- full scans --------------------------------------------------------------------
+
+    async def scan_all(self, pattern: bytes | None = None, prefix: bytes | None = None, slice_bytes: int = 64 << 20, parallel: int = 4) -> dict:
+        """Δ(−∞, H, everything, pattern): every present key matching, read in
+        key-range slices of about `slice_bytes` of the largest layer, every
+        layer's blocks of a slice fetched in parallel range GETs (16 MB each,
+        64 in flight), `parallel` slices decoded at once (the native scan
+        releases the GIL). A literal `prefix` bounds the key range (a seek).
+        Returns counts; nothing is cached."""
+        over = self._over(None)
+        parts = [x.main for x, _ in over]
+        await self.indexes(parts)
+        lo = prefix
+        hi = None if prefix is None else prefix + b"\xff" * 8
+        big = max((p for p in parts if p.index is not None), key=lambda p: p.size, default=None)
+        bounds: list[bytes | None] = [lo]
+        if big is not None:
+            ix = self._ix[big.index]
+            acc = 0
+            for i in ix.blocks(lo, hi):
+                acc += ix.len[i]
+                if acc >= slice_bytes:
+                    bounds.append(ix.first[i])
+                    acc = 0
+        bounds.append(hi)
+        sem = asyncio.Semaphore(parallel)
+        found = 0
+
+        async def one(after, upto):
+            nonlocal found
+            native_after = None if after is lo else after  # a key equal to the prefix counts
+            async with sem:
+                inputs = []
+                for x, _ in over:
+                    part = x.main
+                    if part.index is None:
+                        inputs.append(([self._whole[f[0]] for f in part.files], x.stamp or 0))
+                        continue
+                    ix = self._ix[part.index]
+                    blocks = list(ix.blocks(after, upto))
+                    chunks = []
+                    for f in sorted({ix.file[i] for i in blocks}):
+                        bs = [i for i in blocks if ix.file[i] == f]
+                        if bs:
+                            start, end = ix.off[bs[0]], ix.off[bs[-1]] + ix.len[bs[-1]]
+                            chunks.append(await self.io.read(part.files[f][0], start, end, part.files[f][1]))
+                    inputs.append((chunks, x.stamp or 0))
+                keys, *_ = await asyncio.to_thread(_native.layers_scan, inputs, None, native_after, upto, 2**62, pattern)
+                found += len(keys)
+
+        await asyncio.gather(*(one(a, b) for a, b in zip(bounds, bounds[1:], strict=False)))
+        return {"matches": found, "slices": len(bounds) - 1}
 
     # -- sorted key lists --------------------------------------------------------------
 

@@ -33,8 +33,6 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::pybacked::PyBackedBytes;
 use pyo3::types::{PyBytes, PyList};
-use std::cmp::Ordering;
-use std::collections::BinaryHeap;
 
 pub const DELTA: u8 = 0;
 pub const LAYER: u8 = 1;
@@ -196,7 +194,14 @@ fn decode_block(format: u8, raw: &[u8], stamp: u64, out: &mut Vec<Entry>) -> Res
     let gmin = if format == LAYER { get_varint(raw, &mut pos)? } else { 0 };
     let mut prev: Vec<u8> = Vec::new();
     for _ in 0..n {
-        let key = get_key(raw, &mut pos, &prev)?;
+        let s = get_varint(raw, &mut pos)? as usize;
+        let l = get_varint(raw, &mut pos)? as usize;
+        if s > prev.len() {
+            return Err("shared prefix past the previous key".into());
+        }
+        prev.truncate(s);
+        prev.extend_from_slice(get_bytes(raw, &mut pos, l)?);
+        let key = prev.clone();
         let f = *raw.get(pos).ok_or("truncated block")?;
         pos += 1;
         let e = if format == DELTA {
@@ -208,7 +213,7 @@ fn decode_block(format: u8, raw: &[u8], stamp: u64, out: &mut Vec<Entry>) -> Res
                 None
             };
             Entry {
-                key: key.clone(),
+                key,
                 present: kind != REMOVED,
                 start: kind != ADDED,
                 stamp,
@@ -232,9 +237,8 @@ fn decode_block(format: u8, raw: &[u8], stamp: u64, out: &mut Vec<Entry>) -> Res
             } else {
                 None
             };
-            Entry { key: key.clone(), present: f & PRESENT != 0, start: f & START != 0, stamp: s, flips, payload }
+            Entry { key, present: f & PRESENT != 0, start: f & START != 0, stamp: s, flips, payload }
         };
-        prev = key;
         out.push(e);
     }
     Ok(())
@@ -478,6 +482,7 @@ pub fn index_decode<'py>(
 /// The entries of one input, in key order: whole blocks back to back, in
 /// one or more chunks; a delta block's entries take `stamp`.
 pub struct Stream<'a> {
+    pattern: Option<&'a Glob>, // only keys matching it are built
     chunks: Vec<&'a [u8]>,
     ci: usize,
     pos: usize,
@@ -488,7 +493,11 @@ pub struct Stream<'a> {
 
 impl<'a> Stream<'a> {
     pub fn new(chunks: Vec<&'a [u8]>, stamp: u64) -> Self {
-        Stream { chunks, ci: 0, pos: 0, stamp, buf: Vec::new(), bi: 0 }
+        Stream { pattern: None, chunks, ci: 0, pos: 0, stamp, buf: Vec::new(), bi: 0 }
+    }
+
+    pub fn filtered(chunks: Vec<&'a [u8]>, stamp: u64, pattern: Option<&'a Glob>) -> Self {
+        Stream { pattern, ..Stream::new(chunks, stamp) }
     }
 
     fn next(&mut self) -> Res<Option<Entry>> {
@@ -514,76 +523,70 @@ impl<'a> Stream<'a> {
             self.pos = next;
             self.buf.clear();
             self.bi = 0;
-            decode_block(format, &raw, self.stamp, &mut self.buf)?;
+            match self.pattern {
+                None => decode_block(format, &raw, self.stamp, &mut self.buf)?,
+                Some(toks) => {
+                    let gmin = if format == LAYER {
+                        let mut p = 0;
+                        get_varint(&raw, &mut p)?;
+                        get_varint(&raw, &mut p)?
+                    } else {
+                        0
+                    };
+                    let (buf, stamp) = (&mut self.buf, self.stamp);
+                    walk_block(format, &raw, |key, at| {
+                        if toks.matches(key) {
+                            buf.push(entry_at(format, &raw, gmin, stamp, key, at)?);
+                        }
+                        Ok(true)
+                    })?;
+                }
+            }
         }
-    }
-}
-
-/// Heap item: the smallest key first, then the input with the lowest rank.
-struct Head {
-    key: Vec<u8>,
-    rank: usize,
-}
-
-impl PartialEq for Head {
-    fn eq(&self, o: &Self) -> bool {
-        self.key == o.key && self.rank == o.rank
-    }
-}
-impl Eq for Head {}
-impl PartialOrd for Head {
-    fn partial_cmp(&self, o: &Self) -> Option<Ordering> {
-        Some(self.cmp(o))
-    }
-}
-impl Ord for Head {
-    fn cmp(&self, o: &Self) -> Ordering {
-        o.key.cmp(&self.key).then(o.rank.cmp(&self.rank))
     }
 }
 
 /// A k-way merge of streams by key: `next_group` returns every stream's
-/// entry for the next key, as (rank, entry), rank ascending.
-struct Merger<'a> {
+/// entry for the next key, as (rank, entry), rank ascending. Inputs are few
+/// (the layers a read spans), so the smallest head is found by a scan.
+pub struct Merger<'a> {
     streams: Vec<Stream<'a>>,
     heads: Vec<Option<Entry>>,
-    heap: BinaryHeap<Head>,
+    ranks: Vec<usize>,
 }
 
 impl<'a> Merger<'a> {
-    fn new(mut streams: Vec<Stream<'a>>) -> Res<Self> {
+    pub fn new(mut streams: Vec<Stream<'a>>) -> Res<Self> {
         let mut heads = Vec::with_capacity(streams.len());
-        let mut heap = BinaryHeap::new();
-        for (rank, s) in streams.iter_mut().enumerate() {
-            let e = s.next()?;
-            if let Some(e) = &e {
-                heap.push(Head { key: e.key.clone(), rank });
-            }
-            heads.push(e);
+        for s in streams.iter_mut() {
+            heads.push(s.next()?);
         }
-        Ok(Merger { streams, heads, heap })
+        Ok(Merger { streams, heads, ranks: Vec::new() })
     }
 
-    fn next_group(&mut self, group: &mut Vec<(usize, Entry)>) -> Res<bool> {
+    pub fn next_group(&mut self, group: &mut Vec<(usize, Entry)>) -> Res<bool> {
         group.clear();
-        let Some(top) = self.heap.pop() else { return Ok(false) };
-        let key = top.key;
-        let mut rank = top.rank;
-        loop {
-            let e = self.heads[rank].take().unwrap();
-            let nxt = self.streams[rank].next()?;
-            if let Some(n) = &nxt {
-                if n.key <= e.key {
-                    return Err("an input is not sorted".into());
-                }
-                self.heap.push(Head { key: n.key.clone(), rank });
+        let mut min: Option<&[u8]> = None;
+        for e in self.heads.iter().flatten() {
+            if min.is_none_or(|m| e.key.as_slice() < m) {
+                min = Some(&e.key);
             }
-            self.heads[rank] = nxt;
-            group.push((rank, e));
-            match self.heap.peek() {
-                Some(h) if h.key == key => rank = self.heap.pop().unwrap().rank,
-                _ => break,
+        }
+        let Some(min) = min else { return Ok(false) };
+        self.ranks.clear();
+        for (r, h) in self.heads.iter().enumerate() {
+            if h.as_ref().is_some_and(|e| e.key.as_slice() == min) {
+                self.ranks.push(r);
             }
+        }
+        for i in 0..self.ranks.len() {
+            let r = self.ranks[i];
+            let nxt = self.streams[r].next()?;
+            let e = std::mem::replace(&mut self.heads[r], nxt).unwrap();
+            if self.heads[r].as_ref().is_some_and(|n| n.key <= e.key) {
+                return Err("an input is not sorted".into());
+            }
+            group.push((r, e));
         }
         Ok(true)
     }
@@ -676,6 +679,142 @@ pub fn layers_merge<'py>(
     ))
 }
 
+// -- globs ---------------------------------------------------------------------------------
+
+/// A glob in Solera's grammar (`solera/patterns.py`): `**/` is any run of
+/// path segments (or none), `**` anything, `*` anything but `/`, `?` one
+/// byte but `/`; everything else literal. Matched over bytes as an NFA.
+#[derive(Clone, Debug)]
+pub enum Tok {
+    Lit(u8),
+    One,
+    Star,
+    DStar,
+    SegStart, // `**/`: skip the group, or enter its loop
+    SegLoop,  // inside `**/`: any byte stays; a `/` may leave
+}
+
+/// A compiled glob: its tokens, and its longest literal run, which every
+/// matching key contains (a quick rejection before the automaton).
+pub struct Glob {
+    toks: Vec<Tok>,
+    need: Vec<u8>,
+}
+
+impl Glob {
+    pub fn new(g: &[u8]) -> Glob {
+        let toks = tokens(g);
+        let (mut best, mut cur): (Vec<u8>, Vec<u8>) = (vec![], vec![]);
+        for t in &toks {
+            match t {
+                Tok::Lit(b) => cur.push(*b),
+                _ => {
+                    if cur.len() > best.len() {
+                        best = std::mem::take(&mut cur);
+                    }
+                    cur.clear();
+                }
+            }
+        }
+        if cur.len() > best.len() {
+            best = cur;
+        }
+        Glob { toks, need: best }
+    }
+
+    pub fn matches(&self, key: &[u8]) -> bool {
+        if let Some(&first) = self.need.first() {
+            let n = self.need.len();
+            let found = key.len() >= n && (0..=key.len() - n).any(|i| key[i] == first && &key[i..i + n] == self.need.as_slice());
+            if !found {
+                return false;
+            }
+        }
+        matches(&self.toks, key)
+    }
+}
+
+fn tokens(g: &[u8]) -> Vec<Tok> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < g.len() {
+        if g[i..].starts_with(b"**/") {
+            out.push(Tok::SegStart);
+            out.push(Tok::SegLoop);
+            i += 3;
+        } else if g[i..].starts_with(b"**") {
+            out.push(Tok::DStar);
+            i += 2;
+        } else if g[i] == b'*' {
+            out.push(Tok::Star);
+            i += 1;
+        } else if g[i] == b'?' {
+            out.push(Tok::One);
+            i += 1;
+        } else {
+            out.push(Tok::Lit(g[i]));
+            i += 1;
+        }
+    }
+    out
+}
+
+pub fn matches(toks: &[Tok], key: &[u8]) -> bool {
+    let n = toks.len();
+    assert!(n < 64, "a glob of at most 63 tokens");
+    let close = |mut v: u64| -> u64 {
+        for (i, t) in toks.iter().enumerate() {
+            if v >> i & 1 == 1 {
+                match t {
+                    Tok::Star | Tok::DStar => v |= 1 << (i + 1),
+                    Tok::SegStart => v |= 0b11 << (i + 1),
+                    _ => {}
+                }
+            }
+        }
+        v
+    };
+    let mut cur = close(1);
+    for &c in key {
+        let mut nxt = 0u64;
+        let mut live = cur;
+        while live != 0 {
+            let i = live.trailing_zeros() as usize;
+            live &= live - 1;
+            if i == n {
+                continue;
+            }
+            match toks[i] {
+                Tok::Lit(b) if b == c => nxt |= 1 << (i + 1),
+                Tok::One if c != b'/' => nxt |= 1 << (i + 1),
+                Tok::Star if c != b'/' => nxt |= 1 << i,
+                Tok::DStar => nxt |= 1 << i,
+                Tok::SegLoop => {
+                    nxt |= 1 << i;
+                    if c == b'/' {
+                        nxt |= 1 << (i + 1);
+                    }
+                }
+                _ => {}
+            }
+        }
+        cur = close(nxt);
+        if cur == 0 {
+            return false;
+        }
+    }
+    cur >> n & 1 == 1
+}
+
+/// One byte per key: whether it matches the glob (for tests against
+/// Solera's own matcher).
+#[pyfunction]
+pub fn glob_match<'py>(py: Python<'py>, pattern: PyBackedBytes, keys: Vec<PyBackedBytes>) -> Bound<'py, PyBytes> {
+    let g = Glob::new(&pattern);
+    let out: Vec<u8> = keys.iter().map(|k| g.matches(k) as u8).collect();
+    PyBytes::new(py, &out)
+}
+
 // -- Δ(P, H) -----------------------------------------------------------------------------
 
 pub struct Row {
@@ -686,15 +825,16 @@ pub struct Row {
     pub payload: Option<Vec<u8>>,
 }
 
-/// Inputs newest first; `g_p` None is P = −∞. Keys in (`after`, `upto`];
-/// stops after `limit` rows and returns the last key it delivered, or None
-/// if it reached `upto` (or the inputs' end).
+/// Inputs newest first; `g_p` None is P = −∞. Keys in (`after`, `upto`],
+/// matching `pattern` if given; stops after `limit` rows and returns the
+/// last key it delivered, or None if it reached `upto` (or the inputs' end).
 pub fn scan(
     inputs: Vec<Stream<'_>>,
     g_p: Option<u64>,
     after: Option<&[u8]>,
     upto: Option<&[u8]>,
     limit: usize,
+    pattern: Option<&Glob>,
     out: &mut Vec<Row>,
 ) -> Res<Option<Vec<u8>>> {
     let mut m = Merger::new(inputs)?;
@@ -707,27 +847,31 @@ pub fn scan(
         if upto.is_some_and(|u| key.as_slice() > u) {
             break;
         }
+        if pattern.is_some_and(|p| !p.matches(key)) {
+            continue;
+        }
         // group is by rank ascending: rank 0 is the newest input.
-        let newer: Vec<&Entry> = group.iter().map(|(_, e)| e).filter(|e| g_p.is_none_or(|g| e.stamp > g)).collect();
-        let Some(newest) = newer.first() else { continue };
-        let at_h = newest.present;
-        let at_p = match g_p {
-            None => false,
-            Some(g) => {
-                let odd = newer.iter().map(|e| e.flips.iter().filter(|&&f| f > g).count()).sum::<usize>() % 2 == 1;
-                at_h ^ odd
+        let mut newest: Option<usize> = None;
+        let mut odd = false;
+        for (j, (_, e)) in group.iter().enumerate() {
+            if g_p.is_some_and(|g| e.stamp <= g) {
+                continue;
             }
-        };
+            if newest.is_none() {
+                newest = Some(j);
+            }
+            if let Some(g) = g_p {
+                odd ^= e.flips.iter().filter(|&&f| f > g).count() % 2 == 1;
+            }
+        }
+        let Some(j) = newest else { continue };
+        let at_h = group[j].1.present;
+        let at_p = g_p.is_some() && (at_h ^ odd);
         if !at_p && !at_h {
             continue;
         }
-        out.push(Row {
-            key: newest.key.clone(),
-            at_p,
-            at_h,
-            stamp: newest.stamp,
-            payload: if at_h { newest.payload.clone() } else { None },
-        });
+        let e = std::mem::replace(&mut group[j].1, Entry { key: vec![], present: false, start: false, stamp: 0, flips: vec![], payload: None });
+        out.push(Row { key: e.key, at_p, at_h, stamp: e.stamp, payload: if at_h { e.payload } else { None } });
         if out.len() >= limit {
             return Ok(Some(out.last().unwrap().key.clone()));
         }
@@ -738,7 +882,7 @@ pub fn scan(
 /// Returns (keys, presence at P, presence at H (one byte each), stamps,
 /// payloads, the last key delivered when `limit` stopped it, else None).
 #[pyfunction]
-#[pyo3(signature = (inputs, g_p, after=None, upto=None, limit=usize::MAX))]
+#[pyo3(signature = (inputs, g_p, after=None, upto=None, limit=usize::MAX, pattern=None))]
 #[allow(clippy::type_complexity)]
 pub fn layers_scan<'py>(
     py: Python<'py>,
@@ -747,10 +891,18 @@ pub fn layers_scan<'py>(
     after: Option<PyBackedBytes>,
     upto: Option<PyBackedBytes>,
     limit: usize,
+    pattern: Option<PyBackedBytes>,
 ) -> PyResult<(Bound<'py, PyList>, Bound<'py, PyBytes>, Bound<'py, PyBytes>, Vec<u64>, Bound<'py, PyList>, Option<Bound<'py, PyBytes>>)> {
     let mut rows = Vec::new();
+    let toks = pattern.as_deref().map(Glob::new);
     let last = py
-        .detach(|| scan(streams(&inputs), g_p, after.as_deref(), upto.as_deref(), limit, &mut rows))
+        .detach(|| {
+            let ss = inputs
+                .iter()
+                .map(|(chunks, stamp)| Stream::filtered(chunks.iter().map(|c| c.as_ref()).collect(), *stamp, toks.as_ref()))
+                .collect();
+            scan(ss, g_p, after.as_deref(), upto.as_deref(), limit, toks.as_ref(), &mut rows)
+        })
         .map_err(err)?;
     let keys = PyList::new(py, rows.iter().map(|r| PyBytes::new(py, &r.key)))?;
     let at_p: Vec<u8> = rows.iter().map(|r| r.at_p as u8).collect();
@@ -927,6 +1079,7 @@ pub fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(layers_merge, m)?)?;
     m.add_function(wrap_pyfunction!(layers_scan, m)?)?;
     m.add_function(wrap_pyfunction!(layers_lookup, m)?)?;
+    m.add_function(wrap_pyfunction!(glob_match, m)?)?;
     Ok(())
 }
 
@@ -966,10 +1119,20 @@ mod tests {
         assert_eq!(s.next().unwrap(), Some(e("a", false, 8, &[8, 5])));
         // Presence of a at P = 6: absent now, one flip after 6: present then.
         let mut rows = vec![];
-        scan(vec![Stream::new(vec![&data], 0), Stream::new(vec![&side], 0)], Some(6), None, None, usize::MAX, &mut rows).unwrap();
+        scan(vec![Stream::new(vec![&data], 0), Stream::new(vec![&side], 0)], Some(6), None, None, usize::MAX, None, &mut rows).unwrap();
         let a = rows.iter().find(|r| r.key == b"a").unwrap();
         assert!(a.at_p && !a.at_h);
         assert!(rows.iter().all(|r| r.key != b"b"));
+    }
+
+    #[test]
+    fn globs_follow_solera_grammar() {
+        let m = |g: &str, k: &str| Glob::new(g.as_bytes()).matches(k.as_bytes());
+        assert!(m("?", "b") && !m("?", "aa") && !m("?", "/"));
+        assert!(m("tenant/**", "tenant/a/y") && m("**", "x/y/z") && !m("tenant/*", "tenant/a/y"));
+        assert!(m("**/archive/**", "a/b/archive/c") && m("**/archive/**", "archive/c") && !m("**/archive/**", "xarchive/c"));
+        assert!(m("*template*", "my-template-1") && !m("*template*", "dir/template") && m("**template*", "dir/template"));
+        assert!(m("*4242*", "cust-0004242000001") && !m("*4242*", "cust-0004240000001"));
     }
 
     #[test]

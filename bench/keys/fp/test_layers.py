@@ -262,3 +262,46 @@ def test_a_failing_merge_stops_after_three_attempts():
         assert successor.s.stopped == [ix._key(ix.s.layers[1:5])]
 
     run(go())
+
+
+def test_globs_match_soleras_matcher():
+    import re
+
+    from solera import _native
+    from solera.patterns import glob_regex
+
+    rng = random.Random(25)
+    alphabet = ["a", "b", "/"]
+    parts = ["a", "b", "/", "*", "?", "**", "**/"]
+    for _ in range(600):
+        g = "".join(rng.choice(parts) for _ in range(rng.randint(1, 5)))
+        keys = sorted({"".join(rng.choice(alphabet) for _ in range(rng.randint(0, 6))) for _ in range(40)})
+        want = [bool(re.fullmatch(glob_regex(g), k)) for k in keys]
+        got = list(_native.glob_match(g.encode(), [k.encode() for k in keys]))
+        assert [bool(x) for x in got] == want, g
+    # A25's cases: a short match between longer bounds, and a terminal **.
+    assert list(_native.glob_match(b"?", [b"aa", b"b", b"ca"])) == [0, 1, 0]
+    assert list(_native.glob_match(b"tenant/**", [b"tenant/a/y"])) == [1]
+
+
+def test_full_scan_with_a_pattern():
+    async def go():
+        rng = random.Random(9)
+        async for ix, fold, c, positions in history(rng, 120, 1):
+            pass
+        now = fold.at(c)
+        r = L.Reader(ix.io, L.State.from_json(ix.s.to_json()))
+        for pat, prefix in ((b"*1*", None), (b"k00*", b"k00"), (b"*template*", None)):
+            want = sum(1 for k in now if _native_match(pat, k))
+            got = await r.scan_all(pat, prefix=prefix, slice_bytes=256)
+            assert got["matches"] == want, (pat, got, want)
+
+    run(go())
+
+
+def _native_match(pat: bytes, key: bytes) -> bool:
+    import re
+
+    from solera.patterns import glob_regex
+
+    return bool(re.fullmatch(glob_regex(pat.decode()), key.decode()))

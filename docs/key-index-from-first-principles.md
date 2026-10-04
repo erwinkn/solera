@@ -200,6 +200,7 @@ files of ≤ 64 MB at key boundaries when large), cut into self-delimiting
 | stamp | the generation of its last change in `[a, b]`: its version at `b` | ~2 B (varint from the block's smallest) |
 | flips | the generations in `[a, b]`, newer than the cut, where it was added or removed | 0 B for most keys; ~2 B each |
 | payload | a source's own version at `b`, if present | as given |
+| start | whether the key existed just before `a` (phase 2) | a bit of the flag byte |
 
 Measured (`bench/keys/fp/codec`, 12-digit ids, each file at its own key
 density): a stamped entry is **8.1 B** at 100M (9.3 B at 1M, 9.3 B with half the
@@ -212,10 +213,22 @@ entries with the commit's generation (from the commit record) as every
 stamp: added → present, flip c; updated → present; removed → absent, flip c.
 Nothing is rewritten at commit.
 
-**The base** is the oldest layer, `[0, w]`. Its absent entries shadow nothing
-(nothing is older), so they live in a separate file, the **graveyard**,
-which only catch-ups read. Lookups and full scans read the base's live
-file alone.
+**Main and side parts.** A layer's entries live in two parts. The **main**
+part holds what head reads and readers after the layer need. The **side**
+part holds what only a reader whose P falls inside the layer needs:
+
+- in **the base** (the oldest layer, `[0, w]`), every absent key: nothing is
+  older, so its tombstones shadow nothing (the base's side part is its
+  **graveyard**);
+- in every other layer, keys **absent at both ends**: added and removed
+  inside it (under churn, most temporary keys). Phase 2 added this: an
+  entry's start bit says whether the key existed before the layer.
+
+Why a reader whose P is before a layer can skip that layer's side part: all
+of the layer's flips are then after P and after the cut (none was dropped), so
+a key absent at both ends flipped an even number of times there and changes
+nothing at P or at H; and it shadows nothing, since it did not exist before
+the layer. Head reads (P = −∞) skip every side part.
 
 **The layer index** is a small object written beside each layer larger than one
 block: per block, its first key, offset, length, and its newest stamp; and,
@@ -249,8 +262,8 @@ the batch keeps reading its own.
 ### Reading Δ(P, H, keys)
 
 Over the manifest pinned at H, take the layers that end after P (for
-P = −∞: all of them, the base's live file without its graveyard; for a P
-inside the base, its graveyard too). Merge them by key. For each key:
+P = −∞: all of them, main parts only; otherwise main parts, plus the side
+part of the one layer P falls inside). Merge them by key. For each key:
 
 ```
 entries  = its entries in those layers, newest layer first, keeping only stamps > g(P)
@@ -310,7 +323,7 @@ layer  [1, 5]   a ● g30 {2,3}  b ● g30 {}  c ● g40 {1}  d ○ g50 {4,5}
   for the first 2 after `b`: `c`, `d` (added at 6).
 - **The cut reaches 3.** The next merge of the base with `[1, 5]` drops flips
   at or below 3: `a ● g30`, `b ● g30`, `c ● g40`, and `d ○ g50 {4, 5}` kept in
-  the graveyard: a reader observed at 4 must still learn "removed". Once the
+  the base's side part: a reader observed at 4 must still learn "removed". Once the
   cut passes 5, `d` goes.
 
 Had the merge kept only presence at its ends (two views' before/after), Y,
@@ -733,7 +746,7 @@ Read on this:
   6.5–8.5× and replayed 5.8–9.2×, but stored 55–293 MB at 1M against 15 MB
   here (cited).
 - **Storage stays near the index's own size**: 1.5 entries per live key at
-  the head at 1M, 1.2 at 100M, plus the graveyard.
+  the head at 1M, 1.2 at 100M, plus side parts.
 - **Cold writers at 100M are the expensive case**, as in every design
   (cited: spans $91, two views $114 a month on S3 with a cold writer at
   100M): ~1K GETs per commit, one per key, since random keys share no block
@@ -811,7 +824,7 @@ A17's findings against spans as built, and A25's against two views:
 | A25 R3: read-ahead newer than a pass's end | cannot arise: no pass; a batch reads at its own head |
 | A25 R4: names reused across lives | names carry the life, the epoch and a unique id |
 | A25 R5: unbounded retention under a stalled reader | the window bounds the cut's lag; a stalled reader is folded |
-| A25 R7, R8: layer counts and storage sampled with bias | replayed at every 97th head over the second half of each trace, all tiers counted; storage includes the graveyard |
+| A25 R7, R8: layer counts and storage sampled with bias | replayed at every 97th head over the second half of each trace, all tiers counted; storage includes side parts |
 
 ## Settled, and open
 
