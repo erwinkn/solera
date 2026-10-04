@@ -266,6 +266,7 @@ record of what the count holds: `added` is never a key it holds,
 | A19 R5, A26 N4, F38: served rows | observations come from the row; classes follow them before the callback |
 | A19 R7, F37: shared inputs | context per layer; scanned when it moves |
 | A19 R9, R10, F35: staleness | one comparison, exact or pending; `each` chains intersect key by key |
+| F41: a position past a removal it never delivered (`items` over a current-only `feed` going `{…, k11}` → `{k11}` → `{k1, k3}`: read through commit 2, still holding `k11`, fresh) | nothing moves past an observation: `k11` stays in `S` as served until a batch delivers its removal, and the next comparison classes it from that decoded state against upstream now — an owed removal |
 | A26 N1: the pass's rows | the scan plan holds its pin from its start |
 | A26 N5: the cap | there is none: overrides spill |
 | A27 R3, R4, R8, R9 | normalised patterns; candidates classed once; disjoint overwrite and decode-equal fold; per-range changes |
@@ -304,7 +305,8 @@ pattern changes (first include, prefixless globs) and definition and
 shared-input changes, replans, takeovers, renames — and after **every
 commit** checks that `E` decodes to the dict, and that staleness and a
 default run's load equal the dict's comparison with the upstream. The
-A19, A26 and A27 histories are named examples. Before relying on the
+A19, A26 and A27 histories are named examples, and so is F41 (W38's
+replay in `tests/sim/test_replays.py`, a strict xfail in the old model). Before relying on the
 bounds: measure a large spill and a pattern change at 100M.
 
 ## What gets harder
