@@ -141,6 +141,21 @@ In words: between two boundaries, a contiguous run of spans tiles
 boundary born at head + 1 never cuts a span" is the birth case of the
 invariant.
 
+**The "versions" policy** (`bench/keys/spans.py` at 9e8183d), where a
+merge may cross a live endpoint. There a physical span is a list of
+segments, split at the endpoints live when it was written. Each segment
+holds, per key, the newest version in it and the state before it, which is
+this model's per-key merge. A merge concatenates its inputs' segments, and
+coalesces two adjacent ones only once the endpoint between them has
+retired. So one physical merge is a set of this model's merges, one per
+stretch between live endpoints, plus a regrouping of segments into files
+that changes no contents. The span starting at commit 0, live keys only
+before its first inner endpoint, is this model's base merge. Results 2–4
+therefore hold for "versions" with "span" read as "segment". The grouping
+into files affects only cost, which result 1 covers, including merges that
+shrink. One thing the Rust must then check: a reader at `P` reads exactly
+the segments starting at or after `P`, from whichever files hold them.
+
 ## 3. The read-ahead rule
 
 **The model** (`Keys.lean`), per key. A span's entry is `{gen, del, pred}`.
@@ -229,7 +244,9 @@ result.
    and again when installing. Bound the attempts per merge, and don't let
    abandoned merges write without limit. Result 1 depends on it.
 3. **Boundaries.** Born only at head + 1, and an attempt's reservation is
-   taken at its claim. Installing a merge asserts that no live boundary
+   taken at its claim. Under "versions", every endpoint live when a span is
+   written starts a segment in it, and coalescing happens only across
+   retired endpoints. Installing a merge asserts that no live boundary
    starts any input but the first. A base merge asserts that none starts any
    of its inputs. Results 2–4 depend on it.
 4. **Generations.** Strictly increasing with commit number, and every entry
