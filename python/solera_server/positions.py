@@ -18,6 +18,7 @@ Each (asset, input, partition) keeps a **position**:
         "reconcile": bool,          # a full per-key pass owes a reconcile after (§11)
         "began": int,               # a full pass: the claim generation that started it
       },
+      "began": int,                 # the last full pass's start, kept after it ends (d)
       "patterns": ...,              # keys: the patterns it delivers under (per-key §11)
       "pattern_change": {"old", "new", "at", "snapshot", "pin"},
       "reconcile": {"after": key},  # a per-key output's cleanup after a full pass

@@ -377,7 +377,9 @@ async def test_keys_runs_after_an_upstream_reset_merge_and_together_catch_up(sta
 
 async def test_a_reset_output_holds_only_what_keys_runs_wrote_until_a_default_run(state, tmp_path):
     """R6: `checks` itself reset (moved) starts empty; keys=(k1) leaves k1
-    alone in it, stale keys {k2, k3} (missing); a default run converges."""
+    alone in it; a default run converges. Stale keys {k2, k3} (missing),
+    and k1 too under (d): a reset record says no knob version until a pass
+    completes (the coordinator's ruling 2, an accepted over-report)."""
 
     engine, outside = await _built(state, tmp_path, {"k1": "1", "k2": "1", "k3": "1"})
     await engine.stop()
@@ -386,7 +388,8 @@ async def test_a_reset_output_holds_only_what_keys_runs_wrote_until_a_default_ru
     await engine.initialize()
     await drive(engine, await engine.submit(["checks"], keys={"items": {"keys": ["k1"]}}))
     assert set(await keyed_content(engine, p, "checks", column=None)) == {"k1"}
-    assert await staleness.stale_keys(engine, "checks") == {"k2", "k3"}
+    want = {"k2", "k3"} if staleness.DEP_RESETS else {"k1", "k2", "k3"}
+    assert await staleness.stale_keys(engine, "checks") == want
     await drive(engine, await engine.submit(["checks"]))
     assert set(await keyed_content(engine, p, "checks", column=None)) == {"k1", "k2", "k3"}
     assert not await staleness.partition_stale(engine, "checks")
@@ -1016,3 +1019,23 @@ def test_a_keys_run_makes_each_named_key_match_its_upstream(kind, tmp_path):
             assert content.get(k) == feed.get(k), f"{k}, named: {content.get(k)}, its upstream {feed.get(k)}"
 
     check()
+
+
+async def test_a_dep_change_is_an_input_change_and_a_full_pass(state, tmp_path):
+    """Semantic change (d): `knob` (a dep of `checks`) moves. That is an
+    input change, not a definition change: the reason says so and the
+    position's fingerprint (the declaration and run config) stays. The next
+    default run is a full pass all the same: it rewrites every key, and
+    `checks` is fresh after."""
+
+    engine, outside = await _built(state, tmp_path, {"k1": "1", "k2": "1"})
+    fingerprint = state.model.position("checks", "item", "")["fingerprint"]
+    written = {k: g for k, (g, _) in (await index_entries(state, "checks", "")).items()}
+    await engine.commit_source("knob", version="1")
+    assert await staleness.stale_reasons(engine, "checks") == {staleness.INPUT}
+    assert await staleness.stale_keys(engine, "checks") == {"k1", "k2"}
+    await drive(engine, await engine.submit(["checks"]))
+    assert state.model.position("checks", "item", "")["fingerprint"] == fingerprint
+    after = {k: g for k, (g, _) in (await index_entries(state, "checks", "")).items()}
+    assert all(after[k] > written[k] for k in written), "every key reprocessed"
+    assert not await staleness.partition_stale(engine, "checks")

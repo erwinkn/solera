@@ -519,10 +519,13 @@ head at all). *Example:* `copy` after its version bump: definition
 changed, until a run delivers every key under the new definition.
 
 **fingerprint**. The digest of what an asset's incremental reads depend
-on: its version, its stores' versions, its outputs' migrations, the run's
-config, and the versions of its whole inputs and deps. When it changes,
-every incremental input reads its upstream in a full pass. *Was:*
-interpretation fingerprint.
+on: its version, its stores' versions, its outputs' migrations and the
+run's config — the declaration and the configuration, nothing of its
+inputs. When it changes, every incremental input reads its upstream in a
+full pass. A whole input or dep that moves is an input change: the
+partition record's versions (`seen`) make a full pass due instead.
+*Was:* interpretation fingerprint; it held its whole inputs' and deps'
+versions until semantic change (d).
 
 **pattern change**. What happens when an input's patterns change: commits
 up to the change finish under the old patterns, then a diff pass adds and

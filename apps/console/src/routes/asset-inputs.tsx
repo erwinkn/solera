@@ -18,7 +18,7 @@ const KIND: Record<Input["kind"], { name: string; means: string }> = {
   in: {
     name: "In",
     means:
-      "The whole value at its pinned head, or, over upstream dimensions this asset lacks, a dict of every committed partition across them. A new version of it changes the fingerprint, which resets this asset's incremental inputs.",
+      "The whole value at its pinned head, or, over upstream dimensions this asset lacks, a dict of every committed partition across them. A new version of it is an input change: this asset's incremental inputs owe a full pass.",
   },
   incremental: {
     name: "Incremental",
@@ -35,7 +35,7 @@ const KIND: Record<Input["kind"], { name: string; means: string }> = {
   },
   dep: {
     name: "dep",
-    means: "Pinned in lineage and the fingerprint, watched by OnChange(), never loaded.",
+    means: "Pinned in lineage, caught up to as a whole input is, watched by OnChange(), never loaded.",
   },
 };
 

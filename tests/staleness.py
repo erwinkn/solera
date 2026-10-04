@@ -70,7 +70,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 
 NET = False  # the engine counts the net delta (K44's range scan, on hold): until then the machine models it as built
-DEP_RESETS = True  # knob staleness per key; (d) keeps it per partition: W22 sets False
+DEP_RESETS = False  # knob staleness per partition while a full pass is due (semantic change d); True: per key
 LANDED = False  # every piece of K43–K46 built: True also shrinks their failures
 
 

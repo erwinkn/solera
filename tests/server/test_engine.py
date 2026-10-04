@@ -275,11 +275,17 @@ async def test_full_run_resets_position(state):
         "output": "files",
         "upstream_partition": "",
         "reset_by": first["reset_by"],  # the run whose reset began the pass
+        "began": first["began"],  # when its last full pass began, kept after it ends
     }
     detail = await drive(engine, await engine.submit(["consumer"], mode="full"))
     assert task_statuses(detail)["consumer"] == "succeeded"  # never skipped on full
     second = state.model.position("consumer", "files", "")
-    assert second == {**first, "reset_by": detail["request"]["id"]}  # back at head+1, nothing left mid-way
+    assert second == {
+        **first,
+        "reset_by": detail["request"]["id"],
+        "began": second["began"],
+    }  # back at head+1
+    assert second["began"] > first["began"], "the full run began a pass of its own"
     # Both passes were full-head reads.
     assert seen == [(["a", "b"], True), (["a", "b"], True)]
 

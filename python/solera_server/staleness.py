@@ -17,6 +17,7 @@ A key of a keyed output that is not `each` shares its partition's answer.
 from __future__ import annotations
 
 import logging
+import math
 
 from solera.keys.index import KeyIndex, key_bytes, key_str
 from solera.patterns import Matcher
@@ -86,6 +87,8 @@ class Staleness:
             return True
         definition = self.definition_changed(asset, partition)
         seen = record.get("seen")
+        if seen is None and any(self._versioned(i) for i in inputs):
+            return True  # never caught up: which whole and dep versions it saw, no record says
         each = self._each_input(asset)
         for input in inputs:
             if input.kind == "incremental":
@@ -309,6 +312,9 @@ class Staleness:
         shared_moved = seen is not None and any(
             seen.get(i.param) != self._input_version(planner, i) for i in inputs if self._versioned(i)
         )
+        # Never caught up (a reset, or keys= runs only): no record says which whole and dep
+        # versions its keys saw, so every key is behind them until a pass completes.
+        unknown = seen is None and any(self._versioned(i) for i in inputs)
         under_way = (position or {}).get("pass") or {}
         changed = int(self.m.changed_at.get(asset, 0))
         since_change = int(under_way.get("began") or 0) >= changed  # a pass under the definition as it is
@@ -325,20 +331,23 @@ class Staleness:
             position is None or under_way.get("mode") == "full"
         )
         passing = under_way.get("mode") == "full" and (not input_only or "caught_up_at" not in record)
-        full = position is None or passing or definition or shared_moved or reset
+        full = position is None or passing or definition or shared_moved or reset or unknown
         # An entry counts if it read every whole and dep input as it is, and, with a full
         # pass due, it was claimed since the pass became due.
         due = [self._committed(planner, i) for i in inputs if self._versioned(i)]
         due += [changed] if full and definition else []
         due += [int(record["input_reset_at"])] if full and reset else []
-        since = max(due, default=0)
+        # Behind its whole and dep inputs, every key is stale until the full pass completes:
+        # the record keeps one version of them per partition, not per key (semantic change d).
+        knob = shared_moved or unknown
+        since = math.inf if knob else max(due, default=0)
         read = (
             (await self._read_ahead_of(asset, param, position["ahead"], since))
             if (position or {}).get("ahead")
             else {}
         )
         # A pass begun before its definition changed delivered under the old one.
-        walking = under_way.get("mode") == "full" and (not definition or since_change)
+        walking = under_way.get("mode") == "full" and (not definition or since_change) and not knob
         walked_at = under_way.get("at") if walking else None
         walked_gen = int(under_way.get("read_from") or 0)
         keys: set[str] = set()

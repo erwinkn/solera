@@ -88,6 +88,18 @@ def _batches(keys: int, limit: int) -> int:
     return max(1, -(-int(keys) // max(1, int(limit))))
 
 
+def _dep_restart(position: dict | None, moved_at: int | None) -> bool:
+    """Whether a whole or dep input that moved past the partition's `seen`
+    (at event `moved_at`) makes this input start a full pass over: unless
+    one began since the move (`began`, kept on the position after the pass
+    ends) — under way, it continues; done, what is left (a per-key
+    reconcile) finishes it."""
+
+    if moved_at is None or position is None:
+        return False
+    return int(position.get("began") or 0) < moved_at
+
+
 class Engine(Attempts, Sensors, Staleness, Views):
     Conflict = Conflict
     GRACE_SECONDS = GRACE_SECONDS
@@ -792,8 +804,8 @@ class Engine(Attempts, Sensors, Staleness, Views):
             inputs = planner.inputs(task["asset"], partition)
         except planning.UpstreamOnly as error:
             raise Conflict(str(error)) from None
-        # Pass 1: pin every non-Incremental input; their refs enter the fingerprint (§6).
-        pins, pinned = {}, {}
+        # Pass 1: pin every non-Incremental input.
+        pins = {}
         incremental = []
         for input in inputs:
             param, output = input.param, input.output
@@ -806,7 +818,6 @@ class Engine(Attempts, Sensors, Staleness, Views):
                 )
                 if any(i is not None for i in indexes.values()):
                     pins[param]["indexes"] = {k: i for k, i in indexes.items() if i is not None}
-                pinned[param] = {k: self._logical(output, r) for k, r in refs.items()}
             elif input.kind == "dep":
                 # Across upstream-only dimensions, a dep pins the heads that exist and
                 # agree with this partition's keys; otherwise its one projected head (§7).
@@ -815,18 +826,22 @@ class Engine(Attempts, Sensors, Staleness, Views):
                 else:
                     refs = {input.partition: self._pin_at(output, input.partition)}
                 pins[param] = {"refs": refs}
-                # A bound dynamic partitions pins into lineage, but it is the dimension — not
-                # interpretation: adding a key must not invalidate existing ones.
-                if not input.set_dim:
-                    pinned[param] = {k: self._logical(output, r) for k, r in refs.items()}
             elif input.kind == "incremental":
                 incremental.append(input)
             else:
                 pins[param] = {"ref": self._pin_at(output, input.partition), "load": load}
                 if load == "data" and (index := self._whole_index(output, pins[param]["ref"])) is not None:
                     pins[param]["index"] = index
-                pinned[param] = self._logical(output, pins[param]["ref"])
-        fingerprint = self._fingerprint(asset, run, pinned)
+        fingerprint = self._fingerprint(asset, run)
+        # The whole and dep inputs as pinned now, against those the partition last caught
+        # up to: one moved since makes a full pass due (semantic change d), from its commit.
+        seen = {i.param: self._input_version(planner, i) for i in inputs if self._versioned(i)}
+        recorded = self.m.partition(task["asset"], partition).get("seen")
+        moved_at = (
+            max(self._committed(planner, i) for i in inputs if self._versioned(i))
+            if recorded is not None and recorded != seen
+            else None
+        )
         if full and run["mode"] == "full" and incremental:
             # This run's reset began the pass every input is on: resume it, batch by batch.
             started = [
@@ -852,6 +867,7 @@ class Engine(Attempts, Sensors, Staleness, Views):
                 full,
                 (claim or {}).get("generation"),
                 (ahead or {}).get(param),
+                moved_at,
             )
             if plan["kind"] == "selection":  # its read-ahead entry names the attempt's spec
                 plan.update(run=run["id"], attempt=attempt)
@@ -927,7 +943,7 @@ class Engine(Attempts, Sensors, Staleness, Views):
             "deploy_number": self.m.deploy_number,
             # The version of each whole or dep input read: a catch-up records it, and a
             # partition whose inputs moved since is stale (docs/positions-from-reads.md).
-            "seen": {i.param: self._input_version(planner, i) for i in inputs if self._versioned(i)},
+            "seen": seen,
             "declaration": digest(self._declaration(asset)),
             "prefixes": self._prefixes(pins, outputs, task),
             "inputs": pins,
@@ -1060,7 +1076,18 @@ class Engine(Attempts, Sensors, Staleness, Views):
         return {input.key(s): h["ref"] for s, h in planner.fan_in(input, materialized=True).items()}
 
     def _selection(
-        self, task, input, ref, upstream_partition, fingerprint, run, position, override, ahead, began
+        self,
+        task,
+        input,
+        ref,
+        upstream_partition,
+        fingerprint,
+        run,
+        position,
+        override,
+        ahead,
+        began,
+        moved_at,
     ):
         """A keys= selection of a keyed incremental input (K43, K45): the pin
         for the spec, the plan its commit `advance`s by, and whether it has
@@ -1092,6 +1119,7 @@ class Engine(Attempts, Sensors, Staleness, Views):
         fresh = (
             position is not None
             and position.get("fingerprint") == fingerprint
+            and not _dep_restart(position, moved_at)
             and (
                 position.get("next") is None
                 or int(position["next"]) > head_commit
@@ -1124,6 +1152,7 @@ class Engine(Attempts, Sensors, Staleness, Views):
                 "reset_by": run["id"],
                 "next": int(position["next"]) if position is not None else head_commit + 1,
                 "pass": {"mode": "full", "from": head_commit + 1, "at": None, "batch": 0, "began": began},
+                "began": began,  # the last full pass's start, kept after it ends
             }
             if (position or {}).get("ahead"):  # kept: what keys were read, if under another definition
                 base["ahead"] = position["ahead"]
@@ -1160,6 +1189,7 @@ class Engine(Attempts, Sensors, Staleness, Views):
         full,
         claim_generation=None,
         ahead=None,
+        moved_at=None,
     ):
         """Plan one Incremental input's batch from its position (`pass`):
         returns the pin for the spec, the plan its commit `advance`s the
@@ -1194,7 +1224,17 @@ class Engine(Attempts, Sensors, Staleness, Views):
         began = claim_generation if claim_generation is not None else self.m.event_counter
         if isinstance(override, dict) and "keys" in override:
             return self._selection(
-                task, input, ref, upstream_partition, fingerprint, run, position, override, ahead, began
+                task,
+                input,
+                ref,
+                upstream_partition,
+                fingerprint,
+                run,
+                position,
+                override,
+                ahead,
+                began,
+                moved_at,
             )
         first = int(head.get("base", 0))
         # A `full` run or a keys="full" override starts one pass per run, which the
@@ -1203,7 +1243,13 @@ class Engine(Attempts, Sensors, Staleness, Views):
         # past a pass's start, or at or past `next`: a reset always lands past the
         # commits that existed) is delivered again in full.
         again = override == "full" and (position or {}).get("reset_by") != run["id"]
-        reset = full or position is None or position.get("fingerprint") != fingerprint or again
+        reset = (
+            full
+            or position is None
+            or position.get("fingerprint") != fingerprint
+            or again
+            or _dep_restart(position, moved_at)
+        )
         if not reset and not keyed:
             under_way = position.get("pass")
             reset = int(under_way["from"]) < first if under_way else int(position["next"]) <= first
@@ -1214,6 +1260,10 @@ class Engine(Attempts, Sensors, Staleness, Views):
             "fingerprint": fingerprint,
             "reset_by": run["id"] if reset else position.get("reset_by"),
         }
+        if reset:  # a full pass begins: when, kept after it ends (semantic change d)
+            carried["began"] = began
+        elif position.get("began") is not None:
+            carried["began"] = position["began"]
         if position is not None and position.get("ahead"):  # a start-over keeps them too, before `began`
             carried["ahead"] = position["ahead"]
         current = None if reset else position.get("pass")
@@ -1555,24 +1605,18 @@ class Engine(Attempts, Sensors, Staleness, Views):
         floor = self.m.pin_floor(but=attempt, path=self.m.index(output, partition).prefix)
         return [e for e in entries if e["n"] <= floor and not e.get("stuck")][:DISCARDS]
 
-    @staticmethod
-    def _logical(output: str, ref: dict) -> list:
-        """A pinned input as interpretation sees it: which output, which
-        partition, which version — the generation that wrote it — never where
-        its objects are."""
+    def _fingerprint(self, asset, run):
+        """H(the declaration — version, the store version of each output it
+        writes and reads, migrations — and the run's config): the
+        interpretation its positions were delivered under; a change resets
+        them (§2.2, §6). Not its inputs' versions: a whole or dep input that
+        moves is an input change, which makes a full pass due through the
+        partition record's `seen` (semantic change d). Neither which store
+        holds an output nor its name is in it, only the versions: a move
+        resets the output, and every position that reads it or is its
+        asset's (`Model._reset`); a rename keeps everything."""
 
-        return [output, ref.get("partition") or "", ref.get("generation")]
-
-    def _fingerprint(self, asset, run, pinned):
-        """H(version, the store version of each output it writes and reads,
-        run config, the non-Incremental inputs and deps, as `_logical` sees
-        them) — per-key interpretation state; a change resets the input's
-        position (§2.2, §6). Neither which store holds an output nor its name
-        is in it, only the versions: a move resets the output, and every
-        position that reads it or is its asset's (`Model._reset`); a rename
-        keeps everything."""
-
-        return digest({**self._declaration(asset), "config": run.get("config") or {}, "refs": pinned})
+        return digest({**self._declaration(asset), "config": run.get("config") or {}})
 
     def _declaration(self, asset: dict) -> dict:
         """What of an asset's declaration its outputs are built under: its

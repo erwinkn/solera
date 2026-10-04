@@ -380,8 +380,8 @@ continues, for keyed and unkeyed upstreams, delta passes and full passes
 alike. A consumer that rebuilds starts over when `full and first` —
 never on `full` alone, or each batch would erase the ones before it.
 
-**`deps=`** are unbound inputs: planned, pinned into lineage, part of the
-fingerprint (§6), watched by `OnChange()`, bound to no
+**`deps=`** are unbound inputs: planned, pinned into lineage, caught up
+to as a whole input is (§6), watched by `OnChange()`, bound to no
 parameter. An entry is an output's name, or `In(output,
 all_partitions=True)` to depend on every partition of it, the shared
 dimensions too; nothing else of an `In` means anything on a dep, which is
@@ -479,15 +479,23 @@ write none of them, and the partition is complete all the same. A partition is
 a job, once a run of it succeeded. Selection (`"missing"`), a whole fan-in
 and the console all ask that one question.
 
-The **fingerprint** `H(version, store versions of the
-asset's input and output stores, migration names of the asset's outputs,
-run config, and the non-incremental inputs and deps as output, partition and
-generation)` is stored on the position. A whole input written again, even
-with the same content, is a new generation, so it resets the input
-(`versions.md` §7). A fingerprint mismatch — a `version` bump, a new
-migration, or a change to any whole input — forces `full=True` on the input: the pass
+The **fingerprint** `H(version, store versions of the asset's input and
+output stores, migration names of the asset's outputs, run config)` — the
+declaration and the run's configuration, nothing of the inputs — is
+stored on the position. A fingerprint mismatch — a `version` bump, a new
+migration, another run config — forces `full=True` on the input: the pass
 resets to the whole head. Code changes alone do not: the build identity
 (§11) bumps the deploy, not the fingerprint.
+
+A whole input or a dep that moves is an **input change**, not a
+definition change (semantic change d): the partition record keeps the
+versions it last caught up to (`seen`), and one that moved since makes a
+full pass due — the next default run reprocesses every key under the new
+version, as a fingerprint change does, and `keys=` runs continue that
+pass. Until it completes, every key is stale: the record keeps one
+version of each input per partition, not per key. A whole input written
+again, even with the same content, is a new generation, so it does the
+same (`versions.md` §7).
 
 A head written before the output was incremental has no delta log: "no keys
 known"; the consumer's position starts empty and the next write upserts

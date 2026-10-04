@@ -231,7 +231,7 @@ lineage:  B ← A, generation 12                    (g12 committed)
 | Case | What happens | Holds |
 |---|---|---|
 | A rewrites `k` while B reads it | Immutable: B reads the pinned object, then `k` again with A's delta. Fenced: B may read A's new rows and records generation 12; A's commit, or the repair of its dead attempt, puts `k` in a delta B receives later, and B rereads | yes |
-| Identical rewrites | Every key rewritten is a change; consumers reprocess. A whole input rewritten identically changes its ref's generation, so it resets its consumers' incremental inputs (the fingerprint holds input refs): a full redelivery | accepted |
+| Identical rewrites | Every key rewritten is a change; consumers reprocess. A whole input rewritten identically changes its ref's generation: an input change, so its consumers owe a full pass (the partition record's `seen`): a full redelivery | accepted |
 | `version=` bump | The fingerprint changes, the asset's inputs reset, every key is reprocessed and written at a new generation, so consumers reprocess too. (Revision outputs used to hide this; they are gone.) A cursor producer with no inputs reprocesses nothing, as today | yes |
 | Deploys | The deploy number moves; only failed per-key incremental keys get their one try, and those that succeed are written at a new generation | yes |
 | Retries | A new attempt has a new generation; an uncommitted attempt's delta files and objects are cleaned up. A store call retried inside one attempt rewrites the same names with the same bytes | yes |

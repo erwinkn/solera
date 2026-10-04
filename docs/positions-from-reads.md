@@ -1,11 +1,22 @@
-# Positions from what was read (design note, K43, K45)
+# Positions from what was read (design note, K43, K45–K47)
 
 Status: **approved** by Erwin (K43, amended by K45 and its read-ahead
-entries, K46, K47), and **built**: one record for every asset, `each=True`
-included (a position and read-ahead entries, no per-key payloads), the
-full pass across runs, staleness as three predicates. Waiting: exact
-presence at the position (K44's added and updated, a net "behind"), for
-the key-index redesign. It supersedes K36–K42 and K40's wording.
+entries, K46, K47, and semantic change d).
+
+**Built:** one record shape for every asset, `each=True` included: a
+position plus read-ahead entries, no per-key payloads (K47); `keys=` on
+any keyed incremental input through the read-ahead, capped at 10,000
+entries per partition (K45); a full pass that may complete across runs,
+`keys=` runs included; staleness on demand, transitive, as three
+predicates (K46); whole and dep inputs caught up to in the partition
+record (`seen`), not in the fingerprint (d).
+
+**Not built:** a position *derived* from what attempts report they read —
+positions are still moved by the plan an attempt was given, its
+`selection` kind included, and `caught_up` is still set by the commit
+path; exact presence at the position (K44's added, updated and removed,
+a net "behind"), which waits for the span key index (W42's step 3).
+It supersedes K36–K42 and K40's wording.
 
 ## Units
 
@@ -42,7 +53,10 @@ Roll-ups use "any": a partition is stale if any of its keys is, an asset
 if any of its partitions is.
 
 The **position is derived** from the records, as the index planning uses
-for incremental reads: not a second source of truth.
+for incremental reads: not a second source of truth. *As built*, the
+plan an attempt was given still moves it (`positions.advance`); what the
+attempt reported (`delivered`) feeds only the read-ahead's covers and the
+per-key outcomes.
 
 ## Where each record lives
 
@@ -51,7 +65,7 @@ for incremental reads: not a second source of truth.
 | upstream key (`each=True`) | nothing of its own: derived from the position and the read-ahead (K47) | — | — |
 | upstream partition, incremental input | the position: `next`, the pass under way, the patterns | partition record | yes, but moved by the plan (below) |
 | upstream partition, incremental input, keys read ahead | the read-ahead: `[commit, run, attempt]` per `keys=` run since the last pass (K45) | the position, capped at 10,000 entries | yes |
-| upstream partition, whole or dep input | the head generation read (a digest of the refs, for a fan-in) | partition record | folded into the fingerprint's digest today |
+| upstream partition, whole or dep input | the head generation read (a digest of the refs, for a fan-in) | partition record (`seen`) | yes, since semantic change (d) |
 | the declaration | the asset change it last caught up to | partition record | yes: `caught_up_at`, against `changed_at` |
 
 **The read-ahead** (K45 and its amendment). A `keys=` run of a plain
@@ -195,7 +209,10 @@ kept of earlier causes, and each clears on its own condition:
   caught up (the model records when it dropped the position); or an
   incremental input has a key its patterns take changed past `next`, not
   read ahead at or after its change; or a whole or dep input is at another
-  version than the one recorded at the last catch-up (`seen`). A missing
+  version than the one recorded at the last catch-up (`seen`), or none is
+  recorded yet (d). That last makes a full pass due — the next default run
+  is one, `keys=` runs continue it — and every key stays stale until it
+  completes: the record keeps one version per partition, not per key. A missing
   position, or a pass under way, counts only when the asset's own change
   did not make that pass due: a full pass due only to an asset change is
   `definition changed` alone, until commits land past its base. A pass
@@ -242,23 +259,34 @@ comparison: the work it would do is exactly the stale part.
 
 - **Gone:** the partition record's `reset` flag, and the clause that
   promoted a `keys=` run (both on the parked `held/keys-rule` commit,
-  which this replaces).
-- **Gone:** the `selection` plan kind's special case in
-  `positions.advance`, and K36's "a keys= run never moves a position".
-- **Changed:** today a position is moved by the spec's plan (`engine.py`,
-  `commit_attempt`: `advance(plan, after)`). It becomes what the attempt
+  which this replaces); K36's "a keys= run never moves a position": a
+  `keys=` run adds a read-ahead entry, or collapses the record when it
+  covers (K45).
+- **Gone** (K47): the key index's per-key consumer payloads and the
+  held/each-payload records: an `each=True` input keeps the same record.
+- **Not yet changed:** a position is moved by the spec's plan
+  (`engine.py`, `commit_attempt`: `advance(plan, after)`), the
+  `selection` kind included. The design has it become what the attempt
   reports it read (`delivered`: the keys, and the commits through which
   it read).
-- **Gone:** the fingerprint's `refs` part. Each whole or dep input's
-  version becomes its own field in the partition record, so a change is
-  a comparison, not a digest mismatch forcing a full pass: semantic
-  change (d), falling out.
-- **Derived:** `caught_up` (no unit stale) and `caught_up_at` (the
-  declaration seen), from the records instead of set by the commit path.
+- **Gone** (semantic change d): the fingerprint's `refs` part. Each whole
+  or dep input's version is the partition record's `seen`, so a change
+  is a comparison that makes a full pass due, reason *input changed*, not
+  a digest mismatch, reason *definition changed*. The fingerprint keeps
+  the declaration and the run's config. What it still guards after K43:
+  the run config alone. A declaration change already makes its full pass
+  due through `changed_at` (positions point 3 refuses a commit across
+  one), so the fingerprint's declaration part only repeats that; a run
+  with another `config=` is the one interpretation change no other record
+  holds.
+- **To derive** (not built): `caught_up` (no unit stale) and
+  `caught_up_at` (the declaration seen), from the records instead of set
+  by the commit path.
 - **Kept, but no longer consulted:** the history's lineage table. It
   stays the durable "what was each version built from", for users.
-- **Tests:** those that run `keys=` on assets that are not `each` (F17's,
-  among others) move to `each=True` assets or to partition reruns.
+- **Tests:** `keys=` runs on plain incremental assets stay (K45 replaced
+  K43's refusal); the staleness machine holds them, and every default or
+  full run, to the keys the reference says it writes.
 
 ## Risks
 
