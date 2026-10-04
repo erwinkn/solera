@@ -538,8 +538,12 @@ class Simulation(RuleBasedStateMachine):
         if engine is None:
             return
         held: dict[tuple, str] = {}
-        for task_id, claim in list(engine.m.claims.items()):
-            task = engine.m.task(task_id)
+        m = engine.m
+        for task_id, claim in list(m.claims.items()):
+            task = m.task(task_id)
+            launched = ((task.get("launched") or {}).get("prepared") or {}).get("deploy_number")
+            if launched is not None and m.reset_at.get(("asset", task["asset"]), 0) > launched:
+                continue  # an earlier life's attempt (F12's rule): another asset, of the same name
             partition = (task["asset"], task["partition"])
             if partition in held:
                 raise Violation(f"{partition} claimed by {held[partition]} and {claim['attempt']} at once")
