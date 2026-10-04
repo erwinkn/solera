@@ -605,7 +605,7 @@ async def read(root: Path, what: str, at: int | None) -> dict:
 
 QUIET_LOAD = float(os.environ.get("QUIET_LOAD", "6"))
 QUIET_FILE = Path(os.environ.get("QUIET_FILE", "/tmp/w53-quiet.json"))  # waiting so far, over the whole pass
-QUIET_MAX = 3 * 3600
+QUIET_MAX = int(os.environ.get("QUIET_MAX", 45 * 60))
 
 
 def quiet() -> dict:
