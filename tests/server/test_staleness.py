@@ -627,7 +627,6 @@ async def test_a_stale_status_carries_every_reason_that_holds(state, tmp_path):
     assert await staleness.stale_reasons(engine, "copy") == {staleness.DEFINITION, staleness.UPSTREAM}
 
 
-@pytest.mark.xfail(strict=True, raises=AssertionError, reason="F35: open")
 async def test_a_key_neither_side_holds_leaves_an_each_partition_fresh(state, tmp_path):
     """F35. `fchecks` (each=True over `feed`) runs for k1 alone; `feed` then
     removes k2, which `fchecks` never held. k2 is no output unit, so

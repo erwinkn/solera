@@ -82,23 +82,33 @@ class Staleness:
         is at another version than the one it caught up to. A pass that
         reads the new upstream clears it."""
 
+        definition = self.definition_changed(asset, partition)
+        cheap = await self._input_changed_here(asset, partition, planner, inputs, definition)
+        if self._each_input(asset) is None:
+            return cheap
+        # K38: an each=True partition is stale exactly when one of its keys is. The partition's
+        # own records filter (a pass its definition made due excuses them, so it is checked
+        # too); the keys confirm, the scan run only then, so roll-ups stay cheap (F35).
+        if not cheap and not definition:
+            return False
+        return bool(await self._each_own(asset, partition, planner, inputs, INPUT))
+
+    async def _input_changed_here(
+        self, asset: str, partition: str, planner, inputs, definition: bool
+    ) -> bool:
+        """`input_changed` from the partition's own records: conservative
+        for an each=True one, whose keys decide."""
+
         record = self.m.partition(asset, partition)
         if int(record.get("input_reset_at", -1)) > int(record.get("caught_up_at", -1)):
             return True
-        definition = self.definition_changed(asset, partition)
         seen = record.get("seen")
         if seen is None and any(self._versioned(i) for i in inputs):
             return True  # never caught up: which whole and dep versions it saw, no record says
-        each = self._each_input(asset)
         for input in inputs:
             if input.kind == "incremental":
                 if await self._input_behind(asset, partition, input, definition):
                     return True
-                # A pass its definition made due may also owe keys an input change did: never delivered,
-                # or changed past the snapshot — what is stale as if the definition had not changed.
-                if definition and each and input.param == each[0]:
-                    if await self._each_own(asset, partition, planner, inputs, INPUT):
-                        return True
             elif seen is not None and self._versioned(input):
                 if seen.get(input.param) != self._input_version(planner, input):
                     return True
