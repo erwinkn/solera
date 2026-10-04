@@ -283,7 +283,7 @@ pub enum State {
     Done,
 }
 
-/// One sorted sequence of entries — a file, or a level's files in key order —
+/// One sorted sequence of entries — a file, or a span's files in key order —
 /// fed a segment at a time. Only the blocks being read are decoded.
 #[derive(Default)]
 pub struct Stream {

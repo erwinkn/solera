@@ -81,7 +81,7 @@ TABLES = {
             "failed_count": "INTEGER",
             "error": "VARCHAR",
             "config": "VARCHAR",  # JSON object
-            "keys": "VARCHAR",  # JSON object: the keys asked for, per incremental edge
+            "keys": "VARCHAR",  # JSON object: the keys asked for, per incremental input
         },
     ),
     "tasks": Table(

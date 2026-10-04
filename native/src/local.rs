@@ -481,8 +481,8 @@ impl Local {
     }
 }
 
-/// An index as local files: runs newest first, each a level-0 file alone or
-/// a deeper level's files in key order. Each run keeps the block it read
+/// An index as local files: runs newest first, each a span's files in key
+/// order. Each run keeps the block it read
 /// last: a resolve's keys come sorted, so it never needs an earlier one.
 pub struct Snapshot {
     pub runs: Vec<Vec<Arc<Local>>>,

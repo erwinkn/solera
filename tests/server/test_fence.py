@@ -866,7 +866,7 @@ async def test_a_malformed_worker_result_is_settled_without_its_bad_parts(tmp_pa
         ["not", "a", "report"],
     ],
 )
-async def test_a_malformed_discard_report_is_refused(tmp_path, world, body):
+async def test_a_malformed_cleanup_report_is_refused(tmp_path, world, body):
     """Review round 5, engine #4: a worker's clean up acknowledgement is
     checked whole at the boundary. A malformed one is refused, and the
     state is neither broken nor changed; it used to reach the reducer,

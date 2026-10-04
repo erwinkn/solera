@@ -154,7 +154,7 @@ def _main():
     run.add_argument("--full", action="store_true", help="Full run: reset positions, no prior (§8)")
     run.add_argument("--upstream", action="store_true")
     run.add_argument("--config", default="{}", help="Run configuration as a JSON object")
-    run.add_argument("--keys", action="append", default=[], help="EDGE=full or EDGE=k1,k2")
+    run.add_argument("--keys", action="append", default=[], help="INPUT=full or INPUT=k1,k2")
     run.add_argument("--tag", action="append", default=[], help="Label the run: NAME=VALUE (repeatable)")
 
     runs = commands.add_parser("runs", help="List, delete or prune runs (§7, §11)", parents=[common])

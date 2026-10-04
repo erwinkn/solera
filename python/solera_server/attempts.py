@@ -61,9 +61,9 @@ def _names(value) -> dict[str, list[str]]:
 
 def cleanup_report(body) -> dict:
     """A worker's clean up acknowledgement as the model applies it: its
-    `partition`, and by output the entry ids it cleaned up (`cleaned up`) or
-    could not read the names of (`discard_unresolved`), and the index files
-    it deleted (`discarded_files`)."""
+    `partition`, and by output the entry ids it cleaned up (`cleaned_up`) or
+    could not read the names of (`cleanup_unresolved`), and the index files
+    it deleted (`cleaned_files`)."""
 
     if not isinstance(body, dict) or not isinstance(body.get("partition"), str):
         raise ValueError("a cleanup report names its partition")
@@ -80,7 +80,7 @@ def cleanup_report(body) -> dict:
     files = body.get("cleaned_files")
     if files is not None:
         if not isinstance(files, list) or not all(isinstance(f, str) for f in files):
-            raise ValueError("discarded_files: a list of paths")
+            raise ValueError("cleaned_files: a list of paths")
         out["cleaned_files"] = files
     return out
 

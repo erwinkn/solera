@@ -505,7 +505,7 @@ def test_a_rename_moves_a_scopes_record_whole():
     assert m.partition("old", "x") == {} and sorted(m.partitions.of("new")) == ["x", "y"]
 
 
-def test_a_discard_entrys_delta_outlives_the_attempt_holding_it():
+def test_a_cleanup_entrys_delta_outlives_the_attempt_holding_it():
     """docs/lifecycle.md §9.8, simulation finding F11: an attempt's spec hands
     it a clean up entry; the previous attempt's own cleanups (D8) acknowledge
     that entry meanwhile. The delta file the entry reads stays readable until

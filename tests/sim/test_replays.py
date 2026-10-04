@@ -19,7 +19,7 @@ def test_f9_a_key_dropped_by_a_moved_output_leaves_its_consumers():
     state.teardown()
 
 
-def test_f11_a_discard_entrys_delta_outlives_the_attempt_reading_it():
+def test_f11_a_cleanup_entrys_delta_outlives_the_attempt_reading_it():
     """F11: a `copy` attempt's spec hands it clean up entry `delta` naming a
     delta file compaction let go of before the attempt was claimed; the
     entry is acknowledged meanwhile, and collection deleted that file while

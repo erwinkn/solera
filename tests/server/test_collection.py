@@ -41,7 +41,7 @@ async def named(state, output) -> set[str]:
     return {FileStore.key_name(output, k, g) for k, g in keys.generations.items()}
 
 
-async def no_discards_after_commit(*args):
+async def no_cleanups_after_commit(*args):
     return {}
 
 
@@ -195,7 +195,7 @@ async def test_a_reader_pin_holds_collection_back(tmp_path):
     await state.close()
 
 
-async def test_a_delta_a_pending_discard_reads_outlives_its_index(tmp_path, data):
+async def test_a_delta_a_pending_cleanup_reads_outlives_its_index(tmp_path, data):
     """Review P2-7: compaction lets go of a delta file whose entry is still
     queued: index cleanup keeps the file until the entry is done. And an
     entry whose file is missing is not acknowledged as done."""
@@ -245,7 +245,7 @@ async def test_an_entry_whose_names_cannot_be_read_gets_stuck_and_is_shown(tmp_p
     state = await State.open(tmp_path.as_uri(), "test", flush_interval=0.001)
     engine = engine_for(state, project)
     await engine.initialize()
-    engine._due_after = no_discards_after_commit  # the next attempts' path alone
+    engine._due_after = no_cleanups_after_commit  # the next attempts' path alone
     await run(engine, ["scores"])
     m = state.model
     prefix = m.indexes[("scores", "")].prefix
@@ -289,7 +289,7 @@ async def test_entries_of_one_event_are_acknowledged_one_by_one(tmp_path):
     state = await State.open(tmp_path.as_uri(), "test", flush_interval=0.001)
     engine = engine_for(state, project)
     await engine.initialize()
-    engine._due_after = no_discards_after_commit  # the next attempts' path alone
+    engine._due_after = no_cleanups_after_commit  # the next attempts' path alone
     await run(engine, ["scores"])
     m = state.model
     prefix = m.indexes[("scores", "")].prefix
@@ -300,11 +300,11 @@ async def test_entries_of_one_event_are_acknowledged_one_by_one(tmp_path):
     m._collect("scores", "", {"kind": "version", "generation": 2})
     entries = m.cleanups[("scores", "")]
     assert len({d["n"] for d in entries}) == 1 and len({d["id"] for d in entries}) == 3
-    engine_module.DISCARDS, limit = 1, engine_module.DISCARDS
+    engine_module.CLEANUPS, limit = 1, engine_module.CLEANUPS
     try:
         await run(engine, ["scores"])  # delivers the first alone
     finally:
-        engine_module.DISCARDS = limit
+        engine_module.CLEANUPS = limit
     assert [d["kind"] for d in m.cleanups[("scores", "")]] == ["delta", "version"]
     await run(engine, ["scores"])  # the unresolved delta and its resolved sibling
     [left] = m.cleanups[("scores", "")]
@@ -323,7 +323,7 @@ def scores_project():
     return Project(assets=[scores])
 
 
-async def test_without_the_channel_the_next_attempt_discards(tmp_path, data, monkeypatch):
+async def test_without_the_channel_the_next_attempt_cleans_up(tmp_path, data, monkeypatch):
     """D8's fallbacks: the engine unreachable when the worker says it
     finished, or the worker gone before it acknowledges, leave the entries
     queued; the partition's next attempt cleanups them (a second delete of the

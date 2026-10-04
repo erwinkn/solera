@@ -2,7 +2,7 @@
 
 Status: **§5–§11 and §13 built** (error classes, build identity, per-key incremental,
 groups by key, the failed keys, retry passes, forced retries, the drain on
-cancel, `key_outcomes`, key patterns and the pattern change pattern change); the engine's
+cancel, `key_outcomes`, key patterns and pattern changes); the engine's
 match-count hints (§11) and summary recomputation (§9) are deferred, and
 `solera explain` (§10) is not built; §12 follows `lifecycle.md` §11
 (sensors). §20 records where the build departs from this
@@ -1147,9 +1147,9 @@ Where the implementation (`solera/errors.py`, `solera/build.py`,
   `solera_worker/each.py`) — past that it goes as it is,
   not final; a batch so left with nothing is skipped the same way, and the
   next batch resumes after the last key examined.
-- **The pattern change pattern change** lives on the position: `patterns` (what it
-  delivers under) and, during a transition, `pattern change` {`old`, `new`,
-  `pattern change`, `snapshot` (the upstream index as of the pattern change), `pin`};
+- **A pattern change** lives on the position: `patterns` (what it
+  delivers under) and, during a transition, `pattern_change` {`old`, `new`,
+  `at`, `generation`, `snapshot` (the upstream index as of `at`), `pin`};
   the diff is a pass of mode `diff`, its place the position's
   `pass.at`. The diff reads the whole snapshot (`batch_size` keys
   read per batch), not only the key ranges the patterns' prefixes cover.

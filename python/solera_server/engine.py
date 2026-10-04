@@ -68,7 +68,7 @@ TERMINAL = SUCCESS | {"failed", "blocked", "canceled"}
 HEARTBEAT_SECONDS = 10.0  # a worker beats this often (docs/lifecycle.md §6)
 PROVISION_SECONDS = 600.0  # a launched worker reports within this, or it never started
 CANCEL_GRACE = 60.0  # a requested cancel's time to drain before it is forced (§7)
-DISCARDS = 64  # data-garbage entries one attempt cleanups
+CLEANUPS = 64  # cleanup entries one attempt is given at most
 SOURCE_KEYS_RECORDED = 1000  # a source commit's run lists changed keys up to this many, else counts
 GRACE_SECONDS = 5.0
 CLEANUP_TRIES = 6  # a cleanup task's attempts, its retries backing off from a minute (K25)
@@ -1783,7 +1783,7 @@ class Engine(Attempts, Sensors, Staleness, Views):
         floor = self.m.pin_floor(but=attempt, path=self.m.index(output, partition).prefix)
         now = self.clock()
         return [e for e in entries if e["n"] <= floor and e.get("after", 0) <= now and not e.get("stuck")][
-            :DISCARDS
+            :CLEANUPS
         ]
 
     def _fingerprint(self, asset: str, run) -> str:

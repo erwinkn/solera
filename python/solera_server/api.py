@@ -24,7 +24,7 @@ from .sensors import HOST_TOKEN
 from .state import LostOwnership, State, Unavailable
 
 ATTEMPT_ROUTE = re.compile(
-    r"^/api/projects/[^/]+/attempts/([^/]+)/(start|beat|logs|resolve|finished|discarded)$"
+    r"^/api/projects/[^/]+/attempts/([^/]+)/(start|beat|logs|resolve|finished|cleaned_up)$"
 )
 POOL_ROUTE = re.compile(r"^/api/projects/[^/]+/pools/[^/]+/work$")
 SENSOR_ROUTE = re.compile(r"^/api/projects/[^/]+/sensors/(next|[^/]+/ticks/[^/]+)$")
@@ -639,7 +639,7 @@ def create_app(
         runtime = await project_engine(request, p)
         return await runtime.attempt_finished(attempt, await request.json())
 
-    @app.post("/api/projects/{p}/attempts/{attempt}/discarded", status_code=204)
+    @app.post("/api/projects/{p}/attempts/{attempt}/cleaned_up", status_code=204)
     async def attempt_cleaned_up(p: str, attempt: str, request: Request):
         runtime = await project_engine(request, p)
         await runtime.attempt_cleaned_up(attempt, await request.json())
