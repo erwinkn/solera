@@ -358,6 +358,43 @@ async def test_writes_wait_while_an_outputs_merges_are_far_behind(state):
     assert task["id"] in state.model.claims
 
 
+async def test_every_index_writer_waits_while_merges_are_far_behind(state, tmp_path):
+    """A17 R6: the writer backpressure holds for every key index, not only
+    an asset's declared outputs. At twice the span cap a source commit is
+    refused, retryable, and a per-key asset's task waits while its failure
+    index (`@asset`) is that far behind; both go on once merges catch up."""
+
+    from solera.keys.index import IndexState, Span
+
+    @asset(inputs={"row": Incremental("uploads", each=True)}, outputs=Output("checked", key="id"))
+    async def checked(ctx, row: list):
+        return [{"ok": True}]
+
+    project = Project(
+        assets=[checked], sources=[Source("uploads", key="id")], default_store=FileStore(tmp_path / "out")
+    )
+    engine = engine_for(state, project)
+    await engine.initialize()
+    await engine.commit_source("uploads", upsert=["a"])
+    deep = tuple(Span(c, c, ((c, 10**6 + c),), ()) for c in range(1, 1 + 2 * Options().fan_in))
+
+    index = state.model.indexes[("uploads", "")]
+    state.model.indexes[("uploads", "")] = replace(index, spans=index.spans + deep)
+    with pytest.raises(Engine.Conflict, match="far behind on merges"):
+        await engine.commit_source("uploads", upsert=["b"])
+    state.model.indexes[("uploads", "")] = index  # merged back down
+    assert (await engine.commit_source("uploads", upsert=["b"]))["changed"]
+
+    state.model.indexes[("@checked", "")] = IndexState(spans=deep, prefix="failures/")
+    request = await engine.submit(["checked"])
+    engine._dispatch_due()
+    (task,) = state.model.runs[request["id"]]["tasks"].values()
+    assert task["held"] == ["merges", "@checked"] and task["status"] == "queued"
+    del state.model.indexes[("@checked", "")]
+    engine._dispatch_due()
+    assert task["id"] in state.model.claims
+
+
 async def test_a_consumer_at_no_boundary_starts_over(state):
     """§6: a position whose `next` the index keeps no boundary at — merged
     away while nothing read from there — gets a full pass."""

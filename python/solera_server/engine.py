@@ -584,7 +584,8 @@ class Engine(Attempts, Sensors, Staleness, Views):
             holder = self.m.claimed_partitions.get(key)
             if holder is None or self.m.claimed(holder) is None:
                 holder = retiring.get(key)
-            behind = self._merges_behind(task)
+            written = [o["name"] for o in self.manifest["assets"][task["asset"]]["outputs"]]
+            behind = self._merges_behind([*written, f"@{task['asset']}"], task["partition"])
             cap = self.manifest["assets"][task["asset"]].get("concurrency")
             if holder is not None:
                 held[task_id] = ["claim", holder]
@@ -609,17 +610,19 @@ class Engine(Attempts, Sensors, Staleness, Views):
         if held:
             self.state.record({"type": "TasksHeld", "held": held, "at": now})
 
-    def _merges_behind(self, task: dict) -> str | None:
-        """An output of the task whose key index upkeep has let fall far
-        behind — twice the span cap, which forced merges otherwise hold — or
-        None: writes to it wait until merges catch up (writer backpressure,
-        docs/key-index-design.md § Limits)."""
+    def _merges_behind(self, names: list[str], partition: str) -> str | None:
+        """The first of the key indexes `names` in `partition` that upkeep has
+        let fall far behind — twice the span cap, which forced merges
+        otherwise hold — or None. Every index writer waits until merges catch
+        up (writer backpressure, docs/key-index-design.md § Limits): a task
+        writing one is held (`merges`), its outputs and a per-key asset's
+        failure index alike, and a source commit is refused, retryable."""
 
         cap = 2 * self.key_options.fan_in
-        for output in self.manifest["assets"][task["asset"]]["outputs"]:
-            index = self.m.indexes.get((output["name"], task["partition"]))
+        for name in names:
+            index = self.m.indexes.get((name, partition))
             if index is not None and len(index.spans) >= cap:
-                return output["name"]
+                return name
         return None
 
     def _spawn(self, run_id: str, attempt: str, is_pool: bool, executor: str, work):
@@ -1923,6 +1926,10 @@ class Engine(Attempts, Sensors, Staleness, Views):
         source = self.manifest["sources"].get(name)
         if source is None:
             raise KeyError(name)
+        if self._merges_behind([name], "") is not None:
+            raise Conflict(
+                f"source {name!r}: its key index is far behind on merges; retry once upkeep catches up"
+            )
         # Adapters say "no removals" as an empty list: the same as none, for any source.
         remove = remove or None
         head = self.m.heads.get((name, ""))

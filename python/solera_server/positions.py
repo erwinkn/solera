@@ -164,16 +164,21 @@ def reads(plans: dict) -> list[tuple]:
     """What an attempt's plans read of their upstream indexes: `(output,
     partition, first, end)`, `first` the commit its read starts at and `end`
     the head + 1 the plan was cut at, where the position may land (a pass's
-    batch, a keys= selection, a pattern change's diff). Both stay endpoints
-    of the upstream index until the claim goes (docs/key-index-design.md §
-    Endpoints). Held plans (retries, reconciles) and unkeyed upstreams move
-    no keyed position."""
+    batch, a keys= selection, a pattern change's diff, a retry pass that may
+    cover what is left). Both stay endpoints of the upstream index until the
+    claim goes (docs/key-index-design.md § Endpoints). A plan that cannot
+    move a keyed position reserves nothing: an unkeyed upstream's, one with
+    no head to land at (a reconcile, a retry that cannot cover), or one with
+    no position (a keys= selection while a pattern change decides
+    membership)."""
 
     out = []
     for p in plans.values():
-        if not p or p["kind"] not in ("keys", "selection") or p.get("head") is None:
+        if not p or p["kind"] not in ("keys", "selection", "held") or p.get("head") is None:
             continue
-        position = p["position"]
+        position = p.get("position")
+        if position is None:
+            continue
         first = (p.get("pass") or {}).get("from")
         first = int(position["next"]) if first is None else int(first)
         out.append((position["output"], position["upstream_partition"], first, int(p["head"]) + 1))

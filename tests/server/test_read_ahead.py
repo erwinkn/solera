@@ -230,3 +230,24 @@ async def test_a_pattern_change_after_a_keys_run_delivers_each_key_once(state, t
     delivered = [k for upserted, _ in seen[1:] for k in upserted]
     assert sorted(delivered) == ["k2", "x1"], "each key once: k1 was read ahead, x1 newly taken"
     assert sorted((await engine.list_keys("copy"))["keys"]) == ["k1", "k2", "x1"]
+
+
+async def test_a_keys_run_while_a_pattern_change_decides_membership_runs(state, tmp_path):
+    """A17 R4: `copy`'s patterns take x* now, and before any default run
+    decides membership, keys=(x1) merges x1. Its plan has no position to
+    move — membership is the pattern change's — so it reserves no endpoint,
+    and it is prepared and runs (it raised while preparing)."""
+
+    outside, seen = External(), []
+    engine = make_engine(state, project(tmp_path, outside, seen, exclude=["x*"]))
+    await engine.initialize()
+    outside.feed.update(k1="1", x1="1")
+    await engine.commit_source("feed", upsert=["k1", "x1"])
+    await drive(engine, await engine.submit(["copy"]))
+    await engine.stop()
+    engine = make_engine(state, project(tmp_path, outside, seen))  # x* taken now
+    await engine.initialize()
+    seen.clear()
+    detail = await drive(engine, await engine.submit(["copy"], keys={"feed": {"keys": ["x1"]}}))
+    assert detail["request"]["status"] == "succeeded", detail["request"]
+    assert seen == [(["x1"], [])]

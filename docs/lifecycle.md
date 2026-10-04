@@ -353,9 +353,11 @@ adopted by a restarted engine (§12).
 
 - **Its reads** (`reads`: `(output, partition, first, end)` per keyed
   incremental input): the delta log it reads, from `first`, and the head
-  + 1 its plan was cut at, `end`. Log truncation and index merges
-  (`Model.endpoints`) keep them. Set when `_prepare` plans, before the
-  launch.
+  + 1 its plan was cut at, `end`: where it may move the position, a
+  retry pass that may cover what is left included. Log truncation and
+  index merges (`Model.endpoints`) keep them. Set when `_prepare` plans,
+  before the launch. A plan with no position to move (a keys= selection
+  while a pattern change decides membership) holds none.
 - **Its cleanups** (`cleanups`): the delta files of the pending cleanup
   entries its spec hands it, also set at `_prepare`: collection keeps
   them while the attempt runs, even once another attempt acknowledged the
@@ -380,7 +382,7 @@ the new life off it, so two attempts never own one partition's files
 when it changes, why one is held (`TasksHeld`, shown as "held: reason
 (name)"): `claim` (another attempt holds its partition: one of the
 current life, or an earlier life's not yet ended), `concurrency` (its asset's `concurrency=` partitions are
-claimed), `merges` (an output's key index is too far behind on merges),
+claimed), `merges` (a key index it writes — an output's, or a per-key asset's failure index — is too far behind on merges),
 `engine` (the engine's own slots are full), `executor` (its executor's
 limit), `invalid` (its placement cannot be built).
 

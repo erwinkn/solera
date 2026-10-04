@@ -2,7 +2,7 @@
 over an explicit position — a pass keeps its mode, boundary and batch
 plan until its last batch, then `next` moves past it."""
 
-from solera_server.positions import advance, continues, pins
+from solera_server.positions import advance, continues, pins, reads
 
 CARRIED = {"output": "log", "upstream_partition": "", "fingerprint": "f", "reset_by": "r1"}
 
@@ -51,3 +51,17 @@ def test_a_held_batch_moves_no_position():
     kept = {"kind": "keys", **CARRIED, "next": 3}
     assert advance({"kind": "held", "position": kept}) == kept
     assert advance({"kind": "held", "position": None}) is None
+
+
+def test_every_plan_that_may_move_a_position_reserves_where_it_lands():
+    """A17: what a claim reserves of its upstream index is what its plan may
+    move the position to. A retry pass that may cover what is left lands at
+    its head + 1 (R5): without that endpoint a merge meanwhile forces a full
+    pass. A keys= selection while a pattern change decides membership has
+    no position (R4), and a retry that cannot cover has no head: neither
+    reserves anything."""
+
+    position = {"output": "items", "upstream_partition": "", "next": 3}
+    assert reads({"item": {"kind": "held", "position": position, "head": 5}}) == [("items", "", 3, 6)]
+    assert reads({"item": {"kind": "held", "position": position}}) == []
+    assert reads({"item": {"kind": "selection", "position": None, "head": 5}}) == []

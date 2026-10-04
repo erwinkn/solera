@@ -174,7 +174,7 @@ adding one never cuts a span.
 | Holder | Endpoint | Reserved | Released |
 |---|---|---|---|
 | a consumer's position | `next` | when the position is set | when it moves or is dropped |
-| an attempt that may advance a position: a pass's batch, a keys= selection (a covering one collapses the record to its head + 1), a pattern-change drain | the head + 1 at its claim: its landing point | at the claim or preparation, before its record is installed | when its result is durably part of the position or pass; on failure |
+| an attempt that may advance a position: a pass's batch, a keys= selection (a covering one collapses the record to its head + 1), a per-key retry pass that may cover what is left (likewise), a pattern-change drain; not one with no position to move (a keys= selection while a pattern change decides membership) | the head + 1 at its claim: its landing point | at the claim or preparation, before its record is installed | when its result is durably part of the position or pass; on failure |
 | a pass under way (delta, full or diff) over commits up to `to` | `to + 1` | when the pass starts | when it ends |
 | a pattern change | its split commit + 1 | at the change | when its drain ends |
 
