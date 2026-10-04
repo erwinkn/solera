@@ -580,7 +580,7 @@ def check(spec: Spec, label: str, events: list[dict], constants: dict, work: Pat
     (work / f"{trace}Log.tla").write_text(log_module(spec, events, constants))
     (work / f"{trace}.cfg").write_text(spec.config)
     heap = os.environ.get("TLC_HEAP", "4g")
-    cmd = ["java", f"-Xmx{heap}", "-cp", str(JAR), "tlc2.TLC", "-workers", "1"]
+    cmd = ["java", "-XX:ActiveProcessorCount=1", f"-Xmx{heap}", "-cp", str(JAR), "tlc2.TLC", "-workers", "1"]
     cmd += ["-metadir", str(work / "states"), "-config", f"{trace}.cfg", f"{trace}.tla"]
     limit = float(os.environ.get("TRACE_TIMEOUT", "0")) or None
     try:

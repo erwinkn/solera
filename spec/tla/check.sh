@@ -11,8 +11,13 @@
 #   attempt    ci: small, dup, live and the calibrations; big: two attempts with a
 #              duplicate worker each (too large to finish)
 #   positions  ci: base, each and the calibrations; three: three keys
-#   spans      ci: base, takeover (a zombie), orphans (the collector), retries (failing
-#              merges), empty (spans with no files), passes, and the calibrations
+#   spans      ci: base, orphans (the collector), retries (failing merges), empty (spans
+#              with no files), passes, and the calibrations; long: takeover (a zombie,
+#              ~20 min at 4 workers), for the freeze round and on demand
+#   observed   ci: free and current (every step, both store kinds; OBSERVED_TRACES random
+#              behaviours of 40 steps, every state checked), and each finding's
+#              history (`observed_histories`): run through with every rule on, then
+#              broken with its own rule off
 #   every spec: calibrate (each rule switched off: TLC must find its bug), all
 #
 # A model is its spec's base config ({Spec}.cfg) with changes (`model` below):
@@ -21,7 +26,8 @@
 #                    CONSTRAINT line (nothing after `=`: no such line)
 #   -NAME            NAME left out of the invariants and properties
 #
-# TLC_WORKERS (2) and TLC_HEAP (4g) bound what a run takes of a shared machine;
+# TLC_WORKERS (2; the JVM sees as many cores) and TLC_HEAP (4g) bound what a run
+# takes of a shared machine;
 # TLA_LOGS=DIR keeps TLC's output. Needs Java 11+ (else runs TLC in the
 # eclipse-temurin:21-jre image). Downloads tla2tools.jar into spec/tla/.tools
 # (gitignored).
@@ -118,8 +124,59 @@ model() {
         spans/epoch-state) changes=(MaxTakeovers=1 MaxResets=0 Collectors=TRUE FixEpoch=FALSE -PublishingStored) ;;
         spans/judge) changes=(Collectors=TRUE MaxResets=0 FixJudgeAfter=FALSE) ;;
         spans/garbage-named) changes=(Collectors=TRUE MaxResets=0 MaxClaims=0 MaxTakeovers=1 FixGarbageNamed=FALSE) ;;
+        # ObservedSet.tla: free exploration, or a finding's history (below).
+        observed/free) changes=() ;;
+        observed/current) changes=(CurrentOnly=TRUE) ;;
+        observed/*) observed_history "${2%-off}"
+            changes=("History=\"$history\"" MaxVer=3 MaxCommits=5 "CurrentOnly=$store")
+            if [ "$history" = Regress ]; then changes+=("PROPERTY=NoRegress"); fi
+            if [ "${2%-off}" != "$2" ]; then changes+=("$rule=FALSE"); fi ;;
         *) echo "no model $2 of $1" >&2; exit 2 ;;
     esac
+}
+
+# ObservedSet.tla's histories: each finding as the observed set's steps (its
+# `Histories`), the store it needs, the rule that prevents it, and what
+# TLC finds with that rule off; `-`: a history that must hold either way
+# (a keys= batch in flight across a cut, a definition change, a reset).
+observed_histories='
+a19r1  A19R1  FALSE FixDecodeOld     CountExact
+a19r2  A19R2  FALSE FixFixedT        DecodeExact
+a19r3  A19R3  FALSE FixDecodeOld     DecodeExact
+a19r4  A19R4  FALSE FixPointPatterns DecodeExact
+a19r5  A19R5  TRUE  FixObserve       DecodeExact
+f41    F41    TRUE  FixObserve       DecodeExact
+a26n1  A26N1  FALSE FixPin           RowsKept
+a26n2  A26N2  FALSE FixDecodeOld     CountExact
+a26n3  A26N3  FALSE FixFold          DecodeExact
+a26n4  A26N4  TRUE  FixObserve       DecodeExact
+a26n5  A26N5  FALSE FixNoCap         Admitted
+a27r1  A27R1  FALSE FixContext       OwedExact
+a27r2  A27R2  TRUE  FixObserve       DecodeExact
+a27r3  A27R3  FALSE FixUniversal     OwedExact
+a27r4  A27R4  FALSE FixClassOnce     OwedExact
+a27r5a A27R5a FALSE FixAbsentPoints  DecodeExact
+a27r5b A27R5b FALSE FixPointPatterns DecodeExact
+a27r6  A27R6  FALSE FixPin           RowsKept
+a27r7  A27R7  FALSE FixLives         DecodeExact
+a27r8a A27R8a FALSE FixSupersede     DecodeExact
+a27r8b A27R8b FALSE FixFold          DecodeExact
+a27r8c A27R8c FALSE FixSplit         DecodeExact
+a27r9  A27R9  FALSE FixRangeCands    OwedExact
+a27r10 A27R10 FALSE FixPending       StaleExact
+paused Paused FALSE FixImage         DecodeExact
+passcut PassCut FALSE FixPassCut     EndpointsKept
+regress Regress FALSE FixNoRegress   NoRegress
+resetfly ResetInFlight FALSE FixCommitCheck DecodeExact
+cutfly CutInFlight FALSE FixPassCut  EndpointsKept
+selcut SelCut FALSE -                -
+seldefine SelDefine FALSE -                -
+selreset SelReset FALSE -                -'
+
+# observed_history NAME: set history, store, rule and expected for NAME.
+observed_history() {
+    read -r _ history store rule expected <<< "$(grep -E "^$1 " <<< "$observed_histories")"
+    if [ -z "${history:-}" ]; then echo "no history $1" >&2; exit 2; fi
 }
 
 # calibration SPEC: each rule switched off in turn, and the property TLC must
@@ -252,7 +309,9 @@ edit() { sed -E "$1" "$cfg" > "$cfg.tmp" && mv "$cfg.tmp" "$cfg"; }
 tlc() {  # tlc NAME [TLC options]: run TLC on model NAME, its output in $work/NAME.log
     local name=$1
     shift
-    local args=(-XX:+UseParallelGC "-Xmx${TLC_HEAP:-4g}" -cp "$jar" tlc2.TLC -workers "${TLC_WORKERS:-2}"
+    # The JVM sizes its GC and other threads to every core it sees: show it only its share.
+    local args=(-XX:+UseParallelGC "-XX:ActiveProcessorCount=${TLC_WORKERS:-2}" "-Xmx${TLC_HEAP:-4g}" -cp "$jar"
+                tlc2.TLC -workers "${TLC_WORKERS:-2}"
                 -lncheck final -metadir "$work/states" "$@" -config "$work/$name.cfg" "$module.tla")
     if java -version >/dev/null 2>&1; then  # not just on PATH: macOS has a /usr/bin/java stub
         java "${args[@]}" > "$work/$name.log" 2>&1 || true
@@ -302,7 +361,8 @@ run() {  # run SPEC GROUP
         attempt) module=Attempt ;;
         positions) module=Positions ;;
         spans) module=Spans ;;
-        *) echo "usage: $0 [ci | execution|journal|attempt|positions|spans [GROUP|MODEL]]" >&2; exit 2 ;;
+        observed) module=ObservedSet ;;
+        *) echo "usage: $0 [ci | execution|journal|attempt|positions|spans|observed [GROUP|MODEL]]" >&2; exit 2 ;;
     esac
     case $spec/$2 in
         execution/ci) check smoke; calibration execution ;;
@@ -315,7 +375,18 @@ run() {  # run SPEC GROUP
         attempt/ci) check small; check dup; check live; calibration attempt ;;
         positions/ci) check base; check each; calibration positions ;;
         positions/all) run positions ci; check three ;;
-        spans/ci) check base; check takeover; check orphans; check retries; check empty; check passes; calibration spans ;;
+        spans/ci) check base; check orphans; check retries; check empty; check passes; calibration spans ;;
+        spans/long) check takeover ;;
+        spans/all) run spans ci; run spans long ;;
+        observed/ci)  # every step: too many states to exhaust, so random behaviours, every state checked
+            local sim=(-simulate "num=${OBSERVED_TRACES:-500000}" -depth 40 -seed 1)
+            check free "${sim[@]}"; check current "${sim[@]}"
+            echo "== histories, every rule on, then the history's own off"
+            for h in $(awk 'NF {print $1}' <<< "$observed_histories"); do
+                observed_history "$h"
+                check "$h"
+                if [ "$rule" != - ]; then calibrate "$h-off" "$expected"; fi
+            done ;;
         attempt/all) run attempt ci; check big ;;
         */calibrate) calibration "$spec" ;;
         *) check "$2" ;;
@@ -323,6 +394,6 @@ run() {  # run SPEC GROUP
 }
 
 case ${1:-ci} in
-    ci) for s in execution journal attempt positions spans; do echo "# $s"; run $s ci; done ;;
+    ci) for s in execution journal attempt positions spans observed; do echo "# $s"; run $s ci; done ;;
     *) run "$1" "${2:-ci}" ;;
 esac
