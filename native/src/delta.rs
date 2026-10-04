@@ -40,7 +40,7 @@ pub struct Collected {
 }
 
 impl Collected {
-    fn new(limit: usize) -> Collected {
+    pub(crate) fn new(limit: usize) -> Collected {
         Collected {
             upserts: Some(Arena::default()),
             removes: Some(Arena::default()),
@@ -48,7 +48,7 @@ impl Collected {
         }
     }
 
-    fn add(&mut self, key: &[u8], removed: bool) {
+    pub(crate) fn add(&mut self, key: &[u8], removed: bool) {
         let total = self.upserts.as_ref().map_or(0, |a| a.len())
             + self.removes.as_ref().map_or(0, |a| a.len());
         if total >= self.limit {

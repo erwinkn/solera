@@ -386,3 +386,49 @@ async def test_merge_outputs_carry_their_epoch_and_a_backlog_holds_commits():
         layers=tuple(L.Layer(i, i, L.Part(), generation=i + 1) for i in range(L.MAX_LAYERS + 1))
     )
     assert many.backlogged()
+
+
+@pytest.mark.parametrize("streamed", [False, True])
+async def test_patches_sparse_or_streamed_write_the_same_delta(monkeypatch, streamed):
+    if streamed:
+        monkeypatch.setattr(L, "SPARSE_BYTES", 0)  # every patch streams the index
+    rng = random.Random(21)
+    h = History(rng)
+    for _ in range(30):
+        await h.commit({key(rng.randrange(300)): None for _ in range(10)}, [])
+    live = sorted(h.fold[-1])
+    ups = sorted({key(rng.randrange(300)) for _ in range(40)})
+    rms = sorted(set(rng.sample(live, 10)) - set(ups))
+    run = SortedEntries.of(ups, None, rms)
+    files, listed = await h.index().write_patch(
+        run, name="p1", generation=10_007, replaced=True, collect=1000
+    )
+    st = h.state.committed(h.state.head + 1, files)
+    now = {**h.fold[-1], **dict.fromkeys(ups, (10_007, None))}
+    for k in rms:
+        now.pop(k)
+    assert await L.LayerIndex(h.io, st).lookup([key(i) for i in range(300)]) == now
+    assert sorted(listed[0]) == ups and sorted(listed[1]) == rms
+    data = await h.io.read_whole(st.path(files.part.files[0].name), files.part.files[0].size)
+    written, removed = L.delta_keys(data)
+    assert written == ups and removed == rms
+    assert dict(L.replaced_entries(data)) == {k: h.fold[-1][k][0] for k in ups + rms if k in h.fold[-1]}
+    keys = [
+        k for chunk in [c async for c in L.DeltaKeys(h.io, st.prefix, files.part).chunks(7)] for k in chunk
+    ]
+    assert keys == [k.decode() for k in ups]
+
+
+async def test_a_streamed_replacement_with_an_overlay():
+    h = History(random.Random(22))
+    await h.commit({key(i): None for i in range(20)}, [])
+
+    def chunks():  # the store's keys, sorted, a chunk at a time
+        yield [key(i) for i in range(10, 25)]
+        yield [key(i) for i in range(25, 30)]
+
+    overlay = SortedEntries.of([key(12), key(40)], None, [key(13)])
+    files, _ = await h.index().write_replace(chunks=chunks(), overlay=overlay, name="r", generation=17)
+    st = h.state.committed(1, files)
+    found = await L.LayerIndex(h.io, st).lookup([key(i) for i in range(50)])
+    assert sorted(found) == sorted({key(i) for i in range(10, 30)} - {key(13)} | {key(40)})

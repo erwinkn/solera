@@ -25,7 +25,7 @@
 
 use std::collections::VecDeque;
 
-use crate::delta::{Old, Write};
+use crate::delta::{Collected, Old, Write};
 use crate::entries::SortedEntries;
 use crate::format::{Error, Result};
 use crate::rows::Source;
@@ -948,16 +948,26 @@ pub struct DeltaWriter {
     pub added: u64,
     pub removed: u64,
     pub changed: u64,
+    /// The keys it changed, written and removed, up to a limit: what a store
+    /// is told to write and delete.
+    pub collected: Collected,
     replaced: bool,
 }
 
 impl DeltaWriter {
-    pub fn new(block_size: usize, level: i32, file_limit: usize, replaced: bool) -> DeltaWriter {
+    pub fn new(
+        block_size: usize,
+        level: i32,
+        file_limit: usize,
+        replaced: bool,
+        collect: usize,
+    ) -> DeltaWriter {
         DeltaWriter {
             out: BlockWriter::new(DELTA, block_size, level, file_limit),
             added: 0,
             removed: 0,
             changed: 0,
+            collected: Collected::new(collect),
             replaced,
         }
     }
@@ -984,6 +994,7 @@ impl DeltaWriter {
                 (true, p)
             }
         };
+        self.collected.add(key, !present);
         self.out.push(Entry {
             key: key.to_vec(),
             present,
@@ -1461,7 +1472,7 @@ mod tests {
 
     #[test]
     fn a_delta_reads_as_stamped_entries() {
-        let mut w = DeltaWriter::new(64, 1, 1 << 20, true);
+        let mut w = DeltaWriter::new(64, 1, 1 << 20, true, 100);
         w.apply(b"a", Write::Upsert(None), Old::Absent).unwrap();
         w.apply(b"b", Write::Upsert(Some(b"v2")), Old::Live(7, Some(b"v1")))
             .unwrap();
@@ -1637,7 +1648,7 @@ mod tests {
             Source::Entries(Arc::new(written), 0),
             inputs,
             true,
-            DeltaWriter::new(64, 1, 1 << 20, true),
+            DeltaWriter::new(64, 1, 1 << 20, true, 100),
         )
         .unwrap();
         let mut data = vec![];

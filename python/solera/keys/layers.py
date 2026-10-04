@@ -37,6 +37,7 @@ SMALL = 256 * 1024  # a part this small has no index object: it is read whole
 SEGMENT = 8 * 2**20  # bytes a streaming job reads of an input at once
 WINDOW = 1 << 20  # bytes a page fetches of a part at least (consecutive pages share it)
 PAGE_BUDGET = 64 * 2**20  # bytes a page reads at most before it returns short
+SPARSE_BYTES = 64 * 2**20  # a sparse resolve holding more than this streams instead
 CACHE = 64 * 2**20  # bytes of blocks a reader keeps
 
 # The merge rule (docs/key-index-design.md § Compaction).
@@ -437,6 +438,7 @@ class Delta:
     added: int
     changed: int
     removed: int
+    listed: tuple | None = None  # up to `collect` changed keys: (written, removed)
 
     @property
     def entries(self) -> int:
@@ -743,22 +745,26 @@ class LayerIndex:
 
     # -- the writer ---------------------------------------------------------------------------
 
-    async def resolve(self, written, *, replaced: bool = False) -> Delta:
+    async def resolve(self, written, *, replaced: bool = False, collect: int = 0) -> Delta:
         """A commit's delta from its written entries (a `SortedEntries`),
-        each resolved exactly at the head. With `replaced`, each change
-        records the generation it replaced (an immutable store's cleanup)."""
+        each resolved exactly at the head, the sparse way: the blocks the
+        keys fall in (or whole parts, where streaming them is faster), held
+        while it resolves. With `replaced`, each change records the
+        generation it replaced (an immutable store's cleanup); `collect`
+        lists up to that many changed keys."""
 
         keys = list(written.keys())
         inputs = await self._inputs(keys) if keys else []
-        files, index, added, changed, removed = await in_thread(
+        files, index, added, changed, removed, listed = await in_thread(
             _native.layers_resolve,
             inputs,
             written,
             replaced=replaced,
+            collect=collect,
             block_size=BLOCK,
             file_limit=FILE_LIMIT,
         )
-        return Delta(list(files), bytes(index), added, changed, removed)
+        return Delta(list(files), bytes(index), added, changed, removed, listed)
 
     async def write(self, name: str, delta: Delta, generation: int) -> DeltaFiles:
         """Upload a delta under `name` (unique: its commit and attempt), and
@@ -766,6 +772,103 @@ class LayerIndex:
 
         part = await self._upload(name, delta.files, delta.index)
         return DeltaFiles(part, delta.added, delta.removed, generation)
+
+    async def sparse_bytes(self, keys: list[bytes]) -> int:
+        """What a sparse resolve of `keys` would hold: the blocks it reads."""
+
+        over = self._over(None)
+        await self._prepare([x.main for x, _ in over])
+        total = 0
+        for x, _ in over:
+            if x.main.index is None:
+                total += x.main.size
+            else:
+                ix = self._ix(x.main)
+                total += sum(ix.len[i] for i in self._plan(x.main, keys))
+        return total
+
+    async def write_patch(
+        self, run, *, name: str, generation: int, replaced: bool = False, collect: int = 0
+    ) -> tuple[DeltaFiles, tuple | None]:
+        """A patch's delta (`run`, sorted entries, removes among them),
+        written: resolved sparsely, or streamed against the whole index when
+        the sparse way would hold more than `SPARSE_BYTES` (the rule is in
+        bytes, never in blocks). Returns the delta's files and up to
+        `collect` changed keys, `(written, removed)`, or None past that."""
+
+        keys = list(run.keys())
+        if keys and await self.sparse_bytes(keys) > SPARSE_BYTES:
+            return await self._join(name, generation, replaced, collect, sorted=run)
+        delta = await self.resolve(run, replaced=replaced, collect=collect)
+        return await self.write(name, delta, generation), delta.listed
+
+    async def write_replace(
+        self,
+        rows=None,
+        *,
+        chunks=None,
+        key: str | None = None,
+        overlay=None,
+        name: str,
+        generation: int,
+        replaced: bool = False,
+        collect: int = 0,
+    ) -> tuple[DeltaFiles, tuple | None]:
+        """A full replacement: `rows` (a `Rows`), or `chunks` of sorted keys
+        streamed (rows keyed by `key`, when chunks are tables), is every key
+        now — with `overlay`'s upserts in place of the stream's and its
+        removes gone — and present keys it omits are removed. Streams the
+        index once."""
+
+        return await self._join(
+            name,
+            generation,
+            replaced,
+            collect,
+            rows=rows,
+            chunks=chunks,
+            key=key,
+            overlay=overlay,
+            replace=True,
+        )
+
+    async def _join(
+        self,
+        name,
+        generation,
+        replaced,
+        collect,
+        *,
+        rows=None,
+        sorted=None,
+        chunks=None,
+        key=None,
+        overlay=None,
+        replace=False,
+    ) -> tuple[DeltaFiles, tuple | None]:
+        over = self._over(None)
+        job = _native.LayerJob.join(
+            [self._stamp(x) for x, _ in over],
+            rows=rows,
+            sorted=sorted,
+            replace=replace,
+            replaced=replaced,
+            collect=collect,
+            key=key,
+            overlay=overlay,
+            block_size=BLOCK,
+            file_limit=FILE_LIMIT,
+        )
+        refs: list[FileRef] = []
+
+        async def on_file(part, data, entries, first, last):
+            fname = f"{name}-{len(refs)}.lay"
+            await self._write(fname, data)
+            refs.append(FileRef(fname, len(data), entries, first, last))
+
+        out = await self._drive(job, [x.main for x, _ in over], on_file, chunks=chunks)
+        part = await self._index_part(name, "d", refs, out["main"])
+        return DeltaFiles(part, out["added"], out["removed"], generation), out["collected"]
 
     async def _upload(self, name: str, files: list[tuple], index: bytes) -> Part:
         refs = []
@@ -816,7 +919,7 @@ class LayerIndex:
             await self._write(fname, data)
             files[part].append(FileRef(fname, len(data), entries, first, last))
 
-        out = await _drive(job, self.io, st, [p for _, p in streams], on_file)
+        out = await self._drive(job, [p for _, p in streams], on_file)
         main = await self._index_part(stem, "m", files["main"], out["main"])
         side = await self._index_part(stem, "s", files["side"], out["side"]) if files["side"] else None
         layer = Layer(
@@ -832,32 +935,59 @@ class LayerIndex:
             part = replace(part, index=iname, index_size=len(index))
         return part
 
-    async def replace_all(
-        self, rows, *, name: str, generation: int, replaced: bool = False, key: str | None = None
-    ) -> DeltaFiles:
-        """A full replacement: `rows` (a `Rows`) is every key now; present keys
-        it omits are removed. Streams the index once."""
+    async def replace_all(self, rows, *, name: str, generation: int, replaced: bool = False) -> DeltaFiles:
+        """A full replacement by `rows`: `write_replace`, its delta files alone."""
 
-        over = self._over(None)
-        job = _native.LayerJob.join(
-            [self._stamp(x) for x, _ in over],
-            rows=rows,
-            replace=True,
-            replaced=replaced,
-            key=key,
-            block_size=BLOCK,
-            file_limit=FILE_LIMIT,
-        )
-        refs: list[FileRef] = []
+        files, _ = await self.write_replace(rows, name=name, generation=generation, replaced=replaced)
+        return files
 
-        async def on_file(part, data, entries, first, last):
-            fname = f"{name}-{len(refs)}.lay"
-            await self._write(fname, data)
-            refs.append(FileRef(fname, len(data), entries, first, last))
+    async def _segments(self, part: Part):
+        """A part's bytes in segments of whole blocks, at most `SEGMENT`
+        each, read from the engine's disk where it holds them."""
 
-        out = await _drive(job, self.io, self.state, [x.main for x, _ in over], on_file)
-        part = await self._index_part(name, "d", refs, out["main"])
-        return DeltaFiles(part, out["added"], out["removed"], generation)
+        if part.index is None:
+            for f in part.files:
+                yield await self._read(f.name, 0, f.size, f.size)
+            return
+        await self._prepare([part])
+        ix = self._ix(part)
+        i = 0
+        while i < len(ix.first):
+            j, start = i + 1, ix.off[i]
+            while j < len(ix.first) and ix.file[j] == ix.file[i] and ix.off[j] + ix.len[j] - start <= SEGMENT:
+                j += 1
+            f = part.files[ix.file[i]]
+            yield await self._read(f.name, start, ix.off[j - 1] + ix.len[j - 1], f.size)
+            i = j
+
+    async def _drive(self, job, parts: list[Part], on_file, chunks=None) -> dict:
+        """Run a streaming `LayerJob` over `parts` (its inputs, in its order):
+        feed segments and streamed chunks as it asks, hand its files to
+        `on_file`, return `finish()`."""
+
+        readers = [self._segments(p) for p in parts]
+        it = iter(chunks) if chunks is not None else None
+        try:
+            while (step := await in_thread(job.step)) is not None:
+                kind, x = step
+                if kind == "run":
+                    seg = await anext(readers[x], None)
+                    if seg is None:
+                        job.end(x)
+                    else:
+                        job.feed(x, seg)
+                elif kind == "rows":
+                    chunk = None if it is None else await in_thread(next, it, None)
+                    if chunk is None:
+                        job.end_rows()
+                    else:
+                        job.feed_rows(chunk)
+                else:
+                    await on_file(*x)
+        finally:
+            for r in readers:
+                await r.aclose()
+        return job.finish()
 
 
 def _rows(out) -> list[tuple]:
@@ -874,44 +1004,43 @@ def _rows(out) -> list[tuple]:
     ]
 
 
-async def _segments(io: ObjectIO, state: LayerState, part: Part, cache: dict):
-    """A part's bytes in segments of whole blocks, at most `SEGMENT` each."""
-
-    if part.index is None:
-        for f in part.files:
-            yield await io.read_whole(state.path(f.name), f.size)
-        return
-    raw = await io.read_whole(state.path(part.index), part.index_size)
-    ix = _Index(raw)
-    i = 0
-    while i < len(ix.first):
-        j, start = i + 1, ix.off[i]
-        while j < len(ix.first) and ix.file[j] == ix.file[i] and ix.off[j] + ix.len[j] - start <= SEGMENT:
-            j += 1
-        f = part.files[ix.file[i]]
-        yield await io.read(state.path(f.name), start, ix.off[j - 1] + ix.len[j - 1], f.size)
-        i = j
+# -- a commit's delta, read by others ---------------------------------------------------------
 
 
-async def _drive(job, io: ObjectIO, state: LayerState, parts: list[Part], on_file) -> dict:
-    """Run a streaming `LayerJob` over `parts` (its inputs, in its order):
-    feed segments as it asks, hand its files to `on_file`, return `finish()`."""
+def delta_keys(data: bytes) -> tuple[list[bytes], list[bytes]]:
+    """A delta file's written keys, and its removed keys."""
 
-    readers = [_segments(io, state, p, {}) for p in parts]
-    try:
-        while (step := await in_thread(job.step)) is not None:
-            kind, x = step
-            if kind == "run":
-                seg = await anext(readers[x], None)
-                if seg is None:
-                    job.end(x)
-                else:
-                    job.feed(x, seg)
-            elif kind == "rows":
-                job.end_rows()
-            else:
-                await on_file(*x)
-    finally:
-        for r in readers:
-            await r.aclose()
-    return job.finish()
+    entries = _native.layers_decode(data, 0, 0)
+    return [e[0] for e in entries if e[1]], [e[0] for e in entries if not e[1]]
+
+
+def replaced_entries(data: bytes) -> list[tuple[bytes, int]]:
+    """What a delta file's changes replaced, where the writer recorded it (an
+    immutable store's outputs): `(key, generation)`, for cleanup only — the
+    index never reads it."""
+
+    return [(e[0], e[7]) for e in _native.layers_decode(data, 0, 0) if e[7] is not None]
+
+
+@dataclass(frozen=True)
+class DeltaKeys:
+    """The keys a commit's delta writes — not those it removes — read a page
+    at a time in key order: a store's selection when there are too many to
+    list (`solera.stores.Partition`)."""
+
+    io: ObjectIO
+    prefix: str
+    part: Part
+
+    async def chunks(self, size: int = 100_000):
+        """Chunks of the written keys, as `str`."""
+
+        state = LayerState(prefix=self.prefix, layers=(Layer(0, 0, self.part, None, 1),))
+        index, after = LayerIndex(self.io, state), None
+        while self.part.files:
+            rows, after = await index.delta(None, after=after, first=size)
+            chunk = [key_str(r[0]) for r in rows]
+            if chunk:
+                yield chunk
+            if after is None:
+                return

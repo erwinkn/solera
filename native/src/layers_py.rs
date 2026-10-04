@@ -10,12 +10,13 @@ use pyo3::prelude::*;
 use pyo3::pybacked::PyBackedBytes;
 use pyo3::types::{PyBytes, PyList};
 
+use crate::delta::Collected;
 use crate::layers::{
     self, BlockWriter, DeltaWriter, Glob, LayerJoin, LayerMerge, LayerStream, Stamp, Step,
 };
 use crate::rows::{Cursor, Overlay, Source, Stream};
 use crate::stream::Bytes;
-use crate::{chunk, guard, to_py, Rows, SortedEntries};
+use crate::{arena_list, chunk, guard, to_py, Rows, SortedEntries};
 
 type Input = (Vec<PyBackedBytes>, u64, u64);
 
@@ -39,6 +40,17 @@ fn opt_bytes<'py>(py: Python<'py>, b: Option<&[u8]>) -> Bound<'py, PyAny> {
     match b {
         Some(b) => PyBytes::new(py, b).into_any(),
         None => py.None().into_bound(py),
+    }
+}
+
+/// The changed keys a writer collected — `(written, removed)` — or None
+/// past its limit.
+fn collected<'py>(py: Python<'py>, c: &Collected) -> PyResult<Bound<'py, PyAny>> {
+    match (&c.upserts, &c.removes) {
+        (Some(u), Some(r)) => Ok((arena_list(py, u)?, arena_list(py, r)?)
+            .into_pyobject(py)?
+            .into_any()),
+        _ => Ok(py.None().into_bound(py)),
     }
 }
 
@@ -248,23 +260,32 @@ pub fn glob_blocks<'py>(
 
 /// A commit's delta from its sorted written entries, resolved against
 /// `inputs` (newest first: the blocks the keys fall in, or whole parts):
-/// `(files, index, added, changed, removed)`. With `replaced`, each change
-/// records the generation it replaced (an immutable store's cleanup).
+/// `(files, index, added, changed, removed, collected)`. With `replaced`,
+/// each change records the generation it replaced (an immutable store's
+/// cleanup); `collected` lists up to `collect` changed keys.
 #[pyfunction]
-#[pyo3(signature = (inputs, written, *, replaced=false, block_size=16384, level=1, file_limit=67108864))]
+#[pyo3(signature = (inputs, written, *, replaced=false, collect=0, block_size=16384, level=1, file_limit=67108864))]
 #[allow(clippy::type_complexity)]
 pub fn layers_resolve<'py>(
     py: Python<'py>,
     inputs: Vec<Input>,
     written: PyRef<'_, SortedEntries>,
     replaced: bool,
+    collect: usize,
     block_size: usize,
     level: i32,
     file_limit: usize,
-) -> PyResult<(Bound<'py, PyList>, Bound<'py, PyBytes>, u64, u64, u64)> {
+) -> PyResult<(
+    Bound<'py, PyList>,
+    Bound<'py, PyBytes>,
+    u64,
+    u64,
+    u64,
+    Bound<'py, PyAny>,
+)> {
     guard(|| {
         let sorted = written.inner.clone();
-        let mut w = DeltaWriter::new(block_size, level, file_limit, replaced);
+        let mut w = DeltaWriter::new(block_size, level, file_limit, replaced, collect);
         py.detach(|| layers::resolve(streams(inputs), &sorted, &mut w))
             .map_err(to_py)?;
         let index = layers::index_encode(&w.out.blocks);
@@ -274,6 +295,7 @@ pub fn layers_resolve<'py>(
             w.added,
             w.changed,
             w.removed,
+            collected(py, &w.collected)?,
         ))
     })
 }
@@ -330,7 +352,7 @@ impl LayerJob {
     /// `sorted` entries; merge-joined with `inputs` (newest first). A patch,
     /// or with `replace` the whole new content.
     #[staticmethod]
-    #[pyo3(signature = (inputs, *, rows=None, sorted=None, replace=false, replaced=false, key=None, overlay=None, block_size=16384, level=1, file_limit=67108864))]
+    #[pyo3(signature = (inputs, *, rows=None, sorted=None, replace=false, replaced=false, collect=0, key=None, overlay=None, block_size=16384, level=1, file_limit=67108864))]
     #[allow(clippy::too_many_arguments)]
     fn join(
         inputs: Vec<(u64, u64)>,
@@ -338,6 +360,7 @@ impl LayerJob {
         sorted: Option<PyRef<'_, SortedEntries>>,
         replace: bool,
         replaced: bool,
+        collect: usize,
         key: Option<String>,
         overlay: Option<PyRef<'_, SortedEntries>>,
         block_size: usize,
@@ -362,7 +385,7 @@ impl LayerJob {
                 .into_iter()
                 .map(|(commit, generation)| LayerStream::new(Stamp { commit, generation }))
                 .collect();
-            let delta = DeltaWriter::new(block_size, level, file_limit, replaced);
+            let delta = DeltaWriter::new(block_size, level, file_limit, replaced, collect);
             let job = LayerJoin::new(src, ins, replace, delta).map_err(to_py)?;
             Ok(LayerJob {
                 kind: Kind::Join(Box::new(job)),
@@ -480,6 +503,7 @@ impl LayerJob {
                 d.set_item("changed", j.delta.changed)?;
                 d.set_item("removed", j.delta.removed)?;
                 d.set_item("written", j.delta.out.entries)?;
+                d.set_item("collected", collected(py, &j.delta.collected)?)?;
             }
         }
         Ok(d.into_any())
