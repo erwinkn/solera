@@ -7,13 +7,19 @@ the id of the engine that writes it, the checkpoint it extends, and every
 event since that checkpoint. A checkpoint is the whole state, written now
 and then under a fresh name.
 
-    {prefix}/journal.json                    {"checkpoint", "engine", "events": [...]}
+    {prefix}/journal.json                    {"checkpoint", "engine", "epoch", "events": [...]}
     {prefix}/checkpoints/{engine}-{n:06d}.json   {"at", "engine", "state": {...}}
 
 **Opening.** Read the journal, load the checkpoint it names and apply its
 events; then fence: swap in the same journal under this engine's own id, on
 the ETag read. A checkpoint gone, or a conflict, means another engine moved
 on meanwhile: read again.
+
+**Epochs.** Each engine that opens takes the next epoch, written by the
+swap that fences: once an engine owns the namespace, its epoch is durable,
+and every later owner's is higher. What an engine names by its epoch (a
+key index merge's output) a fenced engine, whose epoch is lower, never
+mistakes for its own.
 
 **Fencing.** Every write is a swap on the ETag of this engine's last one,
 and no body repeats — each names its engine and adds events or a newer
@@ -121,6 +127,7 @@ class Journal:
         self.clock = clock
 
         self.engine: str | None = None
+        self.epoch = 0  # this engine's: one past its predecessor's, durable once it opened
         self.checkpoint: str | None = None  # the checkpoint the journal names
         self.stopped: Stopped | None = None  # why this journal writes no more
         self.ended = asyncio.Event()  # set with `stopped`: what its engine halts on at once
@@ -146,8 +153,8 @@ class Journal:
     def _journal(self) -> str:
         return f"{self.prefix}/journal.json"
 
-    def _body(self, engine: str | None, checkpoint: str | None, events: list[bytes]) -> bytes:
-        head = _dumps({"checkpoint": checkpoint, "engine": engine})  # sorts before "events"
+    def _body(self, engine: str | None, epoch: int, checkpoint: str | None, events: list[bytes]) -> bytes:
+        head = _dumps({"checkpoint": checkpoint, "engine": engine, "epoch": epoch})  # sorts before "events"
         return head[:-1] + b',"events":[' + b",".join(events) + b"]}"
 
     # -- opening ----------------------------------------------------------------------
@@ -192,17 +199,18 @@ class Journal:
                 self.ended.set()
                 return OpenResult(engine=None, replayed=replayed, checkpoint=checkpoint)
             engine = secrets.token_hex(8)  # no two processes share one (§10)
+            epoch = int(body.get("epoch") or 0) + 1
             try:
                 self._etag = await swap(
                     self.store,
                     self._journal,
-                    self._body(engine, checkpoint, self._events),
+                    self._body(engine, epoch, checkpoint, self._events),
                     found and found[1],
                 )
             except Conflict:
                 log.warning("another engine wrote the journal while this one opened; reading it again")
                 continue
-            self.engine = engine
+            self.engine, self.epoch = engine, epoch
             break
         self._task = asyncio.create_task(self._run())
         return OpenResult(engine=self.engine, replayed=replayed, checkpoint=checkpoint)
@@ -319,7 +327,7 @@ class Journal:
             self.min_checkpoint, self._last_checkpoint_size // 16
         )
         snap = _dumps({"at": self.clock(), "engine": self.engine, "state": self._snapshot()}) if due else None
-        body = self._body(self.engine, self.checkpoint, events)
+        body = self._body(self.engine, self.epoch, self.checkpoint, events)
         self._buffer, self._buffer_bytes, self._first_buffered, self._urgent = [], 0, None, False
         self._sealed = (body, events, len(new), snap)
 
@@ -359,7 +367,9 @@ class Journal:
 
         name, size, listed = self._move
         try:
-            self._etag = await swap(self.store, self._journal, self._body(self.engine, name, []), self._etag)
+            self._etag = await swap(
+                self.store, self._journal, self._body(self.engine, self.epoch, name, []), self._etag
+            )
         except Conflict:
             self._move = None
             self._fail(Fenced("another engine wrote the journal"))

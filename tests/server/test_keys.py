@@ -5,6 +5,7 @@ endpoints and deletes files nothing references — and renames carry all of
 it along (§2)."""
 
 import asyncio
+import contextlib
 import random
 from collections import Counter
 from dataclasses import replace
@@ -295,8 +296,9 @@ async def test_orphaned_merge_outputs_are_collected(state):
     await engine.initialize()
     await run(engine, ["items"])
     index = state.model.indexes[("items", "")]
-    orphan = index.path("m000000000000-000000000003-01ORPHAN.0000")
-    running = index.path("m000000000004-000000000006-01RUNNING.0000")
+    epoch = state.journal.epoch
+    orphan = index.path(f"m000000000000-000000000003-{epoch:06d}-01ORPHAN.0000")
+    running = index.path(f"m000000000004-000000000006-{epoch:06d}-01RUNNING.0000")
     for path in (orphan, running):
         await state.put_object(path, b"not read")
     engine.upkeep._busy[(("items", ""), "tail")] = frozenset({(4, 4), (5, 6)})
@@ -305,6 +307,44 @@ async def test_orphaned_merge_outputs_are_collected(state):
     assert orphan not in present and running in present
     assert {index.path(n) for n in index.referenced()} <= present
     engine.upkeep._busy.clear()
+
+
+async def test_a_fenced_engine_never_collects_its_successors_merge_outputs(tmp_path):
+    """A17: engine A lists `keys/`, pauses; B takes the namespace over and
+    publishes a merge; A resumes and must not delete B's output, which its
+    own model never heard of. A merge output carries its engine's epoch, one
+    past its predecessor's: A deletes only its own epoch's or earlier ones'.
+    B, later, reclaims what A left unpublished."""
+
+    url = tmp_path.as_uri()
+    a = await State.open(url, "test", flush_interval=0.001)
+    engine_a = engine_for(a, items_project([{"id": "a"}]))
+    await engine_a.initialize()
+    await run(engine_a, ["items"])
+    index = a.model.indexes[("items", "")]
+    left = index.path(f"m000000000000-000000000000-{a.journal.epoch:06d}-01LEFT.0000")  # A's, unpublished
+    await a.put_object(left, b"x")
+    await engine_a.upkeep.tasks.close()  # A's tick stops here: it pauses
+
+    b = await State.open(url, "test", flush_interval=0.001)  # takes over: A is fenced
+    assert b.journal.epoch == a.journal.epoch + 1
+    published = index.path(f"m000000000000-000000000000-{b.journal.epoch:06d}-01LIVE.0000")
+    await b.put_object(published, b"x")  # as if B published it: A's model never hears of it
+
+    engine_a.upkeep._orphans_at = float("-inf")
+    await engine_a.upkeep.collect_orphans()  # A resumes
+    assert published in on_disk(b, index)  # a later epoch's: never A's to judge
+    assert left not in on_disk(b, index)  # its own, unpublished
+
+    await b.put_object(left, b"x")
+    engine_b = engine_for(b, items_project([{"id": "a"}]))
+    await engine_b.initialize()
+    await engine_b.upkeep.collect_orphans()
+    assert left not in on_disk(b, index) and published not in on_disk(b, index)  # B's model names neither
+    await engine_b.stop()
+    with contextlib.suppress(Exception):
+        await engine_a.stop()
+    await b.close()
 
 
 async def test_a_merge_that_keeps_failing_stops_and_alarms(state, monkeypatch):
@@ -319,7 +359,7 @@ async def test_a_merge_that_keeps_failing_stops_and_alarms(state, monkeypatch):
         await run(engine, ["items"])
     calls = []
 
-    async def broken(self, plan, endpoints):
+    async def broken(self, plan, endpoints, **_):
         calls.append(plan)
         raise RuntimeError("the store is down")
 

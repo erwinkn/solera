@@ -144,13 +144,14 @@ class Upkeep:
         go of no object the deltas did not already list."""
 
         options, objects, service = self.key_options, self.state.objects, self.keys
+        epoch = self.state.journal.epoch
 
         def work():
             async def go(local):
                 keys = KeyIndex(ObjectIO(objects, local=local), None, index, options)
                 if service is not None:
                     keys.on_write = lambda path, f, data: service.installed(index.prefix, f, path, data)
-                return await keys.merge(plan, endpoints)
+                return await keys.merge(plan, endpoints, epoch=epoch)
 
             # One warm copy serves every engine reader: an index the engine's cache
             # holds is read from its local files, the store otherwise.
@@ -242,7 +243,9 @@ class Upkeep:
         """Every `ORPHAN_SECONDS`, delete the merge outputs (`m…` files) that
         nothing names (docs/key-index-design.md § Lifecycles): no index's
         current spans, no file let go of and still awaiting its readers, no
-        pending cleanup, and no merge running here. A published output is in
+        pending cleanup, and no merge running here — of this engine's epoch or
+        an earlier one, never a later one's (a takeover: the engine that
+        fenced this one). A published output is in
         an index until a later event lets go of it, so a pinned snapshot never
         names an orphan. Delta files are not merge outputs: a dead attempt's
         are its repair intent's."""
@@ -251,6 +254,9 @@ class Upkeep:
         if now - self._orphans_at < ORPHAN_SECONDS:
             return
         self._orphans_at = now
+        listed = await self.state.list_objects("keys/")
+        # Judged after the listing, with no await before the delete: a merge of
+        # this engine's that published meanwhile is named, one still running is.
         named = {index.path(n) for index in self.m.indexes.values() for n in index.referenced()}
         named |= {path for path, _ in self.m.garbage} | set(self.m.cleanup_reads())
         running = {
@@ -258,16 +264,20 @@ class Upkeep:
             for (key, _), ins in self._running()
             if key in self.m.indexes
         }
-        orphans = []
-        for path in await self.state.list_objects("keys/"):
+        own, orphans = self.state.journal.epoch, []
+        for path in listed:
             prefix, _, name = path.rpartition("/")
             if not name.startswith("m") or not name.endswith(".kx") or path in named:
                 continue
-            try:  # m{a:012d}-{b:012d}-{stamp}.{n:04d}.kx
-                a, b = int(name[1:13]), int(name[14:26])
+            try:  # m{a:012d}-{b:012d}-{epoch:06d}-{stamp}.{n:04d}.kx
+                a, b, epoch = int(name[1:13]), int(name[14:26]), int(name[27:33])
             except ValueError:
                 continue
-            if (prefix + "/", a, b) not in running:
+            # Only this engine's epoch or an earlier one's: an earlier engine is
+            # fenced and publishes nothing more, and what this one published its
+            # model names. A later epoch is the engine that fenced this one: its
+            # files are never this one's to judge, whatever this one paused on.
+            if epoch <= own and (prefix + "/", a, b) not in running:
                 orphans.append(path)
         if orphans:
             log.info("deleting %d orphaned merge outputs", len(orphans))

@@ -1390,3 +1390,58 @@ async def test_changes_pages_agree_from_any_cursor(io):
             )
             == paged[::3]
         )
+
+
+async def test_local_reads_find_a_key_whose_versions_run_across_files(io, tmp_path):
+    """A17: a span keeps a key's versions newest first, and they may run
+    across files. The engine cache's lookup took the last file whose first
+    key is not above the key — the oldest versions — and answered generation
+    4 where the store reads 20. Local lookups, named changes and pages agree
+    with the store."""
+
+    o = Options(block_size=128, max_file_bytes=400, small_file=0, whole_threshold=0)
+    state = IndexState(prefix="keys/out/_/")
+    rng = random.Random(8)
+    versions = [rng.randbytes(60) for _ in range(20)]  # incompressible: a few versions a file
+    for c in range(20):
+        ks = [b"a", b"hot", b"z"] if c == 0 else [b"hot"]
+        files, _ = await KeyIndex(io, None, state, o).resolve(
+            SortedEntries.of(ks, [versions[c]] * len(ks)),
+            commit_number=c,
+            attempt=f"a{c}",
+            generation=c + 1,
+        )
+        state = state.committed(c, files)
+    out = await KeyIndex(io, None, state, o).merge((0, len(state.spans)), set(range(1, 21)))
+    state = state.merged(out.inputs, out.span)
+    [span] = state.spans
+    assert sum(f.min <= b"hot" <= f.max for f in span.files) >= 3  # its versions in three files or more
+    cache = EngineCache(str(tmp_path))
+    assert await cache.fill(io, state)
+    with cache.open_present(state) as opened:
+        warm = KeyIndex(ObjectIO(None, local=opened.handles), None, state, o)
+        cold = KeyIndex(io, None, state, o)
+        keys = [b"a", b"hot", b"z"]
+        assert (
+            await warm.lookup(keys)
+            == await cold.lookup(keys)
+            == {
+                b"a": (1, versions[0]),
+                b"hot": (20, versions[19]),
+                b"z": (1, versions[0]),
+            }
+        )
+        for first in (0, 5, 19):
+            assert await warm.changes_page(first, 19, None, 10, keys=keys) == await cold.changes_page(
+                first, 19, None, 10, keys=keys
+            )
+            for limit in (1, 2):  # pages may split differently: the entries agree
+
+                async def entries(index, first=first, limit=limit):
+                    return [
+                        e
+                        async for p in index.changes(first, 19, limit=limit)
+                        for e in zip(p.keys, p.classes, p.generations, p.deleted, p.payloads, strict=True)
+                    ]
+
+                assert await entries(warm) == await entries(cold)

@@ -1102,7 +1102,7 @@ class KeyIndex:
             plan = policy.forced(free)
         return plan
 
-    async def merge(self, plan: tuple[int, int], endpoints: set[int]) -> SpanMerged | None:
+    async def merge(self, plan: tuple[int, int], endpoints: set[int], *, epoch: int = 0) -> SpanMerged | None:
         """Run merge `plan`: the spans it names merged into one, keeping the
         versions the live `endpoints` see. Returns what publishing it takes,
         or None for a span rewritten alone that would not drop a quarter of
@@ -1119,7 +1119,9 @@ class KeyIndex:
         runs = [list(s.files) for s in reversed(ins)]
         job = Merge.spans(len(runs), endpoints=gens, base=a == 0, **self._writer())
         stamp = ulid()
-        files = await self._run(job, runs, lambda n: f"m{a:012d}-{b:012d}-{stamp}.{n:04d}")
+        # Named by the merging engine's epoch: the orphan collector of an engine
+        # since fenced, whose epoch is lower, never takes it for its own.
+        files = await self._run(job, runs, lambda n: f"m{a:012d}-{b:012d}-{epoch:06d}-{stamp}.{n:04d}")
         counts = job.segments
         out = Span(a, b, (start,) + tuple(zip(ends, gens, strict=True)), tuple(files), tuple(counts))
         written = sum(counts)

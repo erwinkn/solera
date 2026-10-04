@@ -374,6 +374,17 @@ impl Local {
             .saturating_sub(1)
     }
 
+    /// The first block that may hold `key` — where its first (newest)
+    /// version is, or would be: a scan of the keys from `key` on starts there.
+    fn block_at(&self, key: &[u8]) -> usize {
+        let i = self.dir.partition_point(|d| d.first.as_slice() < key);
+        if i > 0 && key <= self.dir[i - 1].last.as_slice() {
+            i - 1
+        } else {
+            i
+        }
+    }
+
     /// The block that could hold `key`'s first entry, or None: a span's
     /// file may hold a key several times, its versions crossing blocks, and
     /// the first is the newest.
@@ -494,19 +505,21 @@ impl Snapshot {
         self.runs.iter().flatten().map(|f| f.blocks()).sum()
     }
 
-    /// The newest entry of `key`, live or deleted.
+    /// The newest entry of `key`, live or deleted. A span's key may run
+    /// across files, newest version first: it is in the first file whose
+    /// last key is not below it.
     pub fn get(&mut self, key: &[u8]) -> Result<Option<Hit>> {
         for r in 0..self.runs.len() {
             let run = &self.runs[r];
-            let fi = run.partition_point(|f| f.min().is_some_and(|m| m <= key));
-            if fi == 0 {
+            let fi = first_holding(run, key);
+            let Some(f) = run.get(fi) else { continue };
+            if f.min().is_none_or(|m| m > key) {
                 continue;
             }
-            let f = &run[fi - 1];
             let Some(b) = f.block_of(key) else { continue };
-            let held = matches!(&self.last[r], Some((lf, lb, _)) if (*lf, *lb) == (fi - 1, b));
+            let held = matches!(&self.last[r], Some((lf, lb, _)) if (*lf, *lb) == (fi, b));
             if !held {
-                self.last[r] = Some((fi - 1, b, f.read(b)?));
+                self.last[r] = Some((fi, b, f.read(b)?));
             }
             let buf = &self.last[r].as_ref().expect("just read").2;
             if let Some(hit) = f.find_in(b, buf, key)? {
@@ -658,7 +671,7 @@ impl Snapshot {
         let mut out = Vec::with_capacity(keys.len());
         let mut held = 0u64;
         for &k in keys {
-            let mut g = spans::Groups::of(self.runs_from(Some(k)))?;
+            let mut g = spans::Groups::of(self.runs_at(k))?;
             let mut found = None;
             while let Some((key, versions)) = g.next_group()? {
                 if key.as_slice() < k {
@@ -680,13 +693,14 @@ impl Snapshot {
         Ok(out)
     }
 
-    /// Each run's blocks from the one holding `from` (its first key not
-    /// above it), decoded one at a time.
+    /// Each run's blocks from the one holding `from`, decoded one at a time:
+    /// what holds the keys past `from` (the last file whose first key is not
+    /// above it).
     fn runs_from(&self, from: Option<&[u8]>) -> Vec<spans::Blocks<'_>> {
         self.runs
             .iter()
             .map(|run| {
-                let (mut fi, mut bi) = match from {
+                let at = match from {
                     Some(a) => {
                         let fi = run
                             .partition_point(|f| f.min().is_some_and(|m| m <= a))
@@ -695,20 +709,45 @@ impl Snapshot {
                     }
                     None => (0, 0),
                 };
-                Box::new(move || loop {
-                    let Some(f) = run.get(fi) else {
-                        return Ok(None);
-                    };
-                    if bi >= f.blocks() {
-                        (fi, bi) = (fi + 1, 0);
-                        continue;
-                    }
-                    bi += 1;
-                    return f.decoded(bi - 1).map(Some);
-                }) as spans::Blocks<'_>
+                blocks_from(run, at)
             })
             .collect()
     }
+
+    /// Each run's blocks from the first holding `key` itself, decoded one at a
+    /// time: its versions may run across blocks and files, newest first, so
+    /// from the first file whose last key is not below it.
+    fn runs_at(&self, key: &[u8]) -> Vec<spans::Blocks<'_>> {
+        self.runs
+            .iter()
+            .map(|run| {
+                let fi = first_holding(run, key);
+                let at = run.get(fi).map_or((fi, 0), |f| (fi, f.block_at(key)));
+                blocks_from(run, at)
+            })
+            .collect()
+    }
+}
+
+/// The first file of a run (in key order) whose last key is not below `key`.
+fn first_holding(run: &[Arc<Local>], key: &[u8]) -> usize {
+    run.partition_point(|f| f.max().is_some_and(|m| m < key))
+}
+
+/// A run's blocks from file `at.0`, block `at.1` on, decoded one at a time.
+fn blocks_from(run: &[Arc<Local>], at: (usize, usize)) -> spans::Blocks<'_> {
+    let (mut fi, mut bi) = at;
+    Box::new(move || loop {
+        let Some(f) = run.get(fi) else {
+            return Ok(None);
+        };
+        if bi >= f.blocks() {
+            (fi, bi) = (fi + 1, 0);
+            continue;
+        }
+        bi += 1;
+        return f.decoded(bi - 1).map(Some);
+    })
 }
 
 /// Feeds a `Merge` the decoded blocks of a snapshot's runs, one at a time.
