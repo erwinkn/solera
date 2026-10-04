@@ -73,6 +73,23 @@ def key_bytes(key: str) -> bytes:
     return key.encode("utf-8", "surrogateescape")
 
 
+def index_prefix(output: str, partition: str) -> str:
+    """Where a new index's files go: `keys/{output}/{partition}/` (`_` for the
+    unpartitioned partition). An index keeps its prefix when its output is renamed."""
+
+    from urllib.parse import quote
+
+    return f"keys/{output}/{quote(partition or '_', safe='')}/"
+
+
+def delta_names(d: dict | None) -> list[str]:
+    """The object names of a commit's delta, from its JSON (`DeltaFiles`):
+    its files, and its index if it has one."""
+
+    part = (d or {}).get("part") or {}
+    return [f["name"] for f in part.get("files") or ()] + ([part["index"]] if part.get("index") else [])
+
+
 # -- the engine-held record -------------------------------------------------------------------
 
 

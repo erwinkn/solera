@@ -15,12 +15,14 @@ only evicted. Two tiers:
 
 A copy is the object it claims to be: installed or filled with the size
 the state names, and every block read checked; a size mismatch drops it.
+Thread-safe: the engine's key service, its merges and its readers share it.
 """
 
 from __future__ import annotations
 
 import asyncio
 import os
+import threading
 import uuid
 from collections import OrderedDict
 
@@ -39,6 +41,7 @@ class LayerCache:
         self._disk_used = 0
         self._open: dict[str, int] = {}  # object path -> readers
         self._filling: dict[str, asyncio.Future] = {}
+        self._lock = threading.RLock()
         for name in os.listdir(
             root
         ):  # nothing is trusted across restarts: the state names sizes, not contents
@@ -48,12 +51,14 @@ class LayerCache:
     # -- memory: indexes and small parts (the mapping LayerIndex takes) -------------------
 
     def __contains__(self, key) -> bool:
-        return key in self._mem
+        with self._lock:
+            return key in self._mem
 
     def __getitem__(self, key):
-        v, _ = self._mem[key]
-        self._mem.move_to_end(key)
-        return v
+        with self._lock:
+            v, _ = self._mem[key]
+            self._mem.move_to_end(key)
+            return v
 
     def __setitem__(self, key, value) -> None:
         size = (
@@ -70,7 +75,8 @@ class LayerCache:
             self._mem_used -= s
 
     def get(self, key, default=None):
-        return self[key] if key in self._mem else default
+        with self._lock:
+            return self[key] if key in self._mem else default
 
     # -- disk: raw copies ----------------------------------------------------------------------
 
@@ -78,17 +84,26 @@ class LayerCache:
         return os.path.join(self.root, f"{uuid.uuid5(uuid.NAMESPACE_URL, path).hex}.lay")
 
     def has(self, path: str) -> bool:
-        return path in self._files
+        with self._lock:
+            return path in self._files
 
     def read(self, path: str, start: int, end: int) -> bytes | None:
         """Bytes `[start, end)` of a cached file, or None if not cached."""
 
-        f = self._files.get(path)
-        if f is None:
-            return None
-        self._files.move_to_end(path)
-        with open(f[0], "rb") as fh:
-            return os.pread(fh.fileno(), end - start, start)
+        with self._lock:
+            f = self._files.get(path)
+            if f is None:
+                return None
+            self._files.move_to_end(path)
+            self._open[path] = self._open.get(path, 0) + 1  # not evicted while read
+        try:
+            with open(f[0], "rb") as fh:
+                return os.pread(fh.fileno(), end - start, start)
+        finally:
+            with self._lock:
+                self._open[path] -= 1
+                if not self._open[path]:
+                    del self._open[path]
 
     def _evict(self, need: int, keep: str | None) -> bool:
         for path in list(self._files):
@@ -103,17 +118,19 @@ class LayerCache:
         return self._disk_used + need <= self.disk
 
     def _put(self, path: str, data: bytes, prefix: str) -> bool:
-        if path in self._files:
-            return True
-        if not self._evict(len(data), prefix):
-            return False
+        with self._lock:
+            if path in self._files:
+                return True
+            if not self._evict(len(data), prefix):
+                return False
+            self._disk_used += len(data)  # reserved before it is written
         local = self._local(path)
         tmp = f"{local}.{uuid.uuid4().hex}.tmp"
         with open(tmp, "wb") as fh:
             fh.write(data)
         os.replace(tmp, local)
-        self._files[path] = (local, len(data), prefix)
-        self._disk_used += len(data)
+        with self._lock:
+            self._files[path] = (local, len(data), prefix)
         return True
 
     def install(self, path: str, data: bytes, prefix: str) -> bool:
@@ -124,11 +141,12 @@ class LayerCache:
     def retire(self, paths: list[str]) -> None:
         """Files a published merge let go of: evicted first."""
 
-        for p in paths:
-            if p in self._files and not self._open.get(p):
-                local, size, _ = self._files.pop(p)
-                self._disk_used -= size
-                os.remove(local)
+        with self._lock:
+            for p in paths:
+                if p in self._files and not self._open.get(p):
+                    local, size, _ = self._files.pop(p)
+                    self._disk_used -= size
+                    os.remove(local)
 
     async def fill(self, io: ObjectIO, state: LayerState, *, sides: bool = False) -> bool:
         """Cache every file of the state's main parts (and side parts with
@@ -169,7 +187,8 @@ class LayerCache:
     def warm(self, state: LayerState) -> bool:
         """Whether every main part's file is cached."""
 
-        return all(state.path(f.name) in self._files for x in state.layers for f in x.main.files)
+        with self._lock:
+            return all(state.path(f.name) in self._files for x in state.layers for f in x.main.files)
 
     def hold(self, paths: list[str]):
         """Keep `paths` from eviction while a read uses them."""
@@ -178,15 +197,17 @@ class LayerCache:
 
         class _Hold:
             def __enter__(self):
-                for p in paths:
-                    cache._open[p] = cache._open.get(p, 0) + 1
+                with cache._lock:
+                    for p in paths:
+                        cache._open[p] = cache._open.get(p, 0) + 1
                 return self
 
             def __exit__(self, *exc):
-                for p in paths:
-                    cache._open[p] -= 1
-                    if not cache._open[p]:
-                        del cache._open[p]
+                with cache._lock:
+                    for p in paths:
+                        cache._open[p] -= 1
+                        if not cache._open[p]:
+                            del cache._open[p]
 
         return _Hold()
 
