@@ -1057,9 +1057,10 @@ async def run_attempt(
     worker_id = secrets.token_hex(8)
     claim = {"host": socket.gethostname(), "pid": os.getpid(), "at": time.time()}
     if channel is None and (engine_url or spec.get("engine")):
-        from .channel import HttpChannel
+        from .channel import AttemptChannel, HttpTransport
 
-        channel = HttpChannel(engine_url or spec["engine"], spec["project"], attempt, spec["token"])
+        transport = HttpTransport(engine_url or spec["engine"], spec["token"])
+        channel = AttemptChannel(transport, spec["project"], attempt)
     control_file = ControlFile(objects, run, attempt, worker_id)
     owned = await control_file.own(claim)
     if owned == lifecycle.ENDED:
@@ -1138,7 +1139,7 @@ async def run_attempt(
         await tasks.close()
         await reporter.stop()
         if channel is not None:
-            channel.close()
+            await channel.close()
 
 
 async def _await_owner(objects, run: str, attempt: str, poll: float, channel=None, worker_id="") -> None:
@@ -1472,13 +1473,13 @@ async def run_pool(pool: str, server: str, token: str | None = None, *, project:
 
     import httpx
 
-    from .channel import HttpPoolChannel
+    from .channel import HttpTransport, PoolChannel
 
     capacity = {"cpu": os.cpu_count(), "memory": None, "gpu": None}
     host = f"{socket.gethostname()}:{os.getpid()}"
     project = project or load_project(os.environ["SOLERA_PROJECT"]).manifest["name"]
     context = _attempts()
-    channel = HttpPoolChannel(server, project, pool, token)
+    channel = PoolChannel(HttpTransport(server, token, timeout=60), project, pool)
     try:
         print(f"[pool] {host} polls pool {pool!r}", flush=True)
         while True:
@@ -1591,7 +1592,8 @@ async def main():
         return
     if mode == "sensors":
         # solera_worker sensors --pool NAME --server URL [--token T] [--parent PID] (SOLERA_PROJECT env entrypoint)
-        from .sensors import ORPHANED, HttpSensorChannel, run_sensor_host
+        from .channel import HttpTransport, SensorChannel
+        from .sensors import ORPHANED, run_sensor_host
 
         options = dict(zip(rest[::2], rest[1::2], strict=True))
         token = options.get("--token") or next(
@@ -1599,7 +1601,8 @@ async def main():
             None,
         )
         project = load_project(os.environ["SOLERA_PROJECT"])
-        channel = HttpSensorChannel(options["--server"].rstrip("/"), project.manifest["name"], token)
+        transport = HttpTransport(options["--server"], token, timeout=60)
+        channel = SensorChannel(transport, project.manifest["name"])
         parent = int(options["--parent"]) if "--parent" in options else None
         try:
             code = await run_sensor_host(channel, project, options["--pool"], parent=parent)

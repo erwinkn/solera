@@ -25,3 +25,27 @@ def status_of(detail):
 
 def task_statuses(detail):
     return {t["asset"]: t["status"] for t in detail["tasks"]}
+
+
+def attempt_channel(engine, attempt):
+    """A worker's channel to `engine`'s routes in this process, with the attempt's token."""
+
+    from solera import lifecycle
+    from solera_server.api import local_transport
+    from solera_worker.channel import AttemptChannel
+
+    transport = local_transport(engine, lifecycle.token(engine.secret, attempt))
+    return AttemptChannel(transport, engine.manifest["name"], attempt)
+
+
+def sensor_channel(engine):
+    """The engine's own sensor host's channel, in this process, with its token."""
+
+    from solera import lifecycle
+    from solera_server.api import local_transport
+    from solera_server.sensors import HOST_TOKEN
+    from solera_worker.channel import SensorChannel
+
+    return SensorChannel(
+        local_transport(engine, lifecycle.token(engine.secret, HOST_TOKEN)), engine.manifest["name"]
+    )

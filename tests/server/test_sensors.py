@@ -31,14 +31,16 @@ from solera_server.api import create_app
 from solera_server.engine import Conflict, Engine
 from solera_server.executors.inline import InlinePlacement
 from solera_server.state import State
-from solera_worker.sensors import ORPHANED, OVERRAN, LocalSensorChannel, run_sensor_host
+from solera_worker.sensors import ORPHANED, OVERRAN, run_sensor_host
+
+from .engines import sensor_channel
 
 
 async def open_engine(tmp_path, project, *, host=False, **kw) -> tuple[State, Engine]:
     state = await State.open(tmp_path.as_uri(), "test", flush_interval=0.001)
     placements = {"Local": lambda s, c: InlinePlacement(c, project)}
     if host:
-        kw["sensor_host"] = lambda engine: run_sensor_host(LocalSensorChannel(engine), project, "local")
+        kw["sensor_host"] = lambda engine: run_sensor_host(sensor_channel(engine), project, "local")
     engine = Engine(
         state, project.manifest, placements=placements, clock=state.clock, eval_interval=0.02, **kw
     )
@@ -372,7 +374,7 @@ async def test_a_host_whose_tick_overran_exits_and_the_tick_is_dropped(tmp_path,
     loop = asyncio.get_running_loop()
     project = Project(sensors=[stuck])
     state, engine = await open_engine(tmp_path, project)
-    code = await run_sensor_host(LocalSensorChannel(engine), project, "local")
+    code = await run_sensor_host(sensor_channel(engine), project, "local")
     assert code == OVERRAN
     await asyncio.sleep(0.05)
     engine._sensor_sweep()
@@ -392,9 +394,7 @@ async def test_a_sensors_own_timeout_is_its_outcome_not_an_overrun(tmp_path):
 
     project = Project(sensors=[remote])
     state, engine = await open_engine(tmp_path, project)
-    code = await asyncio.wait_for(
-        run_sensor_host(LocalSensorChannel(engine), project, "local", max_ticks=1), 5
-    )
+    code = await asyncio.wait_for(run_sensor_host(sensor_channel(engine), project, "local", max_ticks=1), 5)
     assert code == 0
     assert "remote request timed out" in rows(engine)[-1]["error"]
     await state.close()
@@ -542,7 +542,7 @@ async def test_a_host_on_old_code_waits_then_starts_afresh(tmp_path):
     state, engine = await open_engine(tmp_path, project)
     engine.manifest = {**engine.manifest, "deploy": "newer"}
     code = await asyncio.wait_for(
-        run_sensor_host(LocalSensorChannel(engine), project, "local", stale_wait=0.05), 5
+        run_sensor_host(sensor_channel(engine), project, "local", stale_wait=0.05), 5
     )
     assert code == 0 and "watch" not in state.model.ticks
     with pytest.raises(ValueError, match="JSON object"):
@@ -680,7 +680,7 @@ async def test_an_overrun_does_not_wait_for_other_sensors(tmp_path, monkeypatch)
     project = Project(sensors=[stuck, slow])
     state, engine = await open_engine(tmp_path, project)
     started = asyncio.get_running_loop().time()
-    code = await run_sensor_host(LocalSensorChannel(engine), project, "local", drain=0.2)
+    code = await run_sensor_host(sensor_channel(engine), project, "local", drain=0.2)
     assert code == OVERRAN and asyncio.get_running_loop().time() - started < 3
     assert "slow" in state.model.ticks  # left to expire
     release.set()
@@ -699,9 +699,7 @@ async def test_an_engines_own_host_stops_once_its_engine_is_gone(tmp_path):
     project = Project(sensors=[quiet])
     state, engine = await open_engine(tmp_path, project)
     gone = os.getppid() + 1_000_000  # no process's parent: as if reparented
-    code = await asyncio.wait_for(
-        run_sensor_host(LocalSensorChannel(engine), project, "local", parent=gone), 5
-    )
+    code = await asyncio.wait_for(run_sensor_host(sensor_channel(engine), project, "local", parent=gone), 5)
     assert code == ORPHANED
     await state.close()
 
@@ -727,7 +725,7 @@ async def test_a_host_with_every_slot_taken_still_stops_once_its_engine_is_gone(
     state, engine = await open_engine(tmp_path, project)
     host = asyncio.create_task(
         run_sensor_host(
-            LocalSensorChannel(engine),
+            sensor_channel(engine),
             project,
             "local",
             concurrency=2,

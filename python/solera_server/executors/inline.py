@@ -33,11 +33,16 @@ class InlinePlacement:
     def _work(self, stage: dict):
         """The worker an attempt runs: `run_attempt`, on the engine's channel."""
 
-        from solera_worker.channel import LocalChannel
+        from solera import lifecycle
+        from solera_server.api import local_transport
+        from solera_worker.channel import AttemptChannel
         from solera_worker.worker import run_attempt
 
-        engine = self.ctx.engine
-        channel = LocalChannel(engine, stage["attempt"]) if engine is not None else None
+        engine, attempt = self.ctx.engine, stage["attempt"]
+        channel = None
+        if engine is not None:
+            transport = local_transport(engine, lifecycle.token(engine.secret, attempt))
+            channel = AttemptChannel(transport, engine.manifest["name"], attempt)
         return run_attempt(
             stage["objects"], stage["attempt"], self.project, run=stage["run"], channel=channel
         )

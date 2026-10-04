@@ -329,28 +329,28 @@ async def test_without_the_channel_the_next_attempt_cleans_up(tmp_path, data, mo
     queued; the partition's next attempt cleanups them (a second delete of the
     same names is no harm)."""
 
-    from solera_worker.channel import LocalChannel
+    from solera_worker.channel import AttemptChannel
 
     project = scores_project()
     state = await State.open(tmp_path.as_uri(), "test", flush_interval=0.001)
     engine = engine_for(state, project)
     await engine.initialize()
     await run(engine, ["scores"])
-    finished = LocalChannel.finished
+    finished = AttemptChannel.finished
 
     async def unreachable(self, body):
         await finished(self, body)
         raise OSError("connection reset")  # its answer is lost
 
-    monkeypatch.setattr(LocalChannel, "finished", unreachable)
+    monkeypatch.setattr(AttemptChannel, "finished", unreachable)
     await run(engine, ["scores"])  # supersedes `a`, cannot clean up
     assert objects(data, "scores") != await named(state, "scores") and state.model.cleanups
-    monkeypatch.setattr(LocalChannel, "finished", finished)
+    monkeypatch.setattr(AttemptChannel, "finished", finished)
 
     async def gone(self, body):
         raise OSError("the worker died before it acknowledged")
 
-    monkeypatch.setattr(LocalChannel, "cleaned_up", gone)
+    monkeypatch.setattr(AttemptChannel, "cleaned_up", gone)
     await run(engine, ["scores"])  # supersedes `a` again: cleanups it, cannot acknowledge
     assert objects(data, "scores") == await named(state, "scores") and state.model.cleanups
     monkeypatch.undo()

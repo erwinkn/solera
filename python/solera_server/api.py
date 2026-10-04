@@ -8,6 +8,8 @@ from __future__ import annotations
 import hmac
 import os
 import re
+import secrets
+import weakref
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -772,3 +774,21 @@ def create_app(
         return FileResponse(web / "index.html")
 
     return app
+
+
+_local_apps: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()  # engine -> its in-process app
+
+
+def local_transport(engine: Engine, token: str):
+    """A transport to `engine`'s own routes in this process, for workers it runs
+    itself (`solera_worker.channel.LocalTransport`): the app is the one a
+    served engine runs, with an admin token nobody holds, so a worker gets in
+    only with its own token, as over HTTPS."""
+
+    from solera_worker.channel import LocalTransport
+
+    app = _local_apps.get(engine)
+    if app is None:
+        app = _local_apps[engine] = create_app(engine=engine, token=secrets.token_hex(16))
+        app.state.engine = engine
+    return LocalTransport(app, token)

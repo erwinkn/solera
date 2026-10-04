@@ -10,9 +10,9 @@ from solera.lifecycle import Ended
 from solera.sdk import Output, Project, Retry, StaticPartitions, asset
 from solera.stores import FileStore, Patch
 from solera_server.state import State
-from solera_worker.channel import LocalChannel
 from solera_worker.worker import run_attempt
 
+from .engines import attempt_channel
 from .remote import REMOTE, Fake, Remote, engine_for, fence, finish_as_worker, launched, own, until
 
 
@@ -38,7 +38,7 @@ async def test_a_duplicate_invocation_waits_for_the_owner_and_writes_nothing(tmp
             attempt,
             project,
             run=run["id"],
-            channel=LocalChannel(engine, attempt),
+            channel=attempt_channel(engine, attempt),
             loser_poll=0.05,
         )
 
@@ -77,7 +77,7 @@ async def test_a_loser_exits_once_the_engine_says_the_attempt_ended(tmp_path):
             attempt,
             project,
             run=run["id"],
-            channel=LocalChannel(engine, attempt),
+            channel=attempt_channel(engine, attempt),
             loser_poll=0.05,
         )
     )

@@ -15,6 +15,7 @@ from solera_server.engine import Engine
 from solera_server.executors import PlacementContext
 from solera_worker.worker import run_attempt
 
+from tests.server.engines import attempt_channel
 from tests.server.remote import Gated, as_worker, fence, own
 
 
@@ -52,8 +53,6 @@ async def test_pool_workers_race_for_a_claim(state):
     workers it fits; they race for its claim. The winner runs it and the
     engine commits it; the loser writes nothing and goes back to polling."""
 
-    from solera_worker.channel import LocalChannel
-
     @asset(executor=Pool("ingest")(cpu=2))
     def job():
         return [{"ok": True}]
@@ -69,7 +68,7 @@ async def test_pool_workers_race_for_a_claim(state):
     assert [s["attempt"] for s in await engine.pool_work("ingest", {"cpu": 4}, "w2", 0)] == [attempt]
 
     async def worker():
-        channel = LocalChannel(engine, attempt)
+        channel = attempt_channel(engine, attempt)
         return await run_attempt(
             stage["objects"], attempt, project, run=stage["run"], channel=channel, pool=True
         )

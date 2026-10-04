@@ -32,52 +32,6 @@ class SensorContext:
         self.cursor, self.snapshot = tick.get("cursor"), tick.get("snapshot") or {}
 
 
-class HttpSensorChannel:
-    def __init__(self, server: str, project: str, token: str | None):
-        import httpx
-
-        headers = {"Authorization": f"Bearer {token}"} if token else {}
-        self.base = f"/api/projects/{project}/sensors"
-        self.client = httpx.AsyncClient(base_url=server, headers=headers, timeout=60)
-
-    async def next(self, executor: str, deploy: str, host: str, slots: int, build: str | None = None) -> dict:
-        params = {"executor": executor, "deploy": deploy, "host": host, "slots": slots, "wait": 30}
-        if build:
-            params["build"] = build  # how this host computed its deploy, for the engine's warning
-        response = await self.client.get(f"{self.base}/next", params=params)
-        response.raise_for_status()
-        return response.json()
-
-    async def post(self, sensor: str, tick: str, outcome: dict) -> dict:
-        response = await self.client.post(f"{self.base}/{sensor}/ticks/{tick}", json=outcome)
-        if response.status_code == 409:
-            raise Ended(response.json().get("detail") or "refused")
-        response.raise_for_status()
-        return response.json()
-
-    async def close(self) -> None:
-        await self.client.aclose()
-
-
-class LocalSensorChannel:
-    """The engine's handlers, called in process (tests)."""
-
-    def __init__(self, engine):
-        self.engine = engine
-
-    async def next(self, executor: str, deploy: str, host: str, slots: int, build: str | None = None) -> dict:
-        return await self.engine.sensor_next(executor, deploy, host, slots, 30, build)
-
-    async def post(self, sensor: str, tick: str, outcome: dict) -> dict:
-        try:
-            return await self.engine.sensor_post(sensor, tick, outcome)
-        except self.engine.Conflict as error:
-            raise Ended(str(error)) from error
-
-    async def close(self) -> None:
-        pass
-
-
 async def run_sensor_host(
     channel,
     project: Project,
