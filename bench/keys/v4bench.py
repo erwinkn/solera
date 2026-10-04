@@ -196,18 +196,19 @@ class SpanFiles:
             tuple[str, bytes, int, int, int, int]
         ] = []  # (file, first key, offset, size, entries, codec)
         self.cache: dict[int, bytes] = {}
+        self.counted: set[int] = set()
 
     async def open(self, io: ObjectIO) -> None:
-        for name, size in self.names:
-            footer = K.parse_footer(await io.read(name, size - K.FOOTER_SIZE, size, size))
-            part = await io.read(name, footer["index_offset"], size, size)
-            index = K.parse_index(part, size)
-            for first, off, bsize, entries, _ in index["blocks"]:
-                self.blocks.append((name, first, off, bsize, entries, index["codec"]))
+        """Every file's block index, in parallel: one GET each (the state knows each file's
+        index length, as `FileInfo.index` does today)."""
 
-    @property
-    def firsts(self) -> list[bytes]:
-        return [b[1] for b in self.blocks]
+        async def index(name, size, index_len):
+            return name, K.parse_index(await io.read(name, size - index_len, size, size), size)
+
+        for name, idx in await asyncio.gather(*(index(n, sz, il) for n, sz, il, _ in self.names)):
+            for first, off, bsize, entries, _ in idx["blocks"]:
+                self.blocks.append((name, first, off, bsize, entries, idx["codec"]))
+        self.firsts = [b[1] for b in self.blocks]
 
     async def fetch(self, io: ObjectIO, lo: int, hi: int, sizes: dict) -> list[bytes]:
         """Blocks [lo, hi), consecutive ones of a file in one range read (up to RANGE)."""
@@ -260,8 +261,9 @@ async def paged(io, spans, sizes, after_fn, limit=PAGE, after=None):
         )
 
         def below(first, starts=starts):
+            # Whole blocks past each span's start block, below `first`: the start block may reach far beyond.
             return sum(
-                s.cum[bisect.bisect_left(s.firsts, first)] - s.cum[st]
+                max(0, s.cum[bisect.bisect_left(s.firsts, first)] - s.cum[st + 1])
                 for s, st in zip(spans, starts, strict=True)
             )
 
@@ -282,7 +284,11 @@ async def paged(io, spans, sizes, after_fn, limit=PAGE, after=None):
             fetches.append(s.fetch(io, start, end, sizes))
             codecs.append(s.blocks[0][5] if s.blocks else 1)
         runs = await asyncio.gather(*fetches)
-        decoded += sum(len(zlib.decompress(b)) for r in runs for b in r)
+        for s, st, r in zip(spans, starts, runs, strict=True):  # each block's decoded size counted once
+            for i in range(st, st + len(r)):
+                if i not in s.counted:
+                    s.counted.add(i)
+                    decoded += len(zlib.decompress(s.cache[i]))
         last, more = after_fn(runs, codecs, after, bound)
         cutoff = bound
         if more is None:  # one page wanted
@@ -317,19 +323,23 @@ def reader(job: dict, out) -> None:
                 offs.append((at, at + size))
                 at += size
             rs = [blocks_of(data[a:z]) for a, z in reversed(offs)]
-            counts, keys, classes = _native.presence([r[0] for r in rs], [r[1] for r in rs], True)
+            counts, _, _ = _native.presence([r[0] for r in rs], [r[1] for r in rs], False)
             first.append(time.perf_counter() - t)
-            result["classes"] = dict(zip(keys, classes, strict=True))
+            result["counts"] = list(counts)
             return 0
         spans = [SpanFiles(names) for names in job["spans"]]
         await asyncio.gather(*(s.open(io) for s in spans))
         got: dict[bytes, int] = {}
+        digest = [0, 0]  # keys, and an order-free checksum of (key, class)
 
         def changes(runs, codecs, after, bound):
             keys, classes, gens, deleted, _, last, more = _native.v4_changes(
                 runs, codecs, after, bound, PAGE, job["g_p"], job["g_n1"]
             )
-            got.update(zip(keys, classes, strict=True))
+            digest[0] += len(keys)
+            digest[1] = (
+                digest[1] + sum(zlib.crc32(k + bytes([c])) for k, c in zip(keys, classes, strict=True))
+            ) % 2**64
             if not first:
                 first.append(time.perf_counter() - t)
             return last, more
@@ -343,7 +353,7 @@ def reader(job: dict, out) -> None:
 
         if job["kind"] == "changes":
             decoded = await paged(io, spans, sizes, changes)
-            result["classes"] = got
+            result["digest"] = digest
             return decoded
         if job["kind"] == "scan":
             decoded = await paged(io, spans, sizes, scan, after=job["after"])  # a page mid-index
@@ -354,16 +364,17 @@ def reader(job: dict, out) -> None:
             # Tails (filters) of every file, then the blocks that may hold each key's newest version.
             found: dict[bytes, tuple[int, bool]] = {}
 
-            async def tail(name):
-                size = sizes[name]
-                footer = K.parse_footer(await io.read(name, size - K.FOOTER_SIZE, size, size))
-                return K.parse_tail(await io.read(name, footer["filters_offset"], size, size), size)
+            async def tail(name, size, tail_len):
+                return K.parse_tail(await io.read(name, size - tail_len, size, size), size)
 
-            names = [n for names in job["spans"] if sum(sizes[x] for x, _ in names) > WHOLE for n, _ in names]
-            tails = dict(zip(names, await asyncio.gather(*(tail(n) for n in names)), strict=True))
+            files = [f for names in job["spans"] if sum(f[1] for f in names) > WHOLE for f in names]
+            names = [f[0] for f in files]
+            tails = dict(
+                zip(names, await asyncio.gather(*(tail(f[0], f[1], f[3]) for f in files)), strict=True)
+            )
             wanted = []
             for s in spans:
-                if sum(sizes[name] for name, _ in s.names) <= WHOLE:  # small spans are read whole, as today
+                if sum(f[1] for f in s.names) <= WHOLE:  # small spans are read whole, as today
                     wanted.append(list(range(len(s.blocks))))
                     continue
                 per_file = {}
@@ -513,7 +524,10 @@ def main():
                 name = f"s{sp.a}-{sp.b}.{j:04d}.kx"
                 await io.write(name, d)
                 sizes[name] = len(d)
-                names.append((name, len(d)))
+                footer = K.parse_footer(d[-K.FOOTER_SIZE :])
+                names.append(
+                    (name, len(d), len(d) - footer["index_offset"], len(d) - footer["filters_offset"])
+                )
             spans_named.append((sp.a, sp.b, names))
 
     asyncio.run(put_all())
@@ -552,8 +566,9 @@ def main():
             "g_n1": HEAD,
         }
         r = isolated(job)
-        got = r.pop("classes")
-        bad = sum(1 for k in truth if got.get(k) != truth[k]) + sum(1 for k in got if k not in truth)
+        keys_got, sum_got = r.pop("digest")
+        want = sum(zlib.crc32(k + bytes([c])) for k, c in truth.items()) % 2**64
+        bad = 0 if (keys_got, sum_got) == (len(truth), want) else -1  # -1: the checksums differ
         row = {
             "behind": b,
             "layout": "v4 spans",
@@ -582,8 +597,8 @@ def main():
                 "delta_sizes": [len(deltas[c]) for c in range(p, head + 1)],
             }
         )
-        got = r.pop("classes")
-        bad = sum(1 for k in truth if got.get(k) != truth[k])
+        counts = r.pop("counts")
+        bad = 0 if counts == [sum(1 for c in truth.values() if c == i) for i in range(4)] else -1
         row = {
             "behind": b,
             "layout": "packed deltas",
