@@ -10,7 +10,7 @@ number says where it comes from: **measured** (real files, today's
 reader: `bench/keys/catchup.py`, `layouts.py`, `tiling_reads.py`),
 **replayed** (the merge policy on metadata, with the density model of
 `amplification.py`: `spans.py`, `retention.py`), or **proved** (Lean,
-`experiments/lean/KeyIndex/WriteBound.lean` on branch
+`experiments/lean/KeyIndex/WriteBound.lean` at 2e60ddc on branch
 `bb/experiment-bend-2-for-the-key-index-s-delta-alge-thr_dqc6iaviun`).
 Replayed numbers are preliminary until the implementation replaces them.
 
@@ -43,10 +43,10 @@ observers cost retained versions, never extra spans, and an observer that
 goes away costs nothing until a merge would rewrite its span anyway.
 
 - **Writes are bounded**, whatever order observers come and go in:
-  written ≤ (16 + 10 log₂ K) × committed, K the most entries a span holds
-  (proved in Lean for guarded merges; the two kinds that drop versions, a
-  span rewritten alone and a merge coalescing a retired endpoint's segments,
-  are being added to the proof). Replayed under the review's churn
+  written ≤ (1 + 43R + 20R log₂ K) × committed, K the most entries a span
+  holds and R the attempts allowed per merge (proved in Lean for guarded
+  merges, including those whose output shrinks below their largest input;
+  R = 1 and K = 10⁹ give 624×: loose, but a guarantee). Replayed under the review's churn
   scenarios: 7–10× at 1M keys, 12–14× at 100M. On real files from one
   trace by the real compactions: 13× against 50× for today's leveled
   planner at 100M keys (8× against 17× at 1M).
@@ -116,15 +116,19 @@ endpoints inside old spans, never more.
 Every merge obeys two conditions:
 
 1. **The guard** (bounds writes). The largest input holds at most 4× the
-   other inputs combined, in entries. Under it, written ≤ (16 + 10 log₂ K)
-   × committed for any sequence of commits, endpoint births and releases,
-   K the most entries a span holds (Lean, for merges whose output is at
-   least their largest input). One kind of merge takes a single input: a
-   span rewritten alone, allowed only when at least a quarter of its
-   entries are versions no live endpoint sees. Its cost is paid by the
-   entries it drops, each dropped once. That case, and merges whose output
-   shrinks below their largest input when a retired endpoint's versions
-   coalesce, are being added to the Lean proof.
+   other inputs combined, in entries, counted before dedup. Under it,
+   written ≤ (1 + 43R + 20R log₂ K) × committed for any sequence of commits,
+   endpoint births and retirements (Lean). Two conditions come with it:
+   - K bounds a span's entries. With one version per segment, distinct
+     keys no longer do; keys × (1 + endpoints live inside the span) does,
+     and so does the total committed over the horizon.
+   - R bounds the attempts per published merge, each counted as written
+     (an abandoned upload included). The engine caps retries of a merge at
+     R and reclaims abandoned outputs.
+   One kind of merge takes a single input: a span rewritten alone, allowed
+   only when at least a quarter of its entries are versions no live
+   endpoint sees. Its cost (at most 3× what it drops) is paid by the dropped
+   entries; whether the theorem covers it as stated is being checked.
 2. **The read bound** (keeps catch-up local). A merge may put a live
    endpoint `e` inside its output only if, in the output, the entries before
    `e` are at most max(λ × the entries from `e` on, Z), with λ = 1 and Z = 1M
@@ -290,7 +294,7 @@ P1-4). Each resource has its own bound:
 
 | Resource | Bound | How |
 |---|---|---|
-| Bytes written | (16 + 10 log₂ K) × committed | the guard on every merge (Lean; version-dropping merges pending) |
+| Bytes written | (1 + 43R + 20R log₂ K) × committed | the guard on every merge, retries capped at R (Lean) |
 | Spans: scan fan-in, filters probed, cold tail GETs | set by the policy, not by observers | merges cross endpoints |
 | Decoded bytes per reader | about one block range per span per page, plus the page | fan-in × 64 KB × a few, plus the page's entries |
 | Extra read per catch-up | 2× its own changes, or 10 MB | the read bound |
@@ -321,7 +325,7 @@ lane at 2M entries per commit, about one core); they differ by at most 4
 spans at the peak.
 
 - **Writes stay at 7–10× (1M) and 12–14× (100M) under every churn pattern**,
-  well inside the bound (16 + 10 log₂ K ≈ 290× at 100M: loose, but
+  well inside the bound (624× for R = 1 and K = 10⁹: loose, but
   independent of the order observers come and go in).
 - **Spans stay at 22 or fewer on average, 30 at most**, from 1 to 1,000
   distinct endpoints. Blocking endpoints gives one group of spans per
@@ -537,11 +541,12 @@ tombstone and the predecessors gone. The replaced versions (`a` g1, `b` g1,
 
 ## What must be checked
 
-**Lean** (proposed by the coordinator; the write bound for guarded merges is done):
+**Lean** (proposed by the coordinator):
 
-- the write bound under the guard, for any order of commits, endpoint births
-  and releases, including single-input rewrites and merges whose output is
-  smaller than their largest input (versions dropped);
+- done (2e60ddc): the write bound under the guard, for any order of
+  commits, endpoint births and retirements, with outputs of any size up to
+  the inputs' total and R attempts per merge; still to check: the
+  single-input rewrite;
 - the tiling: after any sequence of guarded, read-bounded merges, for every
   live endpoint `P` and reserved `N + 1`, the versions kept give the same
   classes as the per-commit fold, and an endpoint born at the head + 1 never
@@ -577,7 +582,7 @@ publication failures; spans and written bytes reported against the bounds.
 |---|---|
 | P1-1 landing points | every attempt that may advance a position reserves the head + 1 at its claim (selections, a pass's first attempt, drains), kept until durable transfer, released on failure; a TLA+ calibration |
 | P1-2 read-ahead state | delivered state from the sealed attempt result; latest read wins; tombstones kept |
-| P1-3 retirement rewrites | merges cross endpoints, so retirement forces nothing; the guard bounds writes in any order (Lean); replayed under the review's churn scenarios |
+| P1-3 retirement rewrites | merges cross endpoints, so retirement forces nothing; the guard bounds writes in any order (Lean, 2e60ddc); replayed under the review's churn scenarios |
 | P1-4 span count, memory | spans set by the policy, not by observers; a bound per resource; versions, not bits |
 | P2-1 retention | five lifetimes accounted separately; byte budgets with backpressure and cancel-restart |
 | P2-2 mixed models | numbers labelled; catch-up measured on real spans against packed deltas and aligned blocks; both layouts built from one trace by real compactions |
