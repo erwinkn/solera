@@ -19,11 +19,13 @@
 (* commit it read at (at most MaxEntries of them), and the full pass due  *)
 (* after a reset or an asset change, with the keys it delivered (the      *)
 (* correction: a pass may be completed across runs, keys= or default).    *)
-(* For each=True, the record is per key (K43): the version it read.       *)
+(* Every asset, each=True too, keeps that one record (K47). An each=True  *)
+(* asset may fail keys: read, not written, failing; a retry pass reads     *)
+(* them again, and collapses the record if it leaves nothing behind.      *)
 (*                                                                         *)
-(* FixNet, FixTransitive, FixSkip, FixContinue and FixCollapse select each *)
-(* rule as designed (TRUE) or without it (FALSE): the model must find     *)
-(* what each rule prevents.                                                *)
+(* FixNet, FixTransitive, FixSkip, FixContinue, FixCollapse and           *)
+(* FixRetryCollapse select each rule as designed (TRUE) or without it     *)
+(* (FALSE): the model must find what each rule prevents.                  *)
 (***************************************************************************)
 EXTENDS Integers, FiniteSets, Sequences, TLC
 
@@ -33,12 +35,14 @@ CONSTANTS
     MaxKeysRuns,  \* keys= runs, of one key each
     MaxChanges,   \* deploys: A moved (a reset), B's patterns changed or version bumped
     MaxEntries,   \* the read-ahead's cap, on entries (K45's amendment)
+    MaxRetries,   \* retry passes of failed keys (each=True)
     Each,         \* B is each=True
     FixNet,       \* "behind" is the net delta: a key added and removed past the position does not count
     FixTransitive,\* stale if an upstream it depends on is stale (K46)
     FixSkip,      \* a default run skips a key a keys= run already read at its version
     FixContinue,  \* a default run continues a pass keys= runs began; else it starts over
-    FixCollapse   \* a keys= commit collapses the record only once every key is covered
+    FixCollapse,  \* a keys= commit collapses the record only once every key is covered
+    FixRetryCollapse \* a retry pass that leaves nothing behind collapses the record (K47)
 
 Keys == 1..NK
 Assets == {"A", "B"}
@@ -57,9 +61,10 @@ VARIABLES
     ver,      \* B's version (A has one, never bumped)
     att,      \* [Assets -> the attempt in flight, or none]
     twice,    \* ghost: a key delivered again at a version, under a definition, it was produced from
-    used      \* budgets spent: [src, keys, changes]
+    failing,  \* [Assets -> {<<key, version>>}]: each=True keys that failed, at the version read
+    used      \* budgets spent: [src, keys, changes, retries]
 
-vars == <<log, clock, life, rec, from, chg, pat, ver, att, twice, used>>
+vars == <<log, clock, life, rec, from, chg, pat, ver, att, twice, failing, used>>
 Outs == {"S", "A", "B"}
 
 -----------------------------------------------------------------------------
@@ -88,7 +93,6 @@ Delta(c, n) == {k \in Pat(c) : \E i \in (n + 1)..Top(Up(c)) : k \in DOMAIN log[U
 (*   ahead: what keys= runs read past it, <<key, version read>> (K45);     *)
 (*   pass: a full pass due (after a reset or an asset change), begun (its *)
 (*     first batch started the output over), the keys it delivered;       *)
-(*   per: each=True only, the version each key was read at (K43);         *)
 (*   def: the definition (deploy) its last finished pass was under.       *)
 
 NoPass == [due |-> FALSE, begun |-> FALSE, done |-> {}]
@@ -97,27 +101,27 @@ InPass(c, r) == r.pass.due \/ r.lf # life[Up(c)] \/ r.snap < 0
 
 \* The version r says key k was last read at (-1: not read).
 ReadAt(c, r, k) ==
-    IF EachOf(c) THEN r.per[k]
-    ELSE LET vs == {e[2] : e \in {e \in r.pass.done \cup r.ahead : e[1] = k}} IN
-         IF vs # {} THEN CHOOSE v \in vs : TRUE   \* one entry per key
-         ELSE IF InPass(c, r) THEN -1
-         ELSE VerAt(Up(c), k, r.snap)
+    LET vs == {e[2] : e \in {e \in r.pass.done \cup r.ahead : e[1] = k}} IN
+    IF vs # {} THEN CHOOSE v \in vs : TRUE   \* one entry per key
+    ELSE IF InPass(c, r) THEN -1
+    ELSE VerAt(Up(c), k, r.snap)
 
-\* The keys r says are behind, c holding `held`: read at an older version or
+\* The keys r says are behind, c holding `held` and failing `fl`: read at an older version or
 \* not at all, or held though no longer wanted. A key's last read version
 \* is the read-ahead's, else the pass's, else the snapshot's (K45): a key
 \* read ahead and then removed upstream is behind, though the net delta
 \* past the snapshot omits it. Without FixNet, a key some commit past the
 \* snapshot touched is behind too, unless read ahead at its version.
-BehindR(c, r, held) ==
-    LET u == Up(c) IN
-    {k \in Pat(c) : LET rv == ReadAt(c, r, k)  cv == Cur(u, k) IN rv # cv /\ ~(rv <= 0 /\ cv = 0)}
-    \cup (held \ Want(c))
-    \cup (IF FixNet \/ EachOf(c) \/ InPass(c, r) THEN {}
-          ELSE {k \in Delta(c, r.snap) : ~\E e \in r.ahead : e[1] = k /\ e[2] = Cur(u, k)})
+BehindR(c, r, held, fl) ==
+    LET u == Up(c)
+        read == {k \in Pat(c) : LET rv == ReadAt(c, r, k)  cv == Cur(u, k) IN rv # cv /\ ~(rv <= 0 /\ cv = 0)}
+        plain == IF FixNet \/ InPass(c, r) THEN {}
+                 ELSE {k \in Delta(c, r.snap) : ~\E e \in r.ahead : e[1] = k /\ e[2] = Cur(u, k)}
+        failingNow == {k \in Keys : <<k, Cur(u, k)>> \in fl}   \* failing, not stale
+    IN (read \cup (held \ Want(c)) \cup plain) \ failingNow
 
 \* The status the record gives: directly, and with its upstream's (K46).
-DirectStale(c) == BehindR(c, rec[c], Held(c)) # {} \/ rec[c].def < chg[c]
+DirectStale(c) == BehindR(c, rec[c], Held(c), failing[c]) # {} \/ rec[c].def < chg[c]
 StoredStale(c) == DirectStale(c) \/ (FixTransitive /\ c = "B" /\ DirectStale("A"))
 
 -----------------------------------------------------------------------------
@@ -125,9 +129,14 @@ StoredStale(c) == DirectStale(c) \/ (FixTransitive /\ c = "B" /\ DirectStale("A"
 (* it should, each key produced from its input's current version under    *)
 (* c's current definition, and its last full pass was under it.           *)
 
+\* A key that failed at its input's current version is failing, not stale;
+\* one that failed at an older version is stale (retried, or its change
+\* delivered).
+Failing(c) == {k \in Keys : <<k, Cur(Up(c), k)>> \in failing[c]}
 Correct(c) ==
-    /\ Held(c) = Want(c)
-    /\ \A k \in Held(c) : from[c][k].v = Cur(Up(c), k) /\ from[c][k].d >= chg[c]
+    /\ \A e \in failing[c] : e[2] = Cur(Up(c), e[1])
+    /\ (Held(c) \ Want(c)) \cup (Want(c) \ Held(c)) \subseteq Failing(c)
+    /\ \A k \in Held(c) \ Failing(c) : from[c][k].v = Cur(Up(c), k) /\ from[c][k].d >= chg[c]
     /\ rec[c].def >= chg[c]
 TrueStale(c) == ~Correct(c) \/ (c = "B" /\ ~Correct("A"))
 
@@ -138,13 +147,14 @@ Init ==
     /\ life = [o \in Outs |-> 0]
     /\ chg = [c \in Assets |-> 0]
     /\ rec = [c \in Assets |-> [snap |-> -1, lf |-> 0, ahead |-> {}, pass |-> DuePass,
-                                per |-> [k \in Keys |-> 0], def |-> 0]]
+                                def |-> 0]]
     /\ from = [c \in Assets |-> [k \in Keys |-> [v |-> 0, d |-> 0]]]
     /\ pat = Keys
     /\ ver = 1
     /\ att = [c \in Assets |-> [busy |-> FALSE]]
     /\ twice = FALSE
-    /\ used = [src |-> 0, keys |-> 0, changes |-> 0]
+    /\ failing = [c \in Assets |-> {}]
+    /\ used = [src |-> 0, keys |-> 0, changes |-> 0, retries |-> 0]
 
 \* A commit of o: each key of m written (a fresh version) or removed;
 \* nothing, if m names no key.
@@ -162,7 +172,7 @@ Commit(o, m) ==
 KeysPlan(c, k) ==
     LET r == rec[c]  first == InPass(c, r) /\ ~r.pass.begun IN
     [kind |-> "keys", over |-> first, pin |-> Top(Up(c)),
-     keys |-> IF k \in Pat(c) /\ (first \/ k \in BehindR(c, r, Held(c))) THEN {k} ELSE {}]
+     keys |-> IF k \in Pat(c) /\ (first \/ k \in BehindR(c, r, Held(c), failing[c])) THEN {k} ELSE {}]
 
 \* A default run: in a pass, the keys it has not delivered at their current
 \* version, and it finishes the pass (FixContinue; else it starts it over);
@@ -173,10 +183,10 @@ DefaultPlan(c) ==
     LET r == rec[c]  goOn == FixContinue /\ r.pass.begun IN
     IF InPass(c, r)
     THEN [kind |-> "default", pin |-> Top(Up(c)), over |-> ~goOn,
-          keys |-> IF goOn THEN BehindR(c, r, Held(c)) ELSE Want(c) \cup Held(c)]
+          keys |-> IF goOn THEN BehindR(c, r, Held(c), failing[c]) ELSE Want(c) \cup Held(c)]
     ELSE [kind |-> "default", pin |-> Top(Up(c)), over |-> FALSE,
-          keys |-> IF FixSkip THEN BehindR(c, r, Held(c))
-                   ELSE BehindR(c, r, Held(c)) \cup {e[1] : e \in r.ahead}]
+          keys |-> IF FixSkip THEN BehindR(c, r, Held(c), failing[c])
+                   ELSE BehindR(c, r, Held(c), failing[c]) \cup {e[1] : e \in r.ahead}]
 
 \* A key delivered again at the input version, under the definition, it was
 \* produced from: delivered twice.
@@ -190,7 +200,7 @@ Claim(c, p) ==
                                    read |-> [k \in Keys |-> Cur(Up(c), k)], def |-> chg[c],
                                    rec |-> rec[c]]]
     /\ twice' = (twice \/ Again(c, p))
-    /\ UNCHANGED <<log, clock, life, rec, from, chg, pat, ver>>
+    /\ UNCHANGED <<log, clock, life, rec, from, chg, pat, ver, failing>>
 
 DefaultRun(c) == Claim(c, DefaultPlan(c)) /\ UNCHANGED used
 
@@ -201,31 +211,43 @@ KeysRun(c, k) ==
     /\ Claim(c, KeysPlan(c, k))
     /\ used' = [used EXCEPT !.keys = @ + 1]
 
+\* A retry pass (each=True) reads the failed keys again, as a keys= run of
+\* them (K47).
+RetryPass(c) ==
+    /\ EachOf(c) /\ failing[c] # {} /\ used.retries < MaxRetries
+    /\ Claim(c, [kind |-> "retry", over |-> InPass(c, rec[c]) /\ ~rec[c].pass.begun,
+                 pin |-> Top(Up(c)), keys |-> {e[1] : e \in failing[c]} \cap Pat(c)])
+    /\ used' = [used EXCEPT !.retries = @ + 1]
+
 -----------------------------------------------------------------------------
 (* Committing. Refused if a reset took the output or its input since the  *)
 (* claim, its asset changed, or the record moved (another commit), as a   *)
 (* stale head is: a batch planned under another definition finishes no    *)
 (* pass due under this one.                                                *)
 
-Settle(c) ==
+\* Commit c's attempt; an each=True batch fails the keys F: read, so they
+\* are recorded, but not written.
+Settle(c, F) ==
     LET a == att[c]  p == a.plan  u == Up(c)  r == rec[c]  ks == p.keys
         valid == a.lf = life[c] /\ a.uplf = life[u] /\ a.rec = r /\ a.def = chg[c]
-        held == (IF p.over THEN {} ELSE Held(c) \ ks) \cup {k \in ks \cap Pat(c) : a.read[k] # 0}
+        ok == ks \ F
+        held == (IF p.over THEN {} ELSE Held(c) \ ok) \cup {k \in ok \cap Pat(c) : a.read[k] # 0}
         got == {<<k, a.read[k]>> : k \in ks}
         \* A read of a key replaces the record's earlier one: the latest wins.
         Merge(es) == {e \in es : e[1] \notin ks} \cup got
-        \* each=True: a key read holds its version; one a start-over dropped, none.
-        per == [k \in Keys |-> IF k \in ks THEN a.read[k] ELSE IF p.over THEN 0 ELSE r.per[k]]
         r2 == IF p.kind = "default"
-              THEN [snap |-> p.pin, lf |-> a.uplf, ahead |-> {}, pass |-> NoPass, per |-> per, def |-> a.def]
+              THEN [snap |-> p.pin, lf |-> a.uplf, ahead |-> {}, pass |-> NoPass, def |-> a.def]
               ELSE IF InPass(c, r)
               THEN [r EXCEPT !.pass = [due |-> TRUE, begun |-> TRUE,
-                                       done |-> IF p.over THEN got ELSE Merge(r.pass.done)],
-                             !.per = per]
-              ELSE [r EXCEPT !.ahead = Merge(@), !.per = per]
-        \* A keys= commit that leaves nothing behind finishes the pass or
-        \* collapses the read-ahead (without FixCollapse: any keys= commit).
-        r3 == IF p.kind = "keys" /\ (FixCollapse => BehindR(c, r2, held) = {})
+                                       done |-> IF p.over THEN got ELSE Merge(r.pass.done)]]
+              ELSE [r EXCEPT !.ahead = Merge(@)]
+        fl == (IF p.over THEN {} ELSE {e \in failing[c] : e[1] \notin ks}) \cup {<<k, a.read[k]>> : k \in F}
+        \* A keys= commit, or a retry pass (FixRetryCollapse), that leaves
+        \* nothing behind finishes the pass or collapses the read-ahead
+        \* (without FixCollapse: any keys= commit).
+        collapse == \/ p.kind = "keys" /\ (FixCollapse => BehindR(c, r2, held, fl) = {})
+                    \/ p.kind = "retry" /\ FixRetryCollapse /\ BehindR(c, r2, held, fl) = {}
+        r3 == IF collapse
               THEN [r2 EXCEPT !.snap = Top(u), !.lf = life[u], !.ahead = {}, !.pass = NoPass,
                               !.def = IF InPass(c, r) THEN a.def ELSE @]
               ELSE r2
@@ -233,11 +255,13 @@ Settle(c) ==
     /\ a.busy
     /\ att' = [att EXCEPT ![c] = [busy |-> FALSE]]
     /\ IF valid
-       THEN /\ Commit(c, [k \in ks \cup (Held(c) \ held) |-> k \in held])
+       THEN /\ Commit(c, [k \in ok \cup (Held(c) \ held) |-> k \in held])
             /\ rec' = [rec EXCEPT ![c] = r3]
             /\ from' = [from EXCEPT ![c] = [k \in Keys |->
-                          IF k \in ks THEN [v |-> a.read[k], d |-> a.def] ELSE @[k]]]
-       ELSE UNCHANGED <<log, clock, rec, from>>
+                          IF k \in ok THEN [v |-> a.read[k], d |-> a.def] ELSE @[k]]]
+            \* A start-over rebuilds from scratch: its failures are the only ones.
+            /\ failing' = [failing EXCEPT ![c] = fl]
+       ELSE UNCHANGED <<log, clock, rec, from, failing>>
     /\ UNCHANGED <<life, chg, pat, ver, twice, used>>
 
 -----------------------------------------------------------------------------
@@ -247,19 +271,20 @@ SrcCommit(k) ==
     /\ used.src < MaxSrc
     /\ \E present \in BOOLEAN : Commit("S", [j \in {k} |-> present])
     /\ used' = [used EXCEPT !.src = @ + 1]
-    /\ UNCHANGED <<life, rec, from, chg, pat, ver, att, twice>>
+    /\ UNCHANGED <<life, rec, from, chg, pat, ver, att, twice, failing>>
 
 \* A move of A resets it (K10): A is empty and new; its record and B's on
-\* it go; a full pass is due for both. An asset change of A.
+\* it go, failure records included; a full pass is due for both. An asset
+\* change of A.
 MoveA ==
     /\ used.changes < MaxChanges
     /\ log' = [log EXCEPT !["A"] = <<>>]
     /\ life' = [life EXCEPT !["A"] = @ + 1]
     /\ chg' = [chg EXCEPT !["A"] = used.changes + 1]
-    /\ rec' = [c \in Assets |-> [rec[c] EXCEPT !.snap = -1, !.ahead = {}, !.pass = DuePass,
-                                          !.per = [k \in Keys |-> 0]]]
+    /\ rec' = [c \in Assets |-> [rec[c] EXCEPT !.snap = -1, !.ahead = {}, !.pass = DuePass]]
     /\ from' = [from EXCEPT !["A"] = [k \in Keys |-> [v |-> 0, d |-> 0]]]
     /\ used' = [used EXCEPT !.changes = @ + 1]
+    /\ failing' = [c \in Assets |-> {}]   \* the failure records go with the others
     /\ UNCHANGED <<clock, pat, ver, att, twice>>
 
 \* B's patterns change (they exclude key NK, or include it again), or its
@@ -271,10 +296,17 @@ ChangeB ==
     /\ chg' = [chg EXCEPT !["B"] = used.changes + 1]
     /\ rec' = [rec EXCEPT !["B"] = [@ EXCEPT !.pass = DuePass, !.ahead = {}]]
     /\ used' = [used EXCEPT !.changes = @ + 1]
-    /\ UNCHANGED <<log, clock, life, from, att, twice>>
+    /\ UNCHANGED <<log, clock, life, from, att, twice, failing>>
 
 Next ==
-    \/ \E c \in Assets : DefaultRun(c) \/ Settle(c) \/ \E k \in Keys : KeysRun(c, k)
+    \/ \E c \in Assets :
+          \/ DefaultRun(c) \/ RetryPass(c) \/ \E k \in Keys : KeysRun(c, k)
+          \* An each=True batch may fail keys it hands the asset: under its
+          \* patterns, held upstream (a removal is the engine's to write).
+          \/ \E F \in SUBSET Keys :
+                /\ EachOf(c) \/ F = {}
+                /\ att[c].busy /\ F \subseteq {k \in att[c].plan.keys \cap Pat(c) : att[c].read[k] # 0}
+                /\ Settle(c, F)
     \/ \E k \in Keys : SrcCommit(k)
     \/ MoveA \/ ChangeB
 
@@ -288,7 +320,16 @@ Spec == Init /\ [][Next]_vars
 StatusExact == \A c \in Assets : ~att[c].busy => (StoredStale(c) <=> TrueStale(c))
 
 \* Nothing is delivered twice (K45): no key again at the version, under
-\* the definition, it was produced from, but by a run that starts over.
+\* the definition, it was produced from.
 DeliveredOnce == ~twice
+
+\* A commit that leaves nothing behind leaves no read-ahead (K47: so the
+\* cap on entries is practically unreachable). An upstream change alone may
+\* make the read-ahead current; only a commit collapses it.
+Collapsed ==
+    [][\A c \in Assets :
+         (att[c].busy /\ ~att'[c].busy /\ rec'[c] # rec[c]
+          /\ ~InPass(c, rec'[c]) /\ BehindR(c, rec'[c], Held(c)', failing'[c]) = {})
+         => rec'[c].ahead = {}]_vars
 
 =============================================================================

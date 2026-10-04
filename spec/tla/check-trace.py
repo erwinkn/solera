@@ -23,7 +23,8 @@ gets further.
 
 Actors are `e{n}` for the simulation's engine n and `r{k}` for its k-th
 read-only open. TLC_HEAP (4g) bounds each TLC run; one worker (the report
-needs it).
+needs it). TRACE_TIMEOUT (seconds) stops a trace's search, reported as
+stopped, neither valid nor not.
 """
 
 from __future__ import annotations
@@ -49,8 +50,10 @@ class Spec:
     # (request, actor, names) -> (kind, name) of the object a request is on,
     # if the spec describes it, else None; `names` is the run's own memory,
     # for names the spec gives otherwise.
-    parse: Callable[[dict, str, dict], tuple | None]
+    parse: Callable[[dict, str, dict], tuple | None] | None
     config: str  # the trace module's TLC config
+    # A run's traces, if not one of `parse`'s requests: (label, requests, constants).
+    traces: Callable[[Path], list[tuple[str, list[dict], dict]]] | None = None
 
 
 CHECKPOINT = re.compile(r"/control/checkpoints/([0-9a-f]+-\d+)\.json$")
@@ -77,9 +80,83 @@ def journal_object(request: dict, actor: str, names: dict) -> tuple | None:
     return ("checkpoints", checkpoint(m.group(1))) if m else None
 
 
+ATTEMPT = re.compile(r"/runs/[^/]+/([^/.]+)\.(control|spec)$")
+
+
+def attempt_traces(path: Path) -> list[tuple[str, list[dict], dict]]:
+    """A run's control-file requests, one trace per partition (Attempt.tla
+    models one): attempts numbered in the order their files were created,
+    workers by copy, and an engine older than the newest one that has
+    acted as the zombie."""
+
+    rows = [json.loads(line) for line in path.read_text().splitlines()]
+    rows = [r for r in rows if "kind" in r and ATTEMPT.search(r["path"])]
+    partition = {
+        ATTEMPT.search(r["path"]).group(1): tuple(r["partition"]) for r in rows if r.get("partition")
+    }
+    by: dict[tuple, list[dict]] = {}
+    number: dict[str, int] = {}
+    newest = -1
+    for r in rows:
+        attempt, obj = ATTEMPT.search(r["path"]).groups()
+        if attempt not in partition:
+            continue
+        who = r["who"] or ["engine", newest]
+        if who[0] == "engine":
+            newest = max(newest, who[1])
+        events = by.setdefault(partition[attempt], [])
+        if obj == "control" and r["kind"] == "create" and attempt not in number:
+            number[attempt] = 1 + sum(1 for a in number if partition[a] == partition[attempt])
+        if attempt not in number:
+            continue  # its spec, before the file: the engine's own write
+        role = "worker" if who[0] == "worker" else "zombie" if who[1] < newest else "engine"
+        events.append(
+            {
+                "e": role,
+                "i": number[attempt],
+                "c": who[2] if who[0] == "worker" else 0,
+                "obj": obj,
+                "req": r["kind"],
+                "out": r["outcome"],
+                "st": r.get("state") or "",
+            }
+        )
+    out = []
+    for (asset, part), events in by.items():
+        n = max(ev["i"] for ev in events)
+        copies = sorted({ev["c"] for ev in events if ev["c"]} | {1})
+        constants = {"TraceN": n, "TraceCopies": copies, "TraceRestarts": newest + 2}
+        out.append((f"{path.stem}-{asset}{('-' + part) if part else ''}", events, constants))
+    return out
+
+
 # The specs checked against simulation runs. The first, the segment journal
 # (Journal.tla), retired with its code (docs/verification.md).
 SPECS = {
+    "attempt": Spec(
+        "Attempt",
+        None,
+        """\
+INIT TInit
+NEXT TNext
+CONSTANTS
+    N <- TraceN
+    Copies <- TraceCopies
+    MaxRestarts <- TraceRestarts
+    Zombie = TRUE
+    LostAnswers = TRUE
+    Missing = Missing
+    Unread = Unread
+    PreCreate = TRUE
+    TakeWriting = TRUE
+    EngineSwaps = TRUE
+    Classify = TRUE
+    OfferDurable = TRUE
+INVARIANT NotDone TypeOK NoWriteAfterNone NoOrphanWrite CompleteLanded WritesInOrder
+CHECK_DEADLOCK FALSE
+""",
+        attempt_traces,
+    ),
     "journal": Spec(
         "JournalObject",
         journal_object,
@@ -151,47 +228,58 @@ def tla(value) -> str:
     return str(value)
 
 
-def log_module(spec: Spec, events: list[dict]) -> str:
-    actors = sorted({ev["e"] for ev in events})
-    records = ",\n    ".join(
-        "[" + ", ".join(f"{k} |-> {tla(ev[k])}" for k in ("e", "req", "obj", "n", "out", "listed")) + "]"
-        for ev in events
-    )
+def log_module(spec: Spec, events: list[dict], constants: dict) -> str:
+    fields = sorted(events[0])
+    records = ",\n    ".join("[" + ", ".join(f"{k} |-> {tla(ev[k])}" for k in fields) + "]" for ev in events)
+    defs = "".join(f"{k} == {tla(v)}\n" for k, v in constants.items())
     return (
-        f"---- MODULE {spec.module}TraceLog ----\nEXTENDS Sequences\n"
-        f"TraceActors == {tla(actors)}\nTraceMaxN == {len(events) + 1}\n"
+        f"---- MODULE {spec.module}TraceLog ----\nEXTENDS Sequences\n{defs}"
         f"Trace == <<\n    {records}\n    >>\n====\n"
     )
 
 
-def check(spec: Spec, path: Path, work: Path) -> bool:
+def traces(spec: Spec, path: Path) -> list[tuple[str, list[dict], dict]]:
+    """A run's traces: one, of the requests `parse` keeps, unless the spec
+    splits them itself."""
+
+    if spec.traces is not None:
+        return spec.traces(path)
     events = requests(spec, path)
-    if not events:
-        print(f"{path.name}: no requests")
-        return True
+    constants = {"TraceActors": sorted({ev["e"] for ev in events}), "TraceMaxN": len(events) + 1}
+    return [(path.stem, events, constants)] if events else []
+
+
+def check(spec: Spec, label: str, events: list[dict], constants: dict, work: Path) -> bool | None:
+    """Whether TLC finds a behaviour that makes `events` (None: stopped)."""
+
     trace = f"{spec.module}Trace"
     for name in (spec.module, trace):
         (work / f"{name}.tla").write_text((HERE / f"{name}.tla").read_text())
-    (work / f"{trace}Log.tla").write_text(log_module(spec, events))
+    (work / f"{trace}Log.tla").write_text(log_module(spec, events, constants))
     (work / f"{trace}.cfg").write_text(spec.config)
     heap = os.environ.get("TLC_HEAP", "4g")
     cmd = ["java", f"-Xmx{heap}", "-cp", str(JAR), "tlc2.TLC", "-workers", "1"]
     cmd += ["-metadir", str(work / "states"), "-config", f"{trace}.cfg", f"{trace}.tla"]
-    log = subprocess.run(cmd, cwd=work, capture_output=True, text=True).stdout
-    (work / f"{path.stem}.log").write_text(log)
+    limit = float(os.environ.get("TRACE_TIMEOUT", "0")) or None
+    try:
+        log = subprocess.run(cmd, cwd=work, capture_output=True, text=True, timeout=limit).stdout
+    except subprocess.TimeoutExpired:  # TLC is killed with it
+        print(f"{label}: stopped after {limit:g} s ({len(events)} requests)")
+        return None
+    (work / f"{label}.log").write_text(log)
     violated = re.search(r"Invariant (\w+) is violated", log)
     if violated and violated.group(1) == "NotDone":
-        print(f"{path.name}: valid ({len(events)} requests)")
+        print(f"{label}: valid ({len(events)} requests)")
         return True
     if violated:
-        print(f"{path.name}: the run breaks {violated.group(1)}")
+        print(f"{label}: the run breaks {violated.group(1)}")
         return False
     done = max([int(n) for n in re.findall(r'<<"explained", (\d+)>>', log)] + [0])
     if "Finished in" not in log or done >= len(events):
         print(log[-3000:])
-        print(f"{path.name}: TLC failed")
+        print(f"{label}: TLC failed")
         return False
-    print(f"{path.name}: {done} of {len(events)} requests explained; no behaviour makes request {done + 1}:")
+    print(f"{label}: {done} of {len(events)} requests explained; no behaviour makes request {done + 1}:")
     actor = events[done]["e"]
     for j, ev in [(j, ev) for j, ev in enumerate(events[: done + 1]) if ev["e"] == actor][-8:]:
         print(f"    {j + 1:5d}  {fmt(ev)}")
@@ -205,8 +293,7 @@ def check(spec: Spec, path: Path, work: Path) -> bool:
 
 
 def fmt(ev: dict) -> str:
-    listed = f" -> {ev['listed']}" if ev["req"] == "list" else ""
-    return f"{ev['e']:4s} {ev['req']:8s} {ev['obj']:11s} {str(ev['n'] or ''):>12} {ev['out']}{listed}"
+    return "  ".join(f"{k}={ev[k]}" for k in sorted(ev) if ev[k] not in ((), [], "", 0) or k == "out")
 
 
 def simulate(out: Path) -> list[Path]:
@@ -234,13 +321,20 @@ def main() -> int:
     with tempfile.TemporaryDirectory() as tmp:
         work = Path(tmp)
         runs = [Path(a) for a in sys.argv[2:]] or simulate(work / "runs")
-        failed = [run for run in runs if not check(spec, run, work)]
+        checked = [
+            (label, check(spec, label, events, constants, work))
+            for run in runs
+            for label, events, constants in traces(spec, run)
+        ]
+        failed = [label for label, ok in checked if ok is False]
+        stopped = sum(1 for _, ok in checked if ok is None)
         if failed and os.environ.get("TLA_LOGS"):
             logs = Path(os.environ["TLA_LOGS"])
             logs.mkdir(parents=True, exist_ok=True)
-            for run in failed:
-                (logs / f"{run.stem}.log").write_text((work / f"{run.stem}.log").read_text())
-        print(f"{len(runs) - len(failed)} of {len(runs)} runs valid")
+            for label in failed:
+                (logs / f"{label}.log").write_text((work / f"{label}.log").read_text())
+        valid = len(checked) - len(failed) - stopped
+        print(f"{valid} of {len(checked)} traces valid, {stopped} stopped, from {len(runs)} runs")
         return 1 if failed else 0
 
 

@@ -142,17 +142,14 @@ Launch(i) ==
     /\ UNCHANGED <<control, purged, fence, fenceBy, created, abandoned, decided, requested, eseen,
                    restarts, worker, ghost>>
 
-\* The engine is fenced, or crashes, before AttemptLaunched lands: the
-\* attempt goes with its memory. The next engine never learns of it and
-\* claims the partition for the next attempt; the file stays `open`.
+\* The launch fails before AttemptLaunched lands (a request errs), or the
+\* engine is fenced or crashes then: the attempt goes. No engine learns of
+\* it; the partition is claimed for the next attempt; the file stays `open`.
 Abandon(i) ==
     /\ i \in created \ (launched \cup abandoned)
-    /\ restarts < MaxRestarts
     /\ abandoned' = abandoned \cup {i}
-    /\ restarts' = restarts + 1
-    /\ eseen' = [j \in Attempts |-> Unread]
-    /\ UNCHANGED <<control, purged, fence, fenceBy, created, launched, decided, requested, worker,
-                   ghost>>
+    /\ UNCHANGED <<control, purged, fence, fenceBy, created, launched, decided, requested, eseen,
+                   restarts, worker, ghost>>
 
 \* GET the control file of an attempt the engine is about to end.
 Read(i) ==
@@ -205,9 +202,10 @@ Restart ==
     /\ UNCHANGED <<control, purged, fence, fenceBy, created, abandoned, launched, decided, requested, worker, ghost>>
 
 \* Retention deletes the attempt's spec and control file, any time after
-\* its end is durable. Nothing is kept.
+\* its end is durable, or once it was abandoned. Nothing is kept.
 Purge(i) ==
-    /\ decided[i] # "undecided" /\ i \notin purged
+    /\ decided[i] # "undecided" \/ i \in abandoned
+    /\ i \notin purged
     /\ purged' = purged \cup {i}
     /\ control' = Set(control, i, Missing)
     /\ UNCHANGED <<fence, fenceBy, engine, worker, ghost>>
@@ -294,6 +292,13 @@ Drain(w) ==
     /\ wrote' = Set(wrote, w, "none")
     /\ UNCHANGED <<control, purged, fence, fenceBy, engine, wseen, ghost>>
 
+\* A batch with nothing to write to a gated store seals without the gate.
+NothingToWrite(w) ==
+    /\ wpc[w] = "gate"
+    /\ wpc' = Set(wpc, w, "seal")
+    /\ wrote' = Set(wrote, w, "none")
+    /\ UNCHANGED <<control, purged, fence, fenceBy, engine, wseen, ghost>>
+
 \* Mark the file `writing` before the first store mutation.
 Gate(w) ==
     /\ wpc[w] = "gate"
@@ -342,7 +347,8 @@ Next ==
           \/ Purge(i)
     \/ Restart
     \/ \E w \in Workers :
-          Boot(w) \/ ReadControl(w) \/ Own(w) \/ Acquire(w) \/ Drain(w) \/ Gate(w) \/ Write(w)
+          Boot(w) \/ ReadControl(w) \/ Own(w) \/ Acquire(w) \/ Drain(w) \/ NothingToWrite(w)
+          \/ Gate(w) \/ Write(w)
           \/ Seal(w) \/ SwapUnheard(w) \/ Crash(w)
 
 Spec == Init /\ [][Next]_vars

@@ -134,6 +134,11 @@ class Simulation(RuleBasedStateMachine):
             line["listed"] = [p.removeprefix(root) for p in listed]
         if data is not None and path.endswith("/control/journal.json"):
             line["names"] = json.loads(data)["checkpoint"]  # a move names a new one; an append keeps it
+        elif data is not None and path.endswith(".control"):
+            line["state"] = json.loads(data).get("state")  # what a control file write wrote
+        elif data is not None and path.endswith(".spec"):
+            spec = json.loads(data)  # the partition an attempt runs
+            line["partition"] = [spec.get("asset"), spec.get("partition")]
         self.requests.append(line)
 
     def _db_fault(self, kind, partition):

@@ -443,6 +443,18 @@ New sweeps since that summary:
 | Z13 | semantic change (d) (fae165c), seeded interleavings | 991 | 241 runs, 12,514 steps, 28 h | pg | a worker read a `checks` delta file collection had deleted: F36 (fixed since, 0720b87) |
 | Z14 | as Z13, asyncio's order (`SOLERA_SIM_ORDER=fifo`) | 991 | 250 runs × 50 steps | pg | F36 again, and `copy` and `checks` never converge after automations: F38 |
 
+## Formal models: which spec owns which rules
+
+Four TLA+ specs, checked by `spec/tla/check.sh` (`check.sh` alone is CI).
+Each rule has one owner, so none falls between them:
+
+| Spec | Owns | Leaves to |
+|---|---|---|
+| `Execution.tla` | the engine: runs, claims, attempts, passes and batches of default runs; positions as default runs move them; resets and the reset rule; asset changes and `OnChange` (K34); fenced stores, gates and repairs; engine crash, restart and takeover; worker crashes, timeouts, cancels | `keys=` runs and staleness to `Positions.tla`; the attempt's control file to `Attempt.tla`; the journal to `JournalObject.tla` |
+| `Positions.tla` | partition records: snapshots, K45's read-ahead and its cap, `each=True`'s per-key records, the full pass completed across runs; `keys=` runs; staleness, exact and transitive (K39, K46); and the concurrency that can break them: a batch planned at the claim and committed later, upstream commits between, a commit refused after a reset or an asset change | workers, faults and engines to `Execution.tla` |
+| `Attempt.tla` | the attempt control file: who owns an attempt, the gate, the sealed result or the engine's end; duplicates, zombies, retention; nobody learns of an attempt before its launch is durable (F26) | what an attempt computes to `Execution.tla` |
+| `JournalObject.tla` | the journal: fencing, appends, checkpoints and their cleanup, lost answers, failed requests | what the events mean to the others |
+
 ## Formal model: execution semantics (`spec/tla/Execution.tla`)
 
 The simulation samples interleavings of the real code; the model checker
@@ -670,7 +682,7 @@ it read 1 and 2.
 ## Formal model: positions and staleness (`spec/tla/Positions.tla`)
 
 *The design of `positions-from-reads.md` (K43; K45 and its amendment; the
-full pass completed across runs; K46), not built yet.* What a run reads,
+full pass completed across runs; K46; K47).* What a run reads,
 what the partition record keeps of it, and whether the status derived
 from that record tells the truth. `Execution.tla` keeps the engine,
 faults and resets with default runs; this model leaves them out to reach
@@ -690,9 +702,11 @@ record of an incremental input: a snapshot (the upstream commit read
 through); the read-ahead, the keys `keys=` runs read past it with the
 version read (K45: the amendment's `(commit, attempt)` entries say the
 same), at most `MaxEntries` of them; the full pass due after a reset or
-an asset change, with the keys it delivered; for `each=True`, the
-version each key was read at; and the definition the last finished pass
-was under. A ghost records, per output key, the input version and the
+an asset change, with the keys it delivered; and the definition the last
+finished pass was under. Every asset keeps this one record, `each=True`
+too (K47): no per-key payloads. An `each=True` batch may fail keys it
+hands the asset: read, so recorded, but not written, and failing (the
+failure index, at the version read); a retry pass reads them again. A ghost records, per output key, the input version and the
 definition it was produced from: the truth the record is checked
 against.
 
@@ -701,7 +715,8 @@ first delivery starting the output over; outside one, it reads its key
 ahead if it is behind. A default run in a pass delivers the keys not yet
 delivered at their version and finishes the pass; outside one, what is
 behind. A keys= commit that leaves nothing behind finishes the pass or
-collapses the read-ahead. An attempt planned before a reset of its
+collapses the read-ahead; so does a retry pass that leaves nothing
+behind (K47). An attempt planned before a reset of its
 output or its input, or before an asset change, or against a record that
 moved since, commits nothing.
 
@@ -711,6 +726,10 @@ moved since, commits nothing.
 |---|---|
 | `StatusExact` | with no attempt in flight, the status the record gives equals the truth: the output holds exactly its input's keys under its patterns, each produced from the input's current version under its current definition, and, for `B`, so does `A` (K46: stale if its upstream is) |
 | `DeliveredOnce` | no key is delivered again at the input version, under the definition, it was produced from (K45, and the pass completed across runs) |
+| `Collapsed` | action: a commit that leaves nothing behind leaves no read-ahead entry (K47: the cap on entries is practically unreachable) |
+
+The truth counts a key that failed at its input's current version as
+failing, not stale; one that failed at an older version as stale.
 
 **Calibration.**
 
@@ -721,18 +740,21 @@ moved since, commits nothing.
 | `FixSkip`: a default run skips a key a `keys=` run read at its version | `DeliveredOnce`, 8 steps |
 | `FixContinue`: a default run continues a pass `keys=` runs began | `DeliveredOnce`, 6 steps: it starts the pass over and delivers their keys again |
 | `FixCollapse`: a `keys=` commit collapses the record only once nothing is behind | `StatusExact`, 4 steps |
+| `FixRetryCollapse`: a retry pass that leaves nothing behind collapses the record (K47) | `Collapsed`, 8 steps |
 
 **Results.**
 
 | Model | Keys | Distinct states | Time |
 |---|---|---|---|
 | `base`: `B` not `each`; two commits to `S`, two `keys=` runs, one deploy, one read-ahead entry | 2 | 1,857,464 | 14 s |
-| `each`: `B` is `each=True` | 2 | 1,857,464 | 14 s |
+| `each`: `B` is `each=True`, on the same record, failing keys and one retry pass | 2 | 5,379,738 | ~1 min |
 | `three` | 3 | 7,388,487 | 1 min 10 s |
 
-`each` reaches the same states as `base`: in this chain, which copies
-keys one to one, the snapshot and its read-ahead answer exactly as the
-per-key records do.
+Before K47, `B` as `each=True` with per-key records reached exactly the
+states of `B` on the plain record, with the same verdicts: where an output
+key depends on one input key, the snapshot and its read-ahead answer
+exactly as per-key records do. That is why `each=True` keeps the same
+record (K47).
 
 **What the model found** (design points, sent to W22):
 - *A key read ahead, then removed upstream.* `A`'s snapshot is at `N`;
@@ -748,7 +770,15 @@ per-key records do.
   under the old definition must not finish the pass due under the new
   one: the model refuses its commit, as for a reset. The note does not
   say yet; W22 to confirm.
-- *A start-over drops the records of the keys it does not deliver.*
+- *A start-over drops the records of the keys it does not deliver,* and
+  the failure index with them: the output is rebuilt from scratch.
+- *A reset of the input drops the failure records* with the other
+  records that read it; else an outdated failure is left with no pass to
+  clear it.
+- *A key failing at its current version is not behind,* in the record's
+  status as in the truth; and a batch fails only keys it hands the asset
+  (under the patterns, held upstream), not a removal or a start-over's
+  drop, which the engine writes.
 
 ## Formal model: the journal object (`spec/tla/JournalObject.tla`)
 
@@ -873,7 +903,9 @@ attempts' store writes landed, and in what order.
   boots (stopping if its spec is gone), reads the file, swaps
   it to `owned`, acquires its generation at the store, swaps it to
   `writing`, writes (the transaction checks the generation), and swaps it
-  to `sealed`. A requested cancel lets it drain before `writing`. Its
+  to `sealed`. A requested cancel lets it drain before `writing`; a
+  batch with nothing to write seals without the gate (found by trace
+  validation). Its
   swaps can land with the answer lost; its retry, refused, reads back its
   own body. A refused swap that finds `ended`, another worker's body, or
   no file stops it. Workers pause anywhere and crash anywhere.
@@ -940,9 +972,9 @@ one engine restart, the zombie, lost answers):
 
 | Model | Attempts | Workers each | Distinct states | Depth | Time |
 |---|---|---|---|---|---|
-| `small` | 2 | 1 | 1,954,036 | 32 | 42 s |
-| `dup`: a duplicate worker | 1 | 2 | 41,024 | 20 | 2 s |
-| `live`: liveness, the engine fair | 2 | 1 | 1,954,036 | 32 | 3 min 59 s |
+| `small` | 2 | 1 | 2,181,664 | 32 | 42 s |
+| `dup`: a duplicate worker | 1 | 2 | 43,740 | 20 | 2 s |
+| `live`: liveness, the engine fair | 2 | 1 | 2,181,664 | 32 | 3 min 59 s |
 
 Two attempts with a duplicate worker each (`check.sh attempt big`) is
 too large to finish here. An earlier version, without draining, passed
@@ -1035,9 +1067,27 @@ before the move (`GiveUp`). Checking the code against the spec by hand
 found the move whose outcome is never settled (F24) and the 32-bit engine
 id (F25).
 
-**Next:** the attempt control file (`Attempt.tla`), as its code lands.
-`Execution.tla` needs an abstraction map (key sets, one partition per
-asset) and comes last.
+**The attempt control file** (`Attempt.tla`, `AttemptTrace.tla`;
+`check-trace.py attempt`). `Attempt.tla` models one partition, so a run
+is split into one trace per partition: the export records the partition
+from each attempt's spec and the state each control-file write wrote.
+Attempts are numbered in the order their files were created, and an
+engine older than the newest that has acted is the zombie. The fenced
+store's acquire and writes, and the engine's journal decisions, make no
+object request: they are steps any request may follow. Of a batch of 20
+simulation runs (about nine partition traces each), 16 were explained in
+full; the other 4, each with a partition of about 90 requests, were
+stopped at 10 minutes (`TRACE_TIMEOUT`), the search's cost, not yet
+looked into; no trace had a request the spec could not make. The batch
+found three steps `Attempt.tla` lacked, now in it: a batch with nothing to
+write seals without the gate (`NothingToWrite`); a launch that fails
+before `AttemptLaunched` lands abandons its attempt with no engine
+restarting (`Abandon`); and retention deletes an abandoned attempt's
+files (`Purge`). Every `Attempt.tla` model and calibration passes or fails
+as before.
+
+**Next:** `Execution.tla` needs an abstraction map (key sets, one
+partition per asset) and comes last.
 
 ## Findings
 

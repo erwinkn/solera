@@ -92,6 +92,7 @@ model() {
         positions/skip) changes=(FixSkip=FALSE) ;;
         positions/continue) changes=(FixContinue=FALSE) ;;
         positions/collapse) changes=(FixCollapse=FALSE) ;;
+        positions/retry-collapse) changes=(Each=TRUE FixRetryCollapse=FALSE) ;;
         *) echo "no model $2 of $1" >&2; exit 2 ;;
     esac
 }
@@ -138,6 +139,8 @@ calibration() {
             calibrate continue DeliveredOnce
             # K45: a keys= commit collapses the record while a key is behind.
             calibrate collapse StatusExact
+            # K47: a retry pass that leaves nothing behind keeps its entries.
+            calibrate retry-collapse Collapsed
             ;;
         attempt)
             # A create-if-absent gate with nothing retained: a worker that read its
