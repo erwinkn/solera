@@ -244,6 +244,13 @@ impl SpanMerge {
         }
     }
 
+    /// The two views' net merge (W53 prototype): a key absent before the
+    /// output's range and absent after it (added and removed inside) is
+    /// dropped, not kept as a tombstone.
+    pub fn drop_absent(&mut self) {
+        self.retainer.drop_absent();
+    }
+
     fn write(&mut self, v: Version) -> Result<()> {
         let key = self.gather.key.as_deref().expect("a key gathered");
         self.segments[self

@@ -1451,7 +1451,7 @@ impl Merge {
     /// keeping the versions the live `endpoints` (generations) see; `base`
     /// when the output starts at commit 0 (docs/key-index-design.md).
     #[staticmethod]
-    #[pyo3(signature = (runs, *, endpoints, base, block_size=65536, level=1, bits_per_item=14, k=10, codec=1, max_file_bytes=67108864))]
+    #[pyo3(signature = (runs, *, endpoints, base, block_size=65536, level=1, bits_per_item=14, k=10, codec=1, max_file_bytes=67108864, net=false))]
     #[allow(clippy::too_many_arguments)]
     fn spans(
         runs: usize,
@@ -1463,19 +1463,18 @@ impl Merge {
         k: u8,
         codec: u8,
         max_file_bytes: usize,
+        net: bool,
     ) -> PyResult<Merge> {
         guard(|| {
             let o = options(block_size, level, bits_per_item, k, codec);
+            let mut job = SpanMerge::new(runs, endpoints, base, o, max_file_bytes);
+            if net {
+                job.drop_absent();
+            }
             Ok(Merge {
                 key: None,
                 local: None,
-                kind: Kind::Spans(Box::new(SpanMerge::new(
-                    runs,
-                    endpoints,
-                    base,
-                    o,
-                    max_file_bytes,
-                ))),
+                kind: Kind::Spans(Box::new(job)),
             })
         })
     }
@@ -2009,6 +2008,7 @@ fn _panic(py: Python<'_>, message: &str, parallel: bool) -> PyResult<()> {
 fn solera_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("CODEC_NONE", format::CODEC_NONE)?;
     m.add("CODEC_ZLIB", format::CODEC_ZLIB)?;
+    m.add("CODEC_ZSTD", format::CODEC_ZSTD)?;
     m.add("FOOTER_SIZE", format::FOOTER_SIZE)?;
     m.add("FormatError", m.py().get_type::<FormatError>())?;
     m.add("LimitError", m.py().get_type::<LimitError>())?;

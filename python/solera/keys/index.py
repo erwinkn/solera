@@ -359,6 +359,7 @@ class DeltaFiles:
 class Options:
     block_size: int = 64 * 1024
     level: int = 1
+    codec: int = 1  # 1 zlib, 2 zstd (W53 prototype)
     bits_per_item: int = 14
     k: int = 10
     max_file_bytes: int = 64 * 2**20
@@ -739,6 +740,7 @@ class KeyIndex:
         return {
             "block_size": o.block_size,
             "level": o.level,
+            "codec": o.codec,
             "bits_per_item": o.bits_per_item,
             "k": o.k,
             "max_file_bytes": o.max_file_bytes,
