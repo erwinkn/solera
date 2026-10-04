@@ -44,14 +44,7 @@ const TONES: Record<string, Tone> = {
   advanced: "run",
   requested: "ok",
   refused: "warn",
-  // inputs and explain
-  caught_up: "ok",
-  behind: "warn",
-  delta: "run",
-  full: "run",
-  pattern_change: "wait",
-  reconcile: "wait",
-  never: "idle",
+  // partitions whose comparison isn't computed yet, and explain's verdicts
   pending: "wait",
   failing: "fail",
   excluded: "idle",
@@ -65,11 +58,31 @@ export function tone(status: string | null | undefined): Tone {
 
 const LABELS: Record<string, string> = {
   timed_out: "timed out",
-  caught_up: "caught up",
   not_matched: "not matched",
   onchange: "on change",
   ondeploy: "on deploy",
 };
+
+/** Why something is stale, in the glossary's words; the API has spelled them with spaces and with underscores. */
+export const STALE_REASONS = {
+  input_changed: {
+    label: "input changed",
+    means: "An input it read changed since: new upstream data, or new patterns on the input.",
+  },
+  upstream_stale: {
+    label: "upstream stale",
+    means: "A partition it reads is itself stale: run upstream first, or run with upstream.",
+  },
+  definition_changed: {
+    label: "definition changed",
+    means: "Its asset changed since it was written: version, configuration, patterns, rename or reset.",
+  },
+} as const;
+
+export function staleReason(reason: string): { label: string; means: string } {
+  const known = STALE_REASONS[reason.replaceAll(" ", "_") as keyof typeof STALE_REASONS];
+  return known ?? { label: reason.replaceAll("_", " "), means: reason };
+}
 
 export function label(status: string | null | undefined): string {
   if (!status) return "—";

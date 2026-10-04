@@ -3,7 +3,9 @@ import { useInfiniteQuery, useQuery } from "@tanstack/react-query";
 import { getRouteApi, Link, useNavigate } from "@tanstack/react-router";
 import { Activity, ArrowRight, Hand, KeyRound, Play, XCircle } from "lucide-react";
 import { q, useManifest, useProject } from "@/api/queries";
+import { cleanupStuck } from "@/api/read";
 import type { AssetStatus, Automation } from "@/api/types";
+import { partitionParts } from "@/features/graph";
 import { RunButton } from "@/features/run-dialog";
 import { RunHistogram, RunsTable } from "@/features/runs";
 import { describeTrigger } from "@/features/triggers";
@@ -33,6 +35,8 @@ export function Overview() {
   const manifest = useManifest();
   const diagnostics = useQuery(q.diagnostics()).data;
   const active = useInfiniteQuery(q.runs(project, { status: ["running", "queued"] }, 8)).data;
+  // Counted from the listing, as the list below it is: the engine's cleanup tasks aren't the operator's runs.
+  const running = active?.pages[0]?.total;
   const failed = useInfiniteQuery(q.runs(project, { status: ["failed"], range: "24h" }, 5)).data;
   const day = useInfiniteQuery(q.runs(project, { range: "24h" }, 1)).data;
   // By default the window fits the project: everything when it is younger than a
@@ -57,7 +61,8 @@ export function Overview() {
   const failing = status ? Object.entries(status).filter(([, s]) => failingKeys(s) > 0) : [];
   const keys = failing.reduce((sum, [, s]) => sum + failingKeys(s), 0);
   const starved = useStarvedPools();
-  const operator = repairs && cleanups ? repairs.length + cleanups.length + starved.length : undefined;
+  const stuck = cleanups?.filter(cleanupStuck).length ?? 0;
+  const operator = repairs && cleanups ? repairs.length + stuck + starved.length : undefined;
   const failedTotal = failed?.pages[0]?.total;
   const navigate = useNavigate();
 
@@ -90,8 +95,8 @@ export function Overview() {
           link={(c) => <Link to="/runs" search={{ status: "running,queued" }} className={c} />}
           icon={<Activity />}
           label="Running now"
-          value={diagnostics?.active_runs}
-          tone={diagnostics?.active_runs ? "run" : "idle"}
+          value={running}
+          tone={running ? "run" : "idle"}
           detail={diagnostics ? `${plural(diagnostics.inflight, "attempt")} in flight` : undefined}
         />
         <Vital
@@ -105,7 +110,7 @@ export function Overview() {
         <Vital
           link={(c) => <Link to="/assets" className={c} />}
           icon={<KeyRound />}
-          label="Failing keys"
+          label="Failed keys"
           value={status ? keys : undefined}
           tone={keys ? "warn" : "ok"}
           detail={
@@ -127,7 +132,7 @@ export function Overview() {
               ? operator
                 ? [
                     repairs.length && `${repairs.length} owing a repair`,
-                    cleanups.length && `${cleanups.length} stuck`,
+                    stuck && plural(stuck, "stuck cleanup"),
                     starved.length && plural(starved.length, "idle pool"),
                   ]
                     .filter(Boolean)
@@ -309,7 +314,12 @@ function AttentionAssets({ status }: { status: Record<string, AssetStatus> | und
           name,
           s,
           keys: failingKeys(s),
-          score: s.partitions.failed * 100 + failingKeys(s) * 10 + s.partitions.missing,
+          score:
+            (s.repairs_stuck ?? 0) * 1000 +
+            s.partitions.failed * 100 +
+            s.partitions.stale * 20 +
+            failingKeys(s) * 10 +
+            s.partitions.missing,
         }))
         .filter((r) => r.score > 0)
         .sort((a, b) => b.score - a.score)
@@ -319,7 +329,7 @@ function AttentionAssets({ status }: { status: Record<string, AssetStatus> | und
     <Card>
       <CardHeader
         title="Assets needing attention"
-        description="Failed or missing partitions, failing keys"
+        description="Failed, stale or missing partitions, failing keys, stuck repairs"
         actions={
           <Link to="/assets" className={moreClass}>
             <More />
@@ -330,7 +340,7 @@ function AttentionAssets({ status }: { status: Record<string, AssetStatus> | und
         <ListSkeleton />
       ) : rows.length === 0 ? (
         <Empty compact title={`All ${plural(total, "asset")} current`}>
-          No failed or missing partitions, and no failing keys.
+          No failed, stale or missing partitions, and no failing keys.
         </Empty>
       ) : (
         <ul className="flex flex-col pb-2">
@@ -353,20 +363,19 @@ function AttentionAssets({ status }: { status: Record<string, AssetStatus> | und
                     {s.partitions.failed > 0 && (
                       <Flag tone="fail">{plural(s.partitions.failed, "failed partition")}</Flag>
                     )}
+                    {(s.repairs_stuck ?? 0) > 0 && (
+                      <Flag tone="fail">{plural(s.repairs_stuck ?? 0, "stuck repair")}</Flag>
+                    )}
+                    {s.partitions.stale > 0 && (
+                      <Flag tone="warn">{s.partitioned ? `${s.partitions.stale} stale` : "stale"}</Flag>
+                    )}
                     {s.partitions.missing > 0 && <Flag tone="idle">{s.partitions.missing} missing</Flag>}
                     {keys > 0 && <Flag tone="warn">{plural(keys, "failing key")}</Flag>}
                   </span>
                 </span>
                 {s.partitioned ? (
                   <span className="flex flex-col gap-1">
-                    <SegmentBar
-                      parts={[
-                        { tone: "ok", value: s.partitions.materialized, label: "materialized" },
-                        { tone: "run", value: s.partitions.running, label: "running" },
-                        { tone: "fail", value: s.partitions.failed, label: "failed" },
-                        { tone: "idle", value: s.partitions.missing, label: "missing" },
-                      ]}
-                    />
+                    <SegmentBar parts={partitionParts(s.partitions)} />
                     <span className="text-2xs text-fg-subtle tabular">
                       {s.partitions.materialized}/{s.partitions.total} partitions materialized
                     </span>

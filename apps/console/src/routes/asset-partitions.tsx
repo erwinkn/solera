@@ -4,6 +4,7 @@ import { Play } from "lucide-react";
 import { q, useManifest, useProject } from "@/api/queries";
 import type { AssetDetail, PartitionRow, PartitionStatus } from "@/api/types";
 import { RunButton } from "@/features/run-dialog";
+import { reasonsText, StaleKeysCard, StaleReasons } from "@/features/stale";
 import { cn } from "@/lib/cn";
 import { count, plural } from "@/lib/format";
 import { label, tone, toneSolid, toneSoft } from "@/lib/status";
@@ -13,7 +14,16 @@ import { Tooltip } from "@/ui/overlay";
 import { StatusBadge, StatusIcon } from "@/ui/status";
 
 const route = getRouteApi("/assets/$asset/partitions");
-const ORDER: PartitionStatus[] = ["failed", "running", "missing", "materialized", "removed"];
+/** The legend's order: what needs a look first. */
+const ORDER: PartitionStatus[] = [
+  "failed",
+  "stale",
+  "pending",
+  "running",
+  "missing",
+  "materialized",
+  "removed",
+];
 
 /** `day=2026-09-01,site=alpha` → {day: …, site: …}; a one-dimension key is itself. */
 function parse(partition: string, dims: string[]): Record<string, string> {
@@ -29,6 +39,7 @@ export function AssetPartitions() {
   const { data: rows } = useSuspenseQuery(q.partitions(project, name));
   const { data: detail } = useSuspenseQuery(q.asset(project, name));
   const dims = Object.keys(manifest.assets[name]?.partitions?.dims ?? {});
+  const keyed = manifest.assets[name]?.outputs.some((o) => o.key) ?? false;
   const counts = Object.fromEntries(
     ORDER.map((s) => [s, rows.filter((r) => r.status === s).length]),
   ) as Record<PartitionStatus, number>;
@@ -39,7 +50,7 @@ export function AssetPartitions() {
       <Card>
         <CardHeader
           title="Partitions"
-          description={`${plural(rows.length - counts.removed, "current key")}${counts.removed ? `, ${counts.removed} retired` : ""} · select one for its heads and last attempt`}
+          description={`${plural(rows.length - counts.removed, "partition")}${counts.removed ? `, and ${counts.removed} removed` : ""} · select one for its heads, staleness and last attempt`}
           actions={
             <div className="flex flex-wrap gap-1.5">
               {ORDER.filter((s) => counts[s]).map((s) => (
@@ -70,6 +81,9 @@ export function AssetPartitions() {
         </div>
       </Card>
       <PartitionPanel name={name} row={selected} detail={detail} />
+      {selected?.status === "stale" && keyed && (
+        <StaleKeysCard name={name} partition={selected.partition} className="self-start xl:col-start-2" />
+      )}
     </div>
   );
 }
@@ -83,6 +97,7 @@ function Cell({ row, selected, compact }: { row: PartitionRow; selected: boolean
           <span className="font-mono">{row.partition}</span>
           <span>
             {label(row.status)}
+            {row.status === "stale" && row.reasons?.length ? `: ${reasonsText(row.reasons)}` : ""}
             {row.last_outcome &&
               row.last_outcome !== "succeeded" &&
               ` · last attempt ${label(row.last_outcome)}`}
@@ -104,6 +119,9 @@ function Cell({ row, selected, compact }: { row: PartitionRow; selected: boolean
             ? "border-theme border-dashed border-line-strong bg-surface"
             : toneSolid[t],
           row.status === "removed" && "opacity-40",
+          // Pending: neither stale nor fresh until the engine has compared.
+          row.status === "pending" &&
+            "bg-[repeating-linear-gradient(135deg,var(--wait)_0_3px,var(--wait-soft)_3px_6px)]",
           row.status === "running" && "animate-[pulse-dot_1.6s_ease-in-out_infinite]",
           selected && "ring-2 ring-fg ring-offset-2 ring-offset-surface",
         )}
@@ -210,6 +228,18 @@ function PartitionPanel({ name, row, detail }: { name: string; row?: PartitionRo
         actions={<StatusBadge status={row.status} />}
       />
       <div className="flex flex-col gap-4 px-4 pb-4">
+        {row.status === "stale" && (
+          <div className="flex flex-col gap-1.5">
+            <span className="text-2xs font-medium tracking-wide text-fg-subtle uppercase">Stale because</span>
+            <StaleReasons reasons={row.reasons} />
+          </div>
+        )}
+        {row.status === "pending" && (
+          <p className="text-xs text-fg-muted">
+            The engine hasn't compared this partition with its upstream yet, as after a pattern or definition
+            change at large scale: it is neither stale nor fresh until it has.
+          </p>
+        )}
         <Facts className="grid-cols-2">
           <Fact label="Last outcome">{row.last_outcome ? label(row.last_outcome) : "—"}</Fact>
           <Fact label="Last attempt">

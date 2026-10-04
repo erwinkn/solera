@@ -4,8 +4,10 @@ import { getRouteApi, Link } from "@tanstack/react-router";
 import { GitCommitHorizontal } from "lucide-react";
 import { q, useManifest, useProject } from "@/api/queries";
 import { useCommitSource } from "@/api/mutations";
-import type { Manifest, SourceDecl } from "@/api/types";
+import { keyEntry } from "@/api/read";
+import type { Manifest, OutputHead, SourceDecl } from "@/api/types";
 import { RunsTable } from "@/features/runs";
+import { cn } from "@/lib/cn";
 import { count, plural } from "@/lib/format";
 import { Button } from "@/ui/button";
 import { Empty, ErrorNote, Generation, LoadMore, Skeleton, Time } from "@/ui/data";
@@ -16,10 +18,21 @@ import { Table, TableScroll, Td, Th, Tr } from "@/ui/table";
 /**
  * Sources (architecture.md §5): outputs with no producer, advanced from
  * outside through the commit API or by a sensor. A keyed source and a
- * dynamic partitions are consumed exactly like keyed outputs.
+ * dynamic partitions are consumed exactly like keyed outputs. A source's
+ * data loads through its store or an `@source` function, which says the
+ * version it served each key at (docs/stores.md, "Sources").
  */
 
 type Kind = "dynamic partitions" | "keyed" | "unkeyed";
+
+/** How a source's data is loaded, in a few words; null when the engine doesn't say. */
+function loaderText(s: SourceDecl): string | null {
+  if (s.loader === "function") return "an @source function";
+  if (s.loader === "store") return s.store ? `the ${s.store} store` : "its store";
+  return null;
+}
+
+const dimsOf = (s: SourceDecl) => Object.keys(s.dims ?? {});
 const kindOf = (s: SourceDecl, manifest: Manifest): Kind =>
   manifest.outputs[s.name]?.dynamic_partitions ? "dynamic partitions" : s.key ? "keyed" : "unkeyed";
 
@@ -55,6 +68,7 @@ export function Sources() {
                 <tr>
                   <Th>Source</Th>
                   <Th>Kind</Th>
+                  <Th>Loaded by</Th>
                   <Th>Head</Th>
                   <Th className="text-right">Keys</Th>
                   <Th>Fed by</Th>
@@ -89,8 +103,10 @@ function SourceRow({
   feeders: string[];
 }) {
   const project = useProject();
-  const head = useQuery(q.heads(project, source.name)).data?.[0];
+  const heads = useQuery(q.heads(project, source.name)).data;
+  const head = heads?.[0];
   const kind = kindOf(source, manifest);
+  const partitioned = dimsOf(source).length > 0;
   return (
     <Tr className="relative">
       <Td className="py-2">
@@ -102,7 +118,16 @@ function SourceRow({
           {source.name}
         </Link>
       </Td>
-      <Td className="text-fg-muted">{kind}</Td>
+      <Td className="text-fg-muted">
+        {kind}
+        {dimsOf(source).length > 0 && (
+          <span className="text-fg-subtle"> · by {dimsOf(source).join(" × ")}</span>
+        )}
+      </Td>
+      <Td className="text-xs text-fg-muted">
+        {loaderText(source) ?? "—"}
+        {source.version && <span className="text-fg-subtle"> · v{source.version}</span>}
+      </Td>
       <Td>
         <span className="flex items-center gap-2">
           <Generation value={head?.ref.generation ?? source.head.generation} />
@@ -114,10 +139,20 @@ function SourceRow({
         </span>
       </Td>
       <Td className="text-right">
-        {kind === "unkeyed" ? "—" : head?.key_count != null ? count(head.key_count) : "—"}
+        {kind === "unkeyed" || !heads
+          ? "—"
+          : partitioned
+            ? count(heads.reduce((n, h) => n + (h.key_count ?? 0), 0))
+            : head?.key_count != null
+              ? count(head.key_count)
+              : "—"}
       </Td>
       <Td className="text-xs text-fg-muted">
-        {feeders.length ? feeders.map((f) => `sensor ${f}`).join(", ") : "commit API"}
+        {source.observe
+          ? `observe() · ${source.observe}`
+          : feeders.length
+            ? feeders.map((f) => `sensor ${f}`).join(", ")
+            : "commit API"}
       </Td>
       <Td className="max-w-64 truncate text-xs text-fg-muted">
         {consumers(manifest, source.name).join(", ") || "—"}
@@ -133,7 +168,8 @@ export function Source() {
   const manifest = useManifest();
   const project = useProject();
   const source = manifest.sources[name];
-  const head = useQuery(q.heads(project, name)).data?.[0];
+  const heads = useQuery(q.heads(project, name)).data;
+  const [picked, setPicked] = useState<string | undefined>();
   const sensors = useQuery(q.sensors(project)).data?.sensors.filter((s) => s.commits.includes(name)) ?? [];
   const commitQuery = useInfiniteQuery(q.runs(project, { source: [name] }, 20));
   const commits = commitQuery.data;
@@ -145,6 +181,11 @@ export function Source() {
     );
   const kind = kindOf(source, manifest);
   const readers = consumers(manifest, name);
+  const dims = dimsOf(source);
+  // A partitioned source has a head per partition: the one picked, else the first.
+  const partition = dims.length ? (picked ?? heads?.[0]?.partition) : "";
+  const head = heads?.find((h) => h.partition === partition) ?? (dims.length ? undefined : heads?.[0]);
+  const loader = loaderText(source);
   return (
     <Page>
       <PageHeader
@@ -160,12 +201,19 @@ export function Source() {
           </>
         }
         title={name}
-        description={`A ${kind} source${source.store ? ` on the ${source.store} store` : ", a lineage pointer only"}.`}
+        description={
+          source.loader === "function"
+            ? `A ${kind} source, loaded through an @source function: it says the version it served each ${kind === "unkeyed" ? "read" : "key"} at.`
+            : `A ${kind} source${source.store ? ` on the ${source.store} store` : ", a lineage pointer only"}${dims.length ? `, partitioned by ${dims.join(" × ")}` : ""}.`
+        }
       />
       <div className="grid gap-4 lg:grid-cols-[minmax(0,2fr)_minmax(18rem,1fr)]">
         <div className="flex min-w-0 flex-col gap-4">
           <Card>
-            <CardHeader title="Head" />
+            <CardHeader
+              title="Head"
+              description={dims.length && partition !== undefined ? `Partition ${partition}` : undefined}
+            />
             <Facts className="px-4 pb-4">
               <Fact label="Generation">
                 <Generation value={head?.ref.generation ?? source.head.generation} />
@@ -175,19 +223,35 @@ export function Source() {
                 <Fact label="Keys">{head?.key_count != null ? count(head.key_count) : "—"}</Fact>
               )}
               <Fact label="Committed">{head ? <Time at={head.at} /> : "at registration"}</Fact>
+              {loader && <Fact label="Loaded by">{loader}</Fact>}
+              {source.version && (
+                <Fact label="Loader version">
+                  <span className="font-mono text-xs">{source.version}</span>
+                </Fact>
+              )}
               <Fact label="Fed by">
-                {sensors.length
-                  ? sensors.map((s) => (
-                      <Link
-                        key={s.name}
-                        to="/sensors/$sensor"
-                        params={{ sensor: s.name }}
-                        className="mr-2 text-link hover:underline"
-                      >
-                        {s.name}
-                      </Link>
-                    ))
-                  : "the commit API"}
+                {source.observe ? (
+                  <Link
+                    to="/sensors/$sensor"
+                    params={{ sensor: source.observe }}
+                    className="mr-2 text-link hover:underline"
+                  >
+                    {source.observe}
+                  </Link>
+                ) : sensors.length ? (
+                  sensors.map((s) => (
+                    <Link
+                      key={s.name}
+                      to="/sensors/$sensor"
+                      params={{ sensor: s.name }}
+                      className="mr-2 text-link hover:underline"
+                    >
+                      {s.name}
+                    </Link>
+                  ))
+                ) : (
+                  "the commit API"
+                )}
               </Fact>
               <Fact label="Read by">
                 {readers.length
@@ -205,7 +269,10 @@ export function Source() {
               </Fact>
             </Facts>
           </Card>
-          {kind !== "unkeyed" && <SourceKeys name={name} />}
+          {dims.length > 0 && heads && (
+            <SourcePartitions heads={heads} selected={partition} onSelect={setPicked} />
+          )}
+          {kind !== "unkeyed" && partition !== undefined && <SourceKeys name={name} partition={partition} />}
           <Card>
             <CardHeader
               title="Commits"
@@ -233,21 +300,81 @@ export function Source() {
             )}
           </Card>
         </div>
-        <CommitForm name={name} kind={kind} />
+        {/* The commit API names no partition: a partitioned source is fed by its sensor. */}
+        {dims.length === 0 && <CommitForm name={name} kind={kind} />}
       </div>
     </Page>
   );
 }
 
-function SourceKeys({ name }: { name: string }) {
+/** A partitioned source's heads, one per partition; picking one shows its keys. */
+function SourcePartitions({
+  heads,
+  selected,
+  onSelect,
+}: {
+  heads: OutputHead[];
+  selected?: string;
+  onSelect: (partition: string) => void;
+}) {
+  return (
+    <Card>
+      <CardHeader title="Partitions" description={plural(heads.length, "partition")} />
+      <TableScroll className="max-h-72 overflow-y-auto border-t border-line">
+        <Table>
+          <thead className="sticky top-0 bg-surface">
+            <tr>
+              <Th>Partition</Th>
+              <Th>Generation</Th>
+              <Th className="text-right">Keys</Th>
+              <Th>Committed</Th>
+            </tr>
+          </thead>
+          <tbody>
+            {heads.map((h) => (
+              <Tr key={h.partition} className={cn(h.partition === selected && "bg-select")}>
+                <Td>
+                  <button
+                    type="button"
+                    aria-pressed={h.partition === selected}
+                    onClick={() => onSelect(h.partition)}
+                    className="font-mono text-xs text-link hover:underline"
+                  >
+                    {h.partition}
+                  </button>
+                </Td>
+                <Td>
+                  <Generation value={h.ref.generation} />
+                </Td>
+                <Td className="text-right">{h.key_count != null ? count(h.key_count) : "—"}</Td>
+                <Td className="text-fg-muted">
+                  <Time at={h.at} />
+                </Td>
+              </Tr>
+            ))}
+          </tbody>
+        </Table>
+      </TableScroll>
+    </Card>
+  );
+}
+
+function SourceKeys({ name, partition }: { name: string; partition: string }) {
   const project = useProject();
-  const keys = useInfiniteQuery(q.keys(project, name, ""));
-  const entries = keys.data?.pages.flatMap((p) => Object.entries(p.keys)) ?? [];
+  const keys = useInfiniteQuery(q.keys(project, name, partition));
+  const entries =
+    keys.data?.pages.flatMap((p) => Object.entries(p.keys).map(([k, v]) => [k, keyEntry(v)] as const)) ?? [];
+  // A source key carries the version it was served at, where the source says one.
+  const served = entries.some(([, e]) => e.version != null);
   return (
     <Card>
       <CardHeader
         title="Keys"
-        description={keys.data ? plural(keys.data.pages[0]?.total ?? 0, "key") : undefined}
+        description={
+          keys.data
+            ? `${plural(keys.data.pages[0]?.total ?? 0, "key")}${served ? " · each with the version the source served and the generation that committed it" : ""}`
+            : undefined
+        }
       />
       {keys.isError ? (
         <div className="px-4 pb-4">
@@ -263,14 +390,20 @@ function SourceKeys({ name }: { name: string }) {
             <thead className="sticky top-0 bg-surface">
               <tr>
                 <Th>Key</Th>
+                {served && <Th>Served version</Th>}
                 <Th>Generation</Th>
               </tr>
             </thead>
             <tbody>
-              {entries.map(([k, generation]) => (
+              {entries.map(([k, e]) => (
                 <Tr key={k}>
                   <Td className="font-mono text-xs">{k}</Td>
-                  <Td className="font-mono text-xs text-fg-muted">g{generation}</Td>
+                  {served && (
+                    <Td className="font-mono text-xs">
+                      {e.version ?? <span className="text-fg-subtle">—</span>}
+                    </Td>
+                  )}
+                  <Td className="font-mono text-xs text-fg-muted">g{e.generation}</Td>
                 </Tr>
               ))}
             </tbody>

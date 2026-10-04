@@ -10,6 +10,7 @@ import { RunButton } from "@/features/run-dialog";
 import { RunsTable } from "@/features/runs";
 import { describeTrigger } from "@/features/triggers";
 import { PatternList } from "@/features/patterns";
+import { StaleReasons } from "@/features/stale";
 import { useNow } from "@/lib/clock";
 import { cn } from "@/lib/cn";
 import { count, duration, plural, until } from "@/lib/format";
@@ -136,11 +137,24 @@ export function AssetLayout() {
               <span>
                 {status.partitioned
                   ? `${status.partitions.materialized}/${status.partitions.total} partitions materialized`
-                  : status.partitions.materialized
+                  : status.partitions.materialized || status.partitions.stale
                     ? "materialized"
                     : "not materialized"}
               </span>
             )}
+            {status?.partitioned && status.partitions.stale > 0 && (
+              <Link
+                to="/assets/$asset/partitions"
+                params={{ asset: name }}
+                className="font-medium text-warn-fg hover:underline"
+              >
+                {status.partitions.stale} stale
+              </Link>
+            )}
+            {status?.partitioned && (status.partitions.pending ?? 0) > 0 && (
+              <span className="text-wait-fg">{status.partitions.pending} pending</span>
+            )}
+            {status && !status.partitioned && status.stale && <WholeStaleness name={name} />}
             {Object.entries(asset.tags).map(([k, v]) => (
               <span key={k} className="rounded-full bg-accent-soft px-2 py-0.5 text-fg-muted">
                 {k}={v}
@@ -183,6 +197,18 @@ export function AssetLayout() {
       </nav>
       <Outlet />
     </Page>
+  );
+}
+
+/** An unpartitioned asset is stale as a whole: say why, beside its status. */
+function WholeStaleness({ name }: { name: string }) {
+  const project = useProject();
+  const reasons = useInfiniteQuery(q.staleKeys(project, name, "")).data?.pages[0]?.reasons;
+  return (
+    <span className="inline-flex items-center gap-1.5">
+      <span className="font-medium text-warn-fg">stale</span>
+      <StaleReasons reasons={reasons} />
+    </span>
   );
 }
 
@@ -340,9 +366,9 @@ function Heads({
                     {head.materialized ? (
                       <StatusBadge status="materialized" />
                     ) : (
-                      <Tooltip content="An incremental pass is still under way: more attempts will complete this head.">
+                      <Tooltip content="Committed, not caught up: a run is still walking its batches, and readers that need it whole wait.">
                         <span>
-                          <StatusBadge status="delta" text="incomplete" />
+                          <StatusBadge status="running" text="catching up" />
                         </span>
                       </Tooltip>
                     )}
@@ -412,20 +438,15 @@ function Declaration({ asset, manifest }: { asset: AssetDecl; manifest: Manifest
               <Row key={param} name={param}>
                 <span>
                   <span className="text-fg-subtle">
-                    {input.each
-                      ? "Each"
-                      : input.kind === "in"
-                        ? "In"
-                        : input.kind === "incremental"
-                          ? "Incremental"
-                          : "AllPartitions"}
-                    (
+                    {input.kind === "incremental" ? "Incremental" : "In"}(
                   </span>
                   {input.output}
-                  <span className="text-fg-subtle">)</span>
+                  <span className="text-fg-subtle">
+                    {input.each ? ", each=True" : input.all_partitions ? ", all_partitions=True" : ""})
+                  </span>
                 </span>
                 {input.batch_size != null && (
-                  <Tag>{input.batch_size.toLocaleString("en-US")} keys a commit</Tag>
+                  <Tag>{input.batch_size.toLocaleString("en-US")} keys a batch</Tag>
                 )}
                 {input.each && <Tag>{input.each.concurrency.toLocaleString("en-US")} at once</Tag>}
                 {input.patterns && <PatternList patterns={input.patterns} />}
@@ -451,7 +472,7 @@ function Declaration({ asset, manifest }: { asset: AssetDecl; manifest: Manifest
           <Fact label="Placement">
             {asset.placement.executor}
             <span className="text-fg-subtle"> · {asset.placement.kind}</span>
-            {Object.entries(asset.placement.placement).map(([k, v]) => (
+            {Object.entries(asset.placement.options ?? {}).map(([k, v]) => (
               <span key={k} className="text-fg-subtle">
                 {" "}
                 · {k} {String(v)}
@@ -462,6 +483,9 @@ function Declaration({ asset, manifest }: { asset: AssetDecl; manifest: Manifest
             {asset.retries.n} · {asset.retries.backoff} from {duration(asset.retries.delay)}
           </Fact>
           <Fact label="Timeout">{duration(asset.timeout)}</Fact>
+          {asset.concurrency != null && (
+            <Fact label="Concurrency">{asset.concurrency} partitions at once</Fact>
+          )}
           {asset.aliases.length > 0 && <Fact label="Formerly">{asset.aliases.join(", ")}</Fact>}
         </Facts>
       </div>

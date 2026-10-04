@@ -1,6 +1,6 @@
 import type { ReactNode } from "react";
 import { Link } from "@tanstack/react-router";
-import { CalendarClock, GitCommitHorizontal, Hand, Radar, RotateCcw } from "lucide-react";
+import { CalendarClock, Eraser, GitCommitHorizontal, Hand, Radar, RotateCcw } from "lucide-react";
 import type { Histogram, Partitions, RunRow } from "@/api/types";
 import { cn } from "@/lib/cn";
 import { clock, count, dateTime, firstLine, plural, shortId } from "@/lib/format";
@@ -11,6 +11,23 @@ import { Tooltip } from "@/ui/overlay";
 import { StatusBadge, StatusIcon } from "@/ui/status";
 import { Table, TableScroll, Td, Th, Tr } from "@/ui/table";
 
+/** A cleanup task's asset: none of the project's (K25). */
+export const CLEANUP = "@cleanup";
+
+/**
+ * What a run is about, as its title: its targets, or, for one of the engine's
+ * cleanup tasks (which has none), the output whose leftovers it deletes.
+ */
+export function runTitle(run: {
+  targets: string[];
+  origin?: string;
+  tags?: Record<string, string> | null;
+}): string {
+  if (run.targets.length) return run.targets.join(", ");
+  if (run.origin === "cleanup" || run.tags?.cleanup) return `cleanup · ${run.tags?.cleanup ?? "an output"}`;
+  return "—";
+}
+
 /** Who or what asked for a run, in a few words. */
 export function TriggerLabel({
   run,
@@ -20,7 +37,10 @@ export function TriggerLabel({
   const sensor = run.tags?.sensor;
   let icon: ReactNode;
   let text: ReactNode;
-  if (run.origin === "commit") {
+  if (run.origin === "cleanup") {
+    icon = <Eraser />;
+    text = "engine cleanup";
+  } else if (run.origin === "commit") {
     icon = <GitCommitHorizontal />;
     text = (
       <>
@@ -130,7 +150,7 @@ export function RunsTable({
                   params={{ run: run.id }}
                   className="flex min-w-0 items-baseline gap-2 after:absolute after:inset-0 after:content-['']"
                 >
-                  <span className="truncate font-medium text-fg">{run.targets.join(", ")}</span>
+                  <span className="truncate font-medium text-fg">{runTitle(run)}</span>
                   <Id value={run.id} className="text-fg-subtle" />
                 </Link>
                 {run.status === "failed" && run.error && (
@@ -141,7 +161,11 @@ export function RunsTable({
                 <TriggerLabel run={run} />
               </Td>
               <Td>
-                <PartitionsLabel partitions={run.partitions} />
+                {run.origin === "cleanup" ? (
+                  <span className="text-fg-subtle">whole output</span>
+                ) : (
+                  <PartitionsLabel partitions={run.partitions} />
+                )}
               </Td>
               <Td className="text-fg-muted">
                 <Time at={run.created_at} className="relative z-10" />
@@ -176,7 +200,7 @@ function RunList({ runs }: { runs: RunRow[] }) {
               params={{ run: run.id }}
               className="flex min-w-0 items-baseline gap-2 after:absolute after:inset-0 after:content-['']"
             >
-              <span className="truncate text-sm font-medium text-fg">{run.targets.join(", ")}</span>
+              <span className="truncate text-sm font-medium text-fg">{runTitle(run)}</span>
               <Id value={run.id} className="text-xs text-fg-subtle" />
             </Link>
             {run.status === "failed" && run.error ? (

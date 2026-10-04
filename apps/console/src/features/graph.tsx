@@ -91,6 +91,18 @@ export function graphOf(manifest: Manifest): {
   return { nodes, edges };
 }
 
+/** An asset's partitions by status, as segments of a bar: done, then what needs a look, then nothing yet. */
+export function partitionParts(p: AssetStatus["partitions"]) {
+  return [
+    { tone: "ok" as Tone, value: p.materialized, label: "materialized" },
+    { tone: "warn" as Tone, value: p.stale, label: "stale" },
+    { tone: "wait" as Tone, value: p.pending ?? 0, label: "pending" },
+    { tone: "run" as Tone, value: p.running, label: "running" },
+    { tone: "fail" as Tone, value: p.failed, label: "failed" },
+    { tone: "idle" as Tone, value: p.missing, label: "missing" },
+  ];
+}
+
 /** One tone for an asset: the worst thing about it. */
 export function assetTone(status: AssetStatus | undefined): Tone {
   if (!status) return "idle";
@@ -99,6 +111,8 @@ export function assetTone(status: AssetStatus | undefined): Tone {
   if (p.failed) tones.push("fail");
   if (Object.entries(status.failures ?? {}).some(([k, n]) => k !== "canceled" && (n ?? 0) > 0))
     tones.push("warn");
+  if (p.stale) tones.push("warn");
+  if (p.pending) tones.push("wait");
   if (p.running) tones.push("run");
   if (p.materialized) tones.push("ok");
   if (!tones.length) tones.push("idle");
@@ -261,15 +275,7 @@ function Node({ node, status }: { node: GraphNode; status: AssetStatus | undefin
       {node.kind === "source" ? (
         <span className="text-xs text-fg-subtle">external source</span>
       ) : p && status?.partitioned ? (
-        <SegmentBar
-          className="h-1.5"
-          parts={[
-            { tone: "ok", value: p.materialized, label: "materialized" },
-            { tone: "run", value: p.running, label: "running" },
-            { tone: "fail", value: p.failed, label: "failed" },
-            { tone: "idle", value: p.missing, label: "missing" },
-          ]}
-        />
+        <SegmentBar className="h-1.5" parts={partitionParts(p)} />
       ) : (
         <span className={cn("text-xs", toneText[tone])}>
           {!p
@@ -278,11 +284,15 @@ function Node({ node, status }: { node: GraphNode; status: AssetStatus | undefin
               ? "running"
               : p.failed
                 ? "failed"
-                : p.materialized
-                  ? "materialized"
-                  : node.kind === "job"
-                    ? "not run yet"
-                    : "never materialized"}
+                : p.stale
+                  ? "stale"
+                  : p.pending
+                    ? "pending"
+                    : p.materialized
+                      ? "materialized"
+                      : node.kind === "job"
+                        ? "not run yet"
+                        : "never materialized"}
         </span>
       )}
       <span className="flex items-center gap-2 text-2xs text-fg-subtle">

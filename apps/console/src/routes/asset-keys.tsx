@@ -3,9 +3,11 @@ import { keepPreviousData, useInfiniteQuery, useQuery } from "@tanstack/react-qu
 import { getRouteApi, Link } from "@tanstack/react-router";
 import { ChevronDown, RotateCcw, Search } from "lucide-react";
 import { q, useManifest, useProject } from "@/api/queries";
+import { keyEntry } from "@/api/read";
 import { useRetryKeys } from "@/api/mutations";
 import type { AssetDecl, Explain, FailureClass, FailureKey, FailedKeys, KeyOutcome } from "@/api/types";
 import { PatternList } from "@/features/patterns";
+import { StaleKeysCard } from "@/features/stale";
 import { join, list } from "@/router";
 import { useNow } from "@/lib/clock";
 import { cn } from "@/lib/cn";
@@ -27,12 +29,15 @@ const keyedEdge = (asset: AssetDecl) => Object.values(asset.inputs).some((e) => 
 
 export function AssetKeys() {
   const { asset: name } = route.useParams();
-  const { key } = route.useSearch();
+  const { key, partition } = route.useSearch();
   const manifest = useManifest();
   const asset = manifest.assets[name]!;
   const each = isEach(asset);
+  // Stale keys belong to one partition: the chosen one, or the only one an unpartitioned asset has.
+  const stalePartition = asset.partitions ? partition : "";
   return (
     <div className="flex flex-col gap-4">
+      {stalePartition !== undefined && <StaleKeysCard name={name} partition={stalePartition} />}
       {each && <FailingKeys name={name} />}
       {(each || keyedEdge(asset)) && <ExplainKey key={key} name={name} asset={asset} />}
       {each && <KeyOutcomes name={name} />}
@@ -41,7 +46,7 @@ export function AssetKeys() {
   );
 }
 
-// -- the failure index ---------------------------------------------------------------
+// -- failed keys ---------------------------------------------------------------------
 
 function FailingKeys({ name }: { name: string }) {
   const { partition, outcome } = route.useSearch();
@@ -58,16 +63,15 @@ function FailingKeys({ name }: { name: string }) {
   const keys = failures.data?.pages.flatMap((p) => p.keys) ?? [];
   const totals = totalsOf(first);
   const due = first?.partitions.filter((s) => s.has_retries).length ?? 0;
-  const pass = first?.partitions.find((s) => s.retry);
 
   return (
     <Card>
       <CardHeader
-        title="Failing keys"
+        title="Failed keys"
         description={
           <>
-            The failure index: keys whose last call didn't succeed. They keep their previous output and are
-            retried by their class
+            Keys whose last call didn't succeed, each with its retry record. A failed key keeps its previous
+            output, and a run retries it when its class makes it due
             {partition ? (
               <>
                 {" "}
@@ -125,7 +129,6 @@ function FailingKeys({ name }: { name: string }) {
         {first && (
           <span className="ml-auto text-xs text-fg-subtle">
             {due > 0 ? `${plural(due, "partition")} with keys due now` : "no keys due"}
-            {pass && ` · retry pass in progress`}
           </span>
         )}
       </div>
@@ -372,8 +375,6 @@ function Answer({ explain: e }: { explain: Explain }) {
           ) : (
             "doesn't have it"
           )}
-          {" · input "}
-          {label(e.input_state)}
         </li>
         {Object.entries(e.outputs).map(([output, o]) => (
           <li key={output}>
@@ -454,6 +455,8 @@ function KeyOutcomes({ name }: { name: string }) {
     placeholderData: keepPreviousData,
   });
   const rows = outcomes.data?.pages.flatMap((p) => p.outcomes) ?? [];
+  // Which try each call was: shown once the engine reports it.
+  const tried = rows.some((o) => o.tries != null);
   return (
     <Card>
       <CardHeader
@@ -492,6 +495,7 @@ function KeyOutcomes({ name }: { name: string }) {
                 <Th>Key</Th>
                 {!partition && <Th>Partition</Th>}
                 <Th>Outcome</Th>
+                {tried && <Th className="text-right">Try</Th>}
                 <Th>Generation</Th>
                 <Th>Error</Th>
                 <Th>When</Th>
@@ -506,6 +510,11 @@ function KeyOutcomes({ name }: { name: string }) {
                   <Td>
                     <StatusBadge status={o.outcome} />
                   </Td>
+                  {tried && (
+                    <Td className="text-right text-fg-muted tabular">
+                      {o.tries == null ? "—" : o.tries > 1 ? `retry ${o.tries - 1}` : "first"}
+                    </Td>
+                  )}
                   <Td>
                     <Generation value={o.generation} />
                   </Td>
@@ -631,10 +640,10 @@ function LiveKeys({ name, asset }: { name: string; asset: AssetDecl }) {
               </tr>
             </thead>
             <tbody>
-              {entries.map(([k, generation]) => (
+              {entries.map(([k, entry]) => (
                 <Tr key={k}>
                   <Td className="font-mono text-xs">{k}</Td>
-                  <Td className="font-mono text-xs text-fg-muted">g{generation}</Td>
+                  <Td className="font-mono text-xs text-fg-muted">g{keyEntry(entry).generation}</Td>
                 </Tr>
               ))}
             </tbody>

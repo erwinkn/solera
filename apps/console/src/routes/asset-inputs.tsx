@@ -1,11 +1,10 @@
 import { useSuspenseQuery } from "@tanstack/react-query";
 import { getRouteApi, Link } from "@tanstack/react-router";
 import { q, useProject } from "@/api/queries";
-import type { Input, InputPartition, InputState } from "@/api/types";
+import type { Input, InputPartition, Observed } from "@/api/types";
+import { KeyClasses } from "@/features/batches";
 import { PatternList } from "@/features/patterns";
-import { cn } from "@/lib/cn";
 import { count, plural } from "@/lib/format";
-import { label } from "@/lib/status";
 import { Empty } from "@/ui/data";
 import { Card, CardHeader } from "@/ui/layout";
 import { Tooltip } from "@/ui/overlay";
@@ -14,39 +13,35 @@ import { Table, TableScroll, Td, Th, Tr } from "@/ui/table";
 
 const route = getRouteApi("/assets/$asset/inputs");
 
-const KIND: Record<Input["kind"], { name: string; means: string }> = {
+/** Each input kind as it is declared (`call(output, flag)`), and what it means. */
+const KIND: Record<Input["kind"], { name: string; flag?: string; means: string }> = {
   in: {
     name: "In",
     means:
-      "The whole value at its pinned head, or, over upstream dimensions this asset lacks, a dict of every committed partition across them. A new version of it is an input change: this asset's incremental inputs owe a full pass.",
+      "The whole value at its pinned head, or, over upstream dimensions this asset lacks, a dict of every materialized partition across them. A new version of it is an input change.",
   },
   incremental: {
     name: "Incremental",
-    means: "Only what changed since this asset's position, a batch at a time.",
+    means:
+      "What changed since each partition last read it, as added, updated and removed keys, a batch at a time.",
   },
   each: {
-    name: "Per-key incremental",
-    means: "One call per changed key, its outcome kept per key in the failure index.",
+    name: "Incremental",
+    flag: "each=True",
+    means:
+      "One call per changed key, a batch at a time. A key that fails is kept with its retry record and retried on its own.",
   },
   all_partitions: {
-    name: "All partitions",
+    name: "In",
+    flag: "all_partitions=True",
     means:
-      "Every committed partition of the upstream, the shared dimensions too, as a dict, at pin time. Never waits for missing ones.",
+      "Every materialized partition of the upstream, the shared dimensions too, as a dict at pin time. Never waits for missing ones.",
   },
   dep: {
     name: "dep",
-    means: "Pinned in lineage, caught up to as a whole input is, watched by OnChange(), never loaded.",
+    means:
+      "Pinned in lineage and watched by OnChange(), never loaded. A new version of it is an input change.",
   },
-};
-
-const STATE_HINT: Record<InputState, string> = {
-  never: "Nothing delivered yet: the first pass reads the whole head.",
-  caught_up: "Every commit delivered.",
-  behind: "Commits upstream wait to be delivered.",
-  delta: "A delta pass is being delivered over several attempts.",
-  full: "A full pass (a reset or a full run) is under way.",
-  pattern_change: "The input's patterns changed: finishing old deltas, then diffing membership.",
-  reconcile: "After a full pass: removing keys the upstream no longer names.",
 };
 
 export function AssetInputs() {
@@ -63,16 +58,22 @@ export function AssetInputs() {
   return (
     <div className="flex flex-col gap-4">
       {inputs.map((input) => (
-        <EdgeCard key={input.param} input={input} partition={partition} />
+        <InputCard key={input.param} input={input} partition={partition} />
       ))}
     </div>
   );
 }
 
-function EdgeCard({ input, partition }: { input: Input; partition?: string }) {
+const owes = (o: Observed | null | undefined) =>
+  !!o && (o.full_run_due != null || o.owed == null || o.owed.added + o.owed.updated + o.owed.removed > 0);
+
+function InputCard({ input, partition }: { input: Input; partition?: string }) {
   const kind = KIND[input.kind];
   const partitions = input.partitions.filter((s) => partition === undefined || s.partition === partition);
-  const behind = input.partitions.filter((s) => (s.lag ?? 0) > 0).length;
+  // What each partition owes comes from the observed set; an engine that predates it says nothing.
+  const observed = input.partitions.some((s) => s.observed !== undefined);
+  const heads = input.partitions.some((s) => s.head_commit != null);
+  const owing = input.partitions.filter((s) => owes(s.observed)).length;
   return (
     <Card>
       <CardHeader
@@ -99,7 +100,7 @@ function EdgeCard({ input, partition }: { input: Input; partition?: string }) {
                   {input.output}
                 </Link>
               )}
-              )
+              {kind.flag && `, ${kind.flag}`})
             </span>
           </span>
         }
@@ -108,11 +109,15 @@ function EdgeCard({ input, partition }: { input: Input; partition?: string }) {
           <div className="flex flex-wrap items-center gap-2 text-xs text-fg-muted">
             {input.batch_size != null && (
               <span>
-                {input.batch_size.toLocaleString("en-US")} keys a commit
+                {input.batch_size.toLocaleString("en-US")} keys a batch
                 {input.concurrency != null && `, ${input.concurrency.toLocaleString("en-US")} at once`}
               </span>
             )}
-            {input.partitions.length > 0 && <span>· {behind ? `${behind} behind` : "all caught up"}</span>}
+            {observed && input.partitions.length > 0 && (
+              <span>
+                · {owing ? `${plural(owing, "partition")} owe${owing === 1 ? "s" : ""} work` : "nothing owed"}
+              </span>
+            )}
           </div>
         }
       />
@@ -121,22 +126,20 @@ function EdgeCard({ input, partition }: { input: Input; partition?: string }) {
           Keys taken: <PatternList patterns={input.patterns} />
         </div>
       )}
-      {partitions.length > 0 && (
+      {partitions.length > 0 && (observed || heads) && (
         <TableScroll className="border-t border-line">
           <Table>
             <thead>
               <tr>
                 <Th>Partition</Th>
-                <Th>Pass</Th>
-                <Th className="text-right">Delivered to</Th>
-                <Th className="text-right">Upstream head</Th>
-                <Th>Lag</Th>
-                <Th>Pass under way</Th>
+                {observed && <Th>Owed to it</Th>}
+                {observed && <Th className="text-right">Observed through</Th>}
+                {heads && <Th className="text-right">Upstream head</Th>}
               </tr>
             </thead>
             <tbody>
               {partitions.map((s) => (
-                <PartitionRow key={s.partition} s={s} />
+                <PartitionRow key={s.partition} s={s} observed={observed} heads={heads} />
               ))}
             </tbody>
           </Table>
@@ -146,18 +149,8 @@ function EdgeCard({ input, partition }: { input: Input; partition?: string }) {
   );
 }
 
-function PartitionRow({ s }: { s: InputPartition }) {
-  const position = s.position;
-  const delivered = position ? position.next - 1 : null;
-  const lag = s.lag ?? 0;
-  const head = s.head_commit ?? 0;
-  const done = head + 1 - lag;
-  const d = position?.pass;
-  const at =
-    typeof d?.at === "string" ? `after ${d.at}` : typeof d?.at === "number" ? `commit ${count(d.at)}` : null;
-  const underWay = d
-    ? [d.mode, at, `batch ${d.batch + 1} of ${d.batches}`].filter(Boolean).join(" · ")
-    : null;
+function PartitionRow({ s, observed, heads }: { s: InputPartition; observed: boolean; heads: boolean }) {
+  const o = s.observed;
   return (
     <Tr>
       <Td className="font-mono text-xs">
@@ -166,39 +159,50 @@ function PartitionRow({ s }: { s: InputPartition }) {
           <span className="text-fg-subtle"> ← {s.upstream_partition || "unpartitioned"}</span>
         )}
       </Td>
-      <Td>
-        <Tooltip content={STATE_HINT[s.state]}>
-          <span>
-            <StatusBadge status={s.state} text={label(s.state)} />
-          </span>
-        </Tooltip>
-      </Td>
-      <Td className="text-right text-fg-muted">
-        {delivered != null && delivered >= 0 ? `commit ${count(delivered)}` : "—"}
-      </Td>
-      <Td className="text-right text-fg-muted">
-        {s.head_commit != null ? `commit ${count(s.head_commit)}` : "—"}
-      </Td>
-      <Td>
-        {s.state === "never" && !s.head_commit ? (
-          <span className="text-xs text-fg-subtle">—</span>
-        ) : (
-          <span className="flex items-center gap-2">
-            <span className="h-1.5 w-20 overflow-hidden rounded-full bg-sunken" aria-hidden>
-              <span
-                className={cn("block h-full rounded-full", lag ? "bg-warn" : "bg-viz-ok")}
-                style={{
-                  width: `${head + 1 > 0 ? (100 * Math.max(0, done)) / (head + 1) : 100}%`,
-                }}
-              />
-            </span>
-            <span className={cn("text-xs tabular", lag ? "font-medium text-warn-fg" : "text-fg-subtle")}>
-              {lag ? plural(lag, "commit") : "none"}
-            </span>
-          </span>
-        )}
-      </Td>
-      <Td className="max-w-64 truncate font-mono text-xs text-fg-muted">{underWay ?? "—"}</Td>
+      {observed && (
+        <Td>
+          <Owed observed={o} />
+        </Td>
+      )}
+      {observed && (
+        <Td className="text-right text-fg-muted">
+          {o?.observed_at != null ? (
+            <Tooltip content="Every key this partition read was observed at this upstream commit or later.">
+              <span className="tabular">commit {count(o.observed_at)}</span>
+            </Tooltip>
+          ) : (
+            "—"
+          )}
+        </Td>
+      )}
+      {heads && (
+        <Td className="text-right text-fg-muted tabular">
+          {s.head_commit != null ? `commit ${count(s.head_commit)}` : "—"}
+        </Td>
+      )}
     </Tr>
   );
+}
+
+/** What a partition owes this input: a full run, a count per class, nothing, or not known yet. */
+function Owed({ observed: o }: { observed: Observed | null | undefined }) {
+  if (!o) return <span className="text-xs text-fg-subtle">never read</span>;
+  if (o.full_run_due)
+    return (
+      <span className="flex flex-wrap items-center gap-2">
+        <StatusBadge status="stale" text="full run due" />
+        <span className="text-xs text-fg-muted">{o.full_run_due.replaceAll("_", " ")}</span>
+      </span>
+    );
+  if (!o.owed)
+    return (
+      <Tooltip content="The comparison with upstream isn't computed yet, as after a pattern or definition change at large scale. It is neither stale nor fresh until it is.">
+        <span>
+          <StatusBadge status="pending" />
+        </span>
+      </Tooltip>
+    );
+  const { added, updated, removed } = o.owed;
+  if (added + updated + removed === 0) return <span className="text-xs text-fg-subtle">nothing</span>;
+  return <KeyClasses added={added} updated={updated} removed={removed} />;
 }

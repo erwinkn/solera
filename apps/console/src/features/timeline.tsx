@@ -8,6 +8,7 @@ import { duration } from "@/lib/format";
 import { label, tone, toneSolid } from "@/lib/status";
 import { Tooltip } from "@/ui/overlay";
 import { StatusIcon } from "@/ui/status";
+import { attemptName, hasBatches, KeyClasses } from "./batches";
 
 /**
  * Attempt phases (docs/object-store-state.md §7): from one milestone to the
@@ -37,17 +38,23 @@ export function phasesOf(attempt: Attempt): { phase: Phase; seconds: number }[] 
   })).filter((p) => p.seconds > 0);
 }
 
-function PhaseTip({ attempt, end }: { attempt: Attempt; end: number }) {
+function PhaseTip({ attempt, attempts, end }: { attempt: Attempt; attempts: Attempt[]; end: number }) {
   const phases = phasesOf(attempt);
   const total = (end ?? 0) - (attempt.started_at ?? end);
+  const name = attemptName(attempt, attempts);
   return (
     <div className="flex min-w-44 flex-col gap-1">
       <span className="flex items-center justify-between gap-4 font-medium">
         <span>
-          Attempt {attempt.generation} · {label(attempt.outcome)}
+          {name[0]!.toUpperCase() + name.slice(1)} · {label(attempt.outcome)}
         </span>
         <span className="tabular">{duration(total)}</span>
       </span>
+      {attempt.batch && (
+        <span className="opacity-80">
+          <KeyClasses {...attempt.batch} className="text-current [&_*]:text-current" />
+        </span>
+      )}
       {phases.length === 0 && <span className="opacity-80">No phases recorded yet</span>}
       {phases.map(({ phase, seconds }) => (
         <span key={phase} className="flex items-center justify-between gap-4 tabular">
@@ -242,12 +249,13 @@ export function Waterfall({
                 className="flex h-8 min-w-0 items-center gap-2 pl-4 text-sm"
               >
                 <StatusIcon status={task.status} />
-                <span className="truncate">
-                  <span className="text-fg">{task.asset}</span>
+                <span className="min-w-0 flex-1 truncate">
+                  <span className="text-fg">{task.asset === "@cleanup" ? "cleanup" : task.asset}</span>
                   {task.partition && (
                     <span className="font-mono text-xs text-fg-subtle"> · {task.partition}</span>
                   )}
                 </span>
+                <WalkCount task={task} attempts={list} />
               </Link>
               <div className="relative mr-4 h-8">
                 {scale.ticks.map((tick) => (
@@ -276,15 +284,24 @@ export function Waterfall({
                   />
                 )}
                 {list.slice(1).map((attempt, i) => {
-                  // The retry wait: from one attempt's end to the next one's start.
+                  // Between two attempts: a retry's backoff (the same batch again), or the
+                  // walk moving on to its next batch.
                   const before = list[i]!;
                   if (attempt.started_at == null || before.finished_at == null) return null;
+                  const retry =
+                    attempt.batch && before.batch
+                      ? attempt.batch.index === before.batch.index
+                      : tone(before.outcome) === "fail";
+                  const gap = duration(attempt.started_at - before.finished_at);
                   return (
                     <span
                       key={`gap-${attempt.id}`}
                       aria-hidden
-                      title={`retried after ${duration(attempt.started_at - before.finished_at)}`}
-                      className="absolute top-1/2 h-px border-t border-dotted border-fail"
+                      title={retry ? `retried after ${gap}` : `next batch after ${gap}`}
+                      className={cn(
+                        "absolute top-1/2 h-px border-t border-dotted",
+                        retry ? "border-fail" : "border-fg-subtle",
+                      )}
                       style={{
                         left: x(before.finished_at),
                         width: `calc(${x(attempt.started_at)} - ${x(before.finished_at)})`,
@@ -294,14 +311,18 @@ export function Waterfall({
                 })}
                 {list.map((attempt) => {
                   if (attempt.started_at == null) return null;
-                  const stop = attempt.finished_at ?? (ACTIVE.has(attempt.outcome) ? now : attempt.started_at);
+                  const stop =
+                    attempt.finished_at ?? (ACTIVE.has(attempt.outcome) ? now : attempt.started_at);
                   const left = pos(attempt.started_at);
                   const width = Math.max(0.6, pos(stop) - left);
                   const active =
                     selected.attempt === attempt.id ||
                     (isSelected && !selected.attempt && attempt === list[list.length - 1]);
                   return (
-                    <Tooltip key={attempt.id} content={<PhaseTip attempt={attempt} end={stop} />}>
+                    <Tooltip
+                      key={attempt.id}
+                      content={<PhaseTip attempt={attempt} attempts={list} end={stop} />}
+                    >
                       <Link
                         to="/runs/$run"
                         params={{ run }}
@@ -311,7 +332,7 @@ export function Waterfall({
                           attempt: attempt.id,
                         })}
                         replace
-                        aria-label={`${task.asset} ${task.partition} attempt ${attempt.generation}: ${label(attempt.outcome)}, ${duration(stop - attempt.started_at)}`}
+                        aria-label={`${task.asset} ${task.partition} ${attemptName(attempt, list)}: ${label(attempt.outcome)}, ${duration(stop - attempt.started_at)}`}
                         className={cn(
                           "absolute top-1/2 h-3.5 -translate-y-1/2 rounded-mark p-[1.5px]",
                           active ? "ring-2 ring-fg" : "hover:ring-2 hover:ring-line-strong",
@@ -332,6 +353,24 @@ export function Waterfall({
         })}
       </ol>
     </div>
+  );
+}
+
+/** A task's walk in the waterfall's label column: batches committed of those planned. */
+function WalkCount({ task, attempts }: { task: Task; attempts: Attempt[] }) {
+  const progress = task.progress;
+  if (!hasBatches(attempts) && progress == null) return null;
+  const done = progress ? progress.batch + 1 : 0;
+  const planned = attempts.reduce((n, a) => Math.max(n, a.batch?.count ?? 0), 0) || null;
+  const final = progress?.key === null;
+  return (
+    <span
+      className="pr-2 text-2xs whitespace-nowrap text-fg-subtle tabular"
+      title={final ? "every batch committed" : "batches committed of those planned"}
+    >
+      {done}
+      {final ? `/${done}` : planned != null ? `/${Math.max(planned, done)}` : ""}
+    </span>
   );
 }
 

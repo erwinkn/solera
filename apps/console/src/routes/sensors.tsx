@@ -136,7 +136,11 @@ function OutcomeCounts({ ticks }: { ticks: Tick[] }) {
   );
 }
 
-function Workers({ workers }: { workers: { id: string; executor: string; deploy: string; seen_at: number }[] }) {
+function Workers({
+  workers,
+}: {
+  workers: { id: string; executor: string; deploy: string; seen_at: number }[];
+}) {
   return (
     <Card>
       <CardHeader

@@ -5,7 +5,16 @@ import { Ban, CirclePause, CirclePlay, RotateCcw, Trash2 } from "lucide-react";
 import { ACTIVE_ATTEMPT, ACTIVE_RUN, q, runIsLive, useProject } from "@/api/queries";
 import { useDeleteRun, useRetryRun, useRunAction } from "@/api/mutations";
 import type { Attempt, AttemptError, Json, RunDetail, RunEvent, Task } from "@/api/types";
-import { PartitionsLabel, TriggerLabel } from "@/features/runs";
+import { CLEANUP, PartitionsLabel, runTitle, TriggerLabel } from "@/features/runs";
+import {
+  attemptName,
+  BatchRange,
+  batchLabel,
+  describeProgress,
+  groupByBatch,
+  hasBatches,
+  KeyClasses,
+} from "@/features/batches";
 import { Logs, type LogLevel } from "@/features/logs";
 import { PHASE_LABEL, PhaseBar, PhaseLegend, phaseColor, phasesOf, Waterfall } from "@/features/timeline";
 import { useNow } from "@/lib/clock";
@@ -65,7 +74,7 @@ export function Run() {
             </Crumb>
           </>
         }
-        title={request.targets.join(", ")}
+        title={runTitle({ ...request, origin: request.source ? "commit" : undefined })}
         badge={<StatusBadge status={request.paused && live ? "paused" : request.status} />}
         actions={<RunActions detail={data} />}
         meta={
@@ -79,7 +88,13 @@ export function Run() {
             <Meta label="Trigger">
               <TriggerLabel
                 run={{
-                  origin: request.source ? "commit" : request.automation ? "automation" : "manual",
+                  origin: request.source
+                    ? "commit"
+                    : request.tags?.cleanup
+                      ? "cleanup"
+                      : request.automation
+                        ? "automation"
+                        : "manual",
                   ...request,
                   automation: request.automation ?? null,
                   by: request.by ?? null,
@@ -105,6 +120,12 @@ export function Run() {
               {request.mode}
               {request.upstream && " · with upstream"}
             </Meta>
+            {live && tasks.length > 1 && (
+              <Meta label="Tasks">
+                {tasks.filter((t) => !ACTIVE_RUN.has(t.status) && t.status !== "running").length} of{" "}
+                {tasks.length} done
+              </Meta>
+            )}
             <Meta label="Started">
               <Time at={request.created_at} />
             </Meta>
@@ -250,6 +271,9 @@ function TaskPanel({
   const search = route.useSearch();
   const navigate = route.useNavigate();
   const tab = search.tab ?? "logs";
+  const batched = hasBatches(attempts);
+  const planned = attempts.reduce((n, a) => Math.max(n, a.batch?.count ?? 0), 0) || null;
+  const walk = describeProgress(task.progress, planned);
   const tabs: { id: typeof tab; label: string }[] = [
     { id: "logs", label: "Logs" },
     { id: "result", label: "Result" },
@@ -262,26 +286,34 @@ function TaskPanel({
         ident
         title={
           <span className="flex flex-wrap items-center gap-2">
-            <Link
-              to="/assets/$asset"
-              params={{ asset: task.asset }}
-              search={{ partition: task.partition || undefined }}
-              className="hover:underline"
-            >
-              {task.asset}
-            </Link>
+            {task.asset === CLEANUP ? (
+              <span>cleanup</span>
+            ) : (
+              <Link
+                to="/assets/$asset"
+                params={{ asset: task.asset }}
+                search={{ partition: task.partition || undefined }}
+                className="hover:underline"
+              >
+                {task.asset}
+              </Link>
+            )}
             {task.partition && <span className="font-mono text-sm text-fg-muted">{task.partition}</span>}
             <StatusBadge status={task.status} className="font-sans" />
           </span>
         }
         description={
           <>
-            {plural(task.attempt_count, "attempt")} of at most {task.max_attempts}
+            {walk && `${walk} · `}
+            {batched
+              ? plural(attempts.length, "attempt")
+              : `${plural(task.attempt_count, "attempt")} of at most ${task.max_attempts}`}
             {task.wait != null && ` · waited ${duration(task.wait)}`}
             {task.held && ` · held: ${task.held[0]}${task.held[1] ? ` (${task.held[1]})` : ""}`}
           </>
         }
         actions={
+          !batched &&
           attempts.length > 1 && (
             <div
               role="tablist"
@@ -315,6 +347,7 @@ function TaskPanel({
           )
         }
       />
+      {batched && <Batches run={run} task={task} attempts={attempts} selected={attempt} />}
       {!attempt ? (
         <Empty compact title={task.status === "blocked" ? "Blocked" : "Not started yet"}>
           {task.status === "blocked"
@@ -323,7 +356,7 @@ function TaskPanel({
         </Empty>
       ) : (
         <>
-          <AttemptSummary run={run} attempt={attempt} live={live} />
+          <AttemptSummary run={run} attempt={attempt} attempts={attempts} live={live} />
           <div
             role="tablist"
             aria-label="Attempt details"
@@ -392,9 +425,105 @@ function errorOf(error: Attempt["error"]): AttemptError | null {
   return typeof error === "string" ? { message: error } : error;
 }
 
-function AttemptSummary({ run, attempt, live }: { run: string; attempt: Attempt; live: boolean }) {
+/**
+ * A task's walk, batch by batch (docs/observed-set.md, "A run"): the keys
+ * each batch covered, what it held per class, and its attempts — a retry is
+ * another attempt of the same batch, so it sits on the same row.
+ */
+function Batches({
+  run,
+  task,
+  attempts,
+  selected,
+}: {
+  run: string;
+  task: Task;
+  attempts: Attempt[];
+  selected?: Attempt;
+}) {
+  const groups = groupByBatch(attempts);
+  const committed = task.progress ? task.progress.batch : -1;
+  return (
+    <div className="max-h-72 overflow-auto border-t border-line">
+      <table className="w-full text-sm whitespace-nowrap">
+        <thead className="sticky top-0 z-10 bg-surface text-left text-2xs font-medium tracking-wide text-fg-subtle uppercase">
+          <tr>
+            <th className="py-1.5 pr-3 pl-4 font-medium">Batch</th>
+            <th className="px-3 py-1.5 font-medium">Keys</th>
+            <th className="px-3 py-1.5 font-medium">Held</th>
+            <th className="py-1.5 pr-4 pl-3 font-medium">Attempts</th>
+          </tr>
+        </thead>
+        <tbody>
+          {groups.map(({ batch, attempts: tries }) => {
+            const last = tries[tries.length - 1]!;
+            const current = tries.some((a) => a.id === selected?.id);
+            const done = batch != null && batch.index <= committed;
+            return (
+              <tr
+                key={batch ? `b${batch.index}` : last.id}
+                className={cn("border-t border-line", current && "bg-select")}
+              >
+                <td className="py-1.5 pr-3 pl-4 whitespace-nowrap">
+                  <span className="inline-flex items-center gap-2">
+                    <StatusIcon status={done ? "committed" : last.outcome} />
+                    <span className="tabular">
+                      {batch ? batchLabel(batch, task.progress?.key === null) : attemptName(last, attempts)}
+                    </span>
+                  </span>
+                </td>
+                <td className="max-w-80 px-3 py-1.5">{batch && <BatchRange batch={batch} />}</td>
+                <td className="px-3 py-1.5">{batch && <KeyClasses {...batch} />}</td>
+                <td className="py-1.5 pr-4 pl-3">
+                  <span className="flex flex-wrap gap-1">
+                    {tries.map((a, i) => (
+                      <Link
+                        key={a.id}
+                        to="/runs/$run"
+                        params={{ run }}
+                        search={(s) => ({ ...s, task: task.id, attempt: a.id })}
+                        replace
+                        aria-current={a.id === selected?.id || undefined}
+                        title={`${i === 0 ? "first try" : `retry ${i}`} · ${label(a.outcome)}`}
+                        className={cn(
+                          "inline-flex h-6 items-center gap-1 rounded-sm px-1.5 text-xs font-medium",
+                          a.id === selected?.id
+                            ? "bg-fg text-fg-inverse"
+                            : "text-fg-muted hover:bg-accent-soft",
+                        )}
+                      >
+                        <StatusIcon
+                          status={a.outcome}
+                          className={a.id === selected?.id ? "text-current" : undefined}
+                        />
+                        {i === 0 ? "try 1" : `try ${i + 1}`}
+                      </Link>
+                    ))}
+                  </span>
+                </td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function AttemptSummary({
+  run,
+  attempt,
+  attempts,
+  live,
+}: {
+  run: string;
+  attempt: Attempt;
+  attempts: Attempt[];
+  live: boolean;
+}) {
   const now = useNow();
-  const end = attempt.finished_at ?? (ACTIVE_ATTEMPT.has(attempt.outcome) ? now : (attempt.started_at ?? now));
+  const end =
+    attempt.finished_at ?? (ACTIVE_ATTEMPT.has(attempt.outcome) ? now : (attempt.started_at ?? now));
   const error = errorOf(attempt.error);
   const phases = phasesOf(attempt);
   return (
@@ -406,6 +535,7 @@ function AttemptSummary({ run, attempt, live }: { run: string; attempt: Attempt;
         <Fact label="Attempt">
           <Id value={attempt.id} copy />
         </Fact>
+
         <Fact label="Executor">{attempt.executor ?? "—"}</Fact>
         <Fact label="Started">
           <Time at={attempt.started_at} />
@@ -448,9 +578,17 @@ function AttemptSummary({ run, attempt, live }: { run: string; attempt: Attempt;
         </div>
       )}
 
+      {attempt.batch && (
+        <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs">
+          <span className="text-fg-subtle">{attemptName(attempt, attempts).replace(/^b/, "B")}</span>
+          <BatchRange batch={attempt.batch} />
+          <KeyClasses {...attempt.batch} />
+        </div>
+      )}
+
       {attempt.keys && Object.keys(attempt.keys).length > 0 && (
         <div className="flex flex-wrap items-center gap-2 text-xs">
-          <span className="text-fg-subtle">Keys</span>
+          <span className="text-fg-subtle">Calls</span>
           {Object.entries(attempt.keys).map(([outcome, n]) => (
             <span
               key={outcome}
@@ -712,21 +850,14 @@ function SpecTab({ run, attempt }: { run: string; attempt: Attempt }) {
   );
 }
 
-/** What an incremental pin delivers, in the spec's own terms: batches of keys, or a commit range. */
+/** What an incremental pin reads, in the spec's own terms: which batch, from which key, how many at most. */
 function describeBatch(batch: Record<string, Json>): string {
-  const nth =
-    typeof batch.index === "number"
-      ? `batch ${batch.index + 1}${typeof batch.count === "number" ? ` of ${batch.count}` : ""}`
-      : null;
   const parts: string[] = [];
-  if (batch.full) parts.push("full pass");
-  else if (batch.retry) parts.push("retry batch");
-  else if (batch.reconcile) parts.push("cleanup batch");
-  else if (batch.keys) parts.push("explicit keys");
-  else if (Array.isArray(batch.commits)) parts.push(`commits ${batch.commits.join("–")}`);
-  else if (batch.from !== undefined) parts.push(`commits ${String(batch.from)}–${String(batch.to)}`);
-  if (nth) parts.push(nth);
-  if (typeof batch.limit === "number") parts.push(`${batch.limit} keys a batch`);
+  if (typeof batch.index === "number")
+    parts.push(`batch ${batch.index + 1}${typeof batch.count === "number" ? ` of ~${batch.count}` : ""}`);
+  if (Array.isArray(batch.keys)) parts.push(plural(batch.keys.length, "named key"));
+  else if (typeof batch.after === "string") parts.push(`after ${batch.after}`);
+  if (typeof batch.limit === "number") parts.push(`up to ${batch.limit.toLocaleString("en-US")} keys`);
   return parts.join(" · ");
 }
 

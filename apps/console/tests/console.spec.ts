@@ -156,7 +156,7 @@ test("assets graph, keys and explain", async ({ page }) => {
     .click();
   await expect(page.getByRole("heading", { name: "file_checks", level: 1 })).toBeVisible();
   await page.getByRole("navigation", { name: "Asset sections" }).getByRole("link", { name: /Keys/ }).click();
-  await expect(page.getByRole("heading", { name: "Failing keys" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Failed keys" })).toBeVisible();
   // alpha-file-2 is excluded by the input's "drafts" pattern: explain says so.
   await page.getByLabel("Key to explain").fill("alpha-file-2");
   await page.getByRole("button", { name: "Explain" }).click();
@@ -165,7 +165,7 @@ test("assets graph, keys and explain", async ({ page }) => {
     .getByRole("navigation", { name: "Asset sections" })
     .getByRole("link", { name: "Inputs" })
     .click();
-  await expect(page.getByText("Each(")).toBeVisible();
+  await expect(page.getByText("each=True").first()).toBeVisible();
   await page.goto("/assets?view=list");
   await expect(page.getByRole("link", { name: /file_index/ })).toBeVisible();
 });
@@ -182,7 +182,7 @@ test("automations toggle and health", async ({ page }) => {
 
   await page.goto("/health");
   await expect(page.getByRole("heading", { name: "Repairs owed" })).toBeVisible();
-  await expect(page.getByRole("heading", { name: "Stuck cleanups" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Cleanups" })).toBeVisible();
   await expect(page.getByText("browser", { exact: true })).toBeVisible();
 });
 

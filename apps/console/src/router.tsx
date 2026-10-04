@@ -134,6 +134,8 @@ export const runSearch = (s: Record<string, unknown>) =>
     range: oneOf(...RANGES)(s.range),
     since: num(s.since),
     until: num(s.until),
+    /** Show the engine's cleanup tasks too; hidden unless asked for, as `solera runs` hides them. */
+    cleanup: [true, 1, "1", "true"].includes(s.cleanup as never) ? true : undefined,
   });
 export type RunSearch = ReturnType<typeof runSearch>;
 

@@ -30,6 +30,7 @@ import type {
   RunPage,
   SensorWorker,
   SensorView,
+  StaleKeys,
   Stats,
   Tick,
   Worker,
@@ -91,7 +92,12 @@ export type RunFilter = {
   until?: number;
   /** A trailing window ("24h"): turned into `since` when fetched, so the key stays put. */
   range?: string;
+  /** Include the engine's cleanup tasks, which the API leaves out unless `origin` names them. */
+  cleanup?: boolean;
 };
+
+/** Every origin a run can have: asking for all of them is how a listing includes cleanup tasks. */
+export const ORIGINS = ["manual", "automation", "sensor", "commit", "cleanup"];
 
 const RANGE_SECONDS: Record<string, number> = {
   "1h": 3600,
@@ -102,9 +108,10 @@ const RANGE_SECONDS: Record<string, number> = {
 };
 
 /** The query string of a run filter: list fields repeat, a range becomes `since`. */
-function runQuery({ range, ...filter }: RunFilter) {
+function runQuery({ range, cleanup, ...filter }: RunFilter) {
   const since = range && RANGE_SECONDS[range] ? Date.now() / 1000 - RANGE_SECONDS[range]! : undefined;
-  return { ...filter, since: filter.since ?? since };
+  const origin = cleanup && !filter.origin?.length ? ORIGINS : filter.origin;
+  return { ...filter, origin, since: filter.since ?? since };
 }
 
 export const q = {
@@ -209,6 +216,20 @@ export const q = {
             after: pageParam,
             limit: 100,
           },
+        }),
+      initialPageParam: undefined as string | undefined,
+      getNextPageParam: (page) => page.next ?? undefined,
+      refetchInterval: LIST,
+    }),
+
+  /** One partition's stale keys, a page at a time, each with why. */
+  staleKeys: (project: string, name: string, partition: string) =>
+    infiniteQueryOptions({
+      queryKey: ["assets", name, "stale-keys", partition],
+      queryFn: ({ signal, pageParam }) =>
+        api<StaleKeys>(`${p(project)}/assets/${enc(name)}/stale-keys`, {
+          signal,
+          query: { partition, after: pageParam, limit: 200 },
         }),
       initialPageParam: undefined as string | undefined,
       getNextPageParam: (page) => page.next ?? undefined,

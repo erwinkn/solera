@@ -1,5 +1,5 @@
 import { Suspense, useState, type ReactNode } from "react";
-import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useInfiniteQuery, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link, Outlet, useRouter } from "@tanstack/react-router";
 import { Dialog as BaseDialog } from "@base-ui/react/dialog";
 import {
@@ -16,6 +16,7 @@ import {
   Search,
   X,
 } from "lucide-react";
+import { cleanupStuck } from "@/api/read";
 import { q } from "@/api/queries";
 import { cn } from "@/lib/cn";
 import { connect, disconnect, useSession } from "@/lib/session";
@@ -131,8 +132,12 @@ function useAttention() {
         (a) => a.partitions.failed > 0 || Object.values(a.failures ?? {}).some((n) => (n ?? 0) > 0),
       ).length
     : 0;
-  const leftover = (repairs?.length ?? 0) + (cleanups?.length ?? 0);
-  return { running: diagnostics?.active_runs ?? 0, failing, leftover };
+  const leftover = (repairs?.length ?? 0) + (cleanups?.filter(cleanupStuck).length ?? 0);
+  // The runs listing's count, which leaves out the engine's cleanup tasks as the listing does.
+  const running =
+    useInfiniteQuery({ ...q.runs(project ?? "", { status: ["running", "queued"] }, 8), enabled: !!project })
+      .data?.pages[0]?.total ?? 0;
+  return { running, failing, leftover };
 }
 
 function Nav({ onNavigate }: { onNavigate?: () => void }) {

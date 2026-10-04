@@ -112,7 +112,7 @@ function AssetTable({
             <tr>
               <Th>Asset</Th>
               <Th>Partitions</Th>
-              <Th className="text-right">Failing keys</Th>
+              <Th className="text-right">Failed keys</Th>
               <Th>Updated</Th>
               <Th>Runs on</Th>
               <Th>Automations</Th>

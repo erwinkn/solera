@@ -8,13 +8,16 @@ API token (session storage) and the chosen theme (local storage).
 
 Five questions drive every screen, in this order:
 
-1. **What's running?** Runs and attempts in flight, how far along, where.
-2. **What failed, and why?** Failed runs with their first error line, failing
-   keys with their message, one click from the traceback or log line.
-3. **What's stale?** Partitions missing or failed, edges behind their
-   upstream (lag in batches), keys whose output lags their input revision.
-4. **What's left behind?** Unsettled writes and stuck discards from writers
-   that died, with the action that clears what an operator must.
+1. **What's running?** Runs, their tasks and attempts in flight, and how far
+   each task's walk has got: batches committed, the key it reached.
+2. **What failed, and why?** Failed runs with their first error line, failed
+   keys with their message and retry record, one click from the traceback
+   or log line.
+3. **What's stale, and why?** Partitions and keys due a rebuild, each with
+   its reasons (input changed, upstream stale, definition changed), and what
+   each partition owes each input (added, updated, removed keys).
+4. **What needs an operator?** Repairs a dead writer left, stuck ones first,
+   and stuck cleanups, with the action that clears what an operator must.
 5. **What's next?** Automations by their next fire, keys due for retry.
 
 Dense where the data is dense (runs, keys, logs, events: tables with
@@ -28,21 +31,21 @@ states).
 |---|---|
 | `/` Overview | the five questions: vitals, activity histogram, running now, recent failures, assets needing attention, up next |
 | `/assets` | the asset graph (layered DAG; edge style = edge kind) or a list (`?view=list`) |
-| `/assets/$asset` | declaration, heads per output × scope, cursor, automations |
-| `…/partitions` | the partition grid (1-D strip, 2-D matrix) colored by status |
-| `…/keys` | failing keys (failure index), per-key outcomes, **explain a key**, live key browser, forced retries |
-| `…/edges` | every input edge: kind, patterns, per-partition position and lag |
+| `/assets/$asset` | declaration, heads per output × partition, staleness, cursor, automations |
+| `…/partitions` | the partition grid (1-D strip, 2-D matrix) colored by status, stale reasons, stale keys |
+| `…/keys` | stale keys with reasons, failed keys and their retries, per-key outcomes, **explain a key**, live key browser, forced retries |
+| `…/inputs` | every input: kind, patterns, and per partition what it owes (added, updated, removed, or pending), a full run due, the commit it is observed through |
 | `…/history` | materializations (versions, rows, metadata) and lineage |
 | `…/runs` | runs that touched the asset |
-| `/runs` | filterable run history (facets, histogram, text search), all in the URL |
-| `/runs/$run` | tasks × attempts waterfall, attempt phases and cancel phases, logs with tailing, spec/result, the run's event timeline, cancel/retry/pause |
+| `/runs` | filterable run history (facets, histogram, text search), all in the URL; the engine's cleanup tasks behind a toggle |
+| `/runs/$run` | tasks × attempts waterfall, each task's walk batch by batch (key range, added/updated/removed/unchanged, its attempts and retries), attempt phases and cancel phases, logs with tailing, spec/result, the run's event timeline, cancel/retry/pause |
 | `/automations` | triggers, last and next fire, enable/disable, run now |
 | `/sensors`, `/sensors/$sensor` | sensors, hosts, tick history |
 | `/sources`, `/sources/$source` | head, keys, commit history, commit form |
 | `/executors` | executors with in-flight vs limit, pool workers, sensor hosts |
-| `/health` | engine diagnostics, unsettled writes, stuck discards (clear), store kinds |
+| `/health` | engine diagnostics, repairs owed (stuck ones flagged), cleanups stuck or awaiting their task (clear), store kinds |
 
-Navigation state lives in the URL: filters, the selected scope, task,
+Navigation state lives in the URL: filters, the selected partition, task,
 attempt and tab are search params validated per route, so every view is a
 link. The browser's back button is the undo.
 
@@ -180,10 +183,19 @@ read-only endpoints instead (with tests in `tests/server`):
 
 | Route | For |
 |---|---|
-| `GET /assets:status` | per-asset rollup for the graph and the overview: partition counts, last outcome, failing keys, unsettled writes |
-| `GET /assets/{a}/failures` | the failure index: failing keys with class, tries, due, message |
+| `GET /assets:status` | per-asset rollup for the graph and the overview: partition counts by status, last outcome, failed keys, repairs owed and stuck |
+| `GET /assets/{a}/failed-keys` | failed keys with class, tries, due, message |
+| `GET /assets/{a}/stale-keys` | a partition's stale keys and why |
 | `GET /assets/{a}/key-outcomes` | the `key_outcomes` history, searchable by key |
-| `GET /assets/{a}/explain?key=` | why a key is (not) in the output: patterns, failure, last outcome, revisions |
-| `GET /assets/{a}/edges` | every input's position per partition, with lag in batches |
-| `GET /holds` | unsettled writes and stuck discards |
+| `GET /assets/{a}/explain?key=` | why a key is (not) in the output: patterns, failure, last outcome, generations |
+| `GET /assets/{a}/inputs` | every input, and per partition its observed-set summary: owed keys or pending, a full run due, observed through |
+| `GET /repairs`, `GET /cleanups` | repairs owed (stuck after their run limit), stuck cleanups and removed outputs awaiting their cleanup task |
 | `next_at` on automations | the next scheduled fire, from the engine's own clock rule |
+
+Fields the observed-set rebuild adds as it lands — a task's `progress`, an
+attempt's `batch`, an input partition's `observed`, per-key stale reasons,
+the `pending` partition status, a source's `loader`, `version`, `dims` and
+`observe`, and served versions on source keys — are optional in
+`src/api/types.ts`; a view shows them when the engine sends them and hides
+them otherwise, so the console runs against an engine on either side of the
+rebuild. `src/api/read.ts` reads the few fields whose shape is still settling.

@@ -4,7 +4,10 @@ import { Link } from "@tanstack/react-router";
 import { Eraser } from "lucide-react";
 import { q, useManifest, useProject } from "@/api/queries";
 import { useClearCleanups } from "@/api/mutations";
-import { plural, shortId } from "@/lib/format";
+import { cleanupStuck } from "@/api/read";
+import type { Cleanup, Repair, RetiredCleanup } from "@/api/types";
+import { useNow } from "@/lib/clock";
+import { plural, shortId, until } from "@/lib/format";
 import { Button } from "@/ui/button";
 import { CopyButton, Empty } from "@/ui/data";
 import { Card, CardHeader, Fact, Facts, Page, PageHeader } from "@/ui/layout";
@@ -13,24 +16,30 @@ import { StatusBadge, StatusIcon } from "@/ui/status";
 import { Table, TableScroll, Td, Th, Tr } from "@/ui/table";
 
 /**
- * The engine's own state, and what writers that died left behind
- * (docs/lifecycle.md §9): repairs, which the partition's next attempt makes,
- * and stuck cleanups, whose names couldn't be read.
+ * The engine's own state, and what needs an operator (docs/lifecycle.md §9):
+ * repairs a dead writer left, which the partition's next attempt makes or
+ * which get stuck; and cleanups, stuck or waiting for their cleanup task.
  */
 export function Health() {
   const project = useProject();
   const { data: repairs } = useSuspenseQuery(q.repairs(project));
   const { data: cleanups } = useSuspenseQuery(q.cleanups(project));
-  const total = repairs.length + cleanups.length;
+  const total = repairs.length + cleanups.filter(cleanupStuck).length;
   return (
     <Page>
       <PageHeader
         title="Health"
-        description="The engine, and what writers that died left behind."
-        meta={<span>{total ? `${plural(total, "item")} need attention` : "Nothing left behind"}</span>}
+        description="The engine, and what needs an operator: repairs a dead writer left, and stuck cleanups."
+        meta={
+          <span>
+            {total
+              ? `${plural(total, "item")} need${total === 1 ? "s" : ""} attention`
+              : "Nothing left behind"}
+          </span>
+        }
       />
       <Engine />
-      <div className="grid gap-4 lg:grid-cols-2">
+      <div className="grid items-start gap-4 lg:grid-cols-2">
         <Repairs rows={repairs} />
         <Cleanups rows={cleanups} />
       </div>
@@ -96,20 +105,12 @@ function Engine() {
   );
 }
 
-function Repairs({
-  rows,
-}: {
-  rows: {
-    output: string;
-    partition: string;
-    intents: { run: string; attempt: string; files?: string[] }[];
-  }[];
-}) {
+function Repairs({ rows }: { rows: Repair[] }) {
   return (
     <Card>
       <CardHeader
         title="Repairs owed"
-        description="Outputs an attempt died writing. The next attempt of the partition reads the keys back and folds what landed into its commit."
+        description="An attempt died after it began writing. The partition's next attempt asks the store which of its keys landed and commits them; until then, readers of the partition wait."
       />
       {rows.length === 0 ? (
         <Empty compact title="No repair owed" />
@@ -117,9 +118,17 @@ function Repairs({
         <ul className="flex flex-col divide-y divide-line border-t border-line">
           {rows.map((r) => (
             <li key={`${r.output}/${r.partition}`} className="flex flex-col gap-1 px-4 py-2.5 text-sm">
-              <span>
+              <span className="flex flex-wrap items-center gap-2">
                 <span className="font-medium">{r.output}</span>
-                {r.partition && <span className="ml-2 font-mono text-xs text-fg-muted">{r.partition}</span>}
+                {r.partition && <span className="font-mono text-xs text-fg-muted">{r.partition}</span>}
+                <StatusBadge status={r.stuck ? "failed" : "waiting"} text={r.stuck ? "stuck" : "owed"} />
+              </span>
+              <span className="text-xs text-fg-muted">
+                {r.stuck
+                  ? `${plural(r.repair_runs ?? 0, "run")} came due without repairing it: look at the partition's last attempt.`
+                  : r.repair_runs
+                    ? `${plural(r.repair_runs, "run")} came due since it began owing.`
+                    : "Its next attempt repairs it."}
               </span>
               <span className="text-xs text-fg-muted">
                 {r.intents.map((i) => (
@@ -143,50 +152,91 @@ function Repairs({
   );
 }
 
-function Cleanups({
-  rows,
-}: {
-  rows: {
-    output: string;
-    partition: string;
-    pending: number;
-    stuck: { id: string }[];
-  }[];
-}) {
+const isRetired = (c: Cleanup): c is RetiredCleanup => "due" in c;
+
+/**
+ * Two kinds of cleanup (glossary, "cleanup"): a partition's store cleanup,
+ * stuck after three failed tries, for an operator to clear; and what a
+ * removed or moved output left in its store, waiting for its cleanup task.
+ */
+function Cleanups({ rows }: { rows: Cleanup[] }) {
   const clear = useClearCleanups();
+  const now = useNow();
   return (
     <Card>
       <CardHeader
-        title="Stuck cleanups"
-        description="Data garbage whose names couldn't be read after three tries. It stays on storage; clearing only stops the engine trying."
+        title="Cleanups"
+        description="Deleting what nothing references any more. A store cleanup is stuck after three failed tries; a removed or moved output's data waits for its cleanup task."
+        actions={
+          <Link
+            to="/runs"
+            search={{ origin: "cleanup" }}
+            className="text-xs whitespace-nowrap text-link hover:underline"
+          >
+            Cleanup tasks →
+          </Link>
+        }
       />
       {rows.length === 0 ? (
-        <Empty compact title="No stuck cleanups" />
+        <Empty compact title="Nothing waiting" />
       ) : (
         <ul className="flex flex-col divide-y divide-line border-t border-line">
-          {rows.map((r) => (
-            <li key={`${r.output}/${r.partition}`} className="flex items-center gap-3 px-4 py-2.5 text-sm">
-              <span className="min-w-0 flex-1">
-                <span className="font-medium">{r.output}</span>
-                {r.partition && <span className="ml-2 font-mono text-xs text-fg-muted">{r.partition}</span>}
-                <span className="block text-xs text-fg-subtle">
-                  {plural(r.stuck.length, "stuck entry", "stuck entries")}
-                  {r.pending ? `, ${r.pending} pending` : ""}
+          {rows.map((r) => {
+            const retired = isRetired(r);
+            const stuck = cleanupStuck(r);
+            return (
+              <li
+                key={retired ? r.id : `${r.output}/${r.partition}`}
+                className="flex items-center gap-3 px-4 py-2.5 text-sm"
+              >
+                <span className="flex min-w-0 flex-1 flex-col gap-0.5">
+                  <span className="flex flex-wrap items-center gap-2">
+                    <span className="font-medium">{r.output}</span>
+                    {!retired && r.partition && (
+                      <span className="font-mono text-xs text-fg-muted">{r.partition}</span>
+                    )}
+                    {stuck ? (
+                      <StatusBadge status="failed" text="stuck" />
+                    ) : (
+                      <StatusBadge status="queued" text="cleanup task due" />
+                    )}
+                  </span>
+                  <span className="text-xs text-fg-subtle">
+                    {retired ? (
+                      <>
+                        removed or moved: what it wrote to {r.store} before g{r.before}
+                        {r.stuck
+                          ? ` · ${typeof r.stuck === "string" ? r.stuck : "its cleanup task failed three times"}`
+                          : r.due > now
+                            ? ` · deleted ${until(r.due, now)}`
+                            : " · being deleted"}
+                      </>
+                    ) : (
+                      <>
+                        {plural(r.stuck.length, "stuck entry", "stuck entries")}
+                        {r.pending ? `, ${r.pending} pending` : ""}
+                      </>
+                    )}
+                  </span>
                 </span>
-              </span>
-              <Confirm
-                trigger={
-                  <Button size="sm" icon={<Eraser />}>
-                    Clear
-                  </Button>
-                }
-                title={`Clear stuck cleanups of ${r.output}?`}
-                description="The engine forgets these entries; their objects stay where they are. Same as `solera cleanups OUTPUT PARTITION --clear`."
-                action="Clear"
-                onConfirm={() => clear.mutate({ output: r.output, partition: r.partition })}
-              />
-            </li>
-          ))}
+                {stuck && (
+                  <Confirm
+                    trigger={
+                      <Button size="sm" icon={<Eraser />}>
+                        Clear
+                      </Button>
+                    }
+                    title={`Clear stuck cleanups of ${r.output}?`}
+                    description="The engine forgets these entries; their objects stay where they are. Same as `solera cleanups OUTPUT PARTITION --clear`."
+                    action="Clear"
+                    onConfirm={() =>
+                      clear.mutate({ output: r.output, partition: retired ? "" : r.partition })
+                    }
+                  />
+                )}
+              </li>
+            );
+          })}
         </ul>
       )}
     </Card>

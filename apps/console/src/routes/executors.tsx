@@ -49,7 +49,7 @@ export function Executors() {
                 {s && <Fact label="Tasks">{count(s.tasks ?? 0)}</Fact>}
                 {s && <Fact label="p95">{duration(s.p95)}</Fact>}
                 {s && <Fact label="Wait p95">{duration(s.wait_p95)}</Fact>}
-                {Object.entries(e.environment).map(([k, v]) => (
+                {Object.entries(e.config ?? {}).map(([k, v]) => (
                   <Fact key={k} label={k}>
                     {String(v as Json)}
                   </Fact>

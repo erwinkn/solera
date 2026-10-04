@@ -16,6 +16,8 @@ export interface OutputDecl {
   config: Record<string, Json>;
   dynamic_partitions: boolean;
   keyed?: boolean;
+  /** How long a removed or moved output's data stays before its cleanup task deletes it. */
+  cleanup_after?: number | null;
 }
 
 /** An input's key patterns as the manifest records them: globs or regexes, excludes named. */
@@ -33,6 +35,7 @@ export interface InputDecl {
   batch_size?: number;
   each?: { concurrency: number } | null;
   patterns?: Patterns | null;
+  load?: string;
 }
 
 export type DimDecl =
@@ -48,11 +51,12 @@ export type DimDecl =
       format: string;
     };
 
+/** An asset's (or sensor's) request on an executor: the executor's configuration and its own options. */
 export interface Placement {
   executor: string;
   kind: string;
-  environment: Record<string, Json>;
-  placement: Record<string, Json>;
+  config: Record<string, Json>;
+  options: Record<string, Json>;
 }
 
 export interface AssetDecl {
@@ -63,6 +67,7 @@ export interface AssetDecl {
   placement: Placement;
   retries: { n: number; delay: number; backoff: string };
   timeout: number;
+  concurrency?: number | null;
   version: string;
   retention: Json;
   aliases: string[];
@@ -92,6 +97,14 @@ export interface SourceDecl {
   key: string | null;
   handle: Record<string, Json>;
   head: Ref;
+  /** The loader's own version: bumped when what it serves for the same data changes. */
+  version?: string;
+  /** Loaded through its store's `serve`, or through an `@source` function. */
+  loader?: "store" | "function";
+  /** A partitioned source's dimensions. */
+  dims?: Record<string, DimDecl> | null;
+  /** The sensor `observe=` makes for it, if any. */
+  observe?: string | null;
 }
 
 export type Trigger =
@@ -135,6 +148,8 @@ export interface StoreDecl {
   version: string;
   ref: string;
   writes: "immutable" | "fenced";
+  cleanup_after?: number | null;
+  built_in?: { class: string; config: Record<string, Json> } | null;
 }
 
 export interface Manifest {
@@ -143,7 +158,7 @@ export interface Manifest {
   outputs: Record<string, ManifestOutput>;
   sources: Record<string, SourceDecl>;
   stores: Record<string, StoreDecl>;
-  executors: Record<string, { kind: string; environment: Record<string, Json> }>;
+  executors: Record<string, { kind: string; config: Record<string, Json> }>;
   automations: Record<string, AutomationDecl>;
   sensors: Record<string, SensorDecl>;
   build: {
@@ -204,22 +219,34 @@ export interface AssetStatus {
   } | null;
   failures: Partial<Record<FailureClass, number>> | null;
   repairs: number;
+  repairs_stuck?: number;
   updated_at: number | null;
 }
 
-export type PartitionStatus = "materialized" | "stale" | "missing" | "failed" | "running" | "removed";
+/** Ranked as the glossary ranks them: what a rollup of several shows first. `pending`:
+ * the observed set's comparison isn't computed yet, so it is neither stale nor fresh. */
+export type PartitionStatus =
+  "removed" | "running" | "pending" | "failed" | "stale" | "materialized" | "missing";
 
-/** Why a partition is stale (docs/positions-from-reads.md): an input it read
- * changed, an upstream it reads is itself stale, or its asset changed. */
-export type StaleReason = "input changed" | "upstream stale" | "definition changed";
+/** Why a partition or key is stale (glossary, "stale"): an input unit it read changed
+ * (new patterns included), an upstream it reads is itself stale, or its asset changed.
+ * The API has said both "input changed" and "input_changed"; `staleReason` reads either. */
+export type StaleReason = "input_changed" | "upstream_stale" | "definition_changed";
 
-/** A page of an asset partition's stale keys: all of them or none for a
- * keyed output that is not `each`; `tracked` false for an unkeyed one. */
+/** One stale key, with its own reasons where the API gives them. */
+export interface StaleKey {
+  key: string;
+  reasons?: string[];
+}
+
+/** A page of an asset partition's stale keys: all of them or none for a keyed
+ * output that is not `each`; `tracked` false for an unkeyed one. Keys are bare
+ * strings or `{key, reasons}`; `reasons` is the partition's. */
 export interface StaleKeys {
   tracked: boolean;
-  keys: string[];
+  keys: (string | StaleKey)[];
   next: string | null;
-  reasons: StaleReason[];
+  reasons: string[];
 }
 
 export interface PartitionOutcome {
@@ -232,7 +259,6 @@ export interface AssetDetail {
   asset: AssetDecl;
   heads: Record<string, [string, Head][]>;
   cursor: Json;
-  positions: Record<string, Position | null>;
   current_keys: string[][];
   repairs: Record<string, string[]>;
   partitions: Record<string, PartitionOutcome>;
@@ -244,7 +270,7 @@ export interface PartitionRow {
   status: PartitionStatus;
   last_outcome: string | null;
   last_attempt: string | null;
-  reasons?: StaleReason[]; // when `stale`
+  reasons?: string[]; // when `stale`
 }
 
 export interface OutputHead {
@@ -265,8 +291,9 @@ export interface KeyPage {
   output: string;
   partition: string;
   total: number;
-  /** Each key, and the generation that last wrote it: its version. */
-  keys: Record<string, number>;
+  /** Each key, and the generation that last wrote it; a source key also says the version
+   * it was served at, where known (`{generation, version}`). Read with `keyEntry`. */
+  keys: Record<string, number | { generation: number; version?: string | null }>;
   next: string | null;
 }
 
@@ -292,7 +319,6 @@ export interface FailurePartition {
   counts: Partial<Record<FailureClass, number>>;
   due: number | null;
   deploy_min: number | null;
-  passes?: number | null;
   retry: Json;
   forced: Record<string, number>;
   last?: string | null;
@@ -319,6 +345,8 @@ export interface KeyOutcome {
   /** The generation of the upstream key it processed. */
   generation: number | null;
   outcome: KeyOutcomeKind;
+  /** Which try this was: 1 for the first call, more for a retry. */
+  tries?: number | null;
   error: string | null;
   duration: number | null;
   at: number;
@@ -347,41 +375,25 @@ export interface Explain {
   verdict: "ok" | "failing" | "excluded" | "not_matched" | "pending" | "removed" | "absent";
 }
 
-export type InputState = "never" | "caught_up" | "behind" | "delta" | "full" | "pattern_change" | "reconcile";
+/** Explain's word on the input as a whole; the observed set retires the pass-based values. */
+export type InputState = string;
 
-/** An input's position (python/solera_server/positions.py): `next`,
- * the first upstream commit not yet delivered; `pass`, one under way —
- * its mode, boundary (`from`..`to`) and place (`at`: the last key
- * delivered, or the next commit). */
-export interface Position {
-  kind: "keys" | "commits";
-  output: string;
-  up: string;
-  fingerprint: string;
-  reset_by?: string | null;
-  next: number;
-  pass?: {
-    mode: "full" | "delta" | "diff";
-    from?: number;
-    to?: number;
-    at: string | number | null;
-    batch: number;
-    batches: number;
-    pin?: number | null;
-    reconcile?: boolean;
-  };
-  patterns?: Json;
-  pattern_change?: { old: Json; new: Json; at: number; pin: number };
-  reconcile?: { after: string | null };
+/** What one consumer partition owes one keyed incremental input (docs/observed-set.md):
+ * the comparison of upstream now with what it observed. `owed` is null while that
+ * comparison isn't computed yet (pending); `full_run_due` names why the next run reads
+ * everything (a definition change, an upstream reset); `observed_at` is the oldest commit
+ * any part of the record was observed at: everything is observed at least through it. */
+export interface Observed {
+  owed: { added: number; updated: number; removed: number } | null;
+  full_run_due: string | null;
+  observed_at: number | null;
 }
 
 export interface InputPartition {
   partition: string;
   upstream_partition: string;
-  position: Position | null;
-  head_commit: number | null;
-  lag: number | null;
-  state: InputState;
+  head_commit?: number | null;
+  observed?: Observed | null;
 }
 
 export interface Input {
@@ -530,6 +542,28 @@ export interface Task {
   held?: [string, string | null] | null;
   started_at?: number | null;
   finished_at?: number | null;
+  /** Its last committed batch's index and end key; `key` null once the walk is done.
+   * Null before the first commit; absent from engines that don't report it. */
+  progress?: Progress | null;
+}
+
+export interface Progress {
+  batch: number;
+  key: string | null;
+}
+
+/** One step of a task's walk (docs/observed-set.md, "A run"): up to `batch_size` keys,
+ * committed once. `index` is 0-based in the run, `count` the planned total (possibly an
+ * estimate); the batch covers keys in `(after, last]`. Retries share their batch. */
+export interface Batch {
+  index: number;
+  count: number | null;
+  after: string | null;
+  last: string | null;
+  added: number;
+  updated: number;
+  removed: number;
+  unchanged: number;
 }
 
 export const PHASES = [
@@ -560,6 +594,7 @@ export interface Attempt extends Partial<Record<Phase, number>> {
   gpu?: number | null;
   peak_memory?: number | null;
   cpu_seconds?: number | null;
+  batch?: Batch | null;
 }
 
 export interface AttemptError {
@@ -654,7 +689,7 @@ export interface SensorWorker {
 export interface Executor {
   name: string;
   kind: string;
-  environment: Record<string, Json>;
+  config: Record<string, Json>;
   max_concurrent: number | null;
   in_flight: number;
 }
@@ -668,15 +703,39 @@ export interface Worker {
 export interface Repair {
   output: string;
   partition: string;
+  /** How many runs have come due since it began owing; past the limit it is `stuck`. */
+  repair_runs?: number;
+  stuck?: boolean;
   intents: { run: string; attempt: string; files?: string[] }[];
 }
 
 /** GET /cleanups: output partitions whose cleanups have stuck entries, for an operator to clear. */
-export interface Cleanup {
+export type Cleanup = PartitionCleanup | RetiredCleanup;
+
+/** An output partition's store cleanup: what's pending, and entries stuck after three tries. */
+export interface PartitionCleanup {
   output: string;
   partition: string;
   pending: number;
-  stuck: { id: string; [key: string]: Json }[];
+  stuck: {
+    id: string;
+    kind?: string;
+    misses?: number;
+    attempt?: string;
+    files?: Json;
+    [key: string]: Json | undefined;
+  }[];
+}
+
+/** What a removed or moved output left in a store, awaiting its cleanup task (K25):
+ * written before `before`, deleted from `due` on; `stuck` says why it stopped. */
+export interface RetiredCleanup {
+  id: string;
+  output: string;
+  store: string;
+  before: number;
+  due: number;
+  stuck?: Json;
 }
 
 export interface Stats {

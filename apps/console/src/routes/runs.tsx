@@ -10,7 +10,7 @@ import { label } from "@/lib/status";
 import { join, list, RANGES, type RunSearch } from "@/router";
 import { Button } from "@/ui/button";
 import { Empty, ErrorNote, Skeleton } from "@/ui/data";
-import { Chip, SearchInput, Segmented, Select } from "@/ui/form";
+import { Chip, SearchInput, Segmented, Select, Switch } from "@/ui/form";
 import { Card, Page, PageHeader } from "@/ui/layout";
 import { StatusIcon } from "@/ui/status";
 
@@ -28,6 +28,7 @@ export function filterOf(search: RunSearch): RunFilter {
     range: search.since ? undefined : search.range,
     since: search.since,
     until: search.until,
+    cleanup: search.cleanup,
   };
 }
 
@@ -55,7 +56,9 @@ export function Runs() {
 
   const rows = runs.data?.pages.flatMap((page) => page.runs) ?? [];
   const total = runs.data?.pages[0]?.total;
-  const filtered = Object.entries(search).some(([k, v]) => k !== "range" && v !== undefined);
+  const filtered = Object.entries(search).some(
+    ([k, v]) => k !== "range" && k !== "cleanup" && v !== undefined,
+  );
   const statuses = list(search.status);
   const facetCount = (facet: Facet[] | undefined, value: string) =>
     facet?.find((f) => f.value === value)?.count ?? 0;
@@ -123,11 +126,28 @@ export function Runs() {
               onChange={(v) => set({ tag: v })}
             />
           )}
+          {!search.origin && (
+            <label className="inline-flex h-8 items-center gap-2 px-1 text-sm text-fg-muted">
+              <Switch
+                checked={!!search.cleanup}
+                label="Show cleanup tasks"
+                onCheckedChange={(on) => set({ cleanup: on || undefined })}
+              />
+              Cleanup tasks
+              {facets && (
+                <span className="text-xs text-fg-subtle tabular">
+                  {count(facetCount(facets.origin, "cleanup"))}
+                </span>
+              )}
+            </label>
+          )}
           {filtered && (
             <Button
               variant="ghost"
               icon={<FilterX />}
-              onClick={() => navigate({ search: { range: search.range }, replace: true })}
+              onClick={() =>
+                navigate({ search: { range: search.range, cleanup: search.cleanup }, replace: true })
+              }
             >
               Clear
             </Button>
