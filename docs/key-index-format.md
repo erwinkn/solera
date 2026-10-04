@@ -53,8 +53,8 @@ empty payload (a set's element) is flag bit 2 and a zero length.
 The block's bytes are the concatenated encoded entries, compressed with
 the file's codec (footer). A block decodes to at most 16 MiB, counting its
 entries' bytes and their keys expanded: writers close a block near the
-block size (64 KiB by default) and refuse an entry that would push it past
-16 MiB, and readers refuse a block past it, failing before they inflate it
+block size (64 KiB by default), and before an entry that would push it
+past 16 MiB (refusing only an entry past it alone), and readers refuse a block past it, failing before they inflate it
 whole (F29).
 
 ## Filters

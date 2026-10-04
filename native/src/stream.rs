@@ -637,6 +637,15 @@ impl Writer {
                 String::from_utf8_lossy(key)
             )));
         }
+        // A block closes before an entry would push what it decodes to past
+        // the bound (its key unshared, at most 32 bytes of lengths and
+        // flags): only an entry past it alone is refused.
+        let entry = 2 * key.len() + payload.map_or(0, <[u8]>::len) + 32;
+        if self.count > 0
+            && self.block.len() as u64 + self.block_keys + entry as u64 > MAX_BLOCK_BYTES
+        {
+            self.close_block()?;
+        }
         let shared = if self.count == 0 {
             self.first.clear();
             self.first.extend_from_slice(key);
@@ -661,8 +670,8 @@ impl Writer {
         self.block_keys += key.len() as u64;
         if self.block.len() as u64 + self.block_keys > MAX_BLOCK_BYTES {
             return Err(Error::Value(format!(
-                "an entry of {:?} makes its block decode past {MAX_BLOCK_BYTES} bytes",
-                String::from_utf8_lossy(key)
+                "an entry (a key of {} bytes) decodes past {MAX_BLOCK_BYTES} bytes alone",
+                key.len()
             )));
         }
         if self.block.len() >= self.o.block_size {

@@ -333,7 +333,7 @@ def test_a_block_that_inflates_past_its_bound_is_refused(read):
     """F29: the readers that take a block without a limit inflated whatever
     its zlib stream held: here 32 KB to 32 MiB; a 64 MB block could ask for
     gigabytes. Format v4 bounds what any block decodes to (16 MiB, which
-    writers refuse to exceed), and one past it fails fast, before it is
+    writers never exceed), and one past it fails fast, before it is
     inflated whole."""
 
     bomb = _zlib_bomb(32 << 20)
@@ -342,9 +342,18 @@ def test_a_block_that_inflates_past_its_bound_is_refused(read):
         read(bomb)
 
 
-def test_a_writer_refuses_a_block_past_the_bound():
-    """F29's other side: no writer produces a block readers would refuse."""
+def test_a_writer_never_writes_a_block_past_the_bound():
+    """F29's other side: no writer produces a block readers would refuse.
+    Keys sharing a long prefix compress to almost nothing yet decode to
+    their full length: 1,200 keys of 32 KiB decode to ~38 MiB, so the
+    writer closes their block before 16 MiB, and readers take every block.
+    An entry past the bound alone is refused."""
 
+    keys = [b"p" * 32768 + b"%06d" % i for i in range(1200)]
+    data = _native.encode_file(keys, [0] * len(keys), bytes(len(keys)), payloads=[b"v"] * len(keys))
+    tail, blocks = blocks_of(data)
+    assert len(blocks) >= 3
+    assert [k for b in blocks for k in _native.decode_block(b, tail["codec"])[0]] == keys
     with pytest.raises(ValueError):
         _native.encode_file([b"a"], [1], b"\x00", payloads=[bytes(17 << 20)])
 
