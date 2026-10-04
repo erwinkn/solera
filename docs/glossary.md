@@ -600,10 +600,25 @@ oldest pin).
 
 **cleanup** `Store.cleanup`. Deleting what nothing references any more,
 once no pin predates it: the engine deletes its own files (index,
-history); a worker deletes a store's superseded or abandoned objects
-through `store.cleanup` (immutable stores). A store cleanup is pending, or
-**stuck** after three failed tries. *Was:* garbage, discard, data garbage.
-*Example:* `solera cleanups site_files alpha`.
+history); a worker deletes a store's objects through
+`store.cleanup(output, home, partition, key, generation, before)`, an
+identity pattern: superseded versions, what an attempt that never
+committed wrote, a removed or moved output's whole life. A store cleanup
+is pending, or **stuck** after three failed tries. *Was:* garbage,
+discard, data garbage; the items grammar. *Example:* `solera cleanups
+site_files alpha`.
+
+**cleanup task**. A task of the engine's own, with no asset, that deletes
+what an output removed, or moved to another store, left in the store it
+was on — where no attempt of that output will ever run again (K25).
+
+**cleanup_after** `Output(cleanup_after=)`, a store's `cleanup_after`. How
+long a removed or moved output's data stays before its cleanup task
+deletes it: the output's, else its store's (zero for FileStore and
+S3Store, a week for PostgresStore, whose tables people query directly).
+*Edge case:* `orders` removed on day 0 with a week's grace and added back
+on day 3 keeps what its new life wrote: the cleanup takes only what was
+written before the removal (`before=`).
 
 **retention** `Retention(days=…, runs=…)`. How long run history is kept,
 per asset. Current state and data never expire.

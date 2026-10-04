@@ -528,10 +528,13 @@ class Views:
 
     def cleanups_view(self) -> list[dict]:
         """Output partitions whose cleanups have stuck entries, for an operator
-        to clear (docs/lifecycle.md §9.8)."""
+        to clear (docs/lifecycle.md §9.8); and every output life removed or
+        moved away whose leftovers await a cleanup task, with when each is
+        due (K25)."""
 
-        return [
+        partitions = [
             self.partition_cleanups(output, partition)
             for (output, partition), entries in sorted(self.m.cleanups.items())
             if any(e.get("stuck") for e in entries)
         ]
+        return partitions + self.retired_cleanups()

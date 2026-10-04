@@ -134,6 +134,15 @@ prefix; `before=G` matches every generation older than `G`:
 | `cleanup(o, partition=p, key=k, generation=g)` | one superseded version | a commit replaced it |
 | `cleanup(o, partition=p, generation=g)` | all an attempt wrote | it ended without committing, or wrote after it ended |
 
+A store declares `cleanup_after`, how long a removed or moved output's
+data stays before a cleanup task deletes it (an output may override it).
+A built-in store's class and config enter the manifest, so that task can
+rebuild it once the project no longer declares it; registration refuses
+a secret written in them — a DSN with a password, S3 keys — naming the
+field: pass `env:NAME` instead, resolved in the worker. A store of your
+own carries nothing: its cleanup uses the project's store of that name,
+and is stuck, saying so, once that is gone.
+
 The engine asks only for what no reader pins; the store just deletes,
 idempotently — twice, or what was never written, is harmless. Each
 store satisfies a pattern as it can: FileStore and S3Store by name (the

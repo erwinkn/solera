@@ -212,7 +212,10 @@ class Output:
     delta; `key=` implies it. Public `mode=` is gone (§2.1).
 
     `keyed=True` makes the value a `dict[str, Any]`, one entry per key;
-    `key="id"` makes it rows, keyed by their `id` column."""
+    `key="id"` makes it rows, keyed by their `id` column. `cleanup_after`
+    (a timedelta) overrides its store's: how long the data of this output,
+    once removed or moved to another store, stays before a cleanup task
+    deletes it (docs/glossary.md)."""
 
     is_dynamic_partitions = False
 
@@ -224,8 +227,13 @@ class Output:
         incremental: bool | None = None,
         migrations: tuple | list = (),
         keyed: bool = False,
+        cleanup_after: dt.timedelta | None = None,
         **config: Any,
     ):
+        if cleanup_after is not None and (
+            not isinstance(cleanup_after, dt.timedelta) or cleanup_after < dt.timedelta(0)
+        ):
+            raise RegistrationError(f"Output {name or '?'}: cleanup_after= is a timedelta of zero or more")
         if "mode" in config:
             raise RegistrationError(
                 f"Output {name or '?'}: mode= was removed; declare incremental= instead (§2.1)"
@@ -244,6 +252,7 @@ class Output:
         self.key, self.incremental = key, bool(incremental)
         self.config = config
         self.migrations = tuple(migrations)
+        self.cleanup_after = cleanup_after
 
     def spec(self, default_name: str) -> dict:
         name = self.name or default_name
@@ -255,6 +264,7 @@ class Output:
             "migrations": [m.name for m in self.migrations],
             "config": self.config,
             "dynamic_partitions": self.is_dynamic_partitions,
+            "cleanup_after": None if self.cleanup_after is None else self.cleanup_after.total_seconds(),
         }
 
 
@@ -1324,6 +1334,10 @@ class Project:
                     "migrations": [m.name for m in output.migrations],
                     "config": output.config,
                     "dynamic_partitions": output.is_dynamic_partitions,
+                    # How long its data stays once removed or moved away; None: its store's (K25).
+                    "cleanup_after": None
+                    if output.cleanup_after is None
+                    else output.cleanup_after.total_seconds(),
                     "output": output,
                 }
         return table
@@ -1636,7 +1650,7 @@ class Project:
         executors = self._executors()
         for name, asset in self.assets.items():
             info = assets[name]
-            placement = asset.executor.serialized() if asset.executor else _default_placement()
+            placement = asset.executor.serialized() if asset.executor else default_placement()
             declared = executors.get(placement["executor"])
             if declared is None and placement["kind"] not in _builtin_kinds():
                 raise RegistrationError(
@@ -1722,14 +1736,23 @@ class Project:
                     raise RegistrationError(
                         f"store {name!r}: a {writes} store implements {method}() (docs/stores.md)"
                     )
-        store_records = {
-            name: {
+        store_records = {}
+        for name, store in self.stores.items():
+            store_records[name] = {
                 "version": getattr(store, "version", "1"),
                 "ref": getattr(getattr(store, "ref_type", None), "kind", None) or "ref",
                 "writes": store.writes,
+                # How long a removed or moved output's data stays (K25).
+                "cleanup_after": getattr(store, "cleanup_after", dt.timedelta(0)).total_seconds(),
             }
-            for name, store in self.stores.items()
-        }
+            # A built-in store's class and config: a worker rebuilds it to clean up after
+            # an output the project no longer declares there (K25). Never a literal secret.
+            try:
+                built_in = store.describe() if callable(getattr(store, "describe", None)) else None
+            except ValueError as error:
+                raise RegistrationError(f"store {name!r}: {error}") from None
+            if built_in is not None:
+                store_records[name]["built_in"] = built_in
         body = {
             "name": self.name,
             "assets": manifest_assets,
@@ -1777,7 +1800,7 @@ def _builtin_kinds() -> dict:
     return BUILTIN_KINDS
 
 
-def _default_placement() -> dict:
+def default_placement() -> dict:
     from .executors import Local
 
     return Local()().serialized()

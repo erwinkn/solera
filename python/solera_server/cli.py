@@ -175,7 +175,9 @@ def _main():
     runs_prune.add_argument("--keep", type=int, help="Keep the N newest matching runs")
     runs_prune.add_argument("--dry-run", action="store_true")
     cleanups = commands.add_parser(
-        "cleanups", help="An output partition's pending cleanups, and the stuck ones (docs/lifecycle.md §9.8)"
+        "cleanups",
+        help="An output partition's pending cleanups, and the stuck ones; a removed or moved output's "
+        "leftovers, and when they are due (docs/lifecycle.md §9.8)",
     )
     cleanups.add_argument("output")
     cleanups.add_argument("partition", nargs="?", default="")
@@ -440,10 +442,10 @@ async def _remote(args, parser):
             response.raise_for_status()
             print(json.dumps(response.json(), indent=2))
         elif args.command == "cleanups":
-            response = await client.get(f"{base}/outputs/{args.output}/heads")
+            response = await client.get(f"{base}/cleanups")
             response.raise_for_status()
-            heads = [h for h in response.json()["heads"] if h["partition"] == args.partition]
-            print(json.dumps(heads[0]["cleanups"] if heads else None, indent=2))
+            rows = [r for r in response.json()["cleanups"] if r["output"] == args.output]
+            print(json.dumps(rows, indent=2))
         elif args.command == "stale":
 
             async def page(after):

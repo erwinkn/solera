@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import datetime
 import logging
 import re
 from collections.abc import Callable, Iterable, Mapping
@@ -85,11 +86,24 @@ class Sql(Opaque):
     stmt: str
 
 
+def _dsn_password(dsn: str) -> bool:
+    """Whether a DSN — a URL or `key=value` pairs — names a password."""
+
+    if "://" in dsn:
+        from urllib.parse import urlsplit
+
+        parts = urlsplit(dsn)
+        return bool(parts.password) or "password=" in (parts.query or "")
+    return any(pair.split("=", 1)[0].strip() == "password" for pair in dsn.split())
+
+
 class PostgresStore:
     version = "1"
     ref_type = TableRef
     shared_table = True
     writes = "fenced"
+    # A removed or moved output's table stays a week: people query it directly (K25).
+    cleanup_after = datetime.timedelta(days=7)
 
     def __init__(self, dsn: str, grants: list[str] | tuple = (), sql_read_only: bool = False):
         """`grants`: roles given SELECT on every table the store creates.
@@ -98,6 +112,19 @@ class PostgresStore:
         through the worker, from one connection's COPY into the other's."""
 
         self.dsn, self.grants, self.sql_read_only = dsn, tuple(grants), sql_read_only
+
+    def describe(self) -> dict | None:
+        """`{class, config}` (FileStore.describe), refusing a DSN that holds a
+        password: it would sit in the manifest, journal and API. A DSN
+        without one (local development) passes; `env:NAME` is resolved in the
+        worker."""
+
+        if type(self) is not PostgresStore:
+            return None
+        if not self.dsn.startswith("env:") and _dsn_password(self.dsn):
+            raise ValueError("the dsn holds a password: pass dsn='env:NAME' and set NAME to the DSN")
+        config = {"dsn": self.dsn, "grants": list(self.grants), "sql_read_only": self.sql_read_only}
+        return {"class": "PostgresStore", "config": config}
 
     # -- registration -------------------------------------------------------
 

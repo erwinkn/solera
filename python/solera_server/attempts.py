@@ -459,7 +459,7 @@ class Attempts:
             "run": {"id": task["run"], "config": run.get("config") or {}},
             "outputs": {name: worker_output(info) for name, info in prepared["outputs"].items()},
             "inputs": prepared["inputs"],
-            "placement": self.manifest["assets"][task["asset"]]["placement"],
+            "placement": self._placement_spec(task),
             "heartbeat": self.heartbeat_seconds,
             "engine": self.engine_url,
             "token": lifecycle.token(await self._load_secret(), attempt),
@@ -467,6 +467,8 @@ class Attempts:
         }
         if prepared["cursor"] is not None:
             spec["cursor"] = prepared["cursor"]
+        if prepared.get("cleanup") is not None:  # a cleanup task's entry (K25)
+            spec["cleanup"] = prepared["cleanup"]
         base = lifecycle.base(task["run"], attempt)
         await self.state.create_object(f"{base}{lifecycle.SPEC}", json.dumps(spec).encode())
         # Its control file, before the launch: a worker never creates it, so one that
@@ -805,22 +807,44 @@ class Attempts:
             for e in entries
             if e.get("stuck")
         ]
-        return {
+        view = {
             "output": output,
             "partition": partition,
             "pending": len(entries) - len(stuck),
             "stuck": stuck,
         }
+        retired = self.retired_cleanups(output)
+        return {**view, "retired": retired} if retired else view
+
+    def retired_cleanups(self, output: str | None = None) -> list[dict]:
+        """What removed or moved output lives left behind, awaiting a cleanup
+        task (K25): where, from which generation on it is not theirs, when
+        each is due, and why one is stuck."""
+
+        return [
+            {
+                "id": entry["id"],
+                "output": entry["output"],
+                "store": entry["store"],
+                "before": entry["before"],
+                "due": entry["due"],
+                **({"stuck": entry["stuck"]} if entry.get("stuck") else {}),
+            }
+            for entry in self.m.retired.values()
+            if output is None or entry["output"] == output
+        ]
 
     def clear_cleanups(self, output: str, partition: str, by: str) -> dict:
         """An operator's `solera cleanups --clear`: forget the stuck
         entries. Their objects stay where they are."""
 
         stuck = [e["id"] for e in self.m.cleanups.get((output, partition)) or [] if e.get("stuck")]
-        if stuck:
+        # And an output life's stuck cleanup task (K25): its leftovers stay too.
+        retired = [i for i, e in self.m.retired.items() if e["output"] == output and e.get("stuck")]
+        if stuck or retired:
             event = {"output": output, "partition": partition, "ids": stuck, "by": by, "at": self.clock()}
-            self.state.record({"type": "CleanupsCleared", **event})
-        return {"output": output, "partition": partition, "cleared": stuck}
+            self.state.record({"type": "CleanupsCleared", **event, "retired": retired})
+        return {"output": output, "partition": partition, "cleared": stuck + retired}
 
     async def _end(self, run_id: str, attempt: str) -> dict | None:
         """End the attempt in its control file (§2.4), on what it reads

@@ -1258,6 +1258,8 @@ async def _execute(
         failed = _failed(StoreError(mismatch), False)
         failed["error"]["build"] = project.manifest.get("build")  # how this host computed its deploy
         return failed
+    if spec.get("cleanup") is not None:  # a cleanup task: no asset, an output life's leftovers (K25)
+        return await _retire(spec["cleanup"], project, writes)
     asset = project.assets[spec["asset"]]
     observed = Observed()
     try:
@@ -1339,6 +1341,34 @@ async def _execute(
     finally:
         with contextlib.suppress(Exception):  # a reader that will not close holds nothing we need
             await observed.close()
+
+
+async def _retire(entry: dict, project, writes) -> dict:
+    """A cleanup task (K25): delete what an output life left in a store it
+    was removed or moved from — `store.cleanup(output, home, before=G)`, G
+    the first generation after, so a later life of the name keeps what it
+    wrote. A built-in store is rebuilt from its manifest description; a
+    store of the project's own is the one of that name it still declares,
+    and gone, the task fails for good, saying so."""
+
+    from solera.stores import rebuild
+
+    if entry.get("built_in") is not None:
+        store = rebuild(entry["built_in"], project.home)
+    elif entry["store"] in project.stores:
+        store = project.stores[entry["store"]]
+    else:
+        gone = StoreError(
+            f"store {entry['store']!r} is the project's own and no longer declared: restore it, "
+            f"or give it up (solera cleanups {entry['output']} --clear)"
+        )
+        return _failed(gone, False)
+    decl = entry.get("decl") or {}
+    output = Output(
+        entry["output"], key=decl.get("key"), incremental=decl.get("incremental"), **decl.get("config", {})
+    )
+    await writes.call(store.cleanup(output, home=entry["home"], before=entry["before"]))
+    return {"status": "succeeded", "outputs": {}, "cleaned": entry["id"]}
 
 
 async def _cleanup_after(answer, spec, project, objects, channel, worker_id) -> None:

@@ -1025,6 +1025,19 @@ code, so workers clean up, twice over:
   most 64) in the spec's output info, and the worker, after its own store
   call succeeds, cleanups them and reports which in its result;
   `AttemptFinished` then removes them.
+- **By a cleanup task** (K25), where no attempt of the output will ever
+  come again: an output removed, or moved to another store. The deploy
+  records the life it ended — the old store (a built-in one's class and
+  config, from the manifest), the output's home and declaration, and
+  `before`, the first generation after — due once its `cleanup_after`
+  has passed and no pin predates the deploy. The engine then submits a
+  task of its own, asset `@cleanup`, on the default placement, retried
+  like any (six tries); its worker rebuilds the store and calls
+  `store.cleanup(output, home=…, before=G)`, so a later life of the name
+  in that store keeps what it wrote. A store of the project's own that it
+  no longer declares cannot be rebuilt: the task fails for good, and the
+  entry is stuck with that reason, shown by `solera cleanups`, until an
+  operator clears it (its objects stay).
 
 Deleting a name twice is no harm, and only the index files an
 acknowledged entry names become garbage. Due means no reader pin that

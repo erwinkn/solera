@@ -39,6 +39,7 @@ from .positions import pins, reads
 
 TERMINAL_TASK = frozenset({"succeeded", "skipped", "failed", "blocked", "canceled"})
 TERMINAL_RUN = frozenset({"succeeded", "failed", "canceled"})
+CLEANUP = "@cleanup"  # a cleanup task's asset: none of the project's (K25)
 BAD_OUTCOME = frozenset({"failed", "blocked", "canceled"})
 MAX_RECEIPTS = 10_000  # idempotency receipts kept for replayed submissions
 STUCK_AFTER = 3  # misses before a clean up entry is stuck (docs/lifecycle.md §9.8)
@@ -175,6 +176,7 @@ class Model:
             "partitions": _nest(self.partitions, 2),
             "repairs": _nest(self.repairs, 2),
             "cleanups": _nest(self.cleanups, 2),
+            "retired": dict(self.retired),
             "homes": dict(self.homes),
             "reset_at": _nest(self.reset_at, 2),
             "changed_at": self.changed_at,
@@ -223,6 +225,9 @@ class Model:
         # event counter that let go of it: for the partition's next attempt to clean up
         # once no reader pins it (docs/lifecycle.md §9.8)
         self.cleanups: dict[tuple, list] = _flatten(snap.get("cleanups"), 2)
+        # Output lives removed or moved away, whose data a cleanup task deletes (K25):
+        # id -> where it was, what it was, and when it may go.
+        self.retired: dict[str, dict] = dict(snap.get("retired") or {})
         # Output -> the name its life began under: where its store keeps every partition
         # of it, renamed or not (K25). A rename carries it; a reset starts a new one.
         self.homes: dict[str, str] = dict(snap.get("homes") or {})
@@ -572,16 +577,29 @@ class Model:
         if e["deploy"] != self.deploy:
             self.deploy_number += 1
         previous = (self.manifest or {}).get("outputs") or {}
+        stores_before = (self.manifest or {}).get("stores") or {}
+        sources_before = set((self.manifest or {}).get("sources") or ())
         assets_before = set((self.manifest or {}).get("assets") or ())
         declared_before = {a: declaration(self.manifest, a, self.homes) for a in assets_before}
         self.deploy, self.manifest, self.project = e["deploy"], manifest, e.get("project")
         renamed, output_map = self._apply_aliases(manifest)
         self._reconcile_tasks(manifest, renamed, output_map, e["at"])
         carried = {old for olds in renamed.values() for old in olds}  # by an alias: not removed
+        homes = dict(self.homes)  # the reset starts new lives: the old ones' homes, for their cleanup
         reset = self._reset(
             {output_map.get(name, name): o.get("store") for name, o in previous.items()},
             assets_before - carried,
         )
+        # What an output life left in the store it was removed or moved from: a cleanup
+        # task deletes it, once due and no pin predates the reset (K25). A source's data
+        # is not ours.
+        for name, old in previous.items():
+            now = output_map.get(name, name)
+            moved = now not in manifest["outputs"] or manifest["outputs"][now].get("store") != old.get(
+                "store"
+            )
+            if moved and name not in sources_before and old.get("store") in stores_before:
+                self._retire_output(now, homes.get(now, now), old, stores_before[old["store"]], e["at"])
         for asset in manifest["assets"]:
             olds = [a for a in renamed.get(asset, ()) if a in declared_before]  # renamed by this deploy
             before = declared_before.get(asset, declared_before.get(olds[0]) if olds else None)
@@ -673,7 +691,12 @@ class Model:
                         }
                         if launched["attempt"] in self.pool:
                             self.pool[launched["attempt"]]["asset"] = new
-                elif old not in manifest["assets"] and not task.get("launched") and tid not in self.claims:
+                elif (
+                    old not in manifest["assets"]
+                    and old != CLEANUP
+                    and not task.get("launched")
+                    and tid not in self.claims
+                ):
                     self._retire(run, task, at)
 
     def _retire(self, run: dict, task: dict, at: float) -> None:
@@ -716,6 +739,28 @@ class Model:
                 del positions[input]
             if not positions:
                 del self.partitions[key]["positions"]
+
+    def _retire_output(self, output: str, home: str, old: dict, store: dict, at: float) -> None:
+        """Record an output life's leftovers for a cleanup task (K25): the
+        store it was on — a built-in one's class and config, else its name
+        alone — its home, its declaration, and `before`, the first generation
+        after this deploy: a later life of the name in that store keeps what
+        it writes. Due `cleanup_after` from now: the output's, else its
+        store's."""
+
+        after = old.get("cleanup_after")
+        after = store.get("cleanup_after") or 0.0 if after is None else after
+        entry_id = f"{output}@{self.event_counter}"
+        self.retired[entry_id] = {
+            "id": entry_id,
+            "output": output,
+            "home": home,
+            "store": old["store"],
+            "built_in": store.get("built_in"),
+            "decl": {k: old[k] for k in ("key", "incremental", "config") if k in old},
+            "before": self.event_counter,
+            "due": at + float(after),
+        }
 
     def _reset(self, stores: dict[str, str], assets_before: set[str]) -> set[str]:
         """A deploy that removes an asset, or removes an output or declares it
@@ -1046,6 +1091,10 @@ class Model:
                 self._ready(run, task, at, float(e.get("delay") or 0))
             else:
                 task["status"] = "failed"
+                if task["asset"] == CLEANUP and task.get("cleanup") in self.retired:
+                    # Failed for good: kept, shown with why, never run again until an
+                    # operator clears it (`solera cleanups OUTPUT --clear`, K25).
+                    self.retired[task["cleanup"]]["stuck"] = str(e.get("error") or "failed")
                 self._finished(run, task, "failed", e["attempt"], at)
         elif outcome == "canceled" and commit:
             task["status"] = "canceled"  # a drained batch the user stopped: it does not resume
@@ -1109,6 +1158,9 @@ class Model:
         enters the history, with what it was built from (its `lineage`, with
         what its reads saw: `history.read_lineage`)."""
 
+        if task["asset"] == CLEANUP:  # a cleanup task: its output life's leftovers are gone (K25)
+            self.retired.pop(commit.get("cleaned"), None)
+            return
         asset, partition, at = task["asset"], task["partition"], e["finished_at"]
         reads = history.read_lineage(prepared.get("lineage"), e.get("read"))
         contracts = prepared.get("outputs") or {}
@@ -1255,7 +1307,11 @@ class Model:
         unless its run is paused. A task whose asset left the project while
         its attempt ran — a retry, a next batch — is retired instead."""
 
-        if self.manifest is not None and task["asset"] not in self.manifest["assets"]:
+        if (
+            self.manifest is not None
+            and task["asset"] not in self.manifest["assets"]
+            and task["asset"] != CLEANUP
+        ):
             self._retire(run, task, at)
             return
         due = at + delay
@@ -1465,6 +1521,8 @@ class Model:
         """An operator gave up on stuck entries: their objects stay."""
 
         self._drop_cleanups(e["output"], e["partition"], e["ids"])
+        for entry_id in e.get("retired") or ():  # a stuck cleanup task's output life (K25)
+            self.retired.pop(entry_id, None)
 
     def _replace_index(self, key: tuple, index: IndexState) -> None:
         """Swap in a new index state; files it no longer references await deletion."""

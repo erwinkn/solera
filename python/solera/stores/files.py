@@ -5,6 +5,7 @@ Python, pandas DataFrames and Arrow data (`frames`)."""
 from __future__ import annotations
 
 import asyncio
+import datetime
 import json
 import os
 import pickle
@@ -61,11 +62,22 @@ class FileStore:
     writes = "immutable"
     ref_type = ObjectRef
     shared_table = False
+    cleanup_after = datetime.timedelta(0)  # a removed or moved output's files go at once (K25)
 
     def __init__(self, path: str | os.PathLike | None = None):
         self.path = path
         self.home: str | None = None  # the project's directory, for the default path
         self._stores: dict[str, Any] = {}
+
+    def describe(self) -> dict | None:
+        """What a worker rebuilds this store from — `{class, config}`, in the
+        manifest — to clean up an output removed or moved away from it after
+        the project stops declaring it (K25). None for a subclass: a store of
+        the project's own carries nothing."""
+
+        if type(self) is not FileStore:
+            return None
+        return {"class": "FileStore", "config": {"path": None if self.path is None else str(self.path)}}
 
     def _objects(self):
         from obstore.store import LocalStore
@@ -420,6 +432,21 @@ class S3Store(FileStore):
     def __init__(self, url: str, **options: Any):
         super().__init__()
         self.url, self.options = url, options
+
+    SECRETS = ("access_key_id", "secret_access_key", "session_token", "token", "password")
+
+    def describe(self) -> dict | None:
+        """`{class, config}` (FileStore.describe), refusing a credential
+        written in the open: it would sit in the manifest, journal and API.
+        `env:NAME` is resolved in the worker instead."""
+
+        if type(self) is not S3Store:
+            return None
+        for name, value in self.options.items():
+            plain = name.lower().removeprefix("aws_")
+            if plain in self.SECRETS and isinstance(value, str) and not value.startswith("env:"):
+                raise ValueError(f"{name} is written in the open: pass {name}='env:NAME' and set NAME")
+        return {"class": "S3Store", "config": {"url": self.url, "options": dict(self.options)}}
 
     def _objects(self):
         if "" not in self._stores:

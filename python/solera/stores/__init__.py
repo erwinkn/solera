@@ -511,3 +511,25 @@ def by_key_type(t: Any) -> Any:
 
 from .files import FileStore as FileStore  # noqa: E402 — stores, on the core above
 from .files import S3Store as S3Store  # noqa: E402
+
+
+def rebuild(described: dict, home: str | None = None):
+    """A built-in store from its description (`describe()`, in the manifest),
+    in a worker: a cleanup task's store after the project stopped declaring
+    it (K25). `env:` values are resolved as the store uses them; `home`, the
+    project's directory, is a FileStore's default place."""
+
+    name, config = described["class"], described["config"]
+    if name in ("FileStore", "S3Store"):
+        from .files import FileStore, S3Store
+
+        if name == "S3Store":
+            return S3Store(config["url"], **config["options"])
+        store = FileStore(config["path"])
+        store.home = home
+        return store
+    if name == "PostgresStore":
+        from solera_postgres import PostgresStore
+
+        return PostgresStore(**config)
+    raise StoreError(f"no built-in store {name!r}")

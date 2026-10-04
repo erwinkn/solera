@@ -1033,7 +1033,11 @@ def _store(kind: str, root):
             with psycopg.connect(dsn, autocommit=True) as conn:
                 conn.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
 
-        return PostgresStore(dsn), {"schema": schema, "columns": {"id": "text", "v": "text"}}, drop
+        return (
+            PostgresStore("env:SOLERA_TEST_DATABASE_URL"),
+            {"schema": schema, "columns": {"id": "text", "v": "text"}},
+            drop,
+        )
     from tests.sdk.test_store_conformance import s3_harness
 
     return s3_harness(root).store, {}, lambda: None

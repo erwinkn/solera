@@ -285,9 +285,7 @@ def _postgres(schema: str | None) -> dict:
         return {}
     from solera_postgres import PostgresStore
 
-    from .postgres import DSN
-
-    return {"pg": PostgresStore(DSN)}
+    return {"pg": PostgresStore("env:SOLERA_TEST_DATABASE_URL")}  # never a literal secret in the manifest
 
 
 def is_odd(v: str) -> bool:

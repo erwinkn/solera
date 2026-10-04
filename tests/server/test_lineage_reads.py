@@ -53,7 +53,7 @@ async def test_lineage_says_what_a_current_read_saw(state):
         pytest.skip("SOLERA_TEST_DATABASE_URL is not set")
     from solera_postgres import PostgresStore
 
-    store = PostgresStore(DSN)
+    store = PostgresStore("env:SOLERA_TEST_DATABASE_URL")  # never a literal secret in the manifest
     name = f"sites_{uuid.uuid4().hex[:8]}"
     out = Output(name, key="id", store="postgres", columns={"id": "text", "v": "text"})
     content = {"rows": [{"id": "a", "v": "1"}, {"id": "b", "v": "1"}]}
@@ -151,7 +151,7 @@ async def test_an_external_tables_lineage_is_its_observation(state):
         pytest.skip("SOLERA_TEST_DATABASE_URL is not set")
     from solera_postgres import PostgresStore
 
-    store = PostgresStore(DSN)
+    store = PostgresStore("env:SOLERA_TEST_DATABASE_URL")  # never a literal secret in the manifest
     table = f"ext_{uuid.uuid4().hex[:8]}"
     with store._connect() as conn:
         conn.execute(f'CREATE TABLE "{table}" (id text, v text)')
@@ -189,7 +189,7 @@ async def test_a_renamed_postgres_output_stays_readable(state):
         pytest.skip("SOLERA_TEST_DATABASE_URL is not set")
     from solera_postgres import PostgresStore
 
-    store = PostgresStore(DSN)
+    store = PostgresStore("env:SOLERA_TEST_DATABASE_URL")  # never a literal secret in the manifest
     schema = f"s_{uuid.uuid4().hex[:8]}"
     rows = {"v": [{"id": "a", "v": "1"}]}
 
