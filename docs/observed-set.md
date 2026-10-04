@@ -108,14 +108,18 @@ order, `batch_size` keys a commit. Its **cursor lives in the run's memory
 only**: nothing about the run is stored but what its batches commit.
 
 **Each batch reads at its own head `H`**, pinned for that batch only by
-the claim's existing reader pin (A27 R6). It covers the key range from
-the previous batch's last key to its own, `(prev, c]` — from the first
-key for the first batch, to the last for the final one. At `H` it classes
+the claim's existing reader pin (A27 R6). The claim reserves `H` itself
+as well as the rows, so a retention cut never passes the head of a batch
+in flight, and no batch commits a range `@ H` that nothing can decode
+(W36's model, at `67b85eb`). It covers the key range from the previous
+batch's last key to its own, `(prev, c]` — from the first key for the
+first batch, to the last for the final one. At `H` it classes
 every candidate in that range: the run's owed keys there, plus whatever
 changed in the range since the run compared. So its range write
-`(prev, c] @ H` holds for every key in it, owed or not. It loads the keys
-it owes, calls the producer, and commits its outputs, the range and its
-points.
+`(prev, c] @ H` holds for every key in it, owed or not. This rule is
+load-bearing: with it off, W36's model breaks A19 R2's history (a key
+added twice). It loads the keys it owes, calls the producer, and commits
+its outputs, the range and its points.
 
 A cancelled or failed run leaves its committed batches' ranges and
 points. The next run compares again: keys under those ranges decode at
@@ -376,7 +380,7 @@ holds, `removed` always one.
 | A26 N1: the pass's rows | impossible: there is no pass; each batch reads at its own head, pinned by its claim |
 | A26 N5: the cap | there is none: overrides spill |
 | A27 R3, R4, R8, R9 | normalised patterns; candidates classed once; disjoint overwrite and decode-equal fold; per-range changes |
-| `ObservedSet.tla` 1 (P1, W36): a retention cut past an active pass's `T` (a pass at `T = 1` commits `k1`; `k2` changes at 2; the cut at 2 folds the base and ranges, and the pass's next batch, `k2`, needs the key view at 1, gone) | impossible: there is no pass; the next batch reads at its own head |
+| `ObservedSet.tla` 1 (P1, W36): a retention cut past an active pass's `T` (a pass at `T = 1` commits `k1`; `k2` changes at 2; the cut at 2 folds the base and ranges, and the pass's next batch, `k2`, needs the key view at 1, gone) | impossible: there is no pass; the next batch reads at its own head. Its remainder, a cut past the head of a batch in flight, is closed by the claim reserving that head |
 | `ObservedSet.tla` 2 (P2, W36): a pass sends a key back (the pass is at `T = 1`; `k1` is updated to `@2`; `keys=(k1)` delivers `@2`; the pass reaches `k1` and would deliver `@1`) | impossible: there is no pass; the batch covering `k1` reads at its own head and finds the point equal |
 | `ObservedSet.tla` 3 (P1, W36): a batch committing across a change it was not planned under (an upstream reset, a definition change) | the commit check: the current life, no start-over owed |
 
