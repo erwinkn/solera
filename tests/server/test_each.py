@@ -851,7 +851,6 @@ async def test_binding_a_whole_input_to_another_head_rebuilds_every_key(state, t
     assert await engine.stale_reasons("checks", "") == []
 
 
-@a19("R8")
 async def test_a_forced_retry_runs_after_its_source_reverts(state, tmp_path):
     """A19 R8: `checks` rejects k1 at version 1; the source goes to 2 and back
     to 1 (the net delta: nothing). A forced retry of rejected keys still calls

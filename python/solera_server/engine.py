@@ -1534,6 +1534,17 @@ class Engine(Attempts, Sensors, Staleness, Views):
             latest = int(
                 (self.m.heads.get((input["output"], upstream_partition)) or {}).get("commit_number", -1)
             )
+            if position is not None and "pass" not in position and int(position["next"]) <= latest:
+                index = self.m.index(input["output"], upstream_partition)
+                if index.covers(int(position["next"]), latest):
+                    # What the next delta will deliver: a due key it provably does is left to
+                    # it; any other retries at its current version (A19 R8).
+                    pin["batch"]["retry"]["delta"] = {
+                        "from": int(position["next"]),
+                        "to": latest,
+                        "index": index.slice(int(position["next"]), latest).to_json(),
+                        "ahead": ahead or {},
+                    }
             if position is not None and position.get("ahead") and "pass" not in position:
                 # The pass's last batch says whether, its keys read, nothing past the snapshot
                 # is left undelivered: then the record collapses, as after a default run (K47).

@@ -321,6 +321,19 @@ async def read_each_batch(spec: dict, pin: dict, keys_io) -> Batch:
     upstream = KeyIndex(keys_io, None, IndexState.from_json(pin["index"]))
     current = await upstream.lookup([key_bytes(k) for k in due]) if due else {}
     taken = Matcher(pin.get("patterns"))
+    # A due key written since it failed is left to the next delta only if that delta
+    # delivers it: a write that nets out (v1 -> v2 -> v1) delivers nothing (A19 R8).
+    moved = [k for k in due if (e := current.get(key_bytes(k))) is not None and e[0] != walked[k].upstream]
+    delta, owed = pin["batch"]["retry"].get("delta"), set()
+    if moved and delta is not None:
+        index = KeyIndex(keys_io, None, IndexState.from_json(delta["index"]))
+        lower = {key_bytes(k): (int(g), bool(live)) for k, (g, live) in (delta.get("ahead") or {}).items()}
+        async for page in index.changes(
+            int(delta["from"]), int(delta["to"]), keys=[key_bytes(k) for k in moved], lower=lower
+        ):
+            owed |= {
+                key_str(k) for k, c in zip(page.keys, page.classes, strict=True) if CHANGE[c] is not None
+            }
     upserted, deleted, unmatched = {}, [], []
     for key in due:
         entry = current.get(key_bytes(key))
