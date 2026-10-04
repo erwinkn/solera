@@ -163,6 +163,9 @@ pub fn retain(versions: &[Version], endpoints: &[u64], base: bool) -> Vec<Versio
 }
 
 /// Adjacent spans (`runs`, newest first) merged into one span's files.
+/// Returns them, and the entries of each segment: `segments[i]` counts the
+/// kept versions with `i` of the (sorted) `endpoints` at or below their
+/// generation.
 pub fn merge(
     runs: &[Vec<&[u8]>],
     codecs: &[u8],
@@ -170,11 +173,15 @@ pub fn merge(
     base: bool,
     o: Options,
     max_file_bytes: usize,
-) -> Result<(Vec<Vec<u8>>, u64)> {
+) -> Result<(Vec<Vec<u8>>, Vec<u64>)> {
+    let mut sorted = endpoints.to_vec();
+    sorted.sort_unstable();
+    let mut segments = vec![0u64; sorted.len() + 1];
     let mut g = Groups::new(runs, codecs)?;
     let mut w = Writer::new(o, max_file_bytes).repeating();
     while let Some((key, versions)) = g.next_group()? {
-        for v in retain(&versions, endpoints, base) {
+        for v in retain(&versions, &sorted, base) {
+            segments[sorted.partition_point(|&e| e <= v.generation)] += 1;
             w.push(
                 &key,
                 v.generation,
@@ -185,8 +192,7 @@ pub fn merge(
         }
     }
     w.finish(true)?;
-    let entries = w.entries;
-    Ok((w.files.into_iter().collect(), entries))
+    Ok((w.files.into_iter().collect(), segments))
 }
 
 pub const ADDED: u8 = 0;

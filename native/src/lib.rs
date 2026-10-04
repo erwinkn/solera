@@ -473,7 +473,8 @@ fn presence<'py>(
 /// Format v4 prototype (`v4.rs`): adjacent spans (`runs`, newest first)
 /// merged into one span's files, keeping the versions the live `endpoints`
 /// (generations) see; `base` when the output starts at commit 0. Returns the
-/// files and their entry count.
+/// files, and the entries of each segment (`segments[i]`: versions with `i`
+/// of the sorted endpoints at or below their generation).
 #[pyfunction]
 #[pyo3(signature = (runs, codecs, endpoints, base, block_size=65536, level=1, bits_per_item=14, k=10, codec=1, max_file_bytes=67108864))]
 #[allow(clippy::too_many_arguments)]
@@ -489,16 +490,16 @@ fn v4_merge<'py>(
     k: u8,
     codec: u8,
     max_file_bytes: usize,
-) -> PyResult<(Bound<'py, PyList>, u64)> {
+) -> PyResult<(Bound<'py, PyList>, Vec<u64>)> {
     guard(|| {
         let o = options(block_size, level, bits_per_item, k, codec);
-        let (files, entries) = py
+        let (files, segments) = py
             .detach(|| {
                 let runs: Vec<Vec<&[u8]>> = runs.iter().map(|r| slices(r)).collect();
                 v4::merge(&runs, &codecs, &endpoints, base, o, max_file_bytes)
             })
             .map_err(to_py)?;
-        Ok((list_of_bytes(py, &files)?, entries))
+        Ok((list_of_bytes(py, &files)?, segments))
     })
 }
 
