@@ -458,3 +458,39 @@ async def test_the_resolvers_delta_is_the_writers_and_its_candidate_installs_wit
     cache.offer(h.state.path("000000000013-a2-0.lay"), b"x")
     cache.forget("a2")
     assert not cache.committed(h.state.path("000000000013-a2-0.lay"), 1, h.state.prefix)
+
+
+async def test_the_engine_resolves_a_workers_request_from_its_warm_cache(tmp_path):
+    from solera.keys import resolver as R
+    from solera.keys.layer_cache import LayerCache
+
+    rng = random.Random(29)
+    h = History(rng)
+    for _ in range(10):
+        await h.commit({key(rng.randrange(60)): None for _ in range(5)}, [])
+    await h.merge_some(h.state.head)
+    cache = LayerCache(str(tmp_path), disk=2**20)
+    resolver = R.Resolver(cache, h.io)
+    c, g = h.state.head + 1, 10 * (h.state.head + 1) + 7
+    p = R.Prepared("", c, g, h.state, h.state.head, False, replaced=True)
+    run = SortedEntries.of([key(3), key(70)], None, [key(4), key(90)])
+    ask = R.Ask("out", "", "patch", c, g, h.state.prefix, h.state.head, run)
+
+    async def answer():
+        body = await resolver.resolve("a1", R.request("w", [ask]), lambda n: p, lambda: True)
+        return R.answers(body)["out"]
+
+    first, _ = await answer()
+    assert first == {"name": "out", "result": "declined", "reason": "cold"}
+    await cache.fill(h.io, h.state)  # joins the fill the decline started
+    second, data = await answer()
+    assert second["result"] == "delta"
+    written = await h.index().resolve(run, replaced=True)
+    assert data == written.files[0][0]  # the writer's own delta, replaced generations included
+    name = f"{c:012d}-a1"
+    await h.io.write(h.state.path(f"{name}-0.lay"), data)
+    state = h.state.committed(c, R.delta_files(second, name, g))
+    assert state.count == h.state.count + written.added - written.removed
+    assert cache.committed(h.state.path(f"{name}-0.lay"), len(data), h.state.prefix)  # its candidate
+    rows, _ = await L.LayerIndex(h.io, state).delta(h.state.head, keys=[key(3), key(4), key(70), key(90)])
+    assert [r[0] for r in rows] == sorted({key(3), key(70)} | ({key(4)} & set(h.fold[-1])))

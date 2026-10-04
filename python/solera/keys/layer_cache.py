@@ -181,6 +181,23 @@ class LayerCache:
                     self._disk_used -= size
                     os.remove(local)
 
+    def holds(self, prefix: str) -> bool:
+        """Whether any file of the index at `prefix` is cached: a commit's
+        delta is then worth installing."""
+
+        with self._lock:
+            return any(f[2] == prefix for f in self._files.values())
+
+    def drop(self, prefix: str) -> None:
+        """An index's copies, one found corrupt: evicted (but those a read
+        holds), so the next fill refetches them."""
+
+        with self._lock:
+            for p in [p for p, f in self._files.items() if f[2] == prefix and not self._open.get(p)]:
+                local, size, _ = self._files.pop(p)
+                self._disk_used -= size
+                os.remove(local)
+
     async def fill(self, io: ObjectIO, state: LayerState, *, sides: bool = False) -> bool:
         """Cache every file of the state's main parts (and side parts with
         `sides`), fetched whole, a few at once. Returns whether it all fits."""
