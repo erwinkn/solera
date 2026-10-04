@@ -467,12 +467,15 @@ class _Lazy:
         return None
 
 
-async def _scan_local(snap, after, limit: int, keep_deleted: bool, ceiling: int):
-    """A page of local copies as a native run, and its cursor; past `ceiling`
-    bytes of keys and payloads, `Full` — the page could not be kept."""
+async def _scan_local(snap, after, limit: int, keep_deleted: bool, ceiling: int, below: int | None = None):
+    """A page of local copies as a native run (as of generation `below`: None,
+    the head), and its cursor; past `ceiling` bytes of keys and payloads,
+    `Full` — the page could not be kept."""
 
     try:
-        return await in_thread(snap.scan, after, limit, drop_deleted=not keep_deleted, max_bytes=ceiling)
+        return await in_thread(
+            snap.scan, after, limit, drop_deleted=not keep_deleted, max_bytes=ceiling, below=below
+        )
     except LimitError as e:
         raise Full(str(e)) from e
 
@@ -611,9 +614,11 @@ class KeyIndex:
         `at - 1`."""
 
         keys = sorted(set(keys))
-        if at is not None and at <= self.state.head:
-            below = self._endpoint(at)
-            spans = [list(s.files) for s in reversed(self.state.spans) if s.a < at]
+        at, spans, below = self._at(at)
+
+        async def store():
+            if at is None:
+                return (await self._find(SortedEntries.of(keys), switch=False)).live()
             runs, codecs = await self._key_blocks(spans, keys)
             found, generations, deleted, payloads = await in_thread(
                 _native.span_lookup, runs, codecs, keys, below
@@ -622,17 +627,27 @@ class KeyIndex:
                 k: (generations[i], payloads[i]) for i, k in enumerate(keys) if found[i] and not deleted[i]
             }
 
-        async def store():
-            run = SortedEntries.of(keys)
-            return (await self._find(run, switch=False)).live()
-
         async def local(snap, _ceiling):
-            hits = await in_thread(snap.get, keys)
+            hits = (
+                await in_thread(snap.get, keys)
+                if at is None
+                else await in_thread(snap.lookup_at, keys, below)
+            )
             return {
                 k: (h[0], h[2]) for k, h in zip(keys, hits, strict=True) if h is not None and not h[1]
             }, None
 
-        return await self._read("lookup", (keys,), self.state.newest_first(), local, store)
+        return await self._read("lookup", (keys, at), spans, local, store)
+
+    def _at(self, at: int | None):
+        """A read at reserved endpoint `at` — None, or one past the head, is
+        the head: the endpoint the call names, the spans before it, newest
+        first, and the generation bound it reads below."""
+
+        if at is None or at > self.state.head:
+            return None, self.state.newest_first(), None
+        spans = [list(s.files) for s in reversed(self.state.spans) if s.a < at]
+        return at, spans, self._endpoint(at)
 
     # -- reads: local copies, a record, or the store ----------------------------------------
 
@@ -889,23 +904,20 @@ class KeyIndex:
         and payloads, and the next cursor (`None` when done). With `at`, as
         of that reserved endpoint: the state after commit `at - 1`."""
 
-        if at is not None and at <= self.state.head:
-            below = self._endpoint(at)
-            spans = [list(s.files) for s in reversed(self.state.spans) if s.a < at]
-            keys, generations, _, payloads, nxt = await self._scan(spans, after, limit, True, below)
-            return keys, generations, payloads, nxt
-        spans = self.state.newest_first()
+        at, spans, below = self._at(at)
 
         async def store():
-            keys, generations, _, payloads, nxt = await self._scan(spans, after, limit, drop_deleted=True)
+            keys, generations, _, payloads, nxt = await self._scan(spans, after, limit, True, below)
             return keys, generations, payloads, nxt
 
         async def local(snap, ceiling):
-            page, nxt = await _scan_local(snap, after, limit, False, ceiling)
+            page, nxt = await _scan_local(snap, after, limit, False, ceiling, below)
             keys, generations, _, payloads = page.entries()
             return (keys, generations, payloads, nxt), page
 
-        return await self._read("page", (after, limit), spans, local, store)
+        # Each is one recorded call, `at` among its arguments: served from the
+        # engine's record, or recorded (D93: a full pass reads its pinned snapshot).
+        return await self._read("page", (after, limit, at), spans, local, store)
 
     # -- changes(P -> N) --------------------------------------------------------------------
 

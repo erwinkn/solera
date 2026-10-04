@@ -1839,7 +1839,7 @@ impl Snapshot {
     /// Up to `limit` entries of the merged snapshot past `after` — deletions
     /// dropped with `drop_deleted` — as a `SortedEntries`, and the cursor (None at
     /// the end); past `max_bytes` of keys and payloads, `LimitError`.
-    #[pyo3(signature = (after, limit, *, drop_deleted, max_bytes=u64::MAX))]
+    #[pyo3(signature = (after, limit, *, drop_deleted, max_bytes=u64::MAX, below=None))]
     #[allow(clippy::type_complexity)]
     fn scan<'py>(
         &self,
@@ -1848,11 +1848,12 @@ impl Snapshot {
         limit: usize,
         drop_deleted: bool,
         max_bytes: u64,
+        below: Option<u64>,
     ) -> PyResult<(SortedEntries, Option<Bound<'py, PyBytes>>)> {
         guard(|| {
             let inner = &self.inner;
             let (page, next) = py
-                .detach(|| inner.scan(after.as_deref(), limit, drop_deleted, max_bytes))
+                .detach(|| inner.scan(after.as_deref(), limit, drop_deleted, max_bytes, below))
                 .map_err(to_py)?;
             Ok((
                 SortedEntries {
@@ -1919,6 +1920,39 @@ impl Snapshot {
                     skipped: 0,
                 },
             )
+        })
+    }
+
+    /// Each key (sorted, distinct) at a reserved endpoint — its newest
+    /// version older than `below` (None: the head) as `(generation, deleted,
+    /// payload)` — or None.
+    #[allow(clippy::type_complexity)]
+    fn lookup_at<'py>(
+        &self,
+        py: Python<'py>,
+        keys: Vec<PyBackedBytes>,
+        below: Option<u64>,
+    ) -> PyResult<Vec<Option<(u64, bool, Option<Bound<'py, PyBytes>>)>>> {
+        guard(|| {
+            let inner = &self.inner;
+            let found = py
+                .detach(|| {
+                    let ks: Vec<&[u8]> = keys.iter().map(|k| k.as_ref()).collect();
+                    inner.lookup_at(&ks, below)
+                })
+                .map_err(to_py)?;
+            Ok(found
+                .into_iter()
+                .map(|v| {
+                    v.map(|v| {
+                        (
+                            v.generation,
+                            v.deleted,
+                            v.payload.as_deref().map(|p| PyBytes::new(py, p)),
+                        )
+                    })
+                })
+                .collect())
         })
     }
 

@@ -1445,3 +1445,35 @@ async def test_local_reads_find_a_key_whose_versions_run_across_files(io, tmp_pa
                     ]
 
                 assert await entries(warm) == await entries(cold)
+
+
+async def test_reads_at_an_endpoint_are_recorded_and_answered(io, tmp_path):
+    """D93: a full pass reads its pinned snapshot (`page(at=)`), a selection
+    its keys there (`lookup(at=)`). Each is one recorded call, `at` among its
+    arguments: the engine records it from its local copies, which agree with
+    the store, and the worker answers it from the record without a GET."""
+
+    import json
+
+    from solera.keys.reads import Reads
+
+    state = await logged_index(io)
+    cache = EngineCache(str(tmp_path))
+    assert await cache.fill(io, state)
+    opened = cache.open_present(state)
+    reads = Reads(recording=True, max_entries=10**6, max_bytes=2**24)
+    engine = KeyIndex(ObjectIO(None, local=opened.handles, served=reads), None, state, OPTS)
+    cold = KeyIndex(io, None, state, OPTS)
+    named = [key(i) for i in range(0, 2100, 7)]
+    for at in (3, 7):
+        assert await engine.page(None, 300, at=at) == await cold.page(None, 300, at=at)
+        assert await engine.lookup(named, at=at) == await cold.lookup(named, at=at)
+    assert await engine.page(None, 300, at=3) != await engine.page(None, 300, at=7)  # two snapshots
+    served = Reads.from_json(json.loads(json.dumps(reads.to_json())))
+    worker = KeyIndex(ObjectIO(io.store, metrics=io.metrics, served=served), None, state, OPTS)
+    want = {at: (await cold.page(None, 300, at=at), await cold.lookup(named, at=at)) for at in (3, 7)}
+    gets = io.metrics.gets
+    for at in (3, 7):
+        assert (await worker.page(None, 300, at=at), await worker.lookup(named, at=at)) == want[at]
+    assert io.metrics.gets == gets  # answered from the record: no GET
+    opened.close()

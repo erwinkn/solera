@@ -54,10 +54,9 @@ def _key(identity: str, call: str, args: tuple) -> str:
             return _hex(a)
         return _digest(a) if isinstance(a, list) else a
 
-    if call == "lookup":
-        args = (_digest(args[0]),)
-    else:  # a page of `changes`: (first, last, after, limit, keys, until)
-        args = tuple(plain(a) for a in args)
+    # `lookup`: (keys, at); `page`: (after, limit, at); a page of `changes`:
+    # (first, last, after, limit, keys, until). Keys by their digest.
+    args = tuple(plain(a) for a in args)
     return json.dumps([identity, call, args], separators=(",", ":"))
 
 
@@ -66,9 +65,9 @@ def _asked(call: str, args: tuple) -> int:
 
     if call == "lookup":
         return len(args[0])
-    if call == "changes" and args[4] is not None:
-        return len(args[4])
-    return args[3] if call == "changes" else args[-1]
+    if call == "changes":
+        return len(args[4]) if args[4] is not None else args[3]
+    return args[1]  # a page's limit
 
 
 class Reads:
