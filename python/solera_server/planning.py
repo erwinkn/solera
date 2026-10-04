@@ -372,7 +372,11 @@ class Planner:
         (`UpstreamOnly`): a broadcast incremental read is undefined."""
 
         info = self.manifest["assets"][asset]
-        named = list(info["inputs"].items()) + [(d, {"kind": "dep", "output": d}) for d in info["deps"]]
+        every = set(info.get("deps_all_partitions") or ())
+        named = list(info["inputs"].items()) + [
+            (d, {"kind": "dep", "output": d, **({"all_partitions": True} if d in every else {})})
+            for d in info["deps"]
+        ]
         outputs = {spec["output"] for _, spec in named}
         named += [
             (d["output"], {"kind": "dep", "output": d["output"], "set_dim": True})

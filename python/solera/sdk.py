@@ -1293,6 +1293,24 @@ class Project:
         return value
 
     @staticmethod
+    def _dep(entry, asset_name: str) -> str:
+        """A deps entry's output: a name, or `In(output, all_partitions=…)`. A
+        dep is never loaded, so nothing else of an input means anything."""
+
+        if isinstance(entry, str):
+            return entry
+        if type(entry) is not In:
+            raise RegistrationError(
+                f"{asset_name}: deps entry {entry!r} must be a name or In(output, all_partitions=…): "
+                "a dep is never loaded"
+            )
+        if entry.output is None:
+            raise RegistrationError(f"{asset_name}: an In(...) in deps= names its output")
+        if entry.meta is not None:
+            raise RegistrationError(f"{asset_name}: dep {entry.output!r}: meta= has no meaning on a dep")
+        return entry.output
+
+    @staticmethod
     def _check_each(name: str, asset: Asset, info: dict, param: str, upstream: dict) -> None:
         """A per-key incremental input (`each=True`, docs/per-key-processing.md
         §5): one per asset, over a keyed upstream, the asset's only
@@ -1358,14 +1376,18 @@ class Project:
                     and p.default is p.empty
                 ):
                     raise RegistrationError(f"{name}: parameter {param!r} has no input or resource binding")
-            deps = list(asset.deps)
-            for dep in deps:
-                if not isinstance(dep, str) or dep not in outputs:
+            deps, every = [], []  # names; those read over every partition (`all_partitions`)
+            for entry in asset.deps:
+                dep = self._dep(entry, name)
+                if dep not in outputs:
                     raise RegistrationError(f"{name}: deps entry {dep!r} names an unknown output")
                 if dep in (e.output or p for p, e in inputs.items()):
                     raise RegistrationError(f"{name}: dep {dep!r} is already a bound input")
+                deps.append(dep)
+                if isinstance(entry, In) and entry.all_partitions:
+                    every.append(dep)
             dims = self._dim_spec(asset.partitions, name)
-            assets[name] = {"inputs": inputs, "deps": deps, "dims": dims}
+            assets[name] = {"inputs": inputs, "deps": deps, "deps_all_partitions": every, "dims": dims}
 
         # Input validity: output exists, projection rule, store checks.
         hints_by_asset = self.hints = {n: hints(n, a.fn) for n, a in self.assets.items()}
@@ -1593,6 +1615,11 @@ class Project:
                     for p, e in info["inputs"].items()
                 },
                 "deps": info["deps"],
+                **(
+                    {"deps_all_partitions": info["deps_all_partitions"]}
+                    if info["deps_all_partitions"]
+                    else {}
+                ),
                 "partitions": {"dims": info["dims"]} if info["dims"] else None,
                 "placement": placement,
                 "retries": asset.retries.spec(),

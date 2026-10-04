@@ -167,6 +167,7 @@ window", which are passes.
     key. *Why:* a failure on one file must not block the other 999.
 - **dep** (`deps=`): an input bound to no parameter: planned, pinned,
   watched by `OnChange`, never loaded; it fans in as a whole input does.
+  An entry is a name, or `In(output, all_partitions=True)`.
 
 *Not:* the upstream output itself. *Was:* edge (`EdgeDecl`, `/edges`,
 `--keys EDGE=`); `Each` (per-key incremental) and `AllPartitions` (a

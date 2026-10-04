@@ -382,8 +382,11 @@ never on `full` alone, or each batch would erase the ones before it.
 
 **`deps=`** are unbound inputs: planned, pinned into lineage, part of the
 fingerprint (§6), watched by `AutoRefresh`, bound to no
-parameter. A dep across upstream-only dimensions pins the heads that
-exist, like a whole fan-in (§7).
+parameter. An entry is an output's name, or `In(output,
+all_partitions=True)` to depend on every partition of it, the shared
+dimensions too; nothing else of an `In` means anything on a dep, which is
+never loaded, so other fields are refused. A dep across upstream-only
+dimensions pins the heads that exist, like a whole fan-in (§7).
 
 ### Sources
 

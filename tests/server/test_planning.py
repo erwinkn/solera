@@ -428,3 +428,55 @@ def test_the_cli_says_no_removals_as_none():
 
     args = argparse.Namespace(version="v2", keys=None, upsert=None, remove=None, by=None)
     assert _commit_payload(args)["remove"] is None
+
+
+def test_a_dep_reads_every_partition_with_all_partitions():
+    """A deps= entry may be In(output, all_partitions=True): the dep is planned
+    and pinned over every partition of the upstream, the shared dimensions
+    too, where a plain name projects them. Nothing else of an input means
+    anything on a dep, which is never loaded: refused."""
+    from solera.sdk import Incremental, RegistrationError
+
+    site = StaticPartitions(["east", "west"])
+
+    @asset(partitions={"site": site})
+    def per_site(ctx):
+        return []
+
+    @asset(partitions={"site": site}, deps=["per_site"])
+    def mine(ctx):
+        return []
+
+    @asset(partitions={"site": site}, deps=[In("per_site", all_partitions=True)])
+    def every(ctx):
+        return []
+
+    manifest = Project(assets=[per_site, mine, every]).manifest
+    assert manifest["assets"]["every"]["deps"] == ["per_site"]
+    assert manifest["assets"]["every"]["deps_all_partitions"] == ["per_site"]
+    assert "deps_all_partitions" not in manifest["assets"]["mine"], "a plain name changes no manifest"
+    heads = {("per_site", s): {"ref": {"version": s}} for s in ("east", "west")}
+    now = dt.datetime(2026, 10, 2, tzinfo=UTC).timestamp()
+    planner = Planner(
+        manifest,
+        lambda o, s: heads.get((o, s)),
+        lambda o: [(s, h) for (out, s), h in heads.items() if out == o],
+        now,
+    )
+    (own,) = planner.inputs("mine", "east")
+    (all_of_them,) = planner.inputs("every", "east")
+    assert not own.fan_in and own.partition == "east"
+    assert all_of_them.fan_in and sorted(planner.fan_in(all_of_them, materialized=False)) == ["east", "west"]
+
+    for entry, says in (
+        (Incremental("per_site"), "a dep is never loaded"),
+        (In("per_site", meta={"owner": "lab"}), "meta= has no meaning on a dep"),
+        (In(all_partitions=True), "names its output"),
+    ):
+
+        @asset(deps=[entry])
+        def wrong(ctx):
+            return []
+
+        with pytest.raises(RegistrationError, match=says):
+            Project(assets=[per_site, wrong])

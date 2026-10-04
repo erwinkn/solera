@@ -329,7 +329,14 @@ class Views:
         asset's current partitions and every partition with a position."""
 
         info = self.manifest["assets"][asset]
-        inputs = [*info["inputs"].items(), *((d, {"kind": "dep", "output": d}) for d in info["deps"])]
+        every = set(info.get("deps_all_partitions") or ())
+        inputs = [
+            *info["inputs"].items(),
+            *(
+                (d, {"kind": "dep", "output": d, **({"all_partitions": True} if d in every else {})})
+                for d in info["deps"]
+            ),
+        ]
         current = set(self.planner().partitions(asset, "all"))
         marked: dict[str, set] = {}
         for partition, record in self.m.partitions.of(asset).items():
@@ -348,7 +355,7 @@ class Views:
                     "kind": "each"
                     if input.get("each") is not None
                     else "all_partitions"
-                    if input.get("all_partitions")
+                    if input["kind"] == "in" and input.get("all_partitions")
                     else input["kind"],
                     "output": output,
                     "upstream_asset": self.manifest["outputs"][output].get("asset"),
