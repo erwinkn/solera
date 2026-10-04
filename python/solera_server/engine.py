@@ -549,9 +549,16 @@ class Engine(Attempts, Sensors, Staleness, Views):
         engine_used = len(self.engine_inflight)
         executor_used = dict(self.executor_inflight)
         # Partitions of each asset claimed now, of its current life: what concurrency= caps.
+        # An earlier life's attempt holds no name, but its partition stays its own until
+        # it is ended (F39): two attempts never own one partition's files at once.
         asset_used: dict[str, int] = {}
-        for claimed in map(self.m.task, self.m.claims):
-            if claimed is not None and not self.m.earlier_life(claimed):
+        retiring: dict[tuple, str] = {}
+        for claim, claimed in ((c, self.m.task(t)) for t, c in self.m.claims.items()):
+            if claimed is None:
+                continue
+            if self.m.earlier_life(claimed):
+                retiring[(claimed["asset"], claimed["partition"])] = claim["attempt"]
+            else:
                 asset_used[claimed["asset"]] = asset_used.get(claimed["asset"], 0) + 1
         held = {}
         for task_id in self.m.due(now):
@@ -573,10 +580,13 @@ class Engine(Attempts, Sensors, Staleness, Views):
             executor = spec["executor"]
             limit = getattr(placement, "max_concurrent", None)
             is_pool = spec["kind"] == "Pool"
-            holder = self.m.claimed_partitions.get((task["asset"], task["partition"]))
+            key = (task["asset"], task["partition"])
+            holder = self.m.claimed_partitions.get(key)
+            if holder is None or self.m.claimed(holder) is None:
+                holder = retiring.get(key)
             behind = self._merges_behind(task)
             cap = self.manifest["assets"][task["asset"]].get("concurrency")
-            if holder is not None and self.m.claimed(holder) is not None:
+            if holder is not None:
                 held[task_id] = ["claim", holder]
             elif cap is not None and asset_used.get(task["asset"], 0) >= cap:
                 held[task_id] = ["concurrency", task["asset"]]

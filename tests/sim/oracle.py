@@ -133,10 +133,12 @@ class Journal:
         """The first durable launch of an attempt on an asset partition
         another launched attempt still holds, or None. A task follows its
         asset through a rename (an alias); a name removed and declared again
-        is another asset."""
+        is another asset, but an earlier life's attempt in flight keeps its
+        partition until it ends (F39)."""
 
         asset_of: dict[str, str] = {}  # task -> its asset now
         holder: dict[tuple, str] = {}
+        retiring: dict[tuple, str] = {}  # a removed asset's attempts in flight
         for seq, event in self.events():
             kind = event["type"]
             if kind == "RunSubmitted":
@@ -150,10 +152,13 @@ class Journal:
                     if old not in assets
                 }
                 asset_of = {t: renamed.get(a, a) for t, a in asset_of.items()}
-                # A removed asset's attempts in flight are an earlier life's: they hold no name.
-                holder = {
-                    (renamed.get(a, a), p): h for (a, p), h in holder.items() if a in assets or a in renamed
-                }
+                kept = {}
+                for (a, p), h in holder.items():
+                    if a in assets or a in renamed:
+                        kept[(renamed.get(a, a), p)] = h
+                    else:  # an earlier life's now: it holds no name, only its partition
+                        retiring[(a, p)] = h
+                holder = kept
             elif kind in ("AttemptLaunched", "AttemptFinished"):
                 task = event["task"]
                 partition = (
@@ -163,6 +168,9 @@ class Journal:
                 if kind == "AttemptFinished":
                     if holder.get(partition) == event["attempt"]:
                         del holder[partition]
+                    retiring = {k: h for k, h in retiring.items() if h != event["attempt"]}
+                elif partition in retiring:
+                    return f"{event['attempt']} launched on {partition} at seq {seq}, an earlier life's {retiring[partition]} not ended"
                 elif holder.setdefault(partition, event["attempt"]) != event["attempt"]:
                     return f"{event['attempt']} launched on {partition} at seq {seq}, held by {holder[partition]}"
         return None

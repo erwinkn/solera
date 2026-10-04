@@ -597,6 +597,19 @@ class Attempts:
                 return await self._fail(task_id, attempt, "ended by a replaced engine", retryable=True)
             read_at = loop.time()
             await self._read_worker(run_id, attempt, live, read_at)
+        if self.m.earlier_life(task):
+            # Its asset was removed since its launch: nothing it builds can commit, and
+            # its partition waits for it, so it ends now, as any attempt ends (F39).
+            if handle is not None:
+                await self._cancel(placement, handle)
+            return await self._fail(
+                task_id,
+                attempt,
+                f"asset {task['asset']} was removed",
+                retryable=True,
+                end="aborted",
+                reason="removed",
+            )
         poll = heartbeat / 3
         stirred = self._stirred.setdefault(attempt, asyncio.Event())
 

@@ -368,15 +368,18 @@ adopted by a restarted engine (§12).
 attempt launched before the deploy that removed its asset is an
 **earlier life's** (`Model.earlier_life`, the commit's own rule): it holds
 no entry in `claimed_partitions`, at the reset and when a snapshot is
-loaded, so the new life is not held behind it; it still settles, its
-commit refused, and its task carries on in the new life (F21). Whether an
-attempt is live is the claim's own record (`Model.claimed`), never the
-index (F34).
+loaded, so no name of the new life is kept behind it. It is ended at once,
+as any attempt is (`_end` first, §2.3): the engine that adopts it after
+the deploy fails it, retryable, and its task carries on in the new life
+(F21). Until then it still holds its partition: dispatch keeps a task of
+the new life off it, so two attempts never own one partition's files
+(F39). Whether an attempt is live is the claim's own record
+(`Model.claimed`), never the index (F34).
 
 **Why a due task waits.** Dispatch claims due tasks in order and records,
 when it changes, why one is held (`TasksHeld`, shown as "held: reason
-(name)"): `claim` (another attempt of the current life holds its
-partition), `concurrency` (its asset's `concurrency=` partitions are
+(name)"): `claim` (another attempt holds its partition: one of the
+current life, or an earlier life's not yet ended), `concurrency` (its asset's `concurrency=` partitions are
 claimed), `merges` (an output's key index is too far behind on merges),
 `engine` (the engine's own slots are full), `executor` (its executor's
 limit), `invalid` (its placement cannot be built).
