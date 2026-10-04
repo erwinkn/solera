@@ -75,7 +75,7 @@ export function graphOf(manifest: Manifest): {
   };
   for (const [id, asset] of Object.entries(manifest.assets)) {
     for (const edge of Object.values(asset.inputs)) {
-      const kind: EdgeKind = edge.each ? "each" : edge.kind;
+      const kind: EdgeKind = edge.each ? "each" : edge.all_partitions ? "all_partitions" : edge.kind;
       add({
         from: owner(edge.output),
         to: id,

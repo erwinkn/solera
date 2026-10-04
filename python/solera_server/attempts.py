@@ -918,7 +918,7 @@ class Attempts:
             with contextlib.suppress(Exception):
                 await self.state.delete_objects(await self.state.list_objects(prefix))
         failures = prepared.get("failures")
-        if failures is not None:  # an Each batch's failure delta (docs/per-key-processing.md §9)
+        if failures is not None:  # a per-key batch's failure delta (docs/per-key-processing.md §9)
             prefix = f"{failures['prefix']}{int(failures['commit_number']):012d}-{attempt}"
             self._authority()
             with contextlib.suppress(Exception):

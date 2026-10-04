@@ -1061,7 +1061,7 @@ async def test_a_page_reads_one_entry_past_itself(io, tmp_path):
 
 
 async def test_a_fan_in_whole_read_is_read_ahead_member_by_member(io, tmp_path):
-    """Round 4: an AllPartitions input loaded whole pins each member's index;
+    """Round 4: a whole fan-in loaded whole pins each member's index;
     the start read pages every one of them, as the worker's whole read will."""
 
     from solera.keys.reads import Reads

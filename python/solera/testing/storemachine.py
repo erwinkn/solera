@@ -21,7 +21,7 @@ the machine plays the engine for it:
   attempt may write late (a stale writer) and a second worker of the
   current one may try (a duplicate).
 - **readers.** A reader pins the committed content and reads it later;
-  a by-key reader loads `dict[str, T]` under `Keys`, as `Each` does.
+  a by-key reader loads `dict[str, T]` under `Keys`, as per-key incremental does.
 - **collection** (immutable stores). The names no committed index and no
   pinned reader references — superseded, abandoned, or never written —
   are cleaned up, twice over.
@@ -257,7 +257,7 @@ def stateful(make_harness: Callable[[], Harness]):
         @precondition(lambda self: self.head is not None and self.ledger.entries)
         @rule(keys=st.sets(st.sampled_from(KEYS), min_size=1))
         def read_by_key(self, keys):
-            """`Each`'s read: `dict[str, T]` under `Keys`, each key's group."""
+            """A per-key incremental read: `dict[str, T]` under `Keys`, each key's group."""
 
             selection = Keys(
                 {k: g for k, g in self.ledger.entries.items() if k in keys and k not in self.dirty}

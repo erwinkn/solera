@@ -15,12 +15,12 @@ Each (asset, input, partition) keeps a **position**:
         "at": key | commit | None,  # its place: the last key delivered, the next commit
         "batch": int, "batches": int,  # the next batch's index, and how many are planned
         "pin": int,                 # a delta pass's reader pin (lifecycle.md §9.8)
-        "reconcile": bool,          # a full Each pass owes a reconcile after (§11)
+        "reconcile": bool,          # a full per-key pass owes a reconcile after (§11)
         "began": int,               # a full pass: the claim generation that started it
       },
       "patterns": ...,              # keys: the patterns it delivers under (per-key §11)
       "pattern_change": {"old", "new", "at", "snapshot", "pin"},
-      "reconcile": {"after": key},  # an Each output's cleanup after a full pass
+      "reconcile": {"after": key},  # a per-key output's cleanup after a full pass
       "ahead": [[commit, run, attempt], ...],  # keys: the read-ahead (below)
     }
 
@@ -37,7 +37,7 @@ A pass's mode, boundary and batch plan are decided when it starts and
 kept until its last batch; `next` then moves past it. An attempt is given a
 **plan** — `kind`, the `position` it carries forward, and the `pass`
 its batch is on (`hi`, for commits: the batch's last commit); a `held` plan,
-a batch that moves no position of its own (an Each retry or reconcile
+a batch that moves no position of its own (a per-key retry or reconcile
 batch); or a `selection`, a run's `keys=` selection, which reads the keys it
 names as of one upstream commit and moves neither `next` nor the
 partition's progress.
@@ -46,7 +46,7 @@ partition's progress.
 adds `[commit, run, attempt]` to `ahead`: it read every key the attempt's
 spec names as of upstream commit `commit`. The next pass skips a changed
 key some entry read at or after its last change, and the entries a new
-`next` passes collapse into the snapshot. An `Each` input keeps the same
+`next` passes collapse into the snapshot. A per-key input keeps the same
 record: no per-key one.
 """
 
@@ -94,7 +94,7 @@ def advance(plan: dict, after: str | None = None) -> dict | None:
     elif d["mode"] == "full":
         position["next"] = d["from"]
         if d.get("reconcile"):
-            # An Each output may hold keys the pass no longer names — gone
+            # A per-key output may hold keys the pass no longer names — gone
             # upstream, or left out by the patterns: reconcile them next (§11).
             position["reconcile"] = {"after": None}
     else:
@@ -141,7 +141,7 @@ def selects(plans: dict) -> bool:
 
 def outstanding(position: dict) -> bool:
     """Whether an input still owes its partition pass: one under way, a
-    pattern change's diff, an Each cleanup."""
+    pattern change's diff, a per-key cleanup."""
 
     return "pass" in position or "pattern_change" in position or "reconcile" in position
 

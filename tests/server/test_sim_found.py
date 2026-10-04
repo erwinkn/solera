@@ -325,11 +325,9 @@ async def test_a_full_pass_over_an_empty_upstream_reaches_its_producer(state):
 
 
 async def test_an_each_full_pass_that_takes_no_key_drops_its_keys(state):
-    """F10 for `Each`: the producer is written for one key, so a full pass
+    """F10 for per-key incremental: the producer is written for one key, so a full pass
     taking none is not called; the cleanup after the pass drops the keys the
     asset holds that its input no longer has."""
-
-    from solera.sdk import Each
 
     content = {"rows": [{"id": "a", "v": "1"}]}
 
@@ -337,7 +335,7 @@ async def test_an_each_full_pass_that_takes_no_key_drops_its_keys(state):
     def items():
         return content["rows"]
 
-    @asset(inputs={"item": Each("items", exclude=["k*"])}, outputs=Output("out", key="id"))
+    @asset(inputs={"item": Incremental("items", exclude=["k*"], each=True)}, outputs=Output("out", key="id"))
     def out(ctx, item: list):
         return [{"v": item[0]["v"]}]
 
@@ -710,14 +708,18 @@ async def test_the_retry_clock_waits_for_an_input_with_no_head(state, tmp_path):
     partition whose inputs have no head now waits for them; a run by hand
     still says why it cannot run."""
 
-    from solera.sdk import AutoRefresh, Each
+    from solera.sdk import AutoRefresh
 
     def project(store):
         @asset(outputs=Output("items", key="id", store=store))
         def items():
             return [{"id": "a"}]
 
-        @asset(inputs={"item": Each("items")}, outputs=Output("checks", key="id"), automations=AutoRefresh())
+        @asset(
+            inputs={"item": Incremental("items", each=True)},
+            outputs=Output("checks", key="id"),
+            automations=AutoRefresh(),
+        )
         def checks(ctx, item: list):
             raise RuntimeError("bad")
 

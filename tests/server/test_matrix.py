@@ -7,8 +7,8 @@ import asyncio
 import time
 
 from solera.sdk import (
-    AllPartitions,
     Automation,
+    In,
     Incremental,
     OnChange,
     Output,
@@ -80,12 +80,15 @@ async def test_a_full_run_after_a_rename_stays_readable(state):
     assert seen == [[("a", 2), ("b", 1)]]
 
 
-# -- AllPartitions × zero free dimensions -----------------------------------------------
+# -- all_partitions=True: every partition, shared dimensions too ---------------------------
 
 
-async def test_all_partitions_with_nothing_to_collapse(state):
-    """Unpartitioned on both sides, or every dimension shared: one complete
-    head, read under the key `""`."""
+async def test_all_partitions_reads_every_partition_the_shared_dimensions_too(state):
+    """`all_partitions=True` reads every partition of the upstream as
+    `dict[partition, value]`, the shared dimensions too, with no projection:
+    `report` for east compares east's value with every site's. Unpartitioned,
+    it is the one head under `""`. Without it, a shared dimension is
+    projected and the value comes plain."""
     seen = {}
     sites = StaticPartitions(["east", "west"])
 
@@ -93,7 +96,7 @@ async def test_all_partitions_with_nothing_to_collapse(state):
     def raw():
         return [1]
 
-    @asset(inputs={"raw": AllPartitions()}, retries=Retry(n=0))
+    @asset(inputs={"raw": In(all_partitions=True)}, retries=Retry(n=0))
     def summary(raw: dict[str, list]):
         seen["summary"] = raw
         return [len(raw)]
@@ -102,19 +105,24 @@ async def test_all_partitions_with_nothing_to_collapse(state):
     def per_site(ctx):
         return [ctx.partition]
 
-    @asset(partitions={"site": sites}, inputs={"per_site": AllPartitions()}, retries=Retry(n=0))
-    def mirrored(ctx, per_site: dict[str, list]):
-        seen[ctx.partition] = per_site
-        return [len(per_site)]
+    @asset(
+        partitions={"site": sites},
+        inputs={"every": In("per_site", all_partitions=True), "own": In("per_site")},
+        retries=Retry(n=0),
+    )
+    def report(ctx, every: dict[str, list], own: list):
+        seen[ctx.partition] = (every, own)
+        return [len(every)]
 
-    project = Project(assets=[raw, summary, per_site, mirrored])
+    project = Project(assets=[raw, summary, per_site, report])
     engine = make_engine(state, project)
     await engine.initialize()
     detail = await drive(engine, await engine.submit(["summary"], upstream=True))
     assert status_of(detail) == "succeeded" and seen["summary"] == {"": [1]}
-    detail = await drive(engine, await engine.submit(["mirrored"], partitions="all", upstream=True))
+    detail = await drive(engine, await engine.submit(["report"], partitions="all", upstream=True))
     assert status_of(detail) == "succeeded"
-    assert seen["east"] == {"": ["east"]} and seen["west"] == {"": ["west"]}
+    every = {"east": ["east"], "west": ["west"]}
+    assert seen["east"] == (every, ["east"]) and seen["west"] == (every, ["west"])
 
 
 # -- registration × queued work ---------------------------------------------------------
@@ -216,7 +224,7 @@ async def test_a_change_waits_for_work_already_queued(state):
 
 
 async def test_a_change_is_kept_until_its_delivery_completes(state):
-    """An AllPartitions read excludes a partition whose pass is under way: a
+    """A whole fan-in excludes a partition whose pass is under way: a
     change made by its first batch waits until the last batch drains it — even
     when that batch writes nothing — then fires once, over complete data."""
     observed = []
@@ -229,7 +237,7 @@ async def test_a_change_is_kept_until_its_delivery_completes(state):
     def mid(ctx, files: list):
         return [{"n": 1}] if ctx.batch["files"].first else Result(outputs={})
 
-    @asset(inputs={"mid": AllPartitions()}, automations=Automation(trigger=OnChange("mid")))
+    @asset(inputs={"mid": In(all_partitions=True)}, automations=Automation(trigger=OnChange("mid")))
     def agg(mid: dict[str, list]):
         observed.append(sorted(mid))
         return [len(mid)]
@@ -345,10 +353,10 @@ async def test_a_value_written_again_is_a_new_version_its_readers_reread(state):
 
 
 async def test_an_each_delivery_resumed_by_a_firing_takes_its_change(state):
-    """As test_sim_found's keyed case, for an Each input: a full pass cut
+    """As test_sim_found's keyed case, for a per-key input: a full pass cut
     short after its first key, the upstream changing, the firing resuming it
     — the change is delivered, and only then is the partition drained."""
-    from solera.sdk import AutoRefresh, Each
+    from solera.sdk import AutoRefresh
 
     content, calls = {"a": "1", "b": "1"}, []
 
@@ -357,7 +365,7 @@ async def test_an_each_delivery_resumed_by_a_firing_takes_its_change(state):
         return [{"id": k, "v": v} for k, v in content.items()]
 
     @asset(
-        inputs={"item": Each("items", batch_size=1)},
+        inputs={"item": Incremental("items", batch_size=1, each=True)},
         outputs=Output("out", key="id"),
         automations=AutoRefresh(),
     )

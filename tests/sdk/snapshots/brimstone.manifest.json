@@ -9,7 +9,7 @@
       "doc": "Partitioned upstream, unpartitioned consumer: the site dimension is collapsed.",
       "inputs": {
         "site_health": {
-          "kind": "all_partitions",
+          "kind": "in",
           "load": "ref",
           "meta": null,
           "output": "site_health"
@@ -529,7 +529,7 @@
       "doc": "Static partitions over a site-partitioned input.",
       "inputs": {
         "qaqc_samples": {
-          "kind": "all_partitions",
+          "kind": "in",
           "load": "ref",
           "meta": null,
           "output": "qaqc_samples"
@@ -1004,7 +1004,7 @@
     "id": "snapshot",
     "source": "explicit"
   },
-  "deploy": "b224033274f56e24551c20f2c40a5bed1c1bb04d628a17b4bcdec22b16914a3c",
+  "deploy": "0f49ea19bfdaa11030a6a7c7b40731cb9d4104f863dabfea7ac330cbc2beadff",
   "errors": [],
   "executors": {
     "ingest": {

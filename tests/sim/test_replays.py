@@ -9,7 +9,7 @@ from .world import Fate
 def test_f9_a_key_dropped_by_a_moved_output_leaves_its_consumers():
     """F9: `items` on the table store; `k10`, `k11` committed; `items` moves
     to FileStore (its first write there starts over, with an index of its
-    own); the feed drops `k11`. `checks` (an Each consumer) must drop it."""
+    own); the feed drops `k11`. `checks` (a per-key consumer) must drop it."""
 
     state = Simulation()
     state.boot(seed=2188, store="table")

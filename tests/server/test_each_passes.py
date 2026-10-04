@@ -1,8 +1,8 @@
-"""An Each asset's passes and its retry passes share its runs (per-key
+"""A per-key asset's passes and its retry passes share its runs (per-key
 processing §9): they alternate, and a run never ends with either left half
 way (F31)."""
 
-from solera.sdk import Each, Output, Project, Retry, Source, asset
+from solera.sdk import Incremental, Output, Project, Retry, Source, asset
 from solera.stores import FileStore
 
 from tests.sim.project import External, SourceStore
@@ -21,7 +21,7 @@ async def test_a_run_finishes_the_pass_it_began_before_it_ends(state, tmp_path):
     outside, broken = External(), {"bad"}
 
     @asset(
-        inputs={"item": Each("feed", batch_size=2)},
+        inputs={"item": Incremental("feed", batch_size=2, each=True)},
         outputs=Output("checks", key="id"),
         retries=Retry(0),
     )

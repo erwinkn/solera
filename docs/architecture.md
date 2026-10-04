@@ -8,7 +8,7 @@ placement — is a small amount of engine state around those three things.
 This document is normative for the model; the designs it points to are
 normative for their parts: `object-store-state.md` (engine state, the key
 index, attempt files, run history, retention), `lifecycle.md` (attempts,
-the worker channel, store kinds, sensors), `per-key-processing.md` (`Each`,
+the worker channel, store kinds, sensors), `per-key-processing.md` (per-key incremental,
 error classes, build identity), `resolved-commits.md` (the engine's
 resolver), `versions.md` (what a key's version is), `key-index-format.md`
 (the byte format).
@@ -325,7 +325,8 @@ earlier versions.
 ```python
 inputs = {
     "qaqc_files": Incremental(batch_size=100),  # incremental input, same-named output
-    "site_health": AllPartitions(),  # collapse upstream-only dimensions
+    "site_health": In(),  # a whole input: fans in over upstream-only dimensions
+    "sites": In("site_index", all_partitions=True),  # every partition, shared dimensions too
     "feed": "station_feed",  # rename, same as In("station_feed")
     "x": Incremental("some_output"),  # rename + incremental
     "matrix": In(meta={"owner": "lab"}),  # whole value, with input metadata
@@ -334,22 +335,22 @@ deps = ["usgs_3dep_tiles"]  # pinned, watched, not loaded
 ```
 
 Every value is an `In` or a `str` (sugar for `In(output)`). `In(output=None,
-*, meta=None)` is the input base class: `output` defaults to the parameter
-name, `meta` is free-form JSON recorded on the input in the manifest. The
-engine knows exactly three input kinds; user subclasses are rejected (`Each`
-is an `Incremental` input to the engine, with a failed keys).
+*, meta=None, all_partitions=False)` is the input base class: `output`
+defaults to the parameter name, `meta` is free-form JSON recorded on the
+input in the manifest. An input is one of three kinds: **whole** (`In`, a
+`str`), **incremental** (`Incremental`; per-key incremental with
+`each=True`), and **dep** (`deps=`). User subclasses are rejected.
 
 
 | Value | Meaning |
 |---|---|
-| `In(output=None, meta=None)` | whole value (or ref) of the output at its pinned head |
+| `In(output=None, meta=None, all_partitions=False)` | whole: the value (or ref) of the output at its pinned head. Over upstream dimensions this asset lacks it fans in: `dict[partition, T]` over them, complete heads only (§7). `all_partitions=True` reads every partition of the upstream so — the shared dimensions too, with no projection of this asset's partition: `site_report` for `alpha` compares alpha's index with every other site's |
 | `Incremental(output=None, batch_size=100, meta=None, *, include=None, exclude=None)` | receive only what changed since this consumer's position — upserted/deleted keys on a keyed upstream, new batches on an unkeyed one (§6). On a keyed upstream, `include`/`exclude` globs (or `Regex`) select keys by name; pages are formed from the keys they take — read ahead past the others, at most 100,000 keys a page — so no page is empty, a pass they take nothing from is `skipped` without calling the producer, and a change of patterns cuts over: pending changes finish under the old ones, membership is diffed against the index at the pattern change (pinned until the diff ends), then deltas continue under the new (per-key-processing.md §11) |
-| `Each(output=None, *, batch_size=100, concurrency=16, meta=None)` | an `Incremental` input on a keyed upstream whose producer is written for **one key**: the parameter is that key's value (a rows upstream: its group), `ctx.key` its key. The worker calls it for every changed key of a page, `concurrency` at a time, stores the keys that succeeded as one `Patch({key: value})` per output, and keeps the ones that raised in the asset's failed keys, retried by their error class; deleted keys lose their rows without a call. One per asset, its other inputs whole, every output keyed. per-key-processing.md §5–§10 |
-| `AllPartitions(output=None, meta=None)` | receive every partition of the upstream dimensions this asset lacks (§7) |
+| `Incremental(…, each=True, concurrency=16)` | Per-key incremental: an incremental input on a keyed upstream whose producer is written for **one key**: the parameter is that key's value (a rows upstream: its group), `ctx.key` its key. The worker calls it for every changed key of a page, `concurrency` at a time, stores the keys that succeeded as one `Patch({key: value})` per output, and keeps the ones that raised in the asset's failed keys, retried by their error class; deleted keys lose their rows without a call. One per asset, its other inputs whole, every output keyed. per-key-processing.md §5–§10 |
 
 **By value or by reference.** The annotation decides. `T` loads through the
 upstream store (`store.load(ref, T, selection)`); a `Ref` subclass hands
-over the pinned ref. Under `AllPartitions`, `dict[str, T]` loads per
+over the pinned ref. Under a whole fan-in, `dict[str, T]` loads per
 partition and `dict[str, TableRef]` hands over refs. An `Incremental` input cannot
 be ref-annotated.
 
@@ -370,7 +371,7 @@ patterns take nothing from it, completes the pass without calling the
 producer. One exception: a full pass always reaches its consumer, keys or
 none, because starting over must happen. A plain producer whose full
 pass takes no key is called once with an empty batch — `full`, `first`
-and `final` — and returns its new, empty content; an `Each` producer,
+and `final` — and returns its new, empty content; a per-key producer,
 written for one key, is not called, and the cleanup after the full pass
 drops the keys its asset holds that the input no longer has. `upstream` carries facts about the upstream: its `output`,
 and for an unkeyed incremental upstream the range of `commits` the batch
@@ -382,7 +383,7 @@ never on `full` alone, or each batch would erase the ones before it.
 **`deps=`** are unbound inputs: planned, pinned into lineage, part of the
 fingerprint (§6), watched by `AutoRefresh`, bound to no
 parameter. A dep across upstream-only dimensions pins the heads that
-exist, like `AllPartitions` (§7).
+exist, like a whole fan-in (§7).
 
 ### Sources
 
@@ -472,7 +473,7 @@ meanwhile: the partition drains only once it has caught up. Whether the pass dra
 (`caught_up := not more` on its record), not its outputs': a last batch may
 write none of them, and the partition is complete all the same. A partition is
 **complete** when each of its outputs has a head and its pass drained —
-a job, once a run of it succeeded. Selection (`"missing"`), `AllPartitions`
+a job, once a run of it succeeded. Selection (`"missing"`), a whole fan-in
 and the console all ask that one question.
 
 The **fingerprint** `H(version, store versions of the
@@ -524,12 +525,15 @@ declaration, or the same dynamic partitions):
 - dimensions on both sides: same key;
 - dimensions only on the consumer: broadcast (every consumer key reads the
   same upstream partition);
-- dimensions only on the upstream: must be collapsed with
-  `AllPartitions()`, which yields `dict[key, T]` over those dimensions,
-  resolved to **keys with committed heads at pin time**, never a barrier on
-  missing keys.
+- dimensions only on the upstream: a whole input or a dep fans in over
+  them — `dict[key, T]` over those dimensions, resolved to **keys with
+  committed heads at pin time**, never a barrier on missing keys; an
+  incremental input may not have them (a broadcast incremental read is
+  undefined);
+- `all_partitions=True`: every dimension is read as if only on the
+  upstream: no projection at all.
 
-A **dep** across upstream-only dimensions needs no `AllPartitions`: it
+A **dep** across upstream-only dimensions fans in as a whole input does: it
 collapses the same way, pinning every head that exists and agrees with the
 consumer's shared keys.
 
@@ -548,7 +552,7 @@ runs. It does not wait for Paris. To wait for every site, submit with
 `report` starts only once they all succeed (a failure blocks it). Only an
 upstream build lists the domain, refused past `MAX_SCOPES`.
 `skip_missing_inputs` (§9) waits only for the first: a fan-in that finds no
-upstream head at all — no `readings` for the day, or for `AllPartitions` no
+upstream head at all — no `readings` for the day, or for a whole fan-in no
 complete one — counts as missing, so `report` is skipped until one exists.
 Without the flag it runs over nothing.
 
@@ -559,7 +563,7 @@ diffs the same delta log per consumer key).
 `"latest"`, `"missing"`, `"all"` or a list. `OnChange` automations default
 to the projection rule from the changed upstream partition.
 **Retired** keys (absent from the current set) leave fan-out and every
-fan-in — `AllPartitions`, a collapsing dep, the missing-input check; their
+fan-in — a whole input or a dep over dimensions its consumer lacks, the missing-input check; their
 heads and cursors persist read-only.
 
 ## 8. Runs
@@ -671,7 +675,7 @@ the run's own vocabulary (§8): `partitions`, `mode`, `upstream`, `config`,
 | `name` | required; key for toggles | derived `{asset}.{trigger}.{index}` |
 | `targets` | required: assets, singleton or list | the asset |
 | `trigger` | required | required |
-| `partitions` | `"latest"` · `"missing"` · `"all"` · `[k…]`; default `"latest"` for `Every`/`Cron`, the projection of the changed partition for `OnChange` — a source has no dimensions, so its change reaches every partition of the target (bounded like `"all"`). Named partitions run as named, whatever changed. A firing is one run over every target, so a target that reads another waits for it. A change stays pending — never consumed — while a partition it is owed is claimed or queued in any run (that work would not see it, and the firing could not order after it), and while a target reading the change through `AllPartitions` cannot see it yet: a pass under way is read once it completes | same |
+| `partitions` | `"latest"` · `"missing"` · `"all"` · `[k…]`; default `"latest"` for `Every`/`Cron`, the projection of the changed partition for `OnChange` — a source has no dimensions, so its change reaches every partition of the target (bounded like `"all"`). Named partitions run as named, whatever changed. A firing is one run over every target, so a target that reads another waits for it. A change stays pending — never consumed — while a partition it is owed is claimed or queued in any run (that work would not see it, and the firing could not order after it), and while a target reading the change through a whole fan-in cannot see it yet: a pass under way is read once it completes | same |
 | `enabled` | default `True` | default `True` |
 
 | Trigger | Fires |
@@ -931,7 +935,7 @@ launched attempt settles under the contract it was launched with.
 
 Registration errors:
 
-- an `inputs=` value is not a `str` or one of `In`, `Incremental`, `AllPartitions`,
+- an `inputs=` value is not a `str`, an `In` or an `Incremental`,
   or names an unknown output;
 - a partition input violates the projection rule (§7); an `Incremental` input has
   upstream-only dimensions or is ref-annotated;

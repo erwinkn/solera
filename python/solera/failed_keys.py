@@ -2,7 +2,7 @@
 (docs/per-key-processing.md §9, the authoritative definition). The engine
 and the worker both call these; nothing else decides them.
 
-An `Each` asset keeps, per partition, a key index of the keys that did not
+A per-key asset keeps, per partition, a key index of the keys that did not
 succeed: `key → record`, the record packed into the entry's payload. A key
 that succeeds, is removed upstream or stops matching gets a tombstone.
 """

@@ -18,13 +18,13 @@ import pandas as pd
 from solera.errors import Rejected
 from solera.executors import AWSECS, Pool
 from solera.sdk import (
-    AllPartitions,
     Automation,
     AutoRefresh,
     Cron,
     DynamicPartitions,
-    Each,
     Every,
+    In,
+    Incremental,
     Migration,
     OnDeploy,
     Output,
@@ -175,7 +175,7 @@ class Unprocessable(Rejected):
         ],
     ),
     partitions=sites,
-    inputs={"workbook": Each("qaqc_files", concurrency=8)},
+    inputs={"workbook": Incremental("qaqc_files", concurrency=8, each=True)},
     version="2",  # bump to reprocess every key; code changes alone do not
     automations=AutoRefresh(),
 )
@@ -275,7 +275,7 @@ def site_health(ctx, change_events: TableRef) -> Sql:
 
 @asset(
     outputs=Output("fleet_dashboard", store="postgres", schema="ops"),
-    inputs={"site_health": AllPartitions()},
+    inputs={"site_health": In()},
     automations=AutoRefresh(),
 )
 async def fleet_dashboard(ctx, site_health: dict[str, TableRef]) -> pd.DataFrame:
@@ -287,7 +287,7 @@ async def fleet_dashboard(ctx, site_health: dict[str, TableRef]) -> pd.DataFrame
 @asset(
     outputs=Output("region_rollup", store="postgres", schema="ops", partition_column="region"),
     partitions=StaticPartitions(["east", "west"]),
-    inputs={"qaqc_samples": AllPartitions()},
+    inputs={"qaqc_samples": In()},
     automations=AutoRefresh(),
 )
 async def region_rollup(ctx, qaqc_samples: dict[str, TableRef]) -> pd.DataFrame:

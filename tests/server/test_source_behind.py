@@ -4,7 +4,7 @@ nothing is delivered and the position stays; the retries are the asset's
 budget, then the attempt fails with that reason. The source's next commit,
 restoring or removing the key, lets the next attempt through."""
 
-from solera.sdk import Each, Incremental, Output, Project, Retry, Source, asset
+from solera.sdk import Incremental, Output, Project, Retry, Source, asset
 
 from tests.sim.oracle import keyed_content
 from tests.sim.project import External, SourceStore, rebuild
@@ -17,7 +17,9 @@ def project(root, outside: External, retries: Retry):
     def items(ctx, feed: list):
         return rebuild(ctx.batch["feed"], [{"id": r["id"], "v": r["v"]} for r in feed])
 
-    @asset(inputs={"row": Each("feed")}, outputs=Output("checks", key="id"), retries=retries)
+    @asset(
+        inputs={"row": Incremental("feed", each=True)}, outputs=Output("checks", key="id"), retries=retries
+    )
     async def checks(ctx, row: list):
         return [{"v": row[0]["v"]}]
 

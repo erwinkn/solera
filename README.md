@@ -16,7 +16,7 @@ One distribution, `solera`, built with maturin: four Python packages under
 
 - `python/solera` — the asset SDK project files import
   (`@asset`, `Output`, `Patch`, `DynamicPartitions`, `Incremental`,
-  `AllPartitions`, `TimePartitions`, triggers, placements), and the key
+  `TimePartitions`, triggers, placements), and the key
   index (`solera.keys`). `solera_postgres` ships `PostgresStore` and its
   `Sql` writes.
 - `python/solera_server` — the control plane (state layer, engine,
@@ -68,11 +68,11 @@ The default project is designed to make every architecture feature visible:
 | `upload_drop` | a sensor on `Every(15)` committing to `uploads`: a new upload a minute, three at most — its tick history shows committed and skipped ticks |
 | `site_feed` | per-site cursor asset on `Every(10)`: `site_events` (unkeyed incremental) + `site_files` (keyed inventory), `Patch` both ways |
 | `file_index` | `Incremental(batch_size=2)` consumer — watch `more` continuation; declared `version="2"` |
-| `file_checks` | an `Each` input: one call per changed file, four at a time; the fourth file is rejected on odd feed ticks (the failed keys), and `exclude={"drafts": "*-file-2"}` leaves the third out |
+| `file_checks` | a per-key input: one call per changed file, four at a time; the fourth file is rejected on odd feed ticks (the failed keys), and `exclude={"drafts": "*-file-2"}` leaves the third out |
 | `site_digest` | `site × day` two-dimensional asset (`TimePartitions`), `deps=` on the `roadmap` source, a `bytes` output (pickled by FileStore) |
-| `fleet_index` | `AllPartitions` fan-in: `dict[str, list[dict]]` on FileStore, `dict[str, TableRef]` on Postgres |
+| `fleet_index` | whole-input fan-in: `dict[str, list[dict]]` on FileStore, `dict[str, TableRef]` on Postgres |
 | `site_status` | `Sql` asset over a `TableRef` (Postgres); on FileStore it logs that it skipped |
-| `fleet_status` | Postgres-only `AllPartitions` consumer over `TableRef`s — the SELECT runs in-database |
+| `fleet_status` | Postgres-only fan-in over `TableRef`s — the SELECT runs in-database |
 | `manual_ingest` | the one non-`Local` asset: `Pool("ingest")`, on an `Every(30)` schedule with `partitions="missing"` |
 | `weekly_digest` | a `@job` on a weekly `Cron` — inputs and placement, no outputs |
 | `refresh-index` | a standalone `Automation` targeting `site_feed` + `file_index` |
@@ -160,7 +160,7 @@ that canonical comma form with `--partition`). Its `deps=["roadmap"]` pins the
 plain source in lineage without loading it. The output is bytes, which
 FileStore pickles — check the head's ref on the asset page.
 
-### 6. AllPartitions fan-in
+### 6. Fan-in
 
 ```bash
 uv run solera run fleet_index --upstream
@@ -345,7 +345,7 @@ project = Project(assets=[site_files, daily_digests], sources=[sites], name="min
 
 Save as `my_project.py` and `uv run solera serve --insecure --project
 my_project.py` (the attribute defaults to `project`). Cursors, resources,
-`Incremental`/`AllPartitions` inputs, placements, triggers, and the Postgres stores
+whole, incremental and per-key inputs, placements, triggers, and the Postgres stores
 are documented in [docs/architecture.md](docs/architecture.md);
 `python/solera_server/demo.py` exercises all of them.
 

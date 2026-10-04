@@ -4,9 +4,9 @@ producer is a pure function of its inputs, so the oracle computes every
 output from the sources alone.
 
     feed (keyed source) ──Incremental──▶ items ──Incremental(batch 2)──▶ copy
-    knob (version) ──dep──▶ per_site[site ∈ sites] ──AllPartitions──▶ summary
+    knob (version) ──dep──▶ per_site[site ∈ sites] ──whole (fan-in)──▶ summary
     knob ──dep──▶ log (appends) ──Incremental──▶ tally
-    items ──Each(batch 2)──▶ checks (fails while a key is flaky, by error class)
+    items ──Incremental(batch 2, each=True)──▶ checks (fails while a key is flaky, by error class)
     items ──Incremental(batch 2)──▶ split ──▶ odd (table store), even (FileStore); on a pool
     items ──Incremental(batch 2)──▶ seen (a job: its cursor holds what it read)
     outside (keyed source) ◀── watch (a sensor over an external map; runs per_site when it changed)
@@ -24,13 +24,12 @@ from dataclasses import dataclass, replace
 from solera.errors import Abort, Failed, Rejected, Transient
 from solera.executors import Pool
 from solera.sdk import (
-    AllPartitions,
     Automation,
     AutoRefresh,
     Commit,
     DynamicPartitions,
-    Each,
     Every,
+    In,
     Incremental,
     Output,
     Project,
@@ -118,7 +117,7 @@ class SourceStore(FileStore):
         rows = []
         if isinstance(selection, Keys):
             rows = [{"id": k, "v": current[k]} for k in sorted(selection.generations) if k in current]
-        if by_key_type(t) is not MISSING:  # dict[str, T]: each key's rows (an Each page)
+        if by_key_type(t) is not MISSING:  # dict[str, T]: each key's rows (a per-key page)
             return {r["id"]: [r] for r in rows}
         return rows
 
@@ -205,7 +204,7 @@ def build(variant: Variant, data_root, db: Database, outside: External, pg: str 
         return Result(outputs={"tally": {"rows": total}}, cursor=total)
 
     @asset(
-        inputs={"item": Each("items", batch_size=2, concurrency=2)},
+        inputs={"item": Incremental("items", batch_size=2, concurrency=2, each=True)},
         outputs=Output("checks", key="id"),
         automations=AutoRefresh(),
         retries=Retry(3, delay=1.0),
@@ -245,7 +244,7 @@ def build(variant: Variant, data_root, db: Database, outside: External, pg: str 
     assets = [items, copy, per_site, log, tally, checks, split] + ([seen] if variant.seen else [])
     if variant.summary:
 
-        @asset(inputs={"per_site": AllPartitions()}, automations=AutoRefresh())
+        @asset(inputs={"per_site": In()}, automations=AutoRefresh())
         def summary(per_site: dict[str, dict]):
             return sorted(per_site)
 

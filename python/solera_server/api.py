@@ -267,7 +267,7 @@ def create_app(
         after: str | None = None,
         limit: int = Query(default=100, ge=1, le=1000),
     ):
-        """An Each asset's failing keys (docs/per-key-processing.md §9):
+        """A per-key asset's failing keys (docs/per-key-processing.md §9):
         `?outcome=rejected&outcome=failed` keeps those classes."""
 
         runtime = await asset_engine(request, p, name)
@@ -301,7 +301,7 @@ def create_app(
         before: str | None = None,
         limit: int = Query(default=100, ge=1, le=1000),
     ):
-        """What an Each asset's keys came to (§10), newest first; repeat
+        """What a per-key asset's keys came to (§10), newest first; repeat
         `outcome` to match any of several."""
 
         runtime = await asset_engine(request, p, name)

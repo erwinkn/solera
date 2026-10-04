@@ -3,7 +3,7 @@
 import pytest
 from hypothesis import given, settings
 from hypothesis import strategies as st
-from solera import Each, Incremental, Regex
+from solera import Incremental, Regex
 from solera.patterns import Matcher, spec
 from solera.sdk import RegistrationError
 
@@ -28,10 +28,10 @@ def test_include_exclude_and_names():
 
 def test_edges_carry_patterns():
     assert Incremental("f").spec("x").get("patterns") is None
-    e = Each("f", include="a/**", exclude={"tmp": "**/*.tmp"}).spec("x")
+    e = Incremental("f", include="a/**", exclude={"tmp": "**/*.tmp"}, each=True).spec("x")
     assert e["patterns"] == {"include": [{"glob": "a/**"}], "exclude": [["tmp", {"glob": "**/*.tmp"}]]}
     with pytest.raises(RegistrationError):
-        Each("f", include=[])
+        Incremental("f", include=[], each=True)
     with pytest.raises(RegistrationError):
         Incremental("f", exclude=[""])
 

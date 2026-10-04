@@ -10,7 +10,7 @@ import pytest
 from hypothesis import HealthCheck, Phase, settings
 from hypothesis import strategies as st
 from hypothesis.stateful import RuleBasedStateMachine, initialize, invariant, precondition, rule
-from solera.sdk import Each, Incremental, Output, Project, Source, asset
+from solera.sdk import Incremental, Output, Project, Source, asset
 from solera.stores import FileStore
 from solera_server.state import State
 
@@ -60,7 +60,7 @@ def project(
         return rebuild(ctx.batch["feed"], [{"id": r["id"], "v": r["v"]} for r in feed])
 
     @asset(
-        inputs={"item": Each("items", batch_size=2, exclude=["x*"])},
+        inputs={"item": Incremental("items", batch_size=2, exclude=["x*"], each=True)},
         deps=["knob"],
         outputs=Output("checks", key="id", store=checks_store),
         version=checks_v,
@@ -92,7 +92,7 @@ def project(
         before = 0 if changes.full and changes.first else (ctx.load() or {"rows": 0})["rows"]
         return {"rows": before + len(changes.added) - len(changes.removed)}
 
-    @asset(inputs={"row": Each("feed")}, outputs=Output("fchecks", key="id"))
+    @asset(inputs={"row": Incremental("feed", each=True)}, outputs=Output("fchecks", key="id"))
     async def fchecks(ctx, row: list):
         return [{"v": row[0]["v"]}]
 
@@ -832,7 +832,8 @@ def merge_project(root, outside, store, decl, *, items_store="a"):
         return rebuild(ctx.batch["feed"], [{"id": r["id"], "v": r["v"]} for r in feed])
 
     @asset(
-        inputs={"item": Each("items", batch_size=2)}, outputs=Output("checks", key="id", store="x", **decl)
+        inputs={"item": Incremental("items", batch_size=2, each=True)},
+        outputs=Output("checks", key="id", store="x", **decl),
     )
     async def checks(ctx, item: list):
         return [{"v": item[0]["v"]}]

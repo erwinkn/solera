@@ -604,7 +604,7 @@ of magnitude fewer:
 
 Everything an attempt reads from an index before it computes — a full
 pass's batch, a delta pass, a pattern change's diff, a `keys=` selection,
-an `Each` batch's failure records and retry walk, an immutable store's
+a per-key batch's failure records and retry walk, an immutable store's
 generations for a whole read — a worker alone pages from the store, cold: at
 100M keys, 20 to 37 GETs a page (`bench/keys/results.md`). The engine holds those indexes warm. So, mirroring
 `resolve` for writes, the worker asks once, at `start`, and the engine
@@ -673,7 +673,7 @@ from each commit and made exact by completed retry passes, and retry-pass
 identity. This doc implements none of that differently; it calls the same
 SDK predicate.
 
-In v1 the cache's per-key reader is the start read (§7): an `Each`
+In v1 the cache's per-key reader is the start read (§7): an per-key incremental
 attempt's retry batch — the walk of its failed keys from the pass's
 place, keeping the keys `eligible` says are due, then their upstream
 entries — is the worker's own read code, recorded over local copies like

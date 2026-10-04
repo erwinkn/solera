@@ -164,8 +164,8 @@ def select_partitions(
 
 
 class UpstreamOnly(ValueError):
-    """An input reads an upstream dimension its consumer lacks without
-    AllPartitions (§7)."""
+    """An incremental input over an upstream dimension its consumer lacks
+    (§7): a broadcast incremental read is undefined."""
 
 
 def check_tags(tags) -> dict[str, str]:
@@ -182,17 +182,15 @@ def check_tags(tags) -> dict[str, str]:
     return dict(sorted(tags.items()))
 
 
-COLLAPSING = frozenset({"all_partitions", "dep"})  # input kinds that may read across free dimensions
-
-
 @dataclass(frozen=True)
 class Input:
     """One read of a partition (§5, §7): an input, a dep, or the dep a
     partition-set dimension implies (`set_dim`: lineage, never the
     fingerprint). Of the owner's dimensions `dims`, the consumer shares
-    `pinned` — at its partition's keys — and lacks `free`. A fan-in (an
-    `AllPartitions` or a dep with free dimensions) reads the heads that
-    exist across them; any other input reads its one projected `partition`."""
+    `pinned` — at its partition's keys — and lacks `free`. A fan-in — a
+    whole input or a dep with free dimensions, or one that reads
+    `all_partitions`, every dimension free — reads the heads that exist
+    across them; any other input reads its one projected `partition`."""
 
     param: str
     kind: str
@@ -206,17 +204,20 @@ class Input:
 
     @property
     def fan_in(self) -> bool:
-        return bool(self.free)
+        return bool(self.free) or bool(self.spec.get("all_partitions"))
 
     @property
     def partition(self) -> str | None:
         """The one upstream partition it reads; None for a fan-in."""
 
-        return None if self.free else canonical_partition(self.dims, self.pinned) if self.dims else ""
+        return None if self.fan_in else canonical_partition(self.dims, self.pinned) if self.dims else ""
 
     def key(self, upstream_partition: str) -> str:
-        """A fan-in head's key: its parts on the collapsed dimensions."""
+        """A fan-in head's key: its parts on the collapsed dimensions — the
+        whole partition, with `all_partitions`; "" for an unpartitioned upstream."""
 
+        if not self.dims:
+            return ""
         parts = split_partition(self.dims, upstream_partition)
         return canonical_partition(self.free, {name: parts[name] for name in self.free})
 
@@ -333,13 +334,18 @@ class Planner:
 
     def visible(self, producer: str | None, partition: str, target: str) -> bool:
         """Whether `target` can read a change of `producer` at `partition` yet:
-        `AllPartitions` reads complete passes only, so a change made by a
+        a whole fan-in reads complete passes only, so a change made by a
         pass still under way is not, until that pass drains."""
 
         if producer is None:
             return True
         inputs = self.manifest["assets"][target]["inputs"].values()
-        whole = any(e["kind"] == "all_partitions" and self.owner(e["output"]) == producer for e in inputs)
+        t_dims, p_dims = self.dims(target), self.dims(producer)
+        lacks = any(not any(same_dim(d, td) for td in t_dims.values()) for d in p_dims.values())
+        whole = any(
+            e["kind"] == "in" and self.owner(e["output"]) == producer and (lacks or e.get("all_partitions"))
+            for e in inputs
+        )
         return not whole or self.caught_up(producer, partition)
 
     def reach(self, producer: str | None, partition: str, target: str) -> list[str]:
@@ -360,8 +366,10 @@ class Planner:
 
     def inputs(self, asset: str, partition: str) -> list[Input]:
         """What (asset, partition) reads: its inputs, its deps, then the partition
-        sets its dimensions are bound to. An input that is no fan-in may not
-        lack an upstream dimension (`UpstreamOnly`)."""
+        sets its dimensions are bound to. A whole input or a dep fans in over
+        the upstream dimensions the consumer lacks — over all of them with
+        `all_partitions` —; an incremental input may lack none
+        (`UpstreamOnly`): a broadcast incremental read is undefined."""
 
         info = self.manifest["assets"][asset]
         named = list(info["inputs"].items()) + [(d, {"kind": "dep", "output": d}) for d in info["deps"]]
@@ -375,9 +383,14 @@ class Planner:
         for param, spec in named:
             owner = self.owner(spec["output"])
             dims = self.dims(owner)
-            pinned, free = self.shared(info, partition, dims)
-            if free and spec["kind"] not in COLLAPSING:
-                raise UpstreamOnly(f"upstream-only dimension {next(iter(free))!r} requires AllPartitions")
+            if spec.get("all_partitions"):  # every upstream partition: no projection
+                pinned, free = {}, dict(dims)
+            else:
+                pinned, free = self.shared(info, partition, dims)
+            if free and spec["kind"] == "incremental":
+                raise UpstreamOnly(
+                    f"upstream-only dimension {next(iter(free))!r}: an incremental input cannot read across it"
+                )
             out.append(
                 Input(
                     param,
@@ -397,7 +410,7 @@ class Planner:
         """The heads a fan-in reads, by upstream partition: among those that exist,
         the current partitions — a retired one's head is kept, never read —
         that agree with its shared keys (`complete` ones only, for
-        `AllPartitions`). Never by expanding the domain: the owner's heads are
+        a whole input). Never by expanding the domain: the owner's heads are
         grouped by their shared keys once per planner."""
 
         names = tuple(sorted(input.pinned))
@@ -406,7 +419,7 @@ class Planner:
             member, groups = membership(input.dims, self.time, self.dynamic_partitions), {}
             for upstream_partition, head in sorted(self.heads_of(input.output).items()):
                 if member(upstream_partition):
-                    parts = split_partition(input.dims, upstream_partition)
+                    parts = split_partition(input.dims, upstream_partition) if input.dims else {}
                     groups.setdefault(tuple(parts[n] for n in names), {})[upstream_partition] = head
             self._groups[(input.output, names)] = groups
         heads = groups.get(tuple(input.pinned[n] for n in names)) or {}
@@ -427,16 +440,16 @@ class Planner:
         """Whether (asset, partition) reads an input never written that the run
         doesn't build — preparing it would fail. A fan-in reads what there is,
         so it is missing only when there is nothing: no current upstream head
-        agrees with its shared keys (a complete one, for `AllPartitions`)."""
+        agrees with its shared keys (a complete one, for a whole input)."""
 
         for input in self.inputs(asset, partition):
             built = planned.get(input.owner) or () if input.owner is not None else ()
             if input.fan_in:
                 if any(self._agrees(input, s) for s in built):
                     continue
-                if not self.fan_in(input, materialized=input.kind == "all_partitions"):
+                if not self.fan_in(input, materialized=input.kind == "in"):
                     return True
-            elif input.kind != "all_partitions" and input.partition not in built:
+            elif input.partition not in built:
                 source = (
                     input.owner is None and input.output in self.manifest["sources"] and input.partition == ""
                 )
@@ -446,7 +459,7 @@ class Planner:
 
     @staticmethod
     def _agrees(input: Input, upstream_partition: str) -> bool:
-        parts = split_partition(input.dims, upstream_partition)
+        parts = split_partition(input.dims, upstream_partition) if input.dims else {}
         return all(parts.get(name) == value for name, value in input.pinned.items())
 
     def partitions(self, asset: str, selection) -> list[str]:
@@ -614,7 +627,7 @@ class Planner:
                     if (input.owner, names) not in groups:
                         grouped = groups[(input.owner, names)] = {}
                         for upstream_partition in sorted(planned):
-                            parts = split_partition(input.dims, upstream_partition)
+                            parts = split_partition(input.dims, upstream_partition) if input.dims else {}
                             grouped.setdefault(tuple(parts[n] for n in names), []).append(upstream_partition)
                     ups = groups[(input.owner, names)].get(tuple(input.pinned[n] for n in names), ())
                 else:

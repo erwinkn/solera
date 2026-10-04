@@ -67,7 +67,7 @@ def test_brimstone_deploy_changes_on_change():
 
 
 def test_input_value_must_be_edge_or_str():
-    """§11: an inputs= value that is not str/In/Incremental/AllPartitions is an error."""
+    """§11: an inputs= value that is not str, In or Incremental is an error."""
 
     @asset(inputs={"x": 42})
     def bad(x):
@@ -88,8 +88,9 @@ def test_input_names_unknown_output():
         Project(assets=[bad])
 
 
-def test_upstream_only_dimension_requires_all_partitions():
-    """§7/§11: an input with upstream-only dimensions needs AllPartitions."""
+def test_a_whole_input_over_upstream_only_dimensions_is_read_by_partition():
+    """§7: a whole input over dimensions its consumer lacks fans in: it is
+    annotated dict[str, T], one value per upstream partition."""
 
     upstream_partitions = StaticPartitions(["a", "b"])
 
@@ -101,7 +102,7 @@ def test_upstream_only_dimension_requires_all_partitions():
     def down(up: list):
         return up
 
-    with pytest.raises(RegistrationError, match="AllPartitions"):
+    with pytest.raises(RegistrationError, match="fans in over up's dimensions"):
         Project(assets=[up, down])
 
 

@@ -26,9 +26,10 @@ export interface Patterns {
 export type PatternSpec = { glob?: string; regex?: string };
 
 export interface InputDecl {
-  kind: "in" | "incremental" | "all_partitions";
+  kind: "in" | "incremental";
   output: string;
   meta: Json;
+  all_partitions?: boolean;
   batch_size?: number;
   each?: { concurrency: number } | null;
   patterns?: Patterns | null;

@@ -175,7 +175,7 @@ resets it is an **asset change** (`changed_at` in the model, by asset).
 Its automations then decide, each by its own criterion:
 
 - `OnChange` owes one firing, as for a change of the asset's own, per
-  current partition whose inputs have heads (for `AllPartitions` or a
+  current partition whose inputs have heads (for a
   fan-in, a materialized upstream partition): built at once, not when its
   upstream next changes (F22). The engine works this out once, right after
   recording the deploy (`FiringsOwed`); no tick checks it again, so a run
@@ -295,7 +295,7 @@ State
 | Type | Fields | Bounded by |
 |---|---|---|
 | `Head` | `ref` (from the store), `run`, `attempt` (may point at a deleted run), `commit_number` (incremental outputs: the last commit that changed it, −1 before any), `base` (the first commit after the last reset of an unkeyed incremental output), `count` (keyed: live keys), `partitions?` (dynamic partitions: the partitions it lists), `version` (declared asset version), `asset`, `at`, `n?` (a source's: the event counter of its commit) | outputs × partitions |
-| `PartitionRecord` | `cursor?` (json), `last?` (`Outcome`: its last terminal result), `caught_up?` (whether its last commit finished the pass it was on — the partition's completeness, whatever its outputs wrote), `caught_up_at?` (the event counter of the commit that last caught it up: before its asset's `changed_at`, it is `stale`), `seen?` {input: versions} (the head generations of the whole and dep inputs it last caught up to: moved since, it is `stale`), `positions?` {input: `Position`}, `failures?` (`Failures`: an Each asset's failing keys, per-key-processing.md §9). Registration moves it whole under a rename, drops the positions of inputs the project no longer declares, and those a reset takes (§2). | assets × partitions |
+| `PartitionRecord` | `cursor?` (json), `last?` (`Outcome`: its last terminal result), `caught_up?` (whether its last commit finished the pass it was on — the partition's completeness, whatever its outputs wrote), `caught_up_at?` (the event counter of the commit that last caught it up: before its asset's `changed_at`, it is `stale`), `seen?` {input: versions} (the head generations of the whole and dep inputs it last caught up to: moved since, it is `stale`), `positions?` {input: `Position`}, `failures?` (`Failures`: a per-key asset's failing keys, per-key-processing.md §9). Registration moves it whole under a rename, drops the positions of inputs the project no longer declares, and those a reset takes (§2). | assets × partitions |
 | `Failures` | `commit_number` (the record's last commit), `counts` {outcome: keys}, `due` and `deploy_min` (lower bounds), `retry?` {`pass`, `deploy`, `forced_at`, `after`, `due_acc`, `deploy_acc`}, `passes`, `done_forced`, `last` (`changes` or `retry`), `forced` {class: position} — its index is `indexes["@asset"][partition]` (per-key-processing.md §9) | Each assets × partitions |
 | `KeyIndex` | `prefix` (where its files live — kept across renames), `count` (exact: writes are exact), `files` [{`name`, `level`, `min`, `max`, `entries`, `size`, `tail`, `index`}], `log` [[`batch`, [file]], …] — see §6 | a few dozen files per index |
 | `Position` | `kind` (`keys` or `commits`), `next` (the first upstream commit not yet delivered), `pass` (one under way: its `mode` — `full`, `delta`, or a pattern change's `diff` — its boundary `from`..`to`, its place `at` — the last key delivered, or the next batch — its `page` of `pages`, a delta pass's reader `pin`; a full keyed pass's `from` is the head's commit number + 1 when it began, so changes made meanwhile arrive afterwards as deltas), `fingerprint`, `output` and `up` (the upstream index it reads), and per-key `patterns`, `pattern change`, `reconcile`, and `ahead`, the read-ahead: `[commit, run, attempt]` per `keys=` run since the last pass, capped (`positions-from-reads.md`; `python/solera_server/positions.py`) | inputs × partitions |
@@ -477,7 +477,7 @@ never stale. The one cache of them is the engine's (`resolved-commits.md`
 §5): it answers small writes from local copies before a worker reads
 anything, and answers attempts' input reads at `start`. Workers keep
 no cache: what they read — a write the engine declines or that is too big
-for it, a full pass's batches, `Each`'s lookups — comes from the store
+for it, a full pass's batches, per-key incremental's lookups — comes from the store
 (the costs are in `bench/keys/results.md`, "Without a worker cache").
 
 **Implementation.** The file format is ours (no Parquet). The per-key
@@ -505,11 +505,11 @@ input versions built this version of `revenue`".
 |---|---|---|
 | `runs` | finished run or source commit | `status` (`succeeded`, `failed`, `canceled`, `skipped`), `trigger` (`manual`, `automation`, `sensor`, `commit`), `automation`, `by`, `retry_of` (the run a retry ran again), `source`, `targets`, `assets`, `committed`, `tags` (map), `task_count`, `failed_count`, `error`, `config` and `keys` (JSON, as submitted) |
 | `tasks` | task of a finished run | `asset`, `partition`, `status`, `started_at`, `finished_at`, `attempts`, `duration`, `wait` (seconds it could have run but didn't), `deps`, `max_attempts`, `retry_delay`, `retry_backoff`, `executor` (of its last attempt) |
-| `attempts` | attempt | `task`, `n`, `generation` (the one its writes carried), `outcome`, `started_at`, `finished_at`, `duration`, `preparing`, `provisioning`, `importing`, `loading`, `computing`, `writing`, `settling` (seconds per phase, below), `peak_memory` (bytes; only in a process of its own), `cpu_seconds`, `error`, `executor`, `cpu`, `memory`, `gpu` (requested; all null if it never launched), `options` (map: its other placement options, e.g. `image`), `outputs` (the outputs it committed, each at its `generation`), `keys` (map: an `Each` attempt's keys by outcome) |
+| `attempts` | attempt | `task`, `n`, `generation` (the one its writes carried), `outcome`, `started_at`, `finished_at`, `duration`, `preparing`, `provisioning`, `importing`, `loading`, `computing`, `writing`, `settling` (seconds per phase, below), `peak_memory` (bytes; only in a process of its own), `cpu_seconds`, `error`, `executor`, `cpu`, `memory`, `gpu` (requested; all null if it never launched), `options` (map: its other placement options, e.g. `image`), `outputs` (the outputs it committed, each at its `generation`), `keys` (map: a per-key attempt's keys by outcome) |
 | `run_timeline` | moment of a run | `n` (its order in the run), `at`, `type`, `task` and `attempt` (null for the run's own events), `by`, `name`, `reason`, `until`, `rows` — the timeline, below |
 | `commits` | output version a commit installed | `output`, `partition`, `generation` (its version: the writing attempt's, or a source commit's), `run`, `attempt`, `at`, `batch`, `added`, `removed`, `added_keys`, `removed_keys` (a source commit's keys, up to 1,000), `rows`, `metadata` (JSON; an unkeyed source commit's `version`) |
 | `lineage` | input version an output version was read from, and what a current read saw (stores.md, "What a read sees") | `output`, `partition`, `generation`, `input`, `input_scope`, `input_generation` (what was pinned: the head, or a fixed pass's generation), `param`, `read_generation` (what a read of current rows saw; null for a snapshot store's read, which is the pin, and for an external source's, which is its tick — `versions.md` §6) |
-| `key_outcomes` | key an `Each` attempt processed | `run`, `attempt` (`attempts.id`), `asset`, `partition`, `key`, `generation` (the upstream key's it processed), `outcome` (`ok`, `removed`, `unmatched`, `rejected`, `failed`, `retrying`, `canceled`, `timed_out`), `error`, `duration`, `at` — per-key-processing.md §10 |
+| `key_outcomes` | key a per-key attempt processed | `run`, `attempt` (`attempts.id`), `asset`, `partition`, `key`, `generation` (the upstream key's it processed), `outcome` (`ok`, `removed`, `unmatched`, `rejected`, `failed`, `retrying`, `canceled`, `timed_out`), `error`, `duration`, `at` — per-key-processing.md §10 |
 
 A run where every task was skipped — it launched nothing and wrote
 nothing — is recorded with status `skipped`. Listings hide skipped runs
@@ -694,9 +694,9 @@ count of a keyed output, else the length of a returned list.
 | an asset's versions and their metadata | `GET /assets/{name}/history?output=&partition=&before=` | |
 | what a version was built from, or what was built from it | `GET /outputs/{name}/lineage?partition=&generation=&direction=upstream\|downstream&depth=5` | each edge's `from` is what was read: its `generation` and the writer's `run`, `attempt` and `at`. Flag: `uncommitted` (`{attempt, run}`: a write no attempt committed). `detail` keeps the pin (`pinned_generation`) for debugging |
 | every asset at a glance: partitions by status, newest outcome, failing keys, partitions owing a repair | `GET /assets:status` → `{assets: {name: {partitions, partitioned, last, failures, owing a repair, updated_at}}}` | |
-| an `Each` asset's failing keys, and each partition's failure record | `GET /assets/{name}/failed-keys?partition=&outcome=&after=&limit=100` → `{partitions, keys, deploy, now, next}` | |
+| a per-key asset's failing keys, and each partition's failure record | `GET /assets/{name}/failed-keys?partition=&outcome=&after=&limit=100` → `{partitions, keys, deploy, now, next}` | |
 | a partition's staleness reasons and its stale keys (`positions-from-reads.md`) | `GET /assets/{name}/stale-keys?partition=&after=` | `solera stale ASSET [PARTITION]` |
-| what an `Each` asset's keys came to, newest first | `GET /assets/{name}/key-outcomes?partition=&key=&q=&outcome=&run=&before=&limit=100` → `{outcomes, next}` | |
+| what a per-key asset's keys came to, newest first | `GET /assets/{name}/key-outcomes?partition=&key=&q=&outcome=&run=&before=&limit=100` → `{outcomes, next}` | |
 | why a key is, or is not, in an asset's output (per-key-processing.md §10) | `GET /assets/{name}/explain?key=&partition=&input=` → `{verdict, patterns, failure, last, last_ok, …}` | |
 | an asset's input inputs, with every partition's position, lag and state | `GET /assets/{name}/inputs` | |
 | outputs owing a repair, stuck cleanups (lifecycle.md §9.6, §9.8) | `GET /repairs`, `GET /cleanups` | `solera cleanups` |

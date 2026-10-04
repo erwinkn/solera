@@ -1,8 +1,8 @@
 """Key patterns on inputs (docs/per-key-processing.md §11): which keys of a
-keyed upstream an `Incremental` or `Each` input takes.
+keyed upstream an incremental input takes.
 
-    Each("sharepoint_files", include="ICP/Results/**/*.csv",
-         exclude={"archive": "**/archive/**"})
+    Incremental("sharepoint_files", include="ICP/Results/**/*.csv",
+                exclude={"archive": "**/archive/**"}, each=True)
 
 Globs over the key string: `**` crosses `/` (and `**/` matches no directory
 too), `*` and `?` do not; `Regex("…")` for the rest. A key is taken when it

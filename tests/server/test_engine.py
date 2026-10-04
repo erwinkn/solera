@@ -7,7 +7,6 @@ import json
 import pytest
 from solera.executors import Executor
 from solera.sdk import (
-    AllPartitions,
     Automation,
     Cron,
     DynamicPartitions,
@@ -479,7 +478,7 @@ async def test_ref_annotated_input_receives_ref(state):
 
 
 async def test_all_partitions_values(state, data):
-    """§7: AllPartitions yields dict[key, value] over upstream-only dimensions,
+    """§7: a whole input yields dict[key, value] over upstream-only dimensions,
     resolved to keys with complete heads at pin time."""
 
     @asset(outputs=DynamicPartitions("sites"))
@@ -490,7 +489,7 @@ async def test_all_partitions_values(state, data):
     def per_site(ctx):
         return [{"site": ctx.partition}]
 
-    @asset(inputs={"per_site": AllPartitions()})
+    @asset(inputs={"per_site": In()})
     def rollup(per_site: dict[str, list]):
         return [{"n": len(per_site), "sites": sorted(per_site)}]
 
@@ -559,7 +558,7 @@ async def test_external_partition_set_via_commit(state):
 
 async def test_two_dimension_broadcast_and_collapse(state):
     """§7: a consumer-only dimension broadcasts; an upstream-only dimension
-    collapses via AllPartitions."""
+    fans in as a whole input."""
     seen = []
 
     @asset(outputs=DynamicPartitions("sites"))
@@ -581,7 +580,7 @@ async def test_two_dimension_broadcast_and_collapse(state):
         return [{"site": ctx.partition}]
 
     # collapse: partitioned upstream read by an unpartitioned consumer
-    @asset(inputs={"site_data": AllPartitions()})
+    @asset(inputs={"site_data": In()})
     def collapsed(site_data: dict[str, list]):
         return [{"n": len(site_data)}]
 

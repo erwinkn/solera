@@ -126,7 +126,7 @@ class Staleness:
     def _upstreams(planner, input) -> list[str]:
         """The upstream partitions an input reads: one, or a fan-in's."""
 
-        if input.kind == "all_partitions" or input.fan_in:
+        if input.fan_in:
             return list(planner.fan_in(input, materialized=True))
         return [input.partition]
 
@@ -192,7 +192,7 @@ class Staleness:
     def _committed(self, planner, input) -> int:
         """The event counter of the latest commit of the heads a whole or dep input reads."""
 
-        if input.kind == "all_partitions" or input.fan_in:
+        if input.fan_in:
             heads = planner.fan_in(input, materialized=False).values()
         else:
             heads = [self.m.heads.get((input.output, input.partition)) or {}]

@@ -18,19 +18,20 @@ const KIND: Record<Input["kind"], { name: string; means: string }> = {
   in: {
     name: "In",
     means:
-      "The whole value at its pinned head. A new version of it changes the fingerprint, which resets this asset's incremental inputs.",
+      "The whole value at its pinned head, or, over upstream dimensions this asset lacks, a dict of every committed partition across them. A new version of it changes the fingerprint, which resets this asset's incremental inputs.",
   },
   incremental: {
     name: "Incremental",
     means: "Only what changed since this asset's position, a batch at a time.",
   },
   each: {
-    name: "Each",
+    name: "Per-key incremental",
     means: "One call per changed key, its outcome kept per key in the failure index.",
   },
   all_partitions: {
-    name: "AllPartitions",
-    means: "Every committed partition of the upstream, as a dict, at pin time. Never waits for missing ones.",
+    name: "All partitions",
+    means:
+      "Every committed partition of the upstream, the shared dimensions too, as a dict, at pin time. Never waits for missing ones.",
   },
   dep: {
     name: "dep",
@@ -150,7 +151,9 @@ function PartitionRow({ s }: { s: InputPartition }) {
   const d = position?.pass;
   const at =
     typeof d?.at === "string" ? `after ${d.at}` : typeof d?.at === "number" ? `commit ${count(d.at)}` : null;
-  const underWay = d ? [d.mode, at, `batch ${d.batch + 1} of ${d.batches}`].filter(Boolean).join(" · ") : null;
+  const underWay = d
+    ? [d.mode, at, `batch ${d.batch + 1} of ${d.batches}`].filter(Boolean).join(" · ")
+    : null;
   return (
     <Tr>
       <Td className="font-mono text-xs">

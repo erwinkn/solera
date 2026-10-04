@@ -135,7 +135,7 @@ def test_demo_end_to_end(demo, pool_worker):
     # dynamic partitions) into each run; the rollup fans in over all sites.
     submitted = [
         submit(["site_digest"]),  # site × day — needs sites + site_feed
-        submit(["fleet_index"]),  # AllPartitions rollup over file_index
+        submit(["fleet_index"]),  # a fan-in rollup over file_index
         submit(["site_status"], partitions="all"),
         submit(["manual_ingest"], partitions="all"),
         submit(["weekly_digest"]),  # job: no outputs, just a clean run

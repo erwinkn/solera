@@ -9,9 +9,9 @@ import time
 import httpx
 import pytest
 from solera.sdk import (
-    AllPartitions,
     Automation,
     DynamicPartitions,
+    In,
     OnChange,
     Output,
     Project,
@@ -102,7 +102,7 @@ def test_membership_and_size_agree_with_the_enumeration():
 
 
 async def test_a_fan_in_reads_the_heads_that_exist(state):
-    """Engine review round 2 #7: an AllPartitions read over a million-partition
+    """Engine review round 2 #7: a whole fan-in over a million-partition
     domain pins the heads that exist and agree with the consumer's shared keys
     — it never lists the domain. Building upstream does, and is refused."""
     seen = {}
@@ -113,12 +113,12 @@ async def test_a_fan_in_reads_the_heads_that_exist(state):
     def grid(ctx):
         return [{"at": ctx.partition}]
 
-    @asset(inputs={"grid": AllPartitions()})
+    @asset(inputs={"grid": In()})
     def rollup(grid: dict[str, list]):
         seen["rollup"] = sorted(grid)
         return [{"n": len(grid)}]
 
-    @asset(partitions={"a": a}, inputs={"grid": AllPartitions()})
+    @asset(partitions={"a": a}, inputs={"grid": In()})
     def by_a(ctx, grid: dict[str, list]):
         seen[ctx.partition] = sorted(grid)
         return [{"n": len(grid)}]
@@ -167,7 +167,7 @@ def test_the_planner_takes_its_view_as_arguments():
 
 
 def test_an_empty_fan_in_is_missing():
-    """A fan-in — `AllPartitions`, or a dep across a dimension the consumer
+    """A fan-in — a whole input, or a dep across a dimension the consumer
     lacks — with no upstream head at all counts as missing: under
     `skip_missing_inputs` its partition waits for the first one. Otherwise it
     runs over nothing, as before."""
@@ -181,7 +181,7 @@ def test_an_empty_fan_in_is_missing():
     def report(ctx):
         return []
 
-    @asset(partitions={"day": day}, inputs={"readings": AllPartitions()})
+    @asset(partitions={"day": day}, inputs={"readings": In()})
     def rollup(ctx, readings: dict[str, list]):
         return []
 
@@ -211,14 +211,14 @@ def test_an_empty_fan_in_is_missing():
     heads[("readings", "day=d1,site=west")] = {"asset": "readings"}
     drained[("readings", "day=d1,site=west")] = False  # a pass under way
     assert planned("report", skip_missing_inputs=True) == ["d1"]  # one head of its day is enough
-    assert planned("rollup", skip_missing_inputs=True) is None  # AllPartitions reads complete heads
+    assert planned("rollup", skip_missing_inputs=True) is None  # a whole fan-in reads complete heads
     drained[("readings", "day=d1,site=west")] = True
     assert planned("rollup", skip_missing_inputs=True) == ["d1"]
 
 
 async def test_a_fan_in_reads_only_current_partitions(state):
     """Review round 3 (engine B2, system B2): a retired partition's head is
-    kept for inspection but no fan-in reads it — not AllPartitions, not a
+    kept for inspection but no fan-in reads it — not a whole input, not a
     dep across the dimension, not a missing-input check."""
     members, seen = {"keys": ["east", "west"]}, {}
 
@@ -230,7 +230,7 @@ async def test_a_fan_in_reads_only_current_partitions(state):
     def per_site(ctx):
         return [{"site": ctx.partition}]
 
-    @asset(inputs={"per_site": AllPartitions()})
+    @asset(inputs={"per_site": In()})
     def rollup(per_site: dict[str, list]):
         seen["rollup"] = sorted(per_site)
         return [{"n": len(per_site)}]
@@ -329,7 +329,7 @@ def test_linking_a_run_is_linear():
     def raw(ctx):
         return []
 
-    @asset(partitions={"k": keys}, inputs={"raw": AllPartitions()})
+    @asset(partitions={"k": keys}, inputs={"raw": In()})
     def cooked(ctx, raw: dict[str, list]):
         return []
 

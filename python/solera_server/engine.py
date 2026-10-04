@@ -243,7 +243,7 @@ class Engine(Attempts, Sensors, Staleness, Views):
     @staticmethod
     def _inputs_written(planner, asset: str, partition: str) -> bool:
         """Whether every input of (asset, partition) has something to read: a
-        head, or — across partitions (`AllPartitions`, a fan-in) — at least one
+        head, or — across partitions (a fan-in) — at least one
         materialized upstream partition."""
 
         try:
@@ -251,7 +251,7 @@ class Engine(Attempts, Sensors, Staleness, Views):
         except planning.UpstreamOnly:
             return False
         for input in inputs:
-            if input.kind == "all_partitions" or input.fan_in:
+            if input.fan_in:
                 if not planner.fan_in(input, materialized=True):
                     return False
             elif planner.head(input.output, input.partition) is None:
@@ -509,7 +509,7 @@ class Engine(Attempts, Sensors, Staleness, Views):
         if worker.get("read"):
             event["read"] = worker["read"]  # what its inputs' reads saw, for lineage
         if keys:
-            event["keys"] = keys  # an Each attempt's keys by outcome
+            event["keys"] = keys  # a per-key attempt's keys by outcome
         self.state.record(event)
         if self.keys is not None:
             for name, keys in ((commit or {}).get("keys") or {}).items() if outcome == "succeeded" else ():
@@ -798,8 +798,8 @@ class Engine(Attempts, Sensors, Staleness, Views):
         for input in inputs:
             param, output = input.param, input.output
             load = (asset["inputs"].get(param) or {}).get("load", "data")  # registration decided it
-            if input.kind == "all_partitions":
-                refs = self._all_partitions(planner, input)
+            if input.kind == "in" and input.fan_in:
+                refs = self._whole_fan_in(planner, input)
                 pins[param] = {"refs": refs, "load": load}
                 indexes = (
                     {k: self._whole_index(output, ref) for k, ref in refs.items()} if load == "data" else {}
@@ -878,10 +878,10 @@ class Engine(Attempts, Sensors, Staleness, Views):
             claim["reads"] = reads(plans)
         more = any(p["kind"] == "commits" and continues(p, None, None) for p in plans.values() if p)
         skip = bool(incremental) and all_empty and not more and not full
-        # An Each asset whose keys all failed so far has no head yet: nothing to wait for.
+        # A per-key asset whose keys all failed so far has no head yet: nothing to wait for.
         if skip and each_page is None and not planner.materialized(task["asset"], partition):
             skip = False
-        # A full run's write is the whole content. An Each batch's is not: it
+        # A full run's write is the whole content. A per-key batch's is not: it
         # patches by key, and a key that fails keeps its last good output (§5).
         reset = full and each_page is None
         cursor = None if reset else self.m.partition(task["asset"], partition).get("cursor")
@@ -939,7 +939,7 @@ class Engine(Attempts, Sensors, Staleness, Views):
             "cursor": cursor,
             "fingerprint": fingerprint,
             "outputs": outputs,
-            # An Each batch's failure delta, for cleaning up if it never commits.
+            # A per-key batch's failure delta, for cleaning up if it never commits.
             "failures": None
             if each_page is None
             else {
@@ -1039,8 +1039,8 @@ class Engine(Attempts, Sensors, Staleness, Views):
     def _input_version(self, planner: planning.Planner, input: planning.Input) -> list:
         """A whole or dep input's version: the generation of each head it reads."""
 
-        if input.kind == "all_partitions":
-            refs = self._all_partitions(planner, input)
+        if input.kind == "in" and input.fan_in:
+            refs = self._whole_fan_in(planner, input)
         elif input.fan_in:
             refs = {k: h["ref"] for k, h in planner.fan_in(input, materialized=False).items()}
         else:
@@ -1051,19 +1051,12 @@ class Engine(Attempts, Sensors, Staleness, Views):
         return sorted([key, (ref or {}).get("generation")] for key, ref in refs.items())
 
     @staticmethod
-    def _all_partitions(planner: planning.Planner, input: planning.Input) -> dict:
-        """AllPartitions pins every current upstream partition with a complete
+    def _whole_fan_in(planner: planning.Planner, input: planning.Input) -> dict:
+        """A whole fan-in pins every current upstream partition with a complete
         head that agrees with this partition's shared keys, keyed by the dimensions
-        it collapses (§7) — chosen among the heads that exist, never by
-        expanding the partition domain."""
+        it collapses (§7) — every dimension, with `all_partitions` — chosen
+        among the heads that exist, never by expanding the partition domain."""
 
-        if not input.fan_in:
-            head = planner.head(input.output, input.partition)
-            return (
-                {"": head["ref"]}
-                if head is not None and planner.head_materialized(input.output, input.partition)
-                else {}
-            )
         return {input.key(s): h["ref"] for s, h in planner.fan_in(input, materialized=True).items()}
 
     def _selection(
@@ -1135,14 +1128,14 @@ class Engine(Attempts, Sensors, Staleness, Views):
             if (position or {}).get("ahead"):  # kept: what keys were read, if under another definition
                 base["ahead"] = position["ahead"]
             base["pass"]["batches"] = _batches(index.count, limit)
-            if each:  # an Each output may hold keys the pass will not name: cleaned up after (§11)
+            if each:  # a per-key output may hold keys the pass will not name: cleaned up after (§11)
                 held = [o["name"] for o in self.manifest["assets"][task["asset"]]["outputs"]]
                 base["pass"]["reconcile"] = any(self.m.index(n, task["partition"]).count for n in held)
             if input.get("patterns") is not None:
                 base["patterns"] = input["patterns"]
         d = base["pass"]
         pin["batch"].update({"full": True, "scan": True, "index": d["batch"], "count": d.get("batches", 1)})
-        if each:  # an Each output keeps its keys through a start-over: a named key gone upstream goes (R2)
+        if each:  # a per-key output keeps its keys through a start-over: a named key gone upstream goes (R2)
             pin["batch"]["removes"] = True
             if d.get("reconcile"):  # what its reconcile would walk: the pass covers only once none is left
                 names = [o["name"] for o in self.manifest["assets"][task["asset"]]["outputs"]] + [
@@ -1287,13 +1280,13 @@ class Engine(Attempts, Sensors, Staleness, Views):
         held = [o["name"] for o in self.manifest["assets"][task["asset"]]["outputs"]] + [f"@{task['asset']}"]
         empty = False
         if current is None and reset:
-            # A full pass of an Each input ends with a cleanup of the keys it no
+            # A full pass of a per-key input ends with a cleanup of the keys it no
             # longer names — needed only if the asset held keys when it began (§11).
             current = {"mode": "full", "from": head_commit + 1, "at": None, "began": began}
             if each:
                 current["reconcile"] = any(self.m.index(name, task["partition"]).count for name in held)
             # A full pass starts its consumer over, keys or none: a plain producer is
-            # called with one empty batch, an Each asset's cleanup drops its keys (§5).
+            # called with one empty batch, a per-key asset's cleanup drops its keys (§5).
             empty = each and not current["reconcile"] and index.count == 0 and not index.files
         elif current is None:
             current = {
@@ -1348,7 +1341,7 @@ class Engine(Attempts, Sensors, Staleness, Views):
             carried.pop("patterns")
         return pin, {"kind": "keys", "position": carried, "pass": current, "head": latest}, empty
 
-    # -- Each batches (docs/per-key-processing.md §5, §9) ------------------------------
+    # -- per-key batches (docs/per-key-processing.md §5, §9) ------------------------------
 
     def _forced_at(self, record: dict) -> int:
         return max((record.get("forced") or {}).values(), default=0)
@@ -1371,7 +1364,7 @@ class Engine(Attempts, Sensors, Staleness, Views):
         )
 
     def _each_plan(self, task, asset, param, input, ref, upstream_partition, pin, plan, empty, ahead=None):
-        """An Each input's batch: the changes of its pass, or the keys its
+        """A per-key input's batch: the changes of its pass, or the keys its
         failed keys has due again. When both are pending they alternate —
         neither starves, and there is no fraction to tune (§9). A full
         pass reprocesses every key anyway, so retries wait for it."""
@@ -1475,7 +1468,7 @@ class Engine(Attempts, Sensors, Staleness, Views):
         return pin, plan, empty
 
     def _each_commit(self, task, plan: dict, result: dict) -> tuple[dict, bool, dict | None]:
-        """What an Each batch commits to its failure record, and whether the
+        """What a per-key batch commits to its failure record, and whether the
         task has more to do (§9): the outcome counts move by the batch's
         transitions; the bounds are lowered by the records it wrote; a retry
         batch advances its pass and folds the range it walked into the pass's
@@ -1722,7 +1715,7 @@ class Engine(Attempts, Sensors, Staleness, Views):
                     head["commit_number"], head["base"] = int(info["commit_number"]), before.get("base", 0)
             heads[name] = head
         for name in set(declared) - set(outputs):
-            # An Each batch whose keys all failed writes nothing, and makes no head yet;
+            # A per-key batch whose keys all failed writes nothing, and makes no head yet;
             # nor does a batch whose keys the input's patterns all left out.
             if prepared["outputs"][name]["head"] is None and failures is None and not result.get("skipped"):
                 raise Conflict(f"omitted output {name} has no head to keep (§2)", retryable=False)
@@ -2066,7 +2059,7 @@ class Engine(Attempts, Sensors, Staleness, Views):
     async def submit_retries(
         self, asset: str, partitions, by: str | None, skip_missing_inputs: bool = False
     ) -> list[dict]:
-        """Runs for an Each asset's partitions that have keys to retry, each under
+        """Runs for a per-key asset's partitions that have keys to retry, each under
         the configuration its partition last ran with (kept on its failure record):
         a retry under another configuration would read other inputs, and its
         new fingerprint would redeliver every key (§9). Partitions already active
@@ -2091,7 +2084,7 @@ class Engine(Attempts, Sensors, Staleness, Views):
         return runs
 
     def retry_keys(self, asset: str, classes, partition: str | None = None, by: str | None = None) -> dict:
-        """`solera keys retry`: a forced request for an Each asset's failing
+        """`solera keys retry`: a forced request for a per-key asset's failing
         keys of `classes` (`failed`, `rejected`, `canceled`, `retrying`,
         `timed_out`, or `all`), every partition or one. Its event
         counter is its identity; a retry pass takes each such key once (§9)."""
@@ -2101,7 +2094,7 @@ class Engine(Attempts, Sensors, Staleness, Views):
         if not any(
             e.get("each") for e in (self.manifest["assets"].get(asset) or {}).get("inputs", {}).values()
         ):
-            raise ValueError(f"{asset} has no Each input: it keeps no failing keys")
+            raise ValueError(f"{asset} has no per-key input: it keeps no failing keys")
         classes = sorted(set(NAMES.values()) if "all" in classes else set(classes))
         unknown = set(classes) - set(NAMES.values())
         if unknown or not classes:
@@ -2368,7 +2361,7 @@ class Engine(Attempts, Sensors, Staleness, Views):
                 view["outputs"] = a["outputs"]
                 view["commit"] = f"{task['run']}/{a['id']}"
             if a.get("keys"):
-                view["keys"] = a["keys"]  # an Each attempt's keys by outcome
+                view["keys"] = a["keys"]  # a per-key attempt's keys by outcome
             out.append(view)
         claim = self.m.claims.get(task["id"]) if live else None
         if claim:

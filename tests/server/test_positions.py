@@ -31,7 +31,7 @@ def test_a_keyed_pass_goes_by_key_then_moves_next():
     assert position == {**wm0, "pass": {**full, "at": "k9", "batch": 1}} and continues(plan, "k9", position)
     assert needs(position) == 8  # a full pass resumes as deltas from its `from`
     done = advance({**plan, "pass": position["pass"]}, None)
-    assert done == {**wm0, "next": 8, "reconcile": {"after": None}}  # an Each cleanup owed
+    assert done == {**wm0, "next": 8, "reconcile": {"after": None}}  # a per-key cleanup owed
 
     delta = {"mode": "delta", "from": 5, "to": 7, "at": None, "batch": 0, "batches": 2, "pin": 40}
     paged = advance({"kind": "keys", "position": wm0, "pass": delta}, "k1")

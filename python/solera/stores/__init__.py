@@ -488,7 +488,7 @@ PARALLEL = 32  # object requests in flight per load or write
 
 
 def by_key_type(t: Any) -> Any:
-    """`T` of a `dict[str, T]` load — each key's group on its own, as `Each`
+    """`T` of a `dict[str, T]` load — each key's group on its own, as per-key incremental
     reads a page (per-key §5) — else `MISSING`."""
 
     inner = dict_arg(t)

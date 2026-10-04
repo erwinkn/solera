@@ -1,4 +1,4 @@
-"""`Each`: an asset written for one key, run over a batch of keys
+"""Per-key incremental: an asset written for one key, run over a batch of keys
 (docs/per-key-processing.md §5, §9).
 
 A batch is either the changes of the input's pass (`changes`) or the
@@ -38,7 +38,7 @@ class Batch:
     """The keys one attempt reads from a keyed incremental input, filtered
     by its patterns. `deleted` are keys gone upstream and `unmatched` keys
     that stopped matching the patterns: the consumer's outputs drop both.
-    An `Each` batch also has a `kind` (§9) — the input's `changes`, a
+    A per-key batch also has a `kind` (§9) — the input's `changes`, a
     `retry` of failed keys, or the `reconcile` after a full pass — and the
     failure records it read."""
 
@@ -215,7 +215,7 @@ async def _covers(index, taken, named: set[str], ahead: dict, walked: dict | Non
 
 
 async def _holds_only(held, index, taken, named: set[str]) -> bool:
-    """Whether an Each output (or its failed keys) holds no key its reconcile
+    """Whether a per-key output (or its failed keys) holds no key its reconcile
     would remove — gone upstream or left out by the patterns — but those
     this run names, which it removes itself (R2)."""
 
@@ -403,7 +403,7 @@ async def run(spec, project, asset, param: str, pin: dict, args: dict, ctx, keys
 
         if isinstance(value, Result):
             if value.cursor is not UNSET:
-                raise errors.Failed("an Each asset keeps no cursor: its input is its iteration")
+                raise errors.Failed("a per-key asset keeps no cursor: its input is its iteration")
             unknown = set(value.outputs) - set(decls)
             if unknown:
                 raise errors.Failed(f"returned undeclared output {sorted(unknown)[0]!r}")
@@ -415,7 +415,7 @@ async def run(spec, project, asset, param: str, pin: dict, args: dict, ctx, keys
         for name, v in values.items():
             if isinstance(v, Patch) and (v.rows or [str(k) for k in v.remove] != [key]):
                 raise errors.Failed(
-                    f"{name}: an Each call removes its own key, Patch(None, remove=[ctx.key]), nothing else"
+                    f"{name}: a per-key call removes its own key, Patch(None, remove=[ctx.key]), nothing else"
                 )
         return values
 

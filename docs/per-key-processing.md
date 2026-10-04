@@ -1,12 +1,12 @@
 # Per-key processing
 
-Status: **§5–§11 and §13 built** (error classes, build identity, `Each`,
+Status: **§5–§11 and §13 built** (error classes, build identity, per-key incremental,
 groups by key, the failed keys, retry passes, forced retries, the drain on
 cancel, `key_outcomes`, key patterns and the pattern change pattern change); the engine's
 match-count hints (§11) and summary recomputation (§9) are deferred, and
 `solera explain` (§10) is not built; §12 follows `lifecycle.md` §11
 (sensors). §20 records where the build departs from this
-text. It adds an `Each` input (an asset written
+text. It adds a per-key input (an asset written
 for one key, run over every changed key), keys that hold many rows,
 per-key outcomes with user-classified errors, key patterns on inputs, and
 observable sources. It builds on the engine cache, the HTTP resolver,
@@ -49,7 +49,7 @@ Three things in Solera force that shape:
 
 ## 2. The design in one paragraph
 
-An asset declares how to process **one key**; `Each` runs it over every
+An asset declares how to process **one key**; per-key incremental runs it over every
 changed key of a keyed upstream, `concurrency` at a time, `batch_size` keys
 per attempt, and hands each output's store one `Patch({key: value})`.
 Every key is a group: it holds all the rows that carry it, one or many,
@@ -73,7 +73,7 @@ keys, generations and sources' versions only.
 | Splitting a batch into per-key values; reading a write's keys; stamping the key column; replacing a key's rows | store | its own types |
 | SharePoint, samples, what counts as unprocessable | user code | everything else |
 
-The keyed dictionary stays the one shape the core understands: `Each`
+The keyed dictionary stays the one shape the core understands: per-key incremental
 hands the user one entry of a `dict[key, value]` and hands the store a
 `dict[key, value]` back. Everything about rows — how many a key has, how
 they are compared, which column carries the key — goes through stores
@@ -121,10 +121,10 @@ def sharepoint_files(ctx, events: pd.DataFrame):
         Output("icp_raw_data", store="postgres", schema="analytical", key="path"),
     ),
     partitions=sites,
-    inputs={"file": Each("sharepoint_files",
+    inputs={"file": Incremental("sharepoint_files",
                          include="ICP/Results/**/*.csv",
                          exclude={"archive": "**/archive/**", "templates": "**/*template*"},
-                         batch_size=100, concurrency=16)},
+                         batch_size=100, concurrency=16, each=True)},
     automations=AutoRefresh(),
 )
 async def icp(ctx, file: dict, sharepoint: SharePointClient) -> Result:
@@ -154,10 +154,10 @@ of `ICP/Results/` is a remove for `icp`, a file moved in is an upsert. A
 rename reprocesses the file, which the rows need anyway since they carry
 its path. `item_id` stays a column.
 
-## 5. `Each`
+## 5. Per-key incremental
 
 ```python
-Each(output=None, *, include=None, exclude=None, batch_size=100, concurrency=16, meta=None)
+Incremental(output=None, *, include=None, exclude=None, batch_size=100, concurrency=16, meta=None, each=True)
 ```
 
 - **The upstream must be keyed** — a keyed output or keyed source; keys
@@ -187,9 +187,9 @@ Each(output=None, *, include=None, exclude=None, batch_size=100, concurrency=16,
   every call. A change to one resets the input, as today: every key is
   processed again. Joins with slowly changing tables belong downstream
   (§14).
-- **One `Each` per asset**, and no cursor (`Result(cursor=)` is rejected):
+- **One per-key incremental per asset**, and no cursor (`Result(cursor=)` is rejected):
   the input is the asset's iteration.
-- **To the engine, `Each` is an `Incremental` input** (`"each": {…}` in the
+- **To the engine, per-key incremental is an `Incremental` input** (`"each": {…}` in the
   manifest) with a failed keys (§9). The engine still knows three input
   kinds; the per-key call is the worker's.
 
@@ -264,7 +264,7 @@ states for `Patch` — "the partition's rows for the keys present … are exactl
 these" — and the duplicate-key error goes away: two rows with the same
 key are that key's group.
 
-So a batch asset can return its rows flat, and `Each` hands the store the
+So a batch asset can return its rows flat, and per-key incremental hands the store the
 same thing by key:
 
 ```python
@@ -290,7 +290,7 @@ are 3,000 entries.
 **The version of a key** is the generation of the write that last wrote
 it (`versions.md`): every key a write gives rows is a change, whatever
 the rows; nothing hashes them. A key given no rows (`Patch({k: []})`, or
-an `Each` call returning none) does not exist, so the patch removes it (a
+a per-key call returning none) does not exist, so the patch removes it (a
 replacement simply leaves it out).
 
 "Processed, produced nothing" is not output content: a key's existence is
@@ -356,7 +356,7 @@ generation. No row is read back.
   also what the HTTP resolver needs — the worker's sorted run of `(key,
   payload?, deleted)` — so one path serves replacement, patch, resolve
   and merge-join.
-- **The only per-key Python objects are an `Each` batch's**: a
+- **The only per-key Python objects are a per-key batch's**: a
   `dict[key, value]` of at most `batch_size` entries.
 
 ## 8. Errors
@@ -403,7 +403,7 @@ does not, because the file is the problem. Failed is red and alertable;
 rejected is expected noise. Every automatic retry is bounded — none loops.
 
 **Outside the per-key call** — loading the batch, writing to a store — an
-exception fails the attempt as today. On a non-`Each` asset the classes
+exception fails the attempt as today. On a non-per-key incremental asset the classes
 apply to the attempt: `Rejected` fails the task without retries,
 `Transient` is retried after `retry_after` or the backoff, `Failed` and
 `Abort` follow `retries=` (today's behaviour).
@@ -434,7 +434,7 @@ A key that did not succeed must be remembered until it does, and a
 systemic failure — a bug that throws on every file of a 1M-key full
 pass — must not put 1M entries into engine state or the checkpoint.
 So the failing set is not a map in state: it is a **key index** per
-`Each` asset and partition, in the format and machinery of every other index
+per-key asset and partition, in the format and machinery of every other index
 (`object-store-state.md` §6), under `keys/@{asset}/{partition}/`.
 
 **This section is authoritative** for the failure record, the transition
@@ -555,7 +555,7 @@ pass, which accumulates them as it walks (below), and replace the bounds
 when it completes. A coalesced recomputation from the engine cache is a
 later optimization, not v1.
 
-**When retries come due.** An `Each` asset normally runs when its upstream
+**When retries come due.** A per-key asset normally runs when its upstream
 changes. A retrying key needs its own clock, or a quiet afternoon would
 never retry it:
 
@@ -670,14 +670,14 @@ question, not stored per key.
 ## 11. Key patterns on inputs
 
 ```python
-Each("sharepoint_files", include="ICP/Results/**/*.csv", exclude={"archive": "**/archive/**"})
+Incremental("sharepoint_files", include="ICP/Results/**/*.csv", exclude={"archive": "**/archive/**"}, each=True)
 Incremental("sharepoint_files", include=["XRF/**/*.csv", "XRF Data/**/*.csv"])
 ```
 
 Globs over key strings — `**` crosses `/`, `*` does not — or
 `Regex("…")`. `include` is a pattern or a list; `exclude` a dict of named
 patterns (named, so `explain` can say which rule) or a list. They apply to
-`Each` and `Incremental` alike, and compile to one native matcher shared
+per-key and plain incremental inputs alike, and compile to one native matcher shared
 by engine and worker.
 
 **The worker filters.** It filters every batch it reads, so correctness
@@ -894,7 +894,7 @@ is below the current one.
   crosswalk change would reprocess every BET file. `bet_raw` per file, then
   a SQL asset joins the crosswalk, recomputed in Postgres in seconds.
 - **`SharePointFiles(site, folder, suffix, exclude=Exclude(folders=…, words=…))`**
-  is a helper that returns an `Each` with compiled patterns (§11).
+  is a helper that returns a per-key with compiled patterns (§11).
 - **`class Unprocessable(solera.Rejected)`**, raised for files that are
   bad on purpose.
 - **Sample tracing** is a downstream asset Brimstone builds from output
@@ -908,7 +908,7 @@ is below the current one.
 
 **Simpler.**
 
-- `Each` batches are small writes — `batch_size` keys — so their output
+- per-key incremental batches are small writes — `batch_size` keys — so their output
   deltas take the HTTP resolver whenever the engine has the output's index
   admitted to its cache (exact counts, no index reads on the worker), and
   the cold path otherwise. Failure deltas are always resolved by the
@@ -960,12 +960,12 @@ is below the current one.
 |---|---|
 | Key index (`object-store-state.md` §6) | No format change. A new kind of index (`keys/@{asset}/{partition}/`, the failed keys) compacted like the others; `Rows` groups every key (§6), read once as the prepared write (§7); patches build `Rows`. |
 | Engine cache (`resolved-commits.md`) | New readers: retry batches, read at `start`, in v1; pattern counts at commit and failure-summary recomputation later. No new cached content beyond failed keys. |
-| HTTP resolver (`resolved-commits.md`) | Each batches' output deltas are small resolves when the index is admitted; failure deltas are resolved locally, not by the resolver (§9 here is authoritative for the record, transitions, eligibility, pass state and forced-request identity; the engine's start reads run the same SDK functions, and its v1 has no pattern hints or summary recomputation); the worker uploads both. A sensor's full key map is resolved in-process (small) or on the host (big), not through an attempt's resolve. |
+| HTTP resolver (`resolved-commits.md`) | per-key batches' output deltas are small resolves when the index is admitted; failure deltas are resolved locally, not by the resolver (§9 here is authoritative for the record, transitions, eligibility, pass state and forced-request identity; the engine's start reads run the same SDK functions, and its v1 has no pattern hints or summary recomputation); the worker uploads both. A sensor's full key map is resolved in-process (small) or on the host (big), not through an attempt's resolve. |
 | Attempt lifecycle (`lifecycle.md`) | The cancel record (§2.2) and write-completion evidence (§2.3), authoritative there; the two-phase cancel of §7, which §5 follows; live per-key events and key-tagged logs; per-key outcomes in the sealed result. Sensors (§11) carry observable sources: `Source.observe` declares one. |
 
 ## 17. What changes in the code
 
-- `python/solera/sdk.py`: `Each`; `include`/`exclude` on `Incremental`;
+- `python/solera/sdk.py`: per-key incremental; `include`/`exclude` on `Incremental`;
   `Output(meta=…)`; `Rejected`, `Failed`, `Transient(retry_after,
   retry_for)`, `Abort`, `Project(errors=…)`; `Source.observe` as a sensor, `Observed`;
   `ctx.key`, `ctx.generation`, `ctx.keys(output, prefix=)`; the deploy from
@@ -985,14 +985,14 @@ is below the current one.
 - `native/`: the group digest and grouping in `Rows` (in progress), the
   pattern matcher.
 - `example/brimstone.py`: the §4 shape; `qaqc_samples` becomes an
-  `Each`.
+  per-key incremental.
 - Docs: architecture §2 (outputs), §4 (writes, store hook), §5 (inputs,
   sources), §6 (incrementality), §8 (runs and errors), §9 (observable sources as sensors),
   §11 (deploy); `object-store-state.md` §5–7.
 
 ## 18. Tests
 
-- `Each` delivers exactly what an equivalent batch asset returning
+- per-key incremental delivers exactly what an equivalent batch asset returning
   `Patch({key: …})` writes, over random batches, deletes and failures.
 - Groups: flat rows and the by-key form write the same keys; a key given
   no rows is removed; an opaque write's keys are the partition's. (Group
@@ -1054,8 +1054,8 @@ Where the implementation (`solera/errors.py`, `solera/build.py`,
   an output is explicit, `Patch(None, remove=[ctx.key])`; a `Patch` that
   writes rows or removes another key fails the call. `[]` is an empty
   group: a live key.
-- **An output with nothing to write is left out of the commit;** an `Each`
-  batch whose keys all failed makes no head yet, and an `Each` asset skips
+- **An output with nothing to write is left out of the commit;** an per-key incremental
+  batch whose keys all failed makes no head yet, and a per-key asset skips
   without heads when nothing is pending.
 - **Transient errors at the attempt level** count `retry_for` from the
   task's first transient failure (`transient_since` on the task), past
@@ -1101,7 +1101,7 @@ Where the implementation (`solera/errors.py`, `solera/build.py`,
   empty; a pass they take nothing from does not call the producer
   and ends `skipped` — but for a full pass, which starts its consumer
   over all the same: a plain producer gets one empty batch (`full`,
-  `first`, `final`), and an `Each` asset's cleanup after the pass drops
+  `first`, `final`), and a per-key asset's cleanup after the pass drops
   the keys the input no longer has (`architecture.md` §5). The read-ahead is bounded: the index is read a batch's
   worth and one more at a time, never only what the batch still lacks, and
   a batch examines at most 100,000 entries (`LOOKAHEAD` in
@@ -1129,7 +1129,7 @@ Where the implementation (`solera/errors.py`, `solera/build.py`,
     interrupted like one in flight. Interrupted keys become canceled or
     timed out by the cancel record the result is sealed with, decided
     after the store writes; the result carries that record.
-  - A full pass of an `Each` input keeps patch semantics: a key that
+  - A full pass of a per-key input keeps patch semantics: a key that
     fails keeps its last good output. If the asset held keys when the
     pass began (or the delta log was lost mid-pattern change), the pass
     ends with a **cleanup** (`reconcile` on the position): the outputs'

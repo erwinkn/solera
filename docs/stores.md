@@ -102,7 +102,7 @@ last wrote it: only those keys) or `Commits(lo, hi)`. An immutable store
 needs `Keys` to find a keyed output's objects, which it names by those
 generations. With `Keys`, `t` may be `dict[str, T]`
 (`solera.stores.by_key_type(t)` is `T`): each key's rows on their own, as
-`T` — how `Each` reads a batch — and a key with no rows absent, since it
+`T` — how per-key incremental reads a batch — and a key with no rows absent, since it
 does not exist. `can_load` says which `t` a store loads, by key or not;
 say only what `load` does.
 

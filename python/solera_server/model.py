@@ -197,7 +197,7 @@ class Model:
         # terminal outcome; `caught_up`, whether its last commit finished the pass
         # it was on — its completeness, whatever its outputs wrote; `positions`
         # {input: Position}; `reset`, set when a reset took positions, until a full
-        # pass catches it up (keys= runs read one meanwhile); and an Each asset's `failures` record
+        # pass catches it up (keys= runs read one meanwhile); and a per-key asset's `failures` record
         # (docs/per-key-processing.md §9), whose index lives in `indexes` under
         # ("@asset", partition). A rename moves it, retirement trims it: one record.
         self.partitions = Grouped(_flatten(snap.get("partitions"), 2))
@@ -721,7 +721,7 @@ class Model:
         producers = {outputs[name].get("asset") for name in reset if name in outputs} - {None}
 
         def gone(key) -> bool:
-            if key[0].startswith("@"):  # an Each asset's failed keys
+            if key[0].startswith("@"):  # a per-key asset's failed keys
                 return key[0][1:] not in assets
             return key[0] in reset
 
@@ -759,7 +759,7 @@ class Model:
 
     def _apply_aliases(self, manifest) -> tuple[dict[str, list[str]], dict[str, str]]:
         """Move everything held under an asset's former names to its current
-        one (§2): its partition records, pending automation entries, an Each
+        one (§2): its partition records, pending automation entries, a per-key
         asset's failed keys, and — for outputs named after the asset — heads,
         key indexes, repair intents and pending cleanups. A new name never
         releases a write domain. An index keeps its files where they are (its
@@ -792,7 +792,7 @@ class Model:
         move(self.indexes, output_map, 0)
         # A partition's record goes whole: a name that already has one keeps its own.
         move(self.partitions, asset_map, 0)
-        # An Each asset's failed keys (`@asset`), whose files stay under their prefix.
+        # A per-key asset's failed keys (`@asset`), whose files stay under their prefix.
         move(self.indexes, {f"@{old}": f"@{new}" for old, new in asset_map.items()}, 0)
         move(self.repairs, output_map, 0, merge=list)
         move(self.cleanups, output_map, 0, merge=_renumbered)
@@ -1139,7 +1139,7 @@ class Model:
         self._pend_onchange(asset, partition, changed)
 
     def _failures(self, asset: str, partition: str, f: dict) -> None:
-        """An Each batch's commit to its failure record: the failed keys's
+        """A per-key batch's commit to its failure record: the failed keys's
         delta, and the counts, bounds and retry-pass state the engine worked
         out from it (docs/per-key-processing.md §9)."""
 

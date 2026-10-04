@@ -12,7 +12,7 @@ Eight tables, each row about one:
 
 A version is the generation of the write that made it (docs/versions.md):
 an output version is `(output, partition, generation)`.
-    key_outcomes      key an Each attempt processed: what it came to (per-key-processing.md §10)
+    key_outcomes      key a per-key attempt processed: what it came to (per-key-processing.md §10)
     ticks             sensor tick (lifecycle.md §11): buffered, never journaled
 
 `run_timeline` is the timeline: the engine's events and the worker's, appended
@@ -139,7 +139,7 @@ TABLES = {
             "options": "MAP(VARCHAR, VARCHAR)",  # its other placement options: image, GPU type
             "outputs": "VARCHAR[]",  # the outputs it committed, at its generation
             "generation": "BIGINT",  # the one its writes carried (lifecycle.md §9.7)
-            "keys": "MAP(VARCHAR, BIGINT)",  # an Each attempt's keys by outcome: ok, failed…
+            "keys": "MAP(VARCHAR, BIGINT)",  # a per-key attempt's keys by outcome: ok, failed…
         },
     ),
     "commits": Table(
@@ -1069,7 +1069,7 @@ class History:
         before: str | None = None,
         limit: int = 100,
     ) -> dict:
-        """What the keys of an `Each` asset came to (per-key-processing.md §10),
+        """What the keys of a per-key asset came to (per-key-processing.md §10),
         newest first: `key` exactly, or keys containing `q` (any case). Rows
         are appended when a page commits, so a run in progress shows the pages
         it has committed. `next` is the `before` cursor of the following

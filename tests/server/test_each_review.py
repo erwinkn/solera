@@ -6,7 +6,7 @@ import asyncio
 
 from solera import Failed, Rejected, Transient
 from solera.failed_keys import CANCELED
-from solera.sdk import Each, Incremental, Output, Project, asset
+from solera.sdk import Incremental, Output, Project, asset
 from solera_server.state import State
 
 from .engines import drive, make_engine, task_statuses
@@ -31,7 +31,11 @@ async def test_1_a_cancel_interrupts_keys_still_waiting_for_a_slot(tmp_path):
             await release.wait()
         return [{"n": file}]
 
-    parse = asset(parse, inputs={"file": Each("files", concurrency=1)}, outputs=Output("rows", key="path"))
+    parse = asset(
+        parse,
+        inputs={"file": Incremental("files", concurrency=1, each=True)},
+        outputs=Output("rows", key="path"),
+    )
     project = Project(assets=[files, parse])
     opened = await State.open(tmp_path.as_uri(), "test", flush_interval=0.001)
     engine = engine_for(opened, project, placement="inline", heartbeat_seconds=0.2, cancel_grace=30)
@@ -102,7 +106,7 @@ async def test_3_retries_run_under_the_scopes_configuration(state):
         return {"a": 1, "b": 2}
 
     @asset(
-        inputs={"file": Each("files")},
+        inputs={"file": Incremental("files", each=True)},
         outputs=Output("rows", key="path"),
         automations=Automation(trigger=Every(3600), config={"factor": 10}),
     )
@@ -174,7 +178,12 @@ async def test_5_a_user_cancel_during_a_timeout_drain_makes_its_keys_canceled(tm
             await asyncio.sleep(60)
         return [{"n": file}]
 
-    parse = asset(parse, inputs={"file": Each("files")}, outputs=Output("rows", key="path"), timeout=0.5)
+    parse = asset(
+        parse,
+        inputs={"file": Incremental("files", each=True)},
+        outputs=Output("rows", key="path"),
+        timeout=0.5,
+    )
     project = Project(assets=[files, parse])
     opened = await State.open(tmp_path.as_uri(), "test", flush_interval=0.001)
     engine = engine_for(opened, project, placement="inline", heartbeat_seconds=0.1, cancel_grace=30)
@@ -255,7 +264,12 @@ async def test_8_a_renamed_asset_keeps_its_failures(state):
         raise Failed("bug")
 
     one = Project(
-        assets=[files, asset(parse, inputs={"file": Each("files")}, outputs=Output("rows", key="path"))]
+        assets=[
+            files,
+            asset(
+                parse, inputs={"file": Incremental("files", each=True)}, outputs=Output("rows", key="path")
+            ),
+        ]
     )
     engine = make_engine(state, one)
     await engine.initialize()
@@ -266,7 +280,10 @@ async def test_8_a_renamed_asset_keeps_its_failures(state):
         return [{"n": file}]
 
     renamed = asset(
-        parsed, inputs={"file": Each("files")}, outputs=Output("rows", key="path"), aliases=["parse"]
+        parsed,
+        inputs={"file": Incremental("files", each=True)},
+        outputs=Output("rows", key="path"),
+        aliases=["parse"],
     )
     two = Project(assets=[files, renamed], build="a fix")
     engine = make_engine(state, two)

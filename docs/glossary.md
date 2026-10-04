@@ -148,24 +148,29 @@ elements. *Example:* `sites`.
 Only time partitions have windows. *Was:* also "delta window" and "change
 window", which are passes.
 
-**input** `In`, `Incremental`, `Each`, `AllPartitions`, `deps=`. How an
-asset reads one **upstream** output:
+**input** `In`, `Incremental`, `deps=`. How an asset reads one
+**upstream** output, one of three kinds:
 
 - **whole** (`In`, or a plain `str`): the head's whole value, or its ref.
+  Over upstream dimensions the consumer lacks it fans in, as
+  `dict[partition, value]` over them (§projection). *Why:*
+  `weekly_digest` reads every site's index. With `all_partitions=True` it
+  reads every partition of the upstream, the shared dimensions too, with
+  no projection. *Example:* `site_report` for `alpha` compares alpha's
+  index with every other site's.
 - **incremental** (`Incremental`): what changed since its position, in
-  batches; keyed upstreams by key, unkeyed ones by commit.
-- **`Each`**: an incremental input over a keyed upstream whose asset is
-  written for one key: one call per changed key (`ctx.key`),
-  `concurrency` at once, failures kept per key. *Why:* a failure on one
-  file must not block the other 999.
-- **`AllPartitions`**: a whole input over the upstream's partitions that
-  the consumer lacks dimensions for, as `dict[partition, value]`
-  (§projection). *Why:* `weekly_digest` reads every site's index.
+  batches; keyed upstreams by key, unkeyed ones by commit. Never across
+  upstream-only dimensions.
+  - **per-key incremental** (`each=True`): an incremental input over a
+    keyed upstream whose asset is written for one key: one call per
+    changed key (`ctx.key`), `concurrency` at once, failures kept per
+    key. *Why:* a failure on one file must not block the other 999.
 - **dep** (`deps=`): an input bound to no parameter: planned, pinned,
-  watched by `OnChange`, never loaded.
+  watched by `OnChange`, never loaded; it fans in as a whole input does.
 
 *Not:* the upstream output itself. *Was:* edge (`EdgeDecl`, `/edges`,
-`--keys EDGE=`). *Example:* `file_index` reads
+`--keys EDGE=`); `Each` (per-key incremental) and `AllPartitions` (a
+whole input's fan-in, now its default). *Example:* `file_index` reads
 `Incremental("site_files", batch_size=2)`.
 
 **patterns** `include=`, `exclude=`. Globs (or `Regex`) on an incremental
@@ -245,9 +250,10 @@ not read it yet. *Was:* complete (missing = not complete), drained.
 upstream's extra dimensions **fan in**: the input receives
 `dict[partition, value]` over the upstream partitions materialized at pin
 time, never waiting for the others (`weekly_digest` reads
-`{"alpha": …, "beta": …}` of `file_index`). Only `AllPartitions` and deps
-fan in; another input over an upstream with extra dimensions is refused at
-registration. An incremental input never fans in.
+`{"alpha": …, "beta": …}` of `file_index`). Whole inputs and deps fan in;
+an incremental input over an upstream with extra dimensions is refused at
+registration: it never fans in. `all_partitions=True` projects nothing:
+every upstream partition is read, the shared dimensions too.
 
 **automation** `Automation(trigger=…)`. A rule that submits a run when its
 **trigger** fires: `Every`, `Cron`, `OnChange` (`AutoRefresh()`: on a
@@ -489,7 +495,7 @@ input: up to `batch_size` keys, or up to `batch_size` upstream commits.
 It may be one upstream commit, part of one, or several. One batch per
 attempt and commit. Never empty, but for one case: a full pass whose
 input takes no key reaches a plain producer as one empty batch, since
-starting over must happen (an `Each` asset's cleanup does it instead). It knows its `index` in the pass (0-based, exact),
+starting over must happen (a per-key asset's cleanup does it instead). It knows its `index` in the pass (0-based, exact),
 the planned `count` (possibly an estimate), `first`, `final`, `full`, and
 its `upserted` and `removed` keys. *Example:* `file_index` reads four
 files per site in two batches of `batch_size=2`. *Was:* page (`Changes`,

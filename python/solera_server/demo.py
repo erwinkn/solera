@@ -16,14 +16,13 @@ import time
 from solera.errors import Rejected
 from solera.executors import Pool
 from solera.sdk import (
-    AllPartitions,
     Automation,
     AutoRefresh,
     Commit,
     Cron,
     DynamicPartitions,
-    Each,
     Every,
+    In,
     Incremental,
     Migration,
     OnDeploy,
@@ -240,7 +239,7 @@ def file_index(ctx, site_files: list[dict]):
 
 
 # ---------------------------------------------------------------------------
-# Per-file processing: an Each input runs one call per changed file, four at a
+# Per-file processing: a per-key input runs one call per changed file, four at a
 # time; every file's rows go to the store in one write per page, and a file
 # that raises is kept in the asset's failed keys, per key, while the others
 # commit (docs/per-key-processing.md §5, §9). The input's patterns leave each
@@ -261,7 +260,11 @@ class Unreadable(Rejected):
         migrations=postgres_migrations("file_checks"),
     ),
     partitions={"site": sites},
-    inputs={"file": Each("site_files", batch_size=4, concurrency=4, exclude={"drafts": "*-file-2"})},
+    inputs={
+        "file": Incremental(
+            "site_files", batch_size=4, concurrency=4, exclude={"drafts": "*-file-2"}, each=True
+        )
+    },
     automations=AutoRefresh(),
 )
 async def file_checks(ctx, file: list[dict]):
@@ -301,13 +304,13 @@ def site_digest(ctx, site_files: list[dict]):
 
 
 # ---------------------------------------------------------------------------
-# Fan-in: AllPartitions collapses the site dim into a dict[str, ref] (§7).
+# Fan-in: a whole input over the site dim reads a dict[str, ref] (§7).
 # ---------------------------------------------------------------------------
 
 
 @asset(
     outputs=Output("fleet_index"),
-    inputs={"file_index": AllPartitions()},
+    inputs={"file_index": In()},
     automations=AutoRefresh(),
 )
 def fleet_index(ctx, file_index: dict[str, list[dict]]):
@@ -334,11 +337,11 @@ if DATABASE:
             key="site",
             migrations=postgres_migrations("fleet_status", "CREATE SCHEMA IF NOT EXISTS ops"),
         ),
-        inputs={"site_events": AllPartitions()},
+        inputs={"site_events": In()},
         automations=AutoRefresh(),
     )
     def fleet_status(ctx, site_events: dict[str, TableRef]):
-        """AllPartitions over TableRefs: the pins stay refs, the SELECT runs
+        """A fan-in over TableRefs: the pins stay refs, the SELECT runs
         inside Postgres against each site's partition (§4, §7)."""
         union = " UNION ALL ".join(
             f"SELECT '{ref.where.get('site', site)}' AS site, count(*)::int AS events "

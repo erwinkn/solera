@@ -188,10 +188,10 @@ def _main():
     stale.add_argument("partition", nargs="?", default="", help="Its partition; none when unpartitioned")
 
     keys = commands.add_parser(
-        "keys", help="An Each asset's failing keys (per-key-processing.md §9)", parents=[common]
+        "keys", help="A per-key asset's failing keys (per-key-processing.md §9)", parents=[common]
     )
     keys_sub = keys.add_subparsers(dest="keys_command", required=True)
-    keys_retry = keys_sub.add_parser("retry", help="Retry an Each asset's failing keys now")
+    keys_retry = keys_sub.add_parser("retry", help="Retry a per-key asset's failing keys now")
     keys_retry.add_argument("asset")
     keys_retry.add_argument("--partition", default=None, help="One partition only")
     for name in ("failed", "rejected", "canceled", "retrying", "timed-out", "all"):

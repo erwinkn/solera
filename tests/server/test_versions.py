@@ -4,7 +4,7 @@ over several batches, a failure record kept in its entry across a restart, and r
 by presence after a writer died."""
 
 from solera import Transient
-from solera.sdk import Each, Incremental, Output, Project, Ref, asset
+from solera.sdk import Incremental, Output, Project, Ref, asset
 from solera.stores import Patch
 
 from ..conftest import whole
@@ -91,7 +91,7 @@ async def test_a_failure_record_lives_in_its_entry_across_a_restart(state, tmp_p
             raise Transient("not yet", retry_after=3600, retry_for=86400)
         return [{"n": file, "at": ctx.generation}]
 
-    parse = asset(parse, inputs={"file": Each("files")}, outputs=Output("rows", key="path"))
+    parse = asset(parse, inputs={"file": Incremental("files", each=True)}, outputs=Output("rows", key="path"))
     project = Project(assets=[files, parse])
     engine = make_engine(state, project, clock=clock)
     await engine.initialize()

@@ -150,7 +150,7 @@ class EachAsset:
     """An each=True output: whether it has a head (without one it is
     `missing`, never `stale`); for each key it holds, the upstream version
     it read and the counter of its write; its asset's last change; the
-    keys its `Each` input's patterns take. (The engine keeps no such per-key
+    keys its per-key incremental input's patterns take. (The engine keeps no such per-key
     record: K47 derives the same answers from the position and the
     read-ahead entries; this is the model of what they mean.)"""
 

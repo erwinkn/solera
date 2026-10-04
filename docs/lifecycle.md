@@ -1025,7 +1025,7 @@ control file:
 **Every attempt process exits at once** (`os._exit`) once its sealed
 result is published, or once it cannot be: Local, ECS and Kubernetes
 workers as much as pool children. A thread the attempt gave up on — a
-synchronous `Each` call canceled mid-flight, say — would otherwise keep
+synchronous per-key incremental call canceled mid-flight, say — would otherwise keep
 the process, and its placement, alive until it returned. (Modal runs the
 worker as a function in a container of its own: not this exit.)
 

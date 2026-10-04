@@ -236,13 +236,13 @@ class Ctx:
         self._stores = project.stores
         self._outputs = [o.name or asset.name for o in asset.outputs]
         self._metadata: dict[str, dict] = {}
-        # An Each call's key, and the generation of its upstream entry: the
+        # A per-key call's key, and the generation of its upstream entry: the
         # version it runs at (docs/per-key-processing.md §5, docs/versions.md).
         self.key: str | None = None
         self.generation: int | None = None
 
     def _for_key(self, key: str, generation: int) -> Ctx:
-        """The `ctx` of one Each call: the same attempt, its key named, its log
+        """The `ctx` of one per-key call: the same attempt, its key named, its log
         lines tagged with it."""
 
         one = copy.copy(self)
@@ -334,11 +334,11 @@ async def _resolve_inputs(spec, project, asset, keys_io, timeline, observed: Obs
     reads = []
     for name, pin in spec["inputs"].items():
         input = inputs.get(name)
-        if input is None or "each" in pin:  # a dep pin: recorded, never bound; an Each batch: per key
+        if input is None or "each" in pin:  # a dep pin: recorded, never bound; a per-key batch: per key
             continue
         param = name
         t = hints.get(param)
-        if "refs" in pin:  # AllPartitions
+        if "refs" in pin:  # a whole fan-in: by partition
             inner = dict_arg(t)
             out = {}
             indexes = pin.get("indexes") or {}
@@ -1045,7 +1045,7 @@ async def run_attempt(
         if record.phase == "forced":
             on_ended()
         elif control.get("drain") is not None:
-            # An Each batch drains (per-key §5): no key starts, finished ones are stored.
+            # A per-key batch drains (per-key §5): no key starts, finished ones are stored.
             loop.call_soon_threadsafe(control["drain"].set)
         elif not control["writing"] and not control["stopped"]:
             control["stopped"] = True  # requested: stop computing; a writer drains instead
@@ -1179,7 +1179,7 @@ async def _publish(control_file, result, writes, cancel, timeline, shipper) -> b
             **timeline.report(),
             "log": log,
         }
-        if cancel is not None and "cancel" not in body:  # an Each batch sealed its own record
+        if cancel is not None and "cancel" not in body:  # a per-key batch sealed its own record
             body["cancel"] = cancel.to_json()
         if control_file.intents is not None:  # what a repair reads back, if this one fails
             body["intents"] = control_file.intents

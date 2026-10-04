@@ -1,15 +1,15 @@
-"""`Each` inputs (docs/per-key-processing.md §5–§10): one call per key, by-key
+"""per-key incremental inputs (docs/per-key-processing.md §5–§10): one call per key, by-key
 writes, the failed keys, retry passes, forced retries, key outcomes."""
 
 import asyncio
 import copy
 
 import pytest
-from solera import Abort, Rejected, Transient
+from solera import Abort, Incremental, Rejected, Transient
 from solera.failed_keys import FAILED, REJECTED, RETRYING, Record
 from solera.keys.index import KeyIndex, key_str
 from solera.keys.io import ObjectIO
-from solera.sdk import Each, Output, Project, Ref, RegistrationError, Result, Retry, asset
+from solera.sdk import Output, Project, Ref, RegistrationError, Result, Retry, asset
 from solera.stores import Patch
 
 from ..conftest import whole
@@ -52,7 +52,9 @@ def files_project(content, fn, *, written=None, **input):
         written.update(copy.deepcopy(content))
         return Patch(changed, remove=gone)
 
-    parse = asset(fn, inputs={"file": Each("files", **input)}, outputs=Output("samples", key="path"))
+    parse = asset(
+        fn, inputs={"file": Incremental("files", **input, each=True)}, outputs=Output("samples", key="path")
+    )
     return Project(assets=[files, parse])
 
 
@@ -247,7 +249,10 @@ async def test_abort_fails_the_attempt_and_commits_nothing(state):
         return {"a": {"text": "1"}, "b": {"text": "x"}}
 
     parse = asset(
-        parse, inputs={"file": Each("files")}, outputs=Output("samples", key="path"), retries=Retry(0)
+        parse,
+        inputs={"file": Incremental("files", each=True)},
+        outputs=Output("samples", key="path"),
+        retries=Retry(0),
     )
     project = Project(assets=[files, parse])
     engine = make_engine(state, project)
@@ -285,7 +290,7 @@ async def test_multi_output_result_and_keyed_values(state):
         return {"a": 1, "b": 2}
 
     @asset(
-        inputs={"file": Each("files")},
+        inputs={"file": Incremental("files", each=True)},
         outputs=(Output("rows", key="path"), Output("meta", keyed=True)),
     )
     def parse(ctx, file: int):
@@ -317,11 +322,21 @@ def test_registration():
         return []
 
     with pytest.raises(RegistrationError, match="must be keyed"):
-        Project(assets=[files, asset(parse, inputs={"file": Each("files")}, outputs=Output("x"))])
+        Project(
+            assets=[
+                files,
+                asset(parse, inputs={"file": Incremental("files", each=True)}, outputs=Output("x")),
+            ]
+        )
     with pytest.raises(RegistrationError, match="keyed upstream"):
-        Project(assets=[log, asset(parse, inputs={"file": Each("log")}, outputs=Output("x", key="k"))])
+        Project(
+            assets=[
+                log,
+                asset(parse, inputs={"file": Incremental("log", each=True)}, outputs=Output("x", key="k")),
+            ]
+        )
     with pytest.raises(RegistrationError, match="concurrency"):
-        Each("files", concurrency=0)
+        Incremental("files", concurrency=0, each=True)
 
 
 async def test_a_user_cancel_commits_finished_keys_and_leaves_the_rest_dormant(tmp_path):
@@ -348,7 +363,11 @@ async def test_a_user_cancel_commits_finished_keys_and_leaves_the_rest_dormant(t
         await release.wait()  # b and c hang until canceled
         return [{"n": file}]
 
-    parse = asset(parse, inputs={"file": Each("files", concurrency=3)}, outputs=Output("rows", key="path"))
+    parse = asset(
+        parse,
+        inputs={"file": Incremental("files", concurrency=3, each=True)},
+        outputs=Output("rows", key="path"),
+    )
     project = Project(assets=[files, parse])
     opened = await State.open(tmp_path.as_uri(), "test", flush_interval=0.001)
     engine = engine_for(opened, project, placement="inline", heartbeat_seconds=0.2, cancel_grace=30)
@@ -425,7 +444,7 @@ async def test_the_retry_clock_runs_automated_assets(state):
         return {"a": 1}
 
     @asset(
-        inputs={"file": Each("files")},
+        inputs={"file": Incremental("files", each=True)},
         outputs=Output("rows", key="path"),
         automations=Automation(trigger=Every(3600)),
     )
@@ -465,7 +484,7 @@ async def test_a_timeout_drain_counts_a_try_and_comes_due(tmp_path):
 
     parse = asset(
         parse,
-        inputs={"file": Each("files")},
+        inputs={"file": Incremental("files", each=True)},
         outputs=Output("rows", key="path"),
         timeout=0.5,
         retries=Retry(2, delay=0),
@@ -612,7 +631,7 @@ async def test_a_rescope_pins_its_snapshot_between_attempts(state):
 
 
 async def test_none_is_no_change_and_removal_is_explicit(state):
-    """D7: an output an Each call returns as None (or omits) keeps its
+    """D7: an output a per-key call returns as None (or omits) keeps its
     previous content for that key; `Patch(None, remove=[ctx.key])` removes
     the key; a Patch for anything else fails the call."""
 

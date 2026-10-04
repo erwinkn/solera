@@ -154,7 +154,7 @@ class TableStore:
             rows = [r for r in rows if r[1] is not None and selection.lo <= r[1] <= selection.hi]
         elif (ref.handle or {}).get("commit_number") is not None:
             rows = [r for r in rows if r[1] is None or r[1] <= ref.handle["commit_number"]]
-        if by_key_type(t) is not MISSING:  # dict[str, T]: each key's group (an Each page)
+        if by_key_type(t) is not MISSING:  # dict[str, T]: each key's group (a per-key page)
             groups: dict[str, list] = {}
             for k, _, row in rows:
                 groups.setdefault(k, []).append(dict(row))

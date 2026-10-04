@@ -1,4 +1,4 @@
-"""The console's read models over the API (§8, §10): asset rollups, an Each
+"""The console's read models over the API (§8, §10): asset rollups, a per-key
 asset's failing keys, key outcomes, explain, inputs with their positions,
 holds, and when schedules next fire."""
 
@@ -10,7 +10,6 @@ from solera import Rejected
 from solera.sdk import (
     Automation,
     Cron,
-    Each,
     Every,
     Incremental,
     OnChange,
@@ -46,7 +45,7 @@ def build_project(content, parts):
         return dict(content)
 
     @asset(
-        inputs={"file": Each("files", include="*.csv", exclude={"drafts": "draft-*"})},
+        inputs={"file": Incremental("files", include="*.csv", exclude={"drafts": "draft-*"}, each=True)},
         outputs=Output("samples", key="path"),
     )
     def parse(file: dict):
@@ -128,7 +127,7 @@ async def test_assets_status_rolls_up_every_asset(world):
     assert parse["partitioned"] is False and parse["failures"] == {"rejected": 1, "failed": 1}
     assert parse["last"]["outcome"] == "succeeded" and parse["last"]["attempt"].count("/") == 1
     assert parse["repairs"] == 0 and parse["updated_at"]
-    assert status["files"]["failures"] is None  # no Each input
+    assert status["files"]["failures"] is None  # no per-key input
     consume = status["consume"]
     assert consume["partitioned"] and consume["partitions"]["total"] == 2
     assert (consume["partitions"]["materialized"], consume["partitions"]["missing"]) == (1, 1)
@@ -183,7 +182,7 @@ async def test_failures_list_page_and_filter(world, monkeypatch):
     assert [k["key"] for k in rest["keys"]] == ["bug.csv"] and rest["next"] is None
     monkeypatch.undo()
 
-    assert (await client.get(f"{base}/assets/files/failed-keys")).status_code == 400  # no Each input
+    assert (await client.get(f"{base}/assets/files/failed-keys")).status_code == 400  # no per-key input
     assert (
         await client.get(f"{base}/assets/parse/failed-keys", params={"outcome": "odd"})
     ).status_code == 400
@@ -355,7 +354,9 @@ async def test_a_domain_too_big_to_list_still_rolls_up(tmp_path):
     def rows(ctx):
         return {"k1": {"text": "1"}, "k2": {"text": "2"}}
 
-    @asset(inputs={"row": Each("rows")}, outputs=Output("cells", key="path"), partitions=grid)
+    @asset(
+        inputs={"row": Incremental("rows", each=True)}, outputs=Output("cells", key="path"), partitions=grid
+    )
     def cells(row: dict):
         return [{"value": int(row["text"])}]
 

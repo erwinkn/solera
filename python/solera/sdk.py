@@ -185,7 +185,7 @@ def _load_intent(input, annotation) -> str:
     ("ref") — decided once, from its annotation, and carried in its pin so the
     worker that loads it and the engine that reads ahead for it agree."""
 
-    t = dict_arg(annotation) if input.kind == "all_partitions" else annotation
+    t = (dict_arg(annotation) or annotation) if input.kind == "in" else annotation  # a fan-in: by partition
     return "ref" if t is not None and is_ref_type(t) else "data"
 
 
@@ -363,21 +363,37 @@ class Result:
 
 
 class In:
-    """Whole value (or ref) of an output at its pinned head."""
+    """A whole input: the value (or ref) of an output at its pinned head.
+    Over upstream dimensions the consumer lacks it fans in, as
+    `dict[partition, value]` over them (§7); `all_partitions=True` reads
+    every partition of the upstream so, the shared dimensions too, with no
+    projection of the consumer's partition."""
 
     kind = "in"
 
-    def __init__(self, output: str | None = None, *, meta: dict | None = None):
+    def __init__(self, output: str | None = None, *, meta: dict | None = None, all_partitions: bool = False):
         self.output, self.meta = output, _jsonable(meta, "input meta") if meta is not None else None
+        self.all_partitions = bool(all_partitions)
 
     def spec(self, param: str) -> dict:
-        return {"kind": self.kind, "output": self.output or param, "meta": self.meta}
+        spec = {"kind": self.kind, "output": self.output or param, "meta": self.meta}
+        if self.all_partitions:
+            spec["all_partitions"] = True
+        return spec
 
 
 class Incremental(In):
-    """Delta input: the position-planned changes since last pass (§5, §6).
-    On a keyed upstream, `include` and `exclude` select the keys it takes
-    by name (`solera.patterns`, docs/per-key-processing.md §11)."""
+    """An incremental input: the position-planned changes since its last
+    pass (§5, §6). On a keyed upstream, `include` and `exclude` select the
+    keys it takes by name (`solera.patterns`, docs/per-key-processing.md
+    §11).
+
+    `each=True` makes it per-key incremental (docs/per-key-processing.md
+    §5): the asset is written for one key, the parameter receives one key's
+    value, `ctx.key` names it, and every output is keyed by it. `batch_size`
+    keys make one attempt and one commit; `concurrency` of them run at once.
+    A key whose call raises is recorded in the asset's failure index and
+    retried by its class (§8, §9); it never blocks the others."""
 
     kind = "incremental"
 
@@ -389,13 +405,21 @@ class Incremental(In):
         *,
         include=None,
         exclude=None,
+        each: bool = False,
+        concurrency: int | None = None,
     ):
         from . import patterns
 
         super().__init__(output, meta=meta)
         if batch_size < 1:
             raise RegistrationError("Incremental batch_size must be positive")
+        if concurrency is not None and not each:
+            raise RegistrationError("concurrency= is for a per-key incremental input (each=True)")
+        if each and concurrency is not None and concurrency < 1:
+            raise RegistrationError("Incremental concurrency must be positive")
         self.batch_size = batch_size
+        self.each = bool(each)
+        self.concurrency = (16 if concurrency is None else concurrency) if each else None
         try:
             self.patterns = patterns.spec(include, exclude)
         except (ValueError, TypeError) as error:
@@ -405,40 +429,9 @@ class Incremental(In):
         spec = {**super().spec(param), "batch_size": self.batch_size}
         if self.patterns is not None:
             spec["patterns"] = self.patterns
+        if self.each:
+            spec["each"] = {"concurrency": self.concurrency}
         return spec
-
-
-class Each(Incremental):
-    """An asset written for one key, run over every changed key of a keyed
-    upstream (docs/per-key-processing.md §5): the parameter receives one
-    key's value, `ctx.key` names it, and every output is keyed by it.
-    `batch_size` keys make one attempt and one commit; `concurrency` of them
-    run at once. A key whose call raises is recorded in the asset's failure
-    index and retried by its class (§8, §9); it never blocks the others."""
-
-    def __init__(
-        self,
-        output: str | None = None,
-        *,
-        batch_size: int = 100,
-        concurrency: int = 16,
-        meta: dict | None = None,
-        include=None,
-        exclude=None,
-    ):
-        super().__init__(output, batch_size=batch_size, meta=meta, include=include, exclude=exclude)
-        if concurrency < 1:
-            raise RegistrationError("Each concurrency must be positive")
-        self.concurrency = concurrency
-
-    def spec(self, param: str) -> dict:
-        return {**super().spec(param), "each": {"concurrency": self.concurrency}}
-
-
-class AllPartitions(In):
-    """Collapse the upstream dimensions this asset lacks (§5, §7)."""
-
-    kind = "all_partitions"
 
 
 @dataclass(frozen=True)
@@ -1111,7 +1104,7 @@ def hints(name: str, fn: Callable) -> dict[str, Any]:
 
 def dict_arg(t: Any) -> Any | None:
     """`X` of a `dict[str, X]` or `Mapping[str, X]` annotation — an input by
-    partition (`AllPartitions`) or by key (`Each`'s batch) — else None."""
+    partition (a whole fan-in) or by key (a per-key incremental batch) — else None."""
 
     if typing.get_origin(t) in (dict, Mapping):
         args = typing.get_args(t)
@@ -1295,31 +1288,29 @@ class Project:
     def _input(self, value, param, asset_name) -> In:
         if isinstance(value, str):
             value = In(value)
-        if type(value) not in (In, Incremental, Each, AllPartitions):
-            raise RegistrationError(
-                f"{asset_name}: inputs[{param!r}] must be a str or one of In/Incremental/Each/AllPartitions"
-            )
+        if type(value) not in (In, Incremental):
+            raise RegistrationError(f"{asset_name}: inputs[{param!r}] must be a str, In or Incremental")
         return value
 
     @staticmethod
     def _check_each(name: str, asset: Asset, info: dict, param: str, upstream: dict) -> None:
-        """An Each input (docs/per-key-processing.md §5): one per asset, over a
-        keyed upstream, the asset's only Incremental input, and every output
-        keyed by the input's key."""
+        """A per-key incremental input (`each=True`, docs/per-key-processing.md
+        §5): one per asset, over a keyed upstream, the asset's only
+        incremental input, and every output keyed by the input's key."""
 
         if upstream["key"] is None:
-            raise RegistrationError(f"{name}: Each input {param!r} needs a keyed upstream")
+            raise RegistrationError(f"{name}: per-key input {param!r} (each=True) needs a keyed upstream")
         others = [p for p, e in info["inputs"].items() if p != param and isinstance(e, Incremental)]
         if others:
             raise RegistrationError(
-                f"{name}: an Each asset reads its other inputs whole; {others[0]!r} is Incremental"
+                f"{name}: a per-key asset reads its other inputs whole; {others[0]!r} is incremental"
             )
         if not asset.outputs:
-            raise RegistrationError(f"{name}: an Each asset needs outputs")
+            raise RegistrationError(f"{name}: a per-key asset needs outputs")
         for output in asset.outputs:
             if output.key is None or output.is_dynamic_partitions:
                 raise RegistrationError(
-                    f"{name}: output {output.name} of an Each asset must be keyed (key= or keyed=True)"
+                    f"{name}: output {output.name} of a per-key asset must be keyed (key= or keyed=True)"
                 )
 
     def _build(self) -> dict:
@@ -1396,12 +1387,7 @@ class Project:
                         raise RegistrationError(
                             f"{name}: dimension {d!r} differs from upstream {output_name}"
                         )
-                if missing and not isinstance(input, AllPartitions):
-                    raise RegistrationError(
-                        f"{name}: {output_name} has upstream-only dimensions {sorted(missing)}; "
-                        "collapse them with AllPartitions() (§7)"
-                    )
-                if isinstance(input, Each):
+                if isinstance(input, Incremental) and input.each:
                     self._check_each(name, asset, info, param, upstream)
                 if isinstance(input, Incremental):
                     if missing:
@@ -1425,17 +1411,19 @@ class Project:
                         raise RegistrationError(f"{name}: store-bound input {param!r} is unannotated (§11)")
                     Keys, Commits = _selection_classes()
                     selection = Keys if upstream["key"] is not None else Commits
-                    loaded = dict[str, annotation] if isinstance(input, Each) else annotation
+                    loaded = dict[str, annotation] if input.each else annotation
                     if not store.can_load(loaded, selection):
                         raise RegistrationError(
                             f"{name}: store {upstream['store']} cannot load {annotation} "
                             f"under {selection.__name__}"
                         )
-                elif isinstance(input, AllPartitions):
+                elif missing or input.all_partitions:  # a whole fan-in: by upstream partition
                     inner = dict_arg(annotation)
                     if inner is None:
+                        over = "every partition" if input.all_partitions else f"dimensions {sorted(missing)}"
                         raise RegistrationError(
-                            f"{name}: AllPartitions input {param!r} must be annotated dict[str, T] (§5)"
+                            f"{name}: input {param!r} fans in over {output_name}'s {over}: "
+                            "annotate it dict[str, T] (§5, §7)"
                         )
                     if is_ref_type(inner):
                         if not store.can_load(inner, None):
@@ -1460,8 +1448,8 @@ class Project:
             for output in asset.outputs:
                 record = outputs[output.name]
                 store = self.stores[record["store"]]
-                each = any(isinstance(e, Each) for e in info["inputs"].values())
-                # An Each producer returns one key's value: the output holds them all.
+                each = any(isinstance(e, Incremental) and e.each for e in info["inputs"].values())
+                # A per-key producer returns one key's value: the output holds them all.
                 t = _payload_type(return_t) if len(asset.outputs) == 1 and not each else None
                 if not store.can_store(t, output):
                     raise RegistrationError(

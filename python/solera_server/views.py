@@ -1,4 +1,4 @@
-"""The console's read models (§8, §10): per-asset rollups, an `Each` asset's
+"""The console's read models (§8, §10): per-asset rollups, a per-key asset's
 failed keys and `explain`, every partition of every input, and what holds
 partitions back. Reads only: they record nothing, and never scan a run's tasks.
 A mixin of the engine, as `Attempts` and `Sensors` are."""
@@ -92,7 +92,7 @@ class Views:
     async def asset_statuses(self) -> dict[str, dict]:
         """One rollup per asset, for the console's graph and list: its partitions
         by status — `total` counts the current ones, `removed` those past
-        them — its newest outcome, an `Each` asset's failing keys by class
+        them — its newest outcome, a per-key asset's failing keys by class
         (null for any other), its held partitions, the partitions of its outputs a
         dead writer left owing a repair, and when an output last changed. Counted
         from the dimensions and the partitions with a record, so a domain too big
@@ -197,7 +197,7 @@ class Views:
         after: str | None = None,
         limit: int = 100,
     ) -> dict:
-        """An `Each` asset's failed keys (§9): the record of every partition
+        """A per-key asset's failed keys (§9): the record of every partition
         with one, or of `partition`, and a page of its failing keys in partition and
         key order, of the classes in `outcomes` if any. `after` is the
         previous page's `next`: `[partition, key]` as JSON. A page reads at most
@@ -205,7 +205,7 @@ class Views:
         as a short page with a `next`."""
 
         if self._each_input(asset) is None:
-            raise ValueError(f"{asset} has no Each input: it keeps no failing keys")
+            raise ValueError(f"{asset} has no per-key input: it keeps no failing keys")
         unknown = set(outcomes) - set(NAMES.values())
         if unknown:
             raise ValueError(f"unknown key classes: {sorted(unknown)}")
@@ -272,7 +272,7 @@ class Views:
 
         `state`: `never` (no position), `pattern change` (a pattern change,
         per-key §11), `full` (a full pass under way), `reconcile` (the
-        cleanup after a full Each pass), `delta` (a delta pass delivered over
+        cleanup after a full per-key pass), `delta` (a delta pass delivered over
         several attempts), `behind` (lag), else `caught_up`."""
 
         position = self.m.position(asset, param, partition)
@@ -345,7 +345,11 @@ class Views:
             out.append(
                 {
                     "param": param,
-                    "kind": "each" if input.get("each") is not None else input["kind"],
+                    "kind": "each"
+                    if input.get("each") is not None
+                    else "all_partitions"
+                    if input.get("all_partitions")
+                    else input["kind"],
                     "output": output,
                     "upstream_asset": self.manifest["outputs"][output].get("asset"),
                     "source": output in self.manifest["sources"],
@@ -380,7 +384,7 @@ class Views:
 
     async def explain(self, asset: str, key: str, partition: str = "", input: str | None = None) -> dict:
         """Why `key` is, or is not, in an asset's output (§10), through one
-        Incremental input: `input`, else its Each input, else its one keyed
+        Incremental input: `input`, else its per-key input, else its one keyed
         Incremental input. The verdict is the first of these that holds:
 
         - `not_matched`: no `include` pattern of the input matches it;
