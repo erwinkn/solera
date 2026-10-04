@@ -29,24 +29,26 @@ here ran on object storage. Every server run was capped with `systemd-run
   newest run. Runs merge by size (four alike become one), newest wins, flips
   unite. The oldest run is the **base**.
 - **Δ(P, H, keys) reads only the runs that end after P.** A key differs iff it
-  has an entry stamped after P; its state at H is its newest entry, its
-  presence at P is that state flipped by its flips after P. Any P is exact,
+  has an entry stamped after P and is present at one end at least; its state
+  at H is its newest entry, its presence at P is that state flipped by its
+  flips after P. Any P is exact,
   inside a merged run too: **no endpoints, no reservations, no versions per
   reader, no clipping at H** (a batch reads the run list it pinned at H).
 - **One reader-agnostic rule bounds what a reader reads:** a run may hold at
-  most **k × the bytes of all newer runs + Z** (k = 4, Z = 4 MB). A reader
+  most **k × the bytes of all newer runs + Z** (k = 4, Z = 1 MB). A reader
   then reads at most (1 + k) × what it must, plus Z, wherever its P falls.
-  Replayed: a reader 100 commits behind reads 2.3× the bytes of what changed,
-  a day behind 1.3× (1M keys) and 1.7× (100M).
+  Replayed: a reader 100 commits behind reads 1.7–1.8× the bytes of what
+  changed, a day behind 1.4× (1M keys) and 1.6× (100M).
 - **Retention is one number, the cut:** the newer of the window's edge and
   the oldest live P. Merges drop flips at or below it, and the base drops its
   tombstones. Readers behind the window keep a before-image (the observed
   set's mechanism), built by an ordinary Δ(P, head).
-- **Costs, replayed at one commit of 1K keys every 10 s:** 8–14 runs on
-  average (13–21 at most); 7× (1M) to 11× (100M) entries written per entry
-  committed; 69–98 KB uploaded and 1.4 PUTs per commit; ~$1.8 a month on S3
-  and ~$1.2 on Railway at either size with a warm writer. Storage 15 MB at
-  1M and 1.0 GB at 100M. One round trip for every query once the engine holds
+- **Costs, replayed at one commit of 1K keys every 10 s:** 8.6 runs on
+  average at 1M and 14.6 at 100M (14 and 21 at most); 7.1× (1M) and 11.4×
+  (100M) entries written per entry committed; 69–98 KB uploaded and 1.4 PUTs
+  per commit; ~$2.0 a month on S3 and $0.9–1.3 on Railway with a warm
+  writer, within ~10% of spans' and two views' (cited). Storage 15 MB at 1M
+  and 1.0 GB at 100M. One round trip for every query once the engine holds
   the run indexes; two cold.
 - **What it gives up:** a key's version or payload at P (a source key that
   reverts reads as a redundant update), reads at an interior commit that no
@@ -174,7 +176,7 @@ since P (copy-on-write pages, as in the snapshot-page study).
 | Candidate | 100 behind, 100M | 10,000 behind, 100M | Head lookups | Writes per commit | Fails on |
 |---|---|---|---|---|---|
 | 1. stamped head map | ~810 MB | ~810 MB | 1 run | rewrite the map: ~810 MB per R commits | near readers at 100M |
-| **2. stamped runs, tiered** | **1.9 MB, 1 RT** | **~130 MB, 1 RT per page** | **8–14 runs** | **~0.1 MB, 1.4 PUTs** | (chosen) |
+| **2. stamped runs, tiered** | **1.4 MB, 1 RT** | **~130 MB, 1 RT per page** | **9–15 runs** | **~0.1 MB, 1.4 PUTs** | (chosen) |
 | 3. fan-out on write | 0.8 MB | 77 MB | a separate map | ~100 PUTs, ~0.6 MB+ | writes, PUTs |
 | 4. log, sorted at read | 0.6 MB | 58 MB per batch, or 300 MB of memory | a separate map | 1 PUT | the cursor walk |
 | 5. sharded pages | ~370 MB | ~all of it | 1 tree | 0.5–2 MB | random keys |
@@ -191,7 +193,7 @@ files of ≤ 64 MB at key boundaries when large), cut into self-delimiting
 | Field | Meaning | Bytes (measured, ids, zstd-1) |
 |---|---|---|
 | key | prefix-compressed against the previous key | most of it |
-| present | whether the key exists after commit `b` | 1 flag byte with the next two |
+| present | whether the key exists after commit `b` | one flag byte: present, has flips, has payload |
 | stamp | the generation of its last change in `[a, b]`: its version at `b` | ~2 B (varint from the block's smallest) |
 | flips | the generations in `[a, b]`, newer than the cut, where it was added or removed | 0 B for most keys; ~2 B each |
 | payload | a source's own version at `b`, if present | as given |
@@ -223,7 +225,8 @@ written by the engine with the commit record.
 ### The layout
 
 Runs tile commit time from 0 to the head, without gaps or overlaps, newest
-smallest. Replayed, 100M keys, a moment in the base trace:
+smallest. Replayed, 100M keys, a moment in the base trace (illustrative; a
+run of the sweep):
 
 ```
 commit time →                                                                      head
@@ -243,7 +246,8 @@ the batch keeps reading its own.
 ### Reading Δ(P, H, keys)
 
 Over the manifest pinned at H, take the runs that end after P (for
-P = −∞: all of them). Merge them by key. For each key:
+P = −∞: all of them, the base's live file without its graveyard; for a P
+inside the base, its graveyard too). Merge them by key. For each key:
 
 ```
 entries  = its entries in those runs, newest run first, keeping only stamps > g(P)
@@ -311,9 +315,10 @@ whose P lies inside the merged run, could not be answered from it.
 
 ### Query forms
 
-**1. A writer's sorted keys at the head, Δ(−∞, head, keys).** Every run, newest
-first, per key until found. Per run, the reader picks the faster of two
-plans and, at equal time, the one with fewer requests:
+**1. A writer's sorted keys at the head, Δ(−∞, head, keys).** Every run is
+read in the same round trip, in parallel; for each key, the newest run
+holding it decides. Per run, the reader picks the faster of two plans and,
+within 10% of the same time, the one with fewer requests:
 
 - **seek**: one block per distinct block the keys fall in (the run index
   says which); adjacent blocks become one range GET;
@@ -334,10 +339,10 @@ touches (updates are 90%), so its filter would cost ~125 MB to save ~5% of
 its block reads. The other runs carry one in their run index; it pays only
 when it is already in hand (the engine holds run indexes), since fetching it
 cold costs a round trip and bytes proportional to the run. Replayed at 100M:
-~1,150 GETs per 1K cold lookups without filters, ~1,290 with (they turn
-streams into seeks); the difference is small either way, because the base's
-~1K seeks dominate. Phase 2 measures both; the default is filters in the
-run index, used when held.
+1,012 GETs, 205 MB and ~0.85 s per 1K cold lookups without filters; 1,287
+GETs, 23 MB and ~0.66 s with them held (they turn streamed runs into a few
+seeks). Either way the base's ~1K seeks, one per key, dominate. Phase 2
+measures both; the default is filters in the run index, used when held.
 
 **The warm path.** The engine's cache holds run files on local disk and run
 indexes in memory; a writer's lookup is then local reads (~10 ms for 1K keys,
@@ -426,11 +431,12 @@ payload at P. So a source key that went v1 → v2 → v1 inside (P, H] is
 present at both ends with a stamp after P, and Δ returns it **updated**,
 although its payload is unchanged: the redundant-update fallback the brief
 allows. The writer is unaffected: its lookup returns the head payload, which
-is all it compares. Keeping payloads at P would mean keeping a key's payload
-history inside the window (a payload per update, not per flip): ~25 B per
-update at 16 B payloads, the window's every update. It is the one thing a
-per-reader version bought in spans. Not kept; the cost of the fallback is one
-redundant update per reverted key, which a consumer handles as any update.
+is all it compares. Detecting the revert would need the payload at P, for
+any P in the window: a payload per update, not per flip, kept for the whole
+window (a week of 1K-key commits at 16 B payloads is ~60M payloads, ~1.5 GB
+per partition, and every merge carrying them). That is what a per-reader
+version bought in spans. Not kept: the fallback costs one redundant update
+per reverted key, which a consumer handles as any other update.
 
 ### Stale entries
 
@@ -441,8 +447,8 @@ the read rule makes them harmless: newest wins.
 - **At the head** (lookups, scans), a key is decided by the newest run that
   holds it; a lookup stops there, a scan merges runs and drops the older
   entries. Each stale entry costs its bytes once per scan. Replayed: the runs
-  hold 1.2–1.4 entries per live key on average (1M and 100M, base trace);
-  1.3 at 100M with churn, 3.2 at 1M with churn.
+  hold 1.5 (1M) and 1.2 (100M) entries per live key on average in the base
+  trace; under churn 3.3 (1M) and 1.3 (100M).
 - **In Δ(P, H)**, a stale entry in a run newer than P carries flips the
   reader needs (the key was added in one run, removed in the next): it is
   read for them, not wasted. A stale entry in the straddler stamped at or
@@ -484,17 +490,21 @@ drops absent keys with no flips left.
    quarter of its bytes, reaching as far as rule 3 allows.
 3. **The reader bound** (applies to both): a merge's output that reaches past
    the cut must hold at most **k × the bytes of every newer run + Z**
-   (k = 4, Z = 4 MB). Output wholly at or below the cut is free.
+   (k = 4, Z = 1 MB). Output wholly at or below the cut is free.
 
 Why the bound bounds reads: a reader whose P lies inside run i reads all
 newer runs (it must: they hold only changes after P, at most duplicated by
 stale entries) plus run i, and run i is at most k × those + Z. So it reads at
 most (1 + k) × what the newer runs hold, plus Z, whatever P is and without
-knowing P. Replayed, the bound is far from tight: 1.3–2.3× what changed on
-average, and the worst moment for a 100-behind reader 5.5× (a fresh
-4 MB run next to it).
+knowing P. The bound holds when the run is written; newer runs can later
+shrink by deduplication (at 1M keys especially), so it is a design rule,
+not an invariant, and the replay measures what readers actually read: 1.4–2.0×
+what changed on average in the base trace, 5.5× at the worst sampled moment
+for a reader 100 commits behind (a fresh run of ~1 MB next to it). Without
+the bound, a reader 100 behind at 100M reads 7.6× on average and up to
+1,000× (replayed, below).
 
-**Write amplification**, replayed: 7.0× (1M) and 11.4× (100M) entries
+**Write amplification**, replayed: 7.1× (1M) and 11.4× (100M) entries
 written per entry committed, background only; 11× and 16× in bytes (runs'
 entries are larger than deltas'). Each entry is rewritten once per tier it
 climbs (~6 tiers from a 6 KB delta to a 50–200 MB run) and, at 100M, ~4×
@@ -502,20 +512,43 @@ more by base merges (each rewrites the 810 MB base to absorb a quarter of
 it). That is ~70–100 KB uploaded per commit.
 
 Upkeep runs two lanes, each one merge at a time: the base, and the tiers.
-Their inputs never overlap.
+Their inputs never overlap. **Backpressure**: when queued merge input
+exceeds twice the index's bytes (upkeep is failing or far behind), commits
+to the partition wait, for every writer of the index, sources and failure
+indexes included (A17's R6).
 
 ### Parameters, and what moves them
 
-Replayed on the base trace, floor variant (below), 100M keys unless noted:
+Replayed on the base trace at 100M keys, the cut at the oldest live P
+(below), one parameter moved at a time from k = 4, Z = 4 MB, f = 4, r = 4
+(the sweep's starting point; the chosen Z = 1 MB is the second row). Reads
+are MB and × the bytes of what changed (worst sampled moment).
 
-| Setting | Runs, mean (max) | Writes per entry | Stored | 100 behind | 10,000 behind | Cold 1K lookup |
+| Setting | Runs, mean (max) | Entries written per entry committed | Stored | 100 behind | 10,000 behind | Cold 1K lookup |
 |---|---|---|---|---|---|---|
-SWEEP_TABLE
+| k = 4, Z = 4 MB, f = 4, r = 4 | 13.9 (21) | 11.4 | 999 MB | 1.86 MB, 2.30× (5.5×) | 129 MB, 1.67× (3.7×) | 1,011 GETs, 0.85 s |
+| **Z = 1 MB (chosen)** | **14.6 (21)** | **11.4** | **999 MB** | **1.37 MB, 1.69× (5.5×)** | **129 MB, 1.67× (3.7×)** | **1,012 GETs, 0.85 s** |
+| Z = 16 MB | 13.1 (21) | 11.4 | 998 MB | 2.46 MB, 3.04× (18.8×) | 131 MB, 1.70× (3.7×) | 1,010 GETs, 0.85 s |
+| k = 2 | 15.5 (24) | 10.5 | 1,002 MB | 1.86 MB, 2.30× (5.5×) | 108 MB, 1.40× (1.8×) | 1,012 GETs, 0.86 s |
+| k = 8 | 13.0 (21) | 11.4 | 996 MB | 1.86 MB, 2.30× (5.5×) | 144 MB, 1.87× (3.7×) | 1,010 GETs, 0.85 s |
+| no reader bound | 11.4 (20) | 10.4 | 912 MB | 6.12 MB, 7.56× (1,004×) | 404 MB, 5.23× (11.5×) | 1,004 GETs, 0.69 s |
+| f = 8 | 20.5 (33) | 7.8 | 1,009 MB | 1.28 MB, 1.58× (2.2×) | 110 MB, 1.42× (1.8×) | 1,017 GETs, 0.88 s |
+| r = 2 | 14.5 (22) | 9.4 | 1,115 MB | 1.86 MB, 2.30× (5.5×) | 129 MB, 1.67× (3.7×) | 1,018 GETs, 1.08 s |
+| one merge per lane at 2M entries per commit | 15.1 (22) | 11.4 | 999 MB | 1.83 MB, 2.27× (5.5×) | 129 MB, 1.67× (3.7×) | 1,012 GETs, 0.86 s |
 
-k trades runs (requests per lookup and per page) against bytes a reader
-reads before P; Z sets how large the newest runs may grow before any newer
-data exists; f trades writes against runs. k = 4, Z = 4 MB and f = 4 sit where
-neither runs nor reads grow fast.
+- **The bound is what keeps near readers near**: without it, a reader 100
+  behind can land in a 400 MB run.
+- **Z = 1 MB** cuts a near reader's bytes by a quarter for 0.7 more runs on
+  average; 16 MB lets the newest run grow to 16 MB with nothing newer.
+- **k** trades runs against far readers' bytes, mildly either way.
+- **f = 8 writes 30% less** and reads a little less, at ~6 more runs on
+  average (33 at most): more requests per page and lookup. Writes are cheap
+  in dollars here (below), so f = 4 keeps the run count down; phase 2 can
+  measure both.
+- **r = 2** (the base absorbs at half its size) writes 18% less but keeps
+  larger runs above the base, which cold lookups stream (1.08 against
+  0.85 s).
+- **Budgeted upkeep** changes nothing but half a run.
 
 ## Retention
 
@@ -551,18 +584,37 @@ Three ways to use what the engine knows about readers, replayed with 100
 daily readers spread over the day plus readers 1, 100, 360, 8,640 and
 10,000 commits behind:
 
-LIVEP_TABLE
+| What the index uses | 1M, 7-day window | 1M, 30-day window | 1M, churn | 100M, 7-day window | 100M, churn |
+|---|---|---|---|---|---|
+| nothing: the cut is the window's edge | 31 MB · 7.1× · 31 MB, 2.8× | 90 MB · 6.1× · 90 MB, 8.0× | 382 MB · 8.1× · 250 MB, 23× | 1,148 MB · 9.9× · 122 MB, 1.6× | 1,413 MB · 9.7× · 194 MB, 4.8× |
+| **the oldest live P, as the cut** | **15 MB · 7.1× · 15 MB, 1.4×** | **15 MB · 7.1× · 15 MB, 1.4×** | **72 MB · 7.7× · 72 MB, 6.6×** | **999 MB · 11.4× · 129 MB, 1.7×** | **1,054 MB · 10.3× · 183 MB, 4.5×** |
+| the whole set, in merges too | 15 MB · 7.1× · 15 MB, 1.4× | 15 MB · 7.1× · 15 MB, 1.4× | 72 MB · 7.7× · 72 MB, 6.6× | 999 MB · 11.4× · 129 MB, 1.7× | (not run) |
 
-- **The oldest live P** pays at 1M keys: it halves storage (30 → 15 MB on a
-  7-day window, 90 → 15 MB on a 30-day one), and a day-behind reader reads
-  1.3× what changed instead of 2.7–7.8× (the tombstones of a week or a month
-  of removals, 1.5M–6.5M of them against 1M live keys, are what it no longer
-  reads). At 100M it changes little (storage −13%, writes +15%).
-- **The whole set** (merges may cross any region holding no live P, as
-  spans' read rule did) changes nothing measurable: with readers every few
-  hundred commits, nearly every merge output holds a P, and the bound applies
-  anyway. It would add, for no gain, what spans needed: a P set read inside
-  merge planning, and the reservations A17's R4 and R5 were about.
+Each cell: stored · entries written per entry committed · what a reader
+10,000 commits behind reads, and × the bytes of what changed.
+
+- **The oldest live P** pays at 1M keys: it halves storage (31 → 15 MB on a
+  7-day window, 90 → 15 MB on a 30-day one, 382 → 72 MB under churn), and a
+  reader 10,000 commits behind reads 1.4× what changed instead of 2.8–8.0×
+  (23× → 6.6× under churn): the tombstones of a week or a month of removals,
+  1.5M–6.5M of them against 1M live keys, are what it no longer keeps. At
+  100M it changes little: storage −13 to −25%, writes +6 to +15% (the base
+  absorbs more often), reads about the same.
+- **The whole set** (the reader bound waived for a merge whose output holds
+  no live P, as spans' read rule was per endpoint) changes nothing
+  measurable: with 100 daily readers plus near ones, a P falls every few
+  dozen commits, so nearly every output holds one. It would add, for no gain,
+  what spans needed: a P set inside merge planning, and the reservations
+  A17's R4 and R5 were about.
+- **Where the set would pay, and why it is not taken.** Under churn, a
+  temporary key (added, then removed 100 commits later) keeps its tombstone
+  and two flips until the cut passes its removal, because a reader whose P
+  falls between the add and the remove must learn "removed". Knowing every
+  live P, a merge could drop the key when no P falls in that interval. With
+  100 daily readers a P falls in most 100-commit intervals, so the saving is
+  small; with one hourly and one daily reader it would be most of the 6.6×
+  above (estimated, not replayed; 72 MB at 1M, ~0.1 s of transfer). Taking it means reserving every P
+  before every merge: the cost the design exists to avoid.
 
 So the design uses one number, the oldest live P, and never the set.
 
@@ -625,26 +677,59 @@ version is in the writer's hand at commit).
 
 ## Costs
 
-All replayed (`model.py`, base trace unless noted, floor variant, instant
-upkeep), at one commit of 1K keys every 10 s (259,200 a month). Round trips
-assume the engine holds the manifest and run indexes (warm metadata); a
-fully cold reader adds one round trip to fetch run indexes. Request latency
-30 ms, 64 requests in flight.
+All replayed (`model.py`, base trace, the cut at the oldest live P,
+instant upkeep), at one commit of 1K keys every 10 s (259,200 a month).
+Round trips assume the engine holds the manifest and run indexes; a fully
+cold reader adds one round trip to fetch the run indexes (~0.015 B per entry:
+~30 KB at 1M, ~1.5 MB for the 100M base). Requests: 30 ms each, 64 in flight;
+NIC 1.25 GB/s; decoding 120M entries/s on 4 cores. Catch-ups are paged in
+batches of 10K keys (the observed set's batch); the engine reads each run in
+windows of ≥ 1 MB and serves consecutive batches from them, so a catch-up's
+GETs are about one per run plus one per MB.
 
-COSTS_TABLE
+| Query | 1M keys: round trips · GETs · MB read | 100M keys: round trips · GETs · MB read |
+|---|---|---|
+| writer, 1K sorted keys, engine warm | local · 0 · 0 (~10 ms, cited) | local · 0 · 0 |
+| writer, 1K sorted keys, cold | 1 · 9 · 13 (~0.05 s) | 1 · 1,012 · 205 (~0.85 s); filters held: 1,287 · 23 (~0.66 s) |
+| near reader, 100 behind (~100K keys, 10 batches) | 1 per batch · 8 · 1.6 (1.8×) | 1 per batch · 7 · 1.4 (1.7×) |
+| hourly reader, 360 behind | 1 per batch · 13 · 5.4 (2.0×) | 1 per batch · 12 · 4.6 (1.6×) |
+| far reader, 10,000 behind (1.25M / 9.5M keys) | 1 per batch · 24 · 15 (1.4×) | 1 per batch · 142 · 129 (1.7×) |
+| first run or start-over (all keys) | 1 per batch · ~22 · 13 | 1 per batch · ~1,015 · 999 (~1.7 s of transfer and decoding in all) |
+| first run, prefix pattern matching 1/8 of keys | ~1/8 of the above | ~140 · ~125 |
+| first run, suffix or infix pattern | as a full scan | as a full scan |
+| fold of a reader behind the window | as a far reader | as a far reader |
+| 100 daily readers | each its own far-ish catch-up; the index's structure is unchanged by their number | same |
 
-Dollars a month, warm writer (the engine resolves writes from its cache):
+Dollars a month. S3: PUT $5 per million, GET $0.40 per million,
+$0.023 per GB-month, in-region transfer free. Railway: requests and
+downloads free, uploads $0.05 per GB, $0.015 per GB-month. Readers: one
+hourly, one daily, and 100 daily readers.
 
-DOLLARS_TABLE
+| | 1M, S3 | 1M, Railway | 100M, S3 | 100M, Railway |
+|---|---|---|---|---|
+| deltas: 1 PUT and 5.8 KB per commit | $1.30 | $0.08 | $1.30 | $0.08 |
+| merges: 0.38–0.42 PUTs and 63–92 KB per commit | $0.54 | $0.82 | $0.49 | $1.19 |
+| merges' input reads (~1.5 GETs per commit) | $0.16 | free | $0.16 | free |
+| catch-ups (~85K / ~450K GETs) | $0.03 | free | $0.18 | free |
+| storage (15 MB / 1.0 GB) | $0.0003 | $0.0002 | $0.023 | $0.015 |
+| **total, warm writer** | **$2.03** | **$0.90** | **$2.15** | **$1.29** |
+| a cold writer adds (9 / 1,012 GETs per commit) | $0.93 | free | $105 | free |
+
+Against the baselines on the same prices and rate (cited, `viewbench`):
+spans $1.99 and $1.88 on S3 with a warm writer (1M, 100M), two views $1.85
+and $1.85; on Railway spans $1.15–1.36 and $1.29, two views $1.28 and $0.94;
+a cold writer at 100M costs spans $91 and two views $114 a month.
 
 Read on this:
 
 - **Every query is one round trip** with metadata in hand. A near reader's
   page: one range GET per run (~6 runs); a far reader's: ~12.
-- **Writes cost what spans' did** (cited, replayed: 7–10× at 1M, 12–14× at
-  100M compaction entry writes); two views replayed 5.8–9.2× but stored
-  10–40× more at 1M.
-- **Storage stays near the index's own size**: 1.4 entries per live key at
+- **Writes are in the prior designs' range.** Spans replayed 7–10× (1M) and
+  12–14× (100M) compaction entry writes, and measured 6–7× over 12,000
+  commits (too few to reach a base merge at 100M); two views measured
+  6.5–8.5× and replayed 5.8–9.2×, but stored 55–293 MB at 1M against 15 MB
+  here (cited).
+- **Storage stays near the index's own size**: 1.5 entries per live key at
   the head at 1M, 1.2 at 100M, plus the graveyard.
 - **Cold writers at 100M are the expensive case**, as in every design
   (cited: spans $91, two views $114 a month on S3 with a cold writer at
@@ -670,8 +755,8 @@ Why each difference follows from the problem:
   because its reads asked for a key's state at P (lookups at endpoints, the
   net rule's payload). Δ asks only for presence at P, and the change kinds
   make presence a parity of flips. One entry per key per run follows, and so
-  do lookups that do not slow down with readers (spans: 1.8 s for 1K cold
-  lookups at 1M with 100 daily readers, against 0.17 s; cited).
+  do lookups that do not slow down with readers (spans measured 1.8 s for
+  1K cold lookups at 1M with 100 daily readers, two views 0.17 s; cited).
 - **No interior N.** Spans clipped every read at g(N + 1) because passes
   ended at old commits; two views kept nodes ending anywhere. H is now the
   head or a pin, so a pinned manifest suffices: nothing in a file refers to H.
