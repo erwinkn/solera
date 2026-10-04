@@ -9,5 +9,5 @@ for d in /tmp/viewbench/*/; do
   [ -f "$d/built.json" ] || continue
   [ -f "bench/keys/views/runs-final/$name.json" ] && continue
   echo "$(date +%T) $name $(uptime | sed 's/.*averages: //')"
-  RAYON_NUM_THREADS=2 .venv/bin/python bench/keys/views/viewbench.py --reads "$d" | tail -1 > "bench/keys/views/runs-final/$name.json"
+  SCANS_ALL=1 RAYON_NUM_THREADS=2 .venv/bin/python bench/keys/views/viewbench.py --reads "$d" | tail -1 > "bench/keys/views/runs-final/$name.json"
 done

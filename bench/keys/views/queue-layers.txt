@@ -1,0 +1,6 @@
+100m-layers-base --index layers --size 1e8 --scenario base --no-reads
+1m-layers-base --index layers --size 1e6 --scenario base --no-reads
+1m-layers-daily100 --index layers --size 1e6 --scenario daily100 --no-reads
+1m-layers-stall --index layers --size 1e6 --scenario stall --no-reads
+1m-layers-churn --index layers --size 1e6 --scenario churn --no-reads
+1m-layers-large --index layers --size 1e6 --large 1000000 --large-every 3000 --no-reads
