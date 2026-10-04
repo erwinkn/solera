@@ -687,3 +687,67 @@ async def test_a_last_batch_that_writes_nothing_still_completes_the_partition(st
     assert planner.materialized("parse", "") and planner.partitions("parse", "missing") == []
     assert engine.head_view(written)["materialized"] is True
     assert (await records(engine, "parse"))["b.csv"].outcome == FAILED
+
+
+def _failing_checks(version="1", items_store=None):
+    """`items` (k0, k1) -> `checks`, per key, one key a batch; k1 fails."""
+
+    from solera.stores import FileStore
+
+    @asset(outputs=Output("items", key="id", store=items_store))
+    def items():
+        return [{"id": "k0"}, {"id": "k1"}]
+
+    @asset(
+        inputs={"row": Incremental("items", batch_size=1, each=True)},
+        outputs=Output("checks", key="id"),
+        version=version,
+        retries=Retry(n=0),
+    )
+    async def checks(ctx, row: list):
+        if ctx.key == "k1":
+            raise RuntimeError("broken")
+        return [{"ok": True}]
+
+    import tempfile
+
+    stores = {"b": FileStore(tempfile.mkdtemp(prefix="store-b-"))} if items_store else None
+    return Project(assets=[items, checks], stores=stores)
+
+
+async def test_a_start_over_clears_the_failed_keys(state):
+    """K47 (Positions.tla): a start-over's failed keys start over. `checks`
+    v1 leaves k1 failing; v2 makes a full pass due, and a keys=(k0) run is
+    its first batch: k1's record goes with it, though k1 was not processed
+    again; the failure index starts a new life."""
+
+    engine = make_engine(state, _failing_checks())
+    await engine.initialize()
+    await drive(engine, await engine.submit(["checks"], upstream=True))
+    record = state.model.partition("checks", "")["failures"]
+    assert record["counts"] == {"failed": 1}
+    before = state.model.indexes[("@checks", "")]
+    await engine.stop()
+    engine = make_engine(state, _failing_checks(version="2"))
+    await engine.initialize()
+    await drive(engine, await engine.submit(["checks"], keys={"items": {"keys": ["k0"]}}))
+    assert not state.model.partition("checks", "")["failures"].get("counts"), "k1's record went"
+    after = state.model.indexes.get(("@checks", ""))
+    assert after is None or (after.life != before.life and after.count == 0)
+    assert all(state.model.garbage) and any(p.startswith(before.prefix) for p, _ in state.model.garbage)
+
+
+async def test_a_reset_of_the_input_drops_the_failed_keys(state, tmp_path):
+    """K47 (Positions.tla): `items` moves to another store, a reset of
+    `checks`' input: its failure records are against keys that are no longer
+    the input's, and go at the deploy, before any run."""
+
+    engine = make_engine(state, _failing_checks())
+    await engine.initialize()
+    await drive(engine, await engine.submit(["checks"], upstream=True))
+    assert state.model.partition("checks", "")["failures"]["counts"] == {"failed": 1}
+    await engine.stop()
+    engine = make_engine(state, _failing_checks(items_store="b"))
+    await engine.initialize()
+    assert "failures" not in state.model.partition("checks", "")
+    assert ("@checks", "") not in state.model.indexes

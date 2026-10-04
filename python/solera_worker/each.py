@@ -259,7 +259,8 @@ async def read_each_batch(spec: dict, pin: dict, keys_io) -> Batch:
     if each["kind"] != "retry":
         batch = await read_batch(pin, keys_io)
         touched = [key_bytes(k) for k in [*batch.upserted, *batch.deleted, *batch.unmatched]]
-        priors = await failures.lookup(touched) if touched else {}
+        # A start-over reads no prior record: its failed keys start over (K47).
+        priors = await failures.lookup(touched) if touched and not each.get("start_over") else {}
         batch.priors = {key_str(k): Record.decode(p) for k, (_, p) in priors.items()}
         return batch
     # A retry batch: walk the failed keys from the pass's place, taking the
@@ -606,7 +607,10 @@ async def _failures(spec, each: dict, batch: Batch, outcomes: dict, keys_io) -> 
                 upsert_records.append(record.encode())
         elif prior is not None:
             removes.append(key_bytes(key))
-    index = KeyIndex(keys_io, None, IndexState.from_json(each["failures"]))
+    state = IndexState.from_json(each["failures"])
+    if each.get("start_over"):  # the commit replaces the index: resolved against an empty one
+        state = IndexState(prefix=state.prefix)
+    index = KeyIndex(keys_io, None, state)
     files, _ = await index.resolve(
         SortedEntries.of(upsert_keys, upsert_records, removes),
         commit_number=int(each["commit_number"]),

@@ -1548,8 +1548,12 @@ class Engine(Attempts, Sensors, Staleness, Views):
                     }
                     plan["head"] = latest
             return pin, plan, False
-        pin = {**pin, "each": each}
         batch = {"kind": "changes", "retries": retries, "pass": retry}
+        if pin["batch"].get("full") and int(pin["batch"].get("index") or 0) == 0:
+            # A start-over: its failed keys start over too (K47, Positions.tla). The batch
+            # reads no prior record, and its commit replaces the failure index.
+            each["start_over"] = batch["start_over"] = True
+        pin = {**pin, "each": each}
         plan = {**plan, "each": batch}
         return pin, plan, empty
 
@@ -1563,7 +1567,10 @@ class Engine(Attempts, Sensors, Staleness, Views):
         reconcile batch moves the cleanup on. Returns the record's commit, the
         `more`, and the position a reconcile batch leaves (else None)."""
 
+        batch = plan["each"]
         record = self.m.partition(task["asset"], task["partition"]).get("failures") or {}
+        if batch.get("start_over"):  # the index starts over: nothing of the record before carries
+            record = {"commit_number": record.get("commit_number", -1), "forced": record.get("forced") or {}}
         run = self.m.runs.get(task["run"]) or {}
         report = result.get("failures") or {}
         counts = dict(record.get("counts") or {})
@@ -1572,7 +1579,6 @@ class Engine(Attempts, Sensors, Staleness, Views):
         counts = {k: v for k, v in counts.items() if v}
         due = lower(record.get("due"), report.get("due"))
         deploy_min = lower(record.get("deploy_min"), report.get("deploy_min"))
-        batch = plan["each"]
         commit = {
             "keys": report.get("keys") or {"files": []},
             "commit_number": int(record.get("commit_number", -1)) + 1,
@@ -1627,6 +1633,8 @@ class Engine(Attempts, Sensors, Staleness, Views):
                 or forced_after
             )
         commit.update({"due": due, "deploy_min": deploy_min})
+        if batch.get("start_over"):
+            commit["start_over"] = True
         return commit, more, position
 
     def _due_cleanups(self, output: str, partition: str, attempt: str | None) -> list[dict]:

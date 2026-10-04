@@ -774,6 +774,7 @@ class Model:
                 del positions[input]
             if dropped and key[0] not in producers:  # its input's content replaced: a fact staleness reads
                 self.partitions[key]["input_reset_at"] = self.event_counter
+                self._drop_failures(*key)  # failed against keys that are no longer the input's (K47)
             if not positions:
                 del self.partitions[key]["positions"]
         return producers
@@ -1166,6 +1167,12 @@ class Model:
         out from it (docs/per-key-processing.md §9)."""
 
         record = self._partition(asset, partition).setdefault("failures", {"commit_number": -1, "forced": {}})
+        if f.get("start_over"):  # a start-over's failed keys start over (K47): the batch's alone
+            self._drop_failures(asset, partition)
+            record = self._partition(asset, partition)["failures"] = {
+                "commit_number": record["commit_number"],
+                "forced": record.get("forced") or {},
+            }
         keys = f.get("keys") or {}
         if keys.get("files"):
             name = f"@{asset}"
@@ -1175,6 +1182,15 @@ class Model:
         for field in ("counts", "due", "deploy_min", "retry", "passes", "done_forced", "last", "config"):
             if field in f:
                 record[field] = f[field]
+
+    def _drop_failures(self, asset: str, partition: str) -> None:
+        """A per-key partition's failed keys go: their index's files become
+        garbage, and the next write starts a new index (a new life)."""
+
+        index = self.indexes.pop((f"@{asset}", partition), None)
+        if index is not None:
+            self.garbage.extend([index.path(name), self.event_counter] for name in sorted(index.referenced()))
+        self._partition(asset, partition).pop("failures", None)
 
     def _on_KeysRetryRequested(self, e):
         """`solera retry ASSET --failed …`: a forced request, identified by its

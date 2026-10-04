@@ -469,6 +469,17 @@ gets a tombstone. The message lives with the entry, so retention of the
 history (§10) never orphans a failing key's explanation; a systemic
 failure repeats one message, which block compression absorbs.
 
+The failed keys are of one pass's input (K47, `Positions.tla`). A
+**start-over** — a full pass's first batch, after an asset change, a
+reset, a full run — starts them over: the batch reads no prior record,
+and its commit replaces the index (a new life; the old files go to
+garbage) and the record's counts, bounds and retry pass with its own. A
+**reset of the input** (its upstream moved, removed or replaced) drops
+them at the deploy: they failed against keys that are no longer the
+input's. A batch fails only keys it hands the asset; a removal or a
+cleanup's drop is never a failure, and a key failing at its current
+version is failing, not stale.
+
 **Who writes it: the worker, resolved locally.** Failure deltas never go
 to the HTTP resolver. A batch touches at most `batch_size` keys of the
 failed keys, and the worker needs their *prior records*, not just
