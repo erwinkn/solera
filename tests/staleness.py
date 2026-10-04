@@ -531,3 +531,33 @@ class Holdings:
 
     def check(self, keys: set[str]) -> None:
         assert not self.wrong and self.held == keys, (self.wrong, self.trace)
+
+
+class ObservedSets:
+    """The literal observed set (docs/observed-set.md, D126): per consumer
+    partition and keyed input, key -> (version, context), what each batch
+    actually gave its producer — `added`, `updated` and `unchanged` keys at
+    the version they were served at, `removed` keys gone. Observed absent
+    and never observed are one: not in the dict. A plain dict, updated as
+    the spec says; the engine's decode of its observation record must equal
+    it after every commit (`engine.observed`)."""
+
+    def __init__(self):
+        self.sets: dict[tuple, dict[str, tuple]] = {}
+
+    def apply(self, consumer: str, partition: str, param: str, batch, context: dict | None = None) -> None:
+        held = self.sets.setdefault((consumer, partition, param), {})
+        for key in (*batch.added, *batch.updated, *getattr(batch, "unchanged", ())):
+            held[key] = (batch.served.get(key), dict(context or {}))
+        for key in batch.removed:
+            held.pop(key, None)
+
+    def of(self, consumer: str, partition: str, param: str) -> dict[str, tuple]:
+        return dict(self.sets.get((consumer, partition, param), {}))
+
+
+def decoded(engine, consumer: str, partition: str, param: str) -> dict[str, tuple]:
+    """The engine's decode of a keyed input's observation record, as the
+    reference keeps it: key -> (version, context), present keys only."""
+
+    return {k: (o.version, dict(o.context)) for k, o in engine.observed(consumer, partition, param).items()}
