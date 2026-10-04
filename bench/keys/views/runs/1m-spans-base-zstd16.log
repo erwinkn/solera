@@ -1,3 +1,5 @@
   base: 0 s
   commit 1000: 14 MB stored, 54 s
   commit 2000: 15 MB stored, 115 s
+  commit 3000: 23 MB stored, 235 s
+  commit 4000: 33 MB stored, 546 s

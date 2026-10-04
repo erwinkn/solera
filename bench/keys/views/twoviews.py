@@ -35,6 +35,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass, replace
 
+import numpy as np
 from solera import _native
 from solera.keys.index import Changes, FileInfo, IndexState, KeyIndex, Options, Span
 from solera.keys.io import ObjectIO
@@ -450,29 +451,51 @@ class TwoViews:
         if "head" not in state:
             state["head"] = self.index(self.k_runs())
             state["snap"] = self.index([self.snaps[p]], self.base_o)
-            state["buf"], state["snap_after"], state["snap_done"] = [], None, False
-        hk, hg, _, hnext = await state["head"].page(after, limit)
-        hi = hk[-1] if hnext is not None else None
-        buf = [x for x in state["buf"] if after is None or x[0] > after]
-        while not state["snap_done"] and (hi is None or not buf or buf[-1][0] <= hi):
-            ks, gs, _, nxt = await state["snap"].page(state["snap_after"], limit)
-            buf.extend(zip(ks, gs, strict=True))
+            state["bk"], state["bg"] = np.empty(0, "S1"), np.empty(0, np.uint64)
+            state["snap_after"], state["snap_done"] = None, False
+        bk, bg = state["bk"], state["bg"]
+        ahead = None
+        if not state["snap_done"] and len(bk) <= limit:  # the snapshot's next page, beside the head's
+            (hk, hg, _, hnext), ahead = await asyncio.gather(
+                state["head"].page(after, limit), state["snap"].page(state["snap_after"], limit)
+            )
+        else:
+            hk, hg, _, hnext = await state["head"].page(after, limit)
+        hk = np.array(hk, dtype=object).astype(bytes) if hk else np.empty(0, "S1")
+        hg = np.array(hg, dtype=np.uint64)
+        hi = hk[-1] if hnext is not None and len(hk) else None
+        if after is not None and len(bk):
+            keep = bk > after
+            bk, bg = bk[keep], bg[keep]
+        while ahead is not None or (not state["snap_done"] and (hi is None or not len(bk) or bk[-1] <= hi)):
+            if ahead is None:
+                ahead = await state["snap"].page(state["snap_after"], limit)
+            ks, gs, _, nxt = ahead
+            ahead = None
+            if ks:
+                bk = np.concatenate([bk.astype(object), np.array(ks, dtype=object)]).astype(bytes)
+                bg = np.concatenate([bg, np.array(gs, dtype=np.uint64)])
             state["snap_after"], state["snap_done"] = nxt, nxt is None
-        take = [x for x in buf if hi is None or x[0] <= hi]
-        state["buf"] = [x for x in buf if hi is not None and x[0] > hi]
-        snap = dict(take)
-        out = []
-        for k, g in zip(hk, hg, strict=True):
-            was = snap.pop(k, None)
-            if was is None:
-                out.append((k, ADDED, g, 0))
-            elif was != g:
-                out.append((k, UPDATED, g, 0))
-        out += [(k, REMOVED, g, 1) for k, g in snap.items()]
-        out.sort()
+        cut = len(bk) if hi is None else int(np.searchsorted(bk, hi, side="right"))
+        sk, sg = bk[:cut], bg[:cut]
+        state["bk"], state["bg"] = bk[cut:], bg[cut:]
+        # The merge-join, vectorised: both sides sorted, keys distinct.
+        at = np.searchsorted(sk, hk) if len(sk) else np.zeros(len(hk), dtype=np.int64)
+        inside = at < len(sk)
+        found = np.zeros(len(hk), dtype=bool)
+        found[inside] = sk[at[inside]] == hk[inside]
+        changed = ~found
+        changed[found] = sg[at[found]] != hg[found]
+        gone = np.ones(len(sk), dtype=bool)
+        gone[at[found]] = False
+        keys = np.concatenate([hk[changed].astype(object), sk[gone].astype(object)])
+        cls = np.concatenate([np.where(found[changed], UPDATED, ADDED), np.full(int(gone.sum()), REMOVED)]).astype(np.uint8)
+        gens = np.concatenate([hg[changed], sg[gone]])
+        dels = np.concatenate([np.zeros(int(changed.sum()), np.uint8), np.ones(int(gone.sum()), np.uint8)])
+        order = np.argsort(keys.astype(bytes), kind="stable")
         return Changes(
-            [x[0] for x in out], bytes(x[1] for x in out), [x[2] for x in out], bytes(x[3] for x in out),
-            [None] * len(out), hnext,
+            [bytes(k) for k in keys[order]], cls[order].tobytes(), gens[order].tolist(), dels[order].tobytes(),
+            [None] * len(order), hnext,
         )
 
     async def snapshot_changes_of(self, p: int, keys: list[bytes]) -> Changes:
