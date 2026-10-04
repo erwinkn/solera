@@ -1,0 +1,29 @@
+12-digit ids, each file at its own key density
+file	B/entry	index B/entry	decode M/s
+100M: delta of 1K keys (minimal)	5.79	0.020	41.8
+100M: delta of 1K keys (minimal), 16 B payloads	24.94	0.040	25.8
+100M: delta of 1M keys (minimal)	4.55	0.011	47.5
+100M: run of 100 commits (~100K keys)	8.10	0.017	30.6
+100M: run of a day (~8.3M keys)	8.17	0.014	32.9
+100M: run of a day, 16 B payloads	25.59	0.029	23.0
+100M: run of a day, churn 50%	9.33	0.015	24.8
+100M: base	8.07	0.012	29.8
+100M: base, 16 B payloads	25.94	0.026	19.1
+1M: delta of 1K keys (minimal)	5.79	0.020	39.8
+1M: run of 100 commits (~95K keys)	8.11	0.017	33.7
+1M: run of a day (~1M keys)	8.74	0.015	36.6
+1M: base	9.28	0.015	30.3
+
+other keys, at the density of a 100M-key index
+dataset	file	B/entry	index B/entry	encode M/s	decode M/s
+uuids	delta (minimal)	18.30	0.081	10.2	30.8
+uuids	run, a day	23.00	0.091	8.1	24.2
+uuids	run, churn 50%	24.79	0.096	6.1	16.8
+uuids	base	23.78	0.091	8.4	21.1
+paths	delta (minimal)	6.16	0.052	6.9	23.4
+paths	run, a day	9.92	0.061	5.4	15.3
+paths	run, churn 50%	11.74	0.066	5.2	11.4
+paths	base	10.33	0.061	5.5	17.9
+
+merge of 8 runs, ids@100M, one core: 3.7 M entries in/s
+flip parity check: ok
