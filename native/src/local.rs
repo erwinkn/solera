@@ -584,9 +584,15 @@ impl Snapshot {
 
     /// The entries of the merged snapshot, in key order.
     pub fn merge(&self) -> LocalMerge<'_> {
+        self.merge_below(None)
+    }
+
+    /// The merged snapshot as of a reserved endpoint: each key's newest entry
+    /// older than `below` (None: the head).
+    pub fn merge_below(&self, below: Option<u64>) -> LocalMerge<'_> {
         LocalMerge {
             snap: self,
-            merge: Merge::new(self.runs.len()),
+            merge: Merge::below(self.runs.len(), below),
             feed: Feed::new(self.runs.len()),
         }
     }
@@ -602,8 +608,9 @@ impl Snapshot {
         limit: usize,
         drop_deleted: bool,
         max_bytes: u64,
+        below: Option<u64>,
     ) -> Result<(SortedEntries, Option<Vec<u8>>)> {
-        let mut m = self.merge();
+        let mut m = self.merge_below(below);
         if let Some(a) = after {
             m.feed.seek(self, a);
         }
@@ -638,18 +645,25 @@ impl Snapshot {
         after: Option<&[u8]>,
         limit: usize,
         g_p: u64,
-        g_n1: u64,
+        g_n1: Option<u64>,
         max_bytes: u64,
     ) -> Result<spans::Page<(u8, spans::Version)>> {
         let runs = self.runs_from(after);
         let mut held = 0u64;
         let mut over = false;
-        let page = spans::page_of(spans::Groups::of(runs)?, after, None, limit, |vs| {
-            let (class, v) = spans::change(vs, g_p, g_n1)?;
-            held += v.payload.as_ref().map_or(0, |p| p.len() as u64);
-            over |= held > max_bytes;
-            Some((class, v.clone()))
-        })?;
+        let page = spans::page_of(
+            spans::Groups::of(runs)?,
+            after,
+            None,
+            limit,
+            || spans::Changed::new(g_p, g_n1),
+            |c| {
+                let (class, v) = c.finish()?;
+                held += v.payload.as_ref().map_or(0, |p| p.len() as u64);
+                over |= held > max_bytes;
+                Some((class, v))
+            },
+        )?;
         let keys: u64 = page.items.iter().map(|(k, _)| k.len() as u64).sum();
         if over || held + keys > max_bytes {
             return Err(Error::Limit(format!("a page over {max_bytes} bytes")));
@@ -665,7 +679,7 @@ impl Snapshot {
         &self,
         keys: &[&[u8]],
         g_p: u64,
-        g_n1: u64,
+        g_n1: Option<u64>,
         max_bytes: u64,
     ) -> Result<Vec<Option<(u8, spans::Version)>>> {
         let mut out = Vec::with_capacity(keys.len());
@@ -673,12 +687,15 @@ impl Snapshot {
         for &k in keys {
             let mut g = spans::Groups::of(self.runs_at(k))?;
             let mut found = None;
-            while let Some((key, versions)) = g.next_group()? {
+            while let Some(key) = g.peek() {
                 if key.as_slice() < k {
+                    g.next_into(&mut spans::Skip)?;
                     continue;
                 }
                 if key.as_slice() == k {
-                    found = spans::change(&versions, g_p, g_n1).map(|(c, v)| (c, v.clone()));
+                    let mut c = spans::Changed::new(g_p, g_n1);
+                    g.next_into(&mut c)?;
+                    found = c.finish();
                 }
                 break;
             }
@@ -687,6 +704,34 @@ impl Snapshot {
                 if held > max_bytes {
                     return Err(Error::Limit(format!("a page over {max_bytes} bytes")));
                 }
+            }
+            out.push(found);
+        }
+        Ok(out)
+    }
+
+    /// Each of `keys` (sorted, distinct) at a reserved endpoint: its newest
+    /// version older than `below` (None: the head), live or deleted, or None.
+    pub fn lookup_at(
+        &self,
+        keys: &[&[u8]],
+        below: Option<u64>,
+    ) -> Result<Vec<Option<spans::Version>>> {
+        let mut out = Vec::with_capacity(keys.len());
+        for &k in keys {
+            let mut g = spans::Groups::of(self.runs_at(k))?;
+            let mut found = None;
+            while let Some(key) = g.peek() {
+                if key.as_slice() < k {
+                    g.next_into(&mut spans::Skip)?;
+                    continue;
+                }
+                if key.as_slice() == k {
+                    let mut at = spans::At::new(below);
+                    g.next_into(&mut at)?;
+                    found = at.found;
+                }
+                break;
             }
             out.push(found);
         }

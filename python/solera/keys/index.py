@@ -34,7 +34,6 @@ from . import (
     SortedEntries,
     check_block,
     jobs,
-    merge_page,
     parse_footer,
     parse_index,
     parse_tail,
@@ -416,12 +415,67 @@ class _Parsed:
         return blocks[run[0]][1], blocks[run[-1]][1] + blocks[run[-1]][2]
 
 
-async def _scan_local(snap, after, limit: int, keep_deleted: bool, ceiling: int):
-    """A page of local copies as a native run, and its cursor; past `ceiling`
-    bytes of keys and payloads, `Full` — the page could not be kept."""
+class _Lazy:
+    """One span read for a page (`Merge.read`): its files from the block
+    holding `after`, a segment of consecutive blocks at a time, fetched only
+    when the job asks — the first just enough for `want` entries, each next
+    twice the last, up to `jobs.SEGMENT`. Files no key past `after` can be in
+    are skipped. Through the index's caches (`_open`, `_blocks`): a scan's
+    next page reads neither a block index nor a block twice."""
+
+    def __init__(self, index: KeyIndex, files: list[FileInfo], after: bytes | None, want: int):
+        self.index, self.after, self.want = index, after, want
+        self.files = [f for f in files if after is None or f.max > after]
+        self.fi, self.p, self.bi, self.last = 0, None, 0, 0
+        self.start: int | None = None  # where this reader's last segment began
+
+    async def next(self):
+        while self.fi < len(self.files):
+            if self.p is None:
+                self.p = await self.index._open(self.files[self.fi], filters=False)
+                start = bisect.bisect_right(self.p.firsts, self.after) - 1 if self.after is not None else 0
+                self.bi = max(0, start)
+            p = self.p
+            blocks = p.tail["blocks"]
+            if self.bi >= len(blocks):
+                p.window = {}  # read past: the next page starts in a later file
+                self.fi, self.p, self.start, self.last = self.fi + 1, None, None, 0
+                continue
+            i = j = self.bi
+            got, target = 0, min(jobs.SEGMENT, 2 * self.last) if self.last else jobs.SEGMENT
+            while j < len(blocks):
+                size = blocks[j][1] + blocks[j][2] - blocks[i][1]
+                if j > i and (size > target or (not self.last and got >= self.want)):
+                    break
+                got += blocks[j][3]
+                j += 1
+            fetched = await self.index._blocks(p, range(i, j))
+            if p.data is None:
+                # The next page starts in the block holding this one's last key: in
+                # this reader's last segment or the one before, and it reads on into
+                # what earlier pages fetched past it. A block is never paid for twice.
+                keep = self.start if self.start is not None else i
+                p.window = {k: v for k, v in {**p.window, **fetched}.items() if k >= keep}
+                self.start = i
+            self.bi, self.last = j, blocks[j - 1][1] + blocks[j - 1][2] - blocks[i][1]
+            data = b"".join(fetched[k] for k in range(i, j))
+            metas, off = [], 0
+            for k in range(i, j):
+                metas.append((off, len(fetched[k]), blocks[k][4]))
+                off += len(fetched[k])
+            return data, metas, p.tail["codec"]
+        return None
+
+
+async def _scan_local(snap, after, limit: int, keep_deleted: bool, ceiling: int, below: int | None = None):
+    """A page of local copies as a native run (as of generation `below`: None,
+    the head), and its cursor; past `ceiling` bytes of keys and payloads,
+    `Full` — the page could not be kept."""
 
     try:
-        return await in_thread(snap.scan, after, limit, drop_deleted=not keep_deleted, max_bytes=ceiling)
+        return await in_thread(
+            snap.scan, after, limit, drop_deleted=not keep_deleted, max_bytes=ceiling, below=below
+        )
     except LimitError as e:
         raise Full(str(e)) from e
 
@@ -560,9 +614,11 @@ class KeyIndex:
         `at - 1`."""
 
         keys = sorted(set(keys))
-        if at is not None and at <= self.state.head:
-            below = self._endpoint(at)
-            spans = [list(s.files) for s in reversed(self.state.spans) if s.a < at]
+        at, spans, below = self._at(at)
+
+        async def store():
+            if at is None:
+                return (await self._find(SortedEntries.of(keys), switch=False)).live()
             runs, codecs = await self._key_blocks(spans, keys)
             found, generations, deleted, payloads = await in_thread(
                 _native.span_lookup, runs, codecs, keys, below
@@ -571,17 +627,27 @@ class KeyIndex:
                 k: (generations[i], payloads[i]) for i, k in enumerate(keys) if found[i] and not deleted[i]
             }
 
-        async def store():
-            run = SortedEntries.of(keys)
-            return (await self._find(run, switch=False)).live()
-
         async def local(snap, _ceiling):
-            hits = await in_thread(snap.get, keys)
+            hits = (
+                await in_thread(snap.get, keys)
+                if at is None
+                else await in_thread(snap.lookup_at, keys, below)
+            )
             return {
                 k: (h[0], h[2]) for k, h in zip(keys, hits, strict=True) if h is not None and not h[1]
             }, None
 
-        return await self._read("lookup", (keys,), self.state.newest_first(), local, store)
+        return await self._read("lookup", (keys, at), spans, local, store)
+
+    def _at(self, at: int | None):
+        """A read at reserved endpoint `at` — None, or one past the head, is
+        the head: the endpoint the call names, the spans before it, newest
+        first, and the generation bound it reads below."""
+
+        if at is None or at > self.state.head:
+            return None, self.state.newest_first(), None
+        spans = [list(s.files) for s in reversed(self.state.spans) if s.a < at]
+        return at, spans, self._endpoint(at)
 
     # -- reads: local copies, a record, or the store ----------------------------------------
 
@@ -679,15 +745,17 @@ class KeyIndex:
         }
 
     async def _run(self, job: Merge, runs, name=None, rows=None) -> list[FileInfo]:
-        """Drive a streaming job over `runs`; its files are written as `name(n)`.
-        When the `io`'s local copies hold every file of `runs`, the job reads
-        those, not the store."""
+        """Drive a streaming job over `runs`; its files are written as `name(n)`
+        (with no `name`, counted and discarded). When the `io`'s local copies
+        hold every file of `runs`, the job reads those, not the store."""
 
         local = getattr(self.io, "local", None)
 
         files: dict[int, FileInfo] = {}
 
         async def put(n: int, data: bytes):
+            if name is None:
+                return
             await self.io.write(self.path(name(n)), data)
             files[n] = FileInfo.describe(name(n), data)
             if self.on_write is not None:
@@ -782,63 +850,30 @@ class KeyIndex:
 
     # -- scans: the full pass ---------------------------------------------------------------
 
-    async def _window(self, spans: list[list[FileInfo]], after: bytes | None, limit: int):
-        """The blocks a page of keys > `after` needs from each sorted run of
-        `spans` (newest first), and the bound below which they hold every
-        entry of every run: `(runs, codecs, bound)`, `bound` None at the end.
+    async def _read_page(self, spans: list[list[FileInfo]], after: bytes | None, limit: int, **read):
+        """One page of a span read over `spans` (newest first) past `after`
+        (`Merge.read`'s `changes`, or `bound` and `drop_deleted`): keys,
+        classes, generations, deleted flags, payloads, and the cursor (None
+        when done). Each span is read lazily from the block holding `after`,
+        as far as the page needs: a key whose versions run across blocks and
+        files is followed to its end, so every page but the last advances,
+        holding a few segments and one key's fold (A17 R2, R10)."""
 
-        Files are chosen from their metadata before anything is read — per
-        run, only those covering the next `limit` entries — and only their
-        block indexes are read, never their filters. A span's file may hold a
-        key several times, its versions crossing into the next block or file:
-        the bound is exclusive, so a key it equals is left to the next page."""
-
-        chosen, bound = [], None
-        for span in spans:
-            got = 0
-            for f in sorted(span, key=lambda f: f.min):
-                if after is not None and f.max <= after:
-                    continue
-                if got > limit:
-                    # Everything below this file's first key is complete in the chosen ones.
-                    bound = f.min if bound is None else min(bound, f.min)
-                    break
-                chosen.append(f)
-                # A file the cursor falls inside may have nothing left past it: count only whole files.
-                got += f.entries if after is None or f.min > after else 0
-        parsed = await asyncio.gather(*(self._open(f, filters=False) for f in chosen))
-        windows = []
-        for p in parsed:
-            blocks = p.tail["blocks"]
-            start = max(0, bisect.bisect_right(p.firsts, after) - 1) if after is not None and blocks else 0
-            end, got = start, 0
-            # Enough blocks for `limit` entries, and at least one block past the
-            # one holding `after`, so every call makes progress.
-            while end < len(blocks) and (got < limit + 1 or end - start < 2):
-                got += blocks[end][3]
-                end += 1
-            windows.append(range(start, end))
-            if end < len(blocks):
-                nxt = blocks[end][0]  # everything below the next unfetched block is complete
-                bound = nxt if bound is None else min(bound, nxt)
-        fetched = await asyncio.gather(
-            *(self._blocks(p, window) for p, window in zip(parsed, windows, strict=True))
-        )
-        runs = []
-        for p, window, got in zip(parsed, windows, fetched, strict=True):
-            runs.append([got[i] for i in window])
-            if p.data is None:
-                p.window = got  # the next page starts in it: a file never pays for the same block twice
-        return runs, [p.tail["codec"] for p in parsed], bound
-
-    @staticmethod
-    def _cursor(n: int, limit: int, last, after, more: bool, bound):
-        """Where the next page starts: the last key examined, or None when done."""
-
-        cursor = last if last is not None else after
-        if n == limit:  # full: more past it, or past the fetched blocks
-            return cursor if more or bound is not None else None
-        return cursor if bound is not None else None
+        job = Merge.read(len(spans), after=after, limit=limit, **read)
+        readers = [_Lazy(self, files, after, limit + 1) for files in spans]
+        page = None
+        while (step := await in_thread(job.step)) is not None:
+            kind, x = step
+            if kind == "run":
+                seg = await readers[x].next()
+                if seg is None:
+                    job.end(x)
+                else:
+                    job.feed(x, *seg)
+            else:
+                page = x
+        ks, cs, gs, ds, ps, last, more = page
+        return ks, cs, gs, ds, ps, (last if more else None)
 
     async def _scan(
         self, spans: list[list[FileInfo]], after: bytes | None, limit: int, drop_deleted: bool, below=None
@@ -848,39 +883,17 @@ class KeyIndex:
         `below` (the view at a reserved endpoint) — and the cursor to
         continue from (`None` when the view is exhausted)."""
 
-        # Natively, off the loop: the merge stops at the page, never building the rest.
-        below = 2**64 - 1 if below is None else below
-        (keys, generations, deleted, payloads, last, more), bound = await self._windowed(
-            spans,
-            after,
-            limit,
-            lambda runs, codecs, bound: in_thread(
-                merge_page, runs, codecs, after, bound, limit, drop_deleted, below
-            ),
+        ks, _, gs, ds, ps, cursor = await self._read_page(
+            spans, after, limit, bound=below, drop_deleted=drop_deleted
         )
-        return keys, generations, deleted, payloads, self._cursor(len(keys), limit, last, after, more, bound)
+        return ks, gs, ds, ps, cursor
 
-    async def _windowed(self, spans: list[list[FileInfo]], after: bytes | None, limit: int, read):
-        """`read(runs, codecs, bound)` over the window of a page past `after`,
-        and the window's bound. A window holds `limit` entries, but a key's
-        versions may fill it and run past its bound — no key in it complete,
-        nothing examined (A17: a page empty, its cursor stuck). Then the
-        window widens until one key is whole, or nothing bounds it."""
-
-        want = limit
-        while True:
-            runs, codecs, bound = await self._window(spans, after, want)
-            out = await read(runs, codecs, bound)
-            if out[-2] is not None or bound is None:  # a key examined, or the window is the rest
-                return out, bound
-            want *= 4
-
-    def _endpoint(self, at: int) -> int:
+    def _endpoint(self, at: int) -> int | None:
         """The generation a read at reserved endpoint `at` (the state after
-        commit `at - 1`) takes as its bound."""
+        commit `at - 1`) takes as its bound; None past the head: no bound."""
 
         if at > self.state.head:
-            return 2**64 - 1
+            return None
         g = self.state.generation(at)
         if g is None:
             raise LookupError(f"commit {at} is not an endpoint of this index")
@@ -891,23 +904,20 @@ class KeyIndex:
         and payloads, and the next cursor (`None` when done). With `at`, as
         of that reserved endpoint: the state after commit `at - 1`."""
 
-        if at is not None and at <= self.state.head:
-            below = self._endpoint(at)
-            spans = [list(s.files) for s in reversed(self.state.spans) if s.a < at]
-            keys, generations, _, payloads, nxt = await self._scan(spans, after, limit, True, below)
-            return keys, generations, payloads, nxt
-        spans = self.state.newest_first()
+        at, spans, below = self._at(at)
 
         async def store():
-            keys, generations, _, payloads, nxt = await self._scan(spans, after, limit, drop_deleted=True)
+            keys, generations, _, payloads, nxt = await self._scan(spans, after, limit, True, below)
             return keys, generations, payloads, nxt
 
         async def local(snap, ceiling):
-            page, nxt = await _scan_local(snap, after, limit, False, ceiling)
+            page, nxt = await _scan_local(snap, after, limit, False, ceiling, below)
             keys, generations, _, payloads = page.entries()
             return (keys, generations, payloads, nxt), page
 
-        return await self._read("page", (after, limit), spans, local, store)
+        # Each is one recorded call, `at` among its arguments: served from the
+        # engine's record, or recorded (D93: a full pass reads its pinned snapshot).
+        return await self._read("page", (after, limit, at), spans, local, store)
 
     # -- changes(P -> N) --------------------------------------------------------------------
 
@@ -996,15 +1006,7 @@ class KeyIndex:
                     [ps[i] for i in picked],
                     None,
                 )
-            (ks, cs, gs, ds, ps, last_key, more), bound = await self._windowed(
-                spans,
-                after,
-                limit,
-                lambda runs, codecs, bound: in_thread(
-                    _native.span_changes, runs, codecs, after, bound, limit, g_p, g_n1
-                ),
-            )
-            return clipped(ks, cs, gs, ds, ps, self._cursor(len(ks), limit, last_key, after, more, bound))
+            return clipped(*await self._read_page(spans, after, limit, changes=(g_p, g_n1)))
 
         async def local(snap, ceiling):
             try:
@@ -1018,9 +1020,7 @@ class KeyIndex:
                 )
             except LimitError as e:
                 raise Full(str(e)) from e
-            return clipped(
-                ks, cs, gs, ds, ps, self._cursor(len(ks), limit, last_key, after, more, None)
-            ), None
+            return clipped(ks, cs, gs, ds, ps, last_key if more else None), None
 
         return await self._read("changes", (first, last, after, limit, keys, until), spans, local, store)
 
@@ -1081,17 +1081,25 @@ class KeyIndex:
 
     # -- merges (docs/key-index-design.md § The merge policy) -----------------------------------
 
-    def plan_merge(self, endpoints: set[int], *, lane: str = "any", busy: frozenset = frozenset()):
+    def plan_merge(
+        self,
+        endpoints: set[int],
+        *,
+        lane: str = "any",
+        busy: frozenset = frozenset(),
+        rejected: frozenset = frozenset(),
+    ):
         """The next merge, `(start, count)` of adjacent spans, or None. `lane`:
         "base" plans only merges into the base, "tail" only the others; `busy`
-        names the spans `(a, b)` a merge under way holds. Every merge obeys
+        names the spans `(a, b)` a merge under way holds; `rejected` the span
+        rewrites (`rewrite_key`) found to drop too little. Every merge obeys
         the guard; below the span cap, the read rule; past it, the cheapest
         guarded window merges whatever the read rule says."""
 
         sp = list(self.state.spans)
         if lane == "base" and busy:
             sp = sp[: next((i for i, s in enumerate(sp) if (s.a, s.b) in busy), len(sp))]
-        policy = _Policy(sp, endpoints, self.o)
+        policy = _Policy(sp, endpoints, self.o, rejected)
         if lane != "tail":
             plan = policy.into_base()
             if plan is not None or lane == "base":
@@ -1102,12 +1110,7 @@ class KeyIndex:
             plan = policy.forced(free)
         return plan
 
-    async def merge(self, plan: tuple[int, int], endpoints: set[int], *, epoch: int = 0) -> SpanMerged | None:
-        """Run merge `plan`: the spans it names merged into one, keeping the
-        versions the live `endpoints` see. Returns what publishing it takes,
-        or None for a span rewritten alone that would not drop a quarter of
-        its entries (its output is deleted: nothing to publish)."""
-
+    def _merge_job(self, plan: tuple[int, int], endpoints: set[int]):
         lo, count = plan
         ins = self.state.spans[lo : lo + count]
         a, b = ins[0].a, ins[-1].b
@@ -1115,25 +1118,56 @@ class KeyIndex:
         gens = [self.state.generation(e) for e in ends]
         if any(g is None for g in gens):
             raise ValueError(f"endpoints {ends} do not all start a span or a segment of {a}..{b}")
-        start = ins[0].starts[0]
-        runs = [list(s.files) for s in reversed(ins)]
-        job = Merge.spans(len(runs), endpoints=gens, base=a == 0, **self._writer())
+        job = Merge.spans(count, endpoints=gens, base=a == 0, **self._writer())
+        return job, ins, ends, gens, [list(s.files) for s in reversed(ins)]
+
+    async def drops_enough(self, plan: tuple[int, int], endpoints: set[int]) -> bool:
+        """Whether a span rewritten alone would drop a quarter of its entries
+        (the guard's other half), counted by its merge writing nothing: a
+        rewrite that would not is never uploaded (A17 R7)."""
+
+        job, ins, _, _, runs = self._merge_job(plan, endpoints)
+        await self._run(job, runs, None)
+        return sum(job.segments) * 4 <= sum(s.entries for s in ins) * 3
+
+    async def merge(
+        self, plan: tuple[int, int], endpoints: set[int], *, epoch: int = 0, checked: bool = False
+    ) -> SpanMerged | None:
+        """Run merge `plan`: the spans it names merged into one, keeping the
+        versions the live `endpoints` see. Returns what publishing it takes,
+        or None for a span rewritten alone that would not drop a quarter of
+        its entries — found by `drops_enough` first, unless `checked` says
+        that was done: nothing is uploaded for it."""
+
+        lo, count = plan
+        if count == 1 and not checked and not await self.drops_enough(plan, endpoints):
+            return None
+        job, ins, ends, gens, runs = self._merge_job(plan, endpoints)
+        a, b = ins[0].a, ins[-1].b
         stamp = ulid()
         # Named by the merging engine's epoch: the orphan collector of an engine
         # since fenced, whose epoch is lower, never takes it for its own.
         files = await self._run(job, runs, lambda n: f"m{a:012d}-{b:012d}-{epoch:06d}-{stamp}.{n:04d}")
         counts = job.segments
-        out = Span(a, b, (start,) + tuple(zip(ends, gens, strict=True)), tuple(files), tuple(counts))
-        written = sum(counts)
-        read = sum(s.entries for s in ins)
-        if (
-            count == 1 and written * 4 > read * 3
-        ):  # the guard's other half: drop a quarter, or publish nothing
-            await self.io.delete([self.path(f.name) for f in files])
-            return None
-        return SpanMerged(
-            [(s.a, s.b) for s in ins], [[f.name for f in s.files] for s in ins], out, read, written
+        out = Span(
+            a, b, (ins[0].starts[0],) + tuple(zip(ends, gens, strict=True)), tuple(files), tuple(counts)
         )
+        return SpanMerged(
+            [(s.a, s.b) for s in ins],
+            [[f.name for f in s.files] for s in ins],
+            out,
+            sum(s.entries for s in ins),
+            sum(counts),
+        )
+
+    @staticmethod
+    def rewrite_key(span: Span, endpoints: set[int]) -> str:
+        """What names a span's rewrite: its files and the live endpoints
+        inside it. A rewrite found to drop too little is not tried again
+        until one of them changes."""
+
+        live = sorted(c for c, _ in span.starts[1:] if c in endpoints)
+        return ",".join(f.name for f in span.files) + "|" + ",".join(map(str, live))
 
 
 CLASSES = {(False, True): 0, (True, True): 1, (True, False): 2, (False, False): 3}
@@ -1192,8 +1226,8 @@ class _Policy:
     merge would put inside its output (in bytes), the triggers — into the
     base, four alike, stragglers — and, past the span cap, forced merges."""
 
-    def __init__(self, spans: list[Span], endpoints: set[int], o: Options):
-        self.sp, self.live, self.o = spans, endpoints, o
+    def __init__(self, spans: list[Span], endpoints: set[int], o: Options, rejected: frozenset = frozenset()):
+        self.sp, self.live, self.o, self.rejected = spans, endpoints, o, rejected
         self.entries = [max(s.entries, 1) for s in spans]
 
     def guarded(self, lo: int, count: int) -> bool:
@@ -1273,6 +1307,8 @@ class _Policy:
                             return lo, count
         for j in range(1, len(sp)):  # versions no live endpoint sees any more
             s = sp[j]
+            if KeyIndex.rewrite_key(s, self.live) in self.rejected:
+                continue  # found to drop too little, and nothing changed since
             if free[j] and any(c not in self.live for c, _ in s.starts[1:]):
                 dead = sum(
                     n

@@ -131,11 +131,19 @@ class Staleness:
         return False
 
     async def upstream_stale(self, asset: str, partition: str, planner, inputs, memo: dict) -> bool:
-        """A partition it reads is itself stale, to any depth (K46)."""
+        """A partition it reads is itself stale, to any depth (K46). Along an
+        each chain, only through a stale upstream key its patterns take: a
+        key depends on its own upstream key and nothing else (A19 R10)."""
 
+        each = self._each_input(asset)
         for input in inputs:
             for upstream in self._upstreams(planner, input):
-                if input.owner is not None and await self.stale_reasons(input.owner, upstream, memo):
+                if input.owner is None or not await self.stale_reasons(input.owner, upstream, memo):
+                    continue
+                if each is None or input.param != each[0] or self._each_input(input.owner) is None:
+                    return True  # every key depends on it
+                taken = Matcher(each[1].get("patterns"))
+                if any(taken(k) for k in await self._each_keys(input.owner, upstream, {})):
                     return True
         return False
 
@@ -359,10 +367,11 @@ class Staleness:
         since_change = int(under_way.get("began") or 0) >= changed  # a pass under the definition as it is
         up_state = self.m.indexes.get((input.output, input.partition))
         if only == DEFINITION:
-            old = [
-                k async for k, g, _ in _entries(self, self.m.indexes.get((output, partition))) if g < changed
-            ]
-            return {k for k in old if taken(k)} & await self._holds(up_state, old)
+            held = [(k, g) async for k, g, _ in _entries(self, self.m.indexes.get((output, partition)))]
+            old = [k for k, g in held if g < changed]
+            # A key the patterns no longer take is owed its removal (A19 R9).
+            dropped = {k for k, _ in held if not taken(k)}
+            return ({k for k in old if taken(k)} & await self._holds(up_state, old)) | dropped
         input_only = only == INPUT
         definition = not input_only and self.definition_changed(asset, partition)
         # An upstream reset drops the position: one with no full pass under way delivered what replaced it.

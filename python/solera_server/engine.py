@@ -53,7 +53,7 @@ from .attempts import POOL_OFFERED_GRACE, Attempts, Live, current_names, worker_
 from .executors import PlacementContext, Registry
 from .history import MAX_METADATA, History, RunFilter
 from .keyservice import KeyService, cache_root
-from .model import TERMINAL_RUN, _delta_files, commit_of
+from .model import TERMINAL_RUN, _delta_files, commit_of, declaration
 from .positions import advance, continues, outstanding, reads, selects
 from .sensors import Sensors
 from .staleness import Staleness
@@ -88,16 +88,18 @@ def _batches(keys: int, limit: int) -> int:
     return max(1, -(-int(keys) // max(1, int(limit))))
 
 
-def _dep_restart(position: dict | None, moved_at: int | None) -> bool:
-    """Whether a whole or dep input that moved past the partition's `seen`
-    (at event `moved_at`) makes this input start a full pass over: unless
-    one began since the move (`began`, kept on the position after the pass
-    ends) — under way, it continues; done, what is left (a per-key
-    reconcile) finishes it."""
+def _dep_restart(position: dict | None, shared: dict | None) -> bool:
+    """Whether a whole or dep input at another version than the partition
+    caught up to (`shared["caught_up"]`; none recorded counts as another,
+    F37) makes this input start a full pass over: unless its last full pass
+    began under the versions as they are now (`seen` on the position, kept
+    after the pass ends) — under way, it continues; done, what is left (a
+    per-key reconcile) finishes it. Judged on the versions a pass began
+    under, never on the order of commits (A19 R7)."""
 
-    if moved_at is None or position is None:
+    if not shared or not shared["now"] or shared["caught_up"] == shared["now"] or position is None:
         return False
-    return int(position.get("began") or 0) < moved_at
+    return position.get("seen") != shared["now"]
 
 
 class Engine(Attempts, Sensors, Staleness, Views):
@@ -843,18 +845,14 @@ class Engine(Attempts, Sensors, Staleness, Views):
                 pins[param] = {"ref": self._pin_at(output, input.partition), "load": load}
                 if load == "data" and (index := self._whole_index(output, pins[param]["ref"])) is not None:
                     pins[param]["index"] = index
-        fingerprint = self._fingerprint(asset, run)
+        fingerprint = self._fingerprint(task["asset"], run)
         # The whole and dep inputs as pinned now, against those the partition last caught
         # up to: one moved since makes a full pass due (semantic change d), from its commit.
         # Never caught up, no record says what it saw: their latest commit, so a pass begun
         # before it starts over and redoes what it wrote under the old ones (F37).
         seen = {i.param: self._input_version(planner, i) for i in inputs if self._versioned(i)}
         recorded = self.m.partition(task["asset"], partition).get("seen")
-        moved_at = (
-            max(self._committed(planner, i) for i in inputs if self._versioned(i))
-            if seen and recorded != seen
-            else None
-        )
+        shared = {"now": seen, "caught_up": recorded}
         if full and run["mode"] == "full" and incremental:
             # This run's reset began the pass every input is on: resume it, batch by batch.
             started = [
@@ -880,7 +878,7 @@ class Engine(Attempts, Sensors, Staleness, Views):
                 full,
                 (claim or {}).get("generation"),
                 (ahead or {}).get(param),
-                moved_at,
+                shared,
             )
             if plan["kind"] == "selection":  # its read-ahead entry names the attempt's spec
                 plan.update(run=run["id"], attempt=attempt)
@@ -964,7 +962,7 @@ class Engine(Attempts, Sensors, Staleness, Views):
             # The version of each whole or dep input read: a catch-up records it, and a
             # partition whose inputs moved since is stale (docs/positions-from-reads.md).
             "seen": seen,
-            "declaration": digest(self._declaration(asset)),
+            "declaration": digest(self._declaration(task["asset"])),
             "prefixes": self._prefixes(pins, outputs, task),
             "inputs": pins,
             "lineage": lineage,
@@ -1107,7 +1105,7 @@ class Engine(Attempts, Sensors, Staleness, Views):
         override,
         ahead,
         began,
-        moved_at,
+        shared,
     ):
         """A keys= selection of a keyed incremental input (K43, K45): the pin
         for the spec, the plan its commit `advance`s by, and whether it has
@@ -1122,7 +1120,9 @@ class Engine(Attempts, Sensors, Staleness, Views):
           reset, a log that no longer holds the delta) or under way: it starts
           that pass over with the named keys, or continues it; recorded like
           any read-ahead entry, with the pass as its base.
-        - A pattern change under way: the named keys merged, recorded nowhere.
+        - A pattern change under way: the named keys merged, recorded like any
+          read-ahead entry, which the old patterns' delta and the membership diff
+          consult (A19 R4).
 
         Either plain kind collapses the record once nothing under the patterns
         is left undelivered (`covers`, the worker's)."""
@@ -1146,7 +1146,7 @@ class Engine(Attempts, Sensors, Staleness, Views):
         fresh = (
             position is not None
             and position.get("fingerprint") == fingerprint
-            and not _dep_restart(position, moved_at)
+            and not _dep_restart(position, shared)
             and (
                 position.get("next") is None
                 or int(position["next"]) > head_commit
@@ -1154,17 +1154,22 @@ class Engine(Attempts, Sensors, Staleness, Views):
             )
         )
         pass_ = (position or {}).get("pass") or {}
+        if position is not None and len(position.get("ahead", ())) >= self.read_ahead_cap:
+            raise NonRetryable(f"{task['asset']}: {self.READ_AHEAD_FULL}")
         if fresh and (position.get("patterns") != input.get("patterns") or "pattern_change" in position):
-            # A pattern change decides membership first: merged, recorded nowhere. A named
-            # key is updated if the consumer held it: the old patterns took it at `next` (K44).
+            # A pattern change decides membership first: the named keys merged, and recorded
+            # like any read-ahead, so neither the old patterns' delta nor the membership diff
+            # delivers them again (A19 R4, D93); the change goes on as it was. A named key is
+            # updated if the consumer held it: the old patterns took it at `next` (K44).
             held_at = position.get("next")
             pin["batch"]["held_at"] = {
                 "next": int(held_at) if held_at is not None else None,
                 "patterns": position.get("patterns"),
             }
+            if ahead:
+                pin["ahead"] = ahead
+            plan = {**plan, "position": position, "merge": True}
             return pin, plan, not keys
-        if position is not None and len(position.get("ahead", ())) >= self.read_ahead_cap:
-            raise NonRetryable(f"{task['asset']}: {self.READ_AHEAD_FULL}")
         if ahead and fresh:  # a start-over owes every key again: what was read before is not of it
             pin["ahead"] = ahead
         if fresh and pass_.get("mode") != "full":
@@ -1189,6 +1194,8 @@ class Engine(Attempts, Sensors, Staleness, Views):
                 "pass": {"mode": "full", "from": head_commit + 1, "at": None, "batch": 0, "began": began},
                 "began": began,  # the last full pass's start, kept after it ends
             }
+            if (shared or {}).get("now"):  # and the whole and dep versions it began under
+                base["seen"] = shared["now"]
             if (position or {}).get("ahead"):  # kept: what keys were read, if under another definition
                 base["ahead"] = position["ahead"]
             base["pass"]["batches"] = _batches(index.count, limit)
@@ -1224,7 +1231,7 @@ class Engine(Attempts, Sensors, Staleness, Views):
         full,
         claim_generation=None,
         ahead=None,
-        moved_at=None,
+        shared=None,
     ):
         """Plan one Incremental input's batch from its position (`pass`):
         returns the pin for the spec, the plan its commit `advance`s the
@@ -1269,7 +1276,7 @@ class Engine(Attempts, Sensors, Staleness, Views):
                 override,
                 ahead,
                 began,
-                moved_at,
+                shared,
             )
         first = int(head.get("base", 0))
         # A `full` run or a keys="full" override starts one pass per run, which the
@@ -1283,7 +1290,7 @@ class Engine(Attempts, Sensors, Staleness, Views):
             or position is None
             or position.get("fingerprint") != fingerprint
             or again
-            or _dep_restart(position, moved_at)
+            or _dep_restart(position, shared)
         )
         if not reset and not keyed:
             under_way = position.get("pass")
@@ -1295,10 +1302,12 @@ class Engine(Attempts, Sensors, Staleness, Views):
             "fingerprint": fingerprint,
             "reset_by": run["id"] if reset else position.get("reset_by"),
         }
-        if reset:  # a full pass begins: when, kept after it ends (semantic change d)
+        if reset:  # a full pass begins: when, and under which shared versions, kept after it ends
             carried["began"] = began
-        elif position.get("began") is not None:
-            carried["began"] = position["began"]
+            if (shared or {}).get("now"):
+                carried["seen"] = shared["now"]
+        else:
+            carried.update({k: position[k] for k in ("began", "seen") if k in position})
         if position is not None and position.get("ahead"):  # a start-over keeps them too, before `began`
             carried["ahead"] = position["ahead"]
         current = None if reset else position.get("pass")
@@ -1357,6 +1366,8 @@ class Engine(Attempts, Sensors, Staleness, Views):
                         "count": current["batches"],
                     },
                 }
+                if ahead:  # what selections merged meanwhile: not delivered again (A19 R4)
+                    pin["ahead"] = ahead
                 if carried["patterns"] is None:
                     carried.pop("patterns")
                 return pin, {"kind": "keys", "position": carried, "pass": current, "head": latest}, False
@@ -1660,33 +1671,32 @@ class Engine(Attempts, Sensors, Staleness, Views):
         floor = self.m.pin_floor(but=attempt, path=self.m.index(output, partition).prefix)
         return [e for e in entries if e["n"] <= floor and not e.get("stuck")][:DISCARDS]
 
-    def _fingerprint(self, asset, run):
-        """H(the declaration — version, the store version of each output it
-        writes and reads, migrations — and the run's config): the
-        interpretation its positions were delivered under; a change resets
-        them (§2.2, §6). Not its inputs' versions: a whole or dep input that
+    def _fingerprint(self, asset: str, run) -> str:
+        """H(the definition — `model.declaration`, its inputs' bindings
+        included, without patterns and batch size — and the run's config):
+        the interpretation its positions were delivered under; a change
+        resets them (§2.2, §6), so binding an input to another output makes
+        a full pass due (A19 R7). Not its inputs' versions: a whole or dep input that
         moves is an input change, which makes a full pass due through the
         partition record's `seen` (semantic change d). Neither which store
         holds an output nor its name is in it, only the versions: a move
         resets the output, and every position that reads it or is its
         asset's (`Model._reset`); a rename keeps everything."""
 
-        return digest({**self._declaration(asset), "config": run.get("config") or {}})
-
-    def _declaration(self, asset: dict) -> dict:
-        """What of an asset's declaration its outputs are built under: its
-        version, the versions of the stores it writes and reads, its
-        migrations. A change makes a full pass due: an attempt claimed
-        before it does not commit (Positions.tla; docs/positions-from-reads.md).
-        Not its name: a rename keeps everything."""
-
-        names = {o["name"] for o in asset["outputs"]} | {i["output"] for i in asset["inputs"].values()}
-        outputs, stores = self.manifest["outputs"], self.manifest["stores"]
-        return {
-            "version": asset["version"],
-            "stores": sorted(stores[outputs[n]["store"]]["version"] for n in names | set(asset["deps"])),
-            "migrations": {o["name"]: o["migrations"] for o in asset["outputs"] if o.get("migrations")},
+        definition = self._declaration(asset)
+        # Patterns are diffed, a batch size only pages: neither starts a position over.
+        definition["inputs"] = {
+            p: {k: v for k, v in i.items() if k not in ("patterns", "batch_size")}
+            for p, i in definition["inputs"].items()
         }
+        return digest({**definition, "config": run.get("config") or {}})
+
+    def _declaration(self, asset: str) -> dict:
+        """The asset's canonical definition (`model.declaration`): a change makes a
+        full pass due, and an attempt claimed before it does not commit
+        (Positions.tla; docs/positions-from-reads.md). A rename keeps everything."""
+
+        return declaration(self.manifest, asset, self.m.homes)
 
     # -- the placement loop (§10) ---------------------------------------------------
 
@@ -1740,7 +1750,7 @@ class Engine(Attempts, Sensors, Staleness, Views):
         current = self.manifest["assets"].get(task["asset"])
         if current is not None and prepared.get("declaration") not in (
             None,
-            digest(self._declaration(current)),
+            digest(self._declaration(task["asset"])),
         ):
             raise Conflict(f"asset {task['asset']} changed since this attempt launched")
         outputs = current_names(prepared, result.get("outputs") or {})

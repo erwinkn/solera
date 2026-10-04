@@ -801,7 +801,6 @@ async def test_a_keys_selection_runs_batch_size_keys_at_a_time(state, tmp_path):
     assert live["max"] <= 2 and sum(len(a) for a in detail["attempts"].values()) == 3, live
 
 
-@a19("R7")
 async def test_binding_a_whole_input_to_another_head_rebuilds_every_key(state, tmp_path):
     """A19 R7: `checks` reads factor=In(low) (1); a deploy binds it to
     In(high) (10), committed before the last pass began. The binding is the

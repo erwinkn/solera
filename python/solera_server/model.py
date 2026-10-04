@@ -169,6 +169,7 @@ class Model:
             "project": self.project,
             "heads": _nest(self.heads, 2),
             "indexes": _nest({k: v.to_json() for k, v in self.indexes.items()}, 2),
+            "merges": _nest(self.merges, 2),
             "garbage": self.garbage,
             "deleted": self.deleted,
             "partitions": _nest(self.partitions, 2),
@@ -199,6 +200,11 @@ class Model:
         self.indexes: dict[tuple, IndexState] = {
             k: IndexState.from_json(v) for k, v in _flatten(snap.get("indexes"), 2).items()
         }
+        # (output, partition) -> what merges of the index's current life tried
+        # (docs/key-index-design.md § The write bound): `life`, `attempts` by
+        # input files (uploads, failed or abandoned, none published) and the
+        # span rewrites found to drop too little (`rejected`).
+        self.merges: dict[tuple, dict] = _flatten(snap.get("merges"), 2)
         # [path, n]: files nothing references since the n-th event applied
         self.garbage: list[list] = snap.get("garbage") or []
         # deleted runs whose directories are still to be deleted (§11)
@@ -567,7 +573,7 @@ class Model:
             self.deploy_number += 1
         previous = (self.manifest or {}).get("outputs") or {}
         assets_before = set((self.manifest or {}).get("assets") or ())
-        declared_before = {a: _declared(self.manifest, a) for a in assets_before}
+        declared_before = {a: declaration(self.manifest, a, self.homes) for a in assets_before}
         self.deploy, self.manifest, self.project = e["deploy"], manifest, e.get("project")
         renamed, output_map = self._apply_aliases(manifest)
         self._reconcile_tasks(manifest, renamed, output_map, e["at"])
@@ -579,7 +585,7 @@ class Model:
         for asset in manifest["assets"]:
             olds = [a for a in renamed.get(asset, ()) if a in declared_before]  # renamed by this deploy
             before = declared_before.get(asset, declared_before.get(olds[0]) if olds else None)
-            if before is None or olds or before != _declared(manifest, asset) or asset in reset:
+            if before is None or olds or before != declaration(manifest, asset, self.homes) or asset in reset:
                 self.changed_at[asset] = self.event_counter
         self._unsubscribe()
         automations = {}
@@ -1468,6 +1474,55 @@ class Model:
         for name in sorted(before.referenced() - index.referenced()):
             self.garbage.append([before.path(name), self.event_counter])
 
+    def merge_record(self, key: tuple, life: str) -> dict:
+        """What merges of this index's life `life` tried: another life's count
+        for nothing (A17 R8)."""
+
+        rec = self.merges.get(key)
+        return (
+            rec if rec is not None and rec["life"] == life else {"life": life, "attempts": {}, "rejected": []}
+        )
+
+    def _merge_record(self, key: tuple, life: str) -> dict:
+        rec = self.merge_record(key, life)
+        self.merges[key] = rec
+        return rec
+
+    def _on_MergeAttempted(self, e):
+        """A merge of these input files is about to upload: counted before it
+        does, whatever comes of it."""
+
+        rec = self._merge_record((e["output"], e["partition"]), e["life"])
+        rec["attempts"][e["inputs"]] = rec["attempts"].get(e["inputs"], 0) + 1
+
+    def _on_MergeRejected(self, e):
+        """A span rewrite found, without uploading, to drop too little: not
+        tried again until its files or the endpoints inside it change."""
+
+        rec = self._merge_record((e["output"], e["partition"]), e["life"])
+        if e["rewrite"] not in rec["rejected"]:
+            rec["rejected"].append(e["rewrite"])
+
+    def _prune_merges(self, key: tuple) -> None:
+        """Forget what merges tried of files the index no longer holds, and
+        another life's record."""
+
+        rec, index = self.merges.get(key), self.indexes.get(key)
+        if rec is None:
+            return
+        if index is None or rec["life"] != index.life:
+            del self.merges[key]
+            return
+        held = index.referenced()
+        rec["attempts"] = {
+            k: n
+            for k, n in rec["attempts"].items()
+            if all(f in held for f in k.replace(";", ",").split(",") if f)
+        }
+        rec["rejected"] = [
+            r for r in rec["rejected"] if all(f in held for f in r.split("|")[0].split(",") if f)
+        ]
+
     def _on_IndexMerged(self, e):
         """A merge of adjacent spans published: installed if the index is the
         life it was planned against and still holds exactly its inputs; else
@@ -1484,8 +1539,10 @@ class Model:
         if index is None or index.life != e["life"] or not index.holds(e["inputs"], e["names"]):
             prefix = e.get("prefix") or (index.prefix if index is not None else "")
             self.garbage.extend([f"{prefix}{f.name}.kx", self.event_counter] for f in span.files)
+            self._prune_merges(key)
             return
         self._replace_index(key, index.merged([tuple(r) for r in e["inputs"]], span))
+        self._prune_merges(key)
 
     def _on_FilesCleanedUp(self, e):
         gone = set(e["paths"])
@@ -1585,24 +1642,40 @@ class Model:
         self.deleted = [r for r in self.deleted if r not in gone]
 
 
-def _declared(manifest: dict | None, asset: str) -> str:
-    """What of an asset's declaration its outputs depend on, as one string:
-    its version and deps, its inputs (upstream, kind, patterns, batch
-    size), its outputs with their store's version, not its name — which
-    store holds an output is the reset rule's (§2). A difference makes the
-    deploy an asset change; its docs, automations, placement, retries,
-    timeout, tags or retention do not."""
+def declaration(manifest: dict, asset: str, homes: dict | None = None) -> dict:
+    """An asset's definition, in its one canonical form (A19 R7): what its
+    outputs are built under. Its version; its inputs and deps — what each
+    reads, by that output's home, so a rename changes nothing; how (kind,
+    flags, patterns, batch size); and its store's version; its outputs'
+    declarations (key, incremental, migrations, config) and store versions,
+    not their names, nor which store holds them — that is the reset rule's
+    (§2). A difference is an asset change; its docs, automations,
+    placement, retries, timeout, tags or retention are not. A position
+    takes it without patterns and batch size (`Engine._fingerprint`): a
+    pattern change is diffed, and a batch size only pages."""
 
-    import json
+    homes = homes or {}
+    entry, stores, outputs = manifest["assets"][asset], manifest["stores"], manifest["outputs"]
 
-    entry = (manifest or {})["assets"][asset]
-    stores = manifest["stores"]
-    outputs = [
-        {**{k: v for k, v in o.items() if k != "store"}, "store_version": stores[o["store"]]["version"]}
+    def read(name: str) -> dict:
+        return {"output": homes.get(name, name), "store_version": stores[outputs[name]["store"]]["version"]}
+
+    inputs = {
+        param: {**{k: v for k, v in i.items() if k not in ("meta", "output")}, **read(i["output"])}
+        for param, i in entry["inputs"].items()
+    }
+    deps = sorted((read(d) for d in entry["deps"]), key=lambda d: d["output"])
+    written = [
+        {
+            **{k: v for k, v in o.items() if k not in ("name", "store")},
+            "store_version": stores[o["store"]]["version"],
+        }
         for o in entry["outputs"]
     ]
-    inputs = {p: {k: v for k, v in i.items() if k != "meta"} for p, i in entry["inputs"].items()}
-    return json.dumps(
-        {"version": entry["version"], "deps": entry["deps"], "inputs": inputs, "outputs": outputs},
-        sort_keys=True,
-    )
+    return {
+        "version": entry["version"],
+        "inputs": inputs,
+        "deps": deps,
+        "deps_all_partitions": sorted(homes.get(d, d) for d in entry.get("deps_all_partitions") or ()),
+        "outputs": written,
+    }

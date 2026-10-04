@@ -14,6 +14,7 @@ read-ahead rule.
 from __future__ import annotations
 
 import random
+import zlib
 
 import pytest
 from solera import _native
@@ -21,7 +22,6 @@ from solera import keys as K
 
 KEYS = [b"a", b"b", b"c", b"d", b"e", b"f"]
 TINY = {"block_size": 16, "max_file_bytes": 48}
-HEAD = 2**64 - 1
 CLASS = {(False, True): 0, (True, True): 1, (True, False): 2, (False, False): 3}
 
 
@@ -110,6 +110,33 @@ class History:
         return out
 
 
+def scan(runs: list[list[bytes]], codecs: list[int], bound: int | None, limit: int = 3):
+    """Every live key at `bound` through the streaming page job (`Merge.read`),
+    pages of `limit`, each run fed one block at a time."""
+
+    out, after = [], None
+    while True:
+        job = _native.Merge.read(len(runs), after=after, limit=limit, bound=bound)
+        fed = [0] * len(runs)
+        page = None
+        while (step := job.step()) is not None:
+            kind, x = step
+            if kind == "run":
+                if fed[x] == len(runs[x]):
+                    job.end(x)
+                else:
+                    b = runs[x][fed[x]]
+                    job.feed(x, b, [(0, len(b), zlib.crc32(b))], codecs[x])
+                    fed[x] += 1
+            else:
+                page = x
+        keys, _, gens, _, _, last, more = page
+        out += zip(keys, gens, strict=True)
+        if not more:
+            return [k for k, _ in out], [g for _, g in out]
+        after = last
+
+
 def changes(h: History, p: int, n: int, limit: int = 10**6, between=None) -> dict[bytes, tuple[int, int]]:
     out, after = {}, None
     while True:
@@ -150,7 +177,7 @@ def check(h: History, rng: random.Random) -> int:
     for e in sorted(h.live | {h.head + 1}):
         if e == 0:
             continue
-        bound = HEAD if e == h.head + 1 else gen(e)
+        bound = None if e == h.head + 1 else gen(e)  # None: the head
         state = h.truth[e - 1]
         runs, codecs = h.runs(0, e - 1)
         found, gens, deleted, _ = _native.span_lookup(runs, codecs, KEYS, bound)
@@ -160,7 +187,7 @@ def check(h: History, rng: random.Random) -> int:
             if live:
                 assert g == state[k]
             checks += 1
-        keys, gens, _, _, _ = _native.span_scan(runs, codecs, None, None, 100, bound)
+        keys, gens = scan(runs, codecs, bound)
         assert dict(zip(keys, gens, strict=True)) == state, e
         checks += 1
     return checks

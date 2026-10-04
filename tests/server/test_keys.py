@@ -347,16 +347,73 @@ async def test_a_fenced_engine_never_collects_its_successors_merge_outputs(tmp_p
     await b.close()
 
 
-async def test_a_merge_that_keeps_failing_stops_and_alarms(state, monkeypatch):
-    """docs/key-index-design.md § The write bound: R = 3 attempts per input
-    set; after the third failure the index stops merging, alarmed."""
+async def test_a_fenced_engine_never_deletes_what_only_its_unflushed_merge_let_go_of(tmp_path):
+    """Coordinator, on R1: engine A publishes merge M over output X in its
+    model, but IndexMerged(M) is not durable yet; then B takes over, and
+    B's state still names X. A must delete X neither as an orphan nor as
+    garbage. Named is never judged from non-durable state alone: M put X on
+    A's garbage (`Model._replace_index`), which the orphan collector counts
+    as named, and garbage goes only after `State.durable()`, which a fenced
+    journal refuses (F26)."""
 
+    from solera_server.state import Unavailable
+
+    url = tmp_path.as_uri()
+    a = await State.open(url, "test", flush_interval=3600)  # flushes only when asked
     rows = [{"id": "a"}]
-    engine = engine_for(state, items_project(rows), key_options=Options(window=2))
+    engine_a = engine_for(a, items_project(rows), key_options=Options(window=2))
+    await engine_a.initialize()
+    for n in range(4):
+        rows.append({"id": f"k{n}"})
+        await run(engine_a, ["items"])
+    await engine_a.upkeep.tasks.close()  # merges below are this test's own
+    key = ("items", "")
+
+    async def merge_all():
+        index = a.model.indexes[key]
+        endpoints = a.model.endpoints(*key)
+        await engine_a.upkeep._merge(key, "base", index, (0, len(index.spans)), endpoints)
+
+    await merge_all()
+    await a.durable()
+    x = {a.model.indexes[key].path(f.name) for f in a.model.indexes[key].files}  # X: merge outputs
+    assert all(p.rpartition("/")[2].startswith("m") for p in x)
+    rows.append({"id": "late"})
+    await run(engine_a, ["items"])
+    await a.durable()
+    await merge_all()  # M, over X: recorded, not flushed
+    assert x <= {path for path, _ in a.model.garbage}
+
+    b = await State.open(url, "test", flush_interval=0.001)  # takes over; A is fenced
+    names = {b.model.indexes[key].path(f.name) for f in b.model.indexes[key].files}
+    assert x <= names  # B's live index references X
+
+    engine_a.upkeep._orphans_at = float("-inf")
+    await engine_a.upkeep.collect_orphans()
+    with contextlib.suppress(Unavailable):
+        await engine_a.upkeep.collect()
+    assert x <= on_disk(b, b.model.indexes[key])
+    with contextlib.suppress(Exception):
+        await engine_a.stop()
+    await b.close()
+
+
+async def test_a_merge_that_keeps_failing_stops_and_alarms_across_restarts(tmp_path, monkeypatch):
+    """docs/key-index-design.md § The write bound: R = 3 uploads per input
+    set; after the third, none published, the index stops merging, alarmed.
+    A17 R8: the count is durable, recorded before each upload — a restart
+    or a takeover does not give the same inputs three more — and keyed by
+    the index's life, so a new life merges afresh."""
+
+    url = tmp_path.as_uri()
+    a = await State.open(url, "test", flush_interval=0.001)
+    rows = [{"id": "a"}]
+    engine = engine_for(a, items_project(rows), key_options=Options(window=2))
     await engine.initialize()
     for n in range(4):
         rows.append({"id": f"k{n}"})
         await run(engine, ["items"])
+    await engine.upkeep.tasks.close()  # the rounds below are this test's own
     calls = []
 
     async def broken(self, plan, endpoints, **_):
@@ -364,13 +421,72 @@ async def test_a_merge_that_keeps_failing_stops_and_alarms(state, monkeypatch):
         raise RuntimeError("the store is down")
 
     monkeypatch.setattr(KeyIndex, "merge", broken)
-    for _ in range(6):
+    key = ("items", "")
+
+    async def rounds(upkeep, n=6):
+        for _ in range(n):
+            upkeep._checked.clear()
+            upkeep.maintain()
+            await asyncio.gather(*upkeep.jobs.values(), return_exceptions=True)
+
+    await rounds(engine.upkeep)
+    assert max(Counter(calls).values()) == 3  # an input set, three times; then the index stopped
+    assert "merges no more" in engine.upkeep.failing["key index items/ merges"]
+    tried = len(calls)
+    await engine.stop()
+    await a.close()
+
+    b = await State.open(url, "test", flush_interval=0.001)  # a restart: another engine
+    again = engine_for(b, items_project(rows), key_options=Options(window=2))
+    await again.initialize()
+    await again.upkeep.tasks.close()
+    await rounds(again.upkeep)
+    assert len(calls) == tried  # nothing more: the budget is spent in this life
+    assert "merges no more" in again.upkeep.failing["key index items/ merges"]
+    index = b.model.indexes[key]
+    b.model.indexes[key] = replace(index, life="another")  # a reset since: a new life
+    await rounds(again.upkeep, 1)
+    assert len(calls) > tried  # it merges afresh
+    await again.stop()
+    await b.close()
+
+
+async def test_a_span_rewrite_that_drops_too_little_is_remembered(state, monkeypatch):
+    """A17 R7: a rewrite found to drop too little is counted without
+    uploading, remembered durably (`MergeRejected`), and not tried again
+    over unrelated commits, which leave its files and endpoints as they are."""
+
+    rows = [{"id": "a"}]
+    engine = engine_for(state, items_project(rows))
+    await engine.initialize()
+    await run(engine, ["items"])
+    await engine.upkeep.tasks.close()
+    key = ("items", "")
+    dry = []
+    real = KeyIndex.drops_enough
+
+    async def counted(self, plan, endpoints):
+        dry.append(plan)
+        return await real(self, plan, endpoints)
+
+    monkeypatch.setattr(KeyIndex, "drops_enough", counted)
+
+    def plan(self, endpoints, *, lane="any", busy=frozenset(), rejected=frozenset()):
+        if lane == "base" or KeyIndex.rewrite_key(self.state.spans[-1], endpoints) in rejected:
+            return None
+        return len(self.state.spans) - 1, 1  # the newest span, rewritten alone
+
+    monkeypatch.setattr(KeyIndex, "plan_merge", plan)
+    for n in range(3):
+        rows.append({"id": f"k{n}"})
         engine.upkeep._checked.clear()
         engine.upkeep.maintain()
-        await asyncio.gather(*engine.upkeep.jobs.values(), return_exceptions=True)
-    assert max(Counter(calls).values()) == 3  # an input set, three times; then the index stopped
-    assert ("items", "") in engine.upkeep.stopped
-    assert "merges no more" in engine.upkeep.failing["key index items/ merges"]
+        await asyncio.gather(*engine.upkeep.jobs.values())
+        if n < 2:
+            await run(engine, ["items"])
+    rec = state.model.merge_record(key, state.model.indexes[key].life)
+    assert rec["rejected"] and not rec["attempts"]  # remembered, never uploaded
+    assert len(dry) == len(set(dry)) == len(rec["rejected"])  # each tail checked once
 
 
 async def test_writes_wait_while_an_outputs_merges_are_far_behind(state):

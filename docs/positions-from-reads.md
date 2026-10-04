@@ -120,11 +120,13 @@ them), and stores no per-key version. The record is snapshot
   rename changes no definition: an attempt in flight commits under the new
   name.
 - **A pattern change under way** decides membership first: a `keys=` run
-  meanwhile merges the keys it names and records nothing. Read-ahead
-  entries recorded before it stay right: the change finishes the delta
-  under the old patterns, which they were read under, then diffs
-  membership without consulting them, so a key the old patterns excluded
-  is delivered by the diff, and each key once
+  meanwhile merges the keys it names, and is recorded like any read-ahead
+  entry (D93, A19 R4): the delta under the old patterns classes against
+  it, and the membership diff skips a key it delivered at the key's
+  version, so a count stays exact
+  (`test_a_selection_during_a_pattern_change_is_counted_once`). An entry
+  lists only the keys its run delivered, so a key the old patterns
+  excluded is still delivered by the diff, and each key once
   (`test_a_pattern_change_after_a_keys_run_delivers_each_key_once`). A
   batch planned under the old patterns commits a position that names them,
   so the next plan finds the change and diffs.
@@ -207,7 +209,9 @@ reported reasons are exactly those that hold (Erwin's ruling); nothing is
 kept of earlier causes, and each clears on its own condition:
 
 - `definition_changed`: the asset changed since the partition last caught
-  up. A pass under the new definition clears it.
+  up. A pass under the new definition clears it. For an `each=True`
+  asset, by key: a key it holds written before the change, or one its
+  patterns no longer take, whose removal the pattern change owes (A19 R9).
 - `input_changed`: an upstream reset replaced its input's content since it
   caught up (the model records when it dropped the position); or an
   incremental input has a key its patterns take changed past `next`, not
@@ -220,7 +224,9 @@ kept of earlier causes, and each clears on its own condition:
   did not make that pass due: a full pass due only to an asset change is
   `definition changed` alone, until commits land past its base. A pass
   that reads the new upstream clears it.
-- `upstream_stale`: a partition it reads is itself stale.
+- `upstream_stale`: a partition it reads is itself stale. Along an
+  `each=True` chain, only through a stale upstream key its patterns take:
+  a key depends on its own upstream key and nothing else (A19 R10).
 
 So an upstream reset followed by the asset's own change reports both.
 A key's last read is its read-ahead entry's, else the snapshot's, and the
