@@ -553,14 +553,21 @@ tombstone and the predecessors gone. The replaced versions (`a` g1, `b` g1,
   segment level. The implementation's check: a reader at `P` gets each
   key's state before `P` as its newest kept version older than `P`'s
   generation, else the span's predecessor;
-- the tiling: after any sequence of guarded, read-bounded merges, for every
-  live endpoint `P` and reserved `N + 1`, the versions kept give the same
-  classes as the per-commit fold, and an endpoint born at the head + 1 never
-  falls inside an existing span;
-- the read-ahead rule: with generations strictly increasing in commit order
-  and the delivered state from the result, the class equals the presence
-  change from `r` to `N`; and the counterexample when tombstones outside
-  the base are dropped.
+- done (`Tiling.lean`, `catch_up`, `lookup_head`): merges that respect
+  boundaries keep every catch-up range exactly tiled, and its spans merge
+  to the per-commit fold; a lookup at the head equals the live state. With
+  the round trip above, this holds for spans with versions, read segment by
+  segment;
+- done (`Keys.lean`, `read_ahead`, `read_ahead_spans`): with generations
+  increasing in commit order and the delivered state known, the class
+  equals the presence change from `r` to `N`; and dropping
+  added-then-removed tombstones breaks it (`drop_breaks_read_ahead`, the
+  worked example's key `d`).
+
+All on branch `bb/experiment-bend-2-for-the-key-index-s-delta-alge-thr_dqc6iaviun`,
+standard axioms only (`experiments/lean/REPORT.md`). What they leave to
+TLA+ and the sim: where the delivered state comes from (the sealed
+result), endpoint reservation lifetimes, pins, publication and crashes.
 
 **TLA+** (`KeyIndex.tla`): spans with segments; endpoint holders with the
 reservation lifetimes above, a selection's landing point included; pins;
