@@ -1,21 +1,23 @@
-# The seen-set: incremental reads from one encoded state (draft)
+# The observed set: incremental reads from one observation record (draft)
 
 Status: **draft**, revised after review A27 ("build with listed
-changes"). Docs only; nothing is built. One encoding: a **base**, explicit
-**points**, and compressed **ranges**, with disjoint overwrites and prefix
-membership queries. The interval map and the first exceptions encoding it
+changes"). Docs only; nothing is built. Names (D133): the **observed
+set** is what a consumer partition has processed, key → upstream version;
+its stored form is the **observation record** — a **base**, explicit
+**points** and compressed **ranges**, with disjoint overwrites and prefix
+membership queries — which decodes to it. The two earlier encodings it
 replaces are on this branch's history (`fb56cbe`, `bdf8962`).
 
 ## The principle
 
-A consumer partition's **seen-set** `S`, per keyed incremental input, is
+A consumer partition's **observed set** `S`, per keyed incremental input, is
 key → the **observation** it processed: whether the key was present, its
 version and payload as served, the whole and dep versions it was
 processed under (its **context**), and the upstream's **life**. `S` is
 independent of what upstream holds now.
 
 What the partition owes is decided **key by key, once**: for each
-**candidate** key, from its old effective state, `decode(E)(k)`, to its
+**candidate** key, from its old effective state, `decode(R)(k)`, to its
 new one, the upstream now under the current patterns and context:
 
 | Old (`decode`) | New (upstream now, current patterns, current context) | Owed |
@@ -31,13 +33,14 @@ one (A27 R4). The owed set is the staleness, and exactly what a default
 run loads, as `added`, `updated` and `removed`. A `keys=` run is a filter
 on it. A pattern change stores nothing: it only changes the "new" side.
 
-**The invariant.** After every commit, `decode(E) = S`. Every override is
+**The invariant.** After every commit, `decode(R) = S`. Every override is
 written by a committed batch, and folded only when removing it decodes
 to the same value.
 
-## The encoding
+## The observation record
 
-`E` is three layers, the first that holds `k` deciding:
+The observation record `R` is three layers, the first that holds `k`
+deciding:
 
 1. **Points**: `k → observation`, explicit — presence, version, payload,
    the patterns it was read under, context, life. Written where a batch's
@@ -104,12 +107,12 @@ the base is a plain commit again, and the file is deleted.
 
 Its size is proportional to the keys changed in `(P, C]`, not to the
 index: a reader that lags while a few keys churn holds a few entries
-(~27 B each). A full file — the whole seen-set — is only the degenerate
+(~27 B each). A full file — the whole observed set — is only the degenerate
 case where nearly every key changed.
 
 The index stays reader-agnostic: retention asks for every base older
 than its cut to be given a before-image first, and keeps no per-reader
-snapshot. The reader owns its before-image through its seen record.
+snapshot. The reader owns its before-image through its observation record.
 
 ## Observations: what was served (A27 R2)
 
@@ -143,11 +146,11 @@ home and reset count, never a name or a commit number, which repeat
 across lives; a rename keeps it, with the spill and pins. An upstream
 reset (removed and declared again, moved to another store) starts a new
 life and deletes the old index, so the old layers cannot be decoded. The
-partition then records a **rebuild**: its seen-set is "the old life",
+partition then records a **rebuild**: its observed set is "the old life",
 and it owes a start-over — staleness says so, as an input change — which
 its next run makes: the first batch is `full` and `first`, a plain
 consumer starts over, and a per-key one reconciles against its output
-index. That batch's commit resets `E` to an empty base in the new life.
+index. That batch's commit resets `R` to an empty base in the new life.
 
 ## Candidates, queries and their cost
 
@@ -186,7 +189,7 @@ replans until a rebase); points add none. Each range is one `changes`
 call over its key range; points are one key-list call.
 
 **Freshness is exact or pending** (A27 R10). Staleness is the comparison,
-computed and cached per encoding revision and upstream head; where a
+computed and cached per observation record revision and upstream head; where a
 full compare is due and not yet made, the partition reports **pending**,
 never `stale` or fresh on a guess: widening `include` to a key that
 never existed changes no debt. Shared, definition, retry, reconcile and
@@ -222,10 +225,10 @@ takeovers and renames until the pass ends or is reset.
 len(removed)`, and `checks`, per-key over `items`. `k1@3` is key `k1` at
 generation 3; `⊥` an empty base.
 
-**`keys=` before a default run.** `E = ⊥`. `keys=(k1)` at head `H1`:
+**`keys=` before a default run.** `R = ⊥`. `keys=(k1)` at head `H1`:
 point `k1@1`. `k1` updated to `@4`. Candidates: everything since `⊥`, and
 `k1`: `k1` is owed an update (`@4` against `@1`), `k2` an add. The run
-rebases at its `T`: `E = (T)`, the point folded.
+rebases at its `T`: `R = (T)`, the point folded.
 
 **Widening.** Base `(P, include=k1)`; the deploy widens to `k*`. The
 membership query over prefix `k` finds `k2`: decoded absent, present and
@@ -248,7 +251,7 @@ exclude `drop/*`. `drop/b` is a candidate (a change since `P`): decoded
 absent, excluded now: nothing. Classing the change under the old patterns
 would have owed an add of an excluded key.
 
-**A definition change.** `E` resets to an empty base: everything upstream
+**A definition change.** `R` resets to an empty base: everything upstream
 is owed an add, and the first batch starts the consumer over; a per-key
 asset's leftover outputs are found in its output index.
 
@@ -296,10 +299,10 @@ old index goes. `tally` records a rebuild: owed a start-over, not a
 decode it can no longer make.
 
 **A takeover mid-run.** Batches 1 and 2 committed their overwrites;
-batch 3's attempt dies, writing none. The next engine decodes `E` = `S`,
+batch 3's attempt dies, writing none. The next engine decodes `R` to `S`,
 and batch 3's keys are owed; the pass's pin and `T` held throughout.
 
-**Per-key versus plain.** One encoding. For `checks`, failed keys are
+**Per-key versus plain.** One observation record for both. For `checks`, failed keys are
 seen, retried by their failure records. For `tally`, `S` is the only
 record of what the count holds: `added` is never a key it holds,
 `removed` always one.
@@ -320,13 +323,13 @@ record of what the count holds: `added` is never a key it holds,
 | A27 R3, R4, R8, R9 | normalised patterns; candidates classed once; disjoint overwrite and decode-equal fold; per-range changes |
 
 A19 R6 (`keys=` bounded by `batch_size` and `concurrency`) and R8 (a
-forced retry) are kept as they are, outside the encoding.
+forced retry) are kept as they are, outside the observation record.
 
 ## What it replaces
 
-| Today | With the seen-set |
+| Today | With the observed set |
 |---|---|
-| Position: `next`, `pass` (`from`, `at`, `batch`, `pin`), `fingerprint`, `began`, `seen` | The base; a pass's committed prefix as ranges, its scan plan apart; `fingerprint` stays: a change resets `E` |
+| Position: `next`, `pass` (`from`, `at`, `batch`, `pin`), `fingerprint`, `began`, `seen` | The base; a pass's committed prefix as ranges, its scan plan apart; `fingerprint` stays: a change resets `R` |
 | K45 read-ahead (`ahead`), its cap, paged selections' shared entries | Points, spilling past a bound |
 | D93: snapshot passes; selections classed via `lower=` | A pass reads at its `T`, held by its pin; selections write points; `decode` replaces `lower=` |
 | D100: classes from the index, rows from the store; rowless deliveries | Classes from what was served, decided before the callback |
@@ -351,7 +354,7 @@ histories — upstream commits and resets, current-only rows served ahead,
 behind or not at all, `keys=` and default runs, cancels and failures,
 pattern changes (first include, prefixless globs) and definition and
 shared-input changes, replans, takeovers, renames — and after **every
-commit** checks that `E` decodes to the dict, and that staleness and a
+commit** checks that `R` decodes to the dict, and that staleness and a
 default run's load equal the dict's comparison with the upstream. The
 A19, A26 and A27 histories are named examples, and so is F41 (W38's
 replay in `tests/sim/test_replays.py`, a strict xfail in the old model). Before relying on the
@@ -380,17 +383,18 @@ Base      = Layer                                   # endpoint P: a commit
 Range     = Layer + {lo, hi}                        # endpoint T; disjoint, sorted
 Point     = {key, present, version, payload, patterns, context: id, life}
 ScanPlan  = {T, cursor, patterns, context: id, pin}  # the active pass only
-SeenSet   = {base, ranges[], points{}, contexts[], spill: index state | None,
-             rebuild: life | None}
+ObservationRecord = {base, ranges[], points{}, contexts[], spill: index state | None,
+                     rebuild: life | None}
 ```
 
-**Decode** (old effective state of `k`):
+**Decode** — the observed set, from an observation record (the old
+effective state of `k`):
 
 ```text
-decode(E, k):
-    if E.rebuild:                      return UNKNOWN          # a start-over is owed
-    if k in E.points (or its spill):   return E.points[k] as an observation
-    layer = the range holding k, else E.base
+decode(R, k):
+    if R.rebuild:                      return UNKNOWN          # a start-over is owed
+    if k in R.points (or its spill):   return R.points[k] as an observation
+    layer = the range holding k, else R.base
     if not layer.patterns.take(k):     return ABSENT
     if layer.before_image and k in layer.before_image:
         entry = layer.before_image[k]                      # as at P
@@ -403,8 +407,8 @@ decode(E, k):
 **Classify** (one candidate, once):
 
 ```text
-classify(E, k, now):                  # now: head, current patterns, current context
-    old = decode(E, k)
+classify(R, k, now):                  # now: head, current patterns, current context
+    old = decode(R, k)
     if old is UNKNOWN:                          return REBUILD   # the whole partition starts over
     new = ABSENT if not now.patterns.take(k) else index.lookup(k, at=now.head)
     if old is ABSENT and new is ABSENT:         return NOTHING
@@ -414,7 +418,7 @@ classify(E, k, now):                  # now: head, current patterns, current con
     if old.context != now.context:              return UPDATED
     return NOTHING
 
-owed(E, now) = {k: c for k in candidates(E, now) if (c := classify(E, k, now)) != NOTHING}
+owed(R, now) = {k: c for k in candidates(R, now) if (c := classify(R, k, now)) != NOTHING}
 # candidates: changes(endpoint, now), plus a before-image's keys; plus per-range changes,
 # point keys, membership and context scans
 ```
