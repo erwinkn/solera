@@ -360,12 +360,13 @@ class LayerState:
     # -- the merge rule ---------------------------------------------------------------------
 
     def plan(
-        self, busy: set[str] = frozenset(), stopped: set[str] = frozenset()
+        self, busy: set[str] = frozenset(), stopped: set[str] = frozenset(), lane: str | None = None
     ) -> tuple[str, int, int] | None:
         """The next merge, as `(lane, first, count)`, or None. Two lanes —
         the base absorbing the layers above it, and tiers — each pick inputs
-        no running merge holds (`busy`, ids), so the lanes never share one.
-        `stopped`: input sets (`attempt_key`) upkeep gave up on."""
+        no running merge holds (`busy`, ids), so the lanes never share one;
+        `lane` asks for one lane's only. `stopped`: input sets
+        (`attempt_key`) upkeep gave up on."""
 
         ls = self.layers
         free = [x.id not in busy for x in ls]
@@ -379,7 +380,7 @@ class LayerState:
             out = sum(x.size * (DELTA_GROWTH if x.delta else 1.0) for x in ins)
             return out <= READER_BOUND * sum(x.size for x in ls[lo + count :]) + SLACK
 
-        if len(ls) >= 2:
+        if len(ls) >= 2 and lane in (None, "base"):
             best, acc = None, 0
             for j in range(1, len(ls)):
                 acc += ls[j].size
@@ -387,6 +388,8 @@ class LayerState:
                     best = ("base", 0, j + 1)
             if best:
                 return best
+        if lane == "base":
+            return None
         i = len(ls) - 1
         while i >= 1:
             t = tier(ls[i].size)
