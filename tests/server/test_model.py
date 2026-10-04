@@ -375,7 +375,9 @@ async def test_the_journal_alone_reproduces_the_live_model(tmp_path, clock):
     for _ in range(3):
         await settle(engine, (await engine.submit(["consumer"], upstream=True))["id"])
         clock.now += 61
-    await worker_finished()  # its cleanups recorded too: nothing lands after the snapshot
+    await worker_finished()
+    for cleanup in [r for r in engine.m.runs.values() if r["kind"] == "cleanup"]:
+        await settle(engine, cleanup["id"])  # its cleanup tasks too: nothing lands after the snapshot
     await engine.tick()  # archive what finished
     run = await engine.submit(["polled"])
     await state.durable()

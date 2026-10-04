@@ -110,3 +110,106 @@ def test_registration_refuses_a_keyed_source_loaded_without_versions(tmp_path):
         return []
 
     Project(assets=[refs], sources=[Source("uploads", key="id")])
+
+
+async def test_a_file_source_serves_objects_at_the_stores_version(tmp_path):
+    """A store-backed source: objects under `path`, each served as `{key: name,
+    "content": bytes}` at the store's word for it — on local disk its stamp
+    (inode, mtime, size); with `hash=True` a hash of its content."""
+
+    data = tmp_path / "data"
+    (data / "incoming").mkdir(parents=True)
+    (data / "incoming" / "a.txt").write_text("one")
+    seen = {}
+
+    @asset(inputs={"docs": Incremental()})
+    def sizes(ctx, docs: list):
+        seen["docs"] = ({r["name"]: r["content"] for r in docs}, dict(ctx.batch["docs"].served))
+        return {r["name"]: len(r["content"]) for r in docs}
+
+    @asset(inputs={"hashed": Incremental()})
+    def hashes(ctx, hashed: list):
+        seen["hashed"] = dict(ctx.batch["hashed"].served)
+        return len(hashed)
+
+    project = Project(
+        assets=[sizes, hashes],
+        sources=[
+            Source("docs", key="name", path="incoming"),
+            Source("hashed", key="name", path="incoming", hash=True),
+        ],
+        default_store=FileStore(data),
+    )
+    state, engine = await _engine(tmp_path, project)
+    for name in ("docs", "hashed"):
+        await engine.commit_source(name, upsert={"a.txt": "v1"})
+    assert status_of(await drive(engine, await engine.submit(["sizes", "hashes"]))) == "succeeded"
+    (content, served), hashed = seen["docs"], seen["hashed"]
+    assert content == {"a.txt": b"one"} and served["a.txt"]  # the file's stamp
+    assert hashed == {"a.txt": "sha256:7692c3ad3540bb803c020b3aee66cd8887123234ea0c6e7143c0add73ff431ed"}
+    await engine.stop()
+    await state.close()
+
+
+async def test_an_unkeyed_file_source_serves_the_objects_bytes(tmp_path):
+    data = tmp_path / "data"
+    data.mkdir()
+    (data / "rates.json").write_text('{"eur": 1.1}')
+    got = []
+
+    @asset(inputs={"rates": In()})
+    def priced(rates: bytes):
+        got.append(rates)
+        return 1
+
+    project = Project(
+        assets=[priced], sources=[Source("rates", path="rates.json")], default_store=FileStore(data)
+    )
+    state, engine = await _engine(tmp_path, project)
+    await engine.commit_source("rates", version="v1")
+    assert status_of(await drive(engine, await engine.submit(["priced"]))) == "succeeded"
+    assert got == [b'{"eur": 1.1}']
+    await engine.stop()
+    await state.close()
+
+
+async def test_a_table_source_serves_rows_at_their_version_column(tmp_path):
+    import os
+    import uuid
+
+    dsn = os.environ.get("SOLERA_TEST_DATABASE_URL")
+    if not dsn:
+        pytest.skip("SOLERA_TEST_DATABASE_URL is not set")
+    import psycopg
+    from solera_postgres import PostgresStore
+
+    table = f"orders_{uuid.uuid4().hex[:8]}"
+    with psycopg.connect(dsn, autocommit=True) as conn:
+        conn.execute(f"CREATE TABLE public.{table} (id text PRIMARY KEY, v int, updated_at bigint)")
+        conn.execute(f"INSERT INTO public.{table} VALUES ('a', 1, 100), ('b', 2, 200)")
+    seen = []
+
+    @asset(inputs={"orders": Incremental()})
+    def total(ctx, orders: list):
+        seen.append(dict(ctx.batch["orders"].served))
+        return sum(r["v"] for r in orders)
+
+    pg = PostgresStore("env:SOLERA_TEST_DATABASE_URL")
+    with pytest.raises(RegistrationError, match="which version"):  # keyed, and nothing names the version
+        Project(
+            assets=[total],
+            sources=[Source("orders", store="pg", key="id", table=f"public.{table}")],
+            stores={"pg": pg},
+        )
+    source = Source("orders", store="pg", key="id", table=f"public.{table}", version_column="updated_at")
+    project = Project(
+        assets=[total], sources=[source], stores={"pg": pg}, default_store=FileStore(tmp_path / "out")
+    )
+    state, engine = await _engine(tmp_path, project)
+    await engine.commit_source("orders", upsert={"a": "100", "b": "200"})
+    assert status_of(await drive(engine, await engine.submit(["total"]))) == "succeeded"
+    assert seen == [{"a": "100", "b": "200"}]
+    await engine.stop()
+    await state.close()
+    with psycopg.connect(dsn, autocommit=True) as conn:
+        conn.execute(f"DROP TABLE public.{table}")

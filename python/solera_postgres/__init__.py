@@ -816,6 +816,49 @@ class PostgresStore:
 
     # -- reads ----------------------------------------------------------------
 
+    def can_serve(self, source) -> bool:
+        """A source this store can read: a `table`, and for a keyed one the
+        `version_column` that says each row's version."""
+
+        return bool(source.handle.get("table")) and (
+            source.key is None or bool(source.handle.get("version_column"))
+        )
+
+    async def serve(self, source, keys, ctx):
+        """A source read from a table this store does not write: `Source("orders",
+        store="pg", key="id", table="public.orders", version_column="updated_at")`
+        (docs/stores.md, "Sources: how data is loaded"); the table may name
+        `{partition}`. Keyed, each asked key's row at the version its
+        `version_column` holds, read in one snapshot; unkeyed, every row, at
+        the column's greatest value (none without the column)."""
+
+        return await asyncio.to_thread(self._serve, source, keys, ctx)
+
+    def _serve(self, source, keys, ctx):
+        from solera.sdk import Loaded
+
+        named = str(source.handle["table"]).format(partition=ctx.partition)
+        if named.startswith('"'):  # quoted already: "schema"."table"
+            table = _qname(*_split(named))
+        else:
+            schema, _, name = named.rpartition(".")
+            table = _qname(schema or "public", name)
+        version, clauses, params = source.handle.get("version_column"), [], []
+        for column, value in (source.handle.get("where") or {}).items():  # a fixed filter on the table
+            clauses.append(f"{_ident(column)} = %s")
+            params.append(value)
+        if source.key is not None and keys is not None:
+            clauses.append(f"{_ident(source.key)}::text = ANY(%s)")
+            params.append(list(keys))
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self._connect() as conn, conn.cursor() as cur:
+            conn.read_only = True
+            rows = cur.execute(f"SELECT * FROM {table}{where}", params).fetchall()
+        if source.key is None:
+            newest = max((str(r[version]) for r in rows if r.get(version) is not None), default=None)
+            return Loaded(rows, version=newest if version else None)
+        return {str(r[source.key]): Loaded(r, version=str(r[version])) for r in rows}
+
     async def load(self, ref: Ref, t, selection: Keys | Commits | None) -> Any:
         if isinstance(t, type) and issubclass(t, Ref):
             return ref

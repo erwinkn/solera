@@ -10,7 +10,7 @@ import os
 import pickle
 from typing import Any
 
-from ..sdk import KEYS, ObjectRef, Ref, is_ref_type
+from ..sdk import KEYS, Loaded, ObjectRef, Ref, is_ref_type
 from . import (
     MISSING,
     PARALLEL,
@@ -293,6 +293,56 @@ class FileStore:
         if selection is not None:
             raise StoreError(f"{ref.output}: an unkeyed output cannot serve a selection")
         return value
+
+    def can_serve(self, source) -> bool:
+        """A source that names where its objects are, its `path` — unless a
+        subclass serves sources its own way."""
+
+        return "path" in source.handle or type(self).serve is not FileStore.serve
+
+    async def serve(self, source, keys, ctx):
+        """A source of objects under its `path`, which may name `{partition}`:
+        `Source("docs", store="files", key="name", path="incoming/{partition}/")`
+        (docs/stores.md, "Sources: how data is loaded"). Keyed, each key is an
+        object's name under the path, served as the row `{key: name,
+        "content": bytes}`; unkeyed, the object at the path, its bytes. The
+        version is what the store says of the object in the same response —
+        S3's etag; on local disk its stamp of inode, modification time and
+        size — or, with `hash=True`, a hash of its content: exact, but every
+        object is read. An object that is not there was observed absent."""
+
+        import hashlib
+
+        import obstore
+        from obstore.exceptions import NotFoundError
+
+        objects, hashed = self._objects(), bool(source.handle.get("hash"))
+        base = str(source.handle.get("path", "")).format(partition=ctx.partition)
+
+        async def one(path):
+            try:
+                result = await obstore.get_async(objects, path)
+            except (NotFoundError, FileNotFoundError):
+                return None
+            data = bytes(await result.bytes_async())
+            version = f"sha256:{hashlib.sha256(data).hexdigest()}" if hashed else result.meta["e_tag"]
+            return Loaded(data, version=version)
+
+        if source.key is None:
+            return await one(base)
+        prefix = f"{base.rstrip('/')}/" if base else ""
+        if keys is None:  # all of them
+            keys = [
+                meta["path"][len(prefix) :]
+                async for chunk in obstore.list(objects, prefix=prefix or None)
+                for meta in chunk
+            ]
+        found = await self._many(lambda k: one(f"{prefix}{k}"), keys)
+        return {
+            k: Loaded({source.key: k, "content": loaded.value}, version=loaded.version)
+            for k, loaded in zip(keys, found, strict=True)
+            if loaded is not None
+        }
 
     async def _partitions(self, ref: Ref) -> list[str]:
         return list(await self._found((ref.handle or {}).get("path", "")))

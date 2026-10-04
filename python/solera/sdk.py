@@ -1705,7 +1705,10 @@ class Project:
                 if src is None or src.key is None or src.key.startswith("<"):
                     continue
                 store = self.stores.get(src.store or DEFAULT_STORE)
-                if src.loader is None and not callable(getattr(store, "serve", None)):
+                serves = callable(getattr(store, "serve", None)) and getattr(
+                    store, "can_serve", lambda _: True
+                )(src)
+                if src.loader is None and not serves:
                     if _load_intent(e, hints_by_asset[name].get(p)) == "data":
                         raise RegistrationError(
                             f"{name}: source {src.name!r} is keyed and loaded, but nothing says which version "

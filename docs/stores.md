@@ -337,13 +337,36 @@ its version fails the load. An unkeyed one returns the value, or
 an edit reverted between the commit and the read can leave a consumer one
 revision ahead until the next change.
 
-**Through a store.** A store backs a keyed source when it defines
-`serve(source, keys, ctx)`, answering as a function does.
+**Through a store.** A store backs a source when it defines
+`serve(source, keys, ctx)`, answering as a function does, and
+`can_serve(source)` if only some sources suit it. The built-in ones:
+
+```python
+Source("docs", key="name", path="incoming/{partition}/")         # FileStore, S3Store
+Source("docs", key="name", path="incoming/", hash=True)
+Source("orders", store="pg", key="id", table="public.orders", version_column="updated_at")
+```
+
+- **FileStore and S3Store** read objects under the source's `path` (it
+  may name `{partition}`). Keyed, each key is an object's name under it,
+  served as the row `{key: name, "content": bytes}`; unkeyed, the object at
+  the path itself, its bytes. The version is what the store says of the
+  object, in the same response as its content: S3's etag; on local disk,
+  the stamp of its inode, modification time (to the microsecond) and size.
+  Its blind spot: a rewrite of the same size within one clock tick, in
+  place, goes unseen. `hash=True` versions by a hash of the content
+  instead — exact, but every object is read in full. An object that is not
+  there was observed absent.
+- **PostgresStore** reads a `table` it does not write (it may name
+  `{partition}`): keyed, each asked key's row, at the version its
+  `version_column` holds; unkeyed, every row, at that column's greatest
+  value. A keyed table source without `version_column` is refused.
 
 **Refused at registration:** a keyed source that an asset loads as data
 when nothing can say which version it served — no function, and a store
-without `serve`. A source read only as a `Ref` loads nothing, so needs
-neither.
+that cannot serve it (no `serve`, no `path` for a file store, no
+`version_column` for a table). A source read only as a `Ref` loads
+nothing, so needs neither.
 
 **What the batch gets.** `ctx.batch[input].served` is each key's version
 as served (None where it was absent). Nothing consumes it yet: the
