@@ -561,7 +561,7 @@ def test_a_served_engine_keeps_nothing_of_finished_local_workers(tmp_path, monke
                 if httpx.get(f"{base}/healthz", timeout=1).status_code == 200:
                     break
             time.sleep(0.05)
-        before = set(local._running) | set(local._tails) | set(local._exits)  # other tests' launches
+        before = set(local._children)  # other tests' launches
         for _ in range(3):
             run = httpx.post(
                 f"{base}/api/projects/served/runs", json={"targets": ["tiny"]}, timeout=10
@@ -576,7 +576,7 @@ def test_a_served_engine_keeps_nothing_of_finished_local_workers(tmp_path, monke
                 assert time.monotonic() < deadline
                 time.sleep(0.1)
         deadline = time.monotonic() + 20
-        while left := (set(local._running) | set(local._tails) | set(local._exits)) - before:
+        while left := set(local._children) - before:
             assert time.monotonic() < deadline, left
             time.sleep(0.1)
     finally:

@@ -34,6 +34,7 @@ from solera.keys.index import FileInfo, IndexState, KeyIndex, Options
 from solera.keys.io import ObjectIO
 from solera.keys.reads import Cold, Full, Reads
 from solera.keys.resolver import Limits, Prepared, Resolver
+from solera.tasks import Tasks
 
 log = logging.getLogger(__name__)
 
@@ -77,7 +78,7 @@ class KeyService:
         self._pins: dict[int, float] = {}  # token -> event counter: readers of index files
         self._lock = threading.Lock()
         self._tokens = itertools.count()
-        self._owners: set[asyncio.Task] = set()  # operations running on the loop
+        self.tasks = Tasks("key service")  # operations running on the loop
         self._installing = 0  # bytes of `installed` files waiting
 
     # -- reader pins ----------------------------------------------------------------------
@@ -146,21 +147,20 @@ class KeyService:
         loop, self.loop = self.loop, None
 
         async def drain():
-            owners = (
-                set(self._owners)
-                | set(self.resolver._fills)
-                | set(self.resolver._inflight.values())
-                | set(self.cache._fills.values())
-            )
-            for t in owners:
-                t.cancel()
-            await asyncio.gather(*owners, return_exceptions=True)
+            await self._close_tasks()
             await loop.shutdown_default_executor()
 
         await asyncio.wrap_future(asyncio.run_coroutine_threadsafe(drain(), loop))
         loop.call_soon_threadsafe(loop.stop)
         await asyncio.to_thread(self._thread.join)
         loop.close()
+
+    async def _close_tasks(self) -> None:
+        """Cancel and wait for everything running on the loop: operations,
+        then the resolver's fills and computes, then the cache's fetches."""
+
+        for tasks in (self.tasks, self.resolver._fills, self.resolver._inflight, self.cache._fills):
+            await tasks.close()
 
     def _running(self) -> bool:
         """Started on first use; not again once stopped, or once it failed to start."""
@@ -176,14 +176,10 @@ class KeyService:
         return asyncio.run_coroutine_threadsafe(self._own(coro), self.loop)
 
     async def _own(self, coro):
-        """Runs `coro` as one of this service's operations: `stop` cancels and waits for it."""
+        """Runs `coro` as one of this service's operations: `stop` cancels and waits for it.
+        Its failure reaches the submitter (`_logged` for one fired and forgotten)."""
 
-        task = asyncio.current_task()
-        self._owners.add(task)
-        try:
-            return await coro
-        finally:
-            self._owners.discard(task)
+        return await self.tasks.spawn(coro, awaited=True)
 
     def _fire(self, make) -> None:
         if self._running():

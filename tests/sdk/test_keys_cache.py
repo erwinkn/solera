@@ -1127,9 +1127,10 @@ async def test_a_closed_streaming_reader_owns_no_fetch(io):
     files = [f for level in state.newest_first() for f in level] * 4  # more segments than the queue holds
     reader = jobs._Run(Slow(io.store), state.path, files)
     await asyncio.sleep(0.05)
-    assert reader.queue.full() and len(reader.fetches) > reader.queue.qsize()  # one waits for room
+    fetches = len(reader.tasks) - 1  # beside its producer
+    assert reader.queue.full() and fetches > reader.queue.qsize()  # one waits for room
     await reader.close()
-    assert not reader.fetches and reader.producer.done()
+    assert len(reader.tasks) == 0, "its producer and every fetch ended"
 
 
 async def test_cache_totals_are_kept_not_summed(io, tmp_path):

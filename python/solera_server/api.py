@@ -214,7 +214,7 @@ def create_app(
             "namespace": runtime.state.namespace,
             "project": runtime.manifest["name"],
             "deploy": runtime.manifest["deploy"],
-            "inflight": len(runtime.inflight),
+            "inflight": len(runtime.watchers),
             "active_runs": sum(1 for r in runtime.m.runs.values() if r["status"] not in TERMINAL_RUN),
             "postgres": bool(os.environ.get("DATABASE_URL")),
             "last_error": runtime.failing,

@@ -14,6 +14,7 @@ import asyncio
 from collections.abc import Awaitable, Callable, Iterable
 
 from .. import _native
+from ..tasks import Tasks
 from .io import ObjectIO
 from .threads import in_thread
 
@@ -30,14 +31,11 @@ class _Run:
     def __init__(self, io: ObjectIO, path: Callable[[str], str], files: list):
         self.io, self.path, self.files = io, path, files
         self.queue: asyncio.Queue = asyncio.Queue(AHEAD)
-        self.fetches: set[asyncio.Task] = set()
-        self.producer = asyncio.ensure_future(self._produce())
+        self.tasks = Tasks("read-ahead")  # its producer, then each fetch it started
+        self.tasks.spawn(self._produce())
 
     def _start(self, coro) -> asyncio.Task:
-        task = asyncio.ensure_future(coro)
-        self.fetches.add(task)
-        task.add_done_callback(self.fetches.discard)
-        return task
+        return self.tasks.spawn(coro, awaited=True)  # its failure is raised by the read that takes it
 
     async def _produce(self):
         try:
@@ -76,10 +74,7 @@ class _Run:
         return None if item is None else await item
 
     async def close(self):
-        tasks = [self.producer, *self.fetches]
-        for t in tasks:
-            t.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
+        await self.tasks.close()
 
 
 async def run(
@@ -103,7 +98,7 @@ async def run(
         job.local(local)
     readers = [] if local is not None else [_Run(io, path, files) for files in runs]
     chunks = iter(rows) if rows is not None else None
-    uploads: set[asyncio.Future] = set()
+    uploads: list[asyncio.Future] = []  # in the order started: cancelled so, never a set's order
     n = g = 0
     try:
         while (step := await in_thread(job.step)) is not None:
@@ -122,14 +117,15 @@ async def run(
                     job.feed_rows(chunk)
             else:
                 if len(uploads) >= UPLOADS:
-                    done, uploads = await asyncio.wait(uploads, return_when=asyncio.FIRST_COMPLETED)
-                    for t in done:
+                    await asyncio.wait(uploads, return_when=asyncio.FIRST_COMPLETED)
+                    for t in [t for t in uploads if t.done()]:
                         t.result()
+                    uploads = [t for t in uploads if not t.done()]
                 if kind == "garbage":
-                    uploads.add(asyncio.ensure_future(on_garbage(g, x)))
+                    uploads.append(asyncio.ensure_future(on_garbage(g, x)))
                     g += 1
                 else:
-                    uploads.add(asyncio.ensure_future(on_file(n, x)))
+                    uploads.append(asyncio.ensure_future(on_file(n, x)))
                     n += 1
         await asyncio.gather(*uploads)
     finally:

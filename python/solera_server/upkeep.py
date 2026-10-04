@@ -23,6 +23,7 @@ import math
 from solera.keys import LocalError
 from solera.keys.index import IndexState, KeyIndex, Options
 from solera.keys.io import ObjectIO
+from solera.tasks import Tasks
 
 from . import history
 from .positions import needs
@@ -53,7 +54,7 @@ class Upkeep:
         self.key_options = key_options or Options()
         self.recount_interval, self.concurrency = recount_interval, concurrency
         self.retention_interval, self.interval = retention_interval, interval
-        self.jobs: dict[tuple, asyncio.Task] = {}  # compactions and recounts running
+        self.jobs = Tasks("upkeep")  # compactions and recounts running, by index key
         self.last_error: str | None = None
         self._recounted: dict[tuple, float] = {}  # when each index was last recounted
         self._checked: dict[tuple, IndexState] = {}  # the state last found needing nothing
@@ -71,11 +72,11 @@ class Upkeep:
         self._task = asyncio.create_task(self._run())
 
     async def stop(self) -> None:
-        jobs = [j for j in (self._task, *self.jobs.values()) if j is not None]
-        for job in jobs:
-            job.cancel()
-        await asyncio.gather(*jobs, return_exceptions=True)
-        self._task = None
+        if self._task is not None:
+            self._task.cancel()
+            await asyncio.gather(self._task, return_exceptions=True)
+            self._task = None
+        await self.jobs.close()
         with contextlib.suppress(Exception):
             await self.say_alive(force=True)
 
@@ -153,9 +154,7 @@ class Upkeep:
                 self._checked[key] = index
 
     def _start(self, key: tuple, index: IndexState, *, recount: bool) -> None:
-        job = asyncio.create_task(self._maintenance(key, index, recount))
-        self.jobs[key] = job
-        job.add_done_callback(lambda _t: self.jobs.pop(key, None))
+        self.jobs.spawn(self._maintenance(key, index, recount), key=key)
 
     async def _maintenance(self, key: tuple, index: IndexState, recount: bool) -> None:
         """One compaction or recount, run on a worker thread with its own event

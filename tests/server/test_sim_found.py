@@ -476,7 +476,7 @@ async def test_a_name_removed_while_its_attempt_runs_and_added_back_starts_over(
 
 async def _first_life_across_a_readd(state, monkeypatch, ends: str, when: str, fresh: bool = False):
     from solera_server import attempts
-    from solera_server.executors.inline import InlinePlacement
+    from solera_server.executors import inline
 
     monkeypatch.setattr(attempts, "AFTER_COMMIT_WAIT", 0.2)  # the stopped engine's answer to `finished`
     entered, release = asyncio.Event(), asyncio.Event()
@@ -533,7 +533,7 @@ async def _first_life_across_a_readd(state, monkeypatch, ends: str, when: str, f
         return
     new = await engine.submit(["copy"], mode="full") if when == "during" else None
     if ends == "lost":
-        InlinePlacement._tasks[held].cancel()
+        inline._workers.get(held).cancel()
     release.set()
     try:
         await drive(engine, old, timeout=10)

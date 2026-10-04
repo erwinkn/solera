@@ -46,6 +46,7 @@ from solera.keys.index import (
 )
 from solera.keys.io import ObjectIO
 from solera.sdk import digest
+from solera.tasks import Tasks
 
 from . import history, planning
 from .attempts import POOL_OFFERED_GRACE, Attempts, Live, current_names, worker_report
@@ -138,8 +139,9 @@ class Engine(Attempts, Sensors, Staleness, Views):
         self.eval_interval = eval_interval
         ctx = PlacementContext(state, state.objects_url, project, self.clock, self)
         self.registry = registry or Registry(ctx, extra=placements)
-        # attempt id -> (run id, asyncio task): attempts this process is driving.
-        self.inflight: dict[str, tuple[str, asyncio.Task]] = {}
+        # (run id, attempt id) -> its watcher: attempts this process is driving.
+        self.watchers = Tasks("attempts")
+        self.tasks = Tasks("engine")  # the engine's own: the sensor host
         # Attempts whose end failed: (times, not adopted again before this monotonic time).
         self._crashes: dict[str, tuple[int, float]] = {}
         # attempt id -> set when its run is controlled, so its watcher looks at once.
@@ -299,13 +301,7 @@ class Engine(Attempts, Sensors, Staleness, Views):
         adopts them."""
 
         await self._stop_sensor_host()
-        if self.inflight:
-            # Launched attempts keep running: the next engine adopts them.
-            jobs = [t for _, t in self.inflight.values()]
-            for job in jobs:
-                job.cancel()
-            await asyncio.gather(*jobs, return_exceptions=True)
-            self.inflight.clear()
+        await self.watchers.close()  # launched attempts keep running: the next engine adopts them
         await self.upkeep.stop()
         await self.history.stop()
         if self.keys is not None:
@@ -359,7 +355,7 @@ class Engine(Attempts, Sensors, Staleness, Views):
             if run and run["status"] in TERMINAL:
                 # Wait only on this run's attempts — unrelated pool-placed runs
                 # may hold inflight waiters until a worker claims them.
-                mine = [t for r, t in self.inflight.values() if r == run_id]
+                mine = [self.watchers.get(k) for k in self.watchers if k[0] == run_id]
                 await asyncio.gather(*mine, return_exceptions=True)
                 detail = await self.run_detail(run_id)
                 self._archive_due()  # a one-shot caller (the CLI) leaves nothing behind
@@ -612,22 +608,22 @@ class Engine(Attempts, Sensors, Staleness, Views):
             try:
                 await work
             finally:  # before anyone awaiting the attempt resumes
-                self.inflight.pop(attempt, None)
                 self._stirred.pop(attempt, None)
                 self.live.pop(attempt, None)
                 self.engine_inflight.discard(attempt)
                 self.executor_inflight[executor] = max(0, self.executor_inflight.get(executor, 1) - 1)
 
-        self.inflight[attempt] = (run_id, asyncio.create_task(drive()))
+        self.watchers.spawn(drive(), key=(run_id, attempt))
 
     def _adopt(self):
         """Wait again for attempts launched before a restart (§8): their
         claims are durable, but nothing in this process waits on them yet."""
 
         now = asyncio.get_running_loop().time()
+        watched = {attempt for _, attempt in self.watchers}
         for task_id, claim in list(self.m.claims.items()):
             attempt = claim["attempt"]
-            if not claim.get("launched") or attempt in self.inflight:
+            if not claim.get("launched") or attempt in watched:
                 continue
             if self._crashes.get(attempt, (0, 0.0))[1] > now:  # its end failed: backing off
                 continue
@@ -2245,7 +2241,7 @@ class Engine(Attempts, Sensors, Staleness, Views):
     def _control(self, run_id: str, action: str, by: str | None):
         event = {"type": "RunControlled", "run": run_id, "action": action, "at": self.clock()}
         self.state.record({**event, "by": by} if by else event)
-        for attempt, (run, _job) in self.inflight.items():
+        for run, attempt in self.watchers:
             if run == run_id:
                 self._stirred.setdefault(attempt, asyncio.Event()).set()
 
@@ -2313,7 +2309,7 @@ class Engine(Attempts, Sensors, Staleness, Views):
         """Move finished runs from memory into the history, once none of
         their attempts is still in flight here (§7)."""
 
-        busy = {run_id for run_id, _ in self.inflight.values()}
+        busy = {run_id for run_id, _ in self.watchers}
         for run_id in sorted(self.m.archivable):
             if run_id in busy:
                 continue

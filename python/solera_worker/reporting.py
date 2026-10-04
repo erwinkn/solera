@@ -19,6 +19,7 @@ from obstore.exceptions import NotFoundError
 from solera import lifecycle
 from solera.lifecycle import Cancel, Ended
 from solera.objects import create
+from solera.tasks import Tasks
 
 FALLBACK_AFTER = 2  # failed beats before the worker also reports through `.beat`
 
@@ -133,7 +134,7 @@ class LogShipper:
         self.truncated = False
         self.dropped = 0  # lines past LOG_PENDING_MAX
         self._chunked_at = time.monotonic()
-        self._flush: asyncio.Task | None = None  # the one chunk write a full buffer started
+        self.tasks = Tasks("logs")  # the one chunk write a full buffer started
         self._lock = asyncio.Lock()  # one chunk written at a time
         # The buffers' one owner: lines come from the loop and from threads (a
         # synchronous Each call), while a chunk is compressed and written.
@@ -160,9 +161,9 @@ class LogShipper:
                     del self.live[:drop]
                     self.live_offset += drop
             full = self.pending_bytes >= LOG_CHUNK_BYTES
-        if full and (self._flush is None or self._flush.done()):  # one at a time, however many lines
+        if full and "chunk" not in self.tasks:  # one at a time, however many lines
             try:
-                self._flush = asyncio.get_running_loop().create_task(self.chunk())
+                self.tasks.spawn(self.chunk(), key="chunk")
             except RuntimeError:
                 pass  # logging from a thread: the next periodic flush ships it
 

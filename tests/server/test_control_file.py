@@ -237,7 +237,9 @@ async def test_an_attempt_that_cannot_be_ended_is_adopted_again_after_a_back_off
 
     monkeypatch.setattr(engine, "_follow", broken)
     monkeypatch.setattr(engine, "_end", unreachable)
-    engine.inflight.pop(attempt)[1].cancel()  # its first watcher goes: the next tick adopts it
+    next(
+        engine.watchers.get(k) for k in engine.watchers if k[1] == attempt
+    ).cancel()  # the next tick adopts it
     for _ in range(50):  # a second of ticks
         await engine.tick()
         await asyncio.sleep(0.02)

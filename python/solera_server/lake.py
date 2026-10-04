@@ -38,6 +38,7 @@ from urllib.parse import unquote, urlsplit
 
 import duckdb
 from solera.ids import ulid
+from solera.tasks import Tasks
 
 log = logging.getLogger(__name__)
 
@@ -158,7 +159,7 @@ class Lake:
         self.cache = Path(cache) if cache else None
         self.check_seconds = min(flush_seconds, 1.0)
         self._task: asyncio.Task | None = None  # the background loop, once started
-        self.job: asyncio.Task | None = None  # the merge under way
+        self.merges = Tasks("lake")  # the merge under way, one at a time
         self.last_error: str | None = None
         self._db = None  # in-memory DuckDB mirroring the buffers
         self._mirrored: dict[str, tuple] = {}  # table -> (state, generation, first seq, last seq)
@@ -190,11 +191,11 @@ class Lake:
         self.maintain()
 
     async def stop(self) -> None:
-        jobs = [j for j in (self._task, self.job) if j is not None]
-        for job in jobs:
-            job.cancel()
-        await asyncio.gather(*jobs, return_exceptions=True)
-        self._task = None
+        if self._task is not None:
+            self._task.cancel()
+            await asyncio.gather(self._task, return_exceptions=True)
+            self._task = None
+        await self.merges.close()
         if self._preparer is not None:
             self._preparer.shutdown(wait=False)
             self._preparer = None
@@ -309,14 +310,14 @@ class Lake:
         if self.job is not None:
             return
         plan = self.plan()
-        if not plan:
-            return
-        self.job = asyncio.create_task(self._compact(plan))
+        if plan:
+            self.merges.spawn(self._compact(plan), key="merge")
 
-        def done(_job):
-            self.job = None
+    @property
+    def job(self) -> asyncio.Task | None:
+        """The merge under way, if any."""
 
-        self.job.add_done_callback(done)
+        return self.merges.get("merge")
 
     def plan(self) -> list[tuple[str, list[dict]]]:
         """Groups of files to rewrite as one: `merge_width` neighbours of one

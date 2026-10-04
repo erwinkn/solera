@@ -650,12 +650,7 @@ async def test_fencing_concurrent_claim(state):
     only one attempt owns the partition."""
 
     class Hold(InlinePlacement):
-        async def launch(self, stage):
-            task = asyncio.create_task(self._slow(stage))
-            self._tasks[stage["attempt"]] = task
-            return {"id": stage["attempt"]}
-
-        async def _slow(self, stage):
+        async def _work(self, stage):
             await asyncio.sleep(0.5)
             from solera_worker.worker import run_attempt
 

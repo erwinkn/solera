@@ -76,6 +76,7 @@ from solera.stores import (
     prepare_for,
     resolve_env,
 )
+from solera.tasks import Tasks
 
 from . import each
 from .observed import Observed
@@ -1079,7 +1080,8 @@ async def run_attempt(
         reporter.cancel = started
         on_cancel(started)
     reporter.start()
-    flusher = asyncio.create_task(shipper.periodically())
+    tasks = Tasks("attempt")
+    flusher = tasks.spawn(shipper.periodically(), key="logs")
     try:
         try:
             result = await execution
@@ -1102,7 +1104,7 @@ async def run_attempt(
             return ENDED
         raise
     finally:
-        flusher.cancel()
+        await tasks.close()
         await reporter.stop()
         if channel is not None:
             channel.close()

@@ -246,15 +246,7 @@ def sim_key_service_class():
             if self.loop is None:
                 return
             self.loop = None
-            owners = (
-                set(self._owners)
-                | set(self.resolver._fills)
-                | set(self.resolver._inflight.values())
-                | set(self.cache._fills.values())
-            )
-            for t in owners:
-                t.cancel()
-            await asyncio.gather(*owners, return_exceptions=True)
+            await self._close_tasks()
 
         def _open(self, state):  # from a compaction's thread, while the loop waits for it
             if not self._running():

@@ -34,6 +34,7 @@ from obstore.exceptions import NotFoundError
 from obstore.store import LocalStore, MemoryStore
 from solera import lifecycle
 from solera.objects import create
+from solera.tasks import Tasks
 
 from .journal import Journal, Stopped, encode
 from .model import Model
@@ -102,6 +103,7 @@ class State:
         self.url, self.namespace, self.objects_url = url, namespace, objects_url
         self.journal, self.model, self.clock = journal, model, clock
         self.changed = asyncio.Event()  # set by every record, for whoever waits on changes
+        self.tasks = Tasks("state")  # the exit of a broken state: never canceled
 
     @classmethod
     async def open(
@@ -185,7 +187,7 @@ class State:
             "state failed applying an event (%r): exiting for the journal replay to recover it", error
         )
         try:
-            asyncio.get_running_loop().create_task(self._die())
+            self.tasks.spawn(self._die(), key="die")
         except RuntimeError:  # no loop to flush on
             self._exit(EXIT_BROKEN)
 

@@ -44,6 +44,7 @@ from collections import OrderedDict
 from dataclasses import dataclass, field
 
 from .. import _native
+from ..tasks import Tasks
 from .index import FileInfo, IndexState, digest
 from .io import ObjectIO
 from .threads import in_thread
@@ -171,7 +172,7 @@ class EngineCache:
         self.candidates: _Candidates = _Candidates()  # (path, size, digest) -> _Candidate
         self._file_bytes = 0  # of every local file
         self.reserved = 0
-        self._fills: dict[str, asyncio.Future] = {}
+        self._fills = Tasks("file fills")  # one fetch and build per file, shared by every reader
         self._builds = asyncio.Semaphore(builds)
         self._retired: OrderedDict[str, None] = OrderedDict()
         self._observed: OrderedDict[tuple[str, str], int] = OrderedDict()  # (path, digest) -> built size
@@ -383,9 +384,8 @@ class EngineCache:
 
     def _fill_one(self, io: ObjectIO, prefix: str, path: str, f: FileInfo):
         fut = self._fills.get(path)
-        if fut is None:
-            fut = self._fills[path] = asyncio.ensure_future(self._do_fill(io, prefix, path, f))
-            fut.add_done_callback(lambda _f: self._fills.pop(path, None))
+        if fut is None:  # its failure reaches every reader that asked
+            fut = self._fills.spawn(self._do_fill(io, prefix, path, f), key=path, awaited=True)
         return fut
 
     async def _do_fill(self, io: ObjectIO, prefix: str, path: str, f: FileInfo) -> bool:

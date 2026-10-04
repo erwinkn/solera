@@ -165,7 +165,7 @@ async def test_a_restarted_engine_adopts_and_commits_a_launched_attempt(tmp_path
     assert state.model.claimed(attempt)["launched"]
     await engine.initialize()
     await engine.tick()
-    assert attempt in engine.inflight  # adopted
+    assert attempt in {a for _, a in engine.watchers}  # adopted
     await finish_as_worker(state, run["id"], attempt, "remote")
     detail = await engine.run_until(run["id"], 60)
     assert detail["request"]["status"] == "succeeded"

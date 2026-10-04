@@ -17,6 +17,7 @@ import traceback
 from solera.lifecycle import Ended
 from solera.sdk import Project, Tick
 from solera.stores import resolve_env
+from solera.tasks import Tasks
 
 OVERRAN = 3  # the exit code of a host that gave up on a tick
 ORPHANED = 4  # the exit code of an engine's own host whose engine is gone
@@ -103,7 +104,7 @@ async def run_sensor_host(
     deploy = project.manifest["deploy"]
     build = (project.manifest.get("build") or {}).get("source")
     host = host or f"{socket.gethostname()}:{os.getpid()}"
-    running: set[asyncio.Task] = set()
+    running = Tasks("ticks")  # a task per tick running
     ran, overran, orphaned = 0, False, False
     stop = asyncio.Event()  # a tick overran, or the parent is gone: every wait below races it
 
@@ -137,13 +138,15 @@ async def run_sensor_host(
         orphaned = True
         stop.set()
 
-    stopped = asyncio.create_task(stop.wait())
-    watcher = asyncio.create_task(watch_parent()) if parent is not None else None
+    own = Tasks("sensor host")
+    stopped = own.spawn(stop.wait())
+    if parent is not None:
+        own.spawn(watch_parent())
     try:
         while ran < max_ticks and not stop.is_set():
             slots = min(concurrency - len(running), max_ticks - ran)
             if slots <= 0:
-                await asyncio.wait({*running, stopped}, return_when=asyncio.FIRST_COMPLETED)
+                await asyncio.wait({*running.values(), stopped}, return_when=asyncio.FIRST_COMPLETED)
                 continue
             poll = asyncio.create_task(channel.next(executor, deploy, host, slots, build))
             await asyncio.wait({poll, stopped}, return_when=asyncio.FIRST_COMPLETED)
@@ -160,17 +163,12 @@ async def run_sensor_host(
                 break
             for tick in answer["ticks"]:
                 ran += 1
-                task = asyncio.create_task(one(tick))
-                running.add(task)
-                task.add_done_callback(running.discard)
+                running.spawn(one(tick))
     finally:
-        stopped.cancel()
-        if watcher is not None:
-            watcher.cancel()
+        await own.close()
     if running:
-        await asyncio.wait(running, timeout=drain)
-        for task in running:
-            task.cancel()
+        await asyncio.wait(running.values(), timeout=drain)
+        await running.close()
     return ORPHANED if orphaned else OVERRAN if overran else 0
 
 

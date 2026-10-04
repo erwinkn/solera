@@ -21,7 +21,10 @@ import sys
 import tempfile
 import time
 import uuid
+from dataclasses import dataclass, field
 from pathlib import Path
+
+from solera.tasks import Tasks
 
 ENV_BLOCKLIST_PREFIXES = ("AWS_", "SOLERA_API_TOKEN", "GITHUB_", "GH_TOKEN", "RAILWAY_TOKEN")
 # What an S3 client reads to reach the state's bucket: a worker on the engine's
@@ -34,22 +37,33 @@ OBJECT_STORE_ENV = (
     *("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI", "AWS_CONTAINER_CREDENTIALS_FULL_URI"),
     "AWS_CONTAINER_AUTHORIZATION_TOKEN",
 )
-_running: dict[str, asyncio.subprocess.Process] = {}  # launch id -> this process's child, until it exits
-_tails: dict[str, list[bytearray]] = {}  # launch id -> its output's last bytes, until it exits
-_exits: dict[str, asyncio.Future] = {}  # launch id -> how it ended, until read or released
 
 
-async def _reap(launch: str, process) -> None:
+@dataclass
+class _Child:
+    """A child this process started: its output's last bytes, and its reaper,
+    whose result is how it ended."""
+
+    process: asyncio.subprocess.Process
+    tails: list[bytearray] = field(default_factory=lambda: [bytearray(), bytearray()])
+    reaper: asyncio.Task | None = None
+
+    def log(self) -> str:
+        return (bytes(self.tails[0]) + bytes(self.tails[1])).decode(errors="replace")[-65536:]
+
+
+# Launch id -> this process's child, until how it ended is read or released. Its drains
+# and reaper are this process's, not an engine's: a child outlives the engine that started it.
+_children: dict[str, _Child] = {}
+_tasks = Tasks("local children")
+
+
+async def _reap(child: _Child) -> dict:
     """Reap a child this process started, however its attempt was settled:
-    its registrations go, and how it ended waits for `wait` — or for no
-    one, once the engine released it."""
+    how it ended waits for `wait`, or for no one once the engine released it."""
 
-    await process.wait()
-    _running.pop(launch, None)
-    ended = {"code": process.returncode, "reason": None, "meta": {"log": _process_log(launch)}}
-    done = _exits.get(launch)
-    if done is not None and not done.done():
-        done.set_result(ended)
+    await child.process.wait()
+    return {"code": child.process.returncode, "reason": None, "meta": {"log": child.log()}}
 
 
 def _env(objects_url: str | None = None) -> dict:
@@ -84,13 +98,6 @@ async def _same(run: dict) -> bool | None:
     return await _start_ticks(run["pid"]) == run["ticks"]
 
 
-def _process_log(launch: str | None) -> str:
-    tails = _tails.pop(launch, None)
-    if not tails:
-        return ""
-    return (bytes(tails[0]) + bytes(tails[1])).decode(errors="replace")[-65536:]
-
-
 class LocalPlacement:
     """`Local()()` — subprocess with an explicit env allow-list (§10)."""
 
@@ -118,7 +125,7 @@ class LocalPlacement:
             stderr=asyncio.subprocess.PIPE,
             start_new_session=True,
         )
-        tails = [bytearray(), bytearray()]
+        child = _Child(process)
         total = [0]
 
         async def drain(stream, tail):
@@ -131,13 +138,11 @@ class LocalPlacement:
                         os.killpg(process.pid, signal.SIGKILL)
                     return
 
-        for stream, tail in zip((process.stdout, process.stderr), tails, strict=True):
-            asyncio.create_task(drain(stream, tail))
+        for stream, tail in zip((process.stdout, process.stderr), child.tails, strict=True):
+            _tasks.spawn(drain(stream, tail))
         launch = uuid.uuid4().hex
-        _running[launch] = process
-        _tails[launch] = tails
-        _exits[launch] = asyncio.get_running_loop().create_future()
-        asyncio.create_task(_reap(launch, process))
+        _children[launch] = child
+        child.reaper = _tasks.spawn(_reap(child), key=launch)
         return {
             "launch": launch,
             "pid": process.pid,
@@ -148,14 +153,14 @@ class LocalPlacement:
 
     async def wait(self, handle: dict, timeout: float) -> dict | None:
         launch = handle.get("launch")
-        done = _exits.get(launch)
-        if done is not None:
+        child = _children.get(launch)
+        if child is not None:
             # Our own child: its reaper says how it ended.
             try:
-                ended = await asyncio.wait_for(asyncio.shield(done), timeout)
+                ended = await asyncio.wait_for(asyncio.shield(child.reaper), timeout)
             except TimeoutError:
                 return None
-            _exits.pop(launch, None)
+            _children.pop(launch, None)
             return ended
         # Adopted after a restart, so not our child: watch whether it lives.
         deadline = time.monotonic() + timeout
@@ -173,13 +178,14 @@ class LocalPlacement:
     def release(self, run: dict) -> None:
         """The engine is done with this launch: how it ended goes once known."""
 
-        done = _exits.get(run.get("launch"))
-        if done is not None:
-            done.add_done_callback(lambda _: _exits.pop(run.get("launch"), None))
+        launch = run.get("launch")
+        child = _children.get(launch)
+        if child is not None:
+            child.reaper.add_done_callback(lambda _: _children.pop(launch, None))
 
     async def cancel(self, handle: dict) -> None:
-        launch = handle.get("launch")
-        process = _running.get(launch)
+        child = _children.get(handle.get("launch"))
+        process = child.process if child is not None and not child.reaper.done() else None
         if process is not None:
             with contextlib.suppress(ProcessLookupError, PermissionError):
                 os.killpg(process.pid, signal.SIGTERM)

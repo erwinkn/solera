@@ -41,7 +41,6 @@ class Sensors:
         self.sensor_due: dict[str, float] = {}  # sensor -> loop time it is next due; memory only
         self.sensor_hosts: dict[str, dict] = {}  # hosts that asked for ticks lately
         self._sensors_changed = asyncio.Event()
-        self._host_task: asyncio.Task | None = None
 
     def _sensors(self, executor: str | None = None) -> dict[str, dict]:
         declared = self.manifest.get("sensors") or {}
@@ -302,19 +301,19 @@ class Sensors:
     # -- the local host (§11.2) -------------------------------------------------------------
 
     def _start_sensor_host(self) -> None:
-        if not self._sensors("local") or self._host_task is not None:
+        if not self._sensors("local") or "sensor host" in self.tasks:
             return
         if self.sensor_host is None and not (self.engine_url and self.project):
             log.warning("sensors on the local host need an engine URL to report to; none tick")
             return
-        self._host_task = asyncio.create_task(self._keep_host())
+        self.tasks.spawn(self._keep_host(), key="sensor host")
 
     async def _stop_sensor_host(self) -> None:
-        if self._host_task is not None:
-            self._host_task.cancel()
+        host = self.tasks.get("sensor host")
+        if host is not None:
+            host.cancel()
             with contextlib.suppress(asyncio.CancelledError):
-                await self._host_task
-            self._host_task = None
+                await host
 
     async def _keep_host(self) -> None:
         """Keep the local host running: restarted with backoff if it exits.

@@ -28,6 +28,7 @@ from dataclasses import dataclass
 
 from .. import _native
 from .._native import LimitError, LocalError, SortedEntries
+from ..tasks import Tasks
 from .cache import EngineCache
 from .index import IndexState, Options
 from .io import ObjectIO
@@ -134,8 +135,8 @@ class Resolver:
         self.limits = limits or Limits()
         self._sem = asyncio.Semaphore(self.limits.concurrency)
         self._queued = 0
-        self._inflight: dict[tuple, asyncio.Future] = {}
-        self._fills: set[asyncio.Task] = set()
+        self._inflight = Tasks("resolves")  # one compute per distinct request, shared by duplicates
+        self._fills = Tasks("index fills")
 
     def _reserve(self, n: int) -> bool:
         """Room in the queue for `n` bytes, taken now: released by `_release`."""
@@ -224,15 +225,10 @@ class Resolver:
                 return {**declined, "reason": "busy"}, None
             # The worker uploads the delta under its own name: kept as a candidate under it.
             path = p.index.path(f"{p.commit_number:012d}-{attempt}.0000")
-            fut = self._inflight[key] = asyncio.ensure_future(self._compute(p, kind, data, live, path, keys))
-
+            # Its failure reaches every request that shares it: not logged here as well.
+            fut = self._inflight.spawn(self._compute(p, kind, data, live, path, keys), key=key, awaited=True)
             size = len(data)
-
-            def done(_f, key=key, size=size):
-                self._inflight.pop(key, None)
-                self._release(size)
-
-            fut.add_done_callback(done)
+            fut.add_done_callback(lambda _f: self._release(size))
         return await asyncio.shield(fut)
 
     async def compute(self, p: Prepared, kind: str, run: SortedEntries, path: str):
@@ -321,9 +317,7 @@ class Resolver:
                 if token is not None:
                     self.pins.unpin(token)
 
-        t = asyncio.ensure_future(fill())
-        self._fills.add(t)
-        t.add_done_callback(self._fills.discard)
+        self._fills.spawn(fill())
 
 
 def _writer(o: Options, max_file_bytes: int) -> dict:
