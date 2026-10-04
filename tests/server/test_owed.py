@@ -3,8 +3,10 @@ of upstream commits, runs walking their batches from their progress (some
 of them keys= lists or "all"), commits landing between batches, and the
 patterns and context changing between runs. Each batch's classes update
 the literal observed set; after every batch commit the record decodes to
-it, and a run that saw no commit meanwhile leaves nothing owed and the set
-equal to upstream (docs/observed-set.md)."""
+it — a key changed since it was observed at a version since replaced
+(None), the index keeping no older ones — and a run that saw no commit
+meanwhile leaves nothing owed and the set equal to upstream
+(docs/observed-set.md)."""
 
 import random
 
@@ -28,11 +30,38 @@ async def commit(h: History, rng: random.Random) -> None:
     await h.commit(upserts, rng.sample(live, min(len(live), rng.randrange(0, 4))))
 
 
-def check(h: History, rec: dict, truth: dict) -> None:
-    def at(endpoint, key):
-        return h.states[endpoint].get(key)
+def at_h(index, h: int):
+    """`index`, asserting each read is Δ or a scan at H, `h`, or the head —
+    never a key view at an older commit, which the index does not serve
+    (A31 R2)."""
 
-    assert {k: observed.decode(rec, k, at) for k in KEYS if observed.decode(rec, k, at)} == truth
+    lookup, page = index.lookup, index.page
+    allowed = {None, h + 1}
+
+    async def checked_lookup(keys, at=None):
+        assert at in allowed, f"a lookup at {at - 1}, under H {h}"
+        return await lookup(keys, at=at)
+
+    async def checked_page(after, limit, at=None):
+        assert at in allowed, f"a scan at {at - 1}, under H {h}"
+        return await page(after, limit, at=at)
+
+    index.lookup, index.page = checked_lookup, checked_page
+    return index
+
+
+def check(h: History, rec: dict, truth: dict) -> None:
+    head = h.states[h.commit_number - 1]
+
+    def at(endpoint, key):  # as the index answers: no version at an older commit
+        then = h.states[endpoint].get(key)
+        return then if then == head.get(key) else (observed.OLDER if then is not None else None)
+
+    decoded = {k: found for k in KEYS if (found := observed.decode(rec, k, at)) is not None}
+    assert decoded.keys() == truth.keys()
+    for k, (version, context) in decoded.items():
+        assert context == truth[k][1], k
+        assert version == truth[k][0] or (version is None and truth[k][0] != head.get(k)), k
 
 
 @pytest.mark.parametrize("seed", range(30))
@@ -52,8 +81,11 @@ async def test_runs_keep_the_record_equal_to_the_observed_set(seed):
         size, progress, quiet = rng.choice([1, 3, 7, 100]), None, True
         while True:
             now = owed.Now(h.commit_number - 1, patterns, context, "life")
-            b = await owed.batch(h.index(), rec, now, size, after=progress, keys=mode)
-            ops = await owed.commit_ops(h.index(), rec, now, b, named=isinstance(mode, list))
+            b = await owed.batch(at_h(h.index(), now.head), rec, now, size, after=progress, keys=mode)
+            if rng.random() < 0.3:  # the upstream moves on while the batch runs
+                await commit(h, rng)
+                quiet = False
+            ops = await owed.commit_ops(at_h(h.index(), now.head), rec, now, b, named=isinstance(mode, list))
             observed.apply(rec, ops)
             for o in b.keys:
                 if o.cls == "removed":
@@ -64,9 +96,6 @@ async def test_runs_keep_the_record_equal_to_the_observed_set(seed):
             if b.final:
                 break
             progress = b.end
-            if rng.random() < 0.3:  # the upstream moves on mid-run
-                await commit(h, rng)
-                quiet = False
         if mode is None and quiet:
             now = owed.Now(h.commit_number - 1, patterns, context, "life")
             assert await owed.owed(h.index(), rec, now) == []
@@ -115,3 +144,20 @@ async def test_a_named_key_held_as_it_is_is_unchanged():
     observed.apply(rec, await owed.commit_ops(h.index(), rec, now, await owed.batch(h.index(), rec, now, 10)))
     b = await owed.batch(h.index(), rec, now, 10, keys=["k1", "k9"])
     assert [(o.key, o.cls) for o in b.keys] == [("k1", "unchanged")]  # k9: absent, never held
+
+
+async def test_a_held_base_owes_each_held_key_an_update_or_a_removal():
+    """A per-key consumer's full run compares against what it holds: a key
+    there is present at no upstream version — updated if upstream has it,
+    removed if not — and every other upstream key is added."""
+
+    upstream, held = History(), History()
+    await upstream.commit(["k1", "k2"])
+    await held.commit(["k2", "k3"])
+    rec = observed.record("life", held=True)
+    now = owed.Now(0, None, {}, "life")
+    owes = await owed.owed(upstream.index(), rec, now, held=[held.index()])
+    assert [(o.key, o.cls) for o in owes] == [("k1", "added"), ("k2", "updated"), ("k3", "removed")]
+    b = await owed.batch(upstream.index(), rec, now, 10, held=[held.index()])
+    observed.apply(rec, await owed.commit_ops(upstream.index(), rec, now, b, held=[held.index()]))
+    assert rec["ranges"] == [] and rec["base"]["endpoint"] == 0 and "held" not in rec["base"]

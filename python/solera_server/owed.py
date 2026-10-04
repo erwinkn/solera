@@ -1,14 +1,26 @@
 """What a consumer partition owes of a keyed input (docs/observed-set.md):
 candidates from its observation record's layers, read through the index's
-Δ(P, H, keys); each classed once, from its decoded old state to its new
-one at the head H; a task's batches walking them in key order from its
-progress; and what a batch's commit records, the fold included.
+Δ(P, H, keys) and scans at H; each classed once, from its decoded old
+state to its new one at the head H; a task's batches walking them in key
+order from its progress; and what a batch's commit records, the fold
+included.
+
+The index serves no key view at an older commit, nor versions there:
+only Δ, with presence at both ends, and scans at H. So a layer observed at
+P decodes a key it did not change since at H's version, and one changed
+since — present at P, by Δ's flips — at a version since replaced (None),
+which a present key is owed an update for: the redundant update a revert
+to the old version costs, in exchange for no old versions kept.
 
 Classes: `added` (not held, present now), `removed` (held, absent or no
 longer taken), `updated` (held at another version, or under another
 context), and — for a key a run asked for that is held as it is —
 `unchanged`. A key's version is the source's own word where its index
-entry carries one (its payload), else the generation that wrote it."""
+entry carries one (its payload), else the generation that wrote it.
+
+`held`: a per-key consumer's own indexes (its outputs and failure
+records), what a held base decodes from — a key there is present at no
+upstream version, so owed an update if upstream has it, else a removal."""
 
 from __future__ import annotations
 
@@ -16,7 +28,7 @@ import copy
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 
-from solera.keys.delta import delta
+from solera.keys.delta import delta, version_of
 from solera.keys.index import KeyIndex
 from solera.patterns import Matcher
 
@@ -59,12 +71,6 @@ class Batch:
     final: bool
 
 
-def version_of(generation, payload):
-    if isinstance(payload, bytes):
-        return payload.decode()
-    return payload if payload is not None else generation
-
-
 def segments(rec: dict):
     """The key space in order, as `(lo, hi, layer)`: the ranges, the base filling the gaps."""
 
@@ -87,11 +93,9 @@ def _same(layer: dict, now: Now, cid: str) -> bool:
     )
 
 
-async def _live(index: KeyIndex, at: int | None, after: str | None, hi: str | None) -> AsyncIterator:
-    """Every key live after commit `at` (None: none are) in `(after, hi]`, as Δ(−∞, at)."""
+async def _live(index: KeyIndex, at: int, after: str | None, hi: str | None) -> AsyncIterator:
+    """Every key live at H, `at`, in `(after, hi]`: a scan at H, as Δ(−∞, H)."""
 
-    if at is None:
-        return
     async for d in _diffs(index, None, at, after, hi):
         yield d
 
@@ -106,6 +110,21 @@ async def _diffs(index: KeyIndex, p, h, after, hi) -> AsyncIterator:
         if page.cursor is None or (hi is not None and page.cursor >= hi):
             return
         after = page.cursor
+
+
+async def _holding(held, after: str | None, hi: str | None) -> AsyncIterator:
+    """Every key a per-key consumer holds in `(after, hi]`: the union of its indexes."""
+
+    stream = _none()
+    for index in held or ():
+        stream = _either(_merged(stream, _diffs(index, None, None, after, hi)))
+    async for d in stream:
+        yield d
+
+
+async def _either(pairs) -> AsyncIterator:
+    async for _, x, y in pairs:
+        yield x or y
 
 
 async def _merged(a: AsyncIterator, b: AsyncIterator) -> AsyncIterator:
@@ -125,11 +144,15 @@ async def _merged(a: AsyncIterator, b: AsyncIterator) -> AsyncIterator:
             x, y = await anext(a, sentinel), await anext(b, sentinel)
 
 
-async def candidates(index: KeyIndex, rec: dict, now: Now, after: str | None = None) -> AsyncIterator[Owe]:
+async def candidates(
+    index: KeyIndex, rec: dict, now: Now, after: str | None = None, held=None
+) -> AsyncIterator[Owe]:
     """Every key the partition may owe past `after`, in key order, classed
     (`cls` None: owed nothing). A segment observed under the labels of now
     yields its changes since its head; one under other patterns or context
-    is compared whole, both ends read; a point is decided by itself."""
+    is compared whole — a scan at H, its keys' presence at the segment's
+    head from Δ's flips; a held base against what the consumer holds; a
+    point is decided by itself."""
 
     cid = observed.context_id(now.context)
     take = Matcher(now.patterns)
@@ -142,24 +165,38 @@ async def candidates(index: KeyIndex, rec: dict, now: Now, after: str | None = N
         at_h = {d.key: d for d in (await delta(index, None, now.head, keys=mine)).diffs} if mine else {}
         then = Matcher(layer["patterns"])
         context = rec["contexts"].get(layer["context"], {})
-        if layer["endpoint"] is not None and _same(layer, now, cid):
+        if layer.get("held"):
+            stream = _merged(_holding(held, start, hi), _live(index, now.head, start, hi))
+            whole = True
+        elif layer["endpoint"] is not None and _same(layer, now, cid):
             stream = _merged(_diffs(index, layer["endpoint"], now.head, start, hi), _none())
             whole = False
         else:
-            stream = _merged(_live(index, layer["endpoint"], start, hi), _live(index, now.head, start, hi))
+            changed = (
+                _none()
+                if layer["endpoint"] is None
+                else _diffs(index, layer["endpoint"], now.head, start, hi)
+            )
+            stream = _merged(changed, _live(index, now.head, start, hi))
             whole = True
         found = []
         async for key, before, current in stream:
             if key in rec["points"]:
                 continue
-            if whole:
-                old = (
-                    (version_of(before.generation, before.payload), context) if before and then(key) else None
-                )
+            if layer.get("held"):
+                old = (None, {}) if before else None
+                new = current if current and take(key) else None
+            elif whole:
+                if before is not None:  # changed since the segment's head: present then by Δ's flips
+                    was, version = before.before, None
+                else:  # unchanged since: as at H
+                    was = current is not None and layer["endpoint"] is not None
+                    version = version_of(current.generation, current.payload) if was else None
+                old = (version, context) if was and then(key) else None
                 new = current if current and take(key) else None
             else:  # a difference between the layer's head and H, under one label
                 d = before
-                old = (None, context) if d.before and then(key) else None  # its version: read when needed
+                old = (None, context) if d.before and then(key) else None  # at a version since replaced
                 new = d if d.after and take(key) else None
             found.append(_owe(key, old, new, now.context, versioned=whole))
         for key in mine:
@@ -194,29 +231,30 @@ def _owe(key, old, new, context, *, versioned: bool) -> Owe:
     return Owe(key, cls, old, version, generation)
 
 
-async def owed(index: KeyIndex, rec: dict, now: Now, after: str | None = None) -> list[Owe]:
+async def owed(index: KeyIndex, rec: dict, now: Now, after: str | None = None, held=None) -> list[Owe]:
     """Every key owed past `after`: the staleness, and what a default run loads."""
 
-    return [o async for o in candidates(index, rec, now, after) if o.cls is not None]
+    return [o async for o in candidates(index, rec, now, after, held) if o.cls is not None]
 
 
 async def batch(
-    index: KeyIndex, rec: dict, now: Now, size: int, after: str | None = None, keys=None
+    index: KeyIndex, rec: dict, now: Now, size: int, after: str | None = None, keys=None, held=None
 ) -> Batch:
     """A task's next batch past its progress `after`, at H. By default the
     first `size` owed keys, covering up to the last; with `keys` a list,
-    the next `size` of those named (the input's patterns filtering them),
-    each owed or `unchanged`; with `keys="all"`, every key present at H,
-    owed or `unchanged`, and every owed removal."""
+    the next `size` of those named, each owed — one the input's patterns
+    leave out, a removal if held — or `unchanged`; with `keys="all"`, every
+    key present at H, owed or `unchanged`, and every owed removal."""
 
     take = Matcher(now.patterns)
     if isinstance(keys, list):
-        named = sorted(k for k in set(keys) if take(k) and (after is None or k > after))
+        named = sorted(k for k in set(keys) if after is None or k > after)
         page, rest = named[:size], named[size:]
-        found = {d.key: d for d in (await delta(index, None, now.head, keys=page)).diffs} if page else {}
+        mine = [k for k in page if take(k)]
+        found = {d.key: d for d in (await delta(index, None, now.head, keys=mine)).diffs} if mine else {}
         out = []
         for key in page:
-            old = await _decoded(index, rec, key)
+            old = await _decoded(index, rec, key, held)
             d = found.get(key)
             owe = _owe(key, old, d, now.context, versioned=True)
             if owe.cls is None and d is not None:
@@ -225,9 +263,9 @@ async def batch(
                 out.append(owe)
         return Batch(out, after, page[-1] if page else after, not rest)
     picked: list[Owe] = []
-    source = candidates(index, rec, now, after)
+    source = candidates(index, rec, now, after, held)
     if keys == "all":
-        source = _with_unchanged(index, rec, now, after, source)
+        source = _with_unchanged(index, rec, now, after, source, held)
     async for owe in source:
         if owe.cls is None:
             continue
@@ -236,8 +274,8 @@ async def batch(
             more = await anext(_owed_only(source), None)
             if more is None:
                 break
-            return Batch(await _filled(index, rec, picked), after, picked[-1].key, False)
-    return Batch(await _filled(index, rec, picked), after, None, True)
+            return Batch(picked, after, picked[-1].key, False)
+    return Batch(picked, after, None, True)
 
 
 async def _owed_only(stream):
@@ -246,7 +284,7 @@ async def _owed_only(stream):
             yield owe
 
 
-async def _with_unchanged(index, rec, now, after, owed_stream) -> AsyncIterator[Owe]:
+async def _with_unchanged(index, rec, now, after, owed_stream, held=None) -> AsyncIterator[Owe]:
     """`keys="all"`: every key present at H taken by the patterns, owed or
     `unchanged`, and the owed removals among them, all in key order."""
 
@@ -259,49 +297,42 @@ async def _with_unchanged(index, rec, now, after, owed_stream) -> AsyncIterator[
         if left and left[0] == d.key:
             yield owed[left.pop(0)]
         elif take(d.key):
-            old = await _decoded(index, rec, d.key)
+            old = await _decoded(index, rec, d.key, held)
             yield Owe(d.key, "unchanged", old, version_of(d.generation, d.payload), d.generation)
     for key in left:
         yield owed[key]
 
 
-async def _decoded(index: KeyIndex, rec: dict, key: str) -> tuple | None:
-    found = {}
-
-    async def at(endpoint, k):
-        if endpoint not in found:
-            found[endpoint] = {d.key: d for d in (await delta(index, None, endpoint, keys=[k])).diffs}
-        d = found[endpoint].get(k)
-        return None if d is None else version_of(d.generation, d.payload)
+async def _decoded(index: KeyIndex, rec: dict, key: str, held=None) -> tuple | None:
+    """`key`'s observation as its record decodes it, read at the head: its
+    layer's — observed at P — at the head's version if Δ(P, head) does not
+    name it, else, present at P by its flips, at a version since replaced."""
 
     holder = observed.holder(rec, key)
-    if "present" not in holder and holder["endpoint"] is not None and Matcher(holder["patterns"])(key):
-        version = await at(holder["endpoint"], key)
-        return None if version is None else (version, rec["contexts"].get(holder["context"], {}))
-    return observed.decode(rec, key, lambda e, k: None)
-
-
-async def _filled(index: KeyIndex, rec: dict, owes: list[Owe]) -> list[Owe]:
-    """The batch's old observations whose versions a difference did not carry,
-    read at their layers' heads."""
-
-    out = []
-    for owe in owes:
-        if owe.old is not None and owe.old[0] is None:
-            owe = Owe(owe.key, owe.cls, await _decoded(index, rec, owe.key), owe.new, owe.generation)
-        out.append(owe)
-    return out
+    if holder.get("held"):
+        for index in held or ():
+            if (await delta(index, None, None, keys=[key])).diffs:
+                return None, {}
+        return None
+    if "present" in holder or holder["endpoint"] is None or not Matcher(holder["patterns"])(key):
+        return observed.decode(rec, key, lambda e, k: None)
+    context = rec["contexts"].get(holder["context"], {})
+    changed = (await delta(index, holder["endpoint"], None, keys=[key])).diffs
+    if changed:
+        return (None, context) if changed[0].before else None
+    now = (await delta(index, None, None, keys=[key])).diffs
+    return (version_of(now[0].generation, now[0].payload), context) if now else None
 
 
 async def commit_ops(
-    index: KeyIndex, rec: dict, now: Now, b: Batch, served: dict | None = None, *, named=False
+    index: KeyIndex, rec: dict, now: Now, b: Batch, served: dict | None = None, *, named=False, held=None
 ) -> list[dict]:
     """What a batch's commit records: its range `(after, end] @ H` — or, for
     keys named outright, a point each — the points of what a source served
     otherwise (`served`: key -> version, None for no row), then the fold:
     every older range relabels to H, its keys changed since its head kept as
-    points at their observed version, and a point that decodes the same
-    without it goes."""
+    points — present ones at a version since replaced — and a point that
+    decodes the same without it goes."""
 
     work = copy.deepcopy(rec)
     label = observed.layer(work, now.head, now.patterns, now.context, now.life)
@@ -340,7 +371,7 @@ async def commit_ops(
         async for d in _diffs(index, r["endpoint"], now.head, r["lo"], r["hi"]):
             if d.key in work["points"]:
                 continue
-            was = await _decoded(index, work, d.key)
+            was = await _decoded(index, work, d.key, held)
             if was is None:
                 fold.append({"op": "point", "key": d.key, "present": False, "label": span})
             else:
@@ -355,7 +386,7 @@ async def commit_ops(
             or holder["patterns"] != p["patterns"]
         ):
             continue
-        without = await _decoded(index, {**work, "points": {}}, key)
+        without = await _decoded(index, {**work, "points": {}}, key, held)
         mine = (p["version"], work["contexts"].get(p["context"], {})) if p["present"] else None
         if without == mine:
             fold.append({"op": "drop", "key": key})

@@ -4,7 +4,8 @@ Status: **the spec, being built** (D153): the rebuild replaces positions,
 read-ahead, passes and the staleness predicates with what this doc
 describes, step by step on `main`, over the index's Δ(P, H, keys)
 interface. It was revised after review A27 ("build with listed changes"),
-W36's model of it (`ObservedSet.tla`), Erwin's removal of the pass (a run
+W36's model of it (`ObservedSet.tla`), review A31's reads (R2, R3: Δ and
+scans at a head only), Erwin's removal of the pass (a run
 keeps only its progress, and each batch records what it observed at
 its own head), and his naming calls (D140); fenced stores' and sources'
 reads follow D144 and D146/D147. Names (D133): the **observed set** is
@@ -58,6 +59,19 @@ side.
 written by a committed batch, and every fold leaves the decoded value
 unchanged.
 
+**What the index can say.** The key index serves Δ(P, H) — every key whose
+state differs between P and H, present or not at each end, at its version
+at H — and scans at the head or at a head a batch pinned; no key view at
+an older commit, and no version there (A31 R2). So `decode` knows a key's
+version exactly while the key is unchanged since it was observed: Δ
+does not name it, and its version is the head's. A key changed since is
+known only to have been present or absent then (Δ's flips); a present one
+decodes **at a version since replaced**, which classifies as another
+version: an update. The cost is a redundant update when a key returns to
+the very version observed; the gain, no old versions kept anywhere. The
+invariant holds with that reading: `decode(R)(k)` is `S(k)`, or says `S(k)`'s
+version has been replaced since — which is true.
+
 ## The observation record
 
 The observation record `R` is three layers, the first that holds `k`
@@ -68,7 +82,8 @@ deciding:
    observation of `k` is not what a range or the base would decode: keys
    a run loaded by an explicit `keys=` list; a source serving a row other
    than the version at the batch's head, or none; and a key that changed
-   under a range as the range folds (below). A point pins nothing (A27 R11).
+   under a range as the range folds (below), present at a version since
+   replaced or absent. A point pins nothing (A27 R11).
 2. **Ranges**: disjoint key ranges `[lo, hi] → (H, patterns, context,
    life)`: every key in it as upstream had it at head `H`, if those
    patterns take it, else absent. A batch's commit writes one: the key
@@ -77,7 +92,7 @@ deciding:
 3. **The base**: `(P, patterns, context, life)`: every key as at endpoint
    `P`, if those patterns take it, else absent. One per partition, in one
    of two forms (below): a **commit** `P`, or a commit `C` with a
-   **before-image** of what changed since `P`.
+   **before-image** of what changed between `P` and `C`.
 
 Patterns are stored normalised: no `include` is the universal include,
 never an empty list (A27 R3). Contexts are stored once per partition, in
@@ -93,10 +108,11 @@ atomically (A27 R8).
 **Fold**, at each batch commit, after the overwrite:
 
 - **An older range relabels to `H`.** Its keys that changed between its
-  own head and `H` — found with `changes` restricted to its key range —
-  first become points at the version it observed; nothing left under it
-  then changed, so it decodes the same at `H`. Points are therefore
-  bounded by the keys that changed during the run.
+  own head and `H` — found with Δ(its head, H) restricted to its key
+  range — first become points as it decodes them: present at a version
+  since replaced, or absent, by Δ's flips; nothing left under it then
+  changed, so it decodes the same at `H`. Points are therefore bounded by
+  the keys that changed during the run.
 - Adjacent ranges at the same head, patterns, context and life merge.
   When one range spans every key, it **becomes the base**.
 - **An override drops** when the value decoded *with it removed* equals
@@ -186,35 +202,37 @@ return {"count": count + len(batch.added) - len(batch.removed)}
 
 ## Two forms of base: a commit, or a commit with a before-image
 
-A base is normally a **commit**: `P`, decoded against the upstream's
-history — so the key index keeps `P` as an endpoint. When retention is
-about to cut past `P`, at a cut `C`, the base takes its second form: the
-commit `C` with a **before-image** — a file of only the keys changed in
-`(P, C]` (under `P`'s patterns), each with its presence and version or
-payload at `P`. A key added in `(P, C]` is in it as absent; one removed,
-as present at its old version. Upkeep writes it once, from the index
-while `P` is still readable (index metadata, no store code), and one
-journal event installs it before the cut: `P` is released, `C` becomes
-the base's endpoint. Points stay as they are. A range older than the cut
-folds to `C` as at a batch commit: the keys changed in its range become
+A base is normally a **commit**: `P`, decoded through Δ(P, head) — so the
+key index keeps `P` as an endpoint. When retention needs `P` gone, the
+base takes its second form: the head `C` it is folded to, with a
+**before-image** — a file of only the keys Δ(P, C) names under `P`'s
+patterns, each with its presence at `P` (its flips; the index has no
+version at `P`). A key added since `P` is in it as absent; one removed or
+changed, as present at a version since replaced. Upkeep writes it once,
+from Δ(P, C) while `P` is still an endpoint (index metadata, no store
+code), and one journal event installs it: `P` is released, and `C`
+becomes the base's endpoint. Points stay as they are. A range older than
+`C` folds to it as at a batch commit: the keys changed in its range become
 points, and it relabels. The before-image is the base's fold, kept as a
 file because the base's changed keys can be many.
 
-Decode reads the before-image for its keys and the key view at `C` for
-everything else — the same answer `P` gave. Classify is unchanged.
-Candidates: the before-image's keys, `changes(C, now)`, and a membership
-query if the patterns differ from the base's. If retention later cuts
-past `C` too, the next before-image adds the keys changed in `(C, C′]`,
-keeping each existing key's entry at `P`. When a run's ranges become the
-base, the file is deleted.
+Decode reads the before-image for its keys and Δ(C, head) for everything
+else — the same answer `P` gave, versions since replaced included.
+Classify is unchanged. Candidates: the before-image's keys, Δ(C, now)'s,
+and a membership query if the patterns differ from the base's. A later
+fold adds the keys Δ(C, C′) names, keeping each existing entry as it was
+at `P`. When a run's ranges become the base, the file is deleted.
 
-Its size is proportional to the keys changed in `(P, C]`, not to the
+Its size is proportional to the keys changed since `P`, not to the
 index: a reader that lags while a few keys churn holds a few entries
 (~27 B each). A full file — the whole observed set — is only the degenerate
 case where nearly every key changed.
 
-The index stays reader-agnostic: retention asks for every base and range
-older than its cut to be folded first, and keeps no per-reader snapshot.
+The index stays reader-agnostic: its cut is the **oldest live `P`**, never
+past one (A31 R3). The retention window does not move the cut; it
+*triggers* the before-image folds of the records whose `P` lags it, and
+those raise the oldest live `P`. So `P ≥ cut` is an invariant, and a read
+refused for a cut is an alarm, never a race between a fold and upkeep.
 The reader owns its before-image through its observation record.
 
 ## Observations: what was read (A27 R2)
@@ -305,38 +323,44 @@ an old life, and the engine makes the next run a full run — the same as
 For a decode-equal state with unchanged patterns and context, the
 candidates are complete:
 
-- `changes(P, now)`'s keys, outside the ranges and points;
-- for each range, `changes(H, now)` within it — which also finds a key
+- Δ(P, now)'s keys, outside the ranges and points;
+- for each range, Δ(H, now) within it — which also finds a key
   absent at `H` and restored since, absent at `P` too (A27 R9);
-- every point's key.
+- every point's key, by a lookup at now compared with the point.
 
 Outside them a key's old and new states are the base's, unchanged. Each
 is classed once. A base with a before-image adds the before-image's keys
-to `changes(C, now)`'s. A batch takes the same candidates within its key
+to Δ(C, now)'s. A batch takes the same candidates within its key
 range, at its head.
 
 **When the patterns changed**, the keys whose membership may differ are
 added: those a changed pattern can match. After normalisation, each glob
 has a literal prefix (the characters before its first wildcard; a regex
-only a proved common prefix), which bounds it to one key range: scanned
-in each layer's index state and at now, clipped to that layer's range,
-in the index's byte order with the exact prefix key included (`after` and
-`until` are exclusive). A pattern with no prefix — the universal include
-appearing or going, `**/archive/**`, `*template*`, an unanchored regex —
-bounds nothing: its query is the whole range, a full compare.
+only a proved common prefix), which bounds it to one key range, clipped
+to each layer's range, in the index's byte order with the exact prefix
+key included (`after` and `until` are exclusive). Nothing is scanned at
+an old commit: a key's presence at a layer's head `P` is its presence at
+now, flipped where Δ(P, now) names it — so one scan at now under the
+prefix, merged with Δ(P, now) over it, gives both sides; a key Δ does not
+name was at now's version then. A pattern with no prefix — the universal
+include appearing or going, `**/archive/**`, `*template*`, an unanchored
+regex — bounds nothing: its query is the whole range, a full compare,
+the same composition over every key.
 
 **When the context changed**, the base (and any range under the old
-context) is scanned for its present keys, as above.
+context) is compared whole, as above, for its present keys.
 
-**Costs.** The usual comparison is today's delta read plus point lookups.
-A changed prefix pattern costs the keys under the prefix in each view. A
-full compare reads the upstream at `P` and now, merged with the
-overrides: two key views, streamed (bounded memory, not bounded reads);
-at 100M keys several GB, run when a run plans. Endpoints retained: `P`
-and each range's `H`. The fold relabels older ranges to the newest head
-at every batch commit, so a run in progress holds two: `P` and its latest
-`H`; points add none. Each range is one `changes` call over its key range;
-points are one key-list call.
+**Costs.** The usual comparison is a Δ read plus point lookups. A changed
+prefix pattern costs the keys under the prefix at now and Δ over it. A
+full compare reads every key at now and Δ(P, now), merged with the
+overrides: streamed (bounded memory, not bounded reads); at 100M keys
+several GB, run when a run plans. Endpoints retained: `P` and each
+range's `H`. The fold relabels older ranges to the newest head at every
+batch commit, so a run in progress holds two: `P` and its latest `H`;
+points add none. Each range is one Δ call over its key range; points
+are one key-list lookup at now (A31 R1: a key-list Δ from an older `P`
+is only as good as the index's form for it; a lookup at now compared
+with the record needs none).
 
 **Freshness is exact or pending** (A27 R10). Staleness is the comparison,
 computed and cached per observation record revision and upstream head; where a
@@ -413,10 +437,10 @@ removals.
 **A run in two batches.** From `⊥`, `batch_size=1` over `k1`, `k2`. Batch
 1 reads at `H1`, delivers `k1`, and writes `(−∞, k1] @ H1`. `k2` changes
 at `H2`. Batch 2 reads at `H2`, delivers `k2` at its new version, and
-writes `(k1, +∞) @ H2`. Fold: `changes(H1, H2)` within `(−∞, k1]` is
+writes `(k1, +∞) @ H2`. Fold: Δ(H1, H2) within `(−∞, k1]` is
 empty, so that range relabels to `H2`; the two merge and span every key:
-the base is `(H2)`. Had `k1` changed too, it would keep its `H1` version
-as a point, owed by the next run.
+the base is `(H2)`. Had `k1` changed too, it would become a point,
+present at a version since replaced: an update owed by the next run.
 
 **A cancelled run.** Batches 1 and 2 committed `(−∞, k1] @ H1` and
 `(k1, k2] @ H2` (the first relabelled to `H2` at the second's commit, the
@@ -454,14 +478,15 @@ a run that day delivers it in its first batch, writing `(−∞, k0] @ P′`,
 and is cancelled. Its automation is then disabled, and the index keeps 30
 days of history. Upstream: `k2` updated on day 10, `k3` removed on day
 20, `k4` added on day 35. On day 29, retention's next cut `C` would pass
-`P` and `P′`. Upkeep folds the range — nothing in `(−∞, k0]` changed, so
-it relabels to `C` — and writes the base's before-image of what changed in
-`(P, C]` outside it: `k2@1`, `k3@1` (present), two entries, not the whole
-set. One event installs both; the base is `C` with the before-image, and
-`P` and `P′` are released. On day 40 `tally` runs. Candidates: the
-before-image's `k2` and `k3`, and `changes(C, now)`'s `k4`. Classed as
-always: `k2` `@1` against `@7`, an update; `k3` present against absent, a
-removal; `k4` absent at `C` against present, an add. `k0`, in the range
+`P` and `P′`. Upkeep folds the range to the head `C` — nothing in
+`(−∞, k0]` changed, so it relabels — and writes the base's before-image
+from Δ(P, C) outside it: `k2`, `k3`, both present at `P`, two entries,
+not the whole set. One event installs both; the base is `C` with the
+before-image, and `P` and `P′` are released. On day 40 `tally` runs.
+Candidates: the before-image's `k2` and `k3`, and Δ(C, now)'s `k4`.
+Classed as always: `k2` present at a version since replaced against
+`@7`, an update; `k3` present against absent, a removal; `k4` absent at
+`C` against present, an add. `k0`, in the range
 at `C`, and `k1`, in the base, are unchanged: nothing. The run completes:
 its ranges become the base at its last head, and the file is deleted.
 Without the fold and the before-image, day 40 would find `P` gone and owe
@@ -547,10 +572,10 @@ Deleted: `_selection` and its branches, the pass and its pin, `held_at`,
 `_read_ahead`, `_read_ahead_of`, `changes(lower=)`, `READ_AHEAD_FULL` and
 the cap, `_dep_restart`, `caught_up`, most of `staleness.py` and
 `positions.py`, the per-key reconcile, `Batch.full`, D100's rowless
-deliveries and `gone_since`'s early removal. Kept: the key index and
-`changes()`, endpoint reservation and the claim's reader pin, the failure
-index and retries, D111's bounds; an unkeyed upstream's observation is
-the one commit it last read.
+deliveries and `gone_since`'s early removal. Kept: the key index and its
+Δ, endpoint reservation and the claim's reader pin, the failure index and
+retries, D111's bounds; an unkeyed upstream's observation is the one
+commit it last read.
 
 ## Testing
 
@@ -590,7 +615,7 @@ relying on the bounds: measure a large spill and a pattern change at
 Context   = {id, whole_and_dep_versions}
 Layer     = {endpoint, patterns (normalised), context: id, life}
 Base      = Layer                                   # endpoint P: a commit
-          | Layer + {before_image}                  # endpoint C; the keys changed in (P, C], as at P
+          | Layer + {before_image}                  # endpoint C; the keys Δ(P, C) names, present at P or not
           | {output_index, life}                    # a per-key full run: held keys, at no upstream version
 Range     = Layer + {lo, hi}                        # endpoint H, the head observed at; disjoint, sorted
 Point     = {key, present, version, payload, patterns, context: id, life}
@@ -602,16 +627,17 @@ ObservationRecord = {base, ranges[], points{}, contexts[], spill: index state | 
 effective state of `k`):
 
 ```text
-decode(R, k):
+decode(R, k):                         # read at the head: Δ and a lookup, nothing older
     if k in R.points (or its spill):   return R.points[k] as an observation
     layer = the range holding k, else R.base
     if layer.output_index:             return HELD if k in layer.output_index else ABSENT
     if not layer.patterns.take(k):     return ABSENT
     if layer.before_image and k in layer.before_image:
-        entry = layer.before_image[k]                      # as at P
-        entry = entry if entry.present else None           # a key added since P: absent then
-    else:
-        entry = index(layer.life).lookup(k, at=layer.endpoint)
+        return REPLACED if layer.before_image[k].present else ABSENT   # changed since P
+    d = Δ(layer.endpoint, head, keys=[k])
+    if d:                                                  # changed since: present then by its flips
+        return (REPLACED, layer.context) if d.before else ABSENT
+    entry = index(layer.life).lookup(k, at=head)           # unchanged since: as now
     return ABSENT if entry is None else (entry.version, entry.payload, layer.context)
 ```
 
@@ -624,7 +650,7 @@ classify(R, k, now):                  # now: head, current patterns, current con
     if old is ABSENT and new is ABSENT:         return NOTHING
     if old is ABSENT:                           return ADDED
     if new is ABSENT:                           return REMOVED
-    if old is HELD:                             return UPDATED   # at no upstream version
+    if old is HELD or old is REPLACED:          return UPDATED   # at no version, or one since replaced
     if differs(old.version, old.payload, new):  return UPDATED   # the net rule
     if old.context != now.context:              return UPDATED
     return NOTHING
@@ -632,8 +658,8 @@ classify(R, k, now):                  # now: head, current patterns, current con
 full_run_due(R, now) = R.definition != now.definition or R.base.life != now.life
 owed(R, now) = {k: c for k in candidates(R, now) if (c := classify(R, k, now)) != NOTHING}
 # in a full run: every upstream key under the patterns, plus a per-key base's held keys
-# candidates: changes(endpoint, now), plus a before-image's keys; plus per-range changes,
-# point keys, membership and context scans
+# candidates: Δ(endpoint, now), plus a before-image's keys; plus per-range Δ, point keys,
+# and membership and context compares: a scan at now merged with Δ's flips
 ```
 
 **A run** — each task walks the owed keys in key order, a batch of up to
@@ -664,8 +690,8 @@ may_commit(batch, R, now):
 
 fold(R, H):                                        # at each batch commit
     for range in R.ranges with range.endpoint < H:
-        for k in changes(range.endpoint, H, within=[range.lo, range.hi]).keys:
-            if k not in R.points: R.points[k] = decode(R, k)   # as observed, before relabelling
+        for k in Δ(range.endpoint, H, within=[range.lo, range.hi]).keys:
+            if k not in R.points: R.points[k] = decode(R, k)   # REPLACED or ABSENT, before relabelling
         range.endpoint = H
     merge adjacent ranges with equal (endpoint, patterns, context, life)
     if a range spans every key: R.base, R.ranges = that range, []

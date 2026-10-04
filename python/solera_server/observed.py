@@ -7,7 +7,8 @@ observation — stored as three layers, the first that holds a key deciding:
   it as upstream had it after commit `endpoint`, if the layer's patterns
   take it, else absent (`lo`/`hi` None: unbounded);
 - the **base**: one layer for every other key (`endpoint` None: the empty
-  base, every key absent).
+  base, every key absent; `held`: a per-key consumer's full run, every key
+  its outputs or failure records hold present at no upstream version).
 
 A layer is `{endpoint, patterns, context, life}`: the commit it was observed
 at, the input's patterns then (normalised: None takes every key), the id of
@@ -23,6 +24,8 @@ from collections.abc import Callable
 from hashlib import blake2b
 
 from solera.patterns import Matcher
+
+OLDER = object()  # `at`'s answer for a key present at an endpoint, at a version since replaced
 
 
 def normalised(patterns: dict | None) -> dict | None:
@@ -41,10 +44,13 @@ def context_id(versions: dict) -> str:
     return blake2b(json.dumps(versions, sort_keys=True).encode(), digest_size=8).hexdigest()
 
 
-def record(life: str, patterns: dict | None = None, context: dict | None = None) -> dict:
-    """An empty observation record: the empty base, in `life`."""
+def record(life: str, patterns: dict | None = None, context: dict | None = None, *, held=False) -> dict:
+    """An empty observation record: the empty base, in `life` — or, `held`,
+    the base of a per-key consumer's full run: what it holds."""
 
     out = {"base": {"endpoint": None, "patterns": normalised(patterns), "context": None, "life": life}}
+    if held:
+        out["base"]["held"] = True
     out.update(ranges=[], points={}, contexts={})
     if context is not None:
         out["base"]["context"] = _context(out, context)
@@ -80,21 +86,29 @@ def holder(rec: dict, key: str) -> dict:
     return next((r for r in rec["ranges"] if _in(key, r["lo"], r["hi"])), rec["base"])
 
 
-def decode(rec: dict, key: str, at: Callable[[int, str], object]) -> tuple | None:
+def decode(
+    rec: dict, key: str, at: Callable[[int, str], object], held: Callable[[str], bool] = lambda key: False
+) -> tuple | None:
     """The observation of `key`: `(version, context versions)`, or None for
     not held (observed absent and never observed are one). `at(endpoint,
     key)` is upstream's version of `key` after commit `endpoint`, None if
-    absent."""
+    absent — or `OLDER`, present then at a version the index no longer
+    keeps, decoded as version None; `held(key)`, whether a per-key consumer
+    holds it (a held base, its keys at no upstream version either)."""
 
     found = holder(rec, key)
     if "present" in found:  # a point
         if not found["present"]:
             return None
         return found["version"], rec["contexts"].get(found["context"], {})
+    if found.get("held"):  # present at no upstream version
+        return (None, {}) if held(key) else None
     if found["endpoint"] is None or not Matcher(found["patterns"])(key):
         return None
     version = at(found["endpoint"], key)
-    return None if version is None else (version, rec["contexts"].get(found["context"], {}))
+    if version is None:
+        return None
+    return (None if version is OLDER else version), rec["contexts"].get(found["context"], {})
 
 
 def overwrite(rec: dict, lo: str | None, hi: str | None, label: dict) -> None:

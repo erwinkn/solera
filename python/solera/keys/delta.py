@@ -89,6 +89,15 @@ async def delta(
     return DeltaPage(diffs, key_str(cursor))
 
 
+def version_of(generation: int | None, payload) -> object:
+    """A key's version: its source's own word where its entry carries one
+    (the payload), else the generation that wrote it."""
+
+    if isinstance(payload, bytes):
+        return payload.decode()
+    return payload if payload is not None else generation
+
+
 def _added(key: str, generation: int, payload) -> Diff:
     return Diff(key, False, True, generation, payload)
 
