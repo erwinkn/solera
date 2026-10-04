@@ -135,7 +135,8 @@ A store still:
 5. if fenced, answers **`keys(ref, among)`**: the keys present in the
    partition, sorted, among the given ones or all of them, never a value.
    *Edge case:* repair, §5;
-6. for a `Sql` write, reports the keys it wrote, sorted.
+6. for an opaque write (`Opaque`, which it reads itself: Postgres's
+   `Sql`), reports the keys it wrote, sorted.
 
 A store no longer computes a version, declares `stamped` columns, or
 refuses values its database would round: Postgres may coerce a data
@@ -181,8 +182,8 @@ whether or not the insert landed, and the index would list a key with no
 rows, counted, and handed to every full pass. It reads keys, never
 values.
 
-**Unknown writes.** A `Sql` write's gate names no keys. If it dies, its
-next write must cover every key: a replacement or `Sql` write rewrites
+**Unknown writes.** An opaque write's gate names no keys. If it dies, its
+next write must cover every key: a replacement or opaque write rewrites
 the partition, and every key it writes is at its generation anyway; a patch
 first reads every present key (`keys(ref, None)`), gives each the new
 generation and tombstones live keys the store lacks. Either way consumers
@@ -236,7 +237,7 @@ lineage:  B ← A, generation 12                    (g12 committed)
 | Retries | A new attempt has a new generation; an uncommitted attempt's delta files and objects are cleaned up. A store call retried inside one attempt rewrites the same names with the same bytes | yes |
 | `Each` full redelivery (truncated log, reset) | Every key is processed and written again; its consumers reprocess everything | accepted |
 | Pattern change | Newly matched keys are delivered at their generation; unmatched ones removed | yes |
-| Unknown `Sql` writes | §5: a rewrite, or a key scan before a patch | yes |
+| Unknown opaque writes | §5: a rewrite, or a key scan before a patch | yes |
 | Store move | A reset: the moved output is a new one (object-store-state.md §2) — no head, a fresh index, a whole first write, every key at a new generation; its consumers and its own inputs start over | yes |
 | Rename | Index entries, generations and object names stay | yes |
 | Failed keys retry, upstream changed | The failure record's upstream generation differs from the key's in the pinned input, so the key comes with the delta pass instead (`per-key-processing.md` §9) | yes |
@@ -285,7 +286,7 @@ revision.
   delta bytes; source versions: equal unchanged, different changed, absent
   changed; set elements re-listed unchanged; immutable names and
   cleanups by generation; `keys(ref, among)` in the store conformance
-  kit; the repair example of §5 both ways; a dead `Sql` writer then a
+  kit; the repair example of §5 both ways; a dead opaque writer then a
   replacement, then a patch.
 - **The simulation** (`tests/sim`, `verification.md`). Its invariant
   "Reads say what they read" drops the per-key part: a read reports the
@@ -313,7 +314,7 @@ One implementation worker, in this order, merged when `tests/` and
    exactness checks or `stamped`, `scan` becoming `keys`, `Sql` reporting
    keys; `revision=` out of `Output`; the conformance kit.
 3. **Lifecycle and lineage:** `_store_outputs` and `Ref.generation`;
-   repair by presence and the always-write rule; unknown `Sql` writes;
+   repair by presence and the always-write rule; unknown opaque writes;
    `observed.py` and lineage `{generation, uncommitted?}`; `Each`
    (`ctx.revision` and the failure entry's `revision` become the
    upstream `generation`); the simulation's invariants.

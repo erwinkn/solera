@@ -652,7 +652,7 @@
           }
         },
         "return": {
-          "class": "solera.stores.Sql"
+          "class": "solera_postgres.Sql"
         }
       },
       "version": "1"
@@ -1004,7 +1004,7 @@
     "id": "snapshot",
     "source": "explicit"
   },
-  "deploy": "8dee24bebc771a79e32cebbabe9522beb5821126c8f54ba9363f90f86af035be",
+  "deploy": "b224033274f56e24551c20f2c40a5bed1c1bb04d628a17b4bcdec22b16914a3c",
   "errors": [],
   "executors": {
     "ingest": {

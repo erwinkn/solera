@@ -63,7 +63,13 @@ def postgres_harness(tmp_path):
             await asyncio.to_thread(conn.commit)
             conn.close()
 
-    return Harness(store, fresh("postgres"), hold)
+    def opaque(rows):
+        from solera_postgres import Sql
+
+        values = ", ".join(f"('{r['id']}', '{r['v']}')" for r in rows)
+        return Sql(f"SELECT * FROM (VALUES {values}) AS t(id, v)")
+
+    return Harness(store, fresh("postgres"), hold, opaque)
 
 
 def example_store(fenced=True):
@@ -108,7 +114,7 @@ HARNESSES = {"file": file_harness, "s3": s3_harness, "postgres": postgres_harnes
 
 
 def cases():
-    from solera.testing.stores import EVERY, FENCED, IMMUTABLE, READS
+    from solera.testing.stores import EVERY, FENCED, IMMUTABLE, OPAQUE, READS
 
     for name, kind in (
         ("file", "immutable"),
@@ -117,14 +123,15 @@ def cases():
         ("example", "fenced"),
     ):
         # A fenced store here reads the current rows: it reports what it read (`reads`).
-        for scenario in EVERY + (IMMUTABLE if kind == "immutable" else FENCED + READS):
+        opaque = OPAQUE if name == "postgres" else []  # the shipped store that takes one (Sql)
+        for scenario in EVERY + (IMMUTABLE if kind == "immutable" else FENCED + READS) + opaque:
             yield pytest.param(name, scenario, id=f"{name}-{scenario.__name__}")
 
 
 @pytest.mark.parametrize(("store", "scenario"), list(cases()))
 async def test_shipped_stores_conform(store, scenario, tmp_path):
     harness = HARNESSES[store](tmp_path)
-    assert scenario in scenarios(harness.store)
+    assert scenario in scenarios(harness.store, opaque=harness.opaque is not None)
     await scenario(harness)
 
 

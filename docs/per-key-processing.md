@@ -339,9 +339,11 @@ PostgresStore through `solera.stores.frames`, which imports a library only
 for a value of its own type. A worker whose outputs are lists of dicts
 imports neither pandas, pyarrow nor DuckDB.
 
-**`Sql` writes** never pass through the worker: once the statement has
-written, the store reports the keys the partition holds (`keys(ref, None)`,
-`SELECT DISTINCT key … ORDER BY key` through a server-side cursor), and
+**Opaque writes** (`solera.stores.Opaque`: a value its store reads
+itself, PostgresStore's `Sql`) never pass through the worker: once the
+store has written, it reports the keys the partition holds (Postgres:
+`keys(ref, None)`, `SELECT DISTINCT key … ORDER BY key` through a
+server-side cursor), and
 the worker replaces the index with them, every key at the attempt's
 generation. No row is read back.
 
@@ -993,7 +995,7 @@ is below the current one.
 - `Each` delivers exactly what an equivalent batch asset returning
   `Patch({key: …})` writes, over random batches, deletes and failures.
 - Groups: flat rows and the by-key form write the same keys; a key given
-  no rows is removed; a `Sql` write's keys are the partition's. (Group
+  no rows is removed; an opaque write's keys are the partition's. (Group
   versions were tested here until `versions.md` replaced them.)
 - Each error class in and out of the per-key call; `errors=` mapping;
   `Transient` turning failed after its `retry_for`; failed keys retried

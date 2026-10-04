@@ -66,9 +66,9 @@ from solera.stores import (
     Commits,
     KeyedWrite,
     Keys,
+    Opaque,
     Patch,
     Prepared,
-    Sql,
     StoreError,
     WriteContext,
     WriteError,
@@ -537,7 +537,7 @@ async def _store_outputs(
     for name, o in list(outs.items()):
         if o.index is None:
             continue
-        if o.sql:
+        if o.opaque:
             # Rows the worker never sees: the store reports the whole new key
             # map once it wrote, so its delta comes after — and needs no repair.
             # Unknown writes: if this attempt dies after its gate, no key list says what landed
@@ -599,9 +599,9 @@ async def _store_outputs(
             continue
         written = await writes.call(store.store(o.write or o.value, o.prior, context))
         entry = {}
-        if o.index is not None and o.sql:
+        if o.index is not None and o.opaque:
             if written.keys is None:
-                raise StoreError(f"{output.name}: store {store_name!r} reported no keys for a Sql write")
+                raise StoreError(f"{output.name}: store {store_name!r} reported no keys for an opaque write")
             files, _ = await o.index.replace(
                 written.keys,
                 int(o.info["commit_number"]),
@@ -677,8 +677,8 @@ class _Out:
         return bool(self.info.get("reset"))
 
     @property
-    def sql(self) -> bool:
-        return isinstance(self.value, Sql)
+    def opaque(self) -> bool:
+        return isinstance(self.value, Opaque)
 
     @property
     def replace(self) -> bool:
@@ -727,17 +727,17 @@ def _schema_due(o: _Out) -> bool:
 async def _prepare(o: _Out, spec, keys_io) -> None:
     """Read a keyed write once, by its store (`Store.prepare`); for a patch,
     its run, and what dead attempts left in the store: repaired key by key
-    (`_repair`), or — after an unknown `Sql` write — reconciled whole
+    (`_repair`), or — after an unknown opaque write — reconciled whole
     (`_reconcile`), which resolves the write too (docs/versions.md §5)."""
 
     if o.info.get("index") is None:
-        if o.sql and o.output.incremental:
-            raise WriteError(f"{o.output.name}: Sql writes need a keyed output")
+        if o.opaque and o.output.incremental:
+            raise WriteError(f"{o.output.name}: an opaque write needs a keyed output")
         return
     o.index = KeyIndex(keys_io, None, IndexState.from_json(o.info["index"]))
-    if o.sql:
+    if o.opaque:
         if o.output.is_dynamic_partitions:
-            raise WriteError(f"{o.output.name}: Sql writes need a table output")
+            raise WriteError(f"{o.output.name}: an opaque write needs a table output")
         return
     o.prepared = await asyncio.to_thread(prepare_for, o.store, o.value, o.output)
     if o.replace:
@@ -748,7 +748,7 @@ async def _prepare(o: _Out, spec, keys_io) -> None:
     except ValueError as e:  # a key both written and removed
         raise WriteError(f"{o.output.name}: {e}") from e
     if any(intent.get("unknown") for intent in o.repairs):
-        # A dead Sql writer's keys are unknown (docs/versions.md §5): the index takes
+        # A dead opaque writer's keys are unknown (docs/versions.md §5): the index takes
         # every key the store holds, with this patch on top, and the store writes
         # this patch's keys, every one.
         o.files, _ = await _reconcile(o, spec)
@@ -896,7 +896,7 @@ async def _repair(o: _Out, left: list[str]) -> SortedEntries:
 
 
 async def _reconcile(o: _Out, spec):
-    """The delta of a patch over a store a dead `Sql` writer changed in ways no
+    """The delta of a patch over a store a dead opaque writer changed in ways no
     key list records (docs/versions.md §5): every key the store holds —
     streamed back sorted a chunk at a time by its `keys` — at this attempt's
     generation, with the patch's run laid over them (its keys in place of

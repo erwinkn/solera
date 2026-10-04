@@ -448,7 +448,7 @@ two in flight: at 100M keys, 0.8 GB on top of the data for shuffled Arrow
 rows (0.4 GB sorted; 28 s), 3.4 GB for Python rows, whose keys are packed
 (`bench/keys/results.md`).
 
-A `Sql` write's store reports the keys it holds once it wrote, already
+An opaque write's store (Postgres, for its `Sql`) reports the keys it holds once it wrote, already
 sorted, a chunk at a time through a server-side cursor (`keys(ref,
 None)`), and the replacement streams them, so nothing is sorted or held.
 
@@ -464,8 +464,8 @@ None)`), and the replacement streams them, so nothing is sorted or held.
 | Truncate the log | engine | Drop `log` entries below the lowest consumer position and below every delta an in-flight attempt was given (`IndexTruncated`); an output with no `Incremental` consumers keeps none. A consumer whose delta the log no longer holds gets a full pass. |
 | Delete files | engine | A file in neither `files` nor `log` joins `garbage`, and is deleted once every attempt that could have pinned it has finished (`FilesCleanedUp`): every attempt claimed before the event that let go of it. Both are positions in event order (`applied`), the same in every engine that replays the journal — never wall clocks, which two engines may disagree on. A delta file of an attempt that never committed is deleted when the attempt ends, unless it is an repair intent (§8). |
 
-Writes that never pass through the worker as rows — `Sql` materialized
-inside Postgres — are the one case where the store must report the keys it holds once it
+Writes that never pass through the worker as rows — opaque writes
+(`Opaque`), such as Postgres's `Sql` — are the one case where the store must report the keys it holds once it
 wrote, sorted (above); only stores supporting such writes need to.
 
 External sources use the same index. An API commit becomes a delta file;

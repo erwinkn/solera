@@ -39,11 +39,14 @@ class Harness:
     none). `hold(partition)`, which a fenced store's
     worker must give, is an async context manager that opens a write
     transaction of `partition` holding its fence until the block ends, then
-    commits it: a newer writer waits for it."""
+    commits it: a newer writer waits for it. `opaque(rows)`, which a store
+    that takes an `Opaque` write must give, is such a write holding `rows`
+    (`{"id", "v"}` each): its query, say."""
 
     store: Any
     output: Callable[..., Output]
     hold: Callable[[WriteContext], Any] | None = None
+    opaque: Callable[[list[dict]], Any] | None = None
 
     def __post_init__(self):
         if self.store.writes == "fenced" and self.hold is None:
@@ -421,6 +424,21 @@ async def a_read_reports_the_generation_it_saw(h: Harness) -> None:
         assert await _read(reader, two) == ([("b", "2")], 7)
 
 
+async def an_opaque_write_reports_the_keys_it_holds(h: Harness) -> None:
+    """A write the store reads itself (`Opaque`): the worker never sees its
+    rows, so the store says which keys the partition holds after it
+    (`Written.keys`): sorted by their bytes, each once, in chunks. A load
+    gives its rows."""
+
+    out = keyed(h)
+    written = await h.store.store(
+        h.opaque([{"id": "b", "v": "1"}, {"id": "a", "v": "2"}]), None, context(out, 1)
+    )
+    assert written.keys is not None, "an opaque write reports its keys"
+    assert [k for chunk in written.keys for k in chunk] == ["a", "b"]
+    assert await rows(h, written.ref, None) == [("a", "2"), ("b", "1")]
+
+
 async def _read(reader, ref: Ref) -> tuple[list[tuple[str, str]], int | None]:
     found, generation = await reader.load(ref, list[dict], None)
     return sorted((str(r["id"]), str(r["v"])) for r in found), generation
@@ -457,11 +475,13 @@ FENCED = [
     a_newer_writer_waits_for_an_open_older_one,
 ]
 READS = [a_read_reports_the_generation_it_saw]
+OPAQUE = [an_opaque_write_reports_the_keys_it_holds]
 
 
-def scenarios(store: Any) -> list[Callable]:
+def scenarios(store: Any, *, opaque: bool = False) -> list[Callable]:
     """The scenarios a store (or its class) must pass: every store's, its
-    kind's, and a current-read store's (`reads`)."""
+    kind's, a current-read store's (`reads`), and, for one that takes an
+    `Opaque` write (`opaque`, its harness then makes one), those."""
 
     found = EVERY + {"immutable": IMMUTABLE, "fenced": FENCED}[store.writes]
-    return found + (READS if callable(getattr(store, "reads", None)) else [])
+    return found + (READS if callable(getattr(store, "reads", None)) else []) + (OPAQUE if opaque else [])

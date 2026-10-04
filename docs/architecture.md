@@ -237,7 +237,7 @@ WriteContext = (output: Output, partition: str, commit_number: int | None, attem
 Prepared   = (output, rows: Rows, take: Callable, patch: bool, removes)  # a keyed write, read once
 KeyedWrite = (prepared: Prepared, upserts: Collection[str] | DeltaKeys | None,
               removes: frozenset[str], whole: bool, value: Any)  # what a keyed output's store gets
-Written = (ref: Ref, keys: Iterable | None)   # keys: only for Sql writes the worker never sees as rows
+Written = (ref: Ref, keys: Iterable | None)   # keys: only for opaque writes, which the worker never sees as rows
 Keys    = (generations: Mapping[str, int])  # the generation that last wrote each key
 Commits = (lo: int, hi: int)  # load rows of commits in [lo, hi]
 ```
@@ -260,7 +260,7 @@ how to take the rows it persists. The framework knows plain Python only
 (the default, `solera.stores.prepare`); DataFrames and Arrow are a store's
 to read (`solera.stores.frames`), and its `can_store` says what it takes; for a
 fenced store, `keys(ref, among)` — the keys a partition holds, never a value,
-which a repair and an unknown `Sql` write's reconciliation ask (`versions.md` §5); `shared_table`
+which a repair and an unknown opaque write's reconciliation ask (`versions.md` §5); `shared_table`
 — one table for every partition, so a partitioned output needs a
 `partition_column` (§3).
 
@@ -288,7 +288,7 @@ the store, works out what changed, against the key index (§6):
 | Write | Semantics |
 |---|---|
 | `Patch(rows, remove=())` | after the write, the partition's rows for the keys present in `rows` (read from the declared `key` column) are exactly these; keys in `remove` are gone; every other key is untouched. On an unkeyed incremental output the rows are one new batch and `remove` is not allowed. By key, `Patch({key: rows})`: each key's group, its key column stamped by the store; a key given no rows does not exist, and the patch removes it (per-key-processing.md §6). |
-| `Sql(query)` | PostgresStore only. The output *is* the table `{schema}.{table}` (`table` defaults to the output name, `schema` to `public`): the query — a `SELECT`, `VALUES` or `TABLE` — is materialized into the partition as a replace. It is never run as a statement: the store embeds it, `INSERT INTO t SELECT … FROM (<query>) _src`, prepared, so UPDATE, DELETE, DDL, a data-modifying CTE or a second statement is refused before anything changes; the table changes through a `Migration`. A function the query calls must not write; `PostgresStore(..., sql_read_only=True)` enforces it, running the query in a READ ONLY transaction of its own and streaming its rows through the worker. Returns an ordinary `TableRef`, loadable downstream. Version `H(prior.version ‖ H(query))`. |
+| `Sql(query)` (`solera_postgres`, an `Opaque` write) | PostgresStore only. The output *is* the table `{schema}.{table}` (`table` defaults to the output name, `schema` to `public`): the query — a `SELECT`, `VALUES` or `TABLE` — is materialized into the partition as a replace. It is never run as a statement: the store embeds it, `INSERT INTO t SELECT … FROM (<query>) _src`, prepared, so UPDATE, DELETE, DDL, a data-modifying CTE or a second statement is refused before anything changes; the table changes through a `Migration`. A function the query calls must not write; `PostgresStore(..., sql_read_only=True)` enforces it, running the query in a READ ONLY transaction of its own and streaming its rows through the worker. Returns an ordinary `TableRef`, loadable downstream. Version `H(prior.version ‖ H(query))`. |
 
 ### Shipped stores
 

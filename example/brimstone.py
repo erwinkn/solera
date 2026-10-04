@@ -38,8 +38,8 @@ from solera.sdk import (
     asset,
     job,
 )
-from solera.stores import Patch, S3Store, Sql
-from solera_postgres import PostgresStore
+from solera.stores import Patch, S3Store
+from solera_postgres import PostgresStore, Sql
 
 # ---------------------------------------------------------------------------
 # Resources: ordinary client objects, injected by parameter name. `env:`

@@ -121,8 +121,8 @@ generation, or another worker of this generation, holds it.
 **`keys(ref, among)`** (fenced) yields the keys `ref`'s partition holds now —
 among `among`, or all of them for None — in sorted chunks, by their
 bytes; never a value. A repair asks it after a dead writer (which of the
-keys it meant to change landed), and so does the reconciliation of a
-`Sql` write that died (every key the partition holds), `versions.md` §5.
+keys it meant to change landed), and so does the reconciliation of an
+opaque write that died (every key the partition holds), `versions.md` §5.
 
 **Errors.** Raise `WriteError` for a malformed write (duplicate keys, a
 wrong shape), `StoreError` for anything else the store refuses. A store

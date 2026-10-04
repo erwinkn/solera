@@ -38,8 +38,8 @@ from solera.sdk import (
     job,
     sensor,
 )
-from solera.stores import Patch, S3Store, Sql
-from solera_postgres import PostgresStore
+from solera.stores import Patch, S3Store
+from solera_postgres import PostgresStore, Sql
 
 DATABASE = bool(os.getenv("DATABASE_URL"))
 RELATIONAL = "postgres" if DATABASE else None  # None → the default store

@@ -78,13 +78,13 @@ class Patch:
     remove: Any = ()
 
 
-@dataclass(frozen=True)
-class Sql:
-    """PostgresStore only: materialize a query — a SELECT, VALUES or TABLE —
-    into the output's table (§4). It is never run as a statement: UPDATE,
-    DELETE and DDL are refused; a table changes through a `Migration`."""
-
-    stmt: str
+class Opaque:
+    """A write its store reads itself — a query it runs in place, say
+    (`solera_postgres.Sql`): the worker never sees its rows. Of a keyed
+    output only, the store reports the keys the partition holds after it
+    wrote (`Written.keys`); a writer that dies after its gate leaves keys
+    no one knows, so the next attempt takes the partition's keys whole
+    (docs/versions.md §5). A store that takes one says so in `can_store`."""
 
 
 @dataclass(frozen=True)
@@ -129,7 +129,7 @@ class WriteContext:
 class Written:
     """What a store wrote: a ref to the new content, which the worker gives
     the attempt's generation. `keys` is only for writes the worker never
-    sees as rows (`Sql` materialized inside Postgres): the keys the partition
+    sees as rows (an `Opaque` write, read by the store itself): the keys the partition
     holds now, sorted by their UTF-8 bytes, in chunks — lists of keys — the
     worker pulls one at a time after `store` returned. For every other
     write the worker reads the keys itself (§6, §9)."""

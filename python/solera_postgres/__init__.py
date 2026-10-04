@@ -18,6 +18,7 @@ import contextlib
 import logging
 import re
 from collections.abc import Callable, Iterable, Mapping
+from dataclasses import dataclass
 from typing import Any
 
 from solera.sdk import KEYS, Output, Ref, TableRef
@@ -26,9 +27,9 @@ from solera.stores import (
     Commits,
     KeyedWrite,
     Keys,
+    Opaque,
     Patch,
     Prepared,
-    Sql,
     StoreError,
     WriteContext,
     WriteError,
@@ -72,6 +73,16 @@ def _split(qualified: str) -> tuple[str, str]:
     if found is None:
         raise StoreError(f"not a table this store names: {qualified}")
     return found.group(1), found.group(2)
+
+
+@dataclass(frozen=True)
+class Sql(Opaque):
+    """Materialize a query — a SELECT, VALUES or TABLE — into the output's
+    table (§4), in the database: the worker never sees its rows. It is
+    never run as a statement: UPDATE, DELETE and DDL are refused; a table
+    changes through a `Migration`."""
+
+    stmt: str
 
 
 class PostgresStore:

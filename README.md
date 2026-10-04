@@ -15,9 +15,10 @@ One distribution, `solera`, built with maturin: four Python packages under
 `python/` and a Rust extension.
 
 - `python/solera` — the asset SDK project files import
-  (`@asset`, `Output`, `Patch`, `Sql`, `DynamicPartitions`, `Incremental`,
+  (`@asset`, `Output`, `Patch`, `DynamicPartitions`, `Incremental`,
   `AllPartitions`, `TimePartitions`, triggers, placements), and the key
-  index (`solera.keys`). `solera_postgres` ships `PostgresStore`.
+  index (`solera.keys`). `solera_postgres` ships `PostgresStore` and its
+  `Sql` writes.
 - `python/solera_server` — the control plane (state layer, engine,
   FastAPI, CLI) and the built console under `solera_server/web`.
 - `python/solera_worker` — the task worker that executes attempts in

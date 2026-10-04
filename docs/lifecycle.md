@@ -686,7 +686,7 @@ class MyStore(Store):
 | Kind | Gate and intents | Repair | Partition released when the engine ends the attempt | A read sees |
 |---|---|---|---|---|
 | `immutable` | none | none: abandoned writes are unreferenced | at once | the pinned generation, exactly |
-| `fenced` | gate with intents (repair, and the unknown-writes intent of `Sql`, below) | after `acquire`, by presence (`versions.md` §5) | at once: the next attempt's acquisition fences the old writer | current rows |
+| `fenced` | gate with intents (repair, and the unknown-writes intent of an opaque write, below) | after `acquire`, by presence (`versions.md` §5) | at once: the next attempt's acquisition fences the old writer | current rows |
 
 **Repair by presence.** The next attempt asks the store which of the
 dead writer's intended keys it holds (`keys(ref, among)`, never a value):
@@ -711,8 +711,9 @@ its newer form and delivered again with its own change, a harmless repeat
 (`architecture.md` §3, "What a read sees"). Fencing makes writes safe; it
 does not make reads repeatable. No setting changes this.
 
-**Unknown writes** (`Sql`). A `Sql` write's keys are known only from the
-key map the store reports after it committed, so its gate records an
+**Unknown writes** (opaque). An opaque write's keys (`Opaque`, a value
+its store reads itself: Postgres's `Sql`) are known only from the key
+map the store reports after it committed, so its gate records an
 intent with no key list: *unknown writes*. If its attempt dies after the
 gate, the next attempt cannot repair by reading named keys — there are
 none. For example, the statement deletes `a` and inserts `b`, commits, and
@@ -797,7 +798,7 @@ Internal to the store; the engine supplies one number.
   in the same transaction, so the write domain keeps its generations. An
   operator's `solera migrate` has no generation: it only takes its turn.
 - **Only a migration may replace the relation, or touch another partition.**
-  A `Sql` write is a query the store materializes into its own partition,
+  Its `Sql` write is a query the store materializes into its own partition,
   never a statement: one that would update, delete or replace anything is
   refused before it runs (architecture.md, "Writes").
 - **Cost**: one indexed upsert per acquisition and one row lock per write

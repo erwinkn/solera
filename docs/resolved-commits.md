@@ -124,22 +124,22 @@ What those stores write:
 | Patch | unknown writes | step 2 reads the store's whole key map and reconciles it (below); then as for named intents, with every key of the partition as `intended` |
 | Replacement | none | the delta's upserts and removes; the whole partition if the delta's key list was not collected |
 | Replacement | named or unknown | the whole partition, overwritten. Step 2 does not run: it would keep stray rows the replacement means to remove |
-| `Sql` | — | the query, materialized; the store reports its rows afterwards, resolved as a replacement |
+| Opaque (`Opaque`: Postgres's `Sql`) | — | read by the store itself, a query materialized; the store reports its keys afterwards, resolved as a replacement |
 
-**Unknown writes.** A `Sql` write's intent names no keys: the query
+**Unknown writes.** An opaque write's intent names no keys: a query
 can change any of them, and its key map is known only once it reports. If
 its worker dies after the gate and before reporting, the next attempt
 cannot read back "the intended keys":
 
 ```
 committed           a=1, b absent
-Sql attempt         deletes a, inserts b=1, commits its transaction, dies before reporting
+opaque attempt      deletes a, inserts b=1, commits its transaction, dies before reporting
 next attempt        a patch of c
 ```
 
 So after acquisition (step 1), a **patch** against an unknown-writes
 intent reads the store's full key map for the partition — the same extraction
-a `Sql` write reports with — and reconciles it with the pinned index:
+an opaque write reports with — and reconciles it with the pinned index:
 every key whose store version differs from the index's, that the store
 holds and the index does not, or that the index holds live and the store
 does not (here `a` deleted and `b` inserted), joins the run as a repair
@@ -167,7 +167,7 @@ The token, worker rule and retries are `lifecycle.md`'s (§4, §5.2,
 §5.3); the framing, limits and validation below are this doc's, and
 `lifecycle.md` §5.1 points here. One request per attempt that has something to
 resolve, covering every output the worker wants resolved; outputs it
-resolves itself (big writes, `Sql`, unkeyed, failure deltas, §8) are
+resolves itself (big writes, opaque writes, unkeyed, failure deltas, §8) are
 absent.
 
 **Framing.** `u8` protocol version · `u32` header length · JSON header ·
@@ -286,7 +286,7 @@ prepare.
 
 **Mixed attempts.** Each output is independent: one may be resolved by
 the engine, one declined and resolved by a streaming merge-join, one
-written by `Sql`, and the attempt commits them together. The worker uses
+written opaquely (`Sql`), and the attempt commits them together. The worker uses
 exactly one answer per output, chosen before it uploads that output's
 delta.
 
@@ -782,7 +782,7 @@ reports both.
   compaction that drops it otherwise, including keys the filters counted
   live and keys deleted at the bottom level — and none while a reader
   pins it; a second cleanup is a no-op.
-- **Unknown writes.** A dead `Sql` writer that deleted `a` and inserted
+- **Unknown writes.** A dead opaque writer that deleted `a` and inserted
   `b`: the next patch acquires, reads the store's key map, reconciles both
   keys and only then clears the intent; a replacement overwrites instead.
 - **Retry batches.** Recorded against the pinned failed keys only;
@@ -849,7 +849,7 @@ here.
 |---|---|
 | Sparse reader, streaming patch, the two switches, `exact`, `get` | `KeyIndex.resolve` / `changes` / `lookup` (`solera/keys/index.py`), its per-key state native (`native/src/sparse.rs`: filters, block reads, the delta by position); `Job.patch` and `Job.replace`, one merge-join (`native/src/jobs.rs`) |
 | Compaction garbage | `KeyIndex.compact(garbage=True)`; `.kg` files (`key-index-format.md` § Garbage files) |
-| Repair by store kind, unknown `Sql` writes | `_store_outputs` and `_reconcile` (`solera_worker/worker.py`); acquisition is the lifecycle's |
+| Repair by store kind, unknown opaque writes | `_store_outputs` and `_reconcile` (`solera_worker/worker.py`); acquisition is the lifecycle's |
 | Local form, lookups and merges over it | `native/src/local.rs`: `build_local`, `LocalFile`, `Snapshot` |
 | The cache | `EngineCache` (`solera/keys/cache.py`) |
 | Framing, validation, deduplication, declines | `Resolver`, `request`, `answers` (`solera/keys/resolver.py`) |

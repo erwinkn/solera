@@ -8,7 +8,8 @@ from decimal import Decimal as D
 import pytest
 from solera.keys import SortedEntries
 from solera.sdk import Output
-from solera.stores import KeyedWrite, Keys, Patch, Sql, StoreError, WriteError, prepare_for
+from solera.stores import KeyedWrite, Keys, Patch, StoreError, WriteError, prepare_for
+from solera_postgres import Sql
 
 from tests.conftest import context
 
