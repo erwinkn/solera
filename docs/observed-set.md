@@ -2,9 +2,9 @@
 
 Status: **draft**, revised after review A27 ("build with listed
 changes"), W36's model of it (`ObservedSet.tla`: three counterexamples),
-and Erwin's removal of the pass: a run keeps its cursor in memory, and
-each batch records what it observed at its own head. Docs only; nothing
-is built. Names (D133): the **observed set** is what a consumer partition
+Erwin's removal of the pass (a run keeps its cursor in memory, and each
+batch records what it observed at its own head), and his naming calls
+(D140). Docs only; nothing is built. Names (D133): the **observed set** is what a consumer partition
 has processed, key → upstream version; its stored form is the
 **observation record** — a **base**, explicit **points** and compressed
 **ranges**, with disjoint overwrites and prefix membership queries —
@@ -33,8 +33,18 @@ new one, the upstream now under the current patterns and context:
 Net changes and membership queries never class anything themselves: they
 only collect candidates, deduplicated, and the table above classes each
 one (A27 R4). The owed set is the staleness, and exactly what a default
-run loads, as `added`, `updated` and `removed`. A `keys=` run is a filter
-on it. A pattern change stores nothing: it only changes the "new" side.
+run loads, as `added`, `updated` and `removed`.
+
+**`keys=` only chooses what a run loads**, per input: an explicit list of
+keys, everything under the patterns, or — the default — what is owed. It
+never clears an observation: the observation record changes only through
+what runs commit. (Its value names, and whether a loaded key that is not
+owed gets an `unchanged` class, are still open with Erwin.)
+
+**A pattern change is an input change**: patterns define the effective
+input, so new patterns make staleness say *input changed*, not
+*definition changed*. It stores nothing: it only changes the "new"
+side.
 
 **The invariant.** After every commit, `decode(R) = S`. Every override is
 written by a committed batch, and every fold leaves the decoded value
@@ -47,8 +57,8 @@ deciding:
 
 1. **Points**: `k → observation`, explicit — presence, version, payload,
    the patterns it was read under, context, life. Written where an
-   observation of `k` is not what a range or the base would decode: a
-   `keys=` run's keys; a current-only store serving a row other than the
+   observation of `k` is not what a range or the base would decode: keys
+   a run loaded by an explicit `keys=` list; a current-only store serving a row other than the
    version at the batch's head, or none; and a key that changed under a
    range as the range folds (below). A point pins nothing (A27 R11).
 2. **Ranges**: disjoint key ranges `[lo, hi] → (H, patterns, context,
@@ -95,10 +105,10 @@ refused and writes nothing: its keys stay owed. The engine's commit has
 the life check today; the observed set adds the other.
 
 **Outcomes.** A failed or abandoned attempt writes nothing: its keys stay
-owed. A per-key batch's failed keys are processed — seen at the version
+owed. A per-key batch's failed keys are processed — observed at the version
 they failed at, and retried by their failure record (A19 R8), not owed. A
 drained, canceled per-key batch commits its finished keys as points; its
-interrupted keys are not seen, so they stay owed.
+interrupted keys are not observed, so they stay owed.
 
 ## A run
 
@@ -120,6 +130,11 @@ changed in the range since the run compared. So its range write
 load-bearing: with it off, W36's model breaks A19 R2's history (a key
 added twice). It loads the keys it owes, calls the producer, and commits
 its outputs, the range and its points.
+
+A batch's `index`, `first` and `final` are relative to its run; there
+is no `full`. A run that loads everything under the patterns covers the
+same key ranges and loads every key in them; one given an explicit list
+loads those keys and writes points.
 
 A cancelled or failed run leaves its committed batches' ranges and
 points. The next run compares again: keys under those ranges decode at
@@ -171,7 +186,7 @@ current rows; its reads fail instead of guessing.
 The batch's classes are then decided from the observations, before the
 producer is called: planned as an update, served absent — a removal if
 the key was held, nothing if not; served a version equal to what was
-seen — nothing. So an aggregate's count follows what it was actually
+observed — nothing. So an aggregate's count follows what it was actually
 given (a tally of 2 cannot be left holding one member). A served row
 other than the version at the batch's head becomes a point.
 
@@ -193,9 +208,10 @@ reset (removed and declared again, moved to another store) starts a new
 life and deletes the old index, so the old layers cannot be decoded. The
 partition then records a **rebuild**: its observed set is "the old life",
 and it owes a start-over — staleness says so, as an input change — which
-its next run makes: the first batch is `full` and `first`, a plain
-consumer starts over, and a per-key one reconciles against its output
-index. That batch's commit resets `R` to an empty base in the new life.
+its next run makes: a plain consumer starts over, and a per-key one
+compares against its output index, so a key it holds that the new life
+lacks is an owed removal. The run's first commit resets `R` to an empty
+base in the new life.
 
 ## Candidates, queries and their cost
 
@@ -239,8 +255,10 @@ points are one key-list call.
 computed and cached per observation record revision and upstream head; where a
 full compare is due and not yet made, the partition reports **pending**,
 never `stale` or fresh on a guess: widening `include` to a key that
-never existed changes no debt. Shared, definition, retry, reconcile and
-rebuild debt are explicit, an empty first run included. An `each` chain
+never existed changes no debt. Shared, definition, retry and rebuild debt
+are explicit, an empty first run included. The stale reasons are *input
+changed* (keys owed, new patterns, a shared input moved, an upstream
+reset) and *definition changed*. An `each` chain
 intersects the upstream's owed keys with the consumer's patterns, key by
 key, and rolls up with "any".
 
@@ -290,9 +308,12 @@ exclude `drop/*`. `drop/b` is a candidate (a change since `P`): decoded
 absent, excluded now: nothing. Classing the change under the old patterns
 would have owed an add of an excluded key.
 
-**A definition change.** `R` resets to an empty base: everything upstream
-is owed an add, and the first batch starts the consumer over; a per-key
-asset's leftover outputs are found in its output index.
+**A definition change.** The definition — the digest of the asset's
+version, input bindings, store version and config — differs, and staleness
+says *definition changed*. `R` resets to an empty base: everything
+upstream is owed an add, and the run's first batch starts the consumer
+over; a per-key asset's leftover outputs are owed removals against its
+output index.
 
 **A run in two batches.** From `⊥`, `batch_size=1` over `k1`, `k2`. Batch
 1 reads at `H1`, delivers `k1`, and writes `(−∞, k1] @ H1`. `k2` changes
@@ -362,7 +383,7 @@ its next run owes batch 3's keys and whatever changed since, and needs
 nothing of the old run's cursor.
 
 **Per-key versus plain.** One observation record for both. For `checks`,
-failed keys are seen, retried by their failure records. For `tally`, `S`
+failed keys are observed, retried by their failure records. For `tally`, `S`
 is the only record of what the count holds: `added` is never a key it
 holds, `removed` always one.
 
@@ -387,11 +408,35 @@ holds, `removed` always one.
 A19 R6 (`keys=` bounded by `batch_size` and `concurrency`) and R8 (a
 forced retry) are kept as they are, outside the observation record.
 
+## Words retired
+
+Each goes from the docs and the glossary when the rebuild lands (D140):
+
+- **position** — *was* how far an input had read; now the observation record.
+- **read-ahead** — *was* what `keys=` runs read past the position; now points.
+- **pass** (full, delta, diff) — *was* a frozen walk of the upstream; now a
+  run's batches over what it loads, each at its own head.
+- **retry pass** — *was* a walk of the failed keys; now a run loads the keys
+  its failure records make due.
+- **pattern change** (as a process) — *was* a cut-over, a delta under the
+  old patterns, and a membership diff; now an input change, and the
+  comparison under the new patterns.
+- **reconcile** — *was* a per-key cleanup after a full pass; now owed
+  removals, against the output index after a start-over.
+- **seen** — *was* the whole and dep versions a partition caught up to; now
+  each layer's context.
+- **caught_up** — *was* a flag set by the commit path; now nothing owed.
+- **fingerprint** — *was* its name; now the **definition**.
+- **input unit** — *was* a unit of an input's record; gone. **Output unit**
+  stays.
+- **`Batch.full`** — *was* a full pass's flag; gone: `index`, `first` and
+  `final` are relative to the run.
+
 ## What it replaces
 
 | Today | With the observed set |
 |---|---|
-| Position: `next`, `pass` (`from`, `at`, `batch`, `pin`), `fingerprint`, `began`, `seen` | The base and ranges, each observed at a head; no pass, cursor or scan pin is stored; `fingerprint` stays: a change resets `R` |
+| Position: `next`, `pass` (`from`, `at`, `batch`, `pin`), `fingerprint`, `began`, `seen` | The base and ranges, each observed at a head; no pass, cursor or scan pin is stored; the `definition` (was `fingerprint`) stays: a change resets `R` |
 | K45 read-ahead (`ahead`), its cap, paged selections' shared entries | Points, spilling past a bound |
 | D93: snapshot passes; selections classed via `lower=` | Each batch reads at its own head, pinned by its claim; selections write points; `decode` replaces `lower=` |
 | D100: classes from the index, rows from the store; rowless deliveries | Classes from what was served, decided before the callback |
@@ -403,10 +448,11 @@ Deleted: `_selection` and its branches, the pass and its pin, `held_at`,
 `walked`, `read_from`, `pattern_change` and the `diff` mode,
 `_read_ahead`, `_read_ahead_of`, `changes(lower=)`, `READ_AHEAD_FULL` and
 the cap, `_dep_restart`, `caught_up`, most of `staleness.py` and
-`positions.py`, D100's rowless deliveries and `gone_since`'s early
-removal. Kept: the key index and `changes()`, endpoint reservation and
-the claim's reader pin, the failure index and retries, per-key reconcile,
-D111's bounds, positions by commit for unkeyed upstreams.
+`positions.py`, the per-key reconcile, `Batch.full`, D100's rowless
+deliveries and `gone_since`'s early removal. Kept: the key index and
+`changes()`, endpoint reservation and the claim's reader pin, the failure
+index and retries, D111's bounds; an unkeyed upstream's observation is
+the one commit it last read.
 
 ## Testing
 
@@ -491,7 +537,7 @@ in memory:
 
 ```text
 run(R):
-    todo = sorted(owed(R, now))                    # the comparison
+    todo = sorted(owed(R, now))                    # by default; keys= may name a list, or everything
     prev = FIRST
     while prev is not LAST:
         keys = the next batch_size keys of todo after prev
