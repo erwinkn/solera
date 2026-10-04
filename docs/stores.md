@@ -23,8 +23,12 @@ cannot happen, in one of two ways — its **kind**:
 
 | Kind | How a late writer is made harmless | Implement | A read sees |
 |---|---|---|---|
-| `immutable` | It writes only names no other attempt uses. A late write creates an object nothing references; the engine has it deleted later. | `cleanup` | exactly the pinned generation |
+| `immutable` | It writes only names no other attempt uses. A late write creates an object nothing references; the engine has it deleted later. | — | exactly the pinned generation |
 | `fenced` | Every write checks, atomically, that its attempt still holds the partition. A newer attempt takes it first (`acquire`), so the older one is refused. | `acquire`, `keys` | the current rows |
+
+Both kinds implement `cleanup`: an immutable store for what commits let
+go of and what late writers left, both for an output removed or moved
+away.
 
 There is no third kind: registration refuses a store that declares
 anything else, or lacks the method its kind needs.
@@ -42,7 +46,8 @@ class Store(Protocol):
     async def store(self, write, prior, context) -> Written: ...
     async def load(self, ref, t, selection) -> Any: ...
 
-    async def cleanup(self, context, prior, items) -> None: ...  # immutable
+    async def cleanup(self, output, *, home=None, partition=None, key=None,
+                      generation=None, before=None) -> None: ...
     async def acquire(self, context, prior) -> None: ...          # fenced
     def keys(self, ref, among) -> Iterable[list[str]]: ...      # fenced
     async def migrate(self, output, migrations, context=None, prior=None) -> list[str]: ...  # optional
@@ -111,11 +116,33 @@ generations. With `Keys`, `t` may be `dict[str, T]`
 does not exist. `can_load` says which `t` a store loads, by key or not;
 say only what `load` does.
 
-**`cleanup(context, prior, items)`** (immutable) deletes objects nothing reads
-any more. `items` name them: `("key", key, generation)`,
-`("path", path)`, `("value", generation)`, `("commit_number", n, generation)`, or
-`("commits", lo, hi)`. The engine names only objects no reader pins;
-deleting a name twice, or one never written, must be harmless.
+### Cleanup
+
+**`cleanup(output, *, home, partition, key, generation, before)`** deletes
+every object of the output the pattern matches. A stored object is named
+by identity: its output life (`home`, the name it began under, else the
+output's own; see `WriteContext.home`), its `partition`, its `key` (an
+unkeyed incremental output's commit number; a value has none) and the
+`generation` that wrote it, which is also a key's version. Any field left
+out matches anything, not only trailing ones, so it is a pattern, not a
+prefix; `before=G` matches every generation older than `G`:
+
+| Call | Deletes | When the engine asks |
+|---|---|---|
+| `cleanup(o, home=h, before=G)` | the whole output life | it was removed, or moved to another store; `G` is the first generation after, so a later life of the same name in the same store is never touched |
+| `cleanup(o, partition=p)` | a partition | a removed dynamic partition |
+| `cleanup(o, partition=p, key=k, generation=g)` | one superseded version | a commit replaced it |
+| `cleanup(o, partition=p, generation=g)` | all an attempt wrote | it ended without committing, or wrote after it ended |
+
+The engine asks only for what no reader pins; the store just deletes,
+idempotently — twice, or what was never written, is harmless. Each
+store satisfies a pattern as it can: FileStore and S3Store by name (the
+exact name when the pattern gives it, else a listing filtered by the
+name's last two components), PostgresStore by `DELETE … WHERE`, or `DROP
+TABLE` for the whole output. Its rows carry no generation, so a
+partition's is its fence row's last write: its rows go only if that
+matches, and the table is dropped only when no partition of it is
+newer.
 
 **`acquire(context, prior)`** (fenced) takes the partition for
 `context.generation` and `context.worker_id`, in a transaction of its own,
@@ -334,7 +361,8 @@ create-only:
 A keyed load computes names from `Keys` (each key's generation → the
 object), never by listing. Commits: several attempts may write commit n
 (a retry reuses its number); the committed one is the highest generation.
-`cleanup` deletes the names it is given. FileStore and S3Store
+`cleanup` matches names: a generation is a name's last component, a key
+or commit the one before it. FileStore and S3Store
 (`solera.stores`) are this recipe.
 
 ### A key-value store: conditional puts
@@ -422,5 +450,6 @@ where the example store with its fence left out fails it.
 - Generations only grow for a partition: every later attempt's is larger.
 - The engine records a commit only after `store` returned; a ref it
   records is one your store returned.
-- `cleanup` is called only with names no reader pins, in the partition's next
-  attempt or right after a commit (`lifecycle.md` §9.8).
+- `cleanup` is called only for what no reader pins: in the partition's next
+  attempt, right after a commit, or by a cleanup task once the output is
+  removed or moved away (`lifecycle.md` §9.8).

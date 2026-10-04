@@ -150,6 +150,24 @@ def keyed(h: Harness) -> Output:
     return h.output(key="id")
 
 
+def partitioned(h: Harness) -> Output:
+    """A keyed output for several partitions: a store that shares one table
+    among them (`shared_table`) gets a `partition_column`."""
+
+    shared = getattr(h.store, "shared_table", False)
+    return h.output(key="id", **({"partition_column": "part"} if shared else {}))
+
+
+async def gone(h: Harness, ref: Ref, ledger: Ledger) -> bool:
+    """Whether what `ledger` names of `ref`'s partition is gone: an immutable
+    store refuses to read a name that is gone, a fenced store has no row."""
+
+    try:
+        return not await now(h, ref, ledger)
+    except StoreError:
+        return True
+
+
 # -- every store ---------------------------------------------------------------------------
 
 
@@ -267,14 +285,43 @@ async def partitions_never_touch_each_other(h: Harness) -> None:
     was. (A store that shares one table among partitions declares
     `shared_table`; its outputs get a `partition_column`.)"""
 
-    shared = getattr(h.store, "shared_table", False)
-    out = h.output(key="id", **({"partition_column": "part"} if shared else {}))
+    out = partitioned(h)
     one, two = Ledger(), Ledger()
     first = await write(h, out, [{"id": "a", "v": "1"}], 1, one, partition="p1")
     other = await write(h, out, [{"id": "b", "v": "1"}], 2, two, partition="p2")
     first = await write(h, out, [{"id": "c", "v": "1"}], 3, one, first, partition="p1")
     assert await now(h, first, one) == [("c", "1")]
     assert await now(h, other, two) == [("b", "1")]
+
+
+async def a_partition_cleanup_leaves_the_others(h: Harness) -> None:
+    """Two partitions; cleanup of p1 — a removed dynamic partition — leaves
+    p2 as it was."""
+
+    out = partitioned(h)
+    one, two = Ledger(), Ledger()
+    first = await write(h, out, [{"id": "a", "v": "1"}], 1, one, partition="p1")
+    other = await write(h, out, [{"id": "b", "v": "1"}], 2, two, partition="p2")
+    await h.store.cleanup(out, partition="p1")
+    assert await gone(h, first, one)
+    assert await now(h, other, two) == [("b", "1")]
+
+
+async def a_whole_output_cleanup_takes_only_its_life(h: Harness) -> None:
+    """The output's life that ended (generations 1 and 2, partitions p1 and
+    p2) is cleaned up with `before=10`, the first generation after it; a
+    later life of the same name in the same place (generation 20, p2) wrote
+    meanwhile and keeps it. Twice is no harm."""
+
+    out = partitioned(h)
+    one, two, later = Ledger(), Ledger(), Ledger()
+    first = await write(h, out, [{"id": "a", "v": "1"}], 1, one, partition="p1")
+    await write(h, out, [{"id": "b", "v": "1"}], 2, two, partition="p2")
+    again = await write(h, out, [{"id": "c", "v": "1"}], 20, later, partition="p2")
+    for _ in range(2):
+        await h.store.cleanup(out, before=10)
+    assert await gone(h, first, one)
+    assert await now(h, again, later) == [("c", "1")]
 
 
 async def a_pinned_read_returns_its_version(h: Harness) -> None:
@@ -289,20 +336,34 @@ async def a_pinned_read_returns_its_version(h: Harness) -> None:
     assert await now(h, second, ledger) == [("a", "2")]
 
 
-async def cleanup_never_takes_what_is_read(h: Harness) -> None:
-    """a at 1 is superseded by a at 2, and an abandoned attempt (generation
-    7) wrote b. Cleaning up the superseded and the abandoned names — twice,
-    and names never written — leaves the current content whole."""
+async def a_superseded_version_goes_alone(h: Harness) -> None:
+    """a at 1 (generation 5) is superseded by a at 2 (generation 9):
+    cleanup of a at 5 — twice, and of a version never written — leaves the
+    current content whole, and the old version gone."""
+
+    out, ledger = keyed(h), Ledger()
+    first = await write(h, out, [{"id": "a", "v": "1"}], 5, ledger)
+    pinned = Ledger(dict(ledger.entries))
+    second = await write(h, out, [{"id": "a", "v": "2"}], 9, ledger, first)
+    for _ in range(2):
+        await h.store.cleanup(out, partition="", key="a", generation=5)
+    await h.store.cleanup(out, partition="", key="z", generation=8)
+    assert await now(h, second, ledger) == [("a", "2")]
+    assert await gone(h, first, pinned)
+
+
+async def all_an_attempt_wrote_goes_by_its_generation(h: Harness) -> None:
+    """An abandoned attempt (generation 7) wrote b and c; the committed
+    content is a at 5. cleanup of generation 7 takes b and c, by their
+    generation alone, and leaves a."""
 
     out, ledger = keyed(h), Ledger()
     first = await write(h, out, [{"id": "a", "v": "1"}], 5, ledger)
     abandoned = Ledger()
-    await write(h, out, [{"id": "b", "v": "1"}], 7, abandoned, first, patch=True)  # never committed
-    second = await write(h, out, [{"id": "a", "v": "2"}], 9, ledger, first)
-    items = [("key", "a", 5), ("key", "b", 7), ("key", "z", 8)]
-    for _ in range(2):
-        await h.store.cleanup(context(out, 10), second, items)
-    assert await now(h, second, ledger) == [("a", "2")]
+    await write(h, out, [{"id": "b", "v": "1"}, {"id": "c", "v": "1"}], 7, abandoned, first, patch=True)
+    await h.store.cleanup(out, partition="", generation=7)
+    assert await now(h, first, ledger) == [("a", "1")]
+    assert await gone(h, first, Ledger({"b": 7})) and await gone(h, first, Ledger({"c": 7}))
 
 
 # -- fenced stores -------------------------------------------------------------------------
@@ -464,8 +525,14 @@ EVERY = [
     a_replacement_resolved_writes_its_keys_and_removes_the_rest,
     an_unkeyed_output_is_its_plain_rows,
     partitions_never_touch_each_other,
+    a_partition_cleanup_leaves_the_others,
+    a_whole_output_cleanup_takes_only_its_life,
 ]
-IMMUTABLE = [a_pinned_read_returns_its_version, cleanup_never_takes_what_is_read]
+IMMUTABLE = [
+    a_pinned_read_returns_its_version,
+    a_superseded_version_goes_alone,
+    all_an_attempt_wrote_goes_by_its_generation,
+]
 FENCED = [
     a_stale_writer_is_refused,
     one_generation_admits_one_worker,

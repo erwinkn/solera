@@ -248,11 +248,10 @@ def stateful(make_harness: Callable[[], Harness]):
                 live |= set(pin.entries.items())
             unused = sorted(self.written - live)
             chosen = [n for i, n in enumerate(unused) if take >> (i % 16) & 1]
-            items = [("key", k, g) for k, g in chosen] + [("key", "zz", 99_999)]
+            versions = [*chosen, ("zz", 99_999)]  # and one never written
             for _ in range(2 if twice else 1):
-                self.run(
-                    self.store.cleanup(self._context(Attempt(self.generation + 1, "gc")), self.head, items)
-                )
+                for k, g in versions:
+                    self.run(self.store.cleanup(self.out, partition="", key=k, generation=g))
 
         @precondition(lambda self: self.head is not None and self.ledger.entries)
         @rule(keys=st.sets(st.sampled_from(KEYS), min_size=1))

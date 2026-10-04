@@ -86,3 +86,40 @@ def written(cur, domain: str, partition: str, *, table: str = FENCE_TABLE, param
     found = cur.fetchone()
     value = None if found is None else (found["written"] if isinstance(found, dict) else found[0])
     return None if value is None else int(value)
+
+
+def cleaned(
+    cur,
+    domain: str,
+    *,
+    partition: str | None = None,
+    generation: int | None = None,
+    before: int | None = None,
+    keep: bool = False,
+    table: str = FENCE_TABLE,
+    param: str = "%s",
+) -> tuple[list[str], bool]:
+    """The partitions of `domain` a cleanup pattern takes (docs/stores.md
+    § Cleanup), in the caller's transaction, and whether they are all of
+    its partitions. Rows carry no generation, so a partition's is the one
+    that last wrote it: taken when that is exactly `generation`, or older
+    than `before` — a later life of the same name keeps what it wrote. Their
+    fence rows go, unless `keep` (only some of their rows go, a key's)."""
+
+    p = param
+    cur.execute(f"SELECT part, written FROM {table} WHERE domain = {p}", (domain,))
+    found = {
+        (r["part"] if isinstance(r, dict) else r[0]): (r["written"] if isinstance(r, dict) else r[1])
+        for r in cur.fetchall()
+    }
+
+    def due(g) -> bool:
+        return (generation is None or g == generation) and (before is None or g is None or g < before)
+
+    parts = [part for part, g in found.items() if (partition is None or part == partition) and due(g)]
+    if partition is not None and partition not in found:
+        parts.append(partition)  # never fenced: nothing newer wrote it
+    if not keep:
+        for part in parts:
+            cur.execute(f"DELETE FROM {table} WHERE domain = {p} AND part = {p}", (domain, part))
+    return parts, len(set(parts) & set(found)) == len(found)

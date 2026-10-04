@@ -320,7 +320,7 @@ async def test_a_renamed_asset_keeps_what_its_scope_owes(tmp_path):
     await engine.initialize()
     m = state.model
     m.repairs[("items", "")] = [{"files": [], "run": "r", "attempt": "dead"}]
-    m.cleanups[("items", "")] = [{"n": 1, "id": "1.0", "kind": "items", "items": [["path", "x"]]}]
+    m.cleanups[("items", "")] = [{"n": 1, "id": "1.0", "kind": "version", "generation": 1}]
 
     @asset(outputs=Output(key="id"), aliases=["items"])
     def catalog():

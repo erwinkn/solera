@@ -319,6 +319,54 @@ class PostgresStore:
         self._fence_table(cur)
         self._take(cur, self._relid(cur, table), context, write=True)
 
+    async def cleanup(
+        self, output, *, home=None, partition=None, key=None, generation=None, before=None
+    ) -> None:
+        """Delete what the pattern matches (docs/stores.md § Cleanup). Rows
+        carry no generation: a partition's is its fence row's last write. So
+        a partition's rows go only if that write matches — exactly
+        `generation`, or older than `before` — and the whole output's table
+        is dropped only when no partition of it is newer: a later life of the
+        same name in the same table keeps what it wrote. `key` narrows it to
+        that key's rows. Idempotent."""
+
+        await asyncio.to_thread(self._cleanup, output, home, partition, key, generation, before)
+
+    def _cleanup(self, output, home, partition, key, generation, before) -> None:
+        table, _, _ = self._table(output, None, home)
+        column = output.config.get("partition_column")
+        with self._connect() as conn, conn.cursor() as cur:
+            self._domain(cur, table, exclusive=True)
+            relid = self._relid(cur, table)
+            if relid is None:
+                return
+            self._fence_table(cur)
+            written = {
+                r["part"]: r["written"]
+                for r in cur.execute(f"SELECT part, written FROM {FENCE_TABLE} WHERE relid = %s", (relid,))
+            }
+
+            def due(part) -> bool:
+                g = written.get(part)
+                return (generation is None or g == generation) and (before is None or g is None or g < before)
+
+            parts = list(written) if partition is None else [partition]
+            taken = [p for p in parts if due(p)]
+            if partition is None and key is None and len(taken) == len(written):
+                cur.execute(f"DROP TABLE IF EXISTS {table}")
+                cur.execute(f"DELETE FROM {FENCE_TABLE} WHERE relid = %s", (relid,))
+                return
+            if not column and len(taken) < len(written):
+                return  # partitions share the rows: none of them goes while a newer one is there
+            for part in taken:
+                where = {column: part} if column else {}
+                sql, params = self._where_sql(where), [where[k] for k in sorted(where)]
+                if key is not None:
+                    sql, params = f"{sql} AND {_ident(output.key)}::text = %s", [*params, str(key)]
+                cur.execute(f"DELETE FROM {table} WHERE {sql}", params)
+                if key is None:
+                    cur.execute(f"DELETE FROM {FENCE_TABLE} WHERE relid = %s AND part = %s", (relid, part))
+
     async def acquire(self, context: WriteContext, prior: Ref | None = None) -> None:
         """Take the attempt's generation for the partition it writes — in the
         table `prior`, the committed head, names — in a transaction of its

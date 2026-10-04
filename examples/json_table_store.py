@@ -18,7 +18,7 @@ import contextlib
 
 import psycopg
 from psycopg.types.json import Jsonb
-from solera.fencing import fence, fence_table, written
+from solera.fencing import cleaned, fence, fence_table, written
 from solera.sdk import Ref
 from solera.stores import MISSING, Commits, KeyedWrite, Keys, Patch, Written, by_key_type, takes
 
@@ -40,10 +40,11 @@ class JsonTableStore:
     def can_store(self, t, output) -> bool:
         return takes(t, output, values=False)  # rows as Python: it defines no `prepare` of its own
 
-    def _table(self, output, prior) -> str:
-        """The committed head's table; the output's name only for a first write."""
+    def _table(self, output, prior, home=None) -> str:
+        """The committed head's table; for a first write, the output life's:
+        every partition of one life in one table (`home`, docs/stores.md)."""
 
-        return (prior.handle or {}).get("table") if prior is not None else f'"rows_{output.name}"'
+        return (prior.handle or {}).get("table") if prior is not None else f'"rows_{home or output.name}"'
 
     def _transaction(self, table):
         conn = psycopg.connect(self.dsn)  # `with` commits, or rolls back on an exception
@@ -57,7 +58,7 @@ class JsonTableStore:
         await asyncio.to_thread(self._acquire, context, prior)
 
     def _acquire(self, context, prior) -> None:
-        table = self._table(context.output, prior)
+        table = self._table(context.output, prior, context.home)
         conn, cur = self._transaction(table)
         with conn:
             fence(cur, context, table)
@@ -66,7 +67,7 @@ class JsonTableStore:
         return await asyncio.to_thread(self._store, write, prior, context)
 
     def _store(self, write, prior, context) -> Written:
-        out, table = context.output, self._table(context.output, prior)
+        out, table = context.output, self._table(context.output, prior, context.home)
         if context.reset:
             prior = None  # a full run keeps nothing of the content
         conn, cur = self._transaction(table)
@@ -118,6 +119,29 @@ class JsonTableStore:
                     (context.partition, sorted(write.removes)),
                 )
             return Written(Ref(out.name, "", handle, context.partition))
+
+    async def cleanup(self, output, *, home=None, partition=None, key=None, generation=None, before=None):
+        """Delete what the pattern matches (docs/stores.md § Cleanup): the
+        partitions `cleaned` takes by the generation that last wrote them —
+        or a key's rows of them — and the table once the whole output goes."""
+
+        await asyncio.to_thread(self._cleanup, output, home, partition, key, generation, before)
+
+    def _cleanup(self, output, home, partition, key, generation, before) -> None:
+        table = self._table(output, None, home)
+        conn, cur = self._transaction(table)
+        with conn:
+            parts, everything = cleaned(
+                cur, table, partition=partition, generation=generation, before=before, keep=key is not None
+            )
+            if everything and partition is None and key is None:
+                cur.execute(f"DROP TABLE {table}")
+                return
+            for part in parts:
+                if key is None:
+                    cur.execute(f"DELETE FROM {table} WHERE part = %s", (part,))
+                else:
+                    cur.execute(f"DELETE FROM {table} WHERE part = %s AND k = %s", (part, str(key)))
 
     def keys(self, ref, among=None):
         """The keys `ref`'s partition holds — among `among`, or all — sorted by

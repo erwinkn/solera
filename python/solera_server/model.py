@@ -1384,14 +1384,16 @@ class Model:
             (head.get("ref") or {}).get("handle") or {},
         )
         if old.get("mode") in ("value", "set") and old.get("path") != new.get("path"):
-            self._collect(output, partition, {"kind": "items", "items": [["path", old["path"]]]})
+            self._collect(
+                output, partition, {"kind": "version", "generation": int(before["ref"]["generation"])}
+            )
         if old.get("mode") == "commits" and new.get("mode") == "commits":
             first, last = old["commits"]
             if int(new["commits"][0]) > int(first):
                 self._collect(
                     output,
                     partition,
-                    {"kind": "items", "items": [["commits", int(first), int(new["commits"][0]) - 1]]},
+                    {"kind": "commits", "from": int(first), "to": int(new["commits"][0]) - 1},
                 )
 
     def _abandoned(self, partition: str, attempt: str, launched: dict) -> None:

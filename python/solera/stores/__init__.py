@@ -154,11 +154,17 @@ class Store(Protocol):
 
     `writes` says how a writer the engine gave up on is kept from writing
     over a newer one — every store declares one (docs/stores.md):
-    `"immutable"`, it writes only names no other attempt uses, and
-    implements `cleanup`; or `"fenced"`, it implements `acquire`, every
-    write checks the attempt's generation atomically (`solera.fencing`),
-    and `keys(ref, among)` says which keys the partition holds — for a repair
-    after a writer died (docs/versions.md §5).
+    `"immutable"`, it writes only names no other attempt uses; or
+    `"fenced"`, it implements `acquire`, every write checks the attempt's
+    generation atomically (`solera.fencing`), and `keys(ref, among)` says
+    which keys the partition holds — for a repair after a writer died
+    (docs/versions.md §5).
+
+    Every store implements `cleanup(output, *, home, partition, key,
+    generation, before)`: delete every object of the output life kept
+    under `home` the pattern matches — any field left out matches anything,
+    `before` is every generation older than it — idempotently. The engine
+    asks only for what no pin can read (docs/stores.md § Cleanup).
 
     It also says what a load sees (docs/stores.md): an immutable store
     returns exactly the content a ref and selection pin; a fenced store its
@@ -174,7 +180,10 @@ class Store(Protocol):
     async def store(self, write: Any, prior: Ref | None, context: WriteContext) -> Written: ...
     async def load(self, ref: Ref, t: type, selection: Keys | Commits | None) -> Any: ...
 
-    # immutable: async def cleanup(self, context: WriteContext, prior: Ref | None, items: list) -> None
+    async def cleanup(
+        self, output: Output, *, home=None, partition=None, key=None, generation=None, before=None
+    ) -> None: ...
+
     # fenced:    async def acquire(self, partition: Partition, prior: Ref | None) -> None
     #            def keys(self, ref: Ref, among: list[str] | None) -> Iterable[list[str]]
 

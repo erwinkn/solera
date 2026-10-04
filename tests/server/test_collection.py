@@ -167,7 +167,7 @@ async def test_a_reader_pin_holds_collection_back(tmp_path):
     engine = engine_for(state, project)
     await engine.initialize()
     m = state.model
-    m.cleanups[("scores", "")] = [{"n": 10, "id": "10.0", "kind": "items", "items": [["path", "x"]]}]
+    m.cleanups[("scores", "")] = [{"n": 10, "id": "10.0", "kind": "version", "generation": 1}]
     m.claims["reader"] = {"attempt": "r", "generation": 9, "started_at": 0, "status": "running"}
     assert engine._due_cleanups("scores", "", "me") == []
     m.claims["reader"]["generation"] = 10
@@ -287,9 +287,9 @@ async def test_entries_of_one_event_are_acknowledged_one_by_one(tmp_path):
     prefix = m.indexes[("scores", "")].prefix
     m.cleanups.pop(("scores", ""), None)  # the first commit's own
     m.event_counter += 1
-    m._collect("scores", "", {"kind": "items", "items": [["path", "x"]]})
+    m._collect("scores", "", {"kind": "version", "generation": 1})
     m._collect("scores", "", {"kind": "delta", "prefix": prefix, "files": ["gone"]})
-    m._collect("scores", "", {"kind": "items", "items": [["path", "y"]]})
+    m._collect("scores", "", {"kind": "version", "generation": 2})
     entries = m.cleanups[("scores", "")]
     assert len({d["n"] for d in entries}) == 1 and len({d["id"] for d in entries}) == 3
     engine_module.DISCARDS, limit = 1, engine_module.DISCARDS
@@ -297,7 +297,7 @@ async def test_entries_of_one_event_are_acknowledged_one_by_one(tmp_path):
         await run(engine, ["scores"])  # delivers the first alone
     finally:
         engine_module.DISCARDS = limit
-    assert [d["kind"] for d in m.cleanups[("scores", "")]] == ["delta", "items"]
+    assert [d["kind"] for d in m.cleanups[("scores", "")]] == ["delta", "version"]
     await run(engine, ["scores"])  # the unresolved delta and its resolved sibling
     [left] = m.cleanups[("scores", "")]
     assert left["kind"] == "delta" and left["misses"] == 1

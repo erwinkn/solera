@@ -114,11 +114,9 @@ async def test_a_keyed_output_is_one_object_per_key_and_generation(store):
     current = at(out, patch, 8)
     assert await store.load(patched.ref, None, current) == {"u-2": {"bytes": 6}}
     assert await store.load(written.ref, None, at(out, first, 5)) == first  # the old version, intact
-    old = [("key", k, g) for k, g in at(out, first, 5).generations.items()]
-    await store.cleanup(context(out, generation=9), patched.ref, old)
-    await store.cleanup(
-        context(out, generation=9), patched.ref, old
-    )  # names are never reused: twice is no harm
+    for _ in range(2):  # names are never reused: twice is no harm
+        for k, g in at(out, first, 5).generations.items():
+            await store.cleanup(out, partition="", key=k, generation=g)
     assert await store.load(patched.ref, None, current) == {"u-2": {"bytes": 6}}
     assert len(await paths(store)) == 1
 
@@ -230,7 +228,7 @@ async def test_refs_round_trip_and_gone_values_fail(store):
     written = await store.store("x", None, context(Output("v"), generation=1))
     back = Ref.from_json(written.ref.to_json())
     assert type(back).__name__ == "ObjectRef" and back == written.ref
-    await store.cleanup(context(Output("v"), generation=2), written.ref, [("value", 1)])
+    await store.cleanup(Output("v"), partition="", generation=1)
     with pytest.raises(StoreError, match="gone"):
         await store.load(back, None, None)
 

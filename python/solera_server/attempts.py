@@ -326,7 +326,7 @@ class Attempts:
             if self.m.immutable(name) and head is not None:
                 entries = self._due_cleanups(name, task["partition"], None)
                 if entries:
-                    due[name] = {"cleanup": entries, "before": head["ref"]}
+                    due[name] = {"cleanup": entries, "home": self.m.homes.get(name, name)}
         return {"cleanup": due, "partition": task["partition"]} if due else {}
 
     async def attempt_cleaned_up(self, attempt: str, body) -> None:

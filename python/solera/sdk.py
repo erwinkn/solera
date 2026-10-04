@@ -1696,9 +1696,10 @@ class Project:
             # How a store keeps a writer the engine gave up on from writing over a
             # newer one (docs/stores.md): it writes only names no one else uses, or
             # every write checks the attempt's generation — and says which keys a
-            # partition holds, for a repair (docs/versions.md §5).
+            # partition holds, for a repair (docs/versions.md §5). Either kind cleans up
+            # an output removed or moved away from it (K25).
             writes = getattr(store, "writes", None)
-            needs = {"immutable": ("cleanup",), "fenced": ("acquire", "keys")}.get(writes)
+            needs = {"immutable": ("cleanup",), "fenced": ("acquire", "keys", "cleanup")}.get(writes)
             if needs is None:
                 raise RegistrationError(
                     f"store {name!r}: writes must be 'immutable' or 'fenced' (docs/stores.md)"

@@ -164,7 +164,7 @@ class FileStore:
             commit_number = context.commit_number
         else:
             commit_number = int(prior.handle["commits"][1]) + 1 if prior is not None else 0
-        await self._put(f"{base}/{commit_number:012d}/{generation}", items)
+        await self._put(_commit_name(base, commit_number, generation), items)
         first = commit_number if prior is None else int(prior.handle["commits"][0])
         handle = {"mode": "commits", "path": base, "commits": [first, commit_number]}
         return Written(self._ref(context, handle))
@@ -173,39 +173,65 @@ class FileStore:
     def key_name(base: str, key: str, generation: int) -> str:
         return f"{base}/{_segment(key)}/{int(generation)}"
 
-    async def cleanup(self, context: WriteContext, prior: Ref | None, items: list) -> None:
-        """Delete objects nothing reads any more (docs/lifecycle.md §9.8):
-        superseded ones, and what attempts that never committed wrote.
-        `items` name them: `("key", key, generation)`,
-        `("path", path)`, `("value", generation)`, `("commit_number", n, generation)`,
-        or `("commits", lo, hi)` — every object of commits lo..hi. Names are
-        never reused, so deleting one twice is no harm."""
+    async def cleanup(
+        self, output, *, home=None, partition=None, key=None, generation=None, before=None
+    ) -> None:
+        """Delete every object of `output` the pattern matches (docs/stores.md
+        § Cleanup), each field left out matching anything: the life kept
+        under `home` (else its own name), its `partition`, its `key` (an
+        unkeyed incremental output's commit number), exactly `generation`,
+        or every generation older than `before`. Objects are found by name:
+        a generation is every name's last component — `{base}@{g}` for a
+        value, `{base}/{key}/{g}` otherwise — and a key, or commit, the one
+        before it. Names are never reused, so deleting one twice is no harm."""
 
-        base = self._base(context.output, context, prior)
-        names, ranges = [], []
-        for item in items:
-            kind = item[0]
-            if kind == "key":
-                names.append(self.key_name(base, item[1], item[2]))
-            elif kind == "path":
-                names.append(item[1])
-            elif kind == "value":
-                names.append(f"{base}@{int(item[1])}")
-            elif kind == "commit_number":
-                names.append(f"{base}/{int(item[1]):012d}/{int(item[2])}")
-            elif kind == "commits":
-                ranges.append((int(item[1]), int(item[2])))
+        import obstore
+
+        root = _segment(home or output.name)
+        base = root if not partition else f"{root}/{_segment(partition)}"
+        if key is not None and generation is not None and partition is not None:  # one name: no listing
+            await self._delete(
+                self.key_name(base, key, generation)
+                if isinstance(key, str)
+                else _commit_name(base, key, generation)
+            )
+            return
+        wanted = None if key is None else _segment(key) if isinstance(key, str) else f"{int(key):012d}"
+
+        def matches(path: str) -> bool:
+            name = path.rsplit(".", 1)[0]
+            parent, _, last = name.rpartition("/")
+            if "@" in last:  # a value: `{base}@{g}`
+                found_key, g = None, last.rpartition("@")[2]
             else:
-                raise StoreError(f"{context.output.name}: cannot clean up {item!r}")
-        if ranges:
-            import obstore
+                found_key, g = parent.rpartition("/")[2], last
+            if not g.isdigit() or (wanted is not None and found_key != wanted):
+                return False
+            return (generation is None or int(g) == int(generation)) and (
+                before is None or int(g) < int(before)
+            )
 
-            async for chunk in obstore.list(self._objects(), prefix=f"{base}/"):
-                for meta in chunk:
-                    found = _commit_of(base, meta["path"])
-                    if found and any(lo <= found[0] <= hi for lo, hi in ranges):
-                        names.append(f"{base}/{found[0]:012d}/{found[1]}")
-        await self._many(lambda n: self._delete(n), names)
+        names = []
+        async for chunk in obstore.list(self._objects(), prefix=f"{base}/"):
+            names += [meta["path"] for meta in chunk if matches(meta["path"])]
+        if wanted is None:  # values, `{base}@{g}`, sit beside `base`: one level of its parent
+            parent = base.rpartition("/")[0] or None
+            listed = await obstore.list_with_delimiter_async(self._objects(), prefix=parent)
+            names += [
+                m["path"]
+                for m in listed["objects"]
+                if m["path"].startswith(f"{base}@") and matches(m["path"])
+            ]
+        await self._many(self._remove, names)
+
+    async def _remove(self, path: str) -> None:
+        import obstore
+        from obstore.exceptions import NotFoundError
+
+        try:
+            await obstore.delete_async(self._objects(), path)
+        except (NotFoundError, FileNotFoundError):
+            pass
 
     # -- reads ------------------------------------------------------------------
 
@@ -368,6 +394,10 @@ class FileStore:
     @staticmethod
     def _ref(context, handle) -> ObjectRef:
         return ObjectRef(output=context.output.name, store="", handle=handle, partition=context.partition)
+
+
+def _commit_name(base: str, commit_number: int, generation: int) -> str:
+    return f"{base}/{int(commit_number):012d}/{int(generation)}"
 
 
 def _commit_of(base: str, path: str) -> tuple[int, int] | None:

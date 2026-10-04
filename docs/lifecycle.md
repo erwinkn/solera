@@ -988,17 +988,18 @@ shows.
 
 - **Superseded versions, named at resolution.** A commit records one
   data-garbage entry for its delta file at its event counter. Once no
-  pin predates it, the engine calls `store.cleanup(context, prior, names)`
-  with the delta's predecessors, in batches of 1,000; then the entry goes.
-  A superseded value is one name from the previous head's ref.
+  pin predates it, the worker calls `store.cleanup` with the delta's
+  predecessors, one identity pattern each — `(partition, key, generation)`
+  (docs/stores.md § Cleanup) — 64 at a time; then the entry goes. A
+  superseded value is its previous version's generation.
 - **Versions dropped by a merge** need nothing of their own: writes are
   exact, so every version a merge drops was named as a predecessor by the
   delta that replaced it, and is cleaned up through that delta
   (docs/key-index-design.md).
 - **Attempts that ended without committing.** Their names carry their own
   generation, which no other attempt uses, and their `AttemptFinished`
-  without a commit is durable: the engine cleanups the names in their
-  uploaded delta file, their value and their commit's file.
+  without a commit is durable: one pattern, `(partition, generation)`,
+  takes all they wrote — keys, value or commit.
 - **The sweep**, occasional, for what a worker still running after its
   attempt ended (given up on, or a duplicate) wrote later. It lists a
   partition and deletes a name only if its generation belongs to an attempt
@@ -1040,10 +1041,10 @@ entry is done — and while an attempt whose spec holds the entry runs
 three such attempts it is `stuck`: no longer handed out, listed in
 `/api/diagnostics` and on its partition's head record, until an operator runs
 `solera cleanups OUTPUT [Partition] --clear` (its objects stay). An
-abandoned attempt's keyed names come from listing its own delta files
-(`{commit_number:012d}-{attempt}*` under the index prefix, complete because
-deltas are uploaded before data), not from a sweep; those delta files then
-go through the ordinary index garbage.
+abandoned attempt's objects go by its generation, found by the store
+(FileStore by name, under the output life's home); its own delta files
+(`{commit_number:012d}-{attempt}*` under the index prefix) go through the
+ordinary index garbage.
 A pattern change drain's snapshot pin (`position.pattern change.pin`) holds both
 index-file garbage and data cleanups, as a live claim does; a retry pass
 needs none, since each of its batches reads the state of its own prepare

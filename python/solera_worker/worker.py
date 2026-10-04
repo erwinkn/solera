@@ -16,6 +16,7 @@ import asyncio
 import contextlib
 import copy
 import dataclasses
+import functools
 import importlib
 import importlib.util
 import inspect
@@ -654,6 +655,7 @@ async def _store_outputs(
 
 
 REPAIR_PAGE = 100_000
+CLEANUPS_AT_ONCE = 64  # store.cleanup calls in flight
 LISTED = 1_000_000  # changed keys a replacement lists for its store; past it, the store rewrites it
 RESOLVE_KEYS = 100_000  # a write the engine resolves: its keys (docs/resolved-commits.md §4)...
 RESOLVE_ENTRIES = 2_000_000  # ...and for a replacement, its keys plus the live ones
@@ -1366,11 +1368,12 @@ def _file_entries(data: bytes):
 
 
 async def _cleanup_due(spec, project, asset, objects, writes) -> dict:
-    """Clean up the cleanup the engine handed this attempt (docs/
-    lifecycle.md §9.8): the objects a commit let go of, and
-    what attempts that never committed wrote — all past every reader pin.
-    The engine runs no store code; the partition's next attempt, which has its
-    store, deletes for it. Returns what was done, for the result."""
+    """Clean up what the engine handed this attempt (docs/lifecycle.md
+    §9.8): the versions a commit let go of, and what attempts that never
+    committed wrote — all past every reader pin — each entry as identity
+    patterns for `store.cleanup` (docs/stores.md § Cleanup). The engine runs
+    no store code; the partition's next attempt, which has its store,
+    deletes for it. Returns what was done, for the result."""
 
     import obstore
 
@@ -1378,49 +1381,40 @@ async def _cleanup_due(spec, project, asset, objects, writes) -> dict:
     decls = {o.name or asset.name: o for o in asset.outputs}
     cleaned_up, unresolved, files = {}, {}, []
 
-    async def read(path: str) -> bytes | None:
-        return await _get(objects, path)
-
     for name, info in (spec.get("outputs") or {}).items():
         store = project.stores[declared[name]["store"]]
         if not info.get("cleanup") or store.writes != "immutable":
             continue
-        items, done = [], []
+        patterns, done = [], []
         for entry in info["cleanup"]:
             kind, prefix = entry["kind"], entry.get("prefix") or ""
             if kind == "delta":  # what a commit's delta let go of: every replaced version (exact writes)
-                found = [await read(f"{prefix}{f}.kx") for f in entry["files"]]
+                found = [await _get(objects, f"{prefix}{f}.kx") for f in entry["files"]]
                 if any(data is None for data in found):  # the names are not known: it stays pending
                     unresolved.setdefault(name, []).append(entry["id"])
                     continue
                 for data in found:
                     for key, _, _, _, before in _file_entries(data):
                         if before is not None:
-                            items.append(("key", key_str(key), before))
+                            patterns.append({"key": key_str(key), "generation": before})
             elif kind == "abandoned":  # all an uncommitted attempt wrote carries its generation
-                generation = entry["generation"]
-                if "prefix" in entry:  # keyed: its delta files name every object it could have written
-                    stem = f"{int(entry['commit_number']):012d}-{entry['attempt']}"
-                    async for commit_number in obstore.list(objects, prefix=prefix):
-                        for meta in commit_number:
-                            if meta["path"][len(prefix) :].startswith(stem):
-                                data = await read(meta["path"])
-                                for key, _, deleted, _, _ in _file_entries(data) if data else ():
-                                    if not deleted:
-                                        items.append(("key", key_str(key), generation))
-                                files.append(meta["path"])
-                elif entry.get("commit_number") is not None:
-                    items.append(("commit_number", entry["commit_number"], generation))
-                else:
-                    items.append(("value", generation))
-            else:
-                items += [tuple(i) for i in entry["items"]]
+                patterns.append({"generation": entry["generation"]})
+                if "prefix" in entry:  # keyed: its own delta files go to the index's garbage
+                    stem = f"{prefix}{int(entry['commit_number']):012d}-{entry['attempt']}"
+                    async for chunk in obstore.list(objects, prefix=prefix):  # by segment: filtered
+                        files += [meta["path"] for meta in chunk if meta["path"].startswith(stem)]
+            elif kind == "version":  # a value's object a commit replaced
+                patterns.append({"generation": entry["generation"]})
+            elif kind == "commits":  # an append output started over: its earlier commits
+                patterns += [{"key": n} for n in range(int(entry["from"]), int(entry["to"]) + 1)]
             done.append(entry["id"])
         if not done:
             continue
-        partition = WriteContext(output=decls[name], partition=spec["partition"], attempt=spec["attempt"])
-        before = Ref.from_json(info["before"]) if info.get("before") else None  # where its objects live
-        await writes.call(store.cleanup(partition, before, items))
+        clean = functools.partial(
+            store.cleanup, decls[name], home=info.get("home"), partition=spec["partition"]
+        )
+        for i in range(0, len(patterns), CLEANUPS_AT_ONCE):
+            await writes.call(asyncio.gather(*(clean(**p) for p in patterns[i : i + CLEANUPS_AT_ONCE])))
         cleaned_up[name] = done
     out = {"cleaned_up": cleaned_up} if cleaned_up else {}
     if unresolved:

@@ -52,10 +52,10 @@ class TableStore:
         return takes(t, output, values=False)
 
     @staticmethod
-    def _table(output, prior) -> str:
-        """The committed head's table; the output's name only for a first write."""
+    def _table(output, prior, home=None) -> str:
+        """The committed head's table; the output life's home only for a first write."""
 
-        return (prior.handle or {}).get("table") if prior is not None else f"rows_{output.name}"
+        return (prior.handle or {}).get("table") if prior is not None else f"rows_{home or output.name}"
 
     def _fence(self, context, table: str) -> tuple | None:
         """The fence row this transaction would write, or `StoreError`."""
@@ -75,7 +75,7 @@ class TableStore:
     async def _transaction(self, kind: str, context, prior, body: Callable[[dict], object]):
         """Lock the partition, fence, apply `body` to a copy of its rows, commit."""
 
-        table = self._table(context.output, prior)
+        table = self._table(context.output, prior, context.home)
         fate, delay = self.db.fault(kind, context) if self.db.fault is not None else (None, 0.0)
         async with self.db.lock(table, context.partition):
             began = asyncio.get_running_loop().time()
@@ -102,7 +102,7 @@ class TableStore:
 
     async def store(self, write, prior, context) -> Written:
         out = context.output
-        table = self._table(out, prior)  # where the content is, even when it starts over
+        table = self._table(out, prior, context.home)  # where the content is, even when it starts over
         reset = getattr(context, "reset", False)
         base = None if reset else prior  # what the write builds on
 
@@ -136,6 +136,25 @@ class TableStore:
             return Written(Ref(out.name, "", {"table": table}, context.partition))
 
         return await self._transaction("store", context, prior, body)
+
+    async def cleanup(self, output, *, home=None, partition=None, key=None, generation=None, before=None):
+        """A partition's rows go when its fence's generation matches the pattern
+        (rows carry none); with `key`, that key's rows only."""
+
+        table = self._table(output, None, home)
+        parts = self.db.tables.get(table, {})
+
+        def due(part) -> bool:
+            g = (self.db.fences.get((table, part)) or (None,))[0]
+            return (generation is None or g == generation) and (before is None or g is None or g < before)
+
+        for part in [p for p in list(parts) if (partition is None or p == partition) and due(p)]:
+            async with self.db.lock(table, part):
+                if key is None:
+                    del parts[part]
+                    self.db.fences.pop((table, part), None)
+                else:
+                    parts[part] = [r for r in parts[part] if r[0] != key]
 
     def keys(self, ref, among=None):
         """The keys the partition holds — among `among`, or all — sorted by their
