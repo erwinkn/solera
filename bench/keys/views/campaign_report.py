@@ -113,7 +113,7 @@ def table(runs: dict, scen: str, cols: list[str], rows=ROWS) -> list[str]:
     out.append("| stored, mean · peak | " + " | ".join(f"{st[c][0]:.0f} · {st[c][1]:.0f} MB" for c in have) + " |")
     out.append(
         "| background entry writes per entry committed | "
-        + " | ".join(f"{runs[(scen, c)]['built']['merge_entries'] / runs[(scen, c)]['built']['delta_entries']:.2f}" for c in have)
+        + " | ".join(f"{(runs[(scen, c)]['built']['merge_entries'] + runs[(scen, c)]['built'].get('pack_entries', 0)) / runs[(scen, c)]['built']['delta_entries']:.2f}" for c in have)
         + " |"
     )
     out.append(

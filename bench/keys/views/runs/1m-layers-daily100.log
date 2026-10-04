@@ -7,3 +7,9 @@
   commit 6000: 15 MB stored, 928 s
   commit 7000: 16 MB stored, 1326 s
   commit 8000: 17 MB stored, 1543 s
+  commit 9000: 19 MB stored, 1781 s
+  commit 10000: 19 MB stored, 1898 s
+  commit 11000: 20 MB stored, 2042 s
+  commit 12000: 21 MB stored, 2163 s
+{"index": "layers", "scenario": "daily100", "retention": "layers", "window": 8640, "horizon": 0, "n": 1000000, "commits": 12000, "live": 1000000, "delta_mb": 78.174189, "delta_entries": 11994559, "delta_puts": 12000, "stored_mean_mb": 15.70268888225, "stored_peak_mb": 22.459572, "stored_end_mb": 21.024298, "drops": 0, "drops_by": [], "build_s": 2162.5558560001664, "layers": 10, "cut": 2000, "entries": 2511250, "written": {"delta": {"entries": 12994559, "bytes": 82798306, "puts": 12002, "merges": 0}, "tier": {"entries": 51259002, "bytes": 355850482, "puts": 4624, "merges": 3988}, "base": {"entries": 23061500, "bytes": 190742510, "puts": 74, "merges": 19}}, "merge_entries": 74320502, "merge_bytes": 546592992, "merge_puts": 4698, "merges": 4007}
+exit 0
