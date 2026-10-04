@@ -3,3 +3,7 @@ defaultTargets = ["KeyIndex"]
 
 [[lean_lib]]
 name = "KeyIndex"
+
+[[lean_exe]]
+name = "run"
+root = "Main"
