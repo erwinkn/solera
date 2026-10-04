@@ -42,6 +42,8 @@ class LayerCache:
         self._open: dict[str, int] = {}  # object path -> readers
         self._filling: dict[str, asyncio.Future] = {}
         self._lock = threading.RLock()
+        self._candidates: OrderedDict = OrderedDict()  # path -> delta bytes not yet committed
+        self._candidates_used = 0
         for name in os.listdir(
             root
         ):  # nothing is trusted across restarts: the state names sizes, not contents
@@ -132,6 +134,37 @@ class LayerCache:
         with self._lock:
             self._files[path] = (local, len(data), prefix)
         return True
+
+    def offer(self, path: str, data: bytes) -> None:
+        """A delta the resolver computed, which its attempt uploads under
+        `path`: kept in memory until that commit installs it (`committed`) or
+        room runs out, oldest first."""
+
+        with self._lock:
+            self._candidates[path] = data
+            self._candidates_used += len(data)
+            while self._candidates_used > self.memory // 4 and len(self._candidates) > 1:
+                _, old = self._candidates.popitem(last=False)
+                self._candidates_used -= len(old)
+
+    def committed(self, path: str, size: int, prefix: str) -> bool:
+        """A commit installed the delta at `path`: cached from its candidate,
+        without a GET, if one of that size was offered. Returns whether it was."""
+
+        with self._lock:
+            data = self._candidates.pop(path, None)
+            if data is not None:
+                self._candidates_used -= len(data)
+        if data is None or len(data) != size:
+            return False
+        return self._put(path, data, prefix)
+
+    def forget(self, attempt: str) -> None:
+        """An attempt ended: the candidates it did not commit go."""
+
+        with self._lock:
+            for path in [p for p in self._candidates if f"-{attempt}-" in p]:
+                self._candidates_used -= len(self._candidates.pop(path))
 
     def install(self, path: str, data: bytes, prefix: str) -> bool:
         """A file the engine just wrote: cached without a GET."""

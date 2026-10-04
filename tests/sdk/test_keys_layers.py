@@ -432,3 +432,29 @@ async def test_a_streamed_replacement_with_an_overlay():
     st = h.state.committed(1, files)
     found = await L.LayerIndex(h.io, st).lookup([key(i) for i in range(50)])
     assert sorted(found) == sorted({key(i) for i in range(10, 30)} - {key(13)} | {key(40)})
+
+
+async def test_the_resolvers_delta_is_the_writers_and_its_candidate_installs_without_a_get(tmp_path):
+    from solera.keys.layer_cache import LayerCache
+
+    rng = random.Random(23)
+    h = History(rng)
+    for _ in range(12):
+        await h.commit({key(rng.randrange(100)): None for _ in range(6)}, [])
+    cache = LayerCache(str(tmp_path), disk=2**20)
+    idx = L.LayerIndex(h.io, h.state, cache=cache)
+    run = SortedEntries.of([key(1), key(150)], None, [key(2)])
+    patch = await idx.compute(run, replaced=True)
+    written = await h.index().resolve(run, replaced=True)
+    assert [f[0] for f in patch.files] == [f[0] for f in written.files]
+    full = SortedEntries.of([key(i) for i in range(0, 100, 2)], None, [])
+    replaced = await idx.compute(full, replace=True)
+    assert replaced.removed == sum(1 for k in h.fold[-1] if k not in {key(i) for i in range(0, 100, 2)})
+    path = h.state.path("000000000012-a1-0.lay")
+    cache.offer(path, patch.files[0][0])
+    gets = h.io.metrics.snapshot()["gets"]
+    assert cache.committed(path, len(patch.files[0][0]), h.state.prefix) and cache.has(path)
+    assert h.io.metrics.snapshot()["gets"] == gets
+    cache.offer(h.state.path("000000000013-a2-0.lay"), b"x")
+    cache.forget("a2")
+    assert not cache.committed(h.state.path("000000000013-a2-0.lay"), 1, h.state.prefix)

@@ -890,6 +890,32 @@ class LayerIndex:
         part = await self._index_part(name, "d", refs, out["main"])
         return DeltaFiles(part, out["added"], out["removed"], generation), out["collected"]
 
+    async def compute(self, run, *, replace: bool = False, replaced: bool = False, collect: int = 0) -> Delta:
+        """A delta for `run` (sorted entries), computed but not uploaded: the
+        engine's resolver answers a worker with it, and the worker uploads it
+        under its own name. A patch resolves sparsely; a replacement streams
+        the index, its files kept in memory."""
+
+        if not replace:
+            return await self.resolve(run, replaced=replaced, collect=collect)
+        over = self._over(None)
+        job = _native.LayerJob.join(
+            [self._stamp(x) for x, _ in over],
+            sorted=run,
+            replace=True,
+            replaced=replaced,
+            collect=collect,
+            block_size=BLOCK,
+            file_limit=FILE_LIMIT,
+        )
+        files: list[tuple] = []
+
+        async def on_file(part, data, entries, first, last):
+            files.append((data, entries, first, last))
+
+        out = await self._drive(job, [x.main for x, _ in over], on_file)
+        return Delta(files, out["main"], out["added"], out["changed"], out["removed"], out["collected"])
+
     async def _upload(self, name: str, files: list[tuple], index: bytes) -> Part:
         refs = []
         for i, (data, entries, first, last) in enumerate(files):
