@@ -7,3 +7,7 @@ name = "KeyIndex"
 [[lean_exe]]
 name = "run"
 root = "Main"
+
+[[lean_exe]]
+name = "vectors"
+root = "Vectors"

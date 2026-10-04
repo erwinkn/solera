@@ -248,6 +248,59 @@ generations over all 64). For every summary entry it checked:
 
 All 222,066 summary entries were equal.
 
+## Test vectors for the native span code
+
+`Vectors.lean` (`lake build vectors`, then `.lake/build/bin/vectors
+HISTORIES SEED`) prints one history per line as JSON.
+`vectors/span-model-seed1-100.jsonl.gz` holds 100 of them, generated with
+seed 1. The output is deterministic, so any seed regenerates the same
+lines. Each history:
+
+- `gen_rule`: `gen(c) = 10 * (c + 1)`; `keys`: `a` to `d`.
+- `steps`, in order, each with the `state` after it:
+  - `commit`: `c`, `gen`, and exact `entries` (`key`, `gen`, `del`,
+    `pred`). A key carries a predecessor iff it was live, and only live
+    keys are deleted;
+  - `birth`: an endpoint at the head + 1 (`endpoint` commit, `gen`);
+  - `retire`: an endpoint goes;
+  - `merge`: the `inputs` (adjacent physical spans, `a`..`b`), the `live`
+    endpoint generations at merge time, and `base` (the output starts at
+    commit 0). A merge may cross live endpoints. A one-input merge is a
+    rewrite that coalesces retired endpoints.
+- `state`:
+  - `spans`: oldest first, each with its `segments` (start commits) and,
+    per key, its kept `versions` newest first as `[gen, del]`, plus the
+    `pred` of the oldest;
+  - `lookup_head`, and `lookup_at` each live endpoint: the live generation
+    or null;
+  - `changes`: for every live `P` and every `N` with `N + 1` live or the
+    head + 1, the classes of the keys with a version in
+    `[from_gen, to_gen)`. `nothing` means present in range but absent at
+    both ends, which a reader doesn't deliver;
+  - `read_ahead`: for each such `(P, N)`, every `r` in `[P, N]` and every
+    key, the `delivered` state (the truth at `r`) and the `expected` rule
+    output (`skip` or a class).
+
+The rules:
+
+- **A12-1.** Only the base's initial segment, before the oldest live
+  endpoint inside it, drops tombstones and predecessors.
+- **A12-2.** `changes(P, N)` clips to `[g(P), g(N+1))`; the state at `N` is
+  the newest version older than `g(N+1)`, the state before `P` the newest
+  older than `g(P)`.
+
+Each answer is computed twice, from the encoded spans as a reader would and
+from the per-commit history, and the generator stops on any disagreement.
+The spans are kept with the proven model's operations (`Keys.over` per key,
+`Keys.normE` on the base's initial segment). Calibration: a generator that
+dropped tombstones in every segment of the commit-0 span (breaking A12-1)
+stops at history 5 with "lookup at 5, key d". One that didn't clip
+`changes` at `g(N+1)` (breaking A12-2) stops at history 0. The 200
+histories of seed 1 cover 1,078 merges (631 into the base), 1,221
+multi-segment spans, 660 tombstones in later segments of the commit-0 span,
+5,255 `changes` queries with all four classes, and 51,500 read-ahead
+expectations.
+
 ## What the Rust implementation must be checked against
 
 These are the theorems' hypotheses. Each one the Rust breaks voids a
