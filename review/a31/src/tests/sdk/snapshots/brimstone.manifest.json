@@ -1,0 +1,1630 @@
+{
+  "assets": {
+    "fleet_dashboard": {
+      "aliases": [],
+      "automations": [
+        "fleet_dashboard.onchange.0"
+      ],
+      "concurrency": null,
+      "deps": [],
+      "doc": "Partitioned upstream, unpartitioned consumer: the site dimension is collapsed.",
+      "inputs": {
+        "site_health": {
+          "kind": "in",
+          "load": "ref",
+          "meta": null,
+          "output": "site_health"
+        }
+      },
+      "outputs": [
+        {
+          "cleanup_after": null,
+          "config": {
+            "schema": "ops"
+          },
+          "dynamic_partitions": false,
+          "incremental": false,
+          "key": null,
+          "migrations": [],
+          "name": "fleet_dashboard",
+          "store": "postgres"
+        }
+      ],
+      "partitions": null,
+      "placement": {
+        "config": {},
+        "executor": "local",
+        "kind": "Local",
+        "options": {}
+      },
+      "retention": null,
+      "retries": {
+        "backoff": "exponential",
+        "delay": 1.0,
+        "n": 3
+      },
+      "tags": {},
+      "timeout": 3600,
+      "types": {
+        "params": {
+          "site_health": {
+            "args": [
+              {
+                "class": "builtins.str"
+              },
+              {
+                "class": "solera.sdk.TableRef"
+              }
+            ],
+            "generic": "dict"
+          }
+        },
+        "return": {
+          "class": "pandas.core.frame.DataFrame"
+        }
+      },
+      "version": "1"
+    },
+    "graph_delta": {
+      "aliases": [],
+      "automations": [
+        "graph_delta.every.0"
+      ],
+      "concurrency": null,
+      "deps": [],
+      "doc": "Poll a site's Graph delta feed; the feed's cursor is the cursor.",
+      "inputs": {},
+      "outputs": [
+        {
+          "cleanup_after": null,
+          "config": {
+            "partition_column": "site",
+            "schema": "sharepoint"
+          },
+          "dynamic_partitions": false,
+          "incremental": true,
+          "key": null,
+          "migrations": [],
+          "name": "change_events",
+          "store": "postgres"
+        },
+        {
+          "cleanup_after": null,
+          "config": {},
+          "dynamic_partitions": false,
+          "incremental": true,
+          "key": "file_id",
+          "migrations": [],
+          "name": "qaqc_files",
+          "store": "default"
+        }
+      ],
+      "partitions": {
+        "dims": {
+          "sites": {
+            "kind": "dynamic",
+            "output": "sites"
+          }
+        }
+      },
+      "placement": {
+        "config": {},
+        "executor": "local",
+        "kind": "Local",
+        "options": {}
+      },
+      "retention": null,
+      "retries": {
+        "backoff": "exponential",
+        "delay": 1.0,
+        "n": 3
+      },
+      "tags": {},
+      "timeout": 3600,
+      "types": {
+        "params": {
+          "graph": {
+            "class": "brimstone.GraphClient"
+          }
+        },
+        "return": null
+      },
+      "version": "1"
+    },
+    "hillshade": {
+      "aliases": [],
+      "automations": [
+        "hillshade.every.0"
+      ],
+      "concurrency": null,
+      "deps": [
+        "usgs_3dep_tiles"
+      ],
+      "doc": "Two dimensions; deps= gives lineage and change-watching for a resource-read source.",
+      "inputs": {},
+      "outputs": [
+        {
+          "cleanup_after": null,
+          "config": {},
+          "dynamic_partitions": false,
+          "incremental": false,
+          "key": null,
+          "migrations": [],
+          "name": "hillshade",
+          "store": "blob"
+        }
+      ],
+      "partitions": {
+        "dims": {
+          "day": {
+            "end": null,
+            "end_offset": null,
+            "every": "1d",
+            "format": "%Y-%m-%d",
+            "kind": "time",
+            "start": "2024-01-01",
+            "timezone": "UTC"
+          },
+          "site": {
+            "kind": "dynamic",
+            "output": "sites"
+          }
+        }
+      },
+      "placement": {
+        "config": {},
+        "executor": "local",
+        "kind": "Local",
+        "options": {}
+      },
+      "retention": null,
+      "retries": {
+        "backoff": "exponential",
+        "delay": 1.0,
+        "n": 3
+      },
+      "tags": {},
+      "timeout": 3600,
+      "types": {
+        "params": {
+          "dem": {
+            "class": "brimstone.DemClient"
+          }
+        },
+        "return": {
+          "class": "builtins.bytes"
+        }
+      },
+      "version": "1"
+    },
+    "leach": {
+      "aliases": [],
+      "automations": [],
+      "concurrency": null,
+      "deps": [],
+      "doc": "The resource tier lives on the asset; no job indirection.",
+      "inputs": {
+        "leach_crosswalk": {
+          "kind": "in",
+          "load": "data",
+          "meta": null,
+          "output": "leach_crosswalk"
+        },
+        "pmpt_project_matrix": {
+          "kind": "in",
+          "load": "data",
+          "meta": null,
+          "output": "pmpt_project_matrix"
+        },
+        "project_team_map": {
+          "kind": "in",
+          "load": "data",
+          "meta": null,
+          "output": "project_team_map"
+        },
+        "sample_id_crosswalk": {
+          "kind": "in",
+          "load": "data",
+          "meta": null,
+          "output": "sample_id_crosswalk"
+        },
+        "xrd_profex": {
+          "kind": "in",
+          "load": "data",
+          "meta": null,
+          "output": "xrd_profex"
+        },
+        "xrf": {
+          "kind": "in",
+          "load": "data",
+          "meta": null,
+          "output": "xrf"
+        }
+      },
+      "outputs": [
+        {
+          "cleanup_after": null,
+          "config": {
+            "schema": "leaching"
+          },
+          "dynamic_partitions": false,
+          "incremental": false,
+          "key": null,
+          "migrations": [],
+          "name": "leach_kinetics",
+          "store": "postgres"
+        },
+        {
+          "cleanup_after": null,
+          "config": {
+            "schema": "datasmart"
+          },
+          "dynamic_partitions": false,
+          "incremental": false,
+          "key": null,
+          "migrations": [],
+          "name": "leach_invalid_sample_id_log",
+          "store": "postgres"
+        }
+      ],
+      "partitions": null,
+      "placement": {
+        "config": {
+          "cluster": "lab",
+          "region": "us-east-1"
+        },
+        "executor": "lab",
+        "kind": "AWSECS",
+        "options": {
+          "cpu": 4,
+          "memory": 30000000000
+        }
+      },
+      "retention": null,
+      "retries": {
+        "backoff": "exponential",
+        "delay": 0.2,
+        "n": 3
+      },
+      "tags": {},
+      "timeout": 3600,
+      "types": {
+        "params": {
+          "leach_crosswalk": {
+            "class": "pandas.core.frame.DataFrame"
+          },
+          "pmpt_project_matrix": {
+            "class": "pandas.core.frame.DataFrame"
+          },
+          "project_team_map": {
+            "class": "pandas.core.frame.DataFrame"
+          },
+          "sample_id_crosswalk": {
+            "class": "pandas.core.frame.DataFrame"
+          },
+          "xrd_profex": {
+            "class": "pandas.core.frame.DataFrame"
+          },
+          "xrf": {
+            "class": "pandas.core.frame.DataFrame"
+          }
+        },
+        "return": null
+      },
+      "version": "1"
+    },
+    "manual_upload": {
+      "aliases": [],
+      "automations": [
+        "manual_upload.every.0"
+      ],
+      "concurrency": null,
+      "deps": [],
+      "doc": "Upload keys are registered externally by the uploads service.",
+      "inputs": {},
+      "outputs": [
+        {
+          "cleanup_after": null,
+          "config": {
+            "partition_column": "upload_id",
+            "schema": "uploads"
+          },
+          "dynamic_partitions": false,
+          "incremental": false,
+          "key": null,
+          "migrations": [],
+          "name": "manual_upload",
+          "store": "postgres"
+        }
+      ],
+      "partitions": {
+        "dims": {
+          "uploads": {
+            "kind": "dynamic",
+            "output": "uploads"
+          }
+        }
+      },
+      "placement": {
+        "config": {},
+        "executor": "ingest",
+        "kind": "Pool",
+        "options": {
+          "cpu": 1,
+          "memory": 4000000000
+        }
+      },
+      "retention": null,
+      "retries": {
+        "backoff": "exponential",
+        "delay": 1.0,
+        "n": 3
+      },
+      "tags": {},
+      "timeout": 3600,
+      "types": {
+        "params": {
+          "sharepoint": {
+            "class": "brimstone.SharePointClient"
+          }
+        },
+        "return": {
+          "class": "pandas.core.frame.DataFrame"
+        }
+      },
+      "version": "1"
+    },
+    "psa_mean_data": {
+      "aliases": [],
+      "automations": [
+        "psa_mean_data.onchange.0"
+      ],
+      "concurrency": null,
+      "deps": [],
+      "doc": "",
+      "inputs": {
+        "psa_data": {
+          "kind": "in",
+          "load": "data",
+          "meta": null,
+          "output": "psa_data"
+        },
+        "psa_samples": {
+          "kind": "in",
+          "load": "data",
+          "meta": null,
+          "output": "psa_samples"
+        }
+      },
+      "outputs": [
+        {
+          "cleanup_after": null,
+          "config": {
+            "columns": {
+              "diameter": "float not null",
+              "q": "float not null",
+              "q_cleaned": "float",
+              "sample_id": "string not null",
+              "undersize": "float not null",
+              "undersize_cleaned": "float"
+            },
+            "primary_key": [
+              "sample_id",
+              "diameter"
+            ],
+            "schema": "analytical"
+          },
+          "dynamic_partitions": false,
+          "incremental": false,
+          "key": null,
+          "migrations": [],
+          "name": "psa_mean_data",
+          "store": "postgres"
+        }
+      ],
+      "partitions": null,
+      "placement": {
+        "config": {},
+        "executor": "local",
+        "kind": "Local",
+        "options": {}
+      },
+      "retention": null,
+      "retries": {
+        "backoff": "exponential",
+        "delay": 1.0,
+        "n": 3
+      },
+      "tags": {},
+      "timeout": 3600,
+      "types": {
+        "params": {
+          "psa_data": {
+            "class": "pandas.core.frame.DataFrame"
+          },
+          "psa_samples": {
+            "class": "pandas.core.frame.DataFrame"
+          }
+        },
+        "return": {
+          "class": "pandas.core.frame.DataFrame"
+        }
+      },
+      "version": "1"
+    },
+    "qaqc_samples": {
+      "aliases": [],
+      "automations": [
+        "qaqc_samples.onchange.0"
+      ],
+      "concurrency": null,
+      "deps": [],
+      "doc": "One changed workbook of this site: its samples. Solera runs it for every\nfile_id written since, 64 at a time, writes all of them in one\nstore write, and removes the samples of deleted workbooks; the store\nstamps `file_id` and `site`. A workbook that raises is recorded as a\nfailing key, and the others still commit.",
+      "inputs": {
+        "workbook": {
+          "batch_size": 10000,
+          "each": {
+            "concurrency": 64
+          },
+          "kind": "incremental",
+          "load": "data",
+          "meta": null,
+          "output": "qaqc_files"
+        }
+      },
+      "outputs": [
+        {
+          "cleanup_after": null,
+          "config": {
+            "partition_column": "site",
+            "primary_key": [
+              "file_id",
+              "sample_id"
+            ],
+            "schema": "qaqc"
+          },
+          "dynamic_partitions": false,
+          "incremental": true,
+          "key": "file_id",
+          "migrations": [
+            "0001_analyst",
+            "0002_measured_tz"
+          ],
+          "name": "qaqc_samples",
+          "store": "postgres"
+        }
+      ],
+      "partitions": {
+        "dims": {
+          "sites": {
+            "kind": "dynamic",
+            "output": "sites"
+          }
+        }
+      },
+      "placement": {
+        "config": {},
+        "executor": "local",
+        "kind": "Local",
+        "options": {}
+      },
+      "retention": null,
+      "retries": {
+        "backoff": "exponential",
+        "delay": 1.0,
+        "n": 3
+      },
+      "tags": {},
+      "timeout": 3600,
+      "types": {
+        "params": {
+          "sharepoint": {
+            "class": "brimstone.SharePointClient"
+          },
+          "workbook": {
+            "args": [
+              {
+                "class": "builtins.dict"
+              }
+            ],
+            "generic": "list"
+          }
+        },
+        "return": {
+          "class": "pandas.core.frame.DataFrame"
+        }
+      },
+      "version": "2"
+    },
+    "region_rollup": {
+      "aliases": [],
+      "automations": [
+        "region_rollup.onchange.0"
+      ],
+      "concurrency": null,
+      "deps": [],
+      "doc": "Static partitions over a site-partitioned input.",
+      "inputs": {
+        "qaqc_samples": {
+          "kind": "in",
+          "load": "ref",
+          "meta": null,
+          "output": "qaqc_samples"
+        }
+      },
+      "outputs": [
+        {
+          "cleanup_after": null,
+          "config": {
+            "partition_column": "region",
+            "schema": "ops"
+          },
+          "dynamic_partitions": false,
+          "incremental": false,
+          "key": null,
+          "migrations": [],
+          "name": "region_rollup",
+          "store": "postgres"
+        }
+      ],
+      "partitions": {
+        "dims": {
+          "_": {
+            "keys": [
+              "east",
+              "west"
+            ],
+            "kind": "static"
+          }
+        }
+      },
+      "placement": {
+        "config": {},
+        "executor": "local",
+        "kind": "Local",
+        "options": {}
+      },
+      "retention": null,
+      "retries": {
+        "backoff": "exponential",
+        "delay": 1.0,
+        "n": 3
+      },
+      "tags": {},
+      "timeout": 3600,
+      "types": {
+        "params": {
+          "qaqc_samples": {
+            "args": [
+              {
+                "class": "builtins.str"
+              },
+              {
+                "class": "solera.sdk.TableRef"
+              }
+            ],
+            "generic": "dict"
+          }
+        },
+        "return": {
+          "class": "pandas.core.frame.DataFrame"
+        }
+      },
+      "version": "1"
+    },
+    "site_health": {
+      "aliases": [],
+      "automations": [
+        "site_health.onchange.0"
+      ],
+      "concurrency": null,
+      "deps": [],
+      "doc": "In-database: a TableRef in, a query out; no row enters the worker.\nThe store materializes the SELECT into ops.site_health for this site.",
+      "inputs": {
+        "change_events": {
+          "kind": "in",
+          "load": "ref",
+          "meta": null,
+          "output": "change_events"
+        }
+      },
+      "outputs": [
+        {
+          "cleanup_after": null,
+          "config": {
+            "partition_column": "site",
+            "schema": "ops"
+          },
+          "dynamic_partitions": false,
+          "incremental": false,
+          "key": null,
+          "migrations": [],
+          "name": "site_health",
+          "store": "postgres"
+        }
+      ],
+      "partitions": {
+        "dims": {
+          "sites": {
+            "kind": "dynamic",
+            "output": "sites"
+          }
+        }
+      },
+      "placement": {
+        "config": {},
+        "executor": "local",
+        "kind": "Local",
+        "options": {}
+      },
+      "retention": null,
+      "retries": {
+        "backoff": "exponential",
+        "delay": 1.0,
+        "n": 3
+      },
+      "tags": {},
+      "timeout": 3600,
+      "types": {
+        "params": {
+          "change_events": {
+            "class": "solera.sdk.TableRef"
+          }
+        },
+        "return": {
+          "class": "solera_postgres.Sql"
+        }
+      },
+      "version": "1"
+    },
+    "sites": {
+      "aliases": [],
+      "automations": [
+        "sites.cron.0",
+        "sites.ondeploy.0"
+      ],
+      "concurrency": null,
+      "deps": [],
+      "doc": "Refresh the SharePoint site list daily; new sites surface as missing work.",
+      "inputs": {},
+      "outputs": [
+        {
+          "cleanup_after": null,
+          "config": {},
+          "dynamic_partitions": true,
+          "incremental": true,
+          "key": "<partitions>",
+          "migrations": [],
+          "name": "sites",
+          "store": "default"
+        }
+      ],
+      "partitions": null,
+      "placement": {
+        "config": {},
+        "executor": "local",
+        "kind": "Local",
+        "options": {}
+      },
+      "retention": null,
+      "retries": {
+        "backoff": "exponential",
+        "delay": 1.0,
+        "n": 3
+      },
+      "tags": {},
+      "timeout": 3600,
+      "types": {
+        "params": {
+          "graph": {
+            "class": "brimstone.GraphClient"
+          }
+        },
+        "return": {
+          "args": [
+            {
+              "class": "builtins.str"
+            }
+          ],
+          "generic": "list"
+        }
+      },
+      "version": "1"
+    },
+    "weekly_report": {
+      "aliases": [],
+      "automations": [
+        "weekly_report.cron.0"
+      ],
+      "concurrency": null,
+      "deps": [],
+      "doc": "A job: inputs, placement and automations like an asset, no outputs.",
+      "inputs": {
+        "fleet_dashboard": {
+          "kind": "in",
+          "load": "ref",
+          "meta": null,
+          "output": "fleet_dashboard"
+        }
+      },
+      "outputs": [],
+      "partitions": null,
+      "placement": {
+        "config": {},
+        "executor": "local",
+        "kind": "Local",
+        "options": {}
+      },
+      "retention": null,
+      "retries": {
+        "backoff": "exponential",
+        "delay": 1.0,
+        "n": 3
+      },
+      "tags": {},
+      "timeout": 3600,
+      "types": {
+        "params": {
+          "fleet_dashboard": {
+            "class": "solera.sdk.TableRef"
+          },
+          "mailer": {
+            "class": "brimstone.Mailer"
+          }
+        },
+        "return": {
+          "class": "builtins.NoneType"
+        }
+      },
+      "version": "1"
+    }
+  },
+  "automations": {
+    "fleet_dashboard.onchange.0": {
+      "config": null,
+      "enabled": true,
+      "keys": null,
+      "mode": "incremental",
+      "name": "fleet_dashboard.onchange.0",
+      "partitions": null,
+      "skip_missing_inputs": false,
+      "tags": {},
+      "targets": [
+        "fleet_dashboard"
+      ],
+      "trigger": {
+        "kind": "onchange",
+        "outputs": []
+      },
+      "upstream": false,
+      "watched": [
+        "site_health"
+      ]
+    },
+    "graph_delta.every.0": {
+      "config": null,
+      "enabled": true,
+      "keys": null,
+      "mode": "incremental",
+      "name": "graph_delta.every.0",
+      "partitions": null,
+      "skip_missing_inputs": false,
+      "tags": {},
+      "targets": [
+        "graph_delta"
+      ],
+      "trigger": {
+        "kind": "every",
+        "seconds": 30
+      },
+      "upstream": false,
+      "watched": []
+    },
+    "hillshade.every.0": {
+      "config": null,
+      "enabled": true,
+      "keys": null,
+      "mode": "incremental",
+      "name": "hillshade.every.0",
+      "partitions": null,
+      "skip_missing_inputs": false,
+      "tags": {},
+      "targets": [
+        "hillshade"
+      ],
+      "trigger": {
+        "kind": "every",
+        "seconds": 3600
+      },
+      "upstream": false,
+      "watched": []
+    },
+    "manual_upload.every.0": {
+      "config": null,
+      "enabled": true,
+      "keys": null,
+      "mode": "incremental",
+      "name": "manual_upload.every.0",
+      "partitions": "missing",
+      "skip_missing_inputs": false,
+      "tags": {},
+      "targets": [
+        "manual_upload"
+      ],
+      "trigger": {
+        "kind": "every",
+        "seconds": 60
+      },
+      "upstream": false,
+      "watched": []
+    },
+    "psa_mean_data.onchange.0": {
+      "config": null,
+      "enabled": true,
+      "keys": null,
+      "mode": "incremental",
+      "name": "psa_mean_data.onchange.0",
+      "partitions": null,
+      "skip_missing_inputs": false,
+      "tags": {},
+      "targets": [
+        "psa_mean_data"
+      ],
+      "trigger": {
+        "kind": "onchange",
+        "outputs": []
+      },
+      "upstream": false,
+      "watched": [
+        "psa_data",
+        "psa_samples"
+      ]
+    },
+    "qaqc_samples.onchange.0": {
+      "config": null,
+      "enabled": true,
+      "keys": null,
+      "mode": "incremental",
+      "name": "qaqc_samples.onchange.0",
+      "partitions": null,
+      "skip_missing_inputs": false,
+      "tags": {},
+      "targets": [
+        "qaqc_samples"
+      ],
+      "trigger": {
+        "kind": "onchange",
+        "outputs": []
+      },
+      "upstream": false,
+      "watched": [
+        "qaqc_files"
+      ]
+    },
+    "refresh-lab": {
+      "config": null,
+      "enabled": true,
+      "keys": null,
+      "mode": "incremental",
+      "name": "refresh-lab",
+      "partitions": null,
+      "skip_missing_inputs": false,
+      "tags": {},
+      "targets": [
+        "leach",
+        "psa_mean_data"
+      ],
+      "trigger": {
+        "expression": "0 8 * * *",
+        "kind": "cron",
+        "timezone": "UTC"
+      },
+      "upstream": false,
+      "watched": []
+    },
+    "region_rollup.onchange.0": {
+      "config": null,
+      "enabled": true,
+      "keys": null,
+      "mode": "incremental",
+      "name": "region_rollup.onchange.0",
+      "partitions": null,
+      "skip_missing_inputs": false,
+      "tags": {},
+      "targets": [
+        "region_rollup"
+      ],
+      "trigger": {
+        "kind": "onchange",
+        "outputs": []
+      },
+      "upstream": false,
+      "watched": [
+        "qaqc_samples"
+      ]
+    },
+    "site_health.onchange.0": {
+      "config": null,
+      "enabled": true,
+      "keys": null,
+      "mode": "incremental",
+      "name": "site_health.onchange.0",
+      "partitions": null,
+      "skip_missing_inputs": false,
+      "tags": {},
+      "targets": [
+        "site_health"
+      ],
+      "trigger": {
+        "kind": "onchange",
+        "outputs": []
+      },
+      "upstream": false,
+      "watched": [
+        "change_events"
+      ]
+    },
+    "sites.cron.0": {
+      "config": null,
+      "enabled": true,
+      "keys": null,
+      "mode": "incremental",
+      "name": "sites.cron.0",
+      "partitions": null,
+      "skip_missing_inputs": false,
+      "tags": {},
+      "targets": [
+        "sites"
+      ],
+      "trigger": {
+        "expression": "0 6 * * *",
+        "kind": "cron",
+        "timezone": "UTC"
+      },
+      "upstream": false,
+      "watched": []
+    },
+    "sites.ondeploy.0": {
+      "config": null,
+      "enabled": true,
+      "keys": null,
+      "mode": "incremental",
+      "name": "sites.ondeploy.0",
+      "partitions": null,
+      "skip_missing_inputs": false,
+      "tags": {},
+      "targets": [
+        "sites"
+      ],
+      "trigger": {
+        "kind": "ondeploy"
+      },
+      "upstream": false,
+      "watched": []
+    },
+    "weekly_report.cron.0": {
+      "config": null,
+      "enabled": true,
+      "keys": null,
+      "mode": "incremental",
+      "name": "weekly_report.cron.0",
+      "partitions": null,
+      "skip_missing_inputs": false,
+      "tags": {},
+      "targets": [
+        "weekly_report"
+      ],
+      "trigger": {
+        "expression": "0 7 * * 1",
+        "kind": "cron",
+        "timezone": "UTC"
+      },
+      "upstream": false,
+      "watched": []
+    }
+  },
+  "build": {
+    "id": "snapshot",
+    "source": "explicit"
+  },
+  "deploy": "a3444a997359913b6282781025d544413116bae2332f17bad2ca63973b675f85",
+  "errors": [],
+  "executors": {
+    "ingest": {
+      "config": {},
+      "kind": "Pool"
+    },
+    "lab": {
+      "config": {
+        "cluster": "lab",
+        "region": "us-east-1"
+      },
+      "kind": "AWSECS"
+    },
+    "local": {
+      "config": {},
+      "kind": "Local"
+    }
+  },
+  "name": "default",
+  "outputs": {
+    "change_events": {
+      "asset": "graph_delta",
+      "cleanup_after": null,
+      "config": {
+        "partition_column": "site",
+        "schema": "sharepoint"
+      },
+      "dynamic_partitions": false,
+      "incremental": true,
+      "key": null,
+      "migrations": [],
+      "name": "change_events",
+      "source": false,
+      "store": "postgres"
+    },
+    "fleet_dashboard": {
+      "asset": "fleet_dashboard",
+      "cleanup_after": null,
+      "config": {
+        "schema": "ops"
+      },
+      "dynamic_partitions": false,
+      "incremental": false,
+      "key": null,
+      "migrations": [],
+      "name": "fleet_dashboard",
+      "source": false,
+      "store": "postgres"
+    },
+    "hillshade": {
+      "asset": "hillshade",
+      "cleanup_after": null,
+      "config": {},
+      "dynamic_partitions": false,
+      "incremental": false,
+      "key": null,
+      "migrations": [],
+      "name": "hillshade",
+      "source": false,
+      "store": "blob"
+    },
+    "leach_crosswalk": {
+      "asset": null,
+      "config": {
+        "schema": "datasmart"
+      },
+      "dims": null,
+      "dynamic_partitions": false,
+      "incremental": false,
+      "key": null,
+      "migrations": [],
+      "name": "leach_crosswalk",
+      "source": true,
+      "store": "postgres"
+    },
+    "leach_invalid_sample_id_log": {
+      "asset": "leach",
+      "cleanup_after": null,
+      "config": {
+        "schema": "datasmart"
+      },
+      "dynamic_partitions": false,
+      "incremental": false,
+      "key": null,
+      "migrations": [],
+      "name": "leach_invalid_sample_id_log",
+      "source": false,
+      "store": "postgres"
+    },
+    "leach_kinetics": {
+      "asset": "leach",
+      "cleanup_after": null,
+      "config": {
+        "schema": "leaching"
+      },
+      "dynamic_partitions": false,
+      "incremental": false,
+      "key": null,
+      "migrations": [],
+      "name": "leach_kinetics",
+      "source": false,
+      "store": "postgres"
+    },
+    "manual_upload": {
+      "asset": "manual_upload",
+      "cleanup_after": null,
+      "config": {
+        "partition_column": "upload_id",
+        "schema": "uploads"
+      },
+      "dynamic_partitions": false,
+      "incremental": false,
+      "key": null,
+      "migrations": [],
+      "name": "manual_upload",
+      "source": false,
+      "store": "postgres"
+    },
+    "pmpt_project_matrix": {
+      "asset": null,
+      "config": {
+        "schema": "datasmart"
+      },
+      "dims": null,
+      "dynamic_partitions": false,
+      "incremental": false,
+      "key": null,
+      "migrations": [],
+      "name": "pmpt_project_matrix",
+      "source": true,
+      "store": "postgres"
+    },
+    "project_team_map": {
+      "asset": null,
+      "config": {
+        "schema": "datasmart"
+      },
+      "dims": null,
+      "dynamic_partitions": false,
+      "incremental": false,
+      "key": null,
+      "migrations": [],
+      "name": "project_team_map",
+      "source": true,
+      "store": "postgres"
+    },
+    "psa_data": {
+      "asset": null,
+      "config": {
+        "schema": "datasmart"
+      },
+      "dims": null,
+      "dynamic_partitions": false,
+      "incremental": false,
+      "key": null,
+      "migrations": [],
+      "name": "psa_data",
+      "source": true,
+      "store": "postgres"
+    },
+    "psa_mean_data": {
+      "asset": "psa_mean_data",
+      "cleanup_after": null,
+      "config": {
+        "columns": {
+          "diameter": "float not null",
+          "q": "float not null",
+          "q_cleaned": "float",
+          "sample_id": "string not null",
+          "undersize": "float not null",
+          "undersize_cleaned": "float"
+        },
+        "primary_key": [
+          "sample_id",
+          "diameter"
+        ],
+        "schema": "analytical"
+      },
+      "dynamic_partitions": false,
+      "incremental": false,
+      "key": null,
+      "migrations": [],
+      "name": "psa_mean_data",
+      "source": false,
+      "store": "postgres"
+    },
+    "psa_samples": {
+      "asset": null,
+      "config": {
+        "schema": "datasmart"
+      },
+      "dims": null,
+      "dynamic_partitions": false,
+      "incremental": false,
+      "key": null,
+      "migrations": [],
+      "name": "psa_samples",
+      "source": true,
+      "store": "postgres"
+    },
+    "qaqc_files": {
+      "asset": "graph_delta",
+      "cleanup_after": null,
+      "config": {},
+      "dynamic_partitions": false,
+      "incremental": true,
+      "key": "file_id",
+      "migrations": [],
+      "name": "qaqc_files",
+      "source": false,
+      "store": "default"
+    },
+    "qaqc_samples": {
+      "asset": "qaqc_samples",
+      "cleanup_after": null,
+      "config": {
+        "partition_column": "site",
+        "primary_key": [
+          "file_id",
+          "sample_id"
+        ],
+        "schema": "qaqc"
+      },
+      "dynamic_partitions": false,
+      "incremental": true,
+      "key": "file_id",
+      "migrations": [
+        "0001_analyst",
+        "0002_measured_tz"
+      ],
+      "name": "qaqc_samples",
+      "source": false,
+      "store": "postgres"
+    },
+    "region_rollup": {
+      "asset": "region_rollup",
+      "cleanup_after": null,
+      "config": {
+        "partition_column": "region",
+        "schema": "ops"
+      },
+      "dynamic_partitions": false,
+      "incremental": false,
+      "key": null,
+      "migrations": [],
+      "name": "region_rollup",
+      "source": false,
+      "store": "postgres"
+    },
+    "sample_id_crosswalk": {
+      "asset": null,
+      "config": {
+        "schema": "datasmart"
+      },
+      "dims": null,
+      "dynamic_partitions": false,
+      "incremental": false,
+      "key": null,
+      "migrations": [],
+      "name": "sample_id_crosswalk",
+      "source": true,
+      "store": "postgres"
+    },
+    "site_health": {
+      "asset": "site_health",
+      "cleanup_after": null,
+      "config": {
+        "partition_column": "site",
+        "schema": "ops"
+      },
+      "dynamic_partitions": false,
+      "incremental": false,
+      "key": null,
+      "migrations": [],
+      "name": "site_health",
+      "source": false,
+      "store": "postgres"
+    },
+    "sites": {
+      "asset": "sites",
+      "cleanup_after": null,
+      "config": {},
+      "dynamic_partitions": true,
+      "incremental": true,
+      "key": "<partitions>",
+      "migrations": [],
+      "name": "sites",
+      "source": false,
+      "store": "default"
+    },
+    "uploads": {
+      "asset": null,
+      "config": {
+        "name": "uploads"
+      },
+      "dims": null,
+      "dynamic_partitions": true,
+      "incremental": true,
+      "key": "<partitions>",
+      "migrations": [],
+      "name": "uploads",
+      "source": true,
+      "store": "default"
+    },
+    "usgs_3dep_tiles": {
+      "asset": null,
+      "config": {},
+      "dims": null,
+      "dynamic_partitions": false,
+      "incremental": false,
+      "key": null,
+      "migrations": [],
+      "name": "usgs_3dep_tiles",
+      "source": true,
+      "store": "default"
+    },
+    "xrd_profex": {
+      "asset": null,
+      "config": {
+        "schema": "datasmart"
+      },
+      "dims": null,
+      "dynamic_partitions": false,
+      "incremental": false,
+      "key": null,
+      "migrations": [],
+      "name": "xrd_profex",
+      "source": true,
+      "store": "postgres"
+    },
+    "xrf": {
+      "asset": null,
+      "config": {
+        "schema": "datasmart"
+      },
+      "dims": null,
+      "dynamic_partitions": false,
+      "incremental": false,
+      "key": null,
+      "migrations": [],
+      "name": "xrf",
+      "source": true,
+      "store": "postgres"
+    }
+  },
+  "retention": null,
+  "sensors": {},
+  "sources": {
+    "leach_crosswalk": {
+      "handle": {
+        "schema": "datasmart"
+      },
+      "head": {
+        "generation": 0,
+        "handle": {
+          "name": "leach_crosswalk",
+          "schema": "datasmart"
+        },
+        "meta": {
+          "source": true
+        },
+        "output": "leach_crosswalk",
+        "partition": "",
+        "store": "postgres"
+      },
+      "key": null,
+      "name": "leach_crosswalk",
+      "store": "postgres"
+    },
+    "pmpt_project_matrix": {
+      "handle": {
+        "schema": "datasmart"
+      },
+      "head": {
+        "generation": 0,
+        "handle": {
+          "name": "pmpt_project_matrix",
+          "schema": "datasmart"
+        },
+        "meta": {
+          "source": true
+        },
+        "output": "pmpt_project_matrix",
+        "partition": "",
+        "store": "postgres"
+      },
+      "key": null,
+      "name": "pmpt_project_matrix",
+      "store": "postgres"
+    },
+    "project_team_map": {
+      "handle": {
+        "schema": "datasmart"
+      },
+      "head": {
+        "generation": 0,
+        "handle": {
+          "name": "project_team_map",
+          "schema": "datasmart"
+        },
+        "meta": {
+          "source": true
+        },
+        "output": "project_team_map",
+        "partition": "",
+        "store": "postgres"
+      },
+      "key": null,
+      "name": "project_team_map",
+      "store": "postgres"
+    },
+    "psa_data": {
+      "handle": {
+        "schema": "datasmart"
+      },
+      "head": {
+        "generation": 0,
+        "handle": {
+          "name": "psa_data",
+          "schema": "datasmart"
+        },
+        "meta": {
+          "source": true
+        },
+        "output": "psa_data",
+        "partition": "",
+        "store": "postgres"
+      },
+      "key": null,
+      "name": "psa_data",
+      "store": "postgres"
+    },
+    "psa_samples": {
+      "handle": {
+        "schema": "datasmart"
+      },
+      "head": {
+        "generation": 0,
+        "handle": {
+          "name": "psa_samples",
+          "schema": "datasmart"
+        },
+        "meta": {
+          "source": true
+        },
+        "output": "psa_samples",
+        "partition": "",
+        "store": "postgres"
+      },
+      "key": null,
+      "name": "psa_samples",
+      "store": "postgres"
+    },
+    "sample_id_crosswalk": {
+      "handle": {
+        "schema": "datasmart"
+      },
+      "head": {
+        "generation": 0,
+        "handle": {
+          "name": "sample_id_crosswalk",
+          "schema": "datasmart"
+        },
+        "meta": {
+          "source": true
+        },
+        "output": "sample_id_crosswalk",
+        "partition": "",
+        "store": "postgres"
+      },
+      "key": null,
+      "name": "sample_id_crosswalk",
+      "store": "postgres"
+    },
+    "uploads": {
+      "handle": {
+        "name": "uploads"
+      },
+      "head": {
+        "generation": 0,
+        "handle": {
+          "name": "uploads"
+        },
+        "meta": {
+          "source": true
+        },
+        "output": "uploads",
+        "partition": "",
+        "store": "default"
+      },
+      "key": "<partitions>",
+      "name": "uploads",
+      "store": "default"
+    },
+    "usgs_3dep_tiles": {
+      "handle": {},
+      "head": {
+        "generation": 0,
+        "handle": {
+          "name": "usgs_3dep_tiles"
+        },
+        "meta": {
+          "source": true
+        },
+        "output": "usgs_3dep_tiles",
+        "partition": "",
+        "store": "default"
+      },
+      "key": null,
+      "name": "usgs_3dep_tiles",
+      "store": "default"
+    },
+    "xrd_profex": {
+      "handle": {
+        "schema": "datasmart"
+      },
+      "head": {
+        "generation": 0,
+        "handle": {
+          "name": "xrd_profex",
+          "schema": "datasmart"
+        },
+        "meta": {
+          "source": true
+        },
+        "output": "xrd_profex",
+        "partition": "",
+        "store": "postgres"
+      },
+      "key": null,
+      "name": "xrd_profex",
+      "store": "postgres"
+    },
+    "xrf": {
+      "handle": {
+        "schema": "datasmart"
+      },
+      "head": {
+        "generation": 0,
+        "handle": {
+          "name": "xrf",
+          "schema": "datasmart"
+        },
+        "meta": {
+          "source": true
+        },
+        "output": "xrf",
+        "partition": "",
+        "store": "postgres"
+      },
+      "key": null,
+      "name": "xrf",
+      "store": "postgres"
+    }
+  },
+  "stores": {
+    "blob": {
+      "built_in": {
+        "class": "S3Store",
+        "config": {
+          "options": {},
+          "url": "env:ARTIFACT_STORE"
+        }
+      },
+      "cleanup_after": 0.0,
+      "ref": "object",
+      "version": "4",
+      "writes": "immutable"
+    },
+    "default": {
+      "built_in": {
+        "class": "FileStore",
+        "config": {
+          "path": null
+        }
+      },
+      "cleanup_after": 0.0,
+      "ref": "object",
+      "version": "4",
+      "writes": "immutable"
+    },
+    "postgres": {
+      "built_in": {
+        "class": "PostgresStore",
+        "config": {
+          "dsn": "env:DATABASE_URL",
+          "grants": [
+            "qgis",
+            "felt"
+          ],
+          "sql_read_only": false
+        }
+      },
+      "cleanup_after": 604800.0,
+      "ref": "table",
+      "version": "1",
+      "writes": "fenced"
+    }
+  }
+}

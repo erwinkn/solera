@@ -1,0 +1,27 @@
+Running as unit: run-rc7e8c25edbb04478ad9f591d935be6de.scope; invocation ID: 6da344aaca574029a8b4572734c90d19
+   Compiling libc v0.2.189
+   Compiling target-lexicon v0.13.5
+   Compiling find-msvc-tools v0.1.14
+   Compiling proc-macro2 v1.0.107
+   Compiling shlex v2.0.1
+   Compiling pyo3-build-config v0.29.2
+   Compiling unicode-ident v1.0.26
+   Compiling jobserver v0.1.35
+   Compiling pkg-config v0.3.34
+   Compiling cc v1.5.1
+   Compiling quote v1.0.47
+   Compiling pyo3-ffi v0.29.2
+   Compiling heck v0.5.0
+   Compiling syn v2.0.119
+   Compiling zstd-safe v7.3.0
+   Compiling zstd-sys v2.1.0+zstd.1.5.7
+   Compiling pyo3 v0.29.2
+   Compiling crc32fast v1.5.2
+   Compiling pyo3-macros-backend v0.29.2
+   Compiling once_cell v1.21.4
+   Compiling cfg-if v1.0.5
+   Compiling pyo3-macros v0.29.2
+   Compiling zstd v0.13.3
+   Compiling a31-layers v0.0.1 (/tmp/a31/mini)
+    Finished `release` profile [optimized] target(s) in 1m 11s
+exit 0

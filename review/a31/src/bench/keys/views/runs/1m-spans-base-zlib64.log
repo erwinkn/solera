@@ -1,0 +1,16 @@
+  base: 0 s
+  commit 1000: 16 MB stored, 108 s
+  commit 2000: 27 MB stored, 272 s
+  commit 3000: 38 MB stored, 528 s
+  commit 4000: 49 MB stored, 1027 s
+  commit 5000: 60 MB stored, 1553 s
+  commit 6000: 68 MB stored, 2078 s
+  commit 7000: 68 MB stored, 2511 s
+  commit 8000: 67 MB stored, 2998 s
+  commit 9000: 70 MB stored, 3477 s
+  commit 10000: 79 MB stored, 3904 s
+  commit 11000: 86 MB stored, 4355 s
+  commit 12000: 98 MB stored, 4784 s
+{"index": "spans", "scenario": "base", "retention": "spans", "window": 8640, "horizon": 0, "n": 1000000, "commits": 12000, "live": 1000000, "delta_mb": 181.78849, "delta_entries": 11994559, "delta_puts": 12000, "stored_mean_mb": 56.687871664999996, "stored_peak_mb": 98.168445, "stored_end_mb": 97.952521, "drops": 0, "drops_by": [], "build_s": 4783.925912957871, "spans": 15, "entries": 7459822, "merge_entries": 76100248, "merge_bytes": 1071759715, "merge_puts": 5449, "merges": 5449}
+{"built": {"index": "spans", "scenario": "base", "retention": "spans", "window": 8640, "horizon": 0, "n": 1000000, "commits": 12000, "live": 1000000, "delta_mb": 181.78849, "delta_entries": 11994559, "delta_puts": 12000, "stored_mean_mb": 56.687871664999996, "stored_peak_mb": 98.168445, "stored_end_mb": 97.952521, "drops": 0, "drops_by": [], "build_s": 4783.925912957871, "spans": 15, "entries": 7459822, "merge_entries": 76100248, "merge_bytes": 1071759715, "merge_puts": 5449, "merges": 5449}, "reads": [{"keys": 1000, "mismatches": 0, "what": "changes", "at": 12000, "first_s": 0.04077974986284971, "wall_s": 0.04137216694653034, "gets": 1, "mb_in": 0.015377, "peak_mb": 12.746752, "behind": 1}, {"keys": 95624, "mismatches": 0, "what": "changes", "at": 11901, "first_s": 0.6069140420295298, "wall_s": 0.6327810003422201, "gets": 9, "mb_in": 6.249983, "peak_mb": 97.517568, "behind": 100}, {"keys": 307704, "mismatches": 0, "what": "changes", "at": 11641, "first_s": 0.5161200421862304, "wall_s": 0.8064607083797455, "gets": 10, "mb_in": 6.249983, "peak_mb": 149.143552, "behind": 360}, {"keys": 1431699, "mismatches": 0, "what": "changes", "at": 3361, "first_s": 0.9619223750196397, "wall_s": 7.5263212909922, "gets": 109, "mb_in": 62.158075, "peak_mb": 466.354176, "behind": 8640}, {"keys": 1499923, "mismatches": 0, "what": "changes", "at": 2001, "first_s": 1.1419754582457244, "wall_s": 9.634172167163342, "gets": 141, "mb_in": 75.130147, "peak_mb": 606.94528, "behind": 10000}, {"keys": 1000, "mismatches": 0, "what": "write", "at": null, "first_s": 0.7271379996091127, "wall_s": 0.7271379996091127, "gets": 15, "mb_in": 97.952521, "peak_mb": 213.204992, "behind": "write"}, {"keys": 999, "mismatches": 0, "what": "lookups", "at": null, "first_s": 0.9384279167279601, "wall_s": 0.9384279167279601, "gets": 15, "mb_in": 97.952521, "peak_mb": 209.567744, "behind": "lookups"}, {"keys": 100000, "mismatches": 0, "what": "page", "at": null, "first_s": 1.5179868750274181, "wall_s": 1.5179868750274181, "gets": 26, "mb_in": 14.87941, "peak_mb": 232.439808, "behind": "page"}]}
+exit 0

@@ -1,0 +1,322 @@
+"""The engine's state on an object store (docs/object-store-state.md): the
+in-memory model (model.py), made durable by the journal (journal.py), next to
+the objects attempts, run history and data live in.
+
+Everything lives under `{root}/{namespace}/`:
+
+    control/      the journal and checkpoints (journal.py)
+    keys/         key index files (solera.keys, §6)
+    history/      the run history: `{table}/{id}.parquet` (history.py, §7)
+    runs/{run}/   per attempt `{attempt}.json` (spec, then spec + result +
+                  log index) and `{attempt}.log`
+    data/ blobs/  store data
+
+`record()` applies events to the model at once — so the engine checks a
+precondition and changes state in one synchronous step, with nothing
+interleaved — and the journal makes them durable in the background.
+`durable()` waits for that, for the few things that act on the outside
+world on the strength of an event.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import os
+import re
+import time
+from pathlib import Path
+from urllib.parse import quote, unquote, urlsplit
+
+import obstore
+from obstore.exceptions import NotFoundError
+from obstore.store import LocalStore, MemoryStore
+from solera import lifecycle
+from solera.objects import create
+from solera.tasks import Tasks
+
+from .journal import Journal, Stopped, encode
+from .model import Model
+
+log = logging.getLogger(__name__)
+
+EXIT_BROKEN = 70  # EX_SOFTWARE: the process exits for its restart to replay the journal
+
+
+class Unavailable(RuntimeError):
+    """This writer was replaced (fenced) or cannot make state durable; restart required."""
+
+
+class LostOwnership(Exception):
+    """The attempt no longer owns its partition (fencing, §8)."""
+
+
+class Conflict(Exception):
+    """A commit precondition failed (moved head, stale claim).
+
+    retryable=True for races (a head moved under the attempt); False for
+    violations no retry can fix (undeclared output, missing prior head)."""
+
+    def __init__(self, message: str, retryable: bool = True):
+        super().__init__(message)
+        self.retryable = retryable
+
+
+def esc(value) -> str:
+    return quote(str(value), safe="")
+
+
+def open_store(url: str, namespace: str):
+    """The object store rooted at `{url}/{namespace}`, and the URL workers use for it."""
+
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", namespace):
+        raise ValueError("Namespace must contain 1–64 letters, digits, underscores or hyphens")
+    u = urlsplit(url)
+    if u.query or u.fragment or u.username or u.password:
+        raise ValueError("Credentials and query parameters do not belong in storage URLs")
+    if u.scheme == "file":
+        if u.netloc not in ("", "localhost") or not u.path.startswith("/"):
+            raise ValueError("File storage requires an absolute local path")
+        root = Path(unquote(u.path)).resolve() / namespace
+        root.mkdir(parents=True, exist_ok=True)
+        return LocalStore(root, mkdir=True), root.as_uri()
+    if u.scheme == "s3" and u.netloc:
+        prefix = u.path.strip("/")
+        if ".." in prefix.split("/"):
+            raise ValueError("Invalid object prefix")
+        base = "/".join(filter(None, (prefix, namespace)))
+        objects_url = f"s3://{u.netloc}/{base}"
+        return obstore.store.from_url(objects_url), objects_url
+    if u.scheme == "memory":
+        return MemoryStore(), "memory:///"
+    raise ValueError("Use file:///absolute/path, s3://bucket/prefix, or memory:///")
+
+
+class State:
+    """The model, its journal, and the object store — one per namespace."""
+
+    def __init__(
+        self, store, *, url: str, namespace: str, objects_url: str, journal: Journal, model: Model, clock
+    ):
+        self.objects = store
+        self.url, self.namespace, self.objects_url = url, namespace, objects_url
+        self.journal, self.model, self.clock = journal, model, clock
+        self.changed = asyncio.Event()  # set by every record, for whoever waits on changes
+        self.tasks = Tasks("state")  # the exit of a broken state: never canceled
+
+    @classmethod
+    async def open(
+        cls,
+        url: str,
+        namespace: str = "default",
+        *,
+        clock=None,
+        flush_interval: float = 1.0,
+        min_checkpoint: int = 64 << 10,
+        writer: bool = True,
+    ) -> State:
+        """Load the newest checkpoint, replay the journal, and fence out any
+        earlier writer: from here on this process is the namespace's writer.
+        `writer=False` only reads: nothing is fenced and `record` fails."""
+
+        clock = clock or time.time
+        store, objects_url = open_store(url, namespace)
+        model = Model()
+        journal = Journal(
+            store, "control", flush_interval=flush_interval, min_checkpoint=min_checkpoint, clock=clock
+        )
+        # Encoded at once, under the flusher's lock: no copy needed (docs/journal-object.md).
+        await journal.open(model.restore, model.apply, lambda: model.snapshot(copied=False), writer=writer)
+        return cls(
+            store,
+            url=url,
+            namespace=namespace,
+            objects_url=objects_url,
+            journal=journal,
+            model=model,
+            clock=clock,
+        )
+
+    broken: BaseException | None = None  # a reducer failed half-way: the model is not the journal's
+    _exit = staticmethod(os._exit)  # how a broken state ends its process (tests record it instead)
+
+    @property
+    def poisoned(self) -> bool:
+        return self.journal.stopped is not None or self.broken is not None
+
+    @property
+    def ended(self) -> asyncio.Event:
+        """Set once this state writes no more — fenced by a successor, a write
+        that cannot land, or broken: its engine halts on it at once."""
+
+        return self.journal.ended
+
+    def record(self, *events: dict, lazy: bool = False) -> None:
+        """Apply events to the model now, and make them durable in the
+        background: the one way state changes. A `lazy` event waits for the
+        next one to be written with it.
+
+        The whole batch is encoded first, so one the journal cannot hold
+        (`ValueError`) changes nothing; then the model applies decoded
+        copies. Neither the caller's events nor the model's objects are
+        ever the journal's: what is replayed is what was recorded."""
+
+        if self.journal.stopped:
+            raise Unavailable(f"This engine writes no more ({self.journal.stopped}); restart required")
+        if self.broken is not None:
+            raise Unavailable(
+                f"State failed applying an event ({self.broken}); restart to replay the journal"
+            )
+        encoded = [encode(event) for event in events]
+        for data in encoded:
+            try:
+                self.model.apply(json.loads(data))
+            except Exception as error:
+                # Applied in part, journaled not at all: nothing may build on it.
+                self._break(error)
+                raise Unavailable(
+                    f"State failed applying an event ({error}); restart to replay the journal"
+                ) from error
+        self.journal.append(*encoded, lazy=lazy)
+        self.changed.set()
+
+    def _break(self, error: BaseException) -> None:
+        """The model is no longer a fold of the journal: no checkpoint may
+        be taken of it from now on, and the process exits, so that the
+        platform restarts it and the replay recovers. What was recorded
+        before is written first — it is the journal's; the failed batch
+        never reached it."""
+
+        self.broken = error
+        self.journal.stop_checkpoints()
+        self.journal.ended.set()
+        log.critical(
+            "state failed applying an event (%r): exiting for the journal replay to recover it", error
+        )
+        try:
+            self.tasks.spawn(self._die(), key="die")
+        except RuntimeError:  # no loop to flush on
+            self._exit(EXIT_BROKEN)
+
+    async def _die(self) -> None:
+        try:
+            await self.journal.flush()
+        except Exception:
+            log.exception("flushing before the exit failed: the journal holds what it held")
+        self._exit(EXIT_BROKEN)
+
+    @property
+    def recorded(self) -> int:
+        return self.journal.appended
+
+    async def durable(self) -> None:
+        """Return once everything recorded so far is durable — for what acts
+        on the outside world on the strength of it (docs/object-store-state.md §3)."""
+
+        try:
+            await self.journal.durable()
+        except Stopped as error:
+            raise Unavailable(f"This engine writes no more ({error}); restart required") from error
+
+    async def close(self) -> None:
+        await self.journal.close()
+
+    # -- attempts (§8) -----------------------------------------------------------------
+
+    def attempt_path(self, run_id: str, attempt: str) -> str:
+        return f"runs/{esc(run_id)}/{esc(attempt)}"
+
+    async def delete_run(self, run_id: str) -> None:
+        """Delete a run's attempt objects and logs, control files included:
+        a worker that wakes later finds no file and writes nothing
+        (docs/lifecycle.md §2.4)."""
+
+        await self.delete_objects(await self.list_objects(f"runs/{esc(run_id)}/"))
+        if isinstance(self.objects, LocalStore) and self.objects.prefix is not None:
+            # A local directory outlives its objects, and lists: remove it, and its
+            # parents while they are empty.
+            root = os.path.normpath(str(self.objects.prefix))
+            path = os.path.join(root, "runs", esc(run_id))
+            while path != root:
+                try:
+                    os.rmdir(path)
+                except OSError:
+                    break
+                path = os.path.dirname(path)
+
+    async def attempt_spec(self, run_id: str, attempt: str) -> dict | None:
+        data = await self.get_object(f"{lifecycle.base(run_id, attempt)}{lifecycle.SPEC}")
+        return json.loads(data) if data is not None else None
+
+    async def attempt_result(self, run_id: str, attempt: str) -> dict | None:
+        """The result its worker sealed into its control file, if any (§2.4)."""
+
+        found = await lifecycle.read_control(self.objects, run_id, attempt)
+        return found[0]["result"] if found is not None and found[0]["state"] == lifecycle.SEALED else None
+
+    async def attempt_finished(self, run_id: str, attempt: str) -> bool:
+        """Whether its worker is done with it: a sealed result, or a control file
+        no worker of this version writes — which the engine fails, on reading it."""
+
+        try:
+            return await self.attempt_result(run_id, attempt) is not None
+        except lifecycle.Malformed:
+            return True
+
+    async def attempt_log(self, run_id: str, attempt: str, tail: int | None = None) -> bytes:
+        """An attempt's log as JSON lines: from the chunks its result lists
+        and its tail, reading only the chunks the last `tail` lines are in;
+        while it runs, the chunks shipped so far (docs/lifecycle.md §2.1)."""
+
+        base = lifecycle.base(run_id, attempt)
+        result = await self.attempt_result(run_id, attempt)
+        index = (result or {}).get("log")
+        if index is not None:
+            chunks, lines = list(index["chunks"]), 0
+            if tail is not None:
+                if index.get("tail"):
+                    lines = len(lifecycle.log_text([], index["tail"]).splitlines())
+                kept = []
+                for entry in reversed(chunks):
+                    if lines >= tail:
+                        break
+                    kept.insert(0, entry)
+                    lines += entry[1]
+                chunks = kept
+            data = [await self.get_object(f"{base}{lifecycle.chunk(n)}") or b"" for n, _, _ in chunks]
+            text = lifecycle.log_text(data, index.get("tail"))
+        else:
+            prefix = f"{base}.log."
+            paths = [p for p in await self.list_objects(f"runs/{esc(run_id)}/") if p.startswith(prefix)]
+            text = lifecycle.log_text([await self.get_object(p) or b"" for p in sorted(paths)], None)
+        if tail is not None:
+            text = b"".join(text.splitlines(keepends=True)[-tail:])
+        return text
+
+    # -- objects ---------------------------------------------------------------------------
+
+    async def put_object(self, key: str, value: bytes):
+        await obstore.put_async(self.objects, key, value, mode="overwrite", use_multipart=False)
+
+    async def create_object(self, key: str, value: bytes):
+        """Raises `AlreadyExistsError` if another writer's object is at `key`."""
+
+        await create(self.objects, key, value)
+
+    async def get_object(self, key: str) -> bytes | None:
+        try:
+            result = await obstore.get_async(self.objects, key)
+        except (NotFoundError, FileNotFoundError):
+            return None
+        return bytes(await result.bytes_async())
+
+    async def list_objects(self, prefix: str) -> list[str]:
+        out = []
+        async for batch in obstore.list(self.objects, prefix=prefix):
+            out.extend(meta["path"] for meta in batch)
+        return sorted(out)
+
+    async def delete_objects(self, keys: list[str]):
+        for i in range(0, len(keys), 1000):
+            await obstore.delete_async(self.objects, keys[i : i + 1000])

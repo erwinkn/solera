@@ -1,0 +1,31 @@
+  base: 1 s
+  commit 1000: 10 MB stored, 150 s
+  commit 2000: 12 MB stored, 333 s
+  commit 3000: 14 MB stored, 507 s
+  commit 4000: 15 MB stored, 671 s
+  commit 5000: 14 MB stored, 845 s
+  commit 6000: 15 MB stored, 1013 s
+  commit 7000: 16 MB stored, 1210 s
+  commit 8000: 17 MB stored, 1388 s
+  commit 9000: 18 MB stored, 1585 s
+  commit 10000: 19 MB stored, 1791 s
+  commit 11000: 20 MB stored, 2001 s
+  commit 12000: 21 MB stored, 2195 s
+{"index": "layers", "scenario": "stall", "retention": "layers", "window": 8640, "horizon": 0, "n": 1000000, "commits": 12000, "live": 1000000, "delta_mb": 78.174189, "delta_entries": 11994559, "delta_puts": 12000, "stored_mean_mb": 15.544560049666668, "stored_peak_mb": 22.379638, "stored_end_mb": 21.024298, "drops": 0, "drops_by": [], "build_s": 2195.3166705020703, "layers": 10, "cut": 2000, "entries": 2511250, "written": {"delta": {"entries": 12994559, "bytes": 82798306, "puts": 12002, "merges": 0}, "tier": {"entries": 51259002, "bytes": 355850482, "puts": 4624, "merges": 3988}, "base": {"entries": 22912000, "bytes": 189010807, "puts": 74, "merges": 19}}, "merge_entries": 74171002, "merge_bytes": 544861289, "merge_puts": 4698, "merges": 4007}
+Traceback (most recent call last):
+  File "/home/exedev/.bb/plugins/environment-git-worktree/host-data/worktrees/thr_fs6zyhkyrz-1/data-orchestrator/bench/keys/views/viewbench.py", line 617, in <module>
+    if a.reads:
+    ^^^^^^
+  File "/home/exedev/.bb/plugins/environment-git-worktree/host-data/worktrees/thr_fs6zyhkyrz-1/data-orchestrator/bench/keys/views/viewbench.py", line 609, in main
+    a = ap.parse_args()
+                    ~^^
+  File "/home/exedev/.bb/plugins/environment-git-worktree/host-data/worktrees/thr_fs6zyhkyrz-1/data-orchestrator/bench/keys/views/viewbench.py", line 550, in isolated
+        out = {"keys": len(ups), "mismatches": int(delta.removed != 0 or delta.added != 0)}
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    ...<4 lines>...
+        bad = sum(1 for k in probe if (hits.get(k) or (0,))[0] != now[key_id(k)])
+    
+  File "/home/exedev/.local/share/uv/python/cpython-3.13.15-linux-x86_64-gnu/lib/python3.13/subprocess.py", line 577, in run
+    raise CalledProcessError(retcode, process.args,
+                             output=stdout, stderr=stderr)
+subprocess.CalledProcessError: Command '['/home/exedev/.bb/plugins/environment-git-worktree/host-data/worktrees/thr_fs6zyhkyrz-1/data-orchestrator/.venv/bin/python', '/home/exedev/.bb/plugins/environment-git-worktree/host-data/worktrees/thr_fs6zyhkyrz-1/data-orchestrator/bench/keys/views/viewbench.py', '--read', '/home/exedev/.solera-t31/vb/layers-stall-1000000-12000-0x0-zlib-64k-h0', 'pinned', '2001']' returned non-zero exit status 1.

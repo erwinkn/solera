@@ -1,0 +1,4 @@
+A crash between upload and publication: attempts[D1,D2,D3,D4]=1 before restart; orphans 1, collected by epoch 2: 1; retry published: True, attempts now None (cleared on publication)
+B window: the cut moved to 20 over a live P = 5 -> CutError('P = 5 is below the cut 20')
+C attempt key for inputs D1,D2 = 'D1,D2': no life in it (state.life='l0'); a reset that keeps the State's attempts/stopped would carry old-life failures into the new life's same ids
+D pin at seq 1: deletable = garbage replaced at seq <= pin: ['d1-0-e', 'd2-0-e']; garbage at seq 2 kept: True

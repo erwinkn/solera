@@ -1,0 +1,15 @@
+   Compiling pyo3-build-config v0.29.2
+   Compiling pyo3-ffi v0.29.2
+   Compiling pyo3 v0.29.2
+   Compiling a31-layers v0.0.1 (/tmp/a31/mini)
+    Finished `release` profile [optimized] target(s) in 16.60s
+     Running unittests src/lib.rs (target/release/deps/solera_native_a31-b953f3c2d24c8a38)
+
+running 3 tests
+test layers::tests::globs_follow_solera_grammar ... ok
+test layers::tests::bottom_merge_sends_absent_keys_to_the_graveyard ... ok
+test layers::tests::round_trip_and_merge_keep_flips ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+exit 0

@@ -1,0 +1,17 @@
+[package]
+name = "views-codec"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "W53 micro-measurements: block codec, block size, row vs columnar entries"
+
+[dependencies]
+lz4_flex = "0.11"
+zstd = "0.13"
+flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+[workspace]

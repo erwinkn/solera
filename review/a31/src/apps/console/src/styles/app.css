@@ -1,0 +1,304 @@
+@import "tailwindcss";
+@import "./themes.css";
+@import "./fonts.css";
+
+/*
+ * Tailwind speaks only our semantic tokens: the default palette, font stacks,
+ * radii and shadows are removed, so a component cannot reach for a raw color.
+ * `inline` makes each utility read the custom property itself, which is what
+ * lets a theme switch by changing variables alone.
+ */
+@theme inline {
+  --color-*: initial;
+  --color-transparent: transparent;
+  --color-current: currentColor;
+  --color-bg: var(--bg);
+  --color-surface: var(--surface);
+  --color-surface-2: var(--surface-2);
+  --color-sunken: var(--sunken);
+  --color-overlay: var(--overlay);
+  --color-fg: var(--fg);
+  --color-fg-muted: var(--fg-muted);
+  --color-fg-subtle: var(--fg-subtle);
+  --color-fg-inverse: var(--fg-inverse);
+  --color-line: var(--line);
+  --color-line-strong: var(--line-strong);
+  --color-accent: var(--accent);
+  --color-accent-hover: var(--accent-hover);
+  --color-accent-fg: var(--accent-fg);
+  --color-accent-soft: var(--accent-soft);
+  --color-select: var(--select);
+  --color-select-line: var(--select-line);
+  --color-focus: var(--focus);
+  --color-link: var(--link);
+  --color-ok: var(--ok);
+  --color-ok-soft: var(--ok-soft);
+  --color-ok-fg: var(--ok-fg);
+  --color-viz-ok: var(--viz-ok);
+  --color-run: var(--run);
+  --color-run-soft: var(--run-soft);
+  --color-run-fg: var(--run-fg);
+  --color-wait: var(--wait);
+  --color-wait-soft: var(--wait-soft);
+  --color-wait-fg: var(--wait-fg);
+  --color-warn: var(--warn);
+  --color-warn-soft: var(--warn-soft);
+  --color-warn-fg: var(--warn-fg);
+  --color-fail: var(--fail);
+  --color-fail-soft: var(--fail-soft);
+  --color-fail-fg: var(--fail-fg);
+  --color-idle: var(--idle);
+  --color-idle-soft: var(--idle-soft);
+  --color-idle-fg: var(--idle-fg);
+
+  --font-*: initial;
+  --font-sans: var(--font-ui);
+  --font-display: var(--font-head);
+  --font-mono: var(--font-code);
+
+  --text-*: initial;
+  --text-2xs: var(--t-2xs);
+  --text-2xs--line-height: 1.35;
+  --text-xs: var(--t-xs);
+  --text-xs--line-height: 1.4;
+  --text-sm: var(--t-sm);
+  --text-sm--line-height: 1.45;
+  --text-base: var(--t-base);
+  --text-base--line-height: 1.5;
+  --text-lg: var(--t-lg);
+  --text-lg--line-height: 1.4;
+  --text-xl: var(--t-xl);
+  --text-xl--line-height: 1.25;
+  --text-2xl: var(--t-2xl);
+  --text-2xl--line-height: 1.15;
+  --text-3xl: var(--t-3xl);
+  --text-3xl--line-height: 1.05;
+
+  --radius-*: initial;
+  --radius-xs: var(--r-xs);
+  --radius-sm: var(--r-sm);
+  --radius-md: var(--r-md);
+  --radius-lg: var(--r-lg);
+  --radius-full: var(--r-pill);
+  --radius-mark: var(--r-mark);
+
+  --shadow-*: initial;
+  --shadow-1: var(--shadow-1);
+  --shadow-2: var(--shadow-2);
+  --shadow-3: var(--shadow-3);
+  --shadow-button: var(--shadow-button);
+
+  --ease-*: initial;
+  --ease-out: var(--ease);
+  --ease-bounce: var(--ease-bounce);
+}
+
+/* Borders take the theme's stroke width by default. */
+@utility border-theme {
+  border-width: var(--border-w);
+  border-style: solid;
+}
+@utility motion-1 {
+  transition-duration: var(--dur-1);
+  transition-timing-function: var(--ease);
+}
+@utility motion-2 {
+  transition-duration: var(--dur-2);
+  transition-timing-function: var(--ease);
+}
+@utility motion-3 {
+  transition-duration: var(--dur-3);
+  transition-timing-function: var(--ease-bounce);
+}
+/* A pressable surface: lifts with its shadow, presses into the page. */
+@utility pressable {
+  box-shadow: var(--shadow-button);
+  transition-property: transform, box-shadow, background-color, color, border-color;
+  transition-duration: var(--dur-1);
+  transition-timing-function: var(--ease);
+  &:hover:not(:disabled) {
+    transform: translate(var(--lift-x), var(--lift-y));
+    box-shadow: var(--shadow-button-hover);
+  }
+  &:active:not(:disabled) {
+    transform: translate(var(--press-x), var(--press-y));
+    box-shadow: none;
+  }
+}
+@utility font-display {
+  font-family: var(--font-head);
+  font-weight: var(--head-weight);
+  letter-spacing: var(--head-tracking);
+  font-variation-settings: var(--head-variation);
+  text-transform: var(--head-case);
+}
+@utility tabular {
+  font-variant-numeric: tabular-nums;
+}
+@utility canvas-dots {
+  background-image: var(--canvas-pattern);
+  background-size: var(--canvas-size);
+}
+@utility title-mark {
+  background-image: var(--title-mark);
+  background-repeat: var(--title-mark-repeat);
+  background-position: 0 100%;
+  background-size: var(--title-mark-size);
+  padding-bottom: var(--title-mark-pad);
+}
+@utility art {
+  opacity: var(--art-opacity);
+  filter: saturate(var(--art-saturate));
+}
+
+@utility card-title {
+  font-family: var(--card-title-font);
+  font-size: var(--card-title-size);
+  font-weight: var(--card-title-weight);
+  letter-spacing: var(--card-title-tracking);
+  text-transform: var(--card-title-case);
+  font-variation-settings: var(--head-variation);
+  line-height: 1.3;
+}
+@utility figure {
+  font-family: var(--figure-font);
+  font-weight: var(--figure-weight);
+  letter-spacing: var(--figure-tracking);
+  font-variant-numeric: tabular-nums lining-nums;
+}
+@utility label-font {
+  font-family: var(--label-font);
+  letter-spacing: var(--label-tracking);
+}
+@utility masthead {
+  border-bottom: var(--masthead-rule);
+  padding-bottom: var(--masthead-pad);
+}
+/* Registration marks at a panel's four corners, where a theme draws them. */
+@utility corner-ticks {
+  background-image:
+    linear-gradient(var(--tick), var(--tick)), linear-gradient(var(--tick), var(--tick)),
+    linear-gradient(var(--tick), var(--tick)), linear-gradient(var(--tick), var(--tick)),
+    linear-gradient(var(--tick), var(--tick)), linear-gradient(var(--tick), var(--tick)),
+    linear-gradient(var(--tick), var(--tick)), linear-gradient(var(--tick), var(--tick));
+  background-position:
+    0 0,
+    0 0,
+    100% 0,
+    100% 0,
+    0 100%,
+    0 100%,
+    100% 100%,
+    100% 100%;
+  background-size:
+    9px 2px,
+    2px 9px,
+    9px 2px,
+    2px 9px,
+    9px 2px,
+    2px 9px,
+    9px 2px,
+    2px 9px;
+  background-repeat: no-repeat;
+}
+@utility live-glow {
+  box-shadow: var(--live-glow);
+}
+
+@layer base {
+  html {
+    color-scheme: var(--scheme);
+    -webkit-text-size-adjust: 100%;
+  }
+  body {
+    margin: 0;
+    min-height: 100dvh;
+    background-color: var(--bg);
+    background-image: var(--texture);
+    color: var(--fg);
+    font-family: var(--font-ui);
+    font-size: var(--t-sm);
+    line-height: 1.45;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    text-rendering: optimizeLegibility;
+  }
+  *,
+  ::before,
+  ::after {
+    border-color: var(--line);
+  }
+  ::selection {
+    background: var(--select);
+    color: var(--fg);
+  }
+  :focus-visible {
+    outline: 2px solid var(--focus);
+    outline-offset: 2px;
+    border-radius: var(--r-xs);
+  }
+  code,
+  kbd,
+  samp,
+  pre {
+    font-family: var(--font-code);
+    font-size: 0.95em;
+  }
+  a {
+    color: inherit;
+    text-decoration: none;
+  }
+  button {
+    cursor: pointer;
+  }
+  button:disabled {
+    cursor: default;
+  }
+}
+
+@keyframes pulse-dot {
+  0%,
+  100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 0.45;
+    transform: scale(0.8);
+  }
+}
+@keyframes shimmer {
+  from {
+    background-position: -200px 0;
+  }
+  to {
+    background-position: 200px 0;
+  }
+}
+@keyframes march {
+  to {
+    background-position: 16px 0;
+  }
+}
+@keyframes enter {
+  from {
+    opacity: 0;
+    transform: translateY(4px) scale(0.98);
+  }
+}
+@keyframes fade {
+  from {
+    opacity: 0;
+  }
+}
+
+/* Reduced motion: transitions already read zeroed tokens; loops stop too. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  ::before,
+  ::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    scroll-behavior: auto !important;
+  }
+}

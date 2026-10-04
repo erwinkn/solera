@@ -1,0 +1,16 @@
+[package]
+name = "a31-layers"
+version = "0.0.1"
+edition = "2021"
+
+[lib]
+name = "solera_native_a31"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.29", features = ["abi3-py312"] }
+crc32fast = "1"
+zstd = "0.13"
+
+[profile.release]
+opt-level = 3

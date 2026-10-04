@@ -1,0 +1,8 @@
+## 100,000,000 keys, base trace, 7-day window (f=4, k=4, Z=1 MB, r=4, upkeep instant, live P: set)
+runs 14.6 (21) · stored 999 MB (1092) · background writes 15.9x bytes, 11.4x entries · PUTs/commit 1.38 · uploaded/commit 98 KB · cold 1K lookup 1012 GETs, 204.9 MB, 0.85 s (filters held: 1287 GETs, 23.4 MB, 0.66 s) · head entries per live key 1.23 · first run reads 999 MB
+       1 behind: reads 0.03 MB = 3.59x needed (max 111.94x), runs 1.0 (1), straddler 0.02 MB, needed 1K keys
+     100 behind: reads 1.37 MB = 1.69x needed (max 5.46x), runs 5.6 (9), straddler 0.95 MB, needed 100K keys
+     360 behind: reads 4.60 MB = 1.58x needed (max 2.24x), runs 7.4 (12), straddler 2.59 MB, needed 359K keys
+    8640 behind: reads 110.33 MB = 1.64x needed (max 4.06x), runs 12.4 (19), straddler 68.30 MB, needed 8,295K keys
+   10000 behind: reads 129.00 MB = 1.67x needed (max 3.65x), runs 12.6 (19), straddler 77.61 MB, needed 9,540K keys
+

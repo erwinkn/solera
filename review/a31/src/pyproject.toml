@@ -1,0 +1,95 @@
+[build-system]
+requires = ["maturin>=1.9,<2"]
+build-backend = "maturin"
+
+[project]
+name = "solera"
+version = "0.0.1"
+description = "Asset-first orchestration on object storage: SDK, worker, and control plane"
+readme = "README.md"
+requires-python = ">=3.12"
+license = "Apache-2.0"
+# `pip install solera` is the SDK and the worker; `solera[server]` adds the
+# engine, its API and run history. pandas and pyarrow are used when a value
+# is of their type, never required.
+dependencies = [
+    "croniter>=6,<7",
+    "httpx>=0.28,<1",
+    "obstore==0.11.1",
+]
+
+[project.optional-dependencies]
+server = [
+    "fastapi>=0.115,<1",
+    "uvicorn>=0.34,<1",
+    "duckdb>=1.3,<2",
+    "orjson>=3.10,<4",
+]
+postgres = [
+    "psycopg[binary]>=3.2,<4",
+]
+
+[project.scripts]
+solera = "solera_server.cli:main"
+
+[project.urls]
+Repository = "https://github.com/erwinkn/solera"
+
+[tool.uv]
+package = true
+# Editable installs rebuild the extension when its sources change.
+cache-keys = [
+    { file = "pyproject.toml" },
+    { file = "native/Cargo.toml" },
+    { file = "native/Cargo.lock" },
+    { file = "native/src/**/*.rs" },
+]
+
+# One distribution ("solera") holds four Python packages under `python/` —
+# the asset SDK (`solera`), `solera_postgres`, the worker (`solera_worker`),
+# and the control plane with its committed console bundle (`solera_server`) —
+# and the Rust extension in `native/`, built as `solera._native`.
+[tool.maturin]
+python-source = "python"
+python-packages = ["solera_postgres", "solera_server", "solera_worker"]
+module-name = "solera._native"
+manifest-path = "native/Cargo.toml"
+features = ["pyo3/extension-module"]
+profile = "release"
+
+[dependency-groups]
+dev = [
+    "pytest>=8,<10",
+    "pytest-asyncio>=1,<2",
+    "httpx>=0.28,<1",
+    "ruff>=0.12,<1",
+    "moto[server,s3]>=5,<6",
+    "boto3>=1.36,<2",
+    "pandas>=2.2,<3",
+    "psycopg[binary]>=3.2,<4",
+    "pyarrow>=25,<26",
+    "xxhash>=3,<4",
+    "solera[server]",
+    "hypothesis>=6.100,<7",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+markers = [
+    "s3: requires an S3-compatible HTTP endpoint",
+    "live: requires an explicitly supplied isolated test bucket",
+    "postgres: requires SOLERA_TEST_DATABASE_URL (docker compose up postgres)",
+    "slow: long growth soaks, run with --slow",
+]
+
+[tool.ruff]
+line-length = 110
+extend-exclude = ["*.md"]  # the docs' code blocks are sketches
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+"bench/cost_model/*" = ["F403", "F405", "B023"]  # table scripts: star imports, lambdas over loop rows

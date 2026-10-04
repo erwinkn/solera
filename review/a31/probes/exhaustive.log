@@ -1,0 +1,3 @@
+base  workload: page Δ checks 1324 (every P from cut to head), mismatches 0; lookup-with-P checks 127475, mismatches 5645 [((True, False, None), None), (None, False)]; final layers 6, with side parts 1, cut 110
+churn workload: page Δ checks 1395 (every P from cut to head), mismatches 0; lookup-with-P checks 100487, mismatches 10711 [((True, False, None), None), (None, False)]; final layers 3, with side parts 0, cut 115
+exit 0

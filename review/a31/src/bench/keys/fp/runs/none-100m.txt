@@ -1,0 +1,39 @@
+## 100,000,000 keys, base trace, 7-day window (f=4, k=4, Z=1 MB, r=4, upkeep instant, live P: none)
+runs 15.6 (23) · stored 1148 MB (1280) · background writes 13.8x bytes, 9.9x entries · PUTs/commit 1.38 · uploaded/commit 86 KB · cold 1K lookup 1021 GETs, 347.7 MB, 1.12 s (filters held: 1469 GETs, 26.4 MB, 0.75 s) · head entries per live key 1.41 · first run reads 1141 MB
+       1 behind: reads 0.03 MB = 3.59x needed (max 111.94x), runs 1.0 (1), straddler 0.02 MB, needed 1K keys
+     100 behind: reads 1.37 MB = 1.69x needed (max 5.46x), runs 5.6 (9), straddler 0.95 MB, needed 100K keys
+     360 behind: reads 4.60 MB = 1.58x needed (max 2.24x), runs 7.4 (12), straddler 2.59 MB, needed 359K keys
+    8640 behind: reads 106.14 MB = 1.58x needed (max 4.06x), runs 12.4 (19), straddler 64.11 MB, needed 8,295K keys
+   10000 behind: reads 122.15 MB = 1.58x needed (max 3.65x), runs 12.6 (19), straddler 70.76 MB, needed 9,540K keys
+
+## 100,000,000 keys, 1-day window (f=4, k=4, Z=1 MB, r=4, upkeep instant, live P: none)
+runs 14.6 (21) · stored 988 MB (1085) · background writes 15.9x bytes, 11.4x entries · PUTs/commit 1.38 · uploaded/commit 98 KB · cold 1K lookup 1011 GETs, 193.8 MB, 0.83 s (filters held: 1273 GETs, 23.2 MB, 0.65 s) · head entries per live key 1.22 · first run reads 988 MB
+       1 behind: reads 0.03 MB = 3.59x needed (max 111.94x), runs 1.0 (1), straddler 0.02 MB, needed 1K keys
+     100 behind: reads 1.37 MB = 1.69x needed (max 5.46x), runs 5.6 (9), straddler 0.95 MB, needed 100K keys
+     360 behind: reads 4.60 MB = 1.58x needed (max 2.24x), runs 7.4 (12), straddler 2.59 MB, needed 359K keys
+    8640 behind: reads 110.33 MB = 1.64x needed (max 4.06x), runs 12.4 (19), straddler 68.30 MB, needed 8,295K keys
+
+## 100,000,000 keys, 30-day window (f=4, k=4, Z=1 MB, r=4, upkeep instant, live P: none)
+runs 15.6 (23) · stored 1195 MB (1330) · background writes 14.5x bytes, 10.4x entries · PUTs/commit 1.38 · uploaded/commit 90 KB · cold 1K lookup 1021 GETs, 354.2 MB, 1.14 s (filters held: 1478 GETs, 26.6 MB, 0.76 s) · head entries per live key 1.42 · first run reads 1148 MB
+       1 behind: reads 0.03 MB = 3.59x needed (max 111.94x), runs 1.0 (1), straddler 0.02 MB, needed 1K keys
+     100 behind: reads 1.37 MB = 1.70x needed (max 5.46x), runs 5.6 (9), straddler 0.95 MB, needed 100K keys
+     360 behind: reads 4.60 MB = 1.58x needed (max 2.24x), runs 7.4 (12), straddler 2.59 MB, needed 359K keys
+    8640 behind: reads 106.15 MB = 1.58x needed (max 4.06x), runs 12.4 (19), straddler 64.07 MB, needed 8,295K keys
+   10000 behind: reads 122.17 MB = 1.58x needed (max 3.65x), runs 12.6 (19), straddler 70.79 MB, needed 9,540K keys
+
+## 100,000,000 keys, churn (half of each commit temporary) (f=4, k=4, Z=1 MB, r=4, upkeep instant, live P: none)
+runs 15.9 (23) · stored 1413 MB (1619) · background writes 13.6x bytes, 9.7x entries · PUTs/commit 1.42 · uploaded/commit 127 KB · cold 1K lookup 1029 GETs, 447.7 MB, 1.32 s (filters held: 1596 GETs, 28.1 MB, 0.82 s) · head entries per live key 1.53 · first run reads 1241 MB
+       1 behind: reads 0.04 MB = 3.03x needed (max 64.00x), runs 1.0 (1), straddler 0.03 MB, needed 2K keys
+     100 behind: reads 2.10 MB = 1.73x needed (max 3.54x), runs 6.1 (10), straddler 1.27 MB, needed 150K keys
+     360 behind: reads 7.04 MB = 3.11x needed (max 7.40x), runs 7.9 (13), straddler 4.23 MB, needed 280K keys
+    8640 behind: reads 169.66 MB = 4.83x needed (max 8.59x), runs 13.0 (19), straddler 91.33 MB, needed 4,333K keys
+   10000 behind: reads 193.76 MB = 4.80x needed (max 7.87x), runs 13.3 (20), straddler 103.31 MB, needed 4,983K keys
+
+## 100,000,000 keys, a 1M-key commit mid-trace (f=4, k=4, Z=1 MB, r=4, upkeep instant, live P: none)
+runs 19.1 (32) · stored 1155 MB (1337) · background writes 13.7x bytes, 9.8x entries · PUTs/commit 1.38 · uploaded/commit 86 KB · cold 1K lookup 1024 GETs, 354.6 MB, 1.14 s (filters held: 1495 GETs, 27.9 MB, 0.77 s) · head entries per live key 1.42 · first run reads 1148 MB
+       1 behind: reads 0.03 MB = 3.60x needed (max 111.94x), runs 1.0 (1), straddler 0.03 MB, needed 1K keys
+     100 behind: reads 1.38 MB = 1.70x needed (max 9.17x), runs 5.6 (9), straddler 0.95 MB, needed 100K keys
+     360 behind: reads 4.61 MB = 1.59x needed (max 3.17x), runs 7.4 (12), straddler 2.59 MB, needed 359K keys
+    8640 behind: reads 105.85 MB = 1.58x needed (max 4.11x), runs 12.8 (25), straddler 62.32 MB, needed 8,295K keys
+   10000 behind: reads 122.03 MB = 1.58x needed (max 3.69x), runs 13.1 (26), straddler 69.03 MB, needed 9,540K keys
+

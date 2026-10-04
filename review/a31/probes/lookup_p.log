@@ -1,0 +1,3 @@
+H1 base graveyard: page(5) says k0 -> (True, False) ; lookup([k0], p=5) -> None
+H2 straddler side part: page(3) says k -> (True, False) ; lookup([k], p=3) -> None
+REPRODUCED (lookup with P misses removals held in side parts)

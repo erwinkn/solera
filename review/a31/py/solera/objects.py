@@ -1,0 +1,153 @@
+"""Object-store writes the worker and the engine both decide by
+(docs/object-store-state.md §0).
+
+A create-only PUT decides who owns a name. Its outcome can be ambiguous:
+the object lands but the response is lost, and the retry — obstore's or
+the caller's — finds it there. So an object found in the way is read back,
+and if it holds exactly the bytes being written, the earlier try was this
+write's own and it succeeded.
+
+An object that is overwritten is read with its ETag and replaced with
+`swap`, a compare-and-swap (`If-Match`). A swap refused or unanswered is
+settled the same way, by reading the object back: so no two writes may
+produce the same bytes for one object — every body `swap` writes names its
+writer and never repeats. `file://` has no `If-Match`: there `swap` takes
+an `fcntl` lock and compares SHA-256 digests, which serve as its ETags.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import fcntl
+import hashlib
+import os
+import uuid
+
+import obstore
+from obstore.exceptions import (
+    AlreadyExistsError,
+    InvalidPathError,
+    NotFoundError,
+    NotSupportedError,
+    PermissionDeniedError,
+    PreconditionError,
+    UnauthenticatedError,
+)
+from obstore.store import LocalStore
+
+ATTEMPTS = 5  # writes of one swap whose outcome reads back as "nothing landed"
+_FINAL = (InvalidPathError, NotSupportedError, PermissionDeniedError, UnauthenticatedError)
+
+
+class Conflict(Exception):
+    """Another writer's write is there: the swap's ETag is no longer current."""
+
+
+async def create(store, path: str, data: bytes) -> None:
+    """Create `path` holding `data`. Raises `AlreadyExistsError` only if
+    another writer's object is there."""
+
+    try:
+        await obstore.put_async(store, path, data, mode="create", use_multipart=False)
+    except AlreadyExistsError:
+        existing = await obstore.get_async(store, path)
+        if bytes(await existing.bytes_async()) != data:
+            raise
+
+
+async def read(store, path: str) -> tuple[bytes, str] | None:
+    """`(data, etag)` of the object at `path`, or None if there is none."""
+
+    try:
+        got = await obstore.get_async(store, path)
+    except (NotFoundError, FileNotFoundError):
+        return None
+    data = bytes(await got.bytes_async())
+    return data, (_digest(data) if _local(store) else got.meta["e_tag"])
+
+
+async def swap(store, path: str, data: bytes, etag: str | None) -> str:
+    """Write `data` at `path` only if its ETag is still `etag` (None: only if
+    there is no object); returns the new ETag. Raises `Conflict` if another
+    writer's write is there. A refused or unanswered write reads the object
+    back: holding exactly `data`, it landed; still at `etag`, it is written
+    again; anything else is a conflict."""
+
+    error: BaseException | None = None
+    for _ in range(ATTEMPTS):
+        try:
+            return await _conditional_put(store, path, data, etag)
+        except _FINAL:
+            raise
+        except Exception as e:  # refused (412, 409, exists), or the answer lost: read back
+            error = e
+        found = await read(store, path)
+        if found is not None and found[0] == data:
+            return found[1]  # it landed: the earlier try was this write
+        if (found[1] if found is not None else None) != etag:
+            raise Conflict(f"{path}: another writer's write is there") from error
+        # still at `etag`: nothing landed (409: a concurrent conditional write lost), so again
+    raise error  # type: ignore[misc]
+
+
+async def _conditional_put(store, path: str, data: bytes, etag: str | None) -> str:
+    """One conditional write: the new ETag, or an exception — refused, or
+    unanswered — for `swap` to settle by reading back."""
+
+    if _local(store):
+        return await asyncio.to_thread(_put_file_if, _file(store, path), data, etag)
+    mode = "create" if etag is None else {"e_tag": etag}
+    return (await obstore.put_async(store, path, data, mode=mode, use_multipart=False))["e_tag"]
+
+
+def _local(store) -> bool:
+    """Whether `store` is obstore's local filesystem, which has no `If-Match`."""
+
+    return isinstance(store, LocalStore)
+
+
+def _file(store, path: str) -> str:
+    root = store.prefix
+    return os.path.join(str(root), path) if root is not None else os.path.join("/", path)
+
+
+def _digest(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _put_file_if(full: str, data: bytes, etag: str | None) -> str:
+    """A conditional write of a local file: under an `flock` on its
+    directory, which the kernel drops if the process dies, compare the
+    file's digest with `etag`, then write a temporary file, fsync it and
+    replace the object. Refused (`PreconditionError`) if the digest differs.
+    The lock leaves nothing behind, and a swap from a version of a file that
+    is gone creates nothing, not even its directory: a run deleted under a
+    late worker stays deleted."""
+
+    directory = os.path.dirname(full)
+    if etag is not None and not os.path.exists(full):
+        raise PreconditionError(f"{full}: there is no object to replace")
+    os.makedirs(directory, exist_ok=True)
+    lock = os.open(directory, os.O_RDONLY)
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            try:
+                with open(full, "rb") as f:
+                    current = _digest(f.read())
+            except FileNotFoundError:
+                current = None
+            if current != etag:
+                raise PreconditionError(f"{full}: its digest is not {etag}")
+            tmp = f"{full}.{uuid.uuid4().hex}.tmp"
+            with open(tmp, "wb") as f:
+                f.write(data)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, full)
+            os.fsync(lock)  # the directory: the replace is durable
+            return _digest(data)
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+    finally:
+        os.close(lock)

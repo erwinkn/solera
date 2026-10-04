@@ -1,0 +1,15 @@
+[package]
+name = "fp-codec"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "W57 micro-measurements: stamped entries (last generation, presence, flips) against the minimal delta"
+
+[dependencies]
+zstd = "0.13"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+[workspace]
