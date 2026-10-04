@@ -456,7 +456,7 @@ Each rule has one owner, so none falls between them:
 | `Positions.tla` | partition records: snapshots, K45's read-ahead and its cap, `each=True`'s per-key records, the full pass completed across runs; `keys=` runs; staleness, exact and transitive (K39, K46); and the concurrency that can break them: a batch planned at the claim and committed later, upstream commits between, a commit refused after a reset or an asset change | workers, faults and engines to `Execution.tla` |
 | `Attempt.tla` | the attempt control file: who owns an attempt, the gate, the sealed result or the engine's end; duplicates, zombies, retention; nobody learns of an attempt before its launch is durable (F26) | what an attempt computes to `Execution.tla` |
 | `JournalObject.tla` | the journal: fencing, appends, checkpoints and their cleanup, lost answers, failed requests | what the events mean to the others |
-| `Spans.tla` | the span key index's lifecycle as built: endpoints (positions, an attempt's reads and landing point), the merge lanes, upload and publication, pins and garbage, the orphan collector, merge retries, crashes, takeovers, resets | what a span holds, and why reads at its boundaries are exact, to the Lean proofs (`experiments/lean/KeyIndex`) |
+| `Spans.tla` | the span key index's lifecycle as built: endpoints (positions, passes, an attempt's reads and landing point), the merge lanes, upload and publication in two steps, pins and garbage, empty spans, the orphan collector and its epochs, merge retries, crashes, takeovers, resets; trace-validated against the simulation | what a span holds, and why reads at its boundaries are exact, to the Lean proofs (`experiments/lean/KeyIndex`) |
 
 ## Formal model: execution semantics (`spec/tla/Execution.tla`)
 
@@ -785,85 +785,105 @@ record (K47).
 
 ## Formal model: the span key index's lifecycle (`spec/tla/Spans.tla`)
 
-*The code as built (key index step 2 and later: `upkeep.py`'s `maintain`,
-`_merge`, `collect`, `collect_orphans`; `model.py`'s `endpoints` and pin
-floor; `engine.py`'s `_prepare`), against `key-index-design.md`'s
-"Lifecycles the implementation must honour".* What a span holds is the
-Lean proofs' (`WriteBound`, `Segments`, `Tiling`, `Keys`), taken as given:
-a read at commit `e` from spans that keep `e` as a boundary (a span's
-first commit, or a segment start inside it) agrees with the full history.
-So a span here is its commits `[a, b]`, the segment starts it keeps and
-the index's life, and a read is exact iff its endpoints are boundaries.
+*The code as built (key index step 2 and later, with c4eb4f7's epochs:
+`upkeep.py`'s `maintain`, `_merge`, `collect`, `collect_orphans`;
+`model.py`'s `endpoints`, pins and `IndexMerged`; `engine.py`'s
+`_prepare`), against `key-index-design.md`'s "Lifecycles the
+implementation must honour".* What a span holds is the Lean proofs'
+(`WriteBound`, `Segments`, `Tiling`, `Keys`), taken as given: a read at
+commit `e` from spans that keep `e` as a boundary (a span's first commit,
+or a segment start inside it) agrees with the full history. So a span here
+is its commits `[a, b]`, the segment starts it keeps, the index's life,
+whether it has files, and its writer's epoch; a read is exact iff its
+endpoints are boundaries.
 
 ```bash
-spec/tla/check.sh spans    # base, takeover, retries, the calibrations: ~20 min at 4 workers
+spec/tla/check.sh spans    # six models and the calibrations: ~45 min at 4 workers
 ```
 
-**Model.** One index, one consumer. Commits append delta spans and tick
-the journal's event counter. An attempt's claim makes its reads endpoints
-in the same step (`_prepare` is synchronous): its first, the position's,
-and its landing point, the head + 1; it takes the state as its manifest
-and the event counter as its pin. It settles (its position moves to the
-landing point) or fails; either releases both. Upkeep plans a merge of
-adjacent published spans from the endpoints it knows, keeping a segment
-start at each, in one of two lanes whose inputs never overlap, and uploads
-it under a unique name. Then the serving engine publishes it
-(`IndexMerged`, if the index is still of its life and holds its inputs;
-the inputs become garbage at that event), or deletes a refused output, or
-its process dies first. Garbage is deleted once its event counter is at or
-below the pin floor. The orphan collector deletes merge outputs no current
-span, garbage entry or merge running in the same engine names. A merge's
+**Model.** One index. Commits append spans, one with no files when a
+commit changes no key, and tick the journal's event counter. A claim's
+reads are endpoints from the step that makes it (`_prepare` is
+synchronous); it lands at the head + 1 or, while a pass is under way, at
+the pass's end; its manifest is the state, its pin the event counter. A
+consumer may hold two claims (a retry claimed before the claim it replaces
+goes). A claim settles (the position moves to its landing point), commits
+a pass's batch (the position stays and holds the pass's end until its
+last batch), or fails. Upkeep
+plans a merge of adjacent spans from the endpoints it knows, keeping a
+segment start at each, in one of two lanes that never share an input, and
+uploads it under a name carrying its epoch. Publication has two steps:
+the engine applies `IndexMerged` to its model (if the index is still of
+its life and holds its inputs, `IndexState.holds`: their commits and file
+names) and the journal makes it durable later; the index's other events
+wait for that, as the journal orders them after it. Refused, the output is
+deleted. Garbage is deleted, once durable, at or under the pin floor,
+by the serving engine or by a zombie whose `durable()` passed before the
+fence (its successor replays the same garbage). The
+orphan collector lists the merge outputs, then deletes them one at a
+time: those its model does not name (current spans, garbage, its running
+merges), judged after the listing, of its own epoch or earlier. A takeover
+writes epoch + 1 and replays the durable journal; the engine before runs
+on as a zombie, with the model it had (a publication not yet durable
+included) and its collector wherever it was, until it halts. A merge's
 work can fail; after `R` = 3 failures of one input set the index merges no
-more. A takeover leaves the old engine running as a zombie, with the state
-it last knew, until it halts; its journal writes are fenced. A reset
-starts a new, empty life: the old spans become garbage, the position goes
-back to 1.
+more. A reset starts a new, empty life.
 
 | Property | Says |
 |---|---|
-| `Tiling` | the published spans tile this life's commits exactly |
-| `ReadsExact` | every endpoint is a boundary of the published spans |
-| `StateStored` | every file the state names is stored |
-| `ReadersStored` | every file of an active attempt's manifest is stored |
-| `PublishingStored` | the output of a merge the serving engine will publish is stored |
+| `Tiling` | the spans tile this life's commits exactly, durable and in the serving engine's model |
+| `ReadsExact` | every endpoint is a boundary of both |
+| `StateStored` | every file the journal or the serving engine's model names is stored |
+| `ReadersStored` | every file of a claim's manifest is stored |
+| `PublishingStored` | the output of a merge the serving engine runs is stored |
 | `AttemptsBounded` | no input set is attempted more than `R` times |
 
 | Rule off | TLC finds |
 |---|---|
 | `FixLanding`: a claim's landing point is an endpoint from its plan on (A10) | `ReadsExact`, 7 steps: commit 1; an attempt claims, landing at 2; commit 2; a merge of both keeps no start at 2; the attempt settles inside the merged span |
-| `FixBounds`: a merge keeps a segment start at every endpoint it was planned with | `ReadsExact`, 6 steps |
-| `FixLanes` and `FixInputs` together: the lanes never share an input; publication re-checks the inputs (`IndexState.holds`) | `Tiling`, 6 steps: two merges over one span; the second publishes over inputs the first replaced. Either rule alone suffices: with one of them off, `lanes` and `inputs-alone` pass |
-| `FixLife`: an attempt's commit re-checks the index's life | `ReadsExact`, 5 steps: an attempt claimed before a reset lands its position in the new life |
-| `FixPinFloor`: garbage waits for the pin floor | `ReadersStored`, 5 steps: an attempt claims; a reset lets go of its manifest; it is deleted while the attempt runs |
+| `FixBounds`: a merge keeps a segment start at every endpoint it was planned with | `ReadsExact`, 7 steps |
+| `FixLanes` and `FixInputs` together: the lanes never share an input; publication re-checks the inputs | `Tiling`, 8 steps: two merges over one span; the second publishes over inputs the first replaced. Either rule alone suffices: `lanes` and `inputs-alone` pass |
+| `FixLife`: publication re-checks the index's life | `Tiling`, 6 steps, with spans that have no files (W42): life 0 commits an empty span [1,1] and uploads a merge of it; a reset; life 1 commits an empty [1,1]; the merge publishes, its inputs' name lists (none) matching the new life's, and the index holds a span of life 0. With files, the input check alone refuses it: `life-files` passes |
+| `FixSettleLife`: an attempt's commit re-checks the index's life | `ReadsExact`, 5 steps: an attempt claimed before a reset lands its position in the new life |
+| `FixPinFloor`: garbage waits for the pin floor | `ReadersStored`, 5 steps |
 | `FixDurable`: inputs become garbage at publication, not at upload | `StateStored`, 5 steps |
 | `FixRetries`: at `R` failures the index stops merging | `AttemptsBounded`, 6 steps |
-| `OrphansFenced`: only the serving engine collects orphans | **F40, the code as built.** `PublishingStored`, 5 steps; `StateStored`, 6 steps (`orphans-state`): a takeover; the new engine commits, merges and publishes; the zombie's collector lists the output, which the state it last knew does not name, and deletes it. The index names a file that is gone |
+| `FixEpoch`: a collector deletes outputs of its epoch or earlier only | **F40, the code before c4eb4f7.** `PublishingStored`, 6 steps; `StateStored`, 7 steps (`epoch-state`): a takeover; the new engine commits, merges and publishes; the zombie's collector lists the output, which its model does not name, and deletes it |
+| `FixJudgeAfter`: the collector judges what is named after its listing | `PublishingStored`, 6 steps: it names; a merge of its own is planned and uploaded; it lists, and deletes the output |
+| `FixGarbageNamed`: the collector counts the garbage its model knows as named | `StateStored`, 9 steps (`garbage-named`, no readers): a publication applied but not yet durable; the collector deletes its inputs, which the journal still names |
 
-`OrphansFenced` is TRUE in the CI models, the fix to make: until F40 is
-fixed, they check the design, not the code. The life check on publication
-is redundant while file identities never repeat (the input check already
-refuses a merge over an earlier life's spans); it stays, against names
-that could.
+**A zombie's publication that never became durable** (the coordinator's
+question, also asked of W42): zombie A applies `IndexMerged(M)`,
+replacing X, to its model; it is fenced before the event is durable, so
+B's state still names X. A's collector does not delete X: the epoch rule
+does not protect it (X is A's or older), but A's model holds X as garbage,
+which the collector names. `takeover` passes with this reachable, and
+`garbage-named` shows the rule it rests on. M itself is A's and unnamed by
+B: B's collector deletes it, as it should.
 
-Two divergences that are not safety, reported with F40: `_attempts` is
-keyed by the index and its input commits, not the life, and a refused
-publication keeps its count, so merges refused across resets add up, and
-an index can stop merging with no merge having failed; `stopped` also
-outlives a reset. The model counts failures per input set.
+The collector's listing is the files written up to it (`upto`): files are
+never written again, so those still stored are what it listed and nobody
+deleted since. `Collectors` turns the collectors on (`takeover`,
+`orphans` and their calibrations); `base` runs without them, a sixth of
+the size. While a publication is pending, the index's other events wait
+for it: the spec does not interleave a commit or a claim into that
+window, which only reorders events the journal orders anyway.
 
-Not modelled: renames, which keep the index's prefix; a pass's `to + 1`
-and a pattern change's split, endpoints held as a position's is; several
-consumers; the merge policy's thresholds and the write bound (Lean's);
-cleanup reads (`Model.cleanup_reads`), garbage of another kind. Not
-trace-validated yet: the simulation's export carries object requests,
-not the journal events the guards act on (publication, lives, claims'
-reads).
+Not modelled: renames, which keep the index's prefix; a pattern change's
+split, an endpoint held as a position's is; the merge policy's
+thresholds and the write bound (Lean's); cleanup reads
+(`Model.cleanup_reads`); pins other than claims' (a delta pass's, a
+sensor tick's, the engine's own readers), which only make collection
+wait longer; the read-ahead's entries (`Positions.tla`'s).
 
 | Model | What | Distinct states | Time (4 workers) |
 |---|---|---|---|
-| `base` | 3 commits per life, 6 files, 1 reset, 1 claim, 1 merge in flight | 13,847,449 | 1 min |
-| `takeover` | `base`, a takeover instead of the reset | 44,521,549 | 7 min |
-| `retries` | failing merges, 2 commits, no reset | 59,494,263 | 9 min |
+| `base` | 3 commits per life, 6 files, 1 reset, 1 claim, 1 merge at a time | 7,945,559 | 1.5 min |
+| `takeover` | a takeover and the collectors, 2 commits, 5 files, no reset | 73,114,314 | 20 min |
+| `orphans` | `base` with the collectors, no reset | 11,195,707 | 3 min |
+| `retries` | failing merges, 2 commits, no reset | 34,096,548 | 8 min |
+| `empty` | spans with no files, 2 commits per life | 13,350,551 | 3 min |
+| `passes` | passes, 2 claims, no reset | 27,170,742 | 8 min |
 
 ## Formal model: the journal object (`spec/tla/JournalObject.tla`)
 
@@ -1171,6 +1191,45 @@ restarting (`Abandon`); and retention deletes an abandoned attempt's
 files (`Purge`). Every `Attempt.tla` model and calibration passes or fails
 as before.
 
+**The span key index** (`Spans.tla`, `SpansTrace.tla`; `check-trace.py
+spans`). Its rules act on what the journal decided (a publication and its
+inputs, a life, a claim's reads and pin), so the export also writes the
+journal's durable events, each after the request that made it durable,
+and every engine request carries the event counter of that engine's
+model. `check-trace.py` replays the events through the engine's own
+`Model`, one trace per index: commits, publications, resets, and claims,
+each with its landing point and whether it reads a pass, placed where the
+engine prepared it: at its pin (the counter it was claimed at) or, if a
+commit came between the claim and the plan, at that commit. The spec
+claims and prepares in one step, so its pin is then later than the
+code's, which only makes it laxer about garbage than the code. An engine request is placed after the
+events its engine had applied: the engine merges spans its model holds
+before the journal makes them durable. A claim ends as a settle (the
+position moved to its landing point), a pass's batch (the position still
+holds the pass) or a failure; a merge output's upload is its first file's
+create, its starts taken from the publication; a deletion is the serving
+engine's or a zombie's; a read must find its span stored. The trace
+module fixes each step's parameters, so TLC walks the trace rather than
+searching: a merge may keep more starts than this spec's endpoints (a
+pattern change's), never fewer.
+
+Of a batch of 41 simulation runs on the pushed tree, 265 index traces
+(25,580 records, up to 334 a trace), all are valid: 671 merges uploaded,
+668 published, 3 never; 1,877 claims (419 pass batches); 1,701 deletions
+by the serving engine and 5 by zombies; 2,521 collector listings, 106 of
+them a zombie's; 2,764 takeovers; 60 resets; 11,448 reads. No commit wrote an empty span and no publication was refused in
+that batch: those are checked by the models alone. The first batches
+found what `Spans.tla` lacked, now in it: a claim lands behind the head,
+at a pass's end, held by the position only once a batch commits (a first
+batch that fails leaves no pass); a consumer holds two claims, a retry
+claimed before the claim it replaces goes; a zombie whose `durable()`
+passed before the fence deletes garbage after it (an earlier batch had 43
+such deletions); and an attempt claimed before a commit and prepared
+after it (its pin before its reads). None was a bug in the code. A mutation that plans merges with no endpoints (`maintain` passing
+an empty set) passes the simulation's own checks in 13 runs, while 7 of
+their 85 traces stop at the first upload that keeps no start at an
+endpoint.
+
 **Next:** `Execution.tla` needs an abstraction map (key sets, one
 partition per asset) and comes last.
 
@@ -1217,4 +1276,4 @@ partition per asset) and comes last.
 | F37 | A full pass begun before a dep moved continues after it: `checks` has never run; keys=[k2] writes k2 (generation 10), which begins the full pass it owes (`began` 10, `seen` none). `knob` moves; engine and reference agree that k1 and k2 are stale. The default run calls `checks` on k1 alone, so k2 keeps what the old `knob` gave it, and the engine reports no stale key while `seen` is still none (found writing W22's K47 histories as examples, on fae165c) | P2 | fixed: the move point (the whole and dep inputs' latest commit) is taken whenever the partition record's `seen` is absent or differs, not only when it differs, so a full pass begun before the move starts over and redoes what it wrote under the old version; and a backstop: an each=True partition is never fresh while its record says no whole and dep versions, or old ones — `tests/server/test_staleness.py::test_a_keys_run_on_a_never_built_output_leaves_it_owing_a_full_pass` |
 | F38 | A consumer of an output in a current-only store stalls for good: `items` lives in the table store (its current rows only). `copy` is in a delta pass over `items`' commit 1 (k1, k10, k2; batch 1 of 2 delivered) when `items`, its version bumped, rebuilds as commit 2 without k2. Batch 2 loads k2 by key; the store has none, so F33's check raises SourceBehind ("items: the source index says k2@106 but the source has no k2"), 28 times: the pass stays on commit 1, and the commit that removed k2 already exists, so no retry can pass. The budget runs out, no automation fires again, and `copy` and `checks` stay stale (sweep Z14, shrunk from 52 steps to 4; bisected to ba357e5, F33's fix) | P1 | fixed (the coordinator's ruling): a key missing from a current-only store is decided against the source's head index, not the pass's commit (`each.gone_since`; a delta pin carries the head). The head still names it: the store is behind its index, `SourceBehind`, retryable and bounded (F33). The head lacks it too: removed since, so the batch takes it as removed and the pass goes on. And a partition whose last outcome failed with nothing pending reports `failed`, its reasons kept, never quietly stale — `tests/sim/test_replays.py::test_f38_a_consumer_of_a_current_only_output_finishes_a_pass_its_upstream_outran`, `tests/server/test_source_behind.py::test_a_partition_whose_retries_ran_out_is_failing_not_stale` |
 | F39 | A removed asset's attempt still owns its partition when a later life claims it: `seen`'s attempt 2 runs, its worker dead before its result; a redeploy removes `seen`, the next declares it again. Attempt 2 is an earlier life's, which since F34 holds no name, and nothing ended it: the new life's attempt 3 creates its control file at t=47 while attempt 2's is still owned, a request no behaviour of the attempt spec makes; attempt 2 is ended only at t=251 (trace validation of simulation example 2, seed 65535: `check-trace.py attempt`, "30 of 147 requests explained") | P2 | fixed (the coordinator's ruling: no exception): retiring with the asset ends the attempt as every other end does, `_end` first. The engine that adopts an attempt launched before its asset was removed fails it at once, retryable (`removed`), and its task carries on in the new life. Until it is ended it keeps its partition: dispatch holds a new-life task on it (`claim`), and the journal check counts it as holding the partition — `tests/sim/test_replays.py::test_f39_a_removed_assets_attempt_is_ended_before_its_partition_is_claimed_again` |
-| F40 | After a takeover, the old engine's orphan collector deletes the new engine's span files: it runs every `ORPHAN_SECONDS` with the model it last knew and writes nothing to the journal first, so nothing tells it it is fenced. Engine A commits; B takes over, merges and publishes `m…-…kx`; A's `collect_orphans` lists `keys/`, finds the output its model does not name, and deletes it. B's index then names a file that is gone, and every read of that span fails; deleted before publication, B publishes a file that is gone (`Spans.tla`, calibrations `orphans`, `orphans-state`) | P1 | fixed in c4eb4f7 (found independently by review A17, its R1): each engine takes an epoch, one past its predecessor's, written by the journal swap that fences it; merge outputs are named `m{a}-{b}-{epoch}-{ULID}`, and a collector deletes an unreferenced output only if its epoch is at most its own, judging what is named and running after its listing — `tests/server/test_keys.py::test_f40_a_zombies_orphan_collector_spares_the_serving_engines_spans`, `test_a_fenced_engine_never_collects_its_successors_merge_outputs` |
+| F40 | After a takeover, the old engine's orphan collector deletes the new engine's span files: it runs every `ORPHAN_SECONDS` with the model it last knew and writes nothing to the journal first, so nothing tells it it is fenced. Engine A commits; B takes over, merges and publishes `m…-…kx`; A's `collect_orphans` lists `keys/`, finds the output its model does not name, and deletes it. B's index then names a file that is gone, and every read of that span fails; deleted before publication, B publishes a file that is gone (`Spans.tla`, calibrations `epoch`, `epoch-state`) | P1 | fixed in c4eb4f7 (found independently by review A17, its R1): each engine takes an epoch, one past its predecessor's, written by the journal swap that fences it; merge outputs are named `m{a}-{b}-{epoch}-{ULID}`, and a collector deletes an unreferenced output only if its epoch is at most its own, judging what is named and running after its listing — `tests/server/test_keys.py::test_f40_a_zombies_orphan_collector_spares_the_serving_engines_spans`, `test_a_fenced_engine_never_collects_its_successors_merge_outputs` |

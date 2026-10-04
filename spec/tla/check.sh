@@ -11,7 +11,8 @@
 #   attempt    ci: small, dup, live and the calibrations; big: two attempts with a
 #              duplicate worker each (too large to finish)
 #   positions  ci: base, each and the calibrations; three: three keys
-#   spans      ci: base, takeover (a zombie), retries (failing merges) and the calibrations
+#   spans      ci: base, takeover (a zombie), orphans (the collector), retries (failing
+#              merges), empty (spans with no files), passes, and the calibrations
 #   every spec: calibrate (each rule switched off: TLC must find its bug), all
 #
 # A model is its spec's base config ({Spec}.cfg) with changes (`model` below):
@@ -96,19 +97,27 @@ model() {
         positions/retry-collapse) changes=(Each=TRUE FixRetryCollapse=FALSE) ;;
         # Spans.tla: one consumer, three commits, one claim, one reset, one merge at a time.
         spans/base) changes=() ;;
-        spans/takeover) changes=(MaxTakeovers=1 MaxResets=0) ;;
+        spans/takeover) changes=(MaxTakeovers=1 MaxResets=0 Collectors=TRUE MaxCommits=2 MaxFiles=5) ;;
+        spans/unpublished) changes=(MaxTakeovers=1 MaxResets=0 Collectors=TRUE MaxCommits=2 MaxFiles=5 INVARIANT=NoUnpublished) ;;
+        spans/orphans) changes=(Collectors=TRUE MaxResets=0) ;;
         spans/retries) changes=(MergeFailures=TRUE MaxResets=0 MaxCommits=2) ;;
+        spans/empty) changes=(EmptySpans=TRUE MaxCommits=2) ;;
+        spans/passes) changes=(Passes=TRUE MaxClaims=2 MaxResets=0) ;;
         spans/landing) changes=(FixLanding=FALSE) ;;
         spans/bounds) changes=(FixBounds=FALSE) ;;
         spans/inputs) changes=(MaxJobs=2 MaxCommits=2 MaxResets=0 FixLanes=FALSE FixInputs=FALSE) ;;
         spans/lanes) changes=(MaxJobs=2 MaxCommits=2 MaxResets=0 FixLanes=FALSE) ;;
         spans/inputs-alone) changes=(MaxJobs=2 MaxCommits=2 MaxResets=0 FixInputs=FALSE) ;;
-        spans/life) changes=(FixLife=FALSE) ;;
+        spans/life) changes=(EmptySpans=TRUE FixLife=FALSE) ;;
+        spans/life-files) changes=(FixLife=FALSE) ;;
+        spans/settle-life) changes=(FixSettleLife=FALSE) ;;
         spans/pin-floor) changes=(FixPinFloor=FALSE) ;;
         spans/durable) changes=(FixDurable=FALSE MaxResets=0) ;;
         spans/retries-cap) changes=(MergeFailures=TRUE MaxResets=0 MaxCommits=2 FixRetries=FALSE) ;;
-        spans/orphans) changes=(MaxTakeovers=1 MaxResets=0 OrphansFenced=FALSE) ;;
-        spans/orphans-state) changes=(MaxTakeovers=1 MaxResets=0 OrphansFenced=FALSE -PublishingStored) ;;
+        spans/epoch) changes=(MaxTakeovers=1 MaxResets=0 Collectors=TRUE FixEpoch=FALSE) ;;
+        spans/epoch-state) changes=(MaxTakeovers=1 MaxResets=0 Collectors=TRUE FixEpoch=FALSE -PublishingStored) ;;
+        spans/judge) changes=(Collectors=TRUE MaxResets=0 FixJudgeAfter=FALSE) ;;
+        spans/garbage-named) changes=(Collectors=TRUE MaxResets=0 MaxClaims=0 MaxTakeovers=1 FixGarbageNamed=FALSE) ;;
         *) echo "no model $2 of $1" >&2; exit 2 ;;
     esac
 }
@@ -168,8 +177,13 @@ calibration() {
             # inputs: the second publishes over replaced inputs. Either guard
             # alone suffices (models lanes and inputs-alone pass).
             calibrate inputs Tiling
+            # Publication without the life check: a merge of spans with no files
+            # planned before a reset matches the new life's, whose names are
+            # as empty (W42). With files, the input check alone refuses it
+            # (model life-files passes).
+            calibrate life Tiling
             # An attempt of an earlier life lands its position in the new one.
-            calibrate life ReadsExact
+            calibrate settle-life ReadsExact
             # Garbage deleted while a reader pinned before it still reads it.
             calibrate pin-floor ReadersStored
             # Inputs let go of at upload: a refused or crashed merge leaves the
@@ -177,11 +191,21 @@ calibration() {
             calibrate durable StateStored
             # A failing input set merged again and again.
             calibrate retries-cap AttemptsBounded
-            # F40, the code as built: a zombie collects orphans by the state it
-            # last knew, and deletes the output of a merge the serving engine
-            # is publishing, or (orphans-state) has published since.
-            calibrate orphans PublishingStored
-            calibrate orphans-state StateStored
+            # F40, the code before c4eb4f7: a zombie collects orphans by the
+            # model it last had, and deletes the output of a merge the serving
+            # engine is publishing, or (epoch-state) has published since.
+            calibrate epoch PublishingStored
+            calibrate epoch-state StateStored
+            # A collector that names before it lists: a merge of its own,
+            # planned and uploaded in between, is listed and deleted.
+            calibrate judge PublishingStored
+            # A collector that does not count garbage as named: the inputs of a
+            # publication not yet durable, which the journal still names, go.
+            calibrate garbage-named StateStored
+            # Not a rule: `takeover` reaches the zombie's publication that never
+            # became durable (the coordinator's question), so its passing means
+            # the zombie's collector spares what the journal still names.
+            calibrate unpublished NoUnpublished
             ;;
         attempt)
             # A create-if-absent gate with nothing retained: a worker that read its
@@ -291,7 +315,7 @@ run() {  # run SPEC GROUP
         attempt/ci) check small; check dup; check live; calibration attempt ;;
         positions/ci) check base; check each; calibration positions ;;
         positions/all) run positions ci; check three ;;
-        spans/ci) check base; check takeover; check retries; calibration spans ;;
+        spans/ci) check base; check takeover; check orphans; check retries; check empty; check passes; calibration spans ;;
         attempt/all) run attempt ci; check big ;;
         */calibrate) calibration "$spec" ;;
         *) check "$2" ;;

@@ -105,6 +105,7 @@ class Simulation(RuleBasedStateMachine):
         # SOLERA_SIM_REQUESTS: a directory for each example's requests (spec/tla/check-trace.py)
         if os.environ.get("SOLERA_SIM_REQUESTS"):
             world.objects.trace = self._traced
+            world.objects.tap = self._landed
         self.db, self.outside = Database(), External()
         self.db.fault = self._db_fault
         self.data_root = self.tmp / "data"
@@ -130,6 +131,8 @@ class Simulation(RuleBasedStateMachine):
         root = str(self.tmp.resolve())
         line = {"at": self.world.now(), "who": list(who) if who else None, "kind": kind}
         line |= {"path": path.removeprefix(root), "outcome": outcome}
+        if who and who[0] == "engine" and self.world.slots[who[1]].state is not None:
+            line["counter"] = self.world.slots[who[1]].state.model.event_counter  # what it had applied
         if listed is not None:
             line["listed"] = [p.removeprefix(root) for p in listed]
         if data is not None and path.endswith("/control/journal.json"):
@@ -140,6 +143,14 @@ class Simulation(RuleBasedStateMachine):
             spec = json.loads(data)  # the partition an attempt runs
             line["partition"] = [spec.get("asset"), spec.get("partition")]
         self.requests.append(line)
+
+    def _landed(self, path, data):
+        """The journal's durable events, each after the request that made it
+        durable (Spans.tla's trace: what the index's lifecycle decided)."""
+
+        known = len(self.journal.history)
+        self.journal.landed(path, data)
+        self.requests.extend({"event": event} for event in self.journal.history[known:])
 
     def _db_fault(self, kind, partition):
         if not self.world.plan.enabled:
