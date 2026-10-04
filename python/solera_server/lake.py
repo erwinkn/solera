@@ -158,9 +158,8 @@ class Lake:
                 cache = os.path.join(tempfile.gettempdir(), f"solera-{self.prefix}", digest)
         self.cache = Path(cache) if cache else None
         self.check_seconds = min(flush_seconds, 1.0)
-        self._task: asyncio.Task | None = None  # the background loop, once started
-        self.merges = Tasks("lake")  # the merge under way, one at a time
-        self.last_error: str | None = None
+        self.tasks = Tasks(self.prefix)  # its tick, then the merge under way (one at a time)
+        self.failing: dict[str, str] = {}  # what fails now, by name: the engine's, once it has this lake
         self._db = None  # in-memory DuckDB mirroring the buffers
         self._mirrored: dict[str, tuple] = {}  # table -> (state, generation, first seq, last seq)
         # One thread mirrors the buffers and opens queries' transactions, in the
@@ -175,27 +174,14 @@ class Lake:
     def start(self) -> None:
         """Flush and merge in the background from here on."""
 
-        self._task = asyncio.create_task(self._run())
-
-    async def _run(self) -> None:
-        while True:
-            await asyncio.sleep(self.check_seconds)
-            try:
-                await self.tick()
-            except Exception as error:
-                self.last_error = f"{self.prefix}: {type(error).__name__}: {error}"
-                log.exception("%s flush failed", self.prefix)
+        self.tasks.every(f"{self.prefix} flush", self.check_seconds, self.tick, failing=self.failing)
 
     async def tick(self) -> None:
         await self.flush()
         self.maintain()
 
     async def stop(self) -> None:
-        if self._task is not None:
-            self._task.cancel()
-            await asyncio.gather(self._task, return_exceptions=True)
-            self._task = None
-        await self.merges.close()
+        await self.tasks.close()
         if self._preparer is not None:
             self._preparer.shutdown(wait=False)
             self._preparer = None
@@ -311,13 +297,13 @@ class Lake:
             return
         plan = self.plan()
         if plan:
-            self.merges.spawn(self._compact(plan), key="merge")
+            self.tasks.spawn(self._compact(plan), key="merge")
 
     @property
     def job(self) -> asyncio.Task | None:
         """The merge under way, if any."""
 
-        return self.merges.get("merge")
+        return self.tasks.get("merge")
 
     def plan(self) -> list[tuple[str, list[dict]]]:
         """Groups of files to rewrite as one: `merge_width` neighbours of one
@@ -381,10 +367,11 @@ class Lake:
             # The files replaced stay cached as long as they exist: a pinned
             # query may still read them. Collection evicts them as it deletes them.
             self.state.record({"type": f"{self.name}Compacted", "changes": changes, "at": self.clock()})
+            self.failing.pop(f"{self.prefix} merge", None)
         except asyncio.CancelledError:
             raise
         except Exception as error:
-            self.last_error = f"{self.prefix}: {type(error).__name__}: {error}"
+            self.failing[f"{self.prefix} merge"] = f"{type(error).__name__}: {error}"
             log.exception("%s compaction failed", self.prefix)
 
     def _merge(self, plan) -> list[tuple[bytes, dict]]:

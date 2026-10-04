@@ -151,7 +151,6 @@ class Engine(Attempts, Sensors, Staleness, Views):
         self.engine_inflight: set[str] = set()
         self.executor_inflight: dict[str, int] = {}
         self.runner: asyncio.Task | None = None
-        self.last_error = None
         self._stopping = False
         self.key_options = key_options or Options()
         self._io: ObjectIO | None = None
@@ -162,7 +161,11 @@ class Engine(Attempts, Sensors, Staleness, Views):
         if resolve_cache:
             root = resolve_cache if isinstance(resolve_cache, str) else cache_root(state.objects_url)
             self.keys = KeyService(state.objects, root, options=self.key_options)
+        # What fails now, by name — the eval loop, upkeep, a key index, the history, an
+        # automation — each entry cleared by its own next success: the one place it shows.
+        self.failing: dict[str, str] = {}
         self.history = history or History(state, clock=self.clock)
+        self.history.lake.failing = self.failing
         self.upkeep = Upkeep(
             state,
             self.history,
@@ -173,6 +176,7 @@ class Engine(Attempts, Sensors, Staleness, Views):
             concurrency=maintenance_concurrency,
             retention_interval=retention_interval,
             keys=self.keys,
+            failing=self.failing,
         )
         self._sensors_init(sensor_host)
         self._dynamic_dims = {
@@ -321,18 +325,12 @@ class Engine(Attempts, Sensors, Staleness, Views):
             self.state.changed.clear()
             try:
                 await self.tick()
-                self.last_error = None
+                self.failing.pop("engine", None)
             except Exception as error:
-                self.last_error = f"{type(error).__name__}: {error}"
+                self.failing["engine"] = f"{type(error).__name__}: {error}"
                 log.exception("engine tick failed")
             with contextlib.suppress(TimeoutError):
                 await asyncio.wait_for(self.state.changed.wait(), self.eval_interval)
-
-    @property
-    def failing(self) -> str | None:
-        """What last went wrong, in the eval loop or in storage upkeep."""
-
-        return self.last_error or self.upkeep.last_error
 
     async def tick(self):
         """One evaluation pass: adoption, dispatch, automations, archiving."""
@@ -2177,7 +2175,9 @@ class Engine(Attempts, Sensors, Staleness, Views):
         try:
             run = self._automation_run(auto, partitions)
         except Exception as error:
-            self.last_error = f"automation {auto['name']}: {error}"
+            self.failing[f"automation {auto['name']}"] = str(error)
+        else:
+            self.failing.pop(f"automation {auto['name']}", None)
         self._fired(auto, run)
 
     def _fire_ondeploy(self, auto):
@@ -2187,8 +2187,9 @@ class Engine(Attempts, Sensors, Staleness, Views):
         try:
             run = self._automation_run(auto, auto.get("partitions") or "latest")
         except Exception as error:
-            self.last_error = f"automation {auto['name']}: {error}"
+            self.failing[f"automation {auto['name']}"] = str(error)
             return
+        self.failing.pop(f"automation {auto['name']}", None)
         self._fired(auto, run, deploy=self.manifest["deploy"])
 
     def _fire_onchange(self, auto):
@@ -2219,8 +2220,9 @@ class Engine(Attempts, Sensors, Staleness, Views):
             selection = {t: sorted(partitions) for t, partitions in selected.items() if partitions}
             run = self._automation_run(auto, selection, sorted(selection)) if selection else None
         except Exception as error:
-            self.last_error = f"automation {auto['name']}: {error}"
+            self.failing[f"automation {auto['name']}"] = str(error)
             return  # the changes stay pending: the next tick replays them
+        self.failing.pop(f"automation {auto['name']}", None)
         self._fired(auto, run, consumed=consumed)
 
     async def set_automation(self, name: str, enabled: bool):

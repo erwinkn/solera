@@ -230,12 +230,16 @@ class LogShipper:
                 del self.live[:gone]
                 self.live_offset += gone
 
-    async def periodically(self):
-        while True:
-            await asyncio.sleep(LOG_LIVE_SECONDS)
-            await self.send_live()
-            if self.sealed or (self.pending and time.monotonic() - self._chunked_at >= LOG_CHUNK_SECONDS):
-                await self.chunk()
+    def ship_on(self, tasks: Tasks) -> asyncio.Task:
+        """Ship on `tasks`' ticker: the live lines every `LOG_LIVE_SECONDS`, a
+        chunk once one is sealed or `LOG_CHUNK_SECONDS` have passed."""
+
+        return tasks.every("logs", LOG_LIVE_SECONDS, self._ship)
+
+    async def _ship(self) -> None:
+        await self.send_live()
+        if self.sealed or (self.pending and time.monotonic() - self._chunked_at >= LOG_CHUNK_SECONDS):
+            await self.chunk()
 
     async def finish(self) -> dict:
         """The log's index for the result: its chunks and its tail. Never

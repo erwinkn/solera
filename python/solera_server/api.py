@@ -217,7 +217,7 @@ def create_app(
             "inflight": len(runtime.watchers),
             "active_runs": sum(1 for r in runtime.m.runs.values() if r["status"] not in TERMINAL_RUN),
             "postgres": bool(os.environ.get("DATABASE_URL")),
-            "last_error": runtime.failing,
+            "last_error": "; ".join(f"{name}: {error}" for name, error in runtime.failing.items()) or None,
             # cleanup whose names could not be read: see and clear with `solera cleanups`
             "stuck_cleanups": [
                 {"output": output, "partition": partition, "id": e["id"]}

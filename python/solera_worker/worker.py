@@ -1081,7 +1081,7 @@ async def run_attempt(
         on_cancel(started)
     reporter.start()
     tasks = Tasks("attempt")
-    flusher = tasks.spawn(shipper.periodically(), key="logs")
+    flusher = shipper.ship_on(tasks)
     try:
         try:
             result = await execution

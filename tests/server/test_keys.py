@@ -302,7 +302,7 @@ async def test_a_commit_during_the_recount_keeps_it(state, monkeypatch):
     release.set()
     await asyncio.gather(*engine.upkeep.jobs.values())
     index = state.model.indexes[key]
-    assert counted == [5] and engine.upkeep.last_error is None  # one recount, of the pinned 5 keys
+    assert counted == [5] and not engine.failing  # one recount, of the pinned 5 keys
     assert index.count == 6 == len(rows) and index.count_exact
     assert state.model.heads[key]["count"] == 6
 

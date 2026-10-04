@@ -79,3 +79,39 @@ async def test_a_key_names_one_running_task():
     await task
     await asyncio.sleep(0)
     assert "k" not in tasks
+
+
+async def test_a_ticker_records_a_failure_until_its_next_good_tick(caplog):
+    tasks, failing, ticks = Tasks("t"), {}, []
+
+    async def tick():
+        ticks.append(len(ticks))
+        if len(ticks) == 2:
+            raise RuntimeError("broken once")
+
+    with caplog.at_level(logging.ERROR, logger="solera.tasks"):
+        tasks.every("upkeep", 0.01, tick, failing=failing)
+        while len(ticks) < 2:
+            await asyncio.sleep(0.005)
+        await asyncio.sleep(0)
+        assert failing == {"upkeep": "RuntimeError: broken once"}
+        while len(ticks) < 3:
+            await asyncio.sleep(0.005)
+        assert failing == {}, "its next good tick clears it"
+        await tasks.close()
+    assert "upkeep failed" in caplog.text
+
+
+async def test_a_woken_ticker_ticks_before_its_interval():
+    tasks, wake, ticks = Tasks("t"), asyncio.Event(), []
+
+    async def tick():
+        ticks.append(1)
+
+    tasks.every("loop", 60, tick, wake=wake)
+    await asyncio.sleep(0.01)
+    assert len(ticks) == 1, "it ticks at once"
+    wake.set()
+    await asyncio.sleep(0.01)
+    assert len(ticks) == 2, "and again when woken, not 60 s later"
+    await tasks.close()

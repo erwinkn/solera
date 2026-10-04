@@ -48,19 +48,20 @@ class Upkeep:
         retention_interval: float = 60.0,
         interval: float = 1.0,
         keys=None,
+        failing: dict[str, str] | None = None,
     ):
         self.state, self.history, self.manifest, self.clock = state, history, manifest, clock
         self.keys = keys  # the engine's key cache: compaction outputs go into it as written
         self.key_options = key_options or Options()
         self.recount_interval, self.concurrency = recount_interval, concurrency
         self.retention_interval, self.interval = retention_interval, interval
-        self.jobs = Tasks("upkeep")  # compactions and recounts running, by index key
-        self.last_error: str | None = None
+        self.tasks = Tasks("upkeep")  # its tick
+        self.jobs = Tasks("upkeep jobs")  # compactions and recounts running, by index key
+        self.failing = {} if failing is None else failing  # what fails now, by name: the engine's
         self._recounted: dict[tuple, float] = {}  # when each index was last recounted
         self._checked: dict[tuple, IndexState] = {}  # the state last found needing nothing
         self._swept = -math.inf
         self._alive = -math.inf
-        self._task: asyncio.Task | None = None
         self.retiring = asyncio.Lock()  # one retirement at a time
         self._purging = asyncio.Lock()
 
@@ -69,26 +70,13 @@ class Upkeep:
         return self.state.model
 
     def start(self) -> None:
-        self._task = asyncio.create_task(self._run())
+        self.tasks.every("upkeep", self.interval, self.tick, failing=self.failing)
 
     async def stop(self) -> None:
-        if self._task is not None:
-            self._task.cancel()
-            await asyncio.gather(self._task, return_exceptions=True)
-            self._task = None
+        await self.tasks.close()
         await self.jobs.close()
         with contextlib.suppress(Exception):
             await self.say_alive(force=True)
-
-    async def _run(self) -> None:
-        while True:
-            try:
-                await self.tick()
-                self.last_error = None
-            except Exception as error:
-                self.last_error = f"{type(error).__name__}: {error}"
-                log.exception("storage upkeep failed")
-            await asyncio.sleep(self.interval)
 
     async def tick(self) -> None:
         await self.say_alive()
@@ -185,10 +173,11 @@ class Upkeep:
         try:
             result = await asyncio.to_thread(work)
         except Exception as error:
-            self.last_error = f"key index {key[0]}/{key[1]}: {type(error).__name__}: {error}"
+            self.failing[f"key index {key[0]}/{key[1]}"] = f"{type(error).__name__}: {error}"
             log.exception("key index maintenance failed for %s", key)
             self._recounted[key] = self.clock()
             return
+        self.failing.pop(f"key index {key[0]}/{key[1]}", None)
         output, partition = key
         current = self.m.indexes.get(key)
         if recount:

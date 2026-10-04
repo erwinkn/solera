@@ -10,8 +10,9 @@ the component stops, so a process's shutdown order stays its own."""
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
-from collections.abc import Coroutine, Hashable, Iterator
+from collections.abc import Awaitable, Callable, Coroutine, Hashable, Iterator
 
 log = logging.getLogger(__name__)
 
@@ -38,6 +39,40 @@ class Tasks:
         self._tasks[task if key is None else key] = task
         task.add_done_callback(lambda t, k=(task if key is None else key): self._ended(k, t, awaited))
         return task
+
+    def every(
+        self,
+        name: str,
+        interval: float,
+        tick: Callable[[], Awaitable[None]],
+        *,
+        failing: dict[str, str] | None = None,
+        wake: asyncio.Event | None = None,
+    ) -> asyncio.Task:
+        """Run `tick` now and then every `interval` seconds — sooner when
+        `wake` is set — for as long as the task lives. A tick that raises is
+        logged and recorded in `failing[name]`, which its next good tick
+        clears; the loop goes on."""
+
+        async def loop():
+            while True:
+                if wake is not None:
+                    wake.clear()  # what sets it from here on wakes the next tick
+                try:
+                    await tick()
+                    if failing is not None:
+                        failing.pop(name, None)
+                except Exception as error:
+                    if failing is not None:
+                        failing[name] = f"{type(error).__name__}: {error}"
+                    log.exception("%s failed", name)
+                if wake is None:
+                    await asyncio.sleep(interval)
+                else:
+                    with contextlib.suppress(TimeoutError):
+                        await asyncio.wait_for(wake.wait(), interval)
+
+        return self.spawn(loop(), key=name)
 
     def _ended(self, key: Hashable, task: asyncio.Task, awaited: bool) -> None:
         if self._tasks.get(key) is task:
