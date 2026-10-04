@@ -51,8 +51,13 @@ async def test_pool_workers_race_for_a_claim(state):
     run = await engine.submit(["job"])
     [attempt] = await pool_attempt(engine, state)
     assert state.model.pool[attempt]["needs"] == {"cpu": 2}
+    for _ in range(3000):  # offered once its launch is durable (F26): a loaded machine flushes late
+        if offered := await engine.pool_work("ingest", {"cpu": 4}, "w1", 0):
+            break
+        await engine.tick()
+        await asyncio.sleep(0.02)
+    [stage] = offered
     assert await engine.pool_work("ingest", {"cpu": 1}, "w-small", 0) == []  # does not fit
-    [stage] = await engine.pool_work("ingest", {"cpu": 4}, "w1", 0)
     assert [s["attempt"] for s in await engine.pool_work("ingest", {"cpu": 4}, "w2", 0)] == [attempt]
 
     async def worker():
