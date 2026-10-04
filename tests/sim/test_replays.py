@@ -2,10 +2,7 @@
 xfail while its finding is open (docs/verification.md, "Findings"), an
 ordinary test once fixed."""
 
-import pytest
-
 from .machine import Simulation
-from .oracle import Violation
 from .world import Fate
 
 
@@ -458,7 +455,6 @@ def test_f17_an_output_moved_away_and_back_keeps_its_keys():
     state.teardown()
 
 
-@pytest.mark.xfail(strict=True, raises=Violation, reason="F34: open")
 def test_f34_a_rename_onto_an_earlier_lifes_name_keeps_its_attempt_settleable():
     """F34 (sweep Z11, replayable since the determinism fix): `copy` renamed
     to `mirror`; `mirror`'s attempt runs; `copy` comes back without an alias

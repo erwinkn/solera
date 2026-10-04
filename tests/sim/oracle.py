@@ -150,7 +150,10 @@ class Journal:
                     if old not in assets
                 }
                 asset_of = {t: renamed.get(a, a) for t, a in asset_of.items()}
-                holder = {(renamed.get(a, a), p): h for (a, p), h in holder.items()}
+                # A removed asset's attempts in flight are an earlier life's: they hold no name.
+                holder = {
+                    (renamed.get(a, a), p): h for (a, p), h in holder.items() if a in assets or a in renamed
+                }
             elif kind in ("AttemptLaunched", "AttemptFinished"):
                 task = event["task"]
                 partition = (

@@ -483,7 +483,8 @@ class Model:
             ),
         }
         self.attempts[attempt] = task["id"]
-        self.claimed_partitions[(task["asset"], task["partition"])] = attempt
+        if not self.earlier_life(task):  # it holds no name a later life may claim (F34)
+            self.claimed_partitions[(task["asset"], task["partition"])] = attempt
         self.queue.pop(task["id"], None)
         if pool is not None:  # discoverable until it ends; its claim is the worker's (§10)
             self.pool[attempt] = {
@@ -498,16 +499,24 @@ class Model:
             }
 
     def claimed(self, attempt: str) -> dict | None:
-        """The live claim behind an attempt, if it still holds its partition."""
+        """The live claim behind an attempt. The claim decides, not
+        `claimed_partitions`: that index gates dispatch for an asset's
+        current life only, while an earlier life's attempt, still in flight
+        after a reset, must settle all the same (F34)."""
 
         task_id = self.attempts.get(attempt)
         claim = self.claims.get(task_id) if task_id else None
-        if claim is None or claim["attempt"] != attempt:
-            return None
-        task = self.task(task_id)
-        if task is None or self.claimed_partitions.get((task["asset"], task["partition"])) != attempt:
+        if claim is None or claim["attempt"] != attempt or self.task(task_id) is None:
             return None
         return claim
+
+    def earlier_life(self, task: dict) -> bool:
+        """Whether a task's launched attempt is of an earlier life of its
+        asset: launched before the deploy that removed the asset (F12's
+        rule, the commit's: it commits nothing of the new one)."""
+
+        deploy = ((task.get("launched") or {}).get("prepared") or {}).get("deploy_number")
+        return deploy is not None and self.reset_at.get(("asset", task["asset"]), 0) > deploy
 
     def _release_claim(self, task_id: str, attempt: str | None = None) -> None:
         claim = self.claims.get(task_id)
@@ -615,9 +624,13 @@ class Model:
                             del self.pending[(old, partition)]
                         self.pending.setdefault((new, partition), set()).add(tid)
                     if (old, partition) in self.claimed_partitions:
-                        self.claimed_partitions[(new, partition)] = self.claimed_partitions.pop(
-                            (old, partition)
-                        )
+                        # Never over a claim still held (F34): an earlier life's left the index
+                        # at its reset, so only two live assets merged by a rename meet here,
+                        # and the one already under the name keeps it.
+                        holder = self.claimed_partitions.pop((old, partition))
+                        current = self.claimed_partitions.get((new, partition))
+                        if current is None or self.claimed(current) is None:
+                            self.claimed_partitions[(new, partition)] = holder
                     launched = task.get("launched")
                     if launched is not None:
                         outputs = launched["prepared"].get("outputs") or {}
@@ -693,6 +706,10 @@ class Model:
         outputs, assets = manifest.get("outputs") or {}, manifest.get("assets") or {}
         for asset in assets_before - set(assets):
             self.reset_at[("asset", asset)] = self.deploy_number
+            # Its attempts in flight are an earlier life's now: they settle (and commit
+            # nothing), but no longer hold the name a later life may claim (F34).
+            for key in [k for k in self.claimed_partitions if k[0] == asset]:
+                del self.claimed_partitions[key]
         reset = {
             name
             for name, store in stores.items()
