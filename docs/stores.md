@@ -60,6 +60,7 @@ class Reader(Protocol):                                        # what `reads()` 
 | `output` | the `Output` declaration: `name`, `key`, `incremental`, `config` |
 | `partition` | the partition key, `""` for an unpartitioned output |
 | `commit_number` | for an incremental output, the commit number the engine assigned |
+| `home` | the name the output's life began under: where a first write puts every partition of it, renamed or not (K25); `None` is the output's name |
 | `reset` | the write starts the content over (a `full` run): keep nothing of `prior` |
 | `attempt` | the writing attempt's id |
 | `generation` | a number the engine assigns each attempt on a partition, larger for every later attempt; `None` outside an attempt |
@@ -73,7 +74,11 @@ renamed output's objects, or table, stay where they were, so every ref to
 them stays readable; the declaration names the place only of a first
 write — and what the write builds on, unless `context.reset`, when nothing
 of it is kept. `None` is a first write. `acquire` and `migrate` get it
-too, to find the same place.
+too, to find the same place. A first write's place comes from
+`context.home`, the name the output's life began under, not its name
+now: one life keeps every partition in one place, so `copy` renamed
+`mirror` writes a new partition under `copy/` too, and its whole-output
+cleanup is one place (K25).
 
 - An unkeyed, non-incremental output's write is a value: replace it.
 - An unkeyed incremental output's write is a `Patch` of rows: append it as

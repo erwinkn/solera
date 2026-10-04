@@ -719,6 +719,7 @@ class _Out:
         return WriteContext(
             output=self.output,
             partition=spec["partition"],
+            home=self.info.get("home"),
             commit_number=self.info.get("commit_number"),
             attempt=spec["attempt"],
             reset=self.reset,

@@ -113,10 +113,14 @@ class WriteContext:
     incremental outputs, `attempt` the writing attempt's id. `reset` says the write starts the content over
     (a full run): `prior` still says where the content is, but nothing of
     it is kept — a store's commits start over at `commit_number`. What a keyed write
-    changes is the write's own (`KeyedWrite`)."""
+    changes is the write's own (`KeyedWrite`). `home` is the name the
+    output's life began under: a store keeps every partition of one life in
+    one place derived from it, so a renamed output's new partitions go
+    where its old ones are (K25); `None` means the output's own name."""
 
     output: Output
     partition: str
+    home: str | None = None
     commit_number: int | None = None
     attempt: str | None = None
     reset: bool = False

@@ -134,17 +134,18 @@ class PostgresStore:
 
         return psycopg.connect(resolve_env(self.dsn), row_factory=dict_row, autocommit=False)
 
-    def _table(self, output: Output, prior: Ref | None = None) -> str:
+    def _table(self, output: Output, prior: Ref | None = None, home: str | None = None) -> str:
         """Where the output's content lives: the committed head's table, so a
         renamed output keeps its table, and every ref to it stays readable
-        (§2); the declaration's (`schema`, `table`, else the output's name)
-        only for a first write."""
+        (§2); the declaration's (`schema`, `table`, else the name its life
+        began under, `home`: one table for every partition, K25) only for a
+        first write."""
 
         committed = (prior.handle or {}).get("table") if prior is not None else None
         if committed:
             return (committed, *_split(committed))
         schema = output.config.get("schema", "public")
-        table = output.config.get("table", output.name)
+        table = output.config.get("table", home or output.name)
         return _qname(schema, table), schema, table
 
     def _declared_shape(self, output: Output) -> tuple[dict, list]:
@@ -330,7 +331,7 @@ class PostgresStore:
         await asyncio.to_thread(self._acquire, context, prior)
 
     def _acquire(self, context: WriteContext, prior: Ref | None) -> None:
-        table, _, _ = self._table(context.output, prior)
+        table, _, _ = self._table(context.output, prior, context.home)
         with self._connect() as conn, conn.cursor() as cur:
             self._domain(cur, table)
             relid = self._relid(cur, table)
@@ -419,7 +420,9 @@ class PostgresStore:
 
     def _store(self, write, prior: Ref | None, context: WriteContext) -> Written:
         output = context.output
-        table, _, _ = self._table(output, prior)  # where it is, even when a full run starts it over
+        table, _, _ = self._table(
+            output, prior, context.home
+        )  # where it is, even when a full run starts it over
         if context.reset:
             prior = None  # a full run keeps nothing of the content
         with self._connect() as conn, conn.cursor() as cur:
@@ -700,7 +703,7 @@ class PostgresStore:
         with self._connect() as conn, conn.cursor() as cur:
             self._ensure_ledger(cur)
         applied = []
-        table, _, _ = self._table(output, prior)
+        table, _, _ = self._table(output, prior, context.home if context is not None else None)
         for migration in migrations:
             with self._connect() as conn, conn.cursor() as cur:
                 # The table's write domain, then the table lock, as a writer takes them

@@ -935,6 +935,7 @@ class Engine(Attempts, Sensors, Staleness, Views):
             # Whether the write starts the content over: a first write (an output
             # reset by a move holds no head), or a full run.
             info["reset"] = reset or head is None
+            info["home"] = self.m.homes.get(name, name)  # where its store keeps it (K25)
             if output.get("incremental"):
                 info["commit_number"] = int((head or {}).get("commit_number", -1)) + 1
             if output.get("key") is not None:

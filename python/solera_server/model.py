@@ -174,6 +174,7 @@ class Model:
             "partitions": _nest(self.partitions, 2),
             "repairs": _nest(self.repairs, 2),
             "cleanups": _nest(self.cleanups, 2),
+            "homes": dict(self.homes),
             "reset_at": _nest(self.reset_at, 2),
             "changed_at": self.changed_at,
             "automations": self.automations,
@@ -216,6 +217,9 @@ class Model:
         # event counter that let go of it: for the partition's next attempt to clean up
         # once no reader pins it (docs/lifecycle.md §9.8)
         self.cleanups: dict[tuple, list] = _flatten(snap.get("cleanups"), 2)
+        # Output -> the name its life began under: where its store keeps every partition
+        # of it, renamed or not (K25). A rename carries it; a reset starts a new one.
+        self.homes: dict[str, str] = dict(snap.get("homes") or {})
         # ("output" | "asset", name) -> the deploy number that last reset it:
         # removed, or (an output) moved to another store. An attempt launched
         # under an earlier one commits nothing of it.
@@ -739,6 +743,10 @@ class Model:
         for name in reset:
             self.reset_at[("output", name)] = self.deploy_number
         reset |= {k[0] for k in self.heads} - set(outputs)  # any other name no longer declared
+        for name in reset | (set(self.homes) - set(outputs)):
+            self.homes.pop(name, None)
+        for name in outputs:
+            self.homes.setdefault(name, name)
         producers = {outputs[name].get("asset") for name in reset if name in outputs} - {None}
 
         def gone(key) -> bool:
@@ -811,6 +819,9 @@ class Model:
                     table[target] = merge(table[target] + table.pop(key))
 
         move(self.heads, output_map, 0)
+        for old, new in output_map.items():
+            if old in self.homes and new not in self.homes:
+                self.homes[new] = self.homes.pop(old)
         move(self.indexes, output_map, 0)
         # A partition's record goes whole: a name that already has one keeps its own.
         move(self.partitions, asset_map, 0)

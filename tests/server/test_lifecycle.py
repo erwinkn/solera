@@ -7,8 +7,8 @@ import json
 
 from solera import lifecycle
 from solera.lifecycle import Ended
-from solera.sdk import Output, Project, Retry, asset
-from solera.stores import Patch
+from solera.sdk import Output, Project, Retry, StaticPartitions, asset
+from solera.stores import FileStore, Patch
 from solera_server.state import State
 from solera_worker.channel import LocalChannel
 from solera_worker.worker import run_attempt
@@ -330,4 +330,34 @@ async def test_a_renamed_asset_keeps_what_its_scope_owes(tmp_path):
     await engine.initialize()
     assert m.repairs[("catalog", "")][0]["attempt"] == "dead" and ("items", "") not in m.repairs
     assert [d["n"] for d in m.cleanups[("catalog", "")]] == [1] and ("items", "") not in m.cleanups
+    await state.close()
+
+
+async def test_a_renamed_outputs_new_partitions_go_where_its_old_ones_are(tmp_path):
+    """K25: a store keeps one output life in one place. `copy` writes
+    partition a; renamed `mirror`, it writes partition b for the first time:
+    b goes under copy/ beside a, not under mirror/, so a whole-output
+    cleanup of that life is one place."""
+
+    @asset(partitions={"site": StaticPartitions(["a"])})
+    def copy(ctx):
+        return {"site": ctx.partition}
+
+    @asset(partitions={"site": StaticPartitions(["a", "b"])}, aliases=["copy"])
+    def mirror(ctx):
+        return {"site": ctx.partition}
+
+    def project(one):
+        return Project(assets=[one], default_store=FileStore(tmp_path / "data"))
+
+    state = await State.open(tmp_path.as_uri(), "test", flush_interval=0.001)
+    engine = engine_for(state, project(copy), placement="inline")
+    await engine.initialize()
+    await engine.run_until((await engine.submit(["copy"], partitions=["a"]))["id"], 10)
+    engine = engine_for(state, project(mirror), placement="inline")
+    await engine.initialize()
+    await engine.run_until((await engine.submit(["mirror"], partitions=["b"]))["id"], 10)
+    handles = {p: state.model.heads[("mirror", p)]["ref"]["handle"] for p in "ab"}
+    assert all((h.get("base") or h["path"]).startswith("copy/") for h in handles.values()), handles
+    assert state.model.homes["mirror"] == "copy"
     await state.close()

@@ -306,13 +306,14 @@ class FileStore:
 
     @staticmethod
     def _base(output, context, prior) -> str:
-        """Where the partition's content lives: the prior's place, so a renamed
-        output keeps its objects where they are (§2)."""
+        """Where the partition's content lives: the prior's place, else under
+        the output life's home, so every partition of a renamed output stays
+        in one place (§2, K25)."""
 
         handle = (prior.handle or {}) if prior is not None else {}
         if "base" in handle or "path" in handle:
             return handle.get("base") or handle["path"]
-        name = _segment(output.name)
+        name = _segment(context.home or output.name)
         return f"{name}/{_segment(context.partition)}" if context.partition else name
 
     async def _put(self, base: str, value) -> None:
