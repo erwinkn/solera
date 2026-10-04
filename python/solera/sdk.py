@@ -1040,6 +1040,7 @@ class Asset:
         executor: Any = None,
         retries: Retry | None = None,
         timeout: float = 3600,
+        concurrency: int | None = None,
         version: str = "1",
         retention: Retention | None = None,
         automations: Any = (),
@@ -1061,6 +1062,13 @@ class Asset:
         self.executor = executor
         self.retries = retries or Retry()
         self.timeout = timeout
+        if concurrency is not None and (
+            isinstance(concurrency, bool) or not isinstance(concurrency, int) or concurrency < 1
+        ):
+            raise RegistrationError(
+                f"{self.name}: concurrency= is a positive number of partitions, not {concurrency!r}"
+            )
+        self.concurrency = concurrency  # partitions running at once, across runs: the engine holds the rest
         self.version = str(version)
         self.retention = retention
         if isinstance(automations, Automation):
@@ -1639,6 +1647,7 @@ class Project:
                 "placement": placement,
                 "retries": asset.retries.spec(),
                 "timeout": asset.timeout,
+                "concurrency": asset.concurrency,
                 "version": asset.version,
                 "retention": asset.retention.spec() if asset.retention else None,
                 "aliases": list(asset.aliases),

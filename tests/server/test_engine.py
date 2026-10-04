@@ -1413,3 +1413,42 @@ async def test_an_unchanged_keyed_write_still_applies_its_migrations(state):
     )
     await drive(engine2, await engine2.submit(["files"]))
     assert store.calls == ["files"]  # applied, and known to be: not asked again
+
+
+async def test_an_assets_concurrency_caps_its_partitions_running_at_once(state):
+    """`concurrency=2`: of three due partitions, two are claimed and run; the
+    third waits, held (`concurrency`), and runs as one of them ends. The
+    engine enforces it, across runs."""
+
+    from solera.sdk import RegistrationError
+
+    release, running, peak = asyncio.Event(), set(), [0]
+
+    @asset(partitions={"site": StaticPartitions(["a", "b", "c"])}, concurrency=2, retries=Retry(n=0))
+    async def slow(ctx):
+        running.add(ctx.partition)
+        peak[0] = max(peak[0], len(running))
+        await release.wait()
+        running.discard(ctx.partition)
+        return [1]
+
+    engine = make_engine(state, Project(assets=[slow]))
+    await engine.initialize()
+    run = await engine.submit(["slow"], partitions="all")
+    for _ in range(3000):
+        await engine.tick()
+        if len(running) == 2:
+            break
+        await asyncio.sleep(0.02)
+    for _ in range(20):  # it does not take a third, however many ticks
+        await engine.tick()
+        await asyncio.sleep(0.01)
+    assert len(running) == 2 and len(state.model.claims) == 2
+    waiting = [t for t in state.model.runs[run["id"]]["tasks"].values() if t["id"] not in state.model.claims]
+    assert [t.get("held") for t in waiting] == [["concurrency", "slow"]]
+    release.set()
+    detail = await drive(engine, run)
+    assert status_of(detail) == "succeeded" and peak[0] == 2
+
+    with pytest.raises(RegistrationError, match="positive number of partitions"):
+        asset(concurrency=0)(lambda: [1])

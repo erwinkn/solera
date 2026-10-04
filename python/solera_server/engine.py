@@ -542,12 +542,17 @@ class Engine(Attempts, Sensors, Staleness, Views):
 
     def _dispatch_due(self):
         """Claim the tasks that are due, as far as the engine, their
-        executors, their partitions and their outputs' merges allow. Those held back are recorded, with
-        why, when that changes."""
+        executors, their partitions, their assets' `concurrency=` and their outputs' merges allow.
+        Those held back are recorded, with why, when that changes."""
 
         now = self.clock()
         engine_used = len(self.engine_inflight)
         executor_used = dict(self.executor_inflight)
+        # Partitions of each asset claimed now, of its current life: what concurrency= caps.
+        asset_used: dict[str, int] = {}
+        for claimed in map(self.m.task, self.m.claims):
+            if claimed is not None and not self.m.earlier_life(claimed):
+                asset_used[claimed["asset"]] = asset_used.get(claimed["asset"], 0) + 1
         held = {}
         for task_id in self.m.due(now):
             task = self.m.task(task_id)
@@ -570,8 +575,11 @@ class Engine(Attempts, Sensors, Staleness, Views):
             is_pool = spec["kind"] == "Pool"
             holder = self.m.claimed_partitions.get((task["asset"], task["partition"]))
             behind = self._merges_behind(task)
+            cap = self.manifest["assets"][task["asset"]].get("concurrency")
             if holder is not None and self.m.claimed(holder) is not None:
                 held[task_id] = ["claim", holder]
+            elif cap is not None and asset_used.get(task["asset"], 0) >= cap:
+                held[task_id] = ["concurrency", task["asset"]]
             elif behind is not None:
                 held[task_id] = ["merges", behind]
             elif not is_pool and engine_used >= self.concurrency:
@@ -584,6 +592,7 @@ class Engine(Attempts, Sensors, Staleness, Views):
                 continue
             attempt = ulid(now)
             self.m.claim(task_id, attempt, now)
+            asset_used[task["asset"]] = asset_used.get(task["asset"], 0) + 1
             executor_used[executor] = executor_used.get(executor, 0) + 1
             engine_used += not is_pool
             self._spawn(task["run"], attempt, is_pool, executor, self._attempt(task_id, attempt, placement))

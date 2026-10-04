@@ -5,6 +5,7 @@
       "automations": [
         "fleet_dashboard.onchange.0"
       ],
+      "concurrency": null,
       "deps": [],
       "doc": "Partitioned upstream, unpartitioned consumer: the site dimension is collapsed.",
       "inputs": {
@@ -68,6 +69,7 @@
       "automations": [
         "graph_delta.every.0"
       ],
+      "concurrency": null,
       "deps": [],
       "doc": "Poll a site's Graph delta feed; the feed's cursor is the cursor.",
       "inputs": {},
@@ -131,6 +133,7 @@
       "automations": [
         "hillshade.every.0"
       ],
+      "concurrency": null,
       "deps": [
         "usgs_3dep_tiles"
       ],
@@ -193,6 +196,7 @@
     "leach": {
       "aliases": [],
       "automations": [],
+      "concurrency": null,
       "deps": [],
       "doc": "The resource tier lives on the asset; no job indirection.",
       "inputs": {
@@ -308,6 +312,7 @@
       "automations": [
         "manual_upload.every.0"
       ],
+      "concurrency": null,
       "deps": [],
       "doc": "Upload keys are registered externally by the uploads service.",
       "inputs": {},
@@ -367,6 +372,7 @@
       "automations": [
         "psa_mean_data.onchange.0"
       ],
+      "concurrency": null,
       "deps": [],
       "doc": "",
       "inputs": {
@@ -443,6 +449,7 @@
       "automations": [
         "qaqc_samples.onchange.0"
       ],
+      "concurrency": null,
       "deps": [],
       "doc": "One changed workbook of this site: its samples. Solera runs it for every\nfile_id written since, eight at a time, writes all of them in one\nstore write, and removes the samples of deleted workbooks; the store\nstamps `file_id` and `site`. A workbook that raises is recorded as a\nfailing key, and the others still commit.",
       "inputs": {
@@ -525,6 +532,7 @@
       "automations": [
         "region_rollup.onchange.0"
       ],
+      "concurrency": null,
       "deps": [],
       "doc": "Static partitions over a site-partitioned input.",
       "inputs": {
@@ -599,6 +607,7 @@
       "automations": [
         "site_health.onchange.0"
       ],
+      "concurrency": null,
       "deps": [],
       "doc": "In-database: a TableRef in, a query out; no row enters the worker.\nThe store materializes the SELECT into ops.site_health for this site.",
       "inputs": {
@@ -663,6 +672,7 @@
         "sites.cron.0",
         "sites.ondeploy.0"
       ],
+      "concurrency": null,
       "deps": [],
       "doc": "Refresh the SharePoint site list daily; new sites surface as missing work.",
       "inputs": {},
@@ -714,6 +724,7 @@
       "automations": [
         "weekly_report.cron.0"
       ],
+      "concurrency": null,
       "deps": [],
       "doc": "A job: inputs, placement and automations like an asset, no outputs.",
       "inputs": {
@@ -1004,7 +1015,7 @@
     "id": "snapshot",
     "source": "explicit"
   },
-  "deploy": "0f49ea19bfdaa11030a6a7c7b40731cb9d4104f863dabfea7ac330cbc2beadff",
+  "deploy": "a4440c2f200d7d31741126fd0a37e843ff87d5958b12026750e6480c33325464",
   "errors": [],
   "executors": {
     "ingest": {

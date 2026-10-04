@@ -92,6 +92,7 @@ async def qaqc_samples(ctx, qaqc_files: pd.DataFrame, sharepoint): ...
 | `partitions` | partition declaration (§7) | unpartitioned |
 | `executor` | placement (§10) | `Local()()` |
 | `retries` / `timeout` | `Retry(n, delay, backoff)` / seconds | `Retry(3)` / `3600` |
+| `concurrency` | at most this many of the asset's partitions run at once, across runs: the engine holds the rest, queued (`held: concurrency`), and dispatches them as running ones end. Not a per-key incremental input's `concurrency=`, which is keys at once within an attempt | `None` (no cap) |
 | `version` | opaque string; bump to rebuild: an asset change, so what the old version built is stale and the next run starts over (§6) | `"1"` |
 | `automations` | attached automations (§9) | `()` |
 
