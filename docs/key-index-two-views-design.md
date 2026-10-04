@@ -199,61 +199,131 @@ T's node for `[4, 5]` drops `d` (absent before 4, absent after 5). K at 5
 has no `d`: delivered live, absent now: removed. Without the K lookup the
 consumer would keep `d` forever.
 
-### Retention: the floor
+### Retention
 
-The **floor** is the oldest commit any reader may still start a T read from:
-the minimum of every consumer position (including a pass's start and a
-pattern change's split), K's base watermark `w + 1`, and every pinned K
-manifest's `w + 1`. T keeps every merged node that starts at or after the
-floor and every pack that ends at or after it (a reader positioned inside a
-pack reads its later sections); it deletes the rest.
+Phase 1 proposed one rule, "the floor": keep every level from the oldest
+reader's start. The review (A25) found two faults, and they changed the
+design:
 
-Why this is enough:
+- **R8: the base watermark held too much.** The floor included K's `w + 1`,
+  so T kept every level since the last base merge: ~431M entries at 100M
+  keys, not the 52M of a day. K needs only its **chain** (the nodes tiling
+  `w + 1` to the head), and a pinned snapshot only its own chain. Those are
+  now kept by name; the base watermark holds nothing else.
+- **R5: nothing bounded a stalled reader.** A reader that never moves keeps
+  every level from its start forever. My proposed cure (one node between
+  consecutive reader starts) was wrong: it loses a paused pass's end. A pass
+  over `[4, 7]` and one over `[4, 6]` need different answers from the same
+  merged node `[4, 15]`.
 
-- A cover for `[P, N]` with `P ≥ floor` only uses files starting at or after
-  `P`, or sections of the pack holding `P`. All exist (covers fall back to
-  smaller nodes where a level is not built yet).
-- New readers are born at the head + 1, above everything, so **the floor
-  never decreases** in the durable state. A file below the floor is garbage
-  forever.
-- **No reservation for landing points.** A keys= selection, a covering retry
-  or a pass's batch lands at the head + 1 at its claim. In T that commit is
-  above the floor by construction: nothing needs to remember it. (Spans need
-  every landing point reserved exactly, since merges coalesce across any
-  commit that is not an endpoint: A17's R5.)
+Three policies were then designed and measured. Each keeps K's chain and
+every pinned chain by name.
 
-What it costs: storage. With a reader a day behind, T holds every level's
-nodes for a day of commits: ~0.52 entries per live key at 100M (52M entries,
-~0.6 GB at ~11.5 B per node entry), ~40 at 1M (40M entries, ~0.5 GB)
-(replayed). A reader a week behind holds seven times that. Keeping only the
-nodes on each reader's path (the earlier study's "chains") cuts this, but
-brings back exact reservations for every reader. Storage is last in
-Erwin's priorities, so the floor wins. The physical budget still applies: a
-reader whose catch-up would cost more than a full pass is dropped to one.
+**1. A time window, and materialized seen-record bases (Erwin's; the primary
+policy).** T keeps every level of the last W commits and nothing older,
+with no reader awareness: the cut follows a plain schedule (tied to
+run-history retention). In the engine's seen-set model (D126) each consumer
+partition has a **seen record**, a base plus points plus ranges, whose base
+is normally a commit P decoded against upstream history. When the cut would
+pass P, retention first asks the engine to **materialize that base**: the
+key view as of P − 1, one key-sorted, single-version file, built from what T
+and K hold at that moment (the before-states of T's cover of `[P, head]`,
+laid over K at the head: one native net merge and one base-style merge). The
+index itself needs no reader awareness: the engine knows its seen records.
+The reader then catches up by merge-joining its materialized base with K at
+the head:
 
-If no consumer reads the index, the floor is `w + 1`: T holds only K's chain.
+| In the snapshot | In K at the head | Class |
+|---|---|---|
+| no | yes | added |
+| yes | no | removed |
+| yes, generation g | yes, generation g' ≠ g | updated (neither on a payload-bearing index if payloads are equal) |
+| yes, g | yes, g | not delivered |
+
+These are exactly `changes(P, head)`'s classes. The materialized base goes
+once the reader has moved past it. A full pass's pinned snapshot is the same
+concept, the key view as of a commit: there kept as K's own files, here
+written as one file.
+
+*Example.* T keeps 8,640 commits (a day). A consumer at P = 3,000 has not
+run since; at head 11,639 the cut reaches 3,000. The engine materializes its
+base, the 1M keys as of commit 2,999, and T drops commit 3,000. At head
+12,000 the consumer runs: it pages K at the head against that base, 100K
+keys at a time, both sides fetched together. `cust-…17` in both at
+generations 2,511 and 9,800: updated. In the head only: added. In the
+snapshot only: removed.
+
+What the reader still needs:
+
+- **read-ahead**: classed from K at N, as before (the head here);
+- **keys=**: each named key looked up in its base and in K at the head;
+- **a paused pass over `[P, N]` with N below the head**: its base at `P − 1`
+  and K pinned at N;
+- **an attempt that will land behind the cut** (claimed long ago and still
+  in flight): its landing point is a seen-record base like any other. The
+  engine materializes the bases the cut is about to pass, so it must know
+  every base older than the window: positions, passes' starts, and in-flight
+  claims' landing points. It never needs them younger than the window, and
+  never inside a merge.
+
+Costs, all measured below: one key-view copy written and stored per lagging
+reader (its materialized base) (spans keep at most about one version per key per lagging reader:
+D85); T's window (by the corrected model, entries per live key: 1 day 40.7 at
+1M and 0.52 at 100M; 7 days 288 and 4.2; 30 days 1,240 and 19.8; a window
+keeps every commit's changes at every level, which at 1M keys is 8.6 index
+copies a day per level); and a laggard's catch-up is a full scan of K and of
+its snapshot, whatever its lag.
+
+**2. Cover-based retention (the coordinator's; a secondary row).** T keeps,
+for every active reader interval (a consumer's `[position, head]`, a pass's
+`[start, N]` and its landing point, a pinned snapshot's chain), the units of
+its canonical cover, and deletes everything else. Nobody is dropped; files
+stay single-version and merges never look at readers. But every start, end
+and landing point must be known to the deletion rule: a reservation missed
+when the collector runs is a read that fails loudly (tested: a paused pass
+over `[4, 6]` with its end unreserved fails with "not held"), as in spans. It
+answers A25's counterexample exactly (tested: readers at 4 and 16, passes
+over `[4, 7]` and `[4, 6]` landing at 8 and 7, after every commit). Storage
+by the model: 19.3 entries per live key at 1M and 1.55 at 100M with 100
+daily readers; a lone laggard 10,000 behind keeps 4.9 (1M) and 0.10 (100M),
+100,000 behind 8.8 and 0.81.
+
+**3. A commit horizon (Erwin's earlier call; a secondary row, and an
+optional safety cap on 1 and 2).** A scheduled task drops any reader more
+than X commits behind the head (its next run is a full pass) and
+cancel-restarts a stalled pass past X; T keeps every level from the oldest
+remaining reader. Storage is policy 1's window with W = X. The cost is in
+the readers: a dropped per-key consumer, as built, re-runs every key's
+function in its full pass (a full pass of a per-key input keeps patch
+semantics but compares nothing with the upstream version,
+`per-key-processing.md`). The mitigation, each output key recording the
+upstream generation it was built from so a full pass re-runs only keys whose
+generation differs, costs a payload per output key (a few bytes of
+generation, kept in the output's key index) and partly reverses K47.
 
 ### T's state, names and builds
 
-T's state in the journal, per index: the floor, and per level the commit up
-to which nodes are built. Nothing per node. File names are computed:
-`t{j}-{start:012d}-e{epoch}.kx`, the epoch being the engine's fencing epoch
-(D86). The state records, per level, the commit from which each epoch built
-(a new entry only at a takeover). Readers get a per-level tail-size hint in
-the same state, so the first round trip is one suffix-range GET per file
-(`bytes=-hint`), which also returns the object's size.
+T's state in the journal, per index: per level the commit up to which nodes
+are built, and the window's cut. Nothing per node. File names are computed
+and carry the **index life** and the builder's epoch (A25 R4: a reset
+restarts commit numbers, so a name without the life could be a new life's
+pack for commits 0–3, deleted or overwritten by a paused old collector):
+`{life}/t{j}-{start:012d}-e{epoch}.kx`. No name is ever reused; publication
+checks the life, the exact input files and K's base watermark. The state
+records, per level, the commit from which each epoch built (a new entry only
+at a takeover), and a per-level tail-size hint, so the first round trip is one
+suffix-range GET per file (`bytes=-hint`), which also returns its size.
 
 Unpacked deltas (the commits since the last complete pack, normally ≤ 3)
 stay listed in the state, as today's newest spans are.
 
 **Builds.** When a pack's four commits are in, upkeep copies the four deltas
-into the pack and publishes it (one journal record, "level 1 built through
-c"). When four nodes of level j are built, it merges them into one level
-j + 1 node. A level above K's base level is built only while the floor is at
-or below its start (some reader is far enough behind to use it). Builds are
-deterministic: the same children give the same bytes, so a build retried or
-duplicated by a zombie is harmless, and each output still has a unique name
-by epoch.
+into the pack and publishes it. When four nodes of level j are built, it
+merges them into one level-j+1 node. Builds are deterministic: the same
+children give the same bytes. Every build and base merge upload is counted
+durably before it starts (A25 R6, D109's `MergeAttempted`), by index life
+and input files, and survives takeovers; failed and abandoned uploads count
+in the costs.
 
 **Indexes that skip commits** (a failure index, written only when keys
 fail): the state records skipped commit ranges, and a node whose range lies

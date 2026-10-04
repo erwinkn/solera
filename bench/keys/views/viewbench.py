@@ -356,12 +356,9 @@ async def read(root: Path, what: str, at: int | None) -> dict:
                 async for page in idx.changes(at, head, limit=PAGE):
                     yield page.keys, page.classes, page.generations, page.deleted
             else:
-                after, st = None, {}
+                after = None
                 while True:
-                    if at in v.snaps:
-                        page = await v.snapshot_changes(at, after, PAGE, st)
-                    else:
-                        page = await v.changes_page(at, head, after, PAGE)
+                    page = await v.changes_page(at, head, after, PAGE)
                     yield page.keys, page.classes, page.generations, page.deleted
                     if page.cursor is None:
                         return

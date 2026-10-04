@@ -104,23 +104,6 @@ async def history(
                 continue
             # A floor keeps every N; covers keep the reserved ends only.
             ends = range(p, c + 1) if retention == "floor" else (c if end is None else min(end, c),)
-            if p in v.snaps:  # behind the window: the snapshot, merge-joined with the head
-                want = classes(folds[p - 1], folds[c])
-                got, after, st = {}, None, {}
-                while True:
-                    page = await v.snapshot_changes(p, after, 7, st)
-                    for i, k in enumerate(page.keys):
-                        got[k] = page.classes[i]
-                        state = 0 if page.deleted[i] else page.generations[i]
-                        assert page.deleted[i] or state == folds[c].get(k, 0), (seed, c, p, k)
-                    if page.cursor is None:
-                        break
-                    after = page.cursor
-                assert got == want, (seed, c, p, "snapshot")
-                some = sorted(rng.sample(KEYS, 10))
-                one = await v.snapshot_changes_of(p, some)
-                assert dict(zip(one.keys, one.classes, strict=True)) == {k: x for k, x in want.items() if k in some}
-                continue
             if retention == "window":
                 ends = (c,)
             for n in ends:
@@ -155,7 +138,8 @@ def test_cover_retention_follows_the_fold(seed):
 
 @pytest.mark.parametrize("seed", range(6))
 def test_window_snapshots_follow_the_fold(seed):
-    # T keeps 6 commits; readers that fall behind it catch up from snapshots.
+    # T keeps 6 commits; readers that fall behind it catch up from their
+    # materialized bases (net change from their base to its end) and T.
     v = asyncio.run(history(400 + seed, b=2, commits=50, codec=2, retention="window", window=6))
     assert v.written["snapshot"].entries, "some reader fell behind the window"
 

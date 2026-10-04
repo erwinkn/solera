@@ -17,12 +17,13 @@
   - "cover": the units of the canonical cover of every active reader
     interval `[start, end]` (end None: the head), nothing else. Nobody is
     dropped; every start, end and landing point must be an interval.
-  - "window" (Erwin's refinement): T keeps the last `window` commits, with
-    no reader awareness. Before the cut passes a reader at P, the reader's
-    snapshot is written: the key view as of P - 1, one key-sorted file
-    (the before-states of T's cover of [P, head] laid over K at the head).
-    The reader then catches up by merge-joining its snapshot with K at the
-    head. A full pass's pin is the same concept, kept as files instead.
+  - "window" (Erwin's; D126, D133): T keeps the last `window` commits, with
+    no reader awareness. Before the cut passes a reader's base P, the engine
+    materializes its observation-record base: the keys changed between P and
+    the cut, each with its value at P (the before-image) and at the cut, as
+    one net-change file over [P, end]. The reader catches up with an
+    ordinary `changes` over that file and T's cover of [end + 1, head]. The
+    file is extended (one net merge) whenever the cut nears its end.
   K's base watermark holds only its chain, never every level since (A25 R8).
 
 A reader rebuilds a `TwoViews` from `to_json` and reads through `PackIO`,
@@ -35,7 +36,6 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass, replace
 
-import numpy as np
 from solera import _native
 from solera.keys.index import Changes, FileInfo, IndexState, KeyIndex, Options, Span
 from solera.keys.io import ObjectIO
@@ -103,7 +103,7 @@ class TwoViews:
         self.io, self.prefix, self.o, self.b, self.top = io, prefix, opts, b, top
         self.retention = retention
         self.window = 0
-        self.snaps: dict[int, list[FileInfo]] = {}  # reader start P -> the key view as of P - 1
+        self.snaps: dict[int, tuple[int, list[FileInfo]]] = {}  # base P -> (end, its net change over [P, end])
         self.base_o = replace(opts, bits_per_item=0)  # the base keeps no filter
         self.head = -1
         self.w = -1  # the base holds the state after commit w
@@ -133,7 +133,7 @@ class TwoViews:
             "packs": {str(s): [[c, _js(f)] for c, f in secs] for s, secs in self.packs.items()},
             "nodes": [[j, s, _js(f)] for (j, s), f in self.nodes.items()],
             "pins": {n: [w, _js(f), at] for n, (w, f, at) in self.pins.items()},
-            "snaps": {str(p): _js(f) for p, f in self.snaps.items()},
+            "snaps": {str(p): [e, _js(f)] for p, (e, f) in self.snaps.items()},
             "retention": self.retention,
             "window": self.window,
         }
@@ -142,7 +142,7 @@ class TwoViews:
     def from_json(cls, io: ObjectIO, opts: Options, d: dict) -> TwoViews:
         v = cls(io, d["prefix"], opts, b=d["b"], top=d["top"], retention=d.get("retention", "floor"))
         v.window = d.get("window", 0)
-        v.snaps = {int(p): _fi(f) for p, f in d.get("snaps", {}).items()}
+        v.snaps = {int(p): (e, _fi(f)) for p, (e, f) in d.get("snaps", {}).items()}
         v.head, v.w, v.base = d["head"], d["w"], _fi(d["base"])
         v.deltas = {int(c): _fi(f) for c, f in d["deltas"].items()}
         v.packs = {int(s): [(c, _fi(f)) for c, f in secs] for s, secs in d["packs"].items()}
@@ -356,32 +356,39 @@ class TwoViews:
         await self.io.delete([f"{self.prefix}{name}.kx"])
 
     async def _snapshots(self) -> None:
-        """Before the cut passes a reader, its snapshot; a snapshot whose
-        reader moved on goes."""
+        """Before the cut passes a reader's base P, its materialized base (the
+        net change over [P, head]); extended when the cut nears its end; gone
+        once the reader moved on."""
 
-        cut = self.floor()
+        cut, margin = self.floor(), self.b**2
         starts = {a for a, _ in self.intervals}
         for p in list(self.snaps):
             if p not in starts:
-                await self._delete(self.snaps.pop(p))
+                await self._delete(self.snaps.pop(p)[1])
         for p in sorted(starts):
-            if p < cut + self.b**2 and p not in self.snaps and p <= self.head:
-                # Due within the next few commits: T still covers [P, head].
-                self.snaps[p] = await self.snapshot(p)
+            if p >= cut + margin or p > self.head:
+                continue
+            have = self.snaps.get(p)
+            if have is None:
+                runs = self.runs(p, self.head)
+            elif have[0] + 1 < cut + margin and have[0] < self.head:
+                runs = self.runs(have[0] + 1, self.head) + [have[1]]
+            else:
+                continue
+            files = await self._merge(runs, f"s{p:012d}-{self.head:012d}")
+            self.written["snapshot"].add(files)
+            if have is not None:
+                await self._delete(have[1])
+            self.snaps[p] = (self.head, files)
 
-    async def snapshot(self, p: int) -> list[FileInfo]:
-        """The key view as of p - 1, written as one key-sorted file set."""
+    def reader_runs(self, first: int, last: int) -> list[list[FileInfo]]:
+        """What `changes(first, last)` reads: T's cover, or for a materialized
+        base, T's cover past its end and the base's file."""
 
-        cover = self.runs(p, self.head)
-        before = await self._merge(cover, f"s{p:012d}-before", before=True) if cover else []
-        k = self.k_runs()
-        files = await self._merge(
-            [before] + k if before else k, f"s{p:012d}", base=True, opts=self.base_o, ordered=False
-        )
-        self.written["snapshot"].add(files + before)
-        if before:
-            await self._delete(before)
-        return files
+        have = self.snaps.get(first)
+        if have is None or have[0] > last:
+            return self.runs(first, last)
+        return self.runs(have[0] + 1, last) + [have[1]]
 
     async def _collect(self) -> None:
         f, keep = self.floor(), self.chains()
@@ -413,13 +420,13 @@ class TwoViews:
             "packs": sum(size for _, size in self.pack_objs.values()),
             "nodes": sum(x.size for fs in self.nodes.values() for x in fs),
             "deltas": sum(x.size for fs in self.deltas.values() for x in fs),
-            "snapshots": sum(x.size for fs in self.snaps.values() for x in fs),
+            "snapshots": sum(x.size for _, fs in self.snaps.values() for x in fs),
         }
 
     # -- reading -------------------------------------------------------------------------------
 
     async def changes_page(self, first: int, last: int, after, limit: int) -> Changes:
-        runs = self.runs(first, last)
+        runs = self.reader_runs(first, last)
         if not runs:
             return Changes([], b"", [], b"", [], None)
         # One reader per cover across pages, as spans keep one KeyIndex: a
@@ -433,7 +440,7 @@ class TwoViews:
         return _net(Changes(list(ks), bytes(cs), list(gs), bytes(ds), list(ps), cursor))
 
     async def changes_of(self, first: int, last: int, keys: list[bytes]) -> Changes:
-        runs = self.runs(first, last)
+        runs = self.reader_runs(first, last)
         idx = self.index(runs)
         blocks, codecs = await idx._key_blocks(runs, keys)
         ks, cs, gs, ds, ps, _, _ = await in_thread(_native.span_changes, blocks, codecs, None, None, 2**62, 0, None)
@@ -446,83 +453,6 @@ class TwoViews:
             bytes(ds[i] for i in pick),
             [ps[i] for i in pick],
             None,
-        )
-
-    async def snapshot_changes(self, p: int, after, limit: int, state: dict) -> Changes:
-        """A page of a snapshot reader's catch-up: its snapshot (the key view
-        as of p - 1) merge-joined with K at the head. In the head only: added;
-        in the snapshot only: removed; in both at other generations: updated.
-        `state` keeps the two readers across pages."""
-
-        if "head" not in state:
-            state["head"] = self.index(self.k_runs())
-            state["snap"] = self.index([self.snaps[p]], self.base_o)
-            state["bk"], state["bg"] = np.empty(0, "S1"), np.empty(0, np.uint64)
-            state["snap_after"], state["snap_done"] = None, False
-        bk, bg = state["bk"], state["bg"]
-        ahead = None
-        if not state["snap_done"] and len(bk) <= limit:  # the snapshot's next page, beside the head's
-            (hk, hg, _, hnext), ahead = await asyncio.gather(
-                state["head"].page(after, limit), state["snap"].page(state["snap_after"], limit)
-            )
-        else:
-            hk, hg, _, hnext = await state["head"].page(after, limit)
-        hk = np.array(hk, dtype=object).astype(bytes) if hk else np.empty(0, "S1")
-        hg = np.array(hg, dtype=np.uint64)
-        hi = hk[-1] if hnext is not None and len(hk) else None
-        if after is not None and len(bk):
-            keep = bk > after
-            bk, bg = bk[keep], bg[keep]
-        while ahead is not None or (not state["snap_done"] and (hi is None or not len(bk) or bk[-1] <= hi)):
-            if ahead is None:
-                ahead = await state["snap"].page(state["snap_after"], limit)
-            ks, gs, _, nxt = ahead
-            ahead = None
-            if ks:
-                bk = np.concatenate([bk.astype(object), np.array(ks, dtype=object)]).astype(bytes)
-                bg = np.concatenate([bg, np.array(gs, dtype=np.uint64)])
-            state["snap_after"], state["snap_done"] = nxt, nxt is None
-        cut = len(bk) if hi is None else int(np.searchsorted(bk, hi, side="right"))
-        sk, sg = bk[:cut], bg[:cut]
-        state["bk"], state["bg"] = bk[cut:], bg[cut:]
-        # The merge-join, vectorised: both sides sorted, keys distinct.
-        at = np.searchsorted(sk, hk) if len(sk) else np.zeros(len(hk), dtype=np.int64)
-        inside = at < len(sk)
-        found = np.zeros(len(hk), dtype=bool)
-        found[inside] = sk[at[inside]] == hk[inside]
-        changed = ~found
-        changed[found] = sg[at[found]] != hg[found]
-        gone = np.ones(len(sk), dtype=bool)
-        gone[at[found]] = False
-        keys = np.concatenate([hk[changed].astype(object), sk[gone].astype(object)])
-        cls = np.concatenate([np.where(found[changed], UPDATED, ADDED), np.full(int(gone.sum()), REMOVED)]).astype(np.uint8)
-        gens = np.concatenate([hg[changed], sg[gone]])
-        dels = np.concatenate([np.zeros(int(changed.sum()), np.uint8), np.ones(int(gone.sum()), np.uint8)])
-        order = np.argsort(keys.astype(bytes), kind="stable")
-        return Changes(
-            [bytes(k) for k in keys[order]], cls[order].tobytes(), gens[order].tolist(), dels[order].tobytes(),
-            [None] * len(order), hnext,
-        )
-
-    async def snapshot_changes_of(self, p: int, keys: list[bytes]) -> Changes:
-        """keys= for a snapshot reader: each key looked up in its snapshot and
-        in K at the head."""
-
-        now, was = await asyncio.gather(
-            self.lookup(keys), self.index([self.snaps[p]], self.base_o).lookup(keys)
-        )
-        out = []
-        for k in sorted(set(keys)):
-            a, b = was.get(k), now.get(k)
-            if a is None and b is not None:
-                out.append((k, ADDED, b[0], 0))
-            elif a is not None and b is None:
-                out.append((k, REMOVED, a[0], 1))
-            elif a is not None and a[0] != b[0]:
-                out.append((k, UPDATED, b[0], 0))
-        return Changes(
-            [x[0] for x in out], bytes(x[1] for x in out), [x[2] for x in out], bytes(x[3] for x in out),
-            [None] * len(out), None,
         )
 
     async def lookup(self, keys: list[bytes], *, pin: str | None = None):
