@@ -40,26 +40,28 @@ async def key_index_probe(objects):
     """Index files are written create-only and read back by range (§6)."""
 
     from solera.keys import Rows
-    from solera.keys.index import IndexState, KeyIndex
     from solera.keys.io import ObjectIO
+    from solera.keys.layers import LayerIndex, LayerState
 
     io = ObjectIO(objects)
-    state = IndexState(prefix="conformance/keys/")
-    index = KeyIndex(io, None, state)
-    files, _ = await index.replace(Rows.keys([b"b", b"a"], b"1"), 0, uuid.uuid4().hex, generation=7)
+    state = LayerState(prefix="conformance/keys/", life="0")
+    name = f"{0:012d}-{uuid.uuid4().hex}"
+    files, _ = await LayerIndex(io, state).write_replace(
+        Rows.keys([b"b", b"a"], b"1"), name=name, generation=7
+    )
     state = state.committed(0, files)
     try:
-        index = KeyIndex(io, None, state)
-        keys, generations, versions, _ = await index.page(None, 10)
+        index = LayerIndex(io, state)
+        rows, _ = await index.delta(None, first=10)
         check(
-            keys == [b"a", b"b"] and generations == [7, 7] and versions == [b"1", b"1"],
+            [(r[0], r[3], r[4]) for r in rows] == [(b"a", 7, b"1"), (b"b", 7, b"1")],
             "Key index page read back wrong",
         )
         check(await index.lookup([b"b"]) == {b"b": (7, b"1")}, "Key index lookup read back wrong")
-        changes = await index.changes_page(0, 0, None, 10)
-        check(changes.keys == [b"a", b"b"], "Key index changes read back wrong")
+        rows, _ = await index.delta(None, keys=[b"a", b"c"])
+        check([r[0] for r in rows] == [b"a"], "Key index key list read back wrong")
     finally:
-        await io.delete([state.path(f.name) for f in state.files])
+        await io.delete([state.path(n) for n in state.referenced()])
 
 
 async def selftest(url):

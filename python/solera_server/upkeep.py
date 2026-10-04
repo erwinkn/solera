@@ -74,7 +74,9 @@ class Upkeep:
         self.jobs = Tasks("upkeep jobs")  # merges running, by (index key, lane)
         self.failing = {} if failing is None else failing  # what fails now, by name: the engine's
         self._checked: dict[tuple, LayerState] = {}  # the state last found needing nothing
-        self._busy: dict[tuple, frozenset] = {}  # the input layers (ids) of each merge running, by (key, lane)
+        self._busy: dict[
+            tuple, frozenset
+        ] = {}  # the input layers (ids) of each merge running, by (key, lane)
         self._swept = -math.inf
         self._alive = -math.inf
         self._orphans_at = -math.inf
@@ -123,7 +125,13 @@ class Upkeep:
             oldest = self.m.oldest_observed(*key)
             if oldest is not None and oldest > index.cut:
                 self.state.record(
-                    {"type": "IndexCut", "output": key[0], "partition": key[1], "life": index.life, "cut": oldest}
+                    {
+                        "type": "IndexCut",
+                        "output": key[0],
+                        "partition": key[1],
+                        "life": index.life,
+                        "cut": oldest,
+                    }
                 )
                 index = self.m.indexes[key]
             if len(self.jobs) >= self.concurrency:

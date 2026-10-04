@@ -1399,7 +1399,6 @@ async def _cleanup_due(spec, project, asset, objects, writes) -> dict:
     store and declaration of the output's asset. The engine runs no store
     code. Returns what was done, for the result."""
 
-
     declared = {o["name"]: o for o in project.manifest["assets"][asset.name]["outputs"]}
     decls = {o.name or asset.name: o for o in asset.outputs}
     cleaned_up, unresolved = {}, {}
