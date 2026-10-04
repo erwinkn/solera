@@ -14,7 +14,7 @@ from solera.stores import FileStore
 from solera_server.state import State
 
 from tests import staleness
-from tests.sim.oracle import index_entries, keyed_content
+from tests.sim.oracle import index_entries, keyed_content, value_content
 from tests.sim.project import External, SourceStore, rebuild
 
 from .engines import drive, make_engine
@@ -76,6 +76,7 @@ def project(
         added and removed (a full pass's first batch starts over)."""
 
         changes = ctx.batch["items"]
+        outside.tally.apply(changes)  # the ordered delivery check (A19)
         before = 0 if changes.full and changes.first else (await ctx.load() or {"rows": 0})["rows"]
         return {"rows": before + len(changes.added) - len(changes.removed)}
 
@@ -84,6 +85,7 @@ def project(
         return [{"v": row[0]["v"]}]
 
     outside.delivered = getattr(outside, "delivered", set())
+    outside.tally = getattr(outside, "tally", staleness.Holdings())  # what `tally` holds, from its batches
     outside.checked = getattr(outside, "checked", set())  # the keys `checks` was called on
     outside.started_over = getattr(outside, "started_over", False)
     return Project(
@@ -232,6 +234,25 @@ class Staleness(RuleBasedStateMachine):
         else:
             self._submit([name])
             self.ref.run_default(name)
+
+    @rule(keys=st.one_of(st.none(), st.sets(st.sampled_from(KEYS), min_size=1)))
+    def run_tally(self, keys):
+        """A19: `tally` keeps a count from the classes alone. Every batch's
+        classes agree with what it holds (added only what it lacks, updated
+        and removed only what it holds), and after a default run it holds
+        exactly `items`' keys, its count their number."""
+
+        self._submit(["tally"], keys={"items": {"keys": sorted(keys)}} if keys else None)
+        held = self.outside.tally
+        assert not held.wrong, (held.wrong, held.trace)
+        if keys is None:
+
+            async def exact():
+                items = set(await keyed_content(self.engine, self.project, "items"))
+                assert held.held == items, (held.trace, items)
+                assert (await value_content(self.engine, self.project, "tally"))["rows"] == len(items)
+
+            self._run(exact())
 
     @rule()
     def run_full(self):
@@ -684,8 +705,6 @@ async def test_a_count_kept_from_its_batches_stays_exact_through_a_keys_run(stat
     p = project(tmp_path, outside)
 
     async def tally(keys=None):
-        from tests.sim.oracle import value_content
-
         detail = await drive(engine, await engine.submit(["tally"], keys=keys))
         assert detail["request"]["status"] == "succeeded", detail["request"]
         return (await value_content(engine, p, "tally"))["rows"]

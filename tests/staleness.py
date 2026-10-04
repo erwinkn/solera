@@ -504,3 +504,30 @@ class Reference:
 
     def stale(self, name: str) -> bool:
         return bool(self.reasons(name))
+
+
+class Holdings:
+    """What the consumer holds, from its batches alone: each batch's classes
+    must agree with it — `added` a key it lacks, `updated` and `removed` one
+    it holds — and a start-over (`full and first`) empties it. The count it
+    keeps is its size. A disagreement is recorded, not raised: raised in the
+    producer, it would only fail the attempt."""
+
+    def __init__(self):
+        self.held: set[str] = set()
+        self.trace: list[tuple] = []
+        self.wrong: list[str] = []
+
+    def apply(self, batch) -> None:
+        if batch.full and batch.first:
+            self.held.clear()
+        added, updated, removed = set(batch.added), set(batch.updated), set(batch.removed)
+        self.trace.append((sorted(added), sorted(updated), sorted(removed)))
+        if added & self.held:
+            self.wrong.append(f"added again: {sorted(added & self.held)}")
+        if (updated | removed) - self.held:
+            self.wrong.append(f"never held: {sorted((updated | removed) - self.held)}")
+        self.held = (self.held | added) - removed
+
+    def check(self, keys: set[str]) -> None:
+        assert not self.wrong and self.held == keys, (self.wrong, self.trace)
