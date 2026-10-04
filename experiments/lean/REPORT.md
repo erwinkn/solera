@@ -8,7 +8,7 @@ of it in about 5 seconds.
 
 | # | Question | Answer | File |
 |---|---|---|---|
-| 1 | Does the balance guard bound writes when merged spans share keys? | Yes: at most `(16 + 10 log₂ K)` entries written per committed entry, for any adversarial order | `KeyIndex/WriteBound.lean` |
+| 1 | Does the balance guard bound writes when merged spans share keys, or drop superseded versions? | Yes: at most `(1 + 43R + 20R log₂ K)` entries written per committed entry (R attempts per merge), for any adversarial order | `KeyIndex/WriteBound.lean` |
 | 2 | Do merges that respect boundaries keep every catch-up range exactly tiled? | Yes, and a catch-up's spans merge to the per-commit fold | `KeyIndex/Tiling.lean` |
 | 3 | Is the read-ahead rule right with increasing generations? | Yes; and dropping added-then-removed entries breaks it (counterexample) | `KeyIndex/Keys.lean` |
 | 4 | Does a newest-first lookup over spans equal the fold at the head? | Yes | `KeyIndex/Keys.lean` |
@@ -24,66 +24,88 @@ random histories.
 smaller inputs, and every entry charged sits in a span that at least
 doubles. That holds when spans have disjoint keys. With shared keys, a
 merge's output can stay near its largest input's size, so nothing doubles.
+In the revised policy ("versions", `bench/keys/spans.py` at 9e8183d), a
+merge can even end up smaller than its largest input. When an endpoint
+retires, coalescing drops the superseded versions: a span holding the same
+N keys in two segments becomes N.
 
 **Why the bound survives.** Take a merge whose inputs hold S entries in
-all, m in the largest, and whose output holds u, with m ≤ u ≤ S. Either:
+all, m in the largest, and whose output holds u ≤ S. Either:
 
-- dedup removed at least a quarter of the inputs (u ≤ 3S/4). Then the cost
-  u is at most 4 × the entries that died, and an entry dies only once.
-  Example: a span of 1,000 keys merges with 300 updates of those same keys.
-  The output has 1,000 entries, 300 died, and 1,000 ≤ 4 × 300.
-- or the output kept more than 3/4 of them. Then every input other than the
-  largest grows by more than half (u > 1.5 x), since x ≤ S/2. A weight
-  ℓ(s) ≈ 2 log₂(K/s) per entry drops by at least 1 for each of those
-  entries, and the guard says they hold at least a fifth of S ≥ u.
+- at least a quarter of the inputs were dropped (u ≤ 3S/4). The dropped
+  entries pay, and each is a copy of one committed entry, dropped once.
+  Example: a span of 1,000 keys merges with 300 updates of those keys. The
+  output has 1,000 entries, and 300 were dropped.
+- or the output kept more than 3/4 of them. Then every input but the
+  largest grows by more than half (u > 1.5 x), since x ≤ S/2. A logarithmic
+  weight per entry drops for each of those entries, and the guard says they
+  hold at least a fifth of S ≥ u.
+
+The weight is a harmonic sum, `ℓ(s) = Σ_{j=s+1..K} ⌊4K/j⌋` ≈ 4K ln(K/s).
+It drops by at least K when a span grows by half. When a span shrinks it
+rises smoothly, by at most 4K per entry removed, and the dropped entries pay
+for that too. A floored log₂ weight would jump at powers of two, and a span
+shrinking by one entry across such a jump would be unaffordable. That's why
+the first version of this proof, which assumed outputs never shrink, used
+log₂ and this one doesn't.
 
 A merge into the base is guarded on the base, so it costs at most 5× the
 newer entries it absorbs, and those leave the newer spans for good. It may
-also drop tombstones.
+also drop tombstones and versions.
 
 **The model.** Spans are only their sizes, so the theorem covers every set
-of keys. Steps:
+of keys and versions. Steps:
 
-- `commit n`: a span of `n ≤ K` entries at the head;
-- `merge`: any run of adjacent spans `l1 ++ m :: l2`, with `m` the largest,
-  `5m ≤ 4·S` (the guard), and an output of `u` entries with `m ≤ u ≤ S` and
-  `u ≤ K`;
+- `commit n`: a span of `n ≤ K` entries at the head, written once;
+- `merge`: any run of adjacent spans `l1 ++ m :: l2`, with `m` the largest
+  and `5m ≤ 4·S` (the guard), and an output of any `u ≤ S`, `u ≤ K`,
+  attempted `a ≤ R` times, each attempt writing `u`;
 - `base`: the base and the oldest spans, with `5·base ≤ 4·(base + Σ)` and
-  any output up to `base + Σ`.
+  any output up to `base + Σ`, attempted `a ≤ R` times.
 
 Boundaries, size classes and the cap decide which guarded merges happen,
-never what one costs. So the adversary may choose any sequence.
+never what one costs. So the adversary may choose any sequence. (In the
+revised policy the cap never merges; it only drops a position.)
 
 **Theorems.**
 
 ```lean
-theorem merge_pays : u + 5 * (u * ℓ u) + 4 * u ≤ 4 * S + 5 * pot inputs
-theorem write_bound (h : Reach w s) :
-    s.written ≤ 6 * s.committed + 5 * s.injected ∧
-    s.written ≤ (6 + 5 * w.ℓ 1) * s.committed
-theorem write_bound_log2 (h : Reach (log2Weight K) s) :
-    s.written ≤ (16 + 10 * Nat.log2 K) * s.committed
+theorem merge_pays : M·u + 5·(u·ℓ u) + 23·(M·u) ≤ 23·(M·S) + 5·pot inputs
+theorem write_bound (h : Reach w R s) :
+    M · written ≤ (1 + 23 R) · (M · committed) + 5 R · (committed · ℓ 1)
+theorem write_bound_log2 (hK : 0 < K) (h : Reach (harmonic K) R s) :
+    written ≤ (1 + 43 R + 20 R log₂ K) · committed
 ```
 
-`written` counts every entry written: the commits' own spans, merges and
-base merges. `injected` is `Σ n·ℓ(n)` over commits, so larger commits
-earn a tighter bound. `K` bounds a span's entries; the distinct keys ever
-committed will do. `write_bound` holds for any weight that never rises with
-size and drops by one when a span grows by more than half.
-`log2Weight K` is one such weight: `ℓ(s) = 2 log₂ K + 2 − log₂(s²)`.
+`written` counts every entry written: commits, and every attempt of every
+merge and base merge. `write_bound` holds for any weight with the three
+properties: it never rises with size, it drops by `M` when a span grows
+by half, and a span's total weight rises by at most `4M` per entry removed.
+`harmonic K` is one such weight.
 
-**What the numbers mean.** At K = 10⁸ (log₂ K = 26), at most 276 written per
-committed entry, or 181 with commits of 1,000 entries. This is a worst-case
-guarantee and the constants are loose. The design's replays measure
-10–17×, and its adversarial release orders 1.0–3.9×. A logarithm is
-unavoidable: guarded pairwise merges of equal disjoint spans rewrite each
-entry log₂ K times. Without the guard there is no bound. That was the
-reviewer's 265× case, a big span rewritten once per released boundary.
+**What K is.** K bounds a span's entries. With one version per segment, a
+span can hold several entries per key, so the distinct keys no longer bound
+it. Each entry is a copy of a distinct committed entry, though, so the total
+committed over the horizon always works. So does the distinct keys times
+(1 + the endpoints live inside a span).
 
-**Hypothesis to keep true.** Every merge obeys the guard, on actual
-entries, including into-the-oldest, base and cap-driven merges. I've asked
-the design thread to confirm the revised policy has no exception. The
-theorem says nothing about an unguarded merge.
+**What the numbers mean.** With R = 1 and K = 10⁹: at most 44 + 20·29 = 624
+written per committed entry. This is a worst-case guarantee and the
+constants are loose. The design's replays measure 10–17×, and its
+adversarial release orders 1.0–3.9×. The log factor is unavoidable: guarded
+pairwise merges of equal disjoint spans rewrite each entry log₂ K times.
+Without the guard there is no bound. That was the reviewer's 265× case, a
+big span rewritten once per released boundary.
+
+**Hypotheses to keep true.**
+
+- Every merge obeys the guard, on the inputs' actual entries before dedup.
+  The design thread confirmed this: `Sim.allowed` checks it before every
+  merge (oldest-absorbs, the window of 4, the base). There are no forced or
+  cap-driven merges.
+- Attempts per published merge are bounded by R. Work on merges that never
+  publish (an upload that is abandoned, not retried) isn't covered. The
+  engine has to cap it, or count it against a merge that does publish.
 
 ## 2. The tiling invariant
 
@@ -203,8 +225,9 @@ result.
    predecessor. Check it differentially against the Lean model, as above.
    Results 2–4 depend on it.
 2. **The guard on every merge.** Largest input ≤ 4 × the others, on actual
-   entries, for every kind of merge. Assert it when planning, and again when
-   installing. Result 1 depends on it.
+   entries before dedup, for every kind of merge. Assert it when planning,
+   and again when installing. Bound the attempts per merge, and don't let
+   abandoned merges write without limit. Result 1 depends on it.
 3. **Boundaries.** Born only at head + 1, and an attempt's reservation is
    taken at its claim. Installing a merge asserts that no live boundary
    starts any input but the first. A base merge asserts that none starts any
@@ -221,12 +244,13 @@ result.
 
 ## Effort
 
-About 40 minutes of agent time, 01:31 to 02:12 CEST, after the Bend
+About an hour of agent time, 01:31 to 02:35 CEST, after the Bend
 experiment (`../bend/REPORT.md`). Failing check rounds, per file:
 
 | File | Rounds | What failed |
 |---|---|---|
-| WriteBound | 3 | missing core lemmas (`List.le_sum_of_mem`, `Nat.log2_one`); `simp [Nat.log2]` unfolds the definition; one coefficient rewrite |
+| WriteBound, first version | 3 | missing core lemmas (`List.le_sum_of_mem`, `Nat.log2_one`); `simp [Nat.log2]` unfolds the definition; one coefficient rewrite |
+| WriteBound, shrinking merges and retries (02:15 to 02:35) | 5 | a muddled case split, rethought before it ran; `Nat.succ_mul` rewrote `4 * K`; a structure field `M` that `omega` saw as an unknown; an implicit size in a `rw`; ring identities, which `grind` proves where `omega` can't |
 | Tiling | 3 | `seg_append`'s index arithmetic; `cover` of an append; a misplaced doc comment |
 | Keys, lookup | 3 | the base's normalisation: `st` can tell a tombstone from no entry, so the last step had to go through `live`; `mergeAll`'s equation lemma |
 | Keys, read-ahead | 2 | `if` on a `Prop` needs `Classical`; one `le_refl` |
