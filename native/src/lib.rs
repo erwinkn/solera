@@ -14,6 +14,7 @@ pub mod delta;
 pub mod entries;
 pub mod format;
 pub mod jobs;
+pub mod layers;
 pub mod local;
 pub mod rows;
 pub mod sort;
@@ -2022,6 +2023,7 @@ fn solera_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("LimitError", m.py().get_type::<LimitError>())?;
     m.add("LocalError", m.py().get_type::<LocalError>())?;
     m.add_class::<SortedEntries>()?;
+    layers::register(m)?; // W57 prototype: stamped layers
     m.add_class::<Sparse>()?;
     m.add_function(wrap_pyfunction!(encode_file, m)?)?;
     m.add_function(wrap_pyfunction!(write_files, m)?)?;
