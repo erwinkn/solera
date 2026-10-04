@@ -622,9 +622,18 @@ pub struct Writer {
     file: FileBuf,
     pub files: VecDeque<Vec<u8>>,
     pub entries: u64,
+    /// Format v4 (`v4.rs`): a key may repeat, its generations strictly decreasing.
+    repeats: bool,
+    prev_generation: u64,
 }
 
 impl Writer {
+    /// A writer for format v4: a key may repeat, newest version first.
+    pub fn repeating(mut self) -> Writer {
+        self.repeats = true;
+        self
+    }
+
     pub fn new(o: Options, max_file_bytes: usize) -> Writer {
         Writer {
             o,
@@ -638,6 +647,8 @@ impl Writer {
             file: FileBuf::default(),
             files: VecDeque::new(),
             entries: 0,
+            repeats: false,
+            prev_generation: 0,
         }
     }
 
@@ -649,13 +660,25 @@ impl Writer {
         payload: Option<&[u8]>,
         predecessor: Option<u64>,
     ) -> Result<()> {
-        if self.started && key <= self.prev.as_slice() {
+        let out_of_order = if self.repeats {
+            key < self.prev.as_slice()
+                || (key == self.prev.as_slice() && generation >= self.prev_generation)
+        } else {
+            key <= self.prev.as_slice()
+        };
+        if self.started && out_of_order {
             return Err(Error::Value(format!(
-                "keys must be strictly increasing: {:?} then {:?}",
+                "keys must be strictly increasing{}: {:?} then {:?}",
+                if self.repeats {
+                    " (a repeated key's generations decreasing)"
+                } else {
+                    ""
+                },
                 String::from_utf8_lossy(&self.prev),
                 String::from_utf8_lossy(key)
             )));
         }
+        self.prev_generation = generation;
         let shared = if self.count == 0 {
             self.first.clear();
             self.first.extend_from_slice(key);

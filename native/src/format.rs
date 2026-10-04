@@ -701,11 +701,7 @@ pub type Classed = ([u64; 4], Vec<Vec<u8>>, Vec<u8>);
 /// after the newest: 0 added, 1 updated, 2 removed, 3 neither (added and
 /// removed within the range). Returns the counts, and the keys and classes
 /// with `with_keys`.
-pub fn presence(
-    runs: &[Vec<&[u8]>],
-    codecs: &[u8],
-    with_keys: bool,
-) -> Result<Classed> {
+pub fn presence(runs: &[Vec<&[u8]>], codecs: &[u8], with_keys: bool) -> Result<Classed> {
     let mut m = fed(runs, codecs)?;
     let (mut counts, mut keys, mut classes) = ([0u64; 4], Vec::new(), Vec::new());
     loop {

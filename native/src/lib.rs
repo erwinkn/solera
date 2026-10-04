@@ -20,6 +20,7 @@ pub mod rows;
 pub mod sort;
 pub mod sparse;
 pub mod stream;
+pub mod v4;
 
 use std::sync::Arc;
 
@@ -465,6 +466,209 @@ fn presence<'py>(
             counts.to_vec(),
             list_of_bytes(py, &keys)?,
             PyBytes::new(py, &classes),
+        ))
+    })
+}
+
+/// Format v4 prototype (`v4.rs`): adjacent spans (`runs`, newest first)
+/// merged into one span's files, keeping the versions the live `endpoints`
+/// (generations) see; `base` when the output starts at commit 0. Returns the
+/// files and their entry count.
+#[pyfunction]
+#[pyo3(signature = (runs, codecs, endpoints, base, block_size=65536, level=1, bits_per_item=14, k=10, codec=1, max_file_bytes=67108864))]
+#[allow(clippy::too_many_arguments)]
+fn v4_merge<'py>(
+    py: Python<'py>,
+    runs: Vec<Vec<PyBackedBytes>>,
+    codecs: Vec<u8>,
+    endpoints: Vec<u64>,
+    base: bool,
+    block_size: usize,
+    level: u32,
+    bits_per_item: u64,
+    k: u8,
+    codec: u8,
+    max_file_bytes: usize,
+) -> PyResult<(Bound<'py, PyList>, u64)> {
+    guard(|| {
+        let o = options(block_size, level, bits_per_item, k, codec);
+        let (files, entries) = py
+            .detach(|| {
+                let runs: Vec<Vec<&[u8]>> = runs.iter().map(|r| slices(r)).collect();
+                v4::merge(&runs, &codecs, &endpoints, base, o, max_file_bytes)
+            })
+            .map_err(to_py)?;
+        Ok((list_of_bytes(py, &files)?, entries))
+    })
+}
+
+/// Format v4 prototype: a page of `changes(P, N)` over the spans overlapping
+/// `[P, N]` (`runs`, newest first, each holding its blocks for the key window
+/// `(after, bound)`), clipped to generations `[g_p, g_n1)`: every key that
+/// changed in the range, its class (0 added, 1 updated, 2 removed, 3
+/// neither: a read-ahead may still need it), the generation, deleted flag
+/// and payload of its state at N; the last key examined; whether more
+/// follow.
+#[pyfunction]
+#[pyo3(signature = (runs, codecs, after, bound, limit, g_p, g_n1))]
+#[allow(clippy::type_complexity, clippy::too_many_arguments)]
+fn v4_changes<'py>(
+    py: Python<'py>,
+    runs: Vec<Vec<PyBackedBytes>>,
+    codecs: Vec<u8>,
+    after: Option<PyBackedBytes>,
+    bound: Option<PyBackedBytes>,
+    limit: usize,
+    g_p: u64,
+    g_n1: u64,
+) -> PyResult<(
+    Bound<'py, PyList>,
+    Bound<'py, PyBytes>,
+    Vec<u64>,
+    Bound<'py, PyBytes>,
+    Bound<'py, PyList>,
+    Option<Bound<'py, PyBytes>>,
+    bool,
+)> {
+    guard(|| {
+        let page = py
+            .detach(|| {
+                let runs: Vec<Vec<&[u8]>> = runs.iter().map(|r| slices(r)).collect();
+                v4::page(
+                    &runs,
+                    &codecs,
+                    after.as_deref(),
+                    bound.as_deref(),
+                    limit,
+                    |vs| v4::change(vs, g_p, g_n1).map(|(class, v)| (class, v.clone())),
+                )
+            })
+            .map_err(to_py)?;
+        let p = page;
+        let keys: Vec<Vec<u8>> = p.items.iter().map(|(k, _)| k.clone()).collect();
+        let classes: Vec<u8> = p.items.iter().map(|(_, (c, _))| *c).collect();
+        let gens: Vec<u64> = p.items.iter().map(|(_, (_, v))| v.generation).collect();
+        let deleted: Vec<u8> = p.items.iter().map(|(_, (_, v))| v.deleted as u8).collect();
+        Ok((
+            list_of_bytes(py, &keys)?,
+            PyBytes::new(py, &classes),
+            gens,
+            PyBytes::new(py, &deleted),
+            payload_list(py, p.items.iter().map(|(_, (_, v))| v.payload.as_deref()))?,
+            p.last.map(|k| PyBytes::new(py, &k)),
+            p.more,
+        ))
+    })
+}
+
+/// Format v4 prototype: a page of the live keys at a reserved endpoint (each
+/// key's newest version older than `g_bound`; `2**64 - 1`: the head), over
+/// `runs` newest first: keys, generations, payloads, the last key examined,
+/// whether more follow.
+#[pyfunction]
+#[pyo3(signature = (runs, codecs, after, bound, limit, g_bound))]
+#[allow(clippy::type_complexity, clippy::too_many_arguments)]
+fn v4_scan<'py>(
+    py: Python<'py>,
+    runs: Vec<Vec<PyBackedBytes>>,
+    codecs: Vec<u8>,
+    after: Option<PyBackedBytes>,
+    bound: Option<PyBackedBytes>,
+    limit: usize,
+    g_bound: u64,
+) -> PyResult<(
+    Bound<'py, PyList>,
+    Vec<u64>,
+    Bound<'py, PyList>,
+    Option<Bound<'py, PyBytes>>,
+    bool,
+)> {
+    guard(|| {
+        let p = py
+            .detach(|| {
+                let runs: Vec<Vec<&[u8]>> = runs.iter().map(|r| slices(r)).collect();
+                v4::page(
+                    &runs,
+                    &codecs,
+                    after.as_deref(),
+                    bound.as_deref(),
+                    limit,
+                    |vs| v4::at(vs, g_bound).filter(|v| !v.deleted).cloned(),
+                )
+            })
+            .map_err(to_py)?;
+        let keys: Vec<Vec<u8>> = p.items.iter().map(|(k, _)| k.clone()).collect();
+        let gens: Vec<u64> = p.items.iter().map(|(_, v)| v.generation).collect();
+        Ok((
+            list_of_bytes(py, &keys)?,
+            gens,
+            payload_list(py, p.items.iter().map(|(_, v)| v.payload.as_deref()))?,
+            p.last.map(|k| PyBytes::new(py, &k)),
+            p.more,
+        ))
+    })
+}
+
+/// Format v4 prototype: each of `keys` (sorted) at a reserved endpoint, over
+/// `runs` newest first holding every block that may contain them: its
+/// columns: found (one byte per key), generation, deleted, payload, where a
+/// key is found if some version precedes `g_bound`.
+#[pyfunction]
+#[pyo3(signature = (runs, codecs, keys, g_bound))]
+#[allow(clippy::type_complexity)]
+fn v4_lookup<'py>(
+    py: Python<'py>,
+    runs: Vec<Vec<PyBackedBytes>>,
+    codecs: Vec<u8>,
+    keys: Vec<PyBackedBytes>,
+    g_bound: u64,
+) -> PyResult<(
+    Bound<'py, PyBytes>,
+    Vec<u64>,
+    Bound<'py, PyBytes>,
+    Bound<'py, PyList>,
+)> {
+    guard(|| {
+        let found = py
+            .detach(|| -> format::Result<Vec<Option<v4::Version>>> {
+                let runs: Vec<Vec<&[u8]>> = runs.iter().map(|r| slices(r)).collect();
+                let mut g = v4::Groups::new(&runs, &codecs)?;
+                let mut out = vec![None; keys.len()];
+                let mut i = 0;
+                while i < keys.len() {
+                    let Some((key, versions)) = g.next_group()? else {
+                        break;
+                    };
+                    while i < keys.len() && keys[i].as_ref() < key.as_slice() {
+                        i += 1;
+                    }
+                    if i < keys.len() && keys[i].as_ref() == key.as_slice() {
+                        out[i] = v4::at(&versions, g_bound).cloned();
+                        i += 1;
+                    }
+                }
+                Ok(out)
+            })
+            .map_err(to_py)?;
+        let found_flags: Vec<u8> = found.iter().map(|v| v.is_some() as u8).collect();
+        let gens: Vec<u64> = found
+            .iter()
+            .map(|v| v.as_ref().map_or(0, |v| v.generation))
+            .collect();
+        let deleted: Vec<u8> = found
+            .iter()
+            .map(|v| v.as_ref().is_some_and(|v| v.deleted) as u8)
+            .collect();
+        Ok((
+            PyBytes::new(py, &found_flags),
+            gens,
+            PyBytes::new(py, &deleted),
+            payload_list(
+                py,
+                found
+                    .iter()
+                    .map(|v| v.as_ref().and_then(|v| v.payload.as_deref())),
+            )?,
         ))
     })
 }
@@ -1829,6 +2033,10 @@ fn solera_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(merge_range, m)?)?;
     m.add_function(wrap_pyfunction!(presence, m)?)?;
     m.add_function(wrap_pyfunction!(merge_ranges, m)?)?;
+    m.add_function(wrap_pyfunction!(v4_merge, m)?)?;
+    m.add_function(wrap_pyfunction!(v4_changes, m)?)?;
+    m.add_function(wrap_pyfunction!(v4_scan, m)?)?;
+    m.add_function(wrap_pyfunction!(v4_lookup, m)?)?;
     m.add_function(wrap_pyfunction!(merge_page, m)?)?;
     m.add_function(wrap_pyfunction!(filter_nbits, m)?)?;
     m.add_function(wrap_pyfunction!(_panic, m)?)?;
