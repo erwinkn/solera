@@ -29,6 +29,7 @@ from solera.sdk import (
     Every,
     In,
     Incremental,
+    Loaded,
     OnChange,
     Output,
     Project,
@@ -41,7 +42,7 @@ from solera.sdk import (
     job,
     sensor,
 )
-from solera.stores import MISSING, FileStore, Keys, Patch, by_key_type
+from solera.stores import FileStore, Patch
 
 from .stores import Database, TableStore
 
@@ -104,22 +105,19 @@ FLAKY = {
 
 class SourceStore(FileStore):
     """A keyed source's rows live elsewhere, and are read as they are now
-    (docs/versions.md §6): a load answers each selected key the outside
-    holds with its current value — which may be newer than the commit that
-    named it."""
+    (docs/versions.md §6): it serves each asked key the outside holds with
+    its current value — which may be newer than the commit that named it —
+    at that value as its version, as the source's commits name them."""
 
     def __init__(self, path, outside: External):
         super().__init__(path)
         self.outside = outside
 
-    async def load(self, ref, t, selection):
-        current = self.outside.feed if ref.output == "feed" else self.outside.keys
-        rows = []
-        if isinstance(selection, Keys):
-            rows = [{"id": k, "v": current[k]} for k in sorted(selection.generations) if k in current]
-        if by_key_type(t) is not MISSING:  # dict[str, T]: each key's rows (a per-key page)
-            return {r["id"]: [r] for r in rows}
-        return rows
+    def serve(self, source, keys, ctx):
+        current = self.outside.feed if source.name == "feed" else self.outside.keys
+        return {
+            k: Loaded({"id": k, "v": current[k]}, version=current[k]) for k in keys or current if k in current
+        }
 
 
 def rebuild(changes, rows: list[dict]):

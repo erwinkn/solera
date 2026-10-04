@@ -343,9 +343,10 @@ async def test_replay_reproduces_the_live_model(tmp_path, clock):
         await engine.tick()
     await engine.tick()  # archive what finished
     await engine.stop()
-    # Workers outlive the engine's stop: each records its cleanups after its commit (D8).
-    # Snapshot only once they are done, or replay holds events the snapshot missed.
-    await worker_finished()
+    await worker_finished()  # workers outlive the engine's stop
+    # One small event after the last checkpoint, so that replay has a tail to apply.
+    state.record({"type": "AutomationChanged", "name": "polled.every.0", "enabled": True})
+    await state.durable()
     live = durable(state.model)
     await state.journal.close(checkpoint=False)  # no final checkpoint: replay applies the tail
     assert durable(state.model) == live, "something recorded after the snapshot"

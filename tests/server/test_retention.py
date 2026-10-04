@@ -135,13 +135,17 @@ async def test_source_commits_are_recorded_as_runs(state, clock):
     """§7: each source commit that changes something is a run with no tasks,
     saying who committed and what changed; the default policy expires it."""
 
-    from solera.sdk import Source
+    from solera.sdk import Loaded, source
 
     @asset(inputs={"uploads": Incremental()})
     def ingest(uploads: list):
         return []
 
-    project = Project(assets=[ingest], sources=[Source("uploads", key="id")], retention=Retention(days=1))
+    @source(key="id")
+    async def uploads(keys, ctx):
+        return {k: Loaded({"id": k}, version="1") for k in keys}
+
+    project = Project(assets=[ingest], sources=[uploads], retention=Retention(days=1))
     engine = engine_for(state, project, clock)
     await engine.initialize()
     first = await engine.commit_source("uploads", keys={"u-6": "1", "u-7": "1"}, by="sharepoint-webhook")

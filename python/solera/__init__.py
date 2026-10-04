@@ -13,6 +13,7 @@ from .sdk import (
     Every,
     In,
     Incremental,
+    Loaded,
     Migration,
     ObjectRef,
     Observed,
@@ -38,6 +39,7 @@ from .sdk import (
     digest,
     job,
     sensor,
+    source,
     split_partition,
 )
 from .stores import (
@@ -70,6 +72,7 @@ __all__ = [
     "K8sJob",
     "KEYS",
     "Keys",
+    "Loaded",
     "Local",
     "Migration",
     "Modal",
@@ -95,6 +98,7 @@ __all__ = [
     "WriteContext",
     "Sensor",
     "Source",
+    "source",
     "StaticPartitions",
     "Store",
     "StoreError",

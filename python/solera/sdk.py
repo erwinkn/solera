@@ -279,9 +279,12 @@ class DynamicPartitions(Output):
 
 
 class Source:
-    """An output with no producer (§5). With `observe=Every(…)`, a subclass's
-    `observe(ctx, …resources)` is called on that schedule and commits to the
-    source: sugar for a sensor `{name}.observe` (docs/lifecycle.md §11)."""
+    """An output with no producer (§5). Its data is loaded through its
+    store's `serve` or a function (`@source`), which says the version it
+    served (docs/stores.md, "Sources: how data is loaded"); `version` is the
+    loader's own. With `observe=Every(…)`, a subclass's `observe(ctx,
+    …resources)` is called on that schedule and commits to the source: sugar
+    for a sensor `{name}.observe` (docs/lifecycle.md §11)."""
 
     def __init__(
         self,
@@ -292,11 +295,13 @@ class Source:
         observe: Every | None = None,
         executor: Any = None,
         timeout: float = 60,
+        version: str = "1",
         **handle: Any,
     ):
         if not NAME.fullmatch(name):
             raise RegistrationError(f"Invalid source name: {name!r}")
         self.name, self.store, self.key, self.handle = name, store, key, dict(handle)
+        self.version, self.loader = str(version), None  # a function's, `@source`
         self.observing, self.executor, self.timeout = observe, executor, timeout
         if observe is not None and type(self).observe is Source.observe:
             raise RegistrationError(f"Source {name!r}: observe= needs a subclass that defines observe()")
@@ -347,6 +352,32 @@ class Source:
             partition="",
             meta={"source": True},
         )
+
+
+@dataclass(frozen=True)
+class Loaded:
+    """What a source's loader served: a key's row, or an unkeyed source's
+    value, with the version it was served at — the source's own word (an
+    etag, an `updated_at`). docs/stores.md, "Sources: how data is loaded"."""
+
+    value: Any
+    version: str | None = None
+
+
+def source(fn=None, *, key: str | None = None, version: str = "1"):
+    """A source loaded through a function, `async def name(keys, ctx)`.
+    Keyed, it is called with the keys a batch reads and returns `{key:
+    Loaded(row, version=…)}`: a key it leaves out was observed absent.
+    Unkeyed, it is called with None and returns the value, or
+    `Loaded(value, version=…)`. `version` is the loader's own: bump it when
+    what it serves for the same data changes."""
+
+    def wrap(f):
+        made = Source(f.__name__, key=key, version=version)
+        made.loader = f
+        return made
+
+    return wrap(fn) if fn is not None else wrap
 
 
 class _Unset:
@@ -493,7 +524,10 @@ class Batch:
       the producer — but for a full pass, which always reaches it, as one
       empty batch that is `full`, `first` and `final`: starting over must
       happen;
-    - `upstream`: facts about the upstream (`Upstream`).
+    - `upstream`: facts about the upstream (`Upstream`);
+    - `served` (a source's): the version each key was served at, as its
+      loader said; None for a key it did not have. Consumed by nothing yet:
+      the observed set's rebuild records it.
 
     A consumer that rebuilds starts over when `full and first`, appends every
     batch, and swaps or finalizes on `final`. One that keeps a total moves it
@@ -511,6 +545,7 @@ class Batch:
     count: int = 1
     final: bool = True
     upstream: Upstream = field(default_factory=Upstream)
+    served: dict = field(default_factory=dict)
 
     @property
     def first(self) -> bool:
@@ -1665,6 +1700,18 @@ class Project:
                     f"but the asset places it as {executor}"
                 )
             executors[placement["executor"]] = executor
+            for p, e in info["inputs"].items():
+                src = self.sources.get(getattr(e, "output", None) or p)
+                if src is None or src.key is None or src.key.startswith("<"):
+                    continue
+                store = self.stores.get(src.store or DEFAULT_STORE)
+                if src.loader is None and not callable(getattr(store, "serve", None)):
+                    if _load_intent(e, hints_by_asset[name].get(p)) == "data":
+                        raise RegistrationError(
+                            f"{name}: source {src.name!r} is keyed and loaded, but nothing says which version "
+                            "of a key it served: load it through a function (@source, returning Loaded(row, "
+                            'version=…)) or a store that serves versions (docs/stores.md, "Sources")'
+                        )
             manifest_assets[name] = {
                 "outputs": [o.spec(asset.name) for o in asset.outputs],
                 "inputs": {

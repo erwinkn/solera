@@ -13,7 +13,7 @@ from dataclasses import replace
 import pytest
 from solera.keys import resolver
 from solera.keys.index import KeyIndex, Options
-from solera.sdk import DynamicPartitions, Incremental, Output, Project, Ref, Source, asset
+from solera.sdk import DynamicPartitions, Incremental, Loaded, Output, Project, Ref, Source, asset, source
 from solera.stores import FileStore, Patch
 from solera_server.engine import Engine
 from solera_server.executors.inline import InlinePlacement
@@ -561,9 +561,11 @@ async def test_every_index_writer_waits_while_merges_are_far_behind(state, tmp_p
     async def checked(ctx, row: list):
         return [{"ok": True}]
 
-    project = Project(
-        assets=[checked], sources=[Source("uploads", key="id")], default_store=FileStore(tmp_path / "out")
-    )
+    @source(key="id")
+    async def uploads(keys, ctx):
+        return {k: Loaded({"id": k}, version="1") for k in keys}
+
+    project = Project(assets=[checked], sources=[uploads], default_store=FileStore(tmp_path / "out"))
     engine = engine_for(state, project)
     await engine.initialize()
     await engine.commit_source("uploads", upsert=["a"])
@@ -630,10 +632,10 @@ async def test_keyed_source_commits_go_through_the_index(state):
         return []
 
     class External(FileStore):
-        """The source's data lives elsewhere; loads answer from the selection."""
+        """The source's data lives elsewhere; it serves each asked key, at one version."""
 
-        async def load(self, ref, t, selection):
-            return [{"id": k} for k in selection.generations]
+        def serve(self, source, keys, ctx):
+            return {k: Loaded({"id": k}, version="1") for k in keys}
 
     project = Project(
         assets=[ingest], sources=[Source("uploads", key="id", store="ext")], stores={"ext": External()}

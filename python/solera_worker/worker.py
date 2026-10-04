@@ -83,6 +83,7 @@ from solera.tasks import Tasks, retrying
 from . import each
 from .observed import Observed
 from .reporting import LogShipper, Reporter
+from .sources import reader
 
 
 def _load_module(path: Path):
@@ -368,7 +369,7 @@ async def _resolve_inputs(spec, project, asset, keys_io, timeline, observed: Obs
                 if as_ref:
                     out[key] = ref
                     continue
-                store = project.stores[ref.store]
+                store = reader(project, ref)
                 out[key] = await _load_whole(
                     observed.load,
                     store,
@@ -382,7 +383,7 @@ async def _resolve_inputs(spec, project, asset, keys_io, timeline, observed: Obs
             timeline.add("loaded", param)
             continue
         ref = Ref.from_json(pin["ref"])
-        store = project.stores[ref.store]
+        store = reader(project, ref)
         if "batch" in pin:  # Incremental: selection + ctx.batch (§5.1)
             ch = pin["batch"]
             full = bool(ch.get("full"))
@@ -422,6 +423,7 @@ async def _resolve_inputs(spec, project, asset, keys_io, timeline, observed: Obs
                 count=int(ch.get("count") or 1),
                 final=after is None,  # the pass ran out: never inferred from `count`
                 upstream=Upstream(ref.output),
+                served=dict(getattr(store, "served", {})),  # a source's: what its loader served
             )
             delivered[param] = {"after": after, "upserted": sorted(upserted), "deleted": list(deleted)}
             if read.covers:

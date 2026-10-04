@@ -28,6 +28,8 @@ from solera.sdk import UNSET, Ref, Result
 from solera.stores import Keys, Patch, SourceBehind, missing_keys
 from solera.tasks import Tasks
 
+from .sources import reader
+
 WALK = 100  # failure records walked per retry batch, at most, for each key it may take
 INTERRUPTED = "interrupted"  # a key a drain stopped: canceled or timed out once the result is sealed
 LOOKAHEAD = 100_000  # index entries a batch examines at most, to fill itself and to prove it final
@@ -446,7 +448,7 @@ async def run(spec, project, asset, param: str, pin: dict, args: dict, ctx, keys
     batch = await read_each_batch(spec, pin, keys_io)
     timeline.add("loaded", param, len(batch.upserted))
     ref = Ref.from_json(pin["ref"])
-    store = project.stores[ref.store]
+    store = reader(project, ref)
     t = project.hints[asset.name].get(param)
     loaded = (
         await ctx._observed.load(store, ref, dict[str, t], Keys(batch.upserted)) if batch.upserted else {}

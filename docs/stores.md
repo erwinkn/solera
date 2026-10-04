@@ -306,6 +306,51 @@ attempt committed it, so lineage never claims content that was not read
 (`versions.md` §6). The conformance kit's
 `READS` scenario checks a store that defines `reads()`.
 
+## Sources: how data is loaded
+
+A source is an output Solera does not produce: its commits (`commit_source`,
+or a sensor's `observe()`) say which keys changed and at which version, and
+its data is read when a consumer loads it. Once data is loaded, the batch
+must know exactly which version it got, so every load of a keyed source
+reports, per key, the version it served — and a key it leaves out was
+observed absent.
+
+**Through a function.** `@source` makes a source whose loader is your
+function, called with the keys a batch reads (None for an unkeyed source)
+and a `ctx` naming the source and partition:
+
+```python
+@source(key="id", version="1")
+async def files(keys, ctx):
+    found = await sharepoint.stat_many(keys)
+    return {k: Loaded(read_row(f), version=f.etag) for k, f in found.items()}
+
+
+@source(version="2")
+async def rates(keys, ctx):
+    return Loaded(await fetch_rates(), version=await rates_revision())  # or just the value
+```
+
+A keyed function returns `{key: Loaded(row, version=…)}`; a row without
+its version fails the load. An unkeyed one returns the value, or
+`Loaded(value, version=…)`: the version is optional there, with one caveat —
+an edit reverted between the commit and the read can leave a consumer one
+revision ahead until the next change.
+
+**Through a store.** A store backs a keyed source when it defines
+`serve(source, keys, ctx)`, answering as a function does.
+
+**Refused at registration:** a keyed source that an asset loads as data
+when nothing can say which version it served — no function, and a store
+without `serve`. A source read only as a `Ref` loads nothing, so needs
+neither.
+
+**What the batch gets.** `ctx.batch[input].served` is each key's version
+as served (None where it was absent). Nothing consumes it yet: the
+observed set's rebuild records it as the batch's observations
+(`observed-set.md`). The loader's own `version=` is a code version: bump it
+when what it serves for the same data changes.
+
 ## Recipes
 
 ### A SQL table: `fence()` in every write transaction
