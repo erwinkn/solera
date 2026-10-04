@@ -120,7 +120,7 @@ class Upkeep:
                 )
                 continue
             self.failing.pop(f"key index {key[0]}/{key[1]} merges", None)
-            endpoints = self.m.endpoints(*key)
+            endpoints = set()  # CALIBRATION ONLY: merges keep no endpoint (never merge)
             planned = False
             for lane in ("base", "tail"):
                 if (key, lane) in self.jobs or len(self.jobs) >= self.concurrency:
