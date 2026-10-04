@@ -31,7 +31,9 @@ whose clock jumps to the next timer whenever nothing is ready, so ten minutes of
 heartbeats, retries and timeouts cost a few milliseconds, and `time.time()`
 reads the same clock. Nothing runs beside the loop: object requests are
 answered synchronously through obstore's blocking client, and work handed to a
-thread runs to its end while the loop waits. Attempt ids, worker id and
+thread runs to its end while the loop waits. The loop's order among independent
+callbacks is drawn from the run's seed (below, "Interleavings come from the
+seed"). Attempt ids, worker id and
 writer nonces come from the run's seed.
 
 **The fault plan.** Every object request an actor makes goes through
@@ -204,6 +206,30 @@ schedules, with who scheduled it, labelled by coroutine and line, never
 an address. The report shows the first place the two runs part. A
 compaction's own loop, which runs real threads while the simulation
 waits, is not traced: its order does not reach the simulation's.
+
+**Interleavings come from the seed.** asyncio runs ready callbacks in the
+order they were scheduled, so a fixed program gets one interleaving
+however often it runs. `SimLoop` instead draws each loop iteration's order
+from the run's seed (`_ReadyQueue` in `tests/sim/core.py`). Callbacks with
+one owner keep asyncio's order: a task's steps and what that task scheduled
+(so `call_soon(f)` then `await sleep(0)` still runs `f` first), and one
+future's callbacks. Only independent callbacks trade places: three tasks
+woken by one `Event.set()` run in any order, and so do timers due
+together. One seed, one order, so a failure still replays and shrinks.
+`SOLERA_SIM_ORDER=fifo` runs asyncio's own order.
+
+Measured before F34's fix, on 16 Hypothesis seeds of up to 150 examples ×
+40 steps (about 2,300–2,500 examples per side):
+
+| Order | Seeds that found F34 | Examples to the first find |
+|---|---|---|
+| asyncio's | 1 of 16 | 153 |
+| seeded | 4 of 16 | 24, 65, 144, 153 |
+
+With F26's fix undone (patched out in the sweep's process), neither order
+hit F26 in as many examples. The same sweep, under asyncio's order, found
+a worker reading a `checks` key-index file the engine had deleted; on
+current main it is checked separately.
 
 ## Stores: the generated kit
 

@@ -14,6 +14,7 @@ import contextlib
 import contextvars
 import json
 import logging
+import os
 import random
 from collections import deque
 from collections.abc import Callable
@@ -311,7 +312,9 @@ class World:
 
     def __init__(self, root: Path, seed: int, *, flush_interval=1.0, min_checkpoint=4096, key_options=None):
         self.root = root
-        self.loop = SimLoop()
+        # Ready callbacks interleaved from the run's seed (SOLERA_SIM_ORDER=fifo: asyncio's order).
+        order = None if os.environ.get("SOLERA_SIM_ORDER") == "fifo" else random.Random(seed ^ 0x0BDE5)
+        self.loop = SimLoop(order)
         self.rng = random.Random(seed)
         self.plan = FaultPlan(rng=random.Random(seed ^ 0x5EED))
         self.objects = Objects(self.loop, self.plan)

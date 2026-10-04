@@ -10,7 +10,9 @@ Determinism comes from three rules:
 - **Nothing runs beside the loop.** Object requests are answered
   synchronously (obstore's blocking calls against a real `file://` store)
   and work handed to a thread runs to completion while the loop waits, so
-  the loop's FIFO order is the only order there is.
+  the loop's order is the only order there is. That order is asyncio's
+  FIFO, or (`SimLoop(rng)`) one drawn from the run's seed among callbacks
+  that don't depend on each other: the same seed, the same order.
 - **Randomness is seeded.** ULIDs, worker id and writer nonces come
   from the example's RNG; faults and delays from the fault plan's.
 
@@ -22,6 +24,7 @@ killed (a crashed engine, a dead worker) can make no request at all.
 from __future__ import annotations
 
 import asyncio
+import collections
 import contextvars
 import functools
 import os
@@ -53,6 +56,70 @@ class Killed(BaseException):
 actor: contextvars.ContextVar[tuple | None] = contextvars.ContextVar("sim_actor", default=None)
 
 
+def _owner(handle, scheduler, i: int):
+    """What a ready callback's order is bound to. A task's steps keep their
+    order, and so does what a task schedules (asyncio's call_soon order within
+    a task); a future's callbacks keep theirs; anything else stands alone."""
+
+    bound = getattr(handle._callback, "__self__", None)
+    if isinstance(bound, asyncio.Task):
+        return id(bound)
+    if scheduler is not None:
+        return id(scheduler)
+    args = handle._args or ()
+    if args and isinstance(args[0], asyncio.Future):
+        return id(args[0])
+    return ("alone", i)
+
+
+class _ReadyQueue(collections.deque):
+    """The loop's ready callbacks. With an `rng`, each iteration's batch runs
+    in an order drawn from it: callbacks bound to one owner (`_owner`) keep
+    their order, and only independent ones trade places, as tasks woken in
+    one step or timers due together may. One seed, one order."""
+
+    def __init__(self, loop, rng=None):
+        super().__init__()
+        self.loop, self.rng = loop, rng
+        self.schedulers = collections.deque()  # beside each callback, the task that scheduled it
+        self.fresh = False  # a new iteration whose batch is not yet ordered
+
+    def append(self, handle):
+        super().append(handle)
+        self.schedulers.append(asyncio.current_task(self.loop))
+
+    def clear(self):
+        super().clear()
+        self.schedulers.clear()
+
+    def popleft(self):
+        if self.fresh and self.rng is not None and len(self) > 1:
+            self._shuffle()
+        self.fresh = False
+        self.schedulers.popleft()
+        return super().popleft()
+
+    def _shuffle(self):
+        groups: dict = {}  # owner -> its callbacks, in order; owners in order of first appearance
+        for i, (handle, scheduler) in enumerate(zip(self, self.schedulers, strict=True)):
+            groups.setdefault(_owner(handle, scheduler, i), []).append((handle, scheduler))
+        queues = [g[::-1] for g in groups.values()]
+        merged = []
+        while queues:  # each remaining callback equally likely to come next
+            pick = self.rng.randrange(sum(len(q) for q in queues))
+            for k, q in enumerate(queues):
+                if pick < len(q):
+                    merged.append(q.pop())
+                    if not q:
+                        del queues[k]
+                    break
+                pick -= len(q)
+        super().clear()
+        self.schedulers.clear()
+        super().extend(h for h, _ in merged)
+        self.schedulers.extend(t for _, t in merged)
+
+
 class _VirtualSelector:
     """A selector that never blocks: when nothing is ready it moves the
     loop's clock to the next timer instead of sleeping until it."""
@@ -62,6 +129,7 @@ class _VirtualSelector:
         self.loop: SimLoop | None = None
 
     def select(self, timeout=None):
+        self.loop._ready.fresh = True  # timers due join the batch next: order it at its first run
         events = self.real.select(0)
         if events or timeout == 0:
             return events
@@ -75,10 +143,11 @@ class _VirtualSelector:
 
 
 class SimLoop(asyncio.SelectorEventLoop):
-    def __init__(self):
+    def __init__(self, rng=None):
         selector = _VirtualSelector()
         super().__init__(selector)
         selector.loop = self
+        self._ready = _ReadyQueue(self, rng)  # rng None: asyncio's own order
         self._now = 0.0
         self.threaded = 0  # executor calls made: each ran to its end while the loop waited
 
