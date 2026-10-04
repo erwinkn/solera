@@ -5,7 +5,7 @@ read-ahead, passes and the staleness predicates with what this doc
 describes, step by step on `main`, over the index's Δ(P, H, keys)
 interface. It was revised after review A27 ("build with listed changes"),
 W36's model of it (`ObservedSet.tla`), Erwin's removal of the pass (a run
-keeps its cursor in memory, and each batch records what it observed at
+keeps only its progress, and each batch records what it observed at
 its own head), and his naming calls (D140); fenced stores' and sources'
 reads follow D144 and D146/D147. Names (D133): the **observed set** is
 what a consumer partition has processed, key → upstream version; its
@@ -122,9 +122,17 @@ interrupted keys are not observed, so they stay owed.
 ## A run
 
 A run computes what is owed by comparing upstream now, under the current
-patterns and context, with `decode(R)`. It processes the owed keys in key
-order, `batch_size` keys a commit. Its **cursor lives in the run's memory
-only**: nothing about the run is stored but what its batches commit.
+patterns and context, with `decode(R)`. Each of its tasks (one asset
+partition) walks the owed keys in key order, a **batch** at a time: up to
+`batch_size` keys, committed once; an **attempt** is one execution of a
+batch, and a retry another attempt of the same batch (D155). A task's
+**progress** — its last committed batch's index and end key — is run
+state, recovered from the run's own commit events (D154): an engine
+restart continues the walk from it, it ends with the run, and it is never
+part of the observation record, which keeps D139's rule exact: nothing
+about a walk is stored there. The walk is monotonic within a run; a new
+run walks from the beginning, cheaply, since observed ranges yield only
+their changes since their heads.
 
 **Each batch reads at its own head `H`**, pinned for that batch only by
 the claim's existing reader pin (A27 R6). The claim reserves `H` itself
@@ -147,8 +155,8 @@ points.
 
 A cancelled or failed run leaves its committed batches' ranges and
 points. The next run compares again: keys under those ranges decode at
-their heads, so the unchanged ones are not owed. No plan, cursor, pass or
-scan pin is stored, and none can be left stranded.
+their heads, so the unchanged ones are not owed. No plan, pass or scan pin
+is stored, and none can be left stranded.
 
 ## What a producer sees
 
@@ -466,8 +474,8 @@ refused by the commit check.
 
 **A takeover mid-run.** Batches 1 and 2 committed their overwrites;
 batch 3's attempt dies, writing none. The next engine decodes `R` to `S`;
-its next run owes batch 3's keys and whatever changed since, and needs
-nothing of the old run's cursor.
+the run continues from its task's progress (batch 2's end), and batch 3's
+keys and whatever changed since are its next batch's.
 
 **Per-key versus plain.** One observation record for both. For `checks`,
 failed keys are observed, retried by their failure records. For `tally`, `S`
@@ -526,7 +534,7 @@ Each goes from the docs and the glossary when the observed set is built
 
 | Today | With the observed set |
 |---|---|
-| Position: `next`, `pass` (`from`, `at`, `batch`, `pin`), `fingerprint`, `began`, `seen` | The base and ranges, each observed at a head; no pass, cursor or scan pin is stored; the `definition` (was `fingerprint`) stays: a change resets `R` |
+| Position: `next`, `pass` (`from`, `at`, `batch`, `pin`), `fingerprint`, `began`, `seen` | The base and ranges, each observed at a head; no pass or scan pin is stored, and a task's progress is run state; the `definition` (was `fingerprint`) stays: a change resets `R` |
 | K45 read-ahead (`ahead`), its cap, paged selections' shared entries | Points, spilling past a bound |
 | D93: snapshot passes; selections classed via `lower=` | Each batch reads at its own head, pinned by its claim; selections write points; `decode` replaces `lower=` |
 | D100: classes from the index, rows from the store; rowless deliveries | A fenced store: classes at the commit its read names. A source: classes from what it served, before the callback |
@@ -628,8 +636,8 @@ owed(R, now) = {k: c for k in candidates(R, now) if (c := classify(R, k, now)) !
 # point keys, membership and context scans
 ```
 
-**A run** — the owed keys in key order, `batch_size` a commit, its cursor
-in memory:
+**A run** — each task walks the owed keys in key order, a batch of up to
+`batch_size` committed at a time, from its progress:
 
 ```text
 run(R):
