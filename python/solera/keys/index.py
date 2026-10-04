@@ -5,7 +5,7 @@ and partition. `IndexState` is the engine-held record of which files exist;
 it is plain data, changed only through its pure transition methods, so the
 engine can journal it. `KeyIndex` does the I/O: computing a commit's delta,
 writing delta files, paging, reading pending deltas, and compaction. A full
-replacement, a compaction and a recount stream over the whole index
+replacement and a compaction stream over the whole index
 (`jobs`): memory is a few segments per level and one output file.
 
 Levels: level 0 holds delta files, one per commit, with overlapping key
@@ -141,11 +141,9 @@ class IndexState:
     """What the engine holds per index: `count` live keys, the files by level,
     and the delta log consumers read — `(commit, files)`, oldest first. A delta
     file stays in the log after compaction merges it out of the levels, until
-    no consumer needs it. `inexact` counts the commits since the last recount
-    whose count change came from filters (§6): the count is exact when it is 0."""
+    no consumer needs it. Writes are exact, so `count` always is."""
 
     count: int = 0
-    inexact: int = 0
     files: tuple[FileInfo, ...] = ()
     log: tuple[tuple[int, tuple[FileInfo, ...]], ...] = ()
     prefix: str = ""  # where the files live (`index_prefix` when the index was created)
@@ -154,7 +152,6 @@ class IndexState:
         return {
             "prefix": self.prefix,
             "count": self.count,
-            "inexact": self.inexact,
             "files": [f.to_json() for f in self.files],
             "log": [[b, [f.to_json() for f in fs]] for b, fs in self.log],
         }
@@ -165,15 +162,10 @@ class IndexState:
             return cls()
         return cls(
             d["count"],
-            d["inexact"],
             tuple(FileInfo.from_json(f) for f in d["files"]),
             tuple((b, tuple(FileInfo.from_json(f) for f in fs)) for b, fs in d["log"]),
             d["prefix"],
         )
-
-    @property
-    def count_exact(self) -> bool:
-        return self.inexact == 0
 
     def path(self, name: str) -> str:
         return f"{self.prefix}{name}.kx"
@@ -230,7 +222,6 @@ class IndexState:
         log = self.log + ((commit_number, placed),) if keep_log and placed else self.log
         return IndexState(
             count=self.count + delta.added - delta.removed,
-            inexact=self.inexact + int(not delta.exact),
             files=self.files + placed,
             log=log,
             prefix=self.prefix,
@@ -241,13 +232,6 @@ class IndexState:
 
         gone = set(removed)
         return replace(self, files=tuple(f for f in self.files if f.name not in gone) + tuple(added))
-
-    def recounted(self, live: int, pinned_count: int, pinned_inexact: int) -> IndexState:
-        """Apply a recount of an earlier state of this index (`live` keys where
-        that state said `pinned_count`): the commits since keep their
-        `added - removed`, and the count stays inexact only if one of them was."""
-
-        return replace(self, count=live + self.count - pinned_count, inexact=self.inexact - pinned_inexact)
 
     def truncated(self, lowest_needed_commit: int | None) -> IndexState:
         """Drop log entries no consumer still needs (`None`: no consumers at all)."""
@@ -260,14 +244,12 @@ class IndexState:
 @dataclass(frozen=True)
 class Delta:
     """A patch's delta, encoded but not yet written: its `.kx` files, and how
-    the live key count changes. `exact` is false when a count change was
-    inferred from a filter rather than read. `listed`: up to the `collect`
-    asked for, the written keys and the deleted keys."""
+    the live key count changes. `listed`: up to the `collect` asked for, the
+    written keys and the deleted keys."""
 
     files: list[bytes]
     added: int
     removed: int
-    exact: bool
     listed: tuple[list[bytes], list[bytes]] | None = None
 
     def __len__(self) -> int:
@@ -303,19 +285,13 @@ class DeltaFiles:
     files: list[FileInfo]
     added: int
     removed: int
-    exact: bool
 
     def to_json(self) -> dict:
-        return {
-            "files": [f.to_json() for f in self.files],
-            "added": self.added,
-            "removed": self.removed,
-            "exact": self.exact,
-        }
+        return {"files": [f.to_json() for f in self.files], "added": self.added, "removed": self.removed}
 
     @classmethod
     def from_json(cls, d: dict) -> DeltaFiles:
-        return cls([FileInfo.from_json(f) for f in d["files"]], d["added"], d["removed"], d["exact"])
+        return cls([FileInfo.from_json(f) for f in d["files"]], d["added"], d["removed"])
 
 
 @dataclass
@@ -340,23 +316,6 @@ class Options:
     l0_max_bytes: int = 64 * 2**20
     level_base: int = 64 * 2**20
     fanout: int = 10
-
-
-@dataclass(frozen=True)
-class GarbageFile:
-    """A compaction's garbage file (docs/key-index-format.md § Garbage files):
-    the entries it dropped, for an immutable store to clean up."""
-
-    name: str
-    entries: int
-    size: int
-
-    def to_json(self) -> dict:
-        return {"name": self.name, "entries": self.entries, "size": self.size}
-
-    @classmethod
-    def from_json(cls, d: dict) -> GarbageFile:
-        return cls(d["name"], d["entries"], d["size"])
 
 
 # -- reading ------------------------------------------------------------------------
@@ -488,43 +447,42 @@ class KeyIndex:
         commit_number: int,
         attempt: str,
         generation: int = 0,
-        exact: bool = False,
         collect: int = 0,
     ) -> tuple[DeltaFiles, tuple[list[bytes], list[bytes]] | None]:
         """A patch's delta — `run`'s upserts and removes, at `generation` —
         written as the commit's files (docs/resolved-commits.md §6). A small
         patch reads only what it must — the sparse reader; a dense one, or
         one whose exact reads would touch too many blocks, streams the whole
-        index instead; an empty index reads nothing. With `exact`, every live
-        key's entry is read — no filter counts a key live — so the counts are
-        exact and every written key names its predecessor. Returns the files
+        index instead; an empty index reads nothing. Every key a filter holds
+        has its entry read, so the counts are exact and every written key
+        names its predecessor (docs/key-index-design.md). Returns the files
         and, up to `collect` keys, the written keys and the deleted keys
         (None past it). A full replacement is `replace`."""
 
         entries = sum(f.entries for f in self.state.files)
         if entries and len(run) > self.o.stream_density * entries:
             return await self._stream(run, commit_number, attempt, generation, collect)
-        delta = await self._sparse(run, generation, exact=exact, collect=collect, switch=True)
+        delta = await self._sparse(run, generation, collect=collect, switch=True)
         if delta is None:
             return await self._stream(run, commit_number, attempt, generation, collect)
         self.route = "sparse"
         return await self.write(commit_number, attempt, delta), delta.listed
 
-    async def changes(self, run: SortedEntries, *, generation: int = 0, exact: bool = False) -> Delta:
+    async def delta(self, run: SortedEntries, *, generation: int = 0) -> Delta:
         """A patch's delta through the sparse reader whatever its size, not written."""
 
-        return await self._sparse(run, generation, exact=exact, collect=0, switch=False)
+        return await self._sparse(run, generation, collect=0, switch=False)
 
-    async def _sparse(self, run: SortedEntries, generation: int, *, exact: bool, collect: int, switch: bool):
+    async def _sparse(self, run: SortedEntries, generation: int, *, collect: int, switch: bool):
         """The sparse reader's delta; None when `switch` and streaming would read less."""
 
-        sparse = await self._find(run, exact=exact, switch=switch)
+        sparse = await self._find(run, switch=switch)
         if sparse is None:
             return None
         (files, added, removed, _), listed = await in_thread(
             sparse.delta, generation=generation, collect=collect, **self._writer()
         )
-        return Delta(files, added, removed, not sparse.inferred, listed)
+        return Delta(files, added, removed, listed)
 
     async def lookup(self, keys: list[bytes]) -> dict[bytes, tuple[int, bytes | None]]:
         """Exactly, the live `(generation, payload)` of each of `keys` the
@@ -538,7 +496,7 @@ class KeyIndex:
 
         async def store():
             run = SortedEntries.of(keys)
-            return (await self._find(run, exact=True, switch=False)).live()
+            return (await self._find(run, switch=False)).live()
 
         async def local(snap, _ceiling):
             hits = await in_thread(snap.get, keys)
@@ -596,7 +554,7 @@ class KeyIndex:
         runs = self.state.newest_first()
         job = Merge.patch(run, len(runs), **self._writer(), collect=collect, generation=generation)
         files = await self._run(job, runs, lambda n: f"{commit_number:012d}-{attempt}.{n:04d}", 0)
-        return DeltaFiles(files, job.added, job.removed, True), job.collected()
+        return DeltaFiles(files, job.added, job.removed), job.collected()
 
     async def replace(
         self,
@@ -631,7 +589,7 @@ class KeyIndex:
             overlay=overlay,
         )
         files = await self._run(job, runs, lambda n: f"{commit_number:012d}-{attempt}.{n:04d}", 0, rows)
-        return DeltaFiles(files, job.added, job.removed, True), job.collected()
+        return DeltaFiles(files, job.added, job.removed), job.collected()
 
     def _writer(self) -> dict:
         o = self.o
@@ -643,9 +601,7 @@ class KeyIndex:
             "max_file_bytes": o.max_file_bytes,
         }
 
-    async def _run(
-        self, job: Merge, runs, name=None, level: int = 0, rows=None, on_garbage=None
-    ) -> list[FileInfo]:
+    async def _run(self, job: Merge, runs, name=None, level: int = 0, rows=None) -> list[FileInfo]:
         """Drive a streaming job over `runs`; its files are written as `name(n)`, at
         `level`. When the `io`'s local copies hold every file of `runs`, the
         job reads those, not the store."""
@@ -664,12 +620,10 @@ class KeyIndex:
         if local is not None and all(self.path(f.name) in local for run in runs for f in run):
             held = [[local[self.path(f.name)] for f in run] for run in runs]
         self.local_reads = held is not None
-        await jobs.run(
-            job, self.io, self.path, runs, put, None if isinstance(rows, Rows) else rows, on_garbage, held
-        )
+        await jobs.run(job, self.io, self.path, runs, put, None if isinstance(rows, Rows) else rows, held)
         return [files[n] for n in sorted(files)]
 
-    async def _find(self, run: SortedEntries, *, exact: bool, switch: bool):
+    async def _find(self, run: SortedEntries, *, switch: bool):
         """What the index holds for each entry of `run`, as a native `Sparse`
         state — read live or deleted, absent by the key filters, or, for an
         upsert carrying no payload, live by the key and tombstone filters.
@@ -713,8 +667,8 @@ class KeyIndex:
         parsed = await asyncio.gather(*(self._open(f) for f in files))
         for i, p in enumerate(parsed):
             tail = p.tail
-            sparse.filter(i, *spans[p.info.name], tail["key_filter"], tail["tomb_filter"])
-        sparse.classify(exact)
+            sparse.filter(i, *spans[p.info.name], tail["key_filter"])
+        sparse.classify()
         if not sparse.maybe:
             return sparse
 
@@ -749,7 +703,7 @@ class KeyIndex:
         await asyncio.gather(
             *(self.io.write(self.path(f.name), d) for f, d in zip(files, delta.files, strict=True))
         )
-        return DeltaFiles(files, delta.added, delta.removed, delta.exact)
+        return DeltaFiles(files, delta.added, delta.removed)
 
     # -- scans: full pass and pending deltas ----------------------------------------------
 
@@ -887,14 +841,6 @@ class KeyIndex:
         finally:
             await asyncio.gather(*(r.close() for r in readers))
 
-    async def recount(self) -> int:
-        """Count live keys exactly: one streaming pass over the whole index,
-        over the `io`'s local copies when they hold it (`_run`)."""
-
-        job = Merge.count(len(runs := self.state.newest_first()))
-        await self._run(job, runs)
-        return job.live
-
     # -- compaction ------------------------------------------------------------------------
 
     def plan_compaction(self) -> tuple[list[FileInfo], int] | None:
@@ -933,14 +879,11 @@ class KeyIndex:
             return [pick] + [g for g in below if g.max >= pick.min and g.min <= pick.max], n + 1
         return None
 
-    async def compact(
-        self, plan=None, *, garbage: bool = False
-    ) -> tuple[list[FileInfo], list[str], list[GarbageFile]] | None:
+    async def compact(self, plan=None) -> tuple[list[FileInfo], list[str]] | None:
         """Run one compaction; returns the added files and removed names for
-        `IndexState.compacted`, and with `garbage` the garbage files listing
-        every entry the merge dropped that names an object — what an
-        immutable store cleanups (docs/key-index-format.md § Garbage files).
-        Its inputs are read from the `io`'s local copies when they hold them."""
+        `IndexState.compacted`. The objects its merge drops are listed by the
+        deltas' predecessors already (exact writes). Its inputs are read from
+        the `io`'s local copies when they hold them."""
 
         plan = plan or self.plan_compaction()
         if plan is None:
@@ -949,33 +892,18 @@ class KeyIndex:
         if out_level > self.state.depth and out_level > 1:
             # The deepest level moves down whole: nothing below it to merge with, and
             # its files never overlap. Level-0 files do, so level 0 is always merged.
-            return [replace(f, level=out_level) for f in inputs], [f.name for f in inputs], []
+            return [replace(f, level=out_level) for f in inputs], [f.name for f in inputs]
         drop = out_level >= self.state.depth  # nothing older below: tombstones can go
         # Runs, newest first: each level-0 file alone, a deeper level's files together.
         runs = []
         for lv, group in itertools.groupby(inputs, lambda f: f.level):
             group = list(group)
             runs += [[f] for f in group] if lv == 0 else [group]
-        job = Merge.compact(len(runs), drop_deleted=drop, garbage=garbage, **self._writer())
+        job = Merge.compact(len(runs), drop_deleted=drop, **self._writer())
         # A level-0 file is as recent as its newest input: level 0 orders by name, and delta
         # names start with their commit.
         stamp = ulid() if out_level else f"{inputs[0].name.split('-', 1)[0]}-c{ulid()}"
-        dropped: dict[int, GarbageFile] = {}
-
-        async def put_garbage(n: int, data: bytes):
-            name = f"g{stamp}-{n:04d}"
-            await self.io.write(self.garbage_path(name), data)
-            entries = int.from_bytes(data[-16:-8], "little")
-            dropped[n] = GarbageFile(name, entries, len(data))
-
         added = await self._run(
-            job,
-            runs,
-            lambda n: f"c{stamp}-{n:04d}" if out_level else f"{stamp}.{n:04d}",
-            out_level,
-            on_garbage=put_garbage,
+            job, runs, lambda n: f"c{stamp}-{n:04d}" if out_level else f"{stamp}.{n:04d}", out_level
         )
-        return added, [f.name for f in inputs], [dropped[n] for n in sorted(dropped)]
-
-    def garbage_path(self, name: str) -> str:
-        return f"{self.prefix}{name}.kg"
+        return added, [f.name for f in inputs]

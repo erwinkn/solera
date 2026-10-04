@@ -112,7 +112,7 @@ async def test_the_engine_ends_on_what_it_read(tmp_path, monkeypatch):
     engine = engine_for(state, REMOTE)
     await engine.initialize()
     run, attempt = await launched(engine, ["remote"])
-    intents = {"remote": {"files": [], "added": 0, "removed": 0, "exact": True}}
+    intents = {"remote": {"files": [], "added": 0, "removed": 0}}
     swap, raced = attempts.swap, []
 
     async def worker_first(store, path, data, etag):
@@ -140,7 +140,7 @@ async def test_an_attempt_ended_from_writing_owes_a_repair(tmp_path):
     engine = engine_for(state, REMOTE, cancel_grace=0.1)
     await engine.initialize()
     run, attempt = await launched(engine, ["remote"])
-    intents = {"remote": {"files": [], "added": 0, "removed": 0, "exact": True}}
+    intents = {"remote": {"files": [], "added": 0, "removed": 0}}
     await own(state, run["id"], attempt)
     await as_worker(state, run["id"], attempt, lifecycle.WRITING, intents=intents)
     _, held = await lifecycle.read_control(state.objects, run["id"], attempt)  # the worker's version

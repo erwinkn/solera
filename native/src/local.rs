@@ -555,8 +555,8 @@ impl Snapshot {
                 Step::Run(r) => feed.feed(self, &mut job.merge, r)?,
                 Step::File => files.extend(job.delta.writer.files.pop_front()),
                 Step::Done => break,
-                Step::Rows | Step::Garbage | Step::Page => {
-                    unreachable!("a patch reads no rows, writes no garbage, makes no pages")
+                Step::Rows | Step::Page => {
+                    unreachable!("a patch reads no rows, makes no pages")
                 }
             }
         }

@@ -588,7 +588,6 @@ async def _failures(spec, each: dict, batch: Batch, outcomes: dict, keys_io) -> 
         commit_number=int(each["commit_number"]),
         attempt=spec["attempt"],
         generation=int(spec.get("generation") or 0),
-        exact=True,
     )
     due, deploy_min = minima(records.values())
     report = {

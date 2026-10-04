@@ -37,9 +37,3 @@ test = false
 doc = false
 bench = false
 
-[[bin]]
-name = "kg-file"
-path = "fuzz_targets/kg_file.rs"
-test = false
-doc = false
-bench = false

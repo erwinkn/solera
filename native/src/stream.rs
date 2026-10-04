@@ -11,7 +11,8 @@ use xxhash_rust::xxh3::xxh3_128;
 
 use crate::format::{
     compress, decompress_at_most, filter_nbits, fmt_err, get_varint, hash_positions, key_item,
-    put_bytes, put_varint, shared_prefix, tomb_item, Error, Options, Result, FORMAT_VERSION, MAGIC,
+    put_bytes, put_varint, shared_prefix, Error, Options, Result, FORMAT_VERSION, MAGIC,
+    MAX_BLOCK_BYTES,
 };
 
 /// Bytes owned elsewhere — a Python `bytes`, or a `Vec` in tests.
@@ -136,8 +137,9 @@ pub struct Block {
 }
 
 impl Block {
+    /// A block decoded: at most `MAX_BLOCK_BYTES`, else `Error::Limit` (F29).
     pub fn decode(data: &[u8], codec: u8) -> Result<Block> {
-        Block::decode_at_most(data, codec, u64::MAX)
+        Block::decode_at_most(data, codec, MAX_BLOCK_BYTES)
     }
 
     /// `decode`, decompressing at most `limit` bytes (`Error::Limit` past them).
@@ -470,12 +472,11 @@ struct Packed {
     last: Vec<u8>,
     count: u64,
     keys: Vec<u128>,
-    tombs: Vec<u128>,
 }
 
 /// Compresses a raw block and hashes its filter items.
 fn pack(b: RawBlock, o: &Options) -> Result<Packed> {
-    let (mut keys, mut tombs) = (Vec::new(), Vec::new());
+    let mut keys = Vec::new();
     let (mut pos, raw) = (0usize, &b.data);
     let mut key: Vec<u8> = Vec::new();
     let mut item = Vec::new();
@@ -485,10 +486,6 @@ fn pack(b: RawBlock, o: &Options) -> Result<Packed> {
         key.extend_from_slice(&raw[f.suffix.0..f.suffix.1]);
         key_item(&mut item, &key);
         keys.push(xxh3_128(&item));
-        if f.deleted() {
-            tomb_item(&mut item, &key);
-            tombs.push(xxh3_128(&item));
-        }
     }
     let data = compress(&b.data, o.codec, o.level);
     Ok(Packed {
@@ -498,7 +495,6 @@ fn pack(b: RawBlock, o: &Options) -> Result<Packed> {
         last: b.last,
         count: b.count,
         keys,
-        tombs,
     })
 }
 
@@ -520,7 +516,6 @@ struct FileBuf {
     out: Vec<u8>,
     index: Vec<(Vec<u8>, u64, u64, u64, u32)>,
     keys: Vec<u128>,
-    tombs: Vec<u128>,
     min: Vec<u8>,
     max: Vec<u8>,
     entries: u64,
@@ -540,7 +535,6 @@ impl FileBuf {
         ));
         self.out.extend_from_slice(&p.data);
         self.keys.extend_from_slice(&p.keys);
-        self.tombs.extend_from_slice(&p.tombs);
         self.max = p.last;
         self.entries += p.count;
     }
@@ -550,14 +544,12 @@ impl FileBuf {
             mut out,
             index,
             keys,
-            tombs,
             min,
             max,
             entries,
         } = self;
-        let mut filters = Vec::with_capacity((keys.len() + tombs.len()) * 2 + 256);
+        let mut filters = Vec::with_capacity(keys.len() * 2 + 256);
         filter(&keys, o, &mut filters);
-        filter(&tombs, o, &mut filters);
         let crc = crc32fast::hash(&filters);
         filters.extend_from_slice(&crc.to_le_bytes());
 
@@ -608,6 +600,8 @@ pub struct Writer {
     file: FileBuf,
     pub files: VecDeque<Vec<u8>>,
     pub entries: u64,
+    /// The current block's keys, expanded: what decoding it materializes beside its bytes.
+    block_keys: u64,
 }
 
 impl Writer {
@@ -624,6 +618,7 @@ impl Writer {
             file: FileBuf::default(),
             files: VecDeque::new(),
             entries: 0,
+            block_keys: 0,
         }
     }
 
@@ -663,6 +658,13 @@ impl Writer {
         self.started = true;
         self.count += 1;
         self.entries += 1;
+        self.block_keys += key.len() as u64;
+        if self.block.len() as u64 + self.block_keys > MAX_BLOCK_BYTES {
+            return Err(Error::Value(format!(
+                "an entry of {:?} makes its block decode past {MAX_BLOCK_BYTES} bytes",
+                String::from_utf8_lossy(key)
+            )));
+        }
         if self.block.len() >= self.o.block_size {
             self.close_block()?;
         }
@@ -681,6 +683,7 @@ impl Writer {
             count: self.count,
         });
         self.count = 0;
+        self.block_keys = 0;
         if self.raw.len() >= COMPRESS_BATCH {
             self.compress()?;
         }
@@ -696,7 +699,7 @@ impl Writer {
         for p in packed {
             self.file.add(p);
             // The file so far: its blocks, and the filters they will need.
-            let items = self.file.keys.len() + self.file.tombs.len();
+            let items = self.file.keys.len();
             if self.file.out.len() + items * self.o.bits_per_item as usize / 8
                 >= self.max_file_bytes
             {

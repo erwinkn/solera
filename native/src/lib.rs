@@ -13,7 +13,6 @@ pub mod arrow;
 pub mod delta;
 pub mod entries;
 pub mod format;
-pub mod garbage;
 pub mod jobs;
 pub mod local;
 pub mod rows;
@@ -32,7 +31,7 @@ use pyo3::pybacked::PyBackedBytes;
 use pyo3::types::{PyBool, PyBytes, PyCapsule, PyDict, PyInt, PyList, PyString};
 
 use format::{Error, Options};
-use jobs::{Compact, Count, Join, Scan, Step};
+use jobs::{Compact, Join, Scan, Step};
 use rayon::prelude::*;
 use rows::{Arena, Constant, Cursor, Overlay, Payloads, Source, Stream, Table};
 use stream::Segment;
@@ -278,24 +277,6 @@ fn bloom_check_keys<'py>(
     })
 }
 
-#[pyfunction]
-fn bloom_check_tombstones<'py>(
-    py: Python<'py>,
-    bits: PyBackedBytes,
-    nbits: u64,
-    k: u8,
-    keys: Vec<PyBackedBytes>,
-) -> PyResult<Bound<'py, PyBytes>> {
-    guard(|| {
-        Ok({
-            PyBytes::new(
-                py,
-                &format::bloom_check_tombstones(&bits, nbits, k, &slices(&keys)),
-            )
-        })
-    })
-}
-
 type Found<'py> = (
     Bound<'py, PyBytes>,
     Vec<u64>,
@@ -413,16 +394,6 @@ fn merge_page<'py>(
     })
 }
 
-/// Every entry of a garbage file (docs/key-index-format.md § Garbage files):
-/// keys, generations.
-#[pyfunction]
-fn decode_garbage<'py>(py: Python<'py>, data: &[u8]) -> PyResult<(Bound<'py, PyList>, Vec<u64>)> {
-    guard(|| {
-        let (k, g) = garbage::decode(data).map_err(to_py)?;
-        Ok((list_of_bytes(py, &k)?, g))
-    })
-}
-
 // -- tails ----------------------------------------------------------------------------
 
 #[pyfunction]
@@ -470,10 +441,8 @@ fn parse_index<'py>(py: Python<'py>, part: &[u8], file_size: u64) -> PyResult<Bo
 fn parse_tail<'py>(py: Python<'py>, tail: &[u8], file_size: u64) -> PyResult<Bound<'py, PyDict>> {
     guard(|| {
         let d = parse_index(py, tail, file_size)?;
-        let filters = format::parse_filters(tail, file_size).map_err(to_py)?;
-        for (name, (nbits, k, bits)) in ["key_filter", "tomb_filter"].into_iter().zip(filters) {
-            d.set_item(name, (nbits, k, PyBytes::new(py, bits)))?;
-        }
+        let (nbits, k, bits) = format::parse_filters(tail, file_size).map_err(to_py)?;
+        d.set_item("key_filter", (nbits, k, PyBytes::new(py, bits)))?;
         Ok(d)
     })
 }
@@ -1065,12 +1034,6 @@ impl Sparse {
         self.inner.maybe()
     }
 
-    /// Whether a count change was inferred from the filters.
-    #[getter]
-    fn inferred(&self) -> bool {
-        self.inner.inferred
-    }
-
     /// The positions `[lo, hi)` of the sorted entries' keys in `[min, max]`.
     fn span(&self, min: &[u8], max: &[u8]) -> PyResult<(usize, usize)> {
         guard(|| Ok(self.inner.span(min, max)))
@@ -1114,27 +1077,25 @@ impl Sparse {
         })
     }
 
-    /// Runs one file's filters — `(nbits, k, bits)` each, as its tail holds
-    /// them — over the undecided entries in `[lo, hi)`.
+    /// Runs one file's key filter — `(nbits, k, bits)`, as its tail holds
+    /// it — over the undecided entries in `[lo, hi)`.
     fn filter(
         &mut self,
         file: usize,
         lo: usize,
         hi: usize,
         keys: (u64, u8, PyBackedBytes),
-        tombs: (u64, u8, PyBackedBytes),
     ) -> PyResult<()> {
         guard(|| {
-            self.inner
-                .filter(file, lo, hi, filter_of(&keys), filter_of(&tombs));
+            self.inner.filter(file, lo, hi, filter_of(&keys));
             Ok(())
         })
     }
 
-    /// Decides what the filters can (`exact`: no change from filters alone).
-    fn classify(&mut self, exact: bool) -> PyResult<()> {
+    /// Decides what the filters can: a key no filter holds is absent.
+    fn classify(&mut self) -> PyResult<()> {
         guard(|| {
-            self.inner.classify(exact);
+            self.inner.classify();
             Ok(())
         })
     }
@@ -1186,15 +1147,13 @@ impl Sparse {
 enum Kind {
     Join(Box<Join>),
     Compact(Box<Compact>),
-    Count(Count),
     Scan(Scan),
 }
 
 /// A streaming job over an index's runs (see the module documentation).
 /// `step()` returns `("run", r)` when run `r` needs `feed` or `end`,
 /// `("rows", None)` when a streamed replacement needs `feed_rows` or
-/// `end_rows`, `("file", data)` for each file written, `("garbage", data)`
-/// for each garbage file a compaction writes, and `None` when done.
+/// `end_rows`, `("file", data)` for each file written, and `None` when done.
 #[pyclass(module = "solera._native")]
 struct Merge {
     kind: Kind,
@@ -1208,7 +1167,6 @@ fn merge_of(kind: &mut Kind) -> &mut stream::Merge {
     match kind {
         Kind::Join(j) => &mut j.merge,
         Kind::Compact(j) => &mut j.merge,
-        Kind::Count(j) => &mut j.merge,
         Kind::Scan(j) => &mut j.merge,
     }
 }
@@ -1319,15 +1277,13 @@ impl Merge {
     }
 
     /// Merges `runs` (newest first) into new files; `drop_deleted` when
-    /// nothing older lies below; with `garbage`, the entries it drops that
-    /// name objects go to garbage files.
+    /// nothing older lies below.
     #[staticmethod]
-    #[pyo3(signature = (runs, *, drop_deleted, garbage=false, block_size=65536, level=1, bits_per_item=14, k=10, codec=1, max_file_bytes=67108864))]
+    #[pyo3(signature = (runs, *, drop_deleted, block_size=65536, level=1, bits_per_item=14, k=10, codec=1, max_file_bytes=67108864))]
     #[allow(clippy::too_many_arguments)]
     fn compact(
         runs: usize,
         drop_deleted: bool,
-        garbage: bool,
         block_size: usize,
         level: u32,
         bits_per_item: u64,
@@ -1344,7 +1300,6 @@ impl Merge {
                     kind: Kind::Compact(Box::new(Compact::new(
                         runs,
                         drop_deleted,
-                        garbage,
                         o,
                         max_file_bytes,
                     ))),
@@ -1364,20 +1319,6 @@ impl Merge {
             key: None,
             local: None,
             kind: Kind::Scan(Scan::new(runs, after, limit)),
-        })
-    }
-
-    /// Counts the live keys of `runs` (newest first).
-    #[staticmethod]
-    fn count(runs: usize) -> PyResult<Merge> {
-        guard(|| {
-            Ok({
-                Merge {
-                    key: None,
-                    local: None,
-                    kind: Kind::Count(Count::new(runs)),
-                }
-            })
         })
     }
 
@@ -1456,7 +1397,6 @@ impl Merge {
                         let step = match kind {
                             Kind::Join(j) => j.step()?,
                             Kind::Compact(j) => j.step()?,
-                            Kind::Count(j) => j.step()?,
                             Kind::Scan(j) => j.step()?,
                         };
                         match (step, local.as_mut()) {
@@ -1469,9 +1409,6 @@ impl Merge {
                     let file = match (&step, kind) {
                         (Step::File, Kind::Join(j)) => j.delta.writer.files.pop_front(),
                         (Step::File, Kind::Compact(j)) => j.writer.files.pop_front(),
-                        (Step::Garbage, Kind::Compact(j)) => {
-                            j.garbage.as_mut().and_then(|g| g.files.pop_front())
-                        }
                         _ => None,
                     };
                     Ok((step, file))
@@ -1481,7 +1418,6 @@ impl Merge {
                 Step::Run(r) => Some(("run", r.into_pyobject(py)?.into_any())),
                 Step::Rows => Some(("rows", py.None().into_bound(py))),
                 Step::File => Some(("file", PyBytes::new(py, &file.unwrap()).into_any())),
-                Step::Garbage => Some(("garbage", PyBytes::new(py, &file.unwrap()).into_any())),
                 Step::Page => {
                     let page = match &mut self.kind {
                         Kind::Scan(j) => std::mem::take(&mut j.page),
@@ -1526,24 +1462,6 @@ impl Merge {
     #[getter]
     fn changed(&self) -> PyResult<u64> {
         guard(|| Ok(self.delta()?.changed))
-    }
-
-    /// Entries a compaction wrote to garbage files.
-    #[getter]
-    fn garbage(&self) -> PyResult<u64> {
-        guard(|| match &self.kind {
-            Kind::Compact(j) => Ok(j.garbage.as_ref().map_or(0, |g| g.total)),
-            _ => Err(PyTypeError::new_err("not a compaction")),
-        })
-    }
-
-    /// A count's live keys.
-    #[getter]
-    fn live(&self) -> PyResult<u64> {
-        guard(|| match &self.kind {
-            Kind::Count(j) => Ok(j.live),
-            _ => Err(PyTypeError::new_err("not a count")),
-        })
     }
 
     /// A replacement's or a patch's written keys and its deleted keys, or
@@ -1809,7 +1727,6 @@ fn solera_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(write_files, m)?)?;
     m.add_function(wrap_pyfunction!(decode_block, m)?)?;
     m.add_function(wrap_pyfunction!(bloom_check_keys, m)?)?;
-    m.add_function(wrap_pyfunction!(bloom_check_tombstones, m)?)?;
     m.add_function(wrap_pyfunction!(lookup, m)?)?;
     m.add_function(wrap_pyfunction!(merge_range, m)?)?;
     m.add_function(wrap_pyfunction!(merge_page, m)?)?;
@@ -1819,7 +1736,6 @@ fn solera_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(parse_index, m)?)?;
     m.add_function(wrap_pyfunction!(parse_tail, m)?)?;
     m.add_function(wrap_pyfunction!(check_block, m)?)?;
-    m.add_function(wrap_pyfunction!(decode_garbage, m)?)?;
     m.add_function(wrap_pyfunction!(build_local, m)?)?;
     m.add_function(wrap_pyfunction!(content_digest, m)?)?;
     m.add_class::<LocalFile>()?;

@@ -542,7 +542,7 @@ async def _store_outputs(
             # map once it wrote, so its delta comes after — and needs no repair.
             # Unknown writes: if this attempt dies after its gate, no key list says what landed
             # (docs/lifecycle.md §9.6): the next attempt reconciles the whole partition.
-            intents[name] = {**DeltaFiles([], 0, 0, True).to_json(), "unknown": True}
+            intents[name] = {**DeltaFiles([], 0, 0).to_json(), "unknown": True}
             continue
         if o.files is None:
             await _resolve(o, spec, engine.get(name))
@@ -848,10 +848,10 @@ async def _upload(index: KeyIndex, commit_number: int, attempt: str, answer) -> 
 
     a, data = answer
     if data is None:
-        return DeltaFiles([], 0, 0, True), ([], [])
+        return DeltaFiles([], 0, 0), ([], [])
     name = f"{commit_number:012d}-{attempt}.0000"
     await index.io.write(index.path(name), data)
-    return DeltaFiles([FileInfo.describe(name, 0, data)], a["added"], a["removed"], True), delta_keys(data)
+    return DeltaFiles([FileInfo.describe(name, 0, data)], a["added"], a["removed"]), delta_keys(data)
 
 
 async def _intended(info, keys_io, repairs) -> list[str]:
@@ -1345,7 +1345,6 @@ async def _cleanup_due(spec, project, asset, objects, writes) -> dict:
     store, deletes for it. Returns what was done, for the result."""
 
     import obstore
-    from solera.keys import decode_garbage
 
     declared = {o["name"]: o for o in project.manifest["assets"][asset.name]["outputs"]}
     decls = {o.name or asset.name: o for o in asset.outputs}
@@ -1361,23 +1360,15 @@ async def _cleanup_due(spec, project, asset, objects, writes) -> dict:
         items, done = [], []
         for entry in info["cleanup"]:
             kind, prefix = entry["kind"], entry.get("prefix") or ""
-            if kind in ("delta", "sidecar"):  # what a commit's delta, or a compaction, let go of
-                found = [
-                    await read(f"{prefix}{f}.{'kx' if kind == 'delta' else 'kg'}") for f in entry["files"]
-                ]
+            if kind == "delta":  # what a commit's delta let go of: every replaced version (exact writes)
+                found = [await read(f"{prefix}{f}.kx") for f in entry["files"]]
                 if any(data is None for data in found):  # the names are not known: it stays pending
                     unresolved.setdefault(name, []).append(entry["id"])
                     continue
                 for data in found:
-                    if kind == "delta":
-                        for key, _, _, _, before in _file_entries(data):
-                            if before is not None:
-                                items.append(("key", key_str(key), before))
-                    else:
-                        keys, generations = decode_garbage(data)
-                        items += [("key", key_str(k), g) for k, g in zip(keys, generations, strict=True)]
-                if kind == "sidecar":
-                    files += [f"{prefix}{f}.kg" for f in entry["files"]]
+                    for key, _, _, _, before in _file_entries(data):
+                        if before is not None:
+                            items.append(("key", key_str(key), before))
             elif kind == "abandoned":  # all an uncommitted attempt wrote carries its generation
                 generation = entry["generation"]
                 if "prefix" in entry:  # keyed: its delta files name every object it could have written

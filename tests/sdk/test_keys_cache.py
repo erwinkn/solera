@@ -51,7 +51,7 @@ async def built_index(io, n=3000, commits=12, seed=1):
         )
         state = state.committed(b, files, keep_log=False)
         while (out := await KeyIndex(io, None, state, OPTS).compact()) is not None:
-            state = state.compacted(*out[:2])
+            state = state.compacted(*out)
     return state
 
 
@@ -112,7 +112,7 @@ async def test_engine_and_cold_resolves_agree(io, tmp_path):
             )
         else:
             files, _ = await idx.resolve(
-                SortedEntries.of(ks, vs, rm), commit_number=99, attempt=f"c{step}", generation=100, exact=True
+                SortedEntries.of(ks, vs, rm), commit_number=99, attempt=f"c{step}", generation=100
             )
         cold = decoded([await io.read_whole(state.path(f.name), f.size) for f in files.files])
         if answer["result"] == "empty":
@@ -521,7 +521,7 @@ async def test_a_reader_does_not_evict_what_compaction_wrote(io, tmp_path):
     plan = (state.level(0) + state.level(1), 1) if state.level(0) else (state.level(1), 2)
     written = []
     idx.on_write = lambda path, f, data: written.append((path, f, data))
-    added, removed, _ = await idx.compact(plan)
+    added, removed = await idx.compact(plan)
     for path, f, data in written:
         assert await cache.install(state.prefix, f, path, data)
     with cache.open(state):
@@ -604,9 +604,9 @@ async def test_admission_remembers_what_a_file_built_to(io, tmp_path):
 
 
 async def test_maintenance_reads_the_engine_caches_copies(io, tmp_path):
-    """One warm copy serves every engine reader: a recount and a
-    compaction over the cache's local files read nothing from the store and
-    agree with the store's; a copy short of one file reads the store."""
+    """One warm copy serves every engine reader: a compaction over the
+    cache's local files reads nothing from the store and agrees with the
+    store's; a copy short of one file reads the store."""
 
     from solera_server.keyservice import KeyService
 
@@ -617,16 +617,13 @@ async def test_maintenance_reads_the_engine_caches_copies(io, tmp_path):
         assert await asyncio.wrap_future(service._submit(service.cache.fill(service.io, state)))
         with service.open(state) as local_files:
             assert local_files is not None
-            cold = await KeyIndex(io, None, state, OPTS).recount()
             gets = io.metrics.gets
             held = ObjectIO(io.store, metrics=io.metrics, local=local_files.handles)
-            idx = KeyIndex(held, None, state, OPTS)
-            assert await idx.recount() == cold and idx.local_reads and io.metrics.gets == gets
             plan = (state.level(0) + state.level(1), 1) if state.level(0) else (state.level(1), 2)
             local = KeyIndex(held, None, state, OPTS)
-            added, _, _ = await local.compact(plan, garbage=True)
+            added, _ = await local.compact(plan)
             assert local.local_reads and io.metrics.gets == gets
-            stored, _, _ = await KeyIndex(io, None, state, OPTS).compact(plan, garbage=True)
+            stored, _ = await KeyIndex(io, None, state, OPTS).compact(plan)
 
             async def read(files):
                 return decoded([await io.read_whole(state.path(f.name), f.size) for f in files])
@@ -634,7 +631,8 @@ async def test_maintenance_reads_the_engine_caches_copies(io, tmp_path):
             assert await read(added) == await read(stored)
             partial = ObjectIO(io.store, local=dict(list(local_files.handles.items())[1:]))
             idx = KeyIndex(partial, None, state, OPTS)
-            assert await idx.recount() == cold and not idx.local_reads
+            again, _ = await idx.compact(plan)
+            assert not idx.local_reads and await read(again) == await read(stored)
     finally:
         await service.stop()
 
@@ -658,7 +656,7 @@ async def logged_index(io, seed=3):
         )
         state = state.committed(b, files, keep_log=True)
         while (out := await KeyIndex(io, None, state, OPTS).compact()) is not None:
-            state = state.compacted(*out[:2])
+            state = state.compacted(*out)
     return state
 
 
@@ -1292,7 +1290,7 @@ def test_under_any_budget_and_any_trouble_the_engine_resolves_as_a_cold_reader(
                 )
                 states[i] = states[i].committed(commit, files, keep_log=False)
                 while (out := await KeyIndex(io, None, states[i], OPTS).compact()) is not None:
-                    states[i] = states[i].compacted(*out[:2])
+                    states[i] = states[i].compacted(*out)
                 commit += 1
             elif op == "resolve" and states[i].files:
                 ks = sorted({key(rng.randrange(2000)) for _ in range(n)})
@@ -1312,7 +1310,6 @@ def test_under_any_budget_and_any_trouble_the_engine_resolves_as_a_cold_reader(
                         commit_number=99,
                         attempt=f"cold{rng.getrandbits(32)}",
                         generation=100,
-                        exact=True,
                     )
                     cold = decoded([await io.read_whole(states[i].path(f.name), f.size) for f in files.files])
                     assert (decoded([delta]) if delta else []) == cold

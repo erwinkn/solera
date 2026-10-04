@@ -15,7 +15,7 @@ with a payload (docs/versions.md).
 
 Suites (`--suites`, all by default):
 - base: the operations recorded in results.md, in the same order and with the same keys.
-- scan: a full scan of the index (the recount), in 100K-key pages.
+- scan: a full scan of the index, in 100K-key pages.
 - load: an initial load of every key, unsorted, through `KeyIndex.replace` (`bulk.py` measures
   the bulk operations' memory, each in a process of its own).
 - crossover: patches resolved by the sparse reader and by streaming, forced, against `resolve`'s
@@ -131,6 +131,17 @@ def clear_prefix(prefix: str):
         objs = [{"Key": o["Key"]} for o in page.get("Contents", [])]
         if objs:
             s3.delete_objects(Bucket=S3["bucket"], Delete={"Objects": objs})
+
+
+async def scan_count(idx: KeyIndex) -> int:
+    """The live keys, counted by a full scan in 100K-key pages."""
+
+    count, after = 0, None
+    while True:
+        keys, _, _, after = await idx.page(after, 100_000)
+        count += len(keys)
+        if after is None:
+            return count
 
 
 def key_of(i: int) -> bytes:
@@ -452,9 +463,9 @@ async def steady(n, prefix, state, sample, opts, cold, with_grid=False) -> tuple
     io = cold()
     rows.append(
         await measure(
-            "steady: full scan (recount), 100K-key pages",
+            "steady: full scan, 100K-key pages",
             io,
-            lambda io=io: KeyIndex(io, prefix, st, opts).recount(),
+            lambda io=io: scan_count(KeyIndex(io, prefix, st, opts)),
         )
     )
     if with_grid:  # the sample's payloads are current: unchanged rewrites are real
@@ -495,7 +506,7 @@ async def steady(n, prefix, state, sample, opts, cold, with_grid=False) -> tuple
     got = await KeyIndex(setup, prefix, st, opts).lookup([key_of(i) for i, _ in items])
     if lost := [i for i, _ in items if got.get(key_of(i)) != current[i]]:
         raise AssertionError(f"steady: {len(lost)} of 1,000 keys lost their newest write in the compactions")
-    if n <= 10_000_000 and (count := await KeyIndex(setup, prefix, st, opts).recount()) != n:
+    if n <= 10_000_000 and (count := await scan_count(KeyIndex(setup, prefix, st, opts))) != n:
         raise AssertionError(f"steady: counted {count:,} keys after the compactions, expected {n:,}")
     return rows, shape
 
@@ -675,9 +686,9 @@ async def _run_size(n: int, prefix: str, args) -> dict:
         io = cold()
         rows.append(
             await measure(
-                "full scan (recount), 100K-key pages",
+                "full scan, 100K-key pages",
                 io,
-                lambda io=io: KeyIndex(io, prefix, state, opts).recount(),
+                lambda io=io: scan_count(KeyIndex(io, prefix, state, opts)),
             )
         )
 

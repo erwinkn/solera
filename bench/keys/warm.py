@@ -175,20 +175,6 @@ async def run_size(n: int, args) -> list[dict]:
         )
         if args.reads:
             rows += await served_reads(n, state, cache, sample, window, opts, cold)
-        if args.recount:
-            # The engine's recount: from the store, then over the cache's local copies.
-            row = {"n": n, "op": "recount"}
-            io = cold()
-            live, wall, cpu = await timed(lambda io=io: KeyIndex(io, None, state, opts).recount())
-            row["store"] = (wall, cpu, io.metrics.gets, io.metrics.bytes_in / 1e6)
-            io = cold()
-            with cache.open(state) as opened:
-                io.local = opened.handles
-                again, wall, cpu = await timed(lambda io=io: KeyIndex(io, None, state, opts).recount())
-            assert again == live, (again, live)
-            row["local"] = (wall, cpu, io.metrics.gets, io.metrics.bytes_in / 1e6)
-            rows.append(row)
-            print(row, flush=True)
         resolver = Resolver(cache, cold(), opts)
 
         for k in (int(float(x)) for x in args.patches.split(",") if x):
@@ -246,7 +232,6 @@ async def main():
     ap.add_argument("--bandwidth", type=float, default=80e6)
     ap.add_argument("--s3", default=os.environ.get("SOLERA_TEST_S3", ""))
     ap.add_argument("--prefix", default=None)
-    ap.add_argument("--recount", action="store_true", help="also the engine's recount, store against local")
     ap.add_argument("--reads", action="store_true", help="also input reads, cold against engine-served")
     ap.add_argument("--patches", default="1e3,1e4,1e5", help="patch sizes; empty for none")
     args = ap.parse_args()
@@ -259,7 +244,7 @@ async def main():
     print("| Keys | Patch | Cold worker | Engine, page cache | Engine, SSD only |")
     print("|---|---|---|---|---|")
     for r in rows:
-        if r["op"] in ("engine fill", "recount") or "engine_resolve" not in r:
+        if r["op"] == "engine fill" or "engine_resolve" not in r:
             continue
         print(
             f"| {r['n']:,} | {r['op']} | {cell(r.get('cold'))} | "
@@ -280,12 +265,6 @@ async def main():
         for r in rows:
             if "engine" in r and "engine_resolve" not in r:
                 print(f"| {r['n']:,} | {r['op']} | {cell(r['cold'])} | {cell(r['engine'])} |")
-    if args.recount:
-        print("\n| Keys | Recount from the store | Recount over the cache's local copies |")
-        print("|---|---|---|")
-        for r in rows:
-            if r["op"] == "recount":
-                print(f"| {r['n']:,} | {cell(r['store'])} | {cell(r['local'])} |")
 
 
 if __name__ == "__main__":

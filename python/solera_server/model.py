@@ -118,7 +118,7 @@ def _renumbered(entries: list[dict]) -> list[dict]:
 
 def commit_of(head: dict | None) -> tuple | None:
     """What identifies the commit that installed a head — not the figures
-    upkeep corrects on it (a recount's `count`): whether a writer came in
+    upkeep corrects on it: whether a writer came in
     between is a question of this alone."""
 
     if head is None:
@@ -1369,9 +1369,7 @@ class Model:
         named = set()  # the index-side files the acknowledged entries read: only those become garbage
         for output, done in (e.get("cleaned_up") or {}).items():
             for d in self.cleanups.get((output, partition), []):
-                if d["id"] in done and d["kind"] == "sidecar":
-                    named |= {f"{d['prefix']}{f}.kg" for f in d["files"]}
-                elif d["id"] in done and d["kind"] == "abandoned" and "prefix" in d:
+                if d["id"] in done and d["kind"] == "abandoned" and "prefix" in d:
                     named.add(f"{d['prefix']}{int(d['commit_number']):012d}-{d['attempt']}")
             self._drop_cleanups(output, partition, done)
         for output, missed in (e.get("cleanup_unresolved") or {}).items():
@@ -1414,22 +1412,8 @@ class Model:
         key = (e["output"], e["partition"])
         if key not in self.indexes:
             return
-        if e.get("garbage"):  # the entries the merge dropped: their objects (§9.8)
-            prefix = self.indexes[key].prefix
-            self._collect(
-                *key, {"kind": "sidecar", "prefix": prefix, "files": [g["name"] for g in e["garbage"]]}
-            )
         index = self.indexes[key].compacted([FileInfo.from_json(f) for f in e["added"]], e["removed"])
         self._replace_index(key, index)
-
-    def _on_IndexRecounted(self, e):
-        key = (e["output"], e["partition"])
-        if key in self.indexes:
-            index = self.indexes[key] = self.indexes[key].recounted(
-                e["live"], e["pinned_count"], e["pinned_inexact"]
-            )
-            if key in self.heads:
-                self.heads[key]["count"] = index.count
 
     def _on_IndexTruncated(self, e):
         key = (e["output"], e["partition"])

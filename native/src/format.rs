@@ -13,7 +13,11 @@ use flate2::Compression;
 use crate::stream::{Block, Bytes, Merge, Next, Segment, Writer};
 
 pub const MAGIC: &[u8; 4] = b"CKX1";
-pub const FORMAT_VERSION: u16 = 3;
+pub const FORMAT_VERSION: u16 = 4;
+/// The most bytes a block may decode to (F29): writers close a block near
+/// `block_size` (64 KiB by default), so this bounds every reader, including
+/// those handed a bare block, and a block past it fails fast.
+pub const MAX_BLOCK_BYTES: u64 = 16 << 20;
 pub const CODEC_NONE: u8 = 0;
 pub const CODEC_ZLIB: u8 = 1;
 pub const FOOTER_SIZE: usize = 48;
@@ -100,10 +104,6 @@ pub(crate) fn compress(data: &[u8], codec: u8, level: u32) -> Vec<u8> {
     }
 }
 
-pub(crate) fn decompress(data: &[u8], codec: u8) -> Result<Vec<u8>> {
-    decompress_at_most(data, codec, u64::MAX)
-}
-
 /// `data` decompressed, unless that is more than `limit` bytes: an
 /// `Error::Limit` then, after reading no more than `limit + 1`.
 pub(crate) fn decompress_at_most(data: &[u8], codec: u8, limit: u64) -> Result<Vec<u8>> {
@@ -163,13 +163,7 @@ pub(crate) fn key_item(buf: &mut Vec<u8>, key: &[u8]) {
     buf.extend_from_slice(key);
 }
 
-pub(crate) fn tomb_item(buf: &mut Vec<u8>, key: &[u8]) {
-    buf.clear();
-    buf.push(b't');
-    buf.extend_from_slice(key);
-}
-
-/// Whether a filter may hold `item` (a `key_item` or a `tomb_item`).
+/// Whether a filter may hold `item` (a `key_item`).
 pub(crate) fn may_hold(bits: &[u8], item: &[u8], nbits: u64, k: u8) -> bool {
     test_bits(bits, item, nbits, k)
 }
@@ -186,16 +180,6 @@ pub fn bloom_check_keys(bits: &[u8], nbits: u64, k: u8, keys: &[&[u8]]) -> Vec<u
     keys.iter()
         .map(|key| {
             key_item(&mut buf, key);
-            test_bits(bits, &buf, nbits, k) as u8
-        })
-        .collect()
-}
-
-pub fn bloom_check_tombstones(bits: &[u8], nbits: u64, k: u8, keys: &[&[u8]]) -> Vec<u8> {
-    let mut buf = Vec::new();
-    keys.iter()
-        .map(|key| {
-            tomb_item(&mut buf, key);
             test_bits(bits, &buf, nbits, k) as u8
         })
         .collect()
@@ -408,9 +392,9 @@ pub fn parse_index_at_most(part: &[u8], file_size: u64, limit: u64) -> Result<In
     })
 }
 
-/// A file's two filters, keys and tombstones, `(nbits, k, bits)` each, from
-/// its tail (`tail` ends at `file_size`).
-pub fn parse_filters(tail: &[u8], file_size: u64) -> Result<[(u64, u8, &[u8]); 2]> {
+/// A file's key filter, `(nbits, k, bits)`, from its tail (`tail` ends at
+/// `file_size`).
+pub fn parse_filters(tail: &[u8], file_size: u64) -> Result<(u64, u8, &[u8])> {
     if tail.len() < FOOTER_SIZE {
         return fmt_err("tail too short");
     }
@@ -443,7 +427,7 @@ pub fn parse_filters(tail: &[u8], file_size: u64) -> Result<[(u64, u8, &[u8]); 2
         pos += bits.len();
         Ok((nbits, k, bits))
     };
-    let filters_out = [one()?, one()?];
+    let filters_out = one()?;
     if pos + 4 != filters.len() {
         return fmt_err("bytes past the filters");
     }

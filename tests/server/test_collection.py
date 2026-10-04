@@ -112,10 +112,11 @@ async def test_an_abandoned_attempts_objects_go(tmp_path, data, monkeypatch):
     await state.close()
 
 
-async def test_compaction_garbage_is_collected(tmp_path, data):
-    """Compaction drops shadowed entries — some never named as predecessors
-    (a key the filters cleared) — and lists them; with everything collected,
-    the store holds exactly what the index names."""
+async def test_compaction_leaves_nothing_uncollected(tmp_path, data):
+    """Compaction drops shadowed entries; writes are exact, so every one was
+    named as a predecessor by the delta that superseded it, and compaction
+    lists nothing of its own: with everything collected, the store holds
+    exactly what the index names."""
 
     rng = random.Random(11)
     pending = {"rows": {}}
@@ -142,17 +143,13 @@ async def test_compaction_garbage_is_collected(tmp_path, data):
         engine.upkeep.maintain()
         for job in list(engine.upkeep.jobs.values()):
             await job
-        compacted += sum(1 for d in state.model.cleanups.get(("items", ""), []) if d["kind"] == "sidecar")
-    assert compacted, "no compaction listed garbage"
+        files = state.model.indexes[("items", "")].files
+        compacted += any(f.name.startswith("c") or "-c" in f.name for f in files)  # compaction outputs
+    assert compacted, "no compaction ran"
     pending["rows"] = {}
     for _ in range(4):  # unchanged runs: each collects what is due
         await run(engine, ["items"])
     assert objects(data, "items") == await named(state, "items")
-    await engine.upkeep.collect()
-    sidecars = [
-        p for p in await state.list_objects(state.model.indexes[("items", "")].prefix) if p.endswith(".kg")
-    ]
-    assert sidecars == []  # each went once its entries were cleaned up
     await engine.stop()
     await state.close()
 

@@ -91,9 +91,6 @@ def test_filters_have_no_false_negatives(writer, reader):
     tail = _python.parse_tail(data[_python.parse_footer(data[-48:])["filters_offset"] :], len(data))
     nbits, k, bits = tail["key_filter"]
     assert reader.bloom_check_keys(bits, nbits, k, keys) == b"\x01" * len(keys)
-    gone = [keys[i] for i, d in enumerate(deleted) if d]
-    nbits, k, bits = tail["tomb_filter"]
-    assert reader.bloom_check_tombstones(bits, nbits, k, gone) == b"\x01" * len(gone)
 
 
 @pytest.mark.parametrize("impl", IMPLS)
@@ -108,17 +105,16 @@ def test_filter_false_positive_rate(impl):
 
 
 @pytest.mark.parametrize("impl", IMPLS)
-def test_a_file_has_two_filters_keys_and_tombstones(impl):
-    """docs/versions.md §3: no pair filter — a written key is a change
-    whatever the index holds, so nothing asks whether a version is live."""
+def test_a_file_has_one_filter_its_keys(impl):
+    """Format v4: one filter, every key, deleted ones included. Writes are
+    exact, so a key the filter holds is always read for its predecessor,
+    and a filter of tombstones would decide nothing (docs/key-index-design.md)."""
 
     data = encode(impl, [b"a", b"b"], [1, 2], b"\x00\x01")
     tail = _python.parse_tail(data[_python.parse_footer(data[-48:])["filters_offset"] :], len(data))
-    assert "pair_filter" not in tail
+    assert "tomb_filter" not in tail and "pair_filter" not in tail
     nbits, k, bits = tail["key_filter"]
     assert impl.bloom_check_keys(bits, nbits, k, [b"a", b"b"]) == b"\x01\x01"
-    nbits, k, bits = tail["tomb_filter"]
-    assert impl.bloom_check_tombstones(bits, nbits, k, [b"b"]) == b"\x01"
 
 
 @pytest.mark.parametrize("writer,reader", CROSS)
@@ -307,41 +303,6 @@ def test_a_varint_past_64_bits_is_refused(impl):
     impl.decode_block(entry[:-1] + b"\x01", 0)  # 2^64 - 1 itself fits
 
 
-def test_garbage_files_cross_decode():
-    """docs/key-index-format.md § Garbage files: a key may repeat, at the
-    generations a compaction dropped; each implementation reads the other's."""
-
-    rng = random.Random(11)
-    keys = sorted(f"k{rng.randrange(5000):05d}".encode() for _ in range(20_000))  # repeats
-    generations = [rng.randrange(1 << 40) for _ in keys]
-    data = _python.encode_garbage(keys, generations)
-    assert _native.decode_garbage(data) == (keys, generations)
-    bad = bytearray(data)
-    bad[20] ^= 1
-    for impl in (_python, _native):
-        with pytest.raises(ValueError):
-            impl.decode_garbage(bytes(bad))
-
-
-def test_a_compaction_names_every_object_it_drops():
-    """Every live entry a merge drops for a newer one of its key — from any
-    run, so a key can appear at several generations — goes to the garbage
-    files; tombstones, and entries at the generation that wins, do not."""
-
-    l2 = _native.encode_file([b"a", b"b", b"c"], [1, 1, 1], b"\x00\x00\x00")
-    l1 = _native.encode_file([b"a", b"b"], [2, 2], b"\x00\x01")  # b deleted
-    l0 = _native.encode_file([b"a", b"c"], [3, 1], b"\x00\x00")  # c: the same object
-    job = _native.Merge.compact(3, drop_deleted=True, garbage=True)
-    garbage = []
-    files = drive(job, [[l0], [l1], [l2]], on_garbage=garbage.append)
-    _, k, g, _, _ = decode_all(_native, files[0])
-    assert list(zip(k, g, strict=True)) == [(b"a", 3), (b"c", 1)]
-    [gf] = garbage
-    ks, gs = _python.decode_garbage(gf)
-    assert list(zip(ks, gs, strict=True)) == [(b"a", 2), (b"a", 1), (b"b", 1)]
-    assert job.garbage == 3
-
-
 def _zlib_bomb(payload_bytes: int) -> bytes:
     """One well-formed block entry, key `a`, with a payload of zeros, zlib
     compressed: a few KB that inflate a thousandfold."""
@@ -358,26 +319,34 @@ def _zlib_bomb(payload_bytes: int) -> bytes:
     return out + z.flush()
 
 
-@pytest.mark.xfail(strict=True, reason="F29: open")
 @pytest.mark.parametrize(
     "read",
     [
         lambda b: _native.lookup([b], 1, [b"a"]),
         lambda b: _native.merge_range([[b]], [1], None, None, False),
         lambda b: _native.decode_block(b, 1),
+        lambda b: _python.decode_block(b, 1),
     ],
-    ids=["lookup", "merge_range", "decode_block"],
+    ids=["lookup", "merge_range", "decode_block", "reference"],
 )
 def test_a_block_that_inflates_past_its_bound_is_refused(read):
     """F29: the readers that take a block without a limit inflated whatever
     its zlib stream held: here 32 KB to 32 MiB; a 64 MB block could ask for
-    gigabytes. A block's decoded size is bounded by what its file declares,
-    and one past it fails fast, before it is inflated whole."""
+    gigabytes. Format v4 bounds what any block decodes to (16 MiB, which
+    writers refuse to exceed), and one past it fails fast, before it is
+    inflated whole."""
 
     bomb = _zlib_bomb(32 << 20)
     assert len(bomb) < 64 << 10
     with pytest.raises(ValueError):
         read(bomb)
+
+
+def test_a_writer_refuses_a_block_past_the_bound():
+    """F29's other side: no writer produces a block readers would refuse."""
+
+    with pytest.raises(ValueError):
+        _native.encode_file([b"a"], [1], b"\x00", payloads=[bytes(17 << 20)])
 
 
 def test_malformed_input_raises_errors_never_panics():
@@ -405,7 +374,6 @@ def test_malformed_input_raises_errors_never_panics():
         lambda b: _native.parse_index(b, len(b)),
         lambda b: _native.parse_index(b, len(b) // 2),  # a part longer than its file
         lambda b: _native.parse_tail(b, len(b)),
-        lambda b: _native.decode_garbage(b),
     ]
     for blob in blobs:
         for parse in parsers:
@@ -560,10 +528,10 @@ def test_filters_read_alike_whatever_they_hold(filters, matching, short):
             tail = impl.parse_tail(data, len(data))
         except ValueError:
             return "refused"
-        return tail["key_filter"], tail["tomb_filter"]
+        return tail["key_filter"]
 
     native, reference = read(_native), read(_python)
     assert native == reference
     if native != "refused":
-        for nbits, _, bits in native:
-            assert len(bits) == nbits // 8
+        nbits, _, bits = native
+        assert len(bits) == nbits // 8

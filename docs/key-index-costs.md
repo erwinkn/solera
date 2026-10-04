@@ -57,21 +57,18 @@ but not bottom-level blocks.
 Every key written is a change (`versions.md`), so a commit needs the
 index only to tell new keys from existing ones — the count — and to find
 a source key's version to compare. Every index file carries two Bloom
-filters: one of its keys, one of its deleted keys. A Bloom filter answers
+filters (since format v4, one: its keys). A Bloom filter answers
 "definitely not present" or "maybe present".
 
 - A key **no key filter** of any file that could hold it matches is new.
   No block is read.
-- A key some key filter matches and **no tombstone filter** does is live:
-  an update. No block is read — unless the write carries a payload (a
-  source's version), which only the entry can be compared with.
-- Anything else — a key that may be deleted, a false positive, a
-  version to compare — gets the exact block lookup, which also lets
-  lookups skip files that don't hold the key.
+- Anything else gets the exact block lookup, which also lets lookups skip
+  files that don't hold the key.
 
-The **key count** becomes "exact after each recount, and within the
-filters' false-positive rate in between": a new key that a key filter
-wrongly reports as present is counted as an update until the next recount.
+Writes are exact (`key-index-design.md`), so the **key count** is exact.
+The figures below were measured before that, when a key filter match with
+no tombstone filter match counted as an update with no block read; a cold
+write of existing keys now reads their blocks (~1.25 per key).
 
 ## Measured
 

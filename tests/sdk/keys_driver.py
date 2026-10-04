@@ -15,10 +15,9 @@ def segments(files, per):
             yield data[start:end], [(off - start, size, crc) for _, off, size, _, crc in run], idx["codec"]
 
 
-def drive(job, runs, rows=(), per=3, on_garbage=None):
+def drive(job, runs, rows=(), per=3):
     """Runs `job` over `runs` (each a list of whole files, in key order) and,
-    for a streamed replacement, the chunks `rows`; returns the files written,
-    and hands a compaction's garbage files to `on_garbage`."""
+    for a streamed replacement, the chunks `rows`; returns the files written."""
 
     feeds = [segments(files, per) for files in runs]
     rows = iter(rows)
@@ -31,8 +30,6 @@ def drive(job, runs, rows=(), per=3, on_garbage=None):
         elif kind == "rows":
             chunk = next(rows, None)
             job.end_rows() if chunk is None else job.feed_rows(chunk)
-        elif kind == "garbage":
-            on_garbage(x)
         else:
             out.append(x)
     return out

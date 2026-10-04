@@ -895,11 +895,10 @@ shows.
   pin predates it, the engine calls `store.cleanup(context, prior, names)`
   with the delta's predecessors, in batches of 1,000; then the entry goes.
   A superseded value is one name from the previous head's ref.
-- **Entries dropped by compaction.** An `IndexCompacted` records, at its
-  event counter, one data-garbage entry naming the dropped entries (in a
-  sidecar file the compaction writes, not in the event); they are
-  cleaned up under the same pin rule. A name already cleaned up through a
-  predecessor is cleaned up again, harmlessly.
+- **Entries dropped by compaction** need nothing of their own: writes are
+  exact, so every version a compaction drops was named as a predecessor by
+  the delta that replaced it, and is cleaned up through that delta
+  (docs/key-index-design.md).
 - **Attempts that ended without committing.** Their names carry their own
   generation, which no other attempt uses, and their `AttemptFinished`
   without a commit is durable: the engine cleanups the names in their
@@ -948,8 +947,8 @@ three such attempts it is `stuck`: no longer handed out, listed in
 `solera cleanups OUTPUT [Partition] --clear` (its objects stay). An
 abandoned attempt's keyed names come from listing its own delta files
 (`{commit_number:012d}-{attempt}*` under the index prefix, complete because
-deltas are uploaded before data), not from a sweep; those delta files and
-consumed compaction sidecars then go through the ordinary index garbage.
+deltas are uploaded before data), not from a sweep; those delta files then
+go through the ordinary index garbage.
 A pattern change drain's snapshot pin (`position.pattern change.pin`) holds both
 index-file garbage and data cleanups, as a live claim does; a retry pass
 needs none, since each of its batches reads the state of its own prepare

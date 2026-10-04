@@ -107,10 +107,10 @@ v3       (key, generation, deleted, payload?)    + predecessor generation
   `(key, version)` live?", which no write asks any more: a written key is
   a change whatever the index holds, and the only comparison left, a
   source's versions, reads the entry or streams the index. The sparse
-  reader keeps its two answers: no key filter matched means new; a key
-  filter match with no tombstone match, for an upsert without a payload,
-  counts as an update (inexact on a false positive, as before); anything
-  else gets an exact lookup.
+  reader has two answers: no key filter matched means new; anything else
+  gets an exact lookup (exact writes, `key-index-design.md`; until then a
+  key-filter match with no tombstone match counted as an update with no
+  read).
 
 The resolver, the engine cache, compaction and `.kg` garbage files keep
 their roles with the smaller entry. A delta needs the index only to tell

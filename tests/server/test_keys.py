@@ -4,13 +4,11 @@ log, the engine truncates the log behind consumers, compacts, recounts, and
 deletes files nothing references — and renames carry all of it along (§2)."""
 
 import asyncio
-import dataclasses
 import random
-import threading
 
 import pytest
 from solera.keys import resolver
-from solera.keys.index import DeltaFiles, IndexState, KeyIndex, Options
+from solera.keys.index import KeyIndex, Options
 from solera.sdk import DynamicPartitions, Incremental, Output, Project, Ref, Source, asset
 from solera.stores import FileStore, Patch
 from solera_server.engine import Engine
@@ -173,13 +171,13 @@ async def test_a_patch_reconciles_what_a_dead_sql_writer_left(state, arrow):
     live.rows["b"] = {"id": "b", "v": 1}
     key = ("items", "")
     state.model.repairs[key] = [
-        {"added": 0, "removed": 0, "exact": True, "files": [], "unknown": True, "run": "r", "attempt": "dead"}
+        {"added": 0, "removed": 0, "files": [], "unknown": True, "run": "r", "attempt": "dead"}
     ]
     pending["rows"] = [{"id": "c", "v": 1}]
     await run(engine, ["items"])
     assert key not in state.model.repairs
     index = state.model.indexes[key]
-    assert index.count == 2 and index.count_exact
+    assert index.count == 2
     assert sorted((await engine.list_keys("items"))["keys"]) == ["b", "c"]
     assert sorted(live.rows) == ["b", "c"]
 
@@ -234,7 +232,7 @@ async def test_compaction_truncation_and_garbage(state):
         await settle(engine)
 
     index = state.model.indexes[("items", "")]
-    assert index.count == len(truth) and index.count_exact
+    assert index.count == len(truth)
     assert len(index.level(0)) < 3 and index.depth >= 1  # compacted
     head_commit = state.model.heads[("items", "")]["commit_number"]
     position = state.model.position("mirror", "items", "")
@@ -245,76 +243,6 @@ async def test_compaction_truncation_and_garbage(state):
     assert on_disk(state, index) == {index.path(n) for n in index.referenced()} | read
     assert sorted((await engine.list_keys("items"))["keys"]) == sorted(truth)
     assert await _stored(engine, state) == truth
-
-
-async def test_recount_makes_an_approximate_count_exact(state):
-    """§6: an index whose count drifted is recounted with a full scan."""
-
-    @asset(outputs=Output("items", key="id"))
-    def items():
-        return [{"id": str(i)} for i in range(5)]
-
-    project = Project(assets=[items])
-    engine = engine_for(state, project, recount_interval=0)
-    await engine.initialize()
-    await run(engine, ["items"])
-    key = ("items", "")
-    state.model.indexes[key] = dataclasses.replace(state.model.indexes[key], count=3, inexact=1)
-    await settle(engine)
-    assert state.model.indexes[key].count == 5 and state.model.indexes[key].count_exact
-    assert state.model.heads[key]["count"] == 5
-
-
-async def test_a_commit_during_the_recount_keeps_it(state, monkeypatch):
-    """§6: a recount is exact for the index it pinned; a commit landing while
-    it runs adds its own `added - removed` on top, so a busy index still gets
-    its exact count back."""
-
-    rows = [{"id": str(i)} for i in range(5)]
-
-    @asset(outputs=Output("items", key="id"))
-    def items():
-        return rows
-
-    engine = engine_for(state, Project(assets=[items]), recount_interval=0)
-    await engine.initialize()
-    await run(engine, ["items"])
-    key = ("items", "")
-    state.model.indexes[key] = dataclasses.replace(state.model.indexes[key], count=3, inexact=1)
-
-    # A recount still running when the next commit lands, as a large index's is.
-    started, release = threading.Event(), threading.Event()
-    recount, counted = KeyIndex.recount, []
-
-    async def slow_recount(self):
-        started.set()
-        await asyncio.to_thread(release.wait, 10)
-        counted.append(await recount(self))
-        return counted[-1]
-
-    monkeypatch.setattr(KeyIndex, "recount", slow_recount)
-    await engine.upkeep.tick()
-    assert engine.upkeep.jobs, "a recount should be running"
-    await asyncio.to_thread(started.wait, 10)
-    rows.append({"id": "new"})
-    await run(engine, ["items"])  # an exact commit: +1
-    assert state.model.indexes[key].count == 4 and not state.model.indexes[key].count_exact
-    release.set()
-    await asyncio.gather(*engine.upkeep.jobs.values())
-    index = state.model.indexes[key]
-    assert counted == [5] and not engine.failing  # one recount, of the pinned 5 keys
-    assert index.count == 6 == len(rows) and index.count_exact
-    assert state.model.heads[key]["count"] == 6
-
-
-def test_a_recount_stays_inexact_if_a_later_commit_was():
-    pinned = IndexState(count=10, inexact=2)
-    later = pinned.committed(0, DeltaFiles([], 3, 0, True), keep_log=False)
-    later = later.committed(1, DeltaFiles([], 1, 0, False), keep_log=False)
-    assert (later.count, later.inexact) == (14, 3)
-    recounted = later.recounted(9, pinned.count, pinned.inexact)
-    assert (recounted.count, recounted.inexact, recounted.count_exact) == (13, 1, False)
-    assert later.recounted(9, later.count, later.inexact).count_exact
 
 
 async def test_a_consumer_without_a_log_starts_over(state):
@@ -822,7 +750,6 @@ async def test_a_listing_holds_its_index_files_through_collection(tmp_path, monk
 
     import asyncio
 
-    from solera.keys.index import KeyIndex
     from solera.sdk import Source
     from solera_server.engine import Engine
 

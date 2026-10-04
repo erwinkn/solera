@@ -77,7 +77,7 @@ fn main() {
     let (codec, blocks) = format::file_blocks(&f).unwrap();
     let data: Bytes = Arc::new(f);
     let t = Instant::now();
-    let mut job = Compact::new(1, true, false, o, 64 << 20);
+    let mut job = Compact::new(1, true, o, 64 << 20);
     let mut fed = false;
     let mut files = 0;
     loop {
@@ -98,7 +98,6 @@ fn main() {
                 job.writer.files.pop_front();
                 files += 1;
             }
-            Step::Garbage => unreachable!("no garbage asked for"),
             Step::Rows | Step::Page => unreachable!(),
             Step::Done => break,
         }

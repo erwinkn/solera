@@ -1,4 +1,4 @@
-"""The native streaming jobs — full replacement, compaction, recount — and
+"""The native streaming jobs — full replacement, compaction — and
 the written content they read, against plain-Python expectations and the
 `_python` reference."""
 
@@ -219,9 +219,6 @@ def test_compact_many_files():
         files = drive(job, runs, per=2)
         got = content(files)
         assert got == [(k, g, d, p) for k, (g, d, p) in sorted(want.items()) if not (drop and d)]
-    count = _native.Merge.count(len(runs))
-    drive(count, runs)
-    assert count.live == sum(1 for _, d, _ in want.values() if not d)
 
 
 def test_key_rows_shapes():

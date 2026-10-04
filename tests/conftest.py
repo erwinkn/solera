@@ -82,7 +82,7 @@ async def worker_finished() -> None:
 
 
 async def maintenance_drained(engine) -> None:
-    """Upkeep with nothing left in flight: compactions and recounts done,
+    """Upkeep with nothing left in flight: compactions done,
     their results recorded, garbage collected."""
 
     upkeep = engine.upkeep

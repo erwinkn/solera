@@ -2,16 +2,16 @@
 //! native from start to delta. Python chooses files and fetches their tails
 //! and blocks; this decides, for each of the sorted entries — by its
 //! position, never a Python object — what the index holds: read from a
-//! block, absent by the key filters, or — for an upsert carrying no payload,
-//! which changes the key whatever its entry — live by the key and tombstone
-//! filters; then writes the delta by the one rule (`delta.rs`).
+//! block, or absent by the key filters; then writes the delta by the one
+//! rule (`delta.rs`). Writes are exact: a key a filter holds is always read,
+//! for the predecessor its delta entry names (docs/key-index-design.md).
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use crate::delta::{Delta, Old, Write};
+use crate::delta::{Delta, Old};
 use crate::entries::SortedEntries;
-use crate::format::{key_item, may_hold, tomb_item, Options, Result};
+use crate::format::{key_item, may_hold, Options, Result};
 use crate::stream::Block;
 
 #[derive(Clone)]
@@ -22,8 +22,6 @@ enum Known {
     Absent,
     /// Read live, at this generation, with this payload.
     Live(u64, Option<Vec<u8>>),
-    /// Live, as the filters said.
-    Other,
     /// The filters cannot decide: an exact read in the files holding it.
     Maybe,
 }
@@ -34,11 +32,9 @@ pub type Filter<'a> = (u64, u8, &'a [u8]);
 pub struct Sparse {
     pub sorted: Arc<SortedEntries>,
     known: Vec<Known>,
-    tomb: Vec<bool>,
     key: Vec<bool>,
     /// Per file the filters ran on (an id the caller gives): positions its key filter holds.
     holders: BTreeMap<usize, Vec<u32>>,
-    pub inferred: bool,
 }
 
 impl Sparse {
@@ -47,10 +43,8 @@ impl Sparse {
         Sparse {
             sorted,
             known: vec![Known::Unknown; n],
-            tomb: vec![false; n],
             key: vec![false; n],
             holders: BTreeMap::new(),
-            inferred: false,
         }
     }
 
@@ -187,9 +181,9 @@ impl Sparse {
         Ok(())
     }
 
-    /// Runs one file's filters over the undecided positions in `[lo, hi)`;
+    /// Runs one file's key filter over the undecided positions in `[lo, hi)`;
     /// `file` names it for the exact reads that follow.
-    pub fn filter(&mut self, file: usize, lo: usize, hi: usize, keys: Filter, tombs: Filter) {
+    pub fn filter(&mut self, file: usize, lo: usize, hi: usize, keys: Filter) {
         let mut item = Vec::new();
         let mut held = Vec::new();
         for p in lo..hi {
@@ -203,30 +197,23 @@ impl Sparse {
             }
             held.push(p as u32);
             self.key[p] = true;
-            tomb_item(&mut item, key);
-            self.tomb[p] |= may_hold(tombs.2, &item, tombs.0, tombs.1);
         }
         if !held.is_empty() {
             self.holders.insert(file, held);
         }
     }
 
-    /// Decides what the filters can: no key filter holds a key — absent; an
-    /// upsert with no payload, which no tombstone filter holds — live, unless
-    /// `exact`; the rest need an exact read.
-    pub fn classify(&mut self, exact: bool) {
+    /// Decides what the filters can: no key filter holds a key — absent; the
+    /// rest need an exact read.
+    pub fn classify(&mut self) {
         for p in 0..self.known.len() {
             if !matches!(self.known[p], Known::Unknown) {
                 continue;
             }
-            let bare = matches!(self.sorted.write(p), Write::Upsert(None));
-            self.known[p] = if !self.key[p] {
-                Known::Absent
-            } else if bare && !self.tomb[p] && !exact {
-                self.inferred = true;
-                Known::Other
-            } else {
+            self.known[p] = if self.key[p] {
                 Known::Maybe
+            } else {
+                Known::Absent
             };
         }
     }
@@ -235,7 +222,6 @@ impl Sparse {
     fn old(&self, p: usize) -> Old<'_> {
         match &self.known[p] {
             Known::Live(g, payload) => Old::Live(*g, payload.as_deref()),
-            Known::Other => Old::Other,
             _ => Old::Absent,
         }
     }

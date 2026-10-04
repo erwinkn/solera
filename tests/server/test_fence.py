@@ -361,7 +361,7 @@ async def test_a_drain_that_outlives_its_grace_is_forced_and_still_writing(tmp_p
     await engine.initialize()
     run, attempt = await launched(engine, ["remote"])
     await own(state, run["id"], attempt)
-    intents = {"remote": {"files": [], "added": 0, "removed": 0, "exact": True}}
+    intents = {"remote": {"files": [], "added": 0, "removed": 0}}
     await as_worker(state, run["id"], attempt, lifecycle.WRITING, intents=intents)
     await until(engine, lambda: engine.live[attempt].started)
     await engine.cancel(run["id"])
@@ -986,7 +986,7 @@ async def test_an_adopted_attempt_fails_under_the_contract_it_was_launched_with(
         served = Project(assets=[asset(executor=Fake("fake")())(remote.fn)], executors=[Fake("fake")])
     state, engine = await restart(state, engine, url, served)
     await engine.initialize()
-    intents = {"remote": {"files": [], "added": 0, "removed": 0, "exact": True}}
+    intents = {"remote": {"files": [], "added": 0, "removed": 0}}
     await failed_writing(state, run["id"], attempt, intents)
     await until(engine, lambda: state.model.claimed(attempt) is None)
     assert state.model.runs[run["id"]]["status"] == "failed"

@@ -1,15 +1,13 @@
 """Seed corpora for the fuzz targets: real files the writers make, so the
 fuzzer starts from the format rather than rediscovering it.
 
-    uv run python native/fuzz/seeds.py   # writes native/fuzz/corpus/{kx-file,kg-file}
+    uv run python native/fuzz/seeds.py   # writes native/fuzz/corpus/kx-file
 """
 
 import random
 from pathlib import Path
 
 from solera import _native
-
-from tests.sdk import keys_reference
 
 root = Path(__file__).parent / "corpus"
 rng = random.Random(7)
@@ -35,10 +33,4 @@ for i, (n, kw) in enumerate(
     ]
 ):
     (root / "kx-file" / f"seed{i}").write_bytes(kx(n, **kw))
-(root / "kg-file").mkdir(parents=True, exist_ok=True)
-for i, n in enumerate([0, 1, 50]):
-    keys = sorted(f"k{rng.randrange(40):03d}".encode() for _ in range(n))
-    (root / "kg-file" / f"seed{i}").write_bytes(
-        keys_reference.encode_garbage(keys, [rng.randrange(1 << 40) for _ in keys])
-    )
 print("seeds written under", root)

@@ -579,7 +579,7 @@ function LiveKeys({ name, asset }: { name: string; asset: AssetDecl }) {
             ) : (
               ""
             )}
-            {first && ` · ${first.exact ? "" : "about "}${plural(first.total, "key")}`}
+            {first && ` · ${plural(first.total, "key")}`}
             {" · a key's version is the generation that last wrote it"}
           </>
         }

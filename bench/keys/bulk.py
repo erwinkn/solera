@@ -4,7 +4,7 @@
 
 The operations that touch every key: an initial load, a full replacement
 (every key written again: a derived output's keys carry no payload), a
-compaction that rewrites the bottom level, and a recount. The index they run on
+and a compaction that rewrites the bottom level. The index they run on
 holds every key in level 1 and, in level 0, a patch of 1% of them. Each runs in a process of its own after its input exists, and
 reports the peak resident memory it added on top of that input — the data a
 worker would already hold (the kernel's peak counter is reset first).
@@ -41,7 +41,6 @@ CASES = (
     "replace-list",
     "replace-arrow",
     "compact",
-    "recount",
 )
 
 
@@ -111,9 +110,7 @@ async def one(case: str, n: int, prefix: str, state_file: str | None, args) -> d
         if load or replacing:
             files, _ = await idx.replace(rows, 2, case, generation=3)
             return files
-        if case == "compact":
-            return await idx.compact((state.level(0) + state.level(1), 1))
-        return await idx.recount()
+        return await idx.compact((state.level(0) + state.level(1), 1))
 
     base, _ = memory()
     reset_peak()
@@ -134,9 +131,7 @@ async def one(case: str, n: int, prefix: str, state_file: str | None, args) -> d
         "mb_in": m["bytes_in"] / 1e6,
         "mb_out": m["bytes_out"] / 1e6,
     }
-    if case == "recount":
-        assert out == n, (out, n)
-    elif case == "compact":
+    if case == "compact":
         result["files"] = len(out[0])
     else:
         files = out.files
@@ -150,7 +145,7 @@ async def one(case: str, n: int, prefix: str, state_file: str | None, args) -> d
 
 
 async def build(n: int, prefix: str, path: str) -> None:
-    """The index the replacement, compaction and recount run on: every key at
+    """The index the replacement and compaction run on: every key at
     generation 1 in level 1, then a patch of 1% of them (ids ending in 00) at
     generation 2 in level 0."""
 
@@ -228,14 +223,14 @@ async def main():
         state_file = f"/tmp/bench-bulk-{uuid.uuid4().hex[:8]}.json"
         try:
             cases = args.cases.split(",")
-            if {"replace-list", "replace-arrow", "compact", "recount"} & set(cases):
+            if {"replace-list", "replace-arrow", "compact"} & set(cases):
                 t = time.perf_counter()
                 await build(n, prefix, state_file)
                 print(f"[{n:,}: index built in {time.perf_counter() - t:.0f} s]", flush=True)
             for case in cases:
                 if Rows is None and "arrow" in case:
                     continue
-                needs = case.startswith(("replace", "compact", "recount"))
+                needs = case.startswith(("replace", "compact"))
                 r = run_case(case, n, prefix, state_file if needs else None, args)
                 if r is not None:
                     results.append(r)

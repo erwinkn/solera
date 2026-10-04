@@ -84,13 +84,11 @@ async def run(
     runs: list[list],
     on_file: Callable[[int, bytes], Awaitable[None]] | None = None,
     rows: Iterable | None = None,
-    on_garbage: Callable[[int, bytes], Awaitable[None]] | None = None,
     local: list[list] | None = None,
 ) -> None:
     """Drive `job` to the end over `runs` (each a list of `FileInfo`, in key
     order; newest run first). Written files go to `on_file(n, data)`, `n`
-    counting from 0 in key order, and a compaction's garbage files to
-    `on_garbage(n, data)`. `rows` feeds a streamed replacement its sorted
+    counting from 0 in key order. `rows` feeds a streamed replacement its sorted
     chunks; they are pulled off the event loop. `local`: the runs as
     `LocalFile`s, read in place of the store."""
 
@@ -99,7 +97,7 @@ async def run(
     readers = [] if local is not None else [_Run(io, path, files) for files in runs]
     chunks = iter(rows) if rows is not None else None
     uploads: list[asyncio.Future] = []  # in the order started: cancelled so, never a set's order
-    n = g = 0
+    n = 0
     try:
         while (step := await in_thread(job.step)) is not None:
             kind, x = step
@@ -121,12 +119,8 @@ async def run(
                     for t in [t for t in uploads if t.done()]:
                         t.result()
                     uploads = [t for t in uploads if not t.done()]
-                if kind == "garbage":
-                    uploads.append(asyncio.ensure_future(on_garbage(g, x)))
-                    g += 1
-                else:
-                    uploads.append(asyncio.ensure_future(on_file(n, x)))
-                    n += 1
+                uploads.append(asyncio.ensure_future(on_file(n, x)))
+                n += 1
         await asyncio.gather(*uploads)
     finally:
         await asyncio.gather(*(r.close() for r in readers))

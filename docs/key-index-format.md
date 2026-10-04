@@ -1,4 +1,4 @@
-# Key index file format (`.kx`, version 3)
+# Key index file format (`.kx`, version 4)
 
 Byte-level format of a key index file (`object-store-state.md` §6). The
 `solera._native` Rust extension reads and writes it; `tests/sdk/keys_reference.py`
@@ -51,21 +51,27 @@ compression absorbs. A payload is present or not, never implied: an
 empty payload (a set's element) is flag bit 2 and a zero length.
 
 The block's bytes are the concatenated encoded entries, compressed with
-the file's codec (footer).
+the file's codec (footer). A block decodes to at most 16 MiB, counting its
+entries' bytes and their keys expanded: writers close a block near the
+block size (64 KiB by default) and refuse an entry that would push it past
+16 MiB, and readers refuse a block past it, failing before they inflate it
+whole (F29).
 
 ## Filters
 
 ```
-filters := filter(keys) filter(tombstones) crc32
+filters := filter(keys) crc32
 filter  := nbits varint, k u8, bits (nbits / 8 bytes)
-crc32   := u32, CRC-32 of the two filters' bytes
+crc32   := u32, CRC-32 of the filter's bytes
 ```
 
-Two Bloom filters: one over every key in the file, one over every deleted
-key. Each is sized to its own item count. Readers reject bytes after the
-second filter.
+One Bloom filter, over every key in the file, deleted ones included.
+Readers reject bytes after it. (Version 3 had a second filter, of deleted
+keys, for a shortcut that guessed a key live from the filters alone; writes
+are exact now, so a key the filter holds always has its block read, for
+the predecessor its delta names: docs/key-index-design.md.)
 
-- Items: a key is `b"k" + key`; a deleted key is `b"t" + key`.
+- Items: a key is `b"k" + key`.
 - Filters are **blocked**: `nbits` is a whole number of 512-bit (64-byte)
   blocks, and all `k` bits of an item fall in one block — one cache line
   per item.
@@ -101,7 +107,7 @@ Fixed 48 bytes at the very end of the file:
 | Offset | Size | Field |
 |---|---|---|
 | 0 | 4 | magic `CKX1` |
-| 4 | 2 | format version, `3` |
+| 4 | 2 | format version, `4` |
 | 6 | 1 | codec: `0` none, `1` zlib |
 | 7 | 1 | reserved, `0` |
 | 8 | 8 | entries |
@@ -115,49 +121,12 @@ Fixed 48 bytes at the very end of the file:
 `tail length = file size − filters offset`; `index part = file size −
 index offset`. A reader that needs only the block index (a scan) fetches
 the index part alone; one that needs the filters fetches the whole tail.
-Readers verify both magics, the version (3: earlier versions carried a
-content version per entry and are not read), the index CRC, the filters CRC
-when they read the filters, and each block's CRC before decoding it.
+Readers verify both magics, the version (4: earlier versions are not
+read), the index CRC, the filters CRC when they read the filters, and each
+block's CRC before decoding it.
 
 ## Empty files
 
-A file with no entries has no blocks; each of its filters has `nbits = 512`, and
+A file with no entries has no blocks; its filter has `nbits = 512`, and
 its index has empty `min_key` and `max_key` and `blocks = 0`. Writers only
 produce one for an empty delta.
-
-## Garbage files (`.kg`, version 2)
-
-A compaction of an index whose output is on an immutable store
-(`lifecycle.md` §9.8) also writes, beside its `.kx` outputs, the entries
-its merge dropped that name an object: every live entry passed over for a
-newer entry of the same key at another generation. A key may appear
-several times — a merge can drop its entries from more than one input —
-which a `.kx` file cannot hold, so these are a format of their own.
-Tombstones name no object and are never listed; an entry at the
-surviving entry's generation is the same object and is not listed either.
-
-```
-file   := block* footer
-block  := length u32 · crc32 u32 · bytes      length and CRC-32 of the compressed bytes
-entry  := key (varint len + bytes) · generation varint
-```
-
-A block's bytes decompress (the footer's codec) to consecutive entries,
-in key order across the file; writers close a block once its entries reach
-64 KiB, and a file once its blocks reach the compaction's file size, so a
-compaction may write several. Footer, fixed 24 bytes at the end:
-
-| Offset | Size | Field |
-|---|---|---|
-| 0 | 4 | magic `CKG1` |
-| 4 | 2 | format version, `2` |
-| 6 | 1 | codec: `0` none, `1` zlib |
-| 7 | 1 | reserved, `0` |
-| 8 | 8 | entries |
-| 16 | 4 | blocks |
-| 20 | 4 | magic `CKG1` |
-
-Readers verify both magics, the version, each block's CRC, and that the
-blocks and entries they read match the footer. Garbage files are named
-`g{stamp}-{n:04d}.kg` beside the compaction's outputs; the compaction's
-result lists them, and they are deleted once their objects are.

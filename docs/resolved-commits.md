@@ -273,12 +273,12 @@ freeze, no response to recover and no engine-written file to clean up.
   timeouts count as declines.
 
 **Exact counts.** The engine resolves against full entries, never through
-filters, so `added` and `removed` are exact and an engine-resolved commit
-never increments `inexact`.
+filters, so `added` and `removed` are exact (and so, since exact writes,
+does every resolver: `key-index-design.md`).
 
 **Which snapshot.** While an attempt is live it holds its claim: no
-other commit can change that index, and compaction and recounts change its
-files and count fields but not its content. The engine therefore resolves
+other commit can change that index, and compaction changes its files but
+not its content. The engine therefore resolves
 against the file set it currently holds for that partition, once validation
 passed, and pins that file set before any asynchronous work (§5); the
 content is the pinned snapshot's even if compaction swapped files since
@@ -506,20 +506,18 @@ planner:
    all at once, and resolve newest first;
 2. for the larger levels, read the tails of the files whose key range
    covers a written key, all at once;
-3. classify each key with the filters: absent (no key filter matched),
-   live (a key filter matched, no tombstone filter did, and the upsert
-   carries no payload to compare: written, so changed), or maybe;
+3. classify each key with the filters: absent (no key filter matched), or
+   maybe;
 4. read the blocks of the maybe keys, only in files whose key filter
    matched, all levels at once; each key takes its newest entry.
 
-**Its contract:** the delta is exact; the count is exact unless the
-filters counted a key live behind a key-filter false positive (0.35% per
-check), which increments `inexact` as today. Nothing that decides
-correctness — scheduling, skipping, "unchanged" — reads the count.
-Reading every live key's entry would make the count exact here too, at
-~1.25 block reads per changed key instead of ~0.01: ~1,250 more GETs for
-1K keys at 100M, ~$0.0005 per commit. Indexes over the cache budget take
-this path on every commit, so the design keeps filters and recounts (§12).
+**Its contract:** the delta and the count are exact, and every written key
+that was live names its predecessor (exact writes, `key-index-design.md`).
+Until then a key a key filter matched and no tombstone filter did was
+counted live with no block read, and the count was inexact behind a
+false positive; that shortcut, the tombstone filter, `inexact` and
+recounts are gone. The cost is ~1.25 block reads per updated key instead
+of ~0.01 on a cold reader: ~1,250 more GETs for 1K random updates at 100M.
 An upsert carrying a payload (a source's version) is always read: only
 its entry says whether the version moved — at 10M keys, ~700 GETs for a
 cold 1K-key source commit with versions (`bench/keys/results.md`), which
@@ -755,9 +753,7 @@ reports both.
 
 - **Equivalence.** Engine-resolved and locally resolved deltas decode to
   the same entries (compressed bytes may differ); engine counts equal an
-  oracle's exact counts; the cold path's counts satisfy its contract
-  (`inexact` set exactly when the filters decided, and `added − removed`
-  off by at most the keys it decided). Over random patches, removes,
+  oracle's exact counts, on every path. Over random patches, removes,
   replacements, repairs and compactions between prepare and resolve.
 - **Repair.** The `a=1 → a=2 → a=1` sequence rewrites the store with an
   empty delta; a replacement with repair intents rewrites the partition;
@@ -818,9 +814,10 @@ The follow-up review agrees with all three.
   Under the claim they have the same content, and the current files
   are the warm ones; validation and pinning before any asynchronous work
   make a moved head a `stale` decline rather than a wrong answer.
-- **Filters and recounts stay.** The sparse reader's pair-filter shortcut
-  keeps a declined or over-budget index at ~50 GETs per small commit
-  instead of ~1,300, and approximate counts never decide correctness.
+- **Writes are exact** (since `key-index-design.md`): the sparse reader
+  reads every key a filter holds, so a declined or over-budget index pays
+  ~1,300 GETs per 1K random updates at 100M instead of ~50, for exact
+  counts, exact predecessors and no recount.
 
 ## 13. Open questions
 
@@ -847,8 +844,7 @@ here.
 
 | Piece | Where |
 |---|---|
-| Sparse reader, streaming patch, the two switches, `exact`, `get` | `KeyIndex.resolve` / `changes` / `lookup` (`solera/keys/index.py`), its per-key state native (`native/src/sparse.rs`: filters, block reads, the delta by position); `Job.patch` and `Job.replace`, one merge-join (`native/src/jobs.rs`) |
-| Compaction garbage | `KeyIndex.compact(garbage=True)`; `.kg` files (`key-index-format.md` § Garbage files) |
+| Sparse reader, streaming patch, the two switches, `get` | `KeyIndex.resolve` / `delta` / `lookup` (`solera/keys/index.py`), its per-key state native (`native/src/sparse.rs`: filters, block reads, the delta by position); `Job.patch` and `Job.replace`, one merge-join (`native/src/jobs.rs`) |
 | Repair by store kind, unknown opaque writes | `_store_outputs` and `_reconcile` (`solera_worker/worker.py`); acquisition is the lifecycle's |
 | Local form, lookups and merges over it | `native/src/local.rs`: `build_local`, `LocalFile`, `Snapshot` |
 | The cache | `EngineCache` (`solera/keys/cache.py`) |

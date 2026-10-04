@@ -426,8 +426,11 @@ listing. *Was:* batch (output side). *Example:* commit 57 of
 **key index**. The engine's index of an output partition's keys: per
 key its generation, whether it was removed (a **tombstone**), and its
 version for source keys. A log-structured merge tree of `.kx` files on
-the object store, compacted and recounted in the background. *Was:* pair
-filter, locator (removed by `versions.md`).
+the object store, compacted in the background. Writes are exact: every
+delta entry names its key's predecessor when the key was live, so the
+count is exact and the replaced versions are listed for cleanup.
+*Was:* pair filter, locator (removed by `versions.md`); inexact counts and
+recounts (removed by exact writes, `key-index-design.md`).
 
 **delta**. The keys one commit changed: upserted and removed, one delta
 file per commit number. The **delta log** is the deltas from the furthest

@@ -442,38 +442,6 @@ async def test_a_task_over_many_batches_keeps_no_list_of_them(state, clock):
     assert max(sizes) < min(sizes) + 400  # flat, however many batches
 
 
-async def test_a_recount_meanwhile_does_not_refuse_a_commit(state, clock):
-    """Review round 2, engine #3: a recount corrects the head's count while
-    an attempt runs. No writer came in between: its commit stands."""
-
-    engine = engine_on(state, clock)
-    await quiet(engine)
-    await settle(engine, (await engine.submit(["files"]))["id"])
-    held_engine = engine_on(state, clock, placement="hold")
-    run, task_id, attempt = await held(held_engine, ["files"])
-    for _ in range(6000):  # launched: its spec written and its launch durable, however busy the host
-        if "launched" in state.model.task(task_id):
-            break
-        await asyncio.sleep(0.01)
-    prepared = state.model.task(task_id)["launched"]["prepared"]
-    count = state.model.heads[("files", "")]["count"]
-    state.record(
-        {
-            "type": "IndexRecounted",
-            "output": "files",
-            "partition": "",
-            "live": count + 1,
-            "pinned_count": state.model.indexes[("files", "")].count,
-            "pinned_inexact": 0,
-        }
-    )
-    assert state.model.heads[("files", "")]["count"] != count
-    held_engine.commit_attempt(attempt, prepared, {"outputs": {"files": {"unchanged": True}}})
-    assert (
-        state.model.claimed(attempt) is None and state.model.task(task_id)["last"]["outcome"] == "succeeded"
-    )
-
-
 def test_one_outputs_heads_are_found_without_looking_at_the_others():
     """Review round 5, engine #7: `heads_of` scanned every output's heads,
     so preparing a fan-in grew with the whole namespace. Heads are held by

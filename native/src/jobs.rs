@@ -1,5 +1,5 @@
 //! The streaming jobs over an index: the merge-join of written content with
-//! it — a patch, or a full replacement — a compaction, and a recount. Each is
+//! it — a patch, or a full replacement — a compaction, and a scan. Each is
 //! driven by `step`, which runs until it needs input or has a file to hand
 //! over; the caller does the I/O.
 
@@ -7,7 +7,6 @@ use std::cmp::Ordering;
 
 use crate::delta::{Delta, Old, Write};
 use crate::format::{Error, Options, Result};
-use crate::garbage::GarbageWriter;
 use crate::rows::Source;
 use crate::stream::{Merge, Next, State, Writer};
 
@@ -18,8 +17,6 @@ pub enum Step {
     Rows,
     /// A file is ready: `Writer::files`.
     File,
-    /// A garbage file is ready: `Compact::garbage`'s `files`.
-    Garbage,
     /// A page of entries is ready: `Scan::page`.
     Page,
     Done,
@@ -127,29 +124,20 @@ impl Join {
 }
 
 /// Merges runs into new files, newest entry winning; with `drop_deleted`
-/// (nothing older below), deletions go. With `garbage`, every entry the
-/// merge drops that names an object — a live entry shadowed by a newer one
-/// of its key, at another generation — is written to garbage files.
+/// (nothing older below), deletions go. The objects the dropped entries name
+/// need no list of their own: exact deltas name each one as a predecessor.
 pub struct Compact {
     pub merge: Merge,
     pub writer: Writer,
-    pub garbage: Option<GarbageWriter>,
     drop_deleted: bool,
     done: bool,
 }
 
 impl Compact {
-    pub fn new(
-        runs: usize,
-        drop_deleted: bool,
-        garbage: bool,
-        o: Options,
-        max_file_bytes: usize,
-    ) -> Compact {
+    pub fn new(runs: usize, drop_deleted: bool, o: Options, max_file_bytes: usize) -> Compact {
         Compact {
             merge: Merge::new(runs),
             writer: Writer::new(o, max_file_bytes),
-            garbage: garbage.then(|| GarbageWriter::new(o.codec, o.level, max_file_bytes)),
             drop_deleted,
             done: false,
         }
@@ -160,9 +148,6 @@ impl Compact {
             if !self.writer.files.is_empty() {
                 return Ok(Step::File);
             }
-            if self.garbage.as_ref().is_some_and(|g| !g.files.is_empty()) {
-                return Ok(Step::Garbage);
-            }
             if self.done {
                 return Ok(Step::Done);
             }
@@ -170,13 +155,6 @@ impl Compact {
                 Next::Entry => {
                     let m = &self.merge;
                     let (k, gen, deleted) = (m.key(), m.generation(), m.deleted());
-                    if let Some(g) = &mut self.garbage {
-                        for (odel, ogen) in m.shadowed() {
-                            if !odel && ogen != gen {
-                                g.push(k, ogen);
-                            }
-                        }
-                    }
                     if !(deleted && self.drop_deleted) {
                         // Predecessors belong to delta files only.
                         self.writer.push(k, gen, deleted, m.payload(), None)?;
@@ -185,9 +163,6 @@ impl Compact {
                 Next::Need(r) => return Ok(Step::Run(r)),
                 Next::End => {
                     self.writer.finish(false)?;
-                    if let Some(g) = &mut self.garbage {
-                        g.finish();
-                    }
                     self.done = true;
                 }
             }
@@ -237,31 +212,6 @@ impl Scan {
                 Next::Need(r) => return Ok(Step::Run(r)),
                 Next::End if self.page.is_empty() => return Ok(Step::Done),
                 Next::End => return Ok(Step::Page),
-            }
-        }
-    }
-}
-
-/// Counts the live keys of the merged runs.
-pub struct Count {
-    pub merge: Merge,
-    pub live: u64,
-}
-
-impl Count {
-    pub fn new(runs: usize) -> Count {
-        Count {
-            merge: Merge::new(runs),
-            live: 0,
-        }
-    }
-
-    pub fn step(&mut self) -> Result<Step> {
-        loop {
-            match self.merge.next_key()? {
-                Next::Entry => self.live += !self.merge.deleted() as u64,
-                Next::Need(r) => return Ok(Step::Run(r)),
-                Next::End => return Ok(Step::Done),
             }
         }
     }

@@ -1,8 +1,8 @@
 """Storage upkeep (docs/object-store-state.md §6, §7, §11): background work
 that keeps the object store tidy. The engine never waits on it.
 
-- key indexes: delta logs are truncated to what consumers still read, small
-  files compacted, and inexact counts recounted, on worker threads;
+- key indexes: delta logs are truncated to what consumers still read, and
+  small files compacted, on worker threads;
 - garbage: files nothing references any more are deleted once the events
   that let go of them are durable, and no attempt that may read them runs;
 - retention: finished runs every asset they ran has let go of are deleted;
@@ -43,7 +43,6 @@ class Upkeep:
         *,
         clock,
         key_options: Options | None = None,
-        recount_interval: float = 3600.0,
         concurrency: int = 2,
         retention_interval: float = 60.0,
         interval: float = 1.0,
@@ -53,12 +52,11 @@ class Upkeep:
         self.state, self.history, self.manifest, self.clock = state, history, manifest, clock
         self.keys = keys  # the engine's key cache: compaction outputs go into it as written
         self.key_options = key_options or Options()
-        self.recount_interval, self.concurrency = recount_interval, concurrency
+        self.concurrency = concurrency
         self.retention_interval, self.interval = retention_interval, interval
         self.tasks = Tasks("upkeep")  # its tick
-        self.jobs = Tasks("upkeep jobs")  # compactions and recounts running, by index key
+        self.jobs = Tasks("upkeep jobs")  # compactions running, by index key
         self.failing = {} if failing is None else failing  # what fails now, by name: the engine's
-        self._recounted: dict[tuple, float] = {}  # when each index was last recounted
         self._checked: dict[tuple, IndexState] = {}  # the state last found needing nothing
         self._swept = -math.inf
         self._alive = -math.inf
@@ -124,41 +122,32 @@ class Upkeep:
             self.state.record(*truncations)
 
     def maintain(self) -> None:
-        """Start compactions and recounts, `concurrency` at a time."""
+        """Start compactions, `concurrency` at a time."""
 
-        now = self.clock()
         for key, index in list(self.m.indexes.items()):
             if len(self.jobs) >= self.concurrency:
                 break
             if key in self.jobs or self._checked.get(key) is index:
                 continue
-            plan = KeyIndex(None, None, index, self.key_options).plan_compaction()
-            if plan is not None:
-                self._start(key, index, recount=False)
-            elif not index.count_exact:
-                if now - self._recounted.get(key, -math.inf) >= self.recount_interval:
-                    self._start(key, index, recount=True)
+            if KeyIndex(None, None, index, self.key_options).plan_compaction() is not None:
+                self.jobs.spawn(self._maintenance(key, index), key=key)
             else:
                 self._checked[key] = index
 
-    def _start(self, key: tuple, index: IndexState, *, recount: bool) -> None:
-        self.jobs.spawn(self._maintenance(key, index, recount), key=key)
-
-    async def _maintenance(self, key: tuple, index: IndexState, recount: bool) -> None:
-        """One compaction or recount, run on a worker thread with its own event
-        loop so merging never blocks the engine."""
+    async def _maintenance(self, key: tuple, index: IndexState) -> None:
+        """One compaction, run on a worker thread with its own event loop so
+        merging never blocks the engine. Writes are exact, so the objects a
+        compaction lets go of are already listed by the deltas' predecessors
+        (docs/key-index-design.md): it writes no garbage of its own."""
 
         options, objects, service = self.key_options, self.state.objects, self.keys
-        # An immutable store's compaction lists what its merge dropped: those
-        # entries name objects that collection then cleanups (docs/lifecycle.md §9.8).
-        garbage = self.m.immutable(key[0])
 
         def work():
             async def go(local):
                 keys = KeyIndex(ObjectIO(objects, local=local), None, index, options)
                 if service is not None:
                     keys.on_write = lambda path, f, data: service.installed(index.prefix, f, path, data)
-                return await (keys.recount() if recount else keys.compact(garbage=garbage))
+                return await keys.compact()
 
             # One warm copy serves every engine reader: an index the engine's cache
             # holds is read from its local files, the store otherwise.
@@ -175,34 +164,15 @@ class Upkeep:
         except Exception as error:
             self.failing[f"key index {key[0]}/{key[1]}"] = f"{type(error).__name__}: {error}"
             log.exception("key index maintenance failed for %s", key)
-            self._recounted[key] = self.clock()
             return
         self.failing.pop(f"key index {key[0]}/{key[1]}", None)
         output, partition = key
         current = self.m.indexes.get(key)
-        if recount:
-            # Exact for the state it pinned; commits since add their `added - removed`.
-            self._recounted[key] = self.clock()
-            if current is not None and current.prefix == index.prefix:  # still the same index
-                self.state.record(
-                    {
-                        "type": "IndexRecounted",
-                        "output": output,
-                        "partition": partition,
-                        "live": result,
-                        "pinned_count": index.count,
-                        "pinned_inexact": index.inexact,
-                    }
-                )
-            return
         if result is None:
             return
-        added, removed, dropped = result
+        added, removed = result
         if current is None or not set(removed) <= {f.name for f in current.files}:
-            created = [f.name for f in added if f.name not in removed]
-            await self._delete(
-                [index.path(n) for n in created] + [f"{index.prefix}{g.name}.kg" for g in dropped]
-            )
+            await self._delete([index.path(f.name) for f in added if f.name not in removed])
             return
         event = {
             "type": "IndexCompacted",
@@ -212,8 +182,6 @@ class Upkeep:
             "removed": removed,
             "at": self.clock(),
         }
-        if dropped:
-            event["garbage"] = [g.to_json() for g in dropped]
         self.state.record(event)
         if self.keys is not None:  # published: no new snapshot reads its inputs
             # ...but a delta still in the log stays for delta passes, until collected.

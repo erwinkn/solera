@@ -217,7 +217,7 @@ knows its write landed (`swap`, §0).
 
 Everything else the storage does runs on its own loop, off the engine's:
 the history lake flushes and merges (§7), and `Upkeep` truncates delta
-logs, compacts and recounts key indexes (§6), deletes garbage and applies
+logs, compacts key indexes (§6), deletes garbage and applies
 retention (§11).
 
 ```json
@@ -257,7 +257,6 @@ status are derived inside `apply`; they are not events.
 | `AttemptFinished` | `run`, `task`, `attempt`, `outcome` (`succeeded` \| `failed` \| `skipped` \| `canceled`), `started_at`, `finished_at`, `error?`, `retryable?`, `commit?`, `owing a repair?`, `writes?` | records the attempt; on commit, installs heads, the partition's record (cursor, positions, completeness), and each keyed output's new delta file; `repairs` keeps the intents of a writer that died (§8) |
 | `SourceCommitted` | `source`, `head`, `keys?`, `at`, `run?` | installs a source head and its delta file; a commit that changed something records `run` in the history (§7) |
 | `IndexCompacted` | `output`, `partition`, `added` [file], `removed` [name], `at` | swaps compacted files into a key index |
-| `IndexRecounted` | `output`, `partition`, `live`, `pinned_count`, `pinned_inexact` | a recount found `live` keys where the state it scanned said `pinned_count`: the count becomes `live` plus what commits since added, and `inexact` drops by `pinned_inexact` (§6) |
 | `IndexTruncated` | `output`, `partition`, `below`, `at` | drops delta log entries below `below` |
 | `FilesCleanedUp` | `paths` | forgets index files that were deleted |
 | `AutomationChanged` | `name`, `enabled` | |
@@ -298,7 +297,7 @@ State
 | `Head` | `ref` (from the store), `run`, `attempt` (may point at a deleted run), `commit_number` (incremental outputs: the last commit that changed it, −1 before any), `base` (the first commit after the last reset of an unkeyed incremental output), `count` (keyed: live keys), `partitions?` (dynamic partitions: the partitions it lists), `version` (declared asset version), `asset`, `at`, `n?` (a source's: the event counter of its commit) | outputs × partitions |
 | `PartitionRecord` | `cursor?` (json), `last?` (`Outcome`: its last terminal result), `caught_up?` (whether its last commit finished the pass it was on — the partition's completeness, whatever its outputs wrote), `caught_up_at?` (the event counter of the commit that last caught it up: before its asset's `changed_at`, it is `stale`), `seen?` {input: versions} (the head generations of the whole and dep inputs it last caught up to: moved since, it is `stale`), `positions?` {input: `Position`}, `failures?` (`Failures`: an Each asset's failing keys, per-key-processing.md §9). Registration moves it whole under a rename, drops the positions of inputs the project no longer declares, and those a reset takes (§2). | assets × partitions |
 | `Failures` | `commit_number` (the record's last commit), `counts` {outcome: keys}, `due` and `deploy_min` (lower bounds), `retry?` {`pass`, `deploy`, `forced_at`, `after`, `due_acc`, `deploy_acc`}, `passes`, `done_forced`, `last` (`changes` or `retry`), `forced` {class: position} — its index is `indexes["@asset"][partition]` (per-key-processing.md §9) | Each assets × partitions |
-| `KeyIndex` | `prefix` (where its files live — kept across renames), `count`, `inexact` (commits since the last recount whose count came from filters; the count is exact at 0), `files` [{`name`, `level`, `min`, `max`, `entries`, `size`, `tail`, `index`}], `log` [[`batch`, [file]], …] — see §6 | a few dozen files per index |
+| `KeyIndex` | `prefix` (where its files live — kept across renames), `count` (exact: writes are exact), `files` [{`name`, `level`, `min`, `max`, `entries`, `size`, `tail`, `index`}], `log` [[`batch`, [file]], …] — see §6 | a few dozen files per index |
 | `Position` | `kind` (`keys` or `commits`), `next` (the first upstream commit not yet delivered), `pass` (one under way: its `mode` — `full`, `delta`, or a pattern change's `diff` — its boundary `from`..`to`, its place `at` — the last key delivered, or the next batch — its `page` of `pages`, a delta pass's reader `pin`; a full keyed pass's `from` is the head's commit number + 1 when it began, so changes made meanwhile arrive afterwards as deltas), `fingerprint`, `output` and `up` (the upstream index it reads), and per-key `patterns`, `pattern change`, `reconcile`, and `ahead`, the read-ahead: `[commit, run, attempt]` per `keys=` run since the last pass, capped (`positions-from-reads.md`; `python/solera_server/positions.py`) | inputs × partitions |
 | `Outcome` | `outcome`, `run`, `attempt`, `at` | assets × partitions |
 | `AutomationState` | `enabled`, `last_fired`, `last_run`, `last_revision`, `pending` (set of `[asset, partition]` for OnChange) | automations × partitions |
@@ -328,7 +327,7 @@ Example (abridged):
     "run": "01J8ZC7Q…", "attempt": "01J8ZC7R…",
     "commit_number": 57, "count": 4, "complete": true, "version": "1", "at": 1790074866.0}}},
   "indexes": {"site_files": {"alpha": {
-    "prefix": "keys/site_files/alpha/", "count": 4, "inexact": 0,
+    "prefix": "keys/site_files/alpha/", "count": 4,
     "files": [{"name": "c01J8ZE2…-0000", "level": 1, "min": "alpha-file-0", "max": "alpha-file-3", "entries": 4, "size": 212, "…": "…"},
               {"name": "000000000057-01J8ZC7R…", "level": 0, "min": "alpha-file-1", "max": "alpha-file-3", "entries": 2, "size": 140, "…": "…"}],
     "log": [[56, [{"name": "000000000056-01J8ZB…", "…": "…"}]], [57, [{"name": "000000000057-01J8ZC7R…", "…": "…"}]]]}}},
@@ -382,30 +381,20 @@ lengths, so a reader fetches exactly what it needs with one range read:
 the tail when it checks filters, the index part when it scans, the whole
 file when it is small — then range-reads only the blocks it needs.
 
-**Filters.** Each file carries two blocked Bloom filters (14 bits per
-item, 1.75 B per entry, 0.35% false positives measured — keeping an
-item's bits in one 512-bit block costs ~1.8× over independent bits): its
-keys and its deleted keys. Every key written is a change (`versions.md`),
-so the filters only tell added from updated: a key no key filter matches
-is new; one a key filter matches and no tombstone filter does, across
-every file whose key range could hold it, counts as an update with no
-block read. Everything else — keys that may be deleted, an upsert
-carrying a payload (a source's version, compared with the entry's) —
-gets an exact lookup.
+**Filters.** Each file carries one blocked Bloom filter of its keys (14
+bits per item, 1.75 B per entry, 0.35% false positives measured — keeping
+an item's bits in one 512-bit block costs ~1.8× over independent bits). A
+key no key filter matches, across every file whose key range could hold
+it, is new and needs no block read; every other key gets an exact lookup.
 
-**Key count.** `KeyIndex.count` is exact while every commit's reads are
-exact, which is always the case for indexes small enough to read whole.
-When a commit relies on the filters, a new key that some key filter
-falsely matches is counted as an update, so the count drifts low by about
-the filters' false-positive rate on inserted keys; `inexact` counts such
-commits. While it is non-zero, the engine schedules a **recount** — one
-streaming pass over every level, 8 MB of blocks per read: ~370 reads and
-14 s at 100M keys, a few more with the upper levels full — at most once per
-`recount_interval` (default 1 hour). The recount is exact
-for the state it pinned, and commits landing while it runs keep their
-`added − removed` on top of it (`IndexRecounted`), so a busy index gets
-its exact count back unless one of those commits was itself inexact.
-Deltas themselves are always exact; only the count is approximate.
+**Exact writes, exact count.** Every delta entry names its key's
+predecessor (the generation it replaced) when the key was live, so a
+consumer can tell added from updated and an immutable store's cleanup
+knows every replaced object; `KeyIndex.count` is exact (`count += added −
+removed` per commit). Writes read the block of every key a filter holds
+for that (docs/key-index-design.md, which measured the cost: nothing on a
+warm engine, ~1K block reads per 1K random updates on a cold 100M-key
+index).
 
 **Engine-resolved commits** (`resolved-commits.md`). A small write is first
 offered to the engine over the attempt's channel: it answers from a cache
@@ -457,7 +446,7 @@ None)`), and the replacement streams them, so nothing is sorted or held.
 | Operation | Who | How |
 |---|---|---|
 | Compute a delta | worker, at write time | Read the write's keys once (`Prepared`, `per-key-processing.md` §7), against the index **as pinned in the spec**. A patch is checked with the filters and the read strategy above: every key it writes, at the attempt's generation, plus `deleted` entries for removed keys that may exist. A full replacement is the streaming merge-join above. Either way the result is the batch's delta files, split at ~64 MB. |
-| Commit | engine | Add the delta file to level 0 and to `log`; `count += added − removed`, and `inexact += 1` if the count change came from filters. The claim — one attempt per (asset, partition) from launch to settlement — guarantees the index didn't change underneath. |
+| Commit | engine | Add the delta file to level 0 and to `log`; `count += added − removed`. The claim — one attempt per (asset, partition) from launch to settlement — guarantees the index didn't change underneath. |
 | Deliver pending deltas | worker, for an `Incremental` input | Read the `log` files from the position to the head; chunk by `batch_size` in key order; ask the upstream store for those rows with `Keys(…)`. |
 | Full pass | worker | Page through the merged view of all levels from `after`, `batch_size` keys at a time, and ask the store for them with `Keys(…)`. Per level, only the files covering the page are opened, and only their index parts are read — or the whole file, once, when it is small (below one request's latency worth of transfer, ~2.4 MB). A multi-page scan keeps each file's last fetched blocks for the next page, so it reads every block once. |
 | Compaction | the engine's machine by default (§6, *Engine work*) | Once level 0 holds ~8 files, merge them into one level-0 file — or, once level 0 holds a tenth of level 1's bytes, into level 1 with the level-1 files it overlaps (all of them, for random keys). A level over its target pushes one file down, merging it with the files it overlaps there. A merge streams, a few segments per input and one output file at a time. Commit with `IndexCompacted`. Each merge into a level rewrites about ten times the bytes it brings: ~20–30× over an entry's life with random keys (`bench/keys/amplification.py`). |
@@ -475,8 +464,8 @@ reference to it.
 **Engine work.** Compaction is the one heavy computation the engine
 itself starts. It runs locally on the engine's machine, on a worker thread
 with its own event loop, at most `maintenance_concurrency` at a time. It
-and recounts read the engine's cache's local copies when the cache holds
-the index warm, the store otherwise. A
+reads the engine's cache's local copies when the cache holds the index
+warm, the store otherwise. A
 project-level setting to offload it to an executor is planned, not built:
 
 ```python
@@ -495,7 +484,7 @@ for it, a full pass's batches, `Each`'s lookups — comes from the store
 work — encoding, decoding, sorting, merging, lookups over fetched bytes —
 is Rust, in the `solera._native` extension (PyO3, abi3) that the `solera`
 distribution builds and both the engine and the worker require; I/O goes
-through obstore. A full replacement, a compaction and a recount run as
+through obstore. A full replacement and a compaction run as
 streaming jobs (`native/src/jobs.rs`) that ask for the file segments they
 need and hand back the files they write; Python only chooses files, fetches
 bytes and parses tails (`solera/keys/jobs.py`). Blocks decode and compress

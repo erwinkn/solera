@@ -15,7 +15,8 @@ import zlib
 import xxhash
 
 MAGIC = b"CKX1"
-FORMAT_VERSION = 3
+FORMAT_VERSION = 4
+MAX_BLOCK_BYTES = 16 << 20  # what a block may decode to at most (F29)
 DELETED, PREDECESSOR, PAYLOAD = 1, 2, 4  # entry flags
 CODEC_NONE, CODEC_ZLIB = 0, 1
 FOOTER = struct.Struct("<4sHBBQQIQII4s")
@@ -71,10 +72,21 @@ def _compress(data: bytes, codec: int, level: int) -> bytes:
     return zlib.compress(data, level) if codec == CODEC_ZLIB else bytes(data)
 
 
-def _decompress(data, codec: int) -> bytes:
+def _decompress(data, codec: int, limit: int | None = None) -> bytes:
+    """`data` decompressed; with `limit`, a `FormatError` past it, after
+    inflating no more than `limit + 1` bytes."""
+
     if codec == CODEC_ZLIB:
-        return zlib.decompress(data)
+        if limit is None:
+            return zlib.decompress(data)
+        z = zlib.decompressobj()
+        out = z.decompress(data, limit + 1)
+        if len(out) > limit:
+            raise FormatError(f"more than {limit} bytes decoded")
+        return out + z.flush()
     if codec == CODEC_NONE:
+        if limit is not None and len(data) > limit:
+            raise FormatError(f"more than {limit} bytes decoded")
         return bytes(data)
     raise FormatError(f"unknown codec {codec}")
 
@@ -102,10 +114,6 @@ def _key_item(key: bytes) -> bytes:
     return b"k" + key
 
 
-def _tomb_item(key: bytes) -> bytes:
-    return b"t" + key
-
-
 def _set(bits: bytearray, item: bytes, nbits: int, k: int) -> None:
     for b in _positions(item, nbits, k):
         bits[b >> 3] |= 1 << (b & 7)
@@ -122,12 +130,6 @@ def bloom_check_keys(bits, nbits: int, k: int, keys: list[bytes]) -> bytes:
     """One byte per key: 1 if the key may be present, 0 if it is definitely absent."""
 
     return bytes(1 if _test(bits, _key_item(key), nbits, k) else 0 for key in keys)
-
-
-def bloom_check_tombstones(bits, nbits: int, k: int, keys: list[bytes]) -> bytes:
-    """One byte per key: 1 if the key may be deleted in this file, 0 if it definitely is not."""
-
-    return bytes(1 if _test(bits, _tomb_item(key), nbits, k) else 0 for key in keys)
 
 
 # -- encoding ------------------------------------------------------------------------
@@ -160,7 +162,7 @@ def encode_file(
     block = bytearray()
     block_first = block_prev = None  # prefix compression restarts in every block
     prev = None  # ordering is checked across blocks
-    count = live = 0
+    count = 0
 
     def close_block():
         data = _compress(bytes(block), codec, level)
@@ -187,7 +189,6 @@ def encode_file(
             _put_bytes(block, payload)
         if before is not None:
             put_varint(block, before)
-        live += 1 - flag
         count += 1
         prev = block_prev = key
         if len(block) >= block_size:
@@ -198,20 +199,15 @@ def encode_file(
     if count:
         close_block()
 
-    # Filters: every key, and every deleted key.
+    # The filter: every key.
     key_nbits = filter_nbits(n, bits_per_item)
-    tomb_nbits = filter_nbits(n - live, bits_per_item)
     key_bits = bytearray(key_nbits // 8)
-    tomb_bits = bytearray(tomb_nbits // 8)
     for i in range(n):
         _set(key_bits, _key_item(keys[i]), key_nbits, k)
-        if deleted[i]:
-            _set(tomb_bits, _tomb_item(keys[i]), tomb_nbits, k)
     filters = bytearray()
-    for nbits, bits in ((key_nbits, key_bits), (tomb_nbits, tomb_bits)):
-        put_varint(filters, nbits)
-        filters.append(k)
-        filters += bits
+    put_varint(filters, key_nbits)
+    filters.append(k)
+    filters += key_bits
     filters += struct.pack("<I", zlib.crc32(bytes(filters)))
 
     idx = bytearray()
@@ -254,7 +250,7 @@ def decode_block(data, codec: int):
     """A block's keys, generations, deleted flags, payloads (None for none),
     and each entry's predecessor generation or None."""
 
-    raw = _decompress(data, codec)
+    raw = _decompress(data, codec, MAX_BLOCK_BYTES)
     keys, generations, flags, payloads, predecessors = [], [], bytearray(), [], []
     pos, prev, n = 0, b"", len(raw)
     while pos < n:
@@ -341,20 +337,17 @@ def parse_tail(tail, file_size: int) -> dict:
     filters = tail[rel : rel + out["filters_length"]]
     if len(filters) < 4 or zlib.crc32(filters[:-4]) != struct.unpack("<I", filters[-4:])[0]:
         raise FormatError("filters checksum mismatch")
-    pos = 0
-    parsed = []
-    for _ in range(2):
-        nbits, pos = get_varint(filters, pos)
-        if pos >= len(filters):
-            raise FormatError("truncated filters")
-        k = filters[pos]
-        pos += 1
-        nbytes = nbits // 8
-        parsed.append((nbits, k, bytes(filters[pos : pos + nbytes])))
-        pos += nbytes
+    nbits, pos = get_varint(filters, 0)
+    if pos >= len(filters):
+        raise FormatError("truncated filters")
+    k = filters[pos]
+    pos += 1
+    nbytes = nbits // 8
+    key_filter = (nbits, k, bytes(filters[pos : pos + nbytes]))
+    pos += nbytes
     if pos + 4 != len(filters):
         raise FormatError("bytes past the filters")
-    return {**out, "key_filter": parsed[0], "tomb_filter": parsed[1]}
+    return {**out, "key_filter": key_filter}
 
 
 def check_block(data, crc: int) -> None:
@@ -512,69 +505,3 @@ def merge_range(runs: list, codecs: list[int], after, upto, drop_deleted: bool):
         flags.append(f)
         payloads.append(p)
     return keys, generations, bytes(flags), payloads
-
-
-# -- garbage files ------------------------------------------------------------------------
-
-GARBAGE_MAGIC = b"CKG1"
-GARBAGE_VERSION = 2
-GARBAGE_FOOTER = struct.Struct("<4sHBBQI4s")  # 24 bytes
-GARBAGE_BLOCK = 64 * 1024
-
-
-def encode_garbage(keys: list[bytes], generations: list[int], *, codec=CODEC_ZLIB, level=1):
-    """One garbage file (docs/key-index-format.md § Garbage files) holding the
-    entries in order; a key may repeat."""
-
-    out, block, blocks = bytearray(), bytearray(), 0
-
-    def close():
-        nonlocal block, blocks
-        if block:
-            data = _compress(bytes(block), codec, level)
-            out.extend(struct.pack("<II", len(data), zlib.crc32(data)))
-            out.extend(data)
-            blocks += 1
-            block = bytearray()
-
-    for key, generation in zip(keys, generations, strict=True):
-        _put_bytes(block, key)
-        put_varint(block, generation)
-        if len(block) >= GARBAGE_BLOCK:
-            close()
-    close()
-    out.extend(
-        GARBAGE_FOOTER.pack(GARBAGE_MAGIC, GARBAGE_VERSION, codec, 0, len(keys), blocks, GARBAGE_MAGIC)
-    )
-    return bytes(out)
-
-
-def decode_garbage(data):
-    """Every entry of a garbage file: keys, generations."""
-
-    data = memoryview(data)
-    if len(data) < GARBAGE_FOOTER.size:
-        raise FormatError("garbage file too short")
-    m1, version, codec, _, entries, blocks, m2 = GARBAGE_FOOTER.unpack(data[-GARBAGE_FOOTER.size :])
-    if m1 != GARBAGE_MAGIC or m2 != GARBAGE_MAGIC:
-        raise FormatError("bad garbage file magic")
-    if version != GARBAGE_VERSION:
-        raise FormatError(f"unsupported garbage file version {version}")
-    body = data[: -GARBAGE_FOOTER.size]
-    keys, generations, pos, seen = [], [], 0, 0
-    while pos < len(body):
-        n, crc = struct.unpack_from("<II", body, pos)
-        blk = body[pos + 8 : pos + 8 + n]
-        if len(blk) != n or zlib.crc32(blk) != crc:
-            raise FormatError("garbage block checksum mismatch")
-        pos += 8 + n
-        seen += 1
-        raw, p = _decompress(blk, codec), 0
-        while p < len(raw):
-            key, p = _get_bytes(raw, p)
-            gen, p = get_varint(raw, p)
-            keys.append(key)
-            generations.append(gen)
-    if seen != blocks or len(keys) != entries:
-        raise FormatError("garbage file counts do not match its footer")
-    return keys, generations

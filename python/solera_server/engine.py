@@ -110,7 +110,6 @@ class Engine(Attempts, Sensors, Staleness, Views):
         clock=None,
         eval_interval: float = 0.5,
         key_options: Options | None = None,
-        recount_interval: float = 3600.0,
         maintenance_concurrency: int = 2,
         retention_interval: float = 60.0,
         history: History | None = None,
@@ -171,7 +170,6 @@ class Engine(Attempts, Sensors, Staleness, Views):
             manifest,
             clock=self.clock,
             key_options=self.key_options,
-            recount_interval=recount_interval,
             concurrency=maintenance_concurrency,
             retention_interval=retention_interval,
             keys=self.keys,
@@ -1329,7 +1327,7 @@ class Engine(Attempts, Sensors, Staleness, Views):
         if "batch" not in current:
             # Where each batch sits in the pass (§5), planned when it starts: the keys
             # in the whole index or in the delta's files, by `batch_size` — an
-            # estimate when patterns filter or a count is inexact.
+            # estimate when patterns filter.
             keys = pinned.count if whole else sum(f.entries for _, files in pinned.log for f in files)
             current = {**current, "batch": 0, "batches": _batches(keys, limit)}
             if not whole:  # a delta pass over several attempts holds its first batch's reader pin
@@ -1964,11 +1962,11 @@ class Engine(Attempts, Sensors, Staleness, Views):
             self.m.event_counter,
         )
         if answer["result"] == "empty":
-            return DeltaFiles([], 0, 0, True), ([], [])
+            return DeltaFiles([], 0, 0), ([], [])
         if answer["result"] != "delta":
             return None
         await index.io.write(index.path(name), delta)
-        files = DeltaFiles([FileInfo.describe(name, 0, delta)], answer["added"], answer["removed"], True)
+        files = DeltaFiles([FileInfo.describe(name, 0, delta)], answer["added"], answer["removed"])
         return files, delta_keys(delta)
 
     # -- key index upkeep (§6) --------------------------------------------------------
@@ -1985,14 +1983,13 @@ class Engine(Attempts, Sensors, Staleness, Views):
             raise KeyError(f"{output}/{partition}")
         state = self.m.indexes.get((output, partition))
         if state is None:
-            return {"total": 0, "exact": True, "keys": {}, "next": None}
+            return {"total": 0, "keys": {}, "next": None}
         start = key_bytes(after) if after is not None else None
         with self.m.reading(state.prefix):  # its files outlive compaction until the page is read
             index = KeyIndex(self._key_io(), None, state.slice(), self.key_options)
             keys, generations, _, nxt = await index.page(start, offset + limit)
         return {
             "total": state.count,
-            "exact": state.count_exact,
             # Each key's version: the generation that last wrote it (docs/versions.md).
             "keys": {key_str(k): g for k, g in list(zip(keys, generations, strict=True))[offset:]},
             "next": key_str(nxt) if nxt is not None else None,

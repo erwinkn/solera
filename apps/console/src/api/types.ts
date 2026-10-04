@@ -264,7 +264,6 @@ export interface KeyPage {
   output: string;
   partition: string;
   total: number;
-  exact: boolean;
   /** Each key, and the generation that last wrote it: its version. */
   keys: Record<string, number>;
   next: string | null;
