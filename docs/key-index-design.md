@@ -18,8 +18,13 @@ What is not measured on real files yet: spans holding several versions of
 a key (format v4) have no native merge. The real catch-up runs on spans
 that do not cross the consumers' positions, and the matched layouts have no
 endpoint inside a span. So the span count under many observers, and the
-cost of reading inner versions, are replayed only; the read bound caps the
-latter at 2× or 10 MB per catch-up.
+cost of reading inner versions, are replayed only. The native v4 prototype
+comes next and replaces them.
+
+Write ratios count entries: entries written (merge outputs, plus the
+initial delta where marked "total") per entry committed. Compressed bytes
+are reported separately where measured. "RSS" figures are increases in the
+benchmark process's high-water mark, not a reader's peak memory.
 
 It follows `presence-at-position.md` and `delta-log-ranges.md` (branch
 `bb/design-study-exact-presence-at-a-position`), and keeps their baseline:
@@ -39,24 +44,31 @@ position on, like the delta log.
 The commits observers read from are **endpoints**. A merge may cross an
 endpoint: it then keeps, per key, the version that endpoint sees (the key's
 state just before it), as an LSM keeps the versions its snapshots see. So
-observers cost retained versions, never extra spans, and an observer that
-goes away costs nothing until a merge would rewrite its span anyway.
+observers usually cost retained versions rather than extra spans, and an
+observer that goes away costs nothing until a merge would rewrite its span
+anyway. Not always: large commits each pinned by its own endpoint cannot
+share a span without making some reader read far more than it needs (the
+second review's A12-4). There a hard cap on spans decides, and the readers
+inside a forced merge pay with extra reads.
 
-- **Writes are bounded**, whatever order observers come and go in:
-  written ≤ (1 + 43R + 20R log₂ K) × committed, K the most entries a span
-  holds and R the attempts allowed per merge (proved in Lean for guarded
-  merges, including those whose output shrinks below their largest input;
-  R = 1 and K = 10⁹ give 624×: loose, but a guarantee). Replayed under the review's churn
-  scenarios: 7–10× at 1M keys, 12–14× at 100M. On real files from one
-  trace by the real compactions: 13× against 50× for today's leveled
-  planner at 100M keys (8× against 17× at 1M).
-- **Spans stay few** whatever the number of observers: 22 or fewer on
-  average and 30 at most, from 1 to 1,000 distinct endpoints (replayed),
-  against 546 at 100 endpoints when endpoints block merges.
-- **Catch-up reads only what changed**: measured over real spans, paged,
-  10,000 commits behind at 100M keys takes 16 spans, 259 GETs, 65 MB and
-  7.7 s, against 10,000 deltas today, or one packed object (6 GETs, but
-  97 MB, 12.9 s and 420 MB of merge memory).
+- **Entry writes are bounded**, whatever order observers come and go in:
+  entries written (deltas included) ≤ (1 + 43R + 20R ⌊log₂ K⌋) × entries
+  committed, K the most entries a span holds and R the attempts per merge
+  (proved in Lean for every merge the policy makes, including forced ones
+  and single-span rewrites; R = 3 and K = 10⁹ give 1,870×: loose, but a
+  guarantee). Replayed under the reviews' churn scenarios: 7–10× compaction
+  writes at 1M keys, 12–14× at 100M. On real files, one trace through the
+  real compactions: 14.0× total entry writes against 51.3× for today's
+  leveled planner at 100M keys (9.0× against 18.2× at 1M).
+- **Spans are capped at 32.** Under the replayed patterns (1 to 1,000
+  distinct endpoints, stalled passes, churn) they stay at 9–22 on average
+  and 30 at most at 100M keys (7–19 and 24 at 1M); large pinned commits hit
+  the cap, and upkeep then forces guarded merges
+  across endpoints. Blocking endpoints instead gives 546 spans at 100.
+- **Catch-up reads what changed in its range**: measured over real spans,
+  paged, 10,000 commits behind at 100M keys takes 16 spans, 259 GETs, 65 MB
+  and 7.7 s, against 10,000 deltas today, or one packed object merged at
+  once (6 GETs, 97 MB, 12.9 s). No reader ever reads more than a full read.
 - **Lookups and appends cost what they cost today**, measured on layouts
   built from the same trace: 901 against 907 GETs for 1K cold exact lookups
   at 100M, 10 ms warm. The first version's 40% saving compared against a
@@ -80,9 +92,14 @@ when it was written. For each key it holds:
 
 So a key's entries in a file run newest first, and a lookup takes the
 first. The format lets a key appear several times in a file, in that order
-(format v4). The span from commit 0, the **base**, holds no predecessors
-and drops tombstones that would be its oldest version (no entry means
-absent there).
+(format v4). The span from commit 0, the **base**, holds no predecessors.
+Its **initial segment** (the part before the oldest live endpoint inside
+it) keeps live keys only: a tombstone there means absent, as no entry does.
+Every later segment keeps added-then-removed tombstones, even inside the
+base. Otherwise (the second review's A12-1): a consumer at 1, commit 1 adds
+`d` and a selection delivers it live, commit 2 removes `d`; a base merge
+crossing endpoint 1 keeps only `d`'s tombstone at 2, and dropping it would
+leave the consumer holding `d` forever.
 
 **Tiling.** The spans tile commit time from 0 to the head, without gaps or
 overlaps. `IndexState` holds the live count and a list of spans
@@ -113,38 +130,48 @@ endpoints inside old spans, never more.
 
 ## The merge policy
 
-Every merge obeys two conditions:
+Three rules, in order of precedence:
 
-1. **The guard** (bounds writes). The largest input holds at most 4× the
-   other inputs combined, in entries, counted before dedup. Under it,
-   written ≤ (1 + 43R + 20R log₂ K) × committed for any sequence of commits,
-   endpoint births and retirements (Lean). Two conditions come with it:
+1. **The guard** (hard; bounds writes). The largest input holds at most 4×
+   the other inputs combined, in entries, counted before dedup; or the merge
+   drops at least a quarter of its inputs (output ≤ ¾ of the inputs). Under
+   it, entries written, the initial deltas included, are at most
+   (1 + 43R + 20R ⌊log₂ K⌋) × entries committed, for any sequence of
+   commits, endpoint births and retirements (Lean, `WriteBound.lean` at
+   5a34e6e). Two conditions come with it:
    - K bounds a span's entries. With one version per segment, distinct
      keys no longer do; keys × (1 + endpoints live inside the span) does,
      and so does the total committed over the horizon.
-   - R bounds the attempts per published merge, each counted as written
-     (an abandoned upload included). The engine caps retries of a merge at
-     R and reclaims abandoned outputs.
-   One kind of merge takes a single input: a span rewritten alone, allowed
-   only when at least a quarter of its entries are versions no live
-   endpoint sees. The theorem covers it: a merge needs the guard or must
-   drop a quarter of its inputs (4u ≤ 3S), with the same constant.
-2. **The read bound** (keeps catch-up local). A merge may put a live
-   endpoint `e` inside its output only if, in the output, the entries before
-   `e` are at most max(λ × the entries from `e` on, Z), with λ = 1 and Z = 1M
-   entries (~10 MB). The reader at `e` then reads at most twice what it
-   must, or 10 MB more. So the base never swallows the spans after an old
-   endpoint, while small recent spans merge across endpoints freely.
+   - R bounds attempts. Every attempt of a merge counts as written, whether
+     it publishes, fails, or is abandoned after upload. The engine allows
+     R = 3 attempts per input set; after the third failure it stops merging
+     that index and raises an alarm rather than retrying forever. Abandoned
+     outputs are reclaimed by the orphan collector (lifecycles, below).
+   The single-span rewrite (a span alone, once a quarter of its entries are
+   versions no live endpoint sees) is the "drops a quarter" case.
+2. **The fan-in cap** (hard; bounds readers' fan-in). At most F = 32
+   spans per index. Past it, upkeep merges the guarded window of 2 to 4
+   adjacent spans with the fewest entries, even across a live endpoint and
+   against the read rule.
+3. **The read rule** (soft; keeps catch-up local). Below the cap, a merge
+   may put a live endpoint `e` inside its output only if, in the output,
+   the bytes before `e` are at most max(λ × the bytes from `e` on, Z), and
+   the bytes from `e` on at most max(λ × the bytes before `e`, Z): λ = 1,
+   Z = 10 MB. Both ends matter: a pass pinned at `[P, N]` must not face much
+   older data before `P`, nor much newer data after `N` (the second review's
+   A12-3: one old entry merged with 2M newer ones made a pass read 2M
+   entries for 1). The rule is a preference, not a bound: under the cap it
+   gives way, and a reader's read is then bounded only by a full read.
 
 Upkeep runs these triggers, in order:
 
-- **Into the base.** Once the spans after the base, as far as the read bound
+- **Into the base.** Once the spans after the base, as far as the read rule
   lets it reach, hold a quarter of it, they merge into it.
 - **Four alike.** The newest window of 4 adjacent spans whose largest holds
   at most the other three combined.
 - **Stragglers.** A span smaller than its newer neighbour (left behind when
   an endpoint went away) joins the shortest window around it that satisfies
-  both conditions. Without this rule, a stalled pass plus hourly readers at
+  the guard and the read rule. Without this rule, a stalled pass plus hourly readers at
   100M left 282 spans on average, 714 at most (replayed).
 - **Stale versions.** A span whose dead versions reach a quarter of it is
   rewritten alone.
@@ -220,11 +247,24 @@ lifecycles).
 
 ### 4. changes(P → N, keys or range, per-key lower bounds)
 
-`P` and `N + 1` are reserved endpoints. Read the spans overlapping
-`[P, N]`. For each key: its state at `N` is its newest version; its state
-before `P` is its newest version older than `P`'s generation or, if it has
-none in these spans, its oldest predecessor. A key with no version at or
-after `P` did not change and is skipped.
+`P` and `N + 1` are reserved endpoints, with generations `g(P)` and
+`g(N + 1)` (the first generation of each commit; generations rise with
+commit numbers within an output partition). Read the spans overlapping
+`[P, N]`, and clip every key to that range:
+
+- its versions **in the range** are those with `g(P) ≤ generation <
+  g(N + 1)`. A key with none did not change in `[P, N]` and is skipped,
+  including a key first touched after `N`;
+- its state **at `N`** is its newest version older than `g(N + 1)`: a later
+  span can extend past `N`, and its newer versions are ignored;
+- its state **before `P`** is its newest version older than `g(P)`, or, if
+  it has none in these spans, the predecessor on its oldest version.
+
+The same clipping applies to the "did it change" test, to staleness, and
+to every resumed page. Example (A12-2): `k` added at 1, removed at 2, and a
+span `[1, 2]` holding both versions. `changes(1, 1)` sees only the version
+at 1 and returns added; taking the span's newest version would return
+neither.
 
 | Live before P | Live at N | Class |
 |---|---|---|
@@ -278,35 +318,51 @@ parallel):
 | 1 | 1 GET, 10 KB, 30 ms | same | same |
 | 100 | 4 GETs, 0.9 MB, 0.06 s | 9 GETs, 0.9 MB, 0.07 s | 1 GET, 1.0 MB, 0.08 s |
 | 360 | 9 GETs, 3.3 MB, 0.18 s | 10 GETs, 3.4 MB, 0.17 s | 1 GET, 3.5 MB, 0.24 s |
-| 10,000, 1M keys | 13 spans: 27 GETs, 14 MB, 1.2 s, +21 MB RSS | 25 blocks: 159 GETs, 41 MB, 2.2 s | 7 GETs, 101 MB, 11.7 s, +494 MB RSS |
-| 10,000, 100M keys | 16 spans: 259 GETs, 65 MB, 7.7 s, +20 MB RSS | 25 blocks: 965 GETs, 68 MB, 8.1 s | 6 GETs, 97 MB, 12.9 s, +419 MB RSS |
+| 10,000, 1M keys | 13 spans: 27 GETs, 14 MB, 1.2 s | 25 blocks: 159 GETs, 41 MB, 2.2 s | 7 GETs, 101 MB, 11.7 s |
+| 10,000, 100M keys | 16 spans: 259 GETs, 65 MB, 7.7 s | 25 blocks: 965 GETs, 68 MB, 8.1 s | 6 GETs, 97 MB, 12.9 s |
 
 The 100M catch-up is dominated by paging: ~85 pages of 100K keys, each
-fetching a block range from each span. Building the spans wrote 6.2× (1M)
-and 8.7× (100M) the committed entries past the oldest consumer; the aligned
-blocks 3.5× and 4.4×, on top of whatever the LSM writes. Spans crossed by an
-endpoint (the versions policy) add at most the read bound to these.
+fetching a block range from each span. Building the spans took 6.2× (1M)
+and 8.7× (100M) compaction entry writes per entry committed past the oldest
+consumer; the aligned blocks 3.5× and 4.4×, on top of whatever the LSM
+writes. Limits of this measurement (the second review): the spans do not
+cross the consumers' positions; the classes were checked as four aggregate
+counts, not key by key; the packed column merges the whole object at once
+rather than paging a `changes()`; the increases in the process's high-water
+RSS it printed (+20 MB for spans, +419–494 MB for packed) are not
+per-reader peak memory and are not compared here. The v4 prototype measures
+the same API key by key, in isolated reader processes.
 
-## Bounds, and costs as a function of observers
+## Resource limits
 
-An entry cap bounds neither the span count nor reader memory (the review's
-P1-4). Each resource has its own bound:
+Merging across endpoints trades two costs. Spans that share one sorted file
+cannot skip by time inside it, so an old pass may read data outside its
+range (A12-3). Spans kept apart per endpoint read exactly, but their number
+grows with endpoints, and large pinned commits leave nothing a guarded,
+read-respecting merge may join (A12-4). No layout avoids both, so the
+design states limits and what happens at each (decision D64, for Erwin):
 
-| Resource | Bound | How |
+| Resource | Limit | At the limit |
 |---|---|---|
-| Bytes written | (1 + 43R + 20R log₂ K) × committed | the guard on every merge, retries capped at R (Lean) |
-| Spans: scan fan-in, filters probed, cold tail GETs | set by the policy, not by observers | merges cross endpoints |
-| Decoded bytes per reader | about one block range per span per page, plus the page | fan-in × 64 KB × a few, plus the page's entries |
-| Extra read per catch-up | 2× its own changes, or 10 MB | the read bound |
-| Maintenance backlog | one merge per lane | two lanes |
-| Retained versions | the distinct keys changed between consecutive endpoints, summed | the budgets below |
+| Entries written | (1 + 43R + 20R ⌊log₂ K⌋) × committed, R = 3 | proved for every merge the policy makes; after 3 failed attempts on an input set, merging stops for that index and an alarm is raised |
+| Spans per index (scan fan-in, filters probed, cold tail GETs) | 32 | forced guarded merges across endpoints; readers inside pay extra reads |
+| A reader's read | a full read of the index | structural: a catch-up reads a subset of the spans a full read reads |
+| Decoded bytes per reader | one block range per span per page, plus a page of at most 16 MB | 32 spans × 2 × 64 KB + the page: about 20 MB |
+| Pending maintenance | queued merge input ≤ 2× the index's bytes | commits to the partition wait (writer backpressure) until upkeep catches up |
+| Endpoints | no count limit; measured up to 1,000 distinct | their cost is retained versions (the physical budget) and, under the span cap, reads |
+| Retained bytes | the physical budget over five lifetimes (below) | backpressure, then cancel-restart of the oldest protected reader |
+
+Nothing here relaxes the guard to regain compaction progress.
 
 Replayed (`spans.py`; commits of 1K keys, 90% updates, 5% removes, 5%
 adds; the second half of 40,000–200,000 commits measured; consumers read
 every `period` commits, at one commit per 10 s 360 is hourly and 8,640
-daily). Each cell: written per entry committed · spans, mean (max) ·
-entries per live key. `versions` is this design; `blocked` the reviewed
-one, with the same triggers and guard:
+daily). Each cell: compaction entry writes per entry committed · spans,
+mean (max) · entries per live key. `versions` is the first revision
+(merges cross endpoints under a one-ended read rule, no span cap);
+`blocked` the reviewed original, with the same triggers and guard. The
+final policy (`capped`: two-ended read rule, span cap 32) follows the
+table:
 
 | Observers | 1M keys, versions | 1M, blocked | 100M keys, versions | 100M, blocked |
 |---|---|---|---|---|
@@ -324,20 +380,43 @@ Each cell is the worse of instant upkeep and budgeted upkeep (one merge per
 lane at 2M entries per commit, about one core); they differ by at most 4
 spans at the peak.
 
-- **Writes stay at 7–10× (1M) and 12–14× (100M) under every churn pattern**,
-  well inside the bound (624× for R = 1 and K = 10⁹: loose, but
-  independent of the order observers come and go in).
-- **Spans stay at 22 or fewer on average, 30 at most**, from 1 to 1,000
-  distinct endpoints. Blocking endpoints gives one group of spans per
-  endpoint: 543–546 at 100 readers, 183–187 for 60 staggered hourly ones.
-- **What observers cost is storage.** Each endpoint keeps the keys changed
-  between it and the next: free at 100M (1.13–1.24 entries per live key),
-  ~10× at 1M keys with a reader every 15 minutes of a 10-second source, and
-  7.6× with heavy temporary-key churn. The per-position budget below turns
-  such readers into full passes; the table runs with no budget, to show the
-  cost.
-- **A catch-up reads 1.07–1.24× what changed** for daily readers at 100M,
-  and up to 2× for staggered hourly ones (the read bound at work).
+The final policy, `capped`, on the same scenarios (replayed; worse of
+instant and budgeted upkeep; each cell: compaction entry writes · spans,
+mean (max) · entries per live key · the slowest reader's read per read, ×
+what changed in its range):
+
+| Observers | 1M keys | 100M keys |
+|---|---|---|
+| 1 daily | 7.0 · 6.6 (12) · 2.84 · 2.97 | 12.6 · 9.9 (18) · 1.16 · 1.08 |
+| 10 daily, spread | 7.4 · 12 (17) · 7.42 · 5.89 | 13.6 · 18 (28) · 1.22 · 1.11 |
+| 100 daily, spread | 7.6 · 18 (23) · 9.56 · 6.98 | 14.4 · 21 (29) · 1.24 · 1.07 |
+| 1,000 daily, spread | 7.9 · 19 (24) · 9.92 · 7.09 | 13.6 · 22 (30) · 1.24 · 1.08 |
+| an endpoint at every commit | 9.4 · 7.3 (12) · 2.37 · 2.13 | 13.9 · 10 (17) · 1.13 · 1.40 |
+| stalled full pass, + hourly | 6.6 · 7.4 (13) · 3.80 · (stalled) | 13.1 · 9.8 (21) · 1.17 · 1.06 |
+| 60 staggered hourly | 7.4 · 6.5 (11) · 1.65 · 2.02 | 13.0 · 9.4 (18) · 1.13 · 1.82 |
+| temporary keys, hourly + daily | 7.7 · 7.5 (14) · 6.49 · 1.25 | 12.9 · 10 (18) · 1.13 · 1.03 |
+| a 1M-key commit after 1K ones | 6.6 · 7.1 (16) · 3.04 · 2.75 | 12.9 · 9.7 (21) · 1.15 · 1.04 |
+
+And the second review's two constructions (`adversarial.py`, replayed):
+
+| Case | `versions` | `capped` |
+|---|---|---|
+| A12-3: base, then spans of 1, 1M and 1M entries; a pass at `[0, 0]` | merged: the pass reads 1,990,001 entries for its 1 | refused: it reads 1 |
+| A12-4: base, then forty 2M-entry commits, an endpoint at each | 41 spans, no merge planned | 32 spans (36M entries written); a reader of one commit reads up to 2× its 2M |
+
+- **Compaction entry writes stay at 7–10× (1M) and 12–14× (100M)** under
+  every pattern (add 1 for total entry writes), far inside the proved bound.
+- **Spans stay under the cap without forcing** in every replayed pattern;
+  only A12-4's construction reaches it.
+- **What observers cost is storage**, and at small sizes reads. Each
+  endpoint keeps the keys changed between it and the next: free at 100M
+  (1.13–1.24 entries per live key), 7–10× at 1M keys with a reader every 15
+  minutes of a 10-second source or heavy temporary-key churn. There a daily
+  reader reads 6–7× what changed, still less than a full read; the
+  per-position budget turns such readers into full passes. The tables run
+  without budgets, to show the cost.
+- **The two-ended read rule costs little at 100M** and some at 1M: the 1M
+  daily reader reads 3.0× what changed against 2.0× under `versions`.
 
 ## Retention: each lifetime on its own
 
@@ -406,6 +485,15 @@ each, or reclaim abandoned outputs sooner.
   changed match) stays separate from ordinary classification.
 - **Empty commits, empty base.** An empty delta is still a span, so
   coverage has no holes. A read that finds a hole fails loudly.
+- **Read-ahead results outlive their entries.** A sealed attempt result
+  referenced by a read-ahead entry is kept until the entry collapses, as
+  run retention keeps named runs today (`upkeep.py:307-309`); manual
+  pruning refuses it, or drops the entry and makes the next pass deliver
+  its keys again. A missing result is never reconstructed silently.
+- **Orphans and pins.** The orphan collector's roots are every file of the
+  current state, of every manifest a pin holds, of pending cleanups, and
+  of merges in progress. A reader acquires a manifest and its pin
+  atomically.
 - **No inferred history.** Every index must have been written exactly from
   its first commit. There are no deployments, so a fresh index is a
   precondition, not a migration.
@@ -461,9 +549,10 @@ replayed), and each
 - **Today's LSM plus a packed, resumable log.** Lookups keep the leveled
   layout; catch-up reads one packed object in a few range GETs and merges
   every delta once, holding a cursor per delta. Measured 10,000 behind: 6–7
-  GETs, but 97–101 MB, 11.7–12.9 s of merge and 420–490 MB of memory,
-  against 13–16 spans, 14–65 MB, 1.2–7.7 s and ~20 MB. It keeps today's
-  leveled compaction and two structures.
+  GETs, but 97–101 MB and 11.7–12.9 s for the merge, against 13–16 spans,
+  14–65 MB and 1.2–7.7 s. It keeps today's leveled compaction (51.3× total
+  entry writes at 100M, measured) and two structures. It stays the control
+  for the v4 measurements, with a paged, resumable merge.
 - **Aligned tiers** (the range tree). Measured on the same log: 25 blocks
   and 159–965 GETs for 10,000 behind, against 27–259 for spans, at similar
   bytes, and 3.5–4.4× written on top of the LSM's compaction.
@@ -601,10 +690,24 @@ publication failures; spans and written bytes reported against the bounds.
 | P2-2 mixed models | numbers labelled; catch-up measured on real spans against packed deltas and aligned blocks; both layouts built from one trace by real compactions |
 | P2-3 cap exemption at 0 | removed (`tiling.py`); only positions with a pass under way are exempt, and the physical budget covers them |
 
+The second review (A12), on a7fc05f:
+
+| Finding | Answer |
+|---|---|
+| A12-1 base normalization | only the base's initial segment, before the oldest live endpoint inside it, keeps live keys only; later segments keep tombstones |
+| A12-2 clip changes at `N` | every key clipped to `[g(P), g(N + 1))`: the "changed" test, the state at `N`, staleness and resumed pages |
+| A12-3 an old pass facing newer data | the read rule checks both ends, in bytes, and is a preference; the universal 2×/10 MB bound is withdrawn; a reader's read is bounded by a full read (replayed: the merge is refused, the pass reads 1 entry, not 1,990,001) |
+| A12-4 many large pinned commits | a hard cap of 32 spans, by forced guarded merges; readers inside pay up to 2× (replayed: 41 spans become 32); explicit limits and backpressure in the resource table |
+| A12-5 the theorem | entries, not bytes: (1 + 43R + 20R ⌊log₂ K⌋), deltas included; single-span rewrites covered (5a34e6e); every attempt charged, R = 3 |
+| A12-6 amplification labels | compaction entry writes and total entry writes labelled; 14.0× against 51.3× total at 100M; bytes with the v4 measurements |
+| A12-7 RSS | relabelled as process high-water increases; the memory comparison is dropped; isolated reader processes in the v4 measurements |
+| key-by-key checks; sealed result retention | the v4 prototype compares every key and class; results kept until their entries collapse |
+
 ## Open questions
 
-- λ = 1 and Z = 1M entries for the read bound, 4 for the guard and the
-  window: chosen on the replay; the implementation should re-measure.
+- λ = 1 and Z = 10 MB for the read rule, 32 for the span cap, 4 for the
+  guard and the window, R = 3, the backlog limit at 2× the index: chosen on
+  the replay; the v4 measurements re-check them.
 - The physical budget's default, and whether cancel-restart of a stalled
   pass needs the user's consent.
 - Format v4 lets a key repeat within a file; the reference implementation

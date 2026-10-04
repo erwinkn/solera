@@ -95,6 +95,7 @@ class Sim:
         self.written = self.committed = 0.0
         self.busy: tuple[int, list[Span], Span] | None = None  # (commit it publishes at, inputs, output)
         self.lanes = {"base": [0.0, None], "tail": [0.0, None]}
+        self.fanin = 32
         self.waits = 0
 
     # -- entries -------------------------------------------------------------------------
@@ -122,9 +123,12 @@ class Sim:
             segs[0] = Seg(-1, 1.0, 0.0)
         return Span(rs[0].a, rs[-1].b, segs)
 
-    def allowed(self, rs: list[Span], live: set[int]) -> bool:
+    def guarded(self, rs: list[Span]) -> bool:
         sizes = [self.entries(r) for r in rs]
-        if len(rs) > 1 and max(sizes) > 4 * (sum(sizes) - max(sizes)):
+        return len(rs) == 1 or max(sizes) <= 4 * (sum(sizes) - max(sizes))
+
+    def allowed(self, rs: list[Span], live: set[int]) -> bool:
+        if not self.guarded(rs):
             return False
         if self.policy == "blocked":
             return not any(r.a in live for r in rs[1:])
@@ -135,10 +139,27 @@ class Sim:
         for s, e in zip(out.segs, es, strict=True):
             if s.start in live and before > 0:
                 after = total - before
-                if self.policy == "blocked" or before > max(self.lam * after, self.z):
+                if before > max(self.lam * after, self.z):
+                    return False
+                # `capped`: both temporal ends - a pass ending at `e` must not face much newer data either.
+                if self.policy == "capped" and after > max(self.lam * before, self.z):
                     return False
             before += e
         return True
+
+    def forced(self, live: set[int]) -> tuple[int, int] | None:
+        """`capped`, past `fanin` spans: the guarded window of 2 to 4 adjacent spans
+        (the base excluded) with the fewest entries, whatever the read rule says."""
+
+        sp, best = self.spans, None
+        for w in (2, 3, 4):
+            for lo in range(1, len(sp) - w + 1):
+                rs = sp[lo : lo + w]
+                if self.guarded(rs):
+                    cost = sum(self.entries(r) for r in rs)
+                    if best is None or cost < best[0]:
+                        best = (cost, lo, w)
+        return None if best is None else (best[1], best[2])
 
     def plan(
         self, live: set[int], lane: str = "any", frozen: frozenset = frozenset()
@@ -154,6 +175,10 @@ class Sim:
         sizes = [self.entries(r) for r in sp]
         if lane == "tail":
             out = self._tail(sp, sizes, live, frozen)
+            if out is None and self.policy == "capped" and len(self.spans) > self.fanin:
+                f = self.forced(live)
+                if f is not None and not any(id(r) in frozen for r in self.spans[f[0] : f[0] + f[1]]):
+                    out = f
             return out
         # The oldest span absorbs what follows, as far as it may reach.
         if len(sp) > 1 and (sum(sizes) - sizes[0]) * 4 >= sizes[0]:
@@ -172,7 +197,10 @@ class Sim:
                     return 0, j + 1
         if lane == "base":
             return None
-        return self._tail(sp, sizes, live, frozen)
+        out = self._tail(sp, sizes, live, frozen)
+        if out is None and self.policy == "capped" and len(self.spans) > self.fanin and not frozen:
+            out = self.forced(live)
+        return out
 
     def _tail(self, sp, sizes, live, frozen) -> tuple[int, int] | None:
         def free(lo, w):
