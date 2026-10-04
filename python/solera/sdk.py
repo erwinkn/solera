@@ -453,7 +453,11 @@ class Batch:
       another version; `removed`: present at the position, absent now. A
       key added and removed again appears nowhere; one removed and added
       back is updated. The rows are those of `added` and `updated`. A full
-      pass delivers every key as added;
+      pass delivers every key as added. On a store of current rows only,
+      rows show the store's newest state: a key in `added` or `updated`
+      may come without a row if it was removed since — its removal follows
+      in a later batch — and a key changed after the pass's version may
+      arrive once more as updated (D100);
     - `full`: the batch is part of a full pass — the whole head after a
       reset, not a delta;
     - `index`: this batch's 0-based index in its pass, exact;

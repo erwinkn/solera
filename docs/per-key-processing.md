@@ -253,6 +253,27 @@ The attempt ends `canceled` or `timed out`, with the outputs it
 committed; an attempt timeout stays retryable within `retries=`, as
 today.
 
+**A store of current rows (D100).** A batch's classes follow the key
+index, at its pass's version — a full pass's snapshot, a delta's end —
+and its rows follow the store. On a current-only store, rows show the
+store's newest state. A key in added or updated may come without a row if
+it was removed since; its removal follows in a later batch. A key changed
+after the pass's version may arrive once more as updated. A row missing
+while the source's head index still names the key is the store behind
+its index instead: `SourceBehind`, retryable and bounded (F33). So a
+count kept from the classes stays exact. *Example:* a full pass's
+snapshot holds k1 and k2, a key a batch. k1's batch adds it: count 1. The
+source removes k2 (commit c). k2's batch reads the snapshot, which still
+names k2: added, with no row — count 2. The pass completes at the
+snapshot, and the delta to c removes k2: count 1, the source's. Had k1
+been updated at c before its batch, the batch adds k1 with its new row
+(count 1), and the delta says updated (count 1). A delta the same way: k1
+and k2 updated (version 2); after k1's batch the source removes k2
+(commit 3); k2's batch finds no row, so k2 is updated with no row (count
+2), and the delta to 3 removes it (count 1). A per-key asset drops a key
+it finds gone at once instead: its output index is what it holds, and
+dropping a key twice is harmless.
+
 ## 6. Every key is a group
 
 ```python

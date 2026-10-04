@@ -390,7 +390,10 @@ position, absent now). A key added and removed again appears nowhere,
 and one removed and added back is updated; at a versioned source a key
 taken from `v1` to `v2` and back to `v1` is not delivered at all. A full
 pass delivers every key as added. A key a `keys=` run delivered is
-classed against what that run delivered (§6's read-ahead). So a consumer
+classed against what that run delivered (§6's read-ahead). Classes follow
+the index, rows the store: on a store of current rows only, a key in
+added or updated may come without a row if it was removed since, its
+removal following in a later batch (D100, per-key-processing.md §5). So a consumer
 can keep a total from the changes alone:
 
 ```python

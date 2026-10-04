@@ -267,8 +267,9 @@ async def gone_since(output: str, key: str | None, value, expected: dict, pin: d
     current rows serves only its newest state. A key the head still names
     the store lacks: the store is behind its index, `SourceBehind`,
     retryable and bounded (F33). One the head lacks too was removed since:
-    returned, for the batch to take as removed — a later commit's delta
-    carries the removal anyway."""
+    returned. A plain batch still delivers it in its class, with no row
+    (D100); a per-key batch drops its outputs now, which its own index
+    makes harmless to do twice."""
 
     missing = missing_keys(key, value, expected)
     if not missing:
@@ -341,9 +342,9 @@ async def read_each_batch(spec: dict, pin: dict, keys_io) -> Batch:
             unmatched.append(key)  # no longer one of the input's keys: its outputs and record go
         elif entry is None:
             deleted.append(key)  # gone upstream: its outputs and its record go
-        elif entry[0] == walked[key].upstream:
-            upserted[key] = entry[0]
-        # else: its upstream was written since — the delta pass brings it, at its new generation
+        elif key not in owed:
+            upserted[key] = entry[0]  # at its version now
+        # else: the next delta brings it, at its new version
     batch = Batch(
         upserted,
         deleted,

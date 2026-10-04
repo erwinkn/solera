@@ -251,14 +251,14 @@ async def test_a_selection_during_a_pattern_change_is_counted_once(tmp_path):
         await t.close()
 
 
-@a19("R5")
 async def test_an_early_removal_from_a_current_only_source_is_delivered_once(tmp_path):
-    """A19 R5: a delta over a current-only source, a key a batch: after k1's
-    batch the source removes k2, so k2's batch finds it gone and delivers its
-    removal early (F38). It is recorded (D93), so the delta that carries the
-    removal does not deliver it again: the count is 1."""
+    """A19 R5, D100: a delta over a current-only source, a key a batch: k1
+    and k2 updated; after k1's batch the source removes k2 (commit 3). k2's
+    batch finds no row: it is still updated, with no row, as its class at
+    the delta's version says, and the delta 3 removes it — once. The count
+    goes 2, 2, 2, 1."""
 
-    outside, holdings, removing = External(), Holdings(), {}
+    outside, holdings, removing, counts = External(), Holdings(), {}, []
     state = await State.open((tmp_path / "state").as_uri(), "test", flush_interval=0.001)
 
     @asset(inputs={"feed": Incremental(batch_size=1)}, outputs=Output("tally"))
@@ -269,7 +269,8 @@ async def test_an_early_removal_from_a_current_only_source_is_delivered_once(tmp
         if removing.pop("now", False):
             outside.feed.pop("k2")
             await removing["engine"].commit_source("feed", remove=["k2"])
-        return {"rows": before + len(batch.added) - len(batch.removed)}
+        counts.append(before + len(batch.added) - len(batch.removed))
+        return {"rows": counts[-1]}
 
     p = Project(
         assets=[tally],
@@ -289,7 +290,51 @@ async def test_an_early_removal_from_a_current_only_source_is_delivered_once(tmp
         await drive(engine, await engine.submit(["tally"]))
         await drive(engine, await engine.submit(["tally"]))
         holdings.check({"k1"})
+        assert counts[2:] == [2, 2, 1], (counts, holdings.trace)
+        assert holdings.trace[2:] == [([], ["k1"], []), ([], ["k2"], []), ([], [], ["k2"])]
         assert (await value_content(engine, p, "tally"))["rows"] == 1
+    finally:
+        await engine.stop()
+        await state.close()
+
+
+@a19("R1-R3: a full pass reads its snapshot (page/lookup at= through _read)")
+async def test_a_key_removed_during_a_full_pass_is_counted_out_once(tmp_path):
+    """D100, the full pass: the snapshot holds k1 and k2, a key a batch.
+    After k1's batch the source removes k2 (commit c). k2's batch reads the
+    snapshot, which still names k2: it is added, with no row. The delta then
+    removes it — once. The count goes 1, 2, 1, the source's."""
+
+    outside, holdings, removing, counts = External(), Holdings(), {}, []
+    state = await State.open((tmp_path / "state").as_uri(), "test", flush_interval=0.001)
+
+    @asset(inputs={"feed": Incremental(batch_size=1)}, outputs=Output("tally"))
+    async def tally(ctx, feed: list):
+        batch = ctx.batch["feed"]
+        holdings.apply(batch)
+        before = 0 if batch.full and batch.first else (await ctx.load())["rows"]
+        if removing.pop("now", False):
+            outside.feed.pop("k2")
+            await removing["engine"].commit_source("feed", remove=["k2"])
+        counts.append(before + len(batch.added) - len(batch.removed))
+        return {"rows": counts[-1]}
+
+    p = Project(
+        assets=[tally],
+        sources=[Source("feed", key="id", store="ext")],
+        stores={"ext": SourceStore(tmp_path / "ext", outside)},
+        default_store=FileStore(tmp_path / "default"),
+    )
+    engine = removing["engine"] = make_engine(state, p)
+    try:
+        await engine.initialize()
+        outside.feed.update({"k1": "1", "k2": "1"})
+        await engine.commit_source("feed", upsert=dict(outside.feed))
+        removing["now"] = True
+        await drive(engine, await engine.submit(["tally"]))
+        await drive(engine, await engine.submit(["tally"]))
+        holdings.check({"k1"})
+        assert counts == [1, 2, 1], (counts, holdings.trace)
     finally:
         await engine.stop()
         await state.close()

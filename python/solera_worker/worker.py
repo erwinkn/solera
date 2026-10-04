@@ -407,10 +407,11 @@ async def _resolve_inputs(spec, project, asset, keys_io, timeline, observed: Obs
             upserted, deleted, after = dict(read.upserted), [*read.deleted, *read.unmatched], read.after
             args[param] = await observed.load(store, ref, t, Keys(upserted))
             key = _key_column(project, ref.output)
-            for gone in await each.gone_since(ref.output, key, args[param], upserted, pin, keys_io):
-                del upserted[gone]  # removed since the pass's commit: delivered as removed (F38),
-                if gone in read.updated:  # unless the consumer never held it: then not at all
-                    deleted.append(gone)
+            # Classes follow the index, rows the store (D100): a key a current-only store
+            # no longer has is delivered in its class with no row — its removal is a later
+            # commit, which a later batch delivers — unless the head still names it: then
+            # the store is behind (F33), SourceBehind.
+            await each.gone_since(ref.output, key, args[param], upserted, pin, keys_io)
             batch[param] = Batch(
                 rows=args[param],
                 added=tuple(sorted(k for k in upserted if k not in read.updated)),
