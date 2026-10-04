@@ -62,9 +62,9 @@ deciding:
 1. **Points**: `k → observation`, explicit — presence, version, payload,
    the patterns it was read under, context, life. Written where an
    observation of `k` is not what a range or the base would decode: keys
-   a run loaded by an explicit `keys=` list; a current-only store serving a row other than the
-   version at the batch's head, or none; and a key that changed under a
-   range as the range folds (below). A point pins nothing (A27 R11).
+   a run loaded by an explicit `keys=` list; a source serving a row other
+   than the version at the batch's head, or none; and a key that changed
+   under a range as the range folds (below). A point pins nothing (A27 R11).
 2. **Ranges**: disjoint key ranges `[lo, hi] → (H, patterns, context,
    life)`: every key in it as upstream had it at head `H`, if those
    patterns take it, else absent. A batch's commit writes one: the key
@@ -205,21 +205,55 @@ The index stays reader-agnostic: retention asks for every base and range
 older than its cut to be folded first, and keeps no per-reader snapshot.
 The reader owns its before-image through its observation record.
 
-## Observations: what was served (A27 R2)
+## Observations: what was read (A27 R2)
 
-An observation is what the store served, taken from the row itself: a
-current-only store returns, with each row, its version and payload, and
-says which named keys it has none for. Never a separate lookup of the
-head index — a source can revert between the load and the lookup. A store
-that cannot say what it served cannot back an incremental input on
-current rows; its reads fail instead of guessing.
+Once data is loaded, the batch must know exactly which version it got.
+Two kinds of store of current rows say so in two ways.
 
-The batch's classes are then decided from the observations, before the
-producer is called: planned as an update, served absent — a removal if
+**A fenced store names the commit it read.** PostgresStore — and any
+fenced store with `reads()` (`stores.md`, "What a read sees") — sets the
+partition's fence row's `written` to its generation in every write
+transaction, as it commits, and `reads()` loads rows and `written` in one
+snapshot. So a batch reads its rows and that generation `G` together: the
+rows are exactly the partition's state after `G`'s write. The batch's head
+`H` is the commit whose generation is `G` — chosen by the store, not the
+engine — and the batch classes every candidate in its range at `H`, in the
+same snapshot, so its classes and its rows agree key by key. No
+served-version points, no reclassification, and no "store behind its
+index": the index at `H` and the rows are one state.
+
+- **Several generations.** It holds for a partition written by many: a
+  commit is cumulative, so the commit of the last write, `G`, describes
+  the whole partition, earlier writes included.
+- **`G` names no installed commit** — its write committed in the store,
+  its `AttemptFinished` not durable yet, or a dead writer's partial write:
+  the read saw uncommitted data. It retries, bounded, then fails the read.
+  A dead writer's partition reads again once its repair commits (a repair
+  always writes, so `written` becomes the repair's generation); until then
+  its consumers' batches fail, so a partition owing a repair must come due
+  promptly, not wait for its next scheduled run.
+- **`G` older than the index head** does not happen on a fenced store, whose
+  commits install only after their writes; if it did, `H` would simply be
+  older, and the classes exact at `H`.
+- **Retention.** The claim reserves the head at dispatch; `H` is that head,
+  or a commit installed since, both kept.
+
+**A source says what it served.** An external source — a table, an API,
+files outside Solera, a PostgresStore table no fenced write ever changed
+(`written` is None) — has no fence: its commits are the engine's record of
+what the outside said, and its rows are as they are now. So it returns,
+with each row, its version and payload, and says which named keys it has
+none for. Never a separate lookup of the head index — a source can revert
+between the load and the lookup. A source that cannot say what it served
+cannot back an incremental input; its reads fail instead of guessing.
+
+A source batch's classes are then decided from the observations, before
+the producer is called: planned as an update, served absent — a removal if
 the key was held, nothing if not; served a version equal to what was
 observed — nothing. So an aggregate's count follows what it was actually
-given (a tally of 2 cannot be left holding one member). A served row
-other than the version at the batch's head becomes a point.
+given (a tally of 2 cannot be left holding one member). A served row other
+than the version at the batch's head becomes a point. Every past finding
+about served rows (A19 R5, A26 N4, F38, F41) was on such a source.
 
 ## Context and lives (A27 R1, R7)
 
@@ -391,7 +425,7 @@ becomes `w2`. Every key the base decodes present is owed an update.
 `keys=(k1)` writes `k1` under `w2`: fresh, `k2` still owed. `factor`
 back to `w1`: `k1` owed, `k2` fresh.
 
-**The current-only revert (A27 R2).** A batch reads at a head where `k2`
+**The source revert (A27 R2).** A batch reads at a head where `k2`
 is `@2`; the store serves the row `@3`, saying so: the class is decided
 from `@3`, and a point `k2@3` is written. Restored to `@2`: `@3` against
 `@2`, an update. A row served ahead of every commit is a point all the
@@ -443,7 +477,7 @@ holds, `removed` always one.
 | A19 R1, R2: a key added twice | it decodes present: an update or nothing |
 | A19 R3: a delivered removal forgotten | the removed key decodes present until a run removes it |
 | A19 R4, A26 N2, N3: pattern-time selections | a selection writes points under the patterns it read under; folds are decode-equal; candidates are classed once |
-| A19 R5, A26 N4, F38: served rows | observations come from the row; classes follow them before the callback |
+| A19 R5, A26 N4, F38: served rows | a fenced store's read names its commit, the batch's head; a source's rows carry their version, and classes follow them before the callback |
 | A19 R7, F37: shared inputs | context per layer; scanned when it moves |
 | A19 R9, R10, F35: staleness | one comparison, exact or pending; `each` chains intersect key by key |
 | F41: a position past a removal it never delivered (`items` over a current-only `feed` going `{…, k11}` → `{k11}` → `{k1, k3}`: read through commit 2, still holding `k11`, fresh) | nothing moves past an observation: `k11` stays in `S` as served until a batch delivers its removal, and the next comparison classes it from that decoded state against upstream now — an owed removal |
@@ -491,7 +525,7 @@ Each goes from the docs and the glossary when the observed set is built
 | Position: `next`, `pass` (`from`, `at`, `batch`, `pin`), `fingerprint`, `began`, `seen` | The base and ranges, each observed at a head; no pass, cursor or scan pin is stored; the `definition` (was `fingerprint`) stays: a change resets `R` |
 | K45 read-ahead (`ahead`), its cap, paged selections' shared entries | Points, spilling past a bound |
 | D93: snapshot passes; selections classed via `lower=` | Each batch reads at its own head, pinned by its claim; selections write points; `decode` replaces `lower=` |
-| D100: classes from the index, rows from the store; rowless deliveries | Classes from what was served, decided before the callback |
+| D100: classes from the index, rows from the store; rowless deliveries | A fenced store: classes at the commit its read names. A source: classes from what it served, before the callback |
 | The pattern change: old patterns' delta, membership diff, old/new split | Normalised patterns per layer; prefix membership queries; one classification |
 | `caught_up`, `caught_up_at`, `_dep_restart` | Derived: nothing owed; context per layer |
 | Staleness: three predicates; K38's filter-then-confirm | One comparison, exact or pending |
@@ -524,8 +558,11 @@ relying on the bounds: measure a large spill and a pattern change at
 
 ## What gets harder
 
-- **Stores of current rows must say what they served**, per row; one that
-  cannot fails its reads for incremental consumers instead of guessing.
+- **Stores of current rows must say what they read**: a fenced one, the
+  generation of its snapshot (`reads()`); a source, each row's version.
+  One that cannot fails its reads for incremental consumers.
+- **A dead writer stalls its consumers** until its repair commits: a
+  partition owing a repair must come due promptly.
 - **A full compare at 100M** — a prefixless pattern change, a moved shared
   input, a truncated log — reads two whole key views; until a run makes
   it, the partition is pending.
@@ -598,13 +635,15 @@ run(R):
         keys = the next batch_size keys of todo after prev
         c = keys[-1] if todo goes on past it else LAST
         H = the head now, pinned by the batch's claim
+        if the store is fenced:                    # one snapshot: rows and G together
+            G = the partition's written generation; H = its commit (retry, bounded, if none)
         owed_here = {k: classify(R, k, at H) for k in candidates(R, H) within (prev, c]}
         load the keys owed_here owes, plus any other key the run asked for (unchanged)
-        reclassify each from what was served
+        if the store is a source: reclassify each from what was served
         call the producer
         if not may_commit(batch, R, now):
             return                                 # refused: its keys stay owed
-        commit outputs, the range (prev, c] @ H, a point per key served otherwise
+        commit outputs, the range (prev, c] @ H, a point per key a source served otherwise
         fold(R, H)
         prev = c
 
