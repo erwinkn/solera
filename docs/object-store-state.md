@@ -71,7 +71,7 @@ Everything lives under `{root}/{namespace}/`.
 |---|---|---|---|---|
 | Journal | `control/journal.json` | engine | swapped (`If-Match`) on every flush | never (one object) |
 | Checkpoint | `control/checkpoints/{engine}-{n:06d}.json` | engine | create-only | once the journal has moved to a newer one (§10) |
-| Key index file | `keys/{output}/{partition}/{name}.kx` | worker (delta files), merges | create-only | no longer in the index and no consumer needs it (§6) |
+| Key index file | `keys/{output}/{partition}/{name}.lay` (and `.lix`) | worker or engine (deltas), merges | create-only | no longer in the index and no consumer needs it (§6) |
 | History file | `history/{table}/{ulid}.parquet` | engine | create-only | merged into a bigger file, or rewritten without deleted runs (§7) |
 | Spec | `runs/{run}/{attempt}.spec` | engine, before `AttemptLaunched` | create-only, immutable | with its run |
 | Control file | `runs/{run}/{attempt}.control` | the engine creates it `open` before the launch; then the owner (`owned`, `writing`, `sealed` with its result) or the engine (`ended`) | created once, then only swapped (`If-Match`) | with its run |
@@ -95,9 +95,9 @@ current content.
     journal.json                             ← the engine id, the checkpoint, the events since
     checkpoints/7f3a9c0e5b21d846-000012.json ← the checkpoint the journal names
   keys/
-    site_files/alpha/000000000057.kx         ← delta file of commit 57
-    site_files/alpha/m000000000000-000000000056-01J8ZE2….0000.kx ← merged span [0, 56]
-    uploads/_/000000000003.kx                ← external source
+    site_files/alpha/000000000057-01J8ZD….-0.lay  ← delta of commit 57 (attempt, file)
+    site_files/alpha/1/l000000000000-000000000056-e3-01J8ZE2…-m0.lay ← merged layer [0, 56], main part
+    uploads/_/000000000003-01J8ZC….-0.lay     ← external source
   history/
     runs/01J9A2….parquet                     ← merged: 4,000 runs
     runs/01J9C7….parquet                     ← one flush
@@ -217,7 +217,7 @@ knows its write landed (`swap`, §0).
 
 Everything else the storage does runs on its own loop, off the engine's:
 the history lake flushes and merges (§7), and `Upkeep` merges key
-index spans (§6), deletes garbage and applies retention (§11).
+index layers (§6), deletes garbage and applies retention (§11).
 
 ```json
 {
@@ -255,7 +255,9 @@ status are derived inside `apply`; they are not events.
 | `AttemptPlaced` | `attempt`, `handle` | the placement started it: where it runs, for whichever engine follows it (§8) |
 | `AttemptFinished` | `run`, `task`, `attempt`, `outcome` (`succeeded` \| `failed` \| `skipped` \| `canceled`), `started_at`, `finished_at`, `error?`, `retryable?`, `commit?`, `owing a repair?`, `writes?` | records the attempt; on commit, installs heads, the partition's record (cursor, positions, completeness), and each keyed output's new delta file; `repairs` keeps the intents of a writer that died (§8) |
 | `SourceCommitted` | `source`, `head`, `keys?`, `at`, `run?` | installs a source head and its delta file; a commit that changed something records `run` in the history (§7) |
-| `IndexMerged` | `output`, `partition`, `life`, `prefix`, `inputs` [[a, b]], `names` [[name]], `span`, `read`, `written`, `at` | swaps adjacent spans for their merge, if the index is still that life and holds those files; else its files become garbage |
+| `MergeAttempted` | `output`, `partition`, `life`, `inputs` (the attempt key), `at` | counts an attempt of one merge before its upload; three stop it |
+| `IndexMerged` | `output`, `partition`, `life`, `prefix`, `ids`, `layer`, `at` | swaps adjacent layers for their merge, if the index is still that life and holds those layers; else its files are orphans |
+| `IndexCut` | `output`, `partition`, `life`, `cut` | raises the index's cut (never lowers it) |
 | `FilesCleanedUp` | `paths` | forgets index files that were deleted |
 | `AutomationChanged` | `name`, `enabled` | |
 | `AutomationFired` | `name`, `at`, `run` | clears its pending set |
@@ -349,77 +351,60 @@ Example (abridged):
 One per keyed output (or keyed external source) and partition. The format
 and operations live in an SDK library (`solera.keys`) used by the worker,
 by merges, and by the server for key listings. The engine itself only
-holds each index's `KeyIndex` record.
+holds each index's `LayerState` record.
 
-**Structure: spans tiling commit time** (`key-index-design.md`). Every
-file holds `(key, generation, deleted, payload?, predecessor?)` entries
-sorted by key — the generation that last wrote the key, its version, and
-what an immutable store names its object by (`versions.md`, `lifecycle.md`
-§9.8); the optional payload is a source key's version or a failed keys's
-record; the predecessor is the generation the entry replaced.
+**Structure: stamped layers tiling commit time** (`key-index-design.md`).
+A **layer** holds what commits `[a, b]` changed, one entry per key, sorted
+by key: whether the key is present after `b` and was before `a`, the
+commit and generation of its last change (its version, and what an
+immutable store names its object by: `versions.md`, `lifecycle.md` §9.8),
+its **flips** (the commits that added or removed it, those at or below the
+cut dropped) and, if present, its payload (a source key's version, a failed
+key's record).
 
-- **A span** holds what commits `[a, b]` changed, in key-sorted files of
-  up to ~64 MB. A commit's delta is the span `[c, c]`, even when empty, so
-  the spans tile the commits from 0 to the head with no gap; the one from
-  0 is the **base**.
-- **Versions:** within a span a key keeps one version per segment, newest
-  first, with its predecessor on the oldest. Segments split a span at the
-  **endpoints** live when it was written — the commits readers start from
-  or land at: every position's `next`, a pass's `from` and `to + 1`, a
-  pattern change's split + 1, and what in-flight attempts read. Each is
-  born at head + 1, so it always starts a span.
-- **Newest wins:** a key's current entry is its newest version in the
-  newest span holding it; a `deleted` entry hides older ones. The state
-  at endpoint `P` is each key's newest version older than `P`'s
-  generation, so `changes(P → N)` — every key changed in `[P, N]`, classed
-  added, updated, removed or neither — reads exactly from the spans
-  overlapping `[P, N]`.
-- **`life`** names the index's incarnation: the event counter when it
-  was created. A reset, move or removal starts another, and a merge
-  planned against an old life is refused.
+- A commit's **delta** is the layer `[c, c]`, even when empty, so the
+  layers tile the commits from 0 to the head with no gap; the oldest is the
+  **base**. Upkeep merges adjacent layers: newest state wins, flips unite.
+- **Δ(P, H)**: a key's presence at P is its presence at H flipped once per
+  flip after P. So every key changed in (P, H], classed added, updated or
+  removed, reads exactly from the layers that end after P, for any P at or
+  after the **cut**: the oldest commit a reader may still start from. Below
+  it, the read is refused and the reader makes a full compare.
+- Each layer has a **main** part (what the head and later readers need) and
+  a **side** part (keys only a reader starting inside the layer needs:
+  absent at both ends; in the base, every removed key).
+- **`life`** names the index's incarnation: the event counter when it was
+  created. A reset, move or removal starts another, and a merge planned
+  against an old life is refused.
 
-**File layout.** `[data blocks][filters][block index][footer]`, byte
-format in `key-index-format.md`. Data blocks hold ~64 KB of entries
-before compression. Everything after the data blocks — filters, block
-index, footer — is the file's **tail**; the index and footer alone are
-its **index part**. The `KeyIndex` record stores each file's size and both
-lengths, so a reader fetches exactly what it needs with one range read:
-the tail when it checks filters, the index part when it scans, the whole
-file when it is small — then range-reads only the blocks it needs.
+**File layout.** Self-delimiting compressed blocks of ~16 KiB (zstd), back
+to back, with no filter, index or footer; byte format in
+`key-index-format.md`. A part larger than 256 KiB has an index object
+beside it (per block: file, offset, length, first key, entries, newest
+commit), written with it; smaller parts are read whole. The record keeps
+each file's size, entry count and key range.
 
-**Filters.** Each file carries one blocked Bloom filter of its keys (14
-bits per item, 1.75 B per entry, 0.35% false positives measured — keeping
-an item's bits in one 512-bit block costs ~1.8× over independent bits). A
-key no key filter matches, across every file whose key range could hold
-it, is new and needs no block read; every other key gets an exact lookup.
-
-**Exact writes, exact count.** Every delta entry names its key's
-predecessor (the generation it replaced) when the key was live, so a
-consumer can tell added from updated and an immutable store's cleanup
-knows every replaced object; `KeyIndex.count` is exact (`count += added −
-removed` per commit). Writes read the block of every key a filter holds
-for that (docs/key-index-design.md, which measured the cost: nothing on a
-warm engine, ~1K block reads per 1K random updates on a cold 100M-key
-index).
+**Exact writes, exact count.** A writer resolves every written key against
+the head: an upsert of an absent key is added, of a present one updated (a
+source key with an equal version: nothing), a remove of a present key
+removed, of an absent one nothing. So `count` is exact (`count += added −
+removed` per commit). On an immutable store's outputs each updated or
+removed entry also records the generation it replaced: what the store's
+cleanup deletes. The index never reads it.
 
 **Engine-resolved commits** (`resolved-commits.md`). A small write is first
-offered to the engine over the attempt's channel: it answers from a cache
-of the index files on its local disk — exact, no requests — or declines,
-and the worker resolves the write itself as below. The same cache answers
-an attempt's input reads — its batches of a full pass or of a
-delta — with its `start` reply, so a consumer reads no index file when
-the index is warm.
+offered to the engine over the attempt's channel: it answers from its
+cache of the index (layer files on its local disk, index objects in
+memory), exact and without requests, or declines (a delta over 256 KiB, an
+index it does not hold warm), and the worker resolves the write itself as
+below.
 
-**Read strategy** (`resolved-commits.md` §6). A patch whose run holds
-more than 2% of the index's physical entries streams the whole index —
-every span in 8 MB segments, merged with the sorted run. Otherwise the
-sparse reader: newest first, spans up to 32 MB — two range reads, no
-more than a tail and a block — are read whole, all at once; from the
-first larger span on, it fetches the tails of the files that could hold
-the written keys and runs the filters, and reads blocks only for the keys
-they cannot clear, in the files whose key filter matched, all spans at
-once, each key taking its newest entry. If those block reads would number
-more than 16 per streamed segment, it streams instead.
+**Read strategy.** A patch resolves the sparse way when the blocks its keys
+fall in hold at most 64 MiB: per part, the blocks (seeking) or the whole
+part (streaming), whichever a time model in requests and bytes says is
+faster (`key-index-design.md` § Stream or seek). Otherwise it streams: a
+join of the sorted keys against every layer's main part, 8 MiB per input
+at a time.
 
 **Full replacement.** A bare return of every row must compare every live
 key, so it reads the whole index — as a stream, never whole. The written
@@ -430,70 +415,63 @@ per key). One O(n) pass finds whether they arrive sorted; if not, a
 permutation sorts them — bucketed by the two key bytes after the prefix
 they all share, each bucket sorted as 12-byte (prefix, row) pairs on every
 core, ~4.5 B per key at the peak (bench/keys/results.md, "Sorting the written keys"). A merge-join
-then walks the sorted keys and the index's newest-wins view together, each
-span fed a segment of 8 MB of consecutive blocks at a time, a few ahead.
-Every key written goes straight into the current delta file at the
-writer's generation — a source key whose version equals its entry's
-excepted — live keys not written into `deleted` entries, and each file
-goes to the store as it fills. Only keys are read: nothing of a row's
-other columns reaches the index. Memory is the permutation, a few segments per span and a file or
-two in flight: at 100M keys, 0.8 GB on top of the data for shuffled Arrow
-rows (0.4 GB sorted; 28 s), 3.4 GB for Python rows, whose keys are packed
-(`bench/keys/results.md`).
+then walks the sorted keys and every layer's main part together, each fed
+8 MiB at a time. Every key written goes into the delta (a source key whose
+version equals its entry's excepted), live keys not written as removed,
+and each file goes to the store as it fills. Only keys are read: nothing
+of a row's other columns reaches the index.
 
 An opaque write's store (Postgres, for its `Sql`) reports the keys it holds once it wrote, already
 sorted, a chunk at a time through a server-side cursor (`keys(ref,
-None)`), and the replacement streams them, so nothing is sorted or held.
+None)`), and the replacement streams them, with the run's own writes as an
+overlay, so nothing is sorted or held.
 
 **Operations.**
 
 | Operation | Who | How |
 |---|---|---|
-| Compute a delta | worker, at write time | Read the write's keys once (`Prepared`, `per-key-processing.md` §7), against the index **as pinned in the spec**. A patch is checked with the filters and the read strategy above: every key it writes, at the attempt's generation, plus `deleted` entries for removed keys that may exist. A full replacement is the streaming merge-join above. Either way the result is the batch's delta files, split at ~64 MB. |
-| Commit | engine | Install the delta files as the span `[c, c]`, starting at the generation the commit's writes carried; `count += added − removed`. The claim — one attempt per (asset, partition) from launch to settlement — guarantees the index didn't change underneath. |
-| Deliver pending deltas | worker, for an `Incremental` input | Read `changes(next → head)` from the spans overlapping the range, a page at a time in key order (each span only the blocks the page needs); chunk by `batch_size`; ask the upstream store for those rows with `Keys(…)`. A position whose `next` starts no span or segment — its boundary merged away while nothing held it — gets a full pass. |
-| Full pass | worker | Page through the merged view of all spans from `after`, `batch_size` keys at a time, and ask the store for them with `Keys(…)`. Per span, only the files covering the page are opened, and only their index parts are read — or the whole file, once, when it is small (below one request's latency worth of transfer, ~2.4 MB). A multi-page scan keeps each file's last fetched blocks for the next page, so it reads every block once. |
-| Merge | the engine's machine by default (§6, *Engine work*) | Merge adjacent spans into one, keeping each key's newest version and every version a live endpoint sees, as the merge policy plans it (`key-index-design.md` § The merge policy): a merge's largest input holds at most 4× the others, or a span rewritten alone drops a quarter of its entries; a reader at an endpoint inside the output reads at most about as much on one side as the other; past 32 spans, the cheapest guarded window merges regardless. Two lanes per index — into the base, and among the other spans — never share an input. A merge streams, a few segments per input and one output file at a time, and publishes with `IndexMerged` only if the index is still the life it was planned against and holds its inputs' files; otherwise its output is deleted. Three failed attempts of one input set stop that index's merges until restart, alarmed. |
-| Writer backpressure | engine | An index at twice the span cap (64 spans: upkeep stopped, or far behind) holds back every writer until merges bring it down: the attempts that write it, a per-key asset's failure index included (`held: merges`), and source commits, refused with a retryable 409 (A17 R6). |
-| Delete files | engine | A file no longer in any span joins `garbage`, and is deleted once every attempt that could have pinned it has finished (`FilesCleanedUp`): every attempt claimed before the event that let go of it. Both are positions in event order (`applied`), the same in every engine that replays the journal — never wall clocks, which two engines may disagree on. A delta file of an attempt that never committed is deleted when the attempt ends, unless it is an repair intent (§8). A merge output no state ever named — its merge failed, or its engine stopped before publishing — is found by listing `keys/` every 10 minutes and deleted, unless a merge running here may still write it. |
+| Compute a delta | worker (or the engine, for small writes), at write time | Resolve the write's keys against the index **as pinned in the spec**, as above. The result is the delta's files, split at 64 MiB, named `{commit}-{attempt}-{n}.lay`. |
+| Commit | engine | Install the delta as the layer `[c, c]` at the commit's generation (refused unless generations rise); `count += added − removed`. The claim — one attempt per (asset, partition) from launch to settlement — guarantees the index didn't change underneath. |
+| Read Δ | the engine, for a batch | Δ(P, H) over the layers the batch pinned at H, a page at a time in key order (each part only the blocks the page needs), or restricted to a sorted key list. A P below the cut gets a full compare. |
+| Lookup | writers, the resolver | Each key's state at the head: every layer's main part in one round trip; the newest layer holding a key decides. |
+| Merge | the engine's machine (*Engine work*) | Merge adjacent layers, keeping each key's newest state and its flips after the cut, under the merge rule (`key-index-design.md` § Compaction): four layers of one tier merge; the base absorbs the layers above it once they hold a quarter of its bytes; an output reaching past the cut holds at most 4× the bytes of every newer layer plus 1 MiB. Two lanes per index — the base, and the tiers — never share an input. A merge streams, checks parity where no flip was dropped, records `MergeAttempted` before uploading, and publishes with `IndexMerged` only if the index is still the life it was planned against and holds its inputs; otherwise its output is an orphan. Three attempts of one input set stop it, alarmed. |
+| Cut | engine | `IndexCut` raises the cut to the oldest commit any reader may still start from (`oldest_observed`). It only rises; later merges drop flips at or below it. |
+| Writer backpressure | engine | An index past 64 layers (upkeep stopped, or far behind) holds back every writer until merges bring it down: the attempts that write it, a per-key asset's failure index included (`held: merges`), and source commits, refused with a retryable 409 (A17 R6). |
+| Delete files | engine | Only the engine deletes index files. A file no layer references joins `garbage`, and is deleted once every attempt that could have pinned it has finished (`FilesCleanedUp`); a delta's files stay while its cleanup entry is pending. Positions in event order (`applied`), never wall clocks. An abandoned attempt's delta, and a merge output no state ever named, are orphans: found by listing `keys/` every 10 minutes and deleted, a merge output only if its name's epoch is at most the collector's and no merge running here may still write it. |
 
 Writes that never pass through the worker as rows — opaque writes
 (`Opaque`), such as Postgres's `Sql` — are the one case where the store must report the keys it holds once it
 wrote, sorted (above); only stores supporting such writes need to.
 
-External sources use the same index. An API commit becomes a delta file;
-for very large commits the client builds the file itself and commits a
-reference to it.
+External sources use the same index. An API commit becomes a delta.
 
-**Engine work.** Merging spans is the one heavy computation the engine
-itself starts. It runs locally on the engine's machine, on a worker thread
-with its own event loop, at most `maintenance_concurrency` at a time. It
-reads the engine's cache's local copies when the cache holds the index
-warm, the store otherwise. A
-project-level setting to offload it to an executor is planned, not built:
+**Engine work.** Merging layers is the one heavy computation the engine
+itself starts. It runs locally on the engine's machine, on a worker thread,
+at most `maintenance_concurrency` at a time, reading the engine's cache's
+local copies where it holds them, the store otherwise. A project-level
+setting to offload it to an executor is planned, not built:
 
 ```python
 Project(..., engine_executor=etl(cpu=2, memory="8GB"))   # not built yet; local today
 ```
 
 **Caching.** Index files never change once written, so a cached copy is
-never stale. The one cache of them is the engine's (`resolved-commits.md`
-§5): it answers small writes from local copies before a worker reads
-anything, and answers attempts' input reads at `start`. Workers keep
-no cache: what they read — a write the engine declines or that is too big
-for it, a full pass's batches, per-key incremental's lookups — comes from the store
-(the costs are in `bench/keys/results.md`, "Without a worker cache").
+never stale. The one cache of them is the engine's (`LayerCache`): index
+objects and small parts in memory, layer files on its local disk,
+installed from its own uploads (a merge's outputs, a delta it resolved) and
+filled per index it serves, evicted by bytes. A warm index is read with no
+request. Workers keep no cache: what they read — a write the engine
+declines — comes from the store.
 
 **Implementation.** The file format is ours (no Parquet). The per-key
-work — encoding, decoding, sorting, merging, lookups over fetched bytes —
-is Rust, in the `solera._native` extension (PyO3, abi3) that the `solera`
-distribution builds and both the engine and the worker require; I/O goes
-through obstore. A full replacement and a span merge run as
-streaming jobs (`native/src/jobs.rs`) that ask for the file segments they
-need and hand back the files they write; Python only chooses files, fetches
-bytes and parses tails (`solera/keys/jobs.py`). Blocks decode and compress
-on every core. A pure-Python implementation of the format is kept as the
-tests' reference.
+work — encoding, decoding, merging, joins, scans and lookups over fetched
+bytes — is Rust (`native/src/layers.rs`), in the `solera._native`
+extension (PyO3, abi3) that the `solera` distribution builds and both the
+engine and the worker require; I/O goes through obstore. Merges and
+streamed joins are jobs that ask for the input segments they need and hand
+back the files they write; Python only chooses files, fetches bytes and
+keeps the indexes (`solera/keys/layers.py`). Blocks decode and compress on
+every core.
 
 ## 7. Run history — `history/{table}/*.parquet`
 
@@ -738,10 +716,10 @@ the attempt's token and its generation (the claim's event counter).
 {
   "attempt": "01J8ZB3M…", "run": {"id": "01J8ZB3K…", "config": {}}, "deploy": "c0ffee…",
   "project": "brimstone", "asset": "file_index", "partition": "alpha", "execution": {"kind": "Local"},
-  "inputs": {"site_files": {"ref": {"…": "…"}, "index": {"…": "KeyIndex: the spans over commits 56–57"},
+  "inputs": {"site_files": {"ref": {"…": "…"}, "index": {"…": "LayerState: the layers pinned at 57"},
              "changes": {"from": 56, "to": 57, "after": null, "full": false, "limit": 2}}},
   "outputs": {"file_index": {"before": {"…": "ref"}, "reset": false, "contract": {"…": "store, writes, key"},
-                             "commit_number": 12, "index": {"…": "KeyIndex: every span"}}},
+                             "commit_number": 12, "index": {"…": "LayerState: every layer"}}},
   "heartbeat": 10, "engine": "https://solera.example.com", "token": "…", "generation": 184467
 }
 ```
@@ -1084,8 +1062,9 @@ POST   /api/projects/{p}/runs:prune   {"before", "asset", "keep", "dry_run"}
    in `key-index-costs.md` → Measured). Request counts and bytes carry over
    to S3 exactly; wall times rest on the injected latency and bandwidth,
    which nobody has checked against S3. Those numbers were measured on the
-   leveled index that spans replaced; one run of the span benches over the
-   real implementation, from a worker in the bucket's region, settles it.
+   leveled index; layers were measured the same way (W53's 1M campaign,
+   `key-index-design.md` § Measured). One run over the real implementation,
+   from a worker in the bucket's region, settles it.
 
 ## 13. Future ideas
 

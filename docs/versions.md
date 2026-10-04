@@ -84,8 +84,12 @@ without this, each run would wake every consumer of the set.
 
 ## 3. The index entry
 
-The `.kx` entry collapsed in format version 3 (`key-index-format.md` has
-today's, v4):
+The `.kx` entry collapsed in format version 3. (Since T33 the index is
+stamped layers, with no `.kx` files: a delta entry is the key, its change
+and a payload, plus the replaced generation on immutable stores; a layer
+entry adds presence, the last change's commit and generation, and flips.
+`key-index-format.md` has today's. What this section settled — one
+generation for version and name, one payload field — carries over.)
 
 ```
 before   (key, version, deleted, locator)        + predecessor (version, locator)
