@@ -1,8 +1,9 @@
 """The key index (docs/object-store-state.md §6), checked against a plain dict.
 
 Every step of a random workload — patches, removals, full replacements,
-compactions — must produce the delta a dict says it should, and the index
-must page back exactly the dict's content."""
+span merges — must produce the delta a dict says it should, the index must
+page back exactly the dict's content, and at every live endpoint its view
+and `changes` must match the dict as it was (docs/key-index-design.md)."""
 
 import asyncio
 import random
@@ -13,7 +14,7 @@ from hypothesis import example, given, settings
 from hypothesis import strategies as st
 from obstore.store import MemoryStore
 from solera.keys import Rows, SortedEntries
-from solera.keys.index import IndexState, KeyIndex, Options
+from solera.keys.index import CLASSES, IndexState, KeyIndex, Options, Span
 from solera.keys.io import ObjectIO
 
 from . import keys_reference as _python
@@ -46,21 +47,14 @@ def entries_of(delta):
 
 
 def small_options(**kw):
-    # Tiny files and blocks so a few thousand keys exercise several levels.
-    base = dict(
-        block_size=512,
-        max_file_bytes=16 * 1024,
-        l0_max_files=3,
-        l0_max_bytes=1 << 30,
-        level_base=6 * 1024,
-        fanout=3,
-    )
+    # Tiny files and blocks so a few thousand keys span several files and blocks.
+    base = dict(block_size=512, max_file_bytes=16 * 1024, read_slack=4096)
     base.update(kw)
     return Options(**base)
 
 
 def filtered_options(**kw):
-    # Nothing is small enough to read whole: every level beyond level 0 goes through its filters.
+    # Nothing is small enough to read whole: every span goes through its filters.
     return small_options(whole_threshold=0, small_file=0, **kw)
 
 
@@ -80,7 +74,9 @@ class Harness:
     collection exactly once it is, by the delta that superseded it: writes
     are exact, so its predecessor is always named. A key written with a
     payload (a source's version) equal to its entry's is unchanged; any
-    other write changes it."""
+    other write changes it. `endpoints` are the live endpoints merges keep
+    (a reader's next commit, each reserved at head + 1); `before[c]` is the
+    dict as it was before commit `c`."""
 
     def __init__(self, options):
         self.io = ObjectIO(MemoryStore())
@@ -91,6 +87,9 @@ class Harness:
         self.created: set[tuple] = set()
         self.named: set[tuple] = set()  # superseded objects a delta named
         self.routes: list[str] = []
+        self.endpoints: set[int] = set()
+        self.before: dict[int, dict] = {}
+        self.merges = 0
 
     def index(self):
         return KeyIndex(self.io, "keys/out/p", self.state, self.options)
@@ -160,30 +159,39 @@ class Harness:
                 raise AssertionError(f"{k!r}: writes are exact, so its predecessor is named")
         assert delta.added - delta.removed == len(after) - len(before)
         self.created |= {(k, g) for k, (g, _) in after.items()}
-        self.state = self.state.committed(self.commit_number, files, keep_log=True)
+        assert files.generation == gen
+        self.before[self.commit_number] = before
+        self.state = self.state.committed(self.commit_number, files)
         self.commit_number += 1
         self.model = after
         return delta
 
-    async def _compact(self, plan=None):
+    def reserve(self):
+        """A reader's endpoint, born at head + 1: the state after the head."""
+
+        self.endpoints.add(self.commit_number)
+
+    async def _merge(self, plan=None):
         idx = self.index()
-        out = await idx.compact(plan)
-        if out is None:
+        plan = plan or idx.plan_merge(self.endpoints)
+        if plan is None:
             return False
-        added, removed = out
-        self.state = self.state.compacted(added, removed)
+        out = await idx.merge(plan, self.endpoints)
+        if out is None:  # a rewrite that drops too little: nothing published
+            return False
+        self.state = self.state.merged(out.inputs, out.span)
+        self.merges += 1
         return True
 
-    async def compact_all(self):
-        while await self._compact():
+    async def merge_all(self):
+        while await self._merge():
             pass
 
     async def collapse(self):
-        """One merge of every file into the deepest level: every shadowed entry is dropped."""
+        """One merge of every span: only the versions live endpoints see stay."""
 
-        files = [f for level in self.state.newest_first() for f in level]
-        if len(files) > 1:
-            await self._compact((files, self.state.depth))
+        if len(self.state.spans) > 1:
+            assert await self._merge((0, len(self.state.spans)))
 
     def check_collection(self):
         live = {(k, g) for k, (g, _) in self.model.items()}
@@ -202,11 +210,44 @@ class Harness:
                 break
         assert seen == self.model
         assert self.state.count == len(self.model)
-        levels = {f.level for f in self.state.files}
-        for n in levels - {0}:  # levels 1+ never overlap
-            files = self.state.level(n)
-            for a, b in zip(files, files[1:], strict=False):
-                assert a.max < b.min
+        spans = self.state.spans
+        assert [s.a for s in spans] == [0, *(s.b + 1 for s in spans)][: len(spans)]  # they tile, from 0
+        for s in spans:  # a span's files in key order: a key's versions may cross into the next
+            assert all(a.max <= b.min for a, b in zip(s.files, s.files[1:], strict=False))
+        for e in self.endpoints:
+            if e <= self.state.head:
+                await self.check_endpoint(e)
+
+    async def check_endpoint(self, e):
+        """At endpoint `e`, the view is the dict before commit `e`, and
+        `changes(e -> head)` is the diff from it to now, each key classed."""
+
+        idx, then = self.index(), self.before[e]
+        seen, after = {}, None
+        while True:
+            keys, generations, payloads, after = await idx.page(after, 97, at=e)
+            seen.update(zip(keys, zip(generations, payloads, strict=True), strict=True))
+            if after is None:
+                break
+        assert seen == then, f"the view at {e}"
+        probe = sorted(then)[::7] + sorted(self.model)[::11] + [b"zz-absent"]
+        assert await idx.lookup(probe, at=e) == {k: then[k] for k in probe if k in then}, f"lookups at {e}"
+        got = {}
+        async for page in idx.changes(e, self.state.head, limit=89):
+            for k, c, g, d, p in zip(
+                page.keys, page.classes, page.generations, page.deleted, page.payloads, strict=True
+            ):
+                got[k] = (c, None if d else (g, p))
+        expect = {}
+        for k in then.keys() | self.model.keys():
+            was, now = then.get(k), self.model.get(k)
+            if was != now:
+                expect[k] = (CLASSES[(was is not None, now is not None)], now)
+        # A key written and put back since `e` may be listed too, as "neither"
+        # or "updated" at its old state: it changed in between.
+        extra = {k: v for k, v in got.items() if k not in expect}
+        assert all(v[1] == self.model.get(k) for k, v in extra.items()), f"changes from {e}"
+        assert {k: v for k, v in got.items() if k in expect} == expect, f"changes from {e}"
 
 
 def key(i):
@@ -240,14 +281,19 @@ async def test_random_workload_matches_a_dict(options):
             ks = sorted({key(rng.randrange(universe)) for _ in range(n)})
             rm = sorted({key(rng.randrange(universe)) for _ in range(n // 5)} - set(ks))
             await h.commit(ks, [rev(rng) for _ in ks], rm)
+        if step % 9 == 4:
+            h.reserve()
+        if step % 23 == 22 and h.endpoints:
+            h.endpoints.discard(min(h.endpoints))  # its reader moved on
         if step % 7 == 6:
-            await h.compact_all()
+            await h.merge_all()
         if step % 10 == 9:
             await h.check()
-    await h.compact_all()
+    await h.merge_all()
     await h.check()
-    assert h.state.depth >= 2  # the workload exercised more than one level
+    assert h.merges and len(h.state.spans) < 60  # the workload merged
     await h.collapse()
+    assert len(h.state.spans) == 1
     await h.check()
     h.check_collection()
     if options.stream_density == 0:
@@ -261,7 +307,7 @@ _steps = st.lists(
     st.one_of(
         st.tuples(st.just("patch"), _small_keys, _small_keys),
         st.tuples(st.just("replace"), _small_keys, st.just([])),
-        st.tuples(st.sampled_from(["compact", "compact late"]), st.just([]), st.just([])),
+        st.tuples(st.sampled_from(["merge", "merge late", "reserve"]), st.just([]), st.just([])),
     ),
     max_size=14,
 )
@@ -273,38 +319,43 @@ _steps = st.lists(
     steps=[
         ("patch", [key(0)], []),
         ("patch", [key(0)], []),
+        ("reserve", [], []),
         ("replace", [], []),
-        ("compact late", [], []),
+        ("merge late", [], []),
         ("patch", [key(0), key(1)], []),
         ("patch", [], [key(1)]),
-        ("compact", [], []),
+        ("merge", [], []),
     ]
 )
 def test_any_workload_of_a_few_keys_matches_a_dict(steps):
-    """Patches, removals, replacements (empty ones too) and compactions
-    over six keys, level 0 compacting at two files. A compaction runs in
-    the background in the engine: one `late` is applied after the next
-    commit, unless another took its inputs meanwhile (upkeep then drops it).
-    After every step the index pages back the dict, and levels 1+ never
-    overlap. The explicit example is F16's regression: a removed key came
-    back when level 0 moved into an empty level 1 unmerged."""
+    """Patches, removals, replacements (empty ones too), reservations and
+    merges over six keys, with the whole policy merging eagerly. A merge
+    runs in the background in the engine: one `late` is applied after the
+    next commit, unless another took its inputs meanwhile (upkeep then drops
+    it). After every step the index pages back the dict, the spans tile, and
+    every live endpoint sees the dict as it was. The explicit example began
+    as F16's regression: a removed key came back when level 0 moved into an
+    empty level 1 unmerged."""
 
     async def workload():
-        h = Harness(small_options(l0_max_files=2))
-        late = None  # a compaction's outcome, applied after the next commit
+        h = Harness(small_options(base_ratio=1e9, window=2, read_slack=1 << 30))
+        late = None  # a merge's outcome, applied after the next commit
         for op, ks, rm in steps:
-            if op == "compact":
-                await h._compact()
-            elif op == "compact late":
-                late = late or await h.index().compact()
+            if op == "merge":
+                await h._merge((0, len(h.state.spans)) if len(h.state.spans) > 1 else None)
+            elif op == "merge late":
+                if late is None and len(h.state.spans) > 1:
+                    late = await h.index().merge((0, len(h.state.spans)), h.endpoints)
+            elif op == "reserve":
+                h.reserve()
             else:
                 if op == "patch":
                     await h.commit(ks, None, sorted(set(rm) - set(ks)))
                 else:
                     await h.commit(ks, replace=True)
                 if late is not None:  # as upkeep does: dropped if its inputs went meanwhile
-                    if set(late[1]) <= {f.name for f in h.state.files}:
-                        h.state = h.state.compacted(*late[:2])
+                    if h.state.holds(late.inputs, late.names):
+                        h.state = h.state.merged(late.inputs, late.span)
                     late = None
             await h.check()
 
@@ -334,9 +385,7 @@ async def test_new_keys_are_cleared_by_the_key_filter():
     h = Harness(filtered_options(stream_reads=1e9, stream_density=1.0))
     ks = [key(i) for i in range(0, 8000, 2)]
     await h.commit(ks)
-    for _ in range(3):
-        await h.compact_all()
-    tails = sum(1 for level in h.state.newest_first() for _ in level)
+    tails = len(h.state.files)
     h.io.metrics.reset()
     idx = h.index()
     fresh = [key(i) for i in range(1, 8000, 80)]
@@ -351,12 +400,13 @@ async def test_new_keys_are_cleared_by_the_key_filter():
     assert idx.route == "sparse" and all(e[4] == 1 for e in written)  # read: each names its predecessor
 
 
-async def test_pending_deltas_newest_wins_and_survive_compaction():
+async def test_pending_deltas_newest_wins_and_survive_merges():
     h = Harness(small_options())
     await h.commit([key(1), key(2), key(3)])  # batch 0
+    h.reserve()  # a reader at commit 1
     await h.commit([key(2)], None, [key(3)])  # batch 1
     await h.commit([key(4)])  # batch 2
-    await h.compact_all()
+    await h.collapse()
     idx = h.index()
     keys, generations, deleted, _, nxt = await idx.pending(1, 2, None, 10)
     assert list(zip(keys, generations, deleted, strict=True)) == [
@@ -373,18 +423,16 @@ async def test_pending_deltas_newest_wins_and_survive_compaction():
         if after is None:
             break
     assert got == [key(1), key(2), key(3), key(4)]
-    # Truncating the log drops batches no consumer needs.
-    h.state = h.state.truncated(2)
+    # Commit 2 was no endpoint when they merged: the merge kept no boundary there.
     with pytest.raises(LookupError):
-        await h.index().pending(1, 2, None, 10)
+        await h.index().pending(2, 2, None, 10)
 
 
-async def test_large_first_commit_goes_straight_to_level_one_and_splits():
+async def test_a_large_commit_splits_at_max_file_bytes():
     h = Harness(small_options())
     ks = [key(i) for i in range(20000)]  # a few bytes an entry: enough for several 16 KiB files
     await h.commit(ks)
-    assert {f.level for f in h.state.files} == {1}
-    assert len(h.state.files) > 1  # split at max_file_bytes
+    assert len(h.state.spans) == 1 and len(h.state.files) > 1
     await h.check()
 
 
@@ -421,18 +469,18 @@ class Tracking(ObjectIO):
             self.inflight -= 1
 
 
-async def test_level_0_files_are_read_at_once():
-    h = Harness(small_options(l0_max_files=100))
+async def test_spans_are_read_at_once():
+    h = Harness(small_options())
     h.io = Tracking(h.io.store)
     rng = random.Random(3)
     await h.commit([key(i) for i in range(2000)])
     for _ in range(6):
         ks = sorted({key(rng.randrange(2000)) for _ in range(20)})
         await h.commit(ks)
-    assert len(h.state.level(0)) == 6
+    assert len(h.state.spans) == 7
     h.io.peak = 0
     await h.index().delta(run([key(i) for i in range(0, 2000, 50)]))
-    assert h.io.peak >= 7  # six deltas and level 1, not one after another
+    assert h.io.peak >= 7  # seven spans, not one after another
 
 
 async def test_a_patch_reads_blocks_or_streams():
@@ -441,12 +489,12 @@ async def test_a_patch_reads_blocks_or_streams():
     whose exact reads would touch more blocks than streaming the index costs,
     streams instead."""
 
-    h = Harness(filtered_options(l0_max_files=100, stream_reads=2.0))
+    h = Harness(filtered_options(stream_reads=2.0))
     rng = random.Random(4)
     ks = [key(i) for i in range(4000)]
     vs = [rng.randbytes(16) for _ in ks]  # incompressible versions: data outweighs filters
     await h.commit(ks, vs)
-    files = h.state.level(1)
+    files = h.state.files
     assert len(files) >= 3 and all(f.size > 2 * f.tail for f in files)
     probe, same = ks[::60], vs[::60]  # every few blocks: no two consecutive
 
@@ -481,14 +529,14 @@ async def test_a_full_scan_reads_each_block_once():
     """Pages overlap in the files they read — a small file spans every page —
     but a scan never fetches the same block twice."""
 
-    h = Harness(small_options(small_file=0, l0_max_files=100))
+    h = Harness(small_options(small_file=0))
     rng = random.Random(5)
     ks = [key(i) for i in range(3000)]
     await h.commit(ks, [rng.randbytes(16) for _ in ks])
     for _ in range(3):
         some = sorted({key(rng.randrange(3000)) for _ in range(300)})
         await h.commit(some, [rng.randbytes(16) for _ in some])
-    assert len(h.state.level(0)) == 3 and all(f.size > 2 * f.tail for f in h.state.files)
+    assert len(h.state.spans) == 4 and all(f.size > 2 * f.tail for f in h.state.files)
     h.io.metrics.reset()
     idx = h.index()
     after, pages = None, 0
@@ -501,47 +549,11 @@ async def test_a_full_scan_reads_each_block_once():
     assert h.io.metrics.bytes_in <= sum(f.size for f in h.state.files)
 
 
-async def test_level_0_merges_in_itself_until_it_is_a_tenth_of_level_1():
-    h = Harness(small_options(l0_max_files=3, level_base=1 << 30, fanout=10))
-    rng = random.Random(9)
-    await h.commit([key(i) for i in range(3000)])
-    l1 = sum(f.size for f in h.state.level(1))
-    pushed = False
-    for step in range(200):
-        some = sorted({key(rng.randrange(3000)) for _ in range(10)})
-        await h.commit(some, [rev(rng) for _ in some])
-        plan = h.index().plan_compaction()
-        if plan is None:
-            continue
-        inputs, level = plan
-        l0 = sum(f.size for f in h.state.level(0))
-        if level == 0:
-            assert 10 * l0 < l1 and inputs == h.state.level(0)
-        else:
-            assert level == 1 and 10 * l0 >= l1
-            pushed = True
-        await h.compact_all()
-        assert len(h.state.level(0)) <= (0 if level else 1)
-        if step % 10 == 0:
-            await h.check()
-        if pushed:
-            break
-    assert pushed
-    # A merged level-0 file stays older than the deltas after it.
-    await h.commit([key(1)])
-    await h.commit([key(2)])
-    await h.commit([key(3)])
-    assert h.index().plan_compaction()[1] == 0
-    await h.compact_all()
-    await h.commit([key(1)])
-    await h.check()
-
-
 async def test_generations_and_predecessors():
     """Entries carry the generation that wrote them; delta entries carry the
     generation the key had before, for an immutable store to clean up the
-    object it superseded (lifecycle.md §9.8). Compaction keeps generations
-    and payloads only."""
+    object it superseded (lifecycle.md §9.8). A merge into the base with no
+    endpoint keeps each live key's newest version, without predecessors."""
 
     io = ObjectIO(MemoryStore())
     state = IndexState(prefix="keys/out/")
@@ -557,7 +569,7 @@ async def test_generations_and_predecessors():
         (b"b", 10, 0, b"1", None),
         (b"c", 10, 0, None, None),
     ]
-    state = state.committed(0, first, keep_log=True)
+    state = state.committed(0, first)
     second, _ = await KeyIndex(io, None, state).replace(
         Rows.pairs([(b"a", b"1"), (b"b", b"2"), (b"d", None)]), 1, "w2", generation=20
     )
@@ -566,15 +578,15 @@ async def test_generations_and_predecessors():
         (b"c", 20, 1, None, 10),  # deleted
         (b"d", 20, 0, None, None),  # new: nothing superseded
     ]
-    state = state.committed(1, second, keep_log=True)
+    state = state.committed(1, second)
     idx = KeyIndex(io, None, state)
     delta = await idx.delta(run([b"a", b"d"], None, [b"b"]), generation=30)
     assert [(e[0], e[1], e[4]) for e in entries_of(delta)] == [(b"a", 30, 10), (b"b", 30, 20), (b"d", 30, 20)]
-    state = state.committed(2, await idx.write(2, "w3", delta), keep_log=True)
+    state = state.committed(2, await idx.write(2, "w3", delta, 30))
     keys, generations, payloads, _ = await KeyIndex(io, None, state).page(None, 10)
     assert list(zip(keys, generations, payloads, strict=True)) == [(b"a", 30, None), (b"d", 30, None)]
-    added, removed = await KeyIndex(io, None, state).compact((state.level(0) + state.level(1), 1))
-    assert [e[1:] for e in await entries(added)] == [(30, 0, None, None), (30, 0, None, None)]
+    merged = await KeyIndex(io, None, state).merge((0, 3), set())
+    assert [e[1:] for e in await entries(merged.span.files)] == [(30, 0, None, None), (30, 0, None, None)]
 
 
 async def test_pages_read_each_file_in_its_own_codec():
@@ -589,7 +601,8 @@ async def test_pages_read_each_file_in_its_own_codec():
         data = _python.encode_file([k], [5], b"\x00", codec=codec)
         name = f"{n:012d}-x.0000"
         await io.write(state.path(name), data)
-        state = IndexState(files=(*state.files, FileInfo.describe(name, 0, data)), prefix=state.prefix)
+        span = Span(n, n, ((n, 5),), (FileInfo.describe(name, data),))
+        state = IndexState(spans=(*state.spans, span), prefix=state.prefix)
     idx = KeyIndex(io, None, state)
     assert (await idx.page(None, 10))[0] == [b"a", b"b"]
     assert await idx.lookup([b"a", b"b"]) == {b"a": (5, None), b"b": (5, None)}

@@ -8,6 +8,7 @@ use std::cmp::Ordering;
 use crate::delta::{Delta, Old, Write};
 use crate::format::{Error, Options, Result};
 use crate::rows::Source;
+use crate::spans::{retain, Version};
 use crate::stream::{Merge, Next, State, Writer};
 
 pub enum Step {
@@ -213,6 +214,134 @@ impl Scan {
                 Next::End if self.page.is_empty() => return Ok(Step::Done),
                 Next::End => return Ok(Step::Page),
             }
+        }
+    }
+}
+
+/// Adjacent spans merged into one (docs/key-index-design.md § One merge):
+/// runs, newest first, fed a segment at a time. Each key's versions, read
+/// run by run, come newest first; the merge keeps the newest and each one a
+/// live endpoint sees (`spans::retain`), with the predecessor on the oldest
+/// kept, and writes them to one span's files. With `base` (the output starts
+/// at commit 0), its initial segment keeps live keys only. `segments[i]`
+/// counts the versions written with `i` of the (sorted) endpoints at or
+/// below their generation.
+pub struct SpanMerge {
+    pub merge: Merge,
+    pub writer: Writer,
+    pub segments: Vec<u64>,
+    endpoints: Vec<u64>,
+    base: bool,
+    /// The key being gathered, and the run read for it next.
+    key: Option<Vec<u8>>,
+    at: usize,
+    versions: Vec<Version>,
+    done: bool,
+}
+
+impl SpanMerge {
+    pub fn new(
+        runs: usize,
+        mut endpoints: Vec<u64>,
+        base: bool,
+        o: Options,
+        max_file_bytes: usize,
+    ) -> SpanMerge {
+        endpoints.sort_unstable();
+        endpoints.dedup();
+        SpanMerge {
+            merge: Merge::new(runs),
+            writer: Writer::new(o, max_file_bytes).repeating(),
+            segments: vec![0; endpoints.len() + 1],
+            endpoints,
+            base,
+            key: None,
+            at: 0,
+            versions: Vec::new(),
+            done: false,
+        }
+    }
+
+    pub fn step(&mut self) -> Result<Step> {
+        let runs = &mut self.merge.runs;
+        loop {
+            if !self.writer.files.is_empty() {
+                return Ok(Step::File);
+            }
+            if self.done {
+                return Ok(Step::Done);
+            }
+            if self.key.is_none() {
+                // The smallest key at any run's head: every run ready or done first.
+                let mut min: Option<usize> = None;
+                for r in 0..runs.len() {
+                    match runs[r].state()? {
+                        State::Starved => return Ok(Step::Run(r)),
+                        State::Done => continue,
+                        State::Ready => {
+                            let (b, i) = runs[r].current();
+                            if min.is_none_or(|m| {
+                                let (mb, mi) = runs[m].current();
+                                b.key(i) < mb.key(mi)
+                            }) {
+                                min = Some(r);
+                            }
+                        }
+                    }
+                }
+                let Some(m) = min else {
+                    self.writer.finish(false)?;
+                    self.done = true;
+                    continue;
+                };
+                let (b, i) = runs[m].current();
+                self.key = Some(b.key(i).to_vec());
+                self.at = 0;
+                self.versions.clear();
+            }
+            let key = self.key.as_deref().expect("gathering a key");
+            while self.at < runs.len() {
+                match runs[self.at].state()? {
+                    State::Starved => return Ok(Step::Run(self.at)),
+                    State::Done => self.at += 1,
+                    State::Ready => {
+                        let (b, i) = runs[self.at].current();
+                        if b.key(i) != key {
+                            self.at += 1;
+                            continue;
+                        }
+                        let v = Version {
+                            generation: b.generation(i),
+                            deleted: b.deleted(i),
+                            payload: b.payload(i).map(<[u8]>::to_vec),
+                            predecessor: b.predecessor(i),
+                        };
+                        if self
+                            .versions
+                            .last()
+                            .is_some_and(|p| v.generation >= p.generation)
+                        {
+                            return Err(Error::Format(format!(
+                                "versions of {:?} out of order",
+                                String::from_utf8_lossy(key)
+                            )));
+                        }
+                        self.versions.push(v);
+                        runs[self.at].advance();
+                    }
+                }
+            }
+            for v in retain(&self.versions, &self.endpoints, self.base) {
+                self.segments[self.endpoints.partition_point(|&e| e <= v.generation)] += 1;
+                self.writer.push(
+                    key,
+                    v.generation,
+                    v.deleted,
+                    v.payload.as_deref(),
+                    v.predecessor,
+                )?;
+            }
+            self.key = None;
         }
     }
 }

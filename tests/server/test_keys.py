@@ -1,10 +1,13 @@
 """Key indexes in the engine (docs/object-store-state.md §6): the worker works
-out each commit's delta against the output's index, consumers read the delta
-log, the engine truncates the log behind consumers, compacts, recounts, and
-deletes files nothing references — and renames carry all of it along (§2)."""
+out each commit's delta against the output's index as its span, consumers
+read `changes` from their endpoints, the engine merges spans keeping those
+endpoints and deletes files nothing references — and renames carry all of
+it along (§2)."""
 
 import asyncio
 import random
+from collections import Counter
+from dataclasses import replace
 
 import pytest
 from solera.keys import resolver
@@ -37,7 +40,7 @@ async def run(engine, targets, **kw):
 
 
 async def settle(engine):
-    """Let background compactions finish, then tick so their results land."""
+    """Let background merges finish, then tick so their results land."""
 
     upkeep = engine.upkeep
     for _ in range(20):
@@ -182,10 +185,10 @@ async def test_a_patch_reconciles_what_a_dead_sql_writer_left(state, arrow):
     assert sorted(live.rows) == ["b", "c"]
 
 
-async def test_compaction_truncation_and_garbage(state):
-    """§6: level 0 is compacted once it holds `l0_max_files` files; the delta
-    log keeps only what the consumer's position still needs; files nothing
-    references are deleted — and every pass stays exact throughout."""
+async def test_merges_and_garbage(state):
+    """§6: spans merge as the policy plans them, keeping the boundaries the
+    consumer's position still reads from; files nothing references are
+    deleted — and every pass stays exact throughout."""
 
     rng = random.Random(7)
     truth: dict[str, int] = {}
@@ -208,7 +211,7 @@ async def test_compaction_truncation_and_garbage(state):
         return [{"n": len(items)}]
 
     project = Project(assets=[items, mirror])
-    engine = engine_for(state, project, key_options=Options(l0_max_files=3))
+    engine = engine_for(state, project, key_options=Options(window=2))
     await engine.initialize()
     for step in range(40):
         rows, remove = {}, set()
@@ -233,11 +236,10 @@ async def test_compaction_truncation_and_garbage(state):
 
     index = state.model.indexes[("items", "")]
     assert index.count == len(truth)
-    assert len(index.level(0)) < 3 and index.depth >= 1  # compacted
+    assert len(index.spans) < 10 and index.spans[0].b > 0  # merged, into the base too
     head_commit = state.model.heads[("items", "")]["commit_number"]
     position = state.model.position("mirror", "items", "")
     assert position["next"] == head_commit + 1
-    assert all(commit_number >= position["next"] for commit_number, _ in index.log)  # truncated behind it
     read = state.model.cleanup_reads()  # kept for the cleanups still pending (docs/lifecycle.md §9.8)
     assert {path for path, _ in state.model.garbage} <= read
     assert on_disk(state, index) == {index.path(n) for n in index.referenced()} | read
@@ -245,8 +247,120 @@ async def test_compaction_truncation_and_garbage(state):
     assert await _stored(engine, state) == truth
 
 
-async def test_a_consumer_without_a_log_starts_over(state):
-    """§6: a position whose delta the log no longer holds gets a full pass."""
+def items_project(rows):
+    @asset(outputs=Output("items", key="id"))
+    def items():
+        return list(rows)
+
+    return Project(assets=[items])
+
+
+async def test_a_merge_planned_against_another_life_or_files_publishes_nothing(state):
+    """docs/key-index-design.md § Lifecycles: a merge publishes only if the
+    index is still the life it was planned against and holds its inputs'
+    files; otherwise its output is deleted, and the index is untouched."""
+
+    rows = [{"id": "a"}]
+    engine = engine_for(state, items_project(rows), key_options=Options(window=2))
+    await engine.initialize()
+    for n in range(4):
+        rows.append({"id": f"k{n}"})
+        await run(engine, ["items"])
+    key = ("items", "")
+    planned = state.model.indexes[key]
+    endpoints = state.model.endpoints(*key)
+    plan = KeyIndex(None, None, planned, engine.key_options).plan_merge(endpoints, lane="base")
+    assert plan is not None
+    first = planned.spans[0]
+    for current in (
+        replace(planned, life="another"),  # reset since: another life
+        replace(planned, spans=(replace(first, files=()), *planned.spans[1:])),  # its inputs' files changed
+    ):
+        state.model.indexes[key] = current
+        await engine.upkeep._merge(key, "base", planned, plan, endpoints)
+        assert state.model.indexes[key] is current  # nothing published
+        assert not any(
+            p.rpartition("/")[2].startswith("m") for p in on_disk(state, planned)
+        )  # its output went
+    state.model.indexes[key] = planned
+
+
+async def test_orphaned_merge_outputs_are_collected(state):
+    """A merge output nothing names — its merge failed after uploading, or
+    its engine stopped before publishing — is deleted by the orphan
+    collector; a referenced file, and a running merge's output, are not."""
+
+    rows = [{"id": "a"}, {"id": "b"}]
+    engine = engine_for(state, items_project(rows))
+    await engine.initialize()
+    await run(engine, ["items"])
+    index = state.model.indexes[("items", "")]
+    orphan = index.path("m000000000000-000000000003-01ORPHAN.0000")
+    running = index.path("m000000000004-000000000006-01RUNNING.0000")
+    for path in (orphan, running):
+        await state.put_object(path, b"not read")
+    engine.upkeep._busy[(("items", ""), "tail")] = frozenset({(4, 4), (5, 6)})
+    await engine.upkeep.collect_orphans()
+    present = on_disk(state, index)
+    assert orphan not in present and running in present
+    assert {index.path(n) for n in index.referenced()} <= present
+    engine.upkeep._busy.clear()
+
+
+async def test_a_merge_that_keeps_failing_stops_and_alarms(state, monkeypatch):
+    """docs/key-index-design.md § The write bound: R = 3 attempts per input
+    set; after the third failure the index stops merging, alarmed."""
+
+    rows = [{"id": "a"}]
+    engine = engine_for(state, items_project(rows), key_options=Options(window=2))
+    await engine.initialize()
+    for n in range(4):
+        rows.append({"id": f"k{n}"})
+        await run(engine, ["items"])
+    calls = []
+
+    async def broken(self, plan, endpoints):
+        calls.append(plan)
+        raise RuntimeError("the store is down")
+
+    monkeypatch.setattr(KeyIndex, "merge", broken)
+    for _ in range(6):
+        engine.upkeep._checked.clear()
+        engine.upkeep.maintain()
+        await asyncio.gather(*engine.upkeep.jobs.values(), return_exceptions=True)
+    assert max(Counter(calls).values()) == 3  # an input set, three times; then the index stopped
+    assert ("items", "") in engine.upkeep.stopped
+    assert "merges no more" in engine.upkeep.failing["key index items/ merges"]
+
+
+async def test_writes_wait_while_an_outputs_merges_are_far_behind(state):
+    """docs/key-index-design.md § Limits: an index at twice the span cap —
+    upkeep stopped, or far behind — holds back the attempts that write it,
+    until merges bring it down."""
+
+    from solera.keys.index import Span
+
+    rows = [{"id": "a"}]
+    engine = engine_for(state, items_project(rows))
+    await engine.initialize()
+    await run(engine, ["items"])
+    key = ("items", "")
+    index = state.model.indexes[key]
+    head = index.head
+    extra = tuple(Span(c, c, ((c, 10**6 + c),), ()) for c in range(head + 1, head + 1 + 2 * Options().fan_in))
+    state.model.indexes[key] = replace(index, spans=index.spans + extra)
+    request = await engine.submit(["items"])
+    engine._dispatch_due()
+    (task,) = state.model.runs[request["id"]]["tasks"].values()
+    assert task["held"] == ["merges", "items"] and task["status"] == "queued"
+    state.model.indexes[key] = index  # merged back down
+    engine._dispatch_due()
+    assert task["id"] in state.model.claims
+
+
+async def test_a_consumer_at_no_boundary_starts_over(state):
+    """§6: a position whose `next` the index keeps no boundary at — merged
+    away while nothing read from there — gets a full pass."""
 
     @asset(outputs=Output("items", key="id"))
     def items():
@@ -262,13 +376,14 @@ async def test_a_consumer_without_a_log_starts_over(state):
     project = Project(assets=[items, mirror])
     engine = engine_for(state, project)
     await engine.initialize()
-    await run(engine, ["mirror"], upstream=True)
-    engine.upkeep.truncate()
+    for _ in range(3):
+        await run(engine, ["items"])
+    await run(engine, ["mirror"])
+    await settle(engine)
+    index = state.model.indexes[("items", "")]
+    assert len(index.spans) == 1 and index.generation(1) is None  # merged: no boundary at commit 1
     position = state.model.position("mirror", "items", "")
-    state.model.partition("mirror", "")["positions"]["items"] = {
-        **position,
-        "next": 0,
-    }  # behind the (empty) log
+    state.model.partition("mirror", "")["positions"]["items"] = {**position, "next": 1}
     await run(engine, ["mirror"])
     assert deliveries == [(True, ["a", "b"]), (True, ["a", "b"])]
 
@@ -760,7 +875,7 @@ async def test_a_listing_holds_its_index_files_through_collection(tmp_path, monk
     project = Project(sources=[Source("uploads", key="id")])
     state = await State.open(tmp_path.as_uri(), "test", flush_interval=0.001)
     engine = Engine(
-        state, project.manifest, clock=state.clock, key_options=Options(l0_max_files=2), resolve_cache=False
+        state, project.manifest, clock=state.clock, key_options=Options(window=2), resolve_cache=False
     )
     await engine.initialize()
     for n in range(3):

@@ -17,6 +17,7 @@ pub mod jobs;
 pub mod local;
 pub mod rows;
 pub mod sort;
+pub mod spans;
 pub mod sparse;
 pub mod stream;
 
@@ -31,7 +32,7 @@ use pyo3::pybacked::PyBackedBytes;
 use pyo3::types::{PyBool, PyBytes, PyCapsule, PyDict, PyInt, PyList, PyString};
 
 use format::{Error, Options};
-use jobs::{Compact, Join, Scan, Step};
+use jobs::{Compact, Join, Scan, SpanMerge, Step};
 use rayon::prelude::*;
 use rows::{Arena, Constant, Cursor, Overlay, Payloads, Source, Stream, Table};
 use stream::Segment;
@@ -350,8 +351,8 @@ fn merge_range<'py>(
 /// generations, deleted flags, payloads, the last key examined, and whether
 /// more follow.
 #[pyfunction]
-#[pyo3(signature = (runs, codecs, after, bound, limit, drop_deleted))]
-#[allow(clippy::type_complexity)]
+#[pyo3(signature = (runs, codecs, after, bound, limit, drop_deleted, below=u64::MAX))]
+#[allow(clippy::type_complexity, clippy::too_many_arguments)]
 fn merge_page<'py>(
     py: Python<'py>,
     runs: Vec<Vec<PyBackedBytes>>,
@@ -360,6 +361,7 @@ fn merge_page<'py>(
     bound: Option<PyBackedBytes>,
     limit: usize,
     drop_deleted: bool,
+    below: u64,
 ) -> PyResult<(
     Bound<'py, PyList>,
     Vec<u64>,
@@ -379,6 +381,7 @@ fn merge_page<'py>(
                     bound.as_deref(),
                     limit,
                     drop_deleted,
+                    below,
                 )
             })
             .map_err(to_py)?;
@@ -390,6 +393,220 @@ fn merge_page<'py>(
             p,
             page.last.map(|k| PyBytes::new(py, &k)),
             page.more,
+        ))
+    })
+}
+
+/// Spans (`spans.rs`): adjacent spans (`runs`, newest first)
+/// merged into one span's files, keeping the versions the live `endpoints`
+/// (generations) see; `base` when the output starts at commit 0. Returns the
+/// files, and the entries of each segment (`segments[i]`: versions with `i`
+/// of the sorted endpoints at or below their generation).
+#[pyfunction]
+#[pyo3(signature = (runs, codecs, endpoints, base, block_size=65536, level=1, bits_per_item=14, k=10, codec=1, max_file_bytes=67108864))]
+#[allow(clippy::too_many_arguments)]
+fn merge_spans<'py>(
+    py: Python<'py>,
+    runs: Vec<Vec<PyBackedBytes>>,
+    codecs: Vec<u8>,
+    endpoints: Vec<u64>,
+    base: bool,
+    block_size: usize,
+    level: u32,
+    bits_per_item: u64,
+    k: u8,
+    codec: u8,
+    max_file_bytes: usize,
+) -> PyResult<(Bound<'py, PyList>, Vec<u64>)> {
+    guard(|| {
+        let o = options(block_size, level, bits_per_item, k, codec);
+        let (files, segments) = py
+            .detach(|| {
+                let runs: Vec<Vec<&[u8]>> = runs.iter().map(|r| slices(r)).collect();
+                spans::merge(&runs, &codecs, &endpoints, base, o, max_file_bytes)
+            })
+            .map_err(to_py)?;
+        Ok((list_of_bytes(py, &files)?, segments))
+    })
+}
+
+/// Spans: a page of `changes(P, N)` over the spans overlapping
+/// `[P, N]` (`runs`, newest first, each holding its blocks for the key window
+/// `(after, bound)`), clipped to generations `[g_p, g_n1)`: every key that
+/// changed in the range, its class (0 added, 1 updated, 2 removed, 3
+/// neither: a read-ahead may still need it), the generation, deleted flag
+/// and payload of its state at N; the last key examined; whether more
+/// follow.
+#[pyfunction]
+#[pyo3(signature = (runs, codecs, after, bound, limit, g_p, g_n1))]
+#[allow(clippy::type_complexity, clippy::too_many_arguments)]
+fn span_changes<'py>(
+    py: Python<'py>,
+    runs: Vec<Vec<PyBackedBytes>>,
+    codecs: Vec<u8>,
+    after: Option<PyBackedBytes>,
+    bound: Option<PyBackedBytes>,
+    limit: usize,
+    g_p: u64,
+    g_n1: u64,
+) -> PyResult<ChangesPage<'py>> {
+    guard(|| {
+        let page = py
+            .detach(|| {
+                let runs: Vec<Vec<&[u8]>> = runs.iter().map(|r| slices(r)).collect();
+                spans::page(
+                    &runs,
+                    &codecs,
+                    after.as_deref(),
+                    bound.as_deref(),
+                    limit,
+                    |vs| spans::change(vs, g_p, g_n1).map(|(class, v)| (class, v.clone())),
+                )
+            })
+            .map_err(to_py)?;
+        changes_page(py, page)
+    })
+}
+
+/// A page of `changes`: keys, classes, generations, deleted flags,
+/// payloads, the last key examined, whether more follow.
+type ChangesPage<'py> = (
+    Bound<'py, PyList>,
+    Bound<'py, PyBytes>,
+    Vec<u64>,
+    Bound<'py, PyBytes>,
+    Bound<'py, PyList>,
+    Option<Bound<'py, PyBytes>>,
+    bool,
+);
+
+fn changes_page<'py>(
+    py: Python<'py>,
+    p: spans::Page<(u8, spans::Version)>,
+) -> PyResult<ChangesPage<'py>> {
+    let keys: Vec<Vec<u8>> = p.items.iter().map(|(k, _)| k.clone()).collect();
+    let classes: Vec<u8> = p.items.iter().map(|(_, (c, _))| *c).collect();
+    let gens: Vec<u64> = p.items.iter().map(|(_, (_, v))| v.generation).collect();
+    let deleted: Vec<u8> = p.items.iter().map(|(_, (_, v))| v.deleted as u8).collect();
+    Ok((
+        list_of_bytes(py, &keys)?,
+        PyBytes::new(py, &classes),
+        gens,
+        PyBytes::new(py, &deleted),
+        payload_list(py, p.items.iter().map(|(_, (_, v))| v.payload.as_deref()))?,
+        p.last.map(|k| PyBytes::new(py, &k)),
+        p.more,
+    ))
+}
+
+/// Spans: a page of the live keys at a reserved endpoint (each
+/// key's newest version older than `g_bound`; `2**64 - 1`: the head), over
+/// `runs` newest first: keys, generations, payloads, the last key examined,
+/// whether more follow.
+#[pyfunction]
+#[pyo3(signature = (runs, codecs, after, bound, limit, g_bound))]
+#[allow(clippy::type_complexity, clippy::too_many_arguments)]
+fn span_scan<'py>(
+    py: Python<'py>,
+    runs: Vec<Vec<PyBackedBytes>>,
+    codecs: Vec<u8>,
+    after: Option<PyBackedBytes>,
+    bound: Option<PyBackedBytes>,
+    limit: usize,
+    g_bound: u64,
+) -> PyResult<(
+    Bound<'py, PyList>,
+    Vec<u64>,
+    Bound<'py, PyList>,
+    Option<Bound<'py, PyBytes>>,
+    bool,
+)> {
+    guard(|| {
+        let p = py
+            .detach(|| {
+                let runs: Vec<Vec<&[u8]>> = runs.iter().map(|r| slices(r)).collect();
+                spans::page(
+                    &runs,
+                    &codecs,
+                    after.as_deref(),
+                    bound.as_deref(),
+                    limit,
+                    |vs| spans::at(vs, g_bound).filter(|v| !v.deleted).cloned(),
+                )
+            })
+            .map_err(to_py)?;
+        let keys: Vec<Vec<u8>> = p.items.iter().map(|(k, _)| k.clone()).collect();
+        let gens: Vec<u64> = p.items.iter().map(|(_, v)| v.generation).collect();
+        Ok((
+            list_of_bytes(py, &keys)?,
+            gens,
+            payload_list(py, p.items.iter().map(|(_, v)| v.payload.as_deref()))?,
+            p.last.map(|k| PyBytes::new(py, &k)),
+            p.more,
+        ))
+    })
+}
+
+/// Spans: each of `keys` (sorted) at a reserved endpoint, over
+/// `runs` newest first holding every block that may contain them: its
+/// columns: found (one byte per key), generation, deleted, payload, where a
+/// key is found if some version precedes `g_bound`.
+#[pyfunction]
+#[pyo3(signature = (runs, codecs, keys, g_bound))]
+#[allow(clippy::type_complexity)]
+fn span_lookup<'py>(
+    py: Python<'py>,
+    runs: Vec<Vec<PyBackedBytes>>,
+    codecs: Vec<u8>,
+    keys: Vec<PyBackedBytes>,
+    g_bound: u64,
+) -> PyResult<(
+    Bound<'py, PyBytes>,
+    Vec<u64>,
+    Bound<'py, PyBytes>,
+    Bound<'py, PyList>,
+)> {
+    guard(|| {
+        let found = py
+            .detach(|| -> format::Result<Vec<Option<spans::Version>>> {
+                let runs: Vec<Vec<&[u8]>> = runs.iter().map(|r| slices(r)).collect();
+                let mut g = spans::Groups::new(&runs, &codecs)?;
+                let mut out = vec![None; keys.len()];
+                let mut i = 0;
+                while i < keys.len() {
+                    let Some((key, versions)) = g.next_group()? else {
+                        break;
+                    };
+                    while i < keys.len() && keys[i].as_ref() < key.as_slice() {
+                        i += 1;
+                    }
+                    if i < keys.len() && keys[i].as_ref() == key.as_slice() {
+                        out[i] = spans::at(&versions, g_bound).cloned();
+                        i += 1;
+                    }
+                }
+                Ok(out)
+            })
+            .map_err(to_py)?;
+        let found_flags: Vec<u8> = found.iter().map(|v| v.is_some() as u8).collect();
+        let gens: Vec<u64> = found
+            .iter()
+            .map(|v| v.as_ref().map_or(0, |v| v.generation))
+            .collect();
+        let deleted: Vec<u8> = found
+            .iter()
+            .map(|v| v.as_ref().is_some_and(|v| v.deleted) as u8)
+            .collect();
+        Ok((
+            PyBytes::new(py, &found_flags),
+            gens,
+            PyBytes::new(py, &deleted),
+            payload_list(
+                py,
+                found
+                    .iter()
+                    .map(|v| v.as_ref().and_then(|v| v.payload.as_deref())),
+            )?,
         ))
     })
 }
@@ -1148,6 +1365,7 @@ enum Kind {
     Join(Box<Join>),
     Compact(Box<Compact>),
     Scan(Scan),
+    Spans(Box<SpanMerge>),
 }
 
 /// A streaming job over an index's runs (see the module documentation).
@@ -1168,6 +1386,7 @@ fn merge_of(kind: &mut Kind) -> &mut stream::Merge {
         Kind::Join(j) => &mut j.merge,
         Kind::Compact(j) => &mut j.merge,
         Kind::Scan(j) => &mut j.merge,
+        Kind::Spans(j) => &mut j.merge,
     }
 }
 
@@ -1273,6 +1492,48 @@ impl Merge {
                 local: None,
                 kind: Kind::Join(Box::new(job)),
             })
+        })
+    }
+
+    /// Merges adjacent spans (`runs`, newest first) into one span's files,
+    /// keeping the versions the live `endpoints` (generations) see; `base`
+    /// when the output starts at commit 0 (docs/key-index-design.md).
+    #[staticmethod]
+    #[pyo3(signature = (runs, *, endpoints, base, block_size=65536, level=1, bits_per_item=14, k=10, codec=1, max_file_bytes=67108864))]
+    #[allow(clippy::too_many_arguments)]
+    fn spans(
+        runs: usize,
+        endpoints: Vec<u64>,
+        base: bool,
+        block_size: usize,
+        level: u32,
+        bits_per_item: u64,
+        k: u8,
+        codec: u8,
+        max_file_bytes: usize,
+    ) -> PyResult<Merge> {
+        guard(|| {
+            let o = options(block_size, level, bits_per_item, k, codec);
+            Ok(Merge {
+                key: None,
+                local: None,
+                kind: Kind::Spans(Box::new(SpanMerge::new(
+                    runs,
+                    endpoints,
+                    base,
+                    o,
+                    max_file_bytes,
+                ))),
+            })
+        })
+    }
+
+    /// A span merge's entries per segment (`jobs::SpanMerge::segments`).
+    #[getter]
+    fn segments(&self) -> PyResult<Vec<u64>> {
+        guard(|| match &self.kind {
+            Kind::Spans(j) => Ok(j.segments.clone()),
+            _ => Err(PyTypeError::new_err("not a span merge")),
         })
     }
 
@@ -1398,6 +1659,7 @@ impl Merge {
                             Kind::Join(j) => j.step()?,
                             Kind::Compact(j) => j.step()?,
                             Kind::Scan(j) => j.step()?,
+                            Kind::Spans(j) => j.step()?,
                         };
                         match (step, local.as_mut()) {
                             (Step::Run(r), Some((snap, feed))) => {
@@ -1409,6 +1671,7 @@ impl Merge {
                     let file = match (&step, kind) {
                         (Step::File, Kind::Join(j)) => j.delta.writer.files.pop_front(),
                         (Step::File, Kind::Compact(j)) => j.writer.files.pop_front(),
+                        (Step::File, Kind::Spans(j)) => j.writer.files.pop_front(),
                         _ => None,
                     };
                     Ok((step, file))
@@ -1664,6 +1927,28 @@ impl Snapshot {
         })
     }
 
+    /// A page of `changes` over the snapshot's spans (newest first), clipped
+    /// to generations `[g_p, g_n1)`, as `span_changes` gives it; past
+    /// `max_bytes` of keys and payloads, `LimitError`.
+    #[pyo3(signature = (after, limit, g_p, g_n1, *, max_bytes=u64::MAX))]
+    fn changes<'py>(
+        &self,
+        py: Python<'py>,
+        after: Option<PyBackedBytes>,
+        limit: usize,
+        g_p: u64,
+        g_n1: u64,
+        max_bytes: u64,
+    ) -> PyResult<ChangesPage<'py>> {
+        guard(|| {
+            let inner = &self.inner;
+            let page = py
+                .detach(|| inner.changes(after.as_deref(), limit, g_p, g_n1, max_bytes))
+                .map_err(to_py)?;
+            changes_page(py, page)
+        })
+    }
+
     /// The newest entry of each key — `(generation, deleted, payload)` — or None.
     #[allow(clippy::type_complexity)]
     fn get<'py>(
@@ -1730,6 +2015,10 @@ fn solera_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(lookup, m)?)?;
     m.add_function(wrap_pyfunction!(merge_range, m)?)?;
     m.add_function(wrap_pyfunction!(merge_page, m)?)?;
+    m.add_function(wrap_pyfunction!(merge_spans, m)?)?;
+    m.add_function(wrap_pyfunction!(span_changes, m)?)?;
+    m.add_function(wrap_pyfunction!(span_scan, m)?)?;
+    m.add_function(wrap_pyfunction!(span_lookup, m)?)?;
     m.add_function(wrap_pyfunction!(filter_nbits, m)?)?;
     m.add_function(wrap_pyfunction!(_panic, m)?)?;
     m.add_function(wrap_pyfunction!(parse_footer, m)?)?;

@@ -1,7 +1,7 @@
 """Running a native streaming job (`solera._native.Merge`) over an index.
 
 The job does the per-key work; this module does its I/O. Each run — a
-level-0 file, or a level's files in key order — is read a segment of
+span's files in key order — is read a segment of
 consecutive blocks at a time, a few segments ahead; each file the job
 writes is handed to `on_file` as soon as it is full, a few uploads at a
 time. Memory is those buffers, whatever the size of the index. Given the

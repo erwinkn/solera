@@ -279,7 +279,7 @@ async def test_a_tick_pins_what_it_reads_until_decided(tmp_path):
     state, engine = await open_engine(tmp_path, project)
     await engine.commit_source("uploads", keys={"a": "1"})
     tick = await dispatch(engine, "watch")
-    assert tick["snapshot"]["uploads"]["index"]["files"]
+    assert tick["snapshot"]["uploads"]["index"]["spans"]
     assert state.model.pin_floor() == state.model.ticks["watch"]["pin"]
     await engine.sensor_post("watch", tick["tick"], {})
     assert state.model.pin_floor() == float("inf")

@@ -542,7 +542,7 @@ class Engine(Attempts, Sensors, Staleness, Views):
 
     def _dispatch_due(self):
         """Claim the tasks that are due, as far as the engine, their
-        executors and their partitions allow. Those held back are recorded, with
+        executors, their partitions and their outputs' merges allow. Those held back are recorded, with
         why, when that changes."""
 
         now = self.clock()
@@ -569,8 +569,11 @@ class Engine(Attempts, Sensors, Staleness, Views):
             limit = getattr(placement, "max_concurrent", None)
             is_pool = spec["kind"] == "Pool"
             holder = self.m.claimed_partitions.get((task["asset"], task["partition"]))
+            behind = self._merges_behind(task)
             if holder is not None and self.m.claimed(holder) is not None:
                 held[task_id] = ["claim", holder]
+            elif behind is not None:
+                held[task_id] = ["merges", behind]
             elif not is_pool and engine_used >= self.concurrency:
                 held[task_id] = ["engine", None]
             elif limit is not None and executor_used.get(executor, 0) >= limit:
@@ -586,6 +589,19 @@ class Engine(Attempts, Sensors, Staleness, Views):
             self._spawn(task["run"], attempt, is_pool, executor, self._attempt(task_id, attempt, placement))
         if held:
             self.state.record({"type": "TasksHeld", "held": held, "at": now})
+
+    def _merges_behind(self, task: dict) -> str | None:
+        """An output of the task whose key index upkeep has let fall far
+        behind — twice the span cap, which forced merges otherwise hold — or
+        None: writes to it wait until merges catch up (writer backpressure,
+        docs/key-index-design.md § Limits)."""
+
+        cap = 2 * self.key_options.fan_in
+        for output in self.manifest["assets"][task["asset"]]["outputs"]:
+            index = self.m.indexes.get((output["name"], task["partition"]))
+            if index is not None and len(index.spans) >= cap:
+                return output["name"]
+        return None
 
     def _spawn(self, run_id: str, attempt: str, is_pool: bool, executor: str, work):
         """Drive one attempt in the background, holding its execution slots."""
@@ -892,7 +908,7 @@ class Engine(Attempts, Sensors, Staleness, Views):
             all_empty = all_empty and empty
         claim = self.m.claimed(attempt) if attempt is not None else None
         if claim is not None:
-            # Keep the delta log this attempt reads until it finishes (§6).
+            # What this attempt reads stays endpoints of its upstreams until it finishes (§6).
             claim["reads"] = reads(plans)
         more = any(p["kind"] == "commits" and continues(p, None, None) for p in plans.values() if p)
         skip = bool(incremental) and all_empty and not more and not full
@@ -1379,7 +1395,7 @@ class Engine(Attempts, Sensors, Staleness, Views):
             # Where each batch sits in the pass (§5), planned when it starts: the keys
             # in the whole index or in the delta's files, by `batch_size` — an
             # estimate when patterns filter.
-            keys = pinned.count if whole else sum(f.entries for _, files in pinned.log for f in files)
+            keys = pinned.count if whole else sum(s.entries for s in pinned.spans)
             current = {**current, "batch": 0, "batches": _batches(keys, limit)}
             if not whole:  # a delta pass over several attempts holds its first batch's reader pin
                 current["pin"] = claim_generation
@@ -1920,7 +1936,7 @@ class Engine(Attempts, Sensors, Staleness, Views):
             sorted_run = SortedEntries.of(
                 [key_bytes(k) for k in new], list(new.values()), [key_bytes(k) for k in removes]
             )
-            with self.m.reading(self.m.index(name, "").prefix):  # outlives compaction meanwhile
+            with self.m.reading(self.m.index(name, "").prefix):  # outlives merges meanwhile
                 pinned = self.m.index(name, "").slice()
                 index = KeyIndex(self._key_io(), None, pinned, self.key_options)
                 files = await self._resolve_source(
@@ -2007,11 +2023,11 @@ class Engine(Attempts, Sensors, Staleness, Views):
             self.m.event_counter,
         )
         if answer["result"] == "empty":
-            return DeltaFiles([], 0, 0), ([], [])
+            return DeltaFiles([], 0, 0, generation), ([], [])
         if answer["result"] != "delta":
             return None
         await index.io.write(index.path(name), delta)
-        files = DeltaFiles([FileInfo.describe(name, 0, delta)], answer["added"], answer["removed"])
+        files = DeltaFiles([FileInfo.describe(name, delta)], answer["added"], answer["removed"], generation)
         return files, delta_keys(delta)
 
     # -- key index upkeep (§6) --------------------------------------------------------
@@ -2030,7 +2046,7 @@ class Engine(Attempts, Sensors, Staleness, Views):
         if state is None:
             return {"total": 0, "keys": {}, "next": None}
         start = key_bytes(after) if after is not None else None
-        with self.m.reading(state.prefix):  # its files outlive compaction until the page is read
+        with self.m.reading(state.prefix):  # its files outlive merges until the page is read
             index = KeyIndex(self._key_io(), None, state.slice(), self.key_options)
             keys, generations, _, nxt = await index.page(start, offset + limit)
         return {

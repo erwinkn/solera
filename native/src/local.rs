@@ -37,6 +37,7 @@ use crate::format::{
 };
 use crate::jobs::{Join, Step};
 use crate::rows::Source;
+use crate::spans;
 use crate::stream::{read_entry, write_entry, Block, Merge, Next};
 
 pub const MAGIC: &[u8; 4] = b"KXL3";
@@ -373,10 +374,16 @@ impl Local {
             .saturating_sub(1)
     }
 
-    /// The block that could hold `key`, or None.
+    /// The block that could hold `key`'s first entry, or None: a span's
+    /// file may hold a key several times, its versions crossing blocks, and
+    /// the first is the newest.
     fn block_of(&self, key: &[u8]) -> Option<usize> {
-        let i = self.dir.partition_point(|d| d.first.as_slice() <= key);
-        (i > 0 && key <= self.dir[i - 1].last.as_slice()).then(|| i - 1)
+        let i = self.dir.partition_point(|d| d.first.as_slice() < key);
+        if i > 0 && key <= self.dir[i - 1].last.as_slice() {
+            Some(i - 1)
+        } else {
+            (i < self.dir.len() && self.dir[i].first.as_slice() == key).then_some(i)
+        }
     }
 
     /// An error naming this file: the cache drops it and fetches its source again.
@@ -426,22 +433,19 @@ impl Local {
             }
             Ok(&entries[f.suffix.0..f.suffix.1])
         };
-        // The last restart point whose key is <= key.
+        // The last restart point whose key is below `key` (the first, if none
+        // is): the key's first entry lies past it, maybe beyond the next restart.
         let (mut lo, mut hi) = (0usize, d.restarts as usize);
         while hi - lo > 1 {
             let mid = (lo + hi) / 2;
-            if key_at(restart(mid))? <= key {
+            if key_at(restart(mid))? < key {
                 lo = mid;
             } else {
                 hi = mid;
             }
         }
         let mut p = restart(lo);
-        let end = if lo + 1 < d.restarts as usize {
-            restart(lo + 1)
-        } else {
-            entries.len()
-        };
+        let end = entries.len();
         let mut cur: Vec<u8> = Vec::new();
         while p < end {
             let f = read_entry(entries, &mut p)?;
@@ -607,6 +611,62 @@ impl Snapshot {
             page.push(e.key(), e.generation(), e.deleted(), e.payload())?;
         }
         Ok((page.shrink(), None))
+    }
+}
+
+impl Snapshot {
+    /// `spans::change` over the snapshot's runs (spans, newest first): up to
+    /// `limit` keys past `after` changed in generations `[g_p, g_n1)`, each
+    /// with its class and its state at N, as `spans::page` gives them. Each
+    /// run is read from the block holding `after`; past `max_bytes` of keys
+    /// and payloads, an `Error::Limit`.
+    pub fn changes(
+        &self,
+        after: Option<&[u8]>,
+        limit: usize,
+        g_p: u64,
+        g_n1: u64,
+        max_bytes: u64,
+    ) -> Result<spans::Page<(u8, spans::Version)>> {
+        let runs = self
+            .runs
+            .iter()
+            .map(|run| {
+                let (mut fi, mut bi) = match after {
+                    Some(a) => {
+                        let fi = run
+                            .partition_point(|f| f.min().is_some_and(|m| m <= a))
+                            .saturating_sub(1);
+                        run.get(fi).map_or((0, 0), |f| (fi, f.block_from(a)))
+                    }
+                    None => (0, 0),
+                };
+                Box::new(move || loop {
+                    let Some(f) = run.get(fi) else {
+                        return Ok(None);
+                    };
+                    if bi >= f.blocks() {
+                        (fi, bi) = (fi + 1, 0);
+                        continue;
+                    }
+                    bi += 1;
+                    return f.decoded(bi - 1).map(Some);
+                }) as spans::Blocks<'_>
+            })
+            .collect();
+        let mut held = 0u64;
+        let mut over = false;
+        let page = spans::page_of(spans::Groups::of(runs)?, after, None, limit, |vs| {
+            let (class, v) = spans::change(vs, g_p, g_n1)?;
+            held += v.payload.as_ref().map_or(0, |p| p.len() as u64);
+            over |= held > max_bytes;
+            Some((class, v.clone()))
+        })?;
+        let keys: u64 = page.items.iter().map(|(k, _)| k.len() as u64).sum();
+        if over || held + keys > max_bytes {
+            return Err(Error::Limit(format!("a page over {max_bytes} bytes")));
+        }
+        Ok(page)
     }
 }
 

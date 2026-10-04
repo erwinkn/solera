@@ -4,7 +4,7 @@ thread of their own: nothing here runs on the engine's event loop.
 - `resolve` answers a worker's request from the cache, or declines.
 - `committed` keeps the cache warm with what a commit installed — a delta
   the resolver returned is a candidate already, installed without a GET.
-- `installed` takes a file the engine wrote (a compaction output).
+- `installed` takes a file the engine wrote (a merge output).
 - `reads` answers an attempt's input reads at its `start` (§7): the
   worker's own read code over local copies, recorded.
 
@@ -345,7 +345,7 @@ class KeyService:
         return reads.to_json() if len(reads) else None
 
     def installed(self, prefix: str, f: FileInfo, path: str, data: bytes) -> None:
-        """A file the engine wrote (a compaction output), for the cache. Waiting,
+        """A file the engine wrote (a merge output), for the cache. Waiting,
         it holds its bytes: past `INSTALL_QUEUE` waiting it is skipped, and its
         index demoted — a fill fetches what is missing once there is room."""
 
@@ -370,7 +370,7 @@ class KeyService:
         self.cache.demote(prefix)
 
     def retired(self, paths: list[str]) -> None:
-        """A published compaction let go of these files."""
+        """A published merge let go of these files."""
 
         self._fire(lambda: self._retire(paths))
 

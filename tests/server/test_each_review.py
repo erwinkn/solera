@@ -77,6 +77,17 @@ async def test_2_a_full_run_keeps_a_failing_keys_last_good_output(state):
     assert {k: [r["n"] for r in v] for k, v in got.items()} == {"a": [1], "b": [2]}
 
 
+async def lose_boundaries(engine, key):
+    """Every span of an index merged into one, ignoring the endpoints its
+    readers hold: the delta they would read from is lost."""
+
+    from solera.keys.index import KeyIndex
+
+    index = engine.m.indexes[key]
+    out = await KeyIndex(engine._key_io(), None, index).merge((0, len(index.spans)), set())
+    engine.m.indexes[key] = index.merged(out.inputs, out.span)
+
+
 async def test_2_a_full_run_removes_what_upstream_no_longer_has(state):
     content = {"a": {"n": 1}, "b": {"n": 2}}
 
@@ -87,11 +98,10 @@ async def test_2_a_full_run_removes_what_upstream_no_longer_has(state):
     engine = make_engine(state, project)
     await engine.initialize()
     await drive(engine, await engine.submit(["parse"], upstream=True))
-    # The delta that deleted b is lost (the log truncated past it): a full run finds out.
+    # The delta that deleted b is lost (merged away): a full run finds out.
     del content["b"]
     await drive(engine, await engine.submit(["files"]))
-    index = engine.m.indexes[("files", "")]
-    engine.m.indexes[("files", "")] = index.truncated(index.log[-1][0] + 1)
+    await lose_boundaries(engine, ("files", ""))
     await drive(engine, await engine.submit(["parse"], mode="full"))
     assert set(await rows_of(engine, project, "samples")) == {"a"}
 
@@ -144,8 +154,7 @@ async def test_4_a_rescope_without_its_log_still_removes_left_out_and_deleted_ke
     await drive(engine, await engine.submit(["parse"], upstream=True))
     del content["gone/3"]
     await drive(engine, await engine.submit(["files"]))
-    index = engine.m.indexes[("files", "")]
-    engine.m.indexes[("files", "")] = index.truncated(index.log[-1][0] + 1)  # the log is lost
+    await lose_boundaries(engine, ("files", ""))  # the delta is lost
     new = files_project(content, parse, include="a/**", written=written)
     engine = make_engine(state, new)
     await engine.initialize()

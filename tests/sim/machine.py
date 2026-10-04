@@ -96,7 +96,7 @@ class Simulation(RuleBasedStateMachine):
         if store == "pg" and not postgres.DSN:
             store = "table"
             self.trace.append("  # no Postgres: 'pg' runs on the table store")
-        self.world = world = World(self.tmp, seed, key_options=Options(l0_max_files=2))
+        self.world = world = World(self.tmp, seed, key_options=Options(window=2))
         world.cache_budget = CACHE[cache]
         self.journal = Journal(now=world.now)
         world.objects.tap = self.journal.landed
@@ -586,21 +586,26 @@ class Simulation(RuleBasedStateMachine):
                 )
 
     @invariant()
-    def index_levels_never_overlap(self):
-        """docs/key-index-format.md: an index's level 0 holds one file per
-        commit, overlapping; within each deeper level, files cover disjoint
-        key ranges, so a read takes one file per level."""
+    def index_spans_tile(self):
+        """docs/key-index-design.md: an index's spans tile its commits from 0
+        to the head, and a span's files are in key order (a key's versions
+        may cross from one into the next), so a read takes one file per span
+        for a key."""
 
         engine = self.world.engine if self.world is not None else None
         if engine is None:
             return
         for (output, partition), index in list(engine.m.indexes.items()):
-            for level in range(1, index.depth + 1):
-                files = sorted(index.level(level), key=lambda f: f.min)
-                for a, b in zip(files, files[1:], strict=False):
-                    if a.max >= b.min:
+            starts = [s.a for s in index.spans]
+            if starts != [0, *(s.b + 1 for s in index.spans)][: len(starts)]:
+                raise Violation(
+                    f"{output}[{partition!r}]: spans {[(s.a, s.b) for s in index.spans]} do not tile"
+                )
+            for s in index.spans:
+                for a, b in zip(s.files, s.files[1:], strict=False):
+                    if a.max > b.min:
                         raise Violation(
-                            f"{output}[{partition!r}] level {level}: {a.name} and {b.name} overlap"
+                            f"{output}[{partition!r}] span {s.a}..{s.b}: {a.name} and {b.name} overlap"
                         )
 
     @invariant()
@@ -611,7 +616,7 @@ class Simulation(RuleBasedStateMachine):
         world = self.world
         if world is None or world.engine is None:
             return
-        self.index_levels_never_overlap()  # a read of overlapping levels fails as that, not as this
+        self.index_spans_tile()  # a read of spans that do not tile fails as that, not as this
         engine = world.engine
 
         async def check():
@@ -789,7 +794,7 @@ class Simulation(RuleBasedStateMachine):
         return target
 
     def _check_content(self, automated: bool) -> None:
-        self.index_levels_never_overlap()  # convergence ran no invariant
+        self.index_spans_tile()  # convergence ran no invariant
         engine, project, variant = self.world.engine, self.project, self.variant
         stage = "after automations alone" if automated else "after a catch-up run"
 

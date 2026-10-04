@@ -61,22 +61,21 @@ async def test_a_retry_pass_that_leaves_nothing_uncovered_collapses_the_record()
     by this batch (a removal by removing it) — so the record collapses as
     after a default run; anything else left, it does not."""
 
-    from dataclasses import replace
-
     from obstore.store import MemoryStore
     from solera import keys as K
-    from solera.keys.index import FileInfo, IndexState
+    from solera.keys.index import FileInfo, IndexState, Span
     from solera.keys.io import ObjectIO
     from solera.patterns import Matcher
     from solera_worker.each import _retry_covers
 
-    io, state = ObjectIO(MemoryStore()), IndexState(prefix="idx/")
+    io, spans = ObjectIO(MemoryStore()), [Span(0, 0, ((0, 0),), ())]
     for c, (keys, generation, deleted) in enumerate(
         [([b"a", b"b"], 10, b"\0\0"), ([b"c"], 11, b"\x01")], start=1
     ):
         data = K.encode_file(keys, [generation] * len(keys), deleted)
         await io.write(f"idx/{c:012d}-log.kx", data)
-        state = replace(state, log=state.log + ((c, (FileInfo.describe(f"{c:012d}-log", 0, data),)),))
+        spans.append(Span(c, c, ((c, generation),), (FileInfo.describe(f"{c:012d}-log", data),)))
+    state = IndexState(spans=tuple(spans), prefix="idx/")
     cover = {"from": 1, "to": 2, "index": state.to_json(), "ahead": {"a": 10}}
     taken = Matcher(None)
     assert await _retry_covers(cover, taken, {"b": 10}, {"c"}, io)  # a ahead, b retried, c removed

@@ -280,8 +280,7 @@ def test_an_explicit_selection_is_linear():
 async def test_a_removed_consumer_lets_go_of_its_upstreams_log(state):
     """Review round 5, engine #3 and system #2: `gone` and `keep` read
     `feed` incrementally. `gone` is removed: its position goes with it, so
-    the log of `feed`'s later commits is kept only as long as `keep` needs
-    it."""
+    merges of `feed`'s index keep only the boundaries `keep` reads from."""
 
     rows = [{"id": "a"}]
 
@@ -308,8 +307,8 @@ async def test_a_removed_consumer_lets_go_of_its_upstreams_log(state):
     for key in ("b", "c", "d"):
         rows.append({"id": key})
         await drive(engine, await engine.submit(["keep"], upstream=True))
-        engine.upkeep.truncate()
-    assert state.model.indexes[("feed", "")].log == ()
+    head = state.model.heads[("feed", "")]["commit_number"]
+    assert state.model.endpoints("feed", "") == {head + 1}  # `keep`'s next, and nothing of `gone`'s
 
 
 # -- a rewrite × interpretation ----------------------------------------------------------

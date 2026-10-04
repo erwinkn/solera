@@ -82,12 +82,11 @@ async def worker_finished() -> None:
 
 
 async def maintenance_drained(engine) -> None:
-    """Upkeep with nothing left in flight: compactions done,
+    """Upkeep with nothing left in flight: span merges done,
     their results recorded, garbage collected."""
 
     upkeep = engine.upkeep
     for _ in range(50):
-        upkeep.truncate()
         upkeep.maintain()
         if not upkeep.jobs:
             await upkeep.collect()

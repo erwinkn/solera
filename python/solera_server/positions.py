@@ -147,13 +147,6 @@ def outstanding(position: dict) -> bool:
     return "pass" in position or "pattern_change" in position or "reconcile" in position
 
 
-def needs(position: dict) -> int:
-    """The first commit of the upstream's delta log the input still reads."""
-
-    d = position.get("pass")
-    return int(d["from"]) if d is not None and d.get("from") is not None else int(position["next"])
-
-
 def pins(position: dict) -> list[int]:
     """The reader pins an input holds: a delta pass in batches over attempts
     reads versions as of its first batch; a pattern change, its snapshot's
@@ -168,11 +161,20 @@ def pins(position: dict) -> list[int]:
 
 
 def reads(plans: dict) -> list[tuple]:
-    """The delta logs an attempt's plans read: `(output, partition, first commit)`
-    — kept until its claim goes (§6)."""
+    """What an attempt's plans read of their upstream indexes: `(output,
+    partition, first, end)`, `first` the commit its read starts at and `end`
+    the head + 1 the plan was cut at, where the position may land (a pass's
+    batch, a keys= selection, a pattern change's diff). Both stay endpoints
+    of the upstream index until the claim goes (docs/key-index-design.md §
+    Endpoints). Held plans (retries, reconciles) and unkeyed upstreams move
+    no keyed position."""
 
-    return [
-        (p["position"]["output"], p["position"]["upstream_partition"], p["pass"]["from"])
-        for p in plans.values()
-        if p and p["kind"] == "keys" and p["pass"].get("from") is not None
-    ]
+    out = []
+    for p in plans.values():
+        if not p or p["kind"] not in ("keys", "selection") or p.get("head") is None:
+            continue
+        position = p["position"]
+        first = (p.get("pass") or {}).get("from")
+        first = int(position["next"]) if first is None else int(first)
+        out.append((position["output"], position["upstream_partition"], first, int(p["head"]) + 1))
+    return out

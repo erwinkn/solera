@@ -40,6 +40,7 @@ from solera.keys.index import (
     FileInfo,
     IndexState,
     KeyIndex,
+    Span,
     delta_keys,
     key_bytes,
     key_str,
@@ -767,7 +768,7 @@ async def _resolve(o: _Out, spec, answer) -> None:
     commit_number, attempt = int(o.info["commit_number"]), spec["attempt"]
     generation = int(spec.get("generation") or 0)  # each key's version (docs/versions.md)
     if answer is not None:
-        o.files, o.changed = await _upload(o.index, commit_number, attempt, answer)
+        o.files, o.changed = await _upload(o.index, commit_number, attempt, generation, answer)
     elif o.replace:
         o.files, o.changed = await o.index.replace(
             o.prepared.rows, commit_number, attempt, collect=LISTED, generation=generation
@@ -843,15 +844,18 @@ async def _ask_engine(channel, worker_id, asks: list[Ask]) -> dict[str, tuple[di
     return {name: a for name, a in got.items() if a[0]["result"] in ("delta", "empty")}
 
 
-async def _upload(index: KeyIndex, commit_number: int, attempt: str, answer) -> tuple[DeltaFiles, tuple]:
+async def _upload(
+    index: KeyIndex, commit_number: int, attempt: str, generation: int, answer
+) -> tuple[DeltaFiles, tuple]:
     """The engine's delta, uploaded as this attempt's own delta file."""
 
     a, data = answer
     if data is None:
-        return DeltaFiles([], 0, 0), ([], [])
+        return DeltaFiles([], 0, 0, generation), ([], [])
     name = f"{commit_number:012d}-{attempt}.0000"
     await index.io.write(index.path(name), data)
-    return DeltaFiles([FileInfo.describe(name, 0, data)], a["added"], a["removed"]), delta_keys(data)
+    files = DeltaFiles([FileInfo.describe(name, data)], a["added"], a["removed"], generation)
+    return files, delta_keys(data)
 
 
 async def _intended(info, keys_io, repairs) -> list[str]:
@@ -859,12 +863,11 @@ async def _intended(info, keys_io, repairs) -> list[str]:
     lists the delta files of an attempt that died while writing, and any of
     those writes may have landed."""
 
-    state = IndexState(
-        prefix=info["index"]["prefix"],
-        log=tuple(
-            (n, tuple(FileInfo.from_json(f) for f in intent["files"])) for n, intent in enumerate(repairs)
-        ),
+    spans = tuple(
+        Span(n, n, ((n, 0),), tuple(FileInfo.from_json(f) for f in intent["files"]))
+        for n, intent in enumerate(repairs)
     )
+    state = IndexState(prefix=info["index"]["prefix"], spans=spans)
     index = KeyIndex(keys_io, None, state)
     found, after = [], None
     while True:
@@ -1339,7 +1342,7 @@ def _file_entries(data: bytes):
 
 async def _cleanup_due(spec, project, asset, objects, writes) -> dict:
     """Clean up the cleanup the engine handed this attempt (docs/
-    lifecycle.md §9.8): the objects a commit or a compaction let go of, and
+    lifecycle.md §9.8): the objects a commit let go of, and
     what attempts that never committed wrote — all past every reader pin.
     The engine runs no store code; the partition's next attempt, which has its
     store, deletes for it. Returns what was done, for the result."""

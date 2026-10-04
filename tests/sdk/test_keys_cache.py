@@ -15,28 +15,38 @@ from obstore.store import MemoryStore
 from solera import _native
 from solera.keys import FOOTER_SIZE, SortedEntries
 from solera.keys.cache import Corrupt, EngineCache
-from solera.keys.index import FileInfo, IndexState, KeyIndex, Options
+from solera.keys.index import FileInfo, IndexState, KeyIndex, Options, Span
 from solera.keys.io import ObjectIO
 from solera.keys.resolver import Ask, Limits, Malformed, Prepared, Resolver, answers, frame, request, unframe
 
 from . import keys_reference as _python
 
-OPTS = Options(
-    block_size=512,
-    max_file_bytes=16 * 1024,
-    l0_max_files=3,
-    l0_max_bytes=1 << 30,
-    level_base=6 * 1024,
-    fanout=3,
-)
+OPTS = Options(block_size=512, max_file_bytes=16 * 1024, read_slack=4096)
 
 
 def key(i):
     return f"k{i:06d}".encode()
 
 
-async def built_index(io, n=3000, commits=12, seed=1):
-    """An index over several levels, as random commits and compactions leave it."""
+def single(prefix, *files):
+    """An index of one span, commit 0, holding `files`."""
+
+    return IndexState(prefix=prefix, spans=(Span(0, 0, ((0, 0),), files),))
+
+
+async def merged_all(io, state, endpoints=frozenset()):
+    """Every merge the policy plans, published at once."""
+
+    while (plan := KeyIndex(io, None, state, OPTS).plan_merge(set(endpoints))) is not None:
+        out = await KeyIndex(io, None, state, OPTS).merge(plan, set(endpoints))
+        if out is None:
+            break
+        state = state.merged(out.inputs, out.span)
+    return state
+
+
+async def built_index(io, n=3000, commits=12, seed=1, merge=True):
+    """An index of several spans, as random commits and merges leave it."""
 
     rng = random.Random(seed)
     state = IndexState(prefix="keys/out/_/")
@@ -49,9 +59,9 @@ async def built_index(io, n=3000, commits=12, seed=1):
             attempt=f"w{b}",
             generation=b + 1,
         )
-        state = state.committed(b, files, keep_log=False)
-        while (out := await KeyIndex(io, None, state, OPTS).compact()) is not None:
-            state = state.compacted(*out)
+        state = state.committed(b, files)
+        if merge:
+            state = await merged_all(io, state)
     return state
 
 
@@ -89,7 +99,7 @@ def io():
 
 async def test_engine_and_cold_resolves_agree(io, tmp_path):
     state = await built_index(io)
-    assert state.depth >= 2 and len(state.level(0)) >= 1
+    assert len(state.spans) >= 2 and any(s.b > s.a for s in state.spans)  # merged, and not into one
     cache = EngineCache(str(tmp_path))
     resolver = Resolver(cache, io, OPTS)
     rng = random.Random(5)
@@ -195,7 +205,7 @@ async def built_index_at(io, state):
     files, _ = await KeyIndex(io, None, state, OPTS).replace(
         _native.Rows.pairs([(k, rng.randbytes(8)) for k in ks]), 0, "w", generation=1
     )
-    return state.committed(0, files, keep_log=False)
+    return state.committed(0, files)
 
 
 def tail_of(local: bytes) -> int:
@@ -239,7 +249,7 @@ async def test_a_candidate_becomes_the_committed_file_without_a_get(io, tmp_path
     await io.write(state.path(name), delta)  # the worker uploads the bytes it was given
     from solera.keys.index import FileInfo
 
-    f = FileInfo.describe(name, 0, delta)
+    f = FileInfo.describe(name, delta)
     assert f.digest == answer["file"]["digest"]
     gets = io.metrics.gets
     assert await cache.committed(state.prefix, f, state.path(name))
@@ -289,8 +299,8 @@ async def test_only_the_named_object_is_installed(io, tmp_path):
 
     good = _native.encode_file([b"a"], [1], b"\x00", payloads=[b"good"])
     evil = _native.encode_file([b"a"], [1], b"\x00", payloads=[b"evil"])
-    f = FileInfo.describe("000000000001-x.0000", 0, good)
-    state = IndexState(prefix="keys/out/_/", files=(f,))
+    f = FileInfo.describe("000000000001-x.0000", good)
+    state = single("keys/out/_/", f)
     cache = EngineCache(str(tmp_path))
     assert cache.admit(state)
     with pytest.raises(Corrupt):
@@ -301,9 +311,9 @@ async def test_only_the_named_object_is_installed(io, tmp_path):
         await cache.fill(io, state)
     assert not cache.warm(state)
     assert await cache.install(state.prefix, f, state.path(f.name), good) and cache.warm(state)
-    other = FileInfo.describe(f.name, 0, evil)  # the same name, another object
+    other = FileInfo.describe(f.name, evil)  # the same name, another object
     again = EngineCache(str(tmp_path))
-    assert again.warm(state) and not again.warm(IndexState(prefix=state.prefix, files=(other,)))
+    assert again.warm(state) and not again.warm(single(state.prefix, other))
     assert not again.files  # and the copy that is not it goes
 
 
@@ -312,7 +322,7 @@ async def test_committed_deltas_are_verified_before_install(io, tmp_path):
 
     good = _native.encode_file([b"a"], [1], b"\x00", payloads=[b"good"])
     evil = _native.encode_file([b"a"], [1], b"\x00", payloads=[b"evil"])
-    f = FileInfo.describe("000000000001-x.0000", 0, good)
+    f = FileInfo.describe("000000000001-x.0000", good)
     service = KeyService(io.store, str(tmp_path))
     service.start()
     try:
@@ -336,8 +346,8 @@ async def test_the_disk_budget_holds_against_the_real_size(io, tmp_path):
 
     keys = [key(i) for i in range(10_000)]
     data = _native.encode_file(keys, [0] * len(keys), bytes(len(keys)), payloads=[b"r" * 256] * len(keys))
-    f = FileInfo.describe("c1-0000", 1, data)
-    state = IndexState(prefix="keys/out/_/", files=(f,))
+    f = FileInfo.describe("c1-0000", data)
+    state = single("keys/out/_/", f)
     await io.write(state.path(f.name), data)
     cache = EngineCache(str(tmp_path), candidates=0)
     cache.disk = cache.need(state)
@@ -509,19 +519,19 @@ async def test_a_canceled_fill_keeps_its_room_until_the_build_ends(io, tmp_path,
     )
 
 
-async def test_a_reader_does_not_evict_what_compaction_wrote(io, tmp_path):
-    """Review 7: a compaction's output, installed before the compaction is
-    published, stays while readers still have the snapshot it replaces open; the
-    inputs go once the compaction is published and no reader holds them."""
+async def test_a_reader_does_not_evict_what_a_merge_wrote(io, tmp_path):
+    """Review 7: a merge's output, installed before the merge is published,
+    stays while readers still have the snapshot it replaces open; the inputs
+    go once the merge is published and no reader holds them."""
 
-    state = await built_index(io, commits=3)
+    state = await built_index(io, commits=3, merge=False)
     cache = EngineCache(str(tmp_path))
     await cache.fill(io, state)
     idx = KeyIndex(io, None, state, OPTS)
-    plan = (state.level(0) + state.level(1), 1) if state.level(0) else (state.level(1), 2)
     written = []
     idx.on_write = lambda path, f, data: written.append((path, f, data))
-    added, removed = await idx.compact(plan)
+    out = await idx.merge((0, len(state.spans)), set())
+    removed = [n for names in out.names for n in names]
     for path, f, data in written:
         assert await cache.install(state.prefix, f, path, data)
     with cache.open(state):
@@ -529,7 +539,7 @@ async def test_a_reader_does_not_evict_what_compaction_wrote(io, tmp_path):
         cache.retire([state.path(n) for n in removed])
         assert all(state.path(n) in cache.files for n in removed)  # still read
     assert not any(state.path(n) in cache.files for n in removed)  # gone with the last reader
-    assert cache.warm(state.compacted(added, removed))
+    assert cache.warm(state.merged(out.inputs, out.span))
 
 
 async def test_a_background_fill_is_a_reader_pin(io, tmp_path, monkeypatch):
@@ -588,8 +598,8 @@ async def test_admission_remembers_what_a_file_built_to(io, tmp_path):
 
     keys = [key(i) for i in range(10_000)]
     data = _native.encode_file(keys, [0] * len(keys), bytes(len(keys)), payloads=[b"r" * 256] * len(keys))
-    f = FileInfo.describe("c1-0000", 1, data)
-    state = IndexState(prefix="keys/out/_/", files=(f,))
+    f = FileInfo.describe("c1-0000", data)
+    state = single("keys/out/_/", f)
     await io.write(state.path(f.name), data)
     cache = EngineCache(str(tmp_path), candidates=0)
     cache.disk = 2 * cache.need(state)
@@ -604,9 +614,9 @@ async def test_admission_remembers_what_a_file_built_to(io, tmp_path):
 
 
 async def test_maintenance_reads_the_engine_caches_copies(io, tmp_path):
-    """One warm copy serves every engine reader: a compaction over the
-    cache's local files reads nothing from the store and agrees with the
-    store's; a copy short of one file reads the store."""
+    """One warm copy serves every engine reader: a merge over the cache's
+    local files reads nothing from the store and agrees with the store's; a
+    copy short of one file reads the store."""
 
     from solera_server.keyservice import KeyService
 
@@ -619,11 +629,11 @@ async def test_maintenance_reads_the_engine_caches_copies(io, tmp_path):
             assert local_files is not None
             gets = io.metrics.gets
             held = ObjectIO(io.store, metrics=io.metrics, local=local_files.handles)
-            plan = (state.level(0) + state.level(1), 1) if state.level(0) else (state.level(1), 2)
+            plan = (0, len(state.spans))
             local = KeyIndex(held, None, state, OPTS)
-            added, _ = await local.compact(plan)
+            added = (await local.merge(plan, set())).span.files
             assert local.local_reads and io.metrics.gets == gets
-            stored, _ = await KeyIndex(io, None, state, OPTS).compact(plan)
+            stored = (await KeyIndex(io, None, state, OPTS).merge(plan, set())).span.files
 
             async def read(files):
                 return decoded([await io.read_whole(state.path(f.name), f.size) for f in files])
@@ -631,7 +641,7 @@ async def test_maintenance_reads_the_engine_caches_copies(io, tmp_path):
             assert await read(added) == await read(stored)
             partial = ObjectIO(io.store, local=dict(list(local_files.handles.items())[1:]))
             idx = KeyIndex(partial, None, state, OPTS)
-            again, _ = await idx.compact(plan)
+            again = (await idx.merge(plan, set())).span.files
             assert not idx.local_reads and await read(again) == await read(stored)
     finally:
         await service.stop()
@@ -641,7 +651,7 @@ async def test_maintenance_reads_the_engine_caches_copies(io, tmp_path):
 
 
 async def logged_index(io, seed=3):
-    """An index over several levels whose log holds every batch, deletions included."""
+    """An index of several spans that keeps every commit an endpoint, deletions included."""
 
     rng = random.Random(seed)
     state = IndexState(prefix="keys/out/_/")
@@ -654,9 +664,7 @@ async def logged_index(io, seed=3):
             attempt=f"w{b}",
             generation=b + 1,
         )
-        state = state.committed(b, files, keep_log=True)
-        while (out := await KeyIndex(io, None, state, OPTS).compact()) is not None:
-            state = state.compacted(*out)
+        state = await merged_all(io, state.committed(b, files), range(10))
     return state
 
 
@@ -667,11 +675,11 @@ async def test_local_reads_are_the_stores(io, tmp_path):
     from solera.keys.reads import Cold, Reads
 
     state = await logged_index(io)
-    assert state.depth >= 1 and len(state.log) == 10
+    assert all(state.covers(c, 9) for c in range(10))
     cache = EngineCache(str(tmp_path))
     assert await cache.fill(io, state)
     opened = cache.open_present(state)
-    assert len(opened.handles) == len(state.referenced())  # the logged deltas too
+    assert len(opened.handles) == len(state.referenced())
     local = ObjectIO(None, local=opened.handles)
     rng = random.Random(4)
 
@@ -758,8 +766,8 @@ async def test_a_build_stops_at_the_room_it_holds(io, tmp_path):
 
     keys = [key(i) for i in range(10_000)]
     data = _native.encode_file(keys, [0] * len(keys), bytes(len(keys)), payloads=[b"r" * 4096] * len(keys))
-    f = FileInfo.describe("c1-0000", 1, data)
-    state = IndexState(prefix="keys/out/_/", files=(f,))
+    f = FileInfo.describe("c1-0000", data)
+    state = single("keys/out/_/", f)
     await io.write(state.path(f.name), data)
     cache = EngineCache(str(tmp_path), candidates=0)
     cache.disk = 2 * cache.need(state)
@@ -780,7 +788,7 @@ async def test_long_paths_make_short_local_names(io, tmp_path):
     files, _ = await KeyIndex(io, None, state, OPTS).resolve(
         SortedEntries.of([key(i) for i in range(100)], [b"v"] * 100), commit_number=0, attempt="0" * 26
     )
-    state = state.committed(0, files, keep_log=False)
+    state = state.committed(0, files)
     cache = EngineCache(str(tmp_path))
     assert await cache.fill(io, state)
     assert {len(name) for name in os.listdir(str(tmp_path))} == {len("0" * 32 + ".kxl")}
@@ -849,7 +857,7 @@ async def test_installs_waiting_are_bounded_in_bytes(io, tmp_path, monkeypatch):
             data = _native.encode_file(
                 ks, [0] * len(ks), bytes(len(ks)), payloads=[rng.randbytes(500) for _ in ks], codec=0
             )
-            f = FileInfo.describe(f"c{i:04d}-0000", 1, data)
+            f = FileInfo.describe(f"c{i:04d}-0000", data)
             service.installed(state.prefix, f, state.path(f.name), data)
             assert service._installing <= keyservice.INSTALL_QUEUE
         await asyncio.wrap_future(service._submit(asyncio.sleep(0)))
@@ -1122,7 +1130,7 @@ async def test_a_closed_streaming_reader_owns_no_fetch(io):
             return await super().read(path, start, end, size)
 
     state = await built_index(io, commits=1)
-    files = [f for level in state.newest_first() for f in level] * 4  # more segments than the queue holds
+    files = list(state.files) * 4  # more segments than the queue holds
     reader = jobs._Run(Slow(io.store), state.path, files)
     await asyncio.sleep(0.05)
     fetches = len(reader.tasks) - 1  # beside its producer
@@ -1288,9 +1296,7 @@ def test_under_any_budget_and_any_trouble_the_engine_resolves_as_a_cold_reader(
                     attempt=f"w{commit}",
                     generation=commit + 1,
                 )
-                states[i] = states[i].committed(commit, files, keep_log=False)
-                while (out := await KeyIndex(io, None, states[i], OPTS).compact()) is not None:
-                    states[i] = states[i].compacted(*out)
+                states[i] = await merged_all(io, states[i].committed(commit, files))
                 commit += 1
             elif op == "resolve" and states[i].files:
                 ks = sorted({key(rng.randrange(2000)) for _ in range(n)})

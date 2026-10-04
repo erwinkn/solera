@@ -179,7 +179,7 @@ class Views:
             if state is None:
                 continue
             cursor = key_bytes(start[1]) if start is not None and partition == start[0] else None
-            with self.m.reading(state.prefix):  # its files outlive compaction until the walk ends (aclose)
+            with self.m.reading(state.prefix):  # its files outlive merges until the walk ends (aclose)
                 index = KeyIndex(self._key_io(), None, state.slice(), self.key_options)
                 while True:
                     keys, _, payloads, cursor = await index.page(cursor, PAGE)

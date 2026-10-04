@@ -1,24 +1,23 @@
-"""Key index operations (docs/object-store-state.md §6).
+"""Key index operations (docs/key-index-design.md, docs/object-store-state.md §6).
 
-An index is one log-structured merge tree of `.kx` files per keyed output
-and partition. `IndexState` is the engine-held record of which files exist;
-it is plain data, changed only through its pure transition methods, so the
-engine can journal it. `KeyIndex` does the I/O: computing a commit's delta,
-writing delta files, paging, reading pending deltas, and compaction. A full
-replacement and a compaction stream over the whole index
-(`jobs`): memory is a few segments per level and one output file.
+An index is a list of spans per keyed output and partition: key-sorted
+`.kx` file sets, each covering a stretch of commits, tiling them from 0 to
+the head. `IndexState` is the engine-held record of them; it is plain
+data, changed only through its pure transition methods, so the engine can
+journal it. `KeyIndex` does the I/O: computing a commit's delta (always
+exact), writing it as the commit's span, lookups and scans at the head or
+at a reserved endpoint, `changes(P -> N)`, and merging adjacent spans. A
+full replacement and a merge stream over their inputs (`jobs`): memory is
+a few segments per span and one output file.
 
-Levels: level 0 holds delta files, one per commit, with overlapping key
-ranges, newest first. Levels 1+ hold compacted files with non-overlapping
-ranges; deeper levels are older. For any key, the newest file holding it
-has its current entry.
+Spans are read newest first: for any key, its first entry in the newest
+span holding it is its current state.
 """
 
 from __future__ import annotations
 
 import asyncio
 import bisect
-import itertools
 import json
 import math
 from collections.abc import Iterable
@@ -83,7 +82,6 @@ def index_prefix(output: str, partition: str) -> str:
 @dataclass(frozen=True)
 class FileInfo:
     name: str
-    level: int
     min: bytes
     max: bytes
     entries: int
@@ -95,7 +93,6 @@ class FileInfo:
     def to_json(self) -> dict:
         return {
             "name": self.name,
-            "level": self.level,
             "min": _s(self.min),
             "max": _s(self.max),
             "entries": self.entries,
@@ -108,24 +105,15 @@ class FileInfo:
     @classmethod
     def from_json(cls, d: dict) -> FileInfo:
         return cls(
-            d["name"],
-            d["level"],
-            _b(d["min"]),
-            _b(d["max"]),
-            d["entries"],
-            d["size"],
-            d["tail"],
-            d["index"],
-            d["digest"],
+            d["name"], _b(d["min"]), _b(d["max"]), d["entries"], d["size"], d["tail"], d["index"], d["digest"]
         )
 
     @classmethod
-    def describe(cls, name: str, level: int, data: bytes) -> FileInfo:
+    def describe(cls, name: str, data: bytes) -> FileInfo:
         footer = parse_footer(data[-FOOTER_SIZE:])
         tail = parse_tail(data[footer["filters_offset"] :], len(data))
         return cls(
             name,
-            level,
             tail["min_key"],
             tail["max_key"],
             footer["entries"],
@@ -137,108 +125,170 @@ class FileInfo:
 
 
 @dataclass(frozen=True)
+class Span:
+    """The keys commits `[a, b]` changed (docs/key-index-design.md § The
+    structure): per key, one version per segment it changed in (the newest,
+    newest first), with its predecessor before `a` on the oldest. `starts`
+    holds `(commit, generation)` for the span's start and for each segment
+    start: the endpoints that were live when the span was written. `files`
+    are in key order, never overlapping; a key's versions may cross from one
+    into the next. A commit's delta is the span `[c, c]`; the span from commit
+    0 is the base, which keeps live keys only in its initial segment."""
+
+    a: int
+    b: int
+    starts: tuple[tuple[int, int], ...]
+    files: tuple[FileInfo, ...]
+    counts: tuple[int, ...] = ()  # entries per segment, beside `starts`
+
+    @property
+    def entries(self) -> int:
+        return sum(f.entries for f in self.files)
+
+    @property
+    def size(self) -> int:
+        return sum(f.size for f in self.files)
+
+    def to_json(self) -> dict:
+        return {
+            "a": self.a,
+            "b": self.b,
+            "starts": [list(x) for x in self.starts],
+            "counts": list(self.counts),
+            "files": [f.to_json() for f in self.files],
+        }
+
+    @classmethod
+    def from_json(cls, d: dict) -> Span:
+        return cls(
+            d["a"],
+            d["b"],
+            tuple(tuple(x) for x in d["starts"]),
+            tuple(FileInfo.from_json(f) for f in d["files"]),
+            tuple(d.get("counts") or ()),
+        )
+
+
+@dataclass(frozen=True)
 class IndexState:
-    """What the engine holds per index: `count` live keys, the files by level,
-    and the delta log consumers read — `(commit, files)`, oldest first. A delta
-    file stays in the log after compaction merges it out of the levels, until
-    no consumer needs it. Writes are exact, so `count` always is."""
+    """What the engine holds per index: `count` live keys, and its spans,
+    oldest first, tiling its commits from 0 to the head with no gap
+    (docs/key-index-design.md). Writes are exact, so `count` always is.
+    `life` names this incarnation of the index: a reset, a move or a removal
+    starts a new one, and a merge planned against another life is refused."""
 
     count: int = 0
-    files: tuple[FileInfo, ...] = ()
-    log: tuple[tuple[int, tuple[FileInfo, ...]], ...] = ()
+    spans: tuple[Span, ...] = ()
     prefix: str = ""  # where the files live (`index_prefix` when the index was created)
+    life: str = ""
 
     def to_json(self) -> dict:
         return {
             "prefix": self.prefix,
+            "life": self.life,
             "count": self.count,
-            "files": [f.to_json() for f in self.files],
-            "log": [[b, [f.to_json() for f in fs]] for b, fs in self.log],
+            "spans": [s.to_json() for s in self.spans],
         }
 
     @classmethod
     def from_json(cls, d: dict | None) -> IndexState:
         if not d:
             return cls()
-        return cls(
-            d["count"],
-            tuple(FileInfo.from_json(f) for f in d["files"]),
-            tuple((b, tuple(FileInfo.from_json(f) for f in fs)) for b, fs in d["log"]),
-            d["prefix"],
-        )
+        return cls(d["count"], tuple(Span.from_json(s) for s in d["spans"]), d["prefix"], d.get("life", ""))
 
     def path(self, name: str) -> str:
         return f"{self.prefix}{name}.kx"
 
-    def slice(self, first: int | None = None, last: int | None = None) -> IndexState:
-        """The part of the index one reader needs: the levels, and the log
-        entries in `[first, last]` (none when `first` is None)."""
-
-        if first is None:
-            return replace(self, log=())
-        hi = last if last is not None else math.inf
-        return replace(self, log=tuple(e for e in self.log if first <= e[0] <= hi))
-
-    def covers(self, first: int, last: int) -> bool:
-        """Whether the log still holds every commit in `[first, last]`."""
-
-        logged = {b for b, _ in self.log}
-        return all(b in logged for b in range(first, last + 1))
-
     # -- views ------------------------------------------------------------------------
 
-    def level(self, n: int) -> list[FileInfo]:
-        files = [f for f in self.files if f.level == n]
-        if n == 0:
-            return sorted(files, key=lambda f: f.name, reverse=True)  # newest first
-        return sorted(files, key=lambda f: f.min)
+    @property
+    def files(self) -> tuple[FileInfo, ...]:
+        return tuple(f for s in self.spans for f in s.files)
 
     @property
-    def depth(self) -> int:
-        return max((f.level for f in self.files), default=0)
+    def head(self) -> int:
+        """The last commit the spans hold (-1: none yet)."""
+
+        return self.spans[-1].b if self.spans else -1
 
     def newest_first(self) -> list[list[FileInfo]]:
-        """Levels in recency order: each level-0 file alone, then levels 1..depth."""
+        """The spans as sorted runs, newest first: what a reader merges."""
 
-        out = [[f] for f in self.level(0)]
-        for n in range(1, self.depth + 1):
-            files = self.level(n)
-            if files:
-                out.append(files)
-        return out
+        return [list(s.files) for s in reversed(self.spans)]
 
     def referenced(self) -> set[str]:
-        """Every file name the index still needs: its levels and its log."""
+        """Every file name the index still needs."""
 
-        return {f.name for f in self.files} | {f.name for _, fs in self.log for f in fs}
+        return {f.name for f in self.files}
+
+    def generation(self, commit: int) -> int | None:
+        """The generation of commit `commit`, where it starts a span or a
+        segment: the bound a read at that endpoint takes."""
+
+        for s in self.spans:
+            if s.a <= commit <= s.b:
+                return dict(s.starts).get(commit)
+        return None
+
+    def covers(self, first: int, last: int) -> bool:
+        """Whether the spans can answer for commits `[first, last]`: `first`
+        starts a span or a segment (a reserved endpoint), or lies past the
+        head, and `last` is at most the head."""
+
+        if last > self.head:
+            return False
+        return first > last or first == 0 or self.generation(first) is not None
+
+    def slice(self, first: int | None = None, last: int | None = None) -> IndexState:
+        """The part of the index one reader needs: every span, or with `first`
+        the spans overlapping `[first, last]` (a catch-up's)."""
+
+        if first is None:
+            return self
+        hi = last if last is not None else math.inf
+        return replace(self, spans=tuple(s for s in self.spans if s.b >= first and s.a <= hi))
 
     # -- transitions (pure) ----------------------------------------------------------------
 
-    def committed(self, commit_number: int, delta: DeltaFiles, *, keep_log: bool) -> IndexState:
-        """Install a commit's delta files. An empty index takes them straight into level 1."""
+    def committed(self, commit_number: int, delta: DeltaFiles) -> IndexState:
+        """Install a commit's delta as the span `[c, c]`; an empty delta is a
+        span too, so the spans keep no holes. An index that skips commits (a
+        failure index, which only failing commits write) gets the span
+        `[head + 1, c]`: the commits between changed nothing in it. An empty
+        delta that does not advance the head (a commit that wrote no keys)
+        changes nothing."""
 
-        level = 1 if not self.files else 0
-        placed = tuple(replace(f, level=level) for f in delta.files)
-        log = self.log + ((commit_number, placed),) if keep_log and placed else self.log
-        return IndexState(
-            count=self.count + delta.added - delta.removed,
-            files=self.files + placed,
-            log=log,
-            prefix=self.prefix,
+        if commit_number <= self.head and not delta.files:
+            return self
+        if commit_number <= self.head:
+            raise ValueError(f"commit {commit_number} does not follow the head {self.head}")
+        span = Span(
+            self.head + 1,
+            commit_number,
+            ((self.head + 1, delta.generation),),
+            tuple(delta.files),
+            (sum(f.entries for f in delta.files),),
         )
+        return replace(self, count=self.count + delta.added - delta.removed, spans=self.spans + (span,))
 
-    def compacted(self, added: list[FileInfo], removed: list[str]) -> IndexState:
-        """Swap compaction inputs for outputs (a moved file is both, under one name)."""
+    def merged(self, inputs: list[tuple[int, int]], out: Span) -> IndexState:
+        """Swap adjacent input spans `(a, b)` for their merge."""
 
-        gone = set(removed)
-        return replace(self, files=tuple(f for f in self.files if f.name not in gone) + tuple(added))
+        ranges = [(s.a, s.b) for s in self.spans]
+        lo = ranges.index(tuple(inputs[0]))
+        if ranges[lo : lo + len(inputs)] != [tuple(x) for x in inputs] or (out.a, out.b) != (
+            inputs[0][0],
+            inputs[-1][1],
+        ):
+            raise ValueError(f"spans {inputs} are not this index's, or not adjacent")
+        return replace(self, spans=self.spans[:lo] + (out,) + self.spans[lo + len(inputs) :])
 
-    def truncated(self, lowest_needed_commit: int | None) -> IndexState:
-        """Drop log entries no consumer still needs (`None`: no consumers at all)."""
+    def holds(self, inputs: list[tuple[int, int]], names: list[list[str]]) -> bool:
+        """Whether the index still holds exactly these spans, with these files:
+        a merge planned against them may publish."""
 
-        if lowest_needed_commit is None:
-            return replace(self, log=())
-        return replace(self, log=tuple(e for e in self.log if e[0] >= lowest_needed_commit))
+        current = {(s.a, s.b): [f.name for f in s.files] for s in self.spans}
+        return all(current.get(tuple(r)) == n for r, n in zip(inputs, names, strict=True))
 
 
 @dataclass(frozen=True)
@@ -269,11 +319,12 @@ class DeltaKeys:
     async def chunks(self, size: int = 100_000):
         """Chunks of the written keys, as `str`."""
 
-        index = KeyIndex(self.io, self.prefix, IndexState(log=((0, self.files),), prefix=self.prefix))
+        span = Span(0, 0, ((0, 0),), tuple(self.files))
+        index = KeyIndex(self.io, self.prefix, IndexState(spans=(span,), prefix=self.prefix))
         after = None
         while self.files:
-            keys, _, deleted, _, after = await index.pending(0, 0, after, size)
-            chunk = [key_str(k) for k, d in zip(keys, deleted, strict=True) if not d]
+            keys, _, _, after = await index.page(after, size)
+            chunk = [key_str(k) for k in keys]
             if chunk:
                 yield chunk
             if after is None:
@@ -282,16 +333,27 @@ class DeltaKeys:
 
 @dataclass(frozen=True)
 class DeltaFiles:
+    """A commit's delta as written: its files, the count's change, and the
+    generation it was written at (its span starts there)."""
+
     files: list[FileInfo]
     added: int
     removed: int
+    generation: int = 0
 
     def to_json(self) -> dict:
-        return {"files": [f.to_json() for f in self.files], "added": self.added, "removed": self.removed}
+        return {
+            "files": [f.to_json() for f in self.files],
+            "added": self.added,
+            "removed": self.removed,
+            "generation": self.generation,
+        }
 
     @classmethod
     def from_json(cls, d: dict) -> DeltaFiles:
-        return cls([FileInfo.from_json(f) for f in d["files"]], d["added"], d["removed"])
+        return cls(
+            [FileInfo.from_json(f) for f in d["files"]], d["added"], d["removed"], d.get("generation", 0)
+        )
 
 
 @dataclass
@@ -301,7 +363,7 @@ class Options:
     bits_per_item: int = 14
     k: int = 10
     max_file_bytes: int = 64 * 2**20
-    whole_threshold: int = 2 * RANGE  # levels this small are read whole: no more requests than tail + block
+    whole_threshold: int = 2 * RANGE  # spans this small are read whole: no more requests than tail + block
     small_file: int = (
         2 * 2**20
     )  # files this small are read whole: cheaper to transfer than a second round trip
@@ -312,10 +374,14 @@ class Options:
     stream_density: float = 0.02
     # ...or, after the filters, its exact reads need more blocks than this many per streamed segment.
     stream_reads: float = 16.0
-    l0_max_files: int = 8
-    l0_max_bytes: int = 64 * 2**20
-    level_base: int = 64 * 2**20
-    fanout: int = 10
+    # The merge policy (docs/key-index-design.md § The merge policy).
+    guard: float = 4.0  # a merge's largest input holds at most this many times the others
+    window: int = 4  # spans of one size merged at once
+    base_ratio: float = 4.0  # the base absorbs what follows once that is a quarter of it
+    read_ratio: float = 1.0  # the read rule's λ: a reader at an endpoint reads at most that much more...
+    read_slack: int = 10 * 2**20  # ...or this many bytes
+    fan_in: int = 32  # spans past which merges are forced
+    stale: float = 0.25  # a span rewritten alone must drop at least this share of its entries
 
 
 # -- reading ------------------------------------------------------------------------
@@ -466,7 +532,7 @@ class KeyIndex:
         if delta is None:
             return await self._stream(run, commit_number, attempt, generation, collect)
         self.route = "sparse"
-        return await self.write(commit_number, attempt, delta), delta.listed
+        return await self.write(commit_number, attempt, delta, generation), delta.listed
 
     async def delta(self, run: SortedEntries, *, generation: int = 0) -> Delta:
         """A patch's delta through the sparse reader whatever its size, not written."""
@@ -484,15 +550,26 @@ class KeyIndex:
         )
         return Delta(files, added, removed, listed)
 
-    async def lookup(self, keys: list[bytes]) -> dict[bytes, tuple[int, bytes | None]]:
+    async def lookup(self, keys: list[bytes], at: int | None = None) -> dict[bytes, tuple[int, bytes | None]]:
         """Exactly, the live `(generation, payload)` of each of `keys` the
         index holds — the newest entry wins, and a deleted key is absent:
         for selections named outright (a run's `keys=`), immutable stores'
         reads (docs/lifecycle.md §9.8) and failed keys' prior records.
-        Every level at once; the filters only skip files that cannot hold a
-        key."""
+        Every span at once; the filters only skip files that cannot hold a
+        key. With `at`, as of that reserved endpoint: the state after commit
+        `at - 1`."""
 
         keys = sorted(set(keys))
+        if at is not None and at <= self.state.head:
+            below = self._endpoint(at)
+            levels = [list(s.files) for s in reversed(self.state.spans) if s.a < at]
+            runs, codecs = await self._key_blocks(levels, keys)
+            found, generations, deleted, payloads = await in_thread(
+                _native.span_lookup, runs, codecs, keys, below
+            )
+            return {
+                k: (generations[i], payloads[i]) for i, k in enumerate(keys) if found[i] and not deleted[i]
+            }
 
         async def store():
             run = SortedEntries.of(keys)
@@ -548,13 +625,13 @@ class KeyIndex:
         return out
 
     async def _stream(self, run: SortedEntries, commit_number, attempt, generation, collect):
-        """The streaming merge-join of a patch with every level."""
+        """The streaming merge-join of a patch with every span."""
 
         self.route = "stream"
         runs = self.state.newest_first()
         job = Merge.patch(run, len(runs), **self._writer(), collect=collect, generation=generation)
-        files = await self._run(job, runs, lambda n: f"{commit_number:012d}-{attempt}.{n:04d}", 0)
-        return DeltaFiles(files, job.added, job.removed), job.collected()
+        files = await self._run(job, runs, lambda n: f"{commit_number:012d}-{attempt}.{n:04d}")
+        return DeltaFiles(files, job.added, job.removed, generation), job.collected()
 
     async def replace(
         self,
@@ -588,8 +665,8 @@ class KeyIndex:
             generation=generation,
             overlay=overlay,
         )
-        files = await self._run(job, runs, lambda n: f"{commit_number:012d}-{attempt}.{n:04d}", 0, rows)
-        return DeltaFiles(files, job.added, job.removed), job.collected()
+        files = await self._run(job, runs, lambda n: f"{commit_number:012d}-{attempt}.{n:04d}", rows)
+        return DeltaFiles(files, job.added, job.removed, generation), job.collected()
 
     def _writer(self) -> dict:
         o = self.o
@@ -601,10 +678,10 @@ class KeyIndex:
             "max_file_bytes": o.max_file_bytes,
         }
 
-    async def _run(self, job: Merge, runs, name=None, level: int = 0, rows=None) -> list[FileInfo]:
-        """Drive a streaming job over `runs`; its files are written as `name(n)`, at
-        `level`. When the `io`'s local copies hold every file of `runs`, the
-        job reads those, not the store."""
+    async def _run(self, job: Merge, runs, name=None, rows=None) -> list[FileInfo]:
+        """Drive a streaming job over `runs`; its files are written as `name(n)`.
+        When the `io`'s local copies hold every file of `runs`, the job reads
+        those, not the store."""
 
         local = getattr(self.io, "local", None)
 
@@ -612,7 +689,7 @@ class KeyIndex:
 
         async def put(n: int, data: bytes):
             await self.io.write(self.path(name(n)), data)
-            files[n] = FileInfo.describe(name(n), level, data)
+            files[n] = FileInfo.describe(name(n), data)
             if self.on_write is not None:
                 self.on_write(self.path(name(n)), files[n], data)
 
@@ -625,13 +702,12 @@ class KeyIndex:
 
     async def _find(self, run: SortedEntries, *, switch: bool):
         """What the index holds for each entry of `run`, as a native `Sparse`
-        state — read live or deleted, absent by the key filters, or, for an
-        upsert carrying no payload, live by the key and tombstone filters.
-        Newest first, levels small enough are read whole, all at once; from
-        the first larger one on, every level goes through its filters, since
-        "absent" must hold across every level that could hold the key. Only
+        state — read live or deleted, or absent by the key filters (writes
+        are exact: a key a filter holds has its entry read). Newest first, spans small enough are read whole, all at once; from
+        the first larger one on, every span goes through its filters, since
+        "absent" must hold across every span that could hold the key. Only
         entries the filters cannot decide get block reads, in the files whose
-        key filter matched, all levels at once. With `switch`, None once those
+        key filter matched, all spans at once. With `switch`, None once those
         reads would touch more blocks than streaming the index costs segments
         × `stream_reads`. Python chooses files and fetches; no key becomes a
         Python object."""
@@ -641,7 +717,7 @@ class KeyIndex:
         n = next((i for i, level in enumerate(levels) if not self._read_whole(level)), len(levels))
         whole, filtered = levels[:n], levels[n:]
 
-        # 1. The whole levels, fetched at once and then consulted newest first.
+        # 1. The whole spans, fetched at once and then consulted newest first.
         spans = {f.name: sparse.span(f.min, f.max) for level in levels for f in level}
         await asyncio.gather(
             *(
@@ -686,35 +762,36 @@ class KeyIndex:
         return sparse
 
     def _read_whole(self, level: list[FileInfo]) -> bool:
-        """Whether a level is small enough to read whole without looking at its filters."""
+        """Whether a span is small enough to read whole without looking at its filters."""
 
         return sum(f.size for f in level) <= self.o.whole_threshold
 
     # -- writing ------------------------------------------------------------------------
 
-    async def write(self, commit_number: int, attempt: str, delta: Delta) -> DeltaFiles:
+    async def write(self, commit_number: int, attempt: str, delta: Delta, generation: int = 0) -> DeltaFiles:
         """Write a patch's delta as the commit's files, `{commit}-{attempt}.{n}`:
         the attempt id keeps a retried commit from colliding with its own upload."""
 
         files = [
-            FileInfo.describe(f"{commit_number:012d}-{attempt}.{n:04d}", 0, d)
-            for n, d in enumerate(delta.files)
+            FileInfo.describe(f"{commit_number:012d}-{attempt}.{n:04d}", d) for n, d in enumerate(delta.files)
         ]
         await asyncio.gather(
             *(self.io.write(self.path(f.name), d) for f, d in zip(files, delta.files, strict=True))
         )
-        return DeltaFiles(files, delta.added, delta.removed)
+        return DeltaFiles(files, delta.added, delta.removed, generation)
 
     # -- scans: full pass and pending deltas ----------------------------------------------
 
-    async def _scan(self, levels: list[list[FileInfo]], after: bytes | None, limit: int, drop_deleted: bool):
-        """Up to `limit` entries of the merged view with keys > `after`, and the
-        cursor to continue from (`None` when the view is exhausted).
+    async def _window(self, levels: list[list[FileInfo]], after: bytes | None, limit: int):
+        """The blocks a page of keys > `after` needs from each sorted run of
+        `levels` (newest first), and the bound below which they hold every
+        entry of every run: `(runs, codecs, bound)`, `bound` None at the end.
 
-        `levels` are newest first; the files within one level never overlap.
         Files are chosen from their metadata before anything is read — per
-        level, only those covering the next `limit` keys — and only their
-        block indexes are read, never their filters."""
+        run, only those covering the next `limit` entries — and only their
+        block indexes are read, never their filters. A span's file may hold a
+        key several times, its versions crossing into the next block or file:
+        the bound is exclusive, so a key it equals is left to the next page."""
 
         chosen, bound = [], None
         for level in levels:
@@ -752,20 +829,53 @@ class KeyIndex:
             runs.append([got[i] for i in span])
             if p.data is None:
                 p.window = got  # the next page starts in it: a file never pays for the same block twice
-        codecs = [p.tail["codec"] for p in parsed]  # each file's own
+        return runs, [p.tail["codec"] for p in parsed], bound
+
+    @staticmethod
+    def _cursor(n: int, limit: int, last, after, more: bool, bound):
+        """Where the next page starts: the last key examined, or None when done."""
+
+        cursor = last if last is not None else after
+        if n == limit:  # full: more past it, or past the fetched blocks
+            return cursor if more or bound is not None else None
+        return cursor if bound is not None else None
+
+    async def _scan(
+        self, levels: list[list[FileInfo]], after: bytes | None, limit: int, drop_deleted: bool, below=None
+    ):
+        """Up to `limit` entries of the merged view with keys > `after` —
+        each key's newest version, or its newest older than generation
+        `below` (the view at a reserved endpoint) — and the cursor to
+        continue from (`None` when the view is exhausted)."""
+
+        runs, codecs, bound = await self._window(levels, after, limit)
         # Natively, off the loop: the merge stops at the page, never building the rest.
         keys, generations, deleted, payloads, last, more = await in_thread(
-            merge_page, runs, codecs, after, bound, limit, drop_deleted
+            merge_page, runs, codecs, after, bound, limit, drop_deleted, 2**64 - 1 if below is None else below
         )
-        cursor = last if last is not None else after
-        if len(keys) == limit:  # full: more past it, or past the fetched blocks
-            return keys, generations, deleted, payloads, cursor if more or bound is not None else None
-        return keys, generations, deleted, payloads, cursor if bound is not None else None
+        return keys, generations, deleted, payloads, self._cursor(len(keys), limit, last, after, more, bound)
 
-    async def page(self, after: bytes | None, limit: int):
-        """One page of the full pass: live keys > `after`, their
-        generations and payloads, and the next cursor (`None` when done)."""
+    def _endpoint(self, at: int) -> int:
+        """The generation a read at reserved endpoint `at` (the state after
+        commit `at - 1`) takes as its bound."""
 
+        if at > self.state.head:
+            return 2**64 - 1
+        g = self.state.generation(at)
+        if g is None:
+            raise LookupError(f"commit {at} is not an endpoint of this index")
+        return g
+
+    async def page(self, after: bytes | None, limit: int, at: int | None = None):
+        """One page of the full pass: live keys > `after`, their generations
+        and payloads, and the next cursor (`None` when done). With `at`, as
+        of that reserved endpoint: the state after commit `at - 1`."""
+
+        if at is not None and at <= self.state.head:
+            below = self._endpoint(at)
+            levels = [list(s.files) for s in reversed(self.state.spans) if s.a < at]
+            keys, generations, _, payloads, nxt = await self._scan(levels, after, limit, True, below)
+            return keys, generations, payloads, nxt
         levels = self.state.newest_first()
 
         async def store():
@@ -779,131 +889,411 @@ class KeyIndex:
 
         return await self._read("page", (after, limit), levels, local, store)
 
-    async def pending(self, first_commit: int, last_commit: int, after: bytes | None, limit: int):
-        """Changes in commits `[first_commit, last_commit]`, newest winning, keys > `after`:
-        keys, generations, deleted flags, payloads, and the next cursor (`None` when done)."""
+    # -- changes(P -> N) --------------------------------------------------------------------
 
-        logged = dict(self.state.log)
-        missing = [b for b in range(first_commit, last_commit + 1) if b not in logged]
-        if missing:
-            raise LookupError(f"delta log no longer holds commits {missing[:5]}")
-        # Each commit is a level of its own: its files (a split delta) never overlap.
-        levels = [list(logged[b]) for b in range(last_commit, first_commit - 1, -1)]
+    def _range(self, first: int, last: int) -> tuple[list[list[FileInfo]], int, int]:
+        """The runs of the spans overlapping commits `[first, last]`, newest
+        first, and the generations `[g(first), g(last + 1))` they are clipped to."""
+
+        if not self.state.covers(first, last):
+            raise LookupError(f"commits {first}..{last}: {first} is not an endpoint of this index")
+        g_p = 0 if first == 0 else self._endpoint(first)
+        g_n1 = self._endpoint(last + 1)
+        runs = [list(s.files) for s in reversed(self.state.spans) if s.b >= first and s.a <= last]
+        return runs, g_p, g_n1
+
+    async def changes_page(self, first: int, last: int, after: bytes | None, limit: int):
+        """One page of `changes(first -> last)`: every key changed in commits
+        `[first, last]` past `after`, its class (0 added, 1 updated, 2
+        removed, 3 neither — a read-ahead may need it), the generation,
+        deleted flag and payload of its state at `last`, and the cursor
+        (`None` when done). `first` and `last + 1` are reserved endpoints, or
+        `last` is the head (docs/key-index-design.md § changes)."""
+
+        levels, g_p, g_n1 = self._range(first, last)
+        if not levels:
+            return [], b"", [], b"", [], None
+        snap = self._snapshot(levels)
+        if snap is not None:  # the engine's local copies
+            return await self._changes_local(snap, after, limit, g_p, g_n1)
+        runs, codecs, bound = await self._window(levels, after, limit)
+        keys, classes, generations, deleted, payloads, last_key, more = await in_thread(
+            _native.span_changes, runs, codecs, after, bound, limit, g_p, g_n1
+        )
+        return (
+            keys,
+            classes,
+            generations,
+            deleted,
+            payloads,
+            self._cursor(len(keys), limit, last_key, after, more, bound),
+        )
+
+    async def _changes_local(self, snap, after, limit: int, g_p: int, g_n1: int, ceiling: int = 2**64 - 1):
+        try:
+            keys, classes, generations, deleted, payloads, last_key, more = await in_thread(
+                snap.changes, after, limit, g_p, g_n1, max_bytes=ceiling
+            )
+        except LimitError as e:
+            raise Full(str(e)) from e
+        return (
+            keys,
+            classes,
+            generations,
+            deleted,
+            payloads,
+            self._cursor(len(keys), limit, last_key, after, more, None),
+        )
+
+    async def changes(
+        self,
+        first: int,
+        last: int,
+        *,
+        after: bytes | None = None,
+        limit: int = 100_000,
+        keys: list[bytes] | None = None,
+        until: bytes | None = None,
+        lower: dict[bytes, tuple[int, bool]] | None = None,
+    ):
+        """`changes(first -> last)`, a page at a time: yields `Changes` pages.
+        `keys`: only those keys. `after`/`until`: keys in `(after, until)`, a
+        prefix's range. `lower`: read-ahead bounds, `{key: (generation read,
+        delivered live)}` — such a key is skipped unless it changed after it
+        was read, and then classed from what was delivered. Resume a scan by
+        passing a page's `cursor` as `after`."""
+
+        if keys is not None:
+            yield self._lowered(await self._changes_of(first, last, sorted(set(keys))), lower)
+            return
+        while True:
+            ks, cs, gs, ds, ps, cursor = await self.changes_page(first, last, after, limit)
+            page = Changes(list(ks), bytes(cs), list(gs), bytes(ds), list(ps), cursor)
+            if until is not None:
+                page = page.below(until)
+                if page.cursor is not None and page.cursor >= until:
+                    page = replace(page, cursor=None)
+            yield self._lowered(page, lower)
+            if page.cursor is None:
+                return
+            after = page.cursor
+
+    async def _changes_of(self, first: int, last: int, keys: list[bytes]) -> Changes:
+        """`changes` of named keys: in each span overlapping the range, the
+        blocks that may hold each key's versions, read whole for the keys."""
+
+        levels, g_p, g_n1 = self._range(first, last)
+        runs, codecs = await self._key_blocks(levels, keys)
+        ks, cs, gs, ds, ps, _, _ = await in_thread(
+            _native.span_changes, runs, codecs, None, None, 2**62, g_p, g_n1
+        )
+        want = set(keys)
+        picked = [i for i, k in enumerate(ks) if k in want]
+        return Changes(
+            [ks[i] for i in picked],
+            bytes(cs[i] for i in picked),
+            [gs[i] for i in picked],
+            bytes(ds[i] for i in picked),
+            [ps[i] for i in picked],
+            None,
+        )
+
+    async def _key_blocks(self, levels: list[list[FileInfo]], keys: list[bytes]):
+        """The blocks of `levels` (spans, newest first) that may hold the
+        versions of `keys`, as runs and their codecs: each file a run of its
+        own, in key order, so a key's versions still come newest first when
+        they cross from one file into the next."""
+
+        runs, codecs = [], []
+        for files in levels:
+            parsed = await asyncio.gather(*(self._open(f, filters=False) for f in files))
+            for p in parsed:
+                wanted = set()
+                for k in keys:
+                    if k < p.info.min or k > p.info.max:
+                        continue
+                    i = bisect.bisect_left(p.firsts, k)  # blocks starting below k, and those starting at it
+                    wanted.add(max(0, i - 1))
+                    while i < len(p.firsts) and p.firsts[i] == k:
+                        wanted.add(i)
+                        i += 1
+                got = await self._blocks(p, wanted)
+                runs.append([got[i] for i in sorted(wanted)])
+                codecs.append(p.tail["codec"])
+        return runs, codecs
+
+    @staticmethod
+    def _lowered(page: Changes, lower: dict[bytes, tuple[int, bool]] | None) -> Changes:
+        """The read-ahead rule (docs/key-index-design.md § changes): a key a
+        `keys=` selection delivered at generation `g` is skipped unless its
+        state at `last` is newer; then its class is relative to what was
+        delivered."""
+
+        if not lower:
+            return page
+        keep = []
+        classes = bytearray(page.classes)
+        for i, k in enumerate(page.keys):
+            read = lower.get(k)
+            if read is None:
+                keep.append(i)
+                continue
+            generation, was_live = read
+            if page.generations[i] <= generation:
+                continue  # unchanged since it was read
+            now_live = not page.deleted[i]
+            classes[i] = CLASSES[(was_live, now_live)]
+            keep.append(i)
+        return Changes(
+            [page.keys[i] for i in keep],
+            bytes(classes[i] for i in keep),
+            [page.generations[i] for i in keep],
+            bytes(page.deleted[i] for i in keep),
+            [page.payloads[i] for i in keep],
+            page.cursor,
+        )
+
+    async def pending(self, first_commit: int, last_commit: int, after: bytes | None, limit: int):
+        """The changed keys of commits `[first_commit, last_commit]` past
+        `after`, each as it is at `last_commit`: keys, generations, deleted
+        flags, payloads, and the next cursor (`None` when done). An adapter
+        over `changes_page` while consumers move to `changes`, recorded for
+        the worker like `page` and `lookup`."""
+
+        levels, g_p, g_n1 = self._range(first_commit, last_commit)
 
         async def store():
-            return await self._scan(levels, after, limit, drop_deleted=False)
+            ks, _, gs, ds, ps, cursor = await self.changes_page(first_commit, last_commit, after, limit)
+            return ks, gs, ds, ps, cursor
 
         async def local(snap, ceiling):
-            page, nxt = await _scan_local(snap, after, limit, True, ceiling)
-            return (*page.entries(), nxt), page
+            ks, _, gs, ds, ps, cursor = await self._changes_local(snap, after, limit, g_p, g_n1, ceiling)
+            return (ks, gs, ds, ps, cursor), None
 
-        args = (first_commit, last_commit, after, limit)
-        return await self._read("pending", args, levels, local, store)
+        return await self._read("pending", (first_commit, last_commit, after, limit), levels, local, store)
 
     async def pending_pages(
         self, first_commit: int, last_commit: int, after: bytes | None = None, limit=100_000
     ):
-        """Every page of `pending` from `after`, through one merge of the
-        commits' files, each read once: paging with `pending` starts that
-        merge over for every page, which far behind a long log costs the
-        whole merge per page. Yields `(keys, generations, deleted flags,
-        payloads)`. Where reads are served or the files are local copies,
-        `pending` itself pages, as recorded reads are page by page."""
+        """Every page of `pending` from `after`: `(keys, generations, deleted
+        flags, payloads)`."""
 
-        logged = dict(self.state.log)
-        missing = [b for b in range(first_commit, last_commit + 1) if b not in logged]
-        if missing:
-            raise LookupError(f"delta log no longer holds commits {missing[:5]}")
-        levels = [sorted(logged[b], key=lambda f: f.min) for b in range(last_commit, first_commit - 1, -1)]
-        if getattr(self.io, "served", None) is not None or self._snapshot(levels) is not None:
-            while True:
-                keys, generations, deleted, payloads, after = await self.pending(
-                    first_commit, last_commit, after, limit
-                )
-                yield keys, generations, deleted, payloads
-                if after is None:
-                    return
-        from .jobs import _Run
-
-        job = Merge.scan(len(levels), after=after, limit=limit)
-        readers = [_Run(self.io, self.path, files) for files in levels]
-        try:
-            while (step := await in_thread(job.step)) is not None:
-                kind, x = step
-                if kind == "run":
-                    segment = await readers[x].next()
-                    if segment is None:
-                        job.end(x)
-                    else:
-                        job.feed(x, *segment)
-                else:
-                    yield x
-        finally:
-            await asyncio.gather(*(r.close() for r in readers))
-
-    # -- compaction ------------------------------------------------------------------------
-
-    def plan_compaction(self) -> tuple[list[FileInfo], int] | None:
-        """The next compaction: input files (newest first) and the output level.
-
-        Level 0 acts once it holds `l0_max_files` files or `l0_max_bytes`. It
-        merges into level 1 — with every level-1 file it overlaps, which for
-        random keys is all of them — only once it holds a `fanout`-th of level
-        1's bytes, so each merge rewrites level 1 for at least that many new
-        bytes; until then its files merge among themselves, into one level-0
-        file. A level over its target (`level_base · fanout^(n-1)`) pushes one
-        file — the one overlapping the next level least — down, merging it with
-        the files it overlaps; the deepest level moves down whole, which
-        rewrites nothing."""
-
-        s, o = self.state, self.o
-        l0 = s.level(0)
-        size = sum(f.size for f in l0)
-        if l0 and (len(l0) >= o.l0_max_files or size >= o.l0_max_bytes):
-            l1 = s.level(1)
-            if len(l0) > 1 and size * o.fanout < sum(f.size for f in l1):
-                return l0, 0
-            lo, hi = min(f.min for f in l0), max(f.max for f in l0)
-            return l0 + [f for f in l1 if f.max >= lo and f.min <= hi], 1
-        for n in range(1, s.depth + 1):
-            files = s.level(n)
-            if not files or sum(f.size for f in files) <= o.level_base * o.fanout ** (n - 1):
-                continue
-            if n == s.depth:
-                return files, n + 1
-            below = s.level(n + 1)
-            pick = min(
-                files,
-                key=lambda f, below=below: sum(g.size for g in below if g.max >= f.min and g.min <= f.max),
+        while True:
+            keys, generations, deleted, payloads, after = await self.pending(
+                first_commit, last_commit, after, limit
             )
-            return [pick] + [g for g in below if g.max >= pick.min and g.min <= pick.max], n + 1
+            yield keys, generations, deleted, payloads
+            if after is None:
+                return
+
+    # -- merges (docs/key-index-design.md § The merge policy) -----------------------------------
+
+    def plan_merge(self, endpoints: set[int], *, lane: str = "any", busy: frozenset = frozenset()):
+        """The next merge, `(start, count)` of adjacent spans, or None. `lane`:
+        "base" plans only merges into the base, "tail" only the others; `busy`
+        names the spans `(a, b)` a merge under way holds. Every merge obeys
+        the guard; below the span cap, the read rule; past it, the cheapest
+        guarded window merges whatever the read rule says."""
+
+        sp = list(self.state.spans)
+        if lane == "base" and busy:
+            sp = sp[: next((i for i, s in enumerate(sp) if (s.a, s.b) in busy), len(sp))]
+        policy = _Policy(sp, endpoints, self.o)
+        if lane != "tail":
+            plan = policy.into_base()
+            if plan is not None or lane == "base":
+                return plan
+        free = [(s.a, s.b) not in busy for s in sp]
+        plan = policy.tail(free)
+        if plan is None and len(self.state.spans) > self.o.fan_in:
+            plan = policy.forced(free)
+        return plan
+
+    async def merge(self, plan: tuple[int, int], endpoints: set[int]) -> SpanMerged | None:
+        """Run merge `plan`: the spans it names merged into one, keeping the
+        versions the live `endpoints` see. Returns what publishing it takes,
+        or None for a span rewritten alone that would not drop a quarter of
+        its entries (its output is deleted: nothing to publish)."""
+
+        lo, count = plan
+        ins = self.state.spans[lo : lo + count]
+        a, b = ins[0].a, ins[-1].b
+        ends = sorted(e for e in endpoints if a < e <= b)
+        gens = [self.state.generation(e) for e in ends]
+        if any(g is None for g in gens):
+            raise ValueError(f"endpoints {ends} do not all start a span or a segment of {a}..{b}")
+        start = ins[0].starts[0]
+        runs = [list(s.files) for s in reversed(ins)]
+        job = Merge.spans(len(runs), endpoints=gens, base=a == 0, **self._writer())
+        stamp = ulid()
+        files = await self._run(job, runs, lambda n: f"m{a:012d}-{b:012d}-{stamp}.{n:04d}")
+        counts = job.segments
+        out = Span(a, b, (start,) + tuple(zip(ends, gens, strict=True)), tuple(files), tuple(counts))
+        written = sum(counts)
+        read = sum(s.entries for s in ins)
+        if (
+            count == 1 and written * 4 > read * 3
+        ):  # the guard's other half: drop a quarter, or publish nothing
+            await self.io.delete([self.path(f.name) for f in files])
+            return None
+        return SpanMerged(
+            [(s.a, s.b) for s in ins], [[f.name for f in s.files] for s in ins], out, read, written
+        )
+
+
+CLASSES = {(False, True): 0, (True, True): 1, (True, False): 2, (False, False): 3}
+
+
+@dataclass(frozen=True)
+class Changes:
+    """A page of `changes(P -> N)`: keys, their classes (0 added, 1 updated,
+    2 removed, 3 neither), and the generation, deleted flag and payload of
+    each one's state at N; `cursor`: where the next page starts, None at the end."""
+
+    keys: list[bytes]
+    classes: bytes
+    generations: list[int]
+    deleted: bytes
+    payloads: list
+    cursor: bytes | None
+
+    def below(self, until: bytes) -> Changes:
+        n = bisect.bisect_left(self.keys, until)
+        return Changes(
+            self.keys[:n],
+            self.classes[:n],
+            self.generations[:n],
+            self.deleted[:n],
+            self.payloads[:n],
+            self.cursor,
+        )
+
+
+@dataclass(frozen=True)
+class SpanMerged:
+    """A merge to publish: its input spans `(a, b)` and their files' names
+    (what the index must still hold), and its output; the entries it read and wrote."""
+
+    inputs: list[tuple[int, int]]
+    names: list[list[str]]
+    span: Span
+    read: int
+    written: int
+
+    def to_json(self) -> dict:
+        return {
+            "inputs": [list(r) for r in self.inputs],
+            "names": self.names,
+            "span": self.span.to_json(),
+            "read": self.read,
+            "written": self.written,
+        }
+
+
+class _Policy:
+    """The merge policy over spans (docs/key-index-design.md § The merge
+    policy): the guard (a merge's largest input holds at most `guard` times
+    the others, in entries), the two-ended read rule at every live endpoint a
+    merge would put inside its output (in bytes), the triggers — into the
+    base, four alike, stragglers — and, past the span cap, forced merges."""
+
+    def __init__(self, spans: list[Span], endpoints: set[int], o: Options):
+        self.sp, self.live, self.o = spans, endpoints, o
+        self.entries = [max(s.entries, 1) for s in spans]
+
+    def guarded(self, lo: int, count: int) -> bool:
+        w = self.entries[lo : lo + count]
+        return count == 1 or max(w) <= self.o.guard * (sum(w) - max(w))
+
+    def segments(self, lo: int, count: int) -> list[tuple[int, float]]:
+        """The output's segments, `(start, bytes)`: the inputs' segments, those
+        whose dividing endpoint is gone joined (sizes summed: an upper bound)."""
+
+        out: list[list] = []
+        for s in self.sp[lo : lo + count]:
+            per = s.size / max(s.entries, 1)
+            counts = s.counts or (s.entries,)
+            for (c, _), n in zip(s.starts, counts, strict=False):
+                if out and c not in self.live:
+                    out[-1][1] += n * per
+                else:
+                    out.append([c, n * per])
+        return [(c, b) for c, b in out]
+
+    def readable(self, lo: int, count: int) -> bool:
+        segs = self.segments(lo, count)
+        total = sum(b for _, b in segs)
+        before = 0.0
+        for c, b in segs:
+            if before > 0 and c in self.live:
+                after = total - before
+                if before > max(self.o.read_ratio * after, self.o.read_slack):
+                    return False
+                if after > max(self.o.read_ratio * before, self.o.read_slack):
+                    return False
+            before += b
+        return True
+
+    def allowed(self, lo: int, count: int) -> bool:
+        return self.guarded(lo, count) and self.readable(lo, count)
+
+    def into_base(self):
+        if len(self.sp) < 2 or self.sp[0].a != 0:
+            return None
+        base = self.entries[0]
+        need = base / self.o.base_ratio
+        acc, j0 = 0, None
+        for j in range(1, len(self.sp)):
+            acc += self.entries[j]
+            if acc >= need:
+                j0 = j
+                break
+        if j0 is None:
+            return None
+        ends = [len(self.sp) - 1] + [
+            j - 1
+            for j in range(len(self.sp) - 1, 0, -1)
+            if any(self.sp[j].a <= e <= self.sp[j].b for e in self.live)
+        ]
+        for j in ends:
+            if j >= j0 and self.allowed(0, j + 1):
+                return 0, j + 1
         return None
 
-    async def compact(self, plan=None) -> tuple[list[FileInfo], list[str]] | None:
-        """Run one compaction; returns the added files and removed names for
-        `IndexState.compacted`. The objects its merge drops are listed by the
-        deltas' predecessors already (exact writes). Its inputs are read from
-        the `io`'s local copies when they hold them."""
+    def tail(self, free: list[bool]):
+        sp, w = self.sp, self.o.window
 
-        plan = plan or self.plan_compaction()
-        if plan is None:
-            return None
-        inputs, out_level = plan
-        if out_level > self.state.depth and out_level > 1:
-            # The deepest level moves down whole: nothing below it to merge with, and
-            # its files never overlap. Level-0 files do, so level 0 is always merged.
-            return [replace(f, level=out_level) for f in inputs], [f.name for f in inputs]
-        drop = out_level >= self.state.depth  # nothing older below: tombstones can go
-        # Runs, newest first: each level-0 file alone, a deeper level's files together.
-        runs = []
-        for lv, group in itertools.groupby(inputs, lambda f: f.level):
-            group = list(group)
-            runs += [[f] for f in group] if lv == 0 else [group]
-        job = Merge.compact(len(runs), drop_deleted=drop, **self._writer())
-        # A level-0 file is as recent as its newest input: level 0 orders by name, and delta
-        # names start with their commit.
-        stamp = ulid() if out_level else f"{inputs[0].name.split('-', 1)[0]}-c{ulid()}"
-        added = await self._run(
-            job, runs, lambda n: f"c{stamp}-{n:04d}" if out_level else f"{stamp}.{n:04d}", out_level
-        )
-        return added, [f.name for f in inputs]
+        def ok(lo, count):
+            return all(free[lo : lo + count]) and self.allowed(lo, count)
+
+        for j in range(len(sp) - w, 0, -1):  # never the base
+            win = self.entries[j : j + w]
+            if max(win) <= sum(win) - max(win) and ok(j, w):
+                return j, w
+        for j in range(1, len(sp) - 1):  # a straggler: smaller than its newer neighbour
+            if self.entries[j] < self.entries[j + 1]:
+                for count in range(2, w + 1):
+                    for lo in range(max(1, j + 2 - count), min(j, len(sp) - count) + 1):
+                        if ok(lo, count):
+                            return lo, count
+        for j in range(1, len(sp)):  # versions no live endpoint sees any more
+            s = sp[j]
+            if free[j] and any(c not in self.live for c, _ in s.starts[1:]):
+                dead = sum(
+                    n
+                    for (c, _), n in zip(s.starts[1:], (s.counts or ())[1:], strict=False)
+                    if c not in self.live
+                )
+                if dead * 4 >= s.entries * self.o.stale * 4:
+                    return j, 1
+        return None
+
+    def forced(self, free: list[bool]):
+        best = None
+        for count in (2, 3, 4):
+            for lo in range(1, len(self.sp) - count + 1):
+                if all(free[lo : lo + count]) and self.guarded(lo, count):
+                    cost = sum(self.entries[lo : lo + count])
+                    if best is None or cost < best[0]:
+                        best = (cost, lo, count)
+        return None if best is None else (best[1], best[2])

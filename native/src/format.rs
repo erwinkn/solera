@@ -458,21 +458,18 @@ pub fn lookup(blocks: &[&[u8]], codec: u8, keys: &[&[u8]]) -> Result<Found> {
         .collect::<Result<_>>()?;
     let mut out: Found = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     for key in keys {
-        // The last block whose first key is <= key, then the key within it.
-        let b = blocks.partition_point(|b| !b.is_empty() && b.key(0) <= *key);
-        let hit = b.checked_sub(1).and_then(|b| {
-            let blk = &blocks[b];
-            let (mut lo, mut hi) = (0, blk.len());
-            while lo < hi {
-                let mid = (lo + hi) / 2;
-                match blk.key(mid).cmp(key) {
-                    std::cmp::Ordering::Less => lo = mid + 1,
-                    std::cmp::Ordering::Equal => return Some((blk, mid)),
-                    std::cmp::Ordering::Greater => hi = mid,
-                }
-            }
-            None
-        });
+        // The key's first entry (its newest version, in a span's file): in the
+        // last block starting below it, or the next if that starts with it.
+        let b = blocks.partition_point(|b| !b.is_empty() && b.key(0) < *key);
+        let hit = b
+            .checked_sub(1)
+            .into_iter()
+            .chain((b < blocks.len()).then_some(b))
+            .find_map(|b| {
+                let blk = &blocks[b];
+                let i = blk.lower_bound(key);
+                (i < blk.len() && blk.key(i) == *key).then_some((blk, i))
+            });
         match hit {
             Some((blk, j)) => {
                 out.0.push(1);
@@ -566,11 +563,12 @@ pub fn merge_page(
     bound: Option<&[u8]>,
     limit: usize,
     drop_deleted: bool,
+    below: u64,
 ) -> Result<Page> {
     if codecs.len() != runs.len() {
         return Err(Error::Value("a codec per run".into()));
     }
-    let mut m = Merge::new(runs.len());
+    let mut m = Merge::below(runs.len(), below);
     for ((r, blocks), &codec) in runs.iter().enumerate().zip(codecs) {
         let mut data = Vec::new();
         let mut metas = Vec::new();

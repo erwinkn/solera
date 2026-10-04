@@ -189,6 +189,21 @@ impl Block {
         &self.keys[e.key as usize..(e.key + e.key_len) as usize]
     }
 
+    /// The first entry whose key is not below `key`: where a key's run of
+    /// entries starts (a span's file may hold it several times).
+    pub fn lower_bound(&self, key: &[u8]) -> usize {
+        let (mut lo, mut hi) = (0, self.len());
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            if self.key(mid) < key {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        lo
+    }
+
     #[inline]
     pub fn generation(&self, i: usize) -> u64 {
         self.ents[i].generation
@@ -305,6 +320,18 @@ impl Stream {
     fn block(&self) -> &Block {
         &self.ready[0]
     }
+
+    /// The entry the stream is at, once `state` is `Ready`: its block and position.
+    #[inline]
+    pub(crate) fn current(&self) -> (&Block, usize) {
+        (&self.ready[0], self.pos)
+    }
+
+    /// Moves past the current entry.
+    #[inline]
+    pub(crate) fn advance(&mut self) {
+        self.pos += 1;
+    }
 }
 
 // -- the merged view ------------------------------------------------------------------
@@ -317,23 +344,36 @@ pub enum Next {
 }
 
 /// The newest-wins merge of runs, newest first: for each key, the entry of
-/// the lowest-numbered run holding it.
+/// the lowest-numbered run holding it. A span may hold a key several times,
+/// newest first (docs/key-index-design.md): a run's first entry of a key is
+/// its newest, and the rest are passed over. With `below`, entries at or past
+/// that generation are passed over too: the view at a reserved endpoint.
 pub struct Merge {
     pub runs: Vec<Stream>,
     heap: Vec<usize>,
     pending: Vec<usize>,
     cur: (usize, usize),
-    shadowed: Vec<(usize, usize)>,
+    /// The key last returned: a run's further entries of it are older versions.
+    prev: Vec<u8>,
+    started: bool,
+    below: u64,
 }
 
 impl Merge {
     pub fn new(runs: usize) -> Merge {
+        Merge::below(runs, u64::MAX)
+    }
+
+    /// The merge as of a reserved endpoint: each key's newest entry older than `below`.
+    pub fn below(runs: usize, below: u64) -> Merge {
         Merge {
             runs: (0..runs).map(|_| Stream::default()).collect(),
             heap: Vec::with_capacity(runs),
             pending: (0..runs).rev().collect(),
             cur: (usize::MAX, 0),
-            shadowed: Vec::new(),
+            prev: Vec::new(),
+            started: false,
+            below,
         }
     }
 
@@ -392,6 +432,14 @@ impl Merge {
         while let Some(&r) = self.pending.last() {
             match self.runs[r].state()? {
                 State::Ready => {
+                    let run = &self.runs[r];
+                    let (b, i) = (run.block(), run.pos);
+                    if (self.started && b.key(i) == self.prev.as_slice())
+                        || !crate::spans::older(b.generation(i), self.below)
+                    {
+                        self.runs[r].pos += 1; // an older version, or one past the endpoint
+                        continue;
+                    }
                     self.pending.pop();
                     self.push(r);
                 }
@@ -408,15 +456,17 @@ impl Merge {
         self.cur = (r, self.runs[r].pos);
         self.runs[r].pos += 1;
         self.pending.push(r);
-        // Older entries for the same key are shadowed.
-        self.shadowed.clear();
+        self.prev.clear();
+        self.prev
+            .extend_from_slice(self.runs[r].block().key(self.cur.1));
+        self.started = true;
+        // Older entries of the same key, in other runs: passed over.
         while let Some(&o) = self.heap.first() {
             let run = &self.runs[o];
-            if run.block().key(run.pos) != self.key() {
+            if run.block().key(run.pos) != self.prev.as_slice() {
                 break;
             }
             self.pop();
-            self.shadowed.push((o, self.runs[o].pos));
             self.runs[o].pos += 1;
             self.pending.push(o);
         }
@@ -441,15 +491,6 @@ impl Merge {
     #[inline]
     pub fn payload(&self) -> Option<&[u8]> {
         self.runs[self.cur.0].block().payload(self.cur.1)
-    }
-
-    /// The older entries of the current key the merge passed over, newest
-    /// first: `(deleted, generation)`. Readable until the next call.
-    pub fn shadowed(&self) -> impl Iterator<Item = (bool, u64)> + '_ {
-        self.shadowed.iter().map(|&(r, i)| {
-            let b = self.runs[r].block();
-            (b.deleted(i), b.generation(i))
-        })
     }
 }
 
@@ -602,9 +643,18 @@ pub struct Writer {
     pub entries: u64,
     /// The current block's keys, expanded: what decoding it materializes beside its bytes.
     block_keys: u64,
+    /// A span's files (docs/key-index-design.md): a key may repeat, newest version first.
+    repeats: bool,
+    prev_generation: u64,
 }
 
 impl Writer {
+    /// A writer for a span: a key may repeat, its generations strictly decreasing.
+    pub fn repeating(mut self) -> Writer {
+        self.repeats = true;
+        self
+    }
+
     pub fn new(o: Options, max_file_bytes: usize) -> Writer {
         Writer {
             o,
@@ -619,6 +669,8 @@ impl Writer {
             files: VecDeque::new(),
             entries: 0,
             block_keys: 0,
+            repeats: false,
+            prev_generation: 0,
         }
     }
 
@@ -630,13 +682,25 @@ impl Writer {
         payload: Option<&[u8]>,
         predecessor: Option<u64>,
     ) -> Result<()> {
-        if self.started && key <= self.prev.as_slice() {
+        let out_of_order = if self.repeats {
+            key < self.prev.as_slice()
+                || (key == self.prev.as_slice() && generation >= self.prev_generation)
+        } else {
+            key <= self.prev.as_slice()
+        };
+        if self.started && out_of_order {
             return Err(Error::Value(format!(
-                "keys must be strictly increasing: {:?} then {:?}",
+                "keys must be strictly increasing{}: {:?} then {:?}",
+                if self.repeats {
+                    " (a repeated key's generations decreasing)"
+                } else {
+                    ""
+                },
                 String::from_utf8_lossy(&self.prev),
                 String::from_utf8_lossy(key)
             )));
         }
+        self.prev_generation = generation;
         // A block closes before an entry would push what it decodes to past
         // the bound (its key unshared, at most 32 bytes of lengths and
         // flags): only an entry past it alone is refused.

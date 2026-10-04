@@ -47,7 +47,7 @@ async def key_index_probe(objects):
     state = IndexState(prefix="conformance/keys/")
     index = KeyIndex(io, None, state)
     files, _ = await index.replace(Rows.keys([b"b", b"a"], b"1"), 0, uuid.uuid4().hex, generation=7)
-    state = state.committed(0, files, keep_log=True)
+    state = state.committed(0, files)
     try:
         index = KeyIndex(io, None, state)
         keys, generations, versions, _ = await index.page(None, 10)

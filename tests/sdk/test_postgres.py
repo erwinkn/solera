@@ -447,7 +447,7 @@ async def test_reconciliation_streams_the_slice_s_keys(store, monkeypatch):
     files, _ = await KeyIndex(io, None, state).replace(
         prepare_for(store, rows + [{"id": "f", "x": 6}], out).rows, 0, "w1", generation=1
     )
-    state = state.committed(0, files, keep_log=True)
+    state = state.committed(0, files)
 
     async def no_load(*args, **kwargs):
         raise AssertionError("reconciliation reads keys, never values")
@@ -873,7 +873,7 @@ async def test_a_repair_read_back_waits_off_the_event_loop(store, monkeypatch):
     io = ObjectIO(MemoryStore())
     state = IndexState(prefix="keys/")
     files, _ = await KeyIndex(io, None, state).replace(prepare_for(store, rows, out).rows, 0, "w1")
-    state = state.committed(0, files, keep_log=True)
+    state = state.committed(0, files)
     keys = store.keys
 
     def slow(ref, among=None):

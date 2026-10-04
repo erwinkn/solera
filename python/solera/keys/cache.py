@@ -20,9 +20,9 @@ Budgets:
   evicted oldest first.
 
 Admission is by index, with hysteresis: an index is admitted when its
-snapshot, plus a compaction's overlap, fits beside the indexes active in
+snapshot, plus a merge's output, fits beside the indexes active in
 the last `window` seconds; eviction takes retired files (inputs of a
-published compaction), then files of inactive or demoted indexes, never
+published merge), then files of inactive or demoted indexes, never
 open files or an active index's. A file's local size is estimated from
 its source until one is built; from then on the size it built to counts,
 so an index shown not to fit is not fetched again until room changes.
@@ -65,7 +65,7 @@ class _File:
     source_size: int
     digest: str  # of the source, hex
     readers: int = 0  # open for reading: not evicted
-    retired: bool = False  # a published compaction let go of it
+    retired: bool = False  # a published merge let go of it
 
 
 @dataclass
@@ -114,10 +114,6 @@ class _Candidates(OrderedDict):
     def clear(self):
         super().clear()
         self.bytes = 0
-
-
-def _logged(state: IndexState) -> list[FileInfo]:
-    return [f for _, files in state.log for f in files]
 
 
 class Corrupt(Exception):
@@ -285,7 +281,7 @@ class EngineCache:
 
     def admit(self, state: IndexState) -> bool:
         """Whether this index may be cached: admitted before, or its snapshot plus
-        one compaction's overlap (its largest level) fits beside the active indexes."""
+        one merge's output (its largest span) fits beside the active indexes."""
 
         now = self.clock()
         ix = self.indexes.setdefault(state.prefix, _Index())
@@ -303,15 +299,10 @@ class EngineCache:
         return ix.admitted
 
     def need(self, state: IndexState) -> int:
-        """Room an index needs: its snapshot and its logged deltas, and one
-        compaction's overlap (its largest level)."""
+        """Room an index needs: its spans, and one merge's output (its largest span)."""
 
-        levels: dict[int, int] = {}
-        for f in state.files:
-            levels[f.level] = levels.get(f.level, 0) + self._estimate(state.path(f.name), f)
-        held = {f.name for f in state.files}
-        logged = sum(self._estimate(state.path(f.name), f) for f in _logged(state) if f.name not in held)
-        return sum(levels.values()) + logged + max(levels.values(), default=0)
+        spans = [sum(self._estimate(state.path(f.name), f) for f in s.files) for s in state.spans]
+        return sum(spans) + max(spans, default=0)
 
     def demote(self, prefix: str) -> None:
         ix = self.indexes.get(prefix)
@@ -322,7 +313,7 @@ class EngineCache:
         return all(self._present(state.path(f.name), f) is not None for f in state.files)
 
     def retire(self, paths: list[str]) -> None:
-        """A published compaction let go of these files: no new snapshot reads
+        """A published merge let go of these files: no new snapshot reads
         them. They go as soon as no reader holds them."""
 
         for path in paths:
@@ -341,7 +332,7 @@ class EngineCache:
 
         self.admit(state)  # a read: the index is active, and a recovered one is admitted again
         now, files = self.clock(), []
-        for f in {**{f.name: f for f in _logged(state)}, **{f.name: f for f in state.files}}.values():
+        for f in {f.name: f for f in state.files}.values():
             local = self._present(state.path(f.name), f)
             if local is not None:
                 local.readers += 1
@@ -357,9 +348,9 @@ class EngineCache:
         self.admit(state)  # a read: the index is active, and a recovered one is admitted again
         now = self.clock()
         held, runs = [], []
-        for level in state.newest_first():
+        for span in state.newest_first():
             run = []
-            for f in level:
+            for f in span:
                 local = self.files[state.path(f.name)]
                 local.readers += 1
                 local.used = now
@@ -377,7 +368,7 @@ class EngineCache:
 
         if not self.admit(state):
             return False
-        wanted = {**{f.name: f for f in _logged(state)}, **{f.name: f for f in state.files}}
+        wanted = {f.name: f for f in state.files}
         missing = [f for f in wanted.values() if self._present(state.path(f.name), f) is None]
         await asyncio.gather(*(self._fill_one(io, state.prefix, state.path(f.name), f) for f in missing))
         return self.warm(state)
@@ -442,7 +433,7 @@ class EngineCache:
         return True
 
     async def install(self, prefix: str, f: FileInfo, path: str, data: bytes) -> bool:
-        """Write-through: a file the engine wrote or holds — a compaction output,
+        """Write-through: a file the engine wrote or holds — a merge output,
         a committed delta — into the cache of an admitted index, once verified
         against `f`. False when it could not reserve the room: the index is
         then demoted."""

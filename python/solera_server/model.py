@@ -28,9 +28,10 @@ from __future__ import annotations
 
 import contextlib
 import copy
+import dataclasses
 import math
 
-from solera.keys.index import DeltaFiles, FileInfo, IndexState, index_prefix
+from solera.keys.index import DeltaFiles, IndexState, Span, index_prefix
 
 from . import history
 from .lake import LakeState
@@ -130,6 +131,14 @@ def commit_of(head: dict | None) -> tuple | None:
         head.get("commit_number"),
         head.get("n"),
     )
+
+
+def _delta(keys: dict, generation: int | None) -> DeltaFiles:
+    """A commit's delta, its span starting at `generation`, the one its
+    writes carried, when its head records it."""
+
+    delta = DeltaFiles.from_json(keys)
+    return delta if generation is None else dataclasses.replace(delta, generation=int(generation))
 
 
 def _delta_files(entries) -> frozenset[str]:
@@ -236,8 +245,6 @@ class Model:
     def _reindex(self) -> None:
         """Rebuild the derived indexes from the durable runs and the manifest."""
 
-        self._consumed = self._consumed_outputs(self.manifest)
-
         self.task_run: dict[str, str] = {}
         self.queue: dict[str, float] = {}
         self.pending: dict[tuple, set] = {}
@@ -293,18 +300,6 @@ class Model:
         self.run_left.pop(run_id, None)
         self.archivable.discard(run_id)
 
-    @staticmethod
-    def _consumed_outputs(manifest) -> set[str]:
-        """Outputs some asset reads through an Incremental input: only their
-        indexes keep a delta log (§6)."""
-
-        return {
-            input["output"]
-            for asset in ((manifest or {}).get("assets") or {}).values()
-            for input in asset["inputs"].values()
-            if input["kind"] == "incremental"
-        }
-
     # -- reads ---------------------------------------------------------------------------
 
     def task(self, task_id: str) -> dict | None:
@@ -321,7 +316,34 @@ class Model:
         """The output's key index, or an empty one where a new index would go."""
 
         found = self.indexes.get((output, partition))
-        return found if found is not None else IndexState(prefix=index_prefix(output, partition))
+        if found is not None:
+            return found
+        return IndexState(prefix=index_prefix(output, partition), life=str(self.event_counter))
+
+    def endpoints(self, output: str, partition: str) -> set[int]:
+        """The commits of an index that readers start from or land at, which
+        its merges keep (docs/key-index-design.md § Endpoints): every
+        position's `next`, a pass's `from` and its `to + 1`, a pattern change's
+        split + 1, and what attempts in flight read, `first` and `end`."""
+
+        out: set[int] = set()
+        for position in self.positions():
+            if (position["output"], position["upstream_partition"]) != (output, partition):
+                continue
+            out.add(int(position["next"]))
+            d = position.get("pass")
+            if d is not None:
+                if d.get("from") is not None:
+                    out.add(int(d["from"]))
+                if d.get("to") is not None:
+                    out.add(int(d["to"]) + 1)
+            if position.get("pattern_change") is not None:
+                out.add(int(position["pattern_change"]["at"]) + 1)
+        for claim in self.claims.values():
+            for read in claim.get("reads") or ():
+                if (read[0], read[1]) == (output, partition):
+                    out.update(int(x) for x in read[2:])
+        return out
 
     def heads_of(self, output: str) -> list[tuple[str, dict]]:
         return sorted(self.heads.of(output).items())
@@ -543,7 +565,6 @@ class Model:
         assets_before = set((self.manifest or {}).get("assets") or ())
         declared_before = {a: _declared(self.manifest, a) for a in assets_before}
         self.deploy, self.manifest, self.project = e["deploy"], manifest, e.get("project")
-        self._consumed = self._consumed_outputs(manifest)
         renamed, output_map = self._apply_aliases(manifest)
         self._reconcile_tasks(manifest, renamed, output_map, e["at"])
         carried = {old for olds in renamed.values() for old in olds}  # by an alias: not removed
@@ -860,8 +881,9 @@ class Model:
 
     def _on_TasksHeld(self, e):
         """Why tasks ready to run are not claimed (`[reason, name]`): the
-        engine is full, their executor is, or another attempt holds their
-        partition. Only a change of reason is an event."""
+        engine is full, their executor is, another attempt holds their
+        partition, or an output's merges are far behind. Only a change of
+        reason is an event."""
 
         for tid, held in sorted(e["held"].items()):
             task = self.task(tid)
@@ -1081,7 +1103,7 @@ class Model:
             if contracts[name]["contract"]["writes"] == "immutable":
                 self._superseded(name, partition, before, head, keys, prefix)
             self.heads[(name, partition)] = {**head, "run": e["run"], "attempt": e["attempt"], "at": at}
-            self._commit_keys(name, partition, keys, prefix)
+            self._commit_keys(name, partition, keys, prefix, head["ref"].get("generation"))
             if name in commit.get("repaired", ()):
                 # The commit's delta took in what the dead attempts left (§8):
                 # their intent files are no longer needed.
@@ -1147,9 +1169,7 @@ class Model:
         keys = f.get("keys") or {}
         if keys.get("files"):
             name = f"@{asset}"
-            index = self.index(name, partition).committed(
-                f["commit_number"], DeltaFiles.from_json(keys), keep_log=False
-            )
+            index = self.index(name, partition).committed(f["commit_number"], DeltaFiles.from_json(keys))
             self.indexes[(name, partition)] = index
             record["commit_number"] = f["commit_number"]
         for field in ("counts", "due", "deploy_min", "retry", "passes", "done_forced", "last", "config"):
@@ -1271,20 +1291,23 @@ class Model:
         else:
             run["status"] = "running"
 
-    def _commit_keys(self, output: str, partition: str, keys: dict | None, prefix: str | None) -> None:
-        """Add a commit's delta files to the output's key index (§6): into the
-        levels, and into the delta log if anything reads it incrementally.
-        An output's first index starts where its attempt wrote them, `prefix`
-        — under the name it launched with, when a rename came since. The head
-        carries the index's live key count."""
+    def _commit_keys(
+        self, output: str, partition: str, keys: dict | None, prefix: str | None, generation: int | None
+    ) -> None:
+        """Add a commit's delta files to the output's key index (§6), as its
+        span, which starts at the generation its writes carried: even an
+        empty one, so the spans keep no holes. An output's first index starts
+        where its attempt wrote them, `prefix` — under the name it launched
+        with, when a rename came since. The head carries the index's live key
+        count."""
 
         if keys is not None:
-            index, delta = self.index(output, partition), DeltaFiles.from_json(keys)
+            index = self.index(output, partition)
             if (output, partition) not in self.indexes and prefix is not None:
-                index = IndexState(prefix=prefix)
-            if keys["files"]:
-                index = index.committed(keys["commit_number"], delta, keep_log=output in self._consumed)
-            self.indexes[(output, partition)] = index
+                index = IndexState(prefix=prefix, life=str(self.event_counter))
+            self.indexes[(output, partition)] = index.committed(
+                keys["commit_number"], _delta(keys, generation)
+            )
         index = self.indexes.get((output, partition))
         if index is not None:
             self.heads[(output, partition)]["count"] = index.count
@@ -1408,17 +1431,19 @@ class Model:
         for name in sorted(before.referenced() - index.referenced()):
             self.garbage.append([before.path(name), self.event_counter])
 
-    def _on_IndexCompacted(self, e):
-        key = (e["output"], e["partition"])
-        if key not in self.indexes:
-            return
-        index = self.indexes[key].compacted([FileInfo.from_json(f) for f in e["added"]], e["removed"])
-        self._replace_index(key, index)
+    def _on_IndexMerged(self, e):
+        """A merge of adjacent spans published: installed if the index is the
+        life it was planned against and still holds exactly its inputs; else
+        refused, its output let go of (docs/key-index-design.md § Lifecycles)."""
 
-    def _on_IndexTruncated(self, e):
         key = (e["output"], e["partition"])
-        if key in self.indexes:
-            self._replace_index(key, self.indexes[key].truncated(e["below"]))
+        span = Span.from_json(e["span"])
+        index = self.indexes.get(key)
+        if index is None or index.life != e["life"] or not index.holds(e["inputs"], e["names"]):
+            prefix = e.get("prefix") or (index.prefix if index is not None else "")
+            self.garbage.extend([f"{prefix}{f.name}.kx", self.event_counter] for f in span.files)
+            return
+        self._replace_index(key, index.merged([tuple(r) for r in e["inputs"]], span))
 
     def _on_FilesCleanedUp(self, e):
         gone = set(e["paths"])
@@ -1428,7 +1453,7 @@ class Model:
         before = self.heads.get((e["source"], ""))
         head = e["head"]
         self.heads[(e["source"], "")] = {**head, "at": e["at"], "n": self.event_counter}
-        self._commit_keys(e["source"], "", e.get("keys"), None)
+        self._commit_keys(e["source"], "", e.get("keys"), None, head["ref"].get("generation"))
         run = e.get("run")
         if run is not None:
             self._record("runs", history.source_run_row(run, e["at"]))

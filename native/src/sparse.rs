@@ -110,10 +110,14 @@ impl Sparse {
         }
     }
 
-    /// The block each target lies in, by the file's blocks' first keys.
-    fn block_of(firsts: &[&[u8]], key: &[u8]) -> Option<usize> {
-        let i = firsts.partition_point(|f| *f <= key);
-        i.checked_sub(1)
+    /// The blocks a key's newest entry may lie in, by the file's blocks'
+    /// first keys: the last one starting below it, and — a span's file may
+    /// hold a key several times, its versions crossing into the next block —
+    /// the next, if it starts with the key.
+    fn blocks_of(firsts: &[&[u8]], key: &[u8]) -> impl Iterator<Item = usize> {
+        let i = firsts.partition_point(|f| *f < key);
+        let next = (i < firsts.len() && firsts[i] == key).then_some(i);
+        i.checked_sub(1).into_iter().chain(next)
     }
 
     /// The blocks a read of one file needs (see `targets`), ascending.
@@ -127,7 +131,7 @@ impl Sparse {
         let mut out: Vec<usize> = self
             .targets(file, lo, hi)
             .iter()
-            .filter_map(|&p| Sparse::block_of(firsts, self.sorted.key(p as usize)))
+            .flat_map(|&p| Sparse::blocks_of(firsts, self.sorted.key(p as usize)))
             .collect();
         out.dedup();
         out
@@ -147,34 +151,28 @@ impl Sparse {
     ) -> Result<()> {
         let targets = self.targets(file, lo, hi);
         let fetched: BTreeMap<usize, &[u8]> = blocks.iter().copied().collect();
-        // Targets come in key order, so blocks in file order: one decoded at a time.
-        let mut current: Option<(usize, Block)> = None;
+        // Targets come in key order, so blocks in file order: few decoded at a time.
+        let mut decoded: BTreeMap<usize, Block> = BTreeMap::new();
         for p in targets {
             let key = self.sorted.key(p as usize);
-            let Some(b) = Sparse::block_of(firsts, key) else {
-                continue;
-            };
-            let Some(&raw) = fetched.get(&b) else {
-                continue; // not fetched: not this read's
-            };
-            if current.as_ref().is_none_or(|(i, _)| *i != b) {
-                current = Some((b, Block::decode(raw, codec)?));
-            }
-            let blk = &current.as_ref().expect("just decoded").1;
-            let (mut l, mut h) = (0, blk.len());
-            while l < h {
-                let mid = (l + h) / 2;
-                match blk.key(mid).cmp(key) {
-                    std::cmp::Ordering::Less => l = mid + 1,
-                    std::cmp::Ordering::Greater => h = mid,
-                    std::cmp::Ordering::Equal => {
-                        self.known[p as usize] = if blk.deleted(mid) {
-                            Known::Absent
-                        } else {
-                            Known::Live(blk.generation(mid), blk.payload(mid).map(<[u8]>::to_vec))
-                        };
-                        break;
-                    }
+            for b in Sparse::blocks_of(firsts, key) {
+                let Some(&raw) = fetched.get(&b) else {
+                    continue; // not fetched: not this read's
+                };
+                if !decoded.contains_key(&b) {
+                    decoded.retain(|&i, _| i + 1 >= b); // earlier blocks are done with
+                    decoded.insert(b, Block::decode(raw, codec)?);
+                }
+                let blk = &decoded[&b];
+                // The key's first entry: its newest version.
+                let i = blk.lower_bound(key);
+                if i < blk.len() && blk.key(i) == key {
+                    self.known[p as usize] = if blk.deleted(i) {
+                        Known::Absent
+                    } else {
+                        Known::Live(blk.generation(i), blk.payload(i).map(<[u8]>::to_vec))
+                    };
+                    break;
                 }
             }
         }

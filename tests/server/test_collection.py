@@ -132,7 +132,7 @@ async def test_compaction_leaves_nothing_uncollected(tmp_path, data):
 
     project = Project(assets=[items, mirror])
     state = await State.open(tmp_path.as_uri(), "test", flush_interval=0.001)
-    engine = engine_for(state, project, key_options=Options(l0_max_files=3))
+    engine = engine_for(state, project, key_options=Options(window=2))
     await engine.initialize()
     compacted = 0
     for step in range(24):
@@ -140,13 +140,12 @@ async def test_compaction_leaves_nothing_uncollected(tmp_path, data):
         await run(engine, ["items"])
         if step % 6 == 5:
             await run(engine, ["mirror"])
-        engine.upkeep.truncate()
         engine.upkeep.maintain()
         for job in list(engine.upkeep.jobs.values()):
             await job
         files = state.model.indexes[("items", "")].files
-        compacted += any(f.name.startswith("c") or "-c" in f.name for f in files)  # compaction outputs
-    assert compacted, "no compaction ran"
+        compacted += any(f.name.startswith("m") for f in files)  # merge outputs
+    assert compacted, "no merge ran"
     pending["rows"] = {}
     for _ in range(4):  # unchanged runs: each collects what is due
         await run(engine, ["items"])

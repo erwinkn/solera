@@ -2,7 +2,7 @@
 over an explicit position — a pass keeps its mode, boundary and batch
 plan until its last batch, then `next` moves past it."""
 
-from solera_server.positions import advance, continues, needs, pins
+from solera_server.positions import advance, continues, pins
 
 CARRIED = {"output": "log", "upstream_partition": "", "fingerprint": "f", "reset_by": "r1"}
 
@@ -29,13 +29,12 @@ def test_a_keyed_pass_goes_by_key_then_moves_next():
     plan = {"kind": "keys", "position": wm0, "pass": full}
     position = advance(plan, "k9")
     assert position == {**wm0, "pass": {**full, "at": "k9", "batch": 1}} and continues(plan, "k9", position)
-    assert needs(position) == 8  # a full pass resumes as deltas from its `from`
     done = advance({**plan, "pass": position["pass"]}, None)
     assert done == {**wm0, "next": 8, "reconcile": {"after": None}}  # a per-key cleanup owed
 
     delta = {"mode": "delta", "from": 5, "to": 7, "at": None, "batch": 0, "batches": 2, "pin": 40}
     paged = advance({"kind": "keys", "position": wm0, "pass": delta}, "k1")
-    assert paged["pass"]["at"] == "k1" and pins(paged) == [40] and needs(paged) == 5
+    assert paged["pass"]["at"] == "k1" and pins(paged) == [40]
     assert advance({"kind": "keys", "position": wm0, "pass": delta}, None) == {**wm0, "next": 8}
 
 
