@@ -1,0 +1,14 @@
+SOURCE dcfc0692be17731c8586a48e44fa251e6fa0828d
+FALSE_NEGATIVE '?' 'aa' 'ca' match 'b'
+FALSE_NEGATIVE 'a' 'a' 'ab' match 'a'
+FALSE_NEGATIVE 'tenant/**' 'tenant/a/x' 'tenant/a/z' match 'tenant/a/y'
+FALSE_NEGATIVE '**' 'a/b' 'a/d' match 'a/c'
+K_RUNS sampled 10.5 19 exhaustive 13.000015258789062 25 worst_head 65534
+T_STORAGE head 8639 floor 0 retained_entries 50530435 reported_day_entries 51606853 ratio 0.979
+T_STORAGE head 32767 floor 0 retained_entries 225948202 reported_day_entries 51606853 ratio 4.378
+T_STORAGE head 65534 floor 0 retained_entries 431412513 reported_day_entries 51606853 ratio 8.36
+ALGEBRA_PASS 122472 one-key histories/ranges/covers; classes, presence, live generations/payloads; empty commits
+READ_AHEAD_COUNTEREXAMPLES N=4 r=5: add-at-5 is removed by K@4; remove-at-5 is re-added by K@4
+RETENTION_COUNTEREXAMPLE readers start at 4 and 16, old pass N=7: compact [4,15] has identical before/after for histories with different state at 7
+LIFE_COUNTEREXAMPLE epoch=7 reset/feed commits 0..3: old GC deletes new-life pack keys/feed/_/t1-000000000000-e7.kx
+LIMITS design traces are not an engine/S3 concurrency test; tombstone generation identity is not normalized by this oracle
