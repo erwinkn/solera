@@ -532,11 +532,14 @@ async def test_an_aborted_worker_writes_nothing(tmp_path):
     await engine.initialize()
     for name in ("slow", "quick"):
         run, attempt = await launched(engine, [name])
-        worker = asyncio.create_task(run_attempt(state.objects_url, attempt, project, run=run["id"]))
+        work = run_attempt(state.objects_url, attempt, project, run=run["id"])
         if name == "slow":  # ended while it computes
+            worker = asyncio.create_task(work)
             await until(engine, lambda w=worker, a=attempt: w.done() or engine.live[a].worker_id is not None)
             await asyncio.sleep(0.1)
         assert (await engine._end(run["id"], attempt))["write"] == "none"
+        if name == "quick":  # boots after the end
+            worker = asyncio.create_task(work)
         assert await asyncio.wait_for(worker, 60) == ENDED
         assert await state.attempt_result(run["id"], attempt) is None
         assert await fence(state, run["id"], attempt) == ("ended", "none")
