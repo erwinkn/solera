@@ -25,6 +25,14 @@ READS = {1: MONTH, 360: 720, 8640: 30}
 
 
 def load() -> dict[str, dict]:
+    """Each build's last JSON line; its reads replaced by the timing pass's
+    (runs-final/, keyed by build directory) where there is one."""
+
+    final = {}
+    for f in (HERE / "runs-final").glob("*.json"):
+        if f.read_text().strip():
+            d = json.loads(f.read_text())
+            final[f.stem] = d
     out = {}
     for f in sorted((HERE / "runs").glob("*.log")):
         lines = [x for x in f.read_text().splitlines() if x.startswith("{")]
@@ -33,6 +41,12 @@ def load() -> dict[str, dict]:
         d = json.loads(lines[-1])
         if "built" in d:
             out[f.stem] = d
+    for name, d in final.items():  # the timing pass's reads win; a re-encoded build is its own row
+        match = [k for k, v in out.items() if v["built"] == d["built"]]
+        if match:
+            out[match[0]] = {**out[match[0]], "reads": d["reads"], "final": True}
+        else:
+            out[name] = {**d, "final": True}
     return out
 
 
