@@ -238,9 +238,15 @@ async def build(root: Path, a) -> dict:
         live_n += add_n
         ups = sorted(key(int(i)) for i in np.concatenate([upd, add, churn_add]))
         rms = sorted(key(int(i)) for i in np.concatenate([rm, churn_rm]))
-        files, _ = await ix.index().resolve(
-            SortedEntries.of(ups, None, rms), commit_number=c, attempt=f"a{c}", generation=g
-        )
+        if a.index == "spans":  # as spanbench
+            files, _ = await ix.index().resolve(
+                SortedEntries.of(ups, None, rms), commit_number=c, attempt=f"a{c}", generation=g
+            )
+        else:  # the exact sparse path: resolve's stream-or-sparse switch counts blocks, and
+            # 16 KiB blocks of a filterless base make it stream 100M keys for every commit
+            idx = ix.index()
+            delta = await idx.delta(SortedEntries.of(ups, None, rms), generation=g)
+            files = await idx.write(c, f"a{c}", delta, g)
         delta_bytes += sum(f.size for f in files.files)
         delta_entries += sum(f.entries for f in files.files)
         delta_puts += len(files.files)
