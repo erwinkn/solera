@@ -49,7 +49,8 @@ to the same value.
    patterns take it, else absent. A pass's committed prefix. Compressed:
    one range stands for every key of it.
 3. **The base**: `(P, patterns, context, life)`: every key as at endpoint
-   `P`, if those patterns take it, else absent. One per partition.
+   `P`, if those patterns take it, else absent. One per partition, in one
+   of two forms (below): a **commit** `P`, or a **materialized** base file.
 
 Patterns are stored normalised: no `include` is the universal include,
 never an empty list (A27 R3). Contexts are stored once per partition, in
@@ -77,6 +78,33 @@ endpoint `T` it read at, with the current patterns and context, and drops
 every override that the new base, with that override removed, decodes
 to. Decided by decode equality at that fixed `T`, so updates arriving
 meanwhile do not hold an old base forever; they are owed next.
+
+## Two forms of base: a commit, or a materialized file
+
+A base is normally a **commit**: `P`, decoded against the upstream's
+history — so the key index keeps `P` as an endpoint. When retention is
+about to cut past `P` (a reader paused longer than the index keeps
+history), the base is **materialized** first: a file, key → presence,
+version and payload, holding the decoded seen-set under `P`'s patterns
+and context — everything the base and any range older than the cut
+decode to, read while `P` is still readable. It is written once, by the
+engine's upkeep (index metadata, no store code), and installed by one
+journal event before the cut: `P` is then released. Points stay as they
+are.
+
+Decode and classify are unchanged; a materialized base answers
+`decode(k)` from the file instead of from the index at `P`. Only the
+candidates differ: `changes(P, now)` for a commit base; a full merge-join
+of the file against the key view at the head for a file base. After a
+completed default run the base is a commit again, and the file is
+deleted.
+
+This is all the index needs to know of lagging readers: retention asks
+for every base older than its cut to be materialized first, and keeps
+no per-reader snapshots. The file costs what an index of the decoded keys
+costs (~27 B a key: ~27 MB at 1M keys, ~2.7 GB at 100M), only while a
+reader lags; its catch-up is one full merge-join, the cost of a full
+compare.
 
 ## Observations: what was served (A27 R2)
 
@@ -127,7 +155,8 @@ candidates are complete:
 - every point's key.
 
 Outside them a key's old and new states are the base's, unchanged. Each
-is classed once.
+is classed once. A materialized base has no `P` to read changes from:
+its candidates are a full merge-join of the file with the head's key view.
 
 **When the patterns changed**, the keys whose membership may differ are
 added: those a changed pattern can match. After normalisation, each glob
@@ -243,6 +272,18 @@ for a plain batch, a removal if `k2` was held; for a per-key one, its
 outputs go. Point `k2 absent`. `k2` returns at the same version: decoded
 absent, present now: an add.
 
+**A reader paused 40 days, a 30-day window.** `tally`'s base is commit
+`P`, day 0; its automation is disabled, and the index keeps 30 days of
+history. On day 29, retention's next cut would pass `P`: upkeep reads
+the decoded seen-set at `P` — say `k1@1 k2@1 k3@1` — writes it as a base
+file, installs it, and `P` is released. Upstream goes on: `k2` updated,
+`k3` removed, `k4` added. On day 40 `tally` runs: the candidates come from
+merging the file with the key view at the head — `k2` (`@1` against
+`@7`) an update, `k3` a removal, `k4` an add; `k1` unchanged — classed as
+always. The run completes: the base is the commit it read at, and the
+file is deleted. Without the file, day 40 would find `P` gone and owe a
+start-over.
+
 **An upstream reset (A27 R7).** `items` is moved to another store; its
 old index goes. `tally` records a rebuild: owed a start-over, not a
 decode it can no longer make.
@@ -327,7 +368,8 @@ bounds: measure a large spill and a pattern change at 100M.
 ```text
 Context   = {id, whole_and_dep_versions}
 Layer     = {endpoint, patterns (normalised), context: id, life}
-Base      = Layer                                   # endpoint P
+Base      = Layer                                   # endpoint P: a commit
+          | {file, patterns, context: id, life}     # materialized before retention cuts past P
 Range     = Layer + {lo, hi}                        # endpoint T; disjoint, sorted
 Point     = {key, present, version, payload, patterns, context: id, life}
 ScanPlan  = {T, cursor, patterns, context: id, pin}  # the active pass only
@@ -343,7 +385,8 @@ decode(E, k):
     if k in E.points (or its spill):   return E.points[k] as an observation
     layer = the range holding k, else E.base
     if not layer.patterns.take(k):     return ABSENT
-    entry = index(layer.life).lookup(k, at=layer.endpoint)
+    entry = layer.file.lookup(k) if layer is a file base \
+            else index(layer.life).lookup(k, at=layer.endpoint)
     return ABSENT if entry is None else (entry.version, entry.payload, layer.context)
 ```
 
@@ -362,6 +405,8 @@ classify(E, k, now):                  # now: head, current patterns, current con
     return NOTHING
 
 owed(E, now) = {k: c for k in candidates(E, now) if (c := classify(E, k, now)) != NOTHING}
+# candidates: changes(P, now) for a commit base, a merge-join of the file with the head's
+# key view for a file base; plus per-range changes, point keys, membership and context scans
 ```
 
 A batch then loads its keys, turns each served row into an observation,
