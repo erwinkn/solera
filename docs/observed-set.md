@@ -36,10 +36,14 @@ one (A27 R4). The owed set is the staleness, and exactly what a default
 run loads, as `added`, `updated` and `removed`.
 
 **`keys=` only chooses what a run loads**, per input: an explicit list of
-keys, everything under the patterns, or — the default — what is owed. It
-never clears an observation: the observation record changes only through
-what runs commit. (Its value names, and whether a loaded key that is not
-owed gets an `unchanged` class, are still open with Erwin.)
+keys, `"all"` (everything under the patterns, `keys={"rates": "all"}`), or
+— the default — what is owed. It never clears an observation: the
+observation record changes only through what runs commit.
+
+**A delivered removal is final.** Once a removal is delivered — a pattern
+narrowing's included — the record says the key is no longer held, so a
+later re-inclusion is owed an add. The record keeps no history: that is
+in lineage and run history.
 
 **A pattern change is an input change**: patterns define the effective
 input, so new patterns make staleness say *input changed*, not
@@ -99,10 +103,11 @@ A completed default run thus ends as a base at its last head, plus points
 for the keys that changed behind its batches — which the next run owes.
 
 **The commit check.** A batch commits only if, at its commit, its
-input's life is still current and no start-over is owed (an upstream
-reset's rebuild, or a definition change that reset `R`). Otherwise it is
-refused and writes nothing: its keys stay owed. The engine's commit has
-the life check today; the observed set adds the other.
+input's life and its asset's definition are still the ones it was
+planned under: an upstream reset or a definition change in between
+refuses it, and it writes nothing. Today's engine has both checks (the
+life, and a batch planned before an asset change); the observed set keeps
+them.
 
 **Outcomes.** A failed or abandoned attempt writes nothing: its keys stay
 owed. A per-key batch's failed keys are processed — observed at the version
@@ -132,14 +137,40 @@ added twice). It loads the keys it owes, calls the producer, and commits
 its outputs, the range and its points.
 
 A batch's `index`, `first` and `final` are relative to its run; there
-is no `full`. A run that loads everything under the patterns covers the
-same key ranges and loads every key in them; one given an explicit list
-loads those keys and writes points.
+is no `full`. A run given `"all"` covers the same key ranges and loads
+every key in them; one given an explicit list loads those keys and writes
+points.
 
 A cancelled or failed run leaves its committed batches' ranges and
 points. The next run compares again: keys under those ranges decode at
 their heads, so the unchanged ones are not owed. No plan, cursor, pass or
 scan pin is stored, and none can be left stranded.
+
+## What a producer sees
+
+`ctx.batch[input]` carries, all relative to the run:
+
+- `added`, `updated`, `removed`: the owed classes of the principle's table;
+- `unchanged`: keys loaded only because the run asked (`"all"` or a list)
+  that the consumer already observed at the same version; empty in a
+  default run;
+- `rows`: the rows of `added`, `updated` and `unchanged` — the object the
+  parameter receives; removed keys have no rows;
+- `index` (0-based, in the run), `count` (the batches the run planned, an
+  estimate), `first` (`index == 0`) and `final` (no batch of this run
+  follows); there is no `full`;
+- `upstream`: facts about the upstream.
+
+A consumer that keeps a total moves it by the changes, starting from what
+it holds. `ctx.load()` returns `None` before its first commit, and in a
+full run until that run's first commit, so it starts from zero then;
+`unchanged` keys are already counted:
+
+```python
+before = await ctx.load()
+count = before["count"] if before is not None else 0
+return {"count": count + len(batch.added) - len(batch.removed)}
+```
 
 ## Two forms of base: a commit, or a commit with a before-image
 
@@ -205,13 +236,23 @@ batch records the context it read under, and its range carries it.
 home and reset count, never a name or a commit number, which repeat
 across lives; a rename keeps it, with the spill and pins. An upstream
 reset (removed and declared again, moved to another store) starts a new
-life and deletes the old index, so the old layers cannot be decoded. The
-partition then records a **rebuild**: its observed set is "the old life",
-and it owes a start-over — staleness says so, as an input change — which
-its next run makes: a plain consumer starts over, and a per-key one
-compares against its output index, so a key it holds that the new life
-lacks is an owed removal. The run's first commit resets `R` to an empty
-base in the new life.
+life and deletes the old index, so the old layers cannot be decoded.
+Staleness says *input changed*, and the next run is a full run (below).
+
+**A full run.** A definition change or an upstream reset stores no flag:
+the partition's definition differs from its asset's, or `R`'s layers name
+an old life, and the engine makes the next run a full run — the same as
+`mode="full"`. Every upstream key under the patterns is owed.
+
+- A **plain consumer**'s first commit resets its output (the store keeps
+  nothing prior) and `R`, to an empty base in the current life; until
+  then `ctx.load()` returns `None`, so the producer starts from zero.
+- A **per-key consumer** compares against its own output index: its base
+  becomes that index, where a key it holds decodes present at no upstream
+  version. So every upstream key is owed, and an output key the upstream
+  lacks is an owed removal — also after a cancel midway, since the keys
+  past the last batch still decode from the output index. Its outputs
+  stay readable while it runs.
 
 ## Candidates, queries and their cost
 
@@ -255,8 +296,8 @@ points are one key-list call.
 computed and cached per observation record revision and upstream head; where a
 full compare is due and not yet made, the partition reports **pending**,
 never `stale` or fresh on a guess: widening `include` to a key that
-never existed changes no debt. Shared, definition, retry and rebuild debt
-are explicit, an empty first run included. The stale reasons are *input
+never existed changes no debt. Shared, definition and retry debt are
+explicit, an empty first run included. The stale reasons are *input
 changed* (keys owed, new patterns, a shared input moved, an upstream
 reset) and *definition changed*. An `each` chain
 intersects the upstream's owed keys with the consumer's patterns, key by
@@ -297,6 +338,14 @@ point.
 **Narrowing.** Base `(P, include=k*)`, narrowed to `k1`: the query over
 `k` finds `k2`, decoded present, no longer taken: a removal.
 
+**Removed, then included again.** `k5` is observed at `v1`. The patterns
+narrow to exclude it: decoded present, no longer taken — a removal, which
+a run delivers; its batch's range, under the narrowed patterns, decodes
+`k5` absent. The patterns widen again with `k5` still at `v1`: decoded
+absent, present and taken now — an add, though `v1` is what the consumer
+once held. Had the patterns widened back before the removal was
+delivered, `k5` would decode present at `v1`: nothing.
+
 **A first include (A27 R3).** No `include` (universal) over `keep/a`,
 `drop/b`; the deploy adds `include=keep/*`. The universal include going is
 a prefixless change: the whole range is queried, and `drop/b` is owed a
@@ -310,10 +359,10 @@ would have owed an add of an excluded key.
 
 **A definition change.** The definition — the digest of the asset's
 version, input bindings, store version and config — differs, and staleness
-says *definition changed*. `R` resets to an empty base: everything
-upstream is owed an add, and the run's first batch starts the consumer
-over; a per-key asset's leftover outputs are owed removals against its
-output index.
+says *definition changed*. The next run is a full run: `tally`'s first
+commit resets its count, `ctx.load()` having returned `None`; `checks`
+compares against its output index, and its leftover outputs are owed
+removals.
 
 **A run in two batches.** From `⊥`, `batch_size=1` over `k1`, `k2`. Batch
 1 reads at `H1`, delivers `k1`, and writes `(−∞, k1] @ H1`. `k2` changes
@@ -370,11 +419,11 @@ removal; `k4` absent at `C` against present, an add. `k0`, in the range
 at `C`, and `k1`, in the base, are unchanged: nothing. The run completes:
 its ranges become the base at its last head, and the file is deleted.
 Without the fold and the before-image, day 40 would find `P` gone and owe
-a start-over.
+a full run.
 
 **An upstream reset (A27 R7).** `items` is moved to another store; its
-old index goes. `tally` records a rebuild: owed a start-over, not a
-decode it can no longer make. A batch in flight across the reset is
+old index goes. `tally`'s layers name the old life: it owes a full run,
+not a decode it can no longer make. A batch in flight across the reset is
 refused by the commit check.
 
 **A takeover mid-run.** Batches 1 and 2 committed their overwrites;
@@ -403,14 +452,15 @@ holds, `removed` always one.
 | A27 R3, R4, R8, R9 | normalised patterns; candidates classed once; disjoint overwrite and decode-equal fold; per-range changes |
 | `ObservedSet.tla` 1 (P1, W36): a retention cut past an active pass's `T` (a pass at `T = 1` commits `k1`; `k2` changes at 2; the cut at 2 folds the base and ranges, and the pass's next batch, `k2`, needs the key view at 1, gone) | impossible: there is no pass; the next batch reads at its own head. Its remainder, a cut past the head of a batch in flight, is closed by the claim reserving that head |
 | `ObservedSet.tla` 2 (P2, W36): a pass sends a key back (the pass is at `T = 1`; `k1` is updated to `@2`; `keys=(k1)` delivers `@2`; the pass reaches `k1` and would deliver `@1`) | impossible: there is no pass; the batch covering `k1` reads at its own head and finds the point equal |
-| `ObservedSet.tla` 3 (P1, W36): a batch committing across a change it was not planned under (an upstream reset, a definition change) | the commit check: the current life, no start-over owed |
+| `ObservedSet.tla` 3 (P1, W36): a batch committing across a change it was not planned under (an upstream reset, a definition change) | the commit check: the life and definition it was planned under |
 
 A19 R6 (`keys=` bounded by `batch_size` and `concurrency`) and R8 (a
 forced retry) are kept as they are, outside the observation record.
 
 ## Words retired
 
-Each goes from the docs and the glossary when the rebuild lands (D140):
+Each goes from the docs and the glossary when the observed set is built
+(D140):
 
 - **position** — *was* how far an input had read; now the observation record.
 - **read-ahead** — *was* what `keys=` runs read past the position; now points.
@@ -422,7 +472,9 @@ Each goes from the docs and the glossary when the rebuild lands (D140):
   old patterns, and a membership diff; now an input change, and the
   comparison under the new patterns.
 - **reconcile** — *was* a per-key cleanup after a full pass; now owed
-  removals, against the output index after a start-over.
+  removals, against the output index in a full run.
+- **rebuild**, **start-over** — *was* a flag owing a restart; now a full
+  run, which a definition change or an upstream reset makes due.
 - **seen** — *was* the whole and dep versions a partition caught up to; now
   each layer's context.
 - **caught_up** — *was* a flag set by the commit path; now nothing owed.
@@ -477,7 +529,7 @@ relying on the bounds: measure a large spill and a pattern change at
 - **A full compare at 100M** — a prefixless pattern change, a moved shared
   input, a truncated log — reads two whole key views; until a run makes
   it, the partition is pending.
-- **An upstream reset** is a start-over for its consumers.
+- **An upstream reset** is a full run for its consumers.
 - **Moving to it** resets every consumer once: an empty base, and a full
   first run.
 
@@ -490,10 +542,11 @@ Context   = {id, whole_and_dep_versions}
 Layer     = {endpoint, patterns (normalised), context: id, life}
 Base      = Layer                                   # endpoint P: a commit
           | Layer + {before_image}                  # endpoint C; the keys changed in (P, C], as at P
+          | {output_index, life}                    # a per-key full run: held keys, at no upstream version
 Range     = Layer + {lo, hi}                        # endpoint H, the head observed at; disjoint, sorted
 Point     = {key, present, version, payload, patterns, context: id, life}
-ObservationRecord = {base, ranges[], points{}, contexts[], spill: index state | None,
-                     rebuild: life | None}
+ObservationRecord = {base, ranges[], points{}, contexts[], spill: index state | None}
+# beside it, per partition: the definition its observations were made under
 ```
 
 **Decode** — the observed set, from an observation record (the old
@@ -501,9 +554,9 @@ effective state of `k`):
 
 ```text
 decode(R, k):
-    if R.rebuild:                      return UNKNOWN          # a start-over is owed
     if k in R.points (or its spill):   return R.points[k] as an observation
     layer = the range holding k, else R.base
+    if layer.output_index:             return HELD if k in layer.output_index else ABSENT
     if not layer.patterns.take(k):     return ABSENT
     if layer.before_image and k in layer.before_image:
         entry = layer.before_image[k]                      # as at P
@@ -518,16 +571,18 @@ decode(R, k):
 ```text
 classify(R, k, now):                  # now: head, current patterns, current context
     old = decode(R, k)
-    if old is UNKNOWN:                          return REBUILD   # the whole partition starts over
     new = ABSENT if not now.patterns.take(k) else index.lookup(k, at=now.head)
     if old is ABSENT and new is ABSENT:         return NOTHING
     if old is ABSENT:                           return ADDED
     if new is ABSENT:                           return REMOVED
+    if old is HELD:                             return UPDATED   # at no upstream version
     if differs(old.version, old.payload, new):  return UPDATED   # the net rule
     if old.context != now.context:              return UPDATED
     return NOTHING
 
+full_run_due(R, now) = R.definition != now.definition or R.base.life != now.life
 owed(R, now) = {k: c for k in candidates(R, now) if (c := classify(R, k, now)) != NOTHING}
+# in a full run: every upstream key under the patterns, plus a per-key base's held keys
 # candidates: changes(endpoint, now), plus a before-image's keys; plus per-range changes,
 # point keys, membership and context scans
 ```
@@ -537,14 +592,15 @@ in memory:
 
 ```text
 run(R):
-    todo = sorted(owed(R, now))                    # by default; keys= may name a list, or everything
+    todo = sorted(owed(R, now))                    # by default; keys= may give a list, or "all"
     prev = FIRST
     while prev is not LAST:
         keys = the next batch_size keys of todo after prev
         c = keys[-1] if todo goes on past it else LAST
         H = the head now, pinned by the batch's claim
         owed_here = {k: classify(R, k, at H) for k in candidates(R, H) within (prev, c]}
-        load the keys owed_here owes; reclassify each from what was served
+        load the keys owed_here owes, plus any other key the run asked for (unchanged)
+        reclassify each from what was served
         call the producer
         if not may_commit(batch, R, now):
             return                                 # refused: its keys stay owed
@@ -553,7 +609,7 @@ run(R):
         prev = c
 
 may_commit(batch, R, now):
-    return batch.life == now.life and not R.rebuild and not now.start_over_owed
+    return batch.life == now.life and batch.definition == now.definition
 
 fold(R, H):                                        # at each batch commit
     for range in R.ranges with range.endpoint < H:
