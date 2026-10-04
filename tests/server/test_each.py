@@ -349,7 +349,7 @@ async def test_a_user_cancel_commits_finished_keys_and_leaves_the_rest_dormant(t
     from solera.failed_keys import CANCELED
     from solera_server.state import State
 
-    from .test_fence import engine_for, until
+    from .remote import engine_for, until
 
     started, release = asyncio.Event(), asyncio.Event()
 
@@ -472,7 +472,7 @@ async def test_a_timeout_drain_counts_a_try_and_comes_due(tmp_path):
     from solera.failed_keys import TIMED_OUT
     from solera_server.state import State
 
-    from .test_fence import engine_for
+    from .remote import engine_for
 
     @asset(outputs=Output("files", keyed=True))
     def files():

@@ -10,8 +10,8 @@ from solera.sdk import Incremental, Output, Project, asset
 from solera_server.state import State
 
 from .engines import drive, make_engine, task_statuses
+from .remote import engine_for, until
 from .test_each import files_project, records, rows_of
-from .test_fence import engine_for, until
 
 
 class Bad(Rejected):

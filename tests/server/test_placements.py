@@ -15,7 +15,7 @@ from solera_server.engine import Engine
 from solera_server.executors import PlacementContext
 from solera_worker.worker import run_attempt
 
-from tests.server.test_fence import Gated, as_worker, fence, own
+from tests.server.remote import Gated, as_worker, fence, own
 
 
 def make_engine(state, project, placements=None, **kw):

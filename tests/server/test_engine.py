@@ -28,7 +28,7 @@ from solera.stores import FileStore, Patch
 from solera_server.executors.inline import InlinePlacement
 
 from .engines import drive, make_engine, status_of, task_statuses
-from .test_fence import own
+from .remote import own
 
 
 class Fake(Executor):

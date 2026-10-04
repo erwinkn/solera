@@ -154,7 +154,7 @@ async def test_a_patch_reconciles_what_a_dead_sql_writer_left(state, arrow):
     holds, and the commit settles the intent. (A fenced store: an immutable
     one never has such an intent.)"""
 
-    from tests.server.test_fence import LiveStore
+    from tests.server.remote import LiveStore
 
     live = LiveStore()
     pending = {"rows": [{"id": "a", "v": 1}]}

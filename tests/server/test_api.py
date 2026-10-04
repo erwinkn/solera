@@ -21,7 +21,7 @@ from solera_server.engine import Engine
 from solera_server.executors.inline import InlinePlacement
 from solera_server.state import State
 
-from tests.server.test_fence import own
+from tests.server.remote import own
 
 
 def build_project():

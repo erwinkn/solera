@@ -13,7 +13,7 @@ from solera_server.state import State
 from solera_worker.channel import LocalChannel
 from solera_worker.worker import run_attempt
 
-from .test_fence import REMOTE, Fake, Remote, engine_for, fence, finish_as_worker, launched, own, until
+from .remote import REMOTE, Fake, Remote, engine_for, fence, finish_as_worker, launched, own, until
 
 
 async def test_a_duplicate_invocation_waits_for_the_owner_and_writes_nothing(tmp_path):
@@ -95,7 +95,7 @@ async def test_a_loser_exits_once_the_engine_says_the_attempt_ended(tmp_path):
 async def test_a_loser_without_a_channel_exits_on_a_final_control_file(tmp_path):
     """With no channel, the objects tell it: the engine ended the attempt."""
 
-    from .test_fence import Gated
+    from .remote import Gated
 
     @asset(executor=Fake("fake")(), retries=Retry(0))
     def items():
@@ -273,7 +273,7 @@ async def test_a_fenced_store_runs_its_retry_at_once(tmp_path):
     acquisition fencing the dead writer out, and each attempt acquires a
     higher generation than the last, before it reads anything."""
 
-    from .test_fence import LiveStore
+    from .remote import LiveStore
 
     class Fenced(LiveStore):
         writes = "fenced"

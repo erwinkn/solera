@@ -9,7 +9,7 @@ from solera.stores import Patch
 
 from ..conftest import whole
 from .engines import drive, make_engine, status_of
-from .test_fence import LiveStore
+from .remote import LiveStore
 
 
 async def test_a_delta_pass_over_batches_says_the_generation_it_read(state):

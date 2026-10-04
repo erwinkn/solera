@@ -20,7 +20,7 @@ from solera_server import attempts
 from solera_server.state import State, Unavailable
 from solera_worker.worker import ENDED, run_attempt
 
-from .test_fence import (
+from .remote import (
     REMOTE,
     Fake,
     Gated,

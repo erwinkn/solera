@@ -212,7 +212,7 @@ async def test_a_deleted_run_takes_its_control_files_and_a_late_worker_writes_no
     from solera import lifecycle
     from solera.objects import Conflict, swap
 
-    from tests.server.test_fence import Gated
+    from tests.server.remote import Gated
 
     engine = engine_for(state, Project(assets=[plain], default_store=Gated()), clock)  # gated
     await engine.initialize()
