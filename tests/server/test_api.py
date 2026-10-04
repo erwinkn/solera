@@ -5,7 +5,6 @@ import httpx
 import pytest
 from solera.executors import Pool
 from solera.sdk import (
-    Automation,
     DynamicPartitions,
     Every,
     Incremental,
@@ -32,7 +31,7 @@ def build_project():
     def feed():
         return feed_keys["rows"]
 
-    @asset(inputs={"feed": Incremental()}, automations=Automation(trigger=OnChange("feed")))
+    @asset(inputs={"feed": Incremental()}, automations=OnChange("feed"))
     def total(feed: list):
         return {"n": sum(v["v"] for v in feed)}
 

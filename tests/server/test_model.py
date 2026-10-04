@@ -7,7 +7,7 @@ import json
 
 import orjson
 import pytest
-from solera.sdk import Automation, Every, Incremental, OnChange, Output, Project, asset
+from solera.sdk import Every, Incremental, OnChange, Output, Project, asset
 from solera.stores import Patch
 from solera_server.engine import Engine
 from solera_server.executors.inline import InlinePlacement
@@ -54,7 +54,7 @@ def consumer(files: list):
     return [{"n": len(files)}]
 
 
-@asset(automations=Automation(trigger=Every(60)))
+@asset(automations=Every(60))
 def polled():
     return [1]
 
@@ -319,7 +319,7 @@ async def test_automation_state_survives_reregistration(state, clock):
     await engine.set_automation("polled.every.0", False)
     state.model.automations["consumer.onchange.0"]["pending"] = [["files", ""]]
     await engine_on(state, clock).initialize()  # same manifest: nothing to do
-    changed = Project(assets=[files, consumer, asset(automations=Automation(trigger=Every(5)))(polled.fn)])
+    changed = Project(assets=[files, consumer, asset(automations=Every(5))(polled.fn)])
     await Engine(state, changed.manifest, clock=clock).initialize()
     autos = state.model.automations
     assert autos["polled.every.0"]["enabled"] is False  # toggles survive

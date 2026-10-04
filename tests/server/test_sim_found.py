@@ -4,7 +4,7 @@ to its smallest engine-level sequence."""
 import asyncio
 
 import pytest
-from solera.sdk import Incremental, Output, Project, asset
+from solera.sdk import Incremental, OnChange, Output, Project, asset
 from solera.stores import FileStore, Patch
 
 from ..conftest import whole
@@ -145,7 +145,6 @@ async def test_a_change_made_during_a_full_pass_reaches_downstream(state):
     the upstream changes: the firing for that change resumes the pass —
     and must also deliver the change, since nothing else will fire for it."""
 
-    from solera.sdk import AutoRefresh
     from solera.stores import Patch
 
     content = {"a": "1", "b": "1"}
@@ -157,7 +156,7 @@ async def test_a_change_made_during_a_full_pass_reaches_downstream(state):
     @asset(
         inputs={"items": Incremental(batch_size=1)},
         outputs=Output("out", key="id"),
-        automations=AutoRefresh(),
+        automations=OnChange(),
     )
     def out(ctx, items: list):
         return Patch([{"id": r["id"], "v": r["v"]} for r in items], remove=list(ctx.batch["items"].removed))
@@ -708,8 +707,6 @@ async def test_the_retry_clock_waits_for_an_input_with_no_head(state, tmp_path):
     partition whose inputs have no head now waits for them; a run by hand
     still says why it cannot run."""
 
-    from solera.sdk import AutoRefresh
-
     def project(store):
         @asset(outputs=Output("items", key="id", store=store))
         def items():
@@ -718,7 +715,7 @@ async def test_the_retry_clock_waits_for_an_input_with_no_head(state, tmp_path):
         @asset(
             inputs={"item": Incremental("items", each=True)},
             outputs=Output("checks", key="id"),
-            automations=AutoRefresh(),
+            automations=OnChange(),
         )
         def checks(ctx, item: list):
             raise RuntimeError("bad")
@@ -753,8 +750,6 @@ async def test_a_reset_output_is_due_for_a_rebuild(state, tmp_path):
     the move alone fires `items` again, so it does not stay empty — and its
     consumers waiting — until `feed` next changes."""
 
-    from solera.sdk import AutoRefresh
-
     @asset(outputs=Output("feed", key="id"))
     def feed():
         return [{"id": "a"}]
@@ -763,7 +758,7 @@ async def test_a_reset_output_is_due_for_a_rebuild(state, tmp_path):
         @asset(
             inputs={"feed": Incremental()},
             outputs=Output("items", key="id", store=store),
-            automations=AutoRefresh(),
+            automations=OnChange(),
         )
         def items(ctx, feed: list):
             return feed
@@ -903,17 +898,15 @@ async def test_an_onchange_asset_added_back_is_built(state):
     every partition with no head whose inputs have heads — once, at the
     deploy, never re-checked by a tick."""
 
-    from solera.sdk import AutoRefresh
-
-    @asset(outputs=Output("feed", key="id"), automations=AutoRefresh())
+    @asset(outputs=Output("feed", key="id"), automations=OnChange())
     def feed():
         return [{"id": "a"}]
 
-    @asset(inputs={"feed": Incremental()}, outputs=Output("items", key="id"), automations=AutoRefresh())
+    @asset(inputs={"feed": Incremental()}, outputs=Output("items", key="id"), automations=OnChange())
     def items(feed: list):
         return feed
 
-    @asset(inputs={"items": Incremental()}, outputs=Output("copy", key="id"), automations=AutoRefresh())
+    @asset(inputs={"items": Incremental()}, outputs=Output("copy", key="id"), automations=OnChange())
     def copy(items: list):
         return items
 
@@ -945,7 +938,7 @@ def _changing(tmp_path, kind: str, automation: str, after: bool, calls: list):
     """`feed` and `items` (reading it incrementally), before or `after` an
     asset change of `kind` to `items`, under `automation`."""
 
-    from solera.sdk import Automation, AutoRefresh, Cron
+    from solera.sdk import Cron
 
     @asset(outputs=Output("feed", key="id"))
     def feed():
@@ -955,8 +948,8 @@ def _changing(tmp_path, kind: str, automation: str, after: bool, calls: list):
         return Project(assets=[feed]), "items"
     name = "renamed" if kind == "renamed" and after else "items"
     automations = {
-        "onchange": AutoRefresh(),
-        "schedule": Automation(trigger=Cron("0 7 1 1 *")),  # yearly: not due in the test
+        "onchange": OnChange(),
+        "schedule": Cron("0 7 1 1 *"),  # yearly: not due in the test
         "none": [],
     }[automation]
 

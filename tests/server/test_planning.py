@@ -9,7 +9,6 @@ import time
 import httpx
 import pytest
 from solera.sdk import (
-    Automation,
     DynamicPartitions,
     In,
     OnChange,
@@ -296,8 +295,8 @@ async def test_an_onchange_firing_is_one_run_in_order(state):
         order.append(("downstream", ctx.partition))
         return root
 
-    automation = Automation("both", targets=["root", "downstream"], trigger=OnChange("feed"))
-    only_a = Automation("only_a", targets=["root"], trigger=OnChange("feed"), partitions=["a"], enabled=False)
+    automation = OnChange("feed", name="both", targets=["root", "downstream"])
+    only_a = OnChange("feed", name="only_a", targets=["root"], partitions=["a"], enabled=False)
     project = Project(assets=[root, downstream], sources=[Source("feed")], automations=[automation, only_a])
     engine = make_engine(state, project)
     await engine.initialize()
@@ -356,7 +355,7 @@ async def test_a_source_change_fans_out_over_a_partitioned_consumer(state):
     @asset(
         partitions={"site": StaticPartitions(["a", "b"])},
         deps=["prices"],
-        automations=Automation(trigger=OnChange()),
+        automations=OnChange(),
     )
     def report(ctx):
         return [{"site": ctx.partition}]
@@ -377,7 +376,7 @@ async def test_a_change_during_a_run_is_kept_for_after_it(state):
 
     release, calls = asyncio.Event(), []
 
-    @asset(deps=["prices"], automations=Automation(trigger=OnChange()))
+    @asset(deps=["prices"], automations=OnChange())
     async def report(ctx):
         calls.append(ctx.run_id)
         if len(calls) == 1:

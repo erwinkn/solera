@@ -16,8 +16,6 @@ import time
 from solera.errors import Rejected
 from solera.executors import Pool
 from solera.sdk import (
-    Automation,
-    AutoRefresh,
     Commit,
     Cron,
     DynamicPartitions,
@@ -25,6 +23,7 @@ from solera.sdk import (
     In,
     Incremental,
     Migration,
+    OnChange,
     OnDeploy,
     Output,
     Project,
@@ -135,7 +134,7 @@ ingest = Pool("ingest")
 # ---------------------------------------------------------------------------
 
 
-@asset(outputs=DynamicPartitions(), automations=Automation(trigger=Cron("* * * * *")))
+@asset(outputs=DynamicPartitions(), automations=Cron("* * * * *"))
 def sites(ctx, registry: SiteRegistry):
     """The site list is a dynamic partitions; each run may surface a new site.
 
@@ -188,7 +187,7 @@ def upload_drop(ctx) -> Tick | None:
         ),
     ),
     partitions={"site": sites},
-    automations=Automation(trigger=Every(10)),
+    automations=Every(10),
 )
 def site_feed(ctx, feed: FeedClient):
     """Poll one site's feed; the feed's cursor persists as ctx.cursor."""
@@ -226,7 +225,7 @@ def site_feed(ctx, feed: FeedClient):
     partitions={"site": sites},
     inputs={"site_files": Incremental(batch_size=2)},
     version="2",
-    automations=AutoRefresh(),
+    automations=OnChange(),
 )
 def file_index(ctx, site_files: list[dict]):
     """Index the files written since the last commit (§6)."""
@@ -265,7 +264,7 @@ class Unreadable(Rejected):
             "site_files", batch_size=4, concurrency=4, exclude={"drafts": "*-file-2"}, each=True
         )
     },
-    automations=AutoRefresh(),
+    automations=OnChange(),
 )
 async def file_checks(ctx, file: list[dict]):
     """One changed file: a row per check. The fourth file of a site is
@@ -292,7 +291,7 @@ async def file_checks(ctx, file: list[dict]):
     outputs=Output("site_digest"),
     partitions={"site": sites, "day": TimePartitions(start="2026-09-01", every="1d")},
     deps=["roadmap"],
-    automations=Automation(trigger=Every(120)),
+    automations=Every(120),
 )
 def site_digest(ctx, site_files: list[dict]):
     """A per-site-per-day digest blob; `roadmap` is pinned in lineage only."""
@@ -311,7 +310,7 @@ def site_digest(ctx, site_files: list[dict]):
 @asset(
     outputs=Output("fleet_index"),
     inputs={"file_index": In()},
-    automations=AutoRefresh(),
+    automations=OnChange(),
 )
 def fleet_index(ctx, file_index: dict[str, list[dict]]):
     """One row per site: committed heads at pin time, never a barrier."""
@@ -338,7 +337,7 @@ if DATABASE:
             migrations=postgres_migrations("fleet_status", "CREATE SCHEMA IF NOT EXISTS ops"),
         ),
         inputs={"site_events": In()},
-        automations=AutoRefresh(),
+        automations=OnChange(),
     )
     def fleet_status(ctx, site_events: dict[str, TableRef]):
         """A fan-in over TableRefs: the pins stay refs, the SELECT runs
@@ -367,7 +366,7 @@ if DATABASE:
             migrations=postgres_migrations("site_status", "CREATE SCHEMA IF NOT EXISTS ops"),
         ),
         partitions={"site": sites},
-        automations=AutoRefresh(),
+        automations=OnChange(),
     )
     def site_status(ctx, site_events: TableRef) -> Sql:
         """A SELECT materialized inside Postgres; no row enters the worker."""
@@ -377,7 +376,7 @@ if DATABASE:
 
 else:
 
-    @asset(outputs=Output("site_status"), partitions={"site": sites}, automations=AutoRefresh())
+    @asset(outputs=Output("site_status"), partitions={"site": sites}, automations=OnChange())
     def site_status(ctx, site_events: list):
         ctx.log("DATABASE_URL unset — site_status skipped (needs Postgres)")
         return [{"site": ctx.partition, "status": "skipped"}]
@@ -393,7 +392,7 @@ else:
     outputs=Output("upload_record", key="upload_id"),
     partitions={"upload": uploads},
     executor=ingest(cpu=1),
-    automations=Automation(trigger=Every(30), partitions="missing"),
+    automations=Every(30, partitions="missing"),
 )
 def manual_ingest(ctx, uploads_reader: UploadReader):
     """Runs on `solera worker pool ingest` — claim, lease, run, complete (§10)."""
@@ -409,7 +408,7 @@ def manual_ingest(ctx, uploads_reader: UploadReader):
 
 @job(
     inputs={"fleet_index": "fleet_index"},
-    automations=Automation(trigger=Cron("0 7 * * 1"), skip_missing_inputs=True),
+    automations=Cron("0 7 * * 1", skip_missing_inputs=True),
 )
 def weekly_digest(ctx, fleet_index: list, mailer: Mailer):
     """Jobs take inputs, placement and automations; they return no outputs."""
@@ -417,7 +416,7 @@ def weekly_digest(ctx, fleet_index: list, mailer: Mailer):
     mailer.send("ops@example.com", "Weekly digest", "\n".join(lines))
 
 
-@job(automations=Automation(trigger=OnDeploy()))
+@job(automations=OnDeploy())
 def deploy_notice(ctx):
     """§9: fires once per served deploy — watch it run on boot."""
 
@@ -454,7 +453,7 @@ project = Project(
         "mailer": Mailer(),
     },
     automations=[
-        Automation("refresh-index", targets=[site_feed, file_index], trigger=Cron("*/5 * * * *")),
+        Cron("*/5 * * * *", name="refresh-index", targets=[site_feed, file_index]),
     ],
     name="demo",
 )

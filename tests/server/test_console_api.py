@@ -8,7 +8,6 @@ import httpx
 import pytest
 from solera import Rejected
 from solera.sdk import (
-    Automation,
     Cron,
     Every,
     Incremental,
@@ -412,9 +411,9 @@ async def test_automations_say_when_they_next_fire(tmp_path):
     project = Project(
         assets=[feed, total],
         automations=[
-            Automation("hourly", targets=[feed], trigger=Every(3600)),
-            Automation("weekly", targets=[feed], trigger=Cron("0 7 * * 1", timezone="Europe/Paris")),
-            Automation("follow", targets=[total], trigger=OnChange("feed")),
+            Every(3600, name="hourly", targets=[feed]),
+            Cron("0 7 * * 1", timezone="Europe/Paris", name="weekly", targets=[feed]),
+            OnChange("feed", name="follow", targets=[total]),
         ],
         name="timed",
     )

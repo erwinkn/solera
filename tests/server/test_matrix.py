@@ -7,7 +7,6 @@ import asyncio
 import time
 
 from solera.sdk import (
-    Automation,
     In,
     Incremental,
     OnChange,
@@ -197,7 +196,7 @@ async def test_a_change_waits_for_work_already_queued(state):
         reads.append(list(root))
         return root
 
-    automation = Automation("both", targets=["root", "downstream"], trigger=OnChange("feed"))
+    automation = OnChange("feed", name="both", targets=["root", "downstream"])
     project = Project(assets=[root, downstream], sources=[Source("feed")], automations=[automation])
     engine = make_engine(state, project)
     await engine.initialize()
@@ -237,7 +236,7 @@ async def test_a_change_is_kept_until_its_delivery_completes(state):
     def mid(ctx, files: list):
         return [{"n": 1}] if ctx.batch["files"].first else Result(outputs={})
 
-    @asset(inputs={"mid": In(all_partitions=True)}, automations=Automation(trigger=OnChange("mid")))
+    @asset(inputs={"mid": In(all_partitions=True)}, automations=OnChange("mid"))
     def agg(mid: dict[str, list]):
         observed.append(sorted(mid))
         return [len(mid)]
@@ -356,7 +355,6 @@ async def test_an_each_delivery_resumed_by_a_firing_takes_its_change(state):
     """As test_sim_found's keyed case, for a per-key input: a full pass cut
     short after its first key, the upstream changing, the firing resuming it
     — the change is delivered, and only then is the partition drained."""
-    from solera.sdk import AutoRefresh
 
     content, calls = {"a": "1", "b": "1"}, []
 
@@ -367,7 +365,7 @@ async def test_an_each_delivery_resumed_by_a_firing_takes_its_change(state):
     @asset(
         inputs={"item": Incremental("items", batch_size=1, each=True)},
         outputs=Output("out", key="id"),
-        automations=AutoRefresh(),
+        automations=OnChange(),
     )
     def out(ctx, item: list):
         calls.append((ctx.key, item[0]["v"]))

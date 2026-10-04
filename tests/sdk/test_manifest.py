@@ -7,7 +7,6 @@ from pathlib import Path
 import pytest
 from solera.executors import Executor
 from solera.sdk import (
-    Automation,
     Cron,
     Every,
     In,
@@ -342,11 +341,19 @@ def test_partitions_must_name_keyed_output():
         Project(assets=[bad, unkeyed])
 
 
-def test_automation_requires_trigger():
-    """§9/§11: Automation() without a trigger is an error."""
+def test_automations_are_triggers():
+    """§9: an automation is its trigger, carrying the run it submits;
+    automations= takes them, one or a list (any fires it), and nothing else."""
 
-    with pytest.raises(RegistrationError, match="trigger"):
-        Automation("x", targets=["a"])
+    @asset(automations=[Cron("0 * * * *", partitions="missing"), OnChange(mode="full")])
+    def a():
+        return []
+
+    records = Project(assets=[a]).manifest["automations"]
+    assert records["a.cron.0"]["trigger"]["kind"] == "cron" and records["a.cron.0"]["partitions"] == "missing"
+    assert records["a.onchange.0"]["mode"] == "full"
+    with pytest.raises(RegistrationError, match="automations= takes"):
+        asset(automations=["hourly"])(lambda: [])
 
 
 def test_standalone_automation_requires_name_and_targets():
@@ -357,15 +364,15 @@ def test_standalone_automation_requires_name_and_targets():
         return []
 
     with pytest.raises(RegistrationError, match="name and targets"):
-        Project(assets=[a], automations=[Automation(trigger=Every(60))])
+        Project(assets=[a], automations=[Every(60)])
     with pytest.raises(RegistrationError, match="name and targets"):
-        Project(assets=[a], automations=[Automation("named", trigger=Every(60))])
+        Project(assets=[a], automations=[Every(60, name="named")])
 
 
 def test_automation_name_collision():
     """§9/§11: automation names must be unique."""
 
-    @asset(automations=[Automation(trigger=Every(60)), Automation(trigger=Every(60))])
+    @asset(automations=[Every(60), Every(60)])
     def a():
         return []
 
@@ -382,8 +389,8 @@ def test_automation_name_collision():
         Project(
             assets=[b],
             automations=[
-                Automation("dup", targets=["b"], trigger=Every(60)),
-                Automation("dup", targets=["b"], trigger=Cron("0 0 * * *")),
+                Every(60, name="dup", targets=["b"]),
+                Cron("0 0 * * *", name="dup", targets=["b"]),
             ],
         )
 
@@ -391,7 +398,7 @@ def test_automation_name_collision():
 def test_onchange_cannot_watch_own_outputs():
     """§9/§11: OnChange may not name an output of its own target."""
 
-    @asset(outputs=Output("x"), automations=Automation(trigger=OnChange("x")))
+    @asset(outputs=Output("x"), automations=OnChange("x"))
     def a():
         return []
 

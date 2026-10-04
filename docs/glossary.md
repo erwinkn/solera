@@ -256,12 +256,14 @@ an incremental input over an upstream with extra dimensions is refused at
 registration: it never fans in. `all_partitions=True` projects nothing:
 every upstream partition is read, the shared dimensions too.
 
-**automation** `Automation(trigger=…)`. A rule that submits a run when its
-**trigger** fires: `Every`, `Cron`, `OnChange` (`AutoRefresh()`: on a
-change of any input) or `OnDeploy`. The rest is the run, in the run's own
-vocabulary (`targets`, `partitions`, `mode`, `upstream`, `config`,
-`keys`, `tags`), plus `enabled` and `skip_missing_inputs`; a bare trigger
-stands for an automation with the defaults. **Attached** to an asset
+**automation** `Every`, `Cron`, `OnChange`, `OnDeploy`. A rule that
+submits a run when its **trigger** fires; the trigger is the automation:
+`Every`, `Cron`, `OnChange` (`OnChange()`: on a change of any input or
+dep) or `OnDeploy`. Its keywords are the run, in the run's own vocabulary
+(`targets`, `partitions`, `mode`, `upstream`, `config`, `keys`, `tags`),
+plus `name`, `enabled` and `skip_missing_inputs`. `automations=` takes
+one or a list: any of them fires the asset. *Was:* `Automation(trigger=…)`,
+`AutoRefresh()` (now `OnChange()`). **Attached** to an asset
 (named `{asset}.{kind}.{n}`) or **standalone** (`Project(automations=…)`).
 Each time it fires it submits one run, or skips with a reason (nothing to
 do, inputs missing), which the history records with the time it fired.

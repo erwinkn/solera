@@ -35,7 +35,7 @@ const KIND: Record<Input["kind"], { name: string; means: string }> = {
   },
   dep: {
     name: "dep",
-    means: "Pinned in lineage and the fingerprint, watched by AutoRefresh, never loaded.",
+    means: "Pinned in lineage and the fingerprint, watched by OnChange(), never loaded.",
   },
 };
 

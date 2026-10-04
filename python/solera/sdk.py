@@ -704,67 +704,22 @@ class TimePartitions:
 # ---------------------------------------------------------------------------
 
 
-@dataclass(frozen=True)
-class Every:
-    seconds: int
-
-    def __post_init__(self):
-        if not isinstance(self.seconds, (int, float)) or self.seconds < 1:
-            raise RegistrationError("Every requires an interval of at least 1 second")
-
-    def spec(self) -> dict:
-        return {"kind": "every", "seconds": self.seconds}
-
-
-@dataclass(frozen=True)
-class Cron:
-    expression: str
-    timezone: str = "UTC"
-
-    def __post_init__(self):
-        try:
-            croniter(self.expression)
-        except Exception as error:
-            raise RegistrationError(f"Invalid cron expression: {self.expression}") from error
-        try:
-            ZoneInfo(self.timezone)
-        except (ZoneInfoNotFoundError, ValueError) as error:
-            raise RegistrationError(f"Unknown cron timezone: {self.timezone}") from error
-
-    def spec(self) -> dict:
-        return {"kind": "cron", "expression": self.expression, "timezone": self.timezone}
-
-
-@dataclass(frozen=True)
-class OnChange:
-    outputs: tuple[str, ...] = ()
-
-    def __init__(self, *outputs: str):
-        object.__setattr__(self, "outputs", tuple(outputs))
-
-    def spec(self) -> dict:
-        return {"kind": "onchange", "outputs": list(self.outputs)}
-
-
-@dataclass(frozen=True)
-class OnDeploy:
-    """Once per new deploy, for the latest deploy only (§9)."""
-
-    def spec(self) -> dict:
-        return {"kind": "ondeploy"}
-
-
 class Automation:
-    """When `trigger` fires, submit this run in §8 vocabulary.
-    `skip_missing_inputs`: skip a partition whose inputs have never been written
-    (and that the run doesn't build), rather than run it to fail."""
+    """When it fires, submit a run in §8 vocabulary: every trigger is an
+    automation (`Every`, `Cron`, `OnChange`, `OnDeploy`), and an asset's
+    `automations=` a list of them, any of which fires it. On an asset, it
+    runs the asset; standalone (`Project(automations=)`), it names itself
+    and its `targets`. `skip_missing_inputs`: skip a partition whose inputs
+    have never been written (and that the run doesn't build), rather than
+    run it to fail."""
 
-    def __init__(
+    kind = ""
+
+    def _run(
         self,
+        *,
         name: str | None = None,
         targets: Any = None,
-        trigger: Every | Cron | OnChange | OnDeploy | None = None,
-        *,
         enabled: bool = True,
         partitions: str | list[str] | None = None,
         mode: str = "incremental",
@@ -773,24 +728,82 @@ class Automation:
         keys: dict | None = None,
         tags: dict[str, str] | None = None,
         skip_missing_inputs: bool = False,
-    ):
-        if trigger is None:
-            raise RegistrationError("Automation() requires a trigger (§11)")
-        if not isinstance(trigger, (Every, Cron, OnChange, OnDeploy)):
-            raise RegistrationError(f"Unknown trigger: {trigger!r}")
+    ) -> None:
         if mode not in ("incremental", "full"):
             raise RegistrationError(f"Unknown automation mode: {mode!r}")
-        self.name, self.targets, self.trigger = name, targets, trigger
+        self.name, self.targets = name, targets
         self.enabled, self.partitions, self.mode = enabled, partitions, mode
         self.upstream, self.config, self.keys = upstream, config, keys
         self.tags = _tags(tags, f"Automation {name or ''}".strip())
         self.skip_missing_inputs = bool(skip_missing_inputs)
 
+    def spec(self) -> dict:
+        raise NotImplementedError
 
-def AutoRefresh(**kwargs) -> Automation:
-    """OnChange over the asset's inputs + deps (§9)."""
+    def __repr__(self) -> str:
+        return f"{type(self).__name__}({self.spec()})"
 
-    return Automation(trigger=OnChange(), **kwargs)
+
+class Every(Automation):
+    """Every `seconds` (§9)."""
+
+    kind = "every"
+
+    def __init__(self, seconds: int, **run):
+        if not isinstance(seconds, (int, float)) or seconds < 1:
+            raise RegistrationError("Every requires an interval of at least 1 second")
+        self.seconds = seconds
+        self._run(**run)
+
+    def spec(self) -> dict:
+        return {"kind": "every", "seconds": self.seconds}
+
+
+class Cron(Automation):
+    """On a cron schedule, in `timezone` (§9)."""
+
+    kind = "cron"
+
+    def __init__(self, expression: str, timezone: str = "UTC", **run):
+        try:
+            croniter(expression)
+        except Exception as error:
+            raise RegistrationError(f"Invalid cron expression: {expression}") from error
+        try:
+            ZoneInfo(timezone)
+        except (ZoneInfoNotFoundError, ValueError) as error:
+            raise RegistrationError(f"Unknown cron timezone: {timezone}") from error
+        self.expression, self.timezone = expression, timezone
+        self._run(**run)
+
+    def spec(self) -> dict:
+        return {"kind": "cron", "expression": self.expression, "timezone": self.timezone}
+
+
+class OnChange(Automation):
+    """When an output it watches changes: the named ones, or, naming none,
+    every input and dep of its targets (§9)."""
+
+    kind = "onchange"
+
+    def __init__(self, *outputs: str, **run):
+        self.outputs = tuple(outputs)
+        self._run(**run)
+
+    def spec(self) -> dict:
+        return {"kind": "onchange", "outputs": list(self.outputs)}
+
+
+class OnDeploy(Automation):
+    """Once per new deploy, for the latest deploy only (§9)."""
+
+    kind = "ondeploy"
+
+    def __init__(self, **run):
+        self._run(**run)
+
+    def spec(self) -> dict:
+        return {"kind": "ondeploy"}
 
 
 # ---------------------------------------------------------------------------
@@ -1050,11 +1063,14 @@ class Asset:
         self.timeout = timeout
         self.version = str(version)
         self.retention = retention
-        if isinstance(automations, Automation) or automations.__class__ in (Every, Cron, OnChange, OnDeploy):
+        if isinstance(automations, Automation):
             automations = (automations,)
-        self.automations = tuple(
-            a if isinstance(a, Automation) else Automation(trigger=a) for a in automations
-        )
+        self.automations = tuple(automations)
+        for auto in self.automations:
+            if not isinstance(auto, Automation):
+                raise RegistrationError(
+                    f"{self.name}: automations= takes Every, Cron, OnChange or OnDeploy, not {auto!r}"
+                )
 
     def __call__(self, *args, **kwargs):
         return self.fn(*args, **kwargs)
@@ -1537,12 +1553,11 @@ class Project:
 
         # Automations.
         automation_records = {}
-        trigger_name = {Every: "every", Cron: "cron", OnChange: "onchange", OnDeploy: "ondeploy"}
 
         def add_automation(auto: Automation, *, targets: list[str], attached: Asset | None):
             name = auto.name
             if attached is not None:
-                kind = trigger_name[type(auto.trigger)]
+                kind = auto.kind
                 index = sum(1 for n in automation_records if n.startswith(f"{attached.name}.{kind}"))
                 name = f"{attached.name}.{kind}.{index}"
             elif not name or not targets:
@@ -1553,8 +1568,8 @@ class Project:
                 if target not in self.assets:
                     raise RegistrationError(f"Automation {name}: unknown target {target}")
             watched = []
-            if isinstance(auto.trigger, OnChange):
-                watched = list(auto.trigger.outputs)
+            if isinstance(auto, OnChange):
+                watched = list(auto.outputs)
                 if not watched:
                     for target in targets:
                         info = assets[target]
@@ -1569,7 +1584,7 @@ class Project:
             automation_records[name] = {
                 "name": name,
                 "targets": targets,
-                "trigger": auto.trigger.spec(),
+                "trigger": auto.spec(),
                 "enabled": bool(auto.enabled),
                 "partitions": auto.partitions,
                 "mode": auto.mode,

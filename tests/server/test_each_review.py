@@ -97,7 +97,7 @@ async def test_2_a_full_run_removes_what_upstream_no_longer_has(state):
 
 
 async def test_3_retries_run_under_the_scopes_configuration(state):
-    from solera.sdk import Automation, Every
+    from solera.sdk import Every
 
     calls = []
 
@@ -108,7 +108,7 @@ async def test_3_retries_run_under_the_scopes_configuration(state):
     @asset(
         inputs={"file": Incremental("files", each=True)},
         outputs=Output("rows", key="path"),
-        automations=Automation(trigger=Every(3600), config={"factor": 10}),
+        automations=Every(3600, config={"factor": 10}),
     )
     def parse(ctx, file: int):
         calls.append((ctx.key, ctx.config.get("factor")))

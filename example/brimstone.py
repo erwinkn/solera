@@ -18,14 +18,13 @@ import pandas as pd
 from solera.errors import Rejected
 from solera.executors import AWSECS, Pool
 from solera.sdk import (
-    Automation,
-    AutoRefresh,
     Cron,
     DynamicPartitions,
     Every,
     In,
     Incremental,
     Migration,
+    OnChange,
     OnDeploy,
     Output,
     Project,
@@ -94,7 +93,7 @@ ingest = Pool("ingest")
 @asset(
     outputs=DynamicPartitions(),  # name defaults to the function name
     # Daily, and once per deploy so a fresh revision starts from a current list.
-    automations=[Automation(trigger=Cron("0 6 * * *")), Automation(trigger=OnDeploy())],
+    automations=[Cron("0 6 * * *"), OnDeploy()],
 )
 def sites(graph: GraphClient) -> list[str]:
     """Refresh the SharePoint site list daily; new sites surface as missing work."""
@@ -125,7 +124,7 @@ uploads = DynamicPartitions("uploads")
         Output("qaqc_files", key="file_id"),
     ),
     partitions=sites,
-    automations=Automation(trigger=Every(30)),
+    automations=Every(30),
 )
 def graph_delta(ctx, graph: GraphClient):
     """Poll a site's Graph delta feed; the feed's cursor is the cursor."""
@@ -177,7 +176,7 @@ class Unprocessable(Rejected):
     partitions=sites,
     inputs={"workbook": Incremental("qaqc_files", concurrency=8, each=True)},
     version="2",  # bump to reprocess every key; code changes alone do not
-    automations=AutoRefresh(),
+    automations=OnChange(),
 )
 async def qaqc_samples(ctx, workbook: list[dict], sharepoint: SharePointClient) -> pd.DataFrame:
     """One changed workbook of this site: its samples. Solera runs it for every
@@ -213,7 +212,7 @@ async def qaqc_samples(ctx, workbook: list[dict], sharepoint: SharePointClient) 
     ),
     # Fires when the datasmart sources are advanced through the commit API;
     # refresh-lab's cron is the scheduled fallback.
-    automations=AutoRefresh(),
+    automations=OnChange(),
 )
 def psa_mean_data(ctx, psa_samples: pd.DataFrame, psa_data: pd.DataFrame) -> pd.DataFrame:
     result = compute_psa_mean_data(psa_samples, psa_data)
@@ -263,7 +262,7 @@ def leach(
 @asset(
     outputs=Output("site_health", store="postgres", schema="ops", partition_column="site"),
     partitions=sites,
-    automations=AutoRefresh(),
+    automations=OnChange(),
 )
 def site_health(ctx, change_events: TableRef) -> Sql:
     """In-database: a TableRef in, a query out; no row enters the worker.
@@ -276,7 +275,7 @@ def site_health(ctx, change_events: TableRef) -> Sql:
 @asset(
     outputs=Output("fleet_dashboard", store="postgres", schema="ops"),
     inputs={"site_health": In()},
-    automations=AutoRefresh(),
+    automations=OnChange(),
 )
 async def fleet_dashboard(ctx, site_health: dict[str, TableRef]) -> pd.DataFrame:
     """Partitioned upstream, unpartitioned consumer: the site dimension is collapsed."""
@@ -288,7 +287,7 @@ async def fleet_dashboard(ctx, site_health: dict[str, TableRef]) -> pd.DataFrame
     outputs=Output("region_rollup", store="postgres", schema="ops", partition_column="region"),
     partitions=StaticPartitions(["east", "west"]),
     inputs={"qaqc_samples": In()},
-    automations=AutoRefresh(),
+    automations=OnChange(),
 )
 async def region_rollup(ctx, qaqc_samples: dict[str, TableRef]) -> pd.DataFrame:
     """Static partitions over a site-partitioned input."""
@@ -306,7 +305,7 @@ async def region_rollup(ctx, qaqc_samples: dict[str, TableRef]) -> pd.DataFrame:
     executor=ingest(cpu=1, memory="4GB"),
     # partitions="missing": every key with no complete head is planned each
     # minute, which covers new upload keys and failed first runs alike.
-    automations=Automation(trigger=Every(60), partitions="missing"),
+    automations=Every(60, partitions="missing"),
 )
 async def manual_upload(ctx, sharepoint: SharePointClient) -> pd.DataFrame:
     """Upload keys are registered externally by the uploads service."""
@@ -317,7 +316,7 @@ async def manual_upload(ctx, sharepoint: SharePointClient) -> pd.DataFrame:
     outputs=Output("hillshade", store="blob"),
     partitions={"site": sites, "day": TimePartitions(start="2024-01-01", every="1d")},
     deps=["usgs_3dep_tiles"],
-    automations=Automation(trigger=Every(3600)),  # partitions="latest": every site, newest day
+    automations=Every(3600),  # partitions="latest": every site, newest day
 )
 def hillshade(ctx, dem: DemClient) -> bytes:
     """Two dimensions; deps= gives lineage and change-watching for a resource-read source."""
@@ -326,7 +325,7 @@ def hillshade(ctx, dem: DemClient) -> bytes:
 
 @job(
     inputs={"fleet_dashboard": "fleet_dashboard"},
-    automations=Automation(trigger=Cron("0 7 * * 1")),
+    automations=Cron("0 7 * * 1"),
 )
 def weekly_report(ctx, fleet_dashboard: TableRef, mailer: Mailer, query) -> None:
     """A job: inputs, placement and automations like an asset, no outputs."""
@@ -380,7 +379,7 @@ project = Project(
     },
     automations=[
         # Standalone: multi-target, scheduled, direct asset references.
-        Automation("refresh-lab", targets=[leach, psa_mean_data], trigger=Cron("0 8 * * *")),
+        Cron("0 8 * * *", name="refresh-lab", targets=[leach, psa_mean_data]),
     ],
 )
 

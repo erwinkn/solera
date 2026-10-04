@@ -92,7 +92,7 @@ Graph delta feed ──► sharepoint_events ──► sharepoint_files ──�
     outputs=Output("sharepoint_events", store="postgres", schema="sharepoint",
                    incremental=True, partition_column="site"),
     partitions=sites,
-    automations=Automation(trigger=Every(30)),
+    automations=Every(30),
 )
 def sharepoint_events(ctx, graph: GraphClient):
     """The entry point: Graph delta events as they come, never a listing."""
@@ -105,7 +105,7 @@ def sharepoint_events(ctx, graph: GraphClient):
                    key="path", partition_column="site"),
     partitions=sites,
     inputs={"events": Incremental("sharepoint_events")},
-    automations=AutoRefresh(),
+    automations=OnChange(),
 )
 def sharepoint_files(ctx, events: pd.DataFrame):
     """Fold events into the current state of each file. A folder move or
@@ -125,7 +125,7 @@ def sharepoint_files(ctx, events: pd.DataFrame):
                          include="ICP/Results/**/*.csv",
                          exclude={"archive": "**/archive/**", "templates": "**/*template*"},
                          batch_size=100, concurrency=16, each=True)},
-    automations=AutoRefresh(),
+    automations=OnChange(),
 )
 async def icp(ctx, file: dict, sharepoint: SharePointClient) -> Result:
     raw = await sharepoint.read(file["item_id"])     # a network error is Failed, or Transient if mapped

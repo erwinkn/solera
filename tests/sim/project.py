@@ -24,13 +24,12 @@ from dataclasses import dataclass, replace
 from solera.errors import Abort, Failed, Rejected, Transient
 from solera.executors import Pool
 from solera.sdk import (
-    Automation,
-    AutoRefresh,
     Commit,
     DynamicPartitions,
     Every,
     In,
     Incremental,
+    OnChange,
     Output,
     Project,
     Result,
@@ -148,7 +147,7 @@ def build(variant: Variant, data_root, db: Database, outside: External, pg: str 
         outputs=items_output,
         inputs={"feed": Incremental()},
         version=variant.items_version,
-        automations=AutoRefresh(),
+        automations=OnChange(),
         retries=Retry(3, delay=1.0),
         timeout=300,
     )
@@ -166,7 +165,7 @@ def build(variant: Variant, data_root, db: Database, outside: External, pg: str 
         copy_fn,
         outputs=Output(key="id"),
         inputs={"items": Incremental(batch_size=2, exclude=[variant.exclude] if variant.exclude else None)},
-        automations=AutoRefresh(),
+        automations=OnChange(),
         retries=Retry(3, delay=1.0),
         timeout=300,
         **copy_kw,
@@ -175,16 +174,16 @@ def build(variant: Variant, data_root, db: Database, outside: External, pg: str 
     @asset(
         partitions="sites",
         deps=["knob"],
-        automations=[AutoRefresh(), Automation(trigger=Every(60), partitions="missing")],
+        automations=[OnChange(), Every(60, partitions="missing")],
     )
     def per_site(ctx):
         return {"site": ctx.partition}
 
-    @asset(deps=["knob"], outputs=Output("log", incremental=True), automations=AutoRefresh())
+    @asset(deps=["knob"], outputs=Output("log", incremental=True), automations=OnChange())
     def log(ctx):
         return Patch([{"site": "*", "n": 1}])
 
-    @job(inputs={"items": Incremental(batch_size=2)}, automations=AutoRefresh(), retries=Retry(3, delay=1.0))
+    @job(inputs={"items": Incremental(batch_size=2)}, automations=OnChange(), retries=Retry(3, delay=1.0))
     def seen(ctx, items: list):
         """A job: no output, its cursor its only state — `items`' content as
         its batches tell it, rebuilt from scratch on a full pass."""
@@ -206,7 +205,7 @@ def build(variant: Variant, data_root, db: Database, outside: External, pg: str 
     @asset(
         inputs={"item": Incremental("items", batch_size=2, concurrency=2, each=True)},
         outputs=Output("checks", key="id"),
-        automations=AutoRefresh(),
+        automations=OnChange(),
         retries=Retry(3, delay=1.0),
         timeout=300,
     )
@@ -218,7 +217,7 @@ def build(variant: Variant, data_root, db: Database, outside: External, pg: str 
     @asset(
         outputs=[Output("odd", key="id", store="db"), Output("even", key="id")],
         inputs={"items": Incremental(batch_size=2)},
-        automations=AutoRefresh(),
+        automations=OnChange(),
         retries=Retry(3, delay=1.0),
         timeout=300,
         executor=Pool(POOL)(cpu=2),
@@ -244,7 +243,7 @@ def build(variant: Variant, data_root, db: Database, outside: External, pg: str 
     assets = [items, copy, per_site, log, tally, checks, split] + ([seen] if variant.seen else [])
     if variant.summary:
 
-        @asset(inputs={"per_site": In()}, automations=AutoRefresh())
+        @asset(inputs={"per_site": In()}, automations=OnChange())
         def summary(per_site: dict[str, dict]):
             return sorted(per_site)
 

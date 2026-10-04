@@ -79,7 +79,7 @@ pyarrow unless a value is of their type.
     ),
     partitions=sites,  # an asset producing a DynamicPartitions (§7)
     inputs={"qaqc_files": Incremental()},  # an incremental input (§5)
-    automations=AutoRefresh(),  # OnChange over inputs + deps (§9)
+    automations=OnChange(),  # on a change of any input or dep (§9)
 )
 async def qaqc_samples(ctx, qaqc_files: pd.DataFrame, sharepoint): ...
 ```
@@ -381,7 +381,7 @@ alike. A consumer that rebuilds starts over when `full and first` —
 never on `full` alone, or each batch would erase the ones before it.
 
 **`deps=`** are unbound inputs: planned, pinned into lineage, part of the
-fingerprint (§6), watched by `AutoRefresh`, bound to no
+fingerprint (§6), watched by `OnChange()`, bound to no
 parameter. An entry is an output's name, or `In(output,
 all_partitions=True)` to depend on every partition of it, the shared
 dimensions too; nothing else of an `In` means anything on a dep, which is
@@ -627,7 +627,7 @@ embedded DuckDB (object-store-state.md §7). It serves run listings with
 filters, facets and a time histogram, operations stats (p50/p95 duration
 and queue wait, failure rates, compute hours per executor), an asset's
 version timeline, and lineage in both directions. Runs carry tags
-(`solera run --tag env=prod`, `"tags"` in the API, `Automation(tags=…)`);
+(`solera run --tag env=prod`, `"tags"` in the API, an automation's `tags=`);
 assets carry tags too (`@asset(tags=…)`); an attempt records per-version
 metadata with `ctx.metadata(rows=…, auc=…)` or `Result(metadata=…)`. Each
 run also keeps a timeline — `run_timeline`: submitted, held and why, claimed,
@@ -653,31 +653,25 @@ keys through its own asset, so its key index and consumers see it.
 ## 9. Automations
 
 ```python
-Automation(
-    name=None,
-    targets=None,
-    trigger=...,
-    enabled=True,
-    partitions=None,
-    mode="incremental",
-    upstream=False,
-    config=None,
-    keys=None,
-    tags=None,
-    skip_missing_inputs=False,
-)
-AutoRefresh()  # Automation(trigger=OnChange()) over inputs + deps
+@asset(automations=[Cron("0 6 * * *"), OnChange("readings", mode="full")])  # either fires it
+...
+Project(automations=[Every(300, name="refresh-index", targets=[site_feed, file_index])])
+
+# Every trigger takes the run it submits, as keywords:
+#   name=None, targets=None, enabled=True, partitions=None, mode="incremental",
+#   upstream=False, config=None, keys=None, tags=None, skip_missing_inputs=False
 ```
 
-A trigger says **when**; the automation says **what run** to submit, in
-the run's own vocabulary (§8): `partitions`, `mode`, `upstream`, `config`,
-`keys` are passed through unchanged.
+An automation is its trigger: `Every`, `Cron`, `OnChange` or `OnDeploy`
+says **when**, and its keywords say **what run** to submit, in the run's
+own vocabulary (§8): `partitions`, `mode`, `upstream`, `config`, `keys`
+are passed through unchanged. An asset's `automations=` is one of them or
+a list, any of which fires it.
 
 | Arg | Standalone (`Project(automations=[...])`) | Attached (`automations=` on an asset) |
 |---|---|---|
 | `name` | required; key for toggles | derived `{asset}.{trigger}.{index}` |
 | `targets` | required: assets, singleton or list | the asset |
-| `trigger` | required | required |
 | `partitions` | `"latest"` · `"missing"` · `"all"` · `[k…]`; default `"latest"` for `Every`/`Cron`, the projection of the changed partition for `OnChange` — a source has no dimensions, so its change reaches every partition of the target (bounded like `"all"`). Named partitions run as named, whatever changed. A firing is one run over every target, so a target that reads another waits for it. A change stays pending — never consumed — while a partition it is owed is claimed or queued in any run (that work would not see it, and the firing could not order after it), and while a target reading the change through a whole fan-in cannot see it yet: a pass under way is read once it completes | same |
 | `enabled` | default `True` | default `True` |
 
@@ -690,7 +684,7 @@ the run's own vocabulary (§8): `partitions`, `mode`, `upstream`, `config`,
 
 `partitions="missing"` on a schedule is how new keys of a dynamic partitions
 and failed first runs get picked up without an operator:
-`Automation(trigger=Every(60), partitions="missing")`. `OnDeploy()` on an
+`Every(60, partitions="missing")`. `OnDeploy()` on an
 asset whose outputs declare migrations applies them as part of the deploy;
 on a job it is a post-deploy hook.
 
@@ -950,8 +944,8 @@ Registration errors:
 - an output's config or return annotation fails `can_store`;
 - a partitioned output on a shared-table store lacks `partition_column`;
 - `partitions=` names an output with no key;
-- `Automation()` has no trigger; a standalone automation has no name or
-  targets; automation names collide;
+- an `automations=` entry is not a trigger; a standalone automation has
+  no name or targets; automation names collide;
 - an `OnChange` names an output of its own target;
 - an output declares `migrations=` on a store without `migrate`, a
   migration name repeats, or a payload fails `can_store`;

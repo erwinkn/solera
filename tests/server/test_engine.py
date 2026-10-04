@@ -7,7 +7,6 @@ import json
 import pytest
 from solera.executors import Executor
 from solera.sdk import (
-    Automation,
     Cron,
     DynamicPartitions,
     Every,
@@ -778,7 +777,7 @@ async def test_automation_toggle_and_run_now(state):
     """§9: toggles are keyed by name; run-now submits immediately."""
     calls = {"n": 0}
 
-    @asset(automations=Automation(trigger=Every(1), enabled=True))
+    @asset(automations=Every(1, enabled=True))
     def polled():
         calls["n"] += 1
         return [calls["n"]]
@@ -803,7 +802,7 @@ async def test_an_automation_can_skip_until_its_inputs_are_written(state):
     def index():
         return [1]
 
-    @asset(inputs={"index": "index"}, automations=Automation(trigger=Every(1), skip_missing_inputs=True))
+    @asset(inputs={"index": "index"}, automations=Every(1, skip_missing_inputs=True))
     def digest(index: list):
         return index
 
@@ -876,7 +875,7 @@ async def test_missing_on_schedule_picks_up_new_keys(state):
     def things():
         return members["keys"]
 
-    @asset(partitions="things", automations=Automation(trigger=Every(1), partitions="missing"))
+    @asset(partitions="things", automations=Every(1, partitions="missing"))
     def per_thing(ctx):
         ran.append(ctx.partition)
         return [{"t": ctx.partition}]
@@ -1131,7 +1130,7 @@ async def test_ondeploy_fires_once_per_revision(state):
     last_deploy, then records it; further ticks stay quiet."""
     calls = []
 
-    @job(automations=Automation(trigger=OnDeploy()))
+    @job(automations=OnDeploy())
     def deployed():
         calls.append(1)
 
@@ -1156,7 +1155,7 @@ async def test_ondeploy_silent_on_restart_same_revision(state):
     """§9: a re-registration of the same deploy does not refire."""
     calls = []
 
-    @job(automations=Automation(trigger=OnDeploy()))
+    @job(automations=OnDeploy())
     def deployed():
         calls.append(1)
 
@@ -1181,14 +1180,14 @@ async def test_ondeploy_two_registrations_fire_latest_once(state):
     deploy only."""
     calls = []
 
-    @job(automations=Automation(trigger=OnDeploy()))
+    @job(automations=OnDeploy())
     def deployed():
         calls.append(1)
 
     project_a = Project(assets=[deployed])
     await make_engine(state, project_a).initialize()
 
-    @job(automations=Automation(trigger=OnDeploy()), version="2")
+    @job(automations=OnDeploy(), version="2")
     def deployed():  # noqa: F811 — redeployed: a new deploy
         calls.append(1)
 

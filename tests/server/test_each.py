@@ -435,7 +435,7 @@ async def test_a_retry_pass_spans_batches_and_accumulates_its_bounds(state):
 
 
 async def test_the_retry_clock_runs_automated_assets(state):
-    from solera.sdk import Automation, Every
+    from solera.sdk import Every
 
     tries = {"n": 0}
 
@@ -446,7 +446,7 @@ async def test_the_retry_clock_runs_automated_assets(state):
     @asset(
         inputs={"file": Incremental("files", each=True)},
         outputs=Output("rows", key="path"),
-        automations=Automation(trigger=Every(3600)),
+        automations=Every(3600),
     )
     def parse(file: int):
         tries["n"] += 1

@@ -657,7 +657,7 @@ cache, then read from there.
 ```python
 solera run revenue --tag env=prod --tag ticket=OPS-42     # CLI
 POST /api/projects/{p}/runs  {"targets": ["revenue"], "tags": {"env": "prod"}}
-Automation(trigger=Every(3600), tags={"team": "growth"})   # its runs carry them
+Every(3600, tags={"team": "growth"})   # an automation: its runs carry them
 ```
 
 Assets declare tags too (`@asset(tags={"team": "growth"})`), and a run
@@ -1054,7 +1054,7 @@ append-only output — FileStore's commits, a Postgres event table. Bound it
 with a scheduled job, or a periodic `full` run:
 
 ```python
-@job(deps=["site_events"], automations=Automation(trigger=Every(3600)))
+@job(deps=["site_events"], automations=Every(3600))
 def trim_site_events(db: Database):
     db.execute("DELETE FROM site_events WHERE received_at < now() - interval '7 days'")
 ```
