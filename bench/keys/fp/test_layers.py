@@ -5,7 +5,8 @@ per-commit fold, and its lifecycle (A17's checklist where it applies).
 
 Sizes are shrunk (blocks of 128 raw bytes, parts over 512 bytes indexed,
 tiers from 64 bytes) so that merges, multi-block parts, indexes, straddled
-layers and the graveyard all occur within a few hundred commits.
+layers, the base's graveyard and other layers' side parts (keys added and
+removed inside) all occur within a few hundred commits.
 """
 
 from __future__ import annotations
@@ -120,16 +121,17 @@ def test_layers_against_the_fold():
     assert run(go()) > 300
 
 
-def test_merges_happen_and_the_graveyard_holds_removals_after_the_cut():
+def test_merges_happen_and_side_parts_hold_what_only_straddlers_need():
     async def go():
         rng = random.Random(3)
-        seen_grave = seen_index = seen_straddle = False
+        seen = {"graveyard": False, "side above the base": False, "index": False, "straddle": False}
         async for ix, fold, c, positions in history(rng, 200, 2):
             base = ix.s.layers[0]
-            seen_grave |= base.grave is not None and base.grave.entries > 0
-            seen_index |= any(x.live.index for x in ix.s.layers)
-            seen_straddle |= any(x.a <= min(positions) < x.b for x in ix.s.layers if x.stamp is None)
-        assert seen_grave and seen_index and seen_straddle
+            seen["graveyard"] |= base.side is not None and base.side.entries > 0
+            seen["side above the base"] |= any(x.side is not None and x.side.entries > 0 for x in ix.s.layers[1:])
+            seen["index"] |= any(x.main.index for x in ix.s.layers)
+            seen["straddle"] |= any(x.a <= min(positions) < x.b for x in ix.s.layers if x.stamp is None)
+        assert all(seen.values()), seen
         assert ix.written["base"].merges and ix.written["tier"].merges
 
     run(go())

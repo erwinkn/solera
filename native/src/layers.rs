@@ -49,6 +49,7 @@ const KIND_PAYLOAD: u8 = 4;
 const PRESENT: u8 = 1;
 const PAYLOAD: u8 = 2;
 const FLIPS: u8 = 4;
+const START: u8 = 8;
 
 type Res<T> = Result<T, String>;
 
@@ -60,6 +61,7 @@ fn err(e: String) -> PyErr {
 pub struct Entry {
     pub key: Vec<u8>,
     pub present: bool,
+    pub start: bool, // present just before the layer's first commit
     pub stamp: u64,
     pub flips: Vec<u64>, // newest first, each <= stamp
     pub payload: Option<Vec<u8>>,
@@ -136,6 +138,9 @@ fn encode_layer_block(entries: &[Entry]) -> Vec<u8> {
         if !e.flips.is_empty() {
             f |= FLIPS;
         }
+        if e.start {
+            f |= START;
+        }
         out.push(f);
         put_varint(&mut out, e.stamp - gmin);
         if !e.flips.is_empty() {
@@ -205,6 +210,7 @@ fn decode_block(format: u8, raw: &[u8], stamp: u64, out: &mut Vec<Entry>) -> Res
             Entry {
                 key: key.clone(),
                 present: kind != REMOVED,
+                start: kind != ADDED,
                 stamp,
                 flips: if kind == UPDATED { vec![] } else { vec![stamp] },
                 payload,
@@ -226,7 +232,7 @@ fn decode_block(format: u8, raw: &[u8], stamp: u64, out: &mut Vec<Entry>) -> Res
             } else {
                 None
             };
-            Entry { key: key.clone(), present: f & PRESENT != 0, stamp: s, flips, payload }
+            Entry { key: key.clone(), present: f & PRESENT != 0, start: f & START != 0, stamp: s, flips, payload }
         };
         prev = key;
         out.push(e);
@@ -403,6 +409,7 @@ impl LayerWriter {
             let e = Entry {
                 key: k.to_vec(),
                 present: kind != REMOVED,
+                start: kind != ADDED,
                 stamp: 0,
                 flips: if kind == UPDATED { vec![] } else { vec![0] },
                 payload,
@@ -419,7 +426,7 @@ impl LayerWriter {
         py.detach(|| {
             for w in off.windows(2) {
                 let key = data[w[0] as usize..w[1] as usize].to_vec();
-                self.push(Entry { key, present: true, stamp, flips: vec![], payload: None })?;
+                self.push(Entry { key, present: true, start: false, stamp, flips: vec![], payload: None })?;
             }
             Ok(())
         })
@@ -489,7 +496,7 @@ impl<'a> Stream<'a> {
             if self.bi < self.buf.len() {
                 let e = std::mem::replace(
                     &mut self.buf[self.bi],
-                    Entry { key: vec![], present: false, stamp: 0, flips: vec![], payload: None },
+                    Entry { key: vec![], present: false, start: false, stamp: 0, flips: vec![], payload: None },
                 );
                 self.bi += 1;
                 return Ok(Some(e));
@@ -591,21 +598,29 @@ fn streams(inputs: &[Input]) -> Vec<Stream<'_>> {
 // -- merge -------------------------------------------------------------------------------
 
 pub struct MergeOut {
-    pub live: (Vec<(Vec<u8>, u64)>, Vec<u8>),
-    pub grave: (Vec<(Vec<u8>, u64)>, Vec<u8>),
+    pub main: (Vec<(Vec<u8>, u64)>, Vec<u8>),
+    pub side: (Vec<(Vec<u8>, u64)>, Vec<u8>),
     pub entries_in: u64,
     pub dropped: u64,
 }
 
-/// Inputs oldest first. Per key: the newest entry's state, every input's
-/// flips newer than `cut`, newest first. With `bottom` (the merge holds the
-/// oldest layer), an absent key goes to the graveyard, or away with no flip
-/// left.
+/// Inputs oldest first. Per key: the newest entry's state, the oldest's
+/// presence at the start, every input's flips newer than `cut`, newest
+/// first. Entries go to one of two parts:
+///
+/// - **main**: what head reads and readers after the layer need: present
+///   keys, and (above the base) absent keys that were present at the start,
+///   which shadow older layers;
+/// - **side**: what only a reader whose P falls inside the layer needs: in the
+///   base (`bottom`, nothing older to shadow) every absent key, elsewhere
+///   keys absent at both ends (added and removed inside).
+///
+/// An absent key with no flip left serves no reader at or after the cut and
+/// shadows nothing if it was absent at the start (or is in the base): dropped.
 pub fn merge(inputs: Vec<Stream<'_>>, cut: u64, bottom: bool, block_size: usize, level: i32, file_limit: usize) -> Res<MergeOut> {
-    let n = inputs.len();
     let mut m = Merger::new(inputs)?;
-    let mut live = LayerWriter::create(LAYER, block_size, level, file_limit);
-    let mut grave = LayerWriter::create(LAYER, block_size, level, file_limit);
+    let mut main = LayerWriter::create(LAYER, block_size, level, file_limit);
+    let mut side = LayerWriter::create(LAYER, block_size, level, file_limit);
     let mut group = Vec::new();
     let (mut entries_in, mut dropped) = (0u64, 0u64);
     while m.next_group(&mut group)? {
@@ -613,24 +628,24 @@ pub fn merge(inputs: Vec<Stream<'_>>, cut: u64, bottom: bool, block_size: usize,
         let mut flips: Vec<u64> = group.iter().flat_map(|(_, e)| e.flips.iter().copied()).filter(|&f| f > cut).collect();
         flips.sort_unstable_by(|a, b| b.cmp(a));
         flips.dedup();
-        let (rank, newest) = group.pop().unwrap(); // ranks ascending: the newest input is last
-        debug_assert!(rank < n);
-        let e = Entry { flips, ..newest };
-        if bottom && !e.present {
-            if e.flips.is_empty() {
-                dropped += 1;
-            } else {
-                grave.push(e)?;
-            }
+        let start = group[0].1.start; // ranks ascending: the oldest input first
+        let (_, newest) = group.pop().unwrap(); // and the newest last
+        let e = Entry { flips, start, ..newest };
+        if e.present {
+            main.push(e)?;
+        } else if e.start && !bottom {
+            main.push(e)?;
+        } else if e.flips.is_empty() {
+            dropped += 1;
         } else {
-            live.push(e)?;
+            side.push(e)?;
         }
     }
-    Ok(MergeOut { live: live.finish_raw()?, grave: grave.finish_raw()?, entries_in, dropped })
+    Ok(MergeOut { main: main.finish_raw()?, side: side.finish_raw()?, entries_in, dropped })
 }
 
-/// `inputs` oldest first. Returns (live files, live index, graveyard files,
-/// graveyard index, entries read, entries dropped).
+/// `inputs` oldest first. Returns (main files, main index, side files,
+/// side index, entries read, entries dropped).
 #[pyfunction]
 #[pyo3(signature = (inputs, cut, bottom, *, block_size=16384, level=1, file_limit=67108864))]
 #[allow(clippy::type_complexity)]
@@ -652,10 +667,10 @@ pub fn layers_merge<'py>(
         Ok(l)
     };
     Ok((
-        files(&out.live.0)?,
-        PyBytes::new(py, &out.live.1),
-        files(&out.grave.0)?,
-        PyBytes::new(py, &out.grave.1),
+        files(&out.main.0)?,
+        PyBytes::new(py, &out.main.1),
+        files(&out.side.0)?,
+        PyBytes::new(py, &out.side.1),
         out.entries_in,
         out.dropped,
     ))
@@ -753,21 +768,131 @@ pub fn layers_scan<'py>(
 
 // -- lookups ------------------------------------------------------------------------------
 
-/// Inputs newest first, keys sorted: per key, the newest entry's (present,
-/// stamp, payload), or None if no input holds it.
-pub fn lookup(inputs: Vec<Stream<'_>>, keys: &[&[u8]]) -> Res<Vec<Option<(bool, u64, Option<Vec<u8>>)>>> {
-    let mut out: Vec<Option<(bool, u64, Option<Vec<u8>>)>> = vec![None; keys.len()];
-    for mut s in inputs {
+/// Visit a block's entries in key order without building them: `visit` gets
+/// the key (in a buffer reused across entries) and the entry's position in
+/// `raw`, and returns false to stop.
+fn walk_block(format: u8, raw: &[u8], mut visit: impl FnMut(&[u8], usize) -> Res<bool>) -> Res<()> {
+    let mut pos = 0;
+    let n = get_varint(raw, &mut pos)? as usize;
+    if format == LAYER {
+        get_varint(raw, &mut pos)?;
+    }
+    let mut key: Vec<u8> = Vec::new();
+    for _ in 0..n {
+        let s = get_varint(raw, &mut pos)? as usize;
+        let l = get_varint(raw, &mut pos)? as usize;
+        if s > key.len() {
+            return Err("shared prefix past the previous key".into());
+        }
+        key.truncate(s);
+        key.extend_from_slice(get_bytes(raw, &mut pos, l)?);
+        let at = pos;
+        if !visit(&key, at)? {
+            return Ok(());
+        }
+        // Skip the entry's fields.
+        let f = *raw.get(pos).ok_or("truncated block")?;
+        pos += 1;
+        if format == DELTA {
+            if f & KIND_PAYLOAD != 0 {
+                let l = get_varint(raw, &mut pos)? as usize;
+                get_bytes(raw, &mut pos, l)?;
+            }
+        } else {
+            get_varint(raw, &mut pos)?;
+            if f & FLIPS != 0 {
+                let m = get_varint(raw, &mut pos)?;
+                for _ in 0..m {
+                    get_varint(raw, &mut pos)?;
+                }
+            }
+            if f & PAYLOAD != 0 {
+                let l = get_varint(raw, &mut pos)? as usize;
+                get_bytes(raw, &mut pos, l)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The entry whose fields start at `at` (just after its key) in a block.
+fn entry_at(format: u8, raw: &[u8], gmin: u64, stamp: u64, key: &[u8], at: usize) -> Res<Entry> {
+    let mut pos = at;
+    let f = *raw.get(pos).ok_or("truncated block")?;
+    pos += 1;
+    if format == DELTA {
+        let kind = f & KIND_MASK;
+        let payload = if f & KIND_PAYLOAD != 0 {
+            let l = get_varint(raw, &mut pos)? as usize;
+            Some(get_bytes(raw, &mut pos, l)?.to_vec())
+        } else {
+            None
+        };
+        return Ok(Entry {
+            key: key.to_vec(),
+            present: kind != REMOVED,
+            start: kind != ADDED,
+            stamp,
+            flips: if kind == UPDATED { vec![] } else { vec![stamp] },
+            payload,
+        });
+    }
+    let s = gmin + get_varint(raw, &mut pos)?;
+    let mut flips = Vec::new();
+    if f & FLIPS != 0 {
+        let m = get_varint(raw, &mut pos)?;
+        let mut last = s;
+        for _ in 0..m {
+            last = last.checked_sub(get_varint(raw, &mut pos)?).ok_or("flip past zero")?;
+            flips.push(last);
+        }
+    }
+    let payload = if f & PAYLOAD != 0 {
+        let l = get_varint(raw, &mut pos)? as usize;
+        Some(get_bytes(raw, &mut pos, l)?.to_vec())
+    } else {
+        None
+    };
+    Ok(Entry { key: key.to_vec(), present: f & PRESENT != 0, start: f & START != 0, stamp: s, flips, payload })
+}
+
+type Found = Option<(bool, u64, Option<Vec<u8>>)>;
+
+/// Inputs newest first (each its chunks and a delta's stamp), keys sorted:
+/// per key, the newest entry's (present, stamp, payload), or None if no
+/// input holds it. Blocks are walked without building their entries.
+pub fn lookup(inputs: &[(Vec<&[u8]>, u64)], keys: &[&[u8]]) -> Res<Vec<Found>> {
+    let mut out: Vec<Found> = vec![None; keys.len()];
+    for (chunks, stamp) in inputs {
         let mut i = 0;
-        while let Some(e) = s.next()? {
-            while i < keys.len() && keys[i] < e.key.as_slice() {
-                i += 1;
-            }
-            if i == keys.len() {
-                break;
-            }
-            if keys[i] == e.key.as_slice() && out[i].is_none() {
-                out[i] = Some((e.present, e.stamp, e.payload));
+        'chunks: for chunk in chunks {
+            let mut pos = 0;
+            while pos < chunk.len() {
+                if i == keys.len() {
+                    break 'chunks;
+                }
+                let (format, raw, next) = read_block(chunk, pos)?;
+                pos = next;
+                let gmin = if format == LAYER {
+                    let mut p = 0;
+                    get_varint(&raw, &mut p)?;
+                    get_varint(&raw, &mut p)?
+                } else {
+                    0
+                };
+                walk_block(format, &raw, |key, at| {
+                    while i < keys.len() && keys[i] < key {
+                        i += 1;
+                    }
+                    if i == keys.len() {
+                        return Ok(false);
+                    }
+                    if keys[i] == key && out[i].is_none() {
+                        let e = entry_at(format, &raw, gmin, *stamp, key, at)?;
+                        out[i] = Some((e.present, e.stamp, e.payload));
+                    }
+                    Ok(true)
+                })?;
             }
         }
     }
@@ -781,7 +906,8 @@ pub fn layers_lookup<'py>(py: Python<'py>, inputs: Vec<Input>, keys: Vec<PyBacke
     if ks.windows(2).any(|w| w[0] >= w[1]) {
         return Err(err("lookup keys must be sorted and unique".into()));
     }
-    let found = py.detach(|| lookup(streams(&inputs), &ks)).map_err(err)?;
+    let ins: Vec<(Vec<&[u8]>, u64)> = inputs.iter().map(|(c, s)| (c.iter().map(|x| x.as_ref()).collect(), *s)).collect();
+    let found = py.detach(|| lookup(&ins, &ks)).map_err(err)?;
     let out = PyList::empty(py);
     for f in found {
         match f {
@@ -809,7 +935,7 @@ mod tests {
     use super::*;
 
     fn e(k: &str, present: bool, stamp: u64, flips: &[u64]) -> Entry {
-        Entry { key: k.as_bytes().to_vec(), present, stamp, flips: flips.to_vec(), payload: None }
+        Entry { key: k.as_bytes().to_vec(), present, start: false, stamp, flips: flips.to_vec(), payload: None }
     }
 
     fn layer(entries: &[Entry]) -> Vec<u8> {
@@ -826,16 +952,21 @@ mod tests {
         let older = layer(&[e("a", true, 5, &[5]), e("b", true, 3, &[])]);
         let newer = layer(&[e("a", false, 8, &[8]), e("c", true, 9, &[9])]);
         let out = merge(vec![Stream::new(vec![&older], 0), Stream::new(vec![&newer], 0)], 0, false, 64, 1, 1 << 20).unwrap();
-        let data: Vec<u8> = out.live.0.iter().flat_map(|f| f.0.clone()).collect();
+        let data: Vec<u8> = out.main.0.iter().flat_map(|f| f.0.clone()).collect();
         let mut s = Stream::new(vec![&data], 0);
         let mut got = vec![];
         while let Some(x) = s.next().unwrap() {
             got.push(x);
         }
-        assert_eq!(got, vec![e("a", false, 8, &[8, 5]), e("b", true, 3, &[]), e("c", true, 9, &[9])]);
+        // a: added in the older layer (absent at its start), removed in the
+        // newer: absent at both ends of the merged layer, so on the side.
+        assert_eq!(got, vec![e("b", true, 3, &[]), e("c", true, 9, &[9])]);
+        let side: Vec<u8> = out.side.0.iter().flat_map(|f| f.0.clone()).collect();
+        let mut s = Stream::new(vec![&side], 0);
+        assert_eq!(s.next().unwrap(), Some(e("a", false, 8, &[8, 5])));
         // Presence of a at P = 6: absent now, one flip after 6: present then.
         let mut rows = vec![];
-        scan(vec![Stream::new(vec![&data], 0)], Some(6), None, None, usize::MAX, &mut rows).unwrap();
+        scan(vec![Stream::new(vec![&data], 0), Stream::new(vec![&side], 0)], Some(6), None, None, usize::MAX, &mut rows).unwrap();
         let a = rows.iter().find(|r| r.key == b"a").unwrap();
         assert!(a.at_p && !a.at_h);
         assert!(rows.iter().all(|r| r.key != b"b"));
@@ -847,7 +978,7 @@ mod tests {
         let top = layer(&[e("a", false, 8, &[8]), e("d", false, 4, &[4])]);
         let out = merge(vec![Stream::new(vec![&base], 0), Stream::new(vec![&top], 0)], 5, true, 64, 1, 1 << 20).unwrap();
         assert_eq!(out.dropped, 1); // d: removed at 4, at or below the cut
-        let grave: Vec<u8> = out.grave.0.iter().flat_map(|f| f.0.clone()).collect();
+        let grave: Vec<u8> = out.side.0.iter().flat_map(|f| f.0.clone()).collect();
         let mut s = Stream::new(vec![&grave], 0);
         assert_eq!(s.next().unwrap(), Some(e("a", false, 8, &[8])));
         assert_eq!(s.next().unwrap(), None);

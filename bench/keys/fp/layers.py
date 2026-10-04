@@ -9,9 +9,12 @@ prototype: bench code, over `ObjectIO` and the native kernels in
   A delta is the layer [c, c], read with the commit's generation as stamp.
 - A **layer** covers commits [a, b]: per key changed in it, presence at b,
   stamp (generation of its last change), flips (generations of its adds and
-  removes newer than the cut), payload. Its **live** part holds what head
-  reads need; the **base** (the oldest layer) keeps its absent keys in a
-  separate **graveyard** part, which only catch-ups read.
+  removes newer than the cut), payload, and whether it was present at the
+  layer's start. Its **main** part holds what head reads and readers after
+  the layer need; its **side** part what only a reader whose P falls inside
+  the layer needs: in the base (the oldest layer) every absent key (its
+  graveyard), elsewhere keys absent at both ends (added and removed inside:
+  under churn, most temporary keys).
 - **Upkeep** merges adjacent layers: four of a tier, or the base absorbing
   the layers above it once they hold a quarter of it; every merge's output,
   if it reaches past the cut, holds at most k x (bytes of every newer layer)
@@ -85,20 +88,20 @@ class Layer:
     id: str
     a: int
     b: int
-    live: Part
-    grave: Part | None = None
+    main: Part
+    side: Part | None = None
     stamp: int | None = None  # a delta's generation; None for a stamped layer
 
     @property
     def size(self) -> int:
-        return self.live.size + (self.grave.size if self.grave else 0)
+        return self.main.size + (self.side.size if self.side else 0)
 
     @property
     def entries(self) -> int:
-        return self.live.entries + (self.grave.entries if self.grave else 0)
+        return self.main.entries + (self.side.entries if self.side else 0)
 
     def parts(self) -> list[Part]:
-        return [self.live] + ([self.grave] if self.grave else [])
+        return [self.main] + ([self.side] if self.side else [])
 
     def paths(self) -> list[str]:
         return [p for part in self.parts() for p in part.paths()]
@@ -108,8 +111,8 @@ class Layer:
 
     @staticmethod
     def from_json(d: dict) -> Layer:
-        g = d.get("grave")
-        return Layer(d["id"], d["a"], d["b"], Part(**d["live"]), Part(**g) if g else None, d.get("stamp"))
+        g = d.get("side")
+        return Layer(d["id"], d["a"], d["b"], Part(**d["main"]), Part(**g) if g else None, d.get("stamp"))
 
 
 @dataclass
@@ -248,20 +251,22 @@ class Reader:
     # -- Δ(P, H, after c, first N) -----------------------------------------------------
 
     def _over(self, p: int | None) -> list[tuple[Layer, list[Part]]]:
-        """Newest first: the layers that end after P and the parts to read."""
+        """Newest first: the layers that end after P and the parts to read
+        (a layer's side part only when P falls inside it)."""
         out = []
         for x in reversed(self.s.layers):
             if p is not None and x.b <= p:
                 break
-            parts = [x.live] + ([x.grave] if x.grave and p is not None else [])
+            parts = [x.main] + ([x.side] if x.side and p is not None and x.a <= p else [])
             out.append((x, parts))
         return out
 
     def _upto(self, over, g_p: int | None, p: int | None, after: bytes | None, limit: int) -> bytes | None:
         """A key bound such that the layers' entries in (after, bound] are
-        about `limit` x 1.2 (a straddled layer counted by its share of commits
-        after P); None means the end."""
-        target = limit * 1.2
+        about `limit` x 1.5 (a straddled layer counted by its share of commits
+        after P; stale entries make the distinct keys fewer); None means the
+        end."""
+        target = limit * 1.5
         streams = []
         for x, parts in over:
             share = 1.0
@@ -320,9 +325,7 @@ class Reader:
                 return keys, bytes(at_p), bytes(at_h), stamps, payloads, last
             if upto is None:
                 return keys, bytes(at_p), bytes(at_h), stamps, payloads, None
-            after = upto
-            if len(keys) >= limit // 2:
-                return keys, bytes(at_p), bytes(at_h), stamps, payloads, upto
+            after = upto  # short of `limit`: read on (another round trip)
 
     # -- sorted key lists --------------------------------------------------------------
 
@@ -349,11 +352,11 @@ class Reader:
         """Per key (sorted, unique): the newest entry's (present, stamp,
         payload), or None; with `p`, only layers ending after P."""
         over = self._over(p)
-        parts = [x.live for x, _ in over]
+        parts = [x.main for x, _ in over]
         await self.indexes(parts)
         inputs = []
         for x, _ in over:
-            part = x.live
+            part = x.main
             if part.index is None:
                 inputs.append(([self._whole[f[0]] for f in part.files], x.stamp or 0))
                 continue
@@ -536,19 +539,19 @@ class Layers:
         bottom = lo == 0
         kind = "base" if bottom else "tier"
         reads = []
-        for x in ins:  # oldest first; the base's graveyard is an input of its own
+        for x in ins:  # oldest first; a side part is an input of its own
             for part in x.parts():
                 datas = await asyncio.gather(*(self.io.read_whole(f[0], f[1]) for f in part.files))
                 reads.append((list(datas), x.stamp or 0))
         cut_g = self.s.gens[self.s.cut] if self.s.cut >= 0 else 0  # flips are generations
-        live, live_ix, grave, grave_ix, _, _ = await asyncio.to_thread(
+        main, main_ix, side, side_ix, _, _ = await asyncio.to_thread(
             _native.layers_merge, reads, cut_g, bottom, block_size=BLOCK, file_limit=FILE_LIMIT
         )
         a, b = ins[0].a, ins[-1].b
         lid = f"L{a}-{b}"
-        out = Layer(lid, a, b, await self._write_part(live, live_ix, f"l{a}-{b}", kind))
-        if bottom and grave:
-            out.grave = await self._write_part(grave, grave_ix, f"g{a}-{b}", kind)
+        out = Layer(lid, a, b, await self._write_part(main, main_ix, f"l{a}-{b}", kind))
+        if side:
+            out.side = await self._write_part(side, side_ix, f"s{a}-{b}", kind)
         self.written[kind].merges += 1
         return out if self.publish(ins, out) else None
 
@@ -636,4 +639,4 @@ class Layers:
     # -- accounting ----------------------------------------------------------------------
 
     def stored(self) -> int:
-        return sum(x.size + x.live.index_size + (x.grave.index_size if x.grave else 0) for x in self.s.layers)
+        return sum(x.size + x.main.index_size + (x.side.index_size if x.side else 0) for x in self.s.layers)

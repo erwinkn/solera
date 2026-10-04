@@ -17,6 +17,13 @@ the head (spanbench has no 8,640; added). Scenarios add:
 - `churn`: half of each commit is temporary keys: 250 added, and the 250
   added 100 commits earlier removed; the other 500 follow the usual mix.
 
+`--index layers`: stamped layers (W57, `bench/keys/fp/layers.py`,
+docs/key-index-from-first-principles.md): minimal deltas, written through
+the exact path (a lookup at the head, then the kinds); upkeep with the cut at
+the oldest live P (and `--window`, if set, as the window's edge); reads
+through `layers.Reader`, cold, every layer index fetched. Its stalled pass
+has no pinned snapshot (the design reads only at heads): `pinned` is skipped.
+
 `--horizon X`: a reader more than X commits behind the head is dropped (its
 next read is a full pass), a stalled pass cancel-restarted; on both indexes.
 `--retention floor|cover|window` (views): T keeps every level from the
@@ -51,6 +58,9 @@ from solera.keys.io import ObjectIO
 
 sys.path.insert(0, str(Path(__file__).parent))
 from twoviews import PackIO, TwoViews  # noqa: E402
+
+sys.path.insert(0, str(Path(__file__).parent.parent / "fp"))
+import layers as LY  # noqa: E402
 
 PER = 1000
 PAGE = 100_000
@@ -170,29 +180,102 @@ class Views:
         }
 
 
+class LayersIx:
+    """Stamped layers (W57), upkeep run to quiescence after every commit."""
+
+    def __init__(self, root: Path, window: int):
+        self.io = ObjectIO(LocalStore(str(root / "store"), mkdir=True))
+        self.lx = LY.Layers(self.io, PREFIX, window=window)
+
+    async def commit_keys(self, c: int, g: int, ups: list[bytes], rms: list[bytes]) -> tuple[int, int, int]:
+        before = LY.Written(**self.lx.written["delta"].__dict__)
+        await self.lx.commit(c, g, ups, rms)
+        w = self.lx.written["delta"]
+        return w.bytes - before.bytes, w.entries - before.entries, w.puts - before.puts
+
+    async def upkeep(self, endpoints: set[int], intervals) -> None:
+        # endpoints are next positions: the reader observed at next - 1
+        await self.lx.upkeep(min(endpoints) - 1 if endpoints else None)
+
+    def stored(self) -> int:
+        return self.lx.stored()
+
+    def save(self, root: Path) -> None:
+        (root / "layers.json").write_text(json.dumps(self.lx.s.to_json()))
+
+    def built(self) -> dict:
+        w = self.lx.written
+        return {
+            "layers": len(self.lx.s.layers),
+            "cut": self.lx.s.cut,
+            "entries": sum(x.entries for x in self.lx.s.layers),
+            "written": {k: x.__dict__ for k, x in w.items()},
+            "merge_entries": w["tier"].entries + w["base"].entries,
+            "merge_bytes": w["tier"].bytes + w["base"].bytes,
+            "merge_puts": w["tier"].puts + w["base"].puts,
+            "merges": w["tier"].merges + w["base"].merges,
+        }
+
+
+def sorted_key_chunks(n: int, size: int = 10_000_000):
+    """The base's keys in key order: `cust-` and 13 zero-padded digits sort as
+    their numbers do."""
+    vals = np.sort(values(np.arange(n)))
+    for lo in range(0, n, size):
+        digits = pc.utf8_lpad(pc.cast(pa.array(vals[lo : lo + size]), pa.string()), 13, "0")
+        yield pc.binary_join_element_wise("cust-", digits, "").cast(pa.large_binary())
+
+
+class LayersRead:
+    """The harness's read API over a `layers.Reader` (cold: every index and
+    block through the store)."""
+
+    def __init__(self, io, state):
+        self.r, self.head = LY.Reader(io, state), state.head
+
+    async def page(self, after, limit):
+        keys, _, _, stamps, _, nxt = await self.r.page(None, after, limit)
+        return keys, stamps, None, nxt
+
+    async def lookup(self, keys):
+        found = await self.r.lookup(keys)
+        return {k: (f[1],) for k, f in zip(keys, found, strict=True) if f is not None and f[0]}
+
+    async def write(self, ups):
+        found = await self.r.lookup(ups)
+        added = sum(1 for f in found if f is None or not f[0])
+        return type("Resolved", (), {"added": added, "removed": 0})()
+
+
 # -- the build -----------------------------------------------------------------------------------
 
 
 async def build(root: Path, a) -> dict:
     rng = np.random.default_rng(a.seed)
     opts = options(root)
-    ix = Spans(root, opts) if a.index == "spans" else Views(root, opts, a.retention, a.window)
+    if a.index == "layers":
+        ix = LayersIx(root, a.window if a.window_set else 0)
+    else:
+        ix = Spans(root, opts) if a.index == "spans" else Views(root, opts, a.retention, a.window)
     n, commits = a.n, a.commits
     capacity = n + commits * (PER // 20) + 1 + (commits * PER // 4 if a.scenario == "churn" else 0)
     gen = np.zeros(capacity, dtype=np.uint32)
     t0 = time.perf_counter()
-    chunks = []
-    for lo in range(0, n, 10_000_000):
-        ids = np.arange(lo, min(n, lo + 10_000_000))
-        digits = pc.utf8_lpad(pc.cast(pa.array(values(ids)), pa.string()), 13, "0")
-        chunks.append(pc.binary_join_element_wise("cust-", digits, ""))
-    table = pa.table({"k": pa.chunked_array(chunks)})
-    base_opts = opts if a.index == "spans" else ix.v.base_o
-    files, _ = await KeyIndex(ix.io, None, IndexState(prefix=PREFIX), base_opts).replace(
-        Rows.arrow(table, "k"), 0, "base", generation=1
-    )
-    del table
-    ix.commit(0, files)
+    if a.index == "layers":
+        await ix.lx.load_base(sorted_key_chunks(n), 1)
+    else:
+        chunks = []
+        for lo in range(0, n, 10_000_000):
+            ids = np.arange(lo, min(n, lo + 10_000_000))
+            digits = pc.utf8_lpad(pc.cast(pa.array(values(ids)), pa.string()), 13, "0")
+            chunks.append(pc.binary_join_element_wise("cust-", digits, ""))
+        table = pa.table({"k": pa.chunked_array(chunks)})
+        base_opts = opts if a.index == "spans" else ix.v.base_o
+        files, _ = await KeyIndex(ix.io, None, IndexState(prefix=PREFIX), base_opts).replace(
+            Rows.arrow(table, "k"), 0, "base", generation=1
+        )
+        del table
+        ix.commit(0, files)
     gen[:n] = 1
     present = np.arange(n, dtype=np.int64)
     live_n, nxt_id = n, n
@@ -238,19 +321,25 @@ async def build(root: Path, a) -> dict:
         live_n += add_n
         ups = sorted(key(int(i)) for i in np.concatenate([upd, add, churn_add]))
         rms = sorted(key(int(i)) for i in np.concatenate([rm, churn_rm]))
-        if a.index == "spans":  # as spanbench
-            files, _ = await ix.index().resolve(
-                SortedEntries.of(ups, None, rms), commit_number=c, attempt=f"a{c}", generation=g
-            )
-        else:  # the exact sparse path: resolve's stream-or-sparse switch counts blocks, and
-            # 16 KiB blocks of a filterless base make it stream 100M keys for every commit
-            idx = ix.index()
-            delta = await idx.delta(SortedEntries.of(ups, None, rms), generation=g)
-            files = await idx.write(c, f"a{c}", delta, g)
-        delta_bytes += sum(f.size for f in files.files)
-        delta_entries += sum(f.entries for f in files.files)
-        delta_puts += len(files.files)
-        ix.commit(c, files)
+        if a.index == "layers":  # the exact path: the written keys looked up at the head
+            db, de, dp = await ix.commit_keys(c, g, ups, rms)
+            delta_bytes += db
+            delta_entries += de
+            delta_puts += dp
+        else:
+            if a.index == "spans":  # as spanbench
+                files, _ = await ix.index().resolve(
+                    SortedEntries.of(ups, None, rms), commit_number=c, attempt=f"a{c}", generation=g
+                )
+            else:  # the exact sparse path: resolve's stream-or-sparse switch counts blocks, and
+                # 16 KiB blocks of a filterless base make it stream 100M keys for every commit
+                idx = ix.index()
+                delta = await idx.delta(SortedEntries.of(ups, None, rms), generation=g)
+                files = await idx.write(c, f"a{c}", delta, g)
+            delta_bytes += sum(f.size for f in files.files)
+            delta_entries += sum(f.entries for f in files.files)
+            delta_puts += len(files.files)
+            ix.commit(c, files)
         gen[upd] = g
         gen[add] = g
         gen[churn_add] = g
@@ -304,7 +393,7 @@ async def build(root: Path, a) -> dict:
     return {
         "index": a.index,
         "scenario": a.scenario,
-        "retention": a.retention if a.index == "views" else "spans",
+        "retention": a.retention if a.index == "views" else a.index,
         "window": a.window,
         "horizon": a.horizon,
         "n": n,
@@ -331,7 +420,13 @@ async def read(root: Path, what: str, at: int | None) -> dict:
     now = np.load(root / "head.npy")
     opts = options(root)
     views = built["index"] == "views"
-    if views:
+    layers = built["index"] == "layers"
+    if layers:
+        io = ObjectIO(LocalStore(str(root / "store")), latency=0.03, bandwidth=80e6, concurrency=64)
+        st = LY.State.from_json(json.loads((root / "layers.json").read_text()))
+        idx = LayersRead(io, st)
+        head = st.head
+    elif views:
         io = PackIO(LocalStore(str(root / "store")), latency=0.03, bandwidth=80e6, concurrency=64)
         v = TwoViews.from_json(io, opts, json.loads((root / "views.json").read_text()))
         head, idx = v.head, v.k()
@@ -355,6 +450,15 @@ async def read(root: Path, what: str, at: int | None) -> dict:
                 while True:
                     keys, gens, _, nxt = await idx.page(after, PAGE)
                     yield keys, bytes(len(keys)), gens, bytes(len(keys))
+                    if nxt is None:
+                        return
+                    after = nxt
+            elif layers:  # a reader at position `at` observed at at - 1
+                after = None
+                while True:
+                    keys, ap, ah, stamps, _, nxt = await idx.r.page(at - 1, after, PAGE)
+                    cls = bytes(1 if a and h else 0 if h else 2 for a, h in zip(ap, ah, strict=True))
+                    yield keys, cls, stamps, bytes(1 - h for h in ah)
                     if nxt is None:
                         return
                     after = nxt
@@ -392,6 +496,8 @@ async def read(root: Path, what: str, at: int | None) -> dict:
         else:
             bad += int(np.count_nonzero((then != now) & ~seen))
         out = {"keys": n_got, "mismatches": bad}
+    elif what == "pinned" and layers:  # no snapshot of an old commit, by design
+        return {"what": what, "at": at, "unsupported": True, "keys": 0, "mismatches": 0, "first_s": 0, "wall_s": 0, "gets": 0, "mb_in": 0, "peak_mb": 0}
     elif what == "pinned":  # the stalled pass's snapshot: a first page
         then = np.load(root / f"before-{at}.npy")
         if views:
@@ -407,7 +513,7 @@ async def read(root: Path, what: str, at: int | None) -> dict:
     elif what == "write":
         live = np.flatnonzero(now)
         ups = sorted(key(int(i)) for i in rng.choice(live, PER, replace=False))
-        delta = await idx.delta(SortedEntries.of(ups), generation=2**40)
+        delta = await (idx.write(ups) if layers else idx.delta(SortedEntries.of(ups), generation=2**40))
         wall = time.perf_counter() - t
         out = {"keys": len(ups), "mismatches": int(delta.removed != 0 or delta.added != 0)}
     elif what == "lookups":
@@ -452,9 +558,9 @@ def isolated(root: Path, what: str, at: int | None) -> dict:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--index", choices=("spans", "views"), default="views")
+    ap.add_argument("--index", choices=("spans", "views", "layers"), default="views")
     ap.add_argument("--retention", choices=("floor", "cover", "window"), default="window")
-    ap.add_argument("--window", type=int, default=8640)
+    ap.add_argument("--window", type=int, default=None, help="views: 8,640 if unset; layers: the cut is at most this far back (none if unset)")
     ap.add_argument("--horizon", type=int, default=0)
     ap.add_argument("--scenario", choices=("base", "daily100", "stall", "churn"), default="base")
     ap.add_argument("--size", default="1e6")
@@ -469,6 +575,9 @@ def main():
     ap.add_argument("--no-reads", action="store_true")
     ap.add_argument("--reads")
     a = ap.parse_args()
+    a.window_set = a.window is not None
+    if a.window is None:
+        a.window = 8640
     if a.read:
         root, what, at = a.read
         print(json.dumps(asyncio.run(read(Path(root), what, None if int(at) < 0 else int(at)))))
@@ -481,6 +590,8 @@ def main():
         name = f"{a.index}-{a.scenario}-{a.n}-{a.commits}-{a.large}x{a.large_every}-{a.codec}-{a.block_size >> 10}k-h{a.horizon}"
         if a.index == "views":
             name += f"-{a.retention}{a.window if a.retention == 'window' else ''}"
+        if a.index == "layers" and a.window_set:
+            name += f"-w{a.window}"
         root = Path(a.dir) / name
         shutil.rmtree(root, ignore_errors=True)
         root.mkdir(parents=True)
