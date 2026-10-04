@@ -1,0 +1,6 @@
+delta of 1000 keys at 100M density, 16 KiB blocks, zstd-1, 200 deltas
+kx	12.92 B/entry	12918 B/delta	decode 26.6 M entries/s
+minimal	6.47 B/entry	6468 B/delta	decode 32.5 M entries/s
+delta of 1000000 keys at 100M density, 16 KiB blocks, zstd-1, 2 deltas
+kx	11.04 B/entry	10985714 B/delta	decode 30.2 M entries/s
+minimal	4.92 B/entry	4893129 B/delta	decode 36.7 M entries/s

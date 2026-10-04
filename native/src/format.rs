@@ -20,6 +20,8 @@ pub const FORMAT_VERSION: u16 = 4;
 pub const MAX_BLOCK_BYTES: u64 = 16 << 20;
 pub const CODEC_NONE: u8 = 0;
 pub const CODEC_ZLIB: u8 = 1;
+/// zstd at the writer's `level` (W53 prototype: smaller and faster to decode than zlib).
+pub const CODEC_ZSTD: u8 = 2;
 pub const FOOTER_SIZE: usize = 48;
 
 #[derive(Debug)]
@@ -99,6 +101,8 @@ pub(crate) fn compress(data: &[u8], codec: u8, level: u32) -> Vec<u8> {
         );
         enc.write_all(data).expect("writing to a Vec cannot fail");
         enc.finish().expect("writing to a Vec cannot fail")
+    } else if codec == CODEC_ZSTD {
+        zstd::bulk::compress(data, level as i32).expect("compressing to a Vec cannot fail")
     } else {
         data.to_vec()
     }
@@ -117,6 +121,15 @@ pub(crate) fn decompress_at_most(data: &[u8], codec: u8, limit: u64) -> Result<V
                 .take(limit.saturating_add(1))
                 .read_to_end(&mut out)
                 .map_err(|e| Error::Format(format!("bad zlib data: {e}")))?;
+            out
+        }
+        CODEC_ZSTD => {
+            let mut out = Vec::with_capacity(data.len().saturating_mul(3).min(limit as usize));
+            zstd::stream::read::Decoder::new(data)
+                .map_err(|e| Error::Format(format!("bad zstd data: {e}")))?
+                .take(limit.saturating_add(1))
+                .read_to_end(&mut out)
+                .map_err(|e| Error::Format(format!("bad zstd data: {e}")))?;
             out
         }
         CODEC_NONE => data.to_vec(),

@@ -1,0 +1,24 @@
+100m-spans-base-zlib64 --index spans --size 1e8 --scenario base
+1m-views-stall-zstd16-w8640 --index views --size 1e6 --scenario stall --codec zstd --block-size 16384 --window 8640
+1m-spans-stall-zlib64 --index spans --size 1e6 --scenario stall
+1m-views-base-zlib64-w8640 --index views --size 1e6 --scenario base --window 8640
+100m-views-base-zstd16-w8640 --index views --size 1e8 --scenario base --codec zstd --block-size 16384 --window 8640
+1m-views-churn-zstd16-w8640 --index views --size 1e6 --scenario churn --codec zstd --block-size 16384 --window 8640
+1m-spans-churn-zlib64 --index spans --size 1e6 --scenario churn
+1m-views-daily100-zstd16-w8640 --index views --size 1e6 --scenario daily100 --codec zstd --block-size 16384 --window 8640
+1m-spans-daily100-zlib64 --index spans --size 1e6 --scenario daily100
+1m-views-daily100-zstd16-cover --index views --size 1e6 --scenario daily100 --codec zstd --block-size 16384 --retention cover
+1m-views-base-zstd16-cover --index views --size 1e6 --scenario base --codec zstd --block-size 16384 --retention cover
+100m-spans-base-zstd16 --index spans --size 1e8 --scenario base --codec zstd --block-size 16384
+1m-spans-daily100-zlib64-h1000 --index spans --size 1e6 --scenario daily100 --horizon 1000
+1m-views-daily100-zstd16-floor-h1000 --index views --size 1e6 --scenario daily100 --codec zstd --block-size 16384 --retention floor --horizon 1000
+100m-views-large-zstd16-w8640 --index views --size 1e8 --scenario base --large 1000000 --large-every 3000 --codec zstd --block-size 16384 --window 8640
+100m-spans-large-zlib64 --index spans --size 1e8 --scenario base --large 1000000 --large-every 3000
+100m-views-base-zlib64-w8640 --index views --size 1e8 --scenario base --window 8640
+1m-views-base-zstd16-w8640 --index views --size 1e6 --scenario base --codec zstd --block-size 16384 --window 8640
+1m-views-stall-zstd16-w8640-v2 --index views --size 1e6 --scenario stall --codec zstd --block-size 16384 --window 8640
+100m-views-base-zstd16-w8640 --index views --size 1e8 --scenario base --codec zstd --block-size 16384 --window 8640
+1m-views-base-zlib64-w8640 --index views --size 1e6 --scenario base --window 8640
+1m-views-daily100-zstd16-w8640 --index views --size 1e6 --scenario daily100 --codec zstd --block-size 16384 --window 8640
+1m-views-large-zstd16-w8640 --index views --size 1e6 --scenario base --large 1000000 --large-every 3000 --codec zstd --block-size 16384 --window 8640
+1m-spans-large-zlib64 --index spans --size 1e6 --scenario base --large 1000000 --large-every 3000

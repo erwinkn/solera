@@ -184,6 +184,7 @@ impl<'a> Groups<'a> {
 pub struct Retainer {
     endpoints: Vec<u64>,
     base: bool,
+    drop_absent: bool,
     newer: Option<u64>,
     pending: Option<Version>,
     oldest: (Option<u64>, Option<Vec<u8>>),
@@ -196,10 +197,17 @@ impl Retainer {
         Retainer {
             endpoints,
             base,
+            drop_absent: false,
             newer: None,
             pending: None,
             oldest: (None, None),
         }
+    }
+
+    /// Drop a key that is a tombstone naming no predecessor: absent before
+    /// and after (the two views' net merge; spans keep it, A12-1).
+    pub fn drop_absent(&mut self) {
+        self.drop_absent = true;
     }
 
     /// The (sorted) endpoints it keeps versions for.
@@ -237,6 +245,9 @@ impl Retainer {
             }
         } else {
             (v.predecessor, v.prior) = oldest;
+            if self.drop_absent && v.deleted && v.predecessor.is_none() {
+                return None;
+            }
         }
         Some(v)
     }
