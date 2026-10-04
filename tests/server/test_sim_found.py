@@ -1052,3 +1052,50 @@ async def test_a_pool_attempt_is_offered_only_once_its_launch_is_durable(state, 
     hold.set()
     await ticking
     assert offered == [], "a launch that is not durable is offered to pool workers"
+
+
+@pytest.mark.xfail(strict=True, reason="F33: open (D56)")
+async def test_a_key_a_current_read_missed_reaches_its_consumer_once_restored(state, tmp_path):
+    """F33: `feed` is a keyed source read current (a load answers with the
+    outside as it is now). `feed` commits k1 at version 3; before `items`
+    reads it, the outside loses k1 and the commit saying so never lands;
+    `items` runs, finds no row for k1, and commits. The client restores k1 at
+    version 3 and commits: the same version, so no change. `items` must
+    still end up holding what `feed`'s index lists."""
+
+    from solera.sdk import Source
+
+    from tests.sim.oracle import index_entries
+    from tests.sim.project import External, SourceStore, rebuild
+
+    outside = External()
+
+    @asset(inputs={"feed": Incremental()}, outputs=Output("items", key="id"))
+    def items(ctx, feed: list):
+        return rebuild(ctx.batch["feed"], [{"id": r["id"], "v": r["v"]} for r in feed])
+
+    project = Project(
+        assets=[items],
+        sources=[Source("feed", key="id", store="ext")],
+        stores={"ext": SourceStore(tmp_path / "ext", outside)},
+        default_store=FileStore(tmp_path / "data"),
+    )
+    engine = make_engine(state, project)
+    await engine.initialize()
+    outside.feed.update(k0="1")
+    await engine.commit_source("feed", upsert={"k0": "1"})
+    await drive(engine, await engine.submit(["items"]))
+    outside.feed.clear()
+    outside.feed.update(k1="3")
+    await engine.commit_source("feed", upsert={"k1": "3"}, remove=["k0"])
+    outside.feed.clear()  # the outside loses k1; the commit saying so never lands
+    outside.feed.update(k3="3")
+    await drive(engine, await engine.submit(["items"]))  # finds no row for k1
+    outside.feed.clear()
+    outside.feed.update(k1="3")  # restored, at its old version
+    await engine.commit_source("feed", keys={"k1": "3"})
+    for _ in range(3):  # whatever runs it takes
+        await drive(engine, await engine.submit(["items"]))
+    held = set(await index_entries(state, "items", ""))
+    listed = set(await index_entries(state, "feed", ""))
+    assert held == listed, f"items holds {sorted(held)}, feed's index lists {sorted(listed)}"
