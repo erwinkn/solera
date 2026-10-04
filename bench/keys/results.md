@@ -1341,3 +1341,81 @@ same on matched layouts; the first version's 1,117-vs-1,851 GETs compared
 against a leveled layout with 2.0 entries per live key and is withdrawn.
 
     RAYON_NUM_THREADS=2 uv run python bench/keys/layouts.py --sizes 1e6,1e8 --commits 30000
+
+## Format v4 on real files (2026-10-05)
+
+`v4bench.py`: the capped policy with real v4 merges, 12,000 commits of 1K keys; readers cold in isolated processes; every read checked against the per-commit fold (mismatches: 0 everywhere). Peak = the reader process's RSS above its baseline.
+
+| Keys | Scenario | Spans max | Compaction / total entries | Bytes compaction / total | Stored |
+|---|---|---|---|---|---|
+| 1,000,000 | daily +100,000-key commits | 16 | 6.5× / 7.5× | 6.0× / 7.0× | 33 MB |
+| 1,000,000 | daily hot | 15 | 6.1× / 7.1× | 5.5× / 6.5× | 42 MB |
+| 1,000,000 | many | 24 | 6.4× / 7.4× | 5.8× / 6.8× | 80 MB |
+| 1,000,000 | stalled | 13 | 6.5× / 7.5× | 6.0× / 7.0× | 29 MB |
+| 1,000,000 | staggered | 14 | 7.0× / 8.0× | 6.3× / 7.3× | 32 MB |
+| 100,000,000 | daily +1,000,000-key commits | 18 | 6.7× / 7.7× | 6.6× / 7.6× | 340 MB |
+
+| Keys | Scenario | Read | Spans | Keys | First | Full | GETs | MB | Decoded MB | Peak |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 1,000,000 | daily +100,000-key commits | v4 spans, 1 behind | 1 | 1,000 | 0.07 s | 0.07 s | 2 | 0.0 | 0.0 | 2 MB |
+| 1,000,000 | daily +100,000-key commits | packed deltas, 1 behind | 1 | 1,000 | 0.03 s | 0.03 s | 1 | 0.0 | 0.0 | 2 MB |
+| 1,000,000 | daily +100,000-key commits | v4 spans, 100 behind | 5 | 94,578 | 0.10 s | 0.16 s | 14 | 1.6 | 3.2 | 25 MB |
+| 1,000,000 | daily +100,000-key commits | packed deltas, 100 behind | 100 | 94,578 | 0.06 s | 0.06 s | 1 | 1.0 | 0.0 | 15 MB |
+| 1,000,000 | daily +100,000-key commits | v4 spans, 360 behind | 6 | 295,311 | 0.10 s | 0.33 s | 30 | 3.6 | 7.1 | 44 MB |
+| 1,000,000 | daily +100,000-key commits | packed deltas, 360 behind | 360 | 295,311 | 0.16 s | 0.16 s | 1 | 3.6 | 0.0 | 52 MB |
+| 1,000,000 | daily +100,000-key commits | v4 spans, 10,000 behind | 9 | 1,299,828 | 0.11 s | 1.76 s | 181 | 21.1 | 41.0 | 131 MB |
+| 1,000,000 | daily +100,000-key commits | packed deltas, 10,000 behind | 10,000 | 1,299,828 | 5.72 s | 5.72 s | 7 | 101.7 | 0.0 | 1503 MB |
+| 1,000,000 | daily +100,000-key commits | v4 lookup 1K at head | 10 | 1,000 | 0.44 s | 0.49 s | 20 | 25.4 | 52.9 | 75 MB |
+| 1,000,000 | daily +100,000-key commits | v4 scan page at head | 10 | 19,182 | 0.08 s | 0.08 s | 20 | 0.9 | 1.9 | 17 MB |
+| 1,000,000 | daily hot | v4 spans, 1 behind | 1 | 1,000 | 0.07 s | 0.07 s | 2 | 0.0 | 0.0 | 2 MB |
+| 1,000,000 | daily hot | packed deltas, 1 behind | 1 | 1,000 | 0.03 s | 0.03 s | 1 | 0.0 | 0.0 | 2 MB |
+| 1,000,000 | daily hot | v4 spans, 100 behind | 5 | 86,994 | 0.10 s | 0.10 s | 10 | 0.8 | 1.6 | 29 MB |
+| 1,000,000 | daily hot | packed deltas, 100 behind | 100 | 86,994 | 0.06 s | 0.06 s | 1 | 1.0 | 0.0 | 15 MB |
+| 1,000,000 | daily hot | v4 spans, 360 behind | 7 | 280,508 | 0.09 s | 0.72 s | 55 | 7.7 | 14.7 | 17 MB |
+| 1,000,000 | daily hot | packed deltas, 360 behind | 360 | 280,508 | 0.16 s | 0.16 s | 1 | 3.6 | 0.0 | 52 MB |
+| 1,000,000 | daily hot | v4 spans, 10,000 behind | 10 | 1,435,783 | 0.10 s | 2.22 s | 220 | 26.7 | 52.3 | 69 MB |
+| 1,000,000 | daily hot | packed deltas, 10,000 behind | 10,000 | 1,435,783 | 5.53 s | 5.53 s | 6 | 100.0 | 0.0 | 1492 MB |
+| 1,000,000 | daily hot | v4 lookup 1K at head | 11 | 1,000 | 0.53 s | 0.59 s | 22 | 31.5 | 67.5 | 98 MB |
+| 1,000,000 | daily hot | v4 scan page at head | 11 | 20,567 | 0.08 s | 0.08 s | 22 | 0.9 | 1.8 | 16 MB |
+| 1,000,000 | many | v4 spans, 1 behind | 1 | 1,000 | 0.06 s | 0.06 s | 2 | 0.0 | 0.0 | 2 MB |
+| 1,000,000 | many | packed deltas, 1 behind | 1 | 1,000 | 0.03 s | 0.03 s | 1 | 0.0 | 0.0 | 2 MB |
+| 1,000,000 | many | v4 spans, 100 behind | 6 | 94,661 | 0.10 s | 0.16 s | 16 | 1.7 | 3.2 | 25 MB |
+| 1,000,000 | many | packed deltas, 100 behind | 100 | 94,661 | 0.06 s | 0.06 s | 1 | 1.0 | 0.0 | 15 MB |
+| 1,000,000 | many | v4 spans, 360 behind | 7 | 295,726 | 0.10 s | 0.34 s | 31 | 3.6 | 6.9 | 44 MB |
+| 1,000,000 | many | packed deltas, 360 behind | 360 | 295,726 | 0.16 s | 0.16 s | 1 | 3.6 | 0.0 | 52 MB |
+| 1,000,000 | many | v4 spans, 10,000 behind | 21 | 1,289,313 | 0.11 s | 5.55 s | 1,502 | 60.8 | 119.1 | 65 MB |
+| 1,000,000 | many | packed deltas, 10,000 behind | 10,000 | 1,289,313 | 5.60 s | 5.61 s | 6 | 99.7 | 0.0 | 1476 MB |
+| 1,000,000 | many | v4 lookup 1K at head | 21 | 1,000 | 0.76 s | 0.88 s | 42 | 60.8 | 119.1 | 174 MB |
+| 1,000,000 | many | v4 scan page at head | 21 | 8,141 | 0.09 s | 0.09 s | 42 | 1.3 | 2.5 | 20 MB |
+| 1,000,000 | stalled | v4 spans, 1 behind | 1 | 1,000 | 0.07 s | 0.07 s | 2 | 0.0 | 0.0 | 2 MB |
+| 1,000,000 | stalled | packed deltas, 1 behind | 1 | 1,000 | 0.03 s | 0.03 s | 1 | 0.0 | 0.0 | 2 MB |
+| 1,000,000 | stalled | v4 spans, 100 behind | 6 | 94,661 | 0.10 s | 0.11 s | 12 | 0.8 | 1.6 | 35 MB |
+| 1,000,000 | stalled | packed deltas, 100 behind | 100 | 94,661 | 0.06 s | 0.06 s | 1 | 1.0 | 0.0 | 15 MB |
+| 1,000,000 | stalled | v4 spans, 360 behind | 7 | 295,726 | 0.10 s | 0.29 s | 25 | 2.9 | 5.7 | 46 MB |
+| 1,000,000 | stalled | packed deltas, 360 behind | 360 | 295,726 | 0.16 s | 0.16 s | 1 | 3.6 | 0.0 | 52 MB |
+| 1,000,000 | stalled | v4 spans, 10,000 behind | 9 | 1,289,313 | 0.10 s | 1.41 s | 105 | 16.5 | 32.4 | 137 MB |
+| 1,000,000 | stalled | packed deltas, 10,000 behind | 10,000 | 1,289,313 | 5.75 s | 5.75 s | 6 | 99.7 | 0.0 | 1491 MB |
+| 1,000,000 | stalled | v4 lookup 1K at head | 10 | 1,000 | 0.44 s | 0.48 s | 20 | 21.1 | 47.3 | 64 MB |
+| 1,000,000 | stalled | v4 scan page at head | 10 | 20,136 | 0.08 s | 0.08 s | 20 | 0.8 | 1.7 | 16 MB |
+| 1,000,000 | staggered | v4 spans, 1 behind | 1 | 1,000 | 0.07 s | 0.07 s | 2 | 0.0 | 0.0 | 2 MB |
+| 1,000,000 | staggered | packed deltas, 1 behind | 1 | 1,000 | 0.03 s | 0.03 s | 1 | 0.0 | 0.0 | 2 MB |
+| 1,000,000 | staggered | v4 spans, 100 behind | 5 | 94,661 | 0.10 s | 0.16 s | 11 | 1.3 | 2.6 | 22 MB |
+| 1,000,000 | staggered | packed deltas, 100 behind | 100 | 94,661 | 0.06 s | 0.06 s | 1 | 1.0 | 0.0 | 15 MB |
+| 1,000,000 | staggered | v4 spans, 360 behind | 6 | 295,726 | 0.09 s | 0.50 s | 26 | 5.3 | 10.2 | 39 MB |
+| 1,000,000 | staggered | packed deltas, 360 behind | 360 | 295,726 | 0.16 s | 0.16 s | 1 | 3.6 | 0.0 | 52 MB |
+| 1,000,000 | staggered | v4 spans, 10,000 behind | 9 | 1,289,313 | 0.10 s | 2.24 s | 211 | 23.7 | 48.6 | 54 MB |
+| 1,000,000 | staggered | packed deltas, 10,000 behind | 10,000 | 1,289,313 | 5.57 s | 5.57 s | 6 | 99.7 | 0.0 | 1491 MB |
+| 1,000,000 | staggered | v4 lookup 1K at head | 9 | 1,000 | 0.44 s | 0.49 s | 18 | 23.7 | 48.6 | 77 MB |
+| 1,000,000 | staggered | v4 scan page at head | 9 | 21,396 | 0.08 s | 0.08 s | 18 | 0.8 | 1.6 | 15 MB |
+| 100,000,000 | daily +1,000,000-key commits | v4 spans, 1 behind | 1 | 1,000 | 0.07 s | 0.07 s | 2 | 0.0 | 0.0 | 2 MB |
+| 100,000,000 | daily +1,000,000-key commits | packed deltas, 1 behind | 1 | 1,000 | 0.03 s | 0.03 s | 1 | 0.0 | 0.0 | 2 MB |
+| 100,000,000 | daily +1,000,000-key commits | v4 spans, 100 behind | 5 | 99,939 | 0.09 s | 0.51 s | 24 | 5.5 | 10.3 | 11 MB |
+| 100,000,000 | daily +1,000,000-key commits | packed deltas, 100 behind | 100 | 99,939 | 0.06 s | 0.06 s | 1 | 1.0 | 0.0 | 14 MB |
+| 100,000,000 | daily +1,000,000-key commits | v4 spans, 360 behind | 5 | 359,228 | 0.10 s | 0.53 s | 24 | 5.5 | 10.3 | 46 MB |
+| 100,000,000 | daily +1,000,000-key commits | packed deltas, 360 behind | 360 | 359,228 | 0.16 s | 0.16 s | 1 | 3.5 | 0.0 | 52 MB |
+| 100,000,000 | daily +1,000,000-key commits | v4 spans, 10,000 behind | 9 | 12,029,478 | 0.11 s | 8.53 s | 633 | 78.6 | 153.9 | 554 MB |
+| 100,000,000 | daily +1,000,000-key commits | packed deltas, 10,000 behind | 10,000 | 12,029,478 | 6.60 s | 6.60 s | 7 | 115.5 | 0.0 | 1553 MB |
+| 100,000,000 | daily +1,000,000-key commits | v4 lookup 1K at head | 11 | 1,000 | 1.69 s | 1.80 s | 1,166 | 242.4 | 162.8 | 361 MB |
+| 100,000,000 | daily +1,000,000-key commits | v4 scan page at head | 11 | 100,000 | 0.10 s | 0.10 s | 71 | 0.7 | 1.6 | 45 MB |
+
+    RAYON_NUM_THREADS=3 uv run python bench/keys/v4bench.py --size 1e6 --scenario daily --large 100000

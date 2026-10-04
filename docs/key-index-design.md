@@ -14,12 +14,60 @@ reader: `bench/keys/catchup.py`, `layouts.py`, `tiling_reads.py`),
 `bb/experiment-bend-2-for-the-key-index-s-delta-alge-thr_dqc6iaviun`).
 Replayed numbers are preliminary until the implementation replaces them.
 
-What is not measured on real files yet: spans holding several versions of
-a key (format v4) have no native merge. The real catch-up runs on spans
-that do not cross the consumers' positions, and the matched layouts have no
-endpoint inside a span. So the span count under many observers, and the
-cost of reading inner versions, are replayed only. The native v4 prototype
-comes next and replaces them.
+**Measured on format v4 files** (`bench/keys/v4bench.py`, prototype
+`native/src/v4.rs`): the `capped` policy running real version-keeping
+merges over 12,000 commits of 1K keys, with consumers holding live
+endpoints, then cold readers in isolated processes (30 ms per request,
+80 MB/s per connection, 64 in parallel). Every read was compared key by key
+with the per-commit fold: no mismatch in any scenario. Peak memory is the
+reader process's own, above its baseline.
+
+| Scenario | Spans, max | Compaction / total entry writes | Compressed bytes, compaction / total | Stored |
+|---|---|---|---|---|
+| 1M, daily readers, a 100K-key commit every 3,000 | 16 | 6.5× / 7.5× | 6.0× / 7.0× | 33 MB |
+| 1M, daily readers, hot set (half the updates to 1% of keys) | 15 | 6.1× / 7.1× | 5.5× / 6.5× | 42 MB |
+| 1M, 100 daily readers, spread | 24 | 6.4× / 7.4× | 5.8× / 6.8× | 80 MB |
+| 1M, a daily reader stalled from commit 2,000 | 13 | 6.5× / 7.5× | 6.0× / 7.0× | 29 MB |
+| 1M, 60 staggered hourly readers | 14 | 7.0× / 8.0× | 6.3× / 7.3× | 32 MB |
+| 100M, daily readers, a 1M-key commit every 3,000 | 18 | 6.7× / 7.7× | 6.6× / 7.6× | 340 MB |
+
+Catch-up, `changes(P, H)` paged 100K entries at a time, against the
+control (the same deltas in one packed object, merged at once; its first
+key needs every delta's first block, so its first page is its full read):
+
+| Behind | v4 spans: first page · full · GETs · MB · peak | Packed: full · GETs · MB · peak |
+|---|---|---|
+| 100, 1M keys | 0.10 s · 0.10–0.16 s · 10–16 · 0.8–1.7 · 22–35 MB | 0.06 s · 1 · 1.0 · 15 MB |
+| 360, 1M | 0.09–0.10 s · 0.29–0.72 s · 25–55 · 2.9–7.7 · 17–46 MB | 0.16 s · 1 · 3.6 · 52 MB |
+| 10,000, 1M (1.3–1.4M keys changed) | 0.10–0.11 s · 1.4–5.6 s · 105–1,502 · 16–61 · 54–137 MB | 5.5–5.8 s · 6–7 · 100–102 · ~1.5 GB |
+| 100, 100M | 0.09 s · 0.51 s · 24 · 5.5 · 11 MB | 0.06 s · 1 · 1.0 · 14 MB |
+| 360, 100M | 0.10 s · 0.53 s · 24 · 5.5 · 46 MB | 0.16 s · 1 · 3.5 · 52 MB |
+| 10,000, 100M (12M keys changed) | 0.11 s · 8.5 s · 633 · 79 · 554 MB | 6.6 s · 7 · 116 · 1,553 MB |
+
+At the head: 1K exact lookups take 18–42 GETs, 21–61 MB and 0.48–0.88 s at
+1M (today's leveled layout on a matched trace: 3 GETs, 10 MB, 0.21 s), and
+1,166 GETs, 242 MB and 1.8 s at 100M (leveled, matched trace with other
+keys: 907 GETs, 200 MB, 1.13 s). A 100K-key scan page takes 0.08–0.10 s.
+
+What this says:
+
+- **Writes and span counts hold** on real files: 6–7× compaction entry
+  writes in every scenario, at most 24 spans with 100 readers, the cap
+  never reached.
+- **Far catch-ups win where it matters for a consumer**: the first page in
+  0.1 s instead of 5.5–6.6 s, and a fraction of the memory. A full 12M-key
+  read at 100M is slower than one packed merge (8.5 s against 6.6 s).
+- **Near catch-ups lose to one packed object**: 0.1–0.7 s against
+  0.06–0.16 s, since spans of 5–7 files and the read rule's 10 MB slack
+  cost more requests and bytes than one object holding exactly the deltas.
+- **Lookups pay for retained versions**: at 1M with lagging readers the
+  index holds 3–8× the live keys and a cold lookup reads them; at 100M the
+  versions are a small share and lookups cost about what they cost today.
+  The engine's warm cache answers lookups locally either way.
+
+Limits: keys in the v4 runs are evenly spaced (they compress to ~3.4 B per
+entry at 100M); merges ran in-process with instant upkeep; upload and
+publication failures are not injected here (`retention.py` models them).
 
 Write ratios count entries: entries written (merge outputs, plus the
 initial delta where marked "total") per entry committed. Compressed bytes
