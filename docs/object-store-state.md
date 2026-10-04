@@ -305,11 +305,11 @@ State
 | `Intent` | `added`, `removed`, `exact`, `files` (the dead attempt's delta files), `run`, `attempt` | writers that died mid-write, until the next commit of that output |
 
 **Derived, rebuilt at start:** the claims of launched
-attempts (from `Task.launched`), the pool queue, the ready queue and the
+attempts (lifecycle.md §3.1), the pool queue, the ready queue and the
 dependents index.
 
-**Memory only:** the claim of an attempt still preparing (a restart
-dispatches its task again), what each launched attempt's worker reported
+**Memory only:** the claim of an attempt still preparing (lifecycle.md
+§3.1), what each launched attempt's worker reported
 (rebuilt from the control file and `.beat` after a restart), a cache of
 key index blocks, and
 a local copy of the history files (§7).
@@ -760,7 +760,7 @@ the attempt's token and its generation (the claim's event counter).
 **Launch and adoption.** The engine writes the spec, then
 `AttemptLaunched`, durable, then starts the placement and records its
 handle as `AttemptPlaced` — lazily, riding the next flush. From
-`AttemptLaunched` on, the attempt's claim is durable:
+`AttemptLaunched` on, the attempt's claim is durable (lifecycle.md §3.1):
 an engine that restarts adopts it — follows its handle, or finds it again
 by name (ECS `clientToken`, the Kubernetes job `solera-{attempt}`), or
 follows its worker's reports — and settles it as the first engine would

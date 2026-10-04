@@ -303,14 +303,9 @@ attempt or a call within one.
 one commit. Its own id, spec and result. Outcome: `succeeded`, `failed`,
 `skipped`, `canceled`.
 
-**claim**. The engine's rule that one attempt at a time runs an asset
-partition. Before preparing an attempt, the engine claims its asset
-partition; the claim lasts until the attempt settles. A task whose
-partition is claimed by another run's attempt waits (held: `claim`). The
-event counter at the claim is the attempt's generation. *Example:* the
-hourly run and a manual run both target `file_index:alpha`; the second
-waits for the first's attempt to commit, then reads what it wrote.
-*Was:* scope lock, lock.
+**claim**. The engine's hold of one asset partition for one attempt, from
+dispatch to settlement: what it is, holds and how it ends, in
+`lifecycle.md` §3.1. *Was:* scope lock, lock.
 
 **worker**. A process that runs user code: one attempt (reads the spec,
 computes, writes, seals the result), or, long-lived, a `Pool`'s attempts

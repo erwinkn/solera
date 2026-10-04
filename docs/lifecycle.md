@@ -287,7 +287,7 @@ objects.
 Example: `orders:alpha` writes a three-key `Patch` to PostgresStore, on
 ECS, engine up throughout.
 
-1. **Claim the partition** (memory) and pin inputs, as today. The claim's
+1. **Claim the partition** (memory, §3.1) and pin inputs. The claim's
    event counter becomes the attempt's **generation** (§9.7): chosen now,
    before the spec.
 2. **Write the spec**: `PUT runs/R/A.spec` create-only; then create the
@@ -330,6 +330,104 @@ ECS, engine up throughout.
 
 A failed attempt follows the same path with `status: failed`. Canceling
 and timing out are §7.
+
+### 3.1 Claims
+
+A **claim** holds one asset partition for one attempt, from dispatch to
+settlement: at most one attempt runs an asset partition at a time, and
+the claim is what everything that must not run under, or delete from
+under, an attempt reads. This is the one place claims are explained.
+
+**What a claim is.** A record per task (`Model.claims`): the attempt, its
+**generation** (the event counter when it was claimed: the attempt's
+fence, §9.7, and its reader pin), and what it holds for others. An index,
+`claimed_partitions`, maps (asset, partition) to the attempt holding it:
+the dispatch gate. A claim is **memory only** until `AttemptLaunched` is
+durable; nothing outside the engine learns of the attempt before then
+(F26), so an engine replaced before it leaves nothing to clean up, and
+its successor dispatches the task again. From `AttemptLaunched` on the
+claim is durable: rebuilt from the task's launch record on replay, and
+adopted by a restarted engine (§12).
+
+**What it holds for others.**
+
+- **Its reads** (`reads`: `(output, partition, first, end)` per keyed
+  incremental input): the delta log it reads, from `first`, and the head
+  + 1 its plan was cut at, `end`. Log truncation and index merges
+  (`Model.endpoints`) keep them. Set when `_prepare` plans, before the
+  launch.
+- **Its cleanups** (`cleanups`): the delta files of the pending cleanup
+  entries its spec hands it, also set at `_prepare`: collection keeps
+  them while the attempt runs, even once another attempt acknowledged the
+  entry (F36).
+- **Its reader pin**: by its generation, over the index prefixes it reads
+  and writes (`prefixes`), or every one while it is still preparing:
+  collection deletes nothing such a reader may still read (§9.8).
+
+**Lives.** A name removed and declared again is another asset (F12). An
+attempt launched before the deploy that removed its asset is an
+**earlier life's** (`Model.earlier_life`, the commit's own rule): it holds
+no entry in `claimed_partitions`, at the reset and when a snapshot is
+loaded, so the new life is not held behind it; it still settles, its
+commit refused, and its task carries on in the new life (F21). Whether an
+attempt is live is the claim's own record (`Model.claimed`), never the
+index (F34).
+
+**Why a due task waits.** Dispatch claims due tasks in order and records,
+when it changes, why one is held (`TasksHeld`, shown as "held: reason
+(name)"): `claim` (another attempt of the current life holds its
+partition), `concurrency` (its asset's `concurrency=` partitions are
+claimed), `merges` (an output's key index is too far behind on merges),
+`engine` (the engine's own slots are full), `executor` (its executor's
+limit), `invalid` (its placement cannot be built).
+
+**How a claim ends.** With the attempt's `AttemptFinished` (settled,
+failed, canceled, skipped, or lost: its control file is ended first,
+§2.4), which releases the claim and its index entry. An attempt whose
+claim another engine released (this one was replaced) returns without
+deciding anything: the successor owns it.
+
+**A claim from dispatch to settlement.** `file_index:alpha` (per-key,
+over `site_files`, on a `Pool`):
+
+1. The hourly run's task is due; nothing holds `file_index:alpha`.
+   Dispatch claims it for attempt A at event 120: generation 120, memory
+   only, `claimed_partitions[(file_index, alpha)] = A`.
+2. `_prepare` pins `site_files:alpha` at commit 56..60 and hands A the
+   pending cleanup entry 118.0 (a delta file `…/000000000055-B.0000`).
+   The claim now holds `reads = [(site_files, alpha, 56, 61)]` and
+   `cleanups = {…/000000000055-B.0000}`: truncation stops below 56, and
+   collection keeps that file even if B's own cleanup acknowledges 118.0
+   now.
+3. The spec and the control file (`open`) are written; `AttemptLaunched`
+   is recorded and awaited. Only now is A offered to the `ingest` pool.
+4. Workers `w1` and `w2` long-poll; both are offered A; `w1` swaps the
+   control file to `owned` first and runs it, `w2` loses the swap and
+   polls again (§10).
+5. `w1` seals its result; the engine commits it (`AttemptFinished`,
+   succeeded): the claim, its reads, cleanups and pin go, and the
+   partition is free for the next due task.
+
+**An earlier life.** `copy` is renamed `mirror`; `mirror`'s attempt M
+runs. A deploy removes `mirror` (`copy` back, without an alias): M is now
+an earlier life's, and its index entry goes. `copy`'s attempt C runs;
+`copy` is renamed `mirror` again: C's claim moves to `(mirror, "")`,
+which M no longer holds. M settles, its commit refused; C is untouched.
+
+**A held due task.** `report` has `concurrency=2` and three partitions
+due. Dispatch claims `a` and `b`; `c` is held ("held: concurrency
+(report)") and claimed as soon as one of them settles.
+
+**What checks it.** The simulation asserts one attempt per partition, in
+the journal and in the serving engine's memory, and that every
+current-life claim is its partition's holder (`tests/sim/oracle.py`,
+`two_attempts_at_once`; `tests/sim/machine.py`,
+`one_attempt_per_partition`); `spec/tla/Execution.tla` checks
+`OneAttemptPerPartition`, `spec/tla/Positions.tla` claims reads (`Claim`).
+
+A sensor's **tick claim** (§11.4) is a different thing sharing the word:
+one in-flight tick per sensor, memory only, with a reader pin; no
+partition, attempt or control file.
 
 ## 4. Workers and duplicates
 
@@ -868,7 +966,7 @@ needs to emit cleanup of its own.
 still need it. The pins, all by event counter (`object-store-state.md`
 §6):
 
-- every live claim (as today);
+- every live claim (§3.1);
 - **durable multi-attempt reads**, recorded with their pin in the
   position state, so the pin holds in the gaps between attempts and
   across engine restarts, until the read ends:
@@ -925,16 +1023,15 @@ code, so workers clean up, twice over:
 Deleting a name twice is no harm, and only the index files an
 acknowledged entry names become garbage. Due means no reader pin that
 may read the entry's output partition predates it: pins are per output partition,
-each named by its index prefix. An attempt's claim names the partitions it
-reads and writes (every partition, while it is still preparing); a delta
+each named by its index prefix. An attempt's claim pins what it reads and
+writes (§3.1); a delta
 pass or a pattern change drain its upstream; a sensor tick its sources; an
 engine reader what it reads (`history/` for a history query). Index and
 history files are collected by the same rule, by their paths, so one slow
 reader holds back only what it reads. A delta file
 a pending entry reads is kept, even once the index let go of it, until the
-entry is done — and while an attempt whose spec holds the entry runs, even
-if another acknowledged it meanwhile (the previous attempt's own cleanups
-after its commit can). An entry whose files cannot be read stays pending; after
+entry is done — and while an attempt whose spec holds the entry runs
+(its claim's cleanups, §3.1). An entry whose files cannot be read stays pending; after
 three such attempts it is `stuck`: no longer handed out, listed in
 `/api/diagnostics` and on its partition's head record, until an operator runs
 `solera cleanups OUTPUT [Partition] --clear` (its objects stay). An

@@ -597,10 +597,10 @@ cursor, every incremental input resets to the whole head and its position
 lands past the head commit; the store makes the output equal to
 exactly this write. `keys=full` resets one input only: `prior` is kept.
 
-**Attempts.** A task is claimed under a per-claim, so one attempt at a
-time writes an (asset, partition). Inputs are resolved to heads when the attempt
-starts. Once launched (`AttemptLaunched`), the claim is durable: a
-restarted engine adopts the attempt rather than launching it again. Before
+**Attempts.** A task is claimed, so one attempt at a time writes an
+(asset, partition) (`lifecycle.md` §3.1). Inputs are resolved to heads
+when the attempt starts. Once launched, a restarted engine adopts the
+attempt rather than launching it again. Before
 its first store write the worker takes the attempt's write fence; the
 engine takes the same fence before it cancels, times out or fails the
 attempt, so exactly one side wins (object-store-state.md §8). Outcomes:
