@@ -422,7 +422,13 @@ class TwoViews:
         runs = self.runs(first, last)
         if not runs:
             return Changes([], b"", [], b"", [], None)
-        idx = self.index(runs)
+        # One reader per cover across pages, as spans keep one KeyIndex: a
+        # page never fetches a block index or a block twice.
+        ident = tuple(f.name for r in runs for f in r)
+        cached = getattr(self, "_reader", None)
+        if cached is None or cached[0] != ident:
+            self._reader = (ident, self.index(runs))
+        idx = self._reader[1]
         ks, cs, gs, ds, ps, cursor = await idx._read_page(runs, after, limit, changes=(0, None))
         return _net(Changes(list(ks), bytes(cs), list(gs), bytes(ds), list(ps), cursor))
 
