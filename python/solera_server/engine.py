@@ -34,16 +34,16 @@ from solera import lifecycle
 from solera.failed_keys import lower
 from solera.ids import ulid, ulid_time
 from solera.keys import Rows, SortedEntries
-from solera.keys.index import (
+from solera.keys.io import ObjectIO
+from solera.keys.layers import (
     DeltaFiles,
-    FileInfo,
-    KeyIndex,
-    Options,
+    LayerIndex,
+    Part,
     delta_keys,
+    delta_names,
     key_bytes,
     key_str,
 )
-from solera.keys.io import ObjectIO
 from solera.sdk import default_placement, digest
 from solera.tasks import Tasks
 
@@ -131,7 +131,6 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
         concurrency: int = 4,
         clock=None,
         eval_interval: float = 0.5,
-        key_options: Options | None = None,
         maintenance_concurrency: int = 2,
         retention_interval: float = 60.0,
         history: History | None = None,
@@ -174,7 +173,6 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
         # state — they run no local work and must not starve dispatch (§10).
         self.engine_inflight: set[str] = set()
         self.executor_inflight: dict[str, int] = {}
-        self.key_options = key_options or Options()
         self._io: ObjectIO | None = None
         # The key cache and resolver (docs/resolved-commits.md §4–§5): where
         # `resolve_cache` says, else beside `file://` state or in a temporary
@@ -182,7 +180,7 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
         self.keys: KeyService | None = None
         if resolve_cache:
             root = resolve_cache if isinstance(resolve_cache, str) else cache_root(state.objects_url)
-            self.keys = KeyService(state.objects, root, options=self.key_options)
+            self.keys = KeyService(state.objects, root)
         # What fails now, by name — the eval loop, upkeep, a key index, the history, an
         # automation — each entry cleared by its own next success: the one place it shows.
         self.failing: dict[str, str] = {}
@@ -193,7 +191,6 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
             self.history,
             manifest,
             clock=self.clock,
-            key_options=self.key_options,
             concurrency=maintenance_concurrency,
             retention_interval=retention_interval,
             keys=self.keys,
@@ -562,12 +559,12 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
     def _cache_commit(self, name: str, partition: str, keys: dict | None) -> None:
         """Keep the engine's cache warm with what a commit installed (§5)."""
 
-        if not keys or not keys.get("files"):
+        if not keys:
             return
         index = self.m.indexes.get((name, partition))
-        if index is not None:
-            files = [FileInfo.from_json(f) for f in keys["files"]]
-            self.keys.committed(index.prefix, index.path, files, self.m.event_counter)
+        files = DeltaFiles.from_json(keys).part.files
+        if index is not None and files:
+            self.keys.committed(index.prefix, list(files), self.m.event_counter)
 
     # -- dispatch ---------------------------------------------------------------
 
@@ -644,16 +641,15 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
 
     def _merges_behind(self, names: list[str], partition: str) -> str | None:
         """The first of the key indexes `names` in `partition` that upkeep has
-        let fall far behind — twice the span cap, which forced merges
-        otherwise hold — or None. Every index writer waits until merges catch
-        up (writer backpressure, docs/key-index-design.md § Limits): a task
-        writing one is held (`merges`), its outputs and a per-key asset's
-        failure index alike, and a source commit is refused, retryable."""
+        let fall far behind (`LayerState.backlogged`), or None. Every index
+        writer waits until merges catch up (writer backpressure,
+        docs/key-index-design.md § Compaction): a task writing one is held
+        (`merges`), its outputs and a per-key asset's failure index alike, and
+        a source commit is refused, retryable."""
 
-        cap = 2 * self.key_options.fan_in
         for name in names:
             index = self.m.indexes.get((name, partition))
-            if index is not None and len(index.spans) >= cap:
+            if index is not None and index.backlogged():
                 return name
         return None
 
@@ -1688,30 +1684,26 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
                 [key_bytes(k) for k in new], list(new.values()), [key_bytes(k) for k in removes]
             )
             with self.m.reading(self.m.index(name, "").prefix):  # outlives merges meanwhile
-                pinned = self.m.index(name, "").slice()
-                index = KeyIndex(self._key_io(), None, pinned, self.key_options)
+                pinned = self.m.index(name, "")
+                index = LayerIndex(self._key_io(), pinned, cache=self._key_cache())
+                stem = f"{commit_number:012d}-{attempt}"
                 files = await self._resolve_source(
-                    index, pinned, sorted_run, replace, commit_number, attempt, generation
+                    index, sorted_run, replace, stem, commit_number, generation
                 )
                 if files is not None:
                     files, changed = files
                 elif replace:
-                    files, changed = await index.replace(
+                    files, changed = await index.write_replace(
                         Rows.pairs([(key_bytes(k), r) for k, r in new.items()]),
-                        commit_number,
-                        attempt,
-                        collect=2 * SOURCE_KEYS_RECORDED,
+                        name=stem,
                         generation=generation,
+                        collect=2 * SOURCE_KEYS_RECORDED,
                     )
                 else:
-                    files, changed = await index.resolve(
-                        sorted_run,
-                        commit_number=commit_number,
-                        attempt=attempt,
-                        generation=generation,
-                        collect=2 * SOURCE_KEYS_RECORDED,
+                    files, changed = await index.write_patch(
+                        sorted_run, name=stem, generation=generation, collect=2 * SOURCE_KEYS_RECORDED
                     )
-            if not files.files:
+            if not files.part.files:
                 return None, head["ref"] if head is not None else source["head"]
             record["commit_number"] = commit_number
             if listed is not None:
@@ -1719,7 +1711,7 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
                 record["partitions"] = sorted(set(new) if replace else (before - set(removes)) | set(new))
             event["keys"] = {**files.to_json(), "commit_number": commit_number}
             run["commit_number"] = commit_number
-            counts = (sum(f.entries for f in files.files) - files.removed, files.removed)
+            counts = (files.part.entries - files.removed, files.removed)
             for field, keys, count in zip(
                 ("upserted", "deleted"), changed or (None, None), counts, strict=True
             ):
@@ -1745,41 +1737,43 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
         paths = []
         for event in events:
             if "keys" in event:
-                index = KeyIndex(
-                    self._key_io(), None, self.m.index(event["source"], "").slice(), self.key_options
-                )
-                paths += [index.path(f["name"]) for f in event["keys"]["files"]]
+                index = self.m.index(event["source"], "")
+                paths += [index.path(n) for n in delta_names(event["keys"])]
         if paths:
             await self.state.delete_objects(paths)
 
-    async def _resolve_source(self, index, pinned, run, replace, commit_number, attempt, generation):
+    async def _resolve_source(self, index, run, replace, stem, commit_number, generation):
         """A small source commit through the warm resolver, in process
         (docs/resolved-commits.md §4): its files and changed keys, or None when
         the cache cannot answer and the commit resolves cold."""
 
-        from solera.keys.resolver import Limits
+        from solera.keys.resolver import Limits, delta_files
 
         lim = Limits()
-        size = len(run) + (pinned.count if replace else 0)
+        size = len(run) + (index.state.count if replace else 0)
         if self.keys is None or size > (lim.max_entries if replace else lim.max_keys):
             return None
-        name = f"{commit_number:012d}-{attempt}.0000"
         answer, delta = await self.keys.direct(
-            pinned,
+            index.state,
             "replace" if replace else "patch",
             run,
             generation,
             commit_number,
-            index.path(name),
+            index.state.path(f"{stem}-0.lay"),
             self.m.event_counter,
         )
         if answer["result"] == "empty":
-            return DeltaFiles([], 0, 0, generation), ([], [])
+            return DeltaFiles(Part(), 0, 0, generation), ([], [])
         if answer["result"] != "delta":
             return None
-        await index.io.write(index.path(name), delta)
-        files = DeltaFiles([FileInfo.describe(name, delta)], answer["added"], answer["removed"], generation)
-        return files, delta_keys(delta)
+        await index.io.write(index.state.path(f"{stem}-0.lay"), delta)
+        return delta_files(answer, stem, generation), delta_keys(delta)
+
+    def _key_cache(self):
+        """The engine's cache of layers, where the key service runs: what the
+        engine's own reads and writes go through."""
+
+        return getattr(self.keys, "cache", None) if self.keys is not None else None
 
     # -- key index upkeep (§6) --------------------------------------------------------
 
@@ -1796,15 +1790,19 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
         state = self.m.indexes.get((output, partition))
         if state is None:
             return {"total": 0, "keys": {}, "next": None}
-        start = key_bytes(after) if after is not None else None
+        cursor, rows = key_bytes(after) if after is not None else None, []
         with self.m.reading(state.prefix):  # its files outlive merges until the page is read
-            index = KeyIndex(self._key_io(), None, state.slice(), self.key_options)
-            keys, generations, _, nxt = await index.page(start, offset + limit)
+            index = LayerIndex(self._key_io(), state, cache=self._key_cache())
+            while len(rows) < offset + limit:
+                page, cursor = await index.delta(None, after=cursor, first=offset + limit - len(rows))
+                rows += page
+                if cursor is None:
+                    break
         return {
             "total": state.count,
             # Each key's version: the generation that last wrote it (docs/versions.md).
-            "keys": {key_str(k): g for k, g in list(zip(keys, generations, strict=True))[offset:]},
-            "next": key_str(nxt) if nxt is not None else None,
+            "keys": {key_str(r[0]): r[3] for r in rows[offset:]},
+            "next": key_str(cursor) if cursor is not None else None,
         }
 
     # -- automations (§9) ------------------------------------------------------------

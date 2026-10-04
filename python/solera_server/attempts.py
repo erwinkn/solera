@@ -314,6 +314,7 @@ class Attempts:
                 int(head.get("commit_number", -1)),
                 True,
                 self.m.event_counter,  # the index as of now: what a fill of it reads
+                replaced=info["contract"]["writes"] == "immutable",  # its cleanup reads them
             )
 
         def still_live():
