@@ -347,6 +347,39 @@ async def test_a_fenced_engine_never_collects_its_successors_merge_outputs(tmp_p
     await b.close()
 
 
+async def test_f40_a_zombies_orphan_collector_spares_the_serving_engines_spans(tmp_path):
+    """F40 (spec/tla/Spans.tla, calibration orphans-state): engine A commits
+    once, then B takes over and merges. A has not written since, so it does
+    not know it is fenced; its next orphan collection lists the merge output
+    B published, which A's model does not name. It must not delete it: the
+    output is of B's epoch, later than A's."""
+
+    url, rows = tmp_path.as_uri(), [{"id": "a"}]
+    old_state = await State.open(url, "test", flush_interval=0.001)
+    old = engine_for(old_state, items_project(rows))
+    await old.initialize()
+    await run(old, ["items"])
+    state = await State.open(url, "test", flush_interval=0.001)  # B fences A's journal
+    engine = engine_for(state, items_project(rows), key_options=Options(window=2))
+    await engine.initialize()
+    for n in range(4):
+        rows.append({"id": f"k{n}"})
+        await run(engine, ["items"])
+    await settle(engine)
+    index = state.model.indexes[("items", "")]
+    assert any(n.startswith("m") for n in index.referenced())  # B merged
+    old.upkeep._orphans_at = float("-inf")
+    await old.upkeep.collect_orphans()  # A, by the state it last knew
+    try:
+        assert {index.path(n) for n in index.referenced()} <= on_disk(state, index)
+    finally:
+        for e, s in ((old, old_state), (engine, state)):
+            with contextlib.suppress(Exception):
+                await e.stop()
+            with contextlib.suppress(Exception):
+                await s.close()
+
+
 async def test_a_fenced_engine_never_deletes_what_only_its_unflushed_merge_let_go_of(tmp_path):
     """Coordinator, on R1: engine A publishes merge M over output X in its
     model, but IndexMerged(M) is not durable yet; then B takes over, and

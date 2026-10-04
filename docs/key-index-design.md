@@ -730,7 +730,7 @@ standard axioms only (`experiments/lean/REPORT.md`). What they leave to
 TLA+ and the sim: where the delivered state comes from (the sealed
 result), endpoint reservation lifetimes, pins, publication and crashes.
 
-**TLA+** (`KeyIndex.tla`): spans with segments; endpoint holders with the
+**TLA+** (`Spans.tla`): spans with segments; endpoint holders with the
 reservation lifetimes above, a selection's landing point included; pins;
 two upkeep lanes; publication through the journal; a crash after upload; a
 reset fencing old merges. Invariants: reads agree with the full history
