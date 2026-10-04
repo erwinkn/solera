@@ -20,6 +20,8 @@ pub const FORMAT_VERSION: u16 = 4;
 pub const MAX_BLOCK_BYTES: u64 = 16 << 20;
 pub const CODEC_NONE: u8 = 0;
 pub const CODEC_ZLIB: u8 = 1;
+/// zstd, for measuring the format (bench/spanbench only, not a format of record).
+pub const CODEC_ZSTD: u8 = 2;
 pub const FOOTER_SIZE: usize = 48;
 
 #[derive(Debug)]
@@ -92,6 +94,9 @@ pub(crate) fn get_bytes<'a>(buf: &'a [u8], pos: &mut usize) -> Result<&'a [u8]> 
 // -- compression --------------------------------------------------------------------
 
 pub(crate) fn compress(data: &[u8], codec: u8, level: u32) -> Vec<u8> {
+    if codec == CODEC_ZSTD {
+        return zstd::bulk::compress(data, level as i32).expect("compressing to a Vec cannot fail");
+    }
     if codec == CODEC_ZLIB {
         let mut enc = ZlibEncoder::new(
             Vec::with_capacity(data.len() / 2 + 64),
@@ -117,6 +122,15 @@ pub(crate) fn decompress_at_most(data: &[u8], codec: u8, limit: u64) -> Result<V
                 .take(limit.saturating_add(1))
                 .read_to_end(&mut out)
                 .map_err(|e| Error::Format(format!("bad zlib data: {e}")))?;
+            out
+        }
+        CODEC_ZSTD => {
+            let mut out = Vec::new();
+            zstd::stream::read::Decoder::new(data)
+                .map_err(|e| Error::Format(format!("bad zstd data: {e}")))?
+                .take(limit.saturating_add(1))
+                .read_to_end(&mut out)
+                .map_err(|e| Error::Format(format!("bad zstd data: {e}")))?;
             out
         }
         CODEC_NONE => data.to_vec(),

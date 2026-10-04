@@ -2009,6 +2009,7 @@ fn _panic(py: Python<'_>, message: &str, parallel: bool) -> PyResult<()> {
 fn solera_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("CODEC_NONE", format::CODEC_NONE)?;
     m.add("CODEC_ZLIB", format::CODEC_ZLIB)?;
+    m.add("CODEC_ZSTD", format::CODEC_ZSTD)?;
     m.add("FOOTER_SIZE", format::FOOTER_SIZE)?;
     m.add("FormatError", m.py().get_type::<FormatError>())?;
     m.add("LimitError", m.py().get_type::<LimitError>())?;
