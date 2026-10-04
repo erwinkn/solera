@@ -5,7 +5,6 @@ Python, pandas DataFrames and Arrow data (`frames`)."""
 from __future__ import annotations
 
 import asyncio
-import datetime
 import json
 import os
 import pickle
@@ -62,7 +61,6 @@ class FileStore:
     writes = "immutable"
     ref_type = ObjectRef
     shared_table = False
-    cleanup_after = datetime.timedelta(0)  # a removed or moved output's files go at once (K25)
 
     def __init__(self, path: str | os.PathLike | None = None):
         self.path = path

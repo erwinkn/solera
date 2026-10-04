@@ -1128,8 +1128,7 @@ async def run_attempt(
         flusher.cancel()
         if channel is not None:
             with contextlib.suppress(Exception):
-                answer = await channel.finished({"worker_id": worker_id})
-                await _cleanup_after(answer, spec, control.get("project"), objects, channel, worker_id)
+                await channel.finished({"worker_id": worker_id})
         return 1 if result["status"] == "failed" else 0
     except asyncio.CancelledError:
         if control["forced"] and not asyncio.current_task().cancelling():
@@ -1250,7 +1249,6 @@ async def _execute(
 
     try:
         project = entrypoint if isinstance(entrypoint, Project) else load_project(entrypoint)
-        control["project"] = project  # for the cleanups after its commit
     except Exception as error:
         return _failed(error, False)
     timeline.add("imported")
@@ -1259,8 +1257,14 @@ async def _execute(
         failed = _failed(StoreError(mismatch), False)
         failed["error"]["build"] = project.manifest.get("build")  # how this host computed its deploy
         return failed
-    if spec.get("cleanup") is not None:  # a cleanup task: no asset, an output life's leftovers (K25)
-        return await _retire(spec["cleanup"], project, writes)
+    if (cleanup := spec.get("cleanup")) is not None:  # a cleanup task: no asset of its own (§9.8, K25)
+        try:
+            if "outputs" in cleanup:  # a partition's entries, deleted through its output's store
+                done = await _cleanup_due(cleanup, project, project.assets[cleanup["asset"]], objects, writes)
+                return {"status": "succeeded", "outputs": {}, **done}
+            return await _retire(cleanup, project, writes)  # an output life's leftovers
+        except Exception as error:  # a store that refused: retried within the task's budget
+            return _failed(error, getattr(error, "retryable", True))
     asset = project.assets[spec["asset"]]
     observed = Observed()
     try:
@@ -1327,7 +1331,6 @@ async def _execute(
                 result["cancel"] = cancel.to_json()
             if ran["skipped"]:
                 result["skipped"] = True
-        result.update(await _cleanup_due(spec, project, asset, objects, writes))
         if cursor is not UNSET:
             result["cursor"] = cursor
         return result
@@ -1372,20 +1375,6 @@ async def _retire(entry: dict, project, writes) -> dict:
     return {"status": "succeeded", "outputs": {}, "cleaned": entry["id"]}
 
 
-async def _cleanup_after(answer, spec, project, objects, channel, worker_id) -> None:
-    """Clean up what the engine says is due in this attempt's partition now that
-    its commit is durable (docs/lifecycle.md §9.8), and say so. Anything
-    that fails here leaves the entries queued for the partition's next attempt:
-    deleting a name twice is no harm."""
-
-    if not (answer or {}).get("cleanup") or project is None:
-        return
-    due = {"outputs": answer["cleanup"], "partition": spec["partition"], "attempt": spec["attempt"]}
-    done = await _cleanup_due(due, project, project.assets[spec["asset"]], objects, Writes())
-    if done:
-        await channel.cleaned_up({"worker_id": worker_id, "partition": answer["partition"], **done})
-
-
 def _file_entries(data: bytes):
     """A `.kx` file's entries, every block checked: `(key, generation,
     deleted, payload, predecessor)` each, in key order."""
@@ -1400,12 +1389,12 @@ def _file_entries(data: bytes):
 
 
 async def _cleanup_due(spec, project, asset, objects, writes) -> dict:
-    """Clean up what the engine handed this attempt (docs/lifecycle.md
+    """Clean up what the engine handed this cleanup task (docs/lifecycle.md
     §9.8): the versions a commit let go of, and what attempts that never
     committed wrote — all past every reader pin — each entry as identity
-    patterns for `store.cleanup` (docs/stores.md § Cleanup). The engine runs
-    no store code; the partition's next attempt, which has its store,
-    deletes for it. Returns what was done, for the result."""
+    patterns for `store.cleanup` (docs/stores.md § Cleanup), through the
+    store and declaration of the output's asset. The engine runs no store
+    code. Returns what was done, for the result."""
 
     import obstore
 

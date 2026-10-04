@@ -11,7 +11,7 @@ from solera.sdk import Every, Incremental, OnChange, Output, Project, asset
 from solera.stores import Patch
 from solera_server.engine import Engine
 from solera_server.executors.inline import InlinePlacement
-from solera_server.model import Model
+from solera_server.model import CLEANUP, Model
 from solera_server.state import Conflict, LostOwnership, State
 
 from tests.conftest import worker_finished
@@ -506,10 +506,10 @@ def test_a_rename_moves_a_scopes_record_whole():
 
 
 def test_a_cleanup_entrys_delta_outlives_the_attempt_holding_it():
-    """docs/lifecycle.md §9.8, simulation finding F11: an attempt's spec hands
-    it a clean up entry; the previous attempt's own cleanups (D8) acknowledge
-    that entry meanwhile. The delta file the entry reads stays readable until
-    the attempt holding it ends, not only while the entry is pending."""
+    """docs/lifecycle.md §9.8, simulation finding F11: a cleanup task's spec
+    hands it an entry; the entry goes meanwhile (an operator clears it). The
+    delta file the entry reads stays readable until the task holding it
+    ends, not only while the entry is pending."""
 
     m = Model()
     entry = {"n": 1, "id": "1.0", "kind": "delta", "prefix": "keys/out/_/", "files": ["000000000003-a"]}
@@ -517,18 +517,20 @@ def test_a_cleanup_entrys_delta_outlives_the_attempt_holding_it():
     m.cleanups[("out", "")] = [entry]
     task = {
         "id": "t1",
-        "asset": "out",
-        "partition": "",
+        "asset": CLEANUP,
+        "partition": "out/",
         "launched": {
             "attempt": "A2",
             "started_at": 0.0,
             "generation": 5,
-            "prepared": {"outputs": {"out": {"cleanup": [entry]}}},
+            "prepared": {
+                "cleanup": {"asset": "out", "partition": "", "outputs": {"out": {"cleanup": [entry]}}}
+            },
         },
     }
     m._hold(task)
     assert path in m.cleanup_reads()
-    m._drop_cleanups("out", "", ["1.0"])  # acknowledged by the attempt before
+    m._drop_cleanups("out", "", ["1.0"])  # cleared meanwhile
     assert path in m.cleanup_reads()  # A2 still reads it
     del m.claims["t1"]  # A2 ended
     assert path not in m.cleanup_reads()

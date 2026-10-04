@@ -6,6 +6,7 @@ import asyncio
 import pytest
 from solera.sdk import Incremental, OnChange, Output, Project, asset
 from solera.stores import FileStore, Patch
+from solera_server.model import CLEANUP
 
 from ..conftest import whole
 from .engines import drive, make_engine, status_of
@@ -54,9 +55,6 @@ async def test_a_removed_assets_last_attempt_ends_its_run(state, monkeypatch):
     more, the asset is gone: its task cannot run again, and its run must
     end rather than hold the task forever."""
 
-    from solera_server import attempts
-
-    monkeypatch.setattr(attempts, "AFTER_COMMIT_WAIT", 0.2)  # the stopped engine's answer to `finished`
     entered, release = asyncio.Event(), asyncio.Event()
 
     @asset(outputs=Output("files", key="id"))
@@ -97,9 +95,6 @@ async def test_an_attempt_launched_before_a_rename_settles(state, monkeypatch):
     outcomes to the new name; an attempt launched under the old name still
     settles — its run ends and the partition is free for the next one."""
 
-    from solera_server import attempts
-
-    monkeypatch.setattr(attempts, "AFTER_COMMIT_WAIT", 0.2)  # the stopped engine's answer to `finished`
     entered, release = asyncio.Event(), asyncio.Event()
 
     @asset(outputs=Output("files", key="id"))
@@ -399,9 +394,6 @@ async def test_a_key_a_moved_output_dropped_leaves_its_consumer(state, tmp_path,
     retry reads the new `items` in a full pass: `k11`, which the move's first
     write left out, goes."""
 
-    from solera_server import attempts
-
-    monkeypatch.setattr(attempts, "AFTER_COMMIT_WAIT", 0.2)  # the stopped engine's answer to `finished`
     rows = {"items": [{"id": "k10"}, {"id": "k11"}]}
     entered, release = asyncio.Event(), asyncio.Event()
     calls = []
@@ -472,10 +464,8 @@ async def test_a_name_removed_while_its_attempt_runs_and_added_back_starts_over(
 
 
 async def _first_life_across_a_readd(state, monkeypatch, ends: str, when: str, fresh: bool = False):
-    from solera_server import attempts
     from solera_server.executors import inline
 
-    monkeypatch.setattr(attempts, "AFTER_COMMIT_WAIT", 0.2)  # the stopped engine's answer to `finished`
     entered, release = asyncio.Event(), asyncio.Event()
 
     @asset(outputs=Output("items", key="id"))
@@ -514,7 +504,7 @@ async def _first_life_across_a_readd(state, monkeypatch, ends: str, when: str, f
     while not entered.is_set():
         await engine.tick()
         await asyncio.sleep(0.01)
-    (held,) = [c["attempt"] for c in state.model.claims.values()]
+    (held,) = [c["attempt"] for t, c in state.model.claims.items() if CLEANUP not in t]
     await engine.stop()
 
     engine = make_engine(state, project(None))  # `copy` removed
@@ -540,7 +530,7 @@ async def _first_life_across_a_readd(state, monkeypatch, ends: str, when: str, f
     except TimeoutError:
         raise AssertionError(f"a run never ends: claims {state.model.claims}") from None
     assert await content() == [("a", "2"), ("b", "2")]
-    assert not state.model.claims
+    assert not [t for t in state.model.claims if CLEANUP not in t]  # cleanup tasks may still run
     commits = (await engine.history.commits(outputs=["copy"]))["commits"]
     assert held not in {c["attempt"] for c in commits}, "the first life's attempt committed into the second"
 
@@ -592,9 +582,6 @@ async def test_an_attempt_launched_before_its_output_moved_commits_nothing(state
     also on a partition with no head yet, which the stale-head check alone
     would let through. Its retry writes into the new store."""
 
-    from solera_server import attempts
-
-    monkeypatch.setattr(attempts, "AFTER_COMMIT_WAIT", 0.2)  # the stopped engine's answer to `finished`
     entered, release = asyncio.Event(), asyncio.Event()
 
     def project(store):
@@ -613,7 +600,7 @@ async def test_an_attempt_launched_before_its_output_moved_commits_nothing(state
     while not entered.is_set():
         await engine.tick()
         await asyncio.sleep(0.01)
-    (held,) = [c["attempt"] for c in state.model.claims.values()]
+    (held,) = [c["attempt"] for t, c in state.model.claims.items() if CLEANUP not in t]
     await engine.stop()
     engine = make_engine(state, project("other"))
     await engine.initialize()
@@ -795,9 +782,7 @@ async def test_a_job_added_back_does_not_take_its_first_lifes_commit(state, monk
     positions belong to the first life."""
 
     from solera.sdk import Result, job
-    from solera_server import attempts
 
-    monkeypatch.setattr(attempts, "AFTER_COMMIT_WAIT", 0.2)  # the stopped engine's answer to `finished`
     entered, release = asyncio.Event(), asyncio.Event()
 
     @asset(outputs=Output("items", key="id"))
@@ -847,9 +832,7 @@ async def test_a_job_removed_while_its_attempt_runs_and_added_back_starts_over(s
     on with a fresh attempt of the new code, as a renamed asset's does."""
 
     from solera.sdk import Result, job
-    from solera_server import attempts
 
-    monkeypatch.setattr(attempts, "AFTER_COMMIT_WAIT", 0.2)  # the stopped engine's answer to `finished`
     entered, release, calls = asyncio.Event(), asyncio.Event(), []
 
     @asset(outputs=Output("items", key="id"))
@@ -877,7 +860,7 @@ async def test_a_job_removed_while_its_attempt_runs_and_added_back_starts_over(s
     while not entered.is_set():
         await engine.tick()
         await asyncio.sleep(0.01)
-    (held,) = [c["attempt"] for c in state.model.claims.values()]
+    (held,) = [c["attempt"] for t, c in state.model.claims.items() if CLEANUP not in t]
     await engine.stop()
     for life in (None, "2"):  # removed, and added back
         engine = make_engine(state, project(life))

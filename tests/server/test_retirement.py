@@ -18,12 +18,12 @@ def files(root) -> set[str]:
 
 
 async def _engine(state, project):
-    engine = make_engine(state, project)
+    engine = make_engine(state, project, cleanup_interval=0.0)  # the cleanup job looks at every tick
     await engine.initialize()
     return engine
 
 
-async def _settle(engine, rounds=300):
+async def _settle(engine, rounds=1500):
     """Tick until no run is under way, twice running: a due cleanup task has
     been submitted, and has run."""
 
@@ -37,10 +37,17 @@ async def _settle(engine, rounds=300):
     raise AssertionError("runs still under way")
 
 
+async def _stop(engine):
+    """Stopped once the cleanup its runs made due has run: a cleanup task cut
+    short by the stop would be adopted as lost, and retried a minute later."""
+
+    await _settle(engine)
+    await engine.stop()
+
+
 def orders_project(root, *, with_orders=True, cleanup_after=None, store_after=None):
     store = FileStore(root / "data")
-    if store_after is not None:
-        store.cleanup_after = store_after
+    store.cleanup_after = store_after or dt.timedelta(0)  # a week unless it says (D145): here none
 
     @asset(outputs=Output("orders", key="id", **({"cleanup_after": cleanup_after} if cleanup_after else {})))
     def orders():
@@ -60,13 +67,13 @@ async def test_a_removed_outputs_files_go(tmp_path):
     engine = await _engine(state, orders_project(tmp_path))
     await drive(engine, await engine.submit(["orders", "other"]))
     assert any(f.startswith("orders/") for f in files(tmp_path / "data"))
-    await engine.stop()
+    await _stop(engine)
     engine = await _engine(state, orders_project(tmp_path, with_orders=False))
     await _settle(engine)
     left = files(tmp_path / "data")
     assert not any(f.startswith("orders") for f in left) and any(f.startswith("other") for f in left), left
     assert engine.m.retired == {}
-    await engine.stop()
+    await _stop(engine)
     await state.close()
 
 
@@ -86,7 +93,7 @@ DAY = 86_400.0
 
 
 async def _engine_at(state, project, clock):
-    engine = make_engine(state, project, clock=clock)
+    engine = make_engine(state, project, clock=clock, cleanup_interval=0.0)
     await engine.initialize()
     return engine
 
@@ -100,19 +107,19 @@ async def test_a_moved_outputs_old_files_go_and_its_new_ones_stay(tmp_path):
         def orders():
             return [{"id": "o1"}]
 
-        return Project(
-            assets=[orders], stores={"a": FileStore(tmp_path / "a"), "b": FileStore(tmp_path / "b")}
-        )
+        old = FileStore(tmp_path / "a")
+        old.cleanup_after = dt.timedelta(0)  # a week unless it says (D145): here none
+        return Project(assets=[orders], stores={"a": old, "b": FileStore(tmp_path / "b")})
 
     state = await State.open((tmp_path / "state").as_uri(), "test", flush_interval=0.001)
     engine = await _engine(state, project("a"))
     await drive(engine, await engine.submit(["orders"]))
-    await engine.stop()
+    await _stop(engine)
     engine = await _engine(state, project("b"))
     await drive(engine, await engine.submit(["orders"]))
     await _settle(engine)
     assert files(tmp_path / "a") == set() and files(tmp_path / "b")
-    await engine.stop()
+    await _stop(engine)
     await state.close()
 
 
@@ -126,7 +133,7 @@ async def test_the_grace_period_is_the_stores_unless_the_output_says(tmp_path):
         project = orders_project(tmp_path, cleanup_after=override, store_after=dt.timedelta(days=7))
         engine = await _engine_at(state, project, clock)
         await drive(engine, await engine.submit(["orders"]))
-        await engine.stop()
+        await _stop(engine)
         engine = await _engine_at(state, orders_project(tmp_path, with_orders=False), clock)
         clock.skew += wait - 3600
         await _settle(engine)
@@ -134,7 +141,40 @@ async def test_the_grace_period_is_the_stores_unless_the_output_says(tmp_path):
         clock.skew += 7200
         await _settle(engine)
         assert not any(f.startswith("orders/") for f in files(tmp_path / "data")), "due"
-        await engine.stop()
+        await _stop(engine)
+    await state.close()
+
+
+async def test_a_store_that_says_nothing_keeps_a_removed_output_a_week(tmp_path):
+    """D145: whole-output cleanup waits `cleanup_after`, a week on every store
+    that says nothing, so a removed — or renamed without `aliases=` — output
+    can still come back."""
+
+    state = await State.open((tmp_path / "state").as_uri(), "test", flush_interval=0.001)
+    clock = Clock()
+
+    def project(with_orders):
+        @asset(outputs=Output("orders", key="id"))
+        def orders():
+            return [{"id": "o1"}]
+
+        @asset
+        def other():
+            return 1
+
+        return Project(
+            assets=[orders, other] if with_orders else [other], default_store=FileStore(tmp_path / "data")
+        )
+
+    engine = await _engine_at(state, project(True), clock)
+    await drive(engine, await engine.submit(["orders"]))
+    await _stop(engine)
+    engine = await _engine_at(state, project(False), clock)
+    [entry] = engine.m.retired.values()
+    assert abs(entry["due"] - clock() - 7 * DAY) < 60
+    await _settle(engine)
+    assert any(f.startswith("orders/") for f in files(tmp_path / "data"))
+    await _stop(engine)
     await state.close()
 
 
@@ -149,9 +189,9 @@ async def test_an_output_added_back_within_the_grace_period_keeps_its_new_data(t
     engine = await _engine_at(state, orders_project(tmp_path, store_after=week), clock)
     await drive(engine, await engine.submit(["orders"]))
     old = {f for f in files(tmp_path / "data") if f.startswith("orders/")}
-    await engine.stop()
+    await _stop(engine)
     engine = await _engine_at(state, orders_project(tmp_path, with_orders=False, store_after=week), clock)
-    await engine.stop()
+    await _stop(engine)
     clock.skew += 3 * DAY
     engine = await _engine_at(state, orders_project(tmp_path, store_after=week), clock)
     await drive(engine, await engine.submit(["orders"]))
@@ -160,7 +200,7 @@ async def test_an_output_added_back_within_the_grace_period_keeps_its_new_data(t
     await _settle(engine)
     left = files(tmp_path / "data")
     assert new and new <= left and not (old & left), (old, new, left)
-    await engine.stop()
+    await _stop(engine)
     await state.close()
 
 
@@ -171,7 +211,7 @@ async def test_a_cleanup_waits_for_a_reader_pinned_before_the_reset(tmp_path):
     state = await State.open((tmp_path / "state").as_uri(), "test", flush_interval=0.001)
     engine = await _engine(state, orders_project(tmp_path))
     await drive(engine, await engine.submit(["orders"]))
-    await engine.stop()
+    await _stop(engine)
     engine = await _engine(state, orders_project(tmp_path, with_orders=False))
     [entry] = engine.m.retired.values()
     token = object()
@@ -181,7 +221,7 @@ async def test_a_cleanup_waits_for_a_reader_pinned_before_the_reset(tmp_path):
     del engine.m.readers[token]
     await _settle(engine)
     assert not any(f.startswith("orders/") for f in files(tmp_path / "data"))
-    await engine.stop()
+    await _stop(engine)
     await state.close()
 
 
@@ -193,6 +233,8 @@ async def test_a_custom_store_the_project_no_longer_declares_leaves_the_cleanup_
 
     class Mine(FileStore):
         """A store of the project's own: not rebuilt from the manifest."""
+
+        cleanup_after = dt.timedelta(0)
 
     def project(with_orders):
         @asset(outputs=Output("orders", key="id", store="mine"))
@@ -210,7 +252,7 @@ async def test_a_custom_store_the_project_no_longer_declares_leaves_the_cleanup_
     state = await State.open((tmp_path / "state").as_uri(), "test", flush_interval=0.001)
     engine = await _engine(state, project(True))
     await drive(engine, await engine.submit(["orders"]))
-    await engine.stop()
+    await _stop(engine)
     engine = await _engine(state, project(False))
     await _settle(engine)
     [entry] = engine.m.retired.values()
@@ -220,7 +262,7 @@ async def test_a_custom_store_the_project_no_longer_declares_leaves_the_cleanup_
     assert row["output"] == "orders" and "no longer declared" in row["stuck"]
     assert engine.clear_cleanups("orders", "", "test")["cleared"] == [entry["id"]]
     assert engine.m.retired == {} and files(tmp_path / "mine")  # given up on: its files stay
-    await engine.stop()
+    await _stop(engine)
     await state.close()
 
 

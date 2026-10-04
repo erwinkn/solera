@@ -134,8 +134,13 @@ prefix; `before=G` matches every generation older than `G`:
 | `cleanup(o, partition=p, key=k, generation=g)` | one superseded version | a commit replaced it |
 | `cleanup(o, partition=p, generation=g)` | all an attempt wrote | it ended without committing, or wrote after it ended |
 
-A store declares `cleanup_after`, how long a removed or moved output's
-data stays before a cleanup task deletes it (an output may override it).
+A store may declare `cleanup_after`, how long a whole output's data stays
+once the output is removed, moved to another store, or renamed without
+`aliases=`, before a cleanup task deletes it: a week by default, on every
+store, so an undeclared rename can be undone (an output may override it,
+`Output(cleanup_after=…)`). What a live output lets go of — superseded
+versions, an abandoned attempt's writes — goes as soon as no reader pins
+it.
 A built-in store's class and config enter the manifest, so that task can
 rebuild it once the project no longer declares it; registration refuses
 a secret written in them — a DSN with a password, S3 keys — naming the

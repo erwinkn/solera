@@ -29,6 +29,7 @@ from solera.keys.io import ObjectIO
 from solera.tasks import Tasks
 
 from . import history
+from .model import CLEANUP
 
 log = logging.getLogger(__name__)
 
@@ -359,6 +360,8 @@ class Upkeep:
         horizons = {name: self._horizon(p, nth.get(name)) for name, p in policies.items()}
         default = self._horizon(self.m.policy(None), None)
         finite = {name: h for name, h in horizons.items() if h is not None}
+        if default is not None:  # the engine's cleanup runs: no asset of the project's, so its default
+            finite[CLEANUP] = default
         # A run whose attempt a read-ahead names is kept: its spec and result say what it read (K45).
         named = {entry[1] for position in self.m.positions() for entry in position.get("ahead", ())}
         await self.delete_runs([r for r in await self.history.expired(finite, default) if r[0] not in named])

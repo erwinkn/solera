@@ -219,12 +219,18 @@ async def test_a_run_reads_the_same_once_archived(state, clock):
 async def test_flush_merge_delete_and_purge(state, clock):
     engine = engine_for(state, clock, flush_rows=1, merge_width=2, purge_seconds=100)
     await engine.initialize()
-    runs = [(await run(engine, clock, ["orders"], config={"n": i}))["id"] for i in range(4)]
+    runs = []
+    for i in range(4):
+        runs.append((await run(engine, clock, ["orders"], config={"n": i}))["id"])
+        for cleanup in [r for r in engine.m.runs.values() if r["kind"] == "cleanup"]:
+            await engine.run_until(cleanup["id"], 60)  # what each commit let go of: a run too
     await engine.history.lake.tick()
     files = state.model.history.files
     assert not any(state.model.history.rows.values())
+    cleanups = len((await engine.list_runs(RunFilter(origin=["cleanup"])))["runs"])
+    assert cleanups == 3  # each commit but the first superseded a version
     # Each run's rows went out in its own flush; pairs of them were merged.
-    assert sum(f["rows"] for f in files["runs"]) == 4
+    assert sum(f["rows"] for f in files["runs"]) == 4 + cleanups
     lake = engine.history.lake
     await lake.stop()
     while lake.plan():
@@ -244,7 +250,7 @@ async def test_flush_merge_delete_and_purge(state, clock):
     clock.now += 101  # the file is rewritten without the run
     lake.maintain()
     await lake.job
-    assert "hidden" not in files["runs"][0] and files["runs"][0]["rows"] == 3
+    assert "hidden" not in files["runs"][0] and files["runs"][0]["rows"] == 3 + cleanups
     assert hidden["path"] in {path for path, _ in state.model.garbage}
     made = (await engine.history.commits(outputs=["orders"]))["commits"]
     assert runs[1] not in {m["run"] for m in made}

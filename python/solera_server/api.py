@@ -9,7 +9,6 @@ import hmac
 import os
 import re
 import secrets
-import weakref
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -25,9 +24,7 @@ from .history import TERMINAL_RUN, RunFilter
 from .sensors import HOST_TOKEN
 from .state import LostOwnership, State, Unavailable
 
-ATTEMPT_ROUTE = re.compile(
-    r"^/api/projects/[^/]+/attempts/([^/]+)/(start|beat|logs|resolve|finished|cleaned_up)$"
-)
+ATTEMPT_ROUTE = re.compile(r"^/api/projects/[^/]+/attempts/([^/]+)/(start|beat|logs|resolve|finished)$")
 POOL_ROUTE = re.compile(r"^/api/projects/[^/]+/pools/[^/]+/work$")
 SENSOR_ROUTE = re.compile(r"^/api/projects/[^/]+/sensors/(next|[^/]+/ticks/[^/]+)$")
 
@@ -636,15 +633,10 @@ def create_app(
             return Response(status_code=503)
         return Response(content=body, media_type=CONTENT_TYPE)
 
-    @app.post("/api/projects/{p}/attempts/{attempt}/finished")
+    @app.post("/api/projects/{p}/attempts/{attempt}/finished", status_code=204)
     async def attempt_finished(p: str, attempt: str, request: Request):
         runtime = await project_engine(request, p)
-        return await runtime.attempt_finished(attempt, await request.json())
-
-    @app.post("/api/projects/{p}/attempts/{attempt}/cleaned_up", status_code=204)
-    async def attempt_cleaned_up(p: str, attempt: str, request: Request):
-        runtime = await project_engine(request, p)
-        await runtime.attempt_cleaned_up(attempt, await request.json())
+        await runtime.attempt_finished(attempt, await request.json())
         return Response(status_code=204)
 
     @app.get("/api/projects/{p}/pools/{pool}/work")
@@ -776,9 +768,6 @@ def create_app(
     return app
 
 
-_local_apps: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()  # engine -> its in-process app
-
-
 def local_transport(engine: Engine, token: str):
     """A transport to `engine`'s own routes in this process, for workers it runs
     itself (`solera_worker.channel.LocalTransport`): the app is the one a
@@ -787,8 +776,7 @@ def local_transport(engine: Engine, token: str):
 
     from solera_worker.channel import LocalTransport
 
-    app = _local_apps.get(engine)
-    if app is None:
-        app = _local_apps[engine] = create_app(engine=engine, token=secrets.token_hex(16))
-        app.state.engine = engine
-    return LocalTransport(app, token)
+    if engine.local_app is None:  # held by the engine, so the two go together
+        engine.local_app = create_app(engine=engine, token=secrets.token_hex(16))
+        engine.local_app.state.engine = engine
+    return LocalTransport(engine.local_app, token)

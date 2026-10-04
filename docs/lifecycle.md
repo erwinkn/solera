@@ -357,10 +357,9 @@ adopted by a restarted engine (§12).
   index merges (`Model.endpoints`) keep them. Set when `_prepare` plans,
   before the launch. A plan with no position to move (a keys= selection
   while a pattern change decides membership) holds none.
-- **Its cleanups** (`cleanups`): the delta files of the pending cleanup
-  entries its spec hands it, also set at `_prepare`: collection keeps
-  them while the attempt runs, even once another attempt acknowledged the
-  entry (F36).
+- **Its cleanups** (`cleanups`), a cleanup task's: the delta files of the
+  pending entries its spec hands it, set when it is prepared: collection
+  keeps them while it runs, even once the entry goes meanwhile (F36).
 - **Its reader pin**: by its generation, over the index prefixes it reads
   and writes (`prefixes`), or every one while it is still preparing:
   collection deletes nothing such a reader may still read (§9.8).
@@ -397,12 +396,9 @@ over `site_files`, on a `Pool`):
 1. The hourly run's task is due; nothing holds `file_index:alpha`.
    Dispatch claims it for attempt A at event 120: generation 120, memory
    only, `claimed_partitions[(file_index, alpha)] = A`.
-2. `_prepare` pins `site_files:alpha` at commit 56..60 and hands A the
-   pending cleanup entry 118.0 (a delta file `…/000000000055-B.0000`).
-   The claim now holds `reads = [(site_files, alpha, 56, 61)]` and
-   `cleanups = {…/000000000055-B.0000}`: truncation stops below 56, and
-   collection keeps that file even if B's own cleanup acknowledges 118.0
-   now.
+2. `_prepare` pins `site_files:alpha` at commit 56..60. The claim now
+   holds `reads = [(site_files, alpha, 56, 61)]`: truncation stops below
+   56.
 3. The spec and the control file (`open`) are written; `AttemptLaunched`
    is recorded and awaited. Only now is A offered to the `ingest` pool.
 4. Workers `w1` and `w2` long-poll; both are offered A; `w1` swaps the
@@ -1021,37 +1017,41 @@ shows.
   them): the wait costs storage only.
 
 **As built.** The engine holds no store credentials and runs no user
-code, so workers clean up, twice over:
+code, so every cleanup runs as a **cleanup task**: a task of the engine's
+own, asset `@cleanup`, on the default placement, retried like any (six
+tries, backing off from a minute), never inside a partition's attempt.
 
-- **Right after a commit** (D8). The worker's `finished` waits until the
-  engine settled the attempt and made its commit durable; the answer
-  names the entries now due in its partition — what the commit let go of that
-  no reader pins, and what was waiting — with each output's head. The
-  worker calls `store.cleanup` with them and acknowledges by entry id
-  (`POST attempts/{a}/cleaned up`, recorded as `CleanupsDone`). So a
-  partition that never runs again keeps no garbage.
-- **By the partition's next attempt**, the fallback for whatever the first
-  missed: the engine unreachable, the worker gone before it
-  acknowledged, a reader still pinned. The engine puts the due entries (at
-  most 64) in the spec's output info, and the worker, after its own store
-  call succeeds, cleanups them and reports which in its result;
-  `AttemptFinished` then removes them.
-- **By a cleanup task** (K25), where no attempt of the output will ever
-  come again: an output removed, or moved to another store. The deploy
-  records the life it ended — the old store (a built-in one's class and
-  config, from the manifest), the output's home and declaration, and
-  `before`, the first generation after — due once its `cleanup_after`
-  has passed and no pin predates the deploy. The engine then submits a
-  task of its own, asset `@cleanup`, on the default placement, retried
-  like any (six tries); its worker rebuilds the store and calls
-  `store.cleanup(output, home=…, before=G)`, so a later life of the name
-  in that store keeps what it wrote. A store of the project's own that it
-  no longer declares cannot be rebuilt: the task fails for good, and the
-  entry is stuck with that reason, shown by `solera cleanups`, until an
-  operator clears it (its objects stay).
+- **Right after a commit** that makes entries due — what it let go of that
+  no reader pins, and what was waiting — the engine submits a cleanup task
+  for that output partition. Its spec carries the due entries (at most 64)
+  and the output's asset, whose store and declaration delete them; its
+  result reports which went, and `AttemptFinished` removes them. A task
+  that ends with more due submits the next.
+- **The cleanup job** (`cleanup_interval`, an hour by default) submits
+  cleanup tasks for whatever is due anywhere: entries whose pins or grace
+  have cleared since their commit — an abandoned attempt's once its late
+  window passes — those of partitions that never run again, and output
+  lives past their `cleanup_after`.
+- **An output life** (K25) — an output removed, moved to another store, or
+  renamed without `aliases=` — is recorded by the deploy that ended it:
+  the old store (a built-in one's class and config, from the manifest),
+  the output's home and declaration, and `before`, the first generation
+  after. It is due once its `cleanup_after` has passed (a week by default,
+  `stores.md`) and no pin predates the deploy; its task's worker rebuilds
+  the store and calls `store.cleanup(output, home=…, before=G)`, so a
+  later life of the name in that store keeps what it wrote. A store of the
+  project's own that it no longer declares cannot be rebuilt: the task
+  fails for good.
 
-Deleting a name twice is no harm, and only the index files an
-acknowledged entry names become garbage. Due means no reader pin that
+A cleanup task that fails past its tries leaves what it was handed
+`stuck`, with the reason: shown by `solera cleanups`, handed to no
+further task, until an operator clears it (its objects stay). One task
+runs per output partition at a time; tasks of different partitions run
+at once. Cleanup runs are left out of run listings unless asked for
+(`origin=cleanup`).
+
+Deleting a name twice is no harm, and only the index files an entry a
+cleanup task reported done names become garbage. Due means no reader pin that
 may read the entry's output partition predates it: pins are per output partition,
 each named by its index prefix. An attempt's claim pins what it reads and
 writes (§3.1); a delta
@@ -1060,9 +1060,9 @@ engine reader what it reads (`history/` for a history query). Index and
 history files are collected by the same rule, by their paths, so one slow
 reader holds back only what it reads. A delta file
 a pending entry reads is kept, even once the index let go of it, until the
-entry is done — and while an attempt whose spec holds the entry runs
+entry is done — and while a cleanup task whose spec holds the entry runs
 (its claim's cleanups, §3.1). An entry whose files cannot be read stays pending; after
-three such attempts it is `stuck`: no longer handed out, listed in
+three such tasks it is `stuck`: no longer handed out, listed in
 `/api/diagnostics` and on its partition's head record, until an operator runs
 `solera cleanups OUTPUT [Partition] --clear` (its objects stay). An
 abandoned attempt's objects go by its generation, found by the store
@@ -1074,14 +1074,13 @@ index-file garbage and data cleanups, as a live claim does; a retry pass
 needs none, since each of its batches reads the state of its own prepare
 (`per-key-processing.md` §20).
 
-**Remaining orphans.** Two cases leave objects behind, harmless but for
-the storage they take: the index never names them, and they are
-collected when their output is removed or moved (the cleanup task's
-`before=G`). A partition that never runs again hands its due entries to
-no attempt. And the sweep's bound holds for workers that honour
-cancellation: one whose machine pauses (a suspended VM) can resume after
-the window and complete a write it had already started. Storage is the
-cheap resource: no periodic task chases them.
+**Remaining orphans.** One case leaves objects behind, harmless but for
+the storage they take: the sweep's bound holds for workers that honour
+cancellation, and one whose machine pauses (a suspended VM) can resume
+after the window and complete a write it had already started. The index
+never names it, and it is collected when its output is removed or moved
+(the cleanup task's `before=G`). A partition that never runs again is no
+longer one: the cleanup job takes what it owes.
 
 Writing the same content again (`v1 → v2 → v1`) writes a new name
 (`f-1/{g3}`): deleting the old `f-1/{g1}` cannot touch it. That is what removes the

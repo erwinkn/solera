@@ -100,12 +100,8 @@ class AttemptChannel:
     async def logs(self, body: dict) -> dict:
         return await self._post("logs", body)
 
-    async def finished(self, body: dict) -> dict:
-        # The answer waits for the commit, to name what is due for cleaning up.
-        return await self._post("finished", body, timeout=30.0)
-
-    async def cleaned_up(self, body: dict) -> None:
-        await self._post("cleaned_up", body)
+    async def finished(self, body: dict) -> None:
+        await self._post("finished", body)
 
     async def resolve(self, body: bytes) -> bytes:
         """A small write's delta, from the engine's cache (docs/resolved-commits.md §4)."""

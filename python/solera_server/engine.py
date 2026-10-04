@@ -53,7 +53,16 @@ from .attempts import POOL_OFFERED_GRACE, Attempts, Live, current_names, worker_
 from .executors import PlacementContext, Registry
 from .history import MAX_METADATA, History, RunFilter
 from .keyservice import KeyService, cache_root
-from .model import CLEANUP, REPAIR_RUNS, REPAIR_SPACING, TERMINAL_RUN, _delta_files, commit_of, declaration
+from .model import (
+    CLEANUP,
+    REPAIR_RUNS,
+    REPAIR_SPACING,
+    TERMINAL_RUN,
+    TERMINAL_TASK,
+    _delta_files,
+    commit_of,
+    declaration,
+)
 from .positions import advance, continues, outstanding, reads, selects
 from .sensors import Sensors
 from .staleness import Staleness
@@ -68,10 +77,12 @@ TERMINAL = SUCCESS | {"failed", "blocked", "canceled"}
 HEARTBEAT_SECONDS = 10.0  # a worker beats this often (docs/lifecycle.md §6)
 PROVISION_SECONDS = 600.0  # a launched worker reports within this, or it never started
 CANCEL_GRACE = 60.0  # a requested cancel's time to drain before it is forced (§7)
-CLEANUPS = 64  # cleanup entries one attempt is given at most
+CLEANUPS = 64  # cleanup entries one cleanup task takes at most
+CLEANUP_INTERVAL = 3600.0  # the cleanup job looks for cleanup due anywhere this often (§9.8)
 SOURCE_KEYS_RECORDED = 1000  # a source commit's run lists changed keys up to this many, else counts
 GRACE_SECONDS = 5.0
 CLEANUP_TRIES = 6  # a cleanup task's attempts, its retries backing off from a minute (K25)
+CLEANUP_RETRY_DELAY = 60.0  # a failed cleanup task's first retry, then doubling
 READ_AHEAD_CAP = 10_000  # keys= runs a plain incremental partition records before it must run (K45)
 
 
@@ -139,6 +150,7 @@ class Engine(Attempts, Sensors, Staleness, Views):
         resolve_cache: str | None | bool = True,
         sensor_host=None,
         read_ahead_cap: int = READ_AHEAD_CAP,
+        cleanup_interval: float = CLEANUP_INTERVAL,
     ):
         import time
 
@@ -149,6 +161,8 @@ class Engine(Attempts, Sensors, Staleness, Views):
         self.clock = clock or time.time
         self.heartbeat_seconds, self.concurrency = heartbeat_seconds, concurrency
         self.provision_seconds, self.cancel_grace = provision_seconds, cancel_grace
+        self.cleanup_interval, self._cleanup_job_at = cleanup_interval, 0.0  # the job's next look
+        self.local_app = None  # its routes for workers it runs in this process (`api.local_transport`)
         # Where workers reach this engine (docs/lifecycle.md §5); without one,
         # they report through `.beat` alone.
         self.engine_url = engine_url
@@ -339,7 +353,7 @@ class Engine(Attempts, Sensors, Staleness, Views):
         """One evaluation pass: adoption, dispatch, automations, archiving."""
 
         self._adopt()
-        self._cleanups_due()
+        self._cleanup_job()
         self._dispatch_due()
         self._sensor_sweep()
         self._automation_tick()
@@ -538,6 +552,21 @@ class Engine(Attempts, Sensors, Staleness, Views):
         if keys:
             event["keys"] = keys  # a per-key attempt's keys by outcome
         self.state.record(event)
+        if commit is not None:
+            # What the commit let go of goes at once, if no reader needs it: a cleanup task.
+            cleanup = task.get("cleanup") or {}
+            handed = ((task.get("launched") or {}).get("prepared") or {}).get("cleanup") or {}
+            if "output" in cleanup:  # a cleanup task: the rest, if its limit left some; else the job's
+                if (
+                    sum(len(i.get("cleanup") or ()) for i in (handed.get("outputs") or {}).values())
+                    >= CLEANUPS
+                ):
+                    self._submit_cleanups([(cleanup["output"], cleanup["partition"])])
+            elif task["asset"] in self.manifest["assets"]:
+                outputs = self.manifest["assets"][task["asset"]]["outputs"]
+                self._submit_cleanups(
+                    [(o["name"], task["partition"]) for o in outputs if self.m.immutable(o["name"])]
+                )
         if self.keys is not None:
             for name, keys in ((commit or {}).get("keys") or {}).items() if outcome == "succeeded" else ():
                 self._cache_commit(name, task["partition"], keys)
@@ -690,70 +719,128 @@ class Engine(Attempts, Sensors, Staleness, Views):
             return default_placement()
         return self.manifest["assets"][task["asset"]]["placement"]
 
-    def _cleanups_due(self) -> None:
-        """A cleanup task for each output life whose leftovers are due (K25):
-        past its `cleanup_after`, read by no pin older than the deploy that
-        ended it, not stuck, and none submitted already. It runs as any
-        task does — placed, retried a bounded number of times, in the runs
-        and their history — with no asset of the project's."""
+    def _cleanup_job(self) -> None:
+        """The cleanup job (§9.8): every `cleanup_interval`, a cleanup task for
+        whatever is due anywhere — entries whose pins or grace have cleared
+        since their commit, those of partitions that never run again, and
+        output lives past their `cleanup_after`."""
 
-        if not self.m.retired:
-            return
-        now, floor = self.clock(), self.m.pin_floor()
-        submitted = {t.get("cleanup") for run in self.m.runs.values() for t in run["tasks"].values()}
-        for entry_id, entry in self.m.retired.items():
-            if entry.get("stuck") or entry_id in submitted or entry["due"] > now or floor < entry["before"]:
-                continue
-            run_id = ulid(now)
-            task_id = f"{run_id}/{CLEANUP}:{entry['output']}"
-            task = {
-                "id": task_id,
-                "run": run_id,
-                "asset": CLEANUP,
-                "partition": "",
-                "cleanup": entry_id,
-                "status": "queued",
-                "deps": [],
-                "max_attempts": CLEANUP_TRIES,
-                "retry": {"n": CLEANUP_TRIES - 1, "delay": 60.0, "backoff": "exponential"},
-                "ready_at": now,
-                "queued_at": now,
-                "wait": 0.0,
-            }
-            run = {
-                "id": run_id,
-                "kind": "cleanup",
-                "targets": [],
-                "partitions": "latest",
-                "mode": "incremental",
-                "upstream": False,
-                "config": {},
-                "keys": None,
-                "automation": None,
-                "by": "engine",
-                "tags": {"cleanup": entry["output"]},
-                "status": "running",
-                "paused": False,
-                "created_at": now,
-                "updated_at": now,
-                "events": 0,
-                "tasks": {task_id: task},
-            }
-            self.state.record({"type": "RunSubmitted", "run": run, "command": None})
+        now = self.clock()
+        if now >= self._cleanup_job_at:
+            self._cleanup_job_at = now + self.cleanup_interval
+            self._submit_cleanups()
 
-    def _prepare_cleanup(self, task: dict) -> dict:
-        """A cleanup task's spec: the entry, nothing to read or write besides."""
+    def _submit_cleanups(self, partitions=None) -> None:
+        """A cleanup task for each of `partitions` (output, partition) with
+        entries due — all of them with none, and every output life past its
+        `cleanup_after`, read by no pin older than the deploy that ended it.
+        None where one is queued or running already, or an entry is stuck. It
+        runs as any task does — placed, retried a bounded number of times, in
+        the runs and their history — with no asset of the project's."""
 
-        entry = self.m.retired.get(task["cleanup"])
-        if entry is None:
-            raise NonRetryable(f"cleanup {task['cleanup']}: an operator cleared it")
-        return {
-            "cleanup": dict(entry),
+        submitted = {
+            json.dumps(t.get("cleanup"), sort_keys=True)
+            for run in self.m.runs.values()
+            for t in run["tasks"].values()
+            if t["asset"] == CLEANUP and t["status"] not in TERMINAL_TASK
+        }
+        due, declared = [], {o["name"] for info in self.manifest["assets"].values() for o in info["outputs"]}
+        for output, partition in list(self.m.cleanups) if partitions is None else partitions:
+            if output in declared and self._due_cleanups(output, partition, None):  # what a task could take
+                due.append(({"output": output, "partition": partition}, f"{output}/{partition}", output))
+        if partitions is None and self.m.retired:
+            now, floor = self.clock(), self.m.pin_floor()
+            for entry_id, entry in self.m.retired.items():
+                if not entry.get("stuck") and entry["due"] <= now and floor >= entry["before"]:
+                    due.append(({"life": entry_id}, entry_id, entry["output"]))
+        for cleanup, partition, output in due:
+            if json.dumps(cleanup, sort_keys=True) not in submitted:
+                self._cleanup_task(cleanup, partition, output)
+
+    def _cleanup_task(self, cleanup: dict, partition: str, output: str) -> None:
+        now = self.clock()
+        run_id = ulid(now)
+        task_id = f"{run_id}/{CLEANUP}:{partition}"  # as any task's: run/asset:partition
+        task = {
+            "id": task_id,
+            "run": run_id,
+            "asset": CLEANUP,
+            "partition": partition,  # its own: cleanup tasks of different partitions run at once
+            "cleanup": cleanup,
+            "status": "queued",
+            "deps": [],
+            "max_attempts": CLEANUP_TRIES,
+            "retry": {"n": CLEANUP_TRIES - 1, "delay": CLEANUP_RETRY_DELAY, "backoff": "exponential"},
+            "ready_at": now,
+            "queued_at": now,
+            "wait": 0.0,
+        }
+        run = {
+            "id": run_id,
+            "kind": "cleanup",
+            "targets": [],
+            "partitions": "latest",
+            "mode": "incremental",
+            "upstream": False,
+            "config": {},
+            "keys": None,
+            "automation": None,
+            "by": "engine",
+            "tags": {"cleanup": output},
+            "status": "running",
+            "paused": False,
+            "created_at": now,
+            "updated_at": now,
+            "events": 0,
+            "tasks": {task_id: task},
+        }
+        self.state.record({"type": "RunSubmitted", "run": run, "command": None})
+
+    def _prepare_cleanup(self, task: dict, attempt: str) -> dict:
+        """A cleanup task's spec: an output life's leftovers, or a partition's
+        entries due now (at most `CLEANUPS`), with the output's asset, whose
+        store and declaration delete them; nothing to read or write besides.
+        Nothing due any more (a pin arrived, an operator cleared it): skipped."""
+
+        prepared = {
             "outputs": {},
             "inputs": {},
             "plans": {},
             "cursor": None,
             "deploy_number": self.m.deploy_number,
+        }
+        cleanup = task["cleanup"]
+        if "life" in cleanup:
+            entry = self.m.retired.get(cleanup["life"])
+            if entry is None:
+                raise NonRetryable(f"cleanup {cleanup['life']}: an operator cleared it")
+            return {**prepared, "cleanup": dict(entry)}
+        output, partition = cleanup["output"], cleanup["partition"]
+        owner = next(
+            (
+                a
+                for a, info in self.manifest["assets"].items()
+                for o in info["outputs"]
+                if o["name"] == output
+            ),
+            None,
+        )
+        entries = self._due_cleanups(output, partition, attempt) if owner is not None else []
+        if not entries:
+            return {**prepared, "skip": True}
+        claim = self.m.claimed(attempt)
+        if claim is not None:
+            # What its spec hands it is read from now, not from `AttemptLaunched` on: an
+            # operator's clearing meanwhile must not let collection take it.
+            claim["cleanups"] = _delta_files(entries)
+        home = self.m.homes.get(output, output)
+        return {
+            **prepared,
+            "cleanup": {
+                "asset": owner,
+                "partition": partition,
+                "outputs": {output: {"cleanup": entries, "home": home}},
+            },
         }
 
     def _partition_active_claim(self, asset: str, partition: str) -> bool:
@@ -773,7 +860,7 @@ class Engine(Attempts, Sensors, Staleness, Views):
             run = self.m.runs[task["run"]]
             try:
                 if task["asset"] == CLEANUP:
-                    prepared = self._prepare_cleanup(task)
+                    prepared = self._prepare_cleanup(task, attempt)
                 else:
                     prepared = self._prepare(task, run, attempt, await self._read_ahead(task))
             except (Retryable, NonRetryable, Conflict) as error:
@@ -1039,15 +1126,7 @@ class Engine(Attempts, Sensors, Staleness, Views):
                     info["repairs"] = self.m.repairs[(name, partition)]
                 if output.get("dynamic_partitions") or name in self._dynamic_dims:
                     info["partitions"] = list((head or {}).get("partitions") or ())
-            if due := self._due_cleanups(name, partition, attempt):
-                info["cleanup"] = due
             outputs[name] = info
-        if claim is not None:
-            # What its spec hands it is read from now, not from `AttemptLaunched` on: another
-            # attempt's acknowledgement meanwhile must not let collection take it.
-            claim["cleanups"] = _delta_files(
-                d for info in outputs.values() for d in info.get("cleanup") or ()
-            )
         # The input versions its outputs will be built from, for the history (§7):
         # each pinned ref's generation (docs/versions.md §6).
         lineage = []
@@ -1779,8 +1858,8 @@ class Engine(Attempts, Sensors, Staleness, Views):
     def _due_cleanups(self, output: str, partition: str, attempt: str | None) -> list[dict]:
         """The cleanup of an immutable output's partition that no reader can
         still need: every entry let go of before the oldest reader pin but this
-        attempt's own, which reads none of it. At most `Cleanups` of them, for
-        this attempt to clean up (§9.8)."""
+        attempt's own (a cleanup task's, which reads none of it), and past its
+        `after`. At most `CLEANUPS` of them, for one cleanup task (§9.8)."""
 
         entries = self.m.cleanups.get((output, partition))
         if not entries:
@@ -1843,9 +1922,18 @@ class Engine(Attempts, Sensors, Staleness, Views):
         if claim is None:
             raise LostOwnership(attempt)
         task = self.m.task(self.m.attempts[attempt])
-        if prepared.get("cleanup") is not None:  # a cleanup task: its end is all it installs (K25)
-            commit = {"cleaned": prepared["cleanup"]["id"]}
-            self._finish(task, claim, outcome, commit=commit, error=error, retryable=retryable, delay=delay)
+        if prepared.get("cleanup") is not None:  # a cleanup task: its end, and what it cleaned up (K25)
+            commit = {"cleaned": prepared["cleanup"].get("id")}  # an output life's
+            self._finish(
+                task,
+                claim,
+                outcome,
+                commit=commit,
+                error=error,
+                retryable=retryable,
+                delay=delay,
+                worker=result,
+            )
             return {"run": task["run"], "attempt": attempt, "outputs": {}}
         # Inputs may have moved since they were pinned: the attempt's output
         # derives from what it read (the spec records it), its positions

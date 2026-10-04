@@ -28,7 +28,6 @@ from .state import LostOwnership, Unavailable
 log = logging.getLogger(__name__)
 
 LIVE_LINES = 10_000  # live log lines kept per attempt for the console
-AFTER_COMMIT_WAIT = 10.0  # seconds a worker's `finished` waits for its commit, for its cleanups
 POOL_OFFERED_GRACE = 10.0  # an offered pool attempt not started this long: look for its claim
 POOL_PAGE = 8  # attempts one discovery answer offers
 
@@ -57,32 +56,6 @@ def _names(value) -> dict[str, list[str]]:
     if not isinstance(value, dict):
         return {}
     return {str(k): [str(i) for i in v] for k, v in value.items() if isinstance(v, list)}
-
-
-def cleanup_report(body) -> dict:
-    """A worker's clean up acknowledgement as the model applies it: its
-    `partition`, and by output the entry ids it cleaned up (`cleaned_up`) or
-    could not read the names of (`cleanup_unresolved`), and the index files
-    it deleted (`cleaned_files`)."""
-
-    if not isinstance(body, dict) or not isinstance(body.get("partition"), str):
-        raise ValueError("a cleanup report names its partition")
-    out = {"partition": body["partition"]}
-    for name in ("cleaned_up", "cleanup_unresolved"):
-        value = body.get(name)
-        if value is None:
-            continue
-        if not isinstance(value, dict) or not all(
-            isinstance(v, list) and all(isinstance(i, str) for i in v) for v in value.values()
-        ):
-            raise ValueError(f"{name}: entry ids by output")
-        out[name] = value
-    files = body.get("cleaned_files")
-    if files is not None:
-        if not isinstance(files, list) or not all(isinstance(f, str) for f in files):
-            raise ValueError("cleaned_files: a list of paths")
-        out["cleaned_files"] = files
-    return out
 
 
 def worker_output(info: dict) -> dict:
@@ -296,48 +269,12 @@ class Attempts:
         live.log_offset += len(new)
         return {"offset": live.log_offset}
 
-    async def attempt_finished(self, attempt: str, body: dict) -> dict:
+    async def attempt_finished(self, attempt: str, body: dict) -> None:
         self._serving()
         live = self._live(attempt)
         await self._bind(attempt, live, body["worker_id"])
-        task_id = self.m.attempts.get(attempt)
         live.finished = True
         self._stir(attempt)
-        return await self._due_after(attempt, task_id)
-
-    async def _due_after(self, attempt: str, task_id: str | None) -> dict:
-        """Once the attempt is settled and its commit durable, the data
-        garbage due in its partition — what its commit let go of that no reader
-        pins, and what was waiting — for its worker to clean up at once
-        (docs/lifecycle.md §9.8). Nothing if settling takes longer: the
-        partition's next attempt cleanups it, as ever."""
-
-        task = self.m.task(task_id or "")
-        # Its watcher settles it, then ends: awaited, not polled. None here, no one settles it now.
-        watcher = next((self.watchers.get(k) for k in self.watchers if k[1] == attempt), None)
-        if task is not None and watcher is not None:
-            await asyncio.wait({watcher}, timeout=AFTER_COMMIT_WAIT)
-        if task is None or self.m.claimed(attempt) is not None:
-            return {}
-        await self.state.durable()  # never delete what a replay would still name
-        due = {}
-        for output in self.manifest["assets"].get(task["asset"], {}).get("outputs") or ():
-            name, head = output["name"], self.m.heads.get((output["name"], task["partition"]))
-            if self.m.immutable(name) and head is not None:
-                entries = self._due_cleanups(name, task["partition"], None)
-                if entries:
-                    due[name] = {"cleanup": entries, "home": self.m.homes.get(name, name)}
-        return {"cleanup": due, "partition": task["partition"]} if due else {}
-
-    async def attempt_cleaned_up(self, attempt: str, body) -> None:
-        """A worker's acknowledgement of what it cleaned up after its commit,
-        checked whole before anything is recorded: one that is malformed is
-        refused (`ValueError`), and no reducer ever sees it."""
-
-        self._serving()
-        report = cleanup_report(body)
-        if report.get("cleaned_up") or report.get("cleanup_unresolved"):
-            self.state.record({"type": "CleanupsDone", **report})
 
     async def attempt_resolve(self, attempt: str, body: bytes) -> bytes | None:
         """A small write's delta from the engine's cache (docs/resolved-commits.md
@@ -467,7 +404,7 @@ class Attempts:
         }
         if prepared["cursor"] is not None:
             spec["cursor"] = prepared["cursor"]
-        if prepared.get("cleanup") is not None:  # a cleanup task's entry (K25)
+        if prepared.get("cleanup") is not None:  # a cleanup task's work (§9.8, K25)
             spec["cleanup"] = prepared["cleanup"]
         base = lifecycle.base(task["run"], attempt)
         await self.state.create_object(f"{base}{lifecycle.SPEC}", json.dumps(spec).encode())

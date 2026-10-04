@@ -3,11 +3,14 @@ asset they ran lets go of them; current state and the data in stores never
 do. Runs in which every task was skipped are recorded as skipped, and
 listed only when asked for."""
 
+import json
+
 import pytest
 from solera.sdk import Incremental, Output, Project, Retention, asset
 from solera_server.engine import Engine
 from solera_server.executors.inline import InlinePlacement
 from solera_server.history import RunFilter
+from solera_server.model import CLEANUP
 from solera_server.state import State, Unavailable
 
 
@@ -43,25 +46,37 @@ def engine_for(state, project, clock):
 
 
 async def history_ids(engine) -> list[str]:
-    """Every finished run in the history, oldest first."""
+    """Every finished run in the history, oldest first, but the engine's cleanup runs."""
 
     def work(con):
-        return [r[0] for r in con.execute("SELECT id FROM runs ORDER BY id").fetchall()]
+        return [
+            r[0] for r in con.execute("SELECT id FROM runs WHERE origin <> 'cleanup' ORDER BY id").fetchall()
+        ]
 
     return await engine.history.query(work, ("runs",), live=False)
 
 
 async def run_dirs(state) -> set[str]:
-    """Runs whose objects are there: a deleted run leaves none (docs/lifecycle.md §2.4)."""
+    """Runs whose objects are there, but cleanup runs': a deleted run leaves
+    none (docs/lifecycle.md §2.4)."""
 
-    return {p.split("/")[1] for p in await state.list_objects("runs/")}
+    dirs = {}
+    for path in await state.list_objects("runs/"):
+        if path.endswith(".spec"):
+            dirs[path.split("/")[1]] = json.loads(await state.get_object(path)).get("asset")
+        dirs.setdefault(path.split("/")[1], None)
+    return {run for run, asset in dirs.items() if asset != CLEANUP}
 
 
 async def run(engine, targets, **kw):
+    """A run settled, and the cleanup task its commit made due run too, at the same time."""
+
     detail = await engine.run_until((await engine.submit(targets, **kw))["id"], 60)
     assert detail["request"]["status"] == "succeeded", [
         a.get("error") for x in detail["attempts"].values() for a in x
     ]
+    for cleanup in [r for r in engine.m.runs.values() if r["kind"] == "cleanup"]:
+        await engine.run_until(cleanup["id"], 60)
     return detail["request"]["id"]
 
 

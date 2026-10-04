@@ -413,6 +413,8 @@ async def test_a_fenced_engine_never_deletes_what_only_its_unflushed_merge_let_g
     assert all(p.rpartition("/")[2].startswith("m") for p in x)
     rows.append({"id": "late"})
     await run(engine_a, ["items"])
+    for cleanup in [r for r in engine_a.m.runs.values() if r["kind"] == "cleanup"]:
+        await engine_a.run_until(cleanup["id"], 20)  # its launch would flush M below: done first
     await a.durable()
     await merge_all()  # M, over X: recorded, not flushed
     assert x <= {path for path, _ in a.model.garbage}
@@ -827,7 +829,8 @@ async def test_input_reads_come_from_the_engine_once_warm(state, monkeypatch):
 
     async def reads(self, spec, at):
         out = await real_reads(self, spec, at)
-        served.append(out is not None)
+        if spec.get("inputs"):  # a cleanup task reads none
+            served.append(out is not None)
         return out
 
     monkeypatch.setattr(KeyService, "reads", reads)

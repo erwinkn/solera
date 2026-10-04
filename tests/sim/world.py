@@ -203,13 +203,10 @@ class SimChannel:
         await self.world.channel_point(self.who, "finished")
         return await self._call("finished", body)
 
-    async def cleaned_up(self, body):
-        return await self._call("cleaned_up", body)
-
     async def resolve(self, body):
         return await self._call("resolve", body)
 
-    def close(self):
+    async def close(self):
         pass
 
 

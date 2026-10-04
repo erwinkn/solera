@@ -382,15 +382,8 @@ async def test_worker_pull_path_and_channel(engine, monkeypatch):
             headers={"Authorization": f"Bearer {other}"},
         )
         assert forged.status_code == 401
-        from solera_server import attempts
-
-        monkeypatch.setattr(attempts, "AFTER_COMMIT_WAIT", 0.1)  # nothing settles it here
         finished = await client.post(f"{routes}/finished", json={"worker_id": "mine"}, headers=token)
-        assert finished.status_code == 200  # what is due for cleaning up once committed: here nothing
-        report = {"worker_id": "mine", "partition": "", "cleaned_up": {}}
-        assert (await client.post(f"{routes}/cleaned_up", json=report)).status_code == 401
-        cleaned = await client.post(f"{routes}/cleaned_up", json=report, headers=token)
-        assert cleaned.status_code == 204  # the route the worker's channel posts to
+        assert finished.status_code == 204
 
 
 async def test_console_shell_served(client):

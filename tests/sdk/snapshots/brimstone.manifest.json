@@ -1027,7 +1027,7 @@
     "id": "snapshot",
     "source": "explicit"
   },
-  "deploy": "a3444a997359913b6282781025d544413116bae2332f17bad2ca63973b675f85",
+  "deploy": "3e5c2adb21d52589edf80b3a871af54db1f7910e9d39773a5b7dcc510eac66c6",
   "errors": [],
   "executors": {
     "ingest": {
@@ -1592,7 +1592,7 @@
           "url": "env:ARTIFACT_STORE"
         }
       },
-      "cleanup_after": 0.0,
+      "cleanup_after": 604800.0,
       "ref": "object",
       "version": "4",
       "writes": "immutable"
@@ -1604,7 +1604,7 @@
           "path": null
         }
       },
-      "cleanup_after": 0.0,
+      "cleanup_after": 604800.0,
       "ref": "object",
       "version": "4",
       "writes": "immutable"

@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import datetime
 import logging
 import re
 from collections.abc import Callable, Iterable, Mapping
@@ -102,8 +101,6 @@ class PostgresStore:
     ref_type = TableRef
     shared_table = True
     writes = "fenced"
-    # A removed or moved output's table stays a week: people query it directly (K25).
-    cleanup_after = datetime.timedelta(days=7)
 
     def __init__(self, dsn: str, grants: list[str] | tuple = (), sql_read_only: bool = False):
         """`grants`: roles given SELECT on every table the store creates.

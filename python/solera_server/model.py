@@ -524,9 +524,9 @@ class Model:
             "launched": True,
             "reads": reads(launched["prepared"].get("plans") or {}),
             "prefixes": tuple(launched["prepared"].get("prefixes") or ()),
-            "cleanups": _delta_files(
+            "cleanups": _delta_files(  # a cleanup task's entries (§9.8)
                 d
-                for info in (launched["prepared"].get("outputs") or {}).values()
+                for info in ((launched["prepared"].get("cleanup") or {}).get("outputs") or {}).values()
                 for d in info.get("cleanup") or ()
             ),
         }
@@ -1046,7 +1046,7 @@ class Model:
                 continue
             intents = self.repairs.setdefault((output, task["partition"]), [])
             intents.append({**intent, "run": e["run"], "attempt": e["attempt"]})
-        self._cleaned_up(task["partition"], e)
+        self._cleaned_up((task.get("cleanup") or {}).get("partition", task["partition"]), e, prepared)
         if launched is not None and not e.get("commit"):
             self._abandoned(task["partition"], e["attempt"], launched, at + float(e.get("late_writes") or 0))
         usage = (e.get("worker") or {}).get("usage") or {}
@@ -1102,10 +1102,10 @@ class Model:
                 self._ready(run, task, at, float(e.get("delay") or 0))
             else:
                 task["status"] = "failed"
-                if task["asset"] == CLEANUP and task.get("cleanup") in self.retired:
+                if task["asset"] == CLEANUP:
                     # Failed for good: kept, shown with why, never run again until an
                     # operator clears it (`solera cleanups OUTPUT --clear`, K25).
-                    self.retired[task["cleanup"]]["stuck"] = str(e.get("error") or "failed")
+                    self._stuck(task, prepared, str(e.get("error") or "failed"))
                 self._finished(run, task, "failed", e["attempt"], at)
         elif outcome == "canceled" and commit:
             task["status"] = "canceled"  # a drained batch the user stopped: it does not resume
@@ -1497,12 +1497,28 @@ class Model:
                     entry["prefix"] = info["prefix"]
                 self._collect(name, partition, entry)
 
-    def _cleaned_up(self, partition: str, e: dict) -> None:
-        """A worker cleaned up cleanup: its entries go, and the index-side
+    def _cleaned_up(self, partition: str, e: dict, prepared: dict | None = None) -> None:
+        """A cleanup task cleaned up a partition: its entries go, and the index-side
         files they were read from become garbage themselves. An entry whose
         names it could not read counts a miss; at `STUCK_AFTER` it is
         `stuck`: kept, and shown, but no longer handed out."""
 
+        if e.get("commit") is not None:  # a cleanup task that reported nothing of an entry it was handed
+            handed = ((prepared or {}).get("cleanup") or {}).get("outputs") or {}
+            for output, info in handed.items():
+                told = {
+                    *((e.get("cleaned_up") or {}).get(output) or ()),
+                    *((e.get("cleanup_unresolved") or {}).get(output) or ()),
+                }
+                silent = [d["id"] for d in info.get("cleanup") or () if d["id"] not in told]
+                if silent:
+                    e = {
+                        **e,
+                        "cleanup_unresolved": {
+                            **(e.get("cleanup_unresolved") or {}),
+                            output: [*((e.get("cleanup_unresolved") or {}).get(output) or ()), *silent],
+                        },
+                    }
         named = set()  # the index-side files the acknowledged entries read: only those become garbage
         for output, done in (e.get("cleaned_up") or {}).items():
             for d in self.cleanups.get((output, partition), []):
@@ -1527,11 +1543,19 @@ class Model:
         for intent in self.repairs.get((e["output"], e["partition"]), ()):
             intent["runs"], intent["tried_at"] = runs + 1, e["at"]
 
-    def _on_CleanupsDone(self, e):
-        """A worker cleaned up cleanup right after its own commit (D8):
-        as the partition's next attempt would have."""
+    def _stuck(self, task: dict, prepared: dict, why: str) -> None:
+        """A cleanup task out of tries: its output life, or the entries it was
+        handed, are `stuck` — kept, shown, never handed out again."""
 
-        self._cleaned_up(e["partition"], e)
+        cleanup = task.get("cleanup") or {}
+        if cleanup.get("life") in self.retired:
+            self.retired[cleanup["life"]]["stuck"] = why
+        handed = (prepared.get("cleanup") or {}).get("outputs") or {}
+        for output, info in handed.items():
+            ids = {d["id"] for d in info.get("cleanup") or ()}
+            for d in self.cleanups.get((output, cleanup.get("partition")), []):
+                if d["id"] in ids:
+                    d["stuck"] = True
 
     def _drop_cleanups(self, output: str, partition: str, ids) -> None:
         left = [d for d in self.cleanups.get((output, partition), []) if d["id"] not in set(ids)]

@@ -26,6 +26,7 @@ NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]{0,127}$")
 DEFAULT_STORE = "default"
 KEYS = "<keys>"  # the key of a keyed output: its value is a dict[str, Any]
 MAX_PARTITION_KEYS = 100_000  # enumerated keys of one dimension, at most: past it, an error
+CLEANUP_AFTER = dt.timedelta(days=7)  # a whole output's data stays this long once removed or moved (D145)
 
 
 class RegistrationError(ValueError):
@@ -1742,8 +1743,8 @@ class Project:
                 "version": getattr(store, "version", "1"),
                 "ref": getattr(getattr(store, "ref_type", None), "kind", None) or "ref",
                 "writes": store.writes,
-                # How long a removed or moved output's data stays (K25).
-                "cleanup_after": getattr(store, "cleanup_after", dt.timedelta(0)).total_seconds(),
+                # How long a removed or moved output's data stays (K25): a week unless it says.
+                "cleanup_after": getattr(store, "cleanup_after", CLEANUP_AFTER).total_seconds(),
             }
             # A built-in store's class and config: a worker rebuilds it to clean up after
             # an output the project no longer declares there (K25). Never a literal secret.

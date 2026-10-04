@@ -65,7 +65,7 @@ TABLES = {
             "created_at": "DOUBLE",
             "finished_at": "DOUBLE",
             "status": "VARCHAR",  # a run that wrote nothing is "skipped"
-            "origin": "VARCHAR",  # manual | automation | sensor | commit
+            "origin": "VARCHAR",  # manual | automation | sensor | commit | cleanup
             "automation": "VARCHAR",
             "by": "VARCHAR",
             "retry_of": "VARCHAR",  # the finished run an explicit retry ran again
@@ -377,7 +377,13 @@ def run_row(run: dict, *, live: bool = False) -> dict:
         "created_at": run["created_at"],
         "finished_at": None if live else run.get("updated_at"),
         "status": status,
-        "origin": "automation" if run.get("automation") else "sensor" if run.get("sensor") else "manual",
+        "origin": "cleanup"
+        if run.get("kind") == "cleanup"
+        else "automation"
+        if run.get("automation")
+        else "sensor"
+        if run.get("sensor")
+        else "manual",
         "automation": run.get("automation"),
         "by": run.get("by"),
         "retry_of": run.get("retry_of"),
@@ -573,7 +579,7 @@ class RunFilter:
     field match any; fields must all match. Tags are `key=value` (or just
     `key`): run tags must all match, and `asset_tag` keeps runs that ran an
     asset carrying any of them. Skipped runs are left out unless `status`
-    asks for them."""
+    asks for them, and the engine's cleanup runs unless `origin` does."""
 
     status: list[str] = field(default_factory=list)
     asset: list[str] = field(default_factory=list)
@@ -632,6 +638,8 @@ def run_where(f: RunFilter, manifest: dict, skip: str | None = None) -> tuple[st
         if values and name != skip:
             clauses.append(f"list_contains(?::VARCHAR[], {column})")
             params.append(list(values))
+        elif name == "origin" and skip != "origin":
+            clauses.append("origin <> 'cleanup'")  # a cleanup task follows most commits: asked for, shown
     if skip != "status":
         if f.status:
             clauses.append("list_contains(?::VARCHAR[], status)")

@@ -1,6 +1,6 @@
 """Collection of immutable stores' data (docs/lifecycle.md §9.8): what a
-commit, a compaction or an abandoned attempt let go of is cleaned up by the
-partition's next attempt, once no reader can still need it."""
+commit, a compaction or an abandoned attempt let go of is cleaned up by a
+cleanup task, once no reader can still need it."""
 
 import asyncio
 import json
@@ -11,6 +11,7 @@ from solera.sdk import Incremental, Output, Project, Retry, asset
 from solera.stores import FileStore, Patch
 from solera_server.engine import Engine
 from solera_server.executors.inline import InlinePlacement
+from solera_server.model import TERMINAL_RUN
 from solera_server.state import State
 
 from tests.conftest import whole, worker_finished
@@ -18,15 +19,37 @@ from tests.conftest import whole, worker_finished
 
 def engine_for(state, project, **kw):
     placements = {"Local": lambda s, c: InlinePlacement(c, project)}
+    kw.setdefault("cleanup_interval", 0.0)  # the cleanup job looks at every tick
     return Engine(state, project.manifest, placements=placements, clock=state.clock, eval_interval=0.02, **kw)
 
 
+async def cleaned(engine) -> list[dict]:
+    """Every cleanup task submitted, run to its end, until nothing is due (a
+    task skipped for a reader pinned at its prepare leaves its entries to
+    the job); their runs' details."""
+
+    done = []
+    for _ in range(500):
+        pending = [
+            r for r in engine.m.runs.values() if r["kind"] == "cleanup" and r["status"] not in TERMINAL_RUN
+        ]
+        for r in pending:
+            done.append(await engine.run_until(r["id"], 20))
+        if not pending:
+            if not any(engine._due_cleanups(o, p, None) for o, p in list(engine.m.cleanups)):
+                return done
+            await engine.tick()
+            await asyncio.sleep(0.01)
+    raise AssertionError(f"cleanup never settled: {engine.m.cleanups}")
+
+
 async def run(engine, targets):
-    """A run settled, and its workers done: their cleanups after the commit too."""
+    """A run settled, its workers done, and the cleanup tasks it made due run."""
 
     detail = await engine.run_until((await engine.submit(targets))["id"], 20)
     assert detail["request"]["status"] == "succeeded", [t.get("error") for t in detail["tasks"]]
     await worker_finished()
+    await cleaned(engine)
     return detail
 
 
@@ -228,9 +251,10 @@ async def test_a_delta_a_pending_cleanup_reads_outlives_its_index(tmp_path, data
 
 
 async def test_an_entry_whose_names_cannot_be_read_gets_stuck_and_is_shown(tmp_path):
-    """After three attempts that could not read an entry's names, it is
-    stuck: no longer handed out, so it takes no attempt's slot; shown in
-    diagnostics and on the partition's head, until an operator clears it."""
+    """A cleanup task that cannot read an entry's names counts it a miss, and
+    the next one is submitted as it ends; after three, the entry is stuck: no
+    longer handed out, so no more tasks; shown in diagnostics and on the
+    partition's head, until an operator clears it."""
 
     import httpx
     from solera_server.api import create_app
@@ -245,15 +269,14 @@ async def test_an_entry_whose_names_cannot_be_read_gets_stuck_and_is_shown(tmp_p
     state = await State.open(tmp_path.as_uri(), "test", flush_interval=0.001)
     engine = engine_for(state, project)
     await engine.initialize()
-    engine._due_after = no_cleanups_after_commit  # the next attempts' path alone
     await run(engine, ["scores"])
     m = state.model
     prefix = m.indexes[("scores", "")].prefix
     m.cleanups[("scores", "")] = [{"n": 1, "id": "1.0", "kind": "delta", "prefix": prefix, "files": ["gone"]}]
-    for misses in (1, 2, 3):
-        await run(engine, ["scores"])
-        [entry] = m.cleanups[("scores", "")]
-        assert entry["misses"] == misses and entry.get("stuck", False) == (misses == 3)
+    engine._submit_cleanups()
+    assert len(await cleaned(engine)) == 3  # a miss each, then stuck: no fourth
+    [entry] = m.cleanups[("scores", "")]
+    assert entry["misses"] == 3 and entry["stuck"]
     assert engine._due_cleanups("scores", "", None) == []
     app = create_app(engine=engine, insecure=True)
     app.state.engine = engine
@@ -273,9 +296,9 @@ async def test_an_entry_whose_names_cannot_be_read_gets_stuck_and_is_shown(tmp_p
 
 async def test_entries_of_one_event_are_acknowledged_one_by_one(tmp_path):
     """Astra review 2, P2-5: one commit lets go of several entries at one
-    event counter, and the pass limit can split them. Acknowledging
-    the delivered ones leaves the others queued; and a resolved sibling's
-    acknowledgment does not erase an unresolved one's miss."""
+    event counter, and the per-task limit splits them. Acknowledging the
+    delivered ones leaves the others queued, and a resolved sibling's
+    acknowledgment does not erase an unresolved one's misses."""
 
     from solera_server import engine as engine_module
 
@@ -289,7 +312,6 @@ async def test_entries_of_one_event_are_acknowledged_one_by_one(tmp_path):
     state = await State.open(tmp_path.as_uri(), "test", flush_interval=0.001)
     engine = engine_for(state, project)
     await engine.initialize()
-    engine._due_after = no_cleanups_after_commit  # the next attempts' path alone
     await run(engine, ["scores"])
     m = state.model
     prefix = m.indexes[("scores", "")].prefix
@@ -300,15 +322,22 @@ async def test_entries_of_one_event_are_acknowledged_one_by_one(tmp_path):
     m._collect("scores", "", {"kind": "version", "generation": 2})
     entries = m.cleanups[("scores", "")]
     assert len({d["n"] for d in entries}) == 1 and len({d["id"] for d in entries}) == 3
+    submit = engine._submit_cleanups
+    engine._submit_cleanups = lambda partitions=None: None  # this test submits each task itself
     engine_module.CLEANUPS, limit = 1, engine_module.CLEANUPS
     try:
-        await run(engine, ["scores"])  # delivers the first alone
+        submit()
+        [first] = [
+            r for r in engine.m.runs.values() if r["kind"] == "cleanup" and r["status"] not in TERMINAL_RUN
+        ]
+        await engine.run_until(first["id"], 20)  # the first alone
+        assert [d["kind"] for d in m.cleanups[("scores", "")]] == ["delta", "version"]
     finally:
-        engine_module.CLEANUPS = limit
-    assert [d["kind"] for d in m.cleanups[("scores", "")]] == ["delta", "version"]
-    await run(engine, ["scores"])  # the unresolved delta and its resolved sibling
+        engine_module.CLEANUPS, engine._submit_cleanups = limit, submit
+    submit()
+    await cleaned(engine)  # the unresolved delta, a miss a task, and its resolved sibling
     [left] = m.cleanups[("scores", "")]
-    assert left["kind"] == "delta" and left["misses"] == 1
+    assert left["kind"] == "delta" and left["misses"] == 3 and left["stuck"]
     await engine.stop()
     await state.close()
 
@@ -323,39 +352,29 @@ def scores_project():
     return Project(assets=[scores])
 
 
-async def test_without_the_channel_the_next_attempt_cleans_up(tmp_path, data, monkeypatch):
-    """D8's fallbacks: the engine unreachable when the worker says it
-    finished, or the worker gone before it acknowledges, leave the entries
-    queued; the partition's next attempt cleanups them (a second delete of the
-    same names is no harm)."""
+async def test_a_cleanup_task_that_keeps_failing_is_stuck_and_shown(tmp_path, data, monkeypatch):
+    """A cleanup task whose store refuses retries within its budget; then its
+    entries are stuck — kept, shown, and handed to no further task — until
+    an operator clears them."""
 
-    from solera_worker.channel import AttemptChannel
+    from solera_server import engine as engine_module
 
+    async def refused(self, *args, **kw):
+        raise OSError("the bucket refuses deletes")
+
+    monkeypatch.setattr(engine_module, "CLEANUP_TRIES", 2)
+    monkeypatch.setattr(engine_module, "CLEANUP_RETRY_DELAY", 0.0)
     project = scores_project()
     state = await State.open(tmp_path.as_uri(), "test", flush_interval=0.001)
     engine = engine_for(state, project)
     await engine.initialize()
     await run(engine, ["scores"])
-    finished = AttemptChannel.finished
-
-    async def unreachable(self, body):
-        await finished(self, body)
-        raise OSError("connection reset")  # its answer is lost
-
-    monkeypatch.setattr(AttemptChannel, "finished", unreachable)
-    await run(engine, ["scores"])  # supersedes `a`, cannot clean up
-    assert objects(data, "scores") != await named(state, "scores") and state.model.cleanups
-    monkeypatch.setattr(AttemptChannel, "finished", finished)
-
-    async def gone(self, body):
-        raise OSError("the worker died before it acknowledged")
-
-    monkeypatch.setattr(AttemptChannel, "cleaned_up", gone)
-    await run(engine, ["scores"])  # supersedes `a` again: cleanups it, cannot acknowledge
-    assert objects(data, "scores") == await named(state, "scores") and state.model.cleanups
-    monkeypatch.undo()
-    await run(engine, ["scores"])  # deletes them again, harmlessly, and acknowledges
-    assert ("scores", "") not in state.model.cleanups
+    monkeypatch.setattr(FileStore, "cleanup", refused)
+    await run(engine, ["scores"])  # supersedes `a`: its cleanup task fails, twice
+    [entry] = state.model.cleanups[("scores", "")]
+    assert entry["stuck"] and objects(data, "scores") != await named(state, "scores")
+    await engine.tick()
+    assert await cleaned(engine) == []  # no more tasks: it waits for an operator
     await engine.stop()
     await state.close()
 
@@ -380,9 +399,9 @@ async def test_a_reader_pin_at_commit_keeps_the_garbage_queued(tmp_path, data):
 
 
 async def test_a_run_is_settled_before_its_worker_has_cleaned_up(tmp_path, data, monkeypatch):
-    """Review round 3, S2: the worker cleanups after its commit, so a run
-    reads settled while its cleanups are still under way; tests wait for
-    the worker, never for a while."""
+    """Review round 3, S2: a run reads settled while the cleanup task its
+    commit made due is still under way; tests wait for that task, never for
+    a while."""
 
     cleanup, go = FileStore.cleanup, asyncio.Event()
 
@@ -507,13 +526,14 @@ async def test_a_pool_job_with_no_inputs_pins_only_its_output(tmp_path):
 async def test_a_delta_a_launching_attempt_was_handed_outlives_its_acknowledgement(
     tmp_path, data, monkeypatch
 ):
-    """F36. The engine hands the partition's next attempt a pending delta
-    entry in its spec; before `AttemptLaunched` lands (the spec and the
-    control file are being written), another attempt acknowledges the entry.
-    The attempt's claim names the entry's files only from `AttemptLaunched`
-    on, so for that while nothing holds the delta file: collection deletes
-    it, and the worker then reads a file that is gone (simulation, seed 11:
-    a `checks` delta file deleted 6 s before its reader came)."""
+    """F36. The engine hands a cleanup task a pending delta entry in its spec;
+    before `AttemptLaunched` lands (the spec and the control file are being
+    written), the entry goes (an operator clears it). Were the attempt's
+    claim to name the entry's files only from `AttemptLaunched` on, nothing
+    would hold the delta file meanwhile: collection would delete it, and the
+    worker read a file that is gone (simulation, seed 11, when the next
+    attempt cleaned up: a `checks` delta file deleted 6 s before its reader
+    came)."""
 
     @asset(outputs=Output("scores", keyed=True))
     def scores():
@@ -544,15 +564,15 @@ async def test_a_delta_a_launching_attempt_was_handed_outlives_its_acknowledgeme
         return await create(name, body, *args, **kw)
 
     monkeypatch.setattr(state, "create_object", held)
-    running = asyncio.create_task(engine.run_until((await engine.submit(["scores"]))["id"], 20))
+    engine._submit_cleanups()
+    running = asyncio.create_task(cleaned(engine))
     await asyncio.wait_for(at_control.wait(), 20)
-    assert specs[-1]["outputs"]["scores"]["cleanup"][0]["files"] == ["held"]  # handed the entry
-    del m.cleanups[("scores", "")]  # another attempt acknowledged the entry meanwhile
+    assert specs[-1]["cleanup"]["outputs"]["scores"]["cleanup"][0]["files"] == ["held"]  # handed the entry
+    del m.cleanups[("scores", "")]  # an operator cleared the entry meanwhile
     await engine.upkeep.collect()
     survived = await state.get_object(path) is not None
     go.set()
     await running
-    await worker_finished()
     await engine.stop()
     await state.close()
-    assert survived, "collection deleted the delta file a launching attempt's spec hands it"
+    assert survived, "collection deleted the delta file a launching cleanup task's spec hands it"
