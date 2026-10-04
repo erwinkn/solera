@@ -1,11 +1,13 @@
 # The observed set: incremental reads from one observation record (draft)
 
 Status: **draft**, revised after review A27 ("build with listed
-changes"). Docs only; nothing is built. Names (D133): the **observed
-set** is what a consumer partition has processed, key → upstream version;
-its stored form is the **observation record** — a **base**, explicit
-**points** and compressed **ranges**, with disjoint overwrites and prefix
-membership queries — which decodes to it. The two earlier encodings it
+changes") and W36's model of it (`ObservedSet.tla`: three
+counterexamples, each fix checked in the model). Docs only; nothing is
+built. Names (D133): the **observed set** is what a consumer partition
+has processed, key → upstream version; its stored form is the
+**observation record** — a **base**, explicit **points** and compressed
+**ranges**, with disjoint overwrites and prefix membership queries —
+which decodes to it. The two earlier encodings it
 replaces are on this branch's history (`fb56cbe`, `bdf8962`).
 
 ## The principle
@@ -43,10 +45,11 @@ The observation record `R` is three layers, the first that holds `k`
 deciding:
 
 1. **Points**: `k → observation`, explicit — presence, version, payload,
-   the patterns it was read under, context, life. Written where a batch's
-   observation of `k` is not what a range or the base would decode: a
-   `keys=` run's keys, and a current-only store serving a row other than
-   the batch's version named, or none. A point pins nothing (A27 R11).
+   the patterns it was read under, context, life, and the head it was
+   read at (`observed_at`). Written where a batch's observation of `k` is
+   not what a range or the base would decode: a `keys=` run's keys, and a
+   current-only store serving a row other than the batch's version named,
+   or none. A point pins nothing (A27 R11).
 2. **Ranges**: disjoint key ranges `[lo, hi] → (T, patterns, context,
    life)`: every key in it as upstream had it at endpoint `T`, if those
    patterns take it, else absent. A pass's committed prefix. Compressed:
@@ -63,9 +66,22 @@ a small table that layers refer to by id.
 **Overwrite.** A batch's commit overwrites exactly the keys it committed:
 a range write `[a, c] @ T` splits every range it overlaps — their parts
 outside `[a, c]` stay, so a replanned pass never discards an old tail —
-and drops the points inside, which it supersedes; then the batch's own
-points go on top. One `AttemptFinished` carries the batch's outputs and
-its overwrite, atomically (A27 R8).
+and drops the points inside observed at or before `T`, which it
+supersedes; then the batch's own points go on top. A point observed
+after `T` stays over the range: the pass leaves its key alone — it is
+neither delivered nor reclassified — so a pass at an older `T` never sends
+a key back to a version older than one a `keys=` run already delivered.
+One `AttemptFinished` carries the batch's outputs and its overwrite,
+atomically (A27 R8).
+
+**The commit check.** A batch commits only if, at its commit, its
+input's life is still current, no start-over is owed (an upstream reset's
+rebuild, or a definition change that reset `R`), and — for a pass's
+batch — the pass it was planned under is still the partition's active
+scan plan. Otherwise it is refused and writes nothing: its keys stay
+owed. A `keys=` batch that starts no pass has no plan to check: its
+points are exact at the head they were read at. The engine's commit has
+the life check today; the observed set adds the other two.
 
 **Outcomes.** A failed or abandoned attempt writes nothing: its keys stay
 owed. A per-key batch's failed keys are processed — seen at the version
@@ -113,6 +129,15 @@ case where nearly every key changed.
 The index stays reader-agnostic: retention asks for every base older
 than its cut to be given a before-image first, and keeps no per-reader
 snapshot. The reader owns its before-image through its observation record.
+
+**A cut past an active pass's `T`.** The pass's committed ranges get
+before-images like any range; its scan plan cannot, since its next
+batches need the key view at `T` itself. So the cut **replans** the pass
+at the head: a new scan plan, `T` the head, the cursor at the start (the
+overwrite keeps the old ranges' tails, as in any replan). A batch in
+flight on the old plan is refused at its commit by the commit check, and
+its keys stay owed. A pass therefore never holds retention: one paused
+for weeks is replanned, not kept.
 
 ## Observations: what was served (A27 R2)
 
@@ -213,11 +238,13 @@ points, `M` values, and no retained endpoint.
 ## The active pass and its pin (A27 R6)
 
 A pass under way has a **scan plan** apart from its committed prefix: its
-`T`, its cursor, and a durable reader pin on the row objects it reads (a
-range kept only for decoding needs `T`'s metadata, not its rows). The pin
-is taken when the pass starts — a `keys=` run that starts one included,
-before its first prefix commits — and held through claim ends,
-takeovers and renames until the pass ends or is reset.
+identity, its `T`, its cursor, and a durable reader pin on the row objects
+it reads (a range kept only for decoding needs `T`'s metadata, not its
+rows). The pin is taken when the pass starts — a `keys=` run that starts
+one included, before its first prefix commits — and held through claim
+ends, takeovers and renames until the pass ends, is reset, or is
+replanned by a retention cut past its `T` (above). The pin protects the
+rows the plan reads; it never holds the index's retention.
 
 ## Worked examples
 
@@ -263,6 +290,19 @@ at `T`, held by its pin. Done: the range spans everything and rebases to
 **A replan.** A pass committed `[−∞, k2] @ T1`, then is replanned at `T2`
 and commits `[−∞, k1] @ T2`: the overwrite splits the old range, keeping
 `(k1, k2] @ T1`. The tail is never lost.
+
+**A cut during a pass.** A pass at `T = 1` has committed `k1`: a range
+`[−∞, k1] @ 1`. `k2` changes at commit 2, and retention cuts at 2. The
+range gets its before-image (empty: nothing in it changed), and the pass
+is replanned at the head, 2. A batch for `k2` planned at 1 and still in
+flight is refused at its commit; the replanned pass delivers `k2` at 2.
+Kept at 1, its next batch would have needed the key view at 1, gone.
+
+**A selection ahead of a pass.** A pass is at `T = 1`; `k1` is updated to
+`@2`, and `keys=(k1)` delivers `@2`: a point `k1@2`, observed at 2. The
+pass then reaches `k1`. The point was observed after its `T`, so the pass
+leaves `k1` alone, and its range write keeps the point. Without the
+`observed_at` test it would deliver `k1@1`, sending the consumer back.
 
 **A shared input moves (A27 R1).** Base under `factor=w1`; `factor`
 becomes `w2`. Every key the base decodes present is owed an update.
@@ -321,6 +361,9 @@ record of what the count holds: `added` is never a key it holds,
 | A26 N1: the pass's rows | the scan plan holds its pin from its start |
 | A26 N5: the cap | there is none: overrides spill |
 | A27 R3, R4, R8, R9 | normalised patterns; candidates classed once; disjoint overwrite and decode-equal fold; per-range changes |
+| `ObservedSet.tla` 1 (P1, W36): a retention cut past an active pass's `T` (a pass at `T = 1` commits `k1`; `k2` changes at 2; the cut at 2 gives the base and ranges their before-images, and the pass's next batch, `k2`, needs the key view at 1, gone) | the cut replans the pass at the head; a batch in flight on the old plan is refused by the commit check, its keys owed; no pass holds retention |
+| `ObservedSet.tla` 2 (P2, W36): a pass sends a key back (the pass is at `T = 1`; `k1` is updated to `@2`; `keys=(k1)` delivers `@2`; the pass reaches `k1` and would deliver `@1`) | points record `observed_at`; a pass leaves alone a key whose point was observed after its `T`, and its range write keeps that point |
+| `ObservedSet.tla` 3 (P1, W36): a batch committing across a change it was not planned under (its pass replanned or ended, an upstream reset, a definition change) | the commit check: the active scan plan, the current life, no start-over owed |
 
 A19 R6 (`keys=` bounded by `batch_size` and `concurrency`) and R8 (a
 forced retry) are kept as they are, outside the observation record.
@@ -356,7 +399,8 @@ pattern changes (first include, prefixless globs) and definition and
 shared-input changes, replans, takeovers, renames — and after **every
 commit** checks that `R` decodes to the dict, and that staleness and a
 default run's load equal the dict's comparison with the upstream. The
-A19, A26 and A27 histories are named examples, and so is F41 (W38's
+A19, A26 and A27 histories are named examples, and so are
+`ObservedSet.tla`'s three counterexamples and F41 (W38's
 replay in `tests/sim/test_replays.py`, a strict xfail in the old model). Before relying on the
 bounds: measure a large spill and a pattern change at 100M.
 
@@ -381,10 +425,10 @@ Layer     = {endpoint, patterns (normalised), context: id, life}
 Base      = Layer                                   # endpoint P: a commit
           | Layer + {before_image}                  # endpoint C; the keys changed in (P, C], as at P
 Range     = Layer + {lo, hi}                        # endpoint T; disjoint, sorted
-Point     = {key, present, version, payload, patterns, context: id, life}
-ScanPlan  = {T, cursor, patterns, context: id, pin}  # the active pass only
+Point     = {key, present, version, payload, patterns, context: id, life, observed_at}
+ScanPlan  = {id, T, cursor, patterns, context: id, pin}  # the active pass only
 ObservationRecord = {base, ranges[], points{}, contexts[], spill: index state | None,
-                     rebuild: life | None}
+                     scan_plan: ScanPlan | None, rebuild: life | None}
 ```
 
 **Decode** — the observed set, from an observation record (the old
@@ -423,7 +467,16 @@ owed(R, now) = {k: c for k in candidates(R, now) if (c := classify(R, k, now)) !
 # point keys, membership and context scans
 ```
 
-A batch then loads its keys, turns each served row into an observation,
-re-runs `classify` with the observation as `new`, calls the producer with
-those classes, and commits its overwrite — ranges and points — with its
-outputs.
+A batch then loads its keys — less any whose point was observed after
+its plan's `T` — turns each served row into an observation, re-runs
+`classify` with the observation as `new`, calls the producer with those
+classes, and commits its overwrite — ranges and points — with its
+outputs, if the commit check passes:
+
+```text
+may_commit(batch, R, now):
+    if batch.life != now.life:                        return False   # the input's life is current
+    if R.rebuild or now.start_over_owed:              return False   # no start-over owed
+    if batch.plan is None:                            return True    # a selection's points
+    return R.scan_plan is not None and R.scan_plan.id == batch.plan  # still the active pass
+```
