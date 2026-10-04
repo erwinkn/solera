@@ -391,7 +391,9 @@ class Incremental(In):
     `each=True` makes it per-key incremental (docs/per-key-processing.md
     §5): the asset is written for one key, the parameter receives one key's
     value, `ctx.key` names it, and every output is keyed by it. `batch_size`
-    keys make one attempt and one commit; `concurrency` of them run at once.
+    keys (16 by default) make one attempt and one commit, and all of them
+    run at once: the one knob. The asset's `concurrency=` caps its
+    partitions, so `concurrency=4` with `batch_size=16` runs up to 64 keys.
     A key whose call raises is recorded in the asset's failure index and
     retried by its class (§8, §9); it never blocks the others."""
 
@@ -400,26 +402,20 @@ class Incremental(In):
     def __init__(
         self,
         output: str | None = None,
-        batch_size: int = 100,
+        batch_size: int | None = None,
         meta: dict | None = None,
         *,
         include=None,
         exclude=None,
         each: bool = False,
-        concurrency: int | None = None,
     ):
         from . import patterns
 
         super().__init__(output, meta=meta)
-        if batch_size < 1:
+        if batch_size is not None and batch_size < 1:
             raise RegistrationError("Incremental batch_size must be positive")
-        if concurrency is not None and not each:
-            raise RegistrationError("concurrency= is for a per-key incremental input (each=True)")
-        if each and concurrency is not None and concurrency < 1:
-            raise RegistrationError("Incremental concurrency must be positive")
-        self.batch_size = batch_size
+        self.batch_size = batch_size if batch_size is not None else 16 if each else 100
         self.each = bool(each)
-        self.concurrency = (16 if concurrency is None else concurrency) if each else None
         try:
             self.patterns = patterns.spec(include, exclude)
         except (ValueError, TypeError) as error:
@@ -430,7 +426,7 @@ class Incremental(In):
         if self.patterns is not None:
             spec["patterns"] = self.patterns
         if self.each:
-            spec["each"] = {"concurrency": self.concurrency}
+            spec["each"] = True
         return spec
 
 
@@ -451,8 +447,13 @@ class Batch:
     they sit in their pass:
 
     - `rows`: the delivered rows (the object the parameter received);
-      `upserted` and `removed`: the keys delivered and removed (keyed
-      upstreams);
+    - `added`, `updated` and `removed` (keyed upstreams): each key's change
+      since the input's position, net over the batch's commits. `added`:
+      absent at the position, present now; `updated`: present at both, at
+      another version; `removed`: present at the position, absent now. A
+      key added and removed again appears nowhere; one removed and added
+      back is updated. The rows are those of `added` and `updated`. A full
+      pass delivers every key as added;
     - `full`: the batch is part of a full pass — the whole head after a
       reset, not a delta;
     - `index`: this batch's 0-based index in its pass, exact;
@@ -471,11 +472,16 @@ class Batch:
     - `upstream`: facts about the upstream (`Upstream`).
 
     A consumer that rebuilds starts over when `full and first`, appends every
-    batch, and swaps or finalizes on `final`."""
+    batch, and swaps or finalizes on `final`. One that keeps a total moves it
+    by the changes, starting from what it holds (`ctx.load()`):
+
+        before = 0 if batch.full and batch.first else ctx.load()["count"]
+        return {"count": before + len(batch.added) - len(batch.removed)}"""
 
     rows: Any = ()
+    added: tuple = ()
+    updated: tuple = ()
     removed: tuple = ()
-    upserted: tuple = ()
     full: bool = False
     index: int = 0
     count: int = 1

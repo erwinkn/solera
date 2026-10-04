@@ -262,7 +262,10 @@ async def test_abort_fails_the_attempt_and_commits_nothing(state):
     assert ("samples", "") not in engine.m.heads and "failures" not in engine.m.partition("parse", "")
 
 
-async def test_concurrency_and_batches(state):
+async def test_a_batchs_keys_run_at_once(state):
+    """D80: `batch_size` is the one knob. Seven keys in batches of three
+    make three attempts, and the keys of a batch all run at once."""
+
     live = {"now": 0, "max": 0}
     batches = []
 
@@ -274,11 +277,11 @@ async def test_concurrency_and_batches(state):
         batches.append(ctx.attempt if hasattr(ctx, "attempt") else ctx.run_id)
         return [{"value": file["n"]}]
 
-    project = files_project({f"k{i}": {"n": i} for i in range(7)}, parse, batch_size=3, concurrency=2)
+    project = files_project({f"k{i}": {"n": i} for i in range(7)}, parse, batch_size=3)
     engine = make_engine(state, project)
     await engine.initialize()
     detail = await drive(engine, await engine.submit(["parse"], upstream=True))
-    assert status_of(detail) == "succeeded" and live["max"] == 2
+    assert status_of(detail) == "succeeded" and live["max"] == 3
     task = next(t for t in detail["tasks"] if t["asset"] == "parse")
     assert len(detail["attempts"][task["id"]]) == 3  # 3 + 3 + 1 keys
     assert len(await rows_of(engine, project, "samples")) == 7
@@ -335,8 +338,6 @@ def test_registration():
                 asset(parse, inputs={"file": Incremental("log", each=True)}, outputs=Output("x", key="k")),
             ]
         )
-    with pytest.raises(RegistrationError, match="concurrency"):
-        Incremental("files", concurrency=0, each=True)
 
 
 async def test_a_user_cancel_commits_finished_keys_and_leaves_the_rest_dormant(tmp_path):
@@ -365,7 +366,7 @@ async def test_a_user_cancel_commits_finished_keys_and_leaves_the_rest_dormant(t
 
     parse = asset(
         parse,
-        inputs={"file": Incremental("files", concurrency=3, each=True)},
+        inputs={"file": Incremental("files", each=True)},
         outputs=Output("rows", key="path"),
     )
     project = Project(assets=[files, parse])

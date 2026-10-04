@@ -236,6 +236,7 @@ class Ctx:
         }
         self._stores = project.stores
         self._outputs = [o.name or asset.name for o in asset.outputs]
+        self._pinned = spec.get("outputs") or {}
         self._metadata: dict[str, dict] = {}
         # A per-key call's key, and the generation of its upstream entry: the
         # version it runs at (docs/per-key-processing.md §5, docs/versions.md).
@@ -277,12 +278,23 @@ class Ctx:
         json.dumps(entry, allow_nan=False)
         self._shipper.append(entry)
 
-    async def load(self, ref: Ref, t):
-        """Read a ref the producer holds — one an input gave as a ref. Not an
-        input read of the attempt's: lineage does not record it."""
+    async def load(self, ref: Ref | str | None = None, t=None):
+        """Read what the producer holds, whole. `ctx.load()`, or
+        `ctx.load("name")` for one of several outputs: the asset's own
+        output as committed at the attempt's pin (None before its first
+        commit) — what a total kept from `ctx.batch` changes builds on. A
+        full pass's first batch starts over: it must not build on it.
+        `ctx.load(ref, t)`: a ref an input gave. Not an input read of the
+        attempt's: lineage does not record it."""
 
+        index = None
+        if not isinstance(ref, Ref):
+            info = self._pinned.get(self._output("load", ref)) or {}
+            if info.get("before") is None:
+                return None
+            ref, index = Ref.from_json(info["before"]), info.get("index")
         store = self._stores[ref.store]
-        index = self._indexes.get((ref.output, ref.partition))
+        index = index or self._indexes.get((ref.output, ref.partition))
         value = await _load_whole(_unobserved, store, ref, t, self._keys_io, index)
         self._timeline.add("loaded", ref.output, _rows(value), optional=True)
         return value
@@ -293,17 +305,23 @@ class Ctx:
 
         self._timeline.add("mark", name, optional=True)
 
+    def _output(self, call: str, output: str | None) -> str:
+        """The output a call names, by default the asset's only one."""
+
+        if output is None:
+            if len(self._outputs) != 1:
+                raise ValueError(f"ctx.{call}: name the output (this asset has several, or none)")
+            output = self._outputs[0]
+        if output not in self._outputs:
+            raise ValueError(f"ctx.{call}: {output!r} is not an output of this asset")
+        return output
+
     def metadata(self, output: str | None = None, /, **values):
         """Record facts about the version this attempt writes — row counts,
         a checksum, a model's score — in the run history (§7), to chart
         across versions. `output` defaults to the asset's only output."""
 
-        if output is None:
-            if len(self._outputs) != 1:
-                raise ValueError("ctx.metadata: name the output (this asset has several, or none)")
-            output = self._outputs[0]
-        if output not in self._outputs:
-            raise ValueError(f"ctx.metadata: {output!r} is not an output of this asset")
+        output = self._output("metadata", output)
         json.dumps(values, allow_nan=False)
         self._metadata.setdefault(output, {}).update(values)
 
@@ -389,13 +407,15 @@ async def _resolve_inputs(spec, project, asset, keys_io, timeline, observed: Obs
             args[param] = await observed.load(store, ref, t, Keys(upserted))
             key = _key_column(project, ref.output)
             for gone in await each.gone_since(ref.output, key, args[param], upserted, pin, keys_io):
-                del upserted[gone]  # removed since the pass's commit: delivered as removed (F38)
-                deleted.append(gone)
+                del upserted[gone]  # removed since the pass's commit: delivered as removed (F38),
+                if gone in read.updated:  # unless the consumer never held it: then not at all
+                    deleted.append(gone)
             batch[param] = Batch(
                 rows=args[param],
-                removed=deleted,
+                added=tuple(sorted(k for k in upserted if k not in read.updated)),
+                updated=tuple(sorted(k for k in upserted if k in read.updated)),
+                removed=tuple(deleted),
                 full=full,
-                upserted=tuple(sorted(upserted)),
                 index=int(ch.get("index") or 0),
                 count=int(ch.get("count") or 1),
                 final=after is None,  # the pass ran out: never inferred from `count`

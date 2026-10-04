@@ -362,7 +362,6 @@ class Views:
                     "upstream_asset": self.manifest["outputs"][output].get("asset"),
                     "source": output in self.manifest["sources"],
                     "batch_size": input.get("batch_size"),
-                    "concurrency": (input.get("each") or {}).get("concurrency"),
                     "patterns": input.get("patterns"),
                     "partitions": partitions,
                 }

@@ -474,7 +474,8 @@ async def test_keyed_source_commits_go_through_the_index(state):
 
     @asset(inputs={"uploads": Incremental()})
     def ingest(ctx, uploads: list):
-        got.append((sorted(ctx.batch["uploads"].upserted), sorted(ctx.batch["uploads"].removed)))
+        b = ctx.batch["uploads"]
+        got.append((list(b.added), list(b.updated), list(b.removed)))
         return []
 
     class External(FileStore):
@@ -493,7 +494,7 @@ async def test_keyed_source_commits_go_through_the_index(state):
     assert (await engine.commit_source("uploads", keys={"b": "2", "c": "1"}))["changed"]
     assert not (await engine.commit_source("uploads", upsert={"c": "1"}))["changed"]
     await run(engine, ["ingest"])
-    assert got == [(["a", "b"], []), (["b", "c"], ["a"])]
+    assert got == [(["a", "b"], [], []), (["c"], ["b"], ["a"])]  # K44: each key's change
     head = state.model.heads[("uploads", "")]
     assert head["commit_number"] == 1 and head["count"] == 2
 

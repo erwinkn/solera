@@ -69,7 +69,6 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
-NET = False  # the engine counts the net delta (K44's range scan, on hold): until then the machine models it as built
 LANDED = False  # every piece of K43–K46 built: True also shrinks their failures
 
 
@@ -204,14 +203,8 @@ class Reference:
         self,
         takes: Callable[[str], bool] = everything,
         cap: int = 10_000,
-        net: bool = True,
     ):
         self.cap = cap  # keys= runs a plain incremental partition takes between default runs
-        # What "changed" means: the net delta (the design), or, with net=False, any change
-        # since a read, a key brought back included (the build until K44's range scan).
-        self.net = net
-        self.feed_moved: set[str] = set()  # feed keys changed since `items` last ran, back or not
-        self.feed_changed: dict[str, int] = {}  # feed key -> the counter of its last change
         self.now = 0
         self.feed: dict[str, str] = {}  # key -> its version
         self.feed_read: dict[str, str] = {}  # `feed` as `items` last read it
@@ -238,13 +231,7 @@ class Reference:
         t = self._tick()
         versions = upserts if isinstance(upserts, dict) else dict.fromkeys(upserts, f"v{t}")
         for k in removes - set(versions):
-            if k in self.feed:
-                self.feed_moved.add(k)
-                self.feed_changed[k] = t
             self.feed.pop(k, None)
-        moved = {k for k, v in versions.items() if self.feed.get(k) != v}
-        self.feed_moved |= moved
-        self.feed_changed.update(dict.fromkeys(moved, t))
         self.feed.update(versions)
 
     def _write(self, k: str, generation: int | None, t: int) -> None:
@@ -260,11 +247,11 @@ class Reference:
         """`items` reads the net delta of `feed` since it last read it."""
 
         t = self._tick()
-        for k in sorted(set(self.feed) | set(self.feed_read) | self.feed_moved):
-            if self.feed.get(k) != self.feed_read.get(k) or (not self.net and k in self.feed_moved):
+        for k in sorted(set(self.feed) | set(self.feed_read)):
+            if self.feed.get(k) != self.feed_read.get(k):
                 if k in self.feed or k in self.up:
                     self._write(k, t if k in self.feed else None, t)
-        self.feed_read, self.feed_moved = dict(self.feed), set()
+        self.feed_read = dict(self.feed)
 
     def _at(self, k: str, when: int | None) -> int | None:
         """`items`' key `k` as of counter `when`: its generation, or None."""
@@ -289,7 +276,7 @@ class Reference:
         t = self._tick()
         for k in sorted(set(self.up) | set(self.feed)):
             self._write(k, t if k in self.feed else None, t)
-        self.feed_read, self.feed_moved = dict(self.feed), set()
+        self.feed_read = dict(self.feed)
         for o in self.others.values():
             self._owe_a_pass(o)
             o.input_reset = True
@@ -423,12 +410,12 @@ class Reference:
             k
             for k, t in self.changed.items()
             if o.takes(k)
-            and (self._at(k, o.snapshot) != self.up.get(k) if self.net else t > o.snapshot)
+            and self._at(k, o.snapshot) != self.up.get(k)
             and not any(k in named and at >= t for at, named in o.entries)
         }
 
     def items_stale(self) -> bool:
-        return self.feed != self.feed_read or (not self.net and bool(self.feed_moved))
+        return self.feed != self.feed_read
 
     def run_fchecks(self, keys: set[str] | None = None) -> None:
         """A run of `fchecks`, each=True over `feed`: every key (default), or
@@ -446,11 +433,7 @@ class Reference:
     def fchecks_stale_keys(self) -> set[str]:
         f = self.fchecks
         return {
-            k
-            for k in set(self.feed) | set(f.held)
-            if k not in f.held
-            or f.held[k][0] != self.feed.get(k)
-            or (not self.net and self.feed_changed.get(k, -1) > f.held[k][1])
+            k for k in set(self.feed) | set(f.held) if k not in f.held or f.held[k][0] != self.feed.get(k)
         }
 
     def direct_stale_keys(self) -> dict[str, set[str]]:

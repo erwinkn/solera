@@ -106,8 +106,11 @@ function EdgeCard({ input, partition }: { input: Input; partition?: string }) {
         description={kind.means}
         actions={
           <div className="flex flex-wrap items-center gap-2 text-xs text-fg-muted">
-            {input.batch_size != null && <span>{input.batch_size} keys a batch</span>}
-            {input.concurrency != null && <span>· {input.concurrency} at a time</span>}
+            {input.batch_size != null && (
+              <span>
+                {input.batch_size} keys a batch{input.kind === "each" && ", all at once"}
+              </span>
+            )}
             {input.partitions.length > 0 && <span>· {behind ? `${behind} behind` : "all caught up"}</span>}
           </div>
         }

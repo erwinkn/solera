@@ -44,9 +44,11 @@ names as of one upstream commit and moves neither `next` nor the
 partition's progress.
 
 **The read-ahead** (docs/positions-from-reads.md, K45, K47). A selection
-adds `[commit, run, attempt]` to `ahead`: it read every key the attempt's
-spec names as of upstream commit `commit`. The next pass skips a changed
-key some entry read at or after its last change, and the entries a new
+adds `[commit, run, attempt]` to `ahead`: it delivered, as of upstream
+commit `commit`, the keys the attempt's sealed result lists, live or
+removed. The next pass skips a changed key some entry read at or after
+its last change, classes one changed since by what was delivered (K44),
+and the entries a new
 `next` passes collapse into the snapshot. A per-key input keeps the same
 record: no per-key one.
 """

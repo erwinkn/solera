@@ -203,7 +203,7 @@ def build(variant: Variant, data_root, db: Database, outside: External, pg: str 
         return Result(outputs={"tally": {"rows": total}}, cursor=total)
 
     @asset(
-        inputs={"item": Incremental("items", batch_size=2, concurrency=2, each=True)},
+        inputs={"item": Incremental("items", batch_size=2, each=True)},
         outputs=Output("checks", key="id"),
         automations=OnChange(),
         retries=Retry(3, delay=1.0),

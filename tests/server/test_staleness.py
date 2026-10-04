@@ -32,8 +32,6 @@ def pending(why: str):
 
 
 per_key = pending("each=True staleness from the one record, position + read-ahead (K47): W22's next step")
-net_delta = pending("the net delta: over-reports until K44's range scan (W22)")
-k44 = pending("K44: added/updated/removed and ctx.load(): not built")
 
 
 def taken(key: str) -> bool:
@@ -85,12 +83,12 @@ def project(
         return {"rows": len(items)}
 
     @asset(inputs={"items": Incremental()}, outputs=Output("tally"))
-    def tally(ctx, items: list):
+    async def tally(ctx, items: list):
         """K44's example: the count of `items`, kept from what each batch
         added and removed (a full pass's first batch starts over)."""
 
         changes = ctx.batch["items"]
-        before = 0 if changes.full and changes.first else (ctx.load() or {"rows": 0})["rows"]
+        before = 0 if changes.full and changes.first else (await ctx.load() or {"rows": 0})["rows"]
         return {"rows": before + len(changes.added) - len(changes.removed)}
 
     @asset(inputs={"row": Incremental("feed", each=True)}, outputs=Output("fchecks", key="id"))
@@ -132,7 +130,7 @@ class Staleness(RuleBasedStateMachine):
     def __init__(self):
         super().__init__()
         self.loop = asyncio.new_event_loop()
-        self.ref = staleness.Reference(takes=taken, net=staleness.NET)
+        self.ref = staleness.Reference(takes=taken)
         self.outside = External()
         self.decl = {"items_store": "a", "checks_store": "a", "checks_v": "1", "copy_v": "1", "count_v": "1"}
         self.serial = 0
@@ -690,7 +688,6 @@ async def test_keys_runs_on_an_each_asset_count_toward_the_cap_too(state, tmp_pa
     await drive(engine, await engine.submit(["checks"], keys={"items": {"keys": ["k1"]}}))
 
 
-@k44
 async def test_a_count_kept_from_its_batches_stays_exact_through_a_keys_run(state, tmp_path):
     """K44's example through a keys= run (K45): `tally` = what it held +
     added - removed. k4 added and k1 removed; keys=(k4) delivers k4 as added;
@@ -807,7 +804,6 @@ async def test_a_key_neither_side_holds_leaves_an_each_partition_fresh(state, tm
     assert not await staleness.partition_stale(engine, "fchecks"), "stale, with no stale key"
 
 
-@net_delta
 async def test_a_key_added_and_removed_past_the_read_changes_nothing(state, tmp_path):
     """The net delta, through `items`: k4 is added and removed again past
     what `copy`, `count` and `checks` read. None of them is stale, and a
@@ -827,7 +823,6 @@ async def test_a_key_added_and_removed_past_the_read_changes_nothing(state, tmp_
     assert outside.delivered == set()
 
 
-@net_delta
 async def test_a_key_updated_and_reverted_changes_nothing(state, tmp_path):
     """The net delta, at a versioned source: `feed`'s k1 goes from version 1
     to 2 and back to 1 before anyone reads it. Neither `items` (plain
@@ -971,17 +966,6 @@ def test_the_reference_reads_the_worked_examples():
     assert both.reasons("count") == set()
     both.change_asset("count")  # due only to the asset change
     assert both.reasons("count") == {DEF}
-
-    built = staleness.Reference(takes=taken, net=False)  # the build until K44: a revert counts
-    built.change_knob()
-    built.commit({"k2": "1"}, set())
-    built.run_default("checks")
-    built.run_fchecks()
-    built.commit_feed({"k2": "2"}, set())
-    built.commit_feed({"k2": "1"}, set())  # W22's minimal case
-    assert built.stale("items") and built.fchecks_stale_keys() == {"k2"}
-    built.run_items()  # items writes k2 again, at a new generation
-    assert built.stale_keys() == {"k2"} and not built.stale("items")
 
     capped = staleness.Reference(takes=taken, cap=2)  # the cap counts keys= runs that leave something
     capped.change_knob()

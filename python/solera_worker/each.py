@@ -3,7 +3,7 @@
 
 A batch is either the changes of the input's pass (`changes`) or the
 failed keys's keys that are due again (`retry`). Each key is one call,
-`concurrency` at a time; its outcome is classified (`solera.errors`), the
+all of a batch's at once; its outcome is classified (`solera.errors`), the
 outputs of the keys that succeeded become one `Patch({key: value})` per
 output, and every key's outcome moves its failure record (`solera.failed_keys`)
 — all of it committed together.
@@ -31,6 +31,7 @@ from solera.tasks import Tasks
 WALK = 100  # failure records walked per retry batch, at most, for each key it may take
 INTERRUPTED = "interrupted"  # a key a drain stopped: canceled or timed out once the result is sealed
 LOOKAHEAD = 100_000  # index entries a batch examines at most, to fill itself and to prove it final
+CHANGE = ("added", "updated", "removed", None)  # `KeyIndex.changes` classes, by number; 3 is neither
 
 
 @dataclass
@@ -38,6 +39,8 @@ class Batch:
     """The keys one attempt reads from a keyed incremental input, filtered
     by its patterns. `deleted` are keys gone upstream and `unmatched` keys
     that stopped matching the patterns: the consumer's outputs drop both.
+    `updated`: the keys of `upserted` the consumer held at its position (K44);
+    the others are added.
     A per-key batch also has a `kind` (§9) — the input's `changes`, a
     `retry` of failed keys, or the `reconcile` after a full pass — and the
     failure records it read."""
@@ -51,6 +54,7 @@ class Batch:
     walked: dict[str, Record] = field(default_factory=dict)  # retry: every record walked
     priors: dict[str, Record] = field(default_factory=dict)  # the touched keys' failure records
     covers: bool = False  # a keys= selection past `next`: nothing it did not name is left (K45)
+    updated: set[str] = field(default_factory=set)
 
 
 class _Abort(Exception):
@@ -92,28 +96,52 @@ async def _fill(chunk, start: bytes | None, limit: int, kind) -> tuple[list, str
         cursor = nxt
 
 
+async def _changes(index: KeyIndex, first: int, last: int, after, n: int, ahead: dict):
+    """A page of `changes(first -> last)` past `after`, read-ahead applied:
+    `(key, generation, deleted, class)` entries, and the cursor."""
+
+    lower = {key_bytes(k): (int(g), bool(live)) for k, (g, live) in ahead.items()}
+    pages = index.changes(first, last, after=after, limit=n, lower=lower)
+    try:
+        page = await anext(pages)
+    finally:
+        await pages.aclose()
+    return list(zip(page.keys, page.generations, page.deleted, page.classes, strict=True)), page.cursor
+
+
 async def read_batch(pin: dict, keys_io) -> Batch:
     """An Incremental batch of a keyed upstream, as the spec pins it: the
-    keys= override, a full pass's batch, a delta pass's pending deltas — all
+    keys= override, a full pass's batch, a delta pass's changes — all
     filtered by the input's patterns (per-key §11), read ahead past keys they
     leave out until the batch holds `batch_size` keys or the pass runs
     out — or a pattern change's diff of the index as of its pattern change: the keys whose
-    membership changed. A pure function of the pin: it reads the index
-    through `KeyIndex.page`, `pending` and `lookup` only, so the engine can
-    run it on its own copies to serve the same batch."""
+    membership changed. Each key is classed against the consumer's position
+    (K44): a delta's net change, a full pass's keys all added. A pure
+    function of the pin: it reads the index through `KeyIndex.page`,
+    `changes` and `lookup` only, so the engine can run it on its own copies
+    to serve the same batch."""
 
     ch = pin["batch"]
     index = KeyIndex(keys_io, None, IndexState.from_json(pin["index"]))
     limit = int(ch.get("limit") or 1)
     start = key_bytes(ch["after"]) if ch.get("after") is not None else None
+    # What keys= runs read past `next` (K45): key -> the latest upstream generation one
+    # read it at, and whether it was delivered live. Not delivered again unless changed since.
+    ahead = pin.get("ahead") or {}
+    read_at = {k: int(g) for k, (g, _) in ahead.items()}
 
     async def whole(after, n):
         keys, generations, _, nxt = await index.page(after, n)
-        return list(zip(keys, generations, bytes(len(keys)), strict=True)), nxt
+        return [(k, g, 0, 0) for k, g in zip(keys, generations, strict=True)], nxt
 
     async def delta(after, n):
-        page = await index.changes_page(int(ch["from"]), int(ch["to"]), after, n)
-        return list(zip(page.keys, page.generations, page.deleted, strict=True)), page.cursor
+        return await _changes(index, int(ch["from"]), int(ch["to"]), after, n, ahead)
+
+    def batch_of(page, after, read) -> Batch:
+        upserted = {key_str(e[0]): e[1] for kind, e in page if kind in ("added", "updated")}
+        updated = {key_str(e[0]) for kind, e in page if kind == "updated"}
+        deleted = [key_str(e[0]) for kind, e in page if kind == "removed"]
+        return Batch(upserted, deleted, after, read, updated=updated)
 
     if "pattern_change" in ch:
         old, new = Matcher(ch["pattern_change"]["from"]), Matcher(ch["pattern_change"]["to"])
@@ -121,37 +149,33 @@ async def read_batch(pin: dict, keys_io) -> Batch:
         def changed(entry):
             key = key_str(entry[0])
             before, now = old(key), new(key)
-            return "upsert" if now and not before else "delete" if before and not now else None
+            return "added" if now and not before else "removed" if before and not now else None
 
         page, after, read = await _fill(whole, start, limit, changed)
-        upserted = {key_str(e[0]): e[1] for kind, e in page if kind == "upsert"}
-        unmatched = [key_str(e[0]) for kind, e in page if kind == "delete"]
+        upserted = {key_str(e[0]): e[1] for kind, e in page if kind == "added"}
+        unmatched = [key_str(e[0]) for kind, e in page if kind == "removed"]
         return Batch(upserted, [], after, read, unmatched=unmatched)
     taken = Matcher(pin.get("patterns"))
-    # What keys= runs read past `next` (K45): key -> the latest upstream generation
-    # one read it at. A key read at or after its last change is not delivered again.
-    ahead = pin.get("ahead") or {}
     if "keys" in ch and "from" in ch:
         # A keys= selection of a plain input past its snapshot: the named keys' changes
         # past `next` its read-ahead lacks, and whether any it did not name are left.
-        named, upserted, deleted, left, read = {str(k) for k in ch["keys"]}, {}, [], False, 0
+        named, page, left, read = {str(k) for k in ch["keys"]}, [], False, 0
         after = None
         while int(ch["from"]) <= int(ch["to"]):
-            page = await index.changes_page(int(ch["from"]), int(ch["to"]), after, 1000)
-            after = page.cursor
-            for k, generation, gone in zip(page.keys, page.generations, page.deleted, strict=True):
-                key, read = key_str(k), read + 1
-                if not taken(key) or ahead.get(key, -1) >= generation:
+            entries, after = await delta(after, 1000)
+            for entry in entries:
+                key, kind, read = key_str(entry[0]), CHANGE[entry[3]], read + 1
+                if not taken(key) or kind is None:
                     continue
                 if key not in named:
                     left = True
-                elif gone:
-                    deleted.append(key)
                 else:
-                    upserted[key] = generation
+                    page.append((kind, entry))
             if after is None:
                 break
-        return Batch(upserted, deleted, None, read, covers=not left)
+        batch = batch_of(page, None, read)
+        batch.covers = not left
+        return batch
     if "keys" in ch:  # a run's keys= override: each named key as the upstream holds it, or removed (R2)
         named = sorted({str(k) for k in ch["keys"]})
         found = await index.lookup([key_bytes(k) for k in named])
@@ -164,16 +188,22 @@ async def read_batch(pin: dict, keys_io) -> Batch:
             else [k for k in named if k not in upserted and taken(k)]
         )
         upserted = {k: g for k, g in upserted.items() if taken(k)}
+        updated = set()
         if ch.get("scan"):  # within a full pass: a key it delivered at this version is not delivered twice
             walked = ch.get("walked")
             upserted = {
                 k: g
                 for k, g in upserted.items()
-                if ahead.get(k, -1) < g and not (walked and k <= walked["at"] and g <= walked["generation"])
+                if read_at.get(k, -1) < g and not (walked and k <= walked["at"] and g <= walked["generation"])
             }
-        batch = Batch(upserted, gone, None, len(named))
+        elif upserted:  # merged while a pattern change is under way: held if the old patterns took it then
+            held = ch["held_at"]
+            had = Matcher(held["patterns"])
+            was = await index.lookup([key_bytes(k) for k in upserted if had(k)], at=held["next"])
+            updated = {key_str(k) for k in was}
+        batch = Batch(upserted, gone, None, len(named), updated=updated)
         if ch.get("scan"):  # a full pass's delivery: whether it leaves any key undelivered (K45)
-            batch.covers = await _covers(index, taken, set(named), ahead, ch.get("walked"))
+            batch.covers = await _covers(index, taken, set(named), read_at, ch.get("walked"))
             for held in ch.get("held") or ():  # and leaves nothing its reconcile would remove
                 if not batch.covers:
                     break
@@ -182,18 +212,19 @@ async def read_batch(pin: dict, keys_io) -> Batch:
         return batch
 
     def kind(entry):
+        """A full pass's key is added, unless read ahead within it at this
+        version; a delta's is its net change, `changes` applying the read-ahead."""
+
         key = key_str(entry[0])
-        if not taken(key) or ahead.get(key, -1) >= entry[1]:
+        if not taken(key) or (ch.get("full") and read_at.get(key, -1) >= entry[1]):
             return None
-        return "delete" if entry[2] else "upsert"
+        return CHANGE[entry[3]]
 
     page, after, read = await _fill(whole if ch.get("full") else delta, start, limit, kind)
-    upserted = {key_str(e[0]): e[1] for k, e in page if k == "upsert"}
-    deleted = [key_str(e[0]) for k, e in page if k == "delete"]
-    return Batch(upserted, deleted, after, read)
+    return batch_of(page, after, read)
 
 
-async def _covers(index, taken, named: set[str], ahead: dict, walked: dict | None) -> bool:
+async def _covers(index, taken, named: set[str], read_at: dict, walked: dict | None) -> bool:
     """Whether every key under the patterns has been delivered within a full
     pass at its current version: named now, read ahead at or after it, or
     walked by the pass's own batches (at or before `at`, at a generation
@@ -204,7 +235,7 @@ async def _covers(index, taken, named: set[str], ahead: dict, walked: dict | Non
         keys, generations, _, after = await index.page(after, 1000)
         for k, generation in zip(keys, generations, strict=True):
             key = key_str(k)
-            if not taken(key) or key in named or ahead.get(key, -1) >= generation:
+            if not taken(key) or key in named or read_at.get(key, -1) >= generation:
                 continue
             if walked is not None and key <= walked["at"] and generation <= walked["generation"]:
                 continue
@@ -316,24 +347,22 @@ async def read_each_batch(spec: dict, pin: dict, keys_io) -> Batch:
 
 async def _retry_covers(cover: dict, taken, upserted: dict, deleted: set, keys_io) -> bool:
     """Whether every key the patterns take changed past the snapshot has been
-    delivered: read ahead at or after its change, or read by this batch
-    (K47: a retry pass that leaves nothing uncovered collapses the record)."""
+    delivered: read ahead since its change, or read by this batch (K47: a
+    retry pass that leaves nothing uncovered collapses the record)."""
 
-    ahead = cover.get("ahead") or {}
     index = KeyIndex(keys_io, None, IndexState.from_json(cover["index"]))
-    pages = index.changes(int(cover["from"]), int(cover["to"]), limit=1000)
-    try:
-        async for page in pages:
-            for k, generation, removed in zip(page.keys, page.generations, page.deleted, strict=True):
-                key = key_str(k)
-                if not taken(key) or ahead.get(key, -1) >= generation:
-                    continue
-                if (removed and key in deleted) or (not removed and upserted.get(key, -1) >= generation):
-                    continue
-                return False
-        return True
-    finally:
-        await pages.aclose()
+    first, last, after = int(cover["from"]), int(cover["to"]), None
+    while True:
+        entries, after = await _changes(index, first, last, after, 1000, cover.get("ahead") or {})
+        for k, generation, removed, change in entries:
+            key = key_str(k)
+            if not taken(key) or CHANGE[change] is None:
+                continue
+            if (removed and key in deleted) or (not removed and upserted.get(key, -1) >= generation):
+                continue
+            return False
+        if after is None:
+            return True
 
 
 async def _reconcile_batch(spec: dict, pin: dict, keys_io, failures: KeyIndex) -> Batch:
@@ -412,7 +441,8 @@ async def run(spec, project, asset, param: str, pin: dict, args: dict, ctx, keys
     decls = {o.name or asset.name: o for o in asset.outputs}
     is_async = inspect.iscoroutinefunction(asset.fn)
     signature = inspect.signature(asset.fn)
-    pool = None if is_async else ThreadPoolExecutor(max_workers=int(each["concurrency"]))
+    # Every key of the batch runs at once (D80): `batch_size` is the one knob.
+    pool = None if is_async else ThreadPoolExecutor(max_workers=max(1, len(batch.upserted)))
     loop = asyncio.get_running_loop()
     outputs: dict[str, dict] = {}
     outcomes: dict[str, Outcome] = {}
@@ -443,22 +473,16 @@ async def run(spec, project, asset, param: str, pin: dict, args: dict, ctx, keys
                 )
         return values
 
-    todo = iter(batch.upserted.items())
+    async def one(key: str, generation: int):
+        """One key's call; a drain or another key's abort interrupts it."""
 
-    async def worker():
-        """Calls key after key — `concurrency` workers, never a task per key —
-        until the keys run out, a drain begins, or a key aborts the batch."""
-
-        for key, generation in todo:
-            if drain.is_set() or abort:
-                return  # the keys left are interrupted (below)
-            try:
-                await call(key, generation)
-            except asyncio.CancelledError:
-                if not (drain.is_set() or abort):
-                    raise
-                outcomes[key] = Outcome(INTERRUPTED, generation)
+        try:
+            await call(key, generation)
+        except asyncio.CancelledError:
+            if not (drain.is_set() or abort):
                 raise
+            outcomes[key] = Outcome(INTERRUPTED, generation)
+            raise
 
     async def call(key: str, generation: int):
         kwargs = dict(args)
@@ -495,8 +519,7 @@ async def run(spec, project, asset, param: str, pin: dict, args: dict, ctx, keys
     timeline.add("computing")
     running = Tasks("each")  # their failures are raised here: awaited
     workers = [
-        running.spawn(worker(), awaited=True)
-        for _ in range(min(int(each["concurrency"]), len(batch.upserted)))
+        running.spawn(one(key, generation), awaited=True) for key, generation in batch.upserted.items()
     ]
     stopper = running.spawn(drain.wait(), awaited=True)
     try:

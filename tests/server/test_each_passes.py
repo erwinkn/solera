@@ -69,14 +69,15 @@ async def test_a_retry_pass_that_leaves_nothing_uncovered_collapses_the_record()
     from solera_worker.each import _retry_covers
 
     io, spans = ObjectIO(MemoryStore()), [Span(0, 0, ((0, 0),), ())]
-    for c, (keys, generation, deleted) in enumerate(
-        [([b"a", b"b"], 10, b"\0\0"), ([b"c"], 11, b"\x01")], start=1
+    for c, (keys, generation, deleted, predecessors) in enumerate(
+        [([b"a", b"b"], 10, b"\0\0", None), ([b"c"], 11, b"\x01", [1])],
+        start=1,  # c held before: removed
     ):
-        data = K.encode_file(keys, [generation] * len(keys), deleted)
+        data = K.encode_file(keys, [generation] * len(keys), deleted, predecessors=predecessors)
         await io.write(f"idx/{c:012d}-log.kx", data)
         spans.append(Span(c, c, ((c, generation),), (FileInfo.describe(f"{c:012d}-log", data),)))
     state = IndexState(spans=tuple(spans), prefix="idx/")
-    cover = {"from": 1, "to": 2, "index": state.to_json(), "ahead": {"a": 10}}
+    cover = {"from": 1, "to": 2, "index": state.to_json(), "ahead": {"a": [10, True]}}
     taken = Matcher(None)
     assert await _retry_covers(cover, taken, {"b": 10}, {"c"}, io)  # a ahead, b retried, c removed
     assert not await _retry_covers(cover, taken, {"b": 10}, set(), io)  # c's removal not delivered

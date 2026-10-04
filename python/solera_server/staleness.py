@@ -16,6 +16,7 @@ A key of a keyed output that is not `each` shares its partition's answer.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import math
 
@@ -29,6 +30,13 @@ log = logging.getLogger(__name__)
 
 INPUT, UPSTREAM, DEFINITION = "input changed", "upstream stale", "definition changed"
 BEHIND_PAGE = 1000
+NEITHER = 3  # a `KeyIndex.changes` class: a key that netted out, or that the read-ahead holds
+
+
+def _lower(read: dict[str, tuple[int, bool]]) -> dict[bytes, tuple[int, bool]]:
+    """A read-ahead as `changes`' per-key lower bounds."""
+
+    return {key_bytes(k): v for k, v in read.items()}
 
 
 class Staleness:
@@ -154,14 +162,11 @@ class Staleness:
     async def _input_behind(self, asset: str, partition: str, input, definition: bool = False) -> bool:
         """Whether an incremental input has changes past its position that it has
         not read: commits past `next` — for a keyed upstream, a key its
-        patterns take changed past `next`, not read ahead at or after its
-        change. No position, or a pass, pattern change or cleanup under way,
-        counts only when its own `definition` did not make the pass due; a
-        full pass under way counts again for commits past its base.
-
-        Conservative where the index cannot tell yet: a key removed past
-        `next` counts even when it was also added past `next`, so it may
-        report a change that nets out (docs/positions-from-reads.md)."""
+        patterns take whose net change past `next` (K44: added, updated or
+        removed, not one that nets out) its read-ahead lacks. No position,
+        or a pass, pattern change or cleanup under way, counts only when its
+        own `definition` did not make the pass due; a full pass under way
+        counts again for commits past its base."""
 
         position = self.m.position(asset, input.param, partition)
         head = self.m.heads.get((input.output, input.partition))
@@ -189,17 +194,17 @@ class Staleness:
         state = self.m.index(input.output, input.partition)
         if not state.covers(lo, hi):
             return True  # the log no longer holds it: the next pass is full
-        read = (await self._read_ahead_of(asset, input.param, ahead)) if ahead else {}
+        read = (await self._read_ahead_of(input.param, ahead)) if ahead else {}
         taken = Matcher(patterns)
         behind = False
         with self.m.reading(state.prefix):
             index = KeyIndex(self._key_io(), None, state.slice(lo, hi), self.key_options)
-            pages = index.changes(lo, hi, limit=BEHIND_PAGE)
+            pages = index.changes(lo, hi, limit=BEHIND_PAGE, lower=_lower(read))  # one merge of the commits
             try:
                 async for page in pages:
                     behind = any(
-                        taken(key_str(k)) and read.get(key_str(k), -1) < g
-                        for k, g in zip(page.keys, page.generations, strict=True)
+                        c != NEITHER and taken(key_str(k))
+                        for k, c in zip(page.keys, page.classes, strict=True)
                     )
                     if behind:
                         break
@@ -229,18 +234,34 @@ class Staleness:
             found = await index.lookup([key_bytes(k) for k in keys])
         return {key_str(k) for k in found}
 
-    async def _read_ahead_of(self, asset: str, param: str, entries: list, since: int = 0) -> dict[str, int]:
-        """One input's read-ahead as key -> the latest generation an entry read."""
+    async def _read_ahead_of(self, param: str, entries: list, since: int = 0) -> dict[str, tuple[int, bool]]:
+        """One input's read-ahead (K45): each key a `keys=` run delivered, as
+        the latest upstream generation one read it at and whether it was
+        delivered live. The attempt's spec says what it read and when it was
+        claimed; its sealed result says what it delivered — a key it named
+        but did not deliver is not part of the entry. Entries claimed before
+        `since` are left out; one whose files are gone is lost, and the next
+        pass delivers its keys again."""
 
-        out: dict[str, int] = {}
-        for _, run, attempt in entries:
-            spec = await self.state.attempt_spec(run, attempt)
+        listed = [(run, attempt) for _, run, attempt in entries]
+        specs, results = await asyncio.gather(
+            asyncio.gather(*(self.state.attempt_spec(r, a) for r, a in listed)),
+            asyncio.gather(*(self.state.attempt_result(r, a) for r, a in listed)),
+        )
+        out: dict[str, tuple[int, bool]] = {}
+        for (_, attempt), spec, result in zip(listed, specs, results, strict=True):
             pin = ((spec or {}).get("inputs") or {}).get(param)
-            if pin is None or int(spec.get("generation") or 0) < since:  # claimed before `since`
+            delivered = ((result or {}).get("delivered") or {}).get(param)
+            if pin is None or delivered is None:
+                log.warning("read-ahead attempt %s: its spec or result is gone", attempt)
+                continue
+            if int(spec.get("generation") or 0) < since:  # claimed before `since`
                 continue
             generation = int(pin["ref"].get("generation") or 0)
-            for key in pin["batch"]["keys"]:
-                out[key] = max(out.get(key, -1), generation)
+            for live, keys in ((True, delivered["upserted"]), (False, delivered["deleted"])):
+                for key in keys:
+                    if out.get(key, (-1, False))[0] < generation:
+                        out[key] = (generation, live)
         return out
 
     async def stale_keys(
@@ -272,7 +293,7 @@ class Staleness:
 
     async def _each_keys(self, asset: str, partition: str, memo: dict) -> set[str]:
         """An `each=True` partition's stale keys, from its one record (K47): the
-        position and the read-ahead entries, whose specs name the keys.
+        position and the read-ahead entries (`_read_ahead_of`).
 
         With a snapshot, a key its patterns take changed past `next` — removed
         too — and read by no entry at or after its change. With a full pass due
@@ -360,7 +381,7 @@ class Staleness:
         knob = shared_moved or unknown
         since = math.inf if knob else max(due, default=0)
         read = (
-            (await self._read_ahead_of(asset, param, position["ahead"], since))
+            (await self._read_ahead_of(param, position["ahead"], since))
             if (position or {}).get("ahead")
             else {}
         )
@@ -378,10 +399,12 @@ class Staleness:
                 with self.m.reading(up_state.prefix):
                     index = KeyIndex(self._key_io(), None, up_state.slice(lo, hi), self.key_options)
                     removed = set()
-                    async for page in index.changes(lo, hi, limit=BEHIND_PAGE):
-                        for k, g, gone in zip(page.keys, page.generations, page.deleted, strict=True):
+                    async for page in index.changes(lo, hi, limit=BEHIND_PAGE, lower=_lower(read)):
+                        for k, g, gone, c in zip(
+                            page.keys, page.generations, page.deleted, page.classes, strict=True
+                        ):
                             key = key_str(k)
-                            if not taken(key) or read.get(key, -1) >= g:
+                            if c == NEITHER or not taken(key):
                                 continue
                             if walked_at is not None and key <= walked_at and g <= walked_gen:
                                 continue  # delivered by the pass under way
@@ -399,7 +422,9 @@ class Staleness:
                 if not taken(key):
                     continue
                 upstream.add(key)
-                if read.get(key, -1) >= g or (walked_at is not None and key <= walked_at and g <= walked_gen):
+                if read.get(key, (-1, False))[0] >= g or (
+                    walked_at is not None and key <= walked_at and g <= walked_gen
+                ):
                     continue
                 keys.add(key)
             async for key, _, _ in _entries(self, self.m.indexes.get((output, partition))):

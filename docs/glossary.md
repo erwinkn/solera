@@ -159,11 +159,12 @@ window", which are passes.
   no projection. *Example:* `site_report` for `alpha` compares alpha's
   index with every other site's.
 - **incremental** (`Incremental`): what changed since its position, in
-  batches; keyed upstreams by key, unkeyed ones by commit. Never across
-  upstream-only dimensions.
+  batches; keyed upstreams by key — each key **added**, **updated** or
+  **removed**, net since the position — unkeyed ones by commit. Never
+  across upstream-only dimensions.
   - **per-key incremental** (`each=True`): an incremental input over a
     keyed upstream whose asset is written for one key: one call per
-    changed key (`ctx.key`), `concurrency` at once, failures kept per
+    changed key (`ctx.key`), a batch's keys all at once, failures kept per
     key. *Why:* a failure on one file must not block the other 999.
 - **dep** (`deps=`): an input bound to no parameter: planned, pinned,
   watched by `OnChange`, never loaded; it fans in as a whole input does.
@@ -475,9 +476,11 @@ past it. *Not:* a cursor (the user's state). *Was:* bookmark, watermark.
 **read-ahead**. What `keys=` runs of an incremental input read past its
 position, `each=True` included (one record for every asset, K47), kept on
 the position until the next pass: one entry per run, the upstream commit
-it read at and the attempt whose spec names the keys. The next pass skips
-a key an entry read at or after its last change, then the entries collapse
-into the snapshot; so does a `keys=` run, or a retry pass, that leaves
+it read at and the attempt, whose sealed result says which keys it
+delivered, live or removed. The next pass skips a key an entry read at or
+after its last change, classes one changed since against what the entry
+delivered (K44: delivered removed and live now is added), then the
+entries collapse into the snapshot; so does a `keys=` run, or a retry pass, that leaves
 nothing past it undelivered. Capped at 10,000 entries per partition: past
 it, run the partition first. *Edge case:* nothing is delivered twice,
 though one run may name any number of keys.
@@ -513,7 +516,8 @@ attempt and commit. Never empty, but for one case: a full pass whose
 input takes no key reaches a plain producer as one empty batch, since
 starting over must happen (a per-key asset's cleanup does it instead). It knows its `index` in the pass (0-based, exact),
 the planned `count` (possibly an estimate), `first`, `final`, `full`, and
-its `upserted` and `removed` keys. *Example:* `file_index` reads four
+its `added`, `updated` and `removed` keys: each key's net change since
+the input's position (a full pass's are all added). *Example:* `file_index` reads four
 files per site in two batches of `batch_size=2`. *Was:* page (`Changes`,
 `ctx.batch`, `page_size`, `page`, `pages`).
 

@@ -779,44 +779,20 @@ class Engine(Attempts, Sensors, Staleness, Views):
 
     # -- input resolution + Incremental plans (§5, §6, §8) --------------------------
 
-    async def _read_ahead(self, task: dict) -> dict[str, dict[str, int]]:
+    async def _read_ahead(self, task: dict) -> dict[str, dict[str, tuple[int, bool]]]:
         """Per incremental input whose position reads ahead (K45), each key its
-        `keys=` runs read and the latest upstream generation one read it at:
-        the entries name the attempts, whose immutable specs list the keys.
-        Read only when there are entries, the specs together; a spec gone is
-        an entry lost, whose keys the next pass delivers again. With a full
-        pass under way, only the entries claimed since it began: it owes
-        every key again."""
+        `keys=` runs delivered, as of the latest upstream generation one read it
+        at, and whether live (`_read_ahead_of`). Read only when there are
+        entries. With a full pass under way, only the entries claimed since it
+        began: it owes every key again."""
 
-        entries, began = {}, {}
+        out = {}
         for param in self.manifest["assets"][task["asset"]].get("inputs") or {}:
             position = self.m.position(task["asset"], param, task["partition"])
             if position and position.get("ahead"):
-                entries[param] = position["ahead"]
-                if (position.get("pass") or {}).get("mode") == "full":
-                    began[param] = int(position["pass"].get("began") or 0)
-        if not entries:
-            return {}
-        listed = sorted({(run, attempt) for ahead in entries.values() for _, run, attempt in ahead})
-        specs = dict(
-            zip(
-                listed, await asyncio.gather(*(self.state.attempt_spec(r, a) for r, a in listed)), strict=True
-            )
-        )
-        out = {}
-        for param, ahead in entries.items():
-            read = out[param] = {}
-            for _, run, attempt in ahead:
-                spec = specs[(run, attempt)] or {}
-                pin = (spec.get("inputs") or {}).get(param)
-                if pin is None:
-                    log.warning("%s: the spec of read-ahead attempt %s is gone", task["asset"], attempt)
-                    continue
-                if int(spec.get("generation") or 0) < began.get(param, 0):
-                    continue  # read before the pass under way began
-                generation = int(pin["ref"].get("generation") or 0)
-                for key in pin["batch"]["keys"]:
-                    read[key] = max(read.get(key, -1), generation)
+                under_way = position.get("pass") or {}
+                began = int(under_way.get("began") or 0) if under_way.get("mode") == "full" else 0
+                out[param] = await self._read_ahead_of(param, position["ahead"], began)
         return out
 
     def _prepare(self, task: dict, run: dict, attempt: str | None = None, ahead: dict | None = None) -> dict:
@@ -1174,7 +1150,14 @@ class Engine(Attempts, Sensors, Staleness, Views):
         )
         pass_ = (position or {}).get("pass") or {}
         if fresh and (position.get("patterns") != input.get("patterns") or "pattern_change" in position):
-            return pin, plan, not keys  # a pattern change decides membership first: merged, recorded nowhere
+            # A pattern change decides membership first: merged, recorded nowhere. A named
+            # key is updated if the consumer held it: the old patterns took it at `next` (K44).
+            held_at = position.get("next")
+            pin["batch"]["held_at"] = {
+                "next": int(held_at) if held_at is not None else None,
+                "patterns": position.get("patterns"),
+            }
+            return pin, plan, not keys
         if position is not None and len(position.get("ahead", ())) >= self.read_ahead_cap:
             raise NonRetryable(f"{task['asset']}: {self.READ_AHEAD_FULL}")
         if ahead and fresh:  # a start-over owes every key again: what was read before is not of it
@@ -1495,7 +1478,6 @@ class Engine(Attempts, Sensors, Staleness, Views):
             retry = None  # its predicate's inputs moved: the pass starts over (§9)
         each = {
             "kind": kind,
-            "concurrency": input["each"]["concurrency"],
             "deploy": self.m.deploy_number,
             "forced": forced,
             "forced_at": current,

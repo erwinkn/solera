@@ -24,7 +24,8 @@ def project(root, outside, seen, retention=None, version="1", exclude=None):
         version=version,
     )
     def copy(ctx, feed: list):
-        seen.append((sorted(ctx.batch["feed"].upserted), sorted(ctx.batch["feed"].removed)))
+        changes = ctx.batch["feed"]  # what reached it, added or updated, and removed
+        seen.append((sorted([*changes.added, *changes.updated]), sorted(changes.removed)))
         return rebuild(ctx.batch["feed"], [{"id": r["id"], "v": r["v"]} for r in feed])
 
     return Project(

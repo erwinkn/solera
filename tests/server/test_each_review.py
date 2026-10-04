@@ -18,46 +18,6 @@ class Bad(Rejected):
     pass
 
 
-async def test_1_a_cancel_interrupts_keys_still_waiting_for_a_slot(tmp_path):
-    started, release = asyncio.Event(), asyncio.Event()
-
-    @asset(outputs=Output("files", keyed=True))
-    def files():
-        return {"a": 1, "b": 2, "c": 3, "d": 4}
-
-    async def parse(ctx, file: int):
-        if ctx.key != "a":
-            started.set()
-            await release.wait()
-        return [{"n": file}]
-
-    parse = asset(
-        parse,
-        inputs={"file": Incremental("files", concurrency=1, each=True)},
-        outputs=Output("rows", key="path"),
-    )
-    project = Project(assets=[files, parse])
-    opened = await State.open(tmp_path.as_uri(), "test", flush_interval=0.001)
-    engine = engine_for(opened, project, placement="inline", heartbeat_seconds=0.2, cancel_grace=30)
-    await engine.initialize()
-    await engine.run_until((await engine.submit(["files"]))["id"], 10)
-    run = await engine.submit(["parse"])
-    await until(engine, started.is_set)
-    await engine.cancel(run["id"])
-    detail = await engine.run_until(run["id"], 60)
-    [attempt] = detail["attempts"][detail["tasks"][0]["id"]]
-    assert attempt["keys"] == {"ok": 1, "canceled": 3}  # c and d too, never started
-    assert {k: r.outcome for k, r in (await records(engine, "parse")).items()} == dict.fromkeys(
-        "bcd", CANCELED
-    )
-    release.set()
-    engine.retry_keys("parse", ["canceled"])
-    detail = await engine.run_until((await engine.submit(["parse"]))["id"], 10)
-    assert set(await rows_of(engine, project, "rows")) == set("abcd")
-    await engine.stop()
-    await opened.close()
-
-
 async def test_2_a_full_run_keeps_a_failing_keys_last_good_output(state):
     broken = {"b": False}
 

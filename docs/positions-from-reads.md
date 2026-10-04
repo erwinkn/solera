@@ -9,13 +9,15 @@ any keyed incremental input through the read-ahead, capped at 10,000
 entries per partition (K45); a full pass that may complete across runs,
 `keys=` runs included; staleness on demand, transitive, as three
 predicates (K46); whole and dep inputs caught up to in the partition
-record (`seen`), not in the fingerprint (d).
+record (`seen`), not in the fingerprint (d); exact presence at the
+position (K44): batches class each key added, updated or removed, net,
+and "behind" counts only those, from the span key index's `changes()`,
+the read-ahead classed by what each `keys=` run delivered.
 
 **Not built:** a position *derived* from what attempts report they read —
 positions are still moved by the plan an attempt was given, its
 `selection` kind included, and `caught_up` is still set by the commit
-path; exact presence at the position (K44's added, updated and removed,
-a net "behind"), which waits for the span key index (W42's step 3).
+path.
 It supersedes K36–K42 and K40's wording.
 
 ## Units
@@ -222,9 +224,10 @@ kept of earlier causes, and each clears on its own condition:
 So an upstream reset followed by the asset's own change reports both.
 A key's last read is its read-ahead entry's, else the snapshot's, and the
 latest read wins: a key read ahead and then removed upstream is behind,
-whatever a net delta past the snapshot says (Positions.tla). One case
-over-reports until exact presence lands: a key added and removed past
-`next` counts, though it nets out.
+whatever a net delta past the snapshot says (Positions.tla): it is classed
+against what its `keys=` run delivered, live, so it is removed. Past the
+snapshot alone, the net delta decides: a key added and removed past `next`
+does not count, nor, at a versioned source, one updated and reverted.
 
 What can be stale is what was built since its outputs' last reset: a
 head, or a commit (a `keys=` run that took no key included). Never built,

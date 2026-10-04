@@ -425,7 +425,6 @@ function Declaration({ asset, manifest }: { asset: AssetDecl; manifest: Manifest
                   <span className="text-fg-subtle">)</span>
                 </span>
                 {input.batch_size != null && <Tag>{input.batch_size} keys a batch</Tag>}
-                {input.each && <Tag>{input.each.concurrency} at a time</Tag>}
                 {input.patterns && <PatternList patterns={input.patterns} />}
               </Row>
             ))}

@@ -183,8 +183,8 @@ async def test_rename_and_meta_edges(state):
 
 
 async def test_incremental_filters_input_and_changes(state):
-    """§5/§6: under Incremental the parameter arrives filtered to upserted
-    keys and ctx.batch carries upserted + deleted."""
+    """§5/§6: under Incremental the parameter arrives filtered to the keys
+    added or updated, and ctx.batch says which, and what was removed (K44)."""
     seen = {}
     content = {"rows": [{"id": "a", "v": 1}, {"id": "b", "v": 1}, {"id": "c", "v": 1}]}
 
@@ -195,7 +195,8 @@ async def test_incremental_filters_input_and_changes(state):
     @asset(inputs={"files": Incremental()})
     def consumer(ctx, files: list):
         seen["rows"] = list(files)
-        seen["upserted"] = list(ctx.batch["files"].upserted)
+        seen["added"] = list(ctx.batch["files"].added)
+        seen["updated"] = list(ctx.batch["files"].updated)
         seen["deleted"] = list(ctx.batch["files"].removed)
         return [{"n": len(files)}]
 
@@ -203,7 +204,7 @@ async def test_incremental_filters_input_and_changes(state):
     engine = make_engine(state, project)
     await engine.initialize()
     await drive(engine, await engine.submit(["consumer"], upstream=True))
-    assert seen["upserted"] == ["a", "b", "c"]  # §6: first pass upserts everything
+    assert seen["added"] == ["a", "b", "c"]  # §6: a first pass adds everything
     assert {r["id"] for r in seen["rows"]} == {"a", "b", "c"}
 
     # Second run, nothing written since → skipped, nothing loaded.
@@ -215,14 +216,14 @@ async def test_incremental_filters_input_and_changes(state):
     # One key written again reprocesses only that key (§6).
     content["rows"] = Patch([{"id": "b", "v": 2}])
     await drive(engine, await engine.submit(["consumer"], upstream=True))
-    assert seen["upserted"] == ["b"]
+    assert seen["updated"] == ["b"] and seen["added"] == []  # held at the position: updated (K44)
     assert [r["id"] for r in seen["rows"]] == ["b"]
 
     # A deletion arrives via ctx.batch (§5: what a selection cannot carry).
     seen.clear()
     content["rows"] = Patch([], remove=["b"])
     await drive(engine, await engine.submit(["consumer"], upstream=True))
-    assert seen["deleted"] == ["b"] and seen["upserted"] == []
+    assert seen["deleted"] == ["b"] and seen["added"] == seen["updated"] == []
 
 
 async def test_config_change_reprocesses_everything(state):

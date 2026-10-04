@@ -361,8 +361,9 @@ is added if the consumer was given `k` as removed at `r`, and updated if it
 was given `k` live. So:
 
 - the **delivered state comes from the attempt's sealed result**
-  (`state.attempt_result`), read with its spec (`engine._read_ahead` reads
-  only the spec today): the keys it delivered as upserted, and as removed. A
+  (`state.attempt_result`), read with its spec (`Staleness._read_ahead_of`,
+  for staleness and for the batches alike): the keys it delivered live, and
+  as removed. A
   key the selection named but did not deliver (unchanged past `next`) is not
   part of the entry;
 - per key, the **latest read wins**: the entry with the newest `r` that
@@ -660,7 +661,7 @@ Two consumers keep `tally = ctx.load() + len(added) − len(removed)`.
 - **X** sits at position 1, with tally 2 (`a`, `b`).
 - **Y** read through commit 2 and sits at position 3, with tally 2 (`b`,
   `c`). A keys= selection then read `d` at head 4; its sealed result says `d`
-  was delivered upserted. Y's record is position 3 plus `[4, run,
+  was delivered live. Y's record is position 3 plus `[4, run,
   attempt]`; its bound for `d` is commit 4's generation, 40. Its tally is 3.
 
 The endpoints are 1 (X) and 3 (Y). Suppose upkeep merges all five deltas
@@ -687,7 +688,7 @@ span  [1, 5]   a: g30 | tombstone g20, pred 1     (newest | seen by 3)
   has no version before 3, so its predecessor: live; updated. `c`: g10,
   live: updated. `d` is in the read-ahead: its newest generation, 50, is
   past the bound 40, so it changed after Y read it; it was delivered
-  upserted and is gone: removed. Tally 3 + 1 − 1 = 3: `a`, `b`, `c`.
+  live and is gone: removed. Tally 3 + 1 − 1 = 3: `a`, `b`, `c`.
 
 Had the merge dropped the version endpoint 3 sees for `a`, Y would read
 `a`'s oldest predecessor (live) and class it updated, though Y never had it.

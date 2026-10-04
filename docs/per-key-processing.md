@@ -30,7 +30,7 @@ async def icp(ctx, files: list[dict], sharepoint: SharePointClient):
         except Exception as e:
             ctx.log.warning(f"skipping {f['path']}: {e}")   # swallowed: the file is never retried
     frames = await asyncio.gather(*(one(f) for f in files))
-    return Patch(pd.concat([f for f in frames if f is not None]), remove=ctx.batch["files"].deleted)
+    return Patch(pd.concat([f for f in frames if f is not None]), remove=ctx.batch["files"].removed)
 ```
 
 Three things in Solera force that shape:
@@ -50,8 +50,8 @@ Three things in Solera force that shape:
 ## 2. The design in one paragraph
 
 An asset declares how to process **one key**; per-key incremental runs it over every
-changed key of a keyed upstream, `concurrency` at a time, `batch_size` keys
-per attempt, and hands each output's store one `Patch({key: value})`.
+changed key of a keyed upstream, `batch_size` keys per attempt, all at
+once, and hands each output's store one `Patch({key: value})`.
 Every key is a group: it holds all the rows that carry it, one or many,
 and its version is the generation of the write that last wrote it
 (`versions.md`). Errors raised for one key are classified by the
@@ -69,7 +69,7 @@ keys, generations and sources' versions only.
 | Piece | Lives in | Knows |
 |---|---|---|
 | Key indexes, positions, the failed keys, key patterns | engine | key strings, generations, payloads (opaque bytes), outcome classes |
-| The per-key loop, concurrency, error classification | worker | a batch of keys; each key's value is opaque |
+| The per-key loop, error classification | worker | a batch of keys; each key's value is opaque |
 | Splitting a batch into per-key values; reading a write's keys; stamping the key column; replacing a key's rows | store | its own types |
 | SharePoint, samples, what counts as unprocessable | user code | everything else |
 
@@ -124,7 +124,7 @@ def sharepoint_files(ctx, events: pd.DataFrame):
     inputs={"file": Incremental("sharepoint_files",
                          include="ICP/Results/**/*.csv",
                          exclude={"archive": "**/archive/**", "templates": "**/*template*"},
-                         batch_size=100, concurrency=16, each=True)},
+                         batch_size=16, each=True)},
     automations=OnChange(),
 )
 async def icp(ctx, file: dict, sharepoint: SharePointClient) -> Result:
@@ -157,7 +157,7 @@ its path. `item_id` stays a column.
 ## 5. Per-key incremental
 
 ```python
-Incremental(output=None, *, include=None, exclude=None, batch_size=100, concurrency=16, meta=None, each=True)
+Incremental(output=None, *, include=None, exclude=None, batch_size=16, meta=None, each=True)
 ```
 
 - **The upstream must be keyed** — a keyed output or keyed source; keys
@@ -166,15 +166,17 @@ Incremental(output=None, *, include=None, exclude=None, batch_size=100, concurre
   as part of a batch: the worker asks `store.load(ref, dict[str, T],
   Keys(batch))` and the store splits the batch by key. `ctx.key` and
   `ctx.generation` name the key and its upstream version.
-- **`batch_size`** is keys per attempt, which is keys per commit: it bounds
-  how much work a crash throws away. **`concurrency`** is keys in flight
-  within an attempt: a semaphore for an `async` function, a pool of
-  threads for a plain one.
-- **Neither bounds row memory.** Both count keys: a batch of 100 keys holds
-  whatever rows those keys produce, and one 2 GB workbook is still one
-  key. A per-key function that can produce huge groups needs a smaller
-  `batch_size` and `concurrency`, chosen by its author; Solera does not
-  measure rows.
+- **`batch_size`** (16 by default) is the one knob (D80): keys per
+  attempt, which is keys per commit, and keys in flight, since a batch's
+  keys all run at once — a task each for an `async` function, a thread
+  each for a plain one. It bounds how much work a crash throws away. The
+  asset's `concurrency=` caps its partitions at once, so `concurrency=4`
+  with `batch_size=16` runs up to 64 keys.
+- **It does not bound row memory.** It counts keys: a batch of 16 keys
+  holds whatever rows those keys produce, and one 2 GB workbook is still
+  one key. A per-key function that can produce huge groups needs a
+  smaller `batch_size`, chosen by its author; Solera does not measure
+  rows.
 - **Every output of the asset is keyed by the input's key** — `key=`
   (the rows the call returns, any number) or `keyed=True` (one value).
   Unkeyed outputs are rejected at registration. The call returns a value
@@ -226,8 +228,8 @@ two-phase cancel (`lifecycle.md` §7); for a per-key batch the phases are:
    evidence (`lifecycle.md` §2.3), and repair follows from it. Only a
    worker that cannot drain in time loses finished work.
 
-Finished keys need not be a key-order prefix of the batch — with
-`concurrency=16`, `a c d` may finish while `b` is still reading. So the
+Finished keys need not be a key-order prefix of the batch — its keys
+all run at once, and `a c d` may finish while `b` is still reading. So the
 position does not stop at the first unfinished key: it moves past the
 whole batch, exactly as on success, and the holes are carried by the
 failed keys instead.
@@ -752,7 +754,7 @@ commit 43 deleted archive/a.csv, which still has rows downstream
    | Key at `c` | Delivered as |
    |---|---|
    | matched before, not now (the new `exclude`) | removed: its rows go, its failure entry too |
-   | matched now, not before (a widened `include`) | upserted, at its version in the snapshot |
+   | matched now, not before (a widened `include`) | added, at its version in the snapshot |
    | matched both times, or neither | nothing |
 
 4. **Continue under the new patterns** from commit `c + 1`. Changes

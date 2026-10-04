@@ -92,7 +92,7 @@ async def qaqc_samples(ctx, qaqc_files: pd.DataFrame, sharepoint): ...
 | `partitions` | partition declaration (§7) | unpartitioned |
 | `executor` | placement (§10) | `Local()()` |
 | `retries` / `timeout` | `Retry(n, delay, backoff)` / seconds | `Retry(3)` / `3600` |
-| `concurrency` | at most this many of the asset's partitions run at once, across runs: the engine holds the rest, queued (`held: concurrency`), and dispatches them as running ones end. Not a per-key incremental input's `concurrency=`, which is keys at once within an attempt | `None` (no cap) |
+| `concurrency` | at most this many of the asset's partitions run at once, across runs: the engine holds the rest, queued (`held: concurrency`), and dispatches them as running ones end. A per-key asset runs a batch's keys all at once, so `concurrency=4` with `batch_size=16` runs up to 64 keys (D80) | `None` (no cap) |
 | `version` | opaque string; bump to rebuild: an asset change, so what the old version built is stale and the next run starts over (§6) | `"1"` |
 | `automations` | attached automations (§9) | `()` |
 
@@ -140,11 +140,12 @@ records lineage and cursor and fires nothing.
 | `partition` / `partitions` | canonical key string / dict view by dimension (§7) |
 | `partition_window` | `(start, end)` for time dimensions |
 | `cursor` | committed cursor, `None` on first run or `full` |
-| `batch[input]` | `Batch(rows, removed, upserted, full, index, count, first, final, upstream)` for `Incremental` inputs (§6) |
+| `batch[input]` | `Batch(rows, added, updated, removed, full, index, count, first, final, upstream)` for `Incremental` inputs (§6) |
 | `run_id`, `config` | the run and its config |
 | `execution` | resolved placement `{kind, cpu, memory: bytes, gpu}` |
 | `log(message, **fields)` | structured log line |
-| `load(ref, T)` | load any ref through its store |
+| `load(output=None)` | the asset's own output as committed at the attempt's pin, `None` before its first commit: what a total kept from `batch` changes builds on |
+| `load(ref, T)` | load a ref an input gave, through its store |
 
 ## 3. Refs
 
@@ -346,8 +347,8 @@ input in the manifest. An input is one of three kinds: **whole** (`In`, a
 | Value | Meaning |
 |---|---|
 | `In(output=None, meta=None, all_partitions=False)` | whole: the value (or ref) of the output at its pinned head. Over upstream dimensions this asset lacks it fans in: `dict[partition, T]` over them, complete heads only (§7). `all_partitions=True` reads every partition of the upstream so — the shared dimensions too, with no projection of this asset's partition: `site_report` for `alpha` compares alpha's index with every other site's |
-| `Incremental(output=None, batch_size=100, meta=None, *, include=None, exclude=None)` | receive only what changed since this consumer's position — upserted/deleted keys on a keyed upstream, new batches on an unkeyed one (§6). On a keyed upstream, `include`/`exclude` globs (or `Regex`) select keys by name; pages are formed from the keys they take — read ahead past the others, at most 100,000 keys a page — so no page is empty, a pass they take nothing from is `skipped` without calling the producer, and a change of patterns cuts over: pending changes finish under the old ones, membership is diffed against the index at the pattern change (pinned until the diff ends), then deltas continue under the new (per-key-processing.md §11) |
-| `Incremental(…, each=True, concurrency=16)` | Per-key incremental: an incremental input on a keyed upstream whose producer is written for **one key**: the parameter is that key's value (a rows upstream: its group), `ctx.key` its key. The worker calls it for every changed key of a page, `concurrency` at a time, stores the keys that succeeded as one `Patch({key: value})` per output, and keeps the ones that raised in the asset's failed keys, retried by their error class; deleted keys lose their rows without a call. One per asset, its other inputs whole, every output keyed. per-key-processing.md §5–§10 |
+| `Incremental(output=None, batch_size=100, meta=None, *, include=None, exclude=None)` | receive only what changed since this consumer's position — keys added, updated and removed on a keyed upstream, new batches on an unkeyed one (§6). On a keyed upstream, `include`/`exclude` globs (or `Regex`) select keys by name; pages are formed from the keys they take — read ahead past the others, at most 100,000 keys a page — so no page is empty, a pass they take nothing from is `skipped` without calling the producer, and a change of patterns cuts over: pending changes finish under the old ones, membership is diffed against the index at the pattern change (pinned until the diff ends), then deltas continue under the new (per-key-processing.md §11) |
+| `Incremental(…, each=True)` | Per-key incremental: an incremental input on a keyed upstream whose producer is written for **one key**: the parameter is that key's value (a rows upstream: its group), `ctx.key` its key. The worker calls it for every changed key of a batch, all at once — `batch_size`, 16 by default, is the one knob (D80) — stores the keys that succeeded as one `Patch({key: value})` per output, and keeps the ones that raised in the asset's failed keys, retried by their error class; deleted keys lose their rows without a call. One per asset, its other inputs whole, every output keyed. per-key-processing.md §5–§10 |
 
 **By value or by reference.** The annotation decides. `T` loads through the
 upstream store (`store.load(ref, T, selection)`); a `Ref` subclass hands
@@ -358,8 +359,8 @@ be ref-annotated.
 **The parameter is the selection.** Under `Incremental` the value arrives
 filtered to the delivered keys or commits; `ctx.batch[name]` carries the
 rest. A pass comes in **batches** of `batch_size` keys (or upstream
-commits). The `Batch` describes where it sits: `upserted` and `removed`
-keys, `full` on every batch of a full pass (the whole head, after a
+commits). The `Batch` says what changed and where it sits: `added`,
+`updated` and `removed` keys, `full` on every batch of a full pass (the whole head, after a
 reset), `index` — the batch's 0-based index, exact — `count`, how many
 batches the pass was planned to take when it started (exact without
 patterns and with an exact key count, else an estimate), `first`
@@ -380,6 +381,28 @@ covers. The pass's plan is kept on the input's position while it
 continues, for keyed and unkeyed upstreams, delta passes and full passes
 alike. A consumer that rebuilds starts over when `full and first` —
 never on `full` alone, or each batch would erase the ones before it.
+
+**Added, updated, removed** (K44). Each key of a keyed batch is classed
+by its presence at the consumer's position and now, net over the batch's
+commits: `added` (absent at the position, present now), `updated`
+(present at both, at another version), `removed` (present at the
+position, absent now). A key added and removed again appears nowhere,
+and one removed and added back is updated; at a versioned source a key
+taken from `v1` to `v2` and back to `v1` is not delivered at all. A full
+pass delivers every key as added. A key a `keys=` run delivered is
+classed against what that run delivered (§6's read-ahead). So a consumer
+can keep a total from the changes alone:
+
+```python
+@asset(inputs={"items": Incremental()}, outputs=Output("tally"))
+async def tally(ctx, items: list):
+    batch = ctx.batch["items"]
+    before = 0 if batch.full and batch.first else (await ctx.load())["rows"]
+    return {"rows": before + len(batch.added) - len(batch.removed)}
+```
+
+`ctx.load()` is the asset's own output as committed at the attempt's pin.
+A full pass's first batch starts over and must not build on it.
 
 **`deps=`** are unbound inputs: planned, pinned into lineage, caught up
 to as a whole input is (§6), watched by `OnChange()`, bound to no
