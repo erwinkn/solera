@@ -276,7 +276,7 @@ class Reference:
         t = self._tick()
         for k in sorted(set(self.up) | set(self.feed)):
             self._write(k, t if k in self.feed else None, t)
-        self.feed_read = dict(self.feed)
+        self.feed_read, self.feed_moved = dict(self.feed), set()
         for o in self.others.values():
             self._owe_a_pass(o)
             o.input_reset = True
