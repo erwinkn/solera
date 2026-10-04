@@ -1,0 +1,30 @@
+
+paths: 1,000,000 keys, 625 blocks of 1600; trigram filters 0.9 B/key (2% of the raw keys)
+glob	matches	blocks holding a match	common prefix (first+last)	interval (first+last)	interval (first keys only)	trigrams
+tenant-03/**/*	125,237	12.6%	13.4%	12.6%	12.6%	100.0%
+tenant-*/site-0042/**/*	3,825	1.9%	17.9%	3.0%	3.2%	4.8%
+tenant-03/site-*/2024-03-*/*	2,087	12.6%	13.4%	12.6%	12.6%	12.6%
+*/*/2024-03-*/*	16,729	100.0%	100.0%	100.0%	100.0%	100.0%
+**/report-0004?.*	1,944	96.2%	100.0%	100.0%	100.0%	100.0%
+**/*.pdf	249,836	100.0%	100.0%	100.0%	100.0%	100.0%
+
+paths: 1,000,000 keys, 2,500 blocks of 400; trigram filters 2.5 B/key (5% of the raw keys)
+glob	matches	blocks holding a match	common prefix (first+last)	interval (first+last)	interval (first keys only)	trigrams
+tenant-03/**/*	125,237	12.6%	12.8%	12.6%	12.6%	100.0%
+tenant-*/site-0042/**/*	3,825	0.8%	6.8%	1.0%	1.1%	2.2%
+tenant-03/site-*/2024-03-*/*	2,087	10.2%	12.8%	12.6%	12.6%	12.4%
+*/*/2024-03-*/*	16,729	81.6%	100.0%	100.0%	100.0%	98.0%
+**/report-0004?.*	1,944	53.7%	100.0%	100.0%	100.0%	100.0%
+**/*.pdf	249,836	100.0%	100.0%	100.0%	100.0%	100.0%
+
+12-digit ids: 1,000,000 keys, 371 blocks of 2700; trigram filters 0.5 B/key (4% of the raw keys)
+glob	matches	blocks holding a match	common prefix (first+last)	interval (first+last)	interval (first keys only)	trigrams
+0042*	110	0.3%	5.7%	0.3%	0.3%	100.0%
+*4242*	897	82.7%	100.0%	100.0%	100.0%	100.0%
+*99	9,946	100.0%	100.0%	100.0%	100.0%	100.0%
+
+12-digit ids: 1,000,000 keys, 1,471 blocks of 680; trigram filters 1.8 B/key (15% of the raw keys)
+glob	matches	blocks holding a match	common prefix (first+last)	interval (first+last)	interval (first keys only)	trigrams
+0042*	110	0.1%	1.9%	0.1%	0.1%	97.8%
+*4242*	897	36.2%	100.0%	100.0%	100.0%	98.0%
+*99	9,946	99.9%	100.0%	100.0%	100.0%	100.0%

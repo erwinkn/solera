@@ -1,0 +1,5 @@
+ids@1M: 400000 keys, 12.0 B each
+ids@100M: 399985 keys, 12.0 B each
+uuid@100M: 400000 keys, 36.0 B each
+paths: 399998 keys, 47.5 B each
+rc=0
