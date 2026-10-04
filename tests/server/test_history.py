@@ -2,6 +2,7 @@
 flushed to Parquet, merged, hidden when deleted, and queried with DuckDB."""
 
 import copy
+from pathlib import Path
 
 import pytest
 from solera.sdk import In, Output, Project, Result, Retry, Source, asset
@@ -232,7 +233,10 @@ async def test_flush_merge_delete_and_purge(state, clock):
     assert len(files["runs"]) == 1
     assert [r["id"] for r in (await engine.list_runs())["runs"]] == runs[::-1]
 
+    runs_dir = Path(str(state.objects.prefix)) / "runs"
+    assert (runs_dir / runs[1]).is_dir()
     await engine.delete_run(runs[1])
+    assert not (runs_dir / runs[1]).exists()  # a local directory goes with its objects
     hidden = files["runs"][0]
     assert hidden["hidden"] == [runs[1]]
     assert runs[1] not in [r["id"] for r in (await engine.list_runs())["runs"]]

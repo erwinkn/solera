@@ -473,23 +473,6 @@ def prepare_for(store: Any, write: Any, output: Output) -> Prepared:
     return own(write, output) if own is not None else prepare(write, output)
 
 
-def remove_empty_dirs(objects, prefixes) -> None:
-    """A local filesystem store keeps directories its objects left behind and
-    lists them; object stores have no directories. Remove the empty ones."""
-
-    root = getattr(objects, "prefix", None)
-    if type(objects).__name__ != "LocalStore" or root is None:
-        return
-    for prefix in sorted(set(prefixes), key=len, reverse=True):
-        path = os.path.join(str(root), prefix.strip("/"))
-        while os.path.normpath(path) != os.path.normpath(str(root)):
-            try:
-                os.rmdir(path)
-            except OSError:
-                break
-            path = os.path.dirname(path)
-
-
 def _segment(name: str) -> str:
     """A path segment for a partition or key: any string, escaped."""
 

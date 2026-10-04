@@ -232,10 +232,18 @@ class State:
         a worker that wakes later finds no file and writes nothing
         (docs/lifecycle.md §2.4)."""
 
-        from solera.stores import remove_empty_dirs
-
         await self.delete_objects(await self.list_objects(f"runs/{esc(run_id)}/"))
-        remove_empty_dirs(self.objects, [f"runs/{esc(run_id)}"])
+        if isinstance(self.objects, LocalStore) and self.objects.prefix is not None:
+            # A local directory outlives its objects, and lists: remove it, and its
+            # parents while they are empty.
+            root = os.path.normpath(str(self.objects.prefix))
+            path = os.path.join(root, "runs", esc(run_id))
+            while path != root:
+                try:
+                    os.rmdir(path)
+                except OSError:
+                    break
+                path = os.path.dirname(path)
 
     async def attempt_spec(self, run_id: str, attempt: str) -> dict | None:
         data = await self.get_object(f"{lifecycle.base(run_id, attempt)}{lifecycle.SPEC}")
