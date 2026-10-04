@@ -1481,8 +1481,7 @@ async def _forked(stage: dict, server: str | None, context=None) -> int:
         target=_child, args=(stage, server), name=f"attempt {stage['attempt']}"
     )
     child.start()
-    while child.exitcode is None:
-        await asyncio.sleep(0.1)
+    await asyncio.get_running_loop().run_in_executor(None, child.join)
     return child.exitcode
 
 

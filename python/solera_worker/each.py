@@ -26,6 +26,7 @@ from solera.keys.index import IndexState, KeyIndex, key_bytes, key_str
 from solera.patterns import Matcher
 from solera.sdk import UNSET, Ref, Result
 from solera.stores import Keys, Patch, check_loaded
+from solera.tasks import Tasks
 
 WALK = 100  # failure records walked per retry batch, at most, for each key it may take
 INTERRUPTED = "interrupted"  # a key a drain stopped: canceled or timed out once the result is sealed
@@ -389,7 +390,6 @@ async def run(spec, project, asset, param: str, pin: dict, args: dict, ctx, keys
     signature = inspect.signature(asset.fn)
     pool = None if is_async else ThreadPoolExecutor(max_workers=int(each["concurrency"]))
     loop = asyncio.get_running_loop()
-    gate = asyncio.Semaphore(int(each["concurrency"]))
     outputs: dict[str, dict] = {}
     outcomes: dict[str, Outcome] = {}
     durations: dict[str, float] = {}
@@ -419,18 +419,22 @@ async def run(spec, project, asset, param: str, pin: dict, args: dict, ctx, keys
                 )
         return values
 
-    async def one(key: str):
-        generation = batch.upserted[key]
-        try:
-            async with gate:  # a cancel may reach a key still waiting here: it is interrupted too
-                if drain.is_set() or abort:
-                    outcomes[key] = Outcome(INTERRUPTED, generation)
-                    return
+    todo = iter(batch.upserted.items())
+
+    async def worker():
+        """Calls key after key — `concurrency` workers, never a task per key —
+        until the keys run out, a drain begins, or a key aborts the batch."""
+
+        for key, generation in todo:
+            if drain.is_set() or abort:
+                return  # the keys left are interrupted (below)
+            try:
                 await call(key, generation)
-        except asyncio.CancelledError:
-            if not (drain.is_set() or abort):
+            except asyncio.CancelledError:
+                if not (drain.is_set() or abort):
+                    raise
+                outcomes[key] = Outcome(INTERRUPTED, generation)
                 raise
-            outcomes[key] = Outcome(INTERRUPTED, generation)
 
     async def call(key: str, generation: int):
         kwargs = dict(args)
@@ -465,25 +469,25 @@ async def run(spec, project, asset, param: str, pin: dict, args: dict, ctx, keys
             durations[key] = time.monotonic() - start
 
     timeline.add("computing")
-    tasks = {key: asyncio.create_task(one(key)) for key in batch.upserted}
-    stopper = asyncio.create_task(drain.wait())
+    running = Tasks("each")  # their failures are raised here: awaited
+    workers = [
+        running.spawn(worker(), awaited=True)
+        for _ in range(min(int(each["concurrency"]), len(batch.upserted)))
+    ]
+    stopper = running.spawn(drain.wait(), awaited=True)
     try:
-        pending = set(tasks.values())
+        pending = set(workers)
         while pending:
             done, pending = await asyncio.wait(pending | {stopper}, return_when=asyncio.FIRST_COMPLETED)
             pending.discard(stopper)
             failed = [t for t in done if t is not stopper and not t.cancelled() and t.exception() is not None]
             if failed and not isinstance(failed[0].exception(), _Abort):
                 raise failed[0].exception()
-            if (stopper in done or abort) and pending:
-                # A cancel was requested (or a key aborted the attempt): stop the calls
-                # in flight; the keys they leave are interrupted (§5).
-                for task in pending:
-                    task.cancel()
-                await asyncio.gather(*pending, return_exceptions=True)
-                pending = set()
+            if stopper in done or abort:
+                break  # a cancel was requested, or a key aborted the attempt
     finally:
-        stopper.cancel()
+        # The calls still in flight stop; the keys they leave are interrupted (§5).
+        await running.close()
         if pool is not None:
             pool.shutdown(wait=False, cancel_futures=True)
     timeline.add("computed")

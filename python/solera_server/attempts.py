@@ -312,10 +312,10 @@ class Attempts:
         partition's next attempt cleanups it, as ever."""
 
         task = self.m.task(task_id or "")
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + AFTER_COMMIT_WAIT
-        while task is not None and self.m.claimed(attempt) is not None and loop.time() < deadline:
-            await asyncio.sleep(0.02)
+        # Its watcher settles it, then ends: awaited, not polled. None here, no one settles it now.
+        watcher = next((self.watchers.get(k) for k in self.watchers if k[1] == attempt), None)
+        if task is not None and watcher is not None:
+            await asyncio.wait({watcher}, timeout=AFTER_COMMIT_WAIT)
         if task is None or self.m.claimed(attempt) is not None:
             return {}
         await self.state.durable()  # never delete what a replay would still name
