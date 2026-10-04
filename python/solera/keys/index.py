@@ -432,8 +432,8 @@ class KeyIndex:
     The `io` may carry `local` — the engine cache's copies by path — read in
     place of the store whenever they hold every file a read needs, and
     `served` — a `Reads` record (docs/resolved-commits.md §7): answering,
-    its calls are taken from it; recording, every `page`, `pending` and
-    `lookup` is kept in it, and one that would need the store raises `Cold`."""
+    its calls are taken from it; recording, every `page`, page of `changes`
+    and `lookup` is kept in it, and one that would need the store raises `Cold`."""
 
     def __init__(self, io: ObjectIO, prefix: str | None, state: IndexState, options: Options | None = None):
         self.io = io
@@ -780,7 +780,7 @@ class KeyIndex:
         )
         return DeltaFiles(files, delta.added, delta.removed, generation)
 
-    # -- scans: full pass and pending deltas ----------------------------------------------
+    # -- scans: the full pass ---------------------------------------------------------------
 
     async def _window(self, spans: list[list[FileInfo]], after: bytes | None, limit: int):
         """The blocks a page of keys > `after` needs from each sorted run of
@@ -848,12 +848,32 @@ class KeyIndex:
         `below` (the view at a reserved endpoint) — and the cursor to
         continue from (`None` when the view is exhausted)."""
 
-        runs, codecs, bound = await self._window(spans, after, limit)
         # Natively, off the loop: the merge stops at the page, never building the rest.
-        keys, generations, deleted, payloads, last, more = await in_thread(
-            merge_page, runs, codecs, after, bound, limit, drop_deleted, 2**64 - 1 if below is None else below
+        below = 2**64 - 1 if below is None else below
+        (keys, generations, deleted, payloads, last, more), bound = await self._windowed(
+            spans,
+            after,
+            limit,
+            lambda runs, codecs, bound: in_thread(
+                merge_page, runs, codecs, after, bound, limit, drop_deleted, below
+            ),
         )
         return keys, generations, deleted, payloads, self._cursor(len(keys), limit, last, after, more, bound)
+
+    async def _windowed(self, spans: list[list[FileInfo]], after: bytes | None, limit: int, read):
+        """`read(runs, codecs, bound)` over the window of a page past `after`,
+        and the window's bound. A window holds `limit` entries, but a key's
+        versions may fill it and run past its bound — no key in it complete,
+        nothing examined (A17: a page empty, its cursor stuck). Then the
+        window widens until one key is whole, or nothing bounds it."""
+
+        want = limit
+        while True:
+            runs, codecs, bound = await self._window(spans, after, want)
+            out = await read(runs, codecs, bound)
+            if out[-2] is not None or bound is None:  # a key examined, or the window is the rest
+                return out, bound
+            want *= 4
 
     def _endpoint(self, at: int) -> int:
         """The generation a read at reserved endpoint `at` (the state after
@@ -902,49 +922,6 @@ class KeyIndex:
         runs = [list(s.files) for s in reversed(self.state.spans) if s.b >= first and s.a <= last]
         return runs, g_p, g_n1
 
-    async def changes_page(self, first: int, last: int, after: bytes | None, limit: int):
-        """One page of `changes(first -> last)`: every key changed in commits
-        `[first, last]` past `after`, its class (0 added, 1 updated, 2
-        removed, 3 neither — a read-ahead may need it), the generation,
-        deleted flag and payload of its state at `last`, and the cursor
-        (`None` when done). `first` and `last + 1` are reserved endpoints, or
-        `last` is the head (docs/key-index-design.md § changes)."""
-
-        spans, g_p, g_n1 = self._range(first, last)
-        if not spans:
-            return [], b"", [], b"", [], None
-        snap = self._snapshot(spans)
-        if snap is not None:  # the engine's local copies
-            return await self._changes_local(snap, after, limit, g_p, g_n1)
-        runs, codecs, bound = await self._window(spans, after, limit)
-        keys, classes, generations, deleted, payloads, last_key, more = await in_thread(
-            _native.span_changes, runs, codecs, after, bound, limit, g_p, g_n1
-        )
-        return (
-            keys,
-            classes,
-            generations,
-            deleted,
-            payloads,
-            self._cursor(len(keys), limit, last_key, after, more, bound),
-        )
-
-    async def _changes_local(self, snap, after, limit: int, g_p: int, g_n1: int, ceiling: int = 2**64 - 1):
-        try:
-            keys, classes, generations, deleted, payloads, last_key, more = await in_thread(
-                snap.changes, after, limit, g_p, g_n1, max_bytes=ceiling
-            )
-        except LimitError as e:
-            raise Full(str(e)) from e
-        return (
-            keys,
-            classes,
-            generations,
-            deleted,
-            payloads,
-            self._cursor(len(keys), limit, last_key, after, more, None),
-        )
-
     async def changes(
         self,
         first: int,
@@ -956,47 +933,96 @@ class KeyIndex:
         until: bytes | None = None,
         lower: dict[bytes, tuple[int, bool]] | None = None,
     ):
-        """`changes(first -> last)`, a page at a time: yields `Changes` pages.
-        `keys`: only those keys. `after`/`until`: keys in `(after, until)`, a
+        """`changes(first -> last)`, a page at a time: yields `Changes` pages —
+        every key changed in commits `[first, last]`, its class (0 added, 1
+        updated, 2 removed, 3 neither: a read-ahead may need it) and its
+        state at `last`. `first` and `last + 1` are reserved endpoints, or
+        `last` is the head (docs/key-index-design.md § changes). `keys`: only
+        those keys, one page. `after`/`until`: keys in `(after, until)`, a
         prefix's range. `lower`: read-ahead bounds, `{key: (generation read,
         delivered live)}` — such a key is skipped unless it changed after it
-        was read, and then classed from what was delivered. Resume a scan by
-        passing a page's `cursor` as `after`."""
+        was read, and then classed from what was delivered; applied to each
+        page as read, so it stays out of the recorded call. Resume a scan by
+        passing a page's `cursor` as `after`. Each page is one `_read`: served
+        from the engine's record, or recorded, like `page` and `lookup`."""
 
         if keys is not None:
-            yield self._lowered(await self._changes_of(first, last, sorted(set(keys))), lower)
-            return
+            keys = sorted(set(keys))
         while True:
-            ks, cs, gs, ds, ps, cursor = await self.changes_page(first, last, after, limit)
-            page = Changes(list(ks), bytes(cs), list(gs), bytes(ds), list(ps), cursor)
-            if until is not None:
-                page = page.below(until)
-                if page.cursor is not None and page.cursor >= until:
-                    page = replace(page, cursor=None)
+            page = await self.changes_page(first, last, after, limit, keys=keys, until=until)
             yield self._lowered(page, lower)
             if page.cursor is None:
                 return
             after = page.cursor
 
-    async def _changes_of(self, first: int, last: int, keys: list[bytes]) -> Changes:
-        """`changes` of named keys: in each span overlapping the range, the
-        blocks that may hold each key's versions, read whole for the keys."""
+    async def changes_page(
+        self,
+        first: int,
+        last: int,
+        after: bytes | None,
+        limit: int,
+        *,
+        keys: list[bytes] | None = None,
+        until: bytes | None = None,
+    ) -> Changes:
+        """One page of `changes` (its arguments but `lower`; `keys` sorted
+        and distinct): the one recorded call, `changes`."""
 
         spans, g_p, g_n1 = self._range(first, last)
-        runs, codecs = await self._key_blocks(spans, keys)
-        ks, cs, gs, ds, ps, _, _ = await in_thread(
-            _native.span_changes, runs, codecs, None, None, 2**62, g_p, g_n1
-        )
-        want = set(keys)
-        picked = [i for i, k in enumerate(ks) if k in want]
-        return Changes(
-            [ks[i] for i in picked],
-            bytes(cs[i] for i in picked),
-            [gs[i] for i in picked],
-            bytes(ds[i] for i in picked),
-            [ps[i] for i in picked],
-            None,
-        )
+
+        def clipped(ks, cs, gs, ds, ps, cursor) -> Changes:
+            page = Changes(list(ks), bytes(cs), list(gs), bytes(ds), list(ps), cursor)
+            if until is not None:
+                page = page.below(until)
+                if page.cursor is not None and page.cursor >= until:
+                    page = replace(page, cursor=None)
+            return page
+
+        async def store():
+            if not spans:
+                return Changes([], b"", [], b"", [], None)
+            if keys is not None:
+                runs, codecs = await self._key_blocks(spans, keys)
+                ks, cs, gs, ds, ps, _, _ = await in_thread(
+                    _native.span_changes, runs, codecs, None, None, 2**62, g_p, g_n1
+                )
+                want = set(keys)
+                picked = [i for i, k in enumerate(ks) if k in want]
+                return clipped(
+                    [ks[i] for i in picked],
+                    bytes(cs[i] for i in picked),
+                    [gs[i] for i in picked],
+                    bytes(ds[i] for i in picked),
+                    [ps[i] for i in picked],
+                    None,
+                )
+            (ks, cs, gs, ds, ps, last_key, more), bound = await self._windowed(
+                spans,
+                after,
+                limit,
+                lambda runs, codecs, bound: in_thread(
+                    _native.span_changes, runs, codecs, after, bound, limit, g_p, g_n1
+                ),
+            )
+            return clipped(ks, cs, gs, ds, ps, self._cursor(len(ks), limit, last_key, after, more, bound))
+
+        async def local(snap, ceiling):
+            try:
+                if keys is not None:
+                    ks, cs, gs, ds, ps, _, _ = await in_thread(
+                        snap.changes_of, keys, g_p, g_n1, max_bytes=ceiling
+                    )
+                    return clipped(ks, cs, gs, ds, ps, None), None
+                ks, cs, gs, ds, ps, last_key, more = await in_thread(
+                    snap.changes, after, limit, g_p, g_n1, max_bytes=ceiling
+                )
+            except LimitError as e:
+                raise Full(str(e)) from e
+            return clipped(
+                ks, cs, gs, ds, ps, self._cursor(len(ks), limit, last_key, after, more, None)
+            ), None
+
+        return await self._read("changes", (first, last, after, limit, keys, until), spans, local, store)
 
     async def _key_blocks(self, spans: list[list[FileInfo]], keys: list[bytes]):
         """The blocks of `spans` (spans, newest first) that may hold the
@@ -1052,39 +1078,6 @@ class KeyIndex:
             [page.payloads[i] for i in keep],
             page.cursor,
         )
-
-    async def pending(self, first_commit: int, last_commit: int, after: bytes | None, limit: int):
-        """The changed keys of commits `[first_commit, last_commit]` past
-        `after`, each as it is at `last_commit`: keys, generations, deleted
-        flags, payloads, and the next cursor (`None` when done). An adapter
-        over `changes_page` while consumers move to `changes`, recorded for
-        the worker like `page` and `lookup`."""
-
-        spans, g_p, g_n1 = self._range(first_commit, last_commit)
-
-        async def store():
-            ks, _, gs, ds, ps, cursor = await self.changes_page(first_commit, last_commit, after, limit)
-            return ks, gs, ds, ps, cursor
-
-        async def local(snap, ceiling):
-            ks, _, gs, ds, ps, cursor = await self._changes_local(snap, after, limit, g_p, g_n1, ceiling)
-            return (ks, gs, ds, ps, cursor), None
-
-        return await self._read("pending", (first_commit, last_commit, after, limit), spans, local, store)
-
-    async def pending_pages(
-        self, first_commit: int, last_commit: int, after: bytes | None = None, limit=100_000
-    ):
-        """Every page of `pending` from `after`: `(keys, generations, deleted
-        flags, payloads)`."""
-
-        while True:
-            keys, generations, deleted, payloads, after = await self.pending(
-                first_commit, last_commit, after, limit
-            )
-            yield keys, generations, deleted, payloads
-            if after is None:
-                return
 
     # -- merges (docs/key-index-design.md § The merge policy) -----------------------------------
 

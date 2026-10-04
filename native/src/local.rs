@@ -628,11 +628,65 @@ impl Snapshot {
         g_n1: u64,
         max_bytes: u64,
     ) -> Result<spans::Page<(u8, spans::Version)>> {
-        let runs = self
-            .runs
+        let runs = self.runs_from(after);
+        let mut held = 0u64;
+        let mut over = false;
+        let page = spans::page_of(spans::Groups::of(runs)?, after, None, limit, |vs| {
+            let (class, v) = spans::change(vs, g_p, g_n1)?;
+            held += v.payload.as_ref().map_or(0, |p| p.len() as u64);
+            over |= held > max_bytes;
+            Some((class, v.clone()))
+        })?;
+        let keys: u64 = page.items.iter().map(|(k, _)| k.len() as u64).sum();
+        if over || held + keys > max_bytes {
+            return Err(Error::Limit(format!("a page over {max_bytes} bytes")));
+        }
+        Ok(page)
+    }
+
+    /// `changes` of named keys (sorted, distinct): each key's class and state
+    /// at N, or None where it did not change in the range. Every run seeks to
+    /// the block holding the key; past `max_bytes` of keys and payloads, an
+    /// `Error::Limit`.
+    pub fn changes_of(
+        &self,
+        keys: &[&[u8]],
+        g_p: u64,
+        g_n1: u64,
+        max_bytes: u64,
+    ) -> Result<Vec<Option<(u8, spans::Version)>>> {
+        let mut out = Vec::with_capacity(keys.len());
+        let mut held = 0u64;
+        for &k in keys {
+            let mut g = spans::Groups::of(self.runs_from(Some(k)))?;
+            let mut found = None;
+            while let Some((key, versions)) = g.next_group()? {
+                if key.as_slice() < k {
+                    continue;
+                }
+                if key.as_slice() == k {
+                    found = spans::change(&versions, g_p, g_n1).map(|(c, v)| (c, v.clone()));
+                }
+                break;
+            }
+            if let Some((_, v)) = &found {
+                held += (k.len() + v.payload.as_ref().map_or(0, Vec::len)) as u64;
+                if held > max_bytes {
+                    return Err(Error::Limit(format!("a page over {max_bytes} bytes")));
+                }
+            }
+            out.push(found);
+        }
+        Ok(out)
+    }
+
+    /// Each run's blocks from the one holding `from` (its first key not
+    /// above it), decoded one at a time.
+    fn runs_from(&self, from: Option<&[u8]>) -> Vec<spans::Blocks<'_>> {
+        self.runs
             .iter()
             .map(|run| {
-                let (mut fi, mut bi) = match after {
+                let (mut fi, mut bi) = match from {
                     Some(a) => {
                         let fi = run
                             .partition_point(|f| f.min().is_some_and(|m| m <= a))
@@ -653,20 +707,7 @@ impl Snapshot {
                     return f.decoded(bi - 1).map(Some);
                 }) as spans::Blocks<'_>
             })
-            .collect();
-        let mut held = 0u64;
-        let mut over = false;
-        let page = spans::page_of(spans::Groups::of(runs)?, after, None, limit, |vs| {
-            let (class, v) = spans::change(vs, g_p, g_n1)?;
-            held += v.payload.as_ref().map_or(0, |p| p.len() as u64);
-            over |= held > max_bytes;
-            Some((class, v.clone()))
-        })?;
-        let keys: u64 = page.items.iter().map(|(k, _)| k.len() as u64).sum();
-        if over || held + keys > max_bytes {
-            return Err(Error::Limit(format!("a page over {max_bytes} bytes")));
-        }
-        Ok(page)
+            .collect()
     }
 }
 

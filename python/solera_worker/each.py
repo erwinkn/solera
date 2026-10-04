@@ -112,8 +112,8 @@ async def read_batch(pin: dict, keys_io) -> Batch:
         return list(zip(keys, generations, bytes(len(keys)), strict=True)), nxt
 
     async def delta(after, n):
-        keys, generations, flags, _, nxt = await index.pending(int(ch["from"]), int(ch["to"]), after, n)
-        return list(zip(keys, generations, flags, strict=True)), nxt
+        page = await index.changes_page(int(ch["from"]), int(ch["to"]), after, n)
+        return list(zip(page.keys, page.generations, page.deleted, strict=True)), page.cursor
 
     if "pattern_change" in ch:
         old, new = Matcher(ch["pattern_change"]["from"]), Matcher(ch["pattern_change"]["to"])
@@ -137,10 +137,9 @@ async def read_batch(pin: dict, keys_io) -> Batch:
         named, upserted, deleted, left, read = {str(k) for k in ch["keys"]}, {}, [], False, 0
         after = None
         while int(ch["from"]) <= int(ch["to"]):
-            keys, generations, flags, _, after = await index.pending(
-                int(ch["from"]), int(ch["to"]), after, 1000
-            )
-            for k, generation, gone in zip(keys, generations, flags, strict=True):
+            page = await index.changes_page(int(ch["from"]), int(ch["to"]), after, 1000)
+            after = page.cursor
+            for k, generation, gone in zip(page.keys, page.generations, page.deleted, strict=True):
                 key, read = key_str(k), read + 1
                 if not taken(key) or ahead.get(key, -1) >= generation:
                     continue
@@ -322,10 +321,10 @@ async def _retry_covers(cover: dict, taken, upserted: dict, deleted: set, keys_i
 
     ahead = cover.get("ahead") or {}
     index = KeyIndex(keys_io, None, IndexState.from_json(cover["index"]))
-    pages = index.pending_pages(int(cover["from"]), int(cover["to"]), None, 1000)
+    pages = index.changes(int(cover["from"]), int(cover["to"]), limit=1000)
     try:
-        async for keys, generations, gone, _ in pages:
-            for k, generation, removed in zip(keys, generations, gone, strict=True):
+        async for page in pages:
+            for k, generation, removed in zip(page.keys, page.generations, page.deleted, strict=True):
                 key = key_str(k)
                 if not taken(key) or ahead.get(key, -1) >= generation:
                     continue

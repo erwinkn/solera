@@ -1913,6 +1913,43 @@ impl Snapshot {
         })
     }
 
+    /// `changes` of named keys (sorted, distinct) over the snapshot's spans:
+    /// as `changes` gives a page, with only the keys that changed in the
+    /// range; past `max_bytes` of keys and payloads, `LimitError`.
+    #[pyo3(signature = (keys, g_p, g_n1, *, max_bytes=u64::MAX))]
+    fn changes_of<'py>(
+        &self,
+        py: Python<'py>,
+        keys: Vec<PyBackedBytes>,
+        g_p: u64,
+        g_n1: u64,
+        max_bytes: u64,
+    ) -> PyResult<ChangesPage<'py>> {
+        guard(|| {
+            let inner = &self.inner;
+            let found = py
+                .detach(|| {
+                    let ks: Vec<&[u8]> = keys.iter().map(|k| k.as_ref()).collect();
+                    inner.changes_of(&ks, g_p, g_n1, max_bytes)
+                })
+                .map_err(to_py)?;
+            let items = keys
+                .iter()
+                .zip(found)
+                .filter_map(|(k, f)| f.map(|cv| (k.to_vec(), cv)))
+                .collect();
+            changes_page(
+                py,
+                spans::Page {
+                    items,
+                    last: None,
+                    more: false,
+                    skipped: 0,
+                },
+            )
+        })
+    }
+
     /// The newest entry of each key — `(generation, deleted, payload)` — or None.
     #[allow(clippy::type_complexity)]
     fn get<'py>(

@@ -56,8 +56,8 @@ async def key_index_probe(objects):
             "Key index page read back wrong",
         )
         check(await index.lookup([b"b"]) == {b"b": (7, b"1")}, "Key index lookup read back wrong")
-        changes = await index.pending(0, 0, None, 10)
-        check(changes[0] == [b"a", b"b"], "Key index delta log read back wrong")
+        changes = await index.changes_page(0, 0, None, 10)
+        check(changes.keys == [b"a", b"b"], "Key index changes read back wrong")
     finally:
         await io.delete([state.path(f.name) for f in state.files])
 

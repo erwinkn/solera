@@ -593,8 +593,8 @@ request per step: `start` for reads, `resolve` before writing.
 - **The same code, recorded.** The engine runs the worker's own read code
   (`each.read_window`, `each.read_page`, the whole-read pager) on the
   attempt's spec, over its cache's local copies, and records every index
-  call — `page`, `pending` or `lookup`, its arguments — with its result.
-  The worker runs the same code with the record in front of the store: a
+  call — `page`, a page of `changes` (its classes included) or `lookup`,
+  its arguments — with its result. The worker runs the same code with the record in front of the store: a
   call recorded for the same pinned index and arguments is answered from
   it, any other goes to the store. Same code and pins make the same calls,
   so the record is consumed in order; it replaces reads and never decides

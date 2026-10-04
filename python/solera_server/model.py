@@ -1455,6 +1455,11 @@ class Model:
         key = (e["output"], e["partition"])
         span = Span.from_json(e["span"])
         index = self.indexes.get(key)
+        # File names never repeat across lives (each carries an attempt id or a
+        # merge's ULID), so the input check alone refuses an old life's merge —
+        # except one whose inputs are all empty spans, whose name lists match
+        # in any life while their start generations do not. The life check
+        # covers that, and is cheap (KeyIndex.tla finds nothing with it off).
         if index is None or index.life != e["life"] or not index.holds(e["inputs"], e["names"]):
             prefix = e.get("prefix") or (index.prefix if index is not None else "")
             self.garbage.extend([f"{prefix}{f.name}.kx", self.event_counter] for f in span.files)

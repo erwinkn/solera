@@ -874,8 +874,9 @@ async def _intended(info, keys_io, repairs) -> list[str]:
     index = KeyIndex(keys_io, None, state)
     found, after = [], None
     while True:
-        keys, _, _, _, after = await index.pending(0, len(repairs) - 1, after, REPAIR_PAGE)
-        found.extend(map(key_str, keys))
+        page = await index.changes_page(0, len(repairs) - 1, after, REPAIR_PAGE)
+        found.extend(map(key_str, page.keys))
+        after = page.cursor
         if after is None:
             return found
 

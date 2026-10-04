@@ -402,7 +402,7 @@ async def test_new_keys_are_cleared_by_the_key_filter():
     assert idx.route == "sparse" and all(e[4] == 1 for e in written)  # read: each names its predecessor
 
 
-async def test_pending_deltas_newest_wins_and_survive_merges():
+async def test_changes_newest_wins_and_survive_merges():
     h = Harness(small_options())
     await h.commit([key(1), key(2), key(3)])  # batch 0
     h.reserve()  # a reader at commit 1
@@ -410,24 +410,19 @@ async def test_pending_deltas_newest_wins_and_survive_merges():
     await h.commit([key(4)])  # batch 2
     await h.collapse()
     idx = h.index()
-    keys, generations, deleted, _, nxt = await idx.pending(1, 2, None, 10)
-    assert list(zip(keys, generations, deleted, strict=True)) == [
-        (key(2), 2, 0),
-        (key(3), 2, 1),
-        (key(4), 3, 0),
+    page = await idx.changes_page(1, 2, None, 10)
+    assert list(zip(page.keys, page.classes, page.generations, page.deleted, strict=True)) == [
+        (key(2), 1, 2, 0),  # updated
+        (key(3), 2, 2, 1),  # removed
+        (key(4), 0, 3, 0),  # added
     ]
-    assert nxt is None
+    assert page.cursor is None
     # Paged, two at a time.
-    got, after = [], None
-    while True:
-        k, _, _, _, after = await idx.pending(0, 2, after, 2)
-        got += k
-        if after is None:
-            break
+    got = [k async for p in idx.changes(0, 2, limit=2) for k in p.keys]
     assert got == [key(1), key(2), key(3), key(4)]
     # Commit 2 was no endpoint when they merged: the merge kept no boundary there.
     with pytest.raises(LookupError):
-        await h.index().pending(2, 2, None, 10)
+        await h.index().changes_page(2, 2, None, 10)
 
 
 async def test_a_large_commit_splits_at_max_file_bytes():
@@ -608,3 +603,65 @@ async def test_pages_read_each_file_in_its_own_codec():
     idx = KeyIndex(io, None, state)
     assert (await idx.page(None, 10))[0] == [b"a", b"b"]
     assert await idx.lookup([b"a", b"b"]) == {b"a": (5, None), b"b": (5, None)}
+
+
+_hot_commits = st.lists(
+    st.tuples(st.sets(st.sampled_from([key(i) for i in range(4)]), min_size=1), st.booleans()),
+    min_size=2,
+    max_size=24,
+)
+
+
+@settings(max_examples=60, deadline=None)
+@given(
+    commits=_hot_commits,
+    block_size=st.sampled_from([64, 128, 256]),
+    max_file_bytes=st.sampled_from([300, 10**6]),
+)
+def test_pages_with_small_limits_see_every_key_whose_versions_cross_blocks(
+    commits, block_size, max_file_bytes
+):
+    """A17's P1: a key's retained versions can fill a page's window and run
+    past it — here every commit stays an endpoint, so every version is kept,
+    in blocks and files of a few entries. Paged reads with limits of 1 to 3
+    must still return every key exactly once and end: `page` matches
+    `lookup`, and paged `changes` matches `changes(keys=...)`."""
+
+    async def run():
+        o = small_options(
+            block_size=block_size, max_file_bytes=max_file_bytes, small_file=0, whole_threshold=0
+        )
+        h = Harness(o)
+        for ks, remove in commits:
+            ks = sorted(ks)
+            if remove:
+                await h.commit([], removes=ks)
+            else:
+                await h.commit(ks, [b"v%04d" % h.commit_number * 6] * len(ks))  # a few versions a block
+            h.reserve()
+        if len(h.state.spans) > 1:
+            await h._merge((0, len(h.state.spans)))
+        idx = h.index()
+        everything = [key(i) for i in range(4)]
+        live = await idx.lookup(everything)
+        for limit in (1, 2, 3):
+            seen, after, pages = [], None, 0
+            while True:
+                keys, generations, payloads, after = await idx.page(after, limit)
+                seen += list(zip(keys, zip(generations, payloads, strict=True), strict=True))
+                pages += 1
+                assert pages <= 20, "a paged read that never ends"
+                if after is None:
+                    break
+            assert dict(seen) == live and len(seen) == len(live)
+            for first in sorted(h.endpoints | {0}):
+                if first > h.state.head:
+                    continue
+                [point] = [p async for p in idx.changes(first, h.state.head, keys=everything)]
+                paged = []
+                async for page in idx.changes(first, h.state.head, limit=limit):
+                    paged += zip(page.keys, page.classes, page.generations, strict=True)
+                    assert len(paged) <= 20, "a paged read that never ends"
+                assert paged == list(zip(point.keys, point.classes, point.generations, strict=True))
+
+    asyncio.run(run())

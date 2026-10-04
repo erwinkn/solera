@@ -88,6 +88,13 @@ async def engine_answer(resolver, state, a, worker_id="inv", p=None, live=True):
     return answers(body)["out"]
 
 
+async def _changes(index, lo, hi, after, limit):
+    """A page of `changes` as a tuple: keys, classes, generations, deleted, payloads, cursor."""
+
+    p = await index.changes_page(lo, hi, after, limit)
+    return p.keys, p.classes, p.generations, p.deleted, p.payloads, p.cursor
+
+
 def decoded(files):
     return [e for f in files for e in _python.iter_file(f)]
 
@@ -703,8 +710,12 @@ async def test_local_reads_are_the_stores(io, tmp_path):
         cold, warm = KeyIndex(io, None, state, OPTS), KeyIndex(local, None, state, OPTS)
         assert await walk(warm.page, after, limit) == await walk(cold.page, after, limit)
         assert await walk(
-            lambda a, n, w=warm, lo=lo, hi=hi: w.pending(lo, hi, a, n), after, limit
-        ) == await walk(lambda a, n, c=cold, lo=lo, hi=hi: c.pending(lo, hi, a, n), after, limit)
+            lambda a, n, w=warm, lo=lo, hi=hi: _changes(w, lo, hi, a, n), after, limit
+        ) == await walk(lambda a, n, c=cold, lo=lo, hi=hi: _changes(c, lo, hi, a, n), after, limit)
+        named = sorted({key(rng.randrange(2100)) for _ in range(50)})
+        assert await warm.changes_page(lo, hi, None, 1, keys=named) == await cold.changes_page(
+            lo, hi, None, 1, keys=named
+        )
         probe = [key(rng.randrange(2100)) for _ in range(50)]
         assert await warm.lookup(probe) == await cold.lookup(probe)
     # Recording reads only local copies: one it does not hold is `Cold`.
@@ -730,7 +741,8 @@ async def test_a_record_answers_its_calls_and_nothing_else(io, tmp_path):
     reads = Reads(recording=True, max_entries=10**6, max_bytes=2**24)
     engine = KeyIndex(ObjectIO(None, local=opened.handles, served=reads), None, state, OPTS)
     page = await engine.page(None, 300)
-    window = await engine.pending(3, 9, None, 300)
+    window = await engine.changes_page(3, 9, None, 300)
+    named = await engine.changes_page(3, 9, None, 300, keys=[key(i) for i in range(0, 2100, 7)])
     found = await engine.lookup([key(i) for i in range(0, 2100, 9)])
     import json
 
@@ -739,14 +751,16 @@ async def test_a_record_answers_its_calls_and_nothing_else(io, tmp_path):
     gets = io.metrics.gets
     worker = KeyIndex(worker_io, None, state, OPTS)
     assert await worker.page(None, 300) == page
-    assert await worker.pending(3, 9, None, 300) == window
+    assert await worker.changes_page(3, 9, None, 300) == window
+    assert await worker.changes_page(3, 9, None, 300, keys=[key(i) for i in range(0, 2100, 7)]) == named
+    assert window.keys and set(window.classes) <= {0, 1, 2, 3}  # the classes recorded
     assert await worker.lookup([key(i) for i in range(0, 2100, 9)]) == found
     assert io.metrics.gets == gets
     await worker.page(page[3], 300)  # not recorded: the store
     assert io.metrics.gets > gets
     other = state.slice(3, 9)  # another snapshot: never answered from this one's record
     gets = io.metrics.gets
-    assert await KeyIndex(worker_io, None, other, OPTS).pending(3, 9, None, 300) == window
+    assert await KeyIndex(worker_io, None, other, OPTS).changes_page(3, 9, None, 300) == window
     assert io.metrics.gets > gets
     small = Reads(recording=True, max_entries=100, max_bytes=2**24)
     with pytest.raises(Full):
@@ -1342,10 +1356,10 @@ def test_under_any_budget_and_any_trouble_the_engine_resolves_as_a_cold_reader(
     asyncio.run(run())
 
 
-async def test_pending_pages_stream_what_pending_pages(io):
-    """`pending_pages` reads the commits' files once, through one merge, and
-    yields every entry `pending` gives a page at a time, from any cursor, in
-    pages of any size: deletions, payloads and the newest generation alike."""
+async def test_changes_pages_agree_from_any_cursor(io):
+    """`changes` yields every entry its pages give one at a time, from any
+    cursor, in pages of any size — deletions, payloads, classes and the
+    state at the end alike — and named keys read the same."""
 
     state = await logged_index(io, seed=5)
     rng = random.Random(6)
@@ -1357,12 +1371,22 @@ async def test_pending_pages_stream_what_pending_pages(io):
         index = KeyIndex(io, None, state, OPTS)
         paged, cursor = [], after
         while True:
-            *entries, cursor = await index.pending(lo, hi, cursor, limit)
+            *entries, cursor = await _changes(index, lo, hi, cursor, limit)
             paged += list(zip(*entries, strict=True))
             if cursor is None:
                 break
         streamed = []
-        async for page in KeyIndex(io, None, state, OPTS).pending_pages(lo, hi, after, limit):
-            assert len(page[0]) <= limit
-            streamed += list(zip(*page, strict=True))
+        async for page in KeyIndex(io, None, state, OPTS).changes(lo, hi, after=after, limit=limit):
+            assert len(page.keys) <= limit
+            streamed += list(
+                zip(page.keys, page.classes, page.generations, page.deleted, page.payloads, strict=True)
+            )
         assert streamed == paged
+        named = [e[0] for e in paged[::3]]
+        [point] = [p async for p in KeyIndex(io, None, state, OPTS).changes(lo, hi, keys=named)]
+        assert (
+            list(
+                zip(point.keys, point.classes, point.generations, point.deleted, point.payloads, strict=True)
+            )
+            == paged[::3]
+        )

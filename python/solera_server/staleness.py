@@ -194,12 +194,12 @@ class Staleness:
         behind = False
         with self.m.reading(state.prefix):
             index = KeyIndex(self._key_io(), None, state.slice(lo, hi), self.key_options)
-            pages = index.pending_pages(lo, hi, None, BEHIND_PAGE)  # one merge of the commits
+            pages = index.changes(lo, hi, limit=BEHIND_PAGE)
             try:
-                async for keys, generations, _, _ in pages:
+                async for page in pages:
                     behind = any(
                         taken(key_str(k)) and read.get(key_str(k), -1) < g
-                        for k, g in zip(keys, generations, strict=True)
+                        for k, g in zip(page.keys, page.generations, strict=True)
                     )
                     if behind:
                         break
@@ -378,8 +378,8 @@ class Staleness:
                 with self.m.reading(up_state.prefix):
                     index = KeyIndex(self._key_io(), None, up_state.slice(lo, hi), self.key_options)
                     removed = set()
-                    async for page in index.pending_pages(lo, hi, None, BEHIND_PAGE):
-                        for k, g, gone in zip(page[0], page[1], page[2], strict=True):
+                    async for page in index.changes(lo, hi, limit=BEHIND_PAGE):
+                        for k, g, gone in zip(page.keys, page.generations, page.deleted, strict=True):
                             key = key_str(k)
                             if not taken(key) or read.get(key, -1) >= g:
                                 continue

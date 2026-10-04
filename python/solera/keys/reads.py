@@ -2,7 +2,7 @@
 
 The engine runs an attempt's input reads — the worker's own code — over
 its cache's local copies, with a recording `Reads` on the `ObjectIO`:
-every `KeyIndex` call (`page`, `pending`, `lookup`), its arguments and
+every `KeyIndex` call (`page`, a page of `changes`, `lookup`), its arguments and
 its result are kept, up to the bounds. The record rides the `start` reply;
 the worker runs the same code with the record on its `ObjectIO`, and a
 call found in it for the same pinned index is answered from it — any
@@ -11,7 +11,8 @@ other reads the store.
 A call names its index by the digest of its pinned state, so an answer
 is only ever used for the snapshot it was read from. Results travel as
 `.kx` files (keys, generations, deletions, payloads) — the format
-resolves use, checked as it is decoded.
+resolves use, checked as it is decoded — and a page of `changes` its
+classes beside.
 """
 
 from __future__ import annotations
@@ -22,7 +23,7 @@ import json
 from .. import _native
 from .._native import SortedEntries, encode_file
 
-VERSION = 2
+VERSION = 3
 
 
 class Cold(Exception):
@@ -41,14 +42,33 @@ def _unhex(s: str | None) -> bytes | None:
     return bytes.fromhex(s) if s is not None else None
 
 
+def _digest(keys: list[bytes]) -> str:
+    """Keys, sorted and unique, by their digest."""
+
+    return _native.content_digest(b"".join(len(k).to_bytes(4, "little") + k for k in keys))
+
+
 def _key(identity: str, call: str, args: tuple) -> str:
-    if call == "lookup":  # the keys, sorted and unique, by their digest
-        (keys,) = args
-        packed = b"".join(len(k).to_bytes(4, "little") + k for k in keys)
-        args = (_native.content_digest(packed),)
-    else:
-        args = tuple(_hex(a) if isinstance(a, bytes) else a for a in args)
+    def plain(a):
+        if isinstance(a, bytes):
+            return _hex(a)
+        return _digest(a) if isinstance(a, list) else a
+
+    if call == "lookup":
+        args = (_digest(args[0]),)
+    else:  # a page of `changes`: (first, last, after, limit, keys, until)
+        args = tuple(plain(a) for a in args)
     return json.dumps([identity, call, args], separators=(",", ":"))
+
+
+def _asked(call: str, args: tuple) -> int:
+    """At most how many entries a call returns."""
+
+    if call == "lookup":
+        return len(args[0])
+    if call == "changes" and args[4] is not None:
+        return len(args[4])
+    return args[3] if call == "changes" else args[-1]
 
 
 class Reads:
@@ -72,8 +92,7 @@ class Reads:
         """`Full` before a call is read when what it may return — its limit, or
         the keys it looks up — cannot fit what is left of the record."""
 
-        asked = len(args[0]) if call == "lookup" else args[-1]
-        if self.entries + asked > self.max_entries:
+        if self.entries + _asked(call, args) > self.max_entries:
             raise Full(call)
 
     def decoded_left(self) -> int:
@@ -86,10 +105,14 @@ class Reads:
         one, encoded as it is; `Full` once it would pass the bounds, its
         entries checked before anything is encoded, its bytes after."""
 
-        entries = len(result) if call == "lookup" else len(result[0])
+        entries = len(result) if call == "lookup" else len(result.keys if call == "changes" else result[0])
         if self.entries + entries > self.max_entries:
             raise Full(call)
-        if page is not None:
+        classes = None
+        if call == "changes":
+            keys, classes, nxt = result.keys, result.classes, result.cursor
+            run = encode_file(keys, result.generations, result.deleted, payloads=result.payloads)
+        elif page is not None:
             keys = result[0]
             run = page.encode()
             nxt = result[-1]
@@ -107,19 +130,23 @@ class Reads:
             keys, generations, payloads, nxt = result
             run = encode_file(keys, generations, bytes(len(keys)), payloads=payloads)
         else:
-            keys, generations, deleted, payloads, nxt = result
-            run = encode_file(keys, generations, deleted, payloads=payloads)
+            raise ValueError(f"no record for a {call!r} call")
         if self.entries + len(keys) > self.max_entries or self.bytes + len(run) > self.max_bytes:
             raise Full(call)
         self.entries += len(keys)
         self.bytes += len(run)
-        self.calls[_key(identity, call, args)] = {"run": run, "next": nxt}
+        self.calls[_key(identity, call, args)] = {"run": run, "next": nxt, "classes": classes}
 
     def to_json(self) -> dict:
         return {
             "version": VERSION,
             "calls": [
-                {"key": k, "run": base64.b64encode(c["run"]).decode(), "next": _hex(c["next"])}
+                {
+                    "key": k,
+                    "run": base64.b64encode(c["run"]).decode(),
+                    "next": _hex(c["next"]),
+                    "classes": _hex(c["classes"]),
+                }
                 for k, c in self.calls.items()
             ],
         }
@@ -135,7 +162,11 @@ class Reads:
             return None
         reads = cls()
         for c in d.get("calls") or []:
-            reads.calls[c["key"]] = {"run": base64.b64decode(c["run"]), "next": _unhex(c.get("next"))}
+            reads.calls[c["key"]] = {
+                "run": base64.b64decode(c["run"]),
+                "next": _unhex(c.get("next")),
+                "classes": _unhex(c.get("classes")),
+            }
         return reads
 
     def answer(self, identity: str, call: str, args: tuple):
@@ -152,4 +183,8 @@ class Reads:
             return {k: (g, p) for k, g, p in zip(keys, generations, payloads, strict=True)}
         if call == "page":
             return keys, generations, payloads, c["next"]
-        return keys, generations, deleted, payloads, c["next"]
+        if c["classes"] is None or len(c["classes"]) != len(keys):
+            return None
+        from .index import Changes
+
+        return Changes(list(keys), c["classes"], list(generations), bytes(deleted), list(payloads), c["next"])
