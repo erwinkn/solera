@@ -141,7 +141,8 @@ class Engine(Attempts, Sensors, Staleness, Views):
         self.registry = registry or Registry(ctx, extra=placements)
         # (run id, attempt id) -> its watcher: attempts this process is driving.
         self.watchers = Tasks("attempts")
-        self.tasks = Tasks("engine")  # the engine's own: the sensor host
+        self.tasks = Tasks("engine")  # the eval loop, then the sensor host: _halt stops them so
+        self.fence = Tasks("fence")  # what halts it the moment its state ends
         # Attempts whose end failed: (times, not adopted again before this monotonic time).
         self._crashes: dict[str, tuple[int, float]] = {}
         # attempt id -> set when its run is controlled, so its watcher looks at once.
@@ -150,8 +151,6 @@ class Engine(Attempts, Sensors, Staleness, Views):
         # state — they run no local work and must not starve dispatch (§10).
         self.engine_inflight: set[str] = set()
         self.executor_inflight: dict[str, int] = {}
-        self.runner: asyncio.Task | None = None
-        self._stopping = False
         self.key_options = key_options or Options()
         self._io: ObjectIO | None = None
         # The key cache and resolver (docs/resolved-commits.md §4–§5): where
@@ -277,60 +276,43 @@ class Engine(Attempts, Sensors, Staleness, Views):
         adopts the attempts launched before a restart: their workers keep
         running, and this engine waits for them and commits their results (§8)."""
 
-        self._stopping = False
         if self.keys is not None:
             try:
                 self.keys.start()
             except Exception as e:  # an accelerator: without it, workers resolve their writes
                 log.warning("key cache disabled: %s", e)
-        self.runner = asyncio.create_task(self._loop())
+        self.tasks.every(
+            "engine", self.eval_interval, self.tick, failing=self.failing, wake=self.state.changed
+        )
+        self.fence.spawn(self._fenced())
         self.upkeep.start()
         self.history.start()
         self._start_sensor_host()
 
     async def stop(self):
-        self._stopping = True
-        if self.runner:
-            self.runner.cancel()
-            try:
-                await self.runner
-            except asyncio.CancelledError:
-                pass
-            self.runner = None
+        await self.fence.close()
+        await self._halt()
+
+    async def _fenced(self) -> None:
+        """Replaced (or broken): its successor owns everything now. The
+        handlers' own authority checks stay: a cancel reaches a task only at
+        its next await."""
+
+        await self.state.ended.wait()
+        log.warning("this engine lost the namespace's writer ownership: it stops acting")
         await self._halt()
 
     async def _halt(self) -> None:
-        """Stop acting: the sensor worker, the attempts' watchers, upkeep. The
-        workers themselves keep running; whoever owns the namespace next
-        adopts them."""
+        """Stop acting: the eval loop, the sensor host, the attempts'
+        watchers, upkeep, the history, the key cache. The workers themselves
+        keep running; whoever owns the namespace next adopts them."""
 
-        await self._stop_sensor_host()
+        await self.tasks.close()  # the eval loop, then the sensor host (its child stopped)
         await self.watchers.close()  # launched attempts keep running: the next engine adopts them
         await self.upkeep.stop()
         await self.history.stop()
         if self.keys is not None:
             await self.keys.stop()
-
-    async def _loop(self):
-        """Tick whenever state changes — a submit, a finished attempt, the
-        tick's own events — and every `eval_interval` for what comes due
-        with time: retries, schedules, timeouts."""
-
-        while not self._stopping:
-            if self.state.poisoned:  # replaced (or broken): its successor owns everything now
-                log.warning("this engine lost the namespace's writer ownership: it stops acting")
-                self._stopping = True
-                await self._halt()
-                return
-            self.state.changed.clear()
-            try:
-                await self.tick()
-                self.failing.pop("engine", None)
-            except Exception as error:
-                self.failing["engine"] = f"{type(error).__name__}: {error}"
-                log.exception("engine tick failed")
-            with contextlib.suppress(TimeoutError):
-                await asyncio.wait_for(self.state.changed.wait(), self.eval_interval)
 
     async def tick(self):
         """One evaluation pass: adoption, dispatch, automations, archiving."""

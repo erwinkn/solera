@@ -308,13 +308,6 @@ class Sensors:
             return
         self.tasks.spawn(self._keep_host(), key="sensor host")
 
-    async def _stop_sensor_host(self) -> None:
-        host = self.tasks.get("sensor host")
-        if host is not None:
-            host.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await host
-
     async def _keep_host(self) -> None:
         """Keep the local host running: restarted with backoff if it exits.
         (A host process replaces itself after `max_ticks`, or a tick that

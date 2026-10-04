@@ -123,6 +123,7 @@ class Journal:
         self.engine: str | None = None
         self.checkpoint: str | None = None  # the checkpoint the journal names
         self.stopped: Stopped | None = None  # why this journal writes no more
+        self.ended = asyncio.Event()  # set with `stopped`: what its engine halts on at once
         self._etag: str | None = None  # of this engine's last write
         self._events: list[bytes] = []  # encoded, every event since `checkpoint`: the journal's
         self._events_bytes = 0
@@ -188,6 +189,7 @@ class Journal:
             replayed = len(self._events)
             if not writer:
                 self.stopped = Stopped("opened read-only")
+                self.ended.set()
                 return OpenResult(engine=None, replayed=replayed, checkpoint=checkpoint)
             engine = secrets.token_hex(8)  # no two processes share one (§10)
             try:
@@ -376,6 +378,7 @@ class Journal:
 
     def _fail(self, error: Stopped) -> None:
         self.stopped = error
+        self.ended.set()
         for _, waiter in self._waiters:
             if not waiter.done():
                 waiter.set_exception(error)

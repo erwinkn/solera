@@ -1068,3 +1068,46 @@ async def test_a_removed_assets_launched_attempt_is_not_retried(tmp_path):
     assert detail["request"]["status"] == "failed" and Remote.launches == [attempt]
     await engine.stop()
     await state.close()
+
+
+async def test_a_fenced_engine_halts_at_once_not_at_its_next_tick(tmp_path):
+    """The audit's P5: a successor fences the journal; the engine learns at its
+    next write, and halts then, its eval loop, sensor host and attempt
+    watchers stopped, not up to `eval_interval` later (an hour here)."""
+
+    url = tmp_path.as_uri()
+    held = asyncio.Event()
+
+    @asset
+    async def slow():
+        await held.wait()
+        return [1]
+
+    project = Project(assets=[slow])
+    state = await State.open(url, "test", flush_interval=0.001)
+    engine = Engine(
+        state,
+        project.manifest,
+        placements={"Local": lambda s, c: InlinePlacement(c, project)},
+        eval_interval=3600,
+    )
+    await engine.initialize()
+    await engine.start()
+    await engine.submit(["slow"])
+    for _ in range(3000):
+        if len(engine.watchers):
+            break
+        await asyncio.sleep(0.02)
+    assert len(engine.watchers) == 1 and "engine" in engine.tasks
+    successor = await State.open(url, "test", flush_interval=0.001)  # takes the namespace
+    await engine.submit(["slow"])  # its next write finds the journal fenced
+    await asyncio.wait_for(state.ended.wait(), 60)
+    for _ in range(500):
+        if not len(engine.watchers) and "engine" not in engine.tasks:
+            break
+        await asyncio.sleep(0.01)
+    assert not len(engine.watchers) and "engine" not in engine.tasks, "halted at once"
+    held.set()
+    await engine.stop()
+    await state.close()
+    await successor.close()

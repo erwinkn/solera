@@ -145,6 +145,13 @@ class State:
     def poisoned(self) -> bool:
         return self.journal.stopped is not None or self.broken is not None
 
+    @property
+    def ended(self) -> asyncio.Event:
+        """Set once this state writes no more — fenced by a successor, a write
+        that cannot land, or broken: its engine halts on it at once."""
+
+        return self.journal.ended
+
     def record(self, *events: dict, lazy: bool = False) -> None:
         """Apply events to the model now, and make them durable in the
         background: the one way state changes. A `lazy` event waits for the
@@ -183,6 +190,7 @@ class State:
 
         self.broken = error
         self.journal.stop_checkpoints()
+        self.journal.ended.set()
         log.critical(
             "state failed applying an event (%r): exiting for the journal replay to recover it", error
         )
