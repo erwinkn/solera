@@ -410,7 +410,7 @@ async def _resolve_inputs(spec, project, asset, keys_io, timeline, observed: Obs
             # Classes follow the index, rows the store (D100): a key a current-only store
             # no longer has is delivered in its class with no row — its removal is a later
             # commit, which a later batch delivers — unless the head still names it: then
-            # the store is behind (F33), SourceBehind.
+            # the store is behind its index: SourceBehind.
             await each.gone_since(ref.output, key, args[param], upserted, pin, keys_io)
             batch[param] = Batch(
                 rows=args[param],
@@ -463,7 +463,7 @@ async def _load_whole(load, store, ref, t, keys_io, index_json, key: str | None 
     from the live entries of its pinned index (`Keys`), since a listing would
     also show superseded and abandoned ones (docs/lifecycle.md §9.8): it is
     loaded a page of the index at a time, and the pages put together. Every
-    key the index names must come back (`check_loaded`, F33)."""
+    key the index names must come back (`check_loaded`)."""
 
     if index_json is None or store.writes != "immutable":
         return await load(store, ref, t, None)

@@ -473,7 +473,7 @@ class Attempts:
         await self.state.create_object(f"{base}{lifecycle.SPEC}", json.dumps(spec).encode())
         # Its control file, before the launch: a worker never creates it, so one that
         # finds none stops (§2.4). An engine replaced before `AttemptLaunched` is
-        # durable leaves the file `open`, and no worker ever learns of it (F26).
+        # durable leaves the file `open`, and no worker ever learns of it.
         opened = lifecycle.control(lifecycle.OPEN, engine=self.state.journal.engine)
         await self.state.create_object(f"{base}{lifecycle.CONTROL}", opened)
         if self.keys is not None:  # what `start` answers its reads from (resolved-commits.md §7)
@@ -497,7 +497,7 @@ class Attempts:
             needs = {k: v for k in ("cpu", "memory", "gpu") if (v := execution["options"].get(k)) is not None}
             event["pool"] = {"name": execution["executor"], "needs": needs}
         # Launch only what a restarted engine would adopt, never an orphan: until the
-        # launch is durable, pool discovery does not offer it either (F26). If it never
+        # launch is durable, pool discovery does not offer it either. If it never
         # is (this engine was replaced), it never is offered.
         live.launching = True
         self.state.record(event)
@@ -552,7 +552,7 @@ class Attempts:
     async def _watch(self, task_id: str, attempt: str, placement, handle, adopted=False):
         """Follow a launched attempt to its end (`_follow`). A control file no
         writer of this version would write fails it, retryably, as lost: the
-        engine ends the file on its version, so no worker writes after (F30)."""
+        engine ends the file on its version, so no worker writes after."""
 
         try:
             return await self._follow(task_id, attempt, placement, handle, adopted)
@@ -601,7 +601,7 @@ class Attempts:
             await self._read_worker(run_id, attempt, live, read_at)
         if self.m.earlier_life(task):
             # Its asset was removed since its launch: nothing it builds can commit, and
-            # its partition waits for it, so it ends now, as any attempt ends (F39).
+            # its partition waits for it, so it ends now, as any attempt ends.
             if handle is not None:
                 await self._cancel(placement, handle)
             return await self._fail(

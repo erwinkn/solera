@@ -79,7 +79,7 @@ impl<'a> Run<'a> {
 
 /// One key's versions, newest first, taken one at a time: what a reader
 /// or a merge keeps of a key is its fold's state, never every version the
-/// key holds (A17 R10: one hot key may hold a version per live endpoint).
+/// key holds (one hot key may hold a version per live endpoint).
 pub trait Fold {
     fn push(&mut self, v: Version) -> Result<()>;
 }
@@ -396,7 +396,7 @@ impl Fold for At {
 }
 
 /// Whether generation `g` lies below `bound`; None bounds nothing (the
-/// head). `Some(u64::MAX)` is an exclusive bound like any other (A17 R9).
+/// head). `Some(u64::MAX)` is an exclusive bound like any other.
 pub fn older(g: u64, bound: Option<u64>) -> bool {
     bound.is_none_or(|b| g < b)
 }

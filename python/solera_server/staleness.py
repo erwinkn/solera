@@ -95,7 +95,7 @@ class Staleness:
         if self._each_input(asset) is None:
             return cheap
         # Never fresh while its record is behind its whole and dep inputs, or says none: the
-        # keys then all owe the full pass, whatever a scan finds (F37's backstop).
+        # keys then all owe the full pass, whatever a scan finds.
         seen = self.m.partition(asset, partition).get("seen")
         versioned = [i for i in inputs if self._versioned(i)]
         if versioned and (
@@ -104,7 +104,7 @@ class Staleness:
             return True
         # K38: an each=True partition is stale exactly when one of its keys is. The partition's
         # own records filter (a pass its definition made due excuses them, so it is checked
-        # too); the keys confirm, the scan run only then, so roll-ups stay cheap (F35).
+        # too); the keys confirm, the scan run only then, so roll-ups stay cheap.
         if not cheap and not definition:
             return False
         return bool(await self._each_own(asset, partition, planner, inputs, INPUT))
@@ -133,7 +133,7 @@ class Staleness:
     async def upstream_stale(self, asset: str, partition: str, planner, inputs, memo: dict) -> bool:
         """A partition it reads is itself stale, to any depth (K46). Along an
         each chain, only through a stale upstream key its patterns take: a
-        key depends on its own upstream key and nothing else (A19 R10)."""
+        key depends on its own upstream key and nothing else."""
 
         each = self._each_input(asset)
         for input in inputs:
@@ -369,7 +369,7 @@ class Staleness:
         if only == DEFINITION:
             held = [(k, g) async for k, g, _ in _entries(self, self.m.indexes.get((output, partition)))]
             old = [k for k, g in held if g < changed]
-            # A key the patterns no longer take is owed its removal (A19 R9).
+            # A key the patterns no longer take is owed its removal.
             dropped = {k for k, _ in held if not taken(k)}
             return ({k for k in old if taken(k)} & await self._holds(up_state, old)) | dropped
         input_only = only == INPUT

@@ -857,7 +857,7 @@ class KeyIndex:
         when done). Each span is read lazily from the block holding `after`,
         as far as the page needs: a key whose versions run across blocks and
         files is followed to its end, so every page but the last advances,
-        holding a few segments and one key's fold (A17 R2, R10)."""
+        holding a few segments and one key's fold."""
 
         job = Merge.read(len(spans), after=after, limit=limit, **read)
         readers = [_Lazy(self, files, after, limit + 1) for files in spans]
@@ -1124,7 +1124,7 @@ class KeyIndex:
     async def drops_enough(self, plan: tuple[int, int], endpoints: set[int]) -> bool:
         """Whether a span rewritten alone would drop a quarter of its entries
         (the guard's other half), counted by its merge writing nothing: a
-        rewrite that would not is never uploaded (A17 R7)."""
+        rewrite that would not is never uploaded."""
 
         job, ins, _, _, runs = self._merge_job(plan, endpoints)
         await self._run(job, runs, None)

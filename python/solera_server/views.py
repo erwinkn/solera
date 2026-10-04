@@ -29,7 +29,7 @@ class Views:
         input changed since it read it, an upstream it reads is itself stale,
         or its definition changed; `staleness.py`), `running` (a task is pending),
         `failed` (its last outcome failed, was canceled or blocked, and nothing
-        is pending: failing, not stale — F38; its `reasons` too if stale), `missing`,
+        is pending: failing, not stale; its `reasons` too if stale), `missing`,
         or `removed` (no longer a current key). A job has no head: it is
         materialized when its last outcome succeeded. `every` lists every
         current partition, enumerated — refused past `MAX_PARTITIONS`; else

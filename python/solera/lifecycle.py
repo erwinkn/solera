@@ -75,7 +75,7 @@ FIELDS = {
 
 def check_control(data: bytes, etag: str) -> dict:
     """A control file's body, or `Malformed`: a JSON object in a known state,
-    with what that state adds and no field it cannot have (F32: an `open`
+    with what that state adds and no field it cannot have (an `open`
     file naming a worker would have the engine wait on one that never was)."""
 
     try:

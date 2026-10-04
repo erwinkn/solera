@@ -91,12 +91,12 @@ def _batches(keys: int, limit: int) -> int:
 
 def _dep_restart(position: dict | None, shared: dict | None) -> bool:
     """Whether a whole or dep input at another version than the partition
-    caught up to (`shared["caught_up"]`; none recorded counts as another,
-    F37) makes this input start a full pass over: unless its last full pass
+    caught up to (`shared["caught_up"]`; none recorded counts as another)
+    makes this input start a full pass over: unless its last full pass
     began under the versions as they are now (`seen` on the position, kept
     after the pass ends) — under way, it continues; done, what is left (a
     per-key reconcile) finishes it. Judged on the versions a pass began
-    under, never on the order of commits (A19 R7)."""
+    under, never on the order of commits."""
 
     if not shared or not shared["now"] or shared["caught_up"] == shared["now"] or position is None:
         return False
@@ -566,7 +566,7 @@ class Engine(Attempts, Sensors, Staleness, Views):
         executor_used = dict(self.executor_inflight)
         # Partitions of each asset claimed now, of its current life: what concurrency= caps.
         # An earlier life's attempt holds no name, but its partition stays its own until
-        # it is ended (F39): two attempts never own one partition's files at once.
+        # it is ended: two attempts never own one partition's files at once.
         asset_used: dict[str, int] = {}
         retiring: dict[tuple, str] = {}
         for claim, claimed in ((c, self.m.task(t)) for t, c in self.m.claims.items()):
@@ -865,7 +865,7 @@ class Engine(Attempts, Sensors, Staleness, Views):
             self._crashes.pop(attempt, None)
         except Exception:
             # It could not be ended either (its store unreachable, say): adopted again,
-            # but after a back-off, never in a loop (F30; F20's lesson).
+            # but after a back-off, never in a loop.
             times, _ = self._crashes.get(attempt, (0, 0.0))
             wait = min(60.0, 0.5 * 2**times)
             self._crashes[attempt] = (times + 1, asyncio.get_running_loop().time() + wait)
@@ -944,7 +944,7 @@ class Engine(Attempts, Sensors, Staleness, Views):
         # The whole and dep inputs as pinned now, against those the partition last caught
         # up to: one moved since makes a full pass due (semantic change d), from its commit.
         # Never caught up, no record says what it saw: their latest commit, so a pass begun
-        # before it starts over and redoes what it wrote under the old ones (F37).
+        # before it starts over and redoes what it wrote under the old ones.
         seen = {i.param: self._input_version(planner, i) for i in inputs if self._versioned(i)}
         recorded = self.m.partition(task["asset"], partition).get("seen")
         shared = {"now": seen, "caught_up": recorded}
@@ -1039,7 +1039,7 @@ class Engine(Attempts, Sensors, Staleness, Views):
             outputs[name] = info
         if claim is not None:
             # What its spec hands it is read from now, not from `AttemptLaunched` on: another
-            # attempt's acknowledgement meanwhile must not let collection take it (F36).
+            # attempt's acknowledgement meanwhile must not let collection take it.
             claim["cleanups"] = _delta_files(
                 d for info in outputs.values() for d in info.get("cleanup") or ()
             )
@@ -1218,7 +1218,7 @@ class Engine(Attempts, Sensors, Staleness, Views):
           any read-ahead entry, with the pass as its base.
         - A pattern change under way: the named keys merged, recorded like any
           read-ahead entry, which the old patterns' delta and the membership diff
-          consult (A19 R4).
+          consult.
 
         Either plain kind collapses the record once nothing under the patterns
         is left undelivered (`covers`, the worker's)."""
@@ -1227,7 +1227,7 @@ class Engine(Attempts, Sensors, Staleness, Views):
         each = input.get("each") is not None
         index = self.m.index(output, upstream_partition)
         head_commit = int((self.m.heads.get((output, upstream_partition)) or {}).get("commit_number", -1))
-        # Paged by batch_size (A19 R6, D80): one attempt, one commit and its keys at
+        # Paged by batch_size (D80): one attempt, one commit and its keys at
         # once per page; the task keeps where the selection is.
         named = sorted({str(k) for k in override["keys"]})
         done = (task.get("selected") or {}).get(output)
@@ -1255,7 +1255,7 @@ class Engine(Attempts, Sensors, Staleness, Views):
         if fresh and (position.get("patterns") != input.get("patterns") or "pattern_change" in position):
             # A pattern change decides membership first: the named keys merged, and recorded
             # like any read-ahead, so neither the old patterns' delta nor the membership diff
-            # delivers them again (A19 R4, D93); the change goes on as it was. A named key is
+            # delivers them again (D93); the change goes on as it was. A named key is
             # updated if the consumer held it: the old patterns took it at `next` (K44).
             held_at = position.get("next")
             pin["batch"]["held_at"] = {
@@ -1273,7 +1273,7 @@ class Engine(Attempts, Sensors, Staleness, Views):
             pin["batch"].update({"from": lo, "to": head_commit})  # nothing past `next` when lo > head
             if lo <= head_commit:
                 pin["index"] = index.slice(lo, head_commit).to_json()
-                pin["head"] = index.slice().to_json()  # what a missing key is decided against (F38)
+                pin["head"] = index.slice().to_json()  # what a missing key is decided against
             plan["position"] = position
             return pin, plan, not keys or lo > head_commit
         if fresh:  # a full pass under way: continued, never started over
@@ -1470,7 +1470,7 @@ class Engine(Attempts, Sensors, Staleness, Views):
                         "count": current["batches"],
                     },
                 }
-                if ahead:  # what selections merged meanwhile: not delivered again (A19 R4)
+                if ahead:  # what selections merged meanwhile: not delivered again
                     pin["ahead"] = ahead
                 if carried["patterns"] is None:
                     carried.pop("patterns")
@@ -1538,7 +1538,7 @@ class Engine(Attempts, Sensors, Staleness, Views):
             else _snapshot_read(index, int(current["from"]), latest_generation)
         )
         pin = {"ref": {**ref, "generation": read}, "index": pinned.to_json(), "batch": batch}
-        if not whole:  # a delta's slice: a key missing from the store is decided against the head (F38)
+        if not whole:  # a delta's slice: a key missing from the store is decided against the head
             pin["head"] = index.slice().to_json()
         if ahead and not reset:  # what keys= runs read ahead, past `next` or within this pass: skipped (K45)
             pin["ahead"] = ahead
@@ -1661,7 +1661,7 @@ class Engine(Attempts, Sensors, Staleness, Views):
                 index = self.m.index(input["output"], upstream_partition)
                 if index.covers(int(position["next"]), latest):
                     # What the next delta will deliver: a due key it provably does is left to
-                    # it; any other retries at its current version (A19 R8).
+                    # it; any other retries at its current version.
                     pin["batch"]["retry"]["delta"] = {
                         "from": int(position["next"]),
                         "to": latest,
@@ -1747,7 +1747,7 @@ class Engine(Attempts, Sensors, Staleness, Views):
             if after is None:  # the pass is complete: its accumulators are the exact bounds
                 due, deploy_min = retry["due_acc"], retry["deploy_acc"]
                 commit.update({"passes": retry["pass"], "done_forced": retry["forced_at"], "retry": None})
-                # A pass of changes under way, or pending, is never dropped (F31).
+                # A pass of changes under way, or pending, is never dropped.
                 more = bool(batch.get("changes")) or forced_after or outstanding(plan.get("position") or {})
             else:
                 commit["retry"] = {**retry, "after": after}
@@ -1791,7 +1791,7 @@ class Engine(Attempts, Sensors, Staleness, Views):
         included, without patterns and batch size — and the run's config):
         the interpretation its positions were delivered under; a change
         resets them (§2.2, §6), so binding an input to another output makes
-        a full pass due (A19 R7). Not its inputs' versions: a whole or dep input that
+        a full pass due. Not its inputs' versions: a whole or dep input that
         moves is an input change, which makes a full pass due through the
         partition record's `seen` (semantic change d). Neither which store
         holds an output nor its name is in it, only the versions: a move
@@ -2603,7 +2603,7 @@ class Engine(Attempts, Sensors, Staleness, Views):
             out.append(view)
         claim = self.m.claims.get(task["id"]) if live else None
         if claim:
-            launching = getattr(self.live.get(claim["attempt"]), "launching", False)  # not durable yet (F26)
+            launching = getattr(self.live.get(claim["attempt"]), "launching", False)  # not durable yet
             out.append(
                 {
                     "id": claim["attempt"],

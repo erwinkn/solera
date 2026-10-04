@@ -417,7 +417,7 @@ class Model:
             # Not durable until its launch is: an engine replaced before then leaves
             # the number to the next one, which may hand it out again. Harmless only
             # because nothing outside learns of an attempt before its launch is
-            # durable (F26), so no write was made under it.
+            # durable, so no write was made under it.
             "generation": self.event_counter,
             "status": "running",
         }
@@ -520,7 +520,7 @@ class Model:
             ),
         }
         self.attempts[attempt] = task["id"]
-        if not self.earlier_life(task):  # it holds no name a later life may claim (F34)
+        if not self.earlier_life(task):  # it holds no name a later life may claim
             self.claimed_partitions[(task["asset"], task["partition"])] = attempt
         self.queue.pop(task["id"], None)
         if pool is not None:  # discoverable until it ends; its claim is the worker's (§10)
@@ -539,7 +539,7 @@ class Model:
         """The live claim behind an attempt. The claim decides, not
         `claimed_partitions`: that index gates dispatch for an asset's
         current life only, while an earlier life's attempt, still in flight
-        after a reset, must settle all the same (F34)."""
+        after a reset, must settle all the same."""
 
         task_id = self.attempts.get(attempt)
         claim = self.claims.get(task_id) if task_id else None
@@ -549,8 +549,8 @@ class Model:
 
     def earlier_life(self, task: dict) -> bool:
         """Whether a task's launched attempt is of an earlier life of its
-        asset: launched before the deploy that removed the asset (F12's
-        rule, the commit's: it commits nothing of the new one)."""
+        asset: launched before the deploy that removed the asset (the
+        commit's rule: it commits nothing of the new one)."""
 
         deploy = ((task.get("launched") or {}).get("prepared") or {}).get("deploy_number")
         return deploy is not None and self.reset_at.get(("asset", task["asset"]), 0) > deploy
@@ -673,7 +673,7 @@ class Model:
                             del self.pending[(old, partition)]
                         self.pending.setdefault((new, partition), set()).add(tid)
                     if (old, partition) in self.claimed_partitions:
-                        # Never over a claim still held (F34): an earlier life's left the index
+                        # Never over a claim still held: an earlier life's left the index
                         # at its reset, so only two live assets merged by a rename meet here,
                         # and the one already under the name keeps it.
                         holder = self.claimed_partitions.pop((old, partition))
@@ -783,7 +783,7 @@ class Model:
         for asset in assets_before - set(assets):
             self.reset_at[("asset", asset)] = self.deploy_number
             # Its attempts in flight are an earlier life's now: they settle (and commit
-            # nothing), but no longer hold the name a later life may claim (F34).
+            # nothing), but no longer hold the name a later life may claim.
             for key in [k for k in self.claimed_partitions if k[0] == asset]:
                 del self.claimed_partitions[key]
         reset = {
@@ -1538,7 +1538,7 @@ class Model:
 
     def merge_record(self, key: tuple, life: str) -> dict:
         """What merges of this index's life `life` tried: another life's count
-        for nothing (A17 R8)."""
+        for nothing."""
 
         rec = self.merges.get(key)
         return (
@@ -1705,7 +1705,7 @@ class Model:
 
 
 def declaration(manifest: dict, asset: str, homes: dict | None = None) -> dict:
-    """An asset's definition, in its one canonical form (A19 R7): what its
+    """An asset's definition, in its one canonical form: what its
     outputs are built under. Its version; its inputs and deps — what each
     reads, by that output's home, so a rename changes nothing; how (kind,
     flags, patterns, batch size); and its store's version; its outputs'

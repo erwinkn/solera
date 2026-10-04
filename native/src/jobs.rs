@@ -128,7 +128,7 @@ impl Join {
 /// Each key's versions across runs (newest first), gathered run by run as
 /// the runs are fed: a key's versions may run across blocks, segments and
 /// files, and a run starved mid-key asks for its next segment. One version
-/// at a time: nothing holds a key's whole history (A17 R10).
+/// at a time: nothing holds a key's whole history.
 #[derive(Default)]
 struct Gather {
     key: Option<Vec<u8>>,
@@ -315,7 +315,7 @@ enum Folding {
 /// streams by (`spans::Changed`, `spans::At`), until `limit` keys are kept
 /// and one more key is seen, or the runs end. A key's versions may run
 /// across blocks and files: the page asks for what it lacks and never
-/// stops inside a key, so every page but the last advances (A17 R2), and
+/// stops inside a key, so every page but the last advances, and
 /// it holds a few segments and one key's fold, whatever the key's history.
 pub struct SpanRead {
     pub merge: Merge,

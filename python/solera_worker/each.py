@@ -152,7 +152,7 @@ async def read_batch(pin: dict, keys_io) -> Batch:
             key = key_str(entry[0])
             before, now = old(key), new(key)
             if now and not before and read_at.get(key, -1) >= entry[1]:
-                return None  # a selection merged it meanwhile, at this version (A19 R4)
+                return None  # a selection merged it meanwhile, at this version
             return "added" if now and not before else "removed" if before and not now else None
 
         page, after, read = await _fill(whole, start, limit, changed)
@@ -233,7 +233,7 @@ async def _covers(index, taken, named: set[str], read_at: dict, walked: dict | N
     been delivered within it: named now, read ahead at or after its version,
     or walked by the pass's own batches (at or before `walked["at"]`, at a
     generation they read). A key removed after the snapshot is the next
-    delta's, which delivers its removal (A19 R3)."""
+    delta's, which delivers its removal."""
 
     after = None
     while True:
@@ -268,10 +268,10 @@ async def _holds_only(held, index, taken, named: set[str]) -> bool:
 
 async def gone_since(output: str, key: str | None, value, expected: dict, pin: dict, keys_io) -> list[str]:
     """The keys of a batch a load by `Keys(expected)` did not answer, decided
-    against the source's head index, not the pass's commit (F38): a store of
+    against the source's head index, not the pass's commit: a store of
     current rows serves only its newest state. A key the head still names
     the store lacks: the store is behind its index, `SourceBehind`,
-    retryable and bounded (F33). One the head lacks too was removed since:
+    retryable and bounded. One the head lacks too was removed since:
     returned. A plain batch still delivers it in its class, with no row
     (D100); a per-key batch drops its outputs now, which its own index
     makes harmless to do twice."""
@@ -328,7 +328,7 @@ async def read_each_batch(spec: dict, pin: dict, keys_io) -> Batch:
     current = await upstream.lookup([key_bytes(k) for k in due]) if due else {}
     taken = Matcher(pin.get("patterns"))
     # A due key written since it failed is left to the next delta only if that delta
-    # delivers it: a write that nets out (v1 -> v2 -> v1) delivers nothing (A19 R8).
+    # delivers it: a write that nets out (v1 -> v2 -> v1) delivers nothing.
     moved = [k for k in due if (e := current.get(key_bytes(k))) is not None and e[0] != walked[k].upstream]
     delta, owed = pin["batch"]["retry"].get("delta"), set()
     if moved and delta is not None:

@@ -104,7 +104,7 @@ class Upkeep:
         index whose merges of one input set were uploaded `MERGE_ATTEMPTS`
         times in its current life, none published, merges no more, alarmed:
         the count is durable (`Model.merges`), so neither a restart nor a
-        takeover resets it, and a new life starts afresh (A17 R8)."""
+        takeover resets it, and a new life starts afresh."""
 
         for key, index in list(self.m.indexes.items()):
             if len(self.jobs) >= self.concurrency:
@@ -144,7 +144,7 @@ class Upkeep:
         if the index is still the life it was planned against and holds its
         inputs; else its output is deleted. A span rewritten alone is first
         counted without uploading: if it would drop too little, that is
-        remembered and nothing is uploaded (A17 R7). Every upload is counted,
+        remembered and nothing is uploaded. Every upload is counted,
         durably, before it starts. Writes are exact, so a merge lets go of no
         object the deltas did not already list."""
 

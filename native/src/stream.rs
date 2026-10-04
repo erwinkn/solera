@@ -165,7 +165,7 @@ pub struct Block {
 }
 
 impl Block {
-    /// A block decoded: at most `MAX_BLOCK_BYTES`, else `Error::Limit` (F29).
+    /// A block decoded: at most `MAX_BLOCK_BYTES`, else `Error::Limit`.
     pub fn decode(data: &[u8], codec: u8) -> Result<Block> {
         Block::decode_at_most(data, codec, MAX_BLOCK_BYTES)
     }

@@ -24,7 +24,7 @@ class WriteError(StoreError):
 
 
 class SourceBehind(StoreError):
-    """A load by `Keys` answered without a key the index names (F33): a
+    """A load by `Keys` answered without a key the index names: a
     source read as it is now no longer holds a key its commits say it has.
     Nothing is delivered; the attempt retries under its budget, and the
     source's next commit, removing or restoring the key, settles it."""

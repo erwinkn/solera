@@ -14,7 +14,7 @@ use crate::stream::{Block, Bytes, Merge, Next, Segment, Writer};
 
 pub const MAGIC: &[u8; 4] = b"CKX1";
 pub const FORMAT_VERSION: u16 = 4;
-/// The most bytes a block may decode to (F29): writers close a block near
+/// The most bytes a block may decode to: writers close a block near
 /// `block_size` (64 KiB by default), so this bounds every reader, including
 /// those handed a bare block, and a block past it fails fast.
 pub const MAX_BLOCK_BYTES: u64 = 16 << 20;
