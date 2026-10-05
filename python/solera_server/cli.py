@@ -57,7 +57,7 @@ def _reads(args) -> bool:
     command, action = args.command, getattr(args, "runs_command", None)
     if command == "runs":
         return action is None or (action == "prune" and args.dry_run)
-    if command == "cleanups":
+    if command in ("cleanups", "merges"):
         return not args.clear
     if command == "automations":
         return not args.action
@@ -191,6 +191,15 @@ def _main():
     cleanups.add_argument("output")
     cleanups.add_argument("partition", nargs="?", default="")
     cleanups.add_argument("--clear", action="store_true", help="Forget the stuck entries; their objects stay")
+    merges = commands.add_parser(
+        "merges",
+        help="A key index's failed merges, and when upkeep tries them again (docs/key-index-design.md § Compaction)",
+    )
+    merges.add_argument("output")
+    merges.add_argument("partition", nargs="?", default="")
+    merges.add_argument(
+        "--clear", action="store_true", help="Forget what its merges tried: try them again at once"
+    )
 
     stale = commands.add_parser(
         "stale", help="Whether an asset's partition is stale, why, and its stale keys", parents=[common]
@@ -514,6 +523,16 @@ async def _remote(args, parser):
             response = await client.post(f"{base}/cleanups:clear", json=body)
             response.raise_for_status()
             print(json.dumps(response.json(), indent=2))
+        elif args.command == "merges" and args.clear:
+            body = {"output": args.output, "partition": args.partition, "by": "cli"}
+            response = await client.post(f"{base}/merges:clear", json=body)
+            response.raise_for_status()
+            print(json.dumps(response.json(), indent=2))
+        elif args.command == "merges":
+            params = {"partition": args.partition}
+            response = await client.get(f"{base}/outputs/{args.output}/merges", params=params)
+            response.raise_for_status()
+            print(json.dumps(response.json(), indent=2))
         elif args.command == "cleanups":
             response = await client.get(f"{base}/cleanups")
             response.raise_for_status()
@@ -610,6 +629,13 @@ async def _local(args, parser):
                 done(args.output, args.partition, "cli")
                 if done
                 else runtime.partition_cleanups(args.output, args.partition)
+            )
+            print(json.dumps(view, indent=2))
+        elif args.command == "merges":
+            view = (
+                runtime.clear_merges(args.output, args.partition, "cli")
+                if args.clear
+                else runtime.merges_view(args.output, args.partition)
             )
             print(json.dumps(view, indent=2))
         elif args.command == "keys":

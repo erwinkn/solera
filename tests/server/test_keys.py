@@ -458,23 +458,45 @@ async def test_a_fenced_engine_never_deletes_what_only_its_unflushed_merge_let_g
     await b.close()
 
 
-async def test_a_merge_that_keeps_failing_stops_and_alarms_across_restarts(tmp_path, monkeypatch):
-    """docs/key-index-design.md § Compaction: 3 attempts per input set;
-    after the third, none published, the index stops merging, alarmed.
-    A17 R8: the count is durable, recorded before each upload — a restart
-    or a takeover does not give the same inputs three more — and keyed by
-    the index's life, so a new life merges afresh."""
+async def _rounds(upkeep, n=6):
+    """`n` rounds of upkeep's merges, each waited for."""
+
+    for _ in range(n):
+        upkeep._checked.clear()
+        upkeep.maintain()
+        await asyncio.gather(*upkeep.jobs.values(), return_exceptions=True)
+
+
+async def _layered(state, n=4):
+    """An engine whose `items` index holds `n` + 1 unmerged layers, upkeep's
+    rounds left to the test."""
+
+    rows = [{"id": "a"}]
+    engine = engine_for(state, items_project(rows))
+    await engine.initialize()
+    for i in range(n):
+        rows.append({"id": f"k{i}"})
+        await run(engine, ["items"])
+    await engine.upkeep.tasks.close()  # the rounds are the test's own
+    return engine, rows
+
+
+async def test_a_merge_that_keeps_failing_backs_off_and_resumes(tmp_path, monkeypatch):
+    """docs/key-index-design.md § Compaction: 3 uploads per input set, none
+    published, then the index backs off, alarmed — 10 minutes, doubling —
+    and tries again, until a merge publishes. A17 R8: the count is durable,
+    recorded before each upload, so a restart or a takeover does not give
+    the same inputs three more; a new life merges afresh."""
+
+    from solera_server import upkeep as upkeep_module
 
     url = tmp_path.as_uri()
     a = await State.open(url, "test", flush_interval=0.001)
-    rows = [{"id": "a"}]
-    engine = engine_for(a, items_project(rows))
-    await engine.initialize()
-    for n in range(4):
-        rows.append({"id": f"k{n}"})
-        await run(engine, ["items"])
-    await engine.upkeep.tasks.close()  # the rounds below are this test's own
+    engine, rows = await _layered(a)
+    now = [1000.0]
+    engine.upkeep.clock = lambda: now[0]
     calls = []
+    real = LayerIndex.merge
 
     async def broken(self, lo, count, **_):
         calls.append(self.state.attempt_key(self.state.layers[lo : lo + count]))
@@ -482,16 +504,20 @@ async def test_a_merge_that_keeps_failing_stops_and_alarms_across_restarts(tmp_p
 
     monkeypatch.setattr(LayerIndex, "merge", broken)
     key = ("items", "")
+    alarm = "key index items/ merges"
 
-    async def rounds(upkeep, n=6):
-        for _ in range(n):
-            upkeep._checked.clear()
-            upkeep.maintain()
-            await asyncio.gather(*upkeep.jobs.values(), return_exceptions=True)
-
-    await rounds(engine.upkeep)
-    assert max(Counter(calls).values()) == 3  # an input set, three times; then the index stopped
-    assert "merges no more" in engine.upkeep.failing["key index items/ merges"]
+    await _rounds(engine.upkeep)
+    assert max(Counter(calls).values()) == 3  # an input set, three times; then the index waits
+    assert "backing off, next try in 600 s" in engine.upkeep.failing[alarm]
+    tried = len(calls)
+    now[0] += 599
+    await _rounds(engine.upkeep)
+    assert len(calls) == tried  # not yet
+    now[0] += 1
+    await _rounds(engine.upkeep)
+    assert len(calls) == tried + 1  # one more upload, then twice the wait
+    assert "next try in 1200 s" in engine.upkeep.failing[alarm]
+    assert engine.merges_view(*key)["failed"][0]["uploads"] == 4
     tried = len(calls)
     await engine.stop()
     await a.close()
@@ -500,15 +526,122 @@ async def test_a_merge_that_keeps_failing_stops_and_alarms_across_restarts(tmp_p
     again = engine_for(b, items_project(rows))
     await again.initialize()
     await again.upkeep.tasks.close()
-    await rounds(again.upkeep)
-    assert len(calls) == tried  # nothing more: the budget is spent in this life
-    assert "merges no more" in again.upkeep.failing["key index items/ merges"]
-    index = b.model.indexes[key]
-    b.model.indexes[key] = replace(index, life="another")  # a reset since: a new life
-    await rounds(again.upkeep, 1)
-    assert len(calls) > tried  # it merges afresh
+    again.upkeep.clock = lambda: now[0]
+    await _rounds(again.upkeep)
+    assert len(calls) == tried  # the count and its wait survive the restart
+    assert "backing off" in again.upkeep.failing[alarm]
+
+    # The store comes back: once the wait is over, the merge publishes and the alarm goes.
+    monkeypatch.setattr(LayerIndex, "merge", real)
+    now[0] += upkeep_module.MERGE_BACKOFF_MAX
+    layers = len(b.model.indexes[key].layers)
+    await _rounds(again.upkeep)
+    assert len(b.model.indexes[key].layers) < layers
+    assert alarm not in again.upkeep.failing and again.merges_view(*key)["failed"] == []
     await again.stop()
     await b.close()
+
+
+async def test_an_operator_clear_merges_at_once(state, monkeypatch):
+    """`solera merges --clear` (`MergesCleared`): an index backing off tries
+    again at once."""
+
+    engine, _ = await _layered(state)
+    engine.upkeep.clock = lambda: 1000.0
+    real, calls = LayerIndex.merge, []
+
+    async def broken(self, lo, count, **_):
+        calls.append(1)
+        raise RuntimeError("the store is down")
+
+    monkeypatch.setattr(LayerIndex, "merge", broken)
+    await _rounds(engine.upkeep)
+    assert "backing off" in engine.upkeep.failing["key index items/ merges"]
+    monkeypatch.setattr(LayerIndex, "merge", real)
+    cleared = engine.clear_merges("items", "", "test")
+    assert cleared["cleared"] and engine.merges_view("items", "")["failed"] == []
+    layers = len(state.model.indexes[("items", "")].layers)
+    await _rounds(engine.upkeep)
+    assert len(state.model.indexes[("items", "")].layers) < layers
+    assert "key index items/ merges" not in engine.upkeep.failing
+
+
+async def test_merges_the_engine_stops_count_for_nothing(state, monkeypatch):
+    """An upload cut short by the engine's own stop — a deploy, a restart —
+    counts for nothing (`MergeInterrupted`): three of them leave the index
+    merging, with no wait, where three failures would back it off."""
+
+    import threading
+
+    engine, _ = await _layered(state)
+    engine.upkeep.clock = lambda: 1000.0
+    real, started, release = LayerIndex.merge, [], threading.Event()
+
+    async def slow(self, lo, count, **_):  # on upkeep's worker thread, its own loop
+        started.append(1)
+        while not release.is_set():
+            await asyncio.sleep(0.01)
+        raise RuntimeError("abandoned")
+
+    monkeypatch.setattr(LayerIndex, "merge", slow)
+    for n in range(1, 4):
+        release.clear()
+        engine.upkeep._checked.clear()
+        engine.upkeep.maintain()
+        while len(started) < n:  # the upload is under way
+            await asyncio.sleep(0.01)
+        jobs = list(engine.upkeep.jobs.values())
+        for job in jobs:
+            job.cancel()
+        await asyncio.gather(*jobs, return_exceptions=True)
+        release.set()  # the thread's upload ends; nothing awaits it any more
+    assert engine.merges_view("items", "")["failed"] == []
+    monkeypatch.setattr(LayerIndex, "merge", real)
+    layers = len(state.model.indexes[("items", "")].layers)
+    await _rounds(engine.upkeep, 1)
+    assert len(state.model.indexes[("items", "")].layers) < layers
+
+
+async def test_writers_held_by_backpressure_go_on_once_a_merge_publishes(state, monkeypatch):
+    """Past `MAX_LAYERS` an index's writers wait (backpressure); a merge
+    that publishes, after failures and a wait, brings the layers down and
+    lets them go."""
+
+    from solera.keys.layers import MAX_LAYERS
+
+    rows = [{"id": "a"}]
+    engine = engine_for(state, items_project(rows))
+    await engine.initialize()
+    await run(engine, ["items"])
+    await engine.upkeep.tasks.close()
+    key = ("items", "")
+    index = state.model.indexes[key]
+    state.model.indexes[key] = replace(index, layers=index.layers + empty_layers(index.head + 1))
+    assert len(state.model.indexes[key].layers) > MAX_LAYERS
+    request = await engine.submit(["items"])
+    engine._dispatch_due()
+    (task,) = state.model.runs[request["id"]]["tasks"].values()
+    assert task["held"] == ["merges", "items"]
+    now = [1000.0]
+    engine.upkeep.clock = lambda: now[0]
+    real = LayerIndex.merge
+
+    async def broken(self, lo, count, **_):
+        raise RuntimeError("the store is down")
+
+    monkeypatch.setattr(LayerIndex, "merge", broken)
+    await _rounds(engine.upkeep)
+    engine._dispatch_due()
+    assert task["held"] == ["merges", "items"]  # still behind, backing off
+    monkeypatch.setattr(LayerIndex, "merge", real)
+    now[0] += 600
+    for _ in range(20):  # merge rounds until it is no longer behind
+        await _rounds(engine.upkeep, 1)
+        if not state.model.indexes[key].backlogged():
+            break
+    assert not state.model.indexes[key].backlogged()
+    engine._dispatch_due()
+    assert task["id"] in state.model.claims
 
 
 async def test_writes_wait_while_an_outputs_merges_are_far_behind(state):

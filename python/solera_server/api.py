@@ -60,6 +60,12 @@ class CleanupsClearInput(BaseModel):
     by: str | None = Field(default=None, max_length=200)
 
 
+class MergesClearInput(BaseModel):
+    output: str
+    partition: str = ""
+    by: str | None = Field(default=None, max_length=200)
+
+
 class SourceCommitInput(BaseModel):
     version: str | None = None
     keys: dict | list | None = None
@@ -613,6 +619,20 @@ def create_app(
     async def clear_cleanups(p: str, body: CleanupsClearInput, request: Request):
         runtime = await project_engine(request, p)
         return runtime.clear_cleanups(body.output, body.partition, body.by or "api")
+
+    @app.get("/api/projects/{p}/outputs/{name}/merges")
+    async def output_merges(p: str, name: str, request: Request, partition: str = ""):
+        """A key index's failed merges, and when upkeep tries them again."""
+
+        runtime = await project_engine(request, p)
+        return runtime.merges_view(name, partition)
+
+    @app.post("/api/projects/{p}/merges:clear")
+    async def clear_merges(p: str, body: MergesClearInput, request: Request):
+        """Forget what an index's merges tried: upkeep tries them again at once."""
+
+        runtime = await project_engine(request, p)
+        return runtime.clear_merges(body.output, body.partition, body.by or "api")
 
     @app.post("/api/projects/{p}/assets/{name}/keys:retry")
     async def retry_keys(p: str, name: str, body: KeysRetryInput, request: Request):

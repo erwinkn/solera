@@ -207,8 +207,8 @@ class Model:
             k: LayerState.from_json(v) for k, v in _flatten(snap.get("indexes"), 2).items()
         }
         # (output, partition) -> what merges of the index's current life tried:
-        # `life`, and `attempts` by input layers (uploads, failed or
-        # abandoned, none published), keyed by LayerState.attempt_key.
+        # `life`, and `attempts` by input layers, keyed by LayerState.attempt_key:
+        # {`n`: uploads, failed or abandoned, none published; `at`: the last one's start}.
         self.merges: dict[tuple, dict] = _flatten(snap.get("merges"), 2)
         # [path, n]: files nothing references since the n-th event applied
         self.garbage: list[list] = snap.get("garbage") or []
@@ -1600,10 +1600,29 @@ class Model:
 
     def _on_MergeAttempted(self, e):
         """A merge of these input files is about to upload: counted before it
-        does, whatever comes of it."""
+        does, whatever comes of it, and when."""
 
         rec = self._merge_record((e["output"], e["partition"]), e["life"])
-        rec["attempts"][e["inputs"]] = rec["attempts"].get(e["inputs"], 0) + 1
+        tried = rec["attempts"].get(e["inputs"]) or {"n": 0}
+        rec["attempts"][e["inputs"]] = {"n": tried["n"] + 1, "at": e["at"]}
+
+    def _on_MergeInterrupted(self, e):
+        """The engine stopped while that merge uploaded (a deploy, a
+        restart): the attempt counts for nothing."""
+
+        rec = self.merge_record((e["output"], e["partition"]), e["life"])
+        tried = rec["attempts"].get(e["inputs"])
+        if tried is not None and tried["n"] <= 1:
+            del rec["attempts"][e["inputs"]]
+        elif tried is not None:
+            tried["n"] -= 1
+
+    def _on_MergesCleared(self, e):
+        """An operator's clear: the index's merges are tried again at once."""
+
+        rec = self.merges.get((e["output"], e["partition"]))
+        if rec is not None:
+            rec["attempts"] = {}
 
     def _prune_merges(self, key: tuple) -> None:
         """Forget what merges tried of files the index no longer holds, and

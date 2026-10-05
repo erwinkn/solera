@@ -269,10 +269,17 @@ flips). It also requires rising generations across commits. A failure
 aborts the merge loudly: a corrupt layer is never published.
 
 **Attempts.** A merge is identified by `{life}|{input ids}`. Upkeep records
-`MergeAttempted` durably before uploading; once one input set has had 3
-attempts, none published, the index merges no more in that life, alarmed
-(A17's R8, A25's R6): backpressure then holds its writers until an operator
-acts or a new life starts.
+`MergeAttempted` durably before uploading, so that neither a crash nor a
+takeover gives an input set a fresh budget (A17's R8, A25's R6); an upload
+the engine's own stop cuts short — a deploy, a restart — is taken back
+(`MergeInterrupted`). Once one input set has had 3 uploads, none
+published, the whole index backs off, alarmed: it tries again after 10
+minutes, the wait doubling with each upload, to 4 hours, until a merge
+publishes. Never for good: commits keep adding layers meanwhile, and past
+64 backpressure holds every writer of the partition, which only a
+published merge releases. An operator's `solera merges OUTPUT [PARTITION]
+--clear` (`MergesCleared`) forgets the attempts: upkeep tries at once. A
+new life starts afresh.
 
 **Backpressure.** When an index holds more than 64 layers (upkeep failing
 or behind), commits to the partition wait, from every writer of the index:

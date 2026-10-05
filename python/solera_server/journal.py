@@ -71,8 +71,9 @@ log = logging.getLogger(__name__)
 # compatibility). 2: stamped-layer key indexes and cleanup cursors (T33); 3:
 # key outcomes, a per-key asset's `failures` record renamed `outcomes` (T37); 4:
 # the history's `commits.key_count` (T36), a column of the rows a checkpoint
-# buffers. A journal with no format is from before 2.
-FORMAT = 4
+# buffers; 5: merge attempts with when (`Model.merges`), for their backoff. A
+# journal with no format is from before 2.
+FORMAT = 5
 
 
 class Stopped(RuntimeError):

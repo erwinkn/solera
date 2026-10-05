@@ -24,6 +24,7 @@ from solera.objects import Conflict, swap
 from solera.tasks import retrying
 
 from .state import LostOwnership, Unavailable
+from .upkeep import MERGE_ATTEMPTS, merge_due
 
 log = logging.getLogger(__name__)
 
@@ -778,6 +779,40 @@ class Attempts:
             event = {"output": output, "partition": partition, "ids": stuck, "by": by, "at": self.clock()}
             self.state.record({"type": "CleanupsCleared", **event, "retired": retired})
         return {"output": output, "partition": partition, "cleared": stuck + retired}
+
+    def merges_view(self, output: str, partition: str) -> dict:
+        """An index's merges that failed in its current life: per input set,
+        its uploads (none published), the last one's start, and when the next
+        may start (`merge_due`; null: at once)."""
+
+        index = self.m.indexes.get((output, partition))
+        rec = self.m.merge_record((output, partition), index.life) if index is not None else {"attempts": {}}
+        return {
+            "output": output,
+            "partition": partition,
+            "layers": len(index.layers) if index is not None else 0,
+            "backlogged": index is not None and index.backlogged(),
+            "failed": [
+                {
+                    "inputs": k,
+                    "uploads": t["n"],
+                    "at": t["at"],
+                    "due": merge_due(t) if t["n"] >= MERGE_ATTEMPTS else None,
+                }
+                for k, t in sorted(rec["attempts"].items())
+            ],
+        }
+
+    def clear_merges(self, output: str, partition: str, by: str) -> dict:
+        """An operator's `solera merges --clear`: forget what the index's
+        merges tried, so that upkeep tries them again at once."""
+
+        index = self.m.indexes.get((output, partition))
+        cleared = sorted(self.m.merge_record((output, partition), index.life)["attempts"]) if index else []
+        if cleared:
+            event = {"output": output, "partition": partition, "by": by, "at": self.clock()}
+            self.state.record({"type": "MergesCleared", **event})  # upkeep's next round merges
+        return {"output": output, "partition": partition, "cleared": cleared}
 
     async def _end(self, run_id: str, attempt: str) -> dict | None:
         """End the attempt in its control file (§2.4), on what it reads

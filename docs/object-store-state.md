@@ -196,10 +196,11 @@ One object, `control/journal.json`, rewritten whole by every flush: the
 engine id of its writer, the name of the checkpoint it extends, every
 event since that checkpoint (§10), and the state's `format`.
 
-**Format, and no migration.** The state's format is 4: 2 since the
+**Format, and no migration.** The state's format is 5: 2 since the
 stamped-layer key index and cleanup cursors (T33), 3 since key outcomes
 renamed a per-key asset's `failures` record `outcomes` (T37), 4 since the
-history's commits split their `key_count` from their `rows` (T36). An engine refuses a
+history's commits split their `key_count` from their `rows` (T36), 5 since
+merge attempts record when, for their backoff. An engine refuses a
 namespace written in another format, a journal with no `format` included,
 before it reads or writes anything (`OldNamespace`): **state in another
 format is unreadable; start a fresh namespace.** Solera migrates
@@ -265,7 +266,9 @@ status are derived inside `apply`; they are not events.
 | `AttemptPlaced` | `attempt`, `handle` | the placement started it: where it runs, for whichever engine follows it (§8) |
 | `AttemptFinished` | `run`, `task`, `attempt`, `outcome` (`succeeded` \| `failed` \| `skipped` \| `canceled`), `started_at`, `finished_at`, `error?`, `retryable?`, `commit?`, `owing a repair?`, `writes?` | records the attempt; on commit, installs heads, the partition's record (cursor, positions, completeness), and each keyed output's new delta file; `repairs` keeps the intents of a writer that died (§8) |
 | `SourceCommitted` | `source`, `head`, `keys?`, `at`, `run?` | installs a source head and its delta file; a commit that changed something records `run` in the history (§7) |
-| `MergeAttempted` | `output`, `partition`, `life`, `inputs` (the attempt key), `at` | counts an attempt of one merge before its upload; three stop it |
+| `MergeAttempted` | `output`, `partition`, `life`, `inputs` (the attempt key), `at` | counts an upload of one merge before it starts; after three, none published, the index backs off (10 minutes, doubling to 4 hours) |
+| `MergeInterrupted` | `output`, `partition`, `life`, `inputs`, `at` | the engine's own stop cut that upload short: it counts for nothing |
+| `MergesCleared` | `output`, `partition`, `by`, `at` | an operator's clear: the index's merges are tried again at once |
 | `IndexMerged` | `output`, `partition`, `life`, `prefix`, `ids`, `layer`, `at` | swaps adjacent layers for their merge, if the index is still that life and holds those layers; else its files are orphans |
 | `IndexCut` | `output`, `partition`, `life`, `cut` | raises the index's cut (never lowers it) |
 | `FilesCleanedUp` | `paths` | forgets index files that were deleted |

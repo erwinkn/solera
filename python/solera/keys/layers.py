@@ -46,7 +46,6 @@ TIER_BASE = 8 * 1024  # bytes: tier 0 holds up to FANOUT x this
 READER_BOUND = 4.0  # a layer reaching past the cut holds at most this x the bytes newer than it, ...
 SLACK = 1 * 2**20  # ... plus this
 BASE_SHARE = 4.0  # the base absorbs the layers above it once they hold 1/this of it
-ATTEMPTS = 3  # attempts of one merge (life and inputs) before upkeep stops trying it
 MAX_LAYERS = 64  # past this, commits wait for upkeep (backpressure)
 DELTA_GROWTH = 1.45  # a stamped entry's size over a delta entry's, to bound a merge's output
 
@@ -361,21 +360,18 @@ class LayerState:
 
     # -- the merge rule ---------------------------------------------------------------------
 
-    def plan(
-        self, busy: set[str] = frozenset(), stopped: set[str] = frozenset(), lane: str | None = None
-    ) -> tuple[str, int, int] | None:
+    def plan(self, busy: set[str] = frozenset(), lane: str | None = None) -> tuple[str, int, int] | None:
         """The next merge, as `(lane, first, count)`, or None. Two lanes —
         the base absorbing the layers above it, and tiers — each pick inputs
         no running merge holds (`busy`, ids), so the lanes never share one;
-        `lane` asks for one lane's only. `stopped`: input sets
-        (`attempt_key`) upkeep gave up on."""
+        `lane` asks for one lane's only."""
 
         ls = self.layers
         free = [x.id not in busy for x in ls]
 
         def allowed(lo: int, count: int) -> bool:
             ins = ls[lo : lo + count]
-            if not all(free[lo : lo + count]) or self.attempt_key(ins) in stopped:
+            if not all(free[lo : lo + count]):
                 return False
             if ins[-1].b <= self.cut:
                 return True  # no reader's P lies inside it

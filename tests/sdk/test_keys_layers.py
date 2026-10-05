@@ -284,7 +284,6 @@ def test_the_lanes_never_share_an_input_and_attempts_carry_the_life():
     nxt = st.plan(busy=busy)
     assert nxt is None or not busy & {x.id for x in st.layers[nxt[1] : nxt[1] + nxt[2]]}
     assert st.attempt_key(st.layers[:2]).startswith("l9|")
-    assert st.plan(stopped={st.attempt_key(st.layers[lo : lo + count])}) != (lane, lo, count)
 
 
 async def test_a_warm_engine_reads_no_object(tmp_path):

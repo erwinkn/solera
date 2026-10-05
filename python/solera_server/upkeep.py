@@ -33,7 +33,9 @@ log = logging.getLogger(__name__)
 
 ALIVE = "engine/alive.json"  # when the engine last said it was up, while runs were in progress
 ALIVE_SECONDS = 30.0
-MERGE_ATTEMPTS = 3  # attempts per input set before merging an index stops, alarmed (the write bound's R)
+MERGE_ATTEMPTS = 3  # uploads of one input set, none published, before its index backs off, alarmed
+MERGE_BACKOFF = 600.0  # the first wait after them, doubling with each further upload
+MERGE_BACKOFF_MAX = 4 * 3600.0
 ORPHAN_SECONDS = 600.0
 
 
@@ -50,6 +52,17 @@ def _attempt_of(name: str) -> str | None:
     else:
         return None
     return attempt if len(commit) == 12 and commit.isdigit() and attempt else None
+
+
+def merge_due(tried: dict) -> float:
+    """When an input set's next upload may start: at once for its first
+    `MERGE_ATTEMPTS`, then after a wait that doubles with each upload since,
+    capped at `MERGE_BACKOFF_MAX`."""
+
+    n = tried["n"]
+    if n < MERGE_ATTEMPTS:
+        return -math.inf
+    return tried["at"] + min(MERGE_BACKOFF * 2 ** (n - MERGE_ATTEMPTS), MERGE_BACKOFF_MAX)
 
 
 class Upkeep:
@@ -118,11 +131,18 @@ class Upkeep:
         start merges, `concurrency` at a time: per index, one into the base
         and one among the tiers, whose inputs never overlap. Once an input
         set's merge was uploaded `MERGE_ATTEMPTS` times in the index's
-        current life, none published, the index merges no more, alarmed: the
-        count is durable (`Model.merges`), so neither a restart nor a
-        takeover resets it, and a new life starts afresh. (Not the next
-        smaller set: a store that fails every upload would pay the budget
-        once per candidate set.)"""
+        current life, none published, the index backs off, alarmed: it tries
+        again after 10 minutes, doubling with each upload to 4 hours
+        (`merge_due`), until one publishes or an operator clears it
+        (`MergesCleared`). The count is durable (`Model.merges`), so neither
+        a crash nor a takeover resets it; an upload the engine's own stop cut
+        short counts for nothing (`MergeInterrupted`), and a new life starts
+        afresh. The whole index waits, not only that set: a store that fails
+        every upload would otherwise pay the budget once per candidate set.
+        Commits go on adding layers meanwhile, and past `MAX_LAYERS` their
+        writers wait (backpressure) until a merge publishes."""
+
+        now = self.clock()
 
         for key, index in list(self.m.indexes.items()):
             oldest = self.m.oldest_observed(*key)
@@ -144,21 +164,25 @@ class Upkeep:
             if self._checked.get(key) is index:
                 continue
             rec = self.m.merge_record(key, index.life)
-            spent = {k for k, n in rec["attempts"].items() if n >= MERGE_ATTEMPTS}
-            if spent:
-                self.failing[f"key index {key[0]}/{key[1]} merges"] = (
-                    f"a merge of {sorted(spent)[0]!r} was uploaded {MERGE_ATTEMPTS} times, none published: "
-                    "the index merges no more in this life"
+            alarm = f"key index {key[0]}/{key[1]} merges"
+            failing = {k: t for k, t in rec["attempts"].items() if t["n"] >= MERGE_ATTEMPTS}
+            if not failing:
+                self.failing.pop(alarm, None)
+            else:
+                inputs, tried = max(failing.items(), key=lambda kv: (kv[1]["n"], kv[0]))
+                due = max(merge_due(t) for t in failing.values())
+                self.failing[alarm] = (
+                    f"a merge of {inputs!r} was uploaded {tried['n']} times, none published: "
+                    + (f"backing off, next try in {math.ceil(due - now)} s" if due > now else "trying again")
                 )
-                self._checked[key] = index
-                continue
-            self.failing.pop(f"key index {key[0]}/{key[1]} merges", None)
+                if due > now:
+                    continue  # re-checked on every round until then
             planned = False
             for lane in ("base", "tier"):
                 if (key, lane) in self.jobs or len(self.jobs) >= self.concurrency:
                     continue
                 other = self._busy.get((key, "tier" if lane == "base" else "base"), frozenset())
-                plan = index.plan(busy=other, stopped=spent, lane=lane)
+                plan = index.plan(busy=other, lane=lane)
                 if plan is None:
                     continue
                 _, lo, count = plan
@@ -180,6 +204,12 @@ class Upkeep:
         epoch = self.state.journal.epoch
         output, partition = key
         ins = index.layers[lo : lo + count]
+        tried = {
+            "output": output,
+            "partition": partition,
+            "life": index.life,
+            "inputs": index.attempt_key(ins),
+        }
         cache = getattr(service, "cache", None)
 
         def work():
@@ -190,18 +220,15 @@ class Upkeep:
 
         try:
             try:
-                self.state.record(
-                    {
-                        "type": "MergeAttempted",
-                        "output": output,
-                        "partition": partition,
-                        "life": index.life,
-                        "inputs": index.attempt_key(ins),
-                        "at": self.clock(),
-                    }
-                )
+                self.state.record({"type": "MergeAttempted", **tried, "at": self.clock()})
                 await self.state.durable()  # counted before anything is uploaded
                 ids, layer = await asyncio.to_thread(work)
+            except asyncio.CancelledError:
+                # The engine stops (a deploy, a restart): the upload counts for nothing.
+                # A replaced engine's journal takes no event; its count then stands.
+                with contextlib.suppress(Exception):
+                    self.state.record({"type": "MergeInterrupted", **tried, "at": self.clock()})
+                raise
             except Exception as error:
                 self.failing[f"key index {key[0]}/{key[1]}"] = f"{type(error).__name__}: {error}"
                 log.exception("key index merge failed for %s", key)
