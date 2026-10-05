@@ -1009,8 +1009,11 @@ shows.
   listing: the deltas name every object to delete. A superseded value is
   its previous version's generation. The engine keeps a queued delta's
   files until the cursor passes them, and deletes them itself afterwards
-  (never the cleanup task). Steps run as cleanup tasks, after a commit and
-  from the hourly job, one per partition at a time.
+  (never the cleanup task). Steps run as cleanup tasks, one per partition
+  at a time, coalesced: after commits at most one a minute per output
+  partition (`cleanup_coalesce`), sooner once a step's worth of deltas (64)
+  is queued, and the hourly job as the backstop. A burst of commits makes a
+  few tasks, not one per commit.
 - **Versions dropped by a merge** need nothing of their own: writes are
   exact, so every version a merge drops was named as replaced by the
   delta that replaced it, and is cleaned up through that delta

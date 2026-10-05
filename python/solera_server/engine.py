@@ -25,6 +25,7 @@ import contextlib
 import datetime as dt
 import json
 import logging
+import math
 import secrets
 from zoneinfo import ZoneInfo
 
@@ -79,6 +80,7 @@ PROVISION_SECONDS = 600.0  # a launched worker reports within this, or it never 
 CANCEL_GRACE = 60.0  # a requested cancel's time to drain before it is forced (§7)
 CLEANUPS = 64  # cleanup entries one cleanup task takes at most
 CLEANUP_INTERVAL = 3600.0  # the cleanup job looks for cleanup due anywhere this often (§9.8)
+CLEANUP_COALESCE = 60.0  # after commits, one cleanup task per output partition this often at most
 SOURCE_KEYS_RECORDED = 1000  # a source commit's run lists changed keys up to this many, else counts
 GRACE_SECONDS = 5.0
 CLEANUP_TRIES = 6  # a cleanup task's attempts, its retries backing off from a minute (K25)
@@ -137,6 +139,7 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
         resolve_cache: str | None | bool = True,
         sensor_host=None,
         cleanup_interval: float = CLEANUP_INTERVAL,
+        cleanup_coalesce: float = CLEANUP_COALESCE,
     ):
         import time
 
@@ -148,6 +151,11 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
         self.heartbeat_seconds, self.concurrency = heartbeat_seconds, concurrency
         self.provision_seconds, self.cancel_grace = provision_seconds, cancel_grace
         self.cleanup_interval, self._cleanup_job_at = cleanup_interval, 0.0  # the job's next look
+        # Commits' cleanup, coalesced (§9.8): when each output partition last got a
+        # cleanup task after a commit, and those whose commits wait for their next.
+        self.cleanup_coalesce = cleanup_coalesce
+        self._cleanup_at: dict[tuple, float] = {}
+        self._cleanup_waiting: set[tuple] = set()
         self.local_app = None  # its routes for workers it runs in this process (`api.local_transport`)
         # Where workers reach this engine (docs/lifecycle.md §5); without one,
         # they report through `.beat` alone.
@@ -549,7 +557,7 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
                     self._submit_cleanups([(cleanup["output"], cleanup["partition"])])
             elif task["asset"] in self.manifest["assets"]:
                 outputs = self.manifest["assets"][task["asset"]]["outputs"]
-                self._submit_cleanups(
+                self._cleanup_soon(
                     [(o["name"], task["partition"]) for o in outputs if self.m.immutable(o["name"])]
                 )
         if self.keys is not None:
@@ -713,14 +721,41 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
         if now >= self._cleanup_job_at:
             self._cleanup_job_at = now + self.cleanup_interval
             self._submit_cleanups()
+        due = [
+            k
+            for k in self._cleanup_waiting
+            if now >= self._cleanup_at.get(k, -math.inf) + self.cleanup_coalesce
+        ]
+        if due:
+            self._cleanup_waiting.difference_update(due)
+            self._cleanup_soon(due)
 
-    def _submit_cleanups(self, partitions=None) -> None:
+    def _cleanup_soon(self, partitions) -> None:
+        """Commits let go of something in `partitions` (output, partition): a
+        cleanup task each, coalesced — at most one per `cleanup_coalesce` after
+        commits, sooner once a step's worth of deltas (`CLEANUPS`) is queued;
+        the rest wait for the next look (`_cleanup_job`, each tick), and the
+        hourly job is the backstop. One task takes all that is due then."""
+
+        now = self.clock()
+        for key in partitions:
+            queued = len((self.m.cleaning.get(key) or {}).get("queue") or ())
+            if now < self._cleanup_at.get(key, -math.inf) + self.cleanup_coalesce and queued < CLEANUPS:
+                self._cleanup_waiting.add(key)
+            elif self._submit_cleanups([key]):
+                self._cleanup_at[key] = now
+            elif queued or self.m.cleanups.get(key):  # held (a pin, a task already queued): look again
+                self._cleanup_at[key] = now
+                self._cleanup_waiting.add(key)
+
+    def _submit_cleanups(self, partitions=None) -> int:
         """A cleanup task for each of `partitions` (output, partition) with
         entries due — all of them with none, and every output life past its
         `cleanup_after`, read by no pin older than the deploy that ended it.
         None where one is queued or running already, or an entry is stuck. It
         runs as any task does — placed, retried a bounded number of times, in
-        the runs and their history — with no asset of the project's."""
+        the runs and their history — with no asset of the project's. Returns
+        how many it submitted."""
 
         submitted = {
             json.dumps(t.get("cleanup"), sort_keys=True)
@@ -741,9 +776,12 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
             for entry_id, entry in self.m.retired.items():
                 if not entry.get("stuck") and entry["due"] <= now and floor >= entry["before"]:
                     due.append(({"life": entry_id}, entry_id, entry["output"]))
+        made = 0
         for cleanup, partition, output in due:
             if json.dumps(cleanup, sort_keys=True) not in submitted:
                 self._cleanup_task(cleanup, partition, output)
+                made += 1
+        return made
 
     def _cleanup_task(self, cleanup: dict, partition: str, output: str) -> None:
         now = self.clock()

@@ -16,6 +16,18 @@ KEY = ("items", "")
 GUARD = 300.0  # seconds: a deadlock guard on a run settling, never a timing assumption
 
 
+async def merged(engine):
+    """Upkeep's merges, run until none is due."""
+
+    import asyncio
+
+    for _ in range(50):
+        engine.upkeep.maintain()
+        if not len(engine.upkeep.jobs):
+            return
+        await asyncio.gather(*engine.upkeep.jobs.values(), return_exceptions=True)
+
+
 async def steps(engine):
     """Every cleanup step due, run until none is: each wait is on a cleanup
     run settling, whose result acknowledges its step (`cleaned_to`) only
@@ -56,15 +68,19 @@ async def items(tmp_path, data):
         return Patch(pending["rows"], remove=pending["removes"])
 
     state = await State.open(tmp_path.as_uri(), "test", flush_interval=0.001)
-    engine = engine_for(state, Project(assets=[items]), cancel_grace=0)
+    # The hourly job as deployed (not every tick): cleanup after commits is what's under test.
+    engine = engine_for(state, Project(assets=[items]), cancel_grace=0, cleanup_interval=3600.0)
     await engine.initialize()
 
-    async def commit(rows=None, removes=()):
+    async def commit(rows=None, removes=(), *, clean=True):
+        """One run's commit; with `clean`, then every cleanup step due."""
+
         pending["rows"], pending["removes"] = dict(rows or {}), list(removes)
         detail = await engine.run_until((await engine.submit(["items"]))["id"], GUARD)
         assert detail["request"]["status"] == "succeeded", [t.get("error") for t in detail["tasks"]]
         await worker_finished()
-        await steps(engine)
+        if clean:
+            await steps(engine)
         return state.model.heads[KEY]["ref"]["generation"]
 
     yield engine, state, commit
@@ -178,3 +194,39 @@ async def test_a_delta_is_kept_until_the_cursor_passes_it(items, data, monkeypat
     await engine.upkeep.collect()
     assert first not in set(await state.list_objects(state.model.indexes[KEY].prefix))
     assert len(generations(data)["a"]) == 1
+
+
+async def test_a_burst_of_commits_makes_few_cleanup_tasks(items, data):
+    """Cleanup after commits is coalesced: one task per output partition per
+    `cleanup_coalesce` (a minute), sooner once a step's worth of deltas
+    (`CLEANUPS`) is queued — not one per commit."""
+
+    from solera_server.engine import CLEANUPS
+
+    engine, state, commit = items
+    made, real = [], engine._cleanup_task
+
+    def counted(cleanup, partition, output):
+        made.append(cleanup)
+        return real(cleanup, partition, output)
+
+    engine._cleanup_task = counted
+    for i in range(30):  # commit 0 adds; 1–29 update, each queueing its delta
+        await commit({"a": i}, clean=False)
+    assert len(made) == 1  # the first update's; the 28 after it wait for the window
+    assert queued(state)
+    engine._cleanup_at[KEY] -= engine.cleanup_coalesce + 1  # a minute passes
+    engine._cleanup_job()
+    assert len(made) == 2  # one task for all that waited
+    await steps(engine)
+    assert queued(state) == [] and cursor(state) == state.model.heads[KEY]["commit_number"]
+    assert generations(data)["a"] == {state.model.heads[KEY]["ref"]["generation"]}
+
+    with state.model.reading(state.model.indexes[KEY].prefix):  # no step due: deltas pile up
+        for i in range(CLEANUPS):
+            await commit({"a": 100 + i}, clean=False)
+            if i % 16 == 15:
+                await merged(engine)  # as upkeep would: past 64 layers, commits wait (backpressure)
+    before = len(made)
+    await commit({"a": 999}, clean=False)  # a step's worth queued: at once, inside the window
+    assert len(made) == before + 1
