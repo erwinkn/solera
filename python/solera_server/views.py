@@ -10,7 +10,7 @@ import json
 from collections import Counter
 
 from solera.failed_keys import GONE, NAMES, OK, Record, eligible
-from solera.keys.layers import LayerIndex, key_bytes, key_str
+from solera.keys.layers import LayerIndex, delta_names, key_bytes, key_str
 from solera.patterns import Matcher
 
 from . import observed, owed, planning
@@ -517,7 +517,7 @@ class Views:
                     {
                         "run": i.get("run"),
                         "attempt": i.get("attempt"),
-                        "files": [f["name"] for f in i.get("files") or ()],
+                        "files": delta_names(i),
                     }
                     for i in intents
                 ],

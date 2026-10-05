@@ -141,7 +141,7 @@ class Sensors:
             entry = {"head": self._head_id(source)}
             index = self.m.indexes.get((source, ""))
             if index is not None:
-                entry["index"] = index.slice().to_json()
+                entry["index"] = index.to_json()
             snapshot[source] = entry
         now = asyncio.get_running_loop().time()
         claim = {

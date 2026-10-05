@@ -1058,7 +1058,7 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
             if output.get("incremental"):
                 info["commit_number"] = int((head or {}).get("commit_number", -1)) + 1
             if output.get("key") is not None:
-                info["index"] = self.m.index(name, partition).slice().to_json()
+                info["index"] = self.m.index(name, partition).to_json()
                 if (name, partition) in self.m.repairs:
                     info["repairs"] = self.m.repairs[(name, partition)]
                 if output.get("dynamic_partitions") or name in self._dynamic_dims:
@@ -1180,7 +1180,7 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
             or store.get("writes") != "immutable"
         ):
             return None
-        return self.m.index(output, ref.get("partition") or "").slice().to_json()
+        return self.m.index(output, ref.get("partition") or "").to_json()
 
     @staticmethod
     def _versioned(input: planning.Input) -> bool:
@@ -1262,7 +1262,7 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
             "forced_at": current,
             "now": self.clock(),
             "retries": asset.get("retries", {}).get("n", 0),
-            "failures": failures.slice().to_json(),
+            "failures": failures.to_json(),
             "commit_number": int(record.get("commit_number", -1)) + 1,
             "pass_after": (retry or {}).get("after"),
         }
@@ -1520,7 +1520,7 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
                     raise Conflict(f"keyed output {name}: the result carries no key delta", retryable=False)
                 head["commit_number"] = int((before or {}).get("commit_number", -1))
                 if delta is not None:
-                    if delta["files"]:
+                    if delta_names(delta):
                         head["commit_number"] = int(info["commit_number"])
                     keys[name] = {**delta, "commit_number": head["commit_number"]}
                 if "partitions" in info:

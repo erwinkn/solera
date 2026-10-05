@@ -43,6 +43,7 @@ from solera.keys.layers import (
     LayerState,
     Part,
     delta_keys,
+    delta_names,
     key_bytes,
     key_str,
     replaced_entries,
@@ -569,11 +570,14 @@ async def _store_outputs(
             # map once it wrote, so its delta comes after — and needs no repair.
             # Unknown writes: if this attempt dies after its gate, no key list says what landed
             # (docs/lifecycle.md §9.6): the next attempt reconciles the whole partition.
-            intents[name] = {**DeltaFiles([], 0, 0).to_json(), "unknown": True}
+            intents[name] = {
+                **DeltaFiles(Part(), 0, 0, int(spec.get("generation") or 0)).to_json(),
+                "unknown": True,
+            }
             continue
         if o.files is None:
             await _resolve(o, spec, engine.get(name))
-        if not o.files.files and o.prior is not None and not o.repairs:
+        if not o.files.part.files and o.prior is not None and not o.repairs:
             if not _schema_due(o):
                 entries[name] = {"unchanged": True}
                 del outs[name]
@@ -594,7 +598,7 @@ async def _store_outputs(
         # The engine has cleaned up this attempt's delta files; these came after.
         import obstore
 
-        paths = [outs[n].index.path(f["name"]) for n, files in intents.items() for f in files["files"]]
+        paths = [outs[n].index.state.path(f) for n, files in intents.items() for f in delta_names(files)]
         with contextlib.suppress(Exception):
             await obstore.delete_async(objects, paths)
         raise
