@@ -249,3 +249,51 @@ async def test_a_query_parses_nothing_on_the_event_loop(tmp_path, monkeypatch):
     assert await first == [("a", 1)] and await second == [("a", 1), ("b", 2)]
     assert threads and loop_thread not in threads
     await lake.stop()
+
+
+async def test_buffered_rows_restore_by_column_name_under_a_new_schema(tmp_path):
+    """A checkpoint's buffered rows are positional: one written before a
+    column was added must still flush and read, the new column null. With
+    the column names beside them, a column added anywhere lands right; a
+    checkpoint without them (from before they were kept) is padded."""
+
+    store = Store(tmp_path)
+    store.lake.append("events", {"run": "r1", "at": 1.0, "n": 1})
+    snap = store.lake.to_json()
+    wider = {
+        "events": Table("run", "at", {"run": "VARCHAR", "note": "VARCHAR", "at": "DOUBLE", "n": "INTEGER"})
+    }
+    for saved in (snap, {**snap, "columns": None}):
+        if saved["columns"] is None:  # an older checkpoint: no names, the new column at the end
+            wider = {
+                "events": Table(
+                    "run", "at", {"run": "VARCHAR", "at": "DOUBLE", "n": "INTEGER", "note": "VARCHAR"}
+                )
+            }
+        store.lake = LakeState(wider, saved)
+        lake = Lake(store, wider, lambda: store.lake, name="Log", clock=lambda: 100.0)
+        assert await lake.query(
+            lambda con: con.execute("SELECT run, note, n FROM events").fetchall(), ("events",)
+        ) == [("r1", None, 1)]
+        await lake.flush(force=True)
+        assert len(store.lake.files["events"]) >= 1
+
+
+async def test_a_mirror_that_failed_does_not_poison_later_queries(tmp_path, monkeypatch):
+    store = Store(tmp_path)
+    lake = Lake(store, SCHEMA, lambda: store.lake, name="Log")
+    store.lake.append("events", {"run": "a", "at": 1.0, "n": 1})
+    real, failed = lake._ndjson, []
+
+    def once(*args, **kw):
+        if not failed:
+            failed.append(True)
+            raise ValueError("injected: a row the mirror cannot write")
+        return real(*args, **kw)
+
+    monkeypatch.setattr(lake, "_ndjson", once)
+    try:
+        await lake.query(rows, ("events",))
+    except ValueError:
+        pass
+    assert failed and await lake.query(rows, ("events",)) == [("a", 1)]

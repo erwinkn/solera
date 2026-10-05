@@ -43,6 +43,20 @@ from solera.tasks import Tasks
 log = logging.getLogger(__name__)
 
 
+def _restored(rows: list[list], saved: list[str] | None, columns: list[str]) -> list[list]:
+    """Buffered rows as `columns` order them. `saved`: the columns they were
+    written under; None for a checkpoint that did not say, whose rows are
+    padded (a column added since, at the end)."""
+
+    if saved == columns:
+        return rows
+    if saved is None:
+        return [
+            [seq, [*values, *[None] * (len(columns) - len(values))][: len(columns)]] for seq, values in rows
+        ]
+    return [[seq, [dict(zip(saved, values, strict=True)).get(c) for c in columns]] for seq, values in rows]
+
+
 @dataclass(frozen=True)
 class Table:
     key: str  # the column rows are forgotten by
@@ -53,21 +67,30 @@ class Table:
 class LakeState:
     """A lake's durable part: per table, the files written and the buffered
     rows, `[seq, values]` with values in column order. Changed only by the
-    model, as it applies events."""
+    model, as it applies events. A checkpoint names each buffered table's
+    columns, so rows it held restore by name under a schema that has
+    changed since: a new column null, a dropped one gone."""
 
     def __init__(self, schema: dict[str, Table], snap: dict | None = None):
         snap = snap or {}
         self.schema = schema
         self.files: dict[str, list[dict]] = snap.get("files") or {}
         self.seq: int = snap.get("seq") or 0
-        self.rows: dict[str, list[list]] = snap.get("rows") or {}
+        saved = snap.get("columns") or {}
+        self.rows: dict[str, list[list]] = {
+            table: _restored(rows, saved.get(table), list(schema[table].columns))
+            for table, rows in (snap.get("rows") or {}).items()
+            if table in schema
+        }
         # memory only: bumped when rows leave a buffer other than by a flush
         self.generation: dict[str, int] = {}
 
     def to_json(self) -> dict:
+        rows = {table: rows for table, rows in self.rows.items() if rows}
         return {
             "files": self.files,
-            "rows": {table: rows for table, rows in self.rows.items() if rows},
+            "rows": rows,
+            "columns": {table: list(self.schema[table].columns) for table in rows},
             "seq": self.seq,
         }
 
@@ -499,12 +522,19 @@ class Lake:
         appended — or, after rows were forgotten or the state replaced, copy
         it anew."""
 
+        try:
+            self._mirror_rows(table, lake, generation, rows, seq)
+        except BaseException:
+            self._mirrored.pop(table, None)  # copied anew by the next query: a failure poisons nothing
+            raise
+
+    def _mirror_rows(self, table: str, lake, generation: int, rows: list, seq: int) -> None:
         db = self._database()
         buffer = f'"{table}__buffer"'
         seen = self._mirrored.get(table)
         if seen is None:
             columns = ", ".join(f'"{c}" {t}' for c, t in self.schema[table].columns.items())
-            db.execute(f"CREATE TABLE {buffer} ({columns}, _seq BIGINT)")
+            db.execute(f"CREATE OR REPLACE TABLE {buffer} ({columns}, _seq BIGINT)")
         if seen is None or seen[0] is not lake or seen[1] != generation:
             db.execute(f"DELETE FROM {buffer}")
             last = 0

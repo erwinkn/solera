@@ -495,3 +495,34 @@ async def test_a_retry_is_a_new_run_and_the_old_one_stays_as_it_ended(state, clo
     ok = await run(engine, clock, ["orders"])
     with pytest.raises(Conflict, match="nothing to retry"):
         await engine.retry(ok["id"])
+
+
+async def test_real_attempts_flush_and_read_back_from_an_older_checkpoint(state, clock):
+    """Attempts' rows go through a history flush and a run's detail reads
+    them back — also when the buffer was restored from a checkpoint written
+    before a column was added (W59: the attempts table's `handle`), whose
+    rows are one value short and name no columns."""
+
+    from solera_server.history import TABLES
+    from solera_server.lake import LakeState
+
+    engine = engine_for(state, clock)
+    await engine.initialize()
+    first = await run(engine, clock, ["revenue"], upstream=True)
+    snap = state.model.history.to_json()
+    width = len(TABLES["attempts"].columns)
+    assert snap["rows"]["attempts"] and all(len(v) == width for _, v in snap["rows"]["attempts"])
+    older = {
+        **snap,
+        "columns": None,
+        "rows": {**snap["rows"], "attempts": [[s, v[:-1]] for s, v in snap["rows"]["attempts"]]},
+    }
+    state.model.history = LakeState(TABLES, older)  # as restored from it
+    await engine.history.lake.flush(force=True)
+    assert not state.model.history.rows.get("attempts")  # written out
+    second = await run(engine, clock, ["revenue"])
+    await engine.history.lake.flush(force=True)
+    for request in (first, second):
+        detail = await engine.run_detail(request["id"])
+        attempts = [a for found in detail["attempts"].values() for a in found]
+        assert attempts and all(a["outcome"] == "succeeded" and a.get("handle") is None for a in attempts)
