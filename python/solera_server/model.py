@@ -1250,7 +1250,7 @@ class Model:
             index = self.index(name, partition).committed(f["commit_number"], DeltaFiles.from_json(keys))
             self.indexes[(name, partition)] = index
             record["commit_number"] = f["commit_number"]
-        for field in ("counts", "due", "deploy_min", "retry", "passes", "done_forced", "last", "config"):
+        for field in ("counts", "due", "deploy_min", "retry", "passes", "done_forced", "last"):
             if field in f:
                 record[field] = f[field]
 

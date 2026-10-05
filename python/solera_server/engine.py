@@ -1356,7 +1356,6 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
         record = self.m.partition(task["asset"], task["partition"]).get("outcomes") or {}
         if batch.get("start_over"):  # the index starts over: nothing of the record before carries
             record = {"commit_number": record.get("commit_number", -1), "forced": record.get("forced") or {}}
-        run = self.m.runs.get(task["run"]) or {}
         report = result.get("outcomes") or {}
         counts = dict(record.get("counts") or {})
         for name, delta in (report.get("counts") or {}).items():
@@ -1369,8 +1368,6 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
             "commit_number": int(record.get("commit_number", -1)) + 1,
             "counts": counts,
             "last": batch["kind"],
-            # The configuration the partition runs under, for the runs retries start (§9).
-            "config": run.get("config") or {},
         }
         retry, more = batch.get("pass"), False
         delivered = (result.get("delivered") or {}).get(plan.get("param") or "", {})
@@ -1969,14 +1966,14 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
         self, asset: str, partitions, by: str | None, skip_missing_inputs: bool = False
     ) -> list[dict]:
         """Runs for a per-key asset's partitions that have keys to retry, each under
-        the configuration its partition last ran with (kept on its stored outcome):
+        the configuration its partition last ran with (its record's `config`):
         a retry under another configuration would read other inputs, and its
         new definition would redeliver every key (§9). Partitions already active
         are left to the run they are in."""
 
         by_config: dict[str, list[str]] = {}
         for partition in partitions:
-            config = (self.m.partition(asset, partition).get("outcomes") or {}).get("config") or {}
+            config = self.m.partition(asset, partition).get("config") or {}
             by_config.setdefault(json.dumps(config, sort_keys=True), []).append(partition)
         runs = []
         for config, group in sorted(by_config.items()):
