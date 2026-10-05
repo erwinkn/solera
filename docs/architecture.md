@@ -22,8 +22,8 @@ resolver), `versions.md` (what a key's version is), `key-index-format.md`
 Three rules:
 
 1. **The engine is control-plane only.** It records, for each `(output,
-   partition)`, the committed ref and its metadata, plus cursors, per-input
-   positions and automation state. It never moves, parses or interprets
+   partition)`, the committed ref and its metadata, plus cursors, what each
+   incremental input has processed, and automation state. It never moves, parses or interprets
    payloads. The one value-derived thing it keeps is each keyed output's
    **key index** (§6): per key, the generation that last wrote it, in a
    format it defines, computed by the worker.
@@ -51,7 +51,7 @@ etag) commits only the keys whose version moved.
 | **partition** | One partition key of an asset, or `""` when unpartitioned. |
 | **head** | The committed ref of `(output, partition)`. |
 | **ref** | A self-contained pointer into a store, with the generation that wrote it (§3). |
-| **commit** | The atomic transaction installing an attempt's result: heads, lineage, cursor, positions, key index deltas. |
+| **commit** | The atomic transaction installing an attempt's result: heads, lineage, cursor, what each input processed, key index deltas. |
 | **run** | A request to materialize targets. It plans **tasks**, one per `(asset, partition)`. |
 | **attempt** | One execution of a task. |
 | **cursor** | Per-partition JSON state the producer sets and receives back (§6). |
@@ -109,8 +109,8 @@ store-specific config validated by `can_store` at registration.
 |---|---|
 | `keyed` | The output is a `dict[str, Any]`: its keys are the keys, its values the content. Excludes `key`. |
 | `key` | Column identifying what was materialized. Declared once, here; consumers never name columns. A key holds every row that carries it — one, or the many rows parsed from one file. Independent of `primary_key` (storage identity). |
-| `incremental` | The output is committed in engine-numbered commits: a keyed output's changes land in its key index (object-store-state.md §6), an unkeyed one's rows in its store; `Incremental()` consumers read what arrived after their position. `key=` implies it. Default false — a value output is one object per version. |
-| `migrations` | Ordered `Migration(name, payload)` list owned by this output. The store applies pending ones before its first write to the output in an attempt (§4). Payload type is store-defined (`can_store`). The applied set travels in the handle (§3) and the declared list is in the fingerprint (§6). |
+| `incremental` | The output is committed in engine-numbered commits: a keyed output's changes land in its key index (object-store-state.md §6), an unkeyed one's rows in its store; `Incremental()` consumers read what changed since they last processed it. `key=` implies it. Default false — a value output is one object per version. |
+| `migrations` | Ordered `Migration(name, payload)` list owned by this output. The store applies pending ones before its first write to the output in an attempt (§4). Payload type is store-defined (`can_store`). The applied set travels in the handle (§3) and the declared list is in the definition (§6). |
 | `**config` | Store-specific: `schema`, `primary_key`, `columns`, `indexes`, `partition_column`, … |
 
 A key's version is the generation of the write that last wrote it
@@ -141,7 +141,7 @@ records lineage and cursor and fires nothing.
 | `partition` / `partitions` | canonical key string / dict view by dimension (§7) |
 | `partition_window` | `(start, end)` for time dimensions |
 | `cursor` | committed cursor, `None` on first run or `full` |
-| `batch[input]` | `Batch(rows, added, updated, removed, full, index, count, first, final, upstream)` for `Incremental` inputs (§6) |
+| `batch[input]` | `Batch(rows, added, updated, removed, unchanged, reset, index, count, first, final, upstream)` for `Incremental` inputs (§5; `behaviors.md` INC-10) |
 | `run_id`, `config` | the run and its config |
 | `execution` | resolved placement `{kind, cpu, memory: bytes, gpu}` |
 | `log(message, **fields)` | structured log line |
@@ -319,7 +319,7 @@ in the worker. The manifest records each store's name and `Store.version`
 (a class attribute, default `"1"`), not its construction config: a DSN or a
 grants list is deployment, not definition. Bump `version` when write, load,
 or key extraction changes; it bumps the deploy
-and the fingerprint (§6) of every asset that reads or writes
+and the definition (§6) of every asset that reads or writes
 through the store. A store must keep resolving handles written by its
 earlier versions.
 
@@ -348,7 +348,7 @@ input in the manifest. An input is one of three kinds: **whole** (`In`, a
 | Value | Meaning |
 |---|---|
 | `In(output=None, meta=None, all_partitions=False)` | whole: the value (or ref) of the output at its pinned head. Over upstream dimensions this asset lacks it fans in: `dict[partition, T]` over them, complete heads only (§7). `all_partitions=True` reads every partition of the upstream so — the shared dimensions too, with no projection of this asset's partition: `site_report` for `alpha` compares alpha's index with every other site's |
-| `Incremental(output=None, batch_size=10_000, meta=None, *, include=None, exclude=None)` | receive only what changed since this consumer's position — keys added, updated and removed on a keyed upstream, new batches on an unkeyed one (§6). On a keyed upstream, `include`/`exclude` globs (or `Regex`) select keys by name; pages are formed from the keys they take — read ahead past the others, at most 100,000 keys a page — so no page is empty, a pass they take nothing from is `skipped` without calling the producer, and a change of patterns cuts over: pending changes finish under the old ones, membership is diffed against the index at the pattern change (pinned until the diff ends), then deltas continue under the new (per-key-processing.md §11) |
+| `Incremental(output=None, batch_size=10_000, meta=None, *, include=None, exclude=None)` | receive only what changed since this consumer last processed it — keys added, updated and removed on a keyed upstream, new commits on an unkeyed one (§6). On a keyed upstream, `include`/`exclude` globs (or `Regex`) select keys by name; a change of patterns is an input change: the next run owes the difference in membership (`behaviors.md` CHG-4 to CHG-8) |
 | `Incremental(…, each=True, concurrency=64)` | Per-key incremental: an incremental input on a keyed upstream whose producer is written for **one key**: the parameter is that key's value (a rows upstream: its group), `ctx.key` its key. The worker calls it for every changed key of a batch, `concurrency` at once (64 by default; `batch_size`, 10,000 by default, is keys per commit, D111), stores the keys that succeeded as one `Patch({key: value})` per output, and keeps the ones that raised in the asset's stored outcomes, retried by their error class; deleted keys lose their rows without a call. One per asset, its other inputs whole, every output keyed. per-key-processing.md §5–§10 |
 
 **By value or by reference.** The annotation decides. `T` loads through the
@@ -359,57 +359,44 @@ be ref-annotated.
 
 **The parameter is the selection.** Under `Incremental` the value arrives
 filtered to the delivered keys or commits; `ctx.batch[name]` carries the
-rest. A pass comes in **batches** of `batch_size` keys (or upstream
-commits). The `Batch` says what changed and where it sits: `added`,
-`updated` and `removed` keys, `full` on every batch of a full pass (the whole head as of the pass's start, its snapshot — later changes come as the next delta — after a
-reset), `index` — the batch's 0-based index, exact — `count`, how many
-batches the pass was planned to take when it started (exact without
-patterns and with an exact key count, else an estimate), `first`
-(`index == 0`), and `final`, set when the pass has run out, never
-inferred from `count`. Batches hold only keys the input's patterns take,
-read ahead past the others, so `final` is on a real batch — unless a
-batch had to examine more than 100,000 keys to fill itself or to prove
-it is the last: it then goes as it is, not final, and the rest, if the
-patterns take nothing from it, completes the pass without calling the
-producer. One exception: a full pass always reaches its consumer, keys or
-none, because starting over must happen. A plain producer whose full
-pass takes no key is called once with an empty batch — `full`, `first`
-and `final` — and returns its new, empty content; a per-key producer,
-written for one key, is not called, and the cleanup after the full pass
-drops the keys its asset holds that the input no longer has. `upstream` carries facts about the upstream: its `output`,
-and for an unkeyed incremental upstream the range of `commits` the batch
-covers. The pass's plan is kept on the input's position while it
-continues, for keyed and unkeyed upstreams, delta passes and full passes
-alike. A consumer that rebuilds starts over when `full and first` —
-never on `full` alone, or each batch would erase the ones before it.
+rest. A run works through what the input owes in **batches** of up to
+`batch_size` keys (or upstream commits), in key order, each committed
+once. The `Batch` says what changed and where it sits: `added`,
+`updated`, `removed` and `unchanged` keys, `reset` on the first batch of
+a full run, `index` (0-based in the run), `count` (the batches planned,
+an estimate), `first` (`index == 0`), `final` (no batch of this run
+follows, never inferred from `count`), and `upstream`: its `output`, and
+for an unkeyed upstream the range of `commits` the batch covers. A full
+run always reaches its consumer, even when it owes no key: a plain
+producer is called once with an empty batch; a per-key producer is not
+called, and the keys its asset holds that the input no longer has are
+removed (`behaviors.md` INC-10, SEL-8 to SEL-11).
 
-**Added, updated, removed** (K44). Each key of a keyed batch is classed
-by its presence at the consumer's position and now, net over the batch's
-commits: `added` (absent at the position, present now), `updated`
-(present at both, at another version), `removed` (present at the
-position, absent now). A key added and removed again appears nowhere,
-and one removed and added back is updated; at a versioned source a key
-taken from `v1` to `v2` and back to `v1` is not delivered at all. A full
-pass delivers every key as added. A key a `keys=` run delivered is
-classed against what that run delivered (§6's read-ahead). Classes follow
-the index, rows the store: on a store of current rows only, a key in
-added or updated may come without a row if it was removed since, its
-removal following in a later batch (D100, per-key-processing.md §5). So a consumer
+**Added, updated, removed.** Each key is classed by what the consumer
+partition last processed of it against upstream now, under the current
+patterns: `added` (not held, present now), `updated` (held, at another
+version or under another whole or dep version), `removed` (held, absent
+or no longer taken now). Changes that cancel out deliver nothing; an
+update reverted to the processed version is delivered as `updated`.
+`unchanged` keys are loaded only because a `keys=` run named them. On a
+source read live, classes follow the version the source served, before
+the producer runs (`behaviors.md` INC-2 to INC-7, SRC-4). So a consumer
 can keep a total from the changes alone:
 
 ```python
 @asset(inputs={"items": Incremental()}, outputs=Output("tally"))
 async def tally(ctx, items: list):
     batch = ctx.batch["items"]
-    before = 0 if batch.full and batch.first else (await ctx.load())["rows"]
+    before = 0 if batch.reset else ((await ctx.load()) or {"rows": 0})["rows"]
     return {"rows": before + len(batch.added) - len(batch.removed)}
 ```
 
-`ctx.load()` is the asset's own output as committed at the attempt's pin.
-A full pass's first batch starts over and must not build on it.
+`ctx.load()` is the asset's own output as materialized, `None` before its
+first commit. A full run's first batch (`reset`) starts over and must not
+build on it (D166; `behaviors.md` SEL-9).
 
-**`deps=`** are unbound inputs: planned, pinned into lineage, caught up
-to as a whole input is (§6), watched by `OnChange()`, bound to no
+**`deps=`** are unbound inputs: planned, pinned into lineage, processed
+as a whole input is (§6), watched by `OnChange()`, bound to no
 parameter. An entry is an output's name, or `In(output,
 all_partitions=True)` to depend on every partition of it, the shared
 dimensions too; nothing else of an `In` means anything on a dep, which is
@@ -422,7 +409,7 @@ dimensions pins the heads that exist, like a whole fan-in (§7).
 producer. With a store it loads like any input; without one it is a lineage
 pointer. At registration it gets a synthesized head `{output, store,
 handle: {name, **handle}, meta.external: true}`,
-so pinning and fingerprinting are uniform.
+so pinning and versioning are uniform.
 
 The **commit API** advances a source without moving data:
 
@@ -479,58 +466,42 @@ stores the Graph feed's cursor.
 
 **`Incremental`.** Every commit that changes an incremental output gets
 the next commit number (`head.commit_number`). A keyed output (or keyed source) has
-a **key index** — an engine-owned log-structured merge tree of `(key,
-generation)` files (object-store-state.md §6): the worker resolves each
+a **key index** — an engine-owned index of `(key, generation)` entries,
+one delta per commit (object-store-state.md §6): the worker resolves each
 write against it, skips the store entirely when the write changes nothing
 (an empty patch, a set listed again), and otherwise writes the keys it
 writes and removes, at the attempt's generation, as the commit's delta file. An unkeyed output's commits
 are its store's; `head.base` is the first commit after its last reset. A move to another
-store resets the output altogether (object-store-state.md §2). The
-engine keeps a per-input **position** — how far the consumer has read: `next`,
-the first upstream commit not yet delivered, and while a pass is under
-way, `pass` `{mode, from, to, at, batch, batches}`: `full` or `delta`, its
-boundary, and its place (the last key delivered, or the next commit),
-all decided when it starts and kept until its last batch. For a keyed
-upstream the spec pins the index and a range — its changes from `next`
-to the head, or the whole index for a full pass — and the worker reads
-one batch of it (`batch_size` keys), loads those keys with `Keys(…)`, and
-reports where the batch ended (`after`); for an unkeyed one the engine plans
-a `Commits(lo, hi)` range. Each batch's commit advances the position by
-what it delivered (`pass.advance`); `more` re-queues the task. A
-pass's boundary is fixed when it starts, so one that ends behind the
-head its last batch was planned against — interrupted, then resumed after
-the upstream moved — goes on in the same task to what was committed
-meanwhile: the partition drains only once it has caught up. Whether the pass drained is the partition's
-(`caught_up := not more` on its record), not its outputs': a last batch may
-write none of them, and the partition is complete all the same. A partition is
-**complete** when each of its outputs has a head and its pass drained —
-a job, once a run of it succeeded. Selection (`"missing"`), a whole fan-in
-and the console all ask that one question.
+store resets the output altogether (object-store-state.md §2).
 
-The **fingerprint** `H(version, store versions of the asset's input and
-output stores, migration names of the asset's outputs, run config)` — the
-declaration and the run's configuration, nothing of the inputs — is
-stored on the position. A fingerprint mismatch — a `version` bump, a new
-migration, another run config — forces `full=True` on the input: the pass
-resets to the whole head. Code changes alone do not: the build identity
-(§11) bumps the deploy, not the fingerprint.
+For each consumer partition and incremental input the engine records what
+it has processed: per key, the upstream version (and the whole and dep
+versions it was processed under); for an unkeyed upstream, the last
+commit read (`observed-set.md`). What the partition **owes** is every key
+where that differs from upstream now, under the current patterns. A
+default run loads what is owed; `keys=` chooses another selection
+(§8). Each batch reads upstream as it is when that batch starts, and a
+task resumes from its last committed batch across attempts and restarts;
+a new run starts from the beginning (`behaviors.md` INC, RUN-5). A
+partition is **complete** when no key present upstream is one it has not
+processed since it last started over — a job, once a run of it
+succeeded. Selection (`"missing"`), a whole fan-in and the console all ask
+that one question (`behaviors.md` STA-10).
+
+The **definition** — the asset's `version`, its input bindings, the
+migration names of its outputs, the store versions of its inputs and
+outputs, and the run config — is recorded with what each partition
+processed. A different definition makes the partition stale (`definition
+changed`) and its next run a full run. Code changes alone do not: the
+build identity (§11) bumps the deploy, not the definition.
 
 A whole input or a dep that moves is an **input change**, not a
-definition change (semantic change d): the partition record keeps the
-versions it last caught up to (`seen`), and one that moved since makes a
-full pass due — the next default run reprocesses every key under the new
-version, as a fingerprint change does, and `keys=` runs continue that
-pass. Until it completes, every key is stale: the record keeps one
-version of each input per partition, not per key. A whole input written
-again, even with the same content, is a new generation, so it does the
-same (`versions.md` §7).
-
-A head written before the output was incremental has no key index: "no keys
-known"; the consumer's position starts empty and the next write upserts
-everything. A `version` bump is an asset change like any other: the next
-attempt of each partition starts over, and the full pass it begins may be
-completed by any runs, `keys=` ones included (`positions-from-reads.md`);
-until then the partition is stale, `definition changed`.
+definition change: every key processed under its old version is owed an
+update; a `keys=` run processes the keys it names under the new one. A
+whole input written again, even with the same content, is a new
+generation, so it does the same (`versions.md` §7; `behaviors.md` CHG-10,
+CHG-11). A full run, once due, may be carried out by several runs, `keys=`
+ones included; until then the partition is stale (`behaviors.md` SEL-12).
 
 ## 7. Partitions
 
@@ -616,13 +587,13 @@ A run is `{targets, partitions, mode, upstream, config, keys}`:
 | `mode` | `incremental` (default) or `full` |
 | `upstream` | also plan the upstream closure; default false: **targets only, inputs pinned to current heads**, so a rebuild never re-polls an external system |
 | `config` | JSON passed as `ctx.config` |
-| `keys` | per-input override `{"qaqc_files": {"keys": [...]} \| "full"}`: explicit keys are delivered as that input's selection; `full` resets the input — the whole head as a reset pass |
+| `keys` | per input, what the run loads: `{"qaqc_files": {"keys": [...]}}` (those keys, each in its class or `unchanged`), `"all"` (every key under the patterns, nothing reset), or, by default, what is owed. A full run is `mode="full"`, not a `keys` value (`behaviors.md` SEL-1 to SEL-8) |
 
 **Modes.** `incremental`: the store builds on `prior` = head, the cursor is
-kept, `Incremental` inputs get the position diff. `full`: a reset write, no
-cursor, every incremental input resets to the whole head and its position
-lands past the head commit; the store makes the output equal to
-exactly this write. `keys=full` resets one input only: `prior` is kept.
+kept, `Incremental` inputs get what they owe. `full`: a reset write, no
+cursor, every upstream key under the patterns is owed again, the first
+batch says `reset`, and the store makes the output equal to exactly what
+the run writes.
 
 **Attempts.** A task is claimed, so one attempt at a time writes an
 (asset, partition) (`lifecycle.md` §3.1). Inputs are resolved to heads
@@ -635,7 +606,7 @@ attempt, so exactly one side wins (object-store-state.md §8). Outcomes:
 | Outcome | Meaning |
 |---|---|
 | `succeeded` | committed |
-| `skipped` | every `Incremental` input was already at its head (empty diff) and the partition is complete: no worker launched, nothing changes |
+| `skipped` | nothing is owed and the partition is complete: no worker launched, nothing changes |
 | `failed` | retryable → `retries=` applies with backoff; non-retryable (deploy mismatch) → task fails |
 | `canceled` | run canceled before the attempt began writing; an attempt already writing is committed instead |
 
@@ -649,7 +620,7 @@ anything else is `Failed` (per-key-processing.md §8). For an attempt:
 `retry_after`, else one minute doubling to six hours, past `retries=`,
 until `retry_for` (24 h by default) has passed since its first failure.
 
-A commit installs heads, `input_refs`, the cursor, per-input positions and a
+A commit installs heads, `input_refs`, the cursor, what each input processed, and a
 `changed` list, and pends `OnChange` automations in the same transaction.
 Every terminal task outcome also records `{last_outcome, last_attempt, at}`
 on the `(asset, partition)` record, and queued or running tasks are indexed per
@@ -675,7 +646,7 @@ engine outages don't count as wait.
 **Retention.** `@asset(retention=Retention(days=…, runs=…))` bounds an
 asset's history; `Project(retention=…)` sets the default and
 `Retention(forever=True)` opts out of it (object-store-state.md §11). Current
-state — heads, key indexes, cursors, positions — never depends on runs and
+state — heads, key indexes, cursors, what inputs processed — never depends on runs and
 never expires. Every `retention_interval` (60 s) the engine deletes finished
 runs — their attempt files and logs under `runs/{run}/`, and their history
 rows — that every asset they ran has let go of; only runs in progress are protected. Data never
@@ -708,7 +679,7 @@ a list, any of which fires it.
 |---|---|---|
 | `name` | required; key for toggles | derived `{asset}.{trigger}.{index}` |
 | `targets` | required: assets, singleton or list | the asset |
-| `partitions` | `"latest"` · `"missing"` · `"all"` · `[k…]`; default `"latest"` for `Every`/`Cron`, the projection of the changed partition for `OnChange` — a source has no dimensions, so its change reaches every partition of the target (bounded like `"all"`). Named partitions run as named, whatever changed. A firing is one run over every target, so a target that reads another waits for it. A change stays pending — never consumed — while a partition it is owed is claimed or queued in any run (that work would not see it, and the firing could not order after it), and while a target reading the change through a whole fan-in cannot see it yet: a pass under way is read once it completes | same |
+| `partitions` | `"latest"` · `"missing"` · `"all"` · `[k…]`; default `"latest"` for `Every`/`Cron`, the projection of the changed partition for `OnChange` — a source has no dimensions, so its change reaches every partition of the target (bounded like `"all"`). Named partitions run as named, whatever changed. A firing is one run over every target, so a target that reads another waits for it. A change stays pending — never consumed — while a partition it is owed is claimed or queued in any run (that work would not see it, and the firing could not order after it), and while a target reading the change through a whole fan-in cannot see it yet: a run under way is read once its last batch commits | same |
 | `enabled` | default `True` | default `True` |
 
 | Trigger | Fires |
@@ -759,7 +730,7 @@ environment}}`; the server rebuilds placements from a registry of kinds
 `Project(executors=[MyKind("name", ...)])`, which the server must be able
 to import since `launch` runs in the engine). Each launched attempt records
 where it ran and what it asked for (object-store-state.md §7).
-Placements are not part of the fingerprint. `retries=` and
+Placements are not part of the definition. `retries=` and
 `timeout=` are engine policy. `ctx.placement` is the placement's serialized
 form.
 
@@ -858,10 +829,9 @@ code.
 
 - `inputs` holds every pin by input name, including `deps`; the manifest
   says which bind parameters. `batch` is what to deliver — for a keyed
-  upstream a range of its pinned key index (its changes over commits
-  `from`–`to`, or the whole index when `full`), read `limit` keys at a time from `after`; for
-  an unkeyed one the `[lo, hi]` `Commits` range; a run's `keys=` override
-  names its keys outright. `full` marks a reset pass.
+  upstream the keys the engine planned for this batch, with their classes
+  (`observed-set.md`); for an unkeyed one the `[lo, hi]` `Commits` range.
+  `full` marks a full run's batch.
 - `outputs` is each output's one launch record: its committed head
   (`before`, where its content is), whether the write starts it over
   (`reset`: a first write, or a `full` run, which also withholds the

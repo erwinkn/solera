@@ -7,8 +7,8 @@ that changes an entry changes the contract, and says so. Entries become
 scenario tests, property tests against a reference model, and a
 behavioural TLA+ spec (T40, T41).
 
-Checked against `origin/main` at `4c6608b` ("The simulation checks that
-stored counts sum to the outcome index"). Test paths are under `tests/`; `sim` invariants are
+Checked against `origin/main` at `8fceb63` ("object-store-state.md says
+what the state holds now"); open questions resolved by T42. Test paths are under `tests/`; `sim` invariants are
 `tests/sim/machine.py`; TLA+ specs are `spec/tla/`.
 
 ## How to read it
@@ -92,7 +92,7 @@ about k4 and is not stale. A key removed and added back is `updated`.
 `feed`'s k1 goes @1 → @2 → @1 before `items` runs: `items` gets k1 as
 `updated`. Accepted cost: upstream history keeps no old versions, so a
 key changed since it was processed is known only to have changed.
-*From* review A31 R2 (`observed-set.md`, "What the index can say"). *Covered* `server/test_staleness.py::test_a_key_updated_and_reverted_reads_as_updated`. Contradicted by `architecture.md` §5 (Q4).
+*From* D156; review A31 R2 (`observed-set.md`, "What the index can say"); Q4. *Covered* `server/test_staleness.py::test_a_key_updated_and_reverted_reads_as_updated`.
 
 **INC-5. A total kept from the classes alone stays exact.**
 `tally` = what it held + `len(added)` − `len(removed)`. After any history
@@ -130,15 +130,17 @@ loaded only because the run named them, SEL-1), `rows` (of added, updated
 and unchanged; removed keys have none, and `rows` is the parameter),
 `index` (0-based in the run), `count` (batches planned, an estimate),
 `first`, `final` (no batch of this run follows; never inferred from
-`count`), `upstream` (its output; for an unkeyed upstream the commit
-range). A run of 3 batches gives `index` 0, 1, 2 and `final` only on the
-last.
-*From* D44, D140 (4), D157. *Covered* `server/test_engine.py::test_a_batch_says_where_it_sits_in_its_pass`; `server/test_engine.py::test_the_batch_plan_is_an_estimate_but_final_is_not`. Today the batch also carries `full` (Q1).
+`count`), `reset` (the first batch of a full run, SEL-9), `upstream` (its
+output; for an unkeyed upstream the commit range). A run of 3 batches
+gives `index` 0, 1, 2 and `final` only on the last.
+*From* D44, D140 (4), D157. *Covered* `server/test_engine.py::test_a_batch_says_where_it_sits_in_its_pass`; `server/test_engine.py::test_the_batch_plan_is_an_estimate_but_final_is_not`. `reset` replaces today's `full` in W22's step 6 (Q1).
 
 **INC-11. `ctx.load()` returns the asset's own output as materialized; `None` before its first commit.**
 `tally`'s second batch reads `{"rows": 2}` committed by its first, and adds
 to it.
-*From* D44, D166 (chain: D141 → D166). *Covered* exercised by `tally` in every `server/test_observed_histories.py` test; no dedicated test. In a full run, today's behaviour differs (Q1).
+In a full run too: batch 0 says `reset`, and `ctx.load()` still returns
+what was materialized before it (SEL-9).
+*From* D44, D166 (chain: D141 → D166); Q1. *Covered* exercised by `tally` in every `server/test_observed_histories.py` test; no dedicated test. The full-run case is being built in W22's step 6.
 
 **INC-12. A task walks what it owes in key order, `batch_size` keys a commit.**
 Seven owed keys, `batch_size=3`: three batches, three commits. Default
@@ -285,11 +287,12 @@ ends with the ten processed.
 **SEL-7. `keys={input: "all"}` loads every key under the patterns without starting over.**
 Owed keys in their class, the rest `unchanged`; nothing is reset.
 `keys={"rates": "all"}`.
-*From* D140 (3). *Covered* none: not reachable from the run API (Q3).
+*From* D140 (3); Q3. *Covered* none: being built in W22's step 6 (today the planner has it, the run API does not).
 
 **SEL-8. A full run owes every upstream key under the patterns; a plain consumer starts over.**
-`mode="full"`, `keys={input: "full"}`, or an automatic full run (CHG-1,
-RST-1). `tally`'s first batch starts its count from zero; its cursor is
+`mode="full"`, or an automatic full run (CHG-1, RST-1). A full run is the
+run's mode, never a `keys=` value (Q3; today's `keys={input: "full"}`
+goes in W22's step 6). `tally`'s first batch starts its count from zero; its cursor is
 `None`; the run continues batch by batch across attempts.
 *From* D141, D166, D140. *Covered* `server/test_engine.py::test_a_full_run_starts_its_record_over`; `server/test_engine.py::test_result_cursor_and_omitted_output`; `server/test_each_review.py::test_a_full_run_reads_every_key_once_in_batches`.
 
@@ -297,7 +300,7 @@ RST-1). `tally`'s first batch starts its count from zero; its cursor is
 `tally` sees `batch.reset == True` on batch 0 and ignores `{"rows": 7}`
 from `ctx.load()`; later batches build on what batch 0 committed.
 Per-key producers never see `reset`.
-*From* D166 (chain: D141 → D166; D140 (4) drops `Batch.full`). *Covered* none: not built; today `batch.full and batch.first` (Q1).
+*From* D166 (chain: D141 → D166; D140 (4) drops `Batch.full`); Q1. *Covered* none: being built in W22's step 6; today `batch.full and batch.first`.
 
 **SEL-10. A per-key consumer's full run keeps its outputs readable and removes what upstream lacks.**
 `checks` holds k1, k2, x9; upstream has k1, k2, k3. The full run calls k1
@@ -465,7 +468,7 @@ nothing. Served at the version already processed: nothing.
 `feed` commits k1@3; before `items` reads it the outside loses k1:
 `items` processes k1 as absent. `feed` restores k1@3: `items` is owed k1
 (added). A commit that removes k1 owes nothing more.
-*From* D147, D126 (chain: D56 → D70 → D93 → D100 → D126/D147); F33, F38, F41. *Covered* `server/test_source_behind.py::test_a_key_the_source_lost_is_observed_absent`; `server/test_source_behind.py::test_the_next_commit_restoring_the_key_delivers_it`; `server/test_source_behind.py::test_the_next_commit_removing_the_key_owes_nothing`; `server/test_source_behind.py::test_a_per_key_batch_observes_it_alike`; `server/test_sim_found.py::test_a_key_a_current_read_missed_reaches_its_consumer_once_restored`; `sim/test_replays.py::test_f41_a_consumer_that_read_a_removal_does_not_keep_the_key`. Contradicted by `versions.md` §6 (Q5).
+*From* D147, D126 (chain: D56 → D70 → D93 → D100 → D126/D147); F33, F38, F41. *Covered* `server/test_source_behind.py::test_a_key_the_source_lost_is_observed_absent`; `server/test_source_behind.py::test_the_next_commit_restoring_the_key_delivers_it`; `server/test_source_behind.py::test_the_next_commit_removing_the_key_owes_nothing`; `server/test_source_behind.py::test_a_per_key_batch_observes_it_alike`; `server/test_sim_found.py::test_a_key_a_current_read_missed_reaches_its_consumer_once_restored`; `sim/test_replays.py::test_f41_a_consumer_that_read_a_removal_does_not_keep_the_key`. D56 (fail, retryable) is retired by D147 (Q5).
 
 **SRC-6. A keyed source loaded as data must be able to say what it served.**
 No loader, and a store that cannot serve it (no `version_column`, no
@@ -555,12 +558,13 @@ its new version.
 *From* `per-key-processing.md` §9; F31. *Covered* `server/test_each.py::test_a_retry_pass_spans_batches_and_accumulates_its_bounds`; `server/test_each_passes.py::test_a_run_finishes_the_pass_it_began_before_it_ends`.
 
 **KEY-9. A cancelled per-key batch commits its finished keys.**
-Cancel while b and d run: a, c, e(removed) commit; b, d stay owed. Reason
-`user`: they show `canceled` and nothing restarts them on its own.
-Reason `timeout`: `timed_out`, a try counted, due after backoff, `failed`
-past `retries=`. A user cancel during a timeout's drain makes them
-`canceled`.
-*From* `per-key-processing.md` §5; D139. *Covered* `server/test_each.py::test_a_user_cancel_commits_finished_keys_and_leaves_the_rest_owed`; `server/test_each.py::test_a_timeout_drain_counts_a_try_and_comes_due`; `server/test_each_review.py::test_5_a_user_cancel_during_a_timeout_drain_makes_its_keys_canceled`.
+Cancel while b and d run: a, c, e(removed) commit; b, d stay owed, so the
+partition is stale and the next run of it, whatever starts it, processes
+them. Reason `user`: they show `canceled`, and nothing starts a run for
+them alone. Reason `timeout`: `timed_out`, a try counted, due after
+backoff, `failed` past `retries=`. A user cancel during a timeout's drain
+makes them `canceled`.
+*From* `per-key-processing.md` §5; D139; Q15 (Erwin: cancelled keys need no machinery of their own). *Covered* `server/test_each.py::test_a_user_cancel_commits_finished_keys_and_leaves_the_rest_owed`; `server/test_each.py::test_a_timeout_drain_counts_a_try_and_comes_due`; `server/test_each_review.py::test_5_a_user_cancel_during_a_timeout_drain_makes_its_keys_canceled`.
 
 **KEY-10. A full run starts the failing keys over.**
 `checks` v1 leaves k1 failing; v2 makes a full run due: k1's failure goes
@@ -580,7 +584,7 @@ In order of precedence: `removed` (no longer in the partition set),
 `running`, `failed` (its last outcome), `stale`, `materialized`
 (complete), `missing`. A built partition that is stale shows `stale` even
 if incomplete.
-*From* D177, D38. *Covered* `server/test_api.py::test_partitions_read_scope_records_not_task_history`; `server/test_api.py::test_failed_scope_reports_complete_after_success`; `server/test_console_api.py::test_assets_status_rolls_up_every_asset`. `pending` is decided but absent (Q7).
+*From* D177, D38. *Covered* `server/test_api.py::test_partitions_read_scope_records_not_task_history`; `server/test_api.py::test_failed_scope_reports_complete_after_success`; `server/test_console_api.py::test_assets_status_rolls_up_every_asset`. No `pending` status for now (STA-12).
 
 **STA-2. A stale partition says every reason that holds.**
 `input changed` (an input owes something), `upstream stale` (a partition
@@ -642,10 +646,12 @@ A three-batch run's commit rows say `final` false, false, true; a
 cancelled run logs no `true`.
 *From* D177. *Covered* `server/test_complete.py::test_each_commit_logs_whether_it_was_its_runs_last_batch`.
 
-**STA-12. Freshness is exact or `pending`, never a guess.**
-Where the comparison needs a full compare not yet made (a prefixless
-pattern change at 100M keys), the partition says `pending`.
-*From* D157; review A27 R10. *Covered* none: not built in partition statuses (Q7).
+**STA-12. Freshness is computed exactly when asked; there is no `pending` status.**
+After a prefixless pattern change on 100M keys, asking for the status runs
+the full compare; it is never guessed and never shown as `pending`. A
+`pending` status waits for a background staleness cache, which does not
+exist yet.
+*From* coordinator, rebuild step 5 (Q7; D157's `pending` deferred); review A27 R10. *Covered* `server/test_staleness.py::test_staleness_matches_the_reference_over_any_history`; `ObservedSet.tla` StaleExact.
 
 ## PAR — partitions, fan-in, broadcast, dynamic partitions
 
@@ -917,8 +923,11 @@ On by default for `--insecure` loopback serves, `--reload` elsewhere.
 Saves are debounced; attempts in flight finish under their own deploy.
 *From* D174. *Covered* `server/test_reloading.py::test_a_code_change_is_served_and_a_broken_one_is_not`; `server/test_reloading.py::test_redeploy_serves_another_deploy_in_place`.
 
-**DEP-3. A worker on another deploy fails its attempt, saying why.**
-*From* `architecture.md` §8. *Covered* `worker/test_worker.py::test_revision_mismatch_writes_failed_result`; `sdk/test_build.py::test_the_engine_warns_when_a_worker_computed_its_revision_another_way`.
+**DEP-3. An attempt finishes under the deploy it was launched with.**
+A new deploy (or a local reload) neither stops nor fails attempts in
+flight. A worker whose code is another deploy than its attempt's fails
+it, not retryably, saying why.
+*From* D174; Q16; `architecture.md` §8. *Covered* `worker/test_worker.py::test_revision_mismatch_writes_failed_result`; `sdk/test_build.py::test_the_engine_warns_when_a_worker_computed_its_revision_another_way`.
 
 **DEP-4. A sensor host on old code takes no ticks and restarts on the new.**
 *From* `lifecycle.md` §11. *Covered* `server/test_sensors.py::test_a_host_on_another_revision_gets_no_ticks`; `server/test_sensors.py::test_a_host_on_old_code_waits_then_starts_afresh`.
@@ -943,11 +952,11 @@ g5 writes {a:1}, a reader pins it; g9 writes {a:2}: the reader still
 reads a:1.
 *From* `stores.md`. *Covered* `sdk/test_store_conformance.py::test_shipped_stores_conform` ("a pinned read returns its version"); sim `committed_keys_are_readable`.
 
-**STO-3. A fenced store's read returns current rows, and says which write it saw.**
-A consumer pinned at g12 that reads after g13 committed reads g13's rows,
-and lineage records 13. A row changed since is delivered again with its
-own change (a harmless repeat).
-*From* `stores.md`, "What a read sees"; D144 (1) (Q14). *Covered* `server/test_lineage_reads.py::test_lineage_says_what_a_current_read_saw`; sim `reads_say_what_they_read`.
+**STO-3. A batch on a fenced store is classed at the write its read saw.**
+A batch planned at g12 reads Postgres after g13 committed: it is classed
+at g13, so its classes and rows agree key by key, and lineage records 13.
+A store that moved on since planning makes the batch replan, not fail.
+*From* D144 (1); Q14; `stores.md`, "What a read sees". *Covered* partly: the generation read, `server/test_lineage_reads.py::test_lineage_says_what_a_current_read_saw`, sim `reads_say_what_they_read`; the classes are being built in W22's step 4b (today a newer row is delivered again later with its own change).
 
 **STO-4. On a fenced store a stale writer changes nothing.**
 g5 writes; g9 acquires and writes; g5 writes again: refused. One
@@ -973,40 +982,14 @@ fails. A `bytes` key fails the write rather than vanishing.
 
 ## Contradictions, gaps and open questions
 
-For Erwin; none is resolved here.
+Numbers are stable: entries refer to them.
 
-1. **`Batch.full` vs `batch.reset`, and `ctx.load()` in a full run.** D140 (4)
-   drops `Batch.full`; D166 adds `batch.reset` and says `ctx.load()`
-   always returns what's materialized. Built: `Batch.full` (SDK,
-   `architecture.md` §5), and `observed-set.md` still says `ctx.load()`
-   returns `None` until a full run's first commit (D141). SEL-9, INC-11.
-2. **Stale docs.** `architecture.md` §5–§6 and `per-key-processing.md` §5,
-   §9, §11, §16 still describe positions, passes, the pattern cut-over and
-   D100's rowless deliveries, all deleted by the rebuild (D153).
-   `glossary.md` likely too (not checked entry by entry).
-3. **`keys="all"` vs `"full"`.** D140 (3) gives `keys=` three forms: a
-   list, `"all"`, or default. The run API takes a list or `"full"` (a full
-   run of that input, which starts over); `"all"` exists in the planner
-   but nothing reaches it. Two behaviours, one name each? SEL-7, SEL-8.
-4. **A reverted update.** `architecture.md` §5: at a versioned source, v1 →
-   v2 → v1 is not delivered. `observed-set.md` and the test: delivered as
-   updated. INC-4.
-5. **A key missing from a source.** `versions.md` §6 still says the load
-   fails, retryably (F33, Erwin's answer D56); D147 and the code process
-   it as absent. Confirm D56 is retired. SRC-5.
+### Open, for Erwin
+
 6. **Do pattern changes still trigger the asset-change rule?** D34 lists
    patterns among asset changes (an `OnChange` firing owed at the deploy);
    D140 (2) makes them an input change. Does narrowing `include` still owe
    a firing, or only make the partition stale? AUT-4, CHG-4.
-7. **`pending`.** D157 and `observed-set.md` say a partition whose full
-   compare is not yet made reports `pending`; partition statuses have no
-   such value (only `explain` does). STA-12.
-8. **D180 is not built.** Key-level lineage per batch and history back to
-   the oldest retained run are T39. Today a key outcome's `removed` and
-   processed version reach back only as far as upstream history happens to
-   be kept. HIS-5.
-9. **Sources: `copy=True` and loader version bumps** (D146, D147) have no
-   implementation or test found. SRC-8, SRC-9.
 10. **A removed dynamic partition's data.** `architecture.md` §7 keeps its
     heads read-only; `stores.md` lists `cleanup(o, partition=p)` "for a
     removed dynamic partition". Is it ever cleaned up, and after what
@@ -1024,30 +1007,55 @@ For Erwin; none is resolved here.
 13. **Upkeep that keeps failing.** D181 (an agent decision, awaiting
     review) replaced A17 R8's "stop merging for the index's life" with a
     back-off; built in `a6ece2a`. Confirm it. ENG-14.
-14. **Fenced reads and classes.** D144 (1): a batch on a fenced store is
-    classed at the version its read saw, so classes and rows agree key by
-    key, and a dead writer's partition stalls its consumers until repaired.
-    Not built: today classes follow the engine's view and a newer row is
-    delivered again later. STO-3.
-15. **Cancelled per-key keys: owed but not due.** `per-key-processing.md`
-    §5: user-cancelled keys "run again only when a later run is requested";
-    `observed-set.md`: they stay owed, so the partition is stale and any
-    next run (an `OnChange` firing for an unrelated key) processes them.
-    Both hold today; is the second intended? KEY-9.
-16. **A deploy mismatch: retryable or not?** `architecture.md` §8 calls it
-    non-retryable (the task fails); D174 has in-flight attempts finish under
-    their own deploy. DEP-3.
 17. **Decisions awaiting review:** D178 (internal: keys read from the
-    attempt spec, built in `ea2ec14`; dynamic partition list derived;
-    unkeyed lives) and D181.
+    attempt spec, built in `ea2ec14`; dynamic partition list derived,
+    built in `75539a9`; unkeyed lives) and D181.
     D76 and D162 were marked not okay and are superseded (D78, D168).
+
+### Gaps: decided, not built
+
+8. **D180 is not built.** Key-level lineage per batch and history back to
+   the oldest retained run are T39. Today a key outcome's `removed` and
+   processed version reach back only as far as upstream history happens to
+   be kept. HIS-5.
+9. **Sources: `copy=True` and loader version bumps** (D146, D147) have no
+   implementation or test found. SRC-8, SRC-9.
 18. **D173's console disclosure** is covered only by the console's
     Playwright tests, not checked against these entries. RUN-14.
+
+### Resolved (T42)
+
+1. **`Batch.full` vs `batch.reset`, `ctx.load()` in a full run.** D166
+   wins: the first batch of a full run says `batch.reset`, and `ctx.load()`
+   always returns what's materialized; being built in W22's step 6. INC-10,
+   INC-11, SEL-9.
+2. **Stale docs.** `architecture.md` §1–§10, `versions.md` §6–§8 and
+   `per-key-processing.md` now state the contract and point here
+   (`observed-set.md`, the key-index docs, `glossary.md` and
+   `object-store-state.md` are held for the redesign).
+3. **`keys=` forms.** `keys=` takes a list, `"all"`, or the default (what
+   is owed); a full run is the run's `mode="full"`, not a `keys` value
+   (Erwin, in the rebuild decisions); built in W22's step 6. SEL-7, SEL-8.
+4. **A reverted update** is delivered as updated (D156); `architecture.md`
+   §5 is fixed. INC-4.
+5. **A key missing from a source** is processed as absent: D147 retires
+   D56; `versions.md` §6 is fixed. SRC-5.
+7. **`pending`.** No `pending` partition status until a background
+   staleness cache exists; statuses are computed exactly on demand
+   (coordinator, rebuild step 5). STA-12.
+14. **Fenced reads and classes.** D144 (1) stands: classes and rows agree
+   key by key, and a store that moved on makes the batch replan, not fail;
+   being built in W22's step 4b. STO-3.
+15. **Cancelled per-key keys** stay owed, and any next run processes them:
+   intended (Erwin: cancelled keys need no machinery). KEY-9.
+16. **A deploy mismatch.** D174 wins: attempts in flight finish under their
+   own deploy; a worker running other code fails its attempt, not
+   retryably. DEP-3.
 
 ## Coverage summary
 
 "Covered" means at least one test, sim invariant or TLA+ property cited
-exists on `4c6608b`; "partly" entries cite a test of today's behaviour
+exists on `8fceb63`; "partly" entries cite a test of today's behaviour
 where the decided one is not built.
 
 | Area | Entries | Covered | Partly | None |
@@ -1059,19 +1067,19 @@ where the decided one is not built.
 | RST resets, moves, renames | 8 | 8 | 0 | 0 |
 | SRC sources | 11 | 9 | 0 | 2 (SRC-8, SRC-9) |
 | KEY per-key, key outcomes | 11 | 11 | 0 | 0 |
-| STA staleness, completeness | 12 | 11 | 0 | 1 (STA-12) |
+| STA staleness, completeness | 12 | 12 | 0 | 0 |
 | PAR partitions | 9 | 9 | 0 | 0 |
 | AUT automations | 7 | 7 | 0 | 0 |
 | HIS history, lineage | 6 | 5 | 0 | 1 (HIS-5) |
 | CLN cleanup, retention | 11 | 10 | 0 | 1 (CLN-11) |
 | ENG crashes, fencing | 16 | 16 | 0 | 0 |
 | DEP deploys, reload | 6 | 6 | 0 | 0 |
-| STO stores | 7 | 7 | 0 | 0 |
-| **Total** | **157** | **148** | **1** | **8** |
+| STO stores | 7 | 6 | 1 (STO-3) | 0 |
+| **Total** | **157** | **148** | **2** | **7** |
 
 ## Appendix: entries to today's mechanisms
 
-How `4c6608b` implements each area, for anyone running a new design
+How `8fceb63` implements each area, for anyone running a new design
 through the contract. Nothing above depends on it.
 
 | Area | Mechanism today |

@@ -5,7 +5,10 @@ groups by key, the stored outcomes, retry passes, forced retries, the drain on
 cancel, `key_outcomes`, key patterns and pattern changes); the engine's
 match-count hints (§11) and summary recomputation (§9) are deferred, and
 `solera explain` (§10) is an API, not a CLI; §12 follows `lifecycle.md`
-§11 (sensors). §16 records where the build departs from this text. It
+§11 (sensors). §16 records where the build departs from this text. Since
+the observed-set rebuild (D153) inputs have no positions or passes: a run
+loads what each partition owes, batch by batch (`observed-set.md`), and
+`behaviors.md` is the contract where this text and it differ. It
 covers a per-key input (an asset written for one key, run over every
 changed key), keys that hold many rows, per-key outcomes with
 user-classified errors, key patterns on inputs, and observable sources. It builds on the engine cache, the HTTP resolver,
@@ -59,8 +62,8 @@ Solera exception the user's error subclasses — `Rejected`, `Failed`,
 `Transient`, `Abort` — and a key that did not succeed lands in the input's
 **stored outcomes**, a key index of its own, so it is visible, retried on a
 bounded schedule, and never blocks the keys behind it. `include` and
-`exclude` patterns on an input select keys by name; the worker evaluates
-them on every batch it reads. A `Source` subclass with `observe()` is
+`exclude` patterns on an input select keys by name; the engine evaluates
+them when it plans each batch. A `Source` subclass with `observe()` is
 polled by a sensor and committed like the commit API. Throughout, the engine sees
 keys, generations and sources' versions only.
 
@@ -68,7 +71,7 @@ keys, generations and sources' versions only.
 
 | Piece | Lives in | Knows |
 |---|---|---|
-| Key indexes, positions, the stored outcomes, key patterns | engine | key strings, generations, payloads (opaque bytes), outcome classes |
+| Key indexes, what each input processed, the stored outcomes, key patterns | engine | key strings, generations, payloads (opaque bytes), outcome classes |
 | The per-key loop, error classification | worker | a batch of keys; each key's value is opaque |
 | Splitting a batch into per-key values; reading a write's keys; stamping the key column; replacing a key's rows | store | its own types |
 | SharePoint, samples, what counts as unprocessable | user code | everything else |
@@ -208,7 +211,7 @@ batch: a b c d (changed), e (deleted)
   d → TimeoutError                       failed (unclassified)
   e                                      removed
 store.store(Patch({a: …, b: …}, remove=[e]))      one write per output
-commit: delta files · position → commit 42 · stored outcomes: +c, +d
+commit: delta files · a b c d e processed · stored outcomes: +c, +d
 ```
 
 **Cancel and timeout keep finished keys.** They follow the attempt's
@@ -222,8 +225,8 @@ two-phase cancel (`lifecycle.md` §7); for a per-key batch the phases are:
    batch — records the keys it did not finish as **interrupted** in the
    outcome delta by the record's `reason` (table below), and publishes
    all of it as one result with `status: canceled`, carrying the record
-   as §2.2 says. The engine commits outputs, outcome delta and position
-   as one journal decision.
+   as §2.2 says. The engine commits outputs, outcome delta and what the
+   input processed as one journal decision.
 2. **Forced abort,** after `cancel_grace` without a result: the record's
    phase becomes `forced` and the attempt ends as `lifecycle.md` §7
    describes. Nothing of the batch commits and it is delivered again;
@@ -233,15 +236,14 @@ two-phase cancel (`lifecycle.md` §7); for a per-key batch the phases are:
 
 Finished keys need not be a key-order prefix of the batch — its
 `concurrency` workers run several keys at a time, and `a c d` may finish
-while `b` is still reading. So the
-position does not stop at the first unfinished key: it moves past the
-whole batch, exactly as on success, and the holes are carried by the
-stored outcomes instead.
+while `b` is still reading. So the batch commits its finished keys as
+processed, and its interrupted ones stay owed, carried by the stored
+outcomes (`behaviors.md` KEY-9).
 
 ```
 batch: a b c d e(deleted)   cancel requested while b, d are in flight
 store.store(Patch({a: …, c: …}, remove=[e]))
-result status: canceled → one commit: position past e · stored outcomes +b, +d interrupted
+result status: canceled → one commit: a c e processed · b, d owed · stored outcomes +b, +d interrupted
 ```
 
 What happens to the holes depends on the record's `reason`:
@@ -254,26 +256,14 @@ What happens to the holes depends on the record's `reason`:
 The attempt ends `canceled` or `timed out`, with the outputs it
 committed; an attempt timeout stays retryable within `retries=`.
 
-**A store of current rows (D100).** A batch's classes follow the key
-index, at its pass's version — a full pass's snapshot, a delta's end —
-and its rows follow the store. On a current-only store, rows show the
-store's newest state. A key in added or updated may come without a row if
-it was removed since; its removal follows in a later batch. A key changed
-after the pass's version may arrive once more as updated. A row missing
-while the source's head index still names the key is the store behind
-its index instead: `SourceBehind`, retryable and bounded (F33). So a
-count kept from the classes stays exact. *Example:* a full pass's
-snapshot holds k1 and k2, a key a batch. k1's batch adds it: count 1. The
-source removes k2 (commit c). k2's batch reads the snapshot, which still
-names k2: added, with no row — count 2. The pass completes at the
-snapshot, and the delta to c removes k2: count 1, the source's. Had k1
-been updated at c before its batch, the batch adds k1 with its new row
-(count 1), and the delta says updated (count 1). A delta the same way: k1
-and k2 updated (version 2); after k1's batch the source removes k2
-(commit 3); k2's batch finds no row, so k2 is updated with no row (count
-2), and the delta to 3 removes it (count 1). A per-key asset drops a key
-it finds gone at once instead: its output index is what it holds, and
-dropping a key twice is harmless.
+**A source read live (D147).** A batch's classes follow what the source
+served, decided before the producer is called: a key served absent is a
+removal if the partition held it, else nothing; one served at the version
+already processed is nothing; one served ahead of its commit is classed
+from what was served. A key the source lost without a commit is
+processed as absent, and a later commit restoring it delivers it again.
+So a count kept from the classes stays exact (`behaviors.md` SRC-4,
+SRC-5).
 
 ## 6. Every key is a group
 
@@ -321,7 +311,7 @@ replacement simply leaves it out).
 
 "Processed, produced nothing" is not output content: a key's existence is
 its rows. That a key was processed is recorded by its outcome
-(`key_outcomes`, §10) and by the position that moved past it; the output,
+(`key_outcomes`, §10) and by what the input processed; the output,
 the index and every store hold only keys with rows, so no store has to
 tell an empty group from an absent key — a table cannot.
 
@@ -435,8 +425,8 @@ apply to the attempt: `Rejected` fails the task without retries,
 `Abort` follow `retries=`.
 
 **Stale** means a key's output does not reflect its current input
-revision. That has two causes: an upstream change not yet processed — in
-the delta pass, or committed after it — and a failure. The first is
+revision. That has two causes: an upstream change not yet processed and
+a failure. The first is
 transient and shows as the input's lag; the second is what the failure
 index records, with a reason:
 
@@ -487,7 +477,7 @@ unmatched. `GET /assets/{name}/outcomes/history` is the log (§10).
 
 A key that did not succeed must be remembered until it does, and a
 systemic failure — a bug that throws on every file of a 1M-key full
-pass — must not put 1M entries into engine state or the checkpoint.
+run — must not put 1M entries into engine state or the checkpoint.
 So the stored outcomes are not a map in state: they are a key index, the
 **outcome index**, per per-key asset and partition, in the format and machinery of every other index
 (`object-store-state.md` §6), under `keys/@{asset}/{partition}/`.
@@ -524,9 +514,9 @@ gets a tombstone. The message lives with the entry, so retention of the
 history (§10) never orphans a failing key's explanation; a systemic
 failure repeats one message, which block compression absorbs.
 
-The stored outcomes are of one pass's input (K47, `Positions.tla`). A
-**start-over** — a full pass's first batch, after an asset change, a
-reset, a full run — starts them over: the batch reads no prior record,
+The stored outcomes belong to one life of the input. A **start-over** —
+a full run's first batch, after a definition change, an upstream reset
+or `mode="full"` — starts them over: the batch reads no prior record,
 and its commit replaces the index (a new life; the old files go to
 garbage) and the record's counts, bounds and retry pass with its own. A
 **reset of the input** (its upstream moved, removed or replaced) drops
@@ -568,7 +558,7 @@ retrying adds and removes no key, so the index's own key count says
 nothing about outcomes. The worker's result carries, per outcome, the
 change its transitions made (`{failed: −1, retrying: +1}`); the engine
 applies them in the same commit as the output deltas, the outcome delta
-and the position, so a batch's outputs, position and failures land
+and what the input processed, so a batch's outputs, observations and failures land
 together, and the counts are exact because every prior was read exactly.
 Scheduling never depends on the index's approximate cardinality.
 
@@ -640,7 +630,7 @@ on its next run.
 **Every eligible key is retried**; the only question is pacing. Retries
 form **batches of their own**, up to `batch_size` keys, in a **retry pass**:
 a walk over the stored outcomes in key order, with its place in the
-position:
+partition's record:
 
 ```
 retry: {pass: 7, deploy: 12, forced_at: 4031, after: "ICP/Results/run-17.csv",
@@ -655,7 +645,7 @@ retry: {pass: 7, deploy: 12, forced_at: 4031, after: "ICP/Results/run-17.csv",
 
 - **Each retry batch** walks the index from `after` until it has
   `batch_size` eligible keys or reaches the end. Its commit — atomic with
-  the outputs, outcome delta and position — advances `after` and folds
+  the outputs, outcome delta and observations — advances `after` and folds
   into the accumulators every record in the walked range *as it is after
   the batch's transitions*, eligible or not. The worker computes that from
   what it read, whether the store or the engine's start reply answered.
@@ -676,15 +666,15 @@ retry: {pass: 7, deploy: 12, forced_at: 4031, after: "ICP/Results/run-17.csv",
   answered with its `start` reply (`resolved-commits.md` §7).
 
 When both retries and new changes are pending, the partition **alternates**: a
-retry batch, then a change batch — the position records which kind went
+retry batch, then a change batch — the partition's record says which kind went
 last. Neither starves and there is no fraction to tune: a retry storm of
 1M keys failing after a deploy halves the pace of new files instead of
 stopping them. When only one kind is pending, every batch is that kind.
 
 A retry-eligible key whose upstream has changed since it failed is skipped
 by the retry batch — the worker compares the record's `upstream` with the
-key's generation in the pinned upstream index — and arrives with the
-delta pass instead, so it is processed once, at its new generation.
+key's generation upstream — and arrives with its change instead, so it
+is processed once, at its new generation.
 
 **Bounds.** State is constant per partition. A systemic failure of 1M keys is a
 1M-entry index on the object store, merged like any other. Each batch
@@ -749,79 +739,24 @@ patterns (named, so `explain` can say which rule) or a list. They apply to
 per-key and plain incremental inputs alike, and compile to one native matcher shared
 by engine and worker.
 
-**The worker filters.** It filters every batch it reads, so correctness
-never depends on what the engine knew. In v1 the engine does not evaluate
-patterns: a delta with changes launches an attempt, and a batch whose
-keys all fall outside the patterns ends `skipped` after advancing the
-position.
+**The engine filters.** It evaluates the patterns when it plans each
+batch (`observed-set.md`): batches hold only keys the patterns take, and a
+partition that owes nothing under them is not run.
 
-*Later: engine-side skip hints.* An optimization once wasted launches are
-measured; the engine would evaluate patterns only to skip work, and only
-from what it already holds:
+**A pattern change is an input change, not a reset.** It stores nothing;
+the next run owes the difference in membership, classed once under the
+new patterns against what the partition processed:
 
-1. **Pruning.** Each include pattern has a literal prefix
-   (`ICP/Results/`). A delta file whose `[min, max]` key range misses every
-   include prefix cannot match: no read.
-2. **At commit, from the cache.** When the engine commits a delta, it holds
-   the file — it wrote or fetched it for the engine cache. On the
-   maintenance thread it matches the delta's keys against each consuming
-   input's patterns and keeps, per input and commit, the count of matching
-   keys. That is
-   per-delta work, proportional to the commit, never to the index. Each
-   count is tagged with the fingerprint of the patterns it was computed
-   under, and is used only while the input delivers under those patterns:
-   a zero counted for old patterns never lets the engine skip a commit the
-   new ones might match.
-3. **At prepare, from those counts.** A delta whose commits all matched
-   nothing advances the position with no attempt (the existing `skipped`
-   outcome). Anything
-   unknown — after a restart, or a delta never cached — is launched, and
-   the worker filters it.
-
-With the hints, the engine never waits on S3 to decide and never scans an
-index, and a consumer that cares about one site would skip the others at
-commit time instead of launching for them.
-
-**A pattern change is a key-set diff, not a reset** — taken in three
-steps around a **pattern change commit**, so that no pending change is judged by
-the wrong patterns. Take an `archive` exclusion deployed while the input
-has unconsumed deltas:
-
-```
-position at commit 40, head at 45; the new manifest adds exclude "archive"
-commit 43 deleted archive/a.csv, which still has rows downstream
-```
-
-1. **Cut over.** The engine fixes `c` = the upstream head when it serves
-   the new patterns (45) and records the transition on the position:
-   `pattern_change: {old, new, at: 45, snapshot: <files at 45>}`.
-2. **Finish under the old patterns.** Deltas up to `c` are delivered
-   under the patterns they were committed for: commit 43's deletion of
-   `archive/a.csv` matched before, so its rows are removed. Without this
-   step, the new exclusion would hide the deletion and the rows would
-   survive forever.
-3. **Diff against the snapshot at `c`.** The worker reads, a batch at a time, the
-   upstream index *as of commit 45* — the snapshot recorded in step 1,
-   pinned and protected from garbage collection for the whole drain, not
-   re-pinned to the current head on each batch as a full pass is —
-   limited to the key ranges the old and new include prefixes cover, and
-   delivers only the keys whose match changed:
-
-   | Key at `c` | Delivered as |
-   |---|---|
-   | matched before, not now (the new `exclude`) | removed: its rows go, its failure entry too |
-   | matched now, not before (a widened `include`) | added, at its version in the snapshot |
-   | matched both times, or neither | nothing |
-
-4. **Continue under the new patterns** from commit `c + 1`. Changes
-   committed during steps 2 and 3 wait for this step.
+| Key, held / taken now | Owed |
+|---|---|
+| held, no longer taken (a new `exclude`) | removed: its rows go, its failure entry too |
+| not held, taken now (a widened `include`) | added |
+| held and still taken, or neither | nothing (unless it changed upstream) |
 
 Adding an `archive` exclusion removes the archived keys and processes
-nothing else. **Pattern changes are serialized:** a manifest that changes
-the patterns again while a transition runs does not interrupt it; when
-the transition ends, if the served patterns differ from its `to`, the
-next transition starts with its own pattern change. The position holds at most
-one transition. Patterns are not part of the fingerprint.
+nothing else; a deletion upstream of a now-excluded key that was held is
+still a removal. Patterns are not part of the definition; a change makes
+the partition stale for "input changed" (`behaviors.md` CHG-4 to CHG-8).
 
 **Matching is by key segments, not substrings.** Monolith's
 `"old" in name.lower()` (`icp.py:83`) drops `Gold_ore.csv` and
@@ -934,7 +869,7 @@ per asset: a hash of the asset's whole source file. That was both noisy
 and blind — a cosmetic edit in `icp.py` made a new deploy, a real fix in a
 helper `parsers.py` did not, so `OnDeploy()` missed helper-only deploys.
 Nothing invalidates on it; invalidation is the explicit `version=` and the
-fingerprint.
+definition.
 
 So the manifest has no `code_hash`; the deploy is `H(manifest, build)`,
 where `build` identifies the code exactly:
@@ -1006,8 +941,8 @@ Where the implementation (`solera/errors.py`, `solera/build.py`,
 - **A change batch that leaves keys due at once** continues its run with a
   retry batch; a completed retry pass never continues its run by itself, so
   `retry_after=0` costs one retry per run, not a loop.
-- **A full pass** (a reset, or a `full` run) defers retries until it is
-  drained: it reprocesses every key anyway.
+- **A full run** (after a reset, or `mode="full"`) defers retries until it
+  completes: it reprocesses every key anyway.
 - **A retry batch walks at most 100 × `batch_size` records** before it ends,
   so a long stretch of keys that are not due spans several batches.
 - **Retry and change batches alike** are answered at `start` when the
@@ -1036,57 +971,30 @@ Where the implementation (`solera/errors.py`, `solera/build.py`,
 - **PostgresStore** loads by key only the keys that have rows;
   `can_load(dict[str, T], Keys)` holds when `can_load(T, Keys)` does.
 - **Patterns** (`solera/patterns.py`) are evaluated by Python's `re`, by
-  the worker only — on every batch it reads, whether the store or the
-  engine's start reply (`resolved-commits.md` §7) answers: delta passes, full passes, `keys=` overrides and
-  retry batches (a due key the input no longer takes is `unmatched`). Batches
-  are formed from the keys they take, read ahead past the others until a
-  batch holds `batch_size` keys or the pass runs out, so no batch is
-  empty; a pass they take nothing from does not call the producer
-  and ends `skipped` — but for a full pass, which starts its consumer
-  over all the same: a plain producer gets one empty batch (`full`,
-  `first`, `final`), and a per-key asset's cleanup after the pass drops
-  the keys the input no longer has (`architecture.md` §5). The read-ahead is bounded: the index is read a batch's
-  worth and one more at a time, never only what the batch still lacks, and
-  a batch examines at most 100,000 entries (`LOOKAHEAD` in
-  `solera_worker/each.py`) — past that it goes as it is,
-  not final; a batch so left with nothing is skipped the same way, and the
-  next batch resumes after the last key examined.
-- **A pattern change** lives on the position: `patterns` (what it
-  delivers under) and, during a transition, `pattern_change` {`old`, `new`,
-  `at`, `generation`, `snapshot` (the upstream index as of `at`), `pin`};
-  the diff is a pass of mode `diff`, its place the position's
-  `pass.at`. The diff reads the whole snapshot (`batch_size` keys
-  read per batch), not only the key ranges the patterns' prefixes cover.
-  A newer pattern change waits for the transition to end, then cuts over
-  again. Retries wait for a transition, as for a full pass. A delta
-  the log no longer covers falls back to a full pass under the new
-  patterns, which ends the transition.
-- **The snapshot pin** joins collection's pins: index-file garbage
-  (`Upkeep.collect`) and immutable data cleanups both wait for the oldest
-  pattern change pin as for a live claim. A retry pass needs none: each retry batch
-  reads the stored outcomes and the upstream as they are at its own prepare,
-  and the accumulators absorb what changes between batches.
+  the engine when it plans a batch, for default runs, `keys=` selections
+  and retry batches alike (a due key the input no longer takes is
+  `unmatched`). A full run always reaches its consumer: a plain producer
+  gets one empty batch when it owes no key, and a per-key asset's held
+  keys the input no longer has are owed removals (`behaviors.md` SEL-10,
+  SEL-11).
+- **A pattern change** stores nothing (§11); retries need no pin of their
+  own: each retry batch reads the stored outcomes and the upstream as they
+  are when it is planned.
 - **After the v1 review** (thr_9ezn6cyar5):
-  - Every key of a batch gets an outcome before its position moves past
-    it — a key a cancel reaches while it waits for a concurrency slot is
+  - Every key of a batch gets an outcome before the batch commits — a key a cancel reaches while it waits for a concurrency slot is
     interrupted like one in flight. Interrupted keys become canceled or
     timed out by the cancel record the result is sealed with, decided
     after the store writes; the result carries that record.
-  - A full pass of a per-key input keeps patch semantics: a key that
-    fails keeps its last good output. If the asset held keys when the
-    pass began (or the boundary it started from was lost mid-pattern
-    change), the pass
-    ends with a **cleanup** (`reconcile` on the position): the outputs'
-    and stored outcomes' keys, a batch at a time, against the current
-    upstream and patterns; those it no longer has are removed. Retries
-    wait for it.
-  - A reset begins a **pass** (`pass` on the position: the run that began
-    it); a `full` run's later attempts resume it instead of starting over.
+  - A full run of a per-key input keeps patch semantics: a key that
+    fails keeps its last good output, and the keys it holds that the
+    upstream no longer has are owed removals (`behaviors.md` SEL-10).
+  - A `full` run's later attempts resume from its last committed batch
+    instead of starting over (`behaviors.md` RUN-5).
   - A partition's stored outcome keeps the configuration it last ran under;
     the retry clock, `solera keys retry` and the API submit retries under
     it (`Engine.submit_retries`).
-  - A forced request newer than the pass in progress, or than the last
-    one done, makes the run that sees it continue with a pass.
+  - A forced request newer than the retry pass in progress, or than the
+    last one done, makes the run that sees it continue with a retry pass.
   - `keys=` overrides are filtered by the input's patterns.
   - Renaming an asset (`aliases=`) moves its stored outcome and its
     `@asset` index.

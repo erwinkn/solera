@@ -183,7 +183,7 @@ attempt g15   k present → k@g15         k absent → nothing
 
 *Edge case for the presence check:* without it, g15 would mark `k` live
 whether or not the insert landed, and the index would list a key with no
-rows, counted, and handed to every full pass. It reads keys, never
+rows, counted, and handed to every full run. It reads keys, never
 values.
 
 **Unknown writes.** An opaque write's gate names no keys. If it dies, its
@@ -206,16 +206,16 @@ Lineage records **the generation read**, per input partition:
   snapshot (`reads()`);
 - `uncommitted` when no commit of the partition has that generation;
   *Edge case:* a reader saw a dead attempt's write;
-- a fixed pass over several batches (a delta pass, a pattern change) records the
-  generation the pass was cut at, persisted with the pass, not
-  the head's when a later batch is read. *Edge case:* a delta pass cut at g2
-  whose second batch is read after g3 committed read g2's content;
+- each batch of a run reads upstream at its own head and records the
+  generation it read, not the run's first. *Edge case:* the upstream
+  writes g3 during batch 1; batch 2, planned after, reads and records g3
+  (`behaviors.md` INC-8);
 - an external source, read current with no fence, records the generation
   of the tick the attempt was pinned to. No new marker: external
-  sources are read current by definition. A key its index names that the
-  source no longer holds fails the load, retryably, with the key and its
-  version (F33): nothing is delivered until the source's next commit
-  removes or restores it.
+  sources are read current by definition. A key the source no longer
+  holds when it is loaded is processed as absent: a removal if the
+  consumer held it; a later commit restoring it delivers it again (D147,
+  which retires D56; `behaviors.md` SRC-5).
 
 `ctx.load` reads are not lineage edges: they read no input of the
 attempt's. One moment reads a partition once, so the first read of a partition is
@@ -235,16 +235,16 @@ lineage:  B ← A, generation 12                    (g12 committed)
 | Case | What happens | Holds |
 |---|---|---|
 | A rewrites `k` while B reads it | Immutable: B reads the pinned object, then `k` again with A's delta. Fenced: B may read A's new rows and records generation 12; A's commit, or the repair of its dead attempt, puts `k` in a delta B receives later, and B rereads | yes |
-| Identical rewrites | Every key rewritten is a change; consumers reprocess. A whole input rewritten identically changes its ref's generation: an input change, so its consumers owe a full pass (the partition record's `seen`): a full redelivery | accepted |
-| `version=` bump | The fingerprint changes, the asset's inputs reset, every key is reprocessed and written at a new generation, so consumers reprocess too. (Revision outputs used to hide this; they are gone.) A cursor producer with no inputs reprocesses nothing | yes |
+| Identical rewrites | Every key rewritten is a change; consumers reprocess. A whole input rewritten identically changes its ref's generation: an input change, so its consumers owe every key processed under the old version: a full redelivery | accepted |
+| `version=` bump | The definition changes, the asset's next run is a full run, every key is reprocessed and written at a new generation, so consumers reprocess too. (Revision outputs used to hide this; they are gone.) A cursor producer with no inputs reprocesses nothing | yes |
 | Deploys | The deploy number moves; only failed per-key incremental keys get their one try, and those that succeed are written at a new generation | yes |
 | Retries | A new attempt has a new generation; an uncommitted attempt's delta files and objects are cleaned up. A store call retried inside one attempt rewrites the same names with the same bytes | yes |
-| Per-key full redelivery (a boundary merged away, reset) | Every key is processed and written again; its consumers reprocess everything | accepted |
+| Per-key full redelivery (a full run, an upstream reset) | Every key is processed and written again; its consumers reprocess everything | accepted |
 | Pattern change | Newly matched keys are delivered at their generation; unmatched ones removed | yes |
 | Unknown opaque writes | §5: a rewrite, or a key scan before a patch | yes |
 | Store move | A reset: the moved output is a new one (object-store-state.md §2) — no head, a fresh index, a whole first write, every key at a new generation; its consumers and its own inputs start over | yes |
 | Rename | Index entries, generations and object names stay | yes |
-| A stored outcome's retry, upstream changed | The stored outcome's upstream generation differs from the key's in the pinned input, so the key comes with the delta pass instead (`per-key-processing.md` §9) | yes |
+| A stored outcome's retry, upstream changed | The stored outcome's upstream generation differs from the key's in the pinned input, so the key comes with the change instead, processed once at its new version (`behaviors.md` KEY-8) | yes |
 
 **Breaks with the model as Erwin stated it.** One:
 
@@ -265,7 +265,7 @@ lineage:  B ← A, generation 12                    (g12 committed)
 ## 8. Hashing that stays
 
 None of it over user data: block checksums, the
-fingerprint, and a deploy's build identity.
+definition digest, and a deploy's build identity.
 
 ## 9. Tests
 
