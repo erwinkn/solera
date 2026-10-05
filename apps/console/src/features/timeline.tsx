@@ -46,15 +46,17 @@ function PhaseTip({ attempt, attempts, end }: { attempt: Attempt; attempts: Atte
     <div className="flex min-w-44 flex-col gap-1">
       <span className="flex items-center justify-between gap-4 font-medium">
         <span>
-          {name
-            ? `${name[0]!.toUpperCase() + name.slice(1)} · ${label(attempt.outcome)}`
-            : label(attempt.outcome)}
+          {[
+            name && name[0]!.toUpperCase() + name.slice(1),
+            // The run's last batch: no more of this run follow. Not a word on completeness (D177).
+            name && attempt.batch?.last === null && "the run's last batch",
+            label(attempt.outcome),
+          ]
+            .filter(Boolean)
+            .join(" · ")}
         </span>
         <span className="tabular">{duration(total)}</span>
       </span>
-      {attempt.batch && walkOf(attempts).multi && attempt.batch.last === null && (
-        <span className="opacity-80">The final batch: the partition caught up.</span>
-      )}
       {attempt.batch && walkOf(attempts).multi && (
         <span className="opacity-80">
           <KeyClasses {...attempt.batch} className="text-current [&_*]:text-current" />

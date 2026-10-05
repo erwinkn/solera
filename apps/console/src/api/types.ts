@@ -419,9 +419,12 @@ export interface Commit {
   added_keys: string[] | null;
   removed_keys: string[] | null;
   rows: number | null;
-  /** Whether this was its run's last batch, so the partition caught up; null for a source
-   * commit, absent from older rows. */
+  /** Whether this was the last batch of its run: no more, not whether the partition is
+   * complete (D177; that is the partition's live status). Null for a source commit, absent
+   * from older rows. */
   final?: boolean | null;
+  /** The batch this commit came from, once the API records it on commits. */
+  batch?: { index: number; count: number | null } | null;
   metadata: Json;
   generation: number;
 }

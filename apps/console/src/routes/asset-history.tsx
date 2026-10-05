@@ -3,12 +3,12 @@ import { getRouteApi, Link } from "@tanstack/react-router";
 import { ArrowDownRight, ArrowUpLeft } from "lucide-react";
 import { q, useManifest, useProject } from "@/api/queries";
 import type { Lineage, Commit } from "@/api/types";
+import { batchLabel } from "@/features/batches";
 import { cn } from "@/lib/cn";
 import { compact, shortId } from "@/lib/format";
 import { Button } from "@/ui/button";
 import { Empty, ErrorNote, Generation, Skeleton, Time } from "@/ui/data";
 import { Select } from "@/ui/form";
-import { Tooltip } from "@/ui/overlay";
 import { Card, CardHeader } from "@/ui/layout";
 import { Table, TableScroll, Td, Th, Tr } from "@/ui/table";
 
@@ -168,12 +168,9 @@ function VersionRow({
         <Generation value={m.generation} />
       </Td>
       <Td className="text-right text-xs whitespace-nowrap">
-        {m.final === false && (
-          <Tooltip content="One batch of a run that committed more after it: the partition caught up at that run's final batch.">
-            <span className="mr-2 rounded-full bg-idle-soft px-1.5 py-0.5 text-2xs text-idle-fg">
-              partial
-            </span>
-          </Tooltip>
+        {/* Which batch of its run, where there were several; never a word on completeness (D177). */}
+        {m.batch && (m.batch.count ?? 1) > 1 && (
+          <span className="mr-2 text-fg-subtle">{batchLabel(m.batch, true)}</span>
         )}
         {m.added != null || m.removed != null ? (
           <>

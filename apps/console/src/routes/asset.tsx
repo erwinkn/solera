@@ -363,9 +363,9 @@ function Heads({
                     {head.materialized ? (
                       <StatusBadge status="materialized" />
                     ) : (
-                      <Tooltip content="Committed, not caught up: a run is still walking its batches, and readers that need it whole wait.">
+                      <Tooltip content="Committed, not complete: readers that need it whole wait until it is.">
                         <span>
-                          <StatusBadge status="running" text="catching up" />
+                          <StatusBadge status="waiting" text="incomplete" />
                         </span>
                       </Tooltip>
                     )}
