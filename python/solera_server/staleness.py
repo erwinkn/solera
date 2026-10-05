@@ -23,7 +23,6 @@ from solera.keys.index import KeyIndex, key_bytes, key_str
 from solera.patterns import Matcher
 
 from . import observed, owed, planning
-from .positions import outstanding
 
 log = logging.getLogger(__name__)
 
@@ -104,7 +103,7 @@ class Staleness:
                 if await self._owed(asset, partition, input, planner, inputs, first=True):
                     return True
             elif input.kind == "incremental":
-                if await self._input_behind(asset, partition, input, definition):
+                if self._input_behind(asset, partition, input):
                     return True
             elif not keyed and seen is not None and self._versioned(input):
                 if seen.get(input.param) != self._input_version(planner, input):
@@ -169,23 +168,18 @@ class Staleness:
             return list(planner.fan_in(input, materialized=True))
         return [input.partition]
 
-    async def _input_behind(self, asset: str, partition: str, input, definition: bool = False) -> bool:
-        """Whether an unkeyed incremental input has commits past its position
-        it has not read. No position, or a pass under way, counts only when
-        its own `definition` did not make the pass due; a full pass under
-        way counts again for commits past its base."""
+    def _input_behind(self, asset: str, partition: str, input) -> bool:
+        """Whether an unkeyed incremental input has commits past the last one
+        it read — or what it read no longer holds (its upstream started
+        over), or it never read one."""
 
-        position = self.m.position(asset, input.param, partition)
+        rec = (self.m.partition(asset, partition).get("observed") or {}).get(input.param)
         head = self.m.heads.get((input.output, input.partition))
-        hi = int((head or {}).get("commit_number", -1))
-        if position is None:
-            return not definition
-        under_way = position.get("pass") or {}
-        if under_way.get("mode") == "full":
-            return not definition or hi >= int(under_way["from"])
-        if outstanding(position) and under_way.get("mode") != "delta":
-            return not definition
-        return head is not None and int(position["next"]) <= hi
+        if head is None:
+            return False
+        if rec is None or not self._still(rec, input):
+            return True
+        return int(rec["commit"]) < int(head.get("commit_number", -1))
 
     def _committed(self, planner, input) -> int:
         """The event counter of the latest commit of the heads a whole or dep input reads."""

@@ -1,7 +1,7 @@
 """The engine (§6–§10): control-plane only. It plans runs into per-(asset,
-partition) tasks, resolves inputs to pinned heads, plans Incremental inputs over
-per-input positions, dispatches attempts through placements, and commits
-their results.
+partition) tasks, resolves inputs to pinned heads, plans Incremental inputs from
+what each partition observed of them (docs/observed-set.md), dispatches
+attempts through placements, and commits their results.
 
 State lives in the model (model.py), changed only by events the engine records
 (docs/object-store-state.md §3, §4). Recording is synchronous and never waits
@@ -61,9 +61,9 @@ from .model import (
     _delta_files,
     commit_of,
     declaration,
+    reads,
 )
 from .observing import Observing
-from .positions import advance, continues, outstanding, reads, selects
 from .sensors import Sensors
 from .staleness import Staleness
 from .state import Conflict, LostOwnership, State
@@ -94,32 +94,19 @@ class NonRetryable(RuntimeError):
     """A dispatch-time failure no retry will fix (§8: full run required, …)."""
 
 
+def selects(plans: dict) -> bool:
+    """Whether an attempt reads keys a `keys=` run names: it then leaves the
+    partition's progress as it was."""
+
+    return any(
+        p and p["kind"] == "observed" and p.get("named") and not p.get("retry") for p in plans.values()
+    )
+
+
 def _batches(keys: int, limit: int) -> int:
     """Batches of `limit` a pass of `keys` is planned to take: at least one."""
 
     return max(1, -(-int(keys) // max(1, int(limit))))
-
-
-def _dep_restart(position: dict | None, shared: dict | None) -> bool:
-    """Whether a whole or dep input at another version than the partition
-    caught up to (`shared["caught_up"]`; none recorded counts as another)
-    makes this input start a full pass over: unless its last full pass
-    began under the versions as they are now (`seen` on the position, kept
-    after the pass ends) — under way, it continues; done, what is left (a
-    per-key reconcile) finishes it. Judged on the versions a pass began
-    under, never on the order of commits."""
-
-    if not shared or not shared["now"] or shared["caught_up"] == shared["now"] or position is None:
-        return False
-    return position.get("seen") != shared["now"]
-
-
-def _snapshot_read(index, at: int, latest: int) -> int:
-    """The generation a read at reserved endpoint `at` (the state after
-    commit `at - 1`) has read: just below commit `at`'s first, or, with no
-    commit since, the `latest` the head holds."""
-
-    return latest if at > index.head else int(index.generation(at)) - 1
 
 
 class Engine(Attempts, Observing, Sensors, Staleness, Views):
@@ -858,16 +845,8 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
                 )
                 return
             if prepared.get("skip"):
-                plans = {
-                    p: plan for p, plan in prepared["plans"].items() if plan and plan["kind"] == "commits"
-                }
-                positions = {param: advance(plan) for param, plan in plans.items()}
-                commit = {"positions": positions, **await self._observations(task, prepared, {})}
-                more = any(
-                    not (p["final"] or p.get("done"))
-                    for p in prepared["plans"].values()
-                    if p and p["kind"] == "observed"
-                )
+                commit = await self._observations(task, prepared, {})
+                more = bool(prepared.get("more"))
                 if not selects(prepared["plans"]) and not more:
                     commit["caught_up"] = True
                 self._finish(task, claim, "skipped", commit=commit, more=more)
@@ -972,7 +951,7 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
             # built is rebuilt, the next attempt starting over.
             if head is not None and head.get("version") not in (None, asset["version"]):
                 full = True
-        if observing:  # a keyed input's record decides: its full run's first batch only
+        if observing:  # what its inputs observed decides: a full run's first batch only
             full = any(o["full"] for o in observing.values())
         planner = self.planner()
         try:
@@ -1007,33 +986,21 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
                 pins[param] = {"ref": self._pin_at(output, input.partition), "load": load}
                 if load == "data" and (index := self._whole_index(output, pins[param]["ref"])) is not None:
                     pins[param]["index"] = index
-        fingerprint = self._fingerprint(task["asset"], run)
+        definition = self._definition(task["asset"], run)
         # The whole and dep inputs as pinned now, against those the partition last caught
         # up to: one moved since makes a full pass due (semantic change d), from its commit.
         # Never caught up, no record says what it saw: their latest commit, so a pass begun
         # before it starts over and redoes what it wrote under the old ones.
         seen = {i.param: self._input_version(planner, i) for i in inputs if self._versioned(i)}
-        recorded = self.m.partition(task["asset"], partition).get("seen")
-        shared = {"now": seen, "caught_up": recorded}
-        if full and run["mode"] == "full" and incremental and not observing:
-            # This run's reset began the pass every input is on: resume it, batch by batch.
-            started = [
-                (self.m.position(task["asset"], e.param, partition) or {}).get("reset_by")
-                for e in incremental
-            ]
-            if all(s == run["id"] for s in started):
-                full = False
-        # Pass 2: Incremental plans against the fingerprinted interpretation (§2.2).
+        # Pass 2: Incremental plans, as `_observe` planned them.
         plans, all_empty, each_page = {}, True, None
         for input in incremental:
             param, upstream_partition = input.param, input.partition
             ref = self._pin_at(input.output, upstream_partition)
-            if param in observing:
+            if self._keyed(input):
                 pin, plan, empty = self._observed_pin(input, ref, observing[param])
             else:
-                pin, plan, empty = self._incremental_plan(
-                    task, param, input.spec, ref, upstream_partition, fingerprint, run, full, shared
-                )
+                pin, plan, empty = self._commits_pin(input, ref, observing[param])
             if input.spec.get("each") is not None:
                 pin, plan, empty = self._each_plan(task, asset, input.spec, ref, pin, plan, empty)
                 each_page = pin["each"]
@@ -1044,7 +1011,7 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
         if claim is not None:
             # What this attempt reads stays endpoints of its upstreams until it finishes (§6).
             claim["reads"] = reads(plans)
-        more = any(p["kind"] == "commits" and continues(p) for p in plans.values() if p)
+        more = any(not (p["final"] or p.get("done") or p.get("retry")) for p in plans.values() if p)
         skip = bool(incremental) and all_empty and not more and not full
         # A plain consumer never built is built, an empty input or not; a per-key asset
         # whose keys all failed so far has no head yet: nothing to wait for.
@@ -1100,7 +1067,7 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
             "version": asset["version"],
             "deploy_number": self.m.deploy_number,
             # The version of each whole or dep input read: a catch-up records it, and a
-            # partition whose inputs moved since is stale (docs/positions-from-reads.md).
+            # partition with no incremental input whose inputs moved since is stale.
             "seen": seen,
             "declaration": digest(self._declaration(task["asset"])),
             "prefixes": self._prefixes(pins, outputs, task),
@@ -1111,8 +1078,7 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
             "full": full,
             "skip": skip,
             "cursor": cursor,
-            "fingerprint": fingerprint,
-            "definition": fingerprint,  # what a keyed input's observations are made under
+            "definition": definition,  # what its inputs' observations are made under
             "outputs": outputs,
             # A per-key batch's failure delta, for cleaning up if it never commits.
             "failures": None
@@ -1209,7 +1175,7 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
     def _versioned(input: planning.Input) -> bool:
         """Whether staleness follows an input's version: a whole input or a dep,
         but not a partition set's implied dep (adding a key changes nothing
-        already built), nor an incremental one, which its position follows."""
+        already built), nor an incremental one, which its observations follow."""
 
         return input.kind != "incremental" and not input.set_dim
 
@@ -1239,75 +1205,6 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
         among the heads that exist, never by expanding the partition domain."""
 
         return {input.key(s): h["ref"] for s, h in planner.fan_in(input, materialized=True).items()}
-
-    def _incremental_plan(
-        self, task, param, input, ref, upstream_partition, fingerprint, run, full, shared=None
-    ):
-        """Plan an unkeyed Incremental input's batch from its position (`pass`):
-        returns the pin for the spec, the plan its commit `advance`s the
-        position by, and whether nothing is pending — `batch_size` commits a
-        batch. A pass under way goes on from its place. Otherwise one starts:
-        `full` for a missing position, a fingerprint change, a `full` run, a
-        keys='full' override, or an upstream that started over since the
-        input last read it; else a `delta` of the commits since `next`."""
-
-        output = input["output"]
-        limit = int(input["batch_size"])
-        # The generation of the head a batch is planned against: a pass over several
-        # attempts keeps the one it started at, what lineage says its batches read
-        # (docs/versions.md §6).
-        latest_generation = int(ref.get("generation") or 0)
-        head = self.m.heads.get((output, upstream_partition)) or {}
-        head_commit = int(head.get("commit_number", -1))
-        override = (run.get("keys") or {}).get(output)
-        position = self.m.position(task["asset"], param, task["partition"])
-        first = int(head.get("base", 0))
-        # A `full` run or a keys="full" override starts one pass per run, which the
-        # run's later attempts resume (`pass` on the position) instead of restarting;
-        # an upstream that started over since the input last read it (its `base`
-        # past a pass's start, or at or past `next`: a reset always lands past the
-        # commits that existed) is delivered again in full.
-        again = override == "full" and (position or {}).get("reset_by") != run["id"]
-        reset = (
-            full
-            or position is None
-            or position.get("fingerprint") != fingerprint
-            or again
-            or _dep_restart(position, shared)
-        )
-        if not reset:
-            under_way = position.get("pass")
-            reset = int(under_way["from"]) < first if under_way else int(position["next"]) <= first
-        carried = {
-            "kind": "commits",
-            "output": output,
-            "upstream_partition": upstream_partition,
-            "fingerprint": fingerprint,
-            "reset_by": run["id"] if reset else position.get("reset_by"),
-        }
-        if reset and (shared or {}).get("now"):  # the shared versions it began under, kept after it ends
-            carried["seen"] = shared["now"]
-        elif not reset and "seen" in position:
-            carried["seen"] = position["seen"]
-        current = None if reset else position.get("pass")
-        if current is None:
-            lo = first if reset else int(position["next"])
-            mode = "full" if reset else "delta"
-            current = {"mode": mode, "from": lo, "to": head_commit, "at": lo, "batch": 0}
-            current["batches"] = _batches(head_commit - lo + 1, limit)
-            current["generation"] = latest_generation
-        lo = int(current["at"])
-        hi = min(current["to"], lo + limit - 1)
-        batch = {
-            "commits": [lo, hi],
-            "full": current["mode"] == "full",
-            "more": hi < current["to"],
-            "index": current["batch"],
-            "count": current["batches"],
-        }
-        carried["next"] = current["from"] if reset else int(position["next"])
-        plan = {"kind": "commits", "position": carried, "pass": current, "hi": hi, "head": head_commit}
-        return {"ref": {**ref, "generation": current["generation"]}, "batch": batch}, plan, hi < lo
 
     # -- per-key batches (docs/per-key-processing.md §5, §9) ------------------------------
 
@@ -1481,20 +1378,19 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
             :CLEANUPS
         ]
 
-    def _fingerprint(self, asset: str, run) -> str:
-        """H(the definition — `model.declaration`, its inputs' bindings
-        included, without patterns and batch size — and the run's config):
-        the interpretation its positions were delivered under; a change
-        resets them (§2.2, §6), so binding an input to another output makes
-        a full pass due. Not its inputs' versions: a whole or dep input that
-        moves is an input change, which makes a full pass due through the
-        partition record's `seen` (semantic change d). Neither which store
-        holds an output nor its name is in it, only the versions: a move
-        resets the output, and every position that reads it or is its
-        asset's (`Model._reset`); a rename keeps everything."""
+    def _definition(self, asset: str, run) -> str:
+        """The definition its inputs' observations are made under:
+        H(`model.declaration`, its inputs' bindings included, without
+        patterns and batch size — and the run's config). A change makes the
+        next run a full run (docs/observed-set.md, "Context and lives"), so
+        binding an input to another output starts over. Not its inputs'
+        versions: a whole or dep input that moves is an input change, each
+        layer's context. Neither which store holds an output nor its name is
+        in it, only the versions: a move resets the output (`Model._reset`);
+        a rename keeps everything."""
 
         definition = self._declaration(asset)
-        # Patterns are diffed, a batch size only pages: neither starts a position over.
+        # New patterns are compared, a batch size only pages: neither starts anything over.
         definition["inputs"] = {
             p: {k: v for k, v in i.items() if k not in ("patterns", "batch_size")}
             for p, i in definition["inputs"].items()
@@ -1504,7 +1400,7 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
     def _declaration(self, asset: str) -> dict:
         """The asset's canonical definition (`model.declaration`): a change makes a
         full pass due, and an attempt claimed before it does not commit
-        (Positions.tla; docs/positions-from-reads.md). A rename keeps everything."""
+        (docs/observed-set.md, "The commit check"). A rename keeps everything."""
 
         return declaration(self.manifest, asset, self.m.homes)
 
@@ -1550,7 +1446,7 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
         # Inputs may have moved since they were pinned: the attempt's output
         # derives from what it read (the spec records it), its positions
         # cover only the batch it was given, and a moved input changes the
-        # next attempt's fingerprint. Refusing here would only strand a write
+        # next attempt's definition. Refusing here would only strand a write
         # a shared-table store has already made.
         # Output heads must be unchanged since the claim, and no output it writes or
         # reads incrementally reset since it launched (removed, or moved to another
@@ -1558,11 +1454,7 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
         for output, info in (prepared.get("outputs") or {}).items():
             if commit_of(self.m.heads.get((output, task["partition"]))) != commit_of(info["head"]):
                 raise Conflict(f"output {output} head changed since this attempt was claimed")
-        upstreams = [
-            p.get("output") or p["position"]["output"]
-            for p in (prepared.get("plans") or {}).values()
-            if p and (p.get("output") or p.get("position"))
-        ]
+        upstreams = [p["output"] for p in (prepared.get("plans") or {}).values() if p]
         reset = [("asset", task["asset"])] + [
             ("output", o) for o in [*(prepared.get("outputs") or {}), *upstreams]
         ]
@@ -1583,7 +1475,7 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
         outputs = current_names(prepared, result.get("outputs") or {})
         # Settled under the contract it was launched with, not today's manifest.
         declared = {name: info["contract"] for name, info in (prepared.get("outputs") or {}).items()}
-        positions, more = {}, bool(prepared.get("more"))
+        more = bool(prepared.get("more"))
         failures = None
         for param, plan in (prepared.get("plans") or {}).items():
             if plan is None:
@@ -1591,11 +1483,7 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
             if "each" in plan:
                 failures, each_more = self._each_commit(task, {**plan, "param": param}, result)
                 more = more or each_more
-            if plan["kind"] == "observed":  # the walk goes on to its next batch
-                more = more or not (plan["final"] or plan.get("done") or plan.get("retry"))
-                continue
-            position = positions[param] = advance(plan)
-            more = more or continues(plan, position)
+            more = more or not (plan["final"] or plan.get("done") or plan.get("retry"))  # the walk goes on
         heads, keys = {}, {}
         for name, entry in outputs.items():
             if name not in declared:
@@ -1638,20 +1526,12 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
             # nor does a batch whose keys the input's patterns all left out.
             if prepared["outputs"][name]["head"] is None and failures is None and not result.get("skipped"):
                 raise Conflict(f"omitted output {name} has no head to keep (§2)", retryable=False)
-        commit = {"heads": heads, "positions": positions, **observations}
+        commit = {"heads": heads, **observations}
         # A `keys=` list leaves the partition's progress as it was.
         if not selects(prepared.get("plans") or {}):
-            # Whether the pass is done is the partition's, not its outputs' — a last batch
-            # may write none of them (§7) — and every input's: one still delivering, its
-            # position untouched by this attempt, keeps the partition from draining.
-            after = [
-                positions.get(p) or self.m.position(task["asset"], p, task["partition"])
-                for p, plan in (prepared.get("plans") or {}).items()
-                if plan and plan["kind"] == "commits"
-            ]
-            commit["caught_up"] = not more and not any(
-                outstanding(position) for position in after if position
-            )
+            # Whether the walk is done is the partition's, not its outputs' — a last batch
+            # may write none of them (§7).
+            commit["caught_up"] = not more
             if commit["caught_up"] and prepared.get("seen") is not None:
                 commit["seen"] = prepared["seen"]  # the whole and dep inputs it caught up to
         if failures is not None:
@@ -2013,7 +1893,7 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
         """Runs for a per-key asset's partitions that have keys to retry, each under
         the configuration its partition last ran with (kept on its failure record):
         a retry under another configuration would read other inputs, and its
-        new fingerprint would redeliver every key (§9). Partitions already active
+        new definition would redeliver every key (§9). Partitions already active
         are left to the run they are in."""
 
         by_config: dict[str, list[str]] = {}
@@ -2414,17 +2294,16 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
             o["name"]: [(s, self.head_view(h)) for s, h in self.m.heads_of(o["name"])]
             for o in info["outputs"]
         }
-        positions = {
-            param: self.m.position(asset, param, partition)
-            for param, input in info["inputs"].items()
-            if input["kind"] == "incremental"
+        observed = {
+            param: self._observed_at(rec)
+            for param, rec in (self.m.partition(asset, partition).get("observed") or {}).items()
         }
         dims = self.planner().dims(asset)
         return {
             "asset": info,
             "heads": heads,
             "cursor": self.m.partition(asset, partition).get("cursor"),
-            "positions": positions,
+            "observed": observed,  # each input's oldest commit observed
             "current_keys": self.planner().dim_keys(dims) if dims else [],
             "repairs": {
                 o["name"]: sorted(s for (n, s) in self.m.repairs if n == o["name"]) for o in info["outputs"]

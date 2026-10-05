@@ -261,11 +261,12 @@ class Views:
     # -- inputs (§6; per-key-processing.md §11) -----------------------------------------------
 
     async def _input_observed(self, asset: str, param: str, partition: str) -> dict | None:
-        """One partition of a keyed Incremental input, as its observation record
-        says (docs/observed-set.md): what it owes, counted by class; why a
-        full run is due, if one is; and `observed_at`, the oldest commit any
-        part of the record was observed at — every key is observed at least
-        as of it (None: nothing observed)."""
+        """One partition of an Incremental input, as what it observed says
+        (docs/observed-set.md): what it owes — a keyed input's keys by
+        class, an unkeyed one's commits; why a full run is due, if one is;
+        and `observed_at`, the oldest commit anything it observed was
+        observed at — every key is observed at least as of it (None:
+        nothing observed)."""
 
         planner = self.planner()
         try:
@@ -276,89 +277,34 @@ class Views:
         if input is None:
             return None
         rec = (self.m.partition(asset, partition).get("observed") or {}).get(param)
-        owes = await self._owed(asset, partition, input, planner, inputs)
         due = None
-        if rec is not None and observed.lives(rec) != {self._upstream(input.output, input.partition)[1]}:
+        if rec is not None and not self._still(rec, input):
             due = "input reset"
         elif self.definition_changed(asset, partition) and self.built(asset, partition, planner):
             due = "definition changed"
-        endpoints = [layer["endpoint"] for layer in [rec["base"], *rec["ranges"]]] if rec else []
-        return {
-            "owed": {c: sum(1 for o in owes if o.cls == c) for c in ("added", "updated", "removed")},
-            "full_run_due": due,
-            "observed_at": min((e for e in endpoints if e is not None), default=None),
-        }
-
-    def _input_partition(self, asset: str, param: str, input: dict, partition: str) -> dict:
-        """One partition of an unkeyed Incremental input: its position and how
-        far it is behind the upstream head.
-
-        `position.next` is the first upstream commit the input has not yet
-        delivered (`pass`, a pass under way, keeps its boundary and
-        place until its last batch — see `pass`). So `lag` = head
-        commit + 1 − `next`: the upstream commits not yet
-        delivered in full — counted from the head's `base` for an unkeyed
-        upstream, which starts over there; every commit without a position.
-        A change of fingerprint (the asset's version, its run config, a
-        pinned input) resets the input at its next run: not shown here.
-
-        `state`: `never` (no position), `pattern change` (a pattern change,
-        per-key §11), `full` (a full pass under way), `reconcile` (the
-        cleanup after a full per-key pass), `delta` (a delta pass delivered over
-        several attempts), `behind` (lag), else `caught_up`."""
-
-        position = self.m.position(asset, param, partition)
-        upstream_partition = (position or {}).get("upstream_partition")
-        if upstream_partition is None:
-            try:
-                upstream_partition = next(
-                    e.partition for e in self.planner().inputs(asset, partition) if e.param == param
-                )
-            except (ValueError, KeyError, StopIteration):
-                upstream_partition = None
-        head = (
-            self.m.heads.get((input["output"], upstream_partition))
-            if upstream_partition is not None
-            else None
-        )
-        head_commit = int(head.get("commit_number", -1)) if head is not None else None
-        lag = 0
-        if head_commit is not None:
-            first = int(head.get("base", 0))
-            lag = max(0, head_commit + 1 - max(int(position["next"]) if position else first, first))
-        mode = ((position or {}).get("pass") or {}).get("mode")
-        if position is None:
-            state = "never"
-        elif position.get("pattern_change"):
-            state = "pattern_change"
-        elif mode == "full":
-            state = "full"
-        elif position.get("reconcile") is not None:
-            state = "reconcile"
-        elif mode is not None:
-            state = "delta"
+        if self._keyed(input):
+            owes = await self._owed(asset, partition, input, planner, inputs)
+            owed = {c: sum(1 for o in owes if o.cls == c) for c in ("added", "updated", "removed")}
         else:
-            state = "behind" if lag else "caught_up"
-        view = None
-        if position is not None:  # less the pattern change's snapshot: an index state, too big to show
-            view = dict(position)
-            if position.get("pattern_change"):
-                view["pattern_change"] = {
-                    k: v for k, v in position["pattern_change"].items() if k != "snapshot"
-                }
-        return {
-            "partition": partition,
-            "upstream_partition": upstream_partition,
-            "position": view,
-            "head_commit": head_commit,
-            "lag": lag,
-            "state": state,
-        }
+            head = self.m.heads.get((input.output, input.partition)) or {}
+            last, base = int(head.get("commit_number", -1)), int(head.get("base", 0))
+            read = int(rec["commit"]) if rec is not None and due is None else base - 1
+            owed = {"commits": max(0, last - read)}
+        return {"owed": owed, "full_run_due": due, "observed_at": self._observed_at(rec)}
+
+    def _upstream_partition(self, asset: str, param: str, partition: str) -> str | None:
+        """The upstream partition an input of `partition` reads."""
+
+        try:
+            return next(e.partition for e in self.planner().inputs(asset, partition) if e.param == param)
+        except (ValueError, KeyError, StopIteration, planning.UpstreamOnly):
+            return None
 
     async def asset_inputs(self, asset: str) -> dict:
         """Every input of an asset, deps included (kind `dep`); for an
-        Incremental or Each input, each partition's position and lag — the
-        asset's current partitions and every partition with a position."""
+        Incremental or Each input, what each partition observed and owes —
+        the asset's current partitions and every partition that observed
+        anything (`_input_observed`)."""
 
         info = self.manifest["assets"][asset]
         every = set(info.get("deps_all_partitions") or ())
@@ -372,23 +318,21 @@ class Views:
         current = set(self.planner().partitions(asset, "all"))
         marked: dict[str, set] = {}
         for partition, record in self.m.partitions.of(asset).items():
-            for param in [*(record.get("positions") or ()), *(record.get("observed") or ())]:
+            for param in record.get("observed") or ():
                 marked.setdefault(param, set()).add(partition)
         out = []
         for param, input in inputs:
             output = input["output"]
             partitions = []
             if input["kind"] == "incremental":
-                keyed = self.manifest["outputs"][output].get("key") is not None
                 for partition in sorted(current | marked.get(param, set())):
-                    view = self._input_partition(asset, param, input, partition)
-                    if keyed:  # its observation record, not a position
-                        view = {
+                    partitions.append(
+                        {
                             "partition": partition,
-                            "upstream_partition": view["upstream_partition"],
+                            "upstream_partition": self._upstream_partition(asset, param, partition),
                             "observed": await self._input_observed(asset, param, partition),
                         }
-                    partitions.append(view)
+                    )
             out.append(
                 {
                     "param": param,
@@ -447,9 +391,8 @@ class Views:
         - `pending`: the upstream holds a write of it the input has not
           delivered yet.
 
-        The patterns are those the input delivers under — its position's,
-        else the manifest's; `pending` the manifest's, when a transition to
-        them has yet to run."""
+        The patterns are the input's as declared: new patterns are compared
+        at once, with no transition to run (`pending` is None)."""
 
         info = self.manifest["assets"][asset]
         keyed = {
@@ -472,7 +415,7 @@ class Views:
         ):
             raise KeyError(f"{asset}/{partition}")
         output = spec["output"]
-        where = self._input_partition(asset, input, spec, partition)
+        where = {"upstream_partition": self._upstream_partition(asset, input, partition)}
         if where["upstream_partition"] is None:
             raise ValueError(f"{asset}: no upstream partition for {partition!r}")
         outputs = [o["name"] for o in info["outputs"] if o.get("key") is not None]

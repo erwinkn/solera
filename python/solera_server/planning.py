@@ -186,7 +186,7 @@ def check_tags(tags) -> dict[str, str]:
 class Input:
     """One read of a partition (§5, §7): an input, a dep, or the dep a
     partition-set dimension implies (`set_dim`: lineage, never the
-    fingerprint). Of the owner's dimensions `dims`, the consumer shares
+    definition). Of the owner's dimensions `dims`, the consumer shares
     `pinned` — at its partition's keys — and lacks `free`. A fan-in — a
     whole input or a dep with free dimensions, or one that reads
     `all_partitions`, every dimension free — reads the heads that exist

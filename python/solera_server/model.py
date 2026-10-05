@@ -5,7 +5,7 @@ The model is plain data changed only by `apply(event)`, so replaying the
 journal reproduces it exactly. It has three layers:
 
 - **Durable**: the project, heads, key indexes, each asset partition's record
-  (cursor, last outcome, completeness, positions, failing keys),
+  (cursor, last outcome, completeness, what its inputs observed, failing keys),
   automation state, active runs
   (tasks nested inside, each launched attempt on its task), outputs owing a repair, idempotency
   receipts, files awaiting deletion, and the run history's files and the
@@ -36,7 +36,6 @@ from solera.keys.index import DeltaFiles, IndexState, Span, index_prefix
 
 from . import history, observed
 from .lake import LakeState
-from .positions import reads
 
 TERMINAL_TASK = frozenset({"succeeded", "skipped", "failed", "blocked", "canceled"})
 TERMINAL_RUN = frozenset({"succeeded", "failed", "canceled"})
@@ -215,10 +214,10 @@ class Model:
         # deleted runs whose directories are still to be deleted (§11)
         self.deleted: list[str] = snap.get("deleted") or []
         # (asset, partition) -> the partition's record (§5): its `cursor`; `last`, its last
-        # terminal outcome; `caught_up`, whether its last commit finished the pass
-        # it was on — its completeness, whatever its outputs wrote; `positions`
-        # {input: Position}; `reset`, set when a reset took positions, until a full
-        # pass catches it up (keys= runs read one meanwhile); and a per-key asset's `failures` record
+        # terminal outcome; `caught_up`, whether its last commit finished its walk;
+        # `observed` {input: what it observed — a keyed input's observation record, an
+        # unkeyed one's last commit read}; the `definition` they were observed under;
+        # and a per-key asset's `failures` record
         # (docs/per-key-processing.md §9), whose index lives in `indexes` under
         # ("@asset", partition). A rename moves it, retirement trims it: one record.
         self.partitions = Grouped(_flatten(snap.get("partitions"), 2))
@@ -376,15 +375,6 @@ class Model:
         """An asset partition's record, empty where it has none: to read."""
 
         return self.partitions.get((asset, partition)) or {}
-
-    def position(self, asset: str, input: str, partition: str) -> dict | None:
-        return (self.partition(asset, partition).get("positions") or {}).get(input)
-
-    def positions(self):
-        """Every Incremental input's position, of every partition."""
-
-        for record in self.partitions.values():
-            yield from (record.get("positions") or {}).values()
 
     def _partition(self, asset: str, partition: str) -> dict:
         """An asset partition's record, to change: made if it has none."""
@@ -724,37 +714,33 @@ class Model:
         self.unfinished.pop(task["id"], None)
         self._finished(run, task, "canceled", None, at)
 
-    def _subscribed(self, asset: str, input: str, position: dict) -> bool:
-        """Whether the project still declares the Incremental input a
-        position keeps the pass of: the same asset, parameter and
-        upstream output."""
+    def _subscribed(self, asset: str, input: str, rec: dict) -> bool:
+        """Whether the project still declares the Incremental input a record
+        is what it observed of: the same asset, parameter and upstream output."""
 
         spec = ((self.manifest or {}).get("assets") or {}).get(asset, {}).get("inputs", {}).get(input) or {}
-        return spec.get("kind") == "incremental" and spec.get("output") == position.get("output")
+        return spec.get("kind") == "incremental" and spec.get("output") == rec["upstream"][0]
 
     def _unsubscribe(self, asset: str | None = None, partition: str | None = None) -> None:
-        """Retire the pass obligations of inputs the project no longer
-        declares (a removed consumer, a renamed parameter, another
-        upstream): their positions, which would keep the upstream's delta
-        log and pin its files for good. A partition with an attempt in flight
-        keeps them until it settles: that attempt still reads them. With
-        `asset` and `partition`, only that partition's — one whose attempt ended."""
+        """Retire what inputs the project no longer declares observed (a
+        removed consumer, a renamed parameter, another upstream): records
+        that would keep the upstream's endpoints for good. A partition with
+        an attempt in flight keeps them until it settles: that attempt still
+        reads them. With `asset` and `partition`, only that partition's — one
+        whose attempt ended."""
 
         live = {(t["asset"], t["partition"]) for tid in self.claims if (t := self.task(tid)) is not None}
         keys = list(self.partitions) if asset is None else [(asset, partition)]
         for key in keys:
             if key in live or key not in self.partitions:
                 continue
-            for field in ("positions", "observed"):
-                held = self.partitions[key].get(field)
-                if not held:
-                    continue
-                for input in [
-                    i for i, kept in held.items() if not self._subscribed(key[0], i, _upstream(kept))
-                ]:
-                    del held[input]
-                if not held:
-                    del self.partitions[key][field]
+            held = self.partitions[key].get("observed")
+            if not held:
+                continue
+            for input in [i for i, rec in held.items() if not self._subscribed(key[0], i, rec)]:
+                del held[input]
+            if not held:
+                del self.partitions[key]["observed"]
 
     def _retire_output(self, output: str, home: str, old: dict, store: dict, at: float) -> None:
         """Record an output life's leftovers for a cleanup task (K25): the
@@ -783,9 +769,9 @@ class Model:
         on another store than `stores` says it was on, resets it: what comes
         back under that name, or what the new store holds, is a new one (K10).
         An output's heads, key indexes (their files become garbage) and repair
-        intents go now, with the positions that read it or are its asset's:
-        every consumer and its producer start over, with full passes. A
-        removed asset's partition records go — cursor, positions, failed
+        intents go now, and what its asset's partitions observed: its
+        producer starts over, and every consumer's next run is a full run. A
+        removed asset's partition records go — cursor, observations, failed
         keys — a job's included, which has no output. `reset_at` keeps the
         deploy number, by output and by asset; an attempt launched before the
         reset commits nothing of it (`Engine.commit_attempt`), so nothing
@@ -837,27 +823,16 @@ class Model:
             if key[0] in producers:  # a new life: never built, so missing, not stale
                 for field in ("caught_up", "caught_up_at", "built_at", "seen", "observed", "definition"):
                     self.partitions[key].pop(field, None)
-            # A keyed input's record stays: its layers name the upstream's earlier life,
-            # and its next run is a full run.
+            # What an input observed of a reset upstream stays, its next run a full run: a
+            # keyed record's layers name the upstream's earlier life; an unkeyed one is marked.
             records = self.partitions[key].get("observed") or {}
-            if key[0] not in producers and any(rec["upstream"][0] in reset for rec in records.values()):
+            gone = [rec for rec in records.values() if rec["upstream"][0] in reset]
+            for rec in gone:
+                if "commit" in rec:
+                    rec["reset"] = True
+            if gone and key[0] not in producers:
                 self.partitions[key]["input_reset_at"] = self.event_counter
                 self._drop_failures(*key)  # failed against keys that are no longer the input's (K47)
-            positions = self.partitions[key].get("positions")
-            if not positions:
-                continue
-            dropped = [
-                i
-                for i, position in positions.items()
-                if key[0] in producers or position.get("output") in reset
-            ]
-            for input in dropped:
-                del positions[input]
-            if dropped and key[0] not in producers:  # its input's content replaced: a fact staleness reads
-                self.partitions[key]["input_reset_at"] = self.event_counter
-                self._drop_failures(*key)  # failed against keys that are no longer the input's (K47)
-            if not positions:
-                del self.partitions[key]["positions"]
         return producers
 
     def _apply_aliases(self, manifest) -> tuple[dict[str, list[str]], dict[str, str]]:
@@ -905,9 +880,6 @@ class Model:
         for head in self.heads.values():
             if head.get("asset") in asset_map:
                 head["asset"] = asset_map[head["asset"]]
-        for position in self.positions():
-            if position.get("output") in output_map:
-                position["output"] = output_map[position["output"]]
         for record in self.partitions.values():
             for rec in (record.get("observed") or {}).values():
                 rec["upstream"][0] = output_map.get(rec["upstream"][0], rec["upstream"][0])
@@ -1224,14 +1196,13 @@ class Model:
                 record.pop("cursor", None)
             else:
                 record["cursor"] = commit["cursor"]
-        for input, position in commit.get("positions", {}).items():
-            if self._subscribed(asset, input, position):  # an input removed while it ran keeps no pass
-                record.setdefault("positions", {})[input] = position
         for input, ops in (commit.get("observed") or {}).items():
             records = record.setdefault("observed", {})
-            rec = records.setdefault(input, {})  # a new one's operations begin with its reset
-            observed.apply(rec, ops)
-            if not self._subscribed(asset, input, _upstream(rec)):  # an input removed while it ran
+            if isinstance(ops, dict):  # an unkeyed input: the last commit it read
+                records[input] = ops
+            else:
+                observed.apply(records.setdefault(input, {}), ops)  # a new record's begin with its reset
+            if not self._subscribed(asset, input, records[input]):  # an input removed while it ran
                 del records[input]
         if "definition" in commit:  # what its observations were made under
             record["definition"] = commit["definition"]
@@ -1776,9 +1747,10 @@ def declaration(manifest: dict, asset: str, homes: dict | None = None) -> dict:
     declarations (key, incremental, migrations, config) and store versions,
     not their names, nor which store holds them — that is the reset rule's
     (§2). A difference is an asset change; its docs, automations,
-    placement, retries, timeout, tags or retention are not. A position
-    takes it without patterns and batch size (`Engine._fingerprint`): a
-    pattern change is diffed, and a batch size only pages."""
+    placement, retries, timeout, tags or retention are not. What inputs
+    observe is made under it without patterns and batch size
+    (`Engine._definition`): new patterns are compared, and a batch size
+    only pages."""
 
     homes = homes or {}
     entry, stores, outputs = manifest["assets"][asset], manifest["stores"], manifest["outputs"]
@@ -1807,7 +1779,13 @@ def declaration(manifest: dict, asset: str, homes: dict | None = None) -> dict:
     }
 
 
-def _upstream(kept: dict) -> dict:
-    """What an input's position or observation record reads: `{"output"}`."""
+def reads(plans: dict) -> list[tuple]:
+    """What an attempt's plans read of their upstream indexes until the
+    claim goes: `(output, partition, head)`, the head a keyed batch classes
+    its keys at and its commit records."""
 
-    return {"output": kept["upstream"][0]} if "upstream" in kept else kept
+    return [
+        (p["output"], p["upstream_partition"], p["head"])
+        for p in plans.values()
+        if p and p["kind"] == "observed"
+    ]

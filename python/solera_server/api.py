@@ -283,7 +283,7 @@ def create_app(
         limit: int = Query(default=1000, ge=1, le=10000),
     ):
         """A page of a keyed asset's stale keys in `partition` (unpartitioned:
-        none), and why it is stale (docs/positions-from-reads.md)."""
+        none), and why it is stale (docs/observed-set.md)."""
 
         runtime = await asset_engine(request, p, name)
         return await runtime.stale_keys(name, partition, after=after, limit=limit)

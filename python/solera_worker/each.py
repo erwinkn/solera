@@ -331,7 +331,7 @@ async def run(spec, project, asset, param: str, pin: dict, args: dict, ctx, keys
     if abort:
         return {"abort": abort[0]}
     for key, generation in batch.upserted.items():
-        # Every key of the batch has an outcome before its position moves past it.
+        # Every key of the batch has an outcome before its batch commits.
         outcomes.setdefault(key, Outcome(INTERRUPTED, generation))
     for key in batch.deleted:
         outcomes[key] = Outcome(REMOVED)

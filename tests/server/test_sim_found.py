@@ -427,7 +427,7 @@ async def test_a_key_a_moved_output_dropped_leaves_its_consumer(state, tmp_path,
 
     engine = make_engine(state, project("other"))
     await engine.initialize()
-    assert ("items", "") not in state.model.heads and not state.model.position("copy", "items", "")
+    assert ("items", "") not in state.model.heads and await engine.observed("copy", "", "items") == {}
     rows["items"] = [{"id": "k10"}, {"id": "k12"}]  # the move's first write drops k11
     assert status_of(await drive(engine, await engine.submit(["items"]))) == "succeeded"
     assert state.model.heads[("items", "")]["ref"]["store"] == "other"
@@ -570,7 +570,10 @@ async def test_a_move_and_back_with_no_write_between_resets(state, tmp_path):
         engine = make_engine(state, project(store))
         await engine.initialize()
     assert ("items", "") not in m.heads and ("items", "") not in m.indexes
-    assert m.reset_at[("output", "items")] == m.deploy_number and not m.position("copy", "items", "")
+    assert (
+        m.reset_at[("output", "items")] == m.deploy_number
+        and await engine.observed("copy", "", "items") == {}
+    )
     rows["items"] = [{"id": "a"}]  # the new `items` holds no `b`
     assert status_of(await drive(engine, await engine.submit(["copy"], upstream=True))) == "succeeded"
     assert seen[-1] == (True, ["a"])

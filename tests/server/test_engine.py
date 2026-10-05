@@ -1156,9 +1156,8 @@ async def test_a_batch_says_where_it_sits_in_its_pass(state):
     """A run spans batches of `batch_size`: `index` is the batch's index in
     the run, `count` the plan — an estimate, exact on the final batch —
     `first` is batch 0 and `final` the walk running out (§5; review round
-    3, system B5). For a keyed input `full` marks only a full run's first
-    batch, which starts the output over; an unkeyed upstream's full pass
-    keeps it on every batch until step 5."""
+    3, system B5) — keyed or unkeyed. `full` marks only a full run's first
+    batch, which starts the output over."""
 
     from solera.stores import Patch
 
@@ -1208,9 +1207,9 @@ async def test_a_batch_says_where_it_sits_in_its_pass(state):
         await drive(engine, await engine.submit(["log"]))
     await drive(engine, await engine.submit(["tail"]))
     assert batch_pages == [
-        (0, 3, True, False, [0], True),
-        (1, 3, False, False, [1], True),
-        (2, 3, False, True, [2], True),
+        (0, 3, True, False, [0], False),
+        (1, 3, False, False, [1], False),
+        (2, 3, False, True, [2], False),
     ]
     batch_pages.clear()
     await drive(engine, await engine.submit(["log"]))

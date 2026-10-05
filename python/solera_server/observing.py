@@ -1,6 +1,9 @@
-"""The engine's side of the observed set (docs/observed-set.md): each keyed
-incremental input's batch planned from its consumer partition's
-observation record, what a batch's commit records there, and the decode.
+"""The engine's side of the observed set (docs/observed-set.md): each
+incremental input's batch planned from what its consumer partition
+observed, what a batch's commit records there, and the decode. A keyed
+input keeps an observation record; an unkeyed one, the last commit it
+read (`{upstream, commit, base}`: an append output's commits run from its
+`base`).
 
 A run's task walks an input's owed keys in key order from its **progress**
 — its last committed batch's index and end key (`{batch, key}`, `key` None
@@ -87,24 +90,36 @@ class Observing:
             e is None or e >= head or state.covers(e + 1, head) for e in (x["endpoint"] for x in layers)
         )
 
-    def _full_run(self, task: dict, run: dict, keyed) -> str | None:
+    def _full_run(self, task: dict, run: dict, incremental) -> str | None:
         """Why the task's next batch is a full run's, if it is: its run is
         one (on its first batch), the partition's definition is not the one
-        its observations were made under, or a record no longer decodes —
-        an upstream reset, or history the index no longer serves."""
+        its observations were made under, or what an input observed no
+        longer holds — an upstream reset, an append output started over,
+        history the index no longer serves."""
 
         record = self.m.partition(task["asset"], task["partition"])
         if not task.get("progress") and (
-            run["mode"] == "full" or any((run.get("keys") or {}).get(i.output) == "full" for i in keyed)
+            run["mode"] == "full" or any((run.get("keys") or {}).get(i.output) == "full" for i in incremental)
         ):
             return "full run"
-        if record.get("definition") not in (None, self._fingerprint(task["asset"], run)):
+        if record.get("definition") not in (None, self._definition(task["asset"], run)):
             return "definition changed"
-        for input in keyed:
+        for input in incremental:
             rec = (record.get("observed") or {}).get(input.param)
-            if rec is not None and not self._decodable(rec, input.output, input.partition):
+            if rec is not None and not self._still(rec, input):
                 return "input reset"
         return None
+
+    def _still(self, rec: dict, input: planning.Input) -> bool:
+        """Whether what an input observed still holds of its upstream: a
+        record still decodes; an unkeyed upstream's commits since its base
+        still include the one it read."""
+
+        if self._keyed(input):
+            return self._decodable(rec, input.output, input.partition)
+        head = self.m.heads.get((input.output, input.partition)) or {}
+        base, last = int(head.get("base", 0)), int(head.get("commit_number", -1))
+        return not rec.get("reset") and int(rec["base"]) == base and int(rec["commit"]) <= last
 
     async def _observe(self, task: dict, run: dict, attempt: str | None = None) -> dict:
         """Each keyed incremental input's next batch (docs/observed-set.md, "A
@@ -122,11 +137,12 @@ class Observing:
             inputs = planner.inputs(task["asset"], partition)
         except planning.UpstreamOnly:
             return {}  # `_prepare` refuses it
-        keyed = [i for i in inputs if self._keyed(i)]
-        if not keyed:
+        incremental = [i for i in inputs if i.kind == "incremental"]
+        keyed = [i for i in incremental if self._keyed(i)]
+        if not incremental:
             return {}
         context = self._context(planner, inputs)
-        full = self._full_run(task, run, keyed) is not None
+        full = self._full_run(task, run, incremental) is not None
         records = self.m.partition(task["asset"], partition).get("observed") or {}
         progress = {} if full else task.get("progress") or {}
         upstreams = {i.param: self._upstream(i.output, i.partition) for i in keyed}
@@ -134,6 +150,11 @@ class Observing:
         if claim is not None:
             claim["reads"] = [(i.output, i.partition, upstreams[i.param][0].state.head) for i in keyed]
         out = {}
+        for input in incremental:
+            if input not in keyed:
+                out[input.param] = self._commits(
+                    input, records.get(input.param), progress.get(input.param), full
+                )
         for input in keyed:
             spec, mine = input.spec, progress.get(input.param)
             index, life = upstreams[input.param]
@@ -168,6 +189,60 @@ class Observing:
                 "done": mine is not None and mine["key"] is None,
             }
         return out
+
+    def _commits(self, input: planning.Input, rec: dict | None, mine: dict | None, full: bool) -> dict:
+        """An unkeyed input's next batch: the next `batch_size` commits past
+        the task's progress, else past the commit it last read — from its
+        upstream's base, in a full run or never read."""
+
+        head = self.m.heads.get((input.output, input.partition)) or {}
+        base, last = int(head.get("base", 0)), int(head.get("commit_number", -1))
+        if mine is not None:
+            lo = last + 1 if mine["key"] is None else int(mine["key"]) + 1
+        else:
+            lo = base if full or rec is None else int(rec["commit"]) + 1
+        size = int(input.spec["batch_size"])
+        hi = min(last, lo + size - 1)
+        index = 0 if mine is None else int(mine["batch"]) + 1
+        return {
+            "commits": [lo, hi],
+            "head": last,
+            "base": base,
+            "full": full,
+            "index": index,
+            "count": index + max(1, -(-(last - lo + 1) // size)),
+            "final": hi >= last,
+            "done": mine is not None and mine["key"] is None,
+        }
+
+    def _commits_pin(self, input: planning.Input, ref: dict, o: dict) -> tuple[dict, dict, bool]:
+        """An unkeyed input's pin and plan for its batch of commits."""
+
+        lo, hi = o["commits"]
+        batch = {
+            "commits": [lo, hi],
+            "full": o["full"],
+            "more": not o["final"],
+            "index": o["index"],
+            "count": o["count"],
+        }
+        plan = {
+            "kind": "commits",
+            "output": input.output,
+            "upstream_partition": input.partition,
+            "head": o["head"],
+            "base": o["base"],
+            "index": o["index"],
+            "count": o["count"],
+            "after": lo - 1,
+            "end": hi,
+            "final": o["final"],
+            "full": o["full"],
+            "classes": {},
+        }
+        if o["done"]:
+            plan["done"] = True
+        return {"ref": ref, "batch": batch}, plan, hi < lo
 
     def _observed_pin(self, input: planning.Input, ref: dict, o: dict) -> tuple[dict, dict, bool]:
         """A keyed input's pin and plan for its batch: each key with its
@@ -229,11 +304,7 @@ class Observing:
         installs them as they are; refused if an upstream was reset since
         the batch was planned (the commit check)."""
 
-        plans = {
-            p: plan
-            for p, plan in (prepared.get("plans") or {}).items()
-            if plan and plan["kind"] == "observed"
-        }
+        plans = {p: plan for p, plan in (prepared.get("plans") or {}).items() if plan}
         if not plans:
             return {}
         asset, partition = task["asset"], task["partition"]
@@ -241,6 +312,18 @@ class Observing:
         delivered = result.get("delivered") or {}
         out = {"observed": {}, "progress": {}, "definition": prepared["definition"]}
         for param, plan in plans.items():
+            if plan["kind"] == "commits":  # an unkeyed input: the last commit it read
+                if not plan.get("done"):
+                    out["observed"][param] = {
+                        "upstream": [plan["output"], plan["upstream_partition"]],
+                        "commit": max(plan["end"], plan["after"]),  # an empty batch: what it had read
+                        "base": plan["base"],
+                    }
+                    out["progress"][param] = {
+                        "batch": plan["index"],
+                        "key": None if plan["final"] else plan["end"],
+                    }
+                continue
             index, life = self._upstream(plan["output"], plan["upstream_partition"])
             if life != plan["life"]:
                 raise Conflict(f"input {param}: its upstream was reset since this attempt launched")
@@ -284,10 +367,9 @@ class Observing:
         upstream commit it last read (None: none)."""
 
         spec = self.manifest["assets"][asset]["inputs"][param]
-        if self.manifest["outputs"][spec["output"]].get("key") is None:
-            position = self.m.position(asset, param, partition)
-            return None if position is None else int(position["next"]) - 1
         rec = (self.m.partition(asset, partition).get("observed") or {}).get(param)
+        if self.manifest["outputs"][spec["output"]].get("key") is None:
+            return None if rec is None else int(rec["commit"])
         if rec is None:
             return {}
         output, upstream_partition = rec["upstream"]
@@ -315,6 +397,20 @@ class Observing:
             if found is not None:
                 out[key] = Observation(*found)
         return out
+
+    @staticmethod
+    def _observed_at(rec: dict | None) -> int | None:
+        """The oldest commit any part of what an input observed was observed
+        at — every key is observed at least as of it — or None: nothing."""
+
+        if rec is None:
+            return None
+        if "commit" in rec:
+            return int(rec["commit"])
+        found = [
+            layer["endpoint"] for layer in [rec["base"], *rec["ranges"]] if layer["endpoint"] is not None
+        ]
+        return min(found, default=None)
 
 
 async def _all(index: KeyIndex, at: int | None) -> list:

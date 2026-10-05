@@ -151,7 +151,9 @@ def _main():
     run.add_argument("targets", nargs="+")
     run.add_argument("--partition", action="append", default=[])
     run.add_argument("--partitions", choices=["latest", "all", "missing"])
-    run.add_argument("--full", action="store_true", help="Full run: reset positions, no prior (§8)")
+    run.add_argument(
+        "--full", action="store_true", help="Full run: every input key again, the output started over (§8)"
+    )
     run.add_argument("--upstream", action="store_true")
     run.add_argument("--config", default="{}", help="Run configuration as a JSON object")
     run.add_argument("--keys", action="append", default=[], help="INPUT=full or INPUT=k1,k2")

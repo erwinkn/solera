@@ -478,17 +478,17 @@ def test_one_outputs_heads_are_found_without_looking_at_the_others():
 
 
 def test_a_rename_moves_a_scopes_record_whole():
-    """§2, §5: a partition's cursor, outcome, completeness, positions and
-    failing keys are one record, and `aliases=` moves it as one. A name
-    that already has a record keeps its own: two assets' states never mix.
-    A position of an input the project no longer declares goes."""
+    """§2, §5: a partition's cursor, outcome, completeness, what its inputs
+    observed and failing keys are one record, and `aliases=` moves it as
+    one. A name that already has a record keeps its own: two assets' states
+    never mix. What an input the project no longer declares observed goes."""
 
-    position = {"kind": "keys", "output": "feed", "upstream_partition": "", "next": 3}
+    seen = {"upstream": ["feed", ""], "commit": 2, "base": 0}
     whole = {
         "cursor": "c1",
         "last": {"outcome": "failed", "run": "r", "attempt": "a", "at": 1.0},
         "caught_up": True,
-        "positions": {"feed": position, "gone": {**position, "output": "elsewhere"}},
+        "observed": {"feed": seen, "gone": {**seen, "upstream": ["elsewhere", ""]}},
         "failures": {"commit_number": 0, "forced": {}, "counts": {"failed": 1}},
     }
     m = Model()
@@ -503,7 +503,7 @@ def test_a_rename_moves_a_scopes_record_whole():
         "automations": {},
     }
     m.apply({"type": "ProjectRegistered", "deploy": "r2", "manifest": manifest, "at": 3.0})
-    assert m.partition("new", "x") == {**whole, "positions": {"feed": position}}
+    assert m.partition("new", "x") == {**whole, "observed": {"feed": seen}}
     assert m.partition("new", "y") == {
         "last": {"outcome": "succeeded", "run": "r", "attempt": "b", "at": 2.0}
     }
