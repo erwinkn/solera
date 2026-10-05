@@ -236,7 +236,12 @@ class Reads:
         want = {k: (state[k][0], state[k][2]) for k in map(bytes, keys) if k in state and not state[k][1]}
         got = {bytes(k): (int(g), _payload(p)) for k, (g, p) in result.items()}
         if got != want:
-            self._wrong(index, "lookup", (len(keys),), f"{sorted(got.items())[:3]}, the fold {sorted(want.items())[:3]}")
+            self._wrong(
+                index,
+                "lookup",
+                (len(keys),),
+                f"{sorted(got.items())[:3]}, the fold {sorted(want.items())[:3]}",
+            )
 
 
 def patches(reads: Reads) -> list[tuple]:
