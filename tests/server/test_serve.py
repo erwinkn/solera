@@ -1,10 +1,14 @@
 """`solera serve` as a process. With SOLERA_SELFTEST=1 it probes the
 storage before it listens (docs/railway.md): a failed probe exits
 non-zero and never answers /healthz, so the deployment fails; a passed
-one serves. A SIGTERM — how every platform stops it — exits 0."""
+one serves. A SIGTERM — how every platform stops it — exits 0. A local
+serve reloads its project's code in place; one whose engine was replaced
+exits rather than answer 503."""
 
+import asyncio
 import hashlib
 import http.server
+import json
 import os
 import signal
 import socket
@@ -143,3 +147,94 @@ def test_a_sigterm_stops_it_cleanly(tmp_path):
         stop(process)
     assert process.returncode == 0, err[-2000:]
     assert "Application shutdown complete" in err
+
+
+PROJECT_SRC = """
+from solera.sdk import Output, Project, asset
+
+@asset(outputs=Output("feed", key="k"), version="1")
+def feed():
+    return [{"k": "a", "v": 1}]
+
+project = Project(assets=[feed], name="reloady")
+"""
+
+
+def get(port, path):
+    with urllib.request.urlopen(f"http://127.0.0.1:{port}{path}", timeout=10) as response:
+        return json.loads(response.read())
+
+
+def project_serve(tmp_path):
+    (tmp_path / "proj.py").write_text(PROJECT_SRC)
+    port = free_port()
+    project = f"{tmp_path / 'proj.py'}:project"
+    process = serve(
+        (tmp_path / "state").as_uri(), port, tmp_path, SOLERA_SELFTEST="0", SOLERA_PROJECT=project
+    )
+    deadline = time.monotonic() + 120
+    while not listening(port):
+        assert process.poll() is None, stop(process)
+        assert time.monotonic() < deadline, "serve never listened"
+        time.sleep(0.2)
+    return process, port
+
+
+def test_a_reload_serves_the_new_code_in_the_same_process(tmp_path):
+    """--insecure reloads by default: an edit to the project's module is a
+    new deploy in the same engine, no successor; a file beside it that no
+    module of the project is (a console build's assets) is none."""
+
+    process, port = project_serve(tmp_path)
+    try:
+        first = get(port, "/api/diagnostics")["deploy"]
+        (tmp_path / "web").mkdir()
+        (tmp_path / "web" / "app.js").write_text("console.log(1)")
+        time.sleep(3)  # past the reload's poll and quiet second
+        assert get(port, "/api/diagnostics")["deploy"] == first
+        (tmp_path / "proj.py").write_text(PROJECT_SRC.replace('version="1"', 'version="2"'))
+        deadline = time.monotonic() + 60
+        while get(port, "/api/diagnostics")["deploy"] == first:
+            assert time.monotonic() < deadline, "the edit was never served"
+            time.sleep(0.2)
+        [feed] = get(port, "/api/projects/reloady/assets")["assets"]
+        assert feed["version"] == "2" and process.poll() is None
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/healthz", timeout=10) as response:
+            assert response.status == 200
+    finally:
+        _, err = stop(process)
+    assert "writes no more" not in err and "was replaced" not in err
+
+
+def test_a_serve_whose_engine_was_replaced_exits(tmp_path):
+    """Another engine takes the namespace: at its next write the serve's
+    engine finds itself fenced, and the process ends (0: its successor owns
+    everything) rather than stay up answering 503."""
+
+    from solera_server.state import State
+
+    process, port = project_serve(tmp_path)
+
+    async def takeover():
+        successor = await State.open((tmp_path / "state").as_uri(), "default")
+        try:
+            body = json.dumps({"targets": ["feed"]}).encode()
+            request = urllib.request.Request(
+                f"http://127.0.0.1:{port}/api/projects/reloady/runs",
+                body,
+                {"content-type": "application/json"},
+            )
+            try:  # its write is refused: the request may fail as the serve stops
+                await asyncio.to_thread(urllib.request.urlopen, request, timeout=10)
+            except OSError:
+                pass
+            return await asyncio.to_thread(process.wait, 60)
+        finally:
+            await successor.close()
+
+    try:
+        code = asyncio.run(takeover())
+    finally:
+        _, err = stop(process)
+    assert code == 0, err[-2000:]
+    assert "writes no more" in err

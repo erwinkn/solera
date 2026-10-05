@@ -13,6 +13,7 @@ import sys
 from pathlib import Path
 
 TERMINAL = {"succeeded", "failed", "canceled"}
+GRACEFUL_STOP = 15  # seconds a stopping serve waits for its open connections
 
 
 def _server_url():
@@ -285,21 +286,21 @@ def _main():
         # handler it found: the default one would end a finished stop as killed
         # (143), and systemd would mark the unit failed. A stop is a success.
         signal.signal(signal.SIGTERM, lambda signum, frame: None)
-        uvicorn.run(
-            create_app(
-                state_url=args.state_url,
-                namespace=args.namespace,
-                project=project,
-                insecure=args.insecure,
-                reload=args.insecure if args.reload is None else args.reload,
-                # Where workers reach this engine: set SOLERA_ENGINE_URL to a
-                # public HTTPS name for remote workers (docs/lifecycle.md §5.2).
-                engine_url=os.getenv("SOLERA_ENGINE_URL")
-                or f"http://{'127.0.0.1' if args.host in ('0.0.0.0', '::') else args.host}:{args.port}",
-            ),
-            host=args.host,
-            port=args.port,
+        app = create_app(
+            state_url=args.state_url,
+            namespace=args.namespace,
+            project=project,
+            insecure=args.insecure,
+            reload=args.insecure if args.reload is None else args.reload,
+            # Where workers reach this engine: set SOLERA_ENGINE_URL to a
+            # public HTTPS name for remote workers (docs/lifecycle.md §5.2).
+            engine_url=os.getenv("SOLERA_ENGINE_URL")
+            or f"http://{'127.0.0.1' if args.host in ('0.0.0.0', '::') else args.host}:{args.port}",
         )
+        # A stop waits this long at most for open connections (long polls, streams).
+        uvicorn.run(app, host=args.host, port=args.port, timeout_graceful_shutdown=GRACEFUL_STOP)
+        if code := getattr(app.state, "exit_code", 0):  # an engine that stopped writing (`api`)
+            raise SystemExit(code)
         return
 
     if args.command == "selftest":

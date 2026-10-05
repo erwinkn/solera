@@ -5,10 +5,13 @@ token. Everything else takes the admin token."""
 
 from __future__ import annotations
 
+import asyncio
 import hmac
+import logging
 import os
 import re
 import secrets
+import signal
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -22,12 +25,29 @@ from . import reloading
 from .engine import Conflict, Engine
 from .executors.local import load_manifest
 from .history import TERMINAL_RUN, RunFilter
+from .journal import Fenced
 from .sensors import HOST_TOKEN
 from .state import LostOwnership, State, Unavailable
+
+log = logging.getLogger(__name__)
 
 ATTEMPT_ROUTE = re.compile(r"^/api/projects/[^/]+/attempts/([^/]+)/(start|beat|logs|resolve|finished)$")
 POOL_ROUTE = re.compile(r"^/api/projects/[^/]+/pools/[^/]+/work$")
 SENSOR_ROUTE = re.compile(r"^/api/projects/[^/]+/sensors/(next|[^/]+/ticks/[^/]+)$")
+
+
+async def _end_when_stopped(app, runtime) -> None:
+    """An engine that writes no more ends its serve: answering 503 for ever
+    would keep its port and its place from whoever serves the namespace now.
+    Replaced (fenced), the process exits 0 — its successor owns everything,
+    and a supervisor must not start it again against it; stopped for any
+    other reason, 1."""
+
+    await runtime.state.ended.wait()
+    stopped = runtime.state.journal.stopped
+    app.state.exit_code = 0 if isinstance(stopped, Fenced) else 1
+    log.error("the engine writes no more (%s): the serve stops", stopped)
+    signal.raise_signal(signal.SIGTERM)  # uvicorn's own graceful stop
 
 
 class RunInput(BaseModel):
@@ -117,9 +137,12 @@ def create_app(
         await runtime.start()
         if owned and reload:  # a local serve: each new deploy served as its code changes
             runtime.tasks.spawn(reloading.reload(runtime, project, files), key="reload")
+        ending = asyncio.create_task(_end_when_stopped(app, runtime)) if owned else None
         try:
             yield
         finally:
+            if ending is not None:
+                ending.cancel()
             await runtime.stop()
             if owned:
                 await runtime.state.close()
