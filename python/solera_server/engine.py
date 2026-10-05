@@ -259,7 +259,7 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
     def _owed_firings(self) -> dict[str, list[list[str]]]:
         """What the deploy just registered leaves each `OnChange` automation
         owing, once: for each target it changed — added (again), renamed,
-        its declaration changed, or reset (`Model.changed_at`) — every
+        its declaration changed, or reset (`Model.changed`) — every
         current partition whose inputs have heads, so it is built now, not
         when its upstream next changes. Decided at the deploy and
         recorded, never re-checked by a tick: a run of it that fails is not
@@ -267,7 +267,7 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
         their own criteria."""
 
         planner, owed = self.planner(), {}
-        changed = {a for a, n in self.m.changed_at.items() if n == self.m.event_counter}
+        changed = self.m.changed
         for name, auto in self.m.automations.items():
             if auto["trigger"]["kind"] != "onchange" or not auto["enabled"]:
                 continue

@@ -179,7 +179,6 @@ class Model:
             "retired": dict(self.retired),
             "homes": dict(self.homes),
             "reset_at": _nest(self.reset_at, 2),
-            "changed_at": self.changed_at,
             "automations": self.automations,
             "sensors": self.sensors,
             "runs": self.runs,
@@ -239,10 +238,6 @@ class Model:
         # removed, or (an output) moved to another store. An attempt launched
         # under an earlier one commits nothing of it.
         self.reset_at: dict[tuple, int] = _flatten(snap.get("reset_at"), 2)
-        # asset -> the event counter of its last change: added (again), renamed,
-        # its declaration changed, or reset: the deploy owes its OnChange
-        # automations a firing.
-        self.changed_at: dict[str, int] = snap.get("changed_at") or {}
         self.automations: dict[str, dict] = snap.get("automations") or {}
         # sensor -> {cursor, accepted}: the last tick that changed something (docs/lifecycle.md §11.4)
         self.sensors: dict[str, dict] = snap.get("sensors") or {}
@@ -259,6 +254,10 @@ class Model:
         # sensor -> the tick dispatched and not yet decided: {tick, cursor, snapshot, pin, ...}
         self.ticks: dict[str, dict] = {}
         self.readers: dict[object, tuple] = {}  # the engine's own readers: (event counter, domains)
+        # the assets the last deploy changed: added (again), renamed, their declarations
+        # changed, or reset. Memory only: the engine reads it as it records the deploy,
+        # for what its OnChange automations owe (`FiringsOwed`, an event of its own).
+        self.changed: set[str] = set()
         self._reindex()
 
     def _reindex(self) -> None:
@@ -601,11 +600,12 @@ class Model:
             )
             if moved and name not in sources_before and old.get("store") in stores_before:
                 self._retire_output(now, homes.get(now, now), old, stores_before[old["store"]], e["at"])
+        self.changed = set()
         for asset in manifest["assets"]:
             olds = [a for a in renamed.get(asset, ()) if a in declared_before]  # renamed by this deploy
             before = declared_before.get(asset, declared_before.get(olds[0]) if olds else None)
             if before is None or olds or before != declaration(manifest, asset, self.homes) or asset in reset:
-                self.changed_at[asset] = self.event_counter
+                self.changed.add(asset)
         self._unsubscribe()
         automations = {}
         for name, auto in manifest["automations"].items():

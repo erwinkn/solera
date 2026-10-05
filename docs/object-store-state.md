@@ -171,7 +171,8 @@ while its attempt ran and added back, an asset resumed its first life), F21 (the
 **An asset change leaves the asset due.** A deploy that adds an asset
 (new, or added back), renames it, changes its declaration (its version,
 deps, inputs and their patterns, outputs and their stores' versions) or
-resets it is an **asset change** (`changed_at` in the model, by asset).
+resets it is an **asset change** (`Model.changed`, the deploy's alone:
+what it owes is recorded, `FiringsOwed`, and nothing reads it later).
 Its automations then decide, each by its own criterion:
 
 - `OnChange` owes one firing, as for a change of the asset's own, per
