@@ -38,6 +38,8 @@ from .lake import LakeState
 
 TERMINAL_TASK = frozenset({"succeeded", "skipped", "failed", "blocked", "canceled"})
 TERMINAL_RUN = frozenset({"succeeded", "failed", "canceled"})
+# What an automation's record keeps of its own; the rest is its manifest entry.
+AUTOMATION_STATE = ("enabled", "since", "last_fired", "last_run", "last_deploy", "pending")
 CLEANUP = "@cleanup"  # a cleanup task's asset: none of the project's (K25)
 BAD_OUTCOME = frozenset({"failed", "blocked", "canceled"})
 MAX_RECEIPTS = 10_000  # idempotency receipts kept for replayed submissions
@@ -179,7 +181,10 @@ class Model:
             "retired": dict(self.retired),
             "homes": dict(self.homes),
             "reset_at": _nest(self.reset_at, 2),
-            "automations": self.automations,
+            "automations": {
+                name: {k: auto[k] for k in AUTOMATION_STATE if k in auto}
+                for name, auto in self.automations.items()
+            },
             "sensors": self.sensors,
             "runs": self.runs,
             "receipts": list(self.receipts.items()),
@@ -238,7 +243,13 @@ class Model:
         # removed, or (an output) moved to another store. An attempt launched
         # under an earlier one commits nothing of it.
         self.reset_at: dict[tuple, int] = _flatten(snap.get("reset_at"), 2)
-        self.automations: dict[str, dict] = snap.get("automations") or {}
+        # name -> its manifest entry and its state (`AUTOMATION_STATE`): only the state
+        # is checkpointed, the entry is the manifest's
+        declared = (self.manifest or {}).get("automations") or {}
+        self.automations: dict[str, dict] = {
+            name: {**declared.get(name, {}), **state}
+            for name, state in (snap.get("automations") or {}).items()
+        }
         # sensor -> {cursor, accepted}: the last tick that changed something (docs/lifecycle.md §11.4)
         self.sensors: dict[str, dict] = snap.get("sensors") or {}
         self.runs: dict[str, dict] = snap.get("runs") or {}
@@ -634,7 +645,7 @@ class Model:
             if existing is not None:
                 record["enabled"] = existing["enabled"]
                 if existing["trigger"] == auto["trigger"]:
-                    for field in ("since", "last_fired", "last_run", "last_deploy", "pending"):
+                    for field in AUTOMATION_STATE[1:]:
                         record[field] = existing.get(field, record[field])
             automations[name] = record
         self.automations = automations
