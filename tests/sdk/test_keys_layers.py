@@ -59,7 +59,7 @@ class History:
         keys = sorted(ups)
         payloads = [ups[k] for k in keys] if self.sources else None
         written = SortedEntries.of(keys, payloads, sorted(set(rms) - set(ups)))
-        delta = await self.index().resolve(written, replaced=True)
+        delta = await self.index().resolve(written, generation=g, replaced=True)
         files = await self.index().write(f"d{c:06d}-a", delta, g)
         before = self.fold[-1] if self.fold else {}
         self.state = self.state.committed(c, files)
@@ -410,11 +410,18 @@ async def test_patches_sparse_or_streamed_write_the_same_delta(monkeypatch, stre
     assert await L.LayerIndex(h.io, st).lookup([key(i) for i in range(300)]) == now
     assert sorted(listed[0]) == ups and sorted(listed[1]) == rms
     data = await h.io.read_whole(st.path(files.part.files[0].name), files.part.files[0].size)
-    written, removed = L.delta_keys(data)
+    written, removed = L.delta_keys(data, 10_007)
     assert written == ups and removed == rms
-    assert dict(L.replaced_entries(data)) == {k: h.fold[-1][k][0] for k in ups + rms if k in h.fold[-1]}
+    # Updates and removes name what they replaced; adds name nothing.
+    assert dict(L.replaced_entries(data, 10_007)) == {
+        k: h.fold[-1][k][0] for k in ups + rms if k in h.fold[-1]
+    }
+    with pytest.raises(ValueError):
+        L.replaced_entries(data, 0)  # read without its commit's generation: refused, not wrong
     keys = [
-        k for chunk in [c async for c in L.DeltaKeys(h.io, st.prefix, files.part).chunks(7)] for k in chunk
+        k
+        for chunk in [c async for c in L.DeltaKeys(h.io, st.prefix, files.part, 10_007).chunks(7)]
+        for k in chunk
     ]
     assert keys == [k.decode() for k in ups]
 
@@ -444,8 +451,8 @@ async def test_the_resolvers_delta_is_the_writers_and_its_candidate_installs_wit
     cache = LayerCache(str(tmp_path), disk=2**20)
     idx = L.LayerIndex(h.io, h.state, cache=cache)
     run = SortedEntries.of([key(1), key(150)], None, [key(2)])
-    patch = await idx.compute(run, replaced=True)
-    written = await h.index().resolve(run, replaced=True)
+    patch = await idx.compute(run, generation=127, replaced=True)
+    written = await h.index().resolve(run, generation=127, replaced=True)
     assert [f[0] for f in patch.files] == [f[0] for f in written.files]
     full = SortedEntries.of([key(i) for i in range(0, 100, 2)], None, [])
     replaced = await idx.compute(full, replace=True)
@@ -485,7 +492,7 @@ async def test_the_engine_resolves_a_workers_request_from_its_warm_cache(tmp_pat
     await cache.fill(h.io, h.state)  # joins the fill the decline started
     second, data = await answer()
     assert second["result"] == "delta"
-    written = await h.index().resolve(run, replaced=True)
+    written = await h.index().resolve(run, generation=g, replaced=True)
     assert data == written.files[0][0]  # the writer's own delta, replaced generations included
     name = f"{c:012d}-a1"
     await h.io.write(h.state.path(f"{name}-0.lay"), data)

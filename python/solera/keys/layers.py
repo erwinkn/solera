@@ -765,13 +765,16 @@ class LayerIndex:
 
     # -- the writer ---------------------------------------------------------------------------
 
-    async def resolve(self, written, *, replaced: bool = False, collect: int = 0) -> Delta:
+    async def resolve(
+        self, written, *, generation: int = 0, replaced: bool = False, collect: int = 0
+    ) -> Delta:
         """A commit's delta from its written entries (a `SortedEntries`),
         each resolved exactly at the head, the sparse way: the blocks the
         keys fall in (or whole parts, where streaming them is faster), held
-        while it resolves. With `replaced`, each change records the
-        generation it replaced (an immutable store's cleanup); `collect`
-        lists up to that many changed keys."""
+        while it resolves. With `replaced`, each update and remove records
+        the generation it replaced, back from the commit's `generation` (an
+        immutable store's cleanup); `collect` lists up to that many changed
+        keys."""
 
         keys = list(written.keys())
         inputs = await self._inputs(keys) if keys else []
@@ -779,7 +782,7 @@ class LayerIndex:
             _native.layers_resolve,
             inputs,
             written,
-            replaced=replaced,
+            replaced=generation if replaced else None,
             collect=collect,
             block_size=BLOCK,
             file_limit=FILE_LIMIT,
@@ -819,7 +822,7 @@ class LayerIndex:
         keys = list(run.keys())
         if keys and await self.sparse_bytes(keys) > SPARSE_BYTES:
             return await self._join(name, generation, replaced, collect, sorted=run)
-        delta = await self.resolve(run, replaced=replaced, collect=collect)
+        delta = await self.resolve(run, generation=generation, replaced=replaced, collect=collect)
         return await self.write(name, delta, generation), delta.listed
 
     async def write_replace(
@@ -872,7 +875,7 @@ class LayerIndex:
             rows=rows,
             sorted=sorted,
             replace=replace,
-            replaced=replaced,
+            replaced=generation if replaced else None,
             collect=collect,
             key=key,
             overlay=overlay,
@@ -890,20 +893,22 @@ class LayerIndex:
         part = await self._index_part(name, "d", refs, out["main"])
         return DeltaFiles(part, out["added"], out["removed"], generation), out["collected"]
 
-    async def compute(self, run, *, replace: bool = False, replaced: bool = False, collect: int = 0) -> Delta:
+    async def compute(
+        self, run, *, generation: int = 0, replace: bool = False, replaced: bool = False, collect: int = 0
+    ) -> Delta:
         """A delta for `run` (sorted entries), computed but not uploaded: the
         engine's resolver answers a worker with it, and the worker uploads it
         under its own name. A patch resolves sparsely; a replacement streams
         the index, its files kept in memory."""
 
         if not replace:
-            return await self.resolve(run, replaced=replaced, collect=collect)
+            return await self.resolve(run, generation=generation, replaced=replaced, collect=collect)
         over = self._over(None)
         job = _native.LayerJob.join(
             [self._stamp(x) for x, _ in over],
             sorted=run,
             replace=True,
-            replaced=replaced,
+            replaced=generation if replaced else None,
             collect=collect,
             block_size=BLOCK,
             file_limit=FILE_LIMIT,
@@ -1053,19 +1058,20 @@ def _rows(out) -> list[tuple]:
 # -- a commit's delta, read by others ---------------------------------------------------------
 
 
-def delta_keys(data: bytes) -> tuple[list[bytes], list[bytes]]:
-    """A delta file's written keys, and its removed keys."""
+def delta_keys(data: bytes, generation: int) -> tuple[list[bytes], list[bytes]]:
+    """A delta file's written keys, and its removed keys (`generation`: its commit's)."""
 
-    entries = _native.layers_decode(data, 0, 0)
+    entries = _native.layers_decode(data, 0, generation)
     return [e[0] for e in entries if e[1]], [e[0] for e in entries if not e[1]]
 
 
-def replaced_entries(data: bytes) -> list[tuple[bytes, int]]:
-    """What a delta file's changes replaced, where the writer recorded it (an
-    immutable store's outputs): `(key, generation)`, for cleanup only — the
-    index never reads it."""
+def replaced_entries(data: bytes, generation: int) -> list[tuple[bytes, int]]:
+    """What a delta file's updates and removes replaced, where the writer
+    recorded it (an immutable store's outputs): `(key, generation)`, for its
+    cleanup only — the index never reads it. `generation`: the commit's, which
+    each is written back from."""
 
-    return [(e[0], e[7]) for e in _native.layers_decode(data, 0, 0) if e[7] is not None]
+    return [(e[0], e[7]) for e in _native.layers_decode(data, 0, generation) if e[7] is not None]
 
 
 @dataclass(frozen=True)
@@ -1077,11 +1083,12 @@ class DeltaKeys:
     io: ObjectIO
     prefix: str
     part: Part
+    generation: int  # the commit's
 
     async def chunks(self, size: int = 100_000):
         """Chunks of the written keys, as `str`."""
 
-        state = LayerState(prefix=self.prefix, layers=(Layer(0, 0, self.part, None, 1),))
+        state = LayerState(prefix=self.prefix, layers=(Layer(0, 0, self.part, None, self.generation),))
         index, after = LayerIndex(self.io, state), None
         while self.part.files:
             rows, after = await index.delta(None, after=after, first=size)

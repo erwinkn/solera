@@ -619,6 +619,14 @@ is pending, or **stuck** after three failed tries. *Was:* garbage,
 discard, data garbage; the items grammar. *Example:* `solera cleanups
 site_files alpha`.
 
+**cleanup cursor**. Per immutable keyed output partition, the last commit
+whose superseded versions are cleaned up, and the deltas committed since
+that name what they replaced (D168). A **step** walks the deltas no reader
+still needs, in commit order, deletes the generations they name, then moves
+the cursor; a crash repeats it. *Example:* `site_files`/`alpha`'s cursor at
+812 with deltas 813–840 queued: a reader pinned before commit 820 holds the
+step at 819.
+
 **cleanup task**. A task of the engine's own, with no asset, that deletes
 what an output removed, or moved to another store, left in the store it
 was on — where no attempt of that output will ever run again (K25).

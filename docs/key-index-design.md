@@ -318,8 +318,9 @@ matches and the inputs are still adjacent layers of the current list
 
 **Deletion.** Only the engine deletes index files, never a store's cleanup
 task. A file is dead when the state stops referencing it (a merge published,
-a life ended), no pin older than that remains, and, for a delta, its cleanup
-entry is acknowledged (cleanup reads its replaced generations). Deletion
+a life ended), no pin older than that remains, and, for an immutable store's
+delta, the partition's cleanup cursor has passed it (cleanup reads its
+replaced generations: `lifecycle.md` §9.8). Deletion
 follows a successful journal write made after the decision: a fenced
 engine's write fails and it deletes nothing (A17's R1).
 

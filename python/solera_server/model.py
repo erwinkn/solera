@@ -119,6 +119,13 @@ def _renumbered(entries: list[dict]) -> list[dict]:
     return out
 
 
+def _queues(cleaning: list[dict]) -> dict:
+    """Two names' cleanup cursors as one partition's: both queues, in commit order."""
+
+    queue = sorted((d for c in cleaning for d in c["queue"]), key=lambda d: d["n"])
+    return {"cursor": cleaning[-1]["cursor"], "queue": queue}
+
+
 def commit_of(head: dict | None) -> tuple | None:
     """What identifies the commit that installed a head — not the figures
     upkeep corrects on it: whether a writer came in
@@ -143,10 +150,10 @@ def _delta(keys: dict, generation: int | None) -> DeltaFiles:
     return delta if generation is None else dataclasses.replace(delta, generation=int(generation))
 
 
-def _delta_files(entries) -> frozenset[str]:
-    """The index files clean up entries of kind `delta` read."""
+def _delta_files(deltas) -> frozenset[str]:
+    """The delta files of queued deltas (`Model.cleaning`): a cleanup step's input."""
 
-    return frozenset(f"{d['prefix']}{name}" for d in entries if d["kind"] == "delta" for name in d["files"])
+    return frozenset(f"{d['prefix']}{name}" for d in deltas for name in d["files"])
 
 
 class Model:
@@ -175,6 +182,7 @@ class Model:
             "partitions": _nest(self.partitions, 2),
             "repairs": _nest(self.repairs, 2),
             "cleanups": _nest(self.cleanups, 2),
+            "cleaning": _nest(self.cleaning, 2),
             "retired": dict(self.retired),
             "homes": dict(self.homes),
             "reset_at": _nest(self.reset_at, 2),
@@ -223,6 +231,11 @@ class Model:
         # event counter that let go of it: for the partition's next attempt to clean up
         # once no reader pins it (docs/lifecycle.md §9.8)
         self.cleanups: dict[tuple, list] = _flatten(snap.get("cleanups"), 2)
+        # (output, partition) -> an immutable keyed output's cleanup cursor: `cursor`,
+        # the last commit cleaned, and `queue`, the deltas committed since that name
+        # what they replaced, in commit order, each kept until a cleanup step walks
+        # past it (docs/lifecycle.md §9.8)
+        self.cleaning: dict[tuple, dict] = _flatten(snap.get("cleaning"), 2)
         # Output lives removed or moved away, whose data a cleanup task deletes (K25):
         # id -> where it was, what it was, and when it may go.
         self.retired: dict[str, dict] = dict(snap.get("retired") or {})
@@ -508,10 +521,10 @@ class Model:
             "launched": True,
             "reads": reads(launched["prepared"].get("plans") or {}),
             "prefixes": tuple(launched["prepared"].get("prefixes") or ()),
-            "cleanups": _delta_files(  # a cleanup task's entries (§9.8)
+            "cleanups": _delta_files(  # the deltas a cleanup task's step reads (§9.8)
                 d
                 for info in ((launched["prepared"].get("cleanup") or {}).get("outputs") or {}).values()
-                for d in info.get("cleanup") or ()
+                for d in (info.get("deltas") or {}).get("deltas") or ()
             ),
         }
         self.attempts[attempt] = task["id"]
@@ -866,6 +879,12 @@ class Model:
         move(self.indexes, {f"@{old}": f"@{new}" for old, new in asset_map.items()}, 0)
         move(self.repairs, output_map, 0, merge=list)
         move(self.cleanups, output_map, 0, merge=_renumbered)
+        for key in [k for k in self.cleaning if k[0] in output_map]:  # both names' queues are owed
+            target = (output_map[key[0]], *key[1:])
+            moved = self.cleaning.pop(key)
+            self.cleaning[target] = (
+                _queues([self.cleaning[target], moved]) if target in self.cleaning else moved
+            )
         for head in self.heads.values():
             if head.get("asset") in asset_map:
                 head["asset"] = asset_map[head["asset"]]
@@ -1404,12 +1423,12 @@ class Model:
         return ((manifest.get("stores") or {}).get(record.get("store")) or {}).get("writes") == "immutable"
 
     def cleanup_reads(self) -> set[str]:
-        """The index files clean up entries still read (their delta files name
-        the predecessors): kept while an entry is pending, and while a live
-        attempt holds it in its spec — acknowledged by another meanwhile, it
-        is still being read — even once the index lets go of them."""
+        """The delta files cleanup still reads (they name what their changes
+        replaced): kept while queued, and while a live attempt holds them in
+        its spec — a step acknowledged by another meanwhile is still being
+        read — even once the index lets go of them."""
 
-        pending = _delta_files(d for entries in self.cleanups.values() for d in entries)
+        pending = _delta_files(d for c in self.cleaning.values() for d in c["queue"])
         return pending.union(*(claim.get("cleanups") or () for claim in self.claims.values()))
 
     def _collect(self, output: str, partition: str, entry: dict) -> None:
@@ -1424,17 +1443,24 @@ class Model:
     def _superseded(
         self, output: str, partition: str, before: dict | None, head: dict, keys: dict | None, prefix=None
     ) -> None:
-        """What a commit on an immutable store let go of: each changed key's
-        predecessor (named in its delta files, under `prefix`), a value's
-        previous object, or — when an append output starts over — its
-        earlier commits."""
+        """What a commit on an immutable store let go of: the generations its
+        delta's updates and removes replaced (its delta queued for the
+        partition's cleanup cursor), a value's previous object, or — when an
+        append output starts over — its earlier commits."""
 
-        if delta_names(keys):
-            prefix = prefix or self.index(output, partition).prefix
-            self._collect(
-                output,
-                partition,
-                {"kind": "delta", "prefix": prefix, "files": delta_names(keys)},
+        delta = DeltaFiles.from_json(keys) if keys else None
+        if delta is not None and delta.part.entries > delta.added:  # an update or a remove
+            index = self.index(output, partition)
+            cleaning = self.cleaning.setdefault((output, partition), {"cursor": None, "queue": []})
+            cleaning["queue"].append(
+                {
+                    "n": self.event_counter,
+                    "life": index.life,
+                    "commit": int(head["commit_number"]),
+                    "generation": delta.generation,
+                    "prefix": prefix or index.prefix,
+                    "files": [f.name for f in delta.part.files],
+                }
             )
         old, new = (
             ((before or {}).get("ref") or {}).get("handle") or {},
@@ -1494,6 +1520,14 @@ class Model:
                     }
         for output, done in (e.get("cleaned_up") or {}).items():
             self._drop_cleanups(output, partition, done)
+        for output, to in (e.get("cleaned_to") or {}).items():  # a step: the cursor moves past `to`
+            cleaning = self.cleaning.get((output, partition))
+            if cleaning is None:
+                continue
+            passed = [d for d in cleaning["queue"] if d["n"] <= int(to)]
+            if passed:
+                cleaning["cursor"] = passed[-1]["commit"]
+            cleaning["queue"] = [d for d in cleaning["queue"] if d["n"] > int(to)]
         for output, missed in (e.get("cleanup_unresolved") or {}).items():
             for d in self.cleanups.get((output, partition), []):
                 if d["id"] in missed:

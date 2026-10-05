@@ -276,7 +276,9 @@ class Resolver:
                     return {**declined, "reason": "invalid"}, None
                 index = LayerIndex(self.io, p.index, cache=self.cache)
                 try:
-                    delta = await index.compute(run, replace=kind == "replace", replaced=p.replaced)
+                    delta = await index.compute(
+                        run, generation=p.generation, replace=kind == "replace", replaced=p.replaced
+                    )
                 except ValueError as e:  # the request was checked: a copy is corrupt
                     log.warning("key cache copy of %s: %s", p.index.prefix, e)
                     self.cache.drop(p.index.prefix)  # refetched by the fill

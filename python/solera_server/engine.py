@@ -528,7 +528,7 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
         if write is not None:
             event["write"] = write
         prepared = (task.get("launched") or {}).get("prepared") or {}
-        for field in ("cleaned_up", "cleanup_unresolved"):  # cleanup (§9.8)
+        for field in ("cleaned_up", "cleanup_unresolved", "cleaned_to"):  # cleanup (§9.8)
             if worker.get(field):
                 event[field] = current_names(prepared, worker[field])
         if worker.get("read"):
@@ -541,9 +541,10 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
             cleanup = task.get("cleanup") or {}
             handed = ((task.get("launched") or {}).get("prepared") or {}).get("cleanup") or {}
             if "output" in cleanup:  # a cleanup task: the rest, if its limit left some; else the job's
-                if (
-                    sum(len(i.get("cleanup") or ()) for i in (handed.get("outputs") or {}).values())
-                    >= CLEANUPS
+                if any(
+                    len(i.get("cleanup") or ()) >= CLEANUPS
+                    or len((i.get("deltas") or {}).get("deltas") or ()) >= CLEANUPS
+                    for i in (handed.get("outputs") or {}).values()
                 ):
                     self._submit_cleanups([(cleanup["output"], cleanup["partition"])])
             elif task["asset"] in self.manifest["assets"]:
@@ -728,8 +729,12 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
             if t["asset"] == CLEANUP and t["status"] not in TERMINAL_TASK
         }
         due, declared = [], {o["name"] for info in self.manifest["assets"].values() for o in info["outputs"]}
-        for output, partition in list(self.m.cleanups) if partitions is None else partitions:
-            if output in declared and self._due_cleanups(output, partition, None):  # what a task could take
+        for output, partition in (
+            list({**self.m.cleanups, **self.m.cleaning}) if partitions is None else partitions
+        ):
+            if output in declared and (
+                self._due_cleanups(output, partition, None) or self._due_step(output, partition, None)
+            ):  # what a task could take
                 due.append(({"output": output, "partition": partition}, f"{output}/{partition}", output))
         if partitions is None and self.m.retired:
             now, floor = self.clock(), self.m.pin_floor()
@@ -809,21 +814,20 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
             None,
         )
         entries = self._due_cleanups(output, partition, attempt) if owner is not None else []
-        if not entries:
+        step = self._due_step(output, partition, attempt) if owner is not None else None
+        if not entries and step is None:
             return {**prepared, "skip": True}
         claim = self.m.claimed(attempt)
-        if claim is not None:
-            # What its spec hands it is read from now, not from `AttemptLaunched` on: an
-            # operator's clearing meanwhile must not let collection take it.
-            claim["cleanups"] = _delta_files(entries)
-        home = self.m.homes.get(output, output)
+        if claim is not None and step is not None:
+            # The deltas its spec hands it are read from now, not from `AttemptLaunched`
+            # on: a step acknowledged meanwhile must not let collection take them.
+            claim["cleanups"] = _delta_files(step["deltas"])
+        info = {"cleanup": entries, "home": self.m.homes.get(output, output)}
+        if step is not None:
+            info["deltas"] = step
         return {
             **prepared,
-            "cleanup": {
-                "asset": owner,
-                "partition": partition,
-                "outputs": {output: {"cleanup": entries, "home": home}},
-            },
+            "cleanup": {"asset": owner, "partition": partition, "outputs": {output: info}},
         }
 
     def _partition_active_claim(self, asset: str, partition: str) -> bool:
@@ -1386,6 +1390,28 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
             :CLEANUPS
         ]
 
+    def _due_step(self, output: str, partition: str, attempt: str | None) -> dict | None:
+        """The next step of an immutable keyed output's cleanup cursor (§9.8):
+        the queued deltas no reader can still need, in commit order, up to the
+        first one some reader may — committed after the oldest reader pin but
+        this attempt's own, or past the oldest commit an observation holds
+        (its readers read at it or later, so what a later commit replaced is
+        theirs). At most `CLEANUPS` deltas; `to`, the last one's event counter,
+        is where the cursor moves once its deletes are done. None: none due."""
+
+        cleaning = self.m.cleaning.get((output, partition))
+        if not cleaning or not cleaning["queue"]:
+            return None
+        floor = self.m.pin_floor(but=attempt, path=self.m.index(output, partition).prefix)
+        life = self.m.index(output, partition).life
+        oldest = self.m.oldest_observed(output, partition)
+        due = []
+        for d in cleaning["queue"][:CLEANUPS]:
+            if d["n"] > floor or (d["life"] == life and oldest is not None and d["commit"] > oldest):
+                break
+            due.append(d)
+        return {"to": due[-1]["n"], "deltas": due} if due else None
+
     def _definition(self, asset: str, run) -> str:
         """The definition its inputs' observations are made under:
         H(`model.declaration`, its inputs' bindings included, without
@@ -1767,7 +1793,7 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
         if answer["result"] != "delta":
             return None
         await index.io.write(index.state.path(f"{stem}-0.lay"), delta)
-        return delta_files(answer, stem, generation), delta_keys(delta)
+        return delta_files(answer, stem, generation), delta_keys(delta, generation)
 
     def _key_cache(self):
         """The engine's cache of layers, where the key service runs: what the

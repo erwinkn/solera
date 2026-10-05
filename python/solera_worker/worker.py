@@ -831,7 +831,9 @@ def _keyed_write(o: _Out, keys_io) -> KeyedWrite:
         # collects it: exactly the keys the delta writes, paged from its files
         # when there are too many to list (docs/lifecycle.md §9.8).
         if changed is None:
-            return KeyedWrite(p, DeltaKeys(keys_io, o.index.state.prefix, o.files.part), reset=o.replace)
+            return KeyedWrite(
+                p, DeltaKeys(keys_io, o.index.state.prefix, o.files.part, o.files.generation), reset=o.replace
+            )
         return KeyedWrite(p, upserted, deleted, reset=o.replace)
     if o.reset or (o.replace and (changed is None or o.repairs)):
         # A first write, or a replacement with more changes than it lists, or with
@@ -884,7 +886,7 @@ async def _upload(index: LayerIndex, name: str, generation: int, answer) -> tupl
     if data is None:
         return DeltaFiles(Part(), 0, 0, generation), ([], [])
     await index.io.write(index.state.path(f"{name}-0.lay"), data)
-    return delta_files(a, name, generation), delta_keys(data)
+    return delta_files(a, name, generation), delta_keys(data, generation)
 
 
 async def _intended(info, keys_io, repairs) -> list[str]:
@@ -894,8 +896,10 @@ async def _intended(info, keys_io, repairs) -> list[str]:
 
     prefix, found = info["index"]["prefix"], set()
     for intent in repairs:
-        for f in DeltaFiles.from_json(intent).part.files:
-            written, removed = delta_keys(await keys_io.read_whole(f"{prefix}{f.name}", f.size))
+        delta = DeltaFiles.from_json(intent)
+        for f in delta.part.files:
+            data = await keys_io.read_whole(f"{prefix}{f.name}", f.size)
+            written, removed = delta_keys(data, delta.generation)
             found.update(map(key_str, written + removed))
     return sorted(found)
 
@@ -1397,49 +1401,61 @@ def _stores_of(project, asset: str) -> list:
 
 async def _cleanup_due(spec, project, asset, objects, writes) -> dict:
     """Clean up what the engine handed this cleanup task (docs/lifecycle.md
-    §9.8): the versions a commit let go of, and what attempts that never
-    committed wrote — all past every reader pin — each entry as identity
-    patterns for `store.cleanup` (docs/stores.md § Cleanup), through the
-    store and declaration of the output's asset. The engine runs no store
-    code. Returns what was done, for the result."""
+    §9.8) — all past every reader pin — as identity patterns for
+    `store.cleanup` (docs/stores.md § Cleanup), through the store and
+    declaration of the output's asset; the engine runs no store code:
+
+    - a step of the partition's cleanup cursor (`deltas`): the deltas of its
+      commits, in order, each naming the generations its updates and removes
+      replaced — deleted, and the cursor moves past them (`cleaned_to`). A
+      crash before that replays the step: deletes are idempotent;
+    - entries: what attempts that never committed wrote, a value's previous
+      object, an append output's earlier commits (`cleaned_up`).
+
+    Returns what was done, for the result."""
 
     declared = {o["name"]: o for o in project.manifest["assets"][asset.name]["outputs"]}
     decls = {o.name or asset.name: o for o in asset.outputs}
-    cleaned_up, unresolved = {}, {}
+    cleaned_up, cleaned_to = {}, {}
 
     for name, info in (spec.get("outputs") or {}).items():
         store = project.stores[declared[name]["store"]]
-        if not info.get("cleanup") or store.writes != "immutable":
-            continue
-        patterns, done = [], []
-        for entry in info["cleanup"]:
-            kind, prefix = entry["kind"], entry.get("prefix") or ""
-            if kind == "delta":  # what a commit's delta let go of: every replaced version (exact writes)
-                found = [await _get(objects, f"{prefix}{f}") for f in entry["files"] if f.endswith(".lay")]
-                if any(data is None for data in found):  # the names are not known: it stays pending
-                    unresolved.setdefault(name, []).append(entry["id"])
-                    continue
-                for data in found:
-                    for key, before in replaced_entries(data):
-                        patterns.append({"key": key_str(key), "generation": before})
-            elif kind == "abandoned":  # all an uncommitted attempt wrote carries its generation
-                patterns.append({"generation": entry["generation"]})  # its delta: the engine's orphan rule
-            elif kind == "version":  # a value's object a commit replaced
-                patterns.append({"generation": entry["generation"]})
-            elif kind == "commits":  # an append output started over: its earlier commits
-                patterns += [{"key": n} for n in range(int(entry["from"]), int(entry["to"]) + 1)]
-            done.append(entry["id"])
-        if not done:
+        if store.writes != "immutable" or not (info.get("cleanup") or info.get("deltas")):
             continue
         clean = functools.partial(
             store.cleanup, decls[name], home=info.get("home"), partition=spec["partition"]
         )
-        for i in range(0, len(patterns), CLEANUPS_AT_ONCE):
-            await writes.call(asyncio.gather(*(clean(**p) for p in patterns[i : i + CLEANUPS_AT_ONCE])))
-        cleaned_up[name] = done
+
+        async def delete(patterns, clean=clean):
+            for i in range(0, len(patterns), CLEANUPS_AT_ONCE):
+                await writes.call(asyncio.gather(*(clean(**p) for p in patterns[i : i + CLEANUPS_AT_ONCE])))
+
+        step = info.get("deltas")
+        for d in (step or {}).get("deltas") or ():  # in commit order
+            for f in d["files"]:
+                if not f.endswith(".lay"):
+                    continue
+                data = await _get(objects, f"{d['prefix']}{f}")
+                if data is None:  # kept until the cursor passes it: lost, not owed
+                    raise RuntimeError(f"cleanup of {name}: delta file {d['prefix']}{f} is missing")
+                replaced = replaced_entries(data, int(d["generation"]))
+                await delete([{"key": key_str(k), "generation": g} for k, g in replaced])
+        if step:
+            cleaned_to[name] = int(step["to"])
+        patterns, done = [], []
+        for entry in info.get("cleanup") or ():
+            kind = entry["kind"]
+            if kind in ("abandoned", "version"):  # all an uncommitted attempt wrote; a value's object
+                patterns.append({"generation": entry["generation"]})  # an abandoned delta: the orphan rule
+            elif kind == "commits":  # an append output started over: its earlier commits
+                patterns += [{"key": n} for n in range(int(entry["from"]), int(entry["to"]) + 1)]
+            done.append(entry["id"])
+        await delete(patterns)
+        if done:
+            cleaned_up[name] = done
     out = {"cleaned_up": cleaned_up} if cleaned_up else {}
-    if unresolved:
-        out["cleanup_unresolved"] = unresolved
+    if cleaned_to:
+        out["cleaned_to"] = cleaned_to
     return out
 
 

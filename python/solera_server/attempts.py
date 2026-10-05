@@ -107,6 +107,9 @@ def worker_report(worker: dict | None) -> dict:
     for name in ("cleaned_up", "cleanup_unresolved"):
         if found := _names(worker.get(name)):
             out[name] = found
+    to = worker.get("cleaned_to")  # a cleanup step: where each output's cursor moves
+    if isinstance(to, dict) and (to := {str(k): int(v) for k, v in to.items() if _number(v) is not None}):
+        out["cleaned_to"] = to
     keys = worker.get("keys")
     if isinstance(keys, dict) and (
         keys := {str(k): int(v) for k, v in keys.items() if _number(v) is not None}

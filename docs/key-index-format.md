@@ -50,7 +50,7 @@ file's keys all come after the previous file's.
 entry := key  flags:u8  [payload]  [replaced]
 flags := kind (bits 0–1: 0 added, 1 updated, 2 removed)
        | 4: a payload follows (len:varint, bytes)
-       | 8: a replaced generation follows (varint)
+       | 8: a replaced generation follows (varint: back from the commit's generation)
 ```
 
 A commit's **delta** holds each key it changed once, with its change kind
@@ -60,10 +60,12 @@ number and generation are not in the file: they are the commit record's,
 and every entry takes them.
 
 The **replaced generation** is the generation the change replaced (an
-updated or removed key's): what an immutable store's cleanup deletes
-(`lifecycle.md` §9.8). Writers record it for immutable stores' outputs only,
-never for fenced stores or sources. It serves cleanup only: **the index
-never reads it**.
+updated or removed key's; an add replaces nothing): what an immutable
+store's cleanup deletes (`lifecycle.md` §9.8). It is written as its distance
+back from the commit's generation (a few bytes, often one), so reading it
+needs the commit's generation. Writers record it for immutable stores'
+outputs only, never for fenced stores or sources. It serves cleanup only:
+**the index never reads it**, and merges drop it.
 
 ### A layer entry
 

@@ -993,14 +993,24 @@ still need it. The pins, all by event counter (`object-store-state.md`
 **Collection.** Only from durable decisions; never from what a listing
 shows.
 
-- **Superseded versions, named at resolution.** A commit records one
-  data-garbage entry for its delta file at its event counter. Once no
-  pin predates it, the worker reads the delta's replaced generations and
-  calls `store.cleanup` with them, one identity pattern each — `(partition, key, generation)`
-  (docs/stores.md § Cleanup) — 64 at a time; then the entry goes. A
-  superseded value is its previous version's generation. The engine keeps
-  the delta's files while this entry is pending, and deletes them itself
-  afterwards (never the cleanup task).
+- **Superseded versions, named at resolution, by a cursor (D168).** Each
+  immutable keyed output partition keeps one **cleanup cursor**: the last
+  commit cleaned, and the queue of deltas committed since whose updates or
+  removes name what they replaced (`Model.cleaning`, journaled with the
+  commits). A **step** takes the longest prefix of the queue no reader can
+  still need — each delta committed before the oldest reader pin, and at
+  or before the oldest commit an observation holds (a reader at commit P
+  reads what was live at P: what a commit after P replaced is still its)
+  — reads those deltas in commit order, and calls `store.cleanup` with
+  their replaced generations, one identity pattern each — `(partition,
+  key, generation)` (docs/stores.md § Cleanup) — 64 at a time. Then the
+  cursor moves past them (`cleaned_to` in the cleanup task's result). A
+  crash before that hands the step again; deletes are idempotent. No
+  listing: the deltas name every object to delete. A superseded value is
+  its previous version's generation. The engine keeps a queued delta's
+  files until the cursor passes them, and deletes them itself afterwards
+  (never the cleanup task). Steps run as cleanup tasks, after a commit and
+  from the hourly job, one per partition at a time.
 - **Versions dropped by a merge** need nothing of their own: writes are
   exact, so every version a merge drops was named as replaced by the
   delta that replaced it, and is cleaned up through that delta
