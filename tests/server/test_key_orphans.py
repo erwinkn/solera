@@ -43,6 +43,7 @@ async def test_an_abandoned_attempts_delta_is_collected_by_the_engine(tmp_path, 
     from solera.sdk import Output, Project, Retry, asset
     from solera.stores import FileStore
     from solera_server.state import State
+
     from tests.server.test_collection import engine_for, run
 
     values = [{"a": 1, "b": 1}, {"a": 2, "c": 1}, {"a": 2, "c": 1}]
