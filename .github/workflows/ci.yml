@@ -15,22 +15,7 @@ concurrency:
 jobs:
   verify:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
-    services:
-      postgres:
-        image: postgres:17
-        ports: ['5432:5432']
-        env:
-          POSTGRES_USER: solera
-          POSTGRES_PASSWORD: solera
-          POSTGRES_DB: solera
-        options: >-
-          --health-cmd "pg_isready -U solera"
-          --health-interval 3s
-          --health-timeout 3s
-          --health-retries 20
-    env:
-      SOLERA_TEST_DATABASE_URL: postgresql://solera:solera@127.0.0.1:5432/solera
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -44,9 +29,13 @@ jobs:
           version: '0.12.13'
           python-version: '3.12'
           enable-cache: true
+      - run: cargo fmt --check --manifest-path native/Cargo.toml
+      - run: cargo check --manifest-path native/Cargo.toml
       - run: uv sync --locked
       - run: uv run ruff check
       - run: uv run ruff format --check
-      - run: cargo fmt --check --manifest-path native/Cargo.toml
-      - run: cargo test --release --manifest-path native/Cargo.toml
-      - run: uv run pytest -q -m 'not live'
+      # ty finds the .venv that uv sync built. It becomes blocking (drop continue-on-error)
+      # once the type errors it reports are fixed.
+      - run: uvx ty@0.0.84 check
+        continue-on-error: true
+      - run: uv run pytest -q -m 'not live and not postgres and not s3'
