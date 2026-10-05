@@ -4,8 +4,8 @@ tests of what reads it (Δ, the observed set's planning)."""
 from obstore.store import MemoryStore
 from solera.keys import SortedEntries
 from solera.keys.delta import Diff
-from solera.keys.index import IndexState, KeyIndex, Options, key_bytes
 from solera.keys.io import ObjectIO
+from solera.keys.layers import LayerIndex, LayerState, key_bytes
 
 
 class History:
@@ -13,19 +13,20 @@ class History:
     after commit c."""
 
     def __init__(self):
-        self.io, self.state, self.states = ObjectIO(MemoryStore()), IndexState(), {}
+        self.io, self.states = ObjectIO(MemoryStore()), {}
+        self.state = LayerState(prefix="keys/out/_/", life="l1")
         self.commit_number = 0
 
-    def index(self) -> KeyIndex:
-        return KeyIndex(self.io, "keys/out/_", self.state, Options(block_size=512, max_file_bytes=4096))
+    def index(self) -> LayerIndex:
+        return LayerIndex(self.io, self.state)
 
     async def commit(self, upserts, removes=()) -> None:
-        idx, gen = self.index(), self.commit_number + 1
+        gen = self.commit_number + 1
         removes = sorted(set(removes))
         keys = sorted(set(upserts) - set(removes))
         entries = SortedEntries.of([key_bytes(k) for k in keys], None, [key_bytes(k) for k in removes])
-        files, _ = await idx.resolve(
-            entries, commit_number=self.commit_number, attempt=f"a{gen}", generation=gen, collect=10**6
+        files, _ = await self.index().write_patch(
+            entries, name=f"{self.commit_number:012d}-a{gen}", generation=gen
         )
         self.state = self.state.committed(self.commit_number, files)
         after = {**self.states.get(self.commit_number - 1, {}), **dict.fromkeys(keys, gen)}
@@ -34,14 +35,14 @@ class History:
         self.states[self.commit_number] = after
         self.commit_number += 1
 
-    async def merge_all(self, endpoints: set[int]) -> None:
-        idx = self.index()
-        while (plan := idx.plan_merge(endpoints)) is not None:
-            out = await idx.merge(plan, endpoints)
-            if out is None:
-                return
-            self.state = self.state.merged(out.inputs, out.span)
-            idx = self.index()
+    async def merge_all(self, cut: int = -1) -> None:
+        """Merges under the rule until none is due, with flips kept from `cut` on."""
+
+        self.state = self.state.with_cut(cut)
+        while (plan := self.state.plan()) is not None:
+            _, lo, count = plan
+            ids, out = await self.index().merge(lo, count, epoch=1)
+            self.state = self.state.merged(ids, out)
 
     def expected(self, p, h, keys=None, take=None) -> list[Diff]:
         old, new = ({} if p is None else self.states[p]), self.states[h]

@@ -347,7 +347,7 @@ class KeyedWrite:
     each with its group.
 
     `upserts` are the keys to write: a collection of them; a
-    `solera.keys.index.DeltaKeys` reading them from the commit's delta
+    `solera.keys.layers.DeltaKeys` reading them from the commit's delta
     files when there are too many to list; or None, every key of the write.
     `removes` are deleted, and every other key stays as it is — unless the
     write is a `reset`, the partition's whole content: then every key not in it
@@ -391,7 +391,7 @@ class KeyedWrite:
         read it asynchronously."""
 
         if self.upserts is None:
-            from ..keys.index import key_str
+            from ..keys.layers import key_str
 
             for keys, _ in self.prepared.rows.chunks(size):
                 yield self._grouped([key_str(k) for k in keys])

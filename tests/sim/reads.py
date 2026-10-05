@@ -1,38 +1,40 @@
-"""Reads at an endpoint, checked against the fold of their commits.
+"""Reads of a key index, checked against the fold of their commits.
 
-A reader reads a key index at an endpoint: a commit an observation record
-was observed at, a batch's head. `page` and `lookup` read the state after commit
-`at - 1`; `changes_page` reads what commits `[first, last]` changed, and
-how. A read the index cannot serve at all (a merge dropped the endpoint) is
-wrong too, and so is the merge that dropped it: every endpoint a reader
-holds must still start a span or segment after a merge. Which endpoints
-readers hold comes from the events, not from the engine's own list
-(`Model.endpoints`), so that a reader that list misses is still checked:
+A reader reads Δ(P, H) — every key whose state differs between commits P
+and H, with its presence at both ends and its version at H — or looks keys
+up at the head (docs/key-index-design.md). The index serves these from
+stamped layers, which merges rewrite and whose flips at or below the cut
+they drop. A read the index refuses (a P below the cut, an H inside a merged
+layer) is wrong too, and so is the cut that passed a commit a reader holds.
+Which commits readers hold comes from the events, not from the engine's own
+`Model.oldest_observed`, so that a reader it misses is still checked:
 attempts in flight from their launches to their ends; observation records
 from the model's, their life (resets, renames) being the model's alone to
-fold. The index serves these from spans, which merges rewrite. A merge that
-ignores an endpoint still reads well at the head, and only a reader at that
-endpoint sees the wrong state.
+fold.
 
 So each read is checked against the fold of the commits the reader's own
 index holds. Each commit's entries are taken from its delta files when the
-commit is installed (`IndexState.committed`). Each merge's inputs are
-recorded when it is published (`IndexState.merged`). Any index state can then
-be traced back to its original commits, however merged, and folded up to any
-endpoint, without the spans or merges that served the read. A read that
-disagrees is kept in `wrong`; the `reads_at_endpoints_are_exact` invariant
-raises it."""
+commit is installed (`LayerState.committed`). Each merge's inputs are
+recorded when it is published (`LayerState.merged`). Any index state can
+then be traced back to its original commits, however merged, and folded up
+to any commit, without the layers or merges that served the read. A read
+that disagrees is kept in `wrong`; the `reads_at_endpoints_are_exact`
+invariant raises it."""
 
 from __future__ import annotations
 
 import contextlib
 from pathlib import Path
 
-Entry = tuple[int, bool, bytes | None]  # generation, deleted, payload
+Entry = tuple[int, bool, bytes | None]  # generation, removed, payload
 
 
 def _payload(p) -> bytes | None:
     return None if p is None else bytes(p)
+
+
+def _paths(state, layer) -> tuple[str, ...]:
+    return tuple(state.path(n) for n in layer.names())
 
 
 class Reads:
@@ -46,33 +48,37 @@ class Reads:
     # -- what installs and merges say ------------------------------------------------------
 
     def installed(self, state, commit_number: int, delta) -> None:
-        paths = tuple(state.path(f.name) for f in delta.files)
+        from solera import _native
+
+        paths = tuple(state.path(n) for n in delta.part.names())
         if not paths or paths in self.leaves:
             return
-        from solera_worker.worker import _file_entries
-
         entries: dict[bytes, Entry] = {}
-        for path in paths:
+        for f in delta.part.files:
             try:
-                data = (self.root / path).read_bytes()
+                data = (self.root / state.path(f.name)).read_bytes()
             except FileNotFoundError:
                 return  # unknown: reads over this commit go unchecked
-            for key, generation, deleted, payload, _ in _file_entries(data):
-                entries[bytes(key)] = (int(generation), bool(deleted), _payload(payload))
+            for e in _native.layers_decode(data, commit_number, delta.generation):
+                entries[bytes(e[0])] = (delta.generation, not e[1], _payload(e[6]))
         self.leaves[paths] = (commit_number, entries)
 
-    # -- the endpoints readers hold, apart from the engine's own list ----------------------
+    def merged(self, state, ids, out) -> None:
+        by_id = {x.id: x for x in state.layers}
+        self.merges[_paths(state, out)] = [_paths(state, by_id[i]) for i in ids if i in by_id]
+
+    # -- the commits readers hold, apart from the engine's own word ------------------------
 
     @staticmethod
     def launched(model, e) -> None:
         """An attempt's reads, from its launch: the head each keyed batch
-        classes its keys at, read from endpoint head + 1."""
+        classes its keys at."""
 
         held = model.__dict__.setdefault("_sim_claims", {})
         out = []
         for plan in ((e.get("prepared") or {}).get("plans") or {}).values():
             if plan and plan.get("kind") == "observed":
-                out.append(((plan["output"], plan["upstream_partition"]), int(plan["head"]) + 1))
+                out.append(((plan["output"], plan["upstream_partition"]), int(plan["head"])))
         held[e["attempt"]] = (e["run"], out)
 
     @staticmethod
@@ -86,14 +92,13 @@ class Reads:
 
     @staticmethod
     def holders(model, key) -> set[int]:
-        """The endpoints of `key`'s index readers hold: attempts in flight,
-        from their launches (not the engine's claims), and observation
-        records, from the model's (a record's life is the model's own to
-        fold): each layer's commit, read from endpoint commit + 1."""
+        """The commits of `key`'s index readers hold: attempts in flight, from
+        their launches (not the engine's claims), and observation records,
+        from the model's (a record's life is the model's own to fold)."""
 
         out: set[int] = set()
         for _, reads in model.__dict__.get("_sim_claims", {}).values():
-            out.update(end for k, end in reads if k == key)
+            out.update(head for k, head in reads if k == key)
         state = model.indexes.get(key)
         for record in model.partitions.values():
             for rec in (record.get("observed") or {}).values():
@@ -101,33 +106,20 @@ class Reads:
                     continue
                 for layer in [rec["base"], *rec["ranges"]]:
                     if layer["endpoint"] is not None and layer["life"] == state.life:
-                        out.add(int(layer["endpoint"]) + 1)
+                        out.add(int(layer["endpoint"]))
         return out
 
-    def kept(self, key, before, after, endpoints) -> None:
-        """A merge just installed keeps every endpoint a reader holds: one it
-        drops is one no read can be exact at (W36's planted bug)."""
+    def cut_kept(self, key, cut: int, held: set[int]) -> None:
+        """A cut never passes a commit a reader holds: below the cut, flips
+        go, and Δ from there is refused."""
 
-        if after is before:
-            return  # refused: nothing changed
-        for e in sorted(endpoints):
-            if 0 < e <= after.head and after.generation(e) is None and before.generation(e) is not None:
-                self.wrong.append(
-                    f"{after.prefix}: a merge dropped endpoint {e}, which a reader of {key} holds"
-                )
-                return
-
-    def merged(self, state, inputs, out) -> None:
-        spans = {(s.a, s.b): s for s in state.spans}
-        self.merges[tuple(state.path(f.name) for f in out.files)] = [
-            tuple(state.path(f.name) for f in spans[tuple(r)].files) for r in inputs if tuple(r) in spans
-        ]
+        below = sorted(c for c in held if c < cut)
+        if below:
+            self.wrong.append(f"{key}: the cut moved to {cut}, past commit {below[0]}, which a reader holds")
 
     # -- the fold ----------------------------------------------------------------------------
 
     def _commits(self, paths: tuple[str, ...]) -> list[tuple[int, dict[bytes, Entry]]] | None:
-        if not paths:
-            return []
         if paths in self.leaves:
             return [self.leaves[paths]]
         if paths in self.merges:
@@ -142,167 +134,134 @@ class Reads:
 
     def commits(self, state) -> list[tuple[int, dict[bytes, Entry]]] | None:
         """The original commits an index state holds, oldest first; None if
-        one of its spans cannot be traced back. A slice (a catch-up's pin:
-        the spans overlapping its range) holds only its own."""
+        one of its layers cannot be traced back. An empty delta holds none."""
 
         out = []
-        for span in state.spans:
-            sub = self._commits(tuple(state.path(f.name) for f in span.files))
+        for layer in state.layers:
+            paths = _paths(state, layer)
+            if not paths:
+                continue
+            sub = self._commits(paths)
             if sub is None:
                 return None
             out += sub
         return sorted(out, key=lambda c: c[0])
 
     @staticmethod
-    def fold(commits, below: int | None) -> dict[bytes, Entry]:
-        """Each key's newest entry in the commits before `below` (all: None)."""
+    def fold(commits, upto: int | None) -> dict[bytes, Entry]:
+        """Each key's newest entry in the commits at or before `upto` (all: None)."""
 
         state: dict[bytes, Entry] = {}
         for c, entries in commits:
-            if below is None or c < below:
+            if upto is None or c <= upto:
                 state.update(entries)
         return state
 
-    @staticmethod
-    def _below(state, at: int | None) -> int | None:
-        return None if at is None or at > state.head else at
-
     def _wrong(self, index, call: str, args, why: str) -> None:
-        self.wrong.append(f"{index.prefix} {call}{args}: {why}")
+        self.wrong.append(f"{index.state.prefix} {call}{args}: {why}")
 
     # -- the reads ---------------------------------------------------------------------------
 
     @contextlib.contextmanager
     def served(self, index, call: str, args):
-        """A read at an endpoint the index cannot serve is wrong too: an
-        endpoint a reader holds must stay readable (a merge keeps it)."""
+        """A read the index refuses is wrong too: a commit a reader holds must
+        stay readable (the cut keeps it; a batch reads the state it pinned)."""
+
+        from solera.keys.layers import CutError, NotHeld
 
         try:
             yield
-        except LookupError as error:
+        except (CutError, NotHeld) as error:
             self._wrong(index, call, args, f"not served: {error}")
             raise
 
-    @staticmethod
-    def whole(state) -> bool:
-        return not state.spans or state.spans[0].a == 0
-
-    def page(self, index, after, limit, at, result) -> None:
-        commits = self.commits(index.state)
-        if commits is None or not self.whole(index.state):
-            return
-        self.checked += 1
-        state = self.fold(commits, self._below(index.state, at))
-        keys, generations, payloads, cursor = result
-        want = sorted(
-            k for k, (_, deleted, _) in state.items() if not deleted and (after is None or k > after)
-        )
-        keys = [bytes(k) for k in keys]
-        if keys != want[: len(keys)] or (cursor is None and len(keys) != len(want)):
-            self._wrong(index, "page", (after, limit, at), f"keys {keys[:5]}, the fold {want[:5]}")
-            return
-        for k, g, p in zip(keys, generations, payloads, strict=True):
-            if (int(g), _payload(p)) != (state[k][0], state[k][2]):
-                self._wrong(index, "page", (after, limit, at), f"{k!r} at {g}, the fold at {state[k][0]}")
-                return
-
-    def lookup(self, index, keys, at, result) -> None:
-        commits = self.commits(index.state)
-        if commits is None or not self.whole(index.state):
-            return
-        self.checked += 1
-        state = self.fold(commits, self._below(index.state, at))
-        want = {}
-        for k in map(bytes, keys):
-            if k in state and not state[k][1]:  # live at the endpoint
-                want[k] = (state[k][0], state[k][2])
-        got = {bytes(k): (int(g), _payload(p)) for k, (g, p) in result.items()}
-        if got != want:
-            self._wrong(
-                index,
-                "lookup",
-                (len(keys), at),
-                f"{sorted(got.items())[:3]}, the fold {sorted(want.items())[:3]}",
-            )
-
-    def changes(self, index, first, last, after, limit, keys, until, page) -> None:
-        """Every key with a version in `[first, last]`, classed by the net
-        rule (docs/key-index-design.md § changes) from whether it is live at
-        each end: added, updated, removed, or neither — live at neither, or
-        at both with equal payloads (a source's versions). A neither is
-        delivered to no consumer, and a merge that folds its versions away
-        drops it from the page too: it may be listed, the others must be. A
-        slice cannot tell what was live before it: there, the keys and their
-        states at `last` are checked, not classes."""
+    def delta(self, index, p, keys, after, upto, take, glob, result) -> None:
+        """Every key that differs between P and H: live at one end and not the
+        other, or live at both with another version at H. A filtered read
+        (`take`, `glob`) is checked for what it returns, not for what it
+        leaves out."""
 
         commits = self.commits(index.state)
         if commits is None:
             return
         self.checked += 1
-        whole = self.whole(index.state)
-        before, now = self.fold(commits, first), self.fold(commits, last + 1)
+        before = {} if p is None else self.fold(commits, p)
+        now = self.fold(commits, None)
 
         def live(state, k):
             return k in state and not state[k][1]
 
-        changed = {k for c, entries in commits if first <= c <= last for k in entries}
-        if keys is not None:
-            changed &= {bytes(k) for k in keys}
-        changed = {k for k in changed if (after is None or k > after) and (until is None or k < until)}
-        got = [bytes(k) for k in page.keys]
-        args = (first, last, after, limit)
-
-        def cls(k):
+        def differs(k):
             was, is_ = live(before, k), live(now, k)
-            same = was and is_ and before[k][2] is not None and before[k][2] == now[k][2]
-            return 0 if is_ and not was else 2 if was and not is_ else 1 if is_ and not same else 3
+            return was != is_ or (is_ and before[k][0] != now[k][0])
 
-        cut = got[-1] if got and page.cursor is not None else None  # where this page stops
-        needed = sorted(
-            k
-            for k in changed
-            if (cut is None or k <= cut) and (not whole and live(now, k) or whole and cls(k) != 3)
-        )
-        want = needed
-        if got != sorted(got) or not set(got) <= changed or not set(needed) <= set(got):
-            self._wrong(index, "changes", args, f"keys {got[:5]}, the fold {want[:5]}")
+        rows, cursor = result
+        got = [bytes(r[0]) for r in rows]
+        args = (p, after, len(keys) if keys is not None else None)
+        if got != sorted(got) or len(set(got)) != len(got):
+            self._wrong(index, "delta", args, f"keys out of order: {got[:5]}")
             return
-        for i, k in enumerate(got):
-            g, deleted, p = now[k]
-            seen = (int(page.generations[i]), bool(page.deleted[i]))
-            if seen != (g, deleted) or (not deleted and _payload(page.payloads[i]) != p):
-                self._wrong(index, "changes", args, f"{k!r} at {seen}, the fold at {(g, deleted)}")
+        for k, was, is_, g, pl in rows:
+            k = bytes(k)
+            want = (live(before, k), live(now, k))
+            if (bool(was), bool(is_)) != want or not differs(k):
+                self._wrong(index, "delta", args, f"{k!r} as {(was, is_)}, the fold {want}")
                 return
-            if not whole:
-                continue  # its class needs what came before the slice
-            if page.classes[i] != cls(k):
-                self._wrong(index, "changes", args, f"{k!r} classed {page.classes[i]}, the fold {cls(k)}")
+            if is_ and (int(g), _payload(pl)) != (now[k][0], now[k][2]):
+                self._wrong(index, "delta", args, f"{k!r} at {g}, the fold at {now[k][0]}")
                 return
+        if take is not None or glob is not None:
+            return
+        if keys is not None:
+            want = sorted({bytes(k) for k in keys if differs(bytes(k))})
+        else:
+            stop = bytes(cursor) if cursor is not None else None
+            want = sorted(
+                k
+                for k in set(before) | set(now)
+                if differs(k)
+                and (after is None or k > bytes(after))
+                and (upto is None or k <= bytes(upto))
+                and (stop is None or k <= stop)
+            )
+        if got != want:
+            self._wrong(index, "delta", args, f"keys {got[:5]}, the fold {want[:5]}")
+
+    def lookup(self, index, keys, result) -> None:
+        commits = self.commits(index.state)
+        if commits is None:
+            return
+        self.checked += 1
+        state = self.fold(commits, None)
+        want = {k: (state[k][0], state[k][2]) for k in map(bytes, keys) if k in state and not state[k][1]}
+        got = {bytes(k): (int(g), _payload(p)) for k, (g, p) in result.items()}
+        if got != want:
+            self._wrong(index, "lookup", (len(keys),), f"{sorted(got.items())[:3]}, the fold {sorted(want.items())[:3]}")
 
 
 def patches(reads: Reads) -> list[tuple]:
-    """What `World._install` patches so that every install, merge and read
-    at an endpoint goes through `reads`."""
+    """What `World._install` patches so that every install, merge, cut and
+    read goes through `reads`."""
 
-    from solera.keys.index import IndexState, KeyIndex
+    from solera.keys.layers import LayerIndex, LayerState
     from solera_server.model import Model
 
-    committed, merged, on_merged, apply = (
-        IndexState.committed,
-        IndexState.merged,
-        Model._on_IndexMerged,
+    committed, merged, on_cut, apply = (
+        LayerState.committed,
+        LayerState.merged,
+        Model._on_IndexCut,
         Model.apply,
     )
-    page, lookup, changes_page = KeyIndex.page, KeyIndex.lookup, KeyIndex.changes_page
+    delta, lookup = LayerIndex.delta, LayerIndex.lookup
 
-    def committing(state, commit_number, delta):
-        out = committed(state, commit_number, delta)
-        reads.installed(state, commit_number, delta)
+    def committing(state, commit_number, files):
+        out = committed(state, commit_number, files)
+        reads.installed(state, commit_number, files)
         return out
 
-    def merging(state, inputs, out):
-        reads.merged(state, inputs, out)
-        return merged(state, inputs, out)
+    def merging(state, ids, out):
+        reads.merged(state, ids, out)
+        return merged(state, ids, out)
 
     def applying(model, e):
         if e["type"] == "AttemptLaunched":
@@ -311,38 +270,27 @@ def patches(reads: Reads) -> list[tuple]:
             reads.ended(model, e)
         return apply(model, e)
 
-    def merge_installed(model, e):
+    def cutting(model, e):
         key = (e["output"], e["partition"])
-        before = model.indexes.get(key)
-        endpoints = reads.holders(model, key) if before is not None else set()
-        on_merged(model, e)
-        if before is not None:
-            reads.kept(key, before, model.indexes.get(key), endpoints)
+        reads.cut_kept(key, int(e["cut"]), reads.holders(model, key))
+        on_cut(model, e)
 
-    async def paging(index, after, limit, at=None):
-        with reads.served(index, "page", (after, limit, at)):
-            result = await page(index, after, limit, at)
-        reads.page(index, after, limit, at, result)
+    async def reading(index, p, *, keys=None, after=None, upto=None, glob=None, take=None, **kw):
+        with reads.served(index, "delta", (p, after)):
+            result = await delta(index, p, keys=keys, after=after, upto=upto, glob=glob, take=take, **kw)
+        reads.delta(index, p, keys, after, upto, take, glob, result)
         return result
 
-    async def looking(index, keys, at=None):
-        with reads.served(index, "lookup", (len(keys), at)):
-            result = await lookup(index, keys, at)
-        reads.lookup(index, keys, at, result)
-        return result
-
-    async def changing(index, first, last, after, limit, *, keys=None, until=None):
-        with reads.served(index, "changes", (first, last, after, limit)):
-            result = await changes_page(index, first, last, after, limit, keys=keys, until=until)
-        reads.changes(index, first, last, after, limit, keys, until, result)
+    async def looking(index, keys):
+        result = await lookup(index, keys)
+        reads.lookup(index, keys, result)
         return result
 
     return [
-        (IndexState, "committed", committing),
-        (IndexState, "merged", merging),
-        (Model, "_on_IndexMerged", merge_installed),
+        (LayerState, "committed", committing),
+        (LayerState, "merged", merging),
+        (Model, "_on_IndexCut", cutting),
         (Model, "apply", applying),
-        (KeyIndex, "page", paging),
-        (KeyIndex, "lookup", looking),
-        (KeyIndex, "changes_page", changing),
+        (LayerIndex, "delta", reading),
+        (LayerIndex, "lookup", looking),
     ]

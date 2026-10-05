@@ -1,7 +1,7 @@
 //! Written content as Arrow record batches, read in place: the key column
 //! alone — strings as they are, integers as their decimal text.
 
-use crate::format::{Error, Result};
+use crate::error::{Error, Result};
 use crate::rows::Arena;
 use crate::sort::Keys;
 use arrow_array::cast::AsArray;

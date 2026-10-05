@@ -269,8 +269,10 @@ flips). It also requires rising generations across commits. A failure
 aborts the merge loudly: a corrupt layer is never published.
 
 **Attempts.** A merge is identified by `{life}|{input ids}`. Upkeep records
-`MergeAttempted` durably before uploading; after 3 attempts of one input set
-it stops trying it and raises an alarm (A17's R8, A25's R6).
+`MergeAttempted` durably before uploading; once one input set has had 3
+attempts, none published, the index merges no more in that life, alarmed
+(A17's R8, A25's R6): backpressure then holds its writers until an operator
+acts or a new life starts.
 
 **Backpressure.** When an index holds more than 64 layers (upkeep failing
 or behind), commits to the partition wait, from every writer of the index:

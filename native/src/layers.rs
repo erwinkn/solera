@@ -27,7 +27,7 @@ use std::collections::VecDeque;
 
 use crate::delta::{Collected, Old, Write};
 use crate::entries::SortedEntries;
-use crate::format::{Error, Result};
+use crate::error::{Error, Result};
 use crate::rows::Source;
 use crate::stream::{Bytes, State};
 

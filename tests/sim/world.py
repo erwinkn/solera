@@ -275,8 +275,8 @@ def sim_key_service_class():
     """The engine's key cache on the simulation loop rather than a thread
     of its own: the same cache and resolver, called in loop order."""
 
-    from solera.keys.cache import EngineCache
     from solera.keys.io import ObjectIO
+    from solera.keys.layer_cache import LayerCache
     from solera.keys.resolver import Resolver
     from solera_server.keyservice import KeyService
 
@@ -289,9 +289,9 @@ def sim_key_service_class():
                 return
             self.io = ObjectIO(self.objects)
             budget = SimKeyService.world.cache_budget if SimKeyService.world is not None else None
-            disk, candidates = budget or (self.disk, self.candidates)
-            self.cache = EngineCache(self.root, disk=disk, candidates=candidates, window=self.window)
-            self.resolver = Resolver(self.cache, self.io, self.options, self.limits, pins=self)
+            disk, memory = budget or (self.disk, self.memory)
+            self.cache = LayerCache(self.root, disk=disk, memory=memory)
+            self.resolver = Resolver(self.cache, self.io, self.limits, pins=self)
             self.loop = SimKeyService.loop_of
 
         async def stop(self):
@@ -300,11 +300,6 @@ def sim_key_service_class():
                 return
             self.loop = None
             await self._close_tasks()
-
-        def _open(self, state):  # from a compaction's thread, while the loop waits for it
-            if not self._running():
-                return None
-            return self.cache.open(state)
 
     return SimKeyService
 
@@ -362,7 +357,7 @@ class Clients:
 class World:
     """One simulated deployment over a fresh namespace under `root`."""
 
-    def __init__(self, root: Path, seed: int, *, flush_interval=1.0, min_checkpoint=4096, key_options=None):
+    def __init__(self, root: Path, seed: int, *, flush_interval=1.0, min_checkpoint=4096):
         self.root = root
         # Ready callbacks interleaved from the run's seed (SOLERA_SIM_ORDER=fifo: asyncio's order).
         order = None if os.environ.get("SOLERA_SIM_ORDER") == "fifo" else random.Random(seed ^ 0x0BDE5)
@@ -375,7 +370,6 @@ class World:
         self.url = (root / "state").as_uri()
         self.data_root = str((root / "data").resolve())
         self.flush_interval, self.min_checkpoint = flush_interval, min_checkpoint
-        self.key_options = key_options
         self.slots: list[EngineSlot] = []
         self.slot: EngineSlot | None = None  # the engine clients and workers reach
         self.workers: dict[tuple, Worker] = {}
@@ -399,7 +393,7 @@ class World:
         self.on_record: Callable | None = None  # events an engine applied, as it applies them
         self.pg = None  # a postgres.Ledger, when the project writes to Postgres
         self.pool_hosts = 1  # how many pool hosts poll (`start_pool_hosts`)
-        self.cache_budget: tuple[int, int] | None = None  # (disk, candidates) of engines started from now on
+        self.cache_budget: tuple[int, int] | None = None  # (disk, memory) of engines started from now on
 
     # -- running ------------------------------------------------------------------------
 
@@ -557,7 +551,7 @@ class World:
                 min_checkpoint=self.min_checkpoint,
             )
             slot.state = state
-            kw = {"key_options": self.key_options} if self.key_options is not None else {}
+            kw = {}
             engine = Engine(
                 state,
                 project.manifest,

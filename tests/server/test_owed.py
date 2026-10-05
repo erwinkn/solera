@@ -31,22 +31,17 @@ async def commit(h: History, rng: random.Random) -> None:
 
 
 def at_h(index, h: int):
-    """`index`, asserting each read is Δ or a scan at H, `h`, or the head —
-    never a key view at an older commit, which the index does not serve
-    (A31 R2)."""
+    """`index`, asserting its lookups are at H, `h`: a key view at an older
+    commit is one the index does not serve (A31 R2) — a lookup reads its
+    state's head, and Δ reads the state at H."""
 
-    lookup, page = index.lookup, index.page
-    allowed = {None, h + 1}
+    lookup = index.lookup
 
-    async def checked_lookup(keys, at=None):
-        assert at in allowed, f"a lookup at {at - 1}, under H {h}"
-        return await lookup(keys, at=at)
+    async def checked_lookup(keys):
+        assert index.state.head == h, f"a lookup at {index.state.head}, under H {h}"
+        return await lookup(keys)
 
-    async def checked_page(after, limit, at=None):
-        assert at in allowed, f"a scan at {at - 1}, under H {h}"
-        return await page(after, limit, at=at)
-
-    index.lookup, index.page = checked_lookup, checked_page
+    index.lookup = checked_lookup
     return index
 
 

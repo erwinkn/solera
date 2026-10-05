@@ -350,16 +350,15 @@ adopted by a restarted engine (§12).
 
 **What it holds for others.**
 
-- **Its reads** (`reads`: `(output, partition, first, end)` per keyed
-  incremental input): the delta log it reads, from `first`, and the head
-  + 1 its plan was cut at, `end`: where it may move the position, a
-  retry pass that may cover what is left included. Log truncation and
-  index merges (`Model.endpoints`) keep them. Set when `_prepare` plans,
-  before the launch. A plan with no position to move (a keys= selection
-  while a pattern change decides membership) holds none.
+- **Its reads** (`reads`: `(output, partition, head)` per keyed
+  incremental input): the upstream commit each of its batches classes its
+  keys at (`observed-set.md`). The upstream index's cut never passes it
+  (`Model.oldest_observed`), so Δ from there stays exact. Set when its
+  batches are planned, before the launch.
 - **Its cleanups** (`cleanups`), a cleanup task's: the delta files of the
-  pending entries its spec hands it, set when it is prepared: collection
-  keeps them while it runs, even once the entry goes meanwhile (F36).
+  cleanup step its spec hands it, set when it is prepared: collection
+  keeps them while it runs, even once the step is acknowledged by another
+  meanwhile (F36).
 - **Its reader pin**: by its generation, over the index prefixes it reads
   and writes (`prefixes`), or every one while it is still preparing:
   collection deletes nothing such a reader may still read (§9.8).

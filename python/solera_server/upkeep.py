@@ -116,11 +116,13 @@ class Upkeep:
         """Raise each index's cut to the oldest commit its readers hold (its
         head when none holds one), and
         start merges, `concurrency` at a time: per index, one into the base
-        and one among the tiers, whose inputs never overlap. An input set
-        whose merge was uploaded `MERGE_ATTEMPTS` times in the index's
-        current life, none published, is merged no more, alarmed: the count
-        is durable (`Model.merges`), so neither a restart nor a takeover
-        resets it, and a new life starts afresh."""
+        and one among the tiers, whose inputs never overlap. Once an input
+        set's merge was uploaded `MERGE_ATTEMPTS` times in the index's
+        current life, none published, the index merges no more, alarmed: the
+        count is durable (`Model.merges`), so neither a restart nor a
+        takeover resets it, and a new life starts afresh. (Not the next
+        smaller set: a store that fails every upload would pay the budget
+        once per candidate set.)"""
 
         for key, index in list(self.m.indexes.items()):
             oldest = self.m.oldest_observed(*key)
@@ -146,10 +148,11 @@ class Upkeep:
             if spent:
                 self.failing[f"key index {key[0]}/{key[1]} merges"] = (
                     f"a merge of {sorted(spent)[0]!r} was uploaded {MERGE_ATTEMPTS} times, none published: "
-                    "that merge is not tried again in this life"
+                    "the index merges no more in this life"
                 )
-            else:
-                self.failing.pop(f"key index {key[0]}/{key[1]} merges", None)
+                self._checked[key] = index
+                continue
+            self.failing.pop(f"key index {key[0]}/{key[1]} merges", None)
             planned = False
             for lane in ("base", "tier"):
                 if (key, lane) in self.jobs or len(self.jobs) >= self.concurrency:

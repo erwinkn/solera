@@ -264,13 +264,14 @@ lineage:  B ← A, generation 12                    (g12 committed)
 
 ## 8. Hashing that stays
 
-None of it over user data: key filters, file and payload checksums, the
+None of it over user data: block checksums, the
 fingerprint, and a deploy's build identity.
 
 ## 9. Tests
 
-- **Unit.** The entry format round trips in Rust and the Python reference
-  (`tests/sdk/keys_reference.py`); every
+- **Unit.** The layer and delta entries round-trip natively
+  (`native/src/layers.rs`) and agree with the per-commit fold
+  (`tests/sdk/test_keys_layers.py`); every
   write is a change; a retried store call in one attempt gives the same
   delta bytes; source versions: equal unchanged, different changed, absent
   changed; set elements re-listed unchanged; immutable names and

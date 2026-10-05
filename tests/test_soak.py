@@ -171,7 +171,7 @@ async def test_soak(tmp_path, monkeypatch):
     await asyncio.gather(*engine.upkeep.jobs.values())
     await engine.upkeep.tick()  # the last garbage goes
     for (output, partition), index in state.model.indexes.items():
-        assert len(index.spans) <= engine.key_options.fan_in, (output, partition, len(index.spans))
+        assert not index.backlogged(), (output, partition, len(index.layers))
         referenced = {index.path(n) for n in index.referenced()}
         referenced |= {
             p for p in state.model.cleanup_reads() if p.startswith(index.prefix)

@@ -1541,6 +1541,10 @@ class Model:
             for d in self.cleanups.get((output, cleanup.get("partition")), []):
                 if d["id"] in ids:
                     d["stuck"] = True
+            step = {d["n"] for d in (info.get("deltas") or {}).get("deltas") or ()}  # a cursor step's
+            for d in self.cleaning.get((output, cleanup.get("partition")), []):
+                if d["n"] in step:
+                    d["stuck"] = True
 
     def _drop_cleanups(self, output: str, partition: str, ids) -> None:
         left = [d for d in self.cleanups.get((output, partition), []) if d["id"] not in set(ids)]
@@ -1550,9 +1554,16 @@ class Model:
             self.cleanups.pop((output, partition), None)
 
     def _on_CleanupsCleared(self, e):
-        """An operator gave up on stuck entries: their objects stay."""
+        """An operator gave up on stuck entries, a stuck cursor step's deltas
+        (`delta:{n}`) included: their objects stay."""
 
         self._drop_cleanups(e["output"], e["partition"], e["ids"])
+        key, gone = (e["output"], e["partition"]), set(e["ids"])
+        left = [d for d in self.cleaning.get(key, []) if f"delta:{d['n']}" not in gone]
+        if left:
+            self.cleaning[key] = left
+        else:
+            self.cleaning.pop(key, None)
         for entry_id in e.get("retired") or ():  # a stuck cleanup task's output life (K25)
             self.retired.pop(entry_id, None)
 

@@ -531,9 +531,7 @@ class Views:
         moved away whose leftovers await a cleanup task, with when each is
         due (K25)."""
 
-        partitions = [
-            self.partition_cleanups(output, partition)
-            for (output, partition), entries in sorted(self.m.cleanups.items())
-            if any(e.get("stuck") for e in entries)
-        ]
+        stuck = {k for k, entries in self.m.cleanups.items() if any(e.get("stuck") for e in entries)}
+        stuck |= {k for k, queue in self.m.cleaning.items() if any(d.get("stuck") for d in queue)}
+        partitions = [self.partition_cleanups(output, partition) for output, partition in sorted(stuck)]
         return partitions + self.retired_cleanups()

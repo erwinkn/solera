@@ -155,7 +155,6 @@ class Live:
     lines: deque = field(default_factory=lambda: deque(maxlen=LIVE_LINES))
     log_offset: int = 0
     fresh: bool = False  # launched by this engine process: its first `start` binds unread
-    reads: dict | None = None  # its spec's inputs and outputs, until `start` reads them
 
     def heard(self, now: float, via: str) -> None:
         self.reported, self.via = now, via
@@ -238,14 +237,7 @@ class Attempts:
         await self._bind(attempt, live, body["worker_id"], start=True)
         live.heard(asyncio.get_running_loop().time(), "channel")
         self._stir(attempt)
-        answer = self._cancel_answer(live)
-        spec, live.reads = live.reads, None  # answered once: a retried start reads the store
-        if spec is not None and self.keys is not None:
-            # The attempt's input reads, from the engine's cache (docs/resolved-commits.md §7).
-            reads = await self.keys.reads(spec, self.m.event_counter)
-            if reads is not None:
-                answer["reads"] = reads
-        return answer
+        return self._cancel_answer(live)
 
     async def attempt_beat(self, attempt: str, body: dict) -> dict:
         self._serving()
@@ -414,8 +406,6 @@ class Attempts:
         # durable leaves the file `open`, and no worker ever learns of it.
         opened = lifecycle.control(lifecycle.OPEN, engine=self.state.journal.engine)
         await self.state.create_object(f"{base}{lifecycle.CONTROL}", opened)
-        if self.keys is not None:  # what `start` answers its reads from (resolved-commits.md §7)
-            live.reads = {"inputs": spec["inputs"], "outputs": spec["outputs"]}
         claim = self.m.claimed(attempt)
         if claim is None:
             raise LostOwnership(attempt)  # canceled while the spec was written
@@ -736,19 +726,23 @@ class Attempts:
 
     def partition_cleanups(self, output: str, partition: str) -> dict:
         """An output partition's cleanup awaiting its next attempt (§9.8):
-        how much is pending, and the entries stuck — their names could not
-        be read three times — for an operator to see and clear."""
+        how much is pending, and what is stuck — entries, or a cursor step's
+        deltas, whose cleanup task ran out of tries — for an operator to see
+        and clear."""
 
         entries = self.m.cleanups.get((output, partition)) or []
+        queue = self.m.cleaning.get((output, partition)) or []
         stuck = [
             {k: e[k] for k in ("id", "kind", "misses", "attempt", "files") if k in e}
             for e in entries
             if e.get("stuck")
+        ] + [
+            {"id": f"delta:{d['n']}", "kind": "delta", "commit": d["commit"]} for d in queue if d.get("stuck")
         ]
         view = {
             "output": output,
             "partition": partition,
-            "pending": len(entries) - len(stuck),
+            "pending": len(entries) + len(queue) - len(stuck),
             "stuck": stuck,
         }
         retired = self.retired_cleanups(output)
@@ -777,6 +771,7 @@ class Attempts:
         entries. Their objects stay where they are."""
 
         stuck = [e["id"] for e in self.m.cleanups.get((output, partition)) or [] if e.get("stuck")]
+        stuck += [f"delta:{d['n']}" for d in self.m.cleaning.get((output, partition)) or [] if d.get("stuck")]
         # And an output life's stuck cleanup task (K25): its leftovers stay too.
         retired = [i for i, e in self.m.retired.items() if e["output"] == output and e.get("stuck")]
         if stuck or retired:

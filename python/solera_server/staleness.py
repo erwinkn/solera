@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import logging
 
-from solera.keys.index import KeyIndex, key_str
+from solera.keys.layers import LayerIndex, key_str
 from solera.patterns import Matcher
 
 from . import observed, owed, planning
@@ -251,11 +251,11 @@ async def _entries(engine, state):
     if state is None:
         return
     with engine.m.reading(state.prefix):
-        index = KeyIndex(engine._key_io(), None, state.slice(), engine.key_options)
+        index = LayerIndex(engine._key_io(), state, cache=engine._key_cache())
         after = None
         while True:
-            keys, generations, payloads, after = await index.page(after, BEHIND_PAGE)
-            for k, g, p in zip(keys, generations, payloads, strict=True):
+            rows, after = await index.delta(None, after=after, first=BEHIND_PAGE)
+            for k, _, _, g, p in rows:
                 yield key_str(k), g, p
             if after is None:
                 return

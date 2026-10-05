@@ -5,8 +5,9 @@
 //! to cross the wire.
 
 use crate::delta::Write;
-use crate::format::{sort_order, Error, Result};
+use crate::error::{Error, Result};
 use crate::rows::{Arena, Source};
+use crate::sort::sort_order;
 use crate::stream::State;
 
 #[derive(Default)]

@@ -1438,7 +1438,7 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
         is where the cursor moves once its deletes are done. None: none due."""
 
         queue = self.m.cleaning.get((output, partition))
-        if not queue:
+        if not queue or queue[0].get("stuck"):  # in order: a stuck step holds the rest
             return None
         floor = self.m.pin_floor(but=attempt, path=self.m.index(output, partition).prefix)
         life = self.m.index(output, partition).life

@@ -3,7 +3,7 @@ name = "solera-native-fuzz"
 version = "0.0.0"
 edition = "2021"
 publish = false
-description = "cargo-fuzz targets on the .kx readers (docs/verification.md, \"Fuzzing\")"
+description = "cargo-fuzz targets on the .lay readers (docs/verification.md, \"Fuzzing\")"
 
 [package.metadata]
 cargo-fuzz = true
@@ -12,28 +12,19 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4"
 arbitrary = { version = "1", features = ["derive"] }
 solera-native = { path = ".." }
-crc32fast = "1"
 
 [workspace]
 
 [[bin]]
-name = "kx-file"
-path = "fuzz_targets/kx_file.rs"
+name = "lay-file"
+path = "fuzz_targets/lay_file.rs"
 test = false
 doc = false
 bench = false
 
 [[bin]]
-name = "kx-merge"
-path = "fuzz_targets/kx_merge.rs"
+name = "lay-round-trip"
+path = "fuzz_targets/lay_round_trip.rs"
 test = false
 doc = false
 bench = false
-
-[[bin]]
-name = "kx-round-trip"
-path = "fuzz_targets/kx_round_trip.rs"
-test = false
-doc = false
-bench = false
-

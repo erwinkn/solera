@@ -48,7 +48,6 @@ from solera.keys.layers import (
     key_str,
     replaced_entries,
 )
-from solera.keys.reads import Reads
 from solera.keys.resolver import Ask, answers, delta_files, request
 from solera.lifecycle import Cancel, Ended
 from solera.objects import Conflict, swap
@@ -633,11 +632,11 @@ async def _store_outputs(
         if o.index is not None and o.opaque:
             if written.keys is None:
                 raise StoreError(f"{output.name}: store {store_name!r} reported no keys for an opaque write")
-            files, _ = await o.index.replace(
-                written.keys,
-                int(o.info["commit_number"]),
-                spec["attempt"],
+            files, _ = await o.index.write_replace(
+                chunks=written.keys,
+                name=f"{int(o.info['commit_number']):012d}-{spec['attempt']}",
                 generation=int(spec.get("generation") or 0),
+                replaced=o.kind == "immutable",
             )
             entry["keys"] = files.to_json()
         elif o.index is not None:
@@ -1092,7 +1091,6 @@ async def run_attempt(
         try:
             answer = await channel.start({"worker_id": worker_id, **claim})
             started = Cancel.from_json(answer.get("cancel"))
-            control["reads"] = Reads.from_json(answer.get("reads"))  # the engine's answers to its reads
         except Ended:
             return ENDED
         except Exception:
@@ -1273,9 +1271,9 @@ async def _execute(
     observed = Observed()
     try:
         await claim(_stores_of(project, asset.name), state)
-        # Index files straight from the store, but for the reads the engine answered at
-        # `start` (docs/resolved-commits.md §7); small writes are the engine's too.
-        keys_io = ObjectIO(objects, served=control.get("reads"))
+        # Index files straight from the store; small writes are the engine's
+        # (docs/resolved-commits.md §4).
+        keys_io = ObjectIO(objects)
         args, batch, delivered = await _resolve_inputs(spec, project, asset, keys_io, timeline, observed)
         nothing = delivered.pop("*nothing", False)
         ctx = Ctx(spec, asset, project, objects, batch, shipper, timeline, keys_io, observed)

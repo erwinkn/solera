@@ -502,3 +502,24 @@ async def test_the_engine_resolves_a_workers_request_from_its_warm_cache(tmp_pat
     assert cache.committed(h.state.path(f"{name}-0.lay"), len(data), h.state.prefix)  # its candidate
     rows, _ = await L.LayerIndex(h.io, state).delta(h.state.head, keys=[key(3), key(4), key(70), key(90)])
     assert [r[0] for r in rows] == sorted({key(3), key(70)} | ({key(4)} & set(h.fold[-1])))
+
+
+async def test_indexes_sharing_a_cache_never_read_each_others_files(tmp_path):
+    """One attempt names its output's delta and its failure records' delta
+    alike (`{commit}-{attempt}-0.lay`), under two prefixes: the engine's
+    cache keys what it holds by full path, so each index reads its own."""
+
+    from solera.keys.layer_cache import LayerCache
+
+    io = ObjectIO(MemoryStore())
+    cache = LayerCache(str(tmp_path), disk=2**20)
+    states = {}
+    for prefix, keys in (("keys/out/_/", [b"a", b"b"]), ("failures/out/_/", [b"x"])):
+        state = L.LayerState(prefix=prefix, life="1")
+        files, _ = await L.LayerIndex(io, state).write_patch(
+            SortedEntries.of(keys), name="000000000000-att", generation=7
+        )
+        states[prefix] = state.committed(0, files)
+    for prefix, keys in (("keys/out/_/", [b"a", b"b"]), ("failures/out/_/", [b"x"])):
+        found = await L.LayerIndex(io, states[prefix], cache=cache).lookup([b"a", b"b", b"x"])
+        assert sorted(found) == keys, prefix

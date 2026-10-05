@@ -121,14 +121,14 @@ async def whole(state, output: str, partition: str = ""):
     immutable store: every live entry of the output's key index, with the
     generation that wrote it (docs/lifecycle.md §9.8)."""
 
-    from solera.keys.index import KeyIndex, key_str
     from solera.keys.io import ObjectIO
+    from solera.keys.layers import LayerIndex, key_str
     from solera.stores import Keys
 
-    index = KeyIndex(ObjectIO(state.objects), None, state.model.index(output, partition).slice())
+    index = LayerIndex(ObjectIO(state.objects), state.model.index(output, partition))
     entries, after = {}, None
     while True:
-        keys, generations, _, after = await index.page(after, 100_000)
-        entries.update(zip(map(key_str, keys), generations, strict=True))
+        rows, after = await index.delta(None, after=after, first=100_000)
+        entries.update((key_str(r[0]), r[3]) for r in rows)
         if after is None:
             return Keys(entries)

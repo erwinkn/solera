@@ -551,18 +551,20 @@ class LayerIndex:
 
         async def one(p: Part):
             if p.index is not None:
-                if ("ix", p.index) not in self._small:
+                if ("ix", self.state.path(p.index)) not in self._small:
                     raw = await self._read(p.index, 0, p.index_size, p.index_size)
-                    self._small[("ix", p.index)] = _Index(raw)
+                    self._small[("ix", self.state.path(p.index))] = _Index(raw)
             else:
                 for f in p.files:
-                    if ("whole", f.name) not in self._small:
-                        self._small[("whole", f.name)] = await self._read(f.name, 0, f.size, f.size)
+                    if ("whole", self.state.path(f.name)) not in self._small:
+                        self._small[("whole", self.state.path(f.name))] = await self._read(
+                            f.name, 0, f.size, f.size
+                        )
 
         await asyncio.gather(*(one(p) for p in parts))
 
     def _ix(self, p: Part) -> _Index:
-        return self._small[("ix", p.index)]
+        return self._small[("ix", self.state.path(p.index))]
 
     async def _chunks(self, p: Part, blocks: list[int], window: int = 0) -> list[bytes]:
         """Whole blocks `blocks` (sorted) of part `p`, as chunks in key order;
@@ -570,7 +572,7 @@ class LayerIndex:
         extended to `window` bytes."""
 
         if p.index is None:
-            return [self._small[("whole", f.name)] for f in p.files]
+            return [self._small[("whole", self.state.path(f.name))] for f in p.files]
         ix = self._ix(p)
         need = [i for i in blocks if self._blocks.get((p.index, i)) is None]
         groups: list[list[int]] = []
@@ -672,7 +674,12 @@ class LayerIndex:
             for x, parts in over:
                 for part in parts:
                     if part.index is None:
-                        inputs.append(([self._small[("whole", f.name)] for f in part.files], *self._stamp(x)))
+                        inputs.append(
+                            (
+                                [self._small[("whole", self.state.path(f.name))] for f in part.files],
+                                *self._stamp(x),
+                            )
+                        )
                         continue
                     ix = self._ix(part)
                     span = list(ix.span(cursor, bound))

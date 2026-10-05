@@ -22,7 +22,6 @@ from pathlib import Path
 
 from hypothesis import strategies as st
 from hypothesis.stateful import RuleBasedStateMachine, initialize, invariant, precondition, rule
-from solera.keys.index import Options
 from solera.sdk import Ref
 
 from . import postgres
@@ -102,7 +101,7 @@ class Simulation(RuleBasedStateMachine):
         if store == "pg" and not postgres.DSN:
             store = "table"
             self.trace.append("  # no Postgres: 'pg' runs on the table store")
-        self.world = world = World(self.tmp, seed, key_options=Options(window=2))
+        self.world = world = World(self.tmp, seed)
         world.project_now = lambda: self.project
         world.cache_budget = CACHE[cache]
         self.journal = Journal(now=world.now)
@@ -601,12 +600,12 @@ class Simulation(RuleBasedStateMachine):
 
     @invariant()
     def reads_at_endpoints_are_exact(self):
-        """Every key-index read at an endpoint — `page` and `lookup` at a
-        position, pin or snapshot, `changes` between two — equals the fold of
-        the commits its index holds up to there (`tests/sim/reads.py`)."""
+        """Every key-index read — Δ(P, H) and lookups at the head — equals the
+        fold of the commits its index holds, and the cut never passes a
+        commit a reader holds (`tests/sim/reads.py`)."""
 
         if self.world is not None and self.world.reads.wrong:
-            raise Violation(f"a read at an endpoint is not exact: {self.world.reads.wrong[0]}")
+            raise Violation(f"a key index read is not exact: {self.world.reads.wrong[0]}")
 
     @invariant()
     def one_attempt_per_partition(self):
@@ -670,27 +669,24 @@ class Simulation(RuleBasedStateMachine):
                 )
 
     @invariant()
-    def index_spans_tile(self):
-        """docs/key-index-design.md: an index's spans tile its commits from 0
-        to the head, and a span's files are in key order (a key's versions
-        may cross from one into the next), so a read takes one file per span
-        for a key."""
+    def index_layers_tile(self):
+        """docs/key-index-design.md: an index's layers tile its commits from 0
+        to the head, and a part's files are in key order."""
 
         engine = self.world.engine if self.world is not None else None
         if engine is None:
             return
         for (output, partition), index in list(engine.m.indexes.items()):
-            starts = [s.a for s in index.spans]
-            if starts != [0, *(s.b + 1 for s in index.spans)][: len(starts)]:
-                raise Violation(
-                    f"{output}[{partition!r}]: spans {[(s.a, s.b) for s in index.spans]} do not tile"
-                )
-            for s in index.spans:
-                for a, b in zip(s.files, s.files[1:], strict=False):
-                    if a.max > b.min:
-                        raise Violation(
-                            f"{output}[{partition!r}] span {s.a}..{s.b}: {a.name} and {b.name} overlap"
-                        )
+            spans = [(x.a, x.b) for x in index.layers]
+            if [a for a, _ in spans] != [0, *(b + 1 for _, b in spans)][: len(spans)]:
+                raise Violation(f"{output}[{partition!r}]: layers {spans} do not tile")
+            for x in index.layers:
+                for part in x.parts():
+                    for f, g in zip(part.files, part.files[1:], strict=False):
+                        if f.last >= g.first:
+                            raise Violation(
+                                f"{output}[{partition!r}] layer {x.a}..{x.b}: {f.name} and {g.name} overlap"
+                            )
 
     @invariant()
     def committed_keys_are_readable(self):
