@@ -382,3 +382,30 @@ def test_a_write_with_no_selection_is_paged_natively():
     pages = list(write.iter_chunks(2))
     assert [len(p) for p in pages] == [2, 2, 1]
     assert [(k, g) for p in pages for k, g in p] == [(r["id"], [r]) for r in rows]
+
+
+async def test_a_root_belongs_to_the_namespace_that_first_claims_it(tmp_path):
+    """F43, D167: two namespaces sharing a data root delete each other's
+    data, so the first to write claims it; another is refused, naming
+    both, until a root is moved to it explicitly (`adopt`)."""
+
+    from solera.stores import StoreError
+
+    store = FileStore(tmp_path / "data")
+    await store.claim("prod", "s3://acme/orchestrator")
+    await store.claim("prod", "s3://acme/orchestrator")  # its own: again, nothing
+    other = FileStore(tmp_path / "data")
+    with pytest.raises(
+        StoreError,
+        match="belongs to namespace prod .at s3://acme/orchestrator.; this engine serves namespace staging",
+    ):
+        await other.claim("staging", "s3://acme/orchestrator")
+    with pytest.raises(StoreError, match="belongs to namespace prod"):  # the same name at another location
+        await other.claim("prod", "file:///elsewhere")
+    await other.adopt("staging", "s3://acme/orchestrator")
+    assert await FileStore(tmp_path / "data").owner() == {
+        "namespace": "staging",
+        "at": "s3://acme/orchestrator",
+    }
+    with pytest.raises(StoreError, match="belongs to namespace staging"):
+        await FileStore(tmp_path / "data").claim("prod", "s3://acme/orchestrator")

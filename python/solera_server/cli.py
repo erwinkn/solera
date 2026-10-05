@@ -216,6 +216,13 @@ def _main():
     )
     migrate.add_argument("outputs", nargs="*", help="Outputs to migrate (default: all declaring)")
 
+    adopt = commands.add_parser(
+        "adopt-store",
+        help="Give a store's data root to this namespace, once the namespace that owns it is retired",
+        parents=[common],
+    )
+    adopt.add_argument("store")
+
     commit = commands.add_parser("commit", help="Advance a source (§5)", parents=[common])
     commit.add_argument("source")
     commit.add_argument("--version")
@@ -306,6 +313,9 @@ async def _dispatch(args, parser):
     if args.command == "migrate":
         await _migrate(args, parser)
         return
+    if args.command == "adopt-store":
+        await _adopt_store(args, parser)
+        return
 
     if _server_url():
         await _remote(args, parser)
@@ -317,7 +327,7 @@ async def _migrate(args, parser):
     """Apply declared migrations through the local worker path (§4): load the
     project, bind its stores to the namespace's object store, migrate."""
 
-    from solera_worker.worker import load_project
+    from solera_worker.worker import claim, load_project
 
     from .state import State
 
@@ -344,11 +354,60 @@ async def _migrate(args, parser):
         for output in selected:
             record = project.manifest["outputs"][output.name]
             store = project.stores[record["store"]]
+            await claim([store], state.objects_url)
             applied = await store.migrate(output, output.migrations)
             for name in applied:
                 print(f"{output.name}: applied {name}")
             if not applied:
                 print(f"{output.name}: up to date")
+    finally:
+        await state.close()
+
+
+LIVE = 15 * 60.0  # a namespace whose journal was written this recently has an engine serving it
+
+
+async def _adopt_store(args, parser):
+    """Give a store's data root to this namespace (F43, D167): refused while
+    the namespace that owns it is live — its journal written within
+    `LIVE` — since both would then clean up the same objects."""
+
+    import time
+
+    import obstore
+    from obstore.exceptions import NotFoundError
+    from solera_worker.worker import load_project
+
+    from .state import State, open_store
+
+    state = await State.open(args.state_url, args.namespace, writer=False)
+    try:
+        entrypoint = args.project or state.model.project
+        if not entrypoint:
+            parser.error("solera adopt-store needs --project or a previously registered project")
+        project = load_project(entrypoint)
+        if args.store not in project.stores or not callable(
+            getattr(project.stores[args.store], "adopt", None)
+        ):
+            parser.error(f"{args.store}: no store of this project with a data root to adopt")
+        store = project.stores[args.store]
+        at, _, namespace = state.objects_url.rstrip("/").rpartition("/")
+        found = await store.owner()
+        if found is not None and found != {"namespace": namespace, "at": at}:
+            try:
+                journal = await obstore.head_async(
+                    open_store(found["at"], found["namespace"])[0], "control/journal.json"
+                )
+                written = journal["last_modified"].timestamp()
+            except (NotFoundError, FileNotFoundError, ValueError):
+                written = None  # its state is gone
+            if written is not None and time.time() - written < LIVE:
+                parser.error(
+                    f"{store.where()} belongs to namespace {found['namespace']} (at {found['at']}), which is "
+                    f"live: its journal was written {time.time() - written:.0f}s ago. Stop its engine first"
+                )
+        await store.adopt(namespace, at)
+        print(f"{store.where()} now belongs to namespace {namespace} (at {at})")
     finally:
         await state.close()
 

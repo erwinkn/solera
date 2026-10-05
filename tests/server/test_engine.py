@@ -1404,3 +1404,32 @@ async def test_a_failing_partition_backs_off_its_changes(state):
     offset[0] += 2 * CHANGE_BACKOFF + 1
     await settle(3)
     assert len(calls) == 3 and "failed_in_row" not in state.model.partition("consumer", "")
+
+
+async def test_a_data_root_another_namespace_owns_is_refused(tmp_path):
+    """F43's root cause, two states sharing one data root: their engines'
+    namespaces, both `default`, at two locations, write one FileStore.
+    The first owns the root; the second's attempts fail before writing,
+    naming both — never cleaning up the other's objects (D167)."""
+
+    from solera_server.state import State
+
+    @asset(outputs=Output("files", key="id"))
+    def files():
+        return [{"id": "a", "v": 1}]
+
+    project = Project(assets=[files], default_store=FileStore(tmp_path / "shared"))
+    outcomes = []
+    for where in ("one", "two"):
+        state = await State.open((tmp_path / where).as_uri(), "default", flush_interval=0.001)
+        engine = make_engine(state, project)
+        await engine.initialize()
+        detail = await drive(engine, await engine.submit(["files"]))
+        outcomes.append((status_of(detail), [t.get("error") or "" for t in detail["tasks"]]))
+        await engine.stop()
+        await state.close()
+    assert outcomes[0][0] == "succeeded"
+    status, (error,) = outcomes[1]
+    one = (tmp_path / "one").resolve().as_uri()
+    assert status == "failed" and f"belongs to namespace default (at {one})" in error
+    assert "this engine serves namespace default (at" in error

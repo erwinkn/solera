@@ -1104,7 +1104,9 @@ async def run_attempt(
     shipper = LogShipper(objects, base, channel, worker_id)
     writes = Writes()
     execution = asyncio.create_task(
-        _execute(objects, base, spec, entrypoint, timeline, shipper, writes, control_file, control)
+        _execute(
+            objects, base, spec, entrypoint, timeline, shipper, writes, control_file, control, objects_url
+        )
     )
     reporter = Reporter(
         objects, base, worker_id, channel, spec.get("heartbeat", 10), timeline, on_cancel, on_ended
@@ -1228,9 +1230,11 @@ async def _publish(control_file, result, writes, cancel, timeline, shipper) -> b
 
 
 async def _execute(
-    objects, base, spec, entrypoint, timeline, shipper, writes, control_file, control
+    objects, base, spec, entrypoint, timeline, shipper, writes, control_file, control, state
 ) -> dict | None:
-    """Run the attempt: its result, or `None` once the engine ended it."""
+    """Run the attempt: its result, or `None` once the engine ended it. Every
+    store root it may write or clean up is first claimed for its namespace,
+    whose state is at `state` (`claim`)."""
 
     worker_id = control_file.worker_id
 
@@ -1261,14 +1265,16 @@ async def _execute(
     if (cleanup := spec.get("cleanup")) is not None:  # a cleanup task: no asset of its own (§9.8, K25)
         try:
             if "outputs" in cleanup:  # a partition's entries, deleted through its output's store
+                await claim(_stores_of(project, cleanup["asset"]), state)
                 done = await _cleanup_due(cleanup, project, project.assets[cleanup["asset"]], objects, writes)
                 return {"status": "succeeded", "outputs": {}, **done}
-            return await _retire(cleanup, project, writes)  # an output life's leftovers
+            return await _retire(cleanup, project, writes, state)  # an output life's leftovers
         except Exception as error:  # a store that refused: retried within the task's budget
             return _failed(error, getattr(error, "retryable", True))
     asset = project.assets[spec["asset"]]
     observed = Observed()
     try:
+        await claim(_stores_of(project, asset.name), state)
         # Index files straight from the store, but for the reads the engine answered at
         # `start` (docs/resolved-commits.md §7); small writes are the engine's too.
         keys_io = ObjectIO(objects, served=control.get("reads"))
@@ -1348,7 +1354,7 @@ async def _execute(
             await observed.close()
 
 
-async def _retire(entry: dict, project, writes) -> dict:
+async def _retire(entry: dict, project, writes, state: str) -> dict:
     """A cleanup task (K25): delete what an output life left in a store it
     was removed or moved from — `store.cleanup(output, home, before=G)`, G
     the first generation after, so a later life of the name keeps what it
@@ -1372,8 +1378,27 @@ async def _retire(entry: dict, project, writes) -> dict:
     output = Output(
         entry["output"], key=decl.get("key"), incremental=decl.get("incremental"), **decl.get("config", {})
     )
+    await claim([store], state)
     await writes.call(store.cleanup(output, home=entry["home"], before=entry["before"]))
     return {"status": "succeeded", "outputs": {}, "cleaned": entry["id"]}
+
+
+async def claim(stores, state: str) -> None:
+    """Claim each store's root, where a store has one to claim, for the
+    namespace whose state is at `state` — `{location}/{namespace}` (F43): a
+    root another namespace owns is refused, with a `StoreError`."""
+
+    at, _, namespace = state.rstrip("/").rpartition("/")
+    for store in stores:
+        if callable(getattr(store, "claim", None)):
+            await store.claim(namespace, at)
+
+
+def _stores_of(project, asset: str) -> list:
+    """The stores an asset's outputs are on."""
+
+    names = {o["store"] for o in project.manifest["assets"][asset]["outputs"]}
+    return [project.stores[n] for n in sorted(names)]
 
 
 def _file_entries(data: bytes):

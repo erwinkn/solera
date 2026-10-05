@@ -847,7 +847,7 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
                 if task["asset"] == CLEANUP:
                     prepared = self._prepare_cleanup(task, attempt)
                 else:
-                    prepared = self._prepare(task, run, attempt, await self._observe(task, run))
+                    prepared = self._prepare(task, run, attempt, await self._observe(task, run, attempt))
             except (Retryable, NonRetryable, Conflict) as error:
                 self._finish(
                     task,

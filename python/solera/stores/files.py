@@ -66,6 +66,66 @@ class FileStore:
         self.path = path
         self.home: str | None = None  # the project's directory, for the default path
         self._stores: dict[str, Any] = {}
+        self._owner: dict | None = None  # the namespace this process found owns the root (`claim`)
+
+    # -- ownership (F43, D167) --------------------------------------------------------
+
+    async def claim(self, namespace: str, at: str) -> None:
+        """Mark this store's root as the namespace's — `namespace`, whose
+        state is at `at` — on first use, and refuse a root another
+        namespace owns. Two namespaces sharing a root each clean up what
+        they take for their own (names carry no namespace, and generations
+        restart with each), so each deletes the other's data (F43). The
+        marker, `OWNER` at the root, is created if absent; moving a root to
+        another namespace is explicit (`adopt`, `solera adopt-store`)."""
+
+        mine = {"namespace": namespace, "at": at}
+        if self._owner == mine:
+            return
+        import obstore
+        from obstore.exceptions import AlreadyExistsError
+
+        try:
+            await obstore.put_async(
+                self._objects(), OWNER, json.dumps(mine).encode(), mode="create", use_multipart=False
+            )
+        except AlreadyExistsError:
+            found = await self.owner()
+            if found != mine:
+                raise StoreError(
+                    f"{self.where()} belongs to namespace {found['namespace']} (at {found['at']}); "
+                    f"this engine serves namespace {namespace} (at {at}). Two namespaces sharing a data "
+                    "root delete each other's data: give this one a root of its own (SOLERA_DATA_URL), "
+                    "or move the root to it with `solera adopt-store` once the other is retired"
+                ) from None
+        self._owner = mine
+
+    async def owner(self) -> dict | None:
+        """The namespace that owns this store's root — `{namespace, at}`,
+        `at` where its state is — if one has claimed it."""
+
+        import obstore
+        from obstore.exceptions import NotFoundError
+
+        try:
+            found = await obstore.get_async(self._objects(), OWNER)
+        except (NotFoundError, FileNotFoundError):
+            return None
+        return json.loads(bytes(await found.bytes_async()))
+
+    async def adopt(self, namespace: str, at: str) -> None:
+        """Give this store's root to a namespace, whoever owned it (`solera adopt-store`)."""
+
+        import obstore
+
+        mine = {"namespace": namespace, "at": at}
+        await obstore.put_async(self._objects(), OWNER, json.dumps(mine).encode())
+        self._owner = mine
+
+    def where(self) -> str:
+        """The root, as a person would name it."""
+
+        return os.fspath(self._objects().prefix)
 
     def describe(self) -> dict | None:
         """What a worker rebuilds this store from — `{class, config}`, in the
@@ -456,6 +516,9 @@ class FileStore:
         return ObjectRef(output=context.output.name, store="", handle=handle, partition=context.partition)
 
 
+OWNER = ".solera-owner.json"  # at a store's root: the namespace its data belongs to (F43, D167)
+
+
 def data_path() -> str | None:
     """The directory a `file://` `$SOLERA_DATA_URL` names, if it names one."""
 
@@ -504,6 +567,9 @@ class S3Store(FileStore):
             if plain in self.SECRETS and isinstance(value, str) and not value.startswith("env:"):
                 raise ValueError(f"{name} is written in the open: pass {name}='env:NAME' and set NAME")
         return {"class": "S3Store", "config": {"url": self.url, "options": dict(self.options)}}
+
+    def where(self) -> str:
+        return self.url
 
     def _objects(self):
         if "" not in self._stores:

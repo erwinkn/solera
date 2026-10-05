@@ -14,7 +14,11 @@ from .engines import drive, make_engine
 
 
 def files(root) -> set[str]:
-    return {str(p.relative_to(root)) for p in root.rglob("*") if p.is_file()}
+    """A store root's data: every file but its owner marker, the namespace's (F43)."""
+
+    from solera.stores.files import OWNER
+
+    return {str(p.relative_to(root)) for p in root.rglob("*") if p.is_file() and p.name != OWNER}
 
 
 async def _engine(state, project):

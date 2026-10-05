@@ -176,6 +176,22 @@ call that raises after the attempt began writing leaves its write
 `writing`: the next attempt repairs them (fenced stores keep the
 attempt's intents for that).
 
+**One namespace per root** (F43, D167). A store's names carry no
+namespace, and generations restart with each, so two namespaces writing
+one root would each clean up the other's objects as its own. A store
+with a root (FileStore, S3Store) therefore belongs to the namespace that
+first writes it: `claim(namespace, at)` creates `.solera-owner.json` at
+the root if absent — the namespace, and `at`, where its state is — and
+refuses a root another namespace owns, naming both: `s3://acme-solera/data
+belongs to namespace prod (at s3://acme-solera/orchestrator); this engine
+serves namespace staging`. Workers claim every root an attempt writes or
+cleans up, and `solera migrate` before it migrates. Moving a root is
+explicit: `solera adopt-store STORE` gives it to the namespace the
+command runs in, refused while the namespace that owns it is live (its
+journal written in the last 15 minutes). A store of the project's own
+may define the same three methods (`claim`, `owner`, `adopt`); one
+without them claims nothing.
+
 ## Values a store takes
 
 The framework knows plain Python only: a keyed write is a list of

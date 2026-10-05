@@ -294,3 +294,34 @@ async def test_local_reads_leave_the_running_writer_alone(project_file, state_ur
     coordinator.record({"type": "AutomationChanged", "name": "none", "enabled": True})
     await coordinator.durable()  # still the writer: nothing fenced it
     await coordinator.close()
+
+
+async def test_adopt_store_moves_a_root_once_its_namespace_is_retired(
+    project_file, state_url, capsys, monkeypatch, tmp_path, data
+):
+    """F43, D167: `solera adopt-store` gives a store's data root to this
+    namespace — refused while the namespace that owns it is live (its
+    journal written lately), taken once it is gone."""
+
+    import asyncio
+
+    from solera.stores import FileStore
+    from solera_server.state import State
+
+    monkeypatch.delenv("SOLERA_SERVER_URL", raising=False)
+
+    def run(*argv):
+        return cli(monkeypatch, capsys, "--state-url", state_url, *argv)
+
+    await asyncio.to_thread(run, "run", "--project", project_file, "feed")  # this namespace claims the root
+    here = (tmp_path / "state").resolve().as_uri()
+    live = await State.open((tmp_path / "live").as_uri(), "default", flush_interval=0.001)
+    await FileStore(data).adopt("default", (tmp_path / "live").resolve().as_uri())
+    with pytest.raises(SystemExit):
+        await asyncio.to_thread(run, "adopt-store", "--project", project_file, "default")
+    assert "which is live" in capsys.readouterr().err
+    await live.close()
+    await FileStore(data).adopt("default", (tmp_path / "gone").resolve().as_uri())  # a state no longer there
+    out = await asyncio.to_thread(run, "adopt-store", "--project", project_file, "default")
+    assert f"now belongs to namespace default (at {here})" in str(out)
+    assert await FileStore(data).owner() == {"namespace": "default", "at": here}

@@ -106,13 +106,15 @@ class Observing:
                 return "input reset"
         return None
 
-    async def _observe(self, task: dict, run: dict) -> dict:
+    async def _observe(self, task: dict, run: dict, attempt: str | None = None) -> dict:
         """Each keyed incremental input's next batch (docs/observed-set.md, "A
         run"): past the task's progress, the next `batch_size` owed keys — or
         of the keys a `keys=` run names — classed at the upstream's head now.
         A full run compares against an empty record — a per-key consumer's,
         against what it holds — from the first key. An input whose walk the
-        task finished gets an empty batch."""
+        task finished gets an empty batch. Each head is reserved on the
+        attempt's claim before anything is awaited: a merge planned
+        meanwhile keeps it."""
 
         partition = task["partition"]
         planner = self.planner()
@@ -127,10 +129,14 @@ class Observing:
         full = self._full_run(task, run, keyed) is not None
         records = self.m.partition(task["asset"], partition).get("observed") or {}
         progress = {} if full else task.get("progress") or {}
+        upstreams = {i.param: self._upstream(i.output, i.partition) for i in keyed}
+        claim = self.m.claimed(attempt) if attempt is not None else None
+        if claim is not None:
+            claim["reads"] = [(i.output, i.partition, upstreams[i.param][0].state.head) for i in keyed]
         out = {}
         for input in keyed:
             spec, mine = input.spec, progress.get(input.param)
-            index, life = self._upstream(input.output, input.partition)
+            index, life = upstreams[input.param]
             now = owed.Now(index.state.head, spec.get("patterns"), context, life)
             each = spec.get("each") is not None
             rec = records.get(input.param)
