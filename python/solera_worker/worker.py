@@ -641,8 +641,6 @@ async def _store_outputs(
             entry["keys"] = files.to_json()
         elif o.index is not None:
             entry["keys"] = intents[name]
-            if o.partitions is not None:
-                entry["partitions"] = o.partitions
         if written.ref is None:
             continue
         ref = dataclasses.replace(written.ref, store=store_name)
@@ -686,7 +684,6 @@ class _Out:
     files: DeltaFiles | None = None
     changed: tuple | None = None  # ([written key], [removed key]), or None past LISTED
     write: KeyedWrite | None = None
-    partitions: list[str] | None = None
     schema_only: bool = False  # unchanged content, migrations to apply
 
     @property
@@ -816,12 +813,6 @@ def _keyed_write(o: _Out, keys_io) -> KeyedWrite:
     deletes — or the write whole."""
 
     p, changed = o.prepared, o.changed
-    if o.output.is_dynamic_partitions:
-        own = set(p.take(None))
-        if o.replace:
-            o.partitions = sorted(own)
-        else:
-            o.partitions = sorted((set(o.info.get("partitions") or ()) - set(p.removes)) | own)
     if changed is not None:
         upserted = frozenset(map(key_str, changed[0]))
         deleted = frozenset(map(key_str, changed[1]))

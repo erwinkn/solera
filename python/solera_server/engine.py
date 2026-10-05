@@ -39,6 +39,7 @@ from solera.keys.io import ObjectIO
 from solera.keys.layers import (
     DeltaFiles,
     LayerIndex,
+    LayerState,
     Part,
     delta_keys,
     delta_names,
@@ -48,7 +49,7 @@ from solera.keys.layers import (
 from solera.sdk import default_placement, digest
 from solera.tasks import Tasks
 
-from . import history, planning
+from . import history, owed, planning
 from .attempts import POOL_OFFERED_GRACE, Attempts, Live, current_names, worker_report
 from .executors import PlacementContext, Registry
 from .history import MAX_METADATA, History, RunFilter
@@ -648,6 +649,26 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
         if held:
             self.state.record({"type": "TasksHeld", "held": held, "at": now})
 
+    async def _elements(
+        self, output: str, partition: str, prefix: str | None, delta: dict | None, head: dict | None
+    ) -> list[str]:
+        """A dynamic partitions set's elements after a commit, from its key
+        index: the head's, changed by what the commit's delta changes (Δ from
+        the index's head before it) — whoever wrote the delta: a worker, a
+        repair folding a dead writer's keys in, the engine for a source."""
+
+        elements = set((head or {}).get("partitions") or ())
+        if delta is None or not delta_names(delta):
+            return sorted(elements)
+        state = self.m.indexes.get((output, partition)) or LayerState(prefix=prefix, life="")
+        after = state.committed(int(delta["commit_number"]), DeltaFiles.from_json(delta))
+        index = LayerIndex(self._key_io(), after, cache=self._key_cache())
+        since = state.head if state.head >= 0 else None
+        with self.m.reading(state.prefix):
+            async for d in owed._diffs(index, since, None, None, None):
+                (elements.add if d.after else elements.discard)(d.key)
+        return sorted(elements)
+
     def _merges_behind(self, names: list[str], partition: str) -> str | None:
         """The first of the key indexes `names` in `partition` that upkeep has
         let fall far behind (`LayerState.backlogged`), or None. Every index
@@ -1104,7 +1125,7 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
                 if (name, partition) in self.m.repairs:
                     info["repairs"] = self.m.repairs[(name, partition)]
                 if output.get("dynamic_partitions") or name in self._dynamic_dims:
-                    info["partitions"] = list((head or {}).get("partitions") or ())
+                    info["dynamic"] = True  # its elements, the engine's to work out at commit
             outputs[name] = info
         # The input versions its outputs will be built from, for the history (§7):
         # each pinned ref's generation (docs/versions.md §6).
@@ -1583,8 +1604,14 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
                     if delta_names(delta):
                         head["commit_number"] = int(info["commit_number"])
                     keys[name] = {**delta, "commit_number": head["commit_number"]}
-                if "partitions" in info:
-                    head["partitions"] = entry.get("partitions", info["partitions"])
+                if info.get("dynamic"):
+                    head["partitions"] = await self._elements(
+                        name,
+                        task["partition"],
+                        info.get("prefix"),
+                        keys.get(name),
+                        self.m.heads.get((name, task["partition"])),
+                    )
             elif decl.get("incremental"):
                 if info["reset"]:  # starts over at its commit, whatever its content
                     head["commit_number"] = head["base"] = int(info["commit_number"])
@@ -1766,8 +1793,8 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
                 return None, head["ref"] if head is not None else source["head"]
             record["commit_number"] = commit_number
             if listed is not None:
-                before = set((head or {}).get("partitions") or ())
-                record["partitions"] = sorted(set(new) if replace else (before - set(removes)) | set(new))
+                delta = {**files.to_json(), "commit_number": commit_number}
+                record["partitions"] = await self._elements(name, "", pinned.prefix, delta, head)
             event["keys"] = {**files.to_json(), "commit_number": commit_number}
             run["commit_number"] = commit_number
             counts = (files.part.entries - files.removed, files.removed)

@@ -1394,8 +1394,7 @@ class Model:
         at the generation its writes carried: even an empty one, so the layers
         keep no holes. An output's first index starts
         where its attempt wrote them, `prefix` — under the name it launched
-        with, when a rename came since. The head carries the index's live key
-        count."""
+        with, when a rename came since."""
 
         if keys is not None:
             index = self.index(output, partition)
