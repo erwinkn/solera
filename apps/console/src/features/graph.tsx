@@ -102,6 +102,16 @@ export function partitionParts(p: AssetStatus["partitions"]) {
   ];
 }
 
+/**
+ * An asset's partitions in a few words. A stale partition is still built
+ * (its head is valid, D176/D177), so "0/4 materialized" would read as
+ * nothing built: with any stale, say how many partitions and how many are
+ * stale; else how many are materialized.
+ */
+export function partitionCount(p: AssetStatus["partitions"], materialized = " materialized"): string {
+  return p.stale > 0 ? `${p.total} partitions` : `${p.materialized}/${p.total} partitions${materialized}`;
+}
+
 /** One tone for an asset: the worst thing about it. */
 export function assetTone(status: AssetStatus | undefined): Tone {
   if (!status) return "idle";
@@ -294,7 +304,10 @@ function Node({ node, status }: { node: GraphNode; status: AssetStatus | undefin
       <span className="flex items-center gap-2 text-2xs text-fg-subtle">
         <span className="truncate">
           {KIND_LABEL[node.kind]}
-          {p && status?.partitioned && ` · ${p.materialized}/${p.total} partitions`}
+          {/* Compact in a node: "4/4 stale" when any is, else "3/4 partitions". */}
+          {p &&
+            status?.partitioned &&
+            ` · ${p.stale ? `${p.stale}/${p.total} stale` : partitionCount(p, "")}`}
         </span>
         <span className="ml-auto flex shrink-0 items-center gap-1.5">
           {failing > 0 && (

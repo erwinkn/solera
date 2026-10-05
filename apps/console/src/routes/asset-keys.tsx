@@ -49,7 +49,7 @@ export function AssetKeys() {
       {each && <OutcomesCard name={name} />}
       {(each || keyedEdge(asset)) && <ExplainKey key={key} name={name} asset={asset} />}
       {each && <OutcomeHistory name={name} />}
-      <LiveKeys name={name} asset={asset} />
+      <LiveKeys asset={asset} />
     </div>
   );
 }
@@ -646,7 +646,7 @@ function OutcomeHistory({ name }: { name: string }) {
                 {!partition && <Th>Partition</Th>}
                 <Th>Outcome</Th>
                 {tried && <Th className="text-right">Try</Th>}
-                <Th>Generation</Th>
+                <Th>Version</Th>
                 <Th>Error</Th>
                 <Th>When</Th>
                 <Th>Run</Th>
@@ -703,18 +703,18 @@ function OutcomeHistory({ name }: { name: string }) {
 
 // -- live keys ---------------------------------------------------------------------
 
-function LiveKeys({ name, asset }: { name: string; asset: AssetDecl }) {
+function LiveKeys({ asset }: { asset: AssetDecl }) {
   const { partition, output } = route.useSearch();
   const navigate = route.useNavigate();
   const project = useProject();
   const keyed = asset.outputs.filter((o) => o.key);
   const chosen = keyed.find((o) => o.name === output) ?? keyed[0];
-  const partitions = useQuery({
-    ...q.partitions(project, name),
-    enabled: !!asset.partitions,
+  // Any partition with a head holds keys to read, stale ones too: a stale head is a valid head (D177).
+  const heads = useQuery({
+    ...q.heads(project, chosen?.name ?? ""),
+    enabled: !!chosen && !!asset.partitions,
   }).data;
-  const effectivePartition =
-    partition ?? (asset.partitions ? partitions?.find((p) => p.status === "materialized")?.partition : "");
+  const effectivePartition = partition ?? (asset.partitions ? heads?.[0]?.partition : "");
   const keys = useInfiniteQuery({
     ...q.keys(project, chosen?.name ?? "", effectivePartition ?? ""),
     enabled: !!chosen && effectivePartition !== undefined,
@@ -770,9 +770,9 @@ function LiveKeys({ name, asset }: { name: string; asset: AssetDecl }) {
             ? "This output has no head for this partition yet."
             : keys.error.message}
         </Empty>
-      ) : effectivePartition === undefined && partitions ? (
-        <Empty compact title="No complete partition yet">
-          Pick a partition above to read what its index holds.
+      ) : effectivePartition === undefined && heads ? (
+        <Empty compact title="Nothing committed yet">
+          No partition of this output has a head, so no key index to read.
         </Empty>
       ) : !keys.data ? (
         <Skeleton className="mx-4 mb-4 h-24" />
@@ -786,7 +786,7 @@ function LiveKeys({ name, asset }: { name: string; asset: AssetDecl }) {
             <thead className="sticky top-0 bg-surface">
               <tr>
                 <Th>Key</Th>
-                <Th>Generation</Th>
+                <Th>Version</Th>
               </tr>
             </thead>
             <tbody>

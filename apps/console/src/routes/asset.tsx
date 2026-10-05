@@ -5,7 +5,7 @@ import { Play, Zap } from "lucide-react";
 import { q, useManifest, useProject } from "@/api/queries";
 import { useAutomationToggle, useRunAutomation } from "@/api/mutations";
 import type { AssetDecl, Automation, DimDecl, Head, Json, Manifest } from "@/api/types";
-import { assetTone, KIND_ICON, KIND_LABEL, kindOf } from "@/features/graph";
+import { assetTone, KIND_ICON, KIND_LABEL, kindOf, partitionCount } from "@/features/graph";
 import { RunButton } from "@/features/run-dialog";
 import { RunsTable } from "@/features/runs";
 import { describeTrigger } from "@/features/triggers";
@@ -136,7 +136,7 @@ export function AssetLayout() {
             {status && (
               <span>
                 {status.partitioned
-                  ? `${status.partitions.materialized}/${status.partitions.total} partitions materialized`
+                  ? partitionCount(status.partitions)
                   : status.partitions.materialized || status.partitions.stale
                     ? "materialized"
                     : "not materialized"}

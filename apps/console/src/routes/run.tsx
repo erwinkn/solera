@@ -794,7 +794,7 @@ function ResultTab({ run, attempt }: { run: string; attempt: Attempt }) {
               <tr>
                 <th className="px-3 py-1.5 font-medium">Key</th>
                 <th className="px-3 py-1.5 font-medium">Outcome</th>
-                <th className="px-3 py-1.5 font-medium">Generation</th>
+                <th className="px-3 py-1.5 font-medium">Version</th>
                 <th className="px-3 py-1.5 font-medium">Error</th>
                 <th className="px-3 py-1.5 text-right font-medium">Time</th>
               </tr>

@@ -5,7 +5,7 @@ import { Activity, ArrowRight, Hand, KeyRound, Play, XCircle } from "lucide-reac
 import { q, useManifest, useProject } from "@/api/queries";
 import { cleanupStuck } from "@/api/read";
 import type { AssetStatus, Automation } from "@/api/types";
-import { partitionParts } from "@/features/graph";
+import { partitionCount, partitionParts } from "@/features/graph";
 import { RunButton } from "@/features/run-dialog";
 import { RunHistogram, RunsTable } from "@/features/runs";
 import { describeTrigger } from "@/features/triggers";
@@ -377,7 +377,8 @@ function AttentionAssets({ status }: { status: Record<string, AssetStatus> | und
                   <span className="flex flex-col gap-1">
                     <SegmentBar parts={partitionParts(s.partitions)} />
                     <span className="text-2xs text-fg-subtle tabular">
-                      {s.partitions.materialized}/{s.partitions.total} partitions materialized
+                      {partitionCount(s.partitions)}
+                      {s.partitions.stale > 0 && ` · ${s.partitions.stale} stale`}
                     </span>
                   </span>
                 ) : (
