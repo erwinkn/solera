@@ -6,6 +6,7 @@ it along (§2)."""
 
 import asyncio
 import contextlib
+import inspect
 import random
 from collections import Counter
 from dataclasses import replace
@@ -239,8 +240,8 @@ async def test_merges_and_garbage(state):
     assert index.count == len(truth)
     assert len(index.spans) < 10 and index.spans[0].b > 0  # merged, into the base too
     head_commit = state.model.heads[("items", "")]["commit_number"]
-    position = state.model.position("mirror", "items", "")
-    assert position["next"] == head_commit + 1
+    rec = state.model.partition("mirror", "")["observed"]["items"]  # observed at the head
+    assert rec["base"]["endpoint"] == head_commit and state.model.oldest_observed("items", "") == head_commit
     read = state.model.cleanup_reads()  # kept for the cleanups still pending (docs/lifecycle.md §9.8)
     assert {path for path, _ in state.model.garbage} <= read
     assert on_disk(state, index) == {index.path(n) for n in index.referenced()} | read
@@ -589,8 +590,8 @@ async def test_every_index_writer_waits_while_merges_are_far_behind(state, tmp_p
 
 
 async def test_a_consumer_at_no_boundary_starts_over(state):
-    """§6: a position whose `next` the index keeps no boundary at — merged
-    away while nothing read from there — gets a full pass."""
+    """§6: an observation record whose head the index can no longer read Δ
+    from — merged away while nothing held it — gets a full run."""
 
     @asset(outputs=Output("items", key="id"))
     def items():
@@ -612,10 +613,9 @@ async def test_a_consumer_at_no_boundary_starts_over(state):
     await settle(engine)
     index = state.model.indexes[("items", "")]
     assert len(index.spans) == 1 and index.generation(1) is None  # merged: no boundary at commit 1
-    position = state.model.position("mirror", "items", "")
-    state.model.partition("mirror", "")["positions"]["items"] = {**position, "next": 1}
+    state.model.partition("mirror", "")["observed"]["items"]["base"]["endpoint"] = 0
     await run(engine, ["mirror"])
-    assert deliveries == [(True, ["a", "b"]), (True, ["a", "b"])]
+    assert deliveries == [(False, ["a", "b"]), (True, ["a", "b"])]
 
 
 async def test_keyed_source_commits_go_through_the_index(state):
@@ -726,20 +726,27 @@ async def test_renamed_asset_keeps_its_state(state):
     assert ("feed", "") not in m.heads and m.heads[("source_feed", "")]["ref"] == before["ref"]
     assert m.heads[("source_feed", "")]["asset"] == "source_feed"
     assert m.indexes[("source_feed", "")].prefix == "keys/feed/_/"  # files stay where they are
-    assert m.position("mirror", "feed", "")["output"] == "source_feed"
+    assert m.partition("mirror", "")["observed"]["feed"]["upstream"] == ["source_feed", ""]
     rows["v"] = Patch([{"id": "b", "v": 2}])
     await run(engine, ["mirror"], upstream=True)
     assert m.heads[("source_feed", "")]["commit_number"] == 1
-    assert delivered == [(True, ["a", "b"]), (False, ["b"])]  # only the change, not everything
+    assert delivered == [(False, ["a", "b"]), (False, ["b"])]  # only the change, not everything
     ref = Ref.from_json(m.heads[("source_feed", "")]["ref"])
     loaded = await project.stores["default"].load(ref, None, await whole(state, "source_feed"))
     assert {r["id"]: r["v"] for r in loaded} == {"a": 1, "b": 2}
 
 
-async def test_small_writes_resolve_in_the_engine_and_batches_come_with_start(state, monkeypatch):
-    """docs/resolved-commits.md §4, §7: once the engine's cache holds an index,
-    a small patch's delta comes from the engine — the worker reads no index
-    file — and a consumer's pending batch comes with its start reply."""
+def _planning() -> bool:
+    """Whether a read is the engine's own, planning a batch or its record:
+    a worker's would be anything else."""
+
+    return any(f.filename.endswith(("observing.py", "owed.py")) for f in inspect.stack())
+
+
+async def test_small_writes_resolve_in_the_engine_and_batches_come_in_the_spec(state, monkeypatch):
+    """docs/resolved-commits.md §4: once the engine's cache holds an index, a
+    small patch's delta comes from the engine — the worker reads no index
+    file — and a consumer's batch comes in its spec (docs/observed-set.md)."""
 
     from solera.keys.io import ObjectIO as IO
 
@@ -767,15 +774,6 @@ async def test_small_writes_resolve_in_the_engine_and_batches_come_with_start(st
         return out
 
     monkeypatch.setattr(KeyService, "resolve", resolve)
-    served, real_reads = [], KeyService.reads
-
-    async def reads_(self, spec, *args):
-        out = await real_reads(self, spec, *args)
-        if any("batch" in pin for pin in spec["inputs"].values()):  # a consumer's start
-            served.append(out is not None)
-        return out
-
-    monkeypatch.setattr(KeyService, "reads", reads_)
     engine = engine_for(state, Project(assets=[items, mirror]))
     await engine.initialize()
     await run(engine, ["mirror"], upstream=True)
@@ -785,7 +783,8 @@ async def test_small_writes_resolve_in_the_engine_and_batches_come_with_start(st
         real_read = IO.read
 
         async def read(self, path, start, end, size, real_read=real_read):
-            reads.append(path)
+            if not _planning():
+                reads.append(path)
             return await real_read(self, path, start, end, size)
 
         monkeypatch.setattr(IO, "read", read)
@@ -796,16 +795,14 @@ async def test_small_writes_resolve_in_the_engine_and_batches_come_with_start(st
         monkeypatch.setattr(IO, "read", real_read)
         assert seen == await _stored(engine, state)
     assert set(answers[-3:]) == {"delta"}  # warm: the engine answers
-    assert served[-3:] == [True] * 3  # and the consumer's batches come with its start
-    assert not [p for p in reads if p.endswith(".kx")]  # so nothing reads an index file
+    assert not [p for p in reads if p.endswith(".kx")]  # its batches come in its spec: no index read
     await engine.keys.stop()
 
 
 async def test_input_reads_come_from_the_engine_once_warm(state, monkeypatch):
-    """docs/resolved-commits.md §7: once the engine's cache holds an index, a
-    consumer's batches — a full pass, delta passes — come with its start
-    reply, and its worker reads no index file to find
-    them; what it delivers is what the store's batches would have."""
+    """A consumer's batches — a first run, later ones — come in its spec,
+    planned by the engine (docs/observed-set.md): its worker reads no index
+    file to find them, and what it delivers is what the store holds."""
 
     from solera.keys.io import ObjectIO as IO
 
@@ -827,15 +824,6 @@ async def test_input_reads_come_from_the_engine_once_warm(state, monkeypatch):
         fn.__name__ = name
         return asset(inputs={"items": Incremental(batch_size=100)})(fn)
 
-    served, real_reads = [], KeyService.reads
-
-    async def reads(self, spec, at):
-        out = await real_reads(self, spec, at)
-        if spec.get("inputs"):  # a cleanup task reads none
-            served.append(out is not None)
-        return out
-
-    monkeypatch.setattr(KeyService, "reads", reads)
     engine = engine_for(state, Project(assets=[items, consumer("mirror"), consumer("copy")]))
     await engine.initialize()
     await run(engine, ["mirror"], upstream=True)
@@ -846,7 +834,8 @@ async def test_input_reads_come_from_the_engine_once_warm(state, monkeypatch):
     index_reads, real_read = [], IO.read
 
     async def read(self, path, start, end, size):
-        index_reads.append(path)
+        if not _planning():
+            index_reads.append(path)
         return await real_read(self, path, start, end, size)
 
     for n in range(3):
@@ -854,14 +843,12 @@ async def test_input_reads_come_from_the_engine_once_warm(state, monkeypatch):
         await run(engine, ["items"])
         await warm()
         monkeypatch.setattr(IO, "read", read)
-        served.clear()
-        await run(engine, ["mirror"] if n < 2 else ["mirror", "copy"])  # copy: a full pass
+        await run(engine, ["mirror"] if n < 2 else ["mirror", "copy"])  # copy: its first run
         monkeypatch.setattr(IO, "read", real_read)
-        assert served and all(served)
         truth = await _stored(engine, state)
         assert seen["mirror"] == truth
     assert seen["copy"] == truth
-    assert not [p for p in index_reads if p.endswith(".kx")]  # every batch came with its start
+    assert not [p for p in index_reads if p.endswith(".kx")]  # every batch came in its spec
     await engine.keys.stop()
 
 

@@ -1,16 +1,16 @@
 """Reads at an endpoint, checked against the fold of their commits.
 
-A reader reads a key index at an endpoint: a position's `next`, a claim's
-pin, a full pass's snapshot. `page` and `lookup` read the state after commit
+A reader reads a key index at an endpoint: a commit an observation record
+was observed at, a batch's head. `page` and `lookup` read the state after commit
 `at - 1`; `changes_page` reads what commits `[first, last]` changed, and
 how. A read the index cannot serve at all (a merge dropped the endpoint) is
 wrong too, and so is the merge that dropped it: every endpoint a reader
 holds must still start a span or segment after a merge. Which endpoints
 readers hold comes from the events, not from the engine's own list
 (`Model.endpoints`), so that a reader that list misses is still checked:
-attempts in flight from their launches to their ends; positions from the
-model's records, their life (resets, renames, pattern changes) being the
-model's alone to fold. The index serves these from spans, which merges rewrite. A merge that
+attempts in flight from their launches to their ends; observation records
+from the model's, their life (resets, renames) being the model's alone to
+fold. The index serves these from spans, which merges rewrite. A merge that
 ignores an endpoint still reads well at the head, and only a reader at that
 endpoint sees the wrong state.
 
@@ -65,20 +65,14 @@ class Reads:
 
     @staticmethod
     def launched(model, e) -> None:
-        """An attempt's reads, from its launch: what each plan reads of its
-        upstream index, from where to where (`first`, `end`)."""
+        """An attempt's reads, from its launch: the head each keyed batch
+        classes its keys at, read from endpoint head + 1."""
 
         held = model.__dict__.setdefault("_sim_claims", {})
         out = []
         for plan in ((e.get("prepared") or {}).get("plans") or {}).values():
-            if not plan or plan.get("kind") not in ("keys", "selection", "held") or plan.get("head") is None:
-                continue
-            position = plan.get("position")
-            if position is None:
-                continue
-            first = (plan.get("pass") or {}).get("from")
-            first = int(position["next"]) if first is None else int(first)
-            out.append(((position["output"], position["upstream_partition"]), first, int(plan["head"]) + 1))
+            if plan and plan.get("kind") == "observed":
+                out.append(((plan["output"], plan["upstream_partition"]), int(plan["head"]) + 1))
         held[e["attempt"]] = (e["run"], out)
 
     @staticmethod
@@ -93,24 +87,21 @@ class Reads:
     @staticmethod
     def holders(model, key) -> set[int]:
         """The endpoints of `key`'s index readers hold: attempts in flight,
-        from their launches (not the engine's claims), and positions, from the
-        model's records (a position's life — resets, renames, pattern changes —
-        is the model's own to fold)."""
+        from their launches (not the engine's claims), and observation
+        records, from the model's (a record's life is the model's own to
+        fold): each layer's commit, read from endpoint commit + 1."""
 
         out: set[int] = set()
         for _, reads in model.__dict__.get("_sim_claims", {}).values():
-            out.update(x for k, first, end in reads if k == key for x in (first, end))
-        for position in model.positions():
-            if (position["output"], position["upstream_partition"]) != key:
-                continue
-            out.add(int(position["next"]))
-            d = position.get("pass") or {}
-            if d.get("from") is not None:
-                out.add(int(d["from"]))
-            if d.get("to") is not None:
-                out.add(int(d["to"]) + 1)
-            if position.get("pattern_change") is not None:
-                out.add(int(position["pattern_change"]["at"]) + 1)
+            out.update(end for k, end in reads if k == key)
+        state = model.indexes.get(key)
+        for record in model.partitions.values():
+            for rec in (record.get("observed") or {}).values():
+                if tuple(rec["upstream"]) != key or state is None:
+                    continue
+                for layer in [rec["base"], *rec["ranges"]]:
+                    if layer["endpoint"] is not None and layer["life"] == state.life:
+                        out.add(int(layer["endpoint"]) + 1)
         return out
 
     def kept(self, key, before, after, endpoints) -> None:

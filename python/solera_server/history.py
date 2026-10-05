@@ -105,6 +105,7 @@ TABLES = {
             "retry_delay": "DOUBLE",  # seconds; no retry policy if null
             "retry_backoff": "VARCHAR",
             "executor": "VARCHAR",  # where its last attempt ran
+            "progress": "VARCHAR",  # its walk's last committed batch, `{batch, key}` (JSON)
         },
     ),
     "attempts": Table(
@@ -140,6 +141,7 @@ TABLES = {
             "outputs": "VARCHAR[]",  # the outputs it committed, at its generation
             "generation": "BIGINT",  # the one its writes carried (lifecycle.md §9.7)
             "keys": "MAP(VARCHAR, BIGINT)",  # a per-key attempt's keys by outcome: ok, failed…
+            "batch": "VARCHAR",  # a keyed attempt's batch (`batch`, JSON)
         },
     ),
     "commits": Table(
@@ -276,6 +278,34 @@ def span(attempt: dict) -> float:
     return max(0.0, end - start) if start is not None and end is not None else 0.0
 
 
+def batch(plans: dict | None) -> dict | None:
+    """A keyed attempt's batch, as the history shows it: its keyed input's
+    (the first by name) index in its run, the batches the run planned (an
+    estimate), the key it starts after and its last, and its classes,
+    counted."""
+
+    for _, p in sorted((plans or {}).items()):
+        if p and p["kind"] == "observed" and not p.get("done"):
+            classes = {c: p["classes"].get(c, 0) for c in ("added", "updated", "removed", "unchanged")}
+            return {
+                "index": p["index"],
+                "count": p["count"],
+                "after": p["after"],
+                "last": p["end"],
+                **classes,
+            }
+    return None
+
+
+def progress(task: dict) -> dict | None:
+    """A task's progress, as the history shows it: its keyed input's (the
+    first by name) last committed batch, `{batch, key}` — `key` None once
+    the walk is final — or None before its first commit."""
+
+    walks = task.get("progress") or {}
+    return walks[min(walks)] if walks else None
+
+
 def attempt_row(run_id: str, task: dict, summary: dict, n: int) -> dict:
     """An ended attempt's `attempts` row, written as it ends: a task in
     progress keeps only aggregates of the attempts behind it."""
@@ -298,6 +328,7 @@ def attempt_row(run_id: str, task: dict, summary: dict, n: int) -> dict:
         "outputs": summary.get("outputs") or [],
         "generation": summary.get("generation"),
         "keys": summary.get("keys") or {},
+        "batch": _json(summary.get("batch")),
     }
 
 
@@ -313,6 +344,8 @@ def attempt_summary(row: dict) -> dict:
         attempt["outputs"] = list(row["outputs"])
     if row.get("keys"):
         attempt["keys"] = dict(row["keys"])
+    if row.get("batch"):
+        attempt["batch"] = json.loads(row["batch"])
     return attempt
 
 
@@ -354,6 +387,7 @@ def task_rows(run: dict) -> list[dict]:
                 "retry_delay": retry.get("delay"),
                 "retry_backoff": retry.get("backoff"),
                 "executor": launched["executor"] if launched else task.get("executor"),
+                "progress": _json(progress(task)),
             }
         )
     return rows
@@ -434,6 +468,8 @@ def run_record(rows: dict[str, list[dict]], events: int = 0) -> dict:
             if t["retry_delay"] is None
             else {"n": t["max_attempts"] - 1, "delay": t["retry_delay"], "backoff": t["retry_backoff"]},
             "wait": t["wait"],
+            # By input in a live task; the history keeps the summary alone.
+            "progress": {"": json.loads(t["progress"])} if t.get("progress") else None,
         }
     partitions = row["partitions"]
     return {

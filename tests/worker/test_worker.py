@@ -70,7 +70,8 @@ project = Project(assets=[feed, consumer])
     assert (await state.attempt_spec(detail["request"]["id"], attempt))["asset"] == "consumer"
     result = await state.attempt_result(detail["request"]["id"], attempt)
     assert result["status"] == "succeeded" and result["write"] == "complete"
-    assert result["delivered"]["feed"] == {"after": None, "upserted": ["a", "b"], "deleted": []}
+    generation = head["ref"]["generation"]  # each key's version: the generation that wrote it
+    assert result["delivered"]["feed"] == {"observed": {"a": generation, "b": generation}}
     assert result["log"]["lines"] == 1 and result["log"]["chunks"] == [] and result["log"]["tail"]
     log = await state.attempt_log(detail["request"]["id"], attempt)
     assert json.loads(log.splitlines()[0])["message"] == "consumed"

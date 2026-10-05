@@ -941,7 +941,7 @@ async def test_a_corrupt_copy_recovers_through_start_reads(io, tmp_path):
     from solera_server.keyservice import KeyService
 
     state = await built_index(io, commits=1)
-    spec = {"inputs": {"x": {"index": state.to_json(), "batch": {"full": True, "after": None, "limit": 50}}}}
+    spec = {"inputs": {"x": {"index": state.to_json(), "load": "data"}}}  # a whole read
     service = KeyService(io.store, str(tmp_path))
     service.start()
     try:
@@ -1061,25 +1061,6 @@ print((peak() - before) // 1024)
     out = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, check=True)
     grown_mib = int(out.stdout)
     assert grown_mib < 16, grown_mib
-
-
-async def test_a_page_reads_one_entry_past_itself(io, tmp_path):
-    """Round 4: a full page asks for what it lacks and one more, so its
-    record holds the page and the one entry that says another follows —
-    not a second page."""
-
-    from solera.keys.reads import Reads
-    from solera_worker import each
-
-    state = await built_index(io, commits=1)
-    cache = EngineCache(str(tmp_path))
-    assert await cache.fill(io, state)
-    with cache.open_present(state) as opened:
-        reads = Reads(recording=True, max_entries=10**6, max_bytes=2**24)
-        spec_pin = {"index": state.to_json(), "batch": {"full": True, "after": None, "limit": 100}}
-        read = await each.read_batch(spec_pin, ObjectIO(None, local=opened.handles, served=reads))
-    assert len(read.upserted) == 100 and read.after is not None
-    assert reads.entries == 101
 
 
 async def test_a_fan_in_whole_read_is_read_ahead_member_by_member(io, tmp_path):
@@ -1249,9 +1230,7 @@ async def test_start_reads_are_admitted_and_hold_their_room(io, tmp_path, monkey
     service.start()
     try:
         assert await asyncio.wrap_future(service._submit(service.cache.fill(service.io, state)))
-        spec = {
-            "inputs": {"x": {"index": state.to_json(), "batch": {"full": True, "after": None, "limit": 50}}}
-        }
+        spec = {"inputs": {"x": {"index": state.to_json(), "load": "data"}}}  # a whole read
         outs = await asyncio.gather(*(service.reads(spec, 0) for _ in range(16)))
         assert outs == [None] * 16  # timed out, or turned away
         resolver = service.resolver

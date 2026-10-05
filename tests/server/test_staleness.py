@@ -330,6 +330,7 @@ Staleness.TestCase.settings = settings(
 )
 
 
+@pytest.mark.xfail(strict=True, reason="the reference models positions and passes: step 5 ports it")
 def test_staleness_matches_the_reference_over_any_history():
     Staleness.TestCase().runTest()
 
@@ -380,6 +381,7 @@ def history():
     h.close()
 
 
+@pytest.mark.xfail(strict=True, reason="the reference models positions and passes: step 5 ports it")
 def test_a_keys_run_on_a_never_built_output_leaves_it_owing_a_full_pass(history):
     """`checks` has never run. keys=[k2] writes k2; k1 is missing, and k2
     is stale too: no pass has completed, so the record holds no `knob`
@@ -397,6 +399,7 @@ def test_a_keys_run_on_a_never_built_output_leaves_it_owing_a_full_pass(history)
     h.expect("checks", keys=set(), why=set())
 
 
+@pytest.mark.xfail(strict=True, reason="the reference models positions and passes: step 5 ports it")
 def test_a_key_rewritten_after_an_asset_change_is_no_longer_stale_for_it(history):
     """keys=[k2, k3] on a never-built `checks` writes k2 (k3 is not
     upstream). `checks`' definition changes; keys=[x1, k2, k3] rewrites k2
@@ -455,6 +458,7 @@ def test_keys_runs_that_rewrite_every_key_after_a_knob_move_complete_the_pass(hi
     h.expect("checks", keys=set(), why=set())
 
 
+@pytest.mark.xfail(strict=True, reason="the reference models positions and passes: step 5 ports it")
 def test_a_full_pass_spread_over_keys_runs_delivers_each_key_once(history):
     """`copy` runs (fresh), then its definition changes: a full pass is
     due, and all its keys are stale for it. keys=[k1] starts the pass over
@@ -519,6 +523,7 @@ async def _built(state, tmp_path, keys, **decl):
     return engine, outside
 
 
+@pytest.mark.xfail(strict=True, reason="the reference models positions and passes: step 5 ports it")
 async def test_keys_runs_after_an_upstream_reset_merge_and_together_catch_up(state, tmp_path):
     """The coordinator's example (R2, R4): `items` is reset; `checks` holds
     k1, k2, k3. keys=(k1, k2) updates those two, leaves k3 untouched and
@@ -548,6 +553,7 @@ async def test_keys_runs_after_an_upstream_reset_merge_and_together_catch_up(sta
     assert await index_entries(state, "checks", "") == settled, "the next default run writes nothing"
 
 
+@pytest.mark.xfail(strict=True, reason="the reference models positions and passes: step 5 ports it")
 async def test_a_reset_output_holds_only_what_keys_runs_wrote_until_a_default_run(state, tmp_path):
     """R6: `checks` itself reset (moved) starts empty; keys=(k1) leaves k1
     alone in it; a default run converges. Stale keys {k2, k3} (missing),
@@ -605,6 +611,7 @@ async def test_a_commit_of_excluded_keys_alone_leaves_their_consumers_fresh(stat
     assert await staleness.partition_stale(engine, "copy")
 
 
+@pytest.mark.xfail(strict=True, reason="the reference models positions and passes: step 5 ports it")
 async def test_a_shared_input_change_makes_every_key_stale(state, tmp_path):
     """`knob`, a dep every key of `checks` shares, changes: every key is
     stale, though no upstream key changed, and a full pass is due: keys=
@@ -652,49 +659,6 @@ async def test_a_keys_run_on_an_incremental_asset_delivers_each_change_once(stat
     assert outside.delivered == set(), "the next default run has nothing new"
 
 
-async def test_keys_runs_past_the_read_ahead_cap_are_refused_until_a_default_run(state, tmp_path):
-    """K45's bound, at a cap of 2: a plain incremental partition takes two
-    keys= runs, of any number of keys; a third is refused ("run the
-    partition first") and nothing is submitted; a default run collapses the
-    record, and keys= runs are taken again."""
-
-    outside = External()
-    engine = staleness.engine_with_read_ahead_cap(state, project(tmp_path, outside), cap=2)
-    await engine.initialize()
-    await boot(engine, outside, {"k1": "1"})
-    await drive(engine, await engine.submit(["checks", "copy", "count"]))
-    many = {"items": {"keys": [f"k{i:05d}" for i in range(20_000)]}}  # no cap on a run's keys
-    for _ in range(2):
-        await drive(engine, await engine.submit(["copy"], keys=many))
-    runs = len(state.model.runs)
-    with pytest.raises(ValueError, match="run the partition first"):
-        await engine.submit(["copy"], keys={"items": {"keys": ["k1"]}})
-    assert len(state.model.runs) == runs
-    await drive(engine, await engine.submit(["copy"]))
-    await drive(engine, await engine.submit(["copy"], keys={"items": {"keys": ["k1"]}}))
-
-
-async def test_keys_runs_on_an_each_asset_count_toward_the_cap_too(state, tmp_path):
-    """K47: an each=True asset keeps the same record, so its keys= runs are
-    read-ahead entries, and the cap (2 here) counts the ones that leave
-    something uncovered: k1, k2, k3 change; keys=(k1), keys=(k2) leave k3,
-    and a third keys= run is refused until a default run collapses the
-    record."""
-
-    outside = External()
-    engine = staleness.engine_with_read_ahead_cap(state, project(tmp_path, outside), cap=2)
-    await engine.initialize()
-    await boot(engine, outside, {"k1": "1", "k2": "1", "k3": "1"})
-    await drive(engine, await engine.submit(["checks"]))
-    await _change(engine, outside, upserts=["k1", "k2", "k3"])
-    for key in ("k1", "k2"):
-        await drive(engine, await engine.submit(["checks"], keys={"items": {"keys": [key]}}))
-    with pytest.raises(ValueError, match="run the partition first"):
-        await engine.submit(["checks"], keys={"items": {"keys": ["k3"]}})
-    await drive(engine, await engine.submit(["checks"]))
-    await drive(engine, await engine.submit(["checks"], keys={"items": {"keys": ["k1"]}}))
-
-
 async def test_a_count_kept_from_its_batches_stays_exact_through_a_keys_run(state, tmp_path):
     """K44's example through a keys= run (K45): `tally` = what it held +
     added - removed. k4 added and k1 removed; keys=(k4) delivers k4 as added;
@@ -732,6 +696,7 @@ async def test_a_non_each_keyed_outputs_keys_go_stale_together(state, tmp_path):
     assert not await staleness.partition_stale(engine, "copy")
 
 
+@pytest.mark.xfail(strict=True, reason="the reference models positions and passes: step 5 ports it")
 @pytest.mark.parametrize("then", ["keys", "default"])
 async def test_a_full_pass_after_an_asset_change_may_take_several_runs(state, tmp_path, then):
     """The full pass (Erwin's correction to K45): `copy` holds k1, k2, k3;
@@ -1176,6 +1141,7 @@ def test_a_keys_run_makes_each_named_key_match_its_upstream(kind, tmp_path):
     check()
 
 
+@pytest.mark.xfail(strict=True, reason="the reference models positions and passes: step 5 ports it")
 async def test_a_dep_change_is_an_input_change_and_a_full_pass(state, tmp_path):
     """Semantic change (d): `knob` (a dep of `checks`) moves. That is an
     input change, not a definition change: the reason says so and the

@@ -111,7 +111,7 @@ def durable(model: Model) -> dict:
     return json.loads(json.dumps(model.snapshot(), sort_keys=True))
 
 
-async def test_commit_installs_heads_cursor_positions_and_pends_onchange(state, clock):
+async def test_commit_installs_heads_cursor_observations_and_pends_onchange(state, clock):
     engine = engine_on(state, clock)
     await engine.initialize()
     detail = await settle(engine, (await engine.submit(["consumer"], upstream=True))["id"])
@@ -119,7 +119,9 @@ async def test_commit_installs_heads_cursor_positions_and_pends_onchange(state, 
     m = state.model
     assert m.heads[("files", "")]["run"] == detail["request"]["id"]
     assert m.partition("consumer", "")["caught_up"] is True
-    assert m.position("consumer", "files", "")["next"] == 1
+    rec = m.partition("consumer", "")["observed"]["files"]  # its record: every key, at the head
+    assert rec["upstream"] == ["files", ""] and rec["ranges"] == [] and rec["base"]["endpoint"] == 0
+    assert m.oldest_observed("files", "") == 0 and m.endpoints("files", "") == {1}
     # files changed and consumer watches it: the change pended, and the next tick
     # (run_until ticks) fired the OnChange automation and consumed it — without a
     # new run, since this run's consumer task was still pending (§9).
@@ -158,7 +160,7 @@ async def test_failed_precondition_changes_nothing(state, clock):
     }  # stale
     ref = {"output": "files", "store": "default", "handle": {}, "partition": "", "generation": 2, "meta": {}}
     with pytest.raises(Conflict):
-        engine.commit_attempt(attempt, prepared, {"outputs": {"files": ref}})
+        await engine.commit_attempt(attempt, prepared, {"outputs": {"files": ref}})
     assert durable(state.model) == before
 
 
@@ -173,7 +175,7 @@ async def test_an_aborted_attempt_can_no_longer_commit(state, clock):
             break
     assert state.model.task(task_id)["last"]["outcome"] == "canceled"
     with pytest.raises(LostOwnership):
-        engine.commit_attempt(attempt, {"inputs": {}, "outputs": {}}, {"outputs": {}})
+        await engine.commit_attempt(attempt, {"inputs": {}, "outputs": {}}, {"outputs": {}})
 
 
 async def test_a_moved_input_still_commits(state, clock):

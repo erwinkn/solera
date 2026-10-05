@@ -116,15 +116,6 @@ async def asset_stale(engine, asset: str) -> bool:
     return bool((await engine.asset_statuses())[asset]["stale"])
 
 
-def engine_with_read_ahead_cap(state, project, cap: int):
-    """An engine whose partitions take at most `cap` keys= runs between two
-    default runs."""
-
-    from tests.server.engines import make_engine
-
-    return make_engine(state, project, read_ahead_cap=cap)
-
-
 # -- the reference -------------------------------------------------------------------
 
 INPUT, UPSTREAM, DEFINITION = "input changed", "upstream stale", "definition changed"
@@ -556,8 +547,38 @@ class ObservedSets:
         return dict(self.sets.get((consumer, partition, param), {}))
 
 
-def decoded(engine, consumer: str, partition: str, param: str) -> dict[str, tuple]:
+async def decoded(engine, consumer: str, partition: str, param: str) -> dict[str, tuple]:
     """The engine's decode of a keyed input's observation record, as the
     reference keeps it: key -> (version, context), present keys only."""
 
-    return {k: (o.version, dict(o.context)) for k, o in engine.observed(consumer, partition, param).items()}
+    found = await engine.observed(consumer, partition, param)
+    return {k: (o.version, dict(o.context)) for k, o in found.items()}
+
+
+async def head_versions(engine, output: str, partition: str = "") -> dict:
+    """Every key of an output at its head, at its version: a source's word, else its generation."""
+
+    from solera.keys.delta import delta, version_of
+
+    index, _ = engine._upstream(output, partition)
+    out, after = {}, None
+    while True:
+        page = await delta(index, None, None, after=after)
+        out |= {d.key: version_of(d.generation, d.payload) for d in page.diffs}
+        if page.cursor is None:
+            return out
+        after = page.cursor
+
+
+def agree(decoded: dict, literal: dict, head: dict) -> bool:
+    """Whether a decode is the literal observed set as the index can know it
+    (docs/observed-set.md, "What the index can say"): the same keys under
+    the same contexts, each at its literal version — or at None, a version
+    since replaced, where the literal one is not the head's."""
+
+    if decoded.keys() != literal.keys():
+        return False
+    return all(
+        d[1] == literal[k][1] and (d[0] == literal[k][0] or (d[0] is None and literal[k][0] != head.get(k)))
+        for k, d in decoded.items()
+    )

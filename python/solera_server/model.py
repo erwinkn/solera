@@ -31,11 +31,12 @@ import copy
 import dataclasses
 import math
 
+from solera.keys.delta import reserved
 from solera.keys.index import DeltaFiles, IndexState, Span, index_prefix
 
-from . import history
+from . import history, observed
 from .lake import LakeState
-from .positions import pins, reads
+from .positions import reads
 
 TERMINAL_TASK = frozenset({"succeeded", "skipped", "failed", "blocked", "canceled"})
 TERMINAL_RUN = frozenset({"succeeded", "failed", "canceled"})
@@ -337,30 +338,36 @@ class Model:
             return found
         return IndexState(prefix=index_prefix(output, partition), life=str(self.event_counter))
 
-    def endpoints(self, output: str, partition: str) -> set[int]:
-        """The commits of an index that readers start from or land at, which
-        its merges keep (docs/key-index-design.md § Endpoints): every
-        position's `next`, a pass's `from` and its `to + 1`, a pattern change's
-        split + 1, and what attempts in flight read, `first` and `end`."""
+    def observed_commits(self, output: str, partition: str) -> list[int]:
+        """The commits of an upstream index its readers hold: every commit its
+        consumers' observation records were observed at — their bases' and
+        ranges' heads, in its current life — and the head each batch in
+        flight classed its keys at."""
 
-        out: set[int] = set()
-        for position in self.positions():
-            if (position["output"], position["upstream_partition"]) != (output, partition):
-                continue
-            out.add(int(position["next"]))
-            d = position.get("pass")
-            if d is not None:
-                if d.get("from") is not None:
-                    out.add(int(d["from"]))
-                if d.get("to") is not None:
-                    out.add(int(d["to"]) + 1)
-            if position.get("pattern_change") is not None:
-                out.add(int(position["pattern_change"]["at"]) + 1)
+        state = self.indexes.get((output, partition))
+        life = state.life if state is not None else ""
+        commits = []
+        for record in self.partitions.values():
+            for rec in (record.get("observed") or {}).values():
+                if rec.get("upstream") == [output, partition] and observed.lives(rec) == {life}:
+                    commits += [layer["endpoint"] for layer in [rec["base"], *rec["ranges"]]]
         for claim in self.claims.values():
-            for read in claim.get("reads") or ():
-                if (read[0], read[1]) == (output, partition):
-                    out.update(int(x) for x in read[2:])
-        return out
+            commits += [
+                read[2] for read in claim.get("reads") or () if (read[0], read[1]) == (output, partition)
+            ]
+        return [int(c) for c in commits if c is not None]
+
+    def endpoints(self, output: str, partition: str) -> set[int]:
+        """The endpoints of an index its merges keep (docs/key-index-design.md
+        § Endpoints): where reads at the commits its readers hold start."""
+
+        return reserved(self.observed_commits(output, partition))
+
+    def oldest_observed(self, output: str, partition: str) -> int | None:
+        """The oldest commit of an upstream index any reader holds (None:
+        none): the index's cut never passes it (A31 R3)."""
+
+        return min(self.observed_commits(output, partition), default=None)
 
     def heads_of(self, output: str) -> list[tuple[str, dict]]:
         return sorted(self.heads.of(output).items())
@@ -450,9 +457,6 @@ class Model:
             for c in self.claims.values()
             if c["attempt"] != but and "generation" in c
         ]
-        for position in self.positions():
-            upstream = (self.index(position["output"], position["upstream_partition"]).prefix,)
-            out += [(pin, upstream) for pin in pins(position)]
         for tick in self.ticks.values():
             out.append(
                 (tick["pin"], tuple(self.index(source, "").prefix for source in tick.get("snapshot") or ()))
@@ -739,17 +743,18 @@ class Model:
         live = {(t["asset"], t["partition"]) for tid in self.claims if (t := self.task(tid)) is not None}
         keys = list(self.partitions) if asset is None else [(asset, partition)]
         for key in keys:
-            positions = self.partitions.get(key, {}).get("positions")
-            if not positions or key in live:
+            if key in live or key not in self.partitions:
                 continue
-            for input in [
-                input
-                for input, position in positions.items()
-                if not self._subscribed(key[0], input, position)
-            ]:
-                del positions[input]
-            if not positions:
-                del self.partitions[key]["positions"]
+            for field in ("positions", "observed"):
+                held = self.partitions[key].get(field)
+                if not held:
+                    continue
+                for input in [
+                    i for i, kept in held.items() if not self._subscribed(key[0], i, _upstream(kept))
+                ]:
+                    del held[input]
+                if not held:
+                    del self.partitions[key][field]
 
     def _retire_output(self, output: str, home: str, old: dict, store: dict, at: float) -> None:
         """Record an output life's leftovers for a cleanup task (K25): the
@@ -830,8 +835,14 @@ class Model:
                 del self.partitions[key]
                 continue
             if key[0] in producers:  # a new life: never built, so missing, not stale
-                for field in ("caught_up", "caught_up_at", "built_at", "seen"):
+                for field in ("caught_up", "caught_up_at", "built_at", "seen", "observed", "definition"):
                     self.partitions[key].pop(field, None)
+            # A keyed input's record stays: its layers name the upstream's earlier life,
+            # and its next run is a full run.
+            records = self.partitions[key].get("observed") or {}
+            if key[0] not in producers and any(rec["upstream"][0] in reset for rec in records.values()):
+                self.partitions[key]["input_reset_at"] = self.event_counter
+                self._drop_failures(*key)  # failed against keys that are no longer the input's (K47)
             positions = self.partitions[key].get("positions")
             if not positions:
                 continue
@@ -897,6 +908,9 @@ class Model:
         for position in self.positions():
             if position.get("output") in output_map:
                 position["output"] = output_map[position["output"]]
+        for record in self.partitions.values():
+            for rec in (record.get("observed") or {}).values():
+                rec["upstream"][0] = output_map.get(rec["upstream"][0], rec["upstream"][0])
         for auto in self.automations.values():
             auto["pending"] = [[asset_map.get(a, a), s] for a, s in auto.get("pending") or []]
         return renamed, output_map
@@ -1068,6 +1082,8 @@ class Model:
             summary["outputs"] = sorted(commit.get("heads", {}))
         if e.get("keys"):
             summary["keys"] = e["keys"]
+        if found := history.batch(prepared.get("plans")):
+            summary["batch"] = found
         self._tried(run, task, summary)
         if commit and outcome in ("canceled", "failed"):
             # A drained Each batch: what finished commits (docs/lifecycle.md §7).
@@ -1087,8 +1103,11 @@ class Model:
                 self._finished(run, task, "succeeded", e["attempt"], at)
         elif outcome == "skipped":
             self._install(task, commit or {}, e, prepared)
-            task["status"] = "skipped"
-            self._finished(run, task, "skipped", e["attempt"], at)
+            if e.get("more"):  # a batch with nothing to load, its walk not done
+                self._ready(run, task, at)
+            else:
+                task["status"] = "skipped"
+                self._finished(run, task, "skipped", e["attempt"], at)
         elif outcome == "failed":
             failures = task["outcomes"].get("failed", 0)
             allowed = task["max_attempts"]
@@ -1208,14 +1227,16 @@ class Model:
         for input, position in commit.get("positions", {}).items():
             if self._subscribed(asset, input, position):  # an input removed while it ran keeps no pass
                 record.setdefault("positions", {})[input] = position
-        for output, at in (commit.get("selected") or {}).items():  # a paged keys= selection's place
-            places = task.setdefault("selected", {})
-            if at is None:
-                places.pop(output, None)
-            else:
-                places[output] = at
-            if not places:
-                del task["selected"]
+        for input, ops in (commit.get("observed") or {}).items():
+            records = record.setdefault("observed", {})
+            rec = records.setdefault(input, {})  # a new one's operations begin with its reset
+            observed.apply(rec, ops)
+            if not self._subscribed(asset, input, _upstream(rec)):  # an input removed while it ran
+                del records[input]
+        if "definition" in commit:  # what its observations were made under
+            record["definition"] = commit["definition"]
+        for input, progress in (commit.get("progress") or {}).items():  # the run's walk (D155)
+            task.setdefault("progress", {})[input] = progress
         if "failures" in commit:
             self._failures(asset, partition, commit["failures"])
         for row in commit.get("key_outcomes") or ():
@@ -1784,3 +1805,9 @@ def declaration(manifest: dict, asset: str, homes: dict | None = None) -> dict:
         "deps_all_partitions": sorted(homes.get(d, d) for d in entry.get("deps_all_partitions") or ()),
         "outputs": written,
     }
+
+
+def _upstream(kept: dict) -> dict:
+    """What an input's position or observation record reads: `{"output"}`."""
+
+    return {"output": kept["upstream"][0]} if "upstream" in kept else kept

@@ -315,6 +315,15 @@ must know exactly which version it got, so every load of a keyed source
 reports, per key, the version it served — and a key it leaves out was
 observed absent.
 
+The batch is classed from what was served, before the producer is called
+(docs/observed-set.md, "Observations"): a key served absent is removed if
+the consumer held it, else nothing; one served at the version it already
+holds is unchanged; any other is added or updated. A served version is
+compared with the commit's: the version `commit_source` or `observe()`
+gave the key. A commit that named keys without versions (a list, not a
+map) gives none to compare with — the index then versions each key by
+its generation — and what was served says only whether the key is there.
+
 **Through a function.** `@source` makes a source whose loader is your
 function, called with the keys a batch reads (None for an unkeyed source)
 and a `ctx` naming the source and partition:

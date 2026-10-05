@@ -226,8 +226,8 @@ def test_demo_end_to_end(demo, pool_worker):
             result = client.get(f"{base}/runs/{delta}/attempts/{attempt['id']}/result").json()
             page = result["delivered"]["site_files"]
             seen = delivered.setdefault(task["partition"], [set(), set()])
-            seen[0] |= set(page["upserted"])
-            seen[1] |= set(page["deleted"])
+            seen[0] |= {k for k, version in page["observed"].items() if version is not None}
+            seen[1] |= {k for k, version in page["observed"].items() if version is None}
     assert delivered, "file_index should have run on the new tick"
     for partition, (upserted, deleted) in delivered.items():
         assert upserted <= current_keys[partition]

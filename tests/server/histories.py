@@ -11,13 +11,14 @@ output says — each key it holds, at the upstream version it was given."""
 
 from __future__ import annotations
 
+from solera.failed_keys import Record
 from solera.sdk import In, Incremental, Loaded, Output, Project, Source, asset, source
 from solera.stores import FileStore
 from solera_server.state import State
 
-from tests.sim.oracle import keyed_content, value_content
+from tests.sim.oracle import index_entries, keyed_content, value_content
 from tests.sim.project import External, SourceStore, rebuild
-from tests.staleness import ObservedSets, decoded
+from tests.staleness import ObservedSets, agree, decoded, head_versions
 
 from .engines import drive, make_engine
 
@@ -120,14 +121,25 @@ class World:
         return detail
 
     async def verify(self) -> None:
-        """The engine's decode of every observation record is the literal observed set."""
+        """The engine's decode of every observation record is the literal
+        observed set, as the index can know it (`agree`)."""
 
-        assert decoded(self.engine, "items", "", "feed") == self.observed.of("items", "", "feed")
-        assert decoded(self.engine, "tally", "", "items") == self.observed.of("tally", "", "items")
+        feed, items = await head_versions(self.engine, "feed"), await head_versions(self.engine, "items")
+        for consumer, param, head in (("items", "feed", feed), ("tally", "items", items)):
+            found, literal = (
+                await decoded(self.engine, consumer, "", param),
+                self.observed.of(consumer, "", param),
+            )
+            assert agree(found, literal, head), (consumer, found, literal)
         generations = await keyed_content(self.engine, self.p, "checks", column="g")
         factors = await keyed_content(self.engine, self.p, "checks", column="factor")
-        want = {k: (g, {"factor": factors[k]}) for k, g in generations.items()}
-        assert decoded(self.engine, "checks", "", "row") == want
+        want = {k: (int(g), {"factor": factors[k]}) for k, g in generations.items()}
+        found = await decoded(self.engine, "checks", "", "row")
+        # A failed key is observed too, at the generation it failed at (A19 R8): its
+        # failure record says which; the context, its batch's.
+        for k, (_, payload) in (await index_entries(self.engine.state, "@checks", "")).items():
+            want[k] = (Record.decode(payload).upstream, found.get(k, (None, None))[1])
+        assert agree(found, want, items), ("checks", found, want)
 
     async def count(self) -> int:
         return (await value_content(self.engine, self.p, "tally"))["rows"]

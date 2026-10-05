@@ -279,8 +279,8 @@ def test_an_explicit_selection_is_linear():
 
 async def test_a_removed_consumer_lets_go_of_its_upstreams_log(state):
     """Review round 5, engine #3 and system #2: `gone` and `keep` read
-    `feed` incrementally. `gone` is removed: its position goes with it, so
-    merges of `feed`'s index keep only the boundaries `keep` reads from."""
+    `feed` incrementally. `gone` is removed: its observation record goes
+    with it, so merges of `feed`'s index keep only what `keep` reads from."""
 
     rows = [{"id": "a"}]
 
@@ -303,12 +303,12 @@ async def test_a_removed_consumer_lets_go_of_its_upstreams_log(state):
 
     engine = make_engine(state, Project(assets=[feed, keep]))
     await engine.initialize()
-    assert sorted(a for (a, _), r in state.model.partitions.items() if r.get("positions")) == ["keep"]
+    assert sorted(a for (a, _), r in state.model.partitions.items() if r.get("observed")) == ["keep"]
     for key in ("b", "c", "d"):
         rows.append({"id": key})
         await drive(engine, await engine.submit(["keep"], upstream=True))
     head = state.model.heads[("feed", "")]["commit_number"]
-    assert state.model.endpoints("feed", "") == {head + 1}  # `keep`'s next, and nothing of `gone`'s
+    assert state.model.endpoints("feed", "") == {head + 1}  # `keep`'s head, and nothing of `gone`'s
 
 
 # -- a rewrite × interpretation ----------------------------------------------------------
@@ -376,7 +376,7 @@ async def test_an_each_delivery_resumed_by_a_firing_takes_its_change(state):
     await engine.set_automation("out.onchange.0", False)
     await drive(engine, await engine.submit(["items"]))
     run = await engine.submit(["out"])
-    while (state.model.position("out", "item", "") or {}).get("pass", {}).get("batch") != 1:
+    while not any(t.get("progress") for t in state.model.runs[run["id"]]["tasks"].values()):
         await engine.tick()
         await asyncio.sleep(0.01)
     await engine.cancel(run["id"])

@@ -2,10 +2,7 @@
 xfail while its finding is open (docs/verification.md, "Findings"), an
 ordinary test once fixed."""
 
-import pytest
-
 from .machine import Simulation
-from .oracle import Violation
 from .world import Fate
 
 
@@ -969,14 +966,13 @@ def test_f41_a_consumer_that_read_a_removal_does_not_keep_the_key(monkeypatch):
     state.teardown()
 
 
-@pytest.mark.xfail(strict=True, raises=Violation, reason="F42: open")
 def test_f42_a_full_run_finishes_its_pass():
     """F42 (main's seed 5000, out of memory): two full runs of `copy`, with
-    a commit of `feed` between them. The first finishes its two-batch pass.
-    Every attempt of the second starts the pass over (batch 0, a new
-    `began`), delivers batch 1 of 2, and succeeds; the next one starts over
-    again. The task relaunches without end: thousands of attempts, a cleanup
-    run each, memory without bound."""
+    a commit of `feed` between them. Under positions, every attempt of the
+    second started the pass over (batch 0, a new `began`), delivered batch 1
+    of 2, and succeeded, and the task relaunched without end. Fixed by the
+    observed set (D153): a full run resets only on its task's first batch,
+    and its walk goes on from its progress."""
 
     state = Simulation()
     state.boot(seed=337, store="table", cache="starved")

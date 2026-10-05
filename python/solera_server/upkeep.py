@@ -362,9 +362,7 @@ class Upkeep:
         finite = {name: h for name, h in horizons.items() if h is not None}
         if default is not None:  # the engine's cleanup runs: no asset of the project's, so its default
             finite[CLEANUP] = default
-        # A run whose attempt a read-ahead names is kept: its spec and result say what it read (K45).
-        named = {entry[1] for position in self.m.positions() for entry in position.get("ahead", ())}
-        await self.delete_runs([r for r in await self.history.expired(finite, default) if r[0] not in named])
+        await self.delete_runs(await self.history.expired(finite, default))
 
     async def delete_runs(self, runs: list[tuple[str, str | None]]) -> None:
         """Delete finished runs, `(id, status)`. Retirement comes first and

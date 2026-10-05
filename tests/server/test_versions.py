@@ -12,15 +12,14 @@ from .engines import drive, make_engine, status_of
 from .remote import LiveStore
 
 
-async def test_a_delta_pass_over_batches_says_the_generation_it_read(state):
-    """Review finding 3: a delta pass delivered over batches reads the index
-    as of its start. The upstream writes `b` again (g3) after the pass's
-    first batch; its second batch reads `b` as of g2 — the object it was
-    pinned to — and lineage says g2, not the head's g3. The change then
-    arrives as a delta of its own, read at g3."""
+async def test_each_batch_says_the_generation_it_read(state):
+    """Review finding 3, under the observed set: each batch of a run reads at
+    its own head. The upstream writes `b` again (g3) during the run's first
+    batch; its second batch, planned after, reads `b` at g3 — once, never
+    at g2 — and lineage says what each batch read: g2, then g3."""
 
     content = {"rows": [{"id": "a", "v": 1}, {"id": "b", "v": 1}]}
-    seen, moved = [], {"done": False}
+    seen, moved = [], {"done": True}  # armed for the second run
 
     @asset(outputs=Output("items", key="id"))
     def items():
@@ -30,7 +29,7 @@ async def test_a_delta_pass_over_batches_says_the_generation_it_read(state):
     async def copy(ctx, items: list):
         changes = ctx.batch["items"]
         seen.append((changes.full, [(r["id"], r["v"]) for r in items]))
-        if not changes.full and changes.first and not moved["done"]:
+        if changes.first and not moved["done"]:
             moved["done"] = True  # the upstream moves while the pass is half delivered
             content["rows"] = [{"id": "b", "v": 3}]
             assert status_of(await drive(engine, await engine.submit(["items"]))) == "succeeded"
@@ -44,18 +43,19 @@ async def test_a_delta_pass_over_batches_says_the_generation_it_read(state):
     assert status_of(await drive(engine, await engine.submit(["items"]))) == "succeeded"
     g2 = state.model.heads[("items", "")]["ref"]["generation"]
     seen.clear()
+    moved["done"] = False
     assert status_of(await drive(engine, await engine.submit(["copy"]))) == "succeeded"
     g3 = state.model.heads[("items", "")]["ref"]["generation"]
     assert g3 > g2
-    assert seen == [(False, [("a", 2)]), (False, [("b", 2)]), (False, [("b", 3)])]
+    assert seen == [(False, [("a", 2)]), (False, [("b", 3)])]
 
     made = (await engine.history.commits(outputs=["copy"]))["commits"]
-    pages = sorted(m["generation"] for m in made)[-3:]  # the three batches of the second run
+    pages = sorted(m["generation"] for m in made)[-2:]  # the two batches of the second run
     read = []
     for generation in pages:
         [edge] = (await engine.history.lineage("copy", "", generation))["edges"]
         read.append(edge["from"]["generation"])
-    assert read == [g2, g2, g3]
+    assert read == [g2, g3]
     rows = await project.stores["default"].load(
         Ref.from_json(state.model.heads[("copy", "")]["ref"]), list[dict], await whole(state, "copy")
     )

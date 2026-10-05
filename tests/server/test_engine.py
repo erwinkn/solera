@@ -227,8 +227,8 @@ async def test_incremental_filters_input_and_changes(state):
 
 
 async def test_config_change_reprocesses_everything(state):
-    """§6/§2.2: run config is part of the fingerprint —
-    changing it forces full=True on the input and reprocesses every key."""
+    """§6/§2.2: run config is part of the definition — changing it makes
+    the next run a full run, which reprocesses every key."""
     seen = {}
 
     @asset(outputs=Output("files", key="id"))
@@ -247,12 +247,13 @@ async def test_config_change_reprocesses_everything(state):
     await drive(engine, await engine.submit(["consumer"], upstream=True))
     await drive(engine, await engine.submit(["consumer"], upstream=True, config={"threshold": 2}))
     assert seen["commits"] == [["a"], ["a"]]
-    assert seen["full"] == [True, True]  # first pass + fingerprint reset
+    assert seen["full"] == [False, True]  # a first run, then a full run: the definition changed
 
 
-async def test_full_run_resets_position(state):
-    """§2.2: a `full` run resets the input position — the consumer re-reads
-    the whole head (not a diff) and the position lands past the head commit."""
+async def test_a_full_run_starts_its_record_over(state):
+    """§2.2: a `full` run compares against an empty record — the consumer is
+    given the whole head again, its first batch starting the output over
+    (`full`) — and its commit leaves the record as a default run's would."""
     seen = []
 
     @asset(outputs=Output("files", key="id"))
@@ -268,27 +269,12 @@ async def test_full_run_resets_position(state):
     engine = make_engine(state, project)
     await engine.initialize()
     await drive(engine, await engine.submit(["consumer"], upstream=True))
-    first = state.model.position("consumer", "files", "")
-    assert first == {
-        "kind": "keys",
-        "next": 1,  # the head's next commit: nothing under way
-        "fingerprint": first["fingerprint"],
-        "output": "files",
-        "upstream_partition": "",
-        "reset_by": first["reset_by"],  # the run whose reset began the pass
-        "began": first["began"],  # when its last full pass began, kept after it ends
-    }
+    first = await engine.observed("consumer", "", "files")
+    assert sorted(first) == ["a", "b"]
     detail = await drive(engine, await engine.submit(["consumer"], mode="full"))
     assert task_statuses(detail)["consumer"] == "succeeded"  # never skipped on full
-    second = state.model.position("consumer", "files", "")
-    assert second == {
-        **first,
-        "reset_by": detail["request"]["id"],
-        "began": second["began"],
-    }  # back at head+1
-    assert second["began"] > first["began"], "the full run began a pass of its own"
-    # Both passes were full-head reads.
-    assert seen == [(["a", "b"], True), (["a", "b"], True)]
+    assert await engine.observed("consumer", "", "files") == first
+    assert seen == [(["a", "b"], False), (["a", "b"], True)]
 
 
 async def test_a_version_bump_starts_the_next_run_over(state):
@@ -344,10 +330,8 @@ async def test_incremental_batching_and_more(state):
 
 
 async def test_run_keys_override(state):
-    """§8: a `keys=` list is a selection that moves no pass; on a plain input
-    it is delivered only the named keys' changes past the position (K45), so
-    with nothing changed it is skipped. 'full' drains the folded key map as
-    a reset."""
+    """§8: a `keys=` list loads the keys it names — b, unchanged, observed
+    as it is; 'full' is a full run, every key again."""
     seen = []
 
     @asset(outputs=Output("files", key="id"))
@@ -365,57 +349,15 @@ async def test_run_keys_override(state):
     await drive(engine, await engine.submit(["consumer"], upstream=True))
     detail = await drive(engine, await engine.submit(["consumer"], keys={"files": {"keys": ["b"]}}))
     assert status_of(detail) == "succeeded", [t.get("error") for t in detail["tasks"]]
-    assert seen == [["a", "b"]]  # b did not change past the position: nothing to deliver
+    assert seen == [["a", "b"], ["b"]]
     await drive(engine, await engine.submit(["consumer"], keys={"files": "full"}))
     assert seen[-1] == ["a", "b"]
 
 
-async def test_a_selection_on_a_full_pass_due_starts_it_or_continues_it(state):
-    """Review round 5 (system #3, engine #2), under K45 and Erwin's
-    correction: on a consumer never run, a full pass is due, and keys=(b)
-    starts it over with b alone. A default run continues it, never
-    delivering b again, and stops half-way (after a); keys=(c) then
-    delivers the last key, and the pass is done: the partition is caught
-    up and its record collapses."""
-    calls, broken = [], {"batch": 2}
-
-    @asset(outputs=Output("files", key="id"))
-    def files():
-        return [{"id": k, "v": 1} for k in "abc"]
-
-    @asset(inputs={"files": Incremental(batch_size=1)}, retries=Retry(n=0))
-    def consumer(ctx, files: list):
-        if ctx.batch["files"].index == broken["batch"]:
-            raise RuntimeError("stopped half-way")
-        calls.append((sorted(r["id"] for r in files), ctx.batch["files"].first))
-        return []
-
-    project = Project(assets=[files, consumer])
-    engine = make_engine(state, project)
-    await engine.initialize()
-    await drive(engine, await engine.submit(["files"]))
-    detail = await drive(engine, await engine.submit(["consumer"], keys={"files": {"keys": ["b"]}}))
-    assert status_of(detail) == "succeeded" and calls == [(["b"], True)]  # the start-over
-    assert state.model.position("consumer", "files", "")["pass"]["mode"] == "full"
-    assert not state.model.partition("consumer", "").get("caught_up")
-    calls.clear()
-    await drive(engine, await engine.submit(["consumer"]))  # continues; stops before `c`
-    assert calls == [(["a"], False)], "b is not delivered again, and nothing starts over"
-    assert state.model.partition("consumer", "")["caught_up"] is False
-    calls.clear()
-    broken["batch"] = None
-    await drive(engine, await engine.submit(["consumer"], keys={"files": {"keys": ["c"]}}))
-    assert calls == [(["c"], False)]
-    position = state.model.position("consumer", "files", "")
-    assert "pass" not in position and "ahead" not in position and position["next"] == 1
-    assert state.model.partition("consumer", "")["caught_up"] is True
-    with pytest.raises(ValueError, match="cannot be a full run"):
-        await engine.submit(["consumer"], mode="full", keys={"files": {"keys": ["a"]}})
-
-
 async def test_a_full_override_resumes_its_pass_batch_by_batch(state):
-    """Engine review round 2 #2: `keys={"files": "full"}` starts one pass per
-    run and its later batches resume it — the first batch is not served again."""
+    """Engine review round 2 #2: `keys={"files": "full"}` is a full run, and
+    its later batches walk on from its progress — the first batch is not
+    served again, nor started over."""
     seen = []
 
     @asset(outputs=Output("files", key="id"))
@@ -436,7 +378,7 @@ async def test_a_full_override_resumes_its_pass_batch_by_batch(state):
         seen.clear()
         detail = await drive(engine, await engine.submit(["consumer"], keys={"files": "full"}), timeout=10)
         assert status_of(detail) == "succeeded"
-        assert seen == [(["a", "b"], True, 0), (["c"], True, 1)]
+        assert seen == [(["a", "b"], True, 0), (["c"], False, 1)]
 
 
 async def test_deps_are_pinned_but_unbound(state):
@@ -1211,11 +1153,12 @@ async def test_ondeploy_two_registrations_fire_latest_once(state):
 
 
 async def test_a_batch_says_where_it_sits_in_its_pass(state):
-    """A pass spans batches of `batch_size`: `index` is the batch's index,
-    `count` the plan, `first` is batch 0, `final` the pass running out,
-    and `full` holds on every batch of a full pass — for keyed full
-    passes, delta passes and unkeyed upstreams (§5; review round 3,
-    system B5)."""
+    """A run spans batches of `batch_size`: `index` is the batch's index in
+    the run, `count` the plan — an estimate, exact on the final batch —
+    `first` is batch 0 and `final` the walk running out (§5; review round
+    3, system B5). For a keyed input `full` marks only a full run's first
+    batch, which starts the output over; an unkeyed upstream's full pass
+    keeps it on every batch until step 5."""
 
     from solera.stores import Patch
 
@@ -1252,7 +1195,7 @@ async def test_a_batch_says_where_it_sits_in_its_pass(state):
     engine = make_engine(state, project)
     await engine.initialize()
     await drive(engine, await engine.submit(["consumer"], upstream=True))
-    assert pages == [(0, 3, True, False, True), (1, 3, False, False, True), (2, 3, False, True, True)]
+    assert pages == [(0, 3, True, False, False), (1, 3, False, False, False), (2, 3, False, True, False)]
     assert sorted(rebuilt["keys"]) == [f"k{i}" for i in range(7)]
     # A delta pass of four changed keys: two batches.
     pages.clear()
@@ -1260,7 +1203,7 @@ async def test_a_batch_says_where_it_sits_in_its_pass(state):
         content[key] = 2
     written["keys"] = ["k0", "k2", "k4", "k6"]
     await drive(engine, await engine.submit(["consumer"], upstream=True))
-    assert pages == [(0, 2, True, False, False), (1, 2, False, True, False)]
+    assert pages == [(0, 3, True, False, False), (1, 2, False, True, False)]  # exact once final
     for _ in range(3):
         await drive(engine, await engine.submit(["log"]))
     await drive(engine, await engine.submit(["tail"]))
@@ -1298,7 +1241,7 @@ async def test_the_batch_plan_is_an_estimate_but_final_is_not(state):
     await drive(engine, await engine.submit(["consumer"], upstream=True))
     assert pages == [
         (0, 3, False, ["k0", "k1", "k2"]),
-        (1, 3, True, ["k3"]),  # k4..k6 read past: nothing follows, so this batch is final
+        (1, 2, True, ["k3"]),  # k4..k6 left out: nothing follows, so this batch is final and its count exact
     ]
 
 
@@ -1333,51 +1276,6 @@ async def test_batches_read_ahead_past_keys_the_patterns_leave_out(state):
     await drive(engine, await engine.submit(["files"], mode="full"))  # every key changes: v=1 rewritten
     detail = await drive(engine, await engine.submit(["none"]))  # a delta pass taking none
     assert calls.count("none") == 1 and task_statuses(detail)["none"] == "skipped"
-
-
-async def test_a_batch_looks_ahead_a_bounded_way(state, monkeypatch):
-    """Review round 5 (system #5): a batch reads the index in chunks, whatever
-    it still lacks, and examines at most `LOOKAHEAD` entries — past them it
-    goes as it is, not final; a batch left with nothing is skipped without
-    calling the producer, and the pass still completes."""
-    from solera.keys.index import key_bytes
-    from solera_worker import each
-
-    # The reviewer's case: 100 matches at the head of 10,000 keys, a batch of 100.
-    keys = [key_bytes(f"a/{i:05d}") for i in range(10_000)]
-    scans = []
-
-    async def chunk(after, n):
-        scans.append(n)
-        lo = 0 if after is None else keys.index(after) + 1
-        part = keys[lo : lo + n]
-        return [(k, b"v", 0, 0) for k in part], (part[-1] if lo + n < len(keys) else None)
-
-    def kind(entry):
-        return "upsert" if entry[0].startswith(b"a/000") else None
-
-    page, after, read = await each._fill(chunk, None, 100, kind)
-    assert len(page) == 100 and after is None and read == 10_000 and len(scans) == 100  # was 9,900
-
-    calls = []
-
-    @asset(outputs=Output("files", key="id"))
-    def files():
-        return [{"id": f"k{i:02d}", "v": 1} for i in range(20)]
-
-    @asset(inputs={"files": Incremental(batch_size=100, include="k0*")})
-    def sparse(ctx, files: list):
-        calls.append((sorted(r["id"] for r in files), ctx.batch["files"].final))
-        return [{"n": len(files)}]
-
-    monkeypatch.setattr(each, "LOOKAHEAD", 5)
-    project = Project(assets=[files, sparse])
-    engine = make_engine(state, project)
-    await engine.initialize()
-    detail = await drive(engine, await engine.submit(["sparse"], upstream=True))
-    assert status_of(detail) == "succeeded"
-    assert calls == [([f"k0{i}" for i in range(5)], False), ([f"k0{i}" for i in range(5, 10)], False)]
-    assert state.model.partition("sparse", "")["caught_up"] is True  # the empty rest, skipped
 
 
 async def test_an_unchanged_keyed_write_still_applies_its_migrations(state):

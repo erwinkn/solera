@@ -283,16 +283,17 @@ class Ctx:
     async def load(self, ref: Ref | str | None = None, t=None):
         """Read what the producer holds, whole. `ctx.load()`, or
         `ctx.load("name")` for one of several outputs: the asset's own
-        output as committed at the attempt's pin (None before its first
-        commit) — what a total kept from `ctx.batch` changes builds on. A
-        full pass's first batch starts over: it must not build on it.
-        `ctx.load(ref, t)`: a ref an input gave. Not an input read of the
-        attempt's: lineage does not record it."""
+        output as committed at the attempt's pin — what a total kept from
+        `ctx.batch` changes builds on — or None before its first commit, and
+        in a full run until that run's first commit: the write that starts
+        the content over builds on nothing. `ctx.load(ref, t)`: a ref an
+        input gave. Not an input read of the attempt's: lineage does not
+        record it."""
 
         index = None
         if not isinstance(ref, Ref):
             info = self._pinned.get(self._output("load", ref)) or {}
-            if info.get("before") is None:
+            if info.get("before") is None or info.get("reset"):
                 return None
             ref, index = Ref.from_json(info["before"]), info.get("index")
         store = self._stores[ref.store]
@@ -342,17 +343,17 @@ class Ctx:
 async def _resolve_inputs(spec, project, asset, keys_io, timeline, observed: Observed):
     """Load each pin by annotation; build call args + ctx.batch (§5, §10).
 
-    An Incremental input over a keyed upstream reads its batch from the pinned
-    key index — the pending deltas in `[from, to]`, or the whole index for a
-    full pass — and loads just those keys. `delivered` reports where the
-    batch ended, for the engine's position (§6). Each input loaded is a
-    `loaded` event; `observed` records what each read saw."""
+    An Incremental input over a keyed upstream loads the keys of the batch
+    the engine planned, each with its class, classed again from what a
+    source served (`each.observe`); `delivered` reports what it observed of
+    each, for the engine's record (docs/observed-set.md). Each input loaded
+    is a `loaded` event; `observed` records what each read saw."""
 
     manifest_asset = project.manifest["assets"][asset.name]
     inputs = manifest_asset["inputs"]
     hints = project.hints[asset.name]  # resolved once, at registration
     args, batch, delivered = {}, {}, {}
-    reads = []
+    nothing = []  # per keyed batch: whether a source served none of its classes
     for name, pin in spec["inputs"].items():
         input = inputs.get(name)
         if input is None or "each" in pin:  # a dep pin: recorded, never bound; a per-key batch: per key
@@ -400,34 +401,33 @@ async def _resolve_inputs(spec, project, asset, keys_io, timeline, observed: Obs
                 )
                 timeline.add("loaded", param, _rows(args[param]))
                 continue
-            # The batch — a keys= override, inlined by the engine, or read from the
-            # pinned index — filtered by the input's patterns (per-key §11).
-            read = await each.read_batch(pin, keys_io)
-            if not (full and int(ch.get("index") or 0) == 0):
-                reads.append(read)  # a full pass's first batch starts its consumer over, keys or none
-            upserted, deleted, after = dict(read.upserted), [*read.deleted, *read.unmatched], read.after
-            args[param] = await observed.load(store, ref, t, Keys(upserted))
-            key = _key_column(project, ref.output)
-            # Classes follow the index, rows the store (D100): a key a current-only store
-            # no longer has is delivered in its class with no row — its removal is a later
-            # commit, which a later batch delivers — unless the head still names it: then
-            # the store is behind its index: SourceBehind.
-            await each.gone_since(ref.output, key, args[param], upserted, pin, keys_io)
+            keys = ch["keys"]
+            load = {k: g for k, cls, _, g, _ in keys if cls != "removed"}
+            args[param] = await observed.load(store, ref, t, Keys(load))
+            served = getattr(store, "served", None)
+            if served is None:
+                # Not a source: rows follow the store, classes the index (D100). A key a
+                # current-only store no longer has is delivered in its class with no
+                # row, unless the head still names it: the store is behind, SourceBehind.
+                key = _key_column(project, ref.output)
+                await each.gone_since(ref.output, key, args[param], load, pin, keys_io)
+            classes, seen = each.observe(keys, served)
             batch[param] = Batch(
                 rows=args[param],
-                added=tuple(sorted(k for k in upserted if k not in read.updated)),
-                updated=tuple(sorted(k for k in upserted if k in read.updated)),
-                removed=tuple(deleted),
+                added=tuple(classes["added"]),
+                updated=tuple(classes["updated"]),
+                removed=tuple(classes["removed"]),
+                unchanged=tuple(classes["unchanged"]),
                 full=full,
-                index=int(ch.get("index") or 0),
-                count=int(ch.get("count") or 1),
-                final=after is None,  # the pass ran out: never inferred from `count`
+                index=int(ch["index"]),
+                count=int(ch["count"]),
+                final=bool(ch["final"]),
                 upstream=Upstream(ref.output),
-                served=dict(getattr(store, "served", {})),  # a source's: what its loader served
+                served={k: v for k, v in seen.items() if v is not None},
             )
-            delivered[param] = {"after": after, "upserted": sorted(upserted), "deleted": list(deleted)}
-            if read.covers:
-                delivered[param]["covers"] = True
+            delivered[param] = {"observed": seen}
+            if not full:  # a full run's first batch starts its consumer over, keys or none
+                nothing.append(keys and not any(classes.values()))
             timeline.add("loaded", param, _rows(args[param]))
             continue
         if pin.get("load", "data") == "ref":  # decided at registration, as the engine read for it
@@ -437,10 +437,9 @@ async def _resolve_inputs(spec, project, asset, keys_io, timeline, observed: Obs
                 observed.load, store, ref, t, keys_io, pin.get("index"), _key_column(project, ref.output)
             )
             timeline.add("loaded", param, _rows(args[param]))
-    # Every keyed batch held keys, and the inputs' patterns took none of them: nothing
-    # to call the producer with — unless one starts a full pass (architecture.md §5).
-    filtered = bool(reads) and all(not r.upserted and not r.deleted and not r.unmatched for r in reads)
-    delivered["*filtered"] = filtered and any(r.read for r in reads)
+    # Every keyed batch held keys, and a source served none of them that changes
+    # anything: nothing to call the producer with; its observations commit.
+    delivered["*nothing"] = bool(nothing) and all(nothing)
     return args, batch, delivered
 
 
@@ -1274,7 +1273,7 @@ async def _execute(
         # `start` (docs/resolved-commits.md §7); small writes are the engine's too.
         keys_io = ObjectIO(objects, served=control.get("reads"))
         args, batch, delivered = await _resolve_inputs(spec, project, asset, keys_io, timeline, observed)
-        filtered = delivered.pop("*filtered", False)
+        nothing = delivered.pop("*nothing", False)
         ctx = Ctx(spec, asset, project, objects, batch, shipper, timeline, keys_io, observed)
         signature = inspect.signature(asset.fn)
         if "ctx" in signature.parameters:
@@ -1291,9 +1290,9 @@ async def _execute(
                 return _user_failed(ran["abort"], project)
             value = Result(outputs=ran["values"])
             delivered[each_input[0]] = ran["delivered"]
-        elif filtered:
-            # The inputs' patterns took none of the batch's keys: the producer has
-            # nothing to see, and the batch commits only its position (per-key §11).
+        elif nothing:
+            # A source served none of the batch's keys that changes anything: the producer
+            # has nothing to see, and the batch commits only what it observed.
             return {"status": "succeeded", "skipped": True, "outputs": {}, "delivered": delivered}
         else:
             await observed.close()  # the inputs' moment ends: a long producer holds no snapshot

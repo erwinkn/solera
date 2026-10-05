@@ -507,6 +507,9 @@ class Batch:
       may come without a row if it was removed since — its removal follows
       in a later batch — and a key changed after the pass's version may
       arrive once more as updated (D100);
+    - `unchanged`: keys loaded though the consumer already observed them
+      as they are — a `keys=` run asked for them, or a source served the
+      version already observed; their rows are in `rows` too;
     - `full`: the batch is part of a full pass — the whole head as of the
       pass's start (its snapshot: what changes after comes as the next
       delta) after a
@@ -540,6 +543,7 @@ class Batch:
     added: tuple = ()
     updated: tuple = ()
     removed: tuple = ()
+    unchanged: tuple = ()
     full: bool = False
     index: int = 0
     count: int = 1

@@ -28,7 +28,7 @@ def project(root, outside, store, decl, seen: list):
     async def tally(ctx, items: list):
         batch = ctx.batch["items"]
         seen.append((list(batch.added), list(batch.updated), list(batch.removed)))
-        before = 0 if batch.full and batch.first else (await ctx.load())["rows"]
+        before = ((await ctx.load()) or {"rows": 0})["rows"]
         return {"rows": before + len(batch.added) - len(batch.removed)}
 
     return Project(
@@ -113,7 +113,7 @@ class Tally:
         async def tally(ctx, items: list):
             batch = ctx.batch["items"]
             holdings.apply(batch)
-            before = 0 if batch.full and batch.first else (await ctx.load())["rows"]
+            before = ((await ctx.load()) or {"rows": 0})["rows"]
             return {"rows": before + len(batch.added) - len(batch.removed)}
 
         return Project(
@@ -218,11 +218,11 @@ async def test_a_selection_during_a_pattern_change_is_counted_once(tmp_path):
 
 
 async def test_an_early_removal_from_a_current_only_source_is_delivered_once(tmp_path):
-    """A19 R5, D100: a delta over a current-only source, a key a batch: k1
-    and k2 updated; after k1's batch the source removes k2 (commit 3). k2's
-    batch finds no row: it is still updated, with no row, as its class at
-    the delta's version says, and the delta 3 removes it — once. The count
-    goes 2, 2, 2, 1."""
+    """A19 R5: a current-only source, a key a batch: k1 and k2 updated;
+    while k1's batch runs the source removes k2, and k2's batch, planned
+    before that commit, finds no row. The source says so: k2, held, is
+    removed then (docs/observed-set.md, "Observations"), and the commit
+    after owes nothing more. The count goes 2, 2, 2, 1."""
 
     outside, holdings, removing, counts = External(), Holdings(), {}, []
     state = await State.open((tmp_path / "state").as_uri(), "test", flush_interval=0.001)
@@ -231,7 +231,7 @@ async def test_an_early_removal_from_a_current_only_source_is_delivered_once(tmp
     async def tally(ctx, feed: list):
         batch = ctx.batch["feed"]
         holdings.apply(batch)
-        before = 0 if batch.full and batch.first else (await ctx.load())["rows"]
+        before = ((await ctx.load()) or {"rows": 0})["rows"]
         if removing.pop("now", False):
             outside.feed.pop("k2")
             await removing["engine"].commit_source("feed", remove=["k2"])
@@ -256,8 +256,8 @@ async def test_an_early_removal_from_a_current_only_source_is_delivered_once(tmp
         await drive(engine, await engine.submit(["tally"]))
         await drive(engine, await engine.submit(["tally"]))
         holdings.check({"k1"})
-        assert counts[2:] == [2, 2, 1], (counts, holdings.trace)
-        assert holdings.trace[2:] == [([], ["k1"], []), ([], ["k2"], []), ([], [], ["k2"])]
+        assert counts[2:] == [2, 1], (counts, holdings.trace)
+        assert holdings.trace[2:] == [([], ["k1"], []), ([], [], ["k2"])]
         assert (await value_content(engine, p, "tally"))["rows"] == 1
     finally:
         await engine.stop()
@@ -265,10 +265,10 @@ async def test_an_early_removal_from_a_current_only_source_is_delivered_once(tmp
 
 
 async def test_a_key_removed_during_a_full_pass_is_counted_out_once(tmp_path):
-    """D100, the full pass: the snapshot holds k1 and k2, a key a batch.
-    After k1's batch the source removes k2 (commit c). k2's batch reads the
-    snapshot, which still names k2: it is added, with no row. The delta then
-    removes it — once. The count goes 1, 2, 1, the source's."""
+    """k1 and k2, a key a batch, never read; while k1's batch runs the
+    source removes k2. Each batch reads at its own head: k2's, planned
+    after that commit, finds k2 absent and never held — nothing to deliver.
+    The count is 1, the source's, and the next run owes nothing."""
 
     outside, holdings, removing, counts = External(), Holdings(), {}, []
     state = await State.open((tmp_path / "state").as_uri(), "test", flush_interval=0.001)
@@ -277,7 +277,7 @@ async def test_a_key_removed_during_a_full_pass_is_counted_out_once(tmp_path):
     async def tally(ctx, feed: list):
         batch = ctx.batch["feed"]
         holdings.apply(batch)
-        before = 0 if batch.full and batch.first else (await ctx.load())["rows"]
+        before = ((await ctx.load()) or {"rows": 0})["rows"]
         if removing.pop("now", False):
             outside.feed.pop("k2")
             await removing["engine"].commit_source("feed", remove=["k2"])
@@ -299,7 +299,7 @@ async def test_a_key_removed_during_a_full_pass_is_counted_out_once(tmp_path):
         await drive(engine, await engine.submit(["tally"]))
         await drive(engine, await engine.submit(["tally"]))
         holdings.check({"k1"})
-        assert counts == [1, 2, 1], (counts, holdings.trace)
+        assert counts == [1], (counts, holdings.trace)
     finally:
         await engine.stop()
         await state.close()

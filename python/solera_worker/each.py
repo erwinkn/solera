@@ -1,8 +1,9 @@
 """Per-key incremental: an asset written for one key, run over a batch of keys
-(docs/per-key-processing.md §5, §9).
+(docs/per-key-processing.md §5, §9); and a keyed batch as the engine
+planned it, classed again from what a source served (`observe`).
 
-A batch is either the changes of the input's pass (`changes`) or the
-failed keys's keys that are due again (`retry`). Each key is one call,
+A batch is either the input's owed keys (`changes`) or the failed keys's
+keys that are due again (`retry`). Each key is one call,
 `concurrency` at a time; its outcome is classified (`solera.errors`), the
 outputs of the keys that succeeded become one `Patch({key: value})` per
 output, and every key's outcome moves its failure record (`solera.failed_keys`)
@@ -22,6 +23,7 @@ from dataclasses import dataclass, field
 from solera import errors
 from solera.failed_keys import REMOVED, UNMATCHED, Outcome, Record, eligible, minima, transition
 from solera.keys import SortedEntries
+from solera.keys.delta import version_of
 from solera.keys.index import IndexState, KeyIndex, key_bytes, key_str
 from solera.patterns import Matcher
 from solera.sdk import UNSET, Ref, Result
@@ -32,240 +34,62 @@ from .sources import reader
 
 WALK = 100  # failure records walked per retry batch, at most, for each key it may take
 INTERRUPTED = "interrupted"  # a key a drain stopped: canceled or timed out once the result is sealed
-LOOKAHEAD = 100_000  # index entries a batch examines at most, to fill itself and to prove it final
-CHANGE = ("added", "updated", "removed", None)  # `KeyIndex.changes` classes, by number; 3 is neither
+CLASSES = ("added", "updated", "removed", "unchanged")
+
+
+def observe(keys: list, served: dict | None) -> tuple[dict[str, list[str]], dict]:
+    """A keyed batch's classes, and what it observed of each key (key ->
+    version, None for absent), from the engine's plan — `[key, class,
+    version, generation, old]` each, `old` None (not held) or `[version,
+    same context]` — classed again from what a source served, when it says
+    (docs/observed-set.md, "Observations"): served absent, a removal if the
+    key was held, else nothing; served at the version held, under the same
+    context, unchanged; served otherwise, added or updated by whether it
+    was held. A key planned removed was not loaded. Where the index names
+    no version of the source's (its commit gave none: the version is a
+    generation), what was served says only whether the key is there."""
+
+    classes: dict[str, list[str]] = {c: [] for c in CLASSES}
+    seen = {}
+    for key, cls, version, _, old in keys:
+        if served is not None and cls != "removed":
+            got = served.get(key)
+            if got is None:
+                cls = "removed" if old is not None else None
+            elif not isinstance(version, str):  # nothing to compare its word with: as planned
+                pass
+            elif old is None:
+                cls, version = "added", got
+            else:
+                cls, version = ("unchanged" if old[1] and str(old[0]) == got else "updated"), got
+        seen[key] = None if cls in ("removed", None) else version
+        if cls is not None:
+            classes[cls].append(key)
+    return classes, seen
 
 
 @dataclass
 class Batch:
-    """The keys one attempt reads from a keyed incremental input, filtered
-    by its patterns. `deleted` are keys gone upstream and `unmatched` keys
-    that stopped matching the patterns: the consumer's outputs drop both.
-    `updated`: the keys of `upserted` the consumer held at its position (K44);
-    the others are added.
-    A per-key batch also has a `kind` (§9) — the input's `changes`, a
-    `retry` of failed keys, or the `reconcile` after a full pass — and the
-    failure records it read."""
+    """The keys one per-key attempt calls, and those it removes: `deleted`
+    are keys gone upstream, or held keys the input's patterns no longer
+    take (`unmatched`); the consumer's outputs drop both. A batch has a
+    `kind` (§9) — the input's owed keys, `changes`, or a `retry` of failed
+    keys — the failure records it read, and what it observed of each key
+    (`observed`, `observe`)."""
 
-    upserted: dict[str, int]  # key -> the generation of its upstream entry: its version
+    upserted: dict[str, int]  # key -> the generation of its upstream entry
     deleted: list[str]
-    after: str | None  # where the batch, or the retry walk, ended (None: the pass is done)
-    read: int = 0  # keys examined before the patterns filtered them
+    after: str | None  # where the retry walk ended (None: the walk is done)
     unmatched: list[str] = field(default_factory=list)
     kind: str = "changes"
     walked: dict[str, Record] = field(default_factory=dict)  # retry: every record walked
     priors: dict[str, Record] = field(default_factory=dict)  # the touched keys' failure records
-    covers: bool = False  # a keys= selection past `next`: nothing it did not name is left (K45)
-    updated: set[str] = field(default_factory=set)
+    observed: dict = field(default_factory=dict)  # key -> the version observed, None: absent
 
 
 class _Abort(Exception):
     def __init__(self, error: BaseException):
         self.error = error
-
-
-async def _fill(chunk, start: bytes | None, limit: int, kind) -> tuple[list, str | None, int]:
-    """A batch of `limit` entries that `kind` takes, read ahead past the ones
-    it does not: `chunk(after, n)` returns `(entries, next)` — at most `n`
-    entries as `(key, generation, deleted)` in key order past `after`,
-    and where to go on (None: exhausted). Past a full batch it looks on for
-    one more entry it takes, so that a batch is `final` exactly when nothing
-    follows and no pass ends on an empty batch (§5).
-
-    Entries are read a batch's worth and one more at a time — never just what
-    the batch still lacks, so a sparse pattern costs scans in proportion to
-    the entries it passes over, divided by the batch — and at most
-    `LOOKAHEAD` of them: past that the batch goes as it is — not
-    final, not full, perhaps empty (then its attempt is skipped, the producer
-    not called). The next batch starts after the last entry examined, so no
-    entry is read twice. Returns the batch's entries, where the next batch
-    starts (None: this one is final), and how many entries were read."""
-
-    batch, cursor, read, last = [], start, 0, None
-    while True:
-        entries, nxt = await chunk(cursor, limit + 1)
-        for n, entry in enumerate(entries, 1):
-            taken = kind(entry)
-            if taken is not None:
-                if len(batch) == limit:  # one more is taken: the batch is full, not final
-                    return batch, key_str(last), read
-                batch.append((taken, entry))
-            read, last = read + 1, entry[0]
-            if read >= LOOKAHEAD and (n < len(entries) or nxt is not None):
-                return batch, key_str(last), read  # examined enough: the rest is the next batch's
-        if nxt is None:
-            return batch, None, read
-        cursor = nxt
-
-
-async def _changes(index: KeyIndex, first: int, last: int, after, n: int, ahead: dict):
-    """A page of `changes(first -> last)` past `after`, read-ahead applied:
-    `(key, generation, deleted, class)` entries, and the cursor."""
-
-    lower = {key_bytes(k): (int(g), bool(live)) for k, (g, live) in ahead.items()}
-    pages = index.changes(first, last, after=after, limit=n, lower=lower)
-    try:
-        page = await anext(pages)
-    finally:
-        await pages.aclose()
-    return list(zip(page.keys, page.generations, page.deleted, page.classes, strict=True)), page.cursor
-
-
-async def read_batch(pin: dict, keys_io) -> Batch:
-    """An Incremental batch of a keyed upstream, as the spec pins it: the
-    keys= override, a full pass's batch, a delta pass's changes — all
-    filtered by the input's patterns (per-key §11), read ahead past keys they
-    leave out until the batch holds `batch_size` keys or the pass runs
-    out — or a pattern change's diff of the index as of its pattern change: the keys whose
-    membership changed. Each key is classed against the consumer's position
-    (K44): a delta's net change, a full pass's keys all added. A pure
-    function of the pin: it reads the index through `KeyIndex.page`,
-    `changes` and `lookup` only, so the engine can run it on its own copies
-    to serve the same batch."""
-
-    ch = pin["batch"]
-    index = KeyIndex(keys_io, None, IndexState.from_json(pin["index"]))
-    limit = int(ch.get("limit") or 1)
-    start = key_bytes(ch["after"]) if ch.get("after") is not None else None
-    # What keys= runs read past `next` (K45): key -> the latest upstream generation one
-    # read it at, and whether it was delivered live. Not delivered again unless changed since.
-    ahead = pin.get("ahead") or {}
-    read_at = {k: int(g) for k, (g, _) in ahead.items()}
-
-    snapshot = ch.get("snapshot")  # a full pass reads its start, a reserved endpoint (D93)
-
-    async def whole(after, n):
-        keys, generations, _, nxt = await index.page(after, n, at=snapshot)
-        return [(k, g, 0, 0) for k, g in zip(keys, generations, strict=True)], nxt
-
-    async def delta(after, n):
-        return await _changes(index, int(ch["from"]), int(ch["to"]), after, n, ahead)
-
-    def batch_of(page, after, read) -> Batch:
-        upserted = {key_str(e[0]): e[1] for kind, e in page if kind in ("added", "updated")}
-        updated = {key_str(e[0]) for kind, e in page if kind == "updated"}
-        deleted = [key_str(e[0]) for kind, e in page if kind == "removed"]
-        return Batch(upserted, deleted, after, read, updated=updated)
-
-    if "pattern_change" in ch:
-        old, new = Matcher(ch["pattern_change"]["from"]), Matcher(ch["pattern_change"]["to"])
-
-        def changed(entry):
-            key = key_str(entry[0])
-            before, now = old(key), new(key)
-            if now and not before and read_at.get(key, -1) >= entry[1]:
-                return None  # a selection merged it meanwhile, at this version
-            return "added" if now and not before else "removed" if before and not now else None
-
-        page, after, read = await _fill(whole, start, limit, changed)
-        upserted = {key_str(e[0]): e[1] for kind, e in page if kind == "added"}
-        unmatched = [key_str(e[0]) for kind, e in page if kind == "removed"]
-        return Batch(upserted, [], after, read, unmatched=unmatched)
-    taken = Matcher(pin.get("patterns"))
-    if "keys" in ch and "from" in ch:
-        # A keys= selection of a plain input past its snapshot: the named keys' changes
-        # past `next` its read-ahead lacks, and whether any it did not name are left.
-        named, page, left, read = {str(k) for k in ch["keys"]}, [], False, 0
-        after = None
-        while int(ch["from"]) <= int(ch["to"]):
-            entries, after = await delta(after, 1000)
-            for entry in entries:
-                key, kind, read = key_str(entry[0]), CHANGE[entry[3]], read + 1
-                if not taken(key) or kind is None:
-                    continue
-                if key not in named:
-                    left = True
-                else:
-                    page.append((kind, entry))
-            if after is None:
-                break
-        batch = batch_of(page, None, read)
-        batch.covers = not left
-        return batch
-    if "keys" in ch:  # a run's keys= override: each named key as the upstream holds it, or removed (R2)
-        named = sorted({str(k) for k in ch["keys"]})
-        found = await index.lookup([key_bytes(k) for k in named], at=snapshot)
-        upserted = {key_str(k): generation for k, (generation, _) in found.items()}
-        # A named key the upstream has not is removed (R2) — but not within a full pass,
-        # whose consumer holds only what the pass delivered: never there, never removed.
-        gone = (
-            []
-            if ch.get("scan") and not ch.get("removes")
-            else [k for k in named if k not in upserted and taken(k)]
-        )
-        upserted = {k: g for k, g in upserted.items() if taken(k)}
-        updated = set()
-        if ch.get("scan"):  # within a full pass: a key it delivered at this version is not delivered twice
-            walked = ch.get("walked")
-            upserted = {
-                k: g
-                for k, g in upserted.items()
-                if read_at.get(k, -1) < g and not (walked and k <= walked["at"] and g <= walked["generation"])
-            }
-        elif upserted:  # merged while a pattern change is under way: held if the old patterns took it then
-            held = ch["held_at"]
-            had = Matcher(held["patterns"])
-            was = await index.lookup([key_bytes(k) for k in upserted if had(k)], at=held["next"])
-            updated = {key_str(k) for k in was}
-        batch = Batch(upserted, gone, None, len(named), updated=updated)
-        if ch.get("scan"):  # a full pass's delivery: whether it leaves any key undelivered (K45)
-            batch.covers = await _covers(index, taken, set(named), read_at, ch.get("walked"), snapshot)
-            for held in ch.get("held") or ():  # and leaves nothing its reconcile would remove
-                if not batch.covers:
-                    break
-                held = KeyIndex(keys_io, None, IndexState.from_json(held))
-                batch.covers = await _holds_only(held, index, taken, set(named))
-        return batch
-
-    def kind(entry):
-        """A full pass's key is added, unless read ahead within it at this
-        version; a delta's is its net change, `changes` applying the read-ahead."""
-
-        key = key_str(entry[0])
-        if not taken(key) or (ch.get("full") and read_at.get(key, -1) >= entry[1]):
-            return None
-        return CHANGE[entry[3]]
-
-    page, after, read = await _fill(whole if ch.get("full") else delta, start, limit, kind)
-    return batch_of(page, after, read)
-
-
-async def _covers(index, taken, named: set[str], read_at: dict, walked: dict | None, at=None) -> bool:
-    """Whether every key of the pass's snapshot (`at`) under the patterns has
-    been delivered within it: named now, read ahead at or after its version,
-    or walked by the pass's own batches (at or before `walked["at"]`, at a
-    generation they read). A key removed after the snapshot is the next
-    delta's, which delivers its removal."""
-
-    after = None
-    while True:
-        keys, generations, _, after = await index.page(after, 1000, at=at)
-        for k, generation in zip(keys, generations, strict=True):
-            key = key_str(k)
-            if not taken(key) or key in named or read_at.get(key, -1) >= generation:
-                continue
-            if walked is not None and key <= walked["at"] and generation <= walked["generation"]:
-                continue
-            return False
-        if after is None:
-            return True
-
-
-async def _holds_only(held, index, taken, named: set[str]) -> bool:
-    """Whether a per-key output (or its failed keys) holds no key its reconcile
-    would remove — gone upstream or left out by the patterns — but those
-    this run names, which it removes itself (R2)."""
-
-    after = None
-    while True:
-        keys, _, _, after = await held.page(after, 1000)
-        rest = [k for k in keys if key_str(k) not in named]
-        if any(not taken(key_str(k)) for k in rest):
-            return False
-        if rest and len(await index.lookup(rest)) < len(rest):
-            return False
-        if after is None:
-            return True
 
 
 async def gone_since(output: str, key: str | None, value, expected: dict, pin: dict, keys_io) -> list[str]:
@@ -289,20 +113,24 @@ async def gone_since(output: str, key: str | None, value, expected: dict, pin: d
     return missing
 
 
-async def read_each_batch(spec: dict, pin: dict, keys_io) -> Batch:
+async def read_each_batch(pin: dict, keys_io) -> Batch:
     each = pin["each"]
     failures = KeyIndex(keys_io, None, IndexState.from_json(each["failures"]))
-    if each["kind"] == "reconcile":
-        return await _reconcile_batch(spec, pin, keys_io, failures)
     if each["kind"] != "retry":
-        batch = await read_batch(pin, keys_io)
-        touched = [key_bytes(k) for k in [*batch.upserted, *batch.deleted, *batch.unmatched]]
+        keys = pin["batch"]["keys"]
+        batch = Batch(
+            {k: g for k, cls, _, g, _ in keys if cls != "removed"},
+            [k for k, cls, *_ in keys if cls == "removed"],
+            None,
+            observed={k: v for k, _, v, *_ in keys},
+        )
         # A start-over reads no prior record: its failed keys start over (K47).
+        touched = [key_bytes(k) for k, *_ in keys]
         priors = await failures.lookup(touched) if touched and not each.get("start_over") else {}
         batch.priors = {key_str(k): Record.decode(p) for k, (_, p) in priors.items()}
         return batch
     # A retry batch: walk the failed keys from the pass's place, taking the
-    # keys that are due, `limit` at most (§9).
+    # keys that are due, `limit` at most (§9), each at its version now.
     limit = int(pin["batch"]["limit"])
     after = pin["batch"]["retry"].get("after")
     cursor = key_bytes(after) if after is not None else None
@@ -329,30 +157,17 @@ async def read_each_batch(spec: dict, pin: dict, keys_io) -> Batch:
     upstream = KeyIndex(keys_io, None, IndexState.from_json(pin["index"]))
     current = await upstream.lookup([key_bytes(k) for k in due]) if due else {}
     taken = Matcher(pin.get("patterns"))
-    # A due key written since it failed is left to the next delta only if that delta
-    # delivers it: a write that nets out (v1 -> v2 -> v1) delivers nothing.
-    moved = [k for k in due if (e := current.get(key_bytes(k))) is not None and e[0] != walked[k].upstream]
-    delta, owed = pin["batch"]["retry"].get("delta"), set()
-    if moved and delta is not None:
-        index = KeyIndex(keys_io, None, IndexState.from_json(delta["index"]))
-        lower = {key_bytes(k): (int(g), bool(live)) for k, (g, live) in (delta.get("ahead") or {}).items()}
-        async for page in index.changes(
-            int(delta["from"]), int(delta["to"]), keys=[key_bytes(k) for k in moved], lower=lower
-        ):
-            owed |= {
-                key_str(k) for k, c in zip(page.keys, page.classes, strict=True) if CHANGE[c] is not None
-            }
-    upserted, deleted, unmatched = {}, [], []
+    upserted, deleted, unmatched, observed = {}, [], [], {}
     for key in due:
         entry = current.get(key_bytes(key))
         if not taken(key):
             unmatched.append(key)  # no longer one of the input's keys: its outputs and record go
         elif entry is None:
             deleted.append(key)  # gone upstream: its outputs and its record go
-        elif key not in owed:
+        else:
             upserted[key] = entry[0]  # at its version now
-        # else: the next delta brings it, at its new version
-    batch = Batch(
+        observed[key] = version_of(*entry) if taken(key) and entry is not None else None
+    return Batch(
         upserted,
         deleted,
         end,
@@ -360,74 +175,7 @@ async def read_each_batch(spec: dict, pin: dict, keys_io) -> Batch:
         kind="retry",
         walked=walked,
         priors={k: walked[k] for k in due},
-    )
-    if end is None and pin.get("cover"):  # the pass's last batch: is anything past the snapshot left?
-        batch.covers = await _retry_covers(pin["cover"], taken, upserted, set(deleted), keys_io)
-    return batch
-
-
-async def _retry_covers(cover: dict, taken, upserted: dict, deleted: set, keys_io) -> bool:
-    """Whether every key the patterns take changed past the snapshot has been
-    delivered: read ahead since its change, or read by this batch (K47: a
-    retry pass that leaves nothing uncovered collapses the record)."""
-
-    index = KeyIndex(keys_io, None, IndexState.from_json(cover["index"]))
-    first, last, after = int(cover["from"]), int(cover["to"]), None
-    while True:
-        entries, after = await _changes(index, first, last, after, 1000, cover.get("ahead") or {})
-        for k, generation, removed, change in entries:
-            key = key_str(k)
-            if not taken(key) or CHANGE[change] is None:
-                continue
-            if (removed and key in deleted) or (not removed and upserted.get(key, -1) >= generation):
-                continue
-            return False
-        if after is None:
-            return True
-
-
-async def _reconcile_batch(spec: dict, pin: dict, keys_io, failures: KeyIndex) -> Batch:
-    """After a full pass: the next `limit` keys the asset's outputs or its
-    failed keys hold, and which of them the input no longer has — gone
-    upstream, or left out by its patterns. Those go (§11); the rest stay."""
-
-    limit = int(pin["batch"]["limit"])
-    after = pin["batch"]["reconcile"].get("after")
-    start = key_bytes(after) if after is not None else None
-    indexes = [
-        KeyIndex(keys_io, None, IndexState.from_json(info["index"]))
-        for info in (spec.get("outputs") or {}).values()
-        if info.get("index") is not None
-    ] + [failures]
-    found, bound = set(), None
-    for index in indexes:
-        keys, _, _, nxt = await index.page(start, limit)
-        found.update(keys)
-        if nxt is not None:  # this index holds more, past `nxt`: nothing beyond it is known yet
-            bound = nxt if bound is None else min(bound, nxt)
-    candidates = sorted(k for k in found if bound is None or k <= bound)
-    take = candidates[:limit]
-    more = bound is not None or len(candidates) > limit
-    end = (key_str(take[-1]) if take else key_str(bound)) if more else None
-    upstream = KeyIndex(keys_io, None, IndexState.from_json(pin["index"]))
-    current = await upstream.lookup(take) if take else {}
-    taken = Matcher(pin.get("patterns"))
-    deleted, unmatched = [], []
-    for k in take:
-        key = key_str(k)
-        if not taken(key):
-            unmatched.append(key)
-        elif k not in current:
-            deleted.append(key)
-    touched = [key_bytes(k) for k in [*deleted, *unmatched]]
-    priors = await failures.lookup(touched) if touched else {}
-    return Batch(
-        {},
-        deleted,
-        end,
-        unmatched=unmatched,
-        kind="reconcile",
-        priors={key_str(k): Record.decode(p) for k, (_, p) in priors.items()},
+        observed=observed,
     )
 
 
@@ -445,7 +193,7 @@ async def run(spec, project, asset, param: str, pin: dict, args: dict, ctx, keys
 
     drain = control["drain"]
     each = pin["each"]
-    batch = await read_each_batch(spec, pin, keys_io)
+    batch = await read_each_batch(pin, keys_io)
     timeline.add("loaded", param, len(batch.upserted))
     ref = Ref.from_json(pin["ref"])
     store = reader(project, ref)
@@ -453,11 +201,26 @@ async def run(spec, project, asset, param: str, pin: dict, args: dict, ctx, keys
     loaded = (
         await ctx._observed.load(store, ref, dict[str, t], Keys(batch.upserted)) if batch.upserted else {}
     )
-    for key in await gone_since(
-        ref.output, None, loaded, batch.upserted, pin, keys_io
-    ):  # by key: the mapping's
-        del batch.upserted[key]
-        batch.deleted.append(key)
+    served = getattr(store, "served", None)
+    if served is not None:  # a source says what it served: the batch is classed by it
+        if batch.kind == "changes":
+            classes, batch.observed = observe(pin["batch"]["keys"], served)
+            keep = {*classes["added"], *classes["updated"], *classes["unchanged"]}
+            batch.deleted += [k for k in classes["removed"] if k not in batch.deleted]
+        else:  # a retry's keys are held: one served absent goes
+            keep = {k for k in batch.upserted if served.get(k) is not None}
+            for k in batch.upserted:
+                if k not in keep:
+                    batch.deleted.append(k)
+                    batch.observed[k] = None
+                elif isinstance(batch.observed.get(k), str):  # the index has the source's word
+                    batch.observed[k] = served[k]
+        batch.upserted = {k: g for k, g in batch.upserted.items() if k in keep}
+    else:
+        for key in await gone_since(ref.output, None, loaded, batch.upserted, pin, keys_io):  # by key
+            del batch.upserted[key]
+            batch.deleted.append(key)
+            batch.observed[key] = None
     await ctx._observed.close()  # the inputs' moment ends before the calls
     decls = {o.name or asset.name: o for o in asset.outputs}
     is_async = inspect.iscoroutinefunction(asset.fn)
@@ -617,20 +380,18 @@ async def run(spec, project, asset, param: str, pin: dict, args: dict, ctx, keys
         report = {k: v for k, v in failures.items() if k != "records"}
         return {"failures": report, "key_outcomes": rows, "keys": dict(counts)}
 
-    delivered = {
-        "kind": batch.kind,
-        "after": batch.after,
-        "upserted": sorted(batch.upserted),
-        "deleted": [*batch.deleted, *batch.unmatched],
+    # What it observed: every key of the batch, or — drained — those that finished; an
+    # interrupted key is not observed, so it stays owed (docs/observed-set.md, "Outcomes").
+    observed = {
+        k: v for k, v in batch.observed.items() if k not in outcomes or outcomes[k].kind != INTERRUPTED
     }
-    if batch.covers:  # nothing it did not take is left undelivered: the record collapses (K45, K47)
-        delivered["covers"] = True
+    delivered = {"kind": batch.kind, "after": batch.after, "observed": observed, "whole": not drain.is_set()}
     return {
         "values": values,
         "delivered": delivered,
         "finish": finish,
         "drained": drain.is_set(),
-        "skipped": not outcomes and batch.kind != "reconcile",  # nothing on the batch was the input's
+        "skipped": not outcomes,  # nothing on the batch to call or remove
     }
 
 

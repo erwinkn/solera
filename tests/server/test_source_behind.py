@@ -1,8 +1,9 @@
-"""F33 (Erwin's ruling): a source read as it is now no longer holds a key its
-index names. Loading the batch fails retryable with the key and its version;
-nothing is delivered and the position stays; the retries are the asset's
-budget, then the attempt fails with that reason. The source's next commit,
-restoring or removing the key, lets the next attempt through."""
+"""A source read as it is now no longer holds a key its index names
+(F33, superseded by the observed set: docs/observed-set.md,
+"Observations"). The source says so: the key is observed absent — a key
+never held, nothing; one held, a removal — and the batch commits what it
+saw. The index still names the key, so the partition owes it until the
+source's next commit restores it (delivered) or removes it (nothing)."""
 
 from solera.sdk import Incremental, Output, Project, Retry, Source, asset
 
@@ -30,84 +31,53 @@ def project(root, outside: External, retries: Retry):
     )
 
 
-async def _behind(state, tmp_path, asset_name, retries):
+async def _behind(state, tmp_path, asset_name):
     """`feed` commits k1 and k2, then its client drops k1 outside without a commit."""
 
     outside = External()
-    engine = make_engine(state, p := project(tmp_path, outside, retries))
+    engine = make_engine(state, p := project(tmp_path, outside, Retry(n=0)))
     engine.p = p
     await engine.initialize()
     outside.feed.update({"k1": "1", "k2": "1"})
     await engine.commit_source("feed", upsert={"k1": "1", "k2": "1"})
-    generation = state.model.heads[("feed", "")]["ref"]["generation"]
     del outside.feed["k1"]
     detail = await drive(engine, await engine.submit([asset_name]))
-    return engine, outside, detail, generation
+    return engine, outside, detail
 
 
-async def test_a_key_the_source_lost_fails_the_attempt_after_its_retries(state, tmp_path):
-    engine, _, detail, generation = await _behind(state, tmp_path, "items", Retry(n=2, delay=0))
-    assert status_of(detail) == "failed"
-    (task,) = detail["tasks"]
-    attempts = detail["attempts"][task["id"]]
-    assert len(attempts) == 3, "the first attempt and its two retries, no more"
-    assert all(a["outcome"] == "failed" for a in attempts)
-    want = f"the source index says k1@{generation} but the source has no k1"
-    assert all(want in a["error"] for a in attempts), attempts[-1]["error"]
-    assert ("items", "") not in state.model.heads, "nothing was delivered"
-    assert state.model.position("items", "feed", "") is None, "the position did not move"
+async def test_a_key_the_source_lost_is_observed_absent(state, tmp_path):
+    engine, _, detail = await _behind(state, tmp_path, "items")
+    assert status_of(detail) == "succeeded"
+    assert await keyed_content(engine, engine.p, "items") == {"k2": "1"}
+    assert sorted(await engine.observed("items", "", "feed")) == ["k2"]
+    # Its index still names k1, which no batch has seen: owed, and the partition says so.
+    assert await engine.stale_reasons("items", "") == ["input changed"]
     await engine.stop()
 
 
-async def test_the_next_commit_restoring_the_key_lets_it_through(state, tmp_path):
-    engine, outside, detail, _ = await _behind(state, tmp_path, "items", Retry(n=0))
-    assert status_of(detail) == "failed"
+async def test_the_next_commit_restoring_the_key_delivers_it(state, tmp_path):
+    engine, outside, _ = await _behind(state, tmp_path, "items")
     outside.feed["k1"] = "2"
     await engine.commit_source("feed", upsert={"k1": "2"})
     assert status_of(await drive(engine, await engine.submit(["items"]))) == "succeeded"
     assert await keyed_content(engine, engine.p, "items") == {"k1": "2", "k2": "1"}
+    assert await engine.stale_reasons("items", "") == []
     await engine.stop()
 
 
-async def test_the_next_commit_removing_the_key_lets_it_through(state, tmp_path):
-    engine, _, detail, _ = await _behind(state, tmp_path, "items", Retry(n=0))
-    assert status_of(detail) == "failed"
+async def test_the_next_commit_removing_the_key_owes_nothing(state, tmp_path):
+    engine, _, _ = await _behind(state, tmp_path, "items")
     await engine.commit_source("feed", remove=["k1"])
-    assert status_of(await drive(engine, await engine.submit(["items"]))) == "succeeded"
+    assert await engine.stale_reasons("items", "") == []
+    detail = await drive(engine, await engine.submit(["items"]))
+    assert status_of(detail) in ("succeeded", "skipped")
     assert await keyed_content(engine, engine.p, "items") == {"k2": "1"}
     await engine.stop()
 
 
-async def test_an_each_page_missing_a_key_fails_alike(state, tmp_path):
-    engine, _, detail, generation = await _behind(state, tmp_path, "checks", Retry(n=1, delay=0))
-    assert status_of(detail) == "failed"
-    (task,) = detail["tasks"]
-    attempts = detail["attempts"][task["id"]]
-    assert len(attempts) == 2
-    assert f"k1@{generation} but the source has no k1" in attempts[-1]["error"]
-    await engine.stop()
-
-
-async def test_a_partition_whose_retries_ran_out_is_failing_not_stale(state, tmp_path):
-    """F38's second part: `items` is built, then `feed` commits k3, which the
-    outside lacks. The run fails past its retries and nothing schedules it
-    again: the partition is stale (an input changed) and failed, and it
-    reports failed, its last outcome and the error to see, its reasons
-    kept, never quietly stale."""
-
-    outside = External()
-    engine = make_engine(state, p := project(tmp_path, outside, Retry(n=1, delay=0)))
-    engine.p = p
-    await engine.initialize()
-    outside.feed.update({"k1": "1"})
-    await engine.commit_source("feed", upsert={"k1": "1"})
-    assert status_of(await drive(engine, await engine.submit(["items"]))) == "succeeded"
-    await engine.commit_source("feed", upsert={"k3": "1"})  # the outside never got k3
-    detail = await drive(engine, await engine.submit(["items"]))
-    assert status_of(detail) == "failed"
-    (row,) = (await engine.partition_statuses(["items"], every=False))["items"]
-    assert row["status"] == "failed" and row["last_outcome"] == "failed"
-    assert row["reasons"] == ["input changed"], "stale too, and says so"
-    (task,) = detail["tasks"]
-    assert "the source has no k3" in detail["attempts"][task["id"]][-1]["error"]
+async def test_a_per_key_batch_observes_it_alike(state, tmp_path):
+    engine, _, detail = await _behind(state, tmp_path, "checks")
+    assert status_of(detail) == "succeeded"
+    assert await keyed_content(engine, engine.p, "checks") == {"k2": "1"}
+    assert sorted(await engine.observed("checks", "", "row")) == ["k2"]
     await engine.stop()

@@ -63,6 +63,13 @@ def _context(rec: dict, versions: dict) -> str:
     return cid
 
 
+def lives(rec: dict) -> set[str]:
+    """The upstream lives a record's layers were observed in: one, unless an
+    upstream reset left it naming an earlier life (a full run is due)."""
+
+    return {layer["life"] for layer in [rec["base"], *rec["ranges"], *rec["points"].values()]}
+
+
 def layer(rec: dict, endpoint: int | None, patterns: dict | None, context: dict, life: str) -> dict:
     """A layer's label, its context entered in the record's table."""
 

@@ -298,7 +298,7 @@ class KeyService:
         from solera_worker import each
         from solera_worker.worker import REPAIR_PAGE
 
-        states = {}  # what the reads may touch: inputs, failed keys, outputs (reconcile batches)
+        states = {}  # what the reads may touch: inputs, failed keys, outputs
         for pin in (spec.get("inputs") or {}).values():
             for js in (
                 pin.get("index"),
@@ -318,9 +318,7 @@ class KeyService:
             for pin in (spec.get("inputs") or {}).values():
                 try:
                     if "each" in pin:
-                        await each.read_each_batch(spec, pin, io)
-                    elif "batch" in pin:
-                        await each.read_batch(pin, io)
+                        await each.read_each_batch(pin, io)
                     elif pin.get("load") == "data":  # a whole read: its locators, a page at a time
                         for js in [pin["index"]] if pin.get("index") else (pin.get("indexes") or {}).values():
                             index, after = KeyIndex(io, None, IndexState.from_json(js)), None

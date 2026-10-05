@@ -247,7 +247,7 @@ async def test_explain_says_why_a_key_is_or_is_not_there(world):
         "samples": {"present": True, "generation": ok["outputs"]["samples"]["generation"]}
     }
     assert ok["last"]["outcome"] == "ok" and ok["last_ok"] == ok["last"]
-    assert ok["last_ok"]["generation"] == ok["upstream_generation"] and ok["input_state"] == "caught_up"
+    assert ok["last_ok"]["generation"] == ok["upstream_generation"]
     assert ok["patterns"]["included"] and ok["patterns"]["excluded_by"] is None
     assert ok["patterns"]["pending"] is None and ok["failure"] is None
 
@@ -265,7 +265,7 @@ async def test_explain_says_why_a_key_is_or_is_not_there(world):
     content["new.csv"] = {"text": "8"}
     await run(engine, ["files"])
     pending = await explain("a.csv")
-    assert pending["verdict"] == "pending" and pending["input_state"] == "behind"
+    assert pending["verdict"] == "pending"
     assert pending["last_ok"]["generation"] != pending["upstream_generation"]
     assert (await explain("new.csv"))["verdict"] == "pending"
     assert (await explain("bug.csv"))["verdict"] == "failing"  # its record outlives the key until delivered
@@ -280,7 +280,7 @@ async def test_explain_says_why_a_key_is_or_is_not_there(world):
     assert bad_partition.status_code == 404
     await run(engine, ["parted"], partitions=["y"])  # a plain Incremental input never delivered
     consume = await client.get(f"{base}/assets/consume/explain", params={"key": "k1", "partition": "y"})
-    assert consume.json()["verdict"] == "pending" and consume.json()["input_state"] == "never"
+    assert consume.json()["verdict"] == "pending"
     assert consume.json()["last"] is None and consume.json()["outputs"] == {}
 
 
@@ -300,14 +300,14 @@ async def test_explain_a_key_restored_after_its_removal_is_pending(world):
     restored = await explain("a.csv")
     assert restored["last"]["outcome"] == "removed"
     assert restored["last_ok"]["generation"] != restored["upstream_generation"]  # a new write of it
-    assert restored["outputs"]["samples"]["present"] is False and restored["input_state"] == "behind"
+    assert restored["outputs"]["samples"]["present"] is False
     assert restored["verdict"] == "pending"
     await run(engine, ["parse"])
     delivered = await explain("a.csv")
     assert delivered["verdict"] == "ok" and delivered["outputs"]["samples"]["present"] is True
 
 
-async def test_edges_report_every_scope_and_its_lag(world):
+async def test_edges_report_every_scope_and_what_it_owes(world):
     engine, client, base, _, parts = world
     await run(engine, ["files", "parted"], partitions="all")
     await run(engine, ["consume"], partitions=["x"])
@@ -319,15 +319,13 @@ async def test_edges_report_every_scope_and_its_lag(world):
     assert inputs["parts"]["upstream_asset"] == "parted" and inputs["parts"]["batch_size"] == 1
     assert inputs["files"]["partitions"] == [] and inputs["files"]["source"] is False
     partitions = {s["partition"]: s for s in inputs["parts"]["partitions"]}
-    assert partitions["x"]["state"] == "caught_up" and partitions["x"]["lag"] == 0
-    assert partitions["x"]["position"]["next"] == partitions["x"]["head_commit"] + 1
+    none = {"added": 0, "updated": 0, "removed": 0}
+    head = engine.m.heads[("parts", "x")]["commit_number"]
+    assert partitions["x"]["observed"] == {"owed": none, "full_run_due": None, "observed_at": head}
     assert partitions["y"] == {
         "partition": "y",
         "upstream_partition": "y",
-        "position": None,
-        "head_commit": 0,
-        "lag": 1,
-        "state": "never",
+        "observed": {"owed": {**none, "added": len(parts["y"])}, "full_run_due": None, "observed_at": None},
     }
 
     parts["x"]["k3"] = 3
@@ -338,12 +336,12 @@ async def test_edges_report_every_scope_and_its_lag(world):
         s["partition"]: s
         for s in (await client.get(f"{base}/assets/consume/inputs")).json()["inputs"][0]["partitions"]
     }
-    assert (behind["x"]["state"], behind["x"]["lag"]) == ("behind", 2)
+    assert behind["x"]["observed"]["owed"] == {"added": 1, "updated": 2, "removed": 0}  # k3; k1, k2 rewritten
 
     each = {e["param"]: e for e in (await client.get(f"{base}/assets/parse/inputs")).json()["inputs"]}["file"]
     assert each["kind"] == "each" and (each["batch_size"], each["concurrency"]) == (10_000, 64)  # D111
     assert each["patterns"]["exclude"] == [["drafts", {"glob": "draft-*"}]]
-    assert [s["state"] for s in each["partitions"]] == ["never"]
+    assert [s["observed"]["observed_at"] for s in each["partitions"]] == [None]
 
 
 async def test_a_domain_too_big_to_list_still_rolls_up(tmp_path):

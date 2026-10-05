@@ -162,7 +162,7 @@ async def test_a_change_made_during_a_full_pass_reaches_downstream(state):
     await engine.set_automation("out.onchange.0", False)
     await drive(engine, await engine.submit(["items"]))
     run = await engine.submit(["out"])
-    while (state.model.position("out", "items", "") or {}).get("pass", {}).get("batch") != 1:
+    while not any(t.get("progress") for t in state.model.runs[run["id"]]["tasks"].values()):
         await engine.tick()
         await asyncio.sleep(0.01)
     await engine.cancel(run["id"])  # after its first batch: `a` delivered at 1
@@ -611,11 +611,10 @@ async def test_an_attempt_launched_before_its_output_moved_commits_nothing(state
     assert head["attempt"] != held and head["ref"]["store"] == "other"
 
 
-async def test_a_keys_run_after_a_move_starts_the_full_pass_a_default_run_finishes(state, tmp_path):
-    """K10, the review's example, under K45 and Erwin's correction: `copy`
-    holds {a, b}, moves, and runs keys=(a). The move reset it: a full pass
-    is due, and the keys= run starts it over with `a` alone. The next
-    default run continues that pass with `b`, never `a` again, and
+async def test_a_keys_run_after_a_move_is_finished_by_a_default_run(state, tmp_path):
+    """K10, the review's example: `copy` holds {a, b}, moves, and runs
+    keys=(a). The move reset it, its record with it: the keys= run observes
+    `a` alone. The next default run owes `b`, never `a` again, and
     converges to {a, b}."""
 
     @asset(outputs=Output("items", key="id"))
@@ -640,10 +639,10 @@ async def test_a_keys_run_after_a_move_starts_the_full_pass_a_default_run_finish
     assert status_of(detail) == "succeeded"
     assert sorted((await engine.list_keys("copy"))["keys"]) == ["a"]
     assert state.model.heads[("copy", "")]["ref"]["store"] == "other"
-    assert state.model.position("copy", "items", "")["pass"]["mode"] == "full"  # under way
+    assert sorted(await engine.observed("copy", "", "items")) == ["a"]
     assert status_of(await drive(engine, await engine.submit(["copy"]))) == "succeeded"
     assert sorted((await engine.list_keys("copy"))["keys"]) == ["a", "b"]
-    assert "pass" not in state.model.position("copy", "items", "")
+    assert sorted(await engine.observed("copy", "", "items")) == ["a", "b"]
 
 
 async def test_an_earlier_lifes_objects_are_never_read(state, tmp_path):

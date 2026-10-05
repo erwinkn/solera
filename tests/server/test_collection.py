@@ -187,7 +187,7 @@ async def test_compaction_leaves_nothing_uncollected(tmp_path, data):
 
 async def test_a_reader_pin_holds_collection_back(tmp_path):
     """Cleanup is due only once every reader pin has passed it: the
-    claims of attempts in flight, and a delta pass in batches over attempts."""
+    claims of attempts in flight."""
 
     @asset(outputs=Output("scores", keyed=True))
     def scores():
@@ -202,17 +202,6 @@ async def test_a_reader_pin_holds_collection_back(tmp_path):
     m.claims["reader"] = {"attempt": "r", "generation": 9, "started_at": 0, "status": "running"}
     assert engine._due_cleanups("scores", "", "me") == []
     m.claims["reader"]["generation"] = 10
-    m._partition("c", "")["positions"] = {
-        "e": {
-            "kind": "keys",
-            "output": "scores",
-            "upstream_partition": "",
-            "next": 0,
-            "pass": {"mode": "delta", "from": 0, "to": 1, "at": "k", "batch": 1, "batches": 2, "pin": 8},
-        }
-    }
-    assert engine._due_cleanups("scores", "", "me") == []
-    del m.partitions[("c", "")]
     assert [d["n"] for d in engine._due_cleanups("scores", "", "me")] == [10]
     assert [d["n"] for d in engine._due_cleanups("scores", "", "r")] == [10]  # its own claim reads none of it
     await state.close()

@@ -124,6 +124,14 @@ async def _layers(index: LayerIndex, p, h, *, keys, after, first, take) -> Delta
     return DeltaPage(diffs, None if cursor is None else key_str(cursor))
 
 
+def reserved(commits) -> set[int]:
+    """The endpoints today's index keeps for reads at `commits` — the P of
+    every observation layer, the H a batch in flight pinned: the state after
+    commit c is read from endpoint c + 1."""
+
+    return {int(c) + 1 for c in commits if c is not None}
+
+
 def _added(key: str, generation: int, payload) -> Diff:
     return Diff(key, False, True, generation, payload)
 

@@ -52,36 +52,4 @@ async def test_a_run_finishes_the_pass_it_began_before_it_ends(state, tmp_path):
     assert detail["request"]["status"] == "succeeded"
     assert sorted((await engine.list_keys("checks"))["keys"]) == ["a", "bad", "k1", "k2", "k3"]
     assert engine.m.partition("checks", "")["caught_up"] is True
-    assert "pass" not in engine.m.position("checks", "item", "")
-
-
-async def test_a_retry_pass_that_leaves_nothing_uncovered_collapses_the_record():
-    """K47: a retry pass's last batch says whether every key changed past the
-    snapshot has been delivered — read ahead at or after its change, or read
-    by this batch (a removal by removing it) — so the record collapses as
-    after a default run; anything else left, it does not."""
-
-    from obstore.store import MemoryStore
-    from solera import keys as K
-    from solera.keys.index import FileInfo, IndexState, Span
-    from solera.keys.io import ObjectIO
-    from solera.patterns import Matcher
-    from solera_worker.each import _retry_covers
-
-    io, spans = ObjectIO(MemoryStore()), [Span(0, 0, ((0, 0),), ())]
-    for c, (keys, generation, deleted, predecessors) in enumerate(
-        [([b"a", b"b"], 10, b"\0\0", None), ([b"c"], 11, b"\x01", [1])],
-        start=1,  # c held before: removed
-    ):
-        data = K.encode_file(keys, [generation] * len(keys), deleted, predecessors=predecessors)
-        await io.write(f"idx/{c:012d}-log.kx", data)
-        spans.append(Span(c, c, ((c, generation),), (FileInfo.describe(f"{c:012d}-log", data),)))
-    state = IndexState(spans=tuple(spans), prefix="idx/")
-    cover = {"from": 1, "to": 2, "index": state.to_json(), "ahead": {"a": [10, True]}}
-    taken = Matcher(None)
-    assert await _retry_covers(cover, taken, {"b": 10}, {"c"}, io)  # a ahead, b retried, c removed
-    assert not await _retry_covers(cover, taken, {"b": 10}, set(), io)  # c's removal not delivered
-    assert not await _retry_covers(cover, taken, {"b": 9}, {"c"}, io)  # b read before its change
-    assert await _retry_covers(
-        cover, Matcher({"exclude": [["exclude[0]", {"glob": "b"}]], "include": []}), {}, {"c"}, io
-    )  # b not taken
+    assert sorted(await engine.observed("checks", "", "item")) == ["a", "bad", "k1", "k2", "k3"]

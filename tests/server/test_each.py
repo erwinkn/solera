@@ -340,11 +340,11 @@ def test_registration():
         )
 
 
-async def test_a_user_cancel_commits_finished_keys_and_leaves_the_rest_dormant(tmp_path):
+async def test_a_user_cancel_commits_finished_keys_and_leaves_the_rest_owed(tmp_path):
     """Cancel requested: no key starts, the calls in flight are cancelled, the
-    keys that finished commit with the interrupted ones' records and the
-    position past the whole batch (§5); canceled keys never come due by
-    themselves (§9)."""
+    keys that finished commit with the interrupted ones' records (§5). The
+    interrupted keys are not observed (docs/observed-set.md, "Outcomes"):
+    they stay owed, and the next run takes them."""
 
     from solera.failed_keys import CANCELED
     from solera_server.state import State
@@ -384,13 +384,9 @@ async def test_a_user_cancel_commits_finished_keys_and_leaves_the_rest_dormant(t
     assert set(await rows_of(engine, project, "rows")) == {"a"}
     found = await records(engine, "parse")
     assert {k: r.outcome for k, r in found.items()} == {"b": CANCELED, "c": CANCELED}
-    assert "pass" not in engine.m.position("parse", "file", "")  # past the whole batch
-    # Dormant: a later run finds nothing to do.
+    # Only what finished is observed: b and c, interrupted, stay owed (and retried).
+    assert sorted(await engine.observed("parse", "", "file")) == ["a"]
     release.set()
-    detail = await engine.run_until((await engine.submit(["parse"]))["id"], 10)
-    assert detail["tasks"][0]["status"] == "skipped"
-    # Until someone asks.
-    engine.retry_keys("parse", ["canceled"])
     detail = await engine.run_until((await engine.submit(["parse"]))["id"], 10)
     assert detail["request"]["status"] == "succeeded"
     assert set(await rows_of(engine, project, "rows")) == {"a", "b", "c"}
@@ -551,10 +547,10 @@ async def test_patterns_select_keys_and_a_batch_of_none_is_skipped(state):
 
 
 async def test_a_pattern_change_cuts_over(state):
-    """§11: changes up to the pattern change finish under the old patterns — so a
-    pending deletion of a newly excluded key still removes its rows — then
-    membership is diffed against the snapshot at the pattern change, then deltas
-    continue under the new patterns."""
+    """§11: new patterns are an input change, compared once: a pending deletion
+    of a newly excluded key still removes its rows, newly included keys are
+    added, a key both take is not reprocessed; then changes come under the
+    new patterns."""
 
     content = {"a/1.csv": {"n": 1}, "archive/2.csv": {"n": 2}, "b/3.csv": {"n": 3}}
     seen = []
@@ -589,46 +585,12 @@ async def test_a_pattern_change_cuts_over(state):
     assert status_of(detail) == "succeeded"
     assert set(await rows_of(engine, new, "samples")) == {"a/1.csv", "b/3.csv", "b/4.csv"}
     assert sorted(seen) == ["b/3.csv", "b/4.csv"]  # a/1.csv matched both times: not reprocessed
-    position = engine.m.position("parse", "file", "")
-    assert (
-        "pattern_change" not in position
-        and position["patterns"] == new.manifest["assets"]["parse"]["inputs"]["file"]["patterns"]
-    )
-    # From here on, deltas under the new patterns.
+    # From here on, changes under the new patterns.
     content["b/5.csv"] = {"n": 5}
     content["archive/6.csv"] = {"n": 6}
     seen.clear()
     await drive(engine, await engine.submit(["parse"], upstream=True))
     assert seen == ["b/5.csv"]
-
-
-async def test_a_rescope_pins_its_snapshot_between_attempts(state):
-    """The snapshot a pattern change diffs is read across attempts: index files it
-    names stay until the transition ends, even with no attempt running."""
-
-    def parse(file: dict):
-        return []
-
-    engine = make_engine(state, files_project({}, parse))
-    await engine.initialize()
-    path = "keys/files/_/old.kx"
-    await state.put_object(path, b"x")
-    engine.m.garbage.append([path, engine.m.event_counter + 5])  # let go of after the pin below
-    engine.m._partition("parse", "")["positions"] = {
-        "file": {
-            "kind": "keys",
-            "output": "files",
-            "upstream_partition": "",
-            "next": 3,
-            "pattern_change": {"pin": engine.m.event_counter, "at": 2},
-            "pass": {"mode": "diff", "at": "k", "batch": 1, "batches": 2},
-        }
-    }
-    await engine.upkeep.collect()
-    assert await state.get_object(path) is not None
-    del engine.m.partitions[("parse", "")]["positions"]
-    await engine.upkeep.collect()
-    assert await state.get_object(path) is None
 
 
 async def test_none_is_no_change_and_removal_is_explicit(state):
