@@ -391,4 +391,4 @@ async def test_an_each_delivery_resumed_by_a_firing_takes_its_change(state):
             break
         await asyncio.sleep(0.01)
     assert ("a", "2") in calls and ("b", "2") in calls
-    assert state.model.complete("out", "")
+    assert await engine.complete("out", "")

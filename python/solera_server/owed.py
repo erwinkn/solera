@@ -231,6 +231,18 @@ def _owe(key, old, new, context, *, versioned: bool) -> Owe:
     return Owe(key, cls, old, version, generation)
 
 
+async def uncovered(index: KeyIndex, rec: dict, take) -> bool:
+    """Whether a key present upstream now, that `take` takes, decodes from
+    the empty base: in a gap of the record (`observed.gaps`) and no point.
+    Each gap a scan at the head, stopping at the first such key."""
+
+    for lo, hi in observed.gaps(rec):
+        async for d in _diffs(index, None, None, lo, hi):
+            if take(d.key) and d.key not in rec["points"]:
+                return True
+    return False
+
+
 async def owed(index: KeyIndex, rec: dict, now: Now, after: str | None = None, held=None) -> list[Owe]:
     """Every key owed past `after`: the staleness, and what a default run loads."""
 

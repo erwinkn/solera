@@ -169,16 +169,21 @@ is no `full`. A run given `"all"` covers the same key ranges and loads
 every key in them; one given an explicit list loads those keys and writes
 points.
 
-**Complete.** A partition is complete when no key decodes from the
-empty base: its base is a commit (or, in a per-key consumer's full run,
-what it holds), or its ranges tile the key space from the first key to
-the last. Derived from `R`, never stored. A first or full run is not
-complete before its walk has covered every key; an incremental run
-cancelled midway still has a commit base: complete, and stale. An unkeyed
-input's record, the last commit it read, always is — a prefix of an
-append log is the upstream as of that commit. Fan-ins read complete
-heads, a partition that is not complete shows `missing`, and the
-history's `materialized` column is the same rule after each commit.
+**Complete** (D176). A partition is complete when no key present
+upstream decodes from the empty base — keys absent upstream it decodes as
+absent anyway. Where the base is a commit (or, in a per-key consumer's
+full run, what it holds), or the ranges tile the key space from the first
+key to the last, there is no gap and nothing to read; otherwise each gap
+is a scan of the upstream now, stopping at the first key the patterns
+take that no point covers. Derived from `R` and the upstream, live, never
+stored. A first or full run is not complete before its walk has covered
+every key, unless what it left is gone upstream; an incremental run
+cancelled midway still has a commit base: complete, and stale; a `keys=`
+run naming every key upstream is complete. An unkeyed input's record, the
+last commit it read, always is — a prefix of an append log is the
+upstream as of that commit. Fan-ins read complete heads, and a partition
+that is not complete shows `missing`. The history logs no completeness:
+each commit row records `final`, whether it was its run's last batch.
 
 A cancelled or failed run leaves its committed batches' ranges and
 points. The next run compares again: keys under those ranges decode at

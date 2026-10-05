@@ -96,7 +96,7 @@ async def test_bare_return_and_commit(state):
     assert status_of(detail) == "succeeded"
     installed = head(state, "numbers")
     assert installed["ref"]["output"] == "numbers" and installed["ref"]["generation"]
-    assert state.model.complete("numbers", "")
+    assert await engine.complete("numbers", "")
     assert installed["run"] == run["id"] and installed["attempt"]
 
 
@@ -324,7 +324,7 @@ async def test_incremental_batching_and_more(state):
     detail = await drive(engine, await engine.submit(["consumer"], upstream=True))
     assert status_of(detail) == "succeeded"
     assert commits == [["k0", "k1"], ["k2", "k3"], ["k4"]]
-    assert state.model.complete("consumer", "")
+    assert await engine.complete("consumer", "")
     task = [t for t in detail["tasks"] if t["asset"] == "consumer"][0]
     assert len(detail["attempts"][task["id"]]) == 3  # three batches, three attempts
 

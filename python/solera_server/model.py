@@ -376,24 +376,6 @@ class Model:
 
         return self.partitions.get((asset, partition)) or {}
 
-    def complete(self, asset: str, partition: str) -> bool:
-        """Whether a partition's content is complete — derived, never stored:
-        it has committed, and what each incremental input observed is
-        complete (`observed.complete`: no key decodes from the empty base).
-        Fan-ins, skipped missing inputs, the `missing` status and the
-        history's `materialized` read it."""
-
-        record = self.partition(asset, partition)
-        if "definition" not in record:
-            return False
-        inputs = ((self.manifest or {}).get("assets") or {}).get(asset, {}).get("inputs") or {}
-        records = record.get("observed") or {}
-        return all(
-            param in records and observed.complete(records[param])
-            for param, spec in inputs.items()
-            if spec.get("kind") == "incremental"
-        )
-
     def _partition(self, asset: str, partition: str) -> dict:
         """An asset partition's record, to change: made if it has none."""
 
@@ -1244,7 +1226,7 @@ class Model:
                     keys=(commit.get("keys") or {}).get(name),
                     rows=(commit.get("rows") or {}).get(name),
                     metadata=(commit.get("metadata") or {}).get(name),
-                    materialized=self.complete(asset, partition),
+                    final=commit.get("final"),
                 ),
             )
             for row in history.lineage(name, partition, head, reads):

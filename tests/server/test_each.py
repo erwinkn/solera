@@ -645,7 +645,7 @@ async def test_a_last_batch_that_writes_nothing_still_completes_the_partition(st
     written = engine.m.heads[("samples", "")]
     task = next(t for t in detail["tasks"] if t["asset"] == "parse")
     assert written["attempt"] == detail["attempts"][task["id"]][0]["id"]  # a's batch wrote it
-    assert engine.m.complete("parse", "")
+    assert await engine.complete("parse", "")
     planner = engine.planner()
     assert planner.materialized("parse", "") and planner.partitions("parse", "missing") == []
     assert engine.head_view(written)["materialized"] is True

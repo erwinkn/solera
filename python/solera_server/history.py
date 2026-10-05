@@ -161,7 +161,7 @@ TABLES = {
             "added_keys": "VARCHAR[]",  # a source commit's keys, listed up to 1,000
             "removed_keys": "VARCHAR[]",
             "rows": "BIGINT",
-            "materialized": "BOOLEAN",
+            "final": "BOOLEAN",  # the last batch of its run (a source commit's: null)
             "metadata": "VARCHAR",  # JSON object; an unkeyed source commit's version is in it
             "generation": "BIGINT",  # its version: the write's (an attempt's, a source commit's)
         },
@@ -523,12 +523,12 @@ def source_run_row(run: dict, at: float) -> dict:
 
 
 def commit_row(
-    output, asset, partition, head, *, keys=None, rows=None, metadata=None, listed=None, materialized=True
+    output, asset, partition, head, *, keys=None, rows=None, metadata=None, listed=None, final=None
 ) -> dict:
     """The row of an output version a commit installed: `head` is the head
     as installed, `keys` the commit's key delta for the output, `listed` a
-    source commit's record, which lists the keys it changed; `complete`
-    whether the commit drained its partition's pass."""
+    source commit's record, which lists the keys it changed; `final`
+    whether it was the last batch of its run (as `ctx.batch.final`)."""
 
     listed = listed or {}
 
@@ -548,7 +548,7 @@ def commit_row(
         "added_keys": listed.get("upserted") if isinstance(listed.get("upserted"), list) else None,
         "removed_keys": listed.get("deleted") if isinstance(listed.get("deleted"), list) else None,
         "rows": count if count is not None else rows,
-        "materialized": bool(materialized),
+        "final": final,
         "metadata": metadata or None,
         "generation": head["ref"].get("generation"),
     }

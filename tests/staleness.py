@@ -369,13 +369,14 @@ class Reference:
         return bool(self.reasons(name))
 
     def complete(self, name: str) -> bool:
-        """Whether a consumer's content is complete: built, and no key decodes
-        from the empty base — a default run walked every key since its
-        last start-over from nothing; a per-key consumer's start-over keeps
-        what it holds as its base."""
+        """Whether a consumer's content is complete: built, and no key present
+        upstream decodes from the empty base — a default run walked every
+        key since its last start-over from nothing (a per-key consumer's
+        start-over keeps what it holds as its base), or every key `items`
+        has under its patterns is observed outright."""
 
         o = self.checks if name == "checks" else self.others[name]
-        return o.built and o.whole
+        return o.built and (o.whole or all(k in o.seen for k in self.up if o.takes(k)))
 
 
 class Holdings:

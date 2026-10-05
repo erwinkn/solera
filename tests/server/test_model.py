@@ -118,7 +118,7 @@ async def test_commit_installs_heads_cursor_observations_and_pends_onchange(stat
     assert detail["request"]["status"] == "succeeded"
     m = state.model
     assert m.heads[("files", "")]["run"] == detail["request"]["id"]
-    assert m.complete("consumer", "")
+    assert await engine.complete("consumer", "")
     rec = m.partition("consumer", "")["observed"]["files"]  # its record: every key, at the head
     assert rec["upstream"] == ["files", ""] and rec["ranges"] == [] and rec["base"]["endpoint"] == 0
     assert m.oldest_observed("files", "") == 0 and m.endpoints("files", "") == {1}

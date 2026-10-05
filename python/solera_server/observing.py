@@ -17,6 +17,7 @@ every commit."""
 from __future__ import annotations
 
 import copy
+import json
 from dataclasses import dataclass
 
 from solera.failed_keys import Record, eligible, minima
@@ -80,6 +81,88 @@ class Observing:
                 versions.append([key, given if given is not None else (ref or {}).get("generation")])
             out[input.param] = sorted(versions) if input.fan_in else (versions[0][1] if versions else None)
         return out
+
+    # -- complete (D176): derived and live, never stored -------------------------------
+
+    def _gappy(self, asset: str, partition: str) -> list | None:
+        """What deciding whether a partition is complete takes: None if it is
+        not — never committed, or an incremental input with no record —
+        else each keyed input record with gaps (`observed.gaps`), as
+        `(key, stamp, input, rec)`, `stamp` what its answer depends on."""
+
+        record = self.m.partition(asset, partition)
+        if "definition" not in record:
+            return None
+        try:
+            inputs = self.planner().inputs(asset, partition)
+        except planning.UpstreamOnly:
+            return None
+        records, out = record.get("observed") or {}, []
+        for input in inputs:
+            if input.kind != "incremental":
+                continue
+            rec = records.get(input.param)
+            if rec is None:
+                return None
+            holes = observed.gaps(rec)
+            if not holes:
+                continue
+            state = self.m.indexes.get((input.output, input.partition))
+            stamp = (
+                json.dumps(holes),
+                tuple(sorted(rec["points"])),
+                state.head if state is not None else -1,
+                state.life if state is not None else "",
+                json.dumps(input.spec.get("patterns"), sort_keys=True),
+            )
+            out.append(((asset, partition, input.param), stamp, input, rec))
+        return out
+
+    def _complete_known(self, asset: str, partition: str) -> bool:
+        """`complete` as far as it is known now, for what plans and views
+        synchronously (fan-ins, skipped missing inputs, statuses): a gap
+        not yet checked counts as not complete until the tick checks it."""
+
+        checks = self._gappy(asset, partition)
+        if checks is None:
+            return False
+        return all(self._covers.get(key) == (stamp, True) for key, stamp, _, _ in checks)
+
+    async def complete(self, asset: str, partition: str) -> bool:
+        """Whether a partition's content is complete (D176): it has committed,
+        and no key present upstream decodes from the empty base in what any
+        incremental input observed — keys absent upstream it decodes as
+        absent anyway. A record with no gaps is complete outright; one with
+        gaps (a first or full run not done, keys= runs alone) asks the
+        upstream, a scan of each gap stopping at the first key
+        (`owed.uncovered`). Derived and live, never stored."""
+
+        checks = self._gappy(asset, partition)
+        if checks is None:
+            return False
+        for key, stamp, input, rec in checks:
+            known = self._covers.get(key)
+            if known is None or known[0] != stamp:
+                index, _ = self._upstream(input.output, input.partition)
+                with self.m.reading(index.state.prefix):
+                    covered = not await owed.uncovered(index, rec, Matcher(input.spec.get("patterns")))
+                self._covers[key] = known = (stamp, covered)
+            if not known[1]:
+                return False
+        return True
+
+    async def _cover_tick(self) -> None:
+        """Bring `_complete_known` up to date: every partition with a gap
+        whose answer is not known for the upstream as it is now."""
+
+        gappy = [
+            key
+            for key, record in self.m.partitions.items()
+            if any(observed.gaps(rec) for rec in (record.get("observed") or {}).values())
+        ]
+        for asset, partition in gappy:
+            if asset in self.manifest["assets"]:
+                await self.complete(asset, partition)
 
     def _decodable(self, rec: dict, output: str, partition: str) -> bool:
         """Whether a record still decodes: its layers name the upstream

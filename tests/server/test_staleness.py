@@ -124,7 +124,6 @@ class Staleness(RuleBasedStateMachine):
         self.outside = External()
         self.decl = {"items_store": "a", "checks_store": "a", "checks_v": "1", "copy_v": "1", "count_v": "1"}
         self.serial = 0
-        self.seen: dict[str, int] = {}  # each output's newest commit in the history, checked
 
     def _run(self, coro):
         return self.loop.run_until_complete(coro)
@@ -307,15 +306,10 @@ class Staleness(RuleBasedStateMachine):
                 assert await staleness.asset_stale(e, name) == want, f"{name}: asset stale != {want}"
                 why = await staleness.stale_reasons(e, name)
                 assert why == ref.reasons(name), f"{name}: stale for {why}, not {ref.reasons(name)}"
-            for name in ("checks", "copy", "count"):  # complete, derived; and the history agrees
-                assert e.m.complete(name, "") == ref.complete(name), (
+            for name in ("checks", "copy", "count"):  # complete, derived and live
+                assert await e.complete(name, "") == ref.complete(name), (
                     f"{name}: complete != {ref.complete(name)}"
                 )
-                rows = (await e.history.commits(outputs=[name]))["commits"]
-                newest = rows[0] if rows else None
-                if newest is not None and newest["generation"] != self.seen.get(name):
-                    self.seen[name] = newest["generation"]
-                    assert newest["materialized"] == ref.complete(name), f"{name}'s history: {newest}"
 
         self._run(check())
 

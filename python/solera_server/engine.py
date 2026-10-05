@@ -156,6 +156,7 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
         self.fence = Tasks("fence")  # what halts it the moment its state ends
         # Attempts whose end failed: (times, not adopted again before this monotonic time).
         self._crashes: dict[str, tuple[int, float]] = {}
+        self._covers: dict[tuple, tuple] = {}  # an input record with gaps: is it covered? (`complete`)
         # attempt id -> set when its run is controlled, so its watcher looks at once.
         self._stirred: dict[str, asyncio.Event] = {}
         # Attempts consuming a local execution slot. Pool attempts only poll
@@ -328,6 +329,7 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
         """One evaluation pass: adoption, dispatch, automations, archiving."""
 
         self._adopt()
+        await self._cover_tick()
         self._cleanup_job()
         self._dispatch_due()
         self._sensor_sweep()
@@ -413,7 +415,7 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
             self.m.heads_of,
             self.clock(),
             projected,
-            self.m.complete,
+            self._complete_known,
         )
 
     def _plan_run(
@@ -838,6 +840,7 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
             if prepared.get("skip"):
                 commit = {**await self._observations(task, prepared, {}), **self._made(prepared)}
                 more = bool(prepared.get("more"))
+                commit["final"] = not more
                 self._finish(task, claim, "skipped", commit=commit, more=more)
                 return
             stage = await self._launch(task, run, attempt, prepared)
@@ -1521,6 +1524,7 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
             if prepared["outputs"][name]["head"] is None and failures is None and not result.get("skipped"):
                 raise Conflict(f"omitted output {name} has no head to keep (§2)", retryable=False)
         commit = {"heads": heads, **observations, **self._made(prepared)}
+        commit["final"] = not more and outcome == "succeeded"  # a canceled run has no final commit
         if failures is not None:
             commit["failures"] = failures
             if result.get("key_outcomes"):
