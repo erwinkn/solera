@@ -135,6 +135,11 @@ loud they are. `prefers-reduced-motion` zeroes the motion tokens in both
 themes. `pnpm contrast` checks every text/background pair of every theme, and
 of Brutal's navigation scope, against WCAG AA.
 
+**The default is Voltage (D160):** Signal by day and Arc at night. With no
+theme chosen, the console follows the system's light or dark preference, and
+switches with it; "Automatic" at the top of the theme menu returns to that
+after a pick. Every other theme stays selectable.
+
 The theme is persisted in `localStorage` and applied before first paint by
 `public/theme.js`, a blocking external script (no inline script, so the
 server's CSP can drop `'unsafe-inline'` for scripts).

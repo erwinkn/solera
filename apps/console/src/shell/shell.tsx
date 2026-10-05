@@ -20,7 +20,7 @@ import { cleanupStuck } from "@/api/read";
 import { q } from "@/api/queries";
 import { cn } from "@/lib/cn";
 import { connect, disconnect, useSession } from "@/lib/session";
-import { setTheme, THEME_NAMES, THEMES, useTheme, type Theme } from "@/lib/theme";
+import { setTheme, THEME_NAMES, THEMES, useTheme, type Preference } from "@/lib/theme";
 import { toneSoft, type Tone } from "@/lib/status";
 import { Button, IconButton } from "@/ui/button";
 import { Input, Select } from "@/ui/form";
@@ -257,9 +257,9 @@ function ThemeSwitch() {
         aria-label="Theme"
         className="h-7 w-36 text-xs"
         value={theme}
-        onChange={(e) => setTheme(e.target.value as Theme)}
+        onChange={(e) => setTheme(e.target.value as Preference)}
       >
-        {THEMES.map((t) => (
+        {(["auto", ...THEMES] as const).map((t) => (
           <option key={t} value={t}>
             {THEME_NAMES[t]}
           </option>
