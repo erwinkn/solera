@@ -72,6 +72,9 @@ fn get_varint(buf: &[u8], pos: &mut usize) -> Result<u64> {
             return bad("truncated varint");
         };
         *pos += 1;
+        if shift == 63 && b > 1 {
+            return bad("varint past 64 bits"); // its tenth byte holds one bit (F23)
+        }
         n |= ((b & 0x7f) as u64) << shift;
         if b < 0x80 {
             return Ok(n);
@@ -1519,6 +1522,28 @@ mod tests {
             decode(&side, Stamp::default()).unwrap(),
             m.dropped,
         )
+    }
+
+    #[test]
+    fn a_varint_past_64_bits_is_refused() {
+        let mut max = Vec::new();
+        put_varint(&mut max, u64::MAX);
+        assert_eq!(get_varint(&max, &mut 0).unwrap(), u64::MAX);
+        // F23: a tenth byte above 0x01 is refused, never read with its high bits dropped.
+        let past = [[0xff; 9].as_slice(), &[0x7f]].concat();
+        assert!(get_varint(&past, &mut 0).is_err());
+        let long = [0xff; 11];
+        assert!(get_varint(&long, &mut 0).is_err());
+    }
+
+    #[test]
+    fn a_block_claiming_more_than_max_raw_is_refused_before_inflating() {
+        // F29: a header's raw length bounds what its block inflates to, and past
+        // MAX_RAW it is refused before anything is decompressed.
+        let mut block = vec![0u8; HEADER];
+        block[8..12].copy_from_slice(&((MAX_RAW + 1) as u32).to_le_bytes());
+        let err = read_block(&block, 0).unwrap_err();
+        assert!(format!("{err:?}").contains("raw bytes"));
     }
 
     #[test]
