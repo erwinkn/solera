@@ -172,7 +172,7 @@ export function Run() {
         <Card>
           <CardHeader
             title="Timeline"
-            description={`${plural(tasks.length, "task")} · bars are attempts, split into phases; a dashed line is time waiting to run`}
+            description={`${plural(tasks.length, "task")} · bars are batches (one for most tasks) and their retries, split into phases; a dashed line is time waiting to run`}
             actions={<PhaseLegend className="hidden md:flex" />}
           />
           <Waterfall
@@ -431,7 +431,7 @@ function Batches({ run, task, walk, selected }: { run: string; task: Task; walk:
           <tr>
             <th className="py-1.5 pr-3 pl-4 font-medium">Batch</th>
             <th className="px-3 py-1.5 font-medium">Keys</th>
-            <th className="px-3 py-1.5 font-medium">Held</th>
+            <th className="px-3 py-1.5 font-medium">Changes</th>
             {walk.retried && <th className="py-1.5 pr-4 pl-3 font-medium">Attempts</th>}
           </tr>
         </thead>
@@ -599,16 +599,10 @@ function AttemptSummary({
         </div>
       )}
 
-      {attempt.batch && (
+      {/* With several batches, the batch table above already says this for the selected row. */}
+      {attempt.batch && !walk.multi && (
         <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs">
-          {walk.multi ? (
-            <>
-              <span className="text-fg-subtle">Batch {attempt.batch.index + 1}</span>
-              <BatchRange batch={attempt.batch} />
-            </>
-          ) : (
-            <span className="text-fg-subtle">Keys</span>
-          )}
+          <span className="text-fg-subtle">Keys</span>
           <KeyClasses {...attempt.batch} />
         </div>
       )}
