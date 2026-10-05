@@ -347,3 +347,25 @@ async def test_a_state_no_checkpoint_can_hold_stops_the_journal(store):
     await j._task
     assert (await journal_of(store))["events"] == [] and checkpoints(store) == []
     await j.close()
+
+
+async def test_a_namespace_of_another_state_format_is_refused(store):
+    """State from before the stamped-layer key index (T33) is unreadable,
+    with no migration: an engine refuses it, naming the fix, before reading
+    or writing anything. A fresh namespace is stamped with today's format."""
+
+    j, state, _ = await open_journal(store)
+    record(j, state, "a")
+    await j.close()
+    body = orjson.loads(bytes(await (await obstore.get_async(store, "control/journal.json")).bytes_async()))
+    assert body["format"] == journal_module.FORMAT
+    j, state, _ = await open_journal(store)  # today's format reopens
+    assert state.counts == {"a": 1}
+    await j.close()
+
+    old = {k: v for k, v in body.items() if k != "format"}  # as written before the change
+    await obstore.put_async(store, "control/journal.json", orjson.dumps(old))
+    with pytest.raises(journal_module.OldNamespace, match="start a fresh namespace"):
+        await open_journal(store)
+    after = orjson.loads(bytes(await (await obstore.get_async(store, "control/journal.json")).bytes_async()))
+    assert after == old  # not fenced, not rewritten

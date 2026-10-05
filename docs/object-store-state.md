@@ -92,7 +92,7 @@ current content.
 ```
 {root}/{namespace}/
   control/
-    journal.json                             ← the engine id, the checkpoint, the events since
+    journal.json                             ← the engine id, the checkpoint, the events since, the format
     checkpoints/7f3a9c0e5b21d846-000012.json ← the checkpoint the journal names
   keys/
     site_files/alpha/000000000057-01J8ZD….-0.lay  ← delta of commit 57 (attempt, file)
@@ -192,8 +192,15 @@ Its automations then decide, each by its own criterion:
 ## 3. Journal
 
 One object, `control/journal.json`, rewritten whole by every flush: the
-engine id of its writer, the name of the checkpoint it extends, and
-every event since that checkpoint (§10). There is one way to change state:
+engine id of its writer, the name of the checkpoint it extends, every
+event since that checkpoint (§10), and the state's `format`.
+
+**Format, and no migration.** The state's format is 2 since the
+stamped-layer key index and cleanup cursors (T33). An engine refuses a
+namespace written in another format, a journal with no `format` included,
+before it reads or writes anything (`OldNamespace`): **state from before
+the switch is unreadable; start a fresh namespace.** Solera migrates
+nothing: there are no deployments to keep, and no backwards compatibility. There is one way to change state:
 `State.record(*events)` applies the events to the model and buffers them,
 synchronously — the engine never waits on storage. A background flusher
 appends what is buffered to the journal once the oldest event has waited

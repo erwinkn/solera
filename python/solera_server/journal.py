@@ -7,7 +7,7 @@ the id of the engine that writes it, the checkpoint it extends, and every
 event since that checkpoint. A checkpoint is the whole state, written now
 and then under a fresh name.
 
-    {prefix}/journal.json                    {"checkpoint", "engine", "epoch", "events": [...]}
+    {prefix}/journal.json                    {"checkpoint", "engine", "epoch", "events": [...], "format"}
     {prefix}/checkpoints/{engine}-{n:06d}.json   {"at", "engine", "state": {...}}
 
 **Opening.** Read the journal, load the checkpoint it names and apply its
@@ -66,6 +66,12 @@ from solera.objects import Conflict, create, read, swap
 
 log = logging.getLogger(__name__)
 
+# The state's format, written in every journal. A namespace written in another
+# is refused, never read: there is no migration (no deployments, no backwards
+# compatibility). 2: stamped-layer key indexes and cleanup cursors (T33); a
+# journal with no format is from before them.
+FORMAT = 2
+
 
 class Stopped(RuntimeError):
     """This journal writes no more; its engine must stop."""
@@ -77,6 +83,10 @@ class Fenced(Stopped):
 
 class JournalCorrupt(RuntimeError):
     """The journal, or the checkpoint it names, cannot be read."""
+
+
+class OldNamespace(RuntimeError):
+    """A namespace whose state another format wrote: unreadable here."""
 
 
 def encode(event: dict) -> bytes:
@@ -155,7 +165,7 @@ class Journal:
 
     def _body(self, engine: str | None, epoch: int, checkpoint: str | None, events: list[bytes]) -> bytes:
         head = _dumps({"checkpoint": checkpoint, "engine": engine, "epoch": epoch})  # sorts before "events"
-        return head[:-1] + b',"events":[' + b",".join(events) + b"]}"
+        return head[:-1] + b',"events":[' + b",".join(events) + b'],"format":' + str(FORMAT).encode() + b"}"
 
     # -- opening ----------------------------------------------------------------------
 
@@ -179,6 +189,12 @@ class Journal:
                 body = orjson.loads(found[0]) if found is not None else {"checkpoint": None, "events": []}
             except orjson.JSONDecodeError as error:
                 raise JournalCorrupt(f"{self._journal}: {error}") from None
+            if found is not None and body.get("format", 1) != FORMAT:
+                raise OldNamespace(
+                    f"{self._journal}: written in state format {body.get('format', 1)}, and this engine "
+                    f"reads only format {FORMAT} (stamped-layer key indexes, T33). State from before "
+                    "that change is unreadable: start a fresh namespace."
+                )
             checkpoint = body["checkpoint"]
             try:
                 state = await self._load(checkpoint) if checkpoint is not None else None
