@@ -395,12 +395,12 @@ class Model:
         return self.partitions[key]
 
     def _ended(self, task: dict, outcome: str, run: str, attempt: str | None, at: float) -> None:
-        self._partition(task["asset"], task["partition"])["last"] = {
-            "outcome": outcome,
-            "run": run,
-            "attempt": attempt,
-            "at": at,
-        }
+        record = self._partition(task["asset"], task["partition"])
+        record["last"] = {"outcome": outcome, "run": run, "attempt": attempt, "at": at}
+        if outcome == "failed":  # its runs failing in a row: changes back off (F43)
+            record["failed_in_row"] = int(record.get("failed_in_row") or 0) + 1
+        elif outcome in ("succeeded", "skipped"):
+            record.pop("failed_in_row", None)
 
     def pending_partitions(self, asset: str) -> set[str]:
         return {partition for (a, partition), ids in self.pending.items() if a == asset and ids}

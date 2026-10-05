@@ -1,7 +1,7 @@
 """Soak: the demo project runs in-process on `file://` state with a fake clock
 for >= 500 commits per site, and nothing may grow faster than the work does.
 
-- the demo's data (FileStore, under `$SOLERA_DATA`) grows linearly in
+- the demo's data (FileStore, under `$SOLERA_DATA_URL`) grows linearly in
   commits: one object per commit of events, and per changed key;
 - `control/` — the journal and checkpoints — stays bounded however many runs
   happen: at most two checkpoints, and the journal since the older one;

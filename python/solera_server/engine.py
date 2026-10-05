@@ -83,6 +83,7 @@ SOURCE_KEYS_RECORDED = 1000  # a source commit's run lists changed keys up to th
 GRACE_SECONDS = 5.0
 CLEANUP_TRIES = 6  # a cleanup task's attempts, its retries backing off from a minute (K25)
 CLEANUP_RETRY_DELAY = 60.0  # a failed cleanup task's first retry, then doubling
+CHANGE_BACKOFF, CHANGE_BACKOFF_MAX = 60.0, 3600.0  # a failing partition's changes wait, doubling (F43)
 
 
 class Retryable(RuntimeError):
@@ -2130,7 +2131,11 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
             named = {t: planner.partitions(t, explicit) for t in auto["targets"]} if explicit else None
             for producer, partition in (list(p) for p in auto["pending"]):
                 owed = named or {t: planner.reach(producer, partition, t) for t in auto["targets"]}
-                if any(self._partition_active(t, s) for t, partitions in owed.items() for s in partitions):
+                if any(
+                    self._partition_active(t, s) or self._backing_off(t, s)
+                    for t, partitions in owed.items()
+                    for s in partitions
+                ):
                     continue
                 if not all(planner.visible(producer, partition, t) for t in owed):
                     continue
@@ -2146,6 +2151,20 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
             return  # the changes stay pending: the next tick replays them
         self.failing.pop(f"automation {auto['name']}", None)
         self._fired(auto, run, consumed=consumed)
+
+    def _backing_off(self, asset: str, partition: str) -> bool:
+        """Whether a partition whose runs keep failing waits before a change
+        runs it again (F43): `CHANGE_BACKOFF` after its last failure,
+        doubling with each failure in a row up to `CHANGE_BACKOFF_MAX`. Its
+        changes stay pending, and it stays failed and visible; a run that
+        succeeds — or one a user starts — ends the wait."""
+
+        record = self.m.partition(asset, partition)
+        failed = int(record.get("failed_in_row") or 0)
+        if not failed:
+            return False
+        wait = min(CHANGE_BACKOFF_MAX, CHANGE_BACKOFF * 2 ** (failed - 1))
+        return self.clock() < record["last"]["at"] + wait
 
     async def set_automation(self, name: str, enabled: bool):
         if name not in self.m.automations:

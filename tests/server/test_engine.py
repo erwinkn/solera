@@ -1351,3 +1351,56 @@ async def test_an_assets_concurrency_caps_its_partitions_running_at_once(state):
 
     with pytest.raises(RegistrationError, match="positive number of partitions"):
         asset(concurrency=0)(lambda: [1])
+
+
+async def test_a_failing_partition_backs_off_its_changes(state):
+    """F43's storm: a consumer whose runs fail the same way was run again by
+    every upstream commit — 7,500 failed runs in two hours. Its changes now
+    wait, pending, `CHANGE_BACKOFF` after its last failure, doubling with
+    each failure in a row; a success ends the wait."""
+
+    import time
+
+    from solera_server.engine import CHANGE_BACKOFF
+
+    offset, calls, broken = [0.0], [], {"on": True}
+
+    @asset(outputs=Output("feed", key="id"))
+    def feed():
+        return [{"id": "a", "v": len(calls)}]
+
+    @asset(inputs={"feed": Incremental()}, automations=OnChange(), retries=Retry(n=0))
+    def consumer(feed: list):
+        calls.append(True)
+        if broken["on"]:
+            raise RuntimeError("the input is broken")
+        return []
+
+    engine = make_engine(state, Project(assets=[feed, consumer]), clock=lambda: time.time() + offset[0])
+    await engine.initialize()
+
+    async def settle(want: int):
+        for _ in range(400):
+            await engine.tick()
+            busy = any(r["status"] in ("queued", "running") for r in state.model.runs.values())
+            if len(calls) >= want and not busy:
+                return
+            await asyncio.sleep(0.01)
+
+    await drive(engine, await engine.submit(["feed"]))
+    await settle(1)
+    assert len(calls) == 1 and state.model.partition("consumer", "")["failed_in_row"] == 1
+    for _ in range(3):  # changes while it backs off: pending, no runs
+        await drive(engine, await engine.submit(["feed"]))
+        await settle(1)
+    assert len(calls) == 1 and state.model.automations["consumer.onchange.0"]["pending"]
+    offset[0] += CHANGE_BACKOFF + 1  # its wait is over: one run takes every change
+    await settle(2)
+    assert len(calls) == 2 and state.model.partition("consumer", "")["failed_in_row"] == 2
+    broken["on"] = False
+    await drive(engine, await engine.submit(["feed"]))
+    await settle(2)
+    assert len(calls) == 2  # still waiting: the second wait is twice the first
+    offset[0] += 2 * CHANGE_BACKOFF + 1
+    await settle(3)
+    assert len(calls) == 3 and "failed_in_row" not in state.model.partition("consumer", "")

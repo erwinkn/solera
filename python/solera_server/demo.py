@@ -3,8 +3,10 @@
 `uv run solera serve --insecure` and nothing else: all resources are in-process
 fakes. With `DATABASE_URL` set (docker compose up postgres) the relational
 outputs go to PostgresStore and the Sql asset materializes in-database. The
-rest lives in `.solera/data` next to this file, or in `SOLERA_DATA_URL`
-(`s3://bucket/prefix`) where the disk doesn't outlive the process.
+rest lives where `SOLERA_DATA_URL` says (`s3://bucket/prefix` where the disk
+doesn't outlive the process, or `file:///path`), else beside its state: under
+a local `SOLERA_STATE_URL`'s directory, so that a fresh state starts with
+fresh data and two states never share one (F43).
 """
 
 from __future__ import annotations
@@ -36,12 +38,25 @@ from solera.sdk import (
     job,
     sensor,
 )
-from solera.stores import Patch, S3Store
+from solera.stores import FileStore, Patch
 from solera_postgres import PostgresStore, Sql
 
 DATABASE = bool(os.getenv("DATABASE_URL"))
 RELATIONAL = "postgres" if DATABASE else None  # None → the default store
-DATA_URL = os.getenv("SOLERA_DATA_URL")
+
+
+def default_store():
+    """Where outputs that name no store go (the module docstring): the
+    project's default when `SOLERA_DATA_URL` names one, else under the
+    state's own directory — a state of its own's data, never another's."""
+
+    from pathlib import Path
+    from urllib.parse import unquote, urlparse
+
+    state = os.getenv("SOLERA_STATE_URL") or Path(".solera").resolve().as_uri()  # `solera serve`'s default
+    if os.getenv("SOLERA_DATA_URL") or not state.startswith("file://"):
+        return None
+    return FileStore(os.path.join(unquote(urlparse(state).path), ".demo-data"))
 
 
 def migration_log(output_name: str):
@@ -441,7 +456,7 @@ project = Project(
     stores={
         "postgres": PostgresStore(dsn="env:DATABASE_URL"),
     },
-    default_store=S3Store(DATA_URL) if DATA_URL else None,
+    default_store=default_store(),
     resources={
         "registry": SiteRegistry(),
         "feed": FeedClient(),

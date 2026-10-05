@@ -15,7 +15,7 @@ from tests.sim.oracle import value_content
 from tests.sim.project import External, SourceStore, rebuild
 from tests.staleness import Holdings
 
-from .engines import drive, make_engine
+from .engines import drive, make_engine, status_of
 from .test_staleness import STORES, _store
 
 
@@ -303,3 +303,46 @@ async def test_a_key_removed_during_a_full_pass_is_counted_out_once(tmp_path):
     finally:
         await engine.stop()
         await state.close()
+
+
+@pytest.mark.parametrize("each", [False, True], ids=["plain", "per-key"])
+async def test_a_first_run_delivers_every_key_as_added(state, tmp_path, each):
+    """F44's question: a consumer that has observed nothing is owed every
+    upstream key as an add (docs/observed-set.md, "The principle") — a
+    plain tally over five keys, in batches of two, counts five, and a
+    per-key consumer's batches say added too, none updated."""
+
+    calls = []
+
+    @asset(outputs=Output("files", key="id"))
+    def files():
+        return [{"id": f"k{i}", "v": 1} for i in range(5)]
+
+    if each:
+
+        @asset(inputs={"files": Incremental(batch_size=2, each=True)}, outputs=Output("out", key="id"))
+        def out(ctx, files: list):
+            calls.append(ctx.key)
+            return [{"v": files[0]["v"]}]
+
+    else:
+
+        @asset(inputs={"files": Incremental(batch_size=2)}, outputs=Output("out"))
+        async def out(ctx, files: list):
+            batch = ctx.batch["files"]
+            assert not batch.updated and not batch.removed
+            calls.extend(batch.added)
+            return {"count": ((await ctx.load()) or {"count": 0})["count"] + len(batch.added)}
+
+    project = Project(assets=[files, out], default_store=FileStore(tmp_path / "data"))
+    engine = make_engine(state, project)
+    await engine.initialize()
+    detail = await drive(engine, await engine.submit(["out"], upstream=True))
+    assert status_of(detail) == "succeeded"
+    assert sorted(calls) == [f"k{i}" for i in range(5)]
+    (task,) = [t for t in detail["tasks"] if t["asset"] == "out"]
+    batches = [a["batch"] for a in detail["attempts"][task["id"]]]
+    assert [(b["added"], b["updated"]) for b in batches] == [(2, 0), (2, 0), (1, 0)]
+    if not each:
+        assert (await value_content(engine, project, "out"))["count"] == 5
+    await engine.stop()

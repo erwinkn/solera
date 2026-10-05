@@ -54,7 +54,7 @@ outputs imports neither.
 
 State lands in `./.solera` — a `file://` object store using the same client
 interfaces as S3. Asset data lands in `.solera/data` next to the project
-file (`$SOLERA_DATA` overrides it). `--insecure` disables token auth and is restricted to
+file (`SOLERA_DATA_URL` overrides it: `file:///path`, or `s3://bucket/prefix` for an S3Store). `--insecure` disables token auth and is restricted to
 loopback; set `SOLERA_API_TOKEN` for anything else.
 
 ## The demo project
@@ -209,8 +209,9 @@ workers whose capacity fits.
 
 ## Postgres
 
-The demo runs entirely on FileStore by default: files under `.solera/data`,
-or in a bucket when `SOLERA_DATA_URL` names one (`S3Store`). To move the relational
+The demo runs entirely on FileStore by default: files beside its state
+(`.solera/.demo-data`), or wherever `SOLERA_DATA_URL` names (`file://`, or a
+bucket's `s3://`, an `S3Store`). To move the relational
 outputs (`site_events`, `site_files`, `file_index`, `site_status`,
 `fleet_status`) into shared Postgres tables:
 

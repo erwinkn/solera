@@ -365,3 +365,19 @@ def test_demo_postgres_migrations_and_ondeploy(tmp_path, own_database):
     finally:
         proc.terminate()
         proc.wait(timeout=15)
+
+
+def test_the_demo_keeps_its_data_beside_its_state(tmp_path, monkeypatch):
+    """F43: two states shared one data root — the demo's default, beside its
+    module — and each one's cleanups deleted the other's objects. With no
+    `SOLERA_DATA_URL`, the demo's data now lives under its own state's
+    directory: a fresh state, fresh data."""
+
+    from solera_server import demo
+
+    monkeypatch.delenv("SOLERA_DATA_URL", raising=False)
+    for name in ("a", "b"):
+        monkeypatch.setenv("SOLERA_STATE_URL", (tmp_path / name).as_uri())
+        assert demo.default_store().path == str(tmp_path / name / ".demo-data")
+    monkeypatch.setenv("SOLERA_DATA_URL", (tmp_path / "data").as_uri())
+    assert demo.default_store() is None  # the project's own default: where SOLERA_DATA_URL says

@@ -234,11 +234,11 @@ async def test_refs_round_trip_and_gone_values_fail(store):
 
 
 def test_the_default_path(tmp_path, monkeypatch):
-    monkeypatch.delenv("SOLERA_DATA")
+    monkeypatch.delenv("SOLERA_DATA_URL")
     store = FileStore()
     store.home = str(tmp_path)
     assert Path(store._objects().prefix) == tmp_path / ".solera" / "data"
-    monkeypatch.setenv("SOLERA_DATA", str(tmp_path / "elsewhere"))
+    monkeypatch.setenv("SOLERA_DATA_URL", (tmp_path / "elsewhere").as_uri())
     assert Path(store._objects().prefix) == tmp_path / "elsewhere"
 
 

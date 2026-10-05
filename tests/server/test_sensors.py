@@ -505,7 +505,7 @@ def test_a_served_engine_keeps_its_own_sensor_host(tmp_path, monkeypatch):
     port = sock.getsockname()[1]
     sock.close()
     base = f"http://127.0.0.1:{port}"
-    monkeypatch.setenv("SOLERA_DATA", str(tmp_path / "data"))
+    monkeypatch.setenv("SOLERA_DATA_URL", (tmp_path / "data").as_uri())
     app = create_app(
         state_url=(tmp_path / "state").as_uri(),
         namespace="sensing",

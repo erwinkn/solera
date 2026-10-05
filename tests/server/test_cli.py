@@ -213,13 +213,14 @@ import os
 
 from solera.sdk import Migration, Output, Project, asset
 from solera.stores import FileStore
+from solera.stores.files import data_path
 
 
 class Ledgered(FileStore):
     \"\"\"Runs callable migrations once each, noting them in a ledger file.\"\"\"
 
     async def migrate(self, output, migrations, context=None, prior=None):
-        path = os.path.join(os.environ["SOLERA_DATA"], "ledger.json")
+        path = os.path.join(data_path(), "ledger.json")
         applied = json.load(open(path)) if os.path.exists(path) else []
         for m in migrations:
             if m.name not in applied:

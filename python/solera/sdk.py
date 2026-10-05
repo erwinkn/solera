@@ -1221,6 +1221,20 @@ def _caller_dir() -> str | None:
     return os.path.dirname(os.path.abspath(path)) if path else None
 
 
+def _data_store():
+    """The default store `$SOLERA_DATA_URL` names: an S3Store at an `s3://`
+    URL, else a FileStore — at a `file://` one, or beside the project file."""
+
+    from .stores import FileStore, S3Store
+
+    url = os.environ.get("SOLERA_DATA_URL") or ""
+    if url.startswith("s3://"):
+        return S3Store(url)
+    if url and not url.startswith("file://"):
+        raise RegistrationError(f"SOLERA_DATA_URL: a file:// or s3:// URL, not {url!r}")
+    return FileStore()
+
+
 class Project:
     def __init__(
         self,
@@ -1239,9 +1253,10 @@ class Project:
         name: str = "default",
     ):
         """`default_store` holds every output that names no store: unless
-        given, a FileStore. A FileStore without a path keeps its data in
-        `.solera/data` next to the file that builds the project, or in
-        `$SOLERA_DATA`. `errors` classifies exceptions user code cannot
+        given, the store `$SOLERA_DATA_URL` names — a FileStore at a
+        `file://` URL, an S3Store at an `s3://` one — else a FileStore in
+        `.solera/data` next to the file that builds the project. `errors`
+        classifies exceptions user code cannot
         subclass: `{httpx.TimeoutException: Transient}` (`solera.errors`).
         `build` names the code explicitly (else `$SOLERA_BUILD`, else the
         work tree's content: `solera.build`); it is part of the deploy."""
@@ -1256,7 +1271,7 @@ class Project:
         self.name = name
         self.retention = retention
         self.assets: dict[str, Asset] = {}
-        self.stores = {DEFAULT_STORE: default_store or FileStore(), **(stores or {})}
+        self.stores = {DEFAULT_STORE: default_store or _data_store(), **(stores or {})}
         home = self.home = _caller_dir()
         self.build = build
         for store in self.stores.values():

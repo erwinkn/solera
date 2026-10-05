@@ -296,7 +296,7 @@ the store, works out what changed, against the key index (§6):
 
 | Store | Accepts | Ref |
 |---|---|---|
-| `FileStore(path=None)` (default, built in) | anything: JSON when it round-trips, pickle otherwise; keyed rows as plain Python, DataFrames or Arrow. One file per value, partition, key or batch under `.solera/data` next to the project file (or `$SOLERA_DATA`) | `ObjectRef` |
+| `FileStore(path=None)` (default, built in) | anything: JSON when it round-trips, pickle otherwise; keyed rows as plain Python, DataFrames or Arrow. One file per value, partition, key or batch under `.solera/data` next to the project file (or a `file://` `$SOLERA_DATA_URL`) | `ObjectRef` |
 | `S3Store(url, **options)` | the same, in a bucket | `ObjectRef` |
 | `PostgresStore` | `list[dict]`, `DataFrame`, `GeoDataFrame`, Arrow; `Sql` | `TableRef` |
 

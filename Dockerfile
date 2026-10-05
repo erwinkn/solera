@@ -25,7 +25,7 @@ ARG SOLERA_BUILD=""
 ARG RAILWAY_GIT_COMMIT_SHA=""
 ENV PATH="/home/app/.venv/bin:$PATH" \
     SOLERA_STATE_URL=file:///home/app/state \
-    SOLERA_DATA=/home/app/data \
+    SOLERA_DATA_URL=file:///home/app/data \
     SOLERA_BUILD=${SOLERA_BUILD:-$RAILWAY_GIT_COMMIT_SHA}
 
 EXPOSE 8000

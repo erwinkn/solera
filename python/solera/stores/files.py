@@ -54,8 +54,8 @@ class FileStore:
     are deleted by `cleanup`, once nothing can read them.
 
     Content is JSON when it round-trips exactly, pickle otherwise. `path`
-    defaults to `$SOLERA_DATA`, else `.solera/data` next to the project
-    file."""
+    defaults to where `$SOLERA_DATA_URL` points, a `file://` URL, else
+    `.solera/data` next to the project file."""
 
     version = "4"
     writes = "immutable"
@@ -83,7 +83,7 @@ class FileStore:
         if self.path is not None:
             root = os.fspath(self.path)
         else:
-            root = os.environ.get("SOLERA_DATA") or os.path.join(self.home or os.getcwd(), ".solera", "data")
+            root = data_path() or os.path.join(self.home or os.getcwd(), ".solera", "data")
         root = os.path.abspath(root)
         if root not in self._stores:
             self._stores[root] = LocalStore(root, mkdir=True)
@@ -454,6 +454,15 @@ class FileStore:
     @staticmethod
     def _ref(context, handle) -> ObjectRef:
         return ObjectRef(output=context.output.name, store="", handle=handle, partition=context.partition)
+
+
+def data_path() -> str | None:
+    """The directory a `file://` `$SOLERA_DATA_URL` names, if it names one."""
+
+    from urllib.parse import unquote, urlparse
+
+    url = os.environ.get("SOLERA_DATA_URL") or ""
+    return unquote(urlparse(url).path) if url.startswith("file://") else None
 
 
 def _commit_name(base: str, commit_number: int, generation: int) -> str:

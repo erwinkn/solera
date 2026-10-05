@@ -108,7 +108,7 @@ def data(tmp_path, monkeypatch):
     """Where default stores keep outputs: a fresh directory per test."""
 
     path = tmp_path / "data"
-    monkeypatch.setenv("SOLERA_DATA", str(path))
+    monkeypatch.setenv("SOLERA_DATA_URL", path.as_uri())
     return path
 
 

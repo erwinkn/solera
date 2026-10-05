@@ -865,8 +865,8 @@ class Store(Protocol):
   plus, for an immutable store, what pinned readers still need.
 
 **FileStore**, the default, writes what an asset returns as files under
-`.solera/data` next to the project file (or `FileStore(path)`, or
-`$SOLERA_DATA`) — one object per value, partition, key or commit:
+`.solera/data` next to the project file (or `FileStore(path)`, or a
+`file://` `$SOLERA_DATA_URL`) — one object per value, partition, key or commit:
 
 ```
 rollup@184467.json                a value, by generation 184467
