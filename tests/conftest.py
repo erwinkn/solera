@@ -117,7 +117,7 @@ async def world(monkeypatch):
     world = SimpleNamespace(engines=engines, states=states, exits=exits, expected=())
     yield world
     errors = []
-    for close in [engine.stop for engine in engines] + [state.close for state in states]:
+    for close in [engine.stop for engine in engines] + [_workers_done] + [state.close for state in states]:
         try:
             await close()
         except world.expected:
@@ -128,13 +128,33 @@ async def world(monkeypatch):
         raise errors[0]
 
 
+async def _workers_done(timeout: float = 30) -> None:
+    """This loop's in-process workers, done before the test's states close.
+    They outlive their engine's stop, as a worker process would, but not the
+    test: one still pending when its loop closes never ends, and stays in
+    the process's `inline._workers`, where a later test's `worker_finished`
+    would wait for it forever. One still running after `timeout` is canceled."""
+
+    from solera_server.executors import inline
+
+    loop = asyncio.get_running_loop()
+    left = [t for t in inline._workers.values() if t.get_loop() is loop]
+    if not left:
+        return
+    _, pending = await asyncio.wait(left, timeout=timeout)
+    for task in pending:
+        task.cancel()
+    await asyncio.gather(*pending, return_exceptions=True)
+
+
 async def worker_finished() -> None:
     """Every in-process worker done — past its commit, its cleanups too
     (docs/lifecycle.md §9.8): a run is settled before its worker ends."""
 
     from solera_server.executors import inline
 
-    while running := [inline._workers.get(a) for a in inline._workers]:
+    loop = asyncio.get_running_loop()  # another test's loop runs none of its workers
+    while running := [t for t in inline._workers.values() if t.get_loop() is loop]:
         await asyncio.wait(running)
 
 
