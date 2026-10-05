@@ -274,7 +274,7 @@ SrcCommit(k) ==
     /\ UNCHANGED <<life, rec, from, chg, pat, ver, att, twice, failing>>
 
 \* A move of A resets it (K10): A is empty and new; its record and B's on
-\* it go, failure records included; a full pass is due for both. An asset
+\* it go, stored outcomes included; a full pass is due for both. An asset
 \* change of A.
 MoveA ==
     /\ used.changes < MaxChanges
@@ -284,7 +284,7 @@ MoveA ==
     /\ rec' = [c \in Assets |-> [rec[c] EXCEPT !.snap = -1, !.ahead = {}, !.pass = DuePass]]
     /\ from' = [from EXCEPT !["A"] = [k \in Keys |-> [v |-> 0, d |-> 0]]]
     /\ used' = [used EXCEPT !.changes = @ + 1]
-    /\ failing' = [c \in Assets |-> {}]   \* the failure records go with the others
+    /\ failing' = [c \in Assets |-> {}]   \* the stored outcomes go with the others
     /\ UNCHANGED <<clock, pat, ver, att, twice>>
 
 \* B's patterns change (they exclude key NK, or include it again), or its

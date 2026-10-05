@@ -839,7 +839,7 @@ processes), so only part of the local files stayed in the page cache.
   way; the cache saved requests, not the CPU, which dominates.
 - **Other cold readers**, from the follow-up's tables above: a
   full-pass batch of 10K keys, 80–110 ms and 2–14 GETs; `Each`'s and
-  failure indexes' lookups, a sparse read like the 1K-key rows.
+  outcome indexes' lookups, a sparse read like the 1K-key rows.
 - **The engine's recount and compaction** read the cache's local copies
   when it holds the index warm (one warm copy serves every engine
   reader), the store otherwise. `warm.py --recount --patches ""` at 100M,
@@ -1106,7 +1106,7 @@ would mean a wheel per Python version, so it is left as a choice.
 
 `docs/versions.md`: an entry is `(key, generation, deleted, payload?)` —
 no content version, no pair filter, and an optional payload (a source's
-version, a failure record). Earlier sections measured 16-byte row
+version, a stored outcome). Earlier sections measured 16-byte row
 digests on every entry; `digest.py` and `pyrows.py`, which measured
 digesting, are deleted with the digest. `bench.py --payload N` gives every
 entry an N-byte payload: without one (the default) the index is a derived

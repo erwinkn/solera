@@ -2,7 +2,7 @@
 //! sparse and the streamed (`layers::DeltaWriter`; docs/versions.md).
 //!
 //! A write of a key is an upsert, which may carry a payload (a source's
-//! version, a failure record), or a removal; what the index held is
+//! version, a stored outcome), or a removal; what the index held is
 //! absent, or live at a known generation and payload: every writer reads it
 //! exactly. Writing a key changes it: a new key is
 //! added, a removed live key deleted, any other upsert written — unless it

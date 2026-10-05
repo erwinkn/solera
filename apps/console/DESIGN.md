@@ -188,10 +188,10 @@ read-only endpoints instead (with tests in `tests/server`):
 
 | Route | For |
 |---|---|
-| `GET /assets:status` | per-asset rollup for the graph and the overview: partition counts by status, last outcome, failed keys, repairs owed and stuck |
-| `GET /assets/{a}/failed-keys` | failed keys with class, tries, due, message |
+| `GET /assets:status` | per-asset rollup for the graph and the overview: partition counts by status, last outcome, stored outcome counts (`stored_counts`), repairs owed and stuck |
+| `GET /assets/{a}/outcomes` | each key's latest outcome, stored or derived (`?outcome=`, `?key=`), a stored one with tries, due, message |
 | `GET /assets/{a}/stale-keys` | a partition's stale keys and why |
-| `GET /assets/{a}/key-outcomes` | the `key_outcomes` history, searchable by key |
+| `GET /assets/{a}/outcomes/history` | the `key_outcomes` log, searchable by key |
 | `GET /assets/{a}/explain?key=` | why a key is (not) in the output: patterns, failure, last outcome, generations |
 | `GET /assets/{a}/inputs` | every input, and per partition its observed-set summary: owed keys or pending, a full run due, observed through |
 | `GET /repairs`, `GET /cleanups` | repairs owed (stuck after their run limit), stuck cleanups and removed outputs awaiting their cleanup task |
