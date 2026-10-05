@@ -1,4 +1,4 @@
-import type { Cleanup, KeyPage, StaleKey, StaleKeys } from "./types";
+import type { Cleanup, KeyPage } from "./types";
 
 /**
  * Readers for the few response fields whose shape the API is still settling
@@ -11,13 +11,6 @@ export function keyEntry(value: KeyPage["keys"][string]): { generation: number; 
   return typeof value === "number"
     ? { generation: value, version: null }
     : { generation: value.generation, version: value.version ?? null };
-}
-
-/** A stale key with its own reasons, else the partition's. */
-export function staleKey(entry: StaleKeys["keys"][number], partition: string[]): Required<StaleKey> {
-  return typeof entry === "string"
-    ? { key: entry, reasons: partition }
-    : { key: entry.key, reasons: entry.reasons ?? partition };
 }
 
 /** Whether a cleanup needs an operator: a store cleanup with stuck entries, or a cleanup task that gave up. */

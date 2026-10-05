@@ -1,6 +1,6 @@
 import { useInfiniteQuery } from "@tanstack/react-query";
-import { q, useProject } from "@/api/queries";
-import { staleKey } from "@/api/read";
+import { Link } from "@tanstack/react-router";
+import { q, useManifest, useProject } from "@/api/queries";
 import { cn } from "@/lib/cn";
 import { plural } from "@/lib/format";
 import { staleReason } from "@/lib/status";
@@ -36,10 +36,42 @@ export const reasonsText = (reasons: string[] | undefined) =>
   (reasons ?? []).map((r) => staleReason(r).label).join(", ");
 
 /**
+ * Where a key's reason comes through: the input, linked to what it reads (an
+ * upstream asset at the same partition, or a source).
+ */
+function InputLink({ asset, input, partition }: { asset: string; input: string; partition: string }) {
+  const manifest = useManifest();
+  const output = manifest.assets[asset]?.inputs[input]?.output ?? input;
+  const owner = manifest.outputs[output]?.asset;
+  const label = (
+    <>
+      <span className="font-mono">{input}</span>
+      {output !== input && <span className="text-fg-subtle"> ← {output}</span>}
+    </>
+  );
+  const className = "text-xs whitespace-nowrap text-link hover:underline";
+  return owner ? (
+    <Link
+      to="/assets/$asset"
+      params={{ asset: owner }}
+      search={{ partition: partition || undefined }}
+      className={className}
+    >
+      {label}
+    </Link>
+  ) : (
+    <Link to="/sources/$source" params={{ source: output }} className={className}>
+      {label}
+    </Link>
+  );
+}
+
+/**
  * A stale partition's keys and why each is stale. For an `each` asset they
  * are its own keys, traced one to one to their upstream keys; a keyed asset
- * that isn't `each` has all its keys stale together. A default run of the
- * partition loads exactly these.
+ * that isn't `each` has all its keys stale together. The partition's reasons
+ * show once, above the list; a key shows only its own, each through an input.
+ * A default run of the partition loads exactly these.
  */
 export function StaleKeysCard({
   name,
@@ -55,20 +87,20 @@ export function StaleKeysCard({
   const first = pages.data?.pages[0];
   // Nothing to show for an unkeyed asset, or a partition that isn't stale.
   if (pages.isError || !first || !first.tracked || first.reasons.length === 0) return null;
-  const keys = pages.data?.pages.flatMap((page) => page.keys.map((k) => staleKey(k, page.reasons))) ?? [];
+  const keys = pages.data?.pages.flatMap((page) => page.keys) ?? [];
   return (
     <Card className={className}>
       <CardHeader
         title="Stale keys"
         description={
-          <>
-            {keys.length
-              ? `${plural(keys.length, "key")}${pages.hasNextPage ? " so far" : ""}${partition ? ` in ${partition}` : ""}. A run of the ${partition ? "partition" : "asset"} loads exactly these.`
-              : "No single key is stale: the partition is, as a whole."}{" "}
-            <StaleReasons reasons={first.reasons} className="ml-1 align-middle" />
-          </>
+          keys.length
+            ? `${plural(keys.length, "key")}${pages.hasNextPage ? " so far" : ""}${partition ? ` in ${partition}` : ""}. A run of the ${partition ? "partition" : "asset"} loads exactly these.`
+            : "No single key is stale: the partition is, as a whole."
         }
       />
+      <div className="flex flex-wrap items-center gap-2 px-4 pb-3 text-xs text-fg-muted">
+        Stale because <StaleReasons reasons={first.reasons} />
+      </div>
       {keys.length > 0 && (
         <ul className="flex max-h-80 flex-col divide-y divide-line overflow-y-auto border-t border-line">
           {keys.map((k) => (
@@ -77,7 +109,15 @@ export function StaleKeysCard({
               className="flex flex-wrap items-center justify-between gap-x-3 gap-y-1 px-4 py-1.5"
             >
               <span className="truncate font-mono text-xs text-fg">{k.key}</span>
-              <StaleReasons reasons={k.reasons} />
+              {/* Its own reasons only: one the partition gives (a definition change) shows above. */}
+              <span className="flex flex-wrap items-center gap-x-3 gap-y-1">
+                {k.reasons.map((r) => (
+                  <span key={`${r.kind}/${r.input}`} className="inline-flex items-center gap-1.5">
+                    <StaleReasons reasons={[r.kind]} />
+                    <InputLink asset={name} input={r.input} partition={partition} />
+                  </span>
+                ))}
+              </span>
             </li>
           ))}
         </ul>

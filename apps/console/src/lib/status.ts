@@ -44,7 +44,7 @@ const TONES: Record<string, Tone> = {
   advanced: "run",
   requested: "ok",
   refused: "warn",
-  // partitions whose comparison isn't computed yet, and explain's verdicts
+  // explain's verdicts (pending: written upstream, not processed yet)
   pending: "wait",
   failing: "fail",
   excluded: "idle",

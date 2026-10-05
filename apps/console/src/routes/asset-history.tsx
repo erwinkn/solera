@@ -8,6 +8,7 @@ import { compact, shortId } from "@/lib/format";
 import { Button } from "@/ui/button";
 import { Empty, ErrorNote, Generation, Skeleton, Time } from "@/ui/data";
 import { Select } from "@/ui/form";
+import { Tooltip } from "@/ui/overlay";
 import { Card, CardHeader } from "@/ui/layout";
 import { Table, TableScroll, Td, Th, Tr } from "@/ui/table";
 
@@ -167,6 +168,13 @@ function VersionRow({
         <Generation value={m.generation} />
       </Td>
       <Td className="text-right text-xs whitespace-nowrap">
+        {m.final === false && (
+          <Tooltip content="One batch of a run that committed more after it: the partition caught up at that run's final batch.">
+            <span className="mr-2 rounded-full bg-idle-soft px-1.5 py-0.5 text-2xs text-idle-fg">
+              partial
+            </span>
+          </Tooltip>
+        )}
         {m.added != null || m.removed != null ? (
           <>
             {!!m.added && <span className="text-ok-fg">+{compact(m.added)}</span>}

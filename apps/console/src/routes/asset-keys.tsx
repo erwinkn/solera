@@ -436,7 +436,6 @@ function Answer({ explain: e }: { explain: Explain }) {
         {e.patterns.spec && (
           <li className="flex flex-wrap items-center gap-1.5">
             Patterns <PatternList patterns={e.patterns.spec} />
-            {e.patterns.pending && <span className="text-wait-fg">(a pattern change is being applied)</span>}
           </li>
         )}
       </ul>

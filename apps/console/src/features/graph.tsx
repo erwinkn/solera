@@ -96,7 +96,6 @@ export function partitionParts(p: AssetStatus["partitions"]) {
   return [
     { tone: "ok" as Tone, value: p.materialized, label: "materialized" },
     { tone: "warn" as Tone, value: p.stale, label: "stale" },
-    { tone: "wait" as Tone, value: p.pending ?? 0, label: "pending" },
     { tone: "run" as Tone, value: p.running, label: "running" },
     { tone: "fail" as Tone, value: p.failed, label: "failed" },
     { tone: "idle" as Tone, value: p.missing, label: "missing" },
@@ -112,7 +111,6 @@ export function assetTone(status: AssetStatus | undefined): Tone {
   if (Object.entries(status.failures ?? {}).some(([k, n]) => k !== "canceled" && (n ?? 0) > 0))
     tones.push("warn");
   if (p.stale) tones.push("warn");
-  if (p.pending) tones.push("wait");
   if (p.running) tones.push("run");
   if (p.materialized) tones.push("ok");
   if (!tones.length) tones.push("idle");
@@ -286,13 +284,11 @@ function Node({ node, status }: { node: GraphNode; status: AssetStatus | undefin
                 ? "failed"
                 : p.stale
                   ? "stale"
-                  : p.pending
-                    ? "pending"
-                    : p.materialized
-                      ? "materialized"
-                      : node.kind === "job"
-                        ? "not run yet"
-                        : "never materialized"}
+                  : p.materialized
+                    ? "materialized"
+                    : node.kind === "job"
+                      ? "not run yet"
+                      : "never materialized"}
         </span>
       )}
       <span className="flex items-center gap-2 text-2xs text-fg-subtle">

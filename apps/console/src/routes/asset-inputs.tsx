@@ -64,8 +64,11 @@ export function AssetInputs() {
   );
 }
 
-const owes = (o: Observed | null | undefined) =>
-  !!o && (o.full_run_due != null || o.owed == null || o.owed.added + o.owed.updated + o.owed.removed > 0);
+/** How much is owed, whatever its unit: keys by class for a keyed upstream, commits for an unkeyed one. */
+const owedCount = (owed: Observed["owed"]) =>
+  "commits" in owed ? owed.commits : owed.added + owed.updated + owed.removed;
+
+const owes = (o: Observed | null | undefined) => !!o && (o.full_run_due != null || owedCount(o.owed) > 0);
 
 function InputCard({ input, partition }: { input: Input; partition?: string }) {
   const kind = KIND[input.kind];
@@ -171,7 +174,7 @@ function PartitionRow({ s }: { s: InputPartition }) {
   );
 }
 
-/** What a partition owes this input: a full run, a count per class, nothing, or not known yet. */
+/** What a partition owes this input: a full run, keys per class or commits, or nothing. */
 function Owed({ observed: o }: { observed: Observed | null }) {
   if (!o) return <span className="text-xs text-fg-subtle">never read</span>;
   if (o.full_run_due)
@@ -181,15 +184,13 @@ function Owed({ observed: o }: { observed: Observed | null }) {
         <span className="text-xs text-fg-muted">{o.full_run_due.replaceAll("_", " ")}</span>
       </span>
     );
-  if (!o.owed)
+  if (owedCount(o.owed) === 0) return <span className="text-xs text-fg-subtle">nothing</span>;
+  if ("commits" in o.owed)
     return (
-      <Tooltip content="The comparison with upstream isn't computed yet, as after a pattern or definition change at large scale. It is neither stale nor fresh until it is.">
-        <span>
-          <StatusBadge status="pending" />
-        </span>
-      </Tooltip>
+      <span className="text-xs">
+        <span className="font-medium text-fg tabular">{count(o.owed.commits)}</span>{" "}
+        <span className="text-fg-muted">{o.owed.commits === 1 ? "commit" : "commits"}</span>
+      </span>
     );
-  const { added, updated, removed } = o.owed;
-  if (added + updated + removed === 0) return <span className="text-xs text-fg-subtle">nothing</span>;
-  return <KeyClasses added={added} updated={updated} removed={removed} />;
+  return <KeyClasses {...o.owed} />;
 }

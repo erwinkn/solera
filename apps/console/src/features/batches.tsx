@@ -204,8 +204,8 @@ export function tryOf(attempt: Attempt, attempts: Attempt[]): number {
 
 /**
  * An attempt's name for people, only as much as carries information (D170,
- * D173): "attempt 2 of batch 1" for a retry in a multi-batch walk, "batch 3"
- * for a first try there, "attempt 2" for a retry of a single batch, and none
+ * D173): "attempt 2 of batch 1" for a retry in a multi-batch walk, "batch 3
+ * of 10" for a first try there, "attempt 2" for a retry of a single batch, and none
  * for the one attempt of a plain task: the run says it all.
  */
 export function attemptName(attempt: Attempt, attempts: Attempt[]): string | null {
@@ -213,6 +213,10 @@ export function attemptName(attempt: Attempt, attempts: Attempt[]): string | nul
   const index = attempt.batch?.index;
   const tries = attempts.filter((a) => (index == null ? true : a.batch?.index === index)).length;
   const n = tryOf(attempt, attempts);
-  if (multi && index != null) return tries > 1 ? `attempt ${n} of batch ${index + 1}` : `batch ${index + 1}`;
+  if (multi && index != null) {
+    if (tries > 1) return `attempt ${n} of batch ${index + 1}`;
+    const count = attempt.batch!.count;
+    return count != null ? `batch ${index + 1} of ${Math.max(count, index + 1)}` : `batch ${index + 1}`;
+  }
   return tries > 1 ? `attempt ${n}` : null;
 }

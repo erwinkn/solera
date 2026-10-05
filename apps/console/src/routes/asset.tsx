@@ -151,9 +151,6 @@ export function AssetLayout() {
                 {status.partitions.stale} stale
               </Link>
             )}
-            {status?.partitioned && (status.partitions.pending ?? 0) > 0 && (
-              <span className="text-wait-fg">{status.partitions.pending} pending</span>
-            )}
             {status && !status.partitioned && status.stale && <WholeStaleness name={name} />}
             {Object.entries(asset.tags).map(([k, v]) => (
               <span key={k} className="rounded-full bg-accent-soft px-2 py-0.5 text-fg-muted">

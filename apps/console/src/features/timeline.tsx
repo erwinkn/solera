@@ -52,6 +52,9 @@ function PhaseTip({ attempt, attempts, end }: { attempt: Attempt; attempts: Atte
         </span>
         <span className="tabular">{duration(total)}</span>
       </span>
+      {attempt.batch && walkOf(attempts).multi && attempt.batch.last === null && (
+        <span className="opacity-80">The final batch: the partition caught up.</span>
+      )}
       {attempt.batch && walkOf(attempts).multi && (
         <span className="opacity-80">
           <KeyClasses {...attempt.batch} className="text-current [&_*]:text-current" />

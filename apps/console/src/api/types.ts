@@ -223,30 +223,27 @@ export interface AssetStatus {
   updated_at: number | null;
 }
 
-/** Ranked as the glossary ranks them: what a rollup of several shows first. `pending`:
- * the observed set's comparison isn't computed yet, so it is neither stale nor fresh. */
-export type PartitionStatus =
-  "removed" | "running" | "pending" | "failed" | "stale" | "materialized" | "missing";
+/** Ranked as the glossary ranks them: what a rollup of several shows first. */
+export type PartitionStatus = "removed" | "running" | "failed" | "stale" | "materialized" | "missing";
 
 /** Why a partition or key is stale (glossary, "stale"): an input unit it read changed
- * (new patterns included), an upstream it reads is itself stale, or its asset changed.
- * The API has said both "input changed" and "input_changed"; `staleReason` reads either. */
-export type StaleReason = "input_changed" | "upstream_stale" | "definition_changed";
+ * (new patterns included), an upstream it reads is itself stale, or its asset changed. */
+export type StaleReason = "input changed" | "upstream stale" | "definition changed";
 
-/** One stale key, with its own reasons where the API gives them. */
+/** One stale key, and its own reasons: each names the input it comes through. A key
+ * stale only for a partition-wide reason (a definition change) has none of its own. */
 export interface StaleKey {
   key: string;
-  reasons?: string[];
+  reasons: { kind: StaleReason; input: string }[];
 }
 
-/** A page of an asset partition's stale keys: all of them or none for a keyed
- * output that is not `each`; `tracked` false for an unkeyed one. Keys are bare
- * strings or `{key, reasons}`; `reasons` is the partition's. */
+/** A page of an asset partition's stale keys: all of them or none for a keyed output
+ * that is not `each`; `tracked` false for an unkeyed one. `reasons` is the partition's. */
 export interface StaleKeys {
   tracked: boolean;
-  keys: (string | StaleKey)[];
+  keys: StaleKey[];
   next: string | null;
-  reasons: string[];
+  reasons: StaleReason[];
 }
 
 export interface PartitionOutcome {
@@ -378,13 +375,13 @@ export interface Explain {
 /** Explain's word on the input as a whole; the observed set retires the pass-based values. */
 export type InputState = string;
 
-/** What one consumer partition owes one keyed incremental input (docs/observed-set.md):
- * the comparison of upstream now with what it observed. `owed` is null while that
- * comparison isn't computed yet (pending); `full_run_due` names why the next run reads
- * everything (a definition change, an upstream reset); `observed_at` is the oldest commit
- * any part of the record was observed at: everything is observed at least through it. */
+/** What one consumer partition owes one incremental input (docs/observed-set.md): the
+ * comparison of upstream now with what it observed, by key class for a keyed upstream,
+ * in commits for an unkeyed one. `full_run_due` names why the next run reads everything
+ * (a definition change, an upstream reset); `observed_at` is the oldest commit any part
+ * of the record was observed at: everything is observed at least through it. */
 export interface Observed {
-  owed: { added: number; updated: number; removed: number } | null;
+  owed: { added: number; updated: number; removed: number } | { commits: number };
   full_run_due: string | null;
   observed_at: number | null;
 }
@@ -422,7 +419,9 @@ export interface Commit {
   added_keys: string[] | null;
   removed_keys: string[] | null;
   rows: number | null;
-  materialized: boolean | null;
+  /** Whether this was its run's last batch, so the partition caught up; null for a source
+   * commit, absent from older rows. */
+  final?: boolean | null;
   metadata: Json;
   generation: number;
 }

@@ -15,15 +15,7 @@ import { StatusBadge, StatusIcon } from "@/ui/status";
 
 const route = getRouteApi("/assets/$asset/partitions");
 /** The legend's order: what needs a look first. */
-const ORDER: PartitionStatus[] = [
-  "failed",
-  "stale",
-  "pending",
-  "running",
-  "missing",
-  "materialized",
-  "removed",
-];
+const ORDER: PartitionStatus[] = ["failed", "stale", "running", "missing", "materialized", "removed"];
 
 /** `day=2026-09-01,site=alpha` → {day: …, site: …}; a one-dimension key is itself. */
 function parse(partition: string, dims: string[]): Record<string, string> {
@@ -119,9 +111,6 @@ function Cell({ row, selected, compact }: { row: PartitionRow; selected: boolean
             ? "border-theme border-dashed border-line-strong bg-surface"
             : toneSolid[t],
           row.status === "removed" && "opacity-40",
-          // Pending: neither stale nor fresh until the engine has compared.
-          row.status === "pending" &&
-            "bg-[repeating-linear-gradient(135deg,var(--wait)_0_3px,var(--wait-soft)_3px_6px)]",
           row.status === "running" && "animate-[pulse-dot_1.6s_ease-in-out_infinite]",
           selected && "ring-2 ring-fg ring-offset-2 ring-offset-surface",
         )}
@@ -233,12 +222,6 @@ function PartitionPanel({ name, row, detail }: { name: string; row?: PartitionRo
             <span className="text-2xs font-medium tracking-wide text-fg-subtle uppercase">Stale because</span>
             <StaleReasons reasons={row.reasons} />
           </div>
-        )}
-        {row.status === "pending" && (
-          <p className="text-xs text-fg-muted">
-            The engine hasn't compared this partition with its upstream yet, as after a pattern or definition
-            change at large scale: it is neither stale nor fresh until it has.
-          </p>
         )}
         <Facts className="grid-cols-2">
           <Fact label="Last outcome">{row.last_outcome ? label(row.last_outcome) : "—"}</Fact>
