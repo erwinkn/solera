@@ -120,19 +120,44 @@ export function KeyClasses({
 }
 
 /**
- * How far a task's walk has got: its last committed batch, and the key it
- * reached. `progress.key` null means the walk is done.
+ * What a task's shape has to say (D173): the run is the default picture, and
+ * batches and attempts appear only when they carry information. `multi`: it
+ * walked, or plans, more than one batch. `retried`: some batch (or the task,
+ * when it has none) took more than one attempt.
+ */
+export interface Walk {
+  groups: BatchGroup[];
+  multi: boolean;
+  retried: boolean;
+  /** The planned number of batches, the largest any attempt reported. */
+  planned: number | null;
+}
+
+export function walkOf(attempts: Attempt[]): Walk {
+  const groups = groupByBatch(attempts);
+  const batched = groups.filter((g) => g.batch != null);
+  const planned = batched.reduce((n, g) => Math.max(n, g.batch!.count ?? 0), 0) || null;
+  return {
+    groups,
+    multi: batched.length > 1 || (planned ?? 0) > 1,
+    retried: batched.length ? batched.some((g) => g.attempts.length > 1) : attempts.length > 1,
+    planned,
+  };
+}
+
+/**
+ * How far a multi-batch walk has got, in words: "batch 3 of ~10, through k",
+ * or "10 batches" once done; null when nothing is committed yet.
  */
 export function describeProgress(
   progress: Progress | null | undefined,
   planned: number | null,
 ): string | null {
-  if (progress === undefined) return null;
-  if (progress === null) return "no batch committed yet";
+  if (!progress) return null;
   const n = progress.batch + 1;
-  if (progress.key === null) return n === 1 ? "1 batch, done" : `${count(n)} batches, done`;
+  if (progress.key === null) return `${count(n)} batches`;
   const of = planned != null ? ` of ~${count(Math.max(planned, n + 1))}` : "";
-  return `${count(n)}${of} committed, through ${progress.key}`;
+  return `batch ${count(n)}${of} committed, through ${progress.key}`;
 }
 
 /** A thin bar of a walk's committed batches against the planned count. */
@@ -170,16 +195,24 @@ export function ProgressBar({
   );
 }
 
-/** Which try of its batch an attempt is: 1 for the first, 2 for its first retry. Without batches, its place in the task. */
+/** Which attempt of its batch an attempt is: 1 for the first, 2 for its first retry. Without batches, its place in the task. */
 export function tryOf(attempt: Attempt, attempts: Attempt[]): number {
   const index = attempt.batch?.index;
   const same = attempts.filter((a) => (index == null ? true : a.batch?.index === index));
   return same.findIndex((a) => a.id === attempt.id) + 1;
 }
 
-/** An attempt's name for people (D170): "attempt 2 of batch 1", or "attempt 3" where there are no batches. */
-export function attemptName(attempt: Attempt, attempts: Attempt[]): string {
-  if (!attempt.batch) return `attempt ${attempt.generation}`;
+/**
+ * An attempt's name for people, only as much as carries information (D170,
+ * D173): "attempt 2 of batch 1" for a retry in a multi-batch walk, "batch 3"
+ * for a first try there, "attempt 2" for a retry of a single batch, and none
+ * for the one attempt of a plain task: the run says it all.
+ */
+export function attemptName(attempt: Attempt, attempts: Attempt[]): string | null {
+  const { multi } = walkOf(attempts);
+  const index = attempt.batch?.index;
+  const tries = attempts.filter((a) => (index == null ? true : a.batch?.index === index)).length;
   const n = tryOf(attempt, attempts);
-  return `attempt ${n} of batch ${attempt.batch.index + 1}`;
+  if (multi && index != null) return tries > 1 ? `attempt ${n} of batch ${index + 1}` : `batch ${index + 1}`;
+  return tries > 1 ? `attempt ${n}` : null;
 }

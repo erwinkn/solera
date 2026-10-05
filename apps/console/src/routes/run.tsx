@@ -7,13 +7,13 @@ import { useDeleteRun, useRetryRun, useRunAction } from "@/api/mutations";
 import type { Attempt, AttemptError, Json, RunDetail, RunEvent, Task } from "@/api/types";
 import { CLEANUP, PartitionsLabel, runTitle, TriggerLabel } from "@/features/runs";
 import {
-  attemptName,
   BatchRange,
   batchLabel,
   describeProgress,
-  groupByBatch,
-  hasBatches,
   KeyClasses,
+  ProgressBar,
+  walkOf,
+  type Walk,
 } from "@/features/batches";
 import { Logs, type LogLevel } from "@/features/logs";
 import { workerOf } from "@/features/worker";
@@ -272,10 +272,9 @@ function TaskPanel({
   const search = route.useSearch();
   const navigate = route.useNavigate();
   const tab = search.tab ?? "logs";
-  const batched = hasBatches(attempts);
-  const planned = attempts.reduce((n, a) => Math.max(n, a.batch?.count ?? 0), 0) || null;
-  // Only a task that walks batches has progress to tell; for the others it is always null.
-  const walk = batched || task.progress != null ? describeProgress(task.progress, planned) : null;
+  // The run is the picture (D173): batches show only for a walk of several, attempts only once retried.
+  const walk = walkOf(attempts);
+  const progress = walk.multi ? describeProgress(task.progress, walk.planned) : null;
   const tabs: { id: typeof tab; label: string }[] = [
     { id: "logs", label: "Logs" },
     { id: "result", label: "Result" },
@@ -305,51 +304,35 @@ function TaskPanel({
           </span>
         }
         description={
-          <>
-            {walk && `${walk} · `}
-            {batched
-              ? plural(attempts.length, "attempt")
-              : `${plural(task.attempt_count, "attempt")} of at most ${task.max_attempts}`}
-            {task.wait != null && ` · waited ${duration(task.wait)}`}
-            {task.held && ` · held: ${task.held[0]}${task.held[1] ? ` (${task.held[1]})` : ""}`}
-          </>
+          <span className="inline-flex flex-wrap items-center gap-x-1.5">
+            {walk.multi && <ProgressBar progress={task.progress} planned={walk.planned} />}
+            {[
+              progress,
+              walk.retried && plural(attempts.length, "attempt"),
+              task.wait != null && task.wait >= 1 && `waited ${duration(task.wait)}`,
+              task.held && `held: ${task.held[0]}${task.held[1] ? ` (${task.held[1]})` : ""}`,
+            ]
+              .filter(Boolean)
+              .join(" · ")}
+          </span>
         }
         actions={
-          !batched &&
-          attempts.length > 1 && (
-            <div
-              role="tablist"
-              aria-label="Attempts"
-              className="flex gap-1"
-              onKeyDown={(e) => rove(e, "tab")}
-            >
-              {attempts.map((a) => (
-                <Link
-                  key={a.id}
-                  role="tab"
-                  aria-selected={a.id === attempt?.id}
-                  tabIndex={a.id === attempt?.id ? 0 : -1}
-                  to="/runs/$run"
-                  params={{ run }}
-                  search={(s) => ({ ...s, task: task.id, attempt: a.id })}
-                  replace
-                  className={cn(
-                    "inline-flex h-7 items-center gap-1.5 rounded-sm px-2 text-xs font-medium",
-                    a.id === attempt?.id ? "bg-fg text-fg-inverse" : "text-fg-muted hover:bg-accent-soft",
-                  )}
-                >
-                  <StatusIcon
-                    status={a.outcome}
-                    className={a.id === attempt?.id ? "text-current" : undefined}
-                  />
-                  #{a.generation}
-                </Link>
-              ))}
-            </div>
+          !walk.multi &&
+          walk.retried && (
+            <AttemptChips
+              select={(a) => ({
+                to: "/runs/$run",
+                params: { run },
+                search: (s) => ({ ...s, task: task.id, attempt: a.id }),
+                replace: true,
+              })}
+              attempts={attempts}
+              selected={attempt}
+            />
           )
         }
       />
-      {batched && <Batches run={run} task={task} attempts={attempts} selected={attempt} />}
+      {walk.multi && <Batches run={run} task={task} walk={walk} selected={attempt} />}
       {!attempt ? (
         <Empty compact title={task.status === "blocked" ? "Blocked" : "Not started yet"}>
           {task.status === "blocked"
@@ -358,7 +341,7 @@ function TaskPanel({
         </Empty>
       ) : (
         <>
-          <AttemptSummary run={run} attempt={attempt} live={live} />
+          <AttemptSummary run={run} attempt={attempt} walk={walk} live={live} />
           <div
             role="tablist"
             aria-label="Attempt details"
@@ -432,19 +415,15 @@ function errorOf(error: Attempt["error"]): AttemptError | null {
  * each batch covered, what it held per class, and its attempts — a retry is
  * another attempt of the same batch, so it sits on the same row.
  */
-function Batches({
-  run,
-  task,
-  attempts,
-  selected,
-}: {
-  run: string;
-  task: Task;
-  attempts: Attempt[];
-  selected?: Attempt;
-}) {
-  const groups = groupByBatch(attempts);
+function Batches({ run, task, walk, selected }: { run: string; task: Task; walk: Walk; selected?: Attempt }) {
   const committed = task.progress ? task.progress.batch : -1;
+  const final = task.progress?.key === null;
+  const select = (a: Attempt) => ({
+    to: "/runs/$run" as const,
+    params: { run },
+    search: (s: Record<string, unknown>) => ({ ...s, task: task.id, attempt: a.id }),
+    replace: true,
+  });
   return (
     <div className="max-h-72 overflow-auto border-t border-line">
       <table className="w-full text-sm whitespace-nowrap">
@@ -453,11 +432,11 @@ function Batches({
             <th className="py-1.5 pr-3 pl-4 font-medium">Batch</th>
             <th className="px-3 py-1.5 font-medium">Keys</th>
             <th className="px-3 py-1.5 font-medium">Held</th>
-            <th className="py-1.5 pr-4 pl-3 font-medium">Attempts</th>
+            {walk.retried && <th className="py-1.5 pr-4 pl-3 font-medium">Attempts</th>}
           </tr>
         </thead>
         <tbody>
-          {groups.map(({ batch, attempts: tries }) => {
+          {walk.groups.map(({ batch, attempts: tries }) => {
             const last = tries[tries.length - 1]!;
             const current = tries.some((a) => a.id === selected?.id);
             const done = batch != null && batch.index <= committed;
@@ -467,42 +446,25 @@ function Batches({
                 className={cn("border-t border-line", current && "bg-select")}
               >
                 <td className="py-1.5 pr-3 pl-4 whitespace-nowrap">
-                  <span className="inline-flex items-center gap-2">
+                  <Link
+                    {...select(last)}
+                    aria-current={current || undefined}
+                    className="inline-flex items-center gap-2 hover:underline"
+                  >
                     <StatusIcon status={done ? "committed" : last.outcome} />
-                    <span className="tabular">
-                      {batch ? batchLabel(batch, task.progress?.key === null) : attemptName(last, attempts)}
-                    </span>
-                  </span>
+                    <span className="tabular">{batch ? batchLabel(batch, final) : label(last.outcome)}</span>
+                  </Link>
                 </td>
                 <td className="max-w-80 px-3 py-1.5">{batch && <BatchRange batch={batch} />}</td>
                 <td className="px-3 py-1.5">{batch && <KeyClasses {...batch} />}</td>
-                <td className="py-1.5 pr-4 pl-3">
-                  <span className="flex flex-wrap gap-1">
-                    {tries.map((a, i) => (
-                      <Link
-                        key={a.id}
-                        to="/runs/$run"
-                        params={{ run }}
-                        search={(s) => ({ ...s, task: task.id, attempt: a.id })}
-                        replace
-                        aria-current={a.id === selected?.id || undefined}
-                        title={`attempt ${i + 1} of ${batch ? `batch ${batch.index + 1}` : "the task"} · ${label(a.outcome)}`}
-                        className={cn(
-                          "inline-flex h-6 items-center gap-1 rounded-sm px-1.5 text-xs font-medium",
-                          a.id === selected?.id
-                            ? "bg-fg text-fg-inverse"
-                            : "text-fg-muted hover:bg-accent-soft",
-                        )}
-                      >
-                        <StatusIcon
-                          status={a.outcome}
-                          className={a.id === selected?.id ? "text-current" : undefined}
-                        />
-                        attempt {i + 1}
-                      </Link>
-                    ))}
-                  </span>
-                </td>
+                {walk.retried && (
+                  <td className="py-1.5 pr-4 pl-3">
+                    {/* Attempts only where the batch was retried: one attempt says nothing. */}
+                    {tries.length > 1 && (
+                      <AttemptChips select={select} attempts={tries} selected={selected} />
+                    )}
+                  </td>
+                )}
               </tr>
             );
           })}
@@ -512,7 +474,60 @@ function Batches({
   );
 }
 
-function AttemptSummary({ run, attempt, live }: { run: string; attempt: Attempt; live: boolean }) {
+/** A retried batch's (or task's) attempts, each viewable: the failed tries too. */
+function AttemptChips({
+  select,
+  attempts,
+  selected,
+}: {
+  select: (a: Attempt) => {
+    to: "/runs/$run";
+    params: { run: string };
+    search: (s: Record<string, unknown>) => Record<string, unknown>;
+    replace: boolean;
+  };
+  attempts: Attempt[];
+  selected?: Attempt;
+}) {
+  return (
+    <span
+      role="tablist"
+      aria-label="Attempts"
+      className="flex flex-wrap gap-1"
+      onKeyDown={(e) => rove(e, "tab")}
+    >
+      {attempts.map((a, i) => (
+        <Link
+          key={a.id}
+          {...select(a)}
+          role="tab"
+          aria-selected={a.id === selected?.id}
+          tabIndex={a.id === selected?.id ? 0 : -1}
+          title={`attempt ${i + 1} · ${label(a.outcome)}`}
+          className={cn(
+            "inline-flex h-6 items-center gap-1 rounded-sm px-1.5 text-xs font-medium",
+            a.id === selected?.id ? "bg-fg text-fg-inverse" : "text-fg-muted hover:bg-accent-soft",
+          )}
+        >
+          <StatusIcon status={a.outcome} className={a.id === selected?.id ? "text-current" : undefined} />
+          attempt {i + 1}
+        </Link>
+      ))}
+    </span>
+  );
+}
+
+function AttemptSummary({
+  run,
+  attempt,
+  walk,
+  live,
+}: {
+  run: string;
+  attempt: Attempt;
+  walk: Walk;
+  live: boolean;
+}) {
   const now = useNow();
   const end =
     attempt.finished_at ?? (ACTIVE_ATTEMPT.has(attempt.outcome) ? now : (attempt.started_at ?? now));
@@ -525,9 +540,11 @@ function AttemptSummary({ run, attempt, live }: { run: string; attempt: Attempt;
         <Fact label="Outcome">
           <StatusBadge status={attempt.outcome} />
         </Fact>
-        <Fact label="Attempt">
-          <Id value={attempt.id} copy />
-        </Fact>
+        {walk.retried && (
+          <Fact label="Attempt">
+            <Id value={attempt.id} copy />
+          </Fact>
+        )}
 
         <Fact label="Executor">{attempt.executor ?? "—"}</Fact>
         {worker && (
@@ -584,28 +601,36 @@ function AttemptSummary({ run, attempt, live }: { run: string; attempt: Attempt;
 
       {attempt.batch && (
         <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs">
-          <span className="text-fg-subtle">Batch {attempt.batch.index + 1}</span>
-          <BatchRange batch={attempt.batch} />
+          {walk.multi ? (
+            <>
+              <span className="text-fg-subtle">Batch {attempt.batch.index + 1}</span>
+              <BatchRange batch={attempt.batch} />
+            </>
+          ) : (
+            <span className="text-fg-subtle">Keys</span>
+          )}
           <KeyClasses {...attempt.batch} />
         </div>
       )}
 
-      {attempt.keys && Object.keys(attempt.keys).length > 0 && (
-        <div className="flex flex-wrap items-center gap-2 text-xs">
-          <span className="text-fg-subtle">Calls</span>
-          {Object.entries(attempt.keys).map(([outcome, n]) => (
-            <span
-              key={outcome}
-              className={cn(
-                "inline-flex h-5 items-center gap-1 rounded-full px-2 font-medium",
-                toneSoft[tone(outcome)],
-              )}
-            >
-              {n} {label(outcome)}
-            </span>
-          ))}
-        </div>
-      )}
+      {/* Per-key calls say something only when one didn't end ok (D173). */}
+      {attempt.keys &&
+        Object.entries(attempt.keys).some(([outcome, n]) => outcome !== "ok" && (n ?? 0) > 0) && (
+          <div className="flex flex-wrap items-center gap-2 text-xs">
+            <span className="text-fg-subtle">Calls</span>
+            {Object.entries(attempt.keys).map(([outcome, n]) => (
+              <span
+                key={outcome}
+                className={cn(
+                  "inline-flex h-5 items-center gap-1 rounded-full px-2 font-medium",
+                  toneSoft[tone(outcome)],
+                )}
+              >
+                {n} {label(outcome)}
+              </span>
+            ))}
+          </div>
+        )}
 
       {attempt.outputs && attempt.outputs.length > 0 && (
         <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs">

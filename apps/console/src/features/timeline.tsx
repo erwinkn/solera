@@ -8,7 +8,7 @@ import { duration } from "@/lib/format";
 import { label, tone, toneSolid } from "@/lib/status";
 import { Tooltip } from "@/ui/overlay";
 import { StatusIcon } from "@/ui/status";
-import { attemptName, hasBatches, KeyClasses } from "./batches";
+import { attemptName, KeyClasses, walkOf } from "./batches";
 
 /**
  * Attempt phases (docs/object-store-state.md §7): from one milestone to the
@@ -46,11 +46,13 @@ function PhaseTip({ attempt, attempts, end }: { attempt: Attempt; attempts: Atte
     <div className="flex min-w-44 flex-col gap-1">
       <span className="flex items-center justify-between gap-4 font-medium">
         <span>
-          {name[0]!.toUpperCase() + name.slice(1)} · {label(attempt.outcome)}
+          {name
+            ? `${name[0]!.toUpperCase() + name.slice(1)} · ${label(attempt.outcome)}`
+            : label(attempt.outcome)}
         </span>
         <span className="tabular">{duration(total)}</span>
       </span>
-      {attempt.batch && (
+      {attempt.batch && walkOf(attempts).multi && (
         <span className="opacity-80">
           <KeyClasses {...attempt.batch} className="text-current [&_*]:text-current" />
         </span>
@@ -332,7 +334,7 @@ export function Waterfall({
                           attempt: attempt.id,
                         })}
                         replace
-                        aria-label={`${task.asset} ${task.partition} ${attemptName(attempt, list)}: ${label(attempt.outcome)}, ${duration(stop - attempt.started_at)}`}
+                        aria-label={`${[task.asset, task.partition, attemptName(attempt, list)].filter(Boolean).join(" ")}: ${label(attempt.outcome)}, ${duration(stop - attempt.started_at)}`}
                         className={cn(
                           "absolute top-1/2 h-3.5 -translate-y-1/2 rounded-mark p-[1.5px]",
                           active ? "ring-2 ring-fg" : "hover:ring-2 hover:ring-line-strong",
@@ -356,12 +358,13 @@ export function Waterfall({
   );
 }
 
-/** A task's walk in the waterfall's label column: batches committed of those planned. */
+/** A multi-batch walk in the waterfall's label column: batches committed of those planned. */
 function WalkCount({ task, attempts }: { task: Task; attempts: Attempt[] }) {
+  // Only a walk of several batches has a count worth showing (D173).
+  const { multi, planned } = walkOf(attempts);
+  if (!multi) return null;
   const progress = task.progress;
-  if (!hasBatches(attempts) && progress == null) return null;
   const done = progress ? progress.batch + 1 : 0;
-  const planned = attempts.reduce((n, a) => Math.max(n, a.batch?.count ?? 0), 0) || null;
   const final = progress?.key === null;
   return (
     <span
