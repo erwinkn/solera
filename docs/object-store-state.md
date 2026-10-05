@@ -71,6 +71,7 @@ Everything lives under `{root}/{namespace}/`.
 |---|---|---|---|---|
 | Journal | `control/journal.json` | engine | swapped (`If-Match`) on every flush | never (one object) |
 | Checkpoint | `control/checkpoints/{engine}-{n:06d}.json` | engine | create-only | once the journal has moved to a newer one (§10) |
+| Engine secret | `control/engine-secret` | the first engine that needs one | create-only | never (one object): attempt tokens are signed with it, so tokens in specs survive a restart |
 | Key index file | `keys/{output}/{partition}/{name}.lay` (and `.lix`) | worker or engine (deltas), merges | create-only | no longer in the index and no consumer needs it (§6) |
 | History file | `history/{table}/{ulid}.parquet` | engine | create-only | merged into a bigger file, or rewritten without deleted runs (§7) |
 | Spec | `runs/{run}/{attempt}.spec` | engine, before `AttemptLaunched` | create-only, immutable | with its run |
@@ -124,7 +125,7 @@ Output data lives wherever its store puts it: FileStore under
 
 **Renames.** `@asset(aliases=["old_name"])`. On registration the engine
 moves everything held under an alias to the current name: its partition
-records (cursor, outcome, completeness, positions, failing keys — one
+records (cursor, outcome, what its inputs observed, stored outcomes — one
 record per partition, moved whole), heads, key indexes, automation state
 (attached automations are named after their asset), retention lists. Outputs named after the
 asset follow. Stores never rename anything: the committed head's ref
@@ -139,13 +140,13 @@ store holds, is a new one (K10). At that deploy, not later:
 
 - its heads, key indexes (their files go to collection) and repair intents
   go;
-- every position that reads it goes, and every position of the asset that
-  writes it: its consumers re-read it from scratch, and its asset reads
-  each of its inputs in a full pass. A `keys=` run of a partition that lost
-  positions this way reads that full pass too, to its last batch, before
-  it succeeds;
-- a removed asset loses its partition records — cursor, positions, failed
-  keys — a job's too, which has no output (F21).
+- what its consumers observed of it stays, naming its earlier life, so
+  that their next run is a full run; a per-key consumer's stored outcomes
+  go, against keys no longer its input's (K47). The asset that writes it
+  loses what its partitions observed and were made under: a new life,
+  never built, so missing, not stale;
+- a removed asset loses its partition records — cursor, observations,
+  stored outcomes — a job's too, which has no output (F21).
 
 An attempt launched before the reset commits nothing of it: one of a
 reset asset, or that writes a reset output or reads one incrementally, is
@@ -186,15 +187,17 @@ Its automations then decide, each by its own criterion:
   was declared, never at once;
   `OnDeploy` and sensors keep their criteria.
 - With no automation nothing runs. The partition shows `stale` —
-  materialized, but caught up (`caught_up_at`) before its asset's last
-  change — until a run catches it up: the console and CLI show it, for a
-  run by hand.
+  materialized, but made under another definition than its asset's now
+  (its record's `definition`, compared with the current one) — until a run
+  rebuilds it: the console and CLI show it, for a run by hand.
 
 ## 3. Journal
 
 One object, `control/journal.json`, rewritten whole by every flush: the
-engine id of its writer, the name of the checkpoint it extends, every
-event since that checkpoint (§10), and the state's `format`.
+engine id of its writer and its `epoch` (one past its predecessor's,
+durable once it fenced: what an engine names by it, a merge's output, a
+fenced engine never collects), the name of the checkpoint it extends,
+every event since that checkpoint (§10), and the state's `format`.
 
 **Format, and no migration.** The state's format is 5: 2 since the
 stamped-layer key index and cleanup cursors (T33), 3 since key outcomes
@@ -234,20 +237,24 @@ index layers (§6), deletes garbage and applies retention (§11).
 {
   "checkpoint": "7f3a9c0e5b21d846-000012",
   "engine": "7f3a9c0e5b21d846",
+  "epoch": 3,
   "events": [
     "…every event since checkpoint 000012, then:",
     {"type": "AttemptFinished", "run": "01J8ZC7Q…", "task": "site_feed:alpha",
      "attempt": "01J8ZC7R…", "outcome": "succeeded", "started_at": 1790074865.2, "finished_at": 1790074866.0,
      "commit": {
        "heads": {"site_events": {"…": "Head, §5"}, "site_files": {"…": "Head, §5"}},
-       "keys": {"site_files": {"commit_number": 57, "added": 0, "removed": 0, "exact": true,
-                               "files": [{"name": "000000000057-01J8ZC7R…", "level": 0, "entries": 2,
-                                          "min": "alpha-file-1", "max": "alpha-file-3", "…": "…"}]}},
+       "keys": {"site_files": {"commit_number": 57, "added": 0, "removed": 0, "generation": 412,
+                               "part": {"files": [{"name": "000000000057-01J8ZC7R…-0.lay", "size": 211,
+                                                   "entries": 2, "first": "alpha-file-1",
+                                                   "last": "alpha-file-3"}],
+                                        "index": null, "index_size": 0}}},
        "cursor": "5921",
-       "positions": {}
+       "final": true
      }},
     {"type": "AutomationFired", "name": "site_feed.every.0", "at": 1790074866.1, "run": "01J8ZC7S…"}
-  ]
+  ],
+  "format": 5
 }
 ```
 
@@ -258,19 +265,26 @@ status are derived inside `apply`; they are not events.
 
 | Event | Fields | Effect |
 |---|---|---|
-| `ProjectRegistered` | `deploy`, `manifest` | replaces the manifest; applies aliases; resets removed assets and removed or moved outputs (§2); reconciles automation state |
+| `ProjectRegistered` | `deploy`, `manifest`, `project` | replaces the manifest; applies aliases; resets removed assets and removed or moved outputs (§2); reconciles automation state |
 | `FiringsOwed` | `owed` {automation: [[asset, partition]]} | what the deploy's asset changes leave each `OnChange` automation owing, once (§2): appended to its pending changes |
 | `RunSubmitted` | `run` (id, request, tasks) | adds an active run |
 | `RunControlled` | `run`, `action` (`cancel` \| `pause` \| `resume`) | |
+| `TasksHeld` | `held` {task: [reason, name]}, `at` | why ready tasks are not claimed: the engine or their executor is full, another attempt holds their partition, or an index's merges are far behind (`merges`); recorded only when that changes |
+| `EngineOutage` | `down`, `at` | the engine was down from `down` (the last time it said it was alive) to `at`: every run in progress records the outage, and its tasks' wait leaves it out |
 | `AttemptLaunched` | `run`, `task`, `attempt`, `started_at`, `pin`, `at`, `execution`, `prepared`, `pool?` | the attempt file exists and a placement is about to start it: its claim becomes durable (§8) |
 | `AttemptPlaced` | `attempt`, `handle` | the placement started it: where it runs, for whichever engine follows it (§8) |
-| `AttemptFinished` | `run`, `task`, `attempt`, `outcome` (`succeeded` \| `failed` \| `skipped` \| `canceled`), `started_at`, `finished_at`, `error?`, `retryable?`, `commit?`, `owing a repair?`, `writes?` | records the attempt; on commit, installs heads, the partition's record (cursor, positions, completeness), and each keyed output's new delta file; `repairs` keeps the intents of a writer that died (§8) |
+| `AttemptFinished` | `run`, `task`, `attempt`, `outcome` (`succeeded` \| `failed` \| `skipped` \| `canceled`), `started_at`, `finished_at`, `error?`, `retryable?`, `commit?`, `owing a repair?`, `writes?` | records the attempt; on commit, installs heads, the partition's record (cursor, what its inputs observed, its definition, config and context, its last batch's `final`) and a per-key asset's stored outcomes, and each keyed output's new delta file; `repairs` keeps the intents of a writer that died (§8) |
 | `SourceCommitted` | `source`, `head`, `keys?`, `at`, `run?` | installs a source head and its delta file; a commit that changed something records `run` in the history (§7) |
+| `SensorAdvanced` | `sensor`, `cursor`, `accepted` | a tick that changed something: its cursor, and what it accepted |
+| `KeysRetryRequested` | `asset`, `partition?`, `classes`, `by` | a forced retry of a per-key asset's stored outcomes of those classes (`per-key-processing.md` §9), identified by its event counter |
+| `RepairRunSubmitted` | `output`, `partition`, `at` | the repair clock ran the partition again for its repair: counted, so it stops after a few (§8) |
+| `CleanupsCleared` | `output`, `partition`, `ids`, `retired`, `by`, `at` | an operator gave up on stuck cleanups (a stuck cursor step's deltas, `delta:{n}`, included); their objects stay |
 | `MergeAttempted` | `output`, `partition`, `life`, `inputs` (the attempt key), `at` | counts an upload of one merge before it starts; after three, none published, the index backs off (10 minutes, doubling to 4 hours) |
 | `MergeInterrupted` | `output`, `partition`, `life`, `inputs`, `at` | the engine's own stop cut that upload short: it counts for nothing |
 | `MergesCleared` | `output`, `partition`, `by`, `at` | an operator's clear: the index's merges are tried again at once |
 | `IndexMerged` | `output`, `partition`, `life`, `prefix`, `ids`, `layer`, `at` | swaps adjacent layers for their merge, if the index is still that life and holds those layers; else its files are orphans |
 | `IndexCut` | `output`, `partition`, `life`, `cut` | raises the index's cut (never lowers it) |
+| `OrphansFound` | `paths` | index files nothing names (a merge that never published): garbage now, deleted once no pin predates this event |
 | `FilesCleanedUp` | `paths` | forgets index files that were deleted |
 | `AutomationChanged` | `name`, `enabled` | |
 | `AutomationFired` | `name`, `at`, `run` | clears its pending set |
@@ -293,30 +307,37 @@ than joined string keys, because partition keys may contain `/`.
 
 ```
 State
-  event_counter, deploy, deploy_number, manifest   # event_counter: events applied so far, the model's clock
+  event_counter, deploy, deploy_number, manifest, project   # event_counter: events applied so far, the model's clock
   heads        {output: {partition: Head}}             # assets and external sources
-  indexes      {output: {partition: KeyIndex}}         # keyed outputs and keyed sources (§6)
+  indexes      {output: {partition: KeyIndex}}         # keyed outputs and sources (§6); a per-key asset's outcome index under "@asset"
+  merges       {output: {partition: {life, attempts}}} # what an index's merges tried in its life, for their backoff (§6)
   partitions   {asset: {partition: PartitionRecord}}   # each asset partition's committed lifecycle
   automations  {name: AutomationState}
-  runs         {run: Run}                          # active, or finished and not yet archived
-  history      {files: {table: [File]}, rows: {table: [[seq, row], …]}, seq, imported}   # §7
-  repairs    {output: {partition: [Intent, …]}}      # keyed outputs a dead writer may have half-written (§8)
-  garbage      [[path, n], …]                      # index and history files nothing references since event n
-  retired      [run, …]                            # deleted runs whose directories are still to delete (§11)
+  sensors      {sensor: {cursor, accepted}}            # each sensor's last tick that changed something
+  runs         {run: Run}                              # active, or finished and not yet archived
+  receipts     [[command, run], …]                     # the last 10,000 submissions' ids: a replayed one gets its run
+  history      {files: {table: [File]}, rows: {table: [[seq, row], …]}, seq}   # §7
+  repairs      {output: {partition: [Intent, …]}}      # keyed outputs a dead writer may have half-written (§8)
+  cleanups     {output: {partition: [entry, …]}}       # an immutable store's superseded objects, to clean up (lifecycle.md §9.8)
+  cleaning     {output: {partition: [step, …]}}        # an immutable keyed output's deltas not yet cleaned: its cleanup cursor
+  retired      {id: life}                              # output lives removed or moved away, their data a cleanup task deletes (K25)
+  homes        {output: name}                          # the name an output's life began under: where its store keeps it
+  reset_at     {output|asset: {name: deploy}}          # the deploy that last reset it: an attempt launched before commits nothing of it
+  garbage      [[path, n], …]                          # index and history files nothing references since event n
+  deleted      [run, …]                                # deleted runs whose directories are still to delete (§11)
 ```
 
 | Type | Fields | Bounded by |
 |---|---|---|
 | `Head` | `ref` (from the store), `run`, `attempt` (may point at a deleted run), `commit_number` (incremental outputs: the last commit that changed it, −1 before any), `base` (the first commit after the last reset of an unkeyed incremental output), `partitions?` (dynamic partitions: the partitions it lists, worked out by the engine at each commit from its key index — the elements before, changed by the delta), `version` (declared asset version), `at`, `n?` (a source's: the event counter of its commit) | outputs × partitions |
-| `PartitionRecord` | `cursor?` (json), `last?` (`Outcome`: its last terminal result), `caught_up?` (whether its last commit finished the pass it was on — the partition's completeness, whatever its outputs wrote), `caught_up_at?` (the event counter of the commit that last caught it up: before its asset's `changed_at`, it is `stale`), `seen?` {input: versions} (the head generations of the whole and dep inputs it last caught up to: moved since, it is `stale`), `positions?` {input: `Position`}, `failures?` (`Failures`: a per-key asset's failing keys, per-key-processing.md §9). Registration moves it whole under a rename, drops the positions of inputs the project no longer declares, and those a reset takes (§2). | assets × partitions |
-| `Failures` | `commit_number` (the record's last commit), `counts` {outcome: keys}, `due` and `deploy_min` (lower bounds), `retry?` {`pass`, `deploy`, `forced_at`, `after`, `due_acc`, `deploy_acc`}, `passes`, `done_forced`, `last` (`changes` or `retry`), `forced` {class: position} — its index is `indexes["@asset"][partition]` (per-key-processing.md §9) | Each assets × partitions |
+| `PartitionRecord` | `cursor?` (json), `last?` (`Outcome`: its last terminal result), `failed_in_row?` (its runs failing in a row: changes back off), `observed?` {input: what it observed — a keyed input's observation record (`observed-set.md`), an unkeyed one's last commit read}, `definition?`, `config?` and `context?` (what its last commit was made under: staleness compares them, §2), `outcomes?` (`Outcomes`: a per-key asset's stored outcomes, per-key-processing.md §9). Registration moves it whole under a rename, and drops what a reset takes (§2). | assets × partitions |
+| `Outcomes` | `commit_number` (the record's last commit), `counts` {outcome: keys} (stored outcomes alone; served as `stored_counts`), `due` and `deploy_min` (lower bounds), `retry?` {`pass`, `deploy`, `forced_at`, `after`, `due_acc`, `deploy_acc`}, `passes`, `done_forced`, `last` (`changes` or `retry`), `forced` {class: position} — its index is `indexes["@asset"][partition]` (per-key-processing.md §9) | Each assets × partitions |
 | `KeyIndex` | `prefix` (where its files live — kept across renames), `count` (exact: writes are exact), `files` [{`name`, `level`, `min`, `max`, `entries`, `size`, `tail`, `index`}], `log` [[`batch`, [file]], …] — see §6 | a few dozen files per index |
-| `Position` | `kind` (`keys` or `commits`), `next` (the first upstream commit not yet delivered), `began` (when its last full pass began, kept after it ends), `seen` (the whole and dep versions it began under: an input at another version makes one due, A19 R7), `pass` (one under way: its `mode` — `full`, `delta`, or a pattern change's `diff` — its boundary `from`..`to`, its place `at` — the last key delivered, or the next batch — its `page` of `pages`, a pass's reader `pin` (a delta's files, a full pass's snapshot); a full keyed pass's `from` is the head's commit number + 1 when it began, so changes made meanwhile arrive afterwards as deltas), `fingerprint`, `output` and `up` (the upstream index it reads), and per-key `patterns`, `pattern change`, `reconcile`, and `ahead`, the read-ahead: `[commit, run, attempt, …]` per `keys=` run since the last pass — a selection goes `batch_size` keys an attempt, and its pages' attempts share its entry — capped (`positions-from-reads.md`; `python/solera_server/positions.py`) | inputs × partitions |
 | `Outcome` | `outcome`, `run`, `attempt`, `at` | assets × partitions |
 | `AutomationState` | `enabled`, `since` (when declared: a schedule counts from it), `last_fired`, `last_run`, `last_deploy`, `pending` (set of `[asset, partition]` for OnChange); its trigger, targets and the rest are its manifest entry, merged in memory and never checkpointed | automations × partitions |
 | `Run` | `id`, `request` {targets, partitions, mode, config, keys, automation, tags}, `status`, `paused`, `created_at`, `events` (how many it has recorded), `tasks` {task: `Task`} | in-flight work |
 | `Task` | `status`, `deps`, `ready_at` (now, or a retry's due time), `wait` (seconds counted so far), `queued_at` (when the wait clock last started; null while stopped), `held?` [reason, name] (why the dispatcher last passed it over), `max_attempts`, what its ended attempts add up to — `tries`, `outcomes` {outcome: count}, `duration`, `first_at`, `last_at`, `last` (the latest attempt's `id`, `outcome`, `error?`, `outputs?`), `error?`, `executor?` — never a list of them (each one's row is in the history as it ends), `launched?` {`attempt`, `started_at`, `pin` (`applied` when it was claimed), `at`, `execution`, `prepared`, `handle?`, `pool?`, `worker?`, `claimed_at?`} | |
-| `File` | `path`, `rows`, `bytes`, `at` [lo, hi] (time column), `runs` [first, last], `deleted?` [run] (hidden until rewritten), `deleted_at?` | files per table: ~log(rows) after merging |
+| `File` | `path`, `rows`, `bytes`, `at` [lo, hi] (time column), `keys` [first, last] (its key column: `run`, mostly), `hidden?` [key] (deleted runs, hidden until rewritten), `hidden_at?` | files per table: ~log(rows) after merging |
 | `Intent` | `added`, `removed`, `exact`, `files` (the dead attempt's delta files), `run`, `attempt` | writers that died mid-write, until the next commit of that output |
 
 **Derived, rebuilt at start:** the claims of launched
@@ -338,20 +359,19 @@ Example (abridged):
     "ref": {"output": "site_files", "store": "default", "partition": "alpha", "generation": 184467,
             "handle": {"mode": "keyed", "path": "site_files/alpha", "key": "path"}},
     "run": "01J8ZC7Q…", "attempt": "01J8ZC7R…",
-    "commit_number": 57, "count": 4, "complete": true, "version": "1", "at": 1790074866.0}}},
+    "commit_number": 57, "version": "1", "at": 1790074866.0}}},
   "indexes": {"site_files": {"alpha": {
     "prefix": "keys/site_files/alpha/", "count": 4,
     "files": [{"name": "c01J8ZE2…-0000", "level": 1, "min": "alpha-file-0", "max": "alpha-file-3", "entries": 4, "size": 212, "…": "…"},
               {"name": "000000000057-01J8ZC7R…", "level": 0, "min": "alpha-file-1", "max": "alpha-file-3", "entries": 2, "size": 140, "…": "…"}],
     "log": [[56, [{"name": "000000000056-01J8ZB…", "…": "…"}]], [57, [{"name": "000000000057-01J8ZC7R…", "…": "…"}]]]}}},
-  "partitions": {"site_feed": {"alpha": {"cursor": "5921", "drained": true}},
+  "partitions": {"site_feed": {"alpha": {"cursor": "5921", "definition": "4be1…"}},
              "file_index": {"alpha": {
                "last": {"outcome": "succeeded", "run": "01J8ZB3K…", "attempt": "01J8ZB3M…", "at": 1790074800.0},
-               "drained": true,
-               "positions": {"site_files": {"kind": "keys", "next": 56, "fingerprint": "8d46…",
-                                             "output": "site_files", "up": "alpha"}}}}},
-  "automations": {"site_feed.every.0": {"enabled": true, "last_fired": 1790074866.1,
-                  "last_run": "01J8ZC7S…", "last_revision": "c0ffee…", "pending": []}},
+               "definition": "91c0…", "config": {}, "context": {},
+               "observed": {"site_files": {"…": "an observation record (observed-set.md)"}}}}},
+  "automations": {"site_feed.every.0": {"enabled": true, "since": 1790070000.0, "last_fired": 1790074866.1,
+                  "last_run": "01J8ZC7S…", "last_deploy": 7, "pending": []}},
   "history": {"files": {"runs": [{"path": "history/runs/01J9A2….parquet", "rows": 4000, "at": [1790…, 1790…],
                                   "keys": ["01J9A2…", "01J9B7…"], "bytes": 81233}]},
               "rows": {"runs": [[311, ["01J9C8…", 1790074866.1, "…"]]]}, "seq": 311},
@@ -498,13 +518,14 @@ input versions built this version of `revenue`".
 
 | Table | One row per | Notable columns |
 |---|---|---|
-| `runs` | finished run or source commit | `status` (`succeeded`, `failed`, `canceled`, `skipped`), `trigger` (`manual`, `automation`, `sensor`, `commit`), `automation`, `by`, `retry_of` (the run a retry ran again), `source`, `targets`, `assets`, `committed`, `tags` (map), `task_count`, `failed_count`, `error`, `config` and `keys` (JSON, as submitted) |
-| `tasks` | task of a finished run | `asset`, `partition`, `status`, `started_at`, `finished_at`, `attempts`, `duration`, `wait` (seconds it could have run but didn't), `deps`, `max_attempts`, `retry_delay`, `retry_backoff`, `executor` (of its last attempt) |
-| `attempts` | attempt | `task`, `n`, `generation` (the one its writes carried), `outcome`, `started_at`, `finished_at`, `duration`, `preparing`, `provisioning`, `importing`, `loading`, `computing`, `writing`, `settling` (seconds per phase, below), `peak_memory` (bytes; only in a process of its own), `cpu_seconds`, `error`, `executor`, `cpu`, `memory`, `gpu` (requested; all null if it never launched), `options` (map: its other placement options, e.g. `image`), `outputs` (the outputs it committed, each at its `generation`), `keys` (map: a per-key attempt's keys by outcome) |
+| `runs` | finished run or source commit | `status` (`succeeded`, `failed`, `canceled`, `skipped`), `origin` (`manual`, `automation`, `sensor`, `commit`, `cleanup`), `automation`, `by`, `retry_of` (the run a retry ran again), `source`, `targets`, `assets`, `committed`, `tags` (map), `task_count`, `failed_count`, `error`, `config` and `keys` (JSON, as submitted) |
+| `tasks` | task of a finished run | `asset`, `partition`, `status`, `started_at`, `finished_at`, `attempts`, `duration`, `wait` (seconds it could have run but didn't), `deps`, `max_attempts`, `retry_delay`, `retry_backoff`, `executor` (of its last attempt), `progress` (its walk's last committed batch, `{batch, key}`) |
+| `attempts` | attempt | `task`, `n`, `generation` (the one its writes carried), `outcome`, `started_at`, `finished_at`, `duration`, `preparing`, `provisioning`, `importing`, `loading`, `computing`, `writing`, `settling` (seconds per phase, below), `peak_memory` (bytes; only in a process of its own), `cpu_seconds`, `error`, `executor`, `cpu`, `memory`, `gpu` (requested; all null if it never launched), `options` (map: its other placement options, e.g. `image`), `outputs` (the outputs it committed, each at its `generation`), `keys` (map: a per-key attempt's keys by outcome), `batch` (a keyed attempt's batch, JSON) |
 | `run_timeline` | moment of a run | `n` (its order in the run), `at`, `type`, `task` and `attempt` (null for the run's own events), `by`, `name`, `reason`, `until`, `rows` — the timeline, below |
-| `commits` | output version a commit installed | `output`, `partition`, `generation` (its version: the writing attempt's, or a source commit's), `run`, `attempt`, `at`, `batch`, `added`, `removed`, `added_keys`, `removed_keys` (a source commit's keys, up to 1,000), `key_count` (a keyed output's live keys after it, its index's count), `rows` (what the attempt wrote), `metadata` (JSON; an unkeyed source commit's `version`) |
-| `lineage` | input version an output version was read from, and what a current read saw (stores.md, "What a read sees") | `output`, `partition`, `generation`, `input`, `input_scope`, `input_generation` (what was pinned: the head, or a fixed pass's generation), `param`, `read_generation` (what a read of current rows saw; null for a snapshot store's read, which is the pin, and for an external source's, which is its tick — `versions.md` §6) |
+| `commits` | output version a commit installed | `output`, `partition`, `generation` (its version: the writing attempt's, or a source commit's), `asset`, `store`, `run`, `attempt`, `at`, `commit_number`, `added`, `removed`, `added_keys`, `removed_keys` (a source commit's keys, up to 1,000), `key_count` (a keyed output's live keys after it, its index's count), `rows` (what the attempt wrote), `final` (the last batch of its run; a source commit's: null), `metadata` (JSON; an unkeyed source commit's `version`) |
+| `lineage` | input version an output version was read from, and what a current read saw (stores.md, "What a read sees") | `output`, `partition`, `generation`, `input`, `input_partition`, `input_generation` (what was pinned: the head, or a fixed pass's generation), `param`, `read_generation` (what a read of current rows saw; null for a snapshot store's read, which is the pin, and for an external source's, which is its tick — `versions.md` §6) |
 | `key_outcomes` | key a per-key attempt processed | `run`, `attempt` (`attempts.id`), `asset`, `partition`, `key`, `generation` (the upstream key's it processed), `outcome` (`ok`, `removed`, `unmatched`, `rejected`, `failed`, `retrying`, `canceled`, `timed_out`), `error`, `duration`, `at` — per-key-processing.md §10 |
+| `ticks` | sensor tick (never journaled: a crash loses the last minute's, kept a day) | `sensor`, `tick`, `started_at`, `ended_at`, `host`, `outcome` (`skipped`, `advanced`, `committed`, `requested`, `refused`, `failed`), `error`, `runs` (the runs it requested) |
 
 A run where every task was skipped — it launched nothing and wrote
 nothing — is recorded with status `skipped`. Listings hide skipped runs
@@ -1015,8 +1036,8 @@ Project(retention=Retention(days=30))          # default, including source commi
 Retention(forever=True)
 ```
 
-**Current state never depends on runs.** Heads, cursors, positions and
-key indexes stand on their own; a head keeps its `run` and `attempt`
+**Current state never depends on runs.** Heads, cursors, observation
+records and key indexes stand on their own; a head keeps its `run` and `attempt`
 references even after that run is deleted ("produced 45 days ago, run
 expired"). The only runs that cannot be deleted are active ones.
 Retention applies to runs only: output data holds no history (§9), so
