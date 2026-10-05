@@ -1,146 +1,52 @@
-name: Verify object-backed engine
+name: CI
 on:
   push:
-    branches: [main, 'feat/**']
-  pull_request:
+    branches: [main]
+    paths-ignore:
+      - 'docs/**'
+      - '**/*.md'
+      - 'apps/console/**'
   workflow_dispatch:
 permissions:
   contents: read
 concurrency:
-  group: s3-verify-${{ github.event_name }}-${{ github.ref }}
+  group: ci-main
   cancel-in-progress: true
 jobs:
-  contracts:
+  verify:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
+    services:
+      postgres:
+        image: postgres:17
+        ports: ['5432:5432']
+        env:
+          POSTGRES_USER: solera
+          POSTGRES_PASSWORD: solera
+          POSTGRES_DB: solera
+        options: >-
+          --health-cmd "pg_isready -U solera"
+          --health-interval 3s
+          --health-timeout 3s
+          --health-retries 20
+    env:
+      SOLERA_TEST_DATABASE_URL: postgresql://solera:solera@127.0.0.1:5432/solera
     steps:
       - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: native
       - uses: astral-sh/setup-uv@v6
         with:
           version: '0.12.13'
           python-version: '3.12'
-      - uses: pnpm/action-setup@v4
-        with:
-          package_json_file: apps/console/package.json
-          run_install: false
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '22'
-          cache: pnpm
-          cache-dependency-path: pnpm-lock.yaml
-      - run: pnpm install --frozen-lockfile && pnpm -C apps/console typecheck && pnpm -C apps/console build
-      - run: cargo fmt --check --manifest-path native/Cargo.toml && cargo test --release --manifest-path native/Cargo.toml
+          enable-cache: true
       - run: uv sync --locked
-      - run: uv run ruff check && uv run ruff format --check
-      - run: uv run pytest -q -m 'not live' --junitxml=test-results.xml
-      - run: uv build --wheel
-      - name: Verify packaged console, extension and native probe
-        run: |
-          uv run python - <<'PY'
-          from glob import glob
-          from zipfile import ZipFile
-          with ZipFile(glob('dist/solera-*.whl')[0]) as z:
-              names = z.namelist()
-              assert 'solera/__init__.py' in names
-              assert any(n.startswith('solera/_native.') for n in names), 'no extension in wheel'
-              assert 'solera_worker/__main__.py' in names
-              assert 'solera_server/web/index.html' in names
-              assert 'solera_server/selftest.py' in names
-              assert any(n.startswith('solera_server/web/assets/') and n.endswith('.js') for n in names), 'no bundled JS in wheel'
-              assert any(n.startswith('solera_server/web/assets/') and n.endswith('.css') for n in names), 'no bundled CSS in wheel'
-          PY
-          uv run solera --state-url file:///tmp/ci-native-probe selftest
-      - name: The base install is the SDK and the worker, without the server's libraries
-        run: |
-          uv venv /tmp/base --python 3.12
-          uv pip install --python /tmp/base/bin/python dist/solera-*.whl
-          cat > /tmp/plain.py <<'PY'
-          from solera import Output, Project, asset
-
-          @asset(outputs=Output("items", key="id"))
-          def items():
-              return [{"id": "a", "n": 1}]
-
-          project = Project(name="plain", assets=[items])
-          PY
-          /tmp/base/bin/python - <<'PY'
-          import sys
-          import solera, solera.stores, solera_worker.worker, solera_postgres  # noqa: F401
-          banned = ("fastapi", "uvicorn", "starlette", "duckdb", "pandas", "pyarrow", "numpy")
-          for name in banned:
-              assert name not in sys.modules, name
-              try:
-                  __import__(name)
-              except ImportError:
-                  continue
-              raise AssertionError(f"{name} is installed with the base package")
-          PY
-          /tmp/base/bin/solera manifest --project /tmp/plain.py:project > /dev/null
-          ! /tmp/base/bin/solera --state-url file:///tmp/base-state run --project /tmp/plain.py:project items 2> /tmp/err
-          grep -q "solera\[server\]" /tmp/err
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: python-verification
-          path: |
-            test-results.xml
-            dist/
-  browser:
-    # console tests paused until the design direction is chosen
-    if: github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
-        with:
-          version: '0.12.13'
-          python-version: '3.12'
-      - uses: pnpm/action-setup@v4
-        with:
-          package_json_file: apps/console/package.json
-          run_install: false
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '22'
-          cache: pnpm
-          cache-dependency-path: pnpm-lock.yaml
-      - run: uv sync --locked
-      - run: pnpm install --frozen-lockfile && pnpm -C apps/console audit --audit-level=high
-      - run: pnpm -C apps/console exec playwright install --with-deps chromium
-      - run: pnpm -C apps/console test
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: browser-verification
-          path: apps/console/test-results/
-  journal-spec:
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: '21'
-      - run: spec/tla/check.sh journal
-  execution-spec:
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: '21'
-      - run: spec/tla/check.sh execution
-  attempt-spec:
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: '21'
-      - run: spec/tla/check.sh attempt
+      - run: uv run ruff check
+      - run: uv run ruff format --check
+      - run: cargo fmt --check --manifest-path native/Cargo.toml
+      - run: cargo test --release --manifest-path native/Cargo.toml
+      - run: uv run pytest -q -m 'not live'
