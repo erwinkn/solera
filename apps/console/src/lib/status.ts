@@ -31,6 +31,8 @@ const TONES: Record<string, Tone> = {
   blocked: "warn",
   canceled: "idle",
   aborted: "idle",
+  // planned again at a newer head: no failure, no try (docs/observed-set.md)
+  replanned: "idle",
   skipped: "idle",
   // partitions
   missing: "idle",
@@ -58,6 +60,7 @@ export function tone(status: string | null | undefined): Tone {
 
 const LABELS: Record<string, string> = {
   timed_out: "timed out",
+  replanned: "re-planned",
   not_matched: "not matched",
   onchange: "on change",
   ondeploy: "on deploy",
@@ -144,4 +147,52 @@ export function worst(tones: Iterable<Tone>): Tone {
   let best = SEVERITY.length - 1;
   for (const t of tones) best = Math.min(best, SEVERITY.indexOf(t));
   return SEVERITY[best] ?? "idle";
+}
+
+/**
+ * Why a queued task waits, in plain words (the engine's `held`: a kind and
+ * a detail). Each says what it waits for; the detail names it.
+ */
+const HELD: Record<string, { label: (d: string | null) => string; means: string }> = {
+  claim: {
+    label: () => "another attempt holds this partition",
+    means: "One attempt runs a partition at a time: this one starts when the other ends.",
+  },
+  concurrency: {
+    label: () => "at the asset's concurrency limit",
+    means: "The asset runs at most `concurrency` partitions at once.",
+  },
+  merges: {
+    label: () => "waiting for index merges",
+    means: "Its output's key index is behind on merges: it starts once they catch up.",
+  },
+  writing: {
+    label: (d) => `waiting for ${d ?? "an upstream"} to finish writing`,
+    means: "An attempt upstream is writing into the partition it reads: reading now could see half a write.",
+  },
+  repair: {
+    label: (d) => `waiting for ${d ?? "an upstream"} to be repaired`,
+    means:
+      "A writer upstream died mid-write: its partition's next attempt repairs it, and this one reads after.",
+  },
+  moved: {
+    label: () => "about to re-plan",
+    means:
+      "Its store moved past the head the batch was planned at: it is planned again at the newer head. Not a failure.",
+  },
+  engine: {
+    label: () => "at the engine's limit",
+    means: "The engine runs a bounded number of attempts at once.",
+  },
+  executor: {
+    label: (d) => `executor ${d ?? ""} is at its limit`.replace("  ", " "),
+    means: "Its executor runs a bounded number of attempts at once.",
+  },
+};
+
+export function heldReason(kind: string, detail: string | null): { label: string; means: string } {
+  const known = HELD[kind];
+  return known
+    ? { label: known.label(detail), means: known.means }
+    : { label: detail ? `${kind} (${detail})` : kind, means: `Held: ${kind}` };
 }

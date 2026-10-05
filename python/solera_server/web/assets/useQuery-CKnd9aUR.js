@@ -1,0 +1,1 @@
+import{Mn as e,Pn as t}from"./layout-DFSlvuat.js";function n(n,r){return e(n,t,r)}export{n as t};

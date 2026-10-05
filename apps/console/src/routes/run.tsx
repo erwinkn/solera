@@ -10,8 +10,10 @@ import {
   BatchRange,
   batchLabel,
   describeProgress,
+  isReplan,
   KeyClasses,
   ProgressBar,
+  tryOf,
   walkOf,
   type Walk,
 } from "@/features/batches";
@@ -21,7 +23,7 @@ import { PHASE_LABEL, PhaseBar, PhaseLegend, phaseColor, phasesOf, Waterfall } f
 import { useNow } from "@/lib/clock";
 import { cn } from "@/lib/cn";
 import { bytes, duration, firstLine, plural, shortId } from "@/lib/format";
-import { label, tone, toneSoft } from "@/lib/status";
+import { heldReason, label, tone, toneSoft } from "@/lib/status";
 import { Button } from "@/ui/button";
 import { rove } from "@/ui/form";
 import { CopyButton, Elapsed, Empty, ErrorNote, Id, JsonView, Skeleton, Time } from "@/ui/data";
@@ -192,6 +194,19 @@ export function Run() {
   );
 }
 
+/** Why a queued task waits, in plain words, explained on hover. */
+function HeldNote({ held: [kind, detail] }: { held: [string, string | null] }) {
+  const reason = heldReason(kind, detail);
+  return (
+    <Tooltip content={reason.means}>
+      <span className="underline decoration-dotted underline-offset-2">
+        {" · "}
+        {reason.label}
+      </span>
+    </Tooltip>
+  );
+}
+
 function RunActions({ detail }: { detail: RunDetail }) {
   const { request } = detail;
   const act = useRunAction(request.id);
@@ -308,17 +323,18 @@ function TaskPanel({
             {walk.multi && <ProgressBar progress={task.progress} planned={walk.planned} />}
             {[
               progress,
-              walk.retried && plural(attempts.length, "attempt"),
+              walk.retried && plural(attempts.filter((a) => !isReplan(a)).length, "attempt"),
+              walk.replanned && plural(attempts.filter(isReplan).length, "re-plan"),
               task.wait != null && task.wait >= 1 && `waited ${duration(task.wait)}`,
-              task.held && `held: ${task.held[0]}${task.held[1] ? ` (${task.held[1]})` : ""}`,
             ]
               .filter(Boolean)
               .join(" · ")}
+            {task.held && <HeldNote held={task.held} />}
           </span>
         }
         actions={
           !walk.multi &&
-          walk.retried && (
+          attempts.length > 1 && (
             <AttemptChips
               select={(a) => ({
                 to: "/runs/$run",
@@ -432,7 +448,7 @@ function Batches({ run, task, walk, selected }: { run: string; task: Task; walk:
             <th className="py-1.5 pr-3 pl-4 font-medium">Batch</th>
             <th className="px-3 py-1.5 font-medium">Keys</th>
             <th className="px-3 py-1.5 font-medium">Changes</th>
-            {walk.retried && <th className="py-1.5 pr-4 pl-3 font-medium">Attempts</th>}
+            {(walk.retried || walk.replanned) && <th className="py-1.5 pr-4 pl-3 font-medium">Attempts</th>}
           </tr>
         </thead>
         <tbody>
@@ -458,9 +474,9 @@ function Batches({ run, task, walk, selected }: { run: string; task: Task; walk:
                 </td>
                 <td className="max-w-80 px-3 py-1.5">{batch && <BatchRange batch={batch} />}</td>
                 <td className="px-3 py-1.5">{batch && <KeyClasses {...batch} />}</td>
-                {walk.retried && (
+                {(walk.retried || walk.replanned) && (
                   <td className="py-1.5 pr-4 pl-3">
-                    {/* Attempts only where the batch was retried: one attempt says nothing. */}
+                    {/* Attempts only where the batch ran more than once (a retry, a re-plan): one says nothing. */}
                     {tries.length > 1 && (
                       <AttemptChips select={select} attempts={tries} selected={selected} />
                     )}
@@ -497,21 +513,25 @@ function AttemptChips({
       className="flex flex-wrap gap-1"
       onKeyDown={(e) => rove(e, "tab")}
     >
-      {attempts.map((a, i) => (
+      {attempts.map((a) => (
         <Link
           key={a.id}
           {...select(a)}
           role="tab"
           aria-selected={a.id === selected?.id}
           tabIndex={a.id === selected?.id ? 0 : -1}
-          title={`attempt ${i + 1} · ${label(a.outcome)}`}
+          title={
+            isReplan(a)
+              ? "Re-planned: the store moved past the head this batch was planned at. Not a failure, not a try."
+              : `attempt ${tryOf(a, attempts)} · ${label(a.outcome)}`
+          }
           className={cn(
             "inline-flex h-6 items-center gap-1 rounded-sm px-1.5 text-xs font-medium",
             a.id === selected?.id ? "bg-fg text-fg-inverse" : "text-fg-muted hover:bg-accent-soft",
           )}
         >
           <StatusIcon status={a.outcome} className={a.id === selected?.id ? "text-current" : undefined} />
-          attempt {i + 1}
+          {isReplan(a) ? "re-planned" : `attempt ${tryOf(a, attempts)}`}
         </Link>
       ))}
     </span>
@@ -541,7 +561,7 @@ function AttemptSummary({
         <Fact label="Outcome">
           <StatusBadge status={attempt.outcome} />
         </Fact>
-        {walk.retried && (
+        {(walk.retried || walk.replanned) && (
           <Fact label="Attempt">
             <Id value={attempt.id} copy />
           </Fact>
@@ -641,7 +661,20 @@ function AttemptSummary({
 
       <CancelNote run={run} attempt={attempt} live={live} />
       {/* A cancel's "error" is the cancel itself, which the note above explains. */}
-      {error && error.message !== "canceled" && <ErrorBlock error={error} run={run} attempt={attempt} />}
+      {isReplan(attempt) ? (
+        <div className="flex items-start gap-2.5 rounded-md border-theme border-line bg-surface-2 px-3 py-2.5 text-sm">
+          <StatusIcon status="replanned" className="mt-0.5 size-4" />
+          <div className="flex flex-col gap-0.5">
+            <p className="text-fg">Re-planned: the store moved past the head this batch was planned at.</p>
+            <p className="text-xs text-fg-muted">
+              It reads at the newer head on its next attempt. Not a failure, and it doesn't count as a try.
+              {error?.message && ` (${error.message})`}
+            </p>
+          </div>
+        </div>
+      ) : (
+        error && error.message !== "canceled" && <ErrorBlock error={error} run={run} attempt={attempt} />
+      )}
     </div>
   );
 }
@@ -911,8 +944,10 @@ function EventRow({ event, start, mine }: { event: RunEvent; start: number; mine
   const subject = event.task ? event.task.split("/").slice(1).join("/") : "run";
   const detail: ReactNode[] = [
     event.by && event.by !== "engine" ? `by ${event.by}` : null,
-    event.name,
-    event.reason,
+    // A held event's reason and detail in plain words; any other event's as given.
+    ...(event.type === "held" && event.reason
+      ? [heldReason(event.reason, event.name).label]
+      : [event.name, event.reason]),
     event.rows != null ? `${event.rows} rows` : null,
   ].filter(Boolean);
   return (

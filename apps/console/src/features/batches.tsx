@@ -128,7 +128,10 @@ export function KeyClasses({
 export interface Walk {
   groups: BatchGroup[];
   multi: boolean;
+  /** Some batch (or the task, when it has none) took a retry: re-plans don't count. */
   retried: boolean;
+  /** Some attempt was re-planned: its store moved past the batch's head, so it ran again. */
+  replanned: boolean;
   /** The planned number of batches, the largest any attempt reported. */
   planned: number | null;
 }
@@ -140,7 +143,8 @@ export function walkOf(attempts: Attempt[]): Walk {
   return {
     groups,
     multi: batched.length > 1 || (planned ?? 0) > 1,
-    retried: batched.length ? batched.some((g) => g.attempts.length > 1) : attempts.length > 1,
+    retried: batched.length ? batched.some((g) => tries(g.attempts).length > 1) : tries(attempts).length > 1,
+    replanned: attempts.some(isReplan),
     planned,
   };
 }
@@ -196,9 +200,22 @@ export function ProgressBar({
 }
 
 /** Which attempt of its batch an attempt is: 1 for the first, 2 for its first retry. Without batches, its place in the task. */
-export function tryOf(attempt: Attempt, attempts: Attempt[]): number {
+/**
+ * A re-planned attempt: a batch on a fenced store found the store past the
+ * head it was planned at, and is planned again at the newer one. Not a
+ * failure, and not a try: it leaves the retry budget alone.
+ */
+export const isReplan = (a: Attempt) => a.outcome === "replanned";
+
+/** The attempts that count as tries: every one but the re-plans. */
+const tries = (attempts: Attempt[]) => attempts.filter((a) => !isReplan(a));
+
+/** Which try of its batch an attempt is: 1 for the first, 2 for its first retry, re-plans
+ * not counted; null for a re-plan. Without batches, its place in the task. */
+export function tryOf(attempt: Attempt, attempts: Attempt[]): number | null {
+  if (isReplan(attempt)) return null;
   const index = attempt.batch?.index;
-  const same = attempts.filter((a) => (index == null ? true : a.batch?.index === index));
+  const same = tries(attempts.filter((a) => (index == null ? true : a.batch?.index === index)));
   return same.findIndex((a) => a.id === attempt.id) + 1;
 }
 
@@ -211,12 +228,13 @@ export function tryOf(attempt: Attempt, attempts: Attempt[]): number {
 export function attemptName(attempt: Attempt, attempts: Attempt[]): string | null {
   const { multi } = walkOf(attempts);
   const index = attempt.batch?.index;
-  const tries = attempts.filter((a) => (index == null ? true : a.batch?.index === index)).length;
+  if (isReplan(attempt)) return multi && index != null ? `batch ${index + 1}, re-planned` : "re-planned";
+  const tried = tries(attempts.filter((a) => (index == null ? true : a.batch?.index === index))).length;
   const n = tryOf(attempt, attempts);
   if (multi && index != null) {
-    if (tries > 1) return `attempt ${n} of batch ${index + 1}`;
+    if (tried > 1) return `attempt ${n} of batch ${index + 1}`;
     const count = attempt.batch!.count;
     return count != null ? `batch ${index + 1} of ${Math.max(count, index + 1)}` : `batch ${index + 1}`;
   }
-  return tries > 1 ? `attempt ${n}` : null;
+  return tried > 1 ? `attempt ${n}` : null;
 }

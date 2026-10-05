@@ -5,10 +5,10 @@ import { PHASES, type Attempt, type Phase, type RunEvent, type Task } from "@/ap
 import { useNow } from "@/lib/clock";
 import { cn } from "@/lib/cn";
 import { duration } from "@/lib/format";
-import { label, tone, toneSolid } from "@/lib/status";
+import { heldReason, label, tone, toneSolid } from "@/lib/status";
 import { Tooltip } from "@/ui/overlay";
 import { StatusIcon } from "@/ui/status";
-import { attemptName, KeyClasses, walkOf } from "./batches";
+import { attemptName, isReplan, KeyClasses, walkOf } from "./batches";
 
 /**
  * Attempt phases (docs/object-store-state.md §7): from one milestone to the
@@ -285,7 +285,7 @@ export function Waterfall({
                 {list[0]?.started_at != null && list[0].started_at > start && (
                   <span
                     aria-hidden
-                    title={`waited ${duration(task.wait ?? list[0].started_at - start)}`}
+                    title={`waited ${duration(task.wait ?? list[0].started_at - start)}${task.held ? `: ${heldReason(task.held[0], task.held[1]).label}` : ""}`}
                     className="absolute top-1/2 h-px border-t border-dashed border-fg-subtle"
                     style={{ left: 0, width: x(list[0].started_at) }}
                   />
@@ -295,16 +295,25 @@ export function Waterfall({
                   // walk moving on to its next batch.
                   const before = list[i]!;
                   if (attempt.started_at == null || before.finished_at == null) return null;
+                  // After a re-plan the batch runs again at a newer head: no failure, no retry.
+                  const replan = isReplan(before);
                   const retry =
-                    attempt.batch && before.batch
+                    !replan &&
+                    (attempt.batch && before.batch
                       ? attempt.batch.index === before.batch.index
-                      : tone(before.outcome) === "fail";
+                      : tone(before.outcome) === "fail");
                   const gap = duration(attempt.started_at - before.finished_at);
                   return (
                     <span
                       key={`gap-${attempt.id}`}
                       aria-hidden
-                      title={retry ? `retried after ${gap}` : `next batch after ${gap}`}
+                      title={
+                        replan
+                          ? `planned again after ${gap}`
+                          : retry
+                            ? `retried after ${gap}`
+                            : `next batch after ${gap}`
+                      }
                       className={cn(
                         "absolute top-1/2 h-px border-t border-dotted",
                         retry ? "border-fail" : "border-fg-subtle",
