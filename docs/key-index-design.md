@@ -276,7 +276,7 @@ acts or a new life starts.
 
 **Backpressure.** When an index holds more than 64 layers (upkeep failing
 or behind), commits to the partition wait, from every writer of the index:
-outputs, sources and failure indexes (A17's R6).
+outputs, sources and outcome indexes (A17's R6).
 
 Measured at 1M: 6.2 background entry writes per entry committed, 1.39 PUTs
 per commit, 16 MB stored on average (22 MB at peak) for ~9 MB of live keys.

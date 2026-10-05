@@ -13,7 +13,7 @@ import type {
   Executor,
   Explain,
   Facets,
-  FailedKeys,
+  LatestOutcomes,
   Histogram,
   Repair,
   Cleanup,
@@ -204,11 +204,12 @@ export const q = {
       refetchInterval: LIST,
     }),
 
-  failures: (project: string, name: string, filter: { partition?: string; outcome?: string[] }) =>
+  /** Each key's latest outcome, a page at a time; `outcome` keeps those kinds. */
+  outcomes: (project: string, name: string, filter: { partition?: string; outcome?: string[] }) =>
     infiniteQueryOptions({
-      queryKey: ["assets", name, "failures", filter],
+      queryKey: ["assets", name, "outcomes", filter],
       queryFn: ({ signal, pageParam }) =>
-        api<FailedKeys>(`${p(project)}/assets/${enc(name)}/failed-keys`, {
+        api<LatestOutcomes>(`${p(project)}/assets/${enc(name)}/outcomes`, {
           signal,
           query: {
             partition: filter.partition,
@@ -242,10 +243,10 @@ export const q = {
     filter: { partition?: string; q?: string; outcome?: string[]; key?: string },
   ) =>
     infiniteQueryOptions({
-      queryKey: ["assets", name, "key-outcomes", filter],
+      queryKey: ["assets", name, "outcomes", "history", filter],
       queryFn: ({ signal, pageParam }) =>
         api<{ outcomes: KeyOutcome[]; next: string | null }>(
-          `${p(project)}/assets/${enc(name)}/key-outcomes`,
+          `${p(project)}/assets/${enc(name)}/outcomes/history`,
           {
             signal,
             query: { ...filter, before: pageParam, limit: 100 },

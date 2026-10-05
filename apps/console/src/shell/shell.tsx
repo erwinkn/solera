@@ -129,7 +129,7 @@ function useAttention() {
   }).data;
   const failing = status
     ? Object.values(status).filter(
-        (a) => a.partitions.failed > 0 || Object.values(a.failures ?? {}).some((n) => (n ?? 0) > 0),
+        (a) => a.partitions.failed > 0 || Object.values(a.stored_counts ?? {}).some((n) => (n ?? 0) > 0),
       ).length
     : 0;
   const leftover = (repairs?.length ?? 0) + (cleanups?.filter(cleanupStuck).length ?? 0);

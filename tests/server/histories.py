@@ -11,7 +11,7 @@ output says — each key it holds, at the upstream version it was given."""
 
 from __future__ import annotations
 
-from solera.failed_keys import Record
+from solera.key_outcomes import StoredOutcome
 from solera.sdk import In, Incremental, Loaded, Output, Project, Source, asset, source
 from solera.stores import FileStore
 from solera_server.state import State
@@ -136,9 +136,9 @@ class World:
         want = {k: (int(g), {"factor": factors[k]}) for k, g in generations.items()}
         found = await decoded(self.engine, "checks", "", "row")
         # A failed key is observed too, at the generation it failed at (A19 R8): its
-        # failure record says which; the context, its batch's.
+        # stored outcome says which; the context, its batch's.
         for k, (_, payload) in (await index_entries(self.engine.state, "@checks", "")).items():
-            want[k] = (Record.decode(payload).upstream, found.get(k, (None, None))[1])
+            want[k] = (StoredOutcome.decode(payload).upstream, found.get(k, (None, None))[1])
         assert agree(found, want, items), ("checks", found, want)
 
     async def count(self) -> int:

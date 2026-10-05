@@ -164,7 +164,7 @@ The token, worker rule and retries are `lifecycle.md`'s (§4, §5.2,
 §5.3); the framing, limits and validation below are this doc's, and
 `lifecycle.md` §5.1 points here. One request per attempt that has something to
 resolve, covering every output the worker wants resolved; outputs it
-resolves itself (big writes, opaque writes, unkeyed, failure deltas, §8) are
+resolves itself (big writes, opaque writes, unkeyed, outcome deltas, §8) are
 absent.
 
 **Framing.** `u8` protocol version · `u32` header length · JSON header ·
@@ -309,7 +309,7 @@ the engine checks again.
   does for source commits; a map over `sensor_map_max` is resolved on the
   sensor worker, which commits a reference to its delta. Neither uses
   this route or an attempt's validation.
-- **Failed keys** are not resolve targets: failure deltas are resolved
+- **Stored outcomes** are not resolve targets: outcome deltas are resolved
   by the worker, with exact lookups of prior records
   (`per-key-processing.md` §9).
 
@@ -386,7 +386,7 @@ replaced it.
 
 Removed (§11). The engine plans every input batch from Δ over the layers
 and hands it in the attempt's spec (`observed-set.md`); a per-key batch's
-prior failure records and its retry walk come in the spec too (§8). A
+prior stored outcomes and its retry walk come in the spec too (§8). A
 worker's remaining index reads are its own resolve (§6) and a whole load
 of an immutable store's keys, paged from the pinned index.
 
@@ -400,12 +400,12 @@ moved by transitions, the conservative minima maintained from each commit
 and made exact by completed retry passes, and retry-pass identity. This
 doc implements none of that differently; it calls the same SDK predicate.
 
-The engine reads a per-key batch's failure records when it plans it
+The engine reads a per-key batch's stored outcomes when it plans it
 (`Observing._failed`): the prior records of its keys, by a lookup of the
-failure index at its head, and — when retries may be due — the retry
-batch, a walk of the failed keys from the pass's place keeping those
+outcome index at its head, and — when retries may be due — the retry
+batch, a walk of the stored outcomes from the pass's place keeping those
 `eligible` says are due. Both come in the spec. Failure deltas are not
-resolved here: the worker resolves them locally against the failure index
+resolved here: the worker resolves them locally against the outcome index
 its spec pins.
 
 Not in v1, and not to be built from this doc: engine-side pattern skip

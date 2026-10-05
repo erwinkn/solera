@@ -112,7 +112,7 @@ function AssetTable({
             <tr>
               <Th>Asset</Th>
               <Th>Partitions</Th>
-              <Th className="text-right">Failed keys</Th>
+              <Th className="text-right">Failing keys</Th>
               <Th>Updated</Th>
               <Th>Runs on</Th>
               <Th>Automations</Th>
@@ -184,7 +184,7 @@ function AssetTable({
                     )}
                   </Td>
                   <Td className={cn("text-right", keys ? "font-medium text-warn-fg" : "text-fg-subtle")}>
-                    {s?.failures ? keys : "—"}
+                    {s?.stored_counts ? keys : "—"}
                   </Td>
                   <Td className="text-fg-muted">
                     <Time at={s?.updated_at} />

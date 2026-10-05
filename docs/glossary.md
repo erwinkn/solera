@@ -663,14 +663,18 @@ fenced store reading current rows saw a dead attempt's half. Lineage
 flags it and names the writer. *Not:* a repair's commit, which makes such
 keys committed.
 
-**failed keys**. An `each` asset's record, per partition, of the keys
-whose last call failed, each with its retry record. A **retry pass** walks
-them in batches; `solera keys retry` makes a **forced retry**.
-*Was:* failure index. *Example:* `GET /assets/file_checks/failed-keys`.
-
 **key outcome**. What one `each` call came to: `ok`, `removed`,
 `unmatched`, or a failure (`rejected`, `failed`, `retrying`, `canceled`,
-`timed_out`).
+`timed_out`). A key's **latest outcome**, per partition, is its stored
+outcome if it has one, else derived from the input's observation record:
+`ok` (processed, at the version the record holds), `unmatched` (the
+patterns leave it out), `removed` (upstream removed it since its index's
+cut). Only the failures are stored, in the partition's **outcome index**
+(`@asset`), each with its retry state; a **retry pass** walks them in
+batches, and `solera keys retry` makes a **forced retry**. The
+`key_outcomes` history table is their log, run by run.
+*Was:* failure index, failure records, failed keys. *Example:*
+`GET /assets/file_checks/outcomes?outcome=failed`.
 
 **metadata**. Facts an attempt records about what it commits
 (`ctx.metadata(rows=…)`), per output. **tags** label runs and assets.
@@ -725,7 +729,7 @@ Each line: what goes, what replaces it, and why it does not earn a name.
 | landed, `writes`, `uncertain` | **`write`**: `none`, `writing`, `complete` | One field says how far an attempt's writes got |
 | garbage, discard, data garbage | **cleanup** | One rule (delete once no pin predates it), two places |
 | mixed (lineage) | the generation read | One moment reads a partition once: lineage records its first read |
-| failure index | **failed keys** | |
+| failure index, failure record, failed keys | **key outcomes**: stored outcomes, the outcome index | Only outcomes other than ok are stored; the rest are derived |
 | timeline, `run_events` | **run timeline** | |
 | spec, handle, `RunHandle` | **attempt spec**, **attempt handle** | Both belong to one attempt, not to a run (open question 1) |
 | observation | **tick** | |

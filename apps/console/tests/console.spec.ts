@@ -213,7 +213,7 @@ test("assets graph, keys and explain", async ({ page }) => {
     .click();
   await expect(page.getByRole("heading", { name: "file_checks", level: 1 })).toBeVisible();
   await page.getByRole("navigation", { name: "Asset sections" }).getByRole("link", { name: /Keys/ }).click();
-  await expect(page.getByRole("heading", { name: "Failed keys" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Failing keys" })).toBeVisible();
   // alpha-file-2 is excluded by the input's "drafts" pattern: explain says so.
   await page.getByLabel("Key to explain").fill("alpha-file-2");
   await page.getByRole("button", { name: "Explain" }).click();

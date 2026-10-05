@@ -5,7 +5,7 @@ configuration, patterns and aliases."""
 import asyncio
 
 from solera import Failed, Rejected, Transient
-from solera.failed_keys import CANCELED
+from solera.key_outcomes import CANCELED
 from solera.sdk import Incremental, Output, Project, asset
 from solera_server.state import State
 
@@ -138,7 +138,7 @@ async def test_3_retries_run_under_the_scopes_configuration(state):
     await drive(engine, await engine.submit(["parse"], config={"factor": 10}))
     for _ in range(1200):  # the retry clock, nothing upstream changes
         await engine.tick()
-        if len(calls) >= 3 and not engine.m.partition("parse", "")["failures"].get("counts"):
+        if len(calls) >= 3 and not engine.m.partition("parse", "")["outcomes"].get("counts"):
             break
         await asyncio.sleep(0.05)
     assert calls == [("a", 10), ("b", 10), ("b", 10)]  # a not redelivered, b under factor 10
@@ -301,9 +301,9 @@ async def test_8_a_renamed_asset_keeps_its_failures(state):
     two = Project(assets=[files, renamed], build="a fix")
     engine = make_engine(state, two)
     await engine.initialize()
-    assert "failures" in engine.m.partition("parsed", "") and ("@parsed", "") in engine.m.indexes
+    assert "outcomes" in engine.m.partition("parsed", "") and ("@parsed", "") in engine.m.indexes
     await drive(engine, await engine.submit(["parsed"]))
-    assert calls == [1, 1] and engine.m.partition("parsed", "")["failures"]["counts"] == {}
+    assert calls == [1, 1] and engine.m.partition("parsed", "")["outcomes"]["counts"] == {}
 
 
 async def test_a_full_run_reads_every_key_once_in_batches(state):

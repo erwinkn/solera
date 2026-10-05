@@ -20,7 +20,7 @@ import copy
 import json
 from dataclasses import dataclass
 
-from solera.failed_keys import Record, eligible, minima
+from solera.key_outcomes import StoredOutcome, eligible, minima
 from solera.keys.delta import delta, version_of
 from solera.keys.layers import LayerIndex, key_bytes, key_str
 from solera.patterns import Matcher
@@ -28,7 +28,7 @@ from solera.patterns import Matcher
 from . import observed, owed, planning
 from .state import Conflict
 
-WALK = 100  # failure records a retry batch walks at most, for each key it may take
+WALK = 100  # stored outcomes a retry batch walks at most, for each key it may take
 
 
 @dataclass(frozen=True)
@@ -54,7 +54,7 @@ class Observing:
 
     def _held(self, asset: str, partition: str) -> list[LayerIndex]:
         """A per-key consumer's own indexes — its keyed outputs' and its
-        failure records' — what a held base decodes from."""
+        stored outcomes' — what a held base decodes from."""
 
         names = [o["name"] for o in self.manifest["assets"][asset]["outputs"] if o.get("key") is not None]
         return [
@@ -281,25 +281,25 @@ class Observing:
     async def _failed(
         self, task: dict, input: planning.Input, index: LayerIndex, now, b, full: bool, named: bool
     ):
-        """What a per-key batch needs of its failure records (§9), read here
+        """What a per-key batch needs of its stored outcomes (§9), read here
         so that its worker reads no index: the prior records of its keys —
         none in a full run's first batch, whose records start over — and,
-        when retries may be due, the retry batch the failed keys make due
+        when retries may be due, the retry batch the stored outcomes make due
         next (`_retry`), for `_each_plan` to choose between them."""
 
         state = self.m.index(f"@{task['asset']}", task["partition"])
-        failures = LayerIndex(self._key_io(), state, cache=self._key_cache())
-        record = self.m.partition(task["asset"], task["partition"]).get("failures") or {}
+        stored = LayerIndex(self._key_io(), state, cache=self._key_cache())
+        record = self.m.partition(task["asset"], task["partition"]).get("outcomes") or {}
         keys = [key_bytes(w.key) for w in b.keys]
         with self.m.reading(state.prefix, index.state.prefix):
-            found = await failures.lookup(keys) if keys and not full else {}
+            found = await stored.lookup(keys) if keys and not full else {}
             retry = None
             if not full and not named and self._has_retries(record):
-                retry = await self._retry(task, input, failures, index, now, record)
+                retry = await self._retry(task, input, stored, index, now, record)
         return {"priors": {key_str(k): bytes(p).hex() for k, (_, p) in found.items()}, "retry": retry}
 
-    async def _retry(self, task, input, failures: LayerIndex, index: LayerIndex, now, record: dict) -> dict:
-        """The next retry batch: the failed keys walked from the retry pass's
+    async def _retry(self, task, input, stored: LayerIndex, index: LayerIndex, now, record: dict) -> dict:
+        """The next retry batch: the stored outcomes walked from the retry pass's
         place, taking the ones that are due, `batch_size` at most and
         `WALK` records each at most (§9), each at its version at H — gone
         upstream, removed; left out by the patterns, unmatched. With their
@@ -314,14 +314,14 @@ class Observing:
         after = (retry or {}).get("after")
         cursor = key_bytes(after) if after is not None else None
         forced, clock = dict(record.get("forced") or {}), self.clock()
-        walked: dict[str, Record] = {}
+        walked: dict[str, StoredOutcome] = {}
         due: list[str] = []
         end = None
         while len(due) < limit and len(walked) < WALK * limit:
-            rows, nxt = await failures.delta(None, after=cursor, first=limit)
+            rows, nxt = await stored.delta(None, after=cursor, first=limit)
             for k, _, _, _, p in rows:
                 key = key_str(k)
-                walked[key] = Record.decode(bytes(p))
+                walked[key] = StoredOutcome.decode(bytes(p))
                 if eligible(walked[key], clock, self.m.deploy_number, forced):
                     due.append(key)
                 end = key

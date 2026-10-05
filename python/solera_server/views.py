@@ -1,23 +1,25 @@
 """The console's read models (§8, §10): per-asset rollups, a per-key asset's
-failed keys and `explain`, every partition of every input, and what holds
+stored outcomes and `explain`, every partition of every input, and what holds
 partitions back. Reads only: they record nothing, and never scan a run's tasks.
 A mixin of the engine, as `Attempts` and `Sensors` are."""
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 from collections import Counter
 
-from solera.failed_keys import GONE, NAMES, OK, Record, eligible
-from solera.keys.layers import LayerIndex, delta_names, key_bytes, key_str
+from solera.key_outcomes import GONE, NAMES, OK, StoredOutcome, eligible
+from solera.keys.layers import LayerIndex, delta_names, key_bytes
 from solera.patterns import Matcher
 
 from . import observed, owed, planning
 from .model import BAD_OUTCOME, REPAIR_RUNS
+from .outcomes import OUTCOMES, Derived, Sources
 
-SCAN = 100  # a failure listing reads at most this many entries per key it returns
-PAGE = 1000  # entries read from a failed keys at a time
+SCAN = 100  # an outcome listing reads at most this many entries per key it returns
+PAGE = 1000  # keys whose outcomes are derived at a time
 
 
 class Views:
@@ -117,7 +119,7 @@ class Views:
                 "partitioned": bool(planner.dims(name)),
                 "stale": counts["stale"] > 0,  # any of its partitions (K38, K46)
                 "last": None,
-                "failures": {} if self._each_input(name) else None,
+                "stored_counts": {} if self._each_input(name) else None,
                 "repairs": 0,
                 "repairs_stuck": 0,  # the repair clock gave up: waiting for a run of a user's or a trigger's
                 "updated_at": None,
@@ -138,110 +140,96 @@ class Views:
                     "attempt": view["last_attempt"],
                 }
         for (asset, _), state in self.m.partitions.items():
-            if (failures := (out.get(asset) or {}).get("failures")) is not None:
-                for name, n in ((state.get("failures") or {}).get("counts") or {}).items():
-                    failures[name] = failures.get(name, 0) + n
+            if (counts := (out.get(asset) or {}).get("stored_counts")) is not None:
+                for name, n in ((state.get("outcomes") or {}).get("counts") or {}).items():
+                    counts[name] = counts.get(name, 0) + n
         for output, partition in self.m.repairs:
             if (entry := out.get(owner.get(output))) is not None:
                 entry["repairs"] += 1
                 entry["repairs_stuck"] += self.m.repair_runs(output, partition)[0] >= REPAIR_RUNS
         return out
 
-    # -- failing keys (docs/per-key-processing.md §9) -------------------------------------
+    # -- key outcomes (docs/per-key-processing.md §9) -------------------------------------
 
     def _each_input(self, asset: str) -> tuple[str, dict] | None:
         inputs = self.manifest["assets"][asset]["inputs"]
         return next(((p, e) for p, e in inputs.items() if e.get("each") is not None), None)
 
-    def _failure_view(self, asset: str, partition: str, key: str, record: Record, forced: dict) -> dict:
-        """A failing key's record, its times null where unset; `eligible`:
+    def _stored_view(self, record: StoredOutcome, forced: dict) -> dict:
+        """A stored outcome's tries and times, null where unset; `eligible`:
         whether a retry pass would take it now."""
 
         return {
-            "partition": partition,
-            "key": key,
-            "outcome": record.name,
             "tries": record.tries,
             "since": record.since,
             "last": record.last,
             "next_at": record.next_at or None,
             "until": record.until or None,
-            "generation": record.upstream,  # the upstream key's that failed
             "message": record.message,
             "eligible": eligible(record, self.clock(), self.m.deploy_number, forced),
         }
 
-    async def _failure_entries(self, asset: str, partitions: list[str], start: list | None):
-        """`(partition, key, record)` of an asset's failed keys in partition and key
-        order, from just past `start` (`[partition, key]`)."""
-
-        for partition in partitions:
-            if start is not None and partition < start[0]:
-                continue
-            state = self.m.indexes.get((f"@{asset}", partition))
-            if state is None:
-                continue
-            cursor = key_bytes(start[1]) if start is not None and partition == start[0] else None
-            with self.m.reading(state.prefix):  # its files outlive merges until the walk ends (aclose)
-                index = LayerIndex(self._key_io(), state, cache=self._key_cache())
-                while True:
-                    rows, cursor = await index.delta(None, after=cursor, first=PAGE)
-                    for r in rows:
-                        yield partition, key_str(r[0]), Record.decode(r[4])
-                    if cursor is None:
-                        break
-
-    async def key_failures(
+    async def latest_outcomes(
         self,
         asset: str,
         partition: str | None = None,
         *,
+        key: str | None = None,
         outcomes=(),
         after: str | None = None,
         limit: int = 100,
     ) -> dict:
-        """A per-key asset's failed keys (§9): the record of every partition
-        with one, or of `partition`, and a page of its failing keys in partition and
-        key order, of the classes in `outcomes` if any. `after` is the
-        previous page's `next`: `[partition, key]` as JSON. A page reads at most
-        `SCAN` entries per key it may return, so a rare class can come back
-        as a short page with a `next`."""
+        """A per-key asset's key outcomes (§9): each key's latest outcome in
+        each partition, or in `partition`, as `_derive` rows. `key`: that
+        key's rows alone, one per partition, its outcome null if never
+        processed. Else a page in partition and key order, of the outcomes in
+        `outcomes` if any; `after` is the previous page's `next`,
+        `[partition, key]` as JSON. Filtered to stored outcomes alone, a page
+        reads only the stored entries; any other walks every key upstream
+        holds or removed since its index's cut too. A page reads at most
+        `SCAN` keys per key it may return, so a rare outcome can come back as
+        a short page with a `next`.
+
+        `partitions` is the retry state of every partition that stores
+        outcomes; its `stored_counts` count stored outcomes alone — never
+        ok, removed or unmatched."""
 
         if self._each_input(asset) is None:
-            raise ValueError(f"{asset} has no per-key input: it keeps no failing keys")
-        unknown = set(outcomes) - set(NAMES.values())
+            raise ValueError(f"{asset} has no per-key input: it has no key outcomes")
+        unknown = set(outcomes) - set(OUTCOMES)
         if unknown:
-            raise ValueError(f"unknown key classes: {sorted(unknown)}")
+            raise ValueError(f"unknown key outcomes: {sorted(unknown)}")
         records = {
-            s: r["failures"]
+            s: r["outcomes"]
             for s, r in self.m.partitions.of(asset).items()
-            if "failures" in r and partition in (None, s)
+            if "outcomes" in r and partition in (None, s)
         }
-        start = json.loads(after) if after else None
-        if start is not None and not (isinstance(start, list) and [type(s) for s in start] == [str, str]):
-            raise ValueError("after= takes a page's `next`")
-        keys, nxt, read, last = [], None, 0, None
-        entries = self._failure_entries(asset, sorted(records), start)
-        try:
-            async for s, key, record in entries:
-                if read == SCAN * limit:  # read enough: the next page resumes after the last entry read
-                    nxt = last
-                    break
-                read, last = read + 1, [s, key]
-                if outcomes and record.name not in outcomes:
-                    continue
-                if len(keys) == limit:  # another one: the page is full
-                    nxt = [keys[-1]["partition"], keys[-1]["key"]]
-                    break
-                keys.append(self._failure_view(asset, s, key, record, records[s].get("forced") or {}))
-        finally:
-            await entries.aclose()
+        stored_only = bool(outcomes) and set(outcomes) <= set(NAMES.values())
+        if partition is not None:
+            partitions = [partition]
+        elif stored_only:
+            partitions = sorted(records)
+        else:
+            current = self.planner().partitions(asset, "all")
+            partitions = sorted({*current, *self.m.partitions.of(asset)})
+        keys, nxt = [], None
+        if key is not None:
+            for s in partitions:
+                with self._outcome_sources(asset, s) as src:
+                    keys += [self._outcome_row(s, d, records.get(s)) for d in await src.derive([key])]
+        else:
+            start = json.loads(after) if after else None
+            if start is not None and not (isinstance(start, list) and [type(s) for s in start] == [str, str]):
+                raise ValueError("after= takes a page's `next`")
+            keys, nxt = await self._outcomes_page(
+                asset, partitions, records, start, set(outcomes), stored_only, limit
+            )
         return {
             "asset": asset,
             "partitions": [
                 {
                     "partition": s,
-                    "counts": r.get("counts") or {},
+                    "stored_counts": r.get("counts") or {},
                     "due": r.get("due"),
                     "deploy_min": r.get("deploy_min"),
                     "passes": r.get("passes") or 0,
@@ -257,6 +245,80 @@ class Views:
             "keys": keys,
             "next": json.dumps(nxt) if nxt else None,
         }
+
+    async def _outcomes_page(
+        self, asset, partitions, records, start, outcomes: set, stored_only: bool, limit: int
+    ):
+        """A page of `latest_outcomes`, and its `next` (None: the last page)."""
+
+        rows, read, last = [], 0, None
+        for s in partitions:
+            if start is not None and s < start[0]:
+                continue
+            after = start[1] if start is not None and s == start[0] else None
+            with self._outcome_sources(asset, s) as src:
+                stream = src.stored_keys(after) if stored_only else src.keys(after)
+                try:
+                    while chunk := [k async for k in _take(stream, PAGE)]:
+                        for d in await src.derive(chunk):
+                            row = self._outcome_row(s, d, records.get(s))
+                            if (
+                                read == SCAN * limit
+                            ):  # read enough: the next page resumes after the last key read
+                                return rows, last
+                            read, last = read + 1, [s, row["key"]]
+                            if outcomes and row["outcome"] not in outcomes:
+                                continue
+                            if len(rows) == limit:  # another one: the page is full
+                                return rows, [rows[-1]["partition"], rows[-1]["key"]]
+                            rows.append(row)
+                finally:
+                    await stream.aclose()
+        return rows, None
+
+    @contextlib.contextmanager
+    def _outcome_sources(self, asset: str, partition: str):
+        """What `partition`'s key outcomes are read from (`Sources`),
+        its index files kept for as long as the block reads them."""
+
+        param = self._each_input(asset)[0]
+        state = self.m.indexes.get((f"@{asset}", partition))
+        stored = LayerIndex(self._key_io(), state, cache=self._key_cache()) if state is not None else None
+        rec = (self.m.partition(asset, partition).get("observed") or {}).get(param)
+        upstream = now = None
+        held = []
+        planner = self.planner()
+        try:
+            inputs = planner.inputs(asset, partition)
+            input = next(i for i in inputs if i.param == param)
+        except (planning.UpstreamOnly, KeyError, ValueError, StopIteration):
+            input = None  # not a partition now: what it stored is all it has
+        if input is not None:
+            upstream, life = self._upstream(input.output, input.partition)
+            now = owed.Now(
+                upstream.state.head, input.spec.get("patterns"), self._context(planner, inputs), life
+            )
+            held = self._held(asset, partition)
+            if rec is not None and observed.lives(rec) != {life}:
+                rec = None
+        indexes = [x for x in (upstream, stored, *held) if x is not None]
+        with self.m.reading(*(x.state.prefix for x in indexes)):
+            yield Sources(upstream, rec, now, held, stored)
+
+    def _outcome_row(self, partition: str, d: Derived, record: dict | None) -> dict:
+        """A key's outcome as served: a stored one with its tries and times,
+        null where unset, and `eligible`, whether a retry pass would take it now."""
+
+        row = {
+            "partition": partition,
+            "key": d.key,
+            "outcome": d.outcome,
+            "version": d.version,
+            "owed": d.owed,
+        }
+        if d.stored is not None:
+            row |= self._stored_view(d.stored, (record or {}).get("forced") or {})
+        return row
 
     # -- inputs (§6; per-key-processing.md §11) -----------------------------------------------
 
@@ -378,7 +440,7 @@ class Views:
 
         - `not_matched`: no `include` pattern of the input matches it;
         - `excluded`: an `exclude` pattern does (`patterns.excluded_by`);
-        - `failing`: the asset's failed keys holds it (`failure`);
+        - `failing`: the asset's stored outcomes holds it (`failure`);
         - `removed`: the upstream no longer holds it, and it was processed
           once or an output still does (its removal may be undelivered);
         - `absent`: the upstream does not hold it, and nothing shows it did;
@@ -439,16 +501,21 @@ class Views:
         matcher = Matcher(served)
         included, excluded_by = matcher.included(key), matcher.excluded_by(key)
         generation = upstream[0] if upstream is not None else None
-        failure = None
+        outcome = None
         if failing is not None:
-            forced = (self.m.partition(asset, partition).get("failures") or {}).get("forced") or {}
-            failure = self._failure_view(asset, partition, key, Record.decode(failing[1]), forced)
+            forced = (self.m.partition(asset, partition).get("outcomes") or {}).get("forced") or {}
+            record = StoredOutcome.decode(failing[1])
+            outcome = {
+                "outcome": record.name,
+                "version": record.upstream,
+                **self._stored_view(record, forced),
+            }
         present = {name: v is not None for name, v in zip(outputs, held, strict=True)}
         if not included:
             verdict = "not_matched"
         elif excluded_by is not None:
             verdict = "excluded"
-        elif failure is not None:
+        elif outcome is not None:
             verdict = "failing"
         elif upstream is None:
             verdict = "removed" if last is not None or any(present.values()) else "absent"
@@ -477,7 +544,7 @@ class Views:
                 "excluded_by": excluded_by,
                 "pending": None,
             },
-            "failure": failure,
+            "outcome": outcome,
             "last": last,
             "last_ok": last_ok,
             "verdict": verdict,
@@ -535,3 +602,13 @@ class Views:
         stuck |= {k for k, queue in self.m.cleaning.items() if any(d.get("stuck") for d in queue)}
         partitions = [self.partition_cleanups(output, partition) for output, partition in sorted(stuck)]
         return partitions + self.retired_cleanups()
+
+
+async def _take(stream, n: int):
+    """The next `n` items of `stream`, leaving it open for more."""
+
+    for _ in range(n):
+        x = await anext(stream, None)
+        if x is None:
+            return
+        yield x

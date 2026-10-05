@@ -5,7 +5,14 @@ import { ChevronDown, RotateCcw, Search } from "lucide-react";
 import { q, useManifest, useProject } from "@/api/queries";
 import { keyEntry } from "@/api/read";
 import { useRetryKeys } from "@/api/mutations";
-import type { AssetDecl, Explain, FailureClass, FailureKey, FailedKeys, KeyOutcome } from "@/api/types";
+import type {
+  AssetDecl,
+  Explain,
+  KeyOutcome,
+  LatestOutcomes,
+  StoredOutcomeKind,
+  StoredRow,
+} from "@/api/types";
 import { PatternList } from "@/features/patterns";
 import { StaleKeysCard } from "@/features/stale";
 import { join, list } from "@/router";
@@ -22,7 +29,7 @@ import { StatusBadge, StatusIcon } from "@/ui/status";
 import { Table, TableScroll, Td, Th, Tr } from "@/ui/table";
 
 const route = getRouteApi("/assets/$asset/keys");
-const CLASSES: FailureClass[] = ["failed", "rejected", "retrying", "timed_out", "canceled"];
+const CLASSES: StoredOutcomeKind[] = ["failed", "rejected", "retrying", "timed_out", "canceled"];
 
 const isEach = (asset: AssetDecl) => Object.values(asset.inputs).some((e) => e.each);
 const keyedEdge = (asset: AssetDecl) => Object.values(asset.inputs).some((e) => e.kind === "incremental");
@@ -46,7 +53,7 @@ export function AssetKeys() {
   );
 }
 
-// -- failed keys ---------------------------------------------------------------------
+// -- failing keys --------------------------------------------------------------------
 
 function FailingKeys({ name }: { name: string }) {
   const { partition, outcome } = route.useSearch();
@@ -54,20 +61,21 @@ function FailingKeys({ name }: { name: string }) {
   const project = useProject();
   const now = useNow();
   const classes = list(outcome);
-  const failures = useInfiniteQuery({
-    ...q.failures(project, name, { partition, outcome: classes }),
+  // Stored outcomes alone: what did not succeed, read from the outcome index only.
+  const failing = useInfiniteQuery({
+    ...q.outcomes(project, name, { partition, outcome: classes.length ? classes : CLASSES }),
     placeholderData: keepPreviousData,
   });
   const retry = useRetryKeys(name);
-  const first = failures.data?.pages[0];
-  const keys = failures.data?.pages.flatMap((p) => p.keys) ?? [];
+  const first = failing.data?.pages[0];
+  const keys = (failing.data?.pages.flatMap((p) => p.keys) ?? []) as StoredRow[];
   const totals = totalsOf(first);
   const due = first?.partitions.filter((s) => s.has_retries).length ?? 0;
 
   return (
     <Card>
       <CardHeader
-        title="Failed keys"
+        title="Failing keys"
         description={
           <>
             Keys whose last call didn't succeed, each with its retry record. A failed key keeps its previous
@@ -132,11 +140,11 @@ function FailingKeys({ name }: { name: string }) {
           </span>
         )}
       </div>
-      {failures.isError ? (
+      {failing.isError ? (
         <div className="px-4 pb-4">
-          <ErrorNote error={failures.error} />
+          <ErrorNote error={failing.error} />
         </div>
-      ) : !failures.data ? (
+      ) : !failing.data ? (
         <Skeleton className="mx-4 mb-4 h-24" />
       ) : keys.length === 0 ? (
         <Empty compact title="Every key processed">
@@ -196,9 +204,9 @@ function FailingKeys({ name }: { name: string }) {
           </Table>
         </TableScroll>
       )}
-      {failures.hasNextPage && (
+      {failing.hasNextPage && (
         <div className="flex justify-end border-t border-line px-4 py-2.5">
-          <Button size="sm" onClick={() => failures.fetchNextPage()} disabled={failures.isFetchingNextPage}>
+          <Button size="sm" onClick={() => failing.fetchNextPage()} disabled={failing.isFetchingNextPage}>
             Load more
           </Button>
         </div>
@@ -207,17 +215,17 @@ function FailingKeys({ name }: { name: string }) {
   );
 }
 
-function totalsOf(page: FailedKeys | undefined): Partial<Record<FailureClass, number>> {
-  const totals: Partial<Record<FailureClass, number>> = {};
+function totalsOf(page: LatestOutcomes | undefined): Partial<Record<StoredOutcomeKind, number>> {
+  const totals: Partial<Record<StoredOutcomeKind, number>> = {};
   for (const s of page?.partitions ?? []) {
-    for (const [c, n] of Object.entries(s.counts) as [FailureClass, number][])
+    for (const [c, n] of Object.entries(s.stored_counts) as [StoredOutcomeKind, number][])
       totals[c] = (totals[c] ?? 0) + n;
   }
   return totals;
 }
 
 /** When a key runs again, in its class's terms (per-key-processing.md §8). */
-function nextTry(k: FailureKey, now: number): ReactNode {
+function nextTry(k: StoredRow, now: number): ReactNode {
   if (k.eligible) return <span className="text-wait-fg">due now</span>;
   if (k.next_at) return until(k.next_at, now);
   switch (k.outcome) {
@@ -331,7 +339,7 @@ function Answer({ explain: e }: { explain: Explain }) {
     ),
     failing: (
       <>
-        {label(e.failure?.outcome)} at <Generation value={e.failure?.generation} />: {e.failure?.message}
+        {label(e.outcome?.outcome)} at <Generation value={e.outcome?.version} />: {e.outcome?.message}
       </>
     ),
     excluded: (
@@ -357,7 +365,7 @@ function Answer({ explain: e }: { explain: Explain }) {
       </>
     ),
   };
-  const t = e.verdict === "failing" && e.failure ? tone(e.failure.outcome) : tone(e.verdict);
+  const t = e.verdict === "failing" && e.outcome ? tone(e.outcome.outcome) : tone(e.verdict);
   return (
     <div className="mx-4 mb-4 flex flex-col gap-3 rounded-md border-theme border-line p-4">
       <p className={cn("flex items-start gap-2 text-sm font-medium", toneText[t])}>
@@ -394,19 +402,19 @@ function Answer({ explain: e }: { explain: Explain }) {
             )}
           </li>
         ))}
-        {e.failure && (
+        {e.outcome && (
           <li>
-            {plural(e.failure.tries, "try", "tries")} since <Time at={e.failure.since} />
-            {e.failure.next_at ? (
+            {plural(e.outcome.tries, "try", "tries")} since <Time at={e.outcome.since} />
+            {e.outcome.next_at ? (
               <>
                 {" "}
-                · next at <Time at={e.failure.next_at} />
+                · next at <Time at={e.outcome.next_at} />
               </>
             ) : null}
-            {e.failure.until ? (
+            {e.outcome.until ? (
               <>
                 {" "}
-                · gives up <Time at={e.failure.until} />
+                · gives up <Time at={e.outcome.until} />
               </>
             ) : null}
           </li>

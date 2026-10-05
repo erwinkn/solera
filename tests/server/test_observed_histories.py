@@ -143,7 +143,7 @@ async def test_a19_r8_a_failed_key_is_observed_and_retried_by_its_failure_record
         await w.run("checks")
         await w.verify()
         w.outside.flaky.clear()
-        await w.run("checks")  # its failure record retries it
+        await w.run("checks")  # its stored outcome retries it
         await w.verify()
     finally:
         await w.close()

@@ -108,7 +108,7 @@ export function assetTone(status: AssetStatus | undefined): Tone {
   const tones: Tone[] = [];
   const p = status.partitions;
   if (p.failed) tones.push("fail");
-  if (Object.entries(status.failures ?? {}).some(([k, n]) => k !== "canceled" && (n ?? 0) > 0))
+  if (Object.entries(status.stored_counts ?? {}).some(([k, n]) => k !== "canceled" && (n ?? 0) > 0))
     tones.push("warn");
   if (p.stale) tones.push("warn");
   if (p.running) tones.push("run");
@@ -252,7 +252,7 @@ export function AssetGraph({
 function Node({ node, status }: { node: GraphNode; status: AssetStatus | undefined }) {
   const tone = node.kind === "source" ? "idle" : assetTone(status);
   const p = status?.partitions;
-  const failing = Object.entries(status?.failures ?? {}).reduce(
+  const failing = Object.entries(status?.stored_counts ?? {}).reduce(
     (s, [k, n]) => s + (k === "canceled" ? 0 : (n ?? 0)),
     0,
   );

@@ -1,5 +1,5 @@
 """The console's read models over the API (§8, §10): asset rollups, a per-key
-asset's failing keys, key outcomes, explain, inputs with their positions,
+asset's key outcomes and their log, explain, inputs with their positions,
 holds, and when schedules next fire."""
 
 import json
@@ -123,10 +123,10 @@ async def test_assets_status_rolls_up_every_asset(world):
         "running": 0,
         "removed": 0,
     }
-    assert parse["partitioned"] is False and parse["failures"] == {"rejected": 1, "failed": 1}
+    assert parse["partitioned"] is False and parse["stored_counts"] == {"rejected": 1, "failed": 1}
     assert parse["last"]["outcome"] == "succeeded" and parse["last"]["attempt"].count("/") == 1
     assert parse["repairs"] == 0 and parse["updated_at"]
-    assert status["files"]["failures"] is None  # no per-key input
+    assert status["files"]["stored_counts"] is None  # no per-key input
     consume = status["consume"]
     assert consume["partitioned"] and consume["partitions"]["total"] == 2
     assert (consume["partitions"]["materialized"], consume["partitions"]["missing"]) == (1, 1)
@@ -139,14 +139,15 @@ async def test_assets_status_rolls_up_every_asset(world):
     assert {p["partition"]: p["status"] for p in parts} == {"x": "materialized", "y": "missing"}
 
 
-async def test_failures_list_page_and_filter(world, monkeypatch):
+async def test_stored_outcomes_list_page_and_filter(world, monkeypatch):
     engine, client, base, *_ = world
     await run(engine, ["parse"], upstream=True)
 
-    found = (await client.get(f"{base}/assets/parse/failed-keys")).json()
+    stored = [("outcome", o) for o in ("rejected", "failed", "retrying", "canceled", "timed_out")]
+    found = (await client.get(f"{base}/assets/parse/outcomes", params=stored)).json()
     assert [s["partition"] for s in found["partitions"]] == [""]
     [partition] = found["partitions"]
-    assert partition["counts"] == {"rejected": 1, "failed": 1} and partition["last"] == "changes"
+    assert partition["stored_counts"] == {"rejected": 1, "failed": 1} and partition["last"] == "changes"
     assert found["deploy"] == engine.m.deploy_number and found["next"] is None
     by_key = {k["key"]: k for k in found["keys"]}
     assert set(by_key) == {"bad.csv", "bug.csv"}
@@ -154,38 +155,47 @@ async def test_failures_list_page_and_filter(world, monkeypatch):
     assert (bad["outcome"], bad["tries"], bad["message"]) == ("rejected", 1, "Unprocessable: empty file")
     assert bad["next_at"] is None and bad["until"] is None and bad["eligible"] is False
     # The upstream key's generation: as key_outcomes shows it.
-    rows = (await client.get(f"{base}/assets/parse/key-outcomes", params={"key": "bad.csv"})).json()
-    assert bad["generation"] == rows["outcomes"][0]["generation"]
+    rows = (await client.get(f"{base}/assets/parse/outcomes/history", params={"key": "bad.csv"})).json()
+    assert bad["version"] == rows["outcomes"][0]["generation"]
     assert by_key["bug.csv"]["message"] == "ValueError: unexpected header"
 
-    first = (await client.get(f"{base}/assets/parse/failed-keys", params={"limit": 1})).json()
+    first = (await client.get(f"{base}/assets/parse/outcomes", params=[*stored, ("limit", 1)])).json()
     assert [k["key"] for k in first["keys"]] == ["bad.csv"] and json.loads(first["next"]) == ["", "bad.csv"]
-    second = (
-        await client.get(f"{base}/assets/parse/failed-keys", params={"limit": 1, "after": first["next"]})
-    ).json()
+    params = [*stored, ("limit", 1), ("after", first["next"])]
+    second = (await client.get(f"{base}/assets/parse/outcomes", params=params)).json()
     assert [k["key"] for k in second["keys"]] == ["bug.csv"] and second["next"] is None
 
-    failed = (await client.get(f"{base}/assets/parse/failed-keys", params={"outcome": "failed"})).json()
+    # Every key, its outcome derived where none is stored; one key's alone.
+    every = (await client.get(f"{base}/assets/parse/outcomes")).json()
+    assert {k["key"]: (k["outcome"], k["owed"]) for k in every["keys"]} == {
+        "a.csv": ("ok", False),
+        "bad.csv": ("rejected", False),
+        "bug.csv": ("failed", False),
+        "draft-1.csv": ("unmatched", False),
+        "notes.txt": ("unmatched", False),
+    }
+    one = (await client.get(f"{base}/assets/parse/outcomes", params={"key": "a.csv"})).json()
+    assert [(k["key"], k["outcome"]) for k in one["keys"]] == [("a.csv", "ok")]
+
+    failed = (await client.get(f"{base}/assets/parse/outcomes", params={"outcome": "failed"})).json()
     assert [k["key"] for k in failed["keys"]] == ["bug.csv"] and len(failed["partitions"]) == 1
-    retrying = (await client.get(f"{base}/assets/parse/failed-keys", params={"outcome": "retrying"})).json()
-    assert retrying["keys"] == [] and retrying["partitions"][0]["counts"]["rejected"] == 1
+    retrying = (await client.get(f"{base}/assets/parse/outcomes", params={"outcome": "retrying"})).json()
+    assert retrying["keys"] == [] and retrying["partitions"][0]["stored_counts"]["rejected"] == 1
 
     # A page reads a bounded number of entries: a rare class comes back short, with a `next`.
     monkeypatch.setattr(views, "SCAN", 1)
     params = {"outcome": "failed", "limit": 1}
-    short = (await client.get(f"{base}/assets/parse/failed-keys", params=params)).json()
+    short = (await client.get(f"{base}/assets/parse/outcomes", params=params)).json()
     assert short["keys"] == [] and json.loads(short["next"]) == ["", "bad.csv"]
     rest = (
-        await client.get(f"{base}/assets/parse/failed-keys", params={**params, "after": short["next"]})
+        await client.get(f"{base}/assets/parse/outcomes", params={**params, "after": short["next"]})
     ).json()
     assert [k["key"] for k in rest["keys"]] == ["bug.csv"] and rest["next"] is None
     monkeypatch.undo()
 
-    assert (await client.get(f"{base}/assets/files/failed-keys")).status_code == 400  # no per-key input
-    assert (
-        await client.get(f"{base}/assets/parse/failed-keys", params={"outcome": "odd"})
-    ).status_code == 400
-    assert (await client.get(f"{base}/assets/ghost/failed-keys")).status_code == 404
+    assert (await client.get(f"{base}/assets/files/outcomes")).status_code == 400  # no per-key input
+    assert (await client.get(f"{base}/assets/parse/outcomes", params={"outcome": "odd"})).status_code == 400
+    assert (await client.get(f"{base}/assets/ghost/outcomes")).status_code == 404
 
 
 async def test_key_outcomes_page_newest_first(world):
@@ -194,7 +204,7 @@ async def test_key_outcomes_page_newest_first(world):
     content["a.csv"] = {"text": "5"}
     await run(engine, ["parse"], upstream=True)
 
-    every = (await client.get(f"{base}/assets/parse/key-outcomes")).json()
+    every = (await client.get(f"{base}/assets/parse/outcomes/history")).json()
     rows = every["outcomes"]
     assert every["asset"] == "parse" and every["next"] is None
     assert [r["at"] for r in rows] == sorted((r["at"] for r in rows), reverse=True)
@@ -204,26 +214,26 @@ async def test_key_outcomes_page_newest_first(world):
     paged, before = [], None
     while True:
         params = {"limit": 2, **({"before": before} if before else {})}
-        page = (await client.get(f"{base}/assets/parse/key-outcomes", params=params)).json()
+        page = (await client.get(f"{base}/assets/parse/outcomes/history", params=params)).json()
         paged += page["outcomes"]
         before = page["next"]
         if before is None:
             break
     assert paged == rows
 
-    exact = (await client.get(f"{base}/assets/parse/key-outcomes", params={"key": "a.csv"})).json()
+    exact = (await client.get(f"{base}/assets/parse/outcomes/history", params={"key": "a.csv"})).json()
     assert [r["outcome"] for r in exact["outcomes"]] == ["ok", "ok"]
     assert exact["outcomes"][0]["generation"] != exact["outcomes"][1]["generation"]
-    searched = (await client.get(f"{base}/assets/parse/key-outcomes", params={"q": "BAD"})).json()
+    searched = (await client.get(f"{base}/assets/parse/outcomes/history", params={"q": "BAD"})).json()
     assert {r["key"] for r in searched["outcomes"]} == {"bad.csv"}
     failing = (
         await client.get(
-            f"{base}/assets/parse/key-outcomes", params=[("outcome", "failed"), ("outcome", "ok")]
+            f"{base}/assets/parse/outcomes/history", params=[("outcome", "failed"), ("outcome", "ok")]
         )
     ).json()
     assert {r["outcome"] for r in failing["outcomes"]} == {"failed", "ok"}
     run_id = exact["outcomes"][-1]["run"]
-    one = (await client.get(f"{base}/assets/parse/key-outcomes", params={"run": run_id})).json()
+    one = (await client.get(f"{base}/assets/parse/outcomes/history", params={"run": run_id})).json()
     assert {r["run"] for r in one["outcomes"]} == {run_id}
 
 
@@ -249,10 +259,10 @@ async def test_explain_says_why_a_key_is_or_is_not_there(world):
     assert ok["last"]["outcome"] == "ok" and ok["last_ok"] == ok["last"]
     assert ok["last_ok"]["generation"] == ok["upstream_generation"]
     assert ok["patterns"]["included"] and ok["patterns"]["excluded_by"] is None
-    assert ok["patterns"]["pending"] is None and ok["failure"] is None
+    assert ok["patterns"]["pending"] is None and ok["outcome"] is None
 
     failing = await explain("bad.csv")
-    assert failing["verdict"] == "failing" and failing["failure"]["outcome"] == "rejected"
+    assert failing["verdict"] == "failing" and failing["outcome"]["outcome"] == "rejected"
     assert failing["last"]["outcome"] == "rejected" and failing["last_ok"] is None
     excluded = await explain("draft-1.csv")
     assert excluded["verdict"] == "excluded" and excluded["patterns"]["excluded_by"] == "drafts"

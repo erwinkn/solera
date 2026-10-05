@@ -193,7 +193,7 @@ class Model:
         # durable
         self.event_counter: int = snap.get("event_counter") or 0
         self.deploy = snap.get("deploy")
-        # how many deploys this namespace has served: what gives failed keys
+        # how many deploys this namespace has served: what gives stored outcomes
         # one try per deploy (per-key §13)
         self.deploy_number: int = snap.get("deploy_number") or 0
         self.manifest = snap.get("manifest")
@@ -214,7 +214,7 @@ class Model:
         # terminal outcome;
         # `observed` {input: what it observed — a keyed input's observation record, an
         # unkeyed one's last commit read}; the `definition` they were observed under;
-        # and a per-key asset's `failures` record
+        # and a per-key asset's `outcomes` record
         # (docs/per-key-processing.md §9), whose index lives in `indexes` under
         # ("@asset", partition). A rename moves it, retirement trims it: one record.
         self.partitions = Grouped(_flatten(snap.get("partitions"), 2))
@@ -799,7 +799,7 @@ class Model:
         producers = {outputs[name].get("asset") for name in reset if name in outputs} - {None}
 
         def gone(key) -> bool:
-            if key[0].startswith("@"):  # a per-key asset's failed keys
+            if key[0].startswith("@"):  # a per-key asset's stored outcomes
                 return key[0][1:] not in assets
             return key[0] in reset
 
@@ -827,13 +827,13 @@ class Model:
                 if "commit" in rec:
                     rec["reset"] = True
             if gone and key[0] not in producers:
-                self._drop_failures(*key)  # failed against keys that are no longer the input's (K47)
+                self._drop_outcomes(*key)  # failed against keys that are no longer the input's (K47)
         return producers
 
     def _apply_aliases(self, manifest) -> tuple[dict[str, list[str]], dict[str, str]]:
         """Move everything held under an asset's former names to its current
         one (§2): its partition records, pending automation entries, a per-key
-        asset's failed keys, and — for outputs named after the asset — heads,
+        asset's stored outcomes, and — for outputs named after the asset — heads,
         key indexes, repair intents and pending cleanups. A new name never
         releases a write domain. An index keeps its files where they are (its
         `prefix`). Returns `{asset: [aliases]}`, for the automations and tasks
@@ -868,7 +868,7 @@ class Model:
         move(self.indexes, output_map, 0)
         # A partition's record goes whole: a name that already has one keeps its own.
         move(self.partitions, asset_map, 0)
-        # A per-key asset's failed keys (`@asset`), whose files stay under their prefix.
+        # A per-key asset's stored outcomes (`@asset`), whose files stay under their prefix.
         move(self.indexes, {f"@{old}": f"@{new}" for old, new in asset_map.items()}, 0)
         move(self.repairs, output_map, 0, merge=list)
         move(self.cleanups, output_map, 0, merge=_renumbered)
@@ -1199,8 +1199,8 @@ class Model:
                 del records[input]
         for input, progress in (commit.get("progress") or {}).items():  # the run's walk (D155)
             task.setdefault("progress", {})[input] = progress
-        if "failures" in commit:
-            self._failures(asset, partition, commit["failures"])
+        if "outcomes" in commit:
+            self._stored(asset, partition, commit["outcomes"])
         for row in commit.get("key_outcomes") or ():
             self._record(
                 "key_outcomes",
@@ -1232,15 +1232,15 @@ class Model:
                 self._record("lineage", row)
         self._pend_onchange(asset, partition, changed)
 
-    def _failures(self, asset: str, partition: str, f: dict) -> None:
-        """A per-key batch's commit to its failure record: the failed keys's
+    def _stored(self, asset: str, partition: str, f: dict) -> None:
+        """A per-key batch's commit to its stored outcome: the stored outcomes'
         delta, and the counts, bounds and retry-pass state the engine worked
         out from it (docs/per-key-processing.md §9)."""
 
-        record = self._partition(asset, partition).setdefault("failures", {"commit_number": -1, "forced": {}})
-        if f.get("start_over"):  # a start-over's failed keys start over (K47): the batch's alone
-            self._drop_failures(asset, partition)
-            record = self._partition(asset, partition)["failures"] = {
+        record = self._partition(asset, partition).setdefault("outcomes", {"commit_number": -1, "forced": {}})
+        if f.get("start_over"):  # a start-over's stored outcomes start over (K47): the batch's alone
+            self._drop_outcomes(asset, partition)
+            record = self._partition(asset, partition)["outcomes"] = {
                 "commit_number": record["commit_number"],
                 "forced": record.get("forced") or {},
             }
@@ -1254,14 +1254,14 @@ class Model:
             if field in f:
                 record[field] = f[field]
 
-    def _drop_failures(self, asset: str, partition: str) -> None:
-        """A per-key partition's failed keys go: their index's files become
+    def _drop_outcomes(self, asset: str, partition: str) -> None:
+        """A per-key partition's stored outcomes go: their index's files become
         garbage, and the next write starts a new index (a new life)."""
 
         index = self.indexes.pop((f"@{asset}", partition), None)
         if index is not None:
             self.garbage.extend([index.path(name), self.event_counter] for name in sorted(index.referenced()))
-        self._partition(asset, partition).pop("failures", None)
+        self._partition(asset, partition).pop("outcomes", None)
 
     def _on_KeysRetryRequested(self, e):
         """`solera retry ASSET --failed …`: a forced request, identified by its
@@ -1269,9 +1269,9 @@ class Model:
         (docs/per-key-processing.md §9)."""
 
         for partition, record in self.partitions.of(e["asset"]).items():
-            if "failures" in record and e.get("partition") in (None, partition):
+            if "outcomes" in record and e.get("partition") in (None, partition):
                 for name in e["classes"]:
-                    record["failures"].setdefault("forced", {})[name] = self.event_counter
+                    record["outcomes"].setdefault("forced", {})[name] = self.event_counter
 
     def _pend_onchange(self, asset: str | None, partition: str, changed: list[str]) -> None:
         if not changed:

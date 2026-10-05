@@ -173,9 +173,9 @@ export function AssetLayout() {
         {tabs.keys && (
           <Tab to="/assets/$asset/keys" name={name}>
             Keys
-            {!!status?.failures && Object.values(status.failures).some(Boolean) && (
+            {!!status?.stored_counts && Object.values(status.stored_counts).some(Boolean) && (
               <Count tone="warn">
-                {Object.values(status.failures).reduce((a, n) => (a ?? 0) + (n ?? 0), 0)}
+                {Object.values(status.stored_counts).reduce((a, n) => (a ?? 0) + (n ?? 0), 0)}
               </Count>
             )}
           </Tab>

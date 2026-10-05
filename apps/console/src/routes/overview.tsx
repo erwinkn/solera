@@ -22,7 +22,7 @@ import { StatusIcon } from "@/ui/status";
 const FAILING = ["failed", "rejected", "retrying", "timed_out"] as const;
 
 export function failingKeys(status: AssetStatus | undefined): number {
-  return FAILING.reduce((sum, k) => sum + (status?.failures?.[k] ?? 0), 0);
+  return FAILING.reduce((sum, k) => sum + (status?.stored_counts?.[k] ?? 0), 0);
 }
 
 const route = getRouteApi("/");
@@ -110,7 +110,7 @@ export function Overview() {
         <Vital
           link={(c) => <Link to="/assets" className={c} />}
           icon={<KeyRound />}
-          label="Failed keys"
+          label="Failing keys"
           value={status ? keys : undefined}
           tone={keys ? "warn" : "ok"}
           detail={
@@ -329,7 +329,7 @@ function AttentionAssets({ status }: { status: Record<string, AssetStatus> | und
     <Card>
       <CardHeader
         title="Assets needing attention"
-        description="Failed, stale or missing partitions, failed keys, stuck repairs"
+        description="Failed, stale or missing partitions, failing keys, stuck repairs"
         actions={
           <Link to="/assets" className={moreClass}>
             <More />
@@ -340,7 +340,7 @@ function AttentionAssets({ status }: { status: Record<string, AssetStatus> | und
         <ListSkeleton />
       ) : rows.length === 0 ? (
         <Empty compact title={`All ${plural(total, "asset")} current`}>
-          No failed, stale or missing partitions, and no failed keys.
+          No failed, stale or missing partitions, and no failing keys.
         </Empty>
       ) : (
         <ul className="flex flex-col pb-2">

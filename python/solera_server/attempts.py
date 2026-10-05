@@ -649,7 +649,7 @@ class Attempts:
             )
             return
         status = result.get("status")
-        if status == "canceled" and "failures" in result:
+        if status == "canceled" and "outcomes" in result:
             # A drained Each batch (docs/lifecycle.md §7): what finished commits, as one
             # decision with its interrupted keys and what it observed.
             reason = (result.get("cancel") or {}).get("reason") or "user"
@@ -887,9 +887,9 @@ class Attempts:
             self._authority()
             with contextlib.suppress(Exception):
                 await self.state.delete_objects(await self.state.list_objects(prefix))
-        failures = prepared.get("failures")
-        if failures is not None:  # a per-key batch's failure delta (docs/per-key-processing.md §9)
-            prefix = f"{failures['prefix']}{int(failures['commit_number']):012d}-{attempt}"
+        outcomes = prepared.get("outcomes")
+        if outcomes is not None:  # a per-key batch's outcome delta (docs/per-key-processing.md §9)
+            prefix = f"{outcomes['prefix']}{int(outcomes['commit_number']):012d}-{attempt}"
             self._authority()
             with contextlib.suppress(Exception):
                 await self.state.delete_objects(await self.state.list_objects(prefix))

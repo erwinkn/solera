@@ -1,7 +1,7 @@
 # Per-key processing
 
 Status: **§5–§11 and §13 built** (error classes, build identity, per-key incremental,
-groups by key, the failed keys, retry passes, forced retries, the drain on
+groups by key, the stored outcomes, retry passes, forced retries, the drain on
 cancel, `key_outcomes`, key patterns and pattern changes); the engine's
 match-count hints (§11) and summary recomputation (§9) are deferred, and
 `solera explain` (§10) is an API, not a CLI; §12 follows `lifecycle.md`
@@ -57,7 +57,7 @@ and its version is the generation of the write that last wrote it
 (`versions.md`). Errors raised for one key are classified by the
 Solera exception the user's error subclasses — `Rejected`, `Failed`,
 `Transient`, `Abort` — and a key that did not succeed lands in the input's
-**failed keys**, a key index of its own, so it is visible, retried on a
+**stored outcomes**, a key index of its own, so it is visible, retried on a
 bounded schedule, and never blocks the keys behind it. `include` and
 `exclude` patterns on an input select keys by name; the worker evaluates
 them on every batch it reads. A `Source` subclass with `observe()` is
@@ -68,7 +68,7 @@ keys, generations and sources' versions only.
 
 | Piece | Lives in | Knows |
 |---|---|---|
-| Key indexes, positions, the failed keys, key patterns | engine | key strings, generations, payloads (opaque bytes), outcome classes |
+| Key indexes, positions, the stored outcomes, key patterns | engine | key strings, generations, payloads (opaque bytes), outcome classes |
 | The per-key loop, error classification | worker | a batch of keys; each key's value is opaque |
 | Splitting a batch into per-key values; reading a write's keys; stamping the key column; replacing a key's rows | store | its own types |
 | SharePoint, samples, what counts as unprocessable | user code | everything else |
@@ -195,7 +195,7 @@ Incremental(output=None, *, include=None, exclude=None, batch_size=10_000, concu
 - **One per-key incremental per asset**, and no cursor (`Result(cursor=)` is rejected):
   the input is the asset's iteration.
 - **To the engine, per-key incremental is an `Incremental` input** (`"each": {…}` in the
-  manifest) with a failed keys (§9). The engine still knows three input
+  manifest) with an outcome index (§9). The engine still knows three input
   kinds; the per-key call is the worker's.
 
 One attempt, four changed files and one deleted:
@@ -208,7 +208,7 @@ batch: a b c d (changed), e (deleted)
   d → TimeoutError                       failed (unclassified)
   e                                      removed
 store.store(Patch({a: …, b: …}, remove=[e]))      one write per output
-commit: delta files · position → commit 42 · failed keys: +c, +d
+commit: delta files · position → commit 42 · stored outcomes: +c, +d
 ```
 
 **Cancel and timeout keep finished keys.** They follow the attempt's
@@ -220,9 +220,9 @@ two-phase cancel (`lifecycle.md` §7); for a per-key batch the phases are:
    `cancel_grace` (the engine's, 60 s by default), it **drains**: it writes
    the keys that finished — one store write per output, as for a whole
    batch — records the keys it did not finish as **interrupted** in the
-   failure delta by the record's `reason` (table below), and publishes
+   outcome delta by the record's `reason` (table below), and publishes
    all of it as one result with `status: canceled`, carrying the record
-   as §2.2 says. The engine commits outputs, failure delta and position
+   as §2.2 says. The engine commits outputs, outcome delta and position
    as one journal decision.
 2. **Forced abort,** after `cancel_grace` without a result: the record's
    phase becomes `forced` and the attempt ends as `lifecycle.md` §7
@@ -236,12 +236,12 @@ Finished keys need not be a key-order prefix of the batch — its
 while `b` is still reading. So the
 position does not stop at the first unfinished key: it moves past the
 whole batch, exactly as on success, and the holes are carried by the
-failed keys instead.
+stored outcomes instead.
 
 ```
 batch: a b c d e(deleted)   cancel requested while b, d are in flight
 store.store(Patch({a: …, c: …}, remove=[e]))
-result status: canceled → one commit: position past e · failed keys +b, +d interrupted
+result status: canceled → one commit: position past e · stored outcomes +b, +d interrupted
 ```
 
 What happens to the holes depends on the record's `reason`:
@@ -454,16 +454,45 @@ data, and the stale mark makes it visible.
 not to a run: once a later run fixes `c`, the earlier run should not stay
 red.
 
-## 9. The failed keys
+## 9. Key outcomes
+
+Every key of a per-key asset's partition has a **latest outcome**: what
+its newest call came to, or what the input's observation record says of
+it (`observed-set.md`). Only outcomes other than `ok` are stored; the rest
+are derived, so that 1M keys processed ok cost nothing to remember:
+
+| Outcome | From |
+|---|---|
+| `rejected`, `failed`, `retrying`, `canceled`, `timed_out` | stored: the key's entry in the outcome index (below) |
+| `ok` | the record holds the key: processed, at the version it holds (null where upstream has replaced that version since: the index keeps no older versions) |
+| `unmatched` | upstream holds the key, and the input's patterns leave it out |
+| `removed` | upstream had the key at its index's cut (its first commit where nothing is cut), lacks it now, and the record no longer holds it |
+| none (null) | never processed — or removed before the cut, or added and removed again since |
+
+Each key also says whether the input owes it (`owed`): `a.csv`, processed
+ok at v5 with upstream now at v6, is `ok`, owed. The cut follows the
+oldest reader; T39 keeps it back to the oldest retained run (D180), and
+with it each removal and each processed version for as long as its run.
+
+`GET /assets/{name}/outcomes` serves them (`Engine.latest_outcomes`):
+`?key=` one key's, a row per partition; else a page in partition and key
+order, `?outcome=` keeping those (repeatable), `after=` the previous
+page's `next`. Filtered to stored outcomes alone, a page reads only the
+outcome index; any other walks every key upstream holds or removed since
+its cut. A row is `{partition, key, outcome, version, owed}`, a stored one
+with its `tries`, `since`, `last`, `next_at`, `until`, `message` and
+`eligible`. Each partition's retry state comes with it, its
+`stored_counts` counting stored outcomes alone — never ok, removed or
+unmatched. `GET /assets/{name}/outcomes/history` is the log (§10).
 
 A key that did not succeed must be remembered until it does, and a
 systemic failure — a bug that throws on every file of a 1M-key full
 pass — must not put 1M entries into engine state or the checkpoint.
-So the failing set is not a map in state: it is a **key index** per
-per-key asset and partition, in the format and machinery of every other index
+So the stored outcomes are not a map in state: they are a key index, the
+**outcome index**, per per-key asset and partition, in the format and machinery of every other index
 (`object-store-state.md` §6), under `keys/@{asset}/{partition}/`.
 
-**This section is authoritative** for the failure record, the transition
+**This section is authoritative** for the stored outcome, the transition
 table, the eligibility predicate, the retry-pass state and forced-request
 identity. `resolved-commits.md` and `lifecycle.md` refer here, and the
 SDK holds one implementation that the engine and the worker call — the
@@ -495,7 +524,7 @@ gets a tombstone. The message lives with the entry, so retention of the
 history (§10) never orphans a failing key's explanation; a systemic
 failure repeats one message, which block compression absorbs.
 
-The failed keys are of one pass's input (K47, `Positions.tla`). A
+The stored outcomes are of one pass's input (K47, `Positions.tla`). A
 **start-over** — a full pass's first batch, after an asset change, a
 reset, a full run — starts them over: the batch reads no prior record,
 and its commit replaces the index (a new life; the old files go to
@@ -508,9 +537,9 @@ version is failing, not stale.
 
 **Who writes it: the worker, resolved locally.** Failure deltas never go
 to the HTTP resolver. A batch touches at most `batch_size` keys of the
-failed keys, and the worker needs their *prior records*, not just
+stored outcomes, and the worker needs their *prior records*, not just
 whether they changed: tries, `since` and `until` carry over. So it does
-exact point lookups of the touched keys in the pinned failed keys (a
+exact point lookups of the touched keys in the pinned stored outcomes (a
 small index is read whole; a large one costs at most a block per touched
 key, answered at `start` when the engine holds the index warm), applies
 the transitions below, and uploads the delta next to its output deltas.
@@ -538,7 +567,7 @@ a key is retried, never whether it is.
 retrying adds and removes no key, so the index's own key count says
 nothing about outcomes. The worker's result carries, per outcome, the
 change its transitions made (`{failed: −1, retrying: +1}`); the engine
-applies them in the same commit as the output deltas, the failure delta
+applies them in the same commit as the output deltas, the outcome delta
 and the position, so a batch's outputs, position and failures land
 together, and the counts are exact because every prior was read exactly.
 Scheduling never depends on the index's approximate cardinality.
@@ -610,7 +639,7 @@ on its next run.
 
 **Every eligible key is retried**; the only question is pacing. Retries
 form **batches of their own**, up to `batch_size` keys, in a **retry pass**:
-a walk over the failed keys in key order, with its place in the
+a walk over the stored outcomes in key order, with its place in the
 position:
 
 ```
@@ -626,7 +655,7 @@ retry: {pass: 7, deploy: 12, forced_at: 4031, after: "ICP/Results/run-17.csv",
 
 - **Each retry batch** walks the index from `after` until it has
   `batch_size` eligible keys or reaches the end. Its commit — atomic with
-  the outputs, failure delta and position — advances `after` and folds
+  the outputs, outcome delta and position — advances `after` and folds
   into the accumulators every record in the walked range *as it is after
   the batch's transitions*, eligible or not. The worker computes that from
   what it read, whether the store or the engine's start reply answered.
@@ -642,14 +671,14 @@ retry: {pass: 7, deploy: 12, forced_at: 4031, after: "ICP/Results/run-17.csv",
   and `deploy_min` become `due_acc` and `deploy_acc`, folded with that
   batch's own records, in the same commit. If anything is still eligible —
   it became due behind the walk — the next pass starts.
-- `.spec` pins the failed keys, and the worker reads it a batch at a time, with
+- `.spec` pins the stored outcomes, and the worker reads it a batch at a time, with
   the same predicate; when the engine holds the index warm, that walk is
   answered with its `start` reply (`resolved-commits.md` §7).
 
 When both retries and new changes are pending, the partition **alternates**: a
 retry batch, then a change batch — the position records which kind went
 last. Neither starves and there is no fraction to tune: a retry storm of
-1M failed keys after a deploy halves the pace of new files instead of
+1M keys failing after a deploy halves the pace of new files instead of
 stopping them. When only one kind is pending, every batch is that kind.
 
 A retry-eligible key whose upstream has changed since it failed is skipped
@@ -681,7 +710,7 @@ processed:
 
 The rows travel in the attempt's result (at most `batch_size` of them) and
 the engine appends them at settlement. They are filed by `run`, so
-retention drops them with their run; the failed keys are state and never
+retention drops them with their run; the stored outcomes are state and never
 expires. The table counts no rows: how many rows a key produced is the
 store's knowledge.
 
@@ -689,7 +718,7 @@ Live, over the HTTP channel: a started/finished event per key, so the
 console shows a batch's progress, and `ctx.log` inside the call tags each
 line with the key. The final log keeps the tags.
 
-The asset's **Keys** view lists the failed keys (rejected, failed,
+The asset's **Keys** view lists the stored outcomes (rejected, failed,
 retrying, with messages and due times) and searches `key_outcomes`.
 `solera explain icp "ICP/Results/run-17.csv"` answers the most common
 question — why is my file not in the table:
@@ -919,9 +948,9 @@ where `build` identifies the code exactly:
 
 A git commit with a dirty flag is not an identity: edit a helper without
 committing, deploy, fix it again, deploy — both builds are "abc123,
-dirty", and the failed keys never get their retry under the fix. The
+dirty", and the stored outcomes never get their retry under the fix. The
 commit is recorded for display only. The engine numbers deploys as it serves them — the
-**deploy number** — which the failed keys uses to give failed keys one try per
+**deploy number** — which the stored outcomes use to give a failed key one try per
 deploy without rewriting any entry: a failed key is due when its `deploy`
 is below the current one.
 
@@ -954,7 +983,7 @@ is below the current one.
 ## 16. As built
 
 Where the implementation (`solera/errors.py`, `solera/build.py`,
-`solera/failures.py`, `solera_worker/each.py`, the engine's `_each_plan` and
+`solera/key_outcomes.py`, `solera_worker/each.py`, the engine's `_each_plan` and
 `_each_commit`) departs from or adds to the text above:
 
 - **The value of a key** is what the upstream store hands out for it under
@@ -981,7 +1010,7 @@ Where the implementation (`solera/errors.py`, `solera/build.py`,
 - **Retry and change batches alike** are answered at `start` when the
   engine holds their indexes warm (`resolved-commits.md` §7), else the
   worker reads them from the store. Transitions read priors with an
-  exact `get` of the touched keys, and the failure delta is resolved locally
+  exact `get` of the touched keys, and the outcome delta is resolved locally
   (`KeyIndex.resolve(exact=True)`).
 - **Record times are the worker's clock**; eligibility compares them with
   the engine's `now` in the spec. Skew moves when a key retries, never
@@ -990,15 +1019,15 @@ Where the implementation (`solera/errors.py`, `solera/build.py`,
   --canceled|--retrying|--timed-out|--all] [--partition P]`, or
   `POST /api/projects/{p}/assets/{name}/keys:retry`, records
   `KeysRetryRequested` and submits a run for the partitions concerned at once;
-  only partitions with a failure record take the request.
+  only partitions with a stored outcome take the request.
 - **The retry clock** starts a run for a partition with keys due when the asset
   has any enabled automation and the partition is idle.
 - **`explain`** is an API, not yet a CLI: `GET /assets/{name}/explain?key=&partition=`
   answers with a `verdict` (`ok`, `failing`, `excluded`, `not_matched`,
-  `pending`, `removed`, `absent`) and its evidence — the key's failure
-  record, its newest `key_outcomes` rows, the patterns the input delivers
+  `pending`, `removed`, `absent`) and its evidence — the key's stored
+  outcome, its newest `key_outcomes` rows, the patterns the input delivers
   under and the rule that excluded it (`Engine.explain`). The Keys view
-  reads `GET /assets/{name}/failures` and `GET /assets/{name}/key-outcomes`.
+  reads `GET /assets/{name}/outcomes` and `GET /assets/{name}/outcomes/history`.
 - **The build identity** hashes the modules the project runs, in a git work
   tree or not (data written next to a project never changes it).
 - **PostgresStore** loads by key only the keys that have rows;
@@ -1032,7 +1061,7 @@ Where the implementation (`solera/errors.py`, `solera/build.py`,
 - **The snapshot pin** joins collection's pins: index-file garbage
   (`Upkeep.collect`) and immutable data cleanups both wait for the oldest
   pattern change pin as for a live claim. A retry pass needs none: each retry batch
-  reads the failed keys and the upstream as they are at its own prepare,
+  reads the stored outcomes and the upstream as they are at its own prepare,
   and the accumulators absorb what changes between batches.
 - **After the v1 review** (thr_9ezn6cyar5):
   - Every key of a batch gets an outcome before its position moves past
@@ -1045,18 +1074,18 @@ Where the implementation (`solera/errors.py`, `solera/build.py`,
     pass began (or the boundary it started from was lost mid-pattern
     change), the pass
     ends with a **cleanup** (`reconcile` on the position): the outputs'
-    and failed keys's keys, a batch at a time, against the current
+    and stored outcomes' keys, a batch at a time, against the current
     upstream and patterns; those it no longer has are removed. Retries
     wait for it.
   - A reset begins a **pass** (`pass` on the position: the run that began
     it); a `full` run's later attempts resume it instead of starting over.
-  - A partition's failure record keeps the configuration it last ran under;
+  - A partition's stored outcome keeps the configuration it last ran under;
     the retry clock, `solera keys retry` and the API submit retries under
     it (`Engine.submit_retries`).
   - A forced request newer than the pass in progress, or than the last
     one done, makes the run that sees it continue with a pass.
   - `keys=` overrides are filtered by the input's patterns.
-  - Renaming an asset (`aliases=`) moves its failure record and its
+  - Renaming an asset (`aliases=`) moves its stored outcome and its
     `@asset` index.
   - The manifest records the error policy (`errors`: raised, class,
     `retry_for`), so changing it changes the deploy.

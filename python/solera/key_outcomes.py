@@ -1,4 +1,4 @@
-"""The failed keys's record, transitions and eligibility
+"""The stored outcomes' record, transitions and eligibility
 (docs/per-key-processing.md §9, the authoritative definition). The engine
 and the worker both call these; nothing else decides them.
 
@@ -37,7 +37,7 @@ KINDS = {
 
 
 @dataclass(frozen=True)
-class Record:
+class StoredOutcome:
     """One failing key. Times are whole seconds; `deploy` and `forced` are the
     engine's event counters the last try ran under, copied from the spec — never a
     worker's clock — so whether a key had its deploy or forced retry is
@@ -78,7 +78,7 @@ class Record:
         return bytes(out)
 
     @classmethod
-    def decode(cls, data: bytes) -> Record:
+    def decode(cls, data: bytes) -> StoredOutcome:
         outcome, pos, ints = data[0], 1, []
         for _ in range(8):
             n, pos = _read_varint(data, pos)
@@ -102,8 +102,8 @@ class Outcome:
 
 
 def transition(
-    prior: Record | None, outcome: Outcome, *, now: float, deploy: int, forced: int, retries: int
-) -> Record | None:
+    prior: StoredOutcome | None, outcome: Outcome, *, now: float, deploy: int, forced: int, retries: int
+) -> StoredOutcome | None:
     """The key's record after `outcome` (§9's transition table): `None` for
     no record — nothing, or a tombstone where `prior` existed. `deploy` and
     `forced` are the batch's event counters; `retries` the asset's `retries=`,
@@ -116,7 +116,7 @@ def transition(
     counted = 0 if code == CANCELED else 1  # a cancel interrupted the try: it does not count
     tries = counted if fresh else prior.tries + counted
     since = t if fresh else prior.since
-    record = Record(code, tries, deploy, forced, since, t, 0, 0, outcome.upstream, outcome.message)
+    record = StoredOutcome(code, tries, deploy, forced, since, t, 0, 0, outcome.upstream, outcome.message)
     # Deadlines are computed from the exact time, then rounded up: a budget or a wait
     # is never shortened by the rounding.
     if code == RETRYING:
@@ -135,7 +135,7 @@ def transition(
     return record
 
 
-def eligible(record: Record, now: float, deploy: int, forced: dict[str, int]) -> bool:
+def eligible(record: StoredOutcome, now: float, deploy: int, forced: dict[str, int]) -> bool:
     """Whether a retry pass takes `record`'s key (§9). Each clause retires
     itself: a retried key's `next_at` moves on, its `deploy` becomes the
     pass's, its `forced` the pass's event counter. A canceled key matches only a

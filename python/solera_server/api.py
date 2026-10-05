@@ -274,21 +274,25 @@ def create_app(
         runtime = await asset_engine(request, p, name)
         return await runtime.asset_inputs(name)
 
-    @app.get("/api/projects/{p}/assets/{name}/failed-keys")
-    async def asset_failed_keys(
+    @app.get("/api/projects/{p}/assets/{name}/outcomes")
+    async def asset_outcomes(
         p: str,
         name: str,
         request: Request,
         partition: str | None = None,
+        key: str | None = None,
         after: str | None = None,
         limit: int = Query(default=100, ge=1, le=1000),
     ):
-        """A per-key asset's failing keys (docs/per-key-processing.md §9):
-        `?outcome=rejected&outcome=failed` keeps those classes."""
+        """A per-key asset's key outcomes (docs/per-key-processing.md §9):
+        each key's latest outcome, `?outcome=failed&outcome=ok` keeping those;
+        `?key=` that key's alone."""
 
         runtime = await asset_engine(request, p, name)
         outcomes = [v for v in request.query_params.getlist("outcome") if v]
-        return await runtime.key_failures(name, partition, outcomes=outcomes, after=after, limit=limit)
+        return await runtime.latest_outcomes(
+            name, partition, key=key, outcomes=outcomes, after=after, limit=limit
+        )
 
     @app.get("/api/projects/{p}/assets/{name}/stale-keys")
     async def asset_stale_keys(
@@ -313,8 +317,8 @@ def create_app(
         runtime = await asset_engine(request, p, name)
         return await runtime.stale_keys(name, partition, after=after, limit=limit)
 
-    @app.get("/api/projects/{p}/assets/{name}/key-outcomes")
-    async def asset_key_outcomes(
+    @app.get("/api/projects/{p}/assets/{name}/outcomes/history")
+    async def asset_outcome_history(
         p: str,
         name: str,
         request: Request,
@@ -325,8 +329,8 @@ def create_app(
         before: str | None = None,
         limit: int = Query(default=100, ge=1, le=1000),
     ):
-        """What a per-key asset's keys came to (§10), newest first; repeat
-        `outcome` to match any of several."""
+        """The log of what a per-key asset's keys came to (§10), run by run,
+        newest first; repeat `outcome` to match any of several."""
 
         runtime = await asset_engine(request, p, name)
         outcomes = [v for v in request.query_params.getlist("outcome") if v]

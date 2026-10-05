@@ -1,6 +1,6 @@
 """Versions are generations (docs/versions.md): the sequences its review
 asked for, end to end through the engine — provenance of a pass
-over several batches, a failure record kept in its entry across a restart, and repair
+over several batches, a stored outcome kept in its entry across a restart, and repair
 by presence after a writer died."""
 
 from solera import Transient
@@ -63,14 +63,14 @@ async def test_each_batch_says_the_generation_it_read(state):
 
 
 async def test_a_failure_record_lives_in_its_entry_across_a_restart(state, tmp_path):
-    """Review finding 2: the failed keys's entry carries the key's record —
+    """Review finding 2: the stored outcomes' entry carries the key's record —
     its outcome, tries, retry deadline and the upstream generation it failed
     at — as its payload. After a restart, the replayed engine reads it back
     whole, and a retry takes the key at the upstream generation it failed at."""
 
     import time
 
-    from solera.failed_keys import RETRYING
+    from solera.key_outcomes import RETRYING
     from solera.keys.io import ObjectIO
     from solera.keys.layers import LayerIndex, key_str
 
@@ -110,9 +110,9 @@ async def test_a_failure_record_lives_in_its_entry_across_a_restart(state, tmp_p
     await engine.initialize()
     index = LayerIndex(ObjectIO(again.objects), again.model.index("@parse", ""))
     found = await index.lookup([b"a.csv"])
-    from solera.failed_keys import Record
+    from solera.key_outcomes import StoredOutcome
 
-    assert {key_str(k): Record.decode(p) for k, (_, p) in found.items()} == {"a.csv": record}
+    assert {key_str(k): StoredOutcome.decode(p) for k, (_, p) in found.items()} == {"a.csv": record}
     skew["seconds"] = 7200.0  # two hours on: its retry is due
     await drive(engine, await engine.submit(["parse"]))
     assert tries["n"] == 2 and await records(engine, "parse") == {}

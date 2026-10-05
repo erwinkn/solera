@@ -513,7 +513,7 @@ class Migrating(FileStore):
 
 def test_output_names_are_names():
     """An output is named like everything else — never `@asset`, the
-    namespace of Each failed keys, which would share its key files."""
+    namespace of an each asset's stored outcomes, which would share its key files."""
 
     def parse():
         return {}

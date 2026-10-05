@@ -18,8 +18,8 @@ context), and — for a key a run asked for that is held as it is —
 `unchanged`. A key's version is the source's own word where its index
 entry carries one (its payload), else the generation that wrote it.
 
-`held`: a per-key consumer's own indexes (its outputs and failure
-records), what a held base decodes from — a key there is present at no
+`held`: a per-key consumer's own indexes (its outputs and stored
+outcomes), what a held base decodes from — a key there is present at no
 upstream version, so owed an update if upstream has it, else a removal."""
 
 from __future__ import annotations

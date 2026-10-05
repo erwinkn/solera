@@ -130,8 +130,8 @@ life, and a batch planned before an asset change); the observed set keeps
 them.
 
 **Outcomes.** A failed or abandoned attempt writes nothing: its keys stay
-owed. A per-key batch's failed keys are processed — observed at the version
-they failed at, and retried by their failure record (A19 R8), not owed. A
+owed. A per-key batch's stored outcomes are processed — observed at the version
+they failed at, and retried by their stored outcome (A19 R8), not owed. A
 drained, canceled per-key batch commits its finished keys as points; its
 interrupted keys are not observed, so they stay owed.
 
@@ -519,7 +519,7 @@ the run continues from its task's progress (batch 2's end), and batch 3's
 keys and whatever changed since are its next batch's.
 
 **Per-key versus plain.** One observation record for both. For `checks`,
-failed keys are observed, retried by their failure records. For `tally`, `S`
+stored outcomes are observed, retried by their stored outcomes. For `tally`, `S`
 is the only record of what the count holds: `added` is never a key it
 holds, `removed` always one.
 
@@ -553,8 +553,8 @@ Each goes from the docs and the glossary when the observed set is built
 - **read-ahead** — *was* what `keys=` runs read past the position; now points.
 - **pass** (full, delta, diff) — *was* a frozen walk of the upstream; now a
   run's batches over what it loads, each at its own head.
-- **retry pass** — *was* a walk of the failed keys; now a run loads the keys
-  its failure records make due.
+- **retry pass** — *was* a walk of the stored outcomes; now a run loads the keys
+  its stored outcomes make due.
 - **pattern change** (as a process) — *was* a cut-over, a delta under the
   old patterns, and a membership diff; now an input change, and the
   comparison under the new patterns.
@@ -593,13 +593,13 @@ and `_snapshot_read`; `caught_up` (now `complete`, derived from `R`),
 `seen`, `caught_up_at`, `built_at` and `input_reset_at`; most of `staleness.py`; the per-key reconcile; the
 worker's index reads for a batch (`read_batch`, the retry walk, the
 failure lookups — the engine plans every batch and the spec carries its
-keys, classes, old observations and prior failure records); the
+keys, classes, old observations and prior stored outcomes); the
 `fingerprint`, now the `definition`. Still to go: `Batch.full`, replaced
 by `Batch.reset` (D166, with the SDK contract); D100's rowless deliveries
 and `gone_since`'s early removal, for stores that do not serve (with
 fenced stores' reads); the index's `changes(lower=)`, which nothing calls
 (with the index switch). Kept: the key index and its Δ, endpoint
-reservation and the claim's reader pin, the failure index and retries,
+reservation and the claim's reader pin, the outcome index and retries,
 D111's bounds; an unkeyed upstream's observation is the one commit it
 last read.
 

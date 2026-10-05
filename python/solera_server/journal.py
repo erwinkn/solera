@@ -68,9 +68,10 @@ log = logging.getLogger(__name__)
 
 # The state's format, written in every journal. A namespace written in another
 # is refused, never read: there is no migration (no deployments, no backwards
-# compatibility). 2: stamped-layer key indexes and cleanup cursors (T33); a
-# journal with no format is from before them.
-FORMAT = 2
+# compatibility). 2: stamped-layer key indexes and cleanup cursors (T33); 3:
+# key outcomes, a per-key asset's `failures` record renamed `outcomes` (T37). A
+# journal with no format is from before 2.
+FORMAT = 3
 
 
 class Stopped(RuntimeError):
@@ -192,8 +193,8 @@ class Journal:
             if found is not None and body.get("format", 1) != FORMAT:
                 raise OldNamespace(
                     f"{self._journal}: written in state format {body.get('format', 1)}, and this engine "
-                    f"reads only format {FORMAT} (stamped-layer key indexes, T33). State from before "
-                    "that change is unreadable: start a fresh namespace."
+                    f"reads only format {FORMAT}. State in another format is unreadable: start a fresh "
+                    "namespace."
                 )
             checkpoint = body["checkpoint"]
             try:

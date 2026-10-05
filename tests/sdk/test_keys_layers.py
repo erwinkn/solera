@@ -505,7 +505,7 @@ async def test_the_engine_resolves_a_workers_request_from_its_warm_cache(tmp_pat
 
 
 async def test_indexes_sharing_a_cache_never_read_each_others_files(tmp_path):
-    """One attempt names its output's delta and its failure records' delta
+    """One attempt names its output's delta and its stored outcomes' delta
     alike (`{commit}-{attempt}-0.lay`), under two prefixes: the engine's
     cache keys what it holds by full path, so each index reads its own."""
 

@@ -2,11 +2,11 @@
 (docs/per-key-processing.md §5, §9); and a keyed batch as the engine
 planned it, classed again from what a source served (`observe`).
 
-A batch is either the input's owed keys (`changes`) or the failed keys's
+A batch is either the input's owed keys (`changes`) or the stored outcomes'
 keys that are due again (`retry`). Each key is one call,
 `concurrency` at a time; its outcome is classified (`solera.errors`), the
 outputs of the keys that succeeded become one `Patch({key: value})` per
-output, and every key's outcome moves its failure record (`solera.failed_keys`)
+output, and every key's outcome moves its stored outcome (`solera.key_outcomes`)
 — all of it committed together.
 """
 
@@ -21,7 +21,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 
 from solera import errors
-from solera.failed_keys import REMOVED, UNMATCHED, Outcome, Record, lower, minima, transition
+from solera.key_outcomes import REMOVED, UNMATCHED, Outcome, StoredOutcome, lower, minima, transition
 from solera.keys import SortedEntries
 from solera.keys.layers import LayerIndex, LayerState, key_bytes
 from solera.sdk import UNSET, Ref, Result
@@ -71,7 +71,7 @@ class Batch:
     are keys gone upstream, or held keys the input's patterns no longer
     take (`unmatched`); the consumer's outputs drop both. A batch has a
     `kind` (§9) — the input's owed keys, `changes`, or a `retry` of failed
-    keys — the failure records it read, and what it observed of each key
+    keys — the stored outcomes it read, and what it observed of each key
     (`observed`, `observe`)."""
 
     upserted: dict[str, int]  # key -> the generation of its upstream entry
@@ -79,7 +79,7 @@ class Batch:
     after: str | None  # where the retry walk ended (None: the walk is done)
     unmatched: list[str] = field(default_factory=list)
     kind: str = "changes"
-    priors: dict[str, Record] = field(default_factory=dict)  # the touched keys' failure records
+    priors: dict[str, StoredOutcome] = field(default_factory=dict)  # the touched keys' stored outcomes
     rest: tuple = (None, None)  # retry: the bounds of the records walked but not taken
     observed: dict = field(default_factory=dict)  # key -> the version observed, None: absent
 
@@ -127,7 +127,7 @@ def read_each_batch(pin: dict) -> Batch:
         observed={k: (None if cls in gone else v) for k, cls, v, *_ in keys},
         rest=tuple(each.get("rest") or (None, None)),
     )
-    batch.priors = {k: Record.decode(bytes.fromhex(p)) for k, p in (each.get("priors") or {}).items()}
+    batch.priors = {k: StoredOutcome.decode(bytes.fromhex(p)) for k, p in (each.get("priors") or {}).items()}
     return batch
 
 
@@ -308,16 +308,16 @@ async def run(spec, project, asset, param: str, pin: dict, args: dict, ctx, keys
     }
 
     async def finish(cancel) -> dict:
-        """The batch's failure delta, key outcomes and counts, with interrupted
+        """The batch's outcome delta, key outcomes and counts, with interrupted
         keys made what `cancel` — the record the result is sealed with — says:
         timed out for a timeout, canceled otherwise (lifecycle.md §2.2)."""
 
         made = "timed_out" if cancel is not None and cancel.reason == "timeout" else "canceled"
         final = {k: Outcome(made, o.upstream) if o.kind == INTERRUPTED else o for k, o in outcomes.items()}
-        failures = await _failures(spec, each, batch, final, keys_io)
+        stored = await _outcomes(spec, each, batch, final, keys_io)
         rows, counts = [], Counter()
         for key, outcome in sorted(final.items()):
-            record = failures["records"].get(key)
+            record = stored["records"].get(key)
             name = outcome.kind if outcome.kind in ("ok", "removed", "unmatched") else record.name
             counts[name] += 1
             rows.append(
@@ -329,8 +329,8 @@ async def run(spec, project, asset, param: str, pin: dict, args: dict, ctx, keys
                     "duration": round(durations.get(key, 0.0), 6),
                 }
             )
-        report = {k: v for k, v in failures.items() if k != "records"}
-        return {"failures": report, "key_outcomes": rows, "keys": dict(counts)}
+        report = {k: v for k, v in stored.items() if k != "records"}
+        return {"outcomes": report, "key_outcomes": rows, "keys": dict(counts)}
 
     # What it observed: every key of the batch, or — drained — those that finished; an
     # interrupted key is not observed, so it stays owed (docs/observed-set.md, "Outcomes").
@@ -347,9 +347,9 @@ async def run(spec, project, asset, param: str, pin: dict, args: dict, ctx, keys
     }
 
 
-async def _failures(spec, each: dict, batch: Batch, outcomes: dict, keys_io) -> dict:
+async def _outcomes(spec, each: dict, batch: Batch, outcomes: dict, keys_io) -> dict:
     """Move each touched key's record (§9's transition table), write the
-    failed keys's delta, and report the outcome counts' transitions and
+    outcome delta, and report the outcome counts' transitions and
     the bounds the commit lowers or accumulates."""
 
     deploy, forced = int(each["deploy"]), int(each.get("forced_at") or 0)
@@ -369,7 +369,7 @@ async def _failures(spec, each: dict, batch: Batch, outcomes: dict, keys_io) -> 
                 upsert_records.append(record.encode())
         elif prior is not None:
             removes.append(key_bytes(key))
-    state = LayerState.from_json(each["failures"])
+    state = LayerState.from_json(each["outcomes"])
     if each.get("start_over"):  # the commit replaces the index: resolved against an empty one
         state = LayerState(prefix=state.prefix)
     files, _ = await LayerIndex(keys_io, state).write_patch(

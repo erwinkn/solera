@@ -255,7 +255,7 @@ def file_index(ctx, site_files: list[dict]):
 # ---------------------------------------------------------------------------
 # Per-file processing: a per-key input runs one call per changed file, four at a
 # time; every file's rows go to the store in one write per page, and a file
-# that raises is kept in the asset's failed keys, per key, while the others
+# that raises is kept in the asset's stored outcomes, per key, while the others
 # commit (docs/per-key-processing.md §5, §9). The input's patterns leave each
 # site's third file — a draft — out entirely (§11).
 # ---------------------------------------------------------------------------

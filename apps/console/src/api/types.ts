@@ -217,7 +217,8 @@ export interface AssetStatus {
     at: number;
     attempt: string | null;
   } | null;
-  failures: Partial<Record<FailureClass, number>> | null;
+  /** Its stored outcomes by kind, every partition summed: never ok, removed or unmatched. Null: no per-key input. */
+  stored_counts: Partial<Record<StoredOutcomeKind, number>> | null;
   repairs: number;
   repairs_stuck?: number;
   updated_at: number | null;
@@ -294,26 +295,39 @@ export interface KeyPage {
   next: string | null;
 }
 
-export type FailureClass = "rejected" | "failed" | "retrying" | "canceled" | "timed_out";
+/** An outcome only a key that did not succeed has: these alone are stored. */
+export type StoredOutcomeKind = "rejected" | "failed" | "retrying" | "canceled" | "timed_out";
 
-export interface FailureKey {
-  partition: string;
-  key: string;
-  outcome: FailureClass;
+/** A stored outcome's retry state. */
+export interface StoredState {
   tries: number;
   since: number;
   last: number;
   next_at: number | null;
   until: number | null;
-  /** The generation of the upstream key it failed at. */
-  generation: number;
   message: string;
   eligible: boolean;
 }
 
-export interface FailurePartition {
+/** A key's latest outcome in one partition: stored, or derived from its input's observation record. */
+export interface OutcomeRow extends Partial<StoredState> {
   partition: string;
-  counts: Partial<Record<FailureClass, number>>;
+  key: string;
+  /** Null: never processed. */
+  outcome: KeyOutcomeKind | null;
+  /** The upstream version it came at — a source's own word, else a generation; null where unknown. */
+  version: number | string | null;
+  /** Whether its input owes it: changed upstream since, or never processed. */
+  owed: boolean;
+}
+
+/** A row with a stored outcome: its retry state is all there. */
+export type StoredRow = OutcomeRow & StoredState & { outcome: StoredOutcomeKind };
+
+export interface OutcomePartition {
+  partition: string;
+  /** Stored outcomes alone: never ok, removed or unmatched. */
+  stored_counts: Partial<Record<StoredOutcomeKind, number>>;
   due: number | null;
   deploy_min: number | null;
   retry: Json;
@@ -322,16 +336,16 @@ export interface FailurePartition {
   has_retries?: boolean;
 }
 
-export interface FailedKeys {
+export interface LatestOutcomes {
   asset: string;
-  partitions: FailurePartition[];
+  partitions: OutcomePartition[];
   deploy: number;
   now: number;
-  keys: FailureKey[];
+  keys: OutcomeRow[];
   next: string | null;
 }
 
-export type KeyOutcomeKind = "ok" | "removed" | "unmatched" | FailureClass;
+export type KeyOutcomeKind = "ok" | "removed" | "unmatched" | StoredOutcomeKind;
 
 export interface KeyOutcome {
   run: string;
@@ -366,7 +380,8 @@ export interface Explain {
     excluded_by: string | null;
     pending: Patterns | null;
   };
-  failure: FailureKey | null;
+  /** Its stored outcome, at the upstream generation it came at. */
+  outcome: (StoredState & { outcome: StoredOutcomeKind; version: number }) | null;
   last: KeyOutcome | null;
   last_ok: KeyOutcome | null;
   verdict: "ok" | "failing" | "excluded" | "not_matched" | "pending" | "removed" | "absent";

@@ -8,7 +8,7 @@ observation — stored as three layers, the first that holds a key deciding:
   take it, else absent (`lo`/`hi` None: unbounded);
 - the **base**: one layer for every other key (`endpoint` None: the empty
   base, every key absent; `held`: a per-key consumer's full run, every key
-  its outputs or failure records hold present at no upstream version).
+  its outputs or stored outcomes hold present at no upstream version).
 
 A layer is `{endpoint, patterns, context, life}`: the commit it was observed
 at, the input's patterns then (normalised: None takes every key), the id of

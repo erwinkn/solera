@@ -438,7 +438,7 @@ class Incremental(In):
     commit, and `concurrency` of them (64 by default) run at once within a
     partition. The asset's `concurrency=` caps its partitions at once, each
     cap counting its own unit.
-    A key whose call raises is recorded in the asset's failure index and
+    A key whose call raises is recorded in the asset's outcome index and
     retried by its class (§8, §9); it never blocks the others."""
 
     kind = "incremental"
@@ -1374,7 +1374,7 @@ class Project:
                 output.name = output.name or default
                 if not NAME.fullmatch(output.name):
                     # Names are letters, digits, `_.-`: never `@asset`, the namespace of
-                    # failed keys (docs/per-key-processing.md §9), nor a path.
+                    # stored outcomes (docs/per-key-processing.md §9), nor a path.
                     raise RegistrationError(f"{asset.name}: invalid output name {output.name!r}")
                 if output.name in table or output.name in seen:
                     raise RegistrationError(f"Duplicate output name: {output.name}")

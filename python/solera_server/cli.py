@@ -198,7 +198,7 @@ def _main():
     stale.add_argument("partition", nargs="?", default="", help="Its partition; none when unpartitioned")
 
     keys = commands.add_parser(
-        "keys", help="A per-key asset's failing keys (per-key-processing.md §9)", parents=[common]
+        "keys", help="A per-key asset's key outcomes (per-key-processing.md §9)", parents=[common]
     )
     keys_sub = keys.add_subparsers(dest="keys_command", required=True)
     keys_retry = keys_sub.add_parser("retry", help="Retry a per-key asset's failing keys now")

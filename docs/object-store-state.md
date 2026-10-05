@@ -195,11 +195,12 @@ One object, `control/journal.json`, rewritten whole by every flush: the
 engine id of its writer, the name of the checkpoint it extends, every
 event since that checkpoint (§10), and the state's `format`.
 
-**Format, and no migration.** The state's format is 2 since the
-stamped-layer key index and cleanup cursors (T33). An engine refuses a
+**Format, and no migration.** The state's format is 3: 2 since the
+stamped-layer key index and cleanup cursors (T33), 3 since key outcomes
+renamed a per-key asset's `failures` record `outcomes` (T37). An engine refuses a
 namespace written in another format, a journal with no `format` included,
-before it reads or writes anything (`OldNamespace`): **state from before
-the switch is unreadable; start a fresh namespace.** Solera migrates
+before it reads or writes anything (`OldNamespace`): **state in another
+format is unreadable; start a fresh namespace.** Solera migrates
 nothing: there are no deployments to keep, and no backwards compatibility. There is one way to change state:
 `State.record(*events)` applies the events to the model and buffers them,
 synchronously — the engine never waits on storage. A background flusher
@@ -443,7 +444,7 @@ overlay, so nothing is sorted or held.
 | Lookup | writers, the resolver | Each key's state at the head: every layer's main part in one round trip; the newest layer holding a key decides. |
 | Merge | the engine's machine (*Engine work*) | Merge adjacent layers, keeping each key's newest state and its flips after the cut, under the merge rule (`key-index-design.md` § Compaction): four layers of one tier merge; the base absorbs the layers above it once they hold a quarter of its bytes; an output reaching past the cut holds at most 4× the bytes of every newer layer plus 1 MiB. Two lanes per index — the base, and the tiers — never share an input. A merge streams, checks parity where no flip was dropped, records `MergeAttempted` before uploading, and publishes with `IndexMerged` only if the index is still the life it was planned against and holds its inputs; otherwise its output is an orphan. Three attempts of one input set, none published, stop the index's merges for its life, alarmed. |
 | Cut | engine | `IndexCut` raises the cut to the oldest commit any reader may still start from (`oldest_observed`). It only rises; later merges drop flips at or below it. |
-| Writer backpressure | engine | An index past 64 layers (upkeep stopped, or far behind) holds back every writer until merges bring it down: the attempts that write it, a per-key asset's failure index included (`held: merges`), and source commits, refused with a retryable 409 (A17 R6). |
+| Writer backpressure | engine | An index past 64 layers (upkeep stopped, or far behind) holds back every writer until merges bring it down: the attempts that write it, a per-key asset's outcome index included (`held: merges`), and source commits, refused with a retryable 409 (A17 R6). |
 | Delete files | engine | Only the engine deletes index files. A file no layer references joins `garbage`, and is deleted once every attempt that could have pinned it has finished (`FilesCleanedUp`); an immutable store's delta stays until the partition's cleanup cursor passes it (`lifecycle.md` §9.8). Positions in event order (`applied`), never wall clocks. An abandoned attempt's delta, and a merge output no state ever named, are orphans: found by listing `keys/` every 10 minutes and deleted, a merge output only if its name's epoch is at most the collector's and no merge running here may still write it. |
 
 Writes that never pass through the worker as rows — opaque writes
@@ -683,9 +684,9 @@ count of a keyed output, else the length of a returned list.
 | an asset's versions and their metadata | `GET /assets/{name}/history?output=&partition=&before=` | |
 | what a version was built from, or what was built from it | `GET /outputs/{name}/lineage?partition=&generation=&direction=upstream\|downstream&depth=5` | each edge's `from` is what was read: its `generation` and the writer's `run`, `attempt` and `at`. Flag: `uncommitted` (`{attempt, run}`: a write no attempt committed). `detail` keeps the pin (`pinned_generation`) for debugging |
 | every asset at a glance: partitions by status, newest outcome, failing keys, partitions owing a repair | `GET /assets:status` → `{assets: {name: {partitions, partitioned, last, failures, owing a repair, updated_at}}}` | |
-| a per-key asset's failing keys, and each partition's failure record | `GET /assets/{name}/failed-keys?partition=&outcome=&after=&limit=100` → `{partitions, keys, deploy, now, next}` | |
+| a per-key asset's key outcomes — each key's latest, stored or derived (`per-key-processing.md` §9) — and each partition's retry state | `GET /assets/{name}/outcomes?partition=&key=&outcome=&after=&limit=100` → `{partitions, keys, deploy, now, next}` | |
 | a partition's staleness reasons and its stale keys (`positions-from-reads.md`) | `GET /assets/{name}/stale-keys?partition=&after=` | `solera stale ASSET [PARTITION]` |
-| what a per-key asset's keys came to, newest first | `GET /assets/{name}/key-outcomes?partition=&key=&q=&outcome=&run=&before=&limit=100` → `{outcomes, next}` | |
+| the log of what a per-key asset's keys came to, run by run, newest first | `GET /assets/{name}/outcomes/history?partition=&key=&q=&outcome=&run=&before=&limit=100` → `{outcomes, next}` | |
 | why a key is, or is not, in an asset's output (per-key-processing.md §10) | `GET /assets/{name}/explain?key=&partition=&input=` → `{verdict, patterns, failure, last, last_ok, …}` | |
 | an asset's input inputs, with every partition's position, lag and state | `GET /assets/{name}/inputs` | |
 | outputs owing a repair, stuck cleanups (lifecycle.md §9.6, §9.8) | `GET /repairs`, `GET /cleanups` | `solera cleanups` |

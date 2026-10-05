@@ -32,8 +32,8 @@ from zoneinfo import ZoneInfo
 from croniter import croniter
 from obstore.exceptions import AlreadyExistsError
 from solera import lifecycle
-from solera.failed_keys import lower
 from solera.ids import ulid, ulid_time
+from solera.key_outcomes import lower
 from solera.keys import Rows, SortedEntries
 from solera.keys.io import ObjectIO
 from solera.keys.layers import (
@@ -653,7 +653,7 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
         let fall far behind (`LayerState.backlogged`), or None. Every index
         writer waits until merges catch up (writer backpressure,
         docs/key-index-design.md § Compaction): a task writing one is held
-        (`merges`), its outputs and a per-key asset's failure index alike, and
+        (`merges`), its outputs and a per-key asset's outcome index alike, and
         a source commit is refused, retryable."""
 
         for name in names:
@@ -1132,8 +1132,8 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
             "cursor": cursor,
             "definition": definition,  # what its inputs' observations are made under
             "outputs": outputs,
-            # A per-key batch's failure delta, for cleaning up if it never commits.
-            "failures": None
+            # A per-key batch's outcome delta, for cleaning up if it never commits.
+            "outcomes": None
             if each_page is None
             else {
                 "prefix": self.m.index(f"@{task['asset']}", partition).prefix,
@@ -1145,7 +1145,7 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
         """What an attempt reads, as reader pins name it: the index prefix of
         every output partition it reads or writes — a value's or an unkeyed incremental
         output's too, whose data its partition's garbage names — and of any index
-        its pins name (a failed keys). Collection elsewhere waits for no
+        its pins name (an outcome index). Collection elsewhere waits for no
         attempt that reads none of it."""
 
         found = {self.m.index(name, task["partition"]).prefix for name in outputs}
@@ -1192,7 +1192,7 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
                 "more",
                 "full",
                 "lineage",
-                "failures",
+                "outcomes",
                 "definition",
                 "cleanup",  # a cleanup task's entry (K25)
             )
@@ -1259,7 +1259,7 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
         return max((record.get("forced") or {}).values(), default=0)
 
     def _has_retries(self, record: dict | None) -> bool:
-        """Whether a partition's failure record has keys to retry now: a pass in
+        """Whether a partition's stored outcome has keys to retry now: a pass in
         progress, a key due, a failed key not yet tried under this deploy,
         or a forced request newer than the last pass completed. The
         bounds are conservative: a pass may find nothing, which makes them
@@ -1276,15 +1276,15 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
         )
 
     def _each_plan(self, task, asset, input, ref, pin, plan, empty, o):
-        """A per-key input's batch: its owed keys, or the keys its failed keys
+        """A per-key input's batch: its owed keys, or the keys its stored outcomes
         has due again (`_retry`, as `_observe` read them). When both are
         pending they alternate — neither starves, and there is no fraction to
         tune (§9). A `keys=` run and a full run's first batch take no
-        retries; that batch starts the failed keys over too (K47). Either
-        carries its keys' prior failure records: its worker reads no index."""
+        retries; that batch starts the stored outcomes over too (K47). Either
+        carries its keys' prior stored outcomes: its worker reads no index."""
 
-        record = self.m.partition(task["asset"], task["partition"]).get("failures") or {}
-        failures = self.m.index(f"@{task['asset']}", task["partition"])
+        record = self.m.partition(task["asset"], task["partition"]).get("outcomes") or {}
+        stored = self.m.index(f"@{task['asset']}", task["partition"])
         changes = not empty
         retries = o.get("retry") is not None
         if changes and retries:
@@ -1304,7 +1304,7 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
             "forced_at": current,
             "now": self.clock(),
             "retries": asset.get("retries", {}).get("n", 0),
-            "failures": failures.to_json(),
+            "outcomes": stored.to_json(),
             "commit_number": int(record.get("commit_number", -1)) + 1,
             "pass_after": (retry or {}).get("after"),
         }
@@ -1340,12 +1340,12 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
             return pin, plan, False
         batch = {"kind": "changes", "retries": retries, "pass": retry}
         each["priors"] = o["priors"]
-        if plan["full"]:  # the failed keys start over: the commit replaces the failure index
+        if plan["full"]:  # the stored outcomes start over: the commit replaces the outcome index
             each["start_over"] = batch["start_over"] = True
         return {**pin, "each": each}, {**plan, "each": batch}, empty
 
     def _each_commit(self, task, plan: dict, result: dict) -> tuple[dict, bool]:
-        """What a per-key batch commits to its failure record, and whether the
+        """What a per-key batch commits to its stored outcome, and whether the
         task has more to do (§9): the outcome counts move by the batch's
         transitions; the bounds are lowered by the records it wrote; a retry
         batch advances its pass and folds the range it walked into the pass's
@@ -1353,11 +1353,11 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
         a change batch folds what it wrote behind the pass's place."""
 
         batch = plan["each"]
-        record = self.m.partition(task["asset"], task["partition"]).get("failures") or {}
+        record = self.m.partition(task["asset"], task["partition"]).get("outcomes") or {}
         if batch.get("start_over"):  # the index starts over: nothing of the record before carries
             record = {"commit_number": record.get("commit_number", -1), "forced": record.get("forced") or {}}
         run = self.m.runs.get(task["run"]) or {}
-        report = result.get("failures") or {}
+        report = result.get("outcomes") or {}
         counts = dict(record.get("counts") or {})
         for name, delta in (report.get("counts") or {}).items():
             counts[name] = counts.get(name, 0) + int(delta)
@@ -1555,12 +1555,12 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
         # Settled under the contract it was launched with, not today's manifest.
         declared = {name: info["contract"] for name, info in (prepared.get("outputs") or {}).items()}
         more = bool(prepared.get("more"))
-        failures = None
+        outcomes = None
         for param, plan in (prepared.get("plans") or {}).items():
             if plan is None:
                 continue
             if "each" in plan:
-                failures, each_more = self._each_commit(task, {**plan, "param": param}, result)
+                outcomes, each_more = self._each_commit(task, {**plan, "param": param}, result)
                 more = more or each_more
             more = more or not (plan["final"] or plan.get("done") or plan.get("retry"))  # the walk goes on
         heads, keys = {}, {}
@@ -1603,12 +1603,12 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
         for name in set(declared) - set(outputs):
             # A per-key batch whose keys all failed writes nothing, and makes no head yet;
             # nor does a batch whose keys the input's patterns all left out.
-            if prepared["outputs"][name]["head"] is None and failures is None and not result.get("skipped"):
+            if prepared["outputs"][name]["head"] is None and outcomes is None and not result.get("skipped"):
                 raise Conflict(f"omitted output {name} has no head to keep (§2)", retryable=False)
         commit = {"heads": heads, **observations, **self._made(prepared)}
         commit["final"] = not more and outcome == "succeeded"  # a canceled run has no final commit
-        if failures is not None:
-            commit["failures"] = failures
+        if outcomes is not None:
+            commit["outcomes"] = outcomes
             if result.get("key_outcomes"):
                 commit["key_outcomes"] = result["key_outcomes"]
         if keys:
@@ -1923,18 +1923,18 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
 
     async def _retry_tick(self):
         """The retry clock (docs/per-key-processing.md §9): an automated Each
-        asset whose failed keys has keys due again runs for that partition, even
+        asset whose stored outcomes has keys due again runs for that partition, even
         when nothing upstream changed. An asset run by hand picks them up on
         its next run. A partition whose inputs have no head waits for them: its
         run could not plan, and would be submitted again every tick."""
 
         automated = {t for auto in self.m.automations.values() if auto["enabled"] for t in auto["targets"]}
         for (asset, partition), state in list(self.m.partitions.items()):
-            if asset not in automated or asset not in self.manifest["assets"] or "failures" not in state:
+            if asset not in automated or asset not in self.manifest["assets"] or "outcomes" not in state:
                 continue
             if self._partition_active(asset, partition) or self.m.is_pending(asset, partition):
                 continue
-            if self._has_retries(state["failures"]):
+            if self._has_retries(state["outcomes"]):
                 await self.submit_retries(asset, [partition], "retry clock", skip_missing_inputs=True)
 
     async def _repair_tick(self):
@@ -1969,14 +1969,14 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
         self, asset: str, partitions, by: str | None, skip_missing_inputs: bool = False
     ) -> list[dict]:
         """Runs for a per-key asset's partitions that have keys to retry, each under
-        the configuration its partition last ran with (kept on its failure record):
+        the configuration its partition last ran with (kept on its stored outcome):
         a retry under another configuration would read other inputs, and its
         new definition would redeliver every key (§9). Partitions already active
         are left to the run they are in."""
 
         by_config: dict[str, list[str]] = {}
         for partition in partitions:
-            config = (self.m.partition(asset, partition).get("failures") or {}).get("config") or {}
+            config = (self.m.partition(asset, partition).get("outcomes") or {}).get("config") or {}
             by_config.setdefault(json.dumps(config, sort_keys=True), []).append(partition)
         runs = []
         for config, group in sorted(by_config.items()):
@@ -1998,7 +1998,7 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
         `timed_out`, or `all`), every partition or one. Its event
         counter is its identity; a retry pass takes each such key once (§9)."""
 
-        from solera.failed_keys import NAMES
+        from solera.key_outcomes import NAMES
 
         if not any(
             e.get("each") for e in (self.manifest["assets"].get(asset) or {}).get("inputs", {}).values()
@@ -2018,7 +2018,7 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
             }
         )
         partitions = sorted(
-            s for s, r in self.m.partitions.of(asset).items() if "failures" in r and partition in (None, s)
+            s for s, r in self.m.partitions.of(asset).items() if "outcomes" in r and partition in (None, s)
         )
         return {"asset": asset, "classes": classes, "partitions": partitions}
 

@@ -536,7 +536,7 @@ async def test_writes_wait_while_an_outputs_merges_are_far_behind(state):
 async def test_every_index_writer_waits_while_merges_are_far_behind(state, tmp_path):
     """A17 R6: the writer backpressure holds for every key index, not only
     an asset's declared outputs. Past 64 layers a source commit is refused,
-    retryable, and a per-key asset's task waits while its failure index
+    retryable, and a per-key asset's task waits while its outcome index
     (`@asset`) is that far behind; both go on once merges catch up."""
 
     from solera.keys.layers import LayerState

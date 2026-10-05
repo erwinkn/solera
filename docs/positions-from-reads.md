@@ -144,12 +144,12 @@ its `keys=` runs are read-ahead entries, counted by the cap, and its stale
 keys are derived from it key by key (below). Positions.tla found the
 snapshot plus read-ahead exactly as precise as per-key records in a 1:1
 chain, so the key index stores no consumer payload. A retry pass (an
-`each` asset's failed keys) whose last batch finds nothing past the
+`each` asset's stored outcomes) whose last batch finds nothing past the
 snapshot undelivered, read ahead or read by that batch, collapses the
 record as a default run does. As built it seldom has to: a `keys=` run
 that leaves nothing uncovered collapses the record itself, so entries stay
 only while some changed key is undelivered, which a retry pass, reading
-failed keys at their failed version, does not read.
+stored outcomes at their failed version, does not read.
 
 A full pass records the claim generation that `began` it. Entries
 recorded before a start-over stay in the record, but count toward the
@@ -160,7 +160,7 @@ stops counting once a whole or dep input it read commits again (it read
 the old one). Within a full pass, a `keys=` run skips a named key the
 pass already delivered at its current version, read ahead or walked:
 nothing twice. For `each=True`, it covers (and collapses the record)
-only if the output and its failed keys hold no key the pass's reconcile
+only if the output and its stored outcomes hold no key the pass's reconcile
 would remove, except keys the run names: it removes those itself (R2).
 
 ## Runs target only what input units allow
@@ -315,7 +315,7 @@ comparison: the work it would do is exactly the stale part.
   is stale until it reads again under the new patterns. The position's
   diff pass keeps its old/new split.
 - **Retry passes.** An `each` key that failed was read, so its entry, or
-  the pass it failed in, covers it. Its failure record keeps it due:
+  the pass it failed in, covers it. Its stored outcome keeps it due:
   failing, not stale.
 - **Repairs after a writer died.** A dead attempt committed nothing, so
   its reads update no record. A repair moves no record. Unchanged.

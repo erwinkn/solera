@@ -782,7 +782,7 @@ it read 1 and 2.
   position reaches the head (the design says "commits up to the change
   finish under the old patterns"; the cutover point is simplified); a
   write lands whole or not at all (no half-written batch); immutable
-  stores, renames, fan-in, per-key incremental's failed keys and retry passes, and
+  stores, renames, fan-in, per-key incremental's stored outcomes and retry passes, and
   time partitions are not modelled; runs have one target (no `upstream=`
   run graph); automations are `OnChange` only (an asset with a schedule,
   or none, waits for its next run after an asset change).
@@ -817,7 +817,7 @@ an asset change, with the keys it delivered; and the definition the last
 finished pass was under. Every asset keeps this one record, `each=True`
 too (K47): no per-key payloads. An `each=True` batch may fail keys it
 hands the asset: read, so recorded, but not written, and failing (the
-failure index, at the version read); a retry pass reads them again. A ghost records, per output key, the input version and the
+outcome index, at the version read); a retry pass reads them again. A ghost records, per output key, the input version and the
 definition it was produced from: the truth the record is checked
 against.
 
@@ -882,8 +882,8 @@ record (K47).
   one: the model refuses its commit, as for a reset. The note does not
   say yet; W22 to confirm.
 - *A start-over drops the records of the keys it does not deliver,* and
-  the failure index with them: the output is rebuilt from scratch.
-- *A reset of the input drops the failure records* with the other
+  the outcome index with them: the output is rebuilt from scratch.
+- *A reset of the input drops the stored outcomes* with the other
   records that read it; else an outdated failure is left with no pass to
   clear it.
 - *A key failing at its current version is not behind,* in the record's

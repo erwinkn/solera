@@ -99,11 +99,11 @@ v3       (key, generation, deleted, payload?)    + predecessor generation
 - `version` and `locator` merge into `generation`. *Why:* they were two
   fields for one fact once versions stopped being digests.
 - `payload` is one optional opaque field the index's kind interprets: a
-  source key's version, or a failed keys's failure record
+  source key's version, or a stored outcomes' stored outcome
   (`per-key-processing.md` §9). A flag bit, then length and bytes; an
   upsert carrying a payload equal to the live entry's is unchanged.
   *Edge case:* §2's full ticks; and one field, not two, for the
-  failed keys, which needed one of its own.
+  stored outcomes, which needed one of its own.
 - The predecessor is the generation the change superseded. *Edge case:*
   an immutable store cleanups the superseded object by name,
   `{key}/{generation}`.
@@ -244,7 +244,7 @@ lineage:  B ← A, generation 12                    (g12 committed)
 | Unknown opaque writes | §5: a rewrite, or a key scan before a patch | yes |
 | Store move | A reset: the moved output is a new one (object-store-state.md §2) — no head, a fresh index, a whole first write, every key at a new generation; its consumers and its own inputs start over | yes |
 | Rename | Index entries, generations and object names stay | yes |
-| Failed keys retry, upstream changed | The failure record's upstream generation differs from the key's in the pinned input, so the key comes with the delta pass instead (`per-key-processing.md` §9) | yes |
+| A stored outcome's retry, upstream changed | The stored outcome's upstream generation differs from the key's in the pinned input, so the key comes with the delta pass instead (`per-key-processing.md` §9) | yes |
 
 **Breaks with the model as Erwin stated it.** One:
 

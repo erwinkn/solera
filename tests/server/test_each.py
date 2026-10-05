@@ -1,12 +1,12 @@
 """per-key incremental inputs (docs/per-key-processing.md §5–§10): one call per key, by-key
-writes, the failed keys, retry passes, forced retries, key outcomes."""
+writes, the stored outcomes, retry passes, forced retries, key outcomes."""
 
 import asyncio
 import copy
 
 import pytest
 from solera import Abort, Incremental, Rejected, Transient
-from solera.failed_keys import FAILED, REJECTED, RETRYING, Record
+from solera.key_outcomes import FAILED, REJECTED, RETRYING, StoredOutcome
 from solera.keys.io import ObjectIO
 from solera.keys.layers import LayerIndex, key_str
 from solera.sdk import Output, Project, Ref, RegistrationError, Result, Retry, asset
@@ -31,7 +31,7 @@ async def rows_of(engine, project, output, partition=""):
 async def records(engine, asset_name, partition=""):
     index = LayerIndex(ObjectIO(engine.state.objects), engine.m.index(f"@{asset_name}", partition))
     rows, _ = await index.delta(None, first=10_000)
-    return {key_str(r[0]): Record.decode(r[4]) for r in rows}
+    return {key_str(r[0]): StoredOutcome.decode(r[4]) for r in rows}
 
 
 def files_project(content, fn, *, written=None, **input):
@@ -107,7 +107,7 @@ async def test_failures_are_recorded_and_never_block(state):
     detail = await drive(engine, await engine.submit(["parse"], upstream=True))
     assert status_of(detail) == "succeeded"
     assert set(await rows_of(engine, project, "samples")) == {"good.csv"}
-    record = engine.m.partition("parse", "")["failures"]
+    record = engine.m.partition("parse", "")["outcomes"]
     assert record["counts"] == {"rejected": 1, "failed": 1, "retrying": 1}
     found = await records(engine, "parse")
     assert {k: r.outcome for k, r in found.items()} == {
@@ -134,7 +134,7 @@ async def test_failures_are_recorded_and_never_block(state):
     detail = await drive(engine, await engine.submit(["parse"], upstream=True))
     assert set(await rows_of(engine, project, "samples")) == {"good.csv", "empty.csv"}
     assert set(await records(engine, "parse")) == {"slow.csv"}
-    assert engine.m.partition("parse", "")["failures"]["counts"] == {"retrying": 1}
+    assert engine.m.partition("parse", "")["outcomes"]["counts"] == {"retrying": 1}
 
 
 async def test_removed_keys_lose_their_rows(state):
@@ -176,12 +176,12 @@ async def test_transient_key_retried_when_due(state):
     skew["seconds"] = 7200.0  # two hours on
     await drive(engine, await engine.submit(["parse"]))
     assert tries["n"] == 2 and set(await rows_of(engine, project, "samples")) == {"a"}
-    record = engine.m.partition("parse", "")["failures"]
+    record = engine.m.partition("parse", "")["outcomes"]
     assert record["counts"] == {} and record["due"] is None and record["retry"] is None
     assert record["passes"] == 1
 
 
-async def test_failed_keys_get_one_try_per_deploy(state):
+async def test_a_failed_key_gets_one_try_per_deploy(state):
     tries = {"n": 0}
 
     def parse(file: dict):
@@ -233,7 +233,7 @@ async def test_forced_retry_takes_each_key_once(state):
     assert tries["n"] == 2
     engine.retry_keys("parse", ["all"])
     await drive(engine, await engine.submit(["parse"]))
-    assert tries["n"] == 3 and engine.m.partition("parse", "")["failures"]["counts"] == {}
+    assert tries["n"] == 3 and engine.m.partition("parse", "")["outcomes"]["counts"] == {}
 
 
 async def test_abort_fails_the_attempt_and_commits_nothing(state):
@@ -257,7 +257,7 @@ async def test_abort_fails_the_attempt_and_commits_nothing(state):
     await engine.initialize()
     detail = await drive(engine, await engine.submit(["parse"], upstream=True))
     assert task_statuses(detail)["parse"] == "failed"
-    assert ("samples", "") not in engine.m.heads and "failures" not in engine.m.partition("parse", "")
+    assert ("samples", "") not in engine.m.heads and "outcomes" not in engine.m.partition("parse", "")
 
 
 async def test_concurrency_and_batches(state):
@@ -344,7 +344,7 @@ async def test_a_user_cancel_commits_finished_keys_and_leaves_the_rest_owed(tmp_
     interrupted keys are not observed (docs/observed-set.md, "Outcomes"):
     they stay owed, and the next run takes them."""
 
-    from solera.failed_keys import CANCELED
+    from solera.key_outcomes import CANCELED
     from solera_server.state import State
 
     from .remote import engine_for, until
@@ -394,7 +394,7 @@ async def test_a_user_cancel_commits_finished_keys_and_leaves_the_rest_owed(tmp_
 
 
 async def test_a_retry_pass_spans_batches_and_accumulates_its_bounds(state):
-    """Retry batches walk the failed keys `batch_size` keys at a time,
+    """Retry batches walk the stored outcomes `batch_size` keys at a time,
     alternating with change batches; the pass's accumulators become the exact
     bounds when it completes (§9)."""
 
@@ -410,7 +410,7 @@ async def test_a_retry_pass_spans_batches_and_accumulates_its_bounds(state):
     engine = make_engine(state, project)
     await engine.initialize()
     await drive(engine, await engine.submit(["parse"], upstream=True))
-    record = engine.m.partition("parse", "")["failures"]
+    record = engine.m.partition("parse", "")["outcomes"]
     assert record["counts"] == {"failed": 5} and record["deploy_min"] == engine.m.deploy_number
 
     # A deploy fixes the bug; a new file arrives at the same time.
@@ -423,7 +423,7 @@ async def test_a_retry_pass_spans_batches_and_accumulates_its_bounds(state):
     task = next(t for t in detail["tasks"] if t["asset"] == "parse")
     kinds = [a["keys"] for a in detail["attempts"][task["id"]]]
     assert sum(k.get("ok", 0) for k in kinds) == 6
-    record = engine.m.partition("parse", "")["failures"]
+    record = engine.m.partition("parse", "")["outcomes"]
     assert record["counts"] == {} and record["retry"] is None
     assert record["due"] is None and record["deploy_min"] is None  # exact once the pass completed
     assert len(await rows_of(engine, project, "samples")) == 6
@@ -456,14 +456,14 @@ async def test_the_retry_clock_runs_automated_assets(state):
     assert tries["n"] == 1
     for _ in range(1200):  # nothing upstream changes: the clock alone brings it back
         await engine.tick()
-        if tries["n"] == 2 and not engine.m.partition("parse", "")["failures"].get("counts"):
+        if tries["n"] == 2 and not engine.m.partition("parse", "")["outcomes"].get("counts"):
             break
         await asyncio.sleep(0.05)
-    assert tries["n"] == 2 and engine.m.partition("parse", "")["failures"]["counts"] == {}
+    assert tries["n"] == 2 and engine.m.partition("parse", "")["outcomes"]["counts"] == {}
 
 
 async def test_a_timeout_drain_counts_a_try_and_comes_due(tmp_path):
-    from solera.failed_keys import TIMED_OUT
+    from solera.key_outcomes import TIMED_OUT
     from solera_server.state import State
 
     from .remote import engine_for
@@ -676,41 +676,41 @@ def _failing_checks(version="1", items_store=None):
     return Project(assets=[items, checks], stores=stores)
 
 
-async def test_a_start_over_clears_the_failed_keys(state):
-    """K47 (Positions.tla): a start-over's failed keys start over. `checks`
+async def test_a_start_over_clears_the_stored_outcomes(state):
+    """K47 (Positions.tla): a start-over's stored outcomes start over. `checks`
     v1 leaves k1 failing; v2 makes a full pass due, and a keys=(k0) run is
     its first batch: k1's record goes with it, though k1 was not processed
-    again; the failure index starts a new life."""
+    again; the outcome index starts a new life."""
 
     engine = make_engine(state, _failing_checks())
     await engine.initialize()
     await drive(engine, await engine.submit(["checks"], upstream=True))
-    record = state.model.partition("checks", "")["failures"]
+    record = state.model.partition("checks", "")["outcomes"]
     assert record["counts"] == {"failed": 1}
     before = state.model.indexes[("@checks", "")]
     await engine.stop()
     engine = make_engine(state, _failing_checks(version="2"))
     await engine.initialize()
     await drive(engine, await engine.submit(["checks"], keys={"items": {"keys": ["k0"]}}))
-    assert not state.model.partition("checks", "")["failures"].get("counts"), "k1's record went"
+    assert not state.model.partition("checks", "")["outcomes"].get("counts"), "k1's record went"
     after = state.model.indexes.get(("@checks", ""))
     assert after is None or (after.life != before.life and after.count == 0)
     assert all(state.model.garbage) and any(p.startswith(before.prefix) for p, _ in state.model.garbage)
 
 
-async def test_a_reset_of_the_input_drops_the_failed_keys(state, tmp_path):
+async def test_a_reset_of_the_input_drops_the_stored_outcomes(state, tmp_path):
     """K47 (Positions.tla): `items` moves to another store, a reset of
-    `checks`' input: its failure records are against keys that are no longer
+    `checks`' input: its stored outcomes are against keys that are no longer
     the input's, and go at the deploy, before any run."""
 
     engine = make_engine(state, _failing_checks())
     await engine.initialize()
     await drive(engine, await engine.submit(["checks"], upstream=True))
-    assert state.model.partition("checks", "")["failures"]["counts"] == {"failed": 1}
+    assert state.model.partition("checks", "")["outcomes"]["counts"] == {"failed": 1}
     await engine.stop()
     engine = make_engine(state, _failing_checks(items_store="b"))
     await engine.initialize()
-    assert "failures" not in state.model.partition("checks", "")
+    assert "outcomes" not in state.model.partition("checks", "")
     assert ("@checks", "") not in state.model.indexes
 
 
@@ -838,4 +838,4 @@ async def test_a_forced_retry_runs_after_its_source_reverts(state, tmp_path):
     engine.retry_keys("checks", ["rejected"])
     await drive(engine, await engine.submit(["checks"]))
     assert calls == ["k1"]
-    assert not engine.m.partition("checks", "")["failures"]["counts"]
+    assert not engine.m.partition("checks", "")["outcomes"]["counts"]

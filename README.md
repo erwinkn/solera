@@ -77,7 +77,7 @@ The default project is designed to make every architecture feature visible:
 | `upload_drop` | a sensor on `Every(15)` committing to `uploads`: a new upload a minute, three at most — its tick history shows committed and skipped ticks |
 | `site_feed` | per-site cursor asset on `Every(10)`: `site_events` (unkeyed incremental) + `site_files` (keyed inventory), `Patch` both ways |
 | `file_index` | `Incremental(batch_size=2)` consumer — watch `more` continuation; declared `version="2"` |
-| `file_checks` | a per-key input: one call per changed file, four at a time; the fourth file is rejected on odd feed ticks (the failed keys), and `exclude={"drafts": "*-file-2"}` leaves the third out |
+| `file_checks` | a per-key input: one call per changed file, four at a time; the fourth file is rejected on odd feed ticks (a stored outcome), and `exclude={"drafts": "*-file-2"}` leaves the third out |
 | `site_digest` | `site × day` two-dimensional asset (`TimePartitions`), `deps=` on the `roadmap` source, a `bytes` output (pickled by FileStore) |
 | `fleet_index` | whole-input fan-in: `dict[str, list[dict]]` on FileStore, `dict[str, TableRef]` on Postgres |
 | `site_status` | `Sql` asset over a `TableRef` (Postgres); on FileStore it logs that it skipped |

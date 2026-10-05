@@ -28,7 +28,7 @@ worker's first report.
 
 Its companions: `resolved-commits.md` (the resolver on this channel, and
 the write phases of a keyed output), `per-key-processing.md` (batches,
-failed keys, sensors' sources).
+stored outcomes, sensors' sources).
 
 **This doc is the authority for four records the others use:** the cancel
 record (§2.2), write-completion evidence (§2.3), the sensor snapshot
@@ -136,7 +136,7 @@ What the engine decided to stop, latched, and what the worker acts on:
   a drain result is no longer accepted). It only advances.
 - `reason`: `user` (an explicit cancel of the run), `timeout` (the
   attempt's timeout) or `provisioning` (no first report in time; no worker
-  is running, so there is nothing to drain). The failed keys records
+  is running, so there is nothing to drain). The stored outcomes
   interrupted keys by it (`per-key-processing.md` §5): `user` keys are
   dormant, `timeout` keys count a try and come due.
 - **Precedence**: `user` over `timeout` over `provisioning`. A user cancel
@@ -147,7 +147,7 @@ What the engine decided to stop, latched, and what the worker acts on:
 - **Pass**: every beat answer carries the current record (or `null`);
   the worker latches the strongest it has seen (§5.3).
 - **In the result**: the worker copies the record it sealed with into
-  its result. That record decides how its failure delta treats interrupted
+  its result. That record decides how its outcome delta treats interrupted
   keys; a reason latched after the worker sealed does not rewrite it. The
   engine accepts a `canceled` result while the phase is `requested`, and
   refuses it once `forced`.
@@ -379,7 +379,7 @@ the new life off it, so two attempts never own one partition's files
 when it changes, why one is held (`TasksHeld`, shown as "held: reason
 (name)"): `claim` (another attempt holds its partition: one of the
 current life, or an earlier life's not yet ended), `concurrency` (its asset's `concurrency=` partitions are
-claimed), `merges` (a key index it writes — an output's, or a per-key asset's failure index — is too far behind on merges),
+claimed), `merges` (a key index it writes — an output's, or a per-key asset's outcome index — is too far behind on merges),
 `engine` (the engine's own slots are full), `executor` (its executor's
 limit), `invalid` (its placement cannot be built).
 
@@ -613,7 +613,7 @@ happens to the work left undone.
    - work that finished is written and published — for a per-key batch, the
      finished keys' outputs plus the interrupted holes in its failure
      index — as one result with `status: canceled`, which the engine
-     commits as one journal decision (outputs, failure delta, position
+     commits as one journal decision (outputs, outcome delta, position
      past the whole batch);
    - a plain asset that had not reached its writes publishes `canceled`
      with no outputs and `write: none`; one that had taken the gate

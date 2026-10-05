@@ -499,7 +499,7 @@ def test_a_rename_moves_a_scopes_record_whole():
         "cursor": "c1",
         "last": {"outcome": "failed", "run": "r", "attempt": "a", "at": 1.0},
         "observed": {"feed": seen, "gone": {**seen, "upstream": ["elsewhere", ""]}},
-        "failures": {"commit_number": 0, "forced": {}, "counts": {"failed": 1}},
+        "outcomes": {"commit_number": 0, "forced": {}, "counts": {"failed": 1}},
     }
     m = Model()
     m.partitions[("old", "x")] = copy.deepcopy(whole)

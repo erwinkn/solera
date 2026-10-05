@@ -1,13 +1,13 @@
-"""The failure record, its transitions and eligibility (docs/per-key-processing.md §9)."""
+"""The stored outcome, its transitions and eligibility (docs/per-key-processing.md §9)."""
 
-from solera.failed_keys import (
+from solera.key_outcomes import (
     CANCELED,
     FAILED,
     REJECTED,
     RETRYING,
     TIMED_OUT,
     Outcome,
-    Record,
+    StoredOutcome,
     eligible,
     lower,
     minima,
@@ -27,8 +27,8 @@ def step(prior, kind, now=1000, deploy=3, forced=0, retries=2, upstream=11, **kw
 
 
 def test_record_round_trips_and_clips_its_message():
-    r = Record(FAILED, 300, 7, 4031, 10, 20, 0, 0, 1 << 40, "é" * 300)
-    back = Record.decode(r.encode())
+    r = StoredOutcome(FAILED, 300, 7, 4031, 10, 20, 0, 0, 1 << 40, "é" * 300)
+    back = StoredOutcome.decode(r.encode())
     assert back.tries == 300 and back.forced == 4031 and back.upstream == 1 << 40
     assert len(back.message.encode()) <= 200 and back.message == "é" * 100
 

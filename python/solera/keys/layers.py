@@ -311,7 +311,7 @@ class LayerState:
     def committed(self, commit: int, delta: DeltaFiles) -> LayerState:
         """Install a commit's delta as the layer `[head + 1, c]`: the commits
         between changed nothing in it (an index that skips commits, as a
-        failure index does). Generations rise with commits: one that does
+        outcome index does). Generations rise with commits: one that does
         not is a writer's error, refused."""
 
         if commit <= self.head:
@@ -355,7 +355,7 @@ class LayerState:
     def backlogged(self) -> bool:
         """Upkeep is behind (failing, or slower than commits): the layers pile
         up. Commits to the partition then wait, from every writer of the
-        index (outputs, sources, failure indexes alike)."""
+        index (outputs, sources, outcome indexes alike)."""
 
         return len(self.layers) > MAX_LAYERS
 
