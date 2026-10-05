@@ -249,7 +249,7 @@ class LayerState:
 
     prefix: str = ""
     life: str = ""
-    count: int = 0
+    count: int | None = 0  # live keys at the head; None in a state cut back before it (`at`)
     cut: int = -1
     layers: tuple[Layer, ...] = ()
     generation: int = 0  # the newest commit's
@@ -293,7 +293,9 @@ class LayerState:
 
     def at(self, h: int | None) -> LayerState:
         """The state as of commit `h` (None: the head): the layers up to one
-        ending at `h`. Raises `NotHeld` if a layer reaches past `h`."""
+        ending at `h`, for reads. Raises `NotHeld` if a layer reaches past `h`.
+        Its `count` is None: the live count at `h` is not kept, and the
+        head's is not its."""
 
         if h is None or h == self.head:
             return self
@@ -301,7 +303,7 @@ class LayerState:
             raise NotHeld(f"commit {h} is past the head {self.head}")
         for i, x in enumerate(self.layers):
             if x.b == h:
-                return replace(self, layers=self.layers[: i + 1])
+                return replace(self, layers=self.layers[: i + 1], count=None)
         raise NotHeld(f"no layer ends at commit {h}: read the state a batch pinned at it")
 
     # -- transitions (pure) ------------------------------------------------------------------

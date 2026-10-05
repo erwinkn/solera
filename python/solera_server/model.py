@@ -119,13 +119,6 @@ def _renumbered(entries: list[dict]) -> list[dict]:
     return out
 
 
-def _queues(cleaning: list[dict]) -> dict:
-    """Two names' cleanup cursors as one partition's: both queues, in commit order."""
-
-    queue = sorted((d for c in cleaning for d in c["queue"]), key=lambda d: d["n"])
-    return {"cursor": cleaning[-1]["cursor"], "queue": queue}
-
-
 def commit_of(head: dict | None) -> tuple | None:
     """What identifies the commit that installed a head — not the figures
     upkeep corrects on it: whether a writer came in
@@ -231,11 +224,11 @@ class Model:
         # event counter that let go of it: for the partition's next attempt to clean up
         # once no reader pins it (docs/lifecycle.md §9.8)
         self.cleanups: dict[tuple, list] = _flatten(snap.get("cleanups"), 2)
-        # (output, partition) -> an immutable keyed output's cleanup cursor: `cursor`,
-        # the last commit cleaned, and `queue`, the deltas committed since that name
-        # what they replaced, in commit order, each kept until a cleanup step walks
-        # past it (docs/lifecycle.md §9.8)
-        self.cleaning: dict[tuple, dict] = _flatten(snap.get("cleaning"), 2)
+        # (output, partition) -> an immutable keyed output's cleanup queue: the deltas
+        # committed and not yet cleaned that name what they replaced, in commit order,
+        # each kept until a cleanup step walks past it. Its front is the cleanup
+        # cursor (docs/lifecycle.md §9.8)
+        self.cleaning: dict[tuple, list] = _flatten(snap.get("cleaning"), 2)
         # Output lives removed or moved away, whose data a cleanup task deletes (K25):
         # id -> where it was, what it was, and when it may go.
         self.retired: dict[str, dict] = dict(snap.get("retired") or {})
@@ -879,12 +872,7 @@ class Model:
         move(self.indexes, {f"@{old}": f"@{new}" for old, new in asset_map.items()}, 0)
         move(self.repairs, output_map, 0, merge=list)
         move(self.cleanups, output_map, 0, merge=_renumbered)
-        for key in [k for k in self.cleaning if k[0] in output_map]:  # both names' queues are owed
-            target = (output_map[key[0]], *key[1:])
-            moved = self.cleaning.pop(key)
-            self.cleaning[target] = (
-                _queues([self.cleaning[target], moved]) if target in self.cleaning else moved
-            )
+        move(self.cleaning, output_map, 0, merge=lambda q: sorted(q, key=lambda d: d["n"]))
         for head in self.heads.values():
             if head.get("asset") in asset_map:
                 head["asset"] = asset_map[head["asset"]]
@@ -1428,7 +1416,7 @@ class Model:
         its spec — a step acknowledged by another meanwhile is still being
         read — even once the index lets go of them."""
 
-        pending = _delta_files(d for c in self.cleaning.values() for d in c["queue"])
+        pending = _delta_files(d for queue in self.cleaning.values() for d in queue)
         return pending.union(*(claim.get("cleanups") or () for claim in self.claims.values()))
 
     def _collect(self, output: str, partition: str, entry: dict) -> None:
@@ -1451,8 +1439,7 @@ class Model:
         delta = DeltaFiles.from_json(keys) if keys else None
         if delta is not None and delta.part.entries > delta.added:  # an update or a remove
             index = self.index(output, partition)
-            cleaning = self.cleaning.setdefault((output, partition), {"cursor": None, "queue": []})
-            cleaning["queue"].append(
+            self.cleaning.setdefault((output, partition), []).append(
                 {
                     "n": self.event_counter,
                     "life": index.life,
@@ -1521,13 +1508,11 @@ class Model:
         for output, done in (e.get("cleaned_up") or {}).items():
             self._drop_cleanups(output, partition, done)
         for output, to in (e.get("cleaned_to") or {}).items():  # a step: the cursor moves past `to`
-            cleaning = self.cleaning.get((output, partition))
-            if cleaning is None:
-                continue
-            passed = [d for d in cleaning["queue"] if d["n"] <= int(to)]
-            if passed:
-                cleaning["cursor"] = passed[-1]["commit"]
-            cleaning["queue"] = [d for d in cleaning["queue"] if d["n"] > int(to)]
+            left = [d for d in self.cleaning.get((output, partition), []) if d["n"] > int(to)]
+            if left:
+                self.cleaning[(output, partition)] = left
+            else:
+                self.cleaning.pop((output, partition), None)
         for output, missed in (e.get("cleanup_unresolved") or {}).items():
             for d in self.cleanups.get((output, partition), []):
                 if d["id"] in missed:

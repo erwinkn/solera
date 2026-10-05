@@ -994,10 +994,10 @@ still need it. The pins, all by event counter (`object-store-state.md`
 shows.
 
 - **Superseded versions, named at resolution, by a cursor (D168).** Each
-  immutable keyed output partition keeps one **cleanup cursor**: the last
-  commit cleaned, and the queue of deltas committed since whose updates or
-  removes name what they replaced (`Model.cleaning`, journaled with the
-  commits). A **step** takes the longest prefix of the queue no reader can
+  immutable keyed output partition keeps one **cleanup queue**: the deltas
+  committed and not yet cleaned whose updates or removes name what they
+  replaced, in commit order (`Model.cleaning`, journaled with the commits).
+  Its front is the **cleanup cursor**; nothing else is stored. A **step** takes the longest prefix of the queue no reader can
   still need — each delta committed before the oldest reader pin, and at
   or before the oldest commit an observation holds (a reader at commit P
   reads what was live at P: what a commit after P replaced is still its)

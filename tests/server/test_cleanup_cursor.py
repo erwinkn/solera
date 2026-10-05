@@ -88,12 +88,10 @@ async def items(tmp_path, data):
     await state.close()
 
 
-def cursor(state):
-    return (state.model.cleaning.get(KEY) or {}).get("cursor")
-
-
 def queued(state):
-    return [d["commit"] for d in (state.model.cleaning.get(KEY) or {}).get("queue") or ()]
+    """The commits of the queued deltas: the cleanup cursor stands before the first."""
+
+    return [d["commit"] for d in state.model.cleaning.get(KEY) or ()]
 
 
 async def test_superseded_generations_go_once_no_pin_needs_them(items, data):
@@ -105,7 +103,7 @@ async def test_superseded_generations_go_once_no_pin_needs_them(items, data):
         assert queued(state) == [1]
     await steps(engine)
     assert generations(data) == {"a": {g2}, "b": {g1}}
-    assert cursor(state) == 1 and queued(state) == []
+    assert queued(state) == []
 
 
 async def test_an_observation_holds_the_cursor_back(items, data, monkeypatch):
@@ -117,13 +115,13 @@ async def test_an_observation_holds_the_cursor_back(items, data, monkeypatch):
     g3 = await commit({"a": 3})
     await steps(engine)
     assert generations(data)["a"] == {g1, g2, g3}  # a reader at commit 0 reads g1
-    assert cursor(state) is None and queued(state) == [1, 2]
+    assert queued(state) == [1, 2]  # the cursor stays at the observed commit
     observed["at"] = 1  # the reader moved to commit 1: what commit 1 replaced is no one's
     await steps(engine)
-    assert generations(data)["a"] == {g2, g3} and cursor(state) == 1 and queued(state) == [2]
+    assert generations(data)["a"] == {g2, g3} and queued(state) == [2]
     observed["at"] = None
     await steps(engine)
-    assert generations(data)["a"] == {g3} and cursor(state) == 2
+    assert generations(data)["a"] == {g3} and queued(state) == []
 
 
 async def test_a_removed_keys_object_goes_and_a_later_re_add_stays(items, data, monkeypatch):
@@ -136,7 +134,7 @@ async def test_a_removed_keys_object_goes_and_a_later_re_add_stays(items, data, 
     g3 = await commit({"a": 9})  # commit 2: an add, which names nothing
     await steps(engine)
     assert generations(data) == {"a": {g3}, "b": {g1}}  # the removed object went; the re-add stays
-    assert cursor(state) == 1 and queued(state) == []
+    assert queued(state) == []
 
 
 async def test_a_lost_acknowledgement_replays_the_step(items, data, monkeypatch):
@@ -161,7 +159,7 @@ async def test_a_lost_acknowledgement_replays_the_step(items, data, monkeypatch)
     monkeypatch.setattr(worker, "_cleanup_due", crashing)
     await steps(engine)  # the step stays due, so it is handed again
     assert len(calls) == 2 and "cleaned_to" not in calls[0] and "items" in calls[1]["cleaned_to"]
-    assert generations(data)["a"] == {g2} and cursor(state) == 1 and queued(state) == []
+    assert generations(data)["a"] == {g2} and queued(state) == []
 
 
 async def test_a_delta_is_kept_until_the_cursor_passes_it(items, data, monkeypatch):
@@ -176,7 +174,7 @@ async def test_a_delta_is_kept_until_the_cursor_passes_it(items, data, monkeypat
     await commit({"a": 1, "b": 1})
     for i in range(12):
         await commit({"a": i + 2})
-    queue = state.model.cleaning[KEY]["queue"]
+    queue = state.model.cleaning[KEY]
     first = f"{queue[0]['prefix']}{queue[0]['files'][0]}"
     observed["at"] = None  # merges may now drop flips: the cut goes to the head
     for _ in range(50):
@@ -219,7 +217,7 @@ async def test_a_burst_of_commits_makes_few_cleanup_tasks(items, data):
     engine._cleanup_job()
     assert len(made) == 2  # one task for all that waited
     await steps(engine)
-    assert queued(state) == [] and cursor(state) == state.model.heads[KEY]["commit_number"]
+    assert queued(state) == []
     assert generations(data)["a"] == {state.model.heads[KEY]["ref"]["generation"]}
 
     with state.model.reading(state.model.indexes[KEY].prefix):  # no step due: deltas pile up

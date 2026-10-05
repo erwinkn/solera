@@ -240,6 +240,7 @@ async def test_a_reading_at_an_unheld_h_is_refused():
     assert h.state.at(7).head == 7 and h.state.at(4).head == 4
     with pytest.raises(L.NotHeld):
         h.state.at(2)  # inside the merged layer [1, 4]
+    assert h.state.at(4).count is None and h.state.at(None).count == len(h.fold[-1])  # not the head's
 
 
 async def test_a_replaced_change_names_the_generation_it_replaced():

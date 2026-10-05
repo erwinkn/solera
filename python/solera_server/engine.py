@@ -739,7 +739,7 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
 
         now = self.clock()
         for key in partitions:
-            queued = len((self.m.cleaning.get(key) or {}).get("queue") or ())
+            queued = len(self.m.cleaning.get(key) or ())
             if now < self._cleanup_at.get(key, -math.inf) + self.cleanup_coalesce and queued < CLEANUPS:
                 self._cleanup_waiting.add(key)
             elif self._submit_cleanups([key]):
@@ -1437,14 +1437,14 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
         theirs). At most `CLEANUPS` deltas; `to`, the last one's event counter,
         is where the cursor moves once its deletes are done. None: none due."""
 
-        cleaning = self.m.cleaning.get((output, partition))
-        if not cleaning or not cleaning["queue"]:
+        queue = self.m.cleaning.get((output, partition))
+        if not queue:
             return None
         floor = self.m.pin_floor(but=attempt, path=self.m.index(output, partition).prefix)
         life = self.m.index(output, partition).life
         oldest = self.m.oldest_observed(output, partition)
         due = []
-        for d in cleaning["queue"][:CLEANUPS]:
+        for d in queue[:CLEANUPS]:
             if d["n"] > floor or (d["life"] == life and oldest is not None and d["commit"] > oldest):
                 break
             due.append(d)
