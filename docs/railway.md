@@ -51,3 +51,26 @@ The dedicated `data-orchestrator-s3-test` Railway project was created and the ap
 The failed `orchestrator-s3-test` service was deleted on September 26, 2026; no bucket was ever provisioned. Its removal had sat staged since this attempt: Railway requires two-factor verification to commit staged destructive changes, which API tokens cannot provide. Delete services directly through the API instead of staging their removal.
 
 For a future new Railway bucket, inspect its actual addressing mode: new buckets may use virtual-hosted style, requiring `AWS_VIRTUAL_HOSTED_STYLE_REQUEST=true`. Do not assume path-style compatibility or substitute a filesystem deployment for a provider test.
+
+## Validation — October 5, 2026
+
+**Result: pass.** `solera selftest` passed against a real Railway Storage Bucket (Tigris-backed, `https://t3.storageapi.dev`, region `auto`, created in `sjc`). All four checks passed:
+
+- create-if-absent writes are enforced (a second `If-None-Match: *` create is refused);
+- key index files write and read back by range;
+- manifest registration and control-plane initialization;
+- state restores from the object store, and a new writer fences the old one (the old writer logs `journal stopped: another engine wrote the journal`).
+
+The run took 3.7 s. The deployment then served normally (`solera serve` under uvicorn, sensor requests answered 200).
+
+**How it was run.** The scratch project `solera-cas-probe-2026-10-05` held one bucket and one service built from `erwinkn/solera` `main` through `railway.toml`. The service got its variables as in the table above, with the credentials as Railway reference variables (`${{probe-bucket.ACCESS_KEY_ID}}`, `${{probe-bucket.SECRET_ACCESS_KEY}}`) and `SOLERA_SELFTEST=1`. The probe ran inside Railway: `solera serve` runs `solera selftest` before it starts the API.
+
+**Lesson: run the probe inside Railway.** Bucket credentials are redacted for OAuth apps. `get_bucket_credentials` returns the endpoint, bucket name, region and URL style but `valuesRedacted: true`, with no access key or secret, so the probe can't run from outside with them. `reset_bucket_credentials` needs interactive user approval. The reference variables resolve at runtime on a service in the same project, so no secret leaves Railway.
+
+**Addressing style.** The bucket reports `urlStyle: virtual-host`, so `AWS_VIRTUAL_HOSTED_STYLE_REQUEST=true` is required. With it, the engine's object store expects the bucket in the endpoint host, not as a path segment. With `AWS_ENDPOINT=https://t3.storageapi.dev` the first deployment's probe failed: the request went to `https://t3.storageapi.dev/<prefix>/...`, and Tigris read the first path segment as the bucket and answered `404 NoSuchBucket`. That was a configuration error, not a provider fault. With `AWS_ENDPOINT=https://<bucket name>.t3.storageapi.dev` the probe passed. Use the bucket's own host as the endpoint. The `ENDPOINT` reference alone isn't enough: it gives the bare `t3.storageapi.dev`, so build the host from the `BUCKET` reference. Path-style was not tried.
+
+**Caveats.**
+- `solera selftest` reports checks, not raw HTTP statuses. A pass shows the provider enforces `If-None-Match: *` and that compare-and-swap fenced a stale writer. It does not print the 412 status itself. `bench/railway/probe.py` reports statuses, but it was not run here.
+- Bucket creation was `APPLYING` at first and `live` within a poll or two (seconds). `describe_environment` was the signal to trust, not the create call's response.
+- The first deployment, whose probe failed, still showed `SUCCESS` in `list_deployments`; read the deploy logs, not the status.
+- Cleanup: the service and the bucket (with its `probe-*` objects) were deleted through the API, and `describe_environment` then listed no services, buckets or volumes. The gateway has no project delete, so the empty project must be deleted by hand in the Railway UI.
