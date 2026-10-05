@@ -214,7 +214,7 @@ class Model:
         # deleted runs whose directories are still to be deleted (§11)
         self.deleted: list[str] = snap.get("deleted") or []
         # (asset, partition) -> the partition's record (§5): its `cursor`; `last`, its last
-        # terminal outcome; `caught_up`, whether its last commit finished its walk;
+        # terminal outcome;
         # `observed` {input: what it observed — a keyed input's observation record, an
         # unkeyed one's last commit read}; the `definition` they were observed under;
         # and a per-key asset's `failures` record
@@ -238,8 +238,8 @@ class Model:
         # under an earlier one commits nothing of it.
         self.reset_at: dict[tuple, int] = _flatten(snap.get("reset_at"), 2)
         # asset -> the event counter of its last change: added (again), renamed,
-        # its declaration changed, or reset. A partition caught up before it is
-        # stale (`stale`), and the deploy owes its OnChange automations a firing.
+        # its declaration changed, or reset: the deploy owes its OnChange
+        # automations a firing.
         self.changed_at: dict[str, int] = snap.get("changed_at") or {}
         self.automations: dict[str, dict] = snap.get("automations") or {}
         # sensor -> {cursor, accepted}: the last tick that changed something (docs/lifecycle.md §11.4)
@@ -375,6 +375,24 @@ class Model:
         """An asset partition's record, empty where it has none: to read."""
 
         return self.partitions.get((asset, partition)) or {}
+
+    def complete(self, asset: str, partition: str) -> bool:
+        """Whether a partition's content is complete — derived, never stored:
+        it has committed, and what each incremental input observed is
+        complete (`observed.complete`: no key decodes from the empty base).
+        Fan-ins, skipped missing inputs, the `missing` status and the
+        history's `materialized` read it."""
+
+        record = self.partition(asset, partition)
+        if "definition" not in record:
+            return False
+        inputs = ((self.manifest or {}).get("assets") or {}).get(asset, {}).get("inputs") or {}
+        records = record.get("observed") or {}
+        return all(
+            param in records and observed.complete(records[param])
+            for param, spec in inputs.items()
+            if spec.get("kind") == "incremental"
+        )
 
     def _partition(self, asset: str, partition: str) -> dict:
         """An asset partition's record, to change: made if it has none."""
@@ -821,7 +839,7 @@ class Model:
                 del self.partitions[key]
                 continue
             if key[0] in producers:  # a new life: never built, so missing, not stale
-                for field in ("caught_up", "observed", "definition", "config", "context"):
+                for field in ("observed", "definition", "config", "context"):
                     self.partitions[key].pop(field, None)
             # What an input observed of a reset upstream stays, its next run a full run: a
             # keyed record's layers name the upstream's earlier life; an unkeyed one is marked.
@@ -1182,9 +1200,6 @@ class Model:
                 for intent in self.repairs.pop((name, partition), ()):
                     self.garbage.extend([index.path(f["name"]), self.event_counter] for f in intent["files"])
         record = self._partition(asset, partition)
-        record.setdefault("caught_up", False)  # built, though maybe not caught up (a keys= run)
-        if "caught_up" in commit:
-            record["caught_up"] = bool(commit["caught_up"])
         for field in ("definition", "config", "context"):  # what it was made under: staleness compares
             if field in commit:
                 record[field] = commit[field]
@@ -1229,7 +1244,7 @@ class Model:
                     keys=(commit.get("keys") or {}).get(name),
                     rows=(commit.get("rows") or {}).get(name),
                     metadata=(commit.get("metadata") or {}).get(name),
-                    materialized=commit.get("caught_up", True),
+                    materialized=self.complete(asset, partition),
                 ),
             )
             for row in history.lineage(name, partition, head, reads):

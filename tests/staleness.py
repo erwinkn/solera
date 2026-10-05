@@ -53,7 +53,7 @@ async def stale_keys(engine, asset: str, partition: str = "") -> set[str] | None
         page = await engine.stale_keys(asset, partition, after=after)
         if not page.get("tracked", True):
             return None
-        keys.update(page["keys"])
+        keys.update(k["key"] for k in page["keys"])
         after = page.get("next")
         if after is None:
             return keys
@@ -111,6 +111,7 @@ class EachAsset:
     changed_at: int = 0  # its asset's last change
     made: int = 0
     reset: bool = False
+    whole: bool = False  # no key decodes from the empty base: complete
 
 
 @dataclass
@@ -126,6 +127,7 @@ class ByPartition:
     changed_at: int = 0
     made: int = 0
     reset: bool = False
+    whole: bool = False
 
 
 class Reference:
@@ -225,10 +227,10 @@ class Reference:
         o = self.checks if name == "checks" else self.others[name]
         start_over = self._full(o)
         if start_over:
-            if name == "checks":
-                o.seen = dict.fromkeys(o.seen, (None, None))
-            else:
-                o.seen, o.keys = {}, set()
+            if name == "checks":  # what it holds, its base: complete
+                o.seen, o.whole = dict.fromkeys(o.seen, (None, None)), True
+            else:  # from nothing: no key covered yet
+                o.seen, o.keys, o.whole = {}, set(), False
         written, delivered = set(), set()
         for k in keys:
             held = k in o.seen
@@ -257,6 +259,7 @@ class Reference:
                 o.seen = dict.fromkeys(o.seen, (None, None))
             else:
                 o.seen, o.keys = {}, set()
+        o.whole = True  # its walk covers every key
         owed = self._owed(o, name)
         for k in owed:
             if k in self.up and o.takes(k):
@@ -364,6 +367,15 @@ class Reference:
 
     def stale(self, name: str) -> bool:
         return bool(self.reasons(name))
+
+    def complete(self, name: str) -> bool:
+        """Whether a consumer's content is complete: built, and no key decodes
+        from the empty base — a default run walked every key since its
+        last start-over from nothing; a per-key consumer's start-over keeps
+        what it holds as its base."""
+
+        o = self.checks if name == "checks" else self.others[name]
+        return o.built and o.whole
 
 
 class Holdings:

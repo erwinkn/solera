@@ -124,6 +124,7 @@ class Staleness(RuleBasedStateMachine):
         self.outside = External()
         self.decl = {"items_store": "a", "checks_store": "a", "checks_v": "1", "copy_v": "1", "count_v": "1"}
         self.serial = 0
+        self.seen: dict[str, int] = {}  # each output's newest commit in the history, checked
 
     def _run(self, coro):
         return self.loop.run_until_complete(coro)
@@ -306,6 +307,15 @@ class Staleness(RuleBasedStateMachine):
                 assert await staleness.asset_stale(e, name) == want, f"{name}: asset stale != {want}"
                 why = await staleness.stale_reasons(e, name)
                 assert why == ref.reasons(name), f"{name}: stale for {why}, not {ref.reasons(name)}"
+            for name in ("checks", "copy", "count"):  # complete, derived; and the history agrees
+                assert e.m.complete(name, "") == ref.complete(name), (
+                    f"{name}: complete != {ref.complete(name)}"
+                )
+                rows = (await e.history.commits(outputs=[name]))["commits"]
+                newest = rows[0] if rows else None
+                if newest is not None and newest["generation"] != self.seen.get(name):
+                    self.seen[name] = newest["generation"]
+                    assert newest["materialized"] == ref.complete(name), f"{name}'s history: {newest}"
 
         self._run(check())
 
@@ -515,6 +525,30 @@ async def _built(state, tmp_path, keys, **decl):
     await boot(engine, outside, keys)
     await drive(engine, await engine.submit(["checks", "copy", "count"]))
     return engine, outside
+
+
+async def test_a_stale_keys_reasons_are_its_own_and_name_their_input(state, tmp_path):
+    """Console contract (c): `checks` (each=True over `items`, its input
+    `item`). k1 changes: the key `item` owes says so, naming its input.
+    `checks`' definition changes: every key is stale, but the
+    partition-wide reason is on the partition alone — k2, stale only for
+    it, lists none, and k1 keeps its own."""
+
+    engine, outside = await _built(state, tmp_path, {"k1": "1", "k2": "1"})
+    await _change(engine, outside, upserts=["k1"])
+    page = await engine.stale_keys("checks")
+    assert page["keys"] == [{"key": "k1", "reasons": [{"kind": staleness.INPUT, "input": "item"}]}]
+    assert page["reasons"] == [staleness.INPUT]
+    await engine.stop()
+    engine = make_engine(state, project(tmp_path, outside, checks_v="2"))
+    await engine.initialize()
+    page = await engine.stale_keys("checks")
+    assert page["keys"] == [
+        {"key": "k1", "reasons": [{"kind": staleness.INPUT, "input": "item"}]},
+        {"key": "k2", "reasons": []},
+    ]
+    assert page["reasons"] == [staleness.INPUT, staleness.DEFINITION]
+    await engine.stop()
 
 
 async def test_keys_runs_after_an_upstream_reset_merge_and_together_catch_up(state, tmp_path):

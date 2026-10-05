@@ -386,8 +386,8 @@ class Views:
         - `absent`: the upstream does not hold it, and nothing shows it did;
         - `ok`: processed at the upstream key's current generation — its
           newest `ok`, `removed` or `unmatched` row is an `ok` at it, or the
-          input is caught up (a row expires with its run, and a plain
-          Incremental input records none);
+          input owes nothing for it (a row expires with its run, and a
+          plain Incremental input records none);
         - `pending`: the upstream holds a write of it the input has not
           delivered yet.
 

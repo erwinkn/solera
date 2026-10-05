@@ -194,7 +194,7 @@ def test_an_empty_fan_in_is_missing():
             lambda o, s: heads.get((o, s)),
             lambda o: [(s, h) for (out, s), h in heads.items() if out == o],
             now,
-            caught_up=lambda a, s: drained.get((a, s), False),
+            complete=lambda a, s: drained.get((a, s), False),
         )
         run = planner.plan_run([target], partitions="all", **kw)
         return (

@@ -63,6 +63,29 @@ def _context(rec: dict, versions: dict) -> str:
     return cid
 
 
+def complete(rec: dict) -> bool:
+    """Whether what an input observed is complete: no key decodes from the
+    empty base — the base is a commit, or a per-key consumer's held keys,
+    or the ranges tile the key space from the first key to the last. A
+    first or full run is not complete before its walk has covered every
+    key; an incremental run canceled midway is, and stale. An unkeyed
+    input's record — the last commit it read — always is."""
+
+    if "commit" in rec:
+        return True
+    base = rec["base"]
+    if base["endpoint"] is not None or base.get("held"):
+        return True
+    edge = None
+    for r in rec["ranges"]:
+        if r["lo"] != edge:
+            return False
+        edge = r["hi"]
+        if edge is None:
+            return True
+    return False
+
+
 def lives(rec: dict) -> set[str]:
     """The upstream lives a record's layers were observed in: one, unless an
     upstream reset left it naming an earlier life (a full run is due)."""

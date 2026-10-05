@@ -169,6 +169,17 @@ is no `full`. A run given `"all"` covers the same key ranges and loads
 every key in them; one given an explicit list loads those keys and writes
 points.
 
+**Complete.** A partition is complete when no key decodes from the
+empty base: its base is a commit (or, in a per-key consumer's full run,
+what it holds), or its ranges tile the key space from the first key to
+the last. Derived from `R`, never stored. A first or full run is not
+complete before its walk has covered every key; an incremental run
+cancelled midway still has a commit base: complete, and stale. An unkeyed
+input's record, the last commit it read, always is — a prefix of an
+append log is the upstream as of that commit. Fan-ins read complete
+heads, a partition that is not complete shows `missing`, and the
+history's `materialized` column is the same rule after each commit.
+
 A cancelled or failed run leaves its committed batches' ranges and
 points. The next run compares again: keys under those ranges decode at
 their heads, so the unchanged ones are not owed. No plan, pass or scan pin
@@ -573,8 +584,8 @@ pin, `next`); the engine's keyed and unkeyed pass planning
 (`_incremental_plan`); `held_at`, `walked`, `read_from`; `pattern_change`
 and the `diff` mode; the read-ahead (`_read_ahead`, `_read_ahead_of`,
 `READ_AHEAD_FULL` and the cap, read-ahead run retention); `_dep_restart`
-and `_snapshot_read`; `seen`, `caught_up_at`, `built_at` and
-`input_reset_at`; most of `staleness.py`; the per-key reconcile; the
+and `_snapshot_read`; `caught_up` (now `complete`, derived from `R`),
+`seen`, `caught_up_at`, `built_at` and `input_reset_at`; most of `staleness.py`; the per-key reconcile; the
 worker's index reads for a batch (`read_batch`, the retry walk, the
 failure lookups — the engine plans every batch and the spec carries its
 keys, classes, old observations and prior failure records); the

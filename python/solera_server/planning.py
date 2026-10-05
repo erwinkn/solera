@@ -237,11 +237,11 @@ class Planner:
         heads_of: Callable[[str], Iterable[tuple[str, dict]]],
         now: float,
         projected: Mapping[tuple[str, str], dict] | None = None,
-        caught_up: Callable[[str, str], bool] = lambda asset, partition: False,
+        complete: Callable[[str, str], bool] = lambda asset, partition: False,
     ):
         self.manifest, self.now = manifest, now
         self.projected = dict(projected or {})
-        self._head, self._heads_of, self._caught_up = head, heads_of, caught_up
+        self._head, self._heads_of, self._complete = head, heads_of, complete
         self.time = dt.datetime.fromtimestamp(now, dt.UTC)
         self._groups: dict[tuple, dict] = {}
 
@@ -258,28 +258,29 @@ class Planner:
         heads.update({partition: h for (o, partition), h in self.projected.items() if o == output})
         return heads
 
-    def caught_up(self, asset: str, partition: str) -> bool:
-        """Whether the partition's last commit finished its pass."""
+    def complete(self, asset: str, partition: str) -> bool:
+        """Whether the partition's last commit ended its run's walk."""
 
-        return self._caught_up(asset, partition)
+        return self._complete(asset, partition)
 
     def materialized(self, asset: str, partition: str) -> bool:
         """Whether a partition is complete (§7): each of its outputs has a head,
-        and its pass drained — however many of them its last batches wrote.
+        and its last commit ended its run's walk — however many of them its
+        last batches wrote.
         A job, which has no output, once a run of it succeeded. The one answer
         for selection, fan-in and the views."""
 
         outputs = self.manifest["assets"][asset]["outputs"]
-        return all(self.head(o["name"], partition) is not None for o in outputs) and self.caught_up(
+        return all(self.head(o["name"], partition) is not None for o in outputs) and self.complete(
             asset, partition
         )
 
     def head_materialized(self, output: str, partition: str) -> bool:
-        """Whether an output's head at `partition` is of a complete pass: a
+        """Whether an output's head at `partition` is of a complete walk: a
         source's always is."""
 
         owner = self.owner(output)
-        return owner is None or self.caught_up(owner, partition)
+        return owner is None or self.complete(owner, partition)
 
     def dynamic_partitions(self, output: str) -> list[str] | None:
         """A set dimension's current keys: the element list its head carries (§7)."""
@@ -346,7 +347,7 @@ class Planner:
             e["kind"] == "in" and self.owner(e["output"]) == producer and (lacks or e.get("all_partitions"))
             for e in inputs
         )
-        return not whole or self.caught_up(producer, partition)
+        return not whole or self.complete(producer, partition)
 
     def reach(self, producer: str | None, partition: str, target: str) -> list[str]:
         """The target partitions a change of `producer` at `partition` reaches (§7,

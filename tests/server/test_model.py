@@ -118,7 +118,7 @@ async def test_commit_installs_heads_cursor_observations_and_pends_onchange(stat
     assert detail["request"]["status"] == "succeeded"
     m = state.model
     assert m.heads[("files", "")]["run"] == detail["request"]["id"]
-    assert m.partition("consumer", "")["caught_up"] is True
+    assert m.complete("consumer", "")
     rec = m.partition("consumer", "")["observed"]["files"]  # its record: every key, at the head
     assert rec["upstream"] == ["files", ""] and rec["ranges"] == [] and rec["base"]["endpoint"] == 0
     assert m.oldest_observed("files", "") == 0 and m.endpoints("files", "") == {1}
@@ -487,7 +487,6 @@ def test_a_rename_moves_a_scopes_record_whole():
     whole = {
         "cursor": "c1",
         "last": {"outcome": "failed", "run": "r", "attempt": "a", "at": 1.0},
-        "caught_up": True,
         "observed": {"feed": seen, "gone": {**seen, "upstream": ["elsewhere", ""]}},
         "failures": {"commit_number": 0, "forced": {}, "counts": {"failed": 1}},
     }

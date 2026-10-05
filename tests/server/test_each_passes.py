@@ -51,5 +51,5 @@ async def test_a_run_finishes_the_pass_it_began_before_it_ends(state, tmp_path):
     detail = await drive(engine, run)
     assert detail["request"]["status"] == "succeeded"
     assert sorted((await engine.list_keys("checks"))["keys"]) == ["a", "bad", "k1", "k2", "k3"]
-    assert engine.m.partition("checks", "")["caught_up"] is True
+    assert engine.m.complete("checks", "")
     assert sorted(await engine.observed("checks", "", "item")) == ["a", "bad", "k1", "k2", "k3"]

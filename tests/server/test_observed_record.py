@@ -142,3 +142,23 @@ def test_an_older_selection_over_a_newer_range_is_kept():
     observed.apply(rec, [{"op": "range", "lo": None, "hi": None, "label": new}])
     observed.apply(rec, [{"op": "point", "key": "k1", "present": True, "version": 1, "label": new}])
     assert observed.decode(rec, "k1", lambda e, k: commits[e].get(k)) == (1, {})
+
+
+def test_a_record_is_complete_when_no_key_decodes_from_the_empty_base():
+    """`complete`: the base a commit, or a per-key consumer's held keys, or
+    ranges tiling the key space — under any labels, a mid-run context move
+    included; points never matter. An unkeyed input's record always is."""
+
+    rec = observed.record("life-1")
+    assert not observed.complete(rec)  # the empty base: a first or full run not yet walked
+    w1 = observed.layer(rec, 3, None, {"factor": "w1"}, "life-1")
+    w2 = observed.layer(rec, 4, None, {"factor": "w2"}, "life-1")
+    observed.apply(rec, [{"op": "range", "lo": None, "hi": "k5", "label": w1}])
+    observed.apply(rec, [{"op": "point", "key": "k9", "present": True, "version": 1, "label": w2}])
+    assert not observed.complete(rec)  # a prefix, and a point: past k5 the empty base decides
+    observed.apply(rec, [{"op": "range", "lo": "k5", "hi": None, "label": w2}])
+    assert observed.complete(rec) and len(rec["ranges"]) == 2  # two contexts, every key covered
+    observed.apply(rec, [{"op": "range", "lo": None, "hi": None, "label": w2}])
+    assert observed.complete(rec) and rec["ranges"] == []  # one range spanning all: the base
+    assert observed.complete(observed.record("life-1", held=True))  # a per-key full run's base
+    assert observed.complete({"upstream": ["log", ""], "commit": 0, "base": 0})

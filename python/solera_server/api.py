@@ -283,7 +283,15 @@ def create_app(
         limit: int = Query(default=1000, ge=1, le=10000),
     ):
         """A page of a keyed asset's stale keys in `partition` (unpartitioned:
-        none), and why it is stale (docs/observed-set.md)."""
+        none), and why (docs/observed-set.md): `{tracked, keys, next,
+        reasons}`, `keys` as `[{key, reasons}]`. A key's reasons are only
+        what is specific to it, each naming its input: `{kind: "input
+        changed", input}` (that input owes the key) and `{kind: "upstream
+        stale", input}` (its upstream key is stale, along an each chain). A
+        partition-wide reason — its definition changed, a stale upstream
+        every key depends on, a keyed output that is not `each` — is on the
+        partition's `reasons` alone, never repeated per key: a key it covers
+        lists none."""
 
         runtime = await asset_engine(request, p, name)
         return await runtime.stale_keys(name, partition, after=after, limit=limit)

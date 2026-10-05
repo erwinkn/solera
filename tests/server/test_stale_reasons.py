@@ -96,15 +96,17 @@ async def test_a_partition_may_be_stale_for_several_reasons(state, tmp_path):
 
 
 async def test_stale_keys_follow_the_partition_and_say_why(state, tmp_path):
-    """A keyed output that is not `each` has all its keys stale or none; an
-    unkeyed one has no keys. The route and the engine agree."""
+    """A keyed output that is not `each` has all its keys stale or none, a
+    partition-wide reason no key repeats; an unkeyed one has no keys. The
+    route and the engine agree."""
 
     engine, outside = await built(state, tmp_path)
     assert await engine.stale_keys("copy") == {"tracked": True, "keys": [], "next": None, "reasons": []}
     outside.feed["k1"] = "2"
     await engine.commit_source("feed", upsert=["k1"])
     stale = await engine.stale_keys("copy")
-    assert stale["keys"] == ["k1", "k2"] and stale["reasons"] == ["upstream stale"]
+    assert stale["keys"] == [{"key": "k1", "reasons": []}, {"key": "k2", "reasons": []}]
+    assert stale["reasons"] == ["upstream stale"]
     assert (await engine.stale_keys("summary"))["tracked"] is False
     app = create_app(engine=engine, insecure=True)
     app.state.engine = engine
@@ -112,4 +114,9 @@ async def test_stale_keys_follow_the_partition_and_say_why(state, tmp_path):
         base = f"/api/projects/{engine.manifest['name']}"
         answer = await client.get(f"{base}/assets/copy/stale-keys", params={"limit": 1})
         assert answer.status_code == 200
-        assert answer.json() == {"tracked": True, "keys": ["k1"], "next": "k1", "reasons": ["upstream stale"]}
+        assert answer.json() == {
+            "tracked": True,
+            "keys": [{"key": "k1", "reasons": []}],
+            "next": "k1",
+            "reasons": ["upstream stale"],
+        }

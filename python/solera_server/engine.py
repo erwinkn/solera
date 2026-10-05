@@ -94,15 +94,6 @@ class NonRetryable(RuntimeError):
     """A dispatch-time failure no retry will fix (§8: full run required, …)."""
 
 
-def selects(plans: dict) -> bool:
-    """Whether an attempt reads keys a `keys=` run names: it then leaves the
-    partition's progress as it was."""
-
-    return any(
-        p and p["kind"] == "observed" and p.get("named") and not p.get("retry") for p in plans.values()
-    )
-
-
 def _batches(keys: int, limit: int) -> int:
     """Batches of `limit` a pass of `keys` is planned to take: at least one."""
 
@@ -422,7 +413,7 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
             self.m.heads_of,
             self.clock(),
             projected,
-            lambda a, s: self.m.partition(a, s).get("caught_up", False),
+            self.m.complete,
         )
 
     def _plan_run(
@@ -847,8 +838,6 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
             if prepared.get("skip"):
                 commit = {**await self._observations(task, prepared, {}), **self._made(prepared)}
                 more = bool(prepared.get("more"))
-                if not selects(prepared["plans"]) and not more:
-                    commit["caught_up"] = True
                 self._finish(task, claim, "skipped", commit=commit, more=more)
                 return
             stage = await self._launch(task, run, attempt, prepared)
@@ -987,10 +976,7 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
                 if load == "data" and (index := self._whole_index(output, pins[param]["ref"])) is not None:
                     pins[param]["index"] = index
         definition = self._definition(task["asset"], run)
-        # The whole and dep inputs as pinned now, against those the partition last caught
-        # up to: one moved since makes a full pass due (semantic change d), from its commit.
-        # Never caught up, no record says what it saw: their latest commit, so a pass begun
-        # before it starts over and redoes what it wrote under the old ones.
+        # The whole and dep versions read, which the commit records (its context).
         context = self._context(planner, inputs)
         # Pass 2: Incremental plans, as `_observe` planned them.
         plans, all_empty, each_page = {}, True, None
@@ -1535,11 +1521,6 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
             if prepared["outputs"][name]["head"] is None and failures is None and not result.get("skipped"):
                 raise Conflict(f"omitted output {name} has no head to keep (§2)", retryable=False)
         commit = {"heads": heads, **observations, **self._made(prepared)}
-        # A `keys=` list leaves the partition's progress as it was.
-        if not selects(prepared.get("plans") or {}):
-            # Whether the walk is done is the partition's, not its outputs' — a last batch
-            # may write none of them (§7).
-            commit["caught_up"] = not more
         if failures is not None:
             commit["failures"] = failures
             if result.get("key_outcomes"):
@@ -2281,7 +2262,7 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
         view = dict(head)
         view["commit"] = f"{head['run']}/{head['attempt']}" if head.get("attempt") else None
         owner = head.get("asset")
-        view["materialized"] = owner is None or self.planner().caught_up(
+        view["materialized"] = owner is None or self.planner().complete(
             owner, head["ref"].get("partition") or ""
         )
         return view

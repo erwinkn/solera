@@ -155,11 +155,17 @@ class Staleness:
     async def stale_keys(
         self, asset: str, partition: str = "", *, after: str | None = None, limit=1000
     ) -> dict:
-        """A page of a keyed asset's stale keys in `partition`, and why
-        (K43, K47): an `each=True` asset's key by key, derived from its one
-        record; a keyed output that is not `each` has all its keys stale or
-        none. `tracked` is false for an unkeyed asset, which has no keys.
-        `next` is the cursor for the page after, None at the end."""
+        """A page of a keyed asset's stale keys in `partition`, and why:
+        `keys` is `[{key, reasons}]`, `reasons` the partition's. A key's
+        reasons are only what is specific to it, each naming its input —
+        `{kind: "input changed", input}` for a key that input owes,
+        `{kind: "upstream stale", input}` for one whose upstream key is
+        stale along an each chain. A partition-wide reason (its definition
+        changed, a stale upstream every key depends on, a keyed output that
+        is not `each`, whose keys go stale together) stays on the
+        partition's reasons alone: a key it covers lists none. `tracked` is
+        false for an unkeyed asset, which has no keys; `next` is the cursor
+        for the page after, None at the end."""
 
         if asset not in self.manifest["assets"]:
             raise KeyError(asset)
@@ -170,30 +176,33 @@ class Staleness:
         if not reasons:
             return {"tracked": True, "keys": [], "next": None, "reasons": reasons}
         if self._each_input(asset) is not None:
-            stale = sorted(await self._each_keys(asset, partition, {}))
-            page = [k for k in stale if after is None or k > after][:limit]
-            more = len(page) == limit and page[-1] != stale[-1]
-            return {"tracked": True, "keys": page, "next": page[-1] if more else None, "reasons": reasons}
+            stale = await self._each_keys(asset, partition, {})
+            page = [k for k in sorted(stale) if after is None or k > after][:limit]
+            more = len(page) == limit and page[-1] != max(stale)
+            keys = [{"key": k, "reasons": stale[k]} for k in page]
+            return {"tracked": True, "keys": keys, "next": page[-1] if more else None, "reasons": reasons}
         if (keyed[0], partition) not in self.m.heads:
             return {"tracked": True, "keys": [], "next": None, "reasons": reasons}
         page = await self.list_keys(keyed[0], partition, after=after, limit=limit)
-        return {"tracked": True, "keys": list(page["keys"]), "next": page.get("next"), "reasons": reasons}
+        keys = [{"key": k, "reasons": []} for k in page["keys"]]
+        return {"tracked": True, "keys": keys, "next": page.get("next"), "reasons": reasons}
 
-    async def _each_keys(self, asset: str, partition: str, memo: dict) -> set[str]:
-        """An `each=True` partition's stale keys (`_each_own`), and along an
-        each chain the keys whose upstream key is stale; any other stale
-        upstream makes every key stale."""
+    async def _each_keys(self, asset: str, partition: str, memo: dict) -> dict[str, list]:
+        """An `each=True` partition's stale keys, each with its own reasons
+        (`stale_keys`): those its input owes (`_each_own`), and along an each
+        chain those whose upstream key is stale; any other stale upstream,
+        partition-wide, makes every key it holds stale."""
 
         if (asset, partition) in memo:
             return memo[(asset, partition)]
-        memo[(asset, partition)] = set()
+        memo[(asset, partition)] = {}
         planner = self.planner()
         try:
             inputs = planner.inputs(asset, partition)
         except planning.UpstreamOnly:
             inputs = []
         if not self.built(asset, partition, planner):
-            return set()
+            return {}
         param, spec = self._each_input(asset)
         keys = await self._each_own(asset, partition, planner, inputs)
         taken = Matcher(spec.get("patterns"))
@@ -203,32 +212,36 @@ class Staleness:
                 if i.owner is None or not await self.stale_reasons(i.owner, upstream_partition):
                     continue
                 if i.param == param and self._each_input(i.owner) is not None:
-                    keys |= {k for k in await self._each_keys(i.owner, upstream_partition, memo) if taken(k)}
-                else:  # a stale upstream every key depends on
-                    keys |= {k async for k, _, _ in _entries(self, self.m.indexes.get((output, partition)))}
+                    for k in await self._each_keys(i.owner, upstream_partition, memo):
+                        if taken(k):
+                            keys.setdefault(k, []).append({"kind": UPSTREAM, "input": i.param})
+                else:  # a stale upstream every key depends on: partition-wide
+                    async for k, _, _ in _entries(self, self.m.indexes.get((output, partition))):
+                        keys.setdefault(k, [])
         memo[(asset, partition)] = keys
         return keys
 
-    async def _each_own(self, asset: str, partition: str, planner, inputs) -> set[str]:
+    async def _each_own(self, asset: str, partition: str, planner, inputs) -> dict[str, list]:
         """An `each=True` partition's stale keys by its own input (`_each_keys`):
         the keys it owes — and, its definition changed, a full run due,
-        every key upstream has under the patterns and every key it holds."""
+        every key upstream has under the patterns and every key it holds,
+        for that partition-wide reason alone."""
 
         param, spec = self._each_input(asset)
         input = next((i for i in inputs if i.param == param), None)
         output = next((o["name"] for o in self.manifest["assets"][asset]["outputs"] if o.get("key")), None)
         if input is None or output is None:
-            return set()
-        keys = {o.key for o in await self._owed(asset, partition, input, planner, inputs)}
+            return {}
+        owed = {o.key for o in await self._owed(asset, partition, input, planner, inputs)}
+        keys = {k: [{"kind": INPUT, "input": param}] for k in sorted(owed)}
         if self.definition_changed(asset, partition):
             taken = Matcher(spec.get("patterns"))
-            keys |= {
-                k
-                async for k, _, _ in _entries(self, self.m.indexes.get((input.output, input.partition)))
-                if taken(k)
-            }
+            async for k, _, _ in _entries(self, self.m.indexes.get((input.output, input.partition))):
+                if taken(k):
+                    keys.setdefault(k, [])
             for name in (output, f"@{asset}"):
-                keys |= {k async for k, _, _ in _entries(self, self.m.indexes.get((name, partition)))}
+                async for k, _, _ in _entries(self, self.m.indexes.get((name, partition))):
+                    keys.setdefault(k, [])
         return keys
 
 
