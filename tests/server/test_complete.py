@@ -222,3 +222,17 @@ async def test_each_commit_logs_whether_it_was_its_runs_last_batch(state, tmp_pa
     rows = [r for r in (await engine.history.commits(outputs=["copy"]))["commits"] if r["run"] == run["id"]]
     assert rows and not any(r["final"] for r in rows)
     hold.set()
+
+
+async def test_each_commit_row_names_the_batch_that_made_it(state, tmp_path):
+    """`batch` on a history commit row is `{index, count}` of the attempt
+    that committed it, read from that attempt's row: null for an unbatched
+    task."""
+
+    engine = await engine_of(state, project(tmp_path, {"a": 1, "b": 1, "c": 1}))
+    run = await engine.submit(["copy"], upstream=True)
+    await drive(engine, run)
+    rows = (await engine.history.commits(outputs=["files", "copy"]))["commits"]
+    copies = sorted((r for r in rows if r["output"] == "copy"), key=lambda r: r["generation"])
+    assert [r["batch"] for r in copies] == [{"index": i, "count": 3} for i in range(3)]
+    assert [r["batch"] for r in rows if r["output"] == "files"] == [None]

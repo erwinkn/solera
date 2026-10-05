@@ -1064,21 +1064,26 @@ class History:
         before: str | None = None,
         limit: int = 200,
     ) -> dict:
-        """Output versions, newest first, with their metadata. `next` is the
-        `before` cursor of the following page: `[at, output, partition]` as JSON,
-        since one commit makes several versions at the same moment."""
+        """Output versions, newest first, with their metadata, and `batch`:
+        `{index, count}` of the batch whose attempt committed it, as that
+        attempt's row records it (null for a source commit, an unbatched
+        task, and an attempt still running). `next` is the `before` cursor
+        of the following page: `[at, output, partition]` as JSON, since one
+        commit makes several versions at the same moment."""
 
         clauses, params = ["true"], []
         if outputs is not None:
-            clauses.append("list_contains(?::VARCHAR[], output)")
+            clauses.append("list_contains(?::VARCHAR[], c.output)")
             params.append(list(outputs))
         if partition is not None:
-            clauses.append("partition = ?")
+            clauses.append("c.partition = ?")
             params.append(partition)
         until = None
         if before:
             at, output, at_partition = json.loads(before)
-            clauses.append('("at" < ? OR ("at" = ? AND (output > ? OR (output = ? AND partition > ?))))')
+            clauses.append(
+                '(c."at" < ? OR (c."at" = ? AND (c.output > ? OR (c.output = ? AND c.partition > ?))))'
+            )
             params.extend([at, at, output, output, at_partition])
             until = math.nextafter(at, math.inf)
         where = " AND ".join(clauses)
@@ -1086,17 +1091,22 @@ class History:
         def work(con):
             return _dicts(
                 con.execute(
-                    f'SELECT * FROM commits WHERE {where} ORDER BY "at" DESC, output, partition LIMIT ?',
+                    f"""SELECT c.*, a.batch FROM commits c
+                        LEFT JOIN attempts a ON a.run = c.run AND a.id = c.attempt
+                        WHERE {where} ORDER BY c."at" DESC, c.output, c.partition LIMIT ?""",
                     [*params, limit + 1],
                 )
             )
 
-        found = await self.query(work, ("commits",), until=until, live=False)
+        # An attempt starts before it commits: `until` prunes both alike.
+        found = await self.query(work, ("commits", "attempts"), until=until, live=False)
         more = len(found) > limit
         found = found[:limit]
         for row in found:
             if isinstance(row["metadata"], str):
                 row["metadata"] = json.loads(row["metadata"])
+            made = json.loads(row["batch"]) if row["batch"] else None
+            row["batch"] = {"index": made["index"], "count": made["count"]} if made else None
         last = found[-1] if more and found else None
         cursor = json.dumps([last["at"], last["output"], last["partition"]]) if last else None
         return {"commits": found, "next": cursor}
