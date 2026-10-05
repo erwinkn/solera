@@ -11,9 +11,6 @@
 #   attempt    ci: small, dup, live and the calibrations; big: two attempts with a
 #              duplicate worker each (too large to finish)
 #   positions  ci: base, each and the calibrations; three: three keys
-#   spans      ci: base, orphans (the collector), retries (failing merges), empty (spans
-#              with no files), passes, and the calibrations; long: takeover (a zombie,
-#              ~20 min at 4 workers), for the freeze round and on demand
 #   observed   ci: free and current (every step, both store kinds; OBSERVED_TRACES (20,000) random
 #              behaviours of 40 steps, every state checked), and each finding's
 #              history (`observed_histories`): run through with every rule on, then
@@ -101,29 +98,6 @@ model() {
         positions/continue) changes=(FixContinue=FALSE) ;;
         positions/collapse) changes=(FixCollapse=FALSE) ;;
         positions/retry-collapse) changes=(Each=TRUE FixRetryCollapse=FALSE) ;;
-        # Spans.tla: one consumer, three commits, one claim, one reset, one merge at a time.
-        spans/base) changes=() ;;
-        spans/takeover) changes=(MaxTakeovers=1 MaxResets=0 Collectors=TRUE MaxCommits=2 MaxFiles=5) ;;
-        spans/unpublished) changes=(MaxTakeovers=1 MaxResets=0 Collectors=TRUE MaxCommits=2 MaxFiles=5 INVARIANT=NoUnpublished) ;;
-        spans/orphans) changes=(Collectors=TRUE MaxResets=0) ;;
-        spans/retries) changes=(MergeFailures=TRUE MaxResets=0 MaxCommits=2) ;;
-        spans/empty) changes=(EmptySpans=TRUE MaxCommits=2) ;;
-        spans/passes) changes=(Passes=TRUE MaxClaims=2 MaxResets=0) ;;
-        spans/landing) changes=(FixLanding=FALSE) ;;
-        spans/bounds) changes=(FixBounds=FALSE) ;;
-        spans/inputs) changes=(MaxJobs=2 MaxCommits=2 MaxResets=0 FixLanes=FALSE FixInputs=FALSE) ;;
-        spans/lanes) changes=(MaxJobs=2 MaxCommits=2 MaxResets=0 FixLanes=FALSE) ;;
-        spans/inputs-alone) changes=(MaxJobs=2 MaxCommits=2 MaxResets=0 FixInputs=FALSE) ;;
-        spans/life) changes=(EmptySpans=TRUE FixLife=FALSE) ;;
-        spans/life-files) changes=(FixLife=FALSE) ;;
-        spans/settle-life) changes=(FixSettleLife=FALSE) ;;
-        spans/pin-floor) changes=(FixPinFloor=FALSE) ;;
-        spans/durable) changes=(FixDurable=FALSE MaxResets=0) ;;
-        spans/retries-cap) changes=(MergeFailures=TRUE MaxResets=0 MaxCommits=2 FixRetries=FALSE) ;;
-        spans/epoch) changes=(MaxTakeovers=1 MaxResets=0 Collectors=TRUE FixEpoch=FALSE) ;;
-        spans/epoch-state) changes=(MaxTakeovers=1 MaxResets=0 Collectors=TRUE FixEpoch=FALSE -PublishingStored) ;;
-        spans/judge) changes=(Collectors=TRUE MaxResets=0 FixJudgeAfter=FALSE) ;;
-        spans/garbage-named) changes=(Collectors=TRUE MaxResets=0 MaxClaims=0 MaxTakeovers=1 FixGarbageNamed=FALSE) ;;
         # ObservedSet.tla: free exploration, or a finding's history (below).
         observed/free) changes=() ;;
         observed/current) changes=(CurrentOnly=TRUE) ;;
@@ -226,46 +200,6 @@ calibration() {
             # K47: a retry pass that leaves nothing behind keeps its entries.
             calibrate retry-collapse Collapsed
             ;;
-        spans)
-            # A claim whose landing point is no endpoint: a merge covers it
-            # before the attempt settles (A10).
-            calibrate landing ReadsExact
-            # A merge that keeps no segment start at an endpoint it knew.
-            calibrate bounds ReadsExact
-            # Two merges over one span, and publication without re-checking the
-            # inputs: the second publishes over replaced inputs. Either guard
-            # alone suffices (models lanes and inputs-alone pass).
-            calibrate inputs Tiling
-            # Publication without the life check: a merge of spans with no files
-            # planned before a reset matches the new life's, whose names are
-            # as empty (W42). With files, the input check alone refuses it
-            # (model life-files passes).
-            calibrate life Tiling
-            # An attempt of an earlier life lands its position in the new one.
-            calibrate settle-life ReadsExact
-            # Garbage deleted while a reader pinned before it still reads it.
-            calibrate pin-floor ReadersStored
-            # Inputs let go of at upload: a refused or crashed merge leaves the
-            # state naming deleted files.
-            calibrate durable StateStored
-            # A failing input set merged again and again.
-            calibrate retries-cap AttemptsBounded
-            # F40, the code before c4eb4f7: a zombie collects orphans by the
-            # model it last had, and deletes the output of a merge the serving
-            # engine is publishing, or (epoch-state) has published since.
-            calibrate epoch PublishingStored
-            calibrate epoch-state StateStored
-            # A collector that names before it lists: a merge of its own,
-            # planned and uploaded in between, is listed and deleted.
-            calibrate judge PublishingStored
-            # A collector that does not count garbage as named: the inputs of a
-            # publication not yet durable, which the journal still names, go.
-            calibrate garbage-named StateStored
-            # Not a rule: `takeover` reaches the zombie's publication that never
-            # became durable (the coordinator's question), so its passing means
-            # the zombie's collector spares what the journal still names.
-            calibrate unpublished NoUnpublished
-            ;;
         attempt)
             # A create-if-absent gate with nothing retained: a worker that read its
             # spec, paused, and resumes after its run was purged creates the file
@@ -362,9 +296,8 @@ run() {  # run SPEC GROUP
         journal) module=JournalObject ;;
         attempt) module=Attempt ;;
         positions) module=Positions ;;
-        spans) module=Spans ;;
         observed) module=ObservedSet ;;
-        *) echo "usage: $0 [ci | execution|journal|attempt|positions|spans|observed [GROUP|MODEL]]" >&2; exit 2 ;;
+        *) echo "usage: $0 [ci | execution|journal|attempt|positions|observed [GROUP|MODEL]]" >&2; exit 2 ;;
     esac
     case $spec/$2 in
         execution/ci) check smoke; calibration execution ;;
@@ -377,9 +310,6 @@ run() {  # run SPEC GROUP
         attempt/ci) check small; check dup; check live; calibration attempt ;;
         positions/ci) check base; check each; calibration positions ;;
         positions/all) run positions ci; check three ;;
-        spans/ci) check base; check orphans; check retries; check empty; check passes; calibration spans ;;
-        spans/long) check takeover ;;
-        spans/all) run spans ci; run spans long ;;
         observed/ci)  # every step: too many states to exhaust, so random behaviours, every state checked
             local sim=(-simulate "num=${OBSERVED_TRACES:-20000}" -depth 40 -seed 1)
             check free "${sim[@]}"; check current "${sim[@]}"
@@ -396,6 +326,6 @@ run() {  # run SPEC GROUP
 }
 
 case ${1:-ci} in
-    ci) for s in execution journal attempt positions spans observed; do echo "# $s"; run $s ci; done ;;
+    ci) for s in execution journal attempt positions observed; do echo "# $s"; run $s ci; done ;;
     *) run "$1" "${2:-ci}" ;;
 esac

@@ -22,7 +22,7 @@ from dataclasses import dataclass
 
 from solera.failed_keys import Record, eligible, minima
 from solera.keys.delta import delta, version_of
-from solera.keys.index import KeyIndex, key_bytes, key_str
+from solera.keys.layers import LayerIndex, key_bytes, key_str
 from solera.patterns import Matcher
 
 from . import observed, owed, planning
@@ -45,22 +45,20 @@ class Observing:
     def _keyed(self, input: planning.Input) -> bool:
         return input.kind == "incremental" and self.manifest["outputs"][input.output].get("key") is not None
 
-    def _upstream(self, output: str, partition: str) -> tuple[KeyIndex, str]:
+    def _upstream(self, output: str, partition: str) -> tuple[LayerIndex, str]:
         """An upstream's key index as it is, and its life (`""`: none yet)."""
 
         state = self.m.indexes.get((output, partition))
-        index = KeyIndex(
-            self._key_io(), None, (state or self.m.index(output, partition)).slice(), self.key_options
-        )
+        index = LayerIndex(self._key_io(), state or self.m.index(output, partition), cache=self._key_cache())
         return index, state.life if state is not None else ""
 
-    def _held(self, asset: str, partition: str) -> list[KeyIndex]:
+    def _held(self, asset: str, partition: str) -> list[LayerIndex]:
         """A per-key consumer's own indexes — its keyed outputs' and its
         failure records' — what a held base decodes from."""
 
         names = [o["name"] for o in self.manifest["assets"][asset]["outputs"] if o.get("key") is not None]
         return [
-            KeyIndex(self._key_io(), None, self.m.indexes[(n, partition)].slice(), self.key_options)
+            LayerIndex(self._key_io(), self.m.indexes[(n, partition)], cache=self._key_cache())
             for n in [*names, f"@{asset}"]
             if (n, partition) in self.m.indexes
         ]
@@ -166,16 +164,15 @@ class Observing:
 
     def _decodable(self, rec: dict, output: str, partition: str) -> bool:
         """Whether a record still decodes: its layers name the upstream
-        index's current life, and Δ from each of their heads is served."""
+        index's current life, and Δ from each of their heads is served — at or
+        after the index's cut, below which flips are gone."""
 
         index, life = self._upstream(output, partition)
         if observed.lives(rec) != {life}:
             return False
         state, head = index.state, index.state.head
         layers = [rec["base"], *rec["ranges"]]
-        return all(
-            e is None or e >= head or state.covers(e + 1, head) for e in (x["endpoint"] for x in layers)
-        )
+        return all(e is None or e >= head or e >= state.cut for e in (x["endpoint"] for x in layers))
 
     def _full_run(self, task: dict, run: dict, incremental) -> str | None:
         """Why the task's next batch is a full run's, if it is: its run is
@@ -282,7 +279,7 @@ class Observing:
         return out
 
     async def _failed(
-        self, task: dict, input: planning.Input, index: KeyIndex, now, b, full: bool, named: bool
+        self, task: dict, input: planning.Input, index: LayerIndex, now, b, full: bool, named: bool
     ):
         """What a per-key batch needs of its failure records (§9), read here
         so that its worker reads no index: the prior records of its keys —
@@ -291,7 +288,7 @@ class Observing:
         next (`_retry`), for `_each_plan` to choose between them."""
 
         state = self.m.index(f"@{task['asset']}", task["partition"])
-        failures = KeyIndex(self._key_io(), None, state.slice(), self.key_options)
+        failures = LayerIndex(self._key_io(), state, cache=self._key_cache())
         record = self.m.partition(task["asset"], task["partition"]).get("failures") or {}
         keys = [key_bytes(w.key) for w in b.keys]
         with self.m.reading(state.prefix, index.state.prefix):
@@ -301,7 +298,7 @@ class Observing:
                 retry = await self._retry(task, input, failures, index, now, record)
         return {"priors": {key_str(k): bytes(p).hex() for k, (_, p) in found.items()}, "retry": retry}
 
-    async def _retry(self, task, input, failures: KeyIndex, index: KeyIndex, now, record: dict) -> dict:
+    async def _retry(self, task, input, failures: LayerIndex, index: LayerIndex, now, record: dict) -> dict:
         """The next retry batch: the failed keys walked from the retry pass's
         place, taking the ones that are due, `batch_size` at most and
         `WALK` records each at most (§9), each at its version at H — gone
@@ -321,8 +318,8 @@ class Observing:
         due: list[str] = []
         end = None
         while len(due) < limit and len(walked) < WALK * limit:
-            keys, _, payloads, nxt = await failures.page(cursor, limit)
-            for k, p in zip(keys, payloads, strict=True):
+            rows, nxt = await failures.delta(None, after=cursor, first=limit)
+            for k, _, _, _, p in rows:
                 key = key_str(k)
                 walked[key] = Record.decode(bytes(p))
                 if eligible(walked[key], clock, self.m.deploy_number, forced):
@@ -432,7 +429,7 @@ class Observing:
         size = int(input.spec["batch_size"])
         count = o["index"] + 1 if b.final else max(o["index"] + 2, -(-state.count // size))
         batch = {"keys": keys, "index": o["index"], "count": count, "final": b.final, "full": o["full"]}
-        pin = {"ref": ref, "index": state.slice().to_json(), "batch": batch}
+        pin = {"ref": ref, "index": state.to_json(), "batch": batch}
         if input.spec.get("patterns") is not None:
             pin["patterns"] = input.spec["patterns"]
         classes = {
@@ -580,7 +577,7 @@ class Observing:
         return min(found, default=None)
 
 
-async def _all(index: KeyIndex, at: int | None) -> list:
+async def _all(index: LayerIndex, at: int | None) -> list:
     """Every key live after commit `at` (None: the head)."""
 
     out, after = [], None

@@ -536,7 +536,7 @@ async def test_a_create_whose_response_was_lost_is_its_own(tmp_path, monkeypatch
     await engine.initialize()
     detail = await engine.run_until((await engine.submit(["scores"]))["id"], 10)
     assert detail["request"]["status"] == "succeeded", detail
-    assert {"json", "kx", "control"} <= set(retried)
+    assert {"json", "lay", "control"} <= set(retried)
     assert state.model.heads[("scores", "")]["count"] == 2 and state.model.repairs == {}
     with pytest.raises(AlreadyExistsError):  # another writer's object is still a collision
         await create(state.objects, f"{state.attempt_path(detail['request']['id'], 'x')}.spec", b"a")
@@ -610,7 +610,7 @@ async def test_garbage_waits_for_attempts_claimed_before_it_whatever_the_clocks(
     run, attempt = await launched(engine, ["remote"])
     state, engine = await restart(state, engine, url, REMOTE)
     await engine.initialize()
-    path = f"{state.model.index('remote', '').prefix}merged-away.kx"  # a file of what it writes
+    path = f"{state.model.index('remote', '').prefix}merged-away.lay"  # a file of what it writes
     await state.put_object(path, b"entries")
     state.record({"type": "AutomationChanged", "name": "none", "enabled": True})  # a later event counter
     state.model.garbage.append([path, state.model.event_counter])

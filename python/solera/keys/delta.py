@@ -1,28 +1,24 @@
 """Δ(P, H, keys): every key whose state differs between P and H, with its
-presence at P and at H and its version at H (docs/observed-set.md; the
-interface of docs/key-index-from-first-principles.md), over either index:
-today's `KeyIndex` (spans), or a `LayerIndex` (stamped layers, which
-replaces it behind this interface).
+presence at P and at H and its version at H (docs/observed-set.md,
+docs/key-index-design.md), over the stamped-layer index (`LayerIndex`).
 
 - P is None (−∞: every key live at H is added) or a commit an observation
   was made at: the state after commit P.
 - H is None (the head) or a commit a batch pinned: the state after commit H.
 - keys is a sorted list, or a range — the first `first` keys after `after`
-  that differ; either may carry a pattern filter (`take`).
+  that differ; either may carry a pattern filter (`take`). A range page may
+  come back short, with its cursor: it holds every differing key up to it.
 
-Spans read a change between commits only at endpoints they keep: P + 1
-must be one (and H + 1, unless H is the head), as the records that hold
-those commits reserve them. Layers answer any P at or after the index's cut
-(below it, `CutError`), and an H the state holds a layer boundary at: a
-batch passes the state it pinned at its H (else `NotHeld`)."""
+Any P at or after the index's cut is answered (below it, `CutError`), and
+an H the state holds a layer boundary at: a batch passes the state it
+pinned at its H (else `NotHeld`)."""
 
 from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
 
-from .index import KeyIndex, key_bytes, key_str
-from .layers import LayerIndex
+from .layers import LayerIndex, key_bytes, key_str
 
 
 @dataclass(frozen=True)
@@ -46,7 +42,7 @@ class DeltaPage:
 
 
 async def delta(
-    index: KeyIndex,
+    index: LayerIndex,
     p: int | None,
     h: int | None = None,
     *,
@@ -56,56 +52,8 @@ async def delta(
     take: Callable[[str], bool] | None = None,
 ) -> DeltaPage:
     """Δ(P, H, keys): `keys` named outright, else the first `first` keys after
-    `after` that differ, both filtered by `take`."""
-
-    if isinstance(index, LayerIndex):
-        return await _layers(index, p, h, keys=keys, after=after, first=first, take=take)
-    head = index.state.head
-    h = head if h is None else h
-    at = None if h == head else h + 1  # the state after commit h
-    if p is not None and p >= h:
-        return DeltaPage([])
-    if keys is not None:
-        named = [k for k in sorted(set(keys)) if take is None or take(k)]
-        if not named:
-            return DeltaPage([])
-        if p is None:
-            found = await index.lookup([key_bytes(k) for k in named], at=at)
-            return DeltaPage([_added(key_str(k), g, pl) for k, (g, pl) in sorted(found.items())])
-        page = await index.changes_page(p + 1, h, None, len(named), keys=[key_bytes(k) for k in named])
-        return DeltaPage(_diffs(page, take))
-    diffs: list[Diff] = []
-    cursor = None if after is None else key_bytes(after)
-    while len(diffs) < first:
-        want = first - len(diffs)
-        if p is None:
-            ks, gens, pls, nxt = await index.page(cursor, want, at=at)
-            diffs += [
-                _added(key_str(k), g, pl)
-                for k, g, pl in zip(ks, gens, pls, strict=True)
-                if take is None or take(key_str(k))
-            ]
-        else:
-            page = await index.changes_page(p + 1, h, cursor, want)
-            diffs += _diffs(page, take)
-            nxt = page.cursor
-        if nxt is None:
-            return DeltaPage(diffs)
-        cursor = nxt
-    return DeltaPage(diffs, key_str(cursor))
-
-
-def version_of(generation: int | None, payload) -> object:
-    """A key's version: its source's own word where its entry carries one
-    (the payload), else the generation that wrote it."""
-
-    if isinstance(payload, bytes):
-        return payload.decode()
-    return payload if payload is not None else generation
-
-
-async def _layers(index: LayerIndex, p, h, *, keys, after, first, take) -> DeltaPage:
-    """Δ over stamped layers: one read for a key list and a range (A31 R1)."""
+    `after` that differ, both filtered by `take`. One read for a key list and
+    a range (A31 R1)."""
 
     state = index.state.at(h)
     if state is not index.state:
@@ -124,38 +72,10 @@ async def _layers(index: LayerIndex, p, h, *, keys, after, first, take) -> Delta
     return DeltaPage(diffs, None if cursor is None else key_str(cursor))
 
 
-def reserved(commits) -> set[int]:
-    """The endpoints today's index keeps for reads at `commits` — the P of
-    every observation layer, the H a batch in flight pinned: the state after
-    commit c is read from endpoint c + 1."""
+def version_of(generation: int | None, payload) -> object:
+    """A key's version: its source's own word where its entry carries one
+    (the payload), else the generation that wrote it."""
 
-    return {int(c) + 1 for c in commits if c is not None}
-
-
-def _added(key: str, generation: int, payload) -> Diff:
-    return Diff(key, False, True, generation, payload)
-
-
-def _diffs(page, take) -> list[Diff]:
-    """A `changes` page as differences: class 3 (added and removed again)
-    differs at neither end, so it is none."""
-
-    out = []
-    for i, k in enumerate(page.keys):
-        cls = page.classes[i]
-        if cls == 3:
-            continue
-        key = key_str(k)
-        if take is not None and not take(key):
-            continue
-        live = cls in (0, 1)
-        out.append(
-            Diff(
-                key,
-                cls in (1, 2),
-                live,
-                page.generations[i] if live else None,
-                page.payloads[i] if live else None,
-            )
-        )
-    return out
+    if isinstance(payload, bytes):
+        return payload.decode()
+    return payload if payload is not None else generation

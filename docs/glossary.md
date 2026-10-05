@@ -419,7 +419,7 @@ written by generation 184467.
 
 **commit number**. The n-th commit of an incremental output partition:
 0, 1, 2… with no gaps, since a failed attempt's number goes to its retry.
-Spans and positions count in it. *Why, beside the generation:*
+Layers and positions count in it. *Why, beside the generation:*
 `site_events` appends rows tagged with their commit number; an attempt
 writes half of commit 42 and dies; its retry writes commit 42 again and
 the store keeps only the retry's, so a reader of commits 40–42 never sees
@@ -429,33 +429,44 @@ listing. *Was:* batch (output side). *Example:* commit 57 of
 `site_files`/`alpha` upserted `alpha-file-1`.
 
 **key index**. The engine's index of an output partition's keys: per
-key its generation, whether it was removed (a **tombstone**), and its
-version for source keys. A tiling of commit time by **spans** of `.kx`
+key its presence, the commit and generation of its last change, and its
+version for source keys. A tiling of commit time by **layers** of `.lay`
 files on the object store, merged in the background
-(`key-index-design.md`). Writes are exact: every delta entry names its
-key's predecessor when the key was live, so the count is exact and the
-replaced versions are listed for cleanup. *Was:* pair filter, locator
-(removed by `versions.md`); inexact counts and recounts (removed by exact
-writes); levels, compaction and the delta log (replaced by spans).
+(`key-index-design.md`). It answers two questions: the head (which keys,
+at which generations) and Δ(P, H), what changed between two commits.
+*Was:* pair filter, locator (removed by `versions.md`); levels, compaction
+and the delta log (replaced by spans); spans, endpoints and predecessors
+(replaced by layers).
 
-**delta**. The keys one commit changed: upserted and removed, one delta
-file per commit number. Installed as the span `[c, c]`.
+**delta**. The keys one commit changed, each once: added, updated or
+removed, with a source key's version. One delta per commit number,
+written by the attempt, installed as the layer `[c, c]`. On immutable
+stores an entry also names the generation it replaced, for cleanup only.
 
-**span**. The key-sorted files that hold what commits `[a, b]` changed:
-per key, one version per segment, newest first, with the predecessor on
-the oldest. The spans of an index tile its commits from 0 to the head;
-the one from commit 0 is the **base**. Segments are split at the
-endpoints live when the span was written. *Example:* `site_files`/`alpha`
-holds the base `[0, 812]` and the spans `[813, 840]`, `[841, 841]`.
+**layer**. The key-sorted files that hold what commits `[a, b]` changed:
+per key its state after `b`, its last change, its presence before `a`,
+and its **flips**, the commits in `[a, b]` that added or removed it.
+The layers of an index tile its commits from 0 to the head; the oldest is
+the **base**. A layer's **main** part holds what the head and later
+readers need; its **side** part holds keys only a reader starting inside
+the layer needs (absent at both ends; in the base, every removed key).
+*Example:* `site_files`/`alpha` holds the base `[0, 812]` and the layers
+`[813, 840]`, `[841, 841]`.
 
-**endpoint**. A commit a reader starts from or lands at: a position's
-`next`, a pass's `from` and `to + 1`, a pattern change's split + 1, an
-attempt's reads. Merges keep the versions some live endpoint sees, so
-`changes(P → N)` between endpoints reads exactly. A boundary merged away
-while no reader held it is no endpoint: a position there gets a full pass.
+**flip parity**. How a layer answers a reader starting inside it: a key
+was present at P if it is present at H and an even number of flips lie
+after P, or absent at H and an odd number. *Example:* `alpha-file-1` is
+present at 841 with flips 830 (added) and 820 (removed); a reader at 825
+saw it absent (one flip after 825), one at 815 saw it present.
 
-**merge**. Upkeep's rewrite of adjacent spans into one, under the merge
-policy, published by `IndexMerged` only if the index is still the
+**cut**. The oldest commit any reader may still start from: positions,
+passes, in-flight attempts. Merges drop flips at or below it, so a reader
+starting below the cut is refused (`CutError`) and makes a full compare.
+It only moves forward.
+
+**merge**. Upkeep's rewrite of adjacent layers into one, under the merge
+rule (tiers of 4; the base absorbs layers once they reach 1/4 of its
+bytes), published by `IndexMerged` only if the index is still the
 **life** it was planned against (a reset, move or removal starts another)
 and still holds its inputs. *Was:* compaction, truncation.
 
@@ -592,7 +603,7 @@ them. *Was:* unsettled.
 **pin**. A reader's hold on the state as of one event counter value:
 nothing let go of after that value is deleted until the reader is done.
 *Example:* an attempt pinned at 184467 loads `site_files`/`alpha`'s key
-index while a merge replaces its `.kx` files; the old files stay until
+index while a merge replaces its layers; the old files stay until
 the attempt settles. Attempts pin at their claim; multi-batch passes,
 pattern changes, ticks and the engine's own reads pin too. Internal:
 lineage shows what was read, not what was pinned. *Was:* reader floor (the
@@ -607,6 +618,14 @@ committed wrote, a removed or moved output's whole life. A store cleanup
 is pending, or **stuck** after three failed tries. *Was:* garbage,
 discard, data garbage; the items grammar. *Example:* `solera cleanups
 site_files alpha`.
+
+**cleanup cursor**. Per immutable keyed output partition, the front of its
+**cleanup queue**: the deltas committed and not yet cleaned that name what
+they replaced (D168). A **step** walks the deltas no reader still needs, in
+commit order, deletes the generations they name, then drops them from the
+queue; a crash repeats it. *Example:* `site_files`/`alpha` with deltas
+813–840 queued: a reader pinned before commit 820 holds the step to
+813–819.
 
 **cleanup task**. A task of the engine's own, with no asset, that deletes
 what an output removed, or moved to another store, left in the store it

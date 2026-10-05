@@ -260,17 +260,18 @@ pub fn glob_blocks<'py>(
 
 /// A commit's delta from its sorted written entries, resolved against
 /// `inputs` (newest first: the blocks the keys fall in, or whole parts):
-/// `(files, index, added, changed, removed, collected)`. With `replaced`,
-/// each change records the generation it replaced (an immutable store's
-/// cleanup); `collected` lists up to `collect` changed keys.
+/// `(files, index, added, changed, removed, collected)`. With `replaced`
+/// (the commit's generation), each update and remove records the generation
+/// it replaced, as its distance back from it (an immutable store's cleanup);
+/// `collected` lists up to `collect` changed keys.
 #[pyfunction]
-#[pyo3(signature = (inputs, written, *, replaced=false, collect=0, block_size=16384, level=1, file_limit=67108864))]
+#[pyo3(signature = (inputs, written, *, replaced=None, collect=0, block_size=16384, level=1, file_limit=67108864))]
 #[allow(clippy::type_complexity)]
 pub fn layers_resolve<'py>(
     py: Python<'py>,
     inputs: Vec<Input>,
     written: PyRef<'_, SortedEntries>,
-    replaced: bool,
+    replaced: Option<u64>,
     collect: usize,
     block_size: usize,
     level: i32,
@@ -352,14 +353,14 @@ impl LayerJob {
     /// `sorted` entries; merge-joined with `inputs` (newest first). A patch,
     /// or with `replace` the whole new content.
     #[staticmethod]
-    #[pyo3(signature = (inputs, *, rows=None, sorted=None, replace=false, replaced=false, collect=0, key=None, overlay=None, block_size=16384, level=1, file_limit=67108864))]
+    #[pyo3(signature = (inputs, *, rows=None, sorted=None, replace=false, replaced=None, collect=0, key=None, overlay=None, block_size=16384, level=1, file_limit=67108864))]
     #[allow(clippy::too_many_arguments)]
     fn join(
         inputs: Vec<(u64, u64)>,
         rows: Option<PyRef<'_, Rows>>,
         sorted: Option<PyRef<'_, SortedEntries>>,
         replace: bool,
-        replaced: bool,
+        replaced: Option<u64>,
         collect: usize,
         key: Option<String>,
         overlay: Option<PyRef<'_, SortedEntries>>,

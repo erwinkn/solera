@@ -13,7 +13,7 @@ from urllib.parse import unquote, urlsplit
 
 import pandas as pd
 import pytest
-from solera.keys.index import key_str
+from solera.keys.layers import key_str
 from solera.sdk import KEYS, DynamicPartitions, Output, Ref, RegistrationError
 from solera.stores import (
     Commits,

@@ -12,8 +12,8 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 
 from solera import lifecycle
-from solera.keys.index import KeyIndex, key_str
 from solera.keys.io import ObjectIO
+from solera.keys.layers import LayerIndex, key_str
 from solera.sdk import Ref
 from solera.stores import Keys
 
@@ -194,11 +194,11 @@ class Journal:
 async def index_entries(state, output: str, partition: str) -> dict[str, tuple[int, bytes | None]]:
     """Every live entry of an output partition's key index: key -> (generation, payload)."""
 
-    index = KeyIndex(ObjectIO(state.objects), None, state.model.index(output, partition).slice())
+    index = LayerIndex(ObjectIO(state.objects), state.model.index(output, partition))
     entries, after = {}, None
     while True:
-        keys, generations, payloads, after = await index.page(after, 100_000)
-        entries.update(zip(map(key_str, keys), zip(generations, payloads, strict=True), strict=True))
+        rows, after = await index.delta(None, after=after, first=100_000)
+        entries.update((key_str(r[0]), (r[3], r[4])) for r in rows)
         if after is None:
             return entries
 

@@ -10,7 +10,7 @@ import json
 from collections import Counter
 
 from solera.failed_keys import GONE, NAMES, OK, Record, eligible
-from solera.keys.index import KeyIndex, key_bytes, key_str
+from solera.keys.layers import LayerIndex, delta_names, key_bytes, key_str
 from solera.patterns import Matcher
 
 from . import observed, owed, planning
@@ -183,11 +183,11 @@ class Views:
                 continue
             cursor = key_bytes(start[1]) if start is not None and partition == start[0] else None
             with self.m.reading(state.prefix):  # its files outlive merges until the walk ends (aclose)
-                index = KeyIndex(self._key_io(), None, state.slice(), self.key_options)
+                index = LayerIndex(self._key_io(), state, cache=self._key_cache())
                 while True:
-                    keys, _, payloads, cursor = await index.page(cursor, PAGE)
-                    for k, p in zip(keys, payloads, strict=True):
-                        yield partition, key_str(k), Record.decode(p)
+                    rows, cursor = await index.delta(None, after=cursor, first=PAGE)
+                    for r in rows:
+                        yield partition, key_str(r[0]), Record.decode(r[4])
                     if cursor is None:
                         break
 
@@ -362,9 +362,7 @@ class Views:
         if state is None:
             return None
         with self.m.reading(state.prefix):
-            found = await KeyIndex(self._key_io(), None, state.slice(), self.key_options).lookup(
-                [key_bytes(key)]
-            )
+            found = await LayerIndex(self._key_io(), state, cache=self._key_cache()).lookup([key_bytes(key)])
         return found.get(key_bytes(key))
 
     async def _newest_outcome(self, asset: str, partition: str, key: str, outcomes=None) -> dict | None:
@@ -519,7 +517,7 @@ class Views:
                     {
                         "run": i.get("run"),
                         "attempt": i.get("attempt"),
-                        "files": [f["name"] for f in i.get("files") or ()],
+                        "files": delta_names(i),
                     }
                     for i in intents
                 ],
@@ -533,9 +531,7 @@ class Views:
         moved away whose leftovers await a cleanup task, with when each is
         due (K25)."""
 
-        partitions = [
-            self.partition_cleanups(output, partition)
-            for (output, partition), entries in sorted(self.m.cleanups.items())
-            if any(e.get("stuck") for e in entries)
-        ]
+        stuck = {k for k, entries in self.m.cleanups.items() if any(e.get("stuck") for e in entries)}
+        stuck |= {k for k, queue in self.m.cleaning.items() if any(d.get("stuck") for d in queue)}
+        partitions = [self.partition_cleanups(output, partition) for output, partition in sorted(stuck)]
         return partitions + self.retired_cleanups()

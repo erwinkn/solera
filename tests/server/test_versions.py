@@ -71,8 +71,8 @@ async def test_a_failure_record_lives_in_its_entry_across_a_restart(state, tmp_p
     import time
 
     from solera.failed_keys import RETRYING
-    from solera.keys.index import KeyIndex, key_str
     from solera.keys.io import ObjectIO
+    from solera.keys.layers import LayerIndex, key_str
 
     from .test_each import records
 
@@ -108,7 +108,7 @@ async def test_a_failure_record_lives_in_its_entry_across_a_restart(state, tmp_p
     again = await State.open(tmp_path.as_uri(), "test", flush_interval=0.001)
     engine = make_engine(again, project, clock=clock)
     await engine.initialize()
-    index = KeyIndex(ObjectIO(again.objects), None, again.model.index("@parse", "").slice())
+    index = LayerIndex(ObjectIO(again.objects), again.model.index("@parse", ""))
     found = await index.lookup([b"a.csv"])
     from solera.failed_keys import Record
 
@@ -144,12 +144,12 @@ async def _dead_write(state, landed: bool):
         live.rows["k"] = {"id": "k", "v": 9}
     # The dead attempt's intent, as its gate left it: its delta file names `k`.
     from solera.keys import SortedEntries
-    from solera.keys.index import KeyIndex
     from solera.keys.io import ObjectIO
+    from solera.keys.layers import LayerIndex
 
     index = state.model.index("items", "")
-    files, _ = await KeyIndex(ObjectIO(state.objects), None, index.slice()).resolve(
-        SortedEntries.of([b"k"]), commit_number=1, attempt="dead", generation=12
+    files, _ = await LayerIndex(ObjectIO(state.objects), index).write_patch(
+        SortedEntries.of([b"k"]), name="000000000001-dead", generation=12
     )
     state.model.repairs[("items", "")] = [{**files.to_json(), "run": "r", "attempt": "dead"}]
     assert status_of(await drive(engine, await engine.submit(["items"]))) == "succeeded"

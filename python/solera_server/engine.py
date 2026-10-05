@@ -25,6 +25,7 @@ import contextlib
 import datetime as dt
 import json
 import logging
+import math
 import secrets
 from zoneinfo import ZoneInfo
 
@@ -34,16 +35,16 @@ from solera import lifecycle
 from solera.failed_keys import lower
 from solera.ids import ulid, ulid_time
 from solera.keys import Rows, SortedEntries
-from solera.keys.index import (
+from solera.keys.io import ObjectIO
+from solera.keys.layers import (
     DeltaFiles,
-    FileInfo,
-    KeyIndex,
-    Options,
+    LayerIndex,
+    Part,
     delta_keys,
+    delta_names,
     key_bytes,
     key_str,
 )
-from solera.keys.io import ObjectIO
 from solera.sdk import default_placement, digest
 from solera.tasks import Tasks
 
@@ -79,6 +80,7 @@ PROVISION_SECONDS = 600.0  # a launched worker reports within this, or it never 
 CANCEL_GRACE = 60.0  # a requested cancel's time to drain before it is forced (§7)
 CLEANUPS = 64  # cleanup entries one cleanup task takes at most
 CLEANUP_INTERVAL = 3600.0  # the cleanup job looks for cleanup due anywhere this often (§9.8)
+CLEANUP_COALESCE = 60.0  # after commits, one cleanup task per output partition this often at most
 SOURCE_KEYS_RECORDED = 1000  # a source commit's run lists changed keys up to this many, else counts
 GRACE_SECONDS = 5.0
 CLEANUP_TRIES = 6  # a cleanup task's attempts, its retries backing off from a minute (K25)
@@ -131,13 +133,13 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
         concurrency: int = 4,
         clock=None,
         eval_interval: float = 0.5,
-        key_options: Options | None = None,
         maintenance_concurrency: int = 2,
         retention_interval: float = 60.0,
         history: History | None = None,
         resolve_cache: str | None | bool = True,
         sensor_host=None,
         cleanup_interval: float = CLEANUP_INTERVAL,
+        cleanup_coalesce: float = CLEANUP_COALESCE,
     ):
         import time
 
@@ -149,6 +151,11 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
         self.heartbeat_seconds, self.concurrency = heartbeat_seconds, concurrency
         self.provision_seconds, self.cancel_grace = provision_seconds, cancel_grace
         self.cleanup_interval, self._cleanup_job_at = cleanup_interval, 0.0  # the job's next look
+        # Commits' cleanup, coalesced (§9.8): when each output partition last got a
+        # cleanup task after a commit, and those whose commits wait for their next.
+        self.cleanup_coalesce = cleanup_coalesce
+        self._cleanup_at: dict[tuple, float] = {}
+        self._cleanup_waiting: set[tuple] = set()
         self.local_app = None  # its routes for workers it runs in this process (`api.local_transport`)
         # Where workers reach this engine (docs/lifecycle.md §5); without one,
         # they report through `.beat` alone.
@@ -174,7 +181,6 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
         # state — they run no local work and must not starve dispatch (§10).
         self.engine_inflight: set[str] = set()
         self.executor_inflight: dict[str, int] = {}
-        self.key_options = key_options or Options()
         self._io: ObjectIO | None = None
         # The key cache and resolver (docs/resolved-commits.md §4–§5): where
         # `resolve_cache` says, else beside `file://` state or in a temporary
@@ -182,7 +188,7 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
         self.keys: KeyService | None = None
         if resolve_cache:
             root = resolve_cache if isinstance(resolve_cache, str) else cache_root(state.objects_url)
-            self.keys = KeyService(state.objects, root, options=self.key_options)
+            self.keys = KeyService(state.objects, root)
         # What fails now, by name — the eval loop, upkeep, a key index, the history, an
         # automation — each entry cleared by its own next success: the one place it shows.
         self.failing: dict[str, str] = {}
@@ -193,7 +199,6 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
             self.history,
             manifest,
             clock=self.clock,
-            key_options=self.key_options,
             concurrency=maintenance_concurrency,
             retention_interval=retention_interval,
             keys=self.keys,
@@ -531,11 +536,9 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
         if write is not None:
             event["write"] = write
         prepared = (task.get("launched") or {}).get("prepared") or {}
-        for field in ("cleaned_up", "cleanup_unresolved"):  # cleanup (§9.8)
+        for field in ("cleaned_up", "cleanup_unresolved", "cleaned_to"):  # cleanup (§9.8)
             if worker.get(field):
                 event[field] = current_names(prepared, worker[field])
-        if worker.get("cleaned_files"):
-            event["cleaned_files"] = worker["cleaned_files"]
         if worker.get("read"):
             event["read"] = worker["read"]  # what its inputs' reads saw, for lineage
         if keys:
@@ -546,14 +549,15 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
             cleanup = task.get("cleanup") or {}
             handed = ((task.get("launched") or {}).get("prepared") or {}).get("cleanup") or {}
             if "output" in cleanup:  # a cleanup task: the rest, if its limit left some; else the job's
-                if (
-                    sum(len(i.get("cleanup") or ()) for i in (handed.get("outputs") or {}).values())
-                    >= CLEANUPS
+                if any(
+                    len(i.get("cleanup") or ()) >= CLEANUPS
+                    or len((i.get("deltas") or {}).get("deltas") or ()) >= CLEANUPS
+                    for i in (handed.get("outputs") or {}).values()
                 ):
                     self._submit_cleanups([(cleanup["output"], cleanup["partition"])])
             elif task["asset"] in self.manifest["assets"]:
                 outputs = self.manifest["assets"][task["asset"]]["outputs"]
-                self._submit_cleanups(
+                self._cleanup_soon(
                     [(o["name"], task["partition"]) for o in outputs if self.m.immutable(o["name"])]
                 )
         if self.keys is not None:
@@ -564,12 +568,12 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
     def _cache_commit(self, name: str, partition: str, keys: dict | None) -> None:
         """Keep the engine's cache warm with what a commit installed (§5)."""
 
-        if not keys or not keys.get("files"):
+        if not keys:
             return
         index = self.m.indexes.get((name, partition))
-        if index is not None:
-            files = [FileInfo.from_json(f) for f in keys["files"]]
-            self.keys.committed(index.prefix, index.path, files, self.m.event_counter)
+        files = DeltaFiles.from_json(keys).part.files
+        if index is not None and files:
+            self.keys.committed(index.prefix, list(files), self.m.event_counter)
 
     # -- dispatch ---------------------------------------------------------------
 
@@ -646,16 +650,15 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
 
     def _merges_behind(self, names: list[str], partition: str) -> str | None:
         """The first of the key indexes `names` in `partition` that upkeep has
-        let fall far behind — twice the span cap, which forced merges
-        otherwise hold — or None. Every index writer waits until merges catch
-        up (writer backpressure, docs/key-index-design.md § Limits): a task
-        writing one is held (`merges`), its outputs and a per-key asset's
-        failure index alike, and a source commit is refused, retryable."""
+        let fall far behind (`LayerState.backlogged`), or None. Every index
+        writer waits until merges catch up (writer backpressure,
+        docs/key-index-design.md § Compaction): a task writing one is held
+        (`merges`), its outputs and a per-key asset's failure index alike, and
+        a source commit is refused, retryable."""
 
-        cap = 2 * self.key_options.fan_in
         for name in names:
             index = self.m.indexes.get((name, partition))
-            if index is not None and len(index.spans) >= cap:
+            if index is not None and index.backlogged():
                 return name
         return None
 
@@ -718,14 +721,41 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
         if now >= self._cleanup_job_at:
             self._cleanup_job_at = now + self.cleanup_interval
             self._submit_cleanups()
+        due = [
+            k
+            for k in self._cleanup_waiting
+            if now >= self._cleanup_at.get(k, -math.inf) + self.cleanup_coalesce
+        ]
+        if due:
+            self._cleanup_waiting.difference_update(due)
+            self._cleanup_soon(due)
 
-    def _submit_cleanups(self, partitions=None) -> None:
+    def _cleanup_soon(self, partitions) -> None:
+        """Commits let go of something in `partitions` (output, partition): a
+        cleanup task each, coalesced — at most one per `cleanup_coalesce` after
+        commits, sooner once a step's worth of deltas (`CLEANUPS`) is queued;
+        the rest wait for the next look (`_cleanup_job`, each tick), and the
+        hourly job is the backstop. One task takes all that is due then."""
+
+        now = self.clock()
+        for key in partitions:
+            queued = len(self.m.cleaning.get(key) or ())
+            if now < self._cleanup_at.get(key, -math.inf) + self.cleanup_coalesce and queued < CLEANUPS:
+                self._cleanup_waiting.add(key)
+            elif self._submit_cleanups([key]):
+                self._cleanup_at[key] = now
+            elif queued or self.m.cleanups.get(key):  # held (a pin, a task already queued): look again
+                self._cleanup_at[key] = now
+                self._cleanup_waiting.add(key)
+
+    def _submit_cleanups(self, partitions=None) -> int:
         """A cleanup task for each of `partitions` (output, partition) with
         entries due — all of them with none, and every output life past its
         `cleanup_after`, read by no pin older than the deploy that ended it.
         None where one is queued or running already, or an entry is stuck. It
         runs as any task does — placed, retried a bounded number of times, in
-        the runs and their history — with no asset of the project's."""
+        the runs and their history — with no asset of the project's. Returns
+        how many it submitted."""
 
         submitted = {
             json.dumps(t.get("cleanup"), sort_keys=True)
@@ -734,17 +764,24 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
             if t["asset"] == CLEANUP and t["status"] not in TERMINAL_TASK
         }
         due, declared = [], {o["name"] for info in self.manifest["assets"].values() for o in info["outputs"]}
-        for output, partition in list(self.m.cleanups) if partitions is None else partitions:
-            if output in declared and self._due_cleanups(output, partition, None):  # what a task could take
+        for output, partition in (
+            list({**self.m.cleanups, **self.m.cleaning}) if partitions is None else partitions
+        ):
+            if output in declared and (
+                self._due_cleanups(output, partition, None) or self._due_step(output, partition, None)
+            ):  # what a task could take
                 due.append(({"output": output, "partition": partition}, f"{output}/{partition}", output))
         if partitions is None and self.m.retired:
             now, floor = self.clock(), self.m.pin_floor()
             for entry_id, entry in self.m.retired.items():
                 if not entry.get("stuck") and entry["due"] <= now and floor >= entry["before"]:
                     due.append(({"life": entry_id}, entry_id, entry["output"]))
+        made = 0
         for cleanup, partition, output in due:
             if json.dumps(cleanup, sort_keys=True) not in submitted:
                 self._cleanup_task(cleanup, partition, output)
+                made += 1
+        return made
 
     def _cleanup_task(self, cleanup: dict, partition: str, output: str) -> None:
         now = self.clock()
@@ -815,21 +852,20 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
             None,
         )
         entries = self._due_cleanups(output, partition, attempt) if owner is not None else []
-        if not entries:
+        step = self._due_step(output, partition, attempt) if owner is not None else None
+        if not entries and step is None:
             return {**prepared, "skip": True}
         claim = self.m.claimed(attempt)
-        if claim is not None:
-            # What its spec hands it is read from now, not from `AttemptLaunched` on: an
-            # operator's clearing meanwhile must not let collection take it.
-            claim["cleanups"] = _delta_files(entries)
-        home = self.m.homes.get(output, output)
+        if claim is not None and step is not None:
+            # The deltas its spec hands it are read from now, not from `AttemptLaunched`
+            # on: a step acknowledged meanwhile must not let collection take them.
+            claim["cleanups"] = _delta_files(step["deltas"])
+        info = {"cleanup": entries, "home": self.m.homes.get(output, output)}
+        if step is not None:
+            info["deltas"] = step
         return {
             **prepared,
-            "cleanup": {
-                "asset": owner,
-                "partition": partition,
-                "outputs": {output: {"cleanup": entries, "home": home}},
-            },
+            "cleanup": {"asset": owner, "partition": partition, "outputs": {output: info}},
         }
 
     def _partition_active_claim(self, asset: str, partition: str) -> bool:
@@ -1064,7 +1100,7 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
             if output.get("incremental"):
                 info["commit_number"] = int((head or {}).get("commit_number", -1)) + 1
             if output.get("key") is not None:
-                info["index"] = self.m.index(name, partition).slice().to_json()
+                info["index"] = self.m.index(name, partition).to_json()
                 if (name, partition) in self.m.repairs:
                     info["repairs"] = self.m.repairs[(name, partition)]
                 if output.get("dynamic_partitions") or name in self._dynamic_dims:
@@ -1186,7 +1222,7 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
             or store.get("writes") != "immutable"
         ):
             return None
-        return self.m.index(output, ref.get("partition") or "").slice().to_json()
+        return self.m.index(output, ref.get("partition") or "").to_json()
 
     @staticmethod
     def _versioned(input: planning.Input) -> bool:
@@ -1268,7 +1304,7 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
             "forced_at": current,
             "now": self.clock(),
             "retries": asset.get("retries", {}).get("n", 0),
-            "failures": failures.slice().to_json(),
+            "failures": failures.to_json(),
             "commit_number": int(record.get("commit_number", -1)) + 1,
             "pass_after": (retry or {}).get("after"),
         }
@@ -1391,6 +1427,28 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
         return [e for e in entries if e["n"] <= floor and e.get("after", 0) <= now and not e.get("stuck")][
             :CLEANUPS
         ]
+
+    def _due_step(self, output: str, partition: str, attempt: str | None) -> dict | None:
+        """The next step of an immutable keyed output's cleanup cursor (§9.8):
+        the queued deltas no reader can still need, in commit order, up to the
+        first one some reader may — committed after the oldest reader pin but
+        this attempt's own, or past the oldest commit an observation holds
+        (its readers read at it or later, so what a later commit replaced is
+        theirs). At most `CLEANUPS` deltas; `to`, the last one's event counter,
+        is where the cursor moves once its deletes are done. None: none due."""
+
+        queue = self.m.cleaning.get((output, partition))
+        if not queue or queue[0].get("stuck"):  # in order: a stuck step holds the rest
+            return None
+        floor = self.m.pin_floor(but=attempt, path=self.m.index(output, partition).prefix)
+        life = self.m.index(output, partition).life
+        oldest = self.m.oldest_observed(output, partition)
+        due = []
+        for d in queue[:CLEANUPS]:
+            if d["n"] > floor or (d["life"] == life and oldest is not None and d["commit"] > oldest):
+                break
+            due.append(d)
+        return {"to": due[-1]["n"], "deltas": due} if due else None
 
     def _definition(self, asset: str, run) -> str:
         """The definition its inputs' observations are made under:
@@ -1526,7 +1584,7 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
                     raise Conflict(f"keyed output {name}: the result carries no key delta", retryable=False)
                 head["commit_number"] = int((before or {}).get("commit_number", -1))
                 if delta is not None:
-                    if delta["files"]:
+                    if delta_names(delta):
                         head["commit_number"] = int(info["commit_number"])
                     keys[name] = {**delta, "commit_number": head["commit_number"]}
                 if "partitions" in info:
@@ -1618,14 +1676,17 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
         for an unkeyed source. `by` says where the commit came from."""
 
         head = self.m.heads.get((name, ""))
-        event, ref = await self._prepare_commit(name, version, keys, upsert, remove, by)
-        if event is None:
-            return {"changed": False, "ref": ref}
-        if commit_of(self.m.heads.get((name, ""))) != commit_of(head):
-            await self._drop_prepared([event])
-            raise Conflict(f"source {name!r} moved while committing; retry")
-        event["at"] = self.clock()
-        self.state.record(event)
+        # Its delta is named by nothing until recorded: its index is held as read
+        # meanwhile, so the orphan collector leaves it be.
+        with self.m.reading(self.m.index(name, "").prefix):
+            event, ref = await self._prepare_commit(name, version, keys, upsert, remove, by)
+            if event is None:
+                return {"changed": False, "ref": ref}
+            if commit_of(self.m.heads.get((name, ""))) != commit_of(head):
+                await self._drop_prepared([event])
+                raise Conflict(f"source {name!r} moved while committing; retry")
+            event["at"] = self.clock()
+            self.state.record(event)
         self._committed_keys([event])
         return {"changed": True, "ref": ref, "run": event["run"]["id"]}
 
@@ -1687,30 +1748,26 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
                 [key_bytes(k) for k in new], list(new.values()), [key_bytes(k) for k in removes]
             )
             with self.m.reading(self.m.index(name, "").prefix):  # outlives merges meanwhile
-                pinned = self.m.index(name, "").slice()
-                index = KeyIndex(self._key_io(), None, pinned, self.key_options)
+                pinned = self.m.index(name, "")
+                index = LayerIndex(self._key_io(), pinned, cache=self._key_cache())
+                stem = f"{commit_number:012d}-{attempt}"
                 files = await self._resolve_source(
-                    index, pinned, sorted_run, replace, commit_number, attempt, generation
+                    index, sorted_run, replace, stem, commit_number, generation
                 )
                 if files is not None:
                     files, changed = files
                 elif replace:
-                    files, changed = await index.replace(
+                    files, changed = await index.write_replace(
                         Rows.pairs([(key_bytes(k), r) for k, r in new.items()]),
-                        commit_number,
-                        attempt,
-                        collect=2 * SOURCE_KEYS_RECORDED,
+                        name=stem,
                         generation=generation,
+                        collect=2 * SOURCE_KEYS_RECORDED,
                     )
                 else:
-                    files, changed = await index.resolve(
-                        sorted_run,
-                        commit_number=commit_number,
-                        attempt=attempt,
-                        generation=generation,
-                        collect=2 * SOURCE_KEYS_RECORDED,
+                    files, changed = await index.write_patch(
+                        sorted_run, name=stem, generation=generation, collect=2 * SOURCE_KEYS_RECORDED
                     )
-            if not files.files:
+            if not files.part.files:
                 return None, head["ref"] if head is not None else source["head"]
             record["commit_number"] = commit_number
             if listed is not None:
@@ -1718,7 +1775,7 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
                 record["partitions"] = sorted(set(new) if replace else (before - set(removes)) | set(new))
             event["keys"] = {**files.to_json(), "commit_number": commit_number}
             run["commit_number"] = commit_number
-            counts = (sum(f.entries for f in files.files) - files.removed, files.removed)
+            counts = (files.part.entries - files.removed, files.removed)
             for field, keys, count in zip(
                 ("upserted", "deleted"), changed or (None, None), counts, strict=True
             ):
@@ -1744,41 +1801,43 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
         paths = []
         for event in events:
             if "keys" in event:
-                index = KeyIndex(
-                    self._key_io(), None, self.m.index(event["source"], "").slice(), self.key_options
-                )
-                paths += [index.path(f["name"]) for f in event["keys"]["files"]]
+                index = self.m.index(event["source"], "")
+                paths += [index.path(n) for n in delta_names(event["keys"])]
         if paths:
             await self.state.delete_objects(paths)
 
-    async def _resolve_source(self, index, pinned, run, replace, commit_number, attempt, generation):
+    async def _resolve_source(self, index, run, replace, stem, commit_number, generation):
         """A small source commit through the warm resolver, in process
         (docs/resolved-commits.md §4): its files and changed keys, or None when
         the cache cannot answer and the commit resolves cold."""
 
-        from solera.keys.resolver import Limits
+        from solera.keys.resolver import Limits, delta_files
 
         lim = Limits()
-        size = len(run) + (pinned.count if replace else 0)
+        size = len(run) + (index.state.count if replace else 0)
         if self.keys is None or size > (lim.max_entries if replace else lim.max_keys):
             return None
-        name = f"{commit_number:012d}-{attempt}.0000"
         answer, delta = await self.keys.direct(
-            pinned,
+            index.state,
             "replace" if replace else "patch",
             run,
             generation,
             commit_number,
-            index.path(name),
+            index.state.path(f"{stem}-0.lay"),
             self.m.event_counter,
         )
         if answer["result"] == "empty":
-            return DeltaFiles([], 0, 0, generation), ([], [])
+            return DeltaFiles(Part(), 0, 0, generation), ([], [])
         if answer["result"] != "delta":
             return None
-        await index.io.write(index.path(name), delta)
-        files = DeltaFiles([FileInfo.describe(name, delta)], answer["added"], answer["removed"], generation)
-        return files, delta_keys(delta)
+        await index.io.write(index.state.path(f"{stem}-0.lay"), delta)
+        return delta_files(answer, stem, generation), delta_keys(delta, generation)
+
+    def _key_cache(self):
+        """The engine's cache of layers, where the key service runs: what the
+        engine's own reads and writes go through."""
+
+        return getattr(self.keys, "cache", None) if self.keys is not None else None
 
     # -- key index upkeep (§6) --------------------------------------------------------
 
@@ -1795,15 +1854,19 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
         state = self.m.indexes.get((output, partition))
         if state is None:
             return {"total": 0, "keys": {}, "next": None}
-        start = key_bytes(after) if after is not None else None
+        cursor, rows = key_bytes(after) if after is not None else None, []
         with self.m.reading(state.prefix):  # its files outlive merges until the page is read
-            index = KeyIndex(self._key_io(), None, state.slice(), self.key_options)
-            keys, generations, _, nxt = await index.page(start, offset + limit)
+            index = LayerIndex(self._key_io(), state, cache=self._key_cache())
+            while len(rows) < offset + limit:
+                page, cursor = await index.delta(None, after=cursor, first=offset + limit - len(rows))
+                rows += page
+                if cursor is None:
+                    break
         return {
             "total": state.count,
             # Each key's version: the generation that last wrote it (docs/versions.md).
-            "keys": {key_str(k): g for k, g in list(zip(keys, generations, strict=True))[offset:]},
-            "next": key_str(nxt) if nxt is not None else None,
+            "keys": {key_str(r[0]): r[3] for r in rows[offset:]},
+            "next": key_str(cursor) if cursor is not None else None,
         }
 
     # -- automations (§9) ------------------------------------------------------------

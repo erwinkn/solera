@@ -433,19 +433,18 @@ async def test_reconciliation_streams_the_slice_s_keys(store, monkeypatch):
     patch reconciles like any: a key it gives no rows is removed."""
 
     from obstore.store import MemoryStore
-    from solera.keys.index import IndexState, KeyIndex
+    from solera import _native
     from solera.keys.io import ObjectIO
+    from solera.keys.layers import LayerIndex, LayerState
     from solera_worker import worker
-
-    from . import keys_reference as _python
 
     out = output(key="id", partition_column="site")
     rows = [{"id": "a", "x": 1}, {"id": "c", "x": 3}, {"id": "e", "x": 5}]
     written = await store.store(rows, None, context(out, partition="oakland"))
     io = ObjectIO(MemoryStore())
-    state = IndexState(prefix="keys/")
-    files, _ = await KeyIndex(io, None, state).replace(
-        prepare_for(store, rows + [{"id": "f", "x": 6}], out).rows, 0, "w1", generation=1
+    state = LayerState(prefix="keys/", life="1")
+    files, _ = await LayerIndex(io, state).write_replace(
+        prepare_for(store, rows + [{"id": "f", "x": 6}], out).rows, name="000000000000-w1", generation=1
     )
     state = state.committed(0, files)
 
@@ -468,15 +467,15 @@ async def test_reconciliation_streams_the_slice_s_keys(store, monkeypatch):
             {"commit_number": 1, "repairs": [{"unknown": True}], "before": written.ref.to_json()},
             patch,
         )
-        o.index = KeyIndex(io, None, state)
+        o.index = LayerIndex(io, state)
         o.prepared = prepare_for(store, patch, out)
         o.run = SortedEntries.from_rows(o.prepared.rows, [k.encode() for k in o.prepared.removes])
         g = attempt + 2
         delta, _ = await worker._reconcile(o, {"attempt": f"w{g}", "generation": g})
         got = [
-            e[:3]
-            for f in delta.files
-            for e in _python.iter_file(await io.read_whole(state.path(f.name), f.size))
+            (e[0], e[4], int(not e[1]))
+            for f in delta.part.files
+            for e in _native.layers_decode(await io.read_whole(state.path(f.name), f.size), 1, g)
         ]
         # What the store holds is written again at g; `f`, which it lacks, removed.
         assert got == [(b"a", g, 0), (b"b", g, 0), (b"c", g, 1), (b"e", g, 0), (b"f", g, 1)]
@@ -863,16 +862,18 @@ async def test_a_repair_read_back_waits_off_the_event_loop(store, monkeypatch):
     import time
 
     from obstore.store import MemoryStore
-    from solera.keys.index import IndexState, KeyIndex
     from solera.keys.io import ObjectIO
+    from solera.keys.layers import LayerIndex, LayerState
     from solera_worker import worker
 
     out = output(key="id")
     rows = [{"id": "a", "x": 1}]
     written = await store.store(rows, None, context(out))
     io = ObjectIO(MemoryStore())
-    state = IndexState(prefix="keys/")
-    files, _ = await KeyIndex(io, None, state).replace(prepare_for(store, rows, out).rows, 0, "w1")
+    state = LayerState(prefix="keys/", life="1")
+    files, _ = await LayerIndex(io, state).write_replace(
+        prepare_for(store, rows, out).rows, name="000000000000-w1", generation=1
+    )
     state = state.committed(0, files)
     keys = store.keys
 
@@ -889,7 +890,7 @@ async def test_a_repair_read_back_waits_off_the_event_loop(store, monkeypatch):
         {"commit_number": 1, "repairs": [{"unknown": True}], "before": written.ref.to_json()},
         patch,
     )
-    o.index = KeyIndex(io, None, state)
+    o.index = LayerIndex(io, state)
     o.prepared = prepare_for(store, patch, out)
     o.run = SortedEntries.from_rows(o.prepared.rows)
     late = []

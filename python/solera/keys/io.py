@@ -35,9 +35,7 @@ class Metrics:
 class ObjectIO:
     """Reads and writes objects with at most `concurrency` requests in flight.
     `latency` adds a fixed delay per request and `bandwidth` a per-connection
-    transfer rate, to model a remote object store in benchmarks. `local`
-    (the engine cache's copies, by path) and `served` (a `reads.Reads`) are
-    for the `KeyIndex` reading through it: what it reads before the store."""
+    transfer rate, to model a remote object store in benchmarks."""
 
     def __init__(
         self,
@@ -47,11 +45,8 @@ class ObjectIO:
         latency: float = 0.0,
         bandwidth: float | None = None,
         metrics: Metrics | None = None,
-        local: dict | None = None,
-        served=None,
     ):
         self.store = store
-        self.local, self.served = local, served
         self.latency = latency
         self.bandwidth = bandwidth
         self.metrics = metrics or Metrics()

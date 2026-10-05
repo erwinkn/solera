@@ -1,9 +1,9 @@
-"""Δ(P, H, keys) over today's index (solera.keys.delta): every key whose
-state differs between P and H, with its presence at both and its version at
-H — checked key by key against a per-commit fold: named keys, and ranges
-read a page at a time, with and without a pattern filter, from −∞ and from
-a commit, to the head and to a pinned head, across merges that keep the
-endpoints asked for."""
+"""Δ(P, H, keys) over the stamped-layer index (solera.keys.delta): every key
+whose state differs between P and H, with its presence at both and its
+version at H — checked key by key against a per-commit fold: named keys,
+and ranges read a page at a time, with and without a pattern filter, from
+−∞ and from a commit, to the head and to a pinned head, across merges that
+keep the flips after the cut."""
 
 import random
 
@@ -52,14 +52,14 @@ async def test_delta_agrees_with_the_fold(seed):
             ), (p, at)
 
 
-async def test_delta_reads_across_merges_that_keep_its_endpoints():
+async def test_delta_reads_across_merges_from_any_p_at_or_after_the_cut():
     h = History()
     rng = random.Random(7)
     for _ in range(10):
         await h.commit([k(rng.randrange(40)) for _ in range(8)], [k(rng.randrange(40)) for _ in range(2)])
     p = 4
-    await h.merge_all({p + 1})  # a reader observed at commit 4 keeps commit 5 an endpoint
-    assert len(h.state.spans) < 10
+    await h.merge_all(cut=p)  # a reader observed at commit 4: the cut stays there
+    assert len(h.state.layers) < 10
     head = h.commit_number - 1
     assert await walk(h.index(), p, None, 7) == h.expected(p, head)
     assert await walk(h.index(), None, None, 7) == h.expected(None, head)
@@ -70,3 +70,14 @@ async def test_an_empty_delta():
     await h.commit([k(1)])
     assert (await delta(h.index(), 0, None, keys=[k(1)])).diffs == []  # P is the head: nothing differs
     assert (await delta(h.index(), None, None, keys=[k(2)])).diffs == []  # absent at both ends
+
+
+async def test_delta_from_before_the_first_commit_adds_every_key():
+    """P = -1, the state before commit 0 (an observation of an empty
+    upstream): every key live at H is added, as from −∞."""
+
+    h = History()
+    await h.commit([k(1), k(2)])
+    await h.commit([k(3)], [k(1)])
+    assert (await delta(h.index(), -1, None)).diffs == (await delta(h.index(), None, None)).diffs
+    assert [d.key for d in (await delta(h.index(), -1, None)).diffs] == [k(2), k(3)]

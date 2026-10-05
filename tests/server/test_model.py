@@ -11,7 +11,7 @@ from solera.sdk import Every, Incremental, OnChange, Output, Project, asset
 from solera.stores import Patch
 from solera_server.engine import Engine
 from solera_server.executors.inline import InlinePlacement
-from solera_server.model import CLEANUP, Model
+from solera_server.model import CLEANUP, TERMINAL_RUN, Model
 from solera_server.state import Conflict, LostOwnership, State
 
 from tests.conftest import worker_finished
@@ -121,7 +121,7 @@ async def test_commit_installs_heads_cursor_observations_and_pends_onchange(stat
     assert await engine.complete("consumer", "")
     rec = m.partition("consumer", "")["observed"]["files"]  # its record: every key, at the head
     assert rec["upstream"] == ["files", ""] and rec["ranges"] == [] and rec["base"]["endpoint"] == 0
-    assert m.oldest_observed("files", "") == 0 and m.endpoints("files", "") == {1}
+    assert m.oldest_observed("files", "") == 0
     # files changed and consumer watches it: the change pended, and the next tick
     # (run_until ticks) fired the OnChange automation and consumed it — without a
     # new run, since this run's consumer task was still pending (§9).
@@ -378,9 +378,20 @@ async def test_the_journal_alone_reproduces_the_live_model(tmp_path, clock):
         await settle(engine, (await engine.submit(["consumer"], upstream=True))["id"])
         clock.now += 61
     await worker_finished()
-    for cleanup in [r for r in engine.m.runs.values() if r["kind"] == "cleanup"]:
-        await settle(engine, cleanup["id"])  # its cleanup tasks too: nothing lands after the snapshot
-    await engine.tick()  # archive what finished
+    # A tick archives what finished, and submits the cleanup commits left waiting
+    # (coalesced): settled too, until none is left, so nothing lands after the snapshot.
+    while True:
+        await engine.tick()
+        pending = [
+            r["id"]
+            for r in engine.m.runs.values()
+            if r["kind"] == "cleanup" and r["status"] not in TERMINAL_RUN
+        ]
+        if not pending:
+            break
+        for run_id in pending:
+            await settle(engine, run_id)
+        await worker_finished()
     run = await engine.submit(["polled"])
     await state.durable()
     await engine.pause(run["id"])  # after RunSubmitted was flushed: it must not change it
@@ -511,14 +522,21 @@ def test_a_rename_moves_a_scopes_record_whole():
 
 def test_a_cleanup_entrys_delta_outlives_the_attempt_holding_it():
     """docs/lifecycle.md §9.8, simulation finding F11: a cleanup task's spec
-    hands it an entry; the entry goes meanwhile (an operator clears it). The
-    delta file the entry reads stays readable until the task holding it
-    ends, not only while the entry is pending."""
+    hands it a cursor step; the step's deltas leave the queue meanwhile
+    (another task acknowledged them). The delta file the step reads stays
+    readable until the task holding it ends, not only while it is queued."""
 
     m = Model()
-    entry = {"n": 1, "id": "1.0", "kind": "delta", "prefix": "keys/out/_/", "files": ["000000000003-a"]}
-    path = "keys/out/_/000000000003-a.kx"
-    m.cleanups[("out", "")] = [entry]
+    delta = {
+        "n": 1,
+        "life": "1",
+        "commit": 3,
+        "generation": 9,
+        "prefix": "keys/out/_/",
+        "files": ["000000000003-a-0.lay"],
+    }
+    path = "keys/out/_/000000000003-a-0.lay"
+    m.cleaning[("out", "")] = [delta]
     task = {
         "id": "t1",
         "asset": CLEANUP,
@@ -528,13 +546,17 @@ def test_a_cleanup_entrys_delta_outlives_the_attempt_holding_it():
             "started_at": 0.0,
             "generation": 5,
             "prepared": {
-                "cleanup": {"asset": "out", "partition": "", "outputs": {"out": {"cleanup": [entry]}}}
+                "cleanup": {
+                    "asset": "out",
+                    "partition": "",
+                    "outputs": {"out": {"cleanup": [], "deltas": {"to": 1, "deltas": [delta]}}},
+                }
             },
         },
     }
     m._hold(task)
     assert path in m.cleanup_reads()
-    m._drop_cleanups("out", "", ["1.0"])  # cleared meanwhile
+    del m.cleaning[("out", "")]  # acknowledged meanwhile
     assert path in m.cleanup_reads()  # A2 still reads it
     del m.claims["t1"]  # A2 ended
     assert path not in m.cleanup_reads()

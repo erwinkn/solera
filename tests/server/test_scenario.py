@@ -8,7 +8,6 @@ import json
 import random
 from pathlib import Path
 
-from solera.keys.index import Options
 from solera.sdk import Incremental, Output, Project, Retention, asset
 from solera.stores import Patch
 from solera_server.engine import Engine
@@ -54,7 +53,6 @@ async def test_every_boundary_once(tmp_path):
         project.manifest,
         placements={"Local": lambda s, c: InlinePlacement(c, project)},
         clock=clock,
-        key_options=Options(window=2),
         retention_interval=0,
         history=History(state, clock=clock, flush_rows=10),
     )
@@ -86,7 +84,7 @@ async def test_every_boundary_once(tmp_path):
         await engine.history.lake.tick()
 
     m = state.model
-    assert any(s.b > s.a for s in m.indexes[("items", "")].spans)  # merged
+    assert any(not x.delta for x in m.indexes[("items", "")].layers)  # merged
     assert any(f["rows"] for f in m.history.files.get("runs", ()))  # history flushed
     kept = await engine.list_runs(None, limit=1000)
     assert kept["total"] <= 2 * 3 + 2  # of 20: retired behind `runs=3` per asset

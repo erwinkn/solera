@@ -84,8 +84,12 @@ without this, each run would wake every consumer of the set.
 
 ## 3. The index entry
 
-The `.kx` entry collapsed in format version 3 (`key-index-format.md` has
-today's, v4):
+The `.kx` entry collapsed in format version 3. (Since T33 the index is
+stamped layers, with no `.kx` files: a delta entry is the key, its change
+and a payload, plus the replaced generation on immutable stores; a layer
+entry adds presence, the last change's commit and generation, and flips.
+`key-index-format.md` has today's. What this section settled — one
+generation for version and name, one payload field — carries over.)
 
 ```
 before   (key, version, deleted, locator)        + predecessor (version, locator)
@@ -260,13 +264,14 @@ lineage:  B ← A, generation 12                    (g12 committed)
 
 ## 8. Hashing that stays
 
-None of it over user data: key filters, file and payload checksums, the
+None of it over user data: block checksums, the
 fingerprint, and a deploy's build identity.
 
 ## 9. Tests
 
-- **Unit.** The entry format round trips in Rust and the Python reference
-  (`tests/sdk/keys_reference.py`); every
+- **Unit.** The layer and delta entries round-trip natively
+  (`native/src/layers.rs`) and agree with the per-commit fold
+  (`tests/sdk/test_keys_layers.py`); every
   write is a change; a retried store call in one attempt gives the same
   delta bytes; source versions: equal unchanged, different changed, absent
   changed; set elements re-listed unchanged; immutable names and

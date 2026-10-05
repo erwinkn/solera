@@ -5,6 +5,23 @@
 
 use rayon::prelude::*;
 
+use crate::error::{Error, Result};
+
+/// The permutation that sorts `keys`; errors on a duplicate key.
+pub fn sort_order(keys: &[&[u8]]) -> Result<Vec<usize>> {
+    let mut order: Vec<usize> = (0..keys.len()).collect();
+    order.sort_unstable_by(|&a, &b| keys[a].cmp(keys[b]));
+    for w in order.windows(2) {
+        if keys[w[0]] == keys[w[1]] {
+            return Err(Error::Value(format!(
+                "duplicate key {:?}",
+                String::from_utf8_lossy(keys[w[0]])
+            )));
+        }
+    }
+    Ok(order)
+}
+
 /// Random access to the keys being sorted.
 pub trait Keys: Sync {
     fn len(&self) -> usize;

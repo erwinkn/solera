@@ -23,7 +23,7 @@ from dataclasses import dataclass, field
 from solera import errors
 from solera.failed_keys import REMOVED, UNMATCHED, Outcome, Record, lower, minima, transition
 from solera.keys import SortedEntries
-from solera.keys.index import IndexState, KeyIndex, key_bytes
+from solera.keys.layers import LayerIndex, LayerState, key_bytes
 from solera.sdk import UNSET, Ref, Result
 from solera.stores import Keys, Patch, SourceBehind, missing_keys
 from solera.tasks import Tasks
@@ -102,7 +102,7 @@ async def gone_since(output: str, key: str | None, value, expected: dict, pin: d
     missing = missing_keys(key, value, expected)
     if not missing:
         return []
-    head = KeyIndex(keys_io, None, IndexState.from_json(pin.get("head") or pin["index"]))
+    head = LayerIndex(keys_io, LayerState.from_json(pin.get("head") or pin["index"]))
     held = await head.lookup([key_bytes(k) for k in missing])
     for k in missing:
         if key_bytes(k) in held:
@@ -369,14 +369,12 @@ async def _failures(spec, each: dict, batch: Batch, outcomes: dict, keys_io) -> 
                 upsert_records.append(record.encode())
         elif prior is not None:
             removes.append(key_bytes(key))
-    state = IndexState.from_json(each["failures"])
+    state = LayerState.from_json(each["failures"])
     if each.get("start_over"):  # the commit replaces the index: resolved against an empty one
-        state = IndexState(prefix=state.prefix)
-    index = KeyIndex(keys_io, None, state)
-    files, _ = await index.resolve(
+        state = LayerState(prefix=state.prefix)
+    files, _ = await LayerIndex(keys_io, state).write_patch(
         SortedEntries.of(upsert_keys, upsert_records, removes),
-        commit_number=int(each["commit_number"]),
-        attempt=spec["attempt"],
+        name=f"{int(each['commit_number']):012d}-{spec['attempt']}",
         generation=int(spec.get("generation") or 0),
     )
     due, deploy_min = minima(records.values())

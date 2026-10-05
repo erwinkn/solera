@@ -1,9 +1,8 @@
 """Storage upkeep (docs/object-store-state.md §6, §7, §11): background work
 that keeps the object store tidy. The engine never waits on it.
 
-- key indexes: adjacent spans merged, as the merge policy plans them
-  against the commits readers need (docs/key-index-design.md), on worker
-  threads;
+- key indexes: adjacent layers merged by the rule (docs/key-index-design.md
+  § Compaction), on worker threads; the cut raised as readers move on;
 - garbage: files nothing references any more are deleted once the events
   that let go of them are durable, and no attempt that may read them runs;
   merge outputs no state ever referenced (their merge failed, or its engine
@@ -23,9 +22,8 @@ import json
 import logging
 import math
 
-from solera.keys import LocalError
-from solera.keys.index import IndexState, KeyIndex, Options
 from solera.keys.io import ObjectIO
+from solera.keys.layers import LayerIndex, LayerState, delta_names, epoch_of
 from solera.tasks import Tasks
 
 from . import history
@@ -39,6 +37,21 @@ MERGE_ATTEMPTS = 3  # attempts per input set before merging an index stops, alar
 ORPHAN_SECONDS = 600.0
 
 
+def _attempt_of(name: str) -> str | None:
+    """The attempt a commit's delta file names (`{commit:012d}-{attempt}-{n}.lay`,
+    `{commit:012d}-{attempt}.lix`), or None: not a delta's."""
+
+    stem, _, ext = name.rpartition(".")
+    parts = stem.split("-")
+    if ext == "lay" and len(parts) == 3 and parts[2].isdigit():
+        commit, attempt = parts[0], parts[1]
+    elif ext == "lix" and len(parts) == 2:
+        commit, attempt = parts
+    else:
+        return None
+    return attempt if len(commit) == 12 and commit.isdigit() and attempt else None
+
+
 class Upkeep:
     def __init__(
         self,
@@ -47,7 +60,6 @@ class Upkeep:
         manifest: dict,
         *,
         clock,
-        key_options: Options | None = None,
         concurrency: int = 2,
         retention_interval: float = 60.0,
         interval: float = 1.0,
@@ -56,14 +68,15 @@ class Upkeep:
     ):
         self.state, self.history, self.manifest, self.clock = state, history, manifest, clock
         self.keys = keys  # the engine's key cache: merge outputs go into it as written
-        self.key_options = key_options or Options()
         self.concurrency = concurrency
         self.retention_interval, self.interval = retention_interval, interval
         self.tasks = Tasks("upkeep")  # its tick
         self.jobs = Tasks("upkeep jobs")  # merges running, by (index key, lane)
         self.failing = {} if failing is None else failing  # what fails now, by name: the engine's
-        self._checked: dict[tuple, IndexState] = {}  # the state last found needing nothing
-        self._busy: dict[tuple, frozenset] = {}  # the input spans of each merge running, by (key, lane)
+        self._checked: dict[tuple, LayerState] = {}  # the state last found needing nothing
+        self._busy: dict[
+            tuple, frozenset
+        ] = {}  # the input layers (ids) of each merge running, by (key, lane)
         self._swept = -math.inf
         self._alive = -math.inf
         self._orphans_at = -math.inf
@@ -100,121 +113,103 @@ class Upkeep:
     # -- key indexes (§6) --------------------------------------------------------------
 
     def maintain(self) -> None:
-        """Start span merges, `concurrency` at a time: per index, one into the
-        base and one among the other spans, whose inputs never overlap. An
-        index whose merges of one input set were uploaded `MERGE_ATTEMPTS`
-        times in its current life, none published, merges no more, alarmed:
-        the count is durable (`Model.merges`), so neither a restart nor a
-        takeover resets it, and a new life starts afresh."""
+        """Raise each index's cut to the oldest commit its readers hold (its
+        head when none holds one), and
+        start merges, `concurrency` at a time: per index, one into the base
+        and one among the tiers, whose inputs never overlap. Once an input
+        set's merge was uploaded `MERGE_ATTEMPTS` times in the index's
+        current life, none published, the index merges no more, alarmed: the
+        count is durable (`Model.merges`), so neither a restart nor a
+        takeover resets it, and a new life starts afresh. (Not the next
+        smaller set: a store that fails every upload would pay the budget
+        once per candidate set.)"""
 
         for key, index in list(self.m.indexes.items()):
+            oldest = self.m.oldest_observed(*key)
+            if oldest is None:  # no reader holds a commit of it: none needs a flip
+                oldest = index.head
+            if oldest > index.cut:
+                self.state.record(
+                    {
+                        "type": "IndexCut",
+                        "output": key[0],
+                        "partition": key[1],
+                        "life": index.life,
+                        "cut": oldest,
+                    }
+                )
+                index = self.m.indexes[key]
             if len(self.jobs) >= self.concurrency:
                 break
             if self._checked.get(key) is index:
                 continue
             rec = self.m.merge_record(key, index.life)
-            spent = [k for k, n in rec["attempts"].items() if n >= MERGE_ATTEMPTS]
+            spent = {k for k, n in rec["attempts"].items() if n >= MERGE_ATTEMPTS}
             if spent:
                 self.failing[f"key index {key[0]}/{key[1]} merges"] = (
-                    f"a merge of {spent[0]!r} was uploaded {MERGE_ATTEMPTS} times, none published: "
-                    "this index merges no more in its life"
+                    f"a merge of {sorted(spent)[0]!r} was uploaded {MERGE_ATTEMPTS} times, none published: "
+                    "the index merges no more in this life"
                 )
+                self._checked[key] = index
                 continue
             self.failing.pop(f"key index {key[0]}/{key[1]} merges", None)
-            endpoints = self.m.endpoints(*key)
             planned = False
-            for lane in ("base", "tail"):
+            for lane in ("base", "tier"):
                 if (key, lane) in self.jobs or len(self.jobs) >= self.concurrency:
                     continue
-                other = self._busy.get((key, "tail" if lane == "base" else "base"), frozenset())
-                plan = KeyIndex(None, None, index, self.key_options).plan_merge(
-                    endpoints, lane=lane, busy=other, rejected=frozenset(rec["rejected"])
-                )
+                other = self._busy.get((key, "tier" if lane == "base" else "base"), frozenset())
+                plan = index.plan(busy=other, stopped=spent, lane=lane)
                 if plan is None:
                     continue
-                lo, count = plan
-                self._busy[(key, lane)] = frozenset((sp.a, sp.b) for sp in index.spans[lo : lo + count])
-                self.jobs.spawn(self._merge(key, lane, index, plan, endpoints), key=(key, lane))
+                _, lo, count = plan
+                self._busy[(key, lane)] = frozenset(x.id for x in index.layers[lo : lo + count])
+                self.jobs.spawn(self._merge(key, lane, index, lo, count), key=(key, lane))
                 planned = True
-            if not planned and not any((key, lane) in self.jobs for lane in ("base", "tail")):
+            if not planned and not any((key, lane) in self.jobs for lane in ("base", "tier")):
                 self._checked[key] = index
 
-    async def _merge(self, key: tuple, lane: str, index: IndexState, plan, endpoints: set[int]) -> None:
-        """One span merge, run on a worker thread with its own event loop so
-        merging never blocks the engine, then published through the journal
-        if the index is still the life it was planned against and holds its
-        inputs; else its output is deleted. A span rewritten alone is first
-        counted without uploading: if it would drop too little, that is
-        remembered and nothing is uploaded. Every upload is counted,
-        durably, before it starts. Writes are exact, so a merge lets go of no
-        object the deltas did not already list."""
+    async def _merge(self, key: tuple, lane: str, index: LayerState, lo: int, count: int) -> None:
+        """One merge, run on a worker thread with its own event loop so merging
+        never blocks the engine, then published through the journal if the
+        index is still the life it was planned against and holds its inputs;
+        else its output is deleted. Every upload is counted, durably, before
+        it starts. The engine's cache serves the inputs it holds and takes
+        the outputs as written."""
 
-        options, objects, service = self.key_options, self.state.objects, self.keys
+        objects, service = self.state.objects, self.keys
         epoch = self.state.journal.epoch
         output, partition = key
-        lo, count = plan
+        ins = index.layers[lo : lo + count]
+        cache = getattr(service, "cache", None)
 
-        def work(call):
-            async def go(local):
-                keys = KeyIndex(ObjectIO(objects, local=local), None, index, options)
-                if service is not None:
-                    keys.on_write = lambda path, f, data: service.installed(index.prefix, f, path, data)
-                return await call(keys)
+        def work():
+            async def go():
+                return await LayerIndex(ObjectIO(objects), index, cache=cache).merge(lo, count, epoch=epoch)
 
-            # One warm copy serves every engine reader: an index the engine's cache
-            # holds is read from its local files, the store otherwise.
-            with service.open(index) if service is not None else contextlib.nullcontext() as local:
-                if local is not None:
-                    try:
-                        return asyncio.run(go(local.handles))
-                    except LocalError as e:
-                        service.corrupt(e.path)  # dropped, fetched again by a fill; this run reads the store
-            return asyncio.run(go(None))
+            return asyncio.run(go())
 
         try:
             try:
-                if count == 1 and not await asyncio.to_thread(
-                    work, lambda keys: keys.drops_enough(plan, endpoints)
-                ):
-                    rewrite = KeyIndex.rewrite_key(index.spans[lo], endpoints)
-                    self.state.record(
-                        {
-                            "type": "MergeRejected",
-                            "output": output,
-                            "partition": partition,
-                            "life": index.life,
-                            "rewrite": rewrite,
-                            "at": self.clock(),
-                        }
-                    )
-                    return
-                inputs = ";".join(",".join(f.name for f in sp.files) for sp in index.spans[lo : lo + count])
                 self.state.record(
                     {
                         "type": "MergeAttempted",
                         "output": output,
                         "partition": partition,
                         "life": index.life,
-                        "inputs": inputs,
+                        "inputs": index.attempt_key(ins),
                         "at": self.clock(),
                     }
                 )
                 await self.state.durable()  # counted before anything is uploaded
-                merged = await asyncio.to_thread(
-                    work, lambda keys: keys.merge(plan, endpoints, epoch=epoch, checked=True)
-                )
+                ids, layer = await asyncio.to_thread(work)
             except Exception as error:
                 self.failing[f"key index {key[0]}/{key[1]}"] = f"{type(error).__name__}: {error}"
                 log.exception("key index merge failed for %s", key)
                 return
             self.failing.pop(f"key index {key[0]}/{key[1]}", None)
             current = self.m.indexes.get(key)
-            if (
-                current is None
-                or current.life != index.life
-                or not current.holds(merged.inputs, merged.names)
-            ):
-                await self._delete([index.path(f.name) for f in merged.span.files])
+            if current is None or current.life != index.life or not current.holds(ids):
+                await self._delete([index.path(n) for n in layer.names()])
                 return
             self.state.record(
                 {
@@ -223,17 +218,14 @@ class Upkeep:
                     "partition": partition,
                     "life": index.life,
                     "prefix": index.prefix,
-                    "inputs": [list(r) for r in merged.inputs],
-                    "names": merged.names,
-                    "span": merged.span.to_json(),
-                    "read": merged.read,
-                    "written": merged.written,
+                    "ids": ids,
+                    "layer": layer.to_json(),
                     "at": self.clock(),
                 }
             )
-            if self.keys is not None:  # published: no new snapshot reads its inputs
+            if service is not None:  # published: no new read opens its inputs
                 kept = (self.m.indexes.get(key) or current).referenced()
-                self.keys.retired([index.path(n) for names in merged.names for n in names if n not in kept])
+                service.retired([index.path(n) for x in ins for n in x.names() if n not in kept])
         finally:
             self._busy.pop((key, lane), None)
 
@@ -268,55 +260,66 @@ class Upkeep:
             self.keys.retired(due)
 
     async def collect_orphans(self) -> None:
-        """Every `ORPHAN_SECONDS`, delete the merge outputs (`m…` files) that
-        nothing names (docs/key-index-design.md § Lifecycles): no index's
-        current spans, no file let go of and still awaiting its readers, no
-        pending cleanup, and no merge running here — of this engine's epoch or
-        an earlier one, never a later one's (a takeover: the engine that
-        fenced this one). A published output is in
-        an index until a later event lets go of it, so a pinned snapshot never
-        names an orphan. Delta files are not merge outputs: a dead attempt's
-        are its repair intent's."""
+        """Every `ORPHAN_SECONDS`, find the index files nothing names
+        (docs/key-index-design.md § Lifecycles) and record them as garbage
+        (`OrphansFound`): deleted like any garbage, after a journal write — a
+        fenced engine's fails, and it deletes nothing — and past every pin.
+        Nothing names a file when no index's layers, garbage, pending cleanup
+        or repair intent does, and:
+
+        - a merge output (`{life}/l{a}-{b}-e{epoch}-{id}…`): of this engine's
+          epoch or an earlier one, never a later one's (a takeover), and no
+          merge running here writes it;
+        - a commit's delta (`{commit}-{attempt}-{n}.lay`): its attempt holds
+          no claim (it ended without committing), and no reader here holds
+          its index (a source commit resolving)."""
 
         now = self.clock()
         if now - self._orphans_at < ORPHAN_SECONDS:
             return
         self._orphans_at = now
         listed = await self.state.list_objects("keys/")
-        # Judged after the listing, with no await before the delete: a merge of
+        # Judged after the listing, with no await before the record: a merge of
         # this engine's that published meanwhile is named, one still running is.
-        named = {index.path(n) for index in self.m.indexes.values() for n in index.referenced()}
-        named |= {path for path, _ in self.m.garbage} | set(self.m.cleanup_reads())
-        running = {
-            (self.m.indexes[key].prefix, ins[0][0], ins[-1][1])
-            for (key, _), ins in self._running()
-            if key in self.m.indexes
-        }
-        own, orphans = self.state.journal.epoch, []
+        m = self.m
+        named = {index.path(n) for index in m.indexes.values() for n in index.referenced()}
+        named |= {path for path, _ in m.garbage} | set(m.cleanup_reads())
+        for key, intents in m.repairs.items():
+            index = m.indexes.get(key)
+            if index is not None:
+                named |= {index.path(n) for intent in intents for n in delta_names(intent)}
+        own, running = self.state.journal.epoch, set()
+        for (key, _), ids in self._running():
+            index = m.indexes.get(key)
+            held = [x for x in index.layers if x.id in ids] if index is not None else []
+            if held:
+                running.add(f"{index.prefix}{index.life}/l{held[0].a:012d}-{held[-1].b:012d}-e{own}-")
+        claimed = {c.get("attempt") for c in m.claims.values()}
+        read = [prefixes for _, prefixes in m.readers.values()]
+        orphans = []
         for path in listed:
-            prefix, _, name = path.rpartition("/")
-            if not name.startswith("m") or not name.endswith(".kx") or path in named:
+            if path in named:
                 continue
-            try:  # m{a:012d}-{b:012d}-{epoch:06d}-{stamp}.{n:04d}.kx
-                a, b, epoch = int(name[1:13]), int(name[14:26]), int(name[27:33])
-            except ValueError:
+            epoch = epoch_of(path)
+            if epoch is not None:
+                if epoch <= own and not any(path.startswith(r) for r in running):
+                    orphans.append(path)
                 continue
-            # Only this engine's epoch or an earlier one's: an earlier engine is
-            # fenced and publishes nothing more, and what this one published its
-            # model names. A later epoch is the engine that fenced this one: its
-            # files are never this one's to judge, whatever this one paused on.
-            if epoch <= own and (prefix + "/", a, b) not in running:
-                orphans.append(path)
+            prefix, name = path.rsplit("/", 1)
+            attempt = _attempt_of(name)
+            if attempt is None or attempt in claimed:
+                continue
+            if any(ps is None or f"{prefix}/" in ps for ps in read):
+                continue
+            orphans.append(path)
         if orphans:
-            log.info("deleting %d orphaned merge outputs", len(orphans))
-            await self._delete(orphans)
-            if self.keys is not None:
-                self.keys.retired(orphans)
+            log.info("found %d orphaned index files", len(orphans))
+            self.state.record({"type": "OrphansFound", "paths": orphans})
 
     def _running(self):
-        """The merges running here: `((index key, lane), sorted input spans)`."""
+        """The merges running here: `((index key, lane), input layer ids)`."""
 
-        return [(k, sorted(ins)) for k, ins in self._busy.items() if ins]
+        return [(k, ins) for k, ins in self._busy.items() if ins]
 
     async def _delete(self, paths: list[str]) -> None:
         from obstore.exceptions import NotFoundError

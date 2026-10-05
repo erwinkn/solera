@@ -7,8 +7,8 @@ import copy
 import pytest
 from solera import Abort, Incremental, Rejected, Transient
 from solera.failed_keys import FAILED, REJECTED, RETRYING, Record
-from solera.keys.index import KeyIndex, key_str
 from solera.keys.io import ObjectIO
+from solera.keys.layers import LayerIndex, key_str
 from solera.sdk import Output, Project, Ref, RegistrationError, Result, Retry, asset
 from solera.stores import Patch
 
@@ -29,11 +29,9 @@ async def rows_of(engine, project, output, partition=""):
 
 
 async def records(engine, asset_name, partition=""):
-    index = KeyIndex(
-        ObjectIO(engine.state.objects), None, engine.m.index(f"@{asset_name}", partition).slice()
-    )
-    keys, _, payloads, _ = await index.page(None, 10_000)
-    return {key_str(k): Record.decode(p) for k, p in zip(keys, payloads, strict=True)}
+    index = LayerIndex(ObjectIO(engine.state.objects), engine.m.index(f"@{asset_name}", partition))
+    rows, _ = await index.delta(None, first=10_000)
+    return {key_str(r[0]): Record.decode(r[4]) for r in rows}
 
 
 def files_project(content, fn, *, written=None, **input):

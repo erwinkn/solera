@@ -15,7 +15,7 @@ use rayon::prelude::*;
 
 use crate::delta::Write;
 use crate::entries::SortedEntries;
-use crate::format::{Error, Result};
+use crate::error::{Error, Result};
 use crate::sort::{self, Keys};
 use crate::stream::State;
 

@@ -59,7 +59,7 @@ class History:
         keys = sorted(ups)
         payloads = [ups[k] for k in keys] if self.sources else None
         written = SortedEntries.of(keys, payloads, sorted(set(rms) - set(ups)))
-        delta = await self.index().resolve(written, replaced=True)
+        delta = await self.index().resolve(written, generation=g, replaced=True)
         files = await self.index().write(f"d{c:06d}-a", delta, g)
         before = self.fold[-1] if self.fold else {}
         self.state = self.state.committed(c, files)
@@ -240,6 +240,7 @@ async def test_a_reading_at_an_unheld_h_is_refused():
     assert h.state.at(7).head == 7 and h.state.at(4).head == 4
     with pytest.raises(L.NotHeld):
         h.state.at(2)  # inside the merged layer [1, 4]
+    assert h.state.at(4).count is None and h.state.at(None).count == len(h.fold[-1])  # not the head's
 
 
 async def test_a_replaced_change_names_the_generation_it_replaced():
@@ -410,11 +411,18 @@ async def test_patches_sparse_or_streamed_write_the_same_delta(monkeypatch, stre
     assert await L.LayerIndex(h.io, st).lookup([key(i) for i in range(300)]) == now
     assert sorted(listed[0]) == ups and sorted(listed[1]) == rms
     data = await h.io.read_whole(st.path(files.part.files[0].name), files.part.files[0].size)
-    written, removed = L.delta_keys(data)
+    written, removed = L.delta_keys(data, 10_007)
     assert written == ups and removed == rms
-    assert dict(L.replaced_entries(data)) == {k: h.fold[-1][k][0] for k in ups + rms if k in h.fold[-1]}
+    # Updates and removes name what they replaced; adds name nothing.
+    assert dict(L.replaced_entries(data, 10_007)) == {
+        k: h.fold[-1][k][0] for k in ups + rms if k in h.fold[-1]
+    }
+    with pytest.raises(ValueError):
+        L.replaced_entries(data, 0)  # read without its commit's generation: refused, not wrong
     keys = [
-        k for chunk in [c async for c in L.DeltaKeys(h.io, st.prefix, files.part).chunks(7)] for k in chunk
+        k
+        for chunk in [c async for c in L.DeltaKeys(h.io, st.prefix, files.part, 10_007).chunks(7)]
+        for k in chunk
     ]
     assert keys == [k.decode() for k in ups]
 
@@ -444,8 +452,8 @@ async def test_the_resolvers_delta_is_the_writers_and_its_candidate_installs_wit
     cache = LayerCache(str(tmp_path), disk=2**20)
     idx = L.LayerIndex(h.io, h.state, cache=cache)
     run = SortedEntries.of([key(1), key(150)], None, [key(2)])
-    patch = await idx.compute(run, replaced=True)
-    written = await h.index().resolve(run, replaced=True)
+    patch = await idx.compute(run, generation=127, replaced=True)
+    written = await h.index().resolve(run, generation=127, replaced=True)
     assert [f[0] for f in patch.files] == [f[0] for f in written.files]
     full = SortedEntries.of([key(i) for i in range(0, 100, 2)], None, [])
     replaced = await idx.compute(full, replace=True)
@@ -458,3 +466,60 @@ async def test_the_resolvers_delta_is_the_writers_and_its_candidate_installs_wit
     cache.offer(h.state.path("000000000013-a2-0.lay"), b"x")
     cache.forget("a2")
     assert not cache.committed(h.state.path("000000000013-a2-0.lay"), 1, h.state.prefix)
+
+
+async def test_the_engine_resolves_a_workers_request_from_its_warm_cache(tmp_path):
+    from solera.keys import resolver as R
+    from solera.keys.layer_cache import LayerCache
+
+    rng = random.Random(29)
+    h = History(rng)
+    for _ in range(10):
+        await h.commit({key(rng.randrange(60)): None for _ in range(5)}, [])
+    await h.merge_some(h.state.head)
+    cache = LayerCache(str(tmp_path), disk=2**20)
+    resolver = R.Resolver(cache, h.io)
+    c, g = h.state.head + 1, 10 * (h.state.head + 1) + 7
+    p = R.Prepared("", c, g, h.state, h.state.head, False, replaced=True)
+    run = SortedEntries.of([key(3), key(70)], None, [key(4), key(90)])
+    ask = R.Ask("out", "", "patch", c, g, h.state.prefix, h.state.head, run)
+
+    async def answer():
+        body = await resolver.resolve("a1", R.request("w", [ask]), lambda n: p, lambda: True)
+        return R.answers(body)["out"]
+
+    first, _ = await answer()
+    assert first == {"name": "out", "result": "declined", "reason": "cold"}
+    await cache.fill(h.io, h.state)  # joins the fill the decline started
+    second, data = await answer()
+    assert second["result"] == "delta"
+    written = await h.index().resolve(run, generation=g, replaced=True)
+    assert data == written.files[0][0]  # the writer's own delta, replaced generations included
+    name = f"{c:012d}-a1"
+    await h.io.write(h.state.path(f"{name}-0.lay"), data)
+    state = h.state.committed(c, R.delta_files(second, name, g))
+    assert state.count == h.state.count + written.added - written.removed
+    assert cache.committed(h.state.path(f"{name}-0.lay"), len(data), h.state.prefix)  # its candidate
+    rows, _ = await L.LayerIndex(h.io, state).delta(h.state.head, keys=[key(3), key(4), key(70), key(90)])
+    assert [r[0] for r in rows] == sorted({key(3), key(70)} | ({key(4)} & set(h.fold[-1])))
+
+
+async def test_indexes_sharing_a_cache_never_read_each_others_files(tmp_path):
+    """One attempt names its output's delta and its failure records' delta
+    alike (`{commit}-{attempt}-0.lay`), under two prefixes: the engine's
+    cache keys what it holds by full path, so each index reads its own."""
+
+    from solera.keys.layer_cache import LayerCache
+
+    io = ObjectIO(MemoryStore())
+    cache = LayerCache(str(tmp_path), disk=2**20)
+    states = {}
+    for prefix, keys in (("keys/out/_/", [b"a", b"b"]), ("failures/out/_/", [b"x"])):
+        state = L.LayerState(prefix=prefix, life="1")
+        files, _ = await L.LayerIndex(io, state).write_patch(
+            SortedEntries.of(keys), name="000000000000-att", generation=7
+        )
+        states[prefix] = state.committed(0, files)
+    for prefix, keys in (("keys/out/_/", [b"a", b"b"]), ("failures/out/_/", [b"x"])):
+        found = await L.LayerIndex(io, states[prefix], cache=cache).lookup([b"a", b"b", b"x"])
+        assert sorted(found) == keys, prefix

@@ -3,18 +3,27 @@
 Companion to `object-store-state.md` §6. What the engine-owned key index
 costs on S3, per operation and per month, from 1K to 100M keys per index.
 
-**Status: these costs are the leveled index's.** The index is now spans
-tiling commit time, merged under the policy of `key-index-design.md`;
-levels, compaction and the delta log are gone. The per-commit read and
-write costs below still describe the read strategy, which spans kept; the
-compaction rows and the level structure do not. The span index's costs
-are in `key-index-design.md` — replayed on metadata (`bench/keys/spans.py`,
-`retention.py`) and measured on prototype files (`v4bench.py`,
-`catchup.py`, `layouts.py`, on branch
-`bb/key-index-design-first-principles-thr_xvgqnrw2kr` at `42c4b69`).
-They are re-measured over the implementation next, and this document
-then follows. The leveled benches cited here (`bench.py`, `warm.py`,
-`bulk.py`, `amplification.py`) run at commit `0d09fc4`.
+**Status: the tables below are the leveled index's.** The index is now
+stamped layers (`key-index-design.md`); levels, spans and their compaction
+are gone. What layers cost was measured on real files by W53's 1M campaign
+(`bench/keys/views/campaign.md` on `exp/key-index-campaign`, 43aa22c), one
+commit of 1K keys every 10 s, with the cost model of this document:
+
+| Trace, 1M keys | Stored, mean · peak | Background entry writes per entry committed | PUTs per commit | $ a month, S3, warm · cold writer | $ a month, Railway |
+|---|---|---|---|---|---|
+| base | 16 · 22 MB | 6.18 | 1.39 | $1.91 · $3.67 | $0.67 |
+| 100 daily readers | 16 · 22 MB | 6.20 | 1.39 | $1.91 · $3.67 | $0.67 |
+| churn | 25 · 39 MB | 6.23 | 1.37 | $1.88 · $8.62 | $0.65 |
+| large commits | 15 · 22 MB | 5.51 | 1.39 | $2.23 · $3.47 | $0.74 |
+
+A cold writer pays GETs per commit; the engine's cache (layer files on its
+disk, index objects in memory) makes writers warm. At 100M keys the costs
+are replayed only (`bench/keys/fp/model.py` on `design/key-index-fp`):
+~1.0 GB stored, 11.4 entries written per entry committed, within ~10% of
+spans' monthly dollars. The per-commit read strategy below (sparse blocks,
+or streaming where faster) is still the writer's; the compaction rows and
+the level structure are not. The leveled benches cited here (`bench.py`,
+`warm.py`, `bulk.py`, `amplification.py`) run at commit `0d09fc4`.
 
 The per-operation and per-month tables come from `bench/cost_model/`
 (`model.py` holds the assumptions and formulas; `tables.py` and

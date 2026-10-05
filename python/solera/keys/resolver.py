@@ -9,8 +9,9 @@ recomputed, or shares a computation still in flight.
 
 Framing, both ways: `u8` protocol version · `u32` header length (little
 endian) · JSON header · payloads, each output's at `offset` (from the end
-of the header), `size` bytes long — a `.kx` file. Payloads lie back to back
-in output order, so no byte is two outputs'.
+of the header), `size` bytes long — a request's sorted run
+(`SortedEntries.encode`), an answer's delta (one `.lay` file). Payloads lie
+back to back in output order, so no byte is two outputs'.
 
 Nothing in a request is taken on its word: a run is decoded once, every
 fact checked (`SortedEntries.decode`), and the limits apply to what it holds.
@@ -27,16 +28,17 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 from .. import _native
-from .._native import LimitError, LocalError, SortedEntries
+from .._native import LimitError, SortedEntries
 from ..tasks import Tasks
-from .cache import EngineCache
-from .index import IndexState, Options
+from . import layers
 from .io import ObjectIO
+from .layer_cache import LayerCache
+from .layers import DeltaFiles, FileRef, LayerIndex, LayerState, Part
 from .threads import in_thread
 
 log = logging.getLogger(__name__)
 
-VERSION = 1
+VERSION = 2
 CONTENT_TYPE = f"application/vnd.solera.resolve; version={VERSION}"
 
 
@@ -105,10 +107,11 @@ class Prepared:
     partition: str
     commit_number: int
     generation: int
-    index: IndexState  # the index the engine holds for the partition now
+    index: LayerState  # the index the engine holds for the partition now
     head_commit: int
     replace: bool  # whether a replacement is allowed
     at: float = math.inf  # the event counter the index was read at: a fill's reader pin
+    replaced: bool = False  # an immutable store's output: entries record the generation they replace
 
 
 @dataclass
@@ -127,11 +130,8 @@ class Resolver:
     when given, keeps fills in collection's reader pins: `pin(at)`
     returns a token for `unpin`."""
 
-    def __init__(
-        self, cache: EngineCache, io: ObjectIO, options: Options | None = None, limits=None, pins=None
-    ):
+    def __init__(self, cache: LayerCache, io: ObjectIO, limits=None, pins=None):
         self.cache, self.io, self.pins = cache, io, pins
-        self.o = options or Options()
         self.limits = limits or Limits()
         self._sem = asyncio.Semaphore(self.limits.concurrency)
         self._queued = 0
@@ -224,7 +224,7 @@ class Resolver:
             if not self._reserve(len(data)):
                 return {**declined, "reason": "busy"}, None
             # The worker uploads the delta under its own name: kept as a candidate under it.
-            path = p.index.path(f"{p.commit_number:012d}-{attempt}.0000")
+            path = p.index.path(f"{p.commit_number:012d}-{attempt}-0.lay")
             # Its failure reaches every request that shares it: not logged here as well.
             fut = self._inflight.spawn(self._compute(p, kind, data, live, path, keys), key=key, awaited=True)
             size = len(data)
@@ -243,18 +243,19 @@ class Resolver:
             self._release(run.nbytes)
 
     async def _compute(self, p: Prepared, kind: str, run, live, path: str, keys: int | None = None):
-        """The answer for `run` — a `SortedEntries`, or a request's `.kx` payload
-        claiming `keys` entries, decoded here — against `p`'s index."""
+        """The answer for `run` — a `SortedEntries`, or a request's payload
+        claiming `keys` entries, decoded here — against `p`'s index, from the
+        cache's copies only: a cold index is declined (and filled)."""
 
         declined = {"result": "declined"}
         lim = self.limits
-        indexed = sum(f.entries for f in p.index.files)
+        indexed = sum(x.entries for x in p.index.layers)
         most = lim.max_keys if kind == "patch" else lim.max_entries - indexed
-        local = self.cache.open(p.index)
-        if local is None:
+        if not self.cache.warm(p.index):
             self._background_fill(p.index, p.at)
             return {**declined, "reason": "cold"}, None
-        with local:
+        paths = [p.index.path(f.name) for x in p.index.layers for f in x.main.files]
+        with self.cache.hold(paths):
             async with self._sem:
                 if not live():
                     return {**declined, "reason": "not_live"}, None
@@ -273,35 +274,36 @@ class Resolver:
                     return {**declined, "reason": "too_big"}, None
                 if kind == "replace" and run.removes:
                     return {**declined, "reason": "invalid"}, None
-                snap = _native.Snapshot(local.runs)
+                index = LayerIndex(self.io, p.index, cache=self.cache)
                 try:
-                    files, added, removed, changed = await in_thread(
-                        snap.resolve,
-                        run,
-                        replace=kind == "replace",
-                        generation=p.generation,
-                        **_writer(self.o, lim.max_bytes),
+                    delta = await index.compute(
+                        run, generation=p.generation, replace=kind == "replace", replaced=p.replaced
                     )
-                except LocalError as e:
-                    self.cache.corrupt(e.path)  # refetched by the fill
+                except ValueError as e:  # the request was checked: a copy is corrupt
+                    log.warning("key cache copy of %s: %s", p.index.prefix, e)
+                    self.cache.drop(p.index.prefix)  # refetched by the fill
                     self._background_fill(p.index, p.at)
                     return {**declined, "reason": "cold"}, None
-                except ValueError:
-                    return {**declined, "reason": "invalid"}, None
-        if not files:
+        if not delta.files:
             return {"result": "empty"}, None
-        if len(files) > 1 or len(files[0]) > lim.max_bytes:
-            return {**declined, "reason": "too_big"}, None
-        delta = files[0]
+        if len(delta.files) > 1 or len(delta.files[0][0]) > layers.SMALL:
+            return {**declined, "reason": "too_big"}, None  # a delta this size needs an index object
+        data, entries, first, last = delta.files[0]
+        self.cache.offer(path, data)
         return {
             "result": "delta",
-            "added": added,
-            "removed": removed,
-            "entries": added + removed + changed,
-            "file": {"size": len(delta), "digest": self.cache.offer(path, delta)},
-        }, delta
+            "added": delta.added,
+            "removed": delta.removed,
+            "entries": entries,
+            "file": {
+                "size": len(data),
+                "digest": _native.content_digest(data),
+                "first": bytes(first).hex(),
+                "last": bytes(last).hex(),
+            },
+        }, data
 
-    def _background_fill(self, index: IndexState, at: float) -> None:
+    def _background_fill(self, index: LayerState, at: float) -> None:
         """Fill a cold index, a reader of its files until every fetch is done:
         collection keeps what it reads (taken now, while the request that
         found it cold still holds its own)."""
@@ -320,22 +322,12 @@ class Resolver:
         self._fills.spawn(fill())
 
 
-def _writer(o: Options, max_file_bytes: int) -> dict:
-    return {
-        "block_size": o.block_size,
-        "level": o.level,
-        "bits_per_item": o.bits_per_item,
-        "k": o.k,
-        "max_file_bytes": max_file_bytes,
-    }
-
-
 # -- the worker's side ---------------------------------------------------------------------
 
 
 @dataclass
 class Ask:
-    """One output to resolve: its sorted entries, sent as a `.kx` file."""
+    """One output to resolve: its sorted entries, sent encoded."""
 
     name: str
     partition: str
@@ -345,6 +337,17 @@ class Ask:
     prefix: str
     head_commit: int
     run: SortedEntries
+
+
+def delta_files(answer: dict, name: str, generation: int) -> DeltaFiles:
+    """What a `delta` answer, uploaded by the worker under `name` (its commit
+    and attempt), commits: one small file, no index object."""
+
+    f = answer["file"]
+    ref = FileRef(
+        f"{name}-0.lay", f["size"], answer["entries"], bytes.fromhex(f["first"]), bytes.fromhex(f["last"])
+    )
+    return DeltaFiles(Part((ref,)), answer["added"], answer["removed"], generation)
 
 
 def request(worker_id: str, asks: list[Ask]) -> bytes:

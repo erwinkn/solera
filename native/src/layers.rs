@@ -27,7 +27,7 @@ use std::collections::VecDeque;
 
 use crate::delta::{Collected, Old, Write};
 use crate::entries::SortedEntries;
-use crate::format::{Error, Result};
+use crate::error::{Error, Result};
 use crate::rows::Source;
 use crate::stream::{Bytes, State};
 
@@ -177,7 +177,8 @@ fn encode_block(format: u8, entries: &[Entry]) -> Vec<u8> {
                 out.extend_from_slice(p);
             }
             if let Some(g) = e.replaced {
-                put_varint(&mut out, g);
+                // Compact: back from the commit's generation, which the writer gives.
+                put_varint(&mut out, e.generation - g);
             }
         } else {
             let mut f = 0;
@@ -281,7 +282,11 @@ impl<'a> BlockReader<'a> {
                 None
             };
             let replaced = if f & D_REPLACED != 0 {
-                Some(get_varint(raw, pos)?)
+                let back = get_varint(raw, pos)?;
+                match self.stamp.generation.checked_sub(back) {
+                    Some(g) => Some(g),
+                    None => return bad("a replaced generation before 0"),
+                }
             } else {
                 None
             };
@@ -382,6 +387,69 @@ pub fn decode(data: &[u8], stamp: Stamp) -> Result<Vec<Entry>> {
         }
     }
     Ok(out)
+}
+
+/// A write's sorted entries as one delta file — upserts as updated, with
+/// their payloads, removes as removed — the resolver's transport form.
+pub fn encode_run(run: &SortedEntries, block_size: usize, level: i32) -> Result<Vec<u8>> {
+    let mut w = BlockWriter::new(DELTA, block_size, level, usize::MAX);
+    for i in 0..run.len() {
+        let removed = run.deleted[i];
+        w.push(Entry {
+            key: run.key(i).to_vec(),
+            present: !removed,
+            start: true,
+            commit: 0,
+            generation: 0,
+            flips: if removed { vec![0] } else { vec![] },
+            payload: if removed {
+                None
+            } else {
+                run.payload(i).map(<[u8]>::to_vec)
+            },
+            replaced: None,
+        })?;
+    }
+    w.finish()?;
+    Ok(w.ready.pop_front().map(|f| f.data).unwrap_or_default())
+}
+
+/// Sorted entries back from their transport form, every block checked (its
+/// CRC, its raw length, its format, keys strictly increasing), decoding at
+/// most `max_entries` entries and `max_bytes` bytes (raw, then keys and
+/// payloads): past either, an `Error::Limit`, whatever the file claims.
+pub fn decode_run(data: &[u8], max_entries: u64, max_bytes: u64) -> Result<SortedEntries> {
+    let mut out = SortedEntries::default();
+    let mut budget = max_bytes;
+    let mut take = |n: usize| -> Result<()> {
+        budget = budget
+            .checked_sub(n as u64)
+            .ok_or_else(|| Error::Limit(format!("more than {max_bytes} bytes decoded")))?;
+        Ok(())
+    };
+    let mut pos = 0;
+    while pos < data.len() {
+        let Some(h) = data.get(pos..pos + HEADER) else {
+            return bad("truncated block header");
+        };
+        take(u32::from_le_bytes(h[8..12].try_into().unwrap()) as usize)?;
+        let (format, raw, next) = read_block(data, pos)?;
+        if format != DELTA {
+            return bad("a run's block is not a delta's");
+        }
+        pos = next;
+        let mut r = BlockReader::new(format, &raw, Stamp::default())?;
+        if out.len() as u64 + r.left as u64 > max_entries {
+            return Err(Error::Limit(format!("more than {max_entries} entries")));
+        }
+        while r.next_key()? {
+            let e = r.fields(true)?.unwrap();
+            take(e.key.len() + e.payload.as_ref().map_or(0, Vec::len))?;
+            out.push(&e.key, 0, !e.present, e.payload.as_deref())
+                .map_err(|_| Error::Format("keys out of order".into()))?;
+        }
+    }
+    Ok(out.shrink())
 }
 
 // -- the writer --------------------------------------------------------------------------------
@@ -951,7 +1019,9 @@ pub struct DeltaWriter {
     /// The keys it changed, written and removed, up to a limit: what a store
     /// is told to write and delete.
     pub collected: Collected,
-    replaced: bool,
+    /// The commit's generation when each change records the generation it
+    /// replaced (written as the distance back from it), else None.
+    replaced: Option<u64>,
 }
 
 impl DeltaWriter {
@@ -959,7 +1029,7 @@ impl DeltaWriter {
         block_size: usize,
         level: i32,
         file_limit: usize,
-        replaced: bool,
+        replaced: Option<u64>,
         collect: usize,
     ) -> DeltaWriter {
         DeltaWriter {
@@ -1000,13 +1070,17 @@ impl DeltaWriter {
             present,
             start,
             commit: 0,
-            generation: 0,
+            generation: self.replaced.unwrap_or(0),
             flips: if present && start { vec![] } else { vec![0] },
             payload: payload.map(|p| p.to_vec()),
-            replaced: if self.replaced {
-                before.map(|b| b.0)
-            } else {
-                None
+            replaced: match (self.replaced, before) {
+                (Some(at), Some((g, _))) if g > at => {
+                    return Err(Error::Value(format!(
+                        "a replaced generation {g} after the commit's {at}"
+                    )))
+                }
+                (Some(_), Some((g, _))) => Some(g),
+                _ => None,
             },
         })
     }
@@ -1472,7 +1546,7 @@ mod tests {
 
     #[test]
     fn a_delta_reads_as_stamped_entries() {
-        let mut w = DeltaWriter::new(64, 1, 1 << 20, true, 100);
+        let mut w = DeltaWriter::new(64, 1, 1 << 20, Some(50), 100);
         w.apply(b"a", Write::Upsert(None), Old::Absent).unwrap();
         w.apply(b"b", Write::Upsert(Some(b"v2")), Old::Live(7, Some(b"v1")))
             .unwrap();
@@ -1648,7 +1722,7 @@ mod tests {
             Source::Entries(Arc::new(written), 0),
             inputs,
             true,
-            DeltaWriter::new(64, 1, 1 << 20, true, 100),
+            DeltaWriter::new(64, 1, 1 << 20, Some(100), 100),
         )
         .unwrap();
         let mut data = vec![];
@@ -1659,19 +1733,27 @@ mod tests {
                 _ => unreachable!(),
             }
         }
-        let got: Vec<(String, u8)> = decode(&data, Stamp::default())
+        let stamp = Stamp {
+            commit: 1,
+            generation: 100,
+        };
+        let got: Vec<(String, u8, Option<u64>)> = decode(&data, stamp)
             .unwrap()
             .iter()
-            .map(|x| (String::from_utf8(x.key.clone()).unwrap(), x.kind()))
+            .map(|x| {
+                (
+                    String::from_utf8(x.key.clone()).unwrap(),
+                    x.kind(),
+                    x.replaced,
+                )
+            })
             .collect();
-        assert_eq!(
-            got,
-            vec![
-                ("a".into(), REMOVED),
-                ("c".into(), UPDATED),
-                ("d".into(), ADDED)
-            ]
-        );
+        // Updates and removes name what they replaced; an add names nothing.
+        assert!(matches!(
+            got.as_slice(),
+            [(a, REMOVED, Some(_)), (c, UPDATED, Some(_)), (d, ADDED, None)] if a == "a" && c == "c" && d == "d"
+        ));
+        assert!(decode(&data, Stamp::default()).is_err()); // read without its commit's generation
         assert_eq!((j.delta.added, j.delta.changed, j.delta.removed), (1, 1, 1));
     }
 

@@ -31,8 +31,7 @@ import copy
 import dataclasses
 import math
 
-from solera.keys.delta import reserved
-from solera.keys.index import DeltaFiles, IndexState, Span, index_prefix
+from solera.keys.layers import DeltaFiles, Layer, LayerState, delta_names, index_prefix
 
 from . import history, observed
 from .lake import LakeState
@@ -137,19 +136,17 @@ def commit_of(head: dict | None) -> tuple | None:
 
 
 def _delta(keys: dict, generation: int | None) -> DeltaFiles:
-    """A commit's delta, its span starting at `generation`, the one its
-    writes carried, when its head records it."""
+    """A commit's delta, at `generation`, the one its writes carried, when
+    its head records it."""
 
     delta = DeltaFiles.from_json(keys)
     return delta if generation is None else dataclasses.replace(delta, generation=int(generation))
 
 
-def _delta_files(entries) -> frozenset[str]:
-    """The index files clean up entries of kind `delta` read."""
+def _delta_files(deltas) -> frozenset[str]:
+    """The delta files of queued deltas (`Model.cleaning`): a cleanup step's input."""
 
-    return frozenset(
-        f"{d['prefix']}{name}.kx" for d in entries if d["kind"] == "delta" for name in d["files"]
-    )
+    return frozenset(f"{d['prefix']}{name}" for d in deltas for name in d["files"])
 
 
 class Model:
@@ -178,6 +175,7 @@ class Model:
             "partitions": _nest(self.partitions, 2),
             "repairs": _nest(self.repairs, 2),
             "cleanups": _nest(self.cleanups, 2),
+            "cleaning": _nest(self.cleaning, 2),
             "retired": dict(self.retired),
             "homes": dict(self.homes),
             "reset_at": _nest(self.reset_at, 2),
@@ -201,13 +199,12 @@ class Model:
         self.manifest = snap.get("manifest")
         self.project = snap.get("project")
         self.heads = Grouped(_flatten(snap.get("heads"), 2))
-        self.indexes: dict[tuple, IndexState] = {
-            k: IndexState.from_json(v) for k, v in _flatten(snap.get("indexes"), 2).items()
+        self.indexes: dict[tuple, LayerState] = {
+            k: LayerState.from_json(v) for k, v in _flatten(snap.get("indexes"), 2).items()
         }
-        # (output, partition) -> what merges of the index's current life tried
-        # (docs/key-index-design.md § The write bound): `life`, `attempts` by
-        # input files (uploads, failed or abandoned, none published) and the
-        # span rewrites found to drop too little (`rejected`).
+        # (output, partition) -> what merges of the index's current life tried:
+        # `life`, and `attempts` by input layers (uploads, failed or
+        # abandoned, none published), keyed by LayerState.attempt_key.
         self.merges: dict[tuple, dict] = _flatten(snap.get("merges"), 2)
         # [path, n]: files nothing references since the n-th event applied
         self.garbage: list[list] = snap.get("garbage") or []
@@ -227,6 +224,11 @@ class Model:
         # event counter that let go of it: for the partition's next attempt to clean up
         # once no reader pins it (docs/lifecycle.md §9.8)
         self.cleanups: dict[tuple, list] = _flatten(snap.get("cleanups"), 2)
+        # (output, partition) -> an immutable keyed output's cleanup queue: the deltas
+        # committed and not yet cleaned that name what they replaced, in commit order,
+        # each kept until a cleanup step walks past it. Its front is the cleanup
+        # cursor (docs/lifecycle.md §9.8)
+        self.cleaning: dict[tuple, list] = _flatten(snap.get("cleaning"), 2)
         # Output lives removed or moved away, whose data a cleanup task deletes (K25):
         # id -> where it was, what it was, and when it may go.
         self.retired: dict[str, dict] = dict(snap.get("retired") or {})
@@ -329,13 +331,13 @@ class Model:
         claim = self.claims.get(task["id"])
         return claim["status"] if claim else task["status"]
 
-    def index(self, output: str, partition: str) -> IndexState:
+    def index(self, output: str, partition: str) -> LayerState:
         """The output's key index, or an empty one where a new index would go."""
 
         found = self.indexes.get((output, partition))
         if found is not None:
             return found
-        return IndexState(prefix=index_prefix(output, partition), life=str(self.event_counter))
+        return LayerState(prefix=index_prefix(output, partition), life=str(self.event_counter))
 
     def observed_commits(self, output: str, partition: str) -> list[int]:
         """The commits of an upstream index its readers hold: every commit its
@@ -355,12 +357,6 @@ class Model:
                 read[2] for read in claim.get("reads") or () if (read[0], read[1]) == (output, partition)
             ]
         return [int(c) for c in commits if c is not None]
-
-    def endpoints(self, output: str, partition: str) -> set[int]:
-        """The endpoints of an index its merges keep (docs/key-index-design.md
-        § Endpoints): where reads at the commits its readers hold start."""
-
-        return reserved(self.observed_commits(output, partition))
 
     def oldest_observed(self, output: str, partition: str) -> int | None:
         """The oldest commit of an upstream index any reader holds (None:
@@ -518,10 +514,10 @@ class Model:
             "launched": True,
             "reads": reads(launched["prepared"].get("plans") or {}),
             "prefixes": tuple(launched["prepared"].get("prefixes") or ()),
-            "cleanups": _delta_files(  # a cleanup task's entries (§9.8)
+            "cleanups": _delta_files(  # the deltas a cleanup task's step reads (§9.8)
                 d
                 for info in ((launched["prepared"].get("cleanup") or {}).get("outputs") or {}).values()
-                for d in info.get("cleanup") or ()
+                for d in (info.get("deltas") or {}).get("deltas") or ()
             ),
         }
         self.attempts[attempt] = task["id"]
@@ -812,7 +808,7 @@ class Model:
         for key in [k for k in self.repairs if gone(k)]:  # what dead attempts meant to write
             index = self.index(*key)
             for intent in self.repairs.pop(key):
-                self.garbage.extend([index.path(f["name"]), self.event_counter] for f in intent["files"])
+                self.garbage.extend([index.path(name), self.event_counter] for name in delta_names(intent))
         for key in [k for k in self.indexes if gone(k)]:
             index = self.indexes.pop(key)
             self.garbage.extend([index.path(name), self.event_counter] for name in sorted(index.referenced()))
@@ -876,6 +872,7 @@ class Model:
         move(self.indexes, {f"@{old}": f"@{new}" for old, new in asset_map.items()}, 0)
         move(self.repairs, output_map, 0, merge=list)
         move(self.cleanups, output_map, 0, merge=_renumbered)
+        move(self.cleaning, output_map, 0, merge=lambda q: sorted(q, key=lambda d: d["n"]))
         for head in self.heads.values():
             if head.get("asset") in asset_map:
                 head["asset"] = asset_map[head["asset"]]
@@ -1026,8 +1023,8 @@ class Model:
                 # Reset since it launched: what it meant to write was the old output's,
                 # which owes no repair. Its files go, from where it wrote them.
                 prefix = ((prepared.get("outputs") or {}).get(output) or {}).get("prefix")
-                index = IndexState(prefix=prefix) if prefix else self.index(output, task["partition"])
-                self.garbage.extend([index.path(f["name"]), self.event_counter] for f in intent["files"])
+                index = LayerState(prefix=prefix) if prefix else self.index(output, task["partition"])
+                self.garbage.extend([index.path(name), self.event_counter] for name in delta_names(intent))
                 continue
             intents = self.repairs.setdefault((output, task["partition"]), [])
             intents.append({**intent, "run": e["run"], "attempt": e["attempt"]})
@@ -1180,7 +1177,9 @@ class Model:
                 # their intent files are no longer needed.
                 index = self.index(name, partition)
                 for intent in self.repairs.pop((name, partition), ()):
-                    self.garbage.extend([index.path(f["name"]), self.event_counter] for f in intent["files"])
+                    self.garbage.extend(
+                        [index.path(name), self.event_counter] for name in delta_names(intent)
+                    )
         record = self._partition(asset, partition)
         for field in ("definition", "config", "context"):  # what it was made under: staleness compares
             if field in commit:
@@ -1246,7 +1245,7 @@ class Model:
                 "forced": record.get("forced") or {},
             }
         keys = f.get("keys") or {}
-        if keys.get("files"):
+        if delta_names(keys):
             name = f"@{asset}"
             index = self.index(name, partition).committed(f["commit_number"], DeltaFiles.from_json(keys))
             self.indexes[(name, partition)] = index
@@ -1386,9 +1385,9 @@ class Model:
     def _commit_keys(
         self, output: str, partition: str, keys: dict | None, prefix: str | None, generation: int | None
     ) -> None:
-        """Add a commit's delta files to the output's key index (§6), as its
-        span, which starts at the generation its writes carried: even an
-        empty one, so the spans keep no holes. An output's first index starts
+        """Add a commit's delta to the output's key index (§6), as its layer,
+        at the generation its writes carried: even an empty one, so the layers
+        keep no holes. An output's first index starts
         where its attempt wrote them, `prefix` — under the name it launched
         with, when a rename came since. The head carries the index's live key
         count."""
@@ -1396,7 +1395,7 @@ class Model:
         if keys is not None:
             index = self.index(output, partition)
             if (output, partition) not in self.indexes and prefix is not None:
-                index = IndexState(prefix=prefix, life=str(self.event_counter))
+                index = LayerState(prefix=prefix, life=str(self.event_counter))
             self.indexes[(output, partition)] = index.committed(
                 keys["commit_number"], _delta(keys, generation)
             )
@@ -1412,12 +1411,12 @@ class Model:
         return ((manifest.get("stores") or {}).get(record.get("store")) or {}).get("writes") == "immutable"
 
     def cleanup_reads(self) -> set[str]:
-        """The index files clean up entries still read (their delta files name
-        the predecessors): kept while an entry is pending, and while a live
-        attempt holds it in its spec — acknowledged by another meanwhile, it
-        is still being read — even once the index lets go of them."""
+        """The delta files cleanup still reads (they name what their changes
+        replaced): kept while queued, and while a live attempt holds them in
+        its spec — a step acknowledged by another meanwhile is still being
+        read — even once the index lets go of them."""
 
-        pending = _delta_files(d for entries in self.cleanups.values() for d in entries)
+        pending = _delta_files(d for queue in self.cleaning.values() for d in queue)
         return pending.union(*(claim.get("cleanups") or () for claim in self.claims.values()))
 
     def _collect(self, output: str, partition: str, entry: dict) -> None:
@@ -1432,17 +1431,23 @@ class Model:
     def _superseded(
         self, output: str, partition: str, before: dict | None, head: dict, keys: dict | None, prefix=None
     ) -> None:
-        """What a commit on an immutable store let go of: each changed key's
-        predecessor (named in its delta files, under `prefix`), a value's
-        previous object, or — when an append output starts over — its
-        earlier commits."""
+        """What a commit on an immutable store let go of: the generations its
+        delta's updates and removes replaced (its delta queued for the
+        partition's cleanup cursor), a value's previous object, or — when an
+        append output starts over — its earlier commits."""
 
-        if keys and keys.get("files"):
-            prefix = prefix or self.index(output, partition).prefix
-            self._collect(
-                output,
-                partition,
-                {"kind": "delta", "prefix": prefix, "files": [f["name"] for f in keys["files"]]},
+        delta = DeltaFiles.from_json(keys) if keys else None
+        if delta is not None and delta.part.entries > delta.added:  # an update or a remove
+            index = self.index(output, partition)
+            self.cleaning.setdefault((output, partition), []).append(
+                {
+                    "n": self.event_counter,
+                    "life": index.life,
+                    "commit": int(head["commit_number"]),
+                    "generation": delta.generation,
+                    "prefix": prefix or index.prefix,
+                    "files": [f.name for f in delta.part.files],
+                }
             )
         old, new = (
             ((before or {}).get("ref") or {}).get("handle") or {},
@@ -1474,11 +1479,8 @@ class Model:
                     "kind": "abandoned",
                     "attempt": attempt,
                     "generation": launched["generation"],
-                    "commit_number": info.get("commit_number"),
                     "after": after,
                 }
-                if info.get("prefix") is not None:
-                    entry["prefix"] = info["prefix"]
                 self._collect(name, partition, entry)
 
     def _cleaned_up(self, partition: str, e: dict, prepared: dict | None = None) -> None:
@@ -1503,21 +1505,20 @@ class Model:
                             output: [*((e.get("cleanup_unresolved") or {}).get(output) or ()), *silent],
                         },
                     }
-        named = set()  # the index-side files the acknowledged entries read: only those become garbage
         for output, done in (e.get("cleaned_up") or {}).items():
-            for d in self.cleanups.get((output, partition), []):
-                if d["id"] in done and d["kind"] == "abandoned" and "prefix" in d:
-                    named.add(f"{d['prefix']}{int(d['commit_number']):012d}-{d['attempt']}")
             self._drop_cleanups(output, partition, done)
+        for output, to in (e.get("cleaned_to") or {}).items():  # a step: the cursor moves past `to`
+            left = [d for d in self.cleaning.get((output, partition), []) if d["n"] > int(to)]
+            if left:
+                self.cleaning[(output, partition)] = left
+            else:
+                self.cleaning.pop((output, partition), None)
         for output, missed in (e.get("cleanup_unresolved") or {}).items():
             for d in self.cleanups.get((output, partition), []):
                 if d["id"] in missed:
                     d["misses"] = d.get("misses", 0) + 1
                     if d["misses"] >= STUCK_AFTER:
                         d["stuck"] = True
-        for path in e.get("cleaned_files") or ():
-            if path in named or any(path.startswith(stem) for stem in named):
-                self.garbage.append([path, self.event_counter])
 
     def _on_RepairRunSubmitted(self, e):
         """The repair clock ran a partition again for its repair: its intents count
@@ -1540,6 +1541,10 @@ class Model:
             for d in self.cleanups.get((output, cleanup.get("partition")), []):
                 if d["id"] in ids:
                     d["stuck"] = True
+            step = {d["n"] for d in (info.get("deltas") or {}).get("deltas") or ()}  # a cursor step's
+            for d in self.cleaning.get((output, cleanup.get("partition")), []):
+                if d["n"] in step:
+                    d["stuck"] = True
 
     def _drop_cleanups(self, output: str, partition: str, ids) -> None:
         left = [d for d in self.cleanups.get((output, partition), []) if d["id"] not in set(ids)]
@@ -1549,13 +1554,20 @@ class Model:
             self.cleanups.pop((output, partition), None)
 
     def _on_CleanupsCleared(self, e):
-        """An operator gave up on stuck entries: their objects stay."""
+        """An operator gave up on stuck entries, a stuck cursor step's deltas
+        (`delta:{n}`) included: their objects stay."""
 
         self._drop_cleanups(e["output"], e["partition"], e["ids"])
+        key, gone = (e["output"], e["partition"]), set(e["ids"])
+        left = [d for d in self.cleaning.get(key, []) if f"delta:{d['n']}" not in gone]
+        if left:
+            self.cleaning[key] = left
+        else:
+            self.cleaning.pop(key, None)
         for entry_id in e.get("retired") or ():  # a stuck cleanup task's output life (K25)
             self.retired.pop(entry_id, None)
 
-    def _replace_index(self, key: tuple, index: IndexState) -> None:
+    def _replace_index(self, key: tuple, index: LayerState) -> None:
         """Swap in a new index state; files it no longer references await deletion."""
 
         before = self.indexes[key]
@@ -1568,9 +1580,7 @@ class Model:
         for nothing."""
 
         rec = self.merges.get(key)
-        return (
-            rec if rec is not None and rec["life"] == life else {"life": life, "attempts": {}, "rejected": []}
-        )
+        return rec if rec is not None and rec["life"] == life else {"life": life, "attempts": {}}
 
     def _merge_record(self, key: tuple, life: str) -> dict:
         rec = self.merge_record(key, life)
@@ -1584,14 +1594,6 @@ class Model:
         rec = self._merge_record((e["output"], e["partition"]), e["life"])
         rec["attempts"][e["inputs"]] = rec["attempts"].get(e["inputs"], 0) + 1
 
-    def _on_MergeRejected(self, e):
-        """A span rewrite found, without uploading, to drop too little: not
-        tried again until its files or the endpoints inside it change."""
-
-        rec = self._merge_record((e["output"], e["partition"]), e["life"])
-        if e["rewrite"] not in rec["rejected"]:
-            rec["rejected"].append(e["rewrite"])
-
     def _prune_merges(self, key: tuple) -> None:
         """Forget what merges tried of files the index no longer holds, and
         another life's record."""
@@ -1602,36 +1604,45 @@ class Model:
         if index is None or rec["life"] != index.life:
             del self.merges[key]
             return
-        held = index.referenced()
+        held = {x.id for x in index.layers}
         rec["attempts"] = {
-            k: n
-            for k, n in rec["attempts"].items()
-            if all(f in held for f in k.replace(";", ",").split(",") if f)
+            k: n for k, n in rec["attempts"].items() if all(i in held for i in k.split("|", 1)[-1].split(","))
         }
-        rec["rejected"] = [
-            r for r in rec["rejected"] if all(f in held for f in r.split("|")[0].split(",") if f)
-        ]
 
     def _on_IndexMerged(self, e):
-        """A merge of adjacent spans published: installed if the index is the
+        """A merge of adjacent layers published: installed if the index is the
         life it was planned against and still holds exactly its inputs; else
-        refused, its output let go of (docs/key-index-design.md § Lifecycles)."""
+        refused, its output let go of (docs/key-index-design.md § Lifecycles).
+        Names never repeat across lives (each carries the life, an epoch and
+        a unique id), and the life check refuses an old life's merge of
+        empty layers, whose ids could match."""
 
         key = (e["output"], e["partition"])
-        span = Span.from_json(e["span"])
+        layer = Layer.from_json(e["layer"])
         index = self.indexes.get(key)
-        # File names never repeat across lives (each carries an attempt id or a
-        # merge's ULID), so the input check alone refuses an old life's merge —
-        # except one whose inputs are all empty spans, whose name lists match
-        # in any life while their start generations do not. The life check
-        # covers that, and is cheap (KeyIndex.tla finds nothing with it off).
-        if index is None or index.life != e["life"] or not index.holds(e["inputs"], e["names"]):
+        if index is None or index.life != e["life"] or not index.holds(e["ids"]):
             prefix = e.get("prefix") or (index.prefix if index is not None else "")
-            self.garbage.extend([f"{prefix}{f.name}.kx", self.event_counter] for f in span.files)
+            self.garbage.extend([f"{prefix}{name}", self.event_counter] for name in layer.names())
             self._prune_merges(key)
             return
-        self._replace_index(key, index.merged([tuple(r) for r in e["inputs"]], span))
+        self._replace_index(key, index.merged(e["ids"], layer))
         self._prune_merges(key)
+
+    def _on_IndexCut(self, e):
+        """The index's cut rose: the oldest P its readers hold (in-flight
+        batches' heads included), so merges may drop flips at or below it."""
+
+        key = (e["output"], e["partition"])
+        index = self.indexes.get(key)
+        if index is not None and index.life == e["life"]:
+            self.indexes[key] = index.with_cut(int(e["cut"]))
+
+    def _on_OrphansFound(self, e):
+        """Index files nothing names (`Upkeep.collect_orphans`): garbage now,
+        deleted once no pin predates this event."""
+
+        known = {g[0] for g in self.garbage}
+        self.garbage.extend([p, self.event_counter] for p in e["paths"] if p not in known)
 
     def _on_FilesCleanedUp(self, e):
         gone = set(e["paths"])

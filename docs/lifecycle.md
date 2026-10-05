@@ -33,8 +33,8 @@ failed keys, sensors' sources).
 **This doc is the authority for four records the others use:** the cancel
 record (§2.2), write-completion evidence (§2.3), the sensor snapshot
 (§11.3) and accepted tick outcomes (§11.4). The key index entry's
-generation and the delta's predecessor are named here (§9.8) and laid
-out in bytes in `key-index-format.md`.
+generation and the delta's replaced generation are named here (§9.8) and
+laid out in bytes in `key-index-format.md`.
 
 ## 1. The shape in one paragraph
 
@@ -64,7 +64,7 @@ engine                                   object store                         wo
   ◀──────────────────────────────────────────────── POST attempts/A/beat     every 10 s
                                                                               Store.acquire (fenced)
   ◀──────────────────────────────────────────────── POST attempts/A/resolve  (small keyed writes)
-                                         keys/…/12-A.kx   ◀── deltas
+                                         keys/…/12-A-0.lay ◀── deltas
                                          runs/R/A.control ◀── swap owned → writing (the gate; fenced stores)
                                          output data      ◀── store writes
                                          runs/R/A.log.000000…  ◀── log chunks
@@ -350,16 +350,15 @@ adopted by a restarted engine (§12).
 
 **What it holds for others.**
 
-- **Its reads** (`reads`: `(output, partition, first, end)` per keyed
-  incremental input): the delta log it reads, from `first`, and the head
-  + 1 its plan was cut at, `end`: where it may move the position, a
-  retry pass that may cover what is left included. Log truncation and
-  index merges (`Model.endpoints`) keep them. Set when `_prepare` plans,
-  before the launch. A plan with no position to move (a keys= selection
-  while a pattern change decides membership) holds none.
+- **Its reads** (`reads`: `(output, partition, head)` per keyed
+  incremental input): the upstream commit each of its batches classes its
+  keys at (`observed-set.md`). The upstream index's cut never passes it
+  (`Model.oldest_observed`), so Δ from there stays exact. Set when its
+  batches are planned, before the launch.
 - **Its cleanups** (`cleanups`), a cleanup task's: the delta files of the
-  pending entries its spec hands it, set when it is prepared: collection
-  keeps them while it runs, even once the entry goes meanwhile (F36).
+  cleanup step its spec hands it, set when it is prepared: collection
+  keeps them while it runs, even once the step is acknowledged by another
+  meanwhile (F36).
 - **Its reader pin**: by its generation, over the index prefixes it reads
   and writes (`prefixes`), or every one while it is still preparing:
   collection deletes nothing such a reader may still read (§9.8).
@@ -941,17 +940,18 @@ they can go at once. It costs the same one integer per index entry.
 
 **The records.** Names are settled here; bytes in `key-index-format.md`.
 
-- **Index entry:** `(key, generation, deleted, payload?)`. `generation`
-  is the one that last wrote the key (a varint, ~4–5 bytes before
-  compression; neighbouring entries share generations and compress
-  well): its version and its object's name at once.
-- **Delta entry:** the same, plus an optional **predecessor** generation
-  — the entry it replaces or deletes. Writes are exact, so a writer always
-  names it. A merge keeps it on a key's oldest kept version; a merge into
-  the base drops it.
+- **Index entry** (a layer's): the key, whether it is present, the commit
+  and `generation` of its last change, its flips and an optional payload.
+  `generation` is the one that last wrote the key (a varint offset from
+  its block's smallest): its version and its object's name at once.
+- **Delta entry:** the key, its change (added, updated, removed) and an
+  optional payload; the commit's generation is the commit record's. On an
+  immutable store's outputs, an updated or removed entry also carries the
+  **replaced generation**: the version it replaces or deletes. Writes are
+  exact, so the writer always knows it. It serves cleanup only; the index
+  never reads it, and merges do not keep it.
 - **Everywhere an entry travels, the generation travels with it:**
-  resolver responses (the delta file), reads answered at `start`
-  (`resolved-commits.md` §7: `.kx` files), and the `Keys` selection a
+  resolver responses (the delta), Δ pages, and the `Keys` selection a
   store receives (`{key: generation}`).
 
 **How loads find names.** A keyed load computes every name from `Keys` and
@@ -964,11 +964,12 @@ generation: the attempts that used commit `n` all ran between the commits
 of `n − 1` and `n`, one at a time, and the one that committed `n` was the
 last of them.
 
-**Predecessors.** Collecting a superseded object needs its exact name,
-so its predecessor's generation. Writes are exact
-(`key-index-design.md`): every key a filter holds has its entry read, so
-every delta names the predecessor of each key it writes or removes, on
-the engine, in the streaming merge-join and in the sparse reader alike.
+**Replaced generations.** Collecting a superseded object needs its exact
+name, so the generation it was written at. Writes are exact
+(`key-index-design.md`): every written key is resolved against the head,
+so on an immutable store every delta names the replaced generation of each
+key it updates or removes, on the engine, in the streamed join and in the
+sparse path alike.
 Collection is prompt for every superseded version, and a merge never
 needs to emit cleanup of its own.
 
@@ -991,14 +992,29 @@ still need it. The pins, all by event counter (`object-store-state.md`
 **Collection.** Only from durable decisions; never from what a listing
 shows.
 
-- **Superseded versions, named at resolution.** A commit records one
-  data-garbage entry for its delta file at its event counter. Once no
-  pin predates it, the worker calls `store.cleanup` with the delta's
-  predecessors, one identity pattern each — `(partition, key, generation)`
-  (docs/stores.md § Cleanup) — 64 at a time; then the entry goes. A
-  superseded value is its previous version's generation.
+- **Superseded versions, named at resolution, by a cursor (D168).** Each
+  immutable keyed output partition keeps one **cleanup queue**: the deltas
+  committed and not yet cleaned whose updates or removes name what they
+  replaced, in commit order (`Model.cleaning`, journaled with the commits).
+  Its front is the **cleanup cursor**; nothing else is stored. A **step** takes the longest prefix of the queue no reader can
+  still need — each delta committed before the oldest reader pin, and at
+  or before the oldest commit an observation holds (a reader at commit P
+  reads what was live at P: what a commit after P replaced is still its)
+  — reads those deltas in commit order, and calls `store.cleanup` with
+  their replaced generations, one identity pattern each — `(partition,
+  key, generation)` (docs/stores.md § Cleanup) — 64 at a time. Then the
+  cursor moves past them (`cleaned_to` in the cleanup task's result). A
+  crash before that hands the step again; deletes are idempotent. No
+  listing: the deltas name every object to delete. A superseded value is
+  its previous version's generation. The engine keeps a queued delta's
+  files until the cursor passes them, and deletes them itself afterwards
+  (never the cleanup task). Steps run as cleanup tasks, one per partition
+  at a time, coalesced: after commits at most one a minute per output
+  partition (`cleanup_coalesce`), sooner once a step's worth of deltas (64)
+  is queued, and the hourly job as the backstop. A burst of commits makes a
+  few tasks, not one per commit.
 - **Versions dropped by a merge** need nothing of their own: writes are
-  exact, so every version a merge drops was named as a predecessor by the
+  exact, so every version a merge drops was named as replaced by the
   delta that replaced it, and is cleaned up through that delta
   (docs/key-index-design.md).
 - **Attempts that ended without committing.** Their names carry their own
@@ -1088,7 +1104,7 @@ GC lock, the dequeue-on-reuse rule and the DELETE timing assumption of the
 alternative.
 
 **Costs.** Per changed key: one PUT, and one DELETE (free on
-S3) when superseded, batched. Per commit: the delta's predecessor
+S3) when superseded, batched. Per commit: the delta's replaced
 generations (a few bytes per changed key). Per full load of a keyed input: a
 read of its pinned index. In return: no gate, intents or repair for these
 stores (§9.6); readers see the generation they pinned; a stale write is an

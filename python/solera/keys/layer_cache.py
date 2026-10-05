@@ -90,7 +90,8 @@ class LayerCache:
             return path in self._files
 
     def read(self, path: str, start: int, end: int) -> bytes | None:
-        """Bytes `[start, end)` of a cached file, or None if not cached."""
+        """Bytes `[start, end)` of a cached file, or None if not cached (or
+        its copy went: the caller reads the store)."""
 
         with self._lock:
             f = self._files.get(path)
@@ -101,6 +102,12 @@ class LayerCache:
         try:
             with open(f[0], "rb") as fh:
                 return os.pread(fh.fileno(), end - start, start)
+        except FileNotFoundError:  # gone under it (another engine started on this root): a miss
+            with self._lock:
+                if self._files.get(path) is f:
+                    del self._files[path]
+                    self._disk_used -= f[1]
+            return None
         finally:
             with self._lock:
                 self._open[path] -= 1
@@ -180,6 +187,23 @@ class LayerCache:
                     local, size, _ = self._files.pop(p)
                     self._disk_used -= size
                     os.remove(local)
+
+    def holds(self, prefix: str) -> bool:
+        """Whether any file of the index at `prefix` is cached: a commit's
+        delta is then worth installing."""
+
+        with self._lock:
+            return any(f[2] == prefix for f in self._files.values())
+
+    def drop(self, prefix: str) -> None:
+        """An index's copies, one found corrupt: evicted (but those a read
+        holds), so the next fill refetches them."""
+
+        with self._lock:
+            for p in [p for p, f in self._files.items() if f[2] == prefix and not self._open.get(p)]:
+                local, size, _ = self._files.pop(p)
+                self._disk_used -= size
+                os.remove(local)
 
     async def fill(self, io: ObjectIO, state: LayerState, *, sides: bool = False) -> bool:
         """Cache every file of the state's main parts (and side parts with

@@ -29,7 +29,7 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass
 
 from solera.keys.delta import delta, version_of
-from solera.keys.index import KeyIndex
+from solera.keys.layers import LayerIndex
 from solera.patterns import Matcher
 
 from . import observed
@@ -93,14 +93,14 @@ def _same(layer: dict, now: Now, cid: str) -> bool:
     )
 
 
-async def _live(index: KeyIndex, at: int, after: str | None, hi: str | None) -> AsyncIterator:
+async def _live(index: LayerIndex, at: int, after: str | None, hi: str | None) -> AsyncIterator:
     """Every key live at H, `at`, in `(after, hi]`: a scan at H, as Δ(−∞, H)."""
 
     async for d in _diffs(index, None, at, after, hi):
         yield d
 
 
-async def _diffs(index: KeyIndex, p, h, after, hi) -> AsyncIterator:
+async def _diffs(index: LayerIndex, p, h, after, hi) -> AsyncIterator:
     while True:
         page = await delta(index, p, h, after=after, first=CHUNK)
         for d in page.diffs:
@@ -145,7 +145,7 @@ async def _merged(a: AsyncIterator, b: AsyncIterator) -> AsyncIterator:
 
 
 async def candidates(
-    index: KeyIndex, rec: dict, now: Now, after: str | None = None, held=None
+    index: LayerIndex, rec: dict, now: Now, after: str | None = None, held=None
 ) -> AsyncIterator[Owe]:
     """Every key the partition may owe past `after`, in key order, classed
     (`cls` None: owed nothing). A segment observed under the labels of now
@@ -231,7 +231,7 @@ def _owe(key, old, new, context, *, versioned: bool) -> Owe:
     return Owe(key, cls, old, version, generation)
 
 
-async def uncovered(index: KeyIndex, rec: dict, take) -> bool:
+async def uncovered(index: LayerIndex, rec: dict, take) -> bool:
     """Whether a key present upstream now, that `take` takes, decodes from
     the empty base: in a gap of the record (`observed.gaps`) and no point.
     Each gap a scan at the head, stopping at the first such key."""
@@ -243,14 +243,14 @@ async def uncovered(index: KeyIndex, rec: dict, take) -> bool:
     return False
 
 
-async def owed(index: KeyIndex, rec: dict, now: Now, after: str | None = None, held=None) -> list[Owe]:
+async def owed(index: LayerIndex, rec: dict, now: Now, after: str | None = None, held=None) -> list[Owe]:
     """Every key owed past `after`: the staleness, and what a default run loads."""
 
     return [o async for o in candidates(index, rec, now, after, held) if o.cls is not None]
 
 
 async def batch(
-    index: KeyIndex, rec: dict, now: Now, size: int, after: str | None = None, keys=None, held=None
+    index: LayerIndex, rec: dict, now: Now, size: int, after: str | None = None, keys=None, held=None
 ) -> Batch:
     """A task's next batch past its progress `after`, at H. By default the
     first `size` owed keys, covering up to the last; with `keys` a list,
@@ -315,7 +315,7 @@ async def _with_unchanged(index, rec, now, after, owed_stream, held=None) -> Asy
         yield owed[key]
 
 
-async def _decoded(index: KeyIndex, rec: dict, key: str, held=None) -> tuple | None:
+async def _decoded(index: LayerIndex, rec: dict, key: str, held=None) -> tuple | None:
     """`key`'s observation as its record decodes it, read at the head: its
     layer's — observed at P — at the head's version if Δ(P, head) does not
     name it, else, present at P by its flips, at a version since replaced."""
@@ -337,7 +337,7 @@ async def _decoded(index: KeyIndex, rec: dict, key: str, held=None) -> tuple | N
 
 
 async def commit_ops(
-    index: KeyIndex, rec: dict, now: Now, b: Batch, served: dict | None = None, *, named=False, held=None
+    index: LayerIndex, rec: dict, now: Now, b: Batch, served: dict | None = None, *, named=False, held=None
 ) -> list[dict]:
     """What a batch's commit records: its range `(after, end] @ H` — or, for
     keys named outright, a point each — the points of what a source served

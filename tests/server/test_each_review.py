@@ -82,14 +82,15 @@ async def test_2_a_full_run_keeps_a_failing_keys_last_good_output(state):
 
 
 async def lose_boundaries(engine, key):
-    """Every span of an index merged into one, ignoring the endpoints its
-    readers hold: the delta they would read from is lost."""
+    """Every layer of an index merged into one with the cut at its head,
+    ignoring the commits its readers hold: the flips they would read Δ
+    from are lost."""
 
-    from solera.keys.index import KeyIndex
+    from solera.keys.layers import LayerIndex
 
-    index = engine.m.indexes[key]
-    out = await KeyIndex(engine._key_io(), None, index).merge((0, len(index.spans)), set())
-    engine.m.indexes[key] = index.merged(out.inputs, out.span)
+    index = engine.m.indexes[key].with_cut(engine.m.indexes[key].head)
+    ids, out = await LayerIndex(engine._key_io(), index).merge(0, len(index.layers), epoch=1)
+    engine.m.indexes[key] = index.merged(ids, out)
 
 
 async def test_2_a_full_run_removes_what_upstream_no_longer_has(state):
