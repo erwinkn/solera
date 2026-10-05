@@ -948,16 +948,16 @@ sources, automations, store names with their `Store.version`, executors
 by name, the **build identity**, and the deploy — a digest of
 all of it. The build identity says which code this is
 (per-key-processing.md §13): `Project(build=…)` or `$SOLERA_BUILD` when
-given (a CI commit, an image digest); else, in a git work tree, `HEAD`
-plus the content of every path that differs from it, untracked files
-included and ignored ones not; else the content of the Python files under
-the project's directory. A commit and a dirty flag are recorded for
-display only. Where the manifest is built and where workers import the
-project must agree on it — an image without `.git` should set
-`SOLERA_BUILD` (the `Dockerfile` takes it as a build arg, or from Railway's
-`RAILWAY_GIT_COMMIT_SHA`). A worker or sensor worker whose deploy differs
-because it was computed by another method (git against a file hash) makes
-the engine log a warning that says so. The engine counts the deploys it serves: the **deploy
+given (a CI commit, an image digest); else the source of the modules
+the project runs — every module under its directory that its own objects
+reach, transitively — so a doc, data or state beside it changes nothing.
+The git commit is recorded for display only. Where the manifest is built
+and where workers import the project must agree on it — hosts that import
+it from elsewhere (an image) should set `SOLERA_BUILD` (the `Dockerfile`
+takes it as a build arg, or from Railway's `RAILWAY_GIT_COMMIT_SHA`). A
+worker or sensor worker whose deploy differs because it was computed by
+another method (an explicit id against the modules) makes the engine log
+a warning that says so. The engine counts the deploys it serves: the **deploy
 number**.
 
 Registering a project reconciles the work outstanding under the last one: a

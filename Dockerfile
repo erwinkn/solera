@@ -16,9 +16,9 @@ FROM ghcr.io/astral-sh/uv:python3.12-bookworm-slim
 WORKDIR /home/app
 COPY --from=build /home/app/.venv .venv
 
-# The build identity (docs/per-key-processing.md §13): the image has no `.git`, so
-# the project revision would otherwise hash its Python files while a build from a
-# checkout hashes the work tree, and the two never match. Pass the commit:
+# The build identity (docs/per-key-processing.md §13): without one, every host
+# hashes the source of the project's modules. Naming the commit lets each host built
+# from it agree whatever else it installed, and shows which commit runs. Pass it:
 #   docker build --build-arg SOLERA_BUILD=$(git rev-parse HEAD) .
 # Railway provides RAILWAY_GIT_COMMIT_SHA to builds that declare it.
 ARG SOLERA_BUILD=""

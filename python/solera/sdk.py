@@ -1261,7 +1261,8 @@ class Project:
         classifies exceptions user code cannot
         subclass: `{httpx.TimeoutException: Transient}` (`solera.errors`).
         `build` names the code explicitly (else `$SOLERA_BUILD`, else the
-        work tree's content: `solera.build`); it is part of the deploy."""
+        source of the project's modules: `solera.build`); it is part of the
+        deploy."""
 
         from .errors import check_mapping
         from .stores import FileStore

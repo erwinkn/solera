@@ -34,7 +34,7 @@ Set these environment variables with Railway's reference picker (verify the actu
 
 Keep exactly one replica. Overlapping deployment startup intentionally replaces the previous writer. Do not scale this coordinator horizontally or attach multiple write processes to the same namespace. Services should fail closed rather than run repeated competing takeovers.
 
-`solera serve` runs `solera selftest` before starting the API when `SOLERA_SELFTEST=1`; a failed probe exits non-zero so the deployment fails. It prints only synthetic test results, namespace, and elapsed time, never credentials. If the endpoint ignores preconditions, transactions fail, or the old writer can publish after takeover, startup fails. Health is exposed at `/healthz`; the UI is `/` and requires the API token for data/actions.
+`solera serve` runs `solera selftest` before starting the API when `SOLERA_SELFTEST=1`; a failed probe exits non-zero before anything listens, so `/healthz` never answers and the deployment fails (`tests/server/test_selftest.py`). It prints only synthetic test results, namespace, and elapsed time, never credentials. If the endpoint ignores preconditions, transactions fail, or the old writer can publish after takeover, startup fails. Health is exposed at `/healthz`; the UI is `/` and requires the API token for data/actions.
 
 A second deployment runs the probe under a new namespace. For application persistence verification, materialize an asset in `demo`, redeploy with the same bucket/namespace and no local volume, then inspect the prior run and output in the console. Do not infer persistence merely from a green container healthcheck.
 
@@ -72,5 +72,5 @@ The run took 3.7 s. The deployment then served normally (`solera serve` under uv
 **Caveats.**
 - `solera selftest` reports checks, not raw HTTP statuses. A pass shows the provider enforces `If-None-Match: *` and that compare-and-swap fenced a stale writer. It does not print the 412 status itself. `bench/railway/probe.py` reports statuses, but it was not run here.
 - Bucket creation was `APPLYING` at first and `live` within a poll or two (seconds). `describe_environment` was the signal to trust, not the create call's response.
-- The first deployment, whose probe failed, still showed `SUCCESS` in `list_deployments`; read the deploy logs, not the status.
+- The first deployment, whose probe failed, still showed `SUCCESS` in `list_deployments`; read the deploy logs, not the status. Solera's side checks out: the same failure (a 404 `NoSuchBucket`) makes `solera serve` exit 1 within a second, before it listens. The status is Railway's.
 - Cleanup: the service and the bucket (with its `probe-*` objects) were deleted through the API, and `describe_environment` then listed no services, buckets or volumes. The gateway has no project delete, so the empty project must be deleted by hand in the Railway UI.
