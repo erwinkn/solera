@@ -599,6 +599,26 @@ class Simulation(RuleBasedStateMachine):
             raise Violation(f"task {task} launched {n} attempts")
 
     @invariant()
+    def stored_counts_sum_to_the_outcome_index(self):
+        """A per-key partition's stored-outcome counts (`stored_counts`) sum
+        to its outcome index's live keys: one is the other's summary, moved
+        by the same commits (`solera_worker/each.py`)."""
+
+        world = self.world
+        if world is None or world.engine is None:
+            return
+        m = world.engine.m
+        for (asset, partition), record in list(m.partitions.items()):
+            if (outcomes := record.get("outcomes")) is None:
+                continue
+            counted = sum((outcomes.get("counts") or {}).values())
+            live = m.key_count(f"@{asset}", partition) or 0
+            if counted != live:
+                raise Violation(
+                    f"{asset}/{partition}: stored counts sum to {counted}, its outcome index holds {live}"
+                )
+
+    @invariant()
     def reads_at_endpoints_are_exact(self):
         """Every key-index read — Δ(P, H) and lookups at the head — equals the
         fold of the commits its index holds, and the cut never passes a
