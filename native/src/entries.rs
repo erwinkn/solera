@@ -1,23 +1,13 @@
 //! Sorted entries: a write's entries in key order — upserts, each with its
 //! payload if it carries one, and removes — as the key index takes them end
-//! to end. Built once (from lists, from rows, or from the `.kx` transport
-//! form, every fact checked), read by every resolver, and encoded only to
-//! cross the wire. A delta file's entries held in memory (the engine's
-//! summaries) are one too, with their generations.
+//! to end. Built once (from lists, from rows, or from the transport form, a
+//! delta file, every fact checked), read by every resolver, and encoded only
+//! to cross the wire.
 
-use crate::format::{
-    decompress_at_most, fmt_err, parse_index_at_most, slice_at, sort_order, Error, Index, Options,
-    Result,
-};
-
-/// What a parsed index holds, in bytes: its share of a decoding budget.
-fn index_bytes(idx: &Index) -> u64 {
-    let blocks: usize = idx.blocks.iter().map(|b| b.0.len() + 32).sum();
-    (idx.min_key.len() + idx.max_key.len() + blocks) as u64
-}
 use crate::delta::Write;
+use crate::format::{sort_order, Error, Result};
 use crate::rows::{Arena, Source};
-use crate::stream::{read_entry, State, Writer};
+use crate::stream::State;
 
 #[derive(Default)]
 pub struct SortedEntries {
@@ -28,10 +18,6 @@ pub struct SortedEntries {
     pub deleted: Vec<bool>,
     pub generations: Vec<u64>,
     removes: usize,
-}
-
-fn limit<T>(what: impl std::fmt::Display) -> Result<T> {
-    Err(Error::Limit(what.to_string()))
 }
 
 impl SortedEntries {
@@ -150,103 +136,16 @@ impl SortedEntries {
         b.finish()
     }
 
-    /// Sorted entries from their transport form, a `.kx` file, after checking every
-    /// fact a reader relies on: the footer, the index and each block's
-    /// checksum, each block's entries against its index entry and the
-    /// file's against the footer, keys strictly increasing. Decodes at most
-    /// `max_entries` entries and `max_bytes` bytes (decompressed, and keys
-    /// and payloads decoded): past either, an `Error::Limit`, whatever the
-    /// file claims.
-    pub fn decode(kx: &[u8], max_entries: u64, max_bytes: u64) -> Result<SortedEntries> {
-        let idx = parse_index_at_most(kx, kx.len() as u64, max_bytes)?;
-        let declared = idx.footer.entries;
-        if declared > max_entries {
-            return limit(format!("{declared} entries, over {max_entries}"));
-        }
-        let mut indexed = 0u64;
-        for b in &idx.blocks {
-            indexed = indexed.saturating_add(b.3);
-        }
-        if indexed != declared {
-            return fmt_err("the index's entries do not match the footer");
-        }
-        let mut sorted = SortedEntries::default();
-        // One budget: the index decoded, then the blocks, then their keys and payloads.
-        let mut budget = max_bytes.saturating_sub(index_bytes(&idx));
-        let take = |budget: &mut u64, n: usize| -> Result<()> {
-            match budget.checked_sub(n as u64) {
-                Some(left) => {
-                    *budget = left;
-                    Ok(())
-                }
-                None => limit(format!("more than {max_bytes} bytes decoded")),
-            }
-        };
-        let mut key: Vec<u8> = Vec::new();
-        for (first, offset, size, entries, crc) in &idx.blocks {
-            let Some(raw) = slice_at(kx, *offset, *size) else {
-                return fmt_err("block out of bounds");
-            };
-            if crc32fast::hash(raw) != *crc {
-                return fmt_err("block checksum mismatch");
-            }
-            let data = decompress_at_most(raw, idx.footer.codec, budget)?;
-            take(&mut budget, data.len())?;
-            let (start, mut pos) = (sorted.len(), 0usize);
-            key.clear();
-            while pos < data.len() {
-                if sorted.len() as u64 >= max_entries {
-                    return limit(format!("more than {max_entries} entries"));
-                }
-                let f = read_entry(&data, &mut pos)?;
-                if f.shared > key.len() {
-                    return fmt_err("bad shared prefix length");
-                }
-                let suffix = &data[f.suffix.0..f.suffix.1];
-                let payload = f.payload(&data);
-                take(
-                    &mut budget,
-                    f.shared + suffix.len() + payload.map_or(0, <[u8]>::len),
-                )?;
-                key.truncate(f.shared);
-                key.extend_from_slice(suffix);
-                sorted
-                    .push(&key, f.generation, f.deleted(), payload)
-                    .map_err(|_| Error::Format("keys out of order".into()))?;
-            }
-            if (sorted.len() - start) as u64 != *entries {
-                return fmt_err("a block's entries do not match its index");
-            }
-            if sorted.len() > start && sorted.key(start) != first.as_slice() {
-                return fmt_err("a block's first key does not match its index");
-            }
-        }
-        if sorted.len() as u64 != declared {
-            return fmt_err("the entries do not match the footer");
-        }
-        if !sorted.is_empty()
-            && (sorted.key(0) != idx.min_key.as_slice()
-                || sorted.key(sorted.len() - 1) != idx.max_key.as_slice())
-        {
-            return fmt_err("the keys do not match the index's range");
-        }
-        Ok(sorted.shrink())
+    /// Sorted entries from their transport form, one delta file
+    /// (`layers::decode_run`): every block checked, at most `max_entries`
+    /// entries and `max_bytes` bytes decoded (`Error::Limit` past either).
+    pub fn decode(data: &[u8], max_entries: u64, max_bytes: u64) -> Result<SortedEntries> {
+        crate::layers::decode_run(data, max_entries, max_bytes)
     }
 
-    /// The transport form: one `.kx` file.
-    pub fn encode(&self, o: Options) -> Result<Vec<u8>> {
-        let mut w = Writer::new(o, usize::MAX);
-        for i in 0..self.len() {
-            w.push(
-                self.key(i),
-                self.generations[i],
-                self.deleted[i],
-                self.payload(i),
-                None,
-            )?;
-        }
-        w.finish(true)?;
-        Ok(w.files.pop_front().expect("finish(true) writes a file"))
+    /// The transport form: one delta file (`layers::encode_run`).
+    pub fn encode(&self, block_size: usize, level: i32) -> Result<Vec<u8>> {
+        crate::layers::encode_run(self, block_size, level)
     }
 }
 
@@ -291,15 +190,6 @@ impl<'a> Builder<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::format::CODEC_ZLIB;
-
-    const O: Options = Options {
-        block_size: 64,
-        level: 1,
-        bits_per_item: 14,
-        k: 10,
-        codec: CODEC_ZLIB,
-    };
 
     #[test]
     fn of_encode_decode_round_trip() {
@@ -316,19 +206,27 @@ mod tests {
         assert!(matches!(sorted.write(0), Write::Upsert(None)));
         assert!(matches!(sorted.write(2), Write::Upsert(Some(b"3"))));
         assert!(matches!(sorted.write(4), Write::Upsert(Some(b""))));
-        let back = SortedEntries::decode(&sorted.encode(O).unwrap(), 5, 1 << 20).unwrap();
+        let data = sorted.encode(64, 1).unwrap();
+        let back = SortedEntries::decode(&data, 5, 1 << 20).unwrap();
         assert_eq!(back.keys.data, sorted.keys.data);
         assert_eq!(back.deleted, sorted.deleted);
         assert_eq!(back.has_payload, sorted.has_payload);
         assert_eq!(back.payloads.data, sorted.payloads.data);
         assert!(matches!(
-            SortedEntries::decode(&sorted.encode(O).unwrap(), 4, 1 << 20),
+            SortedEntries::decode(&data, 4, 1 << 20),
             Err(Error::Limit(_))
         ));
         assert!(matches!(
-            SortedEntries::decode(&sorted.encode(O).unwrap(), 5, 8),
+            SortedEntries::decode(&data, 5, 8),
             Err(Error::Limit(_))
         ));
+        let mut flipped = data.clone();
+        *flipped.last_mut().unwrap() ^= 1;
+        assert!(matches!(
+            SortedEntries::decode(&flipped, 5, 1 << 20),
+            Err(Error::Format(_))
+        ));
+        assert!(SortedEntries::decode(&[], 0, 0).unwrap().is_empty());
         assert!(SortedEntries::of(&[b"a"], None, &[b"a"]).is_err());
         assert!(SortedEntries::of(&[b"a", b"a"], None, &[]).is_err());
     }

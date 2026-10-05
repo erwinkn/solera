@@ -384,6 +384,69 @@ pub fn decode(data: &[u8], stamp: Stamp) -> Result<Vec<Entry>> {
     Ok(out)
 }
 
+/// A write's sorted entries as one delta file — upserts as updated, with
+/// their payloads, removes as removed — the resolver's transport form.
+pub fn encode_run(run: &SortedEntries, block_size: usize, level: i32) -> Result<Vec<u8>> {
+    let mut w = BlockWriter::new(DELTA, block_size, level, usize::MAX);
+    for i in 0..run.len() {
+        let removed = run.deleted[i];
+        w.push(Entry {
+            key: run.key(i).to_vec(),
+            present: !removed,
+            start: true,
+            commit: 0,
+            generation: 0,
+            flips: if removed { vec![0] } else { vec![] },
+            payload: if removed {
+                None
+            } else {
+                run.payload(i).map(<[u8]>::to_vec)
+            },
+            replaced: None,
+        })?;
+    }
+    w.finish()?;
+    Ok(w.ready.pop_front().map(|f| f.data).unwrap_or_default())
+}
+
+/// Sorted entries back from their transport form, every block checked (its
+/// CRC, its raw length, its format, keys strictly increasing), decoding at
+/// most `max_entries` entries and `max_bytes` bytes (raw, then keys and
+/// payloads): past either, an `Error::Limit`, whatever the file claims.
+pub fn decode_run(data: &[u8], max_entries: u64, max_bytes: u64) -> Result<SortedEntries> {
+    let mut out = SortedEntries::default();
+    let mut budget = max_bytes;
+    let mut take = |n: usize| -> Result<()> {
+        budget = budget
+            .checked_sub(n as u64)
+            .ok_or_else(|| Error::Limit(format!("more than {max_bytes} bytes decoded")))?;
+        Ok(())
+    };
+    let mut pos = 0;
+    while pos < data.len() {
+        let Some(h) = data.get(pos..pos + HEADER) else {
+            return bad("truncated block header");
+        };
+        take(u32::from_le_bytes(h[8..12].try_into().unwrap()) as usize)?;
+        let (format, raw, next) = read_block(data, pos)?;
+        if format != DELTA {
+            return bad("a run's block is not a delta's");
+        }
+        pos = next;
+        let mut r = BlockReader::new(format, &raw, Stamp::default())?;
+        if out.len() as u64 + r.left as u64 > max_entries {
+            return Err(Error::Limit(format!("more than {max_entries} entries")));
+        }
+        while r.next_key()? {
+            let e = r.fields(true)?.unwrap();
+            take(e.key.len() + e.payload.as_ref().map_or(0, Vec::len))?;
+            out.push(&e.key, 0, !e.present, e.payload.as_deref())
+                .map_err(|_| Error::Format("keys out of order".into()))?;
+        }
+    }
+    Ok(out.shrink())
+}
+
 // -- the writer --------------------------------------------------------------------------------
 
 /// Where a block is, and what it holds.

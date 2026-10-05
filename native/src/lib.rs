@@ -1096,8 +1096,8 @@ impl SortedEntries {
         })
     }
 
-    /// Sorted entries from their transport form, a `.kx` file, every fact checked
-    /// (`FormatError` when one fails), decoding at most `max_entries`
+    /// Sorted entries from their transport form, one delta file, every block
+    /// checked (`FormatError` when one fails), decoding at most `max_entries`
     /// entries and `max_bytes` bytes (`LimitError` past either).
     #[staticmethod]
     #[pyo3(signature = (data, *, max_entries=u64::MAX, max_bytes=u64::MAX))]
@@ -1114,20 +1114,18 @@ impl SortedEntries {
         })
     }
 
-    /// The transport form: one `.kx` file.
-    #[pyo3(signature = (*, block_size=65536, level=1, bits_per_item=14, k=10, codec=1))]
+    /// The transport form: one delta file.
+    #[pyo3(signature = (*, block_size=16384, level=1))]
     fn encode<'py>(
         &self,
         py: Python<'py>,
         block_size: usize,
-        level: u32,
-        bits_per_item: u64,
-        k: u8,
-        codec: u8,
+        level: i32,
     ) -> PyResult<Bound<'py, PyBytes>> {
         guard(|| {
-            let o = options(block_size, level, bits_per_item, k, codec);
-            let out = py.detach(|| self.inner.encode(o)).map_err(to_py)?;
+            let out = py
+                .detach(|| self.inner.encode(block_size, level))
+                .map_err(to_py)?;
             Ok(PyBytes::new(py, &out))
         })
     }
