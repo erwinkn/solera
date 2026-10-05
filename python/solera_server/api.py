@@ -353,8 +353,8 @@ def create_app(
             raise KeyError(name)
         out = []
         planner = runtime.planner()
+        owner = runtime.manifest["outputs"][name].get("asset")
         for partition, head in runtime.m.heads_of(name):
-            owner = head.get("asset")
             cursor = owner is not None and runtime.m.partition(owner, partition).get("cursor") is not None
             out.append(
                 {

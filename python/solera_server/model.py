@@ -646,7 +646,6 @@ class Model:
                     "run": None,
                     "attempt": None,
                     "at": e["at"],
-                    "asset": None,
                     "version": None,  # a source has no code version
                     "n": self.event_counter,
                 }
@@ -879,9 +878,6 @@ class Model:
         move(self.repairs, output_map, 0, merge=list)
         move(self.cleanups, output_map, 0, merge=_renumbered)
         move(self.cleaning, output_map, 0, merge=lambda q: sorted(q, key=lambda d: d["n"]))
-        for head in self.heads.values():
-            if head.get("asset") in asset_map:
-                head["asset"] = asset_map[head["asset"]]
         for record in self.partitions.values():
             for rec in (record.get("observed") or {}).values():
                 rec["upstream"][0] = output_map.get(rec["upstream"][0], rec["upstream"][0])

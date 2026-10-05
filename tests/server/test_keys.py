@@ -706,7 +706,6 @@ async def test_renamed_asset_keeps_its_state(state):
     await engine.initialize()
     m = state.model
     assert ("feed", "") not in m.heads and m.heads[("source_feed", "")]["ref"] == before["ref"]
-    assert m.heads[("source_feed", "")]["asset"] == "source_feed"
     assert m.indexes[("source_feed", "")].prefix == "keys/feed/_/"  # files stay where they are
     assert m.partition("mirror", "")["observed"]["feed"]["upstream"] == ["source_feed", ""]
     rows["v"] = Patch([{"id": "b", "v": 2}])

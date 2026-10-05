@@ -1574,7 +1574,7 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
                 ref = entry.get("ref")
                 if ref is None or ref["partition"] != task["partition"]:
                     raise Conflict(f"output {name}: ref partition != {task['partition']!r}", retryable=False)
-            head = {"ref": ref, "asset": task["asset"], "version": prepared["version"]}
+            head = {"ref": ref, "version": prepared["version"]}
             if decl.get("key") is not None:
                 delta = entry.get("keys")
                 if delta is None and not entry.get("unchanged"):
@@ -1714,7 +1714,6 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
             "ref": ref,
             "run": run_id,
             "attempt": None,
-            "asset": None,
             "version": None,
         }
         event = {"type": "SourceCommitted", "source": name, "head": record}
@@ -2348,9 +2347,9 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
         (`key_count`, its index's), and whether it is of a complete pass —
         its partition's progress says (§7)."""
 
-        view = {**head, "key_count": self.m.key_count(output, partition)}
+        owner = self.manifest["outputs"][output].get("asset")
+        view = {**head, "asset": owner, "key_count": self.m.key_count(output, partition)}
         view["commit"] = f"{head['run']}/{head['attempt']}" if head.get("attempt") else None
-        owner = head.get("asset")
         view["materialized"] = owner is None or self.planner().complete(
             owner, head["ref"].get("partition") or ""
         )
