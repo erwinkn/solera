@@ -1,4 +1,12 @@
 import asyncio
+import faulthandler
+import gc
+import io
+import os
+import sys
+import tempfile
+import threading
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -18,6 +26,55 @@ def pytest_collection_modifyitems(config, items):
     for item in items:
         if "slow" in item.keywords:
             item.add_marker(skip)
+
+
+STALL = float(
+    os.environ.get("SOLERA_TEST_STALL", "300")
+)  # seconds one test may take before its stacks are dumped
+
+
+def _stall_dump(nodeid: str) -> str:
+    """Every thread's stack and every running event loop's tasks, for a test
+    that has run `STALL` seconds: a hang explains itself. Written to a file
+    (`SOLERA_TEST_STALL_DIR`), since pytest captures the process's stderr."""
+
+    folder = os.environ.get("SOLERA_TEST_STALL_DIR") or tempfile.gettempdir()
+    os.makedirs(folder, exist_ok=True)
+    path = os.path.join(folder, f"stall-{os.getpid()}-{int(time.time())}.txt")
+    with open(path, "w") as out:
+        out.write(f"{nodeid}: still running after {STALL:g} s\n\n== threads\n")
+        out.flush()
+        faulthandler.dump_traceback(out, all_threads=True)
+        loops = [
+            o for o in gc.get_objects() if isinstance(o, asyncio.AbstractEventLoop) and not o.is_closed()
+        ]
+        for loop in loops:
+            for _ in range(5):  # read from another thread: the set may change under it
+                try:
+                    tasks = list(asyncio.all_tasks(loop))
+                    break
+                except RuntimeError:
+                    continue
+            else:
+                tasks = []
+            out.write(f"\n== loop {id(loop):x} (running: {loop.is_running()}): {len(tasks)} tasks\n")
+            for task in tasks:
+                buf = io.StringIO()
+                task.print_stack(file=buf)
+                out.write(f"\n{task!r}\n{buf.getvalue()}")
+    sys.__stderr__.write(f"\nSTALL {nodeid}: stacks in {path}\n")
+    return path
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_protocol(item, nextitem):
+    watchdog = threading.Timer(STALL, _stall_dump, args=(item.nodeid,))
+    watchdog.daemon = True
+    watchdog.start()
+    try:
+        yield
+    finally:
+        watchdog.cancel()
 
 
 @pytest.fixture(autouse=True)
