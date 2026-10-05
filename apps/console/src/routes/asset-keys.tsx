@@ -97,7 +97,7 @@ function FailingKeys({ name }: { name: string }) {
               </MenuItem>
             ))}
             <MenuItem onClick={() => retry.mutate({ classes: ["all"], partition })}>
-              Retry every failing key
+              Retry every failed key
             </MenuItem>
           </Menu>
         }

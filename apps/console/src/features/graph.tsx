@@ -307,7 +307,7 @@ function Node({ node, status }: { node: GraphNode; status: AssetStatus | undefin
                 "inline-flex items-center gap-0.5 rounded-full px-1.5 font-medium",
                 toneSoft.warn,
               )}
-              title={`${plural(failing, "failing key")}`}
+              title={`${plural(failing, "failed key")}`}
             >
               <KeyRound className="size-2.5" />
               {failing}

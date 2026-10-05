@@ -87,13 +87,70 @@ test("the theme switches by tokens alone and persists", async ({ page }) => {
   await expect(page.locator("html")).toHaveAttribute("data-theme", "normal");
 });
 
+/** The API as the console calls it, with the test's token. */
+const api = (path: string) => `/api/projects/demo${path}`;
+const auth = { Authorization: `Bearer ${TOKEN}` };
+
+/**
+ * Pause an asset's automations and wait until none of its runs is live, so a
+ * run submitted now has its partitions to itself instead of finding them
+ * already running and planning nothing. Returns what to re-enable.
+ */
+async function quiesce(page: Page, asset: string): Promise<() => Promise<void>> {
+  const { automations } = (await (await page.request.get(api("/automations"), { headers: auth })).json()) as {
+    automations: { name: string; targets: string[]; enabled: boolean }[];
+  };
+  const paused = automations.filter((a) => a.enabled && a.targets.includes(asset)).map((a) => a.name);
+  for (const name of paused) await page.request.post(api(`/automations/${name}/disable`), { headers: auth });
+  await expect
+    .poll(
+      async () =>
+        (
+          (await (
+            await page.request.get(api(`/runs?asset=${asset}&status=running&status=queued&limit=1`), {
+              headers: auth,
+            })
+          ).json()) as { total: number }
+        ).total,
+      { timeout: 45_000 },
+    )
+    .toBe(0);
+  return async () => {
+    for (const name of paused) await page.request.post(api(`/automations/${name}/enable`), { headers: auth });
+  };
+}
+
+/** site_feed's partitions are sites' keys: on a fresh namespace, make sure there are some. */
+async function sitesExist(page: Page) {
+  const count = async () => {
+    const response = await page.request.get(api("/partitions/site_feed"), { headers: auth });
+    return response.ok() ? ((await response.json()) as { partitions: unknown[] }).partitions.length : 0;
+  };
+  if ((await count()) > 0) return;
+  await page.request.post(api("/runs"), { headers: auth, data: { targets: ["sites"], by: "test" } });
+  await expect.poll(count, { timeout: 45_000 }).toBeGreaterThan(0);
+}
+
 test("materialize an asset and follow its run to the logs", async ({ page }) => {
+  await sitesExist(page);
+  // site_feed runs every 10 seconds on its own: hold that off, or our run finds its partitions running.
+  const resume = await quiesce(page, "site_feed");
+  try {
+    await materialize(page);
+  } finally {
+    await resume();
+  }
+});
+
+async function materialize(page: Page) {
   await connect(page, "/assets/site_feed");
   await expect(page.getByRole("heading", { name: "site_feed", level: 1 })).toBeVisible();
   await page.getByRole("button", { name: "Run", exact: true }).click();
   const dialog = page.getByRole("dialog", { name: "Run" });
   await expect(dialog.getByRole("checkbox", { name: "site_feed" })).toBeChecked();
   await dialog.getByRole("radio", { name: "All" }).click();
+  // Full: materializes every partition again, so the run has tasks even if site_feed is current.
+  await dialog.getByRole("radio", { name: "Full" }).click();
   await dialog.getByRole("button", { name: "Start the run" }).click();
   await expect(page).toHaveURL(/\/runs\/[0-9A-Z]{26}/);
   await expect(page.getByRole("heading", { name: "site_feed", level: 1 })).toBeVisible();
@@ -105,7 +162,7 @@ test("materialize an asset and follow its run to the logs", async ({ page }) => 
   await expect(page).toHaveURL(/tab=spec/);
   await page.getByRole("tab", { name: "Events" }).click();
   await expect(page.getByText("committed").first()).toBeVisible();
-});
+}
 
 test("commit to a source, then cancel the run waiting for a pool worker", async ({ page }, info) => {
   const upload = `e2e-${info.project.name}`; // the projects share one server

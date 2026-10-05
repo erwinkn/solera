@@ -329,7 +329,7 @@ function AttentionAssets({ status }: { status: Record<string, AssetStatus> | und
     <Card>
       <CardHeader
         title="Assets needing attention"
-        description="Failed, stale or missing partitions, failing keys, stuck repairs"
+        description="Failed, stale or missing partitions, failed keys, stuck repairs"
         actions={
           <Link to="/assets" className={moreClass}>
             <More />
@@ -340,7 +340,7 @@ function AttentionAssets({ status }: { status: Record<string, AssetStatus> | und
         <ListSkeleton />
       ) : rows.length === 0 ? (
         <Empty compact title={`All ${plural(total, "asset")} current`}>
-          No failed, stale or missing partitions, and no failing keys.
+          No failed, stale or missing partitions, and no failed keys.
         </Empty>
       ) : (
         <ul className="flex flex-col pb-2">
@@ -370,7 +370,7 @@ function AttentionAssets({ status }: { status: Record<string, AssetStatus> | und
                       <Flag tone="warn">{s.partitioned ? `${s.partitions.stale} stale` : "stale"}</Flag>
                     )}
                     {s.partitions.missing > 0 && <Flag tone="idle">{s.partitions.missing} missing</Flag>}
-                    {keys > 0 && <Flag tone="warn">{plural(keys, "failing key")}</Flag>}
+                    {keys > 0 && <Flag tone="warn">{plural(keys, "failed key")}</Flag>}
                   </span>
                 </span>
                 {s.partitioned ? (
