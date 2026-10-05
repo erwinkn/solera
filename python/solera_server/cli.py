@@ -8,6 +8,7 @@ import argparse
 import asyncio
 import json
 import os
+import signal
 import sys
 from pathlib import Path
 
@@ -266,6 +267,10 @@ def _main():
         from .api import create_app
 
         project = args.project or "solera_server.demo:project"
+        # uvicorn shuts down gracefully on SIGTERM, then raises it again into the
+        # handler it found: the default one would end a finished stop as killed
+        # (143), and systemd would mark the unit failed. A stop is a success.
+        signal.signal(signal.SIGTERM, lambda signum, frame: None)
         uvicorn.run(
             create_app(
                 state_url=args.state_url,

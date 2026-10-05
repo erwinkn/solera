@@ -1,6 +1,7 @@
-"""`solera serve` with SOLERA_SELFTEST=1 probes the storage before it
-listens (docs/railway.md): a failed probe exits non-zero and never
-answers /healthz, so the deployment fails; a passed one serves."""
+"""`solera serve` as a process. With SOLERA_SELFTEST=1 it probes the
+storage before it listens (docs/railway.md): a failed probe exits
+non-zero and never answers /healthz, so the deployment fails; a passed
+one serves. A SIGTERM — how every platform stops it — exits 0."""
 
 import hashlib
 import http.server
@@ -122,3 +123,23 @@ def test_a_passed_probe_serves(tmp_path):
     finally:
         out, _ = stop(process)
     assert '"status": "passed"' in out
+
+
+def test_a_sigterm_stops_it_cleanly(tmp_path):
+    """systemd, Railway and the rest stop a service with SIGTERM on every
+    redeploy: a graceful stop is a success, not a failed unit."""
+
+    port = free_port()
+    process = serve((tmp_path / "state").as_uri(), port, tmp_path, SOLERA_SELFTEST="0")
+    try:
+        deadline = time.monotonic() + 120
+        while not listening(port):
+            assert process.poll() is None, stop(process)
+            assert time.monotonic() < deadline, "serve never listened"
+            time.sleep(0.2)
+        process.send_signal(signal.SIGTERM)  # the process itself, as a platform signals it
+        _, err = process.communicate(timeout=60)
+    finally:
+        stop(process)
+    assert process.returncode == 0, err[-2000:]
+    assert "Application shutdown complete" in err
