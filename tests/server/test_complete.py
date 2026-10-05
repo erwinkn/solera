@@ -99,7 +99,7 @@ async def test_deletions_keep_it_complete(state, tmp_path):
 async def test_a_keys_run_on_a_never_run_partition_is_not_complete(state, tmp_path):
     engine = await engine_of(state, project(tmp_path, {"a": 1, "b": 1}))
     await drive(engine, await engine.submit(["files"]))
-    await drive(engine, await engine.submit(["copy"], keys={"files": {"keys": ["a"]}}))
+    await drive(engine, await engine.submit(["copy"], keys={"files": ["a"]}))
     assert not await engine.complete("copy", "")  # points over the empty base
     await drive(engine, await engine.submit(["copy"]))
     assert await engine.complete("copy", "")
@@ -186,7 +186,7 @@ async def test_a_keys_run_naming_every_upstream_key_is_complete(state, tmp_path)
 
     engine = await engine_of(state, project(tmp_path, {"a": 1, "b": 1}))
     await drive(engine, await engine.submit(["files"]))
-    await drive(engine, await engine.submit(["copy"], keys={"files": {"keys": ["a", "b", "z"]}}))
+    await drive(engine, await engine.submit(["copy"], keys={"files": ["a", "b", "z"]}))
     assert await engine.complete("copy", "") and await engine.stale_reasons("copy", "") == []
 
 

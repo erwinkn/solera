@@ -691,7 +691,7 @@ async def test_a_start_over_clears_the_stored_outcomes(state):
     await engine.stop()
     engine = make_engine(state, _failing_checks(version="2"))
     await engine.initialize()
-    await drive(engine, await engine.submit(["checks"], keys={"items": {"keys": ["k0"]}}))
+    await drive(engine, await engine.submit(["checks"], keys={"items": ["k0"]}))
     assert not state.model.partition("checks", "")["outcomes"].get("counts"), "k1's record went"
     after = state.model.indexes.get(("@checks", ""))
     assert after is None or (after.life != before.life and after.count == 0)
@@ -755,7 +755,7 @@ async def test_a_keys_selection_runs_batch_size_keys_at_a_time(state, tmp_path):
     await engine.initialize()
     outside.feed.update({f"k{i}": "1" for i in range(5)})
     await engine.commit_source("feed", upsert=dict(outside.feed))
-    detail = await drive(engine, await engine.submit(["checks"], keys={"feed": {"keys": list(outside.feed)}}))
+    detail = await drive(engine, await engine.submit(["checks"], keys={"feed": list(outside.feed)}))
     assert status_of(detail) == "succeeded"
     assert live["max"] == 1 and sum(len(a) for a in detail["attempts"].values()) == 3, live
 

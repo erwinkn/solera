@@ -589,7 +589,7 @@ A run is `{targets, partitions, mode, upstream, config, keys}`:
 | `mode` | `incremental` (default) or `full` |
 | `upstream` | also plan the upstream closure; default false: **targets only, inputs pinned to current heads**, so a rebuild never re-polls an external system |
 | `config` | JSON passed as `ctx.config` |
-| `keys` | per input, what the run loads: `{"qaqc_files": {"keys": [...]}}` (those keys, each in its class or `unchanged`), `"all"` (every key under the patterns, nothing reset), or, by default, what is owed. A full run is `mode="full"`, not a `keys` value (`behaviors.md` SEL-1 to SEL-8) |
+| `keys` | per input, what the run loads: `{"qaqc_files": [...]}` (those keys, each in its class or `unchanged`), `"all"` (every key under the patterns, nothing reset), or, by default, what is owed. A full run is `mode="full"`, not a `keys` value (`behaviors.md` SEL-1 to SEL-8) |
 
 **Modes.** `incremental`: the store builds on `prior` = head, the cursor is
 kept, `Incremental` inputs get what they owe. `full`: a reset write, no
@@ -820,8 +820,9 @@ code.
                                  "commit_number": 7, "index": KeyIndex}},
   "inputs": {
     "qaqc_files":      {"ref": Ref, "index": KeyIndex,
-                        "changes": {"from": 12, "to": 14, "after": null, "full": false, "limit": 100}},
-    "site_events":     {"ref": Ref, "batch": {"commits": [4, 6], "full": false}},
+                        "batch": {"keys": [[key, class, version, generation, old], …],
+                                  "index": 0, "count": 3, "final": false, "reset": false}},
+    "site_events":     {"ref": Ref, "batch": {"commits": [4, 6], "reset": false}},
     "site_health":     {"refs": {"Richmond": Ref, "Perth": Ref}},
     "psa_samples":     {"ref": Ref},
     "usgs_3dep_tiles": {"ref": Ref}
@@ -833,7 +834,7 @@ code.
   says which bind parameters. `batch` is what to deliver — for a keyed
   upstream the keys the engine planned for this batch, with their classes
   (`observed-set.md`); for an unkeyed one the `[lo, hi]` `Commits` range.
-  `full` marks a full run's batch.
+  `reset` marks a full run's first batch.
 - `outputs` is each output's one launch record: its committed head
   (`before`, where its content is), whether the write starts it over
   (`reset`: a first write, or a `full` run, which also withholds the

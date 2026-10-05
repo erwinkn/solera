@@ -73,7 +73,7 @@ async def _history(kind, root):
         assert await tally() == (([], ["k3"], []), 3)
 
         await feed(removes=["k2"])
-        assert await tally({"items": {"keys": ["k2"]}}) == (([], [], ["k2"]), 2)
+        assert await tally({"items": ["k2"]}) == (([], [], ["k2"]), 2)
         await feed({"k2": "3"})
         # Delivered removed by the keys= run, live now: added, against what that run delivered.
         assert await tally() == ((["k2"], [], []), 3)
@@ -170,7 +170,7 @@ async def test_a_change_during_a_full_pass_is_counted_once(tmp_path, change):
     t = await Tally().start(tmp_path)
     try:
         await t.feed({"k1": "1", "k2": "1"})
-        await t.run(keys={"items": {"keys": ["k1"]}})
+        await t.run(keys={"items": ["k1"]})
         await t.feed(
             **{"update": {"upserts": {"k1": "2"}}, "add": {"upserts": {"k3": "1"}}}.get(
                 change, {"removes": ["k1"]}
@@ -191,9 +191,9 @@ async def test_a_selection_completes_a_full_pass_only_with_the_removals_it_owes(
     t = await Tally().start(tmp_path)
     try:
         await t.feed({"k1": "1", "k2": "1"})
-        await t.run(keys={"items": {"keys": ["k1"]}})
+        await t.run(keys={"items": ["k1"]})
         await t.feed(removes=["k1"])
-        await t.run(keys={"items": {"keys": ["k2"]}})
+        await t.run(keys={"items": ["k2"]})
         await t.run()
         await t.exact()
     finally:
@@ -210,7 +210,7 @@ async def test_a_selection_during_a_pattern_change_is_counted_once(tmp_path):
         await t.feed({"k1": "1", "k2": "1"})
         await t.run()
         await t.deploy(include=["k*"])
-        await t.run(keys={"items": {"keys": ["k2"]}})
+        await t.run(keys={"items": ["k2"]})
         await t.run()
         await t.exact()
     finally:

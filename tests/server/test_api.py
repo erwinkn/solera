@@ -172,8 +172,10 @@ async def test_run_validation_conflict(client, base):
 
     unknown = await client.post(f"{base}/runs", json={"targets": ["ghost"]})
     assert unknown.status_code == 400
-    bad_keys = await client.post(f"{base}/runs", json={"targets": ["total"], "keys": {"strangers": "full"}})
+    bad_keys = await client.post(f"{base}/runs", json={"targets": ["total"], "keys": {"strangers": "all"}})
     assert bad_keys.status_code == 400
+    retired = await client.post(f"{base}/runs", json={"targets": ["total"], "keys": {"feed": "full"}})
+    assert retired.status_code == 400  # a full run is mode="full", not a keys= value
 
 
 async def test_a_value_no_checkpoint_can_hold_is_a_400(client, base, engine):

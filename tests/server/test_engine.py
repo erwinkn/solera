@@ -238,7 +238,7 @@ async def test_config_change_reprocesses_everything(state):
     @asset(inputs={"files": Incremental()})
     def consumer(ctx, files: list):
         seen.setdefault("commits", []).append([r["id"] for r in files])
-        seen.setdefault("full", []).append(ctx.batch["files"].full)
+        seen.setdefault("full", []).append(ctx.batch["files"].reset)
         return []
 
     project = Project(assets=[files, consumer])
@@ -262,7 +262,7 @@ async def test_a_full_run_starts_its_record_over(state):
 
     @asset(inputs={"files": Incremental()})
     def consumer(ctx, files: list):
-        seen.append((sorted(r["id"] for r in files), ctx.batch["files"].full))
+        seen.append((sorted(r["id"] for r in files), ctx.batch["files"].reset))
         return [{"n": len(files)}]
 
     project = Project(assets=[files, consumer])
@@ -331,7 +331,7 @@ async def test_incremental_batching_and_more(state):
 
 async def test_run_keys_override(state):
     """§8: a `keys=` list loads the keys it names — b, unchanged, observed
-    as it is; 'full' is a full run, every key again."""
+    as it is; 'all' loads every key again, unchanged, without starting over."""
     seen = []
 
     @asset(outputs=Output("files", key="id"))
@@ -347,17 +347,16 @@ async def test_run_keys_override(state):
     engine = make_engine(state, project)
     await engine.initialize()
     await drive(engine, await engine.submit(["consumer"], upstream=True))
-    detail = await drive(engine, await engine.submit(["consumer"], keys={"files": {"keys": ["b"]}}))
+    detail = await drive(engine, await engine.submit(["consumer"], keys={"files": ["b"]}))
     assert status_of(detail) == "succeeded", [t.get("error") for t in detail["tasks"]]
     assert seen == [["a", "b"], ["b"]]
-    await drive(engine, await engine.submit(["consumer"], keys={"files": "full"}))
+    await drive(engine, await engine.submit(["consumer"], keys={"files": "all"}))
     assert seen[-1] == ["a", "b"]
 
 
-async def test_a_full_override_resumes_its_pass_batch_by_batch(state):
-    """Engine review round 2 #2: `keys={"files": "full"}` is a full run, and
-    its later batches walk on from its progress — the first batch is not
-    served again, nor started over."""
+async def test_a_full_run_resumes_batch_by_batch(state):
+    """Engine review round 2 #2: a full run's later batches walk on from its
+    progress — the first batch is not served again, nor started over."""
     seen = []
 
     @asset(outputs=Output("files", key="id"))
@@ -367,16 +366,16 @@ async def test_a_full_override_resumes_its_pass_batch_by_batch(state):
     @asset(inputs={"files": Incremental(batch_size=2)})
     def consumer(ctx, files: list):
         changes = ctx.batch["files"]
-        seen.append((sorted(r["id"] for r in files), changes.full, changes.index))
+        seen.append((sorted(r["id"] for r in files), changes.reset, changes.index))
         return []
 
     project = Project(assets=[files, consumer])
     engine = make_engine(state, project)
     await engine.initialize()
     await drive(engine, await engine.submit(["consumer"], upstream=True))
-    for _ in range(2):  # a second override starts a pass of its own
+    for _ in range(2):  # a second full run starts over on its own
         seen.clear()
-        detail = await drive(engine, await engine.submit(["consumer"], keys={"files": "full"}), timeout=10)
+        detail = await drive(engine, await engine.submit(["consumer"], mode="full"), timeout=10)
         assert status_of(detail) == "succeeded"
         assert seen == [(["a", "b"], True, 0), (["c"], False, 1)]
 
@@ -1172,8 +1171,8 @@ async def test_a_batch_says_where_it_sits_in_its_pass(state):
     @asset(inputs={"files": Incremental(batch_size=3)})
     def consumer(ctx, files: list):
         ch = ctx.batch["files"]
-        pages.append((ch.index, ch.count, ch.first, ch.final, ch.full))
-        if ch.full and ch.first:
+        pages.append((ch.index, ch.count, ch.first, ch.final, ch.reset))
+        if ch.reset:
             rebuilt["keys"] = []
         rebuilt["keys"] += [r["id"] for r in files]
         return [{"n": len(files)}]
@@ -1187,7 +1186,7 @@ async def test_a_batch_says_where_it_sits_in_its_pass(state):
     @asset(inputs={"log": Incremental(batch_size=1)})
     def tail(ctx, log: list):
         ch = ctx.batch["log"]
-        batch_pages.append((ch.index, ch.count, ch.first, ch.final, list(ch.upstream.commits), ch.full))
+        batch_pages.append((ch.index, ch.count, ch.first, ch.final, list(ch.upstream.commits), ch.reset))
         return [{"n": len(log)}]
 
     project = Project(assets=[files, consumer, log, tail])

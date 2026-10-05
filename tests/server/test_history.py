@@ -450,7 +450,7 @@ async def test_a_retry_asks_for_the_work_it_selects(state, clock):
     )
     await engine.initialize()
     failed = await run(
-        engine, clock, ["site"], partitions="all", upstream=True, config={"fail": True}, keys={"log": "full"}
+        engine, clock, ["site"], partitions="all", upstream=True, config={"fail": True}, keys={"log": "all"}
     )
     assert failed["status"] == "failed"
     retried = await engine.retry(failed["id"], by="ops")

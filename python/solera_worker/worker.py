@@ -284,16 +284,16 @@ class Ctx:
         """Read what the producer holds, whole. `ctx.load()`, or
         `ctx.load("name")` for one of several outputs: the asset's own
         output as committed at the attempt's pin — what a total kept from
-        `ctx.batch` changes builds on — or None before its first commit, and
-        in a full run until that run's first commit: the write that starts
-        the content over builds on nothing. `ctx.load(ref, t)`: a ref an
-        input gave. Not an input read of the attempt's: lineage does not
-        record it."""
+        `ctx.batch` changes builds on — or None before its first commit.
+        Always what is materialized, a full run's first batch included:
+        `batch.reset` says to start over instead (D166). `ctx.load(ref, t)`:
+        a ref an input gave. Not an input read of the attempt's: lineage
+        does not record it."""
 
         index = None
         if not isinstance(ref, Ref):
             info = self._pinned.get(self._output("load", ref)) or {}
-            if info.get("before") is None or info.get("reset"):
+            if info.get("before") is None:
                 return None
             ref, index = Ref.from_json(info["before"]), info.get("index")
         store = self._stores[ref.store]
@@ -387,13 +387,13 @@ async def _resolve_inputs(spec, project, asset, keys_io, timeline, observed: Obs
         store = reader(project, ref)
         if "batch" in pin:  # Incremental: selection + ctx.batch (§5.1)
             ch = pin["batch"]
-            full = bool(ch.get("full"))
+            reset = bool(ch.get("reset"))
             if "commits" in ch:
                 lo, hi = (int(v) for v in ch["commits"])
                 args[param] = await observed.load(store, ref, t, Commits(lo, hi))
                 batch[param] = Batch(
                     rows=args[param],
-                    full=full,
+                    reset=reset,
                     index=int(ch.get("index") or 0),
                     count=int(ch.get("count") or 1),
                     final=not ch.get("more"),
@@ -413,7 +413,7 @@ async def _resolve_inputs(spec, project, asset, keys_io, timeline, observed: Obs
                 updated=tuple(classes["updated"]),
                 removed=tuple(classes["removed"]),
                 unchanged=tuple(classes["unchanged"]),
-                full=full,
+                reset=reset,
                 index=int(ch["index"]),
                 count=int(ch["count"]),
                 final=bool(ch["final"]),
@@ -421,7 +421,7 @@ async def _resolve_inputs(spec, project, asset, keys_io, timeline, observed: Obs
                 served={k: v for k, v in seen.items() if v is not None},
             )
             delivered[param] = {"observed": seen}
-            if not full:  # a full run's first batch starts its consumer over, keys or none
+            if not reset:  # a full run's first batch starts its consumer over, keys or none
                 nothing.append(keys and not any(classes.values()))
             timeline.add("loaded", param, _rows(args[param]))
             continue

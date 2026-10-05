@@ -163,7 +163,12 @@ def _main():
     )
     run.add_argument("--upstream", action="store_true")
     run.add_argument("--config", default="{}", help="Run configuration as a JSON object")
-    run.add_argument("--keys", action="append", default=[], help="INPUT=full or INPUT=k1,k2")
+    run.add_argument(
+        "--keys",
+        action="append",
+        default=[],
+        help="INPUT=k1,k2 (those keys) or INPUT=all (every key, the rest unchanged); a full run is --full",
+    )
     run.add_argument("--tag", action="append", default=[], help="Label the run: NAME=VALUE (repeatable)")
 
     runs = commands.add_parser("runs", help="List, delete or prune runs (§7, §11)", parents=[common])
@@ -441,7 +446,7 @@ def _parse_keys(specs):
     out = {}
     for spec in specs:
         input, _, value = spec.partition("=")
-        out[input] = value if value == "full" else [k for k in value.split(",") if k]
+        out[input] = value if value == "all" else [k for k in value.split(",") if k]
     return out
 
 

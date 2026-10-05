@@ -555,12 +555,19 @@ class Planner:
             if unknown:
                 raise ValueError(f"keys= names no Incremental input: {sorted(unknown)}")
             for output, override in keys.items():
-                if not isinstance(override, dict):
-                    continue
+                if override != "all" and not (
+                    isinstance(override, list) and all(isinstance(k, str) for k in override)
+                ):
+                    raise ValueError(
+                        f"keys= takes, per input, a list of keys or 'all', not {override!r} for {output!r}"
+                        " (a full run is mode='full')"
+                    )
                 if self.manifest["outputs"][output].get("key") is None:
                     raise ValueError(f"keys= selects keys of {output!r}, which has none")
                 if mode == "full":
-                    raise ValueError("a keys= selection reads the keys it names: it cannot be a full run")
+                    raise ValueError(
+                        "keys= selects what a run reads without starting over: not in a full run"
+                    )
         if skip_active:
             for name in assets:
                 assets[name] = {s for s in assets[name] if not active(name, s)}

@@ -66,7 +66,7 @@ def _mutate(valid: dict):
 ROUTES = {
     "runs": {"targets": ["total"], "partitions": "latest", "mode": "incremental", "keys": None, "config": {}},
     "runs-daily": {"targets": ["daily"], "partitions": ["2026-09-18"], "upstream": True, "tags": {"t": "1"}},
-    "runs-keys": {"targets": ["total"], "keys": {"feed": {"keys": ["a"]}}},
+    "runs-keys": {"targets": ["total"], "keys": {"feed": ["a"]}},
     "commit-keys": {"keys": {"u-1": "v1"}},
     "commit-upsert": {"upsert": ["u-2"], "remove": ["u-1"]},
     "retry": {"classes": ["failed"], "partition": "2026-09-18"},

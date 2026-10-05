@@ -1062,6 +1062,8 @@ class Model:
         }
         if e.get("error"):
             summary["error"] = e["error"]
+        if (handle := history.handle(launched)) is not None:
+            summary["handle"] = handle
         if generation is not None:
             summary["generation"] = int(generation)
         commit = e.get("commit")

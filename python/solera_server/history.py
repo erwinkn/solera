@@ -142,6 +142,7 @@ TABLES = {
             "generation": "BIGINT",  # the one its writes carried (lifecycle.md §9.7)
             "keys": "MAP(VARCHAR, BIGINT)",  # a per-key attempt's keys by outcome: ok, failed…
             "batch": "VARCHAR",  # a keyed attempt's batch (`batch`, JSON)
+            "handle": "VARCHAR",  # its executor's handle as recorded at launch (`handle`, JSON)
         },
     ),
     "commits": Table(
@@ -230,6 +231,17 @@ MAX_METADATA = 64 << 10  # bytes of JSON per output version
 
 
 EXECUTION = ("executor", "cpu", "memory", "gpu", "options")
+
+
+def handle(launched: dict | None) -> dict | None:
+    """A launched attempt's handle, as served (D170): what its executor
+    recorded at launch (`AttemptPlaced`) — an ECS task, a pod, a Modal
+    call — verbatim; None for Local and Pool attempts, whose handle is the
+    engine's own bookkeeping, and before one is recorded."""
+
+    if not launched or launched["execution"].get("kind") in ("Local", "Pool"):
+        return None
+    return launched.get("handle")
 
 
 def execution(spec: dict) -> dict:
@@ -330,6 +342,7 @@ def attempt_row(run_id: str, task: dict, summary: dict, n: int) -> dict:
         "generation": summary.get("generation"),
         "keys": summary.get("keys") or {},
         "batch": _json(summary.get("batch")),
+        "handle": _json(summary.get("handle")),
     }
 
 
@@ -347,6 +360,8 @@ def attempt_summary(row: dict) -> dict:
         attempt["keys"] = dict(row["keys"])
     if row.get("batch"):
         attempt["batch"] = json.loads(row["batch"])
+    if row.get("handle"):
+        attempt["handle"] = json.loads(row["handle"])
     return attempt
 
 

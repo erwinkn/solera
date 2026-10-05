@@ -261,7 +261,7 @@ async def test_7_a_keys_override_obeys_the_patterns(state):
     content.update({"a/1": {"n": 3}, "excluded/2": {"n": 4}})  # both change (K47: keys= reads changes)
     await drive(engine, await engine.submit(["files"]))
     seen.clear()
-    await drive(engine, await engine.submit(["parse"], keys={"files": {"keys": ["excluded/2", "a/1"]}}))
+    await drive(engine, await engine.submit(["parse"], keys={"files": ["excluded/2", "a/1"]}))
     assert seen == ["a/1"] and set(await rows_of(engine, project, "samples")) == {"a/1"}
 
 

@@ -133,14 +133,14 @@ and unchanged; removed keys have none, and `rows` is the parameter),
 `count`), `reset` (the first batch of a full run, SEL-9), `upstream` (its
 output; for an unkeyed upstream the commit range). A run of 3 batches
 gives `index` 0, 1, 2 and `final` only on the last.
-*From* D44, D140 (4), D157. *Covered* `server/test_engine.py::test_a_batch_says_where_it_sits_in_its_pass`; `server/test_engine.py::test_the_batch_plan_is_an_estimate_but_final_is_not`. `reset` replaces today's `full` in W22's step 6 (Q1).
+*From* D44, D140 (4), D157. *Covered* `server/test_engine.py::test_a_batch_says_where_it_sits_in_its_pass`; `server/test_engine.py::test_the_batch_plan_is_an_estimate_but_final_is_not`. `reset`: `server/test_selection.py::test_sel_9_a_full_runs_first_batch_says_reset_and_load_returns_what_is_materialized`.
 
 **INC-11. `ctx.load()` returns the asset's own output as materialized; `None` before its first commit.**
 `tally`'s second batch reads `{"rows": 2}` committed by its first, and adds
 to it.
 In a full run too: batch 0 says `reset`, and `ctx.load()` still returns
 what was materialized before it (SEL-9).
-*From* D44, D166 (chain: D141 → D166); Q1. *Covered* exercised by `tally` in every `server/test_observed_histories.py` test; no dedicated test. The full-run case is being built in W22's step 6.
+*From* D44, D166 (chain: D141 → D166); Q1. *Covered* `server/test_selection.py::test_inc_11_ctx_load_returns_the_output_as_materialized`; the full-run case `server/test_selection.py::test_sel_9_a_full_runs_first_batch_says_reset_and_load_returns_what_is_materialized`; exercised by `tally` in every `server/test_observed_histories.py` test.
 
 **INC-12. A task walks what it owes in key order, `batch_size` keys a commit.**
 Seven owed keys, `batch_size=3`: three batches, three commits. Default
@@ -287,20 +287,20 @@ ends with the ten processed.
 **SEL-7. `keys={input: "all"}` loads every key under the patterns without starting over.**
 Owed keys in their class, the rest `unchanged`; nothing is reset.
 `keys={"rates": "all"}`.
-*From* D140 (3); Q3. *Covered* none: being built in W22's step 6 (today the planner has it, the run API does not).
+*From* D140 (3); Q3. *Covered* `server/test_selection.py::test_sel_7_keys_all_loads_every_key_without_starting_over`; `server/test_engine.py::test_run_keys_override`.
 
 **SEL-8. A full run owes every upstream key under the patterns; a plain consumer starts over.**
 `mode="full"`, or an automatic full run (CHG-1, RST-1). A full run is the
-run's mode, never a `keys=` value (Q3; today's `keys={input: "full"}`
-goes in W22's step 6). `tally`'s first batch starts its count from zero; its cursor is
-`None`; the run continues batch by batch across attempts.
-*From* D141, D166, D140. *Covered* `server/test_engine.py::test_a_full_run_starts_its_record_over`; `server/test_engine.py::test_result_cursor_and_omitted_output`; `server/test_each_review.py::test_a_full_run_reads_every_key_once_in_batches`.
+run's mode, never a `keys=` value (Q3: `keys={input: "full"}` is refused).
+`tally`'s first batch starts its count from zero; its cursor is `None`;
+the run continues batch by batch across attempts.
+*From* D141, D166, D140. *Covered* `server/test_selection.py::test_sel_8_a_full_run_owes_every_key_and_a_plain_consumer_starts_over`; `server/test_selection.py::test_sel_8_keys_full_is_no_longer_a_full_run`; `server/test_engine.py::test_a_full_run_starts_its_record_over`; `server/test_engine.py::test_result_cursor_and_omitted_output`; `server/test_each_review.py::test_a_full_run_reads_every_key_once_in_batches`.
 
 **SEL-9. A full run's first batch says `batch.reset`; `ctx.load()` still returns what is materialized.**
 `tally` sees `batch.reset == True` on batch 0 and ignores `{"rows": 7}`
 from `ctx.load()`; later batches build on what batch 0 committed.
 Per-key producers never see `reset`.
-*From* D166 (chain: D141 → D166; D140 (4) drops `Batch.full`); Q1. *Covered* none: being built in W22's step 6; today `batch.full and batch.first`.
+*From* D166 (chain: D141 → D166; D140 (4) drops `Batch.full`); Q1. *Covered* `server/test_selection.py::test_sel_9_a_full_runs_first_batch_says_reset_and_load_returns_what_is_materialized`.
 
 **SEL-10. A per-key consumer's full run keeps its outputs readable and removes what upstream lacks.**
 `checks` holds k1, k2, x9; upstream has k1, k2, k3. The full run calls k1
@@ -956,7 +956,7 @@ reads a:1.
 A batch planned at g12 reads Postgres after g13 committed: it is classed
 at g13, so its classes and rows agree key by key, and lineage records 13.
 A store that moved on since planning makes the batch replan, not fail.
-*From* D144 (1); Q14; `stores.md`, "What a read sees". *Covered* partly: the generation read, `server/test_lineage_reads.py::test_lineage_says_what_a_current_read_saw`, sim `reads_say_what_they_read`; the classes are being built in W22's step 4b (today a newer row is delivered again later with its own change).
+*From* D144 (1); Q14; `stores.md`, "What a read sees". *Covered* `server/test_fenced_reads.py::test_a_commit_installed_between_plan_and_read_replans_once` (replans once, runs at the new head); `server/test_fenced_reads.py::test_a_long_upstream_write_holds_its_consumers_until_it_commits` (waits, no failed attempt); `server/test_fenced_reads.py::test_a_store_that_keeps_moving_fails_after_its_replan_window`; the generation read, `server/test_lineage_reads.py::test_lineage_says_what_a_current_read_saw`, sim `reads_say_what_they_read`.
 
 **STO-4. On a fenced store a stale writer changes nothing.**
 g5 writes; g9 acquires and writes; g5 writes again: refused. One
@@ -1027,7 +1027,7 @@ Numbers are stable: entries refer to them.
 
 1. **`Batch.full` vs `batch.reset`, `ctx.load()` in a full run.** D166
    wins: the first batch of a full run says `batch.reset`, and `ctx.load()`
-   always returns what's materialized; being built in W22's step 6. INC-10,
+   always returns what's materialized; built (rebuild step 6). INC-10,
    INC-11, SEL-9.
 2. **Stale docs.** `architecture.md` §1–§10, `versions.md` §6–§8 and
    `per-key-processing.md` now state the contract and point here
@@ -1035,7 +1035,7 @@ Numbers are stable: entries refer to them.
    `object-store-state.md` are held for the redesign).
 3. **`keys=` forms.** `keys=` takes a list, `"all"`, or the default (what
    is owed); a full run is the run's `mode="full"`, not a `keys` value
-   (Erwin, in the rebuild decisions); built in W22's step 6. SEL-7, SEL-8.
+   (Erwin, in the rebuild decisions); built (rebuild step 6). SEL-7, SEL-8.
 4. **A reverted update** is delivered as updated (D156); `architecture.md`
    §5 is fixed. INC-4.
 5. **A key missing from a source** is processed as absent: D147 retires
@@ -1045,7 +1045,7 @@ Numbers are stable: entries refer to them.
    (coordinator, rebuild step 5). STA-12.
 14. **Fenced reads and classes.** D144 (1) stands: classes and rows agree
    key by key, and a store that moved on makes the batch replan, not fail;
-   being built in W22's step 4b. STO-3.
+   built (rebuild step 4b). STO-3.
 15. **Cancelled per-key keys** stay owed, and any next run processes them:
    intended (Erwin: cancelled keys need no machinery). KEY-9.
 16. **A deploy mismatch.** D174 wins: attempts in flight finish under their
@@ -1060,9 +1060,9 @@ where the decided one is not built.
 
 | Area | Entries | Covered | Partly | None |
 |---|---|---|---|---|
-| INC incremental delivery | 14 | 13 | 1 (INC-11) | 0 |
+| INC incremental delivery | 14 | 14 | 0 | 0 |
 | RUN runs, batches, attempts | 15 | 14 | 0 | 1 (RUN-14) |
-| SEL keys=, all, full, reset | 12 | 10 | 0 | 2 (SEL-7, SEL-9) |
+| SEL keys=, all, full, reset | 12 | 12 | 0 | 0 |
 | CHG definition, patterns, context | 12 | 12 | 0 | 0 |
 | RST resets, moves, renames | 8 | 8 | 0 | 0 |
 | SRC sources | 11 | 9 | 0 | 2 (SRC-8, SRC-9) |
@@ -1074,8 +1074,8 @@ where the decided one is not built.
 | CLN cleanup, retention | 11 | 10 | 0 | 1 (CLN-11) |
 | ENG crashes, fencing | 16 | 16 | 0 | 0 |
 | DEP deploys, reload | 6 | 6 | 0 | 0 |
-| STO stores | 7 | 6 | 1 (STO-3) | 0 |
-| **Total** | **157** | **148** | **2** | **7** |
+| STO stores | 7 | 7 | 0 | 0 |
+| **Total** | **157** | **152** | **0** | **5** |
 
 ## Appendix: entries to today's mechanisms
 

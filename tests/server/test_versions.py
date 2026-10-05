@@ -28,7 +28,7 @@ async def test_each_batch_says_the_generation_it_read(state):
     @asset(inputs={"items": Incremental(batch_size=1)}, outputs=Output("copy", key="id"))
     async def copy(ctx, items: list):
         changes = ctx.batch["items"]
-        seen.append((changes.full, [(r["id"], r["v"]) for r in items]))
+        seen.append((changes.reset, [(r["id"], r["v"]) for r in items]))
         if changes.first and not moved["done"]:
             moved["done"] = True  # the upstream moves while the pass is half delivered
             content["rows"] = [{"id": "b", "v": 3}]

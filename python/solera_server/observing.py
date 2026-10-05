@@ -182,9 +182,7 @@ class Observing:
         history the index no longer serves."""
 
         record = self.m.partition(task["asset"], task["partition"])
-        if not task.get("progress") and (
-            run["mode"] == "full" or any((run.get("keys") or {}).get(i.output) == "full" for i in incremental)
-        ):
+        if not task.get("progress") and run["mode"] == "full":
             return "full run"
         if record.get("definition") not in (None, self._definition(task["asset"], run)):
             return "definition changed"
@@ -247,8 +245,9 @@ class Observing:
             rec = records.get(input.param)
             if full or rec is None:
                 rec = observed.record(life, held=full and each)
+            # `keys=`: a list of keys, "all" (every key, the rest unchanged), or what is owed
             override = (run.get("keys") or {}).get(input.output)
-            named = sorted({str(k) for k in override["keys"]}) if isinstance(override, dict) else None
+            named = sorted(set(override)) if isinstance(override, list) else None
             held = self._held(task["asset"], partition) if each else None
             if mine is not None and mine["key"] is None:  # walked to the end in this task
                 b = owed.Batch([], None, None, True)
@@ -261,7 +260,7 @@ class Observing:
                         now,
                         int(spec["batch_size"]),
                         after=(mine or {}).get("key"),
-                        keys=named,
+                        keys=named if named is not None else override,
                         held=held,
                     )
             out[input.param] = {
@@ -385,7 +384,7 @@ class Observing:
         lo, hi = o["commits"]
         batch = {
             "commits": [lo, hi],
-            "full": o["full"],
+            "reset": o["full"],
             "more": not o["final"],
             "index": o["index"],
             "count": o["count"],
@@ -428,7 +427,7 @@ class Observing:
         state = self.m.index(input.output, input.partition)
         size = int(input.spec["batch_size"])
         count = o["index"] + 1 if b.final else max(o["index"] + 2, -(-state.count // size))
-        batch = {"keys": keys, "index": o["index"], "count": count, "final": b.final, "full": o["full"]}
+        batch = {"keys": keys, "index": o["index"], "count": count, "final": b.final, "reset": o["full"]}
         pin = {"ref": ref, "index": state.to_json(), "batch": batch}
         if input.spec.get("patterns") is not None:
             pin["patterns"] = input.spec["patterns"]

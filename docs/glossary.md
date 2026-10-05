@@ -218,9 +218,11 @@ or by `Project(errors=…)`.
 task per asset partition, in dependency order: the **run graph**.
 
 **selection**. Which partitions a run covers: `latest`, `missing` (not
-materialized), `all` or a list; and, per input, `keys=`: explicit keys read
-as that input's batch, or `full`. *Example:* `solera run file_index --keys
-'site_files=alpha-file-0'`.
+materialized), `all` or a list; and, per input, `keys=`: a list of keys
+read as that input's batch, or `"all"` — every key under the patterns,
+those already processed as `unchanged`, nothing started over — else what
+is owed. A full run is `mode="full"`, never a `keys=` value. *Example:*
+`solera run file_index --keys 'site_files=alpha-file-0'`.
 
 **full run** `mode="full"`. The opposite of an incremental run: it
 materializes all the data of each partition again. Its writes **reset**
@@ -232,8 +234,8 @@ that removes an output or moves it to another store resets it too, as a
 whole: the output under that name is a new one, its heads, index and the
 positions on it go at that deploy, and an attempt launched before commits
 nothing (object-store-state.md §2).
-*Not:* a full pass of one input (`keys={"x": "full"}`), which rewrites
-nothing by itself. *Was:* `KeyedWrite.whole`.
+*Not:* `keys={"x": "all"}`, which reloads every key of one input and
+rewrites nothing by itself. *Was:* `KeyedWrite.whole`.
 
 **upstream**. The output an input reads. A run with `upstream=True` also
 runs what its targets read; without it, inputs are pinned to current
@@ -345,8 +347,11 @@ creates it (`lifecycle.md` §2.4). *Was:* `{attempt}.worker` (ownership),
 `{attempt}.writing` (the gate) and `{attempt}.result`, until K18.
 
 **attempt handle**. An executor's identifier for the worker it started
-(an ECS task ARN, a pod name), recorded so a restarted engine can follow
-or cancel it. *Was:* `RunHandle`, the protocol's `run` parameter.
+(an ECS task ARN, a pod name), recorded at launch (`AttemptPlaced`) so a
+restarted engine can follow or cancel it, and served as recorded on the
+attempt (D170): none for Local and Pool attempts, whose handle is the
+engine's own. A retry is a new attempt, with a new spec and handle.
+*Was:* `RunHandle`, the protocol's `run` parameter.
 
 **result**. What an attempt produced: per output its ref and delta, the
 batches it read, its cursor, or an error; sealed once into the control
@@ -503,8 +508,7 @@ over one or more attempts:
 
 - **full**: the whole head as of its start, its snapshot — what changes
   after arrives as the next delta, so every delivery in it is added
-  (first read, full run, fingerprint change,
-  `keys=full`);
+  (first read, full run, fingerprint change);
 - **delta**: the commits since the position, removed keys included: an
   `each` asset drops them from its outputs;
 - **diff**: after a pattern change, the keys whose match changed.
@@ -528,7 +532,8 @@ It may be one upstream commit, part of one, or several. One batch per
 attempt and commit. Never empty, but for one case: a full pass whose
 input takes no key reaches a plain producer as one empty batch, since
 starting over must happen (a per-key asset's cleanup does it instead). It knows its `index` in the pass (0-based, exact),
-the planned `count` (possibly an estimate), `first`, `final`, `full`, and
+the planned `count` (possibly an estimate), `first`, `final`, `reset` (a
+full run's first batch: start over), and
 its `added`, `updated` and `removed` keys: each key's net change since
 the input's position (a full pass's are all added). *Example:* `file_index` reads four
 files per site in two batches of `batch_size=2`. *Was:* page (`Changes`,

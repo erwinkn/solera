@@ -244,8 +244,8 @@ async def test_an_unkeyed_upstream_reset_right_after_a_pass_is_delivered_in_full
     @asset(inputs={"log": Incremental()})
     def tally(ctx, log: list):
         changes = ctx.batch["log"]
-        seen.append((changes.full, len(log)))
-        base = 0 if (changes.full and changes.first) or ctx.cursor is None else ctx.cursor
+        seen.append((changes.reset, len(log)))
+        base = 0 if changes.reset or ctx.cursor is None else ctx.cursor
         return Result(outputs={"tally": {"rows": base + len(log)}}, cursor=base + len(log))
 
     engine = make_engine(state, Project(assets=[log, tally]))
@@ -277,7 +277,7 @@ async def test_a_full_pass_that_takes_no_key_still_starts_over(state):
     def mirror(ctx, items: list):
         changes = ctx.batch["items"]
         rows = [{"id": r["id"], "v": r["v"]} for r in items]
-        return rows if changes.full and changes.first else Patch(rows, remove=list(changes.removed))
+        return rows if changes.reset else Patch(rows, remove=list(changes.removed))
 
     engine = make_engine(state, Project(assets=[items, mirror]))
     await engine.initialize()
@@ -305,7 +305,7 @@ async def test_a_full_pass_over_an_empty_upstream_reaches_its_producer(state):
     @asset(inputs={"items": Incremental()}, outputs=Output("mirror", key="id"))
     def mirror(ctx, items: list):
         b = ctx.batch["items"]
-        seen.append((b.full, b.first, b.final, len(items)))
+        seen.append((b.reset, b.first, b.final, len(items)))
         return [{"id": r["id"], "v": r["v"]} for r in items]
 
     engine = make_engine(state, Project(assets=[items, mirror]))
@@ -410,7 +410,7 @@ async def test_a_key_a_moved_output_dropped_leaves_its_consumer(state, tmp_path,
                 entered.set()
                 await release.wait()
             changes = ctx.batch["items"]
-            return items if changes.full else Patch(items, remove=changes.removed)
+            return items if changes.reset else Patch(items, remove=changes.removed)
 
         return Project(assets=[items, copy], stores={"other": FileStore(tmp_path / "other")})
 
@@ -546,8 +546,8 @@ def _moving(tmp_path, rows: dict, seen: list):
         @asset(outputs=Output("copy", key="id"), inputs={"items": Incremental()})
         def copy(ctx, items: list):
             b = ctx.batch["items"]
-            seen.append((b.full, sorted(r["id"] for r in items)))
-            return items if b.full and b.first else Patch(items, remove=list(b.removed))
+            seen.append((b.reset, sorted(r["id"] for r in items)))
+            return items if b.reset else Patch(items, remove=list(b.removed))
 
         return Project(assets=[items, copy], stores={"other": FileStore(tmp_path / "other")})
 
@@ -628,7 +628,7 @@ async def test_a_keys_run_after_a_move_is_finished_by_a_default_run(state, tmp_p
         @asset(outputs=Output("copy", key="id", store=store), inputs={"items": Incremental(batch_size=1)})
         def copy(ctx, items: list):
             b = ctx.batch["items"]
-            return items if b.full and b.first else Patch(items, remove=list(b.removed))
+            return items if b.reset else Patch(items, remove=list(b.removed))
 
         return Project(assets=[items, copy], stores={"other": FileStore(tmp_path / "other")})
 
@@ -638,7 +638,7 @@ async def test_a_keys_run_after_a_move_is_finished_by_a_default_run(state, tmp_p
     await engine.stop()
     engine = make_engine(state, project("other"))
     await engine.initialize()
-    detail = await drive(engine, await engine.submit(["copy"], keys={"items": {"keys": ["a"]}}))
+    detail = await drive(engine, await engine.submit(["copy"], keys={"items": ["a"]}))
     assert status_of(detail) == "succeeded"
     assert sorted((await engine.list_keys("copy"))["keys"]) == ["a"]
     assert state.model.heads[("copy", "")]["ref"]["store"] == "other"

@@ -49,9 +49,7 @@ def project(world: World, *, include=None, batch_size=16, version="1", items_sto
         if world.during is not None:  # a step that happens while this batch runs
             during, world.during = world.during, None
             await during()
-        held = (await ctx.load()) or {"rows": 0}
-        if getattr(batch, "full", False) and batch.first:  # until the rebuild: a start-over
-            held = {"rows": 0}
+        held = {"rows": 0} if batch.reset else (await ctx.load()) or {"rows": 0}
         world.counts.append(held["rows"] + len(batch.added) - len(batch.removed))
         return {"rows": world.counts[-1]}
 

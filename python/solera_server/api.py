@@ -36,7 +36,7 @@ class RunInput(BaseModel):
     mode: str = "incremental"
     upstream: bool = False
     config: dict = Field(default_factory=dict)
-    keys: dict | None = None
+    keys: dict[str, list[str] | str] | None = None  # per input: keys, or "all"
     by: str | None = Field(default=None, max_length=200)
     tags: dict[str, str] = Field(default_factory=dict)
 

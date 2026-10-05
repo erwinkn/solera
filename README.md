@@ -307,7 +307,7 @@ through the server instead.
 solera serve [--project SPEC] [--insecure]   API + console (default project: the demo)
 solera manifest --project SPEC               print the project manifest
 solera run TARGET... [--partitions latest|all|missing] [--partition KEY]
-           [--upstream] [--full] [--keys INPUT=k1,k2] [--config JSON] [--tag NAME=VALUE]
+           [--upstream] [--full] [--keys INPUT=k1,k2|INPUT=all] [--config JSON] [--tag NAME=VALUE]
 solera runs [--status S] [--asset A] [--tag NAME=VALUE] [-q TEXT] [--before RUN_ID] [--limit N]
 solera run-show RUN_ID / logs RUN_ID ATTEMPT_ID [--tail N]
 solera runs delete RUN_ID                    delete a finished run

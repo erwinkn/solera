@@ -208,7 +208,7 @@ async def test_merges_and_garbage(state):
     @asset(inputs={"items": Incremental(batch_size=7)})
     def mirror(ctx, items: list):
         changes = ctx.batch["items"]
-        if changes.full and changes.first:
+        if changes.reset:
             seen.clear()
         for row in items:
             seen[row["id"]] = row["v"]
@@ -715,7 +715,7 @@ async def test_a_consumer_below_the_cut_starts_over(state):
 
     @asset(inputs={"items": Incremental()})
     def mirror(ctx, items: list):
-        deliveries.append((ctx.batch["items"].full, sorted(r["id"] for r in items)))
+        deliveries.append((ctx.batch["items"].reset, sorted(r["id"] for r in items)))
         return []
 
     project = Project(assets=[items, mirror])
@@ -809,7 +809,7 @@ async def test_renamed_asset_keeps_its_state(state):
     rows = {"v": [{"id": "a", "v": 1}, {"id": "b", "v": 1}]}
 
     def mirror(ctx, feed: list):
-        delivered.append((ctx.batch["feed"].full, sorted(r["id"] for r in feed)))
+        delivered.append((ctx.batch["feed"].reset, sorted(r["id"] for r in feed)))
         return []
 
     def feed():

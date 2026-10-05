@@ -63,7 +63,7 @@ def project(
     def copy(ctx, items: list):
         changes = ctx.batch["items"]
         outside.delivered |= {r["id"] for r in items} | set(changes.removed)  # what reached it
-        outside.started_over |= changes.full and changes.first
+        outside.started_over |= changes.reset
         return rebuild(changes, [{"id": r["id"], "v": r["v"]} for r in items])
 
     @asset(inputs={"items": Incremental()}, outputs=Output("count"), version=count_v)
@@ -77,7 +77,7 @@ def project(
 
         changes = ctx.batch["items"]
         outside.tally.apply(changes)  # the ordered delivery check (A19)
-        before = 0 if changes.full and changes.first else (await ctx.load() or {"rows": 0})["rows"]
+        before = 0 if changes.reset else (await ctx.load() or {"rows": 0})["rows"]
         return {"rows": before + len(changes.added) - len(changes.removed)}
 
     @asset(inputs={"row": Incremental("feed", each=True)}, outputs=Output("fchecks", key="id"))
@@ -178,7 +178,7 @@ class Staleness(RuleBasedStateMachine):
 
     @rule(keys=st.one_of(st.none(), st.sets(st.sampled_from(KEYS), min_size=1)))
     def run_fchecks(self, keys):
-        self._submit(["fchecks"], keys=keys and {"feed": {"keys": sorted(keys)}})
+        self._submit(["fchecks"], keys=keys and {"feed": sorted(keys)})
         self.ref.run_fchecks(keys)
 
     @rule()
@@ -214,7 +214,7 @@ class Staleness(RuleBasedStateMachine):
 
     @rule(keys=st.sets(st.sampled_from(KEYS), min_size=1))
     def run_keys(self, keys):
-        self._submit(["checks"], keys={"items": {"keys": sorted(keys)}})
+        self._submit(["checks"], keys={"items": sorted(keys)})
         self.ref.run_keys(keys)
 
     @precondition(lambda self: self.ref.others["copy"].built)
@@ -223,7 +223,7 @@ class Staleness(RuleBasedStateMachine):
         """copy (plain incremental) is delivered the keys a keys= run names,
         as `items` holds them, and nothing else."""
 
-        self._delivered_as(self.ref.run_keys(keys, "copy"), ["copy"], keys={"items": {"keys": sorted(keys)}})
+        self._delivered_as(self.ref.run_keys(keys, "copy"), ["copy"], keys={"items": sorted(keys)})
 
     @rule(name=st.sampled_from(["checks", "copy", "count"]))
     def run_default(self, name):
@@ -242,7 +242,7 @@ class Staleness(RuleBasedStateMachine):
         and removed only what it holds), and after a default run it holds
         exactly `items`' keys, its count their number."""
 
-        self._submit(["tally"], keys={"items": {"keys": sorted(keys)}} if keys else None)
+        self._submit(["tally"], keys={"items": sorted(keys)} if keys else None)
         held = self.outside.tally
         assert not held.wrong, (held.wrong, held.trace)
         if keys is None:
@@ -558,7 +558,7 @@ async def test_keys_runs_after_an_upstream_reset_merge_and_together_catch_up(sta
     engine = make_engine(state, project(tmp_path, outside, items_store="b"))  # items reset
     await engine.initialize()
     await drive(engine, await engine.submit(["items"]))
-    await drive(engine, await engine.submit(["checks"], keys={"items": {"keys": ["k1", "k2"]}}))
+    await drive(engine, await engine.submit(["checks"], keys={"items": ["k1", "k2"]}))
     after = await index_entries(state, "checks", "")
     assert set(after) == {"k1", "k2", "k3"}, "a keys= run after a reset is not a reset write (R2)"
     assert after["k3"] == before["k3"], "k3, not named, is untouched (R2)"
@@ -566,7 +566,7 @@ async def test_keys_runs_after_an_upstream_reset_merge_and_together_catch_up(sta
     assert await staleness.stale_keys(engine, "checks") == {"k3"}
     assert await staleness.partition_stale(engine, "checks") and await staleness.asset_stale(engine, "checks")
 
-    await drive(engine, await engine.submit(["checks"], keys={"items": {"keys": ["k3"]}}))
+    await drive(engine, await engine.submit(["checks"], keys={"items": ["k3"]}))
     assert await staleness.stale_keys(engine, "checks") == set()
     assert not await staleness.partition_stale(engine, "checks"), "keys= runs covering every stale key"
     settled = await index_entries(state, "checks", "")
@@ -584,7 +584,7 @@ async def test_a_reset_output_holds_only_what_keys_runs_wrote_until_a_default_ru
     p = project(tmp_path, outside, checks_store="b")
     engine = make_engine(state, p)
     await engine.initialize()
-    await drive(engine, await engine.submit(["checks"], keys={"items": {"keys": ["k1"]}}))
+    await drive(engine, await engine.submit(["checks"], keys={"items": ["k1"]}))
     assert set(await keyed_content(engine, p, "checks", column=None)) == {"k1"}
     assert await staleness.stale_keys(engine, "checks") == {"k2", "k3"}
     await drive(engine, await engine.submit(["checks"]))
@@ -640,9 +640,9 @@ async def test_a_shared_input_change_makes_every_key_stale(state, tmp_path):
     await engine.commit_source("knob", version="1")
     assert await staleness.stale_keys(engine, "checks") == {"k1", "k2"}
     assert await staleness.partition_stale(engine, "checks") and await staleness.asset_stale(engine, "checks")
-    await drive(engine, await engine.submit(["checks"], keys={"items": {"keys": ["k1"]}}))
+    await drive(engine, await engine.submit(["checks"], keys={"items": ["k1"]}))
     assert await staleness.stale_keys(engine, "checks") == {"k2"}
-    await drive(engine, await engine.submit(["checks"], keys={"items": {"keys": ["k2"]}}))
+    await drive(engine, await engine.submit(["checks"], keys={"items": ["k2"]}))
     assert not await staleness.partition_stale(engine, "checks")
 
 
@@ -664,11 +664,11 @@ async def test_a_keys_run_on_an_incremental_asset_delivers_each_change_once(stat
     engine, outside = await _built(state, tmp_path, {"k1": "1", "k2": "1", "k3": "1"})
     await _change(engine, outside, upserts=["k1", "k2"])
     outside.delivered.clear()
-    await drive(engine, await engine.submit(["copy"], keys={"items": {"keys": ["k1"]}}))
+    await drive(engine, await engine.submit(["copy"], keys={"items": ["k1"]}))
     assert outside.delivered == {"k1"}
     assert await staleness.partition_stale(engine, "copy"), "k2 is not read yet"
     outside.delivered.clear()
-    keys = None if then == "default" else {"items": {"keys": ["k2"]}}
+    keys = None if then == "default" else {"items": ["k2"]}
     await drive(engine, await engine.submit(["copy"], keys=keys))
     assert outside.delivered == {"k2"}, "k1 was delivered twice"
     assert not await staleness.partition_stale(engine, "copy")
@@ -693,7 +693,7 @@ async def test_a_count_kept_from_its_batches_stays_exact_through_a_keys_run(stat
 
     assert await tally() == 3
     await _change(engine, outside, upserts=["k4"], removes=["k1"])
-    assert await tally({"items": {"keys": ["k4"]}}) == 4  # k1's removal not read yet
+    assert await tally({"items": ["k4"]}) == 4  # k1's removal not read yet
     assert await tally() == 3 == len(outside.feed)
 
 
@@ -732,7 +732,7 @@ async def test_a_full_run_after_an_asset_change_may_take_several_runs(state, tmp
     async def run(keys=None):
         outside.delivered.clear()
         outside.started_over = False
-        await drive(engine, await engine.submit(["copy"], keys=keys and {"items": {"keys": keys}}))
+        await drive(engine, await engine.submit(["copy"], keys=keys and {"items": list(keys)}))
         return outside.delivered, outside.started_over
 
     assert await run(["k1"]) == ({"k1"}, True)
@@ -785,7 +785,7 @@ async def test_a_key_neither_side_holds_leaves_an_each_partition_fresh(state, tm
     must agree."""
 
     engine, outside = await _built(state, tmp_path, {"k1": "1", "k2": "1"})
-    await drive(engine, await engine.submit(["fchecks"], upstream=False, keys={"feed": {"keys": ["k1"]}}))
+    await drive(engine, await engine.submit(["fchecks"], upstream=False, keys={"feed": ["k1"]}))
     outside.feed.pop("k2")
     await engine.commit_source("feed", remove=["k2"])
     assert await staleness.stale_keys(engine, "fchecks") == set()
@@ -1077,7 +1077,7 @@ async def _keys_run(kind, tmp_path, reset, case):
                 await engine.initialize()
             await drive(engine, await engine.submit(["items"]))
             before = await index_entries(state, "checks", ""), await keyed_content(engine, p, "checks")
-            run = await engine.submit(["checks"], keys={"items": {"keys": sorted(case["named"])}})
+            run = await engine.submit(["checks"], keys={"items": sorted(case["named"])})
             assert (await drive(engine, run))["request"]["status"] == "succeeded"
             after = await index_entries(state, "checks", ""), await keyed_content(engine, p, "checks")
             return before, after, dict(outside.feed)

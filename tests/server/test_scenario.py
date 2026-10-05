@@ -37,7 +37,7 @@ async def test_every_boundary_once(tmp_path):
     @asset(inputs={"items": Incremental(batch_size=5)})  # a full read spans batches: wipe on its first
     def mirror(ctx, items: list):
         changes = ctx.batch["items"]
-        if changes.full and changes.first:
+        if changes.reset:
             seen.clear()
         seen.update({row["id"]: row["v"] for row in items})
         for key in changes.removed:

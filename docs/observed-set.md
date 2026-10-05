@@ -202,16 +202,17 @@ is stored, and none can be left stranded.
   parameter receives; removed keys have no rows;
 - `index` (0-based, in the run), `count` (the batches the run planned, an
   estimate), `first` (`index == 0`) and `final` (no batch of this run
-  follows); there is no `full`;
+  follows);
+- `reset`: the first batch of a full run — start over (D166);
 - `upstream`: facts about the upstream.
 
 A consumer that keeps a total moves it by the changes, starting from what
-it holds. `ctx.load()` returns `None` before its first commit, and in a
-full run until that run's first commit, so it starts from zero then;
-`unchanged` keys are already counted:
+it holds. `ctx.load()` always returns what is materialized — `None` only
+before its first commit — and a full run's first batch says `reset`, so it
+starts from zero then (D166); `unchanged` keys are already counted:
 
 ```python
-before = await ctx.load()
+before = None if batch.reset else await ctx.load()
 count = before["count"] if before is not None else 0
 return {"count": count + len(batch.added) - len(batch.removed)}
 ```
@@ -336,8 +337,9 @@ an old life, and the engine makes the next run a full run — the same as
 `mode="full"`. Every upstream key under the patterns is owed.
 
 - A **plain consumer**'s first commit resets its output (the store keeps
-  nothing prior) and `R`, to an empty base in the current life; until
-  then `ctx.load()` returns `None`, so the producer starts from zero.
+  nothing prior) and `R`, to an empty base in the current life. Its first
+  batch says `batch.reset`, so the producer starts from zero
+  (`ctx.load()` still returns what is materialized).
 - A **per-key consumer** compares against its own output index: its base
   becomes that index, where a key it holds decodes present at no upstream
   version. So every upstream key is owed, and an output key the upstream
@@ -579,8 +581,11 @@ Each goes from the docs and the glossary when the observed set is built
 - **fingerprint** — *was* its name; now the **definition**.
 - **input unit** — *was* a unit of an input's record; gone. **Output unit**
   stays.
-- **`Batch.full`** — *was* a full pass's flag; gone: `index`, `first` and
-  `final` are relative to the run.
+- **`Batch.full`** — *was* a full pass's flag; now **`Batch.reset`**, set
+  on a full run's first batch only (D166): `index`, `first` and `final`
+  are relative to the run.
+- **`keys="full"`** — *was* a full pass of one input; gone: a full run is
+  `mode="full"`, and `keys=` is a list, `"all"` or the default.
 
 ## What it replaces
 
@@ -608,8 +613,8 @@ keys, classes, old observations and prior stored outcomes); the
 `fingerprint`, now the `definition`; D100's rowless deliveries,
 `gone_since`'s early removal and the fenced `SourceBehind` path (a fenced
 read names its head, or the batch is planned again); the index's
-`changes(lower=)` (with the index switch). Still to go: `Batch.full`,
-replaced by `Batch.reset` (D166, with the SDK contract). Kept: the key index and its Δ, endpoint
+`changes(lower=)` (with the index switch); `Batch.full`, replaced by
+`Batch.reset` (D166), and `keys="full"`. Kept: the key index and its Δ, endpoint
 reservation and the claim's reader pin, the outcome index and retries,
 D111's bounds; an unkeyed upstream's observation is the one commit it
 last read.

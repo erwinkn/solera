@@ -124,7 +124,7 @@ def rebuild(changes, rows: list[dict]):
     """A keyed consumer's write for one batch: a full pass (a reset) starts
     the output over on its first batch (architecture.md §5), then patches."""
 
-    if changes.full and changes.first:
+    if changes.reset:
         return rows
     return Patch(rows, remove=list(changes.removed))
 
@@ -188,7 +188,7 @@ def build(variant: Variant, data_root, db: Database, outside: External, pg: str 
         its batches tell it, rebuilt from scratch on a full pass."""
 
         batch = ctx.batch["items"]
-        held = {} if (batch.full and batch.first) or ctx.cursor is None else dict(ctx.cursor)
+        held = {} if batch.reset or ctx.cursor is None else dict(ctx.cursor)
         held.update({r["id"]: r["v"] for r in items})
         for key in batch.removed:
             held.pop(key, None)
@@ -197,7 +197,7 @@ def build(variant: Variant, data_root, db: Database, outside: External, pg: str 
     @asset(inputs={"log": Incremental()})
     def tally(ctx, log: list):
         changes = ctx.batch["log"]
-        base = 0 if (changes.full and changes.first) or ctx.cursor is None else ctx.cursor
+        base = 0 if changes.reset or ctx.cursor is None else ctx.cursor
         total = base + len(log)
         return Result(outputs={"tally": {"rows": total}}, cursor=total)
 
@@ -230,7 +230,7 @@ def build(variant: Variant, data_root, db: Database, outside: External, pg: str 
         changes = ctx.batch["items"]
         odd = [r for r in items if is_odd(r["v"])]
         even = [r for r in items if not is_odd(r["v"])]
-        if changes.full and changes.first:
+        if changes.reset:
             return Result(outputs={"odd": odd, "even": even})
         gone = list(changes.removed)
         return Result(

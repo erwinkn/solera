@@ -2348,6 +2348,7 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
                 view["keys"] = a["keys"]  # a per-key attempt's keys by outcome
             if a.get("batch"):
                 view["batch"] = a["batch"]  # a keyed attempt's batch
+            view["handle"] = a.get("handle")  # its executor's, as recorded at launch (D170)
             out.append(view)
         claim = self.m.claims.get(task["id"]) if live else None
         if claim:
@@ -2359,6 +2360,7 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
                     "generation": len(out) + 1,
                     "outcome": "launching" if launching else claim["status"],
                     "started_at": claim["started_at"],
+                    "handle": history.handle(task.get("launched")),
                     **(history.execution(task["launched"]["execution"]) if claim.get("launched") else {}),
                 }
             )

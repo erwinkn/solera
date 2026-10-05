@@ -494,50 +494,46 @@ class Upstream:
 class Batch:
     """What an `Incremental` input delivered to a parameter (§5.1). The rows
     arrive as the parameter; `ctx.batch[name]` says what they are and where
-    they sit in their pass:
+    they sit in their run:
 
     - `rows`: the delivered rows (the object the parameter received);
     - `added`, `updated` and `removed` (keyed upstreams): each key's change
-      since the input's position, net over the batch's commits. `added`:
-      absent at the position, present now; `updated`: present at both, at
-      another version; `removed`: present at the position, absent now. A
-      key added and removed again appears nowhere; one removed and added
-      back is updated. The rows are those of `added` and `updated`. A full
-      pass delivers every key as added. On a store of current rows only,
-      rows show the store's newest state: a key in `added` or `updated`
-      may come without a row if it was removed since — its removal follows
-      in a later batch — and a key changed after the pass's version may
-      arrive once more as updated (D100);
-    - `unchanged`: keys loaded though the consumer already observed them
-      as they are — a `keys=` run asked for them, or a source served the
-      version already observed; their rows are in `rows` too;
-    - `full`: the batch is part of a full pass — the whole head as of the
-      pass's start (its snapshot: what changes after comes as the next
-      delta) after a
-      reset, not a delta;
-    - `index`: this batch's 0-based index in its pass, exact;
-    - `count`: how many batches the pass was planned to take when it
-      started, by `batch_size`. Exact when the input has no patterns and the
-      upstream's key count is exact; otherwise an estimate, and the pass
+      against what this partition last processed of it, under the input's
+      patterns now. `added`: not held, present now; `updated`: held, at
+      another version; `removed`: held, absent or no longer taken now.
+      Changes that cancel out deliver nothing. The rows are those of
+      `added` and `updated`, and always come with them: on a store of
+      current rows, the batch reads exactly the state it was classed at;
+    - `unchanged`: keys loaded though the consumer already processed them
+      as they are — a `keys=` run named them, or `keys="all"` reloads
+      everything — or a source served the version already processed;
+      their rows are in `rows` too;
+    - `reset`: the first batch of a full run — `mode="full"`, or one due
+      after a definition change or an upstream reset. Start over: the
+      output this batch writes replaces the content. `ctx.load()` still
+      returns what is materialized, which a reset batch ignores;
+    - `index`: this batch's 0-based index in its run, exact;
+    - `count`: how many batches the run was planned to take, by
+      `batch_size`. Exact when the input has no patterns and the
+      upstream's key count is exact; otherwise an estimate, and the run
       may take fewer batches, or more;
-    - `first`: `index == 0` — on a full pass, the moment to start over;
-    - `final`: no batch of this pass follows, known from the pass itself
-      running out, never from `count`. Batches are formed from the keys the
-      input's patterns take, so every batch holds some: `final` is always
-      on a real batch, and a pass that takes no key at all does not call
-      the producer — but for a full pass, which always reaches it, as one
-      empty batch that is `full`, `first` and `final`: starting over must
-      happen;
+    - `first`: `index == 0`;
+    - `final`: no batch of this run follows, known from the run itself
+      running out, never from `count`. Batches are formed from the keys
+      the input's patterns take, so every batch holds some: `final` is
+      always on a real batch, and a run that takes no key at all does not
+      call the producer — but for a full run, which always reaches it, as
+      one empty batch that is `reset`, `first` and `final`: starting over
+      must happen;
     - `upstream`: facts about the upstream (`Upstream`);
     - `served` (a source's): the version each key was served at, as its
-      loader said; None for a key it did not have. Consumed by nothing yet:
-      the observed set's rebuild records it.
+      loader said; None for a key it did not have.
 
-    A consumer that rebuilds starts over when `full and first`, appends every
-    batch, and swaps or finalizes on `final`. One that keeps a total moves it
-    by the changes, starting from what it holds (`ctx.load()`):
+    A consumer that rebuilds starts over on `reset`, appends every batch,
+    and swaps or finalizes on `final`. One that keeps a total moves it by
+    the changes, from what it holds (`ctx.load()`):
 
-        before = 0 if batch.full and batch.first else (await ctx.load())["count"]
+        before = 0 if batch.reset else (await ctx.load())["count"]
         return {"count": before + len(batch.added) - len(batch.removed)}"""
 
     rows: Any = ()
@@ -545,7 +541,7 @@ class Batch:
     updated: tuple = ()
     removed: tuple = ()
     unchanged: tuple = ()
-    full: bool = False
+    reset: bool = False
     index: int = 0
     count: int = 1
     final: bool = True

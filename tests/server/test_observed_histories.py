@@ -23,7 +23,7 @@ async def test_a19_r1_r2_a_change_during_a_run_is_counted_once(tmp_path, change)
     w = await world(tmp_path)
     try:
         await w.feed({"k1": "1", "k2": "1"})
-        await w.run(keys={"items": {"keys": ["k1"]}})
+        await w.run(keys={"items": ["k1"]})
         await w.verify()
         await w.feed(
             **{"update": {"upserts": {"k1": "2"}}, "add": {"upserts": {"k3": "1"}}}.get(
@@ -43,9 +43,9 @@ async def test_a19_r3_a_delivered_removal_is_not_forgotten(tmp_path):
     w = await world(tmp_path)
     try:
         await w.feed({"k1": "1", "k2": "1"})
-        await w.run(keys={"items": {"keys": ["k1"]}})
+        await w.run(keys={"items": ["k1"]})
         await w.feed(removes=["k1"])
-        await w.run(keys={"items": {"keys": ["k2"]}})
+        await w.run(keys={"items": ["k2"]})
         await w.verify()
         assert await w.stale() == ["input changed"]  # k1's removal is owed
         await w.run()
@@ -61,7 +61,7 @@ async def test_a19_r4_a_selection_under_new_patterns_is_counted_once(tmp_path):
         await w.feed({"k1": "1", "k2": "1"})
         await w.run()
         await w.deploy(include=["k*"])
-        await w.run(keys={"items": {"keys": ["k2"]}})
+        await w.run(keys={"items": ["k2"]})
         await w.verify()
         await w.run()
         await w.verify()
@@ -104,7 +104,7 @@ async def test_a19_r6_keys_runs_go_batch_size_keys_a_commit(tmp_path):
     try:
         await w.feed({f"k{i:02d}": "1" for i in range(20)})
         named = [f"k{i:02d}" for i in range(0, 20, 2)]
-        detail = await w.run(keys={"items": {"keys": named}})
+        detail = await w.run(keys={"items": named})
         assert len([t for t in detail["attempts"].values() for a in t]) >= 3  # 10 keys, 4 a batch
         await w.verify()
         assert set(w.observed.of("tally", "", "items")) == set(named)
@@ -122,7 +122,7 @@ async def test_a19_r7_a_shared_input_move_owes_every_key_its_context(tmp_path):
         await w.run()
         await w.factor("w2")
         assert await w.stale() == ["input changed"]
-        await w.run(keys={"items": {"keys": ["k1"]}})
+        await w.run(keys={"items": ["k1"]})
         await w.verify()
         assert w.observed.of("tally", "", "items")["k1"][1] == {"factor": "w2"}
         assert await w.stale() == ["input changed"]  # k2 under w1
@@ -191,7 +191,7 @@ async def test_a26_n1_a_run_reads_rows_after_the_upstream_moved_on(tmp_path):
     w = await world(tmp_path, batch_size=1)
     try:
         await w.feed({"k1": "1", "k2": "1"})
-        await w.run(keys={"items": {"keys": ["k1"]}})
+        await w.run(keys={"items": ["k1"]})
         await w.feed({"k2": "2"})
         await w.run()
         await w.verify()
@@ -206,13 +206,13 @@ async def test_a26_n2_selections_around_a_pattern_change(tmp_path, history):
     try:
         await w.feed({"k1": "1", "k2": "1", "k3": "1"})
         if history == "partial":
-            await w.run(keys={"items": {"keys": ["k1"]}})
+            await w.run(keys={"items": ["k1"]})
         else:
             await w.run()
         await w.deploy(include=["k*"])
         named = {"repeated": ["k2"], "absent key": ["k9"], "partial": ["k2"]}[history]
         for _ in range(2 if history == "repeated" else 1):
-            await w.run(keys={"items": {"keys": named}})
+            await w.run(keys={"items": named})
             await w.verify()
         await w.run()
         await w.verify()
@@ -228,7 +228,7 @@ async def test_a26_n3_a_selection_before_an_old_pattern_delta_is_kept(tmp_path):
         await w.run()
         await w.feed({"k1": "2"})
         await w.deploy(include=["k*"])
-        await w.run(keys={"items": {"keys": ["k2"]}})
+        await w.run(keys={"items": ["k2"]})
         await w.verify()
         await w.run()
         await w.verify()
@@ -333,12 +333,12 @@ async def test_a27_r8_an_older_selection_over_a_newer_range_stays_a_point(tmp_pa
     w = await world(tmp_path)
     try:
         await w.feed({"k1": "1", "k2": "1"})
-        await w.run(keys={"items": {"keys": ["k1"]}})  # k1@1, a point
+        await w.run(keys={"items": ["k1"]})  # k1@1, a point
         await w.feed({"k1": "2"})
         await w.run()  # a range over k1@2
         await w.verify()
         await w.feed({"k1": "1"})
-        await w.run(keys={"items": {"keys": ["k1"]}})  # back at @1: it must not fold into the base
+        await w.run(keys={"items": ["k1"]})  # back at @1: it must not fold into the base
         await w.verify()
         assert await w.stale() == []
     finally:
@@ -351,7 +351,7 @@ async def test_a27_r9_a_removal_restored_at_its_version_is_owed_its_add(tmp_path
         await w.feed({"k1": "1", "k2": "1"})
         await w.run()
         await w.feed(removes=["k1"])
-        await w.run(keys={"items": {"keys": ["k1"]}})  # k1 removed: observed absent
+        await w.run(keys={"items": ["k1"]})  # k1 removed: observed absent
         await w.verify()
         await w.feed({"k1": "1"})  # restored at its old version, other changes netting out
         assert await w.stale() == ["input changed"]
