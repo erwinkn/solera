@@ -83,3 +83,108 @@ async def test_an_abandoned_attempts_delta_is_collected_by_the_engine(tmp_path, 
     assert [d for ds in state.model.cleanups.values() for d in ds if d.get("attempt") == attempt] == pending
     await engine.stop()
     await state.close()
+
+
+async def test_upkeep_merges_layers_and_reads_stay_exact(tmp_path, data):
+    """Commits pile up deltas; upkeep merges them under the rule (lanes,
+    attempts, publication), raises the cut to the head (no reader), and
+    collects the inputs: the index still lists exactly the live keys."""
+
+    import asyncio
+    import random
+
+    from solera.sdk import Output, Project, asset
+    from solera.stores import Patch
+    from solera_server.state import State
+
+    from tests.server.test_collection import engine_for, run
+
+    rng = random.Random(5)
+    live: dict[str, int] = {}
+    pending = {"rows": {}, "removes": []}
+
+    @asset(outputs=Output("items", keyed=True))
+    def items():
+        return Patch(pending["rows"], remove=pending["removes"])
+
+    project = Project(assets=[items])
+    state = await State.open(tmp_path.as_uri(), "test", flush_interval=0.001)
+    engine = engine_for(state, project)
+    await engine.initialize()
+    for _ in range(30):
+        rows = {f"k{rng.randrange(40):02d}": rng.randrange(9) for _ in range(5)}
+        removes = [k for k in rng.sample(sorted(live), min(2, len(live))) if k not in rows]
+        pending["rows"], pending["removes"] = rows, removes
+        await run(engine, ["items"])
+        live.update(rows)
+        for k in removes:
+            live.pop(k)
+    key = ("items", "")
+    before = len(state.model.indexes[key].layers)
+    for _ in range(50):
+        engine.upkeep.maintain()
+        if not len(engine.upkeep.jobs):
+            break
+        await asyncio.gather(*engine.upkeep.jobs.values(), return_exceptions=True)
+    index = state.model.indexes[key]
+    assert len(index.layers) < before, (before, len(index.layers))
+    assert index.cut == index.head
+    assert not engine.upkeep.failing, engine.upkeep.failing
+    listed = await engine.list_keys("items", "", limit=100)
+    assert sorted(listed["keys"]) == sorted(live) and listed["total"] == len(live)
+    await engine.upkeep.collect()
+    stored = set(await state.list_objects(index.prefix))
+    assert {index.path(n) for n in index.referenced()} <= stored
+    await engine.stop()
+    await state.close()
+
+
+async def test_a_delta_whose_index_is_read_or_intended_is_no_orphan(tmp_path, data):
+    """A delta no claim holds is still kept while a reader holds its index (a
+    source commit resolving) or a repair intent names it."""
+
+    import math
+
+    from solera.sdk import Output, Project, asset
+    from solera_server.state import State
+
+    from tests.server.test_collection import engine_for, run
+
+    @asset(outputs=Output("items", keyed=True))
+    def items():
+        return {"a": 1}
+
+    project = Project(assets=[items])
+    state = await State.open(tmp_path.as_uri(), "test", flush_interval=0.001)
+    engine = engine_for(state, project)
+    await engine.initialize()
+    await run(engine, ["items"])
+    index = state.model.indexes[("items", "")]
+    held, intended = index.path("000000000009-01HELD-0.lay"), index.path("000000000009-01INTENT-0.lay")
+    import obstore
+
+    for path in (held, intended):
+        await obstore.put_async(state.objects, path, b"x")
+    state.model.repairs[("items", "")] = [
+        {
+            "part": {
+                "files": [
+                    {"name": "000000000009-01INTENT-0.lay", "size": 1, "entries": 0, "first": "", "last": ""}
+                ]
+            }
+        }
+    ]
+
+    async def orphans():
+        engine.upkeep._orphans_at = -math.inf
+        n = len(state.model.garbage)
+        await engine.upkeep.collect_orphans()
+        return {p for p, _ in state.model.garbage[n:]}
+
+    with state.model.reading(index.prefix):
+        assert held not in await orphans() and intended not in await orphans()
+    assert held in await orphans()
+    assert intended not in await orphans()
+    state.model.repairs.pop(("items", ""))
+    await engine.stop()
+    await state.close()

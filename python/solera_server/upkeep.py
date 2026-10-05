@@ -113,7 +113,8 @@ class Upkeep:
     # -- key indexes (§6) --------------------------------------------------------------
 
     def maintain(self) -> None:
-        """Raise each index's cut to the oldest commit its readers hold, and
+        """Raise each index's cut to the oldest commit its readers hold (its
+        head when none holds one), and
         start merges, `concurrency` at a time: per index, one into the base
         and one among the tiers, whose inputs never overlap. An input set
         whose merge was uploaded `MERGE_ATTEMPTS` times in the index's
@@ -123,7 +124,9 @@ class Upkeep:
 
         for key, index in list(self.m.indexes.items()):
             oldest = self.m.oldest_observed(*key)
-            if oldest is not None and oldest > index.cut:
+            if oldest is None:  # no reader holds a commit of it: none needs a flip
+                oldest = index.head
+            if oldest > index.cut:
                 self.state.record(
                     {
                         "type": "IndexCut",
