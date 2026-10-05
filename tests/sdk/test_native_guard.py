@@ -11,4 +11,4 @@ def test_a_native_panic_is_an_exception(parallel):
     with pytest.raises(RuntimeError, match="solera._native panicked: an invariant broke") as raised:
         _native._panic("an invariant broke", parallel=parallel)
     assert isinstance(raised.value, Exception)
-    assert _native.filter_nbits(100, 14) > 0  # and the module works on
+    assert len(_native.SortedEntries.of([b"a"])) == 1  # and the module works on

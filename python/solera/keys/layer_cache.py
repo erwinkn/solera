@@ -90,7 +90,8 @@ class LayerCache:
             return path in self._files
 
     def read(self, path: str, start: int, end: int) -> bytes | None:
-        """Bytes `[start, end)` of a cached file, or None if not cached."""
+        """Bytes `[start, end)` of a cached file, or None if not cached (or
+        its copy went: the caller reads the store)."""
 
         with self._lock:
             f = self._files.get(path)
@@ -101,6 +102,12 @@ class LayerCache:
         try:
             with open(f[0], "rb") as fh:
                 return os.pread(fh.fileno(), end - start, start)
+        except FileNotFoundError:  # gone under it (another engine started on this root): a miss
+            with self._lock:
+                if self._files.get(path) is f:
+                    del self._files[path]
+                    self._disk_used -= f[1]
+            return None
         finally:
             with self._lock:
                 self._open[path] -= 1

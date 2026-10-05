@@ -70,3 +70,14 @@ async def test_an_empty_delta():
     await h.commit([k(1)])
     assert (await delta(h.index(), 0, None, keys=[k(1)])).diffs == []  # P is the head: nothing differs
     assert (await delta(h.index(), None, None, keys=[k(2)])).diffs == []  # absent at both ends
+
+
+async def test_delta_from_before_the_first_commit_adds_every_key():
+    """P = -1, the state before commit 0 (an observation of an empty
+    upstream): every key live at H is added, as from −∞."""
+
+    h = History()
+    await h.commit([k(1), k(2)])
+    await h.commit([k(3)], [k(1)])
+    assert (await delta(h.index(), -1, None)).diffs == (await delta(h.index(), None, None)).diffs
+    assert [d.key for d in (await delta(h.index(), -1, None)).diffs] == [k(2), k(3)]

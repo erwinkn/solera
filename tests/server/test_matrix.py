@@ -308,7 +308,7 @@ async def test_a_removed_consumer_lets_go_of_its_upstreams_log(state):
         rows.append({"id": key})
         await drive(engine, await engine.submit(["keep"], upstream=True))
     head = state.model.heads[("feed", "")]["commit_number"]
-    assert state.model.endpoints("feed", "") == {head + 1}  # `keep`'s head, and nothing of `gone`'s
+    assert state.model.oldest_observed("feed", "") == head  # `keep`'s head, and nothing of `gone`'s
 
 
 # -- a rewrite × interpretation ----------------------------------------------------------

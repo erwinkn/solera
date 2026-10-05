@@ -696,7 +696,7 @@ class Simulation(RuleBasedStateMachine):
         world = self.world
         if world is None or world.engine is None:
             return
-        self.index_spans_tile()  # a read of spans that do not tile fails as that, not as this
+        self.index_layers_tile()  # a read of layers that do not tile fails as that, not as this
         engine = world.engine
 
         async def check():
@@ -875,7 +875,7 @@ class Simulation(RuleBasedStateMachine):
         return target
 
     def _check_content(self, automated: bool) -> None:
-        self.index_spans_tile()  # convergence ran no invariant
+        self.index_layers_tile()  # convergence ran no invariant
         engine, project, variant = self.world.engine, self.project, self.variant
         stage = "after automations alone" if automated else "after a catch-up run"
         # A read at an endpoint that went wrong is the cause; contents that differ, its effect.

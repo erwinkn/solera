@@ -62,7 +62,8 @@ project = Project(assets=[feed, consumer])
     head = state.model.heads[("feed", "")]
     assert head["count"] == 2 and head["commit_number"] == 0
     index = state.model.indexes[("feed", "")]
-    [delta] = index.files
+    [layer] = index.layers
+    [delta] = layer.main.files
     assert await state.get_object(index.path(delta.name)) is not None
     assert delta.name.startswith("000000000000-") and delta.entries == 2
     # the spec, and the control file with the sealed result (the commit request,

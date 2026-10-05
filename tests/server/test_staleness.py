@@ -811,23 +811,24 @@ async def test_a_key_added_and_removed_past_the_read_changes_nothing(state, tmp_
     assert outside.delivered == set()
 
 
-async def test_a_key_updated_and_reverted_changes_nothing(state, tmp_path):
-    """The net delta, at a versioned source: `feed`'s k1 goes from version 1
-    to 2 and back to 1 before anyone reads it. Neither `items` (plain
-    incremental) nor `fchecks` (each=True) is stale, and `items`' next run
-    writes nothing."""
+async def test_a_key_updated_and_reverted_reads_as_updated(state, tmp_path):
+    """At a versioned source, `feed`'s k1 goes from version 1 to 2 and back
+    to 1 before anyone reads it. The key index keeps no payload at P
+    (docs/key-index-design.md § What it gives up): k1 reads as updated, a
+    redundant update. `items` (plain incremental) and `fchecks` (each=True)
+    are stale for k1 alone, and `items`' next run rewrites k1, not k2."""
 
     engine, outside = await _built(state, tmp_path, {"k1": "1", "k2": "1"})
     await drive(engine, await engine.submit(["fchecks"]))
     for version in ("2", "1"):
         outside.feed["k1"] = version
         await engine.commit_source("feed", upsert={"k1": version})
-    assert not await staleness.partition_stale(engine, "items")
-    assert not await staleness.partition_stale(engine, "fchecks")
-    assert await staleness.stale_keys(engine, "fchecks") == set()
+    assert await staleness.partition_stale(engine, "items")
+    assert await staleness.stale_keys(engine, "fchecks") == {"k1"}
     before = await index_entries(state, "items", "")
     await drive(engine, await engine.submit(["items"]))
-    assert await index_entries(state, "items", "") == before
+    after = await index_entries(state, "items", "")
+    assert after["k2"] == before["k2"] and after["k1"][0] > before["k1"][0]
 
 
 async def test_a_reset_upstream_and_a_new_version_give_both_reasons(state, tmp_path):

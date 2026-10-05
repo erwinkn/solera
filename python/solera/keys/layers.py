@@ -643,6 +643,8 @@ class LayerIndex:
         most `upto`) that differ, matching `glob` and `take`. A page stops
         early, with its cursor, once it has read `budget` bytes."""
 
+        if p is not None and p < 0:
+            p = None  # the state after commit -1 is the empty one: every key at H is added
         self._check(p)
         if p is not None and p >= self.state.head:
             return [], None
