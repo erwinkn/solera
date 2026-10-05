@@ -1,6 +1,8 @@
 """The build identity in the deploy (docs/per-key-processing.md §13)."""
 
+import json
 import subprocess
+import sys
 
 import pytest
 from solera.build import identity
@@ -10,20 +12,48 @@ def git(repo, *args):
     subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True)
 
 
+PROJECT = """
+from helpers import f
+
+from solera.sdk import Project, asset
+
+
+@asset
+def numbers():
+    return [f()]
+
+
+project = Project(assets=[numbers])
+"""
+
+
 @pytest.fixture
 def repo(tmp_path, monkeypatch):
+    """A project in a git work tree: `project.py` builds it, `helpers.py`
+    is what its asset calls; `other.py` and `notes.md` are beside it."""
+
     monkeypatch.delenv("SOLERA_BUILD", raising=False)
     repo = tmp_path / "repo"
     (repo / "pkg").mkdir(parents=True)
     git(repo, "init", "-q")
     git(repo, "config", "user.email", "t@example.com")
     git(repo, "config", "user.name", "t")
-    (repo / "pkg" / "project.py").write_text("x = 1\n")
+    (repo / "pkg" / "project.py").write_text(PROJECT)
     (repo / "pkg" / "helpers.py").write_text("def f(): return 1\n")
-    (repo / ".gitignore").write_text("data/\n")
+    (repo / "pkg" / "other.py").write_text("x = 1\n")
+    (repo / "pkg" / "notes.md").write_text("# notes\n")
     git(repo, "add", "-A")
     git(repo, "commit", "-qm", "one")
     return repo
+
+
+def build(pkg) -> dict:
+    """The build identity a fresh process importing the project computes, as a worker does."""
+
+    script = "import json, sys; sys.path.insert(0, sys.argv[1]); import project; "
+    script += "print(json.dumps(project.project.manifest['build']))"
+    out = subprocess.run([sys.executable, "-c", script, str(pkg)], capture_output=True, text=True, check=True)
+    return json.loads(out.stdout)
 
 
 def test_explicit_build_wins(repo, monkeypatch):
@@ -32,48 +62,38 @@ def test_explicit_build_wins(repo, monkeypatch):
     assert identity(str(repo / "pkg"))["id"] == "ci-42"
 
 
-def test_uncommitted_edits_are_distinct_builds(repo):
-    """Two different uncommitted fixes of a helper are two builds — a
-    commit with a dirty flag could not tell them apart."""
+def test_the_build_is_the_code_the_project_runs(repo):
+    """The modules its objects reach — `project.py`, and `helpers.py`, which
+    its asset calls — committed or not; the commit only for display. An
+    edit beside them it does not run (a note, a module it never imports,
+    data) changes nothing, so a local serve keeps its deploy."""
 
-    pkg = str(repo / "pkg")
-    clean = identity(pkg)
-    assert clean["source"] == "git" and clean["dirty"] is False
-    (repo / "pkg" / "helpers.py").write_text("def f(): return 2\n")
-    first = identity(pkg)
-    (repo / "pkg" / "helpers.py").write_text("def f(): return 3\n")
-    second = identity(pkg)
-    assert first["dirty"] and second["dirty"] and first["commit"] == second["commit"]
-    assert len({clean["id"], first["id"], second["id"]}) == 3
-    (repo / "pkg" / "helpers.py").write_text("def f(): return 1\n")
-    assert identity(pkg)["id"] == clean["id"]
-
-
-def test_untracked_files_count_ignored_ones_do_not(repo):
-    pkg = str(repo / "pkg")
-    before = identity(pkg)["id"]
-    (repo / "data").mkdir()
-    (repo / "data" / "out.json").write_text("{}")
-    assert identity(pkg)["id"] == before
-    (repo / "pkg" / "new_helper.py").write_text("y = 2\n")
-    assert identity(pkg)["id"] != before
-    (repo / "pkg" / "new_helper.py").unlink()
-    (repo / "pkg" / "helpers.py").unlink()  # a deletion is a change too
-    assert identity(pkg)["id"] != before
+    pkg = repo / "pkg"
+    clean = build(pkg)
+    assert clean["source"] == "modules" and len(clean["commit"]) == 40
+    (pkg / "notes.md").write_text("# other notes\n")
+    (pkg / "other.py").write_text("x = 2\n")
+    (pkg / "data.json").write_text("{}")
+    assert build(pkg)["id"] == clean["id"]
+    (pkg / "helpers.py").write_text("def f(): return 2\n")
+    first = build(pkg)
+    (pkg / "helpers.py").write_text("def f(): return 3\n")
+    second = build(pkg)
+    assert len({clean["id"], first["id"], second["id"]}) == 3  # two uncommitted fixes, two builds
+    (pkg / "helpers.py").write_text("def f(): return 1\n")
+    assert build(pkg)["id"] == clean["id"]
 
 
-def test_outside_git_python_files_only(tmp_path, monkeypatch):
+def test_outside_git_the_modules_are_the_build(tmp_path, monkeypatch):
     monkeypatch.delenv("SOLERA_BUILD", raising=False)
-    (tmp_path / "proj").mkdir()
-    (tmp_path / "proj" / "project.py").write_text("x = 1\n")
-    first = identity(str(tmp_path / "proj"))
-    assert first["source"] == "files"
-    (tmp_path / "proj" / "data.json").write_text("{}")  # what a run writes next to it
-    (tmp_path / "proj" / "__pycache__").mkdir()
-    (tmp_path / "proj" / "__pycache__" / "x.py").write_text("")
-    assert identity(str(tmp_path / "proj"))["id"] == first["id"]
-    (tmp_path / "proj" / "project.py").write_text("x = 2\n")
-    assert identity(str(tmp_path / "proj"))["id"] != first["id"]
+    pkg = tmp_path / "proj"
+    pkg.mkdir()
+    (pkg / "project.py").write_text(PROJECT)
+    (pkg / "helpers.py").write_text("def f(): return 1\n")
+    first = build(pkg)
+    assert first["source"] == "modules" and "commit" not in first
+    (pkg / "helpers.py").write_text("def f(): return 2\n")
+    assert build(pkg)["id"] != first["id"]
 
 
 def test_revision_follows_the_build(monkeypatch):
@@ -107,15 +127,16 @@ def test_the_deploy_number_counts_served_deploys():
 def test_a_method_mismatch_is_named():
     from solera.build import method_note
 
-    assert method_note({"source": "git"}, {"source": "git"}) is None
-    assert method_note({"source": "git"}, None) is None
-    note = method_note({"source": "git"}, {"source": "files"})
-    assert "git work tree" in note and "Python files" in note and "SOLERA_BUILD" in note
+    assert method_note({"source": "modules"}, {"source": "modules"}) is None
+    assert method_note({"source": "modules"}, None) is None
+    note = method_note({"source": "explicit"}, {"source": "modules"})
+    assert "explicit build id" in note and "project's modules" in note and "SOLERA_BUILD" in note
 
 
 async def test_the_engine_warns_when_a_worker_computed_its_revision_another_way(tmp_path, caplog):
-    """A worker whose deploy differs because it hashed files while the engine
-    used git fails its attempt as before, and the engine says why."""
+    """A worker whose deploy differs because it hashed its modules while the
+    engine used an explicit id fails its attempt as before, and the engine
+    says why."""
 
     import logging
 
@@ -131,7 +152,7 @@ async def test_the_engine_warns_when_a_worker_computed_its_revision_another_way(
     project = Project(assets=[numbers], build="served")
     state = await State.open(tmp_path.as_uri(), "test", flush_interval=0.001)
     engine = make_engine(state, project)
-    engine.manifest = {**engine.manifest, "build": {"id": "x", "source": "git"}, "deploy": "elsewhere"}
+    engine.manifest = {**engine.manifest, "build": {"id": "x", "source": "modules"}, "deploy": "elsewhere"}
     await engine.initialize()
     with caplog.at_level(logging.WARNING):
         detail = await engine.run_until((await engine.submit(["numbers"]))["id"], 10)
@@ -156,7 +177,7 @@ async def test_the_engine_warns_a_sensor_host_once(tmp_path, caplog):
     project = Project(assets=[numbers], build="served")
     state = await State.open(tmp_path.as_uri(), "test", flush_interval=0.001)
     engine = make_engine(state, project)
-    engine.manifest = {**engine.manifest, "build": {"id": "x", "source": "git"}}
+    engine.manifest = {**engine.manifest, "build": {"id": "x", "source": "modules"}}
     await engine.initialize()
     with caplog.at_level(logging.WARNING):
         for _ in range(2):
@@ -194,31 +215,3 @@ def test_the_error_policy_changes_the_revision(monkeypatch):
         )
     }
     assert len(revisions) == 5
-
-
-def test_submodule_contents_are_part_of_the_build(tmp_path, monkeypatch):
-    """Review 10: two different edits inside a submodule are two builds."""
-
-    monkeypatch.delenv("SOLERA_BUILD", raising=False)
-    sub = tmp_path / "sub"
-    sub.mkdir()
-    git(sub, "init", "-q")
-    git(sub, "config", "user.email", "t@example.com")
-    git(sub, "config", "user.name", "t")
-    (sub / "lib.py").write_text("x = 1\n")
-    git(sub, "add", "-A")
-    git(sub, "commit", "-qm", "sub")
-    top = tmp_path / "top"
-    top.mkdir()
-    git(top, "init", "-q")
-    git(top, "config", "user.email", "t@example.com")
-    git(top, "config", "user.name", "t")
-    (top / "project.py").write_text("y = 1\n")
-    git(top, "-c", "protocol.file.allow=always", "submodule", "add", "-q", str(sub), "vendored")
-    git(top, "commit", "-qam", "top")
-    clean = identity(str(top))
-    (top / "vendored" / "lib.py").write_text("x = 2\n")
-    first = identity(str(top))
-    (top / "vendored" / "lib.py").write_text("x = 3\n")
-    second = identity(str(top))
-    assert len({clean["id"], first["id"], second["id"]}) == 3

@@ -144,6 +144,12 @@ def _main():
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", type=int, default=int(os.getenv("PORT", "8000")))
     serve.add_argument("--insecure", action="store_true", help="Loopback-only: disable token auth")
+    serve.add_argument(
+        "--reload",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Serve each new deploy as the project's code changes (default: on with --insecure)",
+    )
 
     commands.add_parser("manifest", help="Print the project manifest", parents=[common])
 
@@ -266,6 +272,7 @@ def _main():
                 namespace=args.namespace,
                 project=project,
                 insecure=args.insecure,
+                reload=args.insecure if args.reload is None else args.reload,
                 # Where workers reach this engine: set SOLERA_ENGINE_URL to a
                 # public HTTPS name for remote workers (docs/lifecycle.md §5.2).
                 engine_url=os.getenv("SOLERA_ENGINE_URL")

@@ -909,15 +909,18 @@ where `build` identifies the code exactly:
 
 - `SOLERA_BUILD` when set — an immutable identifier from CI or the image
   (a commit SHA of a clean checkout, an image digest);
-- otherwise a content hash of the project's working tree: every file under
-  the project root that git does not ignore, tracked or untracked, or
-  every file under the project package when it is not in a git
-  repository.
+- otherwise a content hash of the code the project runs: the source of
+  every module under the project's directory that its own objects reach
+  — the module that builds it, its assets', sources', sensors' and stores'
+  modules, and every module their globals name, transitively. A note, a
+  test, data or state beside the project changes nothing, so editing them
+  while `solera serve` runs never fails its attempts; an edit to the
+  project's code does, committed or not.
 
 A git commit with a dirty flag is not an identity: edit a helper without
 committing, deploy, fix it again, deploy — both builds are "abc123,
 dirty", and the failed keys never get their retry under the fix. The
-commit and the dirty flag are recorded for display only. The engine numbers deploys as it serves them — the
+commit is recorded for display only. The engine numbers deploys as it serves them — the
 **deploy number** — which the failed keys uses to give failed keys one try per
 deploy without rewriting any entry: a failed key is due when its `deploy`
 is below the current one.
@@ -996,8 +999,8 @@ Where the implementation (`solera/errors.py`, `solera/build.py`,
   record, its newest `key_outcomes` rows, the patterns the input delivers
   under and the rule that excluded it (`Engine.explain`). The Keys view
   reads `GET /assets/{name}/failures` and `GET /assets/{name}/key-outcomes`.
-- **The build identity outside git** hashes the project directory's Python
-  files only (data written next to a project would otherwise change it).
+- **The build identity** hashes the modules the project runs, in a git work
+  tree or not (data written next to a project never changes it).
 - **PostgresStore** loads by key only the keys that have rows;
   `can_load(dict[str, T], Keys)` holds when `can_load(T, Keys)` does.
 - **Patterns** (`solera/patterns.py`) are evaluated by Python's `re`, by
@@ -1056,7 +1059,6 @@ Where the implementation (`solera/errors.py`, `solera/build.py`,
   - Renaming an asset (`aliases=`) moves its failure record and its
     `@asset` index.
   - The manifest records the error policy (`errors`: raised, class,
-    `retry_for`), so changing it changes the deploy; the build identity
-    hashes submodules and nested work trees that differ from `HEAD`.
+    `retry_for`), so changing it changes the deploy.
   - Deadlines are computed from the exact time, then rounded up; the
     backoff's exponent saturates.

@@ -1580,10 +1580,10 @@ async def main():
         raise SystemExit("usage: solera_worker run|manifest|pool|sensors ...")
     mode, rest = args[0], args[1:]
     if mode == "manifest":
-        # solera_worker manifest PROJECT OUT
+        # solera_worker manifest PROJECT OUT: the manifest, and the files of the code it runs
         entrypoint, out = rest[0], rest[1]
         project = load_project(entrypoint)
-        Path(out).write_text(json.dumps(project.manifest, allow_nan=False))
+        Path(out).write_text(json.dumps({**project.manifest, "watch": project.files()}, allow_nan=False))
         return
     if mode == "run":
         # solera_worker run --objects URL --attempt ID --run RUN (SOLERA_PROJECT env entrypoint)

@@ -5,16 +5,17 @@ In order:
 
 1. an explicit id — `Project(build=…)`, else `$SOLERA_BUILD` — for builds
    CI or an image names (a commit of a clean checkout, an image digest);
-2. inside a git work tree, its content: the `HEAD` commit, plus every path
-   that differs from it — modified, deleted, or untracked and not ignored —
-   with a digest of its bytes;
-3. otherwise, the digest of every Python file under the project's
-   directory.
+2. otherwise, the code the project runs: the source of every module under
+   the project's directory that its own objects reach — the module that
+   builds it, its assets', sources', sensors' and stores' modules, and
+   every module their globals name, transitively (`modules`). A doc, a
+   test, data or state beside it changes nothing; an edit to its code
+   does, committed or not.
 
-A commit with a dirty flag is not an identity — two different uncommitted
-edits share it — so the commit and the flag are recorded for display only.
-Where the manifest is built and where workers import the project must
-agree on the identity: images without `.git` should set `SOLERA_BUILD`.
+The git commit, where there is one, is recorded for display only. Where
+the manifest is built and where workers import the project compute the
+same identity from the same code; hosts that import it from elsewhere
+(an image) should set `SOLERA_BUILD` everywhere.
 """
 
 from __future__ import annotations
@@ -22,22 +23,57 @@ from __future__ import annotations
 import hashlib
 import os
 import subprocess
+import sys
+import types
 
-SKIPPED_DIRS = {"__pycache__", "node_modules", "site-packages", "venv"}
 
-
-def identity(directory: str | None, explicit: str | None = None) -> dict:
-    """`{"id", "source"}`, plus `commit` and `dirty` from git, for display."""
+def identity(directory: str | None, explicit: str | None = None, modules=()) -> dict:
+    """`{"id", "source"}`, plus `commit` from git, for display."""
 
     explicit = explicit or os.environ.get("SOLERA_BUILD")
     if explicit:
         return {"id": str(explicit), "source": "explicit"}
-    if directory:
-        found = _git(directory)
-        if found is not None:
-            return found
-        return {"id": _python_files(directory), "source": "files"}
-    return {"id": "", "source": "none"}
+    if not directory:
+        return {"id": "", "source": "none"}
+    h = hashlib.sha256(b"modules\0")
+    for path in sorted(modules):
+        h.update(os.path.relpath(path, directory).encode(errors="surrogateescape") + b"\0")
+        h.update(_file_digest(path))
+    out = {"id": h.hexdigest(), "source": "modules"}
+    head = _run(directory, "rev-parse", "HEAD")
+    if head:
+        out["commit"] = head.decode().strip()
+    return out
+
+
+def modules(directory: str | None, roots) -> list[str]:
+    """The source files of the modules under `directory` that `roots` — a
+    project's own objects and its module — reach: each object's module,
+    and every module the globals of one found name, transitively."""
+
+    if not directory:
+        return []
+    top = os.path.join(os.path.abspath(directory), "")
+    found: dict[str, None] = {}
+    queue = [m for m in (_module_of(r) for r in roots) if m is not None]
+    while queue:
+        module = queue.pop()
+        path = getattr(module, "__file__", None)
+        if not path or not os.path.abspath(path).startswith(top) or path in found:
+            continue
+        found[path] = None
+        queue.extend(m for m in map(_module_of, list(vars(module).values())) if m is not None)
+    return sorted(found)
+
+
+def _module_of(value) -> types.ModuleType | None:
+    if isinstance(value, types.ModuleType):
+        return value
+    try:
+        name = getattr(value, "__module__", None)
+    except Exception:  # an object that refuses attribute reads
+        return None
+    return sys.modules.get(name) if isinstance(name, str) else None
 
 
 def _run(directory: str, *args: str) -> bytes | None:
@@ -48,58 +84,8 @@ def _run(directory: str, *args: str) -> bytes | None:
     return done.stdout if done.returncode == 0 else None
 
 
-def _git(directory: str) -> dict | None:
-    top = _run(directory, "rev-parse", "--show-toplevel")
-    if top is None:
-        return None
-    top = top.decode().strip()
-    head = (_run(directory, "rev-parse", "HEAD") or b"").decode().strip()
-    status = _run(top, "status", "--porcelain=v1", "-z", "--untracked-files=all", "--no-renames")
-    if status is None:
-        return None
-    h = hashlib.sha256(b"git\0" + head.encode() + b"\0")
-    changed = sorted({entry[3:] for entry in status.decode(errors="surrogateescape").split("\0") if entry})
-    for path in changed:
-        h.update(path.encode(errors="surrogateescape") + b"\0")
-        full = os.path.join(top, path.rstrip("/"))
-        if os.path.isdir(full):
-            # A submodule (or a nested work tree) that differs from what HEAD records:
-            # its own identity — its HEAD and its changed contents — recursively.
-            nested = _git(full)
-            h.update(nested["id"].encode() if nested and nested["source"] == "git" else _tree_digest(full))
-        else:
-            h.update(_file_digest(full))
-    return {"id": h.hexdigest(), "source": "git", "commit": head, "dirty": bool(changed)}
-
-
-def _python_files(directory: str) -> str:
-    h = hashlib.sha256(b"files\0")
-    paths = []
-    for root, dirs, files in os.walk(directory):
-        dirs[:] = sorted(d for d in dirs if not d.startswith(".") and d not in SKIPPED_DIRS)
-        paths.extend(os.path.join(root, f) for f in files if f.endswith(".py"))
-    for path in sorted(paths):
-        h.update(os.path.relpath(path, directory).encode(errors="surrogateescape") + b"\0")
-        h.update(_file_digest(path))
-    return h.hexdigest()
-
-
-def _tree_digest(directory: str) -> bytes:
-    """Every file under a directory git reports as one path, by content."""
-
-    h = hashlib.sha256(b"tree\0")
-    for root, dirs, files in os.walk(directory):
-        dirs[:] = sorted(d for d in dirs if d != ".git")
-        for f in sorted(files):
-            path = os.path.join(root, f)
-            h.update(os.path.relpath(path, directory).encode(errors="surrogateescape") + b"\0")
-            h.update(_file_digest(path))
-    return h.digest()
-
-
 def _file_digest(path: str) -> bytes:
-    """A file's content digest; a deleted path, or a directory git lists,
-    digests as absent."""
+    """A file's content digest; a deleted one digests as absent."""
 
     try:
         with open(path, "rb") as f:
@@ -110,16 +96,15 @@ def _file_digest(path: str) -> bytes:
 
 METHODS = {
     "explicit": "an explicit build id",
-    "git": "the git work tree",
-    "files": "a hash of the Python files",
+    "modules": "the source of the project's modules",
 }
 
 
 def method_note(served: dict | None, reported: dict | None) -> str | None:
     """Why two deploys differ when it is the method, not the code: the
     engine serves a deploy computed one way and a worker or sensor worker
-    computed its own another way — a build with `.git` against an image
-    without it — so they never agree. `None` when the methods match."""
+    computed its own another way — an explicit id against the project's
+    modules — so they never agree. `None` when the methods match."""
 
     a, b = (served or {}).get("source"), (reported or {}).get("source")
     if not a or not b or a == b:

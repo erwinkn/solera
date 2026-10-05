@@ -94,6 +94,17 @@ class NonRetryable(RuntimeError):
     """A dispatch-time failure no retry will fix (§8: full run required, …)."""
 
 
+def _dynamic_dims(manifest: dict) -> set[str]:
+    """The outputs a manifest's dynamic partition dimensions come from."""
+
+    return {
+        dim["output"]
+        for a in manifest["assets"].values()
+        for dim in ((a.get("partitions") or {}).get("dims") or {}).values()
+        if dim["kind"] == "dynamic"
+    }
+
+
 def _batches(keys: int, limit: int) -> int:
     """Batches of `limit` a pass of `keys` is planned to take: at least one."""
 
@@ -189,12 +200,7 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
             failing=self.failing,
         )
         self._sensors_init(sensor_host)
-        self._dynamic_dims = {
-            dim["output"]
-            for a in manifest["assets"].values()
-            for dim in ((a.get("partitions") or {}).get("dims") or {}).values()
-            if dim["kind"] == "dynamic"
-        }
+        self._dynamic_dims = _dynamic_dims(manifest)
 
     @property
     def m(self):
@@ -215,17 +221,35 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
             down = min(json.loads(alive)["at"], now)
             self.state.record({"type": "EngineOutage", "down": down, "at": now})
         if m.deploy != self.manifest["deploy"] or m.manifest != self.manifest or m.project != self.project:
-            self.state.record(
-                {
-                    "type": "ProjectRegistered",
-                    "deploy": self.manifest["deploy"],
-                    "manifest": self.manifest,
-                    "project": self.project,
-                    "at": self.clock(),
-                }
-            )
-            if owed := self._owed_firings():
-                self.state.record({"type": "FiringsOwed", "owed": owed, "at": self.clock()})
+            self._register()
+
+    def _register(self) -> None:
+        """Record the served manifest, and the firings it leaves owed."""
+
+        self.state.record(
+            {
+                "type": "ProjectRegistered",
+                "deploy": self.manifest["deploy"],
+                "manifest": self.manifest,
+                "project": self.project,
+                "at": self.clock(),
+            }
+        )
+        if owed := self._owed_firings():
+            self.state.record({"type": "FiringsOwed", "owed": owed, "at": self.clock()})
+
+    def redeploy(self, manifest: dict) -> bool:
+        """Serve another deploy of the project in place, as a local serve's
+        reload does when its code changes: the deploy is recorded as any
+        other. Attempts in flight finish under the deploy they launched
+        with; new ones run the new code. Whether it changed anything."""
+
+        if manifest["deploy"] == self.manifest["deploy"]:
+            return False
+        self.manifest = self.upkeep.manifest = manifest
+        self._dynamic_dims = _dynamic_dims(manifest)
+        self._register()
+        return True
 
     def _owed_firings(self) -> dict[str, list[list[str]]]:
         """What the deploy just registered leaves each `OnChange` automation

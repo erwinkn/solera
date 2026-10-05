@@ -20,6 +20,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from croniter import croniter
 
 from .build import identity as build_identity
+from .build import modules as build_modules
 from .errors import describe as describe_errors
 
 NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]{0,127}$")
@@ -1211,14 +1212,15 @@ def dict_arg(t: Any) -> Any | None:
 # ---------------------------------------------------------------------------
 
 
-def _caller_dir() -> str | None:
-    """The directory of the file that called into this module."""
+def _caller() -> tuple[str | None, str | None]:
+    """The directory and module name of the file that called into this module."""
 
     frame = sys._getframe(1)
     while frame is not None and frame.f_code.co_filename == __file__:
         frame = frame.f_back
     path = frame.f_globals.get("__file__") if frame is not None else None
-    return os.path.dirname(os.path.abspath(path)) if path else None
+    name = frame.f_globals.get("__name__") if frame is not None else None
+    return (os.path.dirname(os.path.abspath(path)) if path else None), name
 
 
 def _data_store():
@@ -1272,7 +1274,8 @@ class Project:
         self.retention = retention
         self.assets: dict[str, Asset] = {}
         self.stores = {DEFAULT_STORE: default_store or _data_store(), **(stores or {})}
-        home = self.home = _caller_dir()
+        home, self._module = _caller()
+        self.home = home
         self.build = build
         for store in self.stores.values():
             if isinstance(store, FileStore) and store.home is None:
@@ -1835,11 +1838,28 @@ class Project:
             "automations": automation_records,
             "sensors": sensor_records,
             "retention": self.retention.spec() if self.retention else None,
-            "build": build_identity(self.home, self.build),
+            "build": build_identity(self.home, self.build, build_modules(self.home, self._roots())),
             # How user errors are classified changes what failures become (per-key §8).
             "errors": describe_errors(self.errors),
         }
         return {**body, "deploy": digest(body)}
+
+    def files(self) -> list[str]:
+        """The source files of the code the project runs (`solera.build.modules`):
+        what its build identity hashes, and what a local serve's reload watches."""
+
+        return build_modules(self.home, self._roots())
+
+    def _roots(self) -> list:
+        """What the project's code is reached from: the module that builds it,
+        and every function and class of its own it registers."""
+
+        roots = [sys.modules.get(self._module or "")]
+        roots += [a.fn for a in self.assets.values()]
+        roots += [s.loader for s in self.sources.values() if s.loader is not None]
+        roots += [s.fn for s in self.sensors.values()]
+        roots += [type(x) for x in (*self.stores.values(), *self.resources.values(), *self.executors)]
+        return [r for r in roots if r is not None]
 
     def _executors(self) -> dict[str, dict]:
         """`Project(executors=)`, by name: one kind and configuration per name."""

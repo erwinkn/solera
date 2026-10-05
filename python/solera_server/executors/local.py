@@ -207,8 +207,10 @@ class LocalPlacement:
             os.kill(handle["pid"], signal.SIGKILL)
 
 
-async def load_manifest(project: str, *, timeout: float = 60):
-    """`manifest` runs through Local only, at server start (§10)."""
+async def load_manifest(project: str, *, timeout: float = 60, watch: bool = False):
+    """`manifest` runs through Local only, at server start (§10). `watch`:
+    also the source files of the code it runs, `(manifest, files)` — what
+    a local serve's reload polls."""
 
     env = _env()
     env["SOLERA_PROJECT"] = project
@@ -236,4 +238,6 @@ async def load_manifest(project: str, *, timeout: float = 60):
             raise RuntimeError(f"Project manifest failed ({process.returncode}):\n{tail}")
         if out.stat().st_size > 4 * 1024 * 1024:
             raise ValueError("Manifest exceeds the 4 MiB limit")
-        return json.loads(out.read_text())
+        manifest = json.loads(out.read_text())
+        files = manifest.pop("watch", [])
+        return (manifest, files) if watch else manifest

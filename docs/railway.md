@@ -7,10 +7,10 @@ Use a dedicated project and a **private Storage Bucket**, not a Railway disk vol
 Deploy `erwinkn/solera` from `main`. `railway.toml` selects the `Dockerfile` builder: its first stage installs a Rust toolchain and runs `uv sync --locked --no-dev --no-editable`, which builds the `solera._native` extension; the image keeps only the resulting environment and starts `solera serve --host 0.0.0.0` (the CLI reads `$PORT`). The console bundle is committed under `python/solera_server/web`, so no Node runtime, database service, or persistent application volume is needed for S3 mode.
 
 **Build identity.** The deploy includes a build identity
-(`per-key-processing.md` §13). The image has no `.git`, so without one it
-would hash the image's Python files, while anything that builds the project
-from a checkout hashes the git work tree — and the two deploys never
-match. The `Dockerfile` declares `ARG RAILWAY_GIT_COMMIT_SHA`, which Railway
+(`per-key-processing.md` §13). Without one, each host hashes the modules
+the project runs as it imported them, and a host that imports another
+copy of the code (a checkout against the image) computes another deploy.
+The `Dockerfile` declares `ARG RAILWAY_GIT_COMMIT_SHA`, which Railway
 fills at build time, and sets `SOLERA_BUILD` from it (an explicit
 `--build-arg SOLERA_BUILD=…` wins). Workers and sensor workers that run
 elsewhere must set the same `SOLERA_BUILD`; when one reports a deploy

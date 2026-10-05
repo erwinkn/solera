@@ -57,6 +57,15 @@ interfaces as S3. Asset data lands in `.solera/data` next to the project
 file (`SOLERA_DATA_URL` overrides it: `file:///path`, or `s3://bucket/prefix` for an S3Store). `--insecure` disables token auth and is restricted to
 loopback; set `SOLERA_API_TOKEN` for anything else.
 
+A local serve reloads (`--insecure`, or `--reload` elsewhere; `--no-reload`
+turns it off): when the code the project runs changes, the engine serves
+the new deploy in place — attempts in flight finish under theirs, new
+ones run the new code. A burst of saves makes one deploy, and an edit that
+fails to import keeps the current deploy, its error in the console's
+health. A code change without a version bump makes nothing stale (a
+definition change needs `version=`), so a reload never starts anything
+over by itself.
+
 ## The demo project
 
 The default project is designed to make every architecture feature visible:

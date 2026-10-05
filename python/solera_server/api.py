@@ -18,6 +18,7 @@ from pydantic import BaseModel, Field
 from solera import lifecycle
 from solera.lifecycle import Ended
 
+from . import reloading
 from .engine import Conflict, Engine
 from .executors.local import load_manifest
 from .history import TERMINAL_RUN, RunFilter
@@ -68,7 +69,15 @@ class SourceCommitInput(BaseModel):
 
 
 def create_app(
-    *, state_url=None, namespace=None, project=None, token=None, insecure=False, engine=None, engine_url=None
+    *,
+    state_url=None,
+    namespace=None,
+    project=None,
+    token=None,
+    insecure=False,
+    engine=None,
+    engine_url=None,
+    reload=False,
 ):
     state_url = state_url or os.getenv("SOLERA_STATE_URL", Path(".solera").resolve().as_uri())
     namespace = namespace or os.getenv("SOLERA_NAMESPACE", "default")
@@ -84,7 +93,7 @@ def create_app(
         owned = engine is None
         runtime = engine
         if owned:
-            manifest = await load_manifest(project)
+            manifest, files = await load_manifest(project, watch=True)
             state = await State.open(state_url, namespace)
             runtime = Engine(
                 state,
@@ -100,6 +109,8 @@ def create_app(
                 raise
         app.state.engine = runtime
         await runtime.start()
+        if owned and reload:  # a local serve: each new deploy served as its code changes
+            runtime.tasks.spawn(reloading.reload(runtime, project, files), key="reload")
         try:
             yield
         finally:
