@@ -201,8 +201,8 @@ An attempt's `batch` and a task's `progress` (a task with no keyed
 incremental input has neither), an input partition's `observed` (owed keys by
 class, or commits for an unkeyed upstream), per-key stale reasons (each
 through an input) and a history row's `final` come from the observed set
-(rebuild steps 4.3 and 5). Fields still landing — a source's `loader`,
-`version`, `dims` and `observe`, served versions on source keys, and an
-attempt's `handle` (Worker) — are optional in `src/api/types.ts`: a view
+(rebuild steps 4.3 and 5); an attempt's `handle`, shown as Worker in its
+details, from step 6. Fields still landing — a source's `loader`,
+`version`, `dims` and `observe`, and served versions on source keys — are optional in `src/api/types.ts`: a view
 shows them when the engine sends them and hides them otherwise.
 `src/api/read.ts` reads the few fields whose shape is still settling.

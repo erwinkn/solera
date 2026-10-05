@@ -19,7 +19,9 @@ export interface RunInput {
   mode: "incremental" | "full";
   upstream: boolean;
   config?: Record<string, unknown>;
-  keys?: Record<string, unknown> | null;
+  /** Per keyed incremental input (by upstream output): a list of keys, or "all" to read every
+   * key again without a reset. Not with mode "full", which starts over instead. */
+  keys?: Record<string, string[] | "all"> | null;
   tags?: Record<string, string>;
 }
 

@@ -41,6 +41,15 @@ export function RunButton({
   );
 }
 
+type Mode = "incremental" | "all" | "full";
+
+/** What each mode does, in one line: "All keys" and "Full" both read everything, only Full starts over. */
+const MODE_MEANS: Record<Mode, string> = {
+  incremental: "Reads only what changed since each partition last read it.",
+  all: "Reads every key of its keyed inputs again and writes over what they made; nothing is reset first.",
+  full: "Starts over: outputs reset, no cursor, and every input read from scratch.",
+};
+
 function RunForm({
   initial,
   partition,
@@ -57,7 +66,7 @@ function RunForm({
   const [filter, setFilter] = useState("");
   const [selection, setSelection] = useState<Selection>(partition !== undefined ? "pick" : "latest");
   const [picked, setPicked] = useState(partition ?? "");
-  const [mode, setMode] = useState<"incremental" | "full">("incremental");
+  const [mode, setMode] = useState<Mode>("incremental");
   const [upstream, setUpstream] = useState(false);
   const [config, setConfig] = useState("");
   const [tags, setTags] = useState("");
@@ -98,10 +107,26 @@ function RunForm({
     !!tagError ||
     (selection === "pick" && partitioned && keys.length === 0);
 
+  // The keyed incremental inputs of the targets, by upstream output: what "All keys" reads again.
+  const keyedInputs = [
+    ...new Set(
+      targets.flatMap((t) =>
+        Object.values(manifest.assets[t]?.inputs ?? {})
+          .filter((i) => i.kind === "incremental" && manifest.outputs[i.output]?.key != null)
+          .map((i) => i.output),
+      ),
+    ),
+  ].sort();
+  const effectiveMode: Mode = mode === "all" && keyedInputs.length === 0 ? "incremental" : mode;
+
   const run = (): RunInput => ({
     targets,
     partitions: selection === "pick" ? (partitioned ? keys : "latest") : selection,
-    mode,
+    mode: effectiveMode === "full" ? "full" : "incremental",
+    keys:
+      effectiveMode === "all"
+        ? Object.fromEntries(keyedInputs.map((output) => [output, "all" as const]))
+        : undefined,
     upstream,
     config: config.trim() ? (JSON.parse(config) as Record<string, unknown>) : {},
     tags: Object.fromEntries(tagPairs.map(([k, v]) => [k, v ?? ""])),
@@ -224,17 +249,16 @@ function RunForm({
           <span className="text-xs font-medium text-fg-muted">Mode</span>
           <Segmented
             label="Mode"
-            value={mode}
+            value={effectiveMode}
             onChange={setMode}
             options={[
               { value: "incremental", label: "Incremental" },
-              {
-                value: "full",
-                label: "Full",
-                title: "No prior, no cursor; every incremental input resets to the whole head",
-              },
+              // Only where a target reads a keyed input: there is nothing else to read again.
+              ...(keyedInputs.length ? [{ value: "all" as const, label: "All keys" }] : []),
+              { value: "full", label: "Full" },
             ]}
           />
+          <p className="text-xs text-fg-muted">{MODE_MEANS[effectiveMode]}</p>
         </div>
         <label className="flex items-center justify-between gap-3 self-end rounded-sm px-1 py-1.5">
           <span className="text-sm text-fg">Run upstream first</span>
