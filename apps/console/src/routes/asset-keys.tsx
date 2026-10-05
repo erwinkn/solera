@@ -10,6 +10,7 @@ import type {
   Explain,
   KeyOutcome,
   LatestOutcomes,
+  OutcomeRow,
   StoredOutcomeKind,
   StoredRow,
 } from "@/api/types";
@@ -22,7 +23,7 @@ import { count, plural, shortId, until } from "@/lib/format";
 import { label, tone, toneSoft, toneText } from "@/lib/status";
 import { Button } from "@/ui/button";
 import { Empty, ErrorNote, Generation, Skeleton, Time } from "@/ui/data";
-import { Chip, Input, SearchInput, Select } from "@/ui/form";
+import { Chip, Input, SearchInput, Segmented, Select } from "@/ui/form";
 import { Card, CardHeader } from "@/ui/layout";
 import { Menu, MenuItem, Tooltip } from "@/ui/overlay";
 import { StatusBadge, StatusIcon } from "@/ui/status";
@@ -45,51 +46,79 @@ export function AssetKeys() {
   return (
     <div className="flex flex-col gap-4">
       {stalePartition !== undefined && <StaleKeysCard name={name} partition={stalePartition} />}
-      {each && <FailingKeys name={name} />}
+      {each && <OutcomesCard name={name} />}
       {(each || keyedEdge(asset)) && <ExplainKey key={key} name={name} asset={asset} />}
-      {each && <KeyOutcomes name={name} />}
+      {each && <OutcomeHistory name={name} />}
       <LiveKeys name={name} asset={asset} />
     </div>
   );
 }
 
-// -- failing keys --------------------------------------------------------------------
+// -- key outcomes ----------------------------------------------------------------------
 
-function FailingKeys({ name }: { name: string }) {
-  const { partition, outcome } = route.useSearch();
+/** What a key's latest call came to, and for the classes that keep a record, why it is stored. */
+const OUTCOME_HINT: Partial<Record<string, string>> = {
+  ok: "Its last call succeeded.",
+  removed: "It left the upstream, and its output went with it.",
+  unmatched: "The input's patterns don't take it: it is never called.",
+  failed: "Its last call failed. Its previous output stays; it is retried by `retries=`, once per deploy.",
+  rejected:
+    "Its last call rejected its input. Its previous output stays; it runs again when its input changes.",
+  retrying: "Its last call failed transiently: it is retried on its own backoff.",
+  timed_out: "Its last call ran past its timeout. Its previous output stays.",
+  canceled: "Its run was canceled before its call finished. It runs again only on request.",
+};
+
+/**
+ * Each key's latest outcome (per-key-processing.md §9). By default, the keys
+ * whose outcome is kept because it wasn't ok — read from what is stored, so
+ * fast, with totals per class; "All keys" walks every key the input knows.
+ * A key search reads one key, in every partition. Owed — its input changed
+ * since, or it was never called — shows beside the outcome: the next run
+ * loads it.
+ */
+function OutcomesCard({ name }: { name: string }) {
+  const { partition, outcome, view, key } = route.useSearch();
   const navigate = route.useNavigate();
   const project = useProject();
   const now = useNow();
+  const all = view === "all";
   const classes = list(outcome);
-  // Stored outcomes alone: what did not succeed, read from the outcome index only.
-  const failing = useInfiniteQuery({
-    ...q.outcomes(project, name, { partition, outcome: classes.length ? classes : CLASSES }),
+  const outcomes = useInfiniteQuery({
+    ...q.outcomes(project, name, {
+      partition,
+      key,
+      outcome: key ? undefined : classes.length ? classes : all ? undefined : CLASSES,
+    }),
     placeholderData: keepPreviousData,
   });
   const retry = useRetryKeys(name);
-  const first = failing.data?.pages[0];
-  const keys = (failing.data?.pages.flatMap((p) => p.keys) ?? []) as StoredRow[];
+  const first = outcomes.data?.pages[0];
+  const rows = (outcomes.data?.pages.flatMap((p) => p.keys) ?? []).filter(
+    // A key search answers in every partition; one that never processed it and isn't owed it doesn't hold it.
+    (r) => !key || r.outcome != null || r.owed,
+  );
   const totals = totalsOf(first);
+  const failing = Object.values(totals).reduce((a, n) => a + (n ?? 0), 0);
   const due = first?.partitions.filter((s) => s.has_retries).length ?? 0;
+  const stored = rows.some((r) => r.tries != null);
+  const set = (patch: Record<string, string | undefined>) =>
+    navigate({ search: (s) => ({ ...s, ...patch }), replace: true });
 
   return (
     <Card>
       <CardHeader
-        title="Failing keys"
+        title="Key outcomes"
         description={
-          <>
-            Keys whose last call didn't succeed, each with its retry record. A failed key keeps its previous
-            output, and a run retries it when its class makes it due
-            {partition ? (
-              <>
-                {" "}
-                · partition <span className="font-mono">{partition}</span>
-              </>
-            ) : (
-              " · every partition"
-            )}
-            .
-          </>
+          key ? (
+            <>
+              Key <span className="font-mono text-fg">{key}</span>, in every partition that knows it.
+            </>
+          ) : all ? (
+            "Every key's latest outcome, in key order. A key that didn't end ok keeps its previous output."
+          ) : (
+            "Keys whose latest call didn't end ok, with their retry record. Each keeps its previous output, and a run retries it when its class makes it due."
+          )
         }
         actions={
           <Menu
@@ -105,113 +134,227 @@ function FailingKeys({ name }: { name: string }) {
               </MenuItem>
             ))}
             <MenuItem onClick={() => retry.mutate({ classes: ["all"], partition })}>
-              Retry every failed key
+              Retry every key that didn't end ok
             </MenuItem>
           </Menu>
         }
       />
-      <div className="flex flex-wrap items-center gap-1.5 px-4 pb-3">
-        {CLASSES.map((c) => {
-          const active = classes.includes(c);
-          if (!active && !totals[c]) return null;
-          return (
-            <Chip
-              key={c}
-              active={active}
-              count={totals[c] ?? 0}
-              onClick={() =>
-                navigate({
-                  search: (s) => ({
-                    ...s,
-                    outcome: join(active ? classes.filter((x) => x !== c) : [...classes, c]),
-                  }),
-                  replace: true,
-                })
-              }
-            >
-              <StatusIcon status={c} className={active ? "text-current" : undefined} />
-              {label(c)}
-            </Chip>
-          );
-        })}
+      <div className="flex flex-wrap items-center gap-2 px-4 pb-3">
+        <Segmented
+          size="sm"
+          label="Which keys"
+          value={key ? "key" : all ? "all" : "not-ok"}
+          onChange={(v) =>
+            set({
+              view: v === "all" ? "all" : undefined,
+              outcome: undefined,
+              key: v === "key" ? key : undefined,
+            })
+          }
+          options={[
+            { value: "not-ok", label: failing ? `Not ok · ${count(failing)}` : "Not ok" },
+            { value: "all", label: "All keys" },
+            ...(key ? [{ value: "key", label: "This key" }] : []),
+          ]}
+        />
+        {/* Remounted when the key changes elsewhere (an Explain link), so it shows that key. */}
+        <KeySearch key={key ?? ""} value={key} onChange={(k) => set({ key: k })} />
+        {!key && !all && (
+          <span className="flex flex-wrap items-center gap-1.5">
+            {CLASSES.map((c) => {
+              const active = classes.includes(c);
+              if (!active && !totals[c]) return null;
+              return (
+                <Chip
+                  key={c}
+                  active={active}
+                  count={totals[c] ?? 0}
+                  onClick={() =>
+                    set({ outcome: join(active ? classes.filter((x) => x !== c) : [...classes, c]) })
+                  }
+                >
+                  <StatusIcon status={c} className={active ? "text-current" : undefined} />
+                  {label(c)}
+                </Chip>
+              );
+            })}
+          </span>
+        )}
+        {!key && all && (
+          <Select
+            aria-label="Outcome"
+            className="h-7 w-auto text-xs"
+            value={classes[0] ?? ""}
+            onChange={(e) => set({ outcome: e.target.value || undefined })}
+          >
+            <option value="">Outcome: any</option>
+            {ALL_OUTCOMES.map((c) => (
+              <option key={c} value={c}>
+                {label(c)}
+              </option>
+            ))}
+          </Select>
+        )}
         {first && (
           <span className="ml-auto text-xs text-fg-subtle">
             {due > 0 ? `${plural(due, "partition")} with keys due now` : "no keys due"}
           </span>
         )}
       </div>
-      {failing.isError ? (
+      {outcomes.isError ? (
         <div className="px-4 pb-4">
-          <ErrorNote error={failing.error} />
+          <ErrorNote error={outcomes.error} />
         </div>
-      ) : !failing.data ? (
+      ) : !outcomes.data ? (
         <Skeleton className="mx-4 mb-4 h-24" />
-      ) : keys.length === 0 ? (
-        <Empty compact title="Every key processed">
-          No key of this asset is failing
-          {classes.length ? " in these classes" : ""}.
-        </Empty>
+      ) : rows.length === 0 ? (
+        outcomes.hasNextPage ? (
+          // A rare filter reads a bounded number of keys per page: none matched yet, more to read.
+          <Empty compact title="None found yet">
+            No key matched in the keys read so far; there are more to read.
+          </Empty>
+        ) : (
+          <Empty compact title={key ? "No such key" : all ? "No keys" : "Every key ok"}>
+            {key
+              ? "No partition of this asset knows this key."
+              : all
+                ? "Its input holds no key yet."
+                : `No key of this asset is failing${classes.length ? " in these classes" : ""}.`}
+          </Empty>
+        )
       ) : (
-        <TableScroll className="border-t border-line">
+        <TableScroll className="max-h-[32rem] overflow-y-auto border-t border-line">
           <Table>
-            <thead>
+            <thead className="sticky top-0 bg-surface">
               <tr>
                 <Th>Key</Th>
                 {!partition && <Th>Partition</Th>}
-                <Th>Class</Th>
-                <Th className="text-right">Tries</Th>
-                <Th>Since</Th>
-                <Th>Next try</Th>
-                <Th>Last error</Th>
+                <Th>Outcome</Th>
+                <Th>Version</Th>
+                {stored && <Th className="text-right">Tries</Th>}
+                {stored && <Th>Next try</Th>}
+                {stored && <Th>Last error</Th>}
                 <Th />
               </tr>
             </thead>
             <tbody>
-              {keys.map((k) => (
-                <Tr key={`${k.partition}/${k.key}`}>
-                  <Td className="max-w-72 truncate font-mono text-xs">{k.key}</Td>
-                  {!partition && <Td className="font-mono text-xs text-fg-muted">{k.partition || "—"}</Td>}
-                  <Td>
-                    <StatusBadge status={k.outcome} />
-                  </Td>
-                  <Td className="text-right">{k.tries}</Td>
-                  <Td className="text-fg-muted">
-                    <Time at={k.since} />
-                  </Td>
-                  <Td className="text-fg-muted">{nextTry(k, now)}</Td>
-                  <Td className="max-w-96">
-                    <Tooltip content={<span className="break-words">{k.message}</span>}>
-                      <span className="block truncate text-xs text-fail-fg">{k.message}</span>
-                    </Tooltip>
-                  </Td>
-                  <Td className="text-right">
-                    <Link
-                      from="/assets/$asset/keys"
-                      to="."
-                      search={(s) => ({
-                        ...s,
-                        key: k.key,
-                        partition: k.partition || undefined,
-                      })}
-                      className="text-xs text-link hover:underline"
-                    >
-                      Explain
-                    </Link>
-                  </Td>
-                </Tr>
+              {rows.map((k) => (
+                <OutcomeRowView
+                  key={`${k.partition}/${k.key}`}
+                  row={k}
+                  now={now}
+                  showPartition={!partition}
+                  stored={stored}
+                />
               ))}
             </tbody>
           </Table>
         </TableScroll>
       )}
-      {failing.hasNextPage && (
-        <div className="flex justify-end border-t border-line px-4 py-2.5">
-          <Button size="sm" onClick={() => failing.fetchNextPage()} disabled={failing.isFetchingNextPage}>
-            Load more
+      {outcomes.hasNextPage && (
+        <div className="flex items-center justify-between border-t border-line px-4 py-2.5 text-xs text-fg-subtle">
+          <span className="tabular">{count(rows.length)} shown</span>
+          <Button size="sm" onClick={() => outcomes.fetchNextPage()} disabled={outcomes.isFetchingNextPage}>
+            {rows.length === 0 ? "Keep looking" : "Load more"}
           </Button>
         </div>
       )}
     </Card>
+  );
+}
+
+const ALL_OUTCOMES = ["ok", "removed", "unmatched", ...CLASSES] as const;
+
+function OutcomeRowView({
+  row: k,
+  now,
+  showPartition,
+  stored,
+}: {
+  row: OutcomeRow;
+  now: number;
+  showPartition: boolean;
+  stored: boolean;
+}) {
+  const hint = k.outcome ? OUTCOME_HINT[k.outcome] : "No call has processed it yet.";
+  return (
+    <Tr>
+      <Td className="max-w-72 truncate font-mono text-xs">{k.key}</Td>
+      {showPartition && <Td className="font-mono text-xs text-fg-muted">{k.partition || "—"}</Td>}
+      <Td>
+        <span className="inline-flex items-center gap-1.5">
+          <Tooltip content={hint}>
+            <span>
+              {k.outcome ? (
+                <StatusBadge status={k.outcome} />
+              ) : (
+                <StatusBadge status="missing" text="never processed" />
+              )}
+            </span>
+          </Tooltip>
+          {k.owed && (
+            <Tooltip content="Its input owes it: it changed upstream since its last call, or was never called. The next run loads it.">
+              <span className="text-xs text-warn-fg">· owed</span>
+            </Tooltip>
+          )}
+        </span>
+      </Td>
+      <Td>
+        {k.version == null ? (
+          <span className="text-fg-subtle">—</span>
+        ) : typeof k.version === "number" ? (
+          <Generation value={k.version} />
+        ) : (
+          <span className="font-mono text-xs">{k.version}</span>
+        )}
+      </Td>
+      {stored && <Td className="text-right tabular">{k.tries ?? ""}</Td>}
+      {stored && <Td className="text-fg-muted">{k.tries != null ? nextTry(k as StoredRow, now) : ""}</Td>}
+      {stored && (
+        <Td className="max-w-96">
+          {k.message && (
+            <Tooltip content={<span className="break-words">{k.message}</span>}>
+              <span className="block truncate text-xs text-fail-fg">{k.message}</span>
+            </Tooltip>
+          )}
+        </Td>
+      )}
+      <Td className="text-right">
+        <Link
+          from="/assets/$asset/keys"
+          to="."
+          search={(s) => ({ ...s, key: k.key, partition: k.partition || undefined })}
+          className="text-xs text-link hover:underline"
+        >
+          Explain
+        </Link>
+      </Td>
+    </Tr>
+  );
+}
+
+/** Find one key: Enter looks it up, in every partition, and Explain follows. */
+function KeySearch({ value, onChange }: { value?: string; onChange: (key: string | undefined) => void }) {
+  const [draft, setDraft] = useState(value ?? "");
+  return (
+    <form
+      className="w-56"
+      onSubmit={(e) => {
+        e.preventDefault();
+        onChange(draft.trim() || undefined);
+      }}
+    >
+      <SearchInput
+        aria-label="Find a key"
+        placeholder="Find a key"
+        className="font-mono text-xs"
+        value={draft}
+        onChange={(e) => {
+          setDraft(e.target.value);
+          if (!e.target.value) onChange(undefined);
+        }}
+      />
+    </form>
   );
 }
 
@@ -451,9 +594,9 @@ function Answer({ explain: e }: { explain: Explain }) {
   );
 }
 
-// -- key outcomes ------------------------------------------------------------------
+// -- outcome history ---------------------------------------------------------------
 
-function KeyOutcomes({ name }: { name: string }) {
+function OutcomeHistory({ name }: { name: string }) {
   const { partition, q: text } = route.useSearch();
   const navigate = route.useNavigate();
   const project = useProject();
@@ -467,8 +610,8 @@ function KeyOutcomes({ name }: { name: string }) {
   return (
     <Card>
       <CardHeader
-        title="Key outcomes"
-        description="Every key an attempt processed, newest first. Kept as long as its run."
+        title="Outcome history"
+        description="Every call of every key, newest first: the log of each attempt. Kept as long as its run."
         actions={
           <SearchInput
             aria-label="Search keys"

@@ -1,1 +1,0 @@
-import{Nn as e,jn as t}from"./layout-Bq3roGNV.js";function n(n,r){return t(n,e,r)}export{n as t};

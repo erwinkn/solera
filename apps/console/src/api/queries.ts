@@ -204,8 +204,13 @@ export const q = {
       refetchInterval: LIST,
     }),
 
-  /** Each key's latest outcome, a page at a time; `outcome` keeps those kinds. */
-  outcomes: (project: string, name: string, filter: { partition?: string; outcome?: string[] }) =>
+  /** Each key's latest outcome, a page at a time; `outcome` keeps those kinds, `key` that key alone
+   * (one row per partition). Paged in (partition, key) order: `next` is passed back as `after`. */
+  outcomes: (
+    project: string,
+    name: string,
+    filter: { partition?: string; outcome?: string[]; key?: string },
+  ) =>
     infiniteQueryOptions({
       queryKey: ["assets", name, "outcomes", filter],
       queryFn: ({ signal, pageParam }) =>
@@ -214,6 +219,7 @@ export const q = {
           query: {
             partition: filter.partition,
             outcome: filter.outcome,
+            key: filter.key,
             after: pageParam,
             limit: 100,
           },

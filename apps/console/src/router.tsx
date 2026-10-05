@@ -83,6 +83,8 @@ const assetKeys = createRoute({
   validateSearch: (s: Record<string, unknown>) =>
     optional({
       outcome: str(s.outcome),
+      /** Key outcomes: every key, not only those that didn't end ok. */
+      view: oneOf("all")(s.view),
       key: str(s.key),
       input: str(s.input),
       q: str(s.q),
