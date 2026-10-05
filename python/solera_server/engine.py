@@ -1333,7 +1333,6 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
                 **plan,
                 "named": True,
                 "retry": True,
-                "keys": {},
                 "classes": {},
                 "each": {"kind": "retry", "pass": retry, "changes": changes},
             }
@@ -1545,7 +1544,7 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
             digest(self._declaration(task["asset"])),
         ):
             raise Conflict(f"asset {task['asset']} changed since this attempt launched")
-        observations = await self._observations(task, prepared, result)
+        observations = await self._observations(task, prepared, result, attempt)
         if self.m.claimed(attempt) is not claim:
             raise LostOwnership(attempt)
         outputs = current_names(prepared, result.get("outputs") or {})

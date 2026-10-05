@@ -449,7 +449,6 @@ class Observing:
             "end": b.end,
             "final": b.final,
             "full": o["full"],
-            "keys": {w.key: w.new for w in b.keys},
             "classes": classes,
         }
         if o["named"]:
@@ -458,7 +457,9 @@ class Observing:
             plan["done"] = True
         return pin, plan, not b.keys
 
-    async def _observations(self, task: dict, prepared: dict, result: dict) -> dict:
+    async def _observations(
+        self, task: dict, prepared: dict, result: dict, attempt: str | None = None
+    ) -> dict:
         """What a batch's commit records of its keyed inputs: each one's
         record operations — a full run's reset first, then its range `@ H`,
         or a point per key it observed outright (a `keys=` list, a retry,
@@ -466,7 +467,11 @@ class Observing:
         served otherwise, and the fold — its progress, and the definition
         its observations were made under. Decided before the commit, which
         installs them as they are; refused if an upstream was reset since
-        the batch was planned (the commit check)."""
+        the batch was planned (the commit check).
+
+        A batch's keys are its pin's, in the attempt's spec (D178): read
+        from `attempt`'s spec when its preparation no longer holds them —
+        the journal keeps none, a batch of 10,000 keys being ~600 KB."""
 
         plans = {p: plan for p, plan in (prepared.get("plans") or {}).items() if plan}
         if not plans:
@@ -474,6 +479,17 @@ class Observing:
         asset, partition = task["asset"], task["partition"]
         records = self.m.partition(asset, partition).get("observed") or {}
         delivered = result.get("delivered") or {}
+        inputs = prepared.get("inputs")
+
+        async def pinned(param: str) -> dict:
+            nonlocal inputs
+            if inputs is None:
+                spec = await self.state.attempt_spec(task["run"], attempt)
+                if spec is None:
+                    raise Conflict(f"attempt {attempt}: its spec is gone")
+                inputs = spec["inputs"]
+            return {k[0]: k[2] for k in inputs[param]["batch"]["keys"]}
+
         out = {"observed": {}, "progress": {}}
         for param, plan in plans.items():
             if plan["kind"] == "commits":  # an unkeyed input: the last commit it read
@@ -502,7 +518,10 @@ class Observing:
             report = delivered.get(param) or {}
             seen = report.get("observed")
             named = bool(plan.get("named")) or not report.get("whole", True)
-            keys = seen if named and seen is not None else plan["keys"]
+            if named and seen is not None:
+                keys = seen
+            else:  # a retry observes only what it reports
+                keys = {} if plan.get("retry") else await pinned(param)
             b = owed.Batch(
                 [owed.Owe(k, None, None, v, None) for k, v in sorted(keys.items())],
                 plan["after"],
