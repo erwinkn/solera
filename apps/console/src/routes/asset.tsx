@@ -357,7 +357,7 @@ function Heads({
                       <Generation value={head.ref.generation} />
                     </Link>
                   </Td>
-                  <Td className="text-right">{head.count != null ? count(head.count) : "—"}</Td>
+                  <Td className="text-right">{head.key_count != null ? count(head.key_count) : "—"}</Td>
                   <Td className="text-right text-fg-muted">{head.commit_number ?? "—"}</Td>
                   <Td>
                     {head.materialized ? (

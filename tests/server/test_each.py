@@ -646,7 +646,7 @@ async def test_a_last_batch_that_writes_nothing_still_completes_the_partition(st
     assert await engine.complete("parse", "")
     planner = engine.planner()
     assert planner.materialized("parse", "") and planner.partitions("parse", "missing") == []
-    assert engine.head_view(written)["materialized"] is True
+    assert engine.head_view("samples", "", written)["materialized"] is True
     assert (await records(engine, "parse"))["b.csv"].outcome == FAILED
 
 

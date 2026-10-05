@@ -196,9 +196,10 @@ One object, `control/journal.json`, rewritten whole by every flush: the
 engine id of its writer, the name of the checkpoint it extends, every
 event since that checkpoint (§10), and the state's `format`.
 
-**Format, and no migration.** The state's format is 3: 2 since the
+**Format, and no migration.** The state's format is 4: 2 since the
 stamped-layer key index and cleanup cursors (T33), 3 since key outcomes
-renamed a per-key asset's `failures` record `outcomes` (T37). An engine refuses a
+renamed a per-key asset's `failures` record `outcomes` (T37), 4 since the
+history's commits split their `key_count` from their `rows` (T36). An engine refuses a
 namespace written in another format, a journal with no `format` included,
 before it reads or writes anything (`OldNamespace`): **state in another
 format is unreadable; start a fresh namespace.** Solera migrates
@@ -303,7 +304,7 @@ State
 
 | Type | Fields | Bounded by |
 |---|---|---|
-| `Head` | `ref` (from the store), `run`, `attempt` (may point at a deleted run), `commit_number` (incremental outputs: the last commit that changed it, −1 before any), `base` (the first commit after the last reset of an unkeyed incremental output), `count` (keyed: live keys), `partitions?` (dynamic partitions: the partitions it lists), `version` (declared asset version), `asset`, `at`, `n?` (a source's: the event counter of its commit) | outputs × partitions |
+| `Head` | `ref` (from the store), `run`, `attempt` (may point at a deleted run), `commit_number` (incremental outputs: the last commit that changed it, −1 before any), `base` (the first commit after the last reset of an unkeyed incremental output), `partitions?` (dynamic partitions: the partitions it lists), `version` (declared asset version), `asset`, `at`, `n?` (a source's: the event counter of its commit) | outputs × partitions |
 | `PartitionRecord` | `cursor?` (json), `last?` (`Outcome`: its last terminal result), `caught_up?` (whether its last commit finished the pass it was on — the partition's completeness, whatever its outputs wrote), `caught_up_at?` (the event counter of the commit that last caught it up: before its asset's `changed_at`, it is `stale`), `seen?` {input: versions} (the head generations of the whole and dep inputs it last caught up to: moved since, it is `stale`), `positions?` {input: `Position`}, `failures?` (`Failures`: a per-key asset's failing keys, per-key-processing.md §9). Registration moves it whole under a rename, drops the positions of inputs the project no longer declares, and those a reset takes (§2). | assets × partitions |
 | `Failures` | `commit_number` (the record's last commit), `counts` {outcome: keys}, `due` and `deploy_min` (lower bounds), `retry?` {`pass`, `deploy`, `forced_at`, `after`, `due_acc`, `deploy_acc`}, `passes`, `done_forced`, `last` (`changes` or `retry`), `forced` {class: position} — its index is `indexes["@asset"][partition]` (per-key-processing.md §9) | Each assets × partitions |
 | `KeyIndex` | `prefix` (where its files live — kept across renames), `count` (exact: writes are exact), `files` [{`name`, `level`, `min`, `max`, `entries`, `size`, `tail`, `index`}], `log` [[`batch`, [file]], …] — see §6 | a few dozen files per index |
@@ -498,7 +499,7 @@ input versions built this version of `revenue`".
 | `tasks` | task of a finished run | `asset`, `partition`, `status`, `started_at`, `finished_at`, `attempts`, `duration`, `wait` (seconds it could have run but didn't), `deps`, `max_attempts`, `retry_delay`, `retry_backoff`, `executor` (of its last attempt) |
 | `attempts` | attempt | `task`, `n`, `generation` (the one its writes carried), `outcome`, `started_at`, `finished_at`, `duration`, `preparing`, `provisioning`, `importing`, `loading`, `computing`, `writing`, `settling` (seconds per phase, below), `peak_memory` (bytes; only in a process of its own), `cpu_seconds`, `error`, `executor`, `cpu`, `memory`, `gpu` (requested; all null if it never launched), `options` (map: its other placement options, e.g. `image`), `outputs` (the outputs it committed, each at its `generation`), `keys` (map: a per-key attempt's keys by outcome) |
 | `run_timeline` | moment of a run | `n` (its order in the run), `at`, `type`, `task` and `attempt` (null for the run's own events), `by`, `name`, `reason`, `until`, `rows` — the timeline, below |
-| `commits` | output version a commit installed | `output`, `partition`, `generation` (its version: the writing attempt's, or a source commit's), `run`, `attempt`, `at`, `batch`, `added`, `removed`, `added_keys`, `removed_keys` (a source commit's keys, up to 1,000), `rows`, `metadata` (JSON; an unkeyed source commit's `version`) |
+| `commits` | output version a commit installed | `output`, `partition`, `generation` (its version: the writing attempt's, or a source commit's), `run`, `attempt`, `at`, `batch`, `added`, `removed`, `added_keys`, `removed_keys` (a source commit's keys, up to 1,000), `key_count` (a keyed output's live keys after it, its index's count), `rows` (what the attempt wrote), `metadata` (JSON; an unkeyed source commit's `version`) |
 | `lineage` | input version an output version was read from, and what a current read saw (stores.md, "What a read sees") | `output`, `partition`, `generation`, `input`, `input_scope`, `input_generation` (what was pinned: the head, or a fixed pass's generation), `param`, `read_generation` (what a read of current rows saw; null for a snapshot store's read, which is the pin, and for an external source's, which is its tick — `versions.md` §6) |
 | `key_outcomes` | key a per-key attempt processed | `run`, `attempt` (`attempts.id`), `asset`, `partition`, `key`, `generation` (the upstream key's it processed), `outcome` (`ok`, `removed`, `unmatched`, `rejected`, `failed`, `retrying`, `canceled`, `timed_out`), `error`, `duration`, `at` — per-key-processing.md §10 |
 
@@ -668,8 +669,9 @@ def train(ctx):
 ```
 
 Metadata is a JSON object per output version, at most 64 KB (larger is
-dropped, with a warning). `rows` is filled in without asking: the live key
-count of a keyed output, else the length of a returned list.
+dropped, with a warning). `rows` is filled in without asking: the length
+of a returned list. A keyed output's live keys are its index's count, on
+the commit as `key_count` and on a head's view.
 
 **Reading it.**
 

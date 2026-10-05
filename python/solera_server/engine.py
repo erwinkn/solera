@@ -2343,11 +2343,12 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
             "attempts": {t["id"]: self._attempt_views(t, attempts.get(t["id"], []), live) for t in tasks},
         }
 
-    def head_view(self, head: dict) -> dict:
-        """A head as the API shows it: with its commit, and whether it is of a
-        complete pass — its partition's progress says (§7)."""
+    def head_view(self, output: str, partition: str, head: dict) -> dict:
+        """A head as the API shows it: with its commit, its live keys if keyed
+        (`key_count`, its index's), and whether it is of a complete pass —
+        its partition's progress says (§7)."""
 
-        view = dict(head)
+        view = {**head, "key_count": self.m.key_count(output, partition)}
         view["commit"] = f"{head['run']}/{head['attempt']}" if head.get("attempt") else None
         owner = head.get("asset")
         view["materialized"] = owner is None or self.planner().complete(
@@ -2366,7 +2367,7 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
         asset = self.planner().asset_of(name)
         info = self.manifest["assets"][asset]
         heads = {
-            o["name"]: [(s, self.head_view(h)) for s, h in self.m.heads_of(o["name"])]
+            o["name"]: [(s, self.head_view(o["name"], s, h)) for s, h in self.m.heads_of(o["name"])]
             for o in info["outputs"]
         }
         observed = {
@@ -2392,7 +2393,7 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
         assets = []
         for name, info in self.manifest["assets"].items():
             heads = {
-                o["name"]: {s: self.head_view(h) for s, h in self.m.heads_of(o["name"])}
+                o["name"]: {s: self.head_view(o["name"], s, h) for s, h in self.m.heads_of(o["name"])}
                 for o in info["outputs"]
             }
             assets.append({**info, "name": name, "heads": heads})

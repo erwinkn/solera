@@ -196,7 +196,8 @@ export interface Head {
   run?: string;
   attempt?: string;
   at: number;
-  count?: number;
+  /** A keyed output's live keys, as its index counts them; null: unkeyed. */
+  key_count: number | null;
   partitions?: string[];
   commit: string | null;
   schema?: string;
@@ -433,6 +434,9 @@ export interface Commit {
   removed: number | null;
   added_keys: string[] | null;
   removed_keys: string[] | null;
+  /** A keyed output's live keys after this commit. */
+  key_count: number | null;
+  /** What the attempt said it wrote (`ctx.metadata(rows=…)`). */
   rows: number | null;
   /** Whether this was the last batch of its run: no more, not whether the partition is
    * complete (D177; that is the partition's live status). Null for a source commit, absent
@@ -452,6 +456,7 @@ export interface LineageNode {
   run: string | null;
   attempt: string | null;
   at: number | null;
+  key_count: number | null;
   rows: number | null;
   current: boolean;
 }

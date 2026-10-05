@@ -361,12 +361,12 @@ def create_app(
                     "partition": partition,
                     "ref": head["ref"],
                     "version": head.get("version"),
-                    "key_count": head.get("count"),
+                    "key_count": runtime.m.key_count(name, partition),
                     "commit_number": head.get("commit_number"),
                     "materialized": planner.head_materialized(name, partition),
                     "cursor": cursor,
                     "at": head["at"],
-                    "commit": runtime.head_view(head)["commit"],
+                    "commit": runtime.head_view(name, partition, head)["commit"],
                     "cleanups": runtime.partition_cleanups(name, partition),
                 }
             )

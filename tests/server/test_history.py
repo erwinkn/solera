@@ -82,7 +82,7 @@ async def test_versions_carry_metadata_and_lineage(state, clock):
     assert by["orders"]["metadata"] == {"rows": 4, "source": "shop"}
     assert by["orders"]["rows"] == 4
     assert by["revenue"]["metadata"] == {"total": 40}
-    assert by["ranked"]["rows"] == 2  # a keyed output counts its keys
+    assert by["ranked"]["key_count"] == 2 and by["ranked"]["rows"] == 2  # its live keys; the rows it wrote
 
     # Paging one version at a time walks them all, even those made at the same moment.
     paged, cursor = [], None

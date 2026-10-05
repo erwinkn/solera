@@ -246,8 +246,8 @@ function PartitionPanel({ name, row, detail }: { name: string; row?: PartitionRo
               <li key={output} className="flex flex-wrap items-center gap-x-3 gap-y-0.5 px-3 py-2">
                 <span className="font-medium">{output}</span>
                 <Generation value={head.ref.generation} />
-                {head.count != null && (
-                  <span className="text-xs text-fg-muted">{plural(head.count, "key")}</span>
+                {head.key_count != null && (
+                  <span className="text-xs text-fg-muted">{plural(head.key_count, "key")}</span>
                 )}
                 <span className="ml-auto text-xs text-fg-subtle">
                   <Time at={head.at} />

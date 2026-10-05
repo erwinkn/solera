@@ -92,10 +92,10 @@ async def test_every_write_is_a_change_and_an_empty_patch_none(state):
     await engine.initialize()
     await run(engine, ["items"])
     first = dict(state.model.heads[("items", "")])
-    assert store.stored == 1 and first["commit_number"] == 0 and first["count"] == 2
+    assert store.stored == 1 and first["commit_number"] == 0 and state.model.key_count("items", "") == 2
     await run(engine, ["items"])  # identical rows: written again
     second = state.model.heads[("items", "")]
-    assert store.stored == 2 and second["commit_number"] == 1 and second["count"] == 2
+    assert store.stored == 2 and second["commit_number"] == 1 and state.model.key_count("items", "") == 2
     assert second["ref"]["generation"] > first["ref"]["generation"]
     rows["v"] = Patch([])
     await run(engine, ["items"])
@@ -630,7 +630,7 @@ async def test_keyed_source_commits_go_through_the_index(state):
     await run(engine, ["ingest"])
     assert got == [(["a", "b"], [], []), (["c"], ["b"], ["a"])]  # K44: each key's change
     head = state.model.heads[("uploads", "")]
-    assert head["commit_number"] == 1 and head["count"] == 2
+    assert head["commit_number"] == 1 and state.model.key_count("uploads", "") == 2
 
 
 async def test_partition_set_elements_ride_on_the_head(state):
@@ -644,7 +644,8 @@ async def test_partition_set_elements_ride_on_the_head(state):
     await run(engine, ["sites"])
     await run(engine, ["sites"])  # the same element again: nothing changes
     head = state.model.heads[("sites", "")]
-    assert head["partitions"] == ["east"] and head["count"] == 1 and head["commit_number"] == 0
+    assert head["partitions"] == ["east"] and head["commit_number"] == 0
+    assert state.model.key_count("sites", "") == 1
 
 
 async def test_only_the_engine_caches_index_files(state, tmp_path):

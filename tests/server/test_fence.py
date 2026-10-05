@@ -346,7 +346,7 @@ async def test_a_worker_that_dies_writing_leaves_its_output_unsettled_and_the_re
     assert seen == [{("items", ""): 1}]  # the dead attempt left `items` owing a repair
     assert state.model.repairs == {}  # the retry's commit settled it
     assert live.rows == {"a": {"id": "a", "v": 2}, "b": {"id": "b", "v": 1}, "c": {"id": "c", "v": 1}}
-    assert state.model.heads[("items", "")]["count"] == 3
+    assert state.model.key_count("items", "") == 3
     await engine.stop()
     await state.close()
 
@@ -537,7 +537,7 @@ async def test_a_create_whose_response_was_lost_is_its_own(tmp_path, monkeypatch
     detail = await engine.run_until((await engine.submit(["scores"]))["id"], 10)
     assert detail["request"]["status"] == "succeeded", detail
     assert {"json", "lay", "control"} <= set(retried)
-    assert state.model.heads[("scores", "")]["count"] == 2 and state.model.repairs == {}
+    assert state.model.key_count("scores", "") == 2 and state.model.repairs == {}
     with pytest.raises(AlreadyExistsError):  # another writer's object is still a collision
         await create(state.objects, f"{state.attempt_path(detail['request']['id'], 'x')}.spec", b"a")
         await create(state.objects, f"{state.attempt_path(detail['request']['id'], 'x')}.spec", b"b")

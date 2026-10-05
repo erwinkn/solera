@@ -97,7 +97,7 @@ export function AssetHistory() {
                   {!partition && <Th>Partition</Th>}
                   <Th>Version</Th>
                   <Th className="text-right">Changed</Th>
-                  <Th className="text-right">Rows</Th>
+                  <Th className="text-right">Size</Th>
                   <Th>Metadata</Th>
                   <Th>Run</Th>
                 </tr>
@@ -182,7 +182,13 @@ function VersionRow({
           <span className="text-fg-subtle">—</span>
         )}
       </Td>
-      <Td className="text-right">{m.rows != null ? compact(m.rows) : "—"}</Td>
+      <Td className="text-right">
+        {m.key_count != null
+          ? `${compact(m.key_count)} keys`
+          : m.rows != null
+            ? `${compact(m.rows)} rows`
+            : "—"}
+      </Td>
       <Td className="max-w-56 truncate text-xs text-fg-muted">
         {metadata.length
           ? metadata

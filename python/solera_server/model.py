@@ -338,6 +338,12 @@ class Model:
             return found
         return LayerState(prefix=index_prefix(output, partition), life=str(self.event_counter))
 
+    def key_count(self, output: str, partition: str) -> int | None:
+        """A keyed output's live keys, as its index counts them (None: unkeyed)."""
+
+        index = self.indexes.get((output, partition))
+        return None if index is None else index.count
+
     def observed_commits(self, output: str, partition: str) -> list[int]:
         """The commits of an upstream index its readers hold: every commit its
         consumers' observation records were observed at — their bases' and
@@ -1223,6 +1229,7 @@ class Model:
                     partition,
                     head,
                     keys=(commit.get("keys") or {}).get(name),
+                    key_count=self.key_count(name, partition),
                     rows=(commit.get("rows") or {}).get(name),
                     metadata=(commit.get("metadata") or {}).get(name),
                     final=commit.get("final"),
@@ -1399,9 +1406,6 @@ class Model:
             self.indexes[(output, partition)] = index.committed(
                 keys["commit_number"], _delta(keys, generation)
             )
-        index = self.indexes.get((output, partition))
-        if index is not None:
-            self.heads[(output, partition)]["count"] = index.count
 
     # -- cleanup of immutable stores (docs/lifecycle.md §9.8) -----------------------
 
@@ -1672,7 +1676,14 @@ class Model:
             self._record(
                 "commits",
                 history.commit_row(
-                    e["source"], None, "", installed, keys=e.get("keys"), listed=run, metadata=version
+                    e["source"],
+                    None,
+                    "",
+                    installed,
+                    keys=e.get("keys"),
+                    key_count=self.key_count(e["source"], ""),
+                    listed=run,
+                    metadata=version,
                 ),
             )
         if before is None or before["ref"].get("generation") != head["ref"].get("generation"):

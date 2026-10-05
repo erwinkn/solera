@@ -160,7 +160,8 @@ TABLES = {
             "removed": "BIGINT",
             "added_keys": "VARCHAR[]",  # a source commit's keys, listed up to 1,000
             "removed_keys": "VARCHAR[]",
-            "rows": "BIGINT",
+            "key_count": "BIGINT",  # a keyed output's live keys after the commit
+            "rows": "BIGINT",  # what the attempt said it wrote (`ctx.metadata(rows=…)`)
             "final": "BOOLEAN",  # the last batch of its run (a source commit's: null)
             "metadata": "VARCHAR",  # JSON object; an unkeyed source commit's version is in it
             "generation": "BIGINT",  # its version: the write's (an attempt's, a source commit's)
@@ -523,16 +524,26 @@ def source_run_row(run: dict, at: float) -> dict:
 
 
 def commit_row(
-    output, asset, partition, head, *, keys=None, rows=None, metadata=None, listed=None, final=None
+    output,
+    asset,
+    partition,
+    head,
+    *,
+    keys=None,
+    key_count=None,
+    rows=None,
+    metadata=None,
+    listed=None,
+    final=None,
 ) -> dict:
     """The row of an output version a commit installed: `head` is the head
-    as installed, `keys` the commit's key delta for the output, `listed` a
-    source commit's record, which lists the keys it changed; `final`
-    whether it was the last batch of its run (as `ctx.batch.final`)."""
+    as installed, `keys` the commit's key delta for the output and
+    `key_count` its index's live keys after it, `rows` what the attempt
+    said it wrote, `listed` a source commit's record, which lists the keys
+    it changed; `final` whether it was the last batch of its run (as
+    `ctx.batch.final`)."""
 
     listed = listed or {}
-
-    count = head.get("count")
     return {
         "output": output,
         "asset": asset,
@@ -547,7 +558,8 @@ def commit_row(
         # listed up to 1,000, counted past that
         "added_keys": listed.get("upserted") if isinstance(listed.get("upserted"), list) else None,
         "removed_keys": listed.get("deleted") if isinstance(listed.get("deleted"), list) else None,
-        "rows": count if count is not None else rows,
+        "key_count": key_count,
+        "rows": rows,
         "final": final,
         "metadata": metadata or None,
         "generation": head["ref"].get("generation"),
@@ -1223,7 +1235,7 @@ class History:
                 con.executemany("INSERT INTO wanted VALUES (?, ?, ?)", sorted(keys, key=_node_order))
                 for row in _dicts(
                     con.execute(
-                        "SELECT m.output, m.partition, m.generation, m.asset, m.run, m.attempt, m.at, m.rows "
+                        "SELECT m.output, m.partition, m.generation, m.asset, m.run, m.attempt, m.at, m.key_count, m.rows "
                         "FROM commits m JOIN wanted USING (output, partition, generation)"
                     )
                 ):

@@ -60,7 +60,7 @@ project = Project(assets=[feed, consumer])
     attempt = detail["attempts"][task["id"]][0]["id"]
     # the worker wrote the batch's delta file into the output's key index
     head = state.model.heads[("feed", "")]
-    assert head["count"] == 2 and head["commit_number"] == 0
+    assert state.model.key_count("feed", "") == 2 and head["commit_number"] == 0
     index = state.model.indexes[("feed", "")]
     [layer] = index.layers
     [delta] = layer.main.files
