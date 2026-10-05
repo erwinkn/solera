@@ -596,6 +596,9 @@ export interface Attempt extends Partial<Record<Phase, number>> {
   cpu_seconds?: number | null;
   /** Absent for an attempt of a task that walks no batches (no keyed incremental input). */
   batch?: Batch | null;
+  /** The executor's identifier for the worker it started (`{task_arn}`, `{job}`, `{call_id}`),
+   * shown as "Worker"; absent until launched, and from engines that don't report it. */
+  handle?: Record<string, Json> | null;
 }
 
 export interface AttemptError {

@@ -2,7 +2,7 @@ import type { ReactNode } from "react";
 import { useQuery, useSuspenseQuery } from "@tanstack/react-query";
 import { getRouteApi, Link } from "@tanstack/react-router";
 import { Ban, CirclePause, CirclePlay, RotateCcw, Trash2 } from "lucide-react";
-import { ACTIVE_ATTEMPT, ACTIVE_RUN, q, runIsLive, useProject } from "@/api/queries";
+import { ACTIVE_ATTEMPT, ACTIVE_RUN, q, runIsLive, useManifest, useProject } from "@/api/queries";
 import { useDeleteRun, useRetryRun, useRunAction } from "@/api/mutations";
 import type { Attempt, AttemptError, Json, RunDetail, RunEvent, Task } from "@/api/types";
 import { CLEANUP, PartitionsLabel, runTitle, TriggerLabel } from "@/features/runs";
@@ -16,6 +16,7 @@ import {
   KeyClasses,
 } from "@/features/batches";
 import { Logs, type LogLevel } from "@/features/logs";
+import { workerOf } from "@/features/worker";
 import { PHASE_LABEL, PhaseBar, PhaseLegend, phaseColor, phasesOf, Waterfall } from "@/features/timeline";
 import { useNow } from "@/lib/clock";
 import { cn } from "@/lib/cn";
@@ -357,7 +358,7 @@ function TaskPanel({
         </Empty>
       ) : (
         <>
-          <AttemptSummary run={run} attempt={attempt} attempts={attempts} live={live} />
+          <AttemptSummary run={run} attempt={attempt} live={live} />
           <div
             role="tablist"
             aria-label="Attempt details"
@@ -485,7 +486,7 @@ function Batches({
                         search={(s) => ({ ...s, task: task.id, attempt: a.id })}
                         replace
                         aria-current={a.id === selected?.id || undefined}
-                        title={`${i === 0 ? "first try" : `retry ${i}`} · ${label(a.outcome)}`}
+                        title={`attempt ${i + 1} of ${batch ? `batch ${batch.index + 1}` : "the task"} · ${label(a.outcome)}`}
                         className={cn(
                           "inline-flex h-6 items-center gap-1 rounded-sm px-1.5 text-xs font-medium",
                           a.id === selected?.id
@@ -497,7 +498,7 @@ function Batches({
                           status={a.outcome}
                           className={a.id === selected?.id ? "text-current" : undefined}
                         />
-                        {i === 0 ? "try 1" : `try ${i + 1}`}
+                        attempt {i + 1}
                       </Link>
                     ))}
                   </span>
@@ -511,22 +512,13 @@ function Batches({
   );
 }
 
-function AttemptSummary({
-  run,
-  attempt,
-  attempts,
-  live,
-}: {
-  run: string;
-  attempt: Attempt;
-  attempts: Attempt[];
-  live: boolean;
-}) {
+function AttemptSummary({ run, attempt, live }: { run: string; attempt: Attempt; live: boolean }) {
   const now = useNow();
   const end =
     attempt.finished_at ?? (ACTIVE_ATTEMPT.has(attempt.outcome) ? now : (attempt.started_at ?? now));
   const error = errorOf(attempt.error);
   const phases = phasesOf(attempt);
+  const worker = workerOf(attempt, useManifest());
   return (
     <div className="flex flex-col gap-5 border-y border-line px-4 py-4">
       <Facts>
@@ -538,6 +530,17 @@ function AttemptSummary({
         </Fact>
 
         <Fact label="Executor">{attempt.executor ?? "—"}</Fact>
+        {worker && (
+          <Fact label="Worker">
+            {worker.href ? (
+              <a href={worker.href} target="_blank" rel="noreferrer" className="text-link hover:underline">
+                {worker.label}
+              </a>
+            ) : (
+              <span className="font-mono text-xs">{worker.label}</span>
+            )}
+          </Fact>
+        )}
         <Fact label="Started">
           <Time at={attempt.started_at} />
         </Fact>
@@ -581,7 +584,7 @@ function AttemptSummary({
 
       {attempt.batch && (
         <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs">
-          <span className="text-fg-subtle">{attemptName(attempt, attempts).replace(/^b/, "B")}</span>
+          <span className="text-fg-subtle">Batch {attempt.batch.index + 1}</span>
           <BatchRange batch={attempt.batch} />
           <KeyClasses {...attempt.batch} />
         </div>

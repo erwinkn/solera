@@ -177,9 +177,9 @@ export function tryOf(attempt: Attempt, attempts: Attempt[]): number {
   return same.findIndex((a) => a.id === attempt.id) + 1;
 }
 
-/** An attempt's name for people: "batch 2, try 2", or "attempt 3" where there are no batches. */
+/** An attempt's name for people (D170): "attempt 2 of batch 1", or "attempt 3" where there are no batches. */
 export function attemptName(attempt: Attempt, attempts: Attempt[]): string {
   if (!attempt.batch) return `attempt ${attempt.generation}`;
   const n = tryOf(attempt, attempts);
-  return `batch ${attempt.batch.index + 1}${n > 1 ? `, try ${n}` : ""}`;
+  return `attempt ${n} of batch ${attempt.batch.index + 1}`;
 }
