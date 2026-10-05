@@ -31,7 +31,7 @@ async def files() -> list[bytes]:
         state = state.committed(c, delta)
         out += [await io.read_whole(state.path(f.name), f.size) for f in delta.part.files]
     ids, layer = await LayerIndex(io, state).merge(0, len(state.layers), epoch=1)
-    out += [await io.read_whole(state.path(n), 1 << 30) for n in layer.names() if n.endswith(".lay")]
+    out += [await io.read_whole(state.path(f.name), f.size) for p in layer.parts() for f in p.files]
     out.append(SortedEntries.of([b"a", b"b"], [b"1", None], [b"c"]).encode(block_size=256))
     return out
 
