@@ -12,6 +12,7 @@ the worker channel, store kinds, sensors), `per-key-processing.md` (per-key incr
 error classes, build identity), `resolved-commits.md` (the engine's
 resolver), `versions.md` (what a key's version is), `key-index-format.md`
 (the byte format).
+`behaviors.md` is the behaviour contract, independent of design, that every design must keep.
 `example/brimstone.py` is the reference example. Sections: 1 Model · 2 Assets
 · 3 Refs · 4 Stores · 5 Inputs · 6 Incrementality · 7 Partitions · 8 Runs ·
 9 Automations · 10 Execution · 11 Registration · 12 Later and non-goals.
