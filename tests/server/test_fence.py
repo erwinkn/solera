@@ -7,8 +7,8 @@ import contextlib
 import pytest
 from obstore.exceptions import AlreadyExistsError
 from solera import lifecycle
-from solera.sdk import Output, Project, Ref, Result, Retry, asset
-from solera.stores import FileStore, Patch
+from solera.sdk import DynamicPartitions, Output, Project, Ref, Result, Retry, asset
+from solera.stores import FileStore, KeyedWrite, Patch, Written
 from solera_server.engine import Engine
 from solera_server.executors.inline import InlinePlacement
 from solera_server.state import State
@@ -347,6 +347,57 @@ async def test_a_worker_that_dies_writing_leaves_its_output_unsettled_and_the_re
     assert state.model.repairs == {}  # the retry's commit settled it
     assert live.rows == {"a": {"id": "a", "v": 2}, "b": {"id": "b", "v": 1}, "c": {"id": "c", "v": 1}}
     assert state.model.key_count("items", "") == 3
+    await engine.stop()
+    await state.close()
+
+
+class LiveSet(LiveStore):
+    """A `LiveStore` of a dynamic partitions set: its rows are the elements."""
+
+    async def store(self, write, prior, context):
+        if isinstance(write, KeyedWrite):
+            write = write.value
+        patch = isinstance(write, Patch)
+        if not patch:
+            self.rows.clear()
+        for n, element in enumerate(write.rows if patch else write):
+            if self.die is not None and n == self.die:
+                self.die = None
+                raise asyncio.CancelledError  # the worker dies mid-write
+            self.rows[element] = element
+        for element in write.remove if patch else ():
+            self.rows.pop(element, None)
+        return Written(Ref(context.output.name, "live", {}, context.partition))
+
+
+async def test_a_repair_adds_a_dead_writers_elements_to_a_partitions_set(tmp_path):
+    """T36 B2: the dead attempt meant to add `north` and `west`, and only
+    `north` landed. Its retry writes `west` alone; the repair folds `north`
+    into the index, and the set's elements — worked out from the index, not
+    from what the retry wrote — list it too."""
+
+    live = LiveSet()
+    writes = [["east"], Patch(["north", "west"]), Patch(["west"])]
+
+    @asset(outputs=DynamicPartitions("sites", store="live"), retries=Retry(1, delay=0))
+    def sites():
+        return writes.pop(0)
+
+    project = Project(assets=[sites], stores={"live": live})
+    state = await State.open(tmp_path.as_uri(), "test", flush_interval=0.001)
+    engine = engine_for(state, project, placement="inline")
+    await engine.initialize()
+    assert (await engine.run_until((await engine.submit(["sites"]))["id"], 10))["request"][
+        "status"
+    ] == "succeeded"
+    live.die = 1
+    detail = await engine.run_until((await engine.submit(["sites"]))["id"], 20)
+    assert detail["request"]["status"] == "succeeded", detail
+    assert state.model.repairs == {}  # the retry's commit settled the repair
+    assert sorted(live.rows) == ["east", "north", "west"]
+    assert state.model.key_count("sites", "") == 3
+    assert state.model.heads[("sites", "")]["partitions"] == ["east", "north", "west"]
+    assert engine.planner().dynamic_partitions("sites") == ["east", "north", "west"]
     await engine.stop()
     await state.close()
 
