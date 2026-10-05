@@ -21,18 +21,15 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 
 from solera import errors
-from solera.failed_keys import REMOVED, UNMATCHED, Outcome, Record, eligible, minima, transition
+from solera.failed_keys import REMOVED, UNMATCHED, Outcome, Record, lower, minima, transition
 from solera.keys import SortedEntries
-from solera.keys.delta import version_of
-from solera.keys.index import IndexState, KeyIndex, key_bytes, key_str
-from solera.patterns import Matcher
+from solera.keys.index import IndexState, KeyIndex, key_bytes
 from solera.sdk import UNSET, Ref, Result
 from solera.stores import Keys, Patch, SourceBehind, missing_keys
 from solera.tasks import Tasks
 
 from .sources import reader
 
-WALK = 100  # failure records walked per retry batch, at most, for each key it may take
 INTERRUPTED = "interrupted"  # a key a drain stopped: canceled or timed out once the result is sealed
 CLASSES = ("added", "updated", "removed", "unchanged")
 
@@ -82,8 +79,8 @@ class Batch:
     after: str | None  # where the retry walk ended (None: the walk is done)
     unmatched: list[str] = field(default_factory=list)
     kind: str = "changes"
-    walked: dict[str, Record] = field(default_factory=dict)  # retry: every record walked
     priors: dict[str, Record] = field(default_factory=dict)  # the touched keys' failure records
+    rest: tuple = (None, None)  # retry: the bounds of the records walked but not taken
     observed: dict = field(default_factory=dict)  # key -> the version observed, None: absent
 
 
@@ -113,70 +110,25 @@ async def gone_since(output: str, key: str | None, value, expected: dict, pin: d
     return missing
 
 
-async def read_each_batch(pin: dict, keys_io) -> Batch:
+def read_each_batch(pin: dict) -> Batch:
+    """A per-key batch as the engine planned it (§9): its keys — owed ones,
+    or a retry's due ones, each with its class — and their prior failure
+    records. Nothing here reads an index."""
+
     each = pin["each"]
-    failures = KeyIndex(keys_io, None, IndexState.from_json(each["failures"]))
-    if each["kind"] != "retry":
-        keys = pin["batch"]["keys"]
-        batch = Batch(
-            {k: g for k, cls, _, g, _ in keys if cls != "removed"},
-            [k for k, cls, *_ in keys if cls == "removed"],
-            None,
-            observed={k: v for k, _, v, *_ in keys},
-        )
-        # A start-over reads no prior record: its failed keys start over (K47).
-        touched = [key_bytes(k) for k, *_ in keys]
-        priors = await failures.lookup(touched) if touched and not each.get("start_over") else {}
-        batch.priors = {key_str(k): Record.decode(p) for k, (_, p) in priors.items()}
-        return batch
-    # A retry batch: walk the failed keys from the pass's place, taking the
-    # keys that are due, `limit` at most (§9), each at its version now.
-    limit = int(pin["batch"]["limit"])
-    after = pin["batch"]["retry"].get("after")
-    cursor = key_bytes(after) if after is not None else None
-    walked: dict[str, Record] = {}
-    due: list[str] = []
-    end = None
-    while len(due) < limit and len(walked) < WALK * limit:
-        keys, _, payloads, nxt = await failures.page(cursor, limit)
-        for k, p in zip(keys, payloads, strict=True):
-            key = key_str(k)
-            record = walked[key] = Record.decode(p)
-            if eligible(record, each["now"], int(each["deploy"]), each.get("forced") or {}):
-                due.append(key)
-            end = key
-            if len(due) >= limit or len(walked) >= WALK * limit:
-                break
-        else:
-            if nxt is None:
-                end = None  # the whole index walked: the pass is complete
-                break
-            cursor = nxt
-            continue
-        break
-    upstream = KeyIndex(keys_io, None, IndexState.from_json(pin["index"]))
-    current = await upstream.lookup([key_bytes(k) for k in due]) if due else {}
-    taken = Matcher(pin.get("patterns"))
-    upserted, deleted, unmatched, observed = {}, [], [], {}
-    for key in due:
-        entry = current.get(key_bytes(key))
-        if not taken(key):
-            unmatched.append(key)  # no longer one of the input's keys: its outputs and record go
-        elif entry is None:
-            deleted.append(key)  # gone upstream: its outputs and its record go
-        else:
-            upserted[key] = entry[0]  # at its version now
-        observed[key] = version_of(*entry) if taken(key) and entry is not None else None
-    return Batch(
-        upserted,
-        deleted,
-        end,
-        unmatched=unmatched,
-        kind="retry",
-        walked=walked,
-        priors={k: walked[k] for k in due},
-        observed=observed,
+    keys = pin["batch"]["keys"]
+    gone = {"removed", "unmatched"}
+    batch = Batch(
+        {k: g for k, cls, _, g, _ in keys if cls not in gone},
+        [k for k, cls, *_ in keys if cls == "removed"],
+        (pin["batch"].get("retry") or {}).get("after"),
+        unmatched=[k for k, cls, *_ in keys if cls == "unmatched"],
+        kind=each["kind"],
+        observed={k: (None if cls in gone else v) for k, cls, v, *_ in keys},
+        rest=tuple(each.get("rest") or (None, None)),
     )
+    batch.priors = {k: Record.decode(bytes.fromhex(p)) for k, p in (each.get("priors") or {}).items()}
+    return batch
 
 
 async def run(spec, project, asset, param: str, pin: dict, args: dict, ctx, keys_io, timeline, control):
@@ -193,7 +145,7 @@ async def run(spec, project, asset, param: str, pin: dict, args: dict, ctx, keys
 
     drain = control["drain"]
     each = pin["each"]
-    batch = await read_each_batch(pin, keys_io)
+    batch = read_each_batch(pin)
     timeline.add("loaded", param, len(batch.upserted))
     ref = Ref.from_json(pin["ref"])
     store = reader(project, ref)
@@ -438,8 +390,11 @@ async def _failures(spec, each: dict, batch: Batch, outcomes: dict, keys_io) -> 
     pass_after = each.get("pass_after")
     if batch.kind == "retry":
         # The walked range's records, as this batch leaves them: the pass's accumulators (§9).
-        walked = [records[k] if k in records else r for k, r in batch.walked.items()]
-        report["range"] = dict(zip(("due", "deploy_min"), minima(walked), strict=True))
+        mine = minima(records.values())
+        report["range"] = {
+            "due": lower(batch.rest[0], mine[0]),
+            "deploy_min": lower(batch.rest[1], mine[1]),
+        }
     elif pass_after is not None:
         bound = key_bytes(pass_after)
         behind = [r for k, r in records.items() if key_bytes(k) <= bound]

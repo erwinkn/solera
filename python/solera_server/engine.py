@@ -845,7 +845,7 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
                 )
                 return
             if prepared.get("skip"):
-                commit = await self._observations(task, prepared, {})
+                commit = {**await self._observations(task, prepared, {}), **self._made(prepared)}
                 more = bool(prepared.get("more"))
                 if not selects(prepared["plans"]) and not more:
                     commit["caught_up"] = True
@@ -991,7 +991,7 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
         # up to: one moved since makes a full pass due (semantic change d), from its commit.
         # Never caught up, no record says what it saw: their latest commit, so a pass begun
         # before it starts over and redoes what it wrote under the old ones.
-        seen = {i.param: self._input_version(planner, i) for i in inputs if self._versioned(i)}
+        context = self._context(planner, inputs)
         # Pass 2: Incremental plans, as `_observe` planned them.
         plans, all_empty, each_page = {}, True, None
         for input in incremental:
@@ -1002,7 +1002,9 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
             else:
                 pin, plan, empty = self._commits_pin(input, ref, observing[param])
             if input.spec.get("each") is not None:
-                pin, plan, empty = self._each_plan(task, asset, input.spec, ref, pin, plan, empty)
+                pin, plan, empty = self._each_plan(
+                    task, asset, input.spec, ref, pin, plan, empty, observing[param]
+                )
                 each_page = pin["each"]
             pins[param] = pin
             plans[param] = plan
@@ -1066,9 +1068,10 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
         return {
             "version": asset["version"],
             "deploy_number": self.m.deploy_number,
-            # The version of each whole or dep input read: a catch-up records it, and a
-            # partition with no incremental input whose inputs moved since is stale.
-            "seen": seen,
+            # The version of each whole or dep input read: a partition with no keyed
+            # input whose inputs moved since is stale (a keyed one's layers carry it).
+            "context": context,
+            "config": run.get("config") or {},
             "declaration": digest(self._declaration(task["asset"])),
             "prefixes": self._prefixes(pins, outputs, task),
             "inputs": pins,
@@ -1132,7 +1135,8 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
             for k in (
                 "version",
                 "deploy_number",
-                "seen",
+                "context",
+                "config",
                 "declaration",
                 "prefixes",
                 "plans",
@@ -1179,12 +1183,6 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
 
         return input.kind != "incremental" and not input.set_dim
 
-    def _input_version(self, planner: planning.Planner, input: planning.Input) -> list:
-        """A whole or dep input's version: the generation of each head it reads."""
-
-        refs = self._input_refs(planner, input)
-        return sorted([key, (ref or {}).get("generation")] for key, ref in refs.items())
-
     def _input_refs(self, planner: planning.Planner, input: planning.Input) -> dict:
         """The head refs a whole or dep input reads, by partition key."""
 
@@ -1228,17 +1226,18 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
             or self._forced_at(record) > int(record.get("done_forced") or 0)
         )
 
-    def _each_plan(self, task, asset, input, ref, pin, plan, empty):
+    def _each_plan(self, task, asset, input, ref, pin, plan, empty, o):
         """A per-key input's batch: its owed keys, or the keys its failed keys
-        has due again. When both are pending they alternate — neither
-        starves, and there is no fraction to tune (§9). A `keys=` run and a
-        full run's first batch take no retries; that batch starts the failed
-        keys over too (K47)."""
+        has due again (`_retry`, as `_observe` read them). When both are
+        pending they alternate — neither starves, and there is no fraction to
+        tune (§9). A `keys=` run and a full run's first batch take no
+        retries; that batch starts the failed keys over too (K47). Either
+        carries its keys' prior failure records: its worker reads no index."""
 
         record = self.m.partition(task["asset"], task["partition"]).get("failures") or {}
         failures = self.m.index(f"@{task['asset']}", task["partition"])
         changes = not empty
-        retries = not plan["full"] and not plan.get("named") and self._has_retries(record)
+        retries = o.get("retry") is not None
         if changes and retries:
             kind = "retry" if record.get("last") == "changes" else "changes"
         else:
@@ -1271,11 +1270,12 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
                     "deploy_acc": None,
                 }
             each["pass_after"] = retry["after"]
+            each["priors"], each["rest"] = o["retry"]["priors"], o["retry"]["rest"]
             # Each due key at its version now, observed outright: a point each.
             pin = {
                 "ref": ref,
                 "index": pin["index"],
-                "batch": {"retry": {"after": retry["after"]}, "limit": int(input["batch_size"])},
+                "batch": {"keys": o["retry"]["keys"], "retry": {"after": o["retry"]["after"]}},
                 "each": each,
             }
             if input.get("patterns") is not None:
@@ -1290,6 +1290,7 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
             }
             return pin, plan, False
         batch = {"kind": "changes", "retries": retries, "pass": retry}
+        each["priors"] = o["priors"]
         if plan["full"]:  # the failed keys start over: the commit replaces the failure index
             each["start_over"] = batch["start_over"] = True
         return {**pin, "each": each}, {**plan, "each": batch}, empty
@@ -1396,6 +1397,13 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
             for p, i in definition["inputs"].items()
         }
         return digest({**definition, "config": run.get("config") or {}})
+
+    @staticmethod
+    def _made(prepared: dict) -> dict:
+        """What every commit says it was made under: the definition, the run's
+        config, and the whole and dep versions read (staleness compares them)."""
+
+        return {k: prepared[k] for k in ("definition", "config", "context") if k in prepared}
 
     def _declaration(self, asset: str) -> dict:
         """The asset's canonical definition (`model.declaration`): a change makes a
@@ -1526,14 +1534,12 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
             # nor does a batch whose keys the input's patterns all left out.
             if prepared["outputs"][name]["head"] is None and failures is None and not result.get("skipped"):
                 raise Conflict(f"omitted output {name} has no head to keep (§2)", retryable=False)
-        commit = {"heads": heads, **observations}
+        commit = {"heads": heads, **observations, **self._made(prepared)}
         # A `keys=` list leaves the partition's progress as it was.
         if not selects(prepared.get("plans") or {}):
             # Whether the walk is done is the partition's, not its outputs' — a last batch
             # may write none of them (§7).
             commit["caught_up"] = not more
-            if commit["caught_up"] and prepared.get("seen") is not None:
-                commit["seen"] = prepared["seen"]  # the whole and dep inputs it caught up to
         if failures is not None:
             commit["failures"] = failures
             if result.get("key_outcomes"):

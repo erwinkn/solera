@@ -944,10 +944,11 @@ def _changing(tmp_path, kind: str, automation: str, after: bool, calls: list):
 
     body.__name__ = name
     items = asset(
-        inputs={"feed": Incremental(batch_size=2 if kind == "changed" and after else 100)},
+        inputs={"feed": Incremental()},
         outputs=Output(name, key="id", store="other" if kind == "reset" and after else None),
         automations=automations,
         aliases=["items"] if name == "renamed" else [],
+        version="2" if kind == "changed" and after else "1",
     )(body)
     return Project(assets=[feed, items], stores={"other": FileStore(tmp_path / "other")}), name
 
@@ -959,9 +960,10 @@ async def test_an_asset_change_is_built_by_its_automation_or_marked_stale(state,
     renames it, changes its declaration or resets it leaves its OnChange
     automation owing a firing, once, per partition whose inputs have heads:
     it is built at once. A schedule waits for its next time (a new one
-    too: it never fires at declaration) and no
-    automation runs nothing: the partition shows `stale` (or `missing`) until
-    a run catches it up, and then `materialized`."""
+    too: it never fires at declaration) and no automation runs nothing: a
+    changed definition shows `stale` (an added or reset asset `missing`)
+    until a run builds it, and then `materialized`. A rename keeps
+    everything, its definition too: nothing is owed."""
 
     async def quiet(engine):
         for _ in range(6000):
@@ -993,7 +995,7 @@ async def test_an_asset_change_is_built_by_its_automation_or_marked_stale(state,
         if kind == "renamed":  # its state carried over: the firing is a skip, no call
             assert True not in calls
         return
-    expected = "missing" if kind in ("added", "reset") else "stale"
+    expected = {"added": "missing", "reset": "missing", "renamed": "materialized"}.get(kind, "stale")
     assert await status(engine, name) == [expected]  # nothing ran: shown, for a run by hand
     assert status_of(await drive(engine, await engine.submit([name]))) == "succeeded"
     assert await status(engine, name) == ["materialized"]  # the marker clears

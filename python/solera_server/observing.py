@@ -19,11 +19,15 @@ from __future__ import annotations
 import copy
 from dataclasses import dataclass
 
+from solera.failed_keys import Record, eligible, minima
 from solera.keys.delta import delta, version_of
-from solera.keys.index import KeyIndex
+from solera.keys.index import KeyIndex, key_bytes, key_str
+from solera.patterns import Matcher
 
 from . import observed, owed, planning
 from .state import Conflict
+
+WALK = 100  # failure records a retry batch walks at most, for each key it may take
 
 
 @dataclass(frozen=True)
@@ -188,7 +192,87 @@ class Observing:
                 "named": named is not None,
                 "done": mine is not None and mine["key"] is None,
             }
+            if each:
+                out[input.param].update(
+                    await self._failed(task, input, index, now, b, full, named is not None)
+                )
         return out
+
+    async def _failed(
+        self, task: dict, input: planning.Input, index: KeyIndex, now, b, full: bool, named: bool
+    ):
+        """What a per-key batch needs of its failure records (§9), read here
+        so that its worker reads no index: the prior records of its keys —
+        none in a full run's first batch, whose records start over — and,
+        when retries may be due, the retry batch the failed keys make due
+        next (`_retry`), for `_each_plan` to choose between them."""
+
+        state = self.m.index(f"@{task['asset']}", task["partition"])
+        failures = KeyIndex(self._key_io(), None, state.slice(), self.key_options)
+        record = self.m.partition(task["asset"], task["partition"]).get("failures") or {}
+        keys = [key_bytes(w.key) for w in b.keys]
+        with self.m.reading(state.prefix, index.state.prefix):
+            found = await failures.lookup(keys) if keys and not full else {}
+            retry = None
+            if not full and not named and self._has_retries(record):
+                retry = await self._retry(task, input, failures, index, now, record)
+        return {"priors": {key_str(k): bytes(p).hex() for k, (_, p) in found.items()}, "retry": retry}
+
+    async def _retry(self, task, input, failures: KeyIndex, index: KeyIndex, now, record: dict) -> dict:
+        """The next retry batch: the failed keys walked from the retry pass's
+        place, taking the ones that are due, `batch_size` at most and
+        `WALK` records each at most (§9), each at its version at H — gone
+        upstream, removed; left out by the patterns, unmatched. With their
+        prior records, where the walk ended (None: the pass is complete),
+        and the bounds of the records walked but not taken, which the
+        worker folds into the pass's accumulators."""
+
+        limit = int(input.spec["batch_size"])
+        current, retry = self._forced_at(record), record.get("retry")
+        if retry is not None and (retry["deploy"] != self.m.deploy_number or retry["forced_at"] != current):
+            retry = None  # its predicate's inputs moved: the pass starts over (§9)
+        after = (retry or {}).get("after")
+        cursor = key_bytes(after) if after is not None else None
+        forced, clock = dict(record.get("forced") or {}), self.clock()
+        walked: dict[str, Record] = {}
+        due: list[str] = []
+        end = None
+        while len(due) < limit and len(walked) < WALK * limit:
+            keys, _, payloads, nxt = await failures.page(cursor, limit)
+            for k, p in zip(keys, payloads, strict=True):
+                key = key_str(k)
+                walked[key] = Record.decode(bytes(p))
+                if eligible(walked[key], clock, self.m.deploy_number, forced):
+                    due.append(key)
+                end = key
+                if len(due) >= limit or len(walked) >= WALK * limit:
+                    break
+            else:
+                if nxt is None:
+                    end = None  # the whole index walked: the pass is complete
+                    break
+                cursor = nxt
+                continue
+            break
+        found = {d.key: d for d in (await delta(index, None, now.head, keys=due)).diffs} if due else {}
+        take = Matcher(input.spec.get("patterns"))
+        keys = []
+        for key in due:
+            d = found.get(key)
+            if not take(key):
+                keys.append([key, "unmatched", None, None, None])
+            elif d is None:
+                keys.append([key, "removed", None, None, None])
+            else:
+                keys.append([key, "updated", version_of(d.generation, d.payload), d.generation, None])
+        taken = set(due)
+        rest = minima(r for k, r in walked.items() if k not in taken)
+        return {
+            "keys": keys,
+            "after": end,
+            "rest": list(rest),
+            "priors": {k: walked[k].encode().hex() for k in due},
+        }
 
     def _commits(self, input: planning.Input, rec: dict | None, mine: dict | None, full: bool) -> dict:
         """An unkeyed input's next batch: the next `batch_size` commits past
@@ -310,7 +394,7 @@ class Observing:
         asset, partition = task["asset"], task["partition"]
         records = self.m.partition(asset, partition).get("observed") or {}
         delivered = result.get("delivered") or {}
-        out = {"observed": {}, "progress": {}, "definition": prepared["definition"]}
+        out = {"observed": {}, "progress": {}}
         for param, plan in plans.items():
             if plan["kind"] == "commits":  # an unkeyed input: the last commit it read
                 if not plan.get("done"):

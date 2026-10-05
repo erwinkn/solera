@@ -821,7 +821,7 @@ class Model:
                 del self.partitions[key]
                 continue
             if key[0] in producers:  # a new life: never built, so missing, not stale
-                for field in ("caught_up", "caught_up_at", "built_at", "seen", "observed", "definition"):
+                for field in ("caught_up", "observed", "definition", "config", "context"):
                     self.partitions[key].pop(field, None)
             # What an input observed of a reset upstream stays, its next run a full run: a
             # keyed record's layers name the upstream's earlier life; an unkeyed one is marked.
@@ -831,7 +831,6 @@ class Model:
                 if "commit" in rec:
                     rec["reset"] = True
             if gone and key[0] not in producers:
-                self.partitions[key]["input_reset_at"] = self.event_counter
                 self._drop_failures(*key)  # failed against keys that are no longer the input's (K47)
         return producers
 
@@ -1184,13 +1183,11 @@ class Model:
                     self.garbage.extend([index.path(f["name"]), self.event_counter] for f in intent["files"])
         record = self._partition(asset, partition)
         record.setdefault("caught_up", False)  # built, though maybe not caught up (a keys= run)
-        record.setdefault("built_at", self.event_counter)  # its first commit since its last reset
         if "caught_up" in commit:
             record["caught_up"] = bool(commit["caught_up"])
-            if record["caught_up"]:
-                record["caught_up_at"] = self.event_counter  # against its asset's `changed_at`: `stale`
-                if "seen" in commit:  # its whole and dep inputs' versions: moved since, it is stale
-                    record["seen"] = commit["seen"]
+        for field in ("definition", "config", "context"):  # what it was made under: staleness compares
+            if field in commit:
+                record[field] = commit[field]
         if "cursor" in commit:
             if commit["cursor"] is None:
                 record.pop("cursor", None)
@@ -1204,8 +1201,6 @@ class Model:
                 observed.apply(records.setdefault(input, {}), ops)  # a new record's begin with its reset
             if not self._subscribed(asset, input, records[input]):  # an input removed while it ran
                 del records[input]
-        if "definition" in commit:  # what its observations were made under
-            record["definition"] = commit["definition"]
         for input, progress in (commit.get("progress") or {}).items():  # the run's walk (D155)
             task.setdefault("progress", {})[input] = progress
         if "failures" in commit:

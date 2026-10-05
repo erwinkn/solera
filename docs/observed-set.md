@@ -567,15 +567,25 @@ Each goes from the docs and the glossary when the observed set is built
 | `caught_up`, `caught_up_at`, `_dep_restart` | Derived: nothing owed; context per layer |
 | Staleness: three predicates; K38's filter-then-confirm | One comparison, exact or pending |
 
-Deleted: `_selection` and its branches, the pass and its pin, `held_at`,
-`walked`, `read_from`, `pattern_change` and the `diff` mode,
-`_read_ahead`, `_read_ahead_of`, `changes(lower=)`, `READ_AHEAD_FULL` and
-the cap, `_dep_restart`, `caught_up`, most of `staleness.py` and
-`positions.py`, the per-key reconcile, `Batch.full`, D100's rowless
-deliveries and `gone_since`'s early removal. Kept: the key index and its
-Δ, endpoint reservation and the claim's reader pin, the failure index and
-retries, D111's bounds; an unkeyed upstream's observation is the one
-commit it last read.
+Deleted (D153, steps 4–5): `_selection` and its branches; positions
+(`positions.py`: `advance`, `continues`, `outstanding`, the pass and its
+pin, `next`); the engine's keyed and unkeyed pass planning
+(`_incremental_plan`); `held_at`, `walked`, `read_from`; `pattern_change`
+and the `diff` mode; the read-ahead (`_read_ahead`, `_read_ahead_of`,
+`READ_AHEAD_FULL` and the cap, read-ahead run retention); `_dep_restart`
+and `_snapshot_read`; `seen`, `caught_up_at`, `built_at` and
+`input_reset_at`; most of `staleness.py`; the per-key reconcile; the
+worker's index reads for a batch (`read_batch`, the retry walk, the
+failure lookups — the engine plans every batch and the spec carries its
+keys, classes, old observations and prior failure records); the
+`fingerprint`, now the `definition`. Still to go: `Batch.full`, replaced
+by `Batch.reset` (D166, with the SDK contract); D100's rowless deliveries
+and `gone_since`'s early removal, for stores that do not serve (with
+fenced stores' reads); the index's `changes(lower=)`, which nothing calls
+(with the index switch). Kept: the key index and its Δ, endpoint
+reservation and the claim's reader pin, the failure index and retries,
+D111's bounds; an unkeyed upstream's observation is the one commit it
+last read.
 
 ## Testing
 

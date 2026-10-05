@@ -1,4 +1,4 @@
-"""Staleness is transitive and says why (K46, docs/positions-from-reads.md):
+"""Staleness is transitive and says why (K46, docs/observed-set.md):
 `input changed`, `upstream stale`, `definition changed` — on partition
 statuses, the asset roll-up, `stale_keys`, its route and the CLI."""
 

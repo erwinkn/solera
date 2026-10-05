@@ -1,16 +1,17 @@
 """Staleness (K43, K46; docs/observed-set.md): whether an output unit is due
-a rebuild, and why, computed on demand from the records of what was read —
-never a stored dirty flag.
+a rebuild, and why, computed on demand by comparing what was observed with
+what is there now — never a stored dirty flag.
 
-A materialized partition is stale for one or more reasons:
+A built partition is stale for one or more reasons:
 
-- `input changed`: an input unit it depends on changed since it read it —
-  a keyed incremental input owing a key (its observation record compared
-  with upstream now, under the current patterns and context), an unkeyed
-  one with commits past its position, or a whole or dep input at another
-  version than it caught up to;
+- `input changed`: an input owes it something — a keyed incremental input a
+  key (its observation record compared with upstream now, under the current
+  patterns and context: a whole or dep input that moved is in every layer's
+  context), an unkeyed one a commit past the last it read; with no keyed
+  input, a whole or dep input at another version than its last commit read;
 - `upstream stale`: a partition it reads is itself stale, to any depth;
-- `definition changed`: its asset changed since it last caught up.
+- `definition changed`: its asset's definition is not the one its last
+  commit was made under — its next run is a full run.
 
 A key of a keyed output that is not `each` shares its partition's answer.
 """
@@ -19,7 +20,7 @@ from __future__ import annotations
 
 import logging
 
-from solera.keys.index import KeyIndex, key_bytes, key_str
+from solera.keys.index import KeyIndex, key_str
 from solera.patterns import Matcher
 
 from . import observed, owed, planning
@@ -56,59 +57,32 @@ class Staleness:
         if await self.upstream_stale(asset, partition, planner, inputs, memo):
             reasons.append(UPSTREAM)
         if self.definition_changed(asset, partition):
-            # An each=True asset's by key: a key it holds not rewritten since (K47).
-            if self._each_input(asset) is None or await self._each_own(
-                asset, partition, planner, inputs, DEFINITION
-            ):
-                reasons.append(DEFINITION)
+            reasons.append(DEFINITION)
         memo[key] = reasons
         return reasons
 
     def definition_changed(self, asset: str, partition: str) -> bool:
-        """Its asset changed (version, configuration, patterns, rename, added or
-        reset) since it was written — since it last caught up, else since its
-        first commit: a pass under the new definition clears it."""
+        """Its asset's definition — version, configuration, input bindings;
+        not patterns or batch size, and a rename keeps it — is not the one
+        its last commit was made under, under that commit's run config."""
 
         record = self.m.partition(asset, partition)
-        written = int(record.get("caught_up_at", record.get("built_at", 0)))
-        return written < int(self.m.changed_at.get(asset, 0))
+        made = record.get("definition")
+        return made is not None and made != self._definition(asset, {"config": record.get("config") or {}})
 
     async def input_changed(self, asset: str, partition: str, planner, inputs) -> bool:
-        """An input unit it depends on changed past what its record covers: an
-        upstream reset replaced its content since it caught up; an incremental
-        input has changes past its position its read-ahead lacks (a pass due
-        only to its own definition is no input change); a whole or dep input
-        is at another version than the one it caught up to. A pass that
-        reads the new upstream clears it."""
+        """An input owes it something (the module docstring)."""
 
-        definition = self.definition_changed(asset, partition)
-        return await self._input_changed_here(asset, partition, planner, inputs, definition)
-
-    async def _input_changed_here(
-        self, asset: str, partition: str, planner, inputs, definition: bool
-    ) -> bool:
-        """`input_changed` from the partition's records. A partition with a
-        keyed incremental input follows its whole and dep inputs through
-        its layers' context, key by key: one moving owes the keys it holds."""
-
-        record = self.m.partition(asset, partition)
-        if int(record.get("input_reset_at", -1)) > int(record.get("caught_up_at", -1)):
-            return True
         keyed = any(self._keyed(i) for i in inputs)
-        seen = record.get("seen")
-        if not keyed and seen is None and any(self._versioned(i) for i in inputs):
-            return True  # never caught up: which whole and dep versions it saw, no record says
         for input in inputs:
             if self._keyed(input):
                 if await self._owed(asset, partition, input, planner, inputs, first=True):
                     return True
-            elif input.kind == "incremental":
-                if self._input_behind(asset, partition, input):
-                    return True
-            elif not keyed and seen is not None and self._versioned(input):
-                if seen.get(input.param) != self._input_version(planner, input):
-                    return True
-        return False
+            elif input.kind == "incremental" and self._input_behind(asset, partition, input):
+                return True
+        if keyed or not any(self._versioned(i) for i in inputs):
+            return False
+        return self.m.partition(asset, partition).get("context") != self._context(planner, inputs)
 
     async def _owed(self, asset: str, partition: str, input, planner, inputs, *, first=False) -> list:
         """What a keyed incremental input owes (`owed.Owe`s): its record
@@ -153,12 +127,9 @@ class Staleness:
         head of one of its outputs, or a commit (a keys= run that took no key
         included): what can be stale. Never built, it is missing."""
 
-        planner = planner or self.planner()
-        if planner.materialized(asset, partition):
-            return True
         if any(self.m.heads.get((o["name"], partition)) for o in self.manifest["assets"][asset]["outputs"]):
             return True
-        return "caught_up" in self.m.partition(asset, partition)
+        return "definition" in self.m.partition(asset, partition)
 
     @staticmethod
     def _upstreams(planner, input) -> list[str]:
@@ -180,25 +151,6 @@ class Staleness:
         if rec is None or not self._still(rec, input):
             return True
         return int(rec["commit"]) < int(head.get("commit_number", -1))
-
-    def _committed(self, planner, input) -> int:
-        """The event counter of the latest commit of the heads a whole or dep input reads."""
-
-        if input.fan_in:
-            heads = planner.fan_in(input, materialized=False).values()
-        else:
-            heads = [self.m.heads.get((input.output, input.partition)) or {}]
-        return max((int(h.get("n") or 0) for h in heads), default=0)
-
-    async def _holds(self, state, keys: list[str]) -> set[str]:
-        """Which of `keys` an index holds."""
-
-        if state is None or not keys:
-            return set()
-        with self.m.reading(state.prefix):
-            index = KeyIndex(self._key_io(), None, state.slice(), self.key_options)
-            found = await index.lookup([key_bytes(k) for k in keys])
-        return {key_str(k) for k in found}
 
     async def stale_keys(
         self, asset: str, partition: str = "", *, after: str | None = None, limit=1000
@@ -257,34 +209,24 @@ class Staleness:
         memo[(asset, partition)] = keys
         return keys
 
-    async def _each_own(
-        self, asset: str, partition: str, planner, inputs, only: str | None = None
-    ) -> set[str]:
-        """An `each=True` partition's stale keys by its own inputs (`_each_keys`):
-        the keys its input owes — with its definition changed, a full run
-        due, every key upstream has under the patterns and every key it
-        holds too; `only=DEFINITION`, the keys it holds, present upstream,
-        written before its asset changed: an output key's generation is its
-        writer's claim, and a claim before the change never commits."""
+    async def _each_own(self, asset: str, partition: str, planner, inputs) -> set[str]:
+        """An `each=True` partition's stale keys by its own input (`_each_keys`):
+        the keys it owes — and, its definition changed, a full run due,
+        every key upstream has under the patterns and every key it holds."""
 
         param, spec = self._each_input(asset)
         input = next((i for i in inputs if i.param == param), None)
         output = next((o["name"] for o in self.manifest["assets"][asset]["outputs"] if o.get("key")), None)
         if input is None or output is None:
             return set()
-        taken = Matcher(spec.get("patterns"))
-        up_state = self.m.indexes.get((input.output, input.partition))
-        if only == DEFINITION:
-            changed = int(self.m.changed_at.get(asset, 0))
-            held = [(k, g) async for k, g, _ in _entries(self, self.m.indexes.get((output, partition)))]
-            old = [k for k, g in held if g < changed]
-            # A key the patterns no longer take is owed its removal.
-            dropped = {k for k, _ in held if not taken(k)}
-            return ({k for k in old if taken(k)} & await self._holds(up_state, old)) | dropped
         keys = {o.key for o in await self._owed(asset, partition, input, planner, inputs)}
-        if only is None and self.definition_changed(asset, partition):
-            upstream = {k async for k, _, _ in _entries(self, up_state) if taken(k)}
-            keys |= upstream
+        if self.definition_changed(asset, partition):
+            taken = Matcher(spec.get("patterns"))
+            keys |= {
+                k
+                async for k, _, _ in _entries(self, self.m.indexes.get((input.output, input.partition)))
+                if taken(k)
+            }
             for name in (output, f"@{asset}"):
                 keys |= {k async for k, _, _ in _entries(self, self.m.indexes.get((name, partition)))}
         return keys

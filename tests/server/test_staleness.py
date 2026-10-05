@@ -1,4 +1,4 @@
-"""Staleness at every level (K43, K45, K46; tests/staleness.py states the rules):
+"""Staleness at every level (K43, K46, docs/observed-set.md; tests/staleness.py states the rules):
 the engine's stale keys, partition and asset statuses against a reference
 model, over random histories; worked examples and calibrations; and R2 on
 every built-in store."""
@@ -73,7 +73,7 @@ def project(
     @asset(inputs={"items": Incremental()}, outputs=Output("tally"))
     async def tally(ctx, items: list):
         """K44's example: the count of `items`, kept from what each batch
-        added and removed (a full pass's first batch starts over)."""
+        added and removed (a full run's first batch starts over)."""
 
         changes = ctx.batch["items"]
         outside.tally.apply(changes)  # the ordered delivery check (A19)
@@ -220,8 +220,8 @@ class Staleness(RuleBasedStateMachine):
     @precondition(lambda self: self.ref.others["copy"].built)
     @rule(keys=st.sets(st.sampled_from(KEYS), min_size=1))
     def run_keys_on_copy(self, keys):
-        """K45: copy (plain incremental) is delivered the named keys' changes
-        its record lacks, and nothing else."""
+        """copy (plain incremental) is delivered the keys a keys= run names,
+        as `items` holds them, and nothing else."""
 
         self._delivered_as(self.ref.run_keys(keys, "copy"), ["copy"], keys={"items": {"keys": sorted(keys)}})
 
@@ -269,7 +269,7 @@ class Staleness(RuleBasedStateMachine):
 
     def _delivered_as(self, want, assets, **kw):
         """Run, and check what reached `copy`: nothing twice, a start-over
-        only where a full pass begins."""
+        only where a full run begins."""
 
         self.outside.delivered.clear()
         self.outside.started_over = False
@@ -330,7 +330,6 @@ Staleness.TestCase.settings = settings(
 )
 
 
-@pytest.mark.xfail(strict=True, reason="the reference models positions and passes: step 5 ports it")
 def test_staleness_matches_the_reference_over_any_history():
     Staleness.TestCase().runTest()
 
@@ -381,39 +380,35 @@ def history():
     h.close()
 
 
-@pytest.mark.xfail(strict=True, reason="the reference models positions and passes: step 5 ports it")
-def test_a_keys_run_on_a_never_built_output_leaves_it_owing_a_full_pass(history):
-    """`checks` has never run. keys=[k2] writes k2; k1 is missing, and k2
-    is stale too: no pass has completed, so the record holds no `knob`
-    version to say which one k2 saw. `knob` moves: nothing changes. A
-    default run is the full pass that owes: it writes k1 and k2 (k2 again,
-    under the new `knob`), and `checks` is fresh. F37: the engine kept the
-    pass k2 began before the move, wrote k1 alone and said fresh."""
+def test_a_keys_run_on_a_never_built_output_owes_the_rest(history):
+    """`checks` has never run. keys=[k2] writes k2, observed under `knob` as
+    it is: k1 alone is missing. `knob` moves: k2, written under the old
+    one, is owed too. A default run writes both, and `checks` is fresh.
+    F37: the engine once wrote k1 alone and said fresh."""
 
     h = history
     h.run_keys({"k2"})
-    h.expect("checks", keys={"k1", "k2"}, why={IN})
+    h.expect("checks", keys={"k1"}, why={IN})
     h.change_knob()
     h.expect("checks", keys={"k1", "k2"}, why={IN})
     h.run_default("checks")
     h.expect("checks", keys=set(), why=set())
 
 
-@pytest.mark.xfail(strict=True, reason="the reference models positions and passes: step 5 ports it")
 def test_a_key_rewritten_after_an_asset_change_is_no_longer_stale_for_it(history):
     """keys=[k2, k3] on a never-built `checks` writes k2 (k3 is not
-    upstream). `checks`' definition changes; keys=[x1, k2, k3] rewrites k2
-    under it (x1 is excluded, k3 still absent). Only input reasons remain:
-    k1 is missing, and k2, written after the change, is stale only because
-    no pass has completed (no `knob` version on record). A default run
-    completes it."""
+    upstream). `checks`' definition changes: a full run is due, every key
+    stale for it. keys=[x1, k2, k3] is that run's first batch: it starts
+    over from what `checks` holds and rewrites k2 under the new definition
+    (x1 is excluded, k3 still absent). Only k1, missing, remains. A
+    default run writes it."""
 
     h = history
     h.run_keys({"k2", "k3"})
     h.change_asset("checks")
     h.expect("checks", keys={"k1", "k2"}, why={IN, DEF})
     h.run_keys({"x1", "k2", "k3"})
-    h.expect("checks", keys={"k1", "k2"}, why={IN})
+    h.expect("checks", keys={"k1"}, why={IN})
     h.run_default("checks")
     h.expect("checks", keys=set(), why=set())
 
@@ -437,16 +432,15 @@ def test_a_key_gone_upstream_stays_stale_through_a_keys_run_that_does_not_name_i
     h.expect("checks", keys={"k1", "k2"}, why={IN})
     h.run_keys({"k1", "x1", "k3"})
     h.expect("checks", keys={"k2"}, why={IN})
-    assert h.m.ref.checks.entries == 1, "the keys run is kept while k2 is owed"
     h.run_default("checks")
     h.expect("checks", keys=set(), why=set())
 
 
 def test_keys_runs_that_rewrite_every_key_after_a_knob_move_complete_the_pass(history):
     """keys= naming every key completes `checks`' first pass: fresh.
-    `knob` moves: every key is stale (input changed), and a full pass is
-    due. keys=[k1, k2] rewrites every key: that completes the pass, and
-    `checks` is fresh again."""
+    `knob` moves: every key is stale (input changed: each was processed
+    under the old one). keys=[k1, k2] rewrites every key under the new
+    one, and `checks` is fresh again."""
 
     h = history
     h.run_items()
@@ -458,12 +452,12 @@ def test_keys_runs_that_rewrite_every_key_after_a_knob_move_complete_the_pass(hi
     h.expect("checks", keys=set(), why=set())
 
 
-@pytest.mark.xfail(strict=True, reason="the reference models positions and passes: step 5 ports it")
-def test_a_full_pass_spread_over_keys_runs_delivers_each_key_once(history):
-    """`copy` runs (fresh), then its definition changes: a full pass is
-    due, and all its keys are stale for it. keys=[k1] starts the pass over
-    and delivers k1 (`copy` now holds k1 alone, stale); keys=[k1, k2] delivers k2 alone (k1 was delivered in
-    this pass) and completes it: fresh. A default run then delivers
+def test_a_full_run_spread_over_keys_runs_delivers_each_key_it_names(history):
+    """`copy` runs (fresh), then its definition changes: a full run is due,
+    and all its keys are stale for it. keys=[k1] is the full run's first
+    batch: it starts over and delivers k1 (`copy` now holds k1 alone; k2
+    is owed); keys=[k1, k2] delivers both — k1 as it is, loaded because
+    named — and leaves nothing owed: fresh. A default run then delivers
     nothing."""
 
     h = history
@@ -472,8 +466,8 @@ def test_a_full_pass_spread_over_keys_runs_delivers_each_key_once(history):
     h.change_asset("copy")
     h.expect("copy", keys={"k1", "k2"}, why={DEF})
     h.run_keys_on_copy({"k1"})  # the machine checks: {k1} delivered, starting over
-    h.expect("copy", keys={"k1"}, why={DEF})  # rebuilt from k1: what it holds goes stale together
-    h.run_keys_on_copy({"k1", "k2"})  # {k2} alone
+    h.expect("copy", keys={"k1"}, why={IN})  # k2 owed: what it holds goes stale together
+    h.run_keys_on_copy({"k1", "k2"})  # both: k1 unchanged
     h.expect("copy", keys=set(), why=set())
     h.run_default("copy")  # nothing
     h.expect("copy", keys=set(), why=set())
@@ -523,7 +517,6 @@ async def _built(state, tmp_path, keys, **decl):
     return engine, outside
 
 
-@pytest.mark.xfail(strict=True, reason="the reference models positions and passes: step 5 ports it")
 async def test_keys_runs_after_an_upstream_reset_merge_and_together_catch_up(state, tmp_path):
     """The coordinator's example (R2, R4): `items` is reset; `checks` holds
     k1, k2, k3. keys=(k1, k2) updates those two, leaves k3 untouched and
@@ -553,12 +546,10 @@ async def test_keys_runs_after_an_upstream_reset_merge_and_together_catch_up(sta
     assert await index_entries(state, "checks", "") == settled, "the next default run writes nothing"
 
 
-@pytest.mark.xfail(strict=True, reason="the reference models positions and passes: step 5 ports it")
 async def test_a_reset_output_holds_only_what_keys_runs_wrote_until_a_default_run(state, tmp_path):
     """R6: `checks` itself reset (moved) starts empty; keys=(k1) leaves k1
-    alone in it; a default run converges. Stale keys {k2, k3} (missing),
-    and k1 too under (d): a reset record says no knob version until a pass
-    completes (the coordinator's ruling 2, an accepted over-report)."""
+    alone in it, observed as it is; a default run converges. Stale keys
+    {k2, k3}: missing."""
 
     engine, outside = await _built(state, tmp_path, {"k1": "1", "k2": "1", "k3": "1"})
     await engine.stop()
@@ -567,7 +558,7 @@ async def test_a_reset_output_holds_only_what_keys_runs_wrote_until_a_default_ru
     await engine.initialize()
     await drive(engine, await engine.submit(["checks"], keys={"items": {"keys": ["k1"]}}))
     assert set(await keyed_content(engine, p, "checks", column=None)) == {"k1"}
-    assert await staleness.stale_keys(engine, "checks") == {"k1", "k2", "k3"}
+    assert await staleness.stale_keys(engine, "checks") == {"k2", "k3"}
     await drive(engine, await engine.submit(["checks"]))
     assert set(await keyed_content(engine, p, "checks", column=None)) == {"k1", "k2", "k3"}
     assert not await staleness.partition_stale(engine, "checks")
@@ -611,19 +602,18 @@ async def test_a_commit_of_excluded_keys_alone_leaves_their_consumers_fresh(stat
     assert await staleness.partition_stale(engine, "copy")
 
 
-@pytest.mark.xfail(strict=True, reason="the reference models positions and passes: step 5 ports it")
 async def test_a_shared_input_change_makes_every_key_stale(state, tmp_path):
     """`knob`, a dep every key of `checks` shares, changes: every key is
-    stale, though no upstream key changed, and a full pass is due: keys=
-    runs may write part of it (after semantic change (d), every key stays
-    stale until the pass completes), and covering every key completes it."""
+    stale, though no upstream key changed — each was processed under the
+    old one (its context). A keys= run writes k1 under the new one: k1 is
+    fresh, k2 still stale; covering k2 too leaves nothing owed."""
 
     engine, outside = await _built(state, tmp_path, {"k1": "1", "k2": "1"})
     await engine.commit_source("knob", version="1")
     assert await staleness.stale_keys(engine, "checks") == {"k1", "k2"}
     assert await staleness.partition_stale(engine, "checks") and await staleness.asset_stale(engine, "checks")
     await drive(engine, await engine.submit(["checks"], keys={"items": {"keys": ["k1"]}}))
-    assert await staleness.stale_keys(engine, "checks") == {"k1", "k2"}
+    assert await staleness.stale_keys(engine, "checks") == {"k2"}
     await drive(engine, await engine.submit(["checks"], keys={"items": {"keys": ["k2"]}}))
     assert not await staleness.partition_stale(engine, "checks")
 
@@ -638,10 +628,10 @@ async def _change(engine, outside, upserts=(), removes=()):
 
 @pytest.mark.parametrize("then", ["default", "keys"])
 async def test_a_keys_run_on_an_incremental_asset_delivers_each_change_once(state, tmp_path, then):
-    """K45: `copy` (plain incremental) built from k1, k2, k3; k1 and k2
-    change. keys=(k1) delivers k1 alone, and `copy` stays stale (k2). Then
-    a default run delivers k2 alone, never k1 again; or keys=(k2) covers the
-    rest, and the partition's record collapses: `copy` is fresh either way."""
+    """`copy` (plain incremental) built from k1, k2, k3; k1 and k2 change.
+    keys=(k1) delivers k1 alone, and `copy` stays stale (k2). Then a
+    default run delivers k2 alone, never k1 again; or keys=(k2) delivers
+    the rest: `copy` is fresh either way."""
 
     engine, outside = await _built(state, tmp_path, {"k1": "1", "k2": "1", "k3": "1"})
     await _change(engine, outside, upserts=["k1", "k2"])
@@ -660,7 +650,7 @@ async def test_a_keys_run_on_an_incremental_asset_delivers_each_change_once(stat
 
 
 async def test_a_count_kept_from_its_batches_stays_exact_through_a_keys_run(state, tmp_path):
-    """K44's example through a keys= run (K45): `tally` = what it held +
+    """K44's example through a keys= run: `tally` = what it held +
     added - removed. k4 added and k1 removed; keys=(k4) delivers k4 as added;
     the next default run delivers k1's removal alone, never k4 again: the
     tally equals `items`' count after each run."""
@@ -696,14 +686,14 @@ async def test_a_non_each_keyed_outputs_keys_go_stale_together(state, tmp_path):
     assert not await staleness.partition_stale(engine, "copy")
 
 
-@pytest.mark.xfail(strict=True, reason="the reference models positions and passes: step 5 ports it")
 @pytest.mark.parametrize("then", ["keys", "default"])
-async def test_a_full_pass_after_an_asset_change_may_take_several_runs(state, tmp_path, then):
-    """The full pass (Erwin's correction to K45): `copy` holds k1, k2, k3;
-    its version is bumped. keys=(k1) starts the pass over with k1: `copy`
-    holds k1 alone, stale ("definition changed"). Then keys=(k2, k3)
-    continues it, or a default run delivers k2 and k3 and finishes it,
-    without starting over: either way `copy` holds all three, fresh."""
+async def test_a_full_run_after_an_asset_change_may_take_several_runs(state, tmp_path, then):
+    """The full run: `copy` holds k1, k2, k3; its version is bumped.
+    keys=(k1) is the full run's first batch: it starts over with k1, and
+    `copy` holds k1 alone, owing k2 and k3 ("input changed": its
+    definition is the new one now). Then keys=(k2, k3), or a default run,
+    delivers k2 and k3 without starting over: either way `copy` holds all
+    three, fresh."""
 
     engine, outside = await _built(state, tmp_path, {"k1": "1", "k2": "1", "k3": "1"})
     await engine.stop()
@@ -719,7 +709,7 @@ async def test_a_full_pass_after_an_asset_change_may_take_several_runs(state, tm
 
     assert await run(["k1"]) == ({"k1"}, True)
     assert set(await keyed_content(engine, p, "copy", column=None)) == {"k1"}
-    assert await staleness.stale_reasons(engine, "copy") == {staleness.DEFINITION}
+    assert await staleness.stale_reasons(engine, "copy") == {staleness.INPUT}
     assert await run(["k2", "k3"] if then == "keys" else None) == ({"k2", "k3"}, False)
     assert set(await keyed_content(engine, p, "copy", column=None)) == {"k1", "k2", "k3"}
     assert not await staleness.partition_stale(engine, "copy")
@@ -815,7 +805,7 @@ async def test_a_key_updated_and_reverted_changes_nothing(state, tmp_path):
 async def test_a_reset_upstream_and_a_new_version_give_both_reasons(state, tmp_path):
     """The ruling: `items` reset (its content replaced) and then `count`'s
     version bumped: `count` is stale for both, ["input changed",
-    "definition changed"]; one full pass under the new version, reading the
+    "definition changed"]; one full run under the new version, reading the
     new `items`, clears both."""
 
     engine, outside = await _built(state, tmp_path, {"k1": "1"})
@@ -832,8 +822,8 @@ async def test_a_reset_upstream_and_a_new_version_give_both_reasons(state, tmp_p
 
 
 def test_the_reference_reads_the_worked_examples():
-    """The reference itself on the examples above: what the tests hold the
-    engine to."""
+    """The reference itself on worked examples (docs/observed-set.md): what
+    the tests hold the engine to."""
 
     DEF, IN, UP = staleness.DEFINITION, staleness.INPUT, staleness.UPSTREAM
     ref = staleness.Reference(takes=taken)
@@ -842,8 +832,8 @@ def test_the_reference_reads_the_worked_examples():
     for name in ("checks", "copy", "count"):
         ref.run_default(name)
     ref.reset_upstream()
-    assert ref.stale_keys() == {"k1", "k2", "k3"}
-    ref.run_keys({"k1", "k2"})
+    assert ref.stale_keys() == {"k1", "k2", "k3"}  # what it holds, at no upstream version: all owed
+    ref.run_keys({"k1", "k2"})  # the full run starts over from what it holds
     assert ref.stale_keys() == {"k3"} and ref.stale("checks")
     ref.run_keys({"k3"})
     assert ref.stale_keys() == set() and not ref.stale("checks")
@@ -852,13 +842,13 @@ def test_the_reference_reads_the_worked_examples():
     ref.commit(set(), {"k1"})
     assert ref.stale_keys() == {"k1", "k4"}  # so does a key the upstream removed
     ref.change_asset("checks")
-    ref.run_keys({"k1", "k4"})
-    assert ref.stale_keys() == {"k2", "k3"} and ref.reasons("checks") == {DEF}  # written before the change
+    assert ref.reasons("checks") == {IN, DEF} and ref.stale_keys() == {"k1", "k2", "k3", "k4"}
+    ref.run_keys({"k1", "k4"})  # a full run's start-over: k2 and k3 held at no version
+    assert ref.stale_keys() == {"k2", "k3"} and ref.reasons("checks") == {IN}
     ref.reset_checks()
     assert not ref.stale("checks")  # no head: missing, not stale
     ref.run_keys({"k2"})
-    # (d): a reset leaves no full pass behind, and `knob` waits for one: k2 too
-    assert ref.stale_keys() == {"k2", "k3", "k4"}
+    assert ref.stale_keys() == {"k3", "k4"}  # k2 observed as it is; the rest missing
 
     ref = staleness.Reference(takes=taken)  # K39
     ref.change_knob()
@@ -870,35 +860,33 @@ def test_the_reference_reads_the_worked_examples():
     ref.commit({"k1"}, set())
     assert ref.stale("checks") and ref.stale("copy")
 
-    ref.run_default("checks")  # a shared input
+    ref.run_default("checks")  # a shared input: every key held owes its new context
     ref.change_knob()
     assert ref.stale_keys() == {"k1"} and ref.reasons("checks") == {IN}
     assert ref.stale_keys_of("copy") == {"k1"}  # copy holds k1 alone: k1 changed
     assert ref.run_default("copy") == ({"k1"}, False)
     assert not ref.stale("copy") and ref.stale_keys_of("copy") == set()
 
-    ref.commit({"k2", "k3"}, set())  # K45: a keys= run, then the rest
+    ref.commit({"k2", "k3"}, set())  # a keys= run, then the rest
     assert ref.run_keys({"k2"}, "copy") == ({"k2"}, False) and ref.stale("copy")
     assert ref.run_default("copy") == ({"k3"}, False)  # never k2 again
     ref.commit({"k2", "k3"}, set())
-    assert ref.run_keys({"k2", "x1"}, "copy") == ({"k2"}, False)
-    assert len(ref.others["copy"].entries) == 1  # k3 still uncovered
-    assert ref.run_keys({"k3"}, "copy") == ({"k3"}, False) and not ref.stale("copy")  # covered
-    assert ref.others["copy"].entries == []  # nothing left uncovered: collapsed
+    assert ref.run_keys({"k2", "x1"}, "copy") == ({"k2"}, False)  # x1: left out, never held
+    assert ref.run_keys({"k3"}, "copy") == ({"k3"}, False) and not ref.stale("copy")
     assert ref.run_default("copy") == (set(), False)
-    ref.commit({"k2"}, set())  # an entry covers a key only up to the commit it read at
+    ref.commit({"k2"}, set())
     assert ref.run_keys({"k2"}, "copy")[0] == {"k2"}
     ref.commit({"k2"}, set())
-    assert ref.pending("copy") == {"k2"} and ref.run_default("copy") == ({"k2"}, False)
+    assert ref.run_default("copy") == ({"k2"}, False)
 
-    ref.change_asset("copy")  # a full pass over several runs: the coordinator's example
+    ref.change_asset("copy")  # a full run over several runs: the coordinator's example
     assert ref.reasons("copy") == {DEF}
     assert ref.run_keys({"k1"}, "copy") == ({"k1"}, True) and ref.others["copy"].keys == {"k1"}
     assert ref.run_keys({"k2", "k3"}, "copy") == ({"k2", "k3"}, False) and not ref.stale("copy")
     ref.change_asset("copy")
     ref.run_keys({"k1"}, "copy")
     assert ref.run_default("copy") == ({"k2", "k3"}, False) and not ref.stale("copy")
-    ref.reset_upstream()  # a reset owes a pass too, for the input
+    ref.reset_upstream()  # a reset makes a full run due too, for the input
     assert ref.reasons("copy") == {IN} and ref.run_default("copy") == ({"k1", "k2", "k3"}, True)
 
     ref.run_default("count")
@@ -907,7 +895,7 @@ def test_the_reference_reads_the_worked_examples():
     assert ref.stale_keys() == {"k1", "k2", "k3"}  # every key of checks, upstream stale
     ref.change_asset("copy")
     assert ref.reasons("copy") == {DEF, UP}
-    ref.run_items()  # items moved after copy's pass began: its input changed too
+    ref.run_items()  # items moved: copy's input changed too
     assert ref.reasons("copy") == {DEF, IN} and ref.reasons("count") == {IN}
 
     net = staleness.Reference(takes=taken)  # the net delta
@@ -932,45 +920,28 @@ def test_the_reference_reads_the_worked_examples():
     both.reset_upstream()
     both.change_asset("count")
     assert both.reasons("count") == {IN, DEF}
-    both.run_default("count")  # one pass under the new version, reading the new upstream
+    both.run_default("count")  # one full run under the new version, reading the new upstream
     assert both.reasons("count") == set()
     both.change_asset("count")  # due only to the asset change
     assert both.reasons("count") == {DEF}
 
-    capped = staleness.Reference(takes=taken, cap=2)  # the cap counts keys= runs that leave something
-    capped.change_knob()
-    capped.commit({"k1": "1", "k2": "1", "k3": "1"}, set())
-    for name in ("checks", "copy"):
-        capped.run_default(name)
-    capped.commit({"k1": "2", "k2": "2", "k3": "2"}, set())
-    assert capped.run_keys({"k1"}, "copy") == ({"k1"}, False)
-    assert capped.run_keys({"k2"}, "copy") == ({"k2"}, False)
-    assert capped.run_keys({"k3"}, "copy") == "refused"
-    capped.run_default("copy")
-    assert capped.run_keys({"k1"}, "copy") == (set(), False)
-    capped.run_keys({"k1"})  # K47: each=True keeps the same record, capped alike
-    capped.run_keys({"k2"})
-    assert capped.run_keys({"k3"}) == "refused"
-    capped.run_default("checks")
-    assert capped.run_keys({"k1"}) is None
-
-    d = staleness.Reference(takes=taken)  # a dep moving (semantic change (d))
+    d = staleness.Reference(takes=taken)  # a dep moving: context per key
     d.change_knob()
     d.commit({"k1", "k2"}, set())
     assert d.run_default("checks") == {"k1", "k2"}  # the first run: every key
     d.commit({"k1"}, set())
-    assert d.run_default("checks") == {"k1"}  # no pass due: the delta
+    assert d.run_default("checks") == {"k1"}  # what is owed
     d.change_knob()
-    assert d.stale_keys() == {"k1", "k2"} and d.reasons("checks") == {IN}  # and a pass due
+    assert d.stale_keys() == {"k1", "k2"} and d.reasons("checks") == {IN}
     d.run_keys({"k1"})
-    assert d.stale_keys() == {"k1", "k2"}  # one `knob` version per partition
-    assert d.run_default("checks") == {"k2"} and not d.stale("checks")  # what the pass had not
+    assert d.stale_keys() == {"k2"}  # k1 under the new `knob`: fresh
+    assert d.run_default("checks") == {"k2"} and not d.stale("checks")
     d.change_knob()
     d.run_keys({"k1", "k2"})
-    assert not d.stale("checks")  # keys= runs that complete the pass
+    assert not d.stale("checks")
     d.reset_checks()
     d.run_keys({"k2"})
-    assert d.stale_keys() == {"k1", "k2"}  # no `knob` version after a reset: over-reported, accepted
+    assert d.stale_keys() == {"k1"}  # missing
     assert d.run_full() == {"k1", "k2"} and not d.stale("checks")
 
 
@@ -1141,22 +1112,20 @@ def test_a_keys_run_makes_each_named_key_match_its_upstream(kind, tmp_path):
     check()
 
 
-@pytest.mark.xfail(strict=True, reason="the reference models positions and passes: step 5 ports it")
-async def test_a_dep_change_is_an_input_change_and_a_full_pass(state, tmp_path):
-    """Semantic change (d): `knob` (a dep of `checks`) moves. That is an
-    input change, not a definition change: the reason says so and the
-    position's fingerprint (the declaration and run config) stays. The next
-    default run is a full pass all the same: it rewrites every key, and
-    `checks` is fresh after."""
+async def test_a_dep_change_is_an_input_change_owing_every_key(state, tmp_path):
+    """`knob` (a dep of `checks`) moves. That is an input change, not a
+    definition change: the reason says so and the partition's definition
+    stays. Every key was processed under the old `knob`, its context: the
+    next default run rewrites every key, and `checks` is fresh after."""
 
     engine, outside = await _built(state, tmp_path, {"k1": "1", "k2": "1"})
-    fingerprint = state.model.position("checks", "item", "")["fingerprint"]
+    definition = state.model.partition("checks", "")["definition"]
     written = {k: g for k, (g, _) in (await index_entries(state, "checks", "")).items()}
     await engine.commit_source("knob", version="1")
     assert await staleness.stale_reasons(engine, "checks") == {staleness.INPUT}
     assert await staleness.stale_keys(engine, "checks") == {"k1", "k2"}
     await drive(engine, await engine.submit(["checks"]))
-    assert state.model.position("checks", "item", "")["fingerprint"] == fingerprint
+    assert state.model.partition("checks", "")["definition"] == definition
     after = {k: g for k, (g, _) in (await index_entries(state, "checks", "")).items()}
     assert all(after[k] > written[k] for k in written), "every key reprocessed"
     assert not await staleness.partition_stale(engine, "checks")

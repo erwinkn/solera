@@ -149,7 +149,6 @@ async def test_a19_r8_a_failed_key_is_observed_and_retried_by_its_failure_record
         await w.close()
 
 
-@pytest.mark.xfail(strict=True, reason="a pattern change still reads as a definition change until step 5")
 async def test_a19_r9_excluding_every_held_key_owes_their_removal(tmp_path):
     w = await world(tmp_path)
     try:
@@ -283,7 +282,6 @@ async def test_a26_n4_a_row_served_ahead_of_its_commit_is_a_point(tmp_path):
 # -- A27 -------------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(strict=True, reason="a pattern change still reads as a definition change until step 5")
 async def test_a27_r3_a_first_include_owes_the_removal_of_what_it_leaves_out(tmp_path):
     w = await world(tmp_path)
     try:
@@ -364,7 +362,6 @@ async def test_a27_r9_a_removal_restored_at_its_version_is_owed_its_add(tmp_path
         await w.close()
 
 
-@pytest.mark.xfail(strict=True, reason="a pattern change still reads as a definition change until step 5")
 async def test_a27_r10_widening_to_a_key_that_never_existed_changes_no_debt(tmp_path):
     w = await world(tmp_path, include=["k1"])
     try:
