@@ -1605,8 +1605,8 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
         commit["final"] = not more and outcome == "succeeded"  # a canceled run has no final commit
         if outcomes is not None:
             commit["outcomes"] = outcomes
-            if result.get("key_outcomes"):
-                commit["key_outcomes"] = result["key_outcomes"]
+            if result.get("key_outcomes"):  # the history reads them from the result (D178)
+                commit["key_outcomes"] = True
         if keys:
             commit["keys"] = keys
         # What the attempt said of each output version, for the history (§7).

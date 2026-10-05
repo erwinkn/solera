@@ -111,3 +111,23 @@ async def test_a_listing_pages_in_key_order(state):
         if (after := page["next"]) is None:
             break
     assert paged == every["keys"]
+
+
+async def test_the_log_s_rows_are_read_from_results_not_journaled(state):
+    """A commit journals none of its keys' rows (a batch's 10,000 keys
+    each): the history buffers one row standing for the attempt's, and
+    reads them from its sealed result as it writes or answers them."""
+
+    content = {f"{i:02}.csv": {"text": str(i)} for i in range(5)}
+    engine = make_engine(state, files_project(content, parse))
+    await engine.initialize()
+    await run(engine, ["parse"], upstream=True)
+
+    buffered = engine.m.history.rows.get("key_outcomes") or []
+    assert len(buffered) == 1 and buffered[0][1][4] is None  # one row, keyless, for the attempt
+    logged = await engine.history.key_outcomes("parse", limit=100)
+    assert sorted(r["key"] for r in logged["outcomes"]) == sorted(content)
+    await engine.history.lake.flush(force=True)
+    assert not engine.m.history.rows.get("key_outcomes")
+    again = await engine.history.key_outcomes("parse", limit=100)
+    assert sorted(r["key"] for r in again["outcomes"]) == sorted(content)

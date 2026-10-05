@@ -138,6 +138,7 @@ class Lake:
         base_rows: int = 1_000,
         final_rows: int = 1_000_000,
         volatile: tuple[str, ...] = (),
+        expand: dict | None = None,
         pin=contextlib.nullcontext,
     ):
         self.state, self.schema, self.held = state, schema, held
@@ -167,6 +168,10 @@ class Lake:
         self._preparer: ThreadPoolExecutor | None = None
         # rows of `volatile` tables: memory only, never journaled, until a flush writes them
         self.volatile: dict[str, list[list]] = {table: [] for table in volatile}
+        # table -> `expand(values)`, awaited: the rows a buffered row stands for (itself, if
+        # none other), read once, as a flush writes it or a query reads it; memory only
+        self.expand: dict = expand or {}
+        self._expanded: dict[tuple[str, int], list[list]] = {}  # (table, seq) -> its rows
         self.pin = pin  # a context in which the files a query chose are not collected
 
     # -- write path ----------------------------------------------------------------------
@@ -215,7 +220,8 @@ class Lake:
         if not force and count < self.flush_rows and now - oldest < self.flush_seconds:
             return
         upto = {t: rows[-1][0] for t, rows in pending.items()}
-        batches = {t: [values for _, values in rows] for t, rows in pending.items()}
+        await self._expand(list(pending))
+        batches = {t: [values for _, values in self._rows(t, rows)] for t, rows in pending.items()}
         for t, rows in volatile.items():
             batches[t] = batches.get(t, []) + rows
             upto.setdefault(t, 0)
@@ -235,6 +241,29 @@ class Lake:
         self.state.record({"type": f"{self.name}Flushed", "files": files, "upto": upto})
         for table, rows in volatile.items():
             del self.volatile[table][: len(rows)]
+        self._expanded = {k: v for k, v in self._expanded.items() if k[1] > upto.get(k[0], 0)}
+
+    async def _expand(self, tables) -> None:
+        """Read what the buffered rows of `tables` stand for (`expand`), each
+        once. It returns with none missing and no await since its last
+        check: a snapshot taken right after finds every one read."""
+
+        while missing := [
+            (table, seq, values)
+            for table in tables
+            if table in self.expand
+            for seq, values in self.held().rows.get(table) or ()
+            if (table, seq) not in self._expanded
+        ]:
+            for table, seq, values in missing:
+                self._expanded[(table, seq)] = await self.expand[table](values)
+
+    def _rows(self, table: str, rows: list) -> list:
+        """Buffered `[seq, values]` rows as what they stand for, each under its seq."""
+
+        if table not in self.expand:
+            return rows
+        return [[seq, v] for seq, values in rows for v in self._expanded.get((table, seq), ())]
 
     def _time(self, table: str, values: list):
         spec = self.schema[table]
@@ -520,6 +549,7 @@ class Lake:
         on the event loop: the buffers are mirrored, and the transaction
         opened, on the preparing thread, while the files download."""
 
+        await self._expand(tables)
         with self.pin():
             lake = self.held()
             files, chosen = {}, []
@@ -537,7 +567,8 @@ class Lake:
                 files[table] = [(self._local(f["path"]), list(f.get("hidden") or ())) for f in picked]
                 chosen += [f["path"] for f in picked]
             buffers = [
-                (t, lake, lake.generation.get(t, 0), list(lake.rows.get(t) or ()), lake.seq) for t in tables
+                (t, lake, lake.generation.get(t, 0), self._rows(t, list(lake.rows.get(t) or ())), lake.seq)
+                for t in tables
             ]
             if self._preparer is None:
                 self._preparer = ThreadPoolExecutor(1, thread_name_prefix="lake-prepare")

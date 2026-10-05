@@ -1214,18 +1214,9 @@ class Model:
             task.setdefault("progress", {})[input] = progress
         if "outcomes" in commit:
             self._stored(asset, partition, commit["outcomes"])
-        for row in commit.get("key_outcomes") or ():
-            self._record(
-                "key_outcomes",
-                {
-                    **row,
-                    "run": e["run"],
-                    "attempt": e["attempt"],
-                    "asset": asset,
-                    "partition": partition,
-                    "at": at,
-                },
-            )
+        if commit.get("key_outcomes"):  # its keys' rows: the attempt's result holds them
+            row = {"run": e["run"], "attempt": e["attempt"], "asset": asset, "partition": partition, "at": at}
+            self._record("key_outcomes", row)
         for name in changed:
             head = self.heads[(name, partition)]
             self._record(

@@ -750,6 +750,7 @@ class History:
             name="History",
             clock=clock,
             volatile=VOLATILE,
+            expand={"key_outcomes": self._attempt_outcomes},
             pin=lambda: state.model.reading("history/"),
             **lake,
         )
@@ -758,6 +759,20 @@ class History:
     @property
     def m(self):
         return self.state.model
+
+    async def _attempt_outcomes(self, values: list) -> list[list]:
+        """A buffered `key_outcomes` row with no key stands for its attempt's
+        rows, which the attempt's sealed result holds: the commit journals
+        none of them (up to a batch's 10,000 keys each). Nothing, if the run
+        was deleted since."""
+
+        names = list(TABLES["key_outcomes"].columns)
+        row = dict(zip(names, values, strict=True))
+        if row["key"] is not None:
+            return [values]
+        result = await self.state.attempt_result(row["run"], row["attempt"]) or {}
+        stamp = {k: row[k] for k in ("run", "attempt", "asset", "partition", "at")}
+        return [[{**r, **stamp}.get(c) for c in names] for r in result.get("key_outcomes") or ()]
 
     def start(self) -> None:
         self.lake.start()

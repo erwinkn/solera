@@ -703,13 +703,16 @@ processed:
 | `run`, `attempt` | `attempt` holds `attempts.id`, as `commits.attempt` and `lineage.attempt` do |
 | `asset`, `partition`, `key` | |
 | `generation` | the upstream key's generation it processed: its version |
-| `outcome` | `ok`, `rejected`, `failed`, `retrying`, `removed` |
+| `outcome` | `ok`, `removed`, `unmatched`, `rejected`, `failed`, `retrying`, `canceled`, `timed_out` |
 | `error` | class and message |
 | `duration` | seconds in the call |
 | `at` | |
 
-The rows travel in the attempt's result (at most `batch_size` of them) and
-the engine appends them at settlement. They are filed by `run`, so
+The rows travel in the attempt's sealed result (at most `batch_size` of
+them), and stay there: the commit journals one keyless row standing for
+them, which the history reads from the result as it writes the rows out or
+a query reads them (`History._attempt_outcomes`), never 10,000 rows per
+commit through the journal and the checkpoint. They are filed by `run`, so
 retention drops them with their run; the stored outcomes are state and never
 expires. The table counts no rows: how many rows a key produced is the
 store's knowledge.
