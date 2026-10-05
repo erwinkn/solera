@@ -273,7 +273,8 @@ function TaskPanel({
   const tab = search.tab ?? "logs";
   const batched = hasBatches(attempts);
   const planned = attempts.reduce((n, a) => Math.max(n, a.batch?.count ?? 0), 0) || null;
-  const walk = describeProgress(task.progress, planned);
+  // Only a task that walks batches has progress to tell; for the others it is always null.
+  const walk = batched || task.progress != null ? describeProgress(task.progress, planned) : null;
   const tabs: { id: typeof tab; label: string }[] = [
     { id: "logs", label: "Logs" },
     { id: "result", label: "Result" },
@@ -839,7 +840,9 @@ function SpecTab({ run, attempt }: { run: string; attempt: Attempt }) {
                     {plural(Object.keys(pin.refs).length, "partition")} (all partitions)
                   </span>
                 )}
-                {pin.batch && <span className="text-fg-subtle">{describeBatch(pin.batch)}</span>}
+                {pin.batch && (
+                  <span className="text-fg-subtle">{describeBatch(pin.batch, attempt.batch)}</span>
+                )}
               </li>
             ))}
           </ul>
@@ -850,14 +853,14 @@ function SpecTab({ run, attempt }: { run: string; attempt: Attempt }) {
   );
 }
 
-/** What an incremental pin reads, in the spec's own terms: which batch, from which key, how many at most. */
-function describeBatch(batch: Record<string, Json>): string {
+/** What an incremental pin reads: its batch, from the attempt's own record, else the spec's index and keys. */
+function describeBatch(pin: Record<string, Json>, batch: Attempt["batch"]): string {
+  const index = batch?.index ?? (typeof pin.index === "number" ? pin.index : null);
+  const count = batch?.count ?? (typeof pin.count === "number" ? pin.count : null);
   const parts: string[] = [];
-  if (typeof batch.index === "number")
-    parts.push(`batch ${batch.index + 1}${typeof batch.count === "number" ? ` of ~${batch.count}` : ""}`);
-  if (Array.isArray(batch.keys)) parts.push(plural(batch.keys.length, "named key"));
-  else if (typeof batch.after === "string") parts.push(`after ${batch.after}`);
-  if (typeof batch.limit === "number") parts.push(`up to ${batch.limit.toLocaleString("en-US")} keys`);
+  if (index != null) parts.push(batchLabel({ index, count }, pin.final === true));
+  if (batch) parts.push(`${batch.after == null ? "first" : `after ${batch.after}`} → ${batch.last ?? "end"}`);
+  if (Array.isArray(pin.keys)) parts.push(plural(pin.keys.length, "key"));
   return parts.join(" · ");
 }
 

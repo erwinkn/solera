@@ -50,7 +50,7 @@ export function batchLabel(batch: Pick<Batch, "index" | "count">, done?: boolean
   return `batch ${n} of ${done ? "" : "~"}${count(Math.max(batch.count, n))}`;
 }
 
-/** The keys a batch covers, `(after, last]`, as an operator reads it. */
+/** The keys a batch covers, `(after, last]`, as an operator reads it; a null `last` runs to the end. */
 export function BatchRange({
   batch,
   className,
@@ -71,8 +71,8 @@ export function BatchRange({
           <span aria-hidden className="text-fg-subtle">
             →
           </span>
-          <span className="truncate text-fg" title={last ?? "the last key"}>
-            {last ?? "last"}
+          <span className="truncate text-fg" title={last ?? "to the last key"}>
+            {last ?? "end"}
           </span>
         </>
       )}

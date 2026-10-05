@@ -70,9 +70,6 @@ const owes = (o: Observed | null | undefined) =>
 function InputCard({ input, partition }: { input: Input; partition?: string }) {
   const kind = KIND[input.kind];
   const partitions = input.partitions.filter((s) => partition === undefined || s.partition === partition);
-  // What each partition owes comes from the observed set; an engine that predates it says nothing.
-  const observed = input.partitions.some((s) => s.observed !== undefined);
-  const heads = input.partitions.some((s) => s.head_commit != null);
   const owing = input.partitions.filter((s) => owes(s.observed)).length;
   return (
     <Card>
@@ -113,7 +110,7 @@ function InputCard({ input, partition }: { input: Input; partition?: string }) {
                 {input.concurrency != null && `, ${input.concurrency.toLocaleString("en-US")} at once`}
               </span>
             )}
-            {observed && input.partitions.length > 0 && (
+            {input.partitions.length > 0 && (
               <span>
                 · {owing ? `${plural(owing, "partition")} owe${owing === 1 ? "s" : ""} work` : "nothing owed"}
               </span>
@@ -126,20 +123,19 @@ function InputCard({ input, partition }: { input: Input; partition?: string }) {
           Keys taken: <PatternList patterns={input.patterns} />
         </div>
       )}
-      {partitions.length > 0 && (observed || heads) && (
+      {partitions.length > 0 && (
         <TableScroll className="border-t border-line">
           <Table>
             <thead>
               <tr>
                 <Th>Partition</Th>
-                {observed && <Th>Owed to it</Th>}
-                {observed && <Th className="text-right">Observed through</Th>}
-                {heads && <Th className="text-right">Upstream head</Th>}
+                <Th>Owed to it</Th>
+                <Th className="text-right">Observed through</Th>
               </tr>
             </thead>
             <tbody>
               {partitions.map((s) => (
-                <PartitionRow key={s.partition} s={s} observed={observed} heads={heads} />
+                <PartitionRow key={s.partition} s={s} />
               ))}
             </tbody>
           </Table>
@@ -149,7 +145,7 @@ function InputCard({ input, partition }: { input: Input; partition?: string }) {
   );
 }
 
-function PartitionRow({ s, observed, heads }: { s: InputPartition; observed: boolean; heads: boolean }) {
+function PartitionRow({ s }: { s: InputPartition }) {
   const o = s.observed;
   return (
     <Tr>
@@ -159,33 +155,24 @@ function PartitionRow({ s, observed, heads }: { s: InputPartition; observed: boo
           <span className="text-fg-subtle"> ← {s.upstream_partition || "unpartitioned"}</span>
         )}
       </Td>
-      {observed && (
-        <Td>
-          <Owed observed={o} />
-        </Td>
-      )}
-      {observed && (
-        <Td className="text-right text-fg-muted">
-          {o?.observed_at != null ? (
-            <Tooltip content="Every key this partition read was observed at this upstream commit or later.">
-              <span className="tabular">commit {count(o.observed_at)}</span>
-            </Tooltip>
-          ) : (
-            "—"
-          )}
-        </Td>
-      )}
-      {heads && (
-        <Td className="text-right text-fg-muted tabular">
-          {s.head_commit != null ? `commit ${count(s.head_commit)}` : "—"}
-        </Td>
-      )}
+      <Td>
+        <Owed observed={o} />
+      </Td>
+      <Td className="text-right text-fg-muted">
+        {o?.observed_at != null ? (
+          <Tooltip content="Every key this partition read was observed at this upstream commit or later.">
+            <span className="tabular">commit {count(o.observed_at)}</span>
+          </Tooltip>
+        ) : (
+          "—"
+        )}
+      </Td>
     </Tr>
   );
 }
 
 /** What a partition owes this input: a full run, a count per class, nothing, or not known yet. */
-function Owed({ observed: o }: { observed: Observed | null | undefined }) {
+function Owed({ observed: o }: { observed: Observed | null }) {
   if (!o) return <span className="text-xs text-fg-subtle">never read</span>;
   if (o.full_run_due)
     return (

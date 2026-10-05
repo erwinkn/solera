@@ -361,7 +361,7 @@ export interface Explain {
   upstream_asset: string | null;
   upstream_partition: string;
   upstream_generation: number | null;
-  input_state: InputState;
+  input_state?: InputState;
   outputs: Record<string, { present: boolean; generation: number | null }>;
   patterns: {
     spec: Patterns | null;
@@ -392,8 +392,8 @@ export interface Observed {
 export interface InputPartition {
   partition: string;
   upstream_partition: string;
-  head_commit?: number | null;
-  observed?: Observed | null;
+  /** Null until the partition first reads the input. */
+  observed: Observed | null;
 }
 
 export interface Input {
@@ -543,8 +543,8 @@ export interface Task {
   started_at?: number | null;
   finished_at?: number | null;
   /** Its last committed batch's index and end key; `key` null once the walk is done.
-   * Null before the first commit; absent from engines that don't report it. */
-  progress?: Progress | null;
+   * Null before the first commit, and always for a task that walks no batches. */
+  progress: Progress | null;
 }
 
 export interface Progress {
@@ -594,6 +594,7 @@ export interface Attempt extends Partial<Record<Phase, number>> {
   gpu?: number | null;
   peak_memory?: number | null;
   cpu_seconds?: number | null;
+  /** Absent for an attempt of a task that walks no batches (no keyed incremental input). */
   batch?: Batch | null;
 }
 

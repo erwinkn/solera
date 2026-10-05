@@ -197,10 +197,11 @@ read-only endpoints instead (with tests in `tests/server`):
 | `GET /repairs`, `GET /cleanups` | repairs owed (stuck after their run limit), stuck cleanups and removed outputs awaiting their cleanup task |
 | `next_at` on automations | the next scheduled fire, from the engine's own clock rule |
 
-Fields the observed-set rebuild adds as it lands — a task's `progress`, an
-attempt's `batch`, an input partition's `observed`, per-key stale reasons,
-the `pending` partition status, a source's `loader`, `version`, `dims` and
-`observe`, and served versions on source keys — are optional in
-`src/api/types.ts`; a view shows them when the engine sends them and hides
-them otherwise, so the console runs against an engine on either side of the
-rebuild. `src/api/read.ts` reads the few fields whose shape is still settling.
+An attempt's `batch` and a task's `progress` (a task with no keyed
+incremental input has neither), and an input partition's `observed`, come
+from the observed set (rebuild step 4.3). Fields still landing — per-key
+stale reasons, the `pending` partition status (step 5), a source's `loader`,
+`version`, `dims` and `observe`, and served versions on source keys — are
+optional in `src/api/types.ts`: a view shows them when the engine sends
+them and hides them otherwise. `src/api/read.ts` reads the few fields whose
+shape is still settling.
