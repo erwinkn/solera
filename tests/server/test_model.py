@@ -87,15 +87,19 @@ async def settle(engine, run_id):
 
 
 async def held(engine, targets, **kw):
-    """Submit and dispatch without finishing: the attempt stays claimed."""
+    """Submit and dispatch without finishing: the attempt stays launched.
+    Launched, not just claimed: a claim is memory-only until
+    `AttemptLaunched` is durable, so a restart or a cancel before then
+    meets an attempt that never ran."""
 
     run = await engine.submit(targets, **kw)
     task_id = next(t for t in engine.m.runs[run["id"]]["tasks"])
     deadline = asyncio.get_running_loop().time() + 60
-    while task_id not in engine.m.claims:  # claimed: dispatched, however busy the host
-        assert asyncio.get_running_loop().time() < deadline, "never claimed"
+    while not (engine.m.claims.get(task_id) or {}).get("launched"):  # however busy the host
+        assert asyncio.get_running_loop().time() < deadline, "never launched"
         await engine.tick()
         await asyncio.sleep(0.02)
+    await engine.state.durable()
     return run, task_id, engine.m.claims[task_id]["attempt"]
 
 

@@ -149,8 +149,7 @@ class Journal:
         self._buffer_bytes = 0
         self._first_buffered: float | None = None
         self.appended = self.written = 0  # events this engine appended, and wrote
-        self._waiters: list[tuple[int, asyncio.Future]] = []  # (events appended, waiter)
-        self._urgent = False  # someone waits on `durable()`
+        self._waiters: list[tuple[int, asyncio.Future]] = []  # (events appended, waiter): unwritten
         self._sealed: tuple | None = None  # (body, events, count, snapshot): written next, as is
         self._move: tuple | None = None  # (name, size, listed): a checkpoint's move, landed or not
         self._flushing = asyncio.Lock()
@@ -285,7 +284,6 @@ class Journal:
             return
         waiter = asyncio.get_running_loop().create_future()
         self._waiters.append((target, waiter))
-        self._urgent = True
         self._wake.set()
         await waiter
 
@@ -345,7 +343,7 @@ class Journal:
         )
         snap = _dumps({"at": self.clock(), "engine": self.engine, "state": self._snapshot()}) if due else None
         body = self._body(self.engine, self.epoch, self.checkpoint, events)
-        self._buffer, self._buffer_bytes, self._first_buffered, self._urgent = [], 0, None, False
+        self._buffer, self._buffer_bytes, self._first_buffered = [], 0, None
         self._sealed = (body, events, len(new), snap)
 
     async def _take_checkpoint(self, data: bytes) -> None:
@@ -421,12 +419,14 @@ class Journal:
         loop = asyncio.get_running_loop()
         while not self.stopped:
             self._wake.clear()
-            if self._sealed is None and self._move is None:
+            # Someone waits on `durable()`: flush now, lazy events alone included. A
+            # waiter is dropped once written, so this never spins on nothing.
+            if self._sealed is None and self._move is None and not self._waiters:
                 if self._first_buffered is None:
                     await self._wake.wait()
                     continue
                 wait = self._first_buffered + self.flush_interval - loop.time()
-                if wait > 0 and not self._urgent and self._buffer_bytes < self.max_buffer:
+                if wait > 0 and self._buffer_bytes < self.max_buffer:
                     with contextlib.suppress(TimeoutError):
                         await asyncio.wait_for(self._wake.wait(), timeout=wait)
                     continue

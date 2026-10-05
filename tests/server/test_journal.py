@@ -4,6 +4,7 @@ checkpoint's order (list, write, read back, move, delete) — on the local
 filesystem, in memory, and on an S3-compatible server when SOLERA_TEST_S3 is
 set."""
 
+import asyncio
 import json
 import os
 import uuid
@@ -96,6 +97,21 @@ async def test_replay_restores_state(store):
     j2, s2, result = await open_journal(store)
     assert s2.counts == {"a": 2, "b": 1, "c": 1} and result.replayed == 4
     await j2.close()
+
+
+async def test_durable_writes_a_lazy_event_with_nothing_else_buffered(store):
+    """A lazy event waits for the next flush, not for ever: `durable()`
+    makes that flush now, even when nothing else is buffered to start the
+    flush-interval clock (an attempt's handle, recorded after its launch)."""
+
+    j, s, _ = await open_journal(store)
+    record(j, s, "a")
+    await j.durable()
+    s.apply({"type": "Add", "key": "b", "n": 1})
+    j.append(encode({"type": "Add", "key": "b", "n": 1}), lazy=True)
+    await asyncio.wait_for(j.durable(), timeout=10)
+    assert j.written == j.appended
+    await j.close(checkpoint=False)
 
 
 async def test_a_checkpoint_moves_the_journal_and_keeps_one(store):
