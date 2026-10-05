@@ -380,7 +380,9 @@ or no longer taken now). Changes that cancel out deliver nothing; an
 update reverted to the processed version is delivered as `updated`.
 `unchanged` keys are loaded only because a `keys=` run named them. On a
 source read live, classes follow the version the source served, before
-the producer runs (`behaviors.md` INC-2 to INC-7, SRC-4). So a consumer
+the producer runs (`behaviors.md` INC-2 to INC-7, SRC-4); on a fenced
+store, the batch reads exactly the head it was classed at, or is planned
+again (per-key-processing.md §5). So a consumer
 can keep a total from the changes alone:
 
 ```python

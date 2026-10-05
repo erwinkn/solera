@@ -380,6 +380,12 @@ when it changes, why one is held (`TasksHeld`, shown as "held: reason
 (name)"): `claim` (another attempt holds its partition: one of the
 current life, or an earlier life's not yet ended), `concurrency` (its asset's `concurrency=` partitions are
 claimed), `merges` (a key index it writes — an output's, or a per-key asset's outcome index — is too far behind on merges),
+`writing` (an attempt of the upstream of a fenced incremental input holds
+that partition: its rows may show before its commit is installed),
+`repair` (that partition owes a repair: a dead writer's rows show),
+`moved` (its last batch's fenced read saw a newer write than its head: it
+is planned again shortly, for at most `REPLAN_FOR`, 15 minutes, from the
+first such replan in a row — no failure, its retries untouched),
 `engine` (the engine's own slots are full), `executor` (its executor's
 limit), `invalid` (its placement cannot be built).
 

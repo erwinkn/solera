@@ -9,7 +9,9 @@ lose its answer after it committed (`lost`)."""
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import copy
+import types
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
@@ -27,6 +29,9 @@ class Database:
         default_factory=dict
     )  # table -> part -> [(k, commit, row)]
     fences: dict[tuple[str, str], tuple[int, str]] = field(default_factory=dict)
+    # (table, partition) -> the generation of the last write transaction that committed
+    # there: what a read reports with its rows (docs/stores.md, "What a read sees")
+    written: dict[tuple[str, str], int] = field(default_factory=dict)
     locks: dict[tuple[str, str], asyncio.Lock] = field(default_factory=dict)
     commits: int = 0
     # Every committed store transaction: (began at, actor, generation, worker id)
@@ -89,6 +94,8 @@ class TableStore:
                 await asyncio.sleep(delay)  # open, holding the fence row
             if fenced is not None:
                 self.db.fences[(table, context.partition)] = fenced
+                if kind == "store":  # a write marks the partition written as it commits
+                    self.db.written[(table, context.partition)] = fenced[0]
             self.db.tables.setdefault(table, {})[context.partition] = box["rows"]
             self.db.commits += 1
             if kind == "store":
@@ -153,6 +160,7 @@ class TableStore:
                 if key is None:
                     del parts[part]
                     self.db.fences.pop((table, part), None)
+                    self.db.written.pop((table, part), None)
                 else:
                     parts[part] = [r for r in parts[part] if r[0] != key]
 
@@ -163,6 +171,17 @@ class TableStore:
         table = (ref.handle or {}).get("table") or f"rows_{ref.output}"
         held = {r[0] for r in self.db.tables.get(table, {}).get(ref.partition, []) if r[0] is not None}
         yield sorted((k for k in held if among is None or k in among), key=str.encode)
+
+    @contextlib.asynccontextmanager
+    async def reads(self):
+        """One moment: each load returns its rows and the generation whose
+        write last committed in the partition, read together."""
+
+        yield types.SimpleNamespace(load=self._read)
+
+    async def _read(self, ref, t, selection):
+        table = (ref.handle or {}).get("table") or f"rows_{ref.output}"
+        return await self.load(ref, t, selection), self.db.written.get((table, ref.partition))
 
     async def load(self, ref, t, selection) -> list[dict]:
         table = (ref.handle or {}).get("table") or f"rows_{ref.output}"

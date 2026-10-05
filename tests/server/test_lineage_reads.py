@@ -3,9 +3,10 @@ read sees"; docs/versions.md §6): an attempt's reads of PostgresStore see
 one moment, and say which generation's write they saw. Lineage records the
 pin's generation and the one read: exact when they agree; when a newer
 write landed, the generation read, flagged `uncommitted` until a commit
-installs it. Skips unless SOLERA_TEST_DATABASE_URL points at a scratch
+installs it — for a whole read; a batch of keys is planned again instead. Skips unless SOLERA_TEST_DATABASE_URL points at a scratch
 database."""
 
+import asyncio
 import os
 import uuid
 
@@ -108,14 +109,26 @@ async def test_lineage_says_what_a_current_read_saw(state):
         Ref.from_json(head),
         WriteContext(output=out, partition="", attempt="x", generation=newer, worker_id="x"),
     )
-    await run(engine, ["report", "changes"])
+    await run(engine, ["report"])
 
-    # A read of a write no commit installed: flagged; the pin in `detail`.
-    for param in ("report", "changes"):  # a whole read, and a batch of keys
-        edge = (await edges(engine, state, param))["sites"]
-        assert edge["from"]["generation"] == newer
-        assert edge["uncommitted"] == {"attempt": None, "run": None}  # written outside the engine
-        assert edge["detail"]["pinned_generation"] == pinned
+    # A whole read of a write no commit installed: flagged; the pin in `detail`.
+    edge = (await edges(engine, state, "report"))["sites"]
+    assert edge["from"]["generation"] == newer
+    assert edge["uncommitted"] == {"attempt": None, "run": None}  # written outside the engine
+    assert edge["detail"]["pinned_generation"] == pinned
+
+    # A batch of keys never reads it: classed at the head, it must read the head, so
+    # it is planned again, no failure, until a commit installs what it saw
+    # (docs/observed-set.md, "A fenced store names the commit it read").
+    later = await engine.submit(["changes"])
+    [task] = state.model.runs[later["id"]]["tasks"].values()
+    for _ in range(3000):
+        await engine.tick()
+        if (task.get("held") or [None])[0] == "moved":
+            break
+        await asyncio.sleep(0.01)
+    assert task["held"] == ["moved", f"{name}/"] and task["outcomes"] == {"replanned": 1}
+    await engine.cancel(later["id"])
 
     # Its attempt is known: the edge names it, still uncommitted.
     from solera_server.history import attempt_row, commit_row

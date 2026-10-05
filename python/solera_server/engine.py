@@ -632,6 +632,8 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
                 held[task_id] = ["concurrency", task["asset"]]
             elif behind is not None:
                 held[task_id] = ["merges", behind]
+            elif (writing := self._writing(task)) is not None:
+                held[task_id] = writing
             elif not is_pool and engine_used >= self.concurrency:
                 held[task_id] = ["engine", None]
             elif limit is not None and executor_used.get(executor, 0) >= limit:
@@ -668,6 +670,38 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
             async for d in owed._diffs(index, since, None, None, None):
                 (elements.add if d.after else elements.discard)(d.key)
         return sorted(elements)
+
+    def _writing(self, task: dict) -> list | None:
+        """Why a task must wait for a fenced input's partition, or None: an
+        attempt of its upstream holds it — its rows may be visible before its
+        commit is installed — or it owes a repair, a dead writer's rows
+        visible. A batch read now would read a write its head does not hold,
+        and be planned again (docs/observed-set.md): it waits instead, for
+        as long as the upstream's write takes."""
+
+        manifest = self.manifest
+        fenced = set()
+        for spec in ((manifest["assets"].get(task["asset"]) or {}).get("inputs") or {}).values():
+            out = manifest["outputs"].get(spec.get("output")) or {}
+            store = (manifest.get("stores") or {}).get(out.get("store")) or {}
+            if (
+                spec.get("kind") == "incremental"
+                and out.get("key") is not None
+                and store.get("writes") == "fenced"
+            ):
+                fenced.add(spec["output"])
+        if not fenced:
+            return None
+        for input in self.planner().inputs(task["asset"], task["partition"]):
+            if input.output not in fenced or input.partition is None:
+                continue
+            where = f"{input.output}/{input.partition}"
+            holder = self.m.claimed_partitions.get((input.owner, input.partition))
+            if input.owner is not None and holder is not None and self.m.claimed(holder) is not None:
+                return ["writing", where]
+            if (input.output, input.partition) in self.m.repairs:
+                return ["repair", where]
+        return None
 
     def _merges_behind(self, names: list[str], partition: str) -> str | None:
         """The first of the key indexes `names` in `partition` that upkeep has

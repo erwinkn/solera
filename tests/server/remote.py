@@ -5,6 +5,8 @@ file swaps (`own`, `as_worker`, `finish_as_worker`) — and reads them back
 writes the tests watch."""
 
 import asyncio
+import contextlib
+import types
 
 from solera import lifecycle
 from solera.executors import Executor
@@ -142,15 +144,22 @@ REMOTE = Project(assets=[remote], executors=[Fake("fake")], default_store=Gated(
 
 class LiveStore(FileStore):
     """A row store read in place, like a database table: what a dead attempt
-    wrote is visible. `die` makes the next write land its first n rows, then
-    kills the worker."""
+    wrote is visible. Each write marks the partition with its generation as
+    it lands (`written`), which `reads()` reports with the rows, as
+    PostgresStore does. `die` makes the next write land its first n rows,
+    then kills the worker; `hold`, an event, keeps a write open once its
+    rows landed — the store committed, the engine not yet told; `before_read`,
+    a coroutine function, runs once as the next read takes its snapshot."""
 
     writes = "fenced"
 
     def __init__(self):
         super().__init__()
         self.rows: dict[str, dict] = {}
+        self.written: dict[str, int] = {}
         self.die: int | None = None
+        self.hold: asyncio.Event | None = None
+        self.before_read = None
 
     async def acquire(self, context, prior=None):
         pass
@@ -167,6 +176,7 @@ class LiveStore(FileStore):
             rows = rows.to_pylist()
         if not patch:
             self.rows.clear()
+        self.written[context.partition or ""] = int(context.generation)
         for n, row in enumerate(rows):
             if self.die is not None and n == self.die:
                 self.die = None
@@ -174,7 +184,19 @@ class LiveStore(FileStore):
             self.rows[row["id"]] = dict(row)
         for key in write.remove if patch else ():
             self.rows.pop(key, None)
+        if self.hold is not None:
+            await self.hold.wait()
         return Written(Ref(context.output.name, "live", {}, context.partition))
+
+    @contextlib.asynccontextmanager
+    async def reads(self):
+        if self.before_read is not None:
+            hook, self.before_read = self.before_read, None
+            await hook()
+        yield types.SimpleNamespace(load=self._read)
+
+    async def _read(self, ref, t, selection):
+        return await self.load(ref, t, selection), self.written.get(ref.partition or "")
 
     def keys(self, ref, among=None):
         """The keys it holds, sorted by their bytes: what a repair asks."""

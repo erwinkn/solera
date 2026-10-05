@@ -271,16 +271,27 @@ index": the index at `H` and the rows are one state.
 - **Several generations.** It holds for a partition written by many: a
   commit is cumulative, so the commit of the last write, `G`, describes
   the whole partition, earlier writes included.
+- **The engine plans, the read checks.** The engine classes a batch at
+  prepare, at the head its claim reserves, and its worker reads no index.
+  So the read checks instead of choosing: `G` must be that head's
+  generation. A newer one — a write that committed in the store after the
+  batch was planned, installed since or not yet — plans the batch again
+  at the newer head, before the producer runs. A replan is no failure:
+  the task's retries are untouched, the attempt ends `replanned`, and the
+  task waits shortly (held: `moved`), for at most `REPLAN_FOR` (15
+  minutes) from the first replan in a row.
 - **`G` names no installed commit** — its write committed in the store,
-  its `AttemptFinished` not durable yet, or a dead writer's partial write:
-  the read saw uncommitted data. It retries, bounded, then fails the read.
-  A dead writer's partition reads again once its repair commits (a repair
-  always writes, so `written` becomes the repair's generation); until then
-  its consumers' batches fail, so a partition owing a repair must come due
+  its `AttemptFinished` not durable yet, or a dead writer's partial write.
+  The engine knows both: while an upstream attempt holds the partition,
+  or the partition owes a repair, its consumers' batches wait (held:
+  `writing`, `repair`) rather than read and replan in a loop, however long
+  the upstream's batch takes. A dead writer's partition reads again once
+  its repair commits (a repair always writes, so `written` becomes the
+  repair's generation), so a partition owing a repair must come due
   promptly, not wait for its next scheduled run.
 - **`G` older than the index head** does not happen on a fenced store, whose
-  commits install only after their writes; if it did, `H` would simply be
-  older, and the classes exact at `H`.
+  commits install only after their writes; if it did, the batch would be
+  planned again all the same.
 - **Retention.** The claim reserves the head at dispatch; `H` is that head,
   or a commit installed since, both kept.
 
@@ -594,11 +605,11 @@ and `_snapshot_read`; `caught_up` (now `complete`, derived from `R`),
 worker's index reads for a batch (`read_batch`, the retry walk, the
 failure lookups — the engine plans every batch and the spec carries its
 keys, classes, old observations and prior stored outcomes); the
-`fingerprint`, now the `definition`. Still to go: `Batch.full`, replaced
-by `Batch.reset` (D166, with the SDK contract); D100's rowless deliveries
-and `gone_since`'s early removal, for stores that do not serve (with
-fenced stores' reads); the index's `changes(lower=)`, which nothing calls
-(with the index switch). Kept: the key index and its Δ, endpoint
+`fingerprint`, now the `definition`; D100's rowless deliveries,
+`gone_since`'s early removal and the fenced `SourceBehind` path (a fenced
+read names its head, or the batch is planned again); the index's
+`changes(lower=)` (with the index switch). Still to go: `Batch.full`,
+replaced by `Batch.reset` (D166, with the SDK contract). Kept: the key index and its Δ, endpoint
 reservation and the claim's reader pin, the outcome index and retries,
 D111's bounds; an unkeyed upstream's observation is the one commit it
 last read.
@@ -698,11 +709,12 @@ run(R):
     while prev is not LAST:
         keys = the next batch_size keys of todo after prev
         c = keys[-1] if todo goes on past it else LAST
+        wait while an upstream attempt holds a fenced input's partition, or it owes a repair
         H = the head now, pinned by the batch's claim
-        if the store is fenced:                    # one snapshot: rows and G together
-            G = the partition's written generation; H = its commit (retry, bounded, if none)
         owed_here = {k: classify(R, k, at H) for k in candidates(R, H) within (prev, c]}
         load the keys owed_here owes, plus any other key the run asked for (unchanged)
+        if the store is fenced:                    # one snapshot: rows and G together
+            if G != generation(H): plan this batch again at the newer head (not a failure)
         if the store is a source: reclassify each from what was served
         call the producer
         if not may_commit(batch, R, now):

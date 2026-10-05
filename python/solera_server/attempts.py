@@ -31,6 +31,7 @@ log = logging.getLogger(__name__)
 LIVE_LINES = 10_000  # live log lines kept per attempt for the console
 POOL_OFFERED_GRACE = 10.0  # an offered pool attempt not started this long: look for its claim
 POOL_PAGE = 8  # attempts one discovery answer offers
+REPLAN_DELAY = 1.0  # seconds before a batch whose fenced read moved past its head is planned again
 
 
 async def _unless(stirred: asyncio.Event, work):
@@ -684,6 +685,21 @@ class Attempts:
                 result=result,
                 end="canceled",
                 reason=reason,
+            )
+            return
+        if status == "replan":
+            # A fenced read saw a newer write than the batch's head: planned again at
+            # the newer head shortly, never a failure (docs/observed-set.md).
+            output, partition = result.get("moved") or ("?", "")
+            await self._fail(
+                task_id,
+                attempt,
+                str(result.get("error") or "the store moved past the planned head"),
+                outcome="replanned",
+                retryable=True,
+                delay=REPLAN_DELAY,
+                result=result,
+                reason=f"{output}/{partition}",
             )
             return
         if status == "failed":

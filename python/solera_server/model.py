@@ -46,6 +46,9 @@ MAX_RECEIPTS = 10_000  # idempotency receipts kept for replayed submissions
 STUCK_AFTER = 3  # misses before a clean up entry is stuck (docs/lifecycle.md §9.8)
 REPAIR_RUNS = 3  # runs the repair clock gives a partition a dead writer left owing a repair
 REPAIR_SPACING = 60.0  # seconds between them: 60, then 120 (the spacing doubles)
+# seconds a batch is planned again while its fenced reads keep moving past its head,
+# from the first replan in a row (a wait on the upstream's writer starts it again)
+REPLAN_FOR = 900.0
 
 
 def _nest(flat: dict, depth: int) -> dict:
@@ -951,14 +954,17 @@ class Model:
     def _on_TasksHeld(self, e):
         """Why tasks ready to run are not claimed (`[reason, name]`): the
         engine is full, their executor is, another attempt holds their
-        partition, or an output's merges are far behind. Only a change of
-        reason is an event."""
+        partition, an output's merges are far behind, or an attempt is
+        writing a fenced input's partition or it owes a repair (`writing`,
+        `repair`). Only a change of reason is an event."""
 
         for tid, held in sorted(e["held"].items()):
             task = self.task(tid)
             if task is None or task["status"] != "queued" or task.get("held") == held:
                 continue
             task["held"] = held
+            if held[0] in ("writing", "repair"):  # the wait has its reason: replans start afresh
+                task.pop("replanning_since", None)
             self._event(self.runs[task["run"]], "held", e["at"], tid, reason=held[0], name=held[1])
 
     def _on_EngineOutage(self, e):
@@ -1066,6 +1072,8 @@ class Model:
         if found := history.batch(prepared.get("plans")):
             summary["batch"] = found
         self._tried(run, task, summary)
+        if outcome != "replanned":
+            task.pop("replanning_since", None)
         if commit and outcome in ("canceled", "failed"):
             # A drained Each batch: what finished commits (docs/lifecycle.md §7).
             self._install(task, commit, e, prepared)
@@ -1106,6 +1114,16 @@ class Model:
                     # Failed for good: kept, shown with why, never run again until an
                     # operator clears it (`solera cleanups OUTPUT --clear`, K25).
                     self._stuck(task, prepared, str(e.get("error") or "failed"))
+                self._finished(run, task, "failed", e["attempt"], at)
+        elif outcome == "replanned":
+            # Its fenced read saw a newer write than its head: no failure, its budget
+            # untouched — planned again shortly at the newer head, waiting for why.
+            since = task.setdefault("replanning_since", at)
+            if at < since + REPLAN_FOR:
+                self._ready(run, task, at, float(e.get("delay") or 0), why=["moved", e.get("reason")])
+            else:
+                task["status"] = "failed"
+                task["error"] = f"{e.get('error')}: still moving after {REPLAN_FOR:g}s"
                 self._finished(run, task, "failed", e["attempt"], at)
         elif outcome == "canceled" and commit:
             task["status"] = "canceled"  # a drained batch the user stopped: it does not resume
@@ -1301,10 +1319,11 @@ class Model:
                 if entry not in auto["pending"]:
                     auto["pending"].append(entry)
 
-    def _ready(self, run: dict, task: dict, at: float, delay: float = 0.0) -> None:
+    def _ready(self, run: dict, task: dict, at: float, delay: float = 0.0, why: list | None = None) -> None:
         """Queue a task to run from `at + delay`: its wait starts then,
-        unless its run is paused. A task whose asset left the project while
-        its attempt ran — a retry, a next batch — is retired instead."""
+        unless its run is paused. `why` it waits, if not for a retry: held
+        until then. A task whose asset left the project while its attempt
+        ran — a retry, a next batch — is retired instead."""
 
         if (
             self.manifest is not None
@@ -1318,7 +1337,10 @@ class Model:
         task["ready_at"] = due
         task["queued_at"] = None if run.get("paused") else due
         self.queue[task["id"]] = due
-        if delay:
+        if why is not None:
+            task["held"] = why
+            self._event(run, "held", at, task["id"], reason=why[0], name=why[1], until=due)
+        elif delay:
             self._event(run, "retry_scheduled", at, task["id"], until=due)
         else:
             self._event(run, "ready", at, task["id"])

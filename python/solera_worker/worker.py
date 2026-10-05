@@ -405,12 +405,7 @@ async def _resolve_inputs(spec, project, asset, keys_io, timeline, observed: Obs
             load = {k: g for k, cls, _, g, _ in keys if cls != "removed"}
             args[param] = await observed.load(store, ref, t, Keys(load))
             served = getattr(store, "served", None)
-            if served is None:
-                # Not a source: rows follow the store, classes the index (D100). A key a
-                # current-only store no longer has is delivered in its class with no
-                # row, unless the head still names it: the store is behind, SourceBehind.
-                key = _key_column(project, ref.output)
-                await each.gone_since(ref.output, key, args[param], load, pin, keys_io)
+            each.check_read(store, ref, observed)  # rows and classes: one state
             classes, seen = each.observe(keys, served)
             batch[param] = Batch(
                 rows=args[param],
@@ -1332,6 +1327,8 @@ async def _execute(
         return None
     except _Stop:
         raise
+    except each.Moved as moved:  # before the producer ran: nothing written, planned again
+        return {"status": "replan", "error": str(moved), "moved": [moved.output, moved.partition]}
     except StoreError as error:
         return _failed(error, getattr(error, "retryable", False))
     except Exception as error:

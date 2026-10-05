@@ -25,7 +25,7 @@ from solera.key_outcomes import REMOVED, UNMATCHED, Outcome, StoredOutcome, lowe
 from solera.keys import SortedEntries
 from solera.keys.layers import LayerIndex, LayerState, key_bytes
 from solera.sdk import UNSET, Ref, Result
-from solera.stores import Keys, Patch, SourceBehind, missing_keys
+from solera.stores import Keys, Patch, StoreError
 from solera.tasks import Tasks
 
 from .sources import reader
@@ -89,25 +89,34 @@ class _Abort(Exception):
         self.error = error
 
 
-async def gone_since(output: str, key: str | None, value, expected: dict, pin: dict, keys_io) -> list[str]:
-    """The keys of a batch a load by `Keys(expected)` did not answer, decided
-    against the source's head index, not the pass's commit: a store of
-    current rows serves only its newest state. A key the head still names
-    the store lacks: the store is behind its index, `SourceBehind`,
-    retryable and bounded. One the head lacks too was removed since:
-    returned. A plain batch still delivers it in its class, with no row
-    (D100); a per-key batch drops its outputs now, which its own index
-    makes harmless to do twice."""
+class Moved(Exception):
+    """A fenced store's read saw a newer write than the head its batch was
+    planned at (docs/observed-set.md, "A fenced store names the commit it
+    read"): its rows and its classes would disagree, so the batch is planned
+    again at the newer head — never a failure."""
 
-    missing = missing_keys(key, value, expected)
-    if not missing:
-        return []
-    head = LayerIndex(keys_io, LayerState.from_json(pin.get("head") or pin["index"]))
-    held = await head.lookup([key_bytes(k) for k in missing])
-    for k in missing:
-        if key_bytes(k) in held:
-            raise SourceBehind(f"{output}: the source index says {k}@{expected[k]} but the source has no {k}")
-    return missing
+    def __init__(self, output: str, partition: str, read: int | None, planned: int):
+        super().__init__(
+            f"{output}: the store moved past the planned head (read generation {read}, planned {planned})"
+        )
+        self.output, self.partition = output, partition
+
+
+def check_read(store, ref: Ref, observed) -> None:
+    """A batch the engine classed at the head `ref` names must read exactly
+    that state. A source says what it served, and classes follow it; an
+    immutable store reads what was pinned; a fenced store says which write
+    its snapshot saw (`reads()`), and must have seen the head's."""
+
+    if getattr(store, "served", None) is not None or store.writes != "fenced":
+        return
+    if not callable(getattr(store, "reads", None)):
+        raise StoreError(
+            f"{ref.output}: a fenced store backs an incremental input only if it says what it read"
+        )
+    seen = observed.read.get((ref.output, ref.partition or ""))
+    if seen is not None and seen["generation"] != ref.generation:
+        raise Moved(ref.output, ref.partition or "", seen["generation"], ref.generation)
 
 
 def read_each_batch(pin: dict) -> Batch:
@@ -169,10 +178,7 @@ async def run(spec, project, asset, param: str, pin: dict, args: dict, ctx, keys
                     batch.observed[k] = served[k]
         batch.upserted = {k: g for k, g in batch.upserted.items() if k in keep}
     else:
-        for key in await gone_since(ref.output, None, loaded, batch.upserted, pin, keys_io):  # by key
-            del batch.upserted[key]
-            batch.deleted.append(key)
-            batch.observed[key] = None
+        check_read(store, ref, ctx._observed)
     await ctx._observed.close()  # the inputs' moment ends before the calls
     decls = {o.name or asset.name: o for o in asset.outputs}
     is_async = inspect.iscoroutinefunction(asset.fn)

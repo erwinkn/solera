@@ -314,6 +314,11 @@ repeatable — so such a store says what it read, with `reads()`:
   `solera.fencing` does both: `fence(cur, context, domain, write=True)` in
   a write, `written(cur, domain, partition)` in a read. None if no fenced
   write changed the partition.
+- **What an incremental consumer needs.** A batch of keyed changes is
+  classed at a head and must read exactly it: a fenced store backs an
+  incremental input only with `reads()`, and a read whose generation is
+  newer than the batch's head plans the batch again (docs/observed-set.md,
+  "Observations: what was read").
 
 The engine records it as lineage, which names what was read: a snapshot
 store's read is the pinned generation; a current read is the generation

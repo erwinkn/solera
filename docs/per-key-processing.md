@@ -265,6 +265,19 @@ processed as absent, and a later commit restoring it delivers it again.
 So a count kept from the classes stays exact (`behaviors.md` SRC-4,
 SRC-5).
 
+**A fenced store read live.** A batch's classes and its rows are one
+state (docs/observed-set.md, "Observations: what was read"). A fenced
+store's read names the write its snapshot saw (`reads()`), and it must be
+the batch's head: a newer one — a write that landed after the batch was
+planned — plans the batch again at the newer head, before the producer
+runs. That is no failure: the task's retries are untouched, and the
+attempt ends `replanned`. While an upstream attempt holds the partition's
+writer, or the partition owes a repair, its consumers' batches wait
+(held: `writing`, `repair`) instead of reading a write the index does not
+hold yet. So a count kept from the classes stays exact, and a key in
+added or updated always comes with its row. A fenced store without
+`reads()` cannot back an incremental input: its reads fail.
+
 ## 6. Every key is a group
 
 ```python
