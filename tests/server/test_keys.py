@@ -23,7 +23,7 @@ from solera_server.keyservice import KeyService
 from solera_server.state import State, Unavailable
 
 from tests.conftest import whole
-from tests.server.test_collection import cleaned
+from tests.server.test_collection import GUARD, cleaned
 
 
 def engine_for(state, project, **kw):
@@ -38,7 +38,7 @@ def engine_for(state, project, **kw):
 
 
 async def run(engine, targets, **kw):
-    detail = await engine.run_until((await engine.submit(targets, **kw))["id"], 60)
+    detail = await engine.run_until((await engine.submit(targets, **kw))["id"], GUARD)
     assert detail["request"]["status"] == "succeeded", str(detail)[-3000:]
     return detail
 

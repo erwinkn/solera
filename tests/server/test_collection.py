@@ -30,9 +30,12 @@ GUARD = 300.0  # seconds: a deadlock guard on a run settling, never a timing ass
 async def cleaned(engine) -> list[dict]:
     """Every cleanup due, run until none is: each wait is on a cleanup run
     settling, whose result acknowledges its entries and its step only once
-    their deletes are done. Their runs' details."""
+    their deletes are done. Workers still finishing after their runs settled
+    are waited for first: what is due is decided once they are done. Their
+    runs' details."""
 
     done = []
+    await worker_finished()
     for _ in range(50):
         engine._submit_cleanups()
         pending = [
@@ -318,10 +321,10 @@ async def test_a_reader_pin_at_commit_keeps_the_garbage_queued(tmp_path, data):
     await state.close()
 
 
-async def test_a_run_is_settled_before_its_worker_has_cleaned_up(tmp_path, data, monkeypatch):
-    """Review round 3, S2: a run reads settled while the cleanup task its
-    commit made due is still under way; tests wait for that task, never for
-    a while."""
+async def test_a_run_is_settled_before_its_cleanup_has_run(tmp_path, data, monkeypatch):
+    """Review round 3, S2: a run reads settled while the cleanup its commit
+    made due (a cleanup task's step, D168) is still under way; tests wait
+    for that step's acknowledgement, never for a while, nor for workers."""
 
     cleanup, go = FileStore.cleanup, asyncio.Event()
 
@@ -334,16 +337,16 @@ async def test_a_run_is_settled_before_its_worker_has_cleaned_up(tmp_path, data,
     state = await State.open(tmp_path.as_uri(), "test", flush_interval=0.001)
     engine = engine_for(state, project)
     await engine.initialize()
-    await engine.run_until((await engine.submit(["scores"]))["id"], 20)
-    go.set()
-    await worker_finished()
-    go.clear()
-    settled = await engine.run_until((await engine.submit(["scores"]))["id"], 20)
+    await run(engine, ["scores"])  # nothing superseded yet
+    settled = await engine.run_until((await engine.submit(["scores"]))["id"], GUARD)  # supersedes `a`
     assert settled["request"]["status"] == "succeeded"
-    assert objects(data, "scores") != await named(state, "scores")  # the worker is still cleaning up
+    assert objects(data, "scores") != await named(state, "scores")  # its cleanup is still to come
+    assert state.model.cleaning[("scores", "")]  # queued, not acknowledged
     go.set()
-    await worker_finished()
+    await cleaned(engine)
     assert objects(data, "scores") == await named(state, "scores")
+    await engine.stop()
+    await state.close()
 
 
 async def test_a_slow_reader_holds_back_only_what_it_reads(tmp_path):
