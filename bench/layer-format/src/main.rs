@@ -243,6 +243,7 @@ fn main() {
         a.get("coalesce", 64u64 << 10),
         std::sync::atomic::Ordering::Relaxed,
     );
+    pq::BATCH_ROWGROUP.store(a.s("pq_batch", "selection") == "rowgroup", std::sync::atomic::Ordering::Relaxed);
     pq::UNIT_PAGES.store(
         a.get("unit_pages", 2usize),
         std::sync::atomic::Ordering::Relaxed,

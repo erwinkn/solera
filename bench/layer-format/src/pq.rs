@@ -32,6 +32,10 @@ use std::io::Write;
 use std::ops::Range;
 use std::sync::Arc;
 
+/// Decode a unit in a batch the size of its whole row group (`pq_batch=rowgroup`),
+/// as an ablation: the reader then allocates for rows it never decodes.
+pub static BATCH_ROWGROUP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Key pages per read unit (`unit_pages=`).
 pub static UNIT_PAGES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(2);
 
@@ -421,7 +425,11 @@ impl Meta {
         };
         // One batch of exactly the rows selected: a larger batch size would
         // have the reader allocate for rows it never decodes.
-        let rows = sel.row_count();
+        let rows = if BATCH_ROWGROUP.load(std::sync::atomic::Ordering::Relaxed) {
+            self.meta.row_group(rg).num_rows() as usize
+        } else {
+            sel.row_count()
+        };
         ParquetRecordBatchReaderBuilder::new_with_metadata(r, self.arrow.clone())
             .with_row_groups(vec![rg])
             .with_row_selection(sel.clone())
