@@ -285,5 +285,5 @@ dependency cost, into `results/`. `run.sh NAME ARGS` runs one configuration;
 `report.py`, `headline.py`, `variants.py` and `ablations.py` turn the JSON
 lines into these tables. The numbers above were made by its pieces, run one
 by one with the same arguments; the script as a whole was smoke-run at 1M
-keys (`RESULTS=… SCALES=1000000 VKEYS=1000000 AKEYS=1000000`: 556
+keys (`RESULTS=… SCALES=1000000 VKEYS=1000000 AKEYS=1000000`: 464
 measurements, 0 mismatches).
