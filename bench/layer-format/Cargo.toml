@@ -1,0 +1,24 @@
+[package]
+name = "layer-format"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# T44 spike: MVCC change-index layers in our block format vs Parquet.
+[dependencies]
+parquet = { version = "60", default-features = false, features = ["arrow", "async", "zstd"] }
+arrow-array = "60"
+arrow-schema = "60"
+arrow-buffer = "60"
+arrow-ipc = "60"
+bytes = "1"
+futures = "0.3"
+tokio = { version = "1", features = ["rt", "time", "sync", "macros"] }
+zstd = "0.14"
+rand = { version = "0.9", features = ["small_rng"] }
+serde_json = "1"
+libc = "0.2"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+
+[profile.release]
+debug = 1
