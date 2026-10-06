@@ -279,9 +279,11 @@ committed over 30 days, under the brief's estimate of about 5.
 ## Reproduce
 
 `bench/layer-format/all.sh` (~2 h on the 96-core machine, at most two runs
-at once, each in a systemd scope capped at 12 cores): the 10M and 100M
-finals, the DuckDB comparison, the dependency cost. `run.sh NAME ARGS` runs
-one configuration; `report.py`, `headline.py` and `variants.py` turn the
-JSON lines into these tables, `ablations.py` the ablations. The variants
-(`variant-*`) and ablations (`ablation-*`) in `results/` were run as
-`all.sh` runs them.
+at once, each in a systemd scope capped at 12 cores and 110 GB): the 10M and
+100M finals, the variants, the ablations, the DuckDB comparison and the
+dependency cost, into `results/`. `run.sh NAME ARGS` runs one configuration;
+`report.py`, `headline.py`, `variants.py` and `ablations.py` turn the JSON
+lines into these tables. The numbers above were made by its pieces, run one
+by one with the same arguments; the script as a whole was smoke-run at 1M
+keys (`RESULTS=… SCALES=1000000 VKEYS=1000000 AKEYS=1000000`: 556
+measurements, 0 mismatches).
