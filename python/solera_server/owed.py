@@ -179,8 +179,19 @@ async def candidates(
             )
             stream = _merged(changed, _live(index, now.head, start, hi))
             whole = True
-        found = []
+
+        def point(key, at_h=at_h):
+            p = rec["points"][key]
+            old = (p["version"], rec["contexts"].get(p["context"], {})) if p["present"] else None
+            d = at_h.get(key)
+            return _owe(key, old, d if d is not None and take(key) else None, now.context, versioned=True)
+
+        left = iter(mine)  # the segment's points, merged in as the stream passes them: nothing collected
+        nxt = next(left, None)
         async for key, before, current in stream:
+            while nxt is not None and nxt < key:
+                yield point(nxt)
+                nxt = next(left, None)
             if key in rec["points"]:
                 continue
             if layer.get("held"):
@@ -198,16 +209,10 @@ async def candidates(
                 d = before
                 old = (None, context) if d.before and then(key) else None  # at a version since replaced
                 new = d if d.after and take(key) else None
-            found.append(_owe(key, old, new, now.context, versioned=whole))
-        for key in mine:
-            p = rec["points"][key]
-            old = (p["version"], rec["contexts"].get(p["context"], {})) if p["present"] else None
-            d = at_h.get(key)
-            found.append(
-                _owe(key, old, d if d is not None and take(key) else None, now.context, versioned=True)
-            )
-        for owe in sorted(found, key=lambda o: o.key):
-            yield owe
+            yield _owe(key, old, new, now.context, versioned=whole)
+        while nxt is not None:
+            yield point(nxt)
+            nxt = next(left, None)
 
 
 async def _none() -> AsyncIterator:
@@ -301,18 +306,18 @@ async def _with_unchanged(index, rec, now, after, owed_stream, held=None) -> Asy
     `unchanged`, and the owed removals among them, all in key order."""
 
     take = Matcher(now.patterns)
-    owed = {owe.key: owe async for owe in owed_stream if owe.cls is not None}
-    left = sorted(owed)
-    async for d in _live(index, now.head, after, None):
-        while left and left[0] < d.key:  # owed, and absent at H: a removal
-            yield owed[left.pop(0)]
-        if left and left[0] == d.key:
-            yield owed[left.pop(0)]
-        elif take(d.key):
-            old = await _decoded(index, rec, d.key, held)
-            yield Owe(d.key, "unchanged", old, version_of(d.generation, d.payload), d.generation)
-    for key in left:
-        yield owed[key]
+    async for key, owe, d in _merged(owed_stream, _live(index, now.head, after, None)):
+        if owe is not None and owe.cls is not None:  # owed (a removal: absent at H)
+            yield owe
+        elif d is None or not take(key):
+            continue
+        elif owe is not None:  # compared, owed nothing: its old observation is known
+            yield Owe(key, "unchanged", owe.old, owe.new, owe.generation)
+        else:  # not a candidate: its layer saw it as it is now, unchanged since
+            holder = observed.holder(rec, key)
+            context = rec["contexts"].get(holder.get("context"), {})
+            new = version_of(d.generation, d.payload)
+            yield Owe(key, "unchanged", (new, context), new, d.generation)
 
 
 async def _decoded(index: LayerIndex, rec: dict, key: str, held=None) -> tuple | None:

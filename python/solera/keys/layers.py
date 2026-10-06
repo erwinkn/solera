@@ -719,8 +719,8 @@ class LayerIndex:
             for part in parts:
                 if part.index is None:
                     continue  # held whole: reading further costs nothing
-                ix = self._ix(part)
-                streams.append([(ix.first[i], ix.count[i] * share) for i in ix.span(after, None)])
+                # Lazily: the merge stops at the bound, a few blocks in, however long the part.
+                streams.append(_counts(self._ix(part), after, share))
         acc = 0.0
         for k, n in heapq.merge(*streams, key=lambda t: t[0]):
             acc += n
@@ -1046,6 +1046,13 @@ class LayerIndex:
             for r in readers:
                 await r.aclose()
         return job.finish()
+
+
+def _counts(ix: _Index, after: bytes | None, share: float):
+    """A part's blocks from `after` on, `(first key, entries x share)`, one at a time."""
+
+    for i in ix.span(after, None):
+        yield ix.first[i], ix.count[i] * share
 
 
 def _rows(out) -> list[tuple]:
