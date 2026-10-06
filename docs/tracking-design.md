@@ -4,14 +4,17 @@ Status: **target design (T43), for Erwin's review.** It is the plan the
 rebuild follows after the observed-set work. It starts from Fable's brief
 (*Incremental data flow tracking: architecture brief*, Oct 5 2026) and
 applies Erwin's decisions on it (D180, D183, D184). Where it departs from
-the brief, it says so and why.
+the brief, it says so and why. Revised after a review (W65, A40) that
+found three mechanisms to fix: late and dead writes on in-place stores
+(§8), the owed-count rule under conditions (§6), and the cut against the
+cleanup cursor (§13).
 
 Two kinds of decision appear below, always marked:
 
 - **Settled.** Decided by Erwin, with its decision number (D180, D183,
   D184). Stated as decided.
 - **Proposed.** This design's recommendation, waiting for Erwin's
-  confirmation. Numbered P1 to P15 and listed with a recommendation in
+  confirmation. Numbered P1 to P16 and listed with a recommendation in
   §17.
 
 Fable's brief numbers its own decisions D1 to D18. To keep them apart from
@@ -56,7 +59,7 @@ function, same files: history reproduces exactly what a batch received.
 | Staleness from counters that may over-count; a false alarm costs an empty batch | Answers are always exact, kept current by propagating each commit to the edges that read it; no false-alarm runs | D183 |
 | A grace period T: replaced files live T hours; attempts older than T are refused | Exact cleanup: only attempts in flight read old data files, so a file goes once every live attempt planned at or after the commit that replaced it | D183 |
 | Layers are Parquet | Parquet or our block format, decided by benchmark (T44); this design is format-agnostic | D183 |
-| Postgres outputs stage, then publish after the journal decides | One simple store contract: a write returns the keys it wrote; a load returns the keys and versions it actually loaded; deviations are recorded as facts. No staging, publish, two-phase commit or fencing | D184 |
+| Postgres outputs stage, then publish after the journal decides | One simple store contract: a write returns the keys it wrote; a load returns the keys and versions it actually loaded; deviations are recorded as facts. No staging, publish, two-phase commit or fencing. (P15 proposes one more rule for stores that write in place: a write never goes back in versions) | D184 |
 | Batch records carry their replaced slice and a digest | Kept | D184 (Fable D10) |
 | Context read per batch | Kept | D184 (Fable D11) |
 | History exact while a run is retained | Kept | D180 |
@@ -81,7 +84,8 @@ Each term is used in one sense only.
 | Due | Owed, and a default run would take it now. A failing key waiting for its retry is owed but not due (§11). |
 | Batch record | The input-log entry for one committed batch on one edge. |
 | Cut | The oldest commit the change index must still answer at. |
-| Live attempt | An attempt whose spec the engine issued and which it has not yet settled (committed, failed, canceled or given up on). |
+| Live attempt | An attempt whose spec the engine issued and which it has not yet settled (committed, failed, canceled or given up on). It holds the head of every output it reads. |
+| Anomaly | A version loaded from a produced output that no commit of it ever recorded (§8). |
 
 Notation: `k1@4` is key k1 at version 4. `c4` is commit 4 of `items`, and
 `f2` commit 2 of `feed`; other outputs' commits are written `copy#2`. A range `(lo, hi]` excludes
@@ -249,7 +253,8 @@ layers, plus 1 MiB. So a reader starting at any commit reads at most about
 lanes, back-off (D181) and writer backpressure stay.
 
 **What a merge keeps.** Above the cut, every entry. At or below it, entries
-fold into the base: one entry per key present at the cut. With preserved
+fold into the base: one entry per key present at the cut. The cut never
+passes the cleanup cursor (§13). With preserved
 commits (§13, later), merges below the cut keep the states at those commits
 too.
 
@@ -312,10 +317,15 @@ conditions now:
 ### What a batch commit writes
 
 A batch that planned at head H and covered (lo, hi] writes one piece:
-`(lo, hi] → at(H, conditions now)`. Inside that range it leaves a point for
-exactly the keys whose holding differs from what the new piece says: failed
-keys, keys held back from the batch, and keys loaded at another version.
-Every other point in the range is dropped.
+`(lo, hi] → at(H, the conditions it was planned under)`. Those may differ
+from the conditions at commit: a pattern change between the two is an
+input change, which the commit check lets through, and the piece's
+conditions then make its keys owed. Inside that range the batch leaves a
+point for exactly the keys whose holding differs from what the new piece
+says: failed keys, keys held back from the batch, and keys loaded at
+another version. Each point written carries its reason (failed, held back,
+deviation, key list), which lineage needs (§12). Every other point in the
+range is dropped.
 
 **Why it is correct.** A key in the range that the batch did not take was
 not owed at H, which means it already held what `at(H)` says.
@@ -377,36 +387,96 @@ over-count and whose false alarms cost an empty batch.
 
 ### Owed counts (P14)
 
-Each edge keeps, for each piece, the **exact number of keys it owes**
-(keys with a point are counted separately, one by one). Three events change
+Each edge keeps, for each piece, the **exact number of keys it owes**.
+Keys with a point are counted separately, one by one. Four events change
 the numbers.
 
-**1. An upstream commit.** For each entry `k: r → n` that falls in a piece
-`at(P)`, let `h` be what the consumer holds for k, its state at P. Before
-the commit k was owed if `h ≠ r`; after, if `h ≠ n`. The count moves by the
-difference.
+**1. An upstream commit.** For each entry `k: r → n` in the commit,
+compare whole observations, as §5's table does:
 
-- Usually k had not changed since P. Then `h = r`, known for free: when the
-  engine computes `r` from its index, it learns which commit wrote `r`, and
-  that commit is at or before P. The count goes up by one.
-- Only a key that changed again since P needs `h` looked up, with `get(P, k)`
-  in the engine's warm index. That is exactly the case of a revert.
+- **Held**: what the consumer holds for k under its piece. For
+  `at(P, conditions)`, that is k's state at P with the piece's context and
+  definition, or nothing if the piece's patterns do not take k. For
+  `empty`, nothing. For `held`, "held" if the consumer's own output has k.
+- **Wanted before**: `r` under the conditions now, or nothing if the
+  patterns now do not take k. **Wanted after**: `n`, the same way.
+- k was owed before if held differs from wanted before (nothing and
+  nothing are equal); it is owed after if held differs from wanted after.
+  The piece's count moves by the difference: +1, 0 or −1.
 
-For an `empty` piece, `h` is "nothing"; for `held`, it is "held" when the
-consumer's own output has the key. A point compares its own value with `r`
-and `n` the same way. A clear commit is counted by scan.
+What the rule gives in the three usual cases:
 
-**2. A batch commit.** The new piece owes `diff(H, head)` over its range:
-usually nothing, or a few keys from commits since H. A piece the batch cuts
-keeps the owed keys outside the batch's range; the engine knows the ones
-inside, since it planned them and has propagated every commit since H.
+| Piece | Entry | Count |
+|---|---|---|
+| Current conditions | k unchanged since P, now updated | +1 |
+| Current conditions | k reverts to what the consumer holds | −1 |
+| Any | k is not taken by the patterns now | 0: both wanted sides are nothing (CHG-9) |
+| Context or definition differs from now | k present before and after | 0: it was already owed, as updated |
+| Context or definition differs from now | k added, and the consumer holds nothing | +1 |
 
-**3. A change of conditions** (patterns, context, definition), a reset, or
-a new edge. The affected pieces are counted by a scan, when the change
-happens. A status asked meanwhile waits for it; it is never guessed
-(`behaviors.md` STA-12).
+**Finding what is held.** Usually k had not changed since the piece's
+commit P, so its state at P is `r`, known for free. When the engine
+computes `r` from its index, it also learns **since**: the commit that
+wrote `r`, or the upstream's latest clear if that is later. (A clear
+removes keys without naming them, so a key it removed and a later commit
+re-adds has `r` = nothing, while a piece older than the clear holds it.)
+If since ≤ P, held is `r`. Otherwise the engine looks it up: `get(P, k)`
+in its warm index. A point compares its own value the same way.
 
-**Example: tally's counts through §3's story.**
+**The lookup budget.** One warm-index lookup per entry whose key changed
+again since the piece's commit, once per distinct piece commit (edges whose
+pieces sit at the same commit share it). For an edge near the head, that
+is reverts only. For a consumer a month behind, it is every change of a
+hot key.
+
+**2. A clear.** A piece whose commit precedes the upstream's latest clear
+is not propagated entry by entry. During the upstream's full run every
+rebuilt key would need a lookup, for counts nobody can act on: the gate
+holds those edges (§10). Its reason is **upstream incomplete**, exact but
+not a number. It is counted once, by a scan merging S(P) and S(head), when
+the upstream is complete again. `empty` and `held` pieces are counted the
+same way.
+
+**3. A batch commit.** A batch's range always starts at a piece boundary:
+a run's first batch starts at −∞, and the task's progress key stays a
+boundary until the run ends (equal neighbours merge only then). So a batch
+replaces the pieces its range covers and cuts at most one, the piece
+holding its last key.
+
+- The **new piece** owes `diff(H, head)` over its range, compared under
+  the conditions it was planned under, minus its points: usually nothing,
+  or the few keys commits since H changed.
+- The **cut piece's remainder** keeps its count minus the owed keys inside
+  the range. Those are the keys the plan found owed there at H (taken or
+  held back), plus the net changes propagation applied inside the range
+  since H. The engine keeps that sum per live attempt as it propagates, so
+  the split costs no lookup.
+
+**Example: a cut.** Suppose run 3 of `tally` uses `batch_size=1`. It
+starts from run 2's end: `(−∞, k2] at c4` owes 0, `(k2, +∞) at c2` owes 2
+(k3, k5). Batch 1 plans at c4: k3, to remove; the range is (−∞, k3].
+Before it commits, c5 re-adds k3 at version 5. k3 changed since c2 (it was
+removed at c3), so held is looked up: k3@1. Owed before (1 against
+nothing) and after (1 against 5): the count moves by 0, and the sum inside
+the range since c4 is 0. At commit:
+
+| Piece | Owes | Why |
+|---|---|---|
+| (−∞, k3] at c4 | 1 | `diff(c4, c5)` names k3: the consumer now holds nothing, upstream has k3@5 |
+| (k3, +∞) at c2 | 1 | 2 − (1 planned + 0 since c4): k5 |
+
+**4. A change of conditions, a reset, or a new edge.** The affected pieces
+are counted by a scan when the change happens. A status asked meanwhile
+waits for it; it is never guessed (`behaviors.md` STA-12).
+
+**After a restart.** Counts are checkpointed with progress. Replay
+re-propagates the commits since the checkpoint, reading their entries from
+the layer files in the warm cache.
+
+### Examples
+
+**tally's counts through §3's story** (current conditions, every key
+taken).
 
 | Event | (−∞, k2] | (k2, +∞) |
 |---|---|---|
@@ -417,34 +487,43 @@ happens. A status asked meanwhile waits for it; it is never guessed
 | c4: k1 1 → 4 | owes 2 | owes 2 |
 | After run 2, batch 1 | at c4, owes 0 | owes 2 (k3, k5) |
 
-**Example: a revert raises no alarm.** `items` holds `(−∞, +∞) at f1` on
-`feed`, owing 0. f2 changes k1 `v1 → v2`: k1 unchanged since f1, so +1.
-f3 changes k1 back, `v2 → v1`: k1 changed since f1, so the engine looks up
-`h = S(f1)[k1] = v1`; before, `v1 ≠ v2` (owed), after, `v1 = v1` (not owed):
-−1. The count is 0 again. `items` was truly stale between f2 and f3,
-and is fresh after f3, with no run spent finding that out.
+**A revert raises no alarm.** `items` holds `(−∞, +∞) at f1` on `feed`,
+owing 0. f2 changes k1 `v1 → v2`: k1 unchanged since f1, so +1. f3 changes
+k1 back, `v2 → v1`: k1 changed since f1, so the engine looks up held =
+`v1`. Owed before (`v1` against `v2`), not owed after (`v1` against `v1`):
+−1. The count is 0 again. `items` was truly stale between f2 and f3, and
+is fresh after f3, with no run spent finding that out.
+
+**The context moves.** `checks` holds `(−∞, +∞) at c1` under `factor` at
+w1, with k1@1 and k2@1. `factor` moves to w2: the scan counts 2, both
+present keys owed as updated (CHG-10). Then items updates k1 to 2: held
+k1@1 under w1, wanted k1@1 then k1@2 under w2, owed both times: 0, still
+2. Then items adds k3: +1, now 3.
+
+**An excluded key.** `copy` takes `k*` only. items commits nothing but
+`x1`: both wanted sides are nothing, the count does not move, and `copy`
+stays fresh (CHG-9).
 
 ### What follows from the counts
 
 | Question | Answer |
 |---|---|
 | Is anything owed on this edge? | Any piece count or due point above zero |
-| Why? | The reason of each owing piece: input changed (behind the head), patterns, context or definition changed (its conditions differ from now), never processed (`empty`), to reconcile (`held`) |
+| Why? | The reason of each owing piece: input changed (behind the head), patterns, context or definition changed (its conditions differ from now), never processed (`empty`), to reconcile (`held`), upstream incomplete (older than the upstream's latest clear) |
 | Is the partition stale? | Any of its edges owes something due (STA-3: a default run would load something) |
 | Upstream stale | A partition whose stale status flips tells its consumers, which tell theirs: work only where the status changes |
 | Complete? (D177) | No `empty` piece owes anything: an `empty` piece's count is exactly its unprocessed upstream keys |
-| How many keys owed? | The sum of the counts: exact |
+| How many keys owed? | The sum of the counts: exact, except "upstream incomplete", which has no number until the upstream is complete |
 | How many commits behind, since when? | The oldest owing piece's commit, against the head and the commit headers |
 | Which keys? | The planner without a limit, on demand; costs a read proportional to the answer |
 
 ### Cost
 
-Each upstream commit costs work proportional to its entries times the edges
-reading it, plus one warm-index lookup per entry that changed again since
-a piece's commit. Edges whose pieces sit at the same commit share the work.
-For a large commit (a 100M-key rewrite), the counts are computed as a
-stream; "stale or not" is known at the first entry of a key unchanged since
-the piece, long before the exact count is in.
+Each upstream commit costs work proportional to its entries times the
+distinct piece commits reading it, plus the lookups of the budget above.
+For a large commit that is not a clear (a 100M-key update), the counts are
+computed as a stream; "stale or not" is known at the first entry of a key
+unchanged since the piece, long before the exact count is in.
 
 ## 7. A batch from start to finish
 
@@ -459,7 +538,7 @@ immutable files, the engine never handles key lists).
 2. **It issues the spec**: the head H, the range, each key with its class
    and its version at H (D178: the keys travel in the spec), the conditions,
    and the version this attempt will write under. The attempt is now live,
-   holding H.
+   holding H and the heads of every other output it reads.
 3. **The worker loads** the keys at their versions. The load returns the
    keys and versions it actually loaded (D184, §8).
 4. **The worker runs the producer** with the classes as loaded.
@@ -470,12 +549,14 @@ immutable files, the engine never handles key lists).
    built from the written keys, the attempt's version and the replaced
    versions from its index), the edge's new piece and points, the batch
    record, the key outcomes that changed, and, under P13, any load
-   reports.
+   reports on sources.
 8. **It propagates** the output commit to the edges that read the output
    (§6).
 
 A batch whose output does not change makes no output commit: writing
-nothing wakes nothing (INC-14). It still commits its progress.
+nothing wakes nothing (INC-14). It still commits its progress. A clear is
+always a change, so a full run's first batch commits even when it writes
+no key (SEL-11).
 
 ### Where candidates come from
 
@@ -516,7 +597,7 @@ per edge.
 | Head | c4 |
 | Conditions | patterns p1, no context, definition d1 |
 | Replaced slice | (−∞, k2] at c1, no points |
-| Points written | none |
+| Points written | none (each would carry its reason) |
 | Counts | updated 2 |
 | Digest | hash of [(k1, 4, updated), (k2, 2, updated)] |
 | Planner version | 1 |
@@ -532,7 +613,8 @@ About 200 bytes plus the replaced slice, usually one piece.
   list; if its hash differs, the answer is an error naming the batch, never
   a wrong list.
 - **Points written** carry the deviations (§8): keys loaded at another
-  version than planned, with the version loaded.
+  version than planned, with the version loaded. Each point names its
+  reason: failed, held back, deviation, or key list.
 - **A key-list run records its key list**, the one case where planned keys
   are stored: the user's input cannot be derived.
 
@@ -560,7 +642,8 @@ its own head and its own record.
   there and says so.
 - **Deviations are facts.** A key loaded at another version than planned is
   processed as loaded and recorded as a point in the batch record. The
-  producer's output commit is recorded as usual.
+  producer's output commit is recorded as usual. A version of a produced
+  output that no commit recorded is also an anomaly (P16, below).
 - **No staging, publish, two-phase commit or fencing.** There are no store
   *kinds*.
 
@@ -577,30 +660,67 @@ fence table, repair by presence, the repair clock, the write gate's
 intents, `reads()` snapshots, the replan on a newer generation, and the
 waits it needs (held: `moved`, `writing`, `repair`).
 
-### What it gives up, and how it heals
+### Late and dead writes on stores that write in place
 
-A store that writes in place (a table) can now hold rows no commit
-recorded: an attempt that wrote and then died, or a late write from an
-attempt the engine gave up on.
+A store that writes in place (a table, a key-value store) can receive
+writes the engine never committed: an attempt that wrote and then died
+before its commit, or a late write from an attempt the engine gave up on.
+A store that names objects by version (FileStore, S3Store) is safe: such a
+write only creates an object nothing references.
 
-**Example.** items' attempt A plans to update k2 and writes k2@6 to the
-table, then dies before it commits. The log still says k2@2. `tally` plans
-k2@2 and loads k2@6: a point `k2 → 6`. k2 is owed again (holds 6, log says
-2). The next run plans k2@2 and loads k2@6 again: the key stays owed for as
-long as nobody rewrites it.
+**P15. A write never goes back in versions.** For stores that write in
+place, the contract gains one rule: a write refuses a version older than
+the row's. For SQL, one `WHERE excluded.version > t.version` on the upsert
+(and the same guard on a delete); for a key-value store, a conditional
+put. Versions only grow per partition, so a late write of an older attempt
+changes nothing. This keeps ENG-7 and INC-8 without `acquire`, a fence
+table or a repair clock. It is not fencing: nothing is acquired, and the
+store checks one row at a time.
 
-Two proposals close this:
+**What P15 cannot prevent: a dead writer with the newest version.**
+items' attempt A (version 6) updates k2 in its table, writing k2@6, and
+dies before it commits. The log still says k2@2. If A's retry B (version
+7) rewrites k2, the row becomes k2@7 and nothing is left to fix. If B's
+plan no longer holds k2, the row stays k2@6.
 
-- **P13. Loads report what they find.** A key loaded at another version is
-  also reported to the upstream's log, as Fable D16 does for sources: the
-  report becomes an entry `k2: 2 → 6`, unless the log changed k2 since the
-  batch's head (the log then knows better). `tally` is then not owed, and
-  items' retry, which still owes its input, writes k2@7 over it. The same
-  rule corrects a source's log when a load finds the outside moved.
-- **P15. "Newer version wins" writes, as a recipe.** A table store writes
-  `ON CONFLICT … WHERE excluded.version > t.version`. A late write of an
-  older attempt then changes nothing. Recommended for SQL stores; not part
-  of the contract.
+**P16. On a produced output, a version the engine never committed is an
+anomaly.** The engine assigns every version and knows which attempts
+committed, so it can tell. When tally loads k2@6, the engine:
+
+- raises an alarm naming items, k2 and attempt A;
+- processes tally's batch as loaded: the point `k2 → 6` is a fact, and
+  tally stays owed k2 until items rewrites it;
+- re-owes the key on items: for a per-key producer, the key itself; for an
+  ordinary producer, the dead attempt's range (it is in its spec) in `all`
+  mode on the retry. The engine does this as soon as an attempt on an
+  in-place store dies after it may have written, before any load finds the
+  row.
+
+It never writes k2@6 into items' log. A version of an attempt still live is
+not an anomaly: the point stands, and the key settles when that attempt
+commits, or becomes an anomaly if it dies.
+
+**A dead writer's overwrite is repaired only by a rewrite, never by
+cleanup.** On an in-place store the dead row is the key's only row:
+deleting it by version would leave k2 absent while the log says k2@2. So
+in-place stores get no per-version cleanup of abandoned attempts; CLN-5
+applies to stores that name objects by version.
+
+**P13. Loads report what they find, for sources only.** A load that finds
+a source at another version than its log reports it to the source's log,
+as Fable D16 says. The report becomes an entry, unless the log changed
+that key since the batch's head (the log then knows better). A source's
+log is the engine's record of what the outside said, and a load is one
+more observation of the outside.
+
+**Rejected: P13 on produced outputs** (this design's first draft).
+Counterexample, from the review: items on a table without P15. Attempt A
+(version 6) writes k2@6 and is given up on; its retry B writes k2@7 and
+commits c2. A's queued write lands later, and the row regresses to k2@6.
+tally plans k2@7, loads k2@6, and the report writes c3 `k2: 7 → 6` into
+items' log. Downstream processes an update to older data, nothing re-owes
+items, and the regression stands until k2's input changes again. The log
+would record a defect as a change.
 
 ## 9. Conditions: patterns, context, definition
 
@@ -612,7 +732,7 @@ owed (Fable D11; today's behaviour).
 |---|---|
 | Patterns | Keys taken by exactly one of the two pattern sets are owed |
 | Context | Every present key is owed, as updated |
-| Definition | Every present key is owed; an ordinary asset rebuilds with a full run |
+| Definition | Every present key is owed. An ordinary asset rebuilds with a full run (a clear); a per-key asset resets to `held` (KEY-10) |
 
 **Settled (D184, Fable D11): context is read per batch.** Each batch reads
 the heads of the consumer's whole and dep inputs when it starts and stamps
@@ -639,7 +759,7 @@ where the two pattern sets can disagree are scanned, as today.
 |---|---|---|---|
 | Incremental | Due keys, in key order | A piece for the range, plus points | The rest stays owed |
 | All | Every owed key, and every other present key as `unchanged` | The same | The rest is as it was |
-| Key list | Exactly the listed keys | Points only | The listed keys are done |
+| Key list | Exactly the listed keys | Points only; as a full run's first batch, also the clear and the reset (SEL-12) | The listed keys are done |
 | Full | Everything, after a reset written by the first batch | The reset, then a piece per batch | The unreached part is `empty` or `held` |
 
 ### Key list
@@ -687,6 +807,16 @@ commits `copy#2`: a clear, re-adding k1@2 and k2@2. Batch 2 commits
 
 Without the gate, `archive` removes k4 and adds it back, and its output
 lacks k4 in between.
+
+During the full run, `archive`'s piece predates copy's clear: its reason is
+"upstream incomplete", with no number, and it is counted once by a scan
+when copy#3 completes the run (§6).
+
+**The one way the gate holds for good.** A full run canceled midway, or a
+first run that never finishes, leaves the upstream incomplete, and nothing
+resumes a run by itself (RUN-10). Downstream then waits until someone runs
+the upstream again. The status says so: "held: upstream incomplete
+(copy)".
 
 ### Full run of a per-key asset: held
 
@@ -750,8 +880,10 @@ answerable exactly, per key.
 
 **Batch lineage.** Recompute the batch's input from its record: for each
 replaced piece, `diff(piece's commit, record's head)` over the range; apply
-the points written; check the digest. The output side is the entries of
-its output commit.
+the points written (dropping held-back keys, replacing deviations by the
+versions loaded); check the digest. A replaced slice that was `held` needs
+the consumer's own output just before the batch: its output commit minus
+one. The output side is the entries of its output commit.
 
 > tally's run 2, batch 1: range (−∞, k2], head c4, replaced (−∞, k2] at c1.
 > `diff(c1, c4)` over (−∞, k2] gives k1 1 → 4 and k2 1 → 2, both updated.
@@ -774,7 +906,9 @@ count over the upstream's live key count.
 
 **What is stored per key** (**P10**, Fable D17): non-ok outcomes only.
 Each batch's ok keys are recomputed by lineage. Duration per ok key is not
-stored (100M rows per full run); a duration histogram per batch is.
+stored (100M rows per full run); a duration histogram per batch is. Today's
+`key_outcomes` table logs every call, ok included, with its duration, so
+this changes HIS-6.
 
 **Honest answers.** "k1 was at version 1 then; that file has since been
 deleted." "Run not retained." A digest mismatch is an error naming the
@@ -784,18 +918,34 @@ batch.
 
 ### The cut (P11, Fable D18, staged)
 
-**Start with a single cut**, as D180 states: the oldest commit any retained
-run or live piece refers to. Every entry above it is kept; below it,
-entries fold into the base. A retained batch record names its replaced
-slice's commits and its head, so all of them stay above the cut.
+**Start with a single cut**, as D180 states. The cut is the oldest of:
+
+- the commits named by any retained run's batch records (replaced slices
+  and heads);
+- the commits of live pieces;
+- the cleanup cursor (below).
+
+Every entry above the cut is kept; below it, entries fold into the base.
+
+**The cut never passes the cleanup cursor.** Cleanup reads each entry's
+replaced version, and a clear's replaced keys with `scan(r − 1)`. If the
+cut passed a lagging cursor (cleanup is background and can be stuck,
+CLN-7, CLN-8), merges would fold away what it still has to delete, and
+those files would leak for good. Today's rule has the same guard.
 
 **A paused consumer never loses its place** (CLN-11): the cut never passes
-a live piece, so it catches up with one diff, never a full run. Its cost is
-index size: every entry since it stopped. Fable's refinement bounds that to
-one entry per changed key: a **horizon** plus **preserved commits**,
-where merges below the horizon keep only the states at commits someone
-still refers to. It is the same file format with a different
-merge rule, so it can come later (step 9 of §15).
+a live piece, so the consumer catches up with one diff, never a full run.
+Its cost is index size: every entry since it stopped. The cost lasts
+longer than the pause: the batches that catch it up record the old piece
+commit in their replaced slices, so every entry since stays until those
+runs leave history.
+
+Fable's refinement bounds that to one entry per changed key: a
+**horizon** plus **preserved commits**, where merges below the horizon keep
+only the states at commits someone still refers to. It is the same file
+format with a different merge rule, so it can come later (step 9 of §15).
+Its merges respect the cleanup cursor too: they never combine entries the
+cursor has not passed.
 
 ### Cleanup of replaced data (exact)
 
@@ -803,11 +953,14 @@ merge rule, so it can come later (step 9 of §15).
 batch plans at the head and loads versions at that head; only the index
 needs old commits. So only live attempts hold old data.
 
+**What a live attempt holds.** The head of every output it reads, as of
+its spec: its keyed inputs, its whole and dep inputs (the context), and
+its own output, which `ctx.load()` reads.
+
 **The rule.** A version replaced at commit r is deleted once r is at or
 below the oldest head any live attempt holds on that output, or the head
 when none is live. Each entry names what it replaced; a cleanup cursor per
-output walks commits in order, as today (D168). A clear replaces every key
-present before it, found with `scan(r − 1)`.
+output walks commits in order, as today (D168).
 
 **Example.** items is on FileStore. c4 replaced k1@1 with k1@4. A live
 attempt of `checks` holds c3 (it may load k1@1); one of `tally` holds c4.
@@ -823,8 +976,9 @@ observation's hold on the cursor.
 
 **Other files.** Index layers replaced by a merge go once the merge
 publishes; history queries that lose a layer retry with the current list.
-What an abandoned attempt wrote goes by its version, late, as today
-(CLN-5).
+What an abandoned attempt wrote to a store that names objects by version
+goes by its version, late, as today (CLN-5). An in-place store gets no
+such cleanup (§8).
 
 ## 14. Today → target
 
@@ -839,7 +993,8 @@ What an abandoned attempt wrote goes by its version, late, as today
 | Staleness computed on demand, cached per revision | Exact owed counts, updated on each commit |
 | Reader pins; cleanup held by the oldest observation | Cleanup held by the oldest live attempt's head |
 | A new life for a reset (unkeyed); a replacement delta (keyed) | A clear commit; lives only for deleted-and-recreated outputs |
-| Fenced and immutable store kinds; `acquire`, `reads()`, repair, replans and holds | One contract: write returns keys, load returns versions |
+| Fenced and immutable store kinds; `acquire`, `reads()`, replans and holds | One contract: write returns keys, load returns versions; in-place stores never go back in versions (P15) |
+| Repair by presence after a dead writer; the repair clock | An anomaly: alarmed, and the producer re-owes the key or the dead attempt's range (P16) |
 | Failing keys processed at the version they failed on | Success only; failing keys keep a point (P9) |
 | Workers resolve large deltas | The engine builds every commit's entries |
 | **Stay:** key outcomes (D179), `behaviors.md`, a task's progress key (D154, D155), keys in the spec (D178), the commit check, the size rule (D5), merge lanes and back-off (D181), the cleanup cursor (D168), completeness (D177) | |
@@ -851,14 +1006,31 @@ Each step lands on its own, with tests, and leaves the system working.
 | # | Step | What it adds | What it deletes |
 |---|---|---|---|
 | 1 | **The input log.** No index change. | A batch record per committed batch per edge in `batch_inputs`: range, head, conditions, replaced slice, points written, counts, digest, planner version, output commit | Nothing. Lineage cannot be recomputed until step 5; records written from now on will be |
-| 2 | **Drop the fold** (P4). | Pieces keep their own heads; equal neighbours merge; the base is one piece; Δ is read from each piece's own commit (today's index allows it: the cut is the oldest live commit) | The relabel fold, fold-made points, the "range becomes the base" rule, the before-image decision |
+| 2 | **Drop the fold** (P4). | Pieces keep their own heads; equal neighbours merge; the base is one piece; Δ is read from each piece's own commit (today's index allows it: the cut is the oldest live commit). Until step 5, today's flip format cannot let the cut rise past a paused consumer's piece; that is accepted | The relabel fold, fold-made points, the "range becomes the base" rule, the before-image decision |
 | 3 | **Success-only progress** (P9) | Failing keys keep a point; due keys come from points plus key outcomes | "A failing key is processed at the version it failed on" |
-| 4 | **The store contract** (D184) | write returns keys; load returns versions; deviations become points in the record; the engine builds every commit's entries; tables keep a version column | Store kinds, `acquire`, `keys()`, the fence table, repair by presence, the repair clock, gate intents, `reads()`, replans on a newer generation, held `moved`/`writing`/`repair`, lineage's `uncommitted` |
+| 4 | **The store contract** (D184, P15, P16) | write returns keys; load returns versions; deviations become points in the record; the engine builds every commit's entries; in-place stores keep a version column and never go back in versions; anomalies are alarmed and re-owed; P13's load reports on sources | Store kinds, `acquire`, `keys()`, the fence table, repair by presence, the repair clock, gate intents, `reads()`, replans on a newer generation, held `moved`/`writing`/`repair`, lineage's `uncommitted` |
 | 5 | **MVCC entries and `diff(C1, C2)`** | Entries with both versions; merges keep every entry above the cut; `diff`, `scan`, `get` at any retained commit; `history(key)`; lineage and key trace from batch records; the single cut counts retained records | Flips, main and side parts, the graveyard, `NotHeld`, `CutError`'s full-run fallback for live readers, the per-batch pinned index state, the deltas' cleanup-only replaced generation |
 | 6 | **Exact owed counts** (D183) | Per-piece counts updated on each commit; stale status propagated down the graph | The on-demand staleness compare and its cache |
 | 7 | **Clears and the upstream-incomplete gate** (P7, P12) | A full run's first commit is a clear; diff across a clear by two scans; the gate before each spec | Lives for resets of unkeyed outputs (D178's life on unkeyed records); replacement deltas listing every removed key |
 | 8 | **Exact cleanup** (D183) | Cleanup held by the oldest live attempt's head | Reader pins of index state, durable multi-attempt reads, the oldest observation's hold on the cleanup cursor |
 | 9 | **Preserved commits** (P11, later) | A horizon; merges below it keep states at preserved commits | The single cut's "keep every entry" below the horizon |
+
+**Data conversion.**
+
+- **Step 4.** PostgresStore's existing tables have no version column. A
+  store-version migration (DEP-5's path) adds it and backfills each row
+  once from the index: each key's current generation. It is a one-off
+  change to user tables, so it ships as a migration the user sees.
+- **Step 5.** Today's layers keep no old versions, so a diff whose window
+  crosses the conversion cannot produce replaced versions. Recommended: a
+  fresh namespace, as D169 did for the index switch. The engine refuses a
+  namespace from before the switch; user data stays in its stores (a store
+  root moves with `solera adopt-store`); every consumer's first run in the
+  new namespace is a first run. The alternative, a last fold, writes a
+  base at the conversion head and relabels every live piece to it, with
+  points for keys changed since their pieces; it keeps progress but runs
+  retained from before cannot be recomputed, so lineage says "not
+  retained" for them.
 
 Order. Steps 1 and 2 come first and touch no format. Step 8 is
 independent of the others: since the observed-set rebuild removed passes,
@@ -872,21 +1044,30 @@ exact on reverts. Step 4 is independent of the index work.
 | Entry | Today | Target | Step |
 |---|---|---|---|
 | INC-4 | An update reverted to the processed version is delivered as updated | Not delivered, and never stale: diff sees equal ends | 5, 6 |
+| INC-8 | Nothing goes back in time | Unchanged rule; on in-place stores it now rests on P15 (a write older than the row is refused) instead of fencing | 4 |
+| KEY-3 | A Rejected or Failed key is retried when its input changes | Also: if its input reverts to the version the consumer holds, the failure is moot and goes without a retry. Same output, another outcome shown | 3 |
 | KEY-5 | A failing key counts as processed at the version it failed on | A failing key is owed (its point keeps what it held) and shows `owed: true`; a key that never succeeded and is removed upstream owes nothing, and its outcome goes | 3 |
 | STA-3 | Stale means a default run would load something | Unchanged rule; now explicit that owed failing keys not yet due do not make a partition stale | 3 |
-| STA-12 | Computed exactly when asked | Kept exact at every commit; condition changes counted at the change; a status asked meanwhile waits | 6 |
-| STO-1 | A store is immutable or fenced | One contract, no kinds | 4 |
+| STA-12 | Computed exactly when asked | Kept exact at every commit; condition changes counted at the change, a status asked meanwhile waits; "upstream incomplete" has no number until the upstream completes | 6 |
+| STO-1 | A store is immutable or fenced | One contract, no kinds; P15 adds one rule for in-place stores | 4 |
 | STO-2 | An immutable store returns exactly the pinned version | A load returns the versions it read; a store naming objects by version returns exactly the planned ones | 4 |
 | STO-3 | A batch on a fenced store is classed at the write its read saw; a moved store replans | No replan: keys loaded at another version are processed as loaded and recorded as points | 4 |
-| STO-4 | A stale writer on a fenced store changes nothing | Deleted. A late write can land on a store that writes in place; P15 makes it harmless where the store can | 4 |
-| STO-5 | A fenced partition at rest holds exactly its keys | A table at rest holds its log's keys unless a write landed outside a commit; such keys show as deviations at the next load (and, with P13, enter the log) | 4 |
-| ENG-7 | A worker the engine gave up on cannot change what a newer one committed | Holds for stores that name objects by version (and P15 tables); otherwise detected at the next load | 4 |
-| ENG-8 | A dead writer on a fenced store is repaired; readers wait | Deleted: no repair, no repair clock, no waiting | 4 |
+| STO-4 | A stale writer on a fenced store changes nothing | No fence. Under P15 a write older than the row is refused, which keeps the observable rule | 4 |
+| STO-5 | A fenced partition at rest holds exactly its keys | A table at rest holds its log's keys unless a dead writer left a row; that row is an anomaly, alarmed and re-owed (P16) | 4 |
+| ENG-7 | A worker the engine gave up on cannot change what a newer one committed | Holds for stores that name objects by version, and for in-place stores under P15 | 4 |
+| ENG-8 | A dead writer on a fenced store is repaired; readers wait | Replaced: no repair clock, no waiting; the producer re-owes the dead attempt's keys or range (P16) | 4 |
+| CLN-3 | A deleted run's late worker writes nothing | On in-place stores it rests on P15 | 4 |
+| CLN-5 | What an abandoned attempt wrote is cleaned up, late | Only on stores that name objects by version; an in-place store's dead row is repaired by a rewrite (P16) | 4 |
+| SRC-10 | A tick that saw a source another client moved since is refused whole | With P13, consumer loads move source heads too, so ticks on busy sources would collide more. The check becomes per key: a tick is refused only if a key it reports changed since it observed | 4 |
 | HIS-3 | Postgres lineage is the version the read saw, `uncommitted` if no commit made it | Lineage is the batch record: planned versions plus deviations | 4 |
 | HIS-5 | Not built | Built: exact per-key lineage while the run is retained | 5 |
+| HIS-6 | Every call's outcome is logged, ok included, with its duration | Non-ok outcomes only, plus a duration histogram per batch (P10) | 5 |
+| RST-8 | A removed consumer stops holding back its upstream's history | At once for its pieces; its retained batch records hold the cut until its runs leave history | 5 |
 | CLN-4 | A lagging consumer can hold back cleanup | Only attempts in flight hold it back | 8 |
 | CLN-6 | A reader pinned before a removal holds that output's cleanup | An attempt in flight from before the removal holds it | 8 |
 | CLN-11 | Not built; today a consumer below the cut gets a full run | Built: the cut never passes a live piece (open question 12 answered: unbounded index history for a paused consumer until step 9) | 5 |
+| SEL-11 | A full run over an empty upstream reaches its producer and empties the output | Unchanged; the clear is a commit even when it writes no key | 7 |
+| SEL-12 | A due full run may be carried out by several runs, `keys=` ones included | Unchanged; a `keys=` run as a full run's first batch writes the clear, the reset and its points | 7 |
 | RUN-4 | Waiting reasons: claim, concurrency, merges, engine, executor, invalid | Adds `upstream incomplete` (P12) | 7 |
 
 ### New entries
@@ -894,7 +1075,7 @@ exact on reverts. Step 4 is independent of the index work.
 | Proposed id | Rule | Example | From |
 |---|---|---|---|
 | INC-15 | An upstream full run reaches downstream as one change; downstream keeps its progress | §10: archive gets k1, k2, k4 updated, k3 removed, k5 added | P7 |
-| STA-13 | Downstream of an incomplete upstream runs no batch, by default | §10: archive is held while copy's full run is between batches | P12 |
+| STA-13 | Downstream of an incomplete upstream runs no batch, by default. A canceled full run, or a first run that never finishes, holds downstream until a run finishes it | §10: archive is held while copy's full run is between batches | P12 |
 | STA-14 | No false alarms: a partition is stale only if something is due; changes that cancel out start nothing | §6: feed's k1 v1 → v2 → v1 | D183 |
 | STA-15 | Failing keys not yet due are shown, not stale | §11: checks shows k2 failing, stale only for k3 and k5 | P9 |
 | KEY-12 | A key that never succeeded and is removed upstream owes nothing | items adds k6; checks fails on it at its first try; items removes k6: no removal is delivered, and the outcome goes | P9 |
@@ -902,7 +1083,8 @@ exact on reverts. Step 4 is independent of the index work.
 | HIS-7 | A batch's input is recomputed from its record and checked against its digest; a mismatch is an error naming the batch | §12 | D184 |
 | HIS-8 | Lineage lists keys loaded at another version than planned, with the version loaded | §8: tally's point k2 → 5 | D184 |
 | CLN-12 | A replaced data file goes once no live attempt planned before its replacement | §13: k1@1 goes when checks' attempt settles | D183 |
-| SRC-12 | A load that finds another version than the log records it in the upstream's log, unless the log changed that key since the batch's head | §8: k2: 2 → 6 | P13 |
+| SRC-12 | A load that finds a source at another version than its log records it in the source's log, unless the log changed that key since the batch's head | A source's file changed before its sensor saw it | P13 |
+| ENG-17 | A produced output's version that no commit recorded is alarmed, and its producer re-owes it | §8: tally loads k2@6 from dead attempt A | P16 |
 
 ## 17. Decisions
 
@@ -931,9 +1113,18 @@ exact on reverts. Step 4 is independent of the index work.
 | P10 | Per-key history computed; only non-ok outcomes stored (Fable D17) | **Yes,** with a duration histogram per batch instead of per-key durations |
 | P11 | Horizon plus preserved commits, starting with a single cut (Fable D18) | **Yes, staged:** single cut now (step 5), preserved commits when a paused consumer's index cost shows up |
 | P12 | An incomplete upstream blocks downstream batches by default | **Yes.** Without it a downstream partition churns removals and re-adds during every upstream full run. Opt-out per input for consumers that want partial data |
-| P13 | Loads report what they find into the upstream's log, guarded (Fable D16, extended to produced outputs) | **Yes.** Without it, a row no commit recorded keeps a key owed forever (§8) |
-| P14 | Staleness as exact per-piece owed counts, updated from each commit's entries (how §6 implements D183) | **Yes.** The alternative, re-diffing every reading edge on each commit, costs the whole lag at every commit |
-| P15 | "Newer version wins" writes for SQL stores, as a recipe, not a contract | **Yes.** One line of SQL removes the late-writer case where a store can do it |
+| P13 | Loads of a source report what they find into the source's log, guarded (Fable D16, sources only) | **Yes.** A source's log is what the outside said; a load is one more observation. Rejected: the same on produced outputs, which would record a late or dead write as a change (§8) |
+| P14 | Staleness as exact per-piece owed counts, updated from each commit's entries, comparing whole observations (how §6 implements D183) | **Yes.** The alternative, re-diffing every reading edge on each commit, costs the whole lag at every commit |
+| P15 | Part of the contract for stores that write in place: a write refuses a version older than the row's (a conditional put for key-value stores) | **Yes.** One row-level guard keeps ENG-7 and INC-8 without fencing |
+| P16 | On a produced output, a loaded version no commit recorded is an anomaly: alarmed, and re-owed by its producer (the key for a per-key asset; the dead attempt's range in `all` mode on the retry for an ordinary one), never written into the log | **Yes.** It is the only repair a dead writer's in-place overwrite gets |
+
+### Questions for Erwin, from the review
+
+| Question | Context | Recommendation |
+|---|---|---|
+| Is P15 part of the store contract? | D184 says no fencing. P15 is a single row-level guard, not a fence, but it is a new duty for in-place stores, user stores included | Yes: without it, a late write regresses a row and INC-8, ENG-7, CLN-3 no longer hold on tables |
+| Are deviations on produced outputs alarms (P16), or facts written into the log (P13 extended)? | D184 says "the engine records deviations as facts". It still does, as points in the batch record; P16 only refuses to write them into the producer's log | Alarms: a version the engine never committed is a defect to repair, not a change to deliver |
+| Is "upstream incomplete" acceptable as an exact reason with no number? | D183 asks for exact answers. During an upstream full run, a lagging edge's count would cost a lookup per rebuilt key, for edges the gate holds anyway | Yes: the reason is exact, and the number comes with one scan when the upstream completes |
 
 ### Open questions from Fable's brief, answered
 
@@ -952,15 +1143,31 @@ exact on reverts. Step 4 is independent of the index work.
 
 ## 18. How the examples were checked
 
-A small model outside the repo
-(`~/.solera-design/tracking-model/model.py`) implements entries, diff and
-scan from entries alone (clears included), pieces and points, the batch
-commit rule with failures and loads at another version, `held` resets,
-and §6's owed-count propagation. A random test over tiny universes (3 to
-6 keys, versions that revert, occasional clears) checks after every step
-that progress decodes to a brute-force record of what the consumer holds,
-that the propagated counts equal brute-force counts, and that every diff
-and scan equals the true states: about 68,000 steps, all passing. The
-model also prints §3 to §11's examples (tally's progress and counts, the
-revert, the key list, the failure, the clear and the gate, the deviation),
-which match the tables above.
+A model outside the repo, `~/.solera-design/tracking-model/model.py`,
+checks the rules and examples. It implements:
+
+- the output log: entries with both versions and `since`, clears, and
+  `diff` and `scan` computed from entries alone;
+- progress: pieces (`at` with patterns and context, `empty`, `held`),
+  points, decoding, and the batch commit rule with failed keys and keys
+  loaded at another version;
+- §6's counts: event 1 with whole observations and the `since` shortcut;
+  event 2 (a clear: older pieces wait, then one scan when the upstream
+  completes); event 3 (the batch-cut split, computed by the rule, not by
+  recounting); event 4 (condition changes and `held` resets, by scan).
+
+A random test (3,000 histories, about 67,000 steps; 3 to 6 keys plus an
+`x1` some patterns exclude; versions that revert; clears; pattern and
+context changes; batches planned a commit or two before they commit)
+checks after every step that progress decodes to a brute-force record of
+what the consumer holds, that every counted piece's count equals a
+brute-force count, and that every diff and scan equals the true states.
+All pass. The model also prints the examples of §5, §6 and §10, which
+match the tables.
+
+What it does not check: the definition as a condition (it behaves as the
+context), `all` and key-list runs, several keyed inputs, the gate itself
+(it only holds batches while the upstream is incomplete), cleanup and the
+cut, P13 and P16, lineage and digests. The checks in §3, §4, §7, §8, §11,
+§12 and §13 that the model does not print were done by hand. Fable's
+§18 property tests cover the rest, and should come before the build.
