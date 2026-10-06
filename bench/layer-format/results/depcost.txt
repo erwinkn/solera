@@ -1,0 +1,4 @@
+base: clean release build 20 s (8 jobs, as maturin builds it: pyo3/extension-module), libsolera_native.so 3161040 bytes (stripped: 2565592), 43 crates
+parquet: clean release build 54 s (8 jobs, as maturin builds it: pyo3/extension-module), libsolera_native.so 9923680 bytes (stripped: 8263136), 53 crates
+pyarrow (Python route): 152 MB installed; import pyarrow.parquet: 0.08 s
+duckdb (server only today): 59 MB installed

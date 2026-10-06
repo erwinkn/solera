@@ -419,7 +419,9 @@ impl Meta {
             sparse: sparse.clone(),
             len,
         };
-        let rows = self.meta.row_group(rg).num_rows() as usize;
+        // One batch of exactly the rows selected: a larger batch size would
+        // have the reader allocate for rows it never decodes.
+        let rows = sel.row_count();
         ParquetRecordBatchReaderBuilder::new_with_metadata(r, self.arrow.clone())
             .with_row_groups(vec![rg])
             .with_row_selection(sel.clone())
