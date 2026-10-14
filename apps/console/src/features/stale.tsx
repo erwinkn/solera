@@ -5,13 +5,14 @@ import { cn } from "@/lib/cn";
 import { plural } from "@/lib/format";
 import { staleReason } from "@/lib/status";
 import { Button } from "@/ui/button";
+import { ErrorNote } from "@/ui/data";
 import { Card, CardHeader } from "@/ui/layout";
-import { Tooltip } from "@/ui/overlay";
+import { Popover } from "@/ui/overlay";
 
 /**
  * Why a partition or key is stale (glossary, "stale"), one chip per reason,
- * each explained on hover. Staleness is computed on demand: these are the
- * engine's answer now, not a stored state.
+ * each explained on hover, focus or tap. Staleness is computed on demand:
+ * these are the engine's answer now, not a stored state.
  */
 export function StaleReasons({ reasons, className }: { reasons: string[] | undefined; className?: string }) {
   if (!reasons?.length) return null;
@@ -20,11 +21,21 @@ export function StaleReasons({ reasons, className }: { reasons: string[] | undef
       {reasons.map((r) => {
         const reason = staleReason(r);
         return (
-          <Tooltip key={r} content={reason.means}>
-            <span className="inline-flex h-5 items-center rounded-full border-theme border-warn/40 px-2 text-xs whitespace-nowrap text-warn-fg">
-              {reason.label}
-            </span>
-          </Tooltip>
+          <Popover
+            key={r}
+            openOnHover
+            className="max-w-72 text-xs"
+            trigger={
+              <button
+                type="button"
+                className="inline-flex h-5 cursor-help items-center rounded-full border-theme border-warn/40 px-2 text-xs whitespace-nowrap text-warn-fg"
+              >
+                {reason.label}
+              </button>
+            }
+          >
+            {reason.means}
+          </Popover>
         );
       })}
     </span>
@@ -37,7 +48,7 @@ export const reasonsText = (reasons: string[] | undefined) =>
 
 /**
  * Where a key's reason comes through: the input, linked to what it reads (an
- * upstream asset at the same partition, or a source).
+ * upstream asset at the partition the input reads there, or a source).
  */
 function InputLink({ asset, input, partition }: { asset: string; input: string; partition: string }) {
   const manifest = useManifest();
@@ -85,8 +96,18 @@ export function StaleKeysCard({
   const project = useProject();
   const pages = useInfiniteQuery(q.staleKeys(project, name, partition));
   const first = pages.data?.pages[0];
+  // A failed refresh keeps what was read; a failed first read says so.
+  if (!first)
+    return pages.isError ? (
+      <Card className={className}>
+        <CardHeader title="Stale keys" />
+        <div className="px-4 pb-4">
+          <ErrorNote error={pages.error} title="Couldn't read the stale keys" />
+        </div>
+      </Card>
+    ) : null;
   // Nothing to show for an unkeyed asset, or a partition that isn't stale.
-  if (pages.isError || !first || !first.tracked || first.reasons.length === 0) return null;
+  if (!first.tracked || first.reasons.length === 0) return null;
   const keys = pages.data?.pages.flatMap((page) => page.keys) ?? [];
   return (
     <Card className={className}>
@@ -114,7 +135,7 @@ export function StaleKeysCard({
                 {k.reasons.map((r) => (
                   <span key={`${r.kind}/${r.input}`} className="inline-flex items-center gap-1.5">
                     <StaleReasons reasons={[r.kind]} />
-                    <InputLink asset={name} input={r.input} partition={partition} />
+                    <InputLink asset={name} input={r.input} partition={r.upstream_partition} />
                   </span>
                 ))}
               </span>

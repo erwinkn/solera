@@ -346,3 +346,38 @@ async def test_a_first_run_delivers_every_key_as_added(state, tmp_path, each):
     if not each:
         assert (await value_content(engine, project, "out"))["count"] == 5
     await engine.stop()
+
+
+async def test_a_task_walks_as_long_as_its_longest_input(state, tmp_path):
+    """Two keyed inputs walk together, a batch of each per attempt: with two
+    keys in `a` and six in `b`, in batches of two, the task runs three
+    batches. Its progress and batches are the task's, not the first input's:
+    `a` ends in batch 1, but neither that batch nor the task reads final until
+    `b` does, and every batch counts the keys of both."""
+
+    @asset(outputs=Output("a", key="id"))
+    def a():
+        return [{"id": f"a{i}"} for i in range(2)]
+
+    @asset(outputs=Output("b", key="id"))
+    def b():
+        return [{"id": f"b{i}"} for i in range(6)]
+
+    @asset(inputs={"a": Incremental(batch_size=2), "b": Incremental(batch_size=2)}, outputs=Output("out"))
+    def out(ctx, a: list, b: list):
+        return {"n": len(a) + len(b)}
+
+    project = Project(assets=[a, b, out], default_store=FileStore(tmp_path / "data"))
+    engine = make_engine(state, project)
+    await engine.initialize()
+    detail = await drive(engine, await engine.submit(["out"], upstream=True))
+    assert status_of(detail) == "succeeded"
+    (task,) = [t for t in detail["tasks"] if t["asset"] == "out"]
+    batches = [x["batch"] for x in detail["attempts"][task["id"]]]
+    assert [(x["index"], x["count"], x["added"], x["last"]) for x in batches] == [
+        (0, 3, 4, "b1"),
+        (1, 3, 2, "b3"),
+        (2, 3, 2, None),
+    ]
+    assert task["progress"] == {"batch": 2, "key": None}
+    await engine.stop()

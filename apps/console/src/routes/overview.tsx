@@ -13,17 +13,11 @@ import { StarvedPools, useStarvedPools } from "@/features/starved";
 import { useNow } from "@/lib/clock";
 import { cn } from "@/lib/cn";
 import { compact, plural, until } from "@/lib/format";
-import { toneText, type Tone } from "@/lib/status";
+import { failingKeys, toneText, type Tone } from "@/lib/status";
 import { Empty, SegmentBar, Skeleton, Time } from "@/ui/data";
 import { Card, CardHeader, Page, PageHeader } from "@/ui/layout";
 import { Segmented } from "@/ui/form";
 import { StatusIcon } from "@/ui/status";
-
-const FAILING = ["failed", "rejected", "retrying", "timed_out"] as const;
-
-export function failingKeys(status: AssetStatus | undefined): number {
-  return FAILING.reduce((sum, k) => sum + (status?.stored_counts?.[k] ?? 0), 0);
-}
 
 const route = getRouteApi("/");
 const BARS = { "6h": 72, "24h": 48, "7d": 56 } as const;
@@ -370,7 +364,7 @@ function AttentionAssets({ status }: { status: Record<string, AssetStatus> | und
                       <Flag tone="warn">{s.partitioned ? `${s.partitions.stale} stale` : "stale"}</Flag>
                     )}
                     {s.partitions.missing > 0 && <Flag tone="idle">{s.partitions.missing} missing</Flag>}
-                    {keys > 0 && <Flag tone="warn">{plural(keys, "failed key")}</Flag>}
+                    {keys > 0 && <Flag tone="warn">{plural(keys, "failing key")}</Flag>}
                   </span>
                 </span>
                 {s.partitioned ? (

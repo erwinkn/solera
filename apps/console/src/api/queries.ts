@@ -53,6 +53,8 @@ const p = (project: string) => `/projects/${encodeURIComponent(project)}`;
 const enc = encodeURIComponent;
 
 export const ACTIVE_RUN = new Set(["queued", "running", "waiting"]);
+/** A task that is over: any other status (pending, queued, claimable, running, …) may still change. */
+export const TERMINAL_TASK = new Set(["succeeded", "skipped", "failed", "blocked", "canceled"]);
 /** An attempt that can still change: preparing, launching (its launch not yet
  * durable), launched, waiting for a pool worker, running. */
 export const ACTIVE_ATTEMPT = new Set([

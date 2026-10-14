@@ -40,9 +40,6 @@ export function groupByBatch(attempts: Attempt[]): BatchGroup[] {
   return groups;
 }
 
-/** Whether any attempt of a task says which batch it ran: then the task panel shows batches. */
-export const hasBatches = (attempts: Attempt[]) => attempts.some((a) => a.batch != null);
-
 /** "batch 2 of 3", or "of ~3" while the planned count is an estimate the run hasn't reached. */
 export function batchLabel(batch: Pick<Batch, "index" | "count">, done?: boolean): string {
   const n = batch.index + 1;
@@ -199,7 +196,6 @@ export function ProgressBar({
   );
 }
 
-/** Which attempt of its batch an attempt is: 1 for the first, 2 for its first retry. Without batches, its place in the task. */
 /**
  * A re-planned attempt: a batch on a fenced store found the store past the
  * head it was planned at, and is planned again at the newer one. Not a

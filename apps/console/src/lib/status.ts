@@ -1,3 +1,5 @@
+import type { AssetStatus } from "@/api/types";
+
 /**
  * What each state means to an operator, as one of six tones. Every status
  * shown anywhere — runs, tasks, attempts, partitions, keys, ticks, inputs —
@@ -195,4 +197,13 @@ export function heldReason(kind: string, detail: string | null): { label: string
   return known
     ? { label: known.label(detail), means: known.means }
     : { label: detail ? `${kind} (${detail})` : kind, means: `Held: ${kind}` };
+}
+
+/** How many of an asset's keys are failing: their latest call failed, was rejected or timed
+ * out, or is retrying. Stored outcomes are only failures; a canceled key is not failing. */
+export function failingKeys(status: AssetStatus | undefined): number {
+  return Object.entries(status?.stored_counts ?? {}).reduce(
+    (sum, [k, n]) => sum + (k === "canceled" ? 0 : (n ?? 0)),
+    0,
+  );
 }

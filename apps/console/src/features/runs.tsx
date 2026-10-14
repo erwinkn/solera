@@ -161,7 +161,7 @@ export function RunsTable({
                 <TriggerLabel run={run} />
               </Td>
               <Td>
-                {run.origin === "cleanup" ? (
+                {run.origin === "cleanup" && !Array.isArray(partitionsOf(run.partitions)) ? (
                   <span className="text-fg-subtle">whole output</span>
                 ) : (
                   <PartitionsLabel partitions={run.partitions} />

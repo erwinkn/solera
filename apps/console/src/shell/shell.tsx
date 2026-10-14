@@ -21,7 +21,7 @@ import { q } from "@/api/queries";
 import { cn } from "@/lib/cn";
 import { connect, disconnect, useSession } from "@/lib/session";
 import { setTheme, THEME_NAMES, THEMES, useTheme, type Preference } from "@/lib/theme";
-import { toneSoft, type Tone } from "@/lib/status";
+import { failingKeys, toneSoft, type Tone } from "@/lib/status";
 import { Button, IconButton } from "@/ui/button";
 import { Input, Select } from "@/ui/form";
 import { TooltipProvider } from "@/ui/overlay";
@@ -128,9 +128,7 @@ function useAttention() {
     enabled: !!project,
   }).data;
   const failing = status
-    ? Object.values(status).filter(
-        (a) => a.partitions.failed > 0 || Object.values(a.stored_counts ?? {}).some((n) => (n ?? 0) > 0),
-      ).length
+    ? Object.values(status).filter((a) => a.partitions.failed > 0 || failingKeys(a) > 0).length
     : 0;
   const leftover = (repairs?.length ?? 0) + (cleanups?.filter(cleanupStuck).length ?? 0);
   // The runs listing's count, which leaves out the engine's cleanup tasks as the listing does.

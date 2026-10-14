@@ -3,13 +3,12 @@ import { getRouteApi, Link } from "@tanstack/react-router";
 import { List, Network, Play } from "lucide-react";
 import { q, useManifest, useProject } from "@/api/queries";
 import type { AssetStatus, Manifest } from "@/api/types";
-import { AssetGraph, assetTone, KIND_ICON, KIND_LABEL, kindOf } from "@/features/graph";
+import { AssetGraph, assetTone, KIND_ICON, KIND_LABEL, kindOf, partitionParts } from "@/features/graph";
 import { RunButton } from "@/features/run-dialog";
 import { describeTrigger } from "@/features/triggers";
-import { failingKeys } from "@/routes/overview";
 import { cn } from "@/lib/cn";
 import { firstLine, plural } from "@/lib/format";
-import { toneSoft } from "@/lib/status";
+import { failingKeys, toneSoft } from "@/lib/status";
 import { Empty, SegmentBar, Time } from "@/ui/data";
 import { SearchInput, Segmented } from "@/ui/form";
 import { Card, Page, PageHeader } from "@/ui/layout";
@@ -152,33 +151,22 @@ function AssetTable({
                   <Td className="w-56">
                     {p && (
                       <span className="flex items-center gap-2.5">
-                        <SegmentBar
-                          className="w-24"
-                          parts={[
-                            {
-                              tone: "ok",
-                              value: p.materialized,
-                              label: "materialized",
-                            },
-                            { tone: "run", value: p.running, label: "running" },
-                            { tone: "fail", value: p.failed, label: "failed" },
-                            {
-                              tone: "idle",
-                              value: p.missing,
-                              label: "missing",
-                            },
-                          ]}
-                        />
+                        <SegmentBar className="w-24" parts={partitionParts(p)} />
+                        {/* As a graph node says it: "4/4 stale" when any is, else "3/4" materialized. */}
                         <span className="text-xs text-fg-muted tabular">
                           {s.partitioned
-                            ? `${p.materialized}/${p.total}`
-                            : p.materialized
-                              ? "done"
-                              : p.running
-                                ? "running"
-                                : p.failed
-                                  ? "failed"
-                                  : "—"}
+                            ? p.stale
+                              ? `${p.stale}/${p.total} stale`
+                              : `${p.materialized}/${p.total}`
+                            : p.running
+                              ? "running"
+                              : p.failed
+                                ? "failed"
+                                : p.stale
+                                  ? "stale"
+                                  : p.materialized
+                                    ? "done"
+                                    : "—"}
                         </span>
                       </span>
                     )}

@@ -157,10 +157,11 @@ class Staleness:
     ) -> dict:
         """A page of a keyed asset's stale keys in `partition`, and why:
         `keys` is `[{key, reasons}]`, `reasons` the partition's. A key's
-        reasons are only what is specific to it, each naming its input —
-        `{kind: "input changed", input}` for a key that input owes,
-        `{kind: "upstream stale", input}` for one whose upstream key is
-        stale along an each chain. A partition-wide reason (its definition
+        reasons are only what is specific to it, each naming its input and
+        the upstream partition it reads there — `{kind: "input changed",
+        input, upstream_partition}` for a key that input owes, `{kind:
+        "upstream stale", input, upstream_partition}` for one whose upstream
+        key is stale along an each chain. A partition-wide reason (its definition
         changed, a stale upstream every key depends on, a keyed output that
         is not `each`, whose keys go stale together) stays on the
         partition's reasons alone: a key it covers lists none. `tracked` is
@@ -214,7 +215,9 @@ class Staleness:
                 if i.param == param and self._each_input(i.owner) is not None:
                     for k in await self._each_keys(i.owner, upstream_partition, memo):
                         if taken(k):
-                            keys.setdefault(k, []).append({"kind": UPSTREAM, "input": i.param})
+                            keys.setdefault(k, []).append(
+                                {"kind": UPSTREAM, "input": i.param, "upstream_partition": upstream_partition}
+                            )
                 else:  # a stale upstream every key depends on: partition-wide
                     async for k, _, _ in _entries(self, self.m.indexes.get((output, partition))):
                         keys.setdefault(k, [])
@@ -233,7 +236,8 @@ class Staleness:
         if input is None or output is None:
             return {}
         owed = {o.key for o in await self._owed(asset, partition, input, planner, inputs)}
-        keys = {k: [{"kind": INPUT, "input": param}] for k in sorted(owed)}
+        reason = {"kind": INPUT, "input": param, "upstream_partition": input.partition}
+        keys = {k: [dict(reason)] for k in sorted(owed)}
         if self.definition_changed(asset, partition):
             taken = Matcher(spec.get("patterns"))
             async for k, _, _ in _entries(self, self.m.indexes.get((input.output, input.partition))):

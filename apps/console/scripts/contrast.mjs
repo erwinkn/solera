@@ -40,7 +40,8 @@ const pairs = [
   ]),
   ["accent-fg", "accent", TEXT],
   ["fg", "accent-soft", TEXT],
-  ["fg", "select", TEXT],
+  // A selected row keeps its muted and subtle text: a batch range, "final", a timeline label.
+  ...["fg", "fg-muted", "fg-subtle"].map((fg) => [fg, "select", TEXT]),
   ["fg-inverse", "fg", TEXT],
   ["link", "surface", TEXT],
   ["link", "bg", TEXT],

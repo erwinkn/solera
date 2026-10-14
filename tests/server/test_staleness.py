@@ -531,14 +531,16 @@ async def test_a_stale_keys_reasons_are_its_own_and_name_their_input(state, tmp_
     engine, outside = await _built(state, tmp_path, {"k1": "1", "k2": "1"})
     await _change(engine, outside, upserts=["k1"])
     page = await engine.stale_keys("checks")
-    assert page["keys"] == [{"key": "k1", "reasons": [{"kind": staleness.INPUT, "input": "item"}]}]
+    assert page["keys"] == [
+        {"key": "k1", "reasons": [{"kind": staleness.INPUT, "input": "item", "upstream_partition": ""}]}
+    ]
     assert page["reasons"] == [staleness.INPUT]
     await engine.stop()
     engine = make_engine(state, project(tmp_path, outside, checks_v="2"))
     await engine.initialize()
     page = await engine.stale_keys("checks")
     assert page["keys"] == [
-        {"key": "k1", "reasons": [{"kind": staleness.INPUT, "input": "item"}]},
+        {"key": "k1", "reasons": [{"kind": staleness.INPUT, "input": "item", "upstream_partition": ""}]},
         {"key": "k2", "reasons": []},
     ]
     assert page["reasons"] == [staleness.INPUT, staleness.DEFINITION]

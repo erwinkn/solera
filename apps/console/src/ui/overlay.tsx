@@ -184,18 +184,21 @@ export function MenuItem({
   );
 }
 
+/** A popover; `openOnHover` also opens it on hover, as a tooltip that a tap or a key opens too. */
 export function Popover({
   trigger,
   children,
   className,
+  openOnHover,
 }: {
   trigger: ReactElement;
   children: ReactNode;
   className?: string;
+  openOnHover?: boolean;
 }) {
   return (
     <BasePopover.Root>
-      <BasePopover.Trigger render={trigger} />
+      <BasePopover.Trigger render={trigger} openOnHover={openOnHover} />
       <BasePopover.Portal>
         <BasePopover.Positioner sideOffset={6} align="start" className="z-50">
           <BasePopover.Popup className={cn(popup, "p-3", className)}>{children}</BasePopover.Popup>

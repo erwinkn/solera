@@ -23,11 +23,9 @@ export function workerOf(attempt: Attempt, manifest: Manifest): { label: string;
         href: `https://${region}.console.aws.amazon.com/ecs/v2/clusters/${cluster}/tasks/${id}?region=${region}`,
       };
     }
-    case "K8sJob": {
-      const job = typeof handle.job === "string" ? handle.job : null;
-      const namespace = executor.config.namespace;
-      return job ? { label: `job ${typeof namespace === "string" ? `${namespace}/` : ""}${job}` } : null;
-    }
+    case "K8sJob":
+      // The job's name alone: the handle records no namespace, and today's config may name another.
+      return typeof handle.job === "string" ? { label: `job ${handle.job}` } : null;
     case "Modal":
       return typeof handle.call_id === "string" ? { label: `Modal call ${handle.call_id}` } : null;
     case "Local":

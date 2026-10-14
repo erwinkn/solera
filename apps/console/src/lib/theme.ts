@@ -65,6 +65,9 @@ function apply(next: Preference) {
   document.documentElement.dataset.theme = next === "auto" ? automatic() : next;
 }
 
+// theme.js applied it before first paint; applied again here, so the two can never disagree.
+apply(preference.get());
+
 // While automatic, a switch of the system's appearance switches the console with it.
 dark.addEventListener("change", () => {
   if (preference.get() === "auto") apply("auto");

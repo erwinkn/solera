@@ -227,8 +227,10 @@ async def test_flush_merge_delete_and_purge(state, clock):
     await engine.history.lake.tick()
     files = state.model.history.files
     assert not any(state.model.history.rows.values())
-    cleanups = len((await engine.list_runs(RunFilter(origin=["cleanup"])))["runs"])
+    listed = (await engine.list_runs(RunFilter(origin=["cleanup"])))["runs"]
+    cleanups = len(listed)
     assert cleanups == 3  # each commit but the first superseded a version
+    assert [r["partitions"] for r in listed] == [[""]] * 3  # its scope: the one partition it cleans up
     # Each run's rows went out in its own flush; pairs of them were merged.
     assert sum(f["rows"] for f in files["runs"]) == 4 + cleanups
     lake = engine.history.lake

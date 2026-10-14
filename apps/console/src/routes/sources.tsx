@@ -169,7 +169,8 @@ export function Source() {
   const project = useProject();
   const source = manifest.sources[name];
   const heads = useQuery(q.heads(project, name)).data;
-  const [picked, setPicked] = useState<string | undefined>();
+  const { partition: picked } = route.useSearch();
+  const navigate = route.useNavigate();
   const sensors = useQuery(q.sensors(project)).data?.sensors.filter((s) => s.commits.includes(name)) ?? [];
   const commitQuery = useInfiniteQuery(q.runs(project, { source: [name] }, 20));
   const commits = commitQuery.data;
@@ -270,7 +271,11 @@ export function Source() {
             </Facts>
           </Card>
           {dims.length > 0 && heads && (
-            <SourcePartitions heads={heads} selected={partition} onSelect={setPicked} />
+            <SourcePartitions
+              heads={heads}
+              selected={partition}
+              onSelect={(p) => navigate({ search: { partition: p }, replace: true })}
+            />
           )}
           {kind !== "unkeyed" && partition !== undefined && <SourceKeys name={name} partition={partition} />}
           <Card>

@@ -73,7 +73,8 @@ export function AssetPartitions() {
         </div>
       </Card>
       <PartitionPanel name={name} row={selected} detail={detail} />
-      {selected?.status === "stale" && keyed && (
+      {/* A failed or running partition can be stale too: its reasons and keys show all the same. */}
+      {!!selected?.reasons?.length && keyed && (
         <StaleKeysCard name={name} partition={selected.partition} className="self-start xl:col-start-2" />
       )}
     </div>
@@ -217,7 +218,7 @@ function PartitionPanel({ name, row, detail }: { name: string; row?: PartitionRo
         actions={<StatusBadge status={row.status} />}
       />
       <div className="flex flex-col gap-4 px-4 pb-4">
-        {row.status === "stale" && (
+        {!!row.reasons?.length && (
           <div className="flex flex-col gap-1.5">
             <span className="text-2xs font-medium tracking-wide text-fg-subtle uppercase">Stale because</span>
             <StaleReasons reasons={row.reasons} />

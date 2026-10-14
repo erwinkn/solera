@@ -33,7 +33,7 @@ states).
 | `/assets` | the asset graph (layered DAG; edge style = edge kind) or a list (`?view=list`) |
 | `/assets/$asset` | declaration, heads per output × partition, staleness, cursor, automations |
 | `…/partitions` | the partition grid (1-D strip, 2-D matrix) colored by status, stale reasons, stale keys |
-| `…/keys` | stale keys with reasons, failed keys and their retries, per-key outcomes, **explain a key**, live key browser, forced retries |
+| `…/keys` | stale keys with reasons, key outcomes (failing keys and their retries, or every key), **explain a key**, live key browser, forced retries |
 | `…/inputs` | every input: kind, patterns, and per partition what it owes (added, updated, removed, or pending), a full run due, the commit it is observed through |
 | `…/history` | materializations (versions, rows, metadata) and lineage |
 | `…/runs` | runs that touched the asset |
@@ -198,9 +198,10 @@ read-only endpoints instead (with tests in `tests/server`):
 | `next_at` on automations | the next scheduled fire, from the engine's own clock rule |
 
 An attempt's `batch` and a task's `progress` (a task with no keyed
-incremental input has neither), an input partition's `observed` (owed keys by
+incremental input has neither; with several, they are the task's, its
+longest walk's), an input partition's `observed` (owed keys by
 class, or commits for an unkeyed upstream), per-key stale reasons (each
-through an input) and a history row's `final` come from the observed set
+through an input, at the upstream partition it reads) and a history row's `final` come from the observed set
 (rebuild steps 4.3 and 5); an attempt's `handle`, shown as Worker in its
 details, from step 6. Fields still landing — a source's `loader`,
 `version`, `dims` and `observe`, and served versions on source keys — are optional in `src/api/types.ts`: a view

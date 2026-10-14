@@ -86,7 +86,8 @@ function OutcomesCard({ name }: { name: string }) {
   const classes = list(outcome);
   const outcomes = useInfiniteQuery({
     ...q.outcomes(project, name, {
-      partition,
+      // A key search reads every partition, whichever one the page has selected.
+      partition: key ? undefined : partition,
       key,
       outcome: key ? undefined : classes.length ? classes : all ? undefined : CLASSES,
     }),
@@ -214,12 +215,25 @@ function OutcomesCard({ name }: { name: string }) {
             No key matched in the keys read so far; there are more to read.
           </Empty>
         ) : (
-          <Empty compact title={key ? "No such key" : all ? "No keys" : "Every key ok"}>
+          <Empty
+            compact
+            title={
+              key
+                ? "No such key"
+                : classes.length
+                  ? `No ${classes.map(label).join(" or ")} keys`
+                  : all
+                    ? "No keys"
+                    : "Every key ok"
+            }
+          >
             {key
               ? "No partition of this asset knows this key."
-              : all
-                ? "Its input holds no key yet."
-                : `No key of this asset is failing${classes.length ? " in these classes" : ""}.`}
+              : classes.length
+                ? `No key's latest outcome is ${classes.map(label).join(" or ")}${partition ? ` in ${partition}` : ""}.`
+                : all
+                  ? "Its input holds no key yet."
+                  : "No key of this asset is failing."}
           </Empty>
         )
       ) : (
@@ -228,7 +242,7 @@ function OutcomesCard({ name }: { name: string }) {
             <thead className="sticky top-0 bg-surface">
               <tr>
                 <Th>Key</Th>
-                {!partition && <Th>Partition</Th>}
+                {(!partition || key) && <Th>Partition</Th>}
                 <Th>Outcome</Th>
                 <Th>Version</Th>
                 {stored && <Th className="text-right">Tries</Th>}
@@ -243,7 +257,7 @@ function OutcomesCard({ name }: { name: string }) {
                   key={`${k.partition}/${k.key}`}
                   row={k}
                   now={now}
-                  showPartition={!partition}
+                  showPartition={!partition || !!key}
                   stored={stored}
                 />
               ))}

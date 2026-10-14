@@ -194,6 +194,7 @@ const sources = createRoute({
 const source = createRoute({
   getParentRoute: () => root,
   path: "/sources/$source",
+  validateSearch: (s: Record<string, unknown>) => optional({ partition: str(s.partition) }),
   component: lazyRouteComponent(() => import("@/routes/sources"), "Source"),
 });
 

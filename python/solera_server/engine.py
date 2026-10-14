@@ -860,7 +860,8 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
             "id": run_id,
             "kind": "cleanup",
             "targets": [],
-            "partitions": "latest",
+            # Its scope, for the runs list: one output partition, or a retired output life's whole.
+            "partitions": [cleanup["partition"]] if "partition" in cleanup else "latest",
             "mode": "incremental",
             "upstream": False,
             "config": {},

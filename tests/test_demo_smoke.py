@@ -127,7 +127,9 @@ def every_route(serve: Serve) -> int:
         partition = ""
         if manifest["assets"][name].get("partitions"):  # the console asks only of partitioned ones
             built = [
-                p for p in get(f"{BASE}/partitions/{name}")["partitions"] if p["status"] in ("materialized", "stale")
+                p
+                for p in get(f"{BASE}/partitions/{name}")["partitions"]
+                if p["status"] in ("materialized", "stale")
             ]
             if not built:  # nothing to read per partition: a page shows it missing
                 continue

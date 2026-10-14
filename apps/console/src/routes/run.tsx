@@ -2,7 +2,15 @@ import type { ReactNode } from "react";
 import { useQuery, useSuspenseQuery } from "@tanstack/react-query";
 import { getRouteApi, Link } from "@tanstack/react-router";
 import { Ban, CirclePause, CirclePlay, RotateCcw, Trash2 } from "lucide-react";
-import { ACTIVE_ATTEMPT, ACTIVE_RUN, q, runIsLive, useManifest, useProject } from "@/api/queries";
+import {
+  ACTIVE_ATTEMPT,
+  ACTIVE_RUN,
+  q,
+  runIsLive,
+  TERMINAL_TASK,
+  useManifest,
+  useProject,
+} from "@/api/queries";
 import { useDeleteRun, useRetryRun, useRunAction } from "@/api/mutations";
 import type { Attempt, AttemptError, Json, RunDetail, RunEvent, Task } from "@/api/types";
 import { CLEANUP, PartitionsLabel, runTitle, TriggerLabel } from "@/features/runs";
@@ -37,7 +45,7 @@ const route = getRouteApi("/runs/$run");
 function defaultTask(tasks: Task[]): Task | undefined {
   return (
     tasks.find((t) => tone(t.status) === "fail") ??
-    tasks.find((t) => ACTIVE_RUN.has(t.status) || t.status === "running") ??
+    tasks.find((t) => !TERMINAL_TASK.has(t.status)) ??
     tasks[0]
   );
 }
@@ -125,8 +133,7 @@ export function Run() {
             </Meta>
             {live && tasks.length > 1 && (
               <Meta label="Tasks">
-                {tasks.filter((t) => !ACTIVE_RUN.has(t.status) && t.status !== "running").length} of{" "}
-                {tasks.length} done
+                {tasks.filter((t) => TERMINAL_TASK.has(t.status)).length} of {tasks.length} done
               </Meta>
             )}
             <Meta label="Started">
@@ -896,9 +903,7 @@ function SpecTab({ run, attempt }: { run: string; attempt: Attempt }) {
                     {plural(Object.keys(pin.refs).length, "partition")} (all partitions)
                   </span>
                 )}
-                {pin.batch && (
-                  <span className="text-fg-subtle">{describeBatch(pin.batch, attempt.batch)}</span>
-                )}
+                {pin.batch && <span className="text-fg-subtle">{describeBatch(pin.batch)}</span>}
               </li>
             ))}
           </ul>
@@ -909,14 +914,19 @@ function SpecTab({ run, attempt }: { run: string; attempt: Attempt }) {
   );
 }
 
-/** What an incremental pin reads: its batch, from the attempt's own record, else the spec's index and keys. */
-function describeBatch(pin: Record<string, Json>, batch: Attempt["batch"]): string {
-  const index = batch?.index ?? (typeof pin.index === "number" ? pin.index : null);
-  const count = batch?.count ?? (typeof pin.count === "number" ? pin.count : null);
+/** What an incremental pin reads, from the pin itself: each input walks its own batches
+ * (`a` may end in batch 1 while `b` goes on), so the attempt's batch speaks for none of them. */
+function describeBatch(pin: Record<string, Json>): string {
   const parts: string[] = [];
-  if (index != null) parts.push(batchLabel({ index, count }, pin.final === true));
-  if (batch) parts.push(`${batch.after == null ? "first" : `after ${batch.after}`} → ${batch.last ?? "end"}`);
+  if (typeof pin.index === "number") {
+    const count = typeof pin.count === "number" ? pin.count : null;
+    parts.push(batchLabel({ index: pin.index, count }, pin.final === true || pin.more === false));
+  }
   if (Array.isArray(pin.keys)) parts.push(plural(pin.keys.length, "key"));
+  if (Array.isArray(pin.commits) && pin.commits.length === 2) {
+    const [lo, hi] = pin.commits as number[];
+    parts.push(hi! < lo! ? "no new commits" : lo === hi ? `commit ${lo}` : `commits ${lo}–${hi}`);
+  }
   return parts.join(" · ");
 }
 

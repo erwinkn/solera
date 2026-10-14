@@ -232,11 +232,12 @@ export type PartitionStatus = "removed" | "running" | "failed" | "stale" | "mate
  * (new patterns included), an upstream it reads is itself stale, or its asset changed. */
 export type StaleReason = "input changed" | "upstream stale" | "definition changed";
 
-/** One stale key, and its own reasons: each names the input it comes through. A key
- * stale only for a partition-wide reason (a definition change) has none of its own. */
+/** One stale key, and its own reasons: each names the input it comes through and the
+ * upstream partition that input reads. A key stale only for a partition-wide reason (a
+ * definition change) has none of its own. */
 export interface StaleKey {
   key: string;
-  reasons: { kind: StaleReason; input: string }[];
+  reasons: { kind: StaleReason; input: string; upstream_partition: string }[];
 }
 
 /** A page of an asset partition's stale keys: all of them or none for a keyed output
@@ -269,7 +270,8 @@ export interface PartitionRow {
   status: PartitionStatus;
   last_outcome: string | null;
   last_attempt: string | null;
-  reasons?: string[]; // when `stale`
+  /** Why it is stale, when it is: a failed or running partition can be stale too. */
+  reasons?: string[];
 }
 
 export interface OutputHead {
