@@ -11,7 +11,7 @@ import { Popover } from "@/ui/overlay";
 
 /**
  * Why a partition or key is stale (glossary, "stale"), one chip per reason,
- * each explained on hover, focus or tap. Staleness is computed on demand:
+ * each explained on hover, click, tap or Enter. Staleness is computed on demand:
  * these are the engine's answer now, not a stored state.
  */
 export function StaleReasons({ reasons, className }: { reasons: string[] | undefined; className?: string }) {
@@ -24,7 +24,8 @@ export function StaleReasons({ reasons, className }: { reasons: string[] | undef
           <Popover
             key={r}
             openOnHover
-            className="max-w-72 text-xs"
+            title={reason.label}
+            className="max-w-72 text-xs text-fg-muted"
             trigger={
               <button
                 type="button"

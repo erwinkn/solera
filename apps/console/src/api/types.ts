@@ -573,15 +573,18 @@ export interface Task {
 
 export interface Progress {
   batch: number;
-  key: string | null;
+  /** The key it reached; for a task whose only walk left is an unkeyed input's, the commit. */
+  key: string | number | null;
 }
 
 /** One step of a task's walk (docs/observed-set.md, "A run"): up to `batch_size` keys,
  * committed once. `index` is 0-based in the run, `count` the planned total (possibly an
- * estimate); the batch covers keys in `(after, last]`. Retries share their batch. */
+ * estimate), `final` whether it is the run's last; the batch covers keys in `(after, last]`
+ * of its longest keyed walk, none once only unkeyed inputs walk on. Retries share their batch. */
 export interface Batch {
   index: number;
   count: number | null;
+  final: boolean;
   after: string | null;
   last: string | null;
   added: number;

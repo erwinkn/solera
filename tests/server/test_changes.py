@@ -8,7 +8,7 @@ import asyncio
 
 import pytest
 from solera.sdk import Incremental, Output, Project, Source, asset
-from solera.stores import FileStore
+from solera.stores import FileStore, Patch
 from solera_server.state import State
 
 from tests.sim.oracle import value_content
@@ -374,10 +374,48 @@ async def test_a_task_walks_as_long_as_its_longest_input(state, tmp_path):
     assert status_of(detail) == "succeeded"
     (task,) = [t for t in detail["tasks"] if t["asset"] == "out"]
     batches = [x["batch"] for x in detail["attempts"][task["id"]]]
-    assert [(x["index"], x["count"], x["added"], x["last"]) for x in batches] == [
-        (0, 3, 4, "b1"),
-        (1, 3, 2, "b3"),
-        (2, 3, 2, None),
+    assert [(x["index"], x["count"], x["final"], x["added"], x["last"]) for x in batches] == [
+        (0, 3, False, 4, "b1"),
+        (1, 3, False, 2, "b3"),
+        (2, 3, True, 2, None),
     ]
+    assert task["progress"] == {"batch": 2, "key": None}
+    await engine.stop()
+
+
+async def test_a_batch_goes_on_with_an_unkeyed_walk(state, tmp_path):
+    """A keyed input of two keys and an unkeyed one of six commits, in
+    batches of two: the keyed walk ends in batch 1, the unkeyed one in batch
+    3. Every attempt says its batch, numbered on, and only the third is
+    final; the batches after the keyed walk ended have no key range."""
+
+    @asset(outputs=Output("a", key="id"))
+    def a():
+        return [{"id": f"a{i}"} for i in range(2)]
+
+    @asset(outputs=Output("c", incremental=True))
+    def c(ctx):
+        return Patch([{"n": ctx.config.get("n", 0)}])
+
+    @asset(inputs={"a": Incremental(batch_size=2), "c": Incremental(batch_size=2)}, outputs=Output("out"))
+    def out(ctx, a: list, c: list):
+        return {"n": len(a)}
+
+    project = Project(assets=[a, c, out], default_store=FileStore(tmp_path / "data"))
+    engine = make_engine(state, project)
+    await engine.initialize()
+    assert status_of(await drive(engine, await engine.submit(["a"]))) == "succeeded"
+    for n in range(6):
+        assert status_of(await drive(engine, await engine.submit(["c"], config={"n": n}))) == "succeeded"
+    detail = await drive(engine, await engine.submit(["out"]))
+    assert status_of(detail) == "succeeded"
+    (task,) = detail["tasks"]
+    batches = [x["batch"] for x in detail["attempts"][task["id"]]]
+    assert [(x["index"], x["count"], x["final"], x["added"], x["last"]) for x in batches] == [
+        (0, 3, False, 2, None),
+        (1, 3, False, 0, None),
+        (2, 3, True, 0, None),
+    ]
+    assert batches[0]["after"] is None and batches[1]["after"] is None
     assert task["progress"] == {"batch": 2, "key": None}
     await engine.stop()

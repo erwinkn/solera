@@ -1,1 +1,0 @@
-import{Fn as e,Ln as t}from"./layout-DGlYKmN4.js";function n(n,r){return e(n,t,r)}export{n as t};

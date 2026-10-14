@@ -84,10 +84,12 @@ function OutcomesCard({ name }: { name: string }) {
   const now = useNow();
   const all = view === "all";
   const classes = list(outcome);
+  // A key search spans every partition, whichever one the page has selected: its rows, the
+  // class totals and the retries all do.
+  const scope = key ? undefined : partition;
   const outcomes = useInfiniteQuery({
     ...q.outcomes(project, name, {
-      // A key search reads every partition, whichever one the page has selected.
-      partition: key ? undefined : partition,
+      partition: scope,
       key,
       outcome: key ? undefined : classes.length ? classes : all ? undefined : CLASSES,
     }),
@@ -130,11 +132,11 @@ function OutcomesCard({ name }: { name: string }) {
             }
           >
             {(["failed", "rejected", "canceled", "timed_out", "retrying"] as const).map((c) => (
-              <MenuItem key={c} onClick={() => retry.mutate({ classes: [c], partition })}>
+              <MenuItem key={c} onClick={() => retry.mutate({ classes: [c], partition: scope })}>
                 Retry {label(c)} keys{totals[c] ? ` (${totals[c]})` : ""}
               </MenuItem>
             ))}
-            <MenuItem onClick={() => retry.mutate({ classes: ["all"], partition })}>
+            <MenuItem onClick={() => retry.mutate({ classes: ["all"], partition: scope })}>
               Retry every key that didn't end ok
             </MenuItem>
           </Menu>
@@ -230,7 +232,7 @@ function OutcomesCard({ name }: { name: string }) {
             {key
               ? "No partition of this asset knows this key."
               : classes.length
-                ? `No key's latest outcome is ${classes.map(label).join(" or ")}${partition ? ` in ${partition}` : ""}.`
+                ? `No key's latest outcome is ${classes.map(label).join(" or ")}${scope ? ` in ${scope}` : ""}.`
                 : all
                   ? "Its input holds no key yet."
                   : "No key of this asset is failing."}
@@ -242,7 +244,7 @@ function OutcomesCard({ name }: { name: string }) {
             <thead className="sticky top-0 bg-surface">
               <tr>
                 <Th>Key</Th>
-                {(!partition || key) && <Th>Partition</Th>}
+                {!scope && <Th>Partition</Th>}
                 <Th>Outcome</Th>
                 <Th>Version</Th>
                 {stored && <Th className="text-right">Tries</Th>}
@@ -257,7 +259,7 @@ function OutcomesCard({ name }: { name: string }) {
                   key={`${k.partition}/${k.key}`}
                   row={k}
                   now={now}
-                  showPartition={!partition || !!key}
+                  showPartition={!scope}
                   stored={stored}
                 />
               ))}

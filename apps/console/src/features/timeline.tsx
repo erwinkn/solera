@@ -49,7 +49,7 @@ function PhaseTip({ attempt, attempts, end }: { attempt: Attempt; attempts: Atte
           {[
             name && name[0]!.toUpperCase() + name.slice(1),
             // The run's last batch: no more of this run follow. Not a word on completeness (D177).
-            name && attempt.batch?.last === null && "the run's last batch",
+            name && attempt.batch?.final && "the run's last batch",
             label(attempt.outcome),
           ]
             .filter(Boolean)

@@ -1,0 +1,1 @@
+import{Fn as e,Ln as t}from"./layout-nJjCgWjc.js";function n(n,r){return e(n,t,r)}export{n as t};

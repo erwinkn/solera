@@ -184,24 +184,32 @@ export function MenuItem({
   );
 }
 
-/** A popover; `openOnHover` also opens it on hover, as a tooltip that a tap or a key opens too. */
+/**
+ * A popover, opened by a click, a tap or a key; `openOnHover` opens it on
+ * hover too, a toggletip. `title` heads it and names it for assistive tech.
+ */
 export function Popover({
   trigger,
   children,
   className,
   openOnHover,
+  title,
 }: {
   trigger: ReactElement;
   children: ReactNode;
   className?: string;
   openOnHover?: boolean;
+  title?: ReactNode;
 }) {
   return (
     <BasePopover.Root>
       <BasePopover.Trigger render={trigger} openOnHover={openOnHover} />
       <BasePopover.Portal>
         <BasePopover.Positioner sideOffset={6} align="start" className="z-50">
-          <BasePopover.Popup className={cn(popup, "p-3", className)}>{children}</BasePopover.Popup>
+          <BasePopover.Popup className={cn(popup, "p-3", className)}>
+            {title && <BasePopover.Title className="mb-1 font-medium text-fg">{title}</BasePopover.Title>}
+            {children}
+          </BasePopover.Popup>
         </BasePopover.Positioner>
       </BasePopover.Portal>
     </BasePopover.Root>

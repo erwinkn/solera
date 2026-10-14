@@ -292,22 +292,27 @@ def span(attempt: dict) -> float:
 
 
 def batch(plans: dict | None) -> dict | None:
-    """A keyed attempt's batch, as the history shows it: its index in its
-    run, the batches the run planned (an estimate: the longest walk's), the
-    key range of its longest keyed walk — the first by name not at its final
-    batch, else the first — so `last` is None only when every keyed walk
-    ends here, and its classes, counted over every keyed input it reads."""
+    """A keyed attempt's batch, as the history shows it — None for a task
+    with no keyed input. Its inputs walk together, a batch of each per
+    attempt, until each is final: its index, the batches the run planned (an
+    estimate: the longest walk's), whether it is the run's last (`final`:
+    every walk ends here), the key range of its longest keyed walk — the
+    first by name not at its final batch, else the first; none once every
+    keyed walk has ended, its unkeyed ones going on — and its classes,
+    counted over every keyed input it reads."""
 
-    walking = [p for _, p in sorted((plans or {}).items()) if p and not p.get("done")]
-    keyed = [p for p in walking if p["kind"] == "observed"]
-    if not keyed:
+    plans = [p for _, p in sorted((plans or {}).items()) if p]
+    walking = [p for p in plans if not p.get("done")]
+    if not walking or not any(p["kind"] == "observed" for p in plans):
         return None
-    longest = next((p for p in keyed if not p["final"]), keyed[0])
+    keyed = [p for p in walking if p["kind"] == "observed"]
+    longest = next((p for p in keyed if not p["final"]), keyed[0] if keyed else None)
     return {
-        "index": longest["index"],
+        "index": max(p["index"] for p in walking),
         "count": max(p["count"] for p in walking),
-        "after": longest["after"],
-        "last": longest["end"],
+        "final": all(p["final"] for p in walking),
+        "after": longest and longest["after"],
+        "last": longest and longest["end"],
         **{
             c: sum(p["classes"].get(c, 0) for p in keyed)
             for c in ("added", "updated", "removed", "unchanged")
@@ -318,15 +323,18 @@ def batch(plans: dict | None) -> dict | None:
 def progress(task: dict) -> dict | None:
     """A task's progress, as the history shows it: its walk's last committed
     batch, `{batch, key}` — `key` None once every input's walk is final — or
-    None before its first commit. Its inputs walk together, a batch of each
-    per attempt, so the first by name still walking speaks for the task; once
-    all are final, the longest."""
+    None before its first commit. Its inputs walk together, so one still
+    walking speaks for the task — a keyed one first, whose `key` is a key
+    (an unkeyed one's is a commit number) — and once all are final, the
+    longest."""
 
     walks = task.get("progress") or {}
     if not walks:
         return None
-    walking = [w for _, w in sorted(walks.items()) if w["key"] is not None]
-    return walking[0] if walking else max(walks.values(), key=lambda w: w["batch"])
+    walking = sorted(
+        (not isinstance(w["key"], str), name, w) for name, w in walks.items() if w["key"] is not None
+    )
+    return walking[0][2] if walking else max(walks.values(), key=lambda w: w["batch"])
 
 
 def attempt_row(run_id: str, task: dict, summary: dict, n: int) -> dict:

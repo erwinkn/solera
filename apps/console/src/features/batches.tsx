@@ -47,6 +47,10 @@ export function batchLabel(batch: Pick<Batch, "index" | "count">, done?: boolean
   return `batch ${n} of ${done ? "" : "~"}${count(Math.max(batch.count, n))}`;
 }
 
+/** Whether a batch reads a key range: none once its keyed walks have ended and only unkeyed ones go on. */
+export const hasRange = (b: Batch) =>
+  b.after != null || b.last != null || b.added + b.updated + b.removed + b.unchanged > 0;
+
 /** The keys a batch covers, `(after, last]`, as an operator reads it; a null `last` runs to the end. */
 export function BatchRange({
   batch,
@@ -158,7 +162,8 @@ export function describeProgress(
   const n = progress.batch + 1;
   if (progress.key === null) return `${count(n)} batches`;
   const of = planned != null ? ` of ~${count(Math.max(planned, n + 1))}` : "";
-  return `batch ${count(n)}${of} committed, through ${progress.key}`;
+  const through = typeof progress.key === "number" ? `commit ${progress.key}` : progress.key;
+  return `batch ${count(n)}${of} committed, through ${through}`;
 }
 
 /** A thin bar of a walk's committed batches against the planned count. */

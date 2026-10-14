@@ -16,6 +16,7 @@ import type { Attempt, AttemptError, Json, RunDetail, RunEvent, Task } from "@/a
 import { CLEANUP, PartitionsLabel, runTitle, TriggerLabel } from "@/features/runs";
 import {
   BatchRange,
+  hasRange,
   batchLabel,
   describeProgress,
   isReplan,
@@ -476,10 +477,12 @@ function Batches({ run, task, walk, selected }: { run: string; task: Task; walk:
                   >
                     <StatusIcon status={done ? "committed" : last.outcome} />
                     <span className="tabular">{batch ? batchLabel(batch, final) : label(last.outcome)}</span>
-                    {batch?.last === null && <span className="text-xs text-fg-subtle">final</span>}
+                    {batch?.final && <span className="text-xs text-fg-subtle">final</span>}
                   </Link>
                 </td>
-                <td className="max-w-80 px-3 py-1.5">{batch && <BatchRange batch={batch} />}</td>
+                <td className="max-w-80 px-3 py-1.5">
+                  {batch && hasRange(batch) && <BatchRange batch={batch} />}
+                </td>
                 <td className="px-3 py-1.5">{batch && <KeyClasses {...batch} />}</td>
                 {(walk.retried || walk.replanned) && (
                   <td className="py-1.5 pr-4 pl-3">
