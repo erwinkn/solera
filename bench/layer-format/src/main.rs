@@ -38,33 +38,21 @@ impl Args {
     }
 }
 
-/// The entries of commits `[lo, hi]`, sorted; with `ranged`, only those no
-/// range record covers.
-fn entries_of(w: &Workload, lo: u64, hi: u64, ranged: Option<&Ranged>) -> Vec<(u32, u32, u64, u64)> {
-    let mut v: Vec<(u32, u32, u64, u64)> = w.commits[lo as usize..=hi as usize]
-        .iter()
-        .enumerate()
-        .flat_map(|(i, c)| {
-            let cov = ranged.map(|r| &r.covered[lo as usize + i]);
-            c.iter()
-                .enumerate()
-                .filter(move |(j, _)| cov.is_none_or(|cov| cov.is_empty() || !cov[*j]))
-                .map(move |(_, e)| (e.id, lo as u32 + i as u32, e.new, e.replaced))
-        })
-        .collect();
-    v.sort_unstable_by_key(|e| (e.0, std::cmp::Reverse(e.1)));
-    v
-}
-
 /// Range records, found the way the engine would know them: a commit whose
 /// changes include every key present just before it in an id interval, all
 /// rewritten to one version (or all removed), at least `min` keys.
 struct Ranged {
     recs: Vec<Vec<(u32, u32, u64)>>, // by commit: first id, last id, new (NONE: removed)
-    covered: Vec<Vec<bool>>,         // by commit, by change: in a record (empty: none is)
+    covered: usize,                  // entries the records stand for
 }
 
 impl Ranged {
+    /// Whether a record stands for `id`'s entry at `c`: every key present
+    /// before c inside a record's interval is in it (an add is not).
+    fn covers(&self, id: u32, c: u64, replaced: u64) -> bool {
+        replaced != NONE && self.recs[c as usize].iter().any(|r| r.0 <= id && id <= r.1)
+    }
+
     fn recs(&self, lo: u64, hi: u64) -> Vec<ours::Rec> {
         (lo..=hi)
             .flat_map(|c| {
@@ -81,10 +69,10 @@ impl Ranged {
 
 fn detect(w: &Workload, o: &Oracle, min: usize, threads: usize) -> Ranged {
     let n = w.commits.len();
-    let one = |c: usize| -> (Vec<(u32, u32, u64)>, Vec<bool>) {
+    let one = |c: usize| -> (Vec<(u32, u32, u64)>, usize) {
         let ch = &w.commits[c];
         let present = |id: u32| o.at(id, c as u64 - 1).0 != NONE;
-        let (mut recs, mut cov) = (Vec::new(), Vec::new());
+        let (mut recs, mut cov) = (Vec::new(), 0);
         let mut i = 0;
         while i < ch.len() {
             let x = ch[i];
@@ -92,23 +80,20 @@ fn detect(w: &Workload, o: &Oracle, min: usize, threads: usize) -> Ranged {
                 i += 1;
                 continue; // an add: the key was not there before
             }
-            let (mut members, mut last, mut k) = (vec![i], x.id, i + 1);
+            let (mut members, mut last, mut k) = (1, x.id, i + 1);
             while k < ch.len() {
                 let y = ch[k];
                 if y.replaced != NONE {
                     if y.new != x.new || (last + 1..y.id).any(present) {
                         break;
                     }
-                    members.push(k);
+                    members += 1;
                     last = y.id;
                 }
                 k += 1;
             }
-            if members.len() >= min {
-                if cov.is_empty() {
-                    cov = vec![false; ch.len()];
-                }
-                members.iter().for_each(|&m| cov[m] = true);
+            if members >= min {
+                cov += members;
                 recs.push((x.id, last, x.new));
             }
             i = k;
@@ -116,7 +101,7 @@ fn detect(w: &Workload, o: &Oracle, min: usize, threads: usize) -> Ranged {
         (recs, cov)
     };
     let next = std::sync::atomic::AtomicUsize::new(LOAD as usize + 1);
-    let out = std::sync::Mutex::new(vec![(Vec::new(), Vec::new()); n]);
+    let out = std::sync::Mutex::new(vec![(Vec::new(), 0); n]);
     std::thread::scope(|s| {
         for _ in 0..threads {
             s.spawn(|| loop {
@@ -129,8 +114,11 @@ fn detect(w: &Workload, o: &Oracle, min: usize, threads: usize) -> Ranged {
             });
         }
     });
-    let (recs, covered) = out.into_inner().unwrap().into_iter().unzip();
-    Ranged { recs, covered }
+    let (recs, covered): (Vec<_>, Vec<usize>) = out.into_inner().unwrap().into_iter().unzip();
+    Ranged {
+        recs,
+        covered: covered.iter().sum(),
+    }
 }
 
 fn opt(v: u64) -> Option<u64> {
@@ -400,16 +388,15 @@ fn main() {
     let ranged = fmts.iter().any(|f| f.ranges()).then(|| {
         let t = Instant::now();
         let r = detect(&w, &oracle, a.get("min_run", 16), threads);
-        let (n, k): (usize, usize) = (
-            r.recs.iter().map(|v| v.len()).sum(),
-            r.covered.iter().map(|v| v.iter().filter(|&&x| x).count()).sum(),
-        );
+        let n: usize = r.recs.iter().map(|v| v.len()).sum();
         eprintln!(
-            "range records: {n}, covering {k} entries, found in {:.1}s",
+            "range records: {n}, covering {} entries, found in {:.1}s",
+            r.covered,
             t.elapsed().as_secs_f64()
         );
         r
     });
+    drop(w); // the oracle answers from here on: room for 100M keys in 16 GB
     let jobs: Vec<(usize, Fmt)> = (0..sch.layers.len())
         .flat_map(|i| fmts.iter().map(move |&f| (i, f)))
         .collect();
@@ -436,12 +423,18 @@ fn main() {
                     })
                 } else {
                     let r = ranged.as_ref().filter(|_| fmt.ranges());
-                    let es = entries_of(&w, spec.lo, spec.hi, r);
                     let recs = r.map_or(Vec::new(), |r| r.recs(spec.lo, spec.hi));
+                    let mut es = Vec::new();
                     write(fmt, &a, path, spec, recs, &mut |push| {
-                        for e in &es {
-                            gen::key_of(e.0, &mut buf);
-                            push(&buf, e.1 as u64, opt(e.2), opt(e.3));
+                        for id in 0..oracle.space() {
+                            oracle.entries(id, spec.lo, spec.hi, &mut es);
+                            for &(c, new, replaced) in &es {
+                                if r.is_some_and(|r| r.covers(id, c, replaced)) {
+                                    continue;
+                                }
+                                gen::key_of(id, &mut buf);
+                                push(&buf, c, opt(new), opt(replaced));
+                            }
                         }
                     })
                 };
@@ -453,15 +446,12 @@ fn main() {
     let mut built = built.into_inner().unwrap();
     built.sort_by_key(|l| (l.fmt.name(), l.lo));
     eprintln!("layers written in {:.1}s", t1.elapsed().as_secs_f64());
-    drop(w); // the oracle answers from here on: room for 100M keys in 16 GB
     for &fmt in &fmts {
         let ls: Vec<&Layer> = built.iter().filter(|l| l.fmt == fmt).collect();
         let records: usize = ranged.as_ref().filter(|_| fmt.ranges()).map_or(0, |r| {
             ls.iter().filter(|l| !l.base).map(|l| r.recs(l.lo, l.hi).len()).sum()
         });
-        let covered: usize = ranged.as_ref().filter(|_| fmt.ranges()).map_or(0, |r| {
-            r.covered.iter().map(|v| v.iter().filter(|&&x| x).count()).sum()
-        });
+        let covered: usize = ranged.as_ref().filter(|_| fmt.ranges()).map_or(0, |r| r.covered);
         let stored: u64 = ls.iter().map(|l| l.size).sum();
         let meta: u64 = ls.iter().map(|l| l.size - l.meta_start).sum();
         let base = ls.iter().find(|l| l.base).unwrap();

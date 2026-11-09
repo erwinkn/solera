@@ -1,0 +1,106 @@
+== ours
+daily-scattered 100000000: 1720 commits, 32457748 entries after the load, 10 layers (max 15), merges wrote 4.16 entries per entry committed, generated in 10.8s
+layers written in 23.1s
+	Command being timed: "/home/user/.cache/layer-format-target/release/layer-format workload=daily-scattered keys=100000000 fmts=ours block=32768 level=1 coalesce=65536 one_get=1048576 threads=2 tmp=/tmp/layer-format/ranges-daily-scattered-100m"
+	User time (seconds): 148.52
+	System time (seconds): 6.93
+	Percent of CPU this job got: 94%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 2:44.83
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 6789804
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 0
+	Minor (reclaiming a frame) page faults: 3050302
+	Voluntary context switches: 758
+	Involuntary context switches: 306
+	Swaps: 0
+	File system inputs: 0
+	File system outputs: 2517704
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0
+== ours+ranges
+daily-scattered 100000000: 1720 commits, 32457748 entries after the load, 10 layers (max 15), merges wrote 4.16 entries per entry committed, generated in 11.7s
+range records: 0, covering 0 entries, found in 1.0s
+layers written in 23.9s
+	Command being timed: "/home/user/.cache/layer-format-target/release/layer-format workload=daily-scattered keys=100000000 fmts=ours+ranges block=32768 level=1 coalesce=65536 one_get=1048576 threads=2 tmp=/tmp/layer-format/ranges-daily-scattered-100m"
+	User time (seconds): 155.06
+	System time (seconds): 7.23
+	Percent of CPU this job got: 95%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 2:50.28
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 6789880
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 0
+	Minor (reclaiming a frame) page faults: 3232523
+	Voluntary context switches: 772
+	Involuntary context switches: 320
+	Swaps: 0
+	File system inputs: 0
+	File system outputs: 2517704
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0
+== ours+rle
+daily-scattered 100000000: 1720 commits, 32457748 entries after the load, 10 layers (max 15), merges wrote 4.16 entries per entry committed, generated in 10.8s
+layers written in 24.0s
+	Command being timed: "/home/user/.cache/layer-format-target/release/layer-format workload=daily-scattered keys=100000000 fmts=ours+rle block=32768 level=1 coalesce=65536 one_get=1048576 threads=2 tmp=/tmp/layer-format/ranges-daily-scattered-100m"
+	User time (seconds): 148.76
+	System time (seconds): 6.63
+	Percent of CPU this job got: 93%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 2:45.67
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 6789860
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 0
+	Minor (reclaiming a frame) page faults: 2933942
+	Voluntary context switches: 772
+	Involuntary context switches: 300
+	Swaps: 0
+	File system inputs: 0
+	File system outputs: 2512040
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0
+== ours+ranges+rle
+daily-scattered 100000000: 1720 commits, 32457748 entries after the load, 10 layers (max 15), merges wrote 4.16 entries per entry committed, generated in 11.8s
+range records: 0, covering 0 entries, found in 1.1s
+layers written in 24.7s
+	Command being timed: "/home/user/.cache/layer-format-target/release/layer-format workload=daily-scattered keys=100000000 fmts=ours+ranges+rle block=32768 level=1 coalesce=65536 one_get=1048576 threads=2 tmp=/tmp/layer-format/ranges-daily-scattered-100m"
+	User time (seconds): 161.12
+	System time (seconds): 7.15
+	Percent of CPU this job got: 95%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 2:56.21
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 6789740
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 0
+	Minor (reclaiming a frame) page faults: 3043907
+	Voluntary context switches: 778
+	Involuntary context switches: 320
+	Swaps: 0
+	File system inputs: 0
+	File system outputs: 2512040
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0
