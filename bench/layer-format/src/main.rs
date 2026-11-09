@@ -38,17 +38,99 @@ impl Args {
     }
 }
 
-fn entries_of(w: &Workload, lo: u64, hi: u64) -> Vec<(u32, u32, u64, u64)> {
+/// The entries of commits `[lo, hi]`, sorted; with `ranged`, only those no
+/// range record covers.
+fn entries_of(w: &Workload, lo: u64, hi: u64, ranged: Option<&Ranged>) -> Vec<(u32, u32, u64, u64)> {
     let mut v: Vec<(u32, u32, u64, u64)> = w.commits[lo as usize..=hi as usize]
         .iter()
         .enumerate()
         .flat_map(|(i, c)| {
+            let cov = ranged.map(|r| &r.covered[lo as usize + i]);
             c.iter()
-                .map(move |e| (e.id, lo as u32 + i as u32, e.new, e.replaced))
+                .enumerate()
+                .filter(move |(j, _)| cov.is_none_or(|cov| cov.is_empty() || !cov[*j]))
+                .map(move |(_, e)| (e.id, lo as u32 + i as u32, e.new, e.replaced))
         })
         .collect();
     v.sort_unstable_by_key(|e| (e.0, std::cmp::Reverse(e.1)));
     v
+}
+
+/// Range records, found the way the engine would know them: a commit whose
+/// changes include every key present just before it in an id interval, all
+/// rewritten to one version (or all removed), at least `min` keys.
+struct Ranged {
+    recs: Vec<Vec<(u32, u32, u64)>>, // by commit: first id, last id, new (NONE: removed)
+    covered: Vec<Vec<bool>>,         // by commit, by change: in a record (empty: none is)
+}
+
+impl Ranged {
+    fn recs(&self, lo: u64, hi: u64) -> Vec<ours::Rec> {
+        (lo..=hi)
+            .flat_map(|c| {
+                self.recs[c as usize].iter().map(move |&(a, b, new)| ours::Rec {
+                    lo: key(a),
+                    hi: key(b),
+                    commit: c,
+                    new: opt(new),
+                })
+            })
+            .collect()
+    }
+}
+
+fn detect(w: &Workload, o: &Oracle, min: usize, threads: usize) -> Ranged {
+    let n = w.commits.len();
+    let one = |c: usize| -> (Vec<(u32, u32, u64)>, Vec<bool>) {
+        let ch = &w.commits[c];
+        let present = |id: u32| o.at(id, c as u64 - 1).0 != NONE;
+        let (mut recs, mut cov) = (Vec::new(), Vec::new());
+        let mut i = 0;
+        while i < ch.len() {
+            let x = ch[i];
+            if x.replaced == NONE {
+                i += 1;
+                continue; // an add: the key was not there before
+            }
+            let (mut members, mut last, mut k) = (vec![i], x.id, i + 1);
+            while k < ch.len() {
+                let y = ch[k];
+                if y.replaced != NONE {
+                    if y.new != x.new || (last + 1..y.id).any(present) {
+                        break;
+                    }
+                    members.push(k);
+                    last = y.id;
+                }
+                k += 1;
+            }
+            if members.len() >= min {
+                if cov.is_empty() {
+                    cov = vec![false; ch.len()];
+                }
+                members.iter().for_each(|&m| cov[m] = true);
+                recs.push((x.id, last, x.new));
+            }
+            i = k;
+        }
+        (recs, cov)
+    };
+    let next = std::sync::atomic::AtomicUsize::new(LOAD as usize + 1);
+    let out = std::sync::Mutex::new(vec![(Vec::new(), Vec::new()); n]);
+    std::thread::scope(|s| {
+        for _ in 0..threads {
+            s.spawn(|| loop {
+                let c = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if c >= n {
+                    return;
+                }
+                let r = one(c);
+                out.lock().unwrap()[c] = r;
+            });
+        }
+    });
+    let (recs, covered) = out.into_inner().unwrap().into_iter().unzip();
+    Ranged { recs, covered }
 }
 
 fn opt(v: u64) -> Option<u64> {
@@ -65,6 +147,7 @@ fn write(
     a: &Args,
     path: String,
     spec: &sched::Spec,
+    recs: Vec<ours::Rec>,
     each: &mut dyn FnMut(&mut dyn FnMut(&[u8], u64, Option<u64>, Option<u64>)),
 ) -> (Layer, Bytes) {
     let (mut first, mut last) = (Vec::new(), Vec::new());
@@ -76,18 +159,25 @@ fn write(
         last.extend_from_slice(k);
     };
     let (data, size, meta_start, meta2) = match fmt {
-        Fmt::Ours => {
-            let mut w = ours::Writer::new(Vec::new(), a.get("block", 16384), a.get("level", 1));
-            if a.s("layout", "rows") == "cols" {
-                w = w.by_columns();
-            }
+        f if f.ours() => {
+            let mut w = writer(f, a, Vec::new());
             each(&mut |k, c, n, r| {
                 track(k);
                 w.push(k, c, n, r)
             });
+            for r in recs {
+                if first.is_empty() || r.lo < first {
+                    first = r.lo.clone();
+                }
+                if r.hi > last {
+                    last = r.hi.clone();
+                }
+                w.push_range(r);
+            }
             w.finish()
         }
-        Fmt::Pq => {
+        _ => {
+            assert!(recs.is_empty());
             let out = pq::Shared::default();
             let mut w = pq::Writer::new(out.clone(), pq_conf(a));
             each(&mut |k, c, n, r| {
@@ -115,6 +205,17 @@ fn write(
         last,
     };
     (layer, Bytes::from(data))
+}
+
+fn writer<W: std::io::Write>(fmt: Fmt, a: &Args, out: W) -> ours::Writer<W> {
+    let mut w = ours::Writer::new(out, a.get("block", 16384), a.get("level", 1));
+    if a.s("layout", "rows") == "cols" {
+        w = w.by_columns();
+    }
+    if fmt.rle() {
+        w = w.with_rle();
+    }
+    w
 }
 
 fn pq_conf(a: &Args) -> pq::Conf {
@@ -295,8 +396,22 @@ fn main() {
     // Every layer in both formats, a few at a time.
     let store = Store::new();
     let threads: usize = a.get("threads", 8);
+    let fmts: Vec<Fmt> = a.s("fmts", "ours,parquet").split(',').map(Fmt::parse).collect();
+    let ranged = fmts.iter().any(|f| f.ranges()).then(|| {
+        let t = Instant::now();
+        let r = detect(&w, &oracle, a.get("min_run", 16), threads);
+        let (n, k): (usize, usize) = (
+            r.recs.iter().map(|v| v.len()).sum(),
+            r.covered.iter().map(|v| v.iter().filter(|&&x| x).count()).sum(),
+        );
+        eprintln!(
+            "range records: {n}, covering {k} entries, found in {:.1}s",
+            t.elapsed().as_secs_f64()
+        );
+        r
+    });
     let jobs: Vec<(usize, Fmt)> = (0..sch.layers.len())
-        .flat_map(|i| [(i, Fmt::Ours), (i, Fmt::Pq)])
+        .flat_map(|i| fmts.iter().map(move |&f| (i, f)))
         .collect();
     let next = std::sync::atomic::AtomicUsize::new(0);
     let built = std::sync::Mutex::new(Vec::new());
@@ -310,7 +425,7 @@ fn main() {
                 let path = format!("{}/{i:03}-{}-{}", fmt.name(), spec.lo, spec.hi);
                 let mut buf = Vec::with_capacity(48);
                 let (layer, data) = if spec.base {
-                    write(fmt, &a, path, spec, &mut |push| {
+                    write(fmt, &a, path, spec, Vec::new(), &mut |push| {
                         for id in 0..oracle.space() {
                             let (v, c) = oracle.at(id, spec.hi);
                             if v != NONE {
@@ -320,8 +435,10 @@ fn main() {
                         }
                     })
                 } else {
-                    let es = entries_of(&w, spec.lo, spec.hi);
-                    write(fmt, &a, path, spec, &mut |push| {
+                    let r = ranged.as_ref().filter(|_| fmt.ranges());
+                    let es = entries_of(&w, spec.lo, spec.hi, r);
+                    let recs = r.map_or(Vec::new(), |r| r.recs(spec.lo, spec.hi));
+                    write(fmt, &a, path, spec, recs, &mut |push| {
                         for e in &es {
                             gen::key_of(e.0, &mut buf);
                             push(&buf, e.1 as u64, opt(e.2), opt(e.3));
@@ -336,8 +453,15 @@ fn main() {
     let mut built = built.into_inner().unwrap();
     built.sort_by_key(|l| (l.fmt.name(), l.lo));
     eprintln!("layers written in {:.1}s", t1.elapsed().as_secs_f64());
-    for fmt in [Fmt::Ours, Fmt::Pq] {
+    drop(w); // the oracle answers from here on: room for 100M keys in 16 GB
+    for &fmt in &fmts {
         let ls: Vec<&Layer> = built.iter().filter(|l| l.fmt == fmt).collect();
+        let records: usize = ranged.as_ref().filter(|_| fmt.ranges()).map_or(0, |r| {
+            ls.iter().filter(|l| !l.base).map(|l| r.recs(l.lo, l.hi).len()).sum()
+        });
+        let covered: usize = ranged.as_ref().filter(|_| fmt.ranges()).map_or(0, |r| {
+            r.covered.iter().map(|v| v.iter().filter(|&&x| x).count()).sum()
+        });
         let stored: u64 = ls.iter().map(|l| l.size).sum();
         let meta: u64 = ls.iter().map(|l| l.size - l.meta_start).sum();
         let base = ls.iter().find(|l| l.base).unwrap();
@@ -348,7 +472,7 @@ fn main() {
                 "base_meta_mb": (base.size - base.meta_start) as f64 / 1e6,
                 "bytes_per_entry": stored as f64 / ls.iter().map(|l| l.entries).sum::<u64>() as f64,
                 "commits": head - LOAD, "committed": sch.committed, "merge_amp": sch.merged as f64 / sch.committed as f64,
-                "max_layers": sch.max_layers, "folds": sch.folds,
+                "max_layers": sch.max_layers, "folds": sch.folds, "records": records, "covered": covered,
                 "layer_list": ls.iter().map(|l| format!("{}-{}:{}", l.lo, l.hi, l.entries)).collect::<Vec<_>>()})
         );
     }
@@ -451,10 +575,11 @@ fn main() {
             .map(Arc::new)
             .collect()
     };
-    let (ours_l, pq_l) = (layers(Fmt::Ours), layers(Fmt::Pq));
+    let by_fmt: Vec<(Fmt, Vec<Arc<Layer>>)> = fmts.iter().map(|&f| (f, layers(f))).collect();
     for (qn, q) in &qs {
         let want = expect(&oracle, q);
-        for (fmt, ls) in [(Fmt::Ours, &ours_l), (Fmt::Pq, &pq_l)] {
+        for (fmt, ls) in &by_fmt {
+            let fmt = *fmt;
             for (mode, net) in [("cold", Some(NET)), ("warm", None)] {
                 let s = store.view(net);
                 let (lo, hi);
@@ -463,10 +588,11 @@ fn main() {
                         lo = r.map(|r| key(r.0));
                         hi = r.map(|r| key(r.1));
                         let sel = query::diff_layers(ls, *c1, *c2, lo.as_deref(), hi.as_deref());
+                        let older = query::older_layers(ls, *c1, lo.as_deref(), hi.as_deref());
                         let (d, st) = measure(
                             &rt,
                             &s,
-                            query::diff(&s, &sel, *c1, *c2, lo.as_deref(), hi.as_deref(), *limit),
+                            query::diff(&s, &sel, &older, *c1, *c2, lo.as_deref(), hi.as_deref(), *limit),
                         );
                         (d, st, sel.len())
                     }
@@ -508,7 +634,8 @@ fn main() {
         let tmp = std::path::PathBuf::from(a.s("tmp", "/tmp/layer-format"));
         std::fs::create_dir_all(&tmp).unwrap();
         for (mn, fold) in [("merge-newest4", None), ("fold-into-base", Some(head))] {
-            for (fmt, ls) in [(Fmt::Ours, &ours_l), (Fmt::Pq, &pq_l)] {
+            for (fmt, ls) in &by_fmt {
+                let fmt = *fmt;
                 let mut inputs: Vec<Arc<Layer>> = ls.iter().filter(|l| !l.base).cloned().collect();
                 inputs.sort_by_key(|l| l.hi);
                 if fold.is_none() {
@@ -533,21 +660,18 @@ fn main() {
                     entries: 0,
                 };
                 let (written, st) = match fmt {
-                    Fmt::Ours => {
-                        let mut wr =
-                            ours::Writer::new(file, a.get("block", 16384), a.get("level", 1));
-                        if a.s("layout", "rows") == "cols" {
-                            wr = wr.by_columns();
-                        }
-                        let (_, st) = measure(
+                    f if f.ours() => {
+                        let mut wr = writer(f, &a, file);
+                        let (recs, st) = measure(
                             &rt,
                             &s,
                             query::merge(&s, &inputs, fold, |k, e| wr.push(k, e.0, e.1, e.2)),
                         );
+                        recs.into_iter().for_each(|r| wr.push_range(r));
                         let (_, size, ms, m2) = wr.finish();
                         ((size, ms, m2), st)
                     }
-                    Fmt::Pq => {
+                    _ => {
                         let mut wr = pq::Writer::new(file, pq_conf(&a));
                         let (_, st) = measure(
                             &rt,
@@ -582,9 +706,29 @@ fn main() {
                 store.put(&out.path, data);
                 let check = store.view(None);
                 let mut got = Digest::default();
-                rt.block_on(query::merge(&check, &[Arc::new(out)], None, |k, e| {
-                    got.add4(gen::id_of(k), e.0, e.1.unwrap_or(NONE), e.2.unwrap_or(NONE))
+                let mut kept: Vec<(u32, u64, u64, u64)> = Vec::new();
+                let recs = rt.block_on(query::merge(&check, &[Arc::new(out)], None, |k, e| {
+                    let e = (gen::id_of(k), e.0, e.1.unwrap_or(NONE), e.2.unwrap_or(NONE));
+                    if fmt.ranges() && fold.is_none() {
+                        kept.push(e);
+                    } else {
+                        got.add4(e.0, e.1, e.2, e.3);
+                    }
                 }));
+                // Range records kept by the merge: spelled out against the fold, the
+                // entries they stand for.
+                if fmt.ranges() && fold.is_none() {
+                    for r in &recs {
+                        for id in gen::id_of(&r.lo)..=gen::id_of(&r.hi) {
+                            let (v, _) = oracle.at(id, r.commit - 1);
+                            if v != NONE {
+                                kept.push((id, r.commit, r.new.unwrap_or(NONE), v));
+                            }
+                        }
+                    }
+                    kept.sort_unstable_by_key(|e| (e.0, std::cmp::Reverse(e.1)));
+                    kept.iter().for_each(|e| got.add4(e.0, e.1, e.2, e.3));
+                }
                 let mut want = Digest::default();
                 let mut es = Vec::new();
                 for id in 0..oracle.space() {
@@ -613,7 +757,7 @@ fn main() {
                     got,
                     want,
                     &st,
-                    json!({"inputs": inputs.len(), "written_mb": written.0 as f64 / 1e6, "entries": got.n}),
+                    json!({"inputs": inputs.len(), "written_mb": written.0 as f64 / 1e6, "entries": got.n, "records_kept": recs.len()}),
                 );
             }
         }

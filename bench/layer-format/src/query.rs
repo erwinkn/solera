@@ -6,6 +6,7 @@
 
 use crate::gen::{id_of, Digest, NONE};
 use crate::ours;
+use crate::ours::Rec;
 use crate::pq;
 use crate::run::Run;
 use crate::store::{Sparse, Store};
@@ -19,6 +20,9 @@ use tokio::task::JoinHandle;
 pub enum Fmt {
     Ours,
     Pq,
+    OursRanges,
+    OursRle,
+    OursRangesRle,
 }
 
 impl Fmt {
@@ -26,7 +30,26 @@ impl Fmt {
         match self {
             Fmt::Ours => "ours",
             Fmt::Pq => "parquet",
+            Fmt::OursRanges => "ours+ranges",
+            Fmt::OursRle => "ours+rle",
+            Fmt::OursRangesRle => "ours+ranges+rle",
         }
+    }
+    pub fn parse(s: &str) -> Fmt {
+        [Fmt::Ours, Fmt::Pq, Fmt::OursRanges, Fmt::OursRle, Fmt::OursRangesRle]
+            .into_iter()
+            .find(|f| f.name() == s)
+            .expect("fmt?")
+    }
+    /// Our block format, with or without range records and run-length columns.
+    pub fn ours(self) -> bool {
+        self != Fmt::Pq
+    }
+    pub fn ranges(self) -> bool {
+        matches!(self, Fmt::OursRanges | Fmt::OursRangesRle)
+    }
+    pub fn rle(self) -> bool {
+        matches!(self, Fmt::OursRle | Fmt::OursRangesRle)
     }
 }
 
@@ -56,6 +79,8 @@ pub static ONE_GET: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64:
 pub enum Pred<'a> {
     Range(Option<&'a [u8]>, Option<&'a [u8]>),
     Keys(&'a [Vec<u8>]),
+    /// Sorted, disjoint `[lo, hi)` key ranges (ours only).
+    Ranges(&'a [(Vec<u8>, Vec<u8>)]),
 }
 
 #[derive(Clone)]
@@ -83,7 +108,7 @@ enum Dec {
 
 /// Open a layer for a read: its metadata (one GET, or the top level and then
 /// the pieces the read needs), and the units it must read.
-async fn prepare(store: &Store, l: &Layer, p: Pred<'_>) -> (Vec<Unit>, Dec) {
+async fn prepare(store: &Store, l: &Layer, p: Pred<'_>) -> (Vec<Unit>, Dec, Vec<Rec>) {
     let whole = l.size - l.meta_start <= ONE_GET.load(std::sync::atomic::Ordering::Relaxed);
     let sp = store
         .fetch(
@@ -94,13 +119,15 @@ async fn prepare(store: &Store, l: &Layer, p: Pred<'_>) -> (Vec<Unit>, Dec) {
     let (lo, hi, keys) = match p {
         Pred::Range(lo, hi) => (lo, hi, None),
         Pred::Keys(k) => (None, None, Some(k)),
+        Pred::Ranges(_) => (None, None, None),
     };
     match l.fmt {
-        Fmt::Ours => {
+        f if f.ours() => {
             let mut ix = ours::Index::parse_top(&sp.slice(l.meta2..l.size), l.meta_start);
-            let segs = match keys {
-                Some(k) => ix.segs_for_keys(k),
-                None => ix.segs_for(lo, hi),
+            let segs = match p {
+                Pred::Keys(k) => ix.segs_for_keys(k),
+                Pred::Range(lo, hi) => ix.segs_for(lo, hi),
+                Pred::Ranges(rs) => ix.segs_for_ranges(rs),
             };
             let ranges: Vec<Range<u64>> = segs.iter().map(|&i| ix.segs[i].range.clone()).collect();
             let sp = if whole {
@@ -111,9 +138,11 @@ async fn prepare(store: &Store, l: &Layer, p: Pred<'_>) -> (Vec<Unit>, Dec) {
             for (&i, r) in segs.iter().zip(ranges) {
                 ix.load(i, &sp.slice(r));
             }
-            let blocks = match keys {
-                Some(k) => ix.of_keys(k),
-                None => ix.span(lo, hi),
+            let recs = std::mem::take(&mut ix.recs);
+            let blocks = match p {
+                Pred::Keys(k) => ix.of_keys(k),
+                Pred::Range(lo, hi) => ix.span(lo, hi),
+                Pred::Ranges(rs) => ix.span_ranges(rs),
             };
             (
                 blocks
@@ -121,9 +150,11 @@ async fn prepare(store: &Store, l: &Layer, p: Pred<'_>) -> (Vec<Unit>, Dec) {
                     .map(|b| Unit::Block(b.offset..b.offset + b.clen, b.rlen, b.n))
                     .collect(),
                 Dec::Ours,
+                recs,
             )
         }
-        Fmt::Pq => {
+        _ => {
+            assert!(!matches!(p, Pred::Ranges(_)), "key ranges: ours only");
             let meta = if whole {
                 pq::Meta::parse(sp, l.size)
             } else {
@@ -139,7 +170,7 @@ async fn prepare(store: &Store, l: &Layer, p: Pred<'_>) -> (Vec<Unit>, Dec) {
                 .into_iter()
                 .map(|(g, s, r)| Unit::Rg(g, s, r))
                 .collect();
-            (units, Dec::Pq(Arc::new(meta)))
+            (units, Dec::Pq(Arc::new(meta)), Vec::new())
         }
     }
 }
@@ -165,11 +196,13 @@ pub struct Stream {
     target: u64,
     pending: Option<(Range<usize>, JoinHandle<Sparse>)>,
     ready: VecDeque<Run>,
+    /// The layer's range records.
+    pub recs: Vec<Rec>,
 }
 
 impl Stream {
     pub async fn new(store: &Store, layer: Arc<Layer>, p: Pred<'_>, all_at_once: bool) -> Stream {
-        let (units, dec) = prepare(store, &layer, p).await;
+        let (units, dec, recs) = prepare(store, &layer, p).await;
         let units = Arc::new(units);
         if std::env::var("LF_DEBUG").is_ok() {
             let b: u64 = units.iter().map(|u| u.bytes()).sum();
@@ -193,6 +226,7 @@ impl Stream {
             target: if all_at_once { u64::MAX } else { FIRST },
             pending: None,
             ready: VecDeque::new(),
+            recs,
         }
     }
 
@@ -324,6 +358,60 @@ impl Heap {
     }
 }
 
+/// The layers opened for a read, in parallel.
+pub async fn open(
+    store: &Store,
+    layers: &[Arc<Layer>],
+    p: Pred<'_>,
+    all_at_once: bool,
+) -> Vec<Stream> {
+    futures::future::join_all(
+        layers
+            .iter()
+            .map(|l| Stream::new(store, l.clone(), p, all_at_once)),
+    )
+    .await
+}
+
+/// The streams' range records, by their first key.
+fn recs_of(streams: &[Stream]) -> Vec<Rec> {
+    let mut v: Vec<Rec> = streams.iter().flat_map(|s| s.recs.iter().cloned()).collect();
+    v.sort_by(|a, b| a.lo.cmp(&b.lo));
+    v
+}
+
+/// A key's entries (newest first) with the range records covering it spelled
+/// out as entries: a record at commit c applies to the key if it was present
+/// just before c and has no entry of its own at c. Needs the key's history
+/// back to the base.
+fn resolve(es: &mut Vec<E>, covering: &mut Vec<(u64, Option<u64>)>) {
+    covering.sort_unstable_by_key(|r| r.0);
+    let mut out: Vec<E> = Vec::with_capacity(es.len() + covering.len());
+    let mut state: Option<u64> = None;
+    let mut j = 0;
+    let apply = |c: u64, new: Option<u64>, state: &mut Option<u64>, out: &mut Vec<E>| {
+        if let Some(s) = *state {
+            out.push((c, new, Some(s)));
+            *state = new;
+        }
+    };
+    for &e in es.iter().rev() {
+        while j < covering.len() && covering[j].0 <= e.0 {
+            if covering[j].0 < e.0 {
+                apply(covering[j].0, covering[j].1, &mut state, &mut out);
+            }
+            j += 1;
+        }
+        out.push(e);
+        state = e.1;
+    }
+    for &(c, new) in &covering[j..] {
+        apply(c, new, &mut state, &mut out);
+    }
+    out.reverse();
+    *es = out;
+}
+
 /// Every key in `[lo, hi)` of the layers (newest first), with its entries
 /// across them, newest first; `on` returns false to stop.
 pub async fn walk(
@@ -331,18 +419,26 @@ pub async fn walk(
     layers: &[Arc<Layer>],
     p: Pred<'_>,
     all_at_once: bool,
+    on: impl FnMut(&[u8], &[E]) -> bool,
+) {
+    let streams = open(store, layers, p, all_at_once).await;
+    let recs = recs_of(&streams);
+    walk_streams(streams, p, &recs, on).await
+}
+
+/// `walk` over opened streams, newest layer first; `recs` are resolved into
+/// the entries of the keys they cover (none: entries as stored).
+pub async fn walk_streams(
+    streams: Vec<Stream>,
+    p: Pred<'_>,
+    recs: &[Rec],
     mut on: impl FnMut(&[u8], &[E]) -> bool,
 ) {
     let (lo, hi) = match p {
         Pred::Range(lo, hi) => (lo, hi),
-        Pred::Keys(_) => (None, None),
+        _ => (None, None),
     };
-    let streams = futures::future::join_all(
-        layers
-            .iter()
-            .map(|l| Stream::new(store, l.clone(), p, all_at_once)),
-    )
-    .await;
+    let (mut next_rec, mut active, mut covering) = (0, Vec::<usize>::new(), Vec::new());
     let mut curs: Vec<Cur> = streams
         .into_iter()
         .map(|s| Cur {
@@ -398,6 +494,18 @@ pub async fn walk(
         if lo.is_some_and(|lo| key.as_slice() < lo) {
             continue;
         }
+        if !recs.is_empty() {
+            while next_rec < recs.len() && recs[next_rec].lo.as_slice() <= key.as_slice() {
+                active.push(next_rec);
+                next_rec += 1;
+            }
+            active.retain(|&i| recs[i].hi.as_slice() >= key.as_slice());
+            if !active.is_empty() {
+                covering.clear();
+                covering.extend(active.iter().map(|&i| (recs[i].commit, recs[i].new)));
+                resolve(&mut es, &mut covering);
+            }
+        }
         if !on(&key, &es) {
             break;
         }
@@ -429,6 +537,57 @@ pub fn diff_layers(
     v
 }
 
+/// Newest first: the layers below a diff's window (and the base), keys `[lo, hi)`:
+/// what a range record in the window needs to recover the versions it replaced.
+pub fn older_layers(
+    all: &[Arc<Layer>],
+    c1: u64,
+    lo: Option<&[u8]>,
+    hi: Option<&[u8]>,
+) -> Vec<Arc<Layer>> {
+    let mut v: Vec<_> = all
+        .iter()
+        .filter(|l| (l.base || l.hi <= c1) && in_keys(l, lo, hi))
+        .cloned()
+        .collect();
+    v.sort_by_key(|l| std::cmp::Reverse(l.hi));
+    v
+}
+
+/// The key ranges records cover within `[lo, hi)`, as sorted disjoint `[a, b)`.
+fn cover(recs: &[Rec], lo: Option<&[u8]>, hi: Option<&[u8]>) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let mut u: Vec<(Vec<u8>, Vec<u8>)> = recs
+        .iter()
+        .map(|r| {
+            let a = match lo {
+                Some(lo) if lo > r.lo.as_slice() => lo.to_vec(),
+                _ => r.lo.clone(),
+            };
+            let mut b = r.hi.clone();
+            b.push(0); // the key right after hi
+            let b = match hi {
+                Some(hi) if hi < b.as_slice() => hi.to_vec(),
+                _ => b,
+            };
+            (a, b)
+        })
+        .filter(|(a, b)| a < b)
+        .collect();
+    u.sort();
+    let mut out: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    for (a, b) in u {
+        match out.last_mut() {
+            Some(l) if a <= l.1 => {
+                if b > l.1 {
+                    l.1 = b
+                }
+            }
+            _ => out.push((a, b)),
+        }
+    }
+    out
+}
+
 pub fn scan_layers(
     all: &[Arc<Layer>],
     c: u64,
@@ -444,17 +603,41 @@ pub fn scan_layers(
     v
 }
 
+/// `window`: the layers overlapping `(c1, c2]`; `older`: those below it, read
+/// only over the key ranges of the window's range records, if it has any.
+#[allow(clippy::too_many_arguments)]
 pub async fn diff(
     store: &Store,
-    layers: &[Arc<Layer>],
+    window: &[Arc<Layer>],
+    older: &[Arc<Layer>],
     c1: u64,
     c2: u64,
     lo: Option<&[u8]>,
     hi: Option<&[u8]>,
     limit: u64,
 ) -> Digest {
+    let p = Pred::Range(lo, hi);
+    let mut streams = open(store, window, p, false).await;
+    let mut inside = recs_of(&streams);
+    inside.retain(|r| {
+        c1 < r.commit
+            && r.commit <= c2
+            && lo.is_none_or(|lo| r.hi.as_slice() >= lo)
+            && hi.is_none_or(|hi| r.lo.as_slice() < hi)
+    });
+    let mut recs = Vec::new();
+    if !inside.is_empty() {
+        let u = cover(&inside, lo, hi);
+        let older: Vec<Arc<Layer>> = older
+            .iter()
+            .filter(|l| u.iter().any(|(a, b)| in_keys(l, Some(a), Some(b))))
+            .cloned()
+            .collect();
+        streams.extend(open(store, &older, Pred::Ranges(&u), false).await);
+        recs = recs_of(&streams);
+    }
     let mut d = Digest::default();
-    walk(store, layers, Pred::Range(lo, hi), false, |key, es| {
+    walk_streams(streams, p, &recs, |key, es| {
         let mut window = es.iter().filter(|e| c1 < e.0 && e.0 <= c2);
         let Some(newest) = window.next() else {
             return true;
@@ -512,15 +695,21 @@ pub async fn get(store: &Store, layers: &[Arc<Layer>], c: u64, keys: &[Vec<u8>])
 
 /// Every entry of the layers, in order, to `push`; with `fold` at a commit,
 /// one entry per key present there instead (a new base).
+/// A merge keeps the inputs' range records as they are, and returns them for
+/// the output; a fold resolves them (it reads every layer down to the base).
 pub async fn merge(
     store: &Store,
     layers: &[Arc<Layer>],
     fold: Option<u64>,
     mut push: impl FnMut(&[u8], &E),
-) {
+) -> Vec<Rec> {
     let mut layers = layers.to_vec();
     layers.sort_by_key(|l| std::cmp::Reverse(l.hi)); // newest first: a key's entries come out newest first
-    walk(store, &layers, Pred::Range(None, None), false, |key, es| {
+    let p = Pred::Range(None, None);
+    let streams = open(store, &layers, p, false).await;
+    let recs = recs_of(&streams);
+    let resolve = if fold.is_some() { &recs[..] } else { &[] };
+    walk_streams(streams, p, resolve, |key, es| {
         match fold {
             None => es.iter().for_each(|e| push(key, e)),
             Some(c) => {
@@ -534,4 +723,9 @@ pub async fn merge(
         true
     })
     .await;
+    if fold.is_some() {
+        Vec::new()
+    } else {
+        recs
+    }
 }

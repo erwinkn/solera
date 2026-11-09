@@ -61,6 +61,35 @@ pub struct Writer<W: Write> {
     top: Vec<u8>,
     top_prev: Vec<u8>,
     nsegs: u64,
+    rle: Option<Rle>,
+    recs: Vec<Rec>,
+}
+
+/// A range record: every key in `[lo, hi]` present just before `commit` was
+/// rewritten at `commit` to `new` (removed: `None`). The keys and the versions
+/// they replaced are not stored; a reader takes them from older layers.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Rec {
+    pub lo: Vec<u8>,
+    pub hi: Vec<u8>,
+    pub commit: u64,
+    pub new: Option<u64>,
+}
+
+fn put_key(out: &mut Vec<u8>, prev: &[u8], k: &[u8]) {
+    let s = shared(prev, k);
+    put_varint(out, s as u64);
+    put_varint(out, (k.len() - s) as u64);
+    out.extend_from_slice(&k[s..]);
+}
+
+fn get_key(b: &[u8], p: &mut usize, prev: &[u8]) -> Vec<u8> {
+    let s = get_varint(b, p) as usize;
+    let l = get_varint(b, p) as usize;
+    let mut k = prev[..s].to_vec();
+    k.extend_from_slice(&b[*p..*p + l]);
+    *p += l;
+    k
 }
 
 impl<W: Write> Writer<W> {
@@ -85,7 +114,21 @@ impl<W: Write> Writer<W> {
             top: Vec::new(),
             top_prev: Vec::new(),
             nsegs: 0,
+            rle: None,
+            recs: Vec::new(),
         }
+    }
+
+    /// Blocks with keys row by row and the commit, flag and version columns
+    /// run-length coded (`rle`), each column plain where that is smaller.
+    pub fn with_rle(mut self) -> Self {
+        self.rle = Some(Rle::default());
+        self
+    }
+
+    /// A range record, kept in the index's top level.
+    pub fn push_range(&mut self, r: Rec) {
+        self.recs.push(r);
     }
 
     /// Blocks laid out by column (`layout=cols`): each block holds its key
@@ -96,6 +139,9 @@ impl<W: Write> Writer<W> {
     }
 
     fn raw_len(&self) -> usize {
+        if let Some(r) = &self.rle {
+            return r.plain;
+        }
         self.cols.as_ref().map_or(self.raw.len(), |c| c.len())
     }
 
@@ -111,6 +157,13 @@ impl<W: Write> Writer<W> {
         if self.n == 0 {
             self.first.clear();
             self.first.extend_from_slice(key);
+        }
+        if let Some(r) = &mut self.rle {
+            r.push(s, &key[s..], commit, new, replaced);
+            self.prev.clear();
+            self.prev.extend_from_slice(key);
+            self.n += 1;
+            return;
         }
         if let Some(c) = &mut self.cols {
             c.push(s, &key[s..], commit, new, replaced);
@@ -143,6 +196,10 @@ impl<W: Write> Writer<W> {
         if let Some(c) = &mut self.cols {
             self.raw.clear();
             c.finish(&mut self.raw);
+        }
+        if let Some(r) = &mut self.rle {
+            self.raw.clear();
+            r.finish(&mut self.raw);
         }
         let c = zstd::bulk::compress(&self.raw, self.level).unwrap();
         self.out.write_all(&c).unwrap();
@@ -203,6 +260,17 @@ impl<W: Write> Writer<W> {
         let mut top = Vec::new();
         put_varint(&mut top, self.nsegs);
         top.extend_from_slice(&self.top);
+        self.recs
+            .sort_by(|a, b| a.lo.cmp(&b.lo).then(b.commit.cmp(&a.commit)));
+        put_varint(&mut top, self.recs.len() as u64);
+        let mut prev: &[u8] = &[];
+        for r in &self.recs {
+            put_key(&mut top, prev, &r.lo);
+            put_key(&mut top, &r.lo, &r.hi);
+            put_varint(&mut top, r.commit);
+            put_varint(&mut top, r.new.map_or(0, |v| v + 1));
+            prev = &r.hi;
+        }
         let c = zstd::bulk::compress(&top, self.level).unwrap();
         self.out.write_all(&c).unwrap();
         self.out
@@ -235,6 +303,7 @@ pub struct Seg {
 /// the segments loaded so far, in order.
 pub struct Index {
     pub segs: Vec<Seg>,
+    pub recs: Vec<Rec>,
     pub loaded: std::collections::BTreeMap<usize, Vec<Block>>,
 }
 
@@ -251,7 +320,7 @@ impl Index {
         let mut p = 0;
         let count = get_varint(&t, &mut p);
         let mut prev: Vec<u8> = Vec::new();
-        let segs = (0..count)
+        let segs: Vec<Seg> = (0..count)
             .map(|_| {
                 let off = index_start + get_varint(&t, &mut p);
                 let clen = get_varint(&t, &mut p);
@@ -270,8 +339,22 @@ impl Index {
                 }
             })
             .collect();
+        let mut recs = Vec::new();
+        if p < t.len() {
+            let n = get_varint(&t, &mut p);
+            let mut prev: Vec<u8> = Vec::new();
+            for _ in 0..n {
+                let lo = get_key(&t, &mut p, &prev);
+                let hi = get_key(&t, &mut p, &lo);
+                let commit = get_varint(&t, &mut p);
+                let new = get_varint(&t, &mut p).checked_sub(1);
+                prev = hi.clone();
+                recs.push(Rec { lo, hi, commit, new });
+            }
+        }
         Index {
             segs,
+            recs,
             loaded: Default::default(),
         }
     }
@@ -284,7 +367,21 @@ impl Index {
         (a..b.max(a + 1).min(s.len())).collect()
     }
 
+    /// Segments that may hold keys in any of the `[lo, hi)` ranges.
+    pub fn segs_for_ranges(&self, rs: &[(Vec<u8>, Vec<u8>)]) -> Vec<usize> {
+        let mut v: Vec<usize> = rs
+            .iter()
+            .flat_map(|(lo, hi)| self.segs_for(Some(lo), Some(hi)))
+            .collect();
+        v.sort_unstable();
+        v.dedup();
+        v
+    }
+
     pub fn segs_for_keys(&self, keys: &[Vec<u8>]) -> Vec<usize> {
+        if self.segs.is_empty() {
+            return Vec::new(); // a layer of range records only
+        }
         let mut v: Vec<usize> = keys
             .iter()
             .map(|k| at_or_below(&self.segs, |x| &x.first, k))
@@ -330,6 +427,22 @@ impl Index {
         let a = lo.map_or(0, |lo| at_or_below(&b, |x| &x.first, lo));
         let e = hi.map_or(b.len(), |hi| b.partition_point(|x| x.first.as_slice() < hi));
         b[a..e.max(a)].to_vec()
+    }
+
+    /// Loaded blocks that may hold keys in any of the `[lo, hi)` ranges.
+    pub fn span_ranges(&self, rs: &[(Vec<u8>, Vec<u8>)]) -> Vec<&Block> {
+        let b = self.blocks();
+        let mut ix: Vec<usize> = rs
+            .iter()
+            .flat_map(|(lo, hi)| {
+                let a = at_or_below(&b, |x| &x.first, lo);
+                let e = b.partition_point(|x| x.first.as_slice() < hi.as_slice());
+                a..e.max(a)
+            })
+            .collect();
+        ix.sort_unstable();
+        ix.dedup();
+        ix.into_iter().map(|i| b[i]).collect()
     }
 
     /// Loaded blocks that may hold one of `keys`.
@@ -419,6 +532,9 @@ pub fn decode(data: &[u8], rlen: u64, n: u64) -> Run {
     let raw = zstd::bulk::decompress(data, rlen as usize).unwrap();
     if raw.first() == Some(&0xC0) {
         return decode_cols(&raw, n as usize);
+    }
+    if raw.first() == Some(&0xD0) {
+        return decode_rle(&raw, n as usize);
     }
     let n = n as usize;
     let mut key = BinaryBuilder::with_capacity(n, n * 48);
@@ -511,3 +627,154 @@ fn decode_cols(raw: &[u8], n: usize) -> Run {
     .unwrap();
     Run::of(&batch)
 }
+
+fn varint_len(n: u64) -> usize {
+    (64 - (n | 1).leading_zeros() as usize).div_ceil(7)
+}
+
+/// A block's entries as they fill, for `rle`: keys row by row (prefix-coded),
+/// then the flag, commit, new and replaced columns.
+#[derive(Default)]
+pub struct Rle {
+    keys: Vec<u8>,
+    flags: Vec<u64>,
+    commit: Vec<u64>,
+    new: Vec<u64>,
+    replaced: Vec<u64>,
+    /// The bytes the rows would take uncoded: blocks are cut at the same rows as `rows`.
+    plain: usize,
+}
+
+impl Rle {
+    fn push(
+        &mut self,
+        s: usize,
+        suffix: &[u8],
+        commit: u64,
+        new: Option<u64>,
+        replaced: Option<u64>,
+    ) {
+        let before = self.keys.len();
+        put_varint(&mut self.keys, s as u64);
+        put_varint(&mut self.keys, suffix.len() as u64);
+        self.keys.extend_from_slice(suffix);
+        self.flags
+            .push(new.is_some() as u64 | (replaced.is_some() as u64) << 1);
+        self.commit.push(commit);
+        self.plain += self.keys.len() - before + 1 + varint_len(commit);
+        if let Some(v) = new {
+            self.new.push(v);
+            self.plain += varint_len(v);
+        }
+        if let Some(v) = replaced {
+            self.replaced.push(v);
+            self.plain += varint_len(v);
+        }
+    }
+
+    fn finish(&mut self, out: &mut Vec<u8>) {
+        out.push(0xD0); // a run-length block
+        put_varint(out, self.keys.len() as u64);
+        out.extend_from_slice(&self.keys);
+        for col in [&self.flags, &self.commit, &self.new, &self.replaced] {
+            put_col(out, col);
+        }
+        self.keys.clear();
+        self.flags.clear();
+        self.commit.clear();
+        self.new.clear();
+        self.replaced.clear();
+        self.plain = 0;
+    }
+}
+
+/// A column: (value, run length) pairs, or plain varints where that is smaller;
+/// a mode byte and the length first.
+fn put_col(out: &mut Vec<u8>, v: &[u64]) {
+    let (mut runs, mut plain) = (Vec::new(), Vec::new());
+    let mut i = 0;
+    while i < v.len() {
+        let j = i + v[i..].iter().take_while(|&&x| x == v[i]).count();
+        put_varint(&mut runs, v[i]);
+        put_varint(&mut runs, (j - i) as u64);
+        i = j;
+    }
+    v.iter().for_each(|&x| put_varint(&mut plain, x));
+    let (mode, body) = if runs.len() < plain.len() {
+        (1u8, runs)
+    } else {
+        (0u8, plain)
+    };
+    out.push(mode);
+    put_varint(out, body.len() as u64);
+    out.extend_from_slice(&body);
+}
+
+fn get_col(raw: &[u8], p: &mut usize, n: usize) -> Vec<u64> {
+    let mode = raw[*p];
+    *p += 1;
+    let end = get_varint(raw, p) as usize + *p;
+    let mut v = Vec::with_capacity(n);
+    while *p < end {
+        let x = get_varint(raw, p);
+        if mode == 1 {
+            let r = get_varint(raw, p) as usize;
+            v.extend(std::iter::repeat_n(x, r));
+        } else {
+            v.push(x);
+        }
+    }
+    v
+}
+
+fn decode_rle(raw: &[u8], n: usize) -> Run {
+    let mut p = 1;
+    let klen = get_varint(raw, &mut p) as usize;
+    let mut kp = p;
+    p += klen;
+    let flags = get_col(raw, &mut p, n);
+    let commits = get_col(raw, &mut p, n);
+    let news = get_col(raw, &mut p, n);
+    let reps = get_col(raw, &mut p, n);
+    let mut key = BinaryBuilder::with_capacity(n, n * 56);
+    let (mut commit, mut new, mut replaced) = (
+        Int64Builder::with_capacity(n),
+        Int64Builder::with_capacity(n),
+        Int64Builder::with_capacity(n),
+    );
+    let mut prev: Vec<u8> = Vec::with_capacity(64);
+    let (mut ni, mut ri) = (0, 0);
+    for i in 0..n {
+        let s = get_varint(raw, &mut kp) as usize;
+        let l = get_varint(raw, &mut kp) as usize;
+        prev.truncate(s);
+        prev.extend_from_slice(&raw[kp..kp + l]);
+        kp += l;
+        key.append_value(&prev);
+        commit.append_value(commits[i] as i64);
+        if flags[i] & 1 != 0 {
+            new.append_value(news[ni] as i64);
+            ni += 1;
+        } else {
+            new.append_null()
+        }
+        if flags[i] & 2 != 0 {
+            replaced.append_value(reps[ri] as i64);
+            ri += 1;
+        } else {
+            replaced.append_null()
+        }
+    }
+    let batch = RecordBatch::try_new(
+        schema(),
+        vec![
+            Arc::new(key.finish()),
+            Arc::new(commit.finish()),
+            Arc::new(new.finish()),
+            Arc::new(replaced.finish()),
+        ],
+    )
+    .unwrap();
+    Run::of(&batch)
+}
+
