@@ -570,7 +570,11 @@ class LayerIndex:
         if p.index is None:
             return [self._small[("whole", self.state.path(f.name))] for f in p.files]
         ix = self._ix(p)
-        need = [i for i in blocks if self._blocks.get((p.index, i)) is None]
+        held: dict[int, bytes] = {}
+        for i in blocks:
+            if (b := self._blocks.get((p.index, i))) is not None:
+                held[i] = b
+        need = [i for i in blocks if i not in held]
         groups: list[list[int]] = []
         for i in need:
             if groups and i == groups[-1][-1] + 1 and ix.file[i] == ix.file[groups[-1][-1]]:
@@ -595,7 +599,7 @@ class LayerIndex:
                 self._blocks.put((p.index, i), b)
 
         await asyncio.gather(*(fetch(g) for g in groups))
-        return [got.get(i) or self._blocks.get((p.index, i)) for i in blocks]
+        return [got[i] if i in got else self._blocks.get((p.index, i)) or held[i] for i in blocks]
 
     def _over(self, p: int | None) -> list[tuple[Layer, list[Part]]]:
         """Newest first: the layers that end after P, and the parts to read

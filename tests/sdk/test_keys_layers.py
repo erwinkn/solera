@@ -211,6 +211,26 @@ async def test_side_parts_graveyard_and_indexes_occur():
     assert all(seen.values()), seen
 
 
+async def test_a_block_cached_when_a_read_starts_survives_that_reads_own_fetches():
+    h = History(random.Random(13))
+    await h.commit({key(i): None for i in range(300)}, [])
+    part = h.state.layers[-1].main
+    assert part.index is not None
+    full = L.LayerIndex(h.io, h.state)
+    await full._prepare([part])
+    assert len(full._ix(part).first) >= 3
+    want = await full._chunks(part, [0, 2])
+    idx = L.LayerIndex(h.io, h.state, blocks=1)
+    await idx._prepare([part])
+    assert await idx._chunks(part, [0]) == want[:1]
+    assert await idx._chunks(part, [0, 2]) == want
+    lru = L.LayerIndex(h.io, h.state)
+    await lru._prepare([part])
+    await lru._chunks(part, [0])
+    assert await lru._chunks(part, [0, 2]) == want
+    assert list(lru._blocks.items) == [(part.index, 2), (part.index, 0)]
+
+
 async def test_a_p_below_the_cut_fails_loudly():
     h = History(random.Random(5))
     for c in range(12):
