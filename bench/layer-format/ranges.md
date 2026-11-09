@@ -34,7 +34,7 @@ This extends the T44 bench on branch `exp/layer-format-ranges` (forked from `exp
 
 - **ours+ranges.** Records sit in the layer's index top level, so opening a layer reads no extra bytes. A run needs at least 16 keys. Records are found by replaying each commit against the state before it.
 - **ours+rle.** Keys stay row by row, prefix-coded. The flag, commit, new and replaced columns are each stored as (value, run length) pairs, or as plain varints where that is smaller, and the block is then zstd-compressed as before. Blocks are cut at the same rows as ours.
-- **Check.** Every query and merge is compared with the brute-force fold of the commit stream, the same check as before. Merges that keep records are checked by spelling out each record against the fold. Result: 632 measurements, 0 mismatches. A deliberately corrupted resolver fails 9 of the 13 rewrite queries. The other 4 don't use replaced versions or return nothing.
+- **Check.** Every query and merge is compared with the brute-force fold of the commit stream, the same check as before. Merges that keep records are checked by spelling out each record against the fold. Result: 632 measurements, 0 mismatches. A deliberately corrupted resolver fails 8 of the 13 rewrite queries. The other 5 are scans and gets, which never use replaced versions, plus one diff that returns nothing.
 - **Scale.** 10M keys covers all four workloads and all four variants. 100M keys covers rewrite and daily-scattered, one variant per process (peak 9.7 GB), because this machine has 4 cores and a 12.6 GiB memory cap. I didn't run daily-clustered or hot at 100M.
 - **Reproduce.** `bench/layer-format/ranges.sh` (header has the 100M line), then `python3 ranges_report.py results/ranges-*.jsonl`. All tables are in `results/ranges-tables.md`.
 - **Code added (bench).** About 660 lines: about 100 for records in the index and multi-range block lookup, about 170 for run-length blocks, about 180 in the reader (two-phase diff, per-key resolution, records through merges), and about 100 in the driver (finding records, checking merges).
@@ -83,7 +83,7 @@ B/entry divides by the same logical entry count for every variant. At 10M, the c
 | 1K scattered gets | 0.69 s · 705 · 32.4 MB | 0.55 s · 576 · 23.6 MB |
 | merge the 4 newest layers | 0.29 s · 3.2 MB written | 0.07 s · 0.1 MB written |
 
-The 1,440 records cover about 2,000 small key ranges spread over the key space. A diff across them has to fetch a base block and a block from each older layer for each range, which is where the 12× GETs come from.
+The 1,440 records cover as many small key ranges spread over the key space. A diff across them has to fetch a base block and a block from each older layer for each range, which is where the 12× GETs come from.
 
 ## Queries, daily-scattered, 100M keys
 
