@@ -36,7 +36,7 @@ from solera import lifecycle
 from solera.objects import create
 from solera.tasks import Tasks
 
-from .journal import Journal, Stopped, encode
+from .journal import CORE_FORMAT, FORMAT, Journal, Stopped, encode
 from .model import Model
 
 log = logging.getLogger(__name__)
@@ -115,10 +115,14 @@ class State:
         flush_interval: float = 1.0,
         min_checkpoint: int = 64 << 10,
         writer: bool = True,
+        format: int = FORMAT,
     ) -> State:
         """Load the newest checkpoint, replay the journal, and fence out any
         earlier writer: from here on this process is the namespace's writer.
-        `writer=False` only reads: nothing is fenced and `record` fails."""
+        `writer=False` only reads: nothing is fenced and `record` fails.
+        `format` is the state format its engine writes (`journal.CORE_FORMAT`
+        on the new tracking path): a namespace in another is refused before
+        any writer is fenced."""
 
         clock = clock or time.time
         store, objects_url = open_store(url, namespace)
@@ -127,7 +131,14 @@ class State:
             store, "control", flush_interval=flush_interval, min_checkpoint=min_checkpoint, clock=clock
         )
         # Encoded at once, under the flusher's lock: no copy needed (docs/journal-object.md).
-        await journal.open(model.restore, model.apply, lambda: model.snapshot(copied=False), writer=writer)
+        await journal.open(
+            # Restored as the format the journal was read in says (set before any event applies).
+            lambda snap: model.restore(snap, core=journal.format == CORE_FORMAT),
+            model.apply,
+            lambda: model.snapshot(copied=False),
+            writer=writer,
+            format=format,
+        )
         return cls(
             store,
             url=url,

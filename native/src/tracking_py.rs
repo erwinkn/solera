@@ -12,7 +12,7 @@ use std::sync::{Arc, RwLock};
 
 use pyo3::exceptions::{PyKeyError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyDict, PyList, PyTuple};
+use pyo3::types::{PyBytes, PyDict, PyList, PyString, PyTuple};
 use solera_index as ix;
 use solera_tracking as tr;
 use tr::codec::Ver;
@@ -119,9 +119,19 @@ impl KeyMatcher {
     }
 
     fn __call__(&self, key: &str) -> bool {
-        self.included(key) && self.excluded_by(key).is_none()
+        self.takes(key.as_bytes())
     }
 }
+
+impl KeyMatcher {
+    fn takes(&self, key: &[u8]) -> bool {
+        (self.include.is_empty() || self.include.iter().any(|m| m.matches(key)))
+            && !self.exclude.iter().any(|(_, m)| m.matches(key))
+    }
+}
+
+/// Keys a `Tracking.taken` scan reads in one page.
+const TAKEN_PAGE: u64 = 64 << 10;
 
 /// Refuses a pattern outside Solera's regex dialect, with what it lacks.
 #[pyfunction]
@@ -349,6 +359,77 @@ impl Tracking {
     /// Applies one journaled event, whole or not at all.
     fn apply(&self, event: &[u8]) -> PyResult<()> {
         guard(|| self.state.write().unwrap().apply(event).map_err(err))
+    }
+
+    /// Whether `apply` would take the event, applying nothing.
+    fn check(&self, event: &[u8]) -> PyResult<()> {
+        guard(|| {
+            let ev = Event::decode(event).map_err(err)?;
+            self.state.read().unwrap().check_event(&ev).map_err(err)
+        })
+    }
+
+    /// One output as the state holds it: `{"head", "live", "layers"}`, or
+    /// None before its first commit.
+    fn output<'py>(&self, py: Python<'py>, output: &[u8]) -> PyResult<Option<Bound<'py, PyDict>>> {
+        let Some(o) = self.state.read().unwrap().outputs.get(output).cloned() else {
+            return Ok(None);
+        };
+        let d = PyDict::new(py);
+        d.set_item("head", o.head)?;
+        d.set_item("live", o.live)?;
+        let layers = PyList::empty(py);
+        for l in &o.layers {
+            layers.append(crate::index_py::layer_out(py, l)?)?;
+        }
+        d.set_item("layers", layers)?;
+        Ok(Some(d))
+    }
+
+    /// Whether `output` holds at its head a key after `after` that
+    /// `patterns` (`solera.patterns.spec(…)`) take: a scan of its attached
+    /// index, a page at a time, stopping at the first such key. Nothing
+    /// crosses per key; False before its first commit.
+    #[pyo3(signature = (output, patterns=None, after=None))]
+    fn taken(
+        &self,
+        py: Python<'_>,
+        output: &[u8],
+        patterns: Option<&Bound<'_, PyAny>>,
+        after: Option<String>,
+    ) -> PyResult<bool> {
+        guard(|| {
+            let matcher = KeyMatcher::new(patterns)?;
+            let Some(o) = self.state.read().unwrap().outputs.get(output).cloned() else {
+                return Ok(false);
+            };
+            let ixs = self.indexes.read().unwrap().clone();
+            py.detach(|| {
+                rt().block_on(async {
+                    let ix = tr::plan::Indexes::index(ixs.as_ref(), output)?;
+                    let mut q = ix::Query {
+                        after: after.map(String::into_bytes),
+                        limit: Some(TAKEN_PAGE),
+                        ..Default::default()
+                    };
+                    loop {
+                        let mut found = false;
+                        let next = ix
+                            .state_with(&o.layers, o.head, None, &q, |k, _, _, _| {
+                                found = found || matcher.takes(k)
+                            })
+                            .await
+                            .map_err(tr::Error::Index)?;
+                        match next {
+                            _ if found => return Ok(true),
+                            Some(n) => q.after = Some(n),
+                            None => return Ok(false),
+                        }
+                    }
+                })
+            })
+            .map_err(err)
+        })
     }
 
     /// The change index that holds `output`'s layers (runtime configuration, not
@@ -649,14 +730,17 @@ impl Tracking {
     /// B4: builds and writes the next commit of `output` from its changed
     /// keys (`encode_changes`'s form), on the change index attached for it;
     /// None if nothing changed. See
-    /// `commit_py::build_commit`.
+    /// `commit_py::build_commit`. `changes` is `bytes`, or the path of a
+    /// local file holding them, which nothing writes while the build runs
+    /// (the engine's own temporary file): mapped here, so a large write's
+    /// changes are read in place rather than held in memory.
     #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (output, changes, *, version, path, time_ms=0, producer=Vec::new(), mode="patch", at=None, ends_full_run=false, collect=0))]
     fn build_commit<'py>(
         &self,
         py: Python<'py>,
         output: &[u8],
-        changes: &[u8],
+        changes: &Bound<'py, PyAny>,
         version: u64,
         path: &str,
         time_ms: u64,
@@ -666,6 +750,20 @@ impl Tracking {
         ends_full_run: bool,
         collect: usize,
     ) -> PyResult<Option<Bound<'py, pyo3::types::PyDict>>> {
+        let mapped: memmap2::Mmap;
+        let data: &[u8] = if let Ok(b) = changes.cast_exact::<PyBytes>() {
+            b.as_bytes()
+        } else if let Ok(file) = changes.cast_exact::<PyString>() {
+            let file = std::fs::File::open(file.to_str()?)?;
+            // SAFETY: the map is private to this call, and its file is the caller's own,
+            // written by nothing while the build runs.
+            mapped = unsafe { memmap2::Mmap::map(&file) }?;
+            &mapped
+        } else {
+            return Err(PyTypeError::new_err(
+                "changes: bytes, or a local file's path",
+            ));
+        };
         let out = self
             .state
             .read()
@@ -681,7 +779,7 @@ impl Tracking {
             out,
             ixs.as_ref(),
             output,
-            changes,
+            data,
             version,
             path,
             time_ms,

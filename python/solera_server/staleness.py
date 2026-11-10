@@ -24,6 +24,7 @@ from solera.keys.layers import LayerIndex, key_str
 from solera.patterns import Matcher
 
 from . import observed, owed, planning
+from .tracking import stale as core_stale
 
 log = logging.getLogger(__name__)
 
@@ -75,7 +76,10 @@ class Staleness:
 
         keyed = any(self._keyed(i) for i in inputs)
         for input in inputs:
-            if self._keyed(input):
+            if self._keyed(input) and self.core is not None:  # the new path: a plan of one key
+                if await core_stale.owes(self.core, asset, partition, input, planner, inputs):
+                    return True
+            elif self._keyed(input):
                 if await self._owed(asset, partition, input, planner, inputs, first=True):
                     return True
             elif input.kind == "incremental" and self._input_behind(asset, partition, input):

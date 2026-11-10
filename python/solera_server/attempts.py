@@ -397,6 +397,8 @@ class Attempts:
             "token": lifecycle.token(await self._load_secret(), attempt),
             "generation": claim["generation"],  # chosen before the spec (§9.7)
         }
+        if self.core is not None:  # the new tracking path (build plan rule 4)
+            spec.update(self.core.spec(prepared))
         if prepared["cursor"] is not None:
             spec["cursor"] = prepared["cursor"]
         if prepared.get("cleanup") is not None:  # a cleanup task's work (§9.8, K25)
