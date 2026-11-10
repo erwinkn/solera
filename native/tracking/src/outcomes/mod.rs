@@ -381,6 +381,11 @@ pub struct Outcomes {
     pub seen: u64,
     /// The conditions the batch ran, or the catch-up looked, under.
     pub cond: u64,
+    /// The input's head the batch's failures were made at (their records'
+    /// `made`) and checked for moot at: the part applies only while the
+    /// input is still there, since reverts are looked for after it. None
+    /// when no key failed.
+    pub made: Option<u64>,
     /// Points to set (B3's progress): a failure gone moot outside a range
     /// batch leaves the consumer holding what its record held.
     pub points: Vec<(Key, crate::progress::Point)>,
@@ -414,6 +419,7 @@ impl Outcomes {
         e.uv(self.at);
         e.uv(self.seen);
         e.uv(self.cond);
+        e.uv(self.made.map_or(0, |m| m + 1));
         let mut t = crate::progress::CondTable::default();
         let mut body = Enc::new();
         crate::progress::encode_points(&mut body, &mut t, self.points.iter().map(|(k, p)| (k, p)));
@@ -446,6 +452,7 @@ impl Outcomes {
         let at = d.uv()?;
         let seen = d.uv()?;
         let cond = d.uv()?;
+        let made = d.uv()?.checked_sub(1);
         let table = crate::progress::CondTable::decode(d)?;
         let points = crate::progress::decode_points(d, &table)?;
         Ok(Outcomes {
@@ -458,6 +465,7 @@ impl Outcomes {
             at,
             seen,
             cond,
+            made,
             points,
         })
     }
@@ -470,6 +478,12 @@ impl Outcomes {
             .map_or(0, |o| o.head);
         if head != self.at {
             return invalid("the edge's records moved since the batch's outcomes were built");
+        }
+        if let Some(made) = self.made {
+            let input = &t.edges.get(&self.edge).expect("keyed").input;
+            if t.outputs.get(input).map_or(0, |o| o.head) != made {
+                return invalid("the edge's input moved since the batch's records were made");
+            }
         }
         if self.points.windows(2).any(|w| w[0].0 >= w[1].0) {
             return invalid("points out of order");
@@ -726,6 +740,7 @@ mod tests {
             at: 0,
             seen: 0,
             cond: 0,
+            made: None,
             points: vec![],
         });
         let rebuild = |edge: Id| Part::Rebuild(Rebuild { edge, to: 1 });

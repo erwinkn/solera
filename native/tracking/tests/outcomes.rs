@@ -131,6 +131,8 @@ struct World {
     stale: Vec<plan::Plan>,
     /// Every key a batch runs fails (a bad deploy).
     fail_all: bool,
+    /// The input may commit while a change batch's outcomes are built.
+    races: bool,
 }
 
 fn patterns(rng: &mut SmallRng) -> Patterns {
@@ -383,18 +385,7 @@ impl World {
             failed: failed.iter().map(|(k, _)| k.clone()).collect(),
             loaded: loaded.clone(),
         };
-        let mut ops = self.t.progress_ops(p, &[report], b"", None).ok()?;
-        let v = self.t.outcome_view(EDGE.as_bytes()).unwrap();
-        let (f, d) = self.ctx();
-        let ctx = Ctx {
-            now: self.clock,
-            counters: self.counters,
-            retries: 2,
-            time_ms: 0,
-            producer: b"",
-            failures_path: &f,
-            due_path: &d,
-        };
+        let planned = self.t.progress_ops(p, &[report], b"", None).ok()?;
         let counters = match (
             &self
                 .t
@@ -406,13 +397,51 @@ impl World {
             (Some(pass), true) => pass.counters,
             _ => self.counters,
         };
-        let mut parts = oc::commit(&OneIndex(ix), &v, p, 0, &failed, &loaded, &ctx, &mut ops)
-            .await
-            .ok()?;
-        let mut all = ops.parts.clone();
-        all.append(&mut parts);
-        self.t.apply(&Event::of(all).encode()).ok()?;
+        // The engine builds the outcomes from a view, then applies them under
+        // its lock: the input may commit in between, and a refused commit is
+        // built again.
+        let ops = loop {
+            let mut ops = planned.clone();
+            let v = self.t.outcome_view(EDGE.as_bytes()).unwrap();
+            let (f, d) = self.ctx();
+            let ctx = Ctx {
+                now: self.clock,
+                counters: self.counters,
+                retries: 2,
+                time_ms: 0,
+                producer: b"",
+                failures_path: &f,
+                due_path: &d,
+            };
+            let mut parts = oc::commit(&OneIndex(ix), &v, p, 0, &failed, &loaded, &ctx, &mut ops)
+                .await
+                .ok()?;
+            let race = self.races && self.rng.random_bool(0.1);
+            if race {
+                if std::env::var("OUTCOME_TRACE").is_ok() {
+                    eprintln!("  the input commits while the outcomes are built");
+                }
+                for _ in 0..self.rng.random_range(1..=2) {
+                    self.upstream(ix).await;
+                }
+            }
+            let mut all = ops.parts.clone();
+            all.append(&mut parts);
+            match self.t.apply(&Event::of(all).encode()) {
+                Ok(()) => break ops,
+                Err(_) if race => continue,
+                Err(_) => return None,
+            }
+        };
         self.events += 1;
+        for part in &ops.parts {
+            if let Part::Batch(b) = part {
+                assert_eq!(
+                    ops.records[0].points, b.points,
+                    "the batch record holds the points the batch set"
+                );
+            }
+        }
         if p.mode == Mode::Incremental && !p.reset {
             self.lineage(&ops.records[0]);
         }
@@ -737,6 +766,7 @@ fn world(seed: u64) -> World {
     });
     let mut w = World {
         fail_all: false,
+        races: false,
         rng,
         t: Tracking::new(),
         log: Log {
@@ -784,7 +814,9 @@ async fn history(seed: u64, ix: &ChangeIndex) -> [usize; 6] {
             0..=4 => w.upstream(ix).await,
             5..=9 => {
                 let meanwhile = w.rng.random_bool(0.15);
-                w.change_batch(ix, meanwhile).await
+                w.races = true;
+                w.change_batch(ix, meanwhile).await;
+                w.races = false;
             }
             10 => w.key_list(ix).await,
             11 => {

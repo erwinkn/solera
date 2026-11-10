@@ -278,6 +278,12 @@ pub async fn commit(
             next.insert(c.key.clone(), rec);
         }
     }
+    // New failures are made, and checked for moot, at the view's head of the
+    // input; the commit applies only while the input is still there.
+    let made = next
+        .values()
+        .any(Option::is_some)
+        .then_some(v.upstream.head);
     let mut points = Vec::new();
     // A new failure is checked against the input's head when it commits, as
     // the model does: one whose input already returned to what the consumer
@@ -453,6 +459,7 @@ pub async fn commit(
         } else {
             0
         },
+        made,
         points: vec![],
     }));
 
@@ -477,25 +484,27 @@ pub async fn commit(
             _ => false,
         }
     };
-    // The points this commit sets go with the batch's own: one part per edge.
+    // The points this commit sets go with the batch's own, in its progress
+    // part and its record alike: one part per edge.
+    let set = |into: &mut Vec<(Key, Point)>| {
+        into.retain(|(k, pt)| !needless(k, pt.reason, &pt.holding));
+        for (k, pt) in &points {
+            match into.binary_search_by(|(x, _)| x.cmp(k)) {
+                Ok(i) => into[i].1 = pt.clone(),
+                Err(i) => into.insert(i, (k.clone(), pt.clone())),
+            }
+        }
+    };
     for part in &mut ops.parts {
         if let Part::Batch(b) = part {
             if b.edge == v.edge {
-                b.points
-                    .retain(|(k, pt)| !needless(k, pt.reason, &pt.holding));
-                for (k, pt) in &points {
-                    match b.points.binary_search_by(|(x, _)| x.cmp(k)) {
-                        Ok(i) => b.points[i].1 = pt.clone(),
-                        Err(i) => b.points.insert(i, (k.clone(), pt.clone())),
-                    }
-                }
+                set(&mut b.points);
             }
         }
     }
     for r in &mut ops.records {
         if r.edge == v.edge {
-            r.points
-                .retain(|(k, pt)| !needless(k, pt.reason, &pt.holding));
+            set(&mut r.points);
             // What the consumer held where a record said so: lineage
             // recomputes the batch's input from this slice alone (§7).
             for (k, prior) in &priors {
@@ -679,6 +688,7 @@ pub async fn catch_up(
         at: v.failures.head,
         seen: head,
         cond,
+        made: None,
         points,
     }));
     Ok(Some(parts))
