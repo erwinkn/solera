@@ -105,12 +105,13 @@ async def write(
     out removed, and nothing else cleared."""
 
     store = h.store
-    written_keys = sorted({str(r["id"]) for r in rows})
+    written_keys = sorted({str(r["id"]) for r in rows}, key=str.encode)
     if changed:
         prepared = prepare_for(store, rows, out)
         gone = frozenset(set(ledger.entries) - set(written_keys))
         keyed = KeyedWrite(prepared, upserts=frozenset(written_keys), removes=gone, value=rows)
         written = await store.store(keyed, prior, context(out, generation, worker_id, partition=partition))
+        assert said(written) == (written_keys, sorted(gone, key=str.encode), False)
         for key in gone:
             del ledger.entries[key]
         ledger.entries.update(dict.fromkeys(written_keys, generation))
@@ -124,6 +125,8 @@ async def write(
         prepared = prepare_for(store, rows, out)
         keyed = KeyedWrite(prepared, reset=True, value=rows)
     written = await store.store(keyed, prior, context(out, generation, worker_id, partition=partition))
+    removed = sorted(map(str, remove), key=str.encode) if patch else []
+    assert said(written) == (written_keys, removed, not patch), "a write says the keys it wrote and removed"
     if not patch:
         ledger.entries.clear()
     for key in remove:

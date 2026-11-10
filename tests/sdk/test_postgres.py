@@ -345,11 +345,23 @@ async def test_a_table_made_before_versions_is_refused(store):
     version: a write to it is refused, saying to drop it or name another.
     No backfill: Solera starts fresh at the switch."""
 
+    for version in ("", ", _version text"):  # none, or one a version is not
+        out = output(key="id")
+        with store._connect() as conn, conn.cursor() as cur:
+            cur.execute(f'CREATE TABLE "{out.name}" (id text, v text{version})')
+        with pytest.raises(StoreError, match="no _version bigint column.*Drop it, or name a new table"):
+            await store.store([{"id": "a", "v": "1"}], None, context(out))
+
+
+async def test_a_sql_write_says_only_the_keys_it_wrote(store):
+    """A `Sql` write's keys are read in its own transaction: pulled after a
+    later write replaced the partition, they are still the keys it wrote."""
+
     out = output(key="id")
-    with store._connect() as conn, conn.cursor() as cur:
-        cur.execute(f'CREATE TABLE "{out.name}" (id text, v text)')
-    with pytest.raises(StoreError, match="no _version column.*Drop it, or name a new table"):
-        await store.store([{"id": "a", "v": "1"}], None, context(out))
+    first = await store.store(Sql("SELECT 'a'::text AS id, '1' AS v"), None, fenced(out, 5))
+    await store.store(Sql("SELECT 'b'::text AS id, '1' AS v"), first.ref, fenced(out, 9))
+    assert [k for chunk in first.changed.wrote for k in chunk] == ["a"]
+    assert [k for chunk in first.keys for k in chunk] == ["a"]
 
 
 def fenced(out, generation, worker_id="i", partition=""):

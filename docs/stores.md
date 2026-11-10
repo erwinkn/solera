@@ -251,7 +251,9 @@ when a primary key would refuse a key's second row.
 
 A store that names objects by version (FileStore, S3Store) reads a key at
 exactly its planned version, from the name it computes; an object that is
-gone is an error, never an absence. A table holds its rows as they are
+gone is an error, never an absence. A dynamic partitions output's
+elements carry the empty version `""` (membership is all an element
+holds, `versions.md` §2): a read says `""` for each element present. A table holds its rows as they are
 now, so a key may be read at another version than planned, or be absent:
 the load reads what is there and says so, and the core records the
 deviation (design §8).
@@ -261,7 +263,7 @@ a `_version bigint` column and sets it, on every write path (rows,
 patches, commits, `Sql`), to the writing attempt's version: NULL only for
 a write outside an attempt. All rows of a key share one version, since one
 write wrote them. Loads take the column off the rows they return. A table
-without the column was made before rows carried their version and is
+without the column (or with one of another type) was made before rows carried their version and is
 refused, saying so: drop it, or name a new table for the output
 (`Output(..., table=…)`). There is no backfill: Solera starts fresh at
 the switch. A table you create yourself (in a migration) must carry
@@ -269,9 +271,12 @@ the switch. A table you create yourself (in a migration) must carry
 
 **Cost.** A keyed write's keys come from the write itself, so returning
 them costs no request to the backend: PostgresStore's 10,000-key write
-makes the same statements and round trips with or without `changed`. A
-`Sql` write's keys are read by one query once it committed, as `keys`
-already is.
+makes the same statements and round trips with or without `changed`
+(measured on PostgreSQL 16: 1 connection, 15 statements and 1 COPY on
+main and with this contract; pulling the 10,000 keys takes about 1.5 ms
+and no request). A `Sql` write's keys are read by one query inside its
+own write transaction, so a later write's keys never enter its answer;
+`keys` reads them from that same query.
 
 ## Values a store takes
 
@@ -634,9 +639,10 @@ async def test_my_store_conforms(worker, scenario):
 store as the engine does — keyed writes as `KeyedWrite`s resolved against a
 key index the kit keeps, keyed loads through `Keys` — and raise
 `AssertionError` with the scenario's expectation when the store answers
-otherwise. Every scenario that writes a keyed output or loads checks the
-new answers too (`Written.changed`, `read`), as does the generated
-machine (`solera.testing.storemachine`) after every step. FileStore, S3Store, PostgresStore and the example SQL store
+otherwise. Every keyed write a scenario makes checks what the store says
+it changed (`Written.changed`); the scenarios of "What a write and a load
+say" check `read`; the generated machine (`solera.testing.storemachine`)
+checks both after every step. FileStore, S3Store, PostgresStore and the example SQL store
 pass it in Solera's own tests (`tests/sdk/test_store_conformance.py`),
 where the example store with its fence left out fails it.
 

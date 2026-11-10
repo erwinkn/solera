@@ -52,6 +52,10 @@ VERSION_COLUMN = "_version"  # every row's version: the generation of the attemp
 KEY_CHUNK = 100_000  # keys per chunk `keys` reads
 
 
+def _chunked(keys: list[str]):
+    return (keys[i : i + KEY_CHUNK] for i in range(0, len(keys), KEY_CHUNK))
+
+
 def _assigned_commit(context: WriteContext, prior: Ref | None) -> int:
     if context.commit_number is not None:
         return context.commit_number
@@ -223,7 +227,7 @@ class PostgresStore:
             names.append(key_text)
         exists = (
             "SELECT EXISTS (SELECT 1 FROM information_schema.columns c WHERE c.table_schema = t.table_schema "
-            "AND c.table_name = t.table_name AND c.column_name = %s) AS versioned "
+            "AND c.table_name = t.table_name AND c.column_name = %s AND c.data_type = 'bigint') AS versioned "
             "FROM information_schema.tables t WHERE t.table_schema = %s AND t.table_name = %s"
         )
         here = (VERSION_COLUMN, schema, table_name)
@@ -263,7 +267,7 @@ class PostgresStore:
             self._check_drift(cur, output, table, schema, table_name, columns, pk)
             if not existed["versioned"]:
                 raise StoreError(
-                    f"{output.name}: table {table} has no {VERSION_COLUMN} column, which every row of a "
+                    f"{output.name}: table {table} has no {VERSION_COLUMN} bigint column, which every row of a "
                     "table this store writes carries: the table was made before rows carried their "
                     "version. Drop it, or name a new table for the output (Output(..., table=...))"
                 )
@@ -522,9 +526,10 @@ class PostgresStore:
             keys = changed = None
             if isinstance(write, Sql):
                 self._apply_sql(cur, output, write, context, table, slice_where)
-                if output.key:  # read once the write has committed
-                    keys = self._keys(table, output.key, slice_where, None)
-                    changed = Changed(self._keys(table, output.key, slice_where, None), whole=True)
+                if output.key:  # the keys it wrote, read in its own transaction: no later write's
+                    held = self._held(cur, table, output.key, slice_where)
+                    keys = _chunked(held)
+                    changed = Changed(_chunked(held), whole=True)
             elif output.key is not None:
                 if isinstance(write, Patch) and not output.incremental:
                     raise WriteError(f"{output.name}: Patch requires an incremental output")
@@ -737,6 +742,18 @@ class PostgresStore:
 
         handle = ref.handle or {}
         return self._keys(handle["table"], handle["key"], dict(handle.get("where") or {}), among)
+
+    def _held(self, cur, table, key_column: str, where: dict) -> list[str]:
+        """The keys (as text) the partition holds as `cur`'s transaction sees
+        it, sorted by their bytes."""
+
+        key = _ident(key_column)
+        found = cur.execute(
+            f"SELECT DISTINCT {key}::text AS k, convert_to({key}::text, 'UTF8') AS b FROM {table} "
+            f"WHERE {self._where_sql(where)} ORDER BY 2",
+            [where[k] for k in sorted(where)],
+        )
+        return [r["k"] for r in found]
 
     def _keys(self, table, key_column: str, where: dict, among: list[str] | None):
         """The partition's keys (as text) sorted by their bytes, a chunk at a time

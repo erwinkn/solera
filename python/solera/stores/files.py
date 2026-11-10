@@ -363,12 +363,13 @@ class FileStore:
         if value is MISSING:
             raise StoreError(f"{ref.output}: {base} is gone")
         version = _generation(base)
-        if mode == "set":
-            versions = None
+        if mode == "set":  # an element's version is empty: membership is all it holds
+            held = set(value)
             if selection is not None:
-                held = set(value)
                 value = [e for e in value if e in selection.generations]
-                versions = {e: g if e in held else None for e, g in selection.generations.items()}
+                versions = {e: "" if e in held else None for e in selection.generations}
+            else:
+                versions = dict.fromkeys(value, "")
             return Read(frames.materialize(value, t), versions, version)
         if selection is not None:
             raise StoreError(f"{ref.output}: an unkeyed output cannot serve a selection")
