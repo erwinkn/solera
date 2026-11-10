@@ -733,6 +733,18 @@ class Attempts:
         except LostOwnership:
             return
         except self.Conflict as error:
+            if getattr(error, "replan", False):  # it would hold keys back: planned again, no try spent
+                await self._fail(
+                    task_id,
+                    attempt,
+                    str(error),
+                    outcome="replanned",
+                    retryable=True,
+                    delay=REPLAN_DELAY,
+                    result=result,
+                    reason="held back",
+                )
+                return
             await self._fail(
                 task_id,
                 attempt,

@@ -1239,6 +1239,13 @@ class Model:
             self._core_apply(core)
             if core.get("walk") is not None:
                 self._core_walk(asset, partition, core["walk"])
+            for param, stands in (core.get("empty") or {}).items():  # unkeyed inputs' walks from empty
+                if stands != "walking":
+                    self.proceeded.pop((asset, partition), None)
+                if stands == "done":
+                    self.core_empty.pop((asset, partition, param), None)
+                else:
+                    self.core_empty[(asset, partition, param)] = ""
             for record in core.get("records") or ():
                 self._record(
                     "batch_inputs",
@@ -1825,7 +1832,8 @@ class Model:
         to another upstream, and of a producer whose output a reset started
         over, which reads its inputs in full again. Closed in the core as the
         deploy applies, so a replay closes the same ones. An operator's
-        `proceed` goes with them."""
+        `proceed` goes with them, and so does an unkeyed input's walk from
+        empty that reads nothing now."""
 
         assets, outputs = self.manifest["assets"], self.manifest["outputs"]
         for key in [k for k in self.proceeded if k[0] not in assets or k[0] in producers]:
@@ -1844,6 +1852,12 @@ class Model:
                 or upstream != spec.get("output")
             ):
                 closing.append(key)
+        for key in [k for k in self.core_empty if k not in self.core_edges]:  # unkeyed inputs' walks
+            asset, _, param = key
+            spec = ((assets.get(asset) or {}).get("inputs") or {}).get(param) or {}
+            keyed = (outputs.get(spec.get("output")) or {}).get("key") is not None
+            if asset in producers or spec.get("kind") != "incremental" or keyed:
+                del self.core_empty[key]
         if not closing:
             return
         self.core.apply(

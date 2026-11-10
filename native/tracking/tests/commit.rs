@@ -199,7 +199,6 @@ fn commits_match_the_fold() {
                 mode,
                 ends_full_run: ends,
                 collect,
-                skip: &[],
             };
             let bytes = changes.encode();
             let built = rt
@@ -373,7 +372,6 @@ fn a_commit_built_at_an_old_head_is_refused() {
         mode: Mode::Patch,
         ends_full_run: false,
         collect: 0,
-        skip: &[],
     };
     let c = Changes::of(&[(b"k", Change::Upsert(None))]).unwrap();
     let out = t.outputs.get(&output).cloned().unwrap_or_default();
@@ -414,67 +412,6 @@ fn a_commit_built_at_an_old_head_is_refused() {
         ))
         .unwrap();
     assert!(none.is_none(), "removing an absent key changes nothing");
-}
-
-#[test]
-fn skipped_keys_stay_as_they_are() {
-    let rt = runtime();
-    let mut rng = SmallRng::seed_from_u64(2);
-    let ix = index(&mut rng, &rt);
-    let output: Id = b"o".as_slice().into();
-    let mut t = Tracking::new();
-    let skip = [b"k1".to_vec(), b"k2".to_vec()];
-    let commit =
-        |t: &mut Tracking, mode, version, skip: &[Vec<u8>], c: &[(&[u8], Change<'_>)]| {
-            let spec = Spec {
-                version,
-                time_ms: 0,
-                producer: b"",
-                path: if version == 1 { "a" } else { "b" },
-                mode,
-                ends_full_run: false,
-                collect: 0,
-                skip,
-            };
-            let out = t.outputs.get(&output).cloned().unwrap_or_default();
-            let c = Changes::of(c).unwrap();
-            let built = rt
-                .block_on(commit::build(
-                    &OneIndex(&ix),
-                    &output,
-                    &out,
-                    spec,
-                    &mut Held(Some(&c)),
-                ))
-                .unwrap()
-                .unwrap();
-            t.apply(&Event::of(vec![Part::OutputCommit(built.part)]).encode())
-                .unwrap();
-            let o = &t.outputs[&output];
-            scan_all(&rt, &ix, &o.layers, o.head)
-        };
-    commit(
-        &mut t,
-        Mode::Patch,
-        1,
-        &[],
-        &[(b"k1", Change::Upsert(None)), (b"k2", Change::Upsert(None))],
-    );
-    let after = commit(
-        &mut t,
-        Mode::Replace,
-        2,
-        &skip,
-        &[(b"k1", Change::Upsert(None)), (b"k3", Change::Upsert(None))],
-    );
-    let want: State = [(b"k1", 1), (b"k2", 1), (b"k3", 2)]
-        .into_iter()
-        .map(|(k, v)| (k.to_vec(), V::I(v)))
-        .collect();
-    assert_eq!(
-        after, want,
-        "a replace neither updates nor removes a skipped key"
-    );
 }
 
 #[test]
@@ -602,7 +539,6 @@ fn large_commits_cross_pages_and_blocks() {
             mode,
             ends_full_run: false,
             collect: 0,
-            skip: &[],
         };
         let built = rt
             .block_on(commit::build(

@@ -3,8 +3,9 @@
 
 A producer partition is incomplete while a keyed output of it is mid full
 run (its first commit cleared it), or, once it has committed, while an
-`empty` piece of one of its inputs still holds a key it has not processed
-(a first run, or a full run of an unkeyed output, not walked to the end:
+input's walk from empty is not done (`Model.core_empty`): a keyed input's
+empty piece still holds a key it has not processed, or an unkeyed input's
+commits are not all read (a first or full run not walked to the end:
 `Engine._complete_known`). Every reader of an incomplete output waits, keyed
 or whole: its task is held, saying "upstream incomplete" and naming it
 (STA-13, RUN-4). A full run ends with the batch that ends its walk, or as
@@ -103,10 +104,10 @@ async def proceed(engine, asset: str, partition: str, by: str) -> dict:
     full runs end (`FullRunDone`), and the gate lets every reader of its
     outputs through until the partition starts over."""
 
-    core, outputs = engine.core, [o["name"] for o in engine.manifest["assets"][asset]["outputs"]]
-    ids = sorted(i for o in outputs if (i := core.m.core_outputs.get((o, partition))) is not None)
+    core, outputs = engine.core, sorted(o["name"] for o in engine.manifest["assets"][asset]["outputs"])
+    ids = [i for o in outputs if (i := core.m.core_outputs.get((o, partition))) is not None]
     async with contextlib.AsyncExitStack() as locks:
-        for id_ in ids:
+        for id_ in ids:  # in output-name order, as a batch's commit takes them
             await locks.enter_async_context(core.lock(id_))
         stuck = [s["output"] for s in stopped(engine) if (s["asset"], s["partition"]) == (asset, partition)]
         if not stuck:

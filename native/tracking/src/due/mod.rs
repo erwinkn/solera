@@ -136,7 +136,6 @@ pub async fn start(
         mode: CommitMode::Patch,
         ends_full_run: false,
         collect: 0,
-        skip: &[],
     };
     let pid = output_id(PASS, &v.edge);
     let Some(built) = build(ixs, &pid, pass_list, spec, &mut Source(Some(&ch))).await? else {

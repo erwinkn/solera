@@ -36,38 +36,6 @@ pub struct Spec<'a> {
     pub ends_full_run: bool,
     /// Keep up to this many changed keys in `Built::keys` (0: none).
     pub collect: usize,
-    /// Keys the commit leaves as they are at the head, whatever the changes
-    /// say of them (sorted, distinct): a batch's held-back keys (§7).
-    pub skip: &'a [Vec<u8>],
-}
-
-/// The changes without the keys in `skip`.
-struct Skip<'a, 'b> {
-    inner: &'b mut dyn Source,
-    skip: &'a [Vec<u8>],
-    chunk: Changes,
-}
-
-impl Source for Skip<'_, '_> {
-    fn next(&mut self, out: &mut Changes) -> Result<bool> {
-        out.clear();
-        while self.inner.next(&mut self.chunk)? {
-            for i in 0..self.chunk.len() {
-                let k = self.chunk.key(i);
-                if !skipped(self.skip, k) {
-                    out.push(k, self.chunk.change(i))?;
-                }
-            }
-            if !out.is_empty() {
-                return Ok(true);
-            }
-        }
-        Ok(false)
-    }
-}
-
-fn skipped(skip: &[Vec<u8>], k: &[u8]) -> bool {
-    skip.binary_search_by(|s| s.as_slice().cmp(k)).is_ok()
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -199,19 +167,8 @@ pub async fn build_each(
         version: spec.version,
     };
     let mut ch = Changes::new();
-    let mut skipping;
-    let changes: &mut dyn Source = if spec.skip.is_empty() {
-        changes
-    } else {
-        skipping = Skip {
-            inner: changes,
-            skip: spec.skip,
-            chunk: Changes::new(),
-        };
-        &mut skipping
-    };
     match spec.mode {
-        Mode::Replace => replace(ix, out, changes, spec.skip, &mut ch, &mut e).await?,
+        Mode::Replace => replace(ix, out, changes, &mut ch, &mut e).await?,
         Mode::Clear => {
             while changes.next(&mut ch)? {
                 for i in 0..ch.len() {
@@ -302,7 +259,6 @@ async fn replace(
     ix: &ChangeIndex,
     out: &Output,
     changes: &mut dyn Source,
-    skip: &[Vec<u8>],
     ch: &mut Changes,
     e: &mut Entries<'_>,
 ) -> Result<()> {
@@ -344,10 +300,8 @@ async fn replace(
                 i += 1;
             }
             (_, Some(o)) => {
-                if !skipped(skip, o) {
-                    e.put(o, Change::Removed, page.new_version(page.rows(j).start))
-                        .await?;
-                }
+                e.put(o, Change::Removed, page.new_version(page.rows(j).start))
+                    .await?;
                 j += 1;
             }
             (Some(_), None) => unreachable!(),

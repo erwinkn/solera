@@ -85,7 +85,8 @@ class Observing:
 
     def _gappy(self, asset: str, partition: str) -> list | None:
         """What deciding whether a partition is complete takes: None if it is
-        not — never committed, or an incremental input with no record —
+        not — never committed, or an incremental input with no record or
+        (on the core) an unkeyed one's walk from empty not done —
         else each keyed input record with gaps (`observed.gaps`), as
         `(key, stamp, input, rec)`, `stamp` what its answer depends on."""
 
@@ -113,8 +114,10 @@ class Observing:
                     out.append(((asset, partition, input.param), stamp, input, {"core": empty}))
                 continue
             rec = records.get(input.param)
-            if rec is None:
-                return None
+            if rec is None or (
+                self.core is not None and (asset, partition, input.param) in self.m.core_empty
+            ):
+                return None  # never read, or a walk from empty not done (an unkeyed input's, on the core)
             holes = observed.gaps(rec)
             if not holes:
                 continue

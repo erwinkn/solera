@@ -38,19 +38,57 @@ class Built:
     elements: dict = field(default_factory=dict)  # a dynamic partitions output -> its elements after
     progress: dict | None = None  # the run's walk over the keyed inputs: {batch, key}
     walk: dict | None = None  # the batch's range of it: {inputs, after, hi, reset}
+    empty: dict = field(default_factory=dict)  # unkeyed input -> where its walk from empty stands
     locks: contextlib.AsyncExitStack = field(default_factory=contextlib.AsyncExitStack)
 
     def payload(self) -> dict | None:
         """The commit's `core` field, as the model applies it."""
 
-        if self.event is None:
+        if self.event is None and not self.empty:
             return None
         return {
-            "event": b64(self.event),
+            "event": b64(self.event) if self.event is not None else None,
             "records": self.records,
             "counts": self.counts,
             "walk": self.walk,
+            "empty": self.empty,
         }
+
+
+class HeldBack(Conflict):
+    """The batch would hold back a key: it commits nothing and is planned
+    again (the `replanned` outcome, no try spent). Which output keys a held
+    key's load made is the asset's code's to know, so no part of the batch
+    is published; the gate keeps it waiting while its upstream is
+    incomplete, so it is planned again once, not in a loop."""
+
+    replan = True
+
+
+def held(ops: tuple) -> None:
+    """Refuse a batch `progress_ops` holds keys back in (§7 step 4)."""
+
+    if keys := sorted({k for keys in ops[2] for k in keys}):
+        raise HeldBack(f"a clear came in on an input since the batch planned: {len(keys)} keys held back")
+
+
+def unkeyed_walks(core: Core, task: dict, prepared: dict) -> dict:
+    """Per unkeyed incremental input of the batch walking from empty (a full
+    run, or the first), where that walk stands after it: `reset` (it just
+    started over), `walking` or `done`. What `Model.core_empty` holds for
+    keyed inputs as a key, it holds for these as `""` until `done`:
+    completeness reads both."""
+
+    m, asset, partition = core.m, task["asset"], task["partition"]
+    observed = m.partition(asset, partition).get("observed") or {}
+    out = {}
+    for param, plan in (prepared.get("plans") or {}).items():
+        if (plan or {}).get("kind") != "commits" or plan.get("done"):
+            continue
+        reset = plan["full"] or param not in observed
+        if reset or (asset, partition, param) in m.core_empty:
+            out[param] = "done" if plan["final"] else "reset" if reset else "walking"
+    return out
 
 
 async def plan_of(core: Core, task: dict, attempt: str, prepared: dict) -> bytes | None:
@@ -107,10 +145,14 @@ async def build(core: Core, task: dict, attempt: str, prepared: dict, result: di
         claim = m.claimed(attempt)
         generation = int((claim or {}).get("generation") or 0)
         producer = canonical({"run": task["run"], "attempt": attempt})
-        first = None
         clear, ends = full_run(prepared)
         plan = await plan_of(core, task, attempt, prepared)
-        keyed, reports, skip, ops, foreseen = [], [], [], None, None
+        keyed, reports, ops, foreseen = [], [], None, None
+        keyed_outputs = [
+            (name, info, outputs.get(name) or {"unchanged": True})
+            for name, info in sorted((prepared.get("outputs") or {}).items())
+            if info.get("contract", {}).get("key") is not None
+        ]
         if plan is not None:
             keyed = sorted(
                 ((p, plan) for p, plan in prepared["plans"].items() if "core" in (plan or {})),
@@ -120,32 +162,38 @@ async def build(core: Core, task: dict, attempt: str, prepared: dict, result: di
             reports = [
                 ([], sorted(map(tuple, (delivered.get(p) or {}).get("loaded") or ()))) for p, _ in keyed
             ]
-            # A key held back on its inputs is left as it was in the batch's outputs too: a key's
-            # output is one value computed from all its inputs. The batch records name the output
-            # commit, built after: its number is foreseen (one call of 4 ms per 10k keys, not two).
+            # The batch records name the output commit, built after: its number is foreseen,
+            # so the batch costs one call (4 ms per 10k keys), not two.
             foreseen = next(
                 (
-                    (m.core_output(name, partition) or {"head": 0})["head"] + 1
-                    for name, info in sorted((prepared.get("outputs") or {}).items())
-                    if info.get("contract", {}).get("key") is not None
-                    and not (outputs.get(name) or {"unchanged": True}).get("unchanged")
+                    (m.core_output(n, partition) or {"head": 0})["head"] + 1
+                    for n, _, e in keyed_outputs
+                    if not e.get("unchanged")
                 ),
                 None,
             )
             ops = await core.run(
                 core.tracking.progress_ops, plan, reports, producer=producer, output_commit=foreseen
             )
-            skip = sorted({k for keys in ops[2] for k in keys})
-        done = []  # keyed outputs whose full run this batch ends with no commit
-        for name, info in sorted((prepared.get("outputs") or {}).items()):
-            entry = outputs.get(name) or {"unchanged": True}
-            if info.get("contract", {}).get("key") is None:
+            held(ops)
+        # Every output lock the batch needs, in output-name order, as any other taker of several does.
+        ids = {}
+        for name, _, entry in keyed_outputs:
+            if not entry.get("unchanged"):
+                ids[name] = core.named(name, partition)
+            elif ends and (id_ := m.core_outputs.get((name, partition))) is not None:
+                ids[name] = id_
+        for name in sorted(ids):
+            await built.locks.enter_async_context(core.lock(ids[name]))
+        first = None
+        for name, info, entry in keyed_outputs:
+            if name not in ids:
                 continue
-            if entry.get("unchanged"):
-                done.append(name)
+            id_ = ids[name]
+            if entry.get("unchanged"):  # in a full run that this batch ends with no commit of it
+                if core.tracking.full_run(id_.encode()) is not None:
+                    events.append(Tracking.event_full_run_done(id_.encode()))
                 continue
-            id_ = core.named(name, partition)
-            await built.locks.enter_async_context(core.lock(id_))
             core.attach(id_)
             ending = ends and (clear or core.tracking.full_run(id_.encode()) is not None)
             out = m.core_output(name, partition) or {"head": 0, "layers": []}
@@ -162,7 +210,6 @@ async def build(core: Core, task: dict, attempt: str, prepared: dict, result: di
                     mode="clear" if clear else "replace" if entry.get("whole") else "patch",
                     ends_full_run=ending,
                     collect=DYNAMIC_KEYS if dynamic else 0,
-                    skip=skip,
                 )
             if found is None:
                 if ending:
@@ -176,23 +223,13 @@ async def build(core: Core, task: dict, attempt: str, prepared: dict, result: di
             }
             if dynamic:
                 built.elements[name] = await elements(core, name, partition, out, found)
-        for name in done if ends else ():
-            id_ = core.m.core_outputs.get((name, partition))
-            if id_ is None:
-                continue
-            await built.locks.enter_async_context(core.lock(id_))
-            if core.tracking.full_run(id_.encode()) is not None:
-                events.append(Tracking.event_full_run_done(id_.encode()))
         if plan is not None:
-            # Held-back keys keep their points and stay owed for a later run (the walk goes on past
-            # them, so nothing replans them in a loop); leaving their outcomes alone is B6's.
             if first != foreseen:  # an output built nothing, or moved meanwhile
                 ops = await core.run(
                     core.tracking.progress_ops, plan, reports, producer=producer, output_commit=first
                 )
-            progress, records, held = ops
-            if sorted({k for keys in held for k in keys}) != skip:
-                raise Conflict("a clear came while the batch built its outputs: it holds back other keys now")
+                held(ops)  # a clear may have come in while the outputs were built
+            progress, records, _ = ops
             events.insert(0, progress)
             built.records = [[p, b64(r)] for (p, _), r in zip(keyed, records, strict=True)]
             some, ended = keyed[0][1], all(p["final"] for _, p in keyed)
@@ -204,6 +241,7 @@ async def build(core: Core, task: dict, attempt: str, prepared: dict, result: di
                 "reset": bool(some["full"]),
                 "keys": some.get("mode") == "keys",
             }
+        built.empty = unkeyed_walks(core, task, prepared)
         if events:
             built.event = Tracking.join(events)
         return built

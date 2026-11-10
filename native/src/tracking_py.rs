@@ -18,7 +18,7 @@ use solera_tracking as tr;
 use tr::codec::Ver;
 use tr::event::{Event, Part};
 use tr::plan::{InputRequest, Mode, Plan, Request};
-use tr::progress::{Class, Conditions, Key, Matcher, Pat, Patterns};
+use tr::progress::{Class, Conditions, Holding, Key, Matcher, Pat, Patterns, Point, Reason};
 
 use crate::index_py::{key, layers_in, rt, version, ChangeIndex, Owned};
 use crate::{guard, FormatError};
@@ -390,7 +390,8 @@ impl Tracking {
     /// `patterns` (`solera.patterns.spec(…)`) take: a scan of its attached
     /// index, a page at a time, stopping at the first such key. Nothing
     /// crosses per key; False before its first commit. With `edge`, a key
-    /// that edge holds a point for (a key list processed it) does not count.
+    /// that edge processed in a point (a key list's) does not count; a point
+    /// that keeps an absent holding (failed, held back) does not process it.
     #[pyo3(signature = (output, patterns=None, after=None, edge=None))]
     fn taken(
         &self,
@@ -427,7 +428,8 @@ impl Tracking {
                             .state_with(&o.layers, o.head, None, &q, |k, _, _, _| {
                                 found = found
                                     || (matcher.takes(k)
-                                        && points.is_none_or(|p| p.point(k).is_none()))
+                                        && points
+                                            .is_none_or(|p| !p.point(k).is_some_and(processed)))
                             })
                             .await
                             .map_err(tr::Error::Index)?;
@@ -742,10 +744,9 @@ impl Tracking {
     /// `commit_py::build_commit`. `changes` is `bytes`, or the path of a
     /// local file holding them, which nothing writes while the build runs
     /// (the engine's own temporary file): mapped here, so a large write's
-    /// changes are read in place rather than held in memory. A key in
-    /// `skip` (sorted) is left out: the output keeps it as it was.
+    /// changes are read in place rather than held in memory.
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (output, changes, *, version, path, time_ms=0, producer=Vec::new(), mode="patch", at=None, ends_full_run=false, collect=0, skip=Vec::new()))]
+    #[pyo3(signature = (output, changes, *, version, path, time_ms=0, producer=Vec::new(), mode="patch", at=None, ends_full_run=false, collect=0))]
     fn build_commit<'py>(
         &self,
         py: Python<'py>,
@@ -759,14 +760,7 @@ impl Tracking {
         at: Option<u64>,
         ends_full_run: bool,
         collect: usize,
-        skip: Vec<String>,
     ) -> PyResult<Option<Bound<'py, pyo3::types::PyDict>>> {
-        let skip: Vec<Vec<u8>> = skip.into_iter().map(String::into_bytes).collect();
-        if skip.windows(2).any(|w| w[0] >= w[1]) {
-            return Err(pyo3::exceptions::PyValueError::new_err(
-                "skip: sorted and distinct keys",
-            ));
-        }
         let mapped: memmap2::Mmap;
         let data: &[u8] = if let Ok(b) = changes.cast_exact::<PyBytes>() {
             b.as_bytes()
@@ -805,7 +799,6 @@ impl Tracking {
             at,
             ends_full_run,
             collect,
-            &skip,
         )
     }
 
@@ -1049,4 +1042,15 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<KeyMatcher>()?;
     m.add_function(wrap_pyfunction!(regex_check, m)?)?;
     m.add_class::<Tracking>()
+}
+
+/// Whether a point says its consumer processed the key since its progress
+/// started over: one that keeps an absent holding (a failed or held-back
+/// key over the empty base) does not (D177).
+fn processed(p: &Point) -> bool {
+    p.holding != Holding::Absent
+        || !matches!(
+            p.reason,
+            Reason::Failed | Reason::HeldBack | Reason::Unsettled
+        )
 }

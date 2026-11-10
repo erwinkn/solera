@@ -38,7 +38,6 @@ pub(crate) fn build_commit<'py>(
     at: Option<u64>,
     ends_full_run: bool,
     collect: usize,
-    skip: &[Vec<u8>],
 ) -> PyResult<Option<Bound<'py, PyDict>>> {
     let mode = match (mode, at) {
         ("patch", None) => Mode::Patch,
@@ -59,7 +58,6 @@ pub(crate) fn build_commit<'py>(
         mode,
         ends_full_run,
         collect,
-        skip,
     };
     let id: tr::Id = output.into();
     let mut notice = tr::stale::Notice::new(

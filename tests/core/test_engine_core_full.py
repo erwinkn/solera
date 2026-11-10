@@ -5,10 +5,21 @@ back, and the operator's `proceed`."""
 import asyncio
 
 import pytest
-from solera.sdk import In, Incremental, Output, Project, Source, StaticPartitions, asset, canonical_partition
+from solera._native import ChangeIndex, Tracking, encode_changes
+from solera.sdk import (
+    In,
+    Incremental,
+    Output,
+    Project,
+    Retry,
+    Source,
+    StaticPartitions,
+    asset,
+    canonical_partition,
+)
 from solera.stores import FileStore, Patch
 from solera_server.planning import Planner
-from solera_server.state import State
+from solera_server.state import Conflict, State
 from solera_server.tracking import full
 
 from tests.contract.example import Example
@@ -120,21 +131,30 @@ def test_a_fan_in_waits_only_for_the_partitions_its_shared_keys_name(tmp_path):
     assert full.gate(planner, {"asset": "report", "partition": "east"}, incomplete) == [INCOMPLETE, "items"]
 
 
-async def test_a_key_held_back_keeps_its_prior_output(solera, tmp_path):
+def _attempts(detail: dict, asset_name: str) -> list[dict]:
+    [task] = [t for t in detail["tasks"] if t["asset"] == asset_name]
+    return detail["attempts"][task["id"]]
+
+
+async def test_a_batch_that_would_hold_a_key_back_publishes_nothing_and_is_planned_again(solera, tmp_path):
     entered, release, calls = asyncio.Event(), asyncio.Event(), [0]
 
     @asset(inputs={"feed": Incremental()}, outputs=Output("copy", key="id"))
     def copy(feed: list):
         return [{"id": r["id"], "v": r["v"]} for r in feed]
 
-    @asset(inputs={"feed": Incremental(), "copy": Incremental()}, outputs=Output("join", key="id"))
+    @asset(
+        inputs={"feed": Incremental(), "copy": Incremental()},
+        outputs=[Output("mapped", key="id"), Output("total")],
+        retries=Retry(n=0),
+    )
     async def join(feed: list, copy: list):
         calls[0] += 1
         if calls[0] == 2:
             entered.set()
             await release.wait()
-        rows = {r["id"]: r["v"] for r in copy} | {r["id"]: r["v"] for r in feed}
-        return Patch([{"id": k, "v": v} for k, v in rows.items()])
+        mapped = Patch([{"id": "mapped-" + r["id"], "v": r["v"]} for r in feed])
+        return {"mapped": mapped, "total": {"n": sum(int(r["v"]) for r in feed)}}
 
     outside = Outside()
     stores = {"ext": SourceStore(tmp_path / "ext", outside)}
@@ -148,18 +168,162 @@ async def test_a_key_held_back_keeps_its_prior_output(solera, tmp_path):
     await solera.commit_source("feed", upsert=outside.feed)
     await solera.run("copy")
     await solera.run("join")
-    outside.feed["k1"] = "2"
-    await solera.commit_source("feed", upsert={"k1": "2"})
+    eng = solera.engine
+    before = {name: eng.m.heads[(name, "")]["ref"] for name in ("mapped", "total")}
+    outside.feed["k1"] = "9"
+    await solera.commit_source("feed", upsert={"k1": "9"})
     joining = await solera.submit("join")
     await solera.until(entered.is_set)
     await solera.run("copy", mode="full")  # a clear on the input k1's batch did not take
+    replanned = []
+    record = solera.state.record
+
+    def spy(*events, **kw):
+        for e in events:
+            if e.get("type") == "AttemptFinished" and e.get("outcome") == "replanned":
+                replanned.append({name: eng.m.heads[(name, "")]["ref"] for name in before})
+        return record(*events, **kw)
+
+    solera.state.record = spy
     release.set()
-    await solera.wait(joining)
+    detail = await solera.wait(joining)
+    assert detail["request"]["status"] == "succeeded", "no try spent: retries=0 still succeeds"
+    outcomes = [a["outcome"] for a in _attempts(detail, "join")]
+    assert outcomes == ["replanned", "succeeded"], outcomes
+    assert replanned == [before], "the held batch published neither its keyed nor its unkeyed output"
+    assert await solera.rows("mapped") == {"mapped-k1": "9", "mapped-k2": "1"}
+    assert await solera.read("total") == {"n": 9}
+
+
+async def test_a_key_list_that_would_hold_its_key_back_is_planned_again_and_completes(solera, tmp_path):
+    entered, release = asyncio.Event(), asyncio.Event()
+    release.set()
+
+    @asset(inputs={"feed": Incremental()}, outputs=Output("empty", key="id"))
+    def empty(feed: list):
+        return []
+
+    async def join(feed: list, empty: list):
+        entered.set()
+        await release.wait()
+        return [{"id": r["id"], "v": r["v"]} for r in feed]
+
+    outside = Outside()
+
+    def project(version):
+        joining = asset(
+            join,
+            inputs={"feed": Incremental(), "empty": Incremental()},
+            outputs=Output("join", key="id"),
+            version=version,
+        )
+        stores = {"ext": SourceStore(tmp_path / "ext", outside)}
+        sources = [Source("feed", key="id", store="ext")]
+        return Project(
+            assets=[empty, joining],
+            sources=sources,
+            stores=stores,
+            default_store=FileStore(tmp_path / "data"),
+        )
+
+    await solera.deploy(project("1"))
+    outside.feed["k"] = "1"
+    await solera.commit_source("feed", upsert=outside.feed)
+    await solera.run("empty")
+    await solera.run("join")
+    await solera.deploy(project("2"))  # join owes a full run
+    entered.clear()
+    release.clear()
+    listed = await solera.submit("join", keys={"feed": ["k"]})
+    await solera.until(entered.is_set)
+    await solera.run("empty", mode="full")
+    release.set()
+    detail = await solera.wait(listed)
+    assert [a["outcome"] for a in _attempts(detail, "join")] == ["replanned", "succeeded"]
+    await solera.settle(0.1)
+    assert await solera.rows("join") == {"k": "1"}
+    assert await solera.engine.complete("join", "") and full.incomplete(solera.engine) == set()
+
+
+def test_a_point_that_keeps_an_absent_holding_does_not_cover_its_key(tmp_path):
+    t = Tracking()
+    t.attach(b"up", ChangeIndex(tmp_path.as_uri()))
+    t.apply(t.build_commit(b"up", encode_changes(["k"]), version=1, path="one")["event"])
+    t.apply(t.event_edge_open(b"e", b"up", True))
+    p = t.plan({"mode": "keys", "keys": ["k"], "limit": 10, "inputs": [{"edge": b"e", "conditions": {}}]})
+    t.apply(t.build_commit(b"up", encode_changes(["k"]), version=2, mode="clear", path="two")["event"])
+    event, _, held = t.progress_ops(p["plan"], [([], [("k", 2)])])
+    assert held == [["k"]]
+    t.apply(event)
+    assert t.taken(b"up", edge=b"e"), "k was held back over the empty base: never processed"
+
+
+async def test_a_whole_reader_waits_for_a_full_run_over_unkeyed_inputs(solera, tmp_path):
+    entered, release, holding, seen = asyncio.Event(), asyncio.Event(), [False], []
+
+    @asset(outputs=Output("events", incremental=True))
+    def events():
+        return Patch([{"n": 1}])
+
+    @asset(inputs={"events": Incremental(batch_size=1)})
+    async def digest(ctx, events: list):
+        b = ctx.batch["events"]
+        if holding[0] and b.index == 1:
+            entered.set()
+            await release.wait()
+        prior = 0 if b.reset else (await ctx.load() or {"n": 0})["n"]
+        return {"n": prior + len(events)}
+
+    @asset(inputs={"digest": In()})
+    def report(digest: dict):
+        seen.append(digest["n"])
+        return digest
+
+    await solera.deploy(Project(assets=[events, digest, report], default_store=FileStore(tmp_path / "data")))
+    for _ in range(3):
+        await solera.run("events")
+    await solera.run("digest")
+    holding[0] = True
+    rebuild = await solera.submit("digest", mode="full")
+    await solera.until(entered.is_set)
+    try:
+        reader = await solera.submit("report")
+        task = await decided(solera, reader, "report")
+        assert task.get("held") == [INCOMPLETE, "digest"] and seen == [], (task, seen)
+    finally:
+        release.set()
+        await solera.wait(rebuild)
+    await solera.wait(reader)
+    assert seen == [3] and full.incomplete(solera.engine) == set()
+
+
+async def test_proceed_and_a_commit_of_several_outputs_take_their_locks_in_one_order(solera, tmp_path):
+    @asset(outputs=[Output("z", key="id"), Output("a", key="id")])
+    def two():
+        return {"z": [{"id": "k"}], "a": [{"id": "k"}]}
+
+    await solera.deploy(Project(assets=[two], default_store=FileStore(tmp_path / "data")))
     eng = solera.engine
-    edge = eng.m.core_edges[("join", "", "feed")][0]
-    context = {"definition": eng.m.partition("join", "")["definition"].encode(), "context": b"{}"}
-    assert eng.core.tracking.owed(edge.encode(), context)[0] == [("k1", "updated")]
-    assert await solera.rows("join") == {"k1": "1", "k2": "1"}, "held back on every input: its output stays"
+    run, entered, release = eng.core.run, asyncio.Event(), asyncio.Event()
+
+    async def first_build_waits(fn, *args, **kwargs):
+        result = await run(fn, *args, **kwargs)
+        if fn == eng.core.tracking.build_commit and not entered.is_set():
+            entered.set()
+            await release.wait()
+        return result
+
+    eng.core.run = first_build_waits
+    request = await solera.submit("two")
+    await solera.until(entered.is_set)
+    ids = eng.m.core_outputs
+    assert ids[("z", "")] < ids[("a", "")], ids  # id order and name order differ
+    proceeding = asyncio.create_task(eng.proceed("two"))
+    release.set()
+    detail = await solera.wait(request, timeout=5)
+    assert detail["request"]["status"] == "succeeded"
+    with pytest.raises(Conflict):  # nothing to let through: refused, not stuck
+        await asyncio.wait_for(proceeding, 5)
 
 
 async def test_a_rebound_input_closes_its_edge_at_deploy(solera, tmp_path):
