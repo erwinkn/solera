@@ -20,7 +20,8 @@ the attempt's control file (N13).
 from __future__ import annotations
 
 import asyncio
-import bisect
+import heapq
+import itertools
 import tempfile
 from base64 import b64decode, b64encode
 
@@ -128,21 +129,22 @@ async def changes(objects, spec: dict, name: str, o) -> dict:
 
 
 def _encode(o, f) -> int:
-    """Writes the changes' transport form to `f`: its header, then each
-    chunk's blocks (a block stands alone, and keys ascend across chunks, a
-    removal joining the chunk whose keys it falls among). Returns its size."""
+    """Writes the changes' transport form to `f`: its header, then the
+    blocks of each `CHANGES_CHUNK` changes in key order, upserts and
+    removals merged (a block stands alone, and keys ascend across chunks).
+    Returns its size."""
 
     word = "" if o.output.is_dynamic_partitions else None
-    removes = [] if o.replace else sorted(str(k) for k in o.prepared.removes)
+    upserts = ((key_str(k), False) for chunk, _ in o.prepared.rows.chunks(CHANGES_CHUNK) for k in chunk)
+    removes = () if o.replace else ((k, True) for k in sorted(str(k) for k in o.prepared.removes))
     header = encode_changes([])
     f.write(header)
-    done = 0
-    for chunk, _ in o.prepared.rows.chunks(CHANGES_CHUNK):
-        keys = [key_str(k) for k in chunk]
-        end = bisect.bisect_right(removes, keys[-1], done)
-        upserts = keys if word is None else dict.fromkeys(keys, word)
-        f.write(encode_changes(upserts, removes[done:end])[len(header) :])
-        done = end
-    if done < len(removes):
-        f.write(encode_changes([], removes[done:])[len(header) :])
+    for chunk in itertools.batched(heapq.merge(upserts, removes), CHANGES_CHUNK):
+        written = [k for k, removed in chunk if not removed]
+        f.write(
+            encode_changes(
+                written if word is None else dict.fromkeys(written, word),
+                [k for k, removed in chunk if removed],
+            )[len(header) :]
+        )
     return f.tell()

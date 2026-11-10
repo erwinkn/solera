@@ -31,6 +31,9 @@ from solera.threads import in_thread
 from ..state import Conflict
 
 HEAVY = 4  # plans and commit builds running at once: the engine's cores (N9, D208)
+WALK = (
+    "(core)"  # the keyed inputs' walk in a task's progress, beside unkeyed inputs': never a parameter's name
+)
 
 
 def b64(data: bytes) -> str:

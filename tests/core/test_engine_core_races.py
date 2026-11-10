@@ -89,7 +89,8 @@ async def test_a_loads_report_never_overwrites_a_source_commit_made_since_the_ba
     assert await _state(engine, "feed") == {"k": "v3"}
 
 
-async def test_a_finished_keyed_input_is_delivered_empty_while_unkeyed_inputs_go_on(solera, tmp_path):
+@pytest.mark.parametrize("param", ["log", "core"])  # "core": never the keyed walk's own progress
+async def test_a_finished_keyed_input_is_delivered_empty_while_unkeyed_inputs_go_on(solera, tmp_path, param):
     outside, seen = Outside(), []
     outside.feed.update({"k": "v1"})
 
@@ -97,10 +98,20 @@ async def test_a_finished_keyed_input_is_delivered_empty_while_unkeyed_inputs_go
     def log():
         return Patch([{"v": 1}])
 
-    @asset(inputs={"feed": Incremental(batch_size=1), "log": Incremental(batch_size=1)}, retries=Retry(n=0))
-    def consumer(ctx, feed: list, log: list):
+    def log_input(ctx, feed: list, log: list):
         seen.append((len(feed), len(log)))
         return len(log)
+
+    def core_input(ctx, feed: list, core: list):
+        seen.append((len(feed), len(core)))
+        return len(core)
+
+    body = {"log": log_input, "core": core_input}[param]
+    body.__name__ = body.__qualname__ = "consumer"
+    consumer = asset(
+        inputs={"feed": Incremental(batch_size=1), param: Incremental("log", batch_size=1)},
+        retries=Retry(n=0),
+    )(body)
 
     await solera.deploy(
         Project(

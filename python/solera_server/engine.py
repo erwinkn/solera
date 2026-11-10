@@ -71,7 +71,7 @@ from .observing import Observing
 from .sensors import Sensors
 from .staleness import Staleness
 from .state import Conflict, LostOwnership, State
-from .tracking import Core, b64, output_pin
+from .tracking import WALK, Core, b64, output_pin
 from .tracking import commit as core_commit
 from .tracking import prepare as core_prepare
 from .tracking import sources as core_sources
@@ -1649,7 +1649,7 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
             async with built.locks:  # the outputs it built: their commits are recorded in turn
                 observations = await self._observations(task, core_commit.unkeyed(prepared), result, attempt)
                 if built.progress is not None:
-                    observations.setdefault("progress", {})["core"] = built.progress
+                    observations.setdefault("progress", {})[WALK] = built.progress
                 if self.m.claimed(attempt) is not claim:
                     raise LostOwnership(attempt)
                 self._commit_guards(task, prepared)  # again: the build and its observations awaited

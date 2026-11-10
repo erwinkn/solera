@@ -20,7 +20,7 @@ import math
 
 from solera._native import Tracking
 
-from . import Core, b64, canonical
+from . import WALK, Core, b64, canonical
 
 
 def conditions(engine, input, base: dict) -> dict:
@@ -89,7 +89,7 @@ async def prepare(core: Core, task: dict, run: dict, attempt: str | None) -> dic
         pin, plan, empty = engine._commits_pin(input, engine._pin_at(input.output, input.partition), o)
         pins[input.param], plans[input.param] = pin, plan
         all_empty = all_empty and empty
-    mine = progress.get("core")
+    mine = progress.get(WALK)
     if keyed and mine is not None and mine["key"] is None:  # walked to the end in this task
         # While unkeyed inputs go on, each keyed one is delivered empty and final, its edge left be.
         index = int(mine["batch"]) + 1

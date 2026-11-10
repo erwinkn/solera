@@ -710,16 +710,17 @@ impl Tracking {
     /// B4: builds and writes the next commit of `output` from its changed
     /// keys (`encode_changes`'s form), on the change index attached for it;
     /// None if nothing changed. See
-    /// `commit_py::build_commit`. `changes` is any read-only buffer: `bytes`,
-    /// or a file mapped with `mmap`, so a large write's changes are read in
-    /// place rather than held in memory.
+    /// `commit_py::build_commit`. `changes` is `bytes`, or an `mmap.mmap`
+    /// mapped read-only (`mmap.ACCESS_READ`) of a file nothing writes while
+    /// the build runs (the engine's own unlinked temporary file), so a large
+    /// write's changes are read in place rather than held in memory.
     #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (output, changes, *, version, path, time_ms=0, producer=Vec::new(), mode="patch", at=None, collect=0))]
     fn build_commit<'py>(
         &self,
         py: Python<'py>,
         output: &[u8],
-        changes: PyBuffer<u8>,
+        changes: &Bound<'py, PyAny>,
         version: u64,
         path: &str,
         time_ms: u64,
@@ -728,15 +729,23 @@ impl Tracking {
         at: Option<u64>,
         collect: usize,
     ) -> PyResult<Option<Bound<'py, pyo3::types::PyDict>>> {
-        if !changes.readonly() || !changes.is_c_contiguous() {
-            return Err(PyTypeError::new_err(
-                "changes: a read-only contiguous buffer (bytes, or a file mapped read-only)",
-            ));
-        }
-        // SAFETY: `changes` holds the buffer's export until it drops, after the build, and
-        // the exporter is read-only, so these bytes neither move nor change meanwhile.
-        let data = unsafe {
-            std::slice::from_raw_parts(changes.buf_ptr() as *const u8, changes.len_bytes())
+        let mapped: PyBuffer<u8>;
+        let data: &[u8] = if let Ok(b) = changes.cast::<PyBytes>() {
+            b.as_bytes()
+        } else {
+            let refused =
+                || PyTypeError::new_err("changes: bytes, or an mmap.mmap mapped with ACCESS_READ");
+            if !changes.is_instance(&py.import("mmap")?.getattr("mmap")?)? {
+                return Err(refused());
+            }
+            mapped = PyBuffer::get(changes)?;
+            if !mapped.readonly() || !mapped.is_c_contiguous() {
+                return Err(refused());
+            }
+            // SAFETY: `mapped` holds the map's export until the build is done, so it is neither
+            // closed nor resized; an ACCESS_READ map refuses writes through Python, and its file
+            // is the engine's own, written by nothing while the build runs.
+            unsafe { std::slice::from_raw_parts(mapped.buf_ptr() as *const u8, mapped.len_bytes()) }
         };
         let out = self
             .state
