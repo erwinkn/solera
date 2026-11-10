@@ -125,7 +125,75 @@ CALIBRATIONS = {
         ("step", "checks", 2),
         ("full", "checks"),
     ],
+    # Stores that write in place, with late and dead writers (review F1, recs 1 to 5).
+    ("fullrun", "clear", "table", "fence"): [("items", (("k1", True),)), ("plan", "copy", 2), ("restart",)],
+    ("fullrun", "clear", "table", "open_txn"): [("keys", "copy", ("k4",)), ("restart",)],
+    ("fullrun", "clear", "table", "repair"): [("plan", "copy", 2), ("restart",)],
+    ("fullrun", "clear", "table", "repair_removals"): [
+        ("items", (("k1", True), ("k2", True), ("k3", True))),
+        ("step", "copy", 3),
+        ("items", (("k3", False),)),
+        ("plan", "copy", 1),
+        ("write", "copy"),
+        ("giveup", "copy"),
+        ("items", (("k1", True),)),
+        ("step", "copy", 1),
+    ],
+    ("fullrun", "clear", "table", "repair_at_once"): [
+        ("items", (("k1", True),)),
+        ("plan", "copy", 1),
+        ("write", "copy"),
+        ("giveup", "copy"),
+        ("items", (("k1", False),)),
+    ],
+    # The cut and exact cleanup (§13), and lineage (§12), on file stores.
+    ("fullrun", "clear", "file", "cut_records"): [
+        ("step", "copy", 1),
+        ("items", (("k2", True), ("k3", True))),
+    ],
+    ("fullrun", "clear", "file", "cut_pieces"): [
+        ("step", "tally", 1),
+        ("retire",),
+        ("items", (("k1", False), ("k3", True))),
+        ("merge", "items"),
+    ],
+    ("fullrun", "clear", "file", "cut_cursor"): [("items", (("k1", False), ("k3", True)))],
+    ("fullrun", "clear", "file", "cut_attempts"): [
+        ("plan", "checks", 1),
+        ("items", (("k1", True),)),
+        ("merge", "items"),
+    ],
+    ("fullrun", "clear", "file", "cleanup_held"): [
+        ("define", "copy"),
+        ("define", "copy"),
+        ("items", (("k2", True),)),
+        ("step", "copy", 2),
+        ("full", "copy"),
+        ("plan", "archive", 2),
+        ("step", "copy", 2),
+        ("cleanup", "copy"),
+    ],
+    ("fullrun", "clear", "table", "load_check"): [
+        ("items", (("k2", True), ("k5", True))),
+        ("keys", "tally", ("k5",)),
+        ("items", (("k1", True),)),
+        ("write", "tally"),
+        ("restart",),
+    ],
 }
+
+# archive loads k1 as a dead attempt of copy left it: a version no commit
+# recorded. It holds k1 back (rule hold_back, F1 rec 4) until copy redoes it.
+DEAD_ROW = [
+    ("items", (("k1", True),)),
+    ("step", "copy", 1),
+    ("plan", "archive", 1),
+    ("items", (("k1", True),)),
+    ("plan", "copy", 1),
+    ("write", "copy"),
+    ("giveup", "copy"),
+    ("commit", "archive"),
+]
 
 # report plans over tally, whose definition then changes; tally's full run
 # clears its table and counts k1 alone, and report's batch, planned before,

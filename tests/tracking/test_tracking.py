@@ -11,7 +11,13 @@ import pytest
 
 from . import fullrun, oracle, staleness
 from .core import ABSENT, NEG, POS, Log, within
-from .histories import ARCHIVE_LOADS_MID_REBUILD, CALIBRATIONS, REPORT_IN_FLIGHT, REPORT_LOADS_MID_REBUILD
+from .histories import (
+    ARCHIVE_LOADS_MID_REBUILD,
+    CALIBRATIONS,
+    DEAD_ROW,
+    REPORT_IN_FLIGHT,
+    REPORT_LOADS_MID_REBUILD,
+)
 
 HISTORIES = int(os.environ.get("SOLERA_TRACKING_HISTORIES", "200"))
 SLOW = 5000
@@ -348,6 +354,12 @@ def test_a_removal_loaded_before_a_rebuild_is_not_the_rebuilds():
         ("commit", "archive"),
     ]
     assert fullrun.run(events, "clear", "table") is None
+
+
+def test_a_reader_holds_back_a_row_no_commit_recorded():
+    assert fullrun.run(DEAD_ROW, "clear", "table") is None
+    r = fullrun.run(DEAD_ROW, "clear", "table", frozenset({"hold_back"}))
+    assert r is not None and "no commit" in r[1]
 
 
 def test_an_empty_key_list_processes_nothing():

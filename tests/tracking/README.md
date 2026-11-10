@@ -79,4 +79,10 @@ full run begins in the design's form; `("complete",)` it ends;
 `("commit" | "cancel", asset)`; `("load", reader)` a reader's batch loads
 before it commits (archive, report); `("keys", asset, keys)`;
 `("define", asset)` a new definition; `("full", asset)` a full run by hand;
-`("restart",)`; `("summary",)` the whole reader of copy runs.
+`("restart",)`; `("summary",)` the whole reader of copy runs. A producer's
+attempt writes before it commits: `("write", asset)` runs its write
+transaction (a commit runs it first if it has not); `("giveup", asset)` ends
+the attempt without a commit; `("late", asset)` the oldest attempt given up on
+before its write writes now. `("merge", log)` folds items, feed, copy or tally
+at the cut; `("retire",)` drops the oldest batch record from history;
+`("cleanup", asset)` runs copy's or tally's cleanup.
