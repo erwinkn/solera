@@ -850,14 +850,15 @@ In `native/tracking/src/plan/` and `record/`, called from Python as
   its version at H, encoded once, put into the spec untouched and decoded
   again at commit, after a restart too.
 - **Every read is paged and stops when the batch is full.** A source's first
-  page asks for the keys the batch still needs plus one (to know whether the
-  range ends at +∞), and each further page doubles, up to 1M entries. Globs are filtered by the index; `Regex(...)`
+  page asks for about as many keys as the batch still needs (a little more,
+  to know whether the range ends at +∞), and each further page doubles, up
+  to 1M entries. Globs are filtered by the index; `Regex(...)`
   patterns by the planner, which pages on. A `Regex` is in the Rust `regex`
   dialect, matched against the whole key, and today's Python matching uses
   the same native matcher.
-- **Points are looked up in chunks** of up to 1,024 keys, and only up to
-  where every source has read, so a small batch does not fetch points beyond
-  its range.
+- **Points are looked up in chunks** of up to 1,024 keys, no further than
+  the sources have read while any has more to read, so a batch fetches at
+  most one chunk of points beyond its range.
 - **Keys owed but not due** (§11) come from a hook (`plan::Hold`) that B6
   implements over its due index. They are listed as held back and keep
   what they held.
