@@ -9,10 +9,11 @@ use object_store::path::Path;
 use solera_index::{ChangeIndex, NewCommit, Run, Store, StoreOptions, Version, WriteOptions};
 use solera_tracking::commit::OutputCommit;
 use solera_tracking::event::{Event, Part};
+use solera_tracking::outcomes::Outcomes;
 use solera_tracking::plan::OneIndex;
 use solera_tracking::progress::{
-    read_digest, BatchProgress, Conditions, EdgeClose, EdgeOpen, EdgeRename, Key, KeyRange, Pat,
-    Patterns, Progress, Reset, Value,
+    self, read_digest, BatchProgress, Conditions, EdgeClose, EdgeOpen, EdgeRename, Holding, Key,
+    KeyRange, Pat, Patterns, Point, Progress, Reset, Value,
 };
 use solera_tracking::stale::{
     self, graph, Incomplete, NoneDue, Partition, Reason, SetWatch, State, Status, Watch, Witness,
@@ -313,6 +314,41 @@ fn a_watch_shares_no_event_with_a_change_to_its_edge() {
             .is_err());
         assert_eq!(t.snapshot(), before);
     }
+}
+
+#[test]
+fn points_set_by_outcomes_move_the_edge_on() {
+    let mut t = opened();
+    know(&mut t, 0, State::Fresh);
+    let gen = t.stale.inputs[EDGE].gen;
+    let life = t.per_key[EDGE].life;
+    apply(
+        &mut t,
+        vec![Part::Outcomes(Outcomes {
+            edge: EDGE.into(),
+            counts: [0; 6],
+            classes: [0; 3],
+            conds: vec![],
+            refs: vec![],
+            step: None,
+            at: 0,
+            look: None,
+            low: None,
+            life,
+            made: None,
+            points: vec![(
+                key("k"),
+                Point {
+                    holding: Holding::Held,
+                    reason: progress::Reason::Failed,
+                    seen: None,
+                },
+            )],
+        })],
+    );
+    let i = &t.stale.inputs[EDGE];
+    assert!(i.gen > gen);
+    assert!(i.current().is_none());
 }
 
 fn entries(keys: &[(&str, Option<u64>)], commit: u64) -> Run {

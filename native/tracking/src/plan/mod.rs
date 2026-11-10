@@ -15,6 +15,7 @@
 //! Every read is paged and stops once the batch is full, so a plan costs what
 //! its batch holds, not what the key space holds.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use solera_index::{ChangeIndex, LayerRef, Pattern, Query, Run, Version};
@@ -22,15 +23,19 @@ use xxhash_rust::xxh3::xxh3_64;
 
 use crate::codec::{Dec, Enc, Ver};
 use crate::error::{format, invalid, Result};
+use crate::outcomes::commit::records;
+use crate::outcomes::{output_id, record_digest, Conds, FAILURES};
 use crate::progress::{
     owed, read_digest, Class, CondTable, Conditions, Holding, Key, KeyRange, Keyed, Point,
     Progress, Value,
 };
-use crate::state::{Id, Tracking};
+use crate::state::{Id, Output, Tracking};
 
 pub const PLANNER_VERSION: u64 = 1;
-pub const PLAN_FORMAT: u8 = 1;
+pub const PLAN_FORMAT: u8 = 2;
 const POINT_CHUNK: usize = 1024;
+/// Owed keys whose records are read in one lookup, where the edge has any.
+const RECORD_CHUNK: usize = 1024;
 const MAX_PAGE: u64 = 1 << 20;
 
 /// The change index of each output's object store.
@@ -135,8 +140,17 @@ pub struct InputPlan {
     pub own_head: Option<u64>,
     pub keys: Vec<Cand>,
     pub held_back: Vec<HeldBack>,
+    /// Keys in the range whose failure is moot: the consumer holds what
+    /// upstream has now, so the commit drops their records (B6).
+    pub moot: Vec<Key>,
+    /// Failing keys in the range the plan met and left to their retry: tried
+    /// at what upstream has now (B6).
+    pub waiting: Vec<Key>,
     /// The digest of the progress this plan read.
     pub expect: u64,
+    /// The digest of the outcome records it read for its keys, held-back
+    /// and moot keys (B6): the commit checks they did not move.
+    pub records: u64,
 }
 
 impl InputPlan {
@@ -147,6 +161,16 @@ impl InputPlan {
             n[c.class as usize - 1] += 1;
         }
         n
+    }
+
+    /// The keys the commit reads the records of: taken, held back, moot.
+    pub fn touched(&self) -> impl Iterator<Item = &Key> {
+        self.keys
+            .iter()
+            .map(|c| &c.key)
+            .chain(self.held_back.iter().map(|h| &h.key))
+            .chain(&self.moot)
+            .chain(&self.waiting)
     }
 
     /// A digest of the batch's input: lineage recomputes it (§7).
@@ -182,6 +206,16 @@ pub struct Plan {
     pub range: KeyRange,
     pub inputs: Vec<InputPlan>,
     pub unkeyed: Vec<UnkeyedPlan>,
+    /// The retry pass a retry batch belongs to (B6).
+    pub pass: Option<PassId>,
+}
+
+/// A retry pass: its number, which starts over with the edge's records, and
+/// the life of the edge it runs in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PassId {
+    pub life: u64,
+    pub n: u64,
 }
 
 /// What a plan reads of the state, taken under a short lock.
@@ -197,6 +231,16 @@ struct InputView {
     head: u64,
     progress: Arc<Progress>,
     own: Option<(Id, Vec<LayerRef>, u64)>,
+    failures: Option<Failures>,
+}
+
+/// An edge's records of failing keys (B6), where it has any.
+struct Failures {
+    output: Id,
+    out: Output,
+    conds: Arc<Conds>,
+    /// Records with a stored outcome, by the class a try would have.
+    classes: [u64; 3],
 }
 
 impl Tracking {
@@ -222,6 +266,16 @@ impl Tracking {
                 let (l, h) = output(o);
                 (o.clone(), l, h)
             });
+            let fid = output_id(FAILURES, &i.edge);
+            let failures = self.outputs.get(&fid).filter(|o| o.live > 0).map(|o| {
+                let k = self.per_key.get(&i.edge).cloned().unwrap_or_default();
+                Failures {
+                    output: fid.clone(),
+                    out: o.clone(),
+                    conds: k.conds,
+                    classes: k.classes,
+                }
+            });
             inputs.push(InputView {
                 edge: i.edge.clone(),
                 output: e.input.clone(),
@@ -229,6 +283,7 @@ impl Tracking {
                 head,
                 progress: e.progress.clone(),
                 own,
+                failures,
             });
         }
         let mut unkeyed = Vec::with_capacity(req.unkeyed.len());
@@ -348,6 +403,26 @@ struct Found<'a> {
     held_back: Vec<HeldBack>,
     counts: [u64; 4],
     n: usize,
+    /// Owed keys whose records are still to be read (B6).
+    pend: Vec<Pend>,
+    moot: Vec<Key>,
+    /// Count owed keys that are not due (a failing key waiting for its
+    /// retry) in `counts`, without taking them.
+    waiting: bool,
+    /// Records with a stored outcome the walk met, by the class a try at
+    /// what they were tried on would have.
+    visited: [u64; 3],
+    /// Failing keys met and left to their retry.
+    skipped: Vec<Key>,
+    /// Each record read, by key: its part of the plan's `records` digest.
+    read: BTreeMap<Key, u64>,
+}
+
+struct Pend {
+    key: Key,
+    held: Holding,
+    version: Ver,
+    wanted: Holding,
 }
 
 impl Found<'_> {
@@ -360,6 +435,12 @@ impl Found<'_> {
             held_back: vec![],
             counts: [0; 4],
             n: 0,
+            pend: vec![],
+            moot: vec![],
+            waiting: false,
+            visited: [0; 3],
+            skipped: vec![],
+            read: BTreeMap::new(),
         }
     }
 
@@ -379,6 +460,7 @@ struct Walker<'a> {
     all: bool,
     input: usize,
     hold: &'a dyn Hold,
+    fails: Option<(&'a dyn Indexes, &'a Failures)>,
 }
 
 impl Walker<'_> {
@@ -509,7 +591,10 @@ impl Walker<'_> {
             let pk: Option<&[u8]> = (next_point < chunk_at).then(|| points[next_point].0.as_ref());
             let sk: Option<&[u8]> = srcs.iter().filter_map(|s| s.head()).min();
             let key: Key = match (pk, sk) {
-                (None, None) => return Ok(()),
+                (None, None) => {
+                    self.flush(out).await?;
+                    return Ok(());
+                }
                 (Some(a), Some(b)) => a.min(b).into(),
                 (Some(a), None) => a.into(),
                 (None, Some(b)) => b.into(),
@@ -530,7 +615,8 @@ impl Walker<'_> {
                     Role::Own => own = true,
                 }
             }
-            let (held, version) = if pk == Some(&key[..]) {
+            let point = pk == Some(&key[..]);
+            let (held, version) = if point {
                 let point = points[next_point].1;
                 let ver = match (chunk[next_point - chunk_start].take(), diff, &point.seen) {
                     (Some(v), _, _) => v,
@@ -563,20 +649,86 @@ impl Walker<'_> {
                     s.pos += 1;
                 }
             }
-            self.take(key, held, version, out);
+            self.take(key, held, version, point, out);
+            if out.pend.len() >= RECORD_CHUNK || out.n + out.pend.len() >= out.limit {
+                self.flush(out).await?;
+            }
             if out.full() {
                 return Ok(());
             }
         }
     }
 
-    fn take(&self, key: Key, held: Holding, version: Ver, out: &mut Found<'_>) {
+    /// A key a record may speak for waits for the records: an owed key (the
+    /// record says what the consumer holds) and a point (a record beside a
+    /// point that holds what is wanted is moot).
+    fn take(&self, key: Key, held: Holding, version: Ver, point: bool, out: &mut Found<'_>) {
         let wanted = Holding::of(version.as_version(), self.now, &key);
         let version = if matches!(wanted, Holding::Absent) {
             Ver::Absent
         } else {
             version
         };
+        if self.fails.is_some() && (self.all || point || owed(&held, &wanted)) {
+            out.pend.push(Pend {
+                key,
+                held,
+                version,
+                wanted,
+            });
+            return;
+        }
+        self.decide(key, held, version, wanted, out);
+    }
+
+    /// B6: what the edge's records say of the owed keys pending. A record
+    /// holds what the consumer really holds; a key whose failure is moot
+    /// (it holds what upstream has now) is not owed, and its record goes
+    /// at the commit; a failing key tried at what upstream has now waits
+    /// for its retry: owed, not due.
+    async fn flush(&self, out: &mut Found<'_>) -> Result<()> {
+        let Some((ixs, f)) = self.fails else {
+            return Ok(());
+        };
+        if out.pend.is_empty() {
+            return Ok(());
+        }
+        let pend = std::mem::take(&mut out.pend);
+        let keys: Vec<&[u8]> = pend.iter().map(|p| p.key.as_ref()).collect();
+        let recs = records(ixs, &f.output, &f.out, &keys).await?;
+        for p in pend {
+            let Some(rec) = recs.get(&p.key) else {
+                self.decide(p.key, p.held, p.version, p.wanted, out);
+                continue;
+            };
+            if out.keep {
+                out.read.insert(p.key.clone(), record_digest(&p.key, rec));
+            }
+            let held = rec.held.holding(&f.conds)?;
+            let tried = rec.tried(&p.key, &f.conds)?;
+            let c = Class::of(&held, &tried);
+            if c != Class::Unchanged {
+                out.visited[c as usize - 1] += 1;
+            }
+            if !owed(&held, &p.wanted) {
+                if out.keep {
+                    out.moot.push(p.key.clone());
+                }
+            } else if !owed(&tried, &p.wanted) {
+                if out.waiting {
+                    out.counts[Class::of(&held, &p.wanted) as usize - 1] += 1;
+                }
+                if out.keep {
+                    out.skipped.push(p.key);
+                }
+                continue;
+            }
+            self.decide(p.key, held, p.version, p.wanted, out);
+        }
+        Ok(())
+    }
+
+    fn decide(&self, key: Key, held: Holding, version: Ver, wanted: Holding, out: &mut Found<'_>) {
         let class = if owed(&held, &wanted) {
             if self.hold.held_back(self.input, &key) {
                 if out.keep {
@@ -624,6 +776,7 @@ pub async fn plan(view: &View, req: &Request, ixs: &dyn Indexes, hold: &dyn Hold
         return invalid("the view is not the request's");
     }
     let mut inputs: Vec<InputPlan> = Vec::with_capacity(view.inputs.len());
+    let mut reads: Vec<BTreeMap<Key, u64>> = Vec::with_capacity(view.inputs.len());
     let listed: Vec<Key> = match &req.mode {
         Mode::Keys(keys) => {
             if keys.windows(2).any(|w| w[0] >= w[1]) {
@@ -655,12 +808,13 @@ pub async fn plan(view: &View, req: &Request, ixs: &dyn Indexes, hold: &dyn Hold
             all: req.mode == Mode::All,
             input: i,
             hold,
+            fails: v.failures.as_ref().filter(|_| !req.reset).map(|f| (ixs, f)),
         };
         let mut found = Found::new(ahead, true);
         match &req.mode {
             Mode::Keys(_) => {
                 let batch = &listed[..listed.len().min(req.limit)];
-                found.keys = listed_keys(&w, batch).await?;
+                (found.keys, found.read) = listed_keys(&w, batch).await?;
             }
             _ => w.walk(req.after.as_ref(), &mut found).await?,
         }
@@ -672,8 +826,12 @@ pub async fn plan(view: &View, req: &Request, ixs: &dyn Indexes, hold: &dyn Hold
             own_head: v.own.as_ref().map(|o| o.2),
             keys: found.keys,
             held_back: found.held_back,
+            moot: found.moot,
+            waiting: found.skipped,
             expect: 0,
+            records: 0,
         });
+        reads.push(found.read);
     }
     let hi: Option<Key> = match &req.mode {
         Mode::Keys(_) => (listed.len() > req.limit).then(|| listed[req.limit - 1].clone()),
@@ -691,12 +849,19 @@ pub async fn plan(view: &View, req: &Request, ixs: &dyn Indexes, hold: &dyn Hold
         lo: req.after.clone(),
         hi,
     };
-    for (p, v) in inputs.iter_mut().zip(&view.inputs) {
+    for ((p, v), read) in inputs.iter_mut().zip(&view.inputs).zip(&reads) {
         if let Some(hi) = &range.hi {
             p.keys.retain(|c| c.key <= *hi);
             p.held_back.retain(|c| c.key <= *hi);
+            p.moot.retain(|k| k <= hi);
+            p.waiting.retain(|k| k <= hi);
         }
         p.expect = read_digest(v.progress.keyed().expect("a keyed view"), req.reset, &range);
+        let touched: std::collections::BTreeSet<&Key> = p.touched().collect();
+        p.records = touched
+            .into_iter()
+            .filter_map(|k| read.get(k))
+            .fold(0, |a, h| a.wrapping_add(*h));
     }
     Ok(Plan {
         mode: req.mode.clone(),
@@ -704,6 +869,7 @@ pub async fn plan(view: &View, req: &Request, ixs: &dyn Indexes, hold: &dyn Hold
         range,
         inputs,
         unkeyed: view.unkeyed.clone(),
+        pass: None,
     })
 }
 
@@ -731,13 +897,23 @@ async fn versions_at(
 
 /// A key list: each listed key the consumer holds or upstream has under the
 /// patterns, in its class (`unchanged` when held as it is).
-async fn listed_keys(w: &Walker<'_>, keys: &[Key]) -> Result<Vec<Cand>> {
+async fn listed_keys(w: &Walker<'_>, keys: &[Key]) -> Result<(Vec<Cand>, BTreeMap<Key, u64>)> {
     let all: Vec<&[u8]> = keys.iter().map(|k| k.as_ref()).collect();
     let at_head = versions_at(w.ix, w.layers, w.head, &all).await?;
     let mut held: Vec<Option<Holding>> = keys
         .iter()
         .map(|k| w.keyed.point(k).map(|p| p.holding.clone()))
         .collect();
+    let mut read = BTreeMap::new();
+    if let Some((ixs, f)) = w.fails {
+        let recs = records(ixs, &f.output, &f.out, &all).await?;
+        for (i, k) in keys.iter().enumerate() {
+            if let Some(r) = recs.get(k) {
+                held[i] = Some(r.held.holding(&f.conds)?);
+                read.insert(k.clone(), record_digest(k, r));
+            }
+        }
+    }
     let mut by_commit: std::collections::BTreeMap<u64, Vec<usize>> = Default::default();
     let mut own: Vec<usize> = vec![];
     for (i, k) in keys.iter().enumerate() {
@@ -793,7 +969,7 @@ async fn listed_keys(w: &Walker<'_>, keys: &[Key]) -> Result<Vec<Cand>> {
             held: h,
         });
     }
-    Ok(out)
+    Ok((out, read))
 }
 
 /// Owed keys of one edge after `after`, at most `limit`, and where the next page
@@ -819,9 +995,19 @@ pub async fn owed_keys(
 }
 
 /// How many keys of one edge are owed, by class: added, updated, removed.
+/// Failing keys waiting for their retry are owed (B6): those the walk did
+/// not meet, because their input has not changed since they failed, are
+/// counted from the edge's tally of records.
 pub async fn owed_count(view: &View, req: &InputRequest, ixs: &dyn Indexes) -> Result<[u64; 4]> {
     let mut found = Found::new(usize::MAX, false);
-    walker(view, req, ixs)?.walk(None, &mut found).await?;
+    found.waiting = true;
+    let w = walker(view, req, ixs)?;
+    w.walk(None, &mut found).await?;
+    if let Some((_, f)) = w.fails {
+        for i in 0..3 {
+            found.counts[i] += f.classes[i].saturating_sub(found.visited[i]);
+        }
+    }
     Ok(found.counts)
 }
 
@@ -857,6 +1043,7 @@ fn walker<'a>(view: &'a View, req: &'a InputRequest, ixs: &'a dyn Indexes) -> Re
         all: false,
         input: 0,
         hold: &NoHold,
+        fails: v.failures.as_ref().map(|f| (ixs, f)),
     })
 }
 
@@ -882,6 +1069,7 @@ impl Plan {
             e.uv(t.add(&p.conditions) as u64);
             e.opt_u64(p.own_head);
             e.uv(p.expect);
+            e.uv(p.records);
             e.uv(p.keys.len() as u64);
             for c in &p.keys {
                 e.bytes(&c.key);
@@ -895,6 +1083,12 @@ impl Plan {
                 e.version(h.version.as_version());
                 h.held.encode(&mut e, &mut t);
             }
+            for ks in [&p.moot, &p.waiting] {
+                e.uv(ks.len() as u64);
+                for k in ks {
+                    e.bytes(k);
+                }
+            }
         }
         e.uv(self.unkeyed.len() as u64);
         for u in &self.unkeyed {
@@ -902,6 +1096,10 @@ impl Plan {
             e.bytes(&u.output);
             e.uv(u.head);
             e.uv(u.through);
+        }
+        e.opt_u64(self.pass.map(|p| p.life));
+        if let Some(p) = self.pass {
+            e.uv(p.n);
         }
         let mut out = Enc::new();
         out.u8(PLAN_FORMAT);
@@ -953,6 +1151,7 @@ impl Plan {
             let conditions = cond(d.uv()?)?;
             let own_head = d.opt_u64()?;
             let expect = d.uv()?;
+            let records = d.uv()?;
             let mut keys = Vec::new();
             for _ in 0..d.count()? {
                 let key = d.bytes()?.into();
@@ -973,6 +1172,12 @@ impl Plan {
                 let held = Holding::decode(&mut d, &conds)?;
                 held_back.push(HeldBack { key, held, version });
             }
+            let moot = (0..d.count()?)
+                .map(|_| d.bytes().map(Key::from))
+                .collect::<Result<_>>()?;
+            let waiting = (0..d.count()?)
+                .map(|_| d.bytes().map(Key::from))
+                .collect::<Result<_>>()?;
             inputs.push(InputPlan {
                 edge,
                 output,
@@ -981,7 +1186,10 @@ impl Plan {
                 own_head,
                 keys,
                 held_back,
+                moot,
+                waiting,
                 expect,
+                records,
             });
         }
         let mut unkeyed = Vec::new();
@@ -993,6 +1201,10 @@ impl Plan {
                 through: d.uv()?,
             });
         }
+        let pass = match d.opt_u64()? {
+            Some(life) => Some(PassId { life, n: d.uv()? }),
+            None => None,
+        };
         d.end()?;
         Ok(Plan {
             mode,
@@ -1000,6 +1212,7 @@ impl Plan {
             range,
             inputs,
             unkeyed,
+            pass,
         })
     }
 }

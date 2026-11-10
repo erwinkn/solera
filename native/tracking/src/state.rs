@@ -45,6 +45,10 @@ pub struct Edge {
 pub struct Tracking {
     pub outputs: BTreeMap<Id, Output>,
     pub edges: BTreeMap<Id, Edge>,
+    /// B6: per-key edges' counters, outcome counts and retry passes.
+    pub per_key: BTreeMap<Id, crate::outcomes::PerKey>,
+    /// B6: the last life given to a per-key edge.
+    pub lives: u64,
     /// B7: staleness per keyed edge.
     pub stale: Stale,
 }
@@ -64,13 +68,14 @@ impl Tracking {
         let mut touched = std::collections::HashSet::new();
         for p in &ev.parts {
             for t in p.touches() {
-                if !touched.insert(t) {
+                if touched.contains(&t) {
                     return crate::error::invalid(format!(
                         "two parts of one event change {} {}",
                         t.0,
-                        String::from_utf8_lossy(t.1)
+                        String::from_utf8_lossy(&t.1)
                     ));
                 }
+                touched.insert(t);
             }
         }
         for p in &ev.parts {
@@ -91,6 +96,9 @@ impl Tracking {
             Part::Batch(p) => p.check(self),
             Part::Consumed(p) => p.check(self),
             Part::OutputCommit(p) => p.check(self),
+            Part::Outcomes(p) => p.check(self),
+            Part::PassStart(p) => p.check(self),
+            Part::Rebuild(p) => p.check(self),
             Part::Watch(p) => p.check(self),
             Part::Witness(p) => p.check(self),
             Part::Incomplete(p) => p.check(self),
@@ -98,6 +106,7 @@ impl Tracking {
     }
 
     fn apply_part(&mut self, p: Part) {
+        crate::outcomes::follow(&p, self);
         self.stale.touch(&p);
         match p {
             Part::EdgeOpen(p) => p.apply(self),
@@ -107,6 +116,9 @@ impl Tracking {
             Part::Batch(p) => p.apply(self),
             Part::Consumed(p) => p.apply(self),
             Part::OutputCommit(p) => p.apply(self),
+            Part::Outcomes(p) => p.apply(self),
+            Part::PassStart(p) => p.apply(self),
+            Part::Rebuild(p) => p.apply(self),
             Part::Watch(p) => p.apply(self),
             Part::Witness(p) => p.apply(self),
             Part::Incomplete(p) => p.apply(self),
@@ -132,6 +144,12 @@ impl Tracking {
             e.bytes(&edge.input);
             edge.progress.encode(&mut e);
         }
+        e.uv(self.per_key.len() as u64);
+        for (id, k) in &self.per_key {
+            e.bytes(id);
+            k.encode(&mut e);
+        }
+        e.uv(self.lives);
         self.stale.encode(&mut e);
         e.buf
     }
@@ -156,6 +174,12 @@ impl Tracking {
             let progress = Arc::new(Progress::decode(&mut d)?);
             t.edges.insert(id, Edge { input, progress });
         }
+        for _ in 0..d.count()? {
+            let id: Id = d.bytes()?.into();
+            t.per_key
+                .insert(id, crate::outcomes::PerKey::decode(&mut d)?);
+        }
+        t.lives = d.uv()?;
         t.stale = Stale::decode(&mut d)?;
         d.end()?;
         Ok(t)

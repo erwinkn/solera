@@ -24,8 +24,30 @@
 use crate::codec::{Dec, Enc};
 use crate::commit;
 use crate::error::{format, Result};
+use crate::outcomes;
 use crate::progress;
 use crate::stale;
+use std::borrow::Cow;
+
+/// A thing one part of an event changes, as (kind, id).
+pub type Touch<'a> = (&'static str, Cow<'a, [u8]>);
+
+fn on<'a>(kind: &'static str, id: &'a [u8]) -> Touch<'a> {
+    (kind, Cow::Borrowed(id))
+}
+
+/// An edge's outcome state and its record outputs, which B6 changes when
+/// B3 closes, resets or renames the edge ([crate::outcomes::follow]).
+fn outcome_state(edge: &[u8]) -> impl Iterator<Item = Touch<'_>> {
+    std::iter::once(on("outcomes", edge)).chain(
+        [outcomes::FAILURES, outcomes::DUE, outcomes::PASS].map(|k| {
+            (
+                "output",
+                Cow::Owned(outcomes::output_id(k, edge).into_vec()),
+            )
+        }),
+    )
+}
 
 pub const FORMAT: u8 = 1;
 
@@ -47,6 +69,12 @@ pub enum Part {
     Consumed(progress::Consumed),
     /// B4: a commit on an output: its layer, its head, its live count.
     OutputCommit(commit::OutputCommit),
+    /// B6: a batch's outcomes: an edge's counts, conditions and retry step.
+    Outcomes(outcomes::Outcomes),
+    /// B6: a retry pass begins.
+    PassStart(outcomes::PassStart),
+    /// B6: a full run of a per-key asset asked for by hand raises its input's rebuild counter.
+    Rebuild(outcomes::Rebuild),
     /// B7: an edge's conditions now.
     Watch(stale::SetWatch),
     /// B7: what a refresh or a notice found for an edge.
@@ -59,19 +87,49 @@ impl Part {
     /// What the part changes, as (kind, id): parts of one event change
     /// distinct things, so each part's check against the state before the
     /// event still holds when the parts before it have applied.
-    pub fn touches(&self) -> Vec<(&'static str, &[u8])> {
+    pub fn touches(&self) -> Vec<Touch<'_>> {
         match self {
-            Part::EdgeOpen(p) => vec![("edge", &p.edge)],
-            Part::EdgeClose(p) => vec![("edge", &p.edge)],
-            Part::EdgeRename(p) if p.from == p.to => vec![("edge", &p.from)],
-            Part::EdgeRename(p) => vec![("edge", &p.from), ("edge", &p.to)],
-            Part::Reset(p) => vec![("edge", &p.edge)],
-            Part::Batch(p) => vec![("edge", &p.edge)],
-            Part::Consumed(p) => vec![("edge", &p.edge)],
-            Part::OutputCommit(p) => vec![("output", &p.output)],
-            Part::Watch(p) => vec![("edge", &p.edge)],
-            Part::Witness(p) => vec![("witness", &p.edge)],
-            Part::Incomplete(p) => vec![("incomplete", &p.output)],
+            Part::EdgeOpen(p) if p.keyed => vec![on("edge", &p.edge), on("outcomes", &p.edge)],
+            Part::EdgeOpen(p) => vec![on("edge", &p.edge)],
+            Part::EdgeClose(p) => [on("edge", &p.edge)]
+                .into_iter()
+                .chain(outcome_state(&p.edge))
+                .collect(),
+            Part::EdgeRename(p) if p.from == p.to => vec![on("edge", &p.from)],
+            Part::EdgeRename(p) => [on("edge", &p.from), on("edge", &p.to)]
+                .into_iter()
+                .chain(outcome_state(&p.from))
+                .chain(outcome_state(&p.to))
+                .collect(),
+            Part::Reset(p) => [on("edge", &p.edge)]
+                .into_iter()
+                .chain(outcome_state(&p.edge))
+                .collect(),
+            Part::Batch(p) if p.reset => [on("edge", &p.edge)]
+                .into_iter()
+                .chain(outcome_state(&p.edge))
+                .collect(),
+            Part::Batch(p) => vec![on("edge", &p.edge)],
+            Part::Consumed(p) => vec![on("edge", &p.edge)],
+            Part::OutputCommit(p) => vec![on("output", &p.output)],
+            Part::Outcomes(p) => {
+                let mut v = vec![on("outcomes", &p.edge)];
+                if !p.points.is_empty() {
+                    v.push(on("edge", &p.edge));
+                }
+                if p.step.as_ref().is_some_and(|s| s.to.is_none()) {
+                    v.push((
+                        "output",
+                        Cow::Owned(outcomes::output_id(outcomes::PASS, &p.edge).into_vec()),
+                    ));
+                }
+                v
+            }
+            Part::PassStart(p) => vec![on("outcomes", &p.edge)],
+            Part::Rebuild(p) => vec![on("outcomes", &p.edge)],
+            Part::Watch(p) => vec![on("edge", &p.edge)],
+            Part::Witness(p) => vec![on("witness", &p.edge)],
+            Part::Incomplete(p) => vec![on("incomplete", &p.output)],
         }
     }
 
@@ -84,6 +142,9 @@ impl Part {
             Part::Batch(_) => progress::TAG_BATCH,
             Part::Consumed(_) => progress::TAG_CONSUMED,
             Part::OutputCommit(_) => commit::TAG_OUTPUT_COMMIT,
+            Part::Outcomes(_) => outcomes::TAG_OUTCOMES,
+            Part::PassStart(_) => outcomes::TAG_PASS_START,
+            Part::Rebuild(_) => outcomes::TAG_REBUILD,
             Part::Watch(_) => stale::TAG_WATCH,
             Part::Witness(_) => stale::TAG_WITNESS,
             Part::Incomplete(_) => stale::TAG_INCOMPLETE,
@@ -99,6 +160,9 @@ impl Part {
             Part::Batch(p) => p.encode(e),
             Part::Consumed(p) => p.encode(e),
             Part::OutputCommit(p) => p.encode(e),
+            Part::Outcomes(p) => p.encode(e),
+            Part::PassStart(p) => p.encode(e),
+            Part::Rebuild(p) => p.encode(e),
             Part::Watch(p) => p.encode(e),
             Part::Witness(p) => p.encode(e),
             Part::Incomplete(p) => p.encode(e),
@@ -114,6 +178,9 @@ impl Part {
             progress::TAG_BATCH => Part::Batch(progress::BatchProgress::decode(d)?),
             progress::TAG_CONSUMED => Part::Consumed(progress::Consumed::decode(d)?),
             commit::TAG_OUTPUT_COMMIT => Part::OutputCommit(commit::OutputCommit::decode(d)?),
+            outcomes::TAG_OUTCOMES => Part::Outcomes(outcomes::Outcomes::decode(d)?),
+            outcomes::TAG_PASS_START => Part::PassStart(outcomes::PassStart::decode(d)?),
+            outcomes::TAG_REBUILD => Part::Rebuild(outcomes::Rebuild::decode(d)?),
             stale::TAG_WATCH => Part::Watch(stale::SetWatch::decode(d)?),
             stale::TAG_WITNESS => Part::Witness(stale::Witness::decode(d)?),
             stale::TAG_INCOMPLETE => Part::Incomplete(stale::Incomplete::decode(d)?),

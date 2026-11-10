@@ -231,6 +231,12 @@ impl Stale {
                     i.moved(self.gens, (!b.reset).then_some(&b.range));
                 }
             }
+            Part::Outcomes(o) if !o.points.is_empty() => {
+                if let Some(i) = self.inputs.get_mut(&o.edge) {
+                    self.gens += 1;
+                    i.moved(self.gens, None);
+                }
+            }
             _ => {}
         }
     }

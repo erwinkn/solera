@@ -13,13 +13,17 @@
 //! - [`progress`]: pieces and points per edge (B3).
 //! - [`plan`]: the planner (B3).
 //! - [`record`]: the batch record (B3).
+//! - [`outcomes`]: key outcomes of per-key assets, held with their points (B6).
+//! - [`due`]: what is due by time, and retry passes (B6).
 //! - [`commit`]: output and source commits (B4).
 //! - [`stale`]: staleness kept exact at every commit (B7).
 
 pub mod codec;
 pub mod commit;
+pub mod due;
 pub mod error;
 pub mod event;
+pub mod outcomes;
 pub mod plan;
 pub mod progress;
 pub mod record;
