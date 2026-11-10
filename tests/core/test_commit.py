@@ -85,7 +85,7 @@ def test_a_commit_built_at_an_old_head_is_refused(index):
     core.t.attach(b"o", index)
     a = core.t.build_commit(b"o", encode_changes(["k"]), version=1, path="o/a")
     b = core.t.build_commit(b"o", encode_changes(["k"]), version=2, path="o/b")
-    with pytest.raises(ValueError, match="one output"):
+    with pytest.raises(ValueError, match="two parts of one event"):
         core.t.apply(Tracking.join([a["event"], b["event"]]))
     core.t.apply(a["event"])
     with pytest.raises(ValueError, match="another head"):

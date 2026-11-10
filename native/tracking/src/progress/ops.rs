@@ -93,6 +93,7 @@ impl Tracking {
                             Point {
                                 holding: c.held.clone(),
                                 reason: Reason::Failed,
+                                seen: (!key_list).then(|| c.version.clone()),
                             },
                         ));
                     }
@@ -106,6 +107,7 @@ impl Tracking {
                         Point {
                             holding,
                             reason: Reason::KeyList,
+                            seen: None,
                         },
                     ));
                 } else if owed(&holding, &wanted) {
@@ -114,6 +116,7 @@ impl Tracking {
                         Point {
                             holding,
                             reason: Reason::Deviation,
+                            seen: Some(c.version.clone()),
                         },
                     ));
                 }
@@ -126,6 +129,7 @@ impl Tracking {
                         Point {
                             holding: h.held.clone(),
                             reason: Reason::HeldBack,
+                            seen: Some(h.version.clone()),
                         },
                     ));
                 }
@@ -171,10 +175,13 @@ impl Tracking {
             }));
         }
         for u in &plan.unkeyed {
-            parts.push(Part::Consumed(Consumed {
+            let c = Consumed {
                 edge: u.edge.clone(),
                 through: u.head,
-            }));
+                expect: u.through,
+            };
+            c.check(self)?;
+            parts.push(Part::Consumed(c));
         }
         Ok(Ops { parts, records })
     }

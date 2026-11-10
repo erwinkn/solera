@@ -10,6 +10,33 @@ use rand::{Rng, SeedableRng};
 use solera_index::*;
 use std::sync::Arc;
 
+/// Allocations past 1 GiB fail (and abort the test), so a damaged length can
+/// never pass for a buffer size.
+struct Capped;
+
+unsafe impl std::alloc::GlobalAlloc for Capped {
+    unsafe fn alloc(&self, l: std::alloc::Layout) -> *mut u8 {
+        if l.size() > 1 << 30 {
+            return std::ptr::null_mut();
+        }
+        unsafe { std::alloc::System.alloc(l) }
+    }
+
+    unsafe fn dealloc(&self, p: *mut u8, l: std::alloc::Layout) {
+        unsafe { std::alloc::System.dealloc(p, l) }
+    }
+
+    unsafe fn realloc(&self, p: *mut u8, l: std::alloc::Layout, size: usize) -> *mut u8 {
+        if size > 1 << 30 {
+            return std::ptr::null_mut();
+        }
+        unsafe { std::alloc::System.realloc(p, l, size) }
+    }
+}
+
+#[global_allocator]
+static ALLOC: Capped = Capped;
+
 #[derive(Clone, PartialEq, Eq, Debug)]
 enum V {
     I(u64),
@@ -478,6 +505,7 @@ fn index(rng: &mut SmallRng, rt: &tokio::runtime::Runtime) -> ChangeIndex {
             disk: rng.random_bool(0.3).then(|| DiskOptions {
                 dir: scratch("oracle").join(rng.random::<u64>().to_string()),
                 bytes: [1_000, 1 << 30][rng.random_range(0..2)],
+                store: "oracle".into(),
             }),
         },
     )
@@ -569,11 +597,28 @@ fn the_disk_cache_serves_reads_after_a_write_and_after_a_restart() {
             disk: Some(DiskOptions {
                 dir: disk.to_path_buf(),
                 bytes: 1 << 30,
+                store: "t".into(),
             }),
             ..Default::default()
         };
         let store = Store::new(mem.clone(), Path::from("t"), rt.handle().clone(), opts).unwrap();
         ChangeIndex::new(store, WriteOptions::default())
+    };
+    let reopen = |disk: &std::path::Path| {
+        let disk = disk.to_path_buf();
+        let index = &index;
+        async move {
+            // the background fill lets go of the directory just after it counts
+            for _ in 0..200 {
+                if let Ok(ix) =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| index(&disk)))
+                {
+                    return ix;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            panic!("the disk cache stayed locked")
+        }
     };
     rt.block_on(async {
         let ix = index(&dir);
@@ -593,6 +638,7 @@ fn the_disk_cache_serves_reads_after_a_write_and_after_a_restart() {
         assert_eq!(ix_scan(&ix, &layers).await, 5000);
         assert_eq!(ix.store.stats.counts().gets, 0);
         // a restart finds the file
+        drop(ix);
         let again = index(&dir);
         assert_eq!(ix_scan(&again, &layers).await, 5000);
         assert_eq!(again.store.stats.counts().gets, 0);
@@ -607,7 +653,8 @@ fn the_disk_cache_serves_reads_after_a_write_and_after_a_restart() {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         assert_eq!(fresh.store.stats.counts().fills, 1);
-        let fresh = index(&fresh_dir);
+        drop(fresh);
+        let fresh = reopen(&fresh_dir).await;
         assert_eq!(ix_scan(&fresh, &layers).await, 5000);
         assert_eq!(fresh.store.stats.counts().gets, 0);
         assert!(fresh.store.stats.counts().disk_reads > 0);
@@ -626,6 +673,7 @@ fn bad_references_and_abandoned_reads_leave_the_index_working() {
             disk: disk.map(|dir| DiskOptions {
                 dir,
                 bytes: 1 << 30,
+                store: prefix.into(),
             }),
             ..Default::default()
         };
@@ -687,6 +735,22 @@ fn bad_references_and_abandoned_reads_leave_the_index_working() {
             ix.scan(&[wrong], 1, &q).await,
             Err(Error::Format(_))
         ));
+        let moved = LayerRef {
+            top_start: l1.top_start + 1,
+            ..l1.clone()
+        };
+        assert!(matches!(
+            ix.scan(&[moved], 1, &q).await,
+            Err(Error::Format(_))
+        ));
+        let past = LayerRef {
+            top_start: u64::MAX,
+            ..l1.clone()
+        };
+        assert!(matches!(
+            ix.scan(&[past], 1, &q).await,
+            Err(Error::Invalid(_))
+        ));
         // a read dropped mid-GET gives its GET slot back: another layer's read
         // still runs with one slot
         let slow = Arc::new(object_store::throttle::ThrottledStore::new(
@@ -732,18 +796,137 @@ fn bad_references_and_abandoned_reads_leave_the_index_working() {
             ix.commits(&[damaged], 1, 1).await,
             Err(Error::Format(_))
         ));
-        // stores with different prefixes keep apart in one disk cache directory
-        let (a, b) = (index("a", Some(dir.clone())), index("b", Some(dir.clone())));
+        // a read that failed is not remembered: once the file is there, it reads
+        let late = LayerRef {
+            path: "late".into(),
+            ..l1.clone()
+        };
+        assert!(ix.scan(&[late.clone()], 1, &q).await.is_err());
+        let c1 = mem
+            .get(&Path::from("t/c1"))
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        mem.put(&Path::from("t/late"), c1.into()).await.unwrap();
+        assert_eq!(ix.scan(&[late], 1, &q).await.unwrap().run.len(), 1);
+        // a path too long for a cache file name is written, just not kept on disk
+        let long = index("long", Some(dir.join("long")));
+        let path = ["d".repeat(100), "e".repeat(100), "f".repeat(100)].join("/");
+        let ll = long.write_commit(&path, nc(1), &one(3)).await.unwrap();
+        let rl = long.scan(&[ll], 1, &q).await.unwrap();
+        assert_eq!(rl.run.new_version(0), Version::Int(3));
+        drop(long);
+        // a trailer cannot make the commits section larger than the format allows
+        let c2 = mem
+            .get(&Path::from("t/c2"))
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        let mut tail = c2[l2.top_start as usize..].to_vec();
+        let t = tail.len() - 48;
+        let far = 1u64 << 40;
+        tail[t..t + 8].copy_from_slice(&far.to_le_bytes());
+        tail[t + 8..t + 16].copy_from_slice(&0u64.to_le_bytes());
+        tail[t + 16..t + 24].copy_from_slice(&far.to_le_bytes());
+        let check = xxhash_rust::xxh3::xxh3_64(&tail[t..t + 36]) as u32;
+        tail[t + 36..t + 40].copy_from_slice(&check.to_le_bytes());
+        let got = format::Top::parse(&tail, far, far + tail.len() as u64);
+        assert!(matches!(got, Err(Error::Format(_))));
+        // a disk cache directory serves one store at a time, never another's files
+        let a = index("a", Some(dir.clone()));
+        let again = StoreOptions {
+            disk: Some(DiskOptions {
+                dir: dir.clone(),
+                bytes: 1 << 30,
+                store: "a".into(),
+            }),
+            ..Default::default()
+        };
+        assert!(matches!(
+            Store::new(mem.clone(), Path::from("a"), rt.handle().clone(), again),
+            Err(Error::Invalid(_))
+        ));
         let la = a.write_commit("c1", nc(1), &one(1)).await.unwrap();
+        drop(a);
+        let b = index("b", Some(dir.clone()));
         let lb = b.write_commit("c1", nc(1), &one(2)).await.unwrap();
-        let (ra, rb) = (
-            a.scan(&[la], 1, &q).await.unwrap(),
-            b.scan(&[lb], 1, &q).await.unwrap(),
-        );
-        assert_eq!(ra.run.new_version(0), Version::Int(1));
+        let rb = b.scan(&[lb], 1, &q).await.unwrap();
         assert_eq!(rb.run.new_version(0), Version::Int(2));
+        drop(b);
+        let a = index("a", Some(dir.clone()));
+        let ra = a.scan(&[la], 1, &q).await.unwrap();
+        assert_eq!(ra.run.new_version(0), Version::Int(1));
     });
     let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn a_block_is_never_decoded_past_what_its_frame_holds() {
+    let c = zstd::bulk::compress(b"x", 1).unwrap();
+    let mut run = Run::new();
+    let got = format::Decoder::default().decode(&c, u32::MAX, 1, &mut run);
+    assert!(matches!(got, Err(Error::Format(_))));
+}
+
+fn varint(out: &mut Vec<u8>, mut n: u64) {
+    while n >= 0x80 {
+        out.push((n as u8) | 0x80);
+        n >>= 7;
+    }
+    out.push(n as u8);
+}
+
+#[test]
+fn a_segment_cannot_point_a_block_outside_the_data_or_name_keys_past_the_limit() {
+    let segment = |off: u64, clen: u64, key: usize, data_end: u64| {
+        let mut raw = Vec::new();
+        for v in [off, clen, 10, 1] {
+            varint(&mut raw, v);
+        }
+        raw.extend_from_slice(&[0, 0, 0, 0, 0]);
+        varint(&mut raw, key as u64);
+        raw.extend(std::iter::repeat_n(b'k', key));
+        let c = zstd::bulk::compress(&raw, 1).unwrap();
+        let check = xxhash_rust::xxh3::xxh3_64(&c) as u32;
+        format::parse_segment(&c, raw.len() as u32, check, 1, data_end)
+    };
+    assert!(segment(0, 100, 1, 100).is_ok());
+    assert!(segment(0, 100, format::MAX_KEY, 100).is_ok());
+    for (off, clen, key, end) in [
+        (0, 101, 1, 100),
+        (0, u32::MAX as u64, 1, 100),
+        (0, 1 << 40, 1, 100),
+        (u64::MAX, 1, 1, 100),
+        (0, 1 << 30, 1, 1 << 31),
+        (0, 100, format::MAX_KEY + 1, 100),
+    ] {
+        let got = segment(off, clen, key, end);
+        assert!(
+            matches!(got, Err(Error::Format(_))),
+            "{off} {clen} {key} {end}"
+        );
+    }
+}
+
+#[test]
+fn keys_past_the_limit_are_refused_when_written_and_when_read() {
+    let mut w = Writer::new(WriteOptions::default(), 1, 1, None).unwrap();
+    let long = vec![b'k'; format::MAX_KEY + 1];
+    let got = w.push(&long, 1, Version::Int(1), Version::Absent);
+    assert!(matches!(got, Err(Error::Invalid(_))));
+    let mut raw = Vec::new();
+    varint(&mut raw, 0);
+    varint(&mut raw, long.len() as u64);
+    raw.extend_from_slice(&long);
+    varint(&mut raw, 1);
+    let c = zstd::bulk::compress(&raw, 1).unwrap();
+    let mut run = Run::new();
+    let got = format::Decoder::default().decode(&c, raw.len() as u32, 1, &mut run);
+    assert!(matches!(got, Err(Error::Format(_))));
 }
 
 async fn ix_scan(ix: &ChangeIndex, layers: &[LayerRef]) -> usize {

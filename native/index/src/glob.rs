@@ -26,7 +26,7 @@ impl Eq for Glob {}
 
 impl Glob {
     pub fn new(glob: &str) -> Result<Glob> {
-        let mut re = String::from("^(?:");
+        let mut re = String::from("(?s)^(?:");
         let mut prefix = None;
         let mut rest = glob;
         while let Some(c) = rest.chars().next() {

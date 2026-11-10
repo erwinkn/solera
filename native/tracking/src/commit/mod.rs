@@ -13,7 +13,6 @@ use solera_index::LayerRef;
 
 use crate::codec::{Dec, Enc};
 use crate::error::{invalid, Result};
-use crate::event::Part;
 use crate::state::{Id, Tracking};
 
 pub use build::{build, Built, Changed, Mode, Spec};
@@ -53,21 +52,6 @@ impl OutputCommit {
                 "a commit's layer covers commit {}..={} on an output at head {head}: it was built at another head",
                 l.lo, l.hi
             ));
-        }
-        Ok(())
-    }
-
-    /// Within one event, an output takes at most one commit: each part is
-    /// checked against the state before the event, so two would both claim
-    /// the same commit number.
-    pub(crate) fn check_event(parts: &[Part]) -> Result<()> {
-        let mut seen = std::collections::BTreeSet::new();
-        for p in parts {
-            if let Part::OutputCommit(c) = p {
-                if !seen.insert(&c.output) {
-                    return invalid("two commits of one output in one event");
-                }
-            }
         }
         Ok(())
     }

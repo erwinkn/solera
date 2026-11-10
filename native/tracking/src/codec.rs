@@ -140,6 +140,9 @@ impl<'a> Dec<'a> {
         let mut v = 0u64;
         for shift in (0..64).step_by(7) {
             let b = self.u8()?;
+            if shift == 63 && b > 1 {
+                return format("varint past 64 bits");
+            }
             v |= u64::from(b & 0x7f) << shift;
             if b & 0x80 == 0 {
                 return Ok(v);

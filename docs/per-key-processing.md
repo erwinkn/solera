@@ -747,7 +747,10 @@ Incremental("sharepoint_files", include=["XRF/**/*.csv", "XRF Data/**/*.csv"])
 ```
 
 Globs over key strings — `**` crosses `/`, `*` does not — or
-`Regex("…")`. `include` is a pattern or a list; `exclude` a dict of named
+`Regex("…")`, in the dialect of Rust's `regex` crate (not Python's `re`),
+matched against the whole key: matching is linear in the key, so lookaround
+and backreferences are not supported and `Regex(…)` refuses them when the
+input is declared. `include` is a pattern or a list; `exclude` a dict of named
 patterns (named, so `explain` can say which rule) or a list. They apply to
 per-key and plain incremental inputs alike, and compile to one native matcher shared
 by engine and worker.
