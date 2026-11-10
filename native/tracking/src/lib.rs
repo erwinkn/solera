@@ -14,6 +14,7 @@
 //! - [`plan`]: the planner (B3).
 //! - [`record`]: the batch record (B3).
 //! - [`commit`]: output and source commits (B4).
+//! - [`stale`]: staleness kept exact at every commit (B7).
 
 pub mod codec;
 pub mod commit;
@@ -22,6 +23,7 @@ pub mod event;
 pub mod plan;
 pub mod progress;
 pub mod record;
+pub mod stale;
 pub mod state;
 
 pub use error::{Error, Result};

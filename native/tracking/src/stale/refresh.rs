@@ -1,0 +1,453 @@
+//! Keeping what is known current: [`refresh`] at the upstream's head, from
+//! the index; [`notice`] at one commit, from the entries the commit builder
+//! produced; [`retry_due`] when a failed key's retry comes due (rule 5).
+
+use std::sync::Arc;
+
+use solera_index::{LayerRef, Query, Run, Version};
+
+use crate::error::{invalid, Result};
+use crate::event::Part;
+use crate::plan::{plan, Cand, Hold, Indexes, InputRequest, Mode, Request, View};
+use crate::progress::{self, owed, Class, Conditions, Holding, Key, Keyed, Progress, Value};
+use crate::stale::{Changed, Input, Reason, State, Witness};
+use crate::state::{Id, Tracking};
+
+/// Keys owed but not due: failed keys waiting for their retry (B6's due
+/// index; until it lands, the lists the engine passes).
+pub trait Due: Sync {
+    fn not_due(&self, edge: &[u8], key: &[u8]) -> bool;
+}
+
+pub struct NoneDue;
+
+impl Due for NoneDue {
+    fn not_due(&self, _: &[u8], _: &[u8]) -> bool {
+        false
+    }
+}
+
+struct OneEdge<'a> {
+    due: &'a dyn Due,
+    edge: &'a [u8],
+}
+
+impl Hold for OneEdge<'_> {
+    fn held_back(&self, _: usize, key: &[u8]) -> bool {
+        self.due.not_due(self.edge, key)
+    }
+}
+
+/// What a refresh reads of one edge, taken under a short lock.
+pub struct Ask {
+    pub edge: Id,
+    pub output: Id,
+    pub input: Input,
+    /// The gate holds the edge: its upstream is incomplete (rule 8).
+    pub held: bool,
+    pub layers: Vec<LayerRef>,
+    pub head: u64,
+    pub progress: Arc<Progress>,
+    pub req: InputRequest,
+    pub view: View,
+}
+
+impl Ask {
+    pub fn keyed(&self) -> &Keyed {
+        self.progress.keyed().expect("a keyed edge")
+    }
+
+    fn hold<'a>(&'a self, due: &'a dyn Due) -> OneEdge<'a> {
+        OneEdge {
+            due,
+            edge: &self.edge,
+        }
+    }
+
+    fn request(&self, mode: Mode, after: Option<Key>) -> Request {
+        Request {
+            mode,
+            reset: false,
+            after,
+            limit: 1,
+            inputs: vec![self.req.clone()],
+            unkeyed: vec![],
+        }
+    }
+
+    /// Rule 6, the probe: the first due key after `after`, by the planner
+    /// with a limit of one key.
+    async fn probe(&self, ixs: &dyn Indexes, due: &dyn Due, after: Option<Key>) -> Result<State> {
+        let req = self.request(Mode::Incremental, after);
+        let p = plan(&self.view, &req, ixs, &self.hold(due)).await?;
+        Ok(match p.inputs[0].keys.first() {
+            Some(c) => self.stale(c),
+            None => State::Fresh,
+        })
+    }
+
+    /// Whether `key` is due at the head: its state, if it is.
+    async fn recheck(&self, ixs: &dyn Indexes, due: &dyn Due, key: &Key) -> Result<Option<State>> {
+        let req = self.request(Mode::Keys(vec![key.clone()]), None);
+        let p = plan(&self.view, &req, ixs, &crate::plan::NoHold).await?;
+        Ok(match p.inputs[0].keys.first() {
+            Some(c) if c.class != Class::Unchanged && !due.not_due(&self.edge, key) => {
+                Some(self.stale(c))
+            }
+            _ => None,
+        })
+    }
+
+    fn stale(&self, c: &Cand) -> State {
+        State::Stale {
+            key: c.key.clone(),
+            reason: reason_of(self.keyed(), &self.req.conditions, c),
+            since_ms: 0,
+        }
+    }
+
+    /// Rule 1 over every change upstream made after commit `x`, outside the
+    /// ranges whose progress changed since: the first due key, if any.
+    async fn changes_since(
+        &self,
+        ixs: &dyn Indexes,
+        due: &dyn Due,
+        x: u64,
+        changed: &Changed,
+    ) -> Result<Option<State>> {
+        let ix = ixs.index(&self.output)?;
+        let hold = self.hold(due);
+        let mut q = Query {
+            pattern: self.req.conditions.patterns.index_pattern(),
+            ..Default::default()
+        };
+        let mut limit = 16;
+        loop {
+            q.limit = Some(limit);
+            let page = ix.diff(&self.layers, x, self.head, &q).await?;
+            for i in 0..page.run.len() {
+                let key = page.run.key(i);
+                if changed.contains(key) {
+                    continue;
+                }
+                let new = page.run.new_version(page.run.rows(i).start);
+                match rule1(self.keyed(), &self.req.conditions, key, new, Some(&hold)) {
+                    Step::Skip => {}
+                    Step::Due(reason) => {
+                        return Ok(Some(State::Stale {
+                            key: key.into(),
+                            reason,
+                            since_ms: 0,
+                        }))
+                    }
+                    Step::Unsure => unreachable!("rule 1 with a hold decides"),
+                }
+            }
+            match page.next {
+                Some(n) => q.after = Some(n),
+                None => return Ok(None),
+            }
+            limit = (limit * 4).min(1 << 20);
+        }
+    }
+}
+
+impl Tracking {
+    /// What refreshing `edge` reads, under the caller's short lock.
+    pub fn stale_ask(&self, edge: &[u8]) -> Result<Ask> {
+        let Some(input) = self.stale.inputs.get(edge) else {
+            return invalid(format!("no keyed edge {}", String::from_utf8_lossy(edge)));
+        };
+        let Some(w) = &input.watch else {
+            return invalid(format!(
+                "edge {} has no conditions: journal a watch first",
+                String::from_utf8_lossy(edge)
+            ));
+        };
+        let e = &self.edges[edge];
+        let req = InputRequest {
+            edge: edge.into(),
+            conditions: w.conditions.clone(),
+            own: w.own.clone(),
+        };
+        let view = self.view(&Request {
+            mode: Mode::Incremental,
+            reset: false,
+            after: None,
+            limit: 1,
+            inputs: vec![req.clone()],
+            unkeyed: vec![],
+        })?;
+        let (layers, head) = self
+            .outputs
+            .get(&e.input)
+            .map_or((vec![], 0), |o| (o.layers.clone(), o.head));
+        Ok(Ask {
+            edge: edge.into(),
+            output: e.input.clone(),
+            input: input.clone(),
+            held: self.stale.held(input, &e.input),
+            layers,
+            head,
+            progress: e.progress.clone(),
+            req,
+            view,
+        })
+    }
+}
+
+/// Brings one edge current at its upstream's head: what to journal, or None
+/// if it already is or the gate holds it.
+///
+/// - Stale with witness `w`: `w` is rechecked at the head; if it is no longer
+///   due, a probe looks for another from the first key.
+/// - Fresh as of commit `x`, with some ranges changed since: rule 1 over the
+///   upstream's changes after `x` outside those ranges (outside them the edge
+///   still holds what upstream had at `x`, so a change to a key the patterns
+///   take and no point covers is due with no lookup), then a probe from the
+///   first changed range.
+/// - Otherwise (a reset, new conditions, nothing known): a probe from the first key.
+pub async fn refresh(
+    ask: &Ask,
+    ixs: &dyn Indexes,
+    due: &dyn Due,
+    time_ms: u64,
+) -> Result<Option<Witness>> {
+    let i = &ask.input;
+    if ask.held || i.current().is_some_and(|k| k.x == ask.head) {
+        return Ok(None);
+    }
+    let floor = ask.layers.first().and_then(|l| l.floor).unwrap_or(0);
+    let state = match (&i.known, &i.changed) {
+        (
+            Some(super::Known {
+                state: State::Stale { key, reason, .. },
+                ..
+            }),
+            _,
+        ) => match ask.recheck(ixs, due, key).await? {
+            Some(_) if i.current().is_some() => State::Stale {
+                key: key.clone(),
+                reason: *reason,
+                since_ms: 0,
+            },
+            Some(s) => s,
+            None => ask.probe(ixs, due, None).await?,
+        },
+        (Some(k), Changed::Ranges(rs)) if k.x >= floor => {
+            match ask.changes_since(ixs, due, k.x, &i.changed).await? {
+                Some(s) => s,
+                None if rs.is_empty() => State::Fresh,
+                None => {
+                    let after = if rs.iter().any(|r| r.lo.is_none()) {
+                        None
+                    } else {
+                        rs.iter().filter_map(|r| r.lo.clone()).min()
+                    };
+                    ask.probe(ixs, due, after).await?
+                }
+            }
+        }
+        _ => ask.probe(ixs, due, None).await?,
+    };
+    Ok(Some(Witness {
+        edge: ask.edge.clone(),
+        gen: i.gen,
+        x: ask.head,
+        state: since(state, time_ms),
+    }))
+}
+
+/// A state found now: stale since now, unless the edge was stale already
+/// (the part keeps that moment when it applies).
+fn since(state: State, time_ms: u64) -> State {
+    match state {
+        State::Stale { key, reason, .. } => State::Stale {
+            key,
+            reason,
+            since_ms: time_ms,
+        },
+        s => s,
+    }
+}
+
+/// Rule 5: some of an edge's failed keys came due for a retry (their backoff
+/// ended, or one was forced). A fresh edge becomes stale with the first of
+/// them that is due. Also applied at startup to every retry already due.
+pub async fn retry_due(
+    ask: &Ask,
+    ixs: &dyn Indexes,
+    due: &dyn Due,
+    keys: &[Key],
+    time_ms: u64,
+) -> Result<Option<Witness>> {
+    if ask.held
+        || ask
+            .input
+            .current()
+            .is_some_and(|k| matches!(k.state, State::Stale { .. }))
+    {
+        return Ok(None);
+    }
+    for k in keys {
+        if let Some(state) = ask.recheck(ixs, due, k).await? {
+            return Ok(Some(Witness {
+                edge: ask.edge.clone(),
+                gen: ask.input.gen,
+                x: ask.head,
+                state: since(state, time_ms),
+            }));
+        }
+    }
+    Ok(None)
+}
+
+/// Rules 1 and 2 at commit `commit` of `output`, from the commit's entries
+/// (key order) as the commit builder produced them: no index read. For each
+/// edge reading `output` whose state is current as of the commit before:
+/// fresh, the first entry that matters makes it stale; stale with a witness
+/// the commit does not touch, it stays so. An edge the entries cannot decide
+/// (the commit touches its witness, or a key with a point whose state
+/// differs) is left for a refresh. The parts go into the commit's event.
+pub fn notice(t: &Tracking, output: &[u8], commit: u64, entries: &Run, time_ms: u64) -> Vec<Part> {
+    let mut parts = vec![];
+    if t.stale.incomplete.contains(output) {
+        return parts;
+    }
+    for (id, e) in &t.edges {
+        if *e.input != *output {
+            continue;
+        }
+        let Some(i) = t.stale.inputs.get(id) else {
+            continue;
+        };
+        let (Some(w), Some(k)) = (&i.watch, i.current()) else {
+            continue;
+        };
+        let Some(keyed) = e.progress.keyed() else {
+            continue;
+        };
+        if k.x + 1 != commit {
+            continue;
+        }
+        let state = match &k.state {
+            State::Stale { key, .. } => {
+                if contains(entries, key) {
+                    continue;
+                }
+                k.state.clone()
+            }
+            State::Fresh => match first_due(keyed, &w.conditions, entries) {
+                Some(Some((key, reason))) => State::Stale {
+                    key,
+                    reason,
+                    since_ms: time_ms,
+                },
+                Some(None) => State::Fresh,
+                None => continue,
+            },
+        };
+        parts.push(Part::Witness(Witness {
+            edge: id.clone(),
+            gen: i.gen,
+            x: commit,
+            state,
+        }));
+    }
+    parts
+}
+
+/// Rule 1 over one commit's entries: Some(the first due key) or Some(None),
+/// or None when a point leaves it undecided.
+pub fn first_due(
+    keyed: &Keyed,
+    now: &Arc<Conditions>,
+    entries: &Run,
+) -> Option<Option<(Key, Reason)>> {
+    for i in 0..entries.len() {
+        let key = entries.key(i);
+        match rule1(
+            keyed,
+            now,
+            key,
+            entries.new_version(entries.rows(i).start),
+            None,
+        ) {
+            Step::Skip => {}
+            Step::Due(r) => return Some(Some((key.into(), r))),
+            Step::Unsure => return None,
+        }
+    }
+    Some(None)
+}
+
+fn contains(run: &Run, key: &[u8]) -> bool {
+    let (mut lo, mut hi) = (0, run.len());
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        match run.key(mid).cmp(key) {
+            std::cmp::Ordering::Less => lo = mid + 1,
+            std::cmp::Ordering::Greater => hi = mid,
+            std::cmp::Ordering::Equal => return true,
+        }
+    }
+    false
+}
+
+enum Step {
+    Skip,
+    Due(Reason),
+    Unsure,
+}
+
+/// Rule 1 for one change: upstream moved `key` to `new`, and the edge held
+/// what upstream had before. A key the patterns take with no point is due;
+/// a key with a point is due if its state differs from the point and the
+/// key is not waiting for a retry (unsure without `hold`).
+fn rule1(
+    keyed: &Keyed,
+    now: &Arc<Conditions>,
+    key: &[u8],
+    new: Version<'_>,
+    hold: Option<&dyn Hold>,
+) -> Step {
+    if let Some(p) = keyed.point(key) {
+        if !owed(&p.holding, &Holding::of(new, now, key)) {
+            return Step::Skip;
+        }
+        return match hold {
+            None => Step::Unsure,
+            Some(h) if h.held_back(0, key) => Step::Skip,
+            Some(_) => Step::Due(Reason::InputChanged),
+        };
+    }
+    if !now.patterns.takes(key) {
+        return Step::Skip;
+    }
+    Step::Due(match keyed.value_of(key) {
+        Value::Empty | Value::Held => Reason::NeverProcessed,
+        Value::At(..) => Reason::InputChanged,
+    })
+}
+
+/// Why a due key is due.
+fn reason_of(keyed: &Keyed, now: &Conditions, c: &Cand) -> Reason {
+    let point = keyed.point(&c.key);
+    if point.is_some_and(|p| {
+        p.reason == progress::Reason::Failed && p.seen.as_ref() == Some(&c.version)
+    }) {
+        return Reason::RetryDue;
+    }
+    match &c.held {
+        Holding::Held => Reason::NeverProcessed,
+        Holding::Version(_, h) if !h.same_processing(now) || !now.patterns.takes(&c.key) => {
+            Reason::ConditionsChanged
+        }
+        Holding::Version(..) => Reason::InputChanged,
+        Holding::Absent => match (point, keyed.value_of(&c.key)) {
+            (None, Value::Empty | Value::Held) => Reason::NeverProcessed,
+            (None, Value::At(_, h)) if !h.patterns.takes(&c.key) => Reason::ConditionsChanged,
+            _ => Reason::InputChanged,
+        },
+    }
+}

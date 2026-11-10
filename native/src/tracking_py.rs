@@ -23,7 +23,7 @@ use tr::progress::{Class, Conditions, Key, Pat, Patterns};
 use crate::index_py::{key, layers_in, rt, version, ChangeIndex, Owned};
 use crate::{guard, FormatError};
 
-fn err(e: tr::Error) -> PyErr {
+pub(crate) fn err(e: tr::Error) -> PyErr {
     match e {
         tr::Error::Format(m) => FormatError::new_err(m),
         tr::Error::Invalid(m) => PyValueError::new_err(m),
@@ -39,7 +39,7 @@ fn owned(v: &Bound<'_, PyAny>) -> PyResult<Ver> {
     })
 }
 
-fn key_in(k: &Bound<'_, PyAny>) -> PyResult<Key> {
+pub(crate) fn key_in(k: &Bound<'_, PyAny>) -> PyResult<Key> {
     Ok(k.extract::<String>()?.into_bytes().into())
 }
 
@@ -69,7 +69,7 @@ fn pat(p: &Bound<'_, PyAny>) -> PyResult<Pat> {
 }
 
 /// Conditions from `{"patterns": solera.patterns.spec(…), "context": bytes, "definition": bytes, "rebuild": int}`.
-fn conditions(d: &Bound<'_, PyAny>) -> PyResult<Arc<Conditions>> {
+pub(crate) fn conditions(d: &Bound<'_, PyAny>) -> PyResult<Arc<Conditions>> {
     let d = d.cast::<PyDict>()?;
     let mut include = vec![];
     let mut exclude = vec![];
@@ -242,6 +242,8 @@ impl tr::plan::Indexes for Attached {
 struct Tracking {
     state: RwLock<tr::Tracking>,
     indexes: RwLock<Arc<Attached>>,
+    /// B7: owed counts, kept until the edge or its upstream moves.
+    counts: tr::stale::Counts,
 }
 
 impl Tracking {
@@ -249,6 +251,7 @@ impl Tracking {
         Tracking {
             state: RwLock::new(state),
             indexes: RwLock::new(Arc::new(Attached(HashMap::new()))),
+            counts: Default::default(),
         }
     }
 
@@ -593,6 +596,7 @@ impl Tracking {
         let ixs = self.indexes.read().unwrap().clone();
         crate::commit_py::build_commit(
             py,
+            &self.state,
             out,
             ixs.as_ref(),
             output,
@@ -605,6 +609,103 @@ impl Tracking {
             at,
             collect,
         )
+    }
+
+    /// B7: the event telling the core an edge's conditions now (journal it
+    /// when the edge opens and whenever they change). `gate`: the edge waits
+    /// while its upstream is in the middle of a full run.
+    #[staticmethod]
+    #[pyo3(signature = (edge, conditions, own=None, gate=true))]
+    fn event_watch<'py>(
+        py: Python<'py>,
+        edge: Vec<u8>,
+        conditions: &Bound<'py, PyAny>,
+        own: Option<Vec<u8>>,
+        gate: bool,
+    ) -> PyResult<Bound<'py, PyBytes>> {
+        crate::stale_py::event_watch(py, edge, conditions, own, gate)
+    }
+
+    /// B7: the event saying an output's full run started (`on`) or completed.
+    #[staticmethod]
+    fn event_incomplete(py: Python<'_>, output: Vec<u8>, on: bool) -> Bound<'_, PyBytes> {
+        crate::stale_py::event_incomplete(py, output, on)
+    }
+
+    /// B7: brings edges' staleness current at their upstream's head (every
+    /// watched keyed edge whose status is unknown, by default). Returns the
+    /// event to journal and apply, or None.
+    #[pyo3(signature = (edges=None, *, time_ms=0, not_due=None))]
+    fn stale_refresh<'py>(
+        &self,
+        py: Python<'py>,
+        edges: Option<Vec<Vec<u8>>>,
+        time_ms: u64,
+        not_due: Option<&Bound<'py, PyDict>>,
+    ) -> PyResult<Option<Bound<'py, PyBytes>>> {
+        let ixs = self.indexes.read().unwrap().clone();
+        guard(|| crate::stale_py::refresh(py, &self.state, ixs.as_ref(), edges, time_ms, not_due))
+    }
+
+    /// B7: failed keys of `edge` came due for a retry (rule 5); also called
+    /// at startup for every retry already due. The event, or None.
+    #[pyo3(signature = (edge, keys, *, time_ms=0, not_due=None))]
+    fn stale_retry_due<'py>(
+        &self,
+        py: Python<'py>,
+        edge: Vec<u8>,
+        keys: Vec<String>,
+        time_ms: u64,
+        not_due: Option<&Bound<'py, PyDict>>,
+    ) -> PyResult<Option<Bound<'py, PyBytes>>> {
+        let ixs = self.indexes.read().unwrap().clone();
+        guard(|| {
+            crate::stale_py::retry_due(py, &self.state, ixs.as_ref(), edge, keys, time_ms, not_due)
+        })
+    }
+
+    /// B7: each edge's status as known, with no index read: `{edge: status}`.
+    #[pyo3(signature = (edges=None))]
+    fn stale_status<'py>(
+        &self,
+        py: Python<'py>,
+        edges: Option<Vec<Vec<u8>>>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        guard(|| crate::stale_py::status(py, &self.state, edges))
+    }
+
+    /// B7: how many keys `edge` owes, by class; cached until it or its upstream moves.
+    fn stale_count<'py>(&self, py: Python<'py>, edge: Vec<u8>) -> PyResult<Bound<'py, PyDict>> {
+        let ixs = self.indexes.read().unwrap().clone();
+        guard(|| crate::stale_py::count(py, &self.state, ixs.as_ref(), &self.counts, edge))
+    }
+
+    /// B7: a page of the keys `edge` owes: `([(key, class), ...], next)`.
+    #[pyo3(signature = (edge, after=None, limit=1000))]
+    fn stale_keys<'py>(
+        &self,
+        py: Python<'py>,
+        edge: Vec<u8>,
+        after: Option<String>,
+        limit: usize,
+    ) -> PyResult<Bound<'py, PyTuple>> {
+        let ixs = self.indexes.read().unwrap().clone();
+        guard(|| crate::stale_py::keys(py, &self.state, ixs.as_ref(), edge, after, limit))
+    }
+
+    /// B7 (D177): `edge` has processed every key upstream holds under its patterns.
+    fn stale_complete(&self, py: Python<'_>, edge: Vec<u8>) -> PyResult<bool> {
+        let ixs = self.indexes.read().unwrap().clone();
+        guard(|| crate::stale_py::complete(py, &self.state, ixs.as_ref(), edge))
+    }
+
+    /// B7: per partition `(input edges, outputs)`, `(stale, upstream_stale)`;
+    /// stale is None when an input's status is unknown and none is stale.
+    fn stale_graph(
+        &self,
+        partitions: Vec<(Vec<Vec<u8>>, Vec<Vec<u8>>)>,
+    ) -> PyResult<Vec<(Option<bool>, bool)>> {
+        guard(|| crate::stale_py::graph(&self.state, partitions))
     }
 }
 

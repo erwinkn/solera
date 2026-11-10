@@ -48,7 +48,7 @@ pub enum Mode {
 }
 
 /// A commit built and written, not yet installed.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct Built {
     pub part: OutputCommit,
     pub added: u64,
@@ -56,6 +56,8 @@ pub struct Built {
     pub removed: u64,
     /// The changed keys, if no more than `Spec::collect`.
     pub keys: Option<Changed>,
+    /// The commit's entries, in key order: staleness reads them (B7's notice).
+    pub entries: Run,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -160,6 +162,7 @@ pub async fn build(
         updated: e.updated,
         removed: e.removed,
         keys: e.keys,
+        entries: e.run,
     }))
 }
 

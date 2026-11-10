@@ -16,12 +16,13 @@ use crate::codec::{Dec, Enc};
 use crate::error::{format, Result};
 use crate::event::{Event, Part};
 use crate::progress::Progress;
+use crate::stale::Stale;
 
 /// An opaque name the engine chooses: an output (asset, partition, output
 /// name) or an edge (consumer partition, input name), encoded by Python.
 pub type Id = Box<[u8]>;
 
-pub const SNAPSHOT_FORMAT: u8 = 1;
+pub const SNAPSHOT_FORMAT: u8 = 2;
 
 /// One output's log: its layer list, oldest first, and its head. B4's
 /// commit part appends to it.
@@ -44,6 +45,8 @@ pub struct Edge {
 pub struct Tracking {
     pub outputs: BTreeMap<Id, Output>,
     pub edges: BTreeMap<Id, Edge>,
+    /// B7: staleness per keyed edge.
+    pub stale: Stale,
 }
 
 impl Tracking {
@@ -77,10 +80,14 @@ impl Tracking {
             Part::Batch(p) => p.check(self),
             Part::Consumed(p) => p.check(self),
             Part::OutputCommit(p) => p.check(self),
+            Part::Watch(p) => p.check(self),
+            Part::Witness(p) => p.check(self),
+            Part::Incomplete(p) => p.check(self),
         }
     }
 
     fn apply_part(&mut self, p: Part) {
+        self.stale.touch(&p);
         match p {
             Part::EdgeOpen(p) => p.apply(self),
             Part::EdgeClose(p) => p.apply(self),
@@ -89,6 +96,9 @@ impl Tracking {
             Part::Batch(p) => p.apply(self),
             Part::Consumed(p) => p.apply(self),
             Part::OutputCommit(p) => p.apply(self),
+            Part::Watch(p) => p.apply(self),
+            Part::Witness(p) => p.apply(self),
+            Part::Incomplete(p) => p.apply(self),
         }
     }
 
@@ -111,6 +121,7 @@ impl Tracking {
             e.bytes(&edge.input);
             edge.progress.encode(&mut e);
         }
+        self.stale.encode(&mut e);
         e.buf
     }
 
@@ -134,6 +145,7 @@ impl Tracking {
             let progress = Arc::new(Progress::decode(&mut d)?);
             t.edges.insert(id, Edge { input, progress });
         }
+        t.stale = Stale::decode(&mut d)?;
         d.end()?;
         Ok(t)
     }

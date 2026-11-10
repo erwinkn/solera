@@ -24,6 +24,7 @@ fn err(e: tr::Error) -> PyErr {
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_commit<'py>(
     py: Python<'py>,
+    state: &std::sync::RwLock<tr::Tracking>,
     out: tr::Output,
     ixs: &dyn Indexes,
     output: &[u8],
@@ -66,7 +67,15 @@ pub(crate) fn build_commit<'py>(
         return Ok(None);
     };
     let d = PyDict::new(py);
-    let ev = tr::Event::of(vec![tr::Part::OutputCommit(b.part.clone())]).encode();
+    let mut parts = vec![tr::Part::OutputCommit(b.part.clone())];
+    parts.extend(tr::stale::notice(
+        &state.read().unwrap(),
+        output,
+        b.part.layer.hi,
+        &b.entries,
+        time_ms,
+    ));
+    let ev = tr::Event::of(parts).encode();
     d.set_item("event", PyBytes::new(py, &ev))?;
     d.set_item("commit", b.part.layer.hi)?;
     d.set_item("layer", layer_out(py, &b.part.layer)?)?;
