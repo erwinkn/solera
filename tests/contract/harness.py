@@ -614,6 +614,22 @@ class Solera:
         for path in [root, *(p for p in root.rglob("*") if p.is_dir())]:
             os.chmod(path, 0o555 if refused else 0o755)
 
+    # -- PERKEY+HISTORY (target) ---------------------------------------------------
+
+    async def key_log(self, asset: str, **params) -> list[dict]:
+        """What a per-key asset's keys came to, call by call, newest first
+        (`GET /assets/{name}/outcomes/history`), every page: of `params` only
+        (`run=`, `key=`, `outcome=`), if named."""
+
+        out, before = [], None
+        while True:
+            page = await self.get(
+                f"/assets/{asset}/outcomes/history", **params, **({"before": before} if before else {})
+            )
+            out += page["outcomes"]
+            if (before := page["next"]) is None:
+                return out
+
 
 # -- the outside world, as a user's project sees it ---------------------------
 
