@@ -221,9 +221,12 @@ CALIBRATIONS = {
     ],
     ("fullrun", "clear", "table", "switch_commit"): [("items", (("k2", True), ("k3", True)))],
     ("fullrun", "clear", "table", "switch_alone"): [
-        ("items", (("k1", True), ("k2", True), ("k3", True))),
-        ("step", "tally", 2),
-        ("items", (("k2", True), ("k3", False))),
+        ("items", (("k2", True), ("k3", True), ("k4", True))),
+        ("plan", "copy", 2),
+        ("items", (("k1", False), ("k5", True))),
+        ("step", "copy", 1),
+        ("step", "copy", 1),
+        ("items", (("k2", False), ("k5", False))),
     ],
     ("fullrun", "clear", "table", "switch_release"): [
         ("feed", (("k2", True), ("k3", True))),
@@ -242,7 +245,8 @@ CALIBRATIONS = {
         ("plan", "copy", 2),
         ("commit", "copy"),
         ("define", "copy"),
-        ("switch", "copy", "late"),
+        ("switch", "copy", "delayed"),
+        ("notice",),
     ],
     ("fullrun", "clear", "table", "build_keep"): [
         ("items", (("k1", True), ("k4", True))),
@@ -254,7 +258,8 @@ CALIBRATIONS = {
         ("replay", "tally"),
     ],
     ("fullrun", "clear", "table", "notice_match"): [
-        ("items", (("k4", True),)),
+        ("step", "copy", 2),
+        ("items", (("k2", True), ("k4", True))),
         ("step", "copy", 2),
         ("switch", "copy", "late"),
         ("full", "copy"),
@@ -281,6 +286,11 @@ CALIBRATIONS = {
         ("items", (("k3", True),)),
         ("step", "copy", 1),
         ("summary",),
+    ],
+    ("fullrun", "clear", "table", "switch_result"): [
+        ("step", "tally", 1),
+        ("switch", "tally", "delayed"),
+        ("items", (("k1", True),)),
     ],
 }
 

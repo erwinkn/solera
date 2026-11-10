@@ -69,6 +69,7 @@ RULES = {
         "switch_quiet",
         "switch_overtaken",
         "byref_wait",
+        "switch_result",
     ),
 }
 ADDED = {
@@ -91,6 +92,7 @@ ADDED = {
         "switch_quiet",
         "switch_overtaken",
         "byref_wait",
+        "switch_result",
     )
 }
 
@@ -224,12 +226,16 @@ class Output:
             else:
                 rows[k] = self.objects[(k, version)]
 
-    def switch(self, gen: int) -> None:
+    def switch(self, gen: int, newest: int) -> bool:
         """The store's hook at the end of a full run (D211), one transaction:
         the partition's rows are replaced by the build's, and the build goes.
-        Safe to repeat: a no-op once the run's build is gone."""
+        Returns whether the run is published. A call delivered after an attempt
+        newer than `newest` wrote does nothing and says not published; a
+        repeat after the switch does nothing and says published."""
+        if self.fence > newest:
+            return False
         if gen not in self.builds:
-            return
+            return gen <= self.published_run
         build = self.builds.pop(gen)
         for g in [g for g in self.builds if g < gen]:  # older runs' builds: overtaken, never to be published
             del self.builds[g]
@@ -241,6 +247,7 @@ class Output:
             self.loose = {}
         self.switched[gen] += 1
         self.published_run = max(self.published_run, gen)
+        return True
 
     def removed_by(self, k: str, H: int, planned: bool) -> int | None:
         """The rebuild whose commit last removed k, as the reader saw it: at its
@@ -363,6 +370,7 @@ class Ordinary:
         self.released = False  # a person let downstream proceed over the rebuild's partial output
         self.hand = False  # the full run due was asked for by hand, and nothing else makes it due
         self.last: Spec | None = None  # the last attempt that wrote, which a store call may replay
+        self.newest = 0  # the newest attempt version the engine has planned for the asset
         output.ctx = self.runs
         self.cursor: str | None = None
         self.pending: Spec | None = None
@@ -438,7 +446,7 @@ class Ordinary:
             if s.taken != truth:
                 w.violation = f"{self.name} planned {s.taken}, brute force {truth}"
         w.version += 1
-        s.version = w.version
+        s.version = self.newest = w.version
         s.before = [{k: (ABSENT if s.reset else prog.decode(k)) for k in s.taken} for prog in self.progress]
         s.clear = s.reset and w.on("clear")
         s.ctx = self.runs()
@@ -960,6 +968,9 @@ class World:
         self.acks: list[
             tuple[str, int]
         ] = []  # hook calls that returned, their FullRunNoticed not journaled yet
+        self.calls: list[
+            tuple[str, int, int, bool]
+        ] = []  # hook calls issued, not yet run by the store: (asset, run, newest, still awaited)
         self.released: set[int] = set()  # rebuilds a person released
         self.copy = Ordinary(
             self, "copy", [self.items, self.feed], Output("copy", kind, self.on), accumulates=False
@@ -1000,12 +1011,27 @@ class World:
         if self.on("switch_quiet") and (a.pending is not None or a.dead):
             self.trace.append(f"the engine waits to switch {name}: an attempt is in flight or unrepaired")
             return
-        a.output.switch(run)
+        if ack == "delayed":
+            self.calls.append((name, run, a.newest, True))
+            self.trace.append(
+                f"the engine calls {name}'s store to switch to build v{run}; the call arrives later"
+            )
+            return
+        self.deliver(name, run, a.newest, ack)
+
+    def deliver(self, name: str, run: int, newest: int, ack: bool | str) -> None:
+        """The store runs the hook; the engine journals FullRunNoticed only if it
+        reports the run published (switch_result), and never for a call it gave
+        up on at a restart."""
+        published = self.assets[name].output.switch(run, newest)
         self.stats["switches called"] += 1
         self.trace.append(
-            f"the engine calls {name}'s store to switch to build v{run}"
-            + ("" if ack else ", and crashes before it records the call")
+            f"the engine's call to switch {name}'s store to build v{run} (newest v{newest}) runs: "
+            + ("published" if published else "not published")
+            + ("" if ack else "; the engine does not record it")
         )
+        if not published and self.on("switch_result"):
+            return
         if ack == "late":
             self.acks.append((name, run))
         elif ack:
@@ -1151,7 +1177,9 @@ class World:
         elif kind == "switch":
             self.switch(ev[1], ev[2])
         elif kind == "notice":
-            if self.acks:
+            if self.calls:
+                self.deliver(*self.calls.pop(0))
+            elif self.acks:
                 self.notice(*self.acks.pop(0))
         elif kind == "replay":
             self.assets[ev[1]].replay()
@@ -1161,6 +1189,9 @@ class World:
                 a.release()
         elif kind == "restart":
             self.acks = []  # notices not journaled are lost: the hook runs again
+            self.calls = [
+                (n, r, v, False) for n, r, v, _ in self.calls
+            ]  # still run by the store, never noticed
             if not self.on("switch_owed"):
                 self.ended = {}  # switches held in memory are lost
             self.stats["restarts mid-rebuild"] += any(a.rebuild is not None for a in (self.copy, self.tally))
@@ -1335,7 +1366,9 @@ class World:
                         if bad := self.check():
                             return bad
             if not moved:
-                moved = bool(self.acks)
+                moved = bool(self.acks or self.calls)
+                while self.calls:
+                    self.deliver(*self.calls.pop(0))
                 while self.acks:
                     self.notice(*self.acks.pop(0))
                 for name in list(self.ended):
@@ -1427,7 +1460,9 @@ def history(rnd: random.Random, steps: int) -> list[tuple]:
         elif kind == "late":
             events.append((kind, rnd.choice(("copy", "tally")), rnd.random() < 0.5))
         elif kind == "switch":
-            events.append((kind, rnd.choice(("copy", "tally")), rnd.choice((True, True, False, "late"))))
+            events.append(
+                (kind, rnd.choice(("copy", "tally")), rnd.choice((True, True, False, "late", "delayed")))
+            )
         elif kind == "replay":
             events.append((kind, rnd.choice(("copy", "tally"))))
         elif kind == "release":

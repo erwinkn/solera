@@ -567,6 +567,7 @@ def test_a_switch_a_newer_full_run_overtook_is_skipped():
         ("switch_quiet", "outsiders read"),
         ("switch_overtaken", "outsiders read"),
         ("byref_wait", "by reference"),
+        ("switch_result", "log says"),
         ("reset_replay", "times"),  # (iii)
         ("switch_cleanup", "of an older build"),  # (iv)
     ],
@@ -640,6 +641,27 @@ def test_an_input_taken_by_reference_waits_for_the_switch():
     new = {"k1": 2, "k2": 2, "k4": 3, "k5": 3}
     assert w.held["by reference"] == 1 and _versions(w.copy.output.outside()) == new
     assert fullrun.run(events, "clear", "table") is None
+
+
+def test_a_late_switch_call_keeps_the_debt():
+    """The engine calls the switch once the run ended and the partition is
+    quiet, but the call reaches the store after a newer batch wrote into the
+    build: the store does nothing and says not published, so the engine keeps
+    the debt and calls again (Fable review 2 of #37, M1)."""
+    k4 = (("k1", True), ("k2", True), ("k3", True), ("k4", True))
+    events = [("items", k4), ("step", "copy", 4), ("switch", "copy", True)]
+    events += [
+        ("items", (("k3", False), ("k5", True))),
+        ("full", "copy"),
+        ("step", "copy", 2),
+        ("step", "copy", 2),
+    ]
+    events += [("switch", "copy", "delayed"), ("items", (("k1", True),)), ("step", "copy", 1), ("notice",)]
+    w = oracle.replay_fullrun(events, kind="table")
+    assert w.ended == {"copy": 2} and w.copy.output.switched[2] == 0
+    assert fullrun.run(events, "clear", "table") is None
+    r = fullrun.run(events, "clear", "table", frozenset({"switch_result"}))
+    assert r is not None and "copy's log says" in r[1]
 
 
 def test_a_write_context_never_names_two_full_runs():
