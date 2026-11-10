@@ -87,7 +87,7 @@ impl Tracking {
             for c in &p.keys {
                 let wanted = Holding::of(c.version.as_version(), &p.conditions, &c.key);
                 if failed(&c.key) {
-                    if !key_list && owed(&c.held, &wanted) {
+                    if key_list || owed(&c.held, &wanted) {
                         points.push((
                             c.key.clone(),
                             Point {
