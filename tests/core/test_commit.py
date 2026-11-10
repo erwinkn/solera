@@ -2,7 +2,6 @@
 commit from the changed keys, the event it returns installs it."""
 
 import pytest
-
 from solera._native import ChangeIndex, FormatError, Tracking, encode_changes
 
 
@@ -41,7 +40,9 @@ def test_a_batch_commit_records_what_each_key_replaced(index):
     first = core.commit(b"items", encode_changes(["a", "b", "c"]), version=10, path="items/1", collect=10)
     assert first["commit"] == 1 and first["live"] == 3 and first["added"] == 3
     assert first["upserted_keys"] == ["a", "b", "c"] and first["removed_keys"] == []
-    second = core.commit(b"items", encode_changes(["b", "d"], removes=["c", "zz"]), version=11, path="items/2")
+    second = core.commit(
+        b"items", encode_changes(["b", "d"], removes=["c", "zz"]), version=11, path="items/2"
+    )
     assert (second["added"], second["updated"], second["removed"], second["live"]) == (1, 1, 1, 3)
     assert second["upserted_keys"] is None
     assert core.entries(b"items", 2) == [("b", 11, 10), ("c", None, 10), ("d", 11, None)]
