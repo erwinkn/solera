@@ -884,7 +884,14 @@ pub fn parse_commits(b: &[u8]) -> Result<Vec<CommitHeader>> {
     let raw = decompress(&b[8..], rlen)?;
     let mut p = 0;
     let n = varint(&raw, &mut p)?;
-    let mut out = Vec::with_capacity(n.min(1 << 20) as usize);
+    // a header takes at least 8 bytes: its length and seven fields
+    if n > (raw.len() - p) as u64 / 8 {
+        return format(format!(
+            "{n} commit headers in a {} byte section",
+            raw.len()
+        ));
+    }
+    let mut out = Vec::with_capacity(n as usize);
     for _ in 0..n {
         let len = varint(&raw, &mut p)? as usize;
         let rec = take(&raw, &mut p, len)?;
