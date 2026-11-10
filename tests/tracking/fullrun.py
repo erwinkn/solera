@@ -161,7 +161,7 @@ class Ordinary:
             for prog, log in zip(self.progress, self.inputs, strict=True)
         )
 
-    def next_plan(self, n: int, keys: tuple = ()) -> Spec:
+    def next_plan(self, n: int, keys: tuple | None = None) -> Spec:
         """What the next batch must take: a full run's first batch plans on reset
         progress (every key added), a key list takes its keys, a default batch
         the first n owed keys after the run's progress key, on every input."""
@@ -170,18 +170,18 @@ class Ordinary:
         for p in progs if reset else ():
             p.reset()
         heads = [log.head for log in self.inputs]
-        lo = NEG if reset or keys else (self.cursor or NEG)
-        if keys:
+        lo = NEG if reset or keys is not None else (self.cursor or NEG)
+        if keys is not None:
             return Spec("keys", heads, lo, POS, self.cond, sorted(keys), 0, reset)
         owed = sorted({k for p, H in zip(progs, heads, strict=True) for k in p.candidates(H, lo, self.cond)})
         return Spec("range", heads, lo, owed[n - 1] if len(owed) > n else POS, self.cond, owed[:n], 0, reset)
 
-    def plan(self, n: int, keys: tuple = ()) -> None:
+    def plan(self, n: int, keys: tuple | None = None) -> None:
         w = self.w
         if self.pending is not None:
             return
         s = self.next_plan(n, keys)
-        if not keys:
+        if keys is None:
             held = [{} if s.reset else h for h in self.held]
             truth = sorted(
                 {
@@ -198,7 +198,7 @@ class Ordinary:
         self.pending = s
         w.trace.append(
             f"{self.name} plans{' its full run' if s.reset else ''} at {self._heads(s.heads)}, version {w.version}: "
-            + (f"keys={s.taken}" if keys else f"{s.taken}, range ({_k(s.lo)}, {_k(s.hi)}]")
+            + (f"keys={s.taken}" if keys is not None else f"{s.taken}, range ({_k(s.lo)}, {_k(s.hi)}]")
         )
 
     def commit(self) -> None:

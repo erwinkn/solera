@@ -348,3 +348,8 @@ def test_a_removal_loaded_before_a_rebuild_is_not_the_rebuilds():
         ("commit", "archive"),
     ]
     assert fullrun.run(events, "clear", "table") is None
+
+
+def test_an_empty_key_list_processes_nothing():
+    w = oracle.replay_fullrun([("items", (("k1", True),)), ("keys", "copy", ()), ("commit", "copy")])
+    assert oracle.holds(w, "copy") == {} and oracle.due(w, "copy") == ["k1"]
