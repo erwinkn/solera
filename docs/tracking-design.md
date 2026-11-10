@@ -1281,9 +1281,9 @@ described above, with these choices:
   of 17–24 ms. Failures older than the input's last merge are read by a
   lookup at the head instead of a window: 72,700 keys a second, 118–132 ms
   a batch, accepted as measured (Captain, 2026-11-10).
-- **Not built yet: the hold-back at commit** (D205, §10): it needs B3's
-  report to name held-back keys, which comes with clears. Until then the
-  engine must not commit a batch that held keys back.
+- **The hold-back at commit** (D205, §10): a key in B3's `Ops.held_back`
+  keeps its record as it is, failed or not, and B3's `HeldBack` point
+  stands.
 
 ## 12. History
 
