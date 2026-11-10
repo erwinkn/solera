@@ -80,6 +80,7 @@ from solera.stores import (
 )
 from solera.tasks import Tasks, retrying
 
+from . import batch as core
 from . import each
 from .observed import Observed
 from .reporting import LogShipper, Reporter
@@ -296,6 +297,8 @@ class Ctx:
             if info.get("before") is None:
                 return None
             ref, index = Ref.from_json(info["before"]), info.get("index")
+            if "core" in info:
+                index = {"core": info["core"]}
         store = self._stores[ref.store]
         index = index or self._indexes.get((ref.output, ref.partition))
         value = await _load_whole(_unobserved, store, ref, t, self._keys_io, index)
@@ -401,6 +404,31 @@ async def _resolve_inputs(spec, project, asset, keys_io, timeline, observed: Obs
                 )
                 timeline.add("loaded", param, _rows(args[param]))
                 continue
+            if "core" in pin:  # the new tracking core: the keys its plan names
+                keys, classes, versions = core.planned(spec, pin)
+                args[param] = await observed.load(
+                    store,
+                    ref,
+                    t,
+                    Keys({k: v for k, c, v in zip(keys, classes, versions, strict=True) if c != "removed"}),
+                )
+                served = getattr(store, "served", None)
+                classes, loaded = core.observe(keys, classes, versions, served)
+                batch[param] = Batch(
+                    rows=args[param],
+                    **{c: tuple(classes[c]) for c in core.CLASSES},
+                    reset=reset,
+                    index=int(ch["index"]),
+                    count=int(ch["count"]),
+                    final=bool(ch["final"]),
+                    upstream=Upstream(ref.output),
+                    served={k: v for k, v in (served or {}).items() if v is not None},
+                )
+                delivered[param] = {"loaded": loaded}
+                if not reset:
+                    nothing.append(bool(keys) and not any(classes.values()))
+                timeline.add("loaded", param, _rows(args[param]))
+                continue
             keys = ch["keys"]
             load = {k: g for k, cls, _, g, _ in keys if cls != "removed"}
             args[param] = await observed.load(store, ref, t, Keys(load))
@@ -463,18 +491,18 @@ async def _load_whole(load, store, ref, t, keys_io, index_json, key: str | None 
 
     if index_json is None or store.writes != "immutable":
         return await load(store, ref, t, None)
-    index = LayerIndex(keys_io, LayerState.from_json(index_json))
+    if "core" in index_json:  # the new tracking core: the output's layers in the change index
+        pages = core.pages(index_json["core"], REPAIR_PAGE)
+    else:
+        pages = _layer_pages(LayerIndex(keys_io, LayerState.from_json(index_json)))
     paged = _plain(t)  # a type of the store's own (a DataFrame): one read, which the store makes
-    parts, entries, after = [], {}, None
-    while True:
-        rows, after = await index.delta(None, after=after, first=REPAIR_PAGE)
-        entries.update((key_str(r[0]), r[3]) for r in rows)
+    parts, entries = [], {}
+    async for page in pages:
+        entries.update(page)
         if paged:
             parts.append(await store.load(ref, t, Keys(entries)))
             check_loaded(ref.output, key, parts[-1], entries)
             entries = {}
-        if after is None:
-            break
     if not paged:
         value = await store.load(ref, t, Keys(entries))
         check_loaded(ref.output, key, value, entries)
@@ -484,6 +512,17 @@ async def _load_whole(load, store, ref, t, keys_io, index_json, key: str | None 
     if all(isinstance(p, Mapping) for p in parts):
         return {k: v for p in parts for k, v in p.items()}
     return [item for p in parts for item in p]
+
+
+async def _layer_pages(index: LayerIndex):
+    """An index's live keys, each with its generation, a page at a time."""
+
+    after = None
+    while True:
+        rows, after = await index.delta(None, after=after, first=REPAIR_PAGE)
+        yield {key_str(r[0]): r[3] for r in rows}
+        if after is None:
+            return
 
 
 def _plain(t) -> bool:
@@ -557,6 +596,13 @@ async def _store_outputs(
     engine = await _ask_engine(channel, worker_id, asks)
     intents, entries = {}, {}
     for name, o in list(outs.items()):
+        if "core" in o.info and core.unchanged(o) and o.prior is not None:
+            if not _schema_due(o):
+                entries[name] = {"unchanged": True}
+                del outs[name]
+            else:  # no data to write, but migrations to apply: the same content under the new schema
+                o.schema_only = True
+            continue
         if o.index is None:
             continue
         if o.opaque:
@@ -620,11 +666,17 @@ async def _store_outputs(
         if o.schema_only:
             ref = o.prior
             handle = {**(ref.handle or {}), "schema": schema}
-            entries[name] = {"ref": dataclasses.replace(ref, handle=handle).to_json(), "keys": intents[name]}
+            entries[name] = {"ref": dataclasses.replace(ref, handle=handle).to_json()}
+            if "core" in o.info:
+                entries[name].update(await core.changes(objects, spec, name, o))
+            else:
+                entries[name]["keys"] = intents[name]
             continue
         written = await writes.call(store.store(o.write or o.value, o.prior, context))
         entry = {}
-        if o.index is not None and o.opaque:
+        if "core" in o.info:
+            entry.update(await core.changes(objects, spec, name, o))
+        elif o.index is not None and o.opaque:
             if written.keys is None:
                 raise StoreError(f"{output.name}: store {store_name!r} reported no keys for an opaque write")
             files, _ = await o.index.write_replace(
@@ -729,7 +781,7 @@ class _Out:
     def asks(self) -> bool:
         """Whether the engine is asked to resolve this write (small enough)."""
 
-        if self.prepared is None or self.files is not None:
+        if self.prepared is None or self.files is not None or "core" in self.info:
             return False
         if self.replace:
             live = int(self.info["index"].get("count", 0))
@@ -754,6 +806,9 @@ async def _prepare(o: _Out, spec, keys_io) -> None:
     (`_repair`), or — after an unknown opaque write — reconciled whole
     (`_reconcile`), which resolves the write too (docs/versions.md §5)."""
 
+    if "core" in o.info:  # the new tracking core: the engine builds the commit
+        await core.prepare(o)
+        return
     if o.info.get("index") is None:
         if o.opaque and o.output.incremental:
             raise WriteError(f"{o.output.name}: an opaque write needs a keyed output")

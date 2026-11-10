@@ -28,8 +28,8 @@ from dataclasses import dataclass, replace
 
 from .. import _native
 from ..ids import ulid
+from ..threads import in_thread
 from .io import ObjectIO
-from .threads import in_thread
 
 BLOCK = 16 * 1024  # raw bytes per block
 FILE_LIMIT = 64 * 2**20  # bytes per file

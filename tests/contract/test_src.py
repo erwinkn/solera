@@ -581,7 +581,7 @@ async def test_src_10_a_commit_to_other_keys_while_a_tick_runs_does_not_refuse_i
     assert not (await solera.commit_source("uploads", upsert={"a": "2", "z": "2"}))["changed"]
     assert [r["targets"] for r in await solera.runs() if "ingest" in r["targets"]] == [["ingest"]]
     [row] = (await solera.get("/sensors/watch/ticks"))["ticks"]
-    assert row["tick"] == tick["tick"] and row["outcome"] == "accepted"
+    assert row["tick"] == tick["tick"] and row["outcome"] == "requested"
     [tick] = await solera.sensor_ticks(wait=5)
     assert tick["cursor"] == "c1"
 
