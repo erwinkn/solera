@@ -106,17 +106,18 @@ pub struct Owed {
 #[derive(Default)]
 pub struct Counts(Mutex<HashMap<Id, Counted>>);
 
-/// What is owed, with the edge's generation and the head it holds for.
-type Counted = (u64, u64, Owed);
+/// What is owed, with the edge's generation, the head and the revision of
+/// the keys not due it holds for.
+type Counted = ([u64; 3], Owed);
 
 impl Counts {
     pub async fn get(&self, ask: &Ask, ixs: &dyn Indexes, due: &dyn Due) -> Result<Option<Owed>> {
         if ask.held {
             return Ok(None);
         }
-        let at = (ask.input.gen, ask.head);
-        if let Some((g, h, o)) = self.0.lock().unwrap().get(&ask.edge) {
-            if (*g, *h) == at {
+        let at = [ask.input.gen, ask.head, due.revision(&ask.edge)];
+        if let Some((a, o)) = self.0.lock().unwrap().get(&ask.edge) {
+            if *a == at {
                 return Ok(Some(o.clone()));
             }
         }
@@ -150,7 +151,7 @@ impl Counts {
         self.0
             .lock()
             .unwrap()
-            .insert(ask.edge.clone(), (at.0, at.1, o.clone()));
+            .insert(ask.edge.clone(), (at, o.clone()));
         Ok(Some(o))
     }
 

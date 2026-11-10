@@ -682,8 +682,8 @@ and conditions at one generation, as of one upstream commit.
   changed", whatever upstream did since; the notice, the probe and the count
   give each key the same reason.
 
-At 100M keys (`bench/core/stale/`): a notice costs 0.08 to 0.18 µs per
-edge, and about 100 ns per entry per edge when no entry matters; a count,
+At 100M keys (`bench/core/stale/`): a notice costs 0.11 to 0.22 µs per
+edge, and about 80 ns per entry per edge when no entry matters; a count,
 reasons included, costs 1.1 s cold and 0.6 to 0.7 s warm for an edge a day
 behind and 15 s cold for 30 days behind, where the index's diff alone
 takes 0.9 s and 5.7 s cold (`bench/core/stale/results/run-100m.log`).

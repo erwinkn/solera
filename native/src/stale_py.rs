@@ -8,6 +8,7 @@
 //! "unknown" means what is known no longer holds: `stale_refresh` it.
 
 use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::sync::RwLock;
 
 use pyo3::prelude::*;
@@ -44,6 +45,17 @@ impl NotDue {
 impl Due for NotDue {
     fn not_due(&self, edge: &[u8], key: &[u8]) -> bool {
         self.0.get(edge).is_some_and(|s| s.contains(key))
+    }
+
+    fn revision(&self, edge: &[u8]) -> u64 {
+        let Some(keys) = self.0.get(edge) else {
+            return 0;
+        };
+        let mut keys: Vec<&Key> = keys.iter().collect();
+        keys.sort();
+        let mut h = std::hash::DefaultHasher::new();
+        keys.hash(&mut h);
+        h.finish()
     }
 }
 

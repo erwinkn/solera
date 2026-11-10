@@ -18,6 +18,9 @@ use crate::state::{Id, Tracking};
 /// index; until it lands, the lists the engine passes).
 pub trait Due: Sync {
     fn not_due(&self, edge: &[u8], key: &[u8]) -> bool;
+    /// Changes whenever the keys not due on `edge` change: a cached count's
+    /// reasons hold for one revision.
+    fn revision(&self, edge: &[u8]) -> u64;
 }
 
 pub struct NoneDue;
@@ -25,6 +28,10 @@ pub struct NoneDue;
 impl Due for NoneDue {
     fn not_due(&self, _: &[u8], _: &[u8]) -> bool {
         false
+    }
+
+    fn revision(&self, _: &[u8]) -> u64 {
+        0
     }
 }
 

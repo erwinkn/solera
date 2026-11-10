@@ -519,10 +519,15 @@ fn a_count_says_every_reason_that_holds() {
         fn not_due(&self, _: &[u8], key: &[u8]) -> bool {
             key == b"k1"
         }
+
+        fn revision(&self, _: &[u8]) -> u64 {
+            1
+        }
     }
+    let counts = stale::Counts::default();
     let get = |t: &Tracking, due: &dyn stale::Due| {
         let ask = t.stale_ask(EDGE).unwrap();
-        let o = rt.block_on(stale::Counts::default().get(&ask, &OneIndex(&ix), due));
+        let o = rt.block_on(counts.get(&ask, &OneIndex(&ix), due));
         o.unwrap().unwrap()
     };
     let o = get(&t, &NoneDue);
@@ -535,6 +540,11 @@ fn a_count_says_every_reason_that_holds() {
         get(&t, &Waiting).reasons,
         vec![Reason::NeverProcessed],
         "a key waiting for its retry is owed, but gives no reason"
+    );
+    assert_eq!(
+        get(&t, &NoneDue).reasons,
+        vec![Reason::InputChanged, Reason::NeverProcessed],
+        "a cached count holds for the keys not due it was counted with"
     );
     let other = Arc::new(Conditions {
         context: b"w2".as_slice().into(),
