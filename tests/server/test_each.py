@@ -731,35 +731,6 @@ def fed(tmp_path, outside, *assets, extra=()):
     )
 
 
-async def test_a_keys_selection_runs_batch_size_keys_at_a_time(state, tmp_path):
-    """A19 R6, D111: a keys= selection keeps both bounds: five named keys in
-    batches of two (batch_size) make three attempts, and concurrency=1
-    runs one call at a time."""
-
-    from tests.sim.project import External
-
-    outside, live = External(), {"now": 0, "max": 0}
-
-    @asset(
-        inputs={"row": Incremental("feed", each=True, batch_size=2, concurrency=1)},
-        outputs=Output("checks", key="id"),
-    )
-    async def checks(ctx, row: list):
-        live["now"] += 1
-        live["max"] = max(live["max"], live["now"])
-        await asyncio.sleep(0.01)
-        live["now"] -= 1
-        return [{"v": row[0]["v"]}]
-
-    engine = make_engine(state, fed(tmp_path, outside, checks))
-    await engine.initialize()
-    outside.feed.update({f"k{i}": "1" for i in range(5)})
-    await engine.commit_source("feed", upsert=dict(outside.feed))
-    detail = await drive(engine, await engine.submit(["checks"], keys={"feed": list(outside.feed)}))
-    assert status_of(detail) == "succeeded"
-    assert live["max"] == 1 and sum(len(a) for a in detail["attempts"].values()) == 3, live
-
-
 async def test_binding_a_whole_input_to_another_head_rebuilds_every_key(state, tmp_path):
     """A19 R7: `checks` reads factor=In(low) (1); a deploy binds it to
     In(high) (10), committed before the last pass began. The binding is the

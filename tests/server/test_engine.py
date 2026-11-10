@@ -182,50 +182,6 @@ async def test_rename_and_meta_edges(state):
     assert seen["feed"] == [{"id": "a", "v": 1}, {"id": "b", "v": 2}]
 
 
-async def test_incremental_filters_input_and_changes(state):
-    """§5/§6: under Incremental the parameter arrives filtered to the keys
-    added or updated, and ctx.batch says which, and what was removed (K44)."""
-    seen = {}
-    content = {"rows": [{"id": "a", "v": 1}, {"id": "b", "v": 1}, {"id": "c", "v": 1}]}
-
-    @asset(outputs=Output("files", key="id"))
-    def files():
-        return content["rows"]
-
-    @asset(inputs={"files": Incremental()})
-    def consumer(ctx, files: list):
-        seen["rows"] = list(files)
-        seen["added"] = list(ctx.batch["files"].added)
-        seen["updated"] = list(ctx.batch["files"].updated)
-        seen["deleted"] = list(ctx.batch["files"].removed)
-        return [{"n": len(files)}]
-
-    project = Project(assets=[files, consumer])
-    engine = make_engine(state, project)
-    await engine.initialize()
-    await drive(engine, await engine.submit(["consumer"], upstream=True))
-    assert seen["added"] == ["a", "b", "c"]  # §6: a first pass adds everything
-    assert {r["id"] for r in seen["rows"]} == {"a", "b", "c"}
-
-    # Second run, nothing written since → skipped, nothing loaded.
-    seen.clear()
-    detail = await drive(engine, await engine.submit(["consumer"]))
-    assert task_statuses(detail)["consumer"] == "skipped"
-    assert seen == {}
-
-    # One key written again reprocesses only that key (§6).
-    content["rows"] = Patch([{"id": "b", "v": 2}])
-    await drive(engine, await engine.submit(["consumer"], upstream=True))
-    assert seen["updated"] == ["b"] and seen["added"] == []  # held at the position: updated (K44)
-    assert [r["id"] for r in seen["rows"]] == ["b"]
-
-    # A deletion arrives via ctx.batch (§5: what a selection cannot carry).
-    seen.clear()
-    content["rows"] = Patch([], remove=["b"])
-    await drive(engine, await engine.submit(["consumer"], upstream=True))
-    assert seen["deleted"] == ["b"] and seen["added"] == seen["updated"] == []
-
-
 async def test_config_change_reprocesses_everything(state):
     """§6/§2.2: run config is part of the definition — changing it makes
     the next run a full run, which reprocesses every key."""
@@ -327,31 +283,6 @@ async def test_incremental_batching_and_more(state):
     assert await engine.complete("consumer", "")
     task = [t for t in detail["tasks"] if t["asset"] == "consumer"][0]
     assert len(detail["attempts"][task["id"]]) == 3  # three batches, three attempts
-
-
-async def test_run_keys_override(state):
-    """§8: a `keys=` list loads the keys it names — b, unchanged, observed
-    as it is; 'all' loads every key again, unchanged, without starting over."""
-    seen = []
-
-    @asset(outputs=Output("files", key="id"))
-    def files():
-        return [{"id": "a", "v": 1}, {"id": "b", "v": 1}]
-
-    @asset(inputs={"files": Incremental()})
-    def consumer(ctx, files: list):
-        seen.append(sorted(r["id"] for r in files))
-        return []
-
-    project = Project(assets=[files, consumer])
-    engine = make_engine(state, project)
-    await engine.initialize()
-    await drive(engine, await engine.submit(["consumer"], upstream=True))
-    detail = await drive(engine, await engine.submit(["consumer"], keys={"files": ["b"]}))
-    assert status_of(detail) == "succeeded", [t.get("error") for t in detail["tasks"]]
-    assert seen == [["a", "b"], ["b"]]
-    await drive(engine, await engine.submit(["consumer"], keys={"files": "all"}))
-    assert seen[-1] == ["a", "b"]
 
 
 async def test_a_full_run_resumes_batch_by_batch(state):

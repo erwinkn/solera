@@ -73,7 +73,7 @@ Areas: [INC](#inc--incremental-delivery-and-classification) ·
 `tally` has never run; `items` holds k1…k5; `batch_size=2`. The run makes
 three batches, `added` = [k1, k2], [k3, k4], [k5]; nothing is updated or
 removed; the count ends at 5.
-*From* D44, D139; F44. *Covered* `server/test_changes.py::test_a_first_run_delivers_every_key_as_added`; `ObservedSet.tla` CountExact.
+*From* D44, D139; F44. *Covered* `contract/test_inc.py::test_inc_1_a_first_run_delivers_every_upstream_key_as_added`; `contract/test_inc.py::test_inc_1_a_first_run_delivers_every_key_as_added_plain_or_per_key`; `ObservedSet.tla` CountExact.
 
 **INC-2. A key's class is the net difference between what the partition processed and upstream now.**
 `added`: it did not hold the key, upstream has it. `updated`: both have
@@ -81,12 +81,12 @@ it, at different versions. `removed`: it held the key, upstream no longer
 has it (or no longer offers it, INC-7, CHG-4). `tally` processed k1@1,
 k2@1; then k1 → @2, k3 added, k2 removed: the next batch has
 `added=[k3]`, `updated=[k1]`, `removed=[k2]`, and `rows` holds k3 and k1.
-*From* D44, D126, D139 (chain: D42 → D126). *Covered* `server/test_engine.py::test_incremental_filters_input_and_changes`; `server/test_owed.py::test_runs_keep_the_record_equal_to_the_observed_set`; `ObservedSet.tla` OwedExact.
+*From* D44, D126, D139 (chain: D42 → D126). *Covered* `contract/test_inc.py::test_inc_2_a_keys_class_is_the_net_difference_with_upstream_now`; `contract/test_inc.py::test_inc_2_the_parameter_holds_the_changed_rows_and_the_batch_says_which`; `server/test_owed.py::test_runs_keep_the_record_equal_to_the_observed_set`; `ObservedSet.tla` OwedExact.
 
 **INC-3. Changes that cancel out between two runs deliver nothing.**
 k4 is added and removed again before `copy` runs: `copy` gets nothing
 about k4 and is not stale. A key removed and added back is `updated`.
-*From* D44, D126. *Covered* `server/test_staleness.py::test_a_key_added_and_removed_past_the_read_changes_nothing`.
+*From* D44, D126. *Covered* `contract/test_inc.py::test_inc_3_a_key_added_and_removed_between_two_runs_delivers_nothing`; `contract/test_inc.py::test_inc_3_a_key_removed_and_added_back_is_updated`; `server/test_staleness.py::test_a_key_added_and_removed_past_the_read_changes_nothing`.
 
 **INC-4. An update reverted to the processed version is still delivered, as updated.**
 `feed`'s k1 goes @1 → @2 → @1 before `items` runs: `items` gets k1 as
@@ -98,18 +98,18 @@ key changed since it was processed is known only to have changed.
 `tally` = what it held + `len(added)` − `len(removed)`. After any history
 of commits, `keys=` runs, cancels and failures, once a default run has
 nothing left to owe, the count equals the number of keys upstream offers.
-*From* D44, D126, D139. *Covered* `server/test_changes.py::test_a_total_kept_from_the_changes_stays_exact`; `server/test_staleness.py::test_a_count_kept_from_its_batches_stays_exact_through_a_keys_run`; every `server/test_observed_histories.py` test (asserts the count); `ObservedSet.tla` CountExact, TallyExact.
+*From* D44, D126, D139. *Covered* `contract/test_inc.py::test_inc_5_a_count_kept_from_its_batches_stays_exact_through_a_keys_run`; `contract/test_inc.py::test_inc_5_a_count_kept_from_the_classes_alone_stays_exact_through_any_history`; `server/test_changes.py::test_a_total_kept_from_the_changes_stays_exact`; every `server/test_observed_histories.py` test (asserts the count); `ObservedSet.tla` CountExact, TallyExact.
 
 **INC-6. Every change is delivered once, even one made during a run.**
 `keys=(k1)` processes k1@1; then k1 → @2 (or k3 is added, or k1 removed);
 two default runs follow. The change arrives exactly once, in the first.
-*From* D126, D139; review A19 R1, R2. *Covered* `server/test_observed_histories.py::test_a19_r1_r2_a_change_during_a_run_is_counted_once` (update, add, remove); `server/test_changes.py::test_a_change_during_a_full_pass_is_counted_once`; `Positions.tla` DeliveredOnce (positions-era model).
+*From* D126, D139; review A19 R1, R2. *Covered* `contract/test_inc.py::test_inc_6_a_change_after_a_keys_run_is_delivered_once`; `contract/test_inc.py::test_inc_6_a_change_made_during_a_run_is_delivered_once` (update, add, remove each); `server/test_observed_histories.py::test_a19_r1_r2_a_change_during_a_run_is_counted_once` (update, add, remove); `server/test_changes.py::test_a_change_during_a_full_pass_is_counted_once`; `Positions.tla` DeliveredOnce (positions-era model).
 
 **INC-7. A delivered removal is final.**
 Once `tally` was given k5's removal, k5 coming back, even at the version
 it once had, is an `added`. `feed` removes k1; `keys=(k1)` processes the
 removal; `feed` restores k1@1: the next run owes k1 as added.
-*From* D126, D133; review A19 R3, A27 R9. *Covered* `server/test_observed_histories.py::test_a27_r9_a_removal_restored_at_its_version_is_owed_its_add`; `server/test_observed_histories.py::test_a19_r3_a_delivered_removal_is_not_forgotten`.
+*From* D126, D133; review A19 R3, A27 R9. *Covered* `contract/test_inc.py::test_inc_7_a_removal_restored_at_its_version_is_owed_its_add`; `contract/test_inc.py::test_inc_7_a_delivered_removal_is_never_delivered_again`; `server/test_observed_histories.py::test_a27_r9_a_removal_restored_at_its_version_is_owed_its_add`; `server/test_observed_histories.py::test_a19_r3_a_delivered_removal_is_not_forgotten`.
 
 **INC-8. Each batch reads upstream as it is when that batch starts; nothing goes back in time.**
 A run over k1, k2 with `batch_size=1`: batch 1 reads k1; k2 changes; batch
@@ -122,7 +122,7 @@ Batch 1 commits k1; k1 changes while batch 2 runs: the run ends, the
 partition is stale, the next run delivers k1 as updated. A key removed
 during a run, before its batch, is delivered once, as whatever it is when
 its batch reads.
-*From* D139. *Covered* `server/test_changes.py::test_a_key_removed_during_a_full_pass_is_counted_out_once`; `server/test_observed_histories.py::test_a19_r5_an_early_removal_from_a_current_only_source_is_delivered_once`.
+*From* D139. *Covered* `contract/test_inc.py::test_inc_9_a_change_behind_a_runs_batches_is_owed_by_the_next_run`; `contract/test_inc.py::test_inc_9_a_key_removed_during_a_run_before_its_batch_is_delivered_once`; `server/test_observed_histories.py::test_a19_r5_an_early_removal_from_a_current_only_source_is_delivered_once`.
 
 **INC-10. What a producer receives for an incremental input.**
 `ctx.batch[input]`: `added`, `updated`, `removed`, `unchanged` (keys
@@ -133,31 +133,31 @@ and unchanged; removed keys have none, and `rows` is the parameter),
 `count`), `reset` (the first batch of a full run, SEL-9), `upstream` (its
 output; for an unkeyed upstream the commit range). A run of 3 batches
 gives `index` 0, 1, 2 and `final` only on the last.
-*From* D44, D140 (4), D157. *Covered* `server/test_engine.py::test_a_batch_says_where_it_sits_in_its_pass`; `server/test_engine.py::test_the_batch_plan_is_an_estimate_but_final_is_not`. `reset`: `server/test_selection.py::test_sel_9_a_full_runs_first_batch_says_reset_and_load_returns_what_is_materialized`.
+*From* D44, D140 (4), D157. *Covered* `contract/test_inc.py::test_inc_10_a_batch_says_where_it_sits_in_its_run`; `contract/test_inc.py::test_inc_10_final_is_on_the_last_real_batch_whatever_the_plan`; `contract/test_inc.py::test_inc_10_a_batch_says_each_keys_class_and_rows_come_for_all_but_the_removed`; `server/test_engine.py::test_a_batch_says_where_it_sits_in_its_pass`; `server/test_engine.py::test_the_batch_plan_is_an_estimate_but_final_is_not`. `reset`: `contract/test_sel.py::test_sel_9_a_full_runs_first_batch_says_reset_and_load_returns_what_is_materialized`.
 
 **INC-11. `ctx.load()` returns the asset's own output as materialized; `None` before its first commit.**
 `tally`'s second batch reads `{"rows": 2}` committed by its first, and adds
 to it.
 In a full run too: batch 0 says `reset`, and `ctx.load()` still returns
 what was materialized before it (SEL-9).
-*From* D44, D166 (chain: D141 → D166); Q1. *Covered* `server/test_selection.py::test_inc_11_ctx_load_returns_the_output_as_materialized`; the full-run case `server/test_selection.py::test_sel_9_a_full_runs_first_batch_says_reset_and_load_returns_what_is_materialized`; exercised by `tally` in every `server/test_observed_histories.py` test.
+*From* D44, D166 (chain: D141 → D166); Q1. *Covered* `contract/test_inc.py::test_inc_11_ctx_load_returns_the_output_as_materialized`; the full-run case `contract/test_sel.py::test_sel_9_a_full_runs_first_batch_says_reset_and_load_returns_what_is_materialized`; exercised by `tally` in every `server/test_observed_histories.py` test.
 
 **INC-12. A task walks what it owes in key order, `batch_size` keys a commit.**
 Seven owed keys, `batch_size=3`: three batches, three commits. Default
 `batch_size` is 10,000 for every incremental input.
-*From* D111, D115, D155. *Covered* `server/test_each.py::test_concurrency_and_batches`; `server/test_owed.py::test_a_batch_takes_its_size_of_owed_keys_and_covers_up_to_the_last`; `server/test_engine.py::test_incremental_batching_and_more`.
+*From* D111, D115, D155. *Covered* `contract/test_inc.py::test_inc_12_a_task_walks_what_it_owes_in_key_order_batch_size_keys_a_commit`; `contract/test_inc.py::test_inc_12_the_default_batch_size_is_ten_thousand_keys`; `server/test_each.py::test_concurrency_and_batches`; `server/test_owed.py::test_a_batch_takes_its_size_of_owed_keys_and_covers_up_to_the_last`; `server/test_engine.py::test_incremental_batching_and_more`.
 
 **INC-13. An unkeyed incremental upstream delivers the commits after the last one read; its reset is delivered as a start-over.**
 `events` (unkeyed, append) commits 0–9; `digest` read through 6; its next
 batch gets commits 7–9 (`upstream.commits`). If `events` is run `full`,
 `digest` starts over rather than receiving the reset as a delta.
-*From* F8. *Covered* `server/test_sim_found.py::test_an_unkeyed_upstream_reset_right_after_a_pass_is_delivered_in_full`; `server/test_sim_found.py::test_an_earlier_lifes_objects_are_never_read`.
+*From* F8. *Covered* `contract/test_inc.py::test_inc_13_an_unkeyed_upstream_delivers_the_commits_after_the_last_read`; `server/test_sim_found.py::test_an_unkeyed_upstream_reset_right_after_a_pass_is_delivered_in_full`; `server/test_sim_found.py::test_an_earlier_lifes_objects_are_never_read`.
 
 **INC-14. Writing is changing; writing nothing wakes nothing.**
 `items` returns an empty `Patch`: no commit, no `OnChange`. It writes the
 same rows again: a new version, and consumers process them again
 (accepted: over-eager, never wrong).
-*From* `versions.md` §1 (Erwin). *Covered* `server/test_engine.py::test_a_poll_that_writes_nothing_wakes_nothing`; `server/test_keys.py::test_every_write_is_a_change_and_an_empty_patch_none`; `server/test_model.py::test_content_written_again_is_a_change`; `server/test_matrix.py::test_a_value_written_again_is_a_new_version_its_readers_reread`.
+*From* `versions.md` §1 (Erwin). *Covered* `contract/test_inc.py::test_inc_14_writing_nothing_commits_nothing_and_wakes_nothing`; `contract/test_inc.py::test_inc_14_writing_the_same_rows_again_is_a_change_its_consumers_process`; `server/test_engine.py::test_a_poll_that_writes_nothing_wakes_nothing`; `server/test_keys.py::test_every_write_is_a_change_and_an_empty_patch_none`; `server/test_model.py::test_content_written_again_is_a_change`; `server/test_matrix.py::test_a_value_written_again_is_a_new_version_its_readers_reread`.
 
 ## RUN — runs, tasks, batches, attempts, retries, cancel
 
@@ -258,56 +258,56 @@ upstream; `upstream=True` builds the closure first. A selection past
 `copy` holds k1, k2, k3; k1 and k2 changed upstream. `keys=(k1)` delivers
 k1 as updated; k2 and k3 are untouched, and k2 is still owed. A named key
 already processed as it is comes as `unchanged`.
-*From* D140 (3), D126 (chain: D36 → D41 → D42 → D126 → D140). *Covered* `server/test_engine.py::test_run_keys_override`; `server/test_owed.py::test_a_named_key_held_as_it_is_is_unchanged`; `server/test_staleness.py::test_a_keys_run_never_touches_a_key_it_does_not_name`; `server/test_staleness.py::test_a_keys_run_makes_each_named_key_match_its_upstream`.
+*From* D140 (3), D126 (chain: D36 → D41 → D42 → D126 → D140). *Covered* `contract/test_sel.py::test_sel_1_a_keys_run_loads_exactly_the_named_keys_and_never_touches_another`; `contract/test_sel.py::test_sel_1_a_keys_list_loads_the_keys_it_names_and_all_every_key`; `server/test_owed.py::test_a_named_key_held_as_it_is_is_unchanged`; `server/test_staleness.py::test_a_keys_run_never_touches_a_key_it_does_not_name`; `server/test_staleness.py::test_a_keys_run_makes_each_named_key_match_its_upstream`.
 
 **SEL-2. A named key upstream lacks is a removal if held, else nothing.**
 `keys=(k9)` where k9 never existed: nothing delivered, nothing recorded.
 `keys=(k1)` after `feed` removed k1: k1 delivered as removed.
-*From* D126. *Covered* `server/test_observed_histories.py::test_a26_n2_selections_around_a_pattern_change` (`absent key`); `server/test_observed_histories.py::test_a27_r9_a_removal_restored_at_its_version_is_owed_its_add`.
+*From* D126. *Covered* `contract/test_sel.py::test_sel_2_a_named_key_upstream_never_had_delivers_nothing`; `contract/test_sel.py::test_sel_2_a_named_key_upstream_removed_is_delivered_as_removed`; `server/test_observed_histories.py::test_a26_n2_selections_around_a_pattern_change` (`absent key`); `server/test_observed_histories.py::test_a27_r9_a_removal_restored_at_its_version_is_owed_its_add`.
 
 **SEL-3. What a `keys=` run delivered is not delivered again.**
 `keys=(k1)` delivers k1's update; the next default run delivers k2's and
 not k1's.
-*From* D126, D140 (3). *Covered* `server/test_staleness.py::test_a_keys_run_on_an_incremental_asset_delivers_each_change_once`; `server/test_observed_histories.py::test_a19_r4_a_selection_under_new_patterns_is_counted_once`.
+*From* D126, D140 (3). *Covered* `contract/test_sel.py::test_sel_3_what_a_keys_run_delivered_is_not_delivered_again`; `server/test_staleness.py::test_a_keys_run_on_an_incremental_asset_delivers_each_change_once`; `server/test_observed_histories.py::test_a19_r4_a_selection_under_new_patterns_is_counted_once`.
 
 **SEL-4. A `keys=` run never clears what it did not process.**
 After `keys=(k1)`, `copy` stays stale for k2 until a run processes k2.
-*From* D140 (3) (chain: D36 → D140). *Covered* `server/test_observed_histories.py::test_a19_r3_a_delivered_removal_is_not_forgotten`; `server/test_staleness.py::test_a_key_gone_upstream_stays_stale_through_a_keys_run_that_does_not_name_it`.
+*From* D140 (3) (chain: D36 → D140). *Covered* `contract/test_sel.py::test_sel_4_a_keys_run_leaves_owed_what_it_did_not_process`; `contract/test_sel.py::test_sel_4_a_key_gone_upstream_stays_owed_through_a_keys_run_that_does_not_name_it`; `server/test_observed_histories.py::test_a19_r3_a_delivered_removal_is_not_forgotten`; `server/test_staleness.py::test_a_key_gone_upstream_stays_stale_through_a_keys_run_that_does_not_name_it`.
 
 **SEL-5. Named keys go through the input's patterns.**
 `checks` takes `include=["k1"]`; `keys=(k1, k2)` loads k1 only; a held k2
 is delivered as removed.
-*From* `per-key-processing.md` §16. *Covered* `server/test_each_review.py::test_7_a_keys_override_obeys_the_patterns`.
+*From* `per-key-processing.md` §16. *Covered* `contract/test_sel.py::test_sel_5_named_keys_go_through_the_inputs_patterns`; `contract/test_sel.py::test_sel_5_a_keys_override_obeys_the_patterns`.
 
 **SEL-6. A long `keys=` list goes `batch_size` keys a commit, `concurrency` at once.**
 Ten named keys, `batch_size=4`: three batches, three commits; the run
 ends with the ten processed.
-*From* D111 (chain: D93 (3) → D111); review A19 R6. *Covered* `server/test_observed_histories.py::test_a19_r6_keys_runs_go_batch_size_keys_a_commit`; `server/test_each.py::test_a_keys_selection_runs_batch_size_keys_at_a_time`.
+*From* D111 (chain: D93 (3) → D111); review A19 R6. *Covered* `contract/test_sel.py::test_sel_6_a_long_keys_list_goes_batch_size_keys_a_commit`; `contract/test_sel.py::test_sel_6_a_keys_list_runs_batch_size_keys_at_a_time_concurrency_at_once`; `server/test_observed_histories.py::test_a19_r6_keys_runs_go_batch_size_keys_a_commit`.
 
 **SEL-7. `keys={input: "all"}` loads every key under the patterns without starting over.**
 Owed keys in their class, the rest `unchanged`; nothing is reset.
 `keys={"rates": "all"}`.
-*From* D140 (3); Q3. *Covered* `server/test_selection.py::test_sel_7_keys_all_loads_every_key_without_starting_over`; `server/test_engine.py::test_run_keys_override`.
+*From* D140 (3); Q3. *Covered* `contract/test_sel.py::test_sel_7_keys_all_loads_every_key_without_starting_over`; `contract/test_sel.py::test_sel_1_a_keys_list_loads_the_keys_it_names_and_all_every_key`.
 
 **SEL-8. A full run owes every upstream key under the patterns; a plain consumer starts over.**
 `mode="full"`, or an automatic full run (CHG-1, RST-1). A full run is the
 run's mode, never a `keys=` value (Q3: `keys={input: "full"}` is refused).
 `tally`'s first batch starts its count from zero; its cursor is `None`;
 the run continues batch by batch across attempts.
-*From* D141, D166, D140. *Covered* `server/test_selection.py::test_sel_8_a_full_run_owes_every_key_and_a_plain_consumer_starts_over`; `server/test_selection.py::test_sel_8_keys_full_is_no_longer_a_full_run`; `server/test_engine.py::test_a_full_run_starts_its_record_over`; `server/test_engine.py::test_result_cursor_and_omitted_output`; `server/test_each_review.py::test_a_full_run_reads_every_key_once_in_batches`.
+*From* D141, D166, D140. *Covered* `contract/test_sel.py::test_sel_8_a_full_run_owes_every_key_and_a_plain_consumer_starts_over`; `contract/test_sel.py::test_sel_8_keys_full_is_refused_a_full_run_is_the_runs_mode`; `contract/test_sel.py::test_sel_8_a_definition_change_makes_the_next_run_a_full_run`; `contract/test_sel.py::test_sel_8_a_full_run_goes_on_batch_by_batch_across_attempts`; `contract/test_sel.py::test_sel_8_a_full_runs_producer_starts_with_no_cursor`; `server/test_engine.py::test_a_full_run_starts_its_record_over`; `server/test_engine.py::test_result_cursor_and_omitted_output`; `server/test_each_review.py::test_a_full_run_reads_every_key_once_in_batches`.
 
 **SEL-9. A full run's first batch says `batch.reset`; `ctx.load()` still returns what is materialized.**
 `tally` sees `batch.reset == True` on batch 0 and ignores `{"rows": 7}`
 from `ctx.load()`; later batches build on what batch 0 committed.
 Per-key producers never see `reset`.
-*From* D166 (chain: D141 → D166; D140 (4) drops `Batch.full`); Q1. *Covered* `server/test_selection.py::test_sel_9_a_full_runs_first_batch_says_reset_and_load_returns_what_is_materialized`.
+*From* D166 (chain: D141 → D166; D140 (4) drops `Batch.full`); Q1. *Covered* `contract/test_sel.py::test_sel_9_a_full_runs_first_batch_says_reset_and_load_returns_what_is_materialized`; `contract/test_sel.py::test_sel_9_a_per_key_producer_never_sees_reset`.
 
 **SEL-10. A per-key consumer's full run keeps its outputs readable and removes what upstream lacks.**
 `checks` holds k1, k2, x9; upstream has k1, k2, k3. The full run calls k1
 and k2 (updated), k3 (added) and drops x9 (removed). A key that fails
 keeps its last good output. Cancelled midway, the rest stays owed and
 readable.
-*From* D141, D166. *Covered* `server/test_owed.py::test_a_held_base_owes_each_held_key_an_update_or_a_removal`; `server/test_each_review.py::test_2_a_full_run_removes_what_upstream_no_longer_has`; `server/test_each_review.py::test_2_a_full_run_keeps_a_failing_keys_last_good_output`; `server/test_complete.py::test_a_per_key_full_run_canceled_midway_is_complete`.
+*From* D141, D166. *Covered* `contract/test_sel.py::test_sel_10_a_per_key_full_run_calls_every_upstream_key_and_removes_what_upstream_lacks`; `contract/test_sel.py::test_sel_10_a_full_run_keeps_a_failing_keys_last_good_output`; `contract/test_sel.py::test_sel_10_a_per_key_full_run_canceled_midway_leaves_the_rest_owed_and_readable`; `server/test_owed.py::test_a_held_base_owes_each_held_key_an_update_or_a_removal`; `server/test_each_review.py::test_2_a_full_run_removes_what_upstream_no_longer_has`; `server/test_complete.py::test_a_per_key_full_run_canceled_midway_is_complete`.
 
 **SEL-11. A full run reaches its producer even when it owes no key.**
 `copy` (plain) over an upstream now empty, or with patterns taking

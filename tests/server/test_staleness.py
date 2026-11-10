@@ -679,26 +679,6 @@ async def test_a_keys_run_on_an_incremental_asset_delivers_each_change_once(stat
     assert outside.delivered == set(), "the next default run has nothing new"
 
 
-async def test_a_count_kept_from_its_batches_stays_exact_through_a_keys_run(state, tmp_path):
-    """K44's example through a keys= run: `tally` = what it held +
-    added - removed. k4 added and k1 removed; keys=(k4) delivers k4 as added;
-    the next default run delivers k1's removal alone, never k4 again: the
-    tally equals `items`' count after each run."""
-
-    engine, outside = await _built(state, tmp_path, {"k1": "1", "k2": "1", "k3": "1"})
-    p = project(tmp_path, outside)
-
-    async def tally(keys=None):
-        detail = await drive(engine, await engine.submit(["tally"], keys=keys))
-        assert detail["request"]["status"] == "succeeded", detail["request"]
-        return (await value_content(engine, p, "tally"))["rows"]
-
-    assert await tally() == 3
-    await _change(engine, outside, upserts=["k4"], removes=["k1"])
-    assert await tally({"items": ["k4"]}) == 4  # k1's removal not read yet
-    assert await tally() == 3 == len(outside.feed)
-
-
 async def test_a_non_each_keyed_outputs_keys_go_stale_together(state, tmp_path):
     """K43: every key of `copy` depends on the whole of `items` under its
     patterns, so a change of `k1` alone makes `k1`, `k2` and `k3` stale; a
