@@ -335,12 +335,12 @@ starts over (SEL-8).
 **CHG-2. A code change alone is a new deploy, not a definition change.**
 Editing a helper module serves a new deploy: nothing goes stale; failed
 per-key keys get one more try (KEY-3).
-*From* D174; `per-key-processing.md` §13. *Covered* `sdk/test_build.py::test_the_build_is_the_code_the_project_runs`; `server/test_each.py::test_a_failed_key_gets_one_try_per_deploy`.
+*From* D174; `per-key-processing.md` §13. *Covered* `contract/test_chg.py::test_chg_2_a_code_change_alone_is_a_new_deploy_not_a_definition_change`; `contract/test_dep.py::test_dep_1_the_build_is_the_code_the_project_runs`; `server/test_each.py::test_a_failed_key_gets_one_try_per_deploy`.
 
 **CHG-3. A batch planned before a definition change or an upstream reset does not commit.**
 `copy`'s attempt is launched as version 1; version 2 is deployed before
 it settles: it commits nothing, and its keys stay owed under version 2.
-*From* D139 (the commit check); `ObservedSet.tla` counterexample 3. *Covered* `server/test_fence.py::test_an_attempt_launched_before_a_version_bump_does_not_commit`; `server/test_sim_found.py::test_an_attempt_launched_before_its_output_moved_commits_nothing`.
+*From* D139 (the commit check); `ObservedSet.tla` counterexample 3. *Covered* `contract/test_chg.py::test_chg_3_a_batch_launched_before_a_definition_change_does_not_commit`; `contract/test_chg.py::test_chg_3_a_batch_launched_before_an_upstream_reset_does_not_commit`; `server/test_fence.py::test_an_attempt_launched_before_a_version_bump_does_not_commit`; `server/test_sim_found.py::test_an_attempt_launched_before_its_output_moved_commits_nothing`.
 
 **CHG-4. A pattern change is an input change: the next run owes the difference in membership.**
 `tally` has `include=["k1"]`; a deploy widens it to `"k*"`: stale ("input
@@ -353,45 +353,45 @@ something owed (AUT-4).
 **CHG-5. A first `include` removes what it leaves out.**
 No include over `keep/a`, `drop/b`; a deploy adds `include="keep/*"`:
 `drop/b` is owed a removal.
-*From* D126; review A27 R3. *Covered* `server/test_observed_histories.py::test_a27_r3_a_first_include_owes_the_removal_of_what_it_leaves_out`.
+*From* D126; review A27 R3. *Covered* `contract/test_chg.py::test_chg_5_a_first_include_removes_what_it_leaves_out`; `server/test_observed_histories.py::test_a27_r3_a_first_include_owes_the_removal_of_what_it_leaves_out`.
 
 **CHG-6. A key added upstream while the patterns exclude it is owed nothing.**
 Patterns narrow from `keep/*, drop/*` to `keep/*`; `drop/b` is then added
 upstream: nothing.
-*From* D126; review A27 R4. *Covered* `server/test_observed_histories.py::test_a27_r4_an_add_during_a_narrowing_is_owed_nothing`.
+*From* D126; review A27 R4. *Covered* `contract/test_chg.py::test_chg_6_a_key_added_while_the_patterns_exclude_it_is_owed_nothing`; `server/test_observed_histories.py::test_a27_r4_an_add_during_a_narrowing_is_owed_nothing`.
 
 **CHG-7. Widening to a key that never existed owes nothing.**
 `include=["k1"]` → `["k1", "k9"]`, no k9 upstream: not stale.
-*From* D126; review A27 R10. *Covered* `server/test_observed_histories.py::test_a27_r10_widening_to_a_key_that_never_existed_changes_no_debt`.
+*From* D126; review A27 R10. *Covered* `contract/test_chg.py::test_chg_7_widening_to_a_key_that_never_existed_owes_nothing`; `server/test_observed_histories.py::test_a27_r10_widening_to_a_key_that_never_existed_changes_no_debt`.
 
 **CHG-8. A `keys=` run around a pattern change is counted once.**
 Widen `k1` → `k*`, then `keys=(k2)`, then a default run: k2 is added once;
 the count ends at 3 for k1, k2, k3.
-*From* D126; review A19 R4, A26 N2, N3. *Covered* `server/test_observed_histories.py::test_a26_n2_selections_around_a_pattern_change` (repeated, absent key, partial); `server/test_observed_histories.py::test_a26_n3_a_selection_before_an_old_pattern_delta_is_kept`; `server/test_changes.py::test_a_selection_during_a_pattern_change_is_counted_once`.
+*From* D126; review A19 R4, A26 N2, N3. *Covered* `contract/test_chg.py::test_chg_8_a_keys_run_around_a_pattern_change_is_counted_once`; `contract/test_chg.py::test_chg_8_a_keys_run_after_an_unprocessed_change_and_a_widening_is_counted_once`; `server/test_observed_histories.py::test_a26_n2_selections_around_a_pattern_change` (repeated, absent key, partial); `server/test_observed_histories.py::test_a26_n3_a_selection_before_an_old_pattern_delta_is_kept`; `server/test_changes.py::test_a_selection_during_a_pattern_change_is_counted_once`.
 
 **CHG-9. A change to a key a consumer excludes makes nothing stale there.**
 `items` commits only `x1`, which `copy` excludes: `copy` stays fresh.
 `filtered` takes k1 of `checks`; k2 changes: `filtered` stays fresh, and
 k1 changing makes it stale.
-*From* D39; review A19 R10. *Covered* `server/test_staleness.py::test_a_commit_of_excluded_keys_alone_leaves_their_consumers_fresh`; `server/test_observed_histories.py::test_a19_r10_an_excluded_stale_upstream_key_does_not_propagate`; `server/test_staleness.py::test_an_each_consumer_is_not_upstream_stale_for_a_key_it_excludes`.
+*From* D39; review A19 R10. *Covered* `contract/test_chg.py::test_chg_9_a_commit_of_keys_its_consumers_exclude_leaves_them_fresh`; `contract/test_chg.py::test_chg_9_a_per_key_consumer_is_fresh_while_only_keys_it_excludes_are_stale_upstream`; `server/test_staleness.py::test_a_commit_of_excluded_keys_alone_leaves_their_consumers_fresh`; `server/test_observed_histories.py::test_a19_r10_an_excluded_stale_upstream_key_does_not_propagate`; `server/test_staleness.py::test_an_each_consumer_is_not_upstream_stale_for_a_key_it_excludes`.
 
 **CHG-10. A moved whole or dep input owes every key processed under its old version.**
 `checks` processed k1, k2 under `factor=w1`; `factor` → `w2`: both owed
 updates, reason "input changed" (not "definition changed").
 `keys=(k1)` processes k1 under `w2`: k2 still owed. `factor` back to `w1`:
 now k1 is owed and k2 is not.
-*From* D40, D126; review A19 R7, A27 R1. *Covered* `server/test_observed_histories.py::test_a19_r7_a_shared_input_move_owes_every_key_its_context`; `server/test_staleness.py::test_a_shared_input_change_makes_every_key_stale`; `server/test_staleness.py::test_a_dep_change_is_an_input_change_owing_every_key`.
+*From* D40, D126; review A19 R7, A27 R1. *Covered* `contract/test_chg.py::test_chg_10_a_moved_whole_input_owes_every_key_processed_under_its_old_version`; `server/test_observed_histories.py::test_a19_r7_a_shared_input_move_owes_every_key_its_context`; `server/test_staleness.py::test_a_shared_input_change_makes_every_key_stale`; `server/test_staleness.py::test_a_dep_change_is_an_input_change_owing_every_key`.
 
 **CHG-11. A whole input written again with the same content is a change.**
 `settings` is rewritten identically: a new version; its readers owe a
 rerun.
-*From* `versions.md` §7. *Covered* `server/test_matrix.py::test_a_value_written_again_is_a_new_version_its_readers_reread`.
+*From* `versions.md` §7. *Covered* `contract/test_chg.py::test_chg_11_a_whole_input_written_again_with_the_same_content_is_a_change`; `server/test_matrix.py::test_a_value_written_again_is_a_new_version_its_readers_reread`.
 
 **CHG-12. Patterns match keys by path segments.**
 `**` crosses `/`, `*` does not; `Regex(…)` too. `exclude="k1*"` is one
 pattern, not its characters; `**/*old*` matches `Gold_ore.csv`, so word
 rules want segment-anchored patterns.
-*From* F1; `per-key-processing.md` §11. *Covered* `sdk/test_patterns.py::test_globs`; `sdk/test_patterns.py::test_one_exclude_pattern_is_a_pattern_not_its_characters`; `sdk/test_patterns.py::test_a_key_is_taken_when_an_include_and_no_exclude_matches`.
+*From* F1; `per-key-processing.md` §11. *Covered* `contract/test_chg.py::test_chg_12_globs_match_by_path_segments`; `contract/test_chg.py::test_chg_12_one_exclude_pattern_is_a_pattern_not_its_characters`; `contract/test_chg.py::test_chg_12_a_word_rule_wants_a_segment_anchored_pattern`; `contract/test_chg.py::test_chg_12_a_glob_matches_as_the_reference_does`; `contract/test_chg.py::test_chg_12_a_key_is_taken_when_an_include_and_no_exclude_matches`.
 
 ## RST — upstream resets, removals, moves and renames
 
@@ -400,41 +400,41 @@ rules want segment-anchored patterns.
 its first write is whole; every consumer owes a full run (stale "input
 changed"); its own inputs are read in full. Nothing is copied; the old
 store's data is cleaned up (CLN-6).
-*From* D10. *Covered* `server/test_observed_histories.py::test_a27_r7_an_upstream_reset_owes_a_full_run`; `server/test_sim_found.py::test_a_key_a_moved_output_dropped_leaves_its_consumer`; `sim/test_replays.py::test_f9_a_key_dropped_by_a_moved_output_leaves_its_consumers`; `sim/test_replays.py::test_f13_a_key_removed_after_a_store_move_leaves_its_consumers`.
+*From* D10. *Covered* `contract/test_rst.py::test_rst_1_moving_an_output_to_another_store_makes_it_a_new_output`; `contract/test_rst.py::test_rst_1_a_key_the_moved_outputs_first_write_leaves_out_leaves_its_consumers`; `contract/test_rst.py::test_rst_1_a_key_removed_after_a_move_leaves_its_consumers`; `server/test_observed_histories.py::test_a27_r7_an_upstream_reset_owes_a_full_run`; `server/test_sim_found.py::test_a_key_a_moved_output_dropped_leaves_its_consumer`; `sim/test_replays.py::test_f9_a_key_dropped_by_a_moved_output_leaves_its_consumers`; `sim/test_replays.py::test_f13_a_key_removed_after_a_store_move_leaves_its_consumers`.
 
 **RST-2. Moving away and back is two resets.**
 `items` moves to Postgres and back with nothing written between: it is
 reset all the same, and keeps no key from before.
-*From* D10; F17. *Covered* `server/test_sim_found.py::test_a_move_and_back_with_no_write_between_resets`; `sim/test_replays.py::test_f17_an_output_moved_away_and_back_keeps_its_keys`.
+*From* D10; F17. *Covered* `contract/test_rst.py::test_rst_2_moving_away_and_back_is_two_resets`; `server/test_sim_found.py::test_a_move_and_back_with_no_write_between_resets`; `sim/test_replays.py::test_f17_an_output_moved_away_and_back_keeps_its_keys`.
 
 **RST-3. An asset removed and declared again starts a new life.**
 `copy` removed, then declared again: no cursor, no processed keys, no
 failing keys from before. An attempt of the first life, still running,
 commits nothing into the second. Same for a job.
-*From* F12, F19, F21. *Covered* `server/test_sim_found.py::test_a_name_removed_and_added_back_starts_over`; `server/test_sim_found.py::test_an_attempt_of_a_removed_and_readded_asset_stays_in_its_life`; `server/test_sim_found.py::test_a_job_added_back_does_not_take_its_first_lifes_commit`; sim `a_life_is_its_own`.
+*From* F12, F19, F21. *Covered* `contract/test_rst.py::test_rst_3_an_asset_removed_and_declared_again_starts_a_new_life`; `contract/test_rst.py::test_rst_3_a_per_key_asset_declared_again_has_no_failing_keys_from_before`; `contract/test_rst.py::test_rst_3_an_attempt_of_the_first_life_commits_nothing_into_the_second`; `contract/test_rst.py::test_rst_3_a_job_declared_again_does_not_take_its_first_lifes_commit`; `server/test_sim_found.py::test_a_name_removed_and_added_back_starts_over`; `server/test_sim_found.py::test_an_attempt_of_a_removed_and_readded_asset_stays_in_its_life`; `server/test_sim_found.py::test_a_job_added_back_does_not_take_its_first_lifes_commit`; sim `a_life_is_its_own`.
 
 **RST-4. A rename with `aliases=` keeps everything.**
 `copy` → `mirror` (`aliases=["copy"]`): heads, keys, cursor, what each
 input processed, failing keys, owed repairs and cleanups, automation
 state all follow; consumers continue incrementally. Data stays where it
 is: `mirror`'s new partition b is written under `copy/`.
-*From* D85 (1). *Covered* `server/test_keys.py::test_renamed_asset_keeps_its_state`; `server/test_model.py::test_a_rename_moves_a_scopes_record_whole`; `server/test_each_review.py::test_8_a_renamed_asset_keeps_its_failures`; `server/test_lifecycle.py::test_a_renamed_asset_keeps_what_its_scope_owes`; `server/test_lifecycle.py::test_a_renamed_outputs_new_partitions_go_where_its_old_ones_are`; `server/test_lineage_reads.py::test_a_renamed_postgres_output_stays_readable`.
+*From* D85 (1). *Covered* `contract/test_rst.py::test_rst_4_a_rename_with_aliases_keeps_its_heads_keys_and_progress`; `contract/test_rst.py::test_rst_4_a_renamed_per_key_asset_keeps_its_failing_and_processed_keys`; `contract/test_rst.py::test_rst_4_a_renamed_job_keeps_its_cursor`; `contract/test_rst.py::test_rst_4_a_renamed_outputs_data_stays_where_it_is`; `contract/test_rst.py::test_rst_4_a_renamed_postgres_output_stays_in_its_table`; `server/test_keys.py::test_renamed_asset_keeps_its_state`; `server/test_model.py::test_a_rename_moves_a_scopes_record_whole`; `server/test_each_review.py::test_8_a_renamed_asset_keeps_its_failures`; `server/test_lifecycle.py::test_a_renamed_asset_keeps_what_its_scope_owes`; `server/test_lifecycle.py::test_a_renamed_outputs_new_partitions_go_where_its_old_ones_are`; `server/test_lineage_reads.py::test_a_renamed_postgres_output_stays_readable`.
 
 **RST-5. An attempt launched before a rename settles under the new name.**
 `copy`'s attempt runs; `copy` is renamed `mirror`: the attempt commits
 into `mirror` and its run ends. Renamed onto an earlier life's name, the
 earlier life's attempt still settles.
-*From* F5, F34. *Covered* `server/test_sim_found.py::test_an_attempt_launched_before_a_rename_settles`; `server/test_fence.py::test_a_rename_moves_a_launched_attempt_with_its_scope`; `sim/test_replays.py::test_f34_a_rename_onto_an_earlier_lifes_name_keeps_its_attempt_settleable`.
+*From* F5, F34. *Covered* `contract/test_rst.py::test_rst_5_an_attempt_launched_before_a_rename_settles_under_the_new_name`; `contract/test_rst.py::test_rst_5_a_rename_onto_an_earlier_lifes_name_keeps_its_attempt_settleable`; `server/test_sim_found.py::test_an_attempt_launched_before_a_rename_settles`; `server/test_fence.py::test_a_rename_moves_a_launched_attempt_with_its_scope`; `sim/test_replays.py::test_f34_a_rename_onto_an_earlier_lifes_name_keeps_its_attempt_settleable`.
 
 **RST-6. A removed asset's queued work is cancelled, saying why.**
 A deploy drops `doomed`: its queued tasks are cancelled with the reason,
 its runs end, and a launched attempt is not retried.
-*From* F4. *Covered* `server/test_matrix.py::test_a_removed_asset_takes_its_queued_work_with_it`; `server/test_sim_found.py::test_a_removed_assets_last_attempt_ends_its_run`; `server/test_fence.py::test_a_removed_assets_launched_attempt_is_not_retried`.
+*From* F4. *Covered* `contract/test_rst.py::test_rst_6_a_removed_assets_queued_work_is_cancelled_saying_why`; `contract/test_rst.py::test_rst_6_a_removed_assets_last_attempt_ends_its_run`; `contract/test_rst.py::test_rst_6_a_removed_assets_launched_attempt_is_not_retried`; `server/test_matrix.py::test_a_removed_asset_takes_its_queued_work_with_it`; `server/test_sim_found.py::test_a_removed_assets_last_attempt_ends_its_run`; `server/test_fence.py::test_a_removed_assets_launched_attempt_is_not_retried`.
 
 **RST-7. An upstream reset drops a per-key consumer's failing keys for that input.**
 `items` moves; `checks` had k1 failing: k1's failure goes at the deploy
 (it failed against keys that are no longer the input's).
-*From* `per-key-processing.md` §9. *Covered* `server/test_each.py::test_a_reset_of_the_input_drops_the_stored_outcomes`.
+*From* `per-key-processing.md` §9. *Covered* `contract/test_rst.py::test_rst_7_an_upstream_reset_drops_a_per_key_consumers_failing_keys`; `server/test_each.py::test_a_reset_of_the_input_drops_the_stored_outcomes`.
 
 **RST-8. A removed consumer stops holding back its upstream's history.**
 `gone` and `keep` read `feed`; `gone` is removed: `feed`'s history is
@@ -922,30 +922,30 @@ by the engine's own stop count for nothing.
 Editing `helpers.py` (committed or not) is a new deploy; a note or data
 file beside the project is not. `SOLERA_BUILD` wins when set. The engine
 numbers deploys as it serves them.
-*From* D174. *Covered* `sdk/test_build.py::test_the_build_is_the_code_the_project_runs`; `sdk/test_build.py::test_explicit_build_wins`; `sdk/test_build.py::test_the_deploy_number_counts_served_deploys`; `sdk/test_build.py::test_the_error_policy_changes_the_revision`.
+*From* D174. *Covered* `contract/test_dep.py::test_dep_1_an_explicit_build_wins`; `contract/test_dep.py::test_dep_1_the_build_is_the_code_the_project_runs`; `contract/test_dep.py::test_dep_1_outside_git_the_modules_are_the_build`; `contract/test_dep.py::test_dep_1_the_error_policy_changes_the_deploy`; `contract/test_dep.py::test_dep_1_the_engine_numbers_deploys_as_it_serves_them`; `sdk/test_build.py::test_the_deploy_number_counts_served_deploys`.
 
 **DEP-2. A local serve reloads on code changes; a broken edit keeps the current deploy.**
 On by default for `--insecure` loopback serves, `--reload` elsewhere.
 Saves are debounced; attempts in flight finish under their own deploy.
-*From* D174. *Covered* `server/test_reloading.py::test_a_code_change_is_served_and_a_broken_one_is_not`; `server/test_reloading.py::test_redeploy_serves_another_deploy_in_place`.
+*From* D174. *Covered* `contract/test_dep.py::test_dep_2_a_local_serve_reloads_on_code_changes_and_keeps_its_deploy_on_a_broken_edit`; `server/test_reloading.py::test_a_code_change_is_served_and_a_broken_one_is_not`; `server/test_reloading.py::test_redeploy_serves_another_deploy_in_place`.
 
 **DEP-3. An attempt finishes under the deploy it was launched with.**
 A new deploy (or a local reload) neither stops nor fails attempts in
 flight. A worker whose code is another deploy than its attempt's fails
 it, not retryably, saying why.
-*From* D174; Q16; `architecture.md` §8. *Covered* `worker/test_worker.py::test_revision_mismatch_writes_failed_result`; `sdk/test_build.py::test_the_engine_warns_when_a_worker_computed_its_revision_another_way`.
+*From* D174; Q16; `architecture.md` §8. *Covered* `contract/test_dep.py::test_dep_3_an_attempt_finishes_under_the_deploy_it_was_launched_with`; `contract/test_dep.py::test_dep_3_a_worker_on_another_deploy_fails_the_attempt_not_retryably`; `contract/test_dep.py::test_dep_3_a_worker_that_computed_its_deploy_another_way_is_told_why`; `worker/test_worker.py::test_revision_mismatch_writes_failed_result`; `sdk/test_build.py::test_the_engine_warns_when_a_worker_computed_its_revision_another_way`.
 
 **DEP-4. A sensor host on old code takes no ticks and restarts on the new.**
-*From* `lifecycle.md` §11. *Covered* `server/test_sensors.py::test_a_host_on_another_revision_gets_no_ticks`; `server/test_sensors.py::test_a_host_on_old_code_waits_then_starts_afresh`.
+*From* `lifecycle.md` §11. *Covered* `contract/test_dep.py::test_dep_4_a_sensor_host_on_old_code_takes_no_ticks_and_restarts_on_the_new`; `server/test_sensors.py::test_a_host_on_another_revision_gets_no_ticks`; `server/test_sensors.py::test_a_host_on_old_code_waits_then_starts_afresh`.
 
 **DEP-5. Migrations apply before an output's first write; a failed one is not retried.**
 `solera migrate` applies eagerly and is idempotent; each schema's table
 gets its own.
-*From* `architecture.md` §4; F18. *Covered* `worker/test_worker.py::test_migrate_runs_before_first_write`; `worker/test_worker.py::test_failed_migration_is_not_retryable`; `server/test_cli.py::test_migrate_command_applies_and_is_idempotent`; `server/test_engine.py::test_an_unchanged_keyed_write_still_applies_its_migrations`.
+*From* `architecture.md` §4; F18. *Covered* `contract/test_dep.py::test_dep_5_migrations_apply_before_an_outputs_first_write`; `contract/test_dep.py::test_dep_5_a_failed_migration_is_not_retried`; `contract/test_dep.py::test_dep_5_an_unchanged_keyed_write_still_applies_its_migrations`; `contract/test_dep.py::test_dep_5_each_schemas_table_gets_its_own_migrations`; `worker/test_worker.py::test_migrate_runs_before_first_write`; `worker/test_worker.py::test_failed_migration_is_not_retryable`; `server/test_cli.py::test_migrate_command_applies_and_is_idempotent`; `server/test_engine.py::test_an_unchanged_keyed_write_still_applies_its_migrations`.
 
 **DEP-6. A secret written into a built-in store's config is refused at registration.**
 `PostgresStore("postgresql://u:pw@…")` is refused, naming `env:NAME`.
-*From* D96. *Covered* `server/test_retirement.py::test_a_built_in_store_with_a_secret_written_in_the_open_is_refused`.
+*From* D96. *Covered* `contract/test_dep.py::test_dep_6_a_secret_written_into_a_built_in_stores_config_is_refused`.
 
 ## STO — fenced and immutable stores
 
