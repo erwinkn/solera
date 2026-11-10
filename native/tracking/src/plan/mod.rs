@@ -999,19 +999,11 @@ pub async fn owed_keys(
 /// not meet, because their input has not changed since they failed, are
 /// counted from the edge's tally of records.
 pub async fn owed_count(view: &View, req: &InputRequest, ixs: &dyn Indexes) -> Result<[u64; 4]> {
-    let mut found = Found::new(usize::MAX, false);
-    found.waiting = true;
-    let w = walker(view, req, ixs)?;
-    w.walk(None, &mut found).await?;
-    if let Some((_, f)) = w.fails {
-        for i in 0..3 {
-            found.counts[i] += f.classes[i].saturating_sub(found.visited[i]);
-        }
-    }
-    Ok(found.counts)
+    owed_count_each(view, req, ixs, &mut |_, _, _| {}).await
 }
 
-/// `owed_count`, showing `each` every owed key it counts.
+/// `owed_count`, showing `each` every owed key the walk takes: the keys
+/// waiting for their retry are counted but not shown.
 pub async fn owed_count_each(
     view: &View,
     req: &InputRequest,
@@ -1019,8 +1011,15 @@ pub async fn owed_count_each(
     each: Each<'_>,
 ) -> Result<[u64; 4]> {
     let mut found = Found::new(usize::MAX, false);
+    found.waiting = true;
     found.each = Some(each);
-    walker(view, req, ixs)?.walk(None, &mut found).await?;
+    let w = walker(view, req, ixs)?;
+    w.walk(None, &mut found).await?;
+    if let Some((_, f)) = w.fails {
+        for i in 0..3 {
+            found.counts[i] += f.classes[i].saturating_sub(found.visited[i]);
+        }
+    }
     Ok(found.counts)
 }
 

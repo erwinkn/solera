@@ -695,9 +695,9 @@ with a witness, its reason and since when, exact for the edge's progress
 and conditions at one generation, as of one upstream commit.
 
 - **Applying an event never reads the index.** A batch commit, a reset, a
-  rename or new conditions start a new generation and record which key
-  ranges changed (a reset, a batch that resets progress or new conditions:
-  all of them). What is known then stops being current, and the status
+  rename, new conditions or points a batch's outcomes set (B6) start a new
+  generation and record which key ranges changed (a reset, a batch that
+  resets progress, new conditions or outcomes' points: all of them). What is known then stops being current, and the status
   reads "unknown" until a refresh. Generations come from one counter and
   are never reused, so a part for an edge since closed never applies to one
   reopened under its name.
