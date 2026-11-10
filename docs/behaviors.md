@@ -874,13 +874,13 @@ Run R's batch 2 processed k1@7 and k2@3; a month later, R still retained:
 k1@7, updated. Upstream key history is kept back to the oldest commit a
 retained run or live reader refers to. A key outcome's `removed`, and its
 processed version, stay known as long as their run.
-*From* D180. *Today* not built (T39; gap 8): a removed key's outcome is forgotten once its upstream's history is merged past it, though its run is still in history. *Covered* `contract/test_his.py::test_his_5_a_removed_key_outcome_stays_known_while_its_run_is_in_history`.
+*From* D180. *Today* not built (T39; gap 8): a removed key's outcome is forgotten once its upstream's history is merged past it, though its run is still in history. *Covered* `contract/test_his.py::test_his_5_a_removed_key_outcome_stays_known_while_its_run_is_in_history`. Which version of a key a batch read, and its class, have no public name yet (a batch's per-key lineage, B10), so they are tested once the core names them.
 
 **HIS-6. Per-key history keeps failures, a duration histogram per batch, and each batch's 10 slowest keys.**
 Failures are logged per call, newest first. Ok calls are not logged one
 by one: a batch's ok keys come from lineage (HIS-5). All of it expires
 with its run.
-*From* `per-key-processing.md` §10; D179, D195. *Today* every call is logged, ok included, with its duration (`server/test_console_api.py::test_key_outcomes_page_newest_first`). *Covered* `contract/test_his.py::test_his_6_the_per_key_log_keeps_failures_newest_first_not_ok_calls_and_expires_with_its_run`.
+*From* `per-key-processing.md` §10; D179, D195. *Today* every call is logged, ok included, with its duration (`server/test_console_api.py::test_key_outcomes_page_newest_first`). *Covered* `contract/test_his.py::test_his_6_the_per_key_log_keeps_failures_newest_first_not_ok_calls_and_expires_with_its_run`. A batch's duration histogram and its 10 slowest keys have no public name yet, so they are tested once the core names them.
 
 **HIS-7. A batch's input is recomputed from its record and checked against its digest.**
 Asked what batch 2 of run R received, the engine recomputes the key list

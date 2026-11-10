@@ -2,7 +2,6 @@
 
 import asyncio
 import copy
-import time
 
 import pytest
 from solera import Abort, Rejected, Transient
@@ -844,7 +843,8 @@ async def test_key_3_rejected_and_failed_keys_keep_their_output_and_never_block_
 async def test_key_3_a_transient_key_backs_off_doubling_until_retry_for_then_fails(solera):
     """1 min, doubling; `retry_after` honoured; past `retry_for` (24 h unless the
     error says), failed. A key's tries are timed by the worker's clock, which
-    is the wall's: `v` gives up after a second."""
+    is the wall's, not the one `advance` moves: `v` is retried at once and
+    gives up within a second."""
 
     assert Transient("busy").retry_for == "24h"
     c = await Checks(solera).deploy()
@@ -859,8 +859,12 @@ async def test_key_3_a_transient_key_backs_off_doubling_until_retry_for_then_fai
     assert kinds(stored) == {"t": "retrying", "w": "retrying", "v": "retrying"}
     assert stored["t"]["next_at"] - stored["t"]["last"] == pytest.approx(60, abs=1)
     assert stored["w"]["next_at"] - stored["w"]["last"] == pytest.approx(300, abs=1)  # retry_after
-    await asyncio.sleep(max(0.0, stored["v"]["until"] - time.time()) + 0.05)
-    assert await c.run() == ["v"]  # t and w are not due yet
+
+    async def gave_up():
+        assert set(await c.run()) <= {"v"}  # v is due from the next whole second; t and w are not
+        return (await solera.outcomes("checks"))["v"]["outcome"] == "failed"
+
+    await solera.until(gave_up)
     solera.advance(61)
     assert await c.run() == ["t"]
     stored = await solera.outcomes("checks", *STORED)
