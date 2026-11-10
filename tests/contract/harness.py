@@ -650,13 +650,15 @@ class Storage:
     """An S3-compatible server (moto's) on a local port, its credentials in
     the environment, as an engine and its workers on S3 read them, until
     `close()`. `requests` counts every request it has served; `url` is
-    its bucket; `hold_upkeep(output)` stalls an upload, a fault."""
+    its bucket, its own: moto keeps one store for the process, so every
+    server shares it; `hold_upkeep(output)` stalls an upload, a fault."""
 
     ENV = ("AWS_ENDPOINT", "AWS_ALLOW_HTTP", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_REGION")
 
     def __init__(self):
         import os
         import threading
+        import uuid
 
         import boto3
         from moto.server import DomainDispatcherApplication, create_backend_app
@@ -685,15 +687,16 @@ class Storage:
         os.environ.update(
             dict(zip(self.ENV, (endpoint, "true", "contract", "contract", "us-east-1"), strict=True))
         )
-        boto3.client("s3", endpoint_url=endpoint).create_bucket(Bucket="contract")
-        self.url = "s3://contract"
+        self.bucket = f"contract-{uuid.uuid4().hex[:12]}"
+        boto3.client("s3", endpoint_url=endpoint).create_bucket(Bucket=self.bucket)
+        self.url = f"s3://{self.bucket}"
 
     def hold_upkeep(self, output: str) -> Hold:
         """The next uploads of `output`'s key index upkeep stall in the server,
         unanswered, until `release()`: a slow bucket. `entered` is set once
         one is held. It knows today's storage layout, as `refuse_upkeep` does."""
 
-        self.held = Hold(f"/contract/state/contract/keys/{output}/")
+        self.held = Hold(f"/{self.bucket}/state/contract/keys/{output}/")
         return self.held
 
     def close(self) -> None:

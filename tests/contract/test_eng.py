@@ -13,7 +13,7 @@ from solera.sdk import Commit, Output, Project, Retry, Source, Tick, asset, sens
 from solera.stores import FileStore
 
 from tests.contract.example import Example
-from tests.contract.harness import Refused
+from tests.contract.harness import Refused, Storage
 
 
 class Gate:
@@ -527,6 +527,23 @@ async def test_eng_10_an_idle_engine_does_not_spin(solera):
     assert used < 0.1, f"{used:.0%} of a CPU while idle"
 
 
+def test_eng_10_each_storage_server_keeps_its_own_state():
+    """What one test's storage server holds, another's never shows, though
+    moto keeps one store for the whole process."""
+
+    first = Storage()
+    try:
+        obstore.put(obstore.store.from_url(f"{first.url}/state"), "contract/control/journal.json", b"{}")
+    finally:
+        first.close()
+    second = Storage()
+    try:
+        assert second.url != first.url
+        assert list(obstore.list(obstore.store.from_url(f"{second.url}/state"))) == []
+    finally:
+        second.close()
+
+
 async def test_eng_10_the_storage_count_sees_every_request(solera):
     """What ENG-10 bounds is counted request by request, never coalesced:
     1,000 reads of one object of the namespace's state are 1,000 requests."""
@@ -626,13 +643,12 @@ async def failing_upkeep(solera) -> None:
     await solera.start()
 
 
-async def alarmed(solera) -> bool:
-    """The engine shows an alarm: unhealthy, with an error to show."""
+async def alarm(solera) -> tuple[int, str | None]:
+    """What the engine shows of an alarm: its health, and the error it gives."""
 
-    health = (await solera.client.get("/healthz")).status_code
-    error = (await solera.get("/api/diagnostics"))["last_error"]
-    assert (health == 503) == (error is not None), (health, error)
-    return error is not None
+    return (await solera.client.get("/healthz")).status_code, (await solera.get("/api/diagnostics"))[
+        "last_error"
+    ]
 
 
 async def test_eng_14_upkeep_that_keeps_failing_backs_off_alarms_and_tries_again(solera):
@@ -643,7 +659,8 @@ async def test_eng_14_upkeep_that_keeps_failing_backs_off_alarms_and_tries_again
         await failing_upkeep(solera)
         [failed] = (await merges(solera, "feed", tried(3)))["failed"]
         assert failed["due"] - failed["at"] == 600  # three tries, then ten minutes
-        assert await alarmed(solera)
+        health, error = await alarm(solera)
+        assert health == 503 and error is not None, (health, error)  # alarmed, while it waits
         await asyncio.sleep(1.2)  # upkeep looks again, and waits
         assert (await solera.get("/outputs/feed/merges"))["failed"][0]["uploads"] == 3
         solera.advance(600)
@@ -655,7 +672,7 @@ async def test_eng_14_upkeep_that_keeps_failing_backs_off_alarms_and_tries_again
     await merges(solera, "feed", caught_up)
 
     async def alarm_gone():
-        return not await alarmed(solera)
+        return await alarm(solera) == (200, None)
 
     await solera.until(alarm_gone)
     await solera.commit_source("feed", upsert={"later": "1"})  # and writes are taken again
