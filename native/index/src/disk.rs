@@ -17,6 +17,9 @@ use std::sync::Mutex;
 #[derive(Clone, Debug)]
 pub struct DiskOptions {
     pub dir: PathBuf,
+    /// Names the object store (and prefix) whose layers these are, stably
+    /// across restarts: files kept for another name are removed on open.
+    pub store: String,
     /// Bytes of files kept; a layer larger than a quarter of this is not cached.
     pub bytes: u64,
 }
@@ -24,6 +27,7 @@ pub struct DiskOptions {
 pub(crate) struct Disk {
     pub(crate) o: DiskOptions,
     st: Mutex<DiskState>,
+    _lock: std::fs::File,
 }
 
 #[derive(Default)]
@@ -35,13 +39,20 @@ struct DiskState {
     filling: HashSet<String>,
 }
 
-/// A layer path as a file name, and back: `%` and `/` escaped.
+/// A layer path as a file name, and back: `%`, `/` and a leading `.`
+/// escaped (the cache's own files start with a dot).
 fn name(path: &str) -> String {
-    path.replace('%', "%25").replace('/', "%2F")
+    let n = path.replace('%', "%25").replace('/', "%2F");
+    match n.strip_prefix('.') {
+        Some(rest) => format!("%2E{rest}"),
+        None => n,
+    }
 }
 
 fn unname(n: &str) -> String {
-    n.replace("%2F", "/").replace("%25", "%")
+    n.replace("%2E", ".")
+        .replace("%2F", "/")
+        .replace("%25", "%")
 }
 
 impl DiskState {
@@ -58,26 +69,49 @@ impl DiskState {
 }
 
 impl Disk {
-    /// The cache in `o.dir`, with the complete files already there.
+    /// The cache in `o.dir` for the store `o.store` names, with the complete
+    /// files already there. The directory is this store's alone while it is
+    /// open (a lock file); files another store left there are removed.
     pub(crate) fn open(o: DiskOptions) -> Result<Disk> {
         let io =
             |e: std::io::Error| Error::Store(format!("disk cache {}: {e}", o.dir.display()).into());
         std::fs::create_dir_all(&o.dir).map_err(io)?;
+        let lock = std::fs::File::options()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(o.dir.join(".lock"))
+            .map_err(io)?;
+        if lock.try_lock().is_err() {
+            return Err(Error::Invalid(format!(
+                "disk cache {}: another store has it open",
+                o.dir.display()
+            )));
+        }
+        let owner = o.dir.join(".store");
+        let mine = std::fs::read(&owner).is_ok_and(|b| b == o.store.as_bytes());
         let mut found = Vec::new();
         for e in std::fs::read_dir(&o.dir).map_err(io)? {
             let e = e.map_err(io)?;
             let n = e.file_name().to_string_lossy().into_owned();
-            let m = e.metadata().map_err(io)?;
-            if n.starts_with('.') {
+            if n == ".lock" || n == ".store" {
+                continue;
+            }
+            if n.starts_with('.') || !mine {
                 let _ = std::fs::remove_file(e.path());
                 continue;
             }
+            let m = e.metadata().map_err(io)?;
             found.push((m.modified().ok(), unname(&n), m.len()));
+        }
+        if !mine {
+            std::fs::write(&owner, &o.store).map_err(io)?;
         }
         found.sort();
         let disk = Disk {
             o,
             st: Mutex::new(DiskState::default()),
+            _lock: lock,
         };
         for (_, path, size) in found {
             disk.add(&path, size);
@@ -104,10 +138,16 @@ impl Disk {
         let _ = std::fs::remove_file(self.file(path));
     }
 
+    /// Whether `path` can be kept: its file name fits a directory entry.
+    pub(crate) fn keeps(&self, path: &str) -> bool {
+        name(path).len() <= 240
+    }
+
     /// Claim the fill of `path` if it is worth caching and nobody has it.
     pub(crate) fn claim(&self, path: &str, size: u64) -> bool {
         let mut st = self.st.lock().unwrap();
-        size.saturating_mul(4) <= self.o.bytes
+        self.keeps(path)
+            && size.saturating_mul(4) <= self.o.bytes
             && !st.files.contains_key(path)
             && st.filling.insert(path.to_string())
     }
@@ -191,6 +231,12 @@ impl Drop for Temp {
 /// Bytes of a cached file.
 pub(crate) fn read_at(file: &std::path::Path, r: Range<u64>) -> std::io::Result<Vec<u8>> {
     let f = std::fs::File::open(file)?;
+    if r.start > r.end || r.end > f.metadata()?.len() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            format!("range {r:?} past the file's end"),
+        ));
+    }
     let mut b = vec![0u8; (r.end - r.start) as usize];
     f.read_exact_at(&mut b, r.start)?;
     Ok(b)

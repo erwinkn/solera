@@ -196,25 +196,35 @@ pub struct ChangeIndex {
 impl ChangeIndex {
     /// `options` are object_store's (for S3: `aws_access_key_id`, `aws_endpoint`, `aws_allow_http`, …).
     #[new]
-    /// `disk_dir`: keep whole layer files there (for a remote store), up to `disk_bytes`.
+    /// `disk_dir`: keep whole layer files there (for a remote store), up to
+    /// `disk_bytes`. `disk_store` names the store (and prefix) whose layers
+    /// they are, stably across restarts: the directory's files for another
+    /// name are removed.
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (url, options=None, *, memory_bytes=256 << 20, disk_dir=None, disk_bytes=16 << 30, block_bytes=32 << 10, level=1))]
+    #[pyo3(signature = (url, options=None, *, memory_bytes=256 << 20, disk_dir=None, disk_store=None, disk_bytes=16 << 30, block_bytes=32 << 10, level=1))]
     fn new(
         url: &str,
         options: Option<HashMap<String, String>>,
         memory_bytes: u64,
         disk_dir: Option<std::path::PathBuf>,
+        disk_store: Option<String>,
         disk_bytes: u64,
         block_bytes: usize,
         level: i32,
     ) -> PyResult<Self> {
         guard(|| {
-            let opts = ix::StoreOptions {
-                memory_bytes,
-                disk: disk_dir.map(|dir| ix::DiskOptions {
+            let disk = match (disk_dir, disk_store) {
+                (Some(dir), Some(store)) => Some(ix::DiskOptions {
                     dir,
                     bytes: disk_bytes,
+                    store,
                 }),
+                (None, None) => None,
+                _ => return Err(PyValueError::new_err("disk_dir and disk_store go together")),
+            };
+            let opts = ix::StoreOptions {
+                memory_bytes,
+                disk,
                 ..Default::default()
             };
             let store = ix::Store::from_url(

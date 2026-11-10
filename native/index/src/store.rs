@@ -134,6 +134,7 @@ pub(crate) enum Want {
         rlen: u32,
         check: u32,
         blocks: u32,
+        data_end: u64,
     },
     /// `keep`: cache it. A bulk read (a batch past `cache_batch`) does not,
     /// so that a scan or a merge leaves the planners' blocks where they are.
@@ -211,18 +212,8 @@ impl Store {
         rt: tokio::runtime::Handle,
         opts: StoreOptions,
     ) -> Result<Arc<Store>> {
-        let ns = format!("{inner}/{prefix}");
-        let disk = opts.disk.clone().map(|o| {
-            Disk::open(DiskOptions {
-                dir: o.dir.join(format!(
-                    "{:016x}",
-                    xxhash_rust::xxh3::xxh3_64(ns.as_bytes())
-                )),
-                ..o
-            })
-        });
         Ok(Arc::new(Store {
-            disk: disk.transpose()?,
+            disk: opts.disk.clone().map(Disk::open).transpose()?,
             inner,
             prefix,
             rt,
@@ -446,8 +437,9 @@ impl Store {
             t.write(&b).map_err(io)?;
             at = end;
         }
+        d.commit(t, path, size).map_err(io)?;
         self.stats.fills.fetch_add(1, Relaxed);
-        d.commit(t, path, size).map_err(io)
+        Ok(())
     }
 
     /// Bytes of the disk cache in use.
@@ -456,15 +448,14 @@ impl Store {
     }
 
     /// Start writing an object; its bytes go up in parts once past
-    /// `part_bytes`, and to the disk cache as they go.
+    /// `part_bytes`, and to the disk cache as they go. The disk cache never
+    /// fails a write: on a local error the object is simply not kept.
     pub(crate) fn upload(self: &Arc<Self>, path: &str) -> Result<Upload> {
-        let tee = match &self.disk {
-            Some(d) => Some(
-                d.temp()
-                    .map_err(|e| Error::Store(format!("disk cache: {e}").into()))?,
-            ),
-            None => None,
-        };
+        let tee = self
+            .disk
+            .as_ref()
+            .filter(|d| d.keeps(path))
+            .and_then(|d| d.temp().ok());
         Ok(Upload {
             store: self.clone(),
             path: self.path(path)?,
@@ -518,8 +509,9 @@ fn parse(
             rlen,
             check,
             blocks,
+            data_end,
         } => Cached::Seg(Arc::new(
-            parse_segment(&b, *rlen, *check, *blocks).map_err(at)?,
+            parse_segment(&b, *rlen, *check, *blocks, *data_end).map_err(at)?,
         )),
         Want::Top { layer } => {
             let tail = &b[(layer.top_start - start) as usize..];
@@ -536,8 +528,14 @@ fn parse(
                             "{path}: segment {i} outside the index"
                         )));
                     };
-                    let seg = parse_segment(c, top.segs.rlen[i], top.segs.check[i], top.segs.n[i])
-                        .map_err(at)?;
+                    let seg = parse_segment(
+                        c,
+                        top.segs.rlen[i],
+                        top.segs.check[i],
+                        top.segs.n[i],
+                        top.commits_start,
+                    )
+                    .map_err(at)?;
                     extra.push((Part::Seg(i as u32), Cached::Seg(Arc::new(seg))));
                 }
             }
@@ -557,12 +555,23 @@ pub(crate) struct Upload {
     size: u64,
 }
 
+impl Drop for Upload {
+    /// An upload dropped unfinished (an error, a cancelled merge) gives its
+    /// parts back: S3 keeps them, billed, until aborted.
+    fn drop(&mut self) {
+        if let Some(w) = self.parts.take() {
+            self.store.rt.spawn(async move {
+                let _ = w.abort().await;
+            });
+        }
+    }
+}
+
 impl Upload {
     pub(crate) async fn write(&mut self, mut bytes: Vec<u8>) -> Result<()> {
         self.size += bytes.len() as u64;
-        if let Some(t) = &mut self.tee {
-            t.write(&bytes)
-                .map_err(|e| Error::Store(format!("disk cache: {e}").into()))?;
+        if self.tee.as_mut().is_some_and(|t| t.write(&bytes).is_err()) {
+            self.tee = None;
         }
         let part = self.store.opts.part_bytes;
         if self.parts.is_none() {
@@ -603,14 +612,20 @@ impl Upload {
                     .await?;
             }
             Some(w) => {
-                w.finish().await?;
+                // its own task: a caller that stops waiting does not strand the parts
+                self.store
+                    .rt
+                    .spawn(w.finish())
+                    .await
+                    .map_err(|e| Error::Store(format!("an upload failed: {e}").into()))??;
             }
         }
         if let (Some(t), Some(d)) = (self.tee.take(), &self.store.disk) {
             if d.claim(&self.name, self.size) {
-                let kept = d.commit(t, &self.name, self.size);
+                if let Err(e) = d.commit(t, &self.name, self.size) {
+                    eprintln!("solera-index: disk cache of {} failed: {e}", self.name);
+                }
                 d.unclaim(&self.name);
-                kept.map_err(|e| Error::Store(format!("disk cache: {e}").into()))?;
             }
         }
         Ok(())
