@@ -1,9 +1,10 @@
 //! Damage to any section of a layer, sealed again with a valid checksum (so
 //! the parsers see it, as they would a crafted file): every parse returns a
 //! value or a format error, never panics, and holds memory in proportion to
-//! the bytes it decompresses, plus the keys it rebuilds from prefixes, which
-//! the format bounds by `MAX_RAW`. Never in proportion to a length or count
-//! it read. Its own test binary: it measures the heap.
+//! the raw length its section declares (which the format caps at `MAX_RAW`),
+//! plus the keys it rebuilds from prefixes (also capped by `MAX_RAW`). Never
+//! in proportion to any other length or count it read. Its own test binary:
+//! it measures the heap.
 
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
@@ -153,16 +154,35 @@ fn damage(rng: &mut SmallRng, raw: &mut Vec<u8>) {
     }
 }
 
-/// Run `parse` on damaged input that decompresses to `raw` bytes: it
-/// returns a value or a format error, and holds at most 1 MiB plus 64 times
-/// `raw`, plus twice `MAX_RAW` when it rebuilds prefix-coded keys.
+/// Seal damaged raw bytes: compressed, and sometimes damaged again after
+/// compression or declared at another raw length. Returns the compressed
+/// bytes and the raw length to declare.
+fn sealed(rng: &mut SmallRng, raw: &[u8]) -> (Vec<u8>, usize) {
+    let mut c = seal(raw);
+    if rng.random_ratio(1, 3) {
+        damage(rng, &mut c);
+    }
+    let declared = match rng.random_range(0..8) {
+        0 => MAX_RAW,
+        1 => MAX_RAW + 1,
+        2 => rng.random_range(0..=MAX_RAW),
+        3 => u32::MAX as usize,
+        _ => raw.len(),
+    };
+    (c, declared)
+}
+
+/// Run `parse` on a damaged section that declares `declared` raw bytes:
+/// it returns a value or a format error, and holds at most 1 MiB plus 65
+/// times that length (capped at `MAX_RAW`, the format's bound on a
+/// section), plus twice `MAX_RAW` when it rebuilds prefix-coded keys.
 fn parsed<T: std::fmt::Debug>(
     what: &str,
-    raw: usize,
+    declared: usize,
     keys: bool,
     parse: impl FnOnce() -> Result<T>,
 ) {
-    let given = (1 << 20) + 64 * raw + if keys { 2 * MAX_RAW } else { 0 };
+    let bound = (1 << 20) + 65 * declared.min(MAX_RAW) + if keys { 2 * MAX_RAW } else { 0 };
     let base = NOW.load(Relaxed);
     PEAK.store(base, Relaxed);
     let got = parse();
@@ -172,13 +192,21 @@ fn parsed<T: std::fmt::Debug>(
         "{what}: {got:?}"
     );
     assert!(
-        held <= given,
-        "{what}: {held} bytes held for {raw} bytes decompressed"
+        held <= bound,
+        "{what}: {held} bytes held for a section of {declared} bytes"
     );
 }
 
 #[test]
 fn damage_to_any_section_is_a_format_error_within_bounded_memory() {
+    // a frame that declares 64 MiB and holds nothing
+    let c = [0x28, 0xb5, 0x2f, 0xfd, 0xa0, 0, 0, 0, 4, 1, 0, 0];
+    let mut b = (MAX_RAW as u32).to_le_bytes().to_vec();
+    b.extend_from_slice(&check(&c).to_le_bytes());
+    b.extend_from_slice(&c);
+    parsed("an empty 64 MiB frame", MAX_RAW, false, || {
+        parse_commits(&b)
+    });
     let mut rng = SmallRng::seed_from_u64(11);
     let trials: usize = std::env::var("DAMAGE_TRIALS").map_or(4000, |s| s.parse().unwrap());
     let corpora = [
@@ -215,96 +243,90 @@ fn one(rng: &mut SmallRng, trial: usize, file: &[u8], l: &LayerRef) {
     )
     .unwrap();
     assert!(segs.len() > 2 && blocks.len() == 2);
-    {
-        let what = |s: &str| format!("trial {trial}, {s}");
-        match trial % 5 {
-            // the top level, sealed again under a valid trailer
-            0 => {
-                let mut raw = top_raw.clone();
-                damage(rng, &mut raw);
-                let c = seal(&raw);
-                let mut t = trailer.to_vec();
-                t[24..28].copy_from_slice(&(raw.len() as u32).to_le_bytes());
-                t[28..32].copy_from_slice(&check(&c).to_le_bytes());
-                let tc = check(&t[..36]);
-                t[36..40].copy_from_slice(&tc.to_le_bytes());
-                let mut tail = c;
-                tail.extend_from_slice(&t);
-                let size = l.top_start + tail.len() as u64;
-                parsed(&what("top"), raw.len(), true, || {
-                    let t = Top::parse(&tail, l.top_start, size)?;
-                    t.check(&LayerRef { size, ..l.clone() }).map(|_| t.lo)
-                });
-            }
-            // the trailer's offsets and lengths
-            1 => {
-                let mut t = trailer[..36].to_vec();
-                damage(rng, &mut t);
-                t.resize(36, 0);
-                let tc = check(&t);
-                t.extend_from_slice(&tc.to_le_bytes());
-                t.extend_from_slice(&MAGIC);
-                let mut tail = tail[..tail.len() - TRAILER].to_vec();
-                tail.extend_from_slice(&t);
-                parsed(&what("trailer"), top_raw.len(), true, || {
-                    let t = Top::parse(&tail, l.top_start, l.size)?;
-                    t.check(l).map(|_| t.lo)
-                });
-            }
-            // a segment
-            2 => {
-                let i = rng.random_range(0..segs.len());
-                let mut raw = zstd::bulk::decompress(seg(i), segs.rlen[i] as usize).unwrap();
-                damage(rng, &mut raw);
-                let c = seal(&raw);
-                let n = if rng.random_ratio(1, 4) {
-                    rng.random()
-                } else {
-                    segs.n[i]
-                };
-                parsed(&what("segment"), raw.len(), true, || {
-                    parse_segment(&c, raw.len() as u32, check(&c), n, top.commits_start)
-                });
-            }
-            // a block, and every key and version decoded from it
-            3 => {
-                let i = rng.random_range(0..blocks.len());
-                let (o, cl) = (blocks.off[i] as usize, blocks.clen[i] as usize);
-                let mut raw =
-                    zstd::bulk::decompress(&file[o..o + cl], blocks.rlen[i] as usize).unwrap();
-                damage(rng, &mut raw);
-                let c = seal(&raw);
-                let rows = if rng.random_ratio(1, 4) {
-                    rng.random()
-                } else {
-                    blocks.n[i]
-                };
-                let rlen = if rng.random_ratio(1, 8) {
-                    rng.random()
-                } else {
-                    raw.len() as u32
-                };
-                parsed(&what("block"), raw.len(), true, || {
-                    let mut run = Run::new();
-                    Decoder::default().decode(&c, rlen, rows, &mut run)?;
-                    for k in 0..run.len() {
-                        for r in run.rows(k) {
-                            let _ = (run.key(k), run.new_version(r), run.replaced_version(r));
-                        }
+    let what = |s: &str| format!("trial {trial}, {s}");
+    match trial % 5 {
+        // the top level, sealed again under a valid trailer
+        0 => {
+            let mut raw = top_raw.clone();
+            damage(rng, &mut raw);
+            let (c, declared) = sealed(rng, &raw);
+            let mut t = trailer.to_vec();
+            t[24..28].copy_from_slice(&(declared as u32).to_le_bytes());
+            t[28..32].copy_from_slice(&check(&c).to_le_bytes());
+            let tc = check(&t[..36]);
+            t[36..40].copy_from_slice(&tc.to_le_bytes());
+            let mut tail = c;
+            tail.extend_from_slice(&t);
+            let size = l.top_start + tail.len() as u64;
+            parsed(&what("top"), declared, true, || {
+                let t = Top::parse(&tail, l.top_start, size)?;
+                t.check(&LayerRef { size, ..l.clone() }).map(|_| t.lo)
+            });
+        }
+        // the trailer's offsets and lengths
+        1 => {
+            let mut t = trailer[..36].to_vec();
+            damage(rng, &mut t);
+            t.resize(36, 0);
+            let tc = check(&t);
+            t.extend_from_slice(&tc.to_le_bytes());
+            t.extend_from_slice(&MAGIC);
+            let declared = u32_at(&t, 24) as usize;
+            let mut tail = tail[..tail.len() - TRAILER].to_vec();
+            tail.extend_from_slice(&t);
+            parsed(&what("trailer"), declared, true, || {
+                let t = Top::parse(&tail, l.top_start, l.size)?;
+                t.check(l).map(|_| t.lo)
+            });
+        }
+        // a segment
+        2 => {
+            let i = rng.random_range(0..segs.len());
+            let mut raw = zstd::bulk::decompress(seg(i), segs.rlen[i] as usize).unwrap();
+            damage(rng, &mut raw);
+            let (c, declared) = sealed(rng, &raw);
+            let n = if rng.random_ratio(1, 4) {
+                rng.random()
+            } else {
+                segs.n[i]
+            };
+            parsed(&what("segment"), declared, true, || {
+                parse_segment(&c, declared as u32, check(&c), n, top.commits_start)
+            });
+        }
+        // a block, and every key and version decoded from it
+        3 => {
+            let i = rng.random_range(0..blocks.len());
+            let (o, cl) = (blocks.off[i] as usize, blocks.clen[i] as usize);
+            let mut raw =
+                zstd::bulk::decompress(&file[o..o + cl], blocks.rlen[i] as usize).unwrap();
+            damage(rng, &mut raw);
+            let (c, declared) = sealed(rng, &raw);
+            let rows = if rng.random_ratio(1, 4) {
+                rng.random()
+            } else {
+                blocks.n[i]
+            };
+            parsed(&what("block"), declared, true, || {
+                let mut run = Run::new();
+                Decoder::default().decode(&c, declared as u32, rows, &mut run)?;
+                for k in 0..run.len() {
+                    for r in run.rows(k) {
+                        let _ = (run.key(k), run.new_version(r), run.replaced_version(r));
                     }
-                    Ok(run.len())
-                });
-            }
-            // the commits section
-            _ => {
-                let mut raw = commits_raw.clone();
-                damage(rng, &mut raw);
-                let c = seal(&raw);
-                let mut b = (raw.len() as u32).to_le_bytes().to_vec();
-                b.extend_from_slice(&check(&c).to_le_bytes());
-                b.extend_from_slice(&c);
-                parsed(&what("commits"), raw.len(), false, || parse_commits(&b));
-            }
+                }
+                Ok(run.len())
+            });
+        }
+        // the commits section
+        _ => {
+            let mut raw = commits_raw.clone();
+            damage(rng, &mut raw);
+            let (c, declared) = sealed(rng, &raw);
+            let mut b = (declared as u32).to_le_bytes().to_vec();
+            b.extend_from_slice(&check(&c).to_le_bytes());
+            b.extend_from_slice(&c);
+            parsed(&what("commits"), declared, false, || parse_commits(&b));
         }
     }
 }
