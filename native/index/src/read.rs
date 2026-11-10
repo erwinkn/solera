@@ -20,8 +20,8 @@ const ALL: u64 = 4 << 20;
 /// A read of listed keys keeps at most this many bytes fetched ahead of its
 /// decoding, per layer.
 const WINDOW: u64 = 16 << 20;
-/// Opening a layer fetches the index segments it needs about this many
-/// compressed bytes at a time.
+/// A read fetches the index segments it needs about this many bytes at a
+/// time, counting the gaps its GETs coalesce across.
 const SEG_BATCH: u64 = 16 << 20;
 /// A cursor plans at most about this many blocks ahead of its fetches.
 const PLAN_BLOCKS: usize = 1 << 16;
@@ -278,17 +278,25 @@ impl Cursor {
     async fn plan(&mut self) -> Result<()> {
         let s = &self.top.segs;
         if self.seg_got.is_empty() {
-            let (mut got, mut wants, mut bytes) = (Vec::new(), Vec::new(), 0);
+            // what the GETs fetch and hold: the segments and the gaps they
+            // coalesce across
+            let (mut got, mut wants, mut held) = (Vec::new(), Vec::new(), 0);
+            let mut end: Option<u64> = None;
             for &i in &self.segs[self.seg_next..] {
-                if bytes >= SEG_BATCH {
+                if held >= SEG_BATCH {
                     break;
                 }
                 let c = self.store.cached_seg(&self.path, i);
                 if c.is_none() {
-                    bytes += s.clen[i] as u64;
+                    let r = s.off[i]..s.off[i] + s.clen[i] as u64;
+                    let between = end
+                        .map(|e| r.start.saturating_sub(e))
+                        .filter(|&g| g <= self.store.opts.coalesce);
+                    held += between.unwrap_or(0) + s.clen[i] as u64;
+                    end = Some(r.end);
                     wants.push((
                         Part::Block(s.off[i]),
-                        s.off[i]..s.off[i] + s.clen[i] as u64,
+                        r,
                         Want::Block {
                             check: s.check[i],
                             keep: false,
