@@ -69,7 +69,7 @@ impl Part {
             Part::Batch(p) => vec![("edge", &p.edge)],
             Part::Consumed(p) => vec![("edge", &p.edge)],
             Part::OutputCommit(p) => vec![("output", &p.output)],
-            Part::Watch(p) => vec![("watch", &p.edge)],
+            Part::Watch(p) => vec![("edge", &p.edge)],
             Part::Witness(p) => vec![("witness", &p.edge)],
             Part::Incomplete(p) => vec![("incomplete", &p.output)],
         }

@@ -291,6 +291,30 @@ fn state_round_trips_through_events_and_snapshots() {
     }
 }
 
+#[test]
+fn a_watch_shares_no_event_with_a_change_to_its_edge() {
+    let mut t = opened();
+    let before = t.snapshot();
+    let other = Arc::new(Conditions {
+        rebuild: 1,
+        ..Default::default()
+    });
+    for p in [
+        Part::EdgeClose(EdgeClose { edge: EDGE.into() }),
+        Part::EdgeRename(EdgeRename {
+            from: EDGE.into(),
+            to: key("renamed"),
+            input: ITEMS.into(),
+        }),
+        batch(&t, range(Some("a"), Some("b")), 0, false),
+    ] {
+        assert!(t
+            .apply(&Event::of(vec![p, watch(&other)]).encode())
+            .is_err());
+        assert_eq!(t.snapshot(), before);
+    }
+}
+
 fn entries(keys: &[(&str, Option<u64>)], commit: u64) -> Run {
     let mut r = Run::new();
     for (k, v) in keys {
