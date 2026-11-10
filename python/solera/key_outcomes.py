@@ -1,6 +1,9 @@
 """The stored outcomes' record, transitions and eligibility
 (docs/per-key-processing.md §9, the authoritative definition). The engine
-and the worker both call these; nothing else decides them.
+and the worker both call these; nothing else decides them. The transition
+table, the backoff and eligibility are the tracking core's
+(`native/tracking/src/outcomes/transition.rs`): one definition, which
+this module and the core's retries both use.
 
 A per-key asset keeps, per partition, a key index of the keys that did not
 succeed: `key → record`, the record packed into the entry's payload. A key
@@ -9,10 +12,9 @@ that succeeds, is removed upstream or stops matching gets a tombstone.
 
 from __future__ import annotations
 
-import math
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 
-from .errors import backoff
+from . import _native
 
 REJECTED, FAILED, RETRYING, CANCELED, TIMED_OUT = 1, 2, 3, 4, 5
 NAMES = {
@@ -111,28 +113,36 @@ def transition(
 
     if outcome.kind in GONE:
         return None
-    code, t = KINDS[outcome.kind], int(now)  # `since` and `last`: whole seconds, for display
     fresh = prior is None or prior.upstream != outcome.upstream
-    counted = 0 if code == CANCELED else 1  # a cancel interrupted the try: it does not count
-    tries = counted if fresh else prior.tries + counted
-    since = t if fresh else prior.since
-    record = StoredOutcome(code, tries, deploy, forced, since, t, 0, 0, outcome.upstream, outcome.message)
-    # Deadlines are computed from the exact time, then rounded up: a budget or a wait
-    # is never shortened by the rounding.
-    if code == RETRYING:
-        if not fresh and prior.outcome == RETRYING:
-            until = prior.until
-        else:
-            until = math.ceil(now + float(outcome.retry_for or 0))
-        if now >= until:
-            return replace(record, outcome=FAILED)  # its retry_for ran out
-        wait = outcome.retry_after if outcome.retry_after is not None else backoff(tries)
-        return replace(record, next_at=math.ceil(now + wait), until=until)
-    if code == TIMED_OUT:
-        if tries > retries:
-            return replace(record, outcome=FAILED)  # always outlives the timeout: stop cycling
-        return replace(record, next_at=math.ceil(now + backoff(tries)))
-    return record
+    before = None
+    if prior is not None:
+        before = (
+            prior.outcome,
+            prior.tries,
+            prior.deploy,
+            prior.forced,
+            prior.since,
+            prior.last,
+            prior.next_at,
+            prior.until,
+            prior.message.encode(errors="replace"),
+        )
+    after = _native.outcome_transition(
+        before,
+        fresh,
+        outcome.kind,
+        outcome.message.encode(errors="replace"),
+        None if outcome.retry_after is None else float(outcome.retry_after),
+        None if outcome.retry_for is None else float(outcome.retry_for),
+        float(now),
+        int(deploy),
+        int(forced),
+        int(retries),
+    )
+    if after is None:
+        return None
+    *counts, message = after
+    return StoredOutcome(*counts, outcome.upstream, message.decode(errors="replace"))
 
 
 def eligible(record: StoredOutcome, now: float, deploy: int, forced: dict[str, int]) -> bool:
@@ -141,10 +151,9 @@ def eligible(record: StoredOutcome, now: float, deploy: int, forced: dict[str, i
     pass's, its `forced` the pass's event counter. A canceled key matches only a
     forced request."""
 
-    return (
-        (record.outcome in (RETRYING, TIMED_OUT) and record.next_at <= now)
-        or (record.outcome == FAILED and record.deploy < deploy)
-        or record.forced < int(forced.get(record.name, 0))
+    requests = [0] + [int(forced.get(NAMES[code], 0)) for code in range(1, 6)]
+    return _native.outcome_eligible(
+        record.outcome, record.next_at, record.deploy, record.forced, float(now), int(deploy), requests
     )
 
 
