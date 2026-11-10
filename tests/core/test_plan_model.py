@@ -209,3 +209,20 @@ def test_a_held_edge_owes_every_key_its_own_output_holds(tmp_path):
     ]
     replay(events, tmp_path)
     assert HELD == "held"
+
+
+def test_a_failed_removal_owes_nothing_once_the_patterns_take_its_key_again(tmp_path):
+    """k1 leaves the patterns; its removal fails, so a point keeps k1@1. When
+    the patterns take k1 again and k1 never changed, nothing is owed: the
+    point's version at the head must come from the index, not from what the
+    batch recorded under patterns that did not take k1."""
+    events = [
+        ("up", (("k1", 1), ("k2", 1)), False),
+        ("plan", 5),
+        ("commit", (), ()),
+        ("pat", 2),
+        ("plan", 5),
+        ("commit", ("k1",), ()),
+        ("pat", 0),
+    ]
+    replay(events, tmp_path)

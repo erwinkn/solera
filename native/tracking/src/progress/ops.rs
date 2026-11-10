@@ -176,10 +176,13 @@ impl Tracking {
             }));
         }
         for u in &plan.unkeyed {
-            parts.push(Part::Consumed(Consumed {
+            let c = Consumed {
                 edge: u.edge.clone(),
                 through: u.head,
-            }));
+                expect: u.through,
+            };
+            c.check(self)?;
+            parts.push(Part::Consumed(c));
         }
         Ok(Ops { parts, records })
     }

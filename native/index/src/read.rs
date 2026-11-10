@@ -211,6 +211,7 @@ impl Cursor {
                         rlen: s.rlen[i],
                         check: s.check[i],
                         blocks: s.n[i],
+                        data_end: top.commits_start,
                     },
                 )
             })

@@ -107,3 +107,22 @@ fn patterns_take_as_the_python_matcher_does() {
     assert!(!p.exact_in_index());
     assert!(Patterns::new(vec![Pat::Regex("(".into())], vec![]).is_err());
 }
+
+#[test]
+fn a_range_whose_low_end_is_not_below_its_high_end_is_refused() {
+    for (lo, hi) in [("z", "a"), ("m", "m")] {
+        let mut e = Enc::new();
+        range(Some(lo), Some(hi)).encode(&mut e);
+        assert!(KeyRange::decode(&mut Dec::new(&e.buf)).is_err());
+    }
+    let mut p = Keyed::default();
+    p.points.insert(
+        k("q"),
+        Point {
+            holding: Holding::Held,
+            reason: Reason::Failed,
+            seen: None,
+        },
+    );
+    assert_eq!(p.points_in(&range(Some("z"), Some("a"))).count(), 0);
+}

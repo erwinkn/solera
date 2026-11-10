@@ -175,7 +175,7 @@ def test_bad_input_is_refused(tmp_path):
         ix.scan([{**layer, "entries": 5}], 1)
 
 
-segments = st.sampled_from(["a", "b", "/", ".", "é", "€", "😀", "x/y"])
+segments = st.sampled_from(["a", "b", "/", ".", "\n", "é", "€", "😀", "x/y"])
 glob_parts = st.sampled_from(["a", "b", "/", ".", "é", "€", "😀", "*", "**", "**/", "?"])
 
 
@@ -210,11 +210,20 @@ def test_s3_round_trip(tmp_path):
     assert {k for k, *_ in rows} == {k for k in keys if states[floor].get(k) != states[head].get(k)}
     assert ix.stats()["gets"] > 0
 
-    cached = ChangeIndex(url, options, disk_dir=str(tmp_path))
+    cached = ChangeIndex(url, options, disk_dir=str(tmp_path), disk_store=url)
     assert cached.scan(layers, head)[0] == rows_head
-    reopened = ChangeIndex(url, options, disk_dir=str(tmp_path))
+    with pytest.raises(ValueError):
+        ChangeIndex(url, options, disk_dir=str(tmp_path), disk_store=url)
     for _ in range(100):
-        if reopened.scan(layers, head)[0] == rows_head and reopened.stats()["disk_reads"] > 0:
+        if cached.stats()["fills"] == len(layers):
             break
         time.sleep(0.05)
-    assert reopened.stats()["disk_reads"] > 0
+    del cached
+    for _ in range(100):
+        try:
+            reopened = ChangeIndex(url, options, disk_dir=str(tmp_path), disk_store=url)
+            break
+        except ValueError:
+            time.sleep(0.05)
+    assert reopened.scan(layers, head)[0] == rows_head
+    assert reopened.stats()["gets"] == 0 and reopened.stats()["disk_reads"] > 0

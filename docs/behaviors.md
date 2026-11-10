@@ -384,10 +384,12 @@ rerun.
 *From* `versions.md` §7. *Covered* `server/test_matrix.py::test_a_value_written_again_is_a_new_version_its_readers_reread`.
 
 **CHG-12. Patterns match keys by path segments.**
-`**` crosses `/`, `*` does not; `Regex(…)` too. `exclude="k1*"` is one
+`**` crosses `/`, `*` does not; `Regex(…)` too, in Rust's `regex` dialect
+against the whole key (no lookaround or backreferences: refused when
+declared). `exclude="k1*"` is one
 pattern, not its characters; `**/*old*` matches `Gold_ore.csv`, so word
 rules want segment-anchored patterns.
-*From* F1; `per-key-processing.md` §11. *Covered* `sdk/test_patterns.py::test_globs`; `sdk/test_patterns.py::test_one_exclude_pattern_is_a_pattern_not_its_characters`; `sdk/test_patterns.py::test_a_key_is_taken_when_an_include_and_no_exclude_matches`.
+*From* F1; `per-key-processing.md` §11. *Covered* `sdk/test_patterns.py::test_globs`; `sdk/test_patterns.py::test_one_exclude_pattern_is_a_pattern_not_its_characters`; `sdk/test_patterns.py::test_a_key_is_taken_when_an_include_and_no_exclude_matches`; `sdk/test_patterns.py::test_regex_is_rusts_dialect_matched_against_the_whole_key`.
 
 ## RST — upstream resets, removals, moves and renames
 

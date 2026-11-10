@@ -18,7 +18,7 @@ use solera_tracking as tr;
 use tr::codec::Ver;
 use tr::event::{Event, Part};
 use tr::plan::{InputRequest, Mode, Plan, Request};
-use tr::progress::{Class, Conditions, Key, Pat, Patterns};
+use tr::progress::{Class, Conditions, Key, Matcher, Pat, Patterns};
 
 use crate::index_py::{key, layers_in, rt, version, ChangeIndex, Owned};
 use crate::{guard, FormatError};
@@ -66,6 +66,68 @@ fn pat(p: &Bound<'_, PyAny>) -> PyResult<Pat> {
     Err(PyValueError::new_err(
         "a pattern is {\"glob\": …} or {\"regex\": …}",
     ))
+}
+
+/// Whether an input takes a key, from its manifest spec
+/// (`solera.patterns.spec(…)`; `None`: every key), with the matcher the
+/// planner uses.
+#[pyclass(frozen, module = "solera._native")]
+struct KeyMatcher {
+    include: Vec<Matcher>,
+    exclude: Vec<(String, Matcher)>,
+}
+
+#[pymethods]
+impl KeyMatcher {
+    #[new]
+    #[pyo3(signature = (patterns=None))]
+    fn new(patterns: Option<&Bound<'_, PyAny>>) -> PyResult<KeyMatcher> {
+        let mut m = KeyMatcher {
+            include: vec![],
+            exclude: vec![],
+        };
+        let Some(p) = patterns.filter(|p| !p.is_none()) else {
+            return Ok(m);
+        };
+        let p = p.cast::<PyDict>()?;
+        let one = |x: &Bound<'_, PyAny>| Matcher::new(&pat(x)?).map_err(err);
+        if let Some(inc) = item(p, "include")?.filter(|v| !v.is_none()) {
+            for x in inc.try_iter()? {
+                m.include.push(one(&x?)?);
+            }
+        }
+        if let Some(exc) = item(p, "exclude")?.filter(|v| !v.is_none()) {
+            for x in exc.try_iter()? {
+                let x = x?;
+                m.exclude
+                    .push((x.get_item(0)?.extract()?, one(&x.get_item(1)?)?));
+            }
+        }
+        Ok(m)
+    }
+
+    fn included(&self, key: &str) -> bool {
+        self.include.is_empty() || self.include.iter().any(|m| m.matches(key.as_bytes()))
+    }
+
+    /// The name of the first `exclude` pattern that matches the key.
+    fn excluded_by(&self, key: &str) -> Option<String> {
+        self.exclude
+            .iter()
+            .find(|(_, m)| m.matches(key.as_bytes()))
+            .map(|(n, _)| n.clone())
+    }
+
+    fn __call__(&self, key: &str) -> bool {
+        self.included(key) && self.excluded_by(key).is_none()
+    }
+}
+
+/// Refuses a pattern outside Solera's regex dialect, with what it lacks.
+#[pyfunction]
+fn regex_check(pattern: String) -> PyResult<()> {
+    Matcher::new(&Pat::Regex(pattern)).map_err(err)?;
+    Ok(())
 }
 
 /// Conditions from `{"patterns": solera.patterns.spec(…), "context": bytes, "definition": bytes, "rebuild": int}`.
@@ -736,5 +798,7 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(outcome_transition, m)?)?;
     m.add_function(wrap_pyfunction!(outcome_eligible, m)?)?;
     m.add_function(wrap_pyfunction!(outcome_backoff, m)?)?;
+    m.add_class::<KeyMatcher>()?;
+    m.add_function(wrap_pyfunction!(regex_check, m)?)?;
     m.add_class::<Tracking>()
 }
