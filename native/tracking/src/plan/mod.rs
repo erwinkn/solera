@@ -175,14 +175,19 @@ impl InputPlan {
 
     /// A digest of the batch's input: lineage recomputes it (§7).
     pub fn digest(&self) -> u64 {
-        let mut e = Enc::new();
-        for c in &self.keys {
-            e.bytes(&c.key);
-            e.u8(c.class as u8);
-            e.version(c.version.as_version());
-        }
-        xxh3_64(&e.buf)
+        digest(&self.keys)
     }
+}
+
+/// A digest of a batch's keys, classes and versions.
+pub fn digest(keys: &[Cand]) -> u64 {
+    let mut e = Enc::new();
+    for c in keys {
+        e.bytes(&c.key);
+        e.u8(c.class as u8);
+        e.version(c.version.as_version());
+    }
+    xxh3_64(&e.buf)
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -910,6 +915,57 @@ pub async fn plan(view: &View, req: &Request, ixs: &dyn Indexes, hold: &dyn Hold
         unkeyed: view.unkeyed.clone(),
         pass: None,
     })
+}
+
+/// What a batch's lineage replays (§12): the progress its record says it
+/// replaced, read the way `plan` read it.
+pub(crate) struct Replay<'a> {
+    pub ix: &'a ChangeIndex,
+    pub layers: &'a [LayerRef],
+    pub head: u64,
+    pub conditions: &'a Arc<Conditions>,
+    /// The replaced slice; empty for a full run's first batch.
+    pub keyed: &'a Keyed,
+    pub own: Option<(&'a ChangeIndex, &'a [LayerRef], u64)>,
+    pub all: bool,
+    /// The keys the batch left out: held back, or waiting for their retry.
+    pub hold: &'a dyn Hold,
+}
+
+impl Replay<'_> {
+    fn walker(&self) -> Walker<'_> {
+        Walker {
+            ix: self.ix,
+            layers: self.layers,
+            head: self.head,
+            now: self.conditions,
+            keyed: self.keyed,
+            own: self.own,
+            all: self.all,
+            input: 0,
+            hold: self.hold,
+            fails: None,
+        }
+    }
+
+    /// The keys a range batch planned over `range`, stopping past `limit`.
+    pub async fn range(&self, range: &KeyRange, limit: usize) -> Result<Vec<Cand>> {
+        let w = self.walker();
+        let mut found = Found::new(limit.saturating_add(1), true);
+        for piece in self.keyed.pieces(range) {
+            w.piece(&piece.range, &piece.value, &mut found).await?;
+            if found.full() {
+                break;
+            }
+        }
+        Ok(found.keys)
+    }
+
+    /// `keys` (sorted, distinct) as a key list plans them: each one the
+    /// consumer held or upstream has under the conditions, in its class.
+    pub async fn keys(&self, keys: &[Key]) -> Result<Vec<Cand>> {
+        Ok(listed_keys(&self.walker(), keys).await?.0)
+    }
 }
 
 /// The versions of `keys` (sorted, distinct) at commit `c`.

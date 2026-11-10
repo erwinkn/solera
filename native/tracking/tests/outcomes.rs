@@ -36,6 +36,7 @@ use solera_index::{ChangeIndex, LayerRef, NewCommit, Run, Store, StoreOptions, W
 use solera_tracking::codec::Ver;
 use solera_tracking::commit::OutputCommit;
 use solera_tracking::due;
+use solera_tracking::lineage::{self, Answer};
 use solera_tracking::event::{Event, Part};
 use solera_tracking::outcomes::commit::{self as oc, records, Ctx};
 use solera_tracking::outcomes::transition::{
@@ -576,6 +577,24 @@ impl World {
         );
     }
 
+    /// Lineage (§12) in every mode: the batch's keys recomputed from its
+    /// record, past its failing keys waiting for their retry, are its plan's.
+    async fn replay(&self, ix: &ChangeIndex, p: &plan::Plan, rec: &solera_tracking::record::Record) {
+        let got = lineage::input(&self.t.logs(rec, None), rec, &OneIndex(ix), 0)
+            .await
+            .unwrap();
+        let Answer::Found(got) = got else {
+            panic!("a batch just committed is retained: {got:?}");
+        };
+        let keys = |k: &Key, c: Class, v: &Ver| (k.clone(), c, v.clone());
+        assert_eq!(
+            got.iter().map(|r| keys(&r.key, r.class, &r.planned)).collect::<Vec<_>>(),
+            p.inputs[0].keys.iter().map(|c| keys(&c.key, c.class, &c.version)).collect::<Vec<_>>(),
+            "lineage of a batch over {:?}",
+            rec.range
+        );
+    }
+
     /// The worker runs a plan's keys and the engine commits them; the truth follows.
     /// None when the commit is refused: the state moved since the plan.
     async fn run(&mut self, ix: &ChangeIndex, p: &plan::Plan, retry: bool) -> Option<Vec<Key>> {
@@ -610,8 +629,12 @@ impl World {
                     self.upstream(ix).await;
                 }
             }
+            let rec = b.ops.records[0].clone();
             match self.land(b) {
-                Some(keys) => return Some(keys),
+                Some(keys) => {
+                    self.replay(ix, p, &rec).await;
+                    return Some(keys);
+                }
                 None if race => continue,
                 None => return None,
             }

@@ -5,6 +5,8 @@
 //! classes, versions and held-back keys, in every mode, over one or two
 //! keyed inputs, with batches committed several upstream commits after they
 //! were planned, loads at other versions, failures, resets and merges.
+//! Every batch's lineage, recomputed from its record then and at every later
+//! step, is what the batch received, or says its history was cut.
 //! `HISTORY_SEEDS` sets how many histories run.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -19,11 +21,13 @@ use solera_index::{
 };
 use solera_tracking::codec::Ver;
 use solera_tracking::event::{Event, Part};
+use solera_tracking::lineage::{self, Answer, Received};
 use solera_tracking::plan::{self, Hold, InputRequest, Mode, OneIndex, Request};
 use solera_tracking::progress::{
-    Class, Conditions, EdgeOpen, Holding, InputReport, Key, KeyRange, Pat, Patterns, Reason, Reset,
-    Value,
+    owed, Class, Conditions, EdgeOpen, Holding, InputReport, Key, KeyRange, Pat, Patterns, Reason,
+    Reset, Value,
 };
+use solera_tracking::record::Record;
 use solera_tracking::{Output, Tracking};
 
 fn key(s: &str) -> Key {
@@ -384,6 +388,7 @@ async fn history(rng: &mut SmallRng, ix: &ChangeIndex, planned: &mut [usize; 4])
         );
     }
     let mut cursor: Option<Key> = None;
+    let mut stored: Vec<Stored> = vec![];
     let n = rng.random_range(5..45);
     for _ in 0..n {
         let r: f64 = rng.random();
@@ -432,19 +437,22 @@ async fn history(rng: &mut SmallRng, ix: &ChangeIndex, planned: &mut [usize; 4])
                 inp.log.merge(ix, &mut t, cut).await;
             }
         } else {
-            batch(
-                rng,
-                ix,
-                &mut t,
-                &mut inputs,
-                &own,
-                &universe,
-                &mut cursor,
-                planned,
-            )
-            .await;
+            stored.extend(
+                batch(
+                    rng,
+                    ix,
+                    &mut t,
+                    &mut inputs,
+                    &own,
+                    &universe,
+                    &mut cursor,
+                    planned,
+                )
+                .await,
+            );
         }
         check(ix, &t, &inputs, &own, &universe).await;
+        check_lineage(rng, ix, &t, &inputs, &own, &universe, &stored).await;
     }
     n
 }
@@ -488,7 +496,7 @@ async fn batch(
     universe: &[Key],
     cursor: &mut Option<Key>,
     planned: &mut [usize; 4],
-) {
+) -> Vec<Stored> {
     let which = rng.random_range(0..10);
     let (mode, reset) = match which {
         0 => (Mode::All, false),
@@ -679,13 +687,149 @@ async fn batch(
     }
     let ops = t.progress_ops(&p, &reports, b"run/batch", None).unwrap();
     for (rec, ip) in ops.records.iter().zip(&p.inputs) {
-        let back = solera_tracking::record::Record::decode(&rec.encode()).unwrap();
+        let back = Record::decode(&rec.encode()).unwrap();
         assert_eq!(&back, rec);
         assert_eq!(rec.counts, ip.counts());
     }
-    apply(t, ops.parts);
+    apply(t, ops.parts.clone());
     if !matches!(mode, Mode::Keys(_)) {
         *cursor = p.range.hi.clone();
+    }
+
+    // What each input received: the plan's keys, then what the worker did.
+    let key_list = matches!(mode, Mode::Keys(_));
+    let mut stored = vec![];
+    for (i, ((rec, ip), report)) in ops.records.iter().zip(&p.inputs).zip(&reports).enumerate() {
+        let expected = ip
+            .keys
+            .iter()
+            .map(|c| {
+                let wanted = Holding::of(c.version.as_version(), &ip.conditions, &c.key);
+                let pointed = key_list || owed(&c.held, &wanted);
+                let got = report
+                    .loaded
+                    .iter()
+                    .find(|(k, _)| *k == c.key)
+                    .map(|(_, v)| match Holding::of(v.as_version(), &ip.conditions, &c.key) {
+                        Holding::Version(v, _) => v,
+                        _ => Ver::Absent,
+                    });
+                let (reason, loaded) = if ops.held_back[i].contains(&c.key) {
+                    (pointed.then_some(Reason::Unsettled), None)
+                } else if report.failed.contains(&c.key) {
+                    (pointed.then_some(Reason::Failed), None)
+                } else {
+                    let loaded = got.filter(|v| *v != c.version);
+                    let reason = if key_list {
+                        Some(Reason::KeyList)
+                    } else {
+                        loaded.is_some().then_some(Reason::Deviation)
+                    };
+                    (reason, loaded)
+                };
+                Received {
+                    key: c.key.clone(),
+                    class: c.class,
+                    held: c.held.clone(),
+                    planned: c.version.clone(),
+                    loaded,
+                    reason,
+                    deleted: false,
+                }
+            })
+            .collect();
+        stored.push(Stored {
+            rec: rec.clone(),
+            input: i,
+            expected,
+        });
+    }
+    stored
+}
+
+/// A batch's record and what that batch received.
+struct Stored {
+    rec: Record,
+    input: usize,
+    expected: Vec<Received>,
+}
+
+/// Whether cleanup, through commit `cleaned`, has released version `r` of `k`,
+/// which the log held at `head`: a later commit up to `cleaned` replaced it.
+fn released(log: &Log, k: &[u8], r: &Ver, head: u64, cleaned: u64) -> bool {
+    !r.is_absent() && (head + 1..=cleaned.min(log.head())).any(|c| log.at(c - 1, k) == *r && log.at(c, k) != *r)
+}
+
+fn floor(layers: &[LayerRef]) -> u64 {
+    layers.first().and_then(|l| l.floor).unwrap_or(0)
+}
+
+/// Every stored batch's lineage, at a random cleanup cursor: what the batch
+/// received, or "not retained" naming a commit below its log's floor. One
+/// key's trace agrees with the batch's, and a key's history is its log's.
+async fn check_lineage(
+    rng: &mut SmallRng,
+    ix: &ChangeIndex,
+    t: &Tracking,
+    inputs: &[Input],
+    own: &Log,
+    universe: &[Key],
+    stored: &[Stored],
+) {
+    for s in stored {
+        let log = &inputs[s.input].log;
+        let logs = t.logs(&s.rec, (s.input == 0).then_some(own.name.as_ref()));
+        let cleaned = rng.random_range(0..=log.head());
+        let got = lineage::input(&logs, &s.rec, &OneIndex(ix), cleaned)
+            .await
+            .unwrap();
+        let got = match got {
+            Answer::NotRetained { output, commit } => {
+                assert_eq!(output, log.name, "only the input's history is cut");
+                assert!(commit < floor(&log.layers), "not retained: {commit} is below the floor");
+                continue;
+            }
+            Answer::Found(got) => got,
+        };
+        let want: Vec<Received> = s
+            .expected
+            .iter()
+            .map(|r| Received {
+                deleted: released(log, &r.key, r.loaded.as_ref().unwrap_or(&r.planned), s.rec.head, cleaned),
+                ..r.clone()
+            })
+            .collect();
+        assert_eq!(got, want, "lineage of a batch over {:?}", s.rec.range);
+        for k in universe {
+            let one = lineage::received_key(&logs, &s.rec, k, &OneIndex(ix), cleaned)
+                .await
+                .unwrap();
+            assert_eq!(
+                one,
+                Answer::Found(got.iter().find(|r| r.key == *k).cloned()),
+                "the trace of {}",
+                String::from_utf8_lossy(k)
+            );
+        }
+    }
+    for inp in inputs {
+        let log = &inp.log;
+        let f = floor(&log.layers);
+        for k in universe {
+            let h = lineage::history(ix, &log.layers, k).await.unwrap();
+            let changes: Vec<(u64, Ver, Ver)> = (f + 1..=log.head())
+                .rev()
+                .filter(|&c| log.at(c, k) != log.at(c - 1, k))
+                .map(|c| (c, log.at(c, k), log.at(c - 1, k)))
+                .collect();
+            let at_floor = (f > 0).then(|| log.at(f, k)).filter(|v| !v.is_absent());
+            assert_eq!(
+                (h.floor, h.at_floor, h.changes),
+                (f, at_floor, changes),
+                "the history of {}",
+                String::from_utf8_lossy(k)
+            );
+        }
     }
 }
 
