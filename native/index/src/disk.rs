@@ -189,6 +189,28 @@ impl Disk {
         true
     }
 
+    /// Set `more` bytes aside for a claimed fill that grows as it is written
+    /// (a write-through); false, with nothing set aside, if they do not fit.
+    pub(crate) fn grow(&self, path: &str, more: u64) -> bool {
+        let mut st = self.st.lock().unwrap();
+        if !st.filling.contains(path) || st.reserved + more > self.o.bytes {
+            return false;
+        }
+        st.reserved += more;
+        let evict = self.make_room(&mut st);
+        drop(st);
+        self.remove(evict);
+        true
+    }
+
+    /// A claim given up, not failed: its room is given back.
+    pub(crate) fn release(&self, path: &str, size: u64) {
+        let mut st = self.st.lock().unwrap();
+        if st.filling.remove(path) {
+            st.reserved -= size;
+        }
+    }
+
     /// A claimed fill that failed: its room is given back, and it is not
     /// tried again for a while. Ending a claim twice changes nothing.
     pub(crate) fn abandon(&self, path: &str, size: u64) {

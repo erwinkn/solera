@@ -299,12 +299,21 @@ impl Store {
     async fn get(&self, path: &str, r: Range<u64>) -> Result<Bytes> {
         let p = self.path(path)?;
         let _permit = self.sem.acquire().await.expect("semaphore");
-        let b = self
-            .inner
-            .get_ranges(&p, std::slice::from_ref(&r))
-            .await?
-            .pop()
-            .unwrap_or_default();
+        let b = match self.inner.get_ranges(&p, std::slice::from_ref(&r)).await {
+            Ok(mut got) => got.pop().unwrap_or_default(),
+            Err(e) => {
+                // an object shorter than its reference is damaged, not unreachable
+                if let Ok(m) = self.inner.head(&p).await {
+                    if m.size < r.end {
+                        return Err(Error::Format(format!(
+                            "{path}: {} bytes, read at {r:?}",
+                            m.size
+                        )));
+                    }
+                }
+                return Err(e.into());
+            }
+        };
         if b.len() as u64 != r.end - r.start {
             return Err(Error::Format(format!("{path}: short read at {r:?}")));
         }
@@ -513,14 +522,21 @@ impl Store {
     }
 
     /// Start writing an object; its bytes go up in parts once past
-    /// `part_bytes`, and to the disk cache as they go. The disk cache never
-    /// fails a write: on a local error the object is simply not kept.
+    /// `part_bytes`, and to the disk cache as they go, within the room it can
+    /// set aside. The disk cache never fails a write: without room, or on a
+    /// local error, the object is simply not kept.
     pub(crate) fn upload(self: &Arc<Self>, path: &str) -> Result<Upload> {
         let tee = self
             .disk
             .as_ref()
-            .filter(|d| d.keeps(path))
-            .and_then(|d| d.temp().ok());
+            .filter(|d| d.claim(path, 0))
+            .and_then(|d| {
+                let t = d.temp().ok();
+                if t.is_none() {
+                    d.release(path, 0);
+                }
+                t
+            });
         Ok(Upload {
             store: self.clone(),
             path: self.path(path)?,
@@ -624,6 +640,9 @@ impl Drop for Upload {
     /// An upload dropped unfinished (an error, a cancelled merge) gives its
     /// parts back: S3 keeps them, billed, until aborted.
     fn drop(&mut self) {
+        if let (Some(_), Some(d)) = (self.tee.take(), &self.store.disk) {
+            d.release(&self.name, self.size);
+        }
         if let Some(w) = self.parts.take() {
             self.store.rt.spawn(async move {
                 let _ = w.abort().await;
@@ -634,13 +653,15 @@ impl Drop for Upload {
 
 impl Upload {
     pub(crate) async fn write(&mut self, mut bytes: Vec<u8>) -> Result<()> {
-        self.size += bytes.len() as u64;
-        let room = self.store.disk.as_ref().map_or(0, |d| d.o.bytes);
-        if self.size.saturating_mul(4) > room
-            || self.tee.as_mut().is_some_and(|t| t.write(&bytes).is_err())
-        {
-            self.tee = None;
+        let n = bytes.len() as u64;
+        if let (Some(t), Some(d)) = (self.tee.as_mut(), &self.store.disk) {
+            let kept = (self.size + n).saturating_mul(4) <= d.o.bytes && d.grow(&self.name, n);
+            if !kept || t.write(&bytes).is_err() {
+                self.tee = None;
+                d.release(&self.name, self.size + if kept { n } else { 0 });
+            }
         }
+        self.size += n;
         let part = self.store.opts.part_bytes;
         if self.parts.is_none() {
             if self.buf.is_empty() {
@@ -689,10 +710,8 @@ impl Upload {
         }
         self.store.stats.puts.fetch_add(1, Relaxed);
         if let (Some(t), Some(d)) = (self.tee.take(), &self.store.disk) {
-            if d.claim(&self.name, self.size) {
-                if let Err(e) = d.commit(t, &self.name, self.size) {
-                    eprintln!("solera-index: disk cache of {} failed: {e}", self.name);
-                }
+            if let Err(e) = d.commit(t, &self.name, self.size) {
+                eprintln!("solera-index: disk cache of {} failed: {e}", self.name);
             }
         }
         Ok(())

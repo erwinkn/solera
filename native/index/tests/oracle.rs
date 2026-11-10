@@ -1126,6 +1126,122 @@ fn a_fill_that_cannot_be_kept_gives_its_room_back_once() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+#[test]
+fn a_commit_count_past_its_section_is_a_format_error() {
+    let raw = [0x80u8, 0x80, 0x40];
+    let c = zstd::bulk::compress(&raw, 1).unwrap();
+    let mut b = (raw.len() as u32).to_le_bytes().to_vec();
+    b.extend((xxhash_rust::xxh3::xxh3_64(&c) as u32).to_le_bytes());
+    b.extend(&c);
+    match format::parse_commits(&b) {
+        Err(Error::Format(m)) => assert!(m.contains("1048576 commit headers"), "{m}"),
+        got => panic!("{got:?}"),
+    }
+}
+
+#[test]
+fn a_truncated_layer_is_a_format_error() {
+    let rt = runtime();
+    let dir = scratch("short");
+    std::fs::create_dir_all(&dir).unwrap();
+    let index = || {
+        let local = Arc::new(object_store::local::LocalFileSystem::new_with_prefix(&dir).unwrap());
+        let store = Store::new(
+            local,
+            Path::from(""),
+            rt.handle().clone(),
+            StoreOptions::default(),
+        )
+        .unwrap();
+        ChangeIndex::new(store, WriteOptions::default())
+    };
+    let mut run = Run::new();
+    run.push_key(b"k");
+    run.push_entry(1, Version::Int(1), Version::Absent);
+    let nc = NewCommit {
+        commit: 1,
+        time_ms: 0,
+        producer: b"",
+        live_before: 0,
+    };
+    let l = rt.block_on(index().write_commit("c1", nc, &run)).unwrap();
+    let file = dir.join("c1");
+    let b = std::fs::read(&file).unwrap();
+    std::fs::write(&file, &b[..b.len() - 1]).unwrap();
+    let got = rt.block_on(index().scan(&[l], 1, &Query::default()));
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(matches!(got, Err(Error::Format(_))), "{got:?}");
+}
+
+#[test]
+fn write_throughs_stay_within_the_disk_cache() {
+    let rt = runtime();
+    let dir = scratch("tee");
+    let slow = Arc::new(object_store::throttle::ThrottledStore::new(
+        InMemory::new(),
+        object_store::throttle::ThrottleConfig {
+            wait_put_per_call: std::time::Duration::from_millis(300),
+            ..Default::default()
+        },
+    ));
+    let index = |disk: Option<u64>| {
+        let opts = StoreOptions {
+            disk: disk.map(|bytes| DiskOptions {
+                dir: dir.clone(),
+                bytes,
+                store: "t".into(),
+            }),
+            ..Default::default()
+        };
+        let store = Store::new(slow.clone(), Path::from("t"), rt.handle().clone(), opts).unwrap();
+        ChangeIndex::new(store, WriteOptions::default())
+    };
+    let one = |v: u64| {
+        let mut run = Run::new();
+        run.push_key(b"k");
+        run.push_entry(1, Version::Int(v), Version::Absent);
+        run
+    };
+    let nc = NewCommit {
+        commit: 1,
+        time_ms: 0,
+        producer: b"",
+        live_before: 0,
+    };
+    let in_dir = |dir: &std::path::Path| -> u64 {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| !e.file_name().to_string_lossy().starts_with(".l"))
+            .filter(|e| e.file_name() != ".store")
+            .map(|e| e.metadata().unwrap().len())
+            .sum()
+    };
+    rt.block_on(async {
+        let size = index(None)
+            .write_commit("w0", nc, &one(1))
+            .await
+            .unwrap()
+            .size;
+        let bytes = size * 9 / 2;
+        let ix = index(Some(bytes));
+        let runs: Vec<(String, Run)> = (1..=8).map(|i| (format!("w{i}"), one(i))).collect();
+        let writes = futures::future::join_all(runs.iter().map(|(p, r)| ix.write_commit(p, nc, r)));
+        let probe = async {
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            in_dir(&dir)
+        };
+        let (done, used) = tokio::join!(writes, probe);
+        assert!(done.iter().all(|w| w.is_ok()));
+        assert!(
+            used <= bytes,
+            "{used} bytes on disk, the cache holds {bytes}"
+        );
+        assert!(in_dir(&dir) <= bytes && ix.store.disk_bytes() <= bytes);
+    });
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 async fn ix_scan(ix: &ChangeIndex, layers: &[LayerRef]) -> usize {
     ix.scan(layers, 1, &Query::default())
         .await
