@@ -154,7 +154,9 @@ def complete(w, core: Core) -> bool:
     )
 
 
-def replay(events: list[tuple], root, seed: int = 0, rate: float | None = None) -> int:
+def replay(
+    events: list[tuple], root, seed: int = 0, rate: float | None = None, at: set[int] | None = None
+) -> int:
     rnd = random.Random(seed)
     if rate is None:
         rate = rnd.choice((0.2, 0.6, 1.0))  # how often the engine refreshes
@@ -242,7 +244,7 @@ def replay(events: list[tuple], root, seed: int = 0, rate: float | None = None) 
             raise AssertionError(f"the model broke at {where}: {bad}")
         try:
             check(w, core, where + " (as known)", refreshed=False)
-            if rnd.random() < rate:
+            if (i in at) if at is not None else rnd.random() < rate:
                 core.refresh(w)
                 check(w, core, where + " (refreshed)", refreshed=True)
         except AssertionError as e:
@@ -278,3 +280,18 @@ STALENESS = {
 def test_the_models_history_for_each_witness_rule(tmp_path, rule, rate):
     """Each history the model shrank to pin one of its witness rules."""
     replay(STALENESS[rule], tmp_path, rate=rate)
+
+
+def test_a_reset_batch_leaves_everything_after_its_range_unknown(tmp_path):
+    """checks is fresh as of c1; k5's removal reaches no notice, then a full
+    run's first batch takes k1 only. Past the batch's range the consumer holds nothing any more, so k5's
+    removal owes nothing there: k2, never processed, is the witness."""
+    history = [
+        ("up", (("k1", 1), ("k2", 1), ("k5", 1)), False),
+        ("plan", 3),
+        ("commit", (), ()),
+        ("up", (("k5", ABSENT),), True),
+        ("full", 1),
+        ("commit", (), ()),
+    ]
+    replay(history, tmp_path, at={2})
