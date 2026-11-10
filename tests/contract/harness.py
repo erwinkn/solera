@@ -32,6 +32,14 @@ def engine_options(path: str) -> dict:
     return {} if path == "today" else {"tracking": path}
 
 
+def state_options(path: str) -> dict:
+    """The `State.open` arguments for a tracking path: the format it writes."""
+
+    from solera_server.journal import CORE_FORMAT
+
+    return {} if path == "today" else {"format": CORE_FORMAT}
+
+
 class Refused(AssertionError):
     """A request the API refused: its status and detail."""
 
@@ -87,6 +95,7 @@ class Solera:
             "contract",
             clock=self.clock,
             flush_interval=0.001,
+            **state_options(self.path),
         )
 
     async def _serve(self) -> None:

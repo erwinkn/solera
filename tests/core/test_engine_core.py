@@ -180,7 +180,7 @@ def test_a_removal_heavy_write_is_encoded_a_chunk_of_changes_at_a_time(monkeypat
     assert max(calls) <= 7 and sum(calls) == 100, calls
 
 
-def test_a_commit_takes_its_changes_as_bytes_or_a_read_only_map_only(tmp_path):
+def test_a_commit_takes_its_changes_as_bytes_or_a_files_path_only(tmp_path):
     import mmap
 
     from solera._native import ChangeIndex, Tracking, encode_changes
@@ -188,20 +188,14 @@ def test_a_commit_takes_its_changes_as_bytes_or_a_read_only_map_only(tmp_path):
     tracking = Tracking()
     tracking.attach(b"items", ChangeIndex(tmp_path.as_uri()))
     data = encode_changes(["k"])
-    with pytest.raises(TypeError):  # read-only, but over memory Python may still change
-        tracking.build_commit(b"items", memoryview(bytearray(data)).toreadonly(), version=1, path="a.lay")
     path = tmp_path / "changes"
     path.write_bytes(data)
     with path.open("rb") as f, mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mapped:
-        assert tracking.build_commit(b"items", mapped, version=1, path="b.lay")["added"] == 1
-
-    class Exporting(mmap.mmap):  # a subclass may export any buffer, a mutable one's too
-        def __buffer__(self, flags):
-            return memoryview(bytearray(data)).toreadonly()
-
-    with path.open("rb") as f, Exporting(f.fileno(), 0, access=mmap.ACCESS_READ) as mapped:
-        with pytest.raises(TypeError):
-            tracking.build_commit(b"items", mapped, version=2, path="c.lay")
+        # Any other buffer, a read-only one included, may be over memory Python can still change.
+        for other in (memoryview(bytearray(data)).toreadonly(), mapped, bytearray(data)):
+            with pytest.raises(TypeError):
+                tracking.build_commit(b"items", other, version=1, path="a.lay")
+    assert tracking.build_commit(b"items", str(path), version=1, path="b.lay")["added"] == 1
 
 
 async def test_a_launch_journals_no_layer_of_its_outputs(solera):
@@ -212,3 +206,24 @@ async def test_a_launch_journals_no_layer_of_its_outputs(solera):
     assert launches and not any(
         "core" in info for e in launches for info in e["prepared"]["outputs"].values()
     )
+
+
+async def test_an_engine_on_the_other_path_is_refused_before_it_fences_the_running_one(solera, tmp_path):
+    import obstore
+    from solera_server.journal import OldNamespace
+    from solera_server.state import State
+
+    ex = await Example(solera).start()
+    await ex.feed({"k1": "1"})
+    await solera.state.durable()
+
+    async def journal() -> dict:
+        found = await obstore.get_async(solera.state.objects, "control/journal.json")
+        return json.loads(bytes(await found.bytes_async()))
+
+    before = await journal()
+    with pytest.raises(OldNamespace):
+        await State.open((tmp_path / "state").as_uri(), "contract")  # today's path, format 5
+    after = await journal()
+    assert (after["engine"], after["epoch"]) == (before["engine"], before["epoch"])
+    await ex.feed({"k2": "1"})  # the running engine still writes

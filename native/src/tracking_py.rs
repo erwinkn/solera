@@ -10,10 +10,9 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 
-use pyo3::buffer::PyBuffer;
 use pyo3::exceptions::{PyKeyError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyDict, PyList, PyTuple};
+use pyo3::types::{PyBytes, PyDict, PyList, PyString, PyTuple};
 use solera_index as ix;
 use solera_tracking as tr;
 use tr::codec::Ver;
@@ -710,10 +709,10 @@ impl Tracking {
     /// B4: builds and writes the next commit of `output` from its changed
     /// keys (`encode_changes`'s form), on the change index attached for it;
     /// None if nothing changed. See
-    /// `commit_py::build_commit`. `changes` is `bytes`, or an `mmap.mmap`
-    /// mapped read-only (`mmap.ACCESS_READ`) of a file nothing writes while
-    /// the build runs (the engine's own unlinked temporary file), so a large
-    /// write's changes are read in place rather than held in memory.
+    /// `commit_py::build_commit`. `changes` is `bytes`, or the path of a
+    /// local file holding them, which nothing writes while the build runs
+    /// (the engine's own temporary file): mapped here, so a large write's
+    /// changes are read in place rather than held in memory.
     #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (output, changes, *, version, path, time_ms=0, producer=Vec::new(), mode="patch", at=None, collect=0))]
     fn build_commit<'py>(
@@ -729,24 +728,19 @@ impl Tracking {
         at: Option<u64>,
         collect: usize,
     ) -> PyResult<Option<Bound<'py, pyo3::types::PyDict>>> {
-        let mapped: PyBuffer<u8>;
+        let mapped: memmap2::Mmap;
         let data: &[u8] = if let Ok(b) = changes.cast_exact::<PyBytes>() {
             b.as_bytes()
+        } else if let Ok(file) = changes.cast_exact::<PyString>() {
+            let file = std::fs::File::open(file.to_str()?)?;
+            // SAFETY: the map is private to this call, and its file is the caller's own,
+            // written by nothing while the build runs.
+            mapped = unsafe { memmap2::Mmap::map(&file) }?;
+            &mapped
         } else {
-            let refused =
-                || PyTypeError::new_err("changes: bytes, or an mmap.mmap mapped with ACCESS_READ");
-            // Exactly mmap.mmap: a subclass may export another object's buffer.
-            if !changes.get_type().is(&py.import("mmap")?.getattr("mmap")?) {
-                return Err(refused());
-            }
-            mapped = PyBuffer::get(changes)?;
-            if !mapped.readonly() || !mapped.is_c_contiguous() {
-                return Err(refused());
-            }
-            // SAFETY: `mapped` holds the map's export until the build is done, so it is neither
-            // closed nor resized; an ACCESS_READ map refuses writes through Python, and its file
-            // is the engine's own, written by nothing while the build runs.
-            unsafe { std::slice::from_raw_parts(mapped.buf_ptr() as *const u8, mapped.len_bytes()) }
+            return Err(PyTypeError::new_err(
+                "changes: bytes, or a local file's path",
+            ));
         };
         let out = self
             .state

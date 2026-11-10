@@ -192,11 +192,14 @@ class Journal:
         snapshot: Callable[[], dict],
         *,
         writer: bool = True,
+        format: int | None = None,
     ) -> OpenResult:
         """Read the journal, load its checkpoint and apply its events, then
         fence: from here on this process is the only writer. `writer=False`
         opens read-only: nothing is fenced and appends fail — for tools that
-        inspect a namespace a server may be writing."""
+        inspect a namespace a server may be writing. A writer that will write
+        `format` is refused a namespace written in another (`use`) before it
+        fences anyone."""
 
         self._snapshot = snapshot
         while True:
@@ -227,6 +230,8 @@ class Journal:
                 self.stopped = Stopped("opened read-only")
                 self.ended.set()
                 return OpenResult(engine=None, replayed=replayed, checkpoint=checkpoint)
+            if format is not None:
+                self.use(format)
             engine = secrets.token_hex(8)  # no two processes share one (§10)
             epoch = int(body.get("epoch") or 0) + 1
             try:

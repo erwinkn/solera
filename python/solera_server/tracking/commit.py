@@ -15,7 +15,6 @@ of keys.
 from __future__ import annotations
 
 import contextlib
-import mmap
 import tempfile
 from dataclasses import dataclass, field
 
@@ -76,7 +75,8 @@ async def plan_of(core: Core, task: dict, attempt: str, prepared: dict) -> bytes
 async def changes_of(core: Core, name: str, entry: dict):
     """A write's changed keys: in the result, or in the file the worker put
     beside its output when they were too many for it (N13), streamed to a
-    local file and mapped, so the engine never holds a large write's keys."""
+    local file whose path `build_commit` maps, so the engine never holds a
+    large write's keys."""
 
     if entry.get("changes") is not None:
         yield unb64(entry["changes"])
@@ -88,12 +88,11 @@ async def changes_of(core: Core, name: str, entry: dict):
         found = await obstore.get_async(core.engine.state.objects, path)
     except (NotFoundError, FileNotFoundError):
         raise Conflict(f"keyed output {name}: its changed keys at {path} are gone") from None
-    with tempfile.TemporaryFile() as f:
+    with tempfile.NamedTemporaryFile() as f:
         async for chunk in found.stream():
             f.write(chunk)
         f.flush()
-        with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as data:
-            yield data
+        yield f.name
 
 
 async def build(core: Core, task: dict, attempt: str, prepared: dict, result: dict, outputs: dict) -> Built:
