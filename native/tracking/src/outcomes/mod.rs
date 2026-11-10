@@ -759,6 +759,13 @@ pub(crate) fn follow(p: &Part, t: &mut Tracking) {
                 }
             }
             if let Some(mut k) = t.per_key.remove(&r.from) {
+                t.per_key.insert(
+                    r.from.clone(),
+                    PerKey {
+                        life: k.life + 1,
+                        ..PerKey::default()
+                    },
+                );
                 if let Some(closed) = t.per_key.get(&r.to) {
                     k.life = k.life.max(closed.life);
                 }
