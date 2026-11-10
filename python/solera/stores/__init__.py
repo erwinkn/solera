@@ -23,6 +23,15 @@ class WriteError(StoreError):
     """Malformed write: duplicate keys, wrong shape, disallowed op."""
 
 
+class PublicationRefused(StoreError):
+    """A full run's publication (`full_run_ended`) the data refuses: its rows
+    break a constraint only the published rows can check (a unique index
+    spanning partitions, a foreign key). Nothing outside changed; it can
+    succeed only once the data or the definition changes, so the engine
+    retries it after the output's next commit, never on a timer
+    (docs/tracking-design.md §8, D211)."""
+
+
 class SourceBehind(StoreError):
     """A load by `Keys` answered without a key the index names: a
     source read as it is now no longer holds a key its commits say it has.
@@ -128,6 +137,13 @@ class WriteContext:
     # (docs/lifecycle.md §9.7); `None` outside an attempt.
     generation: int | None = None
     worker_id: str | None = None
+    # D211, the new core's writes only (`builds`): a full run builds beside the
+    # published rows. `build_run` is the core's full run in progress, else the
+    # run whose end the store was not yet told (`full_run_ended`); never both.
+    # Today's path leaves `builds` off and writes in place; the flag goes at
+    # the switch to the new core (B11), when every write builds.
+    build_run: int | None = None
+    builds: bool = False
 
 
 Version = int | str
@@ -227,6 +243,9 @@ class Store(Protocol):
 
     # fenced:    async def acquire(self, partition: Partition, prior: Ref | None) -> None
     #            def keys(self, ref: Ref, among: list[str] | None) -> Iterable[list[str]]
+    # in place:  async def written_at(self, versions, prior, context) -> Iterable[list[str]]
+    #            async def full_run_ended(self, output, partition, run, newest, *, home=None) -> bool
+    #            (D196, D211: docs/stores.md, "Tables: dead writers and full runs")
 
 
 def resolve_env(value: Any) -> Any:
