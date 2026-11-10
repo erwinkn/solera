@@ -15,6 +15,9 @@ use std::sync::Arc;
 
 const FIRST: u64 = 256 << 10;
 const MAX: u64 = 32 << 20;
+/// A read of listed keys launches its batches together, each about this size,
+/// cut only where a GET would end anyway.
+const ALL: u64 = 4 << 20;
 
 /// Sorted, distinct keys, back to back.
 #[derive(Default, Clone, Debug)]
@@ -157,7 +160,10 @@ pub(crate) struct Cursor {
     blocks: Vec<BlockRef>,
     next: usize,
     target: u64,
-    pending: Option<(Range<usize>, tokio::task::JoinHandle<Result<Vec<Cached>>>)>,
+    /// A read of listed keys: every batch is launched at once, and they are
+    /// decoded as they arrive.
+    all: bool,
+    pending: VecDeque<(Range<usize>, tokio::task::JoinHandle<Result<Vec<Cached>>>)>,
     ready: VecDeque<(Bytes, BlockRef)>,
     run: Run,
     pos: usize,
@@ -167,7 +173,7 @@ pub(crate) struct Cursor {
 
 impl Drop for Cursor {
     fn drop(&mut self) {
-        if let Some((_, h)) = &self.pending {
+        for (_, h) in &self.pending {
             h.abort();
         }
     }
@@ -255,8 +261,9 @@ impl Cursor {
             path,
             blocks,
             next: 0,
-            target: if all_at_once { u64::MAX } else { FIRST },
-            pending: None,
+            target: if all_at_once { ALL } else { FIRST },
+            all: all_at_once,
+            pending: VecDeque::new(),
             ready: VecDeque::new(),
             run: Run::new(),
             pos: 0,
@@ -268,23 +275,38 @@ impl Cursor {
     fn launch(&mut self) {
         let a = self.next;
         let mut bytes = 0u64;
-        while self.next < self.blocks.len() && (self.next == a || bytes < self.target) {
-            bytes += self.blocks[self.next].clen as u64;
+        let gap = self.store.opts.coalesce;
+        while self.next < self.blocks.len() {
+            let b = &self.blocks[self.next];
+            let joins = self.next > a && {
+                let p = &self.blocks[self.next - 1];
+                b.off <= p.off + p.clen as u64 + gap
+            };
+            if self.next > a && bytes >= self.target && !(self.all && joins) {
+                break;
+            }
+            bytes += b.clen as u64;
             self.next += 1;
         }
         if self.next == a {
             return;
         }
-        if self.target != u64::MAX {
+        let keep = if self.all {
+            self.blocks.iter().map(|b| b.clen as u64).sum::<u64>() <= self.store.opts.cache_batch
+        } else {
             self.target = (self.target * 2).min(MAX);
-        }
+            bytes <= self.store.opts.cache_batch
+        };
         let wants: Vec<(Part, Range<u64>, Want)> = self.blocks[a..self.next]
             .iter()
             .map(|b| {
                 (
                     Part::Block(b.off),
                     b.off..b.off + b.clen as u64,
-                    Want::Block { check: b.check },
+                    Want::Block {
+                        check: b.check,
+                        keep,
+                    },
                 )
             })
             .collect();
@@ -293,7 +315,7 @@ impl Cursor {
             .store
             .rt
             .spawn(async move { store.load(&path, wants).await });
-        self.pending = Some((a..self.next, h));
+        self.pending.push_back((a..self.next, h));
     }
 
     /// Make the current key valid; false once the layer has no more.
@@ -317,16 +339,21 @@ impl Cursor {
                 }
                 continue;
             }
-            if self.pending.is_none() {
+            if self.pending.is_empty() {
                 self.launch();
+                while self.all && self.next < self.blocks.len() {
+                    self.launch();
+                }
             }
-            let Some((span, h)) = self.pending.take() else {
+            let Some((span, h)) = self.pending.pop_front() else {
                 return Ok(false);
             };
             let got = h
                 .await
                 .map_err(|e| Error::Store(format!("fetch task: {e}").into()))??;
-            self.launch();
+            if !self.all {
+                self.launch();
+            }
             for (i, c) in span.zip(got) {
                 let Cached::Block(bytes) = c else {
                     unreachable!()
@@ -406,10 +433,16 @@ impl Walk {
         }
     }
 
-    fn pop(&mut self) -> usize {
+    /// Remove the top cursor (it has no more keys).
+    fn pop(&mut self) {
         let n = self.heap.len();
         self.heap.swap(0, n - 1);
-        let top = self.heap.pop().unwrap();
+        self.heap.pop();
+        self.sift_down();
+    }
+
+    /// The top cursor's key grew: move it down to its place.
+    fn sift_down(&mut self) {
         let n = self.heap.len();
         let mut k = 0;
         loop {
@@ -427,7 +460,6 @@ impl Walk {
             self.heap.swap(k, m);
             k = m;
         }
-        top
     }
 
     /// The next key the read takes, with its entries, into `group` (cleared
@@ -458,8 +490,7 @@ impl Walk {
                 .first()
                 .is_some_and(|&i| self.curs[i].key() == group.key(0))
             {
-                let i = self.pop();
-                let c = &mut self.curs[i];
+                let c = &mut self.curs[self.heap[0]];
                 if take {
                     for row in c.run.rows(c.pos) {
                         group.push_entry_from(&c.run, row);
@@ -467,7 +498,9 @@ impl Walk {
                 }
                 c.pos += 1;
                 if c.fill().await? {
-                    self.push(i);
+                    self.sift_down();
+                } else {
+                    self.pop();
                 }
             }
             if take {

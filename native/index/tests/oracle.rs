@@ -401,6 +401,29 @@ impl World {
                 ctx(&format!("history({:?})", q.q))
             );
         }
+        // the entries of a window of commits above the floor
+        let (w1, w2) = (
+            rng.random_range(floor + 1..=head + 1),
+            rng.random_range(floor..=head + 1),
+        );
+        let q = Q::gen(rng, h);
+        let want: Got = (0..h.keys.len())
+            .filter(|&k| q.takes(&h.keys[k]))
+            .filter_map(|k| {
+                let es: Vec<(u64, O, O)> = (w1..=w2.min(head))
+                    .rev()
+                    .filter_map(|c| h.entry(k, c).map(|e| (c, e.1.clone(), e.2.clone())))
+                    .collect();
+                (!es.is_empty()).then(|| (h.keys[k].clone(), es))
+            })
+            .collect();
+        let page = self.ix.window(&self.layers, w1..=w2, &q.q).await.unwrap();
+        assert_eq!(
+            got(&page),
+            q.page(want),
+            "{}",
+            ctx(&format!("window({w1}..={w2}, {:?})", q.q))
+        );
         // commit headers above the floor
         let hs = self.ix.commits(&self.layers, 0, head).await.unwrap();
         let want: Vec<u64> = (floor + 1..=head).collect();
@@ -450,8 +473,14 @@ fn index(rng: &mut SmallRng, rt: &tokio::runtime::Runtime) -> ChangeIndex {
             one_get: [0, 300, 1 << 20][rng.random_range(0..3)],
             max_inflight: rng.random_range(1..8),
             part_bytes: [200, 1 << 20][rng.random_range(0..2)],
+            cache_batch: [0, 300, 1 << 20][rng.random_range(0..3)],
+            disk: rng.random_bool(0.3).then(|| DiskOptions {
+                dir: scratch("oracle").join(rng.random::<u64>().to_string()),
+                bytes: [1_000, 1 << 30][rng.random_range(0..2)],
+            }),
         },
-    );
+    )
+    .unwrap();
     ChangeIndex::new(
         store,
         WriteOptions {
@@ -460,6 +489,11 @@ fn index(rng: &mut SmallRng, rt: &tokio::runtime::Runtime) -> ChangeIndex {
             seg_blocks: rng.random_range(1..5),
         },
     )
+}
+
+/// A directory for one test's disk caches.
+fn scratch(test: &str) -> std::path::PathBuf {
+    std::env::temp_dir().join(format!("solera-index-{test}-{}", std::process::id()))
 }
 
 fn runtime() -> tokio::runtime::Runtime {
@@ -520,6 +554,73 @@ fn queries_and_merges_match_the_fold() {
             w.check(&mut rng, seed).await;
         });
     }
+    let _ = std::fs::remove_dir_all(scratch("oracle"));
+}
+
+#[test]
+fn the_disk_cache_serves_reads_after_a_write_and_after_a_restart() {
+    let rt = runtime();
+    let mem = Arc::new(InMemory::new());
+    let (dir, fresh_dir) = (scratch("disk"), scratch("disk-fresh"));
+    let index = |disk: &std::path::Path| {
+        let opts = StoreOptions {
+            memory_bytes: 0,
+            disk: Some(DiskOptions {
+                dir: disk.to_path_buf(),
+                bytes: 1 << 30,
+            }),
+            ..Default::default()
+        };
+        let store = Store::new(mem.clone(), Path::from("t"), rt.handle().clone(), opts).unwrap();
+        ChangeIndex::new(store, WriteOptions::default())
+    };
+    rt.block_on(async {
+        let ix = index(&dir);
+        let mut run = Run::new();
+        for i in 0..5000u64 {
+            run.push_key(format!("k{i:05}").as_bytes());
+            run.push_entry(1, Version::Int(i), Version::Absent);
+        }
+        let nc = NewCommit {
+            commit: 1,
+            time_ms: 0,
+            producer: b"",
+            live_before: 0,
+        };
+        let layers = vec![ix.write_commit("c1", nc, &run).await.unwrap()];
+        // written through: no GET
+        assert_eq!(ix_scan(&ix, &layers).await, 5000);
+        assert_eq!(ix.store.stats.counts().gets, 0);
+        // a restart finds the file
+        let again = index(&dir);
+        assert_eq!(ix_scan(&again, &layers).await, 5000);
+        assert_eq!(again.store.stats.counts().gets, 0);
+        // an empty cache reads from the store, then fills in the background
+        let fresh = index(&fresh_dir);
+        assert_eq!(ix_scan(&fresh, &layers).await, 5000);
+        assert!(fresh.store.stats.counts().gets > 0);
+        for _ in 0..200 {
+            if fresh.store.stats.counts().fills == 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(fresh.store.stats.counts().fills, 1);
+        let fresh = index(&fresh_dir);
+        assert_eq!(ix_scan(&fresh, &layers).await, 5000);
+        assert_eq!(fresh.store.stats.counts().gets, 0);
+        assert!(fresh.store.stats.counts().disk_reads > 0);
+    });
+    let _ = std::fs::remove_dir_all(dir);
+    let _ = std::fs::remove_dir_all(fresh_dir);
+}
+
+async fn ix_scan(ix: &ChangeIndex, layers: &[LayerRef]) -> usize {
+    ix.scan(layers, 1, &Query::default())
+        .await
+        .unwrap()
+        .run
+        .len()
 }
 
 #[test]
@@ -600,7 +701,7 @@ fn a_flipped_byte_is_a_format_error() {
             )
         };
         let ix = ChangeIndex::new(
-            store(&mem),
+            store(&mem).unwrap(),
             WriteOptions {
                 block_bytes: 64,
                 level: 1,
@@ -635,7 +736,7 @@ fn a_flipped_byte_is_a_format_error() {
             let at = rng.random_range(0..b.len());
             b[at] ^= 1 << rng.random_range(0..8);
             mem.put(&path, b.into()).await.unwrap();
-            let ix = ChangeIndex::new(store(&mem), WriteOptions::default());
+            let ix = ChangeIndex::new(store(&mem).unwrap(), WriteOptions::default());
             let all = ix.history(&w.layers, &Query::default()).await;
             let commits = ix.commits(&w.layers, 0, w.head).await;
             let failed = [all.err(), commits.err()];

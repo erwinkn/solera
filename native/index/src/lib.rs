@@ -12,6 +12,7 @@
 //! The layer list is plain data the caller passes to each call: the engine's
 //! journaled state owns it, and nothing is found by LIST.
 
+mod disk;
 pub mod error;
 pub mod format;
 pub mod glob;
@@ -20,10 +21,11 @@ mod read;
 pub mod run;
 pub mod store;
 
+pub use disk::DiskOptions;
 pub use error::{Error, Result};
 pub use format::{CommitHeader, LayerRef, WriteOptions, Writer};
 pub use glob::{Glob, Pattern};
-pub use query::{check_layers, pick_merge, ChangeIndex, NewCommit, Page, Query};
+pub use query::{check_layers, pick_merge, ChangeIndex, Entries, NewCommit, Page, Query};
 pub use read::KeyList;
 pub use run::{Run, Version};
 pub use store::{Counts, Store, StoreOptions};

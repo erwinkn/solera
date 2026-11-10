@@ -192,17 +192,25 @@ pub struct ChangeIndex {
 impl ChangeIndex {
     /// `options` are object_store's (for S3: `aws_access_key_id`, `aws_endpoint`, `aws_allow_http`, …).
     #[new]
-    #[pyo3(signature = (url, options=None, *, memory_bytes=256 << 20, block_bytes=32 << 10, level=1))]
+    /// `disk_dir`: keep whole layer files there (for a remote store), up to `disk_bytes`.
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (url, options=None, *, memory_bytes=256 << 20, disk_dir=None, disk_bytes=16 << 30, block_bytes=32 << 10, level=1))]
     fn new(
         url: &str,
         options: Option<HashMap<String, String>>,
         memory_bytes: u64,
+        disk_dir: Option<std::path::PathBuf>,
+        disk_bytes: u64,
         block_bytes: usize,
         level: i32,
     ) -> PyResult<Self> {
         guard(|| {
             let opts = ix::StoreOptions {
                 memory_bytes,
+                disk: disk_dir.map(|dir| ix::DiskOptions {
+                    dir,
+                    bytes: disk_bytes,
+                }),
                 ..Default::default()
             };
             let store = ix::Store::from_url(
@@ -354,13 +362,16 @@ impl ChangeIndex {
     }
 
     /// Every retained entry of each key: rows `(key, [(commit, new, replaced), …])`,
-    /// newest first. A base's entries at or below its floor are the state there.
+    /// newest first; with `commits=(lo, hi)`, only those commits' entries,
+    /// reading only the layers that overlap them. A base's entries at or below
+    /// its floor are the state there.
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (layers, *, lo=None, hi=None, after=None, limit=None, include=None, exclude=None))]
+    #[pyo3(signature = (layers, *, commits=None, lo=None, hi=None, after=None, limit=None, include=None, exclude=None))]
     fn history<'py>(
         &self,
         py: Python<'py>,
         layers: &Bound<'py, PyAny>,
+        commits: Option<(u64, u64)>,
         lo: Option<String>,
         hi: Option<String>,
         after: Option<String>,
@@ -371,8 +382,9 @@ impl ChangeIndex {
         guard(|| {
             let ls = layers_in(layers)?;
             let q = query(lo, hi, after, limit, include, exclude);
+            let (a, b) = commits.unwrap_or((0, u64::MAX));
             let p = py
-                .detach(|| rt().block_on(self.ix.history(&ls, &q)))
+                .detach(|| rt().block_on(self.ix.window(&ls, a..=b, &q)))
                 .map_err(err)?;
             let r = &p.run;
             let rows = PyList::empty(py);
@@ -388,6 +400,57 @@ impl ChangeIndex {
                 rows.append((key(py, r.key(i)), es))?;
             }
             (rows, p.next.as_deref().map(|k| key(py, k))).into_pyobject(py)
+        })
+    }
+
+    /// How many keys `diff` would return, without building them.
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (layers, c1, c2, *, lo=None, hi=None, after=None, limit=None, include=None, exclude=None))]
+    fn count_diff(
+        &self,
+        py: Python<'_>,
+        layers: &Bound<'_, PyAny>,
+        c1: u64,
+        c2: u64,
+        lo: Option<String>,
+        hi: Option<String>,
+        after: Option<String>,
+        limit: Option<u64>,
+        include: Option<Vec<String>>,
+        exclude: Option<Vec<String>>,
+    ) -> PyResult<u64> {
+        guard(|| {
+            let ls = layers_in(layers)?;
+            let q = query(lo, hi, after, limit, include, exclude);
+            let mut n = 0;
+            py.detach(|| rt().block_on(self.ix.diff_with(&ls, c1, c2, &q, |_, _, _, _| n += 1)))
+                .map_err(err)?;
+            Ok(n)
+        })
+    }
+
+    /// How many keys `scan` would return, without building them.
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (layers, c, *, lo=None, hi=None, after=None, limit=None, include=None, exclude=None))]
+    fn count_scan(
+        &self,
+        py: Python<'_>,
+        layers: &Bound<'_, PyAny>,
+        c: u64,
+        lo: Option<String>,
+        hi: Option<String>,
+        after: Option<String>,
+        limit: Option<u64>,
+        include: Option<Vec<String>>,
+        exclude: Option<Vec<String>>,
+    ) -> PyResult<u64> {
+        guard(|| {
+            let ls = layers_in(layers)?;
+            let q = query(lo, hi, after, limit, include, exclude);
+            let mut n = 0;
+            py.detach(|| rt().block_on(self.ix.state_with(&ls, c, None, &q, |_, _, _, _| n += 1)))
+                .map_err(err)?;
+            Ok(n)
         })
     }
 
@@ -462,6 +525,9 @@ impl ChangeIndex {
         d.set_item("hits", c.hits)?;
         d.set_item("misses", c.misses)?;
         d.set_item("waits", c.waits)?;
+        d.set_item("disk_reads", c.disk_reads)?;
+        d.set_item("disk_bytes", c.disk_bytes)?;
+        d.set_item("fills", c.fills)?;
         Ok(d)
     }
 }

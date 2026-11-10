@@ -7,7 +7,7 @@ use crate::glob::Pattern;
 use crate::read::{Bounds, KeyList, Walk};
 use crate::run::{Run, Version};
 use crate::store::Store;
-use std::ops::{Bound, Range};
+use std::ops::{Bound, Range, RangeInclusive};
 use std::sync::Arc;
 
 /// What part of the key space a query reads, and how much of it it returns.
@@ -139,8 +139,17 @@ impl ChangeIndex {
         ))
     }
 
-    /// Keys whose state differs between C1 and C2, with both versions.
-    pub async fn diff(&self, layers: &[LayerRef], c1: u64, c2: u64, q: &Query) -> Result<Page> {
+    /// Keys whose state differs between C1 and C2: `on(key, newest commit
+    /// in the window, version at C2, version at C1)` for each, in key order.
+    /// Returns where the next page starts if the limit stopped it.
+    pub async fn diff_with(
+        &self,
+        layers: &[LayerRef],
+        c1: u64,
+        c2: u64,
+        q: &Query,
+        mut on: impl FnMut(&[u8], u64, Version<'_>, Version<'_>),
+    ) -> Result<Option<Vec<u8>>> {
         let range = check_layers(layers)?;
         at(c1, range, "C1")?;
         at(c2, range, "C2")?;
@@ -148,9 +157,8 @@ impl ChangeIndex {
             return invalid(format!("diff from {c1} to {c2}: C1 is after C2"));
         }
         let ls = pick(layers, c1, c2, &q.bounds());
-        let mut page = Page::default();
         let Some(mut w) = self.walk(ls, q, None, false).await? else {
-            return Ok(page);
+            return Ok(None);
         };
         let mut g = Run::new();
         let limit = q.limit.unwrap_or(u64::MAX);
@@ -166,31 +174,44 @@ impl ChangeIndex {
             if before == after {
                 continue;
             }
-            page.run.push_key(g.key(0));
-            page.run.push_entry(g.commit(newest), after, before);
+            on(g.key(0), g.commit(newest), after, before);
             n += 1;
             if n == limit {
-                page.next = Some(g.key(0).to_vec());
-                break;
+                return Ok(Some(g.key(0).to_vec()));
             }
         }
-        Ok(page)
+        Ok(None)
     }
 
-    async fn state_at(
+    /// `diff_with` into a page: one entry per key, `new` the version at C2,
+    /// `replaced` the version at C1.
+    pub async fn diff(&self, layers: &[LayerRef], c1: u64, c2: u64, q: &Query) -> Result<Page> {
+        let mut run = Run::new();
+        let next = self
+            .diff_with(layers, c1, c2, q, |k, c, new, replaced| {
+                run.push_key(k);
+                run.push_entry(c, new, replaced);
+            })
+            .await?;
+        Ok(Page { run, next })
+    }
+
+    /// Keys present at C, each with the entry that set its version:
+    /// `on(key, commit, version, replaced)`. With `keys`, only those.
+    pub async fn state_with(
         &self,
         layers: &[LayerRef],
         c: u64,
-        q: &Query,
         keys: Option<KeyList>,
-    ) -> Result<Page> {
+        q: &Query,
+        mut on: impl FnMut(&[u8], u64, Version<'_>, Version<'_>),
+    ) -> Result<Option<Vec<u8>>> {
         let range = check_layers(layers)?;
         at(c, range, "commit")?;
         let ls = pick(layers, 0, c, &q.bounds());
         let all_at_once = keys.is_some();
-        let mut page = Page::default();
         let Some(mut w) = self.walk(ls, q, keys, all_at_once).await? else {
-            return Ok(page);
+            return Ok(None);
         };
         let mut g = Run::new();
         let limit = q.limit.unwrap_or(u64::MAX);
@@ -199,23 +220,39 @@ impl ChangeIndex {
             let Some(r) = g.rows(0).find(|&r| g.commit(r) <= c) else {
                 continue;
             };
-            if g.new_version(r).is_absent() {
+            let v = g.new_version(r);
+            if v.is_absent() {
                 continue;
             }
-            page.run.push_key(g.key(0));
-            page.run.push_entry_from(&g, r);
+            on(g.key(0), g.commit(r), v, g.replaced_version(r));
             n += 1;
             if n == limit {
-                page.next = Some(g.key(0).to_vec());
-                break;
+                return Ok(Some(g.key(0).to_vec()));
             }
         }
-        Ok(page)
+        Ok(None)
+    }
+
+    async fn state_page(
+        &self,
+        layers: &[LayerRef],
+        c: u64,
+        keys: Option<KeyList>,
+        q: &Query,
+    ) -> Result<Page> {
+        let mut run = Run::new();
+        let next = self
+            .state_with(layers, c, keys, q, |k, c, new, replaced| {
+                run.push_key(k);
+                run.push_entry(c, new, replaced);
+            })
+            .await?;
+        Ok(Page { run, next })
     }
 
     /// Every key present at C, with its version.
     pub async fn scan(&self, layers: &[LayerRef], c: u64, q: &Query) -> Result<Page> {
-        self.state_at(layers, c, q, None).await
+        self.state_page(layers, c, None, q).await
     }
 
     /// The listed keys' state at C (those present).
@@ -226,29 +263,98 @@ impl ChangeIndex {
         keys: &[K],
         q: &Query,
     ) -> Result<Page> {
-        self.state_at(layers, c, q, Some(KeyList::new(keys))).await
+        self.state_page(layers, c, Some(KeyList::new(keys)), q)
+            .await
+    }
+
+    /// Every retained entry of each key, newest first: `on(group)` with one
+    /// key and its entries.
+    pub async fn history_with(
+        &self,
+        layers: &[LayerRef],
+        q: &Query,
+        on: impl FnMut(&Run),
+    ) -> Result<Option<Vec<u8>>> {
+        self.window_with(layers, 0..=u64::MAX, q, on).await
+    }
+
+    /// The entries of the commits in `commits`, key by key, newest first,
+    /// reading only the layers that overlap them; keys without one are
+    /// skipped. (A cleanup cursor stepping over commits reads each one's
+    /// replaced versions this way.)
+    pub async fn window_with(
+        &self,
+        layers: &[LayerRef],
+        commits: RangeInclusive<u64>,
+        q: &Query,
+        mut on: impl FnMut(&Run),
+    ) -> Result<Option<Vec<u8>>> {
+        check_layers(layers)?;
+        let (lo, hi) = (*commits.start(), *commits.end());
+        if lo > hi {
+            return Ok(None);
+        }
+        let ls = pick(layers, lo.saturating_sub(1), hi, &q.bounds());
+        let Some(mut w) = self.walk(ls, q, None, false).await? else {
+            return Ok(None);
+        };
+        let all = lo == 0 && hi == u64::MAX;
+        let (mut g, mut f) = (Run::new(), Run::new());
+        let limit = q.limit.unwrap_or(u64::MAX);
+        let mut n = 0;
+        while w.next(&mut g).await? {
+            if all {
+                on(&g);
+            } else {
+                f.clear();
+                for r in g.rows(0).filter(|&r| commits.contains(&g.commit(r))) {
+                    if f.is_empty() {
+                        f.push_key(g.key(0));
+                    }
+                    f.push_entry_from(&g, r);
+                }
+                if f.is_empty() {
+                    continue;
+                }
+                on(&f);
+            }
+            n += 1;
+            if n == limit {
+                return Ok(Some(g.key(0).to_vec()));
+            }
+        }
+        Ok(None)
+    }
+
+    /// The entries of the commits in `commits`, as `window_with`.
+    pub async fn window(
+        &self,
+        layers: &[LayerRef],
+        commits: RangeInclusive<u64>,
+        q: &Query,
+    ) -> Result<Page> {
+        let mut run = Run::new();
+        let next = self
+            .window_with(layers, commits, q, |g| run.push_key_from(g, 0))
+            .await?;
+        Ok(Page { run, next })
     }
 
     /// Every retained entry of each key, newest first.
     pub async fn history(&self, layers: &[LayerRef], q: &Query) -> Result<Page> {
-        check_layers(layers)?;
-        let ls = pick(layers, 0, u64::MAX, &q.bounds());
-        let mut page = Page::default();
-        let Some(mut w) = self.walk(ls, q, None, false).await? else {
-            return Ok(page);
-        };
-        let mut g = Run::new();
-        let limit = q.limit.unwrap_or(u64::MAX);
-        let mut n = 0;
-        while w.next(&mut g).await? {
-            page.run.push_key_from(&g, 0);
-            n += 1;
-            if n == limit {
-                page.next = Some(g.key(0).to_vec());
-                break;
-            }
-        }
-        Ok(page)
+        let mut run = Run::new();
+        let next = self
+            .history_with(layers, q, |g| run.push_key_from(g, 0))
+            .await?;
+        Ok(Page { run, next })
+    }
+
+    /// Every entry of one layer, key by key, read as a query reads it (for
+    /// verifying a layer; the list's rules do not apply).
+    pub async fn entries(&self, layer: &LayerRef) -> Result<Entries> {
+        Ok(Entries(
+            Walk::open(&self.store, &[layer], Bounds::all(), None, None, false).await?,
+        ))
     }
 
     /// The headers of the commits `lo..=hi` the layers hold.
@@ -362,8 +468,17 @@ impl ChangeIndex {
         };
         let fold = floor.unwrap_or(0);
         let newest_first: Vec<&LayerRef> = ins.iter().rev().collect();
-        let mut walk =
-            Walk::open(&self.store, &newest_first, Bounds::all(), None, None, false).await?;
+        let (walk, commits) = futures::future::join(
+            Walk::open(&self.store, &newest_first, Bounds::all(), None, None, false),
+            futures::future::try_join_all(ins.iter().map(|l| self.read_commits(l))),
+        )
+        .await;
+        let mut walk = walk?;
+        let headers: Vec<CommitHeader> = commits?
+            .into_iter()
+            .flatten()
+            .filter(|h| h.commit > fold)
+            .collect();
         let mut w = Writer::new(self.write, lo, hi, floor)?;
         let mut up = self.store.upload(path)?;
         let mut g = Run::new();
@@ -409,20 +524,21 @@ impl ChangeIndex {
                 up.write(w.take()).await?;
             }
         }
-        let mut headers = Vec::new();
-        for l in ins {
-            headers.extend(
-                self.read_commits(l)
-                    .await?
-                    .into_iter()
-                    .filter(|h| h.commit > fold),
-            );
-        }
         let mut out = w.finish(&headers)?;
         up.write(w.take()).await?;
         up.finish().await?;
         out.path = path.to_string();
         Ok(out)
+    }
+}
+
+/// A layer's entries, one key at a time.
+pub struct Entries(Walk);
+
+impl Entries {
+    /// The next key and its entries, newest first, into `group`; false at the end.
+    pub async fn next(&mut self, group: &mut Run) -> Result<bool> {
+        self.0.next(group).await
     }
 }
 
