@@ -1,17 +1,18 @@
-//! A read of listed keys holds a bounded window of fetched bytes, however
-//! densely its keys hit the layer (its own test binary: it measures the heap).
+//! Reads hold bounded memory however large the layer (their own test binary:
+//! it measures the heap, one test at a time).
 
 use object_store::local::LocalFileSystem;
 use object_store::path::Path;
 use solera_index::*;
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 struct Counting;
 
 static NOW: AtomicUsize = AtomicUsize::new(0);
 static PEAK: AtomicUsize = AtomicUsize::new(0);
+static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
 
 fn grew(n: usize) {
     let now = NOW.fetch_add(n, Relaxed) + n;
@@ -55,6 +56,7 @@ fn key(i: u64) -> Vec<u8> {
 
 #[test]
 fn a_read_of_listed_keys_holds_a_bounded_window() {
+    let _one = ONE_AT_A_TIME.lock().unwrap();
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
@@ -95,6 +97,28 @@ fn a_read_of_listed_keys_holds_a_bounded_window() {
         held < 40 << 20,
         "a get over a {} MB layer held {} MB",
         layer.size >> 20,
+        held >> 20
+    );
+}
+
+#[test]
+fn a_commit_count_allocates_only_for_the_headers_read() {
+    let _one = ONE_AT_A_TIME.lock().unwrap();
+    let mut raw = vec![0xff, 0xff, 0xff, 0x03];
+    raw.resize(64 << 20, 0);
+    let c = zstd::bulk::compress(&raw, 1).unwrap();
+    let mut b = (raw.len() as u32).to_le_bytes().to_vec();
+    b.extend((xxhash_rust::xxh3::xxh3_64(&c) as u32).to_le_bytes());
+    b.extend(&c);
+    drop(raw);
+    let base = NOW.load(Relaxed);
+    PEAK.store(base, Relaxed);
+    let got = format::parse_commits(&b);
+    let held = PEAK.load(Relaxed) - base;
+    assert!(matches!(got, Err(Error::Format(_))), "{got:?}");
+    assert!(
+        held < 128 << 20,
+        "a damaged commits section held {} MB",
         held >> 20
     );
 }

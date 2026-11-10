@@ -526,6 +526,7 @@ impl Store {
     /// set aside. The disk cache never fails a write: without room, or on a
     /// local error, the object is simply not kept.
     pub(crate) fn upload(self: &Arc<Self>, path: &str) -> Result<Upload> {
+        let object = self.path(path)?;
         let tee = self
             .disk
             .as_ref()
@@ -539,7 +540,7 @@ impl Store {
             });
         Ok(Upload {
             store: self.clone(),
-            path: self.path(path)?,
+            path: object,
             name: path.to_string(),
             buf: Vec::new(),
             parts: None,
