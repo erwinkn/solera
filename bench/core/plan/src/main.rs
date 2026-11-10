@@ -232,12 +232,30 @@ fn state(
     at: u64,
     cond: &Arc<Conditions>,
 ) -> Tracking {
-    scenario_state(layers, head, tasks, Some(Value::At(at, cond.clone())), 0, 0)
+    scenario_state(
+        layers,
+        head,
+        tasks,
+        Some(Value::At(at, cond.clone())),
+        0,
+        0,
+        None,
+    )
+}
+
+/// The keys of `points` failed keys spread over the key space, shifted by `shift`.
+fn point_keys(points: u32, space: u32, shift: u32) -> Vec<Key> {
+    (0..points)
+        .map(|j| key((space as u64 * j as u64 / points as u64) as u32 + shift).into())
+        .collect()
 }
 
 /// One output, and `tasks` consumers each with one piece of `value` over
 /// everything (None: a new edge, empty) and `points` failed keys spread
-/// over the key space, each holding its version at `at`.
+/// over the key space. With `seen` (each key's version at the piece's
+/// commit, as a batch commit records it), every consumer's points sit at the
+/// same keys; without, each consumer's are shifted, and the planner looks
+/// each one up.
 fn scenario_state(
     layers: &[LayerRef],
     head: u64,
@@ -245,6 +263,7 @@ fn scenario_state(
     value: Option<Value>,
     points: u32,
     space: u32,
+    seen: Option<&[Ver]>,
 ) -> Tracking {
     let mut t = Tracking::new();
     t.outputs.insert(
@@ -267,15 +286,17 @@ fn scenario_state(
             Value::At(_, c) => c.clone(),
             _ => Arc::new(Conditions::default()),
         };
-        let pts = (0..points)
-            .map(|j| {
-                let k: Key =
-                    key((space as u64 * j as u64 / points as u64) as u32 + i as u32).into();
+        let shift = if seen.is_some() { 0 } else { i as u32 };
+        let pts = point_keys(points, space, shift)
+            .into_iter()
+            .enumerate()
+            .map(|(j, k)| {
                 (
                     k,
                     Point {
                         holding: Holding::Version(Ver::Int(1), cond.clone()),
                         reason: Reason::Failed,
+                        seen: seen.map(|v| v[j].clone()),
                     },
                 )
             })
@@ -500,6 +521,23 @@ fn main() {
         context: b"old".as_slice().into(),
         ..Default::default()
     });
+    let seen: Vec<Ver> = {
+        let ix = index(&dir, None, &rt, memory);
+        let keys = point_keys(10_000, n, 0);
+        let page = rt
+            .block_on(ix.get(&layers, p, &keys, &Query::default()))
+            .unwrap();
+        let mut got = HashMap::new();
+        for i in 0..page.run.len() {
+            got.insert(
+                page.run.key(i).to_vec(),
+                Ver::of(page.run.new_version(page.run.rows(i).start)),
+            );
+        }
+        keys.iter()
+            .map(|k| got.get(&k[..]).cloned().unwrap_or(Ver::Absent))
+            .collect()
+    };
     let scenarios: Vec<(&str, Option<Value>, u32, usize)> = vec![
         ("day", Some(Value::At(p, cond.clone())), 0, usize::MAX),
         (
@@ -512,6 +550,12 @@ fn main() {
         ("context", Some(Value::At(p, old.clone())), 0, max_batches),
         (
             "points",
+            Some(Value::At(p, cond.clone())),
+            10_000,
+            max_batches,
+        ),
+        (
+            "points-lookup",
             Some(Value::At(p, cond.clone())),
             10_000,
             max_batches,
@@ -536,6 +580,7 @@ fn main() {
                 value.clone(),
                 points,
                 n,
+                (scenario == "points").then_some(seen.as_slice()),
             ));
             let starts: Vec<Option<Key>> = (0..tasks)
                 .map(|i| (i > 0).then(|| key((n as u64 * i as u64 / tasks as u64) as u32).into()))

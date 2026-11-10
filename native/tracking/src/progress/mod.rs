@@ -431,6 +431,12 @@ impl Reason {
 pub struct Point {
     pub holding: Holding,
     pub reason: Reason,
+    /// The version upstream had, under the point's piece's patterns, at the
+    /// commit of the piece the point was written with (a batch writes its
+    /// points with its piece): the planner then reads the key's version at
+    /// the head from the piece's diff, with no lookup. `None` for a key
+    /// list's points, which sit in an older piece.
+    pub seen: Option<Ver>,
 }
 
 pub type Key = Box<[u8]>;
@@ -565,6 +571,13 @@ fn encode_points<'a>(
         e.bytes(k);
         e.u8(p.reason as u8);
         p.holding.encode(e, t);
+        match &p.seen {
+            None => e.u8(0),
+            Some(v) => {
+                e.u8(1);
+                e.version(v.as_version());
+            }
+        }
     }
 }
 
@@ -574,10 +587,22 @@ fn decode_points(d: &mut Dec<'_>, conds: &[Arc<Conditions>]) -> Result<Vec<(Key,
         let k: Key = d.bytes()?.into();
         let reason = Reason::from_u8(d.u8()?)?;
         let holding = Holding::decode(d, conds)?;
+        let seen = match d.u8()? {
+            0 => None,
+            1 => Some(d.ver()?),
+            t => return format(format!("seen tag {t}")),
+        };
         if out.last().is_some_and(|(last, _)| *last >= k) {
             return format("points out of order");
         }
-        out.push((k, Point { holding, reason }));
+        out.push((
+            k,
+            Point {
+                holding,
+                reason,
+                seen,
+            },
+        ));
     }
     Ok(out)
 }
