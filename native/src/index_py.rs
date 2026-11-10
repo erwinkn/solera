@@ -152,16 +152,20 @@ fn query(
     limit: Option<u64>,
     include: Option<Vec<String>>,
     exclude: Option<Vec<String>>,
-) -> Query {
+) -> PyResult<Query> {
     let (include, exclude) = (include.unwrap_or_default(), exclude.unwrap_or_default());
-    Query {
+    let pattern = if include.is_empty() && exclude.is_empty() {
+        None
+    } else {
+        Some(ix::Pattern::new(&include, &exclude).map_err(err)?)
+    };
+    Ok(Query {
         lo: lo.map(String::into_bytes),
         hi: hi.map(String::into_bytes),
         after: after.map(String::into_bytes),
         limit,
-        pattern: (!include.is_empty() || !exclude.is_empty())
-            .then(|| ix::Pattern::new(&include, &exclude)),
-    }
+        pattern,
+    })
 }
 
 /// `(rows, next)`: rows `(key, commit, new, replaced)`, one per key; `next`
@@ -302,7 +306,7 @@ impl ChangeIndex {
     ) -> PyResult<Bound<'py, PyTuple>> {
         guard(|| {
             let ls = layers_in(layers)?;
-            let q = query(lo, hi, after, limit, include, exclude);
+            let q = query(lo, hi, after, limit, include, exclude)?;
             let p = py
                 .detach(|| rt().block_on(self.ix.diff(&ls, c1, c2, &q)))
                 .map_err(err)?;
@@ -327,7 +331,7 @@ impl ChangeIndex {
     ) -> PyResult<Bound<'py, PyTuple>> {
         guard(|| {
             let ls = layers_in(layers)?;
-            let q = query(lo, hi, after, limit, include, exclude);
+            let q = query(lo, hi, after, limit, include, exclude)?;
             let p = py
                 .detach(|| rt().block_on(self.ix.scan(&ls, c, &q)))
                 .map_err(err)?;
@@ -353,7 +357,7 @@ impl ChangeIndex {
     ) -> PyResult<Bound<'py, PyTuple>> {
         guard(|| {
             let ls = layers_in(layers)?;
-            let q = query(lo, hi, after, limit, include, exclude);
+            let q = query(lo, hi, after, limit, include, exclude)?;
             let p = py
                 .detach(|| rt().block_on(self.ix.get(&ls, c, &keys, &q)))
                 .map_err(err)?;
@@ -381,7 +385,7 @@ impl ChangeIndex {
     ) -> PyResult<Bound<'py, PyTuple>> {
         guard(|| {
             let ls = layers_in(layers)?;
-            let q = query(lo, hi, after, limit, include, exclude);
+            let q = query(lo, hi, after, limit, include, exclude)?;
             let (a, b) = commits.unwrap_or((0, u64::MAX));
             let p = py
                 .detach(|| rt().block_on(self.ix.window(&ls, a..=b, &q)))
@@ -421,7 +425,7 @@ impl ChangeIndex {
     ) -> PyResult<u64> {
         guard(|| {
             let ls = layers_in(layers)?;
-            let q = query(lo, hi, after, limit, include, exclude);
+            let q = query(lo, hi, after, limit, include, exclude)?;
             let mut n = 0;
             py.detach(|| rt().block_on(self.ix.diff_with(&ls, c1, c2, &q, |_, _, _, _| n += 1)))
                 .map_err(err)?;
@@ -446,7 +450,7 @@ impl ChangeIndex {
     ) -> PyResult<u64> {
         guard(|| {
             let ls = layers_in(layers)?;
-            let q = query(lo, hi, after, limit, include, exclude);
+            let q = query(lo, hi, after, limit, include, exclude)?;
             let mut n = 0;
             py.detach(|| rt().block_on(self.ix.state_with(&ls, c, None, &q, |_, _, _, _| n += 1)))
                 .map_err(err)?;
@@ -535,8 +539,10 @@ impl ChangeIndex {
 /// Whether `key` matches the include and exclude globs as the index reads them.
 #[pyfunction]
 #[pyo3(signature = (key, include, exclude=Vec::new()))]
-fn index_pattern_matches(key: &str, include: Vec<String>, exclude: Vec<String>) -> bool {
-    ix::Pattern::new(&include, &exclude).matches(key.as_bytes())
+fn index_pattern_matches(key: &str, include: Vec<String>, exclude: Vec<String>) -> PyResult<bool> {
+    Ok(ix::Pattern::new(&include, &exclude)
+        .map_err(err)?
+        .matches(key.as_bytes()))
 }
 
 pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {

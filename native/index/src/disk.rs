@@ -116,24 +116,23 @@ impl Disk {
         self.st.lock().unwrap().filling.remove(path);
     }
 
-    /// A temporary file in the cache's directory, to become `path` by `add`.
-    pub(crate) fn temp(&self) -> std::io::Result<(PathBuf, std::fs::File)> {
-        let t = self.o.dir.join(format!(".tmp-{:016x}", rand_id()));
-        let f = std::fs::File::create(&t)?;
-        Ok((t, f))
+    /// A temporary file in the cache's directory, to become a layer's by
+    /// `commit`; removed if dropped before.
+    pub(crate) fn temp(&self) -> std::io::Result<Temp> {
+        let path = self.o.dir.join(format!(".tmp-{:016x}", rand_id()));
+        let file = std::fs::File::create(&path)?;
+        Ok(Temp {
+            path,
+            file,
+            kept: false,
+        })
     }
 
-    /// The temporary file `t` is complete: it becomes `path`.
-    pub(crate) fn commit(
-        &self,
-        t: &std::path::Path,
-        mut f: std::fs::File,
-        path: &str,
-        size: u64,
-    ) -> std::io::Result<()> {
-        f.flush()?;
-        drop(f);
-        std::fs::rename(t, self.file(path))?;
+    /// The temporary file `t` is complete: it becomes `path`'s.
+    pub(crate) fn commit(&self, mut t: Temp, path: &str, size: u64) -> std::io::Result<()> {
+        t.file.flush()?;
+        std::fs::rename(&t.path, self.file(path))?;
+        t.kept = true;
         self.add(path, size);
         Ok(())
     }
@@ -166,6 +165,26 @@ impl Disk {
 
     pub(crate) fn total(&self) -> u64 {
         self.st.lock().unwrap().total
+    }
+}
+
+pub(crate) struct Temp {
+    path: PathBuf,
+    file: std::fs::File,
+    kept: bool,
+}
+
+impl Temp {
+    pub(crate) fn write(&mut self, b: &[u8]) -> std::io::Result<()> {
+        self.file.write_all(b)
+    }
+}
+
+impl Drop for Temp {
+    fn drop(&mut self) {
+        if !self.kept {
+            let _ = std::fs::remove_file(&self.path);
+        }
     }
 }
 

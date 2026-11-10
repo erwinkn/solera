@@ -4,10 +4,10 @@ The shipped reader (`native/index`) meets the bar set by the format benchmark's 
 
 ## Method
 
-`change-index-bench` (`src/main.rs`) replays T44's run: the same workload generators, seed (7), 30 days × 24 commits a day on top of a load commit, the same layer schedule (`src/sched.rs`, the size rule), and the same query set. Layers are written by the crate's own `write_commit` and `merge`, and queries go through `ChangeIndex` with its default `StoreOptions`.
+`change-index-bench` (`src/main.rs`) replays T44's run: the same workload generators, seed (7), 30 days × 24 commits a day on top of a load commit, the same layer schedule (`src/sched.rs`, the size rule), and the same query set. The layers the schedule leaves are written directly with the crate's `Writer` (the encoder `write_commit` and `merge` use). The measured merges go through `ChangeIndex::merge`, and queries go through `ChangeIndex` with its default `StoreOptions`.
 
 - **cold**: a fresh `Store` (empty memory cache) over a simulated object store (`src/sim.rs`) that charges every GET 30 ms of latency plus transfer at 80 MB/s, as T44 did. Times are wall time; GETs and MB are what the store served.
-- **warm**: the same query again on a store with no simulated latency, every block cached. *warm CPU* is the query's thread CPU time.
+- **warm**: the same query on another fresh `Store` with no simulated latency, over the same local files, which the OS has already cached. The memory cache starts empty, so *warm CPU* (the query's thread CPU time) covers reading, checking and decoding every block the query needs.
 - **peak MB**: the counting allocator's high-water mark during the query, minus what was allocated before it started.
 - **fold ✓**: the result equals the brute-force fold of the commit stream at the queried commits.
 - The T44 numbers are its final runs (`t44/*.jsonl`, the "ours" rows of `exp/layer-format` `results/final-*`).

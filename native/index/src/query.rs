@@ -81,6 +81,7 @@ pub fn check_layers(layers: &[LayerRef]) -> Result<(u64, u64)> {
         if i > 0 && l.floor.is_some() {
             return invalid(format!("{}: only the oldest layer may be a base", l.path));
         }
+        l.check()?;
     }
     Ok((first.floor.unwrap_or(0), layers.last().unwrap().hi))
 }

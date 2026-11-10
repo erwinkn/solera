@@ -77,6 +77,28 @@ pub struct LayerRef {
     pub flags: u64,
 }
 
+impl LayerRef {
+    /// What a reference must hold before any of its file is read: offsets in
+    /// order within the file, and no commit flag this reader does not know.
+    pub fn check(&self) -> Result<()> {
+        if self.flags & !KNOWN_COMMIT_FLAGS != 0 {
+            return format(format!(
+                "{}: commit flags {:#x} are not understood by this reader",
+                self.path, self.flags
+            ));
+        }
+        if self.index_start > self.top_start
+            || self.top_start.checked_add(TRAILER as u64) > Some(self.size)
+        {
+            return invalid(format!(
+                "{}: offsets out of order: index {}, top {}, size {}",
+                self.path, self.index_start, self.top_start, self.size
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// One commit's header. Encoded as a length-prefixed record whose fields are
 /// read in order, so later versions append fields and older readers skip them.
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
@@ -572,8 +594,16 @@ impl Index {
         self.after_first_at_or_below(k).checked_sub(1)
     }
 
-    fn bytes(&self) -> usize {
-        self.off.len() * 24 + self.first.len()
+    /// Memory it holds, for the cache's budget.
+    pub(crate) fn bytes(&self) -> usize {
+        self.off.capacity() * 8
+            + (self.clen.capacity()
+                + self.rlen.capacity()
+                + self.n.capacity()
+                + self.check.capacity()
+                + self.first_end.capacity())
+                * 4
+            + self.first.capacity()
     }
 
     fn parse(b: &[u8], count: Option<u64>, base: u64, relative: bool) -> Result<Index> {
@@ -715,6 +745,9 @@ impl Top {
 }
 
 pub(crate) fn decompress(c: &[u8], rlen: usize) -> Result<Vec<u8>> {
+    if !matches!(zstd::zstd_safe::get_frame_content_size(c), Ok(Some(n)) if n == rlen as u64) {
+        return format(format!("the compressed frame does not hold {rlen} bytes"));
+    }
     let raw = zstd::bulk::decompress(c, rlen).map_err(|e| Error::Format(format!("zstd: {e}")))?;
     if raw.len() != rlen {
         return format("decompressed length mismatch");

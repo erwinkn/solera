@@ -3,7 +3,7 @@
 //! single flight, so that concurrent queries needing the same block or
 //! segment wait on one GET instead of each making its own.
 
-use crate::disk::{Disk, DiskOptions};
+use crate::disk::{Disk, DiskOptions, Temp};
 use crate::error::{Error, Result};
 use crate::format::{parse_segment, Index, LayerRef, Top};
 use bytes::Bytes;
@@ -119,7 +119,7 @@ impl Cached {
         64 + match self {
             Cached::Block(b) => b.len(),
             Cached::Top(t) => t.bytes(),
-            Cached::Seg(s) => s.len() * 24,
+            Cached::Seg(s) => s.bytes(),
         }
     }
 }
@@ -211,8 +211,18 @@ impl Store {
         rt: tokio::runtime::Handle,
         opts: StoreOptions,
     ) -> Result<Arc<Store>> {
+        let ns = format!("{inner}/{prefix}");
+        let disk = opts.disk.clone().map(|o| {
+            Disk::open(DiskOptions {
+                dir: o.dir.join(format!(
+                    "{:016x}",
+                    xxhash_rust::xxh3::xxh3_64(ns.as_bytes())
+                )),
+                ..o
+            })
+        });
         Ok(Arc::new(Store {
-            disk: opts.disk.clone().map(Disk::open).transpose()?,
+            disk: disk.transpose()?,
             inner,
             prefix,
             rt,
@@ -286,6 +296,7 @@ impl Store {
     /// A layer's top level, read once and cached; with small metadata, its
     /// segments come in the same GET.
     pub(crate) async fn top(self: &Arc<Self>, l: &LayerRef) -> Result<Arc<Top>> {
+        l.check()?;
         let whole = l.size - l.index_start <= self.opts.one_get;
         let start = if whole { l.index_start } else { l.top_start };
         let want = Want::Top { layer: l.clone() };
@@ -295,11 +306,12 @@ impl Store {
                 vec![(Part::Top, start..l.size, want)],
             )
             .await?;
+        let Cached::Top(t) = &got[0] else {
+            unreachable!()
+        };
+        t.check(l)?;
         self.fill(l);
-        match &got[0] {
-            Cached::Top(t) => Ok(t.clone()),
-            _ => unreachable!(),
-        }
+        Ok(t.clone())
     }
 
     /// Fetch what is wanted of one object, from the cache, from a GET already
@@ -345,11 +357,13 @@ impl Store {
                 }
                 let items: Vec<(Part, Range<u64>, Want)> =
                     claims[g..e].iter().map(|&i| wants[i].clone()).collect();
-                let fut = self
-                    .clone()
-                    .fetch(path.clone(), span, items)
-                    .boxed()
-                    .shared();
+                let task = self.rt.spawn(self.clone().fetch(path.clone(), span, items));
+                let fut = async move {
+                    task.await
+                        .unwrap_or_else(|e| Err(Error::Store(format!("a read failed: {e}").into())))
+                }
+                .boxed()
+                .shared();
                 for (j, &i) in claims[g..e].iter().enumerate() {
                     st.inflight
                         .insert((path.clone(), wants[i].0.clone()), (fut.clone(), j));
@@ -374,6 +388,11 @@ impl Store {
         span: Range<u64>,
         items: Vec<(Part, Range<u64>, Want)>,
     ) -> std::result::Result<Arc<Vec<Cached>>, Error> {
+        let _claim = Claim {
+            store: &self,
+            path: &path,
+            parts: &items,
+        };
         let got = self.get_range(&path, span.clone()).await;
         let mut extra: Vec<(Part, Cached)> = Vec::new();
         let parsed: Result<Vec<Cached>> = got.and_then(|b| {
@@ -386,11 +405,8 @@ impl Store {
                 })
                 .collect()
         });
-        let mut st = self.state.lock().unwrap();
-        for (part, ..) in &items {
-            st.inflight.remove(&(path.clone(), part.clone()));
-        }
         let parsed = parsed?;
+        let mut st = self.state.lock().unwrap();
         for ((part, _, w), v) in items.iter().zip(&parsed) {
             if !matches!(w, Want::Block { keep: false, .. }) {
                 st.lru.insert((path.clone(), part.clone()), v.clone());
@@ -422,16 +438,16 @@ impl Store {
     async fn download(&self, path: &str, size: u64) -> Result<()> {
         let d = self.disk.as_ref().unwrap();
         let io = |e: std::io::Error| Error::Store(format!("disk cache: {e}").into());
-        let (t, mut f) = d.temp().map_err(io)?;
+        let mut t = d.temp().map_err(io)?;
         let mut at = 0;
         while at < size {
             let end = (at + self.opts.max_get).min(size);
             let b = self.get_range(path, at..end).await?;
-            std::io::Write::write_all(&mut f, &b).map_err(io)?;
+            t.write(&b).map_err(io)?;
             at = end;
         }
         self.stats.fills.fetch_add(1, Relaxed);
-        d.commit(&t, f, path, size).map_err(io)
+        d.commit(t, path, size).map_err(io)
     }
 
     /// Bytes of the disk cache in use.
@@ -458,6 +474,23 @@ impl Store {
             tee,
             size: 0,
         })
+    }
+}
+
+/// A fetch's claim on its parts: while it lives, other reads of them wait
+/// on the fetch; it ends however the fetch does (done, failed, panicked).
+struct Claim<'a> {
+    store: &'a Store,
+    path: &'a Arc<str>,
+    parts: &'a [(Part, Range<u64>, Want)],
+}
+
+impl Drop for Claim<'_> {
+    fn drop(&mut self) {
+        let mut st = self.store.state.lock().unwrap_or_else(|e| e.into_inner());
+        for (part, ..) in self.parts {
+            st.inflight.remove(&(self.path.clone(), part.clone()));
+        }
     }
 }
 
@@ -520,23 +553,15 @@ pub(crate) struct Upload {
     name: String,
     buf: Vec<u8>,
     parts: Option<WriteMultipart>,
-    tee: Option<(std::path::PathBuf, std::fs::File)>,
+    tee: Option<Temp>,
     size: u64,
-}
-
-impl Drop for Upload {
-    fn drop(&mut self) {
-        if let Some((t, _)) = &self.tee {
-            let _ = std::fs::remove_file(t);
-        }
-    }
 }
 
 impl Upload {
     pub(crate) async fn write(&mut self, mut bytes: Vec<u8>) -> Result<()> {
         self.size += bytes.len() as u64;
-        if let Some((_, f)) = &mut self.tee {
-            std::io::Write::write_all(f, &bytes)
+        if let Some(t) = &mut self.tee {
+            t.write(&bytes)
                 .map_err(|e| Error::Store(format!("disk cache: {e}").into()))?;
         }
         let part = self.store.opts.part_bytes;
@@ -581,13 +606,11 @@ impl Upload {
                 w.finish().await?;
             }
         }
-        if let (Some((t, f)), Some(d)) = (self.tee.take(), &self.store.disk) {
+        if let (Some(t), Some(d)) = (self.tee.take(), &self.store.disk) {
             if d.claim(&self.name, self.size) {
-                let kept = d.commit(&t, f, &self.name, self.size);
+                let kept = d.commit(t, &self.name, self.size);
                 d.unclaim(&self.name);
                 kept.map_err(|e| Error::Store(format!("disk cache: {e}").into()))?;
-            } else {
-                let _ = std::fs::remove_file(&t);
             }
         }
         Ok(())

@@ -175,12 +175,13 @@ def test_bad_input_is_refused(tmp_path):
         ix.scan([{**layer, "entries": 5}], 1)
 
 
-segments = st.sampled_from(["a", "b", "/", ".", "é", "x/y"])
-glob_parts = st.sampled_from(["a", "b", "/", ".", "é", "*", "**", "**/", "?"])
+segments = st.sampled_from(["a", "b", "/", ".", "é", "€", "😀", "x/y"])
+glob_parts = st.sampled_from(["a", "b", "/", ".", "é", "€", "😀", "*", "**", "**/", "?"])
 
 
 @given(st.lists(segments, max_size=6).map("".join), st.lists(glob_parts, min_size=1, max_size=5).map("".join))
 def test_the_index_reads_globs_as_solera_patterns_do(key, glob):
+    assert not index_pattern_matches("€", ["*??"]) and not index_pattern_matches("😀", ["**???"])
     assert index_pattern_matches(key, [glob]) == Matcher({"include": [{"glob": glob}]})(key)
     assert index_pattern_matches(key, [], [glob]) == Matcher({"exclude": [["x", {"glob": glob}]]})(key)
 
