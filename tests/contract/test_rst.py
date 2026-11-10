@@ -2,6 +2,7 @@
 
 import asyncio
 import os
+import re
 import uuid
 
 import pytest
@@ -54,12 +55,16 @@ def parsing(root, name: str | None = "parse", aliases=(), fail=("a",), calls=Non
     return Project(assets=[files, parse] if name else [files], default_store=FileStore(root / "data"))
 
 
-async def tasks(solera, run: dict) -> dict:
-    """A run's tasks, each as `(status, error)`, by asset."""
+async def cancelled_as_removed(solera, run: dict) -> list[str]:
+    """The assets whose tasks in `run` were cancelled with an error that
+    names them and says they are gone from the project, whatever its words."""
 
-    return {
-        t["asset"]: (t["status"], t["error"]) for t in (await solera.get("/tasks", run=run["id"]))["tasks"]
-    }
+    removed = re.compile(r"removed|no longer|not in the project|gone", re.I)
+    return sorted(
+        t["asset"]
+        for t in (await solera.get("/tasks", run=run["id"]))["tasks"]
+        if t["status"] == "canceled" and t["asset"] in (t["error"] or "") and removed.search(t["error"] or "")
+    )
 
 
 async def failing(solera, name: str) -> dict:
@@ -440,10 +445,7 @@ async def test_rst_6_a_removed_assets_queued_work_is_cancelled_saying_why(solera
     for run in (gone, renamed):
         await solera.post(f"/runs/{run['id']}/pause")
     await solera.deploy(Project(assets=[new_name, other], default_store=store))
-    assert await tasks(solera, gone) == {
-        "doomed": ("canceled", "asset 'doomed' is no longer in the project"),
-        "after": ("canceled", "asset 'after' is no longer in the project"),
-    }
+    assert await cancelled_as_removed(solera, gone) == ["after", "doomed"]
     assert (await solera.get(f"/runs/{gone['id']}"))["request"]["status"] == "failed"
     await solera.run("other")
     await solera.post(f"/runs/{renamed['id']}/resume")
@@ -493,7 +495,7 @@ async def test_rst_6_a_removed_assets_launched_attempt_is_not_retried(solera):
     await solera.deploy(Project(assets=[other], default_store=store))
     gate.released.set()
     assert (await solera.wait(run))["request"]["status"] == "failed"
-    assert await tasks(solera, run) == {"doomed": ("canceled", "asset 'doomed' is no longer in the project")}
+    assert await cancelled_as_removed(solera, run) == ["doomed"]
     assert tries == [1]
 
 

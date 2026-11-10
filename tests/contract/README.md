@@ -35,7 +35,7 @@ engine's HTTP API, the stores and a worker. The `solera` fixture
   backoffs, schedules, retention). Heartbeats, cancels, timeouts, sensor
   schedules and upkeep run on real time: tests shorten them with serve
   settings (`deploy(project, heartbeat_seconds=0.2, cancel_grace=…)`);
-- waiting: `until(condition)`, `quiet()`, `upkeep()`;
+- waiting: `until(condition)`, `quiet()`;
 - outcomes and history: `outcomes`, `explain`, `retry_keys`, `commits`;
 - workers, hosts and processes a test plays: `workers(boot=)` and
   `kill_workers()`, `work(pool, project)` and `worker(stage)` (a pool
@@ -47,7 +47,11 @@ engine's HTTP API, the stores and a worker. The `solera` fixture
 - faults an operator or a broken worker causes: `tamper(run, attempt,
   change)` rewrites an attempt's control file, `refuse_upkeep(output)` makes
   an output's index upkeep fail. Both know today's storage layout, so the
-  new path needs its own version of each.
+  new path needs its own version of each;
+- measuring: `storage_server()` keeps the namespace's state on a local
+  S3-compatible server that counts every request it serves (ENG-10's
+  bound on idle work) and can stall an output's upkeep uploads
+  (`hold_upkeep(output)`, ENG-14's stop in the middle of a merge).
 
 `example.py` is the contract's running example (`feed → items → tally,
 copy, checks → filtered`, `factor`), with what each producer received batch

@@ -320,8 +320,7 @@ async def test_sel_8_a_full_run_goes_on_batch_by_batch_across_attempts(solera):
 
     ex.during = at_batch_0
     run = await solera.submit("tally", mode="full")
-    while not failed:
-        await solera.settle(0.05)
+    await solera.until(lambda: failed)
     solera.advance(60)  # past the retry's delay
     detail = await solera.wait(run)
     assert detail["request"]["status"] == "succeeded"

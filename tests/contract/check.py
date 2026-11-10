@@ -1,6 +1,7 @@
 """The contract's completeness check: every entry of docs/behaviors.md has a
 test in tests/contract/ or a pending reason, no test names an entry the
-contract lacks, and no contract test imports today's internals.
+contract lacks, no contract test reaches today's internals, and every test
+a *Covered* line names exists.
 
 `uv run python -m tests.contract.check` prints the count."""
 
@@ -36,6 +37,7 @@ INTERNAL = (
 TRUSTED = {"harness.py", "conftest.py"}
 ENTRY = re.compile(r"^\*\*([A-Z]{3}-\d+)\. ", re.M)
 TEST = re.compile(r"^test_([a-z]{3})_(\d+)_")
+REFERENCE = re.compile(r"`([a-z_]+(?:/[a-z_]+)*\.py::\w+)`")
 
 
 def entries() -> list[str]:
@@ -64,19 +66,50 @@ def tests() -> dict[str, list[str]]:
     return found
 
 
-def internal_imports() -> list[str]:
+def internal_uses(source: str) -> list[str]:
+    """What `source` reaches that a contract test may not: a module of
+    `INTERNAL`, imported whole or a name at a time (`from solera import
+    keys`), and the engine or its state through the fixture."""
+
     out = []
-    for path in modules():
-        for node in ast.walk(ast.parse(path.read_text())):
-            if isinstance(node, ast.Import):
-                names = [a.name for a in node.names]
-            elif isinstance(node, ast.ImportFrom) and node.level == 0:
-                names = [node.module or ""]
-            else:
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.Import):
+            names = [a.name for a in node.names]
+        elif isinstance(node, ast.ImportFrom) and node.level == 0:
+            names = [node.module or ""] + [f"{node.module}.{a.name}" for a in node.names]
+        elif isinstance(node, ast.Attribute) and node.attr in ("engine", "state"):
+            out.append(f"line {node.lineno}: .{node.attr}")
+            continue
+        else:
+            continue
+        out += [n for n in names if any(n == i or n.startswith(i + ".") for i in INTERNAL)]
+    return out
+
+
+def internal_imports() -> list[str]:
+    return [f"{path.name}: {use}" for path in modules() for use in internal_uses(path.read_text())]
+
+
+def covered_references() -> list[str]:
+    """Every `file.py::test` a *Covered* line names, that does not exist."""
+
+    tests_root, out = HERE.parent, []
+    for line in BEHAVIORS.read_text().splitlines():
+        if "*Covered*" not in line:
+            continue
+        for ref in REFERENCE.findall(line):
+            path, name = ref.split("::")
+            file = tests_root / path
+            if not file.exists():
+                out.append(ref)
                 continue
-            out += [
-                f"{path.name}: {n}" for n in names if any(n == i or n.startswith(i + ".") for i in INTERNAL)
-            ]
+            defined = {
+                n.name
+                for n in ast.walk(ast.parse(file.read_text()))
+                if isinstance(n, ast.FunctionDef | ast.AsyncFunctionDef)
+            }
+            if name not in defined:
+                out.append(ref)
     return out
 
 
@@ -89,7 +122,8 @@ def problems() -> list[str]:
     out += [f"{e}: pending, but the contract has no such entry" for e in PENDING if e not in known]
     if len(ids) != len(known):
         out.append("docs/behaviors.md names an entry twice")
-    out += [f"imports an internal: {line}" for line in internal_imports()]
+    out += [f"reaches an internal: {line}" for line in internal_imports()]
+    out += [f"a Covered line names a test that does not exist: {ref}" for ref in covered_references()]
     return out
 
 

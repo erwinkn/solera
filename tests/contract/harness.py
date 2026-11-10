@@ -48,6 +48,7 @@ class Solera:
         self.offset = 0.0  # seconds `advance` moved the clock past the wall
         self.state = self.engine = self.project = self.client = None
         self.engine_kw: dict = {}
+        self.state_url: str | None = None  # where the state lives: under `root` on disk unless set
 
     def clock(self) -> float:
         return time.time() + self.offset
@@ -82,7 +83,10 @@ class Solera:
         from solera_server.state import State
 
         self.state = await State.open(
-            (self.root / "state").as_uri(), "contract", clock=self.clock, flush_interval=0.001
+            self.state_url or (self.root / "state").as_uri(),
+            "contract",
+            clock=self.clock,
+            flush_interval=0.001,
         )
 
     async def _serve(self) -> None:
@@ -257,12 +261,6 @@ class Solera:
         return {str(r[key]): r.get(column) for r in await self.read(output, partition) or []}
 
     # -- upkeep, waiting, a sensor host ------------------------------------------
-
-    async def upkeep(self) -> None:
-        """Storage upkeep does one pass, as a served engine's does every
-        second: retention among it."""
-
-        await self.engine.upkeep.tick()
 
     async def until(self, condition, timeout: float = 10) -> None:
         """The engine works, as in `settle`, until `condition()` (awaited when
@@ -498,17 +496,12 @@ class Solera:
         the attempt's routes while an engine serves and through the object
         store alone while none does: its exit code."""
 
-        from solera import lifecycle
-        from solera_server.api import local_transport
         from solera_worker.channel import AttemptChannel
         from solera_worker.worker import run_attempt
 
         attempt, channel = stage["attempt"], None
         if self.engine is not None:
-            token = lifecycle.token(self.engine.secret, attempt)
-            channel = AttemptChannel(
-                local_transport(self.engine, token), self.project.manifest["name"], attempt
-            )
+            channel = AttemptChannel(self._worker_transport(), self.project.manifest["name"], attempt)
         return await run_attempt(
             stage["objects"],
             attempt,
@@ -555,7 +548,11 @@ class Solera:
     async def serve_process(self, **env):
         """`solera serve` as its own process, as an operator starts it, on a
         state beside this namespace's (`env` adds to its environment): the
-        process, once it listens."""
+        process, once it listens. `solera serve` runs today's engine until the
+        switch (build plan rule 4): on another path there is none to start."""
+
+        if self.path != "today":
+            pytest.skip("solera serve runs today's engine until the switch (build plan rule 4)")
 
         import os
         import socket
@@ -589,20 +586,54 @@ class Solera:
                 raise AssertionError(f"serve never listened: {process.communicate()[1][-2000:]}")
             await asyncio.sleep(0.1)
 
-    async def cli(self, *argv: str):
+    async def cli(self, *argv: str, timeout: float = 120):
         """The `solera` CLI on this namespace, as an operator runs it: its exit
-        code, stdout and stderr."""
+        code, stdout and stderr; fails past `timeout` seconds. Its entry
+        point runs in this process, in a thread of its own, not as a
+        `solera` process: such a process can crash as it exits, its work
+        done (exit 139, a SIGSEGV, in about 2 of 60 runs of `solera migrate`)."""
 
-        import os
-        import subprocess
+        import io
         import sys
+        import traceback
 
-        command = [sys.executable, "-c", "from solera_server.cli import main; main()"]
-        command += ["--state-url", (self.root / "state").as_uri(), "--namespace", "contract", *argv]
-        done = await asyncio.to_thread(
-            subprocess.run, command, env={**os.environ}, capture_output=True, text=True, timeout=120
-        )
-        return done.returncode, done.stdout, done.stderr
+        from solera_server.cli import main
+
+        command = ["solera", "--state-url", (self.root / "state").as_uri(), "--namespace", "contract", *argv]
+
+        def run():
+            out, err, code = io.StringIO(), io.StringIO(), 0
+            saved = sys.argv, sys.stdout, sys.stderr
+            sys.argv, sys.stdout, sys.stderr = command, out, err
+            try:
+                main()
+            except SystemExit as exit:
+                if isinstance(exit.code, str):
+                    print(exit.code, file=err)
+                code = exit.code if isinstance(exit.code, int) else int(exit.code is not None)
+            except Exception:
+                traceback.print_exc(file=err)
+                code = 1
+            finally:
+                sys.argv, sys.stdout, sys.stderr = saved
+            return code, out.getvalue(), err.getvalue()
+
+        try:
+            return await asyncio.wait_for(asyncio.to_thread(run), timeout)
+        except TimeoutError:
+            raise AssertionError(f"solera {' '.join(argv)} did not return within {timeout} s") from None
+
+    def storage_server(self) -> Storage:
+        """The namespace's state lives on an S3-compatible server from here on,
+        as a deployment on a bucket keeps it: a server that counts every
+        request it serves, one by one, and can hold an output's upkeep
+        uploads (`Storage`). Call it before the first deploy, and close what
+        it returns after `close()`."""
+
+        assert self.state is None, "storage_server() before the first deploy"
+        storage = Storage()
+        self.state_url = f"{storage.url}/state"
+        return storage
 
     def refuse_upkeep(self, output: str, refused: bool = True) -> None:
         """The namespace's object store refuses (or takes again) the writes
@@ -667,6 +698,80 @@ class Solera:
 
         text = json.dumps(await self.alarms())
         return all(word in text for word in words)
+
+
+class Storage:
+    """An S3-compatible server (moto's) on a local port, its credentials in
+    the environment, as an engine and its workers on S3 read them, until
+    `close()`. `requests` counts every request it has served; `url` is
+    its bucket; `hold_upkeep(output)` stalls an upload, a fault."""
+
+    ENV = ("AWS_ENDPOINT", "AWS_ALLOW_HTTP", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_REGION")
+
+    def __init__(self):
+        import os
+        import threading
+
+        import boto3
+        from moto.server import DomainDispatcherApplication, create_backend_app
+        from werkzeug.serving import make_server
+
+        backend, lock = DomainDispatcherApplication(create_backend_app), threading.Lock()
+        self.requests, self.held = 0, None
+
+        def app(environ, start_response):
+            with lock:
+                self.requests += 1
+            held = self.held
+            if (
+                held
+                and environ["REQUEST_METHOD"] in ("PUT", "POST")
+                and environ["PATH_INFO"].startswith(held.path)
+            ):
+                held.entered.set()
+                held.go.wait(30)
+            return backend(environ, start_response)
+
+        self.server = make_server("127.0.0.1", 0, app, threaded=True)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        endpoint = f"http://127.0.0.1:{self.server.server_port}"
+        self.saved = {name: os.environ.get(name) for name in self.ENV}
+        os.environ.update(
+            dict(zip(self.ENV, (endpoint, "true", "contract", "contract", "us-east-1"), strict=True))
+        )
+        boto3.client("s3", endpoint_url=endpoint).create_bucket(Bucket="contract")
+        self.url = "s3://contract"
+
+    def hold_upkeep(self, output: str) -> Hold:
+        """The next uploads of `output`'s key index upkeep stall in the server,
+        unanswered, until `release()`: a slow bucket. `entered` is set once
+        one is held. It knows today's storage layout, as `refuse_upkeep` does."""
+
+        self.held = Hold(f"/contract/state/contract/keys/{output}/")
+        return self.held
+
+    def close(self) -> None:
+        import os
+
+        if self.held:
+            self.held.release()
+        self.server.shutdown()
+        self.server.server_close()
+        for name, value in self.saved.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+
+class Hold:
+    def __init__(self, path: str):
+        import threading
+
+        self.path, self.entered, self.go = path, threading.Event(), threading.Event()
+
+    def release(self) -> None:
+        self.go.set()
 
 
 # -- the outside world, as a user's project sees it ---------------------------

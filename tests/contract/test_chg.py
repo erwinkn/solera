@@ -31,6 +31,16 @@ def hold(ex: Example) -> tuple[asyncio.Event, asyncio.Event]:
     return entered, release
 
 
+async def obsolete_committed_nothing(solera, detail: dict) -> None:
+    """`tally`'s run's first attempt, the one held across the change, made
+    no commit: every commit of the run is a later attempt's."""
+
+    held, *later = next(iter(detail["attempts"].values()))
+    assert "commit" not in held and later
+    commits = await solera.commits("tally", detail["request"]["id"])
+    assert commits and held["id"] not in {c["attempt"] for c in commits}
+
+
 def delivered(ex: Example, name: str = "tally", since: int = 0) -> list[str]:
     """Every key the producer's batches delivered as changed since its
     `since`-th batch, in order: added, updated or removed."""
@@ -75,8 +85,7 @@ async def test_chg_3_a_batch_launched_before_a_definition_change_does_not_commit
     release.set()
     detail = await solera.wait(run)
     assert detail["request"]["status"] == "succeeded"
-    [attempts] = detail["attempts"].values()
-    assert (await solera.head("tally"))["commit"] != f"{run['id']}/{attempts[0]['id']}"
+    await obsolete_committed_nothing(solera, detail)
     held, *after = ex.seen["tally"]
     assert after and after[-1].added == ["k1", "k2"]  # still owed, under version 2
     assert await ex.count() == 2 and await ex.stale() == []
@@ -96,8 +105,7 @@ async def test_chg_3_a_batch_launched_before_an_upstream_reset_does_not_commit(s
     release.set()
     detail = await solera.wait(run)
     assert detail["request"]["status"] == "succeeded"
-    [attempts] = detail["attempts"].values()
-    assert (await solera.head("tally"))["commit"] != f"{run['id']}/{attempts[0]['id']}"
+    await obsolete_committed_nothing(solera, detail)
     last = ex.seen["tally"][-1]
     assert last.reset and last.added == ["k2", "k3"]  # the new `items`, read in full
     assert await ex.count() == 2 and await ex.stale() == []

@@ -186,7 +186,9 @@ async def test_his_2_a_task_waits_only_while_it_could_run(solera):
 
 async def test_his_4_a_commit_row_names_the_batch_that_made_it(solera):
     """`batch` on a history commit row is `{index, count}` of the attempt
-    that committed it, with `final` on the last: null for an unbatched task."""
+    that committed it, with `final` on the last: null for an unbatched task.
+    `count` is the batches planned, an estimate (INC-10): the row carries the
+    one its attempt reported, whatever the run realised."""
 
     @asset(outputs=Output("files", key="id"))
     def files():
@@ -197,9 +199,15 @@ async def test_his_4_a_commit_row_names_the_batch_that_made_it(solera):
         return [{"id": r["id"], "v": r["v"]} for r in files]
 
     await solera.deploy(Project(assets=[files, copy]))
-    await solera.run("copy", upstream=True)
+    detail = await solera.run("copy", upstream=True)
+    [task] = [t for t in detail["tasks"] if t["asset"] == "copy"]
+    reported = {a["id"]: a["batch"] for a in detail["attempts"][task["id"]]}
     copies = sorted(await commits(solera, "copy"), key=lambda r: r["generation"])
-    assert [r["batch"] for r in copies] == [{"index": i, "count": 3} for i in range(3)]
+    assert [r["batch"]["index"] for r in copies] == [0, 1, 2]
+    for row in copies:  # the estimate the attempt reported, carried as it was
+        made = reported[row["attempt"]]
+        assert isinstance(row["batch"]["count"], int) and row["batch"]["count"] >= 1
+        assert row["batch"] == {"index": made["index"], "count": made["count"]}
     assert [r["final"] for r in copies] == [False, False, True]
     assert [r["batch"] for r in await commits(solera, "files")] == [None]
 
