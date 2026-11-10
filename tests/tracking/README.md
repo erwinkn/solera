@@ -69,7 +69,8 @@ sublist of a history is a history.
 items commit, its notification lost or not; `("clear", changes, lost)` items'
 full run begins in the design's form; `("complete",)` it ends;
 `("plan", n)`, `("full", n)` (a full run's first batch, which resets progress),
-`("keys", keys)`; `("commit", failing keys, keys loaded at the head)`;
+`("keys", keys)`; `("commit", failing keys, keys loaded at the head)` (a key
+loaded at the head is held back if items is mid full run or cleared since the plan);
 `("cancel",)`; `("pat", i)`, `("ctx",)`, `("defn",)` change the conditions;
 `("held",)` progress can no longer be trusted; `("retry", key, by_timer)`;
 `("restart",)`.
