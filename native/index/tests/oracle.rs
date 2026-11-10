@@ -1518,4 +1518,6 @@ fn a_writer_refuses_seg_blocks_past_its_limit() {
         };
         assert!(matches!(Writer::new(o, 1, 1, None), Err(Error::Invalid(_))));
     }
+    let max = Writer::new(WriteOptions::default(), 1, u64::MAX, Some(u64::MAX));
+    assert!(matches!(max, Err(Error::Invalid(_))));
 }

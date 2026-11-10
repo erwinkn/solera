@@ -254,7 +254,7 @@ impl Writer {
     /// A layer covering commits `lo..=hi`; with `floor`, a base holding the
     /// state at that commit.
     pub fn new(o: WriteOptions, lo: u64, hi: u64, floor: Option<u64>) -> Result<Writer> {
-        if lo > hi || lo == 0 || floor.is_some_and(|f| f < lo || f > hi) {
+        if lo > hi || lo == 0 || floor.is_some_and(|f| f < lo || f > hi || f == u64::MAX) {
             return invalid(format!(
                 "a layer covers commits lo..=hi with 1 <= lo <= hi and lo <= floor <= hi, got {lo}..={hi}, floor {floor:?}"
             ));
