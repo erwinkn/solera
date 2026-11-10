@@ -539,11 +539,6 @@ impl Walker<'_> {
         } else {
             version
         };
-        let version = if matches!(wanted, Holding::Absent) {
-            Ver::Absent
-        } else {
-            version
-        };
         let class = if owed(&held, &wanted) {
             if self.hold.held_back(self.input, &key) {
                 if out.keep {
