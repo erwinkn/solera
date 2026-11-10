@@ -419,7 +419,7 @@ head of `site_files`/`alpha`.
 attempt's claim (or at a source's commit). Every write of a key carries
 one; a later attempt on an asset partition has a larger one; it is never
 reused. Lineage records it; immutable stores name objects by it; fenced
-stores compare it. *Example:* `site_files/alpha/f-1/184467.json` was
+stores compare it. *Example:* `site_files/alpha/455/f-1/184467.json` was
 written by generation 184467.
 
 **commit number**. The n-th commit of an incremental output partition:

@@ -41,9 +41,9 @@ class FileStore:
 
         {root}/rollup@184467.json               a value, by generation 184467
         {root}/site_status/alpha@184467.json    a value, partition alpha
-        {root}/uploads/3f2/u-7/184467.pkl       a keyed output: one object per key and generation,
+        {root}/uploads/c49/u-7/184467.pkl       a keyed output: one object per key and generation,
                                                 under one of 4,096 buckets by the key's hash
-        {root}/site_files/alpha/0a1/f-1/184467.json
+        {root}/site_files/alpha/455/f-1/184467.json
                                                 keyed and partitioned: the key's rows
         {root}/site_events/alpha/000000000042/184467.json
                                                 an unkeyed incremental output: one per commit
