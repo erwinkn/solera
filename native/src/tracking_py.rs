@@ -7,7 +7,7 @@
 //! synchronous. Keys are `str`; versions `int`, `str` or None, as in the
 //! change index's bindings.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 
 use pyo3::exceptions::{PyKeyError, PyTypeError, PyValueError};
@@ -189,6 +189,34 @@ fn counts<'py>(py: Python<'py>, n: [u64; 4]) -> PyResult<Bound<'py, PyDict>> {
     Ok(d)
 }
 
+/// Owed keys that are not due, per input: each input's `not_due` list in a
+/// plan request. B6's due index replaces it.
+struct NotDue(Vec<HashSet<Key>>);
+
+impl NotDue {
+    fn of(d: &Bound<'_, PyDict>) -> PyResult<NotDue> {
+        let mut out = vec![];
+        if let Some(ins) = item(d, "inputs")? {
+            for i in ins.try_iter()? {
+                let mut keys = HashSet::new();
+                if let Some(ks) = item(i?.cast::<PyDict>()?, "not_due")? {
+                    for k in ks.try_iter()? {
+                        keys.insert(key_in(&k?)?);
+                    }
+                }
+                out.push(keys);
+            }
+        }
+        Ok(NotDue(out))
+    }
+}
+
+impl tr::plan::Hold for NotDue {
+    fn held_back(&self, input: usize, key: &[u8]) -> bool {
+        self.0.get(input).is_some_and(|s| s.contains(key))
+    }
+}
+
 fn one_event(part: Part) -> Vec<u8> {
     Event::of(vec![part]).encode()
 }
@@ -303,15 +331,12 @@ impl Tracking {
     ) -> PyResult<Bound<'py, PyDict>> {
         guard(|| {
             let req = self::request(request)?;
+            let not_due = NotDue::of(request)?;
             let (view, ixs) = self.view(&req)?;
             let (plan, bytes) = py
                 .detach(|| {
-                    let plan = rt().block_on(tr::plan::plan(
-                        &view,
-                        &req,
-                        ixs.as_ref(),
-                        &tr::plan::NoHold,
-                    ))?;
+                    let plan =
+                        rt().block_on(tr::plan::plan(&view, &req, ixs.as_ref(), &not_due))?;
                     let bytes = plan.encode();
                     Ok::<_, tr::Error>((plan, bytes))
                 })
