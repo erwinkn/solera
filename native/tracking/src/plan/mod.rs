@@ -617,6 +617,9 @@ pub async fn plan(view: &View, req: &Request, ixs: &dyn Indexes, hold: &dyn Hold
     if req.limit == 0 {
         return invalid("a batch takes at least one key");
     }
+    let Some(ahead) = req.limit.checked_add(1) else {
+        return invalid("a batch's limit is too large");
+    };
     if req.inputs.len() != view.inputs.len() {
         return invalid("the view is not the request's");
     }
@@ -628,7 +631,7 @@ pub async fn plan(view: &View, req: &Request, ixs: &dyn Indexes, hold: &dyn Hold
             }
             keys.iter()
                 .filter(|k| req.after.as_ref().is_none_or(|a| *k > a))
-                .take(req.limit + 1)
+                .take(ahead)
                 .cloned()
                 .collect()
         }
@@ -653,7 +656,7 @@ pub async fn plan(view: &View, req: &Request, ixs: &dyn Indexes, hold: &dyn Hold
             input: i,
             hold,
         };
-        let mut found = Found::new(req.limit + 1, true);
+        let mut found = Found::new(ahead, true);
         match &req.mode {
             Mode::Keys(_) => {
                 let batch = &listed[..listed.len().min(req.limit)];
@@ -802,6 +805,9 @@ pub async fn owed_keys(
     after: Option<&Key>,
     limit: usize,
 ) -> Result<(Vec<Cand>, Option<Key>)> {
+    if limit == 0 {
+        return invalid("a page of owed keys holds at least one key");
+    }
     let mut found = Found::new(limit.saturating_add(1), true);
     walker(view, req, ixs)?.walk(after, &mut found).await?;
     let mut keys = found.keys;

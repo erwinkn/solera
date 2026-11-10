@@ -296,6 +296,11 @@ fn main() {
         raw: Arc::new(LocalFileSystem::new_with_prefix(dir).unwrap()),
     };
     let _rt = env.rt.enter();
+    if let Some(how) = only.and_then(|o| o.strip_prefix("core-")) {
+        let layers = chain(dir);
+        core_rewrite(&env, &layers, n, how);
+        return;
+    }
     if let Some(how) = only.and_then(|o| o.strip_prefix("rewrite-only-")) {
         let mut layers = chain(dir);
         let c = layers.last().unwrap().hi + 1;
@@ -528,7 +533,7 @@ fn chain(dir: &str) -> Vec<LayerRef> {
     for e in std::fs::read_dir(dir).unwrap() {
         let p = e.unwrap().path();
         let name = p.file_name().unwrap().to_str().unwrap().to_string();
-        if !name.ends_with(".layer") || name.starts_with('r') {
+        if !name.ends_with(".layer") || name.starts_with('r') || name.starts_with("core-") {
             continue;
         }
         let f = std::fs::read(&p).unwrap();
@@ -617,4 +622,91 @@ fn core_commit(
         ..Default::default()
     };
     (built.part.layer, t)
+}
+
+/// Generated changed keys, a chunk at a time, as a worker's file would hand them over.
+struct Gen {
+    id: u64,
+    n: u64,
+}
+
+impl solera_tracking::commit::Source for Gen {
+    fn next(
+        &mut self,
+        out: &mut solera_tracking::commit::Changes,
+    ) -> solera_tracking::Result<bool> {
+        use solera_tracking::commit::Change;
+        out.clear();
+        if self.id >= self.n {
+            return Ok(false);
+        }
+        let end = (self.id + 65_536).min(self.n);
+        let mut k = Vec::new();
+        for i in self.id..end {
+            k.clear();
+            key_of(i, &mut k);
+            out.push(&k, Change::Upsert(None))?;
+        }
+        self.id = end;
+        Ok(true)
+    }
+}
+
+/// N8 through the core's builder: one commit of every key, `first` on an
+/// empty output (a first listing), `patch` or `replace` over the index in `dir`.
+fn core_rewrite(env: &Env, layers: &[LayerRef], n: u64, how: &str) {
+    use solera_tracking::commit::{build, Mode, Spec};
+    let ix = env.index(false);
+    let (out, mode) = match how {
+        "first" => (solera_tracking::Output::default(), Mode::Patch),
+        "patch" | "replace" => (
+            solera_tracking::Output {
+                layers: layers.to_vec(),
+                head: layers.last().unwrap().hi,
+                live: 0,
+            },
+            if how == "patch" {
+                Mode::Patch
+            } else {
+                Mode::Replace
+            },
+        ),
+        _ => panic!("core-first, core-patch or core-replace"),
+    };
+    let path = format!("core-{how}.layer");
+    let spec = Spec {
+        version: 9_000_000,
+        time_ms: 0,
+        producer: b"bench",
+        path: &path,
+        mode,
+        collect: 0,
+    };
+    let base = status_mb("VmRSS");
+    reset_peak();
+    let (t0, c0) = (Instant::now(), cpu());
+    let id: solera_tracking::Id = b"o".as_slice().into();
+    let built = env
+        .rt
+        .block_on(build(
+            &solera_tracking::plan::OneIndex(&ix),
+            &id,
+            &out,
+            spec,
+            &mut Gen { id: 0, n },
+        ))
+        .unwrap()
+        .unwrap();
+    let s = ix.store.stats.counts();
+    println!(
+        "N8 core {how}: entries={} wall={:.1}s cpu={:.1}s gets={} get_mb={:.0} put_mb={:.0} rss_before_mb={base:.0} peak_rss_mb={:.0}",
+        built.part.layer.entries,
+        t0.elapsed().as_secs_f64(),
+        cpu() - c0,
+        s.gets,
+        s.get_bytes as f64 / 1e6,
+        s.put_bytes as f64 / 1e6,
+        peak_mb()
+    );
+    let _ = std::fs::remove_file(format!("{}/{path}", std::env::args().nth(1).unwrap()));
 }

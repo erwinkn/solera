@@ -1,5 +1,5 @@
-"""The tracking core against the tracking model (tests/tracking, SOLE-7's
-oracle): random staleness histories replayed through both, step by step.
+"""The tracking core against the tracking model (tests/tracking,
+docs/verification.md "The tracking model"): random staleness histories replayed through both, step by step.
 
 After every step the core's owed keys and classes equal what the model says
 the consumer owes, and every plan takes exactly the model's keys with the
@@ -18,9 +18,8 @@ import random
 import pytest
 from solera._native import ChangeIndex, Tracking
 
-oracle = pytest.importorskip("tests.tracking.oracle")
-from tests.tracking import staleness  # noqa: E402
-from tests.tracking.core import ABSENT, HELD, POS  # noqa: E402
+from tests.tracking import staleness
+from tests.tracking.core import ABSENT, HELD, POS
 
 EDGE, ITEMS, OWN = b"checks/items", b"items", b"checks"
 
@@ -209,3 +208,20 @@ def test_a_held_edge_owes_every_key_its_own_output_holds(tmp_path):
     ]
     replay(events, tmp_path)
     assert HELD == "held"
+
+
+def test_a_failed_removal_owes_nothing_once_the_patterns_take_its_key_again(tmp_path):
+    """k1 leaves the patterns; its removal fails, so a point keeps k1@1. When
+    the patterns take k1 again and k1 never changed, nothing is owed: the
+    point's version at the head must come from the index, not from what the
+    batch recorded under patterns that did not take k1."""
+    events = [
+        ("up", (("k1", 1), ("k2", 1)), False),
+        ("plan", 5),
+        ("commit", (), ()),
+        ("pat", 2),
+        ("plan", 5),
+        ("commit", ("k1",), ()),
+        ("pat", 0),
+    ]
+    replay(events, tmp_path)

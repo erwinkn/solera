@@ -21,8 +21,7 @@ use solera_tracking::codec::Ver;
 use solera_tracking::event::{Event, Part};
 use solera_tracking::plan::{self, Hold, InputRequest, Mode, OneIndex, Request};
 use solera_tracking::progress::{
-    owed, Class, Conditions, EdgeOpen, Holding, InputReport, Key, KeyRange, Pat, Patterns, Reset,
-    Value,
+    Class, Conditions, EdgeOpen, Holding, InputReport, Key, KeyRange, Pat, Patterns, Reset, Value,
 };
 use solera_tracking::{Output, Tracking};
 
@@ -141,7 +140,7 @@ impl Input {
                     Holding::Held
                 }
             }
-            Value::At(p, c) => Holding::of(self.log.at(*p, k).as_version(), c, k),
+            Value::At(p, c) => bf_holding(&self.log.at(*p, k), c, k),
         }
     }
 }
@@ -177,13 +176,81 @@ fn version(rng: &mut SmallRng) -> Ver {
     }
 }
 
+/// §5's owed table, written out here so the oracle shares no rule with the
+/// code under test: a version is held the same only under the same context,
+/// definition and rebuild counter.
+fn bf_owed(h: &Holding, w: &Holding) -> bool {
+    match (h, w) {
+        (Holding::Absent, Holding::Absent) => false,
+        (Holding::Version(a, ca), Holding::Version(b, cb)) => {
+            a != b
+                || ca.context != cb.context
+                || ca.definition != cb.definition
+                || ca.rebuild != cb.rebuild
+        }
+        _ => true,
+    }
+}
+
+fn bf_class(h: &Holding, w: &Holding) -> Class {
+    match (h, w) {
+        _ if !bf_owed(h, w) => Class::Unchanged,
+        (Holding::Absent, _) => Class::Added,
+        (_, Holding::Absent) => Class::Removed,
+        _ => Class::Updated,
+    }
+}
+
+/// What processing `v` under `c` leaves, from the patterns' sources
+/// (globs as `solera.patterns.glob_regex` reads them; regexes in full).
+fn bf_holding(v: &Ver, c: &Arc<Conditions>, k: &[u8]) -> Holding {
+    let matches = |p: &Pat| {
+        let re = match p {
+            Pat::Glob(g) => glob_regex(g),
+            Pat::Regex(r) => r.clone(),
+        };
+        regex::bytes::Regex::new(&format!("(?s)^(?:{re})$"))
+            .unwrap()
+            .is_match(k)
+    };
+    let taken = (c.patterns.include().is_empty() || c.patterns.include().iter().any(matches))
+        && !c.patterns.exclude().iter().any(matches);
+    if v.is_absent() || !taken {
+        Holding::Absent
+    } else {
+        Holding::Version(v.clone(), c.clone())
+    }
+}
+
+fn glob_regex(g: &str) -> String {
+    let (mut out, mut i) = (String::new(), 0);
+    while i < g.len() {
+        let rest = &g[i..];
+        let (piece, n) = if rest.starts_with("**/") {
+            ("(?:.*/)?".to_string(), 3)
+        } else if rest.starts_with("**") {
+            (".*".to_string(), 2)
+        } else if rest.starts_with('*') {
+            ("[^/]*".to_string(), 1)
+        } else if rest.starts_with('?') {
+            ("[^/]".to_string(), 1)
+        } else {
+            let ch = rest.chars().next().unwrap();
+            (regex::escape(&ch.to_string()), ch.len_utf8())
+        };
+        out.push_str(&piece);
+        i += n;
+    }
+    out
+}
+
 /// Two holdings that hold the same: the same version under the same
 /// context, definition and rebuild counter (patterns only decide what is
 /// taken, so a holding carries whichever pattern set it was last written under).
 fn same(a: &Holding, b: &Holding) -> bool {
     match (a, b) {
         (Holding::Absent, Holding::Absent) | (Holding::Held, Holding::Held) => true,
-        (Holding::Version(..), Holding::Version(..)) => !owed(a, b),
+        (Holding::Version(..), Holding::Version(..)) => !bf_owed(a, b),
         _ => false,
     }
 }
@@ -215,16 +282,16 @@ fn brute_owed(
             inp.holding(k)
         };
         let v = inp.log.at(h, k);
-        let wanted = Holding::of(v.as_version(), &inp.now, k);
+        let wanted = bf_holding(&v, &inp.now, k);
         let v = if matches!(wanted, Holding::Absent) {
             Ver::Absent
         } else {
             v
         };
-        if owed(&held, &wanted) {
+        if bf_owed(&held, &wanted) {
             out.push((
                 k.clone(),
-                Class::of(&held, &wanted),
+                bf_class(&held, &wanted),
                 v,
                 held,
                 hold.0.contains(k),
@@ -495,14 +562,14 @@ async fn batch(
                                 inp.holding(k)
                             };
                             let v = inp.log.at(inp.log.head(), k);
-                            let wanted = Holding::of(v.as_version(), &inp.now, k);
+                            let wanted = bf_holding(&v, &inp.now, k);
                             let v = if matches!(wanted, Holding::Absent) {
                                 Ver::Absent
                             } else {
                                 v
                             };
                             (!matches!((&held, &wanted), (Holding::Absent, Holding::Absent)))
-                                .then(|| ((*k).clone(), Class::of(&held, &wanted), v, held, false))
+                                .then(|| ((*k).clone(), bf_class(&held, &wanted), v, held, false))
                         })
                         .collect()
                 })

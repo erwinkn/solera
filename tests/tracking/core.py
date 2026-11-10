@@ -43,10 +43,17 @@ class Cond:
         return replace(self, pat=None)
 
 
+class Folded(Exception):
+    """A query reached below the log's base: a merge folded what it needed (§13)."""
+
+
 class Log:
-    """One output's log: commit c holds entries key -> (new, replaced)."""
+    """One output's log: commit c holds entries key -> (new, replaced). A merge
+    folds every commit at or below the cut into the base: a query that needs a
+    state below the base, or an entry at or below it, raises Folded."""
 
     def __init__(self) -> None:
+        self.base = 0
         self.entries: list[dict[str, tuple]] = [{}]
         self.clears: list[int] = []
         self.two_scans = True  # a diff across a clear merges two scans (off: entries only, a calibration)
@@ -77,6 +84,18 @@ class Log:
             self.clears.append(self.head)
         return entries
 
+    def fold(self, cut: int) -> None:
+        self.base = max(self.base, cut)
+
+    def _at(self, c: int) -> None:
+        if c < self.base:
+            raise Folded(f"a query at #{c} reached below the base #{self.base}")
+
+    def entry(self, c: int) -> dict[str, tuple]:
+        if c <= self.base:
+            raise Folded(f"entry #{c} was folded into the base #{self.base}")
+        return self.entries[c]
+
     def last_clear(self, c: int) -> int:
         return max((x for x in self.clears if x <= c), default=0)
 
@@ -89,6 +108,7 @@ class Log:
         return 0
 
     def scan(self, c: int, lo: str = NEG, hi: str = POS) -> dict[str, object]:
+        self._at(c)
         out: dict[str, object] = {}
         for i in range(max(1, self.last_clear(c)), c + 1):
             for k, (new, _) in self.entries[i].items():
@@ -97,6 +117,7 @@ class Log:
         return {k: v for k, v in out.items() if v is not ABSENT}
 
     def get(self, c: int, k: str) -> object:
+        self._at(c)
         for i in range(c, max(1, self.last_clear(c)) - 1, -1):
             if k in self.entries[i]:
                 return self.entries[i][k][0]
@@ -105,6 +126,7 @@ class Log:
     def diff(self, c1: int, c2: int, lo: str = NEG, hi: str = POS) -> dict:
         """Keys whose state differs between c1 and c2: (state at c1, state at c2).
         Across a clear it merges two scans."""
+        self._at(c1)
         if self.two_scans and any(c1 < x <= c2 for x in self.clears):
             a, b = self.scan(c1, lo, hi), self.scan(c2, lo, hi)
             return {k: (a.get(k), b.get(k)) for k in sorted(set(a) | set(b)) if a.get(k) != b.get(k)}

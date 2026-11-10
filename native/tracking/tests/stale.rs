@@ -306,6 +306,15 @@ fn entries(keys: &[(&str, Option<u64>)], commit: u64) -> Run {
     r
 }
 
+/// The notice over `entries`, fed as the commit builder feeds it.
+fn notice(t: &Tracking, commit: u64, entries: &Run, time_ms: u64) -> Vec<Part> {
+    let mut n = stale::Notice::new(t, ITEMS, commit, time_ms);
+    for i in 0..entries.len() {
+        n.push(entries.key(i), entries.new_version(entries.rows(i).start));
+    }
+    n.finish()
+}
+
 fn commit_part(t: &Tracking) -> Part {
     let head = t.outputs.get(ITEMS).map_or(0, |o| o.head);
     let layer = solera_index::LayerRef {
@@ -332,7 +341,7 @@ fn a_notice_decides_from_the_commits_entries_alone() {
 
     // Fresh: keys the patterns leave out are skipped; the first one taken is due.
     let e = entries(&[("a1", Some(1)), ("k2", Some(1)), ("k3", Some(1))], 1);
-    let parts = stale::notice(&t, ITEMS, 1, &e, 7);
+    let parts = notice(&t, 1, &e, 7);
     let Part::Witness(w) = &parts[0] else {
         panic!()
     };
@@ -358,27 +367,75 @@ fn a_notice_decides_from_the_commits_entries_alone() {
 
     // Stale: a commit that does not touch the witness keeps it; one that
     // does is left for a refresh.
-    let parts = stale::notice(&t, ITEMS, 2, &entries(&[("k1", Some(2))], 2), 8);
+    let parts = notice(&t, 2, &entries(&[("k1", Some(2))], 2), 8);
     assert_eq!(parts.len(), 1);
-    assert!(stale::notice(&t, ITEMS, 2, &entries(&[("k2", None)], 2), 8).is_empty());
+    assert!(notice(&t, 2, &entries(&[("k2", None)], 2), 8).is_empty());
     // Only the commit right after what is known is noticed.
-    assert!(stale::notice(&t, ITEMS, 3, &entries(&[("k1", Some(2))], 3), 8).is_empty());
+    assert!(notice(&t, 3, &entries(&[("k1", Some(2))], 3), 8).is_empty());
 
     // Fresh, nothing taken: fresh as of the commit.
     let mut t = opened();
     apply(&mut t, vec![watch(&only_k)]);
     know(&mut t, 0, State::Fresh);
-    let parts = stale::notice(
-        &t,
-        ITEMS,
-        1,
-        &entries(&[("a1", Some(1)), ("x", None)], 1),
-        7,
-    );
+    let parts = notice(&t, 1, &entries(&[("a1", Some(1)), ("x", None)], 1), 7);
     let Part::Witness(w) = &parts[0] else {
         panic!()
     };
     assert_eq!((w.x, &w.state), (1, &State::Fresh));
+}
+
+#[test]
+fn a_notice_settles_each_stale_witness_at_the_first_entry_at_or_past_it() {
+    let mut t = Tracking::new();
+    for (e, w) in [("a/items", "k5"), ("b/items", "k1"), ("c/items", "k3")] {
+        apply(
+            &mut t,
+            vec![Part::EdgeOpen(EdgeOpen {
+                edge: key(e),
+                input: ITEMS.into(),
+                keyed: true,
+            })],
+        );
+        apply(
+            &mut t,
+            vec![Part::Watch(SetWatch {
+                edge: key(e),
+                watch: Watch {
+                    conditions: Arc::default(),
+                    own: None,
+                    gate: true,
+                },
+            })],
+        );
+        let gen = t.stale.inputs[e.as_bytes()].gen;
+        apply(
+            &mut t,
+            vec![Part::Witness(Witness {
+                edge: key(e),
+                gen,
+                x: 0,
+                state: stale(w, 1),
+                retry: false,
+            })],
+        );
+    }
+    let e = entries(&[("k2", Some(1)), ("k3", Some(1)), ("k4", Some(1))], 1);
+    let mut kept: Vec<(Key, State)> = notice(&t, 1, &e, 9)
+        .into_iter()
+        .map(|p| match p {
+            Part::Witness(w) => (w.edge, w.state),
+            _ => panic!(),
+        })
+        .collect();
+    kept.sort_by(|a, b| a.0.cmp(&b.0));
+    assert_eq!(
+        kept,
+        vec![
+            (key("a/items"), stale("k5", 1)),
+            (key("b/items"), stale("k1", 1))
+        ],
+        "c's witness k3 is touched and left for a refresh"
+    );
 }
 
 fn index() -> (tokio::runtime::Runtime, ChangeIndex) {

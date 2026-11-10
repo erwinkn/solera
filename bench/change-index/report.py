@@ -27,7 +27,10 @@ QUERIES = [
     ("scan-head", "scan at head, all"),
     ("scan-head-range1pct", "scan at head, 1% of keys"),
     ("scan-1d-range1pct", "scan a day ago, 1% of keys"),
+    ("get-30", "30 scattered gets"),
+    ("get-100", "100 scattered gets"),
     ("get-1k", "1K scattered gets"),
+    ("get-10k", "10K scattered gets (a batch at the scale target)"),
     ("merge-newest4", "merge the 4 newest layers"),
     ("fold-into-base", "fold every layer into the base"),
 ]

@@ -266,7 +266,11 @@ fn main() {
                 let mut found = 0;
                 for _ in 0..reps {
                     let t0 = Instant::now();
-                    let parts = stale::notice(&t, ITEMS, head, entries, 7);
+                    let mut n = stale::Notice::new(&t, ITEMS, head, 7);
+                    for i in 0..entries.len() {
+                        n.push(entries.key(i), entries.new_version(entries.rows(i).start));
+                    }
+                    let parts = n.finish();
                     lat.push(t0.elapsed().as_secs_f64());
                     found = parts.len();
                 }

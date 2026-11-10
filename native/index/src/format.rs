@@ -19,6 +19,10 @@
 //! - The top level holds the layer's own description (commit run, floor,
 //!   counts, key bounds, flags) and one descriptor per segment, laid out like
 //!   a block's. A reader of a large layer loads only the segments it needs.
+//!   Segments sit after the commits section, except once a writer holds
+//!   `SEG_SPILL` bytes of them: later ones go among the blocks, so that it
+//!   holds a bounded index. A descriptor's offset is doubled, plus one for a
+//!   segment among the blocks (an offset in the file, not in the index).
 //! - The commits section holds each commit's header; queries never read it.
 //! - The trailer: index_start, commits_start, top_start (u64 LE), top raw
 //!   length, top checksum, format version, trailer checksum (u32 LE), magic.
@@ -36,6 +40,29 @@ pub const TRAILER: usize = 48;
 /// Commit flags this reader understands. None yet: a full run's "clear" would
 /// be the first, and a reader that does not know a flag refuses the layer.
 pub const KNOWN_COMMIT_FLAGS: u64 = 0;
+
+/// The most raw bytes a block, a segment, the commits section or the top
+/// level may hold: a reader allocates no more than this for any of them,
+/// whatever a damaged file says.
+pub const MAX_RAW: usize = 64 << 20;
+
+/// The longest key. With `MAX_RAW`, it bounds what a reader rebuilds from
+/// prefix-coded keys: a block's distinct keys, a segment's or the top level's
+/// first keys, at most `MAX_RAW` bytes each.
+pub const MAX_KEY: usize = 64 << 10;
+
+/// The most compressed segment bytes a writer keeps for the end of the file;
+/// past this, segments are written among the blocks.
+const SEG_SPILL: usize = 4 << 20;
+
+fn fits(what: &str, len: usize) -> Result<()> {
+    if len > MAX_RAW {
+        return invalid(format!(
+            "{what} of {len} bytes: the format allows {MAX_RAW}"
+        ));
+    }
+    Ok(())
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct WriteOptions {
@@ -88,7 +115,10 @@ impl LayerRef {
             ));
         }
         if self.index_start > self.top_start
-            || self.top_start.checked_add(TRAILER as u64) > Some(self.size)
+            || self
+                .top_start
+                .checked_add(TRAILER as u64)
+                .is_none_or(|end| end > self.size)
         {
             return invalid(format!(
                 "{}: offsets out of order: index {}, top {}, size {}",
@@ -222,15 +252,27 @@ pub struct Writer {
     entries: u64,
     keys: u64,
     first_key: Vec<u8>,
+    /// Bytes of the distinct keys in the current block, and of the top
+    /// level's first keys, as a reader rebuilds them.
+    block_keys: usize,
+    top_keys: usize,
 }
 
 impl Writer {
     /// A layer covering commits `lo..=hi`; with `floor`, a base holding the
     /// state at that commit.
     pub fn new(o: WriteOptions, lo: u64, hi: u64, floor: Option<u64>) -> Result<Writer> {
-        if lo > hi || lo == 0 || floor.is_some_and(|f| f < lo || f > hi) {
+        if lo > hi || lo == 0 || floor.is_some_and(|f| f < lo || f > hi || f == u64::MAX) {
             return invalid(format!(
                 "a layer covers commits lo..=hi with 1 <= lo <= hi and lo <= floor <= hi, got {lo}..={hi}, floor {floor:?}"
+            ));
+        }
+        fits("a block", o.block_bytes.saturating_mul(2))?;
+        if o.seg_blocks == 0 || o.seg_blocks > MAX_RAW / MAX_KEY {
+            return invalid(format!(
+                "seg_blocks {}: from 1 to {}",
+                o.seg_blocks,
+                MAX_RAW / MAX_KEY
             ));
         }
         let zc = zstd::bulk::Compressor::new(o.level)
@@ -262,6 +304,8 @@ impl Writer {
             entries: 0,
             keys: 0,
             first_key: Vec::new(),
+            block_keys: 0,
+            top_keys: 0,
         })
     }
 
@@ -329,8 +373,16 @@ impl Writer {
                 lossy(key)
             ));
         }
-        if self.raw.len() >= self.o.block_bytes && !same {
-            self.flush_block();
+        if key.len() > MAX_KEY {
+            return invalid(format!(
+                "{:?}…: a key of {} bytes, the format allows {MAX_KEY}",
+                lossy(&key[..64]),
+                key.len()
+            ));
+        }
+        if !same && (self.raw.len() >= self.o.block_bytes || self.block_keys + key.len() > MAX_RAW)
+        {
+            self.flush_block()?;
         }
         let s = if self.rows == 0 {
             0
@@ -361,12 +413,13 @@ impl Writer {
             self.prev.clear();
             self.prev.extend_from_slice(key);
             self.keys += 1;
+            self.block_keys += key.len();
         }
         self.prev_commit = commit;
         self.prev_state = state;
         self.rows += 1;
         self.entries += 1;
-        Ok(())
+        fits("a block", self.raw.len())
     }
 
     /// Every entry of key `i` of `run`, newest first.
@@ -382,9 +435,9 @@ impl Writer {
         Ok(())
     }
 
-    fn flush_block(&mut self) {
+    fn flush_block(&mut self) -> Result<()> {
         if self.rows == 0 {
-            return;
+            return Ok(());
         }
         self.cbuf = self.zc.compress(&self.raw).expect("zstd compression");
         let check = checksum(&self.cbuf);
@@ -410,18 +463,30 @@ impl Writer {
         self.seg_n += 1;
         self.raw.clear();
         self.rows = 0;
+        self.block_keys = 0;
         if self.seg_n as usize == self.o.seg_blocks {
-            self.flush_seg();
+            self.flush_seg()?;
         }
+        Ok(())
     }
 
-    fn flush_seg(&mut self) {
+    fn flush_seg(&mut self) -> Result<()> {
         if self.seg_n == 0 {
-            return;
+            return Ok(());
         }
+        fits("a segment", self.seg.len())?;
+        self.top_keys += self.seg_first.len();
+        fits("the top level's keys", self.top_keys)?;
         let c = self.zc.compress(&self.seg).expect("zstd compression");
         let t = &mut self.top;
-        put_varint(t, self.segs.len() as u64);
+        if self.segs.len() + c.len() > SEG_SPILL {
+            put_varint(t, (self.written << 1) | 1);
+            self.out.extend_from_slice(&c);
+            self.written += c.len() as u64;
+        } else {
+            put_varint(t, (self.segs.len() as u64) << 1);
+            self.segs.extend_from_slice(&c);
+        }
         put_varint(t, c.len() as u64);
         put_varint(t, self.seg.len() as u64);
         put_varint(t, self.seg_n);
@@ -431,10 +496,10 @@ impl Writer {
         put_varint(t, (self.seg_first.len() - s) as u64);
         t.extend_from_slice(&self.seg_first[s..]);
         self.top_prev.clone_from(&self.seg_first);
-        self.segs.extend_from_slice(&c);
         self.nsegs += 1;
         self.seg.clear();
         self.seg_n = 0;
+        Ok(())
     }
 
     /// Finish the file with its commits' headers; the last bytes stay in
@@ -453,8 +518,8 @@ impl Writer {
                 ));
             }
         }
-        self.flush_block();
-        self.flush_seg();
+        self.flush_block()?;
+        self.flush_seg()?;
         let flags = commits.iter().fold(0, |f, h| f | h.flags);
         let commits_start = self.written;
         let mut raw = Vec::new();
@@ -472,6 +537,7 @@ impl Writer {
             put_bytes(&mut rec, &h.producer);
             put_bytes(&mut raw, &rec);
         }
+        fits("the commits section", raw.len())?;
         let c = self.zc.compress(&raw).expect("zstd compression");
         let mut commits_section = Vec::with_capacity(8 + c.len());
         commits_section.extend_from_slice(&(raw.len() as u32).to_le_bytes());
@@ -497,6 +563,7 @@ impl Writer {
         put_bytes(&mut top, if self.entries == 0 { &[] } else { &self.prev });
         put_varint(&mut top, self.nsegs);
         top.extend_from_slice(&self.top);
+        fits("the top level", top.len())?;
         let c = self.zc.compress(&top).expect("zstd compression");
         let top_start = self.written;
         self.out.extend_from_slice(&c);
@@ -606,28 +673,62 @@ impl Index {
             + self.first.capacity()
     }
 
-    fn parse(b: &[u8], count: Option<u64>, base: u64, relative: bool) -> Result<Index> {
+    /// Entries whose ranges lie in `within`. Offsets are deltas from the
+    /// previous entry's, or, with `among` (the top level's segments), doubled
+    /// offsets from `base`, plus one for an offset in the file within
+    /// `among`.
+    fn parse(
+        b: &[u8],
+        count: Option<u64>,
+        base: u64,
+        among: Option<std::ops::Range<u64>>,
+        within: std::ops::Range<u64>,
+    ) -> Result<Index> {
         let mut ix = Index::default();
         let mut p = 0;
         let mut off = 0u64;
         let mut prev: std::ops::Range<usize> = 0..0;
         let mut i = 0u64;
         while count.map_or(p < b.len(), |c| i < c) {
-            if relative {
-                off = base + varint(b, &mut p)?;
-            } else {
-                off += varint(b, &mut p)?;
+            let d = varint(b, &mut p)?;
+            let (o, inside) = match &among {
+                None => (off.checked_add(d), &within),
+                Some(a) if d & 1 == 1 => (Some(d >> 1), a),
+                Some(_) => (base.checked_add(d >> 1), &within),
+            };
+            let Some(o) = o else {
+                return format("index offset overflows");
+            };
+            off = o;
+            let mut small = || -> Result<u32> {
+                u32::try_from(varint(b, &mut p)?).or_else(|_| format("index length overflows"))
+            };
+            let (clen, rlen, n) = (small()?, small()?, small()?);
+            if clen as usize > zstd::zstd_safe::compress_bound(MAX_RAW) || rlen as usize > MAX_RAW {
+                return format(format!("index entry of {clen} bytes, {rlen} raw"));
+            }
+            if off < inside.start
+                || off
+                    .checked_add(clen as u64)
+                    .is_none_or(|end| end > inside.end)
+            {
+                return format(format!(
+                    "index entry {off}+{clen} outside its section {inside:?}"
+                ));
             }
             ix.off.push(off);
-            ix.clen.push(varint(b, &mut p)? as u32);
-            ix.rlen.push(varint(b, &mut p)? as u32);
-            ix.n.push(varint(b, &mut p)? as u32);
+            ix.clen.push(clen);
+            ix.rlen.push(rlen);
+            ix.n.push(n);
             ix.check
                 .push(u32::from_le_bytes(take(b, &mut p, 4)?.try_into().unwrap()));
             let s = varint(b, &mut p)? as usize;
             let l = varint(b, &mut p)? as usize;
             if s > prev.len() {
                 return format("index entry shares more than its predecessor's key");
+            }
+            if s.saturating_add(l) > MAX_KEY || ix.first.len() + s + l > MAX_RAW {
+                return format("index keys longer than the format allows");
             }
             let start = ix.first.len();
             ix.first.extend_from_within(prev.start..prev.start + s);
@@ -656,6 +757,8 @@ pub struct Top {
     pub last_key: Vec<u8>,
     pub index_start: u64,
     pub commits_start: u64,
+    pub top_start: u64,
+    pub size: u64,
     pub segs: Index,
 }
 
@@ -686,6 +789,11 @@ impl Top {
         if ts != top_start || commits_start > index_start || index_start > top_start {
             return format("trailer offsets do not match the layer reference");
         }
+        if !(8..=8 + zstd::zstd_safe::compress_bound(MAX_RAW) as u64)
+            .contains(&(index_start - commits_start))
+        {
+            return format("commits section length out of bounds");
+        }
         let c = &tail[..tail.len() - TRAILER];
         if checksum(c) != u32_at(t, 28) {
             return format("top level checksum mismatch");
@@ -699,7 +807,13 @@ impl Top {
         let first_key = get_bytes(&raw, &mut p)?;
         let last_key = get_bytes(&raw, &mut p)?;
         let nsegs = varint(&raw, &mut p)?;
-        let segs = Index::parse(&raw[p..], Some(nsegs), index_start, true)?;
+        let segs = Index::parse(
+            &raw[p..],
+            Some(nsegs),
+            index_start,
+            Some(0..commits_start),
+            index_start..top_start,
+        )?;
         Ok(Top {
             lo: v[0],
             hi: v[1],
@@ -711,6 +825,8 @@ impl Top {
             last_key,
             index_start,
             commits_start,
+            top_start,
+            size,
             segs,
         })
     }
@@ -727,7 +843,7 @@ impl Top {
         ) != (l.lo, l.hi, l.floor, l.entries, l.keys, l.flags)
             || self.first_key != l.first_key
             || self.last_key != l.last_key
-            || self.index_start != l.index_start
+            || (self.index_start, self.top_start, self.size) != (l.index_start, l.top_start, l.size)
         {
             return format(format!(
                 "{}: the file does not match its layer reference",
@@ -744,10 +860,20 @@ impl Top {
     }
 }
 
-pub(crate) fn decompress(c: &[u8], rlen: usize) -> Result<Vec<u8>> {
+/// A compressed frame must declare the length it is read for, before any
+/// buffer of that length is allocated.
+fn frame_holds(c: &[u8], rlen: usize) -> Result<()> {
+    if rlen > MAX_RAW {
+        return format(format!("{rlen} raw bytes: the format allows {MAX_RAW}"));
+    }
     if !matches!(zstd::zstd_safe::get_frame_content_size(c), Ok(Some(n)) if n == rlen as u64) {
         return format(format!("the compressed frame does not hold {rlen} bytes"));
     }
+    Ok(())
+}
+
+pub(crate) fn decompress(c: &[u8], rlen: usize) -> Result<Vec<u8>> {
+    frame_holds(c, rlen)?;
     let raw = zstd::bulk::decompress(c, rlen).map_err(|e| Error::Format(format!("zstd: {e}")))?;
     if raw.len() != rlen {
         return format("decompressed length mismatch");
@@ -755,12 +881,13 @@ pub(crate) fn decompress(c: &[u8], rlen: usize) -> Result<Vec<u8>> {
     Ok(raw)
 }
 
-/// A segment's block list, from its verified bytes.
-pub fn parse_segment(c: &[u8], rlen: u32, check: u32, blocks: u32) -> Result<Index> {
+/// A segment's block list, from its verified bytes; its blocks lie in the
+/// data section `[0, data_end)`.
+pub fn parse_segment(c: &[u8], rlen: u32, check: u32, blocks: u32, data_end: u64) -> Result<Index> {
     if checksum(c) != check {
         return format("segment checksum mismatch");
     }
-    let ix = Index::parse(&decompress(c, rlen as usize)?, None, 0, false)?;
+    let ix = Index::parse(&decompress(c, rlen as usize)?, None, 0, None, 0..data_end)?;
     if ix.len() != blocks as usize {
         return format("segment block count mismatch");
     }
@@ -779,7 +906,14 @@ pub fn parse_commits(b: &[u8]) -> Result<Vec<CommitHeader>> {
     let raw = decompress(&b[8..], rlen)?;
     let mut p = 0;
     let n = varint(&raw, &mut p)?;
-    let mut out = Vec::with_capacity(n.min(1 << 20) as usize);
+    // a header takes at least 8 bytes: its length and seven fields
+    if n > (raw.len() - p) as u64 / 8 {
+        return format(format!(
+            "{n} commit headers in a {} byte section",
+            raw.len()
+        ));
+    }
+    let mut out = Vec::new();
     for _ in 0..n {
         let len = varint(&raw, &mut p)? as usize;
         let rec = take(&raw, &mut p, len)?;
@@ -824,6 +958,7 @@ impl Decoder {
     pub fn decode(&mut self, c: &[u8], rlen: u32, rows: u32, out: &mut Run) -> Result<()> {
         out.clear();
         self.raw.clear();
+        frame_holds(c, rlen as usize)?;
         self.raw.reserve(rlen as usize);
         let n = self
             .zd
@@ -835,9 +970,13 @@ impl Decoder {
         let raw = &self.raw[..];
         let mut p = 0;
         let mut prev_commit = 0;
+        let mut key_bytes = 0;
         for _ in 0..rows {
             let s = varint(raw, &mut p)? as usize;
             let l = varint(raw, &mut p)? as usize;
+            if s.saturating_add(l) > MAX_KEY {
+                return format("a key longer than the format allows");
+            }
             let suffix = take(raw, &mut p, l)?;
             let commit = varint(raw, &mut p)?;
             let Some(&f) = raw.get(p) else {
@@ -880,6 +1019,10 @@ impl Decoder {
                 };
                 if !ascends {
                     return format("keys do not ascend");
+                }
+                key_bytes += s + l;
+                if key_bytes > MAX_RAW {
+                    return format("a block's keys longer than the format allows");
                 }
                 out.push_key_prefixed(s, suffix);
             }

@@ -9,6 +9,7 @@ import os
 import random
 import time
 import uuid
+import warnings
 from urllib.parse import unquote, urlsplit
 
 import pytest
@@ -168,6 +169,8 @@ def test_bad_input_is_refused(tmp_path):
         ix.write_commit("c1", 1, [("k", 1, 1)])
     with pytest.raises(TypeError):
         ix.write_commit("c1", 1, [("k", 1.5, None)])
+    with pytest.raises(TypeError):
+        ix.write_commit("c1", 1, [("k", True, None)])
     layer = ix.write_commit("c1", 1, [("k", 1, None)])
     with pytest.raises(ValueError):
         ix.diff([{**layer, "lo": 2, "hi": 2}], 1, 2)
@@ -175,7 +178,24 @@ def test_bad_input_is_refused(tmp_path):
         ix.scan([{**layer, "entries": 5}], 1)
 
 
-segments = st.sampled_from(["a", "b", "/", ".", "é", "€", "😀", "x/y"])
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="needs fork")
+def test_a_forked_child_fails_loudly(tmp_path):
+    ix = ChangeIndex(f"file://{tmp_path}")
+    layer = ix.write_commit("c1", 1, [("k", 1, None)])
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        pid = os.fork()
+    if pid == 0:
+        try:
+            ix.scan([layer], 1)
+        except BaseException:
+            os._exit(0)
+        os._exit(1)
+    _, status = os.waitpid(pid, 0)
+    assert os.waitstatus_to_exitcode(status) == 0
+
+
+segments = st.sampled_from(["a", "b", "/", ".", "\n", "é", "€", "😀", "x/y"])
 glob_parts = st.sampled_from(["a", "b", "/", ".", "é", "€", "😀", "*", "**", "**/", "?"])
 
 
@@ -210,11 +230,20 @@ def test_s3_round_trip(tmp_path):
     assert {k for k, *_ in rows} == {k for k in keys if states[floor].get(k) != states[head].get(k)}
     assert ix.stats()["gets"] > 0
 
-    cached = ChangeIndex(url, options, disk_dir=str(tmp_path))
+    cached = ChangeIndex(url, options, disk_dir=str(tmp_path), disk_store=url)
     assert cached.scan(layers, head)[0] == rows_head
-    reopened = ChangeIndex(url, options, disk_dir=str(tmp_path))
+    with pytest.raises(ValueError):
+        ChangeIndex(url, options, disk_dir=str(tmp_path), disk_store=url)
     for _ in range(100):
-        if reopened.scan(layers, head)[0] == rows_head and reopened.stats()["disk_reads"] > 0:
+        if cached.stats()["fills"] == len(layers):
             break
         time.sleep(0.05)
-    assert reopened.stats()["disk_reads"] > 0
+    del cached
+    for _ in range(100):
+        try:
+            reopened = ChangeIndex(url, options, disk_dir=str(tmp_path), disk_store=url)
+            break
+        except ValueError:
+            time.sleep(0.05)
+    assert reopened.scan(layers, head)[0] == rows_head
+    assert reopened.stats()["gets"] == 0 and reopened.stats()["disk_reads"] > 0

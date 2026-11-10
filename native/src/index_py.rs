@@ -15,7 +15,7 @@ use std::sync::OnceLock;
 use pyo3::create_exception;
 use pyo3::exceptions::{PyKeyError, PyOSError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyDict, PyInt, PyList, PyString, PyTuple};
+use pyo3::types::{PyBool, PyBytes, PyDict, PyInt, PyList, PyString, PyTuple};
 use solera_index as ix;
 use solera_index::{Error, LayerRef, Query, Run, Version};
 
@@ -28,16 +28,25 @@ create_exception!(
     "A merge found entries that do not chain: an entry's replaced version is not the previous entry's new one."
 );
 
+/// The runtime, made by this process: its threads do not survive a fork, so
+/// a forked child that calls in fails loudly instead of hanging.
 pub(crate) fn rt() -> &'static tokio::runtime::Runtime {
-    static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
-    RT.get_or_init(|| {
-        tokio::runtime::Builder::new_multi_thread()
+    static RT: OnceLock<(tokio::runtime::Runtime, u32)> = OnceLock::new();
+    let (rt, pid) = RT.get_or_init(|| {
+        let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .thread_name("solera-index")
             .enable_all()
             .build()
-            .expect("the change index's runtime")
-    })
+            .expect("the change index's runtime");
+        (rt, std::process::id())
+    });
+    assert_eq!(
+        *pid,
+        std::process::id(),
+        "the change index cannot be used in a process forked after its first use"
+    );
+    rt
 }
 
 pub(crate) fn err(e: Error) -> PyErr {
@@ -61,7 +70,7 @@ impl Owned {
             Ok(Owned::Absent)
         } else if v.is_instance_of::<PyString>() {
             Ok(Owned::Str(v.extract()?))
-        } else if v.is_instance_of::<PyInt>() {
+        } else if v.is_instance_of::<PyInt>() && !v.is_instance_of::<PyBool>() {
             Ok(Owned::Int(v.extract()?))
         } else {
             Err(PyTypeError::new_err(format!(
@@ -196,34 +205,48 @@ pub struct ChangeIndex {
 impl ChangeIndex {
     /// `options` are object_store's (for S3: `aws_access_key_id`, `aws_endpoint`, `aws_allow_http`, …).
     #[new]
-    /// `disk_dir`: keep whole layer files there (for a remote store), up to `disk_bytes`.
+    /// `disk_dir`: keep whole layer files there (for a remote store), up to
+    /// `disk_bytes`. `disk_store` names the store (and prefix) whose layers
+    /// they are, stably across restarts: the directory's files for another
+    /// name are removed.
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (url, options=None, *, memory_bytes=256 << 20, disk_dir=None, disk_bytes=16 << 30, block_bytes=32 << 10, level=1))]
+    #[pyo3(signature = (url, options=None, *, memory_bytes=256 << 20, disk_dir=None, disk_store=None, disk_bytes=16 << 30, block_bytes=32 << 10, level=1))]
     fn new(
+        py: Python<'_>,
         url: &str,
         options: Option<HashMap<String, String>>,
         memory_bytes: u64,
         disk_dir: Option<std::path::PathBuf>,
+        disk_store: Option<String>,
         disk_bytes: u64,
         block_bytes: usize,
         level: i32,
     ) -> PyResult<Self> {
         guard(|| {
-            let opts = ix::StoreOptions {
-                memory_bytes,
-                disk: disk_dir.map(|dir| ix::DiskOptions {
+            let disk = match (disk_dir, disk_store) {
+                (Some(dir), Some(store)) => Some(ix::DiskOptions {
                     dir,
                     bytes: disk_bytes,
+                    store,
                 }),
+                (None, None) => None,
+                _ => return Err(PyValueError::new_err("disk_dir and disk_store go together")),
+            };
+            let opts = ix::StoreOptions {
+                memory_bytes,
+                disk,
                 ..Default::default()
             };
-            let store = ix::Store::from_url(
-                url,
-                options.unwrap_or_default(),
-                rt().handle().clone(),
-                opts,
-            )
-            .map_err(err)?;
+            let store = py
+                .detach(|| {
+                    ix::Store::from_url(
+                        url,
+                        options.unwrap_or_default(),
+                        rt().handle().clone(),
+                        opts,
+                    )
+                })
+                .map_err(err)?;
             let write = ix::WriteOptions {
                 block_bytes,
                 level,
@@ -237,6 +260,7 @@ impl ChangeIndex {
 
     /// Write commit `commit`'s layer at `path` from its entries `(key, new,
     /// replaced)`, one per changed key, in any order. Returns the layer.
+    #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (path, commit, entries, *, time_ms=0, producer=Vec::new(), live_before=0))]
     fn write_commit<'py>(
         &self,

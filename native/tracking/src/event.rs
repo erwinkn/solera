@@ -16,8 +16,10 @@
 //! [`crate::Tracking::apply`] decodes every part, checks every part against
 //! the state as it was before the event, and only then applies them in order,
 //! so an event applies whole or not at all. Applying a checked part cannot
-//! fail. Parts of one event therefore never depend on each other's effects
-//! to pass their check: an edge is opened by an event of its own.
+//! fail. Parts of one event change distinct things ([`Part::touches`]; an
+//! event where two parts name the same edge or output is refused), so no
+//! part's check depends on another's effect: an edge is opened by an event
+//! of its own.
 
 use crate::codec::{Dec, Enc};
 use crate::commit;
@@ -54,6 +56,25 @@ pub enum Part {
 }
 
 impl Part {
+    /// What the part changes, as (kind, id): parts of one event change
+    /// distinct things, so each part's check against the state before the
+    /// event still holds when the parts before it have applied.
+    pub fn touches(&self) -> Vec<(&'static str, &[u8])> {
+        match self {
+            Part::EdgeOpen(p) => vec![("edge", &p.edge)],
+            Part::EdgeClose(p) => vec![("edge", &p.edge)],
+            Part::EdgeRename(p) if p.from == p.to => vec![("edge", &p.from)],
+            Part::EdgeRename(p) => vec![("edge", &p.from), ("edge", &p.to)],
+            Part::Reset(p) => vec![("edge", &p.edge)],
+            Part::Batch(p) => vec![("edge", &p.edge)],
+            Part::Consumed(p) => vec![("edge", &p.edge)],
+            Part::OutputCommit(p) => vec![("output", &p.output)],
+            Part::Watch(p) => vec![("watch", &p.edge)],
+            Part::Witness(p) => vec![("witness", &p.edge)],
+            Part::Incomplete(p) => vec![("incomplete", &p.output)],
+        }
+    }
+
     fn tag(&self) -> u8 {
         match self {
             Part::EdgeOpen(_) => progress::TAG_EDGE_OPEN,

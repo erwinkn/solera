@@ -16,8 +16,8 @@
 //!   ranges, then one probe (the planner with a limit of one key) from the first
 //!   changed range; a stale witness is rechecked at the head and probed for only
 //!   if it is no longer due. The result is a [`Witness`] part to journal.
-//! - [`notice`]: the same rule 1 over a commit's entries as the commit builder
-//!   produces them, with no index read, for every current edge reading that
+//! - [`Notice`]: the same rule 1 over a commit's entries as the commit builder
+//!   writes them, with no index read, for every current edge reading that
 //!   output. Its parts go into the commit's own event.
 //!
 //! Generations are drawn from one counter and never reused, so a part
@@ -41,7 +41,7 @@ use crate::progress::{Conditions, Key, KeyRange};
 use crate::state::{Id, Tracking};
 
 pub use query::{graph, Counts, Owed, Partition, Status};
-pub use refresh::{notice, refresh, retry_due, Ask, Due, NoneDue};
+pub use refresh::{refresh, retry_due, Ask, Due, NoneDue, Notice};
 
 pub const TAG_WATCH: u8 = 0x40;
 pub const TAG_WITNESS: u8 = 0x41;

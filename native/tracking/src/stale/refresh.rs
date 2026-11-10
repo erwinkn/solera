@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 
-use solera_index::{LayerRef, Query, Run, Version};
+use solera_index::{LayerRef, Query, Version};
 
 use crate::codec::Ver;
 use crate::error::{invalid, Result};
@@ -322,97 +322,139 @@ pub async fn retry_due(
     Ok(Some(part))
 }
 
-/// Rules 1 and 2 at commit `commit` of `output`, from the commit's entries
-/// (key order) as the commit builder produced them: no index read. For each
-/// edge reading `output` whose state is current as of the commit before:
-/// fresh, the first entry that matters makes it stale; stale with a witness
-/// the commit does not touch, it stays so. An edge the entries cannot decide
-/// (the commit touches its witness, or a key with a point whose state
-/// differs) is left for a refresh. The parts go into the commit's event.
-pub fn notice(t: &Tracking, output: &[u8], commit: u64, entries: &Run, time_ms: u64) -> Vec<Part> {
-    let mut parts = vec![];
-    if t.stale.incomplete.contains(output) {
-        return parts;
+/// Rules 1 and 2 at commit `commit` of `output`, over the commit's entries
+/// as the commit builder writes them (key order), with no index read. Made
+/// before the build, for each edge reading `output` whose state is current
+/// as of the commit before; fed every entry; `finish` gives the parts for the
+/// commit's event. Fresh, the first entry that matters makes the edge stale;
+/// stale with a witness the commit does not touch, it stays so. An edge the
+/// entries cannot decide (the commit touches its witness, or a key with a
+/// point whose state differs) is left for a refresh.
+pub struct Notice {
+    commit: u64,
+    time_ms: u64,
+    /// Fresh edges rule 1 has not decided yet.
+    fresh: Vec<Noticed>,
+    /// Stale edges whose witness no entry has reached yet, the smallest
+    /// witness last: each entry is compared with that one only.
+    stale: Vec<Noticed>,
+    parts: Vec<Part>,
+}
+
+struct Noticed {
+    edge: Id,
+    gen: u64,
+    progress: Arc<Progress>,
+    now: Arc<Conditions>,
+    state: State,
+}
+
+impl Noticed {
+    fn witness(&self) -> &[u8] {
+        match &self.state {
+            State::Stale { key, .. } => key,
+            State::Fresh => &[],
+        }
     }
-    for (id, e) in &t.edges {
-        if *e.input != *output {
-            continue;
-        }
-        let Some(i) = t.stale.inputs.get(id) else {
-            continue;
-        };
-        let (Some(w), Some(k)) = (&i.watch, i.current()) else {
-            continue;
-        };
-        let Some(keyed) = e.progress.keyed() else {
-            continue;
-        };
-        if k.x + 1 != commit {
-            continue;
-        }
-        let state = match &k.state {
-            State::Stale { key, .. } => {
-                if contains(entries, key) {
-                    continue;
-                }
-                k.state.clone()
-            }
-            State::Fresh => match first_due(keyed, &w.conditions, entries) {
-                Some(Some((key, reason))) => State::Stale {
-                    key,
-                    reason,
-                    since_ms: time_ms,
-                },
-                Some(None) => State::Fresh,
-                None => continue,
-            },
-        };
-        parts.push(Part::Witness(Witness {
-            edge: id.clone(),
-            gen: i.gen,
+
+    fn part(self, commit: u64) -> Part {
+        Part::Witness(Witness {
+            edge: self.edge,
+            gen: self.gen,
             x: commit,
-            state,
+            state: self.state,
             retry: false,
-        }));
+        })
     }
-    parts
 }
 
-/// Rule 1 over one commit's entries: Some(the first due key) or Some(None),
-/// or None when a point leaves it undecided.
-pub fn first_due(
-    keyed: &Keyed,
-    now: &Arc<Conditions>,
-    entries: &Run,
-) -> Option<Option<(Key, Reason)>> {
-    for i in 0..entries.len() {
-        let key = entries.key(i);
-        match rule1(
-            keyed,
-            now,
-            key,
-            entries.new_version(entries.rows(i).start),
-            None,
-        ) {
-            Step::Skip => {}
-            Step::Due(r) => return Some(Some((key.into(), r))),
-            Step::Unsure => return None,
+impl Notice {
+    pub fn new(t: &Tracking, output: &[u8], commit: u64, time_ms: u64) -> Notice {
+        let mut n = Notice {
+            commit,
+            time_ms,
+            fresh: vec![],
+            stale: vec![],
+            parts: vec![],
+        };
+        if t.stale.incomplete.contains(output) {
+            return n;
         }
+        for (id, e) in &t.edges {
+            let Some(i) = t.stale.inputs.get(id) else {
+                continue;
+            };
+            let (Some(w), Some(k)) = (&i.watch, i.current()) else {
+                continue;
+            };
+            if *e.input != *output || e.progress.keyed().is_none() || k.x + 1 != commit {
+                continue;
+            }
+            let noticed = Noticed {
+                edge: id.clone(),
+                gen: i.gen,
+                progress: e.progress.clone(),
+                now: w.conditions.clone(),
+                state: k.state.clone(),
+            };
+            match k.state {
+                State::Fresh => n.fresh.push(noticed),
+                State::Stale { .. } => n.stale.push(noticed),
+            }
+        }
+        n.stale.sort_by(|a, b| b.witness().cmp(a.witness()));
+        n
     }
-    Some(None)
-}
 
-fn contains(run: &Run, key: &[u8]) -> bool {
-    let (mut lo, mut hi) = (0, run.len());
-    while lo < hi {
-        let mid = (lo + hi) / 2;
-        match run.key(mid).cmp(key) {
-            std::cmp::Ordering::Less => lo = mid + 1,
-            std::cmp::Ordering::Greater => hi = mid,
-            std::cmp::Ordering::Equal => return true,
+    /// The next entry, in key order: `key` became `new`.
+    pub fn push(&mut self, key: &[u8], new: Version<'_>) {
+        while let Some(n) = self.stale.last() {
+            match n.witness().cmp(key) {
+                std::cmp::Ordering::Greater => break,
+                std::cmp::Ordering::Equal => {
+                    self.stale.pop();
+                }
+                std::cmp::Ordering::Less => {
+                    let n = self.stale.pop().expect("a last");
+                    self.parts.push(n.part(self.commit));
+                }
+            }
         }
+        if self.fresh.is_empty() {
+            return;
+        }
+        let (commit, time_ms) = (self.commit, self.time_ms);
+        let parts = &mut self.parts;
+        self.fresh.retain_mut(|n| {
+            let keyed = n.progress.keyed().expect("a keyed edge");
+            match rule1(keyed, &n.now, key, new, None) {
+                Step::Skip => true,
+                Step::Unsure => false,
+                Step::Due(reason) => {
+                    parts.push(Part::Witness(Witness {
+                        edge: n.edge.clone(),
+                        gen: n.gen,
+                        x: commit,
+                        state: State::Stale {
+                            key: key.into(),
+                            reason,
+                            since_ms: time_ms,
+                        },
+                        retry: false,
+                    }));
+                    false
+                }
+            }
+        });
     }
-    false
+
+    /// The parts for the commit's event.
+    pub fn finish(mut self) -> Vec<Part> {
+        for n in self.fresh.into_iter().chain(self.stale) {
+            self.parts.push(n.part(self.commit));
+        }
+        self.parts
+    }
 }
 
 enum Step {

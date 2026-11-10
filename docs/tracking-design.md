@@ -344,6 +344,37 @@ format and rejected. One entry per changed key stays.
   zstd already finds the repeats. The one gain (−31% on the hot
   workload's change layers) is outweighed by its base.
 
+### As built (B4)
+
+In `native/tracking/src/commit/`, as described above:
+
+- **One call builds a commit.** `build` takes the keys a write changed in
+  key order (`Changes`: an upsert with or without a version word, or a
+  removal; an upsert without one gets the attempt's version) and the
+  output's head. It reads the replaced versions with one `get` per block of
+  changes and streams the entries into the index's `CommitWriter`, so a
+  commit's entries are never collected: a 100M-key commit held 386 MB at
+  its peak (the 256 MB block cache included), but the changes handed over
+  stay in memory as the worker encoded them, and so do the changed keys a
+  caller asks to collect. A key whose version
+  does not change is no entry, and a commit with no entry writes nothing.
+- **Three modes.** A *patch* leaves keys it does not name as they are. A
+  *replace* (a source's full listing, or a write that reports the whole
+  output) removes every key at the head it does not name, reading the
+  head's state by `scan`, 65,536 keys a page. A *report* (a load's report
+  on a source, P13) keeps a key's report only if the key's version at the
+  batch's head equals its version at the output's head, so a key that
+  changed and changed back still takes the report.
+- **The event part** `OutputCommit` carries the layer reference and the
+  live count, never keys. Its check refuses a layer that is not exactly the
+  head's next commit, so a commit built at an old head is refused, and an
+  event holds at most one commit per output.
+- **What a worker hands over** is `Changes` in its transport form: zstd
+  blocks of sorted keys, at most 1 MiB a row, a block cut once it passes
+  256 KiB encoded or 8 MiB expanded.
+- **Clears are not built yet**: they wait on the index's clear flag (§10,
+  form (a)).
+
 ## 5. Progress: pieces and points
 
 Progress says, for every key of an edge, what the consumer holds. It
@@ -457,6 +488,31 @@ The other input kinds are the keyed design without keys, as today.
 |---|---|---|
 | Unkeyed incremental | "Consumed through commit c" | The head is past c. A clear after c makes the next run a full run (INC-13) |
 | Whole or dep | None of its own: its head is part of the context | The context now differs from a piece's |
+
+### As built (B3)
+
+In `native/tracking/src/progress/` (the types and the event parts) and
+`progress/ops.rs` (what a batch commit writes), as described above, with
+these additions:
+
+- **A point also records what upstream had.** `Point { holding, reason, seen }`:
+  `seen` is the version upstream had, under the patterns of the piece the
+  point was written with, at that piece's commit. The planner then reads the
+  key's version at the head from the piece's diff instead of looking each
+  point up. With 10,000 failing points on an edge at 100 million keys,
+  planning went from 7.0 to 1.0 µs per key. A key list's points have no
+  `seen`: they sit inside an older piece.
+- **Conditions carry the rebuild counter** (P8 amended): a difference in
+  context, definition or rebuild counter makes every present key owed.
+- **A batch commit checks the progress it read.** `BatchProgress` carries a
+  digest of the progress over its range as the plan read it, and is refused
+  if that moved. An unkeyed edge's `Consumed` carries the `through` it read,
+  so a stale commit cannot move it back. The definition and new-life checks
+  of §7 stay with the engine.
+- **Points stay in memory** (a sorted map per edge). Spilling past a few
+  thousand is not built: not needed at the measured sizes.
+- **Clears are not built yet** (§10, form (a)): the planner needs each
+  output's clear commits, and candidates across a clear come from two scans.
 
 ## 6. Staleness kept exact by propagation
 
@@ -645,9 +701,9 @@ and conditions at one generation, as of one upstream commit.
   reads "unknown" until a refresh. Generations come from one counter and
   are never reused, so a part for an edge since closed never applies to one
   reopened under its name.
-- **At an upstream commit** (rules 1 and 2), the commit builder hands the
-  commit's entries to staleness, which adds a witness part to the commit's
-  own event for every current edge reading the output: fresh, the first
+- **At an upstream commit** (rules 1 and 2), the commit builder feeds each
+  entry to staleness as it writes it, and staleness adds a witness part to
+  the commit's own event for every current edge reading the output: fresh, the first
   entry the patterns take with no point makes it stale; stale, a commit
   that does not touch the witness changes nothing. An edge the entries
   cannot decide (the commit touches its witness, or a point differs) is
@@ -682,8 +738,9 @@ and conditions at one generation, as of one upstream commit.
   changed", whatever upstream did since; the notice, the probe and the count
   give each key the same reason.
 
-At 100M keys (`bench/core/stale/`): a notice costs 0.11 to 0.22 µs per
-edge, and about 80 ns per entry per edge when no entry matters; a count,
+At 100M keys (`bench/core/stale/`): a notice costs 1 to 6 µs per edge
+(50 edges reading a commit of 10k to 45k entries), and about 87 ns per
+entry per edge when no entry matters; a count,
 reasons included, costs 1.1 s cold and 0.6 to 0.7 s warm for an edge a day
 behind and 15 s cold for 30 days behind, where the index's diff alone
 takes 0.9 s and 5.7 s cold (`bench/core/stale/results/run-100m.log`).
@@ -731,15 +788,15 @@ Measured at the scale target (100M keys, one 4-vCPU machine):
 | Commit | CPU | Storage requests | Memory |
 |---|---|---|---|
 | A 10k-key batch in one key range, cold | about 10 ms | 11 to 15 GETs, one 62 KB PUT | |
-| A 100M-key commit (a full rewrite), streamed | about 30 s | | 579 MB peak |
-| A 10k-key batch scattered over the whole output, cold | 2.6 to 2.9 s | about 2,850 GETs | |
+| A 100M-key commit (a full rewrite as a listing), streamed | about 30 s | | 386 MB peak |
+| A 10k-key batch scattered over the whole output, cold | 1.2 to 1.5 s | about 2,850 GETs | |
 
-The one miss is the scattered batch, and all of its cost is the index's
-`get` walking whole blocks it was not asked about; a `get` that skips
-them should bring it to 0.5 to 1 s. Sending such commits to a worker would
+The scattered batch is the dearest, and its cost is the index's `get`
+decoding about 10,000 blocks (2.6 to 2.9 s before `get` learned to skip
+rows it was not asked about). Sending such commits to a worker would
 not make them cheaper, only move them, and it would add a second commit
 builder, a copy of the layer list on workers, and a rebuild whenever the
-head moved in between. The fix belongs in `get`.
+head moved in between.
 
 ### Where candidates come from
 
@@ -807,6 +864,35 @@ About 200 bytes plus the replaced slice, usually one piece.
 A batch covers the same key range on every keyed input; candidates merge
 in key order and N counts distinct keys. Each edge gets its own piece at
 its own head and its own record.
+
+### As built (B3)
+
+In `native/tracking/src/plan/` and `record/`, called from Python as
+`Tracking.plan`, `progress_ops`, `owed` and `owed_count`
+(`native/src/tracking_py.rs`), each one crossing with the GIL released.
+
+- **The key list travels as the plan's bytes**: each key with its class and
+  its version at H, encoded once, put into the spec untouched and decoded
+  again at commit, after a restart too.
+- **Every read is paged and stops when the batch is full.** A source's first
+  page asks for about as many keys as the batch still needs (a little more,
+  to know whether the range ends at +∞), and each further page doubles, up
+  to 1M entries. Globs are filtered by the index; `Regex(...)`
+  patterns by the planner, which pages on. A `Regex` is in the Rust `regex`
+  dialect, matched against the whole key, and today's Python matching uses
+  the same native matcher.
+- **Points are looked up in chunks** of up to 1,024 keys, bounded by the
+  unfinished sources' read frontier; the lookahead may fetch points beyond
+  the final batch range.
+- **Keys owed but not due** (§11) come from a hook (`plan::Hold`) that B6
+  implements over its due index. They are listed as held back and keep
+  what they held.
+- **The batch record** is as in the table above; its digest is xxh3 over
+  the batch's keys, classes and versions, and the planner version is 1.
+- **One journal event** holds every part of a commit. Its parts change
+  distinct things (an edge, an output), are each checked against the state
+  before the event, then applied; an event that changes one thing twice is
+  refused whole.
 
 ## 8. The store contract
 

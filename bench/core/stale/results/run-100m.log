@@ -18,12 +18,12 @@
 {"behind_days":30,"cpu_s":5.226,"head":1720,"keys":27608014,"mode":"warm","query":"raw-diff","wall_s":5.224}
 {"behind_days":30,"cpu_s":5.334,"head":1720,"keys":27608014,"mode":"local-cold","query":"raw-diff","wall_s":5.21}
 {"behind_days":30,"cpu_s":5.153,"head":1720,"keys":27608014,"mode":"warm","query":"raw-diff","wall_s":5.025}
-{"case":"fresh, the first entry matters","commit":"hourly","entries":45335,"head":1720,"ns_per_entry_per_reader":0.005,"p50_ms":0.011,"parts":50,"query":"notice","readers":50,"us_per_reader":0.22}
-{"case":"fresh, no entry matters (patterns leave every key out)","commit":"hourly","entries":45335,"head":1720,"ns_per_entry_per_reader":80.186,"p50_ms":181.762,"parts":50,"query":"notice","readers":50,"us_per_reader":3635.248}
-{"case":"stale, the commit does not touch the witness","commit":"hourly","entries":45335,"head":1720,"ns_per_entry_per_reader":0.003,"p50_ms":0.006,"parts":50,"query":"notice","readers":50,"us_per_reader":0.118}
-{"case":"fresh, the first entry matters","commit":"batch","entries":10000,"head":1720,"ns_per_entry_per_reader":0.022,"p50_ms":0.011,"parts":50,"query":"notice","readers":50,"us_per_reader":0.22}
-{"case":"fresh, no entry matters (patterns leave every key out)","commit":"batch","entries":10000,"head":1720,"ns_per_entry_per_reader":79.799,"p50_ms":39.9,"parts":50,"query":"notice","readers":50,"us_per_reader":797.995}
-{"case":"stale, the commit does not touch the witness","commit":"batch","entries":10000,"head":1720,"ns_per_entry_per_reader":0.011,"p50_ms":0.006,"parts":50,"query":"notice","readers":50,"us_per_reader":0.114}
+{"case":"fresh, the first entry matters","commit":"hourly","entries":45335,"head":1720,"ns_per_entry_per_reader":0.08,"p50_ms":0.182,"parts":50,"query":"notice","readers":50,"us_per_reader":3.636}
+{"case":"fresh, no entry matters (patterns leave every key out)","commit":"hourly","entries":45335,"head":1720,"ns_per_entry_per_reader":87.505,"p50_ms":198.352,"parts":50,"query":"notice","readers":50,"us_per_reader":3967.041}
+{"case":"stale, the commit does not touch the witness","commit":"hourly","entries":45335,"head":1720,"ns_per_entry_per_reader":0.139,"p50_ms":0.316,"parts":50,"query":"notice","readers":50,"us_per_reader":6.322}
+{"case":"fresh, the first entry matters","commit":"batch","entries":10000,"head":1720,"ns_per_entry_per_reader":0.163,"p50_ms":0.082,"parts":50,"query":"notice","readers":50,"us_per_reader":1.634}
+{"case":"fresh, no entry matters (patterns leave every key out)","commit":"batch","entries":10000,"head":1720,"ns_per_entry_per_reader":86.396,"p50_ms":43.198,"parts":50,"query":"notice","readers":50,"us_per_reader":863.963}
+{"case":"stale, the commit does not touch the witness","commit":"batch","entries":10000,"head":1720,"ns_per_entry_per_reader":0.077,"p50_ms":0.039,"parts":50,"query":"notice","readers":50,"us_per_reader":0.775}
 {"case":"fresh as of head-1, rule 1 over the head commit, the first entry matters","cpu_ms":1.142,"found":"Some(\"site-0000/part-00/obj-000000000081-e2bf06e3.json (input changed)\")","gets":2,"head":1720,"mb":0.276,"mode":"cold","query":"refresh","wall_ms":67.168}
 {"case":"fresh as of head-1, rule 1 over the head commit, the first entry matters","cpu_ms":0.187,"found":"Some(\"site-0000/part-00/obj-000000000081-e2bf06e3.json (input changed)\")","gets":0,"head":1720,"mb":0.0,"mode":"warm","query":"refresh","wall_ms":0.173}
 {"case":"fresh as of head-1, rule 1 over the head commit, the first entry matters","cpu_ms":0.51,"found":"Some(\"site-0000/part-00/obj-000000000081-e2bf06e3.json (input changed)\")","gets":2,"head":1720,"mb":0.276,"mode":"local-cold","query":"refresh","wall_ms":0.383}

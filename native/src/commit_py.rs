@@ -5,6 +5,7 @@
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList};
+use solera_index::Version;
 use solera_tracking as tr;
 use solera_tracking::commit::{self, Change, Changes, Mode, Reader, Spec};
 use solera_tracking::plan::Indexes;
@@ -56,10 +57,14 @@ pub(crate) fn build_commit<'py>(
         collect,
     };
     let id: tr::Id = output.into();
+    let mut notice = tr::stale::Notice::new(&state.read().unwrap(), output, out.head + 1, time_ms);
     let built = guard(|| {
         py.detach(|| {
             let mut src = Reader::new(changes)?;
-            rt().block_on(commit::build(ixs, &id, &out, spec, &mut src))
+            let mut each = |k: &[u8], v: Version<'_>| notice.push(k, v);
+            rt().block_on(commit::build_each(
+                ixs, &id, &out, spec, &mut src, &mut each,
+            ))
         })
         .map_err(err)
     })?;
@@ -68,13 +73,7 @@ pub(crate) fn build_commit<'py>(
     };
     let d = PyDict::new(py);
     let mut parts = vec![tr::Part::OutputCommit(b.part.clone())];
-    parts.extend(tr::stale::notice(
-        &state.read().unwrap(),
-        output,
-        b.part.layer.hi,
-        &b.entries,
-        time_ms,
-    ));
+    parts.extend(notice.finish());
     let ev = tr::Event::of(parts).encode();
     d.set_item("event", PyBytes::new(py, &ev))?;
     d.set_item("commit", b.part.layer.hi)?;
