@@ -17,9 +17,9 @@ use solera_index::{
     ChangeIndex, LayerRef, NewCommit, Query, Run, Store, StoreOptions, WriteOptions,
 };
 use solera_tracking::codec::{Dec, Ver};
+use solera_tracking::event::{Event, Part};
 use solera_tracking::outcomes::transition::{Stored, FAILED};
 use solera_tracking::outcomes::{self, Held, Record};
-use solera_tracking::event::{Event, Part};
 use solera_tracking::plan::OneIndex;
 use solera_tracking::progress::{
     read_digest, BatchProgress, Conditions, EdgeOpen, Key, KeyRange, Keyed, Pat, Patterns, Value,
@@ -107,6 +107,7 @@ fn state(
             piece: Some(Value::At(at, cond.clone())),
             points: vec![],
             expect: read_digest(&Keyed::default(), false, &KeyRange::all()),
+            fence: None,
         }));
         t.apply_event(Event::of(parts)).unwrap();
         t.apply_event(Event::of(vec![Part::Watch(SetWatch {
@@ -135,7 +136,8 @@ fn state(
 /// Edge 0's failure records (B6): `n` records in all, failed under `c`, on
 /// keys spread over the key space; with `waiting`, among them every key of
 /// `commit`, tried at the version the commit gives it (waiting for its
-/// retry). Written once to `dir` and reused.
+/// retry). Written once to `dir` and reused. The edge has looked for
+/// reverts through the head, as the engine does before it refreshes.
 fn failures(
     t: &mut Tracking,
     ix: &ChangeIndex,
@@ -188,7 +190,11 @@ fn failures(
     let mut run = Run::new();
     for (k, v) in &recs {
         run.push_key(k);
-        run.push_entry(1, solera_index::Version::Bytes(v), solera_index::Version::Absent);
+        run.push_entry(
+            1,
+            solera_index::Version::Bytes(v),
+            solera_index::Version::Absent,
+        );
     }
     let path = format!("stale-failures-{n}-{waiting}");
     let nc = NewCommit {
@@ -208,7 +214,10 @@ fn failures(
             full_run: None,
         },
     );
+    let seen = t.outputs[&t.edges[&edge(0)].input].head;
     let k = t.per_key.entry(edge(0)).or_default();
+    k.seen = seen;
+    k.cond = cid;
     k.conds = Arc::new([(cid, c.clone())].into_iter().collect());
     k.counts[FAILED as usize] = recs.len() as u64;
     k.classes = [recs.len() as u64, 0, 0];
@@ -481,6 +490,7 @@ fn main() {
             piece: Some(Value::At(head, all.clone())),
             points: vec![],
             expect: read_digest(&k, false, &range),
+            fence: None,
         })]))
         .unwrap();
         for (mode, net) in modes {
