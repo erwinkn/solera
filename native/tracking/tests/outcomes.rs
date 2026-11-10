@@ -1951,6 +1951,8 @@ fn a_key_a_pass_left_while_its_input_had_changed_gets_its_deploy_retry() {
         );
         let ev = w.commit_of(&ix, &step, &[], &[], c2).await.unwrap();
         w.apply(ev);
+        // It changes again, then returns; one catch-up sees both.
+        w.input(&ix, &[("k1", 7)]).await;
         w.input(&ix, &[("k1", 5)]).await;
         if let Some(parts) = w.caught(&ix).await {
             w.apply(parts);

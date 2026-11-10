@@ -594,8 +594,7 @@ pub async fn catch_up(
             }
             // A key back on what it was tried on waits for its retry again:
             // a pass that left it while its input had changed did not cover it.
-            let last = run.rows(i).last().expect("a key has rows");
-            let at_head = Holding::of(run.new_version(last), now, k);
+            let at_head = Holding::of(run.new_version(run.rows(i).start), now, k);
             if !crate::progress::owed(&rec.tried(k, conds)?, &at_head) {
                 cover(&mut low, &rec.stored);
             }
