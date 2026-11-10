@@ -164,17 +164,17 @@ same rows again: a new version, and consumers process them again
 **RUN-1. A run has a task per asset partition; a task commits batch by batch; an attempt runs one batch.**
 `tally` owes 25,000 keys, `batch_size=10_000`: one task, three batches.
 Batch 2's first attempt dies; attempt 2 of batch 2 runs it again.
-*From* D155. *Covered* `server/test_engine.py::test_incremental_batching_and_more`; `server/test_complete.py::test_each_commit_row_names_the_batch_that_made_it`.
+*From* D155. *Covered* `contract/test_run.py::test_run_1_a_task_commits_batch_by_batch_and_an_attempt_runs_one_batch`; `contract/test_run.py::test_run_1_a_run_has_a_task_per_asset_partition`; `contract/test_his.py::test_his_4_a_commit_row_names_the_batch_that_made_it`; `server/test_engine.py::test_incremental_batching_and_more`.
 
 **RUN-2. One attempt at a time per asset partition, across runs.**
 The hourly run and a manual run both target `copy`: the second task waits
 ("held: claim (copy)") and runs after the first settles.
-*From* `lifecycle.md` §3.1; F34, F39. *Covered* `server/test_engine.py::test_fencing_concurrent_claim`; sim `one_attempt_per_partition`; `Execution.tla` OneAttemptPerPartition.
+*From* `lifecycle.md` §3.1; F34, F39. *Covered* `contract/test_run.py::test_run_2_one_attempt_at_a_time_per_partition_across_runs`; `server/test_engine.py::test_fencing_concurrent_claim`; sim `one_attempt_per_partition`; `Execution.tla` OneAttemptPerPartition.
 
 **RUN-3. `@asset(concurrency=N)` caps partitions running at once.**
 `report` has `concurrency=2` and three partitions due: `a` and `b` run,
 `c` waits ("held: concurrency (report)") and runs when one ends.
-*From* D78, D111. *Covered* `server/test_engine.py::test_an_assets_concurrency_caps_its_partitions_running_at_once`.
+*From* D78, D111. *Covered* `contract/test_run.py::test_run_3_concurrency_caps_partitions_running_at_once`; `server/test_engine.py::test_an_assets_concurrency_caps_its_partitions_running_at_once`.
 
 **RUN-4. A waiting task says why.**
 One of: `claim`, `concurrency`, `merges` (an output it writes is far
@@ -187,12 +187,12 @@ Batches 1 and 2 commit; batch 3's attempt dies, or the engine restarts:
 the task continues after batch 2's last key. When the run ends, its
 progress goes; the next run compares again and walks from the first key,
 cheaply, since only changes are owed.
-*From* D154, D155. *Covered* `server/test_engine.py::test_a_full_override_resumes_its_pass_batch_by_batch`; `server/test_each_review.py::test_a_full_run_reads_every_key_once_in_batches`; `sim/test_replays.py::test_f42_a_full_run_finishes_its_pass`.
+*From* D154, D155. *Covered* `contract/test_run.py::test_run_5_a_task_resumes_after_its_last_committed_batch_when_its_attempt_dies`; `contract/test_run.py::test_run_5_a_task_resumes_after_its_last_committed_batch_across_engine_restarts`; `contract/test_run.py::test_run_5_a_new_run_starts_from_the_first_key`; `contract/test_run.py::test_run_5_a_full_run_walks_on_batch_by_batch_and_the_next_starts_over`; `server/test_each_review.py::test_a_full_run_reads_every_key_once_in_batches`; `sim/test_replays.py::test_f42_a_full_run_finishes_its_pass`.
 
 **RUN-6. A task never relaunches forever.**
 Two full runs of `copy` with a `feed` commit between: the second finishes
 in a bounded number of attempts.
-*From* F42; D60, D81. *Covered* `sim/test_replays.py::test_f42_a_full_run_finishes_its_pass`; sim `attempts_are_bounded` (100 attempts per task).
+*From* F42; D60, D81. *Covered* `contract/test_run.py::test_run_6_a_full_run_finishes_in_a_bounded_number_of_attempts`; `sim/test_replays.py::test_f42_a_full_run_finishes_its_pass`; sim `attempts_are_bounded` (100 attempts per task).
 
 **RUN-7. A failed attempt is retried by its error's class.**
 `retries=Retry(3)` by default, with backoff. `Rejected` fails the task at
@@ -200,12 +200,12 @@ once; `Failed` and `Abort` use `retries=`; `Transient` retries after
 `retry_after` (else 1 min doubling to 6 h), past `retries=`, until
 `retry_for` (24 h) since its first failure. A worker that dies without a
 result is a retryable failure.
-*From* `per-key-processing.md` §8. *Covered* `server/test_errors.py::test_rejected_fails_without_retries`; `server/test_errors.py::test_failed_and_abort_follow_retries`; `server/test_errors.py::test_transient_retries_past_retries_within_its_budget`; `server/test_errors.py::test_transient_gives_up_after_retry_for`; `server/test_engine.py::test_retry_with_backoff_and_nonretryable`; `worker/test_worker.py::test_killed_harness_retries`.
+*From* `per-key-processing.md` §8. *Covered* `contract/test_run.py::test_run_7_rejected_fails_at_once`; `contract/test_run.py::test_run_7_failed_and_abort_follow_retries`; `contract/test_run.py::test_run_7_retries_back_off_and_a_retry_that_succeeds_ends_the_task`; `contract/test_run.py::test_run_7_by_default_a_failure_is_retried_three_times_backing_off`; `contract/test_run.py::test_run_7_transient_retries_past_retries_within_its_budget`; `contract/test_run.py::test_run_7_transient_without_retry_after_waits_a_minute_doubling`; `contract/test_run.py::test_run_7_transient_gives_up_after_retry_for`; `contract/test_run.py::test_run_7_transient_retries_for_a_day_by_default`; `contract/test_run.py::test_run_7_a_worker_that_dies_without_a_result_is_retried`; `worker/test_worker.py::test_killed_harness_retries`.
 
 **RUN-8. A failed or abandoned attempt changes nothing a consumer processed.**
 Batch 2 of `tally` fails: its keys stay owed and `tally`'s count is what
 batch 1 left.
-*From* D139 (`observed-set.md`, "Outcomes"). *Covered* `server/test_model.py::test_failed_precondition_changes_nothing`; `server/test_model.py::test_an_aborted_attempt_can_no_longer_commit`.
+*From* D139 (`observed-set.md`, "Outcomes"). *Covered* `contract/test_run.py::test_run_8_a_failed_batch_changes_nothing_its_consumer_processed`; `contract/test_run.py::test_run_8_an_abandoned_attempt_changes_nothing_its_consumer_processed`; `server/test_model.py::test_failed_precondition_changes_nothing`; `server/test_model.py::test_an_aborted_attempt_can_no_longer_commit`.
 
 **RUN-9. A cancel is asked first, then forced.**
 The worker hears the cancel within a beat (10 s), stops starting work and
@@ -213,13 +213,13 @@ has `cancel_grace` (60 s, one engine-wide setting) to publish what
 finished. A plain asset that had not begun writing ends `canceled` with
 nothing; one already writing finishes and its commit stands. Past the
 grace the attempt is forced and nothing more of it is accepted.
-*From* D135; `lifecycle.md` §7. *Covered* `server/test_lifecycle.py::test_a_requested_cancel_drains_into_a_canceled_result`; `server/test_fence.py::test_a_cancel_waits_for_a_worker_that_is_writing`; `server/test_fence.py::test_a_drain_that_outlives_its_grace_is_forced_and_still_writing`; `server/test_fence.py::test_a_cancel_aborts_a_worker_that_is_not_writing`; `server/test_engine.py::test_cancel_run`.
+*From* D135; `lifecycle.md` §7. *Covered* `contract/test_run.py::test_run_9_a_cancel_stops_an_asset_that_has_not_begun_writing`; `contract/test_run.py::test_run_9_an_asset_already_writing_finishes_and_its_commit_stands`; `contract/test_run.py::test_run_9_past_its_grace_a_cancel_is_forced_and_nothing_more_is_accepted`; `server/test_lifecycle.py::test_a_requested_cancel_drains_into_a_canceled_result`; `server/test_fence.py::test_a_cancel_waits_for_a_worker_that_is_writing`; `server/test_fence.py::test_a_drain_that_outlives_its_grace_is_forced_and_still_writing`; `server/test_fence.py::test_a_cancel_aborts_a_worker_that_is_not_writing`; `server/test_engine.py::test_cancel_run`.
 
 **RUN-10. A cancelled run keeps what it committed and does not resume itself.**
 `tally`'s run commits batches 1 and 2 and is cancelled: their keys stay
 processed; the partition is stale; the next run owes only the rest plus
 what changed since.
-*From* D139, D154. *Covered* `server/test_complete.py::test_an_incremental_run_canceled_midway_is_complete_and_stale`; `server/test_each.py::test_a_user_cancel_commits_finished_keys_and_leaves_the_rest_owed`.
+*From* D139, D154. *Covered* `contract/test_run.py::test_run_10_a_cancelled_run_keeps_what_it_committed_and_does_not_resume`; `server/test_complete.py::test_an_incremental_run_canceled_midway_is_complete_and_stale`; `server/test_each.py::test_a_user_cancel_commits_finished_keys_and_leaves_the_rest_owed`.
 
 **RUN-11. An attempt's timeout counts from its worker's first report.**
 A 20-minute image pull does not eat a 30-second timeout. Past the
@@ -227,18 +227,18 @@ timeout the attempt is cancelled (reason `timeout`) and retried within
 `retries=`. Before any report, the executor's provisioning deadline
 applies (`provision=`: 10 min for a container executor, none for a
 `Pool` unless set) and the attempt fails retryably.
-*From* `lifecycle.md` §8. *Covered* `server/test_fence.py::test_the_timeout_runs_from_the_first_report`; `server/test_engine.py::test_timeout_fails_retryably`; `server/test_lifecycle.py::test_a_timeout_drain_is_retryable`; `server/test_fence.py::test_a_worker_that_never_reports_is_given_up_on`.
+*From* `lifecycle.md` §8. *Covered* `contract/test_run.py::test_run_11_provisioning_does_not_count_against_the_timeout`; `contract/test_run.py::test_run_11_past_its_timeout_an_attempt_is_cancelled_and_retried`; `contract/test_run.py::test_run_11_a_worker_that_never_reports_fails_retryably_at_its_provisioning_deadline`; `server/test_fence.py::test_the_timeout_runs_from_the_first_report`; `server/test_engine.py::test_timeout_fails_retryably`; `server/test_lifecycle.py::test_a_timeout_drain_is_retryable`; `server/test_fence.py::test_a_worker_that_never_reports_is_given_up_on`.
 
 **RUN-12. Retrying a finished run is a new run; the old one stays as it ended.**
 Run R had a failed and a canceled task; "retry" submits a new run with
 `retry_of: R` for exactly that work; R still reads as it ended.
-*From* `architecture.md` §8. *Covered* `server/test_history.py::test_a_retry_is_a_new_run_and_the_old_one_stays_as_it_ended`; `server/test_history.py::test_a_retry_asks_for_the_work_it_selects`.
+*From* `architecture.md` §8. *Covered* `contract/test_run.py::test_run_12_retrying_a_finished_run_is_a_new_run_and_the_old_one_stays_as_it_ended`; `contract/test_run.py::test_run_12_a_retry_asks_for_exactly_the_partitions_that_did_not_succeed`; `server/test_history.py::test_a_retry_is_a_new_run_and_the_old_one_stays_as_it_ended`; `server/test_history.py::test_a_retry_asks_for_the_work_it_selects`.
 
 **RUN-13. A task's outcome is `succeeded`, `skipped`, `failed` or `canceled`.**
 `skipped`: nothing owed and the partition complete, so no worker
 launches. A per-key run whose keys partly failed still `succeeded`, with
 per-key counts (`{ok: 3, rejected: 1, failed: 1, removed: 1}`).
-*From* `architecture.md` §8; `per-key-processing.md` §8. *Covered* `server/test_retention.py::test_quiet_runs_are_recorded_as_skipped`; `server/test_each.py::test_failures_are_recorded_and_never_block`.
+*From* `architecture.md` §8; `per-key-processing.md` §8. *Covered* `contract/test_run.py::test_run_13_a_tasks_outcome_is_succeeded_skipped_failed_or_canceled`; `contract/test_run.py::test_run_13_a_per_key_run_whose_keys_partly_failed_succeeded_with_counts`; `server/test_retention.py::test_quiet_runs_are_recorded_as_skipped`; `server/test_each.py::test_failures_are_recorded_and_never_block`.
 
 **RUN-14. The console shows the run first, and batches and attempts only when they say something.**
 A task with one batch and one attempt shows just the run. A retry adds
@@ -250,7 +250,7 @@ user-facing text says "attempt spec" or "attempt handle".
 `upstream=False` (default) pins current heads and never re-runs an
 upstream; `upstream=True` builds the closure first. A selection past
 100,000 partitions or tasks is refused, never truncated.
-*From* `architecture.md` §8. *Covered* `server/test_engine.py::test_upstream_false_never_replans`; `server/test_planning.py::test_latest_and_changes_are_counted_before_they_are_listed`.
+*From* `architecture.md` §8. *Covered* `contract/test_run.py::test_run_15_upstream_false_pins_current_heads_and_never_reruns_an_upstream`; `contract/test_run.py::test_run_15_upstream_true_builds_the_closure_first`; `contract/test_run.py::test_run_15_a_selection_past_100000_partitions_is_refused_not_truncated`; `server/test_planning.py::test_latest_and_changes_are_counted_before_they_are_listed`.
 
 ## SEL — `keys=` lists, `"all"`, full runs, `batch.reset`
 
@@ -754,11 +754,11 @@ change stuck, none silently consumed.
 Runs, tasks, attempts, output versions with metadata, and the input
 versions each was built from; filters, facets, a timeline per run, where
 each attempt ran.
-*From* `architecture.md` §8. *Covered* `server/test_history.py::test_versions_carry_metadata_and_lineage`; `server/test_history.py::test_a_run_reads_the_same_once_archived`; `server/test_history.py::test_runs_filter_facets_and_pages`; `server/test_history.py::test_a_run_has_one_timeline`; `server/test_history.py::test_an_attempt_records_where_it_ran`.
+*From* `architecture.md` §8. *Covered* `contract/test_his.py::test_his_1_versions_carry_metadata_and_lineage`; `contract/test_his.py::test_his_1_runs_filter_facets_and_pages`; `contract/test_his.py::test_his_1_a_run_has_one_timeline_and_says_where_each_attempt_ran`; `contract/test_his.py::test_his_1_a_run_reads_the_same_once_archived`; `server/test_history.py::test_versions_carry_metadata_and_lineage`; `server/test_history.py::test_a_run_reads_the_same_once_archived`; `server/test_history.py::test_runs_filter_facets_and_pages`; `server/test_history.py::test_a_run_has_one_timeline`; `server/test_history.py::test_an_attempt_records_where_it_ran`.
 
 **HIS-2. A task's wait counts only the time it could have run.**
 A paused run or an engine outage is not wait.
-*From* `architecture.md` §8. *Covered* `server/test_history.py::test_a_task_waits_only_while_it_could_run`.
+*From* `architecture.md` §8. *Covered* `contract/test_his.py::test_his_2_a_task_waits_only_while_it_could_run`; `server/test_history.py::test_a_task_waits_only_while_it_could_run`.
 
 **HIS-3. Lineage records the version actually read.**
 FileStore: the pinned version. Postgres: the version whose write the read
@@ -769,7 +769,7 @@ not lineage.
 
 **HIS-4. A commit row names the batch that made it.**
 `batch: {index, count}` and `final`; null for an unbatched task.
-*From* D177, D173. *Covered* `server/test_complete.py::test_each_commit_row_names_the_batch_that_made_it`.
+*From* D177, D173. *Covered* `contract/test_his.py::test_his_4_a_commit_row_names_the_batch_that_made_it`.
 
 **HIS-5. While a run is in history, everything about it is answerable exactly, per key.**
 Run R's batch 2 processed k1@7 and k2@3; a month later, R still retained:

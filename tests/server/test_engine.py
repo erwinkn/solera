@@ -285,32 +285,6 @@ async def test_incremental_batching_and_more(state):
     assert len(detail["attempts"][task["id"]]) == 3  # three batches, three attempts
 
 
-async def test_a_full_run_resumes_batch_by_batch(state):
-    """Engine review round 2 #2: a full run's later batches walk on from its
-    progress — the first batch is not served again, nor started over."""
-    seen = []
-
-    @asset(outputs=Output("files", key="id"))
-    def files():
-        return [{"id": k, "v": 1} for k in "abc"]
-
-    @asset(inputs={"files": Incremental(batch_size=2)})
-    def consumer(ctx, files: list):
-        changes = ctx.batch["files"]
-        seen.append((sorted(r["id"] for r in files), changes.reset, changes.index))
-        return []
-
-    project = Project(assets=[files, consumer])
-    engine = make_engine(state, project)
-    await engine.initialize()
-    await drive(engine, await engine.submit(["consumer"], upstream=True))
-    for _ in range(2):  # a second full run starts over on its own
-        seen.clear()
-        detail = await drive(engine, await engine.submit(["consumer"], mode="full"), timeout=10)
-        assert status_of(detail) == "succeeded"
-        assert seen == [(["a", "b"], True, 0), (["c"], False, 1)]
-
-
 async def test_deps_are_pinned_but_unbound(state):
     """§5: deps are pinned into lineage and the fingerprint but bind no
     parameter."""

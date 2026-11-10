@@ -341,6 +341,52 @@ class Solera:
         rows = (await self.get(f"/assets/{asset}/history", limit=5000))["commits"]
         return sorted((r for r in rows if run_id in (None, r["run"])), key=lambda r: r["generation"])
 
+    # -- RUN+HIS ---------------------------------------------------------------
+
+    def workers(self, *, boot: float | None = 0.0) -> dict:
+        """A serve setting, `deploy(project, placements=solera.workers(…))`:
+        the `Local` executor's workers, each running the real worker but
+        booting `boot` seconds after its launch, as an image pull or a queue
+        makes it; with None it never boots. `kill_workers` kills them."""
+
+        from solera_server.executors.inline import InlinePlacement
+
+        running = self.__dict__.setdefault("running_workers", set())
+
+        class Booting(InlinePlacement):
+            def _work(self, stage):
+                return self._boot(stage)
+
+            async def _boot(self, stage):
+                running.add(asyncio.current_task())
+                try:
+                    await (asyncio.Event().wait() if boot is None else asyncio.sleep(boot))
+                    return await InlinePlacement._work(self, stage)
+                finally:
+                    running.discard(asyncio.current_task())
+
+        return {"Local": lambda s, c: Booting(c, self.project)}
+
+    async def kill_workers(self) -> int:
+        """Every worker `workers` launched that is running dies at once, as a
+        killed process does: it publishes no result. How many died."""
+
+        killed = list(self.__dict__.get("running_workers", ()))
+        for task in killed:
+            task.cancel()
+        await asyncio.gather(*killed, return_exceptions=True)
+        return len(killed)
+
+    async def down(self, seconds: float) -> None:
+        """The engine is down for `seconds`, then served again on the same
+        deploy and state."""
+
+        await self._stop_engine()
+        await self.state.close()
+        self.advance(seconds)
+        await self._open_state()
+        await self._serve()
+
 
 # -- the outside world, as a user's project sees it ---------------------------
 
