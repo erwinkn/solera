@@ -512,13 +512,13 @@ commit.
 **KEY-1. A per-key asset is called once per owed key; removed keys lose their rows without a call.**
 `checks` over k1, k2 (changed) and k3 (removed): two calls; one store
 write per output holds k1's and k2's rows and removes k3's.
-*From* `per-key-processing.md` §5. *Covered* `server/test_each.py::test_one_call_per_key_many_rows_one_write`; `server/test_each.py::test_removed_keys_lose_their_rows`.
+*From* `per-key-processing.md` §5. *Covered* `contract/test_key.py::test_key_1_a_per_key_asset_is_called_once_per_owed_key`; `contract/test_key.py::test_key_1_removed_keys_lose_their_rows_without_a_call`; `server/test_each.py::test_one_call_per_key_many_rows_one_write`.
 
 **KEY-2. `batch_size` is keys per commit; `concurrency` is keys at once.**
 Defaults 10,000 and 64. `@asset(concurrency=4)` with per-key
 `concurrency=64` is at most 4 × 64 calls. A cancel interrupts keys still
 waiting for a slot like keys in flight.
-*From* D111 (chain: D76 → D78 → D80 → D111). *Covered* `server/test_each.py::test_concurrency_and_batches`; `server/test_each_review.py::test_1_a_cancel_interrupts_keys_still_waiting_for_a_slot`.
+*From* D111 (chain: D76 → D78 → D80 → D111). *Covered* `contract/test_key.py::test_key_2_by_default_10000_keys_a_commit_and_64_at_once`; `contract/test_key.py::test_key_2_batch_size_is_keys_per_commit_and_concurrency_keys_at_once`; `contract/test_key.py::test_key_2_the_default_concurrency_runs_64_keys_at_once`; `contract/test_key.py::test_key_2_the_assets_concurrency_caps_partitions_each_at_its_keys_concurrency`; `contract/test_key.py::test_key_2_a_cancel_interrupts_keys_still_waiting_for_a_slot`; `server/test_each.py::test_concurrency_and_batches`; `server/test_each_review.py::test_1_a_cancel_interrupts_keys_still_waiting_for_a_slot`.
 
 **KEY-3. A key's error class decides its fate; one bad key never blocks the others.**
 `Rejected` (an empty file): keeps its previous output, retried when its
@@ -532,7 +532,7 @@ the whole attempt fails, nothing commits.
 A call returns `None` for `icp_raw_data`: its previous rows stay.
 `Patch(None, remove=[ctx.key])` removes it. A key given no rows does not
 exist.
-*From* `per-key-processing.md` §16. *Covered* `server/test_each.py::test_none_is_no_change_and_removal_is_explicit`; `server/test_keys.py::test_a_key_given_no_rows_does_not_exist`.
+*From* `per-key-processing.md` §16. *Covered* `contract/test_key.py::test_key_4_returning_none_changes_nothing_and_removing_is_explicit`; `contract/test_key.py::test_key_4_a_key_given_no_rows_does_not_exist`; `server/test_each.py::test_none_is_no_change_and_removal_is_explicit`; `server/test_keys.py::test_a_key_given_no_rows_does_not_exist`.
 
 **KEY-5. Every key of a per-key partition has a latest outcome.**
 `rejected`, `failed`, `retrying`, `canceled`, `timed_out` (stored, with
@@ -548,18 +548,18 @@ filterable by outcome.
 An automated per-key asset with keys due starts a run on its own when
 the partition is idle; one run by hand picks them up on its next run.
 No input head (a move reset it): the clock waits rather than looping.
-*From* `per-key-processing.md` §9; F20. *Covered* `server/test_each.py::test_the_retry_clock_runs_automated_assets`; `server/test_sim_found.py::test_the_retry_clock_waits_for_an_input_with_no_head`.
+*From* `per-key-processing.md` §9; F20. *Covered* `contract/test_key.py::test_key_6_an_automated_per_key_asset_retries_its_due_keys_on_its_own`; `contract/test_key.py::test_key_6_a_run_by_hand_picks_its_due_keys_up_on_its_next_run`; `contract/test_key.py::test_key_6_with_no_input_head_the_retry_clock_waits`; `server/test_each.py::test_the_retry_clock_runs_automated_assets`; `server/test_sim_found.py::test_the_retry_clock_waits_for_an_input_with_no_head`.
 
 **KEY-7. A forced retry calls each matching key once.**
 `solera keys retry checks --rejected` calls every rejected key once, even
 if its source went 1 → 2 → 1 in between.
-*From* `per-key-processing.md` §16. *Covered* `server/test_each.py::test_forced_retry_takes_each_key_once`; `server/test_each.py::test_a_forced_retry_runs_after_its_source_reverts`; `server/test_each_review.py::test_6_a_forced_retry_during_the_last_retry_page_is_taken`.
+*From* `per-key-processing.md` §16. *Covered* `contract/test_key.py::test_key_7_a_forced_retry_calls_each_matching_key_once`; `contract/test_key.py::test_key_7_a_forced_retry_runs_after_its_source_reverts`; `server/test_each.py::test_forced_retry_takes_each_key_once`; `server/test_each.py::test_a_forced_retry_runs_after_its_source_reverts`; `server/test_each_review.py::test_6_a_forced_retry_during_the_last_retry_page_is_taken`.
 
 **KEY-8. Retries and new changes alternate; a key that changed upstream comes with its change.**
 1M keys failing after a deploy halve the pace of new files instead of
 stopping them. A due key whose upstream changed is processed once, at
 its new version.
-*From* `per-key-processing.md` §9; F31. *Covered* `server/test_each.py::test_a_retry_pass_spans_batches_and_accumulates_its_bounds`; `server/test_each_passes.py::test_a_run_finishes_the_pass_it_began_before_it_ends`.
+*From* `per-key-processing.md` §9; F31. *Covered* `contract/test_key.py::test_key_8_retries_and_new_changes_alternate`; `contract/test_key.py::test_key_8_a_run_finishes_every_pass_it_began`; `contract/test_key.py::test_key_8_a_due_key_that_changed_upstream_is_processed_once_at_its_new_version`; `server/test_each.py::test_a_retry_pass_spans_batches_and_accumulates_its_bounds`; `server/test_each_passes.py::test_a_run_finishes_the_pass_it_began_before_it_ends`.
 
 **KEY-9. A cancelled per-key batch commits its finished keys.**
 Cancel while b and d run: a, c, e(removed) commit; b, d stay owed, so the
@@ -568,7 +568,7 @@ them. Reason `user`: they show `canceled`, and nothing starts a run for
 them alone. Reason `timeout`: `timed_out`, a try counted, due after
 backoff, `failed` past `retries=`. A user cancel during a timeout's drain
 makes them `canceled`.
-*From* `per-key-processing.md` §5; D139; Q15 (Erwin: cancelled keys need no machinery of their own). *Covered* `server/test_each.py::test_a_user_cancel_commits_finished_keys_and_leaves_the_rest_owed`; `server/test_each.py::test_a_timeout_drain_counts_a_try_and_comes_due`; `server/test_each_review.py::test_5_a_user_cancel_during_a_timeout_drain_makes_its_keys_canceled`.
+*From* `per-key-processing.md` §5; D139; Q15 (Erwin: cancelled keys need no machinery of their own). *Covered* `contract/test_key.py::test_key_9_a_user_cancel_commits_finished_keys_and_leaves_the_rest_owed`; `contract/test_key.py::test_key_9_a_timeout_counts_a_try_comes_due_after_backoff_and_fails_past_retries`; `contract/test_key.py::test_key_9_a_user_cancel_during_a_timeout_drain_makes_its_keys_canceled`; `server/test_each.py::test_a_user_cancel_commits_finished_keys_and_leaves_the_rest_owed`; `server/test_each.py::test_a_timeout_drain_counts_a_try_and_comes_due`; `server/test_each_review.py::test_5_a_user_cancel_during_a_timeout_drain_makes_its_keys_canceled`.
 
 **KEY-10. A full run starts the failing keys over.**
 `checks` v1 leaves k1 failing; v2 makes a full run due: k1's failure goes
@@ -579,7 +579,7 @@ with the start-over.
 `GET /assets/checks/explain?key=k2`: `ok`, `failing`, `excluded` (naming
 the rule), `not_matched`, `pending`, `removed` or `absent`, with
 evidence.
-*From* `per-key-processing.md` §10, §16. *Covered* `server/test_console_api.py::test_explain_says_why_a_key_is_or_is_not_there`; `server/test_console_api.py::test_explain_a_key_restored_after_its_removal_is_pending`.
+*From* `per-key-processing.md` §10, §16. *Covered* `contract/test_key.py::test_key_11_explain_says_why_a_key_is_or_is_not_there`; `contract/test_key.py::test_key_11_explain_a_key_restored_after_its_removal_is_pending`.
 
 ## STA — staleness, completeness and statuses
 
@@ -588,13 +588,13 @@ In order of precedence: `removed` (no longer in the partition set),
 `running`, `failed` (its last outcome), `stale`, `materialized`
 (complete), `missing`. A built partition that is stale shows `stale` even
 if incomplete.
-*From* D177, D38. *Covered* `server/test_api.py::test_partitions_read_scope_records_not_task_history`; `server/test_api.py::test_failed_scope_reports_complete_after_success`; `server/test_console_api.py::test_assets_status_rolls_up_every_asset`. No `pending` status for now (STA-12).
+*From* D177, D38. *Covered* `contract/test_sta.py::test_sta_1_a_partitions_status_is_one_of_six`; `contract/test_sta.py::test_sta_1_a_failed_partition_reports_materialized_after_a_success`; `contract/test_sta.py::test_sta_5_assets_status_rolls_up_every_asset`; `server/test_api.py::test_partitions_read_scope_records_not_task_history`. No `pending` status for now (STA-12).
 
 **STA-2. A stale partition says every reason that holds.**
 `input changed` (an input owes something), `upstream stale` (a partition
 it reads is stale), `definition changed`. `copy`'s version bumped while
 `items` is stale: both, in a stable order.
-*From* D35, D140 (2). *Covered* `server/test_stale_reasons.py::test_a_partition_may_be_stale_for_several_reasons`; `server/test_staleness.py::test_a_stale_status_carries_every_reason_that_holds`; `server/test_staleness.py::test_a_reset_upstream_and_a_new_version_give_both_reasons`.
+*From* D35, D140 (2). *Covered* `contract/test_sta.py::test_sta_2_a_partition_may_be_stale_for_several_reasons`; `contract/test_sta.py::test_sta_2_a_stale_status_carries_every_reason_that_holds`; `contract/test_sta.py::test_sta_2_a_reset_upstream_and_a_new_version_give_both_reasons`.
 
 **STA-3. Stale means exactly: a default run would load something.**
 Derived, never stored; one comparison answers both.
@@ -604,30 +604,30 @@ Derived, never stored; one comparison answers both.
 `feed` commits; `items` has not rerun: `items` is "input changed";
 `copy`, `tally`, `checks` are "upstream stale". Once `items` reruns they
 become "input changed"; once they rerun, all are fresh.
-*From* `staleness.py` (K46; no ledger entry). *Covered* `server/test_stale_reasons.py::test_staleness_runs_down_the_lineage`; `server/test_staleness.py::test_staleness_is_transitive_down_a_chain`.
+*From* `staleness.py` (K46; no ledger entry). *Covered* `contract/test_sta.py::test_sta_4_staleness_runs_down_the_lineage`; `contract/test_sta.py::test_sta_4_staleness_is_transitive_down_a_chain`; `contract/test_sta.py::test_sta_4_the_running_example_goes_fresh_level_by_level`.
 
 **STA-5. Roll-ups use "any".**
 An asset is stale if any partition is; a per-key partition if any key is.
-*From* D38, D40. *Covered* `server/test_console_api.py::test_assets_status_rolls_up_every_asset`; `server/test_console_api.py::test_a_domain_too_big_to_list_still_rolls_up`.
+*From* D38, D40. *Covered* `contract/test_sta.py::test_sta_5_assets_status_rolls_up_every_asset`; `contract/test_sta.py::test_sta_5_a_domain_too_big_to_list_still_rolls_up`; `contract/test_sta.py::test_sta_5_a_per_key_partition_is_stale_if_any_key_is`.
 
 **STA-6. Stale keys are exact for per-key assets; other keyed outputs' keys go stale together.**
 `checks`: only the keys owed, each with its own reason naming its input.
 `copy` (keyed, not per-key): a change to k1 makes k1, k2, k3 stale. An
 unkeyed output has no keys.
-*From* D40, D43, D157. *Covered* `server/test_stale_reasons.py::test_stale_keys_follow_the_partition_and_say_why`; `server/test_staleness.py::test_a_stale_keys_reasons_are_its_own_and_name_their_input`; `server/test_staleness.py::test_a_non_each_keyed_outputs_keys_go_stale_together`.
+*From* D40, D43, D157. *Covered* `contract/test_sta.py::test_sta_6_stale_keys_follow_the_partition_and_say_why`; `contract/test_sta.py::test_sta_6_a_stale_keys_reasons_are_its_own_and_name_their_input`; `contract/test_sta.py::test_sta_6_a_non_each_keyed_outputs_keys_go_stale_together`.
 
 **STA-7. A key neither side holds is never stale.**
 `fchecks` processed k1 only; `feed` removes k2, which `fchecks` never
 held: fresh.
-*From* F35; D40. *Covered* `server/test_staleness.py::test_a_key_neither_side_holds_leaves_an_each_partition_fresh`; `server/test_staleness.py::test_a_key_neither_side_holds_is_never_stale`; `server/test_staleness.py::test_a_key_a_keys_run_never_held_leaves_fchecks_fresh_when_it_goes`.
+*From* F35; D40. *Covered* `contract/test_sta.py::test_sta_7_a_key_neither_side_holds_leaves_an_each_partition_fresh`; `contract/test_sta.py::test_sta_7_a_key_added_and_removed_again_leaves_it_fresh`; `contract/test_sta.py::test_sta_7_a_key_a_keys_run_never_held_leaves_it_fresh_when_it_goes`; `server/test_staleness.py::test_a_key_neither_side_holds_is_never_stale`; `server/test_staleness.py::test_a_key_a_keys_run_never_held_leaves_fchecks_fresh_when_it_goes`.
 
 **STA-8. An unkeyed partition stays stale until it reruns.**
 `count` is built; `items` changes: `count` is stale through any number of
 ticks until a run of it.
-*From* D40. *Covered* `server/test_staleness.py::test_an_unkeyed_partition_stays_stale_until_it_reruns`.
+*From* D40. *Covered* `contract/test_sta.py::test_sta_8_an_unkeyed_partition_stays_stale_until_it_reruns`.
 
 **STA-9. Never built is `missing`, not stale.**
-*From* D35, D177. *Covered* `server/test_complete.py::test_never_run_is_not_complete_and_a_first_run_is`.
+*From* D35, D177. *Covered* `contract/test_sta.py::test_sta_9_never_built_is_missing_not_stale`; `contract/test_sta.py::test_sta_10_never_run_is_not_complete_and_a_first_run_is`; `server/test_complete.py::test_never_run_is_not_complete_and_a_first_run_is`.
 
 **STA-10. Complete: no key upstream that the partition has not processed since it last started over.**
 | History | Complete? |
@@ -643,12 +643,12 @@ ticks until a run of it.
 | two inputs, one walked to the end | no |
 
 Complete partitions are what `partitions="missing"` skips and fan-ins read.
-*From* D177 (chain: D175 → D176 → D177). *Covered* `server/test_complete.py::test_never_run_is_not_complete_and_a_first_run_is`; `server/test_complete.py::test_an_incremental_run_canceled_midway_is_complete_and_stale`; `server/test_complete.py::test_a_full_run_canceled_midway_is_not_complete`; `server/test_complete.py::test_a_per_key_full_run_canceled_midway_is_complete`; `server/test_complete.py::test_a_keys_run_on_a_never_run_partition_is_not_complete`; `server/test_complete.py::test_a_keys_run_naming_every_upstream_key_is_complete`; `server/test_complete.py::test_a_partial_full_run_whose_rest_is_deleted_upstream_is_complete`; `server/test_complete.py::test_an_empty_upstream_or_patterns_taking_no_key_complete_at_once`; `server/test_complete.py::test_two_keyed_inputs_are_complete_together`; `server/test_complete.py::test_deletions_keep_it_complete`.
+*From* D177 (chain: D175 → D176 → D177). *Covered* `contract/test_sta.py::test_sta_10_never_run_is_not_complete_and_a_first_run_is`; `contract/test_sta.py::test_sta_10_an_incremental_run_cancelled_midway_is_complete_and_stale`; `contract/test_sta.py::test_sta_10_a_full_run_cancelled_midway_is_not_complete`; `contract/test_sta.py::test_sta_10_a_per_key_full_run_cancelled_midway_is_complete`; `contract/test_sta.py::test_sta_10_a_keys_run_on_a_never_run_partition_is_not_complete`; `contract/test_sta.py::test_sta_10_a_keys_run_naming_every_upstream_key_is_complete`; `contract/test_sta.py::test_sta_10_a_partial_full_run_whose_rest_is_deleted_upstream_is_complete`; `contract/test_sta.py::test_sta_10_an_empty_upstream_or_patterns_taking_no_key_complete_at_once`; `contract/test_sta.py::test_sta_10_deletions_keep_it_complete`; `contract/test_sta.py::test_sta_10_two_inputs_are_complete_together`; `contract/test_sta.py::test_sta_10_partitions_missing_takes_the_incomplete_partitions_alone`; `server/test_complete.py::test_never_run_is_not_complete_and_a_first_run_is`; `server/test_complete.py::test_an_incremental_run_canceled_midway_is_complete_and_stale`; `server/test_complete.py::test_a_full_run_canceled_midway_is_not_complete`; `server/test_complete.py::test_a_per_key_full_run_canceled_midway_is_complete`; `server/test_complete.py::test_a_keys_run_on_a_never_run_partition_is_not_complete`; `server/test_complete.py::test_a_keys_run_naming_every_upstream_key_is_complete`; `server/test_complete.py::test_a_partial_full_run_whose_rest_is_deleted_upstream_is_complete`; `server/test_complete.py::test_an_empty_upstream_or_patterns_taking_no_key_complete_at_once`; `server/test_complete.py::test_two_keyed_inputs_are_complete_together`; `server/test_complete.py::test_deletions_keep_it_complete`.
 
 **STA-11. Completeness is live; history logs only whether a commit was its run's last batch.**
 A three-batch run's commit rows say `final` false, false, true; a
 cancelled run logs no `true`.
-*From* D177. *Covered* `server/test_complete.py::test_each_commit_logs_whether_it_was_its_runs_last_batch`.
+*From* D177. *Covered* `contract/test_sta.py::test_sta_11_each_commit_logs_whether_it_was_its_runs_last_batch`; `server/test_complete.py::test_each_commit_logs_whether_it_was_its_runs_last_batch`.
 
 **STA-12. Freshness is computed exactly when asked; there is no `pending` status.**
 After a prefixless pattern change on 100M keys, asking for the status runs
