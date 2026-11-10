@@ -1,8 +1,10 @@
 """A fenced SQL store in one page (docs/stores.md, "Recipe: a SQL table"):
 each output is a PostgreSQL table of JSON rows, one row per input row,
-with its key and batch alongside: a keyed output's rows, an unkeyed
-one's (its whole content, or batches), loaded as a list — or, by key,
-as `Each` reads a page. The committed head names the table, so a renamed
+with its key, batch and version alongside: a keyed output's rows, an
+unkeyed one's (its whole content, or batches), loaded as a list — or, by
+key, as `Each` reads a page. A write says which keys it changed
+(`KeyedWrite.changed`), and `read` the version each key was read at
+(docs/stores.md, "What a write and a load say"). The committed head names the table, so a renamed
 output keeps it. `fence()` at the top of every write transaction, and as
 `acquire`, is all the fencing it needs; `reads`
 reads an attempt's inputs at one moment, each with the generation that
@@ -20,7 +22,7 @@ import psycopg
 from psycopg.types.json import Jsonb
 from solera.fencing import cleaned, fence, fence_table, written
 from solera.sdk import Ref
-from solera.stores import MISSING, Commits, KeyedWrite, Keys, Patch, Written, by_key_type, takes
+from solera.stores import MISSING, Commits, KeyedWrite, Keys, Patch, Read, Written, by_key_type, takes
 
 ROWS = (None, list, list[dict])  # what a load gives: rows, as a list
 
@@ -51,7 +53,9 @@ class JsonTableStore:
         cur = conn.cursor()
         cur.execute("SELECT pg_advisory_xact_lock(hashtext('json_table_store'))")  # creation takes turns
         fence_table(cur)
-        cur.execute(f"CREATE TABLE IF NOT EXISTS {table} (part text, k text, batch bigint, row jsonb)")
+        cur.execute(
+            f"CREATE TABLE IF NOT EXISTS {table} (part text, k text, batch bigint, row jsonb, version bigint)"
+        )
         return conn, cur
 
     async def acquire(self, context, prior) -> None:
@@ -71,15 +75,15 @@ class JsonTableStore:
         if context.reset:
             prior = None  # a full run keeps nothing of the content
         conn, cur = self._transaction(table)
-        handle = {"table": table}
+        handle, version = {"table": table}, context.generation
         with conn:
             fence(cur, context, table, write=True)  # before this transaction changes anything
             if out.key is None and not out.incremental:  # an unkeyed output: its whole content
                 rows = list(write)
                 cur.execute(f"DELETE FROM {table} WHERE part = %s", (context.partition,))
                 cur.executemany(
-                    f"INSERT INTO {table} VALUES (%s, NULL, NULL, %s)",
-                    [(context.partition, Jsonb(r)) for r in rows],
+                    f"INSERT INTO {table} VALUES (%s, NULL, NULL, %s, %s)",
+                    [(context.partition, Jsonb(r), version) for r in rows],
                 )
                 return Written(Ref(out.name, "", handle, context.partition))
             if out.key is None:  # an unkeyed incremental output: a batch of rows
@@ -94,8 +98,8 @@ class JsonTableStore:
                         (context.partition, context.commit_number),
                     )
                 cur.executemany(
-                    f"INSERT INTO {table} VALUES (%s, NULL, %s, %s)",
-                    [(context.partition, context.commit_number, Jsonb(r)) for r in rows],
+                    f"INSERT INTO {table} VALUES (%s, NULL, %s, %s, %s)",
+                    [(context.partition, context.commit_number, Jsonb(r), version) for r in rows],
                 )
                 return Written(
                     Ref(out.name, "", {**handle, "commit_number": context.commit_number}, context.partition)
@@ -110,15 +114,16 @@ class JsonTableStore:
                         f"DELETE FROM {table} WHERE part = %s AND k = ANY(%s)", (context.partition, keys)
                     )
                 cur.executemany(
-                    f"INSERT INTO {table} VALUES (%s, %s, NULL, %s)",
-                    [(context.partition, k, Jsonb(dict(r))) for k, group in chunk for r in group],
+                    f"INSERT INTO {table} VALUES (%s, %s, NULL, %s, %s)",
+                    [(context.partition, k, Jsonb(dict(r)), version) for k, group in chunk for r in group],
                 )
             if write.removes:
                 cur.execute(
                     f"DELETE FROM {table} WHERE part = %s AND k = ANY(%s)",
                     (context.partition, sorted(write.removes)),
                 )
-            return Written(Ref(out.name, "", handle, context.partition))
+            ref = Ref(out.name, "", {**handle, "key": out.key}, context.partition)
+            return Written(ref, changed=write.changed())
 
     async def cleanup(self, output, *, home=None, partition=None, key=None, generation=None, before=None):
         """Delete what the pattern matches (docs/stores.md § Cleanup): the
@@ -158,6 +163,13 @@ class JsonTableStore:
         yield sorted(found, key=str.encode)
 
     async def load(self, ref, t, selection):
+        return (await self.read(ref, t, selection)).value
+
+    async def read(self, ref, t, selection) -> Read:
+        """`load`, and the version each key was read at (a keyed output's), or
+        the newest one read (an unkeyed output's): a key planned but gone is
+        None."""
+
         def work():
             with psycopg.connect(self.dsn) as conn:
                 return self._load(conn, ref, t, selection)
@@ -176,7 +188,7 @@ class JsonTableStore:
         class Reader:
             async def load(_, ref, t, selection):
                 def work():
-                    rows = self._load(conn, ref, t, selection)
+                    rows = self._load(conn, ref, t, selection).value
                     return rows, written(conn.cursor(), ref.handle["table"], ref.partition)
 
                 async with lock:  # one connection: one load at a time
@@ -187,8 +199,8 @@ class JsonTableStore:
         finally:
             await asyncio.to_thread(conn.close)
 
-    def _load(self, conn, ref, t, selection):
-        sql, params = f"SELECT k, row FROM {ref.handle['table']} WHERE part = %s", [ref.partition]
+    def _load(self, conn, ref, t, selection) -> Read:
+        sql, params = f"SELECT k, row, version FROM {ref.handle['table']} WHERE part = %s", [ref.partition]
         if isinstance(selection, Keys):
             sql, params = sql + " AND k = ANY(%s)", [*params, sorted(selection.generations)]
         elif isinstance(selection, Commits):
@@ -196,9 +208,15 @@ class JsonTableStore:
         elif (ref.handle or {}).get("commit_number") is not None:
             sql, params = sql + " AND batch <= %s", [*params, ref.handle["commit_number"]]
         found = conn.execute(sql, params).fetchall()
+        versions = {k: v for k, _, v in found} if ref.handle.get("key") else None
+        if isinstance(selection, Keys):
+            versions = {k: versions.get(k) for k in selection.generations}
+        newest = (
+            None if versions is not None else max((v for _, _, v in found if v is not None), default=None)
+        )
         if by_key_type(t) is not MISSING:  # each key's rows; a key with none does not exist
             groups: dict[str, list] = {}
-            for k, row in found:
+            for k, row, _ in found:
                 groups.setdefault(k, []).append(row)
-            return groups
-        return [row for _, row in found]
+            return Read(groups, versions)
+        return Read([row for _, row, _ in found], versions, newest)

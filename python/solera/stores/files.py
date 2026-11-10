@@ -19,6 +19,7 @@ from . import (
     Keys,
     Patch,
     Prepared,
+    Read,
     StoreError,
     WriteContext,
     WriteError,
@@ -198,7 +199,9 @@ class FileStore:
             partitions = [e for e in await self._partitions(prior) if e not in drop] + partitions
         name = f"{base}@{generation}"
         await self._put(name, partitions)
-        return Written(self._ref(context, {"mode": "set", "path": name, "base": base}))
+        return Written(
+            self._ref(context, {"mode": "set", "path": name, "base": base}), changed=write.changed()
+        )
 
     async def _store_keyed(self, write: KeyedWrite, prior, context, base, generation) -> Written:
         """One object per key and generation: the keys the write's delta
@@ -213,7 +216,8 @@ class FileStore:
 
         async for chunk in write.chunks():
             await self._many(put, chunk)
-        return Written(self._ref(context, {"mode": "keyed", "path": base, "key": context.output.key}))
+        ref = self._ref(context, {"mode": "keyed", "path": base, "key": context.output.key})
+        return Written(ref, changed=write.changed())
 
     async def _store_commit(self, write: Patch, prior, context, base, generation) -> Written:
         """An unkeyed incremental write: its items, as one object per commit.
@@ -306,8 +310,17 @@ class FileStore:
     # -- reads ------------------------------------------------------------------
 
     async def load(self, ref: Ref, t, selection: Keys | Commits | None) -> Any:
+        return (await self.read(ref, t, selection)).value
+
+    async def read(self, ref: Ref, t, selection: Keys | Commits | None) -> Read:
+        """`load`, and the versions it read (docs/stores.md, "What a write and
+        a load say"). Every object's name carries the version that wrote it,
+        and a keyed read names its objects from the planned versions: it reads
+        exactly those, or fails when one is gone. An unkeyed read is at its
+        object's version — a range of commits at its newest's."""
+
         if is_ref_type(t):
-            return ref
+            return Read(ref)
         handle = ref.handle or {}
         mode, base = handle.get("mode"), handle.get("path")
         if base is None:
@@ -326,7 +339,8 @@ class FileStore:
             if missing := [b for b in range(lo, hi + 1) if b not in names]:
                 raise StoreError(f"{ref.output}: commit {missing[0]} of {base} is gone")
             commits = await self._many(self._found, [names[b] for b in sorted(names)])
-            return frames.materialize([item for b in commits for item in b], t)
+            newest = max((_generation(name) for name in names.values()), default=None)
+            return Read(frames.materialize([item for b in commits for item in b], t), version=newest)
         if mode == "keyed":
             if not isinstance(selection, Keys):
                 raise StoreError(
@@ -337,22 +351,29 @@ class FileStore:
                 lambda k: self._found(self.key_name(base, k, selection.generations[k]), k), keys
             )
             content = dict(zip(keys, found, strict=True))
-            if handle.get("key") == KEYS:
-                return content
             inner = by_key_type(t)
-            if inner is not MISSING:  # dict[str, T]: each key's group, as T
-                return {k: frames.materialize(rows, inner) for k, rows in content.items()}
-            return frames.materialize([row for rows in content.values() for row in rows], t)
+            if handle.get("key") == KEYS:
+                value = content
+            elif inner is not MISSING:  # dict[str, T]: each key's group, as T
+                value = {k: frames.materialize(rows, inner) for k, rows in content.items()}
+            else:
+                value = frames.materialize([row for rows in content.values() for row in rows], t)
+            return Read(value, selection.generations)
         value = await self._get(base)
         if value is MISSING:
             raise StoreError(f"{ref.output}: {base} is gone")
-        if mode == "set":
+        version = _generation(base)
+        if mode == "set":  # an element's version is empty: membership is all it holds
+            held = set(value)
             if selection is not None:
                 value = [e for e in value if e in selection.generations]
-            return frames.materialize(value, t)
+                versions = {e: "" if e in held else None for e in selection.generations}
+            else:
+                versions = dict.fromkeys(value, "")
+            return Read(frames.materialize(value, t), versions, version)
         if selection is not None:
             raise StoreError(f"{ref.output}: an unkeyed output cannot serve a selection")
-        return value
+        return Read(value, version=version)
 
     def can_serve(self, source) -> bool:
         """A source that names where its objects are, its `path` — unless a
@@ -526,6 +547,12 @@ def data_path() -> str | None:
 
     url = os.environ.get("SOLERA_DATA_URL") or ""
     return unquote(urlparse(url).path) if url.startswith("file://") else None
+
+
+def _generation(name: str) -> int:
+    """The generation an object's name ends with: `{base}@{g}` or `{base}/{g}`."""
+
+    return int(name.rpartition("@" if "@" in name.rpartition("/")[2] else "/")[2])
 
 
 def _commit_name(base: str, commit_number: int, generation: int) -> str:
