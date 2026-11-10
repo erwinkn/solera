@@ -21,7 +21,8 @@ use solera_tracking::codec::Ver;
 use solera_tracking::event::{Event, Part};
 use solera_tracking::plan::{self, Hold, InputRequest, Mode, OneIndex, Request};
 use solera_tracking::progress::{
-    Class, Conditions, EdgeOpen, Holding, InputReport, Key, KeyRange, Pat, Patterns, Reset, Value,
+    Class, Conditions, EdgeOpen, Holding, InputReport, Key, KeyRange, Pat, Patterns, Reason, Reset,
+    Value,
 };
 use solera_tracking::{Output, Tracking};
 
@@ -992,4 +993,62 @@ fn the_worked_example_tally() {
 #[allow(dead_code)]
 fn _version_is_used(v: Version<'_>) -> bool {
     v.is_absent()
+}
+
+#[test]
+fn a_key_held_back_at_commit_is_recorded_apart_from_one_the_planner_held_back() {
+    let rt = runtime();
+    let ix = index(&rt);
+    rt.block_on(async {
+        let mut t = Tracking::new();
+        let mut log = Log::new("items");
+        let edge = key("tally/items");
+        apply(
+            &mut t,
+            vec![Part::EdgeOpen(EdgeOpen {
+                edge: edge.clone(),
+                input: log.name.clone(),
+                keyed: true,
+            })],
+        );
+        log.commit(
+            &ix,
+            &mut t,
+            [(key("k1"), Ver::Int(1)), (key("k2"), Ver::Int(1))].into(),
+        )
+        .await;
+        let req = Request {
+            mode: Mode::Incremental,
+            reset: false,
+            after: None,
+            limit: 10,
+            inputs: vec![InputRequest {
+                edge: edge.clone(),
+                conditions: Arc::new(Conditions::default()),
+                own: None,
+            }],
+            unkeyed: vec![],
+        };
+        let hold = SetHold([key("k2")].into());
+        let p = plan::plan(&t.view(&req).unwrap(), &req, &OneIndex(&ix), &hold)
+            .await
+            .unwrap();
+        log.commit(&ix, &mut t, [(key("k1"), Ver::Int(2))].into())
+            .await;
+        t.outputs.get_mut(&log.name).unwrap().full_run = Some(2);
+        let report = InputReport {
+            failed: vec![],
+            loaded: vec![(key("k1"), Ver::Int(2))],
+        };
+        let ops = t.progress_ops(&p, &[report], b"", None).unwrap();
+        assert_eq!(ops.held_back, vec![vec![key("k1")]]);
+        let Part::Batch(b) = &ops.parts[0] else {
+            panic!("a batch part");
+        };
+        let reasons: Vec<_> = b.points.iter().map(|(k, p)| (k.clone(), p.reason)).collect();
+        let want = vec![(key("k1"), Reason::Unsettled), (key("k2"), Reason::HeldBack)];
+        assert_eq!(reasons, want);
+        let rec: Vec<_> = ops.records[0].points.iter().map(|(k, p)| (k.clone(), p.reason)).collect();
+        assert_eq!(rec, want, "the record tells the two apart");
+    });
 }

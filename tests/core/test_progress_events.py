@@ -1,7 +1,7 @@
 """Events on the tracking core's state: refused whole, never half applied."""
 
 import pytest
-from solera._native import ChangeIndex, Tracking
+from solera._native import ChangeIndex, Tracking, encode_changes
 
 
 def items(tmp_path, n: int) -> Tracking:
@@ -112,7 +112,7 @@ def test_a_key_loaded_at_another_version_with_no_full_run_is_a_deviation(tmp_pat
     assert t.owed(b"e", {}) == ([], None)
 
 
-def test_a_commit_is_refused_when_a_full_run_starts_or_ends_after_it_was_built(tmp_path):
+def test_a_commit_is_refused_when_a_full_run_starts_after_it_was_built(tmp_path):
     t, ix, layers = upstream(tmp_path)
     plan = plan_all(t)
     layers.append(ix.write_commit("items/2", 2, [("k1", 2, 1)], live_before=2))
@@ -120,7 +120,7 @@ def test_a_commit_is_refused_when_a_full_run_starts_or_ends_after_it_was_built(t
     event = t.progress_ops(plan, [([], [("k1", 2)])])[0]  # k1 is a deviation
     layers.append(ix.write_commit("items/3", 3, [("k1", 2, None)], live_before=2, clear=True))
     t._set_output(b"items", layers, 3, 1, 3)
-    with pytest.raises(ValueError, match="full run moved"):
+    with pytest.raises(ValueError, match="became unsettled"):
         t.apply(event)
     held = t.progress_ops(plan, [([], [("k1", 2)])])
     assert held[2] == [["k1"]]
@@ -129,7 +129,9 @@ def test_a_commit_is_refused_when_a_full_run_starts_or_ends_after_it_was_built(t
     t.apply(unmoved)  # loaded as planned: the full run's state did not decide anything
 
 
-def test_a_commit_held_mid_full_run_is_refused_once_the_full_run_has_ended(tmp_path):
+def test_a_commit_held_mid_full_run_applies_once_the_full_run_has_ended(tmp_path):
+    """Holding back is always safe: the key stays owed and the next batch
+    takes it, so the end of the full run does not refuse the commit."""
     ix = ChangeIndex(f"file://{tmp_path}")
     t = Tracking()
     t.attach(b"items", ix)
@@ -142,8 +144,8 @@ def test_a_commit_held_mid_full_run_is_refused_once_the_full_run_has_ended(tmp_p
     event, _, held_back = t.progress_ops(plan, [([], [("k1", 2)])])
     assert held_back == [["k1"]]
     t.apply(Tracking.event_full_run_done(b"items"))
-    with pytest.raises(ValueError, match="full run moved"):
-        t.apply(event)
+    t.apply(event)
+    assert t.owed(b"e", {}) == ([("k1", "added")], None)
 
 
 def test_a_key_held_back_on_one_input_is_held_back_on_every_input(tmp_path):
@@ -165,3 +167,162 @@ def test_a_key_held_back_on_one_input_is_held_back_on_every_input(tmp_path):
     assert held_back == [["k"], ["k"]]
     t.apply(event)
     assert t.owed(b"r/b", {}) == ([("k", "added")], None)
+
+
+def test_a_commit_is_refused_once_its_edge_reads_another_output(tmp_path):
+    """Whether a load is held back is decided on the output the plan read: a
+    commit for an edge renamed to read another output since is refused."""
+    t, ix, layers = upstream(tmp_path)
+    t.attach(b"other", ix)
+    other = [ix.write_commit("other/1", 1, [("k1", 1, None)], live_before=0, clear=True)]
+    t._set_output(b"other", other, 1, 1, 1)
+    plan = plan_all(t)
+    layers.append(ix.write_commit("items/2", 2, [("k1", 2, 1)], live_before=2))
+    t._set_output(b"items", layers, 2, 2)
+    event = t.progress_ops(plan, [([], [("k1", 2)])])[0]
+    t.apply(Tracking.event_edge_rename(b"e", b"e", b"other"))
+    with pytest.raises(ValueError, match="reads another output"):
+        t.apply(event)
+    with pytest.raises(ValueError, match="reads another output"):
+        t.progress_ops(plan, [([], [("k1", 2)])])
+
+
+def test_a_commit_is_refused_once_a_fold_passes_the_head_it_planned_at(tmp_path):
+    """A fold through a commit after the plan's head drops the clears it
+    covered, so the commit can no longer tell whether its loads are safe."""
+    t, ix, layers = upstream(tmp_path)
+    plan = plan_all(t)
+    layers.append(ix.write_commit("items/2", 2, [("k1", 2, None)], live_before=2, clear=True))
+    layers.append(ix.write_commit("items/3", 3, [("k2", 3, None)], live_before=1))
+    t._set_output(b"items", layers, 3, 2)
+    assert t.progress_ops(plan, [([], [("k1", 2)])])[2] == [["k1"]]
+    t._set_output(b"items", [ix.merge(layers, 0, 3, 3, "items/m")], 3, 2)
+    with pytest.raises(ValueError, match="no longer reach back"):
+        t.progress_ops(plan, [([], [("k1", 2)])])
+
+
+def test_a_fenced_commit_is_refused_once_a_fold_passes_the_head_it_planned_at(tmp_path):
+    t, ix, layers = upstream(tmp_path)
+    plan = plan_all(t)
+    layers.append(ix.write_commit("items/2", 2, [("k1", 2, 1)], live_before=2))
+    t._set_output(b"items", layers, 2, 2)
+    event = t.progress_ops(plan, [([], [("k1", 2)])])[0]
+    t._set_output(b"items", [ix.merge(layers, 0, 2, 2, "items/m")], 2, 2)
+    with pytest.raises(ValueError, match="no longer reach back"):
+        t.apply(event)
+
+
+def test_a_fenced_commit_can_share_an_event_with_a_commit_to_the_output_it_reads(tmp_path):
+    """Every part of an event is checked on the state before it, so the fence
+    answers for the batch applied first, and the output's commit after."""
+    ix = ChangeIndex(f"file://{tmp_path}")
+    t = Tracking()
+    t.attach(b"items", ix)
+    t.apply(t.build_commit(b"items", encode_changes(["k1", "k2"], []), version=1, path="items/1")["event"])
+    t.apply(Tracking.event_edge_open(b"e", b"items", True))
+    plan = plan_all(t)
+    t.apply(t.build_commit(b"items", encode_changes(["k1"], []), version=2, path="items/2")["event"])
+    event, _, held_back = t.progress_ops(plan, [([], [("k1", 2)])])
+    assert held_back == [[]]
+    more = t.build_commit(b"items", encode_changes(["k2"], []), version=3, path="items/3")
+    t.apply(Tracking.join([more["event"], event]))
+    assert t.owed(b"e", {}) == ([("k2", "updated")], None)
+
+
+def test_a_report_naming_a_key_the_batch_did_not_take_is_refused(tmp_path):
+    t, _, _ = upstream(tmp_path)
+    plan = plan_all(t)
+    with pytest.raises(ValueError, match="did not take"):
+        t.progress_ops(plan, [(["zz"], [])])
+    with pytest.raises(ValueError, match="did not take"):
+        t.progress_ops(plan, [([], [("k0", 1)])])
+    t.apply(t.progress_ops(plan, [(["k2"], [("k1", 1)])])[0])
+
+
+def two_inputs(tmp_path) -> tuple[Tracking, ChangeIndex, dict, list]:
+    """Outputs a and b each hold k at c1; the consumer r read both."""
+    ix = ChangeIndex(f"file://{tmp_path}")
+    t = Tracking()
+    logs = {}
+    for out in (b"a", b"b"):
+        t.attach(out, ix)
+        logs[out] = [ix.write_commit(f"{out.decode()}/1", 1, [("k", 1, None)], live_before=0)]
+        t._set_output(out, logs[out], 1, 1)
+        t.apply(Tracking.event_edge_open(b"r/" + out, out, True))
+    inputs = [{"edge": b"r/a", "conditions": {}}, {"edge": b"r/b", "conditions": {}}]
+    t.apply(t.progress_ops(t.plan({"inputs": inputs, "limit": 10})["plan"], [([], []), ([], [])])[0])
+    return t, ix, logs, inputs
+
+
+def test_a_key_another_input_took_is_held_back_while_this_input_is_unsettled(tmp_path):
+    """k is owed on b only, but the worker loads a's k too, from the middle of
+    a's full run. No version was planned for it on a, so nothing tells whether
+    that load was safe: k is held back on b."""
+    t, ix, logs, inputs = two_inputs(tmp_path)
+    logs[b"b"].append(ix.write_commit("b/2", 2, [("k", 2, 1)], live_before=1))
+    t._set_output(b"b", logs[b"b"], 2, 1)
+    plan = t.plan({"inputs": inputs, "limit": 10})["plan"]
+    assert Tracking.plan_keys(plan, 0)[0] == [] and Tracking.plan_keys(plan, 1)[0] == ["k"]
+    with pytest.raises(ValueError, match="did not take"):
+        t.progress_ops(plan, [([], [("k", None)]), ([], [])])
+    event, _, held_back = t.progress_ops(plan, [([], []), ([], [])])
+    assert held_back == [[], []]
+    logs[b"a"].append(ix.write_commit("a/2", 2, [("m", 2, None)], live_before=1, clear=True))
+    t._set_output(b"a", logs[b"a"], 2, 1, 2)
+    with pytest.raises(ValueError, match="became unsettled"):
+        t.apply(event)
+    event, _, held_back = t.progress_ops(plan, [([], []), ([], [])])
+    assert held_back == [[], ["k"]]
+    t.apply(event)
+    assert t.owed(b"r/b", {}) == ([("k", "updated")], None)
+
+
+def test_an_input_whose_moved_keys_another_input_holds_back_needs_no_fence(tmp_path):
+    """k moved on both inputs and a is mid full run, so k is held back on both:
+    b decided nothing, and a full run of b before the event applies changes
+    nothing."""
+    t, ix, logs, inputs = two_inputs(tmp_path)
+    for out in (b"a", b"b"):
+        logs[out].append(ix.write_commit(f"{out.decode()}/2", 2, [("k", 2, 1)], live_before=1))
+        t._set_output(out, logs[out], 2, 1)
+    plan = t.plan({"inputs": inputs, "limit": 10})["plan"]
+    for out in (b"a", b"b"):
+        logs[out].append(ix.write_commit(f"{out.decode()}/3", 3, [("k", 3, 2)], live_before=1))
+    t._set_output(b"a", logs[b"a"], 3, 1, 3)
+    t._set_output(b"b", logs[b"b"], 3, 1)
+    event, _, held_back = t.progress_ops(plan, [([], [("k", 3)]), ([], [("k", 3)])])
+    assert held_back == [["k"], ["k"]]
+    logs[b"b"].append(ix.write_commit("b/4", 4, [("k", 4, None)], live_before=1, clear=True))
+    t._set_output(b"b", logs[b"b"], 4, 1, 4)
+    t.apply(event)
+    assert t.owed(b"r/b", {}) == ([("k", "updated")], None)
+
+
+def test_an_input_keeps_its_fence_for_a_moved_key_no_other_input_holds_back(tmp_path):
+    """a, mid full run, holds back k1 only; b also moved k2, which it keeps on
+    a settled input: b's fence stands for k2, so a full run of b before the
+    event applies refuses it."""
+    ix = ChangeIndex(f"file://{tmp_path}")
+    t = Tracking()
+    logs = {}
+    for out in (b"a", b"b"):
+        t.attach(out, ix)
+        logs[out] = [
+            ix.write_commit(f"{out.decode()}/1", 1, [("k1", 1, None), ("k2", 1, None)], live_before=0)
+        ]
+        t._set_output(out, logs[out], 1, 2)
+        t.apply(Tracking.event_edge_open(b"r/" + out, out, True))
+    inputs = [{"edge": b"r/a", "conditions": {}}, {"edge": b"r/b", "conditions": {}}]
+    plan = t.plan({"inputs": inputs, "limit": 10})["plan"]
+    assert Tracking.plan_keys(plan, 0)[0] == ["k1", "k2"] == Tracking.plan_keys(plan, 1)[0]
+    logs[b"a"].append(ix.write_commit("a/2", 2, [("k1", 2, 1)], live_before=2))
+    t._set_output(b"a", logs[b"a"], 2, 2, 2)
+    logs[b"b"].append(ix.write_commit("b/2", 2, [("k1", 2, 1), ("k2", 2, 1)], live_before=2))
+    t._set_output(b"b", logs[b"b"], 2, 2)
+    report = [([], [("k1", 2)]), ([], [("k1", 2), ("k2", 2)])]
+    event, _, held_back = t.progress_ops(plan, report)
+    assert held_back == [["k1"], ["k1"]]
+    logs[b"b"].append(ix.write_commit("b/3", 3, [("k1", 3, None)], live_before=2, clear=True))
+    t._set_output(b"b", logs[b"b"], 3, 1, 3)
+    with pytest.raises(ValueError, match="became unsettled"):
+        t.apply(event)
