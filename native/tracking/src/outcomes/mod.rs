@@ -677,23 +677,31 @@ impl PassStart {
 pub struct Rebuild {
     pub edge: Id,
     pub to: u64,
+    /// The edge's outcome life it was asked for in: the counter starts over
+    /// with the records.
+    pub life: u64,
 }
 
 impl Rebuild {
     pub fn encode(&self, e: &mut Enc) {
         e.bytes(&self.edge);
         e.uv(self.to);
+        e.uv(self.life);
     }
 
     pub fn decode(d: &mut Dec<'_>) -> Result<Rebuild> {
         Ok(Rebuild {
             edge: d.bytes()?.into(),
             to: d.uv()?,
+            life: d.uv()?,
         })
     }
 
     pub(crate) fn check(&self, t: &Tracking) -> Result<()> {
         keyed(t, &self.edge)?;
+        if self.life != t.per_key.get(&self.edge).map_or(0, |k| k.life) {
+            return invalid("the edge's records started over since the rebuild was asked for");
+        }
         if self.to != t.rebuild(&self.edge) + 1 {
             return invalid("a rebuild counter moves up by one");
         }
@@ -846,7 +854,7 @@ mod tests {
             made: None,
             points: vec![],
         });
-        let rebuild = |edge: Id| Part::Rebuild(Rebuild { edge, to: 1 });
+        let rebuild = |edge: Id| Part::Rebuild(Rebuild { edge, to: 1, life });
         let before = t.snapshot();
         for parts in [
             vec![Part::EdgeClose(EdgeClose { edge: e() }), done.clone()],
