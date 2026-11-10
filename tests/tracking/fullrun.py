@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import random
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from .core import ABSENT, EMPTY, NEG, POS, Cond, Log, Progress, within
 
@@ -110,6 +110,7 @@ class Spec:
     reset: bool = False
     loads: dict | None = None  # a reader's load, once it ran: key -> Row or None
     loading_rebuild: int | None = None  # the producer's rebuild in progress when it loaded
+    removals: dict = field(default_factory=dict)  # a loaded absence: the rebuild whose commit removed it then
 
 
 def obs(log: Log, k: str, c: int, cond: Cond) -> object:
@@ -368,6 +369,8 @@ class Mirror:
             return
         s.loads = {k: self.src.load(k, s.heads[0]) if isinstance(self.src, Output) else None for k in s.taken}
         s.loading_rebuild = self.producer.rebuild if self.producer else None
+        if isinstance(self.src, Output):
+            s.removals = {k: self.src.removed_by(k, s.heads[0]) for k, row in s.loads.items() if row is None}
         self.w.trace.append(
             f"{self.name} loads "
             + (", ".join(f"{k}@{r.version}" if r else f"{k} absent" for k, r in s.loads.items()) or "nothing")
@@ -408,7 +411,7 @@ class Mirror:
                 w.violation = (
                     f"{self.name} loaded {k}@{row.version}, a row the unfinished rebuild {row.rebuild} built"
                 )
-            self._deliver(k, loaded, row, s.heads[0])
+            self._deliver(k, loaded, row, s.heads[0], s.removals.get(k))
             delivered.append(f"{k}{'' if loaded is ABSENT else '@' + str(loaded[0])}")
             results[k] = loaded
         self.progress.commit_batch(s.heads[0], s.lo, s.hi, s.cond, results, kept)
@@ -419,7 +422,9 @@ class Mirror:
             + (f"; holds back {sorted(kept)}" if kept else "")
         )
 
-    def _deliver(self, k: str, loaded: object, row: Row | None, H: int) -> None:
+    def _deliver(
+        self, k: str, loaded: object, row: Row | None, H: int, removed_by: int | None = None
+    ) -> None:
         w = self.w
         had = self.holds.get(k)
         if loaded is ABSENT:
@@ -433,7 +438,7 @@ class Mirror:
         cls = "added" if had is ABSENT else "removed" if loaded is ABSENT else "updated"
         tag = None
         if isinstance(self.src, Output):
-            tag = self.src.removed_by(k, H) if cls == "removed" else row.rebuild if row else None
+            tag = removed_by if cls == "removed" else row.rebuild if row else None
         if cls == "added" and tag is not None and self.last.get(k) == ("removed", tag):
             if k.lower() not in w.removed_during[tag]:
                 w.violation = f"{self.name} was given {k} removed, then added back, within rebuild {tag}"

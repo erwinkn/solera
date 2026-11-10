@@ -313,3 +313,38 @@ def test_a_key_list_counts_as_processed_on_every_input():
         [("items", (("k1", True),)), ("keys", "copy", ("k1",)), ("commit", "copy"), ("feed", (("k1", True),))]
     )
     assert w.copy.complete() and not oracle.held(w, "archive")
+
+
+def test_a_failing_key_waits_on_the_version_it_loaded():
+    w = oracle.replay_staleness(
+        [("up", (("k1", 1),), False), ("plan", 2), ("up", (("k1", 2),), False), ("commit", ("k1",), ("k1",))]
+    )
+    assert oracle.due(w) == []
+    w.apply(("up", (("k1", 3),), False))
+    assert oracle.due(w) == ["k1"]
+
+
+def test_a_failing_key_the_patterns_drop_loses_its_outcome():
+    w = oracle.replay_staleness(
+        [("up", (("k1", 1),), False), ("plan", 2), ("commit", ("k1",), ()), ("pat", 2), ("pat", 0)]
+    )
+    assert oracle.due(w) == ["k1"]
+
+
+def test_a_removal_loaded_before_a_rebuild_is_not_the_rebuilds():
+    events = [
+        ("items", (("k1", True), ("k2", True))),
+        ("step", "copy", 2),
+        ("step", "archive", 2),
+        ("items", (("k1", False),)),
+        ("step", "copy", 2),
+        ("plan", "archive", 2),
+        ("load", "archive"),
+        ("items", (("k1", True),)),
+        ("step", "copy", 2),
+        ("full", "copy"),
+        ("keys", "copy", ("k2",)),
+        ("commit", "copy"),
+        ("commit", "archive"),
+    ]
+    assert fullrun.run(events, "clear", "table") is None

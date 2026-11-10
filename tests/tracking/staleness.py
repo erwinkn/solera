@@ -131,8 +131,9 @@ class World:
             self.form.on_complete()
 
     def reverted(self) -> None:
-        """A failing key's outcome goes once upstream returns to what the consumer
-        holds; its point stays (§11, KEY-3, review F8). The truth drops it too."""
+        """A failing key's outcome goes once the key is no longer owed: upstream
+        returned to what the consumer holds, or the conditions no longer take it.
+        Its point stays (§11, KEY-3, review F8). The truth drops it too."""
         head = self.up.head
         for record in (self.outcomes, self.failed):
             for k in [k for k in record if self.holds.get(k) == self.prog.wanted(k, head, self.cond)]:
@@ -175,12 +176,12 @@ class World:
             self.prog.reset()
         results, kept = {}, set(b.held_back)
         for k in b.taken:
+            obs = self.prog.wanted(k, self.up.head if k in moved else b.H, b.cond)
             if k in fails:
-                self.outcomes[k] = Fail(self.prog.wanted(k, b.H, b.cond))
-                self.failed[k] = Fail(self.prog.wanted(k, b.H, b.cond))
+                self.outcomes[k] = Fail(obs)
+                self.failed[k] = Fail(obs)
                 kept.add(k)
                 continue
-            obs = self.prog.wanted(k, self.up.head if k in moved else b.H, b.cond)
             results[k] = obs
             self.holds[k] = obs
             self.outcomes.pop(k, None)
@@ -219,18 +220,21 @@ class World:
             self.form.first()
             self.cond = replace(self.cond, pat=PATTERNS[i])
             self.trace.append(f"checks' patterns become {sorted(PATTERNS[i]) if PATTERNS[i] else 'all'}")
+            self.reverted()
             self.form.on_conditions()
 
     def ev_ctx(self) -> None:
         self.form.first()
         self.cond = replace(self.cond, ctx=self.cond.ctx + 1)
         self.trace.append(f"factor moves to w{self.cond.ctx + 1}")
+        self.reverted()
         self.form.on_conditions()
 
     def ev_defn(self) -> None:
         self.form.first()
         self.cond = replace(self.cond, defn=(self.cond.defn[0] + 1,))
         self.trace.append(f"checks' definition becomes d{self.cond.defn[0]}")
+        self.reverted()
         self.form.on_conditions()
 
     def ev_held(self) -> None:
