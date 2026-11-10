@@ -459,21 +459,44 @@ impl Walker<'_> {
             }
         }
         let points: Vec<(&Key, &Point)> = self.keyed.points_in(r).collect();
+        let seen_holds = matches!(value, Value::At(_, c) if c.patterns == self.now.patterns);
         let mut next_point = 0;
-        let mut chunk: Vec<Ver> = Vec::new();
+        let mut chunk: Vec<Option<Ver>> = Vec::new();
         let (mut chunk_start, mut chunk_at) = (0, 0);
         loop {
             for s in &mut srcs {
                 s.fill().await?;
             }
             if next_point == chunk_at && chunk_at < points.len() {
-                let end = (chunk_at + POINT_CHUNK).min(points.len());
-                let keys: Vec<&[u8]> = points[chunk_at..end]
+                let frontier = srcs
                     .iter()
-                    .map(|(k, _)| k.as_ref())
-                    .collect();
-                chunk = versions_at(self.ix, self.layers, self.head, &keys).await?;
-                (chunk_start, chunk_at) = (chunk_at, end);
+                    .filter(|s| s.more)
+                    .filter_map(|s| s.run.last_key())
+                    .min();
+                let end = (chunk_at + POINT_CHUNK).min(points.len());
+                let end = match frontier {
+                    Some(f) => {
+                        chunk_at + points[chunk_at..end].partition_point(|(k, _)| k.as_ref() <= f)
+                    }
+                    None => end,
+                };
+                if end > chunk_at {
+                    let span = &points[chunk_at..end];
+                    let lookup = |p: &Point| !seen_holds || p.seen.is_none();
+                    let keys: Vec<&[u8]> = span
+                        .iter()
+                        .filter(|(_, p)| lookup(p))
+                        .map(|(k, _)| k.as_ref())
+                        .collect();
+                    let mut got = versions_at(self.ix, self.layers, self.head, &keys)
+                        .await?
+                        .into_iter();
+                    chunk = span
+                        .iter()
+                        .map(|(_, p)| if lookup(p) { got.next() } else { None })
+                        .collect();
+                    (chunk_start, chunk_at) = (chunk_at, end);
+                }
             }
             let pk: Option<&[u8]> = (next_point < chunk_at).then(|| points[next_point].0.as_ref());
             let sk: Option<&[u8]> = srcs.iter().filter_map(|s| s.head()).min();
@@ -500,8 +523,15 @@ impl Walker<'_> {
                 }
             }
             let (held, version) = if pk == Some(&key[..]) {
-                let ver = std::mem::take(&mut chunk[next_point - chunk_start]);
-                let held = points[next_point].1.holding.clone();
+                let point = points[next_point].1;
+                let ver = match (chunk[next_point - chunk_start].take(), diff, &point.seen) {
+                    (Some(v), _, _) => v,
+                    (None, Some((_, new)), _) => Ver::of(new),
+                    (None, None, seen) => {
+                        seen.clone().expect("a point read without lookup has seen")
+                    }
+                };
+                let held = point.holding.clone();
                 next_point += 1;
                 (held, ver)
             } else {
