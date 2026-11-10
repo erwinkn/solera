@@ -1256,7 +1256,8 @@ forms: a full run is a clear plus the gate, and staleness is one witness due key
 per input. The rejected forms, P14's exact counts and a rebuild in place behind
 a floor, are in the history of solera#15. It replaces the design's own model,
 which lived outside the repository (`docs/handoff/tracking-model/model.py` on
-`handoff/2026-11-09`); everything that model checked is checked here.
+`handoff/2026-11-09`); everything that model checked is checked here, apart from P14's
+exact counts, which were rejected.
 
 ```bash
 uv run pytest tests/tracking -q            # CI: 200 random histories per store, every short staleness history, every calibration (~20 s)
@@ -1330,6 +1331,7 @@ design and the amendments are switched off by `ADDED`; each is a finding:
 | staleness | `held_probe`: progress reset to `held` probes, as rule 4 | the input reads fresh with every held key owed |
 | staleness | `catch_up_first`: every rule, and every change of conditions or reset, begins with rule 7's comparison | after a lost notification, rule 1 applies an old commit to newer progress or newer conditions and names a key that is not due |
 | staleness | `rearm`: a restart applies rule 5 to every retry already due | a retry whose timer fired before the restart is never noticed |
+| staleness | `hold_back`: a batch holds back a key it loaded at another commit than planned while items is mid full run, or if a clear came since it planned | checks processes a removal the clear made and adds the key back when items completes |
 | full runs | `hold_back`: a reader's batch holds back what it loaded at another version than planned while its upstream is incomplete, or if a clear came since it planned | on a table the gate does not cover a batch already in flight, nor one that loaded mid rebuild and commits after: report loads a half-built count, archive processes removals the clear made |
 
 **Not modeled yet:** stores that write in place with late and dead writers,

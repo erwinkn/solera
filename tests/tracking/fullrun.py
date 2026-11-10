@@ -86,9 +86,10 @@ class Output:
                 self.rows[k] = self.objects[(k, version)] = Row(version, v, rebuild)
         self.log.commit({k: ABSENT if v is ABSENT else version for k, v in writes.items()}, clear)
 
-    def removed_by(self, k: str, H: int) -> int | None:
-        """The rebuild whose commit last removed k, as the reader saw it."""
-        seen = [r for c, r in self.removals.get(k, []) if self.kind == "table" or c <= H]
+    def removed_by(self, k: str, H: int, planned: bool) -> int | None:
+        """The rebuild whose commit last removed k, as the reader saw it: at its
+        head if the removal was planned, else (a table) as the row is now."""
+        seen = [r for c, r in self.removals.get(k, []) if c <= H or not planned]
         return seen[-1] if seen else None
 
     def load(self, k: str, H: int) -> Row | None:
@@ -370,7 +371,11 @@ class Mirror:
         s.loads = {k: self.src.load(k, s.heads[0]) if isinstance(self.src, Output) else None for k in s.taken}
         s.loading_rebuild = self.producer.rebuild if self.producer else None
         if isinstance(self.src, Output):
-            s.removals = {k: self.src.removed_by(k, s.heads[0]) for k, row in s.loads.items() if row is None}
+            s.removals = {
+                k: self.src.removed_by(k, s.heads[0], self._obs(k, s.heads[0], s.cond) is ABSENT)
+                for k, row in s.loads.items()
+                if row is None
+            }
         self.w.trace.append(
             f"{self.name} loads "
             + (", ".join(f"{k}@{r.version}" if r else f"{k} absent" for k, r in s.loads.items()) or "nothing")
@@ -458,6 +463,8 @@ class Mirror:
 
 class World:
     def __init__(self, form: str, kind: str, off: frozenset[str] = frozenset()) -> None:
+        if form not in FORMS:
+            raise ValueError(f"unknown form {form!r}: the model keeps {list(FORMS)}")
         self.form, self.kind, self.off = form, kind, off
         self.version = 0
         self.rebuilds = 0

@@ -60,6 +60,15 @@ CALIBRATIONS = {
         ("retry", "k4", True),
         ("restart",),
     ],
+    ("staleness", "witness", "file", "hold_back"): [
+        ("up", (("k1", 1),), False),
+        ("plan", 2),
+        ("commit", (), ()),
+        ("up", (("k1", 2),), False),
+        ("plan", 2),
+        ("clear", (), False),
+        ("commit", (), ("k1",)),
+    ],
     ("fullrun", "clear", "file", "reset"): [
         ("items", (("k1", True), ("k4", False))),
         ("items", (("k2", True), ("k4", True))),

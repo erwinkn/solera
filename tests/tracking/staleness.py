@@ -42,10 +42,11 @@ RULES = {
         "held_probe",
         "catch_up_first",
         "rearm",
+        "hold_back",
     ),
 }
 ADDED = {
-    "witness": ("reset_probe", "held_probe", "catch_up_first", "rearm"),
+    "witness": ("reset_probe", "held_probe", "catch_up_first", "rearm", "hold_back"),
 }
 
 
@@ -72,6 +73,8 @@ class World:
     """One consumer input and the truth about it."""
 
     def __init__(self, form: str, off: frozenset[str] = frozenset()) -> None:
+        if form not in RULES:
+            raise ValueError(f"unknown form {form!r}: the model keeps {list(RULES)}")
         self.off = off
         self.up = Log()
         self.cond = Cond(PATTERNS[0])
@@ -175,8 +178,17 @@ class World:
             self.covered, self.listed = [], set()
             self.prog.reset()
         results, kept = {}, set(b.held_back)
+        cleared = any(b.H < x <= self.up.head for x in self.up.clears)
         for k in b.taken:
             obs = self.prog.wanted(k, self.up.head if k in moved else b.H, b.cond)
+            if obs != self.prog.wanted(k, b.H, b.cond):
+                if (self.incomplete or cleared) and self.on("hold_back"):
+                    kept.add(k)
+                    continue
+                if self.incomplete:
+                    self.violation = (
+                        f"checks processes {_k(k)} as loaded at c{self.up.head}, mid full run of items"
+                    )
             if k in fails:
                 self.outcomes[k] = Fail(obs)
                 self.failed[k] = Fail(obs)
