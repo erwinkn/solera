@@ -32,7 +32,7 @@ use crate::event::Part;
 use crate::outcomes::commit::{records, View};
 use crate::outcomes::transition::{eligible, Counters, FAILED, NAMES};
 use crate::outcomes::{output_id, record_digest, PassStart, Record, DUE, FAILURES, PASS};
-use crate::plan::{Cand, Indexes, InputPlan, Mode, PassId, Plan};
+use crate::plan::{Cand, Hold, Indexes, InputPlan, Mode, PassId, Plan, Request, View as PlanView};
 use crate::progress::{owed, read_digest, Class, Conditions, Holding, Key, KeyRange};
 use crate::state::{Id, Output, Tracking};
 
@@ -364,8 +364,55 @@ pub async fn plan(
         inputs: vec![input],
         unkeyed: vec![],
         pass: Some(PassId {
+            edge: v.edge.clone(),
             life: v.per_key.life,
             n: pass.n,
         }),
+    })
+}
+
+/// The next retry batch of the pass under way on one keyed input of a
+/// consumer, taken on every keyed input of the request (the consumer's, in
+/// its order) at its head: the worker loads each key on each input and
+/// reports it there, so a load mid full run is held back (D205) and the
+/// other inputs' progress follows what the worker read. On the other inputs
+/// it is a key list over the pass's range; the request's unkeyed inputs are
+/// planned as for any batch.
+pub async fn plan_all(
+    ixs: &dyn Indexes,
+    r: &RetryView,
+    view: &PlanView,
+    req: &Request,
+    hold: &dyn Hold,
+    limit: usize,
+) -> Result<Plan> {
+    let Some(i) = req.inputs.iter().position(|x| x.edge == r.outcomes.edge) else {
+        return invalid("the request names no input of the pass's edge");
+    };
+    let mut p = plan(ixs, r, &req.inputs[i].conditions, limit).await?;
+    if req.inputs.len() == 1 && req.unkeyed.is_empty() {
+        return Ok(p);
+    }
+    let keys: Vec<Key> = p.inputs[0].keys.iter().map(|c| c.key.clone()).collect();
+    let listed = Request {
+        mode: Mode::Keys(keys.clone()),
+        reset: false,
+        after: None,
+        limit: keys.len().max(1),
+        inputs: req.inputs.clone(),
+        unkeyed: req.unkeyed.clone(),
+    };
+    let mut all = crate::plan::plan(view, &listed, ixs, hold).await?;
+    for (j, input) in all.inputs.iter_mut().enumerate() {
+        input.expect = view.expect(j, &p.range);
+    }
+    all.inputs[i] = p.inputs.remove(0);
+    Ok(Plan {
+        mode: Mode::Keys(keys),
+        reset: false,
+        range: p.range,
+        inputs: all.inputs,
+        unkeyed: all.unkeyed,
+        pass: p.pass,
     })
 }
