@@ -127,6 +127,7 @@ pub async fn build(
         time_ms: spec.time_ms,
         producer: spec.producer,
         live_before: out.live,
+        clear: false,
     };
     let mut e = Entries {
         w: ix.commit_writer(spec.path, nc)?,
