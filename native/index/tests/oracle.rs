@@ -784,6 +784,59 @@ fn bad_references_and_abandoned_reads_leave_the_index_working() {
             ix.scan(&[l1.clone(), moved], 2, &q).await,
             Err(Error::Format(_))
         ));
+        // clears add no read to a diff or window whose commits hold none:
+        // neither older clears nor a clear in a layer the read opens anyway
+        let cold = || {
+            let opts = StoreOptions {
+                memory_bytes: 0,
+                ..Default::default()
+            };
+            let store =
+                Store::new(mem.clone(), Path::from("t"), rt.handle().clone(), opts).unwrap();
+            ChangeIndex::new(store, WriteOptions::default())
+        };
+        let (mut cleared, mut plain, none) = (Vec::new(), Vec::new(), Run::new());
+        for c in 1..=32 {
+            let new = if c < 32 { cl(c) } else { nc(c) };
+            let (y, z) = (format!("y{c}"), format!("z{c}"));
+            cleared.push(ix.write_commit(&y, new, &none).await.unwrap());
+            plain.push(ix.write_commit(&z, nc(c), &none).await.unwrap());
+        }
+        let mut merged = Vec::new();
+        for (name, c2, was) in [("w", cl(2), Version::Absent), ("v", nc(2), Version::Int(1))] {
+            let mut r3 = Run::new();
+            r3.push_key(b"k");
+            r3.push_entry(1, Version::Int(3), was);
+            let w1 = ix.write_commit(&format!("{name}1"), nc(1), &one(1)).await;
+            let w2 = ix.write_commit(&format!("{name}2"), c2, &none).await;
+            let w3 = ix.write_commit(&format!("{name}3"), nc(3), &r3).await;
+            let ls = [w1.unwrap(), w2.unwrap(), w3.unwrap()];
+            merged.push(vec![ix.merge(&ls, 0..3, 0, name).await.unwrap()]);
+        }
+        assert_eq!(merged[0][0].clears, vec![2]);
+        let mut gets = Vec::new();
+        for (ls, c) in [
+            (&cleared, 31),
+            (&plain, 31),
+            (&merged[0], 2),
+            (&merged[1], 2),
+        ] {
+            let (a, b) = (cold(), cold());
+            a.diff(ls, c, c + 1, &q).await.unwrap();
+            b.window(ls, c + 1..=c + 1, &q).await.unwrap();
+            gets.push((a.store.stats.counts().gets, b.store.stats.counts().gets));
+        }
+        assert_eq!((gets[0], gets[2]), (gets[1], gets[3]));
+        let (a, none_wanted) = (
+            cold(),
+            Query {
+                limit: Some(0),
+                ..Default::default()
+            },
+        );
+        a.scan(&merged[0], 2, &none_wanted).await.unwrap();
+        a.diff(&merged[0], 2, 3, &none_wanted).await.unwrap();
+        assert_eq!(a.store.stats.counts().gets, 0);
         let past = LayerRef {
             hi: u64::MAX,
             floor: Some(u64::MAX),

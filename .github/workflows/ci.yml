@@ -19,10 +19,10 @@ concurrency:
   group: ci-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 jobs:
-  verify:
+  rust:
     if: github.event_name != 'pull_request' || !github.event.pull_request.draft
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -31,15 +31,25 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: native
+      - run: cargo fmt --check --manifest-path native/Cargo.toml
+      - run: cargo check --manifest-path native/Cargo.toml
+      - run: cargo test --release --manifest-path native/Cargo.toml -p solera-index
+      - run: cargo test --release --manifest-path native/Cargo.toml -p solera-tracking
+  python:
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: native
       - uses: astral-sh/setup-uv@v6
         with:
           version: '0.12.13'
           python-version: '3.12'
           enable-cache: true
-      - run: cargo fmt --check --manifest-path native/Cargo.toml
-      - run: cargo check --manifest-path native/Cargo.toml
-      - run: cargo test --release --manifest-path native/Cargo.toml -p solera-index
-      - run: cargo test --release --manifest-path native/Cargo.toml -p solera-tracking
       - run: uv sync --locked
       - run: uv run ruff check
       - run: uv run ruff format --check
@@ -47,4 +57,14 @@ jobs:
       # once the type errors it reports are fixed.
       - run: uvx ty@0.0.84 check
         continue-on-error: true
-      - run: uv run pytest -q -m 'not live and not postgres and not s3'
+      - run: uv run pytest -q -n auto --durations=15 -m 'not live and not postgres and not s3'
+  # The one check to require: it passes only when both jobs above passed.
+  verify:
+    if: always() && (github.event_name != 'pull_request' || !github.event.pull_request.draft)
+    needs: [rust, python]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - run: |
+          echo "rust: ${{ needs.rust.result }}, python: ${{ needs.python.result }}"
+          test "${{ needs.rust.result }}" = success && test "${{ needs.python.result }}" = success
