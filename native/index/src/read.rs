@@ -20,9 +20,10 @@ const ALL: u64 = 4 << 20;
 /// A read of listed keys keeps at most this many bytes fetched ahead of its
 /// decoding, per layer.
 const WINDOW: u64 = 16 << 20;
-/// A read fetches the index segments it needs about this many bytes at a
-/// time, counting the gaps its GETs coalesce across, and at most
-/// `PARTS` segments.
+/// A read fetches the index segments it needs in batches of at most this
+/// many bytes, counting the gaps its GETs coalesce across and the cached
+/// segments it uses, and at most `PARTS` segments. A read of a range starts
+/// at `FIRST` and doubles, so a page fetches about what it reads.
 const SEG_BATCH: u64 = 16 << 20;
 /// A cursor plans at most about this many blocks ahead of its fetches, and
 /// one batch fetches at most this many blocks or segments.
@@ -190,6 +191,9 @@ pub(crate) struct Cursor {
     blocks: VecDeque<BlockRef>,
     planned: u64,
     target: u64,
+    /// The bytes the next fetch of index segments may hold: it starts small
+    /// for a read that may stop early and doubles per fetch, as `target`.
+    seg_target: u64,
     /// A read of listed keys: batches are launched together, up to
     /// `WINDOW` bytes ahead, and decoded as they arrive.
     all: bool,
@@ -231,6 +235,7 @@ impl Cursor {
         });
         let mut listed_segs: Vec<usize> = listed.iter().map(|&(_, s)| s).collect();
         listed_segs.dedup();
+        let seg_target = if keys.is_some() { SEG_BATCH } else { FIRST };
         let segs = match keys {
             None => top.segs.span(bounds.lo_key(), bounds.hi_key()),
             Some(_) => 0..listed_segs.len(),
@@ -249,6 +254,7 @@ impl Cursor {
             blocks: VecDeque::new(),
             planned: 0,
             target: if all_at_once { ALL } else { FIRST },
+            seg_target,
             all: all_at_once,
             ahead: 0,
             keep_all: false,
@@ -268,7 +274,11 @@ impl Cursor {
     /// segment is.
     async fn plan_ahead(&mut self) -> Result<()> {
         let o = &self.store.opts;
-        let enough = WINDOW.max(o.max_get).max(o.cache_batch);
+        let enough = if self.all {
+            WINDOW.max(o.max_get).max(o.cache_batch)
+        } else {
+            self.target
+        };
         while self.seg_next < self.segs.end && self.blocks.len() < PARTS && self.planned <= enough {
             self.plan().await?;
         }
@@ -290,11 +300,13 @@ impl Cursor {
                     None => j,
                     Some(_) => self.listed_segs[j],
                 };
-                if held >= SEG_BATCH || got.len() >= PARTS {
+                if held >= self.seg_target || got.len() >= PARTS {
                     break;
                 }
                 let c = self.store.cached_seg(&self.path, i);
-                if c.is_none() {
+                if let Some(ix) = &c {
+                    held += ix.bytes() as u64;
+                } else {
                     let r = s.off[i]..s.off[i] + s.clen[i] as u64;
                     let between = end
                         .map(|e| r.start.saturating_sub(e))
@@ -312,6 +324,7 @@ impl Cursor {
                 }
                 got.push((i, c));
             }
+            self.seg_target = (self.seg_target * 2).min(SEG_BATCH);
             let mut fetched = self.store.load(&self.path, wants).await?.into_iter();
             for (i, c) in got {
                 let c = c.map_or_else(|| fetched.next().expect("fetched"), Cached::Seg);
