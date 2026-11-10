@@ -344,6 +344,32 @@ format and rejected. One entry per changed key stays.
   zstd already finds the repeats. The one gain (−31% on the hot
   workload's change layers) is outweighed by its base.
 
+### As built (B4)
+
+In `native/tracking/src/commit/`, as described above:
+
+- **One call builds a commit.** `build` takes the keys a write changed in
+  key order (`Changes`: an upsert with or without a version word, or a
+  removal; an upsert without one gets the attempt's version) and the
+  output's head. It reads the replaced versions with one `get` per block of
+  changes and streams the entries into the index's `CommitWriter`, so a
+  100M-key commit never holds more than one block. A key whose version
+  does not change is no entry, and a commit with no entry writes nothing.
+- **Three modes.** A *patch* leaves keys it does not name as they are. A
+  *replace* (a source's full listing, or a write that reports the whole
+  output) removes every key at the head it does not name, reading the
+  head's state by `scan`, page by page. A *report* (a load's report on a
+  source, P13) keeps a key's report only if the log did not change that key
+  since the batch's head.
+- **The event part** `OutputCommit` carries the layer reference and the
+  live count, never keys. Its check refuses a layer that is not exactly the
+  head's next commit, so a commit built at an old head is refused, and an
+  event holds at most one commit per output.
+- **What a worker hands over** is `Changes` in its transport form: zstd
+  blocks of sorted keys, at most 1 MiB a row and 8 MiB a block.
+- **Clears are not built yet**: they wait on the index's clear flag (§10,
+  form (a)).
+
 ## 5. Progress: pieces and points
 
 Progress says, for every key of an edge, what the consumer holds. It
@@ -693,15 +719,15 @@ Measured at the scale target (100M keys, one 4-vCPU machine):
 | Commit | CPU | Storage requests | Memory |
 |---|---|---|---|
 | A 10k-key batch in one key range, cold | about 10 ms | 11 to 15 GETs, one 62 KB PUT | |
-| A 100M-key commit (a full rewrite), streamed | about 30 s | | 579 MB peak |
-| A 10k-key batch scattered over the whole output, cold | 2.6 to 2.9 s | about 2,850 GETs | |
+| A 100M-key commit (a full rewrite as a listing), streamed | about 30 s | | 386 MB peak |
+| A 10k-key batch scattered over the whole output, cold | 1.2 to 1.5 s | about 2,850 GETs | |
 
-The one miss is the scattered batch, and all of its cost is the index's
-`get` walking whole blocks it was not asked about; a `get` that skips
-them should bring it to 0.5 to 1 s. Sending such commits to a worker would
+The scattered batch is the dearest, and its cost is the index's `get`
+decoding about 10,000 blocks (2.6 to 2.9 s before `get` learned to skip
+rows it was not asked about). Sending such commits to a worker would
 not make them cheaper, only move them, and it would add a second commit
 builder, a copy of the layer list on workers, and a rebuild whenever the
-head moved in between. The fix belongs in `get`.
+head moved in between.
 
 ### Where candidates come from
 
