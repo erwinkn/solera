@@ -6,7 +6,7 @@ use std::collections::BTreeSet;
 use crate::codec::Ver;
 use crate::error::{invalid, Result};
 use crate::event::{Event, Part};
-use crate::plan::{Cand, InputPlan, Mode, Plan, PLANNER_VERSION};
+use crate::plan::{InputPlan, Mode, Plan, PLANNER_VERSION};
 use crate::progress::{
     owed, read_digest, unsettled, BatchProgress, Consumed, Holding, Key, Point, Reason, Value,
 };
@@ -31,9 +31,10 @@ pub struct Ops {
     pub parts: Vec<Part>,
     pub records: Vec<Record>,
     /// Per keyed input, sorted: the keys this commit held back. A key loaded
-    /// at another version than planned on an input whose output was mid full
-    /// run, or cleared since the plan's head, is held back on every input of
-    /// the batch, since its output is one value computed from all of them.
+    /// at another version than planned (or loaded at all, on an input that
+    /// did not take it) on an input whose output was mid full run, or cleared
+    /// since the plan's head, is held back on every input of the batch, since
+    /// its output is one value computed from all of them.
     /// Each keeps what it held; whether it failed is not recorded.
     pub held_back: Vec<Vec<Key>>,
 }
@@ -73,7 +74,8 @@ impl Tracking {
         }
         let taken = |p: &InputPlan, k: &Key| p.keys.binary_search_by(|c| c.key.cmp(k)).is_ok();
         if plan.inputs.iter().zip(reports).any(|(p, r)| {
-            !r.failed.iter().all(|k| taken(p, k)) || !r.loaded.iter().all(|(k, _)| taken(p, k))
+            !r.failed.iter().all(|k| taken(p, k))
+                || !r.loaded.iter().all(|(k, _)| plan.inputs.iter().any(|p| taken(p, k)))
         }) {
             return invalid("a report names a key the batch did not take");
         }
@@ -94,15 +96,6 @@ impl Tracking {
             }
             keyed.push(k);
         }
-        let moved = |p: &InputPlan, r: &InputReport, c: &Cand| {
-            r.loaded
-                .binary_search_by(|(x, _)| x.cmp(&c.key))
-                .is_ok_and(|i| {
-                    let wanted = Holding::of(c.version.as_version(), &p.conditions, &c.key);
-                    let got = Holding::of(r.loaded[i].1.as_version(), &p.conditions, &c.key);
-                    owed(&got, &wanted)
-                })
-        };
         let unsettled = plan
             .inputs
             .iter()
@@ -114,8 +107,7 @@ impl Tracking {
             .zip(reports)
             .zip(&unsettled)
             .filter(|(_, &u)| u)
-            .flat_map(|((p, r), _)| p.keys.iter().filter(move |c| moved(p, r, c)))
-            .map(|c| &c.key)
+            .flat_map(|((p, r), _)| moved(p, r))
             .collect();
         let mut parts = Vec::new();
         let mut records = Vec::new();
@@ -131,7 +123,7 @@ impl Tracking {
                     .ok()
                     .map(|i| &report.loaded[i].1)
             };
-            let mut kept_moved = false;
+            let kept_moved = moved(p, report).any(|k| !hold.contains(k));
             let mut held = Vec::new();
             let mut points: Vec<(Key, Point)> = Vec::new();
             let key_list = matches!(plan.mode, Mode::Keys(_));
@@ -151,7 +143,6 @@ impl Tracking {
                     }
                     continue;
                 }
-                kept_moved |= moved(p, report, c);
                 if failed(&c.key) {
                     if key_list || owed(&c.held, &wanted) {
                         points.push((
@@ -258,4 +249,21 @@ impl Tracking {
             held_back,
         })
     }
+}
+
+/// The keys `r` loaded at another version than `p` planned. A key the input
+/// did not take (another input of the batch did) has no planned version
+/// here, so any load of it counts.
+fn moved<'a>(p: &'a InputPlan, r: &'a InputReport) -> impl Iterator<Item = &'a Key> + 'a {
+    r.loaded
+        .iter()
+        .filter(|(k, got)| {
+            p.keys
+                .binary_search_by(|c| c.key.cmp(k))
+                .map_or(true, |i| {
+                    let wanted = Holding::of(p.keys[i].version.as_version(), &p.conditions, k);
+                    owed(&Holding::of(got.as_version(), &p.conditions, k), &wanted)
+                })
+        })
+        .map(|(k, _)| k)
 }

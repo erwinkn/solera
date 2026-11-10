@@ -237,3 +237,29 @@ def test_a_report_naming_a_key_the_batch_did_not_take_is_refused(tmp_path):
     with pytest.raises(ValueError, match="did not take"):
         t.progress_ops(plan, [([], [("k0", 1)])])
     t.apply(t.progress_ops(plan, [(["k2"], [("k1", 1)])])[0])
+
+
+def test_a_key_another_input_took_is_held_back_when_loaded_mid_full_run(tmp_path):
+    """k is owed on b only, but the worker loads a's k too, from the middle of
+    a's full run: no version was planned for it on a, so the load counts as
+    moved and k is held back on b."""
+    ix = ChangeIndex(f"file://{tmp_path}")
+    t = Tracking()
+    logs = {}
+    for out in (b"a", b"b"):
+        t.attach(out, ix)
+        logs[out] = [ix.write_commit(f"{out.decode()}/1", 1, [("k", 1, None)], live_before=0)]
+        t._set_output(out, logs[out], 1, 1)
+        t.apply(Tracking.event_edge_open(b"r/" + out, out, True))
+    inputs = [{"edge": b"r/a", "conditions": {}}, {"edge": b"r/b", "conditions": {}}]
+    t.apply(t.progress_ops(t.plan({"inputs": inputs, "limit": 10})["plan"], [([], []), ([], [])])[0])
+    logs[b"b"].append(ix.write_commit("b/2", 2, [("k", 2, 1)], live_before=1))
+    t._set_output(b"b", logs[b"b"], 2, 1)
+    plan = t.plan({"inputs": inputs, "limit": 10})["plan"]
+    assert Tracking.plan_keys(plan, 0)[0] == [] and Tracking.plan_keys(plan, 1)[0] == ["k"]
+    logs[b"a"].append(ix.write_commit("a/2", 2, [("m", 2, None)], live_before=1, clear=True))
+    t._set_output(b"a", logs[b"a"], 2, 1, 2)
+    event, _, held_back = t.progress_ops(plan, [([], [("k", None)]), ([], [])])
+    assert held_back == [[], ["k"]]
+    t.apply(event)
+    assert t.owed(b"r/b", {}) == ([("k", "updated")], None)

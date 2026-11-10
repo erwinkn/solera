@@ -531,8 +531,10 @@ these additions:
   since the batch's head (the layers' `clears`): the key keeps what it held,
   even if it also failed, and stays owed. A key held back on one input is
   held back on every input of the batch, since its output is one value
-  computed from all of them. `Ops.held_back` names those keys
-  for the key outcomes (B6), and their points carry their own reason,
+  computed from all of them. A key the input did not take (another input
+  did) has no planned version on it, so any load of it reported there
+  counts. `Ops.held_back` names those keys for the key outcomes (B6), and
+  their points carry their own reason,
   `Unsettled`, apart from the planner's `HeldBack`, so lineage can tell a
   key the batch never took from one it took and held back. The gate that
   holds readers of an incomplete upstream is the engine's (B5).
@@ -551,7 +553,8 @@ these additions:
   dropped the clears after the head, so whether one came in is no longer
   known. `progress_ops` also refuses a plan whose edge now reads another
   output than it planned on, and a report that names a key the batch did
-  not take.
+  not take: a failed key its input did not take, or a loaded key no input
+  of the batch took.
 
 ## 6. Staleness kept exact by propagation
 
