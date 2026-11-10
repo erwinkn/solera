@@ -209,10 +209,11 @@ async def test_dep_2_a_local_serve_reloads_on_code_changes_and_keeps_its_deploy_
     helpers.write_text("def f(): return 1\n")
 
     async def served() -> tuple[int, str, str | None]:
-        """The deploy served, its number, and what fails."""
+        """The deploy's number, the deploy served, and what fails. The number
+        first: a reload serves its deploy before it numbers it."""
 
-        diagnostics = await solera.get("/api/diagnostics")
         number = (await solera.get("/assets/parsed/outcomes"))["deploy"]
+        diagnostics = await solera.get("/api/diagnostics")
         return number, diagnostics["deploy"], diagnostics["last_error"]
 
     async def until(predicate):
@@ -403,6 +404,58 @@ async def test_dep_5_an_unchanged_keyed_write_still_applies_its_migrations(soler
     assert await solera.keys("files") == keys and await solera.rows("files") == {"a": 1}
 
 
+MIGRATED = """
+import json
+import os
+
+from solera.sdk import Migration, Output, Project, asset
+from solera.stores import FileStore
+
+ROOT = {root!r}
+LEDGER = os.path.join(ROOT, "ledger.json")
+
+
+def note(what):
+    with open(os.path.join(ROOT, "calls"), "a") as f:
+        f.write(what + "\\n")
+
+
+class Ledgered(FileStore):
+    \"\"\"Applies each migration once, noting it in a ledger of its own.\"\"\"
+
+    async def migrate(self, output, migrations, context=None, prior=None):
+        applied = json.load(open(LEDGER)) if os.path.exists(LEDGER) else []
+        for m in migrations:
+            if m.name not in applied:
+                m.payload()
+                applied.append(m.name)
+        json.dump(applied, open(LEDGER, "w"))
+        return applied
+
+
+@asset(outputs=Output("docs", store="ledgered", migrations=[Migration("seed", lambda: note("seed"))]))
+def docs():
+    note("docs")
+    return b"x"
+
+
+project = Project(assets=[docs], stores={{"ledgered": Ledgered(os.path.join(ROOT, "data"))}}, name="migdemo")
+"""
+
+
+async def test_dep_5_solera_migrate_applies_eagerly_and_is_idempotent(solera, tmp_path):
+    """`solera migrate` applies what the project declares before any
+    producer runs, and says so; run again, it applies nothing again."""
+
+    project = tmp_path / "migdemo.py"
+    project.write_text(MIGRATED.format(root=str(tmp_path)))
+    for _ in range(2):
+        code, out, err = await solera.cli("migrate", "--project", str(project))
+        assert code == 0, err
+        assert "docs: applied seed" in out
+        assert (tmp_path / "calls").read_text() == "seed\n"  # applied once, and no producer ran
+
+
 @pytest.mark.postgres
 async def test_dep_5_each_schemas_table_gets_its_own_migrations(solera, tmp_path):
     """A staging and a production namespace write `orders` into schemas of
@@ -434,7 +487,7 @@ async def test_dep_5_each_schemas_table_gets_its_own_migrations(solera, tmp_path
 
         return Project(assets=[orders], stores={"pg": PostgresStore("env:SOLERA_TEST_DATABASE_URL")})
 
-    staging = Solera(tmp_path / "staging")
+    staging = Solera(tmp_path / "staging", solera.path)
     try:
         for namespace, schema in zip((solera, staging), schemas, strict=True):
             await namespace.deploy(project(schema))
