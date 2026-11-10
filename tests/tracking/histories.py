@@ -132,3 +132,35 @@ REPORT_IN_FLIGHT = [
     ("step", "tally", 1),
     ("commit", "report"),
 ]
+
+# A reader's batch loads while tally (report) or copy (archive) is mid rebuild
+# and commits after the rebuild completes: the gate no longer holds it, so the
+# hold must also cover a clear since the batch was planned (review, Fable 5.2).
+REPORT_LOADS_MID_REBUILD = [
+    ("items", (("k1", True), ("k3", True))),
+    ("step", "tally", 2),
+    ("step", "report", 2),
+    ("items", (("k5", True),)),
+    ("step", "tally", 2),
+    ("plan", "report", 2),
+    ("define", "tally"),
+    ("step", "tally", 1),
+    ("load", "report"),
+    ("step", "tally", 2),
+    ("step", "tally", 2),
+    ("commit", "report"),
+]
+ARCHIVE_LOADS_MID_REBUILD = [
+    ("items", (("k1", True), ("k2", True), ("k3", True))),
+    ("step", "copy", 3),
+    ("step", "archive", 3),
+    ("feed", (("k3", True),)),
+    ("step", "copy", 3),
+    ("plan", "archive", 2),
+    ("full", "copy"),
+    ("step", "copy", 1),
+    ("load", "archive"),
+    ("step", "copy", 2),
+    ("commit", "archive"),
+    ("step", "archive", 2),
+]

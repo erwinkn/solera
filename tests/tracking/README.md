@@ -9,8 +9,8 @@ covers, what it found and what it leaves out.
 | Module | What it is |
 |---|---|
 | `core.py` | The output log (entries with both versions, clears, `diff`/`scan`/`get` from entries) and progress (pieces, points, decoding, the planner, the batch commit rule) |
-| `staleness.py` | One consumer input (checks over items) under both staleness forms: exact owed counts per piece (`counts`, P14) and one witness due key (`witness`) |
-| `fullrun.py` | The cast (feed and items upstream; copy, tally, archive, report, checks) under both full-run forms: a clear at the first batch with the gate (`clear`) and rebuild in place with a floor (`floor`), on file or table stores |
+| `staleness.py` | One consumer input (checks over items), its staleness kept by one witness due key (`witness`) |
+| `fullrun.py` | The cast (feed and items upstream; copy, tally, archive, report, checks); a full run clears at its first batch and the gate holds readers (`clear`), on file or table stores |
 | `histories.py` | One shrunk history per rule: passes with every rule on, fails with that rule off |
 | `oracle.py` | The stable interface for the build: replay a history, ask what is held, owed, due, and planned next |
 | `__main__.py` | Sweeps, ablations, shrinking and work counts from the command line |
@@ -18,13 +18,13 @@ covers, what it found and what it leaves out.
 ## Running it
 
 ```bash
-uv run pytest tests/tracking -q                    # CI: 200 histories per form, every calibration (~10 s)
-uv run pytest tests/tracking -q --slow             # 5,000 histories per form
-uv run python -m tests.tracking staleness          # 3,000 histories per form
+uv run pytest tests/tracking -q                    # CI: 200 histories per store, every short staleness history, every calibration (~20 s)
+uv run pytest tests/tracking -q --slow             # 5,000 histories per store
+uv run python -m tests.tracking staleness          # 3,000 histories
 uv run python -m tests.tracking fullrun --kind table
 uv run python -m tests.tracking staleness --off rule3_range --shrink   # a minimal failing history
 uv run python -m tests.tracking fullrun --ablate   # each rule switched off in turn
-uv run python -m tests.tracking staleness --stats  # the work each form does
+uv run python -m tests.tracking staleness --stats  # the work the witness does
 ```
 
 ## The oracle
@@ -39,7 +39,13 @@ w = oracle.replay_fullrun([
 oracle.holds(w, "copy")       # what copy processed from items, per key
 oracle.due(w, "copy")         # ["k2"]
 oracle.next_plan(w, "copy")   # (["k2"], "\uffff"): the next batch takes k2 and runs to +inf
+oracle.held(w, "archive")     # True: copy has not processed k2 yet (D177), so the gate holds archive
 ```
+
+`replay_fullrun` uses the decided full-run form (`form="clear"`). While the gate
+holds a consumer, `due` is empty and `next_plan` takes nothing; with a full
+run due, `owed` and `due` name every key upstream holds, as the full run's
+first batch takes them.
 
 `replay_staleness` and `replay_fullrun` raise `oracle.Broken` if a
 history breaks an invariant, so an answer always comes from a consistent
@@ -70,6 +76,7 @@ full run begins in the design's form; `("complete",)` it ends;
 
 **Full run** (`fullrun.history`): `("items" | "feed", ((key, present), ...))`;
 `("plan" | "step", asset, n)` (a step plans and commits at once);
-`("commit" | "cancel", asset)`; `("keys", asset, keys)`;
+`("commit" | "cancel", asset)`; `("load", reader)` a reader's batch loads
+before it commits (archive, report); `("keys", asset, keys)`;
 `("define", asset)` a new definition; `("full", asset)` a full run by hand;
 `("restart",)`; `("summary",)` the whole reader of copy runs.

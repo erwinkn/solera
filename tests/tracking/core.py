@@ -195,6 +195,7 @@ class Progress:
         holding differs from it: kept keys (failed, held back) keep what they
         held; results (key -> what the consumer now holds) deviate if they differ
         from what at(H) says. Every other point in the range is dropped."""
+        assert lo == NEG or any(p[0] == lo for p in self.pieces), f"a batch from {lo} starts inside a piece"
         value = ("at", H, cond)
         old = {k: self.decode(k) for k in kept}
         new = []
@@ -216,12 +217,14 @@ class Progress:
     def commit_points(self, results: dict, failed=()) -> None:
         """A key-list run (§10): points only, the pieces stay. A failing key
         always keeps what it held as a point (P9), even where its piece says the
-        same, so that a piece counts no failing key (§6)."""
+        same, so that a piece counts no failing key (§6). A key processed on an
+        empty piece keeps a point even when absent, so that completeness (D177)
+        counts it as processed."""
         for k in failed:
             self.points[k] = self.decode(k)
         for k, v in results.items():
             self.points.pop(k, None)
-            if v != self.decode(k):
+            if v != self.decode(k) or self.piece_of(k)[2] == EMPTY:
                 self.points[k] = v
 
     def merge(self, keep: str | None) -> None:

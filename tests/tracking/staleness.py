@@ -77,6 +77,9 @@ class World:
         self.cond = Cond(PATTERNS[0])
         self.holds: dict[str, object] = {}  # brute force: what the consumer holds
         self.outcomes: dict[str, Fail] = {}
+        self.failed: dict[str, Fail] = {}  # brute force: keys whose last processing failed, by KEY-3
+        self.covered: list[tuple[str, str]] = []  # brute force: ranges processed since the last reset
+        self.listed: set[str] = set()  # brute force: keys a key list processed since then
         self.prog = Progress(self.up, own=lambda: {k for k, v in self.holds.items() if v is not ABSENT})
         self.pending: Batch | None = None
         self.cursor: str | None = None  # the run's progress key; None when no run is going
@@ -89,8 +92,8 @@ class World:
     def on(self, rule: str) -> bool:
         return rule not in self.off
 
-    def waiting(self, k: str, c: int) -> bool:
-        f = self.outcomes.get(k)
+    def waiting(self, k: str, c: int, outcomes: dict | None = None) -> bool:
+        f = (self.outcomes if outcomes is None else outcomes).get(k)
         return f is not None and not f.retry and f.on == self.prog.wanted(k, c, self.cond)
 
     def due_at(self, k: str, c: int) -> bool:
@@ -110,6 +113,7 @@ class World:
             self.trace.append(
                 f"items c{self.up.head}: {_entries(self.up.entries[-1])}" + (" (lost)" if lost else "")
             )
+            self.reverted()
             self.form.on_commit(lost)
 
     def ev_clear(self, changes: tuple, lost: bool) -> None:
@@ -117,6 +121,7 @@ class World:
             self.up.commit(dict(changes), clear=True)
             self.incomplete = True
             self.trace.append(f"items c{self.up.head}: clear; {_entries(self.up.entries[-1])}")
+            self.reverted()
             self.form.on_commit(lost)
 
     def ev_complete(self) -> None:
@@ -124,6 +129,14 @@ class World:
             self.incomplete = False
             self.trace.append("items completes its full run")
             self.form.on_complete()
+
+    def reverted(self) -> None:
+        """A failing key's outcome goes once upstream returns to what the consumer
+        holds; its point stays (§11, KEY-3, review F8). The truth drops it too."""
+        head = self.up.head
+        for record in (self.outcomes, self.failed):
+            for k in [k for k in record if self.holds.get(k) == self.prog.wanted(k, head, self.cond)]:
+                del record[k]
 
     def ev_plan(self, n: int) -> None:
         if self.pending is None and not self.incomplete:
@@ -157,27 +170,33 @@ class World:
             return
         snap = self.form.before(b)
         if b.reset:
-            self.holds, self.outcomes = {}, {}
+            self.holds, self.outcomes, self.failed = {}, {}, {}
+            self.covered, self.listed = [], set()
             self.prog.reset()
         results, kept = {}, set(b.held_back)
         for k in b.taken:
             if k in fails:
                 self.outcomes[k] = Fail(self.prog.wanted(k, b.H, b.cond))
+                self.failed[k] = Fail(self.prog.wanted(k, b.H, b.cond))
                 kept.add(k)
                 continue
             obs = self.prog.wanted(k, self.up.head if k in moved else b.H, b.cond)
             results[k] = obs
             self.holds[k] = obs
             self.outcomes.pop(k, None)
+            self.failed.pop(k, None)
         self.holds = {k: v for k, v in self.holds.items() if v is not ABSENT}
         if b.kind == "keys":
             self.prog.commit_points(results, kept)
+            self.listed |= set(b.taken)
         else:
             self.prog.commit_batch(b.H, b.lo, b.hi, b.cond, results, kept)
+            self.covered.append((b.lo, b.hi))
             self.cursor = None if b.hi == POS else b.hi
         self.outcomes = {
             k: f for k, f in self.outcomes.items() if k in self.prog.points
         }  # they go together (§11)
+        self.reverted()
         failed = sorted(set(fails) & set(b.taken))
         moved_ = sorted(set(moved) & set(results))
         self.trace.append(
@@ -197,24 +216,29 @@ class World:
 
     def ev_pat(self, i: int) -> None:
         if self.cond.pat != PATTERNS[i]:
+            self.form.first()
             self.cond = replace(self.cond, pat=PATTERNS[i])
             self.trace.append(f"checks' patterns become {sorted(PATTERNS[i]) if PATTERNS[i] else 'all'}")
             self.form.on_conditions()
 
     def ev_ctx(self) -> None:
+        self.form.first()
         self.cond = replace(self.cond, ctx=self.cond.ctx + 1)
         self.trace.append(f"factor moves to w{self.cond.ctx + 1}")
         self.form.on_conditions()
 
     def ev_defn(self) -> None:
+        self.form.first()
         self.cond = replace(self.cond, defn=(self.cond.defn[0] + 1,))
         self.trace.append(f"checks' definition becomes d{self.cond.defn[0]}")
         self.form.on_conditions()
 
     def ev_held(self) -> None:
+        self.form.first()
         self.prog.reset(HELD_PIECE)
         self.holds = {k: HELD for k in self.holds}
-        self.outcomes, self.pending, self.cursor = {}, None, None
+        self.outcomes, self.failed, self.pending, self.cursor = {}, {}, None, None
+        self.covered, self.listed = [(NEG, POS)], set()
         self.trace.append("checks' progress becomes held (it cannot be trusted)")
         self.form.on_reset()
 
@@ -222,6 +246,8 @@ class World:
         f = self.outcomes.get(k)
         if f is not None and not f.retry:
             f.retry = True
+            if k in self.failed:
+                self.failed[k].retry = True
             self.trace.append(f"{k}'s retry comes due" + (" (backoff over)" if timer else " (forced)"))
             self.form.on_retry(k, timer)
 
@@ -235,16 +261,15 @@ class World:
         """(owed, due) from what the consumer really holds."""
         head = self.up.head
         owed = {k for k in KEYS if self.holds.get(k) != self.prog.wanted(k, head, self.cond)}
-        return owed, {k for k in owed if not self.waiting(k, head)}
+        return owed, {k for k in owed if not self.waiting(k, head, self.failed)}
 
     def brute_complete(self) -> bool:
-        now = self.up.states[-1]
-        return not any(
-            k in now
-            and self.cond.takes(k)
-            and k not in self.prog.points
-            and self.prog.piece_of(k)[2] == EMPTY
-            for k in KEYS
+        """D177 from what was processed: every upstream key the patterns take lies
+        in a range processed since the last reset, or a key list processed it."""
+        return all(
+            k in self.listed or any(within(k, lo, hi) for lo, hi in self.covered)
+            for k in self.up.states[-1]
+            if self.cond.takes(k)
         )
 
     def check(self) -> str | None:
@@ -348,13 +373,11 @@ class Witness:
         self.save()
 
     def on_conditions(self) -> None:
-        self.first()
         if self.w.on("rule4"):
             self.probe()
         self.save()
 
     def on_reset(self) -> None:
-        self.first()
         if self.w.on("held_probe"):
             self.probe()
         self.save()

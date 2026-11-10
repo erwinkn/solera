@@ -13,7 +13,7 @@ stable for the build units that test against them; see README.md.
 from __future__ import annotations
 
 from . import fullrun, staleness
-from .core import NEG
+from .core import NEG, POS
 
 
 class Broken(AssertionError):
@@ -67,26 +67,42 @@ def holds(w, asset: str | None = None, input: int = 0) -> dict[str, object]:
     return dict(a.held[input] if isinstance(a, fullrun.Ordinary) else a.holds)
 
 
+def held(w, asset: str | None = None) -> bool:
+    """Does the gate hold the consumer: is its upstream mid full run (P12)?"""
+    if isinstance(w, staleness.World):
+        return w.incomplete
+    a = w.assets[asset]
+    return isinstance(a, fullrun.Mirror) and a.held()
+
+
 def owed(w, asset: str | None = None, input: int = 0) -> list[str]:
-    """Keys whose upstream state now, under the conditions now, differs from what is held."""
+    """Keys whose upstream state now, under the conditions now, differs from what
+    is held; with a full run due, every key upstream holds."""
     if isinstance(w, staleness.World):
         return sorted(w.brute()[0])
     a = w.assets[asset]
-    prog, log = (
-        (a.progress[input], a.inputs[input]) if isinstance(a, fullrun.Ordinary) else (a.progress, a.log)
-    )
-    return prog.candidates(log.head, NEG, a.cond)
+    if isinstance(a, fullrun.Ordinary):
+        log = a.inputs[input]
+        return (
+            sorted(log.scan(log.head)) if a.full_due else a.progress[input].candidates(log.head, NEG, a.cond)
+        )
+    return a.progress.candidates(a.log.head, NEG, a.cond)
 
 
 def due(w, asset: str | None = None, input: int = 0) -> list[str]:
-    """Owed keys a default run would take now (failing keys wait for their retry)."""
+    """Owed keys a default run would take now: none while held, and failing keys
+    wait for their retry."""
+    if held(w, asset):
+        return []
     if isinstance(w, staleness.World):
         return sorted(w.brute()[1])
     return owed(w, asset, input)
 
 
 def next_plan(w, asset: str | None = None, n: int = 2) -> tuple[list[str], str]:
-    """The keys the next batch must take, and where its range ends."""
+    """The keys the next batch must take, and where its range ends: nothing while held."""
+    if held(w, asset):
+        return [], POS
     if isinstance(w, staleness.World):
         taken, hi, _ = w.prog.plan(w.up.head, w.cursor or NEG, n, w.cond, w.due)
         return taken, hi

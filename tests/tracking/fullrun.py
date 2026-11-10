@@ -108,6 +108,8 @@ class Spec:
     taken: list[str]
     version: int
     reset: bool = False
+    loads: dict | None = None  # a reader's load, once it ran: key -> Row or None
+    loading_rebuild: int | None = None  # the producer's rebuild in progress when it loaded
 
 
 def obs(log: Log, k: str, c: int, cond: Cond) -> object:
@@ -213,6 +215,7 @@ class Ordinary:
             self.held = [{} for _ in self.inputs]
             self.covered, self.listed = [], set()
             self.full_due = False
+            self.cursor = None
             w.rebuilds += 1
             w.stats["rebuilds begun"] += 1
             w.stats["rebuilds superseded"] += self.rebuild is not None
@@ -357,30 +360,51 @@ class Mirror:
             f"{self.name} plans at {self.log_name()}#{s.heads[0]}: {s.taken}, range ({_k(s.lo)}, {_k(s.hi)}]"
         )
 
+    def load(self) -> None:
+        """The attempt's load, before its commit: a table gives its rows as they
+        are now, a file store the versions planned."""
+        s = self.pending
+        if s is None or s.loads is not None:
+            return
+        s.loads = {k: self.src.load(k, s.heads[0]) if isinstance(self.src, Output) else None for k in s.taken}
+        s.loading_rebuild = self.producer.rebuild if self.producer else None
+        self.w.trace.append(
+            f"{self.name} loads "
+            + (", ".join(f"{k}@{r.version}" if r else f"{k} absent" for k, r in s.loads.items()) or "nothing")
+        )
+
     def commit(self) -> None:
-        w, s = self.w, self.pending
+        w = self.w
+        self.load()
+        s = self.pending
         if s is None:
             return
         self.pending = None
         if s.cond.defn[0] != self.d:
             w.trace.append(f"{self.name}'s commit is refused: its definition changed")
             return
+        cleared = any(s.heads[0] < x <= self.log.head for x in self.log.clears)
         results, kept, delivered = {}, set(), []
         for k in s.taken:
             planned = self._obs(k, s.heads[0], s.cond)
-            row = self.src.load(k, s.heads[0]) if isinstance(self.src, Output) else None
+            row = s.loads[k]
             loaded = (
                 planned
                 if row is None and not isinstance(self.src, Output)
                 else (ABSENT if row is None else (row.version, s.cond.seen()))
             )
             w.stats["loads at another version"] += loaded != planned
-            if loaded != planned and self.held() and w.on("hold_back"):
+            if loaded != planned and (self.held() or cleared) and w.on("hold_back"):
                 w.stats["held back"] += 1
                 kept.add(k)
                 continue
             p = self.producer
-            if row is not None and p is not None and row.rebuild is not None and row.rebuild == p.rebuild:
+            if (
+                row is not None
+                and p is not None
+                and row.rebuild is not None
+                and row.rebuild in (p.rebuild, s.loading_rebuild)
+            ):
                 w.violation = (
                     f"{self.name} loaded {k}@{row.version}, a row the unfinished rebuild {row.rebuild} built"
                 )
@@ -482,6 +506,10 @@ class World:
                 asset.plan(0, ev[2])
         elif kind == "commit":
             self.assets[ev[1]].commit()
+        elif kind == "load":
+            a = self.assets[ev[1]]
+            if isinstance(a, Mirror):
+                a.load()
         elif kind == "cancel":
             a = self.assets[ev[1]]
             if a.pending or a.cursor:
@@ -527,6 +555,8 @@ class World:
         if self.violation:
             return self.violation
         for a in (self.copy, self.tally):
+            if a.complete() != a.brute_complete():
+                return f"{a.name} reads {'' if a.complete() else 'in'}complete, brute force says otherwise"
             out = a.output
             if out.log.scan(out.log.head) != {k: r.version for k, r in out.rows.items()}:
                 return f"{a.name}'s log says {out.log.scan(out.log.head)}, its store {_rows(out.rows)}"
@@ -594,6 +624,7 @@ def history(rnd: random.Random, steps: int) -> list[tuple]:
         + ("plan",) * 4
         + ("commit",) * 4
         + ("keys", "cancel", "define", "define", "full", "restart", "summary")
+        + ("load",) * 3
     )
     names = ("copy", "copy", "tally", "archive", "report", "checks")
     events: list[tuple] = []
@@ -607,6 +638,8 @@ def history(rnd: random.Random, steps: int) -> list[tuple]:
             events.append((kind, rnd.choice(names), rnd.randint(1, 2)))
         elif kind in ("commit", "cancel"):
             events.append((kind, rnd.choice(names)))
+        elif kind == "load":
+            events.append((kind, rnd.choice(("archive", "report"))))
         elif kind == "keys":
             events.append(
                 (kind, rnd.choice(("copy", "tally")), tuple(sorted(rnd.sample(KEYS, rnd.randint(1, 2)))))

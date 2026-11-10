@@ -11,7 +11,7 @@ import pytest
 
 from . import fullrun, oracle, staleness
 from .core import ABSENT, NEG, POS, Log, within
-from .histories import CALIBRATIONS, REPORT_IN_FLIGHT
+from .histories import ARCHIVE_LOADS_MID_REBUILD, CALIBRATIONS, REPORT_IN_FLIGHT, REPORT_LOADS_MID_REBUILD
 
 HISTORIES = int(os.environ.get("SOLERA_TRACKING_HISTORIES", "200"))
 SLOW = 5000
@@ -183,3 +183,133 @@ def test_the_oracle_refuses_keys_outside_the_models_key_space():
         oracle.replay_fullrun([("keys", "copy", ("k9",))])
     for kind in ("up", "clear"):
         oracle.replay_staleness([(kind, (("k1", "v1"),), False)])
+
+
+ALPHABET = [
+    ("up", (("k1", 1),), False),
+    ("up", (("k1", 2),), False),
+    ("up", (("k1", None),), False),
+    ("up", (("k2", 1),), False),
+    ("up", (("k2", None),), False),
+    ("up", (("x1", 1),), False),
+    ("up", (("x1", None),), False),
+    ("up", (("k1", 1),), True),
+    ("up", (("k1", 2),), True),
+    ("up", (("k1", None),), True),
+    ("up", (("x1", None),), True),
+    ("up", (("k2", 1),), True),
+    ("clear", (("k1", 3),), False),
+    ("clear", (), True),
+    ("complete",),
+    ("plan", 1),
+    ("plan", 2),
+    ("full", 1),
+    ("keys", ("k1",)),
+    ("keys", ("k2",)),
+    ("commit", (), ()),
+    ("commit", ("k1",), ()),
+    ("commit", ("k2",), ()),
+    ("commit", (), ("k1",)),
+    ("commit", (), ("k2",)),
+    ("cancel",),
+    ("pat", 0),
+    ("pat", 1),
+    ("pat", 2),
+    ("ctx",),
+    ("defn",),
+    ("held",),
+    ("retry", "k1", True),
+    ("retry", "k1", False),
+    ("restart",),
+]
+
+
+def _exhaust(depth: int) -> int:
+    """Every staleness history up to depth over a small alphabet; an event that
+    does not apply ends its branch, since every longer history through it is
+    one already checked."""
+    seen = 0
+
+    def dfs(prefix: list[tuple]) -> None:
+        nonlocal seen
+        w = staleness.World("witness")
+        for ev in prefix[:-1]:
+            w.apply(ev)
+        before = len(w.trace)
+        w.apply(prefix[-1])
+        if len(w.trace) == before:
+            return
+        seen += 1
+        bad = w.check()
+        assert bad is None, f"{prefix}: {bad}"
+        if len(prefix) < depth:
+            for ev in ALPHABET:
+                dfs([*prefix, ev])
+
+    for ev in ALPHABET:
+        dfs([ev])
+    return seen
+
+
+def test_every_staleness_history_of_four_events_answers_exactly():
+    assert _exhaust(4) > 100_000
+
+
+def test_a_change_of_conditions_or_a_reset_catches_up_first():
+    for events in (
+        [("pat", 1), ("up", (("x1", 1),), False), ("up", (("x1", None),), True), ("pat", 0)],
+        [
+            ("up", (("k1", 1),), False),
+            ("plan", 2),
+            ("commit", ("k1",), ()),
+            ("up", (("k1", None),), True),
+            ("held",),
+        ],
+    ):
+        oracle.replay_staleness(events)
+
+
+def test_a_failing_keys_outcome_goes_when_upstream_reverts():
+    w = oracle.replay_staleness(
+        [
+            ("up", (("k1", 1),), False),
+            ("plan", 2),
+            ("commit", (), ()),
+            ("up", (("k1", 2),), False),
+            ("plan", 2),
+            ("commit", ("k1",), ()),
+            ("up", (("k1", 1),), False),
+            ("up", (("k1", 2),), False),
+        ]
+    )
+    assert oracle.due(w) == ["k1"]
+
+
+def test_the_oracle_answers_nothing_due_for_a_held_reader():
+    w = oracle.replay_fullrun(
+        [("items", (("k1", True), ("k2", True), ("k3", True))), ("step", "copy", 3), ("full", "copy")]
+    )
+    assert oracle.due(w, "copy") == ["k1", "k2", "k3"] == oracle.next_plan(w, "copy", 3)[0]
+    w.apply(("step", "copy", 1))
+    assert (
+        oracle.held(w, "archive")
+        and oracle.due(w, "archive") == []
+        and oracle.next_plan(w, "archive") == ([], POS)
+    )
+    s = oracle.replay_staleness([("up", (("k1", 1),), False), ("clear", (("k2", 2),), False)])
+    assert oracle.held(s) and oracle.due(s) == []
+
+
+@pytest.mark.parametrize(
+    "events", [REPORT_LOADS_MID_REBUILD, ARCHIVE_LOADS_MID_REBUILD], ids=["report", "archive"]
+)
+def test_a_reader_that_loaded_mid_rebuild_holds_back_after_it_completes(events):
+    assert fullrun.run(events, "clear", "table") is None
+    assert fullrun.run(events, "clear", "table", frozenset({"hold_back"})) is not None
+
+
+def test_a_key_list_counts_as_processed_on_every_input():
+    w = oracle.replay_fullrun(
+        [("items", (("k1", True),)), ("keys", "copy", ("k1",)), ("commit", "copy"), ("feed", (("k1", True),))]
+    )
+    assert w.copy.complete() and not oracle.held(w, "archive")
