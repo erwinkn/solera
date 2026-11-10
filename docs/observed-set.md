@@ -457,7 +457,8 @@ absent, excluded now: nothing. Classing the change under the old patterns
 would have owed an add of an excluded key.
 
 **A definition change.** The definition — the digest of the asset's
-version, input bindings, store version and config — differs, and staleness
+version, input bindings and store version, not the store's config
+(D202) — differs, and staleness
 says *definition changed*. The next run is a full run: `tally`'s first
 commit resets its count, `ctx.load()` having returned `None`; `checks`
 compares against its output index, and its leftover outputs are owed
