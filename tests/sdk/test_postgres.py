@@ -313,6 +313,45 @@ async def test_migration_can_reconcile_drift(store):
     assert await store.load(written.ref, list[dict], None) == [{"id": "a", "v": "1"}]
 
 
+def _versions(store, table) -> list[tuple]:
+    with store._connect() as conn, conn.cursor() as cur:
+        return [tuple(r.values()) for r in cur.execute(f"SELECT id, _version FROM {table} ORDER BY id")]
+
+
+async def test_every_row_carries_the_version_that_wrote_it(store):
+    """docs/stores.md, "What a write and a load say": every write path sets
+    each row's `_version` to its attempt's generation — rows, a patch, a
+    `Sql` query, even one copying `_version` from another table — and a
+    load takes the column off the rows it returns."""
+
+    out = output(key="id", incremental=True)
+    first = await store.store([{"id": "a", "v": "1"}, {"id": "b", "v": "1"}], None, fenced(out, 3))
+    table = first.ref.handle["table"]
+    second = await store.store(Patch([{"id": "b", "v": "2"}]), first.ref, fenced(out, 5))
+    assert _versions(store, table) == [("a", 3), ("b", 5)]
+    assert await store.load(second.ref, list[dict], None) == [{"id": "a", "v": "1"}, {"id": "b", "v": "2"}]
+    copied = output(key="id")
+    sql = await store.store(Sql(f"SELECT * FROM {table}"), None, fenced(copied, 8))
+    assert _versions(store, sql.ref.handle["table"]) == [("a", 8), ("b", 8)]
+    commits = output(incremental=True)
+    batch = await store.store(Patch([{"e": 1}]), None, fenced(commits, 4))
+    with store._connect() as conn, conn.cursor() as cur:
+        found = cur.execute(f"SELECT _version FROM {batch.ref.handle['table']}").fetchall()
+    assert [r["_version"] for r in found] == [4]
+
+
+async def test_a_table_made_before_versions_is_refused(store):
+    """A table without the version column was made before rows carried their
+    version: a write to it is refused, saying to drop it or name another.
+    No backfill: Solera starts fresh at the switch."""
+
+    out = output(key="id")
+    with store._connect() as conn, conn.cursor() as cur:
+        cur.execute(f'CREATE TABLE "{out.name}" (id text, v text)')
+    with pytest.raises(StoreError, match="no _version column.*Drop it, or name a new table"):
+        await store.store([{"id": "a", "v": "1"}], None, context(out))
+
+
 def fenced(out, generation, worker_id="i", partition=""):
     return context(out, partition, generation=generation, worker_id=worker_id)
 

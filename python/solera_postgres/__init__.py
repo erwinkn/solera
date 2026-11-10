@@ -892,7 +892,7 @@ class PostgresStore:
 
         if isinstance(t, type) and issubclass(t, Ref):
             return Read(ref)
-        return await asyncio.to_thread(self._load, ref, t, selection)
+        return await asyncio.to_thread(self._read, ref, t, selection)
 
     @contextlib.asynccontextmanager
     async def reads(self):
@@ -922,7 +922,10 @@ class PostgresStore:
         ).fetchone()
         return None if found is None or found["written"] is None else int(found["written"])
 
-    def _load(self, ref: Ref, t, selection: Keys | Commits | None, conn=None) -> Read:
+    def _load(self, ref: Ref, t, selection: Keys | Commits | None, conn=None) -> Any:
+        return self._read(ref, t, selection, conn).value
+
+    def _read(self, ref: Ref, t, selection: Keys | Commits | None, conn=None) -> Read:
         handle = ref.handle or {}
         with contextlib.nullcontext(conn) if conn else self._connect() as conn, conn.cursor() as cur:
             table = handle.get("table") or _qname(handle.get("schema", "public"), handle["name"])
@@ -1060,7 +1063,7 @@ class _Reader:
         def work():
             with self.conn.cursor() as cur:
                 written = self.store._written(cur, ref)
-            return self.store._load(ref, t, selection, self.conn).value, written
+            return self.store._load(ref, t, selection, self.conn), written
 
         async with self.lock:
             return await asyncio.to_thread(work)

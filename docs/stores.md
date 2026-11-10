@@ -588,6 +588,11 @@ the exact outcome. (`gN` is generation N; content is `{key: v}`, a row
 | all | a write repeated by its attempt lands once | g4 writes {a:1, b:1}; g4 (same worker) writes it again | same ref; a:1, b:1 |
 | all | commits append and load by range | g1 appends commit 3 {a}; g2 commit 4 {b} | whole: a, b; `Commits(4, 4)`: b |
 | all | a replacement resolved writes its keys and removes the rest | g1 writes {a:1, b:1, c:1}; g2 replaces with {a:1, b:2}, resolved against the index | a and b at g2; c removed; a:1, b:2 |
+| all | a write says which keys it wrote and removed | g1 replaces with {c, a, b}; g2 patches b:2, d:1, removes a; load b, c, d as planned | g1 said wrote a, b, c, whole; g2 wrote b, d, removed a; read at b@2, c@1, d@2 |
+| all | a replacement holds exactly its keys at its version | g1 writes {a, b, c}; g2 replaces with {a:2, d:1}, unresolved | said wrote a, d, whole; a and d read at g2; a table holds nothing else |
+| all | an unkeyed read says its version | a value at g3, then g5; commits 3 (g1) and 4 (g2) | reads at 3, then 5; the commits at 2, `Commits(3, 3)` at 1; an unkeyed write says no keys |
+| immutable | a read is at its planned versions | g5 writes {a, b}, plan; g9 patches a:2, removes b; load the plan | a:1, b:1, read at g5, g5 |
+| fenced | a read says what moved since planning | g5 writes {a, b}, plan; g9 patches a:2, removes b; load the plan | a:2; a read at g9, b absent (None) |
 | immutable | a pinned read returns its version | g5 writes {a:1}, pin; g9 writes {a:2} | the pin reads a:1; the new ref a:2 |
 | immutable | cleaning up never takes what is read | g5 writes {a:1}; g7 writes b (never committed); g9 writes {a:2}; clean up a@g5, b@g7 and a name never written, twice | the new ref reads a:2 |
 | fenced | a stale writer is refused | g5 writes {a:1}; g9 acquires, writes {a:2}; g5 writes {a:0} | g5 refused (`StoreError`); a:2 |
@@ -629,7 +634,9 @@ async def test_my_store_conforms(worker, scenario):
 store as the engine does — keyed writes as `KeyedWrite`s resolved against a
 key index the kit keeps, keyed loads through `Keys` — and raise
 `AssertionError` with the scenario's expectation when the store answers
-otherwise. FileStore, S3Store, PostgresStore and the example SQL store
+otherwise. Every scenario that writes a keyed output or loads checks the
+new answers too (`Written.changed`, `read`), as does the generated
+machine (`solera.testing.storemachine`) after every step. FileStore, S3Store, PostgresStore and the example SQL store
 pass it in Solera's own tests (`tests/sdk/test_store_conformance.py`),
 where the example store with its fence left out fails it.
 
