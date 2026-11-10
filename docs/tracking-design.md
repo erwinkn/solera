@@ -1229,6 +1229,41 @@ D191 builds it: per per-key partition, the failing keys ordered by the
 time their retry comes due, so a plan reads only the keys due now and
 the engine wakes at the next due time.
 
+### As built (B6)
+
+In `native/tracking/src/outcomes/` (records, the transition table, the
+commit and the catch-up) and `due/` (the retry clock and passes), as
+described above, with these choices:
+
+- **Records are core outputs**, change-indexed like any output: `\0f` +
+  edge holds each failing key's record (its stored outcome, what it was
+  tried on, what the consumer holds), `\0d` + edge the retry clock (due
+  time, then key), `\0p` + edge a pass's key list. A record carries what
+  the consumer holds, so the failed point B3 writes is dropped where the
+  piece says what the key was tried on. A key loaded at another version
+  keeps its point.
+- **Retries come from passes.** A change batch never takes a failing key
+  whose input is unchanged; a pass does, in key order. By the clock it
+  lists the keys due now; after a deploy or a forced request it walks the
+  records. What the last pass covers is lowered to the counters of any
+  record written or found waiting again since (§9's deploy_min), so no
+  deploy's retry is lost.
+- **Moot is found by a catch-up**: one window read of the input's new
+  commits, plus a scan of the records when the conditions move. The
+  engine catches up before it plans, counts or commits, and on each side
+  of a change of conditions.
+- **A commit is built from a view and applied under the lock**, and is
+  refused when what it read moved: the records of its keys, the input
+  (when a key failed), where reverts were last looked for, the pass, or
+  the edge's life (given once, at open and at each reset or rename).
+- **N6 at 100 million keys**: 367,000 due keys a second, warm retry batches
+  of 17–24 ms. Failures older than the input's last merge are read by a
+  lookup at the head instead of a window: 72,700 keys a second, 118–132 ms
+  a batch, accepted as measured (Captain, 2026-11-10).
+- **Not built yet: the hold-back at commit** (D205, §10): it needs B3's
+  report to name held-back keys, which comes with clears. Until then the
+  engine must not commit a batch that held keys back.
+
 ## 12. History
 
 **Settled (D180):** while a run is in history, everything about it is

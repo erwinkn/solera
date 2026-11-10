@@ -136,5 +136,6 @@ def backoff(tries: int) -> float:
     """Seconds before the next try after `tries` transient failures: one
     minute, doubling, at most six hours."""
 
-    doublings = min(max(tries - 1, 0), 32)  # past the cap long before: never overflows
-    return min(BACKOFF_FIRST * 2**doublings, BACKOFF_MAX)
+    from . import _native  # the core's definition (native/tracking, outcomes/transition.rs)
+
+    return _native.outcome_backoff(max(int(tries), 0))
