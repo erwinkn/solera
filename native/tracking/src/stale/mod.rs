@@ -20,8 +20,10 @@
 //!   produces them, with no index read, for every current edge reading that
 //!   output. Its parts go into the commit's own event.
 //!
-//! A [`Witness`] part applies only if the edge's generation is still the one
-//! it was computed for, and never moves `x` back: a part computed against
+//! Generations are drawn from one counter and never reused, so a part
+//! computed for an edge since closed never applies to one reopened under its
+//! name. A [`Witness`] part applies only if the edge's generation is still the
+//! one it was computed for, and never moves `x` back: a part computed against
 //! progress that has since moved is dropped, and the next refresh recomputes
 //! it. So a lost or late notice can delay an answer but never change it
 //! (the amendment's rule 7).
@@ -167,7 +169,7 @@ impl Input {
         self.known.as_ref().filter(|k| k.gen == self.gen)
     }
 
-    fn moved(&mut self, r: Option<&KeyRange>) {
+    fn moved(&mut self, gen: u64, r: Option<&KeyRange>) {
         if self.current().is_some() {
             self.changed = Changed::Ranges(vec![]);
         }
@@ -175,7 +177,7 @@ impl Input {
             Some(r) => self.changed.add(r),
             None => self.changed = Changed::All,
         }
-        self.gen += 1;
+        self.gen = gen;
     }
 }
 
@@ -185,6 +187,8 @@ pub struct Stale {
     pub inputs: BTreeMap<Id, Input>,
     /// Outputs whose full run has started and not completed (rule 8).
     pub incomplete: BTreeSet<Id>,
+    /// The last generation given out.
+    pub gens: u64,
 }
 
 impl Stale {
@@ -198,25 +202,33 @@ impl Stale {
     pub(crate) fn touch(&mut self, p: &Part) {
         match p {
             Part::EdgeOpen(o) if o.keyed => {
-                self.inputs.insert(o.edge.clone(), Input::default());
+                self.gens += 1;
+                let i = Input {
+                    gen: self.gens,
+                    ..Input::default()
+                };
+                self.inputs.insert(o.edge.clone(), i);
             }
             Part::EdgeClose(c) => {
                 self.inputs.remove(&c.edge);
             }
             Part::EdgeRename(r) => {
                 if let Some(mut i) = self.inputs.remove(&r.from) {
-                    i.moved(None);
+                    self.gens += 1;
+                    i.moved(self.gens, None);
                     self.inputs.insert(r.to.clone(), i);
                 }
             }
             Part::Reset(r) => {
                 if let Some(i) = self.inputs.get_mut(&r.edge) {
-                    i.moved(None);
+                    self.gens += 1;
+                    i.moved(self.gens, None);
                 }
             }
             Part::Batch(b) => {
                 if let Some(i) = self.inputs.get_mut(&b.edge) {
-                    i.moved((!b.reset).then_some(&b.range));
+                    self.gens += 1;
+                    i.moved(self.gens, (!b.reset).then_some(&b.range));
                 }
             }
             _ => {}
@@ -259,6 +271,7 @@ impl Stale {
         for o in &self.incomplete {
             e.bytes(o);
         }
+        e.uv(self.gens);
     }
 
     pub(crate) fn decode(d: &mut Dec<'_>) -> Result<Stale> {
@@ -302,6 +315,7 @@ impl Stale {
         for _ in 0..d.count()? {
             s.incomplete.insert(d.bytes()?.into());
         }
+        s.gens = d.uv()?;
         Ok(s)
     }
 }
@@ -404,7 +418,8 @@ impl SetWatch {
         let i = t.stale.inputs.get_mut(&self.edge).expect("checked");
         if i.watch.as_ref() != Some(&self.watch) {
             i.watch = Some(self.watch);
-            i.moved(None);
+            t.stale.gens += 1;
+            i.moved(t.stale.gens, None);
         }
     }
 }
@@ -418,6 +433,10 @@ pub struct Witness {
     /// The upstream commit it holds as of.
     pub x: u64,
     pub state: State,
+    /// A failed key's retry came due: what is due changed with no change to
+    /// progress, so the part starts a new generation and every part computed
+    /// before it is dropped.
+    pub retry: bool,
 }
 
 impl Witness {
@@ -426,6 +445,7 @@ impl Witness {
         e.uv(self.gen);
         e.uv(self.x);
         encode_state(e, &self.state);
+        e.u8(self.retry as u8);
     }
 
     pub fn decode(d: &mut Dec<'_>) -> Result<Witness> {
@@ -434,6 +454,7 @@ impl Witness {
             gen: d.uv()?,
             x: d.uv()?,
             state: decode_state(d)?,
+            retry: bool_of(d)?,
         })
     }
 
@@ -461,8 +482,12 @@ impl Witness {
             }
             (s, _) => s,
         };
+        if self.retry {
+            t.stale.gens += 1;
+            i.gen = t.stale.gens;
+        }
         i.known = Some(Known {
-            gen: self.gen,
+            gen: i.gen,
             x: self.x,
             state,
         });
@@ -508,7 +533,8 @@ impl Incomplete {
             if e.input == self.output {
                 if let Some(i) = t.stale.inputs.get_mut(id) {
                     if i.watch.as_ref().is_some_and(|w| w.gate) {
-                        i.moved(None);
+                        t.stale.gens += 1;
+                        i.moved(t.stale.gens, None);
                     }
                 }
             }

@@ -189,23 +189,27 @@ pub(crate) fn status<'py>(
     Ok(out)
 }
 
-/// How many keys the edge owes, by class; cached until it or its upstream moves.
+/// How many keys the edge owes, by class; cached until it or its upstream
+/// moves. None while the gate holds it (D197).
 pub(crate) fn count<'py>(
     py: Python<'py>,
     state: &RwLock<tr::Tracking>,
     ixs: &dyn Indexes,
     counts: &Counts,
     edge: Vec<u8>,
-) -> PyResult<Bound<'py, PyDict>> {
+) -> PyResult<Option<Bound<'py, PyDict>>> {
     let ask = state.read().unwrap().stale_ask(&edge).map_err(err)?;
-    let n = py
+    let Some(n) = py
         .detach(|| rt().block_on(counts.get(&ask, ixs)))
-        .map_err(err)?;
+        .map_err(err)?
+    else {
+        return Ok(None);
+    };
     let d = PyDict::new(py);
     for (name, v) in ["added", "updated", "removed"].into_iter().zip(n) {
         d.set_item(name, v)?;
     }
-    Ok(d)
+    Ok(Some(d))
 }
 
 /// A page of the keys the edge owes: `([(key, class), ...], next)`.

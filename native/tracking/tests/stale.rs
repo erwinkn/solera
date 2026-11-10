@@ -61,6 +61,7 @@ fn witness(t: &Tracking, x: u64, state: State) -> Part {
         gen: t.stale.inputs[EDGE].gen,
         x,
         state,
+        retry: false,
     })
 }
 
@@ -135,6 +136,49 @@ fn a_witness_applies_only_to_the_generation_it_was_computed_for() {
 }
 
 #[test]
+fn a_retry_drops_every_part_computed_before_it() {
+    let mut t = opened();
+    know(&mut t, 1, State::Fresh);
+    let notice = witness(&t, 2, State::Fresh);
+    let retry = Part::Witness(Witness {
+        edge: EDGE.into(),
+        gen: t.stale.inputs[EDGE].gen,
+        x: 1,
+        state: stale("k1", 10),
+        retry: true,
+    });
+    apply(&mut t, vec![retry]);
+    apply(&mut t, vec![notice]);
+    let k = t.stale.inputs[EDGE].current().unwrap();
+    assert_eq!(
+        (k.x, &k.state),
+        (1, &stale("k1", 10)),
+        "a notice built before the retry came due does not make the edge fresh"
+    );
+}
+
+#[test]
+fn a_reopened_edge_never_takes_a_part_for_the_edge_closed_under_its_name() {
+    let mut t = opened();
+    let old = witness(&t, 1, State::Fresh);
+    apply(
+        &mut t,
+        vec![Part::EdgeClose(EdgeClose { edge: EDGE.into() })],
+    );
+    apply(
+        &mut t,
+        vec![Part::EdgeOpen(EdgeOpen {
+            edge: EDGE.into(),
+            input: ITEMS.into(),
+            keyed: true,
+        })],
+    );
+    apply(&mut t, vec![watch(&Arc::default())]);
+    apply(&mut t, vec![old]);
+    assert!(t.stale.inputs[EDGE].current().is_none());
+}
+
+#[test]
 fn every_change_to_progress_or_conditions_moves_the_edge() {
     let mut t = opened();
     let gen = |t: &Tracking| t.stale.inputs[EDGE].gen;
@@ -194,6 +238,14 @@ fn the_gate_holds_readers_of_an_incomplete_upstream_and_releases_them_to_a_probe
     };
     apply(&mut t, vec![on(true)]);
     assert_eq!(t.stale_status(EDGE).unwrap(), Status::Held);
+    let (rt, ix) = index();
+    let ask = t.stale_ask(EDGE).unwrap();
+    assert_eq!(
+        rt.block_on(stale::Counts::default().get(&ask, &OneIndex(&ix)))
+            .unwrap(),
+        None,
+        "a held edge has no count (D197)"
+    );
     apply(&mut t, vec![on(false)]);
     assert_eq!(t.stale_status(EDGE).unwrap(), Status::Unknown);
     assert_eq!(t.stale.inputs[EDGE].changed, stale::Changed::All);
@@ -417,7 +469,7 @@ fn a_refresh_catches_up_over_commits_and_batches_at_once() {
     let counts = stale::Counts::default();
     assert_eq!(
         rt.block_on(counts.get(&ask, &OneIndex(&ix))).unwrap(),
-        [0, 0, 1, 0]
+        Some([0, 0, 1, 0])
     );
     assert!(rt.block_on(ask.complete(&OneIndex(&ix))).unwrap());
     apply(

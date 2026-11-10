@@ -748,12 +748,16 @@ generation, as of one upstream commit.
   dropped and recomputed. A lost or late notice delays an answer, never
   changes it.
 - **Retries** (rule 5): a failed key whose retry came due makes a fresh edge
-  stale; at startup the engine applies it to every retry already due.
+  stale, and starts a new generation, since what is due changed with no
+  change to progress; at startup the engine applies it to every retry
+  already due. Generations come from one counter and are never reused, so
+  a part for an edge since closed never applies to one reopened under its
+  name.
 - **The gate** (rule 8): one event per output marks its full run started or
   completed; meanwhile readers that keep the gate read "held: upstream
   incomplete", and when it lifts they are probed again.
 - **Counts** are the planner's owed count, cached until the edge's
-  generation or its upstream's head moves. One reason per edge (the
+  generation or its upstream's head moves; a held edge has none (D197). One reason per edge (the
   witness's); one witness per kind of reason is not built.
 
 At 100M keys (`bench/core/stale/`): a notice costs 0.08 to 0.18 µs per

@@ -674,8 +674,13 @@ impl Tracking {
         guard(|| crate::stale_py::status(py, &self.state, edges))
     }
 
-    /// B7: how many keys `edge` owes, by class; cached until it or its upstream moves.
-    fn stale_count<'py>(&self, py: Python<'py>, edge: Vec<u8>) -> PyResult<Bound<'py, PyDict>> {
+    /// B7: how many keys `edge` owes, by class; cached until it or its upstream
+    /// moves. None while the gate holds it (D197).
+    fn stale_count<'py>(
+        &self,
+        py: Python<'py>,
+        edge: Vec<u8>,
+    ) -> PyResult<Option<Bound<'py, PyDict>>> {
         let ixs = self.indexes.read().unwrap().clone();
         guard(|| crate::stale_py::count(py, &self.state, ixs.as_ref(), &self.counts, edge))
     }

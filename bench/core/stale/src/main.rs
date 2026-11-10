@@ -119,6 +119,7 @@ fn state(
                 gen,
                 x: *x,
                 state: s.clone(),
+                retry: false,
             })]))
             .unwrap();
         }
@@ -176,7 +177,7 @@ fn main() {
                 if pass != "cached" {
                     counts.retain(&Tracking::new());
                 }
-                let n = rt.block_on(counts.get(&ask, &OneIndex(&ix))).unwrap();
+                let n = rt.block_on(counts.get(&ask, &OneIndex(&ix))).unwrap().unwrap();
                 let (wall, cpu) = (t0.elapsed().as_secs_f64(), proc_cpu() - c0);
                 let s = ix.store.stats.counts();
                 emit(

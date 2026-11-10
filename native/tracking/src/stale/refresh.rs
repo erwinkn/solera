@@ -255,6 +255,7 @@ pub async fn refresh(
         gen: i.gen,
         x: ask.head,
         state: since(state, time_ms),
+        retry: false,
     }))
 }
 
@@ -296,6 +297,7 @@ pub async fn retry_due(
                 gen: ask.input.gen,
                 x: ask.head,
                 state: since(state, time_ms),
+                retry: true,
             }));
         }
     }
@@ -352,6 +354,7 @@ pub fn notice(t: &Tracking, output: &[u8], commit: u64, entries: &Run, time_ms: 
             gen: i.gen,
             x: commit,
             state,
+            retry: false,
         }));
     }
     parts

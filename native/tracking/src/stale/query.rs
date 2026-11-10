@@ -77,6 +77,7 @@ impl Tracking {
 
 /// Owed counts by class (added, updated, removed), computed on request and
 /// kept until the edge's progress, its conditions or its upstream's head move.
+/// While the gate holds the edge there is no number (D197): None.
 #[derive(Default)]
 pub struct Counts(Mutex<HashMap<Id, Counted>>);
 
@@ -84,11 +85,14 @@ pub struct Counts(Mutex<HashMap<Id, Counted>>);
 type Counted = (u64, u64, [u64; 4]);
 
 impl Counts {
-    pub async fn get(&self, ask: &Ask, ixs: &dyn Indexes) -> Result<[u64; 4]> {
+    pub async fn get(&self, ask: &Ask, ixs: &dyn Indexes) -> Result<Option<[u64; 4]>> {
+        if ask.held {
+            return Ok(None);
+        }
         let at = (ask.input.gen, ask.head);
         if let Some(&(g, h, n)) = self.0.lock().unwrap().get(&ask.edge) {
             if (g, h) == at {
-                return Ok(n);
+                return Ok(Some(n));
             }
         }
         let n = owed_count(&ask.view, &ask.req, ixs).await?;
@@ -96,7 +100,7 @@ impl Counts {
             .lock()
             .unwrap()
             .insert(ask.edge.clone(), (at.0, at.1, n));
-        Ok(n)
+        Ok(Some(n))
     }
 
     /// Drops what is kept for edges that are gone.
