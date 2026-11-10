@@ -529,11 +529,17 @@ these additions:
   every key it loaded at another version than it planned while its input's
   output is mid full run (`Output.full_run`, B4) or when a clear came in
   since the batch's head (the layers' `clears`): the key keeps what it held,
-  even if it also failed, and stays owed. On such an input it also holds
-  back every key of the batch that input did not take (another input did):
-  the worker loaded it there with no planned version to check the load
-  against. A key held back on one input is held back on every input of the
-  batch, since its output is one value computed from all of them.
+  even if it also failed. A key that was owed stays owed; one taken
+  unchanged (by mode all or a key list) already holds what is current. On
+  such an input it also holds back every key of the batch that the input's
+  patterns take but the input did not (another input did): a load of it
+  there would have no planned version to check against. A key those
+  patterns do not take is not held back for that input. This rests on a
+  contract the engine keeps (B5, B6): on each input, a worker loads only
+  keys that the patterns the batch was planned under take (today, only the
+  keys the input took). A key held back on one input is held back on every
+  input of the batch, since its output is one value computed from all of
+  them.
   `Ops.held_back` names those keys for the key outcomes (B6), and their
   points carry their own reason, `Unsettled`, apart from the planner's
   `HeldBack`, so lineage can tell a key the batch never took from one it
@@ -541,7 +547,8 @@ these additions:
   is the engine's (B5).
 - **The commit is fenced against what decides a hold-back.** A batch that
   kept a key on a settled input that it would have held back had the input
-  been unsettled (loaded at another version, or not taken there) carries a
+  been unsettled (loaded at another version, or not taken there though its
+  patterns take it) carries a
   fence: that input's output and the head it planned at. The event is
   refused if the edge reads another output by then, or the input has become
   unsettled. A batch that held all such keys back carries no fence for that
@@ -1240,16 +1247,20 @@ upstream's clear still makes its consumer run full (INC-13 stays).
    than it planned, if its upstream is incomplete, **or if a clear has
    come since the batch planned** (in the commits after its head H), even
    when that rebuild has completed by the time the batch commits. The key
-   keeps its old point and stays owed; a later batch retries it. A key held
-   back on any input of a batch is held back on every input of that batch,
-   because the key's output is one value computed from all its inputs:
-   holding it back on one input only would either keep an output built on
+   keeps its old point and stays owed; a later batch retries it. On an
+   upstream that is incomplete or cleared since H, a key that another input
+   of the batch took and whose version on this one the batch never planned
+   is held back too, when this input's planned patterns take it: a load of
+   it here could not be checked. A key held back on any input of a batch is
+   held back on every input of that batch, because the key's output is one
+   value computed from all its inputs: holding it back on one input only
+   would either keep an output built on
    a load from the middle of a rebuild, or throw that output away while the
    other inputs record their new versions as processed, so the key would
    never be retried for them. On stores that name objects by version a load
    is exact, so this never fires. On a table it is the same rule as §8's
-   rule 4, and is built as one rule with it. To tell which rebuild, if any, a key loaded as absent belongs to,
-   the engine looks at the commit that last removed it (by a clear or by
+   rule 4, and is built as one rule with it. To tell which rebuild, if any,
+   a key loaded as absent belongs to, the engine looks at the commit that last removed it (by a clear or by
    an ordinary removal): the last removal at or before H when the batch
    planned the key absent, and, only on a table for a key planned present
    that loads absent, the last removal at load time. It records this when
@@ -1414,6 +1425,18 @@ described above, with these choices:
 - **The hold-back at commit** (D205, §10): a key in B3's `Ops.held_back`
   keeps its record as it is, failed or not, and B3's `Unsettled` point
   stands.
+- **A retry on a consumer with several keyed inputs takes the key on
+  every one of them** (`due::plan_all`): the pass's input gets the pass's
+  key list, each other keyed input the same keys at its head, and the
+  worker loads and reports the key on each. So the union hold-back rule
+  applies unchanged, and only the pass's input moves the pass on
+  (`PassId` names its edge); unkeyed inputs are planned as for any batch.
+  A key held back while its own input read it as planned, at the version
+  its record failed on (another input moved), was not retried and its
+  input did not move, so it lowers what the pass covers like a record
+  written, and the next pass takes it again. So while one of a consumer's
+  keyed inputs is mid full run, the engine starts no retry pass for the
+  consumer: each would be held back and come due again at once.
 
 ## 12. History
 

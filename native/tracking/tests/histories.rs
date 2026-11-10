@@ -1045,10 +1045,21 @@ fn a_key_held_back_at_commit_is_recorded_apart_from_one_the_planner_held_back() 
         let Part::Batch(b) = &ops.parts[0] else {
             panic!("a batch part");
         };
-        let reasons: Vec<_> = b.points.iter().map(|(k, p)| (k.clone(), p.reason)).collect();
-        let want = vec![(key("k1"), Reason::Unsettled), (key("k2"), Reason::HeldBack)];
+        let reasons: Vec<_> = b
+            .points
+            .iter()
+            .map(|(k, p)| (k.clone(), p.reason))
+            .collect();
+        let want = vec![
+            (key("k1"), Reason::Unsettled),
+            (key("k2"), Reason::HeldBack),
+        ];
         assert_eq!(reasons, want);
-        let rec: Vec<_> = ops.records[0].points.iter().map(|(k, p)| (k.clone(), p.reason)).collect();
+        let rec: Vec<_> = ops.records[0]
+            .points
+            .iter()
+            .map(|(k, p)| (k.clone(), p.reason))
+            .collect();
         assert_eq!(rec, want, "the record tells the two apart");
     });
 }

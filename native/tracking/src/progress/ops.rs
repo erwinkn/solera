@@ -32,10 +32,10 @@ pub struct Ops {
     pub records: Vec<Record>,
     /// Per keyed input, sorted: the keys this commit held back. On an input
     /// whose output was mid full run, or cleared since the plan's head, a key
-    /// loaded at another version than planned, or a key of the batch the
-    /// input did not take (its load there had no planned version to check),
-    /// is held back on every input of the batch, since its output is one
-    /// value computed from all of them.
+    /// loaded at another version than planned, or a key of the batch that the
+    /// input's patterns take but the input did not (a load of it there would
+    /// have no planned version to check), is held back on every input of the batch,
+    /// since its output is one value computed from all of them.
     /// Each keeps what it held; whether it failed is not recorded.
     pub held_back: Vec<Vec<Key>>,
 }
@@ -86,7 +86,10 @@ impl Tracking {
                 .get(&p.edge)
                 .and_then(|e| Some((&e.input, e.progress.keyed()?)))
             else {
-                return invalid(format!("no keyed edge {}", String::from_utf8_lossy(&p.edge)));
+                return invalid(format!(
+                    "no keyed edge {}",
+                    String::from_utf8_lossy(&p.edge)
+                ));
             };
             if **input != *p.output {
                 return invalid("the edge reads another output than the batch planned");
@@ -112,7 +115,12 @@ impl Tracking {
             .zip(reports)
             .map(|(p, r)| {
                 moved(p, r)
-                    .chain(batch.iter().copied().filter(|k| !taken(p, k)))
+                    .chain(
+                        batch
+                            .iter()
+                            .copied()
+                            .filter(|k| !taken(p, k) && p.conditions.patterns.takes(k)),
+                    )
                     .collect()
             })
             .collect();
@@ -274,12 +282,10 @@ fn moved<'a>(p: &'a InputPlan, r: &'a InputReport) -> impl Iterator<Item = &'a K
     r.loaded
         .iter()
         .filter(|(k, got)| {
-            p.keys
-                .binary_search_by(|c| c.key.cmp(k))
-                .is_ok_and(|i| {
-                    let wanted = Holding::of(p.keys[i].version.as_version(), &p.conditions, k);
-                    owed(&Holding::of(got.as_version(), &p.conditions, k), &wanted)
-                })
+            p.keys.binary_search_by(|c| c.key.cmp(k)).is_ok_and(|i| {
+                let wanted = Holding::of(p.keys[i].version.as_version(), &p.conditions, k);
+                owed(&Holding::of(got.as_version(), &p.conditions, k), &wanted)
+            })
         })
         .map(|(k, _)| k)
 }
