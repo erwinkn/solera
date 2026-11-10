@@ -58,6 +58,18 @@ impl Tracking {
     }
 
     pub fn apply_event(&mut self, ev: Event) -> Result<()> {
+        let mut touched = std::collections::HashSet::new();
+        for p in &ev.parts {
+            for t in p.touches() {
+                if !touched.insert(t) {
+                    return crate::error::invalid(format!(
+                        "two parts of one event change {} {}",
+                        t.0,
+                        String::from_utf8_lossy(t.1)
+                    ));
+                }
+            }
+        }
         for p in &ev.parts {
             self.check(p)?;
         }
@@ -139,7 +151,7 @@ impl Tracking {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::progress::{EdgeClose, EdgeOpen};
+    use crate::progress::{EdgeClose, EdgeOpen, Reset};
 
     #[test]
     fn events_and_snapshots_round_trip() {
@@ -175,6 +187,52 @@ mod tests {
         assert!(Event::decode(&[FORMAT_BAD]).is_err());
         assert!(Event::decode(&[crate::event::FORMAT]).is_err());
         assert!(Event::decode(&[crate::event::FORMAT, 0x7f, 0]).is_err());
+    }
+
+    #[test]
+    fn an_event_that_changes_one_edge_twice_is_refused_whole() {
+        let mut t = Tracking::new();
+        let e = || b"e".as_slice().into();
+        t.apply(
+            &Event::of(vec![Part::EdgeOpen(EdgeOpen {
+                edge: e(),
+                input: b"items".as_slice().into(),
+                keyed: true,
+            })])
+            .encode(),
+        )
+        .unwrap();
+        let before = t.snapshot();
+        let both = Event::of(vec![
+            Part::EdgeClose(EdgeClose { edge: e() }),
+            Part::Reset(Reset {
+                edge: e(),
+                held: false,
+            }),
+        ]);
+        assert!(t.apply(&both.encode()).is_err());
+        assert_eq!(t.snapshot(), before);
+        let twice = Event::of(vec![
+            Part::Reset(Reset {
+                edge: e(),
+                held: true,
+            }),
+            Part::Reset(Reset {
+                edge: e(),
+                held: false,
+            }),
+        ]);
+        assert!(t.apply(&twice.encode()).is_err());
+        assert_eq!(t.snapshot(), before);
+    }
+
+    #[test]
+    fn a_varint_past_64_bits_is_refused() {
+        let mut b = vec![0xff; 9];
+        b.push(0x01);
+        assert_eq!(crate::codec::Dec::new(&b).uv().unwrap(), u64::MAX);
+        *b.last_mut().unwrap() = 0x7f;
+        assert!(crate::codec::Dec::new(&b).uv().is_err());
     }
 
     const FORMAT_BAD: u8 = 99;

@@ -35,14 +35,17 @@ pub enum Pat {
     Regex(String),
 }
 
+/// One pattern, compiled. A `Regex` is in the Rust `regex` dialect, matched
+/// against the whole key: matching is linear in the key, so lookaround and
+/// backreferences are refused.
 #[derive(Clone, Debug)]
-enum Matcher {
+pub enum Matcher {
     Glob(Glob),
     Regex(regex::bytes::Regex),
 }
 
 impl Matcher {
-    fn new(p: &Pat) -> Result<Matcher> {
+    pub fn new(p: &Pat) -> Result<Matcher> {
         Ok(match p {
             Pat::Glob(g) => match Glob::new(g) {
                 Ok(g) => Matcher::Glob(g),
@@ -50,12 +53,18 @@ impl Matcher {
             },
             Pat::Regex(r) => match regex::bytes::Regex::new(&format!(r"(?s)\A(?:{r})\z")) {
                 Ok(re) => Matcher::Regex(re),
-                Err(e) => return invalid(format!("pattern Regex({r:?}): {e}")),
+                Err(e) => {
+                    return invalid(format!(
+                        "pattern Regex({r:?}) is not in Solera's regex dialect (Rust `regex`, \
+                         matched against the whole key; lookaround and backreferences are not \
+                         supported): {e}"
+                    ))
+                }
             },
         })
     }
 
-    fn matches(&self, key: &[u8]) -> bool {
+    pub fn matches(&self, key: &[u8]) -> bool {
         match self {
             Matcher::Glob(g) => g.matches(key),
             Matcher::Regex(r) => r.is_match(key),
@@ -484,7 +493,11 @@ impl KeyRange {
         };
         let lo = one()?;
         let hi = one()?;
-        Ok(KeyRange { lo, hi })
+        let r = KeyRange { lo, hi };
+        if r.is_empty() {
+            return format("a range whose low end is not below its high end");
+        }
+        Ok(r)
     }
 
     fn bounds(&self) -> (Bound<&[u8]>, Bound<&[u8]>) {
@@ -673,7 +686,10 @@ impl Keyed {
         &'a self,
         r: &'a KeyRange,
     ) -> impl Iterator<Item = (&'a Key, &'a Point)> + 'a {
-        self.points.range::<[u8], _>(r.bounds())
+        (!r.is_empty())
+            .then(|| self.points.range::<[u8], _>(r.bounds()))
+            .into_iter()
+            .flatten()
     }
 
     pub fn slice(&self, r: &KeyRange) -> Slice {

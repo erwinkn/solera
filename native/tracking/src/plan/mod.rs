@@ -791,6 +791,9 @@ pub async fn owed_keys(
     after: Option<&Key>,
     limit: usize,
 ) -> Result<(Vec<Cand>, Option<Key>)> {
+    if limit == 0 {
+        return invalid("a page of owed keys holds at least one key");
+    }
     let mut found = Found::new(limit.saturating_add(1), true);
     walker(view, req, ixs)?.walk(after, &mut found).await?;
     let mut keys = found.keys;
