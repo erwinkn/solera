@@ -2,10 +2,12 @@
 
 import os
 import uuid
+from types import SimpleNamespace
 
 import pytest
 from solera.sdk import Incremental, Output, Project, asset
 from solera.stores import FileStore, Patch
+from solera.testing.stores import Ledger, context, now, rows, write
 
 DSN = os.environ.get("SOLERA_TEST_DATABASE_URL")
 
@@ -72,6 +74,32 @@ async def test_sto_6_writes_mean_the_same_on_every_store(solera, store):
     value["v"] = Patch({"e": [], "f": [{"v": "1"}]})  # a key with no rows does not exist
     await solera.run("items")
     assert await content(solera) == {"c": ["2"], "f": ["1"]}
+
+
+async def test_sto_6_the_same_attempt_writing_again_is_one_write(store):
+    """A retried call: the same attempt — one generation, one worker — gives
+    the store the same write twice, as the worker does
+    (`solera.testing.stores`). A replacement, a patch and an incremental
+    output's commit each land once: the same ref, their rows once."""
+
+    store, decl = store
+    h = SimpleNamespace(store=store)
+    out, ledger = Output(f"t_{uuid.uuid4().hex[:12]}", key="id", store="s", **decl), Ledger()
+    content = [{"id": "a", "v": "1"}, {"id": "b", "v": "1"}]
+    first = await write(h, out, content, 1, ledger)
+    assert await write(h, out, content, 1, ledger) == first
+    assert await now(h, first, ledger) == [("a", "1"), ("b", "1")]
+    patch = [{"id": "b", "v": "2"}, {"id": "c", "v": "1"}]
+    second = await write(h, out, patch, 2, ledger, first, remove=["a"], patch=True)
+    assert await write(h, out, patch, 2, ledger, first, remove=["a"], patch=True) == second
+    assert await now(h, second, ledger) == [("b", "2"), ("c", "1")]
+
+    out = Output(f"t_{uuid.uuid4().hex[:12]}", incremental=True, store="s", **decl)
+    commit = [{"id": "a", "v": "1"}]
+    first = await store.store(Patch(commit), None, context(out, 1, commit_number=3))
+    again = await store.store(Patch(commit), None, context(out, 1, commit_number=3))
+    assert again.ref == first.ref
+    assert await rows(h, again.ref, None) == [("a", "1")]
 
 
 async def test_sto_6_a_key_given_no_rows_does_not_exist(solera):

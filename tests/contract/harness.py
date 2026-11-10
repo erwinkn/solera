@@ -498,17 +498,12 @@ class Solera:
         the attempt's routes while an engine serves and through the object
         store alone while none does: its exit code."""
 
-        from solera import lifecycle
-        from solera_server.api import local_transport
         from solera_worker.channel import AttemptChannel
         from solera_worker.worker import run_attempt
 
         attempt, channel = stage["attempt"], None
         if self.engine is not None:
-            token = lifecycle.token(self.engine.secret, attempt)
-            channel = AttemptChannel(
-                local_transport(self.engine, token), self.project.manifest["name"], attempt
-            )
+            channel = AttemptChannel(self._worker_transport(), self.project.manifest["name"], attempt)
         return await run_attempt(
             stage["objects"],
             attempt,
@@ -555,7 +550,11 @@ class Solera:
     async def serve_process(self, **env):
         """`solera serve` as its own process, as an operator starts it, on a
         state beside this namespace's (`env` adds to its environment): the
-        process, once it listens."""
+        process, once it listens. `solera serve` runs today's engine until the
+        switch (build plan rule 4): on another path there is none to start."""
+
+        if self.path != "today":
+            pytest.skip("solera serve runs today's engine until the switch (build plan rule 4)")
 
         import os
         import socket
@@ -603,6 +602,52 @@ class Solera:
             subprocess.run, command, env={**os.environ}, capture_output=True, text=True, timeout=120
         )
         return done.returncode, done.stdout, done.stderr
+
+    def watch_state(self):
+        """What the namespace's storage is asked from here on, as its disk
+        sees it (inotify): `.requests()` counts every open of a file or a
+        directory (a read, a write, a listing) and every rename or delete
+        since the last call."""
+
+        import ctypes
+        import os
+        import struct
+
+        libc = ctypes.CDLL(None, use_errno=True)
+        fd = libc.inotify_init1(os.O_NONBLOCK | os.O_CLOEXEC)
+        assert fd >= 0, os.strerror(ctypes.get_errno())
+        opened, moved, created, deleted = 0x20, 0x80, 0x100, 0x200
+        mask = opened | moved | created | deleted
+        watched: dict[int, str] = {}
+
+        def add(path) -> None:
+            for where, _, _ in os.walk(path):
+                watched[libc.inotify_add_watch(fd, os.fsencode(where), mask)] = where
+
+        add(self.root / "state")
+
+        class Watch:
+            def requests(self) -> int:
+                seen = 0
+                while True:
+                    try:
+                        data = os.read(fd, 1 << 16)
+                    except BlockingIOError:
+                        return seen
+                    at = 0
+                    while at < len(data):
+                        wd, event, _, size = struct.unpack_from("iIII", data, at)
+                        name = data[at + 16 : at + 16 + size].rstrip(b"\0")
+                        at += 16 + size
+                        if event & created and event & 0x40000000:  # a new directory: watch it too
+                            add(os.path.join(watched[wd], os.fsdecode(name)))
+                        if event & (opened | moved | deleted):
+                            seen += 1
+
+            def close(self) -> None:
+                os.close(fd)
+
+        return Watch()
 
     def refuse_upkeep(self, output: str, refused: bool = True) -> None:
         """The namespace's object store refuses (or takes again) the writes
