@@ -505,6 +505,7 @@ fn index(rng: &mut SmallRng, rt: &tokio::runtime::Runtime) -> ChangeIndex {
             disk: rng.random_bool(0.3).then(|| DiskOptions {
                 dir: scratch("oracle").join(rng.random::<u64>().to_string()),
                 bytes: [1_000, 1 << 30][rng.random_range(0..2)],
+                store: "oracle".into(),
             }),
         },
     )
@@ -596,6 +597,7 @@ fn the_disk_cache_serves_reads_after_a_write_and_after_a_restart() {
             disk: Some(DiskOptions {
                 dir: disk.to_path_buf(),
                 bytes: 1 << 30,
+                store: "t".into(),
             }),
             ..Default::default()
         };
@@ -671,6 +673,7 @@ fn bad_references_and_abandoned_reads_leave_the_index_working() {
             disk: disk.map(|dir| DiskOptions {
                 dir,
                 bytes: 1 << 30,
+                store: prefix.into(),
             }),
             ..Default::default()
         };
@@ -814,6 +817,7 @@ fn bad_references_and_abandoned_reads_leave_the_index_working() {
             disk: Some(DiskOptions {
                 dir: dir.clone(),
                 bytes: 1 << 30,
+                store: "a".into(),
             }),
             ..Default::default()
         };
@@ -841,6 +845,31 @@ fn a_block_is_never_decoded_past_what_its_frame_holds() {
     let mut run = Run::new();
     let got = format::Decoder::default().decode(&c, u32::MAX, 1, &mut run);
     assert!(matches!(got, Err(Error::Format(_))));
+}
+
+#[test]
+fn a_segment_cannot_point_a_block_outside_the_data() {
+    let varint = |out: &mut Vec<u8>, mut n: u64| {
+        while n >= 0x80 {
+            out.push((n as u8) | 0x80);
+            n >>= 7;
+        }
+        out.push(n as u8);
+    };
+    let segment = |clen: u64| {
+        let mut raw = Vec::new();
+        for v in [0, clen, 10, 1] {
+            varint(&mut raw, v);
+        }
+        raw.extend_from_slice(&[0, 0, 0, 0, 0, 1, b'k']);
+        let c = zstd::bulk::compress(&raw, 1).unwrap();
+        let check = xxhash_rust::xxh3::xxh3_64(&c) as u32;
+        format::parse_segment(&c, raw.len() as u32, check, 1, 100)
+    };
+    assert!(segment(100).is_ok());
+    assert!(matches!(segment(101), Err(Error::Format(_))));
+    assert!(matches!(segment(u32::MAX as u64), Err(Error::Format(_))));
+    assert!(matches!(segment(1 << 40), Err(Error::Format(_))));
 }
 
 async fn ix_scan(ix: &ChangeIndex, layers: &[LayerRef]) -> usize {

@@ -17,6 +17,9 @@ use std::sync::Mutex;
 #[derive(Clone, Debug)]
 pub struct DiskOptions {
     pub dir: PathBuf,
+    /// Names the object store (and prefix) whose layers these are, stably
+    /// across restarts: files kept for another name are removed on open.
+    pub store: String,
     /// Bytes of files kept; a layer larger than a quarter of this is not cached.
     pub bytes: u64,
 }
@@ -66,10 +69,10 @@ impl DiskState {
 }
 
 impl Disk {
-    /// The cache in `o.dir` for the store `id` names, with the complete files
-    /// already there. The directory is this store's alone while it is open
-    /// (a lock file); files another store left there are removed.
-    pub(crate) fn open(o: DiskOptions, id: &str) -> Result<Disk> {
+    /// The cache in `o.dir` for the store `o.store` names, with the complete
+    /// files already there. The directory is this store's alone while it is
+    /// open (a lock file); files another store left there are removed.
+    pub(crate) fn open(o: DiskOptions) -> Result<Disk> {
         let io =
             |e: std::io::Error| Error::Store(format!("disk cache {}: {e}", o.dir.display()).into());
         std::fs::create_dir_all(&o.dir).map_err(io)?;
@@ -86,7 +89,7 @@ impl Disk {
             )));
         }
         let owner = o.dir.join(".store");
-        let mine = std::fs::read(&owner).is_ok_and(|b| b == id.as_bytes());
+        let mine = std::fs::read(&owner).is_ok_and(|b| b == o.store.as_bytes());
         let mut found = Vec::new();
         for e in std::fs::read_dir(&o.dir).map_err(io)? {
             let e = e.map_err(io)?;
@@ -102,7 +105,7 @@ impl Disk {
             found.push((m.modified().ok(), unname(&n), m.len()));
         }
         if !mine {
-            std::fs::write(&owner, id).map_err(io)?;
+            std::fs::write(&owner, &o.store).map_err(io)?;
         }
         found.sort();
         let disk = Disk {
@@ -222,6 +225,12 @@ impl Drop for Temp {
 /// Bytes of a cached file.
 pub(crate) fn read_at(file: &std::path::Path, r: Range<u64>) -> std::io::Result<Vec<u8>> {
     let f = std::fs::File::open(file)?;
+    if r.start > r.end || r.end > f.metadata()?.len() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            format!("range {r:?} past the file's end"),
+        ));
+    }
     let mut b = vec![0u8; (r.end - r.start) as usize];
     f.read_exact_at(&mut b, r.start)?;
     Ok(b)

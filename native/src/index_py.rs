@@ -196,7 +196,8 @@ pub struct ChangeIndex {
 impl ChangeIndex {
     /// `options` are object_store's (for S3: `aws_access_key_id`, `aws_endpoint`, `aws_allow_http`, …).
     #[new]
-    /// `disk_dir`: keep whole layer files there (for a remote store), up to `disk_bytes`.
+    /// `disk_dir`: keep whole layer files there (for a remote store), up to
+    /// `disk_bytes`; the directory belongs to this URL and endpoint.
     #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (url, options=None, *, memory_bytes=256 << 20, disk_dir=None, disk_bytes=16 << 30, block_bytes=32 << 10, level=1))]
     fn new(
@@ -211,9 +212,20 @@ impl ChangeIndex {
         guard(|| {
             let opts = ix::StoreOptions {
                 memory_bytes,
-                disk: disk_dir.map(|dir| ix::DiskOptions {
-                    dir,
-                    bytes: disk_bytes,
+                disk: disk_dir.map(|dir| {
+                    let o = options.as_ref();
+                    let mut endpoints: Vec<&String> = o
+                        .into_iter()
+                        .flatten()
+                        .filter(|(k, _)| k.to_ascii_lowercase().contains("endpoint"))
+                        .map(|(_, v)| v)
+                        .collect();
+                    endpoints.sort();
+                    ix::DiskOptions {
+                        dir,
+                        bytes: disk_bytes,
+                        store: format!("{url} {endpoints:?}"),
+                    }
                 }),
                 ..Default::default()
             };

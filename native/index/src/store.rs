@@ -134,6 +134,7 @@ pub(crate) enum Want {
         rlen: u32,
         check: u32,
         blocks: u32,
+        data_end: u64,
     },
     /// `keep`: cache it. A bulk read (a batch past `cache_batch`) does not,
     /// so that a scan or a merge leaves the planners' blocks where they are.
@@ -204,29 +205,15 @@ pub struct Store {
 }
 
 impl Store {
-    /// A store over `inner`, every path under `prefix`; `rt` runs prefetches
-    /// and uploads. A disk cache knows the store by `inner`'s description and
-    /// `prefix` (for S3, the bucket but not the endpoint): give each store its
-    /// own `dir`.
+    /// A store over `inner`, every path under `prefix`; `rt` runs prefetches and uploads.
     pub fn new(
         inner: Arc<dyn ObjectStore>,
         prefix: Path,
         rt: tokio::runtime::Handle,
         opts: StoreOptions,
     ) -> Result<Arc<Store>> {
-        let id = format!("{inner}/{prefix}");
-        Store::open(inner, prefix, rt, opts, &id)
-    }
-
-    fn open(
-        inner: Arc<dyn ObjectStore>,
-        prefix: Path,
-        rt: tokio::runtime::Handle,
-        opts: StoreOptions,
-        id: &str,
-    ) -> Result<Arc<Store>> {
         Ok(Arc::new(Store {
-            disk: opts.disk.clone().map(|o| Disk::open(o, id)).transpose()?,
+            disk: opts.disk.clone().map(Disk::open).transpose()?,
             inner,
             prefix,
             rt,
@@ -247,8 +234,7 @@ impl Store {
     }
 
     /// A store from a URL (`file:///…`, `s3://bucket/prefix`, …) and its
-    /// options, as `object_store::parse_url_opts` reads them. A disk cache
-    /// knows the store by its URL and endpoint.
+    /// options, as `object_store::parse_url_opts` reads them.
     pub fn from_url(
         url: &str,
         options: impl IntoIterator<Item = (String, String)>,
@@ -256,16 +242,8 @@ impl Store {
         opts: StoreOptions,
     ) -> Result<Arc<Store>> {
         let u = url::Url::parse(url).map_err(|e| Error::Invalid(format!("{url}: {e}")))?;
-        let options: Vec<(String, String)> = options.into_iter().collect();
-        let mut endpoints: Vec<&str> = options
-            .iter()
-            .filter(|(k, _)| k.to_ascii_lowercase().contains("endpoint"))
-            .map(|(_, v)| v.as_str())
-            .collect();
-        endpoints.sort();
-        let id = format!("{u} {}", endpoints.join(" "));
         let (inner, prefix) = object_store::parse_url_opts(&u, options)?;
-        Store::open(Arc::from(inner), prefix, rt, opts, &id)
+        Store::new(Arc::from(inner), prefix, rt, opts)
     }
 
     fn path(&self, path: &str) -> Result<Path> {
@@ -532,8 +510,9 @@ fn parse(
             rlen,
             check,
             blocks,
+            data_end,
         } => Cached::Seg(Arc::new(
-            parse_segment(&b, *rlen, *check, *blocks).map_err(at)?,
+            parse_segment(&b, *rlen, *check, *blocks, *data_end).map_err(at)?,
         )),
         Want::Top { layer } => {
             let tail = &b[(layer.top_start - start) as usize..];
@@ -550,8 +529,14 @@ fn parse(
                             "{path}: segment {i} outside the index"
                         )));
                     };
-                    let seg = parse_segment(c, top.segs.rlen[i], top.segs.check[i], top.segs.n[i])
-                        .map_err(at)?;
+                    let seg = parse_segment(
+                        c,
+                        top.segs.rlen[i],
+                        top.segs.check[i],
+                        top.segs.n[i],
+                        top.commits_start,
+                    )
+                    .map_err(at)?;
                     extra.push((Part::Seg(i as u32), Cached::Seg(Arc::new(seg))));
                 }
             }
@@ -629,7 +614,12 @@ impl Upload {
                     .await?;
             }
             Some(w) => {
-                w.finish().await?;
+                // its own task: a caller that stops waiting does not strand the parts
+                self.store
+                    .rt
+                    .spawn(w.finish())
+                    .await
+                    .map_err(|e| Error::Store(format!("an upload failed: {e}").into()))??;
             }
         }
         if let (Some(t), Some(d)) = (self.tee.take(), &self.store.disk) {

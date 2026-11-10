@@ -37,6 +37,20 @@ pub const TRAILER: usize = 48;
 /// be the first, and a reader that does not know a flag refuses the layer.
 pub const KNOWN_COMMIT_FLAGS: u64 = 0;
 
+/// The most raw bytes a block, a segment, the commits section or the top
+/// level may hold: a reader allocates no more than this for any of them,
+/// whatever a damaged file says.
+pub const MAX_RAW: usize = 64 << 20;
+
+fn fits(what: &str, len: usize) -> Result<()> {
+    if len > MAX_RAW {
+        return invalid(format!(
+            "{what} of {len} bytes: the format allows {MAX_RAW}"
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct WriteOptions {
     pub block_bytes: usize,
@@ -236,6 +250,7 @@ impl Writer {
                 "a layer covers commits lo..=hi with 1 <= lo <= hi and lo <= floor <= hi, got {lo}..={hi}, floor {floor:?}"
             ));
         }
+        fits("a block", o.block_bytes * 2)?;
         let zc = zstd::bulk::Compressor::new(o.level)
             .map_err(|e| Error::Invalid(format!("zstd level {}: {e}", o.level)))?;
         Ok(Writer {
@@ -333,7 +348,7 @@ impl Writer {
             ));
         }
         if self.raw.len() >= self.o.block_bytes && !same {
-            self.flush_block();
+            self.flush_block()?;
         }
         let s = if self.rows == 0 {
             0
@@ -369,7 +384,7 @@ impl Writer {
         self.prev_state = state;
         self.rows += 1;
         self.entries += 1;
-        Ok(())
+        fits("a block", self.raw.len())
     }
 
     /// Every entry of key `i` of `run`, newest first.
@@ -385,9 +400,9 @@ impl Writer {
         Ok(())
     }
 
-    fn flush_block(&mut self) {
+    fn flush_block(&mut self) -> Result<()> {
         if self.rows == 0 {
-            return;
+            return Ok(());
         }
         self.cbuf = self.zc.compress(&self.raw).expect("zstd compression");
         let check = checksum(&self.cbuf);
@@ -414,14 +429,16 @@ impl Writer {
         self.raw.clear();
         self.rows = 0;
         if self.seg_n as usize == self.o.seg_blocks {
-            self.flush_seg();
+            self.flush_seg()?;
         }
+        Ok(())
     }
 
-    fn flush_seg(&mut self) {
+    fn flush_seg(&mut self) -> Result<()> {
         if self.seg_n == 0 {
-            return;
+            return Ok(());
         }
+        fits("a segment", self.seg.len())?;
         let c = self.zc.compress(&self.seg).expect("zstd compression");
         let t = &mut self.top;
         put_varint(t, self.segs.len() as u64);
@@ -438,6 +455,7 @@ impl Writer {
         self.nsegs += 1;
         self.seg.clear();
         self.seg_n = 0;
+        Ok(())
     }
 
     /// Finish the file with its commits' headers; the last bytes stay in
@@ -456,8 +474,8 @@ impl Writer {
                 ));
             }
         }
-        self.flush_block();
-        self.flush_seg();
+        self.flush_block()?;
+        self.flush_seg()?;
         let flags = commits.iter().fold(0, |f, h| f | h.flags);
         let commits_start = self.written;
         let mut raw = Vec::new();
@@ -475,6 +493,7 @@ impl Writer {
             put_bytes(&mut rec, &h.producer);
             put_bytes(&mut raw, &rec);
         }
+        fits("the commits section", raw.len())?;
         let c = self.zc.compress(&raw).expect("zstd compression");
         let mut commits_section = Vec::with_capacity(8 + c.len());
         commits_section.extend_from_slice(&(raw.len() as u32).to_le_bytes());
@@ -500,6 +519,7 @@ impl Writer {
         put_bytes(&mut top, if self.entries == 0 { &[] } else { &self.prev });
         put_varint(&mut top, self.nsegs);
         top.extend_from_slice(&self.top);
+        fits("the top level", top.len())?;
         let c = self.zc.compress(&top).expect("zstd compression");
         let top_start = self.written;
         self.out.extend_from_slice(&c);
@@ -609,22 +629,38 @@ impl Index {
             + self.first.capacity()
     }
 
-    fn parse(b: &[u8], count: Option<u64>, base: u64, relative: bool) -> Result<Index> {
+    /// Entries whose ranges lie in `within`.
+    fn parse(
+        b: &[u8],
+        count: Option<u64>,
+        base: u64,
+        relative: bool,
+        within: std::ops::Range<u64>,
+    ) -> Result<Index> {
         let mut ix = Index::default();
         let mut p = 0;
         let mut off = 0u64;
         let mut prev: std::ops::Range<usize> = 0..0;
         let mut i = 0u64;
         while count.map_or(p < b.len(), |c| i < c) {
-            if relative {
-                off = base + varint(b, &mut p)?;
-            } else {
-                off += varint(b, &mut p)?;
+            let d = varint(b, &mut p)?;
+            let Some(o) = (if relative { base } else { off }).checked_add(d) else {
+                return format("index offset overflows");
+            };
+            off = o;
+            let mut small = || -> Result<u32> {
+                u32::try_from(varint(b, &mut p)?).or_else(|_| format("index length overflows"))
+            };
+            let (clen, rlen, n) = (small()?, small()?, small()?);
+            if off < within.start || off + clen as u64 > within.end {
+                return format(format!(
+                    "index entry {off}+{clen} outside its section {within:?}"
+                ));
             }
             ix.off.push(off);
-            ix.clen.push(varint(b, &mut p)? as u32);
-            ix.rlen.push(varint(b, &mut p)? as u32);
-            ix.n.push(varint(b, &mut p)? as u32);
+            ix.clen.push(clen);
+            ix.rlen.push(rlen);
+            ix.n.push(n);
             ix.check
                 .push(u32::from_le_bytes(take(b, &mut p, 4)?.try_into().unwrap()));
             let s = varint(b, &mut p)? as usize;
@@ -704,7 +740,13 @@ impl Top {
         let first_key = get_bytes(&raw, &mut p)?;
         let last_key = get_bytes(&raw, &mut p)?;
         let nsegs = varint(&raw, &mut p)?;
-        let segs = Index::parse(&raw[p..], Some(nsegs), index_start, true)?;
+        let segs = Index::parse(
+            &raw[p..],
+            Some(nsegs),
+            index_start,
+            true,
+            index_start..top_start,
+        )?;
         Ok(Top {
             lo: v[0],
             hi: v[1],
@@ -754,6 +796,9 @@ impl Top {
 /// A compressed frame must declare the length it is read for, before any
 /// buffer of that length is allocated.
 fn frame_holds(c: &[u8], rlen: usize) -> Result<()> {
+    if rlen > MAX_RAW {
+        return format(format!("{rlen} raw bytes: the format allows {MAX_RAW}"));
+    }
     if !matches!(zstd::zstd_safe::get_frame_content_size(c), Ok(Some(n)) if n == rlen as u64) {
         return format(format!("the compressed frame does not hold {rlen} bytes"));
     }
@@ -769,12 +814,13 @@ pub(crate) fn decompress(c: &[u8], rlen: usize) -> Result<Vec<u8>> {
     Ok(raw)
 }
 
-/// A segment's block list, from its verified bytes.
-pub fn parse_segment(c: &[u8], rlen: u32, check: u32, blocks: u32) -> Result<Index> {
+/// A segment's block list, from its verified bytes; its blocks lie in the
+/// data section `[0, data_end)`.
+pub fn parse_segment(c: &[u8], rlen: u32, check: u32, blocks: u32, data_end: u64) -> Result<Index> {
     if checksum(c) != check {
         return format("segment checksum mismatch");
     }
-    let ix = Index::parse(&decompress(c, rlen as usize)?, None, 0, false)?;
+    let ix = Index::parse(&decompress(c, rlen as usize)?, None, 0, false, 0..data_end)?;
     if ix.len() != blocks as usize {
         return format("segment block count mismatch");
     }
