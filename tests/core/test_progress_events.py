@@ -296,3 +296,33 @@ def test_an_input_whose_moved_keys_another_input_holds_back_needs_no_fence(tmp_p
     t._set_output(b"b", logs[b"b"], 4, 1, 4)
     t.apply(event)
     assert t.owed(b"r/b", {}) == ([("k", "updated")], None)
+
+
+def test_an_input_keeps_its_fence_for_a_moved_key_no_other_input_holds_back(tmp_path):
+    """a, mid full run, holds back k1 only; b also moved k2, which it keeps on
+    a settled input: b's fence stands for k2, so a full run of b before the
+    event applies refuses it."""
+    ix = ChangeIndex(f"file://{tmp_path}")
+    t = Tracking()
+    logs = {}
+    for out in (b"a", b"b"):
+        t.attach(out, ix)
+        logs[out] = [
+            ix.write_commit(f"{out.decode()}/1", 1, [("k1", 1, None), ("k2", 1, None)], live_before=0)
+        ]
+        t._set_output(out, logs[out], 1, 2)
+        t.apply(Tracking.event_edge_open(b"r/" + out, out, True))
+    inputs = [{"edge": b"r/a", "conditions": {}}, {"edge": b"r/b", "conditions": {}}]
+    plan = t.plan({"inputs": inputs, "limit": 10})["plan"]
+    assert Tracking.plan_keys(plan, 0)[0] == ["k1", "k2"] == Tracking.plan_keys(plan, 1)[0]
+    logs[b"a"].append(ix.write_commit("a/2", 2, [("k1", 2, 1)], live_before=2))
+    t._set_output(b"a", logs[b"a"], 2, 2, 2)
+    logs[b"b"].append(ix.write_commit("b/2", 2, [("k1", 2, 1), ("k2", 2, 1)], live_before=2))
+    t._set_output(b"b", logs[b"b"], 2, 2)
+    report = [([], [("k1", 2)]), ([], [("k1", 2), ("k2", 2)])]
+    event, _, held_back = t.progress_ops(plan, report)
+    assert held_back == [["k1"], ["k1"]]
+    logs[b"b"].append(ix.write_commit("b/3", 3, [("k1", 3, None)], live_before=2, clear=True))
+    t._set_output(b"b", logs[b"b"], 3, 1, 3)
+    with pytest.raises(ValueError, match="became unsettled"):
+        t.apply(event)
