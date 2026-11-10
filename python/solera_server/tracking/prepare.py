@@ -104,8 +104,8 @@ async def prepare(core: Core, task: dict, run: dict, attempt: str | None) -> dic
         o = engine._commits(input, record, mine, full)
         pin, plan, empty = engine._commits_pin(input, engine._pin_at(input.output, input.partition), o)
         pins[input.param], plans[input.param] = pin, plan
-        if not plan.get("done"):
-            heads.append([input.output, input.partition, plan["end"]])
+        if not plan.get("done"):  # the commit its walk goes to: pages before it are the walk's own
+            heads.append([input.output, input.partition, o["head"]])
         all_empty = all_empty and empty
     mine = progress.get(WALK)
     if keyed and mine is not None and mine["key"] is None:  # walked to the end in this task

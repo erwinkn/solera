@@ -1857,8 +1857,9 @@ class Model:
 
         id_ = self.core_outputs.get((output, partition))
         if id_ is not None and self.core is not None:
-            found = self.core.output(id_.encode())
-            return None if found is None else int(found["head"])
+            if (found := self.core.output(id_.encode())) is not None:
+                return int(found["head"])
+            return 0 if (output, partition) in self.heads else None  # a head, and no commit yet: empty
         head = self.heads.get((output, partition))
         if head is None:
             return None

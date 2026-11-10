@@ -950,3 +950,66 @@ async def test_every_taker_of_several_output_locks_takes_them_in_life_id_order(s
     ids = {name: eng.m.core_outputs[(name, "")] for name in ("a_out", "z_out")}
     assert sorted(ids.values()) != [ids["a_out"], ids["z_out"]], "the names sort otherwise than the ids"
     assert taken == sorted(ids.values()), taken
+
+
+async def test_a_first_run_by_a_key_list_that_takes_nothing_holds_its_readers(solera):
+    rows, seen, batches = {"a": 1, "b": 1, "c": 1}, [], []
+
+    @asset(outputs=Output("files", key="id"))
+    def files():
+        return [{"id": k, "v": v} for k, v in rows.items()]
+
+    @asset(inputs={"files": Incremental(batch_size=1)}, outputs=Output("copy", key="id"), retries=Retry(n=0))
+    def copy(ctx, files: list):
+        return rebuild(ctx.batch["files"], [{"id": r["id"], "v": r["v"]} for r in files])
+
+    @asset(inputs={"copy": In()}, retries=Retry(n=0))
+    def report(copy: list):
+        seen.append(sorted(r["id"] for r in copy))
+        return len(copy)
+
+    @asset(inputs={"copy": Incremental(batch_size=10)}, outputs=Output("next", key="id"), retries=Retry(n=0))
+    def next_(ctx, copy: list):
+        batches.append(sorted(r["id"] for r in copy))
+        return rebuild(ctx.batch["copy"], [{"id": r["id"], "v": r["v"]} for r in copy])
+
+    await solera.deploy(
+        Project(assets=[files, copy, report, next_], default_store=FileStore(solera.root / "data"))
+    )
+    await solera.run("files")
+    await solera.run("copy", keys={"files": ["zz"]}, expect=None)
+    assert solera.engine.m.axis_head("copy", "") == 0
+    await solera.submit("report")
+    await solera.submit("next_")
+    await solera.settle(1.0)
+    assert seen == [] and batches == []
+    await solera.run("copy")
+    await solera.settle(1.0)
+    assert seen[-1] == ["a", "b", "c"] and sorted(sum(batches, [])) == ["a", "b", "c"]
+
+
+@pytest.mark.parametrize("size", [1, 2, 3])
+async def test_a_paged_reader_of_an_append_only_output_reads_the_whole_run(solera, size):
+    rows, pages = {"a": 1, "b": 1, "c": 1}, []
+
+    @asset(outputs=Output("files", key="id"))
+    def files():
+        return [{"id": k, "v": v} for k, v in rows.items()]
+
+    @asset(inputs={"files": Incremental(batch_size=1)}, outputs=Output("log", incremental=True))
+    def log(ctx, files: list):
+        return Patch([{"id": r["id"]} for r in files])
+
+    @asset(inputs={"log": Incremental(batch_size=size)}, outputs=Output("tail"), retries=Retry(n=0))
+    async def tail(ctx, log: list):
+        b = ctx.batch["log"]
+        held = [] if b.reset else (await ctx.load() or [])
+        pages.append([b.upstream.commits[0], b.upstream.commits[-1]])
+        return held + [r["id"] for r in log]
+
+    await solera.deploy(Project(assets=[files, log, tail], default_store=FileStore(solera.root / "data")))
+    await solera.run("files")
+    await solera.run("log")
+    detail = await solera.wait(await solera.submit("tail"), 10)
+    assert detail["request"]["status"] == "succeeded", detail
+    assert await solera.read("tail") == ["a", "b", "c"], pages
