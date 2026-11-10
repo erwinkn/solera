@@ -13,11 +13,13 @@ use crate::commit::{build, Change, Changes, Held as Source, Mode, Spec};
 use crate::error::{invalid, Result};
 use crate::event::Part;
 use crate::plan::{Indexes, Mode as PlanMode, Plan};
-use crate::progress::{Class, Holding, Key, Ops, Point, Progress, Reason};
+use crate::progress::{owed, Class, Holding, Key, Ops, Point, Progress, Reason};
 use crate::state::{Id, Output, Tracking};
 
 use super::transition::{transition, Counters, Reported};
-use super::{cond_id, output_id, Conds, Held, Outcomes, PerKey, Record, Step, DUE, FAILURES};
+use super::{
+    cond_id, output_id, record_digest, Conds, Held, Outcomes, PerKey, Record, Step, DUE, FAILURES,
+};
 
 /// What committing reads of the state, taken under the caller's lock.
 #[derive(Clone)]
@@ -154,7 +156,7 @@ pub async fn commit(
     plan: &Plan,
     input: usize,
     reported: &[(Key, Reported)],
-    retry: bool,
+    loaded: &[(Key, Ver)],
     ctx: &Ctx<'_>,
     ops: &mut Ops,
 ) -> Result<Vec<Part>> {
@@ -171,9 +173,10 @@ pub async fn commit(
         return invalid("reported keys are sorted and distinct");
     }
     let keyed = v.progress.keyed().expect("a per-key edge is keyed");
-    let step = if retry {
-        let Some(pass) = &v.per_key.pass else {
-            return invalid("a retry batch with no pass under way");
+    let retry = plan.pass.is_some();
+    let step = if let Some(n) = plan.pass {
+        let Some(pass) = v.per_key.pass.as_ref().filter(|p| p.n == n) else {
+            return invalid("a retry batch of a pass that ended");
         };
         Some(Step {
             n: pass.n,
@@ -188,15 +191,20 @@ pub async fn commit(
         _ => ctx.counters,
     };
     let fid = output_id(FAILURES, &v.edge);
-    let mut touched: Vec<&[u8]> = p
-        .keys
-        .iter()
-        .map(|c| c.key.as_ref())
-        .chain(p.moot.iter().map(|k| k.as_ref()))
-        .collect();
+    if loaded.windows(2).any(|w| w[0].0 >= w[1].0) {
+        return invalid("loaded keys are sorted and distinct");
+    }
+    let mut touched: Vec<&[u8]> = p.touched().map(|k| k.as_ref()).collect();
     touched.sort_unstable();
     touched.dedup();
     let priors = records(ixs, &fid, &v.failures, &touched).await?;
+    let read = priors
+        .iter()
+        .map(|(k, r)| record_digest(k, r))
+        .fold(0, u64::wrapping_add);
+    if read != p.records {
+        return invalid("the edge's records moved since the batch was planned");
+    }
 
     let mut conds: Conds = (*v.per_key.conds).clone();
     let mut added: Vec<(u64, Arc<crate::progress::Conditions>)> = vec![];
@@ -217,11 +225,21 @@ pub async fn commit(
         }
         let r = rep.next_if(|(k, _)| *k == c.key).map(|(_, r)| r);
         let prior = priors.get(&c.key);
+        let tried = loaded
+            .binary_search_by(|(k, _)| k.cmp(&c.key))
+            .map_or(&c.version, |i| &loaded[i].1);
         let stored = match r {
             None => None,
-            Some(_) if c.class == Class::Unchanged => None,
+            Some(_)
+                if !owed(
+                    &c.held,
+                    &Holding::of(tried.as_version(), &p.conditions, &c.key),
+                ) =>
+            {
+                None
+            }
             Some(r) => {
-                let fresh = prior.is_none_or(|p| p.on != c.version || p.on_cond != on_cond);
+                let fresh = prior.is_none_or(|p| p.on != *tried || p.on_cond != on_cond);
                 transition(
                     prior.map(|p| &p.stored),
                     fresh,
@@ -248,7 +266,7 @@ pub async fn commit(
                 };
                 Some(Record {
                     stored: s,
-                    on: c.version.clone(),
+                    on: tried.clone(),
                     on_cond,
                     at: p.head,
                     held,
@@ -390,7 +408,12 @@ pub async fn commit(
         points,
     }));
 
+    // A failing key the worker tried at another version than planned keeps
+    // its point: the piece no longer says what it was tried on.
     let needless = |key: &Key, reason: Reason, holding: &Holding| -> bool {
+        if loaded.binary_search_by(|(k, _)| k.cmp(key)).is_ok() {
+            return false;
+        }
         if range_batch {
             return reason == Reason::Failed;
         }
@@ -418,6 +441,15 @@ pub async fn commit(
         if r.edge == v.edge {
             r.points
                 .retain(|(k, pt)| !needless(k, pt.reason, &pt.holding));
+            // What the consumer held where a record said so: lineage
+            // recomputes the batch's input from this slice alone (§7).
+            for (k, prior) in &priors {
+                if let Err(i) = r.replaced.points.binary_search_by(|(x, _)| x.cmp(k)) {
+                    r.replaced
+                        .points
+                        .insert(i, (k.clone(), moot_point(prior, &conds)?));
+                }
+            }
         }
     }
     Ok(parts)

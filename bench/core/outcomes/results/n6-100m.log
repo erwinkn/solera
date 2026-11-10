@@ -22,3 +22,8 @@ batch 1 warm: 130 ms wall, 130 ms CPU (median of 5); GETs 5 over 5
 batch 2 warm: 118 ms wall, 118 ms CPU (median of 5); GETs 5 over 5
 batch 3 warm: 132 ms wall, 132 ms CPU (median of 5); GETs 5 over 5
 batch 4 warm: 123 ms wall, 124 ms CPU (median of 5); GETs 5 over 5
+
+## final head: retry plans also carry a digest of the records they read (review round 1)
+(failures at c1000)
+pass: 101 batches, 990034 keys taken (19966 short of full batches: changed upstream since they failed), 2.7s wall, 2.7 CPU-s = 367069 due keys a second; batch p50 25 ms (CPU 25), p99 62 ms, max 146 ms; GETs 604 (76 MB); peak RSS 307 MB
+batch 0..4 warm: 17, 18, 19, 24, 17 ms wall (median of 5 each)

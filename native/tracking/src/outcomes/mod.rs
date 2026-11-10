@@ -59,6 +59,15 @@ pub const PASS: u8 = b'p';
 /// The conditions records refer to, by the digest of their encoding.
 pub type Conds = BTreeMap<u64, Arc<Conditions>>;
 
+/// One record's part of a plan's `records` digest: the sum of these over the
+/// keys a batch touches, so that a commit can check them in any order.
+pub fn record_digest(key: &[u8], r: &Record) -> u64 {
+    let mut e = Enc::new();
+    e.bytes(key);
+    e.bytes(&r.encode());
+    xxhash_rust::xxh3::xxh3_64(&e.buf)
+}
+
 pub fn cond_id(c: &Conditions) -> u64 {
     let mut e = Enc::new();
     c.encode(&mut e);

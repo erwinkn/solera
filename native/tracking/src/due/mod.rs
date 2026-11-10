@@ -31,7 +31,7 @@ use crate::error::{invalid, Result};
 use crate::event::Part;
 use crate::outcomes::commit::{records, View};
 use crate::outcomes::transition::{eligible, Counters, FAILED, NAMES};
-use crate::outcomes::{output_id, PassStart, Record, DUE, FAILURES, PASS};
+use crate::outcomes::{output_id, record_digest, PassStart, Record, DUE, FAILURES, PASS};
 use crate::plan::{Cand, Indexes, InputPlan, Mode, Plan};
 use crate::progress::{owed, read_digest, Class, Conditions, Holding, Key, KeyRange};
 use crate::state::{Id, Output, Tracking};
@@ -192,7 +192,8 @@ pub async fn plan(
     }
     let fid = output_id(FAILURES, &v.edge);
     let walk = by_counters(v, &pass.counters) || r.pass_list.head == 0;
-    let mut read: Vec<Key> = Vec::new();
+    // The last key read: where the batch's range ends.
+    let mut last: Option<Key> = None;
     let mut found = std::collections::BTreeMap::new();
     let mut more;
     let at = pass.at as f64;
@@ -215,7 +216,7 @@ pub async fn plan(
                 };
                 let rec = Record::decode(b)?;
                 let k: Key = page.run.key(i).into();
-                read.push(k.clone());
+                last = Some(k.clone());
                 if eligible(&rec.stored, at, &pass.counters) {
                     found.insert(k, rec);
                     if found.len() == limit {
@@ -241,10 +242,8 @@ pub async fn plan(
             .scan(&r.pass_list.layers, r.pass_list.head, &q)
             .await?;
         more = page.next.is_some();
-        read = (0..page.run.len())
-            .map(|i| page.run.key(i).into())
-            .collect();
-        let keys: Vec<&[u8]> = read.iter().map(|k| k.as_ref()).collect();
+        let keys: Vec<&[u8]> = (0..page.run.len()).map(|i| page.run.key(i)).collect();
+        last = keys.last().map(|k| (*k).into());
         for (k, rec) in records(ixs, &fid, &v.failures, &keys).await? {
             if eligible(&rec.stored, at, &pass.counters) {
                 found.insert(k, rec);
@@ -334,7 +333,7 @@ pub async fn plan(
     }
     let range = KeyRange {
         lo: pass.after.clone(),
-        hi: if more { read.last().cloned() } else { None },
+        hi: if more { last } else { None },
     };
     let keyed = v.progress.keyed().expect("a per-key edge is keyed");
     let input = InputPlan {
@@ -347,12 +346,19 @@ pub async fn plan(
         held_back: vec![],
         moot,
         expect: read_digest(keyed, false, &range),
+        records: 0,
     };
+    let mut input = input;
+    input.records = input
+        .touched()
+        .filter_map(|k| found.get(k).map(|r| record_digest(k, r)))
+        .fold(0, u64::wrapping_add);
     Ok(Plan {
         mode: Mode::Keys(input.keys.iter().map(|c| c.key.clone()).collect()),
         reset: false,
         range,
         inputs: vec![input],
         unkeyed: vec![],
+        pass: Some(pass.n),
     })
 }

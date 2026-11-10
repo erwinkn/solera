@@ -127,6 +127,10 @@ struct World {
     files: u64,
     events: u64,
     stats: [usize; 6],
+    /// Plans held back to commit late, after the state moved on.
+    stale: Vec<plan::Plan>,
+    /// Every key a batch runs fails (a bad deploy).
+    fail_all: bool,
 }
 
 fn patterns(rng: &mut SmallRng) -> Patterns {
@@ -296,15 +300,17 @@ impl World {
     }
 
     /// The worker runs a plan's keys and the engine commits them; the truth follows.
-    async fn run(&mut self, ix: &ChangeIndex, p: &plan::Plan, retry: bool) -> Vec<Key> {
+    /// None when the commit is refused: the state moved since the plan.
+    async fn run(&mut self, ix: &ChangeIndex, p: &plan::Plan, retry: bool) -> Option<Vec<Key>> {
         let ip = &p.inputs[0];
         let mut failed: Vec<(Key, Reported)> = vec![];
         let mut loaded: Vec<(Key, Ver)> = vec![];
         for c in &ip.keys {
-            if c.class != Class::Removed && self.rng.random_bool(0.35) {
+            if c.class != Class::Removed && (self.fail_all || self.rng.random_bool(0.35)) {
                 let r = self.report();
                 failed.push((c.key.clone(), r));
-            } else if self.rng.random_bool(0.1) {
+            }
+            if self.rng.random_bool(0.15) {
                 let v = self.log.at(self.log.head(), &c.key);
                 if v != c.version && !v.is_absent() && !c.version.is_absent() {
                     loaded.push((c.key.clone(), v));
@@ -315,7 +321,7 @@ impl World {
             failed: failed.iter().map(|(k, _)| k.clone()).collect(),
             loaded: loaded.clone(),
         };
-        let mut ops = self.t.progress_ops(p, &[report], b"", None).unwrap();
+        let mut ops = self.t.progress_ops(p, &[report], b"", None).ok()?;
         let v = self.t.outcome_view(EDGE.as_bytes()).unwrap();
         let (f, d) = self.ctx();
         let ctx = Ctx {
@@ -338,22 +344,25 @@ impl World {
             (Some(pass), true) => pass.counters,
             _ => self.counters,
         };
-        let mut parts = oc::commit(&OneIndex(ix), &v, p, 0, &failed, retry, &ctx, &mut ops)
+        let mut parts = oc::commit(&OneIndex(ix), &v, p, 0, &failed, &loaded, &ctx, &mut ops)
             .await
-            .unwrap();
+            .ok()?;
         let mut all = ops.parts.clone();
         all.append(&mut parts);
-        self.apply(all);
+        self.t.apply(&Event::of(all).encode()).ok()?;
+        self.events += 1;
         // The truth.
         let cid = cond_id(&ip.conditions);
         let fails: BTreeMap<Key, Reported> = failed.into_iter().collect();
         let loaded: BTreeMap<Key, Ver> = loaded.into_iter().collect();
         for c in &ip.keys {
-            if fails.contains_key(&c.key) && c.class == Class::Unchanged {
+            let got = loaded.get(&c.key).unwrap_or(&c.version);
+            let tried = Holding::of(got.as_version(), &ip.conditions, &c.key);
+            if fails.contains_key(&c.key) && !owed(&self.holding(&c.key), &tried) {
                 self.fails.remove(&c.key);
             } else if let Some(r) = fails.get(&c.key) {
                 let prior = self.fails.get(&c.key);
-                let fresh = prior.is_none_or(|f| f.tried_ver != c.version || f.tried_cond != cid);
+                let fresh = prior.is_none_or(|f| f.tried_ver != *got || f.tried_cond != cid);
                 let s = transition(
                     prior.map(|f| &f.stored),
                     fresh,
@@ -368,15 +377,14 @@ impl World {
                     c.key.clone(),
                     Fail {
                         stored: s,
-                        tried: Holding::of(c.version.as_version(), &ip.conditions, &c.key),
+                        tried,
                         tried_cond: cid,
-                        tried_ver: c.version.clone(),
+                        tried_ver: got.clone(),
                         at: ip.head,
                     },
                 );
             } else {
-                let got = loaded.get(&c.key).unwrap_or(&c.version);
-                match Holding::of(got.as_version(), &ip.conditions, &c.key) {
+                match tried {
                     Holding::Absent => self.holds.remove(&c.key),
                     h => self.holds.insert(c.key.clone(), h),
                 };
@@ -384,7 +392,7 @@ impl World {
             }
         }
         self.reverted();
-        ip.keys.iter().map(|c| c.key.clone()).collect()
+        Some(ip.keys.iter().map(|c| c.key.clone()).collect())
     }
 
     async fn change_batch(&mut self, ix: &ChangeIndex, upstream_meanwhile: bool) {
@@ -398,7 +406,9 @@ impl World {
             self.upstream(ix).await;
         }
         self.stats[0] += 1;
-        self.run(ix, &p, false).await;
+        self.run(ix, &p, false)
+            .await
+            .expect("a batch planned now commits");
         self.cursor = p.range.hi.clone();
     }
 
@@ -415,7 +425,53 @@ impl World {
             .await
             .unwrap();
         self.stats[1] += 1;
-        self.run(ix, &p, false).await;
+        self.run(ix, &p, false)
+            .await
+            .expect("a batch planned now commits");
+    }
+
+    /// A plan held back, to commit after the state moved on.
+    async fn hold(&mut self, ix: &ChangeIndex) {
+        let req = if self.rng.random_bool(0.5) {
+            let keys: Vec<Key> = self
+                .universe
+                .iter()
+                .filter(|_| self.rng.random_bool(0.4))
+                .cloned()
+                .collect();
+            self.request(None, 10, Mode::Keys(keys))
+        } else {
+            let limit = self.rng.random_range(1..4);
+            self.request(None, limit, Mode::Incremental)
+        };
+        let view = self.t.view(&req).unwrap();
+        let p = plan::plan(&view, &req, &OneIndex(ix), &NoHold)
+            .await
+            .unwrap();
+        self.stale.push(p);
+    }
+
+    /// A held plan commits late: refused, or the truth follows it.
+    async fn late(&mut self, ix: &ChangeIndex) {
+        if self.stale.is_empty() {
+            return;
+        }
+        let i = self.rng.random_range(0..self.stale.len());
+        let p = self.stale.remove(i);
+        let pass = self
+            .t
+            .per_key
+            .get(EDGE.as_bytes())
+            .and_then(|k| k.pass.as_ref())
+            .map(|p| p.n);
+        if self.run(ix, &p, p.pass.is_some()).await.is_some() {
+            assert!(
+                p.pass.is_none() || p.pass == pass,
+                "a retry batch of pass {:?} commits in pass {pass:?}",
+                p.pass
+            );
+            self.stats[5] += 1;
+        }
     }
 
     async fn upstream(&mut self, ix: &ChangeIndex) {
@@ -501,7 +557,13 @@ impl World {
                 assert_eq!(c.class, Class::of(&self.holding(&c.key), &wanted));
             }
             self.stats[3] += p.inputs[0].keys.len();
-            let got = self.run(ix, &p, true).await;
+            if self.rng.random_bool(0.3) {
+                self.stale.push(p.clone());
+            }
+            let got = self
+                .run(ix, &p, true)
+                .await
+                .expect("a retry planned now commits");
             taken.extend(got);
         }
         assert_eq!(
@@ -597,7 +659,7 @@ impl World {
     }
 }
 
-async fn history(seed: u64, ix: &ChangeIndex) -> [usize; 6] {
+fn world(seed: u64) -> World {
     let mut rng = SmallRng::seed_from_u64(seed);
     let universe: Vec<Key> = (1..=rng.random_range(3..8))
         .map(|i| key(&format!("k{i}")))
@@ -609,6 +671,7 @@ async fn history(seed: u64, ix: &ChangeIndex) -> [usize; 6] {
         ..Default::default()
     });
     let mut w = World {
+        fail_all: false,
         rng,
         t: Tracking::new(),
         log: Log {
@@ -628,15 +691,21 @@ async fn history(seed: u64, ix: &ChangeIndex) -> [usize; 6] {
         files: 0,
         events: 0,
         stats: [0; 6],
+        stale: vec![],
     };
     w.apply(vec![Part::EdgeOpen(EdgeOpen {
         edge: key(EDGE),
         input: key("items"),
         keyed: true,
     })]);
+    w
+}
+
+async fn history(seed: u64, ix: &ChangeIndex) -> [usize; 6] {
+    let mut w = world(seed);
     let trace = std::env::var("OUTCOME_TRACE").is_ok();
     for step in 0..60 {
-        let op = w.rng.random_range(0..23);
+        let op = w.rng.random_range(0..25);
         if trace {
             eprintln!(
                 "step {step} op {op} head {} now {:?} clock {} counters {:?}",
@@ -689,6 +758,8 @@ async fn history(seed: u64, ix: &ChangeIndex) -> [usize; 6] {
                 w.counters.forced[c] = w.events + 1;
             }
             18 | 20..=22 => w.pass(ix).await,
+            23 => w.hold(ix).await,
+            24 => w.late(ix).await,
             19 => {
                 if w.rng.random_bool(0.3) {
                     w.apply(vec![Part::Reset(Reset {
@@ -805,5 +876,95 @@ fn random_histories() {
             }
         }
     }
-    eprintln!("{seeds} histories: change batches {}, key lists {}, retry passes {} taking {} keys, failing keys left {}", total[0], total[1], total[2], total[3], total[4]);
+    eprintln!("{seeds} histories: change batches {}, key lists {}, retry passes {} taking {} keys, failing keys left {}, late commits accepted {}", total[0], total[1], total[2], total[3], total[4], total[5]);
+}
+
+/// A retry batch planned in one pass never commits in another (review F3):
+/// a pass ends, a new one starts at the same place, and the old pass's plan
+/// is refused.
+#[test]
+fn a_retry_batch_belongs_to_its_pass() {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let ix = index(&rt);
+    rt.block_on(async {
+        let mut w = world(7);
+        w.now = Arc::new(Conditions {
+            definition: b"d1".as_slice().into(),
+            ..Default::default()
+        });
+        let changes = w
+            .universe
+            .iter()
+            .map(|k| (k.clone(), Ver::Int(5)))
+            .collect();
+        assert!(w.log.commit(&ix, &mut w.t, changes).await);
+        w.fail_all = true;
+        loop {
+            w.change_batch(&ix, false).await;
+            if w.cursor.is_none() {
+                break;
+            }
+        }
+        let mut start = |w: &mut World| {
+            w.counters.forced[2] = w.events + 1;
+            w.files += 1;
+            (w.t.outcome_view(EDGE.as_bytes()).unwrap(), w.files)
+        };
+        let (v, f) = start(&mut w);
+        let list = w.t.retry_view(EDGE.as_bytes()).unwrap().pass_list;
+        let parts = due::start(
+            &OneIndex(&ix),
+            &v,
+            &list,
+            w.clock as u64,
+            w.counters,
+            &format!("p/{f}"),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        w.apply(parts);
+        let r = w.t.retry_view(EDGE.as_bytes()).unwrap();
+        let p = due::plan(&OneIndex(&ix), &r, &w.now, 1000).await.unwrap();
+        assert!(p.range.hi.is_none() && !p.inputs[0].keys.is_empty());
+        w.run(&ix, &p, true)
+            .await
+            .expect("the pass's batch commits");
+        assert!(w.t.per_key[EDGE.as_bytes()].pass.is_none());
+        let (v, f) = start(&mut w);
+        let list = w.t.retry_view(EDGE.as_bytes()).unwrap().pass_list;
+        let parts = due::start(
+            &OneIndex(&ix),
+            &v,
+            &list,
+            w.clock as u64,
+            w.counters,
+            &format!("p/{f}"),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        w.apply(parts);
+        let ops = w.t.progress_ops(&p, &[Default::default()], b"", None);
+        let v = w.t.outcome_view(EDGE.as_bytes()).unwrap();
+        let ctx = Ctx {
+            now: w.clock,
+            counters: w.counters,
+            retries: 2,
+            time_ms: 0,
+            producer: b"",
+            failures_path: "f/x",
+            due_path: "d/x",
+        };
+        let got = match ops {
+            Err(e) => panic!("progress refused it first: {e:?}"),
+            Ok(mut ops) => oc::commit(&OneIndex(&ix), &v, &p, 0, &[], &[], &ctx, &mut ops).await,
+        };
+        let err = got.expect_err("an old pass's batch is refused");
+        assert!(format!("{err:?}").contains("pass that ended"), "{err:?}");
+    });
 }

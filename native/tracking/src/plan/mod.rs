@@ -15,6 +15,7 @@
 //! Every read is paged and stops once the batch is full, so a plan costs what
 //! its batch holds, not what the key space holds.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use solera_index::{ChangeIndex, LayerRef, Pattern, Query, Run, Version};
@@ -23,7 +24,7 @@ use xxhash_rust::xxh3::xxh3_64;
 use crate::codec::{Dec, Enc, Ver};
 use crate::error::{format, invalid, Result};
 use crate::outcomes::commit::records;
-use crate::outcomes::{output_id, Conds, FAILURES};
+use crate::outcomes::{output_id, record_digest, Conds, FAILURES};
 use crate::progress::{
     owed, read_digest, Class, CondTable, Conditions, Holding, Key, KeyRange, Keyed, Point,
     Progress, Value,
@@ -144,6 +145,9 @@ pub struct InputPlan {
     pub moot: Vec<Key>,
     /// The digest of the progress this plan read.
     pub expect: u64,
+    /// The digest of the outcome records it read for its keys, held-back
+    /// and moot keys (B6): the commit checks they did not move.
+    pub records: u64,
 }
 
 impl InputPlan {
@@ -154,6 +158,15 @@ impl InputPlan {
             n[c.class as usize - 1] += 1;
         }
         n
+    }
+
+    /// The keys the commit reads the records of: taken, held back, moot.
+    pub fn touched(&self) -> impl Iterator<Item = &Key> {
+        self.keys
+            .iter()
+            .map(|c| &c.key)
+            .chain(self.held_back.iter().map(|h| &h.key))
+            .chain(&self.moot)
     }
 
     /// A digest of the batch's input: lineage recomputes it (§7).
@@ -189,6 +202,8 @@ pub struct Plan {
     pub range: KeyRange,
     pub inputs: Vec<InputPlan>,
     pub unkeyed: Vec<UnkeyedPlan>,
+    /// The retry pass a retry batch belongs to (B6).
+    pub pass: Option<u64>,
 }
 
 /// What a plan reads of the state, taken under a short lock.
@@ -378,6 +393,8 @@ struct Found {
     /// Records with a stored outcome the walk met, by the class a try at
     /// what they were tried on would have.
     visited: [u64; 3],
+    /// Each record read, by key: its part of the plan's `records` digest.
+    read: BTreeMap<Key, u64>,
 }
 
 struct Pend {
@@ -400,6 +417,7 @@ impl Found {
             moot: vec![],
             waiting: false,
             visited: [0; 3],
+            read: BTreeMap::new(),
         }
     }
 
@@ -660,6 +678,9 @@ impl Walker<'_> {
                 self.decide(p.key, p.held, p.version, p.wanted, out);
                 continue;
             };
+            if out.keep {
+                out.read.insert(p.key.clone(), record_digest(&p.key, rec));
+            }
             let held = rec.held.holding(&f.conds)?;
             let tried = rec.tried(&p.key, &f.conds)?;
             let c = Class::of(&held, &tried);
@@ -723,6 +744,7 @@ pub async fn plan(view: &View, req: &Request, ixs: &dyn Indexes, hold: &dyn Hold
         return invalid("the view is not the request's");
     }
     let mut inputs: Vec<InputPlan> = Vec::with_capacity(view.inputs.len());
+    let mut reads: Vec<BTreeMap<Key, u64>> = Vec::with_capacity(view.inputs.len());
     let listed: Vec<Key> = match &req.mode {
         Mode::Keys(keys) => {
             if keys.windows(2).any(|w| w[0] >= w[1]) {
@@ -760,7 +782,7 @@ pub async fn plan(view: &View, req: &Request, ixs: &dyn Indexes, hold: &dyn Hold
         match &req.mode {
             Mode::Keys(_) => {
                 let batch = &listed[..listed.len().min(req.limit)];
-                found.keys = listed_keys(&w, batch).await?;
+                (found.keys, found.read) = listed_keys(&w, batch).await?;
             }
             _ => w.walk(req.after.as_ref(), &mut found).await?,
         }
@@ -774,7 +796,9 @@ pub async fn plan(view: &View, req: &Request, ixs: &dyn Indexes, hold: &dyn Hold
             held_back: found.held_back,
             moot: found.moot,
             expect: 0,
+            records: 0,
         });
+        reads.push(found.read);
     }
     let hi: Option<Key> = match &req.mode {
         Mode::Keys(_) => (listed.len() > req.limit).then(|| listed[req.limit - 1].clone()),
@@ -792,13 +816,17 @@ pub async fn plan(view: &View, req: &Request, ixs: &dyn Indexes, hold: &dyn Hold
         lo: req.after.clone(),
         hi,
     };
-    for (p, v) in inputs.iter_mut().zip(&view.inputs) {
+    for ((p, v), read) in inputs.iter_mut().zip(&view.inputs).zip(&reads) {
         if let Some(hi) = &range.hi {
             p.keys.retain(|c| c.key <= *hi);
             p.held_back.retain(|c| c.key <= *hi);
             p.moot.retain(|k| k <= hi);
         }
         p.expect = read_digest(v.progress.keyed().expect("a keyed view"), req.reset, &range);
+        p.records = p
+            .touched()
+            .filter_map(|k| read.get(k))
+            .fold(0, |a, h| a.wrapping_add(*h));
     }
     Ok(Plan {
         mode: req.mode.clone(),
@@ -806,6 +834,7 @@ pub async fn plan(view: &View, req: &Request, ixs: &dyn Indexes, hold: &dyn Hold
         range,
         inputs,
         unkeyed: view.unkeyed.clone(),
+        pass: None,
     })
 }
 
@@ -833,18 +862,20 @@ async fn versions_at(
 
 /// A key list: each listed key the consumer holds or upstream has under the
 /// patterns, in its class (`unchanged` when held as it is).
-async fn listed_keys(w: &Walker<'_>, keys: &[Key]) -> Result<Vec<Cand>> {
+async fn listed_keys(w: &Walker<'_>, keys: &[Key]) -> Result<(Vec<Cand>, BTreeMap<Key, u64>)> {
     let all: Vec<&[u8]> = keys.iter().map(|k| k.as_ref()).collect();
     let at_head = versions_at(w.ix, w.layers, w.head, &all).await?;
     let mut held: Vec<Option<Holding>> = keys
         .iter()
         .map(|k| w.keyed.point(k).map(|p| p.holding.clone()))
         .collect();
+    let mut read = BTreeMap::new();
     if let Some((ixs, f)) = w.fails {
         let recs = records(ixs, &f.output, &f.out, &all).await?;
         for (i, k) in keys.iter().enumerate() {
             if let Some(r) = recs.get(k) {
                 held[i] = Some(r.held.holding(&f.conds)?);
+                read.insert(k.clone(), record_digest(k, r));
             }
         }
     }
@@ -903,7 +934,7 @@ async fn listed_keys(w: &Walker<'_>, keys: &[Key]) -> Result<Vec<Cand>> {
             held: h,
         });
     }
-    Ok(out)
+    Ok((out, read))
 }
 
 /// Owed keys of one edge after `after`, at most `limit`, and where the next page
@@ -987,6 +1018,7 @@ impl Plan {
             e.uv(t.add(&p.conditions) as u64);
             e.opt_u64(p.own_head);
             e.uv(p.expect);
+            e.uv(p.records);
             e.uv(p.keys.len() as u64);
             for c in &p.keys {
                 e.bytes(&c.key);
@@ -1012,6 +1044,7 @@ impl Plan {
             e.uv(u.head);
             e.uv(u.through);
         }
+        e.opt_u64(self.pass);
         let mut out = Enc::new();
         out.u8(PLAN_FORMAT);
         t.encode(&mut out);
@@ -1062,6 +1095,7 @@ impl Plan {
             let conditions = cond(d.uv()?)?;
             let own_head = d.opt_u64()?;
             let expect = d.uv()?;
+            let records = d.uv()?;
             let mut keys = Vec::new();
             for _ in 0..d.count()? {
                 let key = d.bytes()?.into();
@@ -1095,6 +1129,7 @@ impl Plan {
                 held_back,
                 moot,
                 expect,
+                records,
             });
         }
         let mut unkeyed = Vec::new();
@@ -1106,6 +1141,7 @@ impl Plan {
                 through: d.uv()?,
             });
         }
+        let pass = d.opt_u64()?;
         d.end()?;
         Ok(Plan {
             mode,
@@ -1113,6 +1149,7 @@ impl Plan {
             range,
             inputs,
             unkeyed,
+            pass,
         })
     }
 }
