@@ -88,7 +88,10 @@ impl LayerRef {
             ));
         }
         if self.index_start > self.top_start
-            || self.top_start.checked_add(TRAILER as u64) > Some(self.size)
+            || self
+                .top_start
+                .checked_add(TRAILER as u64)
+                .is_none_or(|end| end > self.size)
         {
             return invalid(format!(
                 "{}: offsets out of order: index {}, top {}, size {}",
@@ -656,6 +659,8 @@ pub struct Top {
     pub last_key: Vec<u8>,
     pub index_start: u64,
     pub commits_start: u64,
+    pub top_start: u64,
+    pub size: u64,
     pub segs: Index,
 }
 
@@ -711,6 +716,8 @@ impl Top {
             last_key,
             index_start,
             commits_start,
+            top_start,
+            size,
             segs,
         })
     }
@@ -727,7 +734,7 @@ impl Top {
         ) != (l.lo, l.hi, l.floor, l.entries, l.keys, l.flags)
             || self.first_key != l.first_key
             || self.last_key != l.last_key
-            || self.index_start != l.index_start
+            || (self.index_start, self.top_start, self.size) != (l.index_start, l.top_start, l.size)
         {
             return format(format!(
                 "{}: the file does not match its layer reference",
@@ -744,10 +751,17 @@ impl Top {
     }
 }
 
-pub(crate) fn decompress(c: &[u8], rlen: usize) -> Result<Vec<u8>> {
+/// A compressed frame must declare the length it is read for, before any
+/// buffer of that length is allocated.
+fn frame_holds(c: &[u8], rlen: usize) -> Result<()> {
     if !matches!(zstd::zstd_safe::get_frame_content_size(c), Ok(Some(n)) if n == rlen as u64) {
         return format(format!("the compressed frame does not hold {rlen} bytes"));
     }
+    Ok(())
+}
+
+pub(crate) fn decompress(c: &[u8], rlen: usize) -> Result<Vec<u8>> {
+    frame_holds(c, rlen)?;
     let raw = zstd::bulk::decompress(c, rlen).map_err(|e| Error::Format(format!("zstd: {e}")))?;
     if raw.len() != rlen {
         return format("decompressed length mismatch");
@@ -824,6 +838,7 @@ impl Decoder {
     pub fn decode(&mut self, c: &[u8], rlen: u32, rows: u32, out: &mut Run) -> Result<()> {
         out.clear();
         self.raw.clear();
+        frame_holds(c, rlen as usize)?;
         self.raw.reserve(rlen as usize);
         let n = self
             .zd

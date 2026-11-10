@@ -204,25 +204,29 @@ pub struct Store {
 }
 
 impl Store {
-    /// A store over `inner`, every path under `prefix`; `rt` runs prefetches and uploads.
+    /// A store over `inner`, every path under `prefix`; `rt` runs prefetches
+    /// and uploads. A disk cache knows the store by `inner`'s description and
+    /// `prefix` (for S3, the bucket but not the endpoint): give each store its
+    /// own `dir`.
     pub fn new(
         inner: Arc<dyn ObjectStore>,
         prefix: Path,
         rt: tokio::runtime::Handle,
         opts: StoreOptions,
     ) -> Result<Arc<Store>> {
-        let ns = format!("{inner}/{prefix}");
-        let disk = opts.disk.clone().map(|o| {
-            Disk::open(DiskOptions {
-                dir: o.dir.join(format!(
-                    "{:016x}",
-                    xxhash_rust::xxh3::xxh3_64(ns.as_bytes())
-                )),
-                ..o
-            })
-        });
+        let id = format!("{inner}/{prefix}");
+        Store::open(inner, prefix, rt, opts, &id)
+    }
+
+    fn open(
+        inner: Arc<dyn ObjectStore>,
+        prefix: Path,
+        rt: tokio::runtime::Handle,
+        opts: StoreOptions,
+        id: &str,
+    ) -> Result<Arc<Store>> {
         Ok(Arc::new(Store {
-            disk: disk.transpose()?,
+            disk: opts.disk.clone().map(|o| Disk::open(o, id)).transpose()?,
             inner,
             prefix,
             rt,
@@ -243,7 +247,8 @@ impl Store {
     }
 
     /// A store from a URL (`file:///…`, `s3://bucket/prefix`, …) and its
-    /// options, as `object_store::parse_url_opts` reads them.
+    /// options, as `object_store::parse_url_opts` reads them. A disk cache
+    /// knows the store by its URL and endpoint.
     pub fn from_url(
         url: &str,
         options: impl IntoIterator<Item = (String, String)>,
@@ -251,8 +256,16 @@ impl Store {
         opts: StoreOptions,
     ) -> Result<Arc<Store>> {
         let u = url::Url::parse(url).map_err(|e| Error::Invalid(format!("{url}: {e}")))?;
+        let options: Vec<(String, String)> = options.into_iter().collect();
+        let mut endpoints: Vec<&str> = options
+            .iter()
+            .filter(|(k, _)| k.to_ascii_lowercase().contains("endpoint"))
+            .map(|(_, v)| v.as_str())
+            .collect();
+        endpoints.sort();
+        let id = format!("{u} {}", endpoints.join(" "));
         let (inner, prefix) = object_store::parse_url_opts(&u, options)?;
-        Store::new(Arc::from(inner), prefix, rt, opts)
+        Store::open(Arc::from(inner), prefix, rt, opts, &id)
     }
 
     fn path(&self, path: &str) -> Result<Path> {
@@ -446,8 +459,9 @@ impl Store {
             t.write(&b).map_err(io)?;
             at = end;
         }
+        d.commit(t, path, size).map_err(io)?;
         self.stats.fills.fetch_add(1, Relaxed);
-        d.commit(t, path, size).map_err(io)
+        Ok(())
     }
 
     /// Bytes of the disk cache in use.
@@ -555,6 +569,18 @@ pub(crate) struct Upload {
     parts: Option<WriteMultipart>,
     tee: Option<Temp>,
     size: u64,
+}
+
+impl Drop for Upload {
+    /// An upload dropped unfinished (an error, a cancelled merge) gives its
+    /// parts back: S3 keeps them, billed, until aborted.
+    fn drop(&mut self) {
+        if let Some(w) = self.parts.take() {
+            self.store.rt.spawn(async move {
+                let _ = w.abort().await;
+            });
+        }
+    }
 }
 
 impl Upload {

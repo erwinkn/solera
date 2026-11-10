@@ -10,6 +10,33 @@ use rand::{Rng, SeedableRng};
 use solera_index::*;
 use std::sync::Arc;
 
+/// Allocations past 1 GiB fail (and abort the test), so a damaged length can
+/// never pass for a buffer size.
+struct Capped;
+
+unsafe impl std::alloc::GlobalAlloc for Capped {
+    unsafe fn alloc(&self, l: std::alloc::Layout) -> *mut u8 {
+        if l.size() > 1 << 30 {
+            return std::ptr::null_mut();
+        }
+        unsafe { std::alloc::System.alloc(l) }
+    }
+
+    unsafe fn dealloc(&self, p: *mut u8, l: std::alloc::Layout) {
+        unsafe { std::alloc::System.dealloc(p, l) }
+    }
+
+    unsafe fn realloc(&self, p: *mut u8, l: std::alloc::Layout, size: usize) -> *mut u8 {
+        if size > 1 << 30 {
+            return std::ptr::null_mut();
+        }
+        unsafe { std::alloc::System.realloc(p, l, size) }
+    }
+}
+
+#[global_allocator]
+static ALLOC: Capped = Capped;
+
 #[derive(Clone, PartialEq, Eq, Debug)]
 enum V {
     I(u64),
@@ -575,6 +602,22 @@ fn the_disk_cache_serves_reads_after_a_write_and_after_a_restart() {
         let store = Store::new(mem.clone(), Path::from("t"), rt.handle().clone(), opts).unwrap();
         ChangeIndex::new(store, WriteOptions::default())
     };
+    let reopen = |disk: &std::path::Path| {
+        let disk = disk.to_path_buf();
+        let index = &index;
+        async move {
+            // the background fill lets go of the directory just after it counts
+            for _ in 0..200 {
+                if let Ok(ix) =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| index(&disk)))
+                {
+                    return ix;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            panic!("the disk cache stayed locked")
+        }
+    };
     rt.block_on(async {
         let ix = index(&dir);
         let mut run = Run::new();
@@ -593,6 +636,7 @@ fn the_disk_cache_serves_reads_after_a_write_and_after_a_restart() {
         assert_eq!(ix_scan(&ix, &layers).await, 5000);
         assert_eq!(ix.store.stats.counts().gets, 0);
         // a restart finds the file
+        drop(ix);
         let again = index(&dir);
         assert_eq!(ix_scan(&again, &layers).await, 5000);
         assert_eq!(again.store.stats.counts().gets, 0);
@@ -607,7 +651,8 @@ fn the_disk_cache_serves_reads_after_a_write_and_after_a_restart() {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         assert_eq!(fresh.store.stats.counts().fills, 1);
-        let fresh = index(&fresh_dir);
+        drop(fresh);
+        let fresh = reopen(&fresh_dir).await;
         assert_eq!(ix_scan(&fresh, &layers).await, 5000);
         assert_eq!(fresh.store.stats.counts().gets, 0);
         assert!(fresh.store.stats.counts().disk_reads > 0);
@@ -687,6 +732,22 @@ fn bad_references_and_abandoned_reads_leave_the_index_working() {
             ix.scan(&[wrong], 1, &q).await,
             Err(Error::Format(_))
         ));
+        let moved = LayerRef {
+            top_start: l1.top_start + 1,
+            ..l1.clone()
+        };
+        assert!(matches!(
+            ix.scan(&[moved], 1, &q).await,
+            Err(Error::Format(_))
+        ));
+        let past = LayerRef {
+            top_start: u64::MAX,
+            ..l1.clone()
+        };
+        assert!(matches!(
+            ix.scan(&[past], 1, &q).await,
+            Err(Error::Invalid(_))
+        ));
         // a read dropped mid-GET gives its GET slot back: another layer's read
         // still runs with one slot
         let slow = Arc::new(object_store::throttle::ThrottledStore::new(
@@ -732,18 +793,54 @@ fn bad_references_and_abandoned_reads_leave_the_index_working() {
             ix.commits(&[damaged], 1, 1).await,
             Err(Error::Format(_))
         ));
-        // stores with different prefixes keep apart in one disk cache directory
-        let (a, b) = (index("a", Some(dir.clone())), index("b", Some(dir.clone())));
+        // a read that failed is not remembered: once the file is there, it reads
+        let late = LayerRef {
+            path: "late".into(),
+            ..l1.clone()
+        };
+        assert!(ix.scan(&[late.clone()], 1, &q).await.is_err());
+        let c1 = mem
+            .get(&Path::from("t/c1"))
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        mem.put(&Path::from("t/late"), c1.into()).await.unwrap();
+        assert_eq!(ix.scan(&[late], 1, &q).await.unwrap().run.len(), 1);
+        // a disk cache directory serves one store at a time, never another's files
+        let a = index("a", Some(dir.clone()));
+        let again = StoreOptions {
+            disk: Some(DiskOptions {
+                dir: dir.clone(),
+                bytes: 1 << 30,
+            }),
+            ..Default::default()
+        };
+        assert!(matches!(
+            Store::new(mem.clone(), Path::from("a"), rt.handle().clone(), again),
+            Err(Error::Invalid(_))
+        ));
         let la = a.write_commit("c1", nc(1), &one(1)).await.unwrap();
+        drop(a);
+        let b = index("b", Some(dir.clone()));
         let lb = b.write_commit("c1", nc(1), &one(2)).await.unwrap();
-        let (ra, rb) = (
-            a.scan(&[la], 1, &q).await.unwrap(),
-            b.scan(&[lb], 1, &q).await.unwrap(),
-        );
-        assert_eq!(ra.run.new_version(0), Version::Int(1));
+        let rb = b.scan(&[lb], 1, &q).await.unwrap();
         assert_eq!(rb.run.new_version(0), Version::Int(2));
+        drop(b);
+        let a = index("a", Some(dir.clone()));
+        let ra = a.scan(&[la], 1, &q).await.unwrap();
+        assert_eq!(ra.run.new_version(0), Version::Int(1));
     });
     let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn a_block_is_never_decoded_past_what_its_frame_holds() {
+    let c = zstd::bulk::compress(b"x", 1).unwrap();
+    let mut run = Run::new();
+    let got = format::Decoder::default().decode(&c, u32::MAX, 1, &mut run);
+    assert!(matches!(got, Err(Error::Format(_))));
 }
 
 async fn ix_scan(ix: &ChangeIndex, layers: &[LayerRef]) -> usize {
