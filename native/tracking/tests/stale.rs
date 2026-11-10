@@ -7,9 +7,11 @@ use std::sync::Arc;
 use object_store::memory::InMemory;
 use object_store::path::Path;
 use solera_index::{ChangeIndex, NewCommit, Run, Store, StoreOptions, Version, WriteOptions};
+use solera_tracking::codec::Ver;
 use solera_tracking::commit::{FullRunDone, OutputCommit};
 use solera_tracking::event::{Event, Part};
-use solera_tracking::outcomes::Outcomes;
+use solera_tracking::outcomes::transition::{Stored, FAILED};
+use solera_tracking::outcomes::{self, Held, Outcomes, Record};
 use solera_tracking::plan::OneIndex;
 use solera_tracking::progress::{
     self, read_digest, BatchProgress, Conditions, EdgeClose, EdgeOpen, EdgeRename, Holding, Key,
@@ -377,6 +379,184 @@ fn points_set_by_outcomes_move_the_edge_on() {
     let i = &t.stale.inputs[EDGE];
     assert!(i.gen > gen);
     assert!(i.current().is_none());
+}
+
+/// An edge `e` reading `up`, whose k1 (Int(1) at commit 1) failed in a batch
+/// at commit 1 while the consumer held nothing: B6 keeps that in a record.
+fn failed_k1(rt: &tokio::runtime::Runtime, ix: &ChangeIndex) -> Tracking {
+    let c = Arc::new(Conditions::default());
+    let mut t = Tracking::new();
+    apply(
+        &mut t,
+        vec![Part::EdgeOpen(EdgeOpen {
+            edge: key("e"),
+            input: key("up"),
+            keyed: true,
+        })],
+    );
+    apply(
+        &mut t,
+        vec![Part::Watch(SetWatch {
+            edge: key("e"),
+            watch: Watch {
+                conditions: c.clone(),
+                own: None,
+                gate: true,
+            },
+        })],
+    );
+    let u = write_k1(rt, ix, b"up", 1, Version::Absent, Version::Int(1));
+    apply(&mut t, vec![u]);
+    let b = Part::Batch(BatchProgress {
+        edge: key("e"),
+        reset: false,
+        range: KeyRange::all(),
+        piece: Some(Value::At(1, c.clone())),
+        points: vec![],
+        expect: read_digest(
+            t.edges[b"e".as_slice()].progress.keyed().unwrap(),
+            false,
+            &KeyRange::all(),
+        ),
+    });
+    let cid = outcomes::cond_id(&c);
+    let rec = Record {
+        stored: Stored {
+            outcome: FAILED,
+            tries: 1,
+            deploy: 0,
+            forced: 0,
+            since: 0,
+            last: 0,
+            next_at: 100,
+            until: 0,
+            message: b"error".as_slice().into(),
+        },
+        on: Ver::Int(1),
+        on_cond: cid,
+        at: 1,
+        held: Held::Absent,
+    }
+    .encode();
+    let fid = outcomes::output_id(outcomes::FAILURES, b"e");
+    let f = write_k1(rt, ix, &fid, 1, Version::Absent, Version::Bytes(&rec));
+    let o = Part::Outcomes(Outcomes {
+        edge: key("e"),
+        counts: [0, 1, 0, 0, 0, 0],
+        classes: [1, 0, 0],
+        conds: vec![(cid, c)],
+        refs: vec![(cid, 1)],
+        step: None,
+        at: 0,
+        look: None,
+        low: None,
+        life: t.per_key[b"e".as_slice()].life,
+        made: Some(1),
+        points: vec![],
+    });
+    apply(&mut t, vec![f, b, o]);
+    t
+}
+
+fn write_k1(
+    rt: &tokio::runtime::Runtime,
+    ix: &ChangeIndex,
+    output: &[u8],
+    commit: u64,
+    old: Version<'_>,
+    new: Version<'_>,
+) -> Part {
+    let mut r = Run::new();
+    r.push_key(b"k1");
+    r.push_entry(commit, new, old);
+    let nc = NewCommit {
+        commit,
+        time_ms: 0,
+        producer: b"",
+        live_before: (commit > 1) as u64,
+        clear: false,
+    };
+    let path = format!(
+        "{}/{commit}",
+        String::from_utf8_lossy(output).replace('\0', "_")
+    );
+    let layer = rt.block_on(ix.write_commit(&path, nc, &r)).unwrap();
+    Part::OutputCommit(OutputCommit {
+        output: output.into(),
+        layer,
+        live: (!new.is_absent()) as u64,
+        ends_full_run: false,
+    })
+}
+
+fn refresh_e(rt: &tokio::runtime::Runtime, ix: &ChangeIndex, t: &mut Tracking) -> Status {
+    let ask = t.stale_ask(b"e").unwrap();
+    if let Some(w) = rt
+        .block_on(stale::refresh(&ask, &OneIndex(ix), &NoneDue, 1))
+        .unwrap()
+    {
+        apply(t, vec![Part::Witness(w)]);
+    }
+    t.stale_status(b"e").unwrap()
+}
+
+#[test]
+fn a_failing_key_is_owed_by_what_its_record_holds() {
+    let (rt, ix) = index();
+    let mut t = failed_k1(&rt, &ix);
+    assert_eq!(
+        refresh_e(&rt, &ix, &mut t),
+        Status::Fresh,
+        "k1 waits for its retry"
+    );
+
+    let removal = write_k1(&rt, &ix, b"up", 2, Version::Int(1), Version::Absent);
+    let mut n = stale::Notice::new(&t, b"up", 2, false, 7);
+    n.push(b"k1", Version::Absent);
+    assert!(
+        n.finish().is_empty(),
+        "an edge with records is left for a refresh"
+    );
+    apply(&mut t, vec![removal]);
+    assert_eq!(
+        refresh_e(&rt, &ix, &mut t),
+        Status::Fresh,
+        "upstream removed k1 and the consumer holds nothing: nothing is owed"
+    );
+
+    let back = write_k1(&rt, &ix, b"up", 3, Version::Absent, Version::Int(3));
+    apply(&mut t, vec![back]);
+    assert_eq!(
+        refresh_e(&rt, &ix, &mut t),
+        Status::Stale {
+            key: Some(key("k1")),
+            reason: Reason::InputChanged,
+            since_ms: 1
+        },
+        "k1 changed since it failed: due"
+    );
+}
+
+#[test]
+fn a_witness_that_failed_waits_for_its_retry() {
+    let (rt, ix) = index();
+    let mut t = failed_k1(&rt, &ix);
+    let gen = t.stale.inputs[b"e".as_slice()].gen;
+    apply(
+        &mut t,
+        vec![Part::Witness(Witness {
+            edge: key("e"),
+            gen,
+            x: 0,
+            state: stale("k1", 1),
+            retry: false,
+        })],
+    );
+    assert_eq!(
+        refresh_e(&rt, &ix, &mut t),
+        Status::Fresh,
+        "the recheck of a witness that has failed since reads its record"
+    );
 }
 
 fn entries(keys: &[(&str, Option<u64>)], commit: u64) -> Run {

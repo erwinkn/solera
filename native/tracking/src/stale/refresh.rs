@@ -9,7 +9,7 @@ use solera_index::{LayerRef, Query, Version};
 use crate::codec::Ver;
 use crate::error::{invalid, Result};
 use crate::event::Part;
-use crate::outcomes::{output_id, FAILURES};
+use crate::outcomes::{output_id, Conds, Record, FAILURES};
 use crate::plan::{plan, Cand, Hold, Indexes, InputRequest, Mode, Request, View};
 use crate::progress::{self, owed, Class, Conditions, Holding, Key, Keyed, Progress, Value};
 use crate::stale::{Changed, Input, Reason, State, Witness};
@@ -17,6 +17,9 @@ use crate::state::{Id, Tracking};
 
 /// Keys owed but not due: failed keys waiting for their retry (B6's due
 /// index; until it lands, the lists the engine passes).
+/// Failure records read in one lookup when rule 1 settles its candidates.
+const RECORD_CHUNK: usize = 1024;
+
 pub trait Due: Sync {
     fn not_due(&self, edge: &[u8], key: &[u8]) -> bool;
     /// Changes whenever the keys not due on `edge` change: a cached count's
@@ -95,16 +98,54 @@ impl Ask {
         })
     }
 
-    /// Whether `key` is due at the head: its state, if it is.
+    /// Whether `key` is due at the head: its state, if it is. A key list
+    /// takes a failing key whatever its record says, so a key waiting for
+    /// its retry is not due here.
     async fn recheck(&self, ixs: &dyn Indexes, due: &dyn Due, key: &Key) -> Result<Option<State>> {
         let req = self.request(Mode::Keys(vec![key.clone()]), None);
         let p = plan(&self.view, &req, ixs, &crate::plan::NoHold).await?;
-        Ok(match p.inputs[0].keys.first() {
-            Some(c) if c.class != Class::Unchanged && !due.not_due(&self.edge, key) => {
-                Some(self.stale(c))
+        let Some(c) = p.inputs[0].keys.first() else {
+            return Ok(None);
+        };
+        if c.class == Class::Unchanged || due.not_due(&self.edge, key) {
+            return Ok(None);
+        }
+        if let Some((recs, conds)) = self.view.failure_records(ixs, &[key]).await? {
+            if let Some(r) = recs.get(key) {
+                if due_by_record(r, &conds, key, &c.version, &self.req.conditions)?.is_none() {
+                    return Ok(None);
+                }
             }
-            _ => None,
-        })
+        }
+        Ok(Some(self.stale(c)))
+    }
+
+    /// Of rule 1's candidates on an edge with failure records, in key order,
+    /// the first still due once each key's record (B6) is read: a record
+    /// says what the consumer holds, and a key tried at what upstream has
+    /// now waits for its retry.
+    async fn settle(
+        &self,
+        ixs: &dyn Indexes,
+        cands: &[(Key, Ver, Reason)],
+    ) -> Result<Option<State>> {
+        let now = &self.req.conditions;
+        for chunk in cands.chunks(RECORD_CHUNK) {
+            let keys: Vec<&[u8]> = chunk.iter().map(|c| c.0.as_ref()).collect();
+            let Some((recs, conds)) = self.view.failure_records(ixs, &keys).await? else {
+                return Ok(chunk.first().map(|c| stale_at(&c.0, c.2)));
+            };
+            for (key, version, reason) in chunk {
+                let Some(r) = recs.get(key) else {
+                    return Ok(Some(stale_at(key, *reason)));
+                };
+                if let Some(held) = due_by_record(r, &conds, key, version, now)? {
+                    let reason = reason_of(self.keyed(), now, key, &held, version);
+                    return Ok(Some(stale_at(key, reason)));
+                }
+            }
+        }
+        Ok(None)
     }
 
     fn stale(&self, c: &Cand) -> State {
@@ -132,6 +173,7 @@ impl Ask {
     ) -> Result<Option<State>> {
         let ix = ixs.index(&self.output)?;
         let hold = self.hold(due);
+        let records = self.view.has_failures();
         let mut q = Query {
             pattern: self.req.conditions.patterns.index_pattern(),
             ..Default::default()
@@ -140,6 +182,7 @@ impl Ask {
         loop {
             q.limit = Some(limit);
             let page = ix.diff(&self.layers, x, self.head, &q).await?;
+            let mut cands = vec![];
             for i in 0..page.run.len() {
                 let key = page.run.key(i);
                 if changed.contains(key) {
@@ -148,15 +191,13 @@ impl Ask {
                 let new = page.run.new_version(page.run.rows(i).start);
                 match rule1(self.keyed(), &self.req.conditions, key, new, Some(&hold)) {
                     Step::Skip => {}
-                    Step::Due(reason) => {
-                        return Ok(Some(State::Stale {
-                            key: key.into(),
-                            reason,
-                            since_ms: 0,
-                        }))
-                    }
+                    Step::Due(reason) if !records => return Ok(Some(stale_at(key, reason))),
+                    Step::Due(reason) => cands.push((key.into(), Ver::of(new), reason)),
                     Step::Unsure => unreachable!("rule 1 with a hold decides"),
                 }
+            }
+            if let Some(s) = self.settle(ixs, &cands).await? {
+                return Ok(Some(s));
             }
             match page.next {
                 Some(n) => q.after = Some(n),
@@ -507,6 +548,32 @@ fn rule1(
         }
         Value::At(..) => Reason::InputChanged,
     })
+}
+
+fn stale_at(key: &[u8], reason: Reason) -> State {
+    State::Stale {
+        key: key.into(),
+        reason,
+        since_ms: 0,
+    }
+}
+
+/// What a failing key's record (B6) says of it with upstream at `version`:
+/// what the consumer holds if the key is owed and not waiting for its retry
+/// (tried at `version` already), else None.
+fn due_by_record(
+    r: &Record,
+    conds: &Conds,
+    key: &[u8],
+    version: &Ver,
+    now: &Arc<Conditions>,
+) -> Result<Option<Holding>> {
+    let wanted = Holding::of(version.as_version(), now, key);
+    let held = r.held.holding(conds)?;
+    if !owed(&held, &wanted) || !owed(&r.tried(key, conds)?, &wanted) {
+        return Ok(None);
+    }
+    Ok(Some(held))
 }
 
 /// Why a due key is due.

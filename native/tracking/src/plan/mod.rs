@@ -243,6 +243,29 @@ struct Failures {
     classes: [u64; 3],
 }
 
+impl View {
+    /// B6: the first input's failure records of `keys` and the conditions
+    /// they name, or None when the edge has no records.
+    pub async fn failure_records(
+        &self,
+        ixs: &dyn Indexes,
+        keys: &[&[u8]],
+    ) -> Result<Option<(BTreeMap<Key, crate::outcomes::Record>, Arc<Conds>)>> {
+        let Some(f) = self.inputs.first().and_then(|v| v.failures.as_ref()) else {
+            return Ok(None);
+        };
+        Ok(Some((
+            records(ixs, &f.output, &f.out, keys).await?,
+            f.conds.clone(),
+        )))
+    }
+
+    /// B6: whether the first input has failure records.
+    pub fn has_failures(&self) -> bool {
+        self.inputs.first().is_some_and(|v| v.failures.is_some())
+    }
+}
+
 impl Tracking {
     pub fn view(&self, req: &Request) -> Result<View> {
         let output = |id: &[u8]| {
