@@ -253,7 +253,14 @@ pub async fn commit(
                 None
             }
             Some(r) => {
-                let fresh = prior.is_none_or(|p| p.on != *tried || p.on_cond != on_cond);
+                // A try is fresh on another version, or under conditions that
+                // process differently; a change of patterns alone is not one.
+                let fresh = prior.is_none_or(|pr| {
+                    pr.on != *tried
+                        || !conds
+                            .get(&pr.on_cond)
+                            .is_some_and(|c| c.same_processing(&p.conditions))
+                });
                 transition(
                     prior.map(|p| &p.stored),
                     fresh,

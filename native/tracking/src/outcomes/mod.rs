@@ -730,49 +730,49 @@ impl Tracking {
 /// starts the records over (they failed against a progress that is gone),
 /// a close drops them, a rename moves them.
 pub(crate) fn follow(p: &Part, t: &mut Tracking) {
+    let edge = match p {
+        Part::Reset(r) => &r.edge,
+        Part::Batch(b) if b.reset => &b.edge,
+        Part::EdgeClose(c) => &c.edge,
+        Part::EdgeRename(r) if r.from != r.to => &r.from,
+        _ => return,
+    };
+    if !t
+        .edges
+        .get(edge)
+        .is_some_and(|e| e.progress.keyed().is_some())
+    {
+        return;
+    }
+    // A later life, even for an edge no B6 part has applied to yet: a part
+    // built before applies to none of what comes after.
+    let mut k = t.per_key.remove(edge).unwrap_or_default();
+    let gone = PerKey {
+        life: k.life + 1,
+        ..PerKey::default()
+    };
     match p {
-        Part::Reset(r) => {
-            t.drop_records(&r.edge);
-            if let Some(k) = t.per_key.get_mut(&r.edge) {
-                k.clear();
-            }
-        }
-        Part::Batch(b) if b.reset => {
-            t.drop_records(&b.edge);
-            if let Some(k) = t.per_key.get_mut(&b.edge) {
-                k.clear();
-            }
-        }
-        Part::EdgeClose(c) => {
-            t.drop_records(&c.edge);
-            if let Some(k) = t.per_key.get_mut(&c.edge) {
-                *k = PerKey {
-                    life: k.life + 1,
-                    ..PerKey::default()
-                };
-            }
-        }
-        Part::EdgeRename(r) if r.from != r.to => {
+        Part::EdgeRename(r) => {
             for kind in [FAILURES, DUE, PASS] {
                 if let Some(o) = t.outputs.remove(&output_id(kind, &r.from)) {
                     t.outputs.insert(output_id(kind, &r.to), o);
                 }
             }
-            if let Some(mut k) = t.per_key.remove(&r.from) {
-                t.per_key.insert(
-                    r.from.clone(),
-                    PerKey {
-                        life: k.life + 1,
-                        ..PerKey::default()
-                    },
-                );
-                if let Some(closed) = t.per_key.get(&r.to) {
-                    k.life = k.life.max(closed.life);
-                }
-                t.per_key.insert(r.to.clone(), k);
+            if let Some(closed) = t.per_key.get(&r.to) {
+                k.life = k.life.max(closed.life);
             }
+            t.per_key.insert(r.to.clone(), k);
+            t.per_key.insert(r.from.clone(), gone);
         }
-        _ => {}
+        Part::EdgeClose(_) => {
+            t.drop_records(edge);
+            t.per_key.insert(edge.clone(), gone);
+        }
+        _ => {
+            t.drop_records(edge);
+            k.clear();
+            t.per_key.insert(edge.clone(), k);
+        }
     }
 }
 

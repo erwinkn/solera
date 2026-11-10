@@ -27,7 +27,7 @@ use solera_tracking::due;
 use solera_tracking::event::{Event, Part};
 use solera_tracking::outcomes::commit::{self as oc, records, Ctx};
 use solera_tracking::outcomes::transition::{
-    eligible, transition, Counters, Kind, Reported, Stored,
+    eligible, transition, Counters, Kind, Reported, Stored, FAILED,
 };
 use solera_tracking::outcomes::{cond_id, output_id, record_digest, Rebuild, FAILURES};
 use solera_tracking::plan::{self, InputRequest, Mode, NoHold, OneIndex, Request};
@@ -109,7 +109,7 @@ impl Log {
 struct Fail {
     stored: Stored,
     tried: Holding,
-    tried_cond: u64,
+    tried_cond: Arc<Conditions>,
     tried_ver: Ver,
     at: u64,
 }
@@ -530,7 +530,6 @@ impl World {
         }
         // The truth.
         let ip = &p.inputs[0];
-        let cid = cond_id(&ip.conditions);
         let fails: BTreeMap<Key, Reported> = failed.into_iter().collect();
         let loaded: BTreeMap<Key, Ver> = loaded.into_iter().collect();
         for c in &ip.keys {
@@ -540,7 +539,9 @@ impl World {
                 self.fails.remove(&c.key);
             } else if let Some(r) = fails.get(&c.key) {
                 let prior = self.fails.get(&c.key);
-                let fresh = prior.is_none_or(|f| f.tried_ver != *got || f.tried_cond != cid);
+                let fresh = prior.is_none_or(|f| {
+                    f.tried_ver != *got || !f.tried_cond.same_processing(&ip.conditions)
+                });
                 let s = transition(
                     prior.map(|f| &f.stored),
                     fresh,
@@ -556,7 +557,7 @@ impl World {
                     Fail {
                         stored: s,
                         tried,
-                        tried_cond: cid,
+                        tried_cond: ip.conditions.clone(),
                         tried_ver: got.clone(),
                         at: ip.head,
                     },
@@ -1433,14 +1434,10 @@ impl World {
     }
 }
 
-/// A part built before the edge's records started over applies to none of
-/// the records after (second review H1). A reset or a close starts the
-/// failures head and the pass numbers over, so a commit or a pass start built
-/// before would meet its head and its turn again.
-#[test]
-fn a_part_built_before_the_records_started_over_is_refused() {
-    let rt = runtime();
-    let restarts = [
+/// What starts an edge's records over: a reset, a close and a reopen, a
+/// rename and a reopen of the old name.
+fn restarts() -> [Vec<Part>; 3] {
+    [
         vec![Part::Reset(Reset {
             edge: key(EDGE),
             held: false,
@@ -1465,8 +1462,17 @@ fn a_part_built_before_the_records_started_over_is_refused() {
                 keyed: true,
             }),
         ],
-    ];
-    for restart in restarts {
+    ]
+}
+
+/// A part built before the edge's records started over applies to none of
+/// the records after (second review H1). A reset or a close starts the
+/// failures head and the pass numbers over, so a commit or a pass start built
+/// before would meet its head and its turn again.
+#[test]
+fn a_part_built_before_the_records_started_over_is_refused() {
+    let rt = runtime();
+    for restart in restarts() {
         let ix = index(&rt);
         rt.block_on(async {
             let mut w = scripted();
@@ -1835,5 +1841,75 @@ fn a_pass_start_on_another_views_list_is_refused() {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("pass list"), "{err}");
+    });
+}
+
+/// A first batch built on an edge no B6 part has applied to yet is refused
+/// once the edge starts over (round 5): the restart gives the edge a later
+/// life even without outcome state.
+#[test]
+fn a_first_batch_built_before_the_edge_started_over_is_refused() {
+    let rt = runtime();
+    for restart in restarts() {
+        let ix = index(&rt);
+        rt.block_on(async {
+            let mut w = scripted();
+            let c = w.counters;
+            w.input(&ix, &[("k1", 5), ("k2", 5)]).await;
+            let first = w.planned(&ix, None, 1, Mode::Incremental).await;
+            let commit = w
+                .commit_of(&ix, &first, &[("k1", Kind::Failed)], &[], c)
+                .await
+                .unwrap();
+            assert!(!w.t.per_key.contains_key(EDGE.as_bytes()));
+            for part in restart {
+                w.apply(vec![part]);
+            }
+            let before = w.t.snapshot();
+            assert!(w.t.apply(&Event::of(commit).encode()).is_err());
+            assert_eq!(w.t.snapshot(), before);
+        });
+    }
+}
+
+/// A change of patterns alone does not make a try fresh (round 5): a key
+/// both patterns take keeps its tries, and its timeouts run out.
+#[test]
+fn a_change_of_patterns_alone_keeps_a_keys_tries() {
+    let rt = runtime();
+    let ix = index(&rt);
+    rt.block_on(async {
+        let mut w = scripted();
+        w.input(&ix, &[("k1", 5)]).await;
+        let first = w.planned(&ix, None, 10, Mode::Incremental).await;
+        let c = w.counters;
+        let ev = w
+            .commit_of(&ix, &first, &[("k1", Kind::TimedOut)], &[], c)
+            .await
+            .unwrap();
+        w.apply(ev);
+        for n in 2..=3 {
+            if n == 3 {
+                w.now = only(&w.now, "k1");
+                if let Some(parts) = w.caught(&ix).await {
+                    w.apply(parts);
+                }
+            }
+            w.clock += 100_000.0;
+            let start = w.start_of(&ix).await.expect("k1's timeout is due");
+            w.apply(start);
+            let step = w.retry_plan(&ix, 10).await;
+            assert_eq!(taken(&step), [key("k1")]);
+            let c = w.counters;
+            let ev = w
+                .commit_of(&ix, &step, &[("k1", Kind::TimedOut)], &[], c)
+                .await
+                .unwrap();
+            w.apply(ev);
+            let r = &w.stored(&ix).await[&key("k1")];
+            assert_eq!(r.stored.tries, n, "k1's tries");
+        }
+        let r = &w.stored(&ix).await[&key("k1")];
+        assert_eq!(r.stored.outcome, FAILED, "k1's timeouts ran out");
     });
 }
