@@ -21,6 +21,8 @@ use crate::state::{Id, Tracking};
 /// index; until it lands, the lists the engine passes).
 /// Failure records read in one lookup when rule 1 settles its candidates.
 const RECORD_CHUNK: usize = 1024;
+/// Retry records a page of the retry plan reads past moot keys.
+const RETRY_PAGE: usize = 256;
 
 pub trait Due: Sync {
     fn not_due(&self, edge: &[u8], key: &[u8]) -> bool;
@@ -164,21 +166,33 @@ impl Ask {
 
     /// Rule 5: the next key of the retry pass under way (B6's retry plan),
     /// if one is due. A key gone moot fills the plan's limit without being
-    /// taken, so the limit grows until a key is taken or the pass is read.
+    /// taken, so past one the plan reads on in pages of `RETRY_PAGE` from
+    /// where the last stopped, until a key is taken or the pass is read.
     pub(super) async fn next_retry(&self, ixs: &dyn Indexes) -> Result<Option<State>> {
         let Some(r) = &self.retry else {
             return Ok(None);
         };
-        let mut limit = 1;
+        let now = &self.req.conditions;
+        let mut p = crate::due::plan(ixs, r, now, 1).await?;
+        let mut from: Option<RetryView> = None;
         loop {
-            let p = crate::due::plan(ixs, r, &self.req.conditions, limit).await?;
             if let Some(c) = p.inputs[0].keys.first() {
                 return Ok(Some(stale_at(&c.key, Reason::RetryDue)));
             }
-            if p.range.hi.is_none() {
+            let Some(hi) = p.range.hi.take() else {
                 return Ok(None);
+            };
+            let v = from.get_or_insert_with(|| RetryView {
+                outcomes: r.outcomes.clone(),
+                pass_list: r.pass_list.clone(),
+                input: r.input.clone(),
+                layers: r.layers.clone(),
+                head: r.head,
+            });
+            if let Some(pass) = v.outcomes.per_key.pass.as_mut() {
+                pass.after = Some(hi);
             }
-            limit *= 16;
+            p = crate::due::plan(ixs, v, now, RETRY_PAGE).await?;
         }
     }
 
@@ -243,7 +257,7 @@ impl Tracking {
         let e = &self.edges[edge];
         let req = InputRequest {
             edge: edge.into(),
-            conditions: w.conditions.clone(),
+            conditions: self.watched(edge, w),
             own: w.own.clone(),
         };
         let view = self.view(&Request {
@@ -443,7 +457,7 @@ impl Notice {
                 edge: id.clone(),
                 gen: i.gen,
                 progress: e.progress.clone(),
-                now: w.conditions.clone(),
+                now: t.watched(id, w),
                 state: k.state.clone(),
             };
             match k.state {

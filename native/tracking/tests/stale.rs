@@ -344,6 +344,11 @@ fn points_set_by_outcomes_move_the_edge_on() {
 /// An edge `e` reading `up`, whose k1 (Int(1) at commit 1) failed in a batch
 /// at commit 1 while the consumer held nothing: B6 keeps that in a record.
 fn failed_k1(rt: &tokio::runtime::Runtime, ix: &ChangeIndex) -> Tracking {
+    failed(rt, ix, &["k1"])
+}
+
+/// `failed_k1` for each of `keys`.
+fn failed(rt: &tokio::runtime::Runtime, ix: &ChangeIndex, keys: &[&str]) -> Tracking {
     let c = Arc::new(Conditions::default());
     let mut t = Tracking::new();
     apply(
@@ -365,7 +370,11 @@ fn failed_k1(rt: &tokio::runtime::Runtime, ix: &ChangeIndex) -> Tracking {
             },
         })],
     );
-    let u = write_k1(rt, ix, b"up", 1, Version::Absent, Version::Int(1));
+    let ups: Vec<_> = keys
+        .iter()
+        .map(|k| (*k, Version::Absent, Version::Int(1)))
+        .collect();
+    let u = write(rt, ix, b"up", 1, 0, &ups);
     apply(&mut t, vec![u]);
     let b = Part::Batch(BatchProgress {
         edge: key("e"),
@@ -399,13 +408,17 @@ fn failed_k1(rt: &tokio::runtime::Runtime, ix: &ChangeIndex) -> Tracking {
     }
     .encode();
     let fid = outcomes::output_id(outcomes::FAILURES, b"e");
-    let f = write_k1(rt, ix, &fid, 1, Version::Absent, Version::Bytes(&rec));
+    let recs: Vec<_> = keys
+        .iter()
+        .map(|k| (*k, Version::Absent, Version::Bytes(&rec)))
+        .collect();
+    let f = write(rt, ix, &fid, 1, 0, &recs);
     let o = Part::Outcomes(Outcomes {
         edge: key("e"),
-        counts: [0, 1, 0, 0, 0, 0],
-        classes: [1, 0, 0],
+        counts: [0, keys.len() as u64, 0, 0, 0, 0],
+        classes: [keys.len() as u64, 0, 0],
         conds: vec![(cid, c)],
-        refs: vec![(cid, 1)],
+        refs: vec![(cid, keys.len() as u64)],
         step: None,
         at: 0,
         look: None,
@@ -426,14 +439,37 @@ fn write_k1(
     old: Version<'_>,
     new: Version<'_>,
 ) -> Part {
+    write(
+        rt,
+        ix,
+        output,
+        commit,
+        (commit > 1) as u64,
+        &[("k1", old, new)],
+    )
+}
+
+/// Commits `entries` (key, replaced, new) to `output`, which held `live` keys.
+fn write(
+    rt: &tokio::runtime::Runtime,
+    ix: &ChangeIndex,
+    output: &[u8],
+    commit: u64,
+    live: u64,
+    entries: &[(&str, Version<'_>, Version<'_>)],
+) -> Part {
     let mut r = Run::new();
-    r.push_key(b"k1");
-    r.push_entry(commit, new, old);
+    let mut after = live as i64;
+    for (k, old, new) in entries {
+        r.push_key(k.as_bytes());
+        r.push_entry(commit, *new, *old);
+        after += !new.is_absent() as i64 - !old.is_absent() as i64;
+    }
     let nc = NewCommit {
         commit,
         time_ms: 0,
         producer: b"",
-        live_before: (commit > 1) as u64,
+        live_before: live,
         clear: false,
     };
     let path = format!(
@@ -444,7 +480,7 @@ fn write_k1(
     Part::OutputCommit(OutputCommit {
         output: output.into(),
         layer,
-        live: (!new.is_absent()) as u64,
+        live: after as u64,
         ends_full_run: false,
     })
 }
@@ -580,7 +616,7 @@ fn a_retry_pass_makes_its_next_key_due() {
 }
 
 #[test]
-fn a_full_run_asked_for_by_hand_raises_the_watched_rebuild_counter() {
+fn a_full_run_asked_for_by_hand_raises_the_rebuild_counter_staleness_reads() {
     let mut t = opened();
     know(&mut t, 0, State::Fresh);
     let life = t.per_key[EDGE].life;
@@ -593,9 +629,70 @@ fn a_full_run_asked_for_by_hand_raises_the_watched_rebuild_counter() {
         })],
     );
     let i = &t.stale.inputs[EDGE];
-    assert_eq!(i.watch.as_ref().unwrap().conditions.rebuild, 1);
     assert_eq!(i.changed, stale::Changed::All);
     assert_eq!(t.stale_status(EDGE).unwrap(), Status::Unknown);
+    assert_eq!(t.stale_ask(EDGE).unwrap().req.conditions.rebuild, 1);
+    apply(&mut t, vec![watch(&Arc::new(Conditions::default()))]);
+    assert_eq!(
+        t.stale_ask(EDGE).unwrap().req.conditions.rebuild,
+        1,
+        "a watch journaled with an older counter does not undo the rebuild"
+    );
+
+    let mut t = opened();
+    know(&mut t, 0, State::Fresh);
+    let life = t.per_key[EDGE].life;
+    let rebuild = Part::Rebuild(outcomes::Rebuild {
+        edge: EDGE.into(),
+        to: 1,
+        life,
+    });
+    let e = Event::of(vec![rebuild, watch(&Arc::new(Conditions::default()))]);
+    t.apply(&e.encode()).unwrap();
+    assert_eq!(
+        t.stale_ask(EDGE).unwrap().req.conditions.rebuild,
+        1,
+        "nor does one in the same event"
+    );
+}
+
+#[test]
+fn a_retry_pass_reads_past_keys_gone_moot() {
+    let (rt, ix) = index();
+    let mut t = failed(&rt, &ix, &["k1", "k2"]);
+    assert_eq!(refresh_e(&rt, &ix, &mut t), Status::Fresh);
+    let removal = write(
+        &rt,
+        &ix,
+        b"up",
+        2,
+        2,
+        &[("k1", Version::Int(1), Version::Absent)],
+    );
+    apply(&mut t, vec![removal]);
+    let life = t.per_key[b"e".as_slice()].life;
+    apply(
+        &mut t,
+        vec![Part::PassStart(PassStart {
+            edge: key("e"),
+            n: 1,
+            at: 200,
+            counters: Counters {
+                deploy: 1,
+                ..Counters::default()
+            },
+            life,
+        })],
+    );
+    assert_eq!(
+        refresh_e(&rt, &ix, &mut t),
+        Status::Stale {
+            key: Some(key("k2")),
+            reason: Reason::RetryDue,
+            since_ms: 1
+        },
+        "k1 went moot when upstream removed it; the pass's next key is k2"
+    );
 }
 
 fn entries(keys: &[(&str, Option<u64>)], commit: u64) -> Run {

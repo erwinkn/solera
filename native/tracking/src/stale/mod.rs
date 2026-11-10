@@ -199,6 +199,19 @@ pub struct Stale {
 }
 
 impl Tracking {
+    /// The conditions `edge` is watched under, with B6's rebuild counter in
+    /// place of the watch's: a full run asked for by hand raises it.
+    pub fn watched(&self, edge: &[u8], w: &Watch) -> Arc<Conditions> {
+        let rebuild = self.rebuild(edge);
+        if w.conditions.rebuild == rebuild {
+            return w.conditions.clone();
+        }
+        Arc::new(Conditions {
+            rebuild,
+            ..(*w.conditions).clone()
+        })
+    }
+
     /// Whether the gate holds an edge reading `output`: the edge keeps the
     /// gate and `output` is in the middle of a full run (rule 8).
     pub fn held(&self, input: &Input, output: &[u8]) -> bool {
@@ -276,9 +289,6 @@ impl Stale {
             }
             Part::Rebuild(r) => {
                 if let Some(i) = self.inputs.get_mut(&r.edge) {
-                    if let Some(w) = i.watch.as_mut() {
-                        Arc::make_mut(&mut w.conditions).rebuild = r.to;
-                    }
                     self.gens += 1;
                     i.moved(self.gens, None);
                 }
