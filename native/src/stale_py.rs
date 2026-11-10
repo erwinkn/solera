@@ -133,25 +133,6 @@ pub(crate) fn refresh<'py>(
     Ok(one_event(py, parts))
 }
 
-pub(crate) fn retry_due<'py>(
-    py: Python<'py>,
-    state: &RwLock<tr::Tracking>,
-    ixs: &dyn Indexes,
-    edge: Vec<u8>,
-    keys: Vec<String>,
-    time_ms: u64,
-    not_due: Option<&Bound<'py, PyDict>>,
-) -> PyResult<Option<Bound<'py, PyBytes>>> {
-    let due = NotDue::of(not_due)?;
-    let ask = state.read().unwrap().stale_ask(&edge).map_err(err)?;
-    let mut keys: Vec<Key> = keys.into_iter().map(|k| k.into_bytes().into()).collect();
-    keys.sort();
-    let w = py
-        .detach(|| rt().block_on(tr::stale::retry_due(&ask, ixs, &due, &keys, time_ms)))
-        .map_err(err)?;
-    Ok(one_event(py, w.into_iter().map(Part::Witness).collect()))
-}
-
 fn status_dict<'py>(py: Python<'py>, s: &Status) -> PyResult<Bound<'py, PyDict>> {
     let d = PyDict::new(py);
     let (name, k, reason, since) = match s {
@@ -212,15 +193,19 @@ pub(crate) fn count<'py>(
         return Ok(None);
     };
     let d = PyDict::new(py);
-    for (name, v) in ["added", "updated", "removed"].into_iter().zip(o.counts) {
-        d.set_item(name, v)?;
+    for (part, counts) in [("due", o.due), ("waiting", o.waiting)] {
+        let c = PyDict::new(py);
+        for (name, v) in ["added", "updated", "removed"].into_iter().zip(counts) {
+            c.set_item(name, v)?;
+        }
+        d.set_item(part, c)?;
     }
     let reasons: Vec<&str> = o.reasons.iter().map(|r| r.name()).collect();
     d.set_item("reasons", reasons)?;
     Ok(Some(d))
 }
 
-/// A page of the keys the edge owes: `([(key, class), ...], next)`.
+/// A page of the keys the edge owes and are due: `([(key, class), ...], next)`.
 pub(crate) fn keys<'py>(
     py: Python<'py>,
     state: &RwLock<tr::Tracking>,
@@ -228,11 +213,13 @@ pub(crate) fn keys<'py>(
     edge: Vec<u8>,
     after: Option<String>,
     limit: usize,
+    not_due: Option<&Bound<'py, PyDict>>,
 ) -> PyResult<Bound<'py, PyTuple>> {
+    let due = NotDue::of(not_due)?;
     let ask = state.read().unwrap().stale_ask(&edge).map_err(err)?;
     let after: Option<Key> = after.map(|k| k.into_bytes().into());
     let (rows, next) = py
-        .detach(|| rt().block_on(ask.keys(ixs, after.as_ref(), limit)))
+        .detach(|| rt().block_on(ask.keys(ixs, &due, after.as_ref(), limit)))
         .map_err(err)?;
     let out = PyList::empty(py);
     for c in &rows {

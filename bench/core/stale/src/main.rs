@@ -125,7 +125,6 @@ fn state(
                 gen,
                 x: *x,
                 state: s.clone(),
-                retry: false,
             })]))
             .unwrap();
         }
@@ -269,7 +268,7 @@ fn main() {
                     .block_on(counts.get(&ask, &OneIndex(&ix), &NoneDue))
                     .unwrap()
                     .unwrap();
-                let n = o.counts;
+                let n = o.due;
                 let (wall, cpu) = (t0.elapsed().as_secs_f64(), proc_cpu() - c0);
                 let s = ix.store.stats.counts();
                 emit(
@@ -550,7 +549,7 @@ fn main() {
                 let s = ix.store.stats.counts();
                 emit(
                     "count-records",
-                    json!({"behind_days": 1, "records": n, "mode": pass, "wall_s": r3(t0.elapsed().as_secs_f64()), "cpu_s": r3(proc_cpu() - c0), "gets": s.gets - s0.gets, "mb": r3((s.get_bytes - s0.get_bytes) as f64 / 1e6), "owed": o.counts.iter().sum::<u64>()}),
+                    json!({"behind_days": 1, "records": n, "mode": pass, "wall_s": r3(t0.elapsed().as_secs_f64()), "cpu_s": r3(proc_cpu() - c0), "gets": s.gets - s0.gets, "mb": r3((s.get_bytes - s0.get_bytes) as f64 / 1e6), "due": o.due.iter().sum::<u64>(), "waiting": o.waiting.iter().sum::<u64>()}),
                 );
             }
         }

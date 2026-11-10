@@ -7,8 +7,9 @@ use std::sync::{Arc, Mutex};
 
 use solera_index::Query;
 
+use crate::codec::Ver;
 use crate::error::Result;
-use crate::plan::{owed_count_each, owed_keys, Cand, Indexes};
+use crate::plan::{owed_count_each, owed_keys_due, Cand, Indexes};
 use crate::progress::{Conditions, Holding, Key, Progress, Value};
 use crate::stale::refresh::reason_of;
 use crate::stale::{Ask, Due, Reason, State};
@@ -90,12 +91,15 @@ fn piece_reason(h: &Conditions, now: &Conditions) -> Option<Reason> {
     }
 }
 
-/// What an edge owes: the count by class (added, updated, removed, and
-/// unchanged, always 0 here), and every reason that holds for a due key
-/// (STA-2), in `Reason` order.
+/// What an edge owes, by class (added, updated, removed, and unchanged,
+/// always 0 here): the keys due now, which the page of owed keys lists, and
+/// the keys owed but not due (failing keys waiting for their retry, keys
+/// held back); and every reason that holds for a due key (STA-2), in
+/// `Reason` order, "retry due" while a retry pass has a key to retry.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Owed {
-    pub counts: [u64; 4],
+    pub due: [u64; 4],
+    pub waiting: [u64; 4],
     pub reasons: Vec<Reason>,
 }
 
@@ -106,16 +110,21 @@ pub struct Owed {
 #[derive(Default)]
 pub struct Counts(Mutex<HashMap<Id, Counted>>);
 
-/// What is owed, with the edge's generation, the head and the revision of
-/// the keys not due it holds for.
-type Counted = ([u64; 3], Owed);
+/// What is owed, with the edge's generation, the head, the revision of the
+/// keys not due and the head of its failure records it holds for.
+type Counted = ([u64; 4], Owed);
 
 impl Counts {
     pub async fn get(&self, ask: &Ask, ixs: &dyn Indexes, due: &dyn Due) -> Result<Option<Owed>> {
         if ask.held {
             return Ok(None);
         }
-        let at = [ask.input.gen, ask.head, due.revision(&ask.edge)];
+        let at = [
+            ask.input.gen,
+            ask.head,
+            due.revision(&ask.edge),
+            ask.failures_head,
+        ];
         if let Some((a, o)) = self.0.lock().unwrap().get(&ask.edge) {
             if *a == at {
                 return Ok(Some(o.clone()));
@@ -130,8 +139,9 @@ impl Counts {
         ];
         let mut seen = [false; 4];
         let mut piece: (usize, Option<Reason>) = (0, None);
-        let counts = owed_count_each(&ask.view, &ask.req, ixs, &mut |key, held, version| {
-            if seen == [true; 4] || due.not_due(&ask.edge, key) {
+        let hold = ask.hold(due);
+        let each = &mut |key: &[u8], held: &Holding, _: &Ver| {
+            if seen == [true; 4] {
                 return;
             }
             if let (Holding::Version(_, h), None) = (held, keyed.point(key)) {
@@ -143,11 +153,18 @@ impl Counts {
                     return;
                 }
             }
-            seen[reason_of(keyed, now, key, held, version) as usize - 1] = true;
-        })
-        .await?;
+            seen[reason_of(keyed, now, key, held) as usize - 1] = true;
+        };
+        let (due_now, waiting) = owed_count_each(&ask.view, &ask.req, ixs, &hold, each).await?;
+        if ask.next_retry(ixs).await?.is_some() {
+            seen[Reason::RetryDue as usize - 1] = true;
+        }
         let reasons = all.into_iter().filter(|r| seen[*r as usize - 1]).collect();
-        let o = Owed { counts, reasons };
+        let o = Owed {
+            due: due_now,
+            waiting,
+            reasons,
+        };
         self.0
             .lock()
             .unwrap()
@@ -169,10 +186,11 @@ impl Ask {
     pub async fn keys(
         &self,
         ixs: &dyn Indexes,
+        due: &dyn Due,
         after: Option<&Key>,
         limit: usize,
     ) -> Result<(Vec<Cand>, Option<Key>)> {
-        owed_keys(&self.view, &self.req, ixs, after, limit).await
+        owed_keys_due(&self.view, &self.req, ixs, &self.hold(due), after, limit).await
     }
 
     /// D177: every upstream key the patterns take has been processed since

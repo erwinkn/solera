@@ -10,8 +10,8 @@ use solera_index::{ChangeIndex, NewCommit, Run, Store, StoreOptions, Version, Wr
 use solera_tracking::codec::Ver;
 use solera_tracking::commit::{FullRunDone, OutputCommit};
 use solera_tracking::event::{Event, Part};
-use solera_tracking::outcomes::transition::{Stored, FAILED};
-use solera_tracking::outcomes::{self, Held, Outcomes, Record};
+use solera_tracking::outcomes::transition::{Counters, Stored, FAILED};
+use solera_tracking::outcomes::{self, Held, Outcomes, PassStart, Record};
 use solera_tracking::plan::OneIndex;
 use solera_tracking::progress::{
     self, read_digest, BatchProgress, Conditions, EdgeClose, EdgeOpen, EdgeRename, Holding, Key,
@@ -64,7 +64,6 @@ fn witness(t: &Tracking, x: u64, state: State) -> Part {
         gen: t.stale.inputs[EDGE].gen,
         x,
         state,
-        retry: false,
     })
 }
 
@@ -135,45 +134,6 @@ fn a_witness_applies_only_to_the_generation_it_was_computed_for() {
         t.stale.inputs[EDGE].current().unwrap().state,
         stale("k3", 10),
         "an edge that stays stale keeps the moment it went stale"
-    );
-}
-
-#[test]
-fn a_retry_drops_every_part_computed_before_it() {
-    let mut t = opened();
-    know(&mut t, 1, State::Fresh);
-    let notice = witness(&t, 2, State::Fresh);
-    let retry = Part::Witness(Witness {
-        edge: EDGE.into(),
-        gen: t.stale.inputs[EDGE].gen,
-        x: 1,
-        state: stale("k1", 10),
-        retry: true,
-    });
-    apply(&mut t, vec![retry]);
-    apply(&mut t, vec![notice]);
-    let k = t.stale.inputs[EDGE].current().unwrap();
-    assert_eq!(
-        (k.x, &k.state),
-        (1, &stale("k1", 10)),
-        "a notice built before the retry came due does not make the edge fresh"
-    );
-
-    let mut t = opened();
-    know(&mut t, 1, State::Fresh);
-    let retry = Part::Witness(Witness {
-        edge: EDGE.into(),
-        gen: t.stale.inputs[EDGE].gen,
-        x: 1,
-        state: stale("k1", 10),
-        retry: true,
-    });
-    know(&mut t, 2, State::Fresh);
-    apply(&mut t, vec![retry]);
-    let i = &t.stale.inputs[EDGE];
-    assert!(
-        i.current().is_none() && i.changed == stale::Changed::All,
-        "a retry that lost the race to a later notice still makes the edge unknown"
     );
 }
 
@@ -549,7 +509,6 @@ fn a_witness_that_failed_waits_for_its_retry() {
             gen,
             x: 0,
             state: stale("k1", 1),
-            retry: false,
         })],
     );
     assert_eq!(
@@ -557,6 +516,86 @@ fn a_witness_that_failed_waits_for_its_retry() {
         Status::Fresh,
         "the recheck of a witness that has failed since reads its record"
     );
+}
+
+#[test]
+fn a_retry_pass_makes_its_next_key_due() {
+    let (rt, ix) = index();
+    let mut t = failed_k1(&rt, &ix);
+    assert_eq!(refresh_e(&rt, &ix, &mut t), Status::Fresh);
+    let count = |t: &Tracking| {
+        let ask = t.stale_ask(b"e").unwrap();
+        let o = rt.block_on(stale::Counts::default().get(&ask, &OneIndex(&ix), &NoneDue));
+        let keys = rt.block_on(ask.keys(&OneIndex(&ix), &NoneDue, None, 10));
+        (o.unwrap().unwrap(), keys.unwrap().0.len())
+    };
+    let (o, listed) = count(&t);
+    assert_eq!(
+        (o.due, o.waiting, o.reasons, listed),
+        ([0; 4], [1, 0, 0, 0], vec![], 0),
+        "k1 waits: owed, not due, not listed"
+    );
+
+    let gen = t.stale.inputs[b"e".as_slice()].gen;
+    let notice = Part::Witness(Witness {
+        edge: key("e"),
+        gen,
+        x: 1,
+        state: State::Fresh,
+    });
+    let life = t.per_key[b"e".as_slice()].life;
+    apply(
+        &mut t,
+        vec![Part::PassStart(PassStart {
+            edge: key("e"),
+            n: 1,
+            at: 200,
+            counters: Counters {
+                deploy: 1,
+                ..Counters::default()
+            },
+            life,
+        })],
+    );
+    apply(&mut t, vec![notice]);
+    assert_eq!(
+        t.stale_status(b"e").unwrap(),
+        Status::Unknown,
+        "a part computed before the pass began is dropped"
+    );
+    assert_eq!(
+        refresh_e(&rt, &ix, &mut t),
+        Status::Stale {
+            key: Some(key("k1")),
+            reason: Reason::RetryDue,
+            since_ms: 1
+        }
+    );
+    let (o, listed) = count(&t);
+    assert_eq!(
+        (o.due, o.waiting, o.reasons, listed),
+        ([0; 4], [1, 0, 0, 0], vec![Reason::RetryDue], 0),
+        "a key the pass retries stays waiting; the pass gives the reason"
+    );
+}
+
+#[test]
+fn a_full_run_asked_for_by_hand_raises_the_watched_rebuild_counter() {
+    let mut t = opened();
+    know(&mut t, 0, State::Fresh);
+    let life = t.per_key[EDGE].life;
+    apply(
+        &mut t,
+        vec![Part::Rebuild(outcomes::Rebuild {
+            edge: EDGE.into(),
+            to: 1,
+            life,
+        })],
+    );
+    let i = &t.stale.inputs[EDGE];
+    assert_eq!(i.watch.as_ref().unwrap().conditions.rebuild, 1);
+    assert_eq!(i.changed, stale::Changed::All);
+    assert_eq!(t.stale_status(EDGE).unwrap(), Status::Unknown);
 }
 
 fn entries(keys: &[(&str, Option<u64>)], commit: u64) -> Run {
@@ -684,7 +723,6 @@ fn a_notice_settles_each_stale_witness_at_the_first_entry_at_or_past_it() {
                 gen,
                 x: 0,
                 state: stale(w, 1),
-                retry: false,
             })],
         );
     }
@@ -818,7 +856,8 @@ fn a_refresh_catches_up_over_commits_and_batches_at_once() {
         rt.block_on(counts.get(&ask, &OneIndex(&ix), &NoneDue))
             .unwrap(),
         Some(stale::Owed {
-            counts: [0, 0, 1, 0],
+            due: [0, 0, 1, 0],
+            waiting: [0; 4],
             reasons: vec![Reason::InputChanged]
         })
     );
@@ -859,15 +898,16 @@ fn a_count_says_every_reason_that_holds() {
         o.unwrap().unwrap()
     };
     let o = get(&t, &NoneDue);
-    assert_eq!(o.counts, [2, 1, 0, 0]);
+    assert_eq!((o.due, o.waiting), ([2, 1, 0, 0], [0; 4]));
     assert_eq!(
         o.reasons,
         vec![Reason::InputChanged, Reason::NeverProcessed]
     );
+    let o = get(&t, &Waiting);
     assert_eq!(
-        get(&t, &Waiting).reasons,
-        vec![Reason::NeverProcessed],
-        "a key waiting for its retry is owed, but gives no reason"
+        (o.due, o.waiting, o.reasons),
+        ([2, 0, 0, 0], [0, 1, 0, 0], vec![Reason::NeverProcessed]),
+        "a key held back is owed and waiting, and gives no reason"
     );
     assert_eq!(
         get(&t, &NoneDue).reasons,

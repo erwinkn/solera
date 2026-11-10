@@ -41,7 +41,7 @@ use crate::progress::{Conditions, Key, KeyRange};
 use crate::state::{Id, Tracking};
 
 pub use query::{graph, Counts, Owed, Partition, Status};
-pub use refresh::{refresh, retry_due, Ask, Due, NoneDue, Notice};
+pub use refresh::{refresh, Ask, Due, NoneDue, Notice};
 
 pub const TAG_WATCH: u8 = 0x40;
 pub const TAG_WITNESS: u8 = 0x41;
@@ -168,6 +168,16 @@ impl Input {
         self.known.as_ref().filter(|k| k.gen == self.gen)
     }
 
+    /// A retry pass began (B6): what is due changed with no change to
+    /// progress. What is known stops being current, and a refresh catches up
+    /// from it as if no range changed, then looks at the pass.
+    fn retried(&mut self, gen: u64) {
+        if self.current().is_some() {
+            self.changed = Changed::Ranges(vec![]);
+        }
+        self.gen = gen;
+    }
+
     fn moved(&mut self, gen: u64, r: Option<&KeyRange>) {
         if self.current().is_some() {
             self.changed = Changed::Ranges(vec![]);
@@ -262,6 +272,21 @@ impl Stale {
                 if let Some(i) = self.inputs.get_mut(&o.edge) {
                     self.gens += 1;
                     i.moved(self.gens, None);
+                }
+            }
+            Part::Rebuild(r) => {
+                if let Some(i) = self.inputs.get_mut(&r.edge) {
+                    if let Some(w) = i.watch.as_mut() {
+                        Arc::make_mut(&mut w.conditions).rebuild = r.to;
+                    }
+                    self.gens += 1;
+                    i.moved(self.gens, None);
+                }
+            }
+            Part::PassStart(p) => {
+                if let Some(i) = self.inputs.get_mut(&p.edge) {
+                    self.gens += 1;
+                    i.retried(self.gens);
                 }
             }
             _ => {}
@@ -459,11 +484,6 @@ pub struct Witness {
     /// The upstream commit it holds as of.
     pub x: u64,
     pub state: State,
-    /// A failed key's retry came due: what is due changed with no change to
-    /// progress, so the part starts a new generation (every part computed
-    /// before it is dropped, and the edge is probed from its first key unless
-    /// the part installs a witness). `Fresh` here means none of the keys is due.
-    pub retry: bool,
 }
 
 impl Witness {
@@ -472,7 +492,6 @@ impl Witness {
         e.uv(self.gen);
         e.uv(self.x);
         encode_state(e, &self.state);
-        e.u8(self.retry as u8);
     }
 
     pub fn decode(d: &mut Dec<'_>) -> Result<Witness> {
@@ -481,7 +500,6 @@ impl Witness {
             gen: d.uv()?,
             x: d.uv()?,
             state: decode_state(d)?,
-            retry: bool_of(d)?,
         })
     }
 
@@ -491,18 +509,12 @@ impl Witness {
 
     /// Installs what was found, unless the edge moved since it was computed
     /// or something newer is already known. An edge that stays stale keeps
-    /// the moment it went stale. A retry's part starts a new generation
-    /// first, whether or not it installs anything.
+    /// the moment it went stale.
     pub(crate) fn apply(self, t: &mut Tracking) {
         let Some(i) = t.stale.inputs.get_mut(&self.edge) else {
             return;
         };
-        let fits = self.gen == i.gen && !i.current().is_some_and(|k| k.x > self.x);
-        if self.retry {
-            t.stale.gens += 1;
-            i.moved(t.stale.gens, None);
-        }
-        if !fits || self.retry && self.state == State::Fresh {
+        if self.gen != i.gen || i.current().is_some_and(|k| k.x > self.x) {
             return;
         }
         let state = match (self.state, i.known.as_ref().map(|k| &k.state)) {

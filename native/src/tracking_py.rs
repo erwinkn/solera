@@ -709,23 +709,6 @@ impl Tracking {
         guard(|| crate::stale_py::refresh(py, &self.state, ixs.as_ref(), edges, time_ms, not_due))
     }
 
-    /// B7: failed keys of `edge` came due for a retry (rule 5); also called
-    /// at startup for every retry already due. The event, or None.
-    #[pyo3(signature = (edge, keys, *, time_ms=0, not_due=None))]
-    fn stale_retry_due<'py>(
-        &self,
-        py: Python<'py>,
-        edge: Vec<u8>,
-        keys: Vec<String>,
-        time_ms: u64,
-        not_due: Option<&Bound<'py, PyDict>>,
-    ) -> PyResult<Option<Bound<'py, PyBytes>>> {
-        let ixs = self.indexes.read().unwrap().clone();
-        guard(|| {
-            crate::stale_py::retry_due(py, &self.state, ixs.as_ref(), edge, keys, time_ms, not_due)
-        })
-    }
-
     /// B7: each edge's status as known, with no index read: `{edge: status}`.
     #[pyo3(signature = (edges=None))]
     fn stale_status<'py>(
@@ -736,9 +719,11 @@ impl Tracking {
         guard(|| crate::stale_py::status(py, &self.state, edges))
     }
 
-    /// B7: how many keys `edge` owes, by class, and every reason that holds
-    /// (STA-2); cached until it or its upstream moves. None while the gate
-    /// holds it (D197).
+    /// B7: how many keys `edge` owes, by class: `due` now (what
+    /// `stale_keys` lists) and `waiting` (failing keys waiting for their
+    /// retry, keys held back), and every reason that holds (STA-2); cached
+    /// until it, its upstream or its failure records move. None while the
+    /// gate holds it (D197).
     #[pyo3(signature = (edge, *, not_due=None))]
     fn stale_count<'py>(
         &self,
@@ -750,17 +735,19 @@ impl Tracking {
         guard(|| crate::stale_py::count(py, &self.state, ixs.as_ref(), &self.counts, edge, not_due))
     }
 
-    /// B7: a page of the keys `edge` owes: `([(key, class), ...], next)`.
-    #[pyo3(signature = (edge, after=None, limit=1000))]
+    /// B7: a page of the keys `edge` owes and are due now (the count's
+    /// `due`): `([(key, class), ...], next)`.
+    #[pyo3(signature = (edge, after=None, limit=1000, *, not_due=None))]
     fn stale_keys<'py>(
         &self,
         py: Python<'py>,
         edge: Vec<u8>,
         after: Option<String>,
         limit: usize,
+        not_due: Option<&Bound<'py, PyDict>>,
     ) -> PyResult<Bound<'py, PyTuple>> {
         let ixs = self.indexes.read().unwrap().clone();
-        guard(|| crate::stale_py::keys(py, &self.state, ixs.as_ref(), edge, after, limit))
+        guard(|| crate::stale_py::keys(py, &self.state, ixs.as_ref(), edge, after, limit, not_due))
     }
 
     /// B7 (D177): `edge` has processed every key upstream holds under its patterns.

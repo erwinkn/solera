@@ -1,17 +1,19 @@
 //! Keeping what is known current: [`refresh`] at the upstream's head, from
-//! the index; [`notice`] at one commit, from the entries the commit builder
-//! produced; [`retry_due`] when a failed key's retry comes due (rule 5).
+//! the index, which also names the next key of a retry pass under way (rule
+//! 5, B6); [`Notice`] at one commit, from the entries the commit builder
+//! produced.
 
 use std::sync::Arc;
 
 use solera_index::{LayerRef, Query, Version};
 
 use crate::codec::Ver;
+use crate::due::RetryView;
 use crate::error::{invalid, Result};
 use crate::event::Part;
 use crate::outcomes::{output_id, Conds, Record, FAILURES};
 use crate::plan::{plan, Cand, Hold, Indexes, InputRequest, Mode, Request, View};
-use crate::progress::{self, owed, Class, Conditions, Holding, Key, Keyed, Progress, Value};
+use crate::progress::{owed, Class, Conditions, Holding, Key, Keyed, Progress, Value};
 use crate::stale::{Changed, Input, Reason, State, Witness};
 use crate::state::{Id, Tracking};
 
@@ -39,7 +41,7 @@ impl Due for NoneDue {
     }
 }
 
-struct OneEdge<'a> {
+pub(super) struct OneEdge<'a> {
     due: &'a dyn Due,
     edge: &'a [u8],
 }
@@ -62,6 +64,10 @@ pub struct Ask {
     pub progress: Arc<Progress>,
     pub req: InputRequest,
     pub view: View,
+    /// B6: the retry pass under way on the edge, if any.
+    pub retry: Option<RetryView>,
+    /// B6: the head of the edge's failure records.
+    pub failures_head: u64,
 }
 
 impl Ask {
@@ -69,7 +75,7 @@ impl Ask {
         self.progress.keyed().expect("a keyed edge")
     }
 
-    fn hold<'a>(&'a self, due: &'a dyn Due) -> OneEdge<'a> {
+    pub(super) fn hold<'a>(&'a self, due: &'a dyn Due) -> OneEdge<'a> {
         OneEdge {
             due,
             edge: &self.edge,
@@ -140,7 +146,7 @@ impl Ask {
                     return Ok(Some(stale_at(key, *reason)));
                 };
                 if let Some(held) = due_by_record(r, &conds, key, version, now)? {
-                    let reason = reason_of(self.keyed(), now, key, &held, version);
+                    let reason = reason_of(self.keyed(), now, key, &held);
                     return Ok(Some(stale_at(key, reason)));
                 }
             }
@@ -151,14 +157,28 @@ impl Ask {
     fn stale(&self, c: &Cand) -> State {
         State::Stale {
             key: c.key.clone(),
-            reason: reason_of(
-                self.keyed(),
-                &self.req.conditions,
-                &c.key,
-                &c.held,
-                &c.version,
-            ),
+            reason: reason_of(self.keyed(), &self.req.conditions, &c.key, &c.held),
             since_ms: 0,
+        }
+    }
+
+    /// Rule 5: the next key of the retry pass under way (B6's retry plan),
+    /// if one is due. A key gone moot fills the plan's limit without being
+    /// taken, so the limit grows until a key is taken or the pass is read.
+    pub(super) async fn next_retry(&self, ixs: &dyn Indexes) -> Result<Option<State>> {
+        let Some(r) = &self.retry else {
+            return Ok(None);
+        };
+        let mut limit = 1;
+        loop {
+            let p = crate::due::plan(ixs, r, &self.req.conditions, limit).await?;
+            if let Some(c) = p.inputs[0].keys.first() {
+                return Ok(Some(stale_at(&c.key, Reason::RetryDue)));
+            }
+            if p.range.hi.is_none() {
+                return Ok(None);
+            }
+            limit *= 16;
         }
     }
 
@@ -238,6 +258,16 @@ impl Tracking {
             .outputs
             .get(&e.input)
             .map_or((vec![], 0), |o| (o.layers.clone(), o.head));
+        let pass = self.per_key.get(edge).is_some_and(|k| k.pass.is_some());
+        let retry = if pass {
+            Some(self.retry_view(edge)?)
+        } else {
+            None
+        };
+        let failures_head = self
+            .outputs
+            .get(&output_id(FAILURES, edge))
+            .map_or(0, |o| o.head);
         Ok(Ask {
             edge: edge.into(),
             output: e.input.clone(),
@@ -248,6 +278,8 @@ impl Tracking {
             progress: e.progress.clone(),
             req,
             view,
+            retry,
+            failures_head,
         })
     }
 }
@@ -263,6 +295,10 @@ impl Tracking {
 ///   take and no point covers is due with no lookup), then a probe from the
 ///   first changed range.
 /// - Otherwise (a reset, new conditions, nothing known): a probe from the first key.
+///
+/// With a retry pass under way (B6), an edge found fresh is stale with the
+/// pass's next key, "retry due"; a witness no longer due gives way to it
+/// before any probe.
 pub async fn refresh(
     ask: &Ask,
     ixs: &dyn Indexes,
@@ -283,7 +319,10 @@ pub async fn refresh(
             _,
         ) => match ask.recheck(ixs, due, key).await? {
             Some(s) => s,
-            None => ask.probe(ixs, due, None).await?,
+            None => match ask.next_retry(ixs).await? {
+                Some(s) => s,
+                None => ask.probe(ixs, due, None).await?,
+            },
         },
         (Some(k), Changed::Ranges(rs)) if k.x >= floor => {
             match ask.changes_since(ixs, due, k.x, &i.changed).await? {
@@ -301,12 +340,15 @@ pub async fn refresh(
         }
         _ => ask.probe(ixs, due, None).await?,
     };
+    let state = match state {
+        State::Fresh => ask.next_retry(ixs).await?.unwrap_or(State::Fresh),
+        s => s,
+    };
     Ok(Some(Witness {
         edge: ask.edge.clone(),
         gen: i.gen,
         x: ask.head,
         state: since(state, time_ms),
-        retry: false,
     }))
 }
 
@@ -321,47 +363,6 @@ fn since(state: State, time_ms: u64) -> State {
         },
         s => s,
     }
-}
-
-/// Rule 5: some of an edge's failed keys came due for a retry (their backoff
-/// ended, or one was forced). What is due changed with no change to
-/// progress, so the part always starts a new generation. A fresh edge
-/// becomes stale with the first of them that is due; a stale one keeps its
-/// witness; if none is due, the part carries `Fresh` and installs nothing.
-/// Also applied at startup to every retry already due. None while the gate
-/// holds the edge: lifting it probes the edge anyway.
-pub async fn retry_due(
-    ask: &Ask,
-    ixs: &dyn Indexes,
-    due: &dyn Due,
-    keys: &[Key],
-    time_ms: u64,
-) -> Result<Option<Witness>> {
-    if ask.held {
-        return Ok(None);
-    }
-    let mut part = Witness {
-        edge: ask.edge.clone(),
-        gen: ask.input.gen,
-        x: ask.head,
-        state: State::Fresh,
-        retry: true,
-    };
-    match ask.input.current() {
-        Some(k) if matches!(k.state, State::Stale { .. }) => {
-            part.x = k.x;
-            part.state = k.state.clone();
-        }
-        _ => {
-            for k in keys {
-                if let Some(state) = ask.recheck(ixs, due, k).await? {
-                    part.state = since(state, time_ms);
-                    break;
-                }
-            }
-        }
-    }
-    Ok(Some(part))
 }
 
 /// Rules 1 and 2 at commit `commit` of `output`, over the commit's entries
@@ -408,7 +409,6 @@ impl Noticed {
             gen: self.gen,
             x: commit,
             state: self.state,
-            retry: false,
         })
     }
 }
@@ -489,7 +489,6 @@ impl Notice {
                             reason,
                             since_ms: time_ms,
                         },
-                        retry: false,
                     }));
                     false
                 }
@@ -528,14 +527,10 @@ fn rule1(
         if !owed(&p.holding, &wanted) {
             return Step::Skip;
         }
-        let version = match wanted {
-            Holding::Absent => Ver::Absent,
-            _ => Ver::of(new),
-        };
         return match hold {
             None => Step::Unsure,
             Some(h) if h.held_back(0, key) => Step::Skip,
-            Some(_) => Step::Due(reason_of(keyed, now, key, &p.holding, &version)),
+            Some(_) => Step::Due(reason_of(keyed, now, key, &p.holding)),
         };
     }
     if !now.patterns.takes(key) {
@@ -577,19 +572,8 @@ fn due_by_record(
 }
 
 /// Why a due key is due.
-pub(super) fn reason_of(
-    keyed: &Keyed,
-    now: &Conditions,
-    key: &[u8],
-    held: &Holding,
-    version: &Ver,
-) -> Reason {
+pub(super) fn reason_of(keyed: &Keyed, now: &Conditions, key: &[u8], held: &Holding) -> Reason {
     let point = keyed.point(key);
-    if point
-        .is_some_and(|p| p.reason == progress::Reason::Failed && p.seen.as_ref() == Some(version))
-    {
-        return Reason::RetryDue;
-    }
     match held {
         Holding::Held => Reason::NeverProcessed,
         Holding::Version(_, h) if !h.same_processing(now) || !now.patterns.takes(key) => {

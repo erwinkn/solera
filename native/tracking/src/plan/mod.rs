@@ -425,12 +425,14 @@ struct Found<'a> {
     keys: Vec<Cand>,
     held_back: Vec<HeldBack>,
     counts: [u64; 4],
+    /// Owed keys not due, counted when `waiting`: failing keys waiting for
+    /// their retry, and keys the hold keeps back.
+    waits: [u64; 4],
     n: usize,
     /// Owed keys whose records are still to be read (B6).
     pend: Vec<Pend>,
     moot: Vec<Key>,
-    /// Count owed keys that are not due (a failing key waiting for its
-    /// retry) in `counts`, without taking them.
+    /// Count owed keys that are not due in `waits`, without taking them.
     waiting: bool,
     /// Records with a stored outcome the walk met, by the class a try at
     /// what they were tried on would have.
@@ -457,6 +459,7 @@ impl Found<'_> {
             keys: vec![],
             held_back: vec![],
             counts: [0; 4],
+            waits: [0; 4],
             n: 0,
             pend: vec![],
             moot: vec![],
@@ -739,7 +742,7 @@ impl Walker<'_> {
                 }
             } else if !owed(&tried, &p.wanted) {
                 if out.waiting {
-                    out.counts[Class::of(&held, &p.wanted) as usize - 1] += 1;
+                    out.waits[Class::of(&held, &p.wanted) as usize - 1] += 1;
                 }
                 if out.keep {
                     out.skipped.push(p.key);
@@ -753,13 +756,17 @@ impl Walker<'_> {
 
     fn decide(&self, key: Key, held: Holding, version: Ver, wanted: Holding, out: &mut Found<'_>) {
         let class = if owed(&held, &wanted) {
+            let class = Class::of(&held, &wanted);
             if self.hold.held_back(self.input, &key) {
+                if out.waiting {
+                    out.waits[class as usize - 1] += 1;
+                }
                 if out.keep {
                     out.held_back.push(HeldBack { key, held, version });
                 }
                 return;
             }
-            Class::of(&held, &wanted)
+            class
         } else if self.all && !matches!(wanted, Holding::Absent) {
             Class::Unchanged
         } else {
@@ -1004,11 +1011,25 @@ pub async fn owed_keys(
     after: Option<&Key>,
     limit: usize,
 ) -> Result<(Vec<Cand>, Option<Key>)> {
+    owed_keys_due(view, req, ixs, &NoHold, after, limit).await
+}
+
+/// `owed_keys` without the keys `hold` keeps back: the keys due now.
+pub async fn owed_keys_due(
+    view: &View,
+    req: &InputRequest,
+    ixs: &dyn Indexes,
+    hold: &dyn Hold,
+    after: Option<&Key>,
+    limit: usize,
+) -> Result<(Vec<Cand>, Option<Key>)> {
     if limit == 0 {
         return invalid("a page of owed keys holds at least one key");
     }
     let mut found = Found::new(limit.saturating_add(1), true);
-    walker(view, req, ixs)?.walk(after, &mut found).await?;
+    walker(view, req, ixs, hold)?
+        .walk(after, &mut found)
+        .await?;
     let mut keys = found.keys;
     let next = (keys.len() > limit).then(|| {
         keys.truncate(limit);
@@ -1022,31 +1043,39 @@ pub async fn owed_keys(
 /// not meet, because their input has not changed since they failed, are
 /// counted from the edge's tally of records.
 pub async fn owed_count(view: &View, req: &InputRequest, ixs: &dyn Indexes) -> Result<[u64; 4]> {
-    owed_count_each(view, req, ixs, &mut |_, _, _| {}).await
+    let (due, waiting) = owed_count_each(view, req, ixs, &NoHold, &mut |_, _, _| {}).await?;
+    Ok(std::array::from_fn(|i| due[i] + waiting[i]))
 }
 
-/// `owed_count`, showing `each` every owed key the walk takes: the keys
-/// waiting for their retry are counted but not shown.
+/// `owed_count` in two parts: the keys due now, which `owed_keys_due`
+/// lists and `each` is shown, and the keys not due (failing keys waiting
+/// for their retry, and keys `hold` keeps back).
 pub async fn owed_count_each(
     view: &View,
     req: &InputRequest,
     ixs: &dyn Indexes,
+    hold: &dyn Hold,
     each: Each<'_>,
-) -> Result<[u64; 4]> {
+) -> Result<([u64; 4], [u64; 4])> {
     let mut found = Found::new(usize::MAX, false);
     found.waiting = true;
     found.each = Some(each);
-    let w = walker(view, req, ixs)?;
+    let w = walker(view, req, ixs, hold)?;
     w.walk(None, &mut found).await?;
     if let Some((_, f)) = w.fails {
         for i in 0..3 {
-            found.counts[i] += f.classes[i].saturating_sub(found.visited[i]);
+            found.waits[i] += f.classes[i].saturating_sub(found.visited[i]);
         }
     }
-    Ok(found.counts)
+    Ok((found.counts, found.waits))
 }
 
-fn walker<'a>(view: &'a View, req: &'a InputRequest, ixs: &'a dyn Indexes) -> Result<Walker<'a>> {
+fn walker<'a>(
+    view: &'a View,
+    req: &'a InputRequest,
+    ixs: &'a dyn Indexes,
+    hold: &'a dyn Hold,
+) -> Result<Walker<'a>> {
     let Some(v) = view.inputs.first() else {
         return invalid("the view holds no keyed edge");
     };
@@ -1064,7 +1093,7 @@ fn walker<'a>(view: &'a View, req: &'a InputRequest, ixs: &'a dyn Indexes) -> Re
         own,
         all: false,
         input: 0,
-        hold: &NoHold,
+        hold,
         fails: v.failures.as_ref().map(|f| (ixs, f)),
     })
 }

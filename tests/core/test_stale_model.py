@@ -10,7 +10,12 @@ due, and the witness is due; the owed count, the page of owed keys and
 completeness (D177) equal the model's. Refreshes are skipped at random, so a
 later one catches up over several commits and several batch commits at once.
 
-Clears are left out: the core does not build them yet.
+Clears and retries are left out: a clearing commit gives no notice, and a
+due retry is B6's retry pass over the edge's failure records, which this
+harness does not write (the Rust tests in native/tracking/tests/stale.rs
+cover both; the cross-check against the model for edges with failure records
+is owed by the engine halves). Failing keys here are points, and the keys
+waiting for their retry are passed as `not_due`.
 """
 
 from __future__ import annotations
@@ -136,14 +141,16 @@ def check(w, core: Core, where: str, refreshed: bool) -> None:
         assert due and s["key"] in due, (where, s, sorted(due))
     if not refreshed:
         return
-    n = core.t.stale_count(EDGE, not_due=core.not_due(w))
-    reasons = n.pop("reasons")
-    assert sum(n.values()) == len(owed), (where, n, sorted(owed))
-    assert bool(reasons) == bool(due), (where, reasons, sorted(due))
+    not_due = core.not_due(w)
+    n = core.t.stale_count(EDGE, not_due=not_due)
+    owed_due = sorted(k for k in owed if k not in not_due[EDGE])
+    assert sum(n["due"].values()) == len(owed_due), (where, n, owed_due)
+    assert sum(n["waiting"].values()) == len(owed) - len(owed_due), (where, n, sorted(owed))
+    assert bool(n["reasons"]) == bool(due), (where, n["reasons"], sorted(due))
     if s["state"] == "stale":
-        assert s["reason"] in reasons, (where, s, reasons)
-    keys, nxt = core.t.stale_keys(EDGE, limit=100)
-    assert nxt is None and [k for k, _ in keys] == sorted(owed), (where, keys)
+        assert s["reason"] in n["reasons"], (where, s, n["reasons"])
+    keys, nxt = core.t.stale_keys(EDGE, limit=100, not_due=not_due)
+    assert nxt is None and [k for k, _ in keys] == owed_due, (where, keys)
     assert core.t.stale_complete(EDGE) == complete(w, core), where
 
 
@@ -223,23 +230,11 @@ def replay(
             core.t.apply(Tracking.event_reset(EDGE, True))
             core.pending = None
         elif kind == "retry":
-            k = ev[1]
-            due_before = w.outcomes.get(k)
-            w.apply(ev)
-            if due_before is not None and due_before.retry:
-                core.time += 1
-                e = core.t.stale_retry_due(EDGE, [k], time_ms=core.time, not_due=core.not_due(w))
-                if e is not None:
-                    core.t.apply(e)
+            continue
         elif kind == "restart":
             w.apply(ev)
             core.t = core.boot(Tracking.restore(core.t.snapshot()))
             core.pending = None
-            retries = sorted(k for k, f in w.outcomes.items() if f.retry)
-            if retries:
-                e = core.t.stale_retry_due(EDGE, retries, time_ms=core.time, not_due=core.not_due(w))
-                if e is not None:
-                    core.t.apply(e)
         else:
             w.apply(ev)
         if not w.listed:

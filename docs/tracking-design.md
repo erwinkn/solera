@@ -710,8 +710,12 @@ and conditions at one generation, as of one upstream commit.
 - **Applying an event never reads the index.** A batch commit, a reset, a
   rename, new conditions or points a batch's outcomes set (B6) start a new
   generation and record which key ranges changed (a reset, a batch that
-  resets progress, new conditions or outcomes' points: all of them). What is known then stops being current, and the status
-  reads "unknown" until a refresh. Generations come from one counter and
+  resets progress, new conditions or outcomes' points: all of them); so do
+  a full run asked for by hand (B6's `Rebuild`, which also raises the
+  rebuild counter in the watched conditions), the start of a retry pass
+  (B6), with no range changed, and the end of a full run, for the readers
+  its gate held. What is known then stops being
+  current, and the status reads "unknown" until a refresh. Generations come from one counter and
   are never reused, so a part for an edge since closed never applies to one
   reopened under its name.
 - **At an upstream commit** (rules 1 and 2), the commit builder feeds each
@@ -720,13 +724,23 @@ and conditions at one generation, as of one upstream commit.
   entry the patterns take with no point makes it stale; stale, a commit
   that does not touch the witness changes nothing. An edge the entries
   cannot decide (the commit touches its witness, or a point differs) is
-  left for a refresh.
+  left for a refresh. So is every reader of a commit that clears (its
+  entries do not show the keys the clear removed) or of an output mid full
+  run, and every edge with failure records: B6 keeps what a failing key
+  holds in a record, not a point, and the notice reads no index.
 - **A refresh** (rules 3, 4, 6, 7) brings an edge current from the index: a
   stale witness is rechecked at the head, and a probe looks for another
   only if it is no longer due; fresh as of commit X, rule 1 runs over the
   diff from X to the head outside the changed ranges (there the edge still
   holds what upstream had at X), then one probe from the first changed
-  range; otherwise one probe from the first key. A refresh reads what
+  range; otherwise one probe from the first key. On an edge with failure
+  records, rule 1's candidates and the rechecked witness are checked
+  against B6's records first: a key is due only if the consumer does not
+  hold, by its record, what upstream has now, and it was not tried at that
+  version already (then it waits for its retry). The probe is the planner,
+  which reads the records itself. The check is bounded by the diff since
+  the last exact answer plus one records lookup per 1,024 candidates, and
+  stops at the first due key. A refresh reads what
   changed since the last exact answer instead of replaying commits in
   order, so rule 7's catch-up never applies an old commit to newer progress
   or conditions.
@@ -734,17 +748,22 @@ and conditions at one generation, as of one upstream commit.
   never moves X back: a part computed against progress that moved is
   dropped and recomputed. A lost or late notice delays an answer, never
   changes it.
-- **Retries** (rule 5): a failed key whose retry came due makes a fresh edge
-  stale. The part always starts a new generation, since what is due
-  changed with no change to progress: a notice or refresh computed before
-  it is dropped, and if one wins the race the edge reads unknown until a
-  refresh. At startup the engine must apply the rule to every retry
-  already due; that call belongs to B7's engine half, not built yet.
-- **The gate** (rule 8): one event per output marks its full run started or
-  completed; meanwhile readers that keep the gate read "held: upstream
-  incomplete", with no count, and when it lifts they are probed again.
-- **Counts** are the planner's owed count, cached until the edge's
-  generation (its progress or conditions) or its upstream's head moves.
+- **Retries** (rule 5) have one definition, B6's: a retry is due while a
+  retry pass is under way. Its `PassStart` starts a new generation, so a
+  part computed before it is dropped, and a refresh that finds nothing
+  else due names the pass's next key, "retry due" (B6's retry plan with a
+  limit of one key, raised while a key gone moot fills it). A witness no
+  longer due gives way to the pass's next key before any probe.
+- **The gate** (rule 8) reads the output's full-run state (§4: a clear
+  starts it; a commit with `ends_full_run`, or `FullRunDone`, ends it).
+  Meanwhile readers that keep the gate read "held: upstream incomplete",
+  with no count, and when it ends they are probed again.
+- **Counts** are the planner's owed count in two parts: the keys due now,
+  which the page of owed keys lists, and the keys owed but not due (failing
+  keys waiting for their retry, keys held back). A key a retry pass will
+  retry stays in the second; the pass gives the reason "retry due". The
+  count is cached until the edge's generation, its upstream's head, the
+  keys not due or the head of its failure records move.
 - **Reasons** (D210): the status names the witness's reason; a count also
   lists every reason that holds for a due key, from the same walk. A key
   owed by a piece processed under other conditions reads "conditions
@@ -757,6 +776,16 @@ entry per edge when no entry matters; a count,
 reasons included, costs 1.1 s cold and 0.6 to 0.7 s warm for an edge a day
 behind and 15 s cold for 30 days behind, where the index's diff alone
 takes 0.9 s and 5.7 s cold (`bench/core/stale/results/run-100m.log`).
+On an edge with a million failure records
+(`bench/core/stale/results/records-100m.log`), a refresh after an hourly
+commit that touches no failing key costs 0.55 to 0.69 ms warm (133 ms
+cold, 5 GETs). In the adverse case, where every key the commit changed is
+a failing key waiting for its retry (upstream reverted each to exactly the
+version it failed at), it reads the records of all 45k candidates: 72 to
+91 ms warm, 1.6 s cold (49 GETs). A count a day behind costs 0.85 to
+0.98 s warm, the extra over an edge without records being the planner's
+own record reads (B6); N11's warm target is 1.0 s for an edge with
+failure records and 0.8 s without.
 
 ## 7. A batch from start to finish
 
