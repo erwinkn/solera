@@ -1182,15 +1182,22 @@ Captain's drive, unverified until B8's tests run them.
    reader waits for, then drops that build and any older one. It returns
    whether the run is published: yes if it switched now or had switched
    before; no if an attempt newer than `newest` has written (a call
-   delivered late) or the build is gone without having been published. It
-   never changes the version check's generation.
+   delivered late; for a run published before, it may say either) or the
+   build is gone without having been published. It holds the partition's
+   version check from the comparison with `newest` until the replacement
+   is done, so no write of the partition lands in between, and it never
+   changes the version check's generation.
 5. **A publication that fails changes nothing outside.** A constraint that
    can only fail when the build's rows meet the published ones (a unique
    index spanning partitions, say) fails the publication: the published
    rows stay as they were, the hook raises, the debt stays in the journal,
    the engine raises an alarm naming the output, the partition and the
-   error, and the full run is reported failed. A violation waits for the
-   data or the definition to change, not for a timer.
+   error, and the full run is reported failed to publish (every batch
+   committed, and Solera's own readers already read its build). The store
+   raises a distinct error for a publication the data refuses, and the
+   engine retries that one after the next commit of any partition of the
+   output, at a restart, or when a person asks, never on a timer; it
+   retries any other error with backoff.
 
 **The engine: one hook, owed in the journal.**
 `Store.full_run_ended(output, partition, run, newest)` says that the full
@@ -1199,7 +1206,8 @@ ended; `newest` is the newest attempt the engine has planned there, so a
 call delivered late does nothing, and the call returns whether the run is
 published. The core journals the clear's version
 for this (today it keeps only the clear's commit number). Stores that name
-objects by version keep the default, which does nothing. The engine owes
+objects by version keep the default, which does nothing and says
+published. The engine owes
 the call in the same journal event that ends the run, whichever way it
 ends: the output commit that carries `ends_full_run`, a `FullRunDone`
 with no batch, or the release after a cancel or a failure (D205, rule 5).
@@ -1212,11 +1220,14 @@ commit recorded. It runs the call before it plans the partition's next
 batch, unless that batch must first repair a dead attempt (D196, rule 3).
 Then it journals `FullRunNoticed(run)` **only if the store says the run is
 published**, and the notice clears the debt only if it still names that
-run. A call that says not published leaves the debt, and the engine calls
-again at the next quiet moment (a build gone unpublished also raises an
-alarm); a call the engine gave up on at a restart is never noticed. It
-calls again after a crash, and with backoff and an alarm while the call
-fails; a repeat for a published run does nothing and says published. **An input taken by reference** (a `TableRef` its consumer queries
+run. A call that says not published leaves the debt. If the engine has
+planned an attempt of the partition since it issued the call, the call
+was late, and the engine calls again once the partition is quiet;
+otherwise the build is gone (or a writer the engine does not know of has
+written), so it raises an alarm and does not call again until an attempt
+commits or the engine restarts. A call the engine gave up on at a restart
+is never noticed. It calls again after a crash, and as obligation 5 says
+while the call fails; a repeat for a published run does nothing and says published. **An input taken by reference** (a `TableRef` its consumer queries
 itself) reads what outsiders read, so the gate counts its upstream
 incomplete until the notice, not only until the run ends.
 
@@ -1244,7 +1255,7 @@ same exception outsiders have.
 **Dead and late writers** keep this section's five rules. The version
 check is the same row, so a late writer is refused whether or not a build
 is open, and the switch never lowers it. A dead attempt's rows are listed
-by version where the log points (step 2) and repaired by the next attempt
+by version where the log points (obligation 2) and repaired by the next attempt
 before the switch can run. Under D205 alone, a full run's first write
 deleted the partition's rows before its clear reached the journal, and
 only rule 4 covered a reader that loaded in between. Under D211 that
@@ -1264,7 +1275,9 @@ transaction, 2,051 s and 46 GB of WAL in all against 1,719 s and 32 GB
 in place; a count issued during the switch read the 100M old rows in
 8.6 s. During the switch
 the disk holds the old rows, the build and the new rows at once, about
-three times the partition, until vacuum. These figures are a measured
+three times the partition, until vacuum (reasoned, not sampled; B8
+measures the peak). Both builds measured are of a shadow without the
+constraints and unique indexes the recipe adds. These figures are a measured
 starting point for B8, not its target; where the switch's time goes is in
 the handoff. Rejected: a view over a table
 with a side column (a 2 ms switch, but outside group and join queries paid
@@ -2067,7 +2080,7 @@ and batches that start at a piece boundary (asserted).
   `switch_quiet` (the switch waits until no attempt is in flight or
   unrepaired), `build_keep` (a write never drops a build the log names),
   `reset_replay` (a reset delivered again after its switch writes in
-  place), `switch_cleanup` (the switch deletes the old rows first) ,
+  place), `switch_cleanup` (the switch deletes the old rows first),
   `byref_wait` (an input taken by reference waits for the switch) and
   `switch_result` (the notice is journaled only when the store says the run
   is published).

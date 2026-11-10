@@ -1161,7 +1161,8 @@ under the gate and the hold-back (STA-13). A Solera asset that takes
 so the gate holds it until the switch. If publishing fails (a
 constraint only the switch can check, such as a unique index across
 partitions), outsiders keep the old rows and the full run is reported
-failed. An output's first run is hidden
+failed to publish: its batches all committed, and Solera's own readers
+already read its result. An output's first run is hidden
 the same way: it is a full run of an empty output, its first batch says
 `batch.reset` (SEL-9), and outside, the table is empty until the run
 completes. A full run released after a cancel (STA-13) is published as
