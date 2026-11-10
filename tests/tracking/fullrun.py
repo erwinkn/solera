@@ -63,6 +63,9 @@ RULES = {
         "switch_owed",
         "switch_guard",
         "switch_cleanup",
+        "build_keep",
+        "reset_replay",
+        "notice_match",
     ),
 }
 ADDED = {
@@ -80,6 +83,9 @@ ADDED = {
         "switch_owed",
         "switch_guard",
         "switch_cleanup",
+        "build_keep",
+        "reset_replay",
+        "notice_match",
     )
 }
 
@@ -104,26 +110,33 @@ class Output:
     """An output partition: the engine's log of it and the store's rows.
 
     A table's full run builds beside the published rows (D211): its first
-    write opens a build (PostgresStore: a shadow table), which every later
-    write of the run and every Solera load uses; programs outside Solera read
-    the published rows (the user's table) until the store's switch, which
-    the engine calls once the run ended in the log. Off (rule swap),
-    outsiders read the table as Solera does."""
+    write opens a build (PostgresStore: a shadow table named by the write's
+    version). A write lands where its attempt's context points: the build of
+    the full run the log has in progress, else that of the run whose switch
+    the engine still owes, else the published rows (the user's table). Solera
+    reads the same way, from the log; programs outside Solera read the
+    published rows, which change only at the store's switch or by a write
+    outside a full run. Off (rule swap), the run writes in place."""
 
     def __init__(self, name: str, kind: str, on=lambda rule: True) -> None:
         self.name, self.kind, self.on = name, kind, on
         self.log = Log()
         self.swap = kind == "table" and on("swap")
+        self.ctx = lambda: (None, None)  # the log's (run in progress, run whose switch is owed)
         self.published: dict[str, Row] = {}  # the user's table, as outsiders read it
-        self.build: dict[str, Row] | None = None  # the open build (a shadow table), if any
-        self.build_gen: int | None = None  # the version of the write that opened it
-        self.opened = 0  # the version of the build last published
-        self.frozen: set[str] = set()  # keys of the published rows no commit explains, when the build opened
+        self.builds: dict[
+            int, dict[str, Row]
+        ] = {}  # open builds (shadow tables), by the version that opened each
+        self.published_run = 0  # the build last published
+        self.loose: dict[str, int] = {}  # published keys an uncommitted write outside a full run touched
+        self.build_loose: dict[
+            int, dict[str, int]
+        ] = {}  # the same, per build, published with it at the switch
         self.ended: set[int] = set()  # builds whose full run ended in the log
         self.switched: Counter = Counter()  # build -> times the store published it
-        self.superseded: set[int] = set()  # builds a newer run's first write replaced unswitched
+        self.superseded: set[int] = set()  # ended builds dropped unpublished: a newer run's end overtook them
         self.settled = [0]  # commits an outsider may see: not mid full run, nor in an unfinished first run
-        self.ran = False  # the output has been complete (or released) once
+        self.ran = False  # a full run (the first run, at least) has ended in the log
         self.shown = 0  # the settled commit the outside view last matched
         self.objects: dict[tuple[str, int], Row] = {}  # every version written, as files keep them
         self.removals: dict[
@@ -134,7 +147,12 @@ class Output:
         self.deleted: set[tuple[str, int]] = set()
 
     def write(
-        self, version: int, writes: dict, clear: bool, rebuild: int | None, dirty: set[str] = frozenset()
+        self,
+        version: int,
+        writes: dict,
+        clear: bool,
+        rebuild: int | None,
+        ctx: tuple[int | None, int | None] = (None, None),
     ) -> None:
         """The store's write: a file store names objects by version; a table writes
         its rows in place, so they change before the engine commits."""
@@ -142,7 +160,7 @@ class Output:
             if v is not ABSENT:
                 self.objects[(k, version)] = Row(version, v, rebuild)
         if self.kind == "table":
-            self._apply(version, writes, clear, dirty)
+            self._apply(version, writes, clear, ctx)
 
     def commit(self, version: int, writes: dict, clear: bool, rebuild: int | None) -> None:
         """The engine's commit: the log, and on a file store what is current."""
@@ -154,29 +172,55 @@ class Output:
             self.removals.setdefault(k, []).append((c, rebuild))
         if self.kind == "file":
             self._apply(version, writes, clear)
+        self.loose = {k: v for k, v in self.loose.items() if v != version}
+        for bl in self.build_loose.values():
+            for k in [k for k, v in bl.items() if v == version]:
+                del bl[k]
         self.log.commit({k: ABSENT if v is ABSENT else version for k, v in writes.items()}, clear)
+
+    def _named(self) -> dict[str, Row] | None:
+        """The build the log names: its run in progress, else the one owed a switch."""
+        for g in self.ctx():
+            if g is not None and g in self.builds:
+                return self.builds[g]
+        return None
 
     @property
     def rows(self) -> dict[str, Row]:
-        """What Solera reads: the open build, if any."""
-        if self.build is not None and self.on("solera_build"):
-            return self.build
+        """What Solera reads: the build the log names, if any."""
+        if self.on("solera_build") and (b := self._named()) is not None:
+            return b
         return self.published
 
     def outside(self) -> dict[str, Row]:
         """What a program reading the table outside Solera sees."""
         return self.published
 
-    def _apply(self, version: int, writes: dict, clear: bool, dirty: set[str] = frozenset()) -> None:
-        if clear and self.swap:
-            if self.build is None:
-                self.frozen = set(dirty)
+    def _apply(self, version: int, writes: dict, clear: bool, ctx: tuple = (None, None)) -> None:
+        run, owed = ctx
+        if not self.swap:
+            if clear:
+                self.published = {}
+            rows = self.published
+        else:
+            keep = {g for g in (run, owed) if g is not None and self.on("build_keep")}
+            for g in [g for g in self.builds if g not in keep and g != version]:
+                del self.builds[g]  # a build no run in the log names: a dead attempt's, or overtaken
+                if g in self.ended and not self.switched[g]:
+                    self.superseded.add(g)
+            if clear and version <= self.published_run and self.on("reset_replay"):
+                rows = self.published  # the same attempt again, its build published: same rows, in place
+                rows.clear()
+            elif clear:
+                rows = self.builds[version] = {}  # a new shadow
             else:
-                self.superseded.add(self.build_gen)
-            self.build, self.build_gen = {}, version  # a new shadow, replacing any open one
-        elif clear:
-            self.published = {}
-        rows = self.published if self.build is None else self.build
+                rows = next((self.builds[g] for g in (run, owed) if g is not None and g in self.builds), None)
+                if rows is None:
+                    rows = self.published
+        if rows is self.published and not clear and (run is None or self.swap):
+            self.loose.update(dict.fromkeys(writes, version))
+        elif not clear and self.swap and (g := next((g for g, b in self.builds.items() if b is rows), None)):
+            self.build_loose.setdefault(g, {}).update(dict.fromkeys(writes, version))
         for k, v in writes.items():
             if v is ABSENT:
                 rows.pop(k, None)
@@ -186,17 +230,23 @@ class Output:
     def switch(self, gen: int) -> None:
         """The store's hook at the end of a full run (D211), one transaction:
         the partition's rows are replaced by the build's, and the build goes.
-        Safe to repeat; a no-op unless the build open is the one this run's
-        first write opened (switch_guard)."""
-        if self.on("switch_guard") and (self.build is None or self.build_gen != gen):
+        Safe to repeat; a no-op unless the build the run opened is still open
+        (switch_guard; off, it publishes the newest build open)."""
+        if not self.on("switch_guard"):
+            gen = max(self.builds, default=gen)
+        if gen not in self.builds:
             return
-        build, gen = self.build or {}, self.build_gen
+        build = self.builds.pop(gen)
+        for g in [g for g in self.builds if g < gen]:  # older runs' builds: overtaken, never to be published
+            del self.builds[g]
+            if g in self.ended and not self.switched[g]:
+                self.superseded.add(g)
         # switch_cleanup: delete the partition's rows before inserting the build's
         self.published = dict(build) if self.on("switch_cleanup") else {**self.published, **build}
-        self.build, self.build_gen = None, None
-        if gen is not None:
-            self.switched[gen] += 1
-            self.opened = gen
+        carried = self.build_loose.pop(gen, {})  # a dead attempt's rows go out with the build, as in place
+        self.loose = carried if self.on("switch_cleanup") else {**self.loose, **carried}
+        self.switched[gen] += 1
+        self.published_run = max(self.published_run, gen)
 
     def removed_by(self, k: str, H: int, planned: bool) -> int | None:
         """The rebuild whose commit last removed k, as the reader saw it: at its
@@ -227,6 +277,7 @@ class Spec:
     removals: dict = field(default_factory=dict)  # a loaded absence: the rebuild whose commit removed it then
     clear: bool = False
     rebuild: int | None = None
+    ctx: tuple = (None, None)  # the write context: the log's run in progress and the run owed a switch
     before: list[dict] = field(default_factory=list)  # what the asset held of each taken key
     loaded: dict = field(default_factory=dict)  # ctx.load() at the start: group -> Row or None
     written: dict | None = None  # the attempt's write, once its transaction ran
@@ -316,6 +367,9 @@ class Ordinary:
         self.rebuild: int | None = None  # the rebuild in progress, from its clear until the asset is complete
         self.full_gen: int | None = None  # the version of the committed clear that began it
         self.released = False  # a person let downstream proceed over the rebuild's partial output
+        self.hand = False  # the full run due was asked for by hand, and nothing else makes it due
+        self.last: Spec | None = None  # the last attempt that wrote, which a store call may replay
+        output.ctx = self.runs
         self.cursor: str | None = None
         self.pending: Spec | None = None
         self.dead: dict[int, frozenset[str]] = {}  # attempts given up on, unrepaired: the keys each may write
@@ -326,6 +380,11 @@ class Ordinary:
     @property
     def cond(self) -> Cond:
         return Cond(defn=(self.d,))
+
+    def runs(self) -> tuple[int | None, int | None]:
+        """What the core says of the output's full runs: the one in progress,
+        and the one whose end the engine has not yet told the store (D211)."""
+        return (self.full_gen if self.rebuild is not None else None), self.w.ended.get(self.name)
 
     def complete(self) -> bool:
         """D177, the engine's way: no empty piece of an input holds an upstream key."""
@@ -388,6 +447,7 @@ class Ordinary:
         s.version = w.version
         s.before = [{k: (ABSENT if s.reset else prog.decode(k)) for k in s.taken} for prog in self.progress]
         s.clear = s.reset and w.on("clear")
+        s.ctx = self.runs()
         if s.reset:
             w.rebuilds += 1
             s.rebuild = w.rebuilds
@@ -404,7 +464,7 @@ class Ordinary:
                 if (ABSENT if row is None else row.version) != log.states[-1].get(g):
                     w.stats["ctx.load() found a row no commit of its own wrote"] += 1
                     if w.on("load_check"):
-                        self.full_due = True
+                        self.full_due, self.hand = True, False
                         w.trace.append(
                             f"  its ctx.load() finds {g}@{row and row.version}, its last commit wrote "
                             f"{log.states[-1].get(g)}: it cannot build on it and owes a full run"
@@ -423,7 +483,7 @@ class Ordinary:
             return False
         return True
 
-    def transact(self, s: Spec, live: bool) -> bool:
+    def transact(self, s: Spec, live: bool, again: bool = False) -> bool:
         """One write transaction. On a table it first raises the partition's version
         row, or is refused if a newer attempt has written (F1, rec 1); the first
         live attempt after one given up on always opens it (rec 3) and repairs what
@@ -442,13 +502,10 @@ class Ordinary:
             out.fence = max(out.fence, s.version)
             if repair and w.on("repair") and not self.repair(s, writes):
                 return False
-        dirty = set(self.excused)
-        if self.pending is not None and self.pending is not s and self.pending.written is not None:
-            dirty |= self._keys(self.pending.written, self.pending.clear)
-        out.write(s.version, writes, s.clear, s.rebuild, dirty)
-        s.written = writes
+        out.write(s.version, writes, s.clear, s.rebuild, s.ctx)
+        s.written, self.last = writes, s
         w.trace.append(
-            f"  {self.name} v{s.version}{'' if live else ', given up on,'} writes"
+            f"  {self.name} v{s.version}{'' if live else ' again,' if again else ', given up on,'} writes"
             f"{' clear;' if s.clear else ''} {_writes(writes)}"
         )
         return True
@@ -472,7 +529,7 @@ class Ordinary:
         if s.clear:
             return True
         if wrong and self.accumulates:
-            self.full_due = True
+            self.full_due, self.hand = True, False
             w.trace.append(f"  {self.name} owes a full run: a dead attempt wrote its own rows")
             return False
         for q in wrong:
@@ -520,6 +577,12 @@ class Ordinary:
         self._dead(s)
         if s.written is None:
             self.zombies.append(s)
+
+    def replay(self) -> None:
+        """A store call delivered twice: the last write transaction runs again,
+        at its own version (STO-6), before or after its commit and switch."""
+        if self.last is not None:
+            self.transact(self.last, live=False, again=True)
 
     def late(self, newest: bool = False) -> None:
         if self.zombies:
@@ -894,7 +957,10 @@ class World:
         self.held: Counter = Counter()
         self.stats: Counter = Counter()
         self.items, self.feed = Log(), Log()
-        self.owed: list[tuple[str, int]] = []  # switches the engine owes a store: (asset, build), journaled
+        self.ended: dict[str, int] = {}  # core: per output, the newest run whose end the store was not told
+        self.acks: list[
+            tuple[str, int]
+        ] = []  # hook calls that returned, their FullRunNoticed not journaled yet
         self.released: set[int] = set()  # rebuilds a person released
         self.copy = Ordinary(
             self, "copy", [self.items, self.feed], Output("copy", kind, self.on), accumulates=False
@@ -919,26 +985,36 @@ class World:
     def owe(self, a: Ordinary, via: str) -> None:
         """A full run ended in the log: the same journal event records that the
         engine owes the store its switch (D211). Only tables have the hook."""
+        a.output.ran = True
         if a.output.kind != "table" or a.full_gen is None:
             return
         a.output.ended.add(a.full_gen)
         if self.on(f"switch_{via}"):
-            self.owed.append((a.name, a.full_gen))
+            self.ended[a.name] = a.full_gen  # the core keeps the newest; an older run's switch was overtaken
 
-    def switch(self, name: str, ack: bool) -> None:
-        """The engine calls the hook for the oldest switch it owes the asset's
-        store; without the ack (a crash after the call) it stays owed."""
-        owed = [x for x in self.owed if x[0] == name]
-        if not owed:
+    def switch(self, name: str, ack: bool | str) -> None:
+        """The engine calls the hook for the run it owes the asset's store. With
+        the ack it then journals FullRunNoticed; "late", the notice is journaled
+        by a later step; without the ack (a crash after the call) it stays owed."""
+        if (run := self.ended.get(name)) is None:
             return
-        self.assets[name].output.switch(owed[0][1])
+        self.assets[name].output.switch(run)
         self.stats["switches called"] += 1
         self.trace.append(
-            f"the engine calls {name}'s store to switch to build v{owed[0][1]}"
+            f"the engine calls {name}'s store to switch to build v{run}"
             + ("" if ack else ", and crashes before it records the call")
         )
-        if ack:
-            self.owed.remove(owed[0])
+        if ack == "late":
+            self.acks.append((name, run))
+        elif ack:
+            self.notice(name, run)
+
+    def notice(self, name: str, run: int) -> None:
+        """FullRunNoticed: the store was told run ended. It clears the debt only
+        if no newer run's end replaced it meanwhile (notice_match)."""
+        self.trace.append(f"the engine journals that {name}'s store was told v{run} ended")
+        if self.ended.get(name) == run or (name in self.ended and not self.on("notice_match")):
+            del self.ended[name]
 
     def observe(self) -> None:
         """Note each commit an outsider may see: one at which the output is
@@ -947,7 +1023,6 @@ class World:
             out = a.output
             if a.rebuild is not None:
                 continue
-            out.ran |= a.complete() or a.released
             if out.ran and out.settled[-1] != out.log.head:
                 out.settled.append(out.log.head)
 
@@ -1052,30 +1127,39 @@ class World:
                 self.stats["cancels mid-rebuild"] += getattr(a, "rebuild", None) is not None
                 if isinstance(a, Ordinary):
                     a.giveup()
+                    if a.hand and a.full_due:
+                        a.full_due = a.hand = False  # the run asked for by hand goes with it
                 a.pending, a.cursor = None, None
                 self.trace.append(f"{a.name}'s run is canceled")
         elif kind == "define":
             a = self.assets[ev[1]]
             a.d += 1
             if isinstance(a, Ordinary):
-                a.full_due = True
+                a.full_due, a.hand = True, False
             self.trace.append(f"{a.name}'s definition changes to d{a.d}")
         elif kind == "full":
             a = self.assets[ev[1]]
             if isinstance(a, Ordinary):
+                a.hand = a.hand or not a.full_due
                 a.full_due = True
             else:
                 a.counter += 1
             self.trace.append(f"a full run of {a.name} is asked for by hand")
         elif kind == "switch":
             self.switch(ev[1], ev[2])
+        elif kind == "notice":
+            if self.acks:
+                self.notice(*self.acks.pop(0))
+        elif kind == "replay":
+            self.assets[ev[1]].replay()
         elif kind == "release":
             a = self.assets[ev[1]]
             if isinstance(a, Ordinary):
                 a.release()
         elif kind == "restart":
+            self.acks = []  # notices not journaled are lost: the hook runs again
             if not self.on("switch_owed"):
-                self.owed = []  # switches held in memory are lost
+                self.ended = {}  # switches held in memory are lost
             self.stats["restarts mid-rebuild"] += any(a.rebuild is not None for a in (self.copy, self.tally))
             for a in self.assets.values():
                 if isinstance(a, Ordinary):
@@ -1130,7 +1214,7 @@ class World:
             excused = set(a.excused)
             if s is not None and s.written is not None:
                 excused |= a._keys(s.written, s.clear)
-            if bad := self.outsiders(a, excused):
+            if bad := self.outsiders(a):
                 return bad
             for k in sorted(set(state) | set(out.rows)):
                 if (r.version if (r := out.rows.get(k)) else ABSENT) != state.get(k) and k not in excused:
@@ -1166,14 +1250,15 @@ class World:
                     return f"{m.name}'s progress decodes {k} as {m.progress.decode(k)}, it holds {m.holds.get(k)}"
         return None
 
-    def outsiders(self, a: Ordinary, excused: set[str]) -> str | None:
+    def outsiders(self, a: Ordinary) -> str | None:
         """D211, on tables. (iii) The store switches to a build once at most, and
         only once its full run ended. (iv) After a switch, no row of an older
         build is left. (i) A program outside Solera reads the log's state at a
-        commit at which the output was neither mid full run nor in its first
-        run, never an earlier one than it read before; keys an uncommitted
-        write touched are excused, as for Solera. (ii) is the check above:
-        Solera reads the log."""
+        commit at which the output was neither mid full run nor in an
+        unfinished first run, never an earlier one than it read before; only
+        keys an uncommitted write outside a full run touched in place are
+        excused, never a full run's writes. (ii) is the check above: Solera
+        reads the log."""
         out = a.output
         if out.kind != "table":
             return None
@@ -1183,10 +1268,10 @@ class World:
                 return f"{a.name}'s store switched to build v{g} {n} times"
             if g not in out.ended:
                 return f"{a.name}'s store switched to build v{g}, whose full run had not ended"
-        if out.swap and (old := {k: r for k, r in view.items() if r.version < out.opened}):
+        if out.swap and (old := {k: r for k, r in view.items() if r.version < out.published_run}):
             return f"{a.name}'s store still holds {_rows(old)} of an older build after its switch"
-        dirty = out.frozen if out.build is not None else excused
-        self.stats["outside reads during a build"] += out.build is not None
+        dirty = set(out.loose)
+        self.stats["outside reads during a build"] += bool(out.builds)
         for c in out.settled:
             st = out.log.states[c]
             if c >= out.shown and all(
@@ -1227,7 +1312,9 @@ class World:
                             return bad
             if not moved:
                 break
-        for name, _ in list(self.owed):
+        while self.acks:
+            self.notice(*self.acks.pop(0))
+        for name in list(self.ended):
             self.switch(name, True)
         if bad := self.check():
             return bad
@@ -1248,6 +1335,8 @@ class World:
                 )
             if lost := sorted(g for g in out.ended if not out.switched[g] and g not in out.superseded):
                 return f"at rest {a.name}'s full runs that opened builds {lost} ended, but no switch published them"
+            if stray := sorted(g for g in out.builds if g not in a.abandoned):
+                return f"at rest {a.name}'s store holds builds {stray} that no run in the log names"
             if out.kind == "table" and {k: r.version for k, r in out.outside().items()} != state:
                 return (
                     f"at rest outsiders read {a.name} as {_rows(out.outside())}, "
@@ -1290,7 +1379,7 @@ def history(rnd: random.Random, steps: int) -> list[tuple]:
         + ("cleanup",) * 2
         + ("retire",)
         + ("switch",) * 3
-        + ("release",)
+        + ("release", "notice", "replay")
     )
     names = ("copy", "copy", "tally", "archive", "report", "checks")
     events: list[tuple] = []
@@ -1311,7 +1400,9 @@ def history(rnd: random.Random, steps: int) -> list[tuple]:
         elif kind == "late":
             events.append((kind, rnd.choice(("copy", "tally")), rnd.random() < 0.5))
         elif kind == "switch":
-            events.append((kind, rnd.choice(("copy", "tally")), rnd.random() < 0.8))
+            events.append((kind, rnd.choice(("copy", "tally")), rnd.choice((True, True, False, "late"))))
+        elif kind == "replay":
+            events.append((kind, rnd.choice(("copy", "tally"))))
         elif kind == "release":
             events.append((kind, rnd.choice(("copy", "tally"))))
         elif kind == "merge":

@@ -440,21 +440,25 @@ def test_lineage_needs_the_keys_a_repair_redid(monkeypatch):
             ("commit", "archive"),
             ("items", (("k1", True),)),
         ],
-        [
-            ("items", (("k1", True),)),
-            ("step", "copy", 1),
-            ("full", "copy"),
-            ("keys", "copy", ()),
-            ("write", "copy"),
-            ("summary",),
-        ],
     ],
-    ids=["a dead removal", "an uncommitted clear"],
+    ids=["a dead removal"],
 )
 def test_a_reader_never_processes_what_no_commit_recorded(events):
     assert fullrun.run(events, "clear", "table") is None
     r = fullrun.run(events, "clear", "table", frozenset({"hold_back"}))
     assert r is not None and "no commit" in r[1]
+
+
+def test_solera_never_reads_a_clear_the_journal_has_not_recorded():
+    """Before D211 this history needed the hold-back: summary read copy's
+    uncommitted clear in place. Now the clear's write opens a build that no
+    run in the log names, so Solera and outsiders both read the old rows."""
+    events = [("items", (("k1", True),)), ("step", "copy", 1), ("switch", "copy", True), ("full", "copy")]
+    events += [("keys", "copy", ()), ("write", "copy"), ("summary",)]
+    for off in (frozenset(), frozenset({"hold_back"})):
+        assert fullrun.run(events, "clear", "table", off) is None
+    w = oracle.replay_fullrun(events, kind="table")
+    assert _versions(w.copy.output.rows) == _versions(w.copy.output.outside()) == {"k1": 1}
 
 
 # -- a table's full run builds beside the published rows (D211) ---------------------
@@ -488,10 +492,10 @@ def test_outsiders_read_copys_full_run_all_old_then_all_new():
     assert w.archive.held()
     w.apply(("step", "copy", 2))
     assert _versions(out.rows) == {"k1": 3, "k2": 3, "k4": 4, "k5": 4} and _versions(out.outside()) == old
-    assert w.owed == [("copy", 3)]  # the run ended in the log; the switch is owed
+    assert w.ended == {"copy": 3}  # the run ended in the log; the switch is owed
     w.apply(("switch", "copy", True))
     assert _versions(out.outside()) == {"k1": 3, "k2": 3, "k4": 4, "k5": 4}
-    assert out.build is None and w.owed == [] and w.check() is None
+    assert out.builds == {} and w.ended == {} and w.check() is None
 
 
 def test_a_first_run_is_hidden_until_it_completes():
@@ -499,7 +503,7 @@ def test_a_first_run_is_hidden_until_it_completes():
     nothing until it completes, then all of it."""
     w = oracle.replay_fullrun([("items", K4), ("step", "copy", 2)], kind="table")
     out = w.copy.output
-    assert sorted(out.rows) == ["k1", "k2"] and out.outside() == {} and out.build is not None
+    assert sorted(out.rows) == ["k1", "k2"] and out.outside() == {} and list(out.builds) == [1]
     w.apply(("step", "copy", 2))
     w.apply(("switch", "copy", True))
     assert sorted(out.outside()) == ["k1", "k2", "k3", "k4"]
@@ -523,10 +527,11 @@ def test_a_release_publishes_the_partial_output():
     assert fullrun.run(events, "clear", "table") is None
 
 
-def test_a_switch_a_newer_full_run_overtook_is_skipped():
+def test_a_late_switch_publishes_its_run_while_a_newer_one_builds():
     """The engine crashed before copy's switch; a newer full run's first write
-    then opened a new build. The late switch publishes nothing: outsiders go
-    from the old rows straight to the newer run's result."""
+    then opened a new build beside the ended run's, which it keeps since the
+    log still owes its switch. The late switch publishes the ended run;
+    outsiders get the newer run's result at its own switch."""
     events = [
         ("items", (("k1", True), ("k2", True))),
         ("step", "copy", 2),
@@ -539,10 +544,10 @@ def test_a_switch_a_newer_full_run_overtook_is_skipped():
     ]
     w = oracle.replay_fullrun(events, kind="table")
     out = w.copy.output
-    assert out.superseded == {2} and _versions(out.outside()) == {"k1": 1, "k2": 1}
+    assert _versions(out.outside()) == {"k1": 2, "k2": 2} and list(out.builds) == [3]
     w.apply(("step", "copy", 1))
     w.apply(("switch", "copy", True))
-    assert _versions(out.outside()) == {"k1": 3, "k2": 4} and out.switched == {1: 1, 3: 1}
+    assert _versions(out.outside()) == {"k1": 3, "k2": 4} and out.switched == {1: 1, 2: 1, 3: 1}
     assert fullrun.run(events, "clear", "table") is None
 
 
@@ -552,11 +557,14 @@ def test_a_switch_a_newer_full_run_overtook_is_skipped():
         ("swap", "outsiders read"),  # (i)
         ("first_full", "outsiders read"),  # (i)
         ("solera_build", "log says"),  # (ii)
-        ("switch_commit", "no switch published them"),  # (iii)
-        ("switch_alone", "no switch published them"),
-        ("switch_release", "no switch published them"),
-        ("switch_owed", "no switch published them"),
-        ("switch_guard", "whose full run had not ended"),
+        ("switch_commit", "log says"),  # (ii): the build a run left unowed is read by no one
+        ("switch_alone", "log says"),
+        ("switch_release", "log says"),
+        ("switch_owed", "log says"),
+        ("notice_match", "log says"),
+        ("build_keep", "outsiders read"),  # (i)
+        ("switch_guard", "whose full run had not ended"),  # (iii)
+        ("reset_replay", "times"),
         ("switch_cleanup", "of an older build"),  # (iv)
     ],
 )
@@ -564,3 +572,59 @@ def test_each_check_on_outside_readers_bites(rule, check):
     events = CALIBRATIONS[("fullrun", "clear", "table", rule)]
     r = fullrun.run(events, "clear", "table", frozenset({rule}))
     assert r is not None and check in r[1]
+
+
+def test_a_canceled_full_run_asked_for_by_hand_leaves_nothing_in_the_way():
+    """Its first write opened a build and died; the person cancels, so the next
+    run is ordinary. Its write lands in the user's table, where the log's state
+    is, and drops the build no run in the log names (Sol review of #37, 1)."""
+    events = [("items", (("k1", True), ("k2", True))), ("step", "copy", 2), ("switch", "copy", True)]
+    events += [("full", "copy"), ("plan", "copy", 1), ("write", "copy"), ("cancel", "copy")]
+    events += [("items", (("k1", True),)), ("step", "copy", 1)]
+    w = oracle.replay_fullrun(events, kind="table")
+    assert not w.copy.full_due and w.copy.output.builds == {}
+    assert _versions(w.copy.output.outside()) == {"k1": 3, "k2": 1} == _versions(w.copy.output.rows)
+    assert fullrun.run(events, "clear", "table") is None
+
+
+def test_a_reset_replayed_after_its_switch_writes_in_place():
+    """A one-batch full run is published, then its write transaction is
+    delivered again at the same version: it rewrites the same rows in the
+    user's table instead of opening a build no run names, which would only
+    go at the next write (Sol review, 2). Neither Solera nor outsiders would
+    read that build: writes and loads follow the log's runs."""
+    events = [("items", (("k1", True),)), ("step", "copy", 1), ("switch", "copy", True), ("replay", "copy")]
+    w = oracle.replay_fullrun(events, kind="table")
+    assert w.copy.output.builds == {} and _versions(w.copy.output.outside()) == {"k1": 1}
+    assert fullrun.run(events, "clear", "table") is None
+    r = fullrun.run(events, "clear", "table", frozenset({"reset_replay"}))
+    assert r is not None and "that no run in the log names" in r[1]
+
+
+def test_a_late_notice_of_an_older_switch_keeps_the_newer_one_owed():
+    """The hook for run A returns, run B ends, then FullRunNoticed(A) is
+    journaled: B's switch stays owed (Sol review, 6)."""
+    events = [("items", (("k1", True),)), ("step", "copy", 1), ("switch", "copy", "late")]
+    events += [("full", "copy"), ("step", "copy", 1), ("notice",)]
+    w = oracle.replay_fullrun(events, kind="table")
+    assert w.ended == {"copy": 2}
+    assert fullrun.run(events, "clear", "table") is None
+    r = fullrun.run(events, "clear", "table", frozenset({"notice_match"}))
+    assert r is not None and "copy's log says" in r[1]
+
+
+def test_outsiders_are_checked_at_once_not_only_at_rest():
+    """Without the build, an uncommitted first write shows outsiders a row no
+    commit recorded, and the check after that very step says so (Sol review, 4)."""
+    w = fullrun.World("clear", "table", frozenset({"swap"}))
+    for ev in [("items", (("k4", True), ("k5", True))), ("plan", "tally", 1), ("write", "tally")]:
+        w.apply(ev)
+    assert "outsiders read tally" in (w.check() or "")
+
+
+def test_an_unrelated_step_does_not_let_a_first_run_show():
+    """A step before the first run must not count the output as having run
+    (Sol review, 5)."""
+    events = [("summary",), *CALIBRATIONS[("fullrun", "clear", "table", "first_full")]]
+    r = fullrun.run(events, "clear", "table", frozenset({"first_full"}))
+    assert r is not None and "outsiders read" in r[1]
