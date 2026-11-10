@@ -1,0 +1,467 @@
+//! The I/O under the index: range GETs on an object store, coalesced; one
+//! in-process cache, shared by every query, of blocks and parsed metadata; and
+//! single flight, so that concurrent queries needing the same block or
+//! segment wait on one GET instead of each making its own.
+
+use crate::error::{Error, Result};
+use crate::format::{parse_segment, Index, LayerRef, Top};
+use bytes::Bytes;
+use futures::future::{BoxFuture, FutureExt, Shared};
+use object_store::path::Path;
+use object_store::{ObjectStore, ObjectStoreExt, PutPayload, WriteMultipart};
+use std::collections::{BTreeMap, HashMap};
+use std::ops::Range;
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::sync::{Arc, Mutex};
+use tokio::sync::Semaphore;
+
+#[derive(Clone, Debug)]
+pub struct StoreOptions {
+    /// Bytes of blocks and metadata kept in memory, shared by every query.
+    pub memory_bytes: u64,
+    /// Ranges closer than this are fetched as one GET.
+    pub coalesce: u64,
+    /// A GET never spans more than this.
+    pub max_get: u64,
+    /// Metadata under this size is read in one GET with the top level.
+    pub one_get: u64,
+    /// GETs in flight at once.
+    pub max_inflight: usize,
+    /// Uploads larger than this go in parts of this size.
+    pub part_bytes: usize,
+}
+
+impl Default for StoreOptions {
+    fn default() -> Self {
+        StoreOptions {
+            memory_bytes: 256 << 20,
+            coalesce: 64 << 10,
+            max_get: 16 << 20,
+            one_get: 1 << 20,
+            max_inflight: 64,
+            part_bytes: 16 << 20,
+        }
+    }
+}
+
+/// Counters since the store was made.
+#[derive(Default, Debug)]
+pub struct Stats {
+    pub gets: AtomicU64,
+    pub get_bytes: AtomicU64,
+    pub puts: AtomicU64,
+    pub put_bytes: AtomicU64,
+    pub hits: AtomicU64,
+    pub misses: AtomicU64,
+    pub waits: AtomicU64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct Counts {
+    pub gets: u64,
+    pub get_bytes: u64,
+    pub puts: u64,
+    pub put_bytes: u64,
+    pub hits: u64,
+    pub misses: u64,
+    pub waits: u64,
+}
+
+impl Stats {
+    pub fn counts(&self) -> Counts {
+        Counts {
+            gets: self.gets.load(Relaxed),
+            get_bytes: self.get_bytes.load(Relaxed),
+            puts: self.puts.load(Relaxed),
+            put_bytes: self.put_bytes.load(Relaxed),
+            hits: self.hits.load(Relaxed),
+            misses: self.misses.load(Relaxed),
+            waits: self.waits.load(Relaxed),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum Part {
+    Top,
+    Seg(u32),
+    Block(u64),
+}
+
+type Key = (Arc<str>, Part);
+
+#[derive(Clone)]
+pub(crate) enum Cached {
+    Block(Bytes),
+    Top(Arc<Top>),
+    Seg(Arc<Index>),
+}
+
+impl Cached {
+    fn weight(&self) -> usize {
+        64 + match self {
+            Cached::Block(b) => b.len(),
+            Cached::Top(t) => t.bytes(),
+            Cached::Seg(s) => s.len() * 24,
+        }
+    }
+}
+
+/// What a fetched range is, to check and parse it.
+#[derive(Clone, Debug)]
+pub(crate) enum Want {
+    Top { layer: LayerRef },
+    Seg { rlen: u32, check: u32, blocks: u32 },
+    Block { check: u32 },
+}
+
+type Load = Shared<BoxFuture<'static, std::result::Result<Arc<Vec<Cached>>, Error>>>;
+
+struct Lru {
+    map: HashMap<Key, (Cached, u64, usize)>,
+    order: BTreeMap<u64, Key>,
+    tick: u64,
+    total: usize,
+    budget: usize,
+}
+
+impl Lru {
+    fn get(&mut self, k: &Key) -> Option<Cached> {
+        let e = self.map.get_mut(k)?;
+        self.order.remove(&e.1);
+        self.tick += 1;
+        e.1 = self.tick;
+        self.order.insert(self.tick, k.clone());
+        Some(e.0.clone())
+    }
+
+    fn insert(&mut self, k: Key, v: Cached) {
+        let w = v.weight();
+        if w > self.budget {
+            return;
+        }
+        if let Some(old) = self.map.remove(&k) {
+            self.order.remove(&old.1);
+            self.total -= old.2;
+        }
+        self.tick += 1;
+        self.order.insert(self.tick, k.clone());
+        self.map.insert(k, (v, self.tick, w));
+        self.total += w;
+        while self.total > self.budget {
+            let Some((_, k)) = self.order.pop_first() else {
+                break;
+            };
+            if let Some(e) = self.map.remove(&k) {
+                self.total -= e.2;
+            }
+        }
+    }
+}
+
+struct State {
+    lru: Lru,
+    inflight: HashMap<Key, (Load, usize)>,
+}
+
+pub struct Store {
+    inner: Arc<dyn ObjectStore>,
+    prefix: Path,
+    pub(crate) rt: tokio::runtime::Handle,
+    pub(crate) opts: StoreOptions,
+    state: Mutex<State>,
+    sem: Semaphore,
+    pub stats: Stats,
+}
+
+impl Store {
+    /// A store over `inner`, every path under `prefix`; `rt` runs prefetches and uploads.
+    pub fn new(
+        inner: Arc<dyn ObjectStore>,
+        prefix: Path,
+        rt: tokio::runtime::Handle,
+        opts: StoreOptions,
+    ) -> Arc<Store> {
+        Arc::new(Store {
+            inner,
+            prefix,
+            rt,
+            sem: Semaphore::new(opts.max_inflight),
+            state: Mutex::new(State {
+                lru: Lru {
+                    map: HashMap::new(),
+                    order: BTreeMap::new(),
+                    tick: 0,
+                    total: 0,
+                    budget: opts.memory_bytes as usize,
+                },
+                inflight: HashMap::new(),
+            }),
+            opts,
+            stats: Stats::default(),
+        })
+    }
+
+    /// A store from a URL (`file:///…`, `s3://bucket/prefix`, …) and its
+    /// options, as `object_store::parse_url_opts` reads them.
+    pub fn from_url(
+        url: &str,
+        options: impl IntoIterator<Item = (String, String)>,
+        rt: tokio::runtime::Handle,
+        opts: StoreOptions,
+    ) -> Result<Arc<Store>> {
+        let u = url::Url::parse(url).map_err(|e| Error::Invalid(format!("{url}: {e}")))?;
+        let (inner, prefix) = object_store::parse_url_opts(&u, options)?;
+        Ok(Store::new(Arc::from(inner), prefix, rt, opts))
+    }
+
+    fn path(&self, path: &str) -> Result<Path> {
+        let p = Path::parse(path).map_err(|e| Error::Invalid(format!("{path}: {e}")))?;
+        Ok(self.prefix.parts().chain(p.parts()).collect())
+    }
+
+    /// One GET.
+    pub(crate) async fn get_range(&self, path: &str, r: Range<u64>) -> Result<Bytes> {
+        let p = self.path(path)?;
+        let _permit = self.sem.acquire().await.expect("semaphore");
+        let b = self.inner.get_range(&p, r.clone()).await?;
+        if b.len() as u64 != r.end - r.start {
+            return Err(Error::Format(format!("{path}: short read at {r:?}")));
+        }
+        self.stats.gets.fetch_add(1, Relaxed);
+        self.stats.get_bytes.fetch_add(b.len() as u64, Relaxed);
+        Ok(b)
+    }
+
+    /// A layer's top level, read once and cached; with small metadata, its
+    /// segments come in the same GET.
+    pub(crate) async fn top(self: &Arc<Self>, l: &LayerRef) -> Result<Arc<Top>> {
+        let whole = l.size - l.index_start <= self.opts.one_get;
+        let start = if whole { l.index_start } else { l.top_start };
+        let want = Want::Top { layer: l.clone() };
+        let got = self
+            .load(
+                &Arc::from(l.path.as_str()),
+                vec![(Part::Top, start..l.size, want)],
+            )
+            .await?;
+        match &got[0] {
+            Cached::Top(t) => Ok(t.clone()),
+            _ => unreachable!(),
+        }
+    }
+
+    /// Fetch what is wanted of one object, from the cache, from a GET already
+    /// in flight, or by new GETs (coalesced); in the order asked.
+    pub(crate) async fn load(
+        self: &Arc<Self>,
+        path: &Arc<str>,
+        wants: Vec<(Part, Range<u64>, Want)>,
+    ) -> Result<Vec<Cached>> {
+        let n = wants.len();
+        let mut out: Vec<Option<Cached>> = vec![None; n];
+        let mut waits: Vec<(usize, Load, usize)> = Vec::new();
+        {
+            let mut st = self.state.lock().unwrap();
+            let mut claims: Vec<usize> = Vec::new();
+            for (i, (part, ..)) in wants.iter().enumerate() {
+                let key = (path.clone(), part.clone());
+                if let Some(v) = st.lru.get(&key) {
+                    out[i] = Some(v);
+                    self.stats.hits.fetch_add(1, Relaxed);
+                } else if let Some((f, j)) = st.inflight.get(&key) {
+                    waits.push((i, f.clone(), *j));
+                    self.stats.waits.fetch_add(1, Relaxed);
+                } else {
+                    claims.push(i);
+                    self.stats.misses.fetch_add(1, Relaxed);
+                }
+            }
+            claims.sort_by_key(|&i| wants[i].1.start);
+            let mut g = 0;
+            while g < claims.len() {
+                let mut span = wants[claims[g]].1.clone();
+                let mut e = g + 1;
+                while e < claims.len() {
+                    let r = &wants[claims[e]].1;
+                    if r.start > span.end + self.opts.coalesce
+                        || r.end.max(span.end) - span.start > self.opts.max_get
+                    {
+                        break;
+                    }
+                    span.end = span.end.max(r.end);
+                    e += 1;
+                }
+                let items: Vec<(Part, Range<u64>, Want)> =
+                    claims[g..e].iter().map(|&i| wants[i].clone()).collect();
+                let fut = self
+                    .clone()
+                    .fetch(path.clone(), span, items)
+                    .boxed()
+                    .shared();
+                for (j, &i) in claims[g..e].iter().enumerate() {
+                    st.inflight
+                        .insert((path.clone(), wants[i].0.clone()), (fut.clone(), j));
+                    waits.push((i, fut.clone(), j));
+                }
+                g = e;
+            }
+        }
+        let done = futures::future::join_all(waits.iter().map(|w| w.1.clone())).await;
+        for ((i, _, j), r) in waits.into_iter().zip(done) {
+            out[i] = Some(r?[j].clone());
+        }
+        Ok(out
+            .into_iter()
+            .map(|v| v.expect("every want answered"))
+            .collect())
+    }
+
+    async fn fetch(
+        self: Arc<Self>,
+        path: Arc<str>,
+        span: Range<u64>,
+        items: Vec<(Part, Range<u64>, Want)>,
+    ) -> std::result::Result<Arc<Vec<Cached>>, Error> {
+        let got = self.get_range(&path, span.clone()).await;
+        let mut extra: Vec<(Part, Cached)> = Vec::new();
+        let parsed: Result<Vec<Cached>> = got.and_then(|b| {
+            items
+                .iter()
+                .map(|(_, r, w)| {
+                    let piece = &b[(r.start - span.start) as usize..(r.end - span.start) as usize];
+                    parse(&path, w, piece, r.start, &mut extra)
+                })
+                .collect()
+        });
+        let mut st = self.state.lock().unwrap();
+        for (part, ..) in &items {
+            st.inflight.remove(&(path.clone(), part.clone()));
+        }
+        let parsed = parsed?;
+        for ((part, ..), v) in items.iter().zip(&parsed) {
+            st.lru.insert((path.clone(), part.clone()), v.clone());
+        }
+        for (part, v) in extra {
+            st.lru.insert((path.clone(), part), v);
+        }
+        Ok(Arc::new(parsed))
+    }
+
+    /// Start writing an object; its bytes go up in parts once past `part_bytes`.
+    pub(crate) fn upload(self: &Arc<Self>, path: &str) -> Result<Upload> {
+        Ok(Upload {
+            store: self.clone(),
+            path: self.path(path)?,
+            buf: Vec::new(),
+            parts: None,
+        })
+    }
+}
+
+fn parse(
+    path: &str,
+    w: &Want,
+    b: &[u8],
+    start: u64,
+    extra: &mut Vec<(Part, Cached)>,
+) -> Result<Cached> {
+    let at = |e: Error| match e {
+        Error::Format(m) => Error::Format(format!("{path}: {m}")),
+        e => e,
+    };
+    Ok(match w {
+        Want::Block { check } => {
+            if crate::format::checksum(b) != *check {
+                return Err(Error::Format(format!(
+                    "{path}: block checksum mismatch at {start}"
+                )));
+            }
+            Cached::Block(Bytes::copy_from_slice(b))
+        }
+        Want::Seg {
+            rlen,
+            check,
+            blocks,
+        } => Cached::Seg(Arc::new(
+            parse_segment(b, *rlen, *check, *blocks).map_err(at)?,
+        )),
+        Want::Top { layer } => {
+            let tail = &b[(layer.top_start - start) as usize..];
+            let top = Top::parse(tail, layer.top_start, layer.size).map_err(at)?;
+            top.check(layer)?;
+            if start == layer.index_start {
+                for i in 0..top.segs.len() {
+                    let (a, n) = (
+                        (top.segs.off[i] - start) as usize,
+                        top.segs.clen[i] as usize,
+                    );
+                    let Some(c) = b.get(a..a + n) else {
+                        return Err(Error::Format(format!(
+                            "{path}: segment {i} outside the index"
+                        )));
+                    };
+                    let seg = parse_segment(c, top.segs.rlen[i], top.segs.check[i], top.segs.n[i])
+                        .map_err(at)?;
+                    extra.push((Part::Seg(i as u32), Cached::Seg(Arc::new(seg))));
+                }
+            }
+            Cached::Top(Arc::new(top))
+        }
+    })
+}
+
+/// An object being written: one PUT if it stays small, else a multipart upload.
+pub(crate) struct Upload {
+    store: Arc<Store>,
+    path: Path,
+    buf: Vec<u8>,
+    parts: Option<WriteMultipart>,
+}
+
+impl Upload {
+    pub(crate) async fn write(&mut self, mut bytes: Vec<u8>) -> Result<()> {
+        let part = self.store.opts.part_bytes;
+        if self.parts.is_none() {
+            if self.buf.is_empty() {
+                self.buf = std::mem::take(&mut bytes);
+            } else {
+                self.buf.extend_from_slice(&bytes);
+            }
+            if self.buf.len() < part {
+                return Ok(());
+            }
+            let up = self.store.inner.put_multipart(&self.path).await?;
+            self.parts = Some(WriteMultipart::new_with_chunk_size(up, part));
+            bytes = std::mem::take(&mut self.buf);
+        }
+        let w = self.parts.as_mut().unwrap();
+        self.store
+            .stats
+            .put_bytes
+            .fetch_add(bytes.len() as u64, Relaxed);
+        w.put(Bytes::from(bytes));
+        w.wait_for_capacity(4).await?;
+        Ok(())
+    }
+
+    pub(crate) async fn finish(self) -> Result<()> {
+        self.store.stats.puts.fetch_add(1, Relaxed);
+        match self.parts {
+            None => {
+                self.store
+                    .stats
+                    .put_bytes
+                    .fetch_add(self.buf.len() as u64, Relaxed);
+                self.store
+                    .inner
+                    .put(&self.path, PutPayload::from(self.buf))
+                    .await?;
+            }
+            Some(w) => {
+                w.finish().await?;
+            }
+        }
+        Ok(())
+    }
+}

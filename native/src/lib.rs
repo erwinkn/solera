@@ -14,6 +14,7 @@ pub mod arrow;
 pub mod delta;
 pub mod entries;
 pub mod error;
+mod index_py;
 pub mod layers;
 mod layers_py;
 pub mod rows;
@@ -691,6 +692,7 @@ fn solera_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Rows>()?;
     m.add_class::<Chunks>()?;
     layers_py::register(m)?;
+    index_py::register(m)?;
     m.add_function(wrap_pyfunction!(content_digest, m)?)?;
     m.add_function(wrap_pyfunction!(_panic, m)?)?;
     Ok(())
