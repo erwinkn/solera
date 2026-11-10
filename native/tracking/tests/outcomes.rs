@@ -2965,9 +2965,12 @@ impl Multi {
                     s.edge,
                     s.holding(k)
                 );
-                if let Some(f) = s.fails.get(k) {
-                    let r = recs.get(k).expect("a failing key has a record");
-                    assert_eq!(r.stored, f.stored, "{:?} {k:?}'s outcome", s.edge);
+                match s.fails.get(k) {
+                    Some(f) => {
+                        let r = recs.get(k).expect("a failing key has a record");
+                        assert_eq!(r.stored, f.stored, "{:?} {k:?}'s outcome", s.edge);
+                    }
+                    None => assert!(!recs.contains_key(k), "{:?} {k:?} has a record", s.edge),
                 }
             }
         }
@@ -3423,6 +3426,65 @@ async fn commit_under(
     let mut all = ops.parts;
     all.append(&mut parts);
     w.apply(all);
+}
+
+/// The same as a retry held back by another input's full run, with the
+/// worker naming b's load of k1 at the version planned: b still read k1 as
+/// planned, so the key comes again.
+#[test]
+fn a_load_named_at_the_planned_version_is_read_as_planned() {
+    let rt = runtime();
+    let ix = index(&rt);
+    rt.block_on(async {
+        let mut w = Multi::new(0);
+        for i in 0..2 {
+            let changes = [(key("k1"), Ver::Int(1))].into();
+            assert!(
+                w.sides[i]
+                    .log
+                    .commit(&ix, &mut w.t, changes, false, true)
+                    .await
+            );
+        }
+        let req = w.request(None, 10);
+        let view = w.t.view(&req).unwrap();
+        let p = plan::plan(&view, &req, &OneIndex(&ix), &NoHold)
+            .await
+            .unwrap();
+        let failed = [(key("k1"), boom())].into();
+        assert!(
+            w.commit_batch(&ix, &p, failed, vec![vec![], vec![]], false)
+                .await
+        );
+        w.counters.deploy = 2;
+        let start = w.start(&ix, 1).await.expect("the deploy starts b's pass");
+        w.apply(start);
+        let r = w.t.retry_view(&w.sides[1].edge).unwrap();
+        let req = w.request(None, 1);
+        let view = w.t.view(&req).unwrap();
+        let p = due::plan_all(&OneIndex(&ix), &r, &view, &req, &NoHold, 10)
+            .await
+            .unwrap();
+        let changes = [(key("k1"), Ver::Int(2))].into();
+        assert!(
+            w.sides[0]
+                .log
+                .commit(&ix, &mut w.t, changes, true, false)
+                .await
+        );
+        let failed = [(key("k1"), boom())].into();
+        let loaded = vec![
+            vec![(key("k1"), Ver::Int(2))],
+            vec![(key("k1"), Ver::Int(1))],
+        ];
+        assert!(w.commit_batch(&ix, &p, failed, loaded, true).await);
+        assert_eq!(w.stats[3], 1, "k1 is held back");
+        assert_eq!(w.t.per_key[&w.sides[1].edge].last.deploy, 1);
+        assert!(
+            w.start(&ix, 1).await.is_some(),
+            "k1 waits for its deploy retry"
+        );
+    });
 }
 
 fn boom() -> Reported {

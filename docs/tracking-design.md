@@ -1423,7 +1423,9 @@ described above, with these choices:
   A key held back while its own input read it as planned, at the version
   its record failed on (another input moved), was not retried and its
   input did not move, so it lowers what the pass covers like a record
-  written, and the next pass takes it again.
+  written, and the next pass takes it again. So while one of a consumer's
+  keyed inputs is mid full run, the engine starts no retry pass for the
+  consumer: each would be held back and come due again at once.
 
 ## 12. History
 

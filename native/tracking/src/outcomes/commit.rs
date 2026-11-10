@@ -507,16 +507,17 @@ pub async fn commit(
             .chain(
                 p.keys
                     .iter()
-                    .filter(|c| {
-                        held_back.binary_search(&c.key).is_ok()
-                            && loaded.binary_search_by(|(x, _)| x.cmp(&c.key)).is_err()
-                    })
+                    .filter(|c| held_back.binary_search(&c.key).is_ok())
                     .filter_map(|c| {
                         let pr = priors.get(&c.key)?;
                         let on = conds.get(&pr.on_cond)?;
                         let tried = Holding::of(pr.on.as_version(), on, &c.key);
                         let planned = Holding::of(c.version.as_version(), &p.conditions, &c.key);
-                        (!owed(&tried, &planned)).then_some(pr)
+                        let got = loaded
+                            .binary_search_by(|(x, _)| x.cmp(&c.key))
+                            .map_or(&c.version, |i| &loaded[i].1);
+                        let read = Holding::of(got.as_version(), &p.conditions, &c.key);
+                        (!owed(&tried, &planned) && !owed(&read, &planned)).then_some(pr)
                     }),
             )
             .fold(None, |mut low, r| {

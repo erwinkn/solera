@@ -32,7 +32,7 @@ use crate::progress::{
 use crate::state::{Id, Output, Tracking};
 
 pub const PLANNER_VERSION: u64 = 1;
-pub const PLAN_FORMAT: u8 = 2;
+pub const PLAN_FORMAT: u8 = 3;
 const POINT_CHUNK: usize = 1024;
 /// Owed keys whose records are read in one lookup, where the edge has any.
 const RECORD_CHUNK: usize = 1024;
