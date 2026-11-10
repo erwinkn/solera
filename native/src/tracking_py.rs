@@ -549,8 +549,9 @@ impl Tracking {
     /// another version than planned), each sorted. Returns the event, the
     /// batch records, and per keyed input the keys it held back: on an input
     /// mid full run or cleared since the plan, a key loaded at another version
-    /// than planned, or one another input took that this input's patterns
-    /// take; held back on every input, they keep what they held. A report
+    /// than planned, or one this input did not take, another input did, and
+    /// this input's patterns take; held back on every input, they keep what
+    /// they held. A report
     /// names only keys its own input took.
     #[pyo3(signature = (plan, reports, producer=Vec::new(), output_commit=None))]
     fn progress_ops<'py>(

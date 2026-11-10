@@ -1,32 +1,30 @@
 """The commit-time hold-back rule (§10 rule 4) against a model, over random
-histories of one consumer reading one to three edges, on one or two outputs,
-with split and overlapping patterns: upstream commits, clears and full runs
-land between the plan, `progress_ops` and the apply, or in the same event as
-the batch. After every batch the consumer owes exactly what the model says,
-no key is committed from an unchecked load on an unsettled input, a refusal
-only ever follows a fenced input becoming unsettled, and once full runs end
-the consumer catches up. SOLERA_HOLDBACK_SEEDS sets the histories per
-configuration (2,000 per configuration were run when the rule changed)."""
+histories of one consumer reading one to three edges on one or two outputs.
+Each edge's patterns (globs, excludes, regexes; split, overlapping, or taking
+nothing) and context may change between batches. Upstream commits, clears
+and full runs land between the plan, `progress_ops` and the apply, or in
+the same event as the batch.
+
+The worker's loads are modeled apart from the rule: a taken key not planned
+removed is loaded and checked against the plan; a batch key an input did not
+take is loaded there, unchecked, if the patterns the batch was planned under
+take it. After every batch: no committed key has an unchecked or moved load
+on an input unsettled when the event applies; a refusal only follows a
+fenced input becoming unsettled; the event gives the same state in either
+part order and as two events, batch first; and the consumer owes exactly
+what the model says under every pattern set and context. Once full runs end
+the consumer catches up, and replay reproduces the snapshot.
+SOLERA_HOLDBACK_SEEDS sets the histories per configuration."""
 
 import fnmatch
 import os
 import random
+import re
 
 import pytest
 from solera._native import ChangeIndex, Tracking, encode_changes
 
 KEYS = ["a1", "a2", "b1", "b2", "c1"]
-
-CONFIGS = {
-    "one": [(b"eA", b"A", None)],
-    "two": [(b"eA", b"A", None), (b"eB", b"B", None)],
-    "same": [(b"e1", b"A", None), (b"e2", b"A", None)],
-    "samepat": [(b"e1", b"A", "a*"), (b"e2", b"A", "b*")],
-    "overlap": [(b"e1", b"A", "a*"), (b"e2", b"A", "*1")],
-    "twopat": [(b"eA", b"A", "a*"), (b"eB", b"B", "*1")],
-    "three": [(b"eA", b"A", None), (b"eB", b"B", None), (b"eA2", b"A", "a*")],
-}
-SEEDS = int(os.environ.get("SOLERA_HOLDBACK_SEEDS", "200"))
 
 
 class Out:
@@ -48,14 +46,6 @@ class World:
         self.n = 0
         self.journal = []
         self.hold = {e: {} for e, _, _ in edges}
-
-    @staticmethod
-    def conds(glob):
-        return {} if glob is None else {"patterns": {"include": [{"glob": glob}]}}
-
-    @staticmethod
-    def takes(glob, k):
-        return glob is None or fnmatch.fnmatchcase(k, glob)
 
     def apply(self, ev):
         self.t.apply(ev)
@@ -117,16 +107,6 @@ class World:
         o = self.outs[out]
         return o.incomplete or any(H < c <= o.head for c in o.clears)
 
-    def check_owed(self, where):
-        for e, o, g in self.edges:
-            want = sorted(
-                k
-                for k in KEYS
-                if (self.outs[o].state.get(k) if self.takes(g, k) else None) != self.hold[e].get(k)
-            )
-            got = sorted(k for k, _ in self.t.owed(e, self.conds(g))[0])
-            assert got == want, (where, e, "owed", got, "model", want, self.hold[e], self.outs[o].state)
-
 
 def random_build(w, rnd, out=None):
     """Builds (does not apply) one random upstream event; returns ('commit', built) or ('done', out) or None."""
@@ -177,8 +157,93 @@ def upstream(w, rnd, n):
         land(w, random_build(w, rnd))
 
 
-def one_batch(w, rnd, quiet=False):
-    edges = w.edges
+class P:
+    def __init__(self, inc=(), exc=()):
+        self.inc, self.exc = list(inc), list(exc)
+
+    @staticmethod
+    def _m(p, k):
+        kind, pat = p
+        return fnmatch.fnmatchcase(k, pat) if kind == "glob" else re.fullmatch(pat, k, re.S) is not None
+
+    def takes(self, k):
+        return (not self.inc or any(self._m(p, k) for p in self.inc)) and not any(
+            self._m(p, k) for p in self.exc
+        )
+
+    def conds(self, ctx=b""):
+        d = {"context": ctx}
+        if self.inc or self.exc:
+            d["patterns"] = {
+                "include": [{kind: pat} for kind, pat in self.inc],
+                "exclude": [{kind: pat} for kind, pat in self.exc],
+            }
+        return d
+
+    def __repr__(self):
+        return f"P({self.inc},{self.exc})"
+
+
+ALL = P()
+A = P([("glob", "a*")])
+B = P([("glob", "b*")])
+ONE = P([("glob", "*1")])
+AB_NOT2 = P([("glob", "a*"), ("glob", "b*")], [("glob", "*2")])
+RX = P([("regex", "[ab]1")])
+RX2 = P([("regex", "(a|c).*")], [("regex", ".*2")])
+NOT_A = P([], [("glob", "a*")])
+NOT_B = P([], [("glob", "b*")])
+NONE = P([("glob", "zz*")])
+
+CONFIGS = {
+    "one": [(b"eA", b"A", [ALL])],
+    "two": [(b"eA", b"A", [ALL]), (b"eB", b"B", [ALL])],
+    "same": [(b"e1", b"A", [ALL]), (b"e2", b"A", [ALL])],
+    "overlap": [(b"e1", b"A", [A]), (b"e2", b"A", [ONE])],
+    "excl_split": [(b"e1", b"A", [NOT_B]), (b"e2", b"A", [NOT_A])],
+    "split": [(b"e1", b"A", [A]), (b"e2", b"A", [B])],
+    "split_chg": [(b"e1", b"A", [A, ALL, NOT_A]), (b"e2", b"A", [B, ONE])],
+    "excl": [(b"e1", b"A", [AB_NOT2, NOT_A]), (b"e2", b"A", [RX2, RX])],
+    "two_chg": [(b"eA", b"A", [A, ALL, RX]), (b"eB", b"B", [ONE, NOT_A, ALL])],
+    "three_chg": [(b"eA", b"A", [ALL, A]), (b"eB", b"B", [ALL, NOT_A]), (b"eA2", b"A", [A, B, RX2])],
+    "none": [(b"e1", b"A", [NONE, A]), (b"e2", b"A", [ALL])],
+}
+SEEDS = int(os.environ.get("SOLERA_HOLDBACK_SEEDS", "150"))
+CTXS = [b"", b"x"]
+
+
+class W2(World):
+    def __init__(self, tmp, edges):
+        super().__init__(tmp, [(e, o, None) for e, o, _ in edges])
+        self.edges2 = edges
+        self.hold = {e: {} for e, _, _ in edges}  # key -> (version, ctx)
+
+    def want(self, o, pat, ctx, k):
+        v = self.outs[o].state.get(k)
+        return (v, ctx) if v is not None and pat.takes(k) else None
+
+    def check_all(self, where):
+        for e, o, pool in self.edges2:
+            for pat in pool:
+                for ctx in CTXS:
+                    want = sorted(k for k in KEYS if self.want(o, pat, ctx, k) != self.hold[e].get(k))
+                    got = sorted(k for k, _ in self.t.owed(e, pat.conds(ctx))[0])
+                    assert got == want, (
+                        where,
+                        e,
+                        pat,
+                        ctx,
+                        "owed",
+                        got,
+                        "model",
+                        want,
+                        self.hold[e],
+                        self.outs[o].state,
+                    )
+
+
+def one_batch(w, rnd, cur, quiet=False):
+    edges = w.edges2
     n = len(edges)
     mode = "incremental" if quiet else rnd.choice(["incremental"] * 3 + ["all", "reset", "keys"])
     kw = {"limit": 100 if quiet else rnd.randint(1, 6)}
@@ -188,7 +253,15 @@ def one_batch(w, rnd, quiet=False):
         kw.update(mode="all", reset=True)
     elif mode == "keys":
         kw.update(mode="keys", keys=sorted(rnd.sample(KEYS, rnd.randint(0, 4))))
-    req = {"inputs": [{"edge": e, "conditions": w.conds(g)} for e, _, g in edges]}
+    if not quiet:
+        for i, (_, _, pool) in enumerate(edges):
+            if rnd.random() < 0.35:
+                cur[i] = (rnd.choice(pool), cur[i][1])
+            if rnd.random() < 0.1:
+                cur[i] = (cur[i][0], rnd.choice(CTXS))
+    pats = [c[0] for c in cur]
+    ctxs = [c[1] for c in cur]
+    req = {"inputs": [{"edge": e, "conditions": pats[i].conds(ctxs[i])} for i, (e, _, _) in enumerate(edges)]}
     if not quiet and mode != "reset" and rnd.random() < 0.3:
         kw["after"] = rnd.choice(KEYS)
     if not quiet and rnd.random() < 0.3:
@@ -209,35 +282,44 @@ def one_batch(w, rnd, quiet=False):
     if not quiet:
         upstream(w, rnd, rnd.randint(0, 2))
     F = set() if quiet else {k for k in batch if rnd.random() < 0.15}
-    reports = []
-    for i, (_, o, g) in enumerate(edges):
-        loaded = []
+    # The worker's loads, written without the rule.
+    reports, bad_load, unchecked = [], [], []
+    for i, (_, o, _) in enumerate(edges):
+        loaded, bad = [], set()
         for k in taken[i]:
-            cur = w.outs[o].state.get(k) if w.takes(g, k) else None
+            if planned[i][k] is None and (quiet or rnd.random() < 0.8):
+                continue  # planned removed: not loaded
+            curv = w.outs[o].state.get(k) if pats[i].takes(k) else None
             if not quiet and rnd.random() < 0.1:
-                cur = rnd.choice([None, 99])
-            if cur != planned[i][k]:
-                loaded.append((k, cur))
+                curv = rnd.choice([None, 99])
+            if curv != planned[i][k]:
+                loaded.append((k, curv))
+                seen = curv if pats[i].takes(k) else None  # what the input contributes
+                if seen != planned[i][k]:
+                    bad.add(k)
         reports.append((sorted(F & set(taken[i])), loaded))
-    moved = [{k for k, _ in reports[i][1]} for i in range(n)]
-    unsure = [moved[i] | {k for k in batch - set(taken[i]) if w.takes(edges[i][2], k)} for i in range(n)]
+        bad_load.append(bad)
+        unchecked.append({k for k in batch - set(taken[i]) if pats[i].takes(k)})
     refusals = 0
     for _ in range(8):
         flags0 = [w.unsettled(o, H[i]) for i, (_, o, _) in enumerate(edges)]
-        hold0 = set()
+        ev0, _, held0 = w.t.progress_ops(p, reports)
+        held = set().union(*map(set, held0)) if held0 else set()
+        for i in range(n):
+            assert set(held0[i]) == held & set(taken[i]), ("per-input held", held0, taken)
+        # model of the rule
+        hold_model = set()
         for i in range(n):
             if flags0[i]:
-                hold0 |= unsure[i]
-        ev0, _, held0 = w.t.progress_ops(p, reports)
-        assert held0 == [sorted(hold0 & set(taken[i])) for i in range(n)], ("held", held0, hold0, taken)
-        fence = [(not flags0[i]) and not unsure[i] <= hold0 for i in range(n)]
+                hold_model |= bad_load[i] | unchecked[i]
+        assert held == hold_model & batch, ("held", held0, hold_model, taken, flags0)
+        fence = [(not flags0[i]) and bool((bad_load[i] | unchecked[i]) - held) for i in range(n)]
         if not quiet:
             upstream(w, rnd, rnd.randint(0, 2))
             if rnd.random() < 0.15:
                 w.restart()
-        # same-event combination
         extra = None
-        if not quiet and rnd.random() < 0.25:
+        if not quiet and rnd.random() < 0.3:
             extra = random_build(w, rnd)
         flags1 = [w.unsettled(o, H[i]) for i, (_, o, _) in enumerate(edges)]
         violated = any(fence[i] and flags1[i] for i in range(n))
@@ -266,13 +348,26 @@ def one_batch(w, rnd, quiet=False):
                 land(w, extra)
             continue
         assert not violated, ("applied though a fenced input became unsettled", fence, flags0, flags1)
-        # No key is committed from a load on an input unsettled when the event
-        # applies unless that load was planned and came back as planned: an
-        # input whose patterns do not take the key does not load it.
-        for i, (_, _, g) in enumerate(edges):
+        if extra is not None:
+            # the two orders of one event, and batch-then-extra as two events, end in one state
+            after = w.t.snapshot()
+            for order in ("rev", "seq"):
+                t = Tracking.restore(before)
+                for o in w.outs:
+                    t.attach(o, w.ix)
+                if order == "rev":
+                    t.apply(Tracking.join(list(reversed(parts))))
+                else:
+                    t.apply(ev0)
+                    t.apply(ev_of(extra))
+                assert t.snapshot() == after, ("order matters", order)
+        # Safety: a committed key has, on every input unsettled when the event applies, no
+        # unchecked load and no load that came back other than planned.
+        for i in range(n):
             if flags1[i]:
-                for k in batch - hold0:
-                    assert not w.takes(g, k) or (k in taken[i] and k not in moved[i]), ("unsafe", i, k, hold0)
+                for k in batch - held:
+                    assert k not in unchecked[i], ("unsafe: unchecked load committed", i, k, held0)
+                    assert k not in bad_load[i], ("unsafe: moved load committed", i, k, held0)
         if extra is not None:
             landed_model(w, extra)
         if mode == "reset":
@@ -281,14 +376,14 @@ def one_batch(w, rnd, quiet=False):
         for i, (e, _, _) in enumerate(edges):
             got = dict(reports[i][1])
             for k in taken[i]:
-                if k in hold0 or k in F:
+                if k in held or k in F:
                     continue
                 v = got.get(k, planned[i][k])
-                if v is None:
+                if v is None or not pats[i].takes(k):
                     w.hold[e].pop(k, None)
                 else:
-                    w.hold[e][k] = v
-        w.check_owed(("after batch", mode, kw, taken, reports, sorted(hold0)))
+                    w.hold[e][k] = (v, ctxs[i])
+        w.check_all(("after batch", mode, kw, pats, ctxs, taken, reports, sorted(held)))
         break
     else:
         raise AssertionError("eight refusals in a row")
@@ -298,27 +393,27 @@ def one_batch(w, rnd, quiet=False):
 
 def run(tmp, cfg, seed):
     rnd = random.Random(seed)
-    w = World(tmp, CONFIGS[cfg])
+    w = W2(tmp, CONFIGS[cfg])
     for o in sorted(w.outs):
         w.commit(o, sorted(rnd.sample(KEYS, 3)))
-    for e, o, _ in w.edges:
+    for e, o, _ in w.edges2:
         w.apply(Tracking.event_edge_open(e, o, True))
-    w.check_owed("start")
-    for _ in range(rnd.randint(1, 7)):
+    cur = [(pool[0], b"") for _, _, pool in w.edges2]
+    w.check_all("start")
+    for _ in range(rnd.randint(1, 8)):
         upstream(w, rnd, rnd.randint(0, 3))
         if rnd.random() < 0.2:
             w.restart()
-        one_batch(w, rnd)
-    # quiesce: full runs end, then the consumer catches up
+        one_batch(w, rnd, cur)
     for o in sorted(w.outs):
         if w.outs[o].incomplete:
             w.done(o)
     rounds = 0
-    while one_batch(w, rnd, quiet=True):
+    while one_batch(w, rnd, cur, quiet=True):
         rounds += 1
         assert rounds <= 2, "the consumer does not catch up"
-    for e, o, g in w.edges:
-        want = {k: v for k, v in w.outs[o].state.items() if w.takes(g, k)}
+    for i, (e, o, _) in enumerate(w.edges2):
+        want = {k: (v, cur[i][1]) for k, v in w.outs[o].state.items() if cur[i][0].takes(k)}
         assert w.hold[e] == want, (e, w.hold[e], want)
     final = w.t.snapshot()
     t = Tracking()
