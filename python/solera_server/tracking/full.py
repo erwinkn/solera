@@ -70,6 +70,10 @@ def gate(planner, task: dict, waits) -> list | None:
             partitions = planner.fan_in(input, materialized=False) if input.fan_in else (input.partition,)
             if any(waits(input.output, p) for p in partitions):
                 return [INCOMPLETE, input.output]
+            if input.fan_in and input.kind == "in":
+                for output in dynamic_sets(input):
+                    if waits(output, ""):
+                        return [INCOMPLETE, output]
     except (
         Exception
     ):  # its preparation refuses it alone, saying why (UpstreamOnly, a partition that no longer fits)
@@ -77,11 +81,21 @@ def gate(planner, task: dict, waits) -> list | None:
     return None
 
 
-def held(m, heads) -> list | None:
-    """Why a batch that read `heads` (`[[output, partition, commit], ...]`)
-    must not commit, if it must not: the first it read that is partial."""
+def dynamic_sets(input) -> list[str]:
+    """The set outputs a fan-in's membership comes from: its dynamic dimensions'."""
 
-    for output, partition, at in heads:
+    return sorted({dim["output"] for dim in (input.dims or {}).values() if dim.get("kind") == "dynamic"})
+
+
+def held(m, heads) -> list | None:
+    """Why a batch that read `heads` (`[[output, partition, commit, life], ...]`)
+    must not commit, if it must not: the first it read that is partial. A
+    head of a life that is no longer the output's was free when planned, and
+    stays so: that life gets no commit, and its spans only shrank."""
+
+    for output, partition, at, *life in heads:
+        if life and life[0] != m.life(output, partition):
+            continue
         if m.partial(output, partition, at):
             return [INCOMPLETE, output]
     return None
@@ -169,31 +183,41 @@ async def proceed(engine, asset: str, partition: str, by: str) -> dict:
     outputs' full runs end (`FullRunDone`)."""
 
     core = engine.core
-    names = [o["name"] for o in engine.manifest["assets"][asset]["outputs"]]
-    ids = sorted(i for o in names if (i := core.m.core_outputs.get((o, partition))) is not None)
-    async with contextlib.AsyncExitStack() as locks:
-        for id_ in ids:  # in life-id order, as a batch's commit takes them
-            await locks.enter_async_context(core.lock(id_))
-        stuck = [s["output"] for s in stopped(engine) if (s["asset"], s["partition"]) == (asset, partition)]
-        if not stuck:
-            raise Conflict(
-                f"{asset} {partition!r}: no incomplete output, or a run of it is under way", retryable=False
+
+    def lives() -> list[str]:
+        names = [o["name"] for o in (engine.manifest["assets"].get(asset) or {}).get("outputs") or ()]
+        return sorted(i for o in names if (i := core.m.core_outputs.get((o, partition))) is not None)
+
+    while True:
+        ids = lives()
+        async with contextlib.AsyncExitStack() as locks:
+            for id_ in ids:  # in life-id order, as a batch's commit takes them
+                await locks.enter_async_context(core.lock(id_))
+            if lives() != ids:  # a deploy changed its lives while it waited: lock the current ones
+                continue
+            stuck = [
+                s["output"] for s in stopped(engine) if (s["asset"], s["partition"]) == (asset, partition)
+            ]
+            if not stuck:
+                raise Conflict(
+                    f"{asset} {partition!r}: no incomplete output, or a run of it is under way",
+                    retryable=False,
+                )
+            ending = [
+                Tracking.event_full_run_done(i.encode())
+                for i in ids
+                if core.tracking.full_run(i.encode()) is not None
+            ]
+            event = Tracking.join(ending) if ending else None
+            core.check(event)
+            engine.state.record(
+                {
+                    "type": "Proceeded",
+                    "asset": asset,
+                    "partition": partition,
+                    "by": by,
+                    "at": engine.clock(),
+                    "event": b64(event) if event is not None else None,
+                }
             )
-        ending = [
-            Tracking.event_full_run_done(i.encode())
-            for i in ids
-            if core.tracking.full_run(i.encode()) is not None
-        ]
-        event = Tracking.join(ending) if ending else None
-        core.check(event)
-        engine.state.record(
-            {
-                "type": "Proceeded",
-                "asset": asset,
-                "partition": partition,
-                "by": by,
-                "at": engine.clock(),
-                "event": b64(event) if event is not None else None,
-            }
-        )
-    return {"asset": asset, "partition": partition, "outputs": stuck}
+        return {"asset": asset, "partition": partition, "outputs": stuck}

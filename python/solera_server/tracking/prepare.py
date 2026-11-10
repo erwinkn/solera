@@ -22,7 +22,7 @@ from solera._native import Tracking
 
 from . import WALK, Core, b64, canonical
 from .commit import HeldBack
-from .full import held
+from .full import dynamic_sets, held
 
 
 def conditions(engine, input, base: dict) -> dict:
@@ -82,7 +82,9 @@ async def prepare(core: Core, task: dict, run: dict, attempt: str | None) -> dic
     for input in base["inputs"]:  # in the step that pinned them: the heads the pins name
         if input.kind == "in":
             parts = base["planner"].fan_in(input, materialized=True) if input.fan_in else (input.partition,)
-            heads += [[input.output, p, m.axis_head(input.output, p)] for p in parts]
+            heads += [[input.output, p, m.axis_head(input.output, p), m.life(input.output, p)] for p in parts]
+            if input.fan_in:  # which partitions it reads: each dynamic dimension's set output says
+                heads += [[s, "", m.axis_head(s, ""), m.life(s, "")] for s in dynamic_sets(input)]
     if (why := held(m, heads)) is not None:
         raise HeldBack(f"{why[0]}: {why[1]}")
     # With incremental inputs, a run starts over as today's path decides (`_full_run`): a full
@@ -105,7 +107,7 @@ async def prepare(core: Core, task: dict, run: dict, attempt: str | None) -> dic
         pin, plan, empty = engine._commits_pin(input, engine._pin_at(input.output, input.partition), o)
         pins[input.param], plans[input.param] = pin, plan
         if not plan.get("done"):  # the commit its walk goes to: pages before it are the walk's own
-            heads.append([input.output, input.partition, o["head"]])
+            heads.append([input.output, input.partition, o["head"], m.life(input.output, input.partition)])
         all_empty = all_empty and empty
     mine = progress.get(WALK)
     if keyed and mine is not None and mine["key"] is None:  # walked to the end in this task
@@ -139,7 +141,9 @@ async def prepare(core: Core, task: dict, run: dict, attempt: str | None) -> dic
         index = 0 if mine is None else int(mine["batch"]) + 1
         for n, input in enumerate(keyed):
             found = summary["inputs"][n]
-            heads.append([input.output, input.partition, found["head"]])
+            heads.append(
+                [input.output, input.partition, found["head"], m.life(input.output, input.partition)]
+            )
             # The walk ends where the plan says (`hi` None). The worker is told each input's
             # own end too: it owes nothing past the batch (a full run: holds nothing past it),
             # though the others' go on.

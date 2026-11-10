@@ -95,7 +95,7 @@ class Observing:
             return None
         try:
             inputs = self.planner().inputs(asset, partition)
-        except planning.UpstreamOnly:
+        except (planning.UpstreamOnly, ValueError):  # a partition that no longer fits its dimensions
             return None
         records, out = record.get("observed") or {}, []
         for input in inputs:

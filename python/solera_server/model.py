@@ -648,6 +648,7 @@ class Model:
         reset = self._reset(
             {output_map.get(name, name): o.get("store") for name, o in previous.items()},
             assets_before - carried,
+            {output_map.get(name, name): axis(o) for name, o in previous.items()},
         )
         # What an output life left in the store it was removed or moved from: a cleanup
         # task deletes it, once due and no pin predates the reset (K25). A source's data
@@ -820,7 +821,7 @@ class Model:
             "due": at + float(after),
         }
 
-    def _reset(self, stores: dict[str, str], assets_before: set[str]) -> set[str]:
+    def _reset(self, stores: dict[str, str], assets_before: set[str], axes: dict[str, str]) -> set[str]:
         """A deploy that removes an asset, or removes an output or declares it
         on another store than `stores` says it was on, resets it: what comes
         back under that name, or what the new store holds, is a new one (K10).
@@ -834,7 +835,9 @@ class Model:
         waits for one in flight. History keeps the records, and pending
         cleanups stay: their objects are still owed. Returns the assets whose
         outputs were reset: changed, so the deploy owes their OnChange
-        automations a firing (`FiringsOwed`)."""
+        automations a firing (`FiringsOwed`). On the new path, an output whose
+        commit axis changes (`axis`: keyed, append-only, single value) is reset
+        too: its partial spans are on the old axis."""
 
         manifest = self.manifest or {}
         outputs, assets = manifest.get("outputs") or {}, manifest.get("assets") or {}
@@ -847,7 +850,9 @@ class Model:
         reset = {
             name
             for name, store in stores.items()
-            if name not in outputs or outputs[name].get("store") != store
+            if name not in outputs
+            or outputs[name].get("store") != store
+            or (self.core is not None and axes.get(name, axis(outputs[name])) != axis(outputs[name]))
         }
         for name in reset:
             self.reset_at[("output", name)] = self.deploy_number
@@ -1851,6 +1856,14 @@ class Model:
         id_ = self.core_outputs.get((output, partition))
         return ("@life", id_) if id_ is not None else (output, partition)
 
+    def life(self, output: str, partition: str) -> str | int:
+        """Which life of an output a head belongs to: its core id, else the
+        deploy that last reset the name. A gate entry of another life than
+        the current one names a life that gets no commit any more."""
+
+        id_ = self.core_outputs.get((output, partition))
+        return id_ if id_ is not None else self.reset_at.get(("output", output), 0)
+
     def axis_head(self, output: str, partition: str) -> int | None:
         """An output's head on its commit axis: its core life's commit, an
         append-only output's commit number, else its ref's generation."""
@@ -1959,7 +1972,7 @@ class Model:
             asset, _, param = key
             spec = ((assets.get(asset) or {}).get("inputs") or {}).get(param) or {}
             keyed = (outputs.get(spec.get("output")) or {}).get("key") is not None
-            upstream = owner.get(self.core_edges[key][1], spec.get("output"))
+            upstream = owner.get(self.core_edges[key][1])  # by its own life only: a gone one closes it
             if (
                 asset in producers
                 or spec.get("kind") != "incremental"
@@ -2076,6 +2089,14 @@ class Model:
     def _on_RunsPurged(self, e):
         gone = set(e["runs"])
         self.deleted = [r for r in self.deleted if r not in gone]
+
+
+def axis(output: dict) -> str:
+    """An output's commit axis (D205's partial spans): a keyed output's core
+    life, an append-only output's commit numbers, a single value's ref
+    generations."""
+
+    return "keyed" if output.get("key") is not None else "append" if output.get("incremental") else "value"
 
 
 def declaration(manifest: dict, asset: str, homes: dict | None = None) -> dict:

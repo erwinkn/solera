@@ -39,6 +39,7 @@ class Built:
     progress: dict | None = None  # the run's walk over the keyed inputs: {batch, key}
     walk: dict | None = None  # the batch's range of it: {inputs, after, hi, reset}
     empty: dict = field(default_factory=dict)  # unkeyed input -> [reset, done] of its walk from empty
+    partition: str = ""
     locks: contextlib.AsyncExitStack = field(default_factory=contextlib.AsyncExitStack)
 
     def payload(self) -> dict | None:
@@ -142,7 +143,7 @@ async def build(core: Core, task: dict, attempt: str, prepared: dict, result: di
 
     engine, m = core.engine, core.m
     partition = task["partition"]
-    built = Built()
+    built = Built(partition=partition)
     events = []
     try:
         claim = m.claimed(attempt)
@@ -286,12 +287,23 @@ def unkeyed(prepared: dict) -> dict:
     return {**prepared, "plans": plans}
 
 
+def named(core: Core, built: Built) -> None:
+    """A batch's outputs are still the lives it built under their names: a
+    deploy that renamed one, or started it over, while the commit was built
+    sends the batch back to be planned again."""
+
+    for name, counts in built.counts.items():
+        if core.m.core_outputs.get((name, built.partition)) != counts["id"]:
+            raise HeldBack(f"output {name}: renamed or started over while its commit was built")
+
+
 def check(core: Core, built: Built) -> None:
     """The commit check of the core (§7): the event applies to the state as it
     is now, or nothing is recorded. Run in the synchronous step that records.
     An input that cleared after the batch's progress was built would have held
     keys back: its fence refuses the batch, which is planned again."""
 
+    named(core, built)
     try:
         core.check(built.event)
     except Conflict as error:

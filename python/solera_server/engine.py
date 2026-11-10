@@ -1683,6 +1683,7 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
                 if self.m.claimed(attempt) is not claim:
                     raise LostOwnership(attempt)
                 self._commit_guards(task, prepared)  # again: the build and its observations awaited
+                core_commit.named(self.core, built)
                 out = await self._install(
                     task, claim, attempt, prepared, result, observations, built, **settle
                 )
