@@ -6,7 +6,7 @@ use crate::format::{lossy, parse_commits, CommitHeader, LayerRef, WriteOptions, 
 use crate::glob::Pattern;
 use crate::read::{Bounds, KeyList, Walk};
 use crate::run::{Run, Version};
-use crate::store::Store;
+use crate::store::{Store, Upload};
 use std::ops::{Bound, Range, RangeInclusive};
 use std::sync::Arc;
 
@@ -157,6 +157,9 @@ impl ChangeIndex {
         if c1 > c2 {
             return invalid(format!("diff from {c1} to {c2}: C1 is after C2"));
         }
+        if c1 == c2 {
+            return Ok(None);
+        }
         let ls = pick(layers, c1, c2, &q.bounds());
         let Some(mut w) = self.walk(ls, q, None, false).await? else {
             return Ok(None);
@@ -170,7 +173,7 @@ impl ChangeIndex {
             let Some(newest) = window.next() else {
                 continue;
             };
-            let oldest = window.last().unwrap_or(newest);
+            let oldest = window.next_back().unwrap_or(newest);
             let (before, after) = (g.replaced_version(oldest), g.new_version(newest));
             if before == after {
                 continue;
@@ -380,31 +383,27 @@ impl ChangeIndex {
 
     async fn read_commits(&self, l: &LayerRef) -> Result<Vec<CommitHeader>> {
         let top = self.store.top(l).await?;
-        let b = self
-            .store
-            .get_range(&l.path, top.commits_start..top.index_start)
-            .await?;
-        parse_commits(&b).map_err(|e| match e {
-            Error::Format(m) => Error::Format(format!("{}: {m}", l.path)),
-            e => e,
-        })
+        self.store
+            .read_checked(&l.path, top.commits_start..top.index_start, |b| {
+                parse_commits(b)
+            })
+            .await
+            .map_err(|e| match e {
+                Error::Format(m) => Error::Format(format!("{}: {m}", l.path)),
+                e => e,
+            })
     }
 
     /// Write one commit's layer at `path`: its entries, one per changed key
-    /// (their commit numbers are ignored). Returns the layer's reference.
+    /// (their commit numbers are ignored). Returns the layer's reference; a
+    /// commit with no entries writes a layer too.
     pub async fn write_commit(
         &self,
         path: &str,
         commit: NewCommit<'_>,
         entries: &Run,
     ) -> Result<LayerRef> {
-        let mut h = CommitHeader {
-            commit: commit.commit,
-            time_ms: commit.time_ms,
-            producer: commit.producer.to_vec(),
-            ..Default::default()
-        };
-        let mut w = Writer::new(self.write, commit.commit, commit.commit, None)?;
+        let mut w = self.commit_writer(path, commit)?;
         for i in 0..entries.len() {
             let rows = entries.rows(i);
             if rows.len() != 1 {
@@ -413,35 +412,32 @@ impl ChangeIndex {
                     lossy(entries.key(i))
                 ));
             }
-            let (new, replaced) = (
+            w.push(
+                entries.key(i),
                 entries.new_version(rows.start),
                 entries.replaced_version(rows.start),
-            );
-            w.push(entries.key(i), commit.commit, new, replaced)?;
-            match (new.is_absent(), replaced.is_absent()) {
-                (false, true) => h.added += 1,
-                (false, false) => h.updated += 1,
-                _ => h.removed += 1,
-            }
+            )
+            .await?;
         }
-        h.live = (commit.live_before + h.added)
-            .checked_sub(h.removed)
-            .ok_or_else(|| {
-                Error::Invalid(format!(
-                    "commit {} removes more keys than were live",
-                    commit.commit
-                ))
-            })?;
-        if !entries.is_empty() {
-            h.min_key = entries.key(0).to_vec();
-            h.max_key = entries.key(entries.len() - 1).to_vec();
-        }
-        let mut l = w.finish(&[h])?;
-        let mut up = self.store.upload(path)?;
-        up.write(w.take()).await?;
-        up.finish().await?;
-        l.path = path.to_string();
-        Ok(l)
+        w.write().await
+    }
+
+    /// Write one commit's layer at `path` as its entries arrive: parts are
+    /// uploaded as they fill, so the writer holds one part, not the commit.
+    pub fn commit_writer(&self, path: &str, commit: NewCommit<'_>) -> Result<CommitWriter> {
+        Ok(CommitWriter {
+            w: Writer::new(self.write, commit.commit, commit.commit, None)?,
+            up: self.store.upload(path)?,
+            part: self.store.opts.part_bytes,
+            h: CommitHeader {
+                commit: commit.commit,
+                time_ms: commit.time_ms,
+                producer: commit.producer.to_vec(),
+                ..Default::default()
+            },
+            live_before: commit.live_before,
+            path: path.to_string(),
+        })
     }
 
     /// Merge the adjacent layers `run` of the list into one at `path`. Every
@@ -533,11 +529,81 @@ impl ChangeIndex {
     }
 }
 
+/// One commit's layer, written key by key (`ChangeIndex::commit_writer`).
+/// After an error, drop it: nothing is written.
+pub struct CommitWriter {
+    w: Writer,
+    up: Upload,
+    part: usize,
+    h: CommitHeader,
+    live_before: u64,
+    path: String,
+}
+
+impl CommitWriter {
+    /// The next changed key, keys ascending, with its new and replaced
+    /// versions.
+    pub async fn push(
+        &mut self,
+        key: &[u8],
+        new: Version<'_>,
+        replaced: Version<'_>,
+    ) -> Result<()> {
+        if self.w.entries() > 0 && key == self.h.max_key {
+            return invalid(format!(
+                "{:?}: a commit holds one entry per key",
+                lossy(key)
+            ));
+        }
+        self.w.push(key, self.h.commit, new, replaced)?;
+        if self.w.entries() == 1 {
+            self.h.min_key = key.to_vec();
+        }
+        self.h.max_key.clear();
+        self.h.max_key.extend_from_slice(key);
+        match (new.is_absent(), replaced.is_absent()) {
+            (false, true) => self.h.added += 1,
+            (false, false) => self.h.updated += 1,
+            _ => self.h.removed += 1,
+        }
+        if self.w.pending() >= self.part {
+            self.up.write(self.w.take()).await?;
+        }
+        Ok(())
+    }
+
+    /// The layer, or `None` (and nothing written) when nothing was pushed.
+    pub async fn finish(self) -> Result<Option<LayerRef>> {
+        if self.w.entries() == 0 {
+            return Ok(None);
+        }
+        self.write().await.map(Some)
+    }
+
+    async fn write(mut self) -> Result<LayerRef> {
+        self.h.live = (self.live_before + self.h.added)
+            .checked_sub(self.h.removed)
+            .ok_or_else(|| {
+                Error::Invalid(format!(
+                    "commit {} removes more keys than were live",
+                    self.h.commit
+                ))
+            })?;
+        let mut l = self.w.finish(std::slice::from_ref(&self.h))?;
+        self.up.write(self.w.take()).await?;
+        self.up.finish().await?;
+        l.path = self.path;
+        Ok(l)
+    }
+}
+
 /// A layer's entries, one key at a time.
 pub struct Entries(Walk);
 
 impl Entries {
-    /// The next key and its entries, newest first, into `group`; false at the end.
+    /// The next key and its entries, newest first, into `group`; false at the
+    /// end. Not cancel-safe: a call dropped before it returns leaves the
+    /// reader unusable.
     pub async fn next(&mut self, group: &mut Run) -> Result<bool> {
         self.0.next(group).await
     }
@@ -565,9 +631,9 @@ pub fn pick_merge(layers: &[LayerRef], cut: u64) -> Option<Range<usize>> {
     let n = layers.len() - b;
     let sizes: Vec<u64> = layers.iter().map(|l| l.size).collect();
     let fits = |a: usize, e: usize| {
-        let size: u64 = sizes[a..e].iter().sum();
-        let newer: u64 = sizes[e..].iter().sum();
-        size <= 4 * newer + MIB
+        let size = sizes[a..e].iter().fold(0u64, |t, &x| t.saturating_add(x));
+        let newer = sizes[e..].iter().fold(0u64, |t, &x| t.saturating_add(x));
+        size <= newer.saturating_mul(4).saturating_add(MIB)
     };
     if n >= 4 {
         for a in (b..=layers.len() - 4).rev() {
@@ -585,9 +651,11 @@ pub fn pick_merge(layers: &[LayerRef], cut: u64) -> Option<Range<usize>> {
     }
     let below = layers[b..].iter().take_while(|l| l.hi <= cut).count();
     if below > 0 {
-        let size: u64 = sizes[b..b + below].iter().sum();
+        let size = sizes[b..b + below]
+            .iter()
+            .fold(0u64, |t, &x| t.saturating_add(x));
         let base = if b == 1 { sizes[0] } else { 0 };
-        if size * 4 >= base {
+        if size.saturating_mul(4) >= base {
             return Some(0..b + below);
         }
     }

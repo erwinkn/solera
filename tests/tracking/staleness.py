@@ -87,6 +87,7 @@ class World:
         self.pending: Batch | None = None
         self.cursor: str | None = None  # the run's progress key; None when no run is going
         self.incomplete = False  # items is mid full run, in the design's form (a clear)
+        self.mid = {0: False}  # per items commit: whether items was mid full run at it
         self.violation: str | None = None  # an invariant a form breaks inside a rule
         self.step = 0
         self.trace: list[str] = []
@@ -113,6 +114,7 @@ class World:
     def ev_up(self, changes: tuple, lost: bool) -> None:
         if any(self.up.states[-1].get(k) != v for k, v in changes):
             self.up.commit(dict(changes))
+            self.mid[self.up.head] = self.incomplete
             self.trace.append(
                 f"items c{self.up.head}: {_entries(self.up.entries[-1])}" + (" (lost)" if lost else "")
             )
@@ -123,6 +125,7 @@ class World:
         if not self.incomplete:
             self.up.commit(dict(changes), clear=True)
             self.incomplete = True
+            self.mid[self.up.head] = True
             self.trace.append(f"items c{self.up.head}: clear; {_entries(self.up.entries[-1])}")
             self.reverted()
             self.form.on_commit(lost)
@@ -130,6 +133,7 @@ class World:
     def ev_complete(self) -> None:
         if self.incomplete:
             self.incomplete = False
+            self.mid[self.up.head] = False
             self.trace.append("items completes its full run")
             self.form.on_complete()
 
@@ -173,6 +177,7 @@ class World:
             self.trace.append("checks' commit is refused: its definition changed")
             return
         snap = self.form.before(b)
+        before = {} if b.reset else dict(self.holds)
         if b.reset:
             self.holds, self.outcomes, self.failed = {}, {}, {}
             self.covered, self.listed = [], set()
@@ -181,19 +186,18 @@ class World:
         cleared = any(b.H < x <= self.up.head for x in self.up.clears)
         for k in b.taken:
             obs = self.prog.wanted(k, self.up.head if k in moved else b.H, b.cond)
-            if obs != self.prog.wanted(k, b.H, b.cond):
-                if (self.incomplete or cleared) and self.on("hold_back"):
-                    kept.add(k)
-                    continue
-                if self.incomplete:
-                    self.violation = (
-                        f"checks processes {_k(k)} as loaded at c{self.up.head}, mid full run of items"
-                    )
+            planned = self.prog.wanted(k, b.H, b.cond)
+            if obs != planned and (self.incomplete or cleared) and self.on("hold_back"):
+                kept.add(k)
+                continue
             if k in fails:
                 self.outcomes[k] = Fail(obs)
                 self.failed[k] = Fail(obs)
                 kept.add(k)
                 continue
+            real = {self.prog.wanted(k, c, b.cond) for c in range(b.H, self.up.head + 1) if not self.mid[c]}
+            if obs not in real and obs != before.get(k):
+                self.violation = f"checks processes {_k(k)} as {obs}, a state items had only mid full run"
             results[k] = obs
             self.holds[k] = obs
             self.outcomes.pop(k, None)

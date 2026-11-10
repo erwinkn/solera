@@ -9,6 +9,7 @@ import os
 import random
 import time
 import uuid
+import warnings
 from urllib.parse import unquote, urlsplit
 
 import pytest
@@ -168,11 +169,30 @@ def test_bad_input_is_refused(tmp_path):
         ix.write_commit("c1", 1, [("k", 1, 1)])
     with pytest.raises(TypeError):
         ix.write_commit("c1", 1, [("k", 1.5, None)])
+    with pytest.raises(TypeError):
+        ix.write_commit("c1", 1, [("k", True, None)])
     layer = ix.write_commit("c1", 1, [("k", 1, None)])
     with pytest.raises(ValueError):
         ix.diff([{**layer, "lo": 2, "hi": 2}], 1, 2)
     with pytest.raises(FormatError):
         ix.scan([{**layer, "entries": 5}], 1)
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="needs fork")
+def test_a_forked_child_fails_loudly(tmp_path):
+    ix = ChangeIndex(f"file://{tmp_path}")
+    layer = ix.write_commit("c1", 1, [("k", 1, None)])
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        pid = os.fork()
+    if pid == 0:
+        try:
+            ix.scan([layer], 1)
+        except BaseException:
+            os._exit(0)
+        os._exit(1)
+    _, status = os.waitpid(pid, 0)
+    assert os.waitstatus_to_exitcode(status) == 0
 
 
 segments = st.sampled_from(["a", "b", "/", ".", "\n", "é", "€", "😀", "x/y"])

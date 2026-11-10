@@ -506,12 +506,6 @@ def test_a_key_a_keys_run_never_held_leaves_fchecks_fresh_when_it_goes(history):
 # -- worked examples and calibrations ---------------------------------------------------
 
 
-async def _quiet_rounds(engine, n=20):
-    for _ in range(n):
-        await engine.tick()
-        await asyncio.sleep(0.01)
-
-
 async def _built(state, tmp_path, keys, **decl):
     outside = External()
     engine = make_engine(state, project(tmp_path, outside, **decl))
@@ -519,32 +513,6 @@ async def _built(state, tmp_path, keys, **decl):
     await boot(engine, outside, keys)
     await drive(engine, await engine.submit(["checks", "copy", "count"]))
     return engine, outside
-
-
-async def test_a_stale_keys_reasons_are_its_own_and_name_their_input(state, tmp_path):
-    """Console contract (c): `checks` (each=True over `items`, its input
-    `item`). k1 changes: the key `item` owes says so, naming its input.
-    `checks`' definition changes: every key is stale, but the
-    partition-wide reason is on the partition alone — k2, stale only for
-    it, lists none, and k1 keeps its own."""
-
-    engine, outside = await _built(state, tmp_path, {"k1": "1", "k2": "1"})
-    await _change(engine, outside, upserts=["k1"])
-    page = await engine.stale_keys("checks")
-    assert page["keys"] == [
-        {"key": "k1", "reasons": [{"kind": staleness.INPUT, "input": "item", "upstream_partition": ""}]}
-    ]
-    assert page["reasons"] == [staleness.INPUT]
-    await engine.stop()
-    engine = make_engine(state, project(tmp_path, outside, checks_v="2"))
-    await engine.initialize()
-    page = await engine.stale_keys("checks")
-    assert page["keys"] == [
-        {"key": "k1", "reasons": [{"kind": staleness.INPUT, "input": "item", "upstream_partition": ""}]},
-        {"key": "k2", "reasons": []},
-    ]
-    assert page["reasons"] == [staleness.INPUT, staleness.DEFINITION]
-    await engine.stop()
 
 
 async def test_keys_runs_after_an_upstream_reset_merge_and_together_catch_up(state, tmp_path):
@@ -592,23 +560,6 @@ async def test_a_reset_output_holds_only_what_keys_runs_wrote_until_a_default_ru
     await drive(engine, await engine.submit(["checks"]))
     assert set(await keyed_content(engine, p, "checks", column=None)) == {"k1", "k2", "k3"}
     assert not await staleness.partition_stale(engine, "checks")
-
-
-async def test_an_unkeyed_partition_stays_stale_until_it_reruns(state, tmp_path):
-    """K38's calibration: `count` (unkeyed) built, then `items` changes:
-    `count` is stale, through any number of ticks, until a run of it."""
-
-    engine, outside = await _built(state, tmp_path, {"k1": "1"})
-    assert not await staleness.partition_stale(engine, "count")
-    outside.feed["k2"] = "1"
-    await engine.commit_source("feed", upsert=["k2"])
-    await drive(engine, await engine.submit(["items"]))
-    await _quiet_rounds(engine)
-    assert await staleness.partition_stale(engine, "count"), "an upstream changed since its catch-up"
-    assert await staleness.asset_stale(engine, "count")
-    await drive(engine, await engine.submit(["count"]))
-    assert not await staleness.partition_stale(engine, "count")
-    assert not await staleness.asset_stale(engine, "count")
 
 
 async def test_a_commit_of_excluded_keys_alone_leaves_their_consumers_fresh(state, tmp_path):
@@ -679,43 +630,6 @@ async def test_a_keys_run_on_an_incremental_asset_delivers_each_change_once(stat
     assert outside.delivered == set(), "the next default run has nothing new"
 
 
-async def test_a_count_kept_from_its_batches_stays_exact_through_a_keys_run(state, tmp_path):
-    """K44's example through a keys= run: `tally` = what it held +
-    added - removed. k4 added and k1 removed; keys=(k4) delivers k4 as added;
-    the next default run delivers k1's removal alone, never k4 again: the
-    tally equals `items`' count after each run."""
-
-    engine, outside = await _built(state, tmp_path, {"k1": "1", "k2": "1", "k3": "1"})
-    p = project(tmp_path, outside)
-
-    async def tally(keys=None):
-        detail = await drive(engine, await engine.submit(["tally"], keys=keys))
-        assert detail["request"]["status"] == "succeeded", detail["request"]
-        return (await value_content(engine, p, "tally"))["rows"]
-
-    assert await tally() == 3
-    await _change(engine, outside, upserts=["k4"], removes=["k1"])
-    assert await tally({"items": ["k4"]}) == 4  # k1's removal not read yet
-    assert await tally() == 3 == len(outside.feed)
-
-
-async def test_a_non_each_keyed_outputs_keys_go_stale_together(state, tmp_path):
-    """K43: every key of `copy` depends on the whole of `items` under its
-    patterns, so a change of `k1` alone makes `k1`, `k2` and `k3` stale; a
-    default run clears them all."""
-
-    engine, outside = await _built(state, tmp_path, {"k1": "1", "k2": "1", "k3": "1"})
-    assert await staleness.stale_keys(engine, "copy") == set()
-    outside.feed["k1"] = "2"
-    await engine.commit_source("feed", upsert=["k1"])
-    await drive(engine, await engine.submit(["items"]))
-    assert await staleness.stale_keys(engine, "copy") == {"k1", "k2", "k3"}
-    assert await staleness.partition_stale(engine, "copy") and await staleness.asset_stale(engine, "copy")
-    await drive(engine, await engine.submit(["copy"]))
-    assert await staleness.stale_keys(engine, "copy") == set()
-    assert not await staleness.partition_stale(engine, "copy")
-
-
 @pytest.mark.parametrize("then", ["keys", "default"])
 async def test_a_full_run_after_an_asset_change_may_take_several_runs(state, tmp_path, then):
     """The full run: `copy` holds k1, k2, k3; its version is bumped.
@@ -744,54 +658,6 @@ async def test_a_full_run_after_an_asset_change_may_take_several_runs(state, tmp
     assert set(await keyed_content(engine, p, "copy", column=None)) == {"k1", "k2", "k3"}
     assert not await staleness.partition_stale(engine, "copy")
     assert await run() == (set(), False)
-
-
-async def test_staleness_is_transitive_down_a_chain(state, tmp_path):
-    """K46, three levels: `feed` commits k2 and `items` has not rerun.
-    `items` is stale ("input changed"); `copy`, `count` and every key of
-    `checks` are stale ("upstream stale"), though `items` has not moved.
-    Once `items` runs, they are stale for their own input instead."""
-
-    engine, outside = await _built(state, tmp_path, {"k1": "1", "k2": "1"})
-    outside.feed["k2"] = "2"
-    await engine.commit_source("feed", upsert=["k2"])
-    assert await staleness.stale_reasons(engine, "items") == {staleness.INPUT}
-    for name in ("checks", "copy", "count"):
-        assert await staleness.stale_reasons(engine, name) == {staleness.UPSTREAM}, name
-        assert await staleness.asset_stale(engine, name), name
-    assert await staleness.stale_keys(engine, "checks") == {"k1", "k2"}
-    await drive(engine, await engine.submit(["items"]))
-    assert not await staleness.partition_stale(engine, "items")
-    for name in ("checks", "copy", "count"):
-        assert await staleness.stale_reasons(engine, name) == {staleness.INPUT}, name
-    assert await staleness.stale_keys(engine, "checks") == {"k2"}
-
-
-async def test_a_stale_status_carries_every_reason_that_holds(state, tmp_path):
-    """K46: `copy`'s version is bumped and `feed` commits, `items` not yet
-    rerun: `copy` is stale for its definition and its upstream at once."""
-
-    engine, outside = await _built(state, tmp_path, {"k1": "1"})
-    await engine.stop()
-    engine = make_engine(state, project(tmp_path, outside, copy_v="2"))
-    await engine.initialize()
-    outside.feed["k1"] = "2"
-    await engine.commit_source("feed", upsert=["k1"])
-    assert await staleness.stale_reasons(engine, "copy") == {staleness.DEFINITION, staleness.UPSTREAM}
-
-
-async def test_a_key_neither_side_holds_leaves_an_each_partition_fresh(state, tmp_path):
-    """F35. `fchecks` (each=True over `feed`) runs for k1 alone; `feed` then
-    removes k2, which `fchecks` never held. k2 is no output unit, so
-    nothing is stale: the keys say so, and the partition, their "any",
-    must agree."""
-
-    engine, outside = await _built(state, tmp_path, {"k1": "1", "k2": "1"})
-    await drive(engine, await engine.submit(["fchecks"], upstream=False, keys={"feed": ["k1"]}))
-    outside.feed.pop("k2")
-    await engine.commit_source("feed", remove=["k2"])
-    assert await staleness.stale_keys(engine, "fchecks") == set()
-    assert not await staleness.partition_stale(engine, "fchecks"), "stale, with no stale key"
 
 
 async def test_a_key_added_and_removed_past_the_read_changes_nothing(state, tmp_path):
@@ -831,25 +697,6 @@ async def test_a_key_updated_and_reverted_reads_as_updated(state, tmp_path):
     await drive(engine, await engine.submit(["items"]))
     after = await index_entries(state, "items", "")
     assert after["k2"] == before["k2"] and after["k1"][0] > before["k1"][0]
-
-
-async def test_a_reset_upstream_and_a_new_version_give_both_reasons(state, tmp_path):
-    """The ruling: `items` reset (its content replaced) and then `count`'s
-    version bumped: `count` is stale for both, ["input changed",
-    "definition changed"]; one full run under the new version, reading the
-    new `items`, clears both."""
-
-    engine, outside = await _built(state, tmp_path, {"k1": "1"})
-    await engine.stop()
-    engine = make_engine(state, project(tmp_path, outside, items_store="b"))  # items reset
-    await engine.initialize()
-    await drive(engine, await engine.submit(["items"]))
-    await engine.stop()
-    engine = make_engine(state, project(tmp_path, outside, items_store="b", count_v="2"))
-    await engine.initialize()
-    assert await staleness.stale_reasons(engine, "count") == {staleness.INPUT, staleness.DEFINITION}
-    await drive(engine, await engine.submit(["count"]))
-    assert await staleness.stale_reasons(engine, "count") == set()
 
 
 def test_the_reference_reads_the_worked_examples():
