@@ -2310,3 +2310,93 @@ fn a_held_back_key_keeps_its_record() {
         assert_eq!(pt.reason, solera_tracking::progress::Reason::HeldBack);
     });
 }
+
+/// A retry batch whose only key B3 holds back (D205) still moves its pass
+/// on, and the key's record stays as it is, so the pass ends covering a
+/// deploy the key was not retried under. The key gets that retry all the
+/// same: it was held back because its input moved after the plan, so either
+/// the input returns to what the key failed on and the catch-up lowers what
+/// the last pass covers, or it stays changed and the key comes with its
+/// change, tried under the deploy now.
+#[test]
+fn a_retry_batch_whose_only_key_is_held_back_still_gets_its_deploy_retry() {
+    let rt = runtime();
+    for returns in [true, false] {
+        let ix = index(&rt);
+        rt.block_on(async {
+            let mut w = scripted();
+            let c1 = w.counters;
+            w.input(&ix, &[("k1", 5)]).await;
+            let first = w.planned(&ix, None, 10, Mode::Incremental).await;
+            let ev = w
+                .commit_of(&ix, &first, &[("k1", Kind::Failed)], &[], c1)
+                .await
+                .unwrap();
+            w.apply(ev);
+            while let Some(parts) = w.start_of(&ix).await {
+                w.apply(parts);
+                let step = w.retry_plan(&ix, 10).await;
+                let ev = w.commit_of(&ix, &step, &[], &[], c1).await.unwrap();
+                w.apply(ev);
+            }
+            w.counters.deploy = 2;
+            let c2 = w.counters;
+            let start = w.start_of(&ix).await.expect("the deploy starts a pass");
+            w.apply(start);
+            let step = w.retry_plan(&ix, 10).await;
+            assert_eq!(taken(&step), [key("k1")]);
+            // The input starts a full run under the retry batch: the worker
+            // loads k1 at another version than planned.
+            let changes = [(key("k1"), Ver::Int(7))].into();
+            assert!(w.log.commit(&ix, &mut w.t, changes, true, false).await);
+            if let Some(parts) = w.caught(&ix).await {
+                w.apply(parts);
+            }
+            let before = w.stored(&ix).await[&key("k1")].clone();
+            let ev = w
+                .commit_of(&ix, &step, &[("k1", Kind::Failed)], &[("k1", 7)], c2)
+                .await
+                .unwrap();
+            w.apply(ev);
+            assert_eq!(w.stored(&ix).await[&key("k1")], before);
+            let edge = &w.t.edges[EDGE.as_bytes()];
+            let pt = edge.progress.keyed().unwrap().point(b"k1").unwrap();
+            assert_eq!(pt.reason, solera_tracking::progress::Reason::HeldBack);
+            let k = &w.t.per_key[EDGE.as_bytes()];
+            assert!(k.pass.is_none(), "the batch ended its pass");
+            assert_eq!(k.last.deploy, 2, "the pass covers the deploy");
+            assert_eq!(before.stored.deploy, 1, "k1 was not retried under it");
+            assert!(
+                w.start_of(&ix).await.is_none(),
+                "k1's input changed: no pass is due for it"
+            );
+            if returns {
+                // The input returns to what k1 failed on: it waits for its
+                // retry again, and the deploy's pass comes back for it.
+                let changes = [(key("k1"), Ver::Int(5))].into();
+                assert!(w.log.commit(&ix, &mut w.t, changes, false, true).await);
+                if let Some(parts) = w.caught(&ix).await {
+                    w.apply(parts);
+                }
+                assert!(taken(&w.planned(&ix, None, 10, Mode::Incremental).await).is_empty());
+                let start = w.start_of(&ix).await;
+                w.apply(start.expect("k1 waits for the deploy's retry"));
+                assert_eq!(taken(&w.retry_plan(&ix, 10).await), [key("k1")]);
+            } else {
+                // The input stays changed: k1 comes with its change, and its
+                // failure is recorded under the deploy now.
+                let p = w.planned(&ix, None, 10, Mode::Incremental).await;
+                assert_eq!(taken(&p), [key("k1")]);
+                let ev = w
+                    .commit_of(&ix, &p, &[("k1", Kind::Failed)], &[], c2)
+                    .await
+                    .unwrap();
+                w.apply(ev);
+                let rec = w.stored(&ix).await[&key("k1")].clone();
+                assert_eq!((rec.on.clone(), rec.stored.deploy), (Ver::Int(7), 2));
+                assert!(!eligible(&rec.stored, w.clock, &w.counters));
+                assert!(w.start_of(&ix).await.is_none());
+            }
+        });
+    }
+}
