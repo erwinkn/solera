@@ -3123,3 +3123,147 @@ fn a_retry_held_back_by_another_inputs_full_run_comes_again() {
         );
     });
 }
+
+/// A failure on b at v1, then b's head moves to v2 and a deploy's pass on b
+/// finds nothing to retry. A retry on a takes k1 on b at v2 and is held
+/// back by a's full run: b's record is of v1, so b's k1 is a change batch's
+/// and b's pass still covers the deploy.
+#[test]
+fn a_held_back_key_planned_at_another_version_than_its_record_lowers_nothing() {
+    let rt = runtime();
+    let ix = index(&rt);
+    rt.block_on(async {
+        let mut w = Multi::new(0);
+        for i in 0..2 {
+            let changes = [(key("k1"), Ver::Int(1))].into();
+            assert!(
+                w.sides[i]
+                    .log
+                    .commit(&ix, &mut w.t, changes, false, true)
+                    .await
+            );
+        }
+        let req = w.request(None, 10);
+        let view = w.t.view(&req).unwrap();
+        let p = plan::plan(&view, &req, &OneIndex(&ix), &NoHold)
+            .await
+            .unwrap();
+        let failed = [(key("k1"), boom())].into();
+        assert!(
+            w.commit_batch(&ix, &p, failed, vec![vec![], vec![]], false)
+                .await
+        );
+        let changes = [(key("k1"), Ver::Int(2))].into();
+        assert!(
+            w.sides[1]
+                .log
+                .commit(&ix, &mut w.t, changes, false, true)
+                .await
+        );
+        w.catch_up(&ix).await;
+        w.counters.deploy = 2;
+        for i in [1, 0] {
+            let start = w.start(&ix, i).await.expect("the deploy starts a pass");
+            w.apply(start);
+            let req = w.request(None, 10);
+            let view = w.t.view(&req).unwrap();
+            let r = w.t.retry_view(&w.sides[i].edge).unwrap();
+            let p = due::plan_all(&OneIndex(&ix), &r, &view, &req, &NoHold, 10)
+                .await
+                .unwrap();
+            if i == 1 {
+                assert!(p.inputs[1].keys.is_empty(), "b's k1 changed");
+                assert!(
+                    w.commit_batch(&ix, &p, BTreeMap::new(), vec![vec![], vec![]], false)
+                        .await
+                );
+                continue;
+            }
+            assert_eq!(p.inputs[1].keys[0].version, Ver::Int(2));
+            let changes = [(key("k1"), Ver::Int(2))].into();
+            assert!(
+                w.sides[0]
+                    .log
+                    .commit(&ix, &mut w.t, changes, true, false)
+                    .await
+            );
+            let loaded = vec![vec![(key("k1"), Ver::Int(2))], vec![]];
+            assert!(w.commit_batch(&ix, &p, BTreeMap::new(), loaded, true).await);
+        }
+        assert_eq!(w.stats[3], 1, "k1 is held back");
+        assert_eq!(w.t.per_key[&w.sides[1].edge].last.deploy, 2);
+        assert!(w.start(&ix, 1).await.is_none(), "no pass is due on b");
+    });
+}
+
+/// A retry plan keeps the consumer's unkeyed inputs, with one keyed input
+/// or several, so the batch consumes them as any batch does.
+#[test]
+fn a_retry_plan_keeps_the_unkeyed_inputs() {
+    let rt = runtime();
+    let ix = index(&rt);
+    rt.block_on(async {
+        let mut w = Multi::new(0);
+        w.apply(vec![Part::EdgeOpen(EdgeOpen {
+            edge: key("c/u"),
+            input: key("u"),
+            keyed: false,
+        })]);
+        let mut u = Log {
+            name: "u".into(),
+            states: vec![BTreeMap::new()],
+            layers: vec![],
+            clears: vec![],
+            full_run: None,
+        };
+        let changes = [(key("v"), Ver::Int(1))].into();
+        assert!(u.commit(&ix, &mut w.t, changes, false, true).await);
+        for i in 0..2 {
+            let changes = [(key("k1"), Ver::Int(1))].into();
+            assert!(
+                w.sides[i]
+                    .log
+                    .commit(&ix, &mut w.t, changes, false, true)
+                    .await
+            );
+        }
+        let req = w.request(None, 10);
+        let view = w.t.view(&req).unwrap();
+        let p = plan::plan(&view, &req, &OneIndex(&ix), &NoHold)
+            .await
+            .unwrap();
+        let failed = [(key("k1"), boom())].into();
+        assert!(
+            w.commit_batch(&ix, &p, failed, vec![vec![], vec![]], false)
+                .await
+        );
+        w.counters.deploy = 2;
+        let start = w.start(&ix, 1).await.expect("the deploy starts b's pass");
+        w.apply(start);
+        for keyed in [vec![1], vec![0, 1]] {
+            let mut req = w.request(None, 10);
+            req.inputs = keyed.iter().map(|&j| req.inputs[j].clone()).collect();
+            req.unkeyed = vec![key("c/u")];
+            let view = w.t.view(&req).unwrap();
+            let r = w.t.retry_view(&w.sides[1].edge).unwrap();
+            let p = due::plan_all(&OneIndex(&ix), &r, &view, &req, &NoHold, 10)
+                .await
+                .unwrap();
+            let want = plan::plan(&view, &req, &OneIndex(&ix), &NoHold)
+                .await
+                .unwrap();
+            assert!(want.unkeyed[0].owed());
+            assert_eq!(p.unkeyed, want.unkeyed, "{} keyed inputs", keyed.len());
+            assert_eq!(p.inputs.last().unwrap().keys.len(), 1, "b retries k1");
+        }
+    });
+}
+
+fn boom() -> Reported {
+    Reported {
+        kind: Kind::Failed,
+        message: b"boom".as_slice().into(),
+        retry_after: None,
+        retry_for: None,
+    }
+}

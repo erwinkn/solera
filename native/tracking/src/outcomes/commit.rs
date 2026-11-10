@@ -494,19 +494,24 @@ pub async fn commit(
         at: v.failures.head,
         look: made.map(|_| (looked, caught_up)),
         life: v.per_key.life,
-        // A key held back while this input read it as planned (another
-        // input moved) was not retried and its input has not moved: it
-        // waits for its retry again, so it lowers what the pass covers like
-        // a record written. One read at another version comes back with its
-        // change, or the catch-up lowers it when the input returns.
+        // A key held back while this input read it as planned, at the
+        // version its record failed on (another input moved), was not
+        // retried and its input has not moved: it waits for its retry
+        // again, so it lowers what the pass covers like a record written.
+        // One read at another version comes back with its change, or the
+        // catch-up lowers it when the input returns; one planned at another
+        // version than its record's is a change batch's.
         low: next
             .values()
             .flatten()
             .chain(
-                held_back
+                p.keys
                     .iter()
-                    .filter(|k| loaded.binary_search_by(|(x, _)| x.cmp(k)).is_err())
-                    .filter_map(|k| priors.get(k)),
+                    .filter(|c| {
+                        held_back.binary_search(&c.key).is_ok()
+                            && loaded.binary_search_by(|(x, _)| x.cmp(&c.key)).is_err()
+                    })
+                    .filter_map(|c| priors.get(&c.key).filter(|pr| pr.on == c.version)),
             )
             .fold(None, |mut low, r| {
                 cover(&mut low, &r.stored);
