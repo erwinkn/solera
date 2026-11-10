@@ -283,3 +283,69 @@ fn a_read_of_a_layer_of_many_short_blocks_plans_a_bounded_window() {
         some.len(),
     );
 }
+
+#[test]
+fn a_read_of_sparse_segments_holds_a_bounded_batch_of_them() {
+    let _one = ONE_AT_A_TIME.lock().unwrap();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let o = WriteOptions {
+        block_bytes: 1,
+        level: 1,
+        seg_blocks: 1,
+    };
+    let n = 2_000_000u64;
+    let dir = std::env::temp_dir().join(format!("solera-index-sparse-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut f = std::fs::File::create(dir.join("sparse")).unwrap();
+    let mut w = Writer::new(o, 1, 1, None).unwrap();
+    for i in 0..n {
+        w.push(&i.to_be_bytes(), 1, Version::Int(i), Version::Absent)
+            .unwrap();
+        if w.pending() > 1 << 20 {
+            std::io::Write::write_all(&mut f, &w.take()).unwrap();
+        }
+    }
+    let h = CommitHeader {
+        commit: 1,
+        added: n,
+        live: n,
+        ..Default::default()
+    };
+    let mut l = w.finish(&[h]).unwrap();
+    std::io::Write::write_all(&mut f, &w.take()).unwrap();
+    drop((w, f));
+    l.path = "sparse".into();
+    // files, not memory: a local GET allocates what it reads; the blocks
+    // fetched ahead stay within WINDOW plus one max_get
+    let local = Arc::new(LocalFileSystem::new_with_prefix(&dir).unwrap());
+    let opts = StoreOptions {
+        max_get: 4 << 20,
+        ..Default::default()
+    };
+    let store = Store::new(local, Path::from(""), rt.handle().clone(), opts).unwrap();
+    let ix = ChangeIndex::new(store, WriteOptions::default());
+    let ls = std::slice::from_ref(&l);
+    let q = Query::default();
+    let one = [n.to_be_bytes()];
+    assert_eq!(rt.block_on(ix.get(ls, 1, &one, &q)).unwrap().run.len(), 0);
+    let some: Vec<Vec<u8>> = (0..n)
+        .step_by(2001)
+        .map(|i| i.to_be_bytes().to_vec())
+        .collect();
+    let base = NOW.load(Relaxed);
+    PEAK.store(base, Relaxed);
+    let got = rt.block_on(ix.get(ls, 1, &some, &q)).unwrap().run.len();
+    let held = PEAK.load(Relaxed) - base;
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(got, some.len());
+    assert!(
+        held < 40 << 20,
+        "a get over {} MB of index held {} MB",
+        (l.top_start - l.index_start) >> 20,
+        held >> 20
+    );
+}
