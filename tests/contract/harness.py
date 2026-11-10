@@ -256,6 +256,54 @@ class Solera:
         key = self.project.manifest["outputs"][output]["key"]
         return {str(r[key]): r.get(column) for r in await self.read(output, partition) or []}
 
+    # -- SRC+PAR+AUT -----------------------------------------------------------
+
+    async def upkeep(self) -> None:
+        """Storage upkeep does one pass, as a served engine's does every
+        second: retention among it."""
+
+        await self.engine.upkeep.tick()
+
+    async def until(self, condition, timeout: float = 10) -> None:
+        """The engine works, as in `settle`, until `condition()` (awaited when
+        it returns an awaitable) holds; fails past `timeout` seconds."""
+
+        import inspect
+
+        deadline = time.monotonic() + timeout
+        while True:
+            held = condition()
+            if inspect.isawaitable(held):
+                held = await held
+            if held:
+                return
+            assert time.monotonic() < deadline, f"still not so after {timeout} s"
+            await self.settle(0.05)
+
+    async def quiet(self, timeout: float = 10) -> None:
+        """The engine works until no run is queued or running."""
+
+        async def idle():
+            return not await self.runs(status=["queued", "running"])
+
+        await self.until(idle, timeout)
+
+    async def sensors(self, ticks: int, executor: str = "local") -> None:
+        """A sensor host of `executor` runs `ticks` ticks as a sensor worker
+        does: it asks for due ones, runs each body, and posts its outcome."""
+
+        from solera_worker.channel import SensorChannel
+        from solera_worker.sensors import run_sensor_host
+
+        client = self.client
+
+        class Transport:
+            async def asend(self, method, path, **kw):
+                return await client.request(method, path, **kw)
+
+        channel = SensorChannel(Transport(), self.project.manifest["name"])
+        await run_sensor_host(channel, self.project, executor, max_ticks=ticks, host="contract")
+
 
 # -- the outside world, as a user's project sees it ---------------------------
 

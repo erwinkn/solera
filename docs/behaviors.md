@@ -449,49 +449,49 @@ d.csv: c1})`: b.csv updated, d.csv added, a.csv unchanged. A full map
 removes keys it omits; `upsert`/`remove` patch. A key given no version is
 always a change. An unkeyed source given its current version again makes
 no commit.
-*From* `versions.md` §2 (Erwin). *Covered* `server/test_keys.py::test_keyed_source_commits_go_through_the_index`; `server/test_api.py::test_source_commit_endpoints`; `server/test_planning.py::test_unkeyed_source_commits_over_http`.
+*From* `versions.md` §2 (Erwin). *Covered* `contract/test_src.py::test_src_1_a_commit_changes_only_the_keys_whose_version_moved`; `contract/test_src.py::test_src_1_a_key_given_no_version_is_always_a_change`; `contract/test_src.py::test_src_1_an_unkeyed_source_at_its_current_version_makes_no_commit`; `contract/test_src.py::test_src_1_the_commit_route_takes_a_full_map_or_a_patch`; `server/test_keys.py::test_keyed_source_commits_go_through_the_index`; `server/test_planning.py::test_unkeyed_source_commits_over_http`.
 
 **SRC-2. Each source commit that changes something is a run with no tasks.**
 It says who committed and what changed, and expires with the project's
 default retention.
-*From* `object-store-state.md` §11. *Covered* `server/test_retention.py::test_source_commits_are_recorded_as_runs`.
+*From* `object-store-state.md` §11. *Covered* `contract/test_src.py::test_src_2_each_commit_that_changes_something_is_a_run_with_no_tasks`; `server/test_retention.py::test_source_commits_are_recorded_as_runs`.
 
 **SRC-3. Sources are read live, and every load says which version it served.**
 A keyed loader returns `{key: Loaded(row, version=…)}`; a key it leaves
 out was served absent. `ctx.batch[input].served` shows each key's served
 version. A keyed loader that omits versions fails the load.
-*From* D146, D147. *Covered* `server/test_sources.py::test_a_function_source_serves_rows_with_their_versions`; `server/test_sources.py::test_a_key_the_loader_leaves_out_was_observed_absent`; `server/test_sources.py::test_a_keyed_loader_must_say_what_it_served`.
+*From* D146, D147. *Covered* `contract/test_src.py::test_src_3_a_keyed_loader_serves_rows_with_their_versions`; `contract/test_src.py::test_src_3_a_keyed_loader_that_omits_versions_fails_the_load`; `server/test_sources.py::test_a_key_the_loader_leaves_out_was_observed_absent`.
 
 **SRC-4. A batch's classes follow what the source served, before the producer runs.**
 The commit says k2@2; the source serves k2@3: classed from @3. Restored
 to @2 by a commit: owed as updated. Served absent: removed if held, else
 nothing. Served at the version already processed: nothing.
-*From* D147, D126; review A27 R2, A26 N4. *Covered* `server/test_observed_histories.py::test_a26_n4_a_row_served_ahead_of_its_commit_is_a_point`; `server/test_observed_histories.py::test_a26_n4_a_key_served_absent_then_back_is_owed_its_add`.
+*From* D147, D126; review A27 R2, A26 N4. *Covered* `contract/test_src.py::test_src_4_a_row_served_ahead_of_its_commit_is_classed_from_what_was_served`; `contract/test_src.py::test_src_4_served_at_the_version_already_processed_is_nothing`; `contract/test_src.py::test_src_4_served_absent_is_removed_if_held_else_nothing`; `server/test_observed_histories.py::test_a26_n4_a_row_served_ahead_of_its_commit_is_a_point`; `server/test_observed_histories.py::test_a26_n4_a_key_served_absent_then_back_is_owed_its_add`.
 
 **SRC-5. A key the source lost without a commit is processed as absent; its return is delivered.**
 `feed` commits k1@3; before `items` reads it the outside loses k1:
 `items` processes k1 as absent. `feed` restores k1@3: `items` is owed k1
 (added). A commit that removes k1 owes nothing more.
-*From* D147, D126 (chain: D56 → D70 → D93 → D100 → D126/D147); F33, F38, F41. *Covered* `server/test_source_behind.py::test_a_key_the_source_lost_is_observed_absent`; `server/test_source_behind.py::test_the_next_commit_restoring_the_key_delivers_it`; `server/test_source_behind.py::test_the_next_commit_removing_the_key_owes_nothing`; `server/test_source_behind.py::test_a_per_key_batch_observes_it_alike`; `server/test_sim_found.py::test_a_key_a_current_read_missed_reaches_its_consumer_once_restored`; `sim/test_replays.py::test_f41_a_consumer_that_read_a_removal_does_not_keep_the_key`. D56 (fail, retryable) is retired by D147 (Q5).
+*From* D147, D126 (chain: D56 → D70 → D93 → D100 → D126/D147); F33, F38, F41. *Covered* `contract/test_src.py::test_src_5_a_key_lost_without_a_commit_is_processed_as_absent`; `contract/test_src.py::test_src_5_its_return_is_delivered`; `contract/test_src.py::test_src_5_a_commit_removing_it_owes_nothing_more`; `contract/test_src.py::test_src_5_items_learns_of_the_return_as_added`; `server/test_source_behind.py::test_a_key_the_source_lost_is_observed_absent`; `server/test_source_behind.py::test_the_next_commit_restoring_the_key_delivers_it`; `server/test_source_behind.py::test_the_next_commit_removing_the_key_owes_nothing`; `server/test_source_behind.py::test_a_per_key_batch_observes_it_alike`; `server/test_sim_found.py::test_a_key_a_current_read_missed_reaches_its_consumer_once_restored`; `sim/test_replays.py::test_f41_a_consumer_that_read_a_removal_does_not_keep_the_key`. D56 (fail, retryable) is retired by D147 (Q5).
 
 **SRC-6. A keyed source loaded as data must be able to say what it served.**
 No loader, and a store that cannot serve it (no `version_column`, no
 `path`): refused at registration. Read only as a `Ref`, it needs neither.
-*From* D147. *Covered* `server/test_sources.py::test_registration_refuses_a_keyed_source_loaded_without_versions`.
+*From* D147. *Covered* `contract/test_src.py::test_src_6_a_keyed_source_loaded_as_data_must_be_able_to_say_what_it_served`.
 
 **SRC-7. Built-in stores serve sources at their own versions.**
 FileStore/S3Store: each object under `path` at its etag (local: inode,
 mtime, size; `hash=True` hashes content). Postgres: each row at its
 `version_column`. An unkeyed function may return a bare value (caveat: a
 revert between commit and read can leave a consumer one revision ahead).
-*From* D147. *Covered* `server/test_sources.py::test_a_file_source_serves_objects_at_the_stores_version`; `server/test_sources.py::test_an_unkeyed_file_source_serves_the_objects_bytes`; `server/test_sources.py::test_a_table_source_serves_rows_at_their_version_column`; `server/test_sources.py::test_an_unkeyed_function_source_serves_its_value`.
+*From* D147. *Covered* `contract/test_src.py::test_src_7_a_file_source_serves_objects_at_the_stores_version`; `contract/test_src.py::test_src_7_an_unkeyed_file_source_serves_the_objects_bytes`; `contract/test_src.py::test_src_7_a_table_source_serves_rows_at_their_version_column`; `contract/test_src.py::test_src_7_an_unkeyed_function_source_serves_its_value`.
 
 **SRC-8. Bumping a loader's `version=` owes every key as updated.**
 `@source(version="1")` → `"2"`: every consumer owes every key.
-*From* D147. *Covered* none found (Q9).
+*From* D147. *Covered* `contract/test_src.py::test_src_8_bumping_a_loaders_version_owes_every_key_as_updated` (a strict xfail until built, Q9).
 
 **SRC-9. `Source(copy=True)` copies each changed key into a Solera store at commit.**
-*From* D146, D147. *Covered* none: not built (Q9).
+*From* D146, D147. *Covered* `contract/test_src.py::test_src_9_a_copied_source_keeps_each_changed_key_as_committed` (a strict xfail until built, Q9).
 
 **SRC-10. A sensor tick is all or nothing.**
 A tick's source commits, requested runs and cursor land together. No
@@ -505,7 +505,7 @@ applies once; a tick's runs are submitted once.
 `Source("landing", observe=Every(300))`: `observe()` returning a version,
 a full map, or `Observed(upsert, remove, cursor)` becomes that source's
 commit.
-*From* `per-key-processing.md` §12. *Covered* `server/test_sensors.py::test_observable_sources_commit_on_their_schedule`.
+*From* `per-key-processing.md` §12. *Covered* `contract/test_src.py::test_src_11_an_observable_source_commits_on_its_schedule`; `server/test_sensors.py::test_observable_sources_commit_on_their_schedule`.
 
 ## KEY — per-key assets and key outcomes
 
@@ -662,28 +662,28 @@ exist yet.
 **PAR-1. Partition keys are canonical strings; an unpartitioned asset has one, never shown.**
 `"Richmond"`, or `"day=2024-01-01,site=Richmond"` sorted by dimension.
 Time windows are half-open and aligned in their timezone.
-*From* D43. *Covered* `sdk/test_partitions.py::test_canonical_key_encoding`; `sdk/test_partitions.py::test_daily_keys`; `sdk/test_partitions.py::test_timezone_alignment`.
+*From* D43. *Covered* `contract/test_par.py::test_par_1_keys_join_dimensions_sorted_by_name`; `contract/test_par.py::test_par_1_time_windows_are_half_open`; `contract/test_par.py::test_par_1_time_windows_align_in_their_timezone`; `contract/test_par.py::test_par_1_runs_name_partitions_by_their_canonical_key`.
 
 **PAR-2. Dimensions project: shared → same key, consumer-only → broadcast, upstream-only → fan-in.**
 `report` (day) over `readings` (day × site) gets `dict[site, T]`. A
 consumer-only dimension reads the same upstream partition for every
 key. An incremental input may not fan in.
-*From* `architecture.md` §7. *Covered* `server/test_engine.py::test_two_dimension_broadcast_and_collapse`; `server/test_engine.py::test_all_partitions_values`.
+*From* `architecture.md` §7. *Covered* `contract/test_par.py::test_par_2_a_consumer_only_dimension_broadcasts_an_upstream_only_one_collapses`; `contract/test_par.py::test_par_2_a_shared_dimension_projects_and_an_upstream_only_one_fans_in`; `contract/test_par.py::test_par_2_an_incremental_input_may_not_fan_in`; `server/test_engine.py::test_all_partitions_values`.
 
 **PAR-3. A fan-in reads the complete heads that exist; it never waits.**
 `report` for 2026-10-01 runs over Richmond and Oslo while Paris has no
 head. To wait for all, `upstream=True`. With `skip_missing_inputs`, a
 fan-in with no head at all is skipped.
-*From* `architecture.md` §7, §9. *Covered* `server/test_planning.py::test_a_fan_in_reads_the_heads_that_exist`; `server/test_planning.py::test_an_empty_fan_in_is_missing`; `server/test_engine.py::test_an_automation_can_skip_until_its_inputs_are_written`; `server/test_matrix.py::test_a_change_is_kept_until_its_delivery_completes`.
+*From* `architecture.md` §7, §9. *Covered* `contract/test_par.py::test_par_3_a_fan_in_reads_the_heads_that_exist`; `contract/test_par.py::test_par_3_a_fan_in_never_waits_for_a_partition_with_no_head`; `contract/test_par.py::test_par_3_with_skip_missing_inputs_a_fan_in_with_no_head_is_skipped`; `contract/test_par.py::test_par_3_a_fan_in_reads_complete_passes_only`; `server/test_planning.py::test_an_empty_fan_in_is_missing`; `server/test_engine.py::test_an_automation_can_skip_until_its_inputs_are_written`; `server/test_matrix.py::test_a_change_is_kept_until_its_delivery_completes`.
 
 **PAR-4. `all_partitions=True` reads every upstream partition, shared dimensions too.**
 `site_report` for alpha compares alpha with every other site.
-*From* `architecture.md` §5. *Covered* `server/test_matrix.py::test_all_partitions_reads_every_partition_the_shared_dimensions_too`; `server/test_planning.py::test_a_dep_reads_every_partition_with_all_partitions`.
+*From* `architecture.md` §5. *Covered* `contract/test_par.py::test_par_4_all_partitions_reads_every_partition_the_shared_dimensions_too`; `server/test_planning.py::test_a_dep_reads_every_partition_with_all_partitions`.
 
 **PAR-5. Dynamic partitions: re-listing changes nothing; new elements surface through `"missing"`.**
 `sites` re-lists every site each cron run: no consumer wakes. A new site
 is picked up by `Every(60, partitions="missing")`.
-*From* `versions.md` §2; D161. *Covered* `server/test_engine.py::test_external_partition_set_via_commit`; `server/test_engine.py::test_missing_on_schedule_picks_up_new_keys`; `server/test_keys.py::test_partition_set_elements_ride_on_the_head`.
+*From* `versions.md` §2; D161. *Covered* `contract/test_par.py::test_par_5_an_external_partition_set_is_patched_by_commits`; `contract/test_par.py::test_par_5_missing_on_a_schedule_picks_up_new_partitions`; `contract/test_par.py::test_par_5_re_listing_the_same_partitions_wakes_no_consumer`; `server/test_keys.py::test_partition_set_elements_ride_on_the_head`.
 
 **PAR-6. A removed partition leaves fan-out and fan-in; its head stays readable.**
 `sites` drops `west`: no run targets it, no fan-in reads it, its status is
@@ -693,17 +693,17 @@ is picked up by `Every(60, partitions="missing")`.
 **PAR-7. Partition selections: `"latest"`, `"missing"`, `"all"`, a list.**
 Counted before listed; past 100,000 refused. An explicit list never
 enumerates the domain.
-*From* `architecture.md` §8; D161. *Covered* `server/test_engine.py::test_partition_selections`; `server/test_planning.py::test_one_explicit_scope_never_enumerates_the_domain`; `server/test_matrix.py::test_an_explicit_selection_is_linear`.
+*From* `architecture.md` §8; D161. *Covered* `contract/test_par.py::test_par_7_latest_missing_all_and_a_list_select_partitions`; `contract/test_par.py::test_par_7_latest_is_the_last_complete_window`; `contract/test_par.py::test_par_7_a_selection_is_counted_before_it_is_listed`; `server/test_planning.py::test_one_explicit_scope_never_enumerates_the_domain`; `server/test_matrix.py::test_an_explicit_selection_is_linear`.
 
 **PAR-8. A source change reaches every partition of its consumer.**
 `rates`, an unkeyed source (no dimensions), changes: every partition of
 `site_report`, which reads it, owes a rerun.
-*From* `architecture.md` §9. *Covered* `server/test_planning.py::test_a_source_change_fans_out_over_a_partitioned_consumer`.
+*From* `architecture.md` §9. *Covered* `contract/test_par.py::test_par_8_a_source_change_reaches_every_partition_of_its_consumer`; `server/test_planning.py::test_a_source_change_fans_out_over_a_partitioned_consumer`.
 
 **PAR-9. A sensor's requested runs see its own commits.**
 A tick replaces `sites` `[old]` with `[new]` and asks for all partitions:
 the run targets `new`.
-*From* `lifecycle.md` §11. *Covered* `server/test_sensors.py::test_requested_runs_see_the_ticks_own_commits`.
+*From* `lifecycle.md` §11. *Covered* `contract/test_par.py::test_par_9_a_sensors_requested_runs_see_its_own_commits`; `server/test_sensors.py::test_requested_runs_see_the_ticks_own_commits`.
 
 ## AUT — automations
 
@@ -711,17 +711,17 @@ the run targets `new`.
 An automation targets `copy` and `summary` (which reads `copy`); `items`
 commits: one run, `summary` after `copy`, partitions projected from the
 change.
-*From* `architecture.md` §9. *Covered* `server/test_engine.py::test_onchange_fans_out_by_projection`; `server/test_planning.py::test_an_onchange_firing_is_one_run_in_order`.
+*From* `architecture.md` §9. *Covered* `contract/test_aut.py::test_aut_1_a_change_fires_one_run_over_its_targets_in_order`; `contract/test_aut.py::test_aut_1_a_firing_projects_the_changed_partitions`; `server/test_engine.py::test_onchange_fans_out_by_projection`; `server/test_planning.py::test_an_onchange_firing_is_one_run_in_order`.
 
 **AUT-2. A change waits while the work it is owed is already queued or running.**
 `copy` is running when `items` commits again: the firing waits and runs
 after, so no change is consumed by work that could not see it.
-*From* `architecture.md` §9. *Covered* `server/test_matrix.py::test_a_change_waits_for_work_already_queued`; `server/test_planning.py::test_a_change_during_a_run_is_kept_for_after_it`.
+*From* `architecture.md` §9. *Covered* `contract/test_aut.py::test_aut_2_a_change_during_a_run_waits_for_it`; `contract/test_aut.py::test_aut_2_a_change_waits_for_work_already_queued`; `server/test_matrix.py::test_a_change_waits_for_work_already_queued`; `server/test_planning.py::test_a_change_during_a_run_is_kept_for_after_it`.
 
 **AUT-3. A schedule waits for its next time, even the first.**
 `Cron("0 6 * * *")` declared at 14:00 first fires tomorrow at 06:00. A
 tick is skipped for a partition running or queued.
-*From* D35 (1). *Covered* `server/test_engine.py::test_every_and_cron_fire`; `server/test_engine.py::test_every_skips_active_scope`; `server/test_engine.py::test_every_skips_queued_scope`.
+*From* D35 (1). *Covered* `contract/test_aut.py::test_aut_3_every_waits_for_its_first_interval`; `contract/test_aut.py::test_aut_3_a_cron_first_fires_at_its_next_time`; `contract/test_aut.py::test_aut_3_a_tick_is_skipped_for_a_partition_queued`; `contract/test_aut.py::test_aut_3_a_tick_is_skipped_for_a_partition_running`; `server/test_engine.py::test_every_and_cron_fire`; `server/test_engine.py::test_every_skips_active_scope`.
 
 **AUT-4. An asset change leaves its automations to decide; with none, it shows stale.**
 Adding, re-adding, renaming, or changing an asset's definition: its
@@ -735,18 +735,18 @@ owes nothing (CHG-7: widening to a key that never existed).
 **AUT-5. `OnDeploy` fires once per new deploy.**
 Restarting on the same deploy is silent; two deploys before a tick fire
 once, for the latest.
-*From* `architecture.md` §9. *Covered* `server/test_engine.py::test_ondeploy_fires_once_per_revision`; `server/test_engine.py::test_ondeploy_silent_on_restart_same_revision`; `server/test_engine.py::test_ondeploy_two_registrations_fire_latest_once`.
+*From* `architecture.md` §9. *Covered* `contract/test_aut.py::test_aut_5_on_deploy_fires_once_per_new_deploy`; `contract/test_aut.py::test_aut_5_two_deploys_before_a_tick_fire_once_for_the_latest`; `server/test_engine.py::test_ondeploy_fires_once_per_revision`; `server/test_engine.py::test_ondeploy_silent_on_restart_same_revision`; `server/test_engine.py::test_ondeploy_two_registrations_fire_latest_once`.
 
 **AUT-6. A failing partition's changes back off.**
 `site_status` fails the same way on every `site_events` commit: its
 firings wait 60 s doubling to 1 h, reset by a success, so it stays
 visibly failed instead of failing 7,500 times.
-*From* D167; F43. *Covered* `server/test_engine.py::test_a_failing_partition_backs_off_its_changes`.
+*From* D167; F43. *Covered* `contract/test_aut.py::test_aut_6_a_failing_partitions_changes_back_off`; `server/test_engine.py::test_a_failing_partition_backs_off_its_changes`.
 
 **AUT-7. With nothing manual, automated outputs converge on their sources.**
 After quiet, every automated output equals what its sources imply; no
 change stuck, none silently consumed.
-*From* D60; `verification.md` ("Automations converge"). *Covered* sim `_converge` (Automations converge, A catch-up run converges); `Execution.tla` Quiesces, RunsEndCaughtUp.
+*From* D60; `verification.md` ("Automations converge"). *Covered* `contract/test_aut.py::test_aut_7_automated_outputs_converge_on_their_sources`; sim `_converge` (Automations converge, A catch-up run converges); `Execution.tla` Quiesces, RunsEndCaughtUp.
 
 ## HIS — history and lineage
 
