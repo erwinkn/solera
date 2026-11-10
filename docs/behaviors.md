@@ -789,10 +789,10 @@ processed version, stay known as long as their run.
 default. A run goes once it is past the horizon of every asset it ran;
 active runs never. Heads, keys, cursors and what was processed stand on
 their own; data never expires.
-*From* `object-store-state.md` §11. *Covered* `server/test_retention.py::test_keep_the_newest_runs`; `server/test_retention.py::test_runs_kept_forever_do_not_crowd_out_expired_ones`; `test_soak.py::test_soak_with_retention`.
+*From* `object-store-state.md` §11. *Covered* `contract/test_cln.py::test_cln_1_runs_expire_by_policy_and_current_state_never_does`; `server/test_retention.py::test_keep_the_newest_runs`; `server/test_retention.py::test_runs_kept_forever_do_not_crowd_out_expired_ones`; `test_soak.py::test_soak_with_retention`.
 
 **CLN-2. Runs can be deleted and pruned by hand; active ones cannot.**
-*From* `object-store-state.md` §11. *Covered* `server/test_api.py::test_delete_and_prune_runs`; `server/test_retention.py::test_pruning_a_skipped_run_deletes_what_its_attempt_wrote`.
+*From* `object-store-state.md` §11. *Covered* `contract/test_cln.py::test_cln_2_runs_are_deleted_and_pruned_by_hand_and_active_ones_are_not`; `server/test_retention.py::test_pruning_a_skipped_run_deletes_what_its_attempt_wrote`.
 
 **CLN-3. A deleted run is gone for good, and its late worker writes nothing.**
 *From* `object-store-state.md` §11. *Covered* `server/test_retention.py::test_a_run_retires_for_good_before_its_files_go`; `server/test_retention.py::test_a_deleted_run_takes_its_control_files_and_a_late_worker_writes_nothing`.
@@ -816,19 +816,19 @@ project no longer declares leaves the cleanup stuck, saying so.
 *From* D145, D96, D144 (2) (chain: D25 → D145). *Covered* `server/test_retirement.py::test_a_removed_outputs_files_go`; `server/test_retirement.py::test_a_moved_outputs_old_files_go_and_its_new_ones_stay`; `server/test_retirement.py::test_the_grace_period_is_the_stores_unless_the_output_says`; `server/test_retirement.py::test_a_store_that_says_nothing_keeps_a_removed_output_a_week`; `server/test_retirement.py::test_an_output_added_back_within_the_grace_period_keeps_its_new_data`; `server/test_retirement.py::test_a_cleanup_waits_for_a_reader_pinned_before_the_reset`; `server/test_retirement.py::test_a_custom_store_the_project_no_longer_declares_leaves_the_cleanup_stuck`.
 
 **CLN-7. Cleanup runs in the background; a run is settled before its cleanup is.**
-*From* D144 (2). *Covered* `server/test_collection.py::test_a_run_is_settled_before_its_cleanup_has_run`.
+*From* D144 (2). *Covered* `contract/test_cln.py::test_cln_7_a_run_is_settled_before_its_cleanup_is`; `server/test_collection.py::test_a_run_is_settled_before_its_cleanup_has_run`.
 
 **CLN-8. A cleanup that keeps failing is stuck and shown, not retried forever.**
-*From* `lifecycle.md` §9.8. *Covered* `server/test_collection.py::test_a_cleanup_task_that_keeps_failing_is_stuck_and_shown`.
+*From* `lifecycle.md` §9.8. *Covered* `contract/test_cln.py::test_cln_8_a_cleanup_that_keeps_failing_is_stuck_and_shown_not_retried_forever`; `server/test_collection.py::test_a_cleanup_task_that_keeps_failing_is_stuck_and_shown`.
 
 **CLN-9. A store root belongs to one namespace.**
 Staging's engine writing `s3://acme-solera/data`, owned by prod, is
 refused naming both. `solera adopt-store` moves it, refused while prod is
 live.
-*From* D167; F43. *Covered* `server/test_engine.py::test_a_data_root_another_namespace_owns_is_refused`; `server/test_cli.py::test_adopt_store_moves_a_root_once_its_namespace_is_retired`; `test_demo_e2e.py::test_the_demo_keeps_its_data_beside_its_state`.
+*From* D167; F43. *Covered* `contract/test_cln.py::test_cln_9_a_store_root_belongs_to_one_namespace`; `server/test_cli.py::test_adopt_store_moves_a_root_once_its_namespace_is_retired`; `test_demo_e2e.py::test_the_demo_keeps_its_data_beside_its_state`.
 
 **CLN-10. Sensor tick rows last a day; a tick that committed lasts as long as its run.**
-*From* `per-key-processing.md` §12. *Covered* `server/test_sensors.py::test_tick_rows_are_written_with_the_history_and_expire_after_a_day`.
+*From* `per-key-processing.md` §12. *Covered* `contract/test_cln.py::test_cln_10_sensor_ticks_last_a_day_and_a_tick_that_asked_for_a_run_lasts_with_it`; `server/test_sensors.py::test_tick_rows_are_written_with_the_history_and_expire_after_a_day`.
 
 **CLN-11. A paused consumer never loses its place to retention.**
 `tally` paused 40 days under a 30-day window: when it runs, it owes k2
@@ -840,32 +840,32 @@ live.
 **ENG-1. A launched attempt survives an engine restart, and commits once.**
 The engine restarts while `copy`'s attempt computes: the new engine
 adopts it (no relaunch) and commits its result.
-*From* `lifecycle.md` §12. *Covered* `server/test_fence.py::test_a_restarted_engine_adopts_and_commits_a_launched_attempt`; `server/test_model.py::test_restart_keeps_launched_claims`; `server/test_fence.py::test_an_attempt_whose_launch_was_cut_short_is_resumed`; sim `one_end_per_attempt`.
+*From* `lifecycle.md` §12. *Covered* `contract/test_eng.py::test_eng_1_a_launched_attempt_survives_a_restart_and_commits_once`; `server/test_fence.py::test_a_restarted_engine_adopts_and_commits_a_launched_attempt`; `server/test_model.py::test_restart_keeps_launched_claims`; `server/test_fence.py::test_an_attempt_whose_launch_was_cut_short_is_resumed`; sim `one_end_per_attempt`.
 
 **ENG-2. An attempt not yet durably launched leaves no trace.**
 The engine is replaced before the launch is durable: no worker was told,
 nothing was written, the next engine dispatches the task again.
-*From* F26. *Covered* `server/test_control_file.py::test_an_engine_fenced_before_its_launch_is_durable_tells_no_worker`; `server/test_sim_found.py::test_a_pool_attempt_is_offered_only_once_its_launch_is_durable`; `Attempt.tla` NoOrphanWrite.
+*From* F26. *Covered* pending in the contract (`tests/contract/entries.py`); `server/test_control_file.py::test_an_engine_fenced_before_its_launch_is_durable_tells_no_worker`; `server/test_sim_found.py::test_a_pool_attempt_is_offered_only_once_its_launch_is_durable`; `Attempt.tla` NoOrphanWrite.
 
 **ENG-3. Workers keep working through an engine outage.**
 A pool worker finishes while the engine is down; the restarted engine
 settles its result.
-*From* `lifecycle.md` §1. *Covered* `server/test_placements.py::test_a_pool_attempt_that_ended_while_the_engine_was_down_settles`.
+*From* `lifecycle.md` §1. *Covered* `contract/test_eng.py::test_eng_3_a_pool_worker_finishes_while_the_engine_is_down`; `server/test_placements.py::test_a_pool_attempt_that_ended_while_the_engine_was_down_settles`.
 
 **ENG-4. A new engine fences the old one; nothing acknowledged is lost.**
 A rolling deploy: B takes the namespace while A still runs. A stops acting
 at once; every event A acknowledged survives; A never deletes B's files.
-*From* D18, D86 (chain: D5 → D9 → D18); F7, F14, F15, F40. *Covered* `server/test_journal.py::test_a_new_engine_fences_the_old_one`; `server/test_fence.py::test_a_fenced_engine_halts_at_once_not_at_its_next_tick`; `server/test_fence.py::test_a_replaced_engine_stops_acting`; `server/test_sim_found.py::test_a_slow_new_engine_never_opens_without_acknowledged_events`; `server/test_keys.py::test_f40_a_zombies_orphan_collector_spares_the_serving_engines_layers`; `JournalObject.tla` NoAckedLoss, OneWriter.
+*From* D18, D86 (chain: D5 → D9 → D18); F7, F14, F15, F40. *Covered* `contract/test_eng.py::test_eng_4_a_new_engine_fences_the_old_one_and_loses_nothing_acknowledged`; `server/test_journal.py::test_a_new_engine_fences_the_old_one`; `server/test_fence.py::test_a_fenced_engine_halts_at_once_not_at_its_next_tick`; `server/test_fence.py::test_a_replaced_engine_stops_acting`; `server/test_sim_found.py::test_a_slow_new_engine_never_opens_without_acknowledged_events`; `server/test_keys.py::test_f40_a_zombies_orphan_collector_spares_the_serving_engines_layers`; `JournalObject.tla` NoAckedLoss, OneWriter.
 
 **ENG-5. State is rebuilt from what was recorded alone.**
 A replay of the recorded events equals the live engine.
-*From* `object-store-state.md` §3. *Covered* `server/test_model.py::test_the_journal_alone_reproduces_the_live_model`; `server/test_journal.py::test_replay_restores_state`; sim `_converge` (the journal alone rebuilds the state).
+*From* `object-store-state.md` §3. *Covered* `contract/test_eng.py::test_eng_5_a_restarted_engine_answers_every_read_as_before`; `server/test_model.py::test_the_journal_alone_reproduces_the_live_model`; `server/test_journal.py::test_replay_restores_state`; sim `_converge` (the journal alone rebuilds the state).
 
 **ENG-6. A worker started twice runs once.**
 Kubernetes starts two pods for one attempt: the first to own it runs; the
 other writes nothing, waits for the end, and its exit does not end the
 attempt.
-*From* `lifecycle.md` §4. *Covered* `server/test_lifecycle.py::test_a_duplicate_invocation_waits_for_the_owner_and_writes_nothing`; `server/test_lifecycle.py::test_a_duplicates_exit_does_not_end_the_owners_attempt`; `server/test_placements.py::test_pool_workers_race_for_a_claim`.
+*From* `lifecycle.md` §4. *Covered* `contract/test_eng.py::test_eng_6_a_worker_started_twice_runs_once`; `contract/test_eng.py::test_eng_6_pool_workers_racing_for_one_attempt_run_it_once`; `server/test_lifecycle.py::test_a_duplicate_invocation_waits_for_the_owner_and_writes_nothing`; `server/test_lifecycle.py::test_a_duplicates_exit_does_not_end_the_owners_attempt`; `server/test_placements.py::test_pool_workers_race_for_a_claim`.
 
 **ENG-7. A worker the engine gave up on cannot change what a newer one committed.**
 A worker paused for a minute wakes after its attempt was ended and retried:
@@ -885,36 +885,36 @@ of that partition wait for the repair.
 A malformed control file or result fails its attempt, retryably. A run
 config holding an integer past 64 bits is a 400. A malformed body is a
 422.
-*From* F27, F28, F30, F32. *Covered* `server/test_control_file.py::test_a_malformed_control_file_fails_its_attempt_and_is_ended`; `server/test_control_file.py::test_an_open_control_file_naming_a_worker_fails_its_attempt`; `server/test_fence.py::test_a_malformed_worker_result_is_settled_without_its_bad_parts`; `server/test_api.py::test_a_value_no_checkpoint_can_hold_is_a_400`; `server/test_api_bodies.py::test_a_malformed_body_on_a_raw_route_is_refused`.
+*From* F27, F28, F30, F32. *Covered* `contract/test_eng.py::test_eng_9_a_config_value_past_64_bits_is_a_400_and_the_engine_goes_on`; `contract/test_eng.py::test_eng_9_a_malformed_body_is_a_422_and_the_engine_goes_on`; `contract/test_eng.py::test_eng_9_a_malformed_control_file_fails_its_attempt_retryably`; `contract/test_eng.py::test_eng_9_a_malformed_worker_result_is_settled_without_its_bad_parts`; `server/test_control_file.py::test_a_malformed_control_file_fails_its_attempt_and_is_ended`; `server/test_control_file.py::test_an_open_control_file_naming_a_worker_fails_its_attempt`; `server/test_fence.py::test_a_malformed_worker_result_is_settled_without_its_bad_parts`; `server/test_api.py::test_a_value_no_checkpoint_can_hold_is_a_400`; `server/test_api_bodies.py::test_a_malformed_body_on_a_raw_route_is_refused`.
 
 **ENG-10. No hot loops.**
 Between external inputs the engine's ticks, events and requests stay
 within `burst + rate × elapsed`. No wake floor: each loop is fixed where
 it is.
-*From* D60, D81; F20. *Covered* sim "No hot loop" (`PACE`, `tests/sim/world.py`).
+*From* D60, D81; F20. *Covered* `contract/test_eng.py::test_eng_10_an_idle_engine_does_not_spin`; sim "No hot loop" (`PACE`, `tests/sim/world.py`).
 
 **ENG-11. A restart may stretch an attempt's timeout by one, never cut it short.**
-*From* `lifecycle.md` §8. *Covered* `server/test_fence.py::test_an_adopted_deadline_trusts_the_launching_clock_within_bounds`.
+*From* `lifecycle.md` §8. *Covered* `contract/test_eng.py::test_eng_11_a_restart_never_cuts_an_attempts_timeout_short_and_stretches_it_by_one_at_most`; `server/test_fence.py::test_an_adopted_deadline_trusts_the_launching_clock_within_bounds`.
 
 **ENG-12. A sensor tick in flight at a restart is forgotten; the sensor is due again from its cursor.**
-*From* `lifecycle.md` §11.5. *Covered* `server/test_sensors.py::test_late_and_pre_restart_ticks_get_409`.
+*From* `lifecycle.md` §11.5. *Covered* `contract/test_eng.py::test_eng_12_a_tick_in_flight_at_a_restart_is_forgotten_and_the_sensor_is_due_from_its_cursor`; `server/test_sensors.py::test_late_and_pre_restart_ticks_get_409`.
 
 **ENG-13. Writes wait while an output's upkeep is far behind.**
 Past the bound, attempts writing that output are held ("held: merges"),
 and a source commit to it is refused, retryable.
-*From* D64, D71. *Covered* `server/test_keys.py::test_writes_wait_while_an_outputs_merges_are_far_behind`; `server/test_keys.py::test_every_index_writer_waits_while_merges_are_far_behind`; `server/test_keys.py::test_writers_held_by_backpressure_go_on_once_a_merge_publishes`.
+*From* D64, D71. *Covered* `contract/test_eng.py::test_eng_13_a_source_commit_waits_while_its_upkeep_is_far_behind`; `contract/test_eng.py::test_eng_13_attempts_writing_an_output_wait_while_its_upkeep_is_far_behind`; `server/test_keys.py::test_writes_wait_while_an_outputs_merges_are_far_behind`; `server/test_keys.py::test_every_index_writer_waits_while_merges_are_far_behind`; `server/test_keys.py::test_writers_held_by_backpressure_go_on_once_a_merge_publishes`.
 
 **ENG-14. Upkeep that keeps failing backs off and alarms; it never stops for good.**
 An output's merges fail three times: it waits 10 minutes, doubling,
 alarmed, and tries again; an operator can clear the wait; merges cut short
 by the engine's own stop count for nothing.
-*From* D181 (Q13). *Covered* `server/test_keys.py::test_a_merge_that_keeps_failing_backs_off_and_resumes`; `server/test_keys.py::test_an_operator_clear_merges_at_once`; `server/test_keys.py::test_merges_the_engine_stops_count_for_nothing`.
+*From* D181 (Q13). *Covered* `contract/test_eng.py::test_eng_14_upkeep_that_keeps_failing_backs_off_alarms_and_tries_again`; `contract/test_eng.py::test_eng_14_an_operator_clear_merges_at_once`; `server/test_keys.py::test_a_merge_that_keeps_failing_backs_off_and_resumes`; `server/test_keys.py::test_an_operator_clear_merges_at_once`; `server/test_keys.py::test_merges_the_engine_stops_count_for_nothing`.
 
 **ENG-15. `SIGTERM` stops `solera serve` cleanly, exit 0.**
-*From* commit `4275ca0` (no ledger entry). *Covered* `server/test_serve.py::test_a_sigterm_stops_it_cleanly`.
+*From* commit `4275ca0` (no ledger entry). *Covered* `contract/test_eng.py::test_eng_15_a_sigterm_stops_solera_serve_cleanly`.
 
 **ENG-16. A namespace from an older state format is refused, naming the fix.**
-*From* D169. *Covered* `server/test_journal.py::test_a_namespace_of_another_state_format_is_refused`.
+*From* D169. *Covered* pending in the contract (`tests/contract/entries.py`); `server/test_journal.py::test_a_namespace_of_another_state_format_is_refused`.
 
 ## DEP — deploys and reload
 
@@ -979,12 +979,12 @@ keys the output lists, as written by its head.
 A replacement is the whole content; a patch changes only its keys; a key
 with zero rows does not exist; many rows of one key are its group; the
 same attempt writing again is one write.
-*From* `stores.md` (invariants 1–2); `per-key-processing.md` §6. *Covered* `sdk/test_store_conformance.py::test_shipped_stores_conform`; `server/test_keys.py::test_a_key_given_no_rows_does_not_exist`; `server/test_each.py::test_one_call_per_key_many_rows_one_write`.
+*From* `stores.md` (invariants 1–2); `per-key-processing.md` §6. *Covered* `contract/test_sto.py::test_sto_6_writes_mean_the_same_on_every_store`; `contract/test_sto.py::test_sto_6_a_key_given_no_rows_does_not_exist`; `contract/test_sto.py::test_sto_6_one_call_per_key_many_rows_one_write`; `sdk/test_store_conformance.py::test_shipped_stores_conform`.
 
 **STO-7. A key is stored as itself, or the write fails.**
 A Postgres `numeric` key column would read `1.0` back as `1`: the write
 fails. A `bytes` key fails the write rather than vanishing.
-*From* `versions.md` §4. *Covered* `server/test_keys.py::test_a_byte_valued_key_fails_the_write_instead_of_vanishing`.
+*From* `versions.md` §4. *Covered* `contract/test_sto.py::test_sto_7_a_byte_valued_key_fails_the_write_instead_of_vanishing`; `contract/test_sto.py::test_sto_7_a_key_its_column_would_change_fails_the_write`; `sdk/test_postgres.py::test_a_key_is_stored_as_itself`.
 
 ## Contradictions, gaps and open questions
 
