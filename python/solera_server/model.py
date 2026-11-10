@@ -202,7 +202,11 @@ class Model:
             data["core_empty"] = _nest(self.core_empty, 3)
         return copy.deepcopy(data) if copied else data
 
-    def restore(self, snap: dict | None) -> None:
+    def restore(self, snap: dict | None, core: bool = False) -> None:
+        """Load a snapshot (None: the empty state). `core`: the namespace is
+        written on the new tracking core, so the model has a core even before
+        its first core event, as the engine that wrote it had."""
+
         snap = copy.deepcopy(snap) if snap else {}
         # durable
         self.event_counter: int = snap.get("event_counter") or 0
@@ -270,7 +274,9 @@ class Model:
         # changed only by the core events this model applies, and the ids it knows things by.
         # (output, partition) -> the core's id of that output's current life; (asset,
         # partition, input) -> the core's id of that edge. Renames move them; a reset drops them.
-        self.core: Tracking | None = Tracking.restore(b64decode(snap["core"])) if "core" in snap else None
+        self.core: Tracking | None = (
+            Tracking.restore(b64decode(snap["core"])) if "core" in snap else Tracking() if core else None
+        )
         self.core_outputs: dict[tuple, str] = _flatten(snap.get("core_outputs"), 2)
         self.core_edges: dict[tuple, str] = _flatten(snap.get("core_edges"), 3)
         # (asset, partition, input) -> the key past which the edge holds nothing since it last

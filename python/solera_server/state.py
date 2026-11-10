@@ -36,7 +36,7 @@ from solera import lifecycle
 from solera.objects import create
 from solera.tasks import Tasks
 
-from .journal import FORMAT, Journal, Stopped, encode
+from .journal import CORE_FORMAT, FORMAT, Journal, Stopped, encode
 from .model import Model
 
 log = logging.getLogger(__name__)
@@ -132,7 +132,12 @@ class State:
         )
         # Encoded at once, under the flusher's lock: no copy needed (docs/journal-object.md).
         await journal.open(
-            model.restore, model.apply, lambda: model.snapshot(copied=False), writer=writer, format=format
+            # Restored as the format the journal was read in says (set before any event applies).
+            lambda snap: model.restore(snap, core=journal.format == CORE_FORMAT),
+            model.apply,
+            lambda: model.snapshot(copied=False),
+            writer=writer,
+            format=format,
         )
         return cls(
             store,

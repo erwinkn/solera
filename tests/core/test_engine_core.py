@@ -227,3 +227,33 @@ async def test_an_engine_on_the_other_path_is_refused_before_it_fences_the_runni
     after = await journal()
     assert (after["engine"], after["epoch"]) == (before["engine"], before["epoch"])
     await ex.feed({"k2": "1"})  # the running engine still writes
+
+
+async def test_a_journal_without_a_checkpoint_replays_into_the_model_that_wrote_it(solera, tmp_path):
+    """Events before a namespace's first core event are replayed on the new
+    path too: today's cleanup bookkeeping, which the new path skips, stays
+    empty, so a successor never cleans up what the live engine kept."""
+
+    from solera.sdk import Output, Project, asset
+    from solera.stores import FileStore
+    from solera_server.state import State
+
+    @asset
+    def value():
+        return {"n": 1}
+
+    @asset(outputs=Output("items", key="id"))
+    def items():
+        return [{"id": "k", "v": "1"}]
+
+    await solera.deploy(Project(assets=[value, items], default_store=FileStore(tmp_path / "data")))
+    await solera.run("value")
+    await solera.run("value")  # today's path would queue the first version's cleanup
+    await solera.run("items")  # the journal's first core event comes after
+    await solera.state.durable()
+    assert solera.state.journal.checkpoint is None and solera.engine.m.cleanups == {}
+    replayed = await State.open((tmp_path / "state").as_uri(), "contract", writer=False)
+    try:
+        assert replayed.model.cleanups == {} and replayed.model.core is not None
+    finally:
+        await replayed.close()
