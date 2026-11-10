@@ -738,7 +738,7 @@ flight when the full run began holds back every key it loaded at another
 version than it planned; those keys stay owed. An input may opt
 out of the gate to read partial data. A full run canceled or failed
 midway raises an alarm, and one command lets downstream proceed.
-*From* P12; the full-run verdict (form (a), SOLE-7, solera#15); review F2. *Today* readers run over a half-rebuilt upstream. *Covered* `contract/test_sta.py::test_sta_13_every_reader_of_an_incomplete_upstream_waits_until_its_full_run_completes`; `contract/test_sta.py::test_sta_13_a_full_run_canceled_midway_holds_its_readers_and_raises_an_alarm`; `contract/test_sta.py::test_sta_13_on_a_table_a_batch_in_flight_holds_back_keys_it_loaded_at_another_version`.
+*From* P12; the full-run verdict (form (a), SOLE-7, solera#15); review F2. *Today* readers run over a half-rebuilt upstream. *Covered* `contract/test_sta.py::test_sta_13_every_reader_of_an_incomplete_upstream_waits_until_its_full_run_completes`; `contract/test_sta.py::test_sta_13_a_full_run_canceled_midway_holds_its_readers_and_raises_an_alarm`; `contract/test_sta.py::test_sta_13_on_a_table_a_batch_in_flight_holds_back_keys_it_loaded_at_another_version`. The opt-out and the command that lets downstream proceed have no public name yet, so they are tested once the core names them.
 
 **STA-14. No false alarms: a partition is stale only if something is due; changes that cancel out start nothing.**
 `feed`'s k1 goes v1 → v2 → v1: `items` is stale while k1 is at v2 and
