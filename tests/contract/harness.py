@@ -582,13 +582,13 @@ class Solera:
                 raise AssertionError(f"serve never listened: {process.communicate()[1][-2000:]}")
             await asyncio.sleep(0.1)
 
-    async def cli(self, *argv: str):
+    async def cli(self, *argv: str, timeout: float = 120):
         """The `solera` CLI on this namespace, as an operator runs it: its exit
-        code, stdout and stderr. Its entry point runs in this process, in a
-        thread of its own: a `solera` process can crash as it exits, after
-        its work is done (a SIGSEGV in about 1 in 30 runs of `solera migrate`)."""
+        code, stdout and stderr; fails past `timeout` seconds. Its entry
+        point runs in this process, in a thread of its own, not as a
+        `solera` process: such a process can crash as it exits, its work
+        done (exit 139, a SIGSEGV, in about 2 of 60 runs of `solera migrate`)."""
 
-        import contextlib
         import io
         import sys
         import traceback
@@ -598,24 +598,26 @@ class Solera:
         command = ["solera", "--state-url", (self.root / "state").as_uri(), "--namespace", "contract", *argv]
 
         def run():
-            out, err, code, argv_ = io.StringIO(), io.StringIO(), 0, sys.argv
-            sys.argv = command
+            out, err, code = io.StringIO(), io.StringIO(), 0
+            saved = sys.argv, sys.stdout, sys.stderr
+            sys.argv, sys.stdout, sys.stderr = command, out, err
             try:
-                with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-                    try:
-                        main()
-                    except SystemExit as exit:
-                        if isinstance(exit.code, str):
-                            print(exit.code, file=sys.stderr)
-                        code = exit.code if isinstance(exit.code, int) else int(exit.code is not None)
-                    except Exception:
-                        traceback.print_exc()
-                        code = 1
+                main()
+            except SystemExit as exit:
+                if isinstance(exit.code, str):
+                    print(exit.code, file=err)
+                code = exit.code if isinstance(exit.code, int) else int(exit.code is not None)
+            except Exception:
+                traceback.print_exc(file=err)
+                code = 1
             finally:
-                sys.argv = argv_
+                sys.argv, sys.stdout, sys.stderr = saved
             return code, out.getvalue(), err.getvalue()
 
-        return await asyncio.to_thread(run)
+        try:
+            return await asyncio.wait_for(asyncio.to_thread(run), timeout)
+        except TimeoutError:
+            raise AssertionError(f"solera {' '.join(argv)} did not return within {timeout} s") from None
 
     def watch_state(self):
         """What the namespace's storage is asked from here on, as its disk
