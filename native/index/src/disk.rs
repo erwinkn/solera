@@ -39,9 +39,11 @@ struct DiskState {
     /// Paths being filled, and the bytes set aside for them.
     filling: HashSet<String>,
     reserved: u64,
-    /// Fills that failed: when, and how many times in a row. Not tried again
-    /// for a minute, doubling with each failure up to about an hour. At most
-    /// `FAILED` are remembered.
+    /// Fills that failed, and copies dropped because they could not be read:
+    /// when, and how many times. Not filled again for a minute, doubling with
+    /// each failure up to about an hour, so that a layer damaged in the store
+    /// is not downloaded again after every read. A fill that succeeds does
+    /// not reset the count. At most `FAILED` are remembered.
     failed: HashMap<String, (std::time::Instant, u32)>,
 }
 
@@ -69,6 +71,23 @@ fn unname(n: &str) -> String {
 }
 
 impl DiskState {
+    /// Note one more failure of `path`, within the bound.
+    fn fail(&mut self, path: &str) {
+        let n = self.failed.get(path).map_or(0, |&(_, n)| n + 1);
+        if n == 0 && self.failed.len() >= FAILED {
+            self.failed.retain(|_, &mut (t, n)| t.elapsed() < backoff(n));
+            let oldest = self.failed.iter().min_by_key(|(_, &(t, _))| t);
+            if let Some(p) = oldest
+                .filter(|_| self.failed.len() >= FAILED)
+                .map(|(p, _)| p.clone())
+            {
+                self.failed.remove(&p);
+            }
+        }
+        self.failed
+            .insert(path.to_string(), (std::time::Instant::now(), n));
+    }
+
     fn touch(&mut self, path: &str) -> bool {
         let Some(e) = self.files.get_mut(path) else {
             return false;
@@ -159,13 +178,14 @@ impl Disk {
         self.st.lock().unwrap().touch(path)
     }
 
-    /// Drop a file that could not be read.
+    /// Drop a file that could not be read; it is not filled again for a while.
     pub(crate) fn forget(&self, path: &str) {
         let mut st = self.st.lock().unwrap();
         if let Some((size, tick)) = st.files.remove(path) {
             st.order.remove(&tick);
             st.total -= size;
         }
+        st.fail(path);
         let _ = std::fs::remove_file(self.file(path));
     }
 
@@ -227,19 +247,7 @@ impl Disk {
         let mut st = self.st.lock().unwrap();
         if st.filling.remove(path) {
             st.reserved -= size;
-            let n = st.failed.get(path).map_or(0, |&(_, n)| n + 1);
-            if n == 0 && st.failed.len() >= FAILED {
-                st.failed.retain(|_, &mut (t, n)| t.elapsed() < backoff(n));
-                let oldest = st.failed.iter().min_by_key(|(_, &(t, _))| t);
-                if let Some(p) = oldest
-                    .filter(|_| st.failed.len() >= FAILED)
-                    .map(|(p, _)| p.clone())
-                {
-                    st.failed.remove(&p);
-                }
-            }
-            st.failed
-                .insert(path.to_string(), (std::time::Instant::now(), n));
+            st.fail(path);
         }
     }
 
@@ -293,7 +301,6 @@ impl Disk {
         if st.filling.remove(path) {
             st.reserved -= size;
         }
-        st.failed.remove(path);
         drop(st);
         self.add(path, size);
         Ok(())

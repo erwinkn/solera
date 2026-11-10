@@ -637,6 +637,14 @@ impl Keyed {
         }
     }
 
+    /// The commits its pieces are at.
+    pub fn commits(&self) -> impl Iterator<Item = u64> + '_ {
+        self.values.iter().filter_map(|v| match v {
+            Value::At(c, _) => Some(*c),
+            _ => None,
+        })
+    }
+
     pub fn piece_count(&self) -> usize {
         self.values.len()
     }
@@ -1192,6 +1200,13 @@ impl BatchProgress {
         }
         if read_digest(k, self.reset, &self.range) != self.expect {
             return invalid("the edge's progress moved since the batch was planned");
+        }
+        if let Some(Value::At(h, _)) = &self.piece {
+            let input = &t.edges[&self.edge].input;
+            let floor = t.outputs.get(input).and_then(|o| o.layers.first()?.floor);
+            if floor.is_some_and(|f| f > *h) {
+                return invalid("the input's layers no longer reach back to the batch's head: a merge folded past it");
+            }
         }
         if let Some((output, head)) = &self.fence {
             if *t.edges[&self.edge].input != **output {
