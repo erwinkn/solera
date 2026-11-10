@@ -466,9 +466,11 @@ impl Tracking {
     /// What committing a plan writes to progress, from what the worker
     /// reports per keyed input: (failed keys, (key, version) loaded at
     /// another version than planned), each sorted. Returns the event, the
-    /// batch records, and per keyed input the keys it held back (loaded at
-    /// another version than planned while upstream was mid full run or after
-    /// a clear since the plan): they keep what they held.
+    /// batch records, and per keyed input the keys it held back: on an input
+    /// mid full run or cleared since the plan, a key loaded at another version
+    /// than planned, or one another input took that this input's patterns
+    /// take; held back on every input, they keep what they held. A report
+    /// names only keys its own input took.
     #[pyo3(signature = (plan, reports, producer=Vec::new(), output_commit=None))]
     fn progress_ops<'py>(
         &self,

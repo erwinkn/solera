@@ -529,10 +529,13 @@ these additions:
   every key it loaded at another version than it planned while its input's
   output is mid full run (`Output.full_run`, B4) or when a clear came in
   since the batch's head (the layers' `clears`): the key keeps what it held,
-  even if it also failed, and stays owed. On such an input it also holds
-  back every key of the batch that input did not take (another input did):
-  the worker loaded it there with no planned version to check the load
-  against. A key held back on one input is held back on every input of the
+  even if it also failed. A key that was owed stays owed; one taken
+  unchanged (by mode all or a key list) already holds what is current. On
+  such an input it also holds back every key of the batch that the input's
+  patterns take but the input did not (another input did): the worker
+  loaded it there with no planned version to check the load against. A key
+  the input's patterns do not take is not loaded there, so it is not held
+  back for that input. A key held back on one input is held back on every input of the
   batch, since its output is one value computed from all of them.
   `Ops.held_back` names those keys for the key outcomes (B6), and their
   points carry their own reason, `Unsettled`, apart from the planner's
@@ -1240,16 +1243,19 @@ upstream's clear still makes its consumer run full (INC-13 stays).
    than it planned, if its upstream is incomplete, **or if a clear has
    come since the batch planned** (in the commits after its head H), even
    when that rebuild has completed by the time the batch commits. The key
-   keeps its old point and stays owed; a later batch retries it. A key held
-   back on any input of a batch is held back on every input of that batch,
+   keeps its old point and stays owed; a later batch retries it. On an
+   incomplete upstream, a key that another input of the batch took and
+   whose version on this one the batch never planned is held back too,
+   when this input's patterns take it: its load here cannot be checked. A
+   key held back on any input of a batch is held back on every input of that batch,
    because the key's output is one value computed from all its inputs:
    holding it back on one input only would either keep an output built on
    a load from the middle of a rebuild, or throw that output away while the
    other inputs record their new versions as processed, so the key would
    never be retried for them. On stores that name objects by version a load
    is exact, so this never fires. On a table it is the same rule as §8's
-   rule 4, and is built as one rule with it. To tell which rebuild, if any, a key loaded as absent belongs to,
-   the engine looks at the commit that last removed it (by a clear or by
+   rule 4, and is built as one rule with it. To tell which rebuild, if any,
+   a key loaded as absent belongs to, the engine looks at the commit that last removed it (by a clear or by
    an ordinary removal): the last removal at or before H when the batch
    planned the key absent, and, only on a table for a key planned present
    that loads absent, the last removal at load time. It records this when
