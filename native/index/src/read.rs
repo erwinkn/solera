@@ -28,7 +28,7 @@ type Fetch = tokio::task::JoinHandle<Result<Vec<Cached>>>;
 #[derive(Default, Clone, Debug)]
 pub struct KeyList {
     buf: Vec<u8>,
-    end: Vec<u32>,
+    end: Vec<usize>,
 }
 
 impl KeyList {
@@ -40,7 +40,7 @@ impl KeyList {
         let mut l = KeyList::default();
         for i in ix {
             l.buf.extend_from_slice(keys[i].as_ref());
-            l.end.push(l.buf.len() as u32);
+            l.end.push(l.buf.len());
         }
         l
     }
@@ -54,8 +54,8 @@ impl KeyList {
     }
 
     pub fn get(&self, i: usize) -> &[u8] {
-        let a = if i == 0 { 0 } else { self.end[i - 1] as usize };
-        &self.buf[a..self.end[i] as usize]
+        let a = if i == 0 { 0 } else { self.end[i - 1] };
+        &self.buf[a..self.end[i]]
     }
 }
 
