@@ -98,6 +98,7 @@ impl Log {
                 layers: self.layers.clone(),
                 head: c,
                 live: self.states.last().unwrap().len() as u64,
+                full_run: None,
             },
         );
         true
