@@ -183,7 +183,9 @@ async def test_his_2_a_task_waits_only_while_it_could_run(solera):
 
 async def test_his_4_a_commit_row_names_the_batch_that_made_it(solera):
     """`batch` on a history commit row is `{index, count}` of the attempt
-    that committed it, with `final` on the last: null for an unbatched task."""
+    that committed it, with `final` on the last: null for an unbatched task.
+    `count` is the batches planned, an estimate (INC-10): only its presence
+    is checked."""
 
     @asset(outputs=Output("files", key="id"))
     def files():
@@ -196,6 +198,7 @@ async def test_his_4_a_commit_row_names_the_batch_that_made_it(solera):
     await solera.deploy(Project(assets=[files, copy]))
     await solera.run("copy", upstream=True)
     copies = sorted(await commits(solera, "copy"), key=lambda r: r["generation"])
-    assert [r["batch"] for r in copies] == [{"index": i, "count": 3} for i in range(3)]
+    assert [r["batch"]["index"] for r in copies] == [0, 1, 2]
+    assert all(set(r["batch"]) == {"index", "count"} for r in copies)
     assert [r["final"] for r in copies] == [False, False, True]
     assert [r["batch"] for r in await commits(solera, "files")] == [None]

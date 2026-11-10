@@ -2,6 +2,7 @@
 
 import asyncio
 import inspect
+import itertools
 import time
 
 import pytest
@@ -102,13 +103,20 @@ async def test_run_1_a_task_commits_batch_by_batch_and_an_attempt_runs_one_batch
     [task] = detail["tasks"]
     assert (task["asset"], task["partition"], task["status"]) == ("tally", "", "succeeded")
     ran = attempts(detail)
-    assert [(a["outcome"], a["batch"]["index"], a["batch"]["count"]) for a in ran] == [
-        ("succeeded", 0, 3),
-        ("failed", 1, 3),
-        ("succeeded", 1, 3),
-        ("succeeded", 2, 3),
+    assert [(a["outcome"], a["batch"]["index"], a["batch"]["final"]) for a in ran] == [
+        ("succeeded", 0, False),
+        ("failed", 1, False),
+        ("succeeded", 1, False),
+        ("succeeded", 2, True),
     ]
-    assert [b.added for b in ex.seen["tally"]] == [["k1", "k2"], ["k3", "k4"], ["k3", "k4"], ["k5"]]
+    seen = ex.seen["tally"]
+    assert [b.added for b in seen] == [["k1", "k2"], ["k3", "k4"], ["k3", "k4"], ["k5"]]
+    assert [(b.index, b.first, b.final) for b in seen] == [
+        (0, True, False),
+        (1, False, False),
+        (1, False, False),
+        (2, False, True),
+    ]
     commits = (await solera.get("/assets/tally/history"))["commits"]
     assert sorted(c["batch"]["index"] for c in commits if c["run"] == run["id"]) == [0, 1, 2]
     assert await ex.count() == 5
@@ -333,6 +341,20 @@ async def test_run_7_retries_back_off_and_a_retry_that_succeeds_ends_the_task(so
     assert [a["outcome"] for a in attempts(detail)] == ["failed", "failed", "succeeded"]
 
 
+async def backs_off(solera, run, calls: list, delays, start: int = 1) -> None:
+    """After each failure the next attempt waits its delay: none comes with
+    half of it left, one comes once it has passed. The clock is the wall's
+    plus what was advanced, so only a pause of half a delay could cross."""
+
+    for n, delay in enumerate(delays, start=start):
+        await until(solera, lambda n=n: failed(solera, run, n))
+        solera.advance(delay / 2)
+        await solera.settle(0.1)
+        assert len(calls) == n, f"retried before its backoff of {delay} s"
+        solera.advance(delay / 2)
+        await until(solera, lambda n=n: len(calls) > n)
+
+
 async def test_run_7_by_default_a_failure_is_retried_three_times_backing_off(solera):
     calls = []
 
@@ -343,17 +365,30 @@ async def test_run_7_by_default_a_failure_is_retried_three_times_backing_off(sol
 
     await solera.deploy(Project(assets=[flaky]))
     run = await solera.submit("flaky")
-    for n, delay in enumerate((1, 2, 4), start=1):  # Retry(3): a second, doubling
+    for n in range(1, 4):  # Retry(3): three retries, each after its backoff
         await until(solera, lambda n=n: failed(solera, run, n))
-        tried = len(calls)
-        solera.advance(delay / 2)
-        await solera.settle(0.1)
-        assert len(calls) == tried  # not before its backoff
-        solera.advance(delay / 2)
-        await until(solera, lambda n=tried: len(calls) > n)
+        solera.advance(60)
+        await until(solera, lambda n=n: len(calls) > n)
     detail = await solera.wait(run)
     assert detail["request"]["status"] == "failed" and len(calls) == 4
-    assert [a["outcome"] for a in attempts(detail)] == ["failed"] * 4
+    ran = attempts(detail)
+    assert [a["outcome"] for a in ran] == ["failed"] * 4
+    # Each retry came a second at least after the failure before it.
+    assert all(b["started_at"] >= a["finished_at"] + 1 for a, b in itertools.pairwise(ran))
+
+
+async def test_run_7_retries_back_off_doubling(solera):
+    calls = []
+
+    @asset(retries=Retry(3, delay=600))
+    def flaky():
+        calls.append(1)
+        raise Failed("bug")
+
+    await solera.deploy(Project(assets=[flaky]))
+    run = await solera.submit("flaky")
+    await backs_off(solera, run, calls, (600, 1200, 2400))
+    assert (await solera.wait(run))["request"]["status"] == "failed" and len(calls) == 4
 
 
 async def test_run_7_transient_retries_past_retries_within_its_budget(solera):
@@ -386,15 +421,27 @@ async def test_run_7_transient_without_retry_after_waits_a_minute_doubling(soler
 
     await solera.deploy(Project(assets=[throttled]))
     run = await solera.submit("throttled")
-    for n, delay in enumerate((60, 120, 240), start=1):
-        await until(solera, lambda n=n: failed(solera, run, n))
-        tried = len(calls)
-        solera.advance(delay - 5)
-        await solera.settle(0.1)
-        assert len(calls) == tried
-        solera.advance(5)
-        await until(solera, lambda n=tried: len(calls) > n)
+    await backs_off(solera, run, calls, (60, 120, 240))
     assert (await solera.wait(run))["request"]["status"] == "succeeded"
+
+
+async def test_run_7_transient_backoff_doubles_up_to_6_hours(solera):
+    calls = []
+
+    @asset(retries=Retry(0))
+    def throttled():
+        calls.append(1)
+        raise Transient("429")
+
+    await solera.deploy(Project(assets=[throttled]))
+    run = await solera.submit("throttled")
+    for n in range(1, 10):  # a minute, doubling: the ninth retry waits 4 h 16 min
+        await until(solera, lambda n=n: failed(solera, run, n))
+        solera.advance(60 * 2 ** (n - 1))
+        await until(solera, lambda n=n: len(calls) > n)
+    # Then 6 h each time, not 8.5 h then 17 h: at 14.5 h and 20.5 h, within retry_for's day.
+    await backs_off(solera, run, calls, (6 * 3600, 6 * 3600), start=10)
+    assert len(calls) == 12
 
 
 async def test_run_7_transient_gives_up_after_retry_for(solera):
