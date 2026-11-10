@@ -12,7 +12,11 @@
 //! - a failure whose input returns to what the consumer holds is moot;
 //! - counts by outcome match the records; snapshots round-trip.
 //!
-//! `OUTCOME_SEEDS` sets how many histories run.
+//! The multi-input histories give one consumer two keyed inputs, with
+//! retries on either input taken on both (`due::plan_all`), during full
+//! runs and clears of the other.
+//!
+//! `OUTCOME_SEEDS` and `MULTI_SEEDS` set how many histories run.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;

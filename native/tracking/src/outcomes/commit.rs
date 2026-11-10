@@ -494,12 +494,20 @@ pub async fn commit(
         at: v.failures.head,
         look: made.map(|_| (looked, caught_up)),
         life: v.per_key.life,
-        // A held-back key was not retried: it waits for its retry again, so
-        // it lowers what the pass covers like a record written.
+        // A key held back while this input read it as planned (another
+        // input moved) was not retried and its input has not moved: it
+        // waits for its retry again, so it lowers what the pass covers like
+        // a record written. One read at another version comes back with its
+        // change, or the catch-up lowers it when the input returns.
         low: next
             .values()
             .flatten()
-            .chain(held_back.iter().filter_map(|k| priors.get(k)))
+            .chain(
+                held_back
+                    .iter()
+                    .filter(|k| loaded.binary_search_by(|(x, _)| x.cmp(k)).is_err())
+                    .filter_map(|k| priors.get(k)),
+            )
             .fold(None, |mut low, r| {
                 cover(&mut low, &r.stored);
                 low
