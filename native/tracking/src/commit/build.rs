@@ -166,7 +166,11 @@ pub async fn build(
     let Some(layer) = e.w.finish().await? else {
         return Ok(None);
     };
-    let cleared = if spec.mode == Mode::Clear { out.live } else { 0 };
+    let cleared = if spec.mode == Mode::Clear {
+        out.live
+    } else {
+        0
+    };
     let removed = e.removed + cleared;
     Ok(Some(Built {
         part: OutputCommit {
