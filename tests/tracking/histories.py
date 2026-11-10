@@ -127,8 +127,20 @@ CALIBRATIONS = {
     ],
     # Stores that write in place, with late and dead writers (review F1, recs 1 to 5).
     ("fullrun", "clear", "table", "fence"): [("items", (("k1", True),)), ("plan", "copy", 2), ("restart",)],
-    ("fullrun", "clear", "table", "open_txn"): [("keys", "copy", ("k4",)), ("restart",)],
-    ("fullrun", "clear", "table", "repair"): [("plan", "copy", 2), ("restart",)],
+    ("fullrun", "clear", "table", "open_txn"): [
+        ("items", (("k1", True),)),
+        ("plan", "copy", 1),
+        ("restart",),
+        ("items", (("k1", False),)),
+        ("late", "copy"),
+    ],
+    ("fullrun", "clear", "table", "repair"): [
+        ("items", (("k1", True),)),
+        ("plan", "copy", 1),
+        ("write", "copy"),
+        ("giveup", "copy"),
+        ("items", (("k1", False),)),
+    ],
     ("fullrun", "clear", "table", "repair_removals"): [
         ("items", (("k1", True), ("k2", True), ("k3", True))),
         ("step", "copy", 3),

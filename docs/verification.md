@@ -1345,16 +1345,17 @@ its log exactly.
 **The cut, cleanup and lineage** (`fullrun.py`, §12, §13). Each committed batch
 writes a record per edge: its range, head, conditions, the replaced slice
 (pieces and points), keys processed outside the range (a key list, a repair),
-deviations, held-back keys, and a digest of what it processed. Lineage
+deviations, held-back keys, and a digest of what it processed: every key that
+changed, and every key a key list or a repair named, changed or not. Lineage
 recomputes the batch's input from the record alone, through the index, and
 must equal the digest, at the commit and after every merge. A merge folds a
 log at the single cut, the oldest of the retained records' heads and replaced
 pieces, the live pieces, the cleanup cursor and the heads live attempts
 planned at; a query below the base fails the history. On file stores, cleanup
 deletes what commit r replaced once r is at or below the oldest head a live
-attempt holds, and an abandoned attempt's objects by version (CLN-5). No
-attempt loads a deleted object, and once quiet cleanup leaves nothing but the
-current objects. Records leave history by a `retire` event, oldest first.
+attempt holds, and an abandoned attempt's objects by version (CLN-5). Cleanup
+never deletes an object the log's head holds, nor one a live attempt planned
+to load, and once quiet the objects left are exactly the log's. Records leave history by a `retire` event, oldest first.
 
 **Calibration.** Every rule is named (`RULES` in each module) and has a
 history in `histories.py` that passes with every rule on and fails with that
@@ -1372,7 +1373,13 @@ design and the amendments are switched off by `ADDED`; each is a finding:
 | full runs | `repair_removals`: the repair also redoes the keys the dead attempts' specs named, not only the rows it finds by version | a dead attempt's delete leaves no row to list: the log keeps a key the table lost |
 | full runs | `cut_attempts`: the cut also holds the head every live attempt planned at | a consumer with no piece at a commit yet (it has processed nothing) plans at c0, a merge folds c0, and its commit's record and new piece name a folded commit |
 
-Two of the five recommendations are less than they seem. `repair_at_once` (a
+The invariants are physical: they compare the table with the log, not the
+model's own record of which attempts died. So three of the rules bite rarely
+in random histories (3,000 on tables: `repair` 13, `repair_at_once` 1,
+`open_txn` 0), and each has a calibration where a dead or late writer's row
+outlives the log for good. `open_txn` bites only when the attempt after one
+given up on has nothing to write and the late writer lands first: without the
+transaction nothing repairs the row. `repair_at_once` (a
 dead attempt makes its producer owed) bites only when the dead attempt's keys
 stop being owed on their own, for instance when upstream removes a key the
 dead attempt added; otherwise the keys it did not commit are still owed and

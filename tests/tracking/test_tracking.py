@@ -365,3 +365,37 @@ def test_a_reader_holds_back_a_row_no_commit_recorded():
 def test_an_empty_key_list_processes_nothing():
     w = oracle.replay_fullrun([("items", (("k1", True),)), ("keys", "copy", ()), ("commit", "copy")])
     assert oracle.holds(w, "copy") == {} and oracle.due(w, "copy") == ["k1"]
+
+
+@pytest.mark.parametrize("rule", ["open_txn", "repair"])
+def test_a_dead_writers_row_outlives_the_log_without_its_rule(rule):
+    events = CALIBRATIONS[("fullrun", "clear", "table", rule)]
+    assert fullrun.run(events, "clear", "table") is None
+    r = fullrun.run(events, "clear", "table", frozenset({rule}))
+    assert r is not None and r[1] == "at rest copy's log says {}, its store {k1@1}"
+
+
+def test_lineage_needs_the_keys_a_key_list_names(monkeypatch):
+    events = [("items", (("k1", True),)), ("step", "copy", 1), ("keys", "copy", ("k1",)), ("commit", "copy")]
+    assert fullrun.run(events, "clear", "file") is None
+    record = fullrun.World.record
+
+    def unlisted(self, rec):
+        rec.listed = {}
+        record(self, rec)
+
+    monkeypatch.setattr(fullrun.World, "record", unlisted)
+    r = fullrun.run(events, "clear", "file")
+    assert r is not None and "lineage" in r[1]
+
+
+def test_cleanup_never_deletes_a_current_file(monkeypatch):
+    events = [("items", (("k1", True),)), ("step", "copy", 1), ("cleanup", "copy")]
+    assert fullrun.run(events, "clear", "file") is None
+
+    def everything(self):
+        self.output.deleted |= set(self.output.objects)
+
+    monkeypatch.setattr(fullrun.Ordinary, "cleanup", everything)
+    r = fullrun.run(events, "clear", "file")
+    assert r is not None and "deleted" in r[1]

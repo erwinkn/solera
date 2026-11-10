@@ -178,15 +178,23 @@ def replaced(prog: Progress, lo: str, hi: str) -> tuple[list, dict]:
     return pieces, {k: v for k, v in prog.points.items() if within(k, lo, hi)}
 
 
-def processed(prior: dict, now: dict) -> list[tuple]:
+def processed(prior: dict, now: dict, listed: dict) -> list[tuple]:
+    """What a batch processed on one edge: every key that changed, and every key
+    it was given by name (a key list, a repair), changed or not."""
     return [
         (
             k,
             None if now[k] is ABSENT else now[k][0],
-            "added" if p is ABSENT else "removed" if now[k] is ABSENT else "updated",
+            "unchanged"
+            if now[k] == p
+            else "added"
+            if p is ABSENT
+            else "removed"
+            if now[k] is ABSENT
+            else "updated",
         )
         for k, p in sorted(prior.items())
-        if now[k] != p
+        if now[k] != p or k in listed
     ]
 
 
@@ -204,7 +212,7 @@ def lineage(rec: Record) -> list[tuple]:
     prior = {k: p.decode(k) for k in keys} | rec.listed
     prior = {k: v for k, v in prior.items() if k not in rec.held_back}
     now = {k: rec.deviations[k] if k in rec.deviations else p.wanted(k, rec.H, rec.cond) for k in prior}
-    return processed(prior, now)
+    return processed(prior, now, rec.listed)
 
 
 def obs(log: Log, k: str, c: int, cond: Cond) -> object:
@@ -500,7 +508,7 @@ class Ordinary:
                     listed,
                     {},
                     frozenset(),
-                    processed(prior, now),
+                    processed(prior, now, listed),
                 )
             )
             results = {k: obs(log, k, s.heads[i], s.cond) for k in s.taken}
@@ -719,7 +727,7 @@ class Mirror:
                 {},
                 {k: v for k, v in results.items() if v != planned[k]},
                 frozenset(kept),
-                processed(prior, results),
+                processed(prior, results, {}),
             )
         )
         self.progress.commit_batch(s.heads[0], s.lo, s.hi, s.cond, results, kept)
@@ -972,6 +980,13 @@ class World:
             for k in sorted(set(state) | set(out.rows)):
                 if (r.version if (r := out.rows.get(k)) else ABSENT) != state.get(k) and k not in excused:
                     return f"{a.name}'s log says {_k(k)}@{state.get(k)}, its store {_rows(out.rows)}"
+            if out.kind == "file":
+                needed = [out.log.head] + [
+                    m.pending.heads[0] for m in (self.archive, self.report) if m.src is out and m.pending
+                ]
+                needed += [s.own_head] if s is not None else []
+                if gone := sorted({o for c in needed for o in out.log.states[c].items()} & out.deleted):
+                    return f"cleanup of {a.name} deleted {gone}, which the log or an attempt still needs"
             for c in range(out.log.base, out.log.head + 1):
                 if out.log.scan(c) != out.log.states[c]:
                     return f"{a.name}'s scan at #{c} differs from its state"
@@ -1024,13 +1039,13 @@ class World:
         for a in (self.copy, self.tally):
             a.cleanup()
             out = a.output
-            left = {
-                (k, v) for k, v in out.objects if (k, v) not in out.deleted and out.log.states[-1].get(k) != v
-            }
-            if out.kind == "file" and left:
-                return f"at rest cleanup of {a.name} left {sorted(left)}"
-            if a.excused or a.dead:
-                return f"at rest {a.name}'s table still holds what dead attempts wrote: {sorted(a.excused)}"
+            state = out.log.states[-1]
+            if out.kind == "file" and (left := set(out.objects) - out.deleted) != set(state.items()):
+                return f"at rest {a.name}'s files are {sorted(left)}, its log holds {sorted(state.items())}"
+            if {k: r.version for k, r in out.rows.items()} != state:
+                return (
+                    f"at rest {a.name}'s log says {dict(sorted(state.items()))}, its store {_rows(out.rows)}"
+                )
         items, feed = self.items.states[-1], self.feed.states[-1]
         copy = {
             fmap(self.copy.d, k): (v, feed.get(k), self.copy.d)
