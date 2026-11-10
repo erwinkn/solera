@@ -253,7 +253,9 @@ async def after_an_older_tick(solera, outcome: Tick) -> dict:
 
 async def past_a_day(solera, tick: dict) -> None:
     """Served for a day and more after `tick`: the older tick's row goes
-    while `tick`'s, under a day old, stands; then it goes too."""
+    while `tick`'s, under a day old, stands; then it goes too, at a sweep
+    after its flush: the engine's clock moves a minute at each look, as
+    sweeps are a minute apart."""
 
     solera.advance(DAY - 60)
     await solera.start()
@@ -265,6 +267,7 @@ async def past_a_day(solera, tick: dict) -> None:
     solera.advance(120)
 
     async def expired():
+        solera.advance(60)
         return (await solera.get("/sensors/watch/ticks"))["ticks"] == []
 
     await solera.until(expired)

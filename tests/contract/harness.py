@@ -362,27 +362,38 @@ class Solera:
 
         from solera_server.executors.inline import InlinePlacement
 
-        running = self.__dict__.setdefault("running_workers", set())
+        running = self.__dict__.setdefault("running_workers", {})  # task -> its attempt
 
         class Booting(InlinePlacement):
             def _work(self, stage):
                 return self._boot(stage)
 
             async def _boot(self, stage):
-                running.add(asyncio.current_task())
+                running[asyncio.current_task()] = stage["attempt"]
                 try:
                     await (asyncio.Event().wait() if boot is None else asyncio.sleep(boot))
                     return await InlinePlacement._work(self, stage)
                 finally:
-                    running.discard(asyncio.current_task())
+                    running.pop(asyncio.current_task(), None)
 
         return {"Local": lambda s, c: Booting(c, self.project)}
 
     async def kill_workers(self) -> int:
-        """Every worker `workers` launched that is running dies at once, as a
-        killed process does: it publishes no result. How many died."""
+        """Every worker `workers` launched that runs a live attempt of the
+        project's assets dies at once, as a killed process does: it
+        publishes no result. How many died. The engine's own cleanup tasks
+        (docs/lifecycle.md §9.8), which start on their own after a commit,
+        and a worker still exiting after its attempt ended run on."""
 
-        killed = list(self.__dict__.get("running_workers", ()))
+        from solera_server.model import CLEANUP
+
+        m = self.engine.m
+
+        def asset_attempt(attempt: str) -> bool:
+            return m.claimed(attempt) is not None and m.task(m.attempts[attempt])["asset"] != CLEANUP
+
+        running = self.__dict__.get("running_workers", {})
+        killed = [task for task, attempt in running.items() if asset_attempt(attempt)]
         for task in killed:
             task.cancel()
         await asyncio.gather(*killed, return_exceptions=True)
