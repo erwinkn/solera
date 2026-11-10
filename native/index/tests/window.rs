@@ -306,7 +306,7 @@ fn a_read_of_a_layer_of_many_short_blocks_plans_a_bounded_window() {
         assert_eq!(read(), want, "{what}");
         let held = PEAK.load(Relaxed) - base;
         assert!(
-            held < 40 << 20,
+            held < 16 << 20,
             "{what} of a layer of {n} blocks held {} MB",
             held >> 20
         );
@@ -326,10 +326,19 @@ fn a_read_of_a_layer_of_many_short_blocks_plans_a_bounded_window() {
         &|| rt.block_on(ix.get(ls, 1, &some, &q)).unwrap().run.len(),
         some.len(),
     );
+    let every = || {
+        let mut e = rt.block_on(ix.entries(&l)).unwrap();
+        let (mut group, mut seen) = (Run::new(), 0);
+        while rt.block_on(e.next(&mut group)).unwrap() {
+            seen += 1;
+        }
+        seen
+    };
+    measure("a read of every entry", &every, n as usize);
 }
 
 #[test]
-fn a_read_of_sparse_segments_holds_a_bounded_batch_of_them() {
+fn reads_of_many_segments_hold_a_bounded_batch_of_them() {
     let _one = ONE_AT_A_TIME.lock().unwrap();
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
@@ -384,12 +393,109 @@ fn a_read_of_sparse_segments_holds_a_bounded_batch_of_them() {
     PEAK.store(base, Relaxed);
     let got = rt.block_on(ix.get(ls, 1, &some, &q)).unwrap().run.len();
     let held = PEAK.load(Relaxed) - base;
-    let _ = std::fs::remove_dir_all(&dir);
     assert_eq!(got, some.len());
     assert!(
         held < 40 << 20,
         "a get over {} MB of index held {} MB",
         (l.top_start - l.index_start) >> 20,
+        held >> 20
+    );
+    let first = Query {
+        limit: Some(1),
+        ..Default::default()
+    };
+    let base = NOW.load(Relaxed);
+    PEAK.store(base, Relaxed);
+    let got = rt.block_on(ix.scan(ls, 1, &first)).unwrap().run.len();
+    let held = PEAK.load(Relaxed) - base;
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(got, 1);
+    assert!(
+        held < 16 << 20,
+        "a scan of one key over {n} segments held {} MB",
+        held >> 20
+    );
+}
+
+#[test]
+fn a_read_that_joins_another_reads_fetch_keeps_only_its_own_blocks() {
+    let _one = ONE_AT_A_TIME.lock().unwrap();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let dir = std::env::temp_dir().join(format!("solera-index-join-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let local = Arc::new(LocalFileSystem::new_with_prefix(&dir).unwrap());
+    let n = 1_000_000u64;
+    let layer = rt.block_on(async {
+        let store = Store::new(
+            local.clone(),
+            Path::from(""),
+            rt.handle().clone(),
+            StoreOptions::default(),
+        )
+        .unwrap();
+        let mut run = Run::new();
+        for i in 0..n {
+            run.push_key(&key(i));
+            run.push_entry(1, Version::Int(mix(i)), Version::Absent);
+        }
+        let nc = NewCommit {
+            commit: 1,
+            time_ms: 0,
+            producer: b"",
+            live_before: 0,
+        };
+        ChangeIndex::new(store, WriteOptions::default())
+            .write_commit("joined", nc, &run)
+            .await
+            .unwrap()
+    });
+    // slow GETs, so that the second read finds the first one's in flight
+    let slow = Arc::new(object_store::throttle::ThrottledStore::new(
+        LocalFileSystem::new_with_prefix(&dir).unwrap(),
+        object_store::throttle::ThrottleConfig {
+            wait_get_per_call: std::time::Duration::from_millis(500),
+            ..Default::default()
+        },
+    ));
+    let store = Store::new(
+        slow,
+        Path::from(""),
+        rt.handle().clone(),
+        StoreOptions::default(),
+    )
+    .unwrap();
+    let ix = Arc::new(ChangeIndex::new(store, WriteOptions::default()));
+    rt.block_on(ix.commits(std::slice::from_ref(&layer), 1, 1))
+        .unwrap();
+    let keys: Arc<Vec<Vec<u8>>> = Arc::new((0..n / 2).map(key).collect());
+    let (ix2, l2, k2) = (ix.clone(), layer.clone(), keys.clone());
+    let base = NOW.load(Relaxed);
+    let bulk = rt.spawn(async move {
+        let q = Query::default();
+        ix2.get(std::slice::from_ref(&l2), 1, &k2, &q)
+            .await
+            .map(|p| p.run.len())
+    });
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    let mut entries = rt.block_on(ix.entries(&layer)).unwrap();
+    let mut group = Run::new();
+    assert!(rt.block_on(entries.next(&mut group)).unwrap());
+    assert_eq!(rt.block_on(bulk).unwrap().unwrap(), n as usize / 2);
+    drop(group);
+    let held = NOW.load(Relaxed).saturating_sub(base);
+    drop((entries, keys));
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        ix.store.stats.counts().waits > 0,
+        "the reads did not share a fetch"
+    );
+    assert!(
+        held < 4 << 20,
+        "a paused read that joined a bulk read's fetches held {} MB",
         held >> 20
     );
 }

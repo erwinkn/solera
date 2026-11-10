@@ -375,7 +375,8 @@ impl Store {
     ) -> Result<Vec<Cached>> {
         let n = wants.len();
         let mut out: Vec<Option<Cached>> = vec![None; n];
-        let mut waits: Vec<(usize, Load, usize)> = Vec::new();
+        // (want, fetch, its place in the fetch, whether another load started it)
+        let mut waits: Vec<(usize, Load, usize, bool)> = Vec::new();
         {
             let mut st = self.state.lock().unwrap();
             let mut claims: Vec<usize> = Vec::new();
@@ -385,7 +386,7 @@ impl Store {
                     out[i] = Some(v);
                     self.stats.hits.fetch_add(1, Relaxed);
                 } else if let Some((f, j)) = st.inflight.get(&key) {
-                    waits.push((i, f.clone(), *j));
+                    waits.push((i, f.clone(), *j, true));
                     self.stats.waits.fetch_add(1, Relaxed);
                 } else {
                     claims.push(i);
@@ -419,14 +420,25 @@ impl Store {
                 for (j, &i) in claims[g..e].iter().enumerate() {
                     st.inflight
                         .insert((path.clone(), wants[i].0.clone()), (fut.clone(), j));
-                    waits.push((i, fut.clone(), j));
+                    waits.push((i, fut.clone(), j, false));
                 }
                 g = e;
             }
         }
-        let done = futures::future::join_all(waits.iter().map(|w| w.1.clone())).await;
-        for ((i, _, j), r) in waits.into_iter().zip(done) {
-            out[i] = Some(r?[j].clone());
+        // A block from another load's fetch is copied out as it arrives, so
+        // that this load holds what it asked for, not that fetch's response.
+        let done =
+            futures::future::join_all(waits.into_iter().map(|(i, f, j, other)| async move {
+                let got = f.await?;
+                Ok::<_, Error>(match &got[j] {
+                    Cached::Block(b) if other => (i, Cached::Block(Bytes::copy_from_slice(b))),
+                    c => (i, c.clone()),
+                })
+            }))
+            .await;
+        for r in done {
+            let (i, c) = r?;
+            out[i] = Some(c);
         }
         Ok(out
             .into_iter()

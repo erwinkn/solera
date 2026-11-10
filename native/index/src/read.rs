@@ -21,10 +21,15 @@ const ALL: u64 = 4 << 20;
 /// decoding, per layer.
 const WINDOW: u64 = 16 << 20;
 /// A read fetches the index segments it needs about this many bytes at a
-/// time, counting the gaps its GETs coalesce across.
+/// time, counting the gaps its GETs coalesce across, and at most
+/// `PARTS` segments.
 const SEG_BATCH: u64 = 16 << 20;
-/// A cursor plans at most about this many blocks ahead of its fetches.
-const PLAN_BLOCKS: usize = 1 << 16;
+/// A cursor plans at most about this many blocks ahead of its fetches, and
+/// one batch fetches at most this many blocks or segments.
+const PARTS: usize = 4096;
+/// What one block or segment in flight costs besides its bytes, counted
+/// against `WINDOW`.
+const PART: u64 = 512;
 
 /// The blocks of one batch, being fetched.
 type Fetch = tokio::task::JoinHandle<Result<Vec<Cached>>>;
@@ -169,9 +174,11 @@ pub(crate) struct Cursor {
     store: Arc<Store>,
     path: Arc<str>,
     top: Arc<Top>,
-    /// The segments the read spans, in order, and how many are planned.
-    segs: Vec<usize>,
+    /// The segments the read spans and the next to plan: segment numbers, or
+    /// for a read of listed keys, places in `listed_segs`.
+    segs: Range<usize>,
     seg_next: usize,
+    listed_segs: Vec<usize>,
     /// Segments fetched and not yet planned.
     seg_got: VecDeque<(usize, Cached)>,
     /// A read of listed keys: each listed key in bounds with the segment that
@@ -222,20 +229,19 @@ impl Cursor {
                 .filter_map(|i| Some((i, top.segs.holding(k.get(i))?)))
                 .collect()
         });
-        let segs: Vec<usize> = match keys {
-            None => top.segs.span(bounds.lo_key(), bounds.hi_key()).collect(),
-            Some(_) => {
-                let mut v: Vec<usize> = listed.iter().map(|&(_, s)| s).collect();
-                v.dedup();
-                v
-            }
+        let mut listed_segs: Vec<usize> = listed.iter().map(|&(_, s)| s).collect();
+        listed_segs.dedup();
+        let segs = match keys {
+            None => top.segs.span(bounds.lo_key(), bounds.hi_key()),
+            Some(_) => 0..listed_segs.len(),
         };
         let mut c = Cursor {
             store: store.clone(),
             path: Arc::from(l.path.as_str()),
             top,
+            seg_next: segs.start,
             segs,
-            seg_next: 0,
+            listed_segs,
             seg_got: VecDeque::new(),
             keys,
             listed,
@@ -254,7 +260,7 @@ impl Cursor {
             bounds,
         };
         c.plan_ahead().await?;
-        c.keep_all = c.seg_next == c.segs.len() && c.planned <= store.opts.cache_batch;
+        c.keep_all = c.seg_next == c.segs.end && c.planned <= store.opts.cache_batch;
         Ok(c)
     }
 
@@ -263,10 +269,7 @@ impl Cursor {
     async fn plan_ahead(&mut self) -> Result<()> {
         let o = &self.store.opts;
         let enough = WINDOW.max(o.max_get).max(o.cache_batch);
-        while self.seg_next < self.segs.len()
-            && self.blocks.len() < PLAN_BLOCKS
-            && self.planned <= enough
-        {
+        while self.seg_next < self.segs.end && self.blocks.len() < PARTS && self.planned <= enough {
             self.plan().await?;
         }
         Ok(())
@@ -282,8 +285,12 @@ impl Cursor {
             // coalesce across
             let (mut got, mut wants, mut held) = (Vec::new(), Vec::new(), 0);
             let mut end: Option<u64> = None;
-            for &i in &self.segs[self.seg_next..] {
-                if held >= SEG_BATCH {
+            for j in self.seg_next..self.segs.end {
+                let i = match self.keys {
+                    None => j,
+                    Some(_) => self.listed_segs[j],
+                };
+                if held >= SEG_BATCH || got.len() >= PARTS {
                     break;
                 }
                 let c = self.store.cached_seg(&self.path, i);
@@ -372,7 +379,8 @@ impl Cursor {
             let more = between.unwrap_or(0) + b.clen as u64;
             if n > 0
                 && ((bytes >= self.target && !(self.all && between.is_some()))
-                    || held + more > max_get)
+                    || held + more > max_get
+                    || n == PARTS)
             {
                 break;
             }
@@ -383,6 +391,7 @@ impl Cursor {
         if n == 0 {
             return;
         }
+        let held = held + n as u64 * PART;
         self.ahead += held;
         self.planned -= bytes;
         let keep = if self.all {
