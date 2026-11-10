@@ -51,4 +51,9 @@ PENDING: dict[str, str] = {
         "a rule of the console's display (D173): the HTTP API serves every batch and attempt, and"
         " which of them the console shows is checked by apps/console's Playwright tests"
     ),
+    # ENG+CLN+STO
+    "ENG-2": "its window, an attempt's spec written but its launch not yet durable, lies inside one engine "
+    "step: no request, restart or takeover a user makes can stop the engine there without hooking its flush",
+    "ENG-16": "needs a namespace in an older state format, and the contract has none to open: making one "
+    "means writing the engine's journal by hand, which no user does and the harness may not",
 }

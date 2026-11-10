@@ -377,7 +377,7 @@ class Solera:
         await asyncio.gather(*killed, return_exceptions=True)
         return len(killed)
 
-    async def down(self, seconds: float) -> None:
+    async def outage(self, seconds: float) -> None:
         """The engine is down for `seconds`, then served again on the same
         deploy and state."""
 
@@ -455,6 +455,164 @@ class Solera:
                     await watcher
 
         return served()
+
+    # -- ENG+CLN+STO ---------------------------------------------------------------
+    # Serving, outages and takeovers, and the workers a test plays itself.
+
+    async def start(self) -> None:
+        """The engine serves on its own from here, as `solera serve` runs it:
+        its loop, upkeep and history work in the background until it stops."""
+
+        await self.engine.start()
+
+    async def down(self) -> None:
+        """The engine process goes away (an outage, a crash): workers keep
+        running; `restart()` serves the namespace again."""
+
+        await self._stop_engine()
+
+    def successor(self) -> Solera:
+        """Another engine process for this namespace, on the same clock (a
+        rolling deploy's new one): its `deploy()` takes the namespace over
+        while this one still runs. The caller closes it."""
+
+        other = Solera(self.root, self.path)
+        other.clock = self.clock
+        return other
+
+    async def offered(self, pool: str, timeout: float = 30, **capacity) -> list[dict]:
+        """What a pool worker polling `pool` is offered (`GET /pools/{pool}/work`),
+        asked until something is: a launch is offered once it is durable."""
+
+        deadline = time.monotonic() + timeout
+        while True:
+            work = (await self.get(f"/pools/{pool}/work", wait=0, host="contract", **capacity))["work"]
+            if work or time.monotonic() > deadline:
+                return work
+            await self.engine.tick()
+            await asyncio.sleep(0.02)
+
+    async def worker(self, stage: dict, project: Project | None = None, *, pool: bool = True) -> int:
+        """A worker runs the attempt `stage` names, as `solera_worker` runs one
+        (`pool`: a pool host's; else one started for that attempt alone), on
+        the attempt's routes while an engine serves and through the object
+        store alone while none does: its exit code."""
+
+        from solera import lifecycle
+        from solera_server.api import local_transport
+        from solera_worker.channel import AttemptChannel
+        from solera_worker.worker import run_attempt
+
+        attempt, channel = stage["attempt"], None
+        if self.engine is not None:
+            token = lifecycle.token(self.engine.secret, attempt)
+            channel = AttemptChannel(
+                local_transport(self.engine, token), self.project.manifest["name"], attempt
+            )
+        return await run_attempt(
+            stage["objects"],
+            attempt,
+            project or self.project,
+            run=stage["run"],
+            channel=channel,
+            pool=pool,
+            loser_poll=0.05,  # a duplicate looks for the owner's end this often
+        )
+
+    async def tamper(self, run: str, attempt: str, change) -> None:
+        """A worker gone wrong: the control file it writes for `attempt` of
+        `run` becomes `change(body)`, its body as it stands (None when there
+        is none), raw bytes."""
+
+        import json
+
+        import obstore
+        from obstore.exceptions import NotFoundError
+        from solera import lifecycle
+
+        store = obstore.store.from_url(self.state.objects_url)
+        path = f"{lifecycle.base(run, attempt)}{lifecycle.CONTROL}"
+        try:
+            body = json.loads(bytes(await (await obstore.get_async(store, path)).bytes_async()))
+        except NotFoundError:
+            body = None
+        await obstore.put_async(store, path, change(body))
+
+    async def sensor_ticks(self, executor: str = "local", wait: float = 0) -> list[dict]:
+        """A sensor host's ask for ticks (`GET /sensors/next`): the ticks due
+        on `executor`'s hosts, each with its sensor's cursor, waiting up to
+        `wait` seconds for one."""
+
+        deploy = (await self.get("/manifest"))["deploy"]
+        params = {"executor": executor, "deploy": deploy, "host": "contract", "slots": 8, "wait": wait}
+        return (await self.get("/sensors/next", **params))["ticks"]
+
+    async def sensor_post(self, tick: dict, outcome) -> dict:
+        """A sensor host posts what `tick` found (a `Tick`)."""
+
+        return await self.post(f"/sensors/{tick['sensor']}/ticks/{tick['tick']}", outcome.to_json())
+
+    async def serve_process(self, **env):
+        """`solera serve` as its own process, as an operator starts it, on a
+        state beside this namespace's (`env` adds to its environment): the
+        process, once it listens."""
+
+        import os
+        import socket
+        import subprocess
+        import sys
+
+        with socket.socket() as sock:
+            sock.bind(("127.0.0.1", 0))
+            port = sock.getsockname()[1]
+        argv = ["--state-url", (self.root / "served").as_uri(), "serve", "--insecure", "--port", str(port)]
+        process = subprocess.Popen(
+            [sys.executable, "-c", "from solera_server.cli import main; main()", *argv],
+            env={
+                **os.environ,
+                "SOLERA_SELFTEST": "0",
+                "SOLERA_DATA_URL": (self.root / "data").as_uri(),
+                **env,
+            },
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
+        deadline = time.monotonic() + 120
+        while True:
+            with socket.socket() as sock:
+                if sock.connect_ex(("127.0.0.1", port)) == 0:
+                    return process
+            if process.poll() is not None or time.monotonic() > deadline:
+                process.kill()
+                raise AssertionError(f"serve never listened: {process.communicate()[1][-2000:]}")
+            await asyncio.sleep(0.1)
+
+    async def cli(self, *argv: str):
+        """The `solera` CLI on this namespace, as an operator runs it: its exit
+        code, stdout and stderr."""
+
+        import os
+        import subprocess
+        import sys
+
+        command = [sys.executable, "-c", "from solera_server.cli import main; main()"]
+        command += ["--state-url", (self.root / "state").as_uri(), "--namespace", "contract", *argv]
+        done = await asyncio.to_thread(
+            subprocess.run, command, env={**os.environ}, capture_output=True, text=True, timeout=120
+        )
+        return done.returncode, done.stdout, done.stderr
+
+    def refuse_upkeep(self, output: str, refused: bool = True) -> None:
+        """The namespace's object store refuses (or takes again) the writes
+        of `output`'s key index upkeep: a disk or bucket gone read-only there."""
+
+        import os
+
+        root = self.root / "state" / "contract" / "keys" / output
+        for path in [root, *(p for p in root.rglob("*") if p.is_dir())]:
+            os.chmod(path, 0o555 if refused else 0o755)
 
 
 # -- the outside world, as a user's project sees it ---------------------------

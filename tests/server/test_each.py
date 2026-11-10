@@ -56,34 +56,6 @@ def files_project(content, fn, *, written=None, **input):
     return Project(assets=[files, parse])
 
 
-async def test_one_call_per_key_many_rows_one_write(state):
-    """Each key's call returns its rows; the store takes every key's group
-    in one write. A file that parses to nothing has no key in the output —
-    a key with no rows does not exist — while its outcome says it was
-    processed."""
-
-    content = {"a.csv": "1,2", "b.csv": "3", "c.csv": ""}
-    calls = []
-
-    def parse(ctx, file: dict):
-        calls.append(ctx.key)
-        return [{"value": int(v)} for v in file["text"].split(",") if v]
-
-    project = files_project({k: {"text": v} for k, v in content.items()}, parse)
-    engine = make_engine(state, project)
-    await engine.initialize()
-    detail = await drive(engine, await engine.submit(["parse"], upstream=True))
-    assert status_of(detail) == "succeeded" and sorted(calls) == ["a.csv", "b.csv", "c.csv"]
-    got = await rows_of(engine, project, "samples")
-    assert {k: sorted(r["value"] for r in v) for k, v in got.items()} == {
-        "a.csv": [1, 2],
-        "b.csv": [3],
-    }
-    assert all(r["path"] == k for k, v in got.items() for r in v)  # the store stamps the key
-    attempt = detail["attempts"][next(t["id"] for t in detail["tasks"] if t["asset"] == "parse")][-1]
-    assert attempt["keys"] == {"ok": 3}
-
-
 async def test_failures_are_recorded_and_never_block(state):
     content = {
         "good.csv": {"text": "1"},

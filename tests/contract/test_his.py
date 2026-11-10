@@ -168,7 +168,7 @@ async def test_his_2_a_task_waits_only_while_it_could_run(solera):
     solera.advance(20)
     await solera.post(f"/runs/{submitted['id']}/resume")
     solera.advance(10)
-    await solera.down(60)
+    await solera.outage(60)
     solera.advance(10)
     detail = await solera.wait(submitted)
     assert detail["request"]["status"] == "succeeded"
