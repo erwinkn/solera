@@ -1481,3 +1481,30 @@ fn a_flipped_byte_or_a_cut_file_is_a_format_error() {
         });
     }
 }
+
+#[test]
+fn a_store_refuses_zero_for_its_sizes() {
+    let rt = runtime();
+    for o in [
+        StoreOptions {
+            max_inflight: 0,
+            ..Default::default()
+        },
+        StoreOptions {
+            max_get: 0,
+            ..Default::default()
+        },
+        StoreOptions {
+            part_bytes: 0,
+            ..Default::default()
+        },
+    ] {
+        let got = Store::new(
+            Arc::new(InMemory::new()),
+            Path::from(""),
+            rt.handle().clone(),
+            o,
+        );
+        assert!(matches!(got, Err(Error::Invalid(_))));
+    }
+}

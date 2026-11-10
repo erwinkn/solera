@@ -211,8 +211,14 @@ impl Store {
         rt: tokio::runtime::Handle,
         opts: StoreOptions,
     ) -> Result<Arc<Store>> {
-        if opts.max_inflight == 0 {
-            return Err(Error::Invalid("max_inflight is at least 1".into()));
+        for (name, v) in [
+            ("max_inflight", opts.max_inflight as u64),
+            ("max_get", opts.max_get),
+            ("part_bytes", opts.part_bytes as u64),
+        ] {
+            if v == 0 {
+                return Err(Error::Invalid(format!("{name} is at least 1")));
+            }
         }
         Ok(Arc::new(Store {
             disk: opts.disk.clone().map(Disk::open).transpose()?,
