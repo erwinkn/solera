@@ -12,7 +12,11 @@
 //! - a failure whose input returns to what the consumer holds is moot;
 //! - counts by outcome match the records; snapshots round-trip.
 //!
-//! `OUTCOME_SEEDS` sets how many histories run.
+//! The multi-input histories give one consumer two keyed inputs, with
+//! retries on either input taken on both (`due::plan_all`), during full
+//! runs and clears of the other.
+//!
+//! `OUTCOME_SEEDS` and `MULTI_SEEDS` set how many histories run.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -44,6 +48,8 @@ fn key(s: &str) -> Key {
 const EDGE: &str = "checks/items";
 
 struct Log {
+    /// The input's output.
+    name: String,
     states: Vec<BTreeMap<Key, Ver>>,
     layers: Vec<LayerRef>,
     /// The commits that cleared, ascending.
@@ -103,7 +109,7 @@ impl Log {
             live_before: before.len() as u64,
             clear,
         };
-        let path = format!("items/c{c}");
+        let path = format!("{}/c{c}", self.name);
         self.layers
             .push(ix.write_commit(&path, nc, &run).await.unwrap());
         self.states.push(after);
@@ -115,7 +121,7 @@ impl Log {
             self.full_run = None;
         }
         t.outputs.insert(
-            key("items"),
+            key(&self.name),
             Output {
                 layers: self.layers.clone(),
                 head: c,
@@ -945,7 +951,7 @@ impl World {
             .and_then(|k| k.pass.as_ref().map(|p| (k.life, p.n)));
         if self.run(ix, &p, p.pass.is_some()).await.is_some() {
             assert!(
-                p.pass.is_none() || p.pass.map(|p| (p.life, p.n)) == pass,
+                p.pass.is_none() || p.pass.as_ref().map(|p| (p.life, p.n)) == pass,
                 "a retry batch of pass {:?} commits in pass {pass:?}",
                 p.pass
             );
@@ -1188,6 +1194,7 @@ fn world(seed: u64) -> World {
         rng,
         t: Tracking::new(),
         log: Log {
+            name: "items".into(),
             states: vec![BTreeMap::new()],
             layers: vec![],
             clears: vec![],
@@ -2265,7 +2272,8 @@ fn a_retry_batch_of_a_pass_in_an_earlier_life_is_refused() {
             w.counters.deploy = 3;
             let start = w.start_of(&ix).await.expect("the deploy starts a pass");
             w.apply(start);
-            if old.pass.unwrap().n == w.t.per_key[EDGE.as_bytes()].pass.as_ref().unwrap().n {
+            if old.pass.as_ref().unwrap().n == w.t.per_key[EDGE.as_bytes()].pass.as_ref().unwrap().n
+            {
                 met += 1;
             }
             let c3 = w.counters;
@@ -2405,5 +2413,1085 @@ fn a_retry_batch_whose_only_key_is_held_back_still_gets_its_deploy_retry() {
                 assert!(w.start_of(&ix).await.is_none());
             }
         });
+    }
+}
+
+/// One keyed input of a consumer with several, and the truth about it.
+struct Side {
+    edge: Key,
+    log: Log,
+    holds: BTreeMap<Key, Holding>,
+    fails: BTreeMap<Key, Fail>,
+}
+
+impl Side {
+    fn holding(&self, k: &[u8]) -> Holding {
+        self.holds.get(k).cloned().unwrap_or(Holding::Absent)
+    }
+
+    fn wanted(&self, k: &[u8], now: &Arc<Conditions>) -> Holding {
+        Holding::of(self.log.at(self.log.head(), k).as_version(), now, k)
+    }
+
+    fn waiting(&self, k: &[u8], now: &Arc<Conditions>) -> bool {
+        self.fails
+            .get(k)
+            .is_some_and(|f| !owed(&f.tried, &self.wanted(k, now)))
+    }
+
+    fn unsettled(&self, planned: u64) -> bool {
+        self.log.full_run.is_some()
+            || self
+                .log
+                .clears
+                .iter()
+                .any(|&c| planned < c && c <= self.log.head())
+    }
+
+    fn reverted(&mut self, now: &Arc<Conditions>) {
+        let gone: Vec<Key> = self
+            .fails
+            .keys()
+            .filter(|k| !owed(&self.holding(k), &self.wanted(k, now)))
+            .cloned()
+            .collect();
+        for k in gone {
+            self.fails.remove(&k);
+        }
+    }
+}
+
+/// A consumer with two keyed inputs, a and b: change batches over both,
+/// retry passes on each, and full runs of a.
+struct Multi {
+    rng: SmallRng,
+    t: Tracking,
+    sides: Vec<Side>,
+    universe: Vec<Key>,
+    now: Arc<Conditions>,
+    cursor: Option<Key>,
+    clock: f64,
+    counters: Counters,
+    files: u64,
+    /// Change batches, retry batches, keys retried, keys held back, retry
+    /// batches during a full run of a, keys a retry batch held back.
+    stats: [usize; 6],
+}
+
+impl Multi {
+    fn new(seed: u64) -> Multi {
+        let side = |name: &str| Side {
+            edge: key(&format!("c/{name}")),
+            log: Log {
+                name: name.into(),
+                states: vec![BTreeMap::new()],
+                layers: vec![],
+                clears: vec![],
+                full_run: None,
+            },
+            holds: BTreeMap::new(),
+            fails: BTreeMap::new(),
+        };
+        let mut w = Multi {
+            rng: SmallRng::seed_from_u64(seed),
+            t: Tracking::new(),
+            sides: vec![side("a"), side("b")],
+            universe: ["k1", "k2", "k3", "k4"].map(key).to_vec(),
+            now: Arc::new(Conditions {
+                definition: b"d1".as_slice().into(),
+                ..Default::default()
+            }),
+            cursor: None,
+            clock: 1_000_000.0,
+            counters: Counters {
+                deploy: 1,
+                forced: [0; 6],
+            },
+            files: 0,
+            stats: [0; 6],
+        };
+        for name in ["a", "b"] {
+            w.apply(vec![Part::EdgeOpen(EdgeOpen {
+                edge: key(&format!("c/{name}")),
+                input: key(name),
+                keyed: true,
+            })]);
+        }
+        w
+    }
+
+    fn apply(&mut self, parts: Vec<Part>) {
+        self.t.apply(&Event::of(parts).encode()).unwrap();
+    }
+
+    fn ctx(&mut self) -> (String, String) {
+        self.files += 1;
+        (format!("f/{}", self.files), format!("d/{}", self.files))
+    }
+
+    fn request(&self, after: Option<Key>, limit: usize) -> Request {
+        Request {
+            mode: Mode::Incremental,
+            reset: false,
+            after,
+            limit,
+            inputs: self
+                .sides
+                .iter()
+                .map(|s| InputRequest {
+                    edge: s.edge.clone(),
+                    conditions: self.now.clone(),
+                    own: None,
+                })
+                .collect(),
+            unkeyed: vec![],
+        }
+    }
+
+    fn report(&mut self) -> Reported {
+        let kinds = [
+            Kind::Failed,
+            Kind::Rejected,
+            Kind::Transient,
+            Kind::TimedOut,
+            Kind::Canceled,
+        ];
+        let kind = kinds[self.rng.random_range(0..kinds.len())];
+        Reported {
+            kind,
+            message: format!("{kind:?}").into_bytes().into(),
+            retry_after: self
+                .rng
+                .random_bool(0.3)
+                .then(|| self.rng.random_range(0..300) as f64),
+            retry_for: Some(self.rng.random_range(0..2000) as f64),
+        }
+    }
+
+    async fn catch_up(&mut self, ix: &ChangeIndex) {
+        for i in 0..self.sides.len() {
+            let v = self.t.outcome_view(&self.sides[i].edge).unwrap();
+            let (f, d) = self.ctx();
+            let ctx = Ctx {
+                now: self.clock,
+                counters: self.counters,
+                retries: 2,
+                time_ms: 0,
+                producer: b"",
+                failures_path: &f,
+                due_path: &d,
+            };
+            if let Some(parts) = oc::catch_up(&OneIndex(ix), &v, &self.now, &ctx)
+                .await
+                .unwrap()
+            {
+                self.apply(parts);
+            }
+        }
+    }
+
+    /// Input i commits; a clear starts a full run, which may go on over
+    /// later commits.
+    async fn upstream(&mut self, ix: &ChangeIndex, i: usize, clear: bool) {
+        let mut changes = BTreeMap::new();
+        for k in self.universe.clone() {
+            if self.rng.random_bool(if clear { 0.6 } else { 0.4 }) {
+                let v = if clear {
+                    Ver::Int(self.rng.random_range(1..4))
+                } else {
+                    version(&mut self.rng)
+                };
+                changes.insert(k, v);
+            }
+        }
+        let ends = self.rng.random_bool(if clear { 0.3 } else { 0.5 });
+        let s = &mut self.sides[i];
+        if s.log.commit(ix, &mut self.t, changes, clear, ends).await {
+            trace(&format!(
+                "input {i} commits{}",
+                if clear { ", clearing" } else { "" }
+            ));
+            s.reverted(&self.now);
+        }
+    }
+
+    async fn start(&mut self, ix: &ChangeIndex, i: usize) -> Option<Vec<Part>> {
+        let r = self.t.retry_view(&self.sides[i].edge).unwrap();
+        self.files += 1;
+        let path = format!("p/{}", self.files);
+        due::start(
+            &OneIndex(ix),
+            &r.outcomes,
+            &r.pass_list,
+            self.clock as u64,
+            self.counters,
+            &path,
+        )
+        .await
+        .unwrap()
+    }
+
+    fn under_way(&self, i: usize) -> Option<solera_tracking::outcomes::Pass> {
+        self.t
+            .per_key
+            .get(&self.sides[i].edge)
+            .and_then(|k| k.pass.clone())
+    }
+
+    /// The worker runs a plan's keys, loading each on every input that took
+    /// it; the input may commit first. Then the commit, on every input in
+    /// one event, and the truth. False when the commit is refused.
+    async fn run(&mut self, ix: &ChangeIndex, p: &plan::Plan) -> bool {
+        let meanwhile = self
+            .rng
+            .random_bool(if p.pass.is_some() { 0.6 } else { 0.3 });
+        if meanwhile {
+            let i = self.rng.random_range(0..self.sides.len());
+            let clear = i == 0 && self.rng.random_bool(0.4);
+            self.upstream(ix, i, clear).await;
+        }
+        let keys: BTreeSet<Key> = p
+            .inputs
+            .iter()
+            .flat_map(|ip| ip.keys.iter().map(|c| c.key.clone()))
+            .collect();
+        let mut failed: BTreeMap<Key, Reported> = BTreeMap::new();
+        for k in keys {
+            if self.rng.random_bool(0.35) {
+                let r = self.report();
+                failed.insert(k, r);
+            }
+        }
+        let mut loaded: Vec<Vec<(Key, Ver)>> = vec![];
+        for (j, ip) in p.inputs.iter().enumerate() {
+            let mut l = vec![];
+            for c in &ip.keys {
+                if self.rng.random_bool(0.6) {
+                    let log = &self.sides[j].log;
+                    let v = log.at(log.head(), &c.key);
+                    if v != c.version && !v.is_absent() && !c.version.is_absent() {
+                        l.push((c.key.clone(), v));
+                    }
+                }
+            }
+            loaded.push(l);
+        }
+        self.commit_batch(ix, p, failed, loaded, meanwhile).await
+    }
+
+    /// A batch's commit on every input in one event, and the truth. False
+    /// when it is refused, which only an input's commit since the plan
+    /// (meanwhile) may cause.
+    async fn commit_batch(
+        &mut self,
+        ix: &ChangeIndex,
+        p: &plan::Plan,
+        failed: BTreeMap<Key, Reported>,
+        loaded: Vec<Vec<(Key, Ver)>>,
+        meanwhile: bool,
+    ) -> bool {
+        let reported = |ip: &plan::InputPlan| -> Vec<(Key, Reported)> {
+            ip.keys
+                .iter()
+                .filter_map(|c| failed.get(&c.key).map(|r| (c.key.clone(), r.clone())))
+                .collect()
+        };
+        let reports: Vec<InputReport> = p
+            .inputs
+            .iter()
+            .zip(&loaded)
+            .map(|(ip, l)| InputReport {
+                failed: reported(ip).into_iter().map(|(k, _)| k).collect(),
+                loaded: l.clone(),
+            })
+            .collect();
+        let mut ops = match self.t.progress_ops(p, &reports, b"", None) {
+            Ok(ops) => ops,
+            Err(e) => {
+                assert!(meanwhile, "progress refuses a batch planned now: {e}");
+                return false;
+            }
+        };
+        self.catch_up(ix).await;
+        let counters: Vec<Counters> = (0..self.sides.len())
+            .map(|j| match (&p.pass, self.under_way(j)) {
+                (Some(id), Some(pass)) if id.edge == self.sides[j].edge => pass.counters,
+                _ => self.counters,
+            })
+            .collect();
+        let mut parts = vec![];
+        for j in 0..self.sides.len() {
+            let v = self.t.outcome_view(&self.sides[j].edge).unwrap();
+            let (f, d) = self.ctx();
+            let ctx = Ctx {
+                now: self.clock,
+                counters: self.counters,
+                retries: 2,
+                time_ms: 0,
+                producer: b"",
+                failures_path: &f,
+                due_path: &d,
+            };
+            let now = self.now.clone();
+            match oc::commit(
+                &OneIndex(ix),
+                &v,
+                p,
+                j,
+                &reported(&p.inputs[j]),
+                &loaded[j],
+                &now,
+                &ctx,
+                &mut ops,
+            )
+            .await
+            {
+                Ok(mut ps) => parts.append(&mut ps),
+                Err(e) => {
+                    assert!(
+                        meanwhile,
+                        "the outcomes of a batch planned now are refused: {e}"
+                    );
+                    return false;
+                }
+            }
+        }
+        let mut all = ops.parts.clone();
+        all.append(&mut parts);
+        if let Err(e) = self.t.apply(&Event::of(all).encode()) {
+            assert!(meanwhile, "a batch planned now is refused: {e}");
+            trace(&format!("the batch is refused: {e}"));
+            return false;
+        }
+        // The truth: on an input mid full run, or cleared since the plan, a
+        // key loaded at another version than planned, or a key of the batch
+        // the input did not take, is held back on every input (D205, the
+        // union rule, #36).
+        let batch: BTreeSet<&Key> = p
+            .inputs
+            .iter()
+            .flat_map(|ip| ip.keys.iter().map(|c| &c.key))
+            .collect();
+        let mut union: BTreeSet<Key> = BTreeSet::new();
+        for (j, ip) in p.inputs.iter().enumerate() {
+            if !self.sides[j].unsettled(ip.head) {
+                continue;
+            }
+            for k in &batch {
+                if !ip.keys.iter().any(|c| c.key == **k) {
+                    union.insert((*k).clone());
+                }
+            }
+            for c in &ip.keys {
+                let moved = loaded[j].iter().any(|(k, v)| {
+                    *k == c.key
+                        && owed(
+                            &Holding::of(v.as_version(), &ip.conditions, k),
+                            &Holding::of(c.version.as_version(), &ip.conditions, k),
+                        )
+                });
+                if moved {
+                    union.insert(c.key.clone());
+                }
+            }
+        }
+        self.stats[3] += union.len();
+        if p.pass.is_some() {
+            self.stats[5] += union.len();
+        }
+        for (j, ip) in p.inputs.iter().enumerate() {
+            let held: Vec<Key> = ip
+                .keys
+                .iter()
+                .filter(|c| union.contains(&c.key))
+                .map(|c| c.key.clone())
+                .collect();
+            assert_eq!(
+                ops.held_back[j], held,
+                "input {j} holds back what the model does"
+            );
+            let s = &mut self.sides[j];
+            for c in &ip.keys {
+                if union.contains(&c.key) {
+                    continue;
+                }
+                let got = loaded[j]
+                    .iter()
+                    .find(|(k, _)| *k == c.key)
+                    .map_or(&c.version, |(_, v)| v);
+                let tried = Holding::of(got.as_version(), &ip.conditions, &c.key);
+                match failed.get(&c.key) {
+                    Some(_) if !owed(&s.holding(&c.key), &tried) => {
+                        s.fails.remove(&c.key);
+                    }
+                    Some(r) => {
+                        let prior = s.fails.get(&c.key);
+                        let fresh = prior.is_none_or(|f| {
+                            f.tried_ver != *got || !f.tried_cond.same_processing(&ip.conditions)
+                        });
+                        let stored = transition(
+                            prior.map(|f| &f.stored),
+                            fresh,
+                            r,
+                            self.clock,
+                            counters[j].deploy,
+                            counters[j].forced_at(),
+                            2,
+                        )
+                        .unwrap();
+                        s.fails.insert(
+                            c.key.clone(),
+                            Fail {
+                                stored,
+                                tried,
+                                tried_cond: ip.conditions.clone(),
+                                tried_ver: got.clone(),
+                                at: ip.head,
+                            },
+                        );
+                    }
+                    None => {
+                        match tried {
+                            Holding::Absent => s.holds.remove(&c.key),
+                            h => s.holds.insert(c.key.clone(), h),
+                        };
+                        s.fails.remove(&c.key);
+                    }
+                }
+            }
+            s.reverted(&self.now);
+        }
+        true
+    }
+
+    async fn change_batch(&mut self, ix: &ChangeIndex) {
+        self.catch_up(ix).await;
+        let limit = self.rng.random_range(1..4);
+        let req = self.request(self.cursor.clone(), limit);
+        let view = self.t.view(&req).unwrap();
+        let p = plan::plan(&view, &req, &OneIndex(ix), &NoHold)
+            .await
+            .unwrap();
+        self.stats[0] += 1;
+        if self.run(ix, &p).await {
+            self.cursor = p.range.hi.clone();
+        }
+    }
+
+    /// A step of input i's retry pass: its start, or its next batch, taken
+    /// on both inputs.
+    async fn pass_step(&mut self, ix: &ChangeIndex, i: usize) {
+        self.catch_up(ix).await;
+        let Some(pass) = self.under_way(i) else {
+            if let Some(parts) = self.start(ix, i).await {
+                trace(&format!("input {i}'s pass starts"));
+                self.apply(parts);
+            }
+            return;
+        };
+        let edge = self.sides[i].edge.clone();
+        let r = self.t.retry_view(&edge).unwrap();
+        let req = self.request(None, 1);
+        let view = self.t.view(&req).unwrap();
+        let limit = self.rng.random_range(1..4);
+        let p = due::plan_all(&OneIndex(ix), &r, &view, &req, &NoHold, limit)
+            .await
+            .unwrap();
+        assert_eq!(p.inputs.len(), 2, "a retry takes its keys on every input");
+        assert_eq!(p.pass.as_ref().unwrap().edge, edge);
+        let retried: Vec<Key> = p.inputs[i].keys.iter().map(|c| c.key.clone()).collect();
+        let s = &self.sides[i];
+        for c in &p.inputs[i].keys {
+            let f = s.fails.get(&c.key).expect("a retried key fails");
+            assert!(eligible(&f.stored, pass.at as f64, &pass.counters));
+            assert!(!owed(&f.tried, &s.wanted(&c.key, &self.now)));
+            assert!(same(&c.held, &s.holding(&c.key)));
+        }
+        let o = &self.sides[1 - i];
+        let listed: Vec<Key> = retried
+            .iter()
+            .filter(|k| {
+                !matches!(o.holding(k), Holding::Absent)
+                    || !matches!(o.wanted(k, &self.now), Holding::Absent)
+            })
+            .cloned()
+            .collect();
+        let other: Vec<Key> = p.inputs[1 - i].keys.iter().map(|c| c.key.clone()).collect();
+        assert_eq!(
+            other, listed,
+            "the other input lists the retried keys it has"
+        );
+        for c in &p.inputs[1 - i].keys {
+            assert!(same(&c.held, &o.holding(&c.key)));
+            assert_eq!(
+                c.class,
+                Class::of(&o.holding(&c.key), &o.wanted(&c.key, &self.now))
+            );
+        }
+        self.stats[1] += 1;
+        self.stats[2] += retried.len();
+        if self.sides[0].log.full_run.is_some() {
+            self.stats[4] += 1;
+        }
+        trace(&format!("input {i}'s pass retries {retried:?}"));
+        self.run(ix, &p).await;
+    }
+
+    async fn check(&mut self, ix: &ChangeIndex) {
+        // The engine catches up before it plans or counts.
+        self.catch_up(ix).await;
+        let ks: Vec<&[u8]> = self.universe.iter().map(|k| k.as_ref()).collect();
+        for s in &self.sides {
+            let keyed = self.t.edges[&s.edge].progress.keyed().unwrap().clone();
+            let fid = output_id(FAILURES, &s.edge);
+            let fo = self.t.outputs.get(&fid).cloned().unwrap_or_default();
+            let recs = records(&OneIndex(ix), &fid, &fo, &ks).await.unwrap();
+            let pk = self.t.per_key.get(&s.edge).cloned().unwrap_or_default();
+            for k in &self.universe {
+                let decoded = match recs.get(k) {
+                    Some(r) => r.held.holding(&pk.conds).unwrap(),
+                    None => match keyed.point(k) {
+                        Some(p) => p.holding.clone(),
+                        None => match keyed.value_of(k) {
+                            Value::Empty => Holding::Absent,
+                            Value::Held => Holding::Held,
+                            Value::At(p, c) => Holding::of(s.log.at(*p, k).as_version(), c, k),
+                        },
+                    },
+                };
+                assert!(
+                    same(&decoded, &s.holding(k)),
+                    "{:?} {k:?} decodes to {decoded:?}, the consumer holds {:?}",
+                    s.edge,
+                    s.holding(k)
+                );
+                match s.fails.get(k) {
+                    Some(f) => {
+                        let r = recs.get(k).expect("a failing key has a record");
+                        assert_eq!(r.stored, f.stored, "{:?} {k:?}'s outcome", s.edge);
+                    }
+                    None => assert!(!recs.contains_key(k), "{:?} {k:?} has a record", s.edge),
+                }
+            }
+        }
+        // A plan from the start takes, on each input, exactly its due keys.
+        let req = self.request(None, 1000);
+        let view = self.t.view(&req).unwrap();
+        let p = plan::plan(&view, &req, &OneIndex(ix), &NoHold)
+            .await
+            .unwrap();
+        for (s, ip) in self.sides.iter().zip(&p.inputs) {
+            let taken: Vec<Key> = ip.keys.iter().map(|c| c.key.clone()).collect();
+            let due: Vec<Key> = self
+                .universe
+                .iter()
+                .filter(|k| {
+                    owed(&s.holding(k), &s.wanted(k, &self.now)) && !s.waiting(k, &self.now)
+                })
+                .cloned()
+                .collect();
+            assert_eq!(taken, due, "{:?} plans {taken:?}, due {due:?}", s.edge);
+        }
+        let back = Tracking::restore(&self.t.snapshot()).unwrap();
+        assert_eq!(back, self.t);
+        // A failing key waiting for a retry it is eligible for gets a pass.
+        for i in 0..self.sides.len() {
+            if self.under_way(i).is_some() {
+                continue;
+            }
+            let s = &self.sides[i];
+            let waiting = s.fails.iter().any(|(k, f)| {
+                eligible(&f.stored, self.clock, &self.counters) && s.waiting(k, &self.now)
+            });
+            if waiting {
+                assert!(
+                    self.start(ix, i).await.is_some(),
+                    "input {i} waits for a retry and no pass starts"
+                );
+            }
+        }
+    }
+}
+
+async fn multi_history(seed: u64, ix: &ChangeIndex) -> [usize; 6] {
+    let mut w = Multi::new(seed);
+    for step in 0..60 {
+        let op = w.rng.random_range(0..15);
+        trace(&format!("step {step} op {op}"));
+        match op {
+            0 => w.upstream(ix, 0, false).await,
+            1 => w.upstream(ix, 1, false).await,
+            2 => w.upstream(ix, 0, true).await,
+            3..=5 => w.change_batch(ix).await,
+            6..=11 => {
+                let i = w.rng.random_range(0..2);
+                w.pass_step(ix, i).await;
+            }
+            12 => w.clock += w.rng.random_range(0..600) as f64,
+            13 => w.counters.deploy += 1,
+            _ => w.catch_up(ix).await,
+        }
+        w.check(ix).await;
+    }
+    w.stats
+}
+
+/// A consumer with two keyed inputs: a retry of a key one input failed on
+/// takes it on both, so the worker reports what it loaded on each, and a
+/// load mid full run of a is held back on both (D205).
+#[test]
+fn multi_input_histories() {
+    let seeds: u64 = std::env::var("MULTI_SEEDS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(300);
+    let only: Option<u64> = std::env::var("MULTI_SEED")
+        .ok()
+        .and_then(|s| s.parse().ok());
+    let rt = runtime();
+    let mut total = [0usize; 6];
+    for seed in (0..seeds).filter(|s| only.is_none_or(|o| o == *s)) {
+        let ix = index(&rt);
+        let s = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            rt.block_on(multi_history(seed, &ix))
+        }));
+        match s {
+            Ok(s) => {
+                for i in 0..6 {
+                    total[i] += s[i];
+                }
+            }
+            Err(e) => {
+                eprintln!("seed {seed} failed");
+                std::panic::resume_unwind(e);
+            }
+        }
+    }
+    eprintln!(
+        "{seeds} multi-input histories: change batches {}, retry batches {} taking {} keys ({} during a full run of a), keys held back {} ({} by retry batches)",
+        total[0], total[1], total[2], total[4], total[3], total[5]
+    );
+}
+
+/// A retry of k1 on b, taken on a too, is held back because a's full run
+/// moved what the worker loaded there; b's own input did not change. The
+/// key was not retried, so b's pass covers its deploy no more, and the next
+/// pass takes it again (§9's deploy_min, D205).
+#[test]
+fn a_retry_held_back_by_another_inputs_full_run_comes_again() {
+    let rt = runtime();
+    let ix = index(&rt);
+    rt.block_on(async {
+        let mut w = Multi::new(0);
+        for i in 0..2 {
+            let changes = [(key("k1"), Ver::Int(1))].into();
+            assert!(
+                w.sides[i]
+                    .log
+                    .commit(&ix, &mut w.t, changes, false, true)
+                    .await
+            );
+        }
+        let req = w.request(None, 10);
+        let view = w.t.view(&req).unwrap();
+        let p = plan::plan(&view, &req, &OneIndex(&ix), &NoHold)
+            .await
+            .unwrap();
+        let boom = Reported {
+            kind: Kind::Failed,
+            message: b"boom".as_slice().into(),
+            retry_after: None,
+            retry_for: None,
+        };
+        let failed: BTreeMap<Key, Reported> = [(key("k1"), boom)].into();
+        assert!(
+            w.commit_batch(&ix, &p, failed, vec![vec![], vec![]], false)
+                .await
+        );
+        w.counters.deploy = 2;
+        let start = w.start(&ix, 1).await.expect("the deploy starts b's pass");
+        w.apply(start);
+        let r = w.t.retry_view(&w.sides[1].edge).unwrap();
+        let req = w.request(None, 1);
+        let view = w.t.view(&req).unwrap();
+        let p = due::plan_all(&OneIndex(&ix), &r, &view, &req, &NoHold, 10)
+            .await
+            .unwrap();
+        assert_eq!(p.inputs[0].keys.len(), 1, "a lists k1");
+        assert_eq!(p.inputs[1].keys.len(), 1, "b retries k1");
+        // a starts a full run; the worker loads a's k1 at its new version.
+        let changes = [(key("k1"), Ver::Int(2))].into();
+        assert!(
+            w.sides[0]
+                .log
+                .commit(&ix, &mut w.t, changes, true, false)
+                .await
+        );
+        let boom = Reported {
+            kind: Kind::Failed,
+            message: b"boom".as_slice().into(),
+            retry_after: None,
+            retry_for: None,
+        };
+        let failed: BTreeMap<Key, Reported> = [(key("k1"), boom)].into();
+        let loaded = vec![vec![(key("k1"), Ver::Int(2))], vec![]];
+        assert!(w.commit_batch(&ix, &p, failed, loaded, true).await);
+        assert_eq!(w.stats[3], 1, "k1 is held back");
+        assert!(w.under_way(1).is_none(), "the batch ended b's pass");
+        assert!(
+            w.start(&ix, 1).await.is_some(),
+            "b's k1 still waits for its deploy retry"
+        );
+    });
+}
+
+/// A failure on b at v1, then b's head moves to v2 and a deploy's pass on b
+/// finds nothing to retry. A retry on a takes k1 on b at v2 and is held
+/// back by a's full run: b's record is of v1, so b's k1 is a change batch's
+/// and b's pass still covers the deploy.
+#[test]
+fn a_held_back_key_planned_at_another_version_than_its_record_lowers_nothing() {
+    let rt = runtime();
+    let ix = index(&rt);
+    rt.block_on(async {
+        let mut w = Multi::new(0);
+        for i in 0..2 {
+            let changes = [(key("k1"), Ver::Int(1))].into();
+            assert!(
+                w.sides[i]
+                    .log
+                    .commit(&ix, &mut w.t, changes, false, true)
+                    .await
+            );
+        }
+        let req = w.request(None, 10);
+        let view = w.t.view(&req).unwrap();
+        let p = plan::plan(&view, &req, &OneIndex(&ix), &NoHold)
+            .await
+            .unwrap();
+        let failed = [(key("k1"), boom())].into();
+        assert!(
+            w.commit_batch(&ix, &p, failed, vec![vec![], vec![]], false)
+                .await
+        );
+        let changes = [(key("k1"), Ver::Int(2))].into();
+        assert!(
+            w.sides[1]
+                .log
+                .commit(&ix, &mut w.t, changes, false, true)
+                .await
+        );
+        w.catch_up(&ix).await;
+        w.counters.deploy = 2;
+        for i in [1, 0] {
+            let start = w.start(&ix, i).await.expect("the deploy starts a pass");
+            w.apply(start);
+            let req = w.request(None, 10);
+            let view = w.t.view(&req).unwrap();
+            let r = w.t.retry_view(&w.sides[i].edge).unwrap();
+            let p = due::plan_all(&OneIndex(&ix), &r, &view, &req, &NoHold, 10)
+                .await
+                .unwrap();
+            if i == 1 {
+                assert!(p.inputs[1].keys.is_empty(), "b's k1 changed");
+                assert!(
+                    w.commit_batch(&ix, &p, BTreeMap::new(), vec![vec![], vec![]], false)
+                        .await
+                );
+                continue;
+            }
+            assert_eq!(p.inputs[1].keys[0].version, Ver::Int(2));
+            let changes = [(key("k1"), Ver::Int(2))].into();
+            assert!(
+                w.sides[0]
+                    .log
+                    .commit(&ix, &mut w.t, changes, true, false)
+                    .await
+            );
+            let loaded = vec![vec![(key("k1"), Ver::Int(2))], vec![]];
+            assert!(w.commit_batch(&ix, &p, BTreeMap::new(), loaded, true).await);
+        }
+        assert_eq!(w.stats[3], 1, "k1 is held back");
+        assert_eq!(w.t.per_key[&w.sides[1].edge].last.deploy, 2);
+        assert!(w.start(&ix, 1).await.is_none(), "no pass is due on b");
+    });
+}
+
+/// A retry plan keeps the consumer's unkeyed inputs, with one keyed input
+/// or several, so the batch consumes them as any batch does.
+#[test]
+fn a_retry_plan_keeps_the_unkeyed_inputs() {
+    let rt = runtime();
+    let ix = index(&rt);
+    rt.block_on(async {
+        let mut w = Multi::new(0);
+        w.apply(vec![Part::EdgeOpen(EdgeOpen {
+            edge: key("c/u"),
+            input: key("u"),
+            keyed: false,
+        })]);
+        let mut u = Log {
+            name: "u".into(),
+            states: vec![BTreeMap::new()],
+            layers: vec![],
+            clears: vec![],
+            full_run: None,
+        };
+        let changes = [(key("v"), Ver::Int(1))].into();
+        assert!(u.commit(&ix, &mut w.t, changes, false, true).await);
+        for i in 0..2 {
+            let changes = [(key("k1"), Ver::Int(1))].into();
+            assert!(
+                w.sides[i]
+                    .log
+                    .commit(&ix, &mut w.t, changes, false, true)
+                    .await
+            );
+        }
+        let req = w.request(None, 10);
+        let view = w.t.view(&req).unwrap();
+        let p = plan::plan(&view, &req, &OneIndex(&ix), &NoHold)
+            .await
+            .unwrap();
+        let failed = [(key("k1"), boom())].into();
+        assert!(
+            w.commit_batch(&ix, &p, failed, vec![vec![], vec![]], false)
+                .await
+        );
+        w.counters.deploy = 2;
+        let start = w.start(&ix, 1).await.expect("the deploy starts b's pass");
+        w.apply(start);
+        for keyed in [vec![1], vec![0, 1]] {
+            let mut req = w.request(None, 10);
+            req.inputs = keyed.iter().map(|&j| req.inputs[j].clone()).collect();
+            req.unkeyed = vec![key("c/u")];
+            let view = w.t.view(&req).unwrap();
+            let r = w.t.retry_view(&w.sides[1].edge).unwrap();
+            let p = due::plan_all(&OneIndex(&ix), &r, &view, &req, &NoHold, 10)
+                .await
+                .unwrap();
+            let want = plan::plan(&view, &req, &OneIndex(&ix), &NoHold)
+                .await
+                .unwrap();
+            assert!(want.unkeyed[0].owed());
+            assert_eq!(p.unkeyed, want.unkeyed, "{} keyed inputs", keyed.len());
+            assert_eq!(p.inputs.last().unwrap().keys.len(), 1, "b retries k1");
+        }
+    });
+}
+
+/// The same with b's conditions moved instead of its version: after a
+/// rebuild on b, a's retry takes b's k1 at v1 under the new conditions, and
+/// b's record of v1 under the old ones is a change batch's.
+#[test]
+fn a_held_back_key_planned_under_other_conditions_than_its_record_lowers_nothing() {
+    let rt = runtime();
+    let ix = index(&rt);
+    rt.block_on(async {
+        let mut w = Multi::new(0);
+        for i in 0..2 {
+            let changes = [(key("k1"), Ver::Int(1))].into();
+            assert!(
+                w.sides[i]
+                    .log
+                    .commit(&ix, &mut w.t, changes, false, true)
+                    .await
+            );
+        }
+        let req = w.request(None, 10);
+        let view = w.t.view(&req).unwrap();
+        let p = plan::plan(&view, &req, &OneIndex(&ix), &NoHold)
+            .await
+            .unwrap();
+        let failed = [(key("k1"), boom())].into();
+        assert!(
+            w.commit_batch(&ix, &p, failed, vec![vec![], vec![]], false)
+                .await
+        );
+        w.catch_up(&ix).await;
+        let life = w.t.per_key[&w.sides[1].edge].life;
+        w.apply(vec![Part::Rebuild(Rebuild {
+            edge: w.sides[1].edge.clone(),
+            to: 1,
+            life,
+        })]);
+        let nows = [
+            w.now.clone(),
+            Arc::new(Conditions {
+                rebuild: 1,
+                ..(*w.now).clone()
+            }),
+        ];
+        catch_up_under(&mut w, &ix, &nows).await;
+        w.counters.deploy = 2;
+        let mut req = w.request(None, 10);
+        req.inputs[1].conditions = nows[1].clone();
+        for i in [1, 0] {
+            let start = w.start(&ix, i).await.expect("the deploy starts a pass");
+            w.apply(start);
+            let view = w.t.view(&req).unwrap();
+            let r = w.t.retry_view(&w.sides[i].edge).unwrap();
+            let p = due::plan_all(&OneIndex(&ix), &r, &view, &req, &NoHold, 10)
+                .await
+                .unwrap();
+            if i == 1 {
+                assert!(p.inputs[1].keys.is_empty(), "b's k1 is owed by the rebuild");
+                let reports = [InputReport::default(), InputReport::default()];
+                commit_under(&mut w, &ix, &p, &nows, &reports).await;
+                continue;
+            }
+            assert_eq!(p.inputs[1].keys[0].version, Ver::Int(1));
+            let changes = [(key("k1"), Ver::Int(2))].into();
+            assert!(
+                w.sides[0]
+                    .log
+                    .commit(&ix, &mut w.t, changes, true, false)
+                    .await
+            );
+            let reports = [
+                InputReport {
+                    failed: vec![],
+                    loaded: vec![(key("k1"), Ver::Int(2))],
+                },
+                InputReport::default(),
+            ];
+            commit_under(&mut w, &ix, &p, &nows, &reports).await;
+        }
+        assert_eq!(w.t.per_key[&w.sides[1].edge].last.deploy, 2);
+        assert!(w.start(&ix, 1).await.is_none(), "no pass is due on b");
+    });
+}
+
+async fn catch_up_under(w: &mut Multi, ix: &ChangeIndex, nows: &[Arc<Conditions>]) {
+    for j in 0..w.sides.len() {
+        let v = w.t.outcome_view(&w.sides[j].edge).unwrap();
+        let (f, d) = w.ctx();
+        let ctx = Ctx {
+            now: w.clock,
+            counters: w.counters,
+            retries: 2,
+            time_ms: 0,
+            producer: b"",
+            failures_path: &f,
+            due_path: &d,
+        };
+        if let Some(parts) = oc::catch_up(&OneIndex(ix), &v, &nows[j], &ctx)
+            .await
+            .unwrap()
+        {
+            w.apply(parts);
+        }
+    }
+}
+
+/// A batch with no failures committed under each input's own conditions.
+async fn commit_under(
+    w: &mut Multi,
+    ix: &ChangeIndex,
+    p: &plan::Plan,
+    nows: &[Arc<Conditions>],
+    reports: &[InputReport],
+) {
+    let mut ops = w.t.progress_ops(p, reports, b"", None).unwrap();
+    catch_up_under(w, ix, nows).await;
+    let mut parts = vec![];
+    for j in 0..w.sides.len() {
+        let v = w.t.outcome_view(&w.sides[j].edge).unwrap();
+        let (f, d) = w.ctx();
+        let ctx = Ctx {
+            now: w.clock,
+            counters: w.counters,
+            retries: 2,
+            time_ms: 0,
+            producer: b"",
+            failures_path: &f,
+            due_path: &d,
+        };
+        let loaded = &reports[j].loaded;
+        let mut ps = oc::commit(
+            &OneIndex(ix),
+            &v,
+            p,
+            j,
+            &[],
+            loaded,
+            &nows[j],
+            &ctx,
+            &mut ops,
+        )
+        .await
+        .unwrap();
+        parts.append(&mut ps);
+    }
+    let mut all = ops.parts;
+    all.append(&mut parts);
+    w.apply(all);
+}
+
+/// The same as a retry held back by another input's full run, with the
+/// worker naming b's load of k1 at the version planned: b still read k1 as
+/// planned, so the key comes again.
+#[test]
+fn a_load_named_at_the_planned_version_is_read_as_planned() {
+    let rt = runtime();
+    let ix = index(&rt);
+    rt.block_on(async {
+        let mut w = Multi::new(0);
+        for i in 0..2 {
+            let changes = [(key("k1"), Ver::Int(1))].into();
+            assert!(
+                w.sides[i]
+                    .log
+                    .commit(&ix, &mut w.t, changes, false, true)
+                    .await
+            );
+        }
+        let req = w.request(None, 10);
+        let view = w.t.view(&req).unwrap();
+        let p = plan::plan(&view, &req, &OneIndex(&ix), &NoHold)
+            .await
+            .unwrap();
+        let failed = [(key("k1"), boom())].into();
+        assert!(
+            w.commit_batch(&ix, &p, failed, vec![vec![], vec![]], false)
+                .await
+        );
+        w.counters.deploy = 2;
+        let start = w.start(&ix, 1).await.expect("the deploy starts b's pass");
+        w.apply(start);
+        let r = w.t.retry_view(&w.sides[1].edge).unwrap();
+        let req = w.request(None, 1);
+        let view = w.t.view(&req).unwrap();
+        let p = due::plan_all(&OneIndex(&ix), &r, &view, &req, &NoHold, 10)
+            .await
+            .unwrap();
+        let changes = [(key("k1"), Ver::Int(2))].into();
+        assert!(
+            w.sides[0]
+                .log
+                .commit(&ix, &mut w.t, changes, true, false)
+                .await
+        );
+        let failed = [(key("k1"), boom())].into();
+        let loaded = vec![
+            vec![(key("k1"), Ver::Int(2))],
+            vec![(key("k1"), Ver::Int(1))],
+        ];
+        assert!(w.commit_batch(&ix, &p, failed, loaded, true).await);
+        assert_eq!(w.stats[3], 1, "k1 is held back");
+        assert_eq!(w.t.per_key[&w.sides[1].edge].last.deploy, 1);
+        assert!(
+            w.start(&ix, 1).await.is_some(),
+            "k1 waits for its deploy retry"
+        );
+    });
+}
+
+fn boom() -> Reported {
+    Reported {
+        kind: Kind::Failed,
+        message: b"boom".as_slice().into(),
+        retry_after: None,
+        retry_for: None,
     }
 }

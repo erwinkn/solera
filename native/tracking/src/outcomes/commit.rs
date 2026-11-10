@@ -187,8 +187,9 @@ pub async fn commit(
         return invalid("catch up first: the edge's reverts are not looked for through the input's head under the conditions now");
     }
     let keyed = v.progress.keyed().expect("a per-key edge is keyed");
-    let retry = plan.pass.is_some();
-    let step = if let Some(id) = plan.pass {
+    let pass = plan.pass.as_ref().filter(|id| id.edge == v.edge);
+    let retry = pass.is_some();
+    let step = if let Some(id) = pass {
         if id.life != v.per_key.life {
             return invalid("a retry batch of a pass in an earlier life of the edge");
         }
@@ -493,10 +494,36 @@ pub async fn commit(
         at: v.failures.head,
         look: made.map(|_| (looked, caught_up)),
         life: v.per_key.life,
-        low: next.values().flatten().fold(None, |mut low, r| {
-            cover(&mut low, &r.stored);
-            low
-        }),
+        // A key held back while this input read it as planned, at what its
+        // record failed on (another input moved), was not retried and its
+        // input has not moved: it waits for its retry again, so it lowers
+        // what the pass covers like a record written. One read at another
+        // version comes back with its change, or the catch-up lowers it
+        // when the input returns; one planned at another holding than its
+        // record's is a change batch's.
+        low: next
+            .values()
+            .flatten()
+            .chain(
+                p.keys
+                    .iter()
+                    .filter(|c| held_back.binary_search(&c.key).is_ok())
+                    .filter_map(|c| {
+                        let pr = priors.get(&c.key)?;
+                        let on = conds.get(&pr.on_cond)?;
+                        let tried = Holding::of(pr.on.as_version(), on, &c.key);
+                        let planned = Holding::of(c.version.as_version(), &p.conditions, &c.key);
+                        let got = loaded
+                            .binary_search_by(|(x, _)| x.cmp(&c.key))
+                            .map_or(&c.version, |i| &loaded[i].1);
+                        let read = Holding::of(got.as_version(), &p.conditions, &c.key);
+                        (!owed(&tried, &planned) && !owed(&read, &planned)).then_some(pr)
+                    }),
+            )
+            .fold(None, |mut low, r| {
+                cover(&mut low, &r.stored);
+                low
+            }),
         made,
         points: vec![],
     }));
