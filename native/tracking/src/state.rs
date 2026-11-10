@@ -67,6 +67,16 @@ impl Tracking {
     }
 
     pub fn apply_event(&mut self, ev: Event) -> Result<()> {
+        self.check_event(&ev)?;
+        for p in ev.parts {
+            self.apply_part(p);
+        }
+        Ok(())
+    }
+
+    /// Whether `apply` would take the event, applying nothing: the engine
+    /// checks a commit's event before it journals it.
+    pub fn check_event(&self, ev: &Event) -> Result<()> {
         let mut touched = std::collections::HashSet::new();
         for p in &ev.parts {
             for t in p.touches() {
@@ -82,9 +92,6 @@ impl Tracking {
         }
         for p in &ev.parts {
             self.check(p)?;
-        }
-        for p in ev.parts {
-            self.apply_part(p);
         }
         Ok(())
     }
@@ -273,6 +280,24 @@ mod tests {
             }),
         ]);
         assert!(t.apply(&twice.encode()).is_err());
+        assert_eq!(t.snapshot(), before);
+    }
+
+    #[test]
+    fn check_answers_as_apply_would_and_applies_nothing() {
+        let mut t = Tracking::new();
+        let open = Event::of(vec![Part::EdgeOpen(EdgeOpen {
+            edge: b"e".as_slice().into(),
+            input: b"items".as_slice().into(),
+            keyed: true,
+        })]);
+        let before = t.snapshot();
+        t.check_event(&open).unwrap();
+        assert_eq!(t.snapshot(), before);
+        t.apply(&open.encode()).unwrap();
+        let before = t.snapshot();
+        assert!(t.check_event(&open).is_err());
+        assert!(t.apply(&open.encode()).is_err());
         assert_eq!(t.snapshot(), before);
     }
 
