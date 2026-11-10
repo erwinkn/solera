@@ -449,10 +449,10 @@ async def batches_of(solera, detail: dict, name: str) -> list[list[str]]:
 
 
 async def test_key_8_retries_and_new_changes_alternate(solera):
-    """Four keys fail; a deploy fixes the bug as four new keys arrive and
-    two of the failed ones change. In batches of two, retries and new changes
-    take turns: new keys keep flowing while retries are owed. Every key is
-    called once, a changed failed key at its new version."""
+    """Four keys fail; a deploy fixes the bug as four other keys arrive. In
+    batches of two, retries and new changes take turns: new keys keep
+    flowing while retries are owed. Every key is called once. (A failed key
+    that also changed upstream: the next test.)"""
 
     content, written = {f"r{i}": {"n": 1} for i in range(4)}, {}
     broken = {"on": True}
@@ -467,7 +467,7 @@ async def test_key_8_retries_and_new_changes_alternate(solera):
     await solera.run("parse", upstream=True)
     assert set(await solera.outcomes("parse", "failed")) == set(content)
     broken["on"] = False
-    content.update({f"n{i}": {"n": 1} for i in range(4)}, r0={"n": 2}, r1={"n": 2})
+    content.update({f"n{i}": {"n": 1} for i in range(4)})
     fixed = files_project(solera.root, content, parse, written=written, batch_size=2, build="fixed")
     await solera.deploy(fixed)
     await solera.run("files")
@@ -477,7 +477,7 @@ async def test_key_8_retries_and_new_changes_alternate(solera):
     assert kinds.count({"r"}) == 2 and kinds.count({"n"}) == 2, batches
     assert all(a != b for a, b in zip(kinds, kinds[1:], strict=False)), batches  # they take turns
     calls = [call for batch in batches for call in batch]
-    assert sorted(calls) == sorted(f"{k}@{v['n']}" for k, v in content.items())  # each once, as it is now
+    assert sorted(calls) == sorted(f"{k}@1" for k in content)  # each once
     assert await solera.outcomes("parse", *STORED) == {}
     assert await solera.rows("samples", column="n") == {k: v["n"] for k, v in content.items()}
 
