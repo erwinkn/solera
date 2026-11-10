@@ -83,6 +83,7 @@ fn a_read_of_listed_keys_holds_a_bounded_window() {
             time_ms: 0,
             producer: b"",
             live_before: 0,
+            clear: false,
         };
         ix.write_commit("big", nc, &run).await.unwrap()
     });
@@ -123,6 +124,7 @@ fn a_commit_writer_holds_parts_not_the_commit() {
         time_ms: 0,
         producer: b"",
         live_before: 0,
+        clear: false,
     };
     let base = NOW.load(Relaxed);
     PEAK.store(base, Relaxed);
@@ -158,6 +160,7 @@ fn a_commit_writer_holds_parts_not_the_commit() {
         time_ms: 0,
         producer: b"",
         live_before: 0,
+        clear: false,
     };
     let base = NOW.load(Relaxed);
     PEAK.store(base, Relaxed);
@@ -492,6 +495,7 @@ fn a_read_that_joins_another_reads_fetch_keeps_only_its_own_blocks() {
             time_ms: 0,
             producer: b"",
             live_before: 0,
+            clear: false,
         };
         ChangeIndex::new(store, WriteOptions::default())
             .write_commit("joined", nc, &run)
