@@ -33,6 +33,14 @@ pub enum Part {
     EdgeOpen(progress::EdgeOpen),
     /// B3: an edge ends: its input was removed, or its consumer.
     EdgeClose(progress::EdgeClose),
+    /// B3: an edge is renamed, keeping its progress.
+    EdgeRename(progress::EdgeRename),
+    /// B3: an edge's progress starts over, empty or held.
+    Reset(progress::Reset),
+    /// B3: what a batch commit writes to a keyed edge.
+    Batch(progress::BatchProgress),
+    /// B3: an unkeyed edge consumed its input through a commit.
+    Consumed(progress::Consumed),
 }
 
 impl Part {
@@ -40,6 +48,10 @@ impl Part {
         match self {
             Part::EdgeOpen(_) => progress::TAG_EDGE_OPEN,
             Part::EdgeClose(_) => progress::TAG_EDGE_CLOSE,
+            Part::EdgeRename(_) => progress::TAG_EDGE_RENAME,
+            Part::Reset(_) => progress::TAG_RESET,
+            Part::Batch(_) => progress::TAG_BATCH,
+            Part::Consumed(_) => progress::TAG_CONSUMED,
         }
     }
 
@@ -47,6 +59,10 @@ impl Part {
         match self {
             Part::EdgeOpen(p) => p.encode(e),
             Part::EdgeClose(p) => p.encode(e),
+            Part::EdgeRename(p) => p.encode(e),
+            Part::Reset(p) => p.encode(e),
+            Part::Batch(p) => p.encode(e),
+            Part::Consumed(p) => p.encode(e),
         }
     }
 
@@ -54,6 +70,10 @@ impl Part {
         Ok(match tag {
             progress::TAG_EDGE_OPEN => Part::EdgeOpen(progress::EdgeOpen::decode(d)?),
             progress::TAG_EDGE_CLOSE => Part::EdgeClose(progress::EdgeClose::decode(d)?),
+            progress::TAG_EDGE_RENAME => Part::EdgeRename(progress::EdgeRename::decode(d)?),
+            progress::TAG_RESET => Part::Reset(progress::Reset::decode(d)?),
+            progress::TAG_BATCH => Part::Batch(progress::BatchProgress::decode(d)?),
+            progress::TAG_CONSUMED => Part::Consumed(progress::Consumed::decode(d)?),
             t => return format(format!("unknown part tag {t:#04x}")),
         })
     }

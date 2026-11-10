@@ -15,7 +15,7 @@ use solera_index::LayerRef;
 use crate::codec::{Dec, Enc};
 use crate::error::{format, Result};
 use crate::event::{Event, Part};
-use crate::progress::{self, Progress};
+use crate::progress::Progress;
 
 /// An opaque name the engine chooses: an output (asset, partition, output
 /// name) or an edge (consumer partition, input name), encoded by Python.
@@ -71,6 +71,10 @@ impl Tracking {
         match p {
             Part::EdgeOpen(p) => p.check(self),
             Part::EdgeClose(p) => p.check(self),
+            Part::EdgeRename(p) => p.check(self),
+            Part::Reset(p) => p.check(self),
+            Part::Batch(p) => p.check(self),
+            Part::Consumed(p) => p.check(self),
         }
     }
 
@@ -78,6 +82,10 @@ impl Tracking {
         match p {
             Part::EdgeOpen(p) => p.apply(self),
             Part::EdgeClose(p) => p.apply(self),
+            Part::EdgeRename(p) => p.apply(self),
+            Part::Reset(p) => p.apply(self),
+            Part::Batch(p) => p.apply(self),
+            Part::Consumed(p) => p.apply(self),
         }
     }
 
@@ -125,39 +133,6 @@ impl Tracking {
         }
         d.end()?;
         Ok(t)
-    }
-}
-
-impl progress::EdgeOpen {
-    pub(crate) fn check(&self, t: &Tracking) -> Result<()> {
-        if t.edges.contains_key(&self.edge) {
-            return crate::error::invalid("the edge is already open");
-        }
-        Ok(())
-    }
-
-    pub(crate) fn apply(self, t: &mut Tracking) {
-        let progress = Arc::new(Progress::new(self.keyed));
-        t.edges.insert(
-            self.edge,
-            Edge {
-                input: self.input,
-                progress,
-            },
-        );
-    }
-}
-
-impl progress::EdgeClose {
-    pub(crate) fn check(&self, t: &Tracking) -> Result<()> {
-        if !t.edges.contains_key(&self.edge) {
-            return crate::error::invalid("no such edge");
-        }
-        Ok(())
-    }
-
-    pub(crate) fn apply(self, t: &mut Tracking) {
-        t.edges.remove(&self.edge);
     }
 }
 
