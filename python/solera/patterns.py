@@ -5,9 +5,11 @@ keyed upstream an incremental input takes.
                 exclude={"archive": "**/archive/**"}, each=True)
 
 Globs over the key string: `**` crosses `/` (and `**/` matches no directory
-too), `*` and `?` do not; `Regex("…")` for the rest. A key is taken when it
-matches an `include` (any key, without one) and no `exclude`. Exclusions are
-named, so that what left a key out can be told on demand.
+too), `*` and `?` do not; `Regex("…")` for the rest, in the Rust `regex`
+dialect (see `Regex`). A key is taken when it matches an `include` (any key,
+without one) and no `exclude`. Exclusions are named, so that what left a key
+out can be told on demand. Matching is native (`Matcher`), the same matcher the
+planner uses.
 """
 
 from __future__ import annotations
@@ -16,15 +18,25 @@ import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 
+from solera._native import KeyMatcher, regex_check
+
 
 @dataclass(frozen=True)
 class Regex:
-    """A pattern as a regular expression, matched against the whole key."""
+    """A pattern as a regular expression, matched against the whole key.
+
+    The dialect is Rust's `regex` crate (https://docs.rs/regex), not Python's
+    `re`: matching takes time linear in the key, so lookaround (`(?=…)`,
+    `(?!…)`, `(?<=…)`, `(?<!…)`) and backreferences (`\\1`) are not
+    supported, and a pattern using them is refused here, when the input is
+    declared. The pattern must match the whole key (as `re.fullmatch`), and
+    `.` matches a newline too.
+    """
 
     pattern: str
 
     def __post_init__(self):
-        re.compile(self.pattern)
+        regex_check(self.pattern)
 
 
 def glob_regex(glob: str) -> str:
@@ -73,23 +85,7 @@ def spec(include=None, exclude=None) -> dict | None:
     return {"include": [_one(p) for p in includes], "exclude": excludes}
 
 
-def _compiled(p: dict) -> re.Pattern:
-    return re.compile(p["regex"] if "regex" in p else glob_regex(p["glob"]), re.DOTALL)
-
-
-class Matcher:
-    """Whether an input takes a key, from its manifest spec (`None`: every key)."""
-
-    def __init__(self, patterns: dict | None):
-        patterns = patterns or {}
-        self.include = [_compiled(p) for p in patterns.get("include") or ()]
-        self.exclude = [(name, _compiled(p)) for name, p in patterns.get("exclude") or ()]
-
-    def included(self, key: str) -> bool:
-        return not self.include or any(p.fullmatch(key) for p in self.include)
-
-    def excluded_by(self, key: str) -> str | None:
-        return next((name for name, p in self.exclude if p.fullmatch(key)), None)
-
-    def __call__(self, key: str) -> bool:
-        return self.included(key) and self.excluded_by(key) is None
+Matcher = KeyMatcher
+"""Whether an input takes a key, from its manifest spec (`None`: every key):
+`included(key)`, `excluded_by(key)` (the first matching exclusion's name) and
+`m(key)`, natively, with the planner's matcher."""

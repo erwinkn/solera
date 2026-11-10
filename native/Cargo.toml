@@ -20,10 +20,11 @@ arrow-array = { version = "60", default-features = false, features = ["ffi"] }
 arrow-schema = "60"
 arrow-buffer = "60"
 solera-index = { path = "index" }
+solera-tracking = { path = "tracking" }
 tokio = { version = "1", features = ["rt-multi-thread"] }
 
 [workspace]
-members = ["index"]
+members = ["index", "tracking"]
 
 [profile.release]
 lto = "thin"

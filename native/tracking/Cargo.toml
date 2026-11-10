@@ -1,0 +1,16 @@
+[package]
+name = "solera-tracking"
+version = "0.0.1"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+
+[dependencies]
+solera-index = { path = "../index" }
+regex = "1"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+
+[dev-dependencies]
+object_store = "0.14"
+rand = { version = "0.9", features = ["small_rng"] }
+tokio = { version = "1", features = ["rt-multi-thread"] }

@@ -39,6 +39,7 @@ jobs:
       - run: cargo fmt --check --manifest-path native/Cargo.toml
       - run: cargo check --manifest-path native/Cargo.toml
       - run: cargo test --release --manifest-path native/Cargo.toml -p solera-index
+      - run: cargo test --release --manifest-path native/Cargo.toml -p solera-tracking
       - run: uv sync --locked
       - run: uv run ruff check
       - run: uv run ruff format --check
