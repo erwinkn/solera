@@ -1,0 +1,26 @@
+[package]
+name = "core-stale-bench"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Staleness at the scale target (build plan N10, N11): keeping the witness
+# current per upstream commit and reading edge, and counting owed keys on
+# request, on the planner bench's 100M-key output (bench/core/plan).
+[dependencies]
+solera-index = { path = "../../../native/index" }
+solera-tracking = { path = "../../../native/tracking" }
+async-trait = "0.1"
+bytes = "1"
+futures = "0.3"
+libc = "0.2"
+object_store = "0.14"
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "time", "sync"] }
+
+[profile.release]
+debug = 1
+lto = "thin"
+codegen-units = 1
+
+[workspace]
