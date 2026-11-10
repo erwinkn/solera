@@ -20,6 +20,7 @@ pub mod layers;
 mod layers_py;
 pub mod rows;
 pub mod sort;
+mod stale_py;
 pub mod stream;
 mod tracking_py;
 

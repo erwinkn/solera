@@ -16,6 +16,7 @@
 //! - [`outcomes`]: key outcomes of per-key assets, held with their points (B6).
 //! - [`due`]: what is due by time, and retry passes (B6).
 //! - [`commit`]: output and source commits (B4).
+//! - [`stale`]: staleness kept exact at every commit (B7).
 
 pub mod codec;
 pub mod commit;
@@ -26,6 +27,7 @@ pub mod outcomes;
 pub mod plan;
 pub mod progress;
 pub mod record;
+pub mod stale;
 pub mod state;
 
 pub use error::{Error, Result};
