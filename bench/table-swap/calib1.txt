@@ -1,0 +1,100 @@
+== swap: 1500 of 1500 fail
+    ('fullrun', 'clear', 'table', 'swap'): [('items', (('k4', True), ('k5', True))), ('step', 'tally', 1)],
+    items c1: k4: − → 1 · k5: − → 1
+    tally plans its full run at c1, version 1: ['k4'], range (-inf, k4]
+      tally v1 writes clear; even=1
+    tally#1 commits v1
+    => outsiders read tally as {even@1}, which no commit since #0 outside a full run recorded
+== solera_build: 631 of 1500 fail
+    ('fullrun', 'clear', 'table', 'solera_build'): [('items', (('k4', True),)), ('step', 'tally', 1), ('define', 'tally'), ('release', 'tally'), ('switch', 'tally', False)],
+    items c1: k4: − → 1
+    tally plans its full run at c1, version 1: ['k4'], range (-inf, +inf]
+      tally v1 writes clear; even=1
+    tally#1 commits v1
+      tally is complete
+    tally's definition changes to d1
+    the engine calls tally's store to switch to build v1, and crashes before it records the call
+    copy plans its full run at c1/f0, version 2: ['k4'], range (-inf, +inf]
+      copy v2 writes clear; k4=1
+    copy#1 commits v2
+      copy is complete
+    tally plans its full run at c1, version 3: ['k4'], range (-inf, +inf]
+      tally v3 writes clear; even=1
+    tally#2 commits v3
+      tally is complete
+    => tally's log says even@3, its store {even@1}
+== first_full: 138 of 1500 fail
+    ('fullrun', 'clear', 'table', 'first_full'): [('items', (('k1', True),)), ('items', (('k3', True),)), ('step', 'copy', 1)],
+    items c1: k1: − → 1
+    items c2: k3: − → 2
+    copy plans at c2/f0, version 1: ['k1'], range (-inf, k1]
+      copy v1 writes k1=1
+    copy#1 commits v1
+    => outsiders read copy as {k1@1}, which no commit since #0 outside a full run recorded
+== switch_commit: 1494 of 1500 fail
+    ('fullrun', 'clear', 'table', 'switch_commit'): [('items', (('k2', True), ('k3', True)))],
+    items c1: k2: − → 1 · k3: − → 1
+    copy plans its full run at c1/f0, version 1: ['k2', 'k3'], range (-inf, +inf]
+      copy v1 writes clear; k2=1, k3=1
+    copy#1 commits v1
+      copy is complete
+    tally plans its full run at c1, version 2: ['k2', 'k3'], range (-inf, +inf]
+      tally v2 writes clear; even=1, odd=1
+    tally#1 commits v2
+      tally is complete
+    checks plans at items c#1: ['k2', 'k3'], range (-inf, +inf]
+    checks loads k2 absent, k3 absent
+    checks commits: k2@1, k3@1
+    archive plans at copy#1: ['k2', 'k3'], range (-inf, +inf]
+    archive loads k2@1, k3@1
+    archive commits: k2@1, k3@1
+    report plans at tally#1: ['even', 'odd'], range (-inf, +inf]
+    report loads even@2, odd@2
+    report commits: even@2, odd@2
+    summary reads copy whole: ['k2', 'k3']
+    items's index merges: the base moves to #1
+    copy's index merges: the base moves to #1
+    tally's index merges: the base moves to #1
+    => at rest outsiders read copy as {}, its log says {'k2': 1, 'k3': 1}
+== switch_alone: 23 of 1500 fail
+    ('fullrun', 'clear', 'table', 'switch_alone'): [('items', (('k2', True), ('k3', True), ('k4', True))), ('plan', 'copy', 2), ('items', (('k1', False), ('k5', True))), ('step', 'copy', 1), ('step', 'copy', 1), ('items', (('k2', False), ('k5', False)))],
+    items c1: k2: − → 1 · k3: − → 1 · k4: − → 1
+    copy plans its full run at c1/f0, version 1: ['k2', 'k3'], range (-inf, k3]
+    items c2: k5: − → 2
+      copy v1 writes clear; k2=1, k3=1
+    copy#1 commits v1
+    copy plans at c2/f0, version 2: ['k4'], range (k3, k4]
+      copy v2 writes k4=1
+    copy#2 commits v2
+    items c3: k2: 1 → − · k5: 2 → −
+      copy is complete
+    copy plans at c3/f0, version 3: [], range (k4, +inf]
+    copy#3 commits v3
+    tally plans its full run at c3, version 4: ['k3', 'k4'], range (-inf, +inf]
+      tally v4 writes clear; even=1, odd=1
+    tally#1 commits v4
+      tally is complete
+    checks plans at items c#3: ['k3', 'k4'], range (-inf, +inf]
+    checks loads k3 absent, k4 absent
+    checks commits: k3@1, k4@1
+    archive plans at copy#2: ['k2', 'k3'], range (-inf, k3]
+    archive loads k2@1, k3@1
+    archive commits: k2@1, k3@1
+    report plans at tally#1: ['even', 'odd'], range (-inf, +inf]
+    report loads even@4, odd@4
+    report commits: even@4, odd@4
+    copy plans at c3/f0, version 8: ['k2'], range (-inf, +inf]
+      copy v8 writes k2 removed
+    copy#3 commits v8
+    archive plans at copy#3: ['k4'], range (k3, +inf]
+    archive loads k4@2
+    archive commits: k4@2
+    archive plans at copy#3: ['k2'], range (-inf, +inf]
+    archive loads k2 absent
+    archive commits: k2
+    the engine calls tally's store to switch to build v4
+    summary reads copy whole: ['k3', 'k4']
+    items's index merges: the base moves to #1
+    copy's index merges: the base moves to #2
+    tally's index merges: the base moves to #1
+    => at rest outsiders read copy as {}, its log says {'k3': 1, 'k4': 2}

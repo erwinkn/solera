@@ -1,0 +1,5 @@
+{"what": "build in the shadow (10000000 rows)", "seconds": 136.1, "rows_per_s": 73484, "wal_mb": 1499, "batch_p50_ms": 128.4, "batch_p99_ms": 274.0, "first_batch_ms": 227.0}
+{"what": "switch under a 10 s outside query", "point_during_switch_s": 0.002, "point_reads_version": 1, "count_during_switch_s": 1.072, "count_reads": [10000000, 1], "delete_s": 10.0, "insert_s": 91.1, "commit_s": 0.02, "drop_s": 0.24, "wal_mb": 4728, "switch_total_s": 101.4}
+{"what": "after the switch", "rows": 10000000, "versions": [1000, 1000]}
+{"what": "build + switch, total", "seconds": 239.7}
+{"what": "vacuum after the switch", "seconds": 8.7}
