@@ -3,7 +3,7 @@ form, a shadow build with a copy at the switch, on one table at the scale
 target (100M rows). Outside query cost is measured before, after today's
 rebuild, and after the switch. Branch exp/table-swap.
 
-    python bench6.py N [today|shadow|both]
+    BENCH_WHAT=today|shadow|both python bench6.py N
 
 BENCH_NARROW=1 leaves column c NULL and the table without its index on a,
 so that 100M rows fit a 65 GB disk: the switch needs the old rows, the
@@ -24,7 +24,7 @@ from bench import conn, fresh, key, out, rebuild, setup_other, size, sql, vacuum
 from bench2 import COLS, gen, measure
 
 N = int(sys.argv[1]) if len(sys.argv) > 1 else 100_000_000
-WHAT = sys.argv[2] if len(sys.argv) > 2 else "both"
+WHAT = os.environ.get("BENCH_WHAT", "both")
 NARROW = os.environ.get("BENCH_NARROW") == "1"
 
 if NARROW:
