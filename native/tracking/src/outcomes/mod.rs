@@ -688,4 +688,79 @@ mod tests {
         assert_eq!(Record::decode(&absent.encode()).unwrap(), absent);
         assert!(Record::decode(&[9]).is_err());
     }
+
+    #[test]
+    fn b3_parts_that_move_outcome_state_are_refused_beside_b6_parts() {
+        use crate::event::{Event, Part};
+        use crate::progress::{EdgeClose, EdgeOpen, EdgeRename, Reset};
+        let e = || -> Id { b"e".as_slice().into() };
+        let mut t = Tracking::new();
+        let apply = |t: &mut Tracking, parts| t.apply(&Event::of(parts).encode());
+        apply(
+            &mut t,
+            vec![Part::EdgeOpen(EdgeOpen {
+                edge: e(),
+                input: b"items".as_slice().into(),
+                keyed: true,
+            })],
+        )
+        .unwrap();
+        let start = PassStart {
+            edge: e(),
+            n: 1,
+            at: 0,
+            counters: Counters::default(),
+        };
+        apply(&mut t, vec![Part::PassStart(start)]).unwrap();
+        let done = Part::Outcomes(Outcomes {
+            edge: e(),
+            counts: [0; 6],
+            classes: [0; 3],
+            conds: vec![],
+            refs: vec![],
+            step: Some(Step {
+                n: 1,
+                from: None,
+                to: None,
+            }),
+            at: 0,
+            seen: 0,
+            cond: 0,
+            points: vec![],
+        });
+        let rebuild = |edge: Id| Part::Rebuild(Rebuild { edge, to: 1 });
+        let before = t.snapshot();
+        for parts in [
+            vec![Part::EdgeClose(EdgeClose { edge: e() }), done.clone()],
+            vec![
+                Part::Reset(Reset {
+                    edge: e(),
+                    held: false,
+                }),
+                rebuild(e()),
+            ],
+            vec![
+                Part::EdgeRename(EdgeRename {
+                    from: e(),
+                    to: b"f".as_slice().into(),
+                    input: b"items".as_slice().into(),
+                }),
+                rebuild(b"f".as_slice().into()),
+            ],
+        ] {
+            let err = apply(&mut t, parts).unwrap_err().to_string();
+            assert!(err.contains("two parts of one event change"), "{err}");
+            assert_eq!(t.snapshot(), before);
+        }
+        let close = Part::EdgeClose(EdgeClose { edge: e() });
+        for kind in [FAILURES, DUE, PASS] {
+            let id = output_id(kind, b"e");
+            assert!(close.touches().contains(&("output", id.to_vec().into())));
+        }
+        assert!(done
+            .touches()
+            .contains(&("output", output_id(PASS, b"e").to_vec().into())));
+        apply(&mut t, vec![done]).unwrap();
+        assert!(t.per_key.get(b"e".as_slice()).unwrap().pass.is_none());
+    }
 }

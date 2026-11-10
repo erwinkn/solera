@@ -26,6 +26,27 @@ use crate::commit;
 use crate::error::{format, Result};
 use crate::outcomes;
 use crate::progress;
+use std::borrow::Cow;
+
+/// A thing one part of an event changes, as (kind, id).
+pub type Touch<'a> = (&'static str, Cow<'a, [u8]>);
+
+fn on<'a>(kind: &'static str, id: &'a [u8]) -> Touch<'a> {
+    (kind, Cow::Borrowed(id))
+}
+
+/// An edge's outcome state and its record outputs, which B6 changes when
+/// B3 closes, resets or renames the edge ([crate::outcomes::follow]).
+fn outcome_state(edge: &[u8]) -> impl Iterator<Item = Touch<'_>> {
+    std::iter::once(on("outcomes", edge)).chain(
+        [outcomes::FAILURES, outcomes::DUE, outcomes::PASS].map(|k| {
+            (
+                "output",
+                Cow::Owned(outcomes::output_id(k, edge).into_vec()),
+            )
+        }),
+    )
+}
 
 pub const FORMAT: u8 = 1;
 
@@ -59,20 +80,45 @@ impl Part {
     /// What the part changes, as (kind, id): parts of one event change
     /// distinct things, so each part's check against the state before the
     /// event still holds when the parts before it have applied.
-    pub fn touches(&self) -> Vec<(&'static str, &[u8])> {
+    pub fn touches(&self) -> Vec<Touch<'_>> {
         match self {
-            Part::EdgeOpen(p) => vec![("edge", &p.edge)],
-            Part::EdgeClose(p) => vec![("edge", &p.edge)],
-            Part::EdgeRename(p) if p.from == p.to => vec![("edge", &p.from)],
-            Part::EdgeRename(p) => vec![("edge", &p.from), ("edge", &p.to)],
-            Part::Reset(p) => vec![("edge", &p.edge)],
-            Part::Batch(p) => vec![("edge", &p.edge)],
-            Part::Consumed(p) => vec![("edge", &p.edge)],
-            Part::OutputCommit(p) => vec![("output", &p.output)],
-            Part::Outcomes(p) if p.points.is_empty() => vec![("outcomes", &p.edge)],
-            Part::Outcomes(p) => vec![("outcomes", &p.edge), ("edge", &p.edge)],
-            Part::PassStart(p) => vec![("outcomes", &p.edge)],
-            Part::Rebuild(p) => vec![("outcomes", &p.edge)],
+            Part::EdgeOpen(p) => vec![on("edge", &p.edge)],
+            Part::EdgeClose(p) => [on("edge", &p.edge)]
+                .into_iter()
+                .chain(outcome_state(&p.edge))
+                .collect(),
+            Part::EdgeRename(p) if p.from == p.to => vec![on("edge", &p.from)],
+            Part::EdgeRename(p) => [on("edge", &p.from), on("edge", &p.to)]
+                .into_iter()
+                .chain(outcome_state(&p.from))
+                .chain(outcome_state(&p.to))
+                .collect(),
+            Part::Reset(p) => [on("edge", &p.edge)]
+                .into_iter()
+                .chain(outcome_state(&p.edge))
+                .collect(),
+            Part::Batch(p) if p.reset => [on("edge", &p.edge)]
+                .into_iter()
+                .chain(outcome_state(&p.edge))
+                .collect(),
+            Part::Batch(p) => vec![on("edge", &p.edge)],
+            Part::Consumed(p) => vec![on("edge", &p.edge)],
+            Part::OutputCommit(p) => vec![on("output", &p.output)],
+            Part::Outcomes(p) => {
+                let mut v = vec![on("outcomes", &p.edge)];
+                if !p.points.is_empty() {
+                    v.push(on("edge", &p.edge));
+                }
+                if p.step.as_ref().is_some_and(|s| s.to.is_none()) {
+                    v.push((
+                        "output",
+                        Cow::Owned(outcomes::output_id(outcomes::PASS, &p.edge).into_vec()),
+                    ));
+                }
+                v
+            }
+            Part::PassStart(p) => vec![on("outcomes", &p.edge)],
+            Part::Rebuild(p) => vec![on("outcomes", &p.edge)],
         }
     }
 

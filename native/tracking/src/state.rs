@@ -63,13 +63,14 @@ impl Tracking {
         let mut touched = std::collections::HashSet::new();
         for p in &ev.parts {
             for t in p.touches() {
-                if !touched.insert(t) {
+                if touched.contains(&t) {
                     return crate::error::invalid(format!(
                         "two parts of one event change {} {}",
                         t.0,
-                        String::from_utf8_lossy(t.1)
+                        String::from_utf8_lossy(&t.1)
                     ));
                 }
+                touched.insert(t);
             }
         }
         for p in &ev.parts {
