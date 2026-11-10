@@ -765,7 +765,8 @@ fn floor(layers: &[LayerRef]) -> u64 {
 }
 
 /// Every stored batch's lineage, at a random cleanup cursor: what the batch
-/// received, or "not retained" naming a commit below its log's floor. One
+/// received, or "not retained" exactly when a commit the plan read (its head,
+/// and without a reset its replaced pieces' commits) is below its log's floor. One
 /// key's trace agrees with the batch's, and a key's history is its log's.
 async fn check_lineage(
     rng: &mut SmallRng,
@@ -783,14 +784,23 @@ async fn check_lineage(
         let got = lineage::input(&logs, &s.rec, &OneIndex(ix), cleaned)
             .await
             .unwrap();
+        let pieces = if s.rec.reset { &[][..] } else { &s.rec.replaced.pieces[..] };
+        let cut = std::iter::once(s.rec.head)
+            .chain(pieces.iter().filter_map(|p| match p.value {
+                Value::At(c, _) => Some(c),
+                _ => None,
+            }))
+            .filter(|&c| c < floor(&log.layers))
+            .min();
         let got = match got {
             Answer::NotRetained { output, commit } => {
                 assert_eq!(output, log.name, "only the input's history is cut");
-                assert!(commit < floor(&log.layers), "not retained: {commit} is below the floor");
+                assert_eq!(Some(commit), cut, "not retained: the oldest commit the plan read, below the floor");
                 continue;
             }
             Answer::Found(got) => got,
         };
+        assert_eq!(cut, None, "found although the plan read commit {cut:?}, below the floor");
         let want: Vec<Received> = s
             .expected
             .iter()
