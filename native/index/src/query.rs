@@ -6,7 +6,7 @@ use crate::format::{lossy, parse_commits, CommitHeader, LayerRef, WriteOptions, 
 use crate::glob::Pattern;
 use crate::read::{Bounds, KeyList, Walk};
 use crate::run::{Run, Version};
-use crate::store::Store;
+use crate::store::{Store, Upload};
 use std::ops::{Bound, Range, RangeInclusive};
 use std::sync::Arc;
 
@@ -392,20 +392,15 @@ impl ChangeIndex {
     }
 
     /// Write one commit's layer at `path`: its entries, one per changed key
-    /// (their commit numbers are ignored). Returns the layer's reference.
+    /// (their commit numbers are ignored). Returns the layer's reference; a
+    /// commit with no entries writes a layer too.
     pub async fn write_commit(
         &self,
         path: &str,
         commit: NewCommit<'_>,
         entries: &Run,
     ) -> Result<LayerRef> {
-        let mut h = CommitHeader {
-            commit: commit.commit,
-            time_ms: commit.time_ms,
-            producer: commit.producer.to_vec(),
-            ..Default::default()
-        };
-        let mut w = Writer::new(self.write, commit.commit, commit.commit, None)?;
+        let mut w = self.commit_writer(path, commit)?;
         for i in 0..entries.len() {
             let rows = entries.rows(i);
             if rows.len() != 1 {
@@ -414,35 +409,32 @@ impl ChangeIndex {
                     lossy(entries.key(i))
                 ));
             }
-            let (new, replaced) = (
+            w.push(
+                entries.key(i),
                 entries.new_version(rows.start),
                 entries.replaced_version(rows.start),
-            );
-            w.push(entries.key(i), commit.commit, new, replaced)?;
-            match (new.is_absent(), replaced.is_absent()) {
-                (false, true) => h.added += 1,
-                (false, false) => h.updated += 1,
-                _ => h.removed += 1,
-            }
+            )
+            .await?;
         }
-        h.live = (commit.live_before + h.added)
-            .checked_sub(h.removed)
-            .ok_or_else(|| {
-                Error::Invalid(format!(
-                    "commit {} removes more keys than were live",
-                    commit.commit
-                ))
-            })?;
-        if !entries.is_empty() {
-            h.min_key = entries.key(0).to_vec();
-            h.max_key = entries.key(entries.len() - 1).to_vec();
-        }
-        let mut l = w.finish(&[h])?;
-        let mut up = self.store.upload(path)?;
-        up.write(w.take()).await?;
-        up.finish().await?;
-        l.path = path.to_string();
-        Ok(l)
+        w.write().await
+    }
+
+    /// Write one commit's layer at `path` as its entries arrive: parts are
+    /// uploaded as they fill, so the writer holds one part, not the commit.
+    pub fn commit_writer(&self, path: &str, commit: NewCommit<'_>) -> Result<CommitWriter> {
+        Ok(CommitWriter {
+            w: Writer::new(self.write, commit.commit, commit.commit, None)?,
+            up: self.store.upload(path)?,
+            part: self.store.opts.part_bytes,
+            h: CommitHeader {
+                commit: commit.commit,
+                time_ms: commit.time_ms,
+                producer: commit.producer.to_vec(),
+                ..Default::default()
+            },
+            live_before: commit.live_before,
+            path: path.to_string(),
+        })
     }
 
     /// Merge the adjacent layers `run` of the list into one at `path`. Every
@@ -531,6 +523,74 @@ impl ChangeIndex {
         up.finish().await?;
         out.path = path.to_string();
         Ok(out)
+    }
+}
+
+/// One commit's layer, written key by key (`ChangeIndex::commit_writer`).
+/// After an error, drop it: nothing is written.
+pub struct CommitWriter {
+    w: Writer,
+    up: Upload,
+    part: usize,
+    h: CommitHeader,
+    live_before: u64,
+    path: String,
+}
+
+impl CommitWriter {
+    /// The next changed key, keys ascending, with its new and replaced
+    /// versions.
+    pub async fn push(
+        &mut self,
+        key: &[u8],
+        new: Version<'_>,
+        replaced: Version<'_>,
+    ) -> Result<()> {
+        if self.w.entries() > 0 && key == self.h.max_key {
+            return invalid(format!(
+                "{:?}: a commit holds one entry per key",
+                lossy(key)
+            ));
+        }
+        self.w.push(key, self.h.commit, new, replaced)?;
+        if self.w.entries() == 1 {
+            self.h.min_key = key.to_vec();
+        }
+        self.h.max_key.clear();
+        self.h.max_key.extend_from_slice(key);
+        match (new.is_absent(), replaced.is_absent()) {
+            (false, true) => self.h.added += 1,
+            (false, false) => self.h.updated += 1,
+            _ => self.h.removed += 1,
+        }
+        if self.w.pending() >= self.part {
+            self.up.write(self.w.take()).await?;
+        }
+        Ok(())
+    }
+
+    /// The layer, or `None` (and nothing written) when nothing was pushed.
+    pub async fn finish(self) -> Result<Option<LayerRef>> {
+        if self.w.entries() == 0 {
+            return Ok(None);
+        }
+        self.write().await.map(Some)
+    }
+
+    async fn write(mut self) -> Result<LayerRef> {
+        self.h.live = (self.live_before + self.h.added)
+            .checked_sub(self.h.removed)
+            .ok_or_else(|| {
+                Error::Invalid(format!(
+                    "commit {} removes more keys than were live",
+                    self.h.commit
+                ))
+            })?;
+        let mut l = self.w.finish(std::slice::from_ref(&self.h))?;
+        self.up.write(self.w.take()).await?;
+        self.up.finish().await?;
+        l.path = self.path;
+        Ok(l)
     }
 }
 

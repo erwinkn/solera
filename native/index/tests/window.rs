@@ -1,17 +1,18 @@
-//! A read of listed keys holds a bounded window of fetched bytes, however
-//! densely its keys hit the layer (its own test binary: it measures the heap).
+//! Reads and writes hold bounded memory however large the layer (their own
+//! test binary: it measures the heap, one test at a time).
 
 use object_store::local::LocalFileSystem;
 use object_store::path::Path;
 use solera_index::*;
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 struct Counting;
 
 static NOW: AtomicUsize = AtomicUsize::new(0);
 static PEAK: AtomicUsize = AtomicUsize::new(0);
+static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
 
 fn grew(n: usize) {
     let now = NOW.fetch_add(n, Relaxed) + n;
@@ -55,6 +56,7 @@ fn key(i: u64) -> Vec<u8> {
 
 #[test]
 fn a_read_of_listed_keys_holds_a_bounded_window() {
+    let _one = ONE_AT_A_TIME.lock().unwrap();
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
@@ -93,6 +95,50 @@ fn a_read_of_listed_keys_holds_a_bounded_window() {
     assert!(
         held < 40 << 20,
         "a get over a {} MB layer held {} MB",
+        layer.size >> 20,
+        held >> 20
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn a_commit_writer_holds_parts_not_the_commit() {
+    let _one = ONE_AT_A_TIME.lock().unwrap();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let dir = std::env::temp_dir().join(format!("solera-index-writer-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let local = Arc::new(LocalFileSystem::new_with_prefix(&dir).unwrap());
+    let opts = StoreOptions {
+        part_bytes: 5 << 20,
+        ..Default::default()
+    };
+    let store = Store::new(local, Path::from(""), rt.handle().clone(), opts).unwrap();
+    let ix = ChangeIndex::new(store, WriteOptions::default());
+    let nc = NewCommit {
+        commit: 1,
+        time_ms: 0,
+        producer: b"",
+        live_before: 0,
+    };
+    let base = NOW.load(Relaxed);
+    PEAK.store(base, Relaxed);
+    let layer = rt.block_on(async {
+        let mut w = ix.commit_writer("big", nc).unwrap();
+        for i in 0..5_000_000u64 {
+            w.push(&key(i), Version::Int(mix(i)), Version::Absent)
+                .await
+                .unwrap();
+        }
+        w.finish().await.unwrap().unwrap()
+    });
+    let held = PEAK.load(Relaxed) - base;
+    assert!(
+        held < 40 << 20,
+        "a commit writer of a {} MB layer held {} MB",
         layer.size >> 20,
         held >> 20
     );

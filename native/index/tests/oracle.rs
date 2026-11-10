@@ -1126,6 +1126,90 @@ fn a_fill_that_cannot_be_kept_gives_its_room_back_once() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+#[test]
+fn a_commit_writer_writes_what_write_commit_writes() {
+    let rt = runtime();
+    let mem = Arc::new(InMemory::new());
+    let opts = StoreOptions {
+        part_bytes: 64 << 10,
+        ..Default::default()
+    };
+    let store = Store::new(mem.clone(), Path::from("t"), rt.handle().clone(), opts).unwrap();
+    let ix = ChangeIndex::new(store, WriteOptions::default());
+    let nc = NewCommit {
+        commit: 1,
+        time_ms: 5,
+        producer: b"p",
+        live_before: 10,
+    };
+    let mut rng = SmallRng::seed_from_u64(1);
+    let mut run = Run::new();
+    for i in 0..20_000u64 {
+        run.push_key(format!("k{i:06}").as_bytes());
+        let v = Version::Int(rng.random());
+        match i % 3 {
+            0 => run.push_entry(1, v, Version::Absent),
+            1 => run.push_entry(1, v, Version::Int(i)),
+            _ => run.push_entry(1, Version::Absent, Version::Int(i)),
+        }
+    }
+    rt.block_on(async {
+        let a = ix.write_commit("a", nc, &run).await.unwrap();
+        let mut w = ix.commit_writer("b", nc).unwrap();
+        for i in 0..run.len() {
+            let r = run.rows(i).start;
+            w.push(run.key(i), run.new_version(r), run.replaced_version(r))
+                .await
+                .unwrap();
+        }
+        let b = w.finish().await.unwrap().unwrap();
+        assert_eq!(
+            LayerRef {
+                path: "a".into(),
+                ..b
+            },
+            a
+        );
+        let bytes = |p: &'static str| {
+            let mem = mem.clone();
+            async move {
+                mem.get(&Path::from(p))
+                    .await
+                    .unwrap()
+                    .bytes()
+                    .await
+                    .unwrap()
+            }
+        };
+        assert_eq!(bytes("t/a").await, bytes("t/b").await);
+        assert_eq!(
+            ix.commits(&[a], 1, 1).await.unwrap()[0].live,
+            10 + 6667 - 6666
+        );
+        // nothing pushed: nothing written
+        let w = ix.commit_writer("e", nc).unwrap();
+        assert!(w.finish().await.unwrap().is_none());
+        assert!(mem.head(&Path::from("t/e")).await.is_err());
+        // one entry per key, keys ascending
+        let mut w = ix.commit_writer("d", nc).unwrap();
+        w.push(b"k", Version::Int(1), Version::Absent)
+            .await
+            .unwrap();
+        assert!(matches!(
+            w.push(b"k", Version::Int(2), Version::Absent).await,
+            Err(Error::Invalid(_))
+        ));
+        let mut w = ix.commit_writer("d", nc).unwrap();
+        w.push(b"k", Version::Int(1), Version::Absent)
+            .await
+            .unwrap();
+        assert!(matches!(
+            w.push(b"j", Version::Int(2), Version::Absent).await,
+            Err(Error::Invalid(_))
+        ));
+    });
+}
+
 async fn ix_scan(ix: &ChangeIndex, layers: &[LayerRef]) -> usize {
     ix.scan(layers, 1, &Query::default())
         .await
