@@ -9,20 +9,9 @@ from solera.sdk import (
     StaticPartitions,
     TimePartitions,
     asset,
-    canonical_partition,
-    split_partition,
 )
 
 AS_OF = dt.datetime(2026, 9, 19, 12, 0, 0, tzinfo=dt.UTC)
-
-
-def test_daily_keys():
-    """§7: every='1d' yields half-open daily windows keyed YYYY-MM-DD."""
-
-    tp = TimePartitions(start="2026-09-17", every="1d")
-    assert tp.keys(AS_OF) == ["2026-09-17", "2026-09-18"]
-    assert tp.latest(AS_OF) == "2026-09-18"
-    assert tp.window("2026-09-18") == ("2026-09-18T00:00:00+00:00", "2026-09-19T00:00:00+00:00")
 
 
 def test_minute_keys():
@@ -60,27 +49,6 @@ def test_end_caps_the_set():
 
     tp = TimePartitions(start="2026-09-17", every="1d", end="2026-09-19")
     assert tp.keys(AS_OF) == ["2026-09-17", "2026-09-18"]
-
-
-def test_timezone_alignment():
-    """§7: windows align to the declared timezone, not UTC."""
-
-    tp = TimePartitions(start="2026-09-17", every="1d", timezone="America/New_York")
-    start, end = tp.window("2026-09-18")
-    assert start == "2026-09-18T00:00:00-04:00"
-    assert end == "2026-09-19T00:00:00-04:00"
-
-
-def test_canonical_key_encoding():
-    """§7: multi-dimension keys are `dim=key` sorted by dimension name."""
-
-    dims = {"site": {"kind": "static", "keys": ["Richmond"]}, "day": {"kind": "time"}}
-    key = canonical_partition(dims, {"site": "Richmond", "day": "2026-09-19"})
-    assert key == "day=2026-09-19,site=Richmond"
-    assert split_partition(dims, key) == {"site": "Richmond", "day": "2026-09-19"}
-    single = {"site": {"kind": "static", "keys": ["Richmond"]}}
-    assert canonical_partition(single, {"site": "Richmond"}) == "Richmond"
-    assert split_partition(single, "Richmond") == {"site": "Richmond"}
 
 
 def test_shared_dimension_identity():

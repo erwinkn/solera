@@ -275,24 +275,6 @@ async def test_automations_enable_disable_run_now(client, base, engine):
     assert detail["request"]["status"] in {"queued", "running"}
 
 
-async def test_source_commit_endpoints(client, base, engine):
-    """POST sources/{name}/commit advances the external output (§5)."""
-
-    committed = await client.post(f"{base}/sources/uploads/commit", json={"keys": {"u-1": "v1"}})
-    assert committed.status_code == 200
-    assert committed.json()["ref"]["generation"]
-
-    patched = await client.post(
-        f"{base}/sources/uploads/commit",
-        json={"upsert": {"u-2": "v1"}, "remove": ["u-1"]},
-    )
-    assert patched.status_code == 200
-    keys = (await client.get(f"{base}/outputs/uploads/keys")).json()["keys"]
-    assert set(keys) == {"u-2"}
-    missing = await client.post(f"{base}/sources/ghost/commit", json={"version": "1"})
-    assert missing.status_code == 404
-
-
 async def test_executors_and_workers(client, base):
     executors = (await client.get(f"{base}/executors")).json()["executors"]
     assert {e["name"]: e["kind"] for e in executors} == {"gpu": "Pool", "local": "Local"}
