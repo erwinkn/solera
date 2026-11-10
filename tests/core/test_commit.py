@@ -116,9 +116,10 @@ def test_bad_input_is_refused(index):
 
 
 def test_commits_match_the_model_over_random_histories(tmp_path):
-    """Each commit's entries and the state after it equal the model's
+    """Each commit's changes and the state after it equal the model's
     (tests/tracking/core.py `Log.commit`) over random patches, full listings,
-    reverts and removals; a commit the model finds empty writes nothing."""
+    clears, reverts and removals; a commit the model finds empty writes
+    nothing, except a clear."""
 
     for seed in range(200):
         rng = random.Random(seed)
@@ -126,23 +127,51 @@ def test_commits_match_the_model_over_random_histories(tmp_path):
         for step in range(1, 13):
             keys = rng.sample("abcdefgh", rng.randint(0, 6))
             versions = {k: rng.choice(["e1", "e2", "", GEN, ABSENT]) for k in keys}
-            replace = rng.random() < 0.25
-            if replace:
+            mode = rng.choice(["patch", "patch", "replace", "clear"])
+            if mode == "replace":
                 versions = {k: v for k, v in versions.items() if v is not ABSENT}
             changes = encode_changes(
                 {k: None if v is GEN else v for k, v in versions.items() if v is not ABSENT},
                 removes=[k for k, v in versions.items() if v is ABSENT],
             )
             named = {k: step if v is GEN else v for k, v in versions.items()}
-            if replace:
+            if mode == "replace":
                 named |= {k: ABSENT for k in log.states[-1] if k not in named}
-            expected = log.commit(named)
-            mode = "replace" if replace else "patch"
+            expected = log.commit(named, clear=mode == "clear")
             built = core.commit(b"o", changes, version=step, path=f"o/{seed}/{step}", mode=mode)
-            if not expected:
+            if not expected and mode != "clear":
                 log.entries.pop(), log.states.pop()
                 assert built is None, (seed, step)
                 continue
-            assert built["commit"] == log.head and built["live"] == len(log.states[-1]), (seed, step)
-            assert core.entries(b"o", log.head) == [(k, n, o) for k, (n, o) in expected.items()], (seed, step)
-            assert core.state(b"o") == log.states[-1], (seed, step)
+            before, after = log.states[-2], log.states[-1]
+            changed = [(k, after.get(k), before.get(k)) for k in sorted(before.keys() | after.keys())]
+            assert built["commit"] == log.head and built["live"] == len(after), (seed, step)
+            assert core.entries(b"o", log.head) == [c for c in changed if c[1] != c[2]], (seed, step)
+            assert core.state(b"o") == after, (seed, step)
+            if mode == "clear":
+                assert core.t.full_run(b"o") == log.head, (seed, step)
+
+
+def test_a_full_run_clears_then_ends_with_its_last_commit_or_without_one(index):
+    core = Core(index)
+    core.commit(b"o", encode_changes({"a": "e1", "b": "e1", "c": "e1"}), version=1, path="o/1")
+    assert core.t.full_run(b"o") is None
+    with pytest.raises(ValueError, match="not in a full run"):
+        core.t.apply(Tracking.event_full_run_done(b"o"))
+    first = core.commit(
+        b"o", encode_changes({"b": "e2", "d": None}, removes=["zz"]), version=2, path="o/2", mode="clear"
+    )
+    assert (first["added"], first["updated"], first["removed"], first["live"]) == (2, 0, 3, 2)
+    assert first["layer"]["clears"] == [2] and core.t.full_run(b"o") == 2
+    assert core.state(b"o") == {"b": "e2", "d": 2}
+    assert core.entries(b"o", 2) == [("a", None, "e1"), ("b", "e2", "e1"), ("c", None, "e1"), ("d", 2, None)]
+    last = core.commit(b"o", encode_changes({"e": "e1"}), version=3, path="o/3", ends_full_run=True)
+    assert last["live"] == 3 and core.t.full_run(b"o") is None
+    with pytest.raises(ValueError, match="not in one"):
+        core.commit(b"o", encode_changes({"f": "e1"}), version=4, path="o/4", ends_full_run=True)
+    empty = core.commit(b"o", encode_changes([]), version=5, path="o/5", mode="clear")
+    assert empty["live"] == 0 and core.state(b"o") == {} and core.t.full_run(b"o") == 4
+    assert core.commit(b"o", encode_changes([]), version=6, path="o/6", ends_full_run=True) is None
+    core.t.apply(Tracking.event_full_run_done(b"o"))
+    assert core.t.full_run(b"o") is None
+    assert Tracking.restore(core.t.snapshot()).snapshot() == core.t.snapshot()
