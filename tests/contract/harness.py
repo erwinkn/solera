@@ -725,8 +725,8 @@ class Solera:
         ref, store = Ref.from_json(head["ref"]), self.project.stores[head["ref"]["store"]]
         try:
             if keys is None:
-                return await store.load(ref, typ or object, None)
-            return await store.load(ref, typ or list[dict], Keys(keys))
+                return (await self.shipped_read(store)(ref, typ or object, None)).value
+            return (await self.shipped_read(store)(ref, typ or list[dict], Keys(keys))).value
         except (FileNotFoundError, NotFoundError, StoreError):
             return None
 
@@ -738,7 +738,21 @@ class Solera:
 
         head = await self.head(output)
         ref, store = Ref.from_json(head["ref"]), self.project.stores[head["ref"]["store"]]
-        return await store.read(ref, list[dict], None if keys is None else Keys(keys))
+        return await self.shipped_read(store)(ref, list[dict], None if keys is None else Keys(keys))
+
+    @staticmethod
+    def shipped_read(store):
+        """`store.read` as the shipped store beneath it reads: what a test
+        adds to a store (a hook as a load begins, a list of the loads)
+        sees the engine's reads, never the test's own."""
+
+        import types
+
+        shipped = next(
+            (c for c in type(store).__mro__ if c.__module__.split(".")[0] in ("solera", "solera_postgres")),
+            None,
+        )
+        return store.read if shipped is None else types.MethodType(shipped.read, store)
 
     async def alarmed(self, *words: str) -> bool:
         """Whether the alarms the engine raises (`alarms()`) name every one of

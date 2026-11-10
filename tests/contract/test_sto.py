@@ -7,8 +7,8 @@ from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
-from solera.sdk import Incremental, Output, Project, RegistrationError, Retry, asset
-from solera.stores import Changed, FileStore, Patch, StoreError, WriteContext
+from solera.sdk import Incremental, Output, Project, Ref, RegistrationError, Retry, asset
+from solera.stores import Changed, FileStore, Keys, Patch, StoreError, WriteContext
 from solera.testing.stores import Ledger, context, now, write
 from solera.testing.stores import rows as stored_rows
 
@@ -271,11 +271,14 @@ class Faults:
             await hook()
         return written
 
-    async def load(self, *args, **kw):
+    async def read(self, *args, **kw):
         self.calls.append("load")
         await self.loading()
         self.seen.append(await super().read(*args, **kw))
-        return self.seen[-1].value
+        return self.seen[-1]
+
+    async def load(self, *args, **kw):
+        return (await self.read(*args, **kw)).value
 
     async def loading(self) -> None:
         if self.before_load is not None:
@@ -539,6 +542,28 @@ async def test_sto_2_a_store_that_names_objects_by_version_loads_exactly_the_pla
     assert received == [((["a"], [], []), {"a": "1"})]
     assert [read.versions for read in files.seen] == [planned]
     assert await solera.rows("items") == {"a": "2"}
+
+
+async def test_sto_2_the_fault_store_sees_a_read_as_one_load(solera):
+    """Of the fixture, so that STO-2 fails on the engine and never on it: a
+    worker's `read` runs the load hook and is recorded once, as its
+    `load` is; the test's own reads (`loaded`) are neither."""
+
+    files, hooked = Files(solera.root / "files"), []
+    await solera.deploy(items_on(files, [rows("a=1")]))
+    await solera.run("items")
+    head, keys = await solera.head("items"), await solera.keys("items")
+    await solera.loaded("items", keys)
+    assert files.seen == [] and files.calls == ["store"]
+
+    async def hook():
+        hooked.append(True)
+
+    files.before_load = hook
+    read = await files.read(Ref.from_json(head["ref"]), list[dict], Keys(keys))
+    assert hooked == [True] and files.seen == [read] and files.calls == ["store", "load"]
+    assert await files.load(Ref.from_json(head["ref"]), list[dict], Keys(keys)) == read.value
+    assert len(files.seen) == 2 and files.calls == ["store", "load", "load"]
 
 
 # -- STO-3 ------------------------------------------------------------------------
