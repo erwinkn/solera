@@ -299,6 +299,68 @@ impl World {
         }
     }
 
+    /// Lineage (§7, HIS-7): a range batch's input recomputed from its record
+    /// alone (the slice it replaced, its head and conditions, the failing
+    /// keys it left waiting) matches the record's digest.
+    fn lineage(&self, rec: &solera_tracking::record::Record) {
+        let within = |r: &solera_tracking::progress::KeyRange, k: &Key| {
+            r.lo.as_ref().is_none_or(|lo| k > lo) && r.hi.as_ref().is_none_or(|hi| k <= hi)
+        };
+        let mut keys = vec![];
+        for k in self.universe.iter().filter(|k| within(&rec.range, k)) {
+            let held = match rec.replaced.points.iter().find(|(x, _)| x == k) {
+                Some((_, p)) => p.holding.clone(),
+                None => match rec
+                    .replaced
+                    .pieces
+                    .iter()
+                    .find(|pc| within(&pc.range, k))
+                    .map(|pc| &pc.value)
+                {
+                    Some(Value::At(c, cond)) => {
+                        Holding::of(self.log.at(*c, k).as_version(), cond, k)
+                    }
+                    _ => Holding::Absent,
+                },
+            };
+            let v = self.log.at(rec.head, k);
+            let wanted = Holding::of(v.as_version(), &rec.conditions, k);
+            if !owed(&held, &wanted) || rec.waiting.contains(k) {
+                continue;
+            }
+            keys.push(plan::Cand {
+                key: k.clone(),
+                class: Class::of(&held, &wanted),
+                version: if matches!(wanted, Holding::Absent) {
+                    Ver::Absent
+                } else {
+                    v
+                },
+                held,
+            });
+        }
+        let replay = plan::InputPlan {
+            edge: rec.edge.clone(),
+            output: rec.output.clone(),
+            head: rec.head,
+            conditions: rec.conditions.clone(),
+            own_head: None,
+            keys,
+            held_back: vec![],
+            moot: vec![],
+            waiting: vec![],
+            expect: 0,
+            records: 0,
+        };
+        assert_eq!(
+            replay.digest(),
+            rec.digest,
+            "lineage of a batch over {:?}: {:?}",
+            rec.range,
+            replay.keys
+        );
+    }
+
     /// The worker runs a plan's keys and the engine commits them; the truth follows.
     /// None when the commit is refused: the state moved since the plan.
     async fn run(&mut self, ix: &ChangeIndex, p: &plan::Plan, retry: bool) -> Option<Vec<Key>> {
@@ -351,6 +413,9 @@ impl World {
         all.append(&mut parts);
         self.t.apply(&Event::of(all).encode()).ok()?;
         self.events += 1;
+        if p.mode == Mode::Incremental && !p.reset {
+            self.lineage(&ops.records[0]);
+        }
         // The truth.
         let cid = cond_id(&ip.conditions);
         let fails: BTreeMap<Key, Reported> = failed.into_iter().collect();
@@ -909,7 +974,7 @@ fn a_retry_batch_belongs_to_its_pass() {
                 break;
             }
         }
-        let mut start = |w: &mut World| {
+        let start = |w: &mut World| {
             w.counters.forced[2] = w.events + 1;
             w.files += 1;
             (w.t.outcome_view(EDGE.as_bytes()).unwrap(), w.files)

@@ -123,6 +123,9 @@ pub struct Record {
     pub on: Ver,
     pub on_cond: u64,
     pub at: u64,
+    /// The input's head when it was recorded: reverts before it do not
+    /// make it moot (the model checks the head at each event).
+    pub made: u64,
     pub held: Held,
 }
 
@@ -133,6 +136,7 @@ impl Record {
         e.version(self.on.as_version());
         e.uv(self.on_cond);
         e.uv(self.at);
+        e.uv(self.made);
         match &self.held {
             Held::Absent => e.u8(0),
             Held::Held => e.u8(1),
@@ -151,6 +155,7 @@ impl Record {
         let on = d.ver()?;
         let on_cond = d.uv()?;
         let at = d.uv()?;
+        let made = d.uv()?;
         let held = match d.u8()? {
             0 => Held::Absent,
             1 => Held::Held,
@@ -163,6 +168,7 @@ impl Record {
             on,
             on_cond,
             at,
+            made,
             held,
         })
     }
@@ -671,6 +677,7 @@ mod tests {
             on: Ver::Int(5),
             on_cond: 9,
             at: 12,
+            made: 14,
             held: Held::Version(Ver::Bytes(b"etag".as_slice().into()), 8),
         };
         assert_eq!(Record::decode(&r.encode()).unwrap(), r);

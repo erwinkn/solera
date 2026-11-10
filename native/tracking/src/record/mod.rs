@@ -11,7 +11,7 @@ use crate::error::{format, Result};
 use crate::progress::{Conditions, Key, KeyRange, Point, Slice};
 use crate::state::Id;
 
-pub const RECORD_FORMAT: u8 = 1;
+pub const RECORD_FORMAT: u8 = 2;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Record {
@@ -41,6 +41,9 @@ pub struct Record {
     pub output_commit: Option<u64>,
     /// A key list's keys: the one input a record cannot derive.
     pub keys: Option<Vec<Key>>,
+    /// Failing keys the plan met and left to their retry, tried at what
+    /// upstream has now (B6): lineage leaves them out.
+    pub waiting: Vec<Key>,
 }
 
 impl Record {
@@ -78,6 +81,10 @@ impl Record {
                 }
             }
         }
+        e.uv(self.waiting.len() as u64);
+        for k in &self.waiting {
+            e.bytes(k);
+        }
         e.buf
     }
 
@@ -114,6 +121,9 @@ impl Record {
             ),
             t => return format(format!("keys tag {t}")),
         };
+        let waiting = (0..d.count()?)
+            .map(|_| d.bytes().map(Key::from))
+            .collect::<Result<_>>()?;
         d.end()?;
         Ok(Record {
             producer,
@@ -132,6 +142,7 @@ impl Record {
             own_head,
             output_commit,
             keys,
+            waiting,
         })
     }
 }

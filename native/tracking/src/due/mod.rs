@@ -345,6 +345,7 @@ pub async fn plan(
         keys: taken,
         held_back: vec![],
         moot,
+        waiting: vec![],
         expect: read_digest(keyed, false, &range),
         records: 0,
     };

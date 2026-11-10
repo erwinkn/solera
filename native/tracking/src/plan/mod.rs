@@ -143,6 +143,9 @@ pub struct InputPlan {
     /// Keys in the range whose failure is moot: the consumer holds what
     /// upstream has now, so the commit drops their records (B6).
     pub moot: Vec<Key>,
+    /// Failing keys in the range the plan met and left to their retry: tried
+    /// at what upstream has now (B6).
+    pub waiting: Vec<Key>,
     /// The digest of the progress this plan read.
     pub expect: u64,
     /// The digest of the outcome records it read for its keys, held-back
@@ -167,6 +170,7 @@ impl InputPlan {
             .map(|c| &c.key)
             .chain(self.held_back.iter().map(|h| &h.key))
             .chain(&self.moot)
+            .chain(&self.waiting)
     }
 
     /// A digest of the batch's input: lineage recomputes it (§7).
@@ -393,6 +397,8 @@ struct Found {
     /// Records with a stored outcome the walk met, by the class a try at
     /// what they were tried on would have.
     visited: [u64; 3],
+    /// Failing keys met and left to their retry.
+    skipped: Vec<Key>,
     /// Each record read, by key: its part of the plan's `records` digest.
     read: BTreeMap<Key, u64>,
 }
@@ -417,6 +423,7 @@ impl Found {
             moot: vec![],
             waiting: false,
             visited: [0; 3],
+            skipped: vec![],
             read: BTreeMap::new(),
         }
     }
@@ -695,6 +702,9 @@ impl Walker<'_> {
                 if out.waiting {
                     out.counts[Class::of(&held, &p.wanted) as usize - 1] += 1;
                 }
+                if out.keep {
+                    out.skipped.push(p.key);
+                }
                 continue;
             }
             self.decide(p.key, held, p.version, p.wanted, out);
@@ -795,6 +805,7 @@ pub async fn plan(view: &View, req: &Request, ixs: &dyn Indexes, hold: &dyn Hold
             keys: found.keys,
             held_back: found.held_back,
             moot: found.moot,
+            waiting: found.skipped,
             expect: 0,
             records: 0,
         });
@@ -821,6 +832,7 @@ pub async fn plan(view: &View, req: &Request, ixs: &dyn Indexes, hold: &dyn Hold
             p.keys.retain(|c| c.key <= *hi);
             p.held_back.retain(|c| c.key <= *hi);
             p.moot.retain(|k| k <= hi);
+            p.waiting.retain(|k| k <= hi);
         }
         p.expect = read_digest(v.progress.keyed().expect("a keyed view"), req.reset, &range);
         p.records = p
@@ -1032,9 +1044,11 @@ impl Plan {
                 e.version(h.version.as_version());
                 h.held.encode(&mut e, &mut t);
             }
-            e.uv(p.moot.len() as u64);
-            for k in &p.moot {
-                e.bytes(k);
+            for ks in [&p.moot, &p.waiting] {
+                e.uv(ks.len() as u64);
+                for k in ks {
+                    e.bytes(k);
+                }
             }
         }
         e.uv(self.unkeyed.len() as u64);
@@ -1119,6 +1133,9 @@ impl Plan {
             let moot = (0..d.count()?)
                 .map(|_| d.bytes().map(Key::from))
                 .collect::<Result<_>>()?;
+            let waiting = (0..d.count()?)
+                .map(|_| d.bytes().map(Key::from))
+                .collect::<Result<_>>()?;
             inputs.push(InputPlan {
                 edge,
                 output,
@@ -1128,6 +1145,7 @@ impl Plan {
                 keys,
                 held_back,
                 moot,
+                waiting,
                 expect,
                 records,
             });

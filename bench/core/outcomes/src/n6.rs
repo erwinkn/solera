@@ -116,6 +116,7 @@ fn failing(env: &Env, ix: &ChangeIndex, n: u64, at: u64, m: &mut Merges) -> (Out
                 on: Ver::Bytes(value(id, 0).as_slice().into()),
                 on_cond: cid,
                 at,
+                made: at,
                 held: Kept::Absent,
             };
             ch.push(&k, Change::Upsert(Some(&r.encode()))).unwrap();

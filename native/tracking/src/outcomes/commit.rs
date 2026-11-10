@@ -269,6 +269,7 @@ pub async fn commit(
                     on: tried.clone(),
                     on_cond,
                     at: p.head,
+                    made: v.upstream.head,
                     held,
                 })
             }
@@ -277,8 +278,51 @@ pub async fn commit(
             next.insert(c.key.clone(), rec);
         }
     }
-    let range_batch = !matches!(plan.mode, PlanMode::Keys(_));
     let mut points = Vec::new();
+    // A new failure is checked against the input's head when it commits, as
+    // the model does: one whose input already returned to what the consumer
+    // holds is moot, and the consumer keeps what it held as a point.
+    if v.upstream.head > p.head {
+        let fresh: Vec<Key> = next
+            .iter()
+            .filter(|(_, r)| r.is_some())
+            .map(|(k, _)| k.clone())
+            .collect();
+        let keys: Vec<&[u8]> = fresh.iter().map(|k| k.as_ref()).collect();
+        let mut at_head = vec![Ver::Absent; keys.len()];
+        if !keys.is_empty() {
+            let got = ixs
+                .index(&v.input)?
+                .get(
+                    &v.upstream.layers,
+                    v.upstream.head,
+                    &keys,
+                    &Query::default(),
+                )
+                .await?;
+            let mut j = 0;
+            for i in 0..got.run.len() {
+                while keys[j] != got.run.key(i) {
+                    j += 1;
+                }
+                at_head[j] = Ver::of(got.run.new_version(got.run.rows(i).start));
+            }
+        }
+        for (k, ver) in fresh.into_iter().zip(at_head) {
+            let rec = next[&k].as_ref().expect("a new record");
+            let held = rec.held.holding(&conds)?;
+            if owed(&held, &Holding::of(ver.as_version(), &p.conditions, &k)) {
+                continue;
+            }
+            points.push((k.clone(), moot_point(rec, &conds)?));
+            if priors.contains_key(&k) {
+                next.insert(k, None);
+            } else {
+                next.remove(&k);
+            }
+        }
+    }
+    let range_batch = !matches!(plan.mode, PlanMode::Keys(_));
     for k in &p.moot {
         if next.contains_key(k) {
             continue;
@@ -387,6 +431,8 @@ pub async fn commit(
     }
     let refs_moved = moved(&before, &refs);
     let referenced = |id: &u64| refs.get(id).is_some_and(|n| *n > 0);
+    points.sort_by(|a, b| a.0.cmp(&b.0));
+    points.dedup_by(|a, b| a.0 == b.0);
     parts.push(Part::Outcomes(Outcomes {
         edge: v.edge.clone(),
         counts,
@@ -396,14 +442,16 @@ pub async fn commit(
         step,
         at: v.failures.head,
         seen: if v.failures.live == 0 {
-            p.head
+            v.upstream.head
         } else {
-            v.per_key.seen.min(p.head)
+            v.per_key.seen
         },
-        cond: if v.failures.live == 0 {
+        // Records written under other conditions than the catch-up last
+        // looked under: the next catch-up looks at all of them.
+        cond: if v.failures.live == 0 || on_cond == v.per_key.cond {
             on_cond
         } else {
-            v.per_key.cond
+            0
         },
         points,
     }));
@@ -495,7 +543,7 @@ pub async fn catch_up(
             let Some(rec) = recs.get(k) else { continue };
             let held = rec.held.holding(conds)?;
             let back = run.rows(i).any(|row| {
-                run.commit(row) > rec.at
+                run.commit(row) > rec.made
                     && !crate::progress::owed(&held, &Holding::of(run.new_version(row), now, k))
             });
             if back {
