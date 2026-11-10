@@ -57,7 +57,7 @@ jobs:
       # once the type errors it reports are fixed.
       - run: uvx ty@0.0.84 check
         continue-on-error: true
-      - run: uv run pytest -q -n auto --durations=30 -m 'not live and not postgres and not s3'
+      - run: uv run pytest -q -n auto --durations=15 -m 'not live and not postgres and not s3'
   # The one check to require: it passes only when both jobs above passed.
   verify:
     if: always() && (github.event_name != 'pull_request' || !github.event.pull_request.draft)
