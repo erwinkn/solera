@@ -48,6 +48,7 @@ class Solera:
         self.offset = 0.0  # seconds `advance` moved the clock past the wall
         self.state = self.engine = self.project = self.client = None
         self.engine_kw: dict = {}
+        self.state_url: str | None = None  # where the state lives: under `root` on disk unless set
 
     def clock(self) -> float:
         return time.time() + self.offset
@@ -82,7 +83,10 @@ class Solera:
         from solera_server.state import State
 
         self.state = await State.open(
-            (self.root / "state").as_uri(), "contract", clock=self.clock, flush_interval=0.001
+            self.state_url or (self.root / "state").as_uri(),
+            "contract",
+            clock=self.clock,
+            flush_interval=0.001,
         )
 
     async def _serve(self) -> None:
@@ -617,51 +621,17 @@ class Solera:
 
         return await asyncio.to_thread(run)
 
-    def watch_state(self):
-        """What the namespace's storage is asked from here on, as its disk
-        sees it (inotify): `.requests()` counts every open of a file or a
-        directory (a read, a write, a listing) and every rename or delete
-        since the last call."""
+    def storage_server(self) -> Storage:
+        """The namespace's state lives on an S3-compatible server from here on,
+        as a deployment on a bucket keeps it: a server that counts every
+        request it serves, one by one, and can hold an output's upkeep
+        uploads (`Storage`). Call it before the first deploy, and close what
+        it returns after `close()`."""
 
-        import ctypes
-        import os
-        import struct
-
-        libc = ctypes.CDLL(None, use_errno=True)
-        fd = libc.inotify_init1(os.O_NONBLOCK | os.O_CLOEXEC)
-        assert fd >= 0, os.strerror(ctypes.get_errno())
-        opened, moved, created, deleted = 0x20, 0x80, 0x100, 0x200
-        mask = opened | moved | created | deleted
-        watched: dict[int, str] = {}
-
-        def add(path) -> None:
-            for where, _, _ in os.walk(path):
-                watched[libc.inotify_add_watch(fd, os.fsencode(where), mask)] = where
-
-        add(self.root / "state")
-
-        class Watch:
-            def requests(self) -> int:
-                seen = 0
-                while True:
-                    try:
-                        data = os.read(fd, 1 << 16)
-                    except BlockingIOError:
-                        return seen
-                    at = 0
-                    while at < len(data):
-                        wd, event, _, size = struct.unpack_from("iIII", data, at)
-                        name = data[at + 16 : at + 16 + size].rstrip(b"\0")
-                        at += 16 + size
-                        if event & created and event & 0x40000000:  # a new directory: watch it too
-                            add(os.path.join(watched[wd], os.fsdecode(name)))
-                        if event & (opened | moved | deleted):
-                            seen += 1
-
-            def close(self) -> None:
-                os.close(fd)
-
-        return Watch()
+        assert self.state is None, "storage_server() before the first deploy"
+        storage = Storage()
+        self.state_url = f"{storage.url}/state"
+        return storage
 
     def refuse_upkeep(self, output: str, refused: bool = True) -> None:
         """The namespace's object store refuses (or takes again) the writes
@@ -672,6 +642,80 @@ class Solera:
         root = self.root / "state" / "contract" / "keys" / output
         for path in [root, *(p for p in root.rglob("*") if p.is_dir())]:
             os.chmod(path, 0o555 if refused else 0o755)
+
+
+class Storage:
+    """An S3-compatible server (moto's) on a local port, its credentials in
+    the environment, as an engine and its workers on S3 read them, until
+    `close()`. `requests` counts every request it has served; `url` is
+    its bucket; `hold_upkeep(output)` stalls an upload, a fault."""
+
+    ENV = ("AWS_ENDPOINT", "AWS_ALLOW_HTTP", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_REGION")
+
+    def __init__(self):
+        import os
+        import threading
+
+        import boto3
+        from moto.server import DomainDispatcherApplication, create_backend_app
+        from werkzeug.serving import make_server
+
+        backend, lock = DomainDispatcherApplication(create_backend_app), threading.Lock()
+        self.requests, self.held = 0, None
+
+        def app(environ, start_response):
+            with lock:
+                self.requests += 1
+            held = self.held
+            if (
+                held
+                and environ["REQUEST_METHOD"] in ("PUT", "POST")
+                and environ["PATH_INFO"].startswith(held.path)
+            ):
+                held.entered.set()
+                held.go.wait(30)
+            return backend(environ, start_response)
+
+        self.server = make_server("127.0.0.1", 0, app, threaded=True)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        endpoint = f"http://127.0.0.1:{self.server.server_port}"
+        self.saved = {name: os.environ.get(name) for name in self.ENV}
+        os.environ.update(
+            dict(zip(self.ENV, (endpoint, "true", "contract", "contract", "us-east-1"), strict=True))
+        )
+        boto3.client("s3", endpoint_url=endpoint).create_bucket(Bucket="contract")
+        self.url = "s3://contract"
+
+    def hold_upkeep(self, output: str) -> Hold:
+        """The next uploads of `output`'s key index upkeep stall in the server,
+        unanswered, until `release()`: a slow bucket. `entered` is set once
+        one is held. It knows today's storage layout, as `refuse_upkeep` does."""
+
+        self.held = Hold(f"/contract/state/contract/keys/{output}/")
+        return self.held
+
+    def close(self) -> None:
+        import os
+
+        if self.held:
+            self.held.release()
+        self.server.shutdown()
+        self.server.server_close()
+        for name, value in self.saved.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+
+class Hold:
+    def __init__(self, path: str):
+        import threading
+
+        self.path, self.entered, self.go = path, threading.Event(), threading.Event()
+
+    def release(self) -> None:
+        self.go.set()
 
 
 # -- the outside world, as a user's project sees it ---------------------------
