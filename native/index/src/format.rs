@@ -19,6 +19,10 @@
 //! - The top level holds the layer's own description (commit run, floor,
 //!   counts, key bounds, flags) and one descriptor per segment, laid out like
 //!   a block's. A reader of a large layer loads only the segments it needs.
+//!   Segments sit after the commits section, except once a writer holds
+//!   `SEG_SPILL` bytes of them: later ones go among the blocks, so that it
+//!   holds a bounded index. A descriptor's offset is doubled, plus one for a
+//!   segment among the blocks (an offset in the file, not in the index).
 //! - The commits section holds each commit's header; queries never read it.
 //! - The trailer: index_start, commits_start, top_start (u64 LE), top raw
 //!   length, top checksum, format version, trailer checksum (u32 LE), magic.
@@ -46,6 +50,10 @@ pub const MAX_RAW: usize = 64 << 20;
 /// prefix-coded keys: a block's distinct keys, a segment's or the top level's
 /// first keys, at most `MAX_RAW` bytes each.
 pub const MAX_KEY: usize = 64 << 10;
+
+/// The most compressed segment bytes a writer keeps for the end of the file;
+/// past this, segments are written among the blocks.
+const SEG_SPILL: usize = 4 << 20;
 
 fn fits(what: &str, len: usize) -> Result<()> {
     if len > MAX_RAW {
@@ -471,7 +479,14 @@ impl Writer {
         fits("the top level's keys", self.top_keys)?;
         let c = self.zc.compress(&self.seg).expect("zstd compression");
         let t = &mut self.top;
-        put_varint(t, self.segs.len() as u64);
+        if self.segs.len() + c.len() > SEG_SPILL {
+            put_varint(t, (self.written << 1) | 1);
+            self.out.extend_from_slice(&c);
+            self.written += c.len() as u64;
+        } else {
+            put_varint(t, (self.segs.len() as u64) << 1);
+            self.segs.extend_from_slice(&c);
+        }
         put_varint(t, c.len() as u64);
         put_varint(t, self.seg.len() as u64);
         put_varint(t, self.seg_n);
@@ -481,7 +496,6 @@ impl Writer {
         put_varint(t, (self.seg_first.len() - s) as u64);
         t.extend_from_slice(&self.seg_first[s..]);
         self.top_prev.clone_from(&self.seg_first);
-        self.segs.extend_from_slice(&c);
         self.nsegs += 1;
         self.seg.clear();
         self.seg_n = 0;
@@ -659,12 +673,15 @@ impl Index {
             + self.first.capacity()
     }
 
-    /// Entries whose ranges lie in `within`.
+    /// Entries whose ranges lie in `within`. Offsets are deltas from the
+    /// previous entry's, or, with `among` (the top level's segments), doubled
+    /// offsets from `base`, plus one for an offset in the file within
+    /// `among`.
     fn parse(
         b: &[u8],
         count: Option<u64>,
         base: u64,
-        relative: bool,
+        among: Option<std::ops::Range<u64>>,
         within: std::ops::Range<u64>,
     ) -> Result<Index> {
         let mut ix = Index::default();
@@ -674,7 +691,12 @@ impl Index {
         let mut i = 0u64;
         while count.map_or(p < b.len(), |c| i < c) {
             let d = varint(b, &mut p)?;
-            let Some(o) = (if relative { base } else { off }).checked_add(d) else {
+            let (o, inside) = match &among {
+                None => (off.checked_add(d), &within),
+                Some(a) if d & 1 == 1 => (Some(d >> 1), a),
+                Some(_) => (base.checked_add(d >> 1), &within),
+            };
+            let Some(o) = o else {
                 return format("index offset overflows");
             };
             off = o;
@@ -685,13 +707,13 @@ impl Index {
             if clen as usize > zstd::zstd_safe::compress_bound(MAX_RAW) || rlen as usize > MAX_RAW {
                 return format(format!("index entry of {clen} bytes, {rlen} raw"));
             }
-            if off < within.start
+            if off < inside.start
                 || off
                     .checked_add(clen as u64)
-                    .is_none_or(|end| end > within.end)
+                    .is_none_or(|end| end > inside.end)
             {
                 return format(format!(
-                    "index entry {off}+{clen} outside its section {within:?}"
+                    "index entry {off}+{clen} outside its section {inside:?}"
                 ));
             }
             ix.off.push(off);
@@ -789,7 +811,7 @@ impl Top {
             &raw[p..],
             Some(nsegs),
             index_start,
-            true,
+            Some(0..commits_start),
             index_start..top_start,
         )?;
         Ok(Top {
@@ -865,7 +887,7 @@ pub fn parse_segment(c: &[u8], rlen: u32, check: u32, blocks: u32, data_end: u64
     if checksum(c) != check {
         return format("segment checksum mismatch");
     }
-    let ix = Index::parse(&decompress(c, rlen as usize)?, None, 0, false, 0..data_end)?;
+    let ix = Index::parse(&decompress(c, rlen as usize)?, None, 0, None, 0..data_end)?;
     if ix.len() != blocks as usize {
         return format("segment block count mismatch");
     }
