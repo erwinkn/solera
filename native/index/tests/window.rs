@@ -92,13 +92,13 @@ fn a_read_of_listed_keys_holds_a_bounded_window() {
     let got = rt.block_on(ix.get(std::slice::from_ref(&layer), 1, &keys, &Query::default()));
     assert_eq!(got.unwrap().run.len(), keys.len());
     let held = PEAK.load(Relaxed) - base;
+    let _ = std::fs::remove_dir_all(dir);
     assert!(
         held < 40 << 20,
         "a get over a {} MB layer held {} MB",
         layer.size >> 20,
         held >> 20
     );
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 #[test]

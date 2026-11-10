@@ -1,6 +1,6 @@
 //! Reading layers: open a layer (its top level and the segments a read
 //! needs), plan the blocks, fetch them in batches that double from 256 KiB to
-//! 32 MiB with one batch in flight ahead, decode; and walk several layers at
+//! `max_get` with one batch in flight ahead, decode; and walk several layers at
 //! once, merged by key, newest layer first.
 
 use crate::error::{Error, Result};
@@ -14,7 +14,6 @@ use std::ops::{Bound, Range};
 use std::sync::Arc;
 
 const FIRST: u64 = 256 << 10;
-const MAX: u64 = 32 << 20;
 /// A read of listed keys launches its batches together, each about this size,
 /// cut only where a GET would end anyway.
 const ALL: u64 = 4 << 20;
@@ -173,7 +172,7 @@ pub(crate) struct Cursor {
     ahead: u64,
     /// A read of listed keys small enough to keep in the memory cache.
     keep_all: bool,
-    pending: VecDeque<(Range<usize>, Fetch)>,
+    pending: VecDeque<(Range<usize>, u64, Fetch)>,
     ready: VecDeque<(Bytes, BlockRef)>,
     run: Run,
     pos: usize,
@@ -183,7 +182,7 @@ pub(crate) struct Cursor {
 
 impl Drop for Cursor {
     fn drop(&mut self) {
-        for (_, h) in &self.pending {
+        for (.., h) in &self.pending {
             h.abort();
         }
     }
@@ -291,40 +290,39 @@ impl Cursor {
         })
     }
 
-    /// Bytes a batch of blocks spans in the file, gaps included: what its
-    /// GETs fetch and hold.
-    fn span(&self, r: Range<usize>) -> u64 {
-        let (first, last) = (&self.blocks[r.start], &self.blocks[r.end - 1]);
-        last.off + last.clen as u64 - first.off
-    }
-
     fn launch(&mut self) {
         let a = self.next;
-        let mut bytes = 0u64;
         let (gap, max_get) = (self.store.opts.coalesce, self.store.opts.max_get);
+        // block bytes, and what the GETs fetch and hold: the blocks and the
+        // gaps they coalesce across
+        let (mut bytes, mut held) = (0u64, 0u64);
         while self.next < self.blocks.len() {
             let b = &self.blocks[self.next];
-            let joins = self.next > a && {
-                let p = &self.blocks[self.next - 1];
-                b.off <= p.off + p.clen as u64 + gap
-            };
+            let between = (self.next > a)
+                .then(|| {
+                    let p = &self.blocks[self.next - 1];
+                    b.off.saturating_sub(p.off + p.clen as u64)
+                })
+                .filter(|&g| g <= gap);
+            let more = between.unwrap_or(0) + b.clen as u64;
             if self.next > a
-                && ((bytes >= self.target && !(self.all && joins))
-                    || self.span(a..self.next + 1) > max_get)
+                && ((bytes >= self.target && !(self.all && between.is_some()))
+                    || held + more > max_get)
             {
                 break;
             }
             bytes += b.clen as u64;
+            held += more;
             self.next += 1;
         }
         if self.next == a {
             return;
         }
-        self.ahead += self.span(a..self.next);
+        self.ahead += held;
         let keep = if self.all {
             self.keep_all
         } else {
-            self.target = (self.target * 2).min(MAX);
+            self.target = (self.target * 2).min(max_get);
             bytes <= self.store.opts.cache_batch
         };
         let wants: Vec<(Part, Range<u64>, Want)> = self.blocks[a..self.next]
@@ -345,7 +343,7 @@ impl Cursor {
             .store
             .rt
             .spawn(async move { store.load(&path, wants).await });
-        self.pending.push_back((a..self.next, h));
+        self.pending.push_back((a..self.next, held, h));
     }
 
     /// Make the current key valid; false once the layer has no more.
@@ -375,13 +373,13 @@ impl Cursor {
             while self.all && self.next < self.blocks.len() && self.ahead < WINDOW {
                 self.launch();
             }
-            let Some((span, h)) = self.pending.pop_front() else {
+            let Some((span, held, h)) = self.pending.pop_front() else {
                 return Ok(false);
             };
             let got = h
                 .await
                 .map_err(|e| Error::Store(format!("fetch task: {e}").into()))??;
-            self.ahead -= self.span(span.clone());
+            self.ahead -= held;
             if !self.all {
                 self.launch();
             }
