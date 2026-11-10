@@ -6,6 +6,7 @@ import os
 import signal
 import time
 
+import obstore
 import pytest
 from solera.executors import Pool
 from solera.sdk import Commit, Output, Project, Retry, Source, Tick, asset, sensor
@@ -228,11 +229,14 @@ def pool_project(calls: list) -> Project:
 async def another_offer(solera, pool: str, stage: dict) -> list[dict]:
     """What the pool offers next, once the attempt `stage` names is no longer offered."""
 
-    for _ in range(250):
-        if work := [s for s in await solera.offered(pool) if s["attempt"] != stage["attempt"]]:
-            return work
-        await solera.settle(0.02)
-    raise AssertionError("nothing else offered")
+    work = []
+
+    async def other():
+        work[:] = [s for s in await solera.offered(pool, timeout=0) if s["attempt"] != stage["attempt"]]
+        return work
+
+    await solera.until(other, 30)
+    return work
 
 
 async def test_eng_9_a_config_value_past_64_bits_is_a_400_and_the_engine_goes_on(solera):
@@ -495,12 +499,12 @@ async def test_eng_10_an_idle_engine_does_not_spin(solera):
     def flaky(items: list) -> int:
         raise ValueError("down")
 
-    await solera.deploy(Project(assets=[items, trained, flaky], default_store=store))
-    await solera.run("items")
-    waiting, flaky_run = await solera.submit("trained"), await solera.submit("flaky")
-    await solera.offered("gpu")
-    watch = solera.watch_state()
+    storage = solera.storage_server()
     try:
+        await solera.deploy(Project(assets=[items, trained, flaky], default_store=store))
+        await solera.run("items")
+        waiting, flaky_run = await solera.submit("trained"), await solera.submit("flaky")
+        await solera.offered("gpu")
         await solera.start()
 
         async def retry_pending():  # flaky failed once, and waits an hour for its retry
@@ -508,19 +512,43 @@ async def test_eng_10_an_idle_engine_does_not_spin(solera):
             return [a["outcome"] for a in detail["attempts"][detail["tasks"][0]["id"]]] == ["failed"]
 
         await solera.until(retry_pending)
-        watch.requests()
-        asked, cpu, wall = store.asked, time.process_time(), time.monotonic()
-        await asyncio.sleep(1.0)
+        requests, asked, cpu, wall = storage.requests, store.asked, time.process_time(), time.monotonic()
+        await asyncio.sleep(1.0)  # idle: what it does meanwhile is measured
         elapsed = time.monotonic() - wall
-        requests = watch.requests()
+        requests = storage.requests - requests
+        used = (time.process_time() - cpu) / elapsed
+        for run in (waiting, flaky_run):
+            assert (await solera.get(f"/runs/{run['id']}"))["request"]["status"] == "running"
     finally:
-        watch.close()
+        await solera.close()
+        storage.close()
     assert requests <= BURST + RATE * elapsed, f"{requests} storage requests in {elapsed:.1f} s while idle"
     assert store.asked == asked
-    used = (time.process_time() - cpu) / elapsed
     assert used < 0.1, f"{used:.0%} of a CPU while idle"
-    for run in (waiting, flaky_run):
-        assert (await solera.get(f"/runs/{run['id']}"))["request"]["status"] == "running"
+
+
+async def test_eng_10_the_storage_count_sees_every_request(solera):
+    """What ENG-10 bounds is counted request by request, never coalesced:
+    1,000 reads of one object of the namespace's state are 1,000 requests."""
+
+    @asset(outputs=Output("items", key="id"))
+    def items():
+        return [{"id": "k1", "v": "1"}]
+
+    storage = solera.storage_server()
+    try:
+        await solera.deploy(Project(assets=[items]))
+        await solera.run("items")
+        await solera.close()  # nobody else asks it anything
+        state = obstore.store.from_url(f"{storage.url}/state")
+        path = next(iter(obstore.list(state)))[0]["path"]
+        before = storage.requests
+        for _ in range(1000):
+            await (await obstore.get_async(state, path)).bytes_async()
+        assert storage.requests - before == 1000
+    finally:
+        await solera.close()
+        storage.close()
 
 
 async def backlogged(solera, keys: int = 1) -> dict:
@@ -558,11 +586,14 @@ async def test_eng_13_attempts_writing_an_output_wait_while_its_upkeep_is_far_be
     taken = await backlogged(solera, keys=2)  # as many commits of feed as it takes
     ex.outside.feed.update(taken)
     run = await solera.submit("items")  # twice as many of items: a batch, a commit each
-    for _ in range(600):
-        await solera.settle(0.02)
-        [task] = (await solera.get(f"/runs/{run['id']}"))["tasks"]
-        if task.get("held"):
-            break
+    task = {}
+
+    async def held():
+        [shown] = (await solera.get(f"/runs/{run['id']}"))["tasks"]
+        task.update(shown)
+        return bool(task.get("held"))
+
+    await solera.until(held, 12)
     assert task["status"] == "queued" and task["held"][0] == "merges"
     assert (await solera.get("/outputs/items/merges"))["backlogged"]
     await solera.start()  # upkeep merges; the writer goes on
@@ -574,12 +605,14 @@ async def test_eng_13_attempts_writing_an_output_wait_while_its_upkeep_is_far_be
 async def merges(solera, output: str, done, seconds: float = 10) -> dict:
     """The output's upkeep as `GET /outputs/{output}/merges` shows it, once `done(view)`."""
 
-    for _ in range(int(seconds / 0.1)):
-        view = await solera.get(f"/outputs/{output}/merges")
-        if done(view):
-            return view
-        await asyncio.sleep(0.1)
-    raise AssertionError(view)
+    view = {}
+
+    async def shown():
+        view.update(await solera.get(f"/outputs/{output}/merges"))
+        return done(view)
+
+    await solera.until(shown, seconds)
+    return view
 
 
 def tried(n: int):
@@ -593,6 +626,15 @@ async def failing_upkeep(solera) -> None:
     await solera.start()
 
 
+async def alarmed(solera) -> bool:
+    """The engine shows an alarm: unhealthy, with an error to show."""
+
+    health = (await solera.client.get("/healthz")).status_code
+    error = (await solera.get("/api/diagnostics"))["last_error"]
+    assert (health == 503) == (error is not None), (health, error)
+    return error is not None
+
+
 async def test_eng_14_upkeep_that_keeps_failing_backs_off_alarms_and_tries_again(solera):
     """An output's merges fail three times: it waits 10 minutes, doubling,
     alarmed, and tries again until a merge publishes."""
@@ -601,7 +643,7 @@ async def test_eng_14_upkeep_that_keeps_failing_backs_off_alarms_and_tries_again
         await failing_upkeep(solera)
         [failed] = (await merges(solera, "feed", tried(3)))["failed"]
         assert failed["due"] - failed["at"] == 600  # three tries, then ten minutes
-        assert "key index feed" in (await solera.get("/api/diagnostics"))["last_error"]
+        assert await alarmed(solera)
         await asyncio.sleep(1.2)  # upkeep looks again, and waits
         assert (await solera.get("/outputs/feed/merges"))["failed"][0]["uploads"] == 3
         solera.advance(600)
@@ -613,27 +655,34 @@ async def test_eng_14_upkeep_that_keeps_failing_backs_off_alarms_and_tries_again
     await merges(solera, "feed", caught_up)
 
     async def alarm_gone():
-        return "key index feed" not in ((await solera.get("/api/diagnostics"))["last_error"] or "")
+        return not await alarmed(solera)
 
     await solera.until(alarm_gone)
     await solera.commit_source("feed", upsert={"later": "1"})  # and writes are taken again
 
 
 async def test_eng_14_merges_cut_short_by_the_engines_stop_count_for_nothing(solera):
-    """Three stops, each in the middle of a merge, leave the output merging
-    at once, where three failed merges would have it wait ten minutes."""
+    """Three stops, each while a merge's upload is under way, leave the output
+    merging at once, where three failed merges would have it wait ten minutes."""
 
-    await Example(solera).start()
-    await backlogged(solera, keys=10_000)  # a merge long enough to stop in
-    for _ in range(3):
+    storage = solera.storage_server()
+    try:
+        await Example(solera).start()
+        await backlogged(solera)
+        for _ in range(3):
+            hold = storage.hold_upkeep("feed")
+            await solera.start()
+            await solera.until(hold.entered.is_set)  # a merge's upload under way, stalled
+            await solera.down()
+            await solera.restart()
+            hold.release()  # the cut upload ends; nothing awaits it any more
+            view = await solera.get("/outputs/feed/merges")
+            assert view["backlogged"] and view["failed"] == []  # counted for nothing
         await solera.start()
-        await merges(solera, "feed", lambda view: bool(view["failed"]))  # an upload under way
-        await solera.down()
-        await solera.restart()
-        view = await solera.get("/outputs/feed/merges")
-        assert view["backlogged"] and view["failed"] == []  # cut short, and counted for nothing
-    await solera.start()
-    await merges(solera, "feed", caught_up)  # no clock moved
+        await merges(solera, "feed", caught_up)  # no clock moved
+    finally:
+        await solera.close()
+        storage.close()
 
 
 async def test_eng_14_an_operator_clear_merges_at_once(solera):
