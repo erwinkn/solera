@@ -1789,7 +1789,12 @@ dependencies = [
 name = "solera-tracking"
 version = "0.0.1"
 dependencies = [
+ "object_store",
+ "rand 0.9.5",
+ "regex",
  "solera-index",
+ "tokio",
+ "xxhash-rust",
 ]
 
 [[package]]
