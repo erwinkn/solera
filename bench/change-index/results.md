@@ -27,10 +27,10 @@ Run: `./run.sh NAME workload=W keys=N` writes `results/NAME.jsonl`. `python3 rep
 
   | workload | 10M before | 10M after | 100M before | 100M after |
   |---|---|---|---|---|
-  | daily-clustered | 1.4 | 0.74 | 1.81 | 1.01 |
-  | daily-scattered | – | 0.75 | 4.52 | 2.47 |
-  | hot | – | 0.57 | 2.89 | 1.61 |
-  | rewrite | – | 1.16 | 3.67 | 2.19 |
+  | daily-clustered | 1.23 | 0.74 | 1.81 | 1.01 |
+  | daily-scattered | 1.47 | 0.75 | 4.52 | 2.47 |
+  | hot | 1.14 | 0.57 | 2.89 | 1.61 |
+  | rewrite | 1.92 | 1.16 | 3.67 | 2.19 |
 
   ("Before" is commit 07e16ddf, CPU seconds.) At 100M, what remains is decoding about one block per listed key per layer.
 - **Warm CPU is up to 30% higher than T44's on whole-layer reads and folds.** This is the machine, not the code. T44 ran on a different machine; T44's own bench rerun on this machine (rewrite, 10M, twice each, interleaved) gives:
