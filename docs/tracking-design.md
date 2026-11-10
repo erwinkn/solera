@@ -353,20 +353,25 @@ In `native/tracking/src/commit/`, as described above:
   removal; an upsert without one gets the attempt's version) and the
   output's head. It reads the replaced versions with one `get` per block of
   changes and streams the entries into the index's `CommitWriter`, so a
-  100M-key commit never holds more than one block. A key whose version
+  commit's entries are never collected: a 100M-key commit held 386 MB at
+  its peak (the 256 MB block cache included), but the changes handed over
+  stay in memory as the worker encoded them, and so do the changed keys a
+  caller asks to collect. A key whose version
   does not change is no entry, and a commit with no entry writes nothing.
 - **Three modes.** A *patch* leaves keys it does not name as they are. A
   *replace* (a source's full listing, or a write that reports the whole
   output) removes every key at the head it does not name, reading the
-  head's state by `scan`, page by page. A *report* (a load's report on a
-  source, P13) keeps a key's report only if the log did not change that key
-  since the batch's head.
+  head's state by `scan`, 65,536 keys a page. A *report* (a load's report
+  on a source, P13) keeps a key's report only if the key's version at the
+  batch's head equals its version at the output's head, so a key that
+  changed and changed back still takes the report.
 - **The event part** `OutputCommit` carries the layer reference and the
   live count, never keys. Its check refuses a layer that is not exactly the
   head's next commit, so a commit built at an old head is refused, and an
   event holds at most one commit per output.
 - **What a worker hands over** is `Changes` in its transport form: zstd
-  blocks of sorted keys, at most 1 MiB a row and 8 MiB a block.
+  blocks of sorted keys, at most 1 MiB a row, a block cut once it passes
+  256 KiB encoded or 8 MiB expanded.
 - **Clears are not built yet**: they wait on the index's clear flag (§10,
   form (a)).
 
