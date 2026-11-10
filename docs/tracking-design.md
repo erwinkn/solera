@@ -770,22 +770,21 @@ and conditions at one generation, as of one upstream commit.
   changed", whatever upstream did since; the notice, the probe and the count
   give each key the same reason.
 
-At 100M keys (`bench/core/stale/`): a notice costs 1 to 6 µs per edge
-(50 edges reading a commit of 10k to 45k entries), and about 87 ns per
-entry per edge when no entry matters; a count,
-reasons included, costs 1.1 s cold and 0.6 to 0.7 s warm for an edge a day
-behind and 15 s cold for 30 days behind, where the index's diff alone
-takes 0.9 s and 5.7 s cold (`bench/core/stale/results/run-100m.log`).
-On an edge with a million failure records
-(`bench/core/stale/results/records-100m.log`), a refresh after an hourly
-commit that touches no failing key costs 0.55 to 0.69 ms warm (133 ms
-cold, 5 GETs). In the adverse case, where every key the commit changed is
-a failing key waiting for its retry (upstream reverted each to exactly the
-version it failed at), it reads the records of all 45k candidates: 72 to
-91 ms warm, 1.6 s cold (49 GETs). A count a day behind costs 0.85 to
-0.98 s warm, the extra over an edge without records being the planner's
-own record reads (B6); N11's warm target is 1.0 s for an edge with
-failure records and 0.8 s without.
+At 100M keys (`bench/core/stale/`, `results/run-100m.log`): a notice
+costs 1 to 4 µs per edge (50 edges reading a commit of 10k to 45k
+entries), and about 86 ns per entry per edge when no entry matters; a
+count, reasons included, costs 1.1 s cold and 0.57 to 0.70 s warm for an
+edge a day behind and 15 s cold for 30 days behind, where the index's diff
+alone takes 0.85 s and 5.5 s cold. On an edge with a million failure
+records, a refresh after an hourly commit that touches no failing key costs
+0.29 to 0.55 ms warm (130 ms cold, 5 GETs). In the adverse case, where
+every key the commit changed is a failing key waiting for its retry
+(upstream reverted each to exactly the version it failed at), it reads the
+records of all 45k candidates: 50 to 75 ms warm, 1.6 s cold (49 GETs). A
+count a day behind costs 0.84 to 1.03 s warm and 2.2 s cold, the extra
+over an edge without records being the planner's own record reads (B6);
+N11's warm target is 1.0 s for an edge with failure records and 0.8 s
+without.
 
 ## 7. A batch from start to finish
 
