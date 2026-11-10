@@ -121,7 +121,7 @@ class Output:
         self.frozen: set[str] = set()  # keys of the published rows no commit explains, when the build opened
         self.ended: set[int] = set()  # builds whose full run ended in the log
         self.switched: Counter = Counter()  # build -> times the store published it
-        self.superseded: set[int] = set()  # ended builds a newer full run's first write replaced first
+        self.superseded: set[int] = set()  # builds a newer run's first write replaced unswitched
         self.settled = [0]  # commits an outsider may see: not mid full run, nor in an unfinished first run
         self.ran = False  # the output has been complete (or released) once
         self.shown = 0  # the settled commit the outside view last matched
@@ -171,7 +171,7 @@ class Output:
         if clear and self.swap:
             if self.build is None:
                 self.frozen = set(dirty)
-            elif self.build_gen in self.ended:
+            else:
                 self.superseded.add(self.build_gen)
             self.build, self.build_gen = {}, version  # a new shadow, replacing any open one
         elif clear:
@@ -830,7 +830,8 @@ class Mirror:
                 points,
                 {},
                 {k: v for k, v in results.items() if v != planned[k]},
-                frozenset(kept),                processed(prior, results, {}),
+                frozenset(kept),
+                processed(prior, results, {}),
             )
         )
         self.progress.commit_batch(s.heads[0], s.lo, s.hi, s.cond, results, kept)
@@ -1189,7 +1190,8 @@ class World:
         for c in out.settled:
             st = out.log.states[c]
             if c >= out.shown and all(
-                (r.version if (r := view.get(k)) else ABSENT) == st.get(k) for k in (set(view) | set(st)) - dirty
+                (r.version if (r := view.get(k)) else ABSENT) == st.get(k)
+                for k in (set(view) | set(st)) - dirty
             ):
                 out.shown = c
                 break
