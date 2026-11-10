@@ -115,6 +115,7 @@ struct Fail {
 }
 
 enum Deferred {
+    Start(Vec<Part>),
     CatchUp(Vec<Part>),
     Commit(Built),
 }
@@ -156,8 +157,11 @@ struct World {
     fail_all: bool,
     /// The input may commit while a change batch's outcomes are built.
     races: bool,
-    /// Parts built and not yet applied: catch-ups and batch commits.
-    deferred: Vec<Deferred>,
+    /// Parts built and not yet applied, with the era they were built in.
+    deferred: Vec<(u64, Deferred)>,
+    /// Bumped each time the edge starts a new life: a reset, a close and
+    /// reopen, a rename.
+    era: u64,
 }
 
 fn patterns(rng: &mut SmallRng) -> Patterns {
@@ -517,6 +521,9 @@ impl World {
             return None;
         }
         self.events += 1;
+        if p.reset {
+            self.era += 1;
+        }
         for part in &ops.parts {
             if let Part::Batch(b) = part {
                 assert_eq!(
@@ -593,7 +600,7 @@ impl World {
                 .await
                 .unwrap()
             {
-                self.deferred.push(Deferred::CatchUp(parts));
+                self.deferred.push((self.era, Deferred::CatchUp(parts)));
             }
             return;
         }
@@ -627,7 +634,7 @@ impl World {
             .build(ix, &p, &planned, &failed, &loaded, counters)
             .await
         {
-            self.deferred.push(Deferred::Commit(b));
+            self.deferred.push((self.era, Deferred::Commit(b)));
         }
     }
 
@@ -636,9 +643,21 @@ impl World {
             return;
         }
         let i = self.rng.random_range(0..self.deferred.len());
-        match self.deferred.remove(i) {
+        let (era, d) = self.deferred.remove(i);
+        let earlier = era != self.era;
+        match d {
+            Deferred::Start(parts) => match self.t.apply(&Event::of(parts).encode()) {
+                Ok(()) => {
+                    assert!(!earlier, "a pass start built in an earlier life applies");
+                    trace("a deferred pass start applies");
+                    self.events += 1;
+                    self.stats[2] += 1;
+                }
+                Err(e) => trace(&format!("a deferred pass start is refused: {e}")),
+            },
             Deferred::CatchUp(parts) => match self.t.apply(&Event::of(parts).encode()) {
                 Ok(()) => {
+                    assert!(!earlier, "a catch-up built in an earlier life applies");
                     trace("a deferred catch-up applies");
                     self.events += 1;
                 }
@@ -646,11 +665,141 @@ impl World {
             },
             Deferred::Commit(b) => {
                 if self.land(b).is_some() {
+                    assert!(!earlier, "a commit built in an earlier life applies");
                     trace("a deferred commit applies");
                     self.stats[5] += 1;
                 }
             }
         }
+    }
+
+    fn under_way(&self) -> bool {
+        self.t
+            .per_key
+            .get(EDGE.as_bytes())
+            .is_some_and(|k| k.pass.is_some())
+    }
+
+    /// One step of a retry pass, interleaved with everything else: its start
+    /// (applied now or held), or its next batch (committed now or held).
+    async fn pass_step(&mut self, ix: &ChangeIndex) {
+        if !self.under_way() {
+            let Some(parts) = self.start_of(ix).await else {
+                return;
+            };
+            if self.rng.random_bool(0.3) {
+                trace("a pass start is held");
+                self.deferred.push((self.era, Deferred::Start(parts)));
+            } else {
+                trace("a pass starts");
+                self.apply(parts);
+                self.stats[2] += 1;
+            }
+            return;
+        }
+        let r = self.t.retry_view(EDGE.as_bytes()).unwrap();
+        let limit = self.rng.random_range(1..4);
+        let p = due::plan(&OneIndex(ix), &r, &self.now, limit)
+            .await
+            .unwrap();
+        for c in &p.inputs[0].keys {
+            assert!(
+                same(&c.held, &self.holding(&c.key)),
+                "retry of {:?} holds {:?}, truth {:?}",
+                c.key,
+                c.held,
+                self.holding(&c.key)
+            );
+            assert_eq!(
+                c.class,
+                Class::of(&self.holding(&c.key), &self.wanted(&c.key))
+            );
+        }
+        self.stats[3] += p.inputs[0].keys.len();
+        if self.rng.random_bool(0.25) {
+            let (failed, loaded) = self.work(&p);
+            let report = InputReport {
+                failed: failed.iter().map(|(k, _)| k.clone()).collect(),
+                loaded: loaded.clone(),
+            };
+            let Ok(planned) = self.t.progress_ops(&p, &[report], b"", None) else {
+                return;
+            };
+            let counters = self.t.per_key[EDGE.as_bytes()]
+                .pass
+                .as_ref()
+                .unwrap()
+                .counters;
+            if let Some(b) = self
+                .build(ix, &p, &planned, &failed, &loaded, counters)
+                .await
+            {
+                trace("a retry batch's commit is held");
+                self.deferred.push((self.era, Deferred::Commit(b)));
+            }
+            return;
+        }
+        if self.rng.random_bool(0.2) {
+            self.stale.push(p.clone());
+        }
+        self.run(ix, &p, true)
+            .await
+            .expect("a retry planned now commits");
+    }
+
+    /// The edge's records start over: the consumer holds nothing.
+    fn forget(&mut self) {
+        self.era += 1;
+        self.holds.clear();
+        self.fails.clear();
+        self.cursor = None;
+    }
+
+    fn close_reopen(&mut self) {
+        trace("close and reopen");
+        self.apply(vec![Part::EdgeClose(EdgeClose { edge: key(EDGE) })]);
+        self.apply(vec![Part::EdgeOpen(EdgeOpen {
+            edge: key(EDGE),
+            input: key("items"),
+            keyed: true,
+        })]);
+        self.forget();
+    }
+
+    /// Renamed away and back: the records go and come back with the edge,
+    /// in a later life.
+    fn rename_round(&mut self) {
+        trace("rename away and back");
+        self.era += 1;
+        self.apply(vec![Part::EdgeRename(EdgeRename {
+            from: key(EDGE),
+            to: key("tmp/items"),
+            input: key("items"),
+        })]);
+        if self.rng.random_bool(0.5) {
+            self.land_deferred();
+        }
+        self.apply(vec![Part::EdgeRename(EdgeRename {
+            from: key("tmp/items"),
+            to: key(EDGE),
+            input: key("items"),
+        })]);
+    }
+
+    fn rename_away_reopen(&mut self) {
+        trace("rename away and reopen");
+        self.files += 1;
+        self.apply(vec![Part::EdgeRename(EdgeRename {
+            from: key(EDGE),
+            to: key(&format!("old{}/items", self.files)),
+            input: key("items"),
+        })]);
+        self.apply(vec![Part::EdgeOpen(EdgeOpen {
+            edge: key(EDGE),
+            input: key("items"),
+            keyed: true,
+        })]);
+        self.forget();
     }
 
     async fn change_batch(&mut self, ix: &ChangeIndex, upstream_meanwhile: bool) {
@@ -925,6 +1074,21 @@ impl World {
         );
         let back = Tracking::restore(&self.t.snapshot()).unwrap();
         assert_eq!(back, self.t);
+        // A failing key waiting for a retry it is eligible for gets a pass.
+        if pk.pass.is_none() {
+            let eligible_now: Vec<Key> = self
+                .fails
+                .iter()
+                .filter(|(k, f)| eligible(&f.stored, self.clock, &self.counters) && self.waiting(k))
+                .map(|(k, _)| k.clone())
+                .collect();
+            if !eligible_now.is_empty() {
+                assert!(
+                    self.start_of(ix).await.is_some(),
+                    "{eligible_now:?} wait for a retry they are eligible for, and no pass starts"
+                );
+            }
+        }
     }
 }
 
@@ -963,6 +1127,7 @@ fn world(seed: u64) -> World {
         events: 0,
         stats: [0; 6],
         stale: vec![],
+        era: 0,
     };
     w.apply(vec![Part::EdgeOpen(EdgeOpen {
         edge: key(EDGE),
@@ -976,7 +1141,7 @@ async fn history(seed: u64, ix: &ChangeIndex) -> [usize; 6] {
     let mut w = world(seed);
     let trace = std::env::var("OUTCOME_TRACE").is_ok();
     for step in 0..60 {
-        let op = w.rng.random_range(0..27);
+        let op = w.rng.random_range(0..34);
         if trace {
             eprintln!(
                 "step {step} op {op} head {} now {:?} clock {} counters {:?}",
@@ -1033,7 +1198,12 @@ async fn history(seed: u64, ix: &ChangeIndex) -> [usize; 6] {
                 let c = w.rng.random_range(1..6);
                 w.counters.forced[c] = w.events + 1;
             }
+            18 | 20..=22 if w.under_way() => w.pass_step(ix).await,
             18 | 20..=22 => w.pass(ix).await,
+            27..=30 => w.pass_step(ix).await,
+            31 => w.close_reopen(),
+            32 => w.rename_round(),
+            33 => w.rename_away_reopen(),
             23 => w.hold(ix).await,
             24 => w.late(ix).await,
             25 => w.defer(ix).await,
@@ -1044,9 +1214,7 @@ async fn history(seed: u64, ix: &ChangeIndex) -> [usize; 6] {
                         edge: key(EDGE),
                         held: false,
                     })]);
-                    w.holds.clear();
-                    w.fails.clear();
-                    w.cursor = None;
+                    w.forget();
                 } else {
                     w.t = Tracking::restore(&w.t.snapshot()).unwrap();
                 }
