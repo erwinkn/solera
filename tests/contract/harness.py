@@ -362,14 +362,14 @@ class Solera:
 
         from solera_server.executors.inline import InlinePlacement
 
-        running = self.__dict__.setdefault("running_workers", {})  # task -> its attempt
+        running = self.__dict__.setdefault("running_workers", {})  # task -> (its run, its attempt)
 
         class Booting(InlinePlacement):
             def _work(self, stage):
                 return self._boot(stage)
 
             async def _boot(self, stage):
-                running[asyncio.current_task()] = stage["attempt"]
+                running[asyncio.current_task()] = stage["run"], stage["attempt"]
                 try:
                     await (asyncio.Event().wait() if boot is None else asyncio.sleep(boot))
                     return await InlinePlacement._work(self, stage)
@@ -383,17 +383,20 @@ class Solera:
         project's assets dies at once, as a killed process does: it
         publishes no result. How many died. The engine's own cleanup tasks
         (docs/lifecycle.md §9.8), which start on their own after a commit,
-        and a worker still exiting after its attempt ended run on."""
+        and a worker still exiting after its attempt ended run on: the run's
+        page tells them apart."""
 
-        from solera_server.model import CLEANUP
-
-        m = self.engine.m
-
-        def asset_attempt(attempt: str) -> bool:
-            return m.claimed(attempt) is not None and m.task(m.attempts[attempt])["asset"] != CLEANUP
+        async def asset_attempt(run: str, attempt: str) -> bool:
+            detail = await self.get(f"/runs/{run}")
+            assets = {task["id"]: task["asset"] for task in detail["tasks"]}
+            return any(
+                a["id"] == attempt and a["outcome"] in ("launching", "running") and assets[task] != "@cleanup"
+                for task, views in detail["attempts"].items()
+                for a in views
+            )
 
         running = self.__dict__.get("running_workers", {})
-        killed = [task for task, attempt in running.items() if asset_attempt(attempt)]
+        killed = [task for task, (run, attempt) in list(running.items()) if await asset_attempt(run, attempt)]
         for task in killed:
             task.cancel()
         await asyncio.gather(*killed, return_exceptions=True)
