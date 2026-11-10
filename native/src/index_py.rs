@@ -5,7 +5,7 @@
 //!
 //! Layers cross as dicts (the engine journals them): `path`, `size`,
 //! `index_start`, `top_start`, `lo`, `hi`, `floor` (None unless a base),
-//! `entries`, `keys`, `first_key`, `last_key`, `flags`. Keys are `str`;
+//! `entries`, `keys`, `first_key`, `last_key`, `flags`, `clears`. Keys are `str`;
 //! versions are `int` (a generation), `str` (a source's version) or None
 //! (absent).
 
@@ -15,7 +15,7 @@ use std::sync::OnceLock;
 use pyo3::create_exception;
 use pyo3::exceptions::{PyKeyError, PyOSError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyDict, PyInt, PyList, PyString, PyTuple};
+use pyo3::types::{PyBool, PyBytes, PyDict, PyInt, PyList, PyString, PyTuple};
 use solera_index as ix;
 use solera_index::{Error, LayerRef, Query, Run, Version};
 
@@ -28,16 +28,25 @@ create_exception!(
     "A merge found entries that do not chain: an entry's replaced version is not the previous entry's new one."
 );
 
+/// The runtime, made by this process: its threads do not survive a fork, so
+/// a forked child that calls in fails loudly instead of hanging.
 pub(crate) fn rt() -> &'static tokio::runtime::Runtime {
-    static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
-    RT.get_or_init(|| {
-        tokio::runtime::Builder::new_multi_thread()
+    static RT: OnceLock<(tokio::runtime::Runtime, u32)> = OnceLock::new();
+    let (rt, pid) = RT.get_or_init(|| {
+        let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .thread_name("solera-index")
             .enable_all()
             .build()
-            .expect("the change index's runtime")
-    })
+            .expect("the change index's runtime");
+        (rt, std::process::id())
+    });
+    assert_eq!(
+        *pid,
+        std::process::id(),
+        "the change index cannot be used in a process forked after its first use"
+    );
+    rt
 }
 
 pub(crate) fn err(e: Error) -> PyErr {
@@ -61,7 +70,7 @@ impl Owned {
             Ok(Owned::Absent)
         } else if v.is_instance_of::<PyString>() {
             Ok(Owned::Str(v.extract()?))
-        } else if v.is_instance_of::<PyInt>() {
+        } else if v.is_instance_of::<PyInt>() && !v.is_instance_of::<PyBool>() {
             Ok(Owned::Int(v.extract()?))
         } else {
             Err(PyTypeError::new_err(format!(
@@ -119,6 +128,7 @@ fn layer_in(d: &Bound<'_, PyDict>) -> PyResult<LayerRef> {
         first_key: field::<String>(d, "first_key")?.into_bytes(),
         last_key: field::<String>(d, "last_key")?.into_bytes(),
         flags: field(d, "flags")?,
+        clears: field(d, "clears")?,
     })
 }
 
@@ -142,6 +152,7 @@ pub(crate) fn layer_out<'py>(py: Python<'py>, l: &LayerRef) -> PyResult<Bound<'p
     d.set_item("first_key", key(py, &l.first_key))?;
     d.set_item("last_key", key(py, &l.last_key))?;
     d.set_item("flags", l.flags)?;
+    d.set_item("clears", &l.clears)?;
     Ok(d)
 }
 
@@ -203,6 +214,7 @@ impl ChangeIndex {
     #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (url, options=None, *, memory_bytes=256 << 20, disk_dir=None, disk_store=None, disk_bytes=16 << 30, block_bytes=32 << 10, level=1))]
     fn new(
+        py: Python<'_>,
         url: &str,
         options: Option<HashMap<String, String>>,
         memory_bytes: u64,
@@ -227,13 +239,16 @@ impl ChangeIndex {
                 disk,
                 ..Default::default()
             };
-            let store = ix::Store::from_url(
-                url,
-                options.unwrap_or_default(),
-                rt().handle().clone(),
-                opts,
-            )
-            .map_err(err)?;
+            let store = py
+                .detach(|| {
+                    ix::Store::from_url(
+                        url,
+                        options.unwrap_or_default(),
+                        rt().handle().clone(),
+                        opts,
+                    )
+                })
+                .map_err(err)?;
             let write = ix::WriteOptions {
                 block_bytes,
                 level,
@@ -247,7 +262,10 @@ impl ChangeIndex {
 
     /// Write commit `commit`'s layer at `path` from its entries `(key, new,
     /// replaced)`, one per changed key, in any order. Returns the layer.
-    #[pyo3(signature = (path, commit, entries, *, time_ms=0, producer=Vec::new(), live_before=0))]
+    /// `clear`: the commit clears the state first (a full run's first
+    /// commit); its entries replace nothing.
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (path, commit, entries, *, time_ms=0, producer=Vec::new(), live_before=0, clear=false))]
     fn write_commit<'py>(
         &self,
         py: Python<'py>,
@@ -257,6 +275,7 @@ impl ChangeIndex {
         time_ms: u64,
         producer: Vec<u8>,
         live_before: u64,
+        clear: bool,
     ) -> PyResult<Bound<'py, PyDict>> {
         guard(|| {
             let mut es: Vec<(String, Owned, Owned)> = Vec::new();
@@ -289,6 +308,7 @@ impl ChangeIndex {
                 time_ms,
                 producer: &producer,
                 live_before,
+                clear,
             };
             let l = py
                 .detach(|| rt().block_on(self.ix.write_commit(path, nc, &run)))

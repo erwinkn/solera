@@ -46,6 +46,10 @@ const EDGE: &str = "checks/items";
 struct Log {
     states: Vec<BTreeMap<Key, Ver>>,
     layers: Vec<LayerRef>,
+    /// The commits that cleared, ascending.
+    clears: Vec<u64>,
+    /// The clear that started a full run still under way.
+    full_run: Option<u64>,
 }
 
 impl Log {
@@ -62,13 +66,23 @@ impl Log {
         ix: &ChangeIndex,
         t: &mut Tracking,
         changes: BTreeMap<Key, Ver>,
+        clear: bool,
+        ends: bool,
     ) -> bool {
         let before = self.states.last().unwrap().clone();
-        let mut after = before.clone();
+        let mut after = if clear {
+            BTreeMap::new()
+        } else {
+            before.clone()
+        };
         let mut run = Run::new();
         let c = self.head() + 1;
         for (k, new) in &changes {
-            let old = before.get(k).cloned().unwrap_or_default();
+            let old = if clear {
+                Ver::Absent
+            } else {
+                before.get(k).cloned().unwrap_or_default()
+            };
             if *new == old {
                 continue;
             }
@@ -87,17 +101,26 @@ impl Log {
             time_ms: 0,
             producer: b"",
             live_before: before.len() as u64,
+            clear,
         };
         let path = format!("items/c{c}");
         self.layers
             .push(ix.write_commit(&path, nc, &run).await.unwrap());
         self.states.push(after);
+        if clear {
+            self.clears.push(c);
+            self.full_run = Some(c);
+        }
+        if ends {
+            self.full_run = None;
+        }
         t.outputs.insert(
             key("items"),
             Output {
                 layers: self.layers.clone(),
                 head: c,
                 live: self.states.last().unwrap().len() as u64,
+                full_run: self.full_run,
             },
         );
         true
@@ -150,7 +173,7 @@ struct World {
     counters: Counters,
     files: u64,
     events: u64,
-    stats: [usize; 6],
+    stats: [usize; 7],
     /// Plans held back to commit late, after the state moved on.
     stale: Vec<plan::Plan>,
     /// Every key a batch runs fails (a bad deploy).
@@ -400,7 +423,6 @@ impl World {
             failed: failed.iter().map(|(k, _)| k.clone()).collect(),
             loaded: loaded.clone(),
         };
-        let planned = self.t.progress_ops(p, &[report], b"", None).ok()?;
         let counters = match (
             &self
                 .t
@@ -414,8 +436,9 @@ impl World {
         };
         // The engine builds the outcomes from a view, then applies them under
         // its lock: the input may commit in between, and a refused commit is
-        // built again.
+        // built again, its progress too.
         loop {
+            let planned = self.t.progress_ops(p, &[report.clone()], b"", None).ok()?;
             let b = self
                 .build(ix, p, &planned, &failed, &loaded, counters)
                 .await?;
@@ -445,7 +468,7 @@ impl World {
                 let r = self.report();
                 failed.push((c.key.clone(), r));
             }
-            if self.rng.random_bool(0.15) {
+            if self.rng.random_bool(0.3) {
                 let v = self.log.at(self.log.head(), &c.key);
                 if v != c.version && !v.is_absent() && !c.version.is_absent() {
                     loaded.push((c.key.clone(), v));
@@ -539,7 +562,35 @@ impl World {
         let ip = &p.inputs[0];
         let fails: BTreeMap<Key, Reported> = failed.into_iter().collect();
         let loaded: BTreeMap<Key, Ver> = loaded.into_iter().collect();
+        // A key loaded at another version than planned while the input is
+        // mid full run, or cleared since the plan, is held back: it keeps
+        // what it held and its outcome (D205, the model's ev_commit).
+        let unsettled = self.log.full_run.is_some()
+            || self
+                .log
+                .clears
+                .iter()
+                .any(|&c| ip.head < c && c <= self.log.head());
+        let held: Vec<Key> = ip
+            .keys
+            .iter()
+            .filter(|c| {
+                unsettled
+                    && loaded.get(&c.key).is_some_and(|v| {
+                        owed(
+                            &Holding::of(v.as_version(), &ip.conditions, &c.key),
+                            &Holding::of(c.version.as_version(), &ip.conditions, &c.key),
+                        )
+                    })
+            })
+            .map(|c| c.key.clone())
+            .collect();
+        assert_eq!(ops.held_back[0], held, "B3 holds back what the model does");
+        self.stats[6] += held.len();
         for c in &ip.keys {
+            if held.binary_search(&c.key).is_ok() {
+                continue;
+            }
             let got = loaded.get(&c.key).unwrap_or(&c.version);
             let tried = Holding::of(got.as_version(), &ip.conditions, &c.key);
             if fails.contains_key(&c.key) && !owed(&self.holding(&c.key), &tried) {
@@ -815,7 +866,11 @@ impl World {
             .await
             .unwrap();
         if upstream_meanwhile {
-            self.upstream(ix).await;
+            if self.rng.random_bool(0.4) {
+                self.upstream_clear(ix).await;
+            } else {
+                self.upstream(ix).await;
+            }
         }
         self.stats[0] += 1;
         // A batch whose input moved on commits only after the catch-up, and
@@ -898,7 +953,24 @@ impl World {
                 changes.insert(k, version(&mut self.rng));
             }
         }
-        if self.log.commit(ix, &mut self.t, changes).await {
+        let ends = self.rng.random_bool(0.5);
+        if self.log.commit(ix, &mut self.t, changes, false, ends).await {
+            self.reverted();
+        }
+    }
+
+    /// A full run of the input begins: its first commit clears, and the run
+    /// may go on over later commits.
+    async fn upstream_clear(&mut self, ix: &ChangeIndex) {
+        let mut changes = BTreeMap::new();
+        for k in self.universe.clone() {
+            if self.rng.random_bool(0.6) {
+                changes.insert(k, Ver::Int(self.rng.random_range(1..4)));
+            }
+        }
+        let ends = self.rng.random_bool(0.3);
+        trace("the input clears");
+        if self.log.commit(ix, &mut self.t, changes, true, ends).await {
             self.reverted();
         }
     }
@@ -1111,6 +1183,8 @@ fn world(seed: u64) -> World {
         log: Log {
             states: vec![BTreeMap::new()],
             layers: vec![],
+            clears: vec![],
+            full_run: None,
         },
         universe,
         now,
@@ -1124,7 +1198,7 @@ fn world(seed: u64) -> World {
         },
         files: 0,
         events: 0,
-        stats: [0; 6],
+        stats: [0; 7],
         stale: vec![],
         era: 0,
     };
@@ -1136,11 +1210,11 @@ fn world(seed: u64) -> World {
     w
 }
 
-async fn history(seed: u64, ix: &ChangeIndex) -> [usize; 6] {
+async fn history(seed: u64, ix: &ChangeIndex) -> [usize; 7] {
     let mut w = world(seed);
     let trace = std::env::var("OUTCOME_TRACE").is_ok();
     for step in 0..60 {
-        let op = w.rng.random_range(0..34);
+        let op = w.rng.random_range(0..36);
         if trace {
             eprintln!(
                 "step {step} op {op} head {} now {:?} clock {} counters {:?}",
@@ -1203,6 +1277,7 @@ async fn history(seed: u64, ix: &ChangeIndex) -> [usize; 6] {
             31 => w.close_reopen(),
             32 => w.rename_round(),
             33 => w.rename_away_reopen(),
+            34 | 35 => w.upstream_clear(ix).await,
             23 => w.hold(ix).await,
             24 => w.late(ix).await,
             25 => w.defer(ix).await,
@@ -1300,7 +1375,7 @@ fn random_histories() {
         .enable_all()
         .build()
         .unwrap();
-    let mut total = [0usize; 6];
+    let mut total = [0usize; 7];
     let only: Option<u64> = std::env::var("OUTCOME_SEED")
         .ok()
         .and_then(|s| s.parse().ok());
@@ -1311,7 +1386,7 @@ fn random_histories() {
         }));
         match s {
             Ok(s) => {
-                for i in 0..6 {
+                for i in 0..7 {
                     total[i] += s[i];
                 }
             }
@@ -1321,7 +1396,7 @@ fn random_histories() {
             }
         }
     }
-    eprintln!("{seeds} histories: change batches {}, key lists {}, retry passes {} taking {} keys, failing keys left {}, late commits accepted {}", total[0], total[1], total[2], total[3], total[4], total[5]);
+    eprintln!("{seeds} histories: change batches {}, key lists {}, retry passes {} taking {} keys, failing keys left {}, late commits accepted {}, keys held back {}", total[0], total[1], total[2], total[3], total[4], total[5], total[6]);
 }
 
 /// A retry batch planned in one pass never commits in another (review F3):
@@ -1346,7 +1421,7 @@ fn a_retry_batch_belongs_to_its_pass() {
             .iter()
             .map(|k| (k.clone(), Ver::Int(5)))
             .collect();
-        assert!(w.log.commit(&ix, &mut w.t, changes).await);
+        assert!(w.log.commit(&ix, &mut w.t, changes, false, true).await);
         w.fail_all = true;
         loop {
             w.change_batch(&ix, false).await;
@@ -1461,7 +1536,7 @@ impl World {
                 v => (key(k), Ver::Int(*v)),
             })
             .collect();
-        assert!(self.log.commit(ix, &mut self.t, changes).await);
+        assert!(self.log.commit(ix, &mut self.t, changes, false, true).await);
     }
 
     async fn planned(

@@ -32,7 +32,7 @@ def test_a_stale_unkeyed_commit_is_refused_and_never_moves_progress_back(tmp_pat
     t = items(tmp_path, 1)
     t.apply(Tracking.event_edge_open(b"u", b"items", False))
     old = t.plan({"unkeyed": [b"u"], "limit": 1})["plan"]
-    stale, _ = t.progress_ops(old, [])
+    stale = t.progress_ops(old, [])[0]
     t2 = items(tmp_path / "two", 2)
     t2.apply(Tracking.event_edge_open(b"u", b"items", False))
     t2.apply(t2.progress_ops(t2.plan({"unkeyed": [b"u"], "limit": 1})["plan"], [])[0])
@@ -58,3 +58,55 @@ def test_a_page_of_owed_keys_holds_at_least_one_key():
     t.apply(Tracking.event_edge_open(b"e", b"items", True))
     with pytest.raises(ValueError, match="at least one key"):
         t.owed(b"e", {}, limit=0)
+
+
+def upstream(tmp_path) -> tuple[Tracking, ChangeIndex, list]:
+    """items at c1 holds k1 and k2; the keyed edge e reads it."""
+    ix = ChangeIndex(f"file://{tmp_path}")
+    t = Tracking()
+    t.attach(b"items", ix)
+    layers = [ix.write_commit("items/1", 1, [("k1", 1, None), ("k2", 1, None)], live_before=0)]
+    t._set_output(b"items", layers, 1, 2)
+    t.apply(Tracking.event_edge_open(b"e", b"items", True))
+    return t, ix, layers
+
+
+def plan_all(t: Tracking) -> bytes:
+    return t.plan({"inputs": [{"edge": b"e", "conditions": {}}], "limit": 10})["plan"]
+
+
+def test_a_key_loaded_after_a_clear_since_the_plan_is_held_back_even_once_the_full_run_is_done(tmp_path):
+    t, ix, layers = upstream(tmp_path)
+    plan = plan_all(t)
+    layers.append(ix.write_commit("items/2", 2, [("k1", 2, None)], live_before=2, clear=True))
+    t._set_output(b"items", layers, 2, 1, 2)
+    t.apply(Tracking.event_full_run_done(b"items"))
+    assert t.full_run(b"items") is None
+    event, _, held_back = t.progress_ops(plan, [(["k1"], [("k1", 2)])])
+    assert held_back == [["k1"]]  # held back before its failure counts
+    t.apply(event)
+    assert t.owed(b"e", {}) == ([("k1", "added"), ("k2", "removed")], None)
+
+
+def test_a_key_loaded_mid_full_run_is_held_back_without_a_clear_since_the_plan(tmp_path):
+    ix = ChangeIndex(f"file://{tmp_path}")
+    t = Tracking()
+    t.attach(b"items", ix)
+    layers = [ix.write_commit("items/1", 1, [("k1", 1, None), ("k2", 1, None)], live_before=0, clear=True)]
+    t._set_output(b"items", layers, 1, 2, 1)
+    t.apply(Tracking.event_edge_open(b"e", b"items", True))
+    plan = plan_all(t)  # a reader the gate does not hold
+    layers.append(ix.write_commit("items/2", 2, [("k1", 2, 1)], live_before=2))
+    t._set_output(b"items", layers, 2, 2, 1)
+    assert t.progress_ops(plan, [([], [("k1", 2)])])[2] == [["k1"]]
+
+
+def test_a_key_loaded_at_another_version_with_no_full_run_is_a_deviation(tmp_path):
+    t, ix, layers = upstream(tmp_path)
+    plan = plan_all(t)
+    layers.append(ix.write_commit("items/2", 2, [("k1", 2, 1)], live_before=2))
+    t._set_output(b"items", layers, 2, 2)
+    event, _, held_back = t.progress_ops(plan, [([], [("k1", 2)])])
+    assert held_back == [[]]
+    t.apply(event)
+    assert t.owed(b"e", {}) == ([], None)

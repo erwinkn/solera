@@ -34,15 +34,17 @@ pub(crate) fn build_commit<'py>(
     producer: &[u8],
     mode: &str,
     at: Option<u64>,
+    ends_full_run: bool,
     collect: usize,
 ) -> PyResult<Option<Bound<'py, PyDict>>> {
     let mode = match (mode, at) {
         ("patch", None) => Mode::Patch,
         ("replace", None) => Mode::Replace,
+        ("clear", None) => Mode::Clear,
         ("report", Some(at)) => Mode::Report(at),
         _ => {
             return Err(PyValueError::new_err(format!(
-                "mode {mode:?} with at={at:?}: patch or replace without at, report with it"
+                "mode {mode:?} with at={at:?}: patch, replace or clear without at, report with it"
             )))
         }
     };
@@ -52,6 +54,7 @@ pub(crate) fn build_commit<'py>(
         producer,
         path,
         mode,
+        ends_full_run,
         collect,
     };
     let id: tr::Id = output.into();

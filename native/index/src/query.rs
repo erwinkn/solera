@@ -2,11 +2,11 @@
 //! `history`; writing a commit; and merging layers.
 
 use crate::error::{invalid, Error, Result};
-use crate::format::{lossy, parse_commits, CommitHeader, LayerRef, WriteOptions, Writer};
+use crate::format::{lossy, parse_commits, CommitHeader, LayerRef, WriteOptions, Writer, CLEAR};
 use crate::glob::Pattern;
 use crate::read::{Bounds, KeyList, Walk};
 use crate::run::{Run, Version};
-use crate::store::Store;
+use crate::store::{Store, Upload};
 use std::ops::{Bound, Range, RangeInclusive};
 use std::sync::Arc;
 
@@ -44,12 +44,17 @@ impl Query {
 /// A query's result: one key per group, in key order, and where the next page
 /// starts if the limit stopped it.
 ///
-/// - `diff`: one entry per key: the newest commit in the window, `new` the
-///   version at C2, `replaced` the version at C1.
+/// - `diff`: one entry per key: the newest commit in the window that changed
+///   it, `new` the version at C2, `replaced` the version at C1.
 /// - `scan`, `get`: one entry per key present at C: the entry that set its
 ///   version.
 /// - `history`: every retained entry, newest first. A base's entries at or
 ///   below its floor are the state there (`replaced` absent), not changes.
+///   At a commit that clears, the entries are the changes it made (see
+///   `window_with`).
+///
+/// The state at C is what was written from the newest commit at or below C
+/// that clears.
 #[derive(Debug, Default)]
 pub struct Page {
     pub run: Run,
@@ -93,6 +98,66 @@ fn at(c: u64, (floor, head): (u64, u64), what: &str) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+/// The newest commit at or below `c` that clears, or 0: the state at `c` is
+/// what was written from it on.
+fn clear_at(layers: &[LayerRef], c: u64) -> u64 {
+    layers
+        .iter()
+        .rev()
+        .flat_map(|l| l.clears.iter().rev())
+        .find(|&&k| k <= c)
+        .copied()
+        .unwrap_or(0)
+}
+
+/// A change of one key: its commit, the row of its new version (none: removed
+/// by a clear) and the row of the version it replaced.
+type Change = (u64, Option<usize>, Option<usize>);
+
+fn version(g: &Run, row: Option<usize>) -> Version<'_> {
+    row.map_or(Version::Absent, |r| g.new_version(r))
+}
+
+/// The changes of `g`'s key in `commits`, oldest first, replayed from `start`
+/// (the newest clear before them, or 0) over the commits in them that clear
+/// (`clears`, ascending). At a clear, a key present before and not written
+/// there is removed, and a key written there replaced what was present (and
+/// did not change if it wrote that again).
+fn replay(
+    g: &Run,
+    start: u64,
+    commits: &RangeInclusive<u64>,
+    clears: &[u64],
+    changes: &mut Vec<Change>,
+) {
+    changes.clear();
+    // the row of the version present, and the next clear
+    let (mut cur, mut next): (Option<usize>, usize) = (None, 0);
+    for r in g.rows(0).rev() {
+        let c = g.commit(r);
+        if c < start || c > *commits.end() {
+            continue;
+        }
+        while next < clears.len() && clears[next] < c {
+            if let Some(p) = cur.take() {
+                changes.push((clears[next], None, Some(p)));
+            }
+            next += 1;
+        }
+        let at_clear = next < clears.len() && clears[next] == c;
+        next += at_clear as usize;
+        if commits.contains(&c) && !(at_clear && version(g, cur) == g.new_version(r)) {
+            changes.push((c, Some(r), cur));
+        }
+        cur = Some(r).filter(|&r| !g.new_version(r).is_absent());
+    }
+    for &k in &clears[next..] {
+        if let Some(p) = cur.take() {
+            changes.push((k, None, Some(p)));
+        }
+    }
 }
 
 /// The newest-first layers a read at commits `(c1, c2]` needs.
@@ -141,7 +206,8 @@ impl ChangeIndex {
     }
 
     /// Keys whose state differs between C1 and C2: `on(key, newest commit
-    /// in the window, version at C2, version at C1)` for each, in key order.
+    /// in the window that changed it, version at C2, version at C1)` for
+    /// each, in key order. A key a clear removed changed at that clear.
     /// Returns where the next page starts if the limit stopped it.
     pub async fn diff_with(
         &self,
@@ -157,7 +223,25 @@ impl ChangeIndex {
         if c1 > c2 {
             return invalid(format!("diff from {c1} to {c2}: C1 is after C2"));
         }
-        let ls = pick(layers, c1, c2, &q.bounds());
+        if c1 == c2 {
+            return Ok(None);
+        }
+        // A clear in the window: the states at C1 and at C2 are compared, which
+        // reads the whole state at C1.
+        let (k1, k2) = (clear_at(layers, c1), clear_at(layers, c2));
+        let across = k2 > c1;
+        let clears: Vec<u64> = layers
+            .iter()
+            .flat_map(|l| l.clears.iter().copied())
+            .filter(|&k| k > c1 && k <= c2)
+            .collect();
+        let mut changes: Vec<Change> = Vec::new();
+        let ls = pick(
+            layers,
+            if across { k1.saturating_sub(1) } else { c1 },
+            c2,
+            &q.bounds(),
+        );
         let Some(mut w) = self.walk(ls, q, None, false).await? else {
             return Ok(None);
         };
@@ -165,17 +249,35 @@ impl ChangeIndex {
         let limit = q.limit.unwrap_or(u64::MAX);
         let mut n = 0;
         while w.next(&mut g).await? {
-            let rows = g.rows(0);
-            let mut window = rows.filter(|&r| g.commit(r) > c1 && g.commit(r) <= c2);
-            let Some(newest) = window.next() else {
-                continue;
+            let (commit, before, after) = if across {
+                replay(&g, k1, &(c1 + 1..=c2), &clears, &mut changes);
+                let (Some(&(c, new, _)), Some(&(.., was))) = (changes.last(), changes.first())
+                else {
+                    continue;
+                };
+                // a key written again at a clear changed there too
+                let written = g.rows(0).map(|r| g.commit(r)).find(|&w| w <= c2);
+                (
+                    c.max(written.unwrap_or(0)),
+                    version(&g, was),
+                    version(&g, new),
+                )
+            } else {
+                let mut window = g.rows(0).filter(|&r| g.commit(r) > c1 && g.commit(r) <= c2);
+                let Some(newest) = window.next() else {
+                    continue;
+                };
+                let oldest = window.next_back().unwrap_or(newest);
+                (
+                    g.commit(newest),
+                    g.replaced_version(oldest),
+                    g.new_version(newest),
+                )
             };
-            let oldest = window.last().unwrap_or(newest);
-            let (before, after) = (g.replaced_version(oldest), g.new_version(newest));
             if before == after {
                 continue;
             }
-            on(g.key(0), g.commit(newest), after, before);
+            on(g.key(0), commit, after, before);
             n += 1;
             if n == limit {
                 return Ok(Some(g.key(0).to_vec()));
@@ -209,7 +311,8 @@ impl ChangeIndex {
     ) -> Result<Option<Vec<u8>>> {
         let range = check_layers(layers)?;
         at(c, range, "commit")?;
-        let ls = pick(layers, 0, c, &q.bounds());
+        let k = clear_at(layers, c);
+        let ls = pick(layers, k.saturating_sub(1), c, &q.bounds());
         let all_at_once = keys.is_some();
         let Some(mut w) = self.walk(ls, q, keys, all_at_once).await? else {
             return Ok(None);
@@ -222,7 +325,7 @@ impl ChangeIndex {
                 continue;
             };
             let v = g.new_version(r);
-            if v.is_absent() {
+            if v.is_absent() || g.commit(r) < k {
                 continue;
             }
             on(g.key(0), g.commit(r), v, g.replaced_version(r));
@@ -283,6 +386,12 @@ impl ChangeIndex {
     /// reading only the layers that overlap them; keys without one are
     /// skipped. (A cleanup cursor stepping over commits reads each one's
     /// replaced versions this way.)
+    ///
+    /// With a clear in `commits`, the entries are the changes it made: at a
+    /// commit that clears, a key present before and not written there is
+    /// removed, and a key written there replaced its version from before
+    /// (and is left out if that did not change). That reads the state before
+    /// the window.
     pub async fn window_with(
         &self,
         layers: &[LayerRef],
@@ -294,6 +403,14 @@ impl ChangeIndex {
         let (lo, hi) = (*commits.start(), *commits.end());
         if lo > hi {
             return Ok(None);
+        }
+        let clears: Vec<u64> = layers
+            .iter()
+            .flat_map(|l| l.clears.iter().copied())
+            .filter(|c| commits.contains(c))
+            .collect();
+        if !clears.is_empty() {
+            return self.changes_with(layers, commits, &clears, q, on).await;
         }
         let ls = pick(layers, lo.saturating_sub(1), hi, &q.bounds());
         let Some(mut w) = self.walk(ls, q, None, false).await? else {
@@ -319,6 +436,46 @@ impl ChangeIndex {
                 }
                 on(&f);
             }
+            n += 1;
+            if n == limit {
+                return Ok(Some(g.key(0).to_vec()));
+            }
+        }
+        Ok(None)
+    }
+
+    /// `window_with` over commits that hold `clears` (ascending): each key's
+    /// entries replayed from the state before the window, so that a clear
+    /// removes what it found.
+    async fn changes_with(
+        &self,
+        layers: &[LayerRef],
+        commits: RangeInclusive<u64>,
+        clears: &[u64],
+        q: &Query,
+        mut on: impl FnMut(&Run),
+    ) -> Result<Option<Vec<u8>>> {
+        let (lo, hi) = (*commits.start(), *commits.end());
+        let start = clear_at(layers, lo.saturating_sub(1));
+        let ls = pick(layers, start.saturating_sub(1), hi, &q.bounds());
+        let Some(mut w) = self.walk(ls, q, None, false).await? else {
+            return Ok(None);
+        };
+        let (mut g, mut f) = (Run::new(), Run::new());
+        let mut changes: Vec<Change> = Vec::new();
+        let limit = q.limit.unwrap_or(u64::MAX);
+        let mut n = 0;
+        while w.next(&mut g).await? {
+            replay(&g, start, &commits, clears, &mut changes);
+            if changes.is_empty() {
+                continue;
+            }
+            f.clear();
+            f.push_key(g.key(0));
+            for &(c, new, was) in changes.iter().rev() {
+                f.push_entry(c, version(&g, new), version(&g, was));
+            }
+            on(&f);
             n += 1;
             if n == limit {
                 return Ok(Some(g.key(0).to_vec()));
@@ -380,31 +537,27 @@ impl ChangeIndex {
 
     async fn read_commits(&self, l: &LayerRef) -> Result<Vec<CommitHeader>> {
         let top = self.store.top(l).await?;
-        let b = self
-            .store
-            .get_range(&l.path, top.commits_start..top.index_start)
-            .await?;
-        parse_commits(&b).map_err(|e| match e {
-            Error::Format(m) => Error::Format(format!("{}: {m}", l.path)),
-            e => e,
-        })
+        self.store
+            .read_checked(&l.path, top.commits_start..top.index_start, |b| {
+                parse_commits(b)
+            })
+            .await
+            .map_err(|e| match e {
+                Error::Format(m) => Error::Format(format!("{}: {m}", l.path)),
+                e => e,
+            })
     }
 
     /// Write one commit's layer at `path`: its entries, one per changed key
-    /// (their commit numbers are ignored). Returns the layer's reference.
+    /// (their commit numbers are ignored). Returns the layer's reference; a
+    /// commit with no entries writes a layer too.
     pub async fn write_commit(
         &self,
         path: &str,
         commit: NewCommit<'_>,
         entries: &Run,
     ) -> Result<LayerRef> {
-        let mut h = CommitHeader {
-            commit: commit.commit,
-            time_ms: commit.time_ms,
-            producer: commit.producer.to_vec(),
-            ..Default::default()
-        };
-        let mut w = Writer::new(self.write, commit.commit, commit.commit, None)?;
+        let mut w = self.commit_writer(path, commit)?;
         for i in 0..entries.len() {
             let rows = entries.rows(i);
             if rows.len() != 1 {
@@ -413,35 +566,33 @@ impl ChangeIndex {
                     lossy(entries.key(i))
                 ));
             }
-            let (new, replaced) = (
+            w.push(
+                entries.key(i),
                 entries.new_version(rows.start),
                 entries.replaced_version(rows.start),
-            );
-            w.push(entries.key(i), commit.commit, new, replaced)?;
-            match (new.is_absent(), replaced.is_absent()) {
-                (false, true) => h.added += 1,
-                (false, false) => h.updated += 1,
-                _ => h.removed += 1,
-            }
+            )
+            .await?;
         }
-        h.live = (commit.live_before + h.added)
-            .checked_sub(h.removed)
-            .ok_or_else(|| {
-                Error::Invalid(format!(
-                    "commit {} removes more keys than were live",
-                    commit.commit
-                ))
-            })?;
-        if !entries.is_empty() {
-            h.min_key = entries.key(0).to_vec();
-            h.max_key = entries.key(entries.len() - 1).to_vec();
-        }
-        let mut l = w.finish(&[h])?;
-        let mut up = self.store.upload(path)?;
-        up.write(w.take()).await?;
-        up.finish().await?;
-        l.path = path.to_string();
-        Ok(l)
+        w.write().await
+    }
+
+    /// Write one commit's layer at `path` as its entries arrive: parts are
+    /// uploaded as they fill, so the writer holds one part, not the commit.
+    pub fn commit_writer(&self, path: &str, commit: NewCommit<'_>) -> Result<CommitWriter> {
+        Ok(CommitWriter {
+            w: Writer::new(self.write, commit.commit, commit.commit, None)?,
+            up: self.store.upload(path)?,
+            part: self.store.opts.part_bytes,
+            h: CommitHeader {
+                commit: commit.commit,
+                time_ms: commit.time_ms,
+                flags: if commit.clear { CLEAR } else { 0 },
+                producer: commit.producer.to_vec(),
+                ..Default::default()
+            },
+            live_before: if commit.clear { 0 } else { commit.live_before },
+            path: path.to_string(),
+        })
     }
 
     /// Merge the adjacent layers `run` of the list into one at `path`. Every
@@ -468,6 +619,15 @@ impl ChangeIndex {
             None
         };
         let fold = floor.unwrap_or(0);
+        // entries older than the newest clear at or below the fold are gone
+        // from the base
+        let clears: Vec<u64> = ins.iter().flat_map(|l| l.clears.iter().copied()).collect();
+        let kept = clears
+            .iter()
+            .rev()
+            .find(|&&k| k <= fold)
+            .copied()
+            .unwrap_or(0);
         let newest_first: Vec<&LayerRef> = ins.iter().rev().collect();
         let (walk, commits) = futures::future::join(
             Walk::open(&self.store, &newest_first, Bounds::all(), None, None, false),
@@ -485,31 +645,40 @@ impl ChangeIndex {
         let mut g = Run::new();
         while walk.next(&mut g).await? {
             let rows = g.rows(0);
-            for r in rows.start..rows.end - 1 {
-                if g.replaced_version(r) != g.new_version(r + 1) {
+            for r in rows.clone() {
+                // what was there before: nothing after a clear or before the
+                // first entry, else the previous entry's version
+                let c = g.commit(r);
+                let since = if r + 1 < rows.end { g.commit(r + 1) } else { 0 };
+                let k = clears.partition_point(|&k| k <= c);
+                let cleared = k > 0 && clears[k - 1] > since;
+                let want = if cleared || r + 1 == rows.end {
+                    if !cleared && !from_start {
+                        continue;
+                    }
+                    Version::Absent
+                } else {
+                    g.new_version(r + 1)
+                };
+                if g.replaced_version(r) != want {
+                    let there = if cleared {
+                        format!("commit {} cleared", clears[k - 1])
+                    } else if r + 1 < rows.end {
+                        format!("commit {} left {want:?}", g.commit(r + 1))
+                    } else {
+                        "nothing was there".to_string()
+                    };
                     return Err(Error::Chain(format!(
-                        "{:?}: commit {} replaced {:?}, but commit {} left {:?}",
+                        "{:?}: commit {c} replaced {:?}, but {there}",
                         lossy(g.key(0)),
-                        g.commit(r),
                         g.replaced_version(r),
-                        g.commit(r + 1),
-                        g.new_version(r + 1)
                     )));
                 }
-            }
-            let oldest = rows.end - 1;
-            if from_start && !g.replaced_version(oldest).is_absent() {
-                return Err(Error::Chain(format!(
-                    "{:?}: its first entry, commit {}, replaced {:?}, but nothing was there",
-                    lossy(g.key(0)),
-                    g.commit(oldest),
-                    g.replaced_version(oldest)
-                )));
             }
             for r in rows.clone() {
                 if g.commit(r) <= fold {
                     let v = g.new_version(r);
-                    if !v.is_absent() {
+                    if !v.is_absent() && g.commit(r) >= kept {
                         w.push(g.key(0), g.commit(r), v, Version::Absent)?;
                     }
                     break;
@@ -533,11 +702,89 @@ impl ChangeIndex {
     }
 }
 
+/// One commit's layer, written key by key (`ChangeIndex::commit_writer`).
+/// After an error, drop it: nothing is written.
+pub struct CommitWriter {
+    w: Writer,
+    up: Upload,
+    part: usize,
+    h: CommitHeader,
+    live_before: u64,
+    path: String,
+}
+
+impl CommitWriter {
+    /// The next changed key, keys ascending, with its new and replaced
+    /// versions.
+    pub async fn push(
+        &mut self,
+        key: &[u8],
+        new: Version<'_>,
+        replaced: Version<'_>,
+    ) -> Result<()> {
+        if self.w.entries() > 0 && key == self.h.max_key {
+            return invalid(format!(
+                "{:?}: a commit holds one entry per key",
+                lossy(key)
+            ));
+        }
+        if self.h.flags & CLEAR != 0 && !replaced.is_absent() {
+            return invalid(format!(
+                "{:?}: commit {} clears, so it replaces nothing, not {replaced:?}",
+                lossy(key),
+                self.h.commit
+            ));
+        }
+        self.w.push(key, self.h.commit, new, replaced)?;
+        if self.w.entries() == 1 {
+            self.h.min_key = key.to_vec();
+        }
+        self.h.max_key.clear();
+        self.h.max_key.extend_from_slice(key);
+        match (new.is_absent(), replaced.is_absent()) {
+            (false, true) => self.h.added += 1,
+            (false, false) => self.h.updated += 1,
+            _ => self.h.removed += 1,
+        }
+        if self.w.pending() >= self.part {
+            self.up.write(self.w.take()).await?;
+        }
+        Ok(())
+    }
+
+    /// The layer, or `None` (and nothing written) when nothing was pushed to
+    /// a commit that does not clear.
+    pub async fn finish(self) -> Result<Option<LayerRef>> {
+        if self.w.entries() == 0 && self.h.flags & CLEAR == 0 {
+            return Ok(None);
+        }
+        self.write().await.map(Some)
+    }
+
+    async fn write(mut self) -> Result<LayerRef> {
+        self.h.live = (self.live_before + self.h.added)
+            .checked_sub(self.h.removed)
+            .ok_or_else(|| {
+                Error::Invalid(format!(
+                    "commit {} removes more keys than were live",
+                    self.h.commit
+                ))
+            })?;
+        let mut l = self.w.finish(std::slice::from_ref(&self.h))?;
+        self.up.write(self.w.take()).await?;
+        self.up.finish().await?;
+        l.path = self.path;
+        Ok(l)
+    }
+}
+
 /// A layer's entries, one key at a time.
 pub struct Entries(Walk);
 
 impl Entries {
-    /// The next key and its entries, newest first, into `group`; false at the end.
+    /// The next key and its entries, newest first, into `group`; false at the
+    /// end. Not cancel-safe: a call dropped before it returns leaves the
+    /// reader unusable.
     pub async fn next(&mut self, group: &mut Run) -> Result<bool> {
         self.0.next(group).await
     }
@@ -551,6 +798,9 @@ pub struct NewCommit<'a> {
     pub time_ms: u64,
     pub producer: &'a [u8],
     pub live_before: u64,
+    /// The commit clears the state first (a full run's first commit): its
+    /// entries replace nothing, and it removes every key it does not write.
+    pub clear: bool,
 }
 
 const MIB: u64 = 1 << 20;
@@ -565,9 +815,9 @@ pub fn pick_merge(layers: &[LayerRef], cut: u64) -> Option<Range<usize>> {
     let n = layers.len() - b;
     let sizes: Vec<u64> = layers.iter().map(|l| l.size).collect();
     let fits = |a: usize, e: usize| {
-        let size: u64 = sizes[a..e].iter().sum();
-        let newer: u64 = sizes[e..].iter().sum();
-        size <= 4 * newer + MIB
+        let size = sizes[a..e].iter().fold(0u64, |t, &x| t.saturating_add(x));
+        let newer = sizes[e..].iter().fold(0u64, |t, &x| t.saturating_add(x));
+        size <= newer.saturating_mul(4).saturating_add(MIB)
     };
     if n >= 4 {
         for a in (b..=layers.len() - 4).rev() {
@@ -585,9 +835,11 @@ pub fn pick_merge(layers: &[LayerRef], cut: u64) -> Option<Range<usize>> {
     }
     let below = layers[b..].iter().take_while(|l| l.hi <= cut).count();
     if below > 0 {
-        let size: u64 = sizes[b..b + below].iter().sum();
+        let size = sizes[b..b + below]
+            .iter()
+            .fold(0u64, |t, &x| t.saturating_add(x));
         let base = if b == 1 { sizes[0] } else { 0 };
-        if size * 4 >= base {
+        if size.saturating_mul(4) >= base {
             return Some(0..b + below);
         }
     }

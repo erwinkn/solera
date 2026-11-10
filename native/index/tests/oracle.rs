@@ -44,6 +44,8 @@ enum V {
 }
 
 type O = Option<V>;
+/// A key's entries: commit, new version, replaced version.
+type Entries = Vec<(u64, O, O)>;
 
 fn ver(v: &O) -> Version<'_> {
     match v {
@@ -70,6 +72,8 @@ struct History {
     commits: Vec<Vec<(usize, O, O)>>,
     /// states[c][k]: k's version after commit c.
     states: Vec<Vec<O>>,
+    /// clears[c]: commit c clears the state first.
+    clears: Vec<bool>,
 }
 
 impl History {
@@ -94,8 +98,14 @@ impl History {
             keys,
             commits: vec![vec![]],
             states: vec![state.clone()],
+            clears: vec![false],
         };
+        let clearing = rng.random_bool(0.5);
         for c in 1..=n as u64 {
+            let clear = clearing && rng.random_bool(0.2);
+            if clear {
+                state.iter_mut().for_each(|v| *v = None);
+            }
             let mut changes = Vec::new();
             for (k, cur) in state.iter_mut().enumerate() {
                 if !rng.random_bool(p) {
@@ -122,8 +132,25 @@ impl History {
             }
             h.commits.push(changes);
             h.states.push(state.clone());
+            h.clears.push(clear);
         }
         h
+    }
+
+    /// Whether commit `c` changed key `k`'s version.
+    fn changed(&self, k: usize, c: u64) -> bool {
+        self.states[c as usize - 1][k] != self.states[c as usize][k]
+    }
+
+    /// Key `k`'s change at commit `c`, if it changed: (commit, new, replaced).
+    fn change(&self, k: usize, c: u64) -> Option<(u64, O, O)> {
+        self.changed(k, c).then(|| {
+            (
+                c,
+                self.states[c as usize][k].clone(),
+                self.states[c as usize - 1][k].clone(),
+            )
+        })
     }
 
     fn head(&self) -> u64 {
@@ -135,10 +162,6 @@ impl History {
         (1..=c)
             .rev()
             .find(|&x| self.commits[x as usize].iter().any(|e| e.0 == k))
-    }
-
-    fn entry(&self, k: usize, c: u64) -> Option<&(usize, O, O)> {
-        self.commits[c as usize].iter().find(|e| e.0 == k)
     }
 }
 
@@ -293,6 +316,7 @@ impl World {
             time_ms: c * 1000,
             producer: producer.as_bytes(),
             live_before,
+            clear: self.h.clears[c as usize],
         };
         let l = self
             .ix
@@ -340,7 +364,9 @@ impl World {
                 .map(|k| {
                     let newest = (c1 + 1..=c2)
                         .rev()
-                        .find(|&c| h.entry(k, c).is_some())
+                        .find(|&c| {
+                            h.changed(k, c) || h.commits[c as usize].iter().any(|e| e.0 == k)
+                        })
                         .unwrap();
                     let (a, b) = (
                         h.states[c2 as usize][k].clone(),
@@ -357,7 +383,7 @@ impl World {
                 ctx(&format!("diff({c1}, {c2}, {:?})", q.q))
             );
             // scan and get: (key, commit that set the version, version)
-            let present = |k: usize, c: u64| -> Option<(Vec<u8>, Vec<(u64, O, O)>)> {
+            let present = |k: usize, c: u64| -> Option<(Vec<u8>, Entries)> {
                 let v = h.states[c as usize][k].clone()?;
                 Some((
                     h.keys[k].clone(),
@@ -411,7 +437,7 @@ impl World {
                 .filter_map(|k| {
                     let mut es: Vec<(u64, O, O)> = (floor + 1..=head)
                         .rev()
-                        .filter_map(|c| h.entry(k, c).map(|e| (c, e.1.clone(), e.2.clone())))
+                        .filter_map(|c| h.change(k, c))
                         .collect();
                     if floor > 0 {
                         if let Some(v) = &h.states[floor as usize][k] {
@@ -440,7 +466,7 @@ impl World {
             .filter_map(|k| {
                 let es: Vec<(u64, O, O)> = (w1..=w2.min(head))
                     .rev()
-                    .filter_map(|c| h.entry(k, c).map(|e| (c, e.1.clone(), e.2.clone())))
+                    .filter_map(|c| h.change(k, c))
                     .collect();
                 (!es.is_empty()).then(|| (h.keys[k].clone(), es))
             })
@@ -476,6 +502,8 @@ impl World {
                     .count() as u64
             );
             assert_eq!(x.producer, format!("run-{}", x.commit).into_bytes());
+            let clear = h.clears[x.commit as usize];
+            assert_eq!(x.flags, if clear { format::CLEAR } else { 0 });
         }
         // below the floor nothing is answered
         if floor > 0 {
@@ -632,6 +660,7 @@ fn the_disk_cache_serves_reads_after_a_write_and_after_a_restart() {
             time_ms: 0,
             producer: b"",
             live_before: 0,
+            clear: false,
         };
         let layers = vec![ix.write_commit("c1", nc, &run).await.unwrap()];
         // written through: no GET
@@ -685,6 +714,7 @@ fn bad_references_and_abandoned_reads_leave_the_index_working() {
         time_ms: 0,
         producer: b"",
         live_before: 0,
+        clear: false,
     };
     let one = |v: u64| {
         let mut run = Run::new();
@@ -701,13 +731,39 @@ fn bad_references_and_abandoned_reads_leave_the_index_working() {
         let q = Query::default();
         // a flag this reader does not know is refused, even on a layer no read opens
         let flagged = LayerRef {
-            flags: 1,
+            flags: 2,
             ..l2.clone()
         };
         assert!(matches!(
             ix.scan(&[l1.clone(), flagged], 2, &q).await,
             Err(Error::Format(_))
         ));
+        // a clear flag goes with the commits that clear, as the file says
+        let flagged = LayerRef {
+            flags: format::CLEAR,
+            ..l2.clone()
+        };
+        assert!(matches!(
+            ix.scan(&[l1.clone(), flagged], 2, &q).await,
+            Err(Error::Invalid(_))
+        ));
+        let flagged = LayerRef {
+            flags: format::CLEAR,
+            clears: vec![1],
+            ..l1.clone()
+        };
+        assert!(matches!(
+            ix.scan(&[flagged], 1, &q).await,
+            Err(Error::Format(_))
+        ));
+        let past = LayerRef {
+            hi: u64::MAX,
+            floor: Some(u64::MAX),
+            flags: format::CLEAR,
+            clears: vec![u64::MAX],
+            ..l1.clone()
+        };
+        assert!(matches!(past.check(), Err(Error::Invalid(_))));
         // offsets out of order are refused before any read, and the index still reads
         let bad = LayerRef {
             top_start: l1.size + 1,
@@ -725,7 +781,14 @@ fn bad_references_and_abandoned_reads_leave_the_index_working() {
             ix.scan(&[bad], 1, &q).await,
             Err(Error::Invalid(_))
         ));
-        assert_eq!(ix.scan(&[l1.clone()], 1, &q).await.unwrap().run.len(), 1);
+        assert_eq!(
+            ix.scan(std::slice::from_ref(&l1), 1, &q)
+                .await
+                .unwrap()
+                .run
+                .len(),
+            1
+        );
         // a reference that does not match its file is refused with the top level cached too
         let wrong = LayerRef {
             entries: 5,
@@ -801,7 +864,7 @@ fn bad_references_and_abandoned_reads_leave_the_index_working() {
             path: "late".into(),
             ..l1.clone()
         };
-        assert!(ix.scan(&[late.clone()], 1, &q).await.is_err());
+        assert!(ix.scan(std::slice::from_ref(&late), 1, &q).await.is_err());
         let c1 = mem
             .get(&Path::from("t/c1"))
             .await
@@ -812,12 +875,14 @@ fn bad_references_and_abandoned_reads_leave_the_index_working() {
         mem.put(&Path::from("t/late"), c1.into()).await.unwrap();
         assert_eq!(ix.scan(&[late], 1, &q).await.unwrap().run.len(), 1);
         // a path too long for a cache file name is written, just not kept on disk
-        let long = index("long", Some(dir.join("long")));
+        let long_dir = scratch("refs-long");
+        let long = index("long", Some(long_dir.clone()));
         let path = ["d".repeat(100), "e".repeat(100), "f".repeat(100)].join("/");
         let ll = long.write_commit(&path, nc(1), &one(3)).await.unwrap();
         let rl = long.scan(&[ll], 1, &q).await.unwrap();
         assert_eq!(rl.run.new_version(0), Version::Int(3));
         drop(long);
+        let _ = std::fs::remove_dir_all(long_dir);
         // a trailer cannot make the commits section larger than the format allows
         let c2 = mem
             .get(&Path::from("t/c2"))
@@ -929,6 +994,415 @@ fn keys_past_the_limit_are_refused_when_written_and_when_read() {
     assert!(matches!(got, Err(Error::Format(_))));
 }
 
+#[test]
+fn the_caches_do_what_they_promise() {
+    let rt = runtime();
+    let slow = Arc::new(object_store::throttle::ThrottledStore::new(
+        InMemory::new(),
+        object_store::throttle::ThrottleConfig {
+            wait_get_per_call: std::time::Duration::from_millis(20),
+            ..Default::default()
+        },
+    ));
+    let small = WriteOptions {
+        block_bytes: 1 << 10,
+        ..Default::default()
+    };
+    let index = |opts: StoreOptions| {
+        let store = Store::new(slow.clone(), Path::from("t"), rt.handle().clone(), opts).unwrap();
+        ChangeIndex::new(store, small)
+    };
+    let nc = |c| NewCommit {
+        commit: c,
+        time_ms: 0,
+        producer: b"",
+        live_before: 0,
+        clear: false,
+    };
+    let layer = |i: u64| {
+        let mut run = Run::new();
+        for k in 0..5000u64 {
+            run.push_key(format!("k{k:05}").as_bytes());
+            run.push_entry(1, Version::Int(k * 7 + i), Version::Absent);
+        }
+        run
+    };
+    let (dir, q) = (scratch("caches"), Query::default());
+    rt.block_on(async {
+        let w = index(StoreOptions::default());
+        let mut ls = Vec::new();
+        for i in 0..5 {
+            ls.push(
+                w.write_commit(&format!("c{i}"), nc(1), &layer(i))
+                    .await
+                    .unwrap(),
+            );
+        }
+        let one = [ls[0].clone()];
+        // single flight: eight reads of one layer at once make one read's GETs
+        let alone = index(StoreOptions::default());
+        alone.scan(&one, 1, &q).await.unwrap();
+        let shared = index(StoreOptions::default());
+        let reads = (0..8).map(|_| shared.scan(&one, 1, &q));
+        for r in futures::future::join_all(reads).await {
+            assert_eq!(r.unwrap().run.len(), 5000);
+        }
+        let (a, s) = (alone.store.stats.counts(), shared.store.stats.counts());
+        assert_eq!(s.gets, a.gets);
+        assert!(s.waits > 0);
+        // reads up to cache_batch are kept, bulk reads are not
+        for (batch, kept) in [(64 << 20, true), (1 << 10, false)] {
+            let ix = index(StoreOptions {
+                cache_batch: batch,
+                ..Default::default()
+            });
+            ix.scan(&one, 1, &q).await.unwrap();
+            let before = ix.store.stats.counts().gets;
+            ix.scan(&one, 1, &q).await.unwrap();
+            assert_eq!(
+                ix.store.stats.counts().gets == before,
+                kept,
+                "cache_batch {batch}"
+            );
+        }
+        // the memory cache holds what it weighs, within its budget
+        let budget = 16 << 10;
+        let ix = index(StoreOptions {
+            memory_bytes: budget,
+            ..Default::default()
+        });
+        for l in &ls {
+            ix.scan(std::slice::from_ref(l), 1, &q).await.unwrap();
+            let held = ix.store.memory_bytes();
+            assert!(held > 0 && held <= budget, "{held}");
+        }
+        // the disk cache keeps within its size, and drops a damaged copy
+        let size = ls[0].size;
+        let ix = index(StoreOptions {
+            disk: Some(DiskOptions {
+                dir: dir.clone(),
+                bytes: size * 9 / 2,
+                store: "t".into(),
+            }),
+            memory_bytes: 0,
+            ..Default::default()
+        });
+        let mut kept = Vec::new();
+        for i in 5..10 {
+            kept.push(
+                ix.write_commit(&format!("c{i}"), nc(1), &layer(i))
+                    .await
+                    .unwrap(),
+            );
+            assert!(ix.store.disk_bytes() <= size * 9 / 2);
+        }
+        let newest = ix.write_commit("c10", nc(1), &layer(10)).await.unwrap();
+        let file = dir.join("c10");
+        let mut b = std::fs::read(&file).unwrap();
+        b[10] ^= 0xff;
+        std::fs::write(&file, b).unwrap();
+        let held = ix.store.disk_bytes();
+        let got = ix.scan(std::slice::from_ref(&newest), 1, &q).await.unwrap();
+        assert_eq!(got.run.new_version(0), Version::Int(10));
+        assert_eq!(ix.store.disk_bytes(), held - newest.size);
+        // and so does a read of the commits section alone
+        let l9 = kept.pop().unwrap();
+        let file = dir.join("c9");
+        let mut b = std::fs::read(&file).unwrap();
+        b[l9.index_start as usize - 1] ^= 0xff;
+        std::fs::write(&file, b).unwrap();
+        for _ in 0..2 {
+            ix.commits(std::slice::from_ref(&l9), 1, 1).await.unwrap();
+        }
+    });
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn a_fill_that_cannot_be_kept_gives_its_room_back_once() {
+    let rt = runtime();
+    let mem = Arc::new(InMemory::new());
+    let dir = scratch("refill");
+    let index = |disk: bool| {
+        let opts = StoreOptions {
+            memory_bytes: 0,
+            disk: disk.then(|| DiskOptions {
+                dir: dir.clone(),
+                bytes: 1 << 30,
+                store: "t".into(),
+            }),
+            ..Default::default()
+        };
+        let store = Store::new(mem.clone(), Path::from("t"), rt.handle().clone(), opts).unwrap();
+        ChangeIndex::new(store, WriteOptions::default())
+    };
+    let nc = NewCommit {
+        commit: 1,
+        time_ms: 0,
+        producer: b"",
+        live_before: 0,
+        clear: false,
+    };
+    let run = |n: u64| {
+        let mut run = Run::new();
+        for i in 0..n {
+            run.push_key(format!("k{i:04}").as_bytes());
+            run.push_entry(1, Version::Int(i), Version::Absent);
+        }
+        run
+    };
+    rt.block_on(async {
+        let w = index(false);
+        let la = w.write_commit("a", nc, &run(100)).await.unwrap();
+        let lb = w.write_commit("b", nc, &run(1)).await.unwrap();
+        let ix = index(true);
+        // a directory where the file would go: the fill's rename fails
+        std::fs::create_dir_all(dir.join("a")).unwrap();
+        let wait_fill = |n: u64| {
+            let ix = &ix;
+            async move {
+                for _ in 0..200 {
+                    if ix.store.stats.counts().fills >= n {
+                        return;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            }
+        };
+        ix.scan(&[la], 1, &Query::default()).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(ix.store.stats.counts().fills, 0);
+        ix.scan(std::slice::from_ref(&lb), 1, &Query::default())
+            .await
+            .unwrap();
+        wait_fill(1).await;
+        assert_eq!(ix.store.stats.counts().fills, 1);
+        assert_eq!(ix.store.disk_bytes(), lb.size);
+    });
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn a_commit_writer_writes_what_write_commit_writes() {
+    let rt = runtime();
+    let mem = Arc::new(InMemory::new());
+    let opts = StoreOptions {
+        part_bytes: 64 << 10,
+        ..Default::default()
+    };
+    let store = Store::new(mem.clone(), Path::from("t"), rt.handle().clone(), opts).unwrap();
+    let ix = ChangeIndex::new(store, WriteOptions::default());
+    let nc = NewCommit {
+        commit: 1,
+        time_ms: 5,
+        producer: b"p",
+        live_before: 10,
+        clear: false,
+    };
+    let mut rng = SmallRng::seed_from_u64(1);
+    let mut run = Run::new();
+    for i in 0..20_000u64 {
+        run.push_key(format!("k{i:06}").as_bytes());
+        let v = Version::Int(rng.random());
+        match i % 3 {
+            0 => run.push_entry(1, v, Version::Absent),
+            1 => run.push_entry(1, v, Version::Int(i)),
+            _ => run.push_entry(1, Version::Absent, Version::Int(i)),
+        }
+    }
+    rt.block_on(async {
+        let a = ix.write_commit("a", nc, &run).await.unwrap();
+        let mut w = ix.commit_writer("b", nc).unwrap();
+        for i in 0..run.len() {
+            let r = run.rows(i).start;
+            w.push(run.key(i), run.new_version(r), run.replaced_version(r))
+                .await
+                .unwrap();
+        }
+        let b = w.finish().await.unwrap().unwrap();
+        assert_eq!(
+            LayerRef {
+                path: "a".into(),
+                ..b
+            },
+            a
+        );
+        let bytes = |p: &'static str| {
+            let mem = mem.clone();
+            async move {
+                mem.get(&Path::from(p))
+                    .await
+                    .unwrap()
+                    .bytes()
+                    .await
+                    .unwrap()
+            }
+        };
+        assert_eq!(bytes("t/a").await, bytes("t/b").await);
+        let h = CommitHeader {
+            commit: 1,
+            time_ms: 5,
+            producer: b"p".to_vec(),
+            added: 6667,
+            updated: 6667,
+            removed: 6666,
+            live: 10 + 6667 - 6666,
+            min_key: b"k000000".to_vec(),
+            max_key: b"k019999".to_vec(),
+            ..Default::default()
+        };
+        assert_eq!(ix.commits(&[a], 1, 1).await.unwrap(), vec![h.clone()]);
+        // the same bytes as the format's writer, given that header
+        let mut fw = Writer::new(WriteOptions::default(), 1, 1, None).unwrap();
+        for i in 0..run.len() {
+            let r = run.rows(i).start;
+            fw.push(run.key(i), 1, run.new_version(r), run.replaced_version(r))
+                .unwrap();
+        }
+        fw.finish(&[h]).unwrap();
+        assert_eq!(bytes("t/b").await, fw.take());
+        // nothing pushed: nothing written
+        let w = ix.commit_writer("e", nc).unwrap();
+        assert!(w.finish().await.unwrap().is_none());
+        assert!(mem.head(&Path::from("t/e")).await.is_err());
+        // one entry per key, keys ascending
+        let mut w = ix.commit_writer("d", nc).unwrap();
+        w.push(b"k", Version::Int(1), Version::Absent)
+            .await
+            .unwrap();
+        assert!(matches!(
+            w.push(b"k", Version::Int(2), Version::Absent).await,
+            Err(Error::Invalid(_))
+        ));
+        let mut w = ix.commit_writer("d", nc).unwrap();
+        w.push(b"k", Version::Int(1), Version::Absent)
+            .await
+            .unwrap();
+        assert!(matches!(
+            w.push(b"j", Version::Int(2), Version::Absent).await,
+            Err(Error::Invalid(_))
+        ));
+    });
+}
+
+#[test]
+fn a_commit_count_past_its_section_is_a_format_error() {
+    let raw = [0x80u8, 0x80, 0x40];
+    let c = zstd::bulk::compress(&raw, 1).unwrap();
+    let mut b = (raw.len() as u32).to_le_bytes().to_vec();
+    b.extend((xxhash_rust::xxh3::xxh3_64(&c) as u32).to_le_bytes());
+    b.extend(&c);
+    match format::parse_commits(&b) {
+        Err(Error::Format(m)) => assert!(m.contains("1048576 commit headers"), "{m}"),
+        got => panic!("{got:?}"),
+    }
+}
+
+#[test]
+fn a_truncated_layer_is_a_format_error() {
+    let rt = runtime();
+    let dir = scratch("short");
+    std::fs::create_dir_all(&dir).unwrap();
+    let index = || {
+        let local = Arc::new(object_store::local::LocalFileSystem::new_with_prefix(&dir).unwrap());
+        let store = Store::new(
+            local,
+            Path::from(""),
+            rt.handle().clone(),
+            StoreOptions::default(),
+        )
+        .unwrap();
+        ChangeIndex::new(store, WriteOptions::default())
+    };
+    let mut run = Run::new();
+    run.push_key(b"k");
+    run.push_entry(1, Version::Int(1), Version::Absent);
+    let nc = NewCommit {
+        commit: 1,
+        time_ms: 0,
+        producer: b"",
+        live_before: 0,
+        clear: false,
+    };
+    let l = rt.block_on(index().write_commit("c1", nc, &run)).unwrap();
+    let file = dir.join("c1");
+    let b = std::fs::read(&file).unwrap();
+    std::fs::write(&file, &b[..b.len() - 1]).unwrap();
+    let got = rt.block_on(index().scan(&[l], 1, &Query::default()));
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(matches!(got, Err(Error::Format(_))), "{got:?}");
+}
+
+#[test]
+fn write_throughs_stay_within_the_disk_cache() {
+    let rt = runtime();
+    let dir = scratch("tee");
+    let slow = Arc::new(object_store::throttle::ThrottledStore::new(
+        InMemory::new(),
+        object_store::throttle::ThrottleConfig {
+            wait_put_per_call: std::time::Duration::from_millis(300),
+            ..Default::default()
+        },
+    ));
+    let index = |disk: Option<u64>| {
+        let opts = StoreOptions {
+            disk: disk.map(|bytes| DiskOptions {
+                dir: dir.clone(),
+                bytes,
+                store: "t".into(),
+            }),
+            ..Default::default()
+        };
+        let store = Store::new(slow.clone(), Path::from("t"), rt.handle().clone(), opts).unwrap();
+        ChangeIndex::new(store, WriteOptions::default())
+    };
+    let one = |v: u64| {
+        let mut run = Run::new();
+        run.push_key(b"k");
+        run.push_entry(1, Version::Int(v), Version::Absent);
+        run
+    };
+    let nc = NewCommit {
+        commit: 1,
+        time_ms: 0,
+        producer: b"",
+        live_before: 0,
+        clear: false,
+    };
+    let in_dir = |dir: &std::path::Path| -> u64 {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| !e.file_name().to_string_lossy().starts_with(".l"))
+            .filter(|e| e.file_name() != ".store")
+            .map(|e| e.metadata().unwrap().len())
+            .sum()
+    };
+    rt.block_on(async {
+        let size = index(None)
+            .write_commit("w0", nc, &one(1))
+            .await
+            .unwrap()
+            .size;
+        let bytes = size * 9 / 2;
+        let ix = index(Some(bytes));
+        let runs: Vec<(String, Run)> = (1..=8).map(|i| (format!("w{i}"), one(i))).collect();
+        let writes = futures::future::join_all(runs.iter().map(|(p, r)| ix.write_commit(p, nc, r)));
+        let probe = async {
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            in_dir(&dir)
+        };
+        let (done, used) = tokio::join!(writes, probe);
+        assert!(done.iter().all(|w| w.is_ok()));
+        assert!(
+            used <= bytes,
+            "{used} bytes on disk, the cache holds {bytes}"
+        );
+        assert!(in_dir(&dir) <= bytes && ix.store.disk_bytes() <= bytes);
+    });
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 async fn ix_scan(ix: &ChangeIndex, layers: &[LayerRef]) -> usize {
     ix.scan(layers, 1, &Query::default())
         .await
@@ -951,6 +1425,7 @@ fn merges_refuse_entries_that_do_not_chain() {
             time_ms: 0,
             producer: b"",
             live_before: 0,
+            clear: false,
         };
         let l1 = ix.write_commit("c1", nc(1), &run).await.unwrap();
         let mut run = Run::new();
@@ -961,6 +1436,7 @@ fn merges_refuse_entries_that_do_not_chain() {
                 "c2",
                 NewCommit {
                     live_before: 1,
+                    clear: false,
                     ..nc(2)
                 },
                 &run,
@@ -986,18 +1462,51 @@ fn merges_refuse_entries_that_do_not_chain() {
                 "ok2",
                 NewCommit {
                     live_before: 1,
+                    clear: false,
                     ..nc(2)
                 },
                 &run,
             )
             .await
             .unwrap();
-        ix.merge(&[l1, l2], 1..2, 0, "m3").await.unwrap();
+        ix.merge(&[l1.clone(), l2], 1..2, 0, "m3").await.unwrap();
+        // after a clear, a key's first entry replaces nothing, wherever the
+        // merge starts
+        let clear = ix
+            .write_commit(
+                "x2",
+                NewCommit {
+                    clear: true,
+                    ..nc(2)
+                },
+                &Run::new(),
+            )
+            .await
+            .unwrap();
+        let mut run = Run::new();
+        run.push_key(b"k");
+        run.push_entry(3, Version::Int(2), Version::Int(1));
+        let l3 = ix
+            .write_commit(
+                "x3",
+                NewCommit {
+                    live_before: 1,
+                    ..nc(3)
+                },
+                &run,
+            )
+            .await
+            .unwrap();
+        let layers = vec![l1, clear, l3];
+        for (run, cut) in [(0..3, 0), (0..3, 3), (1..3, 0)] {
+            let e = ix.merge(&layers, run, cut, "m4").await.unwrap_err();
+            assert!(matches!(e, Error::Chain(_)), "{e}");
+        }
     });
 }
 
 #[test]
-fn a_flipped_byte_is_a_format_error() {
+fn a_flipped_byte_or_a_cut_file_is_a_format_error() {
     let rt = runtime();
     let mut rng = SmallRng::seed_from_u64(5);
     for trial in 0..200u64 {
@@ -1048,7 +1557,11 @@ fn a_flipped_byte_is_a_format_error() {
                 .unwrap()
                 .to_vec();
             let at = rng.random_range(0..b.len());
-            b[at] ^= 1 << rng.random_range(0..8);
+            if trial % 2 == 0 {
+                b[at] ^= 1 << rng.random_range(0..8);
+            } else {
+                b.truncate(at);
+            }
             mem.put(&path, b.into()).await.unwrap();
             let ix = ChangeIndex::new(store(&mem).unwrap(), WriteOptions::default());
             let all = ix.history(&w.layers, &Query::default()).await;
@@ -1056,9 +1569,49 @@ fn a_flipped_byte_is_a_format_error() {
             let failed = [all.err(), commits.err()];
             assert!(
                 failed.iter().any(|e| matches!(e, Some(Error::Format(_)))),
-                "trial {trial}: byte {at} of {} flipped, nothing noticed: {failed:?}",
+                "trial {trial}: byte {at} of {} flipped or cut, nothing noticed: {failed:?}",
                 l.size
             );
         });
     }
+}
+
+#[test]
+fn a_store_refuses_zero_for_its_sizes() {
+    let rt = runtime();
+    for o in [
+        StoreOptions {
+            max_inflight: 0,
+            ..Default::default()
+        },
+        StoreOptions {
+            max_get: 0,
+            ..Default::default()
+        },
+        StoreOptions {
+            part_bytes: 0,
+            ..Default::default()
+        },
+    ] {
+        let got = Store::new(
+            Arc::new(InMemory::new()),
+            Path::from(""),
+            rt.handle().clone(),
+            o,
+        );
+        assert!(matches!(got, Err(Error::Invalid(_))));
+    }
+}
+
+#[test]
+fn a_writer_refuses_seg_blocks_past_its_limit() {
+    for seg_blocks in [0, format::MAX_RAW / format::MAX_KEY + 1, 1 << 48] {
+        let o = WriteOptions {
+            seg_blocks,
+            ..Default::default()
+        };
+        assert!(matches!(Writer::new(o, 1, 1, None), Err(Error::Invalid(_))));
+    }
+    let max = Writer::new(WriteOptions::default(), 1, u64::MAX, Some(u64::MAX));
+    assert!(matches!(max, Err(Error::Invalid(_))));
 }

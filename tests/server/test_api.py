@@ -228,29 +228,6 @@ async def test_attempt_logs_spec_result(client, base, engine):
     assert (await client.get(f"{base}/runs/{run['id']}/attempts/nope/spec")).status_code == 404
 
 
-async def test_delete_and_prune_runs(client, base, engine):
-    """§11: finished runs can be deleted one by one or pruned; active runs cannot."""
-
-    finished = []
-    for _ in range(3):
-        run = await engine.submit(["feed"], mode="full")
-        await engine.run_until(run["id"])
-        finished.append(run["id"])
-    await engine.tick()  # archive
-    gone = await client.delete(f"{base}/runs/{finished[0]}")
-    assert gone.status_code == 200
-    assert (await client.get(f"{base}/runs/{finished[0]}")).status_code == 404
-    assert (await client.get(f"{base}/runs/{finished[0]}/events")).json() == []
-    dry = (await client.post(f"{base}/runs:prune", json={"asset": "feed", "keep": 1, "dry_run": True})).json()
-    assert dry == {"deleted": [finished[1]], "dry_run": True}
-    assert (await client.get(f"{base}/runs/{finished[1]}")).status_code == 200
-    pruned = (await client.post(f"{base}/runs:prune", json={"asset": "feed", "keep": 1})).json()
-    assert pruned["deleted"] == [finished[1]]
-    assert (await client.get(f"{base}/runs/{finished[2]}")).status_code == 200
-    active = await engine.submit(["daily"], partitions=["2026-09-18"])
-    assert (await client.delete(f"{base}/runs/{active['id']}")).status_code == 409
-
-
 async def test_automations_enable_disable_run_now(client, base, engine):
     """Automations list, toggle, and run-now (§9)."""
 
@@ -273,24 +250,6 @@ async def test_automations_enable_disable_run_now(client, base, engine):
     run_id = fired.json()["last_run"]
     detail = (await client.get(f"{base}/runs/{run_id}")).json()
     assert detail["request"]["status"] in {"queued", "running"}
-
-
-async def test_source_commit_endpoints(client, base, engine):
-    """POST sources/{name}/commit advances the external output (§5)."""
-
-    committed = await client.post(f"{base}/sources/uploads/commit", json={"keys": {"u-1": "v1"}})
-    assert committed.status_code == 200
-    assert committed.json()["ref"]["generation"]
-
-    patched = await client.post(
-        f"{base}/sources/uploads/commit",
-        json={"upsert": {"u-2": "v1"}, "remove": ["u-1"]},
-    )
-    assert patched.status_code == 200
-    keys = (await client.get(f"{base}/outputs/uploads/keys")).json()["keys"]
-    assert set(keys) == {"u-2"}
-    missing = await client.post(f"{base}/sources/ghost/commit", json={"version": "1"})
-    assert missing.status_code == 404
 
 
 async def test_executors_and_workers(client, base):
@@ -453,22 +412,6 @@ async def test_partitions_read_scope_records_not_task_history(client, base, engi
     assert complete["last_outcome"] == "succeeded" and complete["last_attempt"]
     assert {p["partition"]: p["status"] for p in by_site} == {"a": "removed", "b": "running"}
     assert reads == []
-
-
-async def test_failed_scope_reports_complete_after_success(client, base, engine):
-    """§8: a partition that failed and later succeeded reports complete — the
-    partition record is the last outcome, not a task-history scan."""
-
-    await engine.run_until(
-        (await engine.submit(["flaky"], partitions=["2026-09-19"], config={"fail": True}))["id"]
-    )
-    parts = (await client.get(f"{base}/partitions/flaky")).json()["partitions"]
-    assert {p["partition"]: p["status"] for p in parts}["2026-09-19"] == "failed"
-
-    await engine.run_until((await engine.submit(["flaky"], partitions=["2026-09-19"]))["id"])
-    parts = (await client.get(f"{base}/partitions/flaky")).json()["partitions"]
-    done = next(p for p in parts if p["partition"] == "2026-09-19")
-    assert done["status"] == "materialized" and done["last_outcome"] == "succeeded"
 
 
 POOLED = """

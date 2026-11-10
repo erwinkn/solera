@@ -234,6 +234,9 @@ pub async fn commit(
         id
     };
     let on_cond = learn(&p.conditions, &mut conds);
+    // What B3 held back keeps what it held, and its record as it is: the
+    // hold-back comes before the failure check (D205).
+    let held_back = ops.held_back.get(input).cloned().unwrap_or_default();
     let mut next: BTreeMap<Key, Option<Record>> = BTreeMap::new();
     let mut rep = reported.iter().peekable();
     for c in &p.keys {
@@ -241,6 +244,9 @@ pub async fn commit(
             rep.next();
         }
         let r = rep.next_if(|(k, _)| *k == c.key).map(|(_, r)| r);
+        if held_back.binary_search(&c.key).is_ok() {
+            continue;
+        }
         let prior = priors.get(&c.key);
         let tried = loaded
             .binary_search_by(|(k, _)| k.cmp(&c.key))
@@ -435,6 +441,7 @@ pub async fn commit(
         path,
         mode: Mode::Patch,
         collect: 0,
+        ends_full_run: false,
     };
     let mut parts = Vec::new();
     if let Some(b) = build(
@@ -693,6 +700,7 @@ pub async fn catch_up(
         path,
         mode: Mode::Patch,
         collect: 0,
+        ends_full_run: false,
     };
     let mut parts = Vec::new();
     if let Some(b) = build(

@@ -74,6 +74,8 @@ pub enum Part {
     PassStart(outcomes::PassStart),
     /// B6: a full run of a per-key asset asked for by hand raises its input's rebuild counter.
     Rebuild(outcomes::Rebuild),
+    /// B4: an output's full run ends without a commit of its own.
+    FullRunDone(commit::FullRunDone),
 }
 
 impl Part {
@@ -120,6 +122,7 @@ impl Part {
             }
             Part::PassStart(p) => vec![on("outcomes", &p.edge)],
             Part::Rebuild(p) => vec![on("outcomes", &p.edge)],
+            Part::FullRunDone(p) => vec![on("output", &p.output)],
         }
     }
 
@@ -135,6 +138,7 @@ impl Part {
             Part::Outcomes(_) => outcomes::TAG_OUTCOMES,
             Part::PassStart(_) => outcomes::TAG_PASS_START,
             Part::Rebuild(_) => outcomes::TAG_REBUILD,
+            Part::FullRunDone(_) => commit::TAG_FULL_RUN_DONE,
         }
     }
 
@@ -150,6 +154,7 @@ impl Part {
             Part::Outcomes(p) => p.encode(e),
             Part::PassStart(p) => p.encode(e),
             Part::Rebuild(p) => p.encode(e),
+            Part::FullRunDone(p) => p.encode(e),
         }
     }
 
@@ -165,6 +170,7 @@ impl Part {
             outcomes::TAG_OUTCOMES => Part::Outcomes(outcomes::Outcomes::decode(d)?),
             outcomes::TAG_PASS_START => Part::PassStart(outcomes::PassStart::decode(d)?),
             outcomes::TAG_REBUILD => Part::Rebuild(outcomes::Rebuild::decode(d)?),
+            commit::TAG_FULL_RUN_DONE => Part::FullRunDone(commit::FullRunDone::decode(d)?),
             t => return format(format!("unknown part tag {t:#04x}")),
         })
     }

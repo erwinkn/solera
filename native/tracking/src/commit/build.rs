@@ -7,7 +7,7 @@
 //! Reads the state only: run it off the event loop. The part's check refuses
 //! it if another commit reached the output meanwhile.
 
-use solera_index::{ChangeIndex, NewCommit, Query, Run, Version};
+use solera_index::{ChangeIndex, CommitWriter, NewCommit, Query, Run, Version};
 
 use crate::plan::Indexes;
 
@@ -31,6 +31,9 @@ pub struct Spec<'a> {
     /// Where its layer is written.
     pub path: &'a str,
     pub mode: Mode,
+    /// The full run's last commit (see [`OutputCommit`]). When nothing
+    /// changed, nothing is built: journal a `FullRunDone` instead.
+    pub ends_full_run: bool,
     /// Keep up to this many changed keys in `Built::keys` (0: none).
     pub collect: usize,
 }
@@ -42,8 +45,14 @@ pub enum Mode {
     /// The changes name every key the output holds afterwards (a source's
     /// full listing): a key present at the head and not named is removed.
     Replace,
-    /// A load's report on a source (P13): a key's report counts only if the
-    /// log did not change that key after this commit, the batch's head.
+    /// The first commit of a full run (form (a)): every key present at the
+    /// head is removed, then the changes' upserts apply. Nothing is read at
+    /// the head, and a removal is dropped: the clear already removed the key.
+    /// Written even when it names no key, since the clear is itself a change.
+    Clear,
+    /// A load's report on a source (P13): a key's report counts only if its
+    /// version at this commit, the batch's head, equals its version at the
+    /// output's head.
     Report(u64),
 }
 
@@ -53,6 +62,7 @@ pub struct Built {
     pub part: OutputCommit,
     pub added: u64,
     pub updated: u64,
+    /// After a clear: every key present before it, none of them in `keys`.
     pub removed: u64,
     /// The changed keys, if no more than `Spec::collect`.
     pub keys: Option<Changed>,
@@ -65,28 +75,26 @@ pub struct Changed {
 }
 
 struct Entries {
-    run: Run,
+    w: CommitWriter,
     added: u64,
     updated: u64,
     removed: u64,
     keys: Option<Changed>,
     collect: usize,
-    commit: u64,
     version: u64,
 }
 
 impl Entries {
-    fn put(&mut self, key: &[u8], change: Change<'_>, old: Version<'_>) {
+    async fn put(&mut self, key: &[u8], change: Change<'_>, old: Version<'_>) -> Result<()> {
         let new = match change {
             Change::Upsert(None) => Version::Int(self.version),
             Change::Upsert(Some(v)) => Version::Bytes(v),
             Change::Removed => Version::Absent,
         };
         if new == old {
-            return;
+            return Ok(());
         }
-        self.run.push_key(key);
-        self.run.push_entry(self.commit, new, old);
+        self.w.push(key, new, old).await?;
         match (new.is_absent(), old.is_absent()) {
             (false, true) => self.added += 1,
             (false, false) => self.updated += 1,
@@ -101,6 +109,7 @@ impl Entries {
                 k.upserted.push(key.into());
             }
         }
+        Ok(())
     }
 }
 
@@ -122,44 +131,58 @@ pub async fn build(
             return invalid(format!("a load at commit {at}, after the head {head}"));
         }
     }
-    let mut e = Entries {
-        run: Run::new(),
-        added: 0,
-        updated: 0,
-        removed: 0,
-        keys: (spec.collect > 0).then(Changed::default),
-        collect: spec.collect,
-        commit,
-        version: spec.version,
-    };
-    let mut ch = Changes::new();
-    if spec.mode == Mode::Replace {
-        replace(ix, out, changes, &mut ch, &mut e).await?;
-    } else {
-        while changes.next(&mut ch)? {
-            patch(ix, out, spec.mode, &ch, &mut e).await?;
-        }
-    }
-    if e.run.is_empty() {
-        return Ok(None);
-    }
     let nc = NewCommit {
         commit,
         time_ms: spec.time_ms,
         producer: spec.producer,
         live_before: out.live,
+        clear: spec.mode == Mode::Clear,
     };
-    let layer = ix.write_commit(spec.path, nc, &e.run).await?;
+    let mut e = Entries {
+        w: ix.commit_writer(spec.path, nc)?,
+        added: 0,
+        updated: 0,
+        removed: 0,
+        keys: (spec.collect > 0).then(Changed::default),
+        collect: spec.collect,
+        version: spec.version,
+    };
+    let mut ch = Changes::new();
+    match spec.mode {
+        Mode::Replace => replace(ix, out, changes, &mut ch, &mut e).await?,
+        Mode::Clear => {
+            while changes.next(&mut ch)? {
+                for i in 0..ch.len() {
+                    e.put(ch.key(i), ch.change(i), Version::Absent).await?;
+                }
+            }
+        }
+        _ => {
+            while changes.next(&mut ch)? {
+                patch(ix, out, spec.mode, &ch, &mut e).await?;
+            }
+        }
+    }
+    let Some(layer) = e.w.finish().await? else {
+        return Ok(None);
+    };
+    let cleared = if spec.mode == Mode::Clear {
+        out.live
+    } else {
+        0
+    };
+    let removed = e.removed + cleared;
     Ok(Some(Built {
         part: OutputCommit {
             output: output.clone(),
             layer,
-            live: out.live + e.added - e.removed,
+            live: out.live + e.added - removed,
+            ends_full_run: spec.ends_full_run,
         },
         added: e.added,
         updated: e.updated,
-        removed: e.removed,
-        keys: e.keys,
+        removed,
+        keys: e.keys.filter(|_| cleared == 0),
     }))
 }
 
@@ -193,7 +216,7 @@ async fn patch(
                 continue;
             }
         }
-        e.put(k, ch.change(i), old);
+        e.put(k, ch.change(i), old).await?;
     }
     Ok(())
 }
@@ -248,16 +271,18 @@ async fn replace(
         match (k, old) {
             (None, None) => return Ok(()),
             (Some(k), Some(o)) if k == o => {
-                e.put(k, ch.change(i), page.new_version(page.rows(j).start));
+                e.put(k, ch.change(i), page.new_version(page.rows(j).start))
+                    .await?;
                 i += 1;
                 j += 1;
             }
             (Some(k), o) if o.is_none_or(|o| k < o) => {
-                e.put(k, ch.change(i), Version::Absent);
+                e.put(k, ch.change(i), Version::Absent).await?;
                 i += 1;
             }
             (_, Some(o)) => {
-                e.put(o, Change::Removed, page.new_version(page.rows(j).start));
+                e.put(o, Change::Removed, page.new_version(page.rows(j).start))
+                    .await?;
                 j += 1;
             }
             (Some(_), None) => unreachable!(),

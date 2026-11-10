@@ -16,7 +16,7 @@ fn main() {
     for i in 0..top.segs.len() {
         let s = &top.segs;
         let c = &f[s.off[i] as usize..s.off[i] as usize + s.clen[i] as usize];
-        let ix = parse_segment(c, s.rlen[i], s.check[i], s.n[i]).unwrap();
+        let ix = parse_segment(c, s.rlen[i], s.check[i], s.n[i], top.commits_start).unwrap();
         for b in 0..ix.len() {
             blocks.push((ix.off[b] as usize, ix.clen[b] as usize, ix.rlen[b], ix.n[b]));
         }

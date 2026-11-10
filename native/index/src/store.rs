@@ -16,6 +16,10 @@ use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex};
 use tokio::sync::Semaphore;
 
+/// A small layer's top level comes with its segments, decoded at once up to
+/// about this many bytes; the rest are decoded when a read needs them.
+const EAGER_SEGS: usize = 16 << 20;
+
 #[derive(Clone, Debug)]
 pub struct StoreOptions {
     /// Bytes of blocks and metadata kept in memory, shared by every query.
@@ -130,12 +134,6 @@ pub(crate) enum Want {
     Top {
         layer: LayerRef,
     },
-    Seg {
-        rlen: u32,
-        check: u32,
-        blocks: u32,
-        data_end: u64,
-    },
     /// `keep`: cache it. A bulk read (a batch past `cache_batch`) does not,
     /// so that a scan or a merge leaves the planners' blocks where they are.
     Block {
@@ -200,6 +198,7 @@ pub struct Store {
     pub(crate) opts: StoreOptions,
     state: Mutex<State>,
     sem: Semaphore,
+    fill_slots: Arc<Semaphore>,
     disk: Option<Disk>,
     pub stats: Stats,
 }
@@ -212,8 +211,18 @@ impl Store {
         rt: tokio::runtime::Handle,
         opts: StoreOptions,
     ) -> Result<Arc<Store>> {
+        for (name, v) in [
+            ("max_inflight", opts.max_inflight as u64),
+            ("max_get", opts.max_get),
+            ("part_bytes", opts.part_bytes as u64),
+        ] {
+            if v == 0 {
+                return Err(Error::Invalid(format!("{name} is at least 1")));
+            }
+        }
         Ok(Arc::new(Store {
             disk: opts.disk.clone().map(Disk::open).transpose()?,
+            fill_slots: Arc::new(Semaphore::new(2)),
             inner,
             prefix,
             rt,
@@ -251,8 +260,27 @@ impl Store {
         Ok(self.prefix.parts().chain(p.parts()).collect())
     }
 
-    /// One GET.
-    pub(crate) async fn get_range(&self, path: &str, r: Range<u64>) -> Result<Bytes> {
+    /// One read, parsed; a damaged copy in the disk cache is dropped and the
+    /// store's read instead.
+    pub(crate) async fn read_checked<T>(
+        &self,
+        path: &str,
+        r: Range<u64>,
+        parse: impl Fn(&[u8]) -> Result<T>,
+    ) -> Result<T> {
+        let (b, from_disk) = self.read(path, r.clone()).await?;
+        match parse(&b) {
+            Err(Error::Format(_)) if from_disk => {
+                self.disk.as_ref().unwrap().forget(path);
+                parse(&self.get(path, r).await?)
+            }
+            got => got,
+        }
+    }
+
+    /// One read, from the disk cache if it holds the layer (then `true`),
+    /// else one GET.
+    async fn read(&self, path: &str, r: Range<u64>) -> Result<(Bytes, bool)> {
         if let Some(d) = self.disk.as_ref().filter(|d| d.has(path)) {
             let (file, range) = (d.file(path), r.clone());
             let got = self
@@ -263,19 +291,33 @@ impl Store {
                 Ok(Ok(b)) => {
                     self.stats.disk_reads.fetch_add(1, Relaxed);
                     self.stats.disk_bytes.fetch_add(b.len() as u64, Relaxed);
-                    return Ok(Bytes::from(b));
+                    return Ok((Bytes::from(b), true));
                 }
                 _ => d.forget(path),
             }
         }
+        Ok((self.get(path, r).await?, false))
+    }
+
+    /// One GET.
+    async fn get(&self, path: &str, r: Range<u64>) -> Result<Bytes> {
         let p = self.path(path)?;
         let _permit = self.sem.acquire().await.expect("semaphore");
-        let b = self
-            .inner
-            .get_ranges(&p, std::slice::from_ref(&r))
-            .await?
-            .pop()
-            .unwrap_or_default();
+        let b = match self.inner.get_ranges(&p, std::slice::from_ref(&r)).await {
+            Ok(mut got) => got.pop().unwrap_or_default(),
+            Err(e) => {
+                // an object shorter than its reference is damaged, not unreachable
+                if let Ok(m) = self.inner.head(&p).await {
+                    if m.size < r.end {
+                        return Err(Error::Format(format!(
+                            "{path}: {} bytes, read at {r:?}",
+                            m.size
+                        )));
+                    }
+                }
+                return Err(e.into());
+            }
+        };
         if b.len() as u64 != r.end - r.start {
             return Err(Error::Format(format!("{path}: short read at {r:?}")));
         }
@@ -305,6 +347,25 @@ impl Store {
         Ok(t.clone())
     }
 
+    /// A decoded segment the memory cache holds.
+    pub(crate) fn cached_seg(&self, path: &Arc<str>, i: usize) -> Option<Arc<Index>> {
+        let mut st = self.state.lock().unwrap();
+        match st.lru.get(&(path.clone(), Part::Seg(i as u32)))? {
+            Cached::Seg(s) => {
+                self.stats.hits.fetch_add(1, Relaxed);
+                Some(s)
+            }
+            _ => None,
+        }
+    }
+
+    /// Keep a decoded segment in the memory cache.
+    pub(crate) fn remember_seg(&self, path: &Arc<str>, i: usize, s: Arc<Index>) {
+        let mut st = self.state.lock().unwrap();
+        st.lru
+            .insert((path.clone(), Part::Seg(i as u32)), Cached::Seg(s));
+    }
+
     /// Fetch what is wanted of one object, from the cache, from a GET already
     /// in flight, or by new GETs (coalesced); in the order asked.
     pub(crate) async fn load(
@@ -314,7 +375,8 @@ impl Store {
     ) -> Result<Vec<Cached>> {
         let n = wants.len();
         let mut out: Vec<Option<Cached>> = vec![None; n];
-        let mut waits: Vec<(usize, Load, usize)> = Vec::new();
+        // (want, fetch, its place in the fetch, whether another load started it)
+        let mut waits: Vec<(usize, Load, usize, bool)> = Vec::new();
         {
             let mut st = self.state.lock().unwrap();
             let mut claims: Vec<usize> = Vec::new();
@@ -324,7 +386,7 @@ impl Store {
                     out[i] = Some(v);
                     self.stats.hits.fetch_add(1, Relaxed);
                 } else if let Some((f, j)) = st.inflight.get(&key) {
-                    waits.push((i, f.clone(), *j));
+                    waits.push((i, f.clone(), *j, true));
                     self.stats.waits.fetch_add(1, Relaxed);
                 } else {
                     claims.push(i);
@@ -358,14 +420,25 @@ impl Store {
                 for (j, &i) in claims[g..e].iter().enumerate() {
                     st.inflight
                         .insert((path.clone(), wants[i].0.clone()), (fut.clone(), j));
-                    waits.push((i, fut.clone(), j));
+                    waits.push((i, fut.clone(), j, false));
                 }
                 g = e;
             }
         }
-        let done = futures::future::join_all(waits.iter().map(|w| w.1.clone())).await;
-        for ((i, _, j), r) in waits.into_iter().zip(done) {
-            out[i] = Some(r?[j].clone());
+        // A block from another load's fetch is copied out as it arrives, so
+        // that this load holds what it asked for, not that fetch's response.
+        let done =
+            futures::future::join_all(waits.into_iter().map(|(i, f, j, other)| async move {
+                let got = f.await?;
+                Ok::<_, Error>(match &got[j] {
+                    Cached::Block(b) if other => (i, Cached::Block(Bytes::copy_from_slice(b))),
+                    c => (i, c.clone()),
+                })
+            }))
+            .await;
+        for r in done {
+            let (i, c) = r?;
+            out[i] = Some(c);
         }
         Ok(out
             .into_iter()
@@ -384,9 +457,9 @@ impl Store {
             path: &path,
             parts: &items,
         };
-        let got = self.get_range(&path, span.clone()).await;
         let mut extra: Vec<(Part, Cached)> = Vec::new();
-        let parsed: Result<Vec<Cached>> = got.and_then(|b| {
+        let mut parse_all = |b: Bytes| -> Result<Vec<Cached>> {
+            extra.clear();
             items
                 .iter()
                 .map(|(_, r, w)| {
@@ -395,8 +468,16 @@ impl Store {
                     parse(&path, w, piece, r.start, &mut extra)
                 })
                 .collect()
-        });
-        let parsed = parsed?;
+        };
+        let (b, from_disk) = self.read(&path, span.clone()).await?;
+        let parsed = match parse_all(b) {
+            // a damaged cached copy: drop it and read the store's
+            Err(Error::Format(_)) if from_disk => {
+                self.disk.as_ref().unwrap().forget(&path);
+                parse_all(self.get(&path, span.clone()).await?)?
+            }
+            r => r?,
+        };
         let mut st = self.state.lock().unwrap();
         for ((part, _, w), v) in items.iter().zip(&parsed) {
             if !matches!(w, Want::Block { keep: false, .. }) {
@@ -410,36 +491,64 @@ impl Store {
     }
 
     /// With a disk cache, fetch a layer's whole file to it in the background,
-    /// unless it is there, being fetched, or too large.
+    /// unless it is there, being fetched, too large, or failed before. Two
+    /// fills run at a time; a fill holds the store only while it reads, so
+    /// dropping the index stops it.
     fn fill(self: &Arc<Self>, l: &LayerRef) {
         let Some(d) = &self.disk else { return };
         if !d.claim(&l.path, l.size) {
             return;
         }
-        let (store, path, size) = (self.clone(), l.path.clone(), l.size);
+        let (store, slots, path, size) = (
+            Arc::downgrade(self),
+            self.fill_slots.clone(),
+            l.path.clone(),
+            l.size,
+        );
         self.rt.spawn(async move {
-            let d = store.disk.as_ref().unwrap();
-            if let Err(e) = store.download(&path, size).await {
-                eprintln!("solera-index: disk cache fill of {path} failed: {e}");
+            let Ok(_slot) = slots.acquire_owned().await else {
+                return;
+            };
+            if let Err(e) = Store::download(&store, &path, size).await {
+                if let Some(s) = store.upgrade() {
+                    s.disk.as_ref().unwrap().abandon(&path, size);
+                    eprintln!("solera-index: disk cache fill of {path} failed: {e}");
+                }
             }
-            d.unclaim(&path);
         });
     }
 
-    async fn download(&self, path: &str, size: u64) -> Result<()> {
-        let d = self.disk.as_ref().unwrap();
+    async fn download(store: &std::sync::Weak<Store>, path: &str, size: u64) -> Result<()> {
+        let gone = || Error::Store("the index was dropped".into());
         let io = |e: std::io::Error| Error::Store(format!("disk cache: {e}").into());
-        let mut t = d.temp().map_err(io)?;
+        let blocking = |e: tokio::task::JoinError| Error::Store(format!("disk cache: {e}").into());
+        let s = store.upgrade().ok_or_else(gone)?;
+        let mut t = s.disk.as_ref().unwrap().temp().map_err(io)?;
+        let step = s.opts.max_get;
+        drop(s);
         let mut at = 0;
         while at < size {
-            let end = (at + self.opts.max_get).min(size);
-            let b = self.get_range(path, at..end).await?;
-            t.write(&b).map_err(io)?;
+            let end = (at + step).min(size);
+            let b = store.upgrade().ok_or_else(gone)?.get(path, at..end).await?;
+            t = tokio::task::spawn_blocking(move || t.write(&b).map(|_| t))
+                .await
+                .map_err(blocking)?
+                .map_err(io)?;
             at = end;
         }
-        d.commit(t, path, size).map_err(io)?;
-        self.stats.fills.fetch_add(1, Relaxed);
+        let s = store.upgrade().ok_or_else(gone)?;
+        let (keep, name) = (s.clone(), path.to_string());
+        tokio::task::spawn_blocking(move || keep.disk.as_ref().unwrap().commit(t, &name, size))
+            .await
+            .map_err(blocking)?
+            .map_err(io)?;
+        s.stats.fills.fetch_add(1, Relaxed);
         Ok(())
+    }
+
+    /// Bytes the memory cache holds.
+    pub fn memory_bytes(&self) -> u64 {
+        self.state.lock().unwrap().lru.total as u64
     }
 
     /// Bytes of the disk cache in use.
@@ -448,17 +557,25 @@ impl Store {
     }
 
     /// Start writing an object; its bytes go up in parts once past
-    /// `part_bytes`, and to the disk cache as they go. The disk cache never
-    /// fails a write: on a local error the object is simply not kept.
+    /// `part_bytes`, and to the disk cache as they go, within the room it can
+    /// set aside. The disk cache never fails a write: without room, or on a
+    /// local error, the object is simply not kept.
     pub(crate) fn upload(self: &Arc<Self>, path: &str) -> Result<Upload> {
+        let object = self.path(path)?;
         let tee = self
             .disk
             .as_ref()
-            .filter(|d| d.keeps(path))
-            .and_then(|d| d.temp().ok());
+            .filter(|d| d.claim(path, 0))
+            .and_then(|d| {
+                let t = d.temp().ok();
+                if t.is_none() {
+                    d.release(path, 0);
+                }
+                t
+            });
         Ok(Upload {
             store: self.clone(),
-            path: self.path(path)?,
+            path: object,
             name: path.to_string(),
             buf: Vec::new(),
             parts: None,
@@ -505,24 +622,21 @@ fn parse(
             }
             Cached::Block(if *keep { Bytes::copy_from_slice(&b) } else { b })
         }
-        Want::Seg {
-            rlen,
-            check,
-            blocks,
-            data_end,
-        } => Cached::Seg(Arc::new(
-            parse_segment(&b, *rlen, *check, *blocks, *data_end).map_err(at)?,
-        )),
         Want::Top { layer } => {
             let tail = &b[(layer.top_start - start) as usize..];
             let top = Top::parse(tail, layer.top_start, layer.size).map_err(at)?;
             top.check(layer)?;
             if start == layer.index_start {
+                let mut decoded = 0;
                 for i in 0..top.segs.len() {
-                    let (a, n) = (
-                        (top.segs.off[i] - start) as usize,
-                        top.segs.clen[i] as usize,
-                    );
+                    if decoded > EAGER_SEGS {
+                        break;
+                    }
+                    // a segment among the blocks is read when needed
+                    let Some(a) = top.segs.off[i].checked_sub(start) else {
+                        continue;
+                    };
+                    let (a, n) = (a as usize, top.segs.clen[i] as usize);
                     let Some(c) = b.get(a..a + n) else {
                         return Err(Error::Format(format!(
                             "{path}: segment {i} outside the index"
@@ -536,6 +650,7 @@ fn parse(
                         top.commits_start,
                     )
                     .map_err(at)?;
+                    decoded += seg.bytes();
                     extra.push((Part::Seg(i as u32), Cached::Seg(Arc::new(seg))));
                 }
             }
@@ -559,6 +674,9 @@ impl Drop for Upload {
     /// An upload dropped unfinished (an error, a cancelled merge) gives its
     /// parts back: S3 keeps them, billed, until aborted.
     fn drop(&mut self) {
+        if let (Some(_), Some(d)) = (self.tee.take(), &self.store.disk) {
+            d.release(&self.name, self.size);
+        }
         if let Some(w) = self.parts.take() {
             self.store.rt.spawn(async move {
                 let _ = w.abort().await;
@@ -569,10 +687,15 @@ impl Drop for Upload {
 
 impl Upload {
     pub(crate) async fn write(&mut self, mut bytes: Vec<u8>) -> Result<()> {
-        self.size += bytes.len() as u64;
-        if self.tee.as_mut().is_some_and(|t| t.write(&bytes).is_err()) {
-            self.tee = None;
+        let n = bytes.len() as u64;
+        if let (Some(t), Some(d)) = (self.tee.as_mut(), &self.store.disk) {
+            let kept = (self.size + n).saturating_mul(4) <= d.o.bytes && d.grow(&self.name, n);
+            if !kept || t.write(&bytes).is_err() {
+                self.tee = None;
+                d.release(&self.name, self.size + if kept { n } else { 0 });
+            }
         }
+        self.size += n;
         let part = self.store.opts.part_bytes;
         if self.parts.is_none() {
             if self.buf.is_empty() {
@@ -598,7 +721,6 @@ impl Upload {
     }
 
     pub(crate) async fn finish(mut self) -> Result<()> {
-        self.store.stats.puts.fetch_add(1, Relaxed);
         match self.parts.take() {
             None => {
                 self.store
@@ -620,12 +742,10 @@ impl Upload {
                     .map_err(|e| Error::Store(format!("an upload failed: {e}").into()))??;
             }
         }
+        self.store.stats.puts.fetch_add(1, Relaxed);
         if let (Some(t), Some(d)) = (self.tee.take(), &self.store.disk) {
-            if d.claim(&self.name, self.size) {
-                if let Err(e) = d.commit(t, &self.name, self.size) {
-                    eprintln!("solera-index: disk cache of {} failed: {e}", self.name);
-                }
-                d.unclaim(&self.name);
+            if let Err(e) = d.commit(t, &self.name, self.size) {
+                eprintln!("solera-index: disk cache of {} failed: {e}", self.name);
             }
         }
         Ok(())
