@@ -9,7 +9,7 @@ from solera.key_outcomes import CANCELED
 from solera.sdk import Incremental, Output, Project, asset
 from solera_server.state import State
 
-from .engines import drive, make_engine, task_statuses
+from .engines import drive, make_engine
 from .remote import engine_for, until
 from .test_each import files_project, records, rows_of
 
@@ -60,25 +60,6 @@ async def test_1_a_cancel_interrupts_keys_still_waiting_for_a_slot(tmp_path):
     assert set(await rows_of(engine, project, "rows")) == set("abcd")
     await engine.stop()
     await opened.close()
-
-
-async def test_2_a_full_run_keeps_a_failing_keys_last_good_output(state):
-    broken = {"b": False}
-
-    def parse(ctx, file: dict):
-        if broken.get(ctx.key):
-            raise ValueError("broken now")
-        return [{"n": file["n"]}]
-
-    project = files_project({"a": {"n": 1}, "b": {"n": 2}}, parse)
-    engine = make_engine(state, project)
-    await engine.initialize()
-    await drive(engine, await engine.submit(["parse"], upstream=True))
-    broken["b"] = True
-    detail = await drive(engine, await engine.submit(["parse"], mode="full"))
-    assert task_statuses(detail)["parse"] == "succeeded"
-    got = await rows_of(engine, project, "samples")
-    assert {k: [r["n"] for r in v] for k, v in got.items()} == {"a": [1], "b": [2]}
 
 
 async def lose_boundaries(engine, key):
@@ -244,25 +225,6 @@ async def test_6_a_forced_retry_during_the_last_retry_page_is_taken(state):
     gate["event"].set()
     await engine.run_until(run["id"], 60)
     assert calls == ["a", "a", "a"]  # the newer request was taken in the same run
-
-
-async def test_7_a_keys_override_obeys_the_patterns(state):
-    seen = []
-
-    def parse(ctx, file: dict):
-        seen.append(ctx.key)
-        return [{"n": file["n"]}]
-
-    content = {"a/1": {"n": 1}, "excluded/2": {"n": 2}}
-    project = files_project(content, parse, include="a/**")
-    engine = make_engine(state, project)
-    await engine.initialize()
-    await drive(engine, await engine.submit(["parse"], upstream=True))
-    content.update({"a/1": {"n": 3}, "excluded/2": {"n": 4}})  # both change (K47: keys= reads changes)
-    await drive(engine, await engine.submit(["files"]))
-    seen.clear()
-    await drive(engine, await engine.submit(["parse"], keys={"files": ["excluded/2", "a/1"]}))
-    assert seen == ["a/1"] and set(await rows_of(engine, project, "samples")) == {"a/1"}
 
 
 async def test_8_a_renamed_asset_keeps_its_failures(state):

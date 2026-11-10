@@ -11,7 +11,13 @@ import pytest
 
 from . import fullrun, oracle, staleness
 from .core import ABSENT, NEG, POS, Log, within
-from .histories import ARCHIVE_LOADS_MID_REBUILD, CALIBRATIONS, REPORT_IN_FLIGHT, REPORT_LOADS_MID_REBUILD
+from .histories import (
+    ARCHIVE_LOADS_MID_REBUILD,
+    CALIBRATIONS,
+    DEAD_ROW,
+    REPORT_IN_FLIGHT,
+    REPORT_LOADS_MID_REBUILD,
+)
 
 HISTORIES = int(os.environ.get("SOLERA_TRACKING_HISTORIES", "200"))
 SLOW = 5000
@@ -350,6 +356,102 @@ def test_a_removal_loaded_before_a_rebuild_is_not_the_rebuilds():
     assert fullrun.run(events, "clear", "table") is None
 
 
+def test_a_reader_holds_back_a_row_no_commit_recorded():
+    assert fullrun.run(DEAD_ROW, "clear", "table") is None
+    r = fullrun.run(DEAD_ROW, "clear", "table", frozenset({"hold_back"}))
+    assert r is not None and "no commit" in r[1]
+
+
 def test_an_empty_key_list_processes_nothing():
     w = oracle.replay_fullrun([("items", (("k1", True),)), ("keys", "copy", ()), ("commit", "copy")])
     assert oracle.holds(w, "copy") == {} and oracle.due(w, "copy") == ["k1"]
+
+
+@pytest.mark.parametrize("rule", ["open_txn", "repair"])
+def test_a_dead_writers_row_outlives_the_log_without_its_rule(rule):
+    events = CALIBRATIONS[("fullrun", "clear", "table", rule)]
+    assert fullrun.run(events, "clear", "table") is None
+    r = fullrun.run(events, "clear", "table", frozenset({rule}))
+    assert r is not None and r[1] == "at rest copy's log says {}, its store {k1@1}"
+
+
+def test_lineage_needs_the_keys_a_key_list_names(monkeypatch):
+    events = [("items", (("k1", True),)), ("step", "copy", 1), ("keys", "copy", ("k1",)), ("commit", "copy")]
+    assert fullrun.run(events, "clear", "file") is None
+    record = fullrun.World.record
+
+    def unlisted(self, rec):
+        rec.listed = {}
+        record(self, rec)
+
+    monkeypatch.setattr(fullrun.World, "record", unlisted)
+    r = fullrun.run(events, "clear", "file")
+    assert r is not None and "lineage" in r[1]
+
+
+def test_cleanup_never_deletes_a_current_file(monkeypatch):
+    events = [("items", (("k1", True),)), ("step", "copy", 1), ("cleanup", "copy")]
+    assert fullrun.run(events, "clear", "file") is None
+
+    def everything(self):
+        self.output.deleted |= set(self.output.objects)
+
+    monkeypatch.setattr(fullrun.Ordinary, "cleanup", everything)
+    r = fullrun.run(events, "clear", "file")
+    assert r is not None and "deleted" in r[1]
+
+
+def test_lineage_needs_the_keys_a_repair_redid(monkeypatch):
+    events = [
+        ("items", (("k1", True),)),
+        ("step", "copy", 1),
+        ("keys", "copy", ("k1",)),
+        ("write", "copy"),
+        ("giveup", "copy"),
+        ("step", "copy", 1),
+    ]
+    w = oracle.replay_fullrun(events, kind="table")
+    assert w.records[-2].edge == "copy<0" and w.records[-2].digest == [("k1", 1, "unchanged")]
+    record = fullrun.World.record
+
+    def unlisted(self, rec):
+        rec.listed = {}
+        record(self, rec)
+
+    monkeypatch.setattr(fullrun.World, "record", unlisted)
+    r = fullrun.run(events, "clear", "table")
+    assert r is not None and "lineage" in r[1]
+
+
+@pytest.mark.parametrize(
+    "events",
+    [
+        [
+            ("items", (("k1", True),)),
+            ("step", "copy", 1),
+            ("step", "archive", 1),
+            ("items", (("k1", True),)),
+            ("step", "copy", 1),
+            ("plan", "archive", 1),
+            ("items", (("k1", False),)),
+            ("plan", "copy", 1),
+            ("write", "copy"),
+            ("giveup", "copy"),
+            ("commit", "archive"),
+            ("items", (("k1", True),)),
+        ],
+        [
+            ("items", (("k1", True),)),
+            ("step", "copy", 1),
+            ("full", "copy"),
+            ("keys", "copy", ()),
+            ("write", "copy"),
+            ("summary",),
+        ],
+    ],
+    ids=["a dead removal", "an uncommitted clear"],
+)
+def test_a_reader_never_processes_what_no_commit_recorded(events):
+    assert fullrun.run(events, "clear", "table") is None
+    r = fullrun.run(events, "clear", "table", frozenset({"hold_back"}))
+    assert r is not None and "no commit" in r[1]

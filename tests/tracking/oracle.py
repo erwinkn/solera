@@ -13,7 +13,7 @@ stable for the build units that test against them; see README.md.
 from __future__ import annotations
 
 from . import fullrun, staleness
-from .core import NEG, POS
+from .core import NEG, POS, Folded
 
 
 class Broken(AssertionError):
@@ -53,8 +53,12 @@ def replay_fullrun(events: list[tuple], form: str = "clear", kind: str = "file")
     _check_keys(events, fullrun.KEYS)
     w = fullrun.World(form, kind)
     for i, ev in enumerate(events):
-        w.apply(ev)
-        if bad := w.check():
+        try:
+            w.apply(ev)
+            bad = w.check()
+        except Folded as e:
+            bad = str(e)
+        if bad:
             raise Broken(f"step {i} {ev}: {bad}")
     return w
 

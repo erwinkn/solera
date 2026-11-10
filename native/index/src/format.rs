@@ -259,7 +259,7 @@ impl Writer {
                 "a layer covers commits lo..=hi with 1 <= lo <= hi and lo <= floor <= hi, got {lo}..={hi}, floor {floor:?}"
             ));
         }
-        fits("a block", o.block_bytes * 2)?;
+        fits("a block", o.block_bytes.saturating_mul(2))?;
         if o.seg_blocks == 0 || o.seg_blocks * MAX_KEY > MAX_RAW {
             return invalid(format!(
                 "seg_blocks {}: from 1 to {}",
@@ -884,7 +884,14 @@ pub fn parse_commits(b: &[u8]) -> Result<Vec<CommitHeader>> {
     let raw = decompress(&b[8..], rlen)?;
     let mut p = 0;
     let n = varint(&raw, &mut p)?;
-    let mut out = Vec::with_capacity(n.min(1 << 20) as usize);
+    // a header takes at least 8 bytes: its length and seven fields
+    if n > (raw.len() - p) as u64 / 8 {
+        return format(format!(
+            "{n} commit headers in a {} byte section",
+            raw.len()
+        ));
+    }
+    let mut out = Vec::new();
     for _ in 0..n {
         let len = varint(&raw, &mut p)? as usize;
         let rec = take(&raw, &mut p, len)?;

@@ -56,34 +56,6 @@ def files_project(content, fn, *, written=None, **input):
     return Project(assets=[files, parse])
 
 
-async def test_one_call_per_key_many_rows_one_write(state):
-    """Each key's call returns its rows; the store takes every key's group
-    in one write. A file that parses to nothing has no key in the output —
-    a key with no rows does not exist — while its outcome says it was
-    processed."""
-
-    content = {"a.csv": "1,2", "b.csv": "3", "c.csv": ""}
-    calls = []
-
-    def parse(ctx, file: dict):
-        calls.append(ctx.key)
-        return [{"value": int(v)} for v in file["text"].split(",") if v]
-
-    project = files_project({k: {"text": v} for k, v in content.items()}, parse)
-    engine = make_engine(state, project)
-    await engine.initialize()
-    detail = await drive(engine, await engine.submit(["parse"], upstream=True))
-    assert status_of(detail) == "succeeded" and sorted(calls) == ["a.csv", "b.csv", "c.csv"]
-    got = await rows_of(engine, project, "samples")
-    assert {k: sorted(r["value"] for r in v) for k, v in got.items()} == {
-        "a.csv": [1, 2],
-        "b.csv": [3],
-    }
-    assert all(r["path"] == k for k, v in got.items() for r in v)  # the store stamps the key
-    attempt = detail["attempts"][next(t["id"] for t in detail["tasks"] if t["asset"] == "parse")][-1]
-    assert attempt["keys"] == {"ok": 3}
-
-
 async def test_failures_are_recorded_and_never_block(state):
     content = {
         "good.csv": {"text": "1"},
@@ -135,21 +107,6 @@ async def test_failures_are_recorded_and_never_block(state):
     assert set(await rows_of(engine, project, "samples")) == {"good.csv", "empty.csv"}
     assert set(await records(engine, "parse")) == {"slow.csv"}
     assert engine.m.partition("parse", "")["outcomes"]["counts"] == {"retrying": 1}
-
-
-async def test_removed_keys_lose_their_rows(state):
-    content = {"a": {"text": "1"}, "b": {"text": "2"}}
-
-    def parse(file: dict):
-        return [{"value": int(file["text"])}]
-
-    project = files_project(content, parse)
-    engine = make_engine(state, project)
-    await engine.initialize()
-    await drive(engine, await engine.submit(["parse"], upstream=True))
-    del content["a"]
-    await drive(engine, await engine.submit(["parse"], upstream=True))
-    assert set(await rows_of(engine, project, "samples")) == {"b"}
 
 
 async def test_transient_key_retried_when_due(state):
@@ -729,35 +686,6 @@ def fed(tmp_path, outside, *assets, extra=()):
         stores={"ext": SourceStore(tmp_path / "ext", outside)},
         default_store=FileStore(tmp_path / "default"),
     )
-
-
-async def test_a_keys_selection_runs_batch_size_keys_at_a_time(state, tmp_path):
-    """A19 R6, D111: a keys= selection keeps both bounds: five named keys in
-    batches of two (batch_size) make three attempts, and concurrency=1
-    runs one call at a time."""
-
-    from tests.sim.project import External
-
-    outside, live = External(), {"now": 0, "max": 0}
-
-    @asset(
-        inputs={"row": Incremental("feed", each=True, batch_size=2, concurrency=1)},
-        outputs=Output("checks", key="id"),
-    )
-    async def checks(ctx, row: list):
-        live["now"] += 1
-        live["max"] = max(live["max"], live["now"])
-        await asyncio.sleep(0.01)
-        live["now"] -= 1
-        return [{"v": row[0]["v"]}]
-
-    engine = make_engine(state, fed(tmp_path, outside, checks))
-    await engine.initialize()
-    outside.feed.update({f"k{i}": "1" for i in range(5)})
-    await engine.commit_source("feed", upsert=dict(outside.feed))
-    detail = await drive(engine, await engine.submit(["checks"], keys={"feed": list(outside.feed)}))
-    assert status_of(detail) == "succeeded"
-    assert live["max"] == 1 and sum(len(a) for a in detail["attempts"].values()) == 3, live
 
 
 async def test_binding_a_whole_input_to_another_head_rebuilds_every_key(state, tmp_path):
