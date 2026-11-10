@@ -3,13 +3,15 @@
 A test checks the entry its name starts with: `test_inc_4_…` is INC-4's.
 Every entry has at least one test, or a reason in `PENDING`.
 
-`CHANGED` lists the entries whose expected behaviour the new core changes
-(docs/tracking-design.md §16), each with the decision that changes it. Their
-tests assert the target, so today's path skips them."""
+`TARGET` lists the entries whose expected behaviour today's engine lacks:
+those the new tracking core changes or adds (docs/tracking-design.md §16,
+and the full-run and staleness verdicts), each with the decision. Their
+tests assert the target, so today's path skips them; an entry whose rule
+the core keeps, and which today's engine already passes, is not listed."""
 
-CHANGED: dict[str, str] = {
+TARGET: dict[str, str] = {
+    # changed
     "INC-4": "D187",
-    "INC-8": "D196",
     "KEY-3": "D191",
     "KEY-5": "D191",
     "KEY-10": "D194",
@@ -32,20 +34,33 @@ CHANGED: dict[str, str] = {
     "CLN-4": "D183",
     "CLN-6": "D183, D201",
     "CLN-11": "D192",
-    "SEL-11": "§10",
-    "SEL-12": "§10",
+    "SEL-11": "the full-run verdict",
+    "SEL-12": "the full-run verdict",
     "RUN-4": "D197",
     "AUT-4": "D200",
     "CHG-4": "D200",
     "CHG-1": "D202",
     "PAR-6": "D201",
+    "INC-8": "D196",
+    # new
+    "INC-15": "P7, the full-run verdict",
+    "STA-13": "P12, the full-run verdict",
+    "STA-14": "D183",
+    "STA-15": "D191",
+    "KEY-12": "D191",
+    "KEY-13": "D194",
+    "CHG-13": "D184",
+    "HIS-7": "D184",
+    "HIS-8": "D184",
+    "CLN-12": "D183",
+    "CLN-13": "D192",
+    "CLN-14": "D198",
+    "SRC-12": "D193",
+    "ENG-17": "D196",
+    "ENG-18": "D196",
 }
 
 PENDING: dict[str, str] = {
-    **{
-        entry: f"changed by docs/tracking-design.md §16 ({decision}); its test, written for the target, is next"
-        for entry, decision in CHANGED.items()
-    },
     "RUN-14": (
         "a rule of the console's display (D173): the HTTP API serves every batch and attempt, and"
         " which of them the console shows is checked by apps/console's Playwright tests"
