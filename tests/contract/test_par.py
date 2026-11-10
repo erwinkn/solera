@@ -507,12 +507,12 @@ async def test_par_6_a_removed_partitions_head_stays_readable_for_cleanup_after_
     assert await solera.status("site_files", "west") == "removed"
     solera.advance(6 * DAY)
     await solera.upkeep()
-    assert await solera.load("site_files", head, keys) == [{"id": "b", "v": 1}]
+    assert await solera.at("site_files", head, keys) == [{"id": "b", "v": 1}]
     solera.advance(DAY + 60)
     await solera.start()
 
     async def gone():
-        return await solera.load("site_files", head, keys) is None
+        return await solera.at("site_files", head, keys) is None
 
     await solera.until(gone, timeout=3)
 

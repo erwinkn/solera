@@ -640,19 +640,33 @@ class Solera:
         names = ("backend", "state", "objects", "namespace", "project", "deploy", "inflight", "active_runs")
         return {k: v for k, v in (await self.get("/api/diagnostics")).items() if k not in names and v}
 
-    async def load(self, output: str, head: dict, keys: dict):
-        """A keyed output's content at `head` (as `head()` gave it), read
-        through its store at `keys`, as a reader pinned there would: None
-        once its data is gone."""
+    # -- STORES+CLEANUP (target) -------------------------------------------------
+
+    async def at(self, output: str, head: dict, keys: dict | None = None, typ=None):
+        """An output's content as a reader planned at `head` (a head `head()`
+        gave) loads it through its store: a keyed one at `keys`, its keys
+        and versions then (`keys()` gave). None once the store no longer
+        holds it: cleanup took it."""
 
         from obstore.exceptions import NotFoundError
         from solera.stores import StoreError
 
         ref, store = Ref.from_json(head["ref"]), self.project.stores[head["ref"]["store"]]
         try:
-            return await store.load(ref, list[dict], Keys(keys))
+            if keys is None:
+                return await store.load(ref, typ or object, None)
+            return await store.load(ref, typ or list[dict], Keys(keys))
         except (FileNotFoundError, NotFoundError, StoreError):
             return None
+
+    async def alarmed(self, *words: str) -> bool:
+        """Whether the alarms the engine raises (`alarms()`) name every one of
+        `words`."""
+
+        import json
+
+        text = json.dumps(await self.alarms())
+        return all(word in text for word in words)
 
 
 # -- the outside world, as a user's project sees it ---------------------------

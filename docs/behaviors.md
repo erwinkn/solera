@@ -908,21 +908,21 @@ their own; data never expires.
 
 **CLN-3. A deleted run is gone for good, and its late worker writes nothing.**
 On a store that writes in place this rests on the version check (STO-4).
-*From* `object-store-state.md` §11; D196. *Covered* {{COVERED}}; `server/test_retention.py::test_a_run_retires_for_good_before_its_files_go`; `server/test_retention.py::test_a_deleted_run_takes_its_control_files_and_a_late_worker_writes_nothing`.
+*From* `object-store-state.md` §11; D196. *Covered* `contract/test_cln.py::test_cln_3_a_deleted_runs_late_write_to_a_table_changes_nothing`; `contract/test_cln.py::test_cln_3_a_deleted_runs_late_write_to_files_is_never_read`; `server/test_retention.py::test_a_run_retires_for_good_before_its_files_go`; `server/test_retention.py::test_a_deleted_run_takes_its_control_files_and_a_late_worker_writes_nothing`.
 
 **CLN-4. Superseded versions go once no attempt in flight may read them.**
 `items` rewrites k1 (FileStore, k1@g5 → k1@g9): k1@g5's object is deleted
 once no live attempt planned at a head before g9. A lagging consumer holds
 nothing back, since it plans at the head when it runs. A burst of commits
 makes few cleanup tasks.
-*From* D183, D168, D144 (2). *Today* a lagging consumer's oldest observation holds the cleanup cursor back (`server/test_cleanup_cursor.py::test_an_observation_holds_the_cursor_back`). *Covered* {{COVERED}}; sim `nothing_read_after_collection`.
+*From* D183, D168, D144 (2). *Today* a lagging consumer's oldest observation holds the cleanup cursor back (`server/test_cleanup_cursor.py::test_an_observation_holds_the_cursor_back`). *Covered* `contract/test_cln.py::test_cln_4_a_lagging_consumer_holds_no_superseded_version_back`; `contract/test_cln.py::test_cln_4_a_burst_of_commits_makes_few_cleanup_tasks`; sim `nothing_read_after_collection`.
 
 **CLN-5. What an abandoned attempt wrote is cleaned up: late on a store that names objects by version, by the next attempt on a table.**
 An attempt dies after writing an object to FileStore: the object is
 deleted after the asset's timeout plus the cancel grace. On a table, the
 next attempt's repair deletes the rows whose key the log lacks, and the
 producer rewrites the others (ENG-8).
-*From* `lifecycle.md` §9.8; D196. *Covered* {{COVERED}}; `server/test_collection.py::test_an_abandoned_attempts_objects_go`.
+*From* `lifecycle.md` §9.8; D196. *Covered* `contract/test_cln.py::test_cln_5_what_an_abandoned_attempt_wrote_to_files_goes_late`; `contract/test_cln.py::test_cln_5_what_an_abandoned_attempt_wrote_to_a_table_goes_with_the_next_attempt`; `server/test_collection.py::test_an_abandoned_attempts_objects_go`.
 
 **CLN-6. A removed, moved, or renamed-without-alias output's old data goes after `cleanup_after`.**
 A week by default on every store (an undo window); an output may
@@ -930,7 +930,7 @@ override it. Added back within the week, its new data stays. An attempt
 in flight from before the removal holds the cleanup back. A removed
 dynamic partition's data follows the same window (PAR-6). A custom store
 the project no longer declares leaves the cleanup stuck, saying so.
-*From* D145, D96, D144 (2), D183, D201. *Today* a reader pinned before the removal holds it back, and a removed dynamic partition's data is never cleaned up. *Covered* {{COVERED}}; `server/test_retirement.py::test_a_removed_outputs_files_go`; `server/test_retirement.py::test_a_moved_outputs_old_files_go_and_its_new_ones_stay`; `server/test_retirement.py::test_the_grace_period_is_the_stores_unless_the_output_says`; `server/test_retirement.py::test_a_store_that_says_nothing_keeps_a_removed_output_a_week`; `server/test_retirement.py::test_an_output_added_back_within_the_grace_period_keeps_its_new_data`; `server/test_retirement.py::test_a_custom_store_the_project_no_longer_declares_leaves_the_cleanup_stuck`.
+*From* D145, D96, D144 (2), D183, D201. *Today* a reader pinned before the removal holds it back, and a removed dynamic partition's data is never cleaned up. *Covered* `contract/test_cln.py::test_cln_6_a_removed_outputs_data_goes_after_a_week_and_one_added_back_keeps_its_new_data`; `contract/test_cln.py::test_cln_6_an_attempt_in_flight_from_before_the_move_holds_the_cleanup_back`; `contract/test_cln.py::test_cln_6_a_removed_dynamic_partitions_data_goes_after_a_week`; `contract/test_cln.py::test_cln_6_a_custom_store_the_project_no_longer_declares_leaves_the_cleanup_stuck`; `server/test_retirement.py::test_a_removed_outputs_files_go`; `server/test_retirement.py::test_a_moved_outputs_old_files_go_and_its_new_ones_stay`; `server/test_retirement.py::test_the_grace_period_is_the_stores_unless_the_output_says`; `server/test_retirement.py::test_a_store_that_says_nothing_keeps_a_removed_output_a_week`; `server/test_retirement.py::test_an_output_added_back_within_the_grace_period_keeps_its_new_data`; `server/test_retirement.py::test_a_custom_store_the_project_no_longer_declares_leaves_the_cleanup_stuck`.
 
 **CLN-7. Cleanup runs in the background; a run is settled before its cleanup is.**
 *From* D144 (2). *Covered* `contract/test_cln.py::test_cln_7_a_run_is_settled_before_its_cleanup_is`; `server/test_collection.py::test_a_run_is_settled_before_its_cleanup_has_run`.
@@ -952,26 +952,26 @@ live.
 k4 (added), not a full run, because the cut never passes a consumer's
 progress. Its upstream's history is kept for it meanwhile, watched by an
 alarm (CLN-13).
-*From* D123, D126, D192 (answers open question 12). *Today* a consumer below the cut starts over (`server/test_keys.py::test_a_consumer_below_the_cut_starts_over`). *Covered* {{COVERED}}.
+*From* D123, D126, D192 (answers open question 12). *Covered* `contract/test_cln.py::test_cln_11_a_paused_consumer_never_loses_its_place_to_retention`.
 
 **CLN-12. A replaced data file goes once no live attempt planned before its replacement.**
 `items` replaces k1@1 with k1@4 at c4 while an attempt of `checks`
 planned at c3 is live: k1@1's file stays, and the attempt can load it.
 When that attempt settles, the file goes.
-*From* D183. *Covered* {{COVERED}}.
+*From* D183. *Covered* `contract/test_cln.py::test_cln_12_a_replaced_data_file_goes_once_no_live_attempt_planned_before_its_replacement`.
 
 **CLN-13. An output whose history outgrows its live keys raises an alarm naming what holds it; an operator can release a consumer's place.**
 `copy`, run by hand once a quarter, holds `items`' history while `items`
 is rewritten daily: past a set multiple of `items`' live keys, an alarm
 names `copy` and its place. Releasing that place lets the history go, and
 `copy` then owes a full run.
-*From* D192 (review F5). *Covered* {{COVERED}}.
+*From* D192 (review F5). *Covered* `contract/test_cln.py::test_cln_13_an_output_whose_history_outgrows_its_live_keys_raises_an_alarm_naming_what_holds_it`.
 
 **CLN-14. An append-only output keeps everything unless it opts into a retention; a consumer behind the retention edge is warned, then owes a full run over what remains.**
 `events` keeps 30 days; `digest` reads it incrementally and is paused 40
 days: before its place falls behind, it is marked "behind retention"; its
 next run is a full run over the 30 days `events` still holds.
-*From* D198 (Q7). *Covered* {{COVERED}}.
+*From* D198 (Q7). *Covered* `contract/test_cln.py::test_cln_14_an_append_only_output_keeps_everything_by_default`.
 
 ## ENG — engine crashes, restarts, zombies and fencing
 
@@ -1010,7 +1010,7 @@ A worker paused for a minute wakes after its attempt was ended and retried:
 on Postgres its write transaction is refused by the version check
 (STO-4); on FileStore its writes land under names nothing reads.
 Heartbeats are evidence, never permission.
-*From* `lifecycle.md` §6, §9.4; D196. *Covered* {{COVERED}}; `server/test_fence.py::test_an_aborted_worker_writes_nothing`; sim `fenced_writes_hold_their_gate`; `Attempt.tla` NoWriteAfterNone, WritesInOrder, OneOutcome.
+*From* `lifecycle.md` §6, §9.4; D196. *Covered* `contract/test_eng.py::test_eng_7_a_late_write_to_a_table_is_refused_by_its_version_check`; `contract/test_eng.py::test_eng_7_a_late_write_to_files_lands_under_names_nothing_reads`; `server/test_fence.py::test_an_aborted_worker_writes_nothing`; sim `fenced_writes_hold_their_gate`; `Attempt.tla` NoWriteAfterNone, WritesInOrder, OneOutcome.
 
 **ENG-8. A dead writer's rows on a table are repaired by the next attempt.**
 `orders`' attempt (version 6) dies mid-write on Postgres. The next attempt
@@ -1018,7 +1018,7 @@ opens a write transaction, even an empty one, lists the rows at version 6,
 deletes those whose key the log lacks, and rewrites the others. No repair
 clock, and readers never wait: a consumer that loads a dead row meanwhile
 raises an anomaly (ENG-17).
-*From* D196. *Today* repair by presence, a repair clock, and readers held until the repair (`server/test_fence.py::test_the_repair_clock_repairs_a_dead_writers_partition_on_its_own`). *Covered* {{COVERED}}.
+*From* D196. *Today* repair by presence, a repair clock, and readers held until the repair (`server/test_fence.py::test_the_repair_clock_repairs_a_dead_writers_partition_on_its_own`). *Covered* `contract/test_eng.py::test_eng_8_a_dead_writers_rows_are_repaired_by_the_next_attempt_and_nothing_waits_for_it`.
 
 **ENG-9. Bad input fails one attempt or request, never the engine.**
 A malformed control file or result fails its attempt, retryably. A run
@@ -1061,13 +1061,13 @@ died before committing: the engine raises an alarm naming `items`, k2 and
 A; `tally`'s k2 is not due until `items` has redone it; `items`' log
 never records version 6. A version of an attempt still live is not an
 anomaly: the key settles when that attempt commits.
-*From* D196 (review F1, recommendation 4). *Today* readers of a dead writer's partition wait for its repair. *Covered* {{COVERED}}.
+*From* D196 (review F1, recommendation 4). *Today* readers of a dead writer's partition wait for its repair. *Covered* `contract/test_eng.py::test_eng_17_a_dead_writers_version_is_an_anomaly_never_a_change`; `contract/test_eng.py::test_eng_17_a_version_of_an_attempt_still_live_is_no_anomaly`.
 
 **ENG-18. An asset never builds on a dead write to its own output.**
 `tally` on Postgres holds 4; attempt A reads 4, writes 5 and dies before
 its commit. The retry's `ctx.load()` would return 5, which is not
 `tally`'s last commit: `tally` owes a full run instead of adding to 5.
-*From* D196 (review F1, recommendation 5). *Today* the dead write is repaired before the retry reads. *Covered* {{COVERED}}.
+*From* D196 (review F1, recommendation 5). *Today* the retry's `ctx.load()` returns the dead write and adds to it: `tally` ends at 6. *Covered* `contract/test_eng.py::test_eng_18_an_asset_never_builds_on_a_dead_write_to_its_own_output`.
 
 ## DEP — deploys and reload
 
@@ -1107,19 +1107,19 @@ No store kinds. A write returns the keys it wrote and removed; a load
 returns the keys and versions it actually loaded, absent included. A store
 that writes in place keeps one version check per partition inside each
 write transaction (STO-4). Registration refuses a store missing a method.
-*From* D184, D196. *Today* a store is immutable or fenced, and registration refuses another kind (`sdk/test_store_conformance.py::test_shipped_stores_conform`). *Covered* {{COVERED}}.
+*From* D184, D196. *Today* a store is immutable or fenced, and registration refuses another kind (`sdk/test_store_conformance.py::test_shipped_stores_conform`). *Covered* `contract/test_sto.py::test_sto_1_a_store_declares_no_kind`; `contract/test_sto.py::test_sto_1_registration_refuses_a_store_missing_a_method`.
 
 **STO-2. A load says the versions it read; a store that names objects by version loads exactly the planned ones.**
 g5 writes {a:1}, a reader plans it; g9 writes {a:2}: the reader still
 loads a:1, and says it loaded g5.
-*From* D184; `stores.md`. *Today* the read returns the pinned version but does not say which version it loaded. *Covered* {{COVERED}}; sim `committed_keys_are_readable`.
+*From* D184; `stores.md`. *Covered* `contract/test_sto.py::test_sto_2_a_store_that_names_objects_by_version_loads_exactly_the_planned_ones`; sim `committed_keys_are_readable`.
 
 **STO-3. A key loaded at another version than planned is processed as loaded; nothing replans.**
 `items` is on Postgres; `tally`'s batch plans k1@4 and k2@2, and `items`
 commits k2 → 5 before the load. The batch gets k2 as updated at 5, its
 lineage records the deviation (HIS-8), and once it commits k2 is not owed
 again.
-*From* D184. *Today* the batch replans at the new head (`server/test_fenced_reads.py::test_a_commit_installed_between_plan_and_read_replans_once`). *Covered* {{COVERED}}.
+*From* D184. *Today* the batch replans at the new head (`server/test_fenced_reads.py::test_a_commit_installed_between_plan_and_read_replans_once`). *Covered* `contract/test_sto.py::test_sto_3_a_key_loaded_at_another_version_is_processed_as_loaded_and_nothing_replans`.
 
 **STO-4. On a store that writes in place, a stale writer changes nothing.**
 Each write transaction first raises the partition's version check to its
@@ -1127,13 +1127,13 @@ attempt's version, or is refused whole if it is already higher. g5
 writes; g9 writes; g5 writes again: refused. A newer writer waits for an
 older one's open transaction, which can then never write again. Nothing is
 acquired before reads.
-*From* D196; `stores.md` (invariants 6–8). *Today* the same holds through `acquire` and the fence row. *Covered* {{COVERED}}; `sdk/test_store_conformance.py::test_shipped_stores_conform`; `sdk/test_store_machine.py::test_a_store_conforms_under_random_sequences`.
+*From* D196; `stores.md` (invariants 6–8). *Today* the same holds through `acquire` and the fence row. *Covered* `contract/test_sto.py::test_sto_4_a_stale_writer_changes_nothing`; `contract/test_sto.py::test_sto_4_nothing_is_acquired_before_reads`; `sdk/test_store_conformance.py::test_shipped_stores_conform`; `sdk/test_store_machine.py::test_a_store_conforms_under_random_sequences`.
 
 **STO-5. A table never holds a row its log does not have.**
 Once no attempt is live on a partition of a store that writes in place,
 it holds exactly the keys its output lists, at the versions its log
 records. A dead attempt's rows are repaired by the next attempt (ENG-8).
-*From* D196; `verification.md`. *Covered* {{COVERED}}; sim `a_fenced_scope_at_rest_holds_its_index_keys`.
+*From* D196; `verification.md`. *Covered* `contract/test_sto.py::test_sto_5_a_table_never_holds_a_row_its_log_does_not_have`; sim `a_fenced_scope_at_rest_holds_its_index_keys`.
 
 **STO-6. Writes mean the same on every store.**
 A replacement is the whole content; a patch changes only its keys; a key
