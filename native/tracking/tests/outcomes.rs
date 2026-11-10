@@ -2271,3 +2271,42 @@ fn a_retry_batch_of_a_pass_in_an_earlier_life_is_refused() {
     }
     assert!(met > 0, "no restart gave the new pass the old one's number");
 }
+
+/// A key B3 holds back keeps its record as it is (D205): it was loaded at
+/// another version than planned while the input is mid full run, so the
+/// failure the worker reports for it is not recorded, and its point holds
+/// what the consumer held.
+#[test]
+fn a_held_back_key_keeps_its_record() {
+    let rt = runtime();
+    let ix = index(&rt);
+    rt.block_on(async {
+        let mut w = scripted();
+        let c = w.counters;
+        w.input(&ix, &[("k1", 5), ("k2", 5)]).await;
+        let first = w.planned(&ix, None, 10, Mode::Incremental).await;
+        let ev = w
+            .commit_of(&ix, &first, &[("k1", Kind::Transient)], &[], c)
+            .await
+            .unwrap();
+        w.apply(ev);
+        let before = w.stored(&ix).await[&key("k1")].clone();
+        w.input(&ix, &[("k1", 6)]).await;
+        let p = w.planned(&ix, None, 10, Mode::Incremental).await;
+        assert_eq!(taken(&p), [key("k1")]);
+        let changes = [(key("k1"), Ver::Int(7)), (key("k2"), Ver::Int(5))].into();
+        assert!(w.log.commit(&ix, &mut w.t, changes, true, false).await);
+        if let Some(parts) = w.caught(&ix).await {
+            w.apply(parts);
+        }
+        let ev = w
+            .commit_of(&ix, &p, &[("k1", Kind::Transient)], &[("k1", 7)], c)
+            .await
+            .unwrap();
+        w.apply(ev);
+        assert_eq!(w.stored(&ix).await[&key("k1")], before);
+        let edge = &w.t.edges[EDGE.as_bytes()];
+        let pt = edge.progress.keyed().unwrap().point(b"k1").unwrap();
+        assert_eq!(pt.reason, solera_tracking::progress::Reason::HeldBack);
+    });
+}
