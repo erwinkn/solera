@@ -1,0 +1,68 @@
+N8 first listing: entries=100000000 layers=0 total=22.285s cpu=22.883s get=0.006s get_cpu=0.004s build_cpu=10.054s gets=0 get_mb=0.00 put_kb=602770.4
+N8 first listing: peak_rss_mb=77 layer_mb=602.8
+day 2: entries=995176 layers=1 total=8.799s cpu=8.831s get=8.515s get_cpu=8.559s build_cpu=0.134s gets=62 get_mb=602.88 put_kb=8531.8
+day 3: entries=995135 layers=2 total=10.038s cpu=9.909s get=9.778s get_cpu=9.653s build_cpu=0.128s gets=62 get_mb=609.97 put_kb=8590.3
+day 4: entries=995109 layers=3 total=10.102s cpu=10.049s get=9.859s get_cpu=9.807s build_cpu=0.124s gets=62 get_mb=610.01 put_kb=8648.0
+day 5: entries=995167 layers=4 total=10.894s cpu=10.929s get=10.627s get_cpu=10.666s build_cpu=0.133s gets=62 get_mb=610.08 put_kb=8695.8
+day 6: entries=995066 layers=5 total=12.186s cpu=12.252s get=11.887s get_cpu=11.954s build_cpu=0.139s gets=62 get_mb=610.13 put_kb=8742.7
+day 7: entries=995027 layers=3 total=11.551s cpu=11.585s get=11.261s get_cpu=11.295s build_cpu=0.148s gets=79 get_mb=647.95 put_kb=8788.2
+day 8: entries=995203 layers=4 total=12.308s cpu=12.387s get=12.005s get_cpu=12.085s build_cpu=0.149s gets=62 get_mb=610.23 put_kb=8831.0
+layers after the days: 5 sizes_mb=[603.0, 38.0, 9.0, 9.0, 9.0]
+N7 range cold #0: entries=10000 layers=5 total=0.010s cpu=0.010s get=0.007s get_cpu=0.008s build_cpu=0.001s gets=11 get_mb=0.28 put_kb=61.8
+N7 range cold #1: entries=10000 layers=6 total=0.013s cpu=0.011s get=0.010s get_cpu=0.008s build_cpu=0.001s gets=12 get_mb=0.28 put_kb=61.7
+N7 range cold #2: entries=10000 layers=7 total=0.011s cpu=0.012s get=0.008s get_cpu=0.009s build_cpu=0.001s gets=15 get_mb=0.29 put_kb=62.0
+N7 range warm #0: entries=10000 layers=8 total=0.011s cpu=0.012s get=0.008s get_cpu=0.009s build_cpu=0.001s gets=17 get_mb=0.31 put_kb=61.8
+N7 range warm #1: entries=10000 layers=6 total=0.012s cpu=0.012s get=0.008s get_cpu=0.009s build_cpu=0.002s gets=8 get_mb=0.13 put_kb=62.0
+N7 range warm #2: entries=10000 layers=7 total=0.011s cpu=0.012s get=0.008s get_cpu=0.008s build_cpu=0.001s gets=6 get_mb=0.11 put_kb=62.3
+N7 range warm #3: entries=10000 layers=8 total=0.013s cpu=0.013s get=0.009s get_cpu=0.009s build_cpu=0.002s gets=7 get_mb=0.13 put_kb=62.1
+N7 range warm #4: entries=10000 layers=6 total=0.010s cpu=0.010s get=0.007s get_cpu=0.007s build_cpu=0.001s gets=8 get_mb=0.13 put_kb=61.3
+N7 range warm #5: entries=10000 layers=7 total=0.010s cpu=0.010s get=0.007s get_cpu=0.007s build_cpu=0.001s gets=8 get_mb=0.13 put_kb=62.0
+N7 range warm #6: entries=10000 layers=8 total=0.010s cpu=0.011s get=0.008s get_cpu=0.008s build_cpu=0.001s gets=8 get_mb=0.15 put_kb=62.0
+N7 range warm #7: entries=10000 layers=6 total=0.009s cpu=0.009s get=0.006s get_cpu=0.007s build_cpu=0.001s gets=8 get_mb=0.13 put_kb=61.9
+N7 range warm #8: entries=10000 layers=7 total=0.010s cpu=0.010s get=0.007s get_cpu=0.007s build_cpu=0.001s gets=8 get_mb=0.12 put_kb=62.1
+N7 range warm #9: entries=10000 layers=8 total=0.010s cpu=0.010s get=0.007s get_cpu=0.007s build_cpu=0.001s gets=9 get_mb=0.13 put_kb=61.9
+N7 range warm #10: entries=10000 layers=6 total=0.012s cpu=0.013s get=0.009s get_cpu=0.009s build_cpu=0.002s gets=8 get_mb=0.14 put_kb=61.7
+N7 range warm #11: entries=10000 layers=7 total=0.013s cpu=0.013s get=0.009s get_cpu=0.009s build_cpu=0.002s gets=9 get_mb=0.13 put_kb=62.3
+N7 scattered cold #0: entries=10000 layers=8 total=2.803s cpu=2.923s get=2.799s get_cpu=2.919s build_cpu=0.002s gets=2840 get_mb=301.66 put_kb=109.0
+N7 scattered cold #1: entries=10000 layers=6 total=2.810s cpu=2.941s get=2.806s get_cpu=2.937s build_cpu=0.002s gets=2877 get_mb=302.63 put_kb=109.2
+N7 scattered cold #2: entries=9999 layers=7 total=2.579s cpu=2.726s get=2.573s get_cpu=2.722s build_cpu=0.002s gets=2819 get_mb=305.32 put_kb=109.2
+N7 scattered warm #0: entries=10000 layers=8 total=2.658s cpu=2.768s get=2.655s get_cpu=2.765s build_cpu=0.002s gets=2862 get_mb=305.79 put_kb=109.4
+N7 scattered warm #1: entries=10000 layers=9 total=2.438s cpu=2.600s get=2.434s get_cpu=2.597s build_cpu=0.002s gets=2801 get_mb=305.67 put_kb=109.0
+N7 scattered warm #2: entries=10000 layers=7 total=2.585s cpu=2.709s get=2.581s get_cpu=2.706s build_cpu=0.002s gets=2841 get_mb=304.16 put_kb=109.3
+N7 scattered warm #3: entries=9999 layers=8 total=2.464s cpu=2.591s get=2.460s get_cpu=2.588s build_cpu=0.001s gets=2877 get_mb=301.59 put_kb=109.1
+N7 scattered warm #4: entries=10000 layers=9 total=2.340s cpu=2.462s get=2.337s get_cpu=2.459s build_cpu=0.001s gets=2847 get_mb=303.41 put_kb=109.4
+N7 scattered warm #5: entries=9999 layers=7 total=2.444s cpu=2.553s get=2.439s get_cpu=2.549s build_cpu=0.002s gets=2880 get_mb=304.00 put_kb=109.1
+N7 scattered warm #6: entries=10000 layers=8 total=2.531s cpu=2.657s get=2.526s get_cpu=2.653s build_cpu=0.002s gets=2855 get_mb=303.35 put_kb=109.3
+N7 scattered warm #7: entries=10000 layers=9 total=2.450s cpu=2.568s get=2.446s get_cpu=2.564s build_cpu=0.002s gets=2901 get_mb=300.31 put_kb=109.4
+N7 scattered warm #8: entries=10000 layers=10 total=2.439s cpu=2.558s get=2.436s get_cpu=2.554s build_cpu=0.001s gets=2929 get_mb=300.14 put_kb=109.4
+N7 scattered warm #9: entries=9998 layers=8 total=2.759s cpu=2.867s get=2.755s get_cpu=2.863s build_cpu=0.002s gets=2864 get_mb=302.87 put_kb=109.0
+N7 scattered warm #10: entries=10000 layers=9 total=2.897s cpu=2.912s get=2.894s get_cpu=2.909s build_cpu=0.002s gets=2859 get_mb=303.13 put_kb=109.2
+N7 scattered warm #11: entries=10000 layers=10 total=2.488s cpu=2.604s get=2.485s get_cpu=2.600s build_cpu=0.001s gets=2823 get_mb=304.65 put_kb=109.3
+N8 rewrite by scan: entries=100000000 layers=8 total=42.206s cpu=43.666s get=16.960s get_cpu=18.276s build_cpu=12.155s gets=7688 get_mb=668.37 put_kb=614719.2
+N8 rewrite by scan: rss_before_mb=805 peak_rss_mb=999 layer_mb=614.7
+N8 rewrite by get: entries=100000000 layers=9 total=128.785s cpu=128.626s get=101.197s get_cpu=101.200s build_cpu=12.918s gets=8296 get_mb=1283.11 put_kb=605232.9
+N8 rewrite by get: rss_before_mb=920 peak_rss_mb=1028 layer_mb=605.2
+key generation alone: cpu=14.340s for 100000000 keys
+	Command being timed: "./target/release/commit-bench /workspace/data 100000000 7"
+	User time (seconds): 320.70
+	System time (seconds): 7.13
+	Percent of CPU this job got: 101%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 5:24.20
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 1052304
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 0
+	Minor (reclaiming a frame) page faults: 409767
+	Voluntary context switches: 132299
+	Involuntary context switches: 27786
+	Swaps: 0
+	File system inputs: 0
+	File system outputs: 3768848
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0

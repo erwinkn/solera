@@ -1,0 +1,23 @@
+[package]
+name = "commit-bench"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+solera-index = { path = "../../../native/index" }
+solera-tracking = { path = "../../../native/tracking" }
+object_store = "0.14"
+tokio = { version = "1", features = ["rt-multi-thread"] }
+bytes = "1"
+rand = { version = "0.9", features = ["small_rng"] }
+libc = "0.2"
+zstd = "0.13"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+debug = 1
+
+[workspace]

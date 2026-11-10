@@ -20,6 +20,7 @@
 //! to pass their check: an edge is opened by an event of its own.
 
 use crate::codec::{Dec, Enc};
+use crate::commit;
 use crate::error::{format, Result};
 use crate::progress;
 
@@ -41,6 +42,8 @@ pub enum Part {
     Batch(progress::BatchProgress),
     /// B3: an unkeyed edge consumed its input through a commit.
     Consumed(progress::Consumed),
+    /// B4: a commit on an output: its layer, its head, its live count.
+    OutputCommit(commit::OutputCommit),
 }
 
 impl Part {
@@ -52,6 +55,7 @@ impl Part {
             Part::Reset(_) => progress::TAG_RESET,
             Part::Batch(_) => progress::TAG_BATCH,
             Part::Consumed(_) => progress::TAG_CONSUMED,
+            Part::OutputCommit(_) => commit::TAG_OUTPUT_COMMIT,
         }
     }
 
@@ -63,6 +67,7 @@ impl Part {
             Part::Reset(p) => p.encode(e),
             Part::Batch(p) => p.encode(e),
             Part::Consumed(p) => p.encode(e),
+            Part::OutputCommit(p) => p.encode(e),
         }
     }
 
@@ -74,6 +79,7 @@ impl Part {
             progress::TAG_RESET => Part::Reset(progress::Reset::decode(d)?),
             progress::TAG_BATCH => Part::Batch(progress::BatchProgress::decode(d)?),
             progress::TAG_CONSUMED => Part::Consumed(progress::Consumed::decode(d)?),
+            commit::TAG_OUTPUT_COMMIT => Part::OutputCommit(commit::OutputCommit::decode(d)?),
             t => return format(format!("unknown part tag {t:#04x}")),
         })
     }

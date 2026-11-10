@@ -51,6 +51,38 @@ impl Tracking {
     fn apply(&self, event: &[u8]) -> PyResult<()> {
         self.state.write().unwrap().apply(event).map_err(err)
     }
+
+    /// B4: builds and writes the next commit of `output` from its changed
+    /// keys (`encode_changes`'s form); None if nothing changed. See
+    /// `commit_py::build_commit`.
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (index, output, changes, *, version, path, time_ms=0, producer=Vec::new(), mode="patch", at=None, collect=0))]
+    fn build_commit<'py>(
+        &self,
+        py: Python<'py>,
+        index: &Bound<'py, crate::index_py::ChangeIndex>,
+        output: &[u8],
+        changes: &[u8],
+        version: u64,
+        path: &str,
+        time_ms: u64,
+        producer: Vec<u8>,
+        mode: &str,
+        at: Option<u64>,
+        collect: usize,
+    ) -> PyResult<Option<Bound<'py, pyo3::types::PyDict>>> {
+        let out = self
+            .state
+            .read()
+            .unwrap()
+            .outputs
+            .get(output)
+            .cloned()
+            .unwrap_or_default();
+        crate::commit_py::build_commit(
+            py, out, index, output, changes, version, path, time_ms, &producer, mode, at, collect,
+        )
+    }
 }
 
 pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {

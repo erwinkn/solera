@@ -75,6 +75,7 @@ impl Tracking {
             Part::Reset(p) => p.check(self),
             Part::Batch(p) => p.check(self),
             Part::Consumed(p) => p.check(self),
+            Part::OutputCommit(p) => p.check(self),
         }
     }
 
@@ -86,6 +87,7 @@ impl Tracking {
             Part::Reset(p) => p.apply(self),
             Part::Batch(p) => p.apply(self),
             Part::Consumed(p) => p.apply(self),
+            Part::OutputCommit(p) => p.apply(self),
         }
     }
 
