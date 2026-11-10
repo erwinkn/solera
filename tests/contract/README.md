@@ -47,7 +47,10 @@ engine's HTTP API, the stores and a worker. The `solera` fixture
 - faults an operator or a broken worker causes: `tamper(run, attempt,
   change)` rewrites an attempt's control file, `refuse_upkeep(output)` makes
   an output's index upkeep fail. Both know today's storage layout, so the
-  new path needs its own version of each.
+  new path needs its own version of each;
+- measuring: `watch_state()` counts the reads and writes on the
+  namespace's state directory through the operating system's file watcher
+  (ENG-10's bound on idle work).
 
 `example.py` is the contract's running example (`feed → items → tally,
 copy, checks → filtered`, `factor`), with what each producer received batch
