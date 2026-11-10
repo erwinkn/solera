@@ -603,6 +603,18 @@ def test_a_reset_replayed_after_its_switch_writes_in_place():
     assert r is not None and "that no run in the log names" in r[1]
 
 
+def test_a_replayed_write_carries_what_its_repair_added():
+    """A store call delivered twice sends the same payload: the retry that
+    repaired k3 writes k3 again on replay, so the commit that follows records
+    both keys it holds (Sol review 3 of #37, 1)."""
+    events = [("step", "copy", 2), ("items", (("k2", True), ("k3", True)))]
+    events += [("plan", "copy", 2), ("write", "copy"), ("giveup", "copy")]
+    events += [("plan", "copy", 1), ("write", "copy"), ("replay", "copy"), ("commit", "copy")]
+    w = oracle.replay_fullrun(events, kind="table")
+    assert w.copy.output.log.states[-1] == {"k2": 3, "k3": 3} == _versions(w.copy.output.rows)
+    assert fullrun.run(events, "clear", "table") is None
+
+
 def test_a_late_notice_of_an_older_switch_keeps_the_newer_one_owed():
     """The hook for run A returns, run B ends, then FullRunNoticed(A) is
     journaled: B's switch stays owed (Sol review, 6)."""

@@ -480,7 +480,7 @@ class Ordinary:
         live attempt after one given up on always opens it (rec 3) and repairs what
         the dead attempts wrote (rec 2)."""
         w, out = self.w, self.output
-        writes = self.produce(s, s.before)
+        writes = dict(s.written) if again else self.produce(s, s.before)
         if out.kind == "table":
             if w.on("fence") and out.fence > s.version:
                 w.stats["writes refused"] += 1

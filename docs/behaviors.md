@@ -326,9 +326,7 @@ the run continues batch by batch across attempts.
 **SEL-9. A full run's first batch says `batch.reset`; `ctx.load()` still returns what is materialized.**
 `tally` sees `batch.reset == True` on batch 0 and ignores `{"rows": 7}`
 from `ctx.load()`; later batches build on what batch 0 committed.
-Per-key producers never see `reset`. An ordinary output's first run is a
-full run of an empty output, so its first batch says `reset` too (D211,
-STO-8).
+Per-key producers never see `reset`.
 *From* D166 (chain: D141 → D166; D140 (4) drops `Batch.full`); Q1. *Covered* `contract/test_sel.py::test_sel_9_a_full_runs_first_batch_says_reset_and_load_returns_what_is_materialized`; `contract/test_sel.py::test_sel_9_a_per_key_producer_never_sees_reset`.
 
 **SEL-10. A per-key consumer's full run keeps its outputs readable and removes what upstream lacks.**
@@ -1159,7 +1157,9 @@ batch commits, a query outside Solera reads k1 to k4 at their old
 versions; from the switch that follows it on, k1, k2, k4 and k5 at the
 new ones; never a mix. Solera's own readers read the build as it grows,
 under the gate and the hold-back (STA-13). An output's first run is hidden
-the same way: outside, the table is empty until the run completes. A full
+the same way: it is a full run of an empty output, its first batch says
+`batch.reset` (SEL-9), and outside, the table is empty until the run
+completes. A full
 run released after a cancel (STA-13) is published as it stands. A
 per-key asset's full run (SEL-10) keeps every key readable and changes
 them a batch at a time, outside Solera as inside.
