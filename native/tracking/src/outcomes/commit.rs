@@ -453,7 +453,7 @@ pub async fn commit(
         } else {
             0
         },
-        points,
+        points: vec![],
     }));
 
     // A failing key the worker tried at another version than planned keeps
@@ -477,11 +477,18 @@ pub async fn commit(
             _ => false,
         }
     };
+    // The points this commit sets go with the batch's own: one part per edge.
     for part in &mut ops.parts {
         if let Part::Batch(b) = part {
             if b.edge == v.edge {
                 b.points
                     .retain(|(k, pt)| !needless(k, pt.reason, &pt.holding));
+                for (k, pt) in &points {
+                    match b.points.binary_search_by(|(x, _)| x.cmp(k)) {
+                        Ok(i) => b.points[i].1 = pt.clone(),
+                        Err(i) => b.points.insert(i, (k.clone(), pt.clone())),
+                    }
+                }
             }
         }
     }

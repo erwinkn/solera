@@ -69,6 +69,10 @@ impl Part {
             Part::Batch(p) => vec![("edge", &p.edge)],
             Part::Consumed(p) => vec![("edge", &p.edge)],
             Part::OutputCommit(p) => vec![("output", &p.output)],
+            Part::Outcomes(p) if p.points.is_empty() => vec![("outcomes", &p.edge)],
+            Part::Outcomes(p) => vec![("outcomes", &p.edge), ("edge", &p.edge)],
+            Part::PassStart(p) => vec![("outcomes", &p.edge)],
+            Part::Rebuild(p) => vec![("outcomes", &p.edge)],
         }
     }
 
