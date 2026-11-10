@@ -470,6 +470,7 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
             self.clock(),
             projected,
             self._complete_known,
+            any_head=self.core is not None,
         )
 
     def _plan_run(
@@ -625,7 +626,7 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
             else:
                 asset_used[claimed["asset"]] = asset_used.get(claimed["asset"], 0) + 1
         held = {}
-        incomplete = core_full.incomplete(self) if self.core is not None else set()
+        incomplete = core_full.waiting(self) if self.core is not None else set()
         planner = self.planner() if incomplete else None
         for task_id in self.m.due(now):
             task = self.m.task(task_id)
@@ -1340,6 +1341,7 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
                 "lineage",
                 "outcomes",
                 "definition",
+                "gate",  # the upstream heads it read: its commit checks them again (`full.held`)
                 "cleanup",  # a cleanup task's entry (K25)
             )
         }
@@ -1395,7 +1397,7 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
     @staticmethod
     def _whole_fan_in(planner: planning.Planner, input: planning.Input) -> dict:
         """A whole fan-in pins every current upstream partition with a complete
-        head that agrees with this partition's shared keys, keyed by the dimensions
+        head (any head on the new core, whose gate holds a partial one) that agrees with this partition's shared keys, keyed by the dimensions
         it collapses (§7) — every dimension, with `all_partitions` — chosen
         among the heads that exist, never by expanding the partition domain."""
 
@@ -1835,6 +1837,10 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
         worked = bool((task.get("outcomes") or {}).get("succeeded"))
         if outcome == "succeeded" and result.get("skipped") and not more and not worked:
             outcome = "skipped"  # the patterns took none of its keys: it did nothing (per-key §11)
+        if self.core is not None and (why := core_full.held(self.m, prepared.get("gate") or ())) is not None:
+            raise core_commit.HeldBack(
+                f"{why[0]}: {why[1]}"
+            )  # a head it read is partial: never, by `prepare`
         if built is not None:  # checked, then recorded with nothing awaited between (rule 3)
             core_commit.check(self.core, built)
             if (core := built.payload()) is not None:

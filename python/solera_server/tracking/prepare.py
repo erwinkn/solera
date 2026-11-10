@@ -16,15 +16,13 @@ commit numbers.
 
 from __future__ import annotations
 
-import contextlib
 import math
 
 from solera._native import Tracking
 
-from .. import planning
 from . import WALK, Core, b64, canonical
 from .commit import HeldBack
-from .full import gate, incomplete_at
+from .full import held
 
 
 def conditions(engine, input, base: dict) -> dict:
@@ -71,40 +69,22 @@ def open_edges(core: Core, task: dict, keyed: list) -> dict:
 
 async def prepare(core: Core, task: dict, run: dict, attempt: str | None) -> dict:
     """An attempt's preparation on the new path: `Engine._prepare`'s result,
-    with the plan's bytes under `plan` (kept out of the journal). It holds
-    its keyed upstreams' locks, in output-name order as every taker of
-    several does, from the gate's check to the plan: no clear, and no end of
-    a full run, comes between what the gate let through and what it plans
-    on. An upstream incomplete by then sends it back to wait (`HeldBack`).
-    Each upstream's life is named (minted) before it is locked; one reset
-    while the locks were awaited is locked on a second pass."""
+    with the plan's bytes under `plan` (kept out of the journal), and under
+    `gate` every upstream head it reads, `[output, partition, commit]`: a
+    whole input's as pinned, a keyed input's as planned, an unkeyed input's
+    planned end. A partial one sends it back to wait (`HeldBack`); its commit
+    checks them again (`full.held`)."""
 
-    engine = core.engine
-    try:
-        inputs = engine.planner().inputs(task["asset"], task["partition"])
-    except planning.UpstreamOnly:
-        inputs = []
-    upstreams = sorted(
-        {(i.output, i.partition) for i in inputs if i.kind == "incremental" and engine._keyed(i)}
-    )
-    ids = [core.named(*key) for key in upstreams]
-    async with contextlib.AsyncExitStack() as locks:
-        for id_ in ids:
-            await locks.enter_async_context(core.lock(id_))
-        prepared = await _prepare(core, task, run, attempt, set(ids))
-    return prepared if prepared is not None else await prepare(core, task, run, attempt)
-
-
-async def _prepare(core: Core, task: dict, run: dict, attempt: str | None, locked: set) -> dict | None:
-    """`prepare`, under the locks of `locked` upstream lives: None, to start
-    over, if a deploy came while it planned or an upstream it plans on is a
-    life it does not hold the lock of (reset since)."""
-
-    engine = core.engine
-    deploy = engine.m.deploy_number
+    engine, m = core.engine, core.m
+    deploy = m.deploy_number
     base = engine._pin_inputs(task, run)
-    if (waiting := gate(engine.planner(), task, lambda o, p: incomplete_at(engine, o, p))) is not None:
-        raise HeldBack(f"{waiting[0]}: {waiting[1]}")
+    heads = []
+    for input in base["inputs"]:  # in the step that pinned them: the heads the pins name
+        if input.kind == "in":
+            parts = base["planner"].fan_in(input, materialized=True) if input.fan_in else (input.partition,)
+            heads += [[input.output, p, m.axis_head(input.output, p)] for p in parts]
+    if (why := held(m, heads)) is not None:
+        raise HeldBack(f"{why[0]}: {why[1]}")
     # With incremental inputs, a run starts over as today's path decides (`_full_run`): a full
     # run's first batch, a definition other than the partition was built under, an input reset.
     if base["incremental"]:
@@ -124,6 +104,8 @@ async def _prepare(core: Core, task: dict, run: dict, attempt: str | None, locke
         o = engine._commits(input, record, mine, full)
         pin, plan, empty = engine._commits_pin(input, engine._pin_at(input.output, input.partition), o)
         pins[input.param], plans[input.param] = pin, plan
+        if not plan.get("done"):
+            heads.append([input.output, input.partition, plan["end"]])
         all_empty = all_empty and empty
     mine = progress.get(WALK)
     if keyed and mine is not None and mine["key"] is None:  # walked to the end in this task
@@ -137,8 +119,6 @@ async def _prepare(core: Core, task: dict, run: dict, attempt: str | None, locke
             }
             plans[input.param] = {"kind": "core", "output": input.output, "final": True, "done": True}
     elif keyed:
-        if any(core.m.core_outputs.get((i.output, i.partition)) not in locked for i in keyed):
-            return None
         edges = open_edges(core, task, keyed)
         core.attach(*(core.m.core_edges[(task["asset"], task["partition"], i.param)][1] for i in keyed))
         after = (mine or {}).get("key")
@@ -159,6 +139,7 @@ async def _prepare(core: Core, task: dict, run: dict, attempt: str | None, locke
         index = 0 if mine is None else int(mine["batch"]) + 1
         for n, input in enumerate(keyed):
             found = summary["inputs"][n]
+            heads.append([input.output, input.partition, found["head"]])
             # The walk ends where the plan says (`hi` None). The worker is told each input's
             # own end too: it owes nothing past the batch (a full run: holds nothing past it),
             # though the others' go on.
@@ -194,10 +175,13 @@ async def _prepare(core: Core, task: dict, run: dict, attempt: str | None, locke
             }
             all_empty = all_empty and not found["keys"]
     if engine.m.deploy_number != deploy:  # redeployed while it planned: prepared under one deploy only
-        return None
+        return await prepare(core, task, run, attempt)
+    if (why := held(m, heads)) is not None:  # a head it planned on is partial
+        raise HeldBack(f"{why[0]}: {why[1]}")
     more = any(not (p["final"] or p.get("done")) for p in plans.values())
     skip = bool(base["incremental"]) and all_empty and not more and not full
     prepared = engine._prepared(task, run, attempt, base, plans, more, skip, None)
+    prepared["gate"] = heads
     if plan_bytes is not None:
         prepared["plan"] = plan_bytes
         if attempt is not None:
@@ -206,11 +190,17 @@ async def _prepare(core: Core, task: dict, run: dict, attempt: str | None, locke
 
 
 def restarted(core: Core, task: dict, input) -> bool:
-    """Whether a keyed input's edge reads an upstream life that is gone (a
-    reset: the output removed, or moved to another store)."""
+    """Whether a keyed input must start over: what its committed progress
+    reads (`Model.core_read`, which only a commit writes) is an upstream life
+    that is gone (a reset: the output removed, or moved to another store),
+    or nothing though the partition has committed (its edge was closed and
+    opened again by deploys since)."""
 
-    found = core.m.core_edges.get((task["asset"], task["partition"], input.param))
-    return found is not None and found[1] != core.m.core_outputs.get((input.output, input.partition))
+    m, asset, partition = core.m, task["asset"], task["partition"]
+    read = m.core_read.get((asset, partition, input.param))
+    if read is None:
+        return "definition" in m.partition(asset, partition)
+    return read != m.core_outputs.get((input.output, input.partition))
 
 
 def refuse(engine, task: dict, run: dict, keyed: list) -> None:

@@ -148,7 +148,7 @@ async def build(core: Core, task: dict, attempt: str, prepared: dict, result: di
         claim = m.claimed(attempt)
         generation = int((claim or {}).get("generation") or 0)
         producer = canonical({"run": task["run"], "attempt": attempt})
-        clear, ends = full_run(prepared)
+        clear = full_run(prepared)
         plan = await plan_of(core, task, attempt, prepared)
         keyed, reports, ops, foreseen = [], [], None, None
         keyed_outputs = [
@@ -179,26 +179,21 @@ async def build(core: Core, task: dict, attempt: str, prepared: dict, result: di
                 core.tracking.progress_ops, plan, reports, producer=producer, output_commit=foreseen
             )
             held(ops)
-        # Every output lock the batch needs, in output-name order, as any other taker of several does.
-        ids = {}
-        for name, _, entry in keyed_outputs:
-            if not entry.get("unchanged"):
-                ids[name] = core.named(name, partition)
-            elif ends and (id_ := m.core_outputs.get((name, partition))) is not None:
-                ids[name] = id_
-        for name in sorted(ids):
-            await built.locks.enter_async_context(core.lock(ids[name]))
+        # Every output lock the batch needs, in the order of the lives' ids, as any other taker of
+        # several does: an id is never renamed.
+        ids = {
+            name: core.named(name, partition)
+            for name, _, entry in keyed_outputs
+            if not entry.get("unchanged")
+        }
+        for id_ in sorted(ids.values()):
+            await built.locks.enter_async_context(core.lock(id_))
         first = None
         for name, info, entry in keyed_outputs:
             if name not in ids:
                 continue
             id_ = ids[name]
-            if entry.get("unchanged"):  # in a full run that this batch ends with no commit of it
-                if core.tracking.full_run(id_.encode()) is not None:
-                    events.append(Tracking.event_full_run_done(id_.encode()))
-                continue
             core.attach(id_)
-            ending = ends and (clear or core.tracking.full_run(id_.encode()) is not None)
             out = m.core_output(name, partition) or {"head": 0, "layers": []}
             dynamic = bool(info.get("dynamic"))
             async with changes_of(core, name, entry) as changes:
@@ -211,12 +206,9 @@ async def build(core: Core, task: dict, attempt: str, prepared: dict, result: di
                     time_ms=int(engine.clock() * 1000),
                     producer=producer,
                     mode="clear" if clear else "replace" if entry.get("whole") else "patch",
-                    ends_full_run=ending,
                     collect=DYNAMIC_KEYS if dynamic else 0,
                 )
             if found is None:
-                if ending:
-                    events.append(Tracking.event_full_run_done(id_.encode()))
                 continue
             events.append(found["event"])
             first = found["commit"] if first is None else first
@@ -273,18 +265,15 @@ async def elements(core: Core, name: str, partition: str, out: dict, found: dict
             return keys
 
 
-def full_run(prepared: dict) -> tuple[bool, bool]:
-    """Whether a batch's commit starts its outputs' full run, and whether it
-    ends any it is in (the full-run verdict: the clear, plus the gate). A
-    full run's first batch of an incremental asset clears: its outputs start
-    over, and their readers wait until the run completes. The walk's last
-    batch ends it; a key list's never does, and once its producer is
-    complete anyway the tick ends the run (`full.settle`)."""
+def full_run(prepared: dict) -> bool:
+    """Whether a batch's commit starts its outputs' full run (the clear,
+    plus the gate): a full run's first batch of an incremental asset clears,
+    its outputs start over, and their readers wait until the run completes
+    (`full`). The core's mark of the run ends once its spans close
+    (`full.settle`)."""
 
     plans = [p for p in (prepared.get("plans") or {}).values() if p]
-    clear = bool(prepared.get("full")) and bool(plans)
-    ends = not prepared.get("more") and not any(p.get("mode") == "keys" for p in plans)
-    return clear, ends
+    return bool(prepared.get("full")) and bool(plans)
 
 
 def unkeyed(prepared: dict) -> dict:

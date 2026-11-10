@@ -200,7 +200,8 @@ class Model:
             data["core_outputs"] = _nest(self.core_outputs, 2)
             data["core_edges"] = _nest(self.core_edges, 3)
             data["core_empty"] = _nest(self.core_empty, 3)
-            data["proceeded"] = _nest(self.proceeded, 2)
+            data["core_read"] = _nest(self.core_read, 3)
+            data["partial_spans"] = [[list(k), v] for k, v in self.partial_spans.items()]
         return copy.deepcopy(data) if copied else data
 
     def restore(self, snap: dict | None, core: bool = False) -> None:
@@ -283,8 +284,14 @@ class Model:
         # (asset, partition, input) -> the key past which the edge holds nothing since it last
         # started over ("": every key), until a walk gets to the end: what completeness reads.
         self.core_empty: dict[tuple, str] = _flatten(snap.get("core_empty"), 3)
-        # (asset, partition): incomplete, and an operator let its readers proceed (until it starts over)
-        self.proceeded: dict[tuple, float] = _flatten(snap.get("proceeded"), 2)
+        # (asset, partition, input) -> the upstream life a keyed input's committed progress
+        # reads: only a commit writes it, so a reader whose upstream started over starts over
+        # too until one of its batches commits (`prepare.restarted`).
+        self.core_read: dict[tuple, str] = _flatten(snap.get("core_read"), 3)
+        # An output life's partial commits (D205): `span_key` -> [[from, to, proceeded], ...],
+        # `[from, to)` on its commit axis (`axis_head`), `to` None while open. Written only by
+        # its producer's commits, `settle`'s `Settled` and `Proceeded` (`_spans`).
+        self.partial_spans: dict[tuple, list] = {tuple(k): v for k, v in snap.get("partial_spans") or ()}
         # derived from launched attempts, plus memory-only claims of attempts preparing
         # task id -> {attempt, started_at, pin, status, launched?, reads?}; `pin`: `applied` at the claim
         self.claims: dict[str, dict] = {}
@@ -858,8 +865,11 @@ class Model:
 
         for key in [k for k in self.heads if gone(k)]:
             del self.heads[key]
+        lives = {("@life", id_) for k, id_ in self.core_outputs.items() if k[0] in reset}
         for key in [k for k in self.core_outputs if k[0] in reset]:  # its next commit names a new life
             del self.core_outputs[key]
+        for key in [k for k in self.partial_spans if k in lives or k[0] in reset]:  # they go with the life
+            del self.partial_spans[key]
         for key in [k for k in self.repairs if gone(k)]:  # what dead attempts meant to write
             index = self.index(*key)
             for intent in self.repairs.pop(key):
@@ -920,7 +930,8 @@ class Model:
         move(self.core_outputs, output_map, 0)  # the new path's ids: the same output, the same edges
         move(self.core_edges, asset_map, 0)
         move(self.core_empty, asset_map, 0)
-        move(self.proceeded, asset_map, 0)
+        move(self.core_read, asset_map, 0)
+        move(self.partial_spans, output_map, 0)  # an output with no core id: its spans by name
         for old, new in output_map.items():
             if old in self.homes and new not in self.homes:
                 self.homes[new] = self.homes.pop(old)
@@ -1240,13 +1251,18 @@ class Model:
             self.retired.pop(commit.get("cleaned"), None)
             return
         asset, partition, at = task["asset"], task["partition"], e["finished_at"]
+        names = sorted(prepared.get("outputs") or {})
+        heads_before = {
+            name: (self.span_key(name, partition), self.axis_head(name, partition)) for name in names
+        }
         if (core := commit.get("core")) is not None:  # first: what follows reads it
             self._core_apply(core)
             if core.get("walk") is not None:
                 self._core_walk(asset, partition, core["walk"])
-            for param, (reset, done) in (core.get("empty") or {}).items():  # unkeyed inputs' walks from empty
-                if reset:  # the partition starts over: an operator's proceed no longer holds
-                    self.proceeded.pop((asset, partition), None)
+            for param in (core.get("walk") or {}).get("inputs") or ():  # the lives its progress reads now
+                if (edge := self.core_edges.get((asset, partition, param))) is not None:
+                    self.core_read[(asset, partition, param)] = edge[1]
+            for param, (_, done) in (core.get("empty") or {}).items():  # unkeyed inputs' walks from empty
                 if done:
                     self.core_empty.pop((asset, partition, param), None)
                 else:
@@ -1277,6 +1293,10 @@ class Model:
                     self.garbage.extend(
                         [index.path(name), self.event_counter] for name in delta_names(intent)
                     )
+        if self.core is not None:
+            walk = (core or {}).get("walk") or {}
+            restart = bool(walk.get("reset")) or any(r for r, _ in ((core or {}).get("empty") or {}).values())
+            self._spans(asset, partition, heads_before, restart)
         record = self._partition(asset, partition)
         for field in ("definition", "config", "context"):  # what it was made under: staleness compares
             if field in commit:
@@ -1824,12 +1844,101 @@ class Model:
                 self.core_edges[(asset, partition, param)] = id_
                 self.core_empty[(asset, partition, param)] = ""
 
+    def span_key(self, output: str, partition: str) -> tuple:
+        """Where an output's partial spans are kept: under its core life, or
+        by name for an output with no core id (append-only, single value)."""
+
+        id_ = self.core_outputs.get((output, partition))
+        return ("@life", id_) if id_ is not None else (output, partition)
+
+    def axis_head(self, output: str, partition: str) -> int | None:
+        """An output's head on its commit axis: its core life's commit, an
+        append-only output's commit number, else its ref's generation."""
+
+        id_ = self.core_outputs.get((output, partition))
+        if id_ is not None and self.core is not None:
+            found = self.core.output(id_.encode())
+            return None if found is None else int(found["head"])
+        head = self.heads.get((output, partition))
+        if head is None:
+            return None
+        if head.get("commit_number") is not None:
+            return int(head["commit_number"])
+        return int(head["ref"].get("generation") or 0)
+
+    def partial(self, output: str, partition: str, at: int | None, proceeded: bool = False) -> bool:
+        """Whether commit `at` of an output's current life is partial: its
+        producer partition had a walk from empty pending when it was made. A
+        span an operator let readers proceed over counts only with
+        `proceeded`."""
+
+        if at is None:
+            return False
+        return any(
+            lo <= at and (hi is None or at < hi) and (proceeded or not flag)
+            for lo, hi, flag in self.partial_spans.get(self.span_key(output, partition), ())
+        )
+
+    def _spans(self, asset: str, partition: str, before: dict, restart: bool) -> None:
+        """A producer partition's commit, applied: its outputs' partial spans
+        (D205). A walk that starts over closes each open span above the head
+        before it (that head stays partial, or proceeded); while a walk from
+        empty is pending, each output this commit made opens one at it; once
+        none is, every open one closes at the head, which is complete."""
+
+        pending = any(k[0] == asset and k[1] == partition for k in self.core_empty)
+        for name, (was, head_before) in before.items():
+            key, head = self.span_key(name, partition), self.axis_head(name, partition)
+            spans = [list(s) for s in self.partial_spans.get(key, ())] if key == was else []
+            if restart and spans and spans[-1][1] is None:
+                spans[-1][1] = head_before + 1
+            if spans and spans[-1][1] is None:
+                if not pending:
+                    spans[-1][1] = head
+            elif pending and head is not None and (key != was or head != head_before):
+                spans.append([head, None, False])
+            self._keep_spans(key, spans)
+
+    def _keep_spans(self, key: tuple, spans: list) -> None:
+        merged = []
+        for span in spans:
+            if span[1] is not None and span[1] <= span[0]:
+                continue
+            if merged and merged[-1][1] == span[0] and merged[-1][2] == span[2]:
+                merged[-1][1] = span[1]
+            else:
+                merged.append(span)
+        if merged:
+            self.partial_spans[key] = merged
+        else:
+            self.partial_spans.pop(key, None)
+
+    def _open_spans(self, asset: str, partition: str):
+        """The open spans of an asset partition's outputs: `(output, key, spans)`."""
+
+        for output in (self.manifest or {}).get("assets", {}).get(asset, {}).get("outputs") or ():
+            key = self.span_key(output["name"], partition)
+            spans = [list(s) for s in self.partial_spans.get(key, ())]
+            if spans and spans[-1][1] is None:
+                yield output["name"], key, spans
+
+    def _on_Settled(self, e):
+        """The tick found a partition complete with no batch to say so (a key
+        list took the rest, or the rest was deleted upstream): its open spans
+        close at their heads."""
+
+        for output, key, spans in list(self._open_spans(e["asset"], e["partition"])):
+            spans[-1][1] = self.axis_head(output, e["partition"])
+            self._keep_spans(key, spans)
+
     def _on_Proceeded(self, e):
         """An operator lets the readers of an incomplete partition proceed
         over its partial output (D205), until it starts over."""
 
         self._core_apply(e)  # the keyed outputs' full runs it ends
-        self.proceeded[(e["asset"], e["partition"])] = e["at"]
+        for _, key, spans in list(self._open_spans(e["asset"], e["partition"])):
+            spans[-1][2] = True
+            self._keep_spans(key, spans)
 
     def _core_close(self, producers: set[str]) -> None:
         """After a deploy, the new path's edges that read nothing now: of an
@@ -1841,8 +1950,8 @@ class Model:
         empty that reads nothing now."""
 
         assets, outputs = self.manifest["assets"], self.manifest["outputs"]
-        for key in [k for k in self.proceeded if k[0] not in assets or k[0] in producers]:
-            del self.proceeded[key]
+        for key in [k for k in self.core_read if k[0] not in assets]:
+            del self.core_read[key]
         owner = {id_: output for (output, _), id_ in self.core_outputs.items()}
         closing = []
         for key in sorted(self.core_edges):
@@ -1871,6 +1980,7 @@ class Model:
         for key in closing:
             del self.core_edges[key]
             self.core_empty.pop(key, None)
+            self.core_read.pop(key, None)  # what it read is no input's now: a later edge starts over
 
     def _core_walk(self, asset: str, partition: str, walk: dict) -> None:
         """A batch's walk over its keyed inputs, `(after, hi]` (`hi` None: to
@@ -1879,8 +1989,6 @@ class Model:
         list's walk fills nothing, and after a reset leaves every key empty."""
 
         after, hi = walk["after"], walk["hi"]
-        if walk["reset"]:
-            self.proceeded.pop((asset, partition), None)
         for param in walk["inputs"]:
             if walk.get("keys"):  # a key list writes points only: what was empty stays so
                 if walk["reset"]:

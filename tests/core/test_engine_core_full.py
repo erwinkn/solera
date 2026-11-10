@@ -91,12 +91,12 @@ async def test_a_reader_waits_for_a_first_keyed_run_not_walked_to_the_end(solera
     try:
         assert await solera.rows("copy") == {"a": "1"}
         await eng._cover_tick()
-        assert ("copy", "") in full.incomplete(eng)
+        assert ("copy", "") in full.waiting(eng)
     finally:
         release.set()
         await solera.wait(first)
     await eng._cover_tick()
-    assert full.incomplete(eng) == set()
+    assert full.waiting(eng) == set()
 
 
 @pytest.mark.parametrize("lists", [[["a", "b"]], [["a"], ["b"]]])
@@ -109,7 +109,7 @@ async def test_key_lists_that_take_every_key_end_a_full_run(solera, lists):
         await solera.run("copy", keys={"files": keys})
     await solera.settle(0.1)
     assert await solera.engine.complete("copy", "")
-    assert full.incomplete(solera.engine) == set() and full.running(solera.engine.core) == set()
+    assert full.waiting(solera.engine) == set() and full.running(solera.engine.core) == set()
 
 
 def test_a_fan_in_waits_only_for_the_partitions_its_shared_keys_name(tmp_path):
@@ -248,7 +248,7 @@ async def test_a_key_list_that_would_hold_its_key_back_is_planned_again_and_comp
     assert [a["outcome"] for a in _attempts(detail, "join")] == ["replanned", "succeeded"]
     await solera.settle(0.1)
     assert await solera.rows("join") == {"k": "1"}
-    assert await solera.engine.complete("join", "") and full.incomplete(solera.engine) == set()
+    assert await solera.engine.complete("join", "") and full.waiting(solera.engine) == set()
 
 
 async def test_a_whole_reader_waits_for_a_full_run_over_unkeyed_inputs(solera, tmp_path):
@@ -287,7 +287,7 @@ async def test_a_whole_reader_waits_for_a_full_run_over_unkeyed_inputs(solera, t
         release.set()
         await solera.wait(rebuild)
     await solera.wait(reader)
-    assert seen == [3] and full.incomplete(solera.engine) == set()
+    assert seen == [3] and full.waiting(solera.engine) == set()
 
 
 async def test_proceed_and_a_commit_of_several_outputs_take_their_locks_in_one_order(solera, tmp_path):
@@ -378,18 +378,15 @@ async def test_proceed_lets_readers_go_on_over_a_partial_output_until_it_starts_
     await solera.state.durable()
     replay = await State.open((tmp_path / "state").as_uri(), "contract", writer=False)
     try:
-        assert (
-            replay.model.proceeded
-            == solera.engine.m.proceeded
-            == {("copy", ""): pytest.approx(replay.model.proceeded[("copy", "")])}
-        )
+        assert replay.model.partial_spans == solera.engine.m.partial_spans != {}
+        assert full.waiting(solera.engine) == set(), "every span of copy's is proceeded"
     finally:
         await replay.close()
     files.waiting = False  # the canceled batch never got past its hold
     files.hold.clear()  # the next full run starts over: its readers wait again
     rebuild = await solera.submit("copy", mode="full")
     await solera.until(lambda: files.waiting)
-    assert solera.engine.m.proceeded == {}
+    assert full.waiting(solera.engine) == {("copy", "")}
     reader = await solera.submit("report")
     task = await decided(solera, reader, "report")
     assert task.get("held") == [INCOMPLETE, "copy"], task
@@ -490,9 +487,9 @@ async def test_finishing_one_unkeyed_walk_does_not_revoke_proceed(solera, tmp_pa
     for _ in range(4):
         await solera.run("right")
     await solera.run("digest", expect="failed")
-    assert full.incomplete(solera.engine) == {("digest", "")}
+    assert full.waiting(solera.engine) == {("digest", "")}
     await solera.post("/assets/digest/proceed", {"partition": ""})
-    assert ("digest", "") in solera.engine.m.proceeded
+    assert full.waiting(solera.engine) == set()
     phase[0] = "resume"
     resumed = await solera.submit("digest")
     await solera.until(entered.is_set)
@@ -500,7 +497,7 @@ async def test_finishing_one_unkeyed_walk_does_not_revoke_proceed(solera, tmp_pa
         reader = await solera.submit("report")
         task = await decided(solera, reader, "report")
         assert task.get("held") != ["upstream incomplete", "digest"], task
-        assert ("digest", "") in solera.engine.m.proceeded
+        assert full.waiting(solera.engine) == set()
     finally:
         release.set()
         await solera.wait(resumed)
@@ -637,7 +634,7 @@ async def test_the_gate_is_checked_again_as_the_batch_is_planned(solera, tmp_pat
     rebuilding[0] = True
     producer = await solera.submit("copy", mode="full")
     await solera.until(second_entered.is_set)
-    assert ("copy", "") in full.incomplete(eng)
+    assert ("copy", "") in full.waiting(eng)
     release.set()
     try:
         await solera.settle(0.4)

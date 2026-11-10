@@ -380,7 +380,9 @@ class _Gate:
         return out
 
 
-async def test_a_consumer_waits_for_an_outputs_first_commit_and_refuses_nothing(solera, tmp_path):
+async def test_a_consumer_opening_its_edge_while_an_outputs_first_commit_is_built_refuses_nothing(
+    solera, tmp_path
+):
     @asset(outputs=Output("items", key="id"), retries=Retry(n=0))
     def items():
         return [{"id": "k", "v": "1"}]
@@ -394,16 +396,12 @@ async def test_a_consumer_waits_for_an_outputs_first_commit_and_refuses_nothing(
     request = await solera.submit("items")
     driving = asyncio.create_task(solera.engine.run_until(request["id"], 30))
     await asyncio.wait_for(gate.reached.wait(), 10)
-    copying = await solera.submit("copy")  # plans under items' lock: not while its first commit is built
-    await solera.settle(0.3)
-    assert solera.engine.m.core_edges == {}
+    await solera.submit("copy")  # its edge names items' id while items' first commit is built
+    await solera.until(lambda: any(e[1] for e in solera.engine.m.core_edges.values()), 10)
     gate.release.set()
     await driving
     detail = await solera.get(f"/runs/{request['id']}")
     assert detail["request"]["status"] == "succeeded", detail
-    await solera.wait(copying)
-    [(edge, upstream)] = solera.engine.m.core_edges.values()
-    assert upstream == solera.engine.m.core_outputs[("items", "")]
 
 
 async def test_a_run_cancelled_while_its_batch_is_planned_keeps_no_plan(solera, tmp_path):

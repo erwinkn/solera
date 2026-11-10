@@ -21,7 +21,7 @@ async def owes(core: Core, asset: str, partition: str, input, planner, inputs) -
     if upstream is None or found is None:
         return False
     edge = m.core_edges.get((asset, partition, input.param))
-    if edge is None or edge[1] != upstream:
+    if edge is None or m.core_read.get((asset, partition, input.param)) != upstream:
         return found["live"] > 0
     record = m.partition(asset, partition)
     base = {
