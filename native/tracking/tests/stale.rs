@@ -89,6 +89,7 @@ fn batch(t: &Tracking, range: KeyRange, at: u64, reset: bool) -> Part {
         piece: Some(Value::At(at, Arc::default())),
         points: vec![],
         expect: read_digest(k, reset, &range),
+        fence: None,
     })
 }
 
@@ -387,6 +388,7 @@ fn failed(rt: &tokio::runtime::Runtime, ix: &ChangeIndex, keys: &[&str]) -> Trac
             false,
             &KeyRange::all(),
         ),
+        fence: None,
     });
     let cid = outcomes::cond_id(&c);
     let rec = Record {

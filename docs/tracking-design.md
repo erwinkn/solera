@@ -719,8 +719,9 @@ and conditions at one generation, as of one upstream commit.
   rename, new conditions or points a batch's outcomes set (B6) start a new
   generation and record which key ranges changed (a reset, a batch that
   resets progress, new conditions or outcomes' points: all of them); so do
-  a full run asked for by hand (B6's `Rebuild`, which also raises the
-  rebuild counter in the watched conditions), the start of a retry pass
+  a full run asked for by hand (B6's `Rebuild`; staleness reads the
+  rebuild counter from B6, not from the watch, so a watch journaled with
+  an older counter never undoes it), the start of a retry pass
   (B6), with no range changed, and the end of a full run, for the readers
   its gate held. What is known then stops being
   current, and the status reads "unknown" until a refresh. Generations come from one counter and
@@ -760,7 +761,9 @@ and conditions at one generation, as of one upstream commit.
   retry pass is under way. Its `PassStart` starts a new generation, so a
   part computed before it is dropped, and a refresh that finds nothing
   else due names the pass's next key, "retry due" (B6's retry plan with a
-  limit of one key, raised while a key gone moot fills it). A witness no
+  limit of one key; while keys gone moot fill it, the plan reads on from
+  where it stopped in pages of 256 keys, so memory stays bounded however
+  many keys went moot). A witness no
   longer due gives way to the pass's next key before any probe.
 - **The gate** (rule 8) reads the output's full-run state (§4: a clear
   starts it; a commit with `ends_full_run`, or `FullRunDone`, ends it).
