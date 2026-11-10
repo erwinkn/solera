@@ -574,7 +574,7 @@ impl Slice {
     }
 }
 
-fn encode_points<'a>(
+pub fn encode_points<'a>(
     e: &mut Enc,
     t: &mut CondTable,
     points: impl ExactSizeIterator<Item = (&'a Key, &'a Point)>,
@@ -594,7 +594,7 @@ fn encode_points<'a>(
     }
 }
 
-fn decode_points(d: &mut Dec<'_>, conds: &[Arc<Conditions>]) -> Result<Vec<(Key, Point)>> {
+pub fn decode_points(d: &mut Dec<'_>, conds: &[Arc<Conditions>]) -> Result<Vec<(Key, Point)>> {
     let mut out: Vec<(Key, Point)> = Vec::new();
     for _ in 0..d.count()? {
         let k: Key = d.bytes()?.into();

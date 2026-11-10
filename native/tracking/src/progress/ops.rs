@@ -192,6 +192,7 @@ impl Tracking {
                     Mode::Keys(_) => Some(p.keys.iter().map(|c| c.key.clone()).collect()),
                     _ => None,
                 },
+                waiting: p.waiting.clone(),
             });
             parts.push(Part::Batch(BatchProgress {
                 edge: p.edge.clone(),
