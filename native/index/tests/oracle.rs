@@ -1127,6 +1127,108 @@ fn a_fill_that_cannot_be_kept_gives_its_room_back_once() {
 }
 
 #[test]
+fn a_commit_writer_writes_what_write_commit_writes() {
+    let rt = runtime();
+    let mem = Arc::new(InMemory::new());
+    let opts = StoreOptions {
+        part_bytes: 64 << 10,
+        ..Default::default()
+    };
+    let store = Store::new(mem.clone(), Path::from("t"), rt.handle().clone(), opts).unwrap();
+    let ix = ChangeIndex::new(store, WriteOptions::default());
+    let nc = NewCommit {
+        commit: 1,
+        time_ms: 5,
+        producer: b"p",
+        live_before: 10,
+    };
+    let mut rng = SmallRng::seed_from_u64(1);
+    let mut run = Run::new();
+    for i in 0..20_000u64 {
+        run.push_key(format!("k{i:06}").as_bytes());
+        let v = Version::Int(rng.random());
+        match i % 3 {
+            0 => run.push_entry(1, v, Version::Absent),
+            1 => run.push_entry(1, v, Version::Int(i)),
+            _ => run.push_entry(1, Version::Absent, Version::Int(i)),
+        }
+    }
+    rt.block_on(async {
+        let a = ix.write_commit("a", nc, &run).await.unwrap();
+        let mut w = ix.commit_writer("b", nc).unwrap();
+        for i in 0..run.len() {
+            let r = run.rows(i).start;
+            w.push(run.key(i), run.new_version(r), run.replaced_version(r))
+                .await
+                .unwrap();
+        }
+        let b = w.finish().await.unwrap().unwrap();
+        assert_eq!(
+            LayerRef {
+                path: "a".into(),
+                ..b
+            },
+            a
+        );
+        let bytes = |p: &'static str| {
+            let mem = mem.clone();
+            async move {
+                mem.get(&Path::from(p))
+                    .await
+                    .unwrap()
+                    .bytes()
+                    .await
+                    .unwrap()
+            }
+        };
+        assert_eq!(bytes("t/a").await, bytes("t/b").await);
+        let h = CommitHeader {
+            commit: 1,
+            time_ms: 5,
+            producer: b"p".to_vec(),
+            added: 6667,
+            updated: 6667,
+            removed: 6666,
+            live: 10 + 6667 - 6666,
+            min_key: b"k000000".to_vec(),
+            max_key: b"k019999".to_vec(),
+            ..Default::default()
+        };
+        assert_eq!(ix.commits(&[a], 1, 1).await.unwrap(), vec![h.clone()]);
+        // the same bytes as the format's writer, given that header
+        let mut fw = Writer::new(WriteOptions::default(), 1, 1, None).unwrap();
+        for i in 0..run.len() {
+            let r = run.rows(i).start;
+            fw.push(run.key(i), 1, run.new_version(r), run.replaced_version(r))
+                .unwrap();
+        }
+        fw.finish(&[h]).unwrap();
+        assert_eq!(bytes("t/b").await, fw.take());
+        // nothing pushed: nothing written
+        let w = ix.commit_writer("e", nc).unwrap();
+        assert!(w.finish().await.unwrap().is_none());
+        assert!(mem.head(&Path::from("t/e")).await.is_err());
+        // one entry per key, keys ascending
+        let mut w = ix.commit_writer("d", nc).unwrap();
+        w.push(b"k", Version::Int(1), Version::Absent)
+            .await
+            .unwrap();
+        assert!(matches!(
+            w.push(b"k", Version::Int(2), Version::Absent).await,
+            Err(Error::Invalid(_))
+        ));
+        let mut w = ix.commit_writer("d", nc).unwrap();
+        w.push(b"k", Version::Int(1), Version::Absent)
+            .await
+            .unwrap();
+        assert!(matches!(
+            w.push(b"j", Version::Int(2), Version::Absent).await,
+            Err(Error::Invalid(_))
+        ));
+    });
+}
+
+#[test]
 fn a_commit_count_past_its_section_is_a_format_error() {
     let raw = [0x80u8, 0x80, 0x40];
     let c = zstd::bulk::compress(&raw, 1).unwrap();
@@ -1378,4 +1480,44 @@ fn a_flipped_byte_or_a_cut_file_is_a_format_error() {
             );
         });
     }
+}
+
+#[test]
+fn a_store_refuses_zero_for_its_sizes() {
+    let rt = runtime();
+    for o in [
+        StoreOptions {
+            max_inflight: 0,
+            ..Default::default()
+        },
+        StoreOptions {
+            max_get: 0,
+            ..Default::default()
+        },
+        StoreOptions {
+            part_bytes: 0,
+            ..Default::default()
+        },
+    ] {
+        let got = Store::new(
+            Arc::new(InMemory::new()),
+            Path::from(""),
+            rt.handle().clone(),
+            o,
+        );
+        assert!(matches!(got, Err(Error::Invalid(_))));
+    }
+}
+
+#[test]
+fn a_writer_refuses_seg_blocks_past_its_limit() {
+    for seg_blocks in [0, format::MAX_RAW / format::MAX_KEY + 1, 1 << 48] {
+        let o = WriteOptions {
+            seg_blocks,
+            ..Default::default()
+        };
+        assert!(matches!(Writer::new(o, 1, 1, None), Err(Error::Invalid(_))));
+    }
+    let max = Writer::new(WriteOptions::default(), 1, u64::MAX, Some(u64::MAX));
+    assert!(matches!(max, Err(Error::Invalid(_))));
 }

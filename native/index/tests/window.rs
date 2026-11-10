@@ -1,5 +1,5 @@
-//! Reads hold bounded memory however large the layer (their own test binary:
-//! it measures the heap, one test at a time).
+//! Reads and writes hold bounded memory however large the layer (their own
+//! test binary: it measures the heap, one test at a time).
 
 use object_store::local::LocalFileSystem;
 use object_store::path::Path;
@@ -96,6 +96,95 @@ fn a_read_of_listed_keys_holds_a_bounded_window() {
     assert!(
         held < 40 << 20,
         "a get over a {} MB layer held {} MB",
+        layer.size >> 20,
+        held >> 20
+    );
+}
+
+#[test]
+fn a_commit_writer_holds_parts_not_the_commit() {
+    let _one = ONE_AT_A_TIME.lock().unwrap();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let dir = std::env::temp_dir().join(format!("solera-index-writer-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let local = Arc::new(LocalFileSystem::new_with_prefix(&dir).unwrap());
+    let opts = StoreOptions {
+        part_bytes: 5 << 20,
+        ..Default::default()
+    };
+    let store = Store::new(local, Path::from(""), rt.handle().clone(), opts).unwrap();
+    let ix = ChangeIndex::new(store, WriteOptions::default());
+    let nc = NewCommit {
+        commit: 1,
+        time_ms: 0,
+        producer: b"",
+        live_before: 0,
+    };
+    let base = NOW.load(Relaxed);
+    PEAK.store(base, Relaxed);
+    let layer = rt.block_on(async {
+        let mut w = ix.commit_writer("big", nc).unwrap();
+        for i in 0..5_000_000u64 {
+            w.push(&key(i), Version::Int(mix(i)), Version::Absent)
+                .await
+                .unwrap();
+        }
+        w.finish().await.unwrap().unwrap()
+    });
+    let held = PEAK.load(Relaxed) - base;
+    assert!(
+        held < 40 << 20,
+        "a commit writer of a {} MB layer held {} MB",
+        layer.size >> 20,
+        held >> 20
+    );
+    // long keys make a large index, which goes out with the blocks
+    let long = |i: u64| {
+        let mut k = format!("{i:08}").into_bytes();
+        let mut x = i + 1;
+        while k.len() < format::MAX_KEY {
+            x = mix(x);
+            k.extend_from_slice(&x.to_le_bytes());
+        }
+        k
+    };
+    let n = 2048u64;
+    let nc = NewCommit {
+        commit: 1,
+        time_ms: 0,
+        producer: b"",
+        live_before: 0,
+    };
+    let base = NOW.load(Relaxed);
+    PEAK.store(base, Relaxed);
+    let layer = rt.block_on(async {
+        let mut w = ix.commit_writer("long", nc).unwrap();
+        for i in 0..n {
+            w.push(&long(i), Version::Int(i), Version::Absent)
+                .await
+                .unwrap();
+        }
+        w.finish().await.unwrap().unwrap()
+    });
+    let held = PEAK.load(Relaxed) - base;
+    let ls = std::slice::from_ref(&layer);
+    let all = rt.block_on(ix.scan(ls, 1, &Query::default())).unwrap();
+    assert_eq!(all.run.len(), n as usize);
+    let some: Vec<Vec<u8>> = (0..n).step_by(97).map(long).collect();
+    let got = rt
+        .block_on(ix.get(ls, 1, &some, &Query::default()))
+        .unwrap();
+    assert_eq!(got.run.len(), some.len());
+    let _ = std::fs::remove_dir_all(dir);
+    // one segment of these keys is 8 MiB raw, and the top level grows with
+    // the layer (within the format's limit)
+    assert!(
+        held < 64 << 20,
+        "a commit writer of a {} MB layer of long keys held {} MB",
         layer.size >> 20,
         held >> 20
     );

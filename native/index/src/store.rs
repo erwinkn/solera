@@ -211,8 +211,14 @@ impl Store {
         rt: tokio::runtime::Handle,
         opts: StoreOptions,
     ) -> Result<Arc<Store>> {
-        if opts.max_inflight == 0 {
-            return Err(Error::Invalid("max_inflight is at least 1".into()));
+        for (name, v) in [
+            ("max_inflight", opts.max_inflight as u64),
+            ("max_get", opts.max_get),
+            ("part_bytes", opts.part_bytes as u64),
+        ] {
+            if v == 0 {
+                return Err(Error::Invalid(format!("{name} is at least 1")));
+            }
         }
         Ok(Arc::new(Store {
             disk: opts.disk.clone().map(Disk::open).transpose()?,
@@ -626,10 +632,11 @@ fn parse(
                     if decoded > EAGER_SEGS {
                         break;
                     }
-                    let (a, n) = (
-                        (top.segs.off[i] - start) as usize,
-                        top.segs.clen[i] as usize,
-                    );
+                    // a segment among the blocks is read when needed
+                    let Some(a) = top.segs.off[i].checked_sub(start) else {
+                        continue;
+                    };
+                    let (a, n) = (a as usize, top.segs.clen[i] as usize);
                     let Some(c) = b.get(a..a + n) else {
                         return Err(Error::Format(format!(
                             "{path}: segment {i} outside the index"

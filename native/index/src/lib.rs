@@ -25,7 +25,9 @@ pub use disk::DiskOptions;
 pub use error::{Error, Result};
 pub use format::{CommitHeader, LayerRef, WriteOptions, Writer};
 pub use glob::{Glob, Pattern};
-pub use query::{check_layers, pick_merge, ChangeIndex, Entries, NewCommit, Page, Query};
+pub use query::{
+    check_layers, pick_merge, ChangeIndex, CommitWriter, Entries, NewCommit, Page, Query,
+};
 pub use read::KeyList;
 pub use run::{Run, Version};
 pub use store::{Counts, Store, StoreOptions};
