@@ -46,6 +46,8 @@ pub struct Tracking {
     pub edges: BTreeMap<Id, Edge>,
     /// B6: per-key edges' counters, outcome counts and retry passes.
     pub per_key: BTreeMap<Id, crate::outcomes::PerKey>,
+    /// B6: the last life given to a per-key edge.
+    pub lives: u64,
 }
 
 impl Tracking {
@@ -137,6 +139,7 @@ impl Tracking {
             e.bytes(id);
             k.encode(&mut e);
         }
+        e.uv(self.lives);
         e.buf
     }
 
@@ -165,6 +168,7 @@ impl Tracking {
             t.per_key
                 .insert(id, crate::outcomes::PerKey::decode(&mut d)?);
         }
+        t.lives = d.uv()?;
         d.end()?;
         Ok(t)
     }

@@ -29,7 +29,7 @@ use solera_tracking::outcomes::commit::{self as oc, records, Ctx};
 use solera_tracking::outcomes::transition::{
     eligible, transition, Counters, Kind, Reported, Stored, FAILED,
 };
-use solera_tracking::outcomes::{cond_id, output_id, record_digest, Rebuild, FAILURES};
+use solera_tracking::outcomes::{output_id, record_digest, Rebuild, FAILURES};
 use solera_tracking::plan::{self, InputRequest, Mode, NoHold, OneIndex, Request};
 use solera_tracking::progress::{
     owed, Class, Conditions, EdgeClose, EdgeOpen, EdgeRename, Holding, InputReport, Key, Ops, Pat,
@@ -1845,8 +1845,7 @@ fn a_pass_start_on_another_views_list_is_refused() {
 }
 
 /// A first batch built on an edge no B6 part has applied to yet is refused
-/// once the edge starts over (round 5): the restart gives the edge a later
-/// life even without outcome state.
+/// once the edge starts over (round 5): every life is given once.
 #[test]
 fn a_first_batch_built_before_the_edge_started_over_is_refused() {
     let rt = runtime();
@@ -1861,7 +1860,6 @@ fn a_first_batch_built_before_the_edge_started_over_is_refused() {
                 .commit_of(&ix, &first, &[("k1", Kind::Failed)], &[], c)
                 .await
                 .unwrap();
-            assert!(!w.t.per_key.contains_key(EDGE.as_bytes()));
             for part in restart {
                 w.apply(vec![part]);
             }
@@ -1911,5 +1909,57 @@ fn a_change_of_patterns_alone_keeps_a_keys_tries() {
         }
         let r = &w.stored(&ix).await[&key("k1")];
         assert_eq!(r.stored.outcome, FAILED, "k1's timeouts ran out");
+    });
+}
+
+/// A pass by counters leaves a failed key whose input changed since it
+/// failed; the input then returns to what the key failed on, so the key waits
+/// for its retry again. The catch-up that sees it return lowers what the last
+/// pass covers, and the deploy's retry still comes (second review, round 2).
+#[test]
+fn a_key_a_pass_left_while_its_input_had_changed_gets_its_deploy_retry() {
+    let rt = runtime();
+    let ix = index(&rt);
+    rt.block_on(async {
+        let mut w = scripted();
+        let c1 = w.counters;
+        w.input(&ix, &[("k1", 5)]).await;
+        let first = w.planned(&ix, None, 10, Mode::Incremental).await;
+        let ev = w
+            .commit_of(&ix, &first, &[("k1", Kind::Failed)], &[], c1)
+            .await
+            .unwrap();
+        w.apply(ev);
+        while let Some(parts) = w.start_of(&ix).await {
+            w.apply(parts);
+            let step = w.retry_plan(&ix, 10).await;
+            let ev = w.commit_of(&ix, &step, &[], &[], c1).await.unwrap();
+            w.apply(ev);
+        }
+        w.counters.deploy = 2;
+        let c2 = w.counters;
+        w.input(&ix, &[("k1", 6)]).await;
+        if let Some(parts) = w.caught(&ix).await {
+            w.apply(parts);
+        }
+        let start = w.start_of(&ix).await.expect("the deploy starts a pass");
+        w.apply(start);
+        let step = w.retry_plan(&ix, 10).await;
+        assert!(
+            taken(&step).is_empty(),
+            "k1's input changed: it is not a retry's"
+        );
+        let ev = w.commit_of(&ix, &step, &[], &[], c2).await.unwrap();
+        w.apply(ev);
+        w.input(&ix, &[("k1", 5)]).await;
+        if let Some(parts) = w.caught(&ix).await {
+            w.apply(parts);
+        }
+        let rec = w.stored(&ix).await[&key("k1")].clone();
+        assert!(eligible(&rec.stored, w.clock, &w.counters));
+        assert!(taken(&w.planned(&ix, None, 10, Mode::Incremental).await).is_empty());
+        let start = w.start_of(&ix).await;
+        w.apply(start.expect("k1 waits for the deploy's retry"));
+        assert_eq!(taken(&w.retry_plan(&ix, 10).await), [key("k1")]);
     });
 }

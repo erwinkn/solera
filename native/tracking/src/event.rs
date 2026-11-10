@@ -82,6 +82,7 @@ impl Part {
     /// event still holds when the parts before it have applied.
     pub fn touches(&self) -> Vec<Touch<'_>> {
         match self {
+            Part::EdgeOpen(p) if p.keyed => vec![on("edge", &p.edge), on("outcomes", &p.edge)],
             Part::EdgeOpen(p) => vec![on("edge", &p.edge)],
             Part::EdgeClose(p) => [on("edge", &p.edge)]
                 .into_iter()

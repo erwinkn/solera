@@ -242,6 +242,23 @@ impl Counters {
     }
 }
 
+impl Stored {
+    /// What it carries of the counters, for what a pass covers (§9's
+    /// deploy_min): its deploy if it failed, its forced counter for its
+    /// outcome, and no bound on the rest.
+    pub fn low(&self) -> Counters {
+        let mut c = Counters {
+            deploy: u64::MAX,
+            forced: [u64::MAX; 6],
+        };
+        if self.outcome == FAILED {
+            c.deploy = self.deploy;
+        }
+        c.forced[self.outcome as usize] = self.forced;
+        c
+    }
+}
+
 /// Whether a retry takes `s`'s key at `now` (§9). Each clause retires
 /// itself: a retried key's `next_at` moves on, its `deploy` becomes the
 /// retry's, its `forced` the retry's counter. A canceled key matches only a

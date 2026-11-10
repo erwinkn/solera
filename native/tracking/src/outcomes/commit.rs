@@ -290,7 +290,6 @@ pub async fn commit(
                     on: tried.clone(),
                     on_cond,
                     at: p.head,
-                    made: v.upstream.head,
                     held,
                 })
             }
@@ -482,20 +481,10 @@ pub async fn commit(
         at: v.failures.head,
         look: made.map(|_| (looked, caught_up)),
         life: v.per_key.life,
-        low: next
-            .values()
-            .flatten()
-            .fold(None, |low: Option<Counters>, r| {
-                let mut c = Counters {
-                    deploy: u64::MAX,
-                    forced: [u64::MAX; 6],
-                };
-                if r.stored.outcome == super::transition::FAILED {
-                    c.deploy = r.stored.deploy;
-                }
-                c.forced[r.stored.outcome as usize] = r.stored.forced;
-                Some(low.map_or(c, |l| l.least(&c)))
-            }),
+        low: next.values().flatten().fold(None, |mut low, r| {
+            cover(&mut low, &r.stored);
+            low
+        }),
         made,
         points: vec![],
     }));
@@ -580,6 +569,7 @@ pub async fn catch_up(
     let conds: &Conds = &v.per_key.conds;
     let ix = ixs.index(&v.input)?;
     let mut gone: BTreeMap<Key, Record> = BTreeMap::new();
+    let mut low = None;
     let mut after: Option<Vec<u8>> = None;
     while seen < head {
         let q = Query {
@@ -596,11 +586,18 @@ pub async fn catch_up(
             let Some(rec) = recs.get(k) else { continue };
             let held = rec.held.holding(conds)?;
             let back = run.rows(i).any(|row| {
-                run.commit(row) > rec.made
-                    && !crate::progress::owed(&held, &Holding::of(run.new_version(row), now, k))
+                !crate::progress::owed(&held, &Holding::of(run.new_version(row), now, k))
             });
             if back {
                 gone.insert(k.into(), rec.clone());
+                continue;
+            }
+            // A key back on what it was tried on waits for its retry again:
+            // a pass that left it while its input had changed did not cover it.
+            let last = run.rows(i).last().expect("a key has rows");
+            let at_head = Holding::of(run.new_version(last), now, k);
+            if !crate::progress::owed(&rec.tried(k, conds)?, &at_head) {
+                cover(&mut low, &rec.stored);
             }
         }
         match page.next {
@@ -637,6 +634,8 @@ pub async fn catch_up(
             };
             if check {
                 maybe.push((k, rec, held));
+            } else {
+                cover(&mut low, &rec.stored);
             }
         }
         let keys: Vec<&[u8]> = maybe.iter().map(|m| m.0).collect();
@@ -656,6 +655,8 @@ pub async fn catch_up(
         for ((k, rec, held), ver) in maybe.into_iter().zip(at_head) {
             if !crate::progress::owed(&held, &Holding::of(ver.as_version(), now, k)) {
                 gone.insert(k.into(), rec);
+            } else {
+                cover(&mut low, &rec.stored);
             }
         }
         match page.next {
@@ -730,12 +731,17 @@ pub async fn catch_up(
             },
             Look { seen: head, cond },
         )),
-        low: None,
+        low,
         life: v.per_key.life,
         made: None,
         points,
     }));
     Ok(Some(parts))
+}
+
+/// Lowers what a pass covers to what a record carries (§9's deploy_min).
+fn cover(low: &mut Option<Counters>, s: &super::Stored) {
+    *low = Some(low.map_or(s.low(), |l| l.least(&s.low())));
 }
 
 /// Reference counts that changed, with the count after (0: gone).
