@@ -1171,9 +1171,11 @@ async fn history(seed: u64, ix: &ChangeIndex) -> [usize; 6] {
             12 => {
                 w.catch_up(ix).await;
                 let to = w.t.rebuild(EDGE.as_bytes()) + 1;
+                let life = w.t.per_key[EDGE.as_bytes()].life;
                 w.apply(vec![Part::Rebuild(Rebuild {
                     edge: key(EDGE),
                     to,
+                    life,
                 })]);
                 w.now = Arc::new(Conditions {
                     rebuild: to,
@@ -1657,6 +1659,11 @@ fn a_part_built_before_the_records_started_over_is_refused() {
             let commit = w.commit_of(&ix, &next, &[("k2", Kind::Failed)], &[], c);
             let commit = commit.await.unwrap();
             let start = w.start_of(&ix).await.expect("a failed key, a deploy");
+            let rebuild = vec![Part::Rebuild(Rebuild {
+                edge: key(EDGE),
+                to: w.t.rebuild(EDGE.as_bytes()) + 1,
+                life: w.t.per_key[EDGE.as_bytes()].life,
+            })];
             for part in restart {
                 w.apply(vec![part]);
             }
@@ -1669,7 +1676,7 @@ fn a_part_built_before_the_records_started_over_is_refused() {
                 .unwrap();
             w.apply(ev);
             let before = w.t.snapshot();
-            for stale in [commit, start] {
+            for stale in [commit, start, rebuild] {
                 let err = w.t.apply(&Event::of(stale).encode()).unwrap_err();
                 assert!(err.to_string().contains("started over"), "{err}");
             }
