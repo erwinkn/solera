@@ -15,7 +15,7 @@ use crate::codec::{Dec, Enc};
 use crate::error::{format, invalid, Result};
 use crate::state::{Id, Tracking};
 
-pub use build::{build, Built, Changed, Mode, Spec};
+pub use build::{build, build_each, Built, Changed, Each, Mode, Spec};
 pub use changes::{Change, Changes, Held, Reader, Source};
 
 pub const TAG_OUTPUT_COMMIT: u8 = 0x20;

@@ -26,6 +26,7 @@ use crate::commit;
 use crate::error::{format, Result};
 use crate::outcomes;
 use crate::progress;
+use crate::stale;
 use std::borrow::Cow;
 
 /// A thing one part of an event changes, as (kind, id).
@@ -76,6 +77,10 @@ pub enum Part {
     PassStart(outcomes::PassStart),
     /// B6: a full run of a per-key asset asked for by hand raises its input's rebuild counter.
     Rebuild(outcomes::Rebuild),
+    /// B7: an edge's conditions now.
+    Watch(stale::SetWatch),
+    /// B7: what a refresh or a notice found for an edge.
+    Witness(stale::Witness),
 }
 
 impl Part {
@@ -123,6 +128,8 @@ impl Part {
             }
             Part::PassStart(p) => vec![on("outcomes", &p.edge)],
             Part::Rebuild(p) => vec![on("outcomes", &p.edge)],
+            Part::Watch(p) => vec![on("edge", &p.edge)],
+            Part::Witness(p) => vec![on("witness", &p.edge)],
         }
     }
 
@@ -139,6 +146,8 @@ impl Part {
             Part::Outcomes(_) => outcomes::TAG_OUTCOMES,
             Part::PassStart(_) => outcomes::TAG_PASS_START,
             Part::Rebuild(_) => outcomes::TAG_REBUILD,
+            Part::Watch(_) => stale::TAG_WATCH,
+            Part::Witness(_) => stale::TAG_WITNESS,
         }
     }
 
@@ -155,6 +164,8 @@ impl Part {
             Part::Outcomes(p) => p.encode(e),
             Part::PassStart(p) => p.encode(e),
             Part::Rebuild(p) => p.encode(e),
+            Part::Watch(p) => p.encode(e),
+            Part::Witness(p) => p.encode(e),
         }
     }
 
@@ -171,6 +182,8 @@ impl Part {
             outcomes::TAG_OUTCOMES => Part::Outcomes(outcomes::Outcomes::decode(d)?),
             outcomes::TAG_PASS_START => Part::PassStart(outcomes::PassStart::decode(d)?),
             outcomes::TAG_REBUILD => Part::Rebuild(outcomes::Rebuild::decode(d)?),
+            stale::TAG_WATCH => Part::Watch(stale::SetWatch::decode(d)?),
+            stale::TAG_WITNESS => Part::Witness(stale::Witness::decode(d)?),
             t => return format(format!("unknown part tag {t:#04x}")),
         })
     }

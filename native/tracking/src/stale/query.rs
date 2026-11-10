@@ -1,0 +1,286 @@
+//! Questions about staleness: an edge's status, the owed count (computed on
+//! request and cached until the upstream or the progress moves), the page of
+//! owed keys, completeness (D177), and staleness down the graph.
+
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, Mutex};
+
+use solera_index::Query;
+
+use crate::codec::Ver;
+use crate::error::Result;
+use crate::plan::{owed_count_each, owed_keys_due, Cand, Indexes};
+use crate::progress::{Conditions, Holding, Key, Progress, Value};
+use crate::stale::refresh::reason_of;
+use crate::stale::{Ask, Due, Reason, State};
+use crate::state::{Id, Tracking};
+
+/// What an edge's staleness is now.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Status {
+    /// No conditions were journaled for the edge yet.
+    Unwatched,
+    /// Its upstream is in the middle of a full run and the gate holds it (rule 8).
+    Held,
+    /// What is known no longer holds: refresh it.
+    Unknown,
+    Fresh,
+    /// Something is due. `key` is the witness (None on an unkeyed edge).
+    Stale {
+        key: Option<Key>,
+        reason: Reason,
+        since_ms: u64,
+    },
+}
+
+impl Tracking {
+    /// Rule 7: what is known, if it holds now (the edge's progress and
+    /// conditions have not moved, and nothing was committed upstream since).
+    pub fn stale_status(&self, edge: &[u8]) -> Result<Status> {
+        let Some(e) = self.edges.get(edge) else {
+            return crate::error::invalid(format!("no edge {}", String::from_utf8_lossy(edge)));
+        };
+        let head = self.outputs.get(&e.input).map_or(0, |o| o.head);
+        if let Progress::Unkeyed(through) = *e.progress {
+            return Ok(if head > through {
+                Status::Stale {
+                    key: None,
+                    reason: Reason::InputChanged,
+                    since_ms: 0,
+                }
+            } else {
+                Status::Fresh
+            });
+        }
+        let i = &self.stale.inputs[edge];
+        if i.watch.is_none() {
+            return Ok(Status::Unwatched);
+        }
+        if self.held(i, &e.input) {
+            return Ok(Status::Held);
+        }
+        Ok(match i.current().filter(|k| k.x == head) {
+            None => Status::Unknown,
+            Some(k) => match &k.state {
+                State::Fresh => Status::Fresh,
+                State::Stale {
+                    key,
+                    reason,
+                    since_ms,
+                } => Status::Stale {
+                    key: Some(key.clone()),
+                    reason: *reason,
+                    since_ms: *since_ms,
+                },
+            },
+        })
+    }
+}
+
+/// The reason of every owed key without a point that a piece holds under
+/// `h`, if it does not depend on the key: conditions changed, or the same
+/// conditions (the input changed). Keeps `reason_of`'s pattern match per key
+/// out of a count.
+fn piece_reason(h: &Conditions, now: &Conditions) -> Option<Reason> {
+    if !h.same_processing(now) {
+        Some(Reason::ConditionsChanged)
+    } else if h.patterns == now.patterns {
+        Some(Reason::InputChanged)
+    } else {
+        None
+    }
+}
+
+/// What an edge owes, by class (added, updated, removed, and unchanged,
+/// always 0 here): the keys due now, which the page of owed keys lists, and
+/// the keys owed but not due (failing keys waiting for their retry, keys
+/// held back); and every reason that holds for a due key (STA-2), in
+/// `Reason` order, "retry due" while a retry pass has a key to retry.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Owed {
+    pub due: [u64; 4],
+    pub waiting: [u64; 4],
+    pub reasons: Vec<Reason>,
+}
+
+/// What an edge owes, computed on request by one walk of the planner and
+/// kept until the edge's generation (its progress, its conditions, a retry)
+/// or its upstream's head moves. While the gate holds the edge there is no
+/// number (D197): None.
+#[derive(Default)]
+pub struct Counts(Mutex<HashMap<Id, Counted>>);
+
+/// What is owed, with the edge's generation, the head, the revision of the
+/// keys not due and the head of its failure records it holds for.
+type Counted = ([u64; 4], Owed);
+
+impl Counts {
+    pub async fn get(&self, ask: &Ask, ixs: &dyn Indexes, due: &dyn Due) -> Result<Option<Owed>> {
+        if ask.held {
+            return Ok(None);
+        }
+        let at = [
+            ask.input.gen,
+            ask.head,
+            due.revision(&ask.edge),
+            ask.failures_head,
+        ];
+        if let Some((a, o)) = self.0.lock().unwrap().get(&ask.edge) {
+            if *a == at {
+                return Ok(Some(o.clone()));
+            }
+        }
+        let (keyed, now) = (ask.keyed(), &ask.req.conditions);
+        let all = [
+            Reason::InputChanged,
+            Reason::ConditionsChanged,
+            Reason::NeverProcessed,
+            Reason::RetryDue,
+        ];
+        let mut seen = [false; 4];
+        let mut piece: (usize, Option<Reason>) = (0, None);
+        let hold = ask.hold(due);
+        let each = &mut |key: &[u8], held: &Holding, _: &Ver| {
+            if seen == [true; 4] {
+                return;
+            }
+            if let (Holding::Version(_, h), None) = (held, keyed.point(key)) {
+                if piece.0 != Arc::as_ptr(h) as usize {
+                    piece = (Arc::as_ptr(h) as usize, piece_reason(h, now));
+                }
+                if let Some(r) = piece.1 {
+                    seen[r as usize - 1] = true;
+                    return;
+                }
+            }
+            seen[reason_of(keyed, now, key, held) as usize - 1] = true;
+        };
+        let (due_now, waiting) = owed_count_each(&ask.view, &ask.req, ixs, &hold, each).await?;
+        if ask.next_retry(ixs).await?.is_some() {
+            seen[Reason::RetryDue as usize - 1] = true;
+        }
+        let reasons = all.into_iter().filter(|r| seen[*r as usize - 1]).collect();
+        let o = Owed {
+            due: due_now,
+            waiting,
+            reasons,
+        };
+        self.0
+            .lock()
+            .unwrap()
+            .insert(ask.edge.clone(), (at, o.clone()));
+        Ok(Some(o))
+    }
+
+    /// Drops what is kept for edges that are gone.
+    pub fn retain(&self, t: &Tracking) {
+        self.0
+            .lock()
+            .unwrap()
+            .retain(|e, _| t.stale.inputs.contains_key(e));
+    }
+}
+
+impl Ask {
+    /// The owed keys after `after`, at most `limit`, and where the next page starts.
+    pub async fn keys(
+        &self,
+        ixs: &dyn Indexes,
+        due: &dyn Due,
+        after: Option<&Key>,
+        limit: usize,
+    ) -> Result<(Vec<Cand>, Option<Key>)> {
+        owed_keys_due(&self.view, &self.req, ixs, &self.hold(due), after, limit).await
+    }
+
+    /// D177: every upstream key the patterns take has been processed since
+    /// progress last started over: no `empty` piece holds one that no point covers.
+    pub async fn complete(&self, ixs: &dyn Indexes) -> Result<bool> {
+        if self.head == 0 {
+            return Ok(true);
+        }
+        let ix = ixs.index(&self.output)?;
+        let keyed = self.keyed();
+        let now = &self.req.conditions;
+        for piece in keyed.pieces(&Default::default()) {
+            if piece.value != Value::Empty {
+                continue;
+            }
+            let mut q = Query {
+                lo: piece.range.lo.as_deref().map(<[u8]>::to_vec),
+                hi: piece.range.hi.as_deref().map(<[u8]>::to_vec),
+                pattern: now.patterns.index_pattern(),
+                ..Default::default()
+            };
+            let mut limit = 16;
+            loop {
+                q.limit = Some(limit);
+                let page = ix.scan(&self.layers, self.head, &q).await?;
+                for i in 0..page.run.len() {
+                    let k = page.run.key(i);
+                    if now.patterns.takes(k) && keyed.point(k).is_none() {
+                        return Ok(false);
+                    }
+                }
+                match page.next {
+                    Some(n) => q.after = Some(n),
+                    None => break,
+                }
+                limit = (limit * 4).min(1 << 20);
+            }
+        }
+        Ok(true)
+    }
+}
+
+/// One consumer partition: the edges it reads, the outputs it writes.
+pub struct Partition {
+    pub inputs: Vec<Id>,
+    pub outputs: Vec<Id>,
+}
+
+/// Per partition: stale (any input stale; None if some input's status is
+/// unknown and none is stale) and upstream stale (some partition it reads
+/// from, directly or further up, is stale).
+pub fn graph(t: &Tracking, parts: &[Partition]) -> Result<Vec<(Option<bool>, bool)>> {
+    let mut stale = Vec::with_capacity(parts.len());
+    for p in parts {
+        let mut s = Some(false);
+        for e in &p.inputs {
+            match t.stale_status(e)? {
+                Status::Stale { .. } => {
+                    s = Some(true);
+                    break;
+                }
+                Status::Unknown | Status::Unwatched => s = None,
+                Status::Fresh | Status::Held => {}
+            }
+        }
+        stale.push(s);
+    }
+    let mut readers: HashMap<&[u8], Vec<usize>> = HashMap::new();
+    for (j, p) in parts.iter().enumerate() {
+        for e in &p.inputs {
+            if let Some(edge) = t.edges.get(e) {
+                readers.entry(&edge.input).or_default().push(j);
+            }
+        }
+    }
+    let mut up = vec![false; parts.len()];
+    let mut queue: VecDeque<usize> = (0..parts.len())
+        .filter(|&j| stale[j] == Some(true))
+        .collect();
+    let mut seen = vec![false; parts.len()];
+    while let Some(j) = queue.pop_front() {
+        if std::mem::replace(&mut seen[j], true) {
+            continue;
+        }
+        for o in &parts[j].outputs {
+            for &r in readers.get(o.as_ref()).map_or(&[][..], |v| v) {
+                up[r] = true;
+                queue.push_back(r);
+            }
+        }
+    }
+    Ok(stale.into_iter().zip(up).collect())
+}
