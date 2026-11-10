@@ -730,6 +730,16 @@ class Solera:
         except (FileNotFoundError, NotFoundError, StoreError):
             return None
 
+    async def loaded(self, output: str, keys: dict | None = None):
+        """What an output's store says it read (`Read`: the value, and the
+        versions it read) at its head: a keyed one at `keys`, keys and
+        versions as `keys()` gives them, or whole without them, every row
+        its store holds whatever the keys list."""
+
+        head = await self.head(output)
+        ref, store = Ref.from_json(head["ref"]), self.project.stores[head["ref"]["store"]]
+        return await store.read(ref, list[dict], None if keys is None else Keys(keys))
+
     async def alarmed(self, *words: str) -> bool:
         """Whether the alarms the engine raises (`alarms()`) name every one of
         `words`."""

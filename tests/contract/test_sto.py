@@ -3,11 +3,12 @@
 import asyncio
 import os
 import uuid
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
 from solera.sdk import Incremental, Output, Project, RegistrationError, Retry, asset
-from solera.stores import FileStore, Patch, StoreError, WriteContext
+from solera.stores import Changed, FileStore, Patch, StoreError, WriteContext
 from solera.testing.stores import Ledger, context, now, write
 from solera.testing.stores import rows as stored_rows
 
@@ -225,13 +226,16 @@ class Faults:
     gone (a request still queued at the database); `outcomes` says how it
     landed. `before_load`, a coroutine function: awaited once, as the next
     load begins. `calls` lists what the engine and its workers asked of it,
-    `versions` the version of each write that landed."""
+    `versions` the version of each write that landed, `said` what each
+    said it changed (`Written.changed`, its keys pulled: `(wrote, removed,
+    whole)`, None for no answer), `seen` what each load said it read
+    (`Read`)."""
 
     def __init__(self, *args, **kw):
         super().__init__(*args, **kw)
         self.before_load = self.late = self.after_write = self.landing = None
         self.landed, self.sent = asyncio.Event(), asyncio.Event()
-        self.calls, self.outcomes, self.versions = [], [], []
+        self.calls, self.outcomes, self.versions, self.said, self.seen = [], [], [], [], []
 
     def hang_after_write(self) -> None:
         self.landed.clear()
@@ -256,6 +260,11 @@ class Faults:
             await asyncio.Event().wait()  # its worker dies here
         written = await base(write, prior, context)
         self.versions.append(context.generation)
+        self.said.append(None)
+        if (changed := written.changed) is not None:  # pulled once: handed on as pulled
+            wrote, removed = [k for c in changed.wrote for k in c], [k for c in changed.removed for k in c]
+            self.said[-1] = (wrote, removed, changed.whole)
+            written = replace(written, changed=Changed([wrote], [removed], changed.whole))
         self.landed.set()
         if self.after_write is not None:
             hook, self.after_write = self.after_write, None
@@ -265,7 +274,8 @@ class Faults:
     async def load(self, *args, **kw):
         self.calls.append("load")
         await self.loading()
-        return await super().load(*args, **kw)
+        self.seen.append(await super().read(*args, **kw))
+        return self.seen[-1].value
 
     async def loading(self) -> None:
         if self.before_load is not None:
@@ -311,6 +321,15 @@ def table():
         conn.execute(f'DROP SCHEMA IF EXISTS "{store.schema}" CASCADE')
 
 
+@pytest.fixture(params=["files", pytest.param("table", marks=pytest.mark.postgres)])
+def shipped(request, solera):
+    """A shipped store a test makes misbehave: `Files`, or `table`'s."""
+
+    if request.param == "files":
+        return Files(solera.root / "files")
+    return request.getfixturevalue("table")
+
+
 def on(store, **columns) -> dict:
     """What an output on `store` declares, `Output(…, **on(store))`: a table's
     schema and columns, `id` and `v` unless `columns` says."""
@@ -320,16 +339,14 @@ def on(store, **columns) -> dict:
     return {"store": "s", "schema": store.schema, "columns": columns or COLUMNS}
 
 
-def in_table(store, table: str = "items") -> dict[str, list]:
-    """Each key's values as the table holds them, read in the database
-    itself: what anyone reading the table sees, whatever the log lists."""
-
-    import psycopg
+def in_table(read) -> dict[str, list]:
+    """Each key's values in what a read returned (`Read`): of a table read
+    whole, every row it holds, what anyone reading the table sees, whatever
+    the log lists."""
 
     out = {}
-    with psycopg.connect(DSN) as conn:
-        for key, v in conn.execute(f'SELECT id, v FROM "{store.schema}"."{table}"').fetchall():
-            out.setdefault(key, []).append(v)
+    for row in read.value:
+        out.setdefault(str(row["id"]), []).append(row["v"])
     return {k: sorted(v) for k, v in out.items()}
 
 
@@ -442,7 +459,7 @@ async def test_sto_1_a_store_declares_no_kind(solera):
     assert await solera.rows("items") == {"a": "1", "b": "1"}
 
 
-@pytest.mark.parametrize("method", ["store", "load", "cleanup"])
+@pytest.mark.parametrize("method", ["store", "load", "read", "cleanup"])
 async def test_sto_1_registration_refuses_a_store_missing_a_method(solera, method):
     """A store that says how it writes, as today's registration asks, and
     lacks one method of the contract: refused at registration."""
@@ -457,16 +474,62 @@ async def test_sto_1_registration_refuses_a_store_missing_a_method(solera, metho
         )
 
 
+async def test_sto_1_a_write_says_the_keys_it_wrote_and_removed(solera, shipped):
+    """`items` writes a and b; then b and c in their place; then a patch: d,
+    and b removed. Each write says the keys it wrote, and each is at its
+    writer's version; a replacement says it was the whole content, or
+    names what it left out; the patch, the key it removed."""
+
+    writes = [rows("a=1", "b=1"), rows("b=2", "c=2"), Patch(rows("d=3"), remove=["b"])]
+    await solera.deploy(items_on(shipped, writes))
+    for _ in range(3):
+        await solera.run("items")
+    assert None not in shipped.said, f"every keyed write says what it changed: {shipped.said}"
+    (wrote, removed, whole), (rewrote, dropped, replaced), patch = shipped.said
+    assert wrote == ["a", "b"] and (whole or removed == [])
+    assert rewrote == ["b", "c"] and (replaced or dropped == ["a"])
+    assert patch == (["d"], ["b"], False)
+    assert await solera.keys("items") == {"c": shipped.versions[1], "d": shipped.versions[2]}
+
+
+async def test_sto_1_a_load_says_the_keys_and_versions_it_loaded(solera, shipped):
+    """A load of `items` at its keys says each key at the version it read:
+    the version its log lists."""
+
+    await solera.deploy(items_on(shipped, [rows("a=1", "b=1"), Patch(rows("b=2"))]))
+    await solera.run("items")
+    await solera.run("items")
+    live = await solera.keys("items")
+    read = await solera.loaded("items", live)
+    assert read.versions == live == {"a": shipped.versions[0], "b": shipped.versions[1]}
+    assert sorted(read.value, key=lambda r: r["id"]) == rows("a=1", "b=2")
+
+
+@pytest.mark.postgres
+async def test_sto_1_a_load_says_a_planned_key_it_did_not_find_is_absent(solera, table):
+    """A table holds its rows as they are now: a load planned at a and b,
+    after a later write removed b, says it read a and found no b."""
+
+    await solera.deploy(items_on(table, [rows("a=1", "b=1"), Patch([], remove=["b"])]))
+    await solera.run("items")
+    planned = await solera.keys("items")
+    await solera.run("items")
+    read = await solera.loaded("items", planned)
+    assert read.versions == {"a": planned["a"], "b": None}
+    assert read.value == rows("a=1")
+
+
 # -- STO-2 ------------------------------------------------------------------------
 
 
 async def test_sto_2_a_store_that_names_objects_by_version_loads_exactly_the_planned_ones(solera):
     """g5 writes {a:1}, and `copy` plans it; g9 writes {a:2} before `copy`
-    loads: `copy` still loads a:1."""
+    loads: `copy` still loads a:1, and its load says it read a at g5."""
 
     files, received = Files(solera.root / "files"), []
     await solera.deploy(items_on(files, [rows("a=1"), rows("a=2")], received))
     await solera.run("items")
+    planned = await solera.keys("items")
 
     async def meanwhile():  # once copy planned a at g5, before it loads
         await solera.run("items")
@@ -474,6 +537,7 @@ async def test_sto_2_a_store_that_names_objects_by_version_loads_exactly_the_pla
     files.before_load = meanwhile
     await solera.run("copy")
     assert received == [((["a"], [], []), {"a": "1"})]
+    assert [read.versions for read in files.seen] == [planned]
     assert await solera.rows("items") == {"a": "2"}
 
 
@@ -512,7 +576,8 @@ async def test_sto_3_a_key_loaded_at_another_version_is_processed_as_loaded_and_
 
 @pytest.mark.postgres
 async def test_sto_4_a_stale_writer_changes_nothing(table):
-    """g5 writes; g9 writes; g5 writes again: refused, whole."""
+    """g5 writes; g9 writes; g5 writes again: refused, whole. The table holds
+    g9's rows, at g9."""
 
     output = Output("items", key="id", **on(table))
 
@@ -525,7 +590,8 @@ async def test_sto_4_a_stale_writer_changes_nothing(table):
     second = await table.store(rows("a=2", "b=2"), first.ref, by(9))
     with pytest.raises(StoreError):
         await table.store(Patch(rows("a=3", "c=3")), second.ref, by(5))
-    assert in_table(table) == {"a": ["2"], "b": ["2"]}
+    read = await table.read(second.ref, list[dict], None)
+    assert in_table(read) == {"a": ["2"], "b": ["2"]} and read.versions == {"a": 9, "b": 9}
 
 
 @pytest.mark.postgres
@@ -545,7 +611,7 @@ async def test_sto_4_nothing_is_acquired_before_reads(solera, table):
     await solera.run("items")
     await solera.run("copy")
     assert table.calls == ["store"]
-    assert in_table(table, "copy") == {"a": ["1"]}
+    assert in_table(await solera.loaded("copy")) == {"a": ["1"]}
 
 
 # -- STO-5 ------------------------------------------------------------------------
@@ -555,7 +621,7 @@ async def test_sto_4_nothing_is_acquired_before_reads(solera, table):
 async def test_sto_5_a_table_never_holds_a_row_its_log_does_not_have(solera, table):
     """`items` holds a and b. An attempt writes c and a → 2, and dies before
     its commit; its retry writes a → 2. At rest the table holds exactly the
-    keys `items` lists, as its log has them: no c."""
+    keys `items` lists, at the versions its log records: no c."""
 
     writes = [rows("a=1", "b=1"), Patch(rows("c=1", "a=2")), Patch(rows("a=2"))]
     await served(solera, items_on(table, writes, retries=Retry(1, delay=0)))
@@ -565,4 +631,6 @@ async def test_sto_5_a_table_never_holds_a_row_its_log_does_not_have(solera, tab
     await killed_after_writing(solera, table)
     assert (await solera.wait(run))["request"]["status"] == "succeeded"
     assert await solera.rows("items") == {"a": "2", "b": "1"}
-    assert in_table(table) == {"a": ["2"], "b": ["1"]}
+    read = await solera.loaded("items")
+    assert in_table(read) == {"a": ["2"], "b": ["1"]}
+    assert read.versions == await solera.keys("items")

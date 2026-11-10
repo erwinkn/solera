@@ -351,7 +351,7 @@ async def test_cln_3_a_deleted_runs_late_write_to_a_table_changes_nothing(solera
     await table.landing
     [refused] = table.outcomes
     assert isinstance(refused, Exception), refused
-    assert in_table(table) == {"a": ["3"]} and await solera.rows("items") == {"a": "3"}
+    assert in_table(await solera.loaded("items")) == {"a": ["3"]} and await solera.rows("items") == {"a": "3"}
     await gone_for_good(solera, deleted)
 
 
@@ -450,9 +450,9 @@ async def test_cln_5_what_an_abandoned_attempt_wrote_to_a_table_goes_with_the_ne
     solera.advance(2)  # past the asset's timeout and the cancel grace
     await solera.start()
     await cleanup_pass(solera)
-    assert in_table(table) == {"a": ["2"], "b": ["1"], "c": ["1"]}
+    assert in_table(await solera.loaded("items")) == {"a": ["2"], "b": ["1"], "c": ["1"]}
     await solera.run("items")
-    assert in_table(table) == {"a": ["3"], "b": ["1"]}
+    assert in_table(await solera.loaded("items")) == {"a": ["3"], "b": ["1"]}
     assert await solera.rows("items") == {"a": "3", "b": "1"}
 
 

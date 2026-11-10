@@ -1109,12 +1109,12 @@ No store kinds. A write returns the keys it wrote and removed; a load
 returns the keys and versions it actually loaded, absent included. A store
 that writes in place keeps one version check per partition inside each
 write transaction (STO-4). Registration refuses a store missing a method.
-*From* D184, D196. *Today* a store is immutable or fenced, and registration refuses another kind (`sdk/test_store_conformance.py::test_shipped_stores_conform`). *Covered* `contract/test_sto.py::test_sto_1_a_store_declares_no_kind`; `contract/test_sto.py::test_sto_1_registration_refuses_a_store_missing_a_method`. What a write returns (the keys it wrote and removed) and what a load returns (the keys and versions it loaded) have no public name yet, so they are tested once the core names them.
+*From* D184, D196. *Today* a store is immutable or fenced, and registration refuses another kind (`sdk/test_store_conformance.py::test_shipped_stores_conform`). *Covered* `contract/test_sto.py::test_sto_1_a_store_declares_no_kind`; `contract/test_sto.py::test_sto_1_registration_refuses_a_store_missing_a_method`; `contract/test_sto.py::test_sto_1_a_write_says_the_keys_it_wrote_and_removed`; `contract/test_sto.py::test_sto_1_a_load_says_the_keys_and_versions_it_loaded`; `contract/test_sto.py::test_sto_1_a_load_says_a_planned_key_it_did_not_find_is_absent`; `sdk/test_store_conformance.py::test_shipped_stores_conform`.
 
 **STO-2. A load says the versions it read; a store that names objects by version loads exactly the planned ones.**
 g5 writes {a:1}, a reader plans it; g9 writes {a:2}: the reader still
 loads a:1, and says it loaded g5.
-*From* D184; `stores.md`. *Covered* `contract/test_sto.py::test_sto_2_a_store_that_names_objects_by_version_loads_exactly_the_planned_ones`; sim `committed_keys_are_readable`. The versions a load says it read have no public name yet, so they are tested once the core names them.
+*From* D184; `stores.md`. *Covered* `contract/test_sto.py::test_sto_2_a_store_that_names_objects_by_version_loads_exactly_the_planned_ones`; `sdk/test_store_conformance.py::test_shipped_stores_conform`; sim `committed_keys_are_readable`.
 
 **STO-3. A key loaded at another version than planned is processed as loaded; nothing replans.**
 `items` is on Postgres; `tally`'s batch plans k1@4 and k2@2, and `items`

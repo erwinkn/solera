@@ -756,7 +756,7 @@ async def test_eng_7_a_late_write_to_a_table_is_refused_by_its_version_check(sol
     await table.landing
     [refused] = table.outcomes
     assert isinstance(refused, Exception), refused
-    assert in_table(table) == {"a": ["3"]}
+    assert in_table(await solera.loaded("items")) == {"a": ["3"]}
     assert await solera.rows("items") == {"a": "3"}
 
 
@@ -795,9 +795,9 @@ async def test_eng_8_a_dead_writers_rows_are_repaired_by_the_next_attempt_and_no
     ] == []  # no repair clock
     await solera.run("copy", timeout=5)  # its reader does not wait
     assert await solera.rows("copy") == {"a": "1", "b": "1"}
-    assert in_table(table) == {"a": ["1"], "b": ["1"], "c": ["1"]}
+    assert in_table(await solera.loaded("items")) == {"a": ["1"], "b": ["1"], "c": ["1"]}
     await solera.run("items")
-    assert in_table(table) == {"a": ["1"], "b": ["1"]}
+    assert in_table(await solera.loaded("items")) == {"a": ["1"], "b": ["1"]}
     assert await solera.rows("items") == {"a": "1", "b": "1"}
 
 
