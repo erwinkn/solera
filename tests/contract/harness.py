@@ -591,18 +591,38 @@ class Solera:
 
     async def cli(self, *argv: str):
         """The `solera` CLI on this namespace, as an operator runs it: its exit
-        code, stdout and stderr."""
+        code, stdout and stderr. Its entry point runs in this process, in a
+        thread of its own: a `solera` process can crash as it exits, after
+        its work is done (a SIGSEGV in about 1 in 30 runs of `solera migrate`)."""
 
-        import os
-        import subprocess
+        import contextlib
+        import io
         import sys
+        import traceback
 
-        command = [sys.executable, "-c", "from solera_server.cli import main; main()"]
-        command += ["--state-url", (self.root / "state").as_uri(), "--namespace", "contract", *argv]
-        done = await asyncio.to_thread(
-            subprocess.run, command, env={**os.environ}, capture_output=True, text=True, timeout=120
-        )
-        return done.returncode, done.stdout, done.stderr
+        from solera_server.cli import main
+
+        command = ["solera", "--state-url", (self.root / "state").as_uri(), "--namespace", "contract", *argv]
+
+        def run():
+            out, err, code, argv_ = io.StringIO(), io.StringIO(), 0, sys.argv
+            sys.argv = command
+            try:
+                with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                    try:
+                        main()
+                    except SystemExit as exit:
+                        if isinstance(exit.code, str):
+                            print(exit.code, file=sys.stderr)
+                        code = exit.code if isinstance(exit.code, int) else int(exit.code is not None)
+                    except Exception:
+                        traceback.print_exc()
+                        code = 1
+            finally:
+                sys.argv = argv_
+            return code, out.getvalue(), err.getvalue()
+
+        return await asyncio.to_thread(run)
 
     def refuse_upkeep(self, output: str, refused: bool = True) -> None:
         """The namespace's object store refuses (or takes again) the writes
