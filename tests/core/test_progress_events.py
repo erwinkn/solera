@@ -144,3 +144,24 @@ def test_a_commit_held_mid_full_run_is_refused_once_the_full_run_has_ended(tmp_p
     t.apply(Tracking.event_full_run_done(b"items"))
     with pytest.raises(ValueError, match="full run moved"):
         t.apply(event)
+
+
+def test_a_key_held_back_on_one_input_is_held_back_on_every_input(tmp_path):
+    """k's output is one value computed from both inputs: a load of k that a
+    full run of a makes unsafe holds k back on b too, so neither commits it."""
+    ix = ChangeIndex(f"file://{tmp_path}")
+    t = Tracking()
+    logs = {}
+    for out in (b"a", b"b"):
+        t.attach(out, ix)
+        logs[out] = [ix.write_commit(f"{out.decode()}/1", 1, [("k", 1, None), ("m", 1, None)], live_before=0)]
+        t._set_output(out, logs[out], 1, 2)
+        t.apply(Tracking.event_edge_open(b"r/" + out, out, True))
+    inputs = [{"edge": b"r/a", "conditions": {}}, {"edge": b"r/b", "conditions": {}}]
+    plan = t.plan({"inputs": inputs, "limit": 10})["plan"]
+    logs[b"a"].append(ix.write_commit("a/2", 2, [("k", 2, None)], live_before=2, clear=True))
+    t._set_output(b"a", logs[b"a"], 2, 1, 2)
+    event, _, held_back = t.progress_ops(plan, [([], [("k", 2)]), ([], [])])
+    assert held_back == [["k"], ["k"]]
+    t.apply(event)
+    assert t.owed(b"r/b", {}) == ([("k", "added")], None)
