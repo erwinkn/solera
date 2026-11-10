@@ -38,6 +38,7 @@ jobs:
           enable-cache: true
       - run: cargo fmt --check --manifest-path native/Cargo.toml
       - run: cargo check --manifest-path native/Cargo.toml
+      - run: cargo test --release -p solera-tracking --manifest-path native/Cargo.toml
       - run: uv sync --locked
       - run: uv run ruff check
       - run: uv run ruff format --check

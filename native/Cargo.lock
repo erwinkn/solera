@@ -1779,9 +1779,17 @@ dependencies = [
  "pyo3",
  "rayon",
  "solera-index",
+ "solera-tracking",
  "tokio",
  "xxhash-rust",
  "zstd",
+]
+
+[[package]]
+name = "solera-tracking"
+version = "0.0.1"
+dependencies = [
+ "solera-index",
 ]
 
 [[package]]
