@@ -328,12 +328,12 @@ class Counts:
             self.stats["adjusted"] += 1
             val = p[2]
             if val[0] == "at" and (not w.on("since") or w.up.since(k, c - 1) <= val[1]):
-                held = (rep, val[2]) if rep is not ABSENT and val[2].takes(k) else ABSENT
+                held = (rep, val[2].seen()) if rep is not ABSENT and val[2].takes(k) else ABSENT
             else:
                 self.stats["lookups"] += val[0] == "at"
                 held = w.prog.held_by(val, k)
-            before = (rep, w.cond) if rep is not ABSENT and w.cond.takes(k) else ABSENT
-            after = (new, w.cond) if new is not ABSENT and w.cond.takes(k) else ABSENT
+            before = (rep, w.cond.seen()) if rep is not ABSENT and w.cond.takes(k) else ABSENT
+            after = (new, w.cond.seen()) if new is not ABSENT and w.cond.takes(k) else ABSENT
             delta = int(held != after) - int(held != before)
             self.n[(p[0], p[1])] += delta
             self.applied.append((c, k, delta))

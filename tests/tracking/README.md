@@ -43,8 +43,15 @@ oracle.next_plan(w, "copy")   # (["k2"], "\uffff"): the next batch takes k2 and 
 
 `replay_staleness` and `replay_fullrun` raise `oracle.Broken` if a
 history breaks an invariant, so an answer always comes from a consistent
-state. An observation is `(version, Cond)`, `"held"`, or absent; a range
-bound is a key, `""` for -inf or `"\uffff"` for +inf.
+state. An observation is `(version, Cond)`, `"held"`, or absent; its `Cond`
+has `pat=None`, since patterns only decide which keys are taken (a pattern
+change owes only the keys that change membership). A range bound is a key,
+`""` for -inf or `"\uffff"` for +inf.
+
+The brute force ranges over a small fixed key space, so a history may name
+only its keys, or the replay raises `ValueError`: `staleness.KEYS` (k1 to k5
+and x1; `("pat", i)` picks `staleness.PATTERNS[i]`) and `fullrun.KEYS` (k1 to
+k5; k2 and k4 are even for tally).
 
 ## Events
 

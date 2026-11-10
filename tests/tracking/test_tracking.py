@@ -10,7 +10,7 @@ import random
 import pytest
 
 from . import fullrun, oracle, staleness
-from .core import NEG, POS
+from .core import ABSENT, NEG, POS, Log, within
 from .histories import CALIBRATIONS, REPORT_IN_FLIGHT
 
 HISTORIES = int(os.environ.get("SOLERA_TRACKING_HISTORIES", "200"))
@@ -142,3 +142,93 @@ def test_archive_sees_a_full_run_of_copy_the_way_the_amendment_tells_it():
         assert sorted(w.copy.output.rows) == ["k1", "k2", "k4", "k5"]
         assert w.copy.complete() and w.copy.floor is None
         assert oracle.next_plan(w, "archive", 9)[0] == ["k1", "k2", "k3", "k4", "k5"]
+
+
+def test_the_log_answers_from_entries_what_its_states_say():
+    """get, scan and diff, computed from entries, equal the true states at every
+    pair of commits and over ranges, across clears and reverts."""
+    keys = ("k1", "k2", "k3", "k4")
+    ranges = [(NEG, POS), (NEG, "k2"), ("k1", "k3"), ("k3", POS)]
+    for seed in range(150):
+        rnd = random.Random(seed)
+        log = Log()
+        for _ in range(16):
+            changes = {k: rnd.choice((ABSENT, 1, 2, 3)) for k in rnd.sample(keys, rnd.randint(1, 3))}
+            log.commit(changes, clear=rnd.random() < 0.15)
+        for c in range(log.head + 1):
+            now = log.states[c]
+            assert {k: log.get(c, k) for k in keys} == {k: now.get(k) for k in keys}, (seed, c)
+            for lo, hi in ranges:
+                assert log.scan(c, lo, hi) == {k: v for k, v in now.items() if within(k, lo, hi)}, (seed, c)
+                for c1 in range(c + 1):
+                    then = log.states[c1]
+                    want = {
+                        k: (then.get(k), now.get(k))
+                        for k in set(then) | set(now)
+                        if within(k, lo, hi) and then.get(k) != now.get(k)
+                    }
+                    assert log.diff(c1, c, lo, hi) == want, (seed, c1, c, lo, hi)
+
+
+def test_a_pattern_change_owes_only_the_keys_that_change_membership():
+    w = oracle.replay_staleness(
+        [("up", (("k2", 1), ("k3", 1), ("x1", 1)), False), ("plan", 6), ("commit", (), ()), ("pat", 2)]
+    )
+    assert oracle.due(w) == ["k3"]
+
+
+def test_a_feed_removal_does_not_excuse_churn():
+    events = list(CALIBRATIONS[("fullrun", "clear", "table", "hold_back")])
+    events.insert(-1, ("feed", (("k3", False), ("k4", False))))
+    assert fullrun.run(events, "clear", "table") is None
+    assert fullrun.run(events, "clear", "table", frozenset({"hold_back"})) is not None
+
+
+def test_the_floor_forms_log_removes_no_key_it_adds_back(monkeypatch):
+    events = [
+        ("items", (("k1", True), ("k2", True))),
+        ("step", "copy", 2),
+        ("full", "copy"),
+        ("step", "copy", 1),
+        ("step", "copy", 1),
+    ]
+    assert fullrun.run(events, "floor", "file") is None
+    write, begun = fullrun.Output.write, set()
+
+    def clearing(self, version, writes, clear, rebuild):
+        clear = clear or (rebuild is not None and rebuild not in begun)
+        begun.add(rebuild)
+        write(self, version, writes, clear, rebuild)
+
+    monkeypatch.setattr(fullrun.Output, "write", clearing)
+    r = fullrun.run(events, "floor", "file")
+    assert r is not None and "adds it back" in r[1]
+
+
+def test_an_ungated_reader_never_loads_a_half_built_row(monkeypatch):
+    events = [
+        ("items", (("k1", True), ("k3", True))),
+        ("feed", (("k1", True),)),
+        ("step", "copy", 2),
+        ("step", "archive", 2),
+        ("define", "copy"),
+        ("step", "copy", 1),
+        ("step", "archive", 2),
+    ]
+    assert fullrun.run(events, "floor", "file") is None
+    produce = fullrun.Ordinary.produce
+
+    def without_feed(self, s, before):
+        out = produce(self, s, before)
+        return {k: v if v is ABSENT or self.accumulates else (v[0], ABSENT, v[2]) for k, v in out.items()}
+
+    monkeypatch.setattr(fullrun.Ordinary, "produce", without_feed)
+    r = fullrun.run(events, "floor", "file")
+    assert r is not None and "half-built" in r[1]
+
+
+def test_the_oracle_refuses_keys_outside_the_models_key_space():
+    with pytest.raises(ValueError, match="key space"):
+        oracle.replay_staleness([("up", (("order-123", 1),), False)])
+    with pytest.raises(ValueError, match="key space"):
+        oracle.replay_fullrun([("keys", "copy", ("k9",))])

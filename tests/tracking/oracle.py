@@ -20,8 +20,26 @@ class Broken(AssertionError):
     """The history breaks an invariant of the model: the model has no answer."""
 
 
+def _check_keys(events: list[tuple], keys: tuple[str, ...], named: set[str]) -> None:
+    """The model's brute force ranges over a fixed key space: refuse other keys."""
+    found: set[str] = set()
+
+    def walk(x: object) -> None:
+        if isinstance(x, str):
+            found.add(x)
+        elif isinstance(x, tuple):
+            for y in x:
+                walk(y)
+
+    for ev in events:
+        walk(ev[2:] if ev[0] in named else ev[1:])
+    if outside := found - set(keys):
+        raise ValueError(f"keys {sorted(outside)} are outside the model's key space {list(keys)}")
+
+
 def replay_staleness(events: list[tuple], form: str = "witness") -> staleness.World:
     """One consumer input (checks over items) after the history."""
+    _check_keys(events, staleness.KEYS, set())
     w = staleness.World(form)
     for i, ev in enumerate(events):
         w.apply(ev)
@@ -32,6 +50,7 @@ def replay_staleness(events: list[tuple], form: str = "witness") -> staleness.Wo
 
 def replay_fullrun(events: list[tuple], form: str = "floor", kind: str = "file") -> fullrun.World:
     """The cast (copy, tally, archive, report, checks) after the history, unsettled."""
+    _check_keys(events, fullrun.KEYS, {"plan", "step", "commit", "cancel", "keys", "define", "full"})
     w = fullrun.World(form, kind)
     for i, ev in enumerate(events):
         w.apply(ev)

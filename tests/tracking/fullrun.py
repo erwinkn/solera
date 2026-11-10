@@ -129,7 +129,7 @@ class Spec:
 
 def obs(log: Log, k: str, c: int, cond: Cond) -> object:
     v = log.get(c, k)
-    return ABSENT if v is ABSENT else (v, cond)
+    return ABSENT if v is ABSENT else (v, cond.seen())
 
 
 class Ordinary:
@@ -238,7 +238,10 @@ class Ordinary:
             w.stats["rebuilds superseded"] += self.rebuild is not None
             w.stats["rebuilds begun by keys="] += s.kind == "keys"
             self.rebuild = w.rebuilds
-            w.removed_during[self.rebuild] = set()
+            since = [log.diff(s.heads[i], log.head) for i, log in enumerate(self.inputs)]
+            w.removed_during[self.rebuild] = {k for k, (_, now) in since[0].items() if now is ABSENT}
+            w.changed_during[self.rebuild] = {k for d in since for k in d}
+            w.rebuild_d[self.rebuild] = self.d
             if w.form == "floor" and w.on("floor_set") and (self.floor is None or w.on("floor_moves_up")):
                 self.floor = s.version
         elif s.reset:
@@ -316,6 +319,15 @@ class Ordinary:
             if left:
                 w.stats["leftovers removed"] += len(left)
                 w.trace.append(f"  and removes the leftovers below {self.floor}: {left}")
+        if w.form == "floor" and self.rebuild is not None and not self.accumulates:
+            for k, v in writes.items():
+                last = self.output.removals.get(k, [(0, None)])[-1][1]
+                if v is ABSENT or k in self.output.rows or last != self.rebuild:
+                    continue
+                if k.lower() not in w.removed_during[self.rebuild]:
+                    w.violation = (
+                        f"{self.name}'s log removes {k} and adds it back within rebuild {self.rebuild}"
+                    )
         if writes or clear:
             self.output.write(version, writes, clear, self.rebuild)
         if done:
@@ -430,21 +442,26 @@ class Mirror:
             loaded = (
                 planned
                 if row is None and not isinstance(self.src, Output)
-                else (ABSENT if row is None else (row.version, s.cond))
+                else (ABSENT if row is None else (row.version, s.cond.seen()))
             )
             w.stats["loads at another version"] += loaded != planned
             if loaded != planned and self.held() and w.on("hold_back"):
                 w.stats["held back"] += 1
                 kept.add(k)
                 continue
-            if (
-                isinstance(self.src, Output)
-                and row is not None
-                and self.producer
-                and self.producer.accumulates
-            ):
-                if row.rebuild is not None and row.rebuild == self.producer.rebuild:
+            p = self.producer
+            if row is not None and p is not None and row.rebuild is not None and row.rebuild == p.rebuild:
+                if p.accumulates:
                     w.violation = f"{self.name} loaded {k}@{row.version}, a row the unfinished rebuild {row.rebuild} built"
+                elif k.lower() not in w.changed_during[row.rebuild]:
+                    d, items = w.rebuild_d[row.rebuild], w.items.states[-1]
+                    src = k.lower()
+                    final = (items[src], w.feed.states[-1].get(src), d) if src in items else None
+                    if row.value != final:
+                        w.violation = (
+                            f"{self.name} loaded {k}@{row.version} as {row.value} mid-rebuild {row.rebuild}, "
+                            f"which will hold {final}: a half-built row"
+                        )
             self._deliver(k, loaded, row, s.heads[0])
             delivered.append(f"{k}{'' if loaded is ABSENT else '@' + str(loaded[0])}")
             results[k] = loaded
@@ -493,7 +510,9 @@ class World:
         self.form, self.kind, self.off = form, kind, off
         self.version = 0
         self.rebuilds = 0
-        self.removed_during: dict[int, set[str]] = {}  # per rebuild: the items keys removed while it ran
+        self.removed_during: dict[int, set[str]] = {}  # per rebuild: the items keys removed since it planned
+        self.changed_during: dict[int, set[str]] = {}  # per rebuild: the input keys changed since it planned
+        self.rebuild_d: dict[int, int] = {}  # per rebuild: the definition it builds
         self.violation: str | None = None
         self.trace: list[str] = []
         self.held: Counter = Counter()
@@ -523,9 +542,11 @@ class World:
             log.commit(changes)
             for a in (self.copy, self.tally):
                 if a.rebuild is not None:
-                    self.removed_during[a.rebuild] |= {
-                        k for k, (n, _) in log.entries[-1].items() if n is ABSENT
-                    }
+                    self.changed_during[a.rebuild] |= set(log.entries[-1])
+                    if kind == "items":
+                        self.removed_during[a.rebuild] |= {
+                            k for k, (n, _) in log.entries[-1].items() if n is ABSENT
+                        }
             self.trace.append(
                 f"{kind} {'c' if kind == 'items' else 'f'}{log.head}: "
                 + " · ".join(

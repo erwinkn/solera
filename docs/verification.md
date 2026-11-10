@@ -1261,7 +1261,11 @@ uv run python -m tests.tracking fullrun --kind table --off hold_back --shrink
 ```
 
 **State.** The log of an output: commits of entries that carry both versions
-(P1), clears, and `diff`, `scan` and `get` computed from entries alone. Progress:
+(P1), clears, and `diff`, `scan` and `get` computed from entries alone; a test
+checks all three against the true states at every pair of commits, over
+ranges, across clears and reverts. A holding records the version, the context
+and the definition: patterns only decide which keys are taken, so a pattern
+change owes only the keys that change membership (§9, CHG-4). Progress:
 pieces (`at(H, conditions)`, `empty`, `held`) and points, decoding, a planner
 that reads candidates from the log piece by piece (§7), and the batch commit
 rule (§5), with failing keys (P9), keys loaded at another version, key-list
@@ -1306,8 +1310,24 @@ completed rebuild leaves no row below its floor; no reader loads a row an
 unfinished rebuild of an accumulating output built; no keyed reader is given
 a key removed and then added back within one rebuild, unless items removed
 it meanwhile; checks never removes a key items has; summary never reads a copy
-that is incomplete or mixes definitions. Once quiet (every owed run done),
-every output equals what its definition gives from items and feed.
+that is incomplete or mixes definitions. Under `floor`, copy's log never
+removes a key and adds it back within one rebuild unless items removed it
+since the rebuild planned (the amendment's invariant 3), and a reader that is
+not held loads a row the unfinished rebuild built only if it is the row the
+completed rebuild will hold, unless items or feed changed that key since
+(invariant 11). Once quiet (every owed run done), every output equals what
+its definition gives from items and feed.
+
+Invariant 3 does not hold for an accumulating output under `floor`: a
+rebuild's half-built count can reach zero, be removed, and come back. In
+`[items k1; tally runs; items removes k1, adds k3; full run of tally by hand,
+first batch keys=(k1); tally runs]` tally's log removes odd and writes it back,
+though odd never emptied upstream. Only the gate keeps report from seeing it,
+which is one more reason the engine must know that an output accumulates.
+Invariant 7 is checked in part: a completed rebuild leaves no row below its
+floor and no floor is left at rest, so leftovers are removed at least once;
+that they are removed at most once holds by construction (one path removes
+them, and it ends the rebuild) and is not audited on its own.
 
 **Calibration.** Every rule a form needs is named (`RULES` in each module) and
 has a history in `histories.py` that passes with every rule on and fails with

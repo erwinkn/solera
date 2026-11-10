@@ -10,7 +10,7 @@ compare what the queries compute from entries with the truth.
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 ABSENT = None
 HELD = "held"
@@ -36,6 +36,11 @@ class Cond:
 
     def takes(self, k: str) -> bool:
         return self.pat is None or k in self.pat
+
+    def seen(self) -> Cond:
+        """What a holding records: patterns only decide which keys are taken, so a
+        key both pattern sets take is not owed (§9, CHG-4)."""
+        return replace(self, pat=None)
 
 
 class Log:
@@ -118,7 +123,7 @@ class Progress:
     covering the key space, and points overriding them.
 
     A piece value is ("at", P, cond), EMPTY or HELD_PIECE. An observation (what
-    the consumer holds for a key) is ABSENT, HELD, or (version, cond)."""
+    the consumer holds for a key) is ABSENT, HELD, or (version, cond.seen())."""
 
     def __init__(self, log: Log, own: Callable[[], set[str]] = set) -> None:
         self.log = log
@@ -143,7 +148,7 @@ class Progress:
     def held_by(self, value: tuple, k: str) -> object:
         if value[0] == "at":
             v = self.log.get(value[1], k)
-            return (v, value[2]) if v is not ABSENT and value[2].takes(k) else ABSENT
+            return (v, value[2].seen()) if v is not ABSENT and value[2].takes(k) else ABSENT
         if value == EMPTY:
             return ABSENT
         return HELD if k in self.own() else ABSENT
@@ -153,7 +158,7 @@ class Progress:
 
     def wanted(self, k: str, c: int, cond: Cond) -> object:
         v = self.log.get(c, k)
-        return (v, cond) if v is not ABSENT and cond.takes(k) else ABSENT
+        return (v, cond.seen()) if v is not ABSENT and cond.takes(k) else ABSENT
 
     # -- planning (§7: candidates come from the log, per piece) -------------------------
     def candidates(self, H: int, lo: str, cond: Cond) -> list[str]:
