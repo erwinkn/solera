@@ -21,7 +21,7 @@ use crate::progress::Progress;
 /// name) or an edge (consumer partition, input name), encoded by Python.
 pub type Id = Box<[u8]>;
 
-pub const SNAPSHOT_FORMAT: u8 = 1;
+pub const SNAPSHOT_FORMAT: u8 = 2;
 
 /// One output's log: its layer list, oldest first, and its head. B4's
 /// commit part appends to it.
@@ -44,6 +44,8 @@ pub struct Edge {
 pub struct Tracking {
     pub outputs: BTreeMap<Id, Output>,
     pub edges: BTreeMap<Id, Edge>,
+    /// B6: per-key edges' counters, outcome counts and retry passes.
+    pub per_key: BTreeMap<Id, crate::outcomes::PerKey>,
 }
 
 impl Tracking {
@@ -77,10 +79,14 @@ impl Tracking {
             Part::Batch(p) => p.check(self),
             Part::Consumed(p) => p.check(self),
             Part::OutputCommit(p) => p.check(self),
+            Part::Outcomes(p) => p.check(self),
+            Part::PassStart(p) => p.check(self),
+            Part::Rebuild(p) => p.check(self),
         }
     }
 
     fn apply_part(&mut self, p: Part) {
+        crate::outcomes::follow(&p, self);
         match p {
             Part::EdgeOpen(p) => p.apply(self),
             Part::EdgeClose(p) => p.apply(self),
@@ -89,6 +95,9 @@ impl Tracking {
             Part::Batch(p) => p.apply(self),
             Part::Consumed(p) => p.apply(self),
             Part::OutputCommit(p) => p.apply(self),
+            Part::Outcomes(p) => p.apply(self),
+            Part::PassStart(p) => p.apply(self),
+            Part::Rebuild(p) => p.apply(self),
         }
     }
 
@@ -110,6 +119,11 @@ impl Tracking {
             e.bytes(id);
             e.bytes(&edge.input);
             edge.progress.encode(&mut e);
+        }
+        e.uv(self.per_key.len() as u64);
+        for (id, k) in &self.per_key {
+            e.bytes(id);
+            k.encode(&mut e);
         }
         e.buf
     }
@@ -133,6 +147,11 @@ impl Tracking {
             let input: Id = d.bytes()?.into();
             let progress = Arc::new(Progress::decode(&mut d)?);
             t.edges.insert(id, Edge { input, progress });
+        }
+        for _ in 0..d.count()? {
+            let id: Id = d.bytes()?.into();
+            t.per_key
+                .insert(id, crate::outcomes::PerKey::decode(&mut d)?);
         }
         d.end()?;
         Ok(t)

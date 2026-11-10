@@ -1,0 +1,549 @@
+//! What a batch commit writes to an edge's records: each taken key's
+//! outcome through the transition table, each moot failure dropped, the
+//! retry clock moved with them; and the points progress no longer needs,
+//! since a failing key's record now holds what it held.
+
+use std::collections::BTreeMap;
+use std::sync::Arc;
+
+use solera_index::Query;
+
+use crate::commit::{build, Change, Changes, Held as Source, Mode, Spec};
+use crate::error::{invalid, Result};
+use crate::event::Part;
+use crate::plan::{Indexes, Mode as PlanMode, Plan};
+use crate::progress::{Class, Holding, Key, Ops, Point, Progress, Reason};
+use crate::state::{Id, Output, Tracking};
+
+use super::transition::{transition, Counters, Reported};
+use super::{cond_id, output_id, Conds, Held, Outcomes, PerKey, Record, Step, DUE, FAILURES};
+
+/// What committing reads of the state, taken under the caller's lock.
+#[derive(Clone)]
+pub struct View {
+    pub edge: Id,
+    pub failures: Output,
+    pub due: Output,
+    pub per_key: PerKey,
+    pub progress: Arc<Progress>,
+    /// The output the edge reads, and its log.
+    pub input: Id,
+    pub upstream: Output,
+}
+
+impl Tracking {
+    pub fn outcome_view(&self, edge: &[u8]) -> Result<View> {
+        let Some(e) = self.edges.get(edge) else {
+            return invalid(format!("no edge {}", String::from_utf8_lossy(edge)));
+        };
+        let out = |k| {
+            self.outputs
+                .get(&output_id(k, edge))
+                .cloned()
+                .unwrap_or_default()
+        };
+        Ok(View {
+            edge: edge.into(),
+            failures: out(FAILURES),
+            due: out(DUE),
+            per_key: self.per_key.get(edge).cloned().unwrap_or_default(),
+            progress: e.progress.clone(),
+            input: e.input.clone(),
+            upstream: self.outputs.get(&e.input).cloned().unwrap_or_default(),
+        })
+    }
+}
+
+/// Where and when a batch's outcomes are committed.
+#[derive(Clone, Debug)]
+pub struct Ctx<'a> {
+    /// Seconds since the epoch, the engine's clock at commit.
+    pub now: f64,
+    /// The counters the batch ran under (a retry batch runs under its pass's).
+    pub counters: Counters,
+    /// The asset's `retries=`, which bounds timeouts.
+    pub retries: u64,
+    pub time_ms: u64,
+    pub producer: &'a [u8],
+    /// Paths for the layers of the record and clock outputs.
+    pub failures_path: &'a str,
+    pub due_path: &'a str,
+}
+
+/// The key of a retrying key's entry on the retry clock: its due time, then
+/// the key.
+pub fn due_key(at: u64, key: &[u8]) -> Vec<u8> {
+    let mut k = Vec::with_capacity(8 + key.len());
+    k.extend_from_slice(&at.to_be_bytes());
+    k.extend_from_slice(key);
+    k
+}
+
+/// The point a failure gone moot leaves: the consumer keeps what it held,
+/// and its piece says what it was tried on.
+pub(crate) fn moot_point(r: &Record, conds: &Conds) -> Result<Point> {
+    Ok(Point {
+        holding: r.held.holding(conds)?,
+        reason: Reason::Failed,
+        seen: None,
+    })
+}
+
+/// The records of `keys` (sorted, distinct) at the output's head.
+pub async fn records(
+    ixs: &dyn Indexes,
+    output: &Id,
+    out: &Output,
+    keys: &[&[u8]],
+) -> Result<BTreeMap<Key, Record>> {
+    let mut found = BTreeMap::new();
+    if out.live == 0 || keys.is_empty() {
+        return Ok(found);
+    }
+    let page = ixs
+        .index(output)?
+        .get(&out.layers, out.head, keys, &Query::default())
+        .await?;
+    for i in 0..page.run.len() {
+        let solera_index::Version::Bytes(b) = page.run.new_version(page.run.rows(i).start) else {
+            return invalid("a record that is not a version word");
+        };
+        found.insert(page.run.key(i).into(), Record::decode(b)?);
+    }
+    Ok(found)
+}
+
+/// One record's share of the edge's counts.
+pub(crate) fn tally(
+    r: &Record,
+    key: &[u8],
+    conds: &Conds,
+    counts: &mut [u64; 6],
+    classes: &mut [u64; 3],
+    refs: &mut BTreeMap<u64, u64>,
+    add: bool,
+) -> Result<()> {
+    let bump = |n: &mut u64| {
+        if add {
+            *n += 1
+        } else {
+            *n -= 1
+        }
+    };
+    bump(&mut counts[r.stored.outcome as usize]);
+    let class = Class::of(&r.held.holding(conds)?, &r.tried(key, conds)?);
+    if class != Class::Unchanged {
+        bump(&mut classes[class as usize - 1]);
+    }
+    for c in r.conds() {
+        bump(refs.entry(c).or_default());
+    }
+    Ok(())
+}
+
+/// The parts that commit a batch's outcomes for one keyed input of `plan`:
+/// its record output's commit, its retry clock's, and [`Outcomes`]; it also
+/// drops from `ops` (B3's progress parts and records for this plan) the
+/// points that the records now stand for. `reported` names every taken key
+/// that did not succeed (sorted); every other taken key succeeded. `retry`:
+/// the pass whose step this batch is.
+pub async fn commit(
+    ixs: &dyn Indexes,
+    v: &View,
+    plan: &Plan,
+    input: usize,
+    reported: &[(Key, Reported)],
+    retry: bool,
+    ctx: &Ctx<'_>,
+    ops: &mut Ops,
+) -> Result<Vec<Part>> {
+    let Some(p) = plan.inputs.get(input) else {
+        return invalid("no such keyed input in the plan");
+    };
+    if p.edge != v.edge {
+        return invalid("the view is of another edge");
+    }
+    if plan.reset {
+        return invalid("a per-key batch never resets its progress (D194)");
+    }
+    if reported.windows(2).any(|w| w[0].0 >= w[1].0) {
+        return invalid("reported keys are sorted and distinct");
+    }
+    let keyed = v.progress.keyed().expect("a per-key edge is keyed");
+    let step = if retry {
+        let Some(pass) = &v.per_key.pass else {
+            return invalid("a retry batch with no pass under way");
+        };
+        Some(Step {
+            n: pass.n,
+            from: plan.range.lo.clone(),
+            to: plan.range.hi.clone(),
+        })
+    } else {
+        None
+    };
+    let counters = match (&step, &v.per_key.pass) {
+        (Some(_), Some(pass)) => pass.counters,
+        _ => ctx.counters,
+    };
+    let fid = output_id(FAILURES, &v.edge);
+    let mut touched: Vec<&[u8]> = p
+        .keys
+        .iter()
+        .map(|c| c.key.as_ref())
+        .chain(p.moot.iter().map(|k| k.as_ref()))
+        .collect();
+    touched.sort_unstable();
+    touched.dedup();
+    let priors = records(ixs, &fid, &v.failures, &touched).await?;
+
+    let mut conds: Conds = (*v.per_key.conds).clone();
+    let mut added: Vec<(u64, Arc<crate::progress::Conditions>)> = vec![];
+    let mut learn = |c: &Arc<crate::progress::Conditions>, conds: &mut Conds| -> u64 {
+        let id = cond_id(c);
+        if !conds.contains_key(&id) {
+            conds.insert(id, c.clone());
+            added.push((id, c.clone()));
+        }
+        id
+    };
+    let on_cond = learn(&p.conditions, &mut conds);
+    let mut next: BTreeMap<Key, Option<Record>> = BTreeMap::new();
+    let mut rep = reported.iter().peekable();
+    for c in &p.keys {
+        while rep.peek().is_some_and(|(k, _)| *k < c.key) {
+            rep.next();
+        }
+        let r = rep.next_if(|(k, _)| *k == c.key).map(|(_, r)| r);
+        let prior = priors.get(&c.key);
+        let stored = match r {
+            None => None,
+            Some(_) if c.class == Class::Unchanged => None,
+            Some(r) => {
+                let fresh = prior.is_none_or(|p| p.on != c.version || p.on_cond != on_cond);
+                transition(
+                    prior.map(|p| &p.stored),
+                    fresh,
+                    r,
+                    ctx.now,
+                    counters.deploy,
+                    counters.forced_at(),
+                    ctx.retries,
+                )
+            }
+        };
+        let rec = match stored {
+            None => None,
+            Some(s) => {
+                let held = match &c.held {
+                    Holding::Version(_, hc) => {
+                        let id = learn(hc, &mut conds);
+                        match Held::of(&c.held) {
+                            Held::Version(v, _) => Held::Version(v, id),
+                            h => h,
+                        }
+                    }
+                    h => Held::of(h),
+                };
+                Some(Record {
+                    stored: s,
+                    on: c.version.clone(),
+                    on_cond,
+                    at: p.head,
+                    held,
+                })
+            }
+        };
+        if rec.is_some() || prior.is_some() {
+            next.insert(c.key.clone(), rec);
+        }
+    }
+    let range_batch = !matches!(plan.mode, PlanMode::Keys(_));
+    let mut points = Vec::new();
+    for k in &p.moot {
+        if next.contains_key(k) {
+            continue;
+        }
+        let Some(prior) = priors.get(k) else { continue };
+        next.insert(k.clone(), None);
+        if !range_batch {
+            points.push((k.clone(), moot_point(prior, &conds)?));
+        }
+    }
+    if rep.next().is_some()
+        || reported
+            .iter()
+            .any(|(k, _)| p.keys.binary_search_by(|c| c.key.cmp(k)).is_err())
+    {
+        return invalid("an outcome reported for a key the batch did not take");
+    }
+
+    let mut counts = v.per_key.counts;
+    let mut classes = v.per_key.classes;
+    let mut refs = v.per_key.refs.clone();
+    let before = refs.clone();
+    let mut fch = Changes::new();
+    let mut words: Vec<(Key, Vec<u8>)> = Vec::new();
+    let mut due: Vec<(Vec<u8>, bool)> = Vec::new();
+    for (k, rec) in &next {
+        let prior = priors.get(k);
+        if let Some(p) = prior {
+            tally(p, k, &conds, &mut counts, &mut classes, &mut refs, false)?;
+        }
+        if let Some(r) = rec {
+            tally(r, k, &conds, &mut counts, &mut classes, &mut refs, true)?;
+        }
+        let at = |r: Option<&Record>| {
+            r.map(|r| &r.stored)
+                .filter(|s| s.timed())
+                .map(|s| s.next_at)
+        };
+        let (old, new) = (at(prior), at(rec.as_ref()));
+        if old != new {
+            if let Some(t) = old {
+                due.push((due_key(t, k), false));
+            }
+            if let Some(t) = new {
+                due.push((due_key(t, k), true));
+            }
+        }
+        if let Some(r) = rec {
+            words.push((k.clone(), r.encode()));
+        }
+    }
+    let mut w = words.iter().peekable();
+    for (k, rec) in &next {
+        match rec {
+            Some(_) => {
+                let (_, word) = w.next().expect("one word per record");
+                fch.push(k, Change::Upsert(Some(word)))?;
+            }
+            None => fch.push(k, Change::Removed)?,
+        }
+    }
+    due.sort();
+    let mut dch = Changes::new();
+    for (k, add) in &due {
+        dch.push(
+            k,
+            if *add {
+                Change::Upsert(Some(b""))
+            } else {
+                Change::Removed
+            },
+        )?;
+    }
+
+    let spec = |path| Spec {
+        version: 0,
+        time_ms: ctx.time_ms,
+        producer: ctx.producer,
+        path,
+        mode: Mode::Patch,
+        collect: 0,
+    };
+    let mut parts = Vec::new();
+    if let Some(b) = build(
+        ixs,
+        &fid,
+        &v.failures,
+        spec(ctx.failures_path),
+        &mut Source(Some(&fch)),
+    )
+    .await?
+    {
+        parts.push(Part::OutputCommit(b.part));
+    }
+    let did = output_id(DUE, &v.edge);
+    if let Some(b) = build(
+        ixs,
+        &did,
+        &v.due,
+        spec(ctx.due_path),
+        &mut Source(Some(&dch)),
+    )
+    .await?
+    {
+        parts.push(Part::OutputCommit(b.part));
+    }
+    let refs_moved = moved(&before, &refs);
+    let referenced = |id: &u64| refs.get(id).is_some_and(|n| *n > 0);
+    parts.push(Part::Outcomes(Outcomes {
+        edge: v.edge.clone(),
+        counts,
+        classes,
+        conds: added.into_iter().filter(|(id, _)| referenced(id)).collect(),
+        refs: refs_moved,
+        step,
+        at: v.failures.head,
+        seen: if v.failures.live == 0 {
+            p.head
+        } else {
+            v.per_key.seen.min(p.head)
+        },
+        points,
+    }));
+
+    let needless = |key: &Key, reason: Reason, holding: &Holding| -> bool {
+        if range_batch {
+            return reason == Reason::Failed;
+        }
+        if !retry || keyed.point(key).is_some() {
+            return false;
+        }
+        match reason {
+            Reason::Failed => true,
+            Reason::KeyList => priors
+                .get(key)
+                .and_then(|r| r.tried(key, &conds).ok())
+                .is_some_and(|t| !crate::progress::owed(&t, holding)),
+            _ => false,
+        }
+    };
+    for part in &mut ops.parts {
+        if let Part::Batch(b) = part {
+            if b.edge == v.edge {
+                b.points
+                    .retain(|(k, pt)| !needless(k, pt.reason, &pt.holding));
+            }
+        }
+    }
+    for r in &mut ops.records {
+        if r.edge == v.edge {
+            r.points
+                .retain(|(k, pt)| !needless(k, pt.reason, &pt.holding));
+        }
+    }
+    Ok(parts)
+}
+
+/// Looks for reverts since the edge last looked (KEY-3, §11): a failing key
+/// whose input returns to what the consumer holds, after it was tried, is
+/// moot. Its record goes, and a point keeps what the consumer holds, since
+/// its piece says what it was tried on. Reads the input's entries since
+/// then, and the records of their keys. The engine calls it after the
+/// input's commits and before it plans, counts or changes the conditions,
+/// as the witness catches up (§6). None when there is nothing to record.
+pub async fn catch_up(
+    ixs: &dyn Indexes,
+    v: &View,
+    now: &Arc<crate::progress::Conditions>,
+    ctx: &Ctx<'_>,
+) -> Result<Option<Vec<Part>>> {
+    let head = v.upstream.head;
+    let seen = v.per_key.seen;
+    if v.failures.live == 0 || seen >= head {
+        return Ok(None);
+    }
+    let fid = output_id(FAILURES, &v.edge);
+    let conds: &Conds = &v.per_key.conds;
+    let ix = ixs.index(&v.input)?;
+    let mut gone: BTreeMap<Key, Record> = BTreeMap::new();
+    let mut after: Option<Vec<u8>> = None;
+    loop {
+        let q = Query {
+            after: after.take(),
+            limit: Some(65_536),
+            ..Default::default()
+        };
+        let page = ix.window(&v.upstream.layers, seen + 1..=head, &q).await?;
+        let run = &page.run;
+        let keys: Vec<&[u8]> = (0..run.len()).map(|i| run.key(i)).collect();
+        let recs = records(ixs, &fid, &v.failures, &keys).await?;
+        for i in 0..run.len() {
+            let k = run.key(i);
+            let Some(rec) = recs.get(k) else { continue };
+            let held = rec.held.holding(conds)?;
+            let back = run.rows(i).any(|row| {
+                run.commit(row) > rec.at
+                    && !crate::progress::owed(&held, &Holding::of(run.new_version(row), now, k))
+            });
+            if back {
+                gone.insert(k.into(), rec.clone());
+            }
+        }
+        match page.next {
+            Some(n) => after = Some(n),
+            None => break,
+        }
+    }
+    let mut counts = v.per_key.counts;
+    let mut classes = v.per_key.classes;
+    let mut refs = v.per_key.refs.clone();
+    let before = refs.clone();
+    let mut fch = Changes::new();
+    let mut due = Vec::new();
+    let mut points = Vec::new();
+    for (k, rec) in &gone {
+        tally(rec, k, conds, &mut counts, &mut classes, &mut refs, false)?;
+        fch.push(k, Change::Removed)?;
+        if rec.stored.timed() {
+            due.push(due_key(rec.stored.next_at, k));
+        }
+        points.push((k.clone(), moot_point(rec, conds)?));
+    }
+    due.sort();
+    let mut dch = Changes::new();
+    for k in &due {
+        dch.push(k, Change::Removed)?;
+    }
+    let spec = |path| Spec {
+        version: 0,
+        time_ms: ctx.time_ms,
+        producer: ctx.producer,
+        path,
+        mode: Mode::Patch,
+        collect: 0,
+    };
+    let mut parts = Vec::new();
+    if let Some(b) = build(
+        ixs,
+        &fid,
+        &v.failures,
+        spec(ctx.failures_path),
+        &mut Source(Some(&fch)),
+    )
+    .await?
+    {
+        parts.push(Part::OutputCommit(b.part));
+    }
+    let did = output_id(DUE, &v.edge);
+    if let Some(b) = build(
+        ixs,
+        &did,
+        &v.due,
+        spec(ctx.due_path),
+        &mut Source(Some(&dch)),
+    )
+    .await?
+    {
+        parts.push(Part::OutputCommit(b.part));
+    }
+    parts.push(Part::Outcomes(Outcomes {
+        edge: v.edge.clone(),
+        counts,
+        classes,
+        conds: vec![],
+        refs: moved(&before, &refs),
+        step: None,
+        at: v.failures.head,
+        seen: head,
+        points,
+    }));
+    Ok(Some(parts))
+}
+
+/// Reference counts that changed, with the count after (0: gone).
+fn moved(before: &BTreeMap<u64, u64>, after: &BTreeMap<u64, u64>) -> Vec<(u64, u64)> {
+    after
+        .iter()
+        .filter(|(id, n)| before.get(id) != Some(n))
+        .map(|(id, n)| (*id, *n))
+        .chain(
+            before
+                .keys()
+                .filter(|id| !after.contains_key(id))
+                .map(|id| (*id, 0)),
+        )
+        .collect()
+}
