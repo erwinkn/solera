@@ -16,6 +16,10 @@ use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex};
 use tokio::sync::Semaphore;
 
+/// A small layer's top level comes with its segments, decoded at once up to
+/// about this many bytes; the rest are decoded when a read needs them.
+const EAGER_SEGS: usize = 16 << 20;
+
 #[derive(Clone, Debug)]
 pub struct StoreOptions {
     /// Bytes of blocks and metadata kept in memory, shared by every query.
@@ -600,7 +604,11 @@ fn parse(
             let top = Top::parse(tail, layer.top_start, layer.size).map_err(at)?;
             top.check(layer)?;
             if start == layer.index_start {
+                let mut decoded = 0;
                 for i in 0..top.segs.len() {
+                    if decoded > EAGER_SEGS {
+                        break;
+                    }
                     let (a, n) = (
                         (top.segs.off[i] - start) as usize,
                         top.segs.clen[i] as usize,
@@ -618,6 +626,7 @@ fn parse(
                         top.commits_start,
                     )
                     .map_err(at)?;
+                    decoded += seg.bytes();
                     extra.push((Part::Seg(i as u32), Cached::Seg(Arc::new(seg))));
                 }
             }
