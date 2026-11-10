@@ -146,6 +146,9 @@ enum Deferred {
 /// A batch's commit, built and not yet applied.
 struct Built {
     plan: plan::Plan,
+    /// Whether the input was unsettled when B3 built the batch's progress,
+    /// which decides its hold-backs.
+    unsettled: bool,
     parts: Vec<Part>,
     ops: Ops,
     failed: Vec<(Key, Reported)>,
@@ -488,6 +491,13 @@ impl World {
         loaded: &[(Key, Ver)],
         counters: Counters,
     ) -> Option<Built> {
+        let head = p.inputs[0].head;
+        let unsettled = self.log.full_run.is_some()
+            || self
+                .log
+                .clears
+                .iter()
+                .any(|&c| head < c && c <= self.log.head());
         self.catch_up(ix).await;
         let mut ops = planned.clone();
         let v = self.t.outcome_view(EDGE.as_bytes()).unwrap();
@@ -517,6 +527,7 @@ impl World {
         .ok()?;
         Some(Built {
             plan: p.clone(),
+            unsettled,
             parts,
             ops,
             failed: failed.to_vec(),
@@ -530,6 +541,7 @@ impl World {
     fn land(&mut self, b: Built) -> Option<Vec<Key>> {
         let Built {
             plan: p,
+            unsettled,
             mut parts,
             ops,
             failed,
@@ -562,15 +574,10 @@ impl World {
         let ip = &p.inputs[0];
         let fails: BTreeMap<Key, Reported> = failed.into_iter().collect();
         let loaded: BTreeMap<Key, Ver> = loaded.into_iter().collect();
-        // A key loaded at another version than planned while the input is
-        // mid full run, or cleared since the plan, is held back: it keeps
-        // what it held and its outcome (D205, the model's ev_commit).
-        let unsettled = self.log.full_run.is_some()
-            || self
-                .log
-                .clears
-                .iter()
-                .any(|&c| ip.head < c && c <= self.log.head());
+        // A key loaded at another version than planned while the input was
+        // mid full run, or cleared since the plan, when B3 built the batch's
+        // progress is held back: it keeps what it held and its outcome (D205,
+        // the model's ev_commit).
         let held: Vec<Key> = ip
             .keys
             .iter()
@@ -2307,7 +2314,7 @@ fn a_held_back_key_keeps_its_record() {
         assert_eq!(w.stored(&ix).await[&key("k1")], before);
         let edge = &w.t.edges[EDGE.as_bytes()];
         let pt = edge.progress.keyed().unwrap().point(b"k1").unwrap();
-        assert_eq!(pt.reason, solera_tracking::progress::Reason::HeldBack);
+        assert_eq!(pt.reason, solera_tracking::progress::Reason::Unsettled);
     });
 }
 
@@ -2361,7 +2368,7 @@ fn a_retry_batch_whose_only_key_is_held_back_still_gets_its_deploy_retry() {
             assert_eq!(w.stored(&ix).await[&key("k1")], before);
             let edge = &w.t.edges[EDGE.as_bytes()];
             let pt = edge.progress.keyed().unwrap().point(b"k1").unwrap();
-            assert_eq!(pt.reason, solera_tracking::progress::Reason::HeldBack);
+            assert_eq!(pt.reason, solera_tracking::progress::Reason::Unsettled);
             let k = &w.t.per_key[EDGE.as_bytes()];
             assert!(k.pass.is_none(), "the batch ended its pass");
             assert_eq!(k.last.deploy, 2, "the pass covers the deploy");

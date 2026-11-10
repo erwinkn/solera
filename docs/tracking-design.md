@@ -529,32 +529,34 @@ these additions:
   every key it loaded at another version than it planned while its input's
   output is mid full run (`Output.full_run`, B4) or when a clear came in
   since the batch's head (the layers' `clears`): the key keeps what it held,
-  even if it also failed, and stays owed. A key held back on one input is
-  held back on every input of the batch, since its output is one value
-  computed from all of them. A key the input did not take (another input
-  did) has no planned version on it, so any load of it reported there
-  counts. `Ops.held_back` names those keys for the key outcomes (B6), and
-  their points carry their own reason,
-  `Unsettled`, apart from the planner's `HeldBack`, so lineage can tell a
-  key the batch never took from one it took and held back. The gate that
-  holds readers of an incomplete upstream is the engine's (B5).
+  even if it also failed, and stays owed. On such an input it also holds
+  back every key of the batch that input did not take (another input did):
+  the worker loaded it there with no planned version to check the load
+  against. A key held back on one input is held back on every input of the
+  batch, since its output is one value computed from all of them.
+  `Ops.held_back` names those keys for the key outcomes (B6), and their
+  points carry their own reason, `Unsettled`, apart from the planner's
+  `HeldBack`, so lineage can tell a key the batch never took from one it
+  took and held back. The gate that holds readers of an incomplete upstream
+  is the engine's (B5).
 - **The commit is fenced against what decides a hold-back.** A batch that
-  kept a key loaded at another version on a settled input carries a fence:
-  that input's output and the head it planned at. The event is refused if
-  the edge reads another output by then, or the input has become unsettled,
-  since the key would then have been held back. A batch that held keys back
-  carries no fence for that input: holding back is always safe, and at worst
-  costs a later batch. The fence names the output among the things its part
-  touches, so no other part of the same event (a clear of that output) can
-  change what it reads.
+  kept a key on a settled input that it would have held back had the input
+  been unsettled (loaded at another version, or not taken there) carries a
+  fence: that input's output and the head it planned at. The event is
+  refused if the edge reads another output by then, or the input has become
+  unsettled. A batch that held all such keys back carries no fence for that
+  input: holding back is always safe, and at worst costs a later batch.
+  Every part of an event is checked on the state before it, so the fence
+  answers for the batch applied ahead of the rest of its event; another
+  part may commit to the output it reads, as a source load report does
+  (P13).
 - **What the commit cannot check, it refuses.** `progress_ops`, and a
   fenced event when it applies, refuse once a fold of the input's layers
   has passed the batch's head (a layer's `floor` above it): the fold
   dropped the clears after the head, so whether one came in is no longer
   known. `progress_ops` also refuses a plan whose edge now reads another
-  output than it planned on, and a report that names a key the batch did
-  not take: a failed key its input did not take, or a loaded key no input
-  of the batch took.
+  output than it planned on, and a report that names a key its input did
+  not take.
 
 ## 6. Staleness kept exact by propagation
 
@@ -1309,7 +1311,7 @@ described above, with these choices:
   lookup at the head instead of a window: 72,700 keys a second, 118–132 ms
   a batch, accepted as measured (Captain, 2026-11-10).
 - **The hold-back at commit** (D205, §10): a key in B3's `Ops.held_back`
-  keeps its record as it is, failed or not, and B3's `HeldBack` point
+  keeps its record as it is, failed or not, and B3's `Unsettled` point
   stands.
 
 ## 12. History

@@ -30,11 +30,12 @@ pub struct InputReport {
 pub struct Ops {
     pub parts: Vec<Part>,
     pub records: Vec<Record>,
-    /// Per keyed input, sorted: the keys this commit held back. A key loaded
-    /// at another version than planned (or loaded at all, on an input that
-    /// did not take it) on an input whose output was mid full run, or cleared
-    /// since the plan's head, is held back on every input of the batch, since
-    /// its output is one value computed from all of them.
+    /// Per keyed input, sorted: the keys this commit held back. On an input
+    /// whose output was mid full run, or cleared since the plan's head, a key
+    /// loaded at another version than planned, or a key of the batch the
+    /// input did not take (its load there had no planned version to check),
+    /// is held back on every input of the batch, since its output is one
+    /// value computed from all of them.
     /// Each keeps what it held; whether it failed is not recorded.
     pub held_back: Vec<Vec<Key>>,
 }
@@ -74,8 +75,7 @@ impl Tracking {
         }
         let taken = |p: &InputPlan, k: &Key| p.keys.binary_search_by(|c| c.key.cmp(k)).is_ok();
         if plan.inputs.iter().zip(reports).any(|(p, r)| {
-            !r.failed.iter().all(|k| taken(p, k))
-                || !r.loaded.iter().all(|(k, _)| plan.inputs.iter().any(|p| taken(p, k)))
+            !r.failed.iter().all(|k| taken(p, k)) || !r.loaded.iter().all(|(k, _)| taken(p, k))
         }) {
             return invalid("a report names a key the batch did not take");
         }
@@ -101,19 +101,37 @@ impl Tracking {
             .iter()
             .map(|p| unsettled(self, &p.output, p.head))
             .collect::<Result<Vec<bool>>>()?;
-        let hold: BTreeSet<&Key> = plan
+        let batch: BTreeSet<&Key> = plan
+            .inputs
+            .iter()
+            .flat_map(|p| p.keys.iter().map(|c| &c.key))
+            .collect();
+        let unsure: Vec<Vec<&Key>> = plan
             .inputs
             .iter()
             .zip(reports)
+            .map(|(p, r)| {
+                moved(p, r)
+                    .chain(batch.iter().copied().filter(|k| !taken(p, k)))
+                    .collect()
+            })
+            .collect();
+        let hold: BTreeSet<&Key> = unsure
+            .iter()
             .zip(&unsettled)
             .filter(|(_, &u)| u)
-            .flat_map(|((p, r), _)| moved(p, r))
+            .flat_map(|(ks, _)| ks.iter().copied())
             .collect();
         let mut parts = Vec::new();
         let mut records = Vec::new();
         let mut held_back = Vec::new();
-        for (((p, report), &unsettled), keyed) in
-            plan.inputs.iter().zip(reports).zip(&unsettled).zip(keyed)
+        for ((((p, report), &unsettled), keyed), unsure) in plan
+            .inputs
+            .iter()
+            .zip(reports)
+            .zip(&unsettled)
+            .zip(keyed)
+            .zip(&unsure)
         {
             let failed = |k: &Key| report.failed.binary_search(k).is_ok();
             let loaded = |k: &Key| {
@@ -123,7 +141,7 @@ impl Tracking {
                     .ok()
                     .map(|i| &report.loaded[i].1)
             };
-            let kept_moved = moved(p, report).any(|k| !hold.contains(k));
+            let kept_unsure = unsure.iter().any(|k| !hold.contains(k));
             let mut held = Vec::new();
             let mut points: Vec<(Key, Point)> = Vec::new();
             let key_list = matches!(plan.mode, Mode::Keys(_));
@@ -231,7 +249,7 @@ impl Tracking {
                 piece: (!key_list).then(|| Value::At(p.head, p.conditions.clone())),
                 points,
                 expect: p.expect,
-                fence: (kept_moved && !unsettled).then(|| (p.output.clone(), p.head)),
+                fence: (kept_unsure && !unsettled).then(|| (p.output.clone(), p.head)),
             }));
         }
         for u in &plan.unkeyed {
@@ -251,16 +269,14 @@ impl Tracking {
     }
 }
 
-/// The keys `r` loaded at another version than `p` planned. A key the input
-/// did not take (another input of the batch did) has no planned version
-/// here, so any load of it counts.
+/// The keys `r` loaded at another version than `p` planned.
 fn moved<'a>(p: &'a InputPlan, r: &'a InputReport) -> impl Iterator<Item = &'a Key> + 'a {
     r.loaded
         .iter()
         .filter(|(k, got)| {
             p.keys
                 .binary_search_by(|c| c.key.cmp(k))
-                .map_or(true, |i| {
+                .is_ok_and(|i| {
                     let wanted = Holding::of(p.keys[i].version.as_version(), &p.conditions, k);
                     owed(&Holding::of(got.as_version(), &p.conditions, k), &wanted)
                 })

@@ -212,9 +212,9 @@ def test_a_fenced_commit_is_refused_once_a_fold_passes_the_head_it_planned_at(tm
         t.apply(event)
 
 
-def test_a_fenced_commit_cannot_share_an_event_with_a_commit_to_the_output_it_reads(tmp_path):
-    """The fence reads the input's output, so no other part of its event may
-    change it: the event's outcome would depend on the order of its parts."""
+def test_a_fenced_commit_can_share_an_event_with_a_commit_to_the_output_it_reads(tmp_path):
+    """Every part of an event is checked on the state before it, so the fence
+    answers for the batch applied first, and the output's commit after."""
     ix = ChangeIndex(f"file://{tmp_path}")
     t = Tracking()
     t.attach(b"items", ix)
@@ -224,9 +224,9 @@ def test_a_fenced_commit_cannot_share_an_event_with_a_commit_to_the_output_it_re
     t.apply(t.build_commit(b"items", encode_changes(["k1"], []), version=2, path="items/2")["event"])
     event, _, held_back = t.progress_ops(plan, [([], [("k1", 2)])])
     assert held_back == [[]]
-    clear = t.build_commit(b"items", encode_changes(["k1"], []), version=3, path="items/3", mode="clear")
-    with pytest.raises(ValueError, match="two parts of one event change output items"):
-        t.apply(Tracking.join([clear["event"], event]))
+    more = t.build_commit(b"items", encode_changes(["k2"], []), version=3, path="items/3")
+    t.apply(Tracking.join([more["event"], event]))
+    assert t.owed(b"e", {}) == ([("k2", "updated")], None)
 
 
 def test_a_report_naming_a_key_the_batch_did_not_take_is_refused(tmp_path):
@@ -239,10 +239,8 @@ def test_a_report_naming_a_key_the_batch_did_not_take_is_refused(tmp_path):
     t.apply(t.progress_ops(plan, [(["k2"], [("k1", 1)])])[0])
 
 
-def test_a_key_another_input_took_is_held_back_when_loaded_mid_full_run(tmp_path):
-    """k is owed on b only, but the worker loads a's k too, from the middle of
-    a's full run: no version was planned for it on a, so the load counts as
-    moved and k is held back on b."""
+def two_inputs(tmp_path) -> tuple[Tracking, ChangeIndex, dict, list]:
+    """Outputs a and b each hold k at c1; the consumer r read both."""
     ix = ChangeIndex(f"file://{tmp_path}")
     t = Tracking()
     logs = {}
@@ -253,13 +251,48 @@ def test_a_key_another_input_took_is_held_back_when_loaded_mid_full_run(tmp_path
         t.apply(Tracking.event_edge_open(b"r/" + out, out, True))
     inputs = [{"edge": b"r/a", "conditions": {}}, {"edge": b"r/b", "conditions": {}}]
     t.apply(t.progress_ops(t.plan({"inputs": inputs, "limit": 10})["plan"], [([], []), ([], [])])[0])
+    return t, ix, logs, inputs
+
+
+def test_a_key_another_input_took_is_held_back_while_this_input_is_unsettled(tmp_path):
+    """k is owed on b only, but the worker loads a's k too, from the middle of
+    a's full run. No version was planned for it on a, so nothing tells whether
+    that load was safe: k is held back on b."""
+    t, ix, logs, inputs = two_inputs(tmp_path)
     logs[b"b"].append(ix.write_commit("b/2", 2, [("k", 2, 1)], live_before=1))
     t._set_output(b"b", logs[b"b"], 2, 1)
     plan = t.plan({"inputs": inputs, "limit": 10})["plan"]
     assert Tracking.plan_keys(plan, 0)[0] == [] and Tracking.plan_keys(plan, 1)[0] == ["k"]
+    with pytest.raises(ValueError, match="did not take"):
+        t.progress_ops(plan, [([], [("k", None)]), ([], [])])
+    event, _, held_back = t.progress_ops(plan, [([], []), ([], [])])
+    assert held_back == [[], []]
     logs[b"a"].append(ix.write_commit("a/2", 2, [("m", 2, None)], live_before=1, clear=True))
     t._set_output(b"a", logs[b"a"], 2, 1, 2)
-    event, _, held_back = t.progress_ops(plan, [([], [("k", None)]), ([], [])])
+    with pytest.raises(ValueError, match="became unsettled"):
+        t.apply(event)
+    event, _, held_back = t.progress_ops(plan, [([], []), ([], [])])
     assert held_back == [[], ["k"]]
+    t.apply(event)
+    assert t.owed(b"r/b", {}) == ([("k", "updated")], None)
+
+
+def test_an_input_whose_moved_keys_another_input_holds_back_needs_no_fence(tmp_path):
+    """k moved on both inputs and a is mid full run, so k is held back on both:
+    b decided nothing, and a full run of b before the event applies changes
+    nothing."""
+    t, ix, logs, inputs = two_inputs(tmp_path)
+    for out in (b"a", b"b"):
+        logs[out].append(ix.write_commit(f"{out.decode()}/2", 2, [("k", 2, 1)], live_before=1))
+        t._set_output(out, logs[out], 2, 1)
+    plan = t.plan({"inputs": inputs, "limit": 10})["plan"]
+    for out in (b"a", b"b"):
+        logs[out].append(ix.write_commit(f"{out.decode()}/3", 3, [("k", 3, 2)], live_before=1))
+    t._set_output(b"a", logs[b"a"], 3, 1, 3)
+    t._set_output(b"b", logs[b"b"], 3, 1)
+    event, _, held_back = t.progress_ops(plan, [([], [("k", 3)]), ([], [("k", 3)])])
+    assert held_back == [["k"], ["k"]]
+    logs[b"b"].append(ix.write_commit("b/4", 4, [("k", 4, None)], live_before=1, clear=True))
+    t._set_output(b"b", logs[b"b"], 4, 1, 4)
     t.apply(event)
     assert t.owed(b"r/b", {}) == ([("k", "updated")], None)

@@ -100,16 +100,11 @@ impl Part {
                 .into_iter()
                 .chain(outcome_state(&p.edge))
                 .collect(),
-            Part::Batch(p) => {
-                let mut v = vec![on("edge", &p.edge)];
-                if let Some((output, _)) = &p.fence {
-                    v.push(on("output", output));
-                }
-                if p.reset {
-                    v.extend(outcome_state(&p.edge));
-                }
-                v
-            }
+            Part::Batch(p) if p.reset => [on("edge", &p.edge)]
+                .into_iter()
+                .chain(outcome_state(&p.edge))
+                .collect(),
+            Part::Batch(p) => vec![on("edge", &p.edge)],
             Part::Consumed(p) => vec![on("edge", &p.edge)],
             Part::OutputCommit(p) => vec![on("output", &p.output)],
             Part::FullRunDone(p) => vec![on("output", &p.output)],
