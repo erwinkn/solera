@@ -46,6 +46,10 @@ const EDGE: &str = "checks/items";
 struct Log {
     states: Vec<BTreeMap<Key, Ver>>,
     layers: Vec<LayerRef>,
+    /// The commits that cleared, ascending.
+    clears: Vec<u64>,
+    /// The clear that started a full run still under way.
+    full_run: Option<u64>,
 }
 
 impl Log {
@@ -62,13 +66,23 @@ impl Log {
         ix: &ChangeIndex,
         t: &mut Tracking,
         changes: BTreeMap<Key, Ver>,
+        clear: bool,
+        ends: bool,
     ) -> bool {
         let before = self.states.last().unwrap().clone();
-        let mut after = before.clone();
+        let mut after = if clear {
+            BTreeMap::new()
+        } else {
+            before.clone()
+        };
         let mut run = Run::new();
         let c = self.head() + 1;
         for (k, new) in &changes {
-            let old = before.get(k).cloned().unwrap_or_default();
+            let old = if clear {
+                Ver::Absent
+            } else {
+                before.get(k).cloned().unwrap_or_default()
+            };
             if *new == old {
                 continue;
             }
@@ -87,19 +101,26 @@ impl Log {
             time_ms: 0,
             producer: b"",
             live_before: before.len() as u64,
-            clear: false,
+            clear,
         };
         let path = format!("items/c{c}");
         self.layers
             .push(ix.write_commit(&path, nc, &run).await.unwrap());
         self.states.push(after);
+        if clear {
+            self.clears.push(c);
+            self.full_run = Some(c);
+        }
+        if ends {
+            self.full_run = None;
+        }
         t.outputs.insert(
             key("items"),
             Output {
                 layers: self.layers.clone(),
                 head: c,
                 live: self.states.last().unwrap().len() as u64,
-                full_run: None,
+                full_run: self.full_run,
             },
         );
         true
@@ -125,6 +146,9 @@ enum Deferred {
 /// A batch's commit, built and not yet applied.
 struct Built {
     plan: plan::Plan,
+    /// Whether the input was unsettled when B3 built the batch's progress,
+    /// which decides its hold-backs.
+    unsettled: bool,
     parts: Vec<Part>,
     ops: Ops,
     failed: Vec<(Key, Reported)>,
@@ -152,7 +176,7 @@ struct World {
     counters: Counters,
     files: u64,
     events: u64,
-    stats: [usize; 6],
+    stats: [usize; 7],
     /// Plans held back to commit late, after the state moved on.
     stale: Vec<plan::Plan>,
     /// Every key a batch runs fails (a bad deploy).
@@ -402,7 +426,6 @@ impl World {
             failed: failed.iter().map(|(k, _)| k.clone()).collect(),
             loaded: loaded.clone(),
         };
-        let planned = self.t.progress_ops(p, &[report], b"", None).ok()?;
         let counters = match (
             &self
                 .t
@@ -416,8 +439,9 @@ impl World {
         };
         // The engine builds the outcomes from a view, then applies them under
         // its lock: the input may commit in between, and a refused commit is
-        // built again.
+        // built again, its progress too.
         loop {
+            let planned = self.t.progress_ops(p, &[report.clone()], b"", None).ok()?;
             let b = self
                 .build(ix, p, &planned, &failed, &loaded, counters)
                 .await?;
@@ -447,7 +471,7 @@ impl World {
                 let r = self.report();
                 failed.push((c.key.clone(), r));
             }
-            if self.rng.random_bool(0.15) {
+            if self.rng.random_bool(0.3) {
                 let v = self.log.at(self.log.head(), &c.key);
                 if v != c.version && !v.is_absent() && !c.version.is_absent() {
                     loaded.push((c.key.clone(), v));
@@ -467,6 +491,13 @@ impl World {
         loaded: &[(Key, Ver)],
         counters: Counters,
     ) -> Option<Built> {
+        let head = p.inputs[0].head;
+        let unsettled = self.log.full_run.is_some()
+            || self
+                .log
+                .clears
+                .iter()
+                .any(|&c| head < c && c <= self.log.head());
         self.catch_up(ix).await;
         let mut ops = planned.clone();
         let v = self.t.outcome_view(EDGE.as_bytes()).unwrap();
@@ -496,6 +527,7 @@ impl World {
         .ok()?;
         Some(Built {
             plan: p.clone(),
+            unsettled,
             parts,
             ops,
             failed: failed.to_vec(),
@@ -509,6 +541,7 @@ impl World {
     fn land(&mut self, b: Built) -> Option<Vec<Key>> {
         let Built {
             plan: p,
+            unsettled,
             mut parts,
             ops,
             failed,
@@ -541,7 +574,30 @@ impl World {
         let ip = &p.inputs[0];
         let fails: BTreeMap<Key, Reported> = failed.into_iter().collect();
         let loaded: BTreeMap<Key, Ver> = loaded.into_iter().collect();
+        // A key loaded at another version than planned while the input was
+        // mid full run, or cleared since the plan, when B3 built the batch's
+        // progress is held back: it keeps what it held and its outcome (D205,
+        // the model's ev_commit).
+        let held: Vec<Key> = ip
+            .keys
+            .iter()
+            .filter(|c| {
+                unsettled
+                    && loaded.get(&c.key).is_some_and(|v| {
+                        owed(
+                            &Holding::of(v.as_version(), &ip.conditions, &c.key),
+                            &Holding::of(c.version.as_version(), &ip.conditions, &c.key),
+                        )
+                    })
+            })
+            .map(|c| c.key.clone())
+            .collect();
+        assert_eq!(ops.held_back[0], held, "B3 holds back what the model does");
+        self.stats[6] += held.len();
         for c in &ip.keys {
+            if held.binary_search(&c.key).is_ok() {
+                continue;
+            }
             let got = loaded.get(&c.key).unwrap_or(&c.version);
             let tried = Holding::of(got.as_version(), &ip.conditions, &c.key);
             if fails.contains_key(&c.key) && !owed(&self.holding(&c.key), &tried) {
@@ -817,7 +873,11 @@ impl World {
             .await
             .unwrap();
         if upstream_meanwhile {
-            self.upstream(ix).await;
+            if self.rng.random_bool(0.4) {
+                self.upstream_clear(ix).await;
+            } else {
+                self.upstream(ix).await;
+            }
         }
         self.stats[0] += 1;
         // A batch whose input moved on commits only after the catch-up, and
@@ -900,7 +960,24 @@ impl World {
                 changes.insert(k, version(&mut self.rng));
             }
         }
-        if self.log.commit(ix, &mut self.t, changes).await {
+        let ends = self.rng.random_bool(0.5);
+        if self.log.commit(ix, &mut self.t, changes, false, ends).await {
+            self.reverted();
+        }
+    }
+
+    /// A full run of the input begins: its first commit clears, and the run
+    /// may go on over later commits.
+    async fn upstream_clear(&mut self, ix: &ChangeIndex) {
+        let mut changes = BTreeMap::new();
+        for k in self.universe.clone() {
+            if self.rng.random_bool(0.6) {
+                changes.insert(k, Ver::Int(self.rng.random_range(1..4)));
+            }
+        }
+        let ends = self.rng.random_bool(0.3);
+        trace("the input clears");
+        if self.log.commit(ix, &mut self.t, changes, true, ends).await {
             self.reverted();
         }
     }
@@ -1113,6 +1190,8 @@ fn world(seed: u64) -> World {
         log: Log {
             states: vec![BTreeMap::new()],
             layers: vec![],
+            clears: vec![],
+            full_run: None,
         },
         universe,
         now,
@@ -1126,7 +1205,7 @@ fn world(seed: u64) -> World {
         },
         files: 0,
         events: 0,
-        stats: [0; 6],
+        stats: [0; 7],
         stale: vec![],
         era: 0,
     };
@@ -1138,11 +1217,11 @@ fn world(seed: u64) -> World {
     w
 }
 
-async fn history(seed: u64, ix: &ChangeIndex) -> [usize; 6] {
+async fn history(seed: u64, ix: &ChangeIndex) -> [usize; 7] {
     let mut w = world(seed);
     let trace = std::env::var("OUTCOME_TRACE").is_ok();
     for step in 0..60 {
-        let op = w.rng.random_range(0..34);
+        let op = w.rng.random_range(0..36);
         if trace {
             eprintln!(
                 "step {step} op {op} head {} now {:?} clock {} counters {:?}",
@@ -1207,6 +1286,7 @@ async fn history(seed: u64, ix: &ChangeIndex) -> [usize; 6] {
             31 => w.close_reopen(),
             32 => w.rename_round(),
             33 => w.rename_away_reopen(),
+            34 | 35 => w.upstream_clear(ix).await,
             23 => w.hold(ix).await,
             24 => w.late(ix).await,
             25 => w.defer(ix).await,
@@ -1304,7 +1384,7 @@ fn random_histories() {
         .enable_all()
         .build()
         .unwrap();
-    let mut total = [0usize; 6];
+    let mut total = [0usize; 7];
     let only: Option<u64> = std::env::var("OUTCOME_SEED")
         .ok()
         .and_then(|s| s.parse().ok());
@@ -1315,7 +1395,7 @@ fn random_histories() {
         }));
         match s {
             Ok(s) => {
-                for i in 0..6 {
+                for i in 0..7 {
                     total[i] += s[i];
                 }
             }
@@ -1325,7 +1405,7 @@ fn random_histories() {
             }
         }
     }
-    eprintln!("{seeds} histories: change batches {}, key lists {}, retry passes {} taking {} keys, failing keys left {}, late commits accepted {}", total[0], total[1], total[2], total[3], total[4], total[5]);
+    eprintln!("{seeds} histories: change batches {}, key lists {}, retry passes {} taking {} keys, failing keys left {}, late commits accepted {}, keys held back {}", total[0], total[1], total[2], total[3], total[4], total[5], total[6]);
 }
 
 /// A retry batch planned in one pass never commits in another (review F3):
@@ -1350,7 +1430,7 @@ fn a_retry_batch_belongs_to_its_pass() {
             .iter()
             .map(|k| (k.clone(), Ver::Int(5)))
             .collect();
-        assert!(w.log.commit(&ix, &mut w.t, changes).await);
+        assert!(w.log.commit(&ix, &mut w.t, changes, false, true).await);
         w.fail_all = true;
         loop {
             w.change_batch(&ix, false).await;
@@ -1465,7 +1545,7 @@ impl World {
                 v => (key(k), Ver::Int(*v)),
             })
             .collect();
-        assert!(self.log.commit(ix, &mut self.t, changes).await);
+        assert!(self.log.commit(ix, &mut self.t, changes, false, true).await);
     }
 
     async fn planned(
@@ -2197,4 +2277,133 @@ fn a_retry_batch_of_a_pass_in_an_earlier_life_is_refused() {
         });
     }
     assert!(met > 0, "no restart gave the new pass the old one's number");
+}
+
+/// A key B3 holds back keeps its record as it is (D205): it was loaded at
+/// another version than planned while the input is mid full run, so the
+/// failure the worker reports for it is not recorded, and its point holds
+/// what the consumer held.
+#[test]
+fn a_held_back_key_keeps_its_record() {
+    let rt = runtime();
+    let ix = index(&rt);
+    rt.block_on(async {
+        let mut w = scripted();
+        let c = w.counters;
+        w.input(&ix, &[("k1", 5), ("k2", 5)]).await;
+        let first = w.planned(&ix, None, 10, Mode::Incremental).await;
+        let ev = w
+            .commit_of(&ix, &first, &[("k1", Kind::Transient)], &[], c)
+            .await
+            .unwrap();
+        w.apply(ev);
+        let before = w.stored(&ix).await[&key("k1")].clone();
+        w.input(&ix, &[("k1", 6)]).await;
+        let p = w.planned(&ix, None, 10, Mode::Incremental).await;
+        assert_eq!(taken(&p), [key("k1")]);
+        let changes = [(key("k1"), Ver::Int(7)), (key("k2"), Ver::Int(5))].into();
+        assert!(w.log.commit(&ix, &mut w.t, changes, true, false).await);
+        if let Some(parts) = w.caught(&ix).await {
+            w.apply(parts);
+        }
+        let ev = w
+            .commit_of(&ix, &p, &[("k1", Kind::Transient)], &[("k1", 7)], c)
+            .await
+            .unwrap();
+        w.apply(ev);
+        assert_eq!(w.stored(&ix).await[&key("k1")], before);
+        let edge = &w.t.edges[EDGE.as_bytes()];
+        let pt = edge.progress.keyed().unwrap().point(b"k1").unwrap();
+        assert_eq!(pt.reason, solera_tracking::progress::Reason::Unsettled);
+    });
+}
+
+/// A retry batch whose only key B3 holds back (D205) still moves its pass
+/// on, and the key's record stays as it is, so the pass ends covering a
+/// deploy the key was not retried under. The key gets that retry all the
+/// same: it was held back because its input moved after the plan, so either
+/// the input returns to what the key failed on and the catch-up lowers what
+/// the last pass covers, or it stays changed and the key comes with its
+/// change, tried under the deploy now.
+#[test]
+fn a_retry_batch_whose_only_key_is_held_back_still_gets_its_deploy_retry() {
+    let rt = runtime();
+    for returns in [true, false] {
+        let ix = index(&rt);
+        rt.block_on(async {
+            let mut w = scripted();
+            let c1 = w.counters;
+            w.input(&ix, &[("k1", 5)]).await;
+            let first = w.planned(&ix, None, 10, Mode::Incremental).await;
+            let ev = w
+                .commit_of(&ix, &first, &[("k1", Kind::Failed)], &[], c1)
+                .await
+                .unwrap();
+            w.apply(ev);
+            while let Some(parts) = w.start_of(&ix).await {
+                w.apply(parts);
+                let step = w.retry_plan(&ix, 10).await;
+                let ev = w.commit_of(&ix, &step, &[], &[], c1).await.unwrap();
+                w.apply(ev);
+            }
+            w.counters.deploy = 2;
+            let c2 = w.counters;
+            let start = w.start_of(&ix).await.expect("the deploy starts a pass");
+            w.apply(start);
+            let step = w.retry_plan(&ix, 10).await;
+            assert_eq!(taken(&step), [key("k1")]);
+            // The input starts a full run under the retry batch: the worker
+            // loads k1 at another version than planned.
+            let changes = [(key("k1"), Ver::Int(7))].into();
+            assert!(w.log.commit(&ix, &mut w.t, changes, true, false).await);
+            if let Some(parts) = w.caught(&ix).await {
+                w.apply(parts);
+            }
+            let before = w.stored(&ix).await[&key("k1")].clone();
+            let ev = w
+                .commit_of(&ix, &step, &[("k1", Kind::Failed)], &[("k1", 7)], c2)
+                .await
+                .unwrap();
+            w.apply(ev);
+            assert_eq!(w.stored(&ix).await[&key("k1")], before);
+            let edge = &w.t.edges[EDGE.as_bytes()];
+            let pt = edge.progress.keyed().unwrap().point(b"k1").unwrap();
+            assert_eq!(pt.reason, solera_tracking::progress::Reason::Unsettled);
+            let k = &w.t.per_key[EDGE.as_bytes()];
+            assert!(k.pass.is_none(), "the batch ended its pass");
+            assert_eq!(k.last.deploy, 2, "the pass covers the deploy");
+            assert_eq!(before.stored.deploy, 1, "k1 was not retried under it");
+            assert!(
+                w.start_of(&ix).await.is_none(),
+                "k1's input changed: no pass is due for it"
+            );
+            if returns {
+                // The input returns to what k1 failed on: it waits for its
+                // retry again, and the deploy's pass comes back for it.
+                let changes = [(key("k1"), Ver::Int(5))].into();
+                assert!(w.log.commit(&ix, &mut w.t, changes, false, true).await);
+                if let Some(parts) = w.caught(&ix).await {
+                    w.apply(parts);
+                }
+                assert!(taken(&w.planned(&ix, None, 10, Mode::Incremental).await).is_empty());
+                let start = w.start_of(&ix).await;
+                w.apply(start.expect("k1 waits for the deploy's retry"));
+                assert_eq!(taken(&w.retry_plan(&ix, 10).await), [key("k1")]);
+            } else {
+                // The input stays changed: k1 comes with its change, and its
+                // failure is recorded under the deploy now.
+                let p = w.planned(&ix, None, 10, Mode::Incremental).await;
+                assert_eq!(taken(&p), [key("k1")]);
+                let ev = w
+                    .commit_of(&ix, &p, &[("k1", Kind::Failed)], &[], c2)
+                    .await
+                    .unwrap();
+                w.apply(ev);
+                let rec = w.stored(&ix).await[&key("k1")].clone();
+                assert_eq!((rec.on.clone(), rec.stored.deploy), (Ver::Int(7), 2));
+                assert!(!eligible(&rec.stored, w.clock, &w.counters));
+                assert!(w.start_of(&ix).await.is_none());
+            }
+        });
+    }
 }

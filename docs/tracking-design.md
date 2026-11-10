@@ -32,7 +32,7 @@ Two kinds of label appear below:
 
 - **Settled.** Decided, with its decision number: D180, D183, D184 from
   before, D187 to D204 from Erwin's answers of 2026-11-10, and D205 to
-  D209 from the experiments and the build that followed. §17 lists each
+  D210 from the experiments and the build that followed. §17 lists each
   with its evidence. Nothing in this design is pending.
 - **P1 to P16** are the names this design gave its proposals before they
   were decided. They are kept as names, so that §17 can map each to its
@@ -447,9 +447,9 @@ input change, which the commit check lets through, and the piece's
 conditions then make its keys owed. Inside that range the batch leaves a
 point for exactly the keys whose holding differs from what the new piece
 says: failed keys, keys held back from the batch, and keys loaded at
-another version. Each point written carries its reason (failed, held back,
-deviation, key list), which lineage needs (§12). Every other point in the
-range is dropped.
+another version. Each point written carries its reason (failed, held back
+by the planner, held back at commit, deviation, key list), which lineage
+needs (§12). Every other point in the range is dropped.
 
 **Why it is correct.** A key in the range that the batch did not take was
 not owed at H, which means it already held what `at(H)` says.
@@ -529,11 +529,34 @@ these additions:
   every key it loaded at another version than it planned while its input's
   output is mid full run (`Output.full_run`, B4) or when a clear came in
   since the batch's head (the layers' `clears`): the key keeps what it held,
-  even if it also failed, and stays owed. A key held back on one input is
-  held back on every input of the batch, since its output is one value
-  computed from all of them. `Ops.held_back` names those keys
-  for the key outcomes (B6). The gate that holds readers of an incomplete
-  upstream is the engine's (B5).
+  even if it also failed, and stays owed. On such an input it also holds
+  back every key of the batch that input did not take (another input did):
+  the worker loaded it there with no planned version to check the load
+  against. A key held back on one input is held back on every input of the
+  batch, since its output is one value computed from all of them.
+  `Ops.held_back` names those keys for the key outcomes (B6), and their
+  points carry their own reason, `Unsettled`, apart from the planner's
+  `HeldBack`, so lineage can tell a key the batch never took from one it
+  took and held back. The gate that holds readers of an incomplete upstream
+  is the engine's (B5).
+- **The commit is fenced against what decides a hold-back.** A batch that
+  kept a key on a settled input that it would have held back had the input
+  been unsettled (loaded at another version, or not taken there) carries a
+  fence: that input's output and the head it planned at. The event is
+  refused if the edge reads another output by then, or the input has become
+  unsettled. A batch that held all such keys back carries no fence for that
+  input: holding back is always safe, and at worst costs a later batch.
+  Every part of an event is checked on the state before it, so the fence
+  answers for the batch applied ahead of the rest of its event; another
+  part may commit to the output it reads, as a source load report does
+  (P13).
+- **What the commit cannot check, it refuses.** `progress_ops`, and a
+  fenced event when it applies, refuse once a fold of the input's layers
+  has passed the batch's head (a layer's `floor` above it): the fold
+  dropped the clears after the head, so whether one came in is no longer
+  known. `progress_ops` also refuses a plan whose edge now reads another
+  output than it planned on, and a report that names a key its input did
+  not take.
 
 ## 6. Staleness kept exact by propagation
 
@@ -578,9 +601,14 @@ was last brought up to.
 - **stale(w, reason, since, X)**: key w, the **witness**, is due as of X,
   for this reason, and the edge has been stale since that moment.
 
-To keep STA-2 ("a stale partition says every reason that holds"), the
-edge keeps one witness per kind of reason: input changed, conditions
-changed, never processed, retry due.
+**Settled (D210): every reason that holds is listed when asked** (STA-2,
+"a stale partition says every reason that holds"). The status names the
+witness's reason at once. The full list (input changed, conditions
+changed, never processed, retry due) comes with the count, from the same
+walk of the planner, and is cached with it. No witness is kept per kind of
+reason, and an upstream commit does no extra work for reasons. `OnChange`
+needs only stale or fresh; the console shows the status at once and the
+reasons when they arrive.
 
 ### The rules
 
@@ -694,13 +722,109 @@ scattered daily changes.
 | Question | Answer |
 |---|---|
 | Is anything due on this edge? | The edge has a witness |
-| Why? | The reason of each witness kept, one per kind: input changed (behind the head), conditions changed (patterns, context, definition or rebuild counter), never processed (`empty`), retry due; or "upstream incomplete" while a gate holds the edge |
+| Why? | The witness's reason at once; every reason that holds when asked, with the count (D210): input changed (behind the head), conditions changed (patterns, context, definition or rebuild counter), never processed (`empty`), retry due; or "upstream incomplete" while a gate holds the edge |
 | Is the partition stale? | Any of its edges has a witness (STA-3: a default run would load something) |
 | Upstream stale | A partition whose stale status flips tells its consumers, which tell theirs: work only where the status changes |
 | Complete? (D177) | For each `empty` piece, whether it has an upstream key: one key or none |
-| How many keys owed? | Counted when asked: the keys an unlimited plan would take plus the owed keys not yet due (failing keys waiting for their retry, and keys held back while their producer repairs an anomaly, §8), each counted once; cached until the upstream, the progress or the conditions (patterns, context, definition, rebuild counter) change. No number while a gate holds the edge (D197) |
+| How many keys owed? | Counted when asked: the keys an unlimited plan would take plus the owed keys not yet due (failing keys waiting for their retry, and keys held back while their producer repairs an anomaly, §8), each counted once; cached until the upstream, the progress or the conditions (patterns, context, definition, rebuild counter) change. The reasons that hold come with it (D210). No number while a gate holds the edge (D197) |
 | How many commits behind, since when? | The oldest owing piece's commit, against the head and the commit headers; "since" from the witness |
 | Which keys? | The planner without a limit, on demand; costs a read proportional to the answer |
+
+### As built (B7, `native/tracking/src/stale/`)
+
+The witness (D206) is built as follows. Per keyed edge the core keeps its
+conditions now (a watch event, journaled when the edge opens and whenever
+a deploy changes them), a generation, and what is known: fresh, or stale
+with a witness, its reason and since when, exact for the edge's progress
+and conditions at one generation, as of one upstream commit.
+
+- **Applying an event never reads the index.** A batch commit, a reset, a
+  rename, new conditions or points a batch's outcomes set (B6) start a new
+  generation and record which key ranges changed (a reset, a batch that
+  resets progress, new conditions or outcomes' points: all of them); so do
+  a full run asked for by hand (B6's `Rebuild`; staleness reads the
+  rebuild counter from B6, not from the watch, so a watch journaled with
+  an older counter never undoes it), the start of a retry pass
+  (B6), with no range changed, and the end of a full run, for the readers
+  its gate held. What is known then stops being
+  current, and the status reads "unknown" until a refresh. Generations come from one counter and
+  are never reused, so a part for an edge since closed never applies to one
+  reopened under its name.
+- **At an upstream commit** (rules 1 and 2), the commit builder feeds each
+  entry to staleness as it writes it, and staleness adds a witness part to
+  the commit's own event for every current edge reading the output: fresh, the first
+  entry the patterns take with no point makes it stale; stale, a commit
+  that does not touch the witness changes nothing. An edge the entries
+  cannot decide (the commit touches its witness, or a point differs) is
+  left for a refresh. So is every reader of a commit that clears (its
+  entries do not show the keys the clear removed) or of an output mid full
+  run, and every edge with failure records: B6 keeps what a failing key
+  holds in a record, not a point, and the notice reads no index.
+- **A refresh** (rules 3, 4, 6, 7) brings an edge current from the index: a
+  stale witness is rechecked at the head, and a probe looks for another
+  only if it is no longer due; fresh as of commit X, rule 1 runs over the
+  diff from X to the head outside the changed ranges (there the edge still
+  holds what upstream had at X), then one probe from the first changed
+  range; otherwise one probe from the first key. On an edge with failure
+  records, rule 1's candidates and the rechecked witness are checked
+  against B6's records first: a key is due only if the consumer does not
+  hold, by its record, what upstream has now, and it was not tried at that
+  version already (then it waits for its retry). The probe is the planner,
+  which reads the records itself. The check is bounded by the diff since
+  the last exact answer plus one records lookup per 1,024 candidates, and
+  stops at the first due key. Records hold only after B6's catch-up has
+  looked for reverts through the head under the conditions now (KEY-3), so
+  a refresh, a count or a key list on an edge with failure records is
+  refused until then, as B6's commit is; the engine catches up first. A
+  key the engine names not due is never due by rule 1, point or not, as
+  the planner's probe holds it back. A refresh reads what
+  changed since the last exact answer instead of replaying commits in
+  order, so rule 7's catch-up never applies an old commit to newer progress
+  or conditions.
+- **A witness part applies only to the generation it was computed for** and
+  never moves X back: a part computed against progress that moved is
+  dropped and recomputed. A lost or late notice delays an answer, never
+  changes it.
+- **Retries** (rule 5) have one definition, B6's: a retry is due while a
+  retry pass is under way. Its `PassStart` starts a new generation, so a
+  part computed before it is dropped, and a refresh that finds nothing
+  else due names the pass's next key, "retry due" (B6's retry plan in
+  pages of 256 keys, each from where the last stopped, until one is taken:
+  memory stays bounded however many keys went moot, and a pass by counters
+  walks its records 1,024 at a time, 0.48 s behind 1M records it does not
+  retry where a page of one key took 44.5 s). A witness no
+  longer due gives way to the pass's next key before any probe.
+- **The gate** (rule 8) reads the output's full-run state (§4: a clear
+  starts it; a commit with `ends_full_run`, or `FullRunDone`, ends it).
+  Meanwhile readers that keep the gate read "held: upstream incomplete",
+  with no count, and when it ends they are probed again.
+- **Counts** are the planner's owed count in two parts: the keys due now,
+  which the page of owed keys lists, and the keys owed but not due (failing
+  keys waiting for their retry, keys held back). A key a retry pass will
+  retry stays in the second; the pass gives the reason "retry due". The
+  count is cached until the edge's generation, its upstream's head, the
+  keys not due or the head of its failure records move.
+- **Reasons** (D210): the status names the witness's reason; a count also
+  lists every reason that holds for a due key, from the same walk. A key
+  owed by a piece processed under other conditions reads "conditions
+  changed", whatever upstream did since; the notice, the probe and the count
+  give each key the same reason.
+
+At 100M keys (`bench/core/stale/`, `results/run-100m.log`): a notice
+costs 1 to 4 µs per edge (50 edges reading a commit of 10k to 45k
+entries), and about 86 ns per entry per edge when no entry matters; a
+count, reasons included, costs 1.1 s cold and 0.57 to 0.70 s warm for an
+edge a day behind and 15 s cold for 30 days behind, where the index's diff
+alone takes 0.85 s and 5.5 s cold. On an edge with a million failure
+records, a refresh after an hourly commit that touches no failing key costs
+0.29 to 0.55 ms warm (130 ms cold, 5 GETs). In the adverse case, where
+every key the commit changed is a failing key waiting for its retry
+(upstream reverted each to exactly the version it failed at), it reads the
+records of all 45k candidates: 50 to 75 ms warm, 1.6 s cold (49 GETs). A
+count a day behind costs 0.84 to 1.03 s warm and 2.2 s cold, the extra
+over an edge without records being the planner's own record reads (B6);
+N11's warm target is 1.0 s for an edge with failure records and 0.8 s
+without.
 
 ## 7. A batch from start to finish
 
@@ -812,7 +936,8 @@ About 200 bytes plus the replaced slice, usually one piece.
   a wrong list.
 - **Points written** carry the deviations (§8): keys loaded at another
   version than planned, with the version loaded. Each point names its
-  reason: failed, held back, deviation, or key list.
+  reason: failed, held back by the planner, held back at commit (§10 rule
+  4), deviation, or key list.
 - **A key-list run records its key list**, the one case where planned keys
   are stored: the user's input cannot be derived.
 
@@ -1226,10 +1351,15 @@ upstream's clear still makes its consumer run full (INC-13 stays).
    than it planned, if its upstream is incomplete, **or if a clear has
    come since the batch planned** (in the commits after its head H), even
    when that rebuild has completed by the time the batch commits. The key
-   keeps its old point and stays owed; a later batch retries it. On stores
-   that name objects by version a load is exact, so this never fires. On a
-   table it is the same rule as §8's rule 4, and is built as one rule with
-   it. To tell which rebuild, if any, a key loaded as absent belongs to,
+   keeps its old point and stays owed; a later batch retries it. A key held
+   back on any input of a batch is held back on every input of that batch,
+   because the key's output is one value computed from all its inputs:
+   holding it back on one input only would either keep an output built on
+   a load from the middle of a rebuild, or throw that output away while the
+   other inputs record their new versions as processed, so the key would
+   never be retried for them. On stores that name objects by version a load
+   is exact, so this never fires. On a table it is the same rule as §8's
+   rule 4, and is built as one rule with it. To tell which rebuild, if any, a key loaded as absent belongs to,
    the engine looks at the commit that last removed it (by a clear or by
    an ordinary removal): the last removal at or before H when the batch
    planned the key absent, and, only on a table for a key planned present
@@ -1392,9 +1522,9 @@ described above, with these choices:
   of 17–24 ms. Failures older than the input's last merge are read by a
   lookup at the head instead of a window: 72,700 keys a second, 118–132 ms
   a batch, accepted as measured (Captain, 2026-11-10).
-- **Not built yet: the hold-back at commit** (D205, §10): it needs B3's
-  report to name held-back keys, which comes with clears. Until then the
-  engine must not commit a batch that held keys back.
+- **The hold-back at commit** (D205, §10): a key in B3's `Ops.held_back`
+  keeps its record as it is, failed or not, and B3's `Unsettled` point
+  stands.
 
 ## 12. History
 
@@ -1783,6 +1913,7 @@ store is exact" stands: D196 keeps it.
 | D207 | The engine builds every commit, on a thread off its event loop; nothing goes to a worker | Review F4 | §4, §7 | SOLE-12 at 100M keys: a 10k-key batch in one range about 10 ms CPU, 11–15 GETs cold, one 62 KB PUT; a 100M-key commit streamed about 30 s CPU, 579 MB peak. The scattered 10k-key batch (2.6–2.9 s) is the index's `get`, to be fixed there |
 | D208 | The core does its own I/O in Rust (`object_store`), with one shared memory cache, single-flight fetches and an on-disk cache of layer files; synchronous calls that release the GIL; heavy queries capped by the engine | The I/O boundary | §1, §15 | SOLE-6, 50 concurrent queries on local files, S3 and S3 + 30 ms: equal on small queries; on 1K scattered gets Python fetching cost 100–120 µs more CPU per GET, stalled the event loop up to 0.76 s (Rust under 60 ms) and was 3–93% slower. Cost: +60 s release build, +8 MB |
 | D209 | A `Regex(...)` key pattern uses the Rust `regex` dialect, matched against the whole key, validated at declaration by the native matcher, which today's Python path also matches through; lookaround and backreferences are refused | A contract choice in the build (SOLE-11) | §9 | Two dialects would make the SDK and the core disagree on which keys are owed; matching in Python would cross once per key; the Rust dialect is linear-time. Pre-usage, so no pattern breaks. Visible to users |
+| D210 | Staleness reasons (STA-2): an edge's status names its witness's reason at once; every reason that holds is computed when asked, by the same walk as the count, and cached with it. No witness per kind of reason, no extra work at commits | §6's one witness per kind of reason | §6 | B7 at 100M keys: listing the reasons adds nothing measurable to a count a day behind (0.58 to 0.71 s warm with them, 0.58 to 0.70 s without), once a memo per piece keeps the per-key pattern match out. Four witnesses would mean up to four probes after a batch and four states per edge, for a list only the console shows |
 | D211 | On a table, an ordinary output's full run builds beside the published rows and the store switches once, in one transaction, when the run ends; outside Solera a table shows all old rows, then all new. Solera reads what its commits name. The write context carries the core's full run in progress and the run whose end the store was not yet told; the engine owes `Store.full_run_ended(output, partition, run)` in the journal event that ends the run (its last commit, `FullRunDone`, or a release), calls it once no attempt of the partition is in flight or unrepaired, journals `FullRunNoticed(run)` after it, and repeats it after a crash; a newer run's journaled clear drops the debt. An ordinary output's first run is a full run | Erwin's ask (2026-11-10): outside readers never see a half-built table, with the mechanism in the store | §8, §10 | Model: twelve rules (§18), each failing alone in 24 to 1,500 of 1,500 histories, 5,000 histories pass with all on. PostgreSQL 16 at 10M rows: outside queries keep their plan; build 136 s + switch 101 s (4.7 GB WAL) against 212 s in place; a side-column view switched in 2 ms but outside group and join queries paid 18% to 37% more; `ALTER TABLE` swaps waited behind a 10 s reader |
 
 Nothing in this design is pending. What remains to measure (the cost of a
@@ -1890,8 +2021,8 @@ hold-back.
 
 **What it does not check yet:** stores that write in place with late and
 dead writers (§8), cleanup against the cut (§13), lineage and digests
-(§12), several upstream levels rebuilding at once, one witness per kind of
-reason (STA-2), the propagation of "upstream stale" down the graph, and the
+(§12), several upstream levels rebuilding at once, the list of reasons
+that hold (STA-2, D210), the propagation of "upstream stale" down the graph, and the
 cost of any of it at the scale target. The first three are the model's
 next phase, before the units that build them (§15). The checks in §3, §4,
 §7, §8, §12 and §13 that the model does not cover were done by hand; the
