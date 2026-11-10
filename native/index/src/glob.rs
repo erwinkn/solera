@@ -3,110 +3,63 @@
 //! of leading directories (none included), `**` anything, `*` anything but
 //! `/`, `?` one character but `/`; everything else matches itself. A key
 //! is taken when it matches an include (any key, without one) and no exclude.
+//! Each glob compiles to the same regular expression as in Python, matched
+//! in linear time.
 
+use crate::error::{Error, Result};
+use regex::bytes::Regex;
 use std::ops::Bound;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum Tok {
-    Lit(Vec<u8>),
-    One,
-    Star,
-    Any,
-    AnyDir,
+#[derive(Clone, Debug)]
+pub struct Glob {
+    re: Regex,
+    prefix: Vec<u8>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Glob {
-    toks: Vec<Tok>,
+impl PartialEq for Glob {
+    fn eq(&self, o: &Glob) -> bool {
+        self.re.as_str() == o.re.as_str()
+    }
 }
+
+impl Eq for Glob {}
 
 impl Glob {
-    pub fn new(glob: &str) -> Glob {
-        let g = glob.as_bytes();
-        let mut toks: Vec<Tok> = Vec::new();
-        let mut i = 0;
-        while i < g.len() {
-            let t = if g[i..].starts_with(b"**/") {
-                i += 3;
-                Tok::AnyDir
-            } else if g[i..].starts_with(b"**") {
-                i += 2;
-                Tok::Any
-            } else if g[i] == b'*' {
-                i += 1;
-                Tok::Star
-            } else if g[i] == b'?' {
-                i += 1;
-                Tok::One
+    pub fn new(glob: &str) -> Result<Glob> {
+        let mut re = String::from("^(?:");
+        let mut prefix = None;
+        let mut rest = glob;
+        while let Some(c) = rest.chars().next() {
+            let (part, n) = if rest.starts_with("**/") {
+                ("(?:.*/)?", 3)
+            } else if rest.starts_with("**") {
+                (".*", 2)
+            } else if c == '*' {
+                ("[^/]*", 1)
+            } else if c == '?' {
+                ("[^/]", 1)
             } else {
-                if let Some(Tok::Lit(l)) = toks.last_mut() {
-                    l.push(g[i]);
-                } else {
-                    toks.push(Tok::Lit(vec![g[i]]));
-                }
-                i += 1;
+                re.push_str(&regex::escape(&rest[..c.len_utf8()]));
+                rest = &rest[c.len_utf8()..];
                 continue;
             };
-            toks.push(t);
+            prefix.get_or_insert(glob.len() - rest.len());
+            re.push_str(part);
+            rest = &rest[n..];
         }
-        Glob { toks }
+        re.push_str(")$");
+        let re = Regex::new(&re).map_err(|e| Error::Invalid(format!("glob {glob:?}: {e}")))?;
+        let prefix = glob.as_bytes()[..prefix.unwrap_or(glob.len())].to_vec();
+        Ok(Glob { re, prefix })
     }
 
     pub fn matches(&self, key: &[u8]) -> bool {
-        matches(&self.toks, key)
+        self.re.is_match(key)
     }
 
     /// The literal text every match starts with.
     pub fn prefix(&self) -> &[u8] {
-        match self.toks.first() {
-            Some(Tok::Lit(l)) => l,
-            _ => &[],
-        }
-    }
-}
-
-fn char_len(b: u8) -> usize {
-    match b {
-        0xf0..=0xff => 4,
-        0xe0..=0xef => 3,
-        0xc0..=0xdf => 2,
-        _ => 1,
-    }
-}
-
-fn matches(toks: &[Tok], s: &[u8]) -> bool {
-    let Some(t) = toks.first() else {
-        return s.is_empty();
-    };
-    let rest = &toks[1..];
-    match t {
-        Tok::Lit(l) => s.starts_with(l) && matches(rest, &s[l.len()..]),
-        Tok::One => {
-            !s.is_empty() && s[0] != b'/' && matches(rest, &s[char_len(s[0]).min(s.len())..])
-        }
-        Tok::Star => {
-            for i in 0..=s.len() {
-                if matches(rest, &s[i..]) {
-                    return true;
-                }
-                if i < s.len() && s[i] == b'/' {
-                    return false;
-                }
-            }
-            false
-        }
-        Tok::Any => {
-            if rest.is_empty() {
-                return true;
-            }
-            (0..=s.len()).any(|i| matches(rest, &s[i..]))
-        }
-        Tok::AnyDir => {
-            matches(rest, s)
-                || s.iter()
-                    .enumerate()
-                    .any(|(i, &c)| c == b'/' && matches(rest, &s[i + 1..]))
-        }
+        &self.prefix
     }
 }
 
@@ -118,11 +71,16 @@ pub struct Pattern {
 }
 
 impl Pattern {
-    pub fn new<S: AsRef<str>>(include: &[S], exclude: &[S]) -> Pattern {
-        Pattern {
-            include: include.iter().map(|g| Glob::new(g.as_ref())).collect(),
-            exclude: exclude.iter().map(|g| Glob::new(g.as_ref())).collect(),
-        }
+    pub fn new<S: AsRef<str>>(include: &[S], exclude: &[S]) -> Result<Pattern> {
+        let globs = |gs: &[S]| {
+            gs.iter()
+                .map(|g| Glob::new(g.as_ref()))
+                .collect::<Result<_>>()
+        };
+        Ok(Pattern {
+            include: globs(include)?,
+            exclude: globs(exclude)?,
+        })
     }
 
     #[inline]
