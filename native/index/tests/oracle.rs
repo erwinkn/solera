@@ -72,6 +72,8 @@ struct History {
     commits: Vec<Vec<(usize, O, O)>>,
     /// states[c][k]: k's version after commit c.
     states: Vec<Vec<O>>,
+    /// clears[c]: commit c clears the state first.
+    clears: Vec<bool>,
 }
 
 impl History {
@@ -96,8 +98,14 @@ impl History {
             keys,
             commits: vec![vec![]],
             states: vec![state.clone()],
+            clears: vec![false],
         };
+        let clearing = rng.random_bool(0.5);
         for c in 1..=n as u64 {
+            let clear = clearing && rng.random_bool(0.2);
+            if clear {
+                state.iter_mut().for_each(|v| *v = None);
+            }
             let mut changes = Vec::new();
             for (k, cur) in state.iter_mut().enumerate() {
                 if !rng.random_bool(p) {
@@ -124,8 +132,25 @@ impl History {
             }
             h.commits.push(changes);
             h.states.push(state.clone());
+            h.clears.push(clear);
         }
         h
+    }
+
+    /// Whether commit `c` changed key `k`'s version.
+    fn changed(&self, k: usize, c: u64) -> bool {
+        self.states[c as usize - 1][k] != self.states[c as usize][k]
+    }
+
+    /// Key `k`'s change at commit `c`, if it changed: (commit, new, replaced).
+    fn change(&self, k: usize, c: u64) -> Option<(u64, O, O)> {
+        self.changed(k, c).then(|| {
+            (
+                c,
+                self.states[c as usize][k].clone(),
+                self.states[c as usize - 1][k].clone(),
+            )
+        })
     }
 
     fn head(&self) -> u64 {
@@ -137,10 +162,6 @@ impl History {
         (1..=c)
             .rev()
             .find(|&x| self.commits[x as usize].iter().any(|e| e.0 == k))
-    }
-
-    fn entry(&self, k: usize, c: u64) -> Option<&(usize, O, O)> {
-        self.commits[c as usize].iter().find(|e| e.0 == k)
     }
 }
 
@@ -295,6 +316,7 @@ impl World {
             time_ms: c * 1000,
             producer: producer.as_bytes(),
             live_before,
+            clear: self.h.clears[c as usize],
         };
         let l = self
             .ix
@@ -342,7 +364,9 @@ impl World {
                 .map(|k| {
                     let newest = (c1 + 1..=c2)
                         .rev()
-                        .find(|&c| h.entry(k, c).is_some())
+                        .find(|&c| {
+                            h.changed(k, c) || h.commits[c as usize].iter().any(|e| e.0 == k)
+                        })
                         .unwrap();
                     let (a, b) = (
                         h.states[c2 as usize][k].clone(),
@@ -413,7 +437,7 @@ impl World {
                 .filter_map(|k| {
                     let mut es: Vec<(u64, O, O)> = (floor + 1..=head)
                         .rev()
-                        .filter_map(|c| h.entry(k, c).map(|e| (c, e.1.clone(), e.2.clone())))
+                        .filter_map(|c| h.change(k, c))
                         .collect();
                     if floor > 0 {
                         if let Some(v) = &h.states[floor as usize][k] {
@@ -442,7 +466,7 @@ impl World {
             .filter_map(|k| {
                 let es: Vec<(u64, O, O)> = (w1..=w2.min(head))
                     .rev()
-                    .filter_map(|c| h.entry(k, c).map(|e| (c, e.1.clone(), e.2.clone())))
+                    .filter_map(|c| h.change(k, c))
                     .collect();
                 (!es.is_empty()).then(|| (h.keys[k].clone(), es))
             })
@@ -478,6 +502,8 @@ impl World {
                     .count() as u64
             );
             assert_eq!(x.producer, format!("run-{}", x.commit).into_bytes());
+            let clear = h.clears[x.commit as usize];
+            assert_eq!(x.flags, if clear { format::CLEAR } else { 0 });
         }
         // below the floor nothing is answered
         if floor > 0 {
@@ -634,6 +660,7 @@ fn the_disk_cache_serves_reads_after_a_write_and_after_a_restart() {
             time_ms: 0,
             producer: b"",
             live_before: 0,
+            clear: false,
         };
         let layers = vec![ix.write_commit("c1", nc, &run).await.unwrap()];
         // written through: no GET
@@ -687,6 +714,7 @@ fn bad_references_and_abandoned_reads_leave_the_index_working() {
         time_ms: 0,
         producer: b"",
         live_before: 0,
+        clear: false,
     };
     let one = |v: u64| {
         let mut run = Run::new();
@@ -703,13 +731,39 @@ fn bad_references_and_abandoned_reads_leave_the_index_working() {
         let q = Query::default();
         // a flag this reader does not know is refused, even on a layer no read opens
         let flagged = LayerRef {
-            flags: 1,
+            flags: 2,
             ..l2.clone()
         };
         assert!(matches!(
             ix.scan(&[l1.clone(), flagged], 2, &q).await,
             Err(Error::Format(_))
         ));
+        // a clear flag goes with the commits that clear, as the file says
+        let flagged = LayerRef {
+            flags: format::CLEAR,
+            ..l2.clone()
+        };
+        assert!(matches!(
+            ix.scan(&[l1.clone(), flagged], 2, &q).await,
+            Err(Error::Invalid(_))
+        ));
+        let flagged = LayerRef {
+            flags: format::CLEAR,
+            clears: vec![1],
+            ..l1.clone()
+        };
+        assert!(matches!(
+            ix.scan(&[flagged], 1, &q).await,
+            Err(Error::Format(_))
+        ));
+        let past = LayerRef {
+            hi: u64::MAX,
+            floor: Some(u64::MAX),
+            flags: format::CLEAR,
+            clears: vec![u64::MAX],
+            ..l1.clone()
+        };
+        assert!(matches!(past.check(), Err(Error::Invalid(_))));
         // offsets out of order are refused before any read, and the index still reads
         let bad = LayerRef {
             top_start: l1.size + 1,
@@ -963,6 +1017,7 @@ fn the_caches_do_what_they_promise() {
         time_ms: 0,
         producer: b"",
         live_before: 0,
+        clear: false,
     };
     let layer = |i: u64| {
         let mut run = Run::new();
@@ -1086,6 +1141,7 @@ fn a_fill_that_cannot_be_kept_gives_its_room_back_once() {
         time_ms: 0,
         producer: b"",
         live_before: 0,
+        clear: false,
     };
     let run = |n: u64| {
         let mut run = Run::new();
@@ -1141,6 +1197,7 @@ fn a_commit_writer_writes_what_write_commit_writes() {
         time_ms: 5,
         producer: b"p",
         live_before: 10,
+        clear: false,
     };
     let mut rng = SmallRng::seed_from_u64(1);
     let mut run = Run::new();
@@ -1265,6 +1322,7 @@ fn a_truncated_layer_is_a_format_error() {
         time_ms: 0,
         producer: b"",
         live_before: 0,
+        clear: false,
     };
     let l = rt.block_on(index().write_commit("c1", nc, &run)).unwrap();
     let file = dir.join("c1");
@@ -1309,6 +1367,7 @@ fn write_throughs_stay_within_the_disk_cache() {
         time_ms: 0,
         producer: b"",
         live_before: 0,
+        clear: false,
     };
     let in_dir = |dir: &std::path::Path| -> u64 {
         std::fs::read_dir(dir)
@@ -1366,6 +1425,7 @@ fn merges_refuse_entries_that_do_not_chain() {
             time_ms: 0,
             producer: b"",
             live_before: 0,
+            clear: false,
         };
         let l1 = ix.write_commit("c1", nc(1), &run).await.unwrap();
         let mut run = Run::new();
@@ -1376,6 +1436,7 @@ fn merges_refuse_entries_that_do_not_chain() {
                 "c2",
                 NewCommit {
                     live_before: 1,
+                    clear: false,
                     ..nc(2)
                 },
                 &run,
@@ -1401,13 +1462,46 @@ fn merges_refuse_entries_that_do_not_chain() {
                 "ok2",
                 NewCommit {
                     live_before: 1,
+                    clear: false,
                     ..nc(2)
                 },
                 &run,
             )
             .await
             .unwrap();
-        ix.merge(&[l1, l2], 1..2, 0, "m3").await.unwrap();
+        ix.merge(&[l1.clone(), l2], 1..2, 0, "m3").await.unwrap();
+        // after a clear, a key's first entry replaces nothing, wherever the
+        // merge starts
+        let clear = ix
+            .write_commit(
+                "x2",
+                NewCommit {
+                    clear: true,
+                    ..nc(2)
+                },
+                &Run::new(),
+            )
+            .await
+            .unwrap();
+        let mut run = Run::new();
+        run.push_key(b"k");
+        run.push_entry(3, Version::Int(2), Version::Int(1));
+        let l3 = ix
+            .write_commit(
+                "x3",
+                NewCommit {
+                    live_before: 1,
+                    ..nc(3)
+                },
+                &run,
+            )
+            .await
+            .unwrap();
+        let layers = vec![l1, clear, l3];
+        for (run, cut) in [(0..3, 0), (0..3, 3), (1..3, 0)] {
+            let e = ix.merge(&layers, run, cut, "m4").await.unwrap_err();
+            assert!(matches!(e, Error::Chain(_)), "{e}");
+        }
     });
 }
 

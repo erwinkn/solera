@@ -150,6 +150,30 @@ def test_a_merge_refuses_entries_that_do_not_chain(tmp_path):
         ix.merge([l1, l2], 0, 2, 0, "m")
 
 
+def test_a_clear_removes_what_its_full_run_does_not_write(tmp_path):
+    ix = ChangeIndex(f"file://{tmp_path}")
+    layers = [ix.write_commit("c1", 1, [("a", 1, None), ("b", 2, None)])]
+    layers.append(ix.write_commit("c2", 2, [("a", 1, None), ("c", 3, None)], clear=True))
+    layers.append(ix.write_commit("c3", 3, [("c", 4, 3)], live_before=2))
+    assert [layer["clears"] for layer in layers] == [[], [2], []]
+    assert ix.scan(layers, 1)[0] == [("a", 1, 1, None), ("b", 1, 2, None)]
+    assert ix.scan(layers, 2)[0] == [("a", 2, 1, None), ("c", 2, 3, None)]
+    assert ix.diff(layers, 1, 2)[0] == [("b", 2, None, 2), ("c", 2, 3, None)]
+    assert ix.diff(layers, 1, 3)[0] == [("b", 2, None, 2), ("c", 3, 4, None)]
+    assert ix.diff(layers, 2, 3)[0] == [("c", 3, 4, 3)]
+    assert ix.history(layers, commits=(2, 2))[0] == [("b", [(2, None, 2)]), ("c", [(2, 3, None)])]
+    assert [h["live"] for h in ix.commits(layers, 1, 3)] == [2, 2, 2]
+    with pytest.raises(ValueError):
+        ix.write_commit("bad", 4, [("a", 2, 1)], clear=True)
+    # a clear that writes nothing still removes everything
+    layers.append(ix.write_commit("c4", 4, [], clear=True))
+    assert ix.scan(layers, 4)[0] == []
+    assert ix.diff(layers, 3, 4)[0] == [("a", 4, None, 1), ("c", 4, None, 4)]
+    base = ix.merge(layers, 0, 4, 4, "m")
+    assert (base["floor"], base["clears"], base["entries"]) == (4, [], 0)
+    assert ix.scan([base], 4)[0] == []
+
+
 def test_a_damaged_layer_is_a_format_error(tmp_path):
     ix = ChangeIndex(f"file://{tmp_path}")
     layer = ix.write_commit("c1", 1, [(f"k{i:04}", i, None) for i in range(2000)])
