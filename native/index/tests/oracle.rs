@@ -1412,7 +1412,7 @@ fn merges_refuse_entries_that_do_not_chain() {
 }
 
 #[test]
-fn a_flipped_byte_is_a_format_error() {
+fn a_flipped_byte_or_a_cut_file_is_a_format_error() {
     let rt = runtime();
     let mut rng = SmallRng::seed_from_u64(5);
     for trial in 0..200u64 {
@@ -1463,7 +1463,11 @@ fn a_flipped_byte_is_a_format_error() {
                 .unwrap()
                 .to_vec();
             let at = rng.random_range(0..b.len());
-            b[at] ^= 1 << rng.random_range(0..8);
+            if trial % 2 == 0 {
+                b[at] ^= 1 << rng.random_range(0..8);
+            } else {
+                b.truncate(at);
+            }
             mem.put(&path, b.into()).await.unwrap();
             let ix = ChangeIndex::new(store(&mem).unwrap(), WriteOptions::default());
             let all = ix.history(&w.layers, &Query::default()).await;
@@ -1471,7 +1475,7 @@ fn a_flipped_byte_is_a_format_error() {
             let failed = [all.err(), commits.err()];
             assert!(
                 failed.iter().any(|e| matches!(e, Some(Error::Format(_)))),
-                "trial {trial}: byte {at} of {} flipped, nothing noticed: {failed:?}",
+                "trial {trial}: byte {at} of {} flipped or cut, nothing noticed: {failed:?}",
                 l.size
             );
         });
