@@ -328,6 +328,40 @@ async def test_eng_9_a_result_the_engine_cannot_use_fails_its_attempt_retryably(
     assert await solera.read("trained") == {"w": 2}  # the retry's: nothing of the malformed result
 
 
+@pytest.mark.xfail(
+    strict=True, reason="today's engine accepts a result with an unknown status (gap, behaviors.md ENG-9)"
+)
+async def test_eng_9_a_result_with_an_unknown_status_fails_its_attempt_retryably(solera):
+    calls = []
+    await solera.deploy(pool_project(calls))
+    run = await solera.submit("trained")
+    [stage] = await solera.offered("gpu")
+    await solera.down()
+    assert await solera.worker(stage) == 0
+
+    def unknown(body):
+        body["result"]["status"] = "nonsense"
+        return json.dumps(body).encode()
+
+    await solera.tamper(stage["run"], stage["attempt"], unknown)
+    await solera.restart()
+
+    async def attempts():
+        detail = await solera.get(f"/runs/{run['id']}")
+        attempts = detail["attempts"].get(detail["tasks"][0]["id"], [])
+        return [a for a in attempts if a["outcome"] in ("succeeded", "failed")]  # settled
+
+    await solera.until(attempts)
+    [first] = await attempts()
+    assert first["outcome"] == "failed" and "commit" not in first, first
+    [retry] = await another_offer(solera, "gpu", stage)
+    assert await solera.worker(retry) == 0
+    detail = await solera.wait(run)
+    assert detail["request"]["status"] == "succeeded"
+    assert calls == [1, 1]
+    assert await solera.read("trained") == {"w": 2}  # the retry's: nothing of the bad result
+
+
 async def test_eng_9_malformed_telemetry_in_a_result_is_dropped_and_the_attempt_settles(solera):
     calls, sent = [], []
     await solera.deploy(pool_project(calls))
