@@ -256,6 +256,59 @@ class Solera:
         key = self.project.manifest["outputs"][output]["key"]
         return {str(r[key]): r.get(column) for r in await self.read(output, partition) or []}
 
+    # -- KEY+STA ---------------------------------------------------------------
+
+    async def until(self, ready, timeout: float = 10) -> None:
+        """The engine works until `ready()` holds: a condition on what user
+        code saw, or on what the API answers (`ready` may be async)."""
+
+        deadline = time.monotonic() + timeout
+        while True:
+            done = ready()
+            if asyncio.iscoroutine(done):
+                done = await done
+            if done:
+                return
+            if time.monotonic() > deadline:
+                raise TimeoutError(f"{ready} did not hold within {timeout}s")
+            await self.engine.tick()
+            await asyncio.sleep(0.02)
+
+    async def retry_keys(self, asset: str, *classes: str, partition: str | None = None) -> list[dict]:
+        """`solera keys retry` (`POST /assets/{name}/keys:retry`): the runs it
+        started, each settled, as `GET /runs/{id}` gives them."""
+
+        before = {r["id"] for r in await self.runs(limit=500)}
+        await self.post(f"/assets/{asset}/keys:retry", {"classes": list(classes), "partition": partition})
+        started = [r["id"] for r in await self.runs(limit=500) if r["id"] not in before]
+        return [await self.wait(run_id) for run_id in started]
+
+    async def outcomes(self, asset: str, *outcomes: str, partition: str | None = None) -> dict[str, dict]:
+        """A per-key asset's key outcomes (`GET /assets/{name}/outcomes`),
+        every page, by key: of `outcomes` only, if named."""
+
+        out, after = {}, None
+        while True:
+            params = {"outcome": list(outcomes)}
+            params |= {"partition": partition} if partition is not None else {}
+            params |= {"after": after} if after is not None else {}
+            page = await self.get(f"/assets/{asset}/outcomes", **params)
+            out.update((row["key"], row) for row in page["keys"])
+            if (after := page.get("next")) is None:
+                return out
+
+    async def explain(self, asset: str, key: str, **params) -> dict:
+        """Why `key` is or is not in `asset`'s output (`GET /assets/{name}/explain`)."""
+
+        return await self.get(f"/assets/{asset}/explain", key=key, **params)
+
+    async def commits(self, asset: str, run_id: str | None = None) -> list[dict]:
+        """The commits history logs for `asset`'s outputs, oldest first: those
+        of `run_id` only, if named."""
+
+        rows = (await self.get(f"/assets/{asset}/history", limit=5000))["commits"]
+        return sorted((r for r in rows if run_id in (None, r["run"])), key=lambda r: r["generation"])
+
 
 # -- the outside world, as a user's project sees it ---------------------------
 

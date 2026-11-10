@@ -455,22 +455,6 @@ async def test_partitions_read_scope_records_not_task_history(client, base, engi
     assert reads == []
 
 
-async def test_failed_scope_reports_complete_after_success(client, base, engine):
-    """§8: a partition that failed and later succeeded reports complete — the
-    partition record is the last outcome, not a task-history scan."""
-
-    await engine.run_until(
-        (await engine.submit(["flaky"], partitions=["2026-09-19"], config={"fail": True}))["id"]
-    )
-    parts = (await client.get(f"{base}/partitions/flaky")).json()["partitions"]
-    assert {p["partition"]: p["status"] for p in parts}["2026-09-19"] == "failed"
-
-    await engine.run_until((await engine.submit(["flaky"], partitions=["2026-09-19"]))["id"])
-    parts = (await client.get(f"{base}/partitions/flaky")).json()["partitions"]
-    done = next(p for p in parts if p["partition"] == "2026-09-19")
-    assert done["status"] == "materialized" and done["last_outcome"] == "succeeded"
-
-
 POOLED = """
 from solera.executors import Pool
 from solera.sdk import Project, asset

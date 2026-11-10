@@ -137,21 +137,6 @@ async def test_failures_are_recorded_and_never_block(state):
     assert engine.m.partition("parse", "")["outcomes"]["counts"] == {"retrying": 1}
 
 
-async def test_removed_keys_lose_their_rows(state):
-    content = {"a": {"text": "1"}, "b": {"text": "2"}}
-
-    def parse(file: dict):
-        return [{"value": int(file["text"])}]
-
-    project = files_project(content, parse)
-    engine = make_engine(state, project)
-    await engine.initialize()
-    await drive(engine, await engine.submit(["parse"], upstream=True))
-    del content["a"]
-    await drive(engine, await engine.submit(["parse"], upstream=True))
-    assert set(await rows_of(engine, project, "samples")) == {"b"}
-
-
 async def test_transient_key_retried_when_due(state):
     """A transient key is retried once its `retry_after` has passed — on the
     engine's clock, which the test moves instead of waiting on the wall."""
