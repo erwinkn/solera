@@ -26,6 +26,7 @@ from solera.sdk import (
     sensor,
     split_partition,
 )
+from solera.stores import FileStore
 
 from tests.contract.harness import Refused
 
@@ -468,3 +469,66 @@ async def test_par_9_a_sensors_requested_runs_see_its_own_commits(solera):
     assert [t["partition"] for t in detail["tasks"]] == ["new"]
     assert ran == ["new"]
     assert sorted(await solera.keys("sites")) == ["new"]
+
+
+# -- target (PR 2) --
+
+
+# -- PAR-6 (target) ---------------------------------------------------------------------
+
+DAY = 86400
+
+
+def sited(root, content: dict) -> Project:
+    """`site_files`, keyed, one partition per site of `sites` (dynamic)."""
+
+    @asset(outputs=Output("site_files", key="id"), partitions={"site": DynamicPartitions("sites")})
+    def site_files(ctx):
+        return [{"id": k, "v": v} for k, v in content[ctx.partition].items()]
+
+    return Project(
+        assets=[site_files], sources=[DynamicPartitions("sites")], default_store=FileStore(root / "data")
+    )
+
+
+async def test_par_6_a_removed_partitions_head_stays_readable_for_cleanup_after_then_goes(solera):
+    """`sites` drops west: no run targets it, its status is `removed`, and
+    its last head reads as it was for a week (the default `cleanup_after`);
+    then its data is cleaned up."""
+
+    content = {"east": {"a": 1}, "west": {"b": 1}}
+    await solera.deploy(sited(solera.root, content))
+    await solera.commit_source("sites", upsert=["east", "west"])
+    await solera.run("site_files", partitions="all")
+    head, keys = await solera.head("site_files", "west"), await solera.keys("site_files", "west")
+    await solera.commit_source("sites", remove=["west"])
+    detail = await solera.run("site_files", partitions="all")
+    assert [t["partition"] for t in detail["tasks"]] == ["east"]
+    assert await solera.status("site_files", "west") == "removed"
+    solera.advance(6 * DAY)
+    await solera.upkeep()
+    assert await solera.load("site_files", head, keys) == [{"id": "b", "v": 1}]
+    solera.advance(DAY + 60)
+    await solera.start()
+
+    async def gone():
+        return await solera.load("site_files", head, keys) is None
+
+    await solera.until(gone, timeout=3)
+
+
+async def test_par_6_a_partition_back_within_the_window_picks_up_where_it_left_off(solera):
+    content = {"east": {"a": 1}, "west": {"b": 1}}
+    await solera.deploy(sited(solera.root, content))
+    await solera.commit_source("sites", upsert=["east", "west"])
+    await solera.run("site_files", partitions="all")
+    head = await solera.head("site_files", "west")
+    await solera.commit_source("sites", remove=["west"])
+    solera.advance(3 * DAY)
+    await solera.upkeep()
+    await solera.commit_source("sites", upsert=["west"])
+    assert await solera.status("site_files", "west") == "materialized"
+    assert (await solera.head("site_files", "west"))["ref"] == head["ref"]
+    assert await solera.rows("site_files", "west") == {"b": 1}
+    detail = await solera.run("site_files", partitions="missing", expect=None)
+    assert [t["partition"] for t in detail["tasks"]] == []

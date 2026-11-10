@@ -614,6 +614,30 @@ class Solera:
         for path in [root, *(p for p in root.rglob("*") if p.is_dir())]:
             os.chmod(path, 0o555 if refused else 0o755)
 
+    # -- FULLRUN+STALENESS (target) ----------------------------------------------
+
+    async def alarms(self) -> dict:
+        """What the engine's diagnostics (`GET /api/diagnostics`) raise, past
+        what names the engine itself: where an operator looks for what needs
+        a hand (stuck cleanups today; a full run left incomplete, STA-13)."""
+
+        names = ("backend", "state", "objects", "namespace", "project", "deploy", "inflight", "active_runs")
+        return {k: v for k, v in (await self.get("/api/diagnostics")).items() if k not in names and v}
+
+    async def load(self, output: str, head: dict, keys: dict):
+        """A keyed output's content at `head` (as `head()` gave it), read
+        through its store at `keys`, as a reader pinned there would: None
+        once its data is gone."""
+
+        from obstore.exceptions import NotFoundError
+        from solera.stores import StoreError
+
+        ref, store = Ref.from_json(head["ref"]), self.project.stores[head["ref"]["store"]]
+        try:
+            return await store.load(ref, list[dict], Keys(keys))
+        except (FileNotFoundError, NotFoundError, StoreError):
+            return None
+
 
 # -- the outside world, as a user's project sees it ---------------------------
 
