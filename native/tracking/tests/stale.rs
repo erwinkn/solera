@@ -487,6 +487,7 @@ fn up(
         time_ms: 0,
         producer: b"",
         live_before: live,
+        clear: false,
     };
     let layer = rt
         .block_on(ix.write_commit(&format!("items/{}", head + 1), nc, &run))
