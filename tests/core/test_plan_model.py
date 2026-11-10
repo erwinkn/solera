@@ -1,5 +1,5 @@
-"""The tracking core against the tracking model (tests/tracking, SOLE-7's
-oracle): random staleness histories replayed through both, step by step.
+"""The tracking core against the tracking model (tests/tracking,
+docs/verification.md "The tracking model"): random staleness histories replayed through both, step by step.
 
 After every step the core's owed keys and classes equal what the model says
 the consumer owes, and every plan takes exactly the model's keys with the
@@ -18,9 +18,8 @@ import random
 import pytest
 from solera._native import ChangeIndex, Tracking
 
-oracle = pytest.importorskip("tests.tracking.oracle")
-from tests.tracking import staleness  # noqa: E402
-from tests.tracking.core import ABSENT, HELD, POS  # noqa: E402
+from tests.tracking import staleness
+from tests.tracking.core import ABSENT, HELD, POS
 
 EDGE, ITEMS, OWN = b"checks/items", b"items", b"checks"
 
