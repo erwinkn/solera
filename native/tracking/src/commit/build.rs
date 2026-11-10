@@ -42,8 +42,9 @@ pub enum Mode {
     /// The changes name every key the output holds afterwards (a source's
     /// full listing): a key present at the head and not named is removed.
     Replace,
-    /// A load's report on a source (P13): a key's report counts only if the
-    /// log did not change that key after this commit, the batch's head.
+    /// A load's report on a source (P13): a key's report counts only if its
+    /// version at this commit, the batch's head, equals its version at the
+    /// output's head.
     Report(u64),
 }
 

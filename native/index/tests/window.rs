@@ -142,7 +142,52 @@ fn a_commit_writer_holds_parts_not_the_commit() {
         layer.size >> 20,
         held >> 20
     );
+    // long keys make a large index, which goes out with the blocks
+    let long = |i: u64| {
+        let mut k = format!("{i:08}").into_bytes();
+        let mut x = i + 1;
+        while k.len() < format::MAX_KEY {
+            x = mix(x);
+            k.extend_from_slice(&x.to_le_bytes());
+        }
+        k
+    };
+    let n = 2048u64;
+    let nc = NewCommit {
+        commit: 1,
+        time_ms: 0,
+        producer: b"",
+        live_before: 0,
+    };
+    let base = NOW.load(Relaxed);
+    PEAK.store(base, Relaxed);
+    let layer = rt.block_on(async {
+        let mut w = ix.commit_writer("long", nc).unwrap();
+        for i in 0..n {
+            w.push(&long(i), Version::Int(i), Version::Absent)
+                .await
+                .unwrap();
+        }
+        w.finish().await.unwrap().unwrap()
+    });
+    let held = PEAK.load(Relaxed) - base;
+    let ls = std::slice::from_ref(&layer);
+    let all = rt.block_on(ix.scan(ls, 1, &Query::default())).unwrap();
+    assert_eq!(all.run.len(), n as usize);
+    let some: Vec<Vec<u8>> = (0..n).step_by(97).map(long).collect();
+    let got = rt
+        .block_on(ix.get(ls, 1, &some, &Query::default()))
+        .unwrap();
+    assert_eq!(got.run.len(), some.len());
     let _ = std::fs::remove_dir_all(dir);
+    // one segment of these keys is 8 MiB raw, and the top level grows with
+    // the layer (within the format's limit)
+    assert!(
+        held < 64 << 20,
+        "a commit writer of a {} MB layer of long keys held {} MB",
+        layer.size >> 20,
+        held >> 20
+    );
 }
 
 #[test]

@@ -632,10 +632,11 @@ fn parse(
                     if decoded > EAGER_SEGS {
                         break;
                     }
-                    let (a, n) = (
-                        (top.segs.off[i] - start) as usize,
-                        top.segs.clen[i] as usize,
-                    );
+                    // a segment among the blocks is read when needed
+                    let Some(a) = top.segs.off[i].checked_sub(start) else {
+                        continue;
+                    };
+                    let (a, n) = (a as usize, top.segs.clen[i] as usize);
                     let Some(c) = b.get(a..a + n) else {
                         return Err(Error::Format(format!(
                             "{path}: segment {i} outside the index"
