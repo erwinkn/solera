@@ -256,10 +256,16 @@ async def test_his_5_a_removed_key_outcome_stays_known_while_its_run_is_in_histo
     await c.feed(removes=["k2"])
     await c.run()
     assert (await solera.outcomes("checks"))["k2"]["outcome"] == "removed"
+    await solera.start()
+
+    async def merged():  # each commit adds a layer; a published merge folds them into one
+        views = [await solera.get(f"/outputs/{o}/merges") for o in ("feed", "checks")]
+        return all(view["layers"] == 1 for view in views)
+
     for v in ("2", "3"):
         await c.feed(k1=v)
         await c.run()
-        await solera.upkeep()
+        await solera.until(merged)
     [k2] = (await solera.get("/assets/checks/outcomes", key="k2"))["keys"]
     assert k2["outcome"] == "removed"
     assert (await solera.outcomes("checks"))["k2"]["outcome"] == "removed"

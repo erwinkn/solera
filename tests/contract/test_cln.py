@@ -675,14 +675,15 @@ async def test_cln_11_a_paused_consumer_never_loses_its_place_to_retention(soler
     writes = [rows("k1=0", "k2=0", "k3=0"), Patch(rows("k2=1", "k4=1"), remove=["k3"])]
     writes += [Patch(rows(f"k2={day}")) for day in range(2, 41)]
     await solera.deploy(paused_project(received, writes, retention=Retention(days=7)))
-    first = (await solera.run("items"))["request"]["id"]
+    await solera.run("items")
     await solera.run("copy")
-    for _ in range(40):
-        solera.advance(DAY)
-        await solera.run("items")
-        await solera.upkeep()
     await solera.start()
-    await expired(solera, first)
+    runs = []
+    for day in range(1, 41):
+        solera.advance(DAY)
+        runs.append((await solera.run("items"))["request"]["id"])
+        if day % 10 == 0:  # every ten days, retention has cut: the run of eight days ago is gone
+            await expired(solera, runs[day - 9])
     await solera.run("copy")
     assert received[-1] == (False, (["k4"], ["k2"], ["k3"]), {"k2": "40", "k4": "1"})
     assert await solera.rows("copy") == {"k1": "0", "k2": "40", "k4": "1"}
@@ -771,13 +772,14 @@ async def test_cln_14_an_append_only_output_keeps_everything_by_default(solera):
         return len(events)
 
     await solera.deploy(Project(assets=[events, digest], retention=Retention(days=7)))
-    first = (await solera.run("events"))["request"]["id"]
+    await solera.run("events")
     await solera.run("digest")
+    await solera.start()
+    runs = []
     for day[0] in range(1, 41):
         solera.advance(DAY)
-        await solera.run("events")
-        await solera.upkeep()
-    await solera.start()
-    await expired(solera, first)
+        runs.append((await solera.run("events"))["request"]["id"])
+        if day[0] % 10 == 0:  # every ten days, retention has cut: the run of eight days ago is gone
+            await expired(solera, runs[day[0] - 9])
     await solera.run("digest")
     assert received == [(False, [0]), (False, list(range(1, 41)))]
