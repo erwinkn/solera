@@ -103,8 +103,8 @@ class Observing:
                 continue
             if self.core is not None and self._keyed(input):  # the new path: the edge's empty part
                 edge = self.m.core_edges.get((asset, partition, input.param))
-                if edge is None:
-                    return None
+                if edge is None or edge[1] != self.m.core_outputs.get((input.output, input.partition)):
+                    return None  # never read, or it read a life of its upstream that is gone
                 empty = self.m.core_empty.get((asset, partition, input.param))
                 if empty is not None:
                     up = self.m.core_output(input.output, input.partition) or {}

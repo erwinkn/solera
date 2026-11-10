@@ -235,7 +235,8 @@ async def build(core: Core, task: dict, attempt: str, prepared: dict, result: di
             progress, records, _ = ops
             events.insert(0, progress)
             built.records = [[p, b64(r)] for (p, _), r in zip(keyed, records, strict=True)]
-            some, ended = keyed[0][1], all(p["final"] for _, p in keyed)
+            some = keyed[0][1]
+            ended = some["end"] is None  # the plan's walk, not one input's own end
             built.progress = {"batch": some["index"], "key": None if ended else some["end"]}
             built.walk = {
                 "inputs": [p for p, _ in keyed],

@@ -20,10 +20,11 @@ from solera.sdk import (
 from solera.stores import FileStore, Patch
 from solera_server.planning import Planner
 from solera_server.state import Conflict, State
-from solera_server.tracking import full
+from solera_server.tracking import b64, full
+from solera_server.tracking import prepare as prepare_module
 
 from tests.contract.example import Example
-from tests.contract.harness import Outside, Refused, Solera, SourceStore
+from tests.contract.harness import Outside, Refused, Solera, SourceStore, rebuild
 from tests.contract.test_run import hold
 from tests.contract.test_sta import INCOMPLETE, Files, decided
 
@@ -127,8 +128,13 @@ def test_a_fan_in_waits_only_for_the_partitions_its_shared_keys_name(tmp_path):
     heads = {east: {"commit": 1}, west: {"commit": 1}}
     planner = Planner(project.manifest, lambda o, p: heads.get(p), lambda o: heads, 0)
     incomplete = {("items", east)}
-    assert full.gate(planner, {"asset": "report", "partition": "west"}, incomplete) is None
-    assert full.gate(planner, {"asset": "report", "partition": "east"}, incomplete) == [INCOMPLETE, "items"]
+    assert (
+        full.gate(planner, {"asset": "report", "partition": "west"}, lambda o, p: (o, p) in incomplete)
+        is None
+    )
+    assert full.gate(
+        planner, {"asset": "report", "partition": "east"}, lambda o, p: (o, p) in incomplete
+    ) == [INCOMPLETE, "items"]
 
 
 def _attempts(detail: dict, asset_name: str) -> list[dict]:
@@ -400,7 +406,7 @@ def test_the_engines_own_tasks_pass_the_gate(tmp_path):
 
     project = Project(assets=[items], default_store=FileStore(tmp_path / "data"))
     planner = Planner(project.manifest, lambda o, p: None, lambda o: {}, 0)
-    assert full.gate(planner, {"asset": "@cleanup", "partition": ""}, {("items", "")}) is None
+    assert full.gate(planner, {"asset": "@cleanup", "partition": ""}, lambda o, p: True) is None
 
 
 async def test_an_input_cleared_while_the_batch_builds_replans_it_without_spending_a_try(solera, tmp_path):
@@ -582,3 +588,140 @@ def test_failed_retry_does_not_erase_a_successful_key_list_removals_coverage(tmp
     assert not t.taken(b"up", edge=b"e"), (
         "a failed retry must keep k's earlier coverage, as well as its holding"
     )
+
+
+async def test_the_gate_is_checked_again_as_the_batch_is_planned(solera, tmp_path, monkeypatch):
+    # The reader passes the gate at dispatch; before it plans, the producer starts a full run.
+    # It must not plan over the partial output: under the producer's lock it waits instead.
+    rebuilding, second_entered, second_release = [False], asyncio.Event(), asyncio.Event()
+    seen = []
+
+    @asset(inputs={"feed": Incremental(batch_size=1)}, outputs=Output("copy", key="id"))
+    async def copy(ctx, feed: list):
+        if rebuilding[0] and ctx.batch["feed"].index == 1:
+            second_entered.set()
+            await second_release.wait()
+        return rebuild(ctx.batch["feed"], feed)
+
+    @asset(inputs={"copy": Incremental()})
+    def reader(copy: list):
+        seen.append(sorted(r["id"] for r in copy))
+        return len(copy)
+
+    outside = Outside()
+    await solera.deploy(
+        Project(
+            assets=[copy, reader],
+            sources=[Source("feed", key="id", store="ext")],
+            stores={"ext": SourceStore(tmp_path / "ext", outside)},
+            default_store=FileStore(tmp_path / "data"),
+        )
+    )
+    outside.feed.update(a="1", b="1", c="1")
+    await solera.commit_source("feed", upsert=outside.feed)
+    await solera.run("copy")
+    await solera.run("reader")
+    seen.clear()
+    eng = solera.engine
+    prepare, entered, release = prepare_module.prepare, asyncio.Event(), asyncio.Event()
+
+    async def late(core, task, *args):
+        if task["asset"] == "reader" and not entered.is_set():
+            entered.set()
+            await release.wait()
+        return await prepare(core, task, *args)
+
+    monkeypatch.setattr(prepare_module, "prepare", late)
+    request = await solera.submit("reader", mode="full")
+    await solera.until(entered.is_set)
+    rebuilding[0] = True
+    producer = await solera.submit("copy", mode="full")
+    await solera.until(second_entered.is_set)
+    assert ("copy", "") in full.incomplete(eng)
+    release.set()
+    try:
+        await solera.settle(0.4)
+        assert seen == [], f"the reader planned over a partial full run: {seen}"
+    finally:
+        second_release.set()
+        await solera.wait(producer)
+        await solera.wait(request)
+    assert seen == [["a", "b", "c"]]
+
+
+async def test_a_walk_ends_where_its_plan_ends_not_where_one_inputs_probe_does(solera, tmp_path):
+    # Two inputs, batch size 1: the plan stops at a. Between the plan and the probe of each
+    # input's own end, b is removed, then the batch puts it back. The walk goes on to b.
+    outside = Outside()
+
+    @asset(
+        inputs={"left": Incremental(batch_size=1), "right": Incremental(batch_size=1)},
+        outputs=Output("copy", key="id"),
+    )
+    async def copy(ctx, left: list, right: list):
+        outside.feed["b"] = "1"
+        await solera.commit_source("left", upsert={"b": "1"})
+        await solera.commit_source("right", upsert={"b": "1"})
+        return rebuild(ctx.batch["left"], left)
+
+    await solera.deploy(
+        Project(
+            assets=[copy],
+            sources=[Source("left", key="id", store="ext"), Source("right", key="id", store="ext")],
+            stores={"ext": SourceStore(tmp_path / "ext", outside)},
+            default_store=FileStore(tmp_path / "data"),
+        )
+    )
+    outside.feed.update(a="1", b="1")
+    await solera.commit_source("left", upsert=outside.feed)
+    await solera.commit_source("right", upsert=outside.feed)
+    eng = solera.engine
+    run, once = eng.core.run, [False]
+
+    async def shrink_after_plan(fn, *args, **kw):
+        result = await run(fn, *args, **kw)
+        if fn == eng.core.tracking.plan and not once[0]:
+            once[0] = True
+            assert result["hi"] == "a"
+            outside.feed.pop("b")
+            await solera.commit_source("left", remove=["b"])
+            await solera.commit_source("right", remove=["b"])
+        return result
+
+    eng.core.run = shrink_after_plan
+    await solera.run("copy", mode="full")
+    edge = eng.m.core_edges[("copy", "", "left")][0].encode()
+    event = eng.core.tracking.event_watch(edge, {})
+    eng.state.record({"type": "Core", "event": b64(event), "outputs": [], "edges": []})
+    assert await eng.complete("copy", "") == await eng.core.run(eng.core.tracking.stale_complete, edge)
+    assert sorted(r["id"] for r in await solera.read("copy")) == ["a", "b"]
+
+
+async def test_an_edge_on_a_gone_upstream_life_counts_for_no_completeness(solera, tmp_path):
+    def project(old):
+        @asset(outputs=Output("left", key="id"))
+        def left():
+            return [{"id": "k", "v": "1"}]
+
+        @asset(outputs=Output("right", key="id"))
+        def right():
+            return [{"id": "k", "v": "1"}]
+
+        @asset(inputs={"data": Incremental("left" if old else "right")}, outputs=Output("copy", key="id"))
+        def copy(data: list):
+            return data
+
+        return Project(
+            assets=[left, right, copy] if old else [right, copy], default_store=FileStore(tmp_path / "data")
+        )
+
+    await solera.deploy(project(True))
+    await solera.run("left")
+    await solera.run("copy")
+    await solera.deploy(project(False))
+    assert not await solera.engine.complete("copy", ""), (
+        "copy claims completeness from its retired input edge"
+    )
+    await solera.run("right")
+    await solera.run("copy")
+    assert await solera.engine.complete("copy", "")

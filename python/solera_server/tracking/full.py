@@ -34,24 +34,43 @@ def running(core: Core) -> set[tuple[str, str]]:
     return {key for key, id_ in core.m.core_outputs.items() if tracking.full_run(id_.encode()) is not None}
 
 
+def incomplete_at(engine, output: str, partition: str) -> bool:
+    """Whether the readers of an output partition wait: its producer
+    partition is incomplete (a keyed output of it mid full run, or an input's
+    walk from empty not done) and no operator let its readers proceed."""
+
+    m = engine.m
+    asset = (engine.manifest["outputs"].get(output) or {}).get("asset")
+    if (asset, partition) in m.proceeded:
+        return False
+    id_ = m.core_outputs.get((output, partition))
+    if id_ is not None and engine.core.tracking.full_run(id_.encode()) is not None:
+        return True
+    declared = engine.manifest["assets"].get(asset)
+    if declared is None or (output, partition) not in m.heads:
+        return False
+    walking = any((asset, partition, param) in m.core_empty for param in declared.get("inputs") or {})
+    return walking and not engine._complete_known(asset, partition)
+
+
 def incomplete(engine) -> set[tuple[str, str]]:
-    """The outputs whose producer partition is incomplete, but those an
-    operator let readers proceed over."""
+    """Every output partition whose readers wait (`incomplete_at`): what the
+    dispatch pass and the alarm read."""
 
     m, assets = engine.m, engine.manifest["assets"]
-    out = running(engine.core)
+    candidates = running(engine.core)
     for asset, partition in {(a, p) for a, p, _ in m.core_empty}:
-        if asset in assets and not engine._complete_known(asset, partition):
-            out |= {
-                (o["name"], partition) for o in assets[asset]["outputs"] if (o["name"], partition) in m.heads
-            }
-    owners = engine.manifest["outputs"]
-    return {(o, p) for o, p in out if ((owners.get(o) or {}).get("asset"), p) not in m.proceeded}
+        if asset in assets:
+            candidates |= {(o["name"], partition) for o in assets[asset]["outputs"]}
+    return {(o, p) for o, p in candidates if incomplete_at(engine, o, p)}
 
 
-def gate(planner, task: dict, incomplete: set) -> list | None:
-    """Why a task waits for an upstream, if it does: the first output it
-    reads, incrementally or whole, that is `incomplete`."""
+def gate(planner, task: dict, waits) -> list | None:
+    """Why a task waits for an upstream, if it does: the first output
+    partition it reads, incrementally or whole, that `waits(output,
+    partition)`. Checked when the task is dispatched, and again as its batch
+    is planned, under its keyed upstreams' locks (`prepare`): what it plans
+    on is what the gate let through."""
 
     if task["asset"] not in planner.manifest["assets"]:  # the engine's own task (a cleanup): it reads nothing
         return None
@@ -63,7 +82,7 @@ def gate(planner, task: dict, incomplete: set) -> list | None:
         if input.kind == "dep":
             continue
         partitions = planner.fan_in(input, materialized=False) if input.fan_in else (input.partition,)
-        if any((input.output, p) in incomplete for p in partitions):
+        if any(waits(input.output, p) for p in partitions):
             return [INCOMPLETE, input.output]
     return None
 

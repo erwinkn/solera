@@ -51,7 +51,7 @@ from solera.sdk import default_placement, digest
 from solera.tasks import Tasks
 
 from . import history, owed, planning
-from .attempts import POOL_OFFERED_GRACE, Attempts, Live, current_names, worker_report
+from .attempts import POOL_OFFERED_GRACE, REPLAN_DELAY, Attempts, Live, current_names, worker_report
 from .executors import PlacementContext, Registry
 from .history import MAX_METADATA, History, RunFilter
 from .journal import CORE_FORMAT, FORMAT
@@ -656,7 +656,10 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
             cap = declared.get("concurrency")
             if holder is not None:
                 held[task_id] = ["claim", holder]
-            elif incomplete and (waiting := core_full.gate(planner, task, incomplete)) is not None:
+            elif (
+                incomplete
+                and (waiting := core_full.gate(planner, task, lambda o, p: (o, p) in incomplete)) is not None
+            ):
                 held[task_id] = waiting
             elif cap is not None and asset_used.get(task["asset"], 0) >= cap:
                 held[task_id] = ["concurrency", task["asset"]]
@@ -977,6 +980,19 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
                 else:
                     prepared = self._prepare(task, run, attempt, await self._observe(task, run, attempt))
             except (Retryable, NonRetryable, Conflict) as error:
+                if getattr(
+                    error, "replan", False
+                ):  # an upstream became incomplete: planned again, no try spent
+                    self._finish(
+                        task,
+                        claim,
+                        "replanned",
+                        error=error,
+                        retryable=True,
+                        delay=REPLAN_DELAY,
+                        reason=core_full.INCOMPLETE,
+                    )
+                    return
                 self._finish(
                     task,
                     claim,
