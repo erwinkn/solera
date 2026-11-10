@@ -311,6 +311,9 @@ fn main() {
     let mut probe: Vec<u32> = (0..1000).map(|_| rand::Rng::random_range(&mut rng, 0..space)).collect();
     probe.sort_unstable();
     probe.dedup();
+    let mut batch: Vec<u32> = (0..10_000).map(|_| rand::Rng::random_range(&mut rng, 0..space)).collect();
+    batch.sort_unstable();
+    batch.dedup();
     let r0 = LOAD + if name == "rewrite" { a.get::<u64>("days", 7) * per_day } else { 0 };
     let mut qs: Vec<(&str, Q)> = vec![
         ("diff-1c", Q::Diff(head - 1, head, None, u64::MAX)),
@@ -324,6 +327,7 @@ fn main() {
         ("scan-head-range1pct", Q::Scan(head, narrow)),
         ("scan-1d-range1pct", Q::Scan(head - day, narrow)),
         ("get-1k", Q::Get(head, probe.clone())),
+        ("get-10k", Q::Get(head, batch)),
     ];
     if name == "rewrite" {
         qs.push(("diff-across-rewrite", Q::Diff(r0, head, None, u64::MAX)));

@@ -384,6 +384,29 @@ impl Cursor {
     pub(crate) fn key(&self) -> &[u8] {
         self.run.key(self.pos)
     }
+
+    /// Move to the first key at or after `target`, searching each decoded
+    /// block instead of stepping through it; false once the layer has none.
+    async fn seek(&mut self, target: &[u8]) -> Result<bool> {
+        loop {
+            let (mut lo, mut hi) = (self.pos, self.run.len());
+            while lo < hi {
+                let m = (lo + hi) / 2;
+                if self.run.key(m) < target {
+                    lo = m + 1;
+                } else {
+                    hi = m;
+                }
+            }
+            self.pos = lo;
+            if !self.fill().await? {
+                return Ok(false);
+            }
+            if self.key() >= target {
+                return Ok(true);
+            }
+        }
+    }
 }
 
 /// Several layers merged by key: each key once, with its entries from every
@@ -491,7 +514,6 @@ impl Walk {
             if self.bounds.above(key) {
                 return Ok(false);
             }
-            let mut take = self.pattern.as_ref().is_none_or(|p| p.matches(key));
             if let Some(keys) = &self.keys {
                 while self.kp < keys.len() && keys.get(self.kp) < key {
                     self.kp += 1;
@@ -499,8 +521,19 @@ impl Walk {
                 if self.kp == keys.len() {
                     return Ok(false);
                 }
-                take &= keys.get(self.kp) == key;
+                if key < keys.get(self.kp) {
+                    // not a listed key: jump this layer to the next one listed
+                    let want = keys.get(self.kp).to_vec();
+                    if self.curs[top].seek(&want).await? {
+                        self.sift_down();
+                    } else {
+                        self.pop();
+                    }
+                    continue;
+                }
             }
+            let key = self.curs[top].key();
+            let take = self.pattern.as_ref().is_none_or(|p| p.matches(key));
             group.push_key(key);
             while self
                 .heap
