@@ -1094,9 +1094,21 @@ async def test_sta_13_on_a_table_a_batch_in_flight_holds_back_keys_it_loaded_at_
             await r.feed({"k3": "2", "k4": "2"})
             await solera.run("copy")
             archive = await solera.submit("archive")
-            assert await solera.offered("p")  # launched: k3 and k4 planned as updated
+            [stage] = await solera.offered("p")  # launched: k3 and k4 planned as updated
             run = await r.midway()  # copy's table: k1 and k2 alone
             await solera.work("p", r.project(store, decl, Pool("p")()))
+
+            async def attempts() -> list[dict]:
+                detail = await solera.get(f"/runs/{archive['id']}")
+                [task] = [t for t in detail["tasks"] if t["asset"] == "archive"]
+                return detail["attempts"].get(task["id"], [])
+
+            async def settled() -> bool:
+                return all(a["outcome"] not in ("claimable", "running") for a in await attempts())
+
+            await solera.until(settled)  # copy is still paused mid full run
+            outcomes = [(a["id"], a["outcome"]) for a in await attempts()]
+            assert outcomes == [(stage["attempt"], "succeeded")], outcomes  # it committed, not planned again
             assert await solera.rows("archive") == {"k1": "1", "k2": "1", "k3": "1", "k4": "1"}
             assert INCOMPLETE in await solera.stale("archive")
             await r.finish(run)
