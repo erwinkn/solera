@@ -1,8 +1,9 @@
 //! Damage to any section of a layer, sealed again with a valid checksum (so
 //! the parsers see it, as they would a crafted file): every parse returns a
-//! value or a format error, never panics, and allocates in proportion to the
-//! bytes it was given, never to a length or count it read. Its own test
-//! binary: it measures the heap.
+//! value or a format error, never panics, and holds memory in proportion to
+//! the bytes it decompresses, plus the keys it rebuilds from prefixes, which
+//! the format bounds by `MAX_RAW`. Never in proportion to a length or count
+//! it read. Its own test binary: it measures the heap.
 
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
@@ -58,17 +59,20 @@ fn u32_at(b: &[u8], at: usize) -> u32 {
     u32::from_le_bytes(b[at..at + 4].try_into().unwrap())
 }
 
-/// A valid layer of a few hundred keys in tiny blocks and segments, with
-/// byte and integer versions, removals and several commits.
-fn layer(rng: &mut SmallRng) -> (Vec<u8>, LayerRef) {
+/// A valid layer in tiny blocks and segments, with byte and integer
+/// versions, removals and several commits. Its keys share a prefix of
+/// `shared` bytes, and each commit header carries `producer` zero bytes (a
+/// section that compresses well).
+fn layer(rng: &mut SmallRng, keys: u32, shared: usize, producer: usize) -> (Vec<u8>, LayerRef) {
     let o = WriteOptions {
         block_bytes: 128,
         level: 1,
         seg_blocks: 2,
     };
     let mut w = Writer::new(o, 1, 20, None).unwrap();
-    for k in 0..300u32 {
-        let key = format!("key/{k:05}/{}", "x".repeat(rng.random_range(0..20)));
+    let prefix = "p".repeat(shared);
+    for k in 0..keys {
+        let key = format!("{prefix}key/{k:05}/{}", "x".repeat(rng.random_range(0..20)));
         let n = rng.random_range(1..4u64);
         let mut c = 21 - rng.random_range(0..4u64);
         for _ in 0..n {
@@ -89,7 +93,7 @@ fn layer(rng: &mut SmallRng) -> (Vec<u8>, LayerRef) {
             commit: c,
             time_ms: c * 1000,
             added: c,
-            producer: b"run-7".to_vec(),
+            producer: vec![0; producer],
             min_key: b"key/".to_vec(),
             max_key: b"key/9".to_vec(),
             ..Default::default()
@@ -149,9 +153,16 @@ fn damage(rng: &mut SmallRng, raw: &mut Vec<u8>) {
     }
 }
 
-/// Run `parse` on damaged input of `given` bytes: it returns a value or a
-/// format error, and holds at most 1 MiB plus 64 times what it was given.
-fn parsed<T: std::fmt::Debug>(what: &str, given: usize, parse: impl FnOnce() -> Result<T>) {
+/// Run `parse` on damaged input that decompresses to `raw` bytes: it
+/// returns a value or a format error, and holds at most 1 MiB plus 64 times
+/// `raw`, plus twice `MAX_RAW` when it rebuilds prefix-coded keys.
+fn parsed<T: std::fmt::Debug>(
+    what: &str,
+    raw: usize,
+    keys: bool,
+    parse: impl FnOnce() -> Result<T>,
+) {
+    let given = (1 << 20) + 64 * raw + if keys { 2 * MAX_RAW } else { 0 };
     let base = NOW.load(Relaxed);
     PEAK.store(base, Relaxed);
     let got = parse();
@@ -161,8 +172,8 @@ fn parsed<T: std::fmt::Debug>(what: &str, given: usize, parse: impl FnOnce() -> 
         "{what}: {got:?}"
     );
     assert!(
-        held <= (1 << 20) + 64 * given,
-        "{what}: {held} bytes held for {given} bytes of input"
+        held <= given,
+        "{what}: {held} bytes held for {raw} bytes decompressed"
     );
 }
 
@@ -170,7 +181,17 @@ fn parsed<T: std::fmt::Debug>(what: &str, given: usize, parse: impl FnOnce() -> 
 fn damage_to_any_section_is_a_format_error_within_bounded_memory() {
     let mut rng = SmallRng::seed_from_u64(11);
     let trials: usize = std::env::var("DAMAGE_TRIALS").map_or(4000, |s| s.parse().unwrap());
-    let (file, l) = layer(&mut rng);
+    let corpora = [
+        layer(&mut rng, 300, 0, 5),
+        layer(&mut rng, 48, 65_000, 1 << 20),
+    ];
+    for trial in 0..trials {
+        let (file, l) = &corpora[trial / 5 % 2];
+        one(&mut rng, trial, file, l);
+    }
+}
+
+fn one(rng: &mut SmallRng, trial: usize, file: &[u8], l: &LayerRef) {
     let top_start = l.top_start as usize;
     let tail = &file[top_start..];
     let top = Top::parse(tail, l.top_start, l.size).unwrap();
@@ -194,15 +215,13 @@ fn damage_to_any_section_is_a_format_error_within_bounded_memory() {
     )
     .unwrap();
     assert!(segs.len() > 2 && blocks.len() == 2);
-    let mut run = Run::new();
-    let mut dec = Decoder::default();
-    for trial in 0..trials {
+    {
         let what = |s: &str| format!("trial {trial}, {s}");
         match trial % 5 {
             // the top level, sealed again under a valid trailer
             0 => {
                 let mut raw = top_raw.clone();
-                damage(&mut rng, &mut raw);
+                damage(rng, &mut raw);
                 let c = seal(&raw);
                 let mut t = trailer.to_vec();
                 t[24..28].copy_from_slice(&(raw.len() as u32).to_le_bytes());
@@ -212,36 +231,38 @@ fn damage_to_any_section_is_a_format_error_within_bounded_memory() {
                 let mut tail = c;
                 tail.extend_from_slice(&t);
                 let size = l.top_start + tail.len() as u64;
-                let n = tail.len();
-                parsed(&what("top"), n, || Top::parse(&tail, l.top_start, size));
+                parsed(&what("top"), raw.len(), true, || {
+                    let t = Top::parse(&tail, l.top_start, size)?;
+                    t.check(&LayerRef { size, ..l.clone() }).map(|_| t.lo)
+                });
             }
             // the trailer's offsets and lengths
             1 => {
                 let mut t = trailer[..36].to_vec();
-                damage(&mut rng, &mut t);
+                damage(rng, &mut t);
                 t.resize(36, 0);
                 let tc = check(&t);
                 t.extend_from_slice(&tc.to_le_bytes());
                 t.extend_from_slice(&MAGIC);
                 let mut tail = tail[..tail.len() - TRAILER].to_vec();
                 tail.extend_from_slice(&t);
-                let n = tail.len();
-                parsed(&what("trailer"), n, || {
-                    Top::parse(&tail, l.top_start, l.size)
+                parsed(&what("trailer"), top_raw.len(), true, || {
+                    let t = Top::parse(&tail, l.top_start, l.size)?;
+                    t.check(l).map(|_| t.lo)
                 });
             }
             // a segment
             2 => {
                 let i = rng.random_range(0..segs.len());
                 let mut raw = zstd::bulk::decompress(seg(i), segs.rlen[i] as usize).unwrap();
-                damage(&mut rng, &mut raw);
+                damage(rng, &mut raw);
                 let c = seal(&raw);
                 let n = if rng.random_ratio(1, 4) {
                     rng.random()
                 } else {
                     segs.n[i]
                 };
-                parsed(&what("segment"), c.len() + raw.len(), || {
+                parsed(&what("segment"), raw.len(), true, || {
                     parse_segment(&c, raw.len() as u32, check(&c), n, top.commits_start)
                 });
             }
@@ -251,7 +272,7 @@ fn damage_to_any_section_is_a_format_error_within_bounded_memory() {
                 let (o, cl) = (blocks.off[i] as usize, blocks.clen[i] as usize);
                 let mut raw =
                     zstd::bulk::decompress(&file[o..o + cl], blocks.rlen[i] as usize).unwrap();
-                damage(&mut rng, &mut raw);
+                damage(rng, &mut raw);
                 let c = seal(&raw);
                 let rows = if rng.random_ratio(1, 4) {
                     rng.random()
@@ -263,8 +284,9 @@ fn damage_to_any_section_is_a_format_error_within_bounded_memory() {
                 } else {
                     raw.len() as u32
                 };
-                parsed(&what("block"), c.len() + raw.len(), || {
-                    dec.decode(&c, rlen, rows, &mut run)?;
+                parsed(&what("block"), raw.len(), true, || {
+                    let mut run = Run::new();
+                    Decoder::default().decode(&c, rlen, rows, &mut run)?;
                     for k in 0..run.len() {
                         for r in run.rows(k) {
                             let _ = (run.key(k), run.new_version(r), run.replaced_version(r));
@@ -276,13 +298,12 @@ fn damage_to_any_section_is_a_format_error_within_bounded_memory() {
             // the commits section
             _ => {
                 let mut raw = commits_raw.clone();
-                damage(&mut rng, &mut raw);
+                damage(rng, &mut raw);
                 let c = seal(&raw);
                 let mut b = (raw.len() as u32).to_le_bytes().to_vec();
                 b.extend_from_slice(&check(&c).to_le_bytes());
                 b.extend_from_slice(&c);
-                let n = b.len() + raw.len();
-                parsed(&what("commits"), n, || parse_commits(&b));
+                parsed(&what("commits"), raw.len(), false, || parse_commits(&b));
             }
         }
     }
