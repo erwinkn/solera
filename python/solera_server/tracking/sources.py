@@ -26,7 +26,7 @@ async def build(
 ) -> dict | None:
     """Build a keyed source's next commit: `{"event", "minted", "counts",
     "upserted", "deleted", "elements"}`, or None when it changes nothing.
-    Its layer is named by its run, which no other build shares; the caller
+    Its layer is named by this build alone (`Core.path`); the caller
     checks and records the event, or leaves the layer an orphan (build plan
     B9 sweeps them). With `at`, it is a load's report (SRC-12): a key counts
     only if the log holds the same version for it at `at` and at the head."""

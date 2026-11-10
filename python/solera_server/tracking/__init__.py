@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import secrets
 from base64 import b64decode, b64encode
 
 import orjson
@@ -135,10 +136,11 @@ class Core:
     @staticmethod
     def path(id_: str, commit: int, by) -> str:
         """Where a commit's layer goes: under its output's id, named by its
-        commit and who made it, so a commit built again lands on the same
-        object."""
+        commit, who made it, and this build alone. Two builds never share an
+        object: an engine that lost its namespace may still be uploading one
+        while its successor builds the same commit again."""
 
-        return f"core/{id_}/{commit:012d}-{by}.lay"
+        return f"core/{id_}/{commit:012d}-{by}-{secrets.token_hex(8)}.lay"
 
     def spec(self, prepared: dict) -> dict:
         """What the new path adds to an attempt's spec: the field that sends

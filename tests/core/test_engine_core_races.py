@@ -4,6 +4,7 @@ the commits made while it is validated, a redeploy while a batch's commit
 is built. Each interleaving is forced by wrapping the call it races."""
 
 import asyncio
+import threading
 
 import pytest
 from solera.sdk import Commit, Incremental, Output, Project, Retry, Source, Tick, asset, sensor
@@ -272,3 +273,59 @@ async def test_a_redeploy_while_a_batch_is_planned_prepares_it_under_the_new_dep
     monkeypatch.setattr(solera.state, "record", capture)
     await solera.run("copy", expect=None)
     assert redeployed and installed == ["2"], installed
+
+
+async def test_an_engine_that_lost_its_namespace_never_overwrites_its_successors_commit_layer(
+    tmp_path, monkeypatch
+):
+    from solera._native import ChangeIndex
+    from solera.threads import in_thread
+
+    @asset(outputs=Output("items", key="id"))
+    def items():
+        return [{"id": "k", "v": "1"}]
+
+    project = Project(assets=[items], default_store=FileStore(tmp_path / "data"))
+    first, second = Solera(tmp_path, "core"), None
+    release, entered = threading.Event(), threading.Event()
+    try:
+        await first.deploy(project)
+        await first.run("items")
+        old = first.engine
+        run = old.core.run
+
+        async def held(fn, *args, **kwargs):  # the old engine's build stalls until its successor committed
+            if fn != old.core.tracking.build_commit:
+                return await run(fn, *args, **kwargs)
+
+            def blocked():
+                entered.set()
+                release.wait(20)
+                return fn(*args, **kwargs)
+
+            return await in_thread(blocked)
+
+        monkeypatch.setattr(old.core, "run", held)
+        request = await first.submit("items")
+        waiting = asyncio.create_task(first.wait(request))
+        await first.until(entered.is_set)
+        await first.state.durable()
+        second = first.successor()
+        second.clock = lambda: first.clock() + 1  # a build at another time writes other bytes
+        await second.deploy(project)
+        await second.wait(request)
+        await second.state.durable()
+        output = second.engine.m.core_output("items", "")
+        path = output["layers"][-1]["path"]
+        before = await second.state.get_object(path)
+        release.set()
+        await asyncio.gather(waiting, return_exceptions=True)
+        await first.engine.stop()
+        assert await second.state.get_object(path) == before
+        rows, _ = ChangeIndex(second.state.objects_url).scan(output["layers"], output["head"])
+        assert [row[0] for row in rows] == ["k"]
+    finally:
+        release.set()
+        if second is not None:
+            await second.close()
+        await first.close()
