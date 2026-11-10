@@ -28,7 +28,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from ..sdk import Output, Ref
-from ..stores import Commits, KeyedWrite, Keys, Patch, StoreError, WriteContext, prepare_for
+from ..stores import Changed, Commits, KeyedWrite, Keys, Patch, StoreError, WriteContext, Written, prepare_for
 
 
 @dataclass
@@ -105,12 +105,13 @@ async def write(
     out removed, and nothing else cleared."""
 
     store = h.store
-    written_keys = sorted({str(r["id"]) for r in rows})
+    written_keys = sorted({str(r["id"]) for r in rows}, key=str.encode)
     if changed:
         prepared = prepare_for(store, rows, out)
         gone = frozenset(set(ledger.entries) - set(written_keys))
         keyed = KeyedWrite(prepared, upserts=frozenset(written_keys), removes=gone, value=rows)
         written = await store.store(keyed, prior, context(out, generation, worker_id, partition=partition))
+        assert said(written) == (written_keys, sorted(gone, key=str.encode), False)
         for key in gone:
             del ledger.entries[key]
         ledger.entries.update(dict.fromkeys(written_keys, generation))
@@ -124,12 +125,40 @@ async def write(
         prepared = prepare_for(store, rows, out)
         keyed = KeyedWrite(prepared, reset=True, value=rows)
     written = await store.store(keyed, prior, context(out, generation, worker_id, partition=partition))
+    removed = sorted(map(str, remove), key=str.encode) if patch else []
+    assert said(written) == (written_keys, removed, not patch), "a write says the keys it wrote and removed"
     if not patch:
         ledger.entries.clear()
     for key in remove:
         ledger.entries.pop(str(key), None)
     ledger.entries.update(dict.fromkeys(written_keys, generation))
     return written.ref
+
+
+def said(written: Written) -> tuple[list[str], list[str], bool]:
+    """What a write said it changed (`Written.changed`): the keys it wrote,
+    the keys it removed — each checked sorted by their UTF-8 bytes — and
+    whether it was the whole content."""
+
+    changed = written.changed
+    assert isinstance(changed, Changed), f"a keyed write says what it changed, got {changed!r}"
+    wrote, removed = [k for c in changed.wrote for k in c], [k for c in changed.removed for k in c]
+    for keys in (wrote, removed):
+        assert keys == sorted(set(keys), key=str.encode), (
+            f"keys said sorted by their bytes, once each: {keys}"
+        )
+    return wrote, removed, changed.whole
+
+
+async def read(h: Harness, ref: Ref, selection) -> tuple[list[tuple[str, str]], dict | None, object]:
+    """What `read` gives: the rows as `rows` gives them, its `versions`
+    and its `version`. Its value is what `load` gives."""
+
+    found = await h.store.read(ref, list[dict], selection)
+    got = sorted((str(r["id"]), str(r["v"])) for r in found.value)
+    assert got == await rows(h, ref, selection), "read's value is what load gives"
+    versions = None if found.versions is None else dict(found.versions)
+    return got, versions, found.version
 
 
 async def rows(h: Harness, ref: Ref, selection) -> list[tuple[str, str]]:
@@ -264,6 +293,64 @@ async def a_replacement_resolved_writes_its_keys_and_removes_the_rest(h: Harness
     assert await now(h, second, ledger) == [("a", "1"), ("b", "2")]
 
 
+async def a_write_says_which_keys_it_wrote_and_removed(h: Harness) -> None:
+    """A replacement {c, a, b} says it wrote a, b and c, the whole content; a
+    patch writing b at 2 and d, removing a, says it wrote b and d and
+    removed a. A load at the keys planned says the version each was read
+    at: b and d at 2, c at 1 (docs/stores.md, "What a write and a load say")."""
+
+    out, ledger = keyed(h), Ledger()
+    store = h.store
+    value = [{"id": k, "v": "1"} for k in "cab"]
+    first = await store.store(KeyedWrite.of(store, value, out, None), None, context(out, 1))
+    assert said(first) == (["a", "b", "c"], [], True)
+    patch = Patch([{"id": "b", "v": "2"}, {"id": "d", "v": "1"}], remove=["a"])
+    second = await store.store(KeyedWrite.of(store, patch, out, first.ref), first.ref, context(out, 2))
+    assert said(second) == (["b", "d"], ["a"], False)
+    ledger.entries.update({"b": 2, "c": 1, "d": 2})
+    assert await read(h, second.ref, ledger.keys()) == (
+        [("b", "2"), ("c", "1"), ("d", "1")],
+        {"b": 2, "c": 1, "d": 2},
+        None,
+    )
+
+
+async def a_replacement_holds_exactly_its_keys_at_its_version(h: Harness) -> None:
+    """{a, b, c} at 1, then the replacement {a at 2, d} as the producer
+    returned it — unresolved, no index to compare it with: the partition
+    holds a and d, both at version 2, and nothing of version 1; the write
+    says it wrote a and d, the whole content."""
+
+    out, store = keyed(h), h.store
+    value = [{"id": k, "v": "1"} for k in "abc"]
+    first = await store.store(KeyedWrite.of(store, value, out, None), None, context(out, 1))
+    value = [{"id": "a", "v": "2"}, {"id": "d", "v": "1"}]
+    second = await store.store(KeyedWrite.of(store, value, out, first.ref), first.ref, context(out, 2))
+    assert said(second) == (["a", "d"], [], True)
+    held = Ledger({"a": 2, "d": 2})
+    assert await read(h, second.ref, held.keys()) == ([("a", "2"), ("d", "1")], {"a": 2, "d": 2}, None)
+    if h.store.writes != "immutable":  # a table's rows, whole: nothing below version 2 is left
+        assert await read(h, second.ref, None) == ([("a", "2"), ("d", "1")], {"a": 2, "d": 2}, None)
+
+
+async def an_unkeyed_read_says_its_version(h: Harness) -> None:
+    """An unkeyed value written at 3, then at 5: a read says the version it
+    read. Commits 3 (at 1) and 4 (at 2): a read says the newest version
+    among them, a range only its own; an unkeyed write says no keys."""
+
+    out = h.output()
+    first = await h.store.store([{"id": "a", "v": "1"}], None, context(out, 3))
+    assert first.changed is None, "an unkeyed write has no keys to say"
+    assert await read(h, first.ref, None) == ([("a", "1")], None, 3)
+    second = await h.store.store([{"id": "b", "v": "1"}], first.ref, context(out, 5))
+    assert await read(h, second.ref, None) == ([("b", "1")], None, 5)
+    out = h.output(incremental=True)
+    one = await h.store.store(Patch([{"id": "a", "v": "1"}]), None, context(out, 1, commit_number=3))
+    two = await h.store.store(Patch([{"id": "b", "v": "1"}]), one.ref, context(out, 2, commit_number=4))
+    assert (await read(h, two.ref, None))[2] == 2
+    assert await read(h, two.ref, Commits(3, 3)) == ([("a", "1")], None, 1)
+
+
 # -- immutable stores ----------------------------------------------------------------------
 
 
@@ -334,6 +421,18 @@ async def a_pinned_read_returns_its_version(h: Harness) -> None:
     second = await write(h, out, [{"id": "a", "v": "2"}], 9, ledger, first)
     assert await rows(h, first, pinned) == [("a", "1")]
     assert await now(h, second, ledger) == [("a", "2")]
+
+
+async def a_read_is_at_its_planned_versions(h: Harness) -> None:
+    """a and b at 5 are planned; then 9 writes a at 2 and removes b: a load at
+    the plan reads a at 1 and b at 1, and says versions 5 and 5 — every
+    object is named by the version that wrote it."""
+
+    out, ledger = keyed(h), Ledger()
+    first = await write(h, out, [{"id": "a", "v": "1"}, {"id": "b", "v": "1"}], 5, ledger)
+    planned = ledger.keys()
+    await write(h, out, [{"id": "a", "v": "2"}], 9, ledger, first, remove=["b"], patch=True)
+    assert await read(h, first, planned) == ([("a", "1"), ("b", "1")], {"a": 5, "b": 5}, None)
 
 
 async def a_superseded_version_goes_alone(h: Harness) -> None:
@@ -443,6 +542,19 @@ async def a_partition_says_which_keys_it_holds(h: Harness) -> None:
     assert held([]) == []
 
 
+async def a_read_says_what_moved_since_planning(h: Harness) -> None:
+    """a and b at 5 are planned; then 9 writes a at 2 and removes b: a load
+    at the plan reads what the table holds now and says so — a at version
+    9, b absent (None) — never an error (docs/stores.md, "What a write and
+    a load say")."""
+
+    out, ledger = keyed(h), Ledger()
+    first = await write(h, out, [{"id": "a", "v": "1"}, {"id": "b", "v": "1"}], 5, ledger)
+    planned = ledger.keys()
+    second = await write(h, out, [{"id": "a", "v": "2"}], 9, ledger, first, remove=["b"], patch=True)
+    assert await read(h, second, planned) == ([("a", "2")], {"a": 9, "b": None}, None)
+
+
 async def a_newer_writer_waits_for_an_open_older_one(h: Harness) -> None:
     """Writer 5's transaction is open: writer 9's acquisition waits for it to
     commit, then takes over; writer 5's next write is refused."""
@@ -497,6 +609,7 @@ async def an_opaque_write_reports_the_keys_it_holds(h: Harness) -> None:
     )
     assert written.keys is not None, "an opaque write reports its keys"
     assert [k for chunk in written.keys for k in chunk] == ["a", "b"]
+    assert said(written) == (["a", "b"], [], True), "an opaque write replaced the partition: its keys, whole"
     assert await rows(h, written.ref, None) == [("a", "2"), ("b", "1")]
 
 
@@ -523,6 +636,9 @@ EVERY = [
     a_commit_written_again_lands_once,
     a_full_run_starts_the_commits_over,
     a_replacement_resolved_writes_its_keys_and_removes_the_rest,
+    a_write_says_which_keys_it_wrote_and_removed,
+    a_replacement_holds_exactly_its_keys_at_its_version,
+    an_unkeyed_read_says_its_version,
     an_unkeyed_output_is_its_plain_rows,
     partitions_never_touch_each_other,
     a_partition_cleanup_leaves_the_others,
@@ -530,6 +646,7 @@ EVERY = [
 ]
 IMMUTABLE = [
     a_pinned_read_returns_its_version,
+    a_read_is_at_its_planned_versions,
     a_superseded_version_goes_alone,
     all_an_attempt_wrote_goes_by_its_generation,
 ]
@@ -539,6 +656,7 @@ FENCED = [
     a_first_write_acquires,
     the_next_attempt_replaces_what_a_dead_writer_left,
     a_partition_says_which_keys_it_holds,
+    a_read_says_what_moved_since_planning,
     a_newer_writer_waits_for_an_open_older_one,
 ]
 READS = [a_read_reports_the_generation_it_saw]
