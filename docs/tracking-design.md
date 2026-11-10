@@ -1140,42 +1140,51 @@ outputs (keyed, single-value, append-only). A per-key asset's full run
 (D194) has no reset and keeps every key readable, so its keys change one
 batch at a time outside Solera as inside. D205 is unchanged for Solera's
 own readers. The store owns the mechanism; the engine gains one hook that
-says a full run ended and two fields of the write context that say which
-full runs the log knows, and none of it knows how a store uses them.
+says a full run ended, one field of the write context that says which
+full run's build a write targets, and one gate condition for inputs taken
+by reference; none of it knows how a store uses them.
 
 **The store (PostgresStore).**
 
 1. **The first write of a full run opens a build.** A write with
    `context.reset` creates a shadow table named by its version (in a
-   schema of Solera's, with the user table's columns, the key index and
-   any declared primary key) and writes into it. If that version's build
+   schema of Solera's, with the user table's columns, constraints, unique
+   indexes, the key index and any declared primary key, so a row that
+   breaks a constraint fails its batch as today), registers it under its
+   partition, and writes into it. If that version's build
    was already published (the same attempt delivered again after its
    switch), it rewrites the same rows in place instead.
-2. **A write goes where the log points.** The write context carries the
-   core's full run in progress (`full_run`) and the run whose end the
-   store has not yet been told (`full_run_ended`). A write that is not a
-   reset goes to the build of the first of them that is open, else to the
-   user's table. Every write, reset or not, keeps the builds those two
-   fields name and its own new build, and drops the partition's other
+2. **A write goes where the log points.** The write context's `build_run` names the
+   core's full run in progress, else the run whose end the store has not
+   yet been told (the two are never both set). A write that is not a reset
+   goes to that run's build if it is open, else to the user's table. Every
+   write, reset or not, keeps the build `build_run` names and its own
+   new build, and drops the partition's other
    builds in the same transaction: no run in the log names them (a dead
    first attempt's, or one a newer run overtook), and the version check
    has locked their writers out.
-3. **Solera reads what its commits name.** A commit's ref names the table
-   its rows went to; a load reads it, and if that shadow is gone (switched,
-   or overtaken), it reads the user's table again in a new transaction. It
+3. **Solera reads what its commits name.** A commit's ref names the user's
+   table and the run of the build its rows went to; a load reads that
+   build if it is still open, else the user's table, in its own
+   transaction (again in a new one if a switch drops the build under it). It
    reports the versions it read, as every table load does (D184). A build no
    commit names is read by no one, so Solera never reads a clear the
    journal has not recorded.
-4. **The switch is one transaction.** It locks the partition's
-   version-check row; if the run's build is open, it deletes the
+4. **The switch is one transaction.** It takes the table's
+   write domain and then the partition's version-check row, the order
+   every write takes them in; if the run's build is open and no attempt
+   newer than the engine knows of has written, it deletes the
    partition's rows from the user's table, inserts the build's, and drops
    the build and any older one. Otherwise it does nothing (published
    already). MVCC keeps outsiders on the old rows until it commits, and it
    takes no lock a reader waits for.
 
 **The engine: one hook, owed in the journal.**
-`Store.full_run_ended(output, partition, run)` says that the full run of
-this partition that began at version `run` has ended. Stores that name
+`Store.full_run_ended(output, partition, run, newest)` says that the full
+run of this partition whose clear the attempt at version `run` wrote has
+ended; `newest` is the newest attempt the engine has planned there, so a
+call delivered late does nothing. The core journals the clear's version
+for this (today it keeps only the clear's commit number). Stores that name
 objects by version keep the default, which does nothing. The engine owes
 the call in the same journal event that ends the run, whichever way it
 ends: the output commit that carries `ends_full_run`, a `FullRunDone`
@@ -1188,8 +1197,11 @@ commit and is not yet repaired, so the switch never publishes a row no
 commit recorded. It runs the call before it plans the partition's next
 batch, unless that batch must first repair a dead attempt (D196, rule 3).
 Then it journals `FullRunNoticed(run)`, which clears the debt only if it
-still names that run, and calls again after a crash; a repeat finds the
-build gone and does nothing.
+still names that run, and calls again after a crash, or with backoff and
+an alarm while the call fails; a repeat finds the run published and does
+nothing. **An input taken by reference** (a `TableRef` its consumer queries
+itself) reads what outsiders read, so the gate counts its upstream
+incomplete until the notice, not only until the run ends.
 
 **An ordinary output's first run is a full run** of an empty output: its
 first batch says `batch.reset` and commits a clear, so a first run also
@@ -1226,7 +1238,11 @@ pays instead: at 10M rows it built the shadow in 136 s (today's in-place
 rebuild: 213 s, since the shadow carries no user index), then switched in
 one 101 s transaction writing 4.7 GB of WAL, 240 s in all against 212 to
 214 s today. A query issued during the switch read the old rows without
-waiting (2 ms for a point query, 1.07 s for a count). During the switch
+waiting (2 ms for a point query, 1.07 s for a count). At 100M rows (narrow
+rows, 10.8 GB) the build took 1,330 s and the switch one 699 s
+transaction, 2,051 s and 46 GB of WAL in all against 1,719 s and 32 GB
+in place; a count issued during the switch read the 100M old rows in
+8.6 s. During the switch
 the disk holds the old rows, the build and the new rows at once, about
 three times the partition, until vacuum. Rejected: a view over a table
 with a side column (a 2 ms switch, but outside group and join queries paid
@@ -1825,7 +1841,7 @@ executable contract tests, as part of the build (T41).
 | SRC-12 | A load that finds a source at another version than its log records it in the source's log, unless the log changed that key since the batch's head. Two consumers of a source that changes on every read may trigger each other, bounded by ENG-10 | A source's file changed before its sensor saw it | D193 |
 | ENG-17 | A loaded version, or absence, of a produced output that neither its log nor a live attempt explains is alarmed; the consumer's key is not due until the producer redoes it; it never enters the log | §8: tally loads k2@6 from dead attempt A | D196 |
 | ENG-18 | An asset whose `ctx.load()` returns a version other than its own last commit owes a full run | §8: tally after a dead write of 5 | D196 |
-| STO-8 | A program reading a table outside Solera never sees an ordinary output's full run half done: all old rows until the run ends, then all new; a first run shows nothing until it completes; a released run is published as it stands | §8: copy's full run in batches of 2 | D211 |
+| STO-8 | A program reading a table outside Solera never sees an ordinary output's full run half done: all old rows until the run ends, then all new; a first run shows nothing until it completes; a released run is published as it stands; an asset that queries the table by reference waits until the switch | §8: copy's full run in batches of 2 | D211 |
 
 ## 17. Decisions
 
@@ -1914,7 +1930,7 @@ store is exact" stands: D196 keeps it.
 | D208 | The core does its own I/O in Rust (`object_store`), with one shared memory cache, single-flight fetches and an on-disk cache of layer files; synchronous calls that release the GIL; heavy queries capped by the engine | The I/O boundary | §1, §15 | SOLE-6, 50 concurrent queries on local files, S3 and S3 + 30 ms: equal on small queries; on 1K scattered gets Python fetching cost 100–120 µs more CPU per GET, stalled the event loop up to 0.76 s (Rust under 60 ms) and was 3–93% slower. Cost: +60 s release build, +8 MB |
 | D209 | A `Regex(...)` key pattern uses the Rust `regex` dialect, matched against the whole key, validated at declaration by the native matcher, which today's Python path also matches through; lookaround and backreferences are refused | A contract choice in the build (SOLE-11) | §9 | Two dialects would make the SDK and the core disagree on which keys are owed; matching in Python would cross once per key; the Rust dialect is linear-time. Pre-usage, so no pattern breaks. Visible to users |
 | D210 | Staleness reasons (STA-2): an edge's status names its witness's reason at once; every reason that holds is computed when asked, by the same walk as the count, and cached with it. No witness per kind of reason, no extra work at commits | §6's one witness per kind of reason | §6 | B7 at 100M keys: listing the reasons adds nothing measurable to a count a day behind (0.58 to 0.71 s warm with them, 0.58 to 0.70 s without), once a memo per piece keeps the per-key pattern match out. Four witnesses would mean up to four probes after a batch and four states per edge, for a list only the console shows |
-| D211 | On a table, an ordinary output's full run builds beside the published rows and the store switches once, in one transaction, when the run ends; outside Solera a table shows all old rows, then all new. Solera reads what its commits name. The write context carries the core's full run in progress and the run whose end the store was not yet told; the engine owes `Store.full_run_ended(output, partition, run)` in the journal event that ends the run (its last commit, `FullRunDone`, or a release), calls it once no attempt of the partition is in flight or unrepaired, journals `FullRunNoticed(run)` after it, and repeats it after a crash; a newer run's journaled clear drops the debt. An ordinary output's first run is a full run | Erwin's ask (2026-11-10): outside readers never see a half-built table, with the mechanism in the store | §8, §10 | Model: thirteen rules (§18), each failing alone in 5 to 1,500 of 1,500 histories, 5,000 histories pass with all on. PostgreSQL 16 at 10M rows: outside queries keep their plan; build 136 s + switch 101 s (4.7 GB WAL) against 212 s in place; a side-column view switched in 2 ms but outside group and join queries paid 18% to 37% more; `ALTER TABLE` swaps waited behind a 10 s reader |
+| D211 | On a table, an ordinary output's full run builds beside the published rows and the store switches once, in one transaction, when the run ends; outside Solera a table shows all old rows, then all new. Solera reads what its commits name. The write context carries the full run whose build a write targets (the run in progress, else the run whose end the store was not yet told); the engine owes `Store.full_run_ended(output, partition, run, newest)` in the journal event that ends the run (its last commit, `FullRunDone`, or a release), calls it once no attempt of the partition is in flight or unrepaired, journals `FullRunNoticed(run)` after it, and repeats it after a crash; a newer run's journaled clear drops the debt. An input taken by reference waits until the switch. An ordinary output's first run is a full run | Erwin's ask (2026-11-10): outside readers never see a half-built table, with the mechanism in the store | §8, §10 | Model: fourteen rules (§18), each failing alone in 5 to 1,500 of 1,500 histories, 5,000 histories pass with all on. PostgreSQL 16 at 10M rows: outside queries keep their plan; build 136 s + switch 101 s (4.7 GB WAL) against 212 s in place; at 100M, 2,051 s against 1,719 s, 46 GB of WAL against 32 GB, and a 699 s switch no reader waited for; a side-column view switched in 2 ms but outside group and join queries paid 18% to 37% more; `ALTER TABLE` swaps waited behind a 10 s reader |
 
 Nothing in this design is pending. What remains to measure (the cost of a
 count on request at the scale target, among others) is listed with the
@@ -1996,11 +2012,14 @@ and batches that start at a piece boundary (asserted).
   a crash), a store call delivered twice, the release of a canceled full
   run, and the cancel of a full run asked for by hand before its first
   commit. After every step, the four checks of §8 ("What outsiders see");
-  at rest, the checks listed there. The model's loads read the build the
-  log names now; a load by its commit's ref can only be closer to what the
-  batch planned. The model lets the engine switch whenever the partition
+  at rest, the checks listed there. `summary` also reads `copy` by
+  reference, from the user's table, and must find the log's head state.
+  The model's loads read the build the log names now; loads by their
+  commit's ref, put into a variant of the model in review, fail none of
+  5,000 histories (a load whose build a newer run overtook falls back to
+  older rows, and the hold-back holds it). The model lets the engine switch whenever the partition
   is quiet; running it before the next batch, as §8 says, is one such
-  order. Thirteen rules: `swap` (build beside), `solera_build` (Solera
+  order. Fourteen rules: `swap` (build beside), `solera_build` (Solera
   reads the build), `first_full` (a first run is a full run),
   `switch_commit`, `switch_alone` and `switch_release` (each way a run
   ends owes the switch), `switch_owed` (the owed switch is journaled and
@@ -2009,7 +2028,8 @@ and batches that start at a piece boundary (asserted).
   `switch_quiet` (the switch waits until no attempt is in flight or
   unrepaired), `build_keep` (a write never drops a build the log names),
   `reset_replay` (a reset delivered again after its switch writes in
-  place) and `switch_cleanup` (the switch deletes the old rows first).
+  place), `switch_cleanup` (the switch deletes the old rows first) and
+  `byref_wait` (an input taken by reference waits for the switch).
 
 **Every rule is needed.** Each rule is named, and `histories.py` holds one
 shrunk history per rule that passes with every rule on and fails with

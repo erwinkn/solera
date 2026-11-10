@@ -277,6 +277,11 @@ CALIBRATIONS = {
         ("step", "copy", 1),
         ("switch", "copy", False),
     ],
+    ("fullrun", "clear", "table", "byref_wait"): [
+        ("items", (("k3", True),)),
+        ("step", "copy", 1),
+        ("summary",),
+    ],
 }
 
 # archive loads k1 as a dead attempt of copy left it: a version no commit

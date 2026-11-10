@@ -9,7 +9,8 @@ copy is an ordinary keyed copy of items, with feed as a second keyed input,
 whose definitions keep every key, drop the even ones, or rename every key.
 tally is an ordinary asset that keeps a count per group (odd and even keys)
 by building on ctx.load(). archive reads copy, report reads tally, summary
-reads copy whole. checks is a per-key asset over items under the amended P8:
+reads copy whole, through the store and by reference (the user's table
+itself, D211). checks is a per-key asset over items under the amended P8:
 nothing resets, and a full run asked for by hand raises a rebuild counter that
 is part of its conditions. copy and tally live in one kind of store per
 history: "file" (an attempt loads the version it planned) or "table" (it loads
@@ -67,6 +68,7 @@ RULES = {
         "notice_match",
         "switch_quiet",
         "switch_overtaken",
+        "byref_wait",
     ),
 }
 ADDED = {
@@ -88,6 +90,7 @@ ADDED = {
         "notice_match",
         "switch_quiet",
         "switch_overtaken",
+        "byref_wait",
     )
 }
 
@@ -1185,6 +1188,7 @@ class World:
         if not c.complete() and not c.released and self.on("gate_whole"):
             self.held["summary"] += 1
             return
+        self.by_reference()
         read = {k: r.version for k, r in c.output.rows.items()}
         if read != c.output.log.scan(c.output.log.head):
             self.stats["summary reads a version no commit recorded"] += 1
@@ -1200,6 +1204,26 @@ class World:
         self.trace.append(f"summary reads copy whole: {sorted(c.output.rows)}")
         if (not c.brute_complete() and not c.released) or len(defs) > 1:
             self.violation = f"summary read a copy that is incomplete or mixes definitions {sorted(defs)}"
+
+    def by_reference(self) -> None:
+        """A whole reader of copy that takes it by reference queries the user's
+        table itself: no store load serves it, so its gate also waits while the
+        store's switch is owed (D211), and it records copy's head as read."""
+        c = self.copy
+        out = c.output
+        if out.kind != "table":
+            return
+        if "copy" in self.ended and self.on("byref_wait"):
+            self.held["by reference"] += 1
+            return
+        view, state = out.outside(), out.log.states[-1]
+        if any(
+            (r.version if (r := view.get(k)) else ABSENT) != state.get(k)
+            for k in (set(view) | set(state)) - set(out.loose)
+        ):
+            self.violation = (
+                f"a reader of copy by reference reads {_rows(view)}, copy#{out.log.head} records {state}"
+            )
 
     # -- invariants -------------------------------------------------------------
     def check(self) -> str | None:

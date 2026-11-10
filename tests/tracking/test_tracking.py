@@ -566,6 +566,7 @@ def test_a_switch_a_newer_full_run_overtook_is_skipped():
         ("build_keep", "outsiders read"),  # (i)
         ("switch_quiet", "outsiders read"),
         ("switch_overtaken", "outsiders read"),
+        ("byref_wait", "by reference"),
         ("reset_replay", "times"),  # (iii)
         ("switch_cleanup", "of an older build"),  # (iv)
     ],
@@ -613,6 +614,43 @@ def test_a_replayed_write_carries_what_its_repair_added():
     w = oracle.replay_fullrun(events, kind="table")
     assert w.copy.output.log.states[-1] == {"k2": 3, "k3": 3} == _versions(w.copy.output.rows)
     assert fullrun.run(events, "clear", "table") is None
+
+
+def test_an_input_taken_by_reference_waits_for_the_switch():
+    """STO-8's example, read by an asset that queries copy's table itself: the
+    run has ended in the log, but until the switch the table holds the old
+    rows, so the gate holds the reader; after the switch it reads the new
+    ones (Fable review of #37, H1)."""
+    k4 = (("k1", True), ("k2", True), ("k3", True), ("k4", True))
+    events = [("items", k4), ("step", "copy", 4), ("switch", "copy", True)]
+    events += [
+        ("items", (("k3", False), ("k5", True))),
+        ("full", "copy"),
+        ("step", "copy", 2),
+        ("step", "copy", 2),
+    ]
+    events += [("summary",)]
+    w = oracle.replay_fullrun(events, kind="table")
+    assert w.copy.complete() and w.ended == {"copy": 2} and w.held["by reference"] == 1
+    assert fullrun.run(events, "clear", "table") is None
+    r = fullrun.run(events, "clear", "table", frozenset({"byref_wait"}))
+    assert r is not None and "by reference" in r[1]
+    events += [("switch", "copy", True), ("summary",)]
+    w = oracle.replay_fullrun(events, kind="table")
+    new = {"k1": 2, "k2": 2, "k4": 3, "k5": 3}
+    assert w.held["by reference"] == 1 and _versions(w.copy.output.outside()) == new
+    assert fullrun.run(events, "clear", "table") is None
+
+
+def test_a_write_context_never_names_two_full_runs():
+    """The run in progress and the run owed a switch are never both set: a
+    newer run's clear drops the older debt, so B8's write context carries one
+    field (Fable review of #37, low 6)."""
+    for seed in range(300):
+        w = fullrun.World("clear", "table")
+        for ev in fullrun.history(random.Random(seed), 60):
+            w.apply(ev)
+            assert None in w.copy.runs() and None in w.tally.runs()
 
 
 def test_a_late_notice_of_an_older_switch_keeps_the_newer_one_owed():
