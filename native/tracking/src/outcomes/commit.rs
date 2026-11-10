@@ -494,13 +494,13 @@ pub async fn commit(
         at: v.failures.head,
         look: made.map(|_| (looked, caught_up)),
         life: v.per_key.life,
-        // A key held back while this input read it as planned, at the
-        // version its record failed on (another input moved), was not
-        // retried and its input has not moved: it waits for its retry
-        // again, so it lowers what the pass covers like a record written.
-        // One read at another version comes back with its change, or the
-        // catch-up lowers it when the input returns; one planned at another
-        // version than its record's is a change batch's.
+        // A key held back while this input read it as planned, at what its
+        // record failed on (another input moved), was not retried and its
+        // input has not moved: it waits for its retry again, so it lowers
+        // what the pass covers like a record written. One read at another
+        // version comes back with its change, or the catch-up lowers it
+        // when the input returns; one planned at another holding than its
+        // record's is a change batch's.
         low: next
             .values()
             .flatten()
@@ -511,7 +511,13 @@ pub async fn commit(
                         held_back.binary_search(&c.key).is_ok()
                             && loaded.binary_search_by(|(x, _)| x.cmp(&c.key)).is_err()
                     })
-                    .filter_map(|c| priors.get(&c.key).filter(|pr| pr.on == c.version)),
+                    .filter_map(|c| {
+                        let pr = priors.get(&c.key)?;
+                        let on = conds.get(&pr.on_cond)?;
+                        let tried = Holding::of(pr.on.as_version(), on, &c.key);
+                        let planned = Holding::of(c.version.as_version(), &p.conditions, &c.key);
+                        (!owed(&tried, &planned)).then_some(pr)
+                    }),
             )
             .fold(None, |mut low, r| {
                 cover(&mut low, &r.stored);

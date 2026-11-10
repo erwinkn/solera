@@ -3259,6 +3259,154 @@ fn a_retry_plan_keeps_the_unkeyed_inputs() {
     });
 }
 
+/// The same with b's conditions moved instead of its version: after a
+/// rebuild on b, a's retry takes b's k1 at v1 under the new conditions, and
+/// b's record of v1 under the old ones is a change batch's.
+#[test]
+fn a_held_back_key_planned_under_other_conditions_than_its_record_lowers_nothing() {
+    let rt = runtime();
+    let ix = index(&rt);
+    rt.block_on(async {
+        let mut w = Multi::new(0);
+        for i in 0..2 {
+            let changes = [(key("k1"), Ver::Int(1))].into();
+            assert!(
+                w.sides[i]
+                    .log
+                    .commit(&ix, &mut w.t, changes, false, true)
+                    .await
+            );
+        }
+        let req = w.request(None, 10);
+        let view = w.t.view(&req).unwrap();
+        let p = plan::plan(&view, &req, &OneIndex(&ix), &NoHold)
+            .await
+            .unwrap();
+        let failed = [(key("k1"), boom())].into();
+        assert!(
+            w.commit_batch(&ix, &p, failed, vec![vec![], vec![]], false)
+                .await
+        );
+        w.catch_up(&ix).await;
+        let life = w.t.per_key[&w.sides[1].edge].life;
+        w.apply(vec![Part::Rebuild(Rebuild {
+            edge: w.sides[1].edge.clone(),
+            to: 1,
+            life,
+        })]);
+        let nows = [
+            w.now.clone(),
+            Arc::new(Conditions {
+                rebuild: 1,
+                ..(*w.now).clone()
+            }),
+        ];
+        catch_up_under(&mut w, &ix, &nows).await;
+        w.counters.deploy = 2;
+        let mut req = w.request(None, 10);
+        req.inputs[1].conditions = nows[1].clone();
+        for i in [1, 0] {
+            let start = w.start(&ix, i).await.expect("the deploy starts a pass");
+            w.apply(start);
+            let view = w.t.view(&req).unwrap();
+            let r = w.t.retry_view(&w.sides[i].edge).unwrap();
+            let p = due::plan_all(&OneIndex(&ix), &r, &view, &req, &NoHold, 10)
+                .await
+                .unwrap();
+            if i == 1 {
+                assert!(p.inputs[1].keys.is_empty(), "b's k1 is owed by the rebuild");
+                let reports = [InputReport::default(), InputReport::default()];
+                commit_under(&mut w, &ix, &p, &nows, &reports).await;
+                continue;
+            }
+            assert_eq!(p.inputs[1].keys[0].version, Ver::Int(1));
+            let changes = [(key("k1"), Ver::Int(2))].into();
+            assert!(
+                w.sides[0]
+                    .log
+                    .commit(&ix, &mut w.t, changes, true, false)
+                    .await
+            );
+            let reports = [
+                InputReport {
+                    failed: vec![],
+                    loaded: vec![(key("k1"), Ver::Int(2))],
+                },
+                InputReport::default(),
+            ];
+            commit_under(&mut w, &ix, &p, &nows, &reports).await;
+        }
+        assert_eq!(w.t.per_key[&w.sides[1].edge].last.deploy, 2);
+        assert!(w.start(&ix, 1).await.is_none(), "no pass is due on b");
+    });
+}
+
+async fn catch_up_under(w: &mut Multi, ix: &ChangeIndex, nows: &[Arc<Conditions>]) {
+    for j in 0..w.sides.len() {
+        let v = w.t.outcome_view(&w.sides[j].edge).unwrap();
+        let (f, d) = w.ctx();
+        let ctx = Ctx {
+            now: w.clock,
+            counters: w.counters,
+            retries: 2,
+            time_ms: 0,
+            producer: b"",
+            failures_path: &f,
+            due_path: &d,
+        };
+        if let Some(parts) = oc::catch_up(&OneIndex(ix), &v, &nows[j], &ctx)
+            .await
+            .unwrap()
+        {
+            w.apply(parts);
+        }
+    }
+}
+
+/// A batch with no failures committed under each input's own conditions.
+async fn commit_under(
+    w: &mut Multi,
+    ix: &ChangeIndex,
+    p: &plan::Plan,
+    nows: &[Arc<Conditions>],
+    reports: &[InputReport],
+) {
+    let mut ops = w.t.progress_ops(p, reports, b"", None).unwrap();
+    catch_up_under(w, ix, nows).await;
+    let mut parts = vec![];
+    for j in 0..w.sides.len() {
+        let v = w.t.outcome_view(&w.sides[j].edge).unwrap();
+        let (f, d) = w.ctx();
+        let ctx = Ctx {
+            now: w.clock,
+            counters: w.counters,
+            retries: 2,
+            time_ms: 0,
+            producer: b"",
+            failures_path: &f,
+            due_path: &d,
+        };
+        let loaded = &reports[j].loaded;
+        let mut ps = oc::commit(
+            &OneIndex(ix),
+            &v,
+            p,
+            j,
+            &[],
+            loaded,
+            &nows[j],
+            &ctx,
+            &mut ops,
+        )
+        .await
+        .unwrap();
+        parts.append(&mut ps);
+    }
+    let mut all = ops.parts;
+    all.append(&mut parts);
+    w.apply(all);
+}
+
 fn boom() -> Reported {
     Reported {
         kind: Kind::Failed,
