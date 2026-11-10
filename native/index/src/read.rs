@@ -22,6 +22,9 @@ const ALL: u64 = 4 << 20;
 /// decoding, per layer.
 const WINDOW: u64 = 16 << 20;
 
+/// The blocks of one batch, being fetched.
+type Fetch = tokio::task::JoinHandle<Result<Vec<Cached>>>;
+
 /// Sorted, distinct keys, back to back.
 #[derive(Default, Clone, Debug)]
 pub struct KeyList {
@@ -168,7 +171,9 @@ pub(crate) struct Cursor {
     all: bool,
     /// Bytes launched and not yet taken.
     ahead: u64,
-    pending: VecDeque<(Range<usize>, tokio::task::JoinHandle<Result<Vec<Cached>>>)>,
+    /// A read of listed keys small enough to keep in the memory cache.
+    keep_all: bool,
+    pending: VecDeque<(Range<usize>, Fetch)>,
     ready: VecDeque<(Bytes, BlockRef)>,
     run: Run,
     pos: usize,
@@ -267,6 +272,7 @@ impl Cursor {
                 }
             }
         }
+        let keep_all = blocks.iter().map(|b| b.clen as u64).sum::<u64>() <= store.opts.cache_batch;
         Ok(Cursor {
             store: store.clone(),
             path,
@@ -275,6 +281,7 @@ impl Cursor {
             target: if all_at_once { ALL } else { FIRST },
             all: all_at_once,
             ahead: 0,
+            keep_all,
             pending: VecDeque::new(),
             ready: VecDeque::new(),
             run: Run::new(),
@@ -284,17 +291,27 @@ impl Cursor {
         })
     }
 
+    /// Bytes a batch of blocks spans in the file, gaps included: what its
+    /// GETs fetch and hold.
+    fn span(&self, r: Range<usize>) -> u64 {
+        let (first, last) = (&self.blocks[r.start], &self.blocks[r.end - 1]);
+        last.off + last.clen as u64 - first.off
+    }
+
     fn launch(&mut self) {
         let a = self.next;
         let mut bytes = 0u64;
-        let gap = self.store.opts.coalesce;
+        let (gap, max_get) = (self.store.opts.coalesce, self.store.opts.max_get);
         while self.next < self.blocks.len() {
             let b = &self.blocks[self.next];
             let joins = self.next > a && {
                 let p = &self.blocks[self.next - 1];
                 b.off <= p.off + p.clen as u64 + gap
             };
-            if self.next > a && bytes >= self.target && !(self.all && joins) {
+            if self.next > a
+                && ((bytes >= self.target && !(self.all && joins))
+                    || self.span(a..self.next + 1) > max_get)
+            {
                 break;
             }
             bytes += b.clen as u64;
@@ -303,9 +320,9 @@ impl Cursor {
         if self.next == a {
             return;
         }
-        self.ahead += bytes;
+        self.ahead += self.span(a..self.next);
         let keep = if self.all {
-            self.blocks.iter().map(|b| b.clen as u64).sum::<u64>() <= self.store.opts.cache_batch
+            self.keep_all
         } else {
             self.target = (self.target * 2).min(MAX);
             bytes <= self.store.opts.cache_batch
@@ -364,10 +381,7 @@ impl Cursor {
             let got = h
                 .await
                 .map_err(|e| Error::Store(format!("fetch task: {e}").into()))??;
-            self.ahead -= self.blocks[span.clone()]
-                .iter()
-                .map(|b| b.clen as u64)
-                .sum::<u64>();
+            self.ahead -= self.span(span.clone());
             if !self.all {
                 self.launch();
             }

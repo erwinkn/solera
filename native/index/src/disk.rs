@@ -39,8 +39,8 @@ struct DiskState {
     /// Paths being filled, and the bytes set aside for them.
     filling: HashSet<String>,
     reserved: u64,
-    /// Fills that failed: not tried again by this process.
-    failed: HashSet<String>,
+    /// Fills that failed, and when: not tried again for a minute.
+    failed: HashMap<String, std::time::Instant>,
 }
 
 /// A layer path as a file name, and back: `%`, `/` and a leading `.`
@@ -81,6 +81,17 @@ impl Disk {
         let io =
             |e: std::io::Error| Error::Store(format!("disk cache {}: {e}", o.dir.display()).into());
         std::fs::create_dir_all(&o.dir).map_err(io)?;
+        let owner = o.dir.join(".store");
+        if !owner.exists()
+            && std::fs::read_dir(&o.dir)
+                .map_err(io)?
+                .any(|e| e.is_ok_and(|e| e.file_name() != ".lock"))
+        {
+            return Err(Error::Invalid(format!(
+                "disk cache {}: the directory holds files and is not a cache",
+                o.dir.display()
+            )));
+        }
         let lock = std::fs::File::options()
             .create(true)
             .truncate(false)
@@ -98,19 +109,7 @@ impl Disk {
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
-        let owner = o.dir.join(".store");
-        let marked = std::fs::read(&owner).ok();
-        let mine = marked.as_deref() == Some(o.store.as_bytes());
-        if marked.is_none()
-            && std::fs::read_dir(&o.dir)
-                .map_err(io)?
-                .any(|e| e.is_ok_and(|e| e.file_name() != ".lock"))
-        {
-            return Err(Error::Invalid(format!(
-                "disk cache {}: the directory holds files and is not a cache",
-                o.dir.display()
-            )));
-        }
+        let mine = std::fs::read(&owner).is_ok_and(|b| b == o.store.as_bytes());
         let mut found = Vec::new();
         for e in std::fs::read_dir(&o.dir).map_err(io)? {
             let e = e.map_err(io)?;
@@ -169,14 +168,20 @@ impl Disk {
     /// than the cache's size. The claim ends with `commit` or `abandon`.
     pub(crate) fn claim(&self, path: &str, size: u64) -> bool {
         let mut st = self.st.lock().unwrap();
+        let failed = st
+            .failed
+            .get(path)
+            .is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(60));
         if !self.keeps(path)
             || size.saturating_mul(4) > self.o.bytes
+            || st.reserved + size > self.o.bytes
             || st.files.contains_key(path)
-            || st.failed.contains(path)
+            || failed
             || !st.filling.insert(path.to_string())
         {
             return false;
         }
+        st.failed.remove(path);
         st.reserved += size;
         let evict = self.make_room(&mut st);
         drop(st);
@@ -185,12 +190,14 @@ impl Disk {
     }
 
     /// A claimed fill that failed: its room is given back, and it is not
-    /// tried again.
+    /// tried again for a while. Ending a claim twice changes nothing.
     pub(crate) fn abandon(&self, path: &str, size: u64) {
         let mut st = self.st.lock().unwrap();
-        st.filling.remove(path);
-        st.reserved -= size;
-        st.failed.insert(path.to_string());
+        if st.filling.remove(path) {
+            st.reserved -= size;
+            st.failed
+                .insert(path.to_string(), std::time::Instant::now());
+        }
     }
 
     /// Evict least recently used files until the files and the room set
@@ -240,8 +247,9 @@ impl Disk {
         }
         t.kept = true;
         let mut st = self.st.lock().unwrap();
-        st.filling.remove(path);
-        st.reserved -= size;
+        if st.filling.remove(path) {
+            st.reserved -= size;
+        }
         drop(st);
         self.add(path, size);
         Ok(())

@@ -256,9 +256,22 @@ impl Store {
         Ok(self.prefix.parts().chain(p.parts()).collect())
     }
 
-    /// One GET.
-    pub(crate) async fn get_range(&self, path: &str, r: Range<u64>) -> Result<Bytes> {
-        Ok(self.read(path, r).await?.0)
+    /// One read, parsed; a damaged copy in the disk cache is dropped and the
+    /// store's read instead.
+    pub(crate) async fn read_checked<T>(
+        &self,
+        path: &str,
+        r: Range<u64>,
+        parse: impl Fn(&[u8]) -> Result<T>,
+    ) -> Result<T> {
+        let (b, from_disk) = self.read(path, r.clone()).await?;
+        match parse(&b) {
+            Err(Error::Format(_)) if from_disk => {
+                self.disk.as_ref().unwrap().forget(path);
+                parse(&self.get(path, r).await?)
+            }
+            got => got,
+        }
     }
 
     /// One read, from the disk cache if it holds the layer (then `true`),

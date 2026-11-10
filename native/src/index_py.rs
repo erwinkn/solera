@@ -212,6 +212,7 @@ impl ChangeIndex {
     #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (url, options=None, *, memory_bytes=256 << 20, disk_dir=None, disk_store=None, disk_bytes=16 << 30, block_bytes=32 << 10, level=1))]
     fn new(
+        py: Python<'_>,
         url: &str,
         options: Option<HashMap<String, String>>,
         memory_bytes: u64,
@@ -236,13 +237,16 @@ impl ChangeIndex {
                 disk,
                 ..Default::default()
             };
-            let store = ix::Store::from_url(
-                url,
-                options.unwrap_or_default(),
-                rt().handle().clone(),
-                opts,
-            )
-            .map_err(err)?;
+            let store = py
+                .detach(|| {
+                    ix::Store::from_url(
+                        url,
+                        options.unwrap_or_default(),
+                        rt().handle().clone(),
+                        opts,
+                    )
+                })
+                .map_err(err)?;
             let write = ix::WriteOptions {
                 block_bytes,
                 level,
@@ -256,6 +260,7 @@ impl ChangeIndex {
 
     /// Write commit `commit`'s layer at `path` from its entries `(key, new,
     /// replaced)`, one per changed key, in any order. Returns the layer.
+    #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (path, commit, entries, *, time_ms=0, producer=Vec::new(), live_before=0))]
     fn write_commit<'py>(
         &self,
