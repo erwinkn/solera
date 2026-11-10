@@ -9,6 +9,7 @@ from solera.stores import FileStore, Patch
 
 from tests.contract.example import Example
 from tests.contract.harness import Outside, Refused, SourceStore
+from tests.contract.test_sta import INCOMPLETE, Rebuild, task_of
 
 
 def files_project(root, content: dict, fn, version: str = "1", **input) -> Project:
@@ -440,3 +441,71 @@ async def test_sel_10_a_per_key_full_run_canceled_midway_leaves_the_rest_owed_an
     got = {k: [r["version"] for r in v] for k, v in (await samples(solera)).items()}
     assert got == {"a": ["2"], "b": ["2"], "c": ["2"]}
     assert await solera.stale("parse") == [] and await solera.stale_keys("parse") == {}
+
+
+# -- target (PR 2) --
+
+
+# -- SEL-11 (target) --------------------------------------------------------------------
+
+
+async def test_sel_11_a_full_run_over_an_empty_upstream_reaches_its_producer(solera):
+    """items is now empty: copy's full run calls it once, an empty batch,
+    first and final; copy becomes empty and is complete at once."""
+
+    ex = await built(solera)
+    await ex.feed(removes=["k1", "k2", "k3"])
+    [batch] = await ex.run("copy", mode="full")
+    assert (batch.first, batch.final, batch.reset, batch.rows) == (True, True, True, [])
+    assert await solera.rows("copy") == {} and (await solera.head("copy"))["materialized"]
+    assert await solera.stale("copy") == []
+
+
+async def test_sel_11_a_full_run_whose_patterns_take_nothing_reaches_its_producer(solera):
+    """copy and checks now take `z*` alone. copy's full run is one empty
+    batch and empties it; checks is called for no key, and loses every key
+    it held."""
+
+    ex = await built(solera)
+    await ex.deploy(include=["z*"])
+    [batch] = await ex.run("copy", mode="full")
+    assert (batch.first, batch.final, batch.reset, batch.rows, batch.classes) == (
+        True,
+        True,
+        True,
+        [],
+        ([], [], []),
+    )
+    assert await solera.rows("copy") == {} and (await solera.head("copy"))["materialized"]
+    ex.calls.clear()
+    await solera.run("checks", mode="full")
+    assert ex.calls.get("checks", []) == [] and await solera.rows("checks") == {}
+    assert await solera.stale("checks") == [] and await solera.stale("copy") == []
+
+
+# -- SEL-12 (target) --------------------------------------------------------------------
+
+
+async def test_sel_12_a_keys_run_may_be_a_full_runs_first_batch_and_a_default_run_finishes_it(solera):
+    """copy's version is bumped; `keys=(k1)` is the full run's first batch:
+    its commit clears copy, which holds k1 alone and owes k2 and k3. archive
+    is held until a default run finishes copy, then gets one difference."""
+
+    r = await Rebuild(solera).start(keys=("k1", "k2", "k3"))
+    await r.deploy(version="2")
+    await solera.run("copy", keys={"items": ["k1"]})
+    [batch] = r.seen["copy"][-1:]
+    assert (batch.reset, batch.rows) == (True, ["k1"])
+    assert await solera.rows("copy") == {"k1": "1"} and not (await solera.head("copy"))["materialized"]
+    assert await solera.stale("copy") != []
+    reader = await solera.submit("archive")
+    await solera.settle(0.5)
+    task = await task_of(solera, reader, "archive")
+    assert task["status"] == "queued" and task.get("held") == [INCOMPLETE, "copy"], task
+    batches = len(r.seen["copy"])
+    await solera.run("copy")
+    assert [(b.reset, b.added) for b in r.seen["copy"][batches:]] == [(False, ["k2", "k3"])]
+    assert (await solera.head("copy"))["materialized"] and await solera.stale("copy") == []
+    assert (await solera.wait(reader))["request"]["status"] == "succeeded"
+    assert r.seen["archive"][-1].classes == ([], ["k1", "k2", "k3"], [])
+    assert await solera.rows("archive") == await solera.rows("copy") == {"k1": "1", "k2": "1", "k3": "1"}

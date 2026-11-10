@@ -103,7 +103,7 @@ k1 is at @2, fresh again once it is back at @1, and its next run delivers
 nothing for k1. What is owed compares versions, so equal ends mean nothing
 changed, and no run is spent on it (STA-14).
 *From* D187 (replaces D156); review A31 R2. *Today* the key is delivered as
-`updated` (`server/test_staleness.py::test_a_key_updated_and_reverted_reads_as_updated`). *Covered* {{COVERED}}.
+`updated` (`server/test_staleness.py::test_a_key_updated_and_reverted_reads_as_updated`). *Covered* `contract/test_inc.py::test_inc_4_an_update_reverted_to_the_processed_version_is_not_delivered`.
 
 **INC-5. A total kept from the classes alone stays exact.**
 `tally` = what it held + `len(added)` − `len(removed)`. After any history
@@ -129,7 +129,7 @@ run's batch reached k1, that batch delivers nothing for k1, never k1@1. On
 a store that writes in place, this rests on the version check per
 partition in every write transaction (STO-4), not on a fence taken before
 reads.
-*From* D139, D154, D196; `ObservedSet.tla` counterexample 2 (W36). *Covered* {{COVERED}}; `server/test_observed_histories.py::test_a26_n1_a_run_reads_rows_after_the_upstream_moved_on`; `server/test_versions.py::test_each_batch_says_the_generation_it_read`.
+*From* D139, D154, D196; `ObservedSet.tla` counterexample 2 (W36). *Covered* `contract/test_inc.py::test_inc_8_each_batch_reads_upstream_as_it_is_when_it_starts`; `contract/test_inc.py::test_inc_8_a_batch_never_delivers_a_key_older_than_one_already_delivered`; `server/test_observed_histories.py::test_a26_n1_a_run_reads_rows_after_the_upstream_moved_on`; `server/test_versions.py::test_each_batch_says_the_generation_it_read`.
 
 **INC-9. A change made behind a run's batches is owed by the next run.**
 Batch 1 commits k1; k1 changes while batch 2 runs: the run ends, the
@@ -183,7 +183,7 @@ updated, k3 removed, k5 added; never k4 removed and then added back. A
 difference whose window holds a clear is two scans, `copy` as `archive`
 last read it and `copy` now, never a replay of each commit.
 *From* P7, P12; the full-run verdict (form (a), SOLE-7, solera#15). *Today* a keyed full run starts a new
-life of its output, and its readers see removals and then re-adds. *Covered* {{COVERED}}.
+life of its output, and its readers see removals and then re-adds. *Covered* `contract/test_inc.py::test_inc_15_an_upstream_full_run_never_makes_a_keyed_reader_remove_and_add_back`.
 
 ## RUN — runs, tasks, batches, attempts, retries, cancel
 
@@ -207,7 +207,7 @@ One of: `claim`, `concurrency`, `merges` (an output it writes is far
 behind on upkeep), `engine` (the engine's slots), `executor` (its limit),
 `invalid` (its placement cannot be built), `upstream incomplete` (an
 upstream it reads is mid full run, STA-13).
-*From* `lifecycle.md` §3.1; D71, D197. *Today* there is no `upstream incomplete`. *Covered* {{COVERED}}; `server/test_history.py::test_a_task_held_back_says_why`; `server/test_keys.py::test_writes_wait_while_an_outputs_merges_are_far_behind`.
+*From* `lifecycle.md` §3.1; D71, D197. *Today* there is no `upstream incomplete`. *Covered* `contract/test_run.py::test_run_4_a_task_held_by_an_upstream_mid_full_run_says_upstream_incomplete`; `server/test_history.py::test_a_task_held_back_says_why`; `server/test_keys.py::test_writes_wait_while_an_outputs_merges_are_far_behind`.
 
 **RUN-5. A task resumes from its last committed batch, across attempts and engine restarts; a new run starts from the beginning.**
 Batches 1 and 2 commit; batch 3's attempt dies, or the engine restarts:
@@ -342,13 +342,13 @@ nothing: called once with an empty batch, first and final, and its
 output becomes empty; its first commit is a clear even though it writes
 no key, and the run is complete at once. A per-key consumer is not
 called; its held keys are removed.
-*From* F10; the full-run verdict (form (a)). *Covered* {{COVERED}}; `server/test_sim_found.py::test_a_full_pass_that_takes_no_key_still_starts_over`; `server/test_sim_found.py::test_a_full_pass_over_an_empty_upstream_reaches_its_producer`; `server/test_sim_found.py::test_an_each_full_pass_that_takes_no_key_drops_its_keys`.
+*From* F10; the full-run verdict (form (a)). *Covered* `contract/test_sel.py::test_sel_11_a_full_run_over_an_empty_upstream_reaches_its_producer`; `contract/test_sel.py::test_sel_11_a_full_run_whose_patterns_take_nothing_reaches_its_producer`; `server/test_sim_found.py::test_a_full_pass_that_takes_no_key_still_starts_over`; `server/test_sim_found.py::test_a_full_pass_over_an_empty_upstream_reaches_its_producer`; `server/test_sim_found.py::test_an_each_full_pass_that_takes_no_key_drops_its_keys`.
 
 **SEL-12. A due full run may be carried out by several runs, `keys=` ones included.**
 `copy`'s version is bumped; `keys=(k1)` is the full run's first batch:
 its commit clears `copy`, which now holds k1 alone and owes k2, k3; its
 readers are held (STA-13) until a default run finishes it.
-*From* D140, D141; the full-run verdict (form (a)). *Covered* {{COVERED}}; `server/test_staleness.py::test_a_full_run_after_an_asset_change_may_take_several_runs`; `server/test_staleness.py::test_a_full_run_spread_over_keys_runs_delivers_each_key_it_names`.
+*From* D140, D141; the full-run verdict (form (a)). *Today* its readers are not held: they run over the half-built `copy`. *Covered* `contract/test_sel.py::test_sel_12_a_keys_run_may_be_a_full_runs_first_batch_and_a_default_run_finishes_it`; `server/test_staleness.py::test_a_full_run_after_an_asset_change_may_take_several_runs`; `server/test_staleness.py::test_a_full_run_spread_over_keys_runs_delivers_each_key_it_names`.
 
 ## CHG — definition, pattern and context changes
 
@@ -359,7 +359,7 @@ stores' config (D202): rotating a password or moving a DSN changes
 nothing, and a store whose data really changed bumps its version. `tally`
 `version="1"` → `"2"`: stale ("definition changed"); the next default run
 starts over (SEL-8).
-*From* D140 (1), D93 (4), D34, D202 (Q11). *Covered* {{COVERED}}; `server/test_engine.py::test_a_version_bump_starts_the_next_run_over`; `server/test_engine.py::test_config_change_reprocesses_everything`; `server/test_engine.py::test_migration_changes_fingerprint_and_marks_handle`; `server/test_each.py::test_binding_a_whole_input_to_another_head_rebuilds_every_key`.
+*From* D140 (1), D93 (4), D34, D202 (Q11). *Covered* `contract/test_chg.py::test_chg_1_a_version_bump_makes_it_stale_and_its_next_run_a_full_run`; `contract/test_chg.py::test_chg_1_a_runs_config_is_part_of_the_definition`; `contract/test_chg.py::test_chg_1_a_stores_version_is_part_of_the_definition`; `contract/test_chg.py::test_chg_1_a_stores_config_is_not_part_of_the_definition`; `server/test_engine.py::test_a_version_bump_starts_the_next_run_over`; `server/test_engine.py::test_config_change_reprocesses_everything`; `server/test_engine.py::test_migration_changes_fingerprint_and_marks_handle`; `server/test_each.py::test_binding_a_whole_input_to_another_head_rebuilds_every_key`.
 
 **CHG-2. A code change alone is a new deploy, not a definition change.**
 Editing a helper module serves a new deploy: nothing goes stale; failed
@@ -377,7 +377,7 @@ changed"); the next run adds k2, k3 and does not process k1 again.
 Narrowing to `"z*"` owes the removal of every held key. If `tally` has
 an `OnChange` automation, either deploy fires it, because it makes
 something owed (AUT-4).
-*From* D140 (2), D126, D200 (amends D34's "patterns are an asset change"). *Covered* {{COVERED}}; `server/test_each.py::test_a_pattern_change_cuts_over`; `server/test_observed_histories.py::test_a19_r9_excluding_every_held_key_owes_their_removal`; `server/test_staleness.py::test_a_pattern_change_that_excludes_every_held_key_leaves_it_stale`.
+*From* D140 (2), D126, D200 (amends D34's "patterns are an asset change"). *Covered* `contract/test_chg.py::test_chg_4_widening_patterns_owes_the_keys_that_join_and_nothing_else`; `contract/test_chg.py::test_chg_4_narrowing_patterns_owes_the_removal_of_every_held_key`; `contract/test_chg.py::test_chg_4_a_pattern_change_that_owes_something_fires_onchange`; `server/test_each.py::test_a_pattern_change_cuts_over`; `server/test_observed_histories.py::test_a19_r9_excluding_every_held_key_owes_their_removal`; `server/test_staleness.py::test_a_pattern_change_that_excludes_every_held_key_leaves_it_stale`.
 
 **CHG-5. A first `include` removes what it leaves out.**
 No include over `keep/a`, `drop/b`; a deploy adds `include="keep/*"`:
@@ -426,7 +426,7 @@ rules want segment-anchored patterns.
 `factor` moves from w1 to w2 while `checks`' run is between its first and
 second batch: later batches read w2, and after the run the keys of the
 first batch are owed again, reason "input changed".
-*From* D184 (context read per batch, Fable D11). *Today* the whole input is pinned for the run, so later batches read w1 too and the run leaves every key owed. *Covered* {{COVERED}}.
+*From* D184 (context read per batch, Fable D11). *Covered* `contract/test_chg.py::test_chg_13_a_whole_input_moving_mid_run_owes_the_keys_processed_before_it_moved`.
 
 ## RST — upstream resets, removals, moves and renames
 
@@ -537,7 +537,7 @@ changed since it observed it: a commit by another client, or a
 consumer's load (SRC-12), to other keys does not refuse it. A raising tick
 keeps its cursor. A retried post applies once; a tick's runs are
 submitted once.
-*From* `lifecycle.md` §11; D193. *Today* a tick is refused whole if the source moved at all since it observed it (`server/test_sensors.py::test_a_tick_that_saw_a_source_since_moved_is_refused_whole`). *Covered* {{COVERED}}; `server/test_sensors.py::test_a_tick_commits_and_requests_runs_in_one_record`; `server/test_sensors.py::test_nothing_changed_records_nothing_and_a_cursor_alone_only_advances`; `server/test_sensors.py::test_a_raising_body_fails_its_tick_and_keeps_the_cursor`; `server/test_sensors.py::test_a_retried_post_is_answered_again_and_applied_once`; sim `a_ticks_runs_are_submitted_once`.
+*From* `lifecycle.md` §11; D193. *Today* a tick is refused whole if the source moved at all since it observed it (`server/test_sensors.py::test_a_tick_that_saw_a_source_since_moved_is_refused_whole`). *Covered* `contract/test_src.py::test_src_10_a_commit_to_other_keys_while_a_tick_runs_does_not_refuse_it`; `contract/test_src.py::test_src_10_a_commit_to_a_key_the_tick_reports_refuses_it_whole`; `server/test_sensors.py::test_a_tick_commits_and_requests_runs_in_one_record`; `server/test_sensors.py::test_nothing_changed_records_nothing_and_a_cursor_alone_only_advances`; `server/test_sensors.py::test_a_raising_body_fails_its_tick_and_keeps_the_cursor`; `server/test_sensors.py::test_a_retried_post_is_answered_again_and_applied_once`; sim `a_ticks_runs_are_submitted_once`.
 
 **SRC-11. An observable source commits on its schedule.**
 `Source("landing", observe=Every(300))`: `observe()` returning a version,
@@ -551,7 +551,7 @@ says so; `items` loads k1@3: `feed`'s log now records k1@3, unless the log
 changed k1 since the batch's head (it then knows better). Two consumers of
 a source that changes on every read may trigger each other, bounded by
 the engine's pace (ENG-10).
-*From* D193 (P13, sources only). *Today* the load corrects the batch's classes but the source's log keeps @2, so `items` is owed k1 again. *Covered* {{COVERED}}.
+*From* D193 (P13, sources only). *Today* the load corrects the batch's classes but the source's log keeps @2, so `items` is owed k1 again. *Covered* `contract/test_src.py::test_src_12_a_load_that_finds_a_source_ahead_of_its_log_records_it`; `contract/test_src.py::test_src_12_a_log_that_moved_since_the_batchs_head_keeps_its_version`.
 
 ## KEY — per-key assets and key outcomes
 
@@ -668,7 +668,7 @@ it reads is stale), `definition changed`. `copy`'s version bumped while
 Derived from progress and upstream; one comparison answers both. Owed
 failing keys whose retry is not due yet do not make a partition stale
 (STA-15).
-*From* D35, D42, D126, D191. *Covered* {{COVERED}}; `server/test_staleness.py::test_staleness_matches_the_reference_over_any_history` (property test); `ObservedSet.tla` StaleExact, OwedExact.
+*From* D35, D42, D126, D191. *Today* a failing key counts as processed, so one whose retry has come due leaves the partition fresh though a default run would load it. *Covered* `contract/test_sta.py::test_sta_3_a_failing_key_whose_retry_is_not_due_does_not_make_it_stale`; `server/test_staleness.py::test_staleness_matches_the_reference_over_any_history` (property test); `ObservedSet.tla` StaleExact, OwedExact.
 
 **STA-4. Staleness runs down the lineage.**
 `feed` commits; `items` has not rerun: `items` is "input changed";
@@ -727,7 +727,7 @@ of owed keys is counted when asked and cached until the upstream or the
 progress moves. A status asked right after a prefixless pattern change on
 100M keys is exact: never guessed, never `pending`. Where a gate holds an
 input (STA-13), its reason is `upstream incomplete`, with no number.
-*From* D183, D197; the staleness verdict (form (b), SOLE-7, solera#15); review A27 R10. *Today* staleness is computed by a full compare when asked, and no reason says `upstream incomplete`. *Covered* {{COVERED}}; `server/test_staleness.py::test_staleness_matches_the_reference_over_any_history`.
+*From* D183, D197; the staleness verdict (form (b), SOLE-7, solera#15); review A27 R10. *Today* staleness is computed by a full compare when asked, and no reason says `upstream incomplete`. *Covered* `contract/test_sta.py::test_sta_12_a_status_right_after_a_prefixless_pattern_change_is_exact`; `contract/test_sta.py::test_sta_12_an_input_a_gate_holds_says_upstream_incomplete_with_no_number`; `server/test_staleness.py::test_staleness_matches_the_reference_over_any_history`.
 
 **STA-13. A reader of an incomplete upstream runs no batch until the upstream's full run completes.**
 `copy` runs full in two batches; between them, `archive` (keyed),
@@ -738,13 +738,13 @@ flight when the full run began holds back every key it loaded at another
 version than it planned; those keys stay owed. An input may opt
 out of the gate to read partial data. A full run canceled or failed
 midway raises an alarm, and one command lets downstream proceed.
-*From* P12; the full-run verdict (form (a), SOLE-7, solera#15); review F2. *Today* readers run over a half-rebuilt upstream. *Covered* {{COVERED}}.
+*From* P12; the full-run verdict (form (a), SOLE-7, solera#15); review F2. *Today* readers run over a half-rebuilt upstream. *Covered* `contract/test_sta.py::test_sta_13_every_reader_of_an_incomplete_upstream_waits_until_its_full_run_completes`; `contract/test_sta.py::test_sta_13_a_full_run_canceled_midway_holds_its_readers_and_raises_an_alarm`; `contract/test_sta.py::test_sta_13_on_a_table_a_batch_in_flight_holds_back_keys_it_loaded_at_another_version`.
 
 **STA-14. No false alarms: a partition is stale only if something is due; changes that cancel out start nothing.**
 `feed`'s k1 goes v1 → v2 → v1: `items` is stale while k1 is at v2 and
 fresh again at v1; a run asked for after the revert delivers nothing. A
 key added and removed again between two runs is never owed.
-*From* D183, D187. *Today* the revert leaves `items` stale until a run delivers k1 as updated. *Covered* {{COVERED}}.
+*From* D183, D187. *Today* the revert leaves `items` stale until a run delivers k1 as updated. *Covered* `contract/test_sta.py::test_sta_14_a_change_reverted_before_a_run_leaves_it_fresh_and_starts_nothing`; `contract/test_sta.py::test_sta_14_a_key_added_and_removed_between_two_runs_is_never_owed`.
 
 **STA-15. Failing keys not yet due are shown, not stale.**
 `checks` has k2 failing, its retry not due yet, and owes k3 and k5: it is
@@ -786,7 +786,7 @@ is picked up by `Every(60, partitions="missing")`.
 `removed`, and its last head can still be read for `cleanup_after` (a
 week by default); then its data is cleaned up (CLN-6). Back within the
 window, it picks up where it left off.
-*From* `architecture.md` §7; D201 (answers open question 10). *Today* its data is never cleaned up. *Covered* {{COVERED}}; `server/test_engine.py::test_retired_keys_leave_fanout`; `server/test_planning.py::test_a_fan_in_reads_only_current_partitions`.
+*From* `architecture.md` §7; D201 (answers open question 10). *Today* its data is never cleaned up. *Covered* `contract/test_par.py::test_par_6_a_removed_partitions_head_stays_readable_for_cleanup_after_then_goes`; `contract/test_par.py::test_par_6_a_partition_back_within_the_window_picks_up_where_it_left_off`; `server/test_engine.py::test_retired_keys_leave_fanout`; `server/test_planning.py::test_a_fan_in_reads_only_current_partitions`.
 
 **PAR-7. Partition selections: `"latest"`, `"missing"`, `"all"`, a list.**
 Counted before listed; past 100,000 refused. An explicit list never
@@ -828,7 +828,7 @@ schedule waits for its next time; with no automation, the asset shows
 stale for a run by hand. A deploy that changes an input's patterns owes
 the firing when the change makes something owed (CHG-4), and none when it
 owes nothing (CHG-7: widening to a key that never existed).
-*From* D34 (pattern part amended by D140 (2) and D200, Q6), D33; F22. *Today* every pattern change owes the firing, including one that owes nothing. *Covered* {{COVERED}}; `server/test_sim_found.py::test_an_onchange_asset_added_back_is_built`; `server/test_sim_found.py::test_an_asset_change_is_built_by_its_automation_or_marked_stale`; `server/test_sim_found.py::test_a_reset_output_is_due_for_a_rebuild`.
+*From* D34 (pattern part amended by D140 (2) and D200, Q6), D33; F22. *Covered* `contract/test_aut.py::test_aut_4_a_pattern_change_that_owes_nothing_fires_nothing`; `contract/test_aut.py::test_aut_4_a_definition_change_fires_onchange_once`; `contract/test_aut.py::test_aut_4_with_no_automation_a_changed_asset_shows_stale`; `server/test_sim_found.py::test_an_onchange_asset_added_back_is_built`; `server/test_sim_found.py::test_an_asset_change_is_built_by_its_automation_or_marked_stale`; `server/test_sim_found.py::test_a_reset_output_is_due_for_a_rebuild`.
 
 **AUT-5. `OnDeploy` fires once per new deploy.**
 Restarting on the same deploy is silent; two deploys before a tick fire
