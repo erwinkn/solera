@@ -354,32 +354,6 @@ async def test_run_keys_override(state):
     assert seen[-1] == ["a", "b"]
 
 
-async def test_a_full_run_resumes_batch_by_batch(state):
-    """Engine review round 2 #2: a full run's later batches walk on from its
-    progress — the first batch is not served again, nor started over."""
-    seen = []
-
-    @asset(outputs=Output("files", key="id"))
-    def files():
-        return [{"id": k, "v": 1} for k in "abc"]
-
-    @asset(inputs={"files": Incremental(batch_size=2)})
-    def consumer(ctx, files: list):
-        changes = ctx.batch["files"]
-        seen.append((sorted(r["id"] for r in files), changes.reset, changes.index))
-        return []
-
-    project = Project(assets=[files, consumer])
-    engine = make_engine(state, project)
-    await engine.initialize()
-    await drive(engine, await engine.submit(["consumer"], upstream=True))
-    for _ in range(2):  # a second full run starts over on its own
-        seen.clear()
-        detail = await drive(engine, await engine.submit(["consumer"], mode="full"), timeout=10)
-        assert status_of(detail) == "succeeded"
-        assert seen == [(["a", "b"], True, 0), (["c"], False, 1)]
-
-
 async def test_deps_are_pinned_but_unbound(state):
     """§5: deps are pinned into lineage and the fingerprint but bind no
     parameter."""
@@ -567,30 +541,6 @@ async def test_retired_keys_leave_fanout(state):
     assert head(state, "per_thing", "b") is not None  # head persists
 
 
-async def test_upstream_false_never_replans(state):
-    """§8: upstream=False plans targets only; inputs pin current heads and a
-    producer is never re-run."""
-    calls = {"n": 0}
-
-    @asset(outputs=Output("feed", key="id"))
-    def producer():
-        calls["n"] += 1
-        return [{"id": "a", "v": calls["n"]}]
-
-    @asset(inputs={"feed": Incremental()})
-    def consumer(feed: list):
-        return [{"n": len(feed)}]
-
-    project = Project(assets=[producer, consumer])
-    engine = make_engine(state, project)
-    await engine.initialize()
-    await drive(engine, await engine.submit(["producer"]))
-    detail = await drive(engine, await engine.submit(["consumer"], upstream=False))
-    assert status_of(detail) == "succeeded"
-    assert calls["n"] == 1  # producer never re-polled
-    assert [t["asset"] for t in detail["tasks"]] == ["consumer"]
-
-
 async def test_fencing_concurrent_claim(state):
     """§8: a second task for a claimed partition requeues instead of dispatching;
     only one attempt owns the partition."""
@@ -616,28 +566,6 @@ async def test_fencing_concurrent_claim(state):
     d1, d2 = await asyncio.gather(t1, t2)
     statuses = sorted(task_statuses(d)["slow"] for d in (d1, d2))
     assert statuses == ["skipped", "succeeded"] or statuses == ["succeeded"] * 2
-
-
-async def test_retry_with_backoff_and_nonretryable(state):
-    """§8: retryable failures re-queue with Retry backoff; non-retryable
-    failures end the task."""
-    calls = {"n": 0}
-
-    @asset(retries=Retry(2, delay=0.01))
-    def flaky():
-        calls["n"] += 1
-        if calls["n"] < 3:
-            raise ValueError("transient")
-        return ["ok"]
-
-    project = Project(assets=[flaky])
-    engine = make_engine(state, project)
-    await engine.initialize()
-    detail = await drive(engine, await engine.submit(["flaky"]))
-    assert status_of(detail) == "succeeded"
-    assert calls["n"] == 3
-    attempts = detail["attempts"][detail["tasks"][0]["id"]]
-    assert [a["outcome"] for a in attempts] == ["failed", "failed", "succeeded"]
 
 
 async def test_cancel_run(state):

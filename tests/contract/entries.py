@@ -46,4 +46,9 @@ PENDING: dict[str, str] = {
         entry: f"changed by docs/tracking-design.md §16 ({decision}); its test, written for the target, is next"
         for entry, decision in CHANGED.items()
     },
+    # RUN+HIS
+    "RUN-14": (
+        "a rule of the console's display (D173): the HTTP API serves every batch and attempt, and"
+        " which of them the console shows is checked by apps/console's Playwright tests"
+    ),
 }
