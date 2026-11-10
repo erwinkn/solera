@@ -4,6 +4,7 @@ binding rebuilt after a restart, and logs as chunks plus a tail."""
 
 import asyncio
 import json
+import logging
 
 from solera import lifecycle
 from solera.lifecycle import Ended
@@ -118,27 +119,40 @@ async def test_a_loser_without_a_channel_exits_on_a_final_control_file(tmp_path)
 
 
 class Duplicate(Remote):
-    """The relaunched handle names a duplicate, which exits at once."""
+    """The relaunched handle names a duplicate, which exits once `exits`
+    is set: after the owner has begun to report."""
+
+    exits = False
 
     async def wait(self, handle, timeout):
+        if not Duplicate.exits:
+            await asyncio.sleep(min(timeout, 0.05))
+            return None
         return {"code": 0, "reason": None, "meta": {}}
 
 
-async def test_a_duplicates_exit_does_not_end_the_owners_attempt(tmp_path):
+async def test_a_duplicates_exit_does_not_end_the_owners_attempt(tmp_path, caplog):
     """The provider reports an exit while the claim's owner still beats over
     the channel: the exit was another worker's. The engine drops the
     handle, follows the owner, and commits its result (§4)."""
 
+    caplog.set_level(logging.INFO, logger="solera_server.attempts")
     state = await State.open(tmp_path.as_uri(), "test", flush_interval=0.001)
     engine = engine_for(state, REMOTE, worker=Duplicate, heartbeat_seconds=0.3)
     await engine.initialize()
     Remote.launches.clear()
+    Duplicate.exits = False
     run = await engine.submit(["remote"])
     await until(engine, lambda: Remote.launches)
     attempt = Remote.launches[0]
     await own(state, run["id"], attempt, "owner")
     await engine.attempt_start(attempt, {"worker_id": "owner"})
-    for seq in range(1, 6):
+    Duplicate.exits = True
+    deadline = asyncio.get_running_loop().time() + 60
+    seq = 0
+    while "an exit while its owner reports" not in caplog.text:
+        assert asyncio.get_running_loop().time() < deadline, "the duplicate's exit was never seen"
+        seq += 1
         await engine.attempt_beat(attempt, {"worker_id": "owner", "seq": seq})
         await engine.tick()
         await asyncio.sleep(0.05)
