@@ -1508,3 +1508,14 @@ fn a_store_refuses_zero_for_its_sizes() {
         assert!(matches!(got, Err(Error::Invalid(_))));
     }
 }
+
+#[test]
+fn a_writer_refuses_seg_blocks_past_its_limit() {
+    for seg_blocks in [0, format::MAX_RAW / format::MAX_KEY + 1, 1 << 48] {
+        let o = WriteOptions {
+            seg_blocks,
+            ..Default::default()
+        };
+        assert!(matches!(Writer::new(o, 1, 1, None), Err(Error::Invalid(_))));
+    }
+}

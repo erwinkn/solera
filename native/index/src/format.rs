@@ -260,7 +260,7 @@ impl Writer {
             ));
         }
         fits("a block", o.block_bytes.saturating_mul(2))?;
-        if o.seg_blocks == 0 || o.seg_blocks * MAX_KEY > MAX_RAW {
+        if o.seg_blocks == 0 || o.seg_blocks > MAX_RAW / MAX_KEY {
             return invalid(format!(
                 "seg_blocks {}: from 1 to {}",
                 o.seg_blocks,
