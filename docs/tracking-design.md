@@ -458,6 +458,31 @@ The other input kinds are the keyed design without keys, as today.
 | Unkeyed incremental | "Consumed through commit c" | The head is past c. A clear after c makes the next run a full run (INC-13) |
 | Whole or dep | None of its own: its head is part of the context | The context now differs from a piece's |
 
+### As built (B3)
+
+In `native/tracking/src/progress/` (the types and the event parts) and
+`progress/ops.rs` (what a batch commit writes), as described above, with
+these additions:
+
+- **A point also records what upstream had.** `Point { holding, reason, seen }`:
+  `seen` is the version upstream had, under the patterns of the piece the
+  point was written with, at that piece's commit. The planner then reads the
+  key's version at the head from the piece's diff instead of looking each
+  point up. With 10,000 failing points on an edge at 100 million keys,
+  planning went from 7.0 to 1.0 µs per key. A key list's points have no
+  `seen`: they sit inside an older piece.
+- **Conditions carry the rebuild counter** (P8 amended): a difference in
+  context, definition or rebuild counter makes every present key owed.
+- **A batch commit checks the progress it read.** `BatchProgress` carries a
+  digest of the progress over its range as the plan read it, and is refused
+  if that moved. An unkeyed edge's `Consumed` carries the `through` it read,
+  so a stale commit cannot move it back. The definition and new-life checks
+  of §7 stay with the engine.
+- **Points stay in memory** (a sorted map per edge). Spilling past a few
+  thousand is not built: not needed at the measured sizes.
+- **Clears are not built yet** (§10, form (a)): the planner needs each
+  output's clear commits, and candidates across a clear come from two scans.
+
 ## 6. Staleness kept exact by propagation
 
 **Settled (D183):** answers are always exact. Nothing is checked every
@@ -744,6 +769,35 @@ About 200 bytes plus the replaced slice, usually one piece.
 A batch covers the same key range on every keyed input; candidates merge
 in key order and N counts distinct keys. Each edge gets its own piece at
 its own head and its own record.
+
+### As built (B3)
+
+In `native/tracking/src/plan/` and `record/`, called from Python as
+`Tracking.plan`, `progress_ops`, `owed` and `owed_count`
+(`native/src/tracking_py.rs`), each one crossing with the GIL released.
+
+- **The key list travels as the plan's bytes**: each key with its class and
+  its version at H, encoded once, put into the spec untouched and decoded
+  again at commit, after a restart too.
+- **Every read is paged and stops when the batch is full.** A source's first
+  page asks for about as many keys as the batch still needs (a little more,
+  to know whether the range ends at +∞), and each further page doubles, up
+  to 1M entries. Globs are filtered by the index; `Regex(...)`
+  patterns by the planner, which pages on. A `Regex` is in the Rust `regex`
+  dialect, matched against the whole key, and today's Python matching uses
+  the same native matcher.
+- **Points are looked up in chunks** of up to 1,024 keys, bounded by the
+  unfinished sources' read frontier; the lookahead may fetch points beyond
+  the final batch range.
+- **Keys owed but not due** (§11) come from a hook (`plan::Hold`) that B6
+  implements over its due index. They are listed as held back and keep
+  what they held.
+- **The batch record** is as in the table above; its digest is xxh3 over
+  the batch's keys, classes and versions, and the planner version is 1.
+- **One journal event** holds every part of a commit. Its parts change
+  distinct things (an edge, an output), are each checked against the state
+  before the event, then applied; an event that changes one thing twice is
+  refused whole.
 
 ## 8. The store contract
 

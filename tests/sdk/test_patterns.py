@@ -23,3 +23,15 @@ def test_edges_carry_patterns():
         Incremental("f", include=[], each=True)
     with pytest.raises(RegistrationError):
         Incremental("f", exclude=[""])
+
+
+def test_regex_is_rusts_dialect_matched_against_the_whole_key():
+    """`Regex` is the Rust `regex` dialect, matched natively by the planner's
+    matcher: what it lacks is refused when the pattern is declared."""
+    for unsupported in [r"(?!archive/).*\.csv", r".*(?<=\.csv)", r"(a)\1"]:
+        with pytest.raises(ValueError, match="lookaround and backreferences are not supported"):
+            Regex(unsupported)
+    word = Matcher(spec(include=Regex(r"\w+")))
+    assert word("e\u0301")  # Rust's \w takes combining marks; Python's re does not
+    assert not word("a/b") and not Matcher(spec(include=Regex("ab")))("abc")
+    assert Matcher(spec(include=Regex("a.b")))("a\nb")
