@@ -422,6 +422,11 @@ pub enum Reason {
     Deviation = 3,
     /// The key was processed through an explicit key list.
     KeyList = 4,
+    /// The batch loaded the key, on this input or another, at another
+    /// version than planned while that input was mid full run or cleared
+    /// since the plan, and held it back at commit: the consumer keeps what
+    /// it held. Unlike `HeldBack`, the key was in the batch's plan.
+    Unsettled = 5,
 }
 
 impl Reason {
@@ -431,6 +436,7 @@ impl Reason {
             2 => Reason::HeldBack,
             3 => Reason::Deviation,
             4 => Reason::KeyList,
+            5 => Reason::Unsettled,
             _ => return format(format!("reason {b}")),
         })
     }
@@ -1091,23 +1097,30 @@ pub struct BatchProgress {
     /// The digest of the progress the plan read (the range's slice; with a
     /// reset, all of it): the commit applies only over that progress.
     pub expect: u64,
-    /// When the batch loaded a key at another version than planned: the head
-    /// it planned at, and whether the input was `unsettled` then, which
-    /// decided whether those keys were held back. Refused if that answer
-    /// changed before the event applies.
-    pub fence: Option<(u64, bool)>,
+    /// When the batch kept a key loaded at another version than planned,
+    /// its input then being settled: that input's output and the head the
+    /// batch planned at. Refused if the edge reads another output, or the
+    /// input became `unsettled`, before the event applies, since the load
+    /// would then have been held back. The other way needs no fence: holding
+    /// back is safe.
+    pub fence: Option<(Id, u64)>,
 }
 
 /// Whether a batch planned at `head` holds back what it loaded at another
 /// version: its input's output is mid full run, or a clear came in since.
-pub fn unsettled(t: &Tracking, output: &[u8], head: u64) -> bool {
-    t.outputs.get(output).is_some_and(|o| {
-        o.full_run.is_some()
-            || o.layers
-                .iter()
-                .flat_map(|l| &l.clears)
-                .any(|&k| head < k && k <= o.head)
-    })
+/// Refused once a fold has dropped the clears after `head`.
+pub fn unsettled(t: &Tracking, output: &[u8], head: u64) -> Result<bool> {
+    let Some(o) = t.outputs.get(output) else {
+        return Ok(false);
+    };
+    if o.layers.iter().filter_map(|l| l.floor).any(|f| f > head) {
+        return invalid("the input's layers no longer reach back to the batch's head");
+    }
+    Ok(o.full_run.is_some()
+        || o.layers
+            .iter()
+            .flat_map(|l| &l.clears)
+            .any(|&k| head < k && k <= o.head))
 }
 
 impl BatchProgress {
@@ -1126,11 +1139,12 @@ impl BatchProgress {
         }
         encode_points(&mut body, &mut t, self.points.iter().map(|(k, p)| (k, p)));
         body.uv(self.expect);
-        match self.fence {
+        match &self.fence {
             None => body.u8(0),
-            Some((h, held)) => {
-                body.u8(1 + held as u8);
-                body.uv(h);
+            Some((output, head)) => {
+                body.u8(1);
+                body.bytes(output);
+                body.uv(*head);
             }
         }
         t.encode(e);
@@ -1151,7 +1165,7 @@ impl BatchProgress {
         let expect = d.uv()?;
         let fence = match d.u8()? {
             0 => None,
-            t @ (1 | 2) => Some((d.uv()?, t == 2)),
+            1 => Some((d.bytes()?.into(), d.uv()?)),
             t => return format(format!("fence tag {t}")),
         };
         Ok(BatchProgress {
@@ -1176,9 +1190,12 @@ impl BatchProgress {
         if read_digest(k, self.reset, &self.range) != self.expect {
             return invalid("the edge's progress moved since the batch was planned");
         }
-        if let Some((head, held)) = self.fence {
-            if unsettled(t, &t.edges[&self.edge].input, head) != held {
-                return invalid("the input's full run moved since the batch's commit was built");
+        if let Some((output, head)) = &self.fence {
+            if *t.edges[&self.edge].input != **output {
+                return invalid("the edge reads another output than the batch planned");
+            }
+            if unsettled(t, output, *head)? {
+                return invalid("the input became unsettled since the batch's commit was built");
             }
         }
         Ok(())
