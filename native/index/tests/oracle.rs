@@ -784,6 +784,22 @@ fn bad_references_and_abandoned_reads_leave_the_index_working() {
             ix.scan(&[l1.clone(), moved], 2, &q).await,
             Err(Error::Format(_))
         ));
+        // older clears add no read to a diff or window whose commits hold none
+        let (mut cleared, mut plain, none) = (Vec::new(), Vec::new(), Run::new());
+        for c in 1..=32 {
+            let new = if c < 32 { cl(c) } else { nc(c) };
+            let (y, z) = (format!("y{c}"), format!("z{c}"));
+            cleared.push(ix.write_commit(&y, new, &none).await.unwrap());
+            plain.push(ix.write_commit(&z, nc(c), &none).await.unwrap());
+        }
+        let mut gets = Vec::new();
+        for ls in [&cleared, &plain] {
+            let (a, b) = (index("t", None), index("t", None));
+            a.diff(ls, 31, 32, &q).await.unwrap();
+            b.window(ls, 32..=32, &q).await.unwrap();
+            gets.push((a.store.stats.counts().gets, b.store.stats.counts().gets));
+        }
+        assert_eq!(gets[0], gets[1]);
         let past = LayerRef {
             hi: u64::MAX,
             floor: Some(u64::MAX),
