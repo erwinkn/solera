@@ -37,9 +37,12 @@ use xxhash_rust::xxh3::xxh3_64;
 pub const MAGIC: [u8; 8] = *b"SOLCIDX1";
 pub const VERSION: u32 = 1;
 pub const TRAILER: usize = 48;
-/// Commit flags this reader understands. None yet: a full run's "clear" would
-/// be the first, and a reader that does not know a flag refuses the layer.
-pub const KNOWN_COMMIT_FLAGS: u64 = 0;
+/// A commit flag: the commit clears the state first (a full run's first
+/// commit). Every key present before it is removed; then its entries apply.
+pub const CLEAR: u64 = 1;
+/// Commit flags this reader understands; a reader refuses a layer with any
+/// other.
+pub const KNOWN_COMMIT_FLAGS: u64 = CLEAR;
 
 /// The most raw bytes a block, a segment, the commits section or the top
 /// level may hold: a reader allocates no more than this for any of them,
@@ -102,6 +105,8 @@ pub struct LayerRef {
     pub last_key: Vec<u8>,
     /// The union of its commits' flags.
     pub flags: u64,
+    /// The commits above the floor that clear, ascending.
+    pub clears: Vec<u64>,
 }
 
 impl LayerRef {
@@ -123,6 +128,17 @@ impl LayerRef {
             return invalid(format!(
                 "{}: offsets out of order: index {}, top {}, size {}",
                 self.path, self.index_start, self.top_start, self.size
+            ));
+        }
+        let above = self.floor.map_or(self.lo, |f| f + 1);
+        if (self.flags & CLEAR != 0) != !self.clears.is_empty()
+            || self.clears.first().is_some_and(|&c| c < above)
+            || self.clears.last().is_some_and(|&c| c > self.hi)
+            || self.clears.windows(2).any(|w| w[0] >= w[1])
+        {
+            return invalid(format!(
+                "{}: clears {:?} are not ascending commits in {above}..={} with the clear flag",
+                self.path, self.clears, self.hi
             ));
         }
         Ok(())
@@ -521,6 +537,11 @@ impl Writer {
         self.flush_block()?;
         self.flush_seg()?;
         let flags = commits.iter().fold(0, |f, h| f | h.flags);
+        let clears: Vec<u64> = commits
+            .iter()
+            .filter(|h| h.flags & CLEAR != 0)
+            .map(|h| h.commit)
+            .collect();
         let commits_start = self.written;
         let mut raw = Vec::new();
         put_varint(&mut raw, commits.len() as u64);
@@ -556,8 +577,12 @@ impl Writer {
             self.entries,
             self.keys,
             flags,
+            clears.len() as u64,
         ] {
             put_varint(&mut top, v);
+        }
+        for &c in &clears {
+            put_varint(&mut top, c);
         }
         put_bytes(&mut top, &self.first_key);
         put_bytes(&mut top, if self.entries == 0 { &[] } else { &self.prev });
@@ -597,6 +622,7 @@ impl Writer {
                 self.prev.clone()
             },
             flags,
+            clears,
         })
     }
 }
@@ -753,6 +779,7 @@ pub struct Top {
     pub entries: u64,
     pub keys: u64,
     pub flags: u64,
+    pub clears: Vec<u64>,
     pub first_key: Vec<u8>,
     pub last_key: Vec<u8>,
     pub index_start: u64,
@@ -764,7 +791,7 @@ pub struct Top {
 
 impl Top {
     pub fn bytes(&self) -> usize {
-        self.segs.bytes() + self.first_key.len() + self.last_key.len() + 128
+        self.segs.bytes() + self.first_key.len() + self.last_key.len() + self.clears.len() * 8 + 128
     }
 
     /// The top level from the file's tail `[top_start, size)`.
@@ -800,10 +827,17 @@ impl Top {
         }
         let raw = decompress(c, u32_at(t, 24) as usize)?;
         let mut p = 0;
-        let mut v = [0u64; 6];
+        let mut v = [0u64; 7];
         for x in &mut v {
             *x = varint(&raw, &mut p)?;
         }
+        // each takes at least a byte
+        if v[6] > (raw.len() - p) as u64 {
+            return format("more clears than the top level holds");
+        }
+        let clears = (0..v[6])
+            .map(|_| varint(&raw, &mut p))
+            .collect::<Result<Vec<u64>>>()?;
         let first_key = get_bytes(&raw, &mut p)?;
         let last_key = get_bytes(&raw, &mut p)?;
         let nsegs = varint(&raw, &mut p)?;
@@ -821,6 +855,7 @@ impl Top {
             entries: v[3],
             keys: v[4],
             flags: v[5],
+            clears,
             first_key,
             last_key,
             index_start,
@@ -841,6 +876,7 @@ impl Top {
             self.keys,
             self.flags,
         ) != (l.lo, l.hi, l.floor, l.entries, l.keys, l.flags)
+            || self.clears != l.clears
             || self.first_key != l.first_key
             || self.last_key != l.last_key
             || (self.index_start, self.top_start, self.size) != (l.index_start, l.top_start, l.size)

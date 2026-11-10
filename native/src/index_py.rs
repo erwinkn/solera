@@ -5,7 +5,7 @@
 //!
 //! Layers cross as dicts (the engine journals them): `path`, `size`,
 //! `index_start`, `top_start`, `lo`, `hi`, `floor` (None unless a base),
-//! `entries`, `keys`, `first_key`, `last_key`, `flags`. Keys are `str`;
+//! `entries`, `keys`, `first_key`, `last_key`, `flags`, `clears`. Keys are `str`;
 //! versions are `int` (a generation), `str` (a source's version) or None
 //! (absent).
 
@@ -128,6 +128,7 @@ fn layer_in(d: &Bound<'_, PyDict>) -> PyResult<LayerRef> {
         first_key: field::<String>(d, "first_key")?.into_bytes(),
         last_key: field::<String>(d, "last_key")?.into_bytes(),
         flags: field(d, "flags")?,
+        clears: field(d, "clears")?,
     })
 }
 
@@ -151,6 +152,7 @@ fn layer_out<'py>(py: Python<'py>, l: &LayerRef) -> PyResult<Bound<'py, PyDict>>
     d.set_item("first_key", key(py, &l.first_key))?;
     d.set_item("last_key", key(py, &l.last_key))?;
     d.set_item("flags", l.flags)?;
+    d.set_item("clears", &l.clears)?;
     Ok(d)
 }
 
@@ -260,8 +262,10 @@ impl ChangeIndex {
 
     /// Write commit `commit`'s layer at `path` from its entries `(key, new,
     /// replaced)`, one per changed key, in any order. Returns the layer.
+    /// `clear`: the commit clears the state first (a full run's first
+    /// commit); its entries replace nothing.
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (path, commit, entries, *, time_ms=0, producer=Vec::new(), live_before=0))]
+    #[pyo3(signature = (path, commit, entries, *, time_ms=0, producer=Vec::new(), live_before=0, clear=false))]
     fn write_commit<'py>(
         &self,
         py: Python<'py>,
@@ -271,6 +275,7 @@ impl ChangeIndex {
         time_ms: u64,
         producer: Vec<u8>,
         live_before: u64,
+        clear: bool,
     ) -> PyResult<Bound<'py, PyDict>> {
         guard(|| {
             let mut es: Vec<(String, Owned, Owned)> = Vec::new();
@@ -303,6 +308,7 @@ impl ChangeIndex {
                 time_ms,
                 producer: &producer,
                 live_before,
+                clear,
             };
             let l = py
                 .detach(|| rt().block_on(self.ix.write_commit(path, nc, &run)))
