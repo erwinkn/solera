@@ -22,16 +22,14 @@ from solera.sdk import Loaded, Project, Ref
 from solera.stores import FileStore, Keys, Patch
 
 PATHS = ("today", "core")
+NOT_YET = "on the new tracking core yet"  # what the new path refuses until a later unit builds it
 _CLI = threading.Lock()  # held while a `Solera.cli` call's entry point runs
 
 
 def engine_options(path: str) -> dict:
-    """The `Engine` arguments that select a tracking path. B5 replaces the
-    skip with the constructor argument it adds (build plan, rule 4)."""
+    """The `Engine` arguments that select a tracking path (build plan, rule 4)."""
 
-    if path == "today":
-        return {}
-    pytest.skip("the new core's path is not built yet (build plan B5)")
+    return {} if path == "today" else {"tracking": path}
 
 
 class Refused(AssertionError):
@@ -165,14 +163,18 @@ class Solera:
 
         run_id = run if isinstance(run, str) else run["id"]
         await self.engine.run_until(run_id, timeout)
-        return await self.get(f"/runs/{run_id}")
+        detail = await self.get(f"/runs/{run_id}")
+        for task in detail.get("tasks") or ():
+            if NOT_YET in (task.get("error") or ""):  # a later unit's: the test waits for it
+                pytest.skip(task["error"])
+        return detail
 
     async def run(self, targets, *, expect: str | None = "succeeded", timeout: float = 30, **fields) -> dict:
         """Ask for a run and wait for it to settle as `expect` (None: any)."""
 
         detail = await self.wait(await self.submit(targets, **fields), timeout)
         if expect is not None:
-            assert detail["request"]["status"] == expect, detail["request"]
+            assert detail["request"]["status"] == expect, detail
         return detail
 
     async def settle(self, seconds: float = 0.5) -> None:
@@ -767,7 +769,8 @@ class Solera:
 class Storage:
     """An S3-compatible server (moto's) on a local port, its credentials in
     the environment, as an engine and its workers on S3 read them, until
-    `close()`. `requests` counts every request it has served; `url` is
+    `close()`. `requests` counts every request it has served (`methods`: by
+    method); `url` is
     its bucket, its own: moto keeps one store for the process, so every
     server shares it; `hold_upkeep(output)` stalls an upload, a fault."""
 
@@ -783,11 +786,13 @@ class Storage:
         from werkzeug.serving import make_server
 
         backend, lock = DomainDispatcherApplication(create_backend_app), threading.Lock()
-        self.requests, self.held = 0, None
+        self.requests, self.held, self.methods = 0, None, {}
 
         def app(environ, start_response):
             with lock:
                 self.requests += 1
+                method = environ["REQUEST_METHOD"]
+                self.methods[method] = self.methods.get(method, 0) + 1
             held = self.held
             if (
                 held

@@ -30,11 +30,11 @@ from dataclasses import dataclass
 from .. import _native
 from .._native import LimitError, SortedEntries
 from ..tasks import Tasks
+from ..threads import in_thread
 from . import layers
 from .io import ObjectIO
 from .layer_cache import LayerCache
 from .layers import DeltaFiles, FileRef, LayerIndex, LayerState, Part
-from .threads import in_thread
 
 log = logging.getLogger(__name__)
 

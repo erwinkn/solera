@@ -30,7 +30,9 @@ import contextlib
 import copy
 import dataclasses
 import math
+from base64 import b64decode, b64encode
 
+from solera._native import Tracking
 from solera.keys.layers import DeltaFiles, Layer, LayerState, delta_names, index_prefix
 
 from . import history, observed
@@ -193,6 +195,11 @@ class Model:
             "receipts": list(self.receipts.items()),
             "history": self.history.to_json(),
         }
+        if self.core is not None:  # the new tracking core (format 6): its state, opaque bytes
+            data["core"] = b64encode(self.core.snapshot()).decode()
+            data["core_outputs"] = _nest(self.core_outputs, 2)
+            data["core_edges"] = _nest(self.core_edges, 3)
+            data["core_empty"] = _nest(self.core_empty, 3)
         return copy.deepcopy(data) if copied else data
 
     def restore(self, snap: dict | None) -> None:
@@ -259,6 +266,16 @@ class Model:
         self.receipts: dict[str, str] = dict(snap.get("receipts") or [])
         # the run history (§7): per table, its files and the rows awaiting a flush
         self.history = LakeState(history.TABLES, snap.get("history"))
+        # The new tracking core (docs/tracking-design.md; None on today's path): its state,
+        # changed only by the core events this model applies, and the ids it knows things by.
+        # (output, partition) -> the core's id of that output's current life; (asset,
+        # partition, input) -> the core's id of that edge. Renames move them; a reset drops them.
+        self.core: Tracking | None = Tracking.restore(b64decode(snap["core"])) if "core" in snap else None
+        self.core_outputs: dict[tuple, str] = _flatten(snap.get("core_outputs"), 2)
+        self.core_edges: dict[tuple, str] = _flatten(snap.get("core_edges"), 3)
+        # (asset, partition, input) -> the key past which the edge holds nothing since it last
+        # started over ("": every key), until a walk gets to the end: what completeness reads.
+        self.core_empty: dict[tuple, str] = _flatten(snap.get("core_empty"), 3)
         # derived from launched attempts, plus memory-only claims of attempts preparing
         # task id -> {attempt, started_at, pin, status, launched?, reads?}; `pin`: `applied` at the claim
         self.claims: dict[str, dict] = {}
@@ -355,6 +372,9 @@ class Model:
     def key_count(self, output: str, partition: str) -> int | None:
         """A keyed output's live keys, as its index counts them (None: unkeyed)."""
 
+        if self.core is not None:
+            found = self.core_output(output, partition)
+            return None if found is None else found["live"]
         index = self.indexes.get((output, partition))
         return None if index is None else index.count
 
@@ -1048,7 +1068,7 @@ class Model:
             intents = self.repairs.setdefault((output, task["partition"]), [])
             intents.append({**intent, "run": e["run"], "attempt": e["attempt"]})
         self._cleaned_up((task.get("cleanup") or {}).get("partition", task["partition"]), e, prepared)
-        if launched is not None and not e.get("commit"):
+        if launched is not None and not e.get("commit") and self.core is None:
             self._abandoned(task["partition"], e["attempt"], launched, at + float(e.get("late_writes") or 0))
         usage = (e.get("worker") or {}).get("usage") or {}
         summary = {
@@ -1193,6 +1213,15 @@ class Model:
             self.retired.pop(commit.get("cleaned"), None)
             return
         asset, partition, at = task["asset"], task["partition"], e["finished_at"]
+        if (core := commit.get("core")) is not None:  # first: what follows reads it
+            self._core_apply(core)
+            if core.get("walk") is not None:
+                self._core_walk(asset, partition, core["walk"])
+            for record in core.get("records") or ():
+                self._record(
+                    "batch_inputs",
+                    history.batch_input_row(e["run"], e["attempt"], asset, partition, record, at),
+                )
         reads = history.read_lineage(prepared.get("lineage"), e.get("read"))
         contracts = prepared.get("outputs") or {}
         changed = []
@@ -1201,7 +1230,8 @@ class Model:
             prefix = contracts[name].get("prefix")  # where its delta files are
             if before is None or before["ref"].get("generation") != head["ref"].get("generation"):
                 changed.append(name)
-            if contracts[name]["contract"]["writes"] == "immutable":
+            if contracts[name]["contract"]["writes"] == "immutable" and self.core is None:
+                # The new path deletes nothing until retention is built on it (build plan B9).
                 self._superseded(name, partition, before, head, keys, prefix)
             self.heads[(name, partition)] = {**head, "run": e["run"], "attempt": e["attempt"], "at": at}
             self._commit_keys(name, partition, keys, prefix, head["ref"].get("generation"))
@@ -1246,7 +1276,8 @@ class Model:
                     asset,
                     partition,
                     head,
-                    keys=(commit.get("keys") or {}).get(name),
+                    keys=(commit.get("keys") or {}).get(name)
+                    or ((commit.get("core") or {}).get("counts") or {}).get(name),
                     key_count=self.key_count(name, partition),
                     rows=(commit.get("rows") or {}).get(name),
                     metadata=(commit.get("metadata") or {}).get(name),
@@ -1695,6 +1726,8 @@ class Model:
     def _on_SourceCommitted(self, e):
         before = self.heads.get((e["source"], ""))
         head = e["head"]
+        if (core := e.get("core")) is not None:
+            self._core_apply(core)
         self.heads[(e["source"], "")] = {**head, "at": e["at"], "n": self.event_counter}
         self._commit_keys(e["source"], "", e.get("keys"), None, head["ref"].get("generation"))
         run = e.get("run")
@@ -1720,7 +1753,7 @@ class Model:
                     None,
                     "",
                     installed,
-                    keys=e.get("keys"),
+                    keys=e.get("keys") or ((e.get("core") or {}).get("counts") or {}).get(e["source"]),
                     key_count=self.key_count(e["source"], ""),
                     listed=run,
                     metadata=version,
@@ -1728,6 +1761,60 @@ class Model:
             )
         if before is None or before["ref"].get("generation") != head["ref"].get("generation"):
             self._pend_onchange(None, "", [e["source"]])
+
+    # -- the new tracking core (format 6) -------------------------------------------------
+
+    def _on_Core(self, e):
+        self._core_apply(e)
+
+    def _core_apply(self, part: dict) -> None:
+        """Apply a core event (`event`: its bytes, base64), whole: the engine
+        checked it before recording it. Then the ids it mints or retires:
+        `outputs` `[[output, partition, id | None], ...]`, `edges`
+        `[[asset, partition, input, id | None], ...]`."""
+
+        if self.core is None:
+            self.core = Tracking()
+        if part.get("event") is not None:
+            self.core.apply(b64decode(part["event"]))
+        for output, partition, id_ in part.get("outputs") or ():
+            if id_ is None:
+                self.core_outputs.pop((output, partition), None)
+            else:
+                self.core_outputs[(output, partition)] = id_
+        for asset, partition, param, id_ in part.get("edges") or ():
+            if id_ is None:
+                self.core_edges.pop((asset, partition, param), None)
+                self.core_empty.pop((asset, partition, param), None)
+            else:
+                self.core_edges[(asset, partition, param)] = id_
+                self.core_empty[(asset, partition, param)] = ""
+
+    def _core_walk(self, asset: str, partition: str, walk: dict) -> None:
+        """A batch's walk over its keyed inputs, `(after, hi]` (`hi` None: to
+        the end): it fills what an edge held nothing of, from the start after a
+        reset; once a walk gets to the end, nothing is left empty."""
+
+        after, hi = walk["after"], walk["hi"]
+        for param in walk["inputs"]:
+            key = (asset, partition, param)
+            empty = "" if walk["reset"] else self.core_empty.get(key)
+            if empty is None or (after is not None and after > empty):
+                continue
+            if hi is None:
+                self.core_empty.pop(key, None)
+            elif hi > empty:
+                self.core_empty[key] = hi
+
+    def core_output(self, output: str, partition: str) -> dict | None:
+        """A keyed output as the core holds it: `{"id", "head", "live", "layers"}`,
+        or None before its life's first commit."""
+
+        id_ = self.core_outputs.get((output, partition))
+        if id_ is None or self.core is None:
+            return None
+        found = self.core.output(id_.encode())
+        return None if found is None else {"id": id_, **found}
 
     def _on_SensorAdvanced(self, e):
         self.sensors[e["sensor"]] = {"cursor": e.get("cursor"), "accepted": e["accepted"]}

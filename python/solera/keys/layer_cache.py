@@ -26,9 +26,9 @@ import threading
 import uuid
 from collections import OrderedDict
 
+from ..threads import in_thread
 from .io import ObjectIO
 from .layers import LayerState
-from .threads import in_thread
 
 
 class LayerCache:

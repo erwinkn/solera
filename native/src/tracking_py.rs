@@ -348,6 +348,31 @@ impl Tracking {
         guard(|| self.state.write().unwrap().apply(event).map_err(err))
     }
 
+    /// Whether `apply` would take the event, applying nothing.
+    fn check(&self, event: &[u8]) -> PyResult<()> {
+        guard(|| {
+            let ev = Event::decode(event).map_err(err)?;
+            self.state.read().unwrap().check_event(&ev).map_err(err)
+        })
+    }
+
+    /// One output as the state holds it: `{"head", "live", "layers"}`, or
+    /// None before its first commit.
+    fn output<'py>(&self, py: Python<'py>, output: &[u8]) -> PyResult<Option<Bound<'py, PyDict>>> {
+        let Some(o) = self.state.read().unwrap().outputs.get(output).cloned() else {
+            return Ok(None);
+        };
+        let d = PyDict::new(py);
+        d.set_item("head", o.head)?;
+        d.set_item("live", o.live)?;
+        let layers = PyList::empty(py);
+        for l in &o.layers {
+            layers.append(crate::index_py::layer_out(py, l)?)?;
+        }
+        d.set_item("layers", layers)?;
+        Ok(Some(d))
+    }
+
     /// The change index that holds `output`'s layers (runtime configuration, not
     /// state). Every output on one object store should share one index, and
     /// so its cache.

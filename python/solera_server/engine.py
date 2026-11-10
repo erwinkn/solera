@@ -32,6 +32,7 @@ from zoneinfo import ZoneInfo
 from croniter import croniter
 from obstore.exceptions import AlreadyExistsError
 from solera import lifecycle
+from solera._native import Tracking
 from solera.ids import ulid, ulid_time
 from solera.key_outcomes import lower
 from solera.keys import Rows, SortedEntries
@@ -53,6 +54,7 @@ from . import history, owed, planning
 from .attempts import POOL_OFFERED_GRACE, Attempts, Live, current_names, worker_report
 from .executors import PlacementContext, Registry
 from .history import MAX_METADATA, History, RunFilter
+from .journal import CORE_FORMAT, FORMAT
 from .keyservice import KeyService, cache_root
 from .model import (
     CLEANUP,
@@ -69,6 +71,10 @@ from .observing import Observing
 from .sensors import Sensors
 from .staleness import Staleness
 from .state import Conflict, LostOwnership, State
+from .tracking import Core, b64, output_pin
+from .tracking import commit as core_commit
+from .tracking import prepare as core_prepare
+from .tracking import sources as core_sources
 from .upkeep import ALIVE, Upkeep
 from .views import Views
 
@@ -141,11 +147,22 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
         sensor_host=None,
         cleanup_interval: float = CLEANUP_INTERVAL,
         cleanup_coalesce: float = CLEANUP_COALESCE,
+        tracking: str = "today",
     ):
+        """`tracking` selects the tracking path, for tests until the switch
+        (build plan B5, rule 4): `"today"`, or `"core"`, the new tracking
+        core. A namespace is written by one path only: the new one writes
+        state format 6 (`journal.CORE_FORMAT`), and each refuses the other's."""
+
         import time
 
         if heartbeat_seconds <= 0 or concurrency < 1:
             raise ValueError("Heartbeat interval and concurrency must be positive")
+        if tracking not in ("today", "core"):
+            raise ValueError(f"tracking={tracking!r}: 'today' or 'core'")
+        state.journal.use(CORE_FORMAT if tracking == "core" else FORMAT)
+        if tracking == "core" and state.model.core is None:
+            state.model.core = Tracking()
         self.state, self.manifest = state, manifest
         self.project = project
         self.clock = clock or time.time
@@ -187,8 +204,10 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
         # `resolve_cache` says, else beside `file://` state or in a temporary
         # directory; None or False: off.
         self.keys: KeyService | None = None
-        if resolve_cache:
-            root = resolve_cache if isinstance(resolve_cache, str) else cache_root(state.objects_url)
+        root = resolve_cache if isinstance(resolve_cache, str) else cache_root(state.objects_url)
+        # The new path: the core and its change index, whose disk cache sits beside the key cache's.
+        self.core = Core(self, root if resolve_cache else None) if tracking == "core" else None
+        if resolve_cache and self.core is None:
             self.keys = KeyService(state.objects, root)
         # What fails now, by name — the eval loop, upkeep, a key index, the history, an
         # automation — each entry cleared by its own next success: the one place it shows.
@@ -496,6 +515,8 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
         `reason` why, and `writes` what is known of its writes
         (docs/lifecycle.md §2.3)."""
 
+        if self.core is not None:
+            self.core.plans.pop(claim["attempt"], None)
         event = {
             "type": "AttemptFinished",
             "run": task["run"],
@@ -556,7 +577,7 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
                     for i in (handed.get("outputs") or {}).values()
                 ):
                     self._submit_cleanups([(cleanup["output"], cleanup["partition"])])
-            elif task["asset"] in self.manifest["assets"]:
+            elif task["asset"] in self.manifest["assets"] and self.core is None:
                 outputs = self.manifest["assets"][task["asset"]]["outputs"]
                 self._cleanup_soon(
                     [(o["name"], task["partition"]) for o in outputs if self.m.immutable(o["name"])]
@@ -942,6 +963,8 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
             try:
                 if task["asset"] == CLEANUP:
                     prepared = self._prepare_cleanup(task, attempt)
+                elif self.core is not None:
+                    prepared = await core_prepare.prepare(self.core, task, run, attempt)
                 else:
                     prepared = self._prepare(task, run, attempt, await self._observe(task, run, attempt))
             except (Retryable, NonRetryable, Conflict) as error:
@@ -951,6 +974,11 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
                     "failed",
                     error=error,
                     retryable=not isinstance(error, NonRetryable) and getattr(error, "retryable", True),
+                )
+                return
+            if prepared.get("skip") and self.core is not None:  # its progress still moves to the heads
+                await self.commit_attempt(
+                    attempt, prepared, {"outputs": {}, "skipped": True}, outcome="skipped"
                 )
                 return
             if prepared.get("skip"):
@@ -1046,11 +1074,46 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
 
         Each output the attempt may write is pinned with its commit number and,
         when keyed, its key index: the worker works out the delta against
-        exactly that state (§6)."""
+        exactly that state (§6).
+
+        The new tracking core's path plans in `tracking.prepare` instead,
+        around the same two halves: `_pin_inputs` and `_prepared`."""
+
+        observing = observing or {}
+        base = self._pin_inputs(task, run)
+        if observing:  # what its inputs observed decides: a full run's first batch only
+            base["full"] = any(o["full"] for o in observing.values())
+        asset, pins = base["asset"], base["pins"]
+        # Pass 2: Incremental plans, as `_observe` planned them.
+        plans, all_empty, each_page = {}, True, None
+        for input in base["incremental"]:
+            param, upstream_partition = input.param, input.partition
+            ref = self._pin_at(input.output, upstream_partition)
+            if self._keyed(input):
+                pin, plan, empty = self._observed_pin(input, ref, observing[param])
+            else:
+                pin, plan, empty = self._commits_pin(input, ref, observing[param])
+            if input.spec.get("each") is not None:
+                pin, plan, empty = self._each_plan(
+                    task, asset, input.spec, ref, pin, plan, empty, observing[param]
+                )
+                each_page = pin["each"]
+            pins[param] = pin
+            plans[param] = plan
+            all_empty = all_empty and empty
+        more = any(not (p["final"] or p.get("done") or p.get("retry")) for p in plans.values() if p)
+        skip = bool(base["incremental"]) and all_empty and not more and not base["full"]
+        return self._prepared(task, run, attempt, base, plans, more, skip, each_page)
+
+    def _pin_inputs(self, task: dict, run: dict) -> dict:
+        """The first half of preparing an attempt, either path's: its outputs'
+        heads, whether it starts over (a full run, or a version bump), and a
+        pin for every input that is not incremental, with the definition and
+        context it is made under. The incremental inputs are listed, for the
+        path's planner."""
 
         asset = self.manifest["assets"][task["asset"]]
         partition = task["partition"]
-        observing = observing or {}
         full = run["mode"] == "full"
         heads = {}
         for output in asset["outputs"]:
@@ -1059,14 +1122,11 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
             # built is rebuilt, the next attempt starting over.
             if head is not None and head.get("version") not in (None, asset["version"]):
                 full = True
-        if observing:  # what its inputs observed decides: a full run's first batch only
-            full = any(o["full"] for o in observing.values())
         planner = self.planner()
         try:
             inputs = planner.inputs(task["asset"], partition)
         except planning.UpstreamOnly as error:
             raise Conflict(str(error)) from None
-        # Pass 1: pin every non-Incremental input.
         pins = {}
         incremental = []
         for input in inputs:
@@ -1094,32 +1154,31 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
                 pins[param] = {"ref": self._pin_at(output, input.partition), "load": load}
                 if load == "data" and (index := self._whole_index(output, pins[param]["ref"])) is not None:
                     pins[param]["index"] = index
-        definition = self._definition(task["asset"], run)
-        # The whole and dep versions read, which the commit records (its context).
-        context = self._context(planner, inputs)
-        # Pass 2: Incremental plans, as `_observe` planned them.
-        plans, all_empty, each_page = {}, True, None
-        for input in incremental:
-            param, upstream_partition = input.param, input.partition
-            ref = self._pin_at(input.output, upstream_partition)
-            if self._keyed(input):
-                pin, plan, empty = self._observed_pin(input, ref, observing[param])
-            else:
-                pin, plan, empty = self._commits_pin(input, ref, observing[param])
-            if input.spec.get("each") is not None:
-                pin, plan, empty = self._each_plan(
-                    task, asset, input.spec, ref, pin, plan, empty, observing[param]
-                )
-                each_page = pin["each"]
-            pins[param] = pin
-            plans[param] = plan
-            all_empty = all_empty and empty
+        return {
+            "asset": asset,
+            "heads": heads,
+            "full": full,
+            "planner": planner,
+            "inputs": inputs,
+            "pins": pins,
+            "incremental": incremental,
+            "definition": self._definition(task["asset"], run),
+            # The whole and dep versions read, which the commit records (its context).
+            "context": self._context(planner, inputs),
+        }
+
+    def _prepared(
+        self, task: dict, run: dict, attempt: str | None, base: dict, plans: dict, more, skip, each_page
+    ) -> dict:
+        """The second half of preparing an attempt, either path's: what it
+        reads and writes, once its incremental inputs are planned."""
+
+        asset, heads, full, pins = base["asset"], base["heads"], base["full"], base["pins"]
+        partition = task["partition"]
         claim = self.m.claimed(attempt) if attempt is not None else None
         if claim is not None:
             # What this attempt reads stays endpoints of its upstreams until it finishes (§6).
             claim["reads"] = reads(plans)
-        more = any(not (p["final"] or p.get("done") or p.get("retry")) for p in plans.values() if p)
-        skip = bool(incremental) and all_empty and not more and not full
         # A plain consumer never built is built, an empty input or not; a per-key asset
         # whose keys all failed so far has no head yet: nothing to wait for.
         if skip and each_page is None and not any(heads.values()):
@@ -1156,7 +1215,10 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
             if output.get("incremental"):
                 info["commit_number"] = int((head or {}).get("commit_number", -1)) + 1
             if output.get("key") is not None:
-                info["index"] = self.m.index(name, partition).to_json()
+                if self.core is not None:
+                    info["core"] = output_pin(self.core, name, partition)
+                else:
+                    info["index"] = self.m.index(name, partition).to_json()
                 if (name, partition) in self.m.repairs:
                     info["repairs"] = self.m.repairs[(name, partition)]
                 if output.get("dynamic_partitions") or name in self._dynamic_dims:
@@ -1165,7 +1227,7 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
         # The input versions its outputs will be built from, for the history (§7):
         # each pinned ref's generation (docs/versions.md §6).
         lineage = []
-        for input in inputs:
+        for input in base["inputs"]:
             pin = pins.get(input.param) or {}
             refs = [pin["ref"]] if pin.get("ref") else list((pin.get("refs") or {}).values())
             for ref in refs:
@@ -1175,7 +1237,7 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
             "deploy_number": self.m.deploy_number,
             # The version of each whole or dep input read: a partition with no keyed
             # input whose inputs moved since is stale (a keyed one's layers carry it).
-            "context": context,
+            "context": base["context"],
             "config": run.get("config") or {},
             "declaration": digest(self._declaration(task["asset"])),
             "prefixes": self._prefixes(pins, outputs, task),
@@ -1186,7 +1248,7 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
             "full": full,
             "skip": skip,
             "cursor": cursor,
-            "definition": definition,  # what its inputs' observations are made under
+            "definition": base["definition"],  # what its inputs' observations are made under
             "outputs": outputs,
             # A per-key batch's outcome delta, for cleaning up if it never commits.
             "outcomes": None
@@ -1278,6 +1340,8 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
             or store.get("writes") != "immutable"
         ):
             return None
+        if self.core is not None:  # the new path: the layers the worker names its objects from
+            return {"core": output_pin(self.core, output, ref.get("partition") or "")}
         return self.m.index(output, ref.get("partition") or "").to_json()
 
     @staticmethod
@@ -1555,8 +1619,6 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
         `canceled`, or `failed` (a timeout, retryable). Its observations are
         decided first; nothing awaited after them, the rest installs as one."""
 
-        from solera.sdk import UNSET
-
         claim = self.m.claimed(attempt)
         if claim is None:
             raise LostOwnership(attempt)
@@ -1600,9 +1662,35 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
             digest(self._declaration(task["asset"])),
         ):
             raise Conflict(f"asset {task['asset']} changed since this attempt launched")
+        settle = {"outcome": outcome, "error": error, "retryable": retryable, "delay": delay}
+        if self.core is not None:
+            outputs = current_names(prepared, result.get("outputs") or {})
+            built = await core_commit.build(self.core, task, attempt, prepared, result, outputs)
+            async with built.locks:  # the outputs it built: their commits are recorded in turn
+                observations = await self._observations(task, core_commit.unkeyed(prepared), result, attempt)
+                if built.progress is not None:
+                    observations.setdefault("progress", {})["core"] = built.progress
+                if self.m.claimed(attempt) is not claim:
+                    raise LostOwnership(attempt)
+                out = await self._install(
+                    task, claim, attempt, prepared, result, observations, built, **settle
+                )
+            await core_sources.record_loads(self, attempt, prepared, result)
+            return out
         observations = await self._observations(task, prepared, result, attempt)
         if self.m.claimed(attempt) is not claim:
             raise LostOwnership(attempt)
+        return await self._install(task, claim, attempt, prepared, result, observations, None, **settle)
+
+    async def _install(
+        self, task, claim, attempt, prepared, result, observations, built, *, outcome, error, retryable, delay
+    ) -> dict:
+        """The rest of committing an attempt, once what its inputs observed is
+        decided — and on the new path its core commit built (`built`): its
+        outputs' heads and the commit, installed in one synchronous step."""
+
+        from solera.sdk import UNSET
+
         outputs = current_names(prepared, result.get("outputs") or {})
         # Settled under the contract it was launched with, not today's manifest.
         declared = {name: info["contract"] for name, info in (prepared.get("outputs") or {}).items()}
@@ -1630,7 +1718,21 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
                 if ref is None or ref["partition"] != task["partition"]:
                     raise Conflict(f"output {name}: ref partition != {task['partition']!r}", retryable=False)
             head = {"ref": ref, "version": prepared["version"]}
-            if decl.get("key") is not None:
+            if decl.get("key") is not None and built is not None:
+                counts = built.counts.get(name)
+                schema = (ref.get("handle") or {}).get("schema")
+                if (
+                    counts is None
+                    and before is not None
+                    and schema == (before["ref"].get("handle") or {}).get("schema")
+                ):
+                    head["ref"] = before["ref"]  # it changed no key, nor its schema: the head stands
+                head["commit_number"] = (
+                    counts["commit"] if counts else int((before or {}).get("commit_number", 0))
+                )
+                if info.get("dynamic"):
+                    head["partitions"] = built.elements.get(name, (before or {}).get("partitions") or [])
+            elif decl.get("key") is not None:
                 delta = entry.get("keys")
                 if delta is None and not entry.get("unchanged"):
                     raise Conflict(f"keyed output {name}: the result carries no key delta", retryable=False)
@@ -1664,7 +1766,7 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
             if prepared["outputs"][name]["head"] is None and outcomes is None and not result.get("skipped"):
                 raise Conflict(f"omitted output {name} has no head to keep (§2)", retryable=False)
         commit = {"heads": heads, **observations, **self._made(prepared)}
-        commit["final"] = not more and outcome == "succeeded"  # a canceled run has no final commit
+        commit["final"] = not more and outcome in SUCCESS  # a canceled run has no final commit
         if outcomes is not None:
             commit["outcomes"] = outcomes
             if result.get("key_outcomes"):  # the history reads them from the result (D178)
@@ -1700,12 +1802,16 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
         worked = bool((task.get("outcomes") or {}).get("succeeded"))
         if outcome == "succeeded" and result.get("skipped") and not more and not worked:
             outcome = "skipped"  # the patterns took none of its keys: it did nothing (per-key §11)
+        if built is not None:  # checked, then recorded with nothing awaited between (rule 3)
+            core_commit.check(self.core, built)
+            if (core := built.payload()) is not None:
+                commit["core"] = core
         self._finish(
             task,
             claim,
             outcome,
             commit=commit,
-            more=more and outcome == "succeeded",
+            more=more and outcome in SUCCESS,
             worker=result,
             write=result.get("write"),
             error=error,
@@ -1744,6 +1850,8 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
                 await self._drop_prepared([event])
                 raise Conflict(f"source {name!r} moved while committing; retry")
             event["at"] = self.clock()
+            if self.core is not None:
+                self.core.check_payload(event.get("core"))
             self.state.record(event)
         self._committed_keys([event])
         return {"changed": True, "ref": ref, "run": event["run"]["id"]}
@@ -1794,6 +1902,25 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
                     return {str(k): (key_bytes(str(v)) if v is not None else None) for k, v in given.items()}
                 return {str(k): listed for k in given or []}
 
+            if self.core is not None:  # the new tracking core builds the commit
+                built = await core_sources.build(
+                    self.core, name, generation, keys, upsert, remove, "" if listed is not None else None
+                )
+                if built is None:
+                    return None, head["ref"] if head is not None else source["head"]
+                record["commit_number"] = run["commit_number"] = built["counts"]["commit"]
+                if listed is not None:
+                    record["partitions"] = built["elements"]
+                event["core"] = {
+                    "event": b64(built["event"]),
+                    "outputs": built["minted"],
+                    "counts": {name: built["counts"]},
+                }
+                run["upserted"], run["deleted"] = built["upserted"], built["deleted"]
+                meta = dict(ref.get("meta") or {})
+                ref["meta"] = {**meta, "source": True}
+                event["run"] = run
+                return event, ref
             if keys is not None:
                 new, removes, replace = versions(keys), [], True
             else:
@@ -1908,6 +2035,23 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
 
         if (output, partition) not in self.m.heads:
             raise KeyError(f"{output}/{partition}")
+        if self.core is not None:  # the new path: the output's layers in the change index
+            found = self.m.core_output(output, partition)
+            if found is None:
+                return {"total": 0, "keys": {}, "next": None}
+            rows, cursor = [], after
+            while len(rows) < offset + limit:
+                page, cursor = await self.core.run(
+                    self.core.index.scan,
+                    found["layers"],
+                    found["head"],
+                    after=cursor,
+                    limit=offset + limit - len(rows),
+                )
+                rows += page
+                if cursor is None:
+                    break
+            return {"total": found["live"], "keys": {r[0]: r[2] for r in rows[offset:]}, "next": cursor}
         state = self.m.indexes.get((output, partition))
         if state is None:
             return {"total": 0, "keys": {}, "next": None}

@@ -61,3 +61,24 @@ PENDING: dict[str, str] = {
     "ENG-16": "needs a namespace in an older state format, and the contract has none to open: making one "
     "means writing the engine's journal by hand, which no user does and the harness may not",
 }
+
+
+# On the new core's path, the entries — or single tests, by name — that a later
+# unit builds there (build plan, "Where the contract must come first"): skipped
+# with the unit's name until it lands. A test whose run the new path refuses
+# (`harness.NOT_YET`) skips on its own; these are the ones that would fail
+# instead, or assert something a refused run never reaches.
+CORE_LATER: dict[str, str] = {
+    **dict.fromkeys(["RST-1", "RST-2", "RST-3", "RST-4"], "B5 PR 2: lives and renames"),
+    **dict.fromkeys(["CHG-3", "INC-15", "STA-13", "SEL-12"], "B5 PR 2: upstream resets and full runs"),
+    "test_sta_10_a_partial_full_run_whose_rest_is_deleted_upstream_is_complete": "B5 PR 2: full runs",
+    "test_run_4_a_task_held_by_an_upstream_mid_full_run_says_upstream_incomplete": "B5 PR 2: the gate",
+    "test_aut_7_automated_outputs_converge_on_their_sources": "B6: its project has a per-key asset",
+    **dict.fromkeys(["KEY", "STA-15", "HIS-6"], "B6: per-key assets"),
+    **dict.fromkeys(["STA-12", "STA-14", "AUT-4", "CHG-4"], "B7: staleness kept current"),
+    **dict.fromkeys(
+        ["STO-1", "STO-3", "STO-4", "STO-5", "ENG-7", "ENG-8", "ENG-17", "ENG-18"], "B8: exact tables"
+    ),
+    **dict.fromkeys(["CLN", "RST-8", "PAR-6", "ENG-13", "ENG-14"], "B9: retention and upkeep"),
+    **dict.fromkeys(["HIS-3", "HIS-5", "HIS-7", "HIS-8"], "B10: lineage"),
+}
