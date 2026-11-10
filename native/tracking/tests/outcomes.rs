@@ -356,18 +356,24 @@ impl World {
     /// Journals the watch the conditions now call for, refreshes at random,
     /// and checks the status. A refresh on an edge with failure records
     /// waits for the catch-up.
-    async fn stale_check(&mut self, ix: &ChangeIndex, label: &str) {
+    async fn stale_check(&mut self, ix: &ChangeIndex, caught_up: bool) {
+        let label = if caught_up {
+            "after the catch-up"
+        } else {
+            "before the catch-up"
+        };
         let edge = self.edge();
         let watch = self.t.stale.inputs[&edge].watch.as_ref();
         if watch.is_none_or(|w| w.conditions != self.now || w.gate != self.gate) {
-            self.apply(vec![Part::Watch(SetWatch {
+            let part = Part::Watch(SetWatch {
                 edge: edge.clone(),
                 watch: Watch {
                     conditions: self.now.clone(),
                     own: None,
                     gate: self.gate,
                 },
-            })]);
+            });
+            self.t.apply(&Event::of(vec![part]).encode()).unwrap();
         }
         if self.stale_rng.random_bool(0.6) {
             match self.t.stale_ask(&edge) {
@@ -376,11 +382,22 @@ impl World {
                         .await
                         .unwrap();
                     if let Some(w) = w {
-                        self.apply(vec![Part::Witness(w)]);
+                        self.t
+                            .apply(&Event::of(vec![Part::Witness(w)]).encode())
+                            .unwrap();
                     }
+                    let status = self.t.stale_status(&edge).unwrap();
+                    assert!(
+                        !matches!(status, Status::Unknown | Status::Unwatched),
+                        "[{label}] a refresh leaves the edge known"
+                    );
                 }
                 Err(e) => {
                     assert!(e.to_string().contains("catch up first"), "{e}");
+                    assert!(
+                        !caught_up || self.t.rebuild(&edge) != self.now.rebuild,
+                        "refused after the catch-up under the conditions staleness reads: {e}"
+                    );
                     self.stats[10] += 1;
                 }
             }
@@ -392,6 +409,14 @@ impl World {
     async fn stale_verify(&mut self, ix: &ChangeIndex, label: &str) {
         let edge = self.edge();
         let status = self.t.stale_status(&edge).unwrap();
+        let held = self.gate && self.log.full_run.is_some();
+        if status != Status::Unwatched {
+            assert_eq!(
+                status == Status::Held,
+                held,
+                "[{label}] held exactly while the gate holds the input's full run"
+            );
+        }
         if matches!(status, Status::Unknown | Status::Unwatched | Status::Held) {
             return;
         }
@@ -1442,9 +1467,9 @@ async fn history(seed: u64, ix: &ChangeIndex) -> [usize; 11] {
             }
             _ => unreachable!(),
         }
-        w.stale_check(ix, "before the catch-up").await;
+        w.stale_check(ix, false).await;
         w.catch_up(ix).await;
-        w.stale_check(ix, "after the catch-up").await;
+        w.stale_check(ix, true).await;
         if trace {
             let short = |h: &Holding| match h {
                 Holding::Version(v, c) => format!(
@@ -1545,7 +1570,7 @@ fn random_histories() {
             }
         }
     }
-    eprintln!("{seeds} histories: change batches {}, key lists {}, retry passes {} taking {} keys, failing keys left {}, late commits accepted {}, keys held back {}; staleness checked fresh {}, stale {}, retry due {}; refreshes refused before a catch-up {}", total[0], total[1], total[2], total[3], total[4], total[5], total[6], total[7], total[8], total[9], total[10]);
+    eprintln!("{seeds} histories: change batches {}, key lists {}, retry passes {} taking {} keys, failing keys left {}, late commits accepted {}, keys held back {}; staleness checked fresh {}, stale {}, retry due {}; refreshes refused for want of a catch-up {}", total[0], total[1], total[2], total[3], total[4], total[5], total[6], total[7], total[8], total[9], total[10]);
 }
 
 /// A retry batch planned in one pass never commits in another (review F3):
