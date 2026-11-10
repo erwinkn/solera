@@ -46,12 +46,10 @@ PENDING: dict[str, str] = {
         entry: f"changed by docs/tracking-design.md §16 ({decision}); its test, written for the target, is next"
         for entry, decision in CHANGED.items()
     },
-    # RUN+HIS
     "RUN-14": (
         "a rule of the console's display (D173): the HTTP API serves every batch and attempt, and"
         " which of them the console shows is checked by apps/console's Playwright tests"
     ),
-    # ENG+CLN+STO
     "ENG-2": "its window, an attempt's spec written but its launch not yet durable, lies inside one engine "
     "step: no request, restart or takeover a user makes can stop the engine there without hooking its flush",
     "ENG-16": "needs a namespace in an older state format, and the contract has none to open: making one "

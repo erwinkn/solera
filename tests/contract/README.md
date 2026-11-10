@@ -31,7 +31,23 @@ engine's HTTP API, the stores and a worker. The `solera` fixture
 - reads: `get`/`post`/`request` on any route, `stale`, `stale_keys`,
   `status`, `keys`, `head`, `read` and `rows` (an output through its
   store, as a downstream reader gets it);
-- time: `advance(seconds)` moves every clock the namespace reads.
+- time: `advance(seconds)` moves the clock the engine plans by (retry
+  backoffs, schedules, retention). Heartbeats, cancels, timeouts, sensor
+  schedules and upkeep run on real time: tests shorten them with serve
+  settings (`deploy(project, heartbeat_seconds=0.2, cancel_grace=…)`);
+- waiting: `until(condition)`, `quiet()`, `upkeep()`;
+- outcomes and history: `outcomes`, `explain`, `retry_keys`, `commits`;
+- workers, hosts and processes a test plays: `workers(boot=)` and
+  `kill_workers()`, `work(pool, project)` and `worker(stage)` (a pool
+  worker), `offered(pool)`, `sensors`, `sensor_host`, `sensor_ticks` and
+  `sensor_post`, `reloading(entry)` (a `--reload` serve), `serve_process()`,
+  `cli(*argv)`;
+- outages and takeovers: `start()` (the engine's own loops), `down()`,
+  `outage(seconds)`, `successor()` (a second engine on the namespace);
+- faults an operator or a broken worker causes: `tamper(run, attempt,
+  change)` rewrites an attempt's control file, `refuse_upkeep(output)` makes
+  an output's index upkeep fail. Both know today's storage layout, so the
+  new path needs its own version of each.
 
 `example.py` is the contract's running example (`feed → items → tally,
 copy, checks → filtered`, `factor`), with what each producer received batch

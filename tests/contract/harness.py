@@ -256,7 +256,7 @@ class Solera:
         key = self.project.manifest["outputs"][output]["key"]
         return {str(r[key]): r.get(column) for r in await self.read(output, partition) or []}
 
-    # -- SRC+PAR+AUT -----------------------------------------------------------
+    # -- upkeep, waiting, a sensor host ------------------------------------------
 
     async def upkeep(self) -> None:
         """Storage upkeep does one pass, as a served engine's does every
@@ -304,7 +304,7 @@ class Solera:
         channel = SensorChannel(Transport(), self.project.manifest["name"])
         await run_sensor_host(channel, self.project, executor, max_ticks=ticks, host="contract")
 
-    # -- KEY+STA ---------------------------------------------------------------
+    # -- key outcomes and commits ------------------------------------------------
 
     async def retry_keys(self, asset: str, *classes: str, partition: str | None = None) -> list[dict]:
         """`solera keys retry` (`POST /assets/{name}/keys:retry`): the runs it
@@ -341,7 +341,7 @@ class Solera:
         rows = (await self.get(f"/assets/{asset}/history", limit=5000))["commits"]
         return sorted((r for r in rows if run_id in (None, r["run"])), key=lambda r: r["generation"])
 
-    # -- RUN+HIS ---------------------------------------------------------------
+    # -- workers that boot slowly or die, outages --------------------------------
 
     def workers(self, *, boot: float | None = 0.0) -> dict:
         """A serve setting, `deploy(project, placements=solera.workers(…))`:
@@ -387,7 +387,7 @@ class Solera:
         await self._open_state()
         await self._serve()
 
-    # -- CHG+RST+DEP -------------------------------------------------------------
+    # -- pool workers, sensor hosts and reloads a test plays ---------------------
 
     def _worker_transport(self):
         """The engine's routes as a worker in this process reaches them."""
@@ -456,7 +456,7 @@ class Solera:
 
         return served()
 
-    # -- ENG+CLN+STO ---------------------------------------------------------------
+    # -- takeovers, workers and processes a test plays ---------------------------
     # Serving, outages and takeovers, and the workers a test plays itself.
 
     async def start(self) -> None:
