@@ -8,6 +8,7 @@ import asyncio
 import json
 import os
 import pickle
+import zlib
 from typing import Any
 
 from ..sdk import KEYS, Loaded, ObjectRef, Ref, is_ref_type
@@ -40,8 +41,10 @@ class FileStore:
 
         {root}/rollup@184467.json               a value, by generation 184467
         {root}/site_status/alpha@184467.json    a value, partition alpha
-        {root}/uploads/u-7/184467.pkl           a keyed output: one object per key and generation
-        {root}/site_files/alpha/f-1/184467.json keyed and partitioned: the key's rows
+        {root}/uploads/3f2/u-7/184467.pkl       a keyed output: one object per key and generation,
+                                                under one of 4,096 buckets by the key's hash
+        {root}/site_files/alpha/0a1/f-1/184467.json
+                                                keyed and partitioned: the key's rows
         {root}/site_events/alpha/000000000042/184467.json
                                                 an unkeyed incremental output: one per commit
 
@@ -245,7 +248,12 @@ class FileStore:
 
     @staticmethod
     def key_name(base: str, key: str, generation: int) -> str:
-        return f"{base}/{_segment(key)}/{int(generation)}"
+        """`{base}/{bucket}/{key}/{generation}`: each key's directory sits in one
+        of `BUCKETS` buckets by its hash, so no directory holds more than a
+        bucket's share of the keys. One directory of every key stopped at
+        64,998 keys on ext4 without `dir_nlink` (ERW-21)."""
+
+        return f"{base}/{zlib.crc32(key.encode()) % BUCKETS:03x}/{_segment(key)}/{int(generation)}"
 
     async def cleanup(
         self, output, *, home=None, partition=None, key=None, generation=None, before=None
@@ -256,7 +264,7 @@ class FileStore:
         unkeyed incremental output's commit number), exactly `generation`,
         or every generation older than `before`. Objects are found by name:
         a generation is every name's last component — `{base}@{g}` for a
-        value, `{base}/{key}/{g}` otherwise — and a key, or commit, the one
+        value, `{base}/{bucket}/{key}/{g}` otherwise — and a key, or commit, the one
         before it. Names are never reused, so deleting one twice is no harm."""
 
         import obstore
@@ -537,6 +545,7 @@ class FileStore:
         return ObjectRef(output=context.output.name, store="", handle=handle, partition=context.partition)
 
 
+BUCKETS = 4096  # a keyed output's directories of keys (`key_name`); ext4 allows 64,998 in one
 OWNER = ".solera-owner.json"  # at a store's root: the namespace its data belongs to (F43, D167)
 
 

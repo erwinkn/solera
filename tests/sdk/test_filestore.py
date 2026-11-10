@@ -104,8 +104,8 @@ async def test_a_keyed_output_is_one_object_per_key_and_generation(store):
     first = {"u-1": {"bytes": 3}, "u-2": {"bytes": 5}}
     written = await store.store(first, None, context(out, generation=5))
     names = await paths(store)
-    assert names == ["uploads/u-1/5.json", "uploads/u-2/5.json"]
-    assert {n.split("/")[1] for n in names} == {"u-1", "u-2"}
+    assert names == sorted(f"{FileStore.key_name('uploads', k, 5)}.json" for k in first)
+    assert {n.split("/")[2] for n in names} == {"u-1", "u-2"}
     with pytest.raises(StoreError, match="takes Keys"):
         await store.load(written.ref, None, None)  # a whole read goes through the index
     patch = {"u-2": {"bytes": 6}}
@@ -121,6 +121,20 @@ async def test_a_keyed_output_is_one_object_per_key_and_generation(store):
     assert len(await paths(store)) == 1
 
 
+async def test_a_keyed_output_spreads_its_keys_over_buckets(data):
+    """ERW-21: one directory holding every key's directory stopped at 64,998
+    keys on ext4 without `dir_nlink`; the keys sit in buckets by hash."""
+
+    from solera.stores.files import BUCKETS
+
+    store, out = FileStore(data), Output("uploads", keyed=True)
+    content = {f"k{i:06d}": i for i in range(20_000)}
+    written = await store.store(content, None, context(out, generation=1))
+    assert await store.load(written.ref, None, at(out, content, 1)) == content
+    entries = [len(dirs) + len(files) for _, dirs, files in os.walk(Path(data) / "uploads")]
+    assert entries[0] == BUCKETS and max(entries[1:]) < 32
+
+
 async def test_a_keyed_write_touches_only_what_the_harness_says(store):
     out = Output("uploads", keyed=True)
     content = {"a": 1, "b": 20, "c": 3}
@@ -128,7 +142,7 @@ async def test_a_keyed_write_touches_only_what_the_harness_says(store):
     only = KeyedWrite(prepared, frozenset({"b"}), frozenset({"a"}))
     await store.store(only, None, context(out, generation=3))
     # `c` is in the write but not in upserts: the worker knows it is there already.
-    assert await paths(store) == ["uploads/b/3.json"]
+    assert await paths(store) == [f"{FileStore.key_name('uploads', 'b', 3)}.json"]
     # A requested key the write does not hold is an error, never a silent skip.
     with pytest.raises(StoreError, match="zzz"):
         await store.store(KeyedWrite(prepared, frozenset({"b", "zzz"})), None, context(out, generation=4))
@@ -156,7 +170,7 @@ async def test_rows_by_key_column(store):
     out = Output("files", key="id")
     rows = [{"id": 1, "v": "1"}, {"id": 2, "v": "1"}]
     first = await store.store(rows, None, context(out, generation=1))
-    assert await paths(store) == ["files/1/1.json", "files/2/1.json"]
+    assert await paths(store) == sorted(f"{FileStore.key_name('files', k, 1)}.json" for k in "12")
     patch = [{"id": 3, "v": "1"}]
     patched = await store.store(Patch(patch, remove=[1]), first.ref, context(out, generation=2))
     current = Keys({**at(out, rows, 1, keys={"2"}).generations, **at(out, patch, 2).generations})
