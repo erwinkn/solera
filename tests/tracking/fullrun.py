@@ -47,6 +47,7 @@ RULES = {
         "repair",
         "repair_removals",
         "repair_at_once",
+        "repair_handover",
         "load_check",
         "cut_records",
         "cut_pieces",
@@ -55,7 +56,7 @@ RULES = {
         "cleanup_held",
     ),
 }
-ADDED = {"clear": ("hold_back", "repair_removals", "cut_attempts")}
+ADDED = {"clear": ("hold_back", "repair_removals", "repair_handover", "cut_attempts")}
 
 
 def fmap(d: int, k: str) -> str | None:
@@ -142,7 +143,7 @@ class Spec:
     taken: list[str]
     version: int
     reset: bool = False
-    own_head: int = 0  # the head of its own output when it planned
+    repaired: dict = field(default_factory=dict)  # the dead attempts its repair took over: version -> names
     loads: dict | None = None  # a reader's load, once it ran: key -> Row or None
     loading_rebuild: int | None = None  # the producer's rebuild in progress when it loaded
     removals: dict = field(default_factory=dict)  # a loaded absence: the rebuild whose commit removed it then
@@ -306,7 +307,6 @@ class Ordinary:
         w.version += 1
         s.version = w.version
         s.before = [{k: (ABSENT if s.reset else prog.decode(k)) for k in s.taken} for prog in self.progress]
-        s.own_head = self.output.log.head
         s.clear = s.reset and w.on("clear")
         if s.reset:
             w.rebuilds += 1
@@ -385,7 +385,7 @@ class Ordinary:
             k for k in keys - set(writes) if (r.version if (r := out.rows.get(k)) else ABSENT) != state.get(k)
         )
         w.trace.append(f"  {self.name} v{s.version} repairs v{sorted(self.dead)}: {wrong}")
-        self.dead = {}
+        s.repaired, self.dead = self.dead, {}
         if s.clear:
             return True
         if wrong and self.accumulates:
@@ -395,10 +395,11 @@ class Ordinary:
         for q in wrong:
             items, feed = self.inputs
             k = q.lower()
-            has = obs(items, k, s.heads[0], s.cond)
+            v = items.get(s.heads[0], k)
+            has = ABSENT if v is ABSENT else (v, s.cond.seen())
             d = s.cond.defn[0]
             ok = has is not ABSENT and fmap(d, k) == q
-            writes[q] = (has[0], feed.states[s.heads[1]].get(k), d) if ok else ABSENT
+            writes[q] = (has[0], feed.get(s.heads[1], k), d) if ok else ABSENT
             s.redo[k] = has
         self.excused = set()
         return True
@@ -413,7 +414,6 @@ class Ordinary:
         held = [out.log.head]
         if w.on("cleanup_held"):
             held += [m.pending.heads[0] for m in (w.archive, w.report) if m.src is out and m.pending]
-            held += [self.pending.own_head] if self.pending else []
         while out.cursor < min(held):
             r = out.cursor + 1
             gone = (
@@ -423,8 +423,7 @@ class Ordinary:
             )
             out.deleted |= set(gone.items())
             out.cursor = r
-        live = {s.version for s in self.zombies} | ({self.pending.version} if self.pending else set())
-        out.deleted |= {key for key in out.objects if key[1] in self.abandoned - live}
+        out.deleted |= {key for key in out.objects if key[1] in self.abandoned}
         w.trace.append(f"cleanup of {self.name} reaches #{out.cursor}")
 
     def giveup(self) -> None:
@@ -439,9 +438,9 @@ class Ordinary:
         if s.written is None:
             self.zombies.append(s)
 
-    def late(self) -> None:
+    def late(self, newest: bool = False) -> None:
         if self.zombies:
-            s = self.zombies.pop(0)
+            s = self.zombies.pop(-1 if newest else 0)
             if self.transact(s, live=False) and s.version in self.dead:
                 self.excused |= self._keys(s.written or {}, s.clear)
 
@@ -450,6 +449,8 @@ class Ordinary:
             d = s.cond.defn[0]
             names = {group(k) if self.accumulates else fmap(d, k) for k in s.taken} - {None}
             self.dead[s.version] = ALL if s.reset else frozenset(names)
+            if self.w.on("repair_handover"):
+                self.dead |= s.repaired
             if s.written is not None:
                 self.excused |= self._keys(s.written, s.clear)
 
@@ -691,8 +692,6 @@ class Mirror:
                 w.stats["held back"] += 1
                 kept.add(k)
                 continue
-            if not recorded:
-                w.violation = f"{self.name} processed {k} as {loaded}, a version no commit of {self.log_name()} recorded"
             p = self.producer
             if (
                 row is not None
@@ -764,7 +763,7 @@ class Mirror:
     def _recorded(self, k: str, loaded: object, H: int) -> bool:
         """Did a commit at or after the planned head record what was loaded?"""
         v = ABSENT if loaded is ABSENT else loaded[0]
-        return any(self.log.states[c].get(k) == v for c in range(H, self.log.head + 1))
+        return any(self.log.get(c, k) == v for c in range(H, self.log.head + 1))
 
     def _universe(self) -> set[str]:
         return set(KEYS) | {k.upper() for k in KEYS} | {"odd", "even"}
@@ -895,7 +894,7 @@ class World:
         elif kind in ("write", "giveup", "late"):
             a = self.assets[ev[1]]
             if isinstance(a, Ordinary):
-                getattr(a, kind)()
+                getattr(a, kind)(*ev[2:])
             elif kind == "giveup" and a.pending:
                 a.pending = None
                 self.trace.append(f"the engine gives up on {a.name}'s attempt")
@@ -954,6 +953,7 @@ class World:
                     f"summary reads copy whole, finds {_rows(c.output.rows)}, no commit's: it holds back"
                 )
                 return
+        if read not in c.output.log.states:
             self.violation = f"summary read {_rows(c.output.rows)}, rows no commit of copy recorded"
         defs = {r.value[2] for r in c.output.rows.values()}
         self.trace.append(f"summary reads copy whole: {sorted(c.output.rows)}")
@@ -980,7 +980,6 @@ class World:
                 needed = [out.log.head] + [
                     m.pending.heads[0] for m in (self.archive, self.report) if m.src is out and m.pending
                 ]
-                needed += [s.own_head] if s is not None else []
                 if gone := sorted({o for c in needed for o in out.log.states[c].items()} & out.deleted):
                     return f"cleanup of {a.name} deleted {gone}, which the log or an attempt still needs"
             for c in range(out.log.base, out.log.head + 1):
@@ -997,6 +996,10 @@ class World:
                         return (
                             f"{a.name}'s progress decodes {k} as {prog.decode(k)}, it processed {held.get(k)}"
                         )
+        for m in (self.archive, self.report):
+            for k, v in m.holds.items():
+                if all(st.get(k) != v[0] for st in m.src.log.states):
+                    return f"{m.name} holds {k}@{v[0]}, a version no commit of {m.log_name()} recorded"
         for m in (self.archive, self.report, self.checks):
             for k in m._universe():
                 if m.progress.decode(k) != m.holds.get(k):
@@ -1093,8 +1096,10 @@ def history(rnd: random.Random, steps: int) -> list[tuple]:
             events.append((kind, rnd.choice(names)))
         elif kind == "load":
             events.append((kind, rnd.choice(("archive", "report"))))
-        elif kind in ("write", "late", "cleanup"):
+        elif kind in ("write", "cleanup"):
             events.append((kind, rnd.choice(("copy", "tally"))))
+        elif kind == "late":
+            events.append((kind, rnd.choice(("copy", "tally")), rnd.random() < 0.5))
         elif kind == "merge":
             events.append((kind, rnd.choice(("items", "feed", "copy", "tally"))))
         elif kind == "keys":

@@ -158,6 +158,18 @@ CALIBRATIONS = {
         ("giveup", "copy"),
         ("items", (("k1", False),)),
     ],
+    ("fullrun", "clear", "table", "repair_handover"): [
+        ("items", (("k1", True), ("k3", True))),
+        ("step", "copy", 2),
+        ("keys", "copy", ("k2", "k3")),
+        ("write", "copy"),
+        ("items", (("k1", False), ("k3", False))),
+        ("giveup", "copy"),
+        ("plan", "copy", 1),
+        ("write", "copy"),
+        ("items", (("k1", True), ("k2", True))),
+        ("restart",),
+    ],
     # The cut and exact cleanup (§13), and lineage (§12), on file stores.
     ("fullrun", "clear", "file", "cut_records"): [
         ("step", "copy", 1),

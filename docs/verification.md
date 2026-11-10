@@ -1371,15 +1371,19 @@ design and the amendments are switched off by `ADDED`; each is a finding:
 | staleness | `hold_back`: a batch holds back a key it loaded at another commit than planned while items is mid full run, or if a clear came since it planned | checks processes a removal the clear made and adds the key back when items completes, a state items had only mid full run (the check records which commits fell inside one). Only the mid-full-run half bites here: this model loads at the instant of the commit, so after the full run completes it loads a finished state; the full-run model's `load` event tests the clear-since-plan half |
 | full runs | `hold_back`: a reader's batch holds back what it loaded at another version than planned while its upstream is incomplete, or if a clear came since it planned | on a table the gate does not cover a batch already in flight, nor one that loaded mid rebuild and commits after: report loads a half-built count, archive processes removals the clear made. With late and dead writers the same rule is recommendation 4 |
 | full runs | `repair_removals`: the repair also redoes the keys the dead attempts' specs named, not only the rows it finds by version | a dead attempt's delete leaves no row to list: the log keeps a key the table lost |
+| full runs | `repair_handover`: an attempt given up on after its repair hands the dead attempts it repaired to the next repair | the repair deleted a row while redoing an older dead attempt's key and died: that row is in no spec the next repair lists, and the table lacks a key the log has |
 | full runs | `cut_attempts`: the cut also holds the head every live attempt planned at | a consumer with no piece at a commit yet (it has processed nothing) plans at c0, a merge folds c0, and its commit's record and new piece name a folded commit |
 
 The invariants are physical: they compare the table with the log, not the
-model's own record of which attempts died. So three of the rules bite rarely
-in random histories (3,000 on tables: `repair` 13, `repair_at_once` 1,
-`open_txn` 0), and each has a calibration where a dead or late writer's row
-outlives the log for good. `open_txn` bites only when the attempt after one
-given up on has nothing to write and the late writer lands first: without the
-transaction nothing repairs the row. `repair_at_once` (a
+model's own record of which attempts died. So the repair rules bite rarely in
+random histories (3,000 on tables: `repair` 7, `open_txn` 1,
+`repair_at_once` 1, `repair_removals` 0, `repair_handover` 0; a
+writer-heavy generator found the last one, 22 times in 300,000 histories
+before the rule), and each has a calibration where a dead or late writer's
+row outlives the log. `open_txn` bites only when the attempt after one
+given up on has nothing to write: without the transaction it neither raises
+the fence nor repairs, so a late writer's row stays, whether it landed before
+that attempt or after. `repair_at_once` (a
 dead attempt makes its producer owed) bites only when the dead attempt's keys
 stop being owed on their own, for instance when upstream removes a key the
 dead attempt added; otherwise the keys it did not commit are still owed and
@@ -1387,8 +1391,9 @@ the retry runs anyway. `load_check` is needed beside the repair: the repairing
 attempt writes the rows it found, so a dead count it built on at its start is
 overwritten, not repaired.
 
-**Not modeled yet:** several upstream levels rebuilding at once
-rebuilding at once, one witness per reason (STA-2), the propagation of
+**Not modeled yet:** several upstream levels rebuilding at once, lineage over a
+`held` replaced slice (§12, review F8: the full-run model has no held pieces
+and no pattern changes, and the staleness model keeps no records), one witness per reason (STA-2), the propagation of
 "upstream stale" down the graph, and the cost of any of it at scale.
 
 ## Trace validation: simulation runs against the specs
