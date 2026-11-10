@@ -592,6 +592,9 @@ class Mirror:
         self.log = src.log if isinstance(src, Output) else src
         self.progress = Progress(self.log)
         self.holds: dict[str, object] = {}  # brute force
+        self.delivered: list[
+            tuple
+        ] = []  # brute force: (key, version or ABSENT, planned head, head) since the last check
         self.store: dict[str, tuple] = {}
         self.last: dict[
             str, tuple[str, int | None]
@@ -703,6 +706,7 @@ class Mirror:
                     f"{self.name} loaded {k}@{row.version}, a row the unfinished rebuild {row.rebuild} built"
                 )
             self._deliver(k, loaded, row, s.heads[0], s.removals.get(k))
+            self.delivered.append((k, ABSENT if loaded is ABSENT else loaded[0], s.heads[0], self.log.head))
             delivered.append(f"{k}{'' if loaded is ABSENT else '@' + str(loaded[0])}")
             results[k] = loaded
         pieces, points = replaced(self.progress, s.lo, s.hi)
@@ -945,7 +949,7 @@ class World:
             self.held["summary"] += 1
             return
         read = {k: r.version for k, r in c.output.rows.items()}
-        if read != c.output.log.states[-1]:
+        if read != c.output.log.scan(c.output.log.head):
             self.stats["summary reads a version no commit recorded"] += 1
             if self.on("hold_back"):
                 self.held["summary"] += 1
@@ -953,7 +957,7 @@ class World:
                     f"summary reads copy whole, finds {_rows(c.output.rows)}, no commit's: it holds back"
                 )
                 return
-        if read not in c.output.log.states:
+        if read != c.output.log.states[-1]:
             self.violation = f"summary read {_rows(c.output.rows)}, rows no commit of copy recorded"
         defs = {r.value[2] for r in c.output.rows.values()}
         self.trace.append(f"summary reads copy whole: {sorted(c.output.rows)}")
@@ -997,9 +1001,10 @@ class World:
                             f"{a.name}'s progress decodes {k} as {prog.decode(k)}, it processed {held.get(k)}"
                         )
         for m in (self.archive, self.report):
-            for k, v in m.holds.items():
-                if all(st.get(k) != v[0] for st in m.src.log.states):
-                    return f"{m.name} holds {k}@{v[0]}, a version no commit of {m.log_name()} recorded"
+            for k, v, H, head in m.delivered:
+                if all(st.get(k, ABSENT) != v for st in m.log.states[H : head + 1]):
+                    return f"{m.name} processed {k} as {v}, which no commit of {m.log_name()} since #{H} recorded"
+            m.delivered = []
         for m in (self.archive, self.report, self.checks):
             for k in m._universe():
                 if m.progress.decode(k) != m.holds.get(k):

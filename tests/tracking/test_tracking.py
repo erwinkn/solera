@@ -421,3 +421,37 @@ def test_lineage_needs_the_keys_a_repair_redid(monkeypatch):
     monkeypatch.setattr(fullrun.World, "record", unlisted)
     r = fullrun.run(events, "clear", "table")
     assert r is not None and "lineage" in r[1]
+
+
+@pytest.mark.parametrize(
+    "events",
+    [
+        [
+            ("items", (("k1", True),)),
+            ("step", "copy", 1),
+            ("step", "archive", 1),
+            ("items", (("k1", True),)),
+            ("step", "copy", 1),
+            ("plan", "archive", 1),
+            ("items", (("k1", False),)),
+            ("plan", "copy", 1),
+            ("write", "copy"),
+            ("giveup", "copy"),
+            ("commit", "archive"),
+            ("items", (("k1", True),)),
+        ],
+        [
+            ("items", (("k1", True),)),
+            ("step", "copy", 1),
+            ("full", "copy"),
+            ("keys", "copy", ()),
+            ("write", "copy"),
+            ("summary",),
+        ],
+    ],
+    ids=["a dead removal", "an uncommitted clear"],
+)
+def test_a_reader_never_processes_what_no_commit_recorded(events):
+    assert fullrun.run(events, "clear", "table") is None
+    r = fullrun.run(events, "clear", "table", frozenset({"hold_back"}))
+    assert r is not None and "no commit" in r[1]

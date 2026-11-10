@@ -1337,9 +1337,10 @@ dead row and the live attempt's alike, and a whole reader retries a read that
 found one), and `load_check` (an attempt whose `ctx.load()` finds a row its own
 last commit did not write cannot build on it and owes a full run). After every
 step the table equals the log except for keys a live attempt has written or a
-dead one wrote and no repair has fixed yet; no reader processes, and no whole
-reader reads, a version no commit recorded; tally's committed counts equal what
-it processed. Once quiet, after every late writer has tried, each table equals
+dead one wrote and no repair has fixed yet; no reader processes a version, or
+an absence, that no commit since its planned head recorded, and a whole reader
+reads only the committed head; tally's committed counts equal what it
+processed. The rules read the index; these checks read the brute-force states. Once quiet, after every late writer has tried, each table equals
 its log exactly.
 
 **The cut, cleanup and lineage** (`fullrun.py`, §12, §13). Each committed batch
