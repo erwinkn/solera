@@ -399,3 +399,25 @@ def test_cleanup_never_deletes_a_current_file(monkeypatch):
     monkeypatch.setattr(fullrun.Ordinary, "cleanup", everything)
     r = fullrun.run(events, "clear", "file")
     assert r is not None and "deleted" in r[1]
+
+
+def test_lineage_needs_the_keys_a_repair_redid(monkeypatch):
+    events = [
+        ("items", (("k1", True),)),
+        ("step", "copy", 1),
+        ("keys", "copy", ("k1",)),
+        ("write", "copy"),
+        ("giveup", "copy"),
+        ("step", "copy", 1),
+    ]
+    w = oracle.replay_fullrun(events, kind="table")
+    assert w.records[-2].edge == "copy<0" and w.records[-2].digest == [("k1", 1, "unchanged")]
+    record = fullrun.World.record
+
+    def unlisted(self, rec):
+        rec.listed = {}
+        record(self, rec)
+
+    monkeypatch.setattr(fullrun.World, "record", unlisted)
+    r = fullrun.run(events, "clear", "table")
+    assert r is not None and "lineage" in r[1]

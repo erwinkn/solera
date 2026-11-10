@@ -1344,7 +1344,7 @@ its log exactly.
 
 **The cut, cleanup and lineage** (`fullrun.py`, §12, §13). Each committed batch
 writes a record per edge: its range, head, conditions, the replaced slice
-(pieces and points), keys processed outside the range (a key list, a repair),
+(pieces and points), keys processed by name (a key list, a repair),
 deviations, held-back keys, and a digest of what it processed: every key that
 changed, and every key a key list or a repair named, changed or not. Lineage
 recomputes the batch's input from the record alone, through the index, and

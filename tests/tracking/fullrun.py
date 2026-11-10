@@ -167,7 +167,7 @@ class Record:
     cond: Cond
     pieces: list  # the replaced slice: the pieces over (lo, hi] before the batch
     points: dict  # and its points
-    listed: dict  # keys processed outside a range (a key list, a repair): what was held before
+    listed: dict  # keys processed by name (a key list, a repair): what was held before
     deviations: dict  # keys loaded at another version than planned: what was loaded
     held_back: frozenset
     digest: list  # what the batch processed: (key, version, class)
@@ -488,11 +488,7 @@ class Ordinary:
             prior = dict(s.before[i])
             outside = {k for k in s.redo if k not in prior}
             prior |= {k: prog.decode(k) for k in outside}
-            listed = {
-                k: v
-                for k, v in prior.items()
-                if s.kind == "keys" or k in outside and not within(k, s.lo, s.hi)
-            }
+            listed = {k: v for k, v in prior.items() if s.kind == "keys" or k in s.redo}
             now = {k: obs(log, k, s.heads[i], s.cond) for k in prior}
             w.record(
                 Record(
