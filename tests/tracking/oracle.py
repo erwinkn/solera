@@ -48,7 +48,7 @@ def replay_staleness(events: list[tuple], form: str = "witness") -> staleness.Wo
     return w
 
 
-def replay_fullrun(events: list[tuple], form: str = "floor", kind: str = "file") -> fullrun.World:
+def replay_fullrun(events: list[tuple], form: str = "clear", kind: str = "file") -> fullrun.World:
     """The cast (copy, tally, archive, report, checks) after the history, unsettled."""
     _check_keys(events, fullrun.KEYS)
     w = fullrun.World(form, kind)

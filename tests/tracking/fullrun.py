@@ -1,13 +1,8 @@
-"""A full run of an ordinary asset (§10), in two forms:
-
-- "clear", the design's: the first batch's commit is a clear and resets the
-  asset's progress to empty; readers wait while their upstream is incomplete
-  (P7, P12);
-- "floor", the amendment's (amendment-full-run.md in the Captain drive): the
-  first batch resets progress and sets the rebuild floor V to its version;
-  each batch rewrites its keys in place; ctx.load() hides rows below V; the
-  commit that completes the run removes every row below V and clears the
-  floor; only readers of an accumulating output, and whole readers, wait.
+"""A full run of an ordinary asset (§10), in the decided form ("clear", P7, P12):
+the first batch's commit is a clear and resets the asset's progress to empty,
+and readers wait while their upstream is incomplete. The amendment's other
+form (rebuild in place behind a floor) was checked against it and rejected;
+it is in the history of solera#15 and in handoffs/SOLE-7/verdict.md.
 
 The cast is the design's. items and feed are upstream logs the history drives.
 copy is an ordinary keyed copy of items, with feed as a second keyed input,
@@ -31,7 +26,7 @@ from .core import ABSENT, EMPTY, NEG, POS, Cond, Log, Progress, within
 
 KEYS = ("k1", "k2", "k3", "k4", "k5")
 EVEN = {"k2", "k4"}
-FORMS = ("clear", "floor")
+FORMS = ("clear",)
 RULES = {
     "clear": (
         "reset",
@@ -43,20 +38,8 @@ RULES = {
         "hold_back",
         "counter",
     ),
-    "floor": (
-        "reset",
-        "floor_set",
-        "load_floor",
-        "leftovers",
-        "complete_alone",
-        "floor_moves_up",
-        "gate_accumulating",
-        "gate_whole",
-        "hold_back",
-        "counter",
-    ),
 }
-ADDED = {"clear": ("hold_back",), "floor": ("hold_back",)}
+ADDED = {"clear": ("hold_back",)}
 
 
 def fmap(d: int, k: str) -> str | None:
@@ -144,10 +127,7 @@ class Ordinary:
         self.listed: set[str] = set()
         self.d = 0
         self.full_due = False
-        self.floor: int | None = None
-        self.rebuild: int | None = (
-            None  # the rebuild in progress: "clear" from its clear, "floor" while V is set
-        )
+        self.rebuild: int | None = None  # the rebuild in progress, from its clear until the asset is complete
         self.cursor: str | None = None
         self.pending: Spec | None = None
 
@@ -238,12 +218,8 @@ class Ordinary:
             w.stats["rebuilds superseded"] += self.rebuild is not None
             w.stats["rebuilds begun by keys="] += s.kind == "keys"
             self.rebuild = w.rebuilds
-            since = [log.diff(s.heads[i], log.head) for i, log in enumerate(self.inputs)]
-            w.removed_during[self.rebuild] = {k for k, (_, now) in since[0].items() if now is ABSENT}
-            w.changed_during[self.rebuild] = {k for d in since for k in d}
-            w.rebuild_d[self.rebuild] = self.d
-            if w.form == "floor" and w.on("floor_set") and (self.floor is None or w.on("floor_moves_up")):
-                self.floor = s.version
+            since = self.inputs[0].diff(s.heads[0], self.inputs[0].head)
+            w.removed_during[self.rebuild] = {k for k, (_, now) in since.items() if now is ABSENT}
         elif s.reset:
             self.full_due = False
         for i, (prog, log) in enumerate(zip(self.progress, self.inputs, strict=True)):
@@ -264,9 +240,9 @@ class Ordinary:
             prog.merge(self.cursor)
         writes = self.produce(s, before)
         w.trace.append(
-            f"{self.name}#{self.output.log.head + 1} (version {s.version}){' clear;' if s.reset and w.form == 'clear' and w.on('clear') else ''} writes {_writes(writes)}"
+            f"{self.name}#{self.output.log.head + 1} (version {s.version}){' clear;' if s.reset and w.on('clear') else ''} writes {_writes(writes)}"
         )
-        self.finish(s.version, writes, clear=s.reset and w.form == "clear" and w.on("clear"))
+        self.finish(s.version, writes, clear=s.reset and w.on("clear"))
 
     def produce(self, s: Spec, before: list[dict]) -> dict:
         """The asset's code: what it writes for the keys and classes it was given."""
@@ -297,64 +273,22 @@ class Ordinary:
     def load(self, g: str) -> int:
         """ctx.load() of the asset's own output, as the store has it now."""
         row = self.output.rows.get(g)
-        if row is None:
-            return 0
-        if self.floor is not None and row.version < self.floor:
-            if self.w.on("load_floor"):
-                return 0
-            self.w.violation = (
-                f"{self.name}'s ctx.load() returned {g}@{row.version}, below the floor {self.floor}"
-            )
-        return row.value[0]
+        return 0 if row is None else row.value[0]
 
     def finish(self, version: int, writes: dict, clear: bool) -> None:
-        """Commit the output, removing the leftovers if this completes a rebuild."""
-        w = self.w
-        done = self.rebuild is not None and self.complete()
-        if done and self.floor is not None and w.on("leftovers"):
-            after = {k: r.version for k, r in self.output.rows.items()}
-            after.update({k: version for k, v in writes.items() if v is not ABSENT})
-            left = sorted(k for k, v in after.items() if v < self.floor and writes.get(k, 0) is not ABSENT)
-            writes = {**writes, **dict.fromkeys(left, ABSENT)}
-            if left:
-                w.stats["leftovers removed"] += len(left)
-                w.trace.append(f"  and removes the leftovers below {self.floor}: {left}")
-        if w.form == "floor" and self.rebuild is not None and not self.accumulates:
-            for k, v in writes.items():
-                last = self.output.removals.get(k, [(0, None)])[-1][1]
-                if v is ABSENT or k in self.output.rows or last != self.rebuild:
-                    continue
-                if k.lower() not in w.removed_during[self.rebuild]:
-                    w.violation = (
-                        f"{self.name}'s log removes {k} and adds it back within rebuild {self.rebuild}"
-                    )
+        """Commit the output; the asset is complete once no input is owed a key
+        it has not processed since the clear (D177)."""
         if writes or clear:
             self.output.write(version, writes, clear, self.rebuild)
-        if done:
-            w.stats["rebuilds completed"] += 1
-            floor, self.floor, self.rebuild = self.floor, None, None
-            w.trace.append(
-                f"  {self.name} is complete" + (f"; its floor {floor} is cleared" if floor else "")
-            )
-            if floor is not None and any(r.version < floor for r in self.output.rows.values()):
-                w.violation = f"{self.name} completed its rebuild from {floor} with rows below it"
+        if self.rebuild is not None and self.complete():
+            self.w.stats["rebuilds completed"] += 1
+            self.rebuild = None
+            self.w.trace.append(f"  {self.name} is complete")
 
     def complete_alone(self) -> None:
-        """Completion without a batch. Under a clear it is only a status; under a
-        floor the engine commits the removal of the leftovers by itself, unless a
-        batch in flight will commit it."""
-        w = self.w
-        if self.rebuild is None or not self.complete():
-            return
-        if w.form == "clear":
+        """Completion without a batch is only a status."""
+        if self.rebuild is not None and self.complete():
             self.finish(0, {}, clear=False)
-        elif self.pending is None and w.on("complete_alone"):
-            w.version += 1
-            w.stats["completed with no batch"] += 1
-            w.trace.append(
-                f"{self.name} becomes complete with no batch: the engine commits version {w.version}"
-            )
-            self.finish(w.version, {}, clear=False)
 
     @staticmethod
     def _heads(heads: list[int]) -> str:
@@ -390,11 +324,7 @@ class Mirror:
         p, w = self.producer, self.w
         if p is None or self.gate is None:
             return False
-        if w.form == "clear":
-            return w.on("gate_accumulating" if self.gate == "accumulating" else "gate") and not p.complete()
-        if self.gate == "accumulating":
-            return w.on("gate_accumulating") and (not p.complete() or p.floor is not None)
-        return False
+        return w.on("gate_accumulating" if self.gate == "accumulating" else "gate") and not p.complete()
 
     def owed(self) -> bool:
         return bool(self.progress.candidates(self.log.head, NEG, self.cond))
@@ -451,17 +381,9 @@ class Mirror:
                 continue
             p = self.producer
             if row is not None and p is not None and row.rebuild is not None and row.rebuild == p.rebuild:
-                if p.accumulates:
-                    w.violation = f"{self.name} loaded {k}@{row.version}, a row the unfinished rebuild {row.rebuild} built"
-                elif k.lower() not in w.changed_during[row.rebuild]:
-                    d, items = w.rebuild_d[row.rebuild], w.items.states[-1]
-                    src = k.lower()
-                    final = (items[src], w.feed.states[-1].get(src), d) if src in items else None
-                    if row.value != final:
-                        w.violation = (
-                            f"{self.name} loaded {k}@{row.version} as {row.value} mid-rebuild {row.rebuild}, "
-                            f"which will hold {final}: a half-built row"
-                        )
+                w.violation = (
+                    f"{self.name} loaded {k}@{row.version}, a row the unfinished rebuild {row.rebuild} built"
+                )
             self._deliver(k, loaded, row, s.heads[0])
             delivered.append(f"{k}{'' if loaded is ABSENT else '@' + str(loaded[0])}")
             results[k] = loaded
@@ -511,8 +433,6 @@ class World:
         self.version = 0
         self.rebuilds = 0
         self.removed_during: dict[int, set[str]] = {}  # per rebuild: the items keys removed since it planned
-        self.changed_during: dict[int, set[str]] = {}  # per rebuild: the input keys changed since it planned
-        self.rebuild_d: dict[int, int] = {}  # per rebuild: the definition it builds
         self.violation: str | None = None
         self.trace: list[str] = []
         self.held: Counter = Counter()
@@ -524,7 +444,6 @@ class World:
         self.report = Mirror(self, "report", self.tally.output, self.tally, gate="accumulating")
         self.checks = Mirror(self, "checks", self.items, None, gate=None)
         self.assets = {a.name: a for a in (self.copy, self.tally, self.archive, self.report, self.checks)}
-        self.floors = {"copy": 0, "tally": 0}
         self.copy.output.log.two_scans = self.on("two_scans")
 
     def on(self, rule: str) -> bool:
@@ -542,7 +461,6 @@ class World:
             log.commit(changes)
             for a in (self.copy, self.tally):
                 if a.rebuild is not None:
-                    self.changed_during[a.rebuild] |= set(log.entries[-1])
                     if kind == "items":
                         self.removed_during[a.rebuild] |= {
                             k for k, (n, _) in log.entries[-1].items() if n is ABSENT
@@ -596,8 +514,7 @@ class World:
     def summary(self) -> None:
         """A whole reader of copy: runs only when the gate lets it."""
         c = self.copy
-        held = not c.complete() or (self.form == "floor" and c.floor is not None)
-        if held and self.on("gate_whole"):
+        if not c.complete() and self.on("gate_whole"):
             self.held["summary"] += 1
             return
         defs = {r.value[2] for r in c.output.rows.values()}
@@ -622,10 +539,6 @@ class World:
                         return (
                             f"{a.name}'s progress decodes {k} as {prog.decode(k)}, it processed {held.get(k)}"
                         )
-            floor = a.floor or 0
-            if floor < self.floors[a.name] and a.floor is not None:
-                return f"{a.name}'s floor went down to {floor}"
-            self.floors[a.name] = max(self.floors[a.name], floor)
         for m in (self.archive, self.report, self.checks):
             for k in m._universe():
                 if m.progress.decode(k) != m.holds.get(k):
@@ -670,8 +583,6 @@ class World:
         ):
             if have != want:
                 return f"at rest {name} holds {have}, it should hold {want}"
-        if self.copy.floor is not None or self.tally.floor is not None:
-            return "at rest a floor is still set"
         return None
 
 

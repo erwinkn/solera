@@ -1,5 +1,5 @@
-"""The tracking model (docs/verification.md, "The tracking model"): both forms
-of each open design choice hold over random histories, every rule is needed,
+"""The tracking model (docs/verification.md, "The tracking model"): the decided
+forms hold over random histories, every rule is needed,
 and the model tells the design's own examples the way the design does."""
 
 from __future__ import annotations
@@ -96,13 +96,9 @@ TALLY = [  # §3's story: tally reads items with batch_size=2
 ]
 
 
-def test_tallys_owed_counts_and_witness_follow_the_design_and_the_amendment():
-    counts = oracle.replay_staleness(TALLY, "counts")
-    assert isinstance(counts.form, staleness.Counts)
-    assert counts.form.n == {(NEG, "k2"): 0, ("k2", POS): 2}  # §6: "at c4, owes 0 · owes 2 (k3, k5)"
-    assert counts.prog.pieces[0][2][1] == 4 and counts.prog.pieces[1][2][1] == 2
-    witness = oracle.replay_staleness(TALLY, "witness")
-    assert isinstance(witness.form, staleness.Witness)
+def test_tallys_witness_follows_the_amendment():
+    witness = oracle.replay_staleness(TALLY)
+    assert witness.prog.pieces[0][2][1] == 4 and witness.prog.pieces[1][2][1] == 2
     assert witness.form.state == ("stale", "k3")  # the amendment: "probe finds k3, removed at c3"
     assert oracle.due(witness) == ["k3", "k5"]
 
@@ -120,8 +116,8 @@ def test_a_revert_raises_no_alarm():
         assert w.form.answer() == ("fresh",) and oracle.due(w) == []
 
 
-def test_archive_sees_a_full_run_of_copy_the_way_the_amendment_tells_it():
-    """amendment-full-run.md's worked example: copy holds k1..k4, its definition
+def test_archive_sees_a_full_run_of_copy_the_way_the_design_tells_it():
+    """amendment-full-run.md's worked example, under the decided form (a clear): copy holds k1..k4, its definition
     changes, items has k1, k2, k4, k5 (k3 removed), batch_size=2."""
     start = [
         ("items", (("k1", True), ("k2", True), ("k3", True), ("k4", True))),
@@ -131,17 +127,13 @@ def test_archive_sees_a_full_run_of_copy_the_way_the_amendment_tells_it():
         ("full", "copy"),
         ("step", "copy", 2),
     ]
-    floor = oracle.replay_fullrun(start, "floor")
-    assert sorted(floor.copy.output.rows) == ["k1", "k2", "k3", "k4"]  # rebuilt in place: k3, k4 still there
-    assert oracle.next_plan(floor, "archive", 4)[0] == ["k1", "k2"]  # archive sees two updates, no removal
-    clear = oracle.replay_fullrun(start, "clear")
-    assert sorted(clear.copy.output.rows) == ["k1", "k2"]  # the clear emptied copy
-    assert clear.archive.held()  # and the gate holds archive
-    for w in (floor, clear):
-        w.apply(("step", "copy", 2))
-        assert sorted(w.copy.output.rows) == ["k1", "k2", "k4", "k5"]
-        assert w.copy.complete() and w.copy.floor is None
-        assert oracle.next_plan(w, "archive", 9)[0] == ["k1", "k2", "k3", "k4", "k5"]
+    w = oracle.replay_fullrun(start)
+    assert sorted(w.copy.output.rows) == ["k1", "k2"]  # the clear emptied copy
+    assert w.archive.held()  # and the gate holds archive
+    w.apply(("step", "copy", 2))
+    assert sorted(w.copy.output.rows) == ["k1", "k2", "k4", "k5"]
+    assert w.copy.complete() and w.copy.rebuild is None
+    assert oracle.next_plan(w, "archive", 9)[0] == ["k1", "k2", "k3", "k4", "k5"]
 
 
 def test_the_log_answers_from_entries_what_its_states_say():
@@ -182,49 +174,6 @@ def test_a_feed_removal_does_not_excuse_churn():
     events.insert(-1, ("feed", (("k3", False), ("k4", False))))
     assert fullrun.run(events, "clear", "table") is None
     assert fullrun.run(events, "clear", "table", frozenset({"hold_back"})) is not None
-
-
-def test_the_floor_forms_log_removes_no_key_it_adds_back(monkeypatch):
-    events = [
-        ("items", (("k1", True), ("k2", True))),
-        ("step", "copy", 2),
-        ("full", "copy"),
-        ("step", "copy", 1),
-        ("step", "copy", 1),
-    ]
-    assert fullrun.run(events, "floor", "file") is None
-    write, begun = fullrun.Output.write, set()
-
-    def clearing(self, version, writes, clear, rebuild):
-        clear = clear or (rebuild is not None and rebuild not in begun)
-        begun.add(rebuild)
-        write(self, version, writes, clear, rebuild)
-
-    monkeypatch.setattr(fullrun.Output, "write", clearing)
-    r = fullrun.run(events, "floor", "file")
-    assert r is not None and "adds it back" in r[1]
-
-
-def test_an_ungated_reader_never_loads_a_half_built_row(monkeypatch):
-    events = [
-        ("items", (("k1", True), ("k3", True))),
-        ("feed", (("k1", True),)),
-        ("step", "copy", 2),
-        ("step", "archive", 2),
-        ("define", "copy"),
-        ("step", "copy", 1),
-        ("step", "archive", 2),
-    ]
-    assert fullrun.run(events, "floor", "file") is None
-    produce = fullrun.Ordinary.produce
-
-    def without_feed(self, s, before):
-        out = produce(self, s, before)
-        return {k: v if v is ABSENT or self.accumulates else (v[0], ABSENT, v[2]) for k, v in out.items()}
-
-    monkeypatch.setattr(fullrun.Ordinary, "produce", without_feed)
-    r = fullrun.run(events, "floor", "file")
-    assert r is not None and "half-built" in r[1]
 
 
 def test_the_oracle_refuses_keys_outside_the_models_key_space():

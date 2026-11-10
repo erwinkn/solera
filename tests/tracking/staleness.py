@@ -1,9 +1,11 @@
-"""Staleness kept exact (§6): the design's exact owed counts per piece (P14)
-against the amendment's one witness due key per input
-(handoffs/SOLE-4/amendment-staleness.md in the Captain drive).
+"""Staleness kept exact (§6) in the decided form: one witness due key per input
+(handoffs/SOLE-4/amendment-staleness.md in the Captain drive), with this
+model's additions. P14's exact owed counts per piece were checked against it
+and rejected; they are in the history of solera#15 and in
+handoffs/SOLE-7/verdict.md.
 
-Both forms run over the same random histories of one consumer input, checks
-on items, and are checked after every step against brute force: what the
+The witness runs over random histories of one consumer input, checks on
+items, and is checked after every step against brute force: what the
 consumer really holds, the keys it owes and the keys that are due. A history
 mixes upstream commits that revert, an upstream full run in the design's form
 (a clear, then "upstream complete"), batches planned and committed later,
@@ -24,22 +26,9 @@ from .core import ABSENT, EMPTY, HELD, HELD_PIECE, NEG, POS, Cond, Log, Progress
 KEYS = ("k1", "k2", "k3", "k4", "k5", "x1")
 PATTERNS = (None, frozenset({"k1", "k2", "k3", "k4", "k5"}), frozenset({"k2", "k4", "x1"}))
 
-# Each form's rules, by the names a calibration switches off. The witness's last
-# three are this model's additions to the amendment (see docs/verification.md).
+# The rules, by the names a calibration switches off. The last four are this
+# model's additions to the amendment (see docs/verification.md).
 RULES = {
-    "counts": (
-        "propagate",
-        "since",
-        "clear",
-        "split",
-        "new_piece",
-        "new_piece_conditions",
-        "split_recount",
-        "conditions",
-        "reset",
-        "keys",
-        "replay",
-    ),
     "witness": (
         "rule1",
         "rule2",
@@ -56,7 +45,6 @@ RULES = {
     ),
 }
 ADDED = {
-    "counts": ("new_piece_conditions", "split_recount", "keys"),
     "witness": ("reset_probe", "held_probe", "catch_up_first", "rearm"),
 }
 
@@ -96,7 +84,7 @@ class World:
         self.violation: str | None = None  # an invariant a form breaks inside a rule
         self.step = 0
         self.trace: list[str] = []
-        self.form: Counts | Witness = Counts(self) if form == "counts" else Witness(self)
+        self.form = Witness(self)
 
     def on(self, rule: str) -> bool:
         return rule not in self.off
@@ -280,177 +268,6 @@ class World:
         if self.form.complete() != self.brute_complete():
             return f"complete reads {self.form.complete()}, brute force {self.brute_complete()}"
         return self.form.check()
-
-
-class Counts:
-    """P14: per piece, the exact number of owed keys without a point, kept by
-    four events; due points are counted one by one when asked."""
-
-    def __init__(self, w: World) -> None:
-        self.w = w
-        self.n: dict[tuple[str, str], int | None] = {(NEG, POS): 0}
-        self.applied: list[tuple[int, str, int]] = []  # what propagation did since the live attempt planned
-        self.stats: Counter = Counter()
-        self.recounted = 0  # the step of the last count by scan
-        self.save()
-
-    def save(self) -> None:
-        """Counts are checkpointed with progress, at every event of the consumer."""
-        self.saved = (dict(self.n), list(self.applied), self.w.up.head)
-
-    def owed_under(self, p: list, k: str) -> bool:
-        w = self.w
-        return w.prog.held_by(p[2], k) != w.prog.wanted(k, w.up.head, w.cond)
-
-    def scan(self, p: list) -> int | None:
-        w = self.w
-        if w.incomplete:
-            return None  # counted once the upstream is complete again (event 2)
-        self.stats["scanned"] += 1
-        self.recounted = w.step
-        return sum(
-            1
-            for k in w.prog.candidates(w.up.head, p[0], w.cond)
-            if within(k, p[0], p[1]) and k not in w.prog.points
-        )
-
-    def on_commit(self, lost: bool) -> None:
-        w, c = self.w, self.w.up.head
-        if c in w.up.clears and self.w.on("clear"):
-            self.n = dict.fromkeys(self.n)
-            return
-        for k, (new, rep) in w.up.entries[c].items():
-            if k in w.prog.points or not w.on("propagate"):
-                continue
-            p = w.prog.piece_of(k)
-            if self.n[(p[0], p[1])] is None:
-                continue
-            self.stats["adjusted"] += 1
-            val = p[2]
-            if val[0] == "at" and (not w.on("since") or w.up.since(k, c - 1) <= val[1]):
-                held = (rep, val[2].seen()) if rep is not ABSENT and val[2].takes(k) else ABSENT
-            else:
-                self.stats["lookups"] += val[0] == "at"
-                held = w.prog.held_by(val, k)
-            before = (rep, w.cond.seen()) if rep is not ABSENT and w.cond.takes(k) else ABSENT
-            after = (new, w.cond.seen()) if new is not ABSENT and w.cond.takes(k) else ABSENT
-            delta = int(held != after) - int(held != before)
-            self.n[(p[0], p[1])] += delta
-            self.applied.append((c, k, delta))
-
-    def recount(self) -> None:
-        self.n = {(p[0], p[1]): self.scan(p) for p in self.w.prog.pieces}
-
-    def on_complete(self) -> None:
-        self.n = {
-            (p[0], p[1]): self.scan(p) if self.n[(p[0], p[1])] is None else self.n[(p[0], p[1])]
-            for p in self.w.prog.pieces
-        }
-        self.save()
-
-    def on_conditions(self) -> None:
-        if self.w.on("conditions"):
-            self.recount()
-        self.save()
-
-    def on_reset(self) -> None:
-        if self.w.on("reset"):
-            self.recount()
-        else:
-            self.n = {(NEG, POS): 0}
-        self.applied = []
-        self.save()
-
-    def before(self, b: Batch):
-        w = self.w
-        counted = {k for k in b.taken if k not in w.prog.points and self.owed_under(w.prog.piece_of(k), k)}
-        return [list(p) for p in w.prog.pieces], dict(self.n), set(w.prog.points), counted
-
-    def after(self, b: Batch, snap) -> None:
-        w = self.w
-        old_pieces, old_n, old_points, counted = snap
-        if b.reset:
-            self.recount() if w.on("reset") else None
-            self.applied = []
-            return
-        if b.kind == "keys":
-            for k in b.taken:
-                p = w.prog.piece_of(k)
-                if self.n[(p[0], p[1])] is not None and w.on("keys"):
-                    now = k not in w.prog.points and self.owed_under(p, k)
-                    self.n[(p[0], p[1])] += now - (k in counted)
-            return
-        n: dict[tuple[str, str], int | None] = {}
-        for p in w.prog.pieces:
-            key = (p[0], p[1])
-            if key == (b.lo, b.hi):
-                if w.incomplete:
-                    n[key] = None
-                elif b.cond != w.cond and w.on("new_piece_conditions"):
-                    n[key] = self.scan(p)
-                elif w.on("new_piece"):
-                    diff = w.up.diff(b.H, w.up.head, b.lo, b.hi)
-                    n[key] = sum(1 for k in diff if k not in w.prog.points and self.owed_under(p, k))
-                else:
-                    n[key] = 0
-            elif key in old_n:
-                n[key] = old_n[key]
-            else:  # what is left of the piece the batch cut
-                src = next(q for q in old_pieces if q[0] <= p[0] and p[1] == q[1])
-                count = old_n[(src[0], src[1])]
-                if self.recounted > b.step and w.on("split_recount"):
-                    count = self.scan(p)
-                elif count is not None and w.on("split"):
-
-                    def inside(k: str, src: list = src) -> bool:
-                        return within(k, b.lo, b.hi) and within(k, src[0], src[1])
-
-                    planned = sum(1 for k in b.taken + b.held_back if inside(k) and k not in old_points)
-                    count -= planned + sum(d for c, k, d in self.applied if c > b.H and inside(k))
-                n[key] = count
-        self.n = n
-        self.applied = []
-
-    def remap(self) -> None:
-        n = {}
-        for p in self.w.prog.pieces:
-            parts = [v for (lo, hi), v in self.n.items() if p[0] <= lo and hi <= p[1]]
-            n[(p[0], p[1])] = None if None in parts else sum(parts)  # type: ignore[arg-type]
-        self.n = n
-
-    def on_retry(self, k: str, timer: bool) -> None:
-        pass  # due points are counted one by one, when asked
-
-    def on_restart(self) -> None:
-        n, applied, head = self.saved
-        self.n, self.applied = dict(n), list(applied)
-        if self.w.on("replay"):
-            replay, self.w.up.entries = self.w.up.entries, self.w.up.entries[: head + 1]
-            for c in range(head + 1, len(replay)):
-                self.w.up.entries.append(replay[c])
-                self.on_commit(False)
-        self.save()
-
-    def answer(self) -> tuple:
-        w = self.w
-        if None in self.n.values():
-            return ("held",)
-        if any(v for v in self.n.values()) or any(w.due(k) for k in w.prog.points):
-            return ("stale", None)
-        return ("fresh",)
-
-    def complete(self) -> bool:
-        return not any(p[2] == EMPTY and self.n[(p[0], p[1])] for p in self.w.prog.pieces)
-
-    def check(self) -> str | None:
-        w = self.w
-        for p in w.prog.pieces:
-            truth = sum(
-                1 for k in KEYS if within(k, p[0], p[1]) and k not in w.prog.points and self.owed_under(p, k)
-            )
-            if self.n[(p[0], p[1])] != truth:
-                return f"piece ({_k(p[0])}, {_k(p[1])}] counts {self.n[(p[0], p[1])]}, brute force {truth}"
-        return None
 
 
 class Witness:
