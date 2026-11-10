@@ -21,6 +21,7 @@ drive lists the hooks later units add.
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import secrets
 from base64 import b64decode, b64encode
@@ -32,9 +33,10 @@ from solera.threads import in_thread
 from ..state import Conflict
 
 HEAVY = 4  # plans and commit builds running at once: the engine's cores (N9, D208)
-WALK = (
-    "(core)"  # the keyed inputs' walk in a task's progress, beside unkeyed inputs': never a parameter's name
-)
+# The keyed inputs' walk in a task's progress, beside unkeyed inputs': never a parameter's name.
+WALK = "(core)"
+
+log = logging.getLogger(__name__)
 
 
 def b64(data: bytes) -> str:
@@ -67,7 +69,12 @@ class Core:
 
     def __init__(self, engine, cache: str | None = None):
         self.engine = engine
-        self.index = open_index(engine.state.objects_url, os.path.join(cache, "core") if cache else None)
+        url = engine.state.objects_url
+        try:
+            self.index = open_index(url, os.path.join(cache, "core") if cache else None)
+        except ValueError as error:  # its disk cache is another's (an engine this one took over from)
+            log.warning("the change index runs without a disk cache: %s", error)
+            self.index = open_index(url)
         self.heavy = asyncio.Semaphore(HEAVY)
         self.locks: dict[str, asyncio.Lock] = {}  # output id -> held while a commit of it is built
         self.plans: dict[str, bytes] = {}  # attempt -> its plan, while it runs here (else its spec's)

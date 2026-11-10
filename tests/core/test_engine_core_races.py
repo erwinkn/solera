@@ -329,3 +329,33 @@ async def test_an_engine_that_lost_its_namespace_never_overwrites_its_successors
         if second is not None:
             await second.close()
         await first.close()
+
+
+@pytest.mark.parametrize("operation", ["restart", "takeover"])
+async def test_an_engine_on_the_same_host_as_its_predecessor_serves_on_s3(tmp_path, operation, monkeypatch):
+    """The predecessor still holds its change index's disk cache: the next
+    engine runs without one rather than failing after it fenced it."""
+
+    import solera_server.engine as engine_module
+
+    monkeypatch.setattr(engine_module, "cache_root", lambda url: str(tmp_path / "cache"))
+    first, second = Solera(tmp_path, "core"), None
+    storage = first.storage_server()
+    try:
+        project = Project(sources=[Source("feed", key="id")])
+        await first.deploy(project)
+        await first.commit_source("feed", upsert={"k": "v1"})
+        await first.state.durable()
+        if operation == "restart":
+            await first.restart()
+            await first.commit_source("feed", upsert={"k": "v2"})
+        else:
+            second = first.successor()
+            second.state_url = first.state_url
+            await second.deploy(project)
+            await second.commit_source("feed", upsert={"k": "v2"})
+    finally:
+        if second is not None:
+            await second.close()
+        await first.close()
+        storage.close()
