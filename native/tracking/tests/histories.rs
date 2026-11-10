@@ -108,6 +108,7 @@ impl Log {
                 layers: self.layers.clone(),
                 head: self.head(),
                 live,
+                full_run: None,
             },
         );
     }

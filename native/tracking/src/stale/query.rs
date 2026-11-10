@@ -55,7 +55,7 @@ impl Tracking {
         if i.watch.is_none() {
             return Ok(Status::Unwatched);
         }
-        if self.stale.held(i, &e.input) {
+        if self.held(i, &e.input) {
             return Ok(Status::Held);
         }
         Ok(match i.current().filter(|k| k.x == head) {

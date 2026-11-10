@@ -31,7 +31,7 @@
 mod query;
 mod refresh;
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crate::codec::{Dec, Enc};
@@ -45,7 +45,6 @@ pub use refresh::{refresh, retry_due, Ask, Due, NoneDue, Notice};
 
 pub const TAG_WATCH: u8 = 0x40;
 pub const TAG_WITNESS: u8 = 0x41;
-pub const TAG_INCOMPLETE: u8 = 0x42;
 
 /// Past this many changed ranges an edge is probed from its first key.
 const MAX_RANGES: usize = 64;
@@ -181,25 +180,53 @@ impl Input {
     }
 }
 
-/// Staleness of every keyed edge, and the outputs in the middle of a full run.
+/// Staleness of every keyed edge.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Stale {
     pub inputs: BTreeMap<Id, Input>,
-    /// Outputs whose full run has started and not completed (rule 8).
-    pub incomplete: BTreeSet<Id>,
     /// The last generation given out.
     pub gens: u64,
 }
 
-impl Stale {
-    /// Whether the gate holds an edge reading `output`.
+impl Tracking {
+    /// Whether the gate holds an edge reading `output`: the edge keeps the
+    /// gate and `output` is in the middle of a full run (rule 8).
     pub fn held(&self, input: &Input, output: &[u8]) -> bool {
-        input.watch.as_ref().is_some_and(|w| w.gate) && self.incomplete.contains(output)
+        input.watch.as_ref().is_some_and(|w| w.gate)
+            && self
+                .outputs
+                .get(output)
+                .is_some_and(|o| o.full_run.is_some())
     }
 
-    /// Follows the other units' parts that change an edge's progress. Called
-    /// for every part, before it applies.
-    pub(crate) fn touch(&mut self, p: &Part) {
+    /// Follows the other units' parts that change an edge's progress, and
+    /// the end of a full run, which releases the edges its gate held to a
+    /// probe. Called for every part, before it applies.
+    pub(crate) fn stale_touch(&mut self, p: &Part) {
+        let ended = match p {
+            Part::OutputCommit(c) if c.ends_full_run => Some(&c.output),
+            Part::FullRunDone(d) => Some(&d.output),
+            _ => None,
+        };
+        if let Some(output) = ended {
+            for (id, e) in &self.edges {
+                if e.input != *output {
+                    continue;
+                }
+                if let Some(i) = self.stale.inputs.get_mut(id) {
+                    if i.watch.as_ref().is_some_and(|w| w.gate) {
+                        self.stale.gens += 1;
+                        i.moved(self.stale.gens, None);
+                    }
+                }
+            }
+        }
+        self.stale.touch(p);
+    }
+}
+
+impl Stale {
+    fn touch(&mut self, p: &Part) {
         match p {
             Part::EdgeOpen(o) if o.keyed => {
                 self.gens += 1;
@@ -273,10 +300,6 @@ impl Stale {
                 }
             }
         }
-        e.uv(self.incomplete.len() as u64);
-        for o in &self.incomplete {
-            e.bytes(o);
-        }
         e.uv(self.gens);
     }
 
@@ -317,9 +340,6 @@ impl Stale {
                     known,
                 },
             );
-        }
-        for _ in 0..d.count()? {
-            s.incomplete.insert(d.bytes()?.into());
         }
         s.gens = d.uv()?;
         Ok(s)
@@ -501,52 +521,5 @@ impl Witness {
             state,
         });
         i.changed = Changed::Ranges(vec![]);
-    }
-}
-
-/// An output's full run starts (`on`) or completes (rule 8): while it runs,
-/// every edge reading it that keeps the gate reads "held: upstream
-/// incomplete". When it completes, those edges are probed again.
-#[derive(Clone, Debug, PartialEq)]
-pub struct Incomplete {
-    pub output: Id,
-    pub on: bool,
-}
-
-impl Incomplete {
-    pub fn encode(&self, e: &mut Enc) {
-        e.bytes(&self.output);
-        e.u8(self.on as u8);
-    }
-
-    pub fn decode(d: &mut Dec<'_>) -> Result<Incomplete> {
-        Ok(Incomplete {
-            output: d.bytes()?.into(),
-            on: bool_of(d)?,
-        })
-    }
-
-    pub(crate) fn check(&self, _: &Tracking) -> Result<()> {
-        Ok(())
-    }
-
-    pub(crate) fn apply(self, t: &mut Tracking) {
-        if self.on {
-            t.stale.incomplete.insert(self.output);
-            return;
-        }
-        if !t.stale.incomplete.remove(&self.output) {
-            return;
-        }
-        for (id, e) in &t.edges {
-            if e.input == self.output {
-                if let Some(i) = t.stale.inputs.get_mut(id) {
-                    if i.watch.as_ref().is_some_and(|w| w.gate) {
-                        t.stale.gens += 1;
-                        i.moved(t.stale.gens, None);
-                    }
-                }
-            }
-        }
     }
 }

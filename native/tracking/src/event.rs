@@ -69,6 +69,8 @@ pub enum Part {
     Consumed(progress::Consumed),
     /// B4: a commit on an output: its layer, its head, its live count.
     OutputCommit(commit::OutputCommit),
+    /// B4: an output's full run ends without a commit of its own.
+    FullRunDone(commit::FullRunDone),
     /// B6: a batch's outcomes: an edge's counts, conditions and retry step.
     Outcomes(outcomes::Outcomes),
     /// B6: a retry pass begins.
@@ -79,8 +81,6 @@ pub enum Part {
     Watch(stale::SetWatch),
     /// B7: what a refresh or a notice found for an edge.
     Witness(stale::Witness),
-    /// B7: an output's full run starts or completes.
-    Incomplete(stale::Incomplete),
 }
 
 impl Part {
@@ -112,6 +112,7 @@ impl Part {
             Part::Batch(p) => vec![on("edge", &p.edge)],
             Part::Consumed(p) => vec![on("edge", &p.edge)],
             Part::OutputCommit(p) => vec![on("output", &p.output)],
+            Part::FullRunDone(p) => vec![on("output", &p.output)],
             Part::Outcomes(p) => {
                 let mut v = vec![on("outcomes", &p.edge)];
                 if !p.points.is_empty() {
@@ -129,7 +130,6 @@ impl Part {
             Part::Rebuild(p) => vec![on("outcomes", &p.edge)],
             Part::Watch(p) => vec![on("edge", &p.edge)],
             Part::Witness(p) => vec![on("witness", &p.edge)],
-            Part::Incomplete(p) => vec![on("incomplete", &p.output)],
         }
     }
 
@@ -142,12 +142,12 @@ impl Part {
             Part::Batch(_) => progress::TAG_BATCH,
             Part::Consumed(_) => progress::TAG_CONSUMED,
             Part::OutputCommit(_) => commit::TAG_OUTPUT_COMMIT,
+            Part::FullRunDone(_) => commit::TAG_FULL_RUN_DONE,
             Part::Outcomes(_) => outcomes::TAG_OUTCOMES,
             Part::PassStart(_) => outcomes::TAG_PASS_START,
             Part::Rebuild(_) => outcomes::TAG_REBUILD,
             Part::Watch(_) => stale::TAG_WATCH,
             Part::Witness(_) => stale::TAG_WITNESS,
-            Part::Incomplete(_) => stale::TAG_INCOMPLETE,
         }
     }
 
@@ -160,12 +160,12 @@ impl Part {
             Part::Batch(p) => p.encode(e),
             Part::Consumed(p) => p.encode(e),
             Part::OutputCommit(p) => p.encode(e),
+            Part::FullRunDone(p) => p.encode(e),
             Part::Outcomes(p) => p.encode(e),
             Part::PassStart(p) => p.encode(e),
             Part::Rebuild(p) => p.encode(e),
             Part::Watch(p) => p.encode(e),
             Part::Witness(p) => p.encode(e),
-            Part::Incomplete(p) => p.encode(e),
         }
     }
 
@@ -178,12 +178,12 @@ impl Part {
             progress::TAG_BATCH => Part::Batch(progress::BatchProgress::decode(d)?),
             progress::TAG_CONSUMED => Part::Consumed(progress::Consumed::decode(d)?),
             commit::TAG_OUTPUT_COMMIT => Part::OutputCommit(commit::OutputCommit::decode(d)?),
+            commit::TAG_FULL_RUN_DONE => Part::FullRunDone(commit::FullRunDone::decode(d)?),
             outcomes::TAG_OUTCOMES => Part::Outcomes(outcomes::Outcomes::decode(d)?),
             outcomes::TAG_PASS_START => Part::PassStart(outcomes::PassStart::decode(d)?),
             outcomes::TAG_REBUILD => Part::Rebuild(outcomes::Rebuild::decode(d)?),
             stale::TAG_WATCH => Part::Watch(stale::SetWatch::decode(d)?),
             stale::TAG_WITNESS => Part::Witness(stale::Witness::decode(d)?),
-            stale::TAG_INCOMPLETE => Part::Incomplete(stale::Incomplete::decode(d)?),
             t => return format(format!("unknown part tag {t:#04x}")),
         })
     }

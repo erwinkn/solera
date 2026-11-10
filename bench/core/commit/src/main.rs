@@ -555,6 +555,7 @@ fn chain(dir: &str) -> Vec<LayerRef> {
             first_key: top.first_key.clone(),
             last_key: top.last_key.clone(),
             flags: top.flags,
+            clears: Vec::new(),
         });
     }
     let mut out: Vec<LayerRef> = Vec::new();
@@ -587,6 +588,7 @@ fn core_commit(
         layers: layers.to_vec(),
         head: c - 1,
         live: 0,
+        full_run: None,
     };
     let path = format!("c{c}.layer");
     let spec = Spec {
@@ -595,6 +597,7 @@ fn core_commit(
         producer: b"bench",
         path: &path,
         mode: Mode::Patch,
+        ends_full_run: false,
         collect: 0,
     };
     let (t0, c0, s0) = (Instant::now(), cpu(), ix.store.stats.counts());
@@ -664,6 +667,7 @@ fn core_rewrite(env: &Env, layers: &[LayerRef], n: u64, how: &str) {
                 layers: layers.to_vec(),
                 head: layers.last().unwrap().hi,
                 live: 0,
+                full_run: None,
             },
             if how == "patch" {
                 Mode::Patch
@@ -680,6 +684,7 @@ fn core_rewrite(env: &Env, layers: &[LayerRef], n: u64, how: &str) {
         producer: b"bench",
         path: &path,
         mode,
+        ends_full_run: false,
         collect: 0,
     };
     let base = status_mb("VmRSS");

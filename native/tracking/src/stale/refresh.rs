@@ -9,6 +9,7 @@ use solera_index::{LayerRef, Query, Version};
 use crate::codec::Ver;
 use crate::error::{invalid, Result};
 use crate::event::Part;
+use crate::outcomes::{output_id, FAILURES};
 use crate::plan::{plan, Cand, Hold, Indexes, InputRequest, Mode, Request, View};
 use crate::progress::{self, owed, Class, Conditions, Holding, Key, Keyed, Progress, Value};
 use crate::stale::{Changed, Input, Reason, State, Witness};
@@ -200,7 +201,7 @@ impl Tracking {
             edge: edge.into(),
             output: e.input.clone(),
             input: input.clone(),
-            held: self.stale.held(input, &e.input),
+            held: self.held(input, &e.input),
             layers,
             head,
             progress: e.progress.clone(),
@@ -329,7 +330,10 @@ pub async fn retry_due(
 /// commit's event. Fresh, the first entry that matters makes the edge stale;
 /// stale with a witness the commit does not touch, it stays so. An edge the
 /// entries cannot decide (the commit touches its witness, or a key with a
-/// point whose state differs) is left for a refresh.
+/// point whose state differs) is left for a refresh, and so is every edge
+/// when the commit clears (its entries do not show the keys it removed) or
+/// `output` is mid full run, and an edge with failure records (B6: a
+/// record, not a point, says what a failing key holds).
 pub struct Notice {
     commit: u64,
     time_ms: u64,
@@ -369,7 +373,7 @@ impl Noticed {
 }
 
 impl Notice {
-    pub fn new(t: &Tracking, output: &[u8], commit: u64, time_ms: u64) -> Notice {
+    pub fn new(t: &Tracking, output: &[u8], commit: u64, clears: bool, time_ms: u64) -> Notice {
         let mut n = Notice {
             commit,
             time_ms,
@@ -377,7 +381,7 @@ impl Notice {
             stale: vec![],
             parts: vec![],
         };
-        if t.stale.incomplete.contains(output) {
+        if clears || t.outputs.get(output).is_some_and(|o| o.full_run.is_some()) {
             return n;
         }
         for (id, e) in &t.edges {
@@ -388,6 +392,10 @@ impl Notice {
                 continue;
             };
             if *e.input != *output || e.progress.keyed().is_none() || k.x + 1 != commit {
+                continue;
+            }
+            let failures = t.outputs.get(&output_id(FAILURES, id));
+            if failures.is_some_and(|o| o.live > 0) {
                 continue;
             }
             let noticed = Noticed {

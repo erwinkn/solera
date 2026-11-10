@@ -85,6 +85,7 @@ fn state(
             layers: layers.to_vec(),
             head,
             live: 0,
+            full_run: None,
         },
     );
     for i in 0..n {
@@ -266,7 +267,7 @@ fn main() {
                 let mut found = 0;
                 for _ in 0..reps {
                     let t0 = Instant::now();
-                    let mut n = stale::Notice::new(&t, ITEMS, head, 7);
+                    let mut n = stale::Notice::new(&t, ITEMS, head, false, 7);
                     for i in 0..entries.len() {
                         n.push(entries.key(i), entries.new_version(entries.rows(i).start));
                     }

@@ -50,6 +50,7 @@ fn put(
         producer: b"",
         path: &path,
         mode: Mode::Patch,
+        ends_full_run: false,
         collect: 0,
     };
     let b = env
@@ -80,7 +81,12 @@ fn load_as(dir: &str, name: &str) -> Output {
     let head = d.uv().unwrap();
     let live = d.uv().unwrap();
     let layers = (0..d.uv().unwrap()).map(|_| d.layer().unwrap()).collect();
-    Output { layers, head, live }
+    Output {
+        layers,
+        head,
+        live,
+        full_run: None,
+    }
 }
 
 fn failing(env: &Env, ix: &ChangeIndex, n: u64, at: u64, m: &mut Merges) -> (Output, Output) {

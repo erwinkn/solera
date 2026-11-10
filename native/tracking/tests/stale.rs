@@ -7,7 +7,7 @@ use std::sync::Arc;
 use object_store::memory::InMemory;
 use object_store::path::Path;
 use solera_index::{ChangeIndex, NewCommit, Run, Store, StoreOptions, Version, WriteOptions};
-use solera_tracking::commit::OutputCommit;
+use solera_tracking::commit::{FullRunDone, OutputCommit};
 use solera_tracking::event::{Event, Part};
 use solera_tracking::outcomes::Outcomes;
 use solera_tracking::plan::OneIndex;
@@ -16,7 +16,7 @@ use solera_tracking::progress::{
     KeyRange, Pat, Patterns, Point, Progress, Reset, Value,
 };
 use solera_tracking::stale::{
-    self, graph, Incomplete, NoneDue, Partition, Reason, SetWatch, State, Status, Watch, Witness,
+    self, graph, NoneDue, Partition, Reason, SetWatch, State, Status, Watch, Witness,
 };
 use solera_tracking::Tracking;
 
@@ -245,18 +245,22 @@ fn every_change_to_progress_or_conditions_moves_the_edge() {
 }
 
 #[test]
-fn the_gate_holds_readers_of_an_incomplete_upstream_and_releases_them_to_a_probe() {
+fn the_gate_holds_readers_of_an_upstream_mid_full_run_and_releases_them_to_a_probe() {
+    let clear = |t: &Tracking, ends_full_run| {
+        let Part::OutputCommit(mut c) = commit_part(t) else {
+            unreachable!()
+        };
+        c.layer.clears = vec![c.layer.hi];
+        c.layer.flags = solera_index::format::CLEAR;
+        c.ends_full_run = ends_full_run;
+        Part::OutputCommit(c)
+    };
+    let (rt, ix) = index();
     let mut t = opened();
     know(&mut t, 0, State::Fresh);
-    let on = |on| {
-        Part::Incomplete(Incomplete {
-            output: ITEMS.into(),
-            on,
-        })
-    };
-    apply(&mut t, vec![on(true)]);
+    let p = clear(&t, false);
+    apply(&mut t, vec![p]);
     assert_eq!(t.stale_status(EDGE).unwrap(), Status::Held);
-    let (rt, ix) = index();
     let ask = t.stale_ask(EDGE).unwrap();
     assert_eq!(
         rt.block_on(stale::Counts::default().get(&ask, &OneIndex(&ix), &NoneDue))
@@ -264,9 +268,42 @@ fn the_gate_holds_readers_of_an_incomplete_upstream_and_releases_them_to_a_probe
         None,
         "a held edge has no count (D197)"
     );
-    apply(&mut t, vec![on(false)]);
+    assert!(notice(&t, 2, &entries(&[("k", Some(2))], 2), 7).is_empty());
+    apply(
+        &mut t,
+        vec![Part::FullRunDone(FullRunDone {
+            output: ITEMS.into(),
+        })],
+    );
     assert_eq!(t.stale_status(EDGE).unwrap(), Status::Unknown);
     assert_eq!(t.stale.inputs[EDGE].changed, stale::Changed::All);
+
+    let mut t = opened();
+    know(&mut t, 0, State::Fresh);
+    let p = clear(&t, true);
+    apply(&mut t, vec![p]);
+    assert_eq!(
+        t.stale_status(EDGE).unwrap(),
+        Status::Unknown,
+        "a clear that also ends its run releases the edge to a probe"
+    );
+}
+
+#[test]
+fn a_notice_leaves_a_clear_and_an_edge_with_failure_records_for_a_refresh() {
+    let mut t = opened();
+    know(&mut t, 0, State::Fresh);
+    let e = entries(&[("k", Some(1))], 1);
+    assert_eq!(notice(&t, 1, &e, 7).len(), 1);
+    let mut n = stale::Notice::new(&t, ITEMS, 1, true, 7);
+    n.push(e.key(0), e.new_version(0));
+    assert!(
+        n.finish().is_empty(),
+        "a clear's entries do not show what it removed"
+    );
+    let failures = solera_tracking::outcomes::output_id(solera_tracking::outcomes::FAILURES, EDGE);
+    t.outputs.entry(failures).or_default().live = 1;
+    assert!(notice(&t, 1, &e, 7).is_empty());
 }
 
 #[test]
@@ -274,16 +311,7 @@ fn state_round_trips_through_events_and_snapshots() {
     let mut t = opened();
     know(&mut t, 0, stale("k1", 5));
     let b = batch(&t, range(Some("a"), Some("b")), 0, false);
-    apply(
-        &mut t,
-        vec![
-            b,
-            Part::Incomplete(Incomplete {
-                output: key("other"),
-                on: true,
-            }),
-        ],
-    );
+    apply(&mut t, vec![b]);
     let back = Tracking::restore(&t.snapshot()).unwrap();
     assert_eq!(back.stale, t.stale);
     for p in [witness(&t, 9, stale("k", 1)), watch(&Arc::default())] {
@@ -368,7 +396,7 @@ fn entries(keys: &[(&str, Option<u64>)], commit: u64) -> Run {
 
 /// The notice over `entries`, fed as the commit builder feeds it.
 fn notice(t: &Tracking, commit: u64, entries: &Run, time_ms: u64) -> Vec<Part> {
-    let mut n = stale::Notice::new(t, ITEMS, commit, time_ms);
+    let mut n = stale::Notice::new(t, ITEMS, commit, false, time_ms);
     for i in 0..entries.len() {
         n.push(entries.key(i), entries.new_version(entries.rows(i).start));
     }
@@ -386,6 +414,7 @@ fn commit_part(t: &Tracking) -> Part {
         output: ITEMS.into(),
         layer,
         live: 0,
+        ends_full_run: false,
     })
 }
 
@@ -558,6 +587,7 @@ fn up(
             output: ITEMS.into(),
             layer,
             live: (live as i64 + delta) as u64,
+            ends_full_run: false,
         })],
     );
 }

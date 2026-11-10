@@ -378,11 +378,15 @@ impl Tracking {
         live: u64,
     ) -> PyResult<()> {
         let layers = layers_in(layers)?;
-        self.state
-            .write()
-            .unwrap()
-            .outputs
-            .insert(output.into(), tr::Output { layers, head, live });
+        self.state.write().unwrap().outputs.insert(
+            output.into(),
+            tr::Output {
+                layers,
+                head,
+                live,
+                full_run: None,
+            },
+        );
         Ok(())
     }
 
@@ -633,7 +637,7 @@ impl Tracking {
     /// None if nothing changed. See
     /// `commit_py::build_commit`.
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (output, changes, *, version, path, time_ms=0, producer=Vec::new(), mode="patch", at=None, collect=0))]
+    #[pyo3(signature = (output, changes, *, version, path, time_ms=0, producer=Vec::new(), mode="patch", at=None, ends_full_run=false, collect=0))]
     fn build_commit<'py>(
         &self,
         py: Python<'py>,
@@ -645,6 +649,7 @@ impl Tracking {
         producer: Vec<u8>,
         mode: &str,
         at: Option<u64>,
+        ends_full_run: bool,
         collect: usize,
     ) -> PyResult<Option<Bound<'py, pyo3::types::PyDict>>> {
         let out = self
@@ -669,6 +674,7 @@ impl Tracking {
             &producer,
             mode,
             at,
+            ends_full_run,
             collect,
         )
     }
@@ -686,12 +692,6 @@ impl Tracking {
         gate: bool,
     ) -> PyResult<Bound<'py, PyBytes>> {
         crate::stale_py::event_watch(py, edge, conditions, own, gate)
-    }
-
-    /// B7: the event saying an output's full run started (`on`) or completed.
-    #[staticmethod]
-    fn event_incomplete(py: Python<'_>, output: Vec<u8>, on: bool) -> Bound<'_, PyBytes> {
-        crate::stale_py::event_incomplete(py, output, on)
     }
 
     /// B7: brings edges' staleness current at their upstream's head (every
@@ -776,6 +776,28 @@ impl Tracking {
         partitions: Vec<crate::stale_py::Names>,
     ) -> PyResult<Vec<(Option<bool>, bool)>> {
         guard(|| crate::stale_py::graph(&self.state, partitions))
+    }
+
+    /// B4: the clear that started `output`'s full run, while it is under way.
+    fn full_run(&self, output: &[u8]) -> Option<u64> {
+        self.state
+            .read()
+            .unwrap()
+            .outputs
+            .get(output)
+            .and_then(|o| o.full_run)
+    }
+
+    /// B4: the event that ends `output`'s full run without a commit: its last
+    /// batch changed nothing, or a person let downstream proceed.
+    #[staticmethod]
+    fn event_full_run_done<'py>(py: Python<'py>, output: Vec<u8>) -> Bound<'py, PyBytes> {
+        PyBytes::new(
+            py,
+            &one_event(Part::FullRunDone(tr::commit::FullRunDone {
+                output: output.into(),
+            })),
+        )
     }
 }
 

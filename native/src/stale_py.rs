@@ -81,14 +81,6 @@ pub(crate) fn event_watch<'py>(
     Ok(one_event(py, vec![part]).expect("one part"))
 }
 
-pub(crate) fn event_incomplete(py: Python<'_>, output: Vec<u8>, on: bool) -> Bound<'_, PyBytes> {
-    let part = Part::Incomplete(tr::stale::Incomplete {
-        output: output.into(),
-        on,
-    });
-    one_event(py, vec![part]).expect("one part")
-}
-
 fn asks(
     state: &RwLock<tr::Tracking>,
     edges: Option<Vec<Vec<u8>>>,

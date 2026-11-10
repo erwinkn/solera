@@ -434,6 +434,7 @@ pub async fn commit(
         producer: ctx.producer,
         path,
         mode: Mode::Patch,
+        ends_full_run: false,
         collect: 0,
     };
     let mut parts = Vec::new();
@@ -692,6 +693,7 @@ pub async fn catch_up(
         producer: ctx.producer,
         path,
         mode: Mode::Patch,
+        ends_full_run: false,
         collect: 0,
     };
     let mut parts = Vec::new();
