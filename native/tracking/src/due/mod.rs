@@ -92,6 +92,7 @@ pub async fn start(
         n: v.per_key.passes + 1,
         at: now,
         counters,
+        life: v.per_key.life,
     });
     if by_counters(v, &counters) {
         return Ok(Some(vec![start]));
@@ -136,8 +137,9 @@ pub async fn start(
         collect: 0,
     };
     let pid = output_id(PASS, &v.edge);
-    let built = build(ixs, &pid, pass_list, spec, &mut Source(Some(&ch))).await?;
-    let built = built.expect("a fresh list of keys");
+    let Some(built) = build(ixs, &pid, pass_list, spec, &mut Source(Some(&ch))).await? else {
+        return invalid("the pass list is not the view's: take both from one retry view");
+    };
     Ok(Some(vec![Part::OutputCommit(built.part), start]))
 }
 

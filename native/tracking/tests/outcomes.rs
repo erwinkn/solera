@@ -32,7 +32,7 @@ use solera_tracking::outcomes::transition::{
 use solera_tracking::outcomes::{cond_id, output_id, Rebuild, FAILURES};
 use solera_tracking::plan::{self, InputRequest, Mode, NoHold, OneIndex, Request};
 use solera_tracking::progress::{
-    owed, Class, Conditions, EdgeOpen, Holding, InputReport, Key, Pat, Patterns, Reset, Value,
+    owed, Class, Conditions, EdgeOpen, Holding, InputReport, Key, Ops, Pat, Patterns, Reset, Value,
 };
 use solera_tracking::{Output, Tracking};
 
@@ -113,6 +113,28 @@ struct Fail {
     at: u64,
 }
 
+enum Deferred {
+    CatchUp(Vec<Part>),
+    Commit(Built),
+}
+
+/// A batch's commit, built and not yet applied.
+struct Built {
+    plan: plan::Plan,
+    parts: Vec<Part>,
+    ops: Ops,
+    failed: Vec<(Key, Reported)>,
+    loaded: Vec<(Key, Ver)>,
+    counters: Counters,
+    clock: f64,
+}
+
+fn trace(m: &str) {
+    if std::env::var("OUTCOME_TRACE").is_ok() {
+        eprintln!("  {m}");
+    }
+}
+
 struct World {
     rng: SmallRng,
     t: Tracking,
@@ -133,6 +155,8 @@ struct World {
     fail_all: bool,
     /// The input may commit while a change batch's outcomes are built.
     races: bool,
+    /// Parts built and not yet applied: catch-ups and batch commits.
+    deferred: Vec<Deferred>,
 }
 
 fn patterns(rng: &mut SmallRng) -> Patterns {
@@ -366,21 +390,7 @@ impl World {
     /// The worker runs a plan's keys and the engine commits them; the truth follows.
     /// None when the commit is refused: the state moved since the plan.
     async fn run(&mut self, ix: &ChangeIndex, p: &plan::Plan, retry: bool) -> Option<Vec<Key>> {
-        let ip = &p.inputs[0];
-        let mut failed: Vec<(Key, Reported)> = vec![];
-        let mut loaded: Vec<(Key, Ver)> = vec![];
-        for c in &ip.keys {
-            if c.class != Class::Removed && (self.fail_all || self.rng.random_bool(0.35)) {
-                let r = self.report();
-                failed.push((c.key.clone(), r));
-            }
-            if self.rng.random_bool(0.15) {
-                let v = self.log.at(self.log.head(), &c.key);
-                if v != c.version && !v.is_absent() && !c.version.is_absent() {
-                    loaded.push((c.key.clone(), v));
-                }
-            }
-        }
+        let (failed, loaded) = self.work(p);
         let report = InputReport {
             failed: failed.iter().map(|(k, _)| k.clone()).collect(),
             loaded: loaded.clone(),
@@ -400,39 +410,111 @@ impl World {
         // The engine builds the outcomes from a view, then applies them under
         // its lock: the input may commit in between, and a refused commit is
         // built again.
-        let ops = loop {
-            let mut ops = planned.clone();
-            let v = self.t.outcome_view(EDGE.as_bytes()).unwrap();
-            let (f, d) = self.ctx();
-            let ctx = Ctx {
-                now: self.clock,
-                counters: self.counters,
-                retries: 2,
-                time_ms: 0,
-                producer: b"",
-                failures_path: &f,
-                due_path: &d,
-            };
-            let mut parts = oc::commit(&OneIndex(ix), &v, p, 0, &failed, &loaded, &ctx, &mut ops)
-                .await
-                .ok()?;
+        loop {
+            let b = self
+                .build(ix, p, &planned, &failed, &loaded, counters)
+                .await?;
             let race = self.races && self.rng.random_bool(0.1);
             if race {
-                if std::env::var("OUTCOME_TRACE").is_ok() {
-                    eprintln!("  the input commits while the outcomes are built");
-                }
+                trace("the input commits while the outcomes are built");
                 for _ in 0..self.rng.random_range(1..=2) {
                     self.upstream(ix).await;
                 }
             }
-            let mut all = ops.parts.clone();
-            all.append(&mut parts);
-            match self.t.apply(&Event::of(all).encode()) {
-                Ok(()) => break ops,
-                Err(_) if race => continue,
-                Err(_) => return None,
+            match self.land(b) {
+                Some(keys) => return Some(keys),
+                None if race => continue,
+                None => return None,
             }
+        }
+    }
+
+    /// What the worker reports for a plan's keys: those that failed, and
+    /// those it loaded at another version.
+    fn work(&mut self, p: &plan::Plan) -> (Vec<(Key, Reported)>, Vec<(Key, Ver)>) {
+        let ip = &p.inputs[0];
+        let mut failed: Vec<(Key, Reported)> = vec![];
+        let mut loaded: Vec<(Key, Ver)> = vec![];
+        for c in &ip.keys {
+            if c.class != Class::Removed && (self.fail_all || self.rng.random_bool(0.35)) {
+                let r = self.report();
+                failed.push((c.key.clone(), r));
+            }
+            if self.rng.random_bool(0.15) {
+                let v = self.log.at(self.log.head(), &c.key);
+                if v != c.version && !v.is_absent() && !c.version.is_absent() {
+                    loaded.push((c.key.clone(), v));
+                }
+            }
+        }
+        (failed, loaded)
+    }
+
+    /// The engine catches up, then builds a batch's commit from a view.
+    async fn build(
+        &mut self,
+        ix: &ChangeIndex,
+        p: &plan::Plan,
+        planned: &Ops,
+        failed: &[(Key, Reported)],
+        loaded: &[(Key, Ver)],
+        counters: Counters,
+    ) -> Option<Built> {
+        self.catch_up(ix).await;
+        let mut ops = planned.clone();
+        let v = self.t.outcome_view(EDGE.as_bytes()).unwrap();
+        let (f, d) = self.ctx();
+        let ctx = Ctx {
+            now: self.clock,
+            counters: self.counters,
+            retries: 2,
+            time_ms: 0,
+            producer: b"",
+            failures_path: &f,
+            due_path: &d,
         };
+        let parts = oc::commit(
+            &OneIndex(ix),
+            &v,
+            p,
+            0,
+            failed,
+            loaded,
+            &self.now,
+            &ctx,
+            &mut ops,
+        )
+        .await
+        .inspect_err(|e| trace(&format!("the commit is refused: {e}")))
+        .ok()?;
+        Some(Built {
+            plan: p.clone(),
+            parts,
+            ops,
+            failed: failed.to_vec(),
+            loaded: loaded.to_vec(),
+            counters,
+            clock: self.clock,
+        })
+    }
+
+    /// A built commit applies, or is refused; the truth follows it.
+    fn land(&mut self, b: Built) -> Option<Vec<Key>> {
+        let Built {
+            plan: p,
+            mut parts,
+            ops,
+            failed,
+            loaded,
+            counters,
+            clock,
+        } = b;
+        let mut all = ops.parts.clone();
+        all.append(&mut parts);
+        if let Err(e) = self.t.apply(&Event::of(all).encode()) {
+            trace(&format!("the event is refused: {e}"));
+            return None;
+        }
         self.events += 1;
         for part in &ops.parts {
             if let Part::Batch(b) = part {
@@ -446,6 +528,7 @@ impl World {
             self.lineage(&ops.records[0]);
         }
         // The truth.
+        let ip = &p.inputs[0];
         let cid = cond_id(&ip.conditions);
         let fails: BTreeMap<Key, Reported> = failed.into_iter().collect();
         let loaded: BTreeMap<Key, Ver> = loaded.into_iter().collect();
@@ -461,7 +544,7 @@ impl World {
                     prior.map(|f| &f.stored),
                     fresh,
                     r,
-                    self.clock,
+                    clock,
                     counters.deploy,
                     counters.forced_at(),
                     2,
@@ -489,9 +572,93 @@ impl World {
         Some(ip.keys.iter().map(|c| c.key.clone()).collect())
     }
 
+    /// The engine builds a catch-up or a batch's commit, and applies it only
+    /// later, after other events: refused, or the truth follows it.
+    async fn defer(&mut self, ix: &ChangeIndex) {
+        if self.rng.random_bool(0.4) {
+            let v = self.t.outcome_view(EDGE.as_bytes()).unwrap();
+            let (f, d) = self.ctx();
+            let ctx = Ctx {
+                now: self.clock,
+                counters: self.counters,
+                retries: 2,
+                time_ms: 0,
+                producer: b"",
+                failures_path: &f,
+                due_path: &d,
+            };
+            if let Some(parts) = oc::catch_up(&OneIndex(ix), &v, &self.now, &ctx)
+                .await
+                .unwrap()
+            {
+                self.deferred.push(Deferred::CatchUp(parts));
+            }
+            return;
+        }
+        let mode = match self.rng.random_range(0..3) {
+            0 => Mode::All,
+            1 => Mode::Keys(
+                self.universe
+                    .iter()
+                    .filter(|_| self.rng.random_bool(0.4))
+                    .cloned()
+                    .collect(),
+            ),
+            _ => Mode::Incremental,
+        };
+        let limit = self.rng.random_range(1..4);
+        let req = self.request(None, limit, mode);
+        let view = self.t.view(&req).unwrap();
+        let p = plan::plan(&view, &req, &OneIndex(ix), &NoHold)
+            .await
+            .unwrap();
+        let (failed, loaded) = self.work(&p);
+        let report = InputReport {
+            failed: failed.iter().map(|(k, _)| k.clone()).collect(),
+            loaded: loaded.clone(),
+        };
+        let Ok(planned) = self.t.progress_ops(&p, &[report], b"", None) else {
+            return;
+        };
+        let counters = self.counters;
+        if let Some(b) = self
+            .build(ix, &p, &planned, &failed, &loaded, counters)
+            .await
+        {
+            self.deferred.push(Deferred::Commit(b));
+        }
+    }
+
+    fn land_deferred(&mut self) {
+        if self.deferred.is_empty() {
+            return;
+        }
+        let i = self.rng.random_range(0..self.deferred.len());
+        match self.deferred.remove(i) {
+            Deferred::CatchUp(parts) => match self.t.apply(&Event::of(parts).encode()) {
+                Ok(()) => {
+                    trace("a deferred catch-up applies");
+                    self.events += 1;
+                }
+                Err(e) => trace(&format!("a deferred catch-up is refused: {e}")),
+            },
+            Deferred::Commit(b) => {
+                if self.land(b).is_some() {
+                    trace("a deferred commit applies");
+                    self.stats[5] += 1;
+                }
+            }
+        }
+    }
+
     async fn change_batch(&mut self, ix: &ChangeIndex, upstream_meanwhile: bool) {
         let limit = self.rng.random_range(1..4);
-        let req = self.request(self.cursor.clone(), limit, Mode::Incremental);
+        let mode = if self.rng.random_bool(0.1) {
+            Mode::All
+        } else {
+            Mode::Incremental
+        };
+        let req = self.request(self.cursor.clone(), limit, mode);
         let view = self.t.view(&req).unwrap();
         let p = plan::plan(&view, &req, &OneIndex(ix), &NoHold)
             .await
@@ -500,9 +667,15 @@ impl World {
             self.upstream(ix).await;
         }
         self.stats[0] += 1;
-        self.run(ix, &p, false)
-            .await
-            .expect("a batch planned now commits");
+        // A batch whose input moved on commits only after the catch-up, and
+        // is planned again if the catch-up changed its range.
+        if self.run(ix, &p, false).await.is_none() {
+            assert!(
+                self.log.head() > p.inputs[0].head,
+                "a batch planned now commits"
+            );
+            return;
+        }
         self.cursor = p.range.hi.clone();
     }
 
@@ -767,6 +940,7 @@ fn world(seed: u64) -> World {
     let mut w = World {
         fail_all: false,
         races: false,
+        deferred: vec![],
         rng,
         t: Tracking::new(),
         log: Log {
@@ -800,7 +974,7 @@ async fn history(seed: u64, ix: &ChangeIndex) -> [usize; 6] {
     let mut w = world(seed);
     let trace = std::env::var("OUTCOME_TRACE").is_ok();
     for step in 0..60 {
-        let op = w.rng.random_range(0..25);
+        let op = w.rng.random_range(0..27);
         if trace {
             eprintln!(
                 "step {step} op {op} head {} now {:?} clock {} counters {:?}",
@@ -820,6 +994,7 @@ async fn history(seed: u64, ix: &ChangeIndex) -> [usize; 6] {
             }
             10 => w.key_list(ix).await,
             11 => {
+                w.catch_up(ix).await;
                 w.now = Arc::new(Conditions {
                     definition: format!("d{}", w.rng.random_range(1..3)).into_bytes().into(),
                     ..(*w.now).clone()
@@ -828,6 +1003,7 @@ async fn history(seed: u64, ix: &ChangeIndex) -> [usize; 6] {
                 w.reverted();
             }
             12 => {
+                w.catch_up(ix).await;
                 let to = w.t.rebuild(EDGE.as_bytes()) + 1;
                 w.apply(vec![Part::Rebuild(Rebuild {
                     edge: key(EDGE),
@@ -841,6 +1017,7 @@ async fn history(seed: u64, ix: &ChangeIndex) -> [usize; 6] {
                 w.reverted();
             }
             13 => {
+                w.catch_up(ix).await;
                 let p = patterns(&mut w.rng);
                 w.now = Arc::new(Conditions {
                     patterns: p,
@@ -857,6 +1034,8 @@ async fn history(seed: u64, ix: &ChangeIndex) -> [usize; 6] {
             18 | 20..=22 => w.pass(ix).await,
             23 => w.hold(ix).await,
             24 => w.late(ix).await,
+            25 => w.defer(ix).await,
+            26 => w.land_deferred(),
             19 => {
                 if w.rng.random_bool(0.3) {
                     w.apply(vec![Part::Reset(Reset {
@@ -1007,7 +1186,9 @@ fn a_retry_batch_belongs_to_its_pass() {
             }
         }
         let start = |w: &mut World| {
-            w.counters.forced[2] = w.events + 1;
+            for f in &mut w.counters.forced[1..] {
+                *f = w.events + 1;
+            }
             w.files += 1;
             (w.t.outcome_view(EDGE.as_bytes()).unwrap(), w.files)
         };
@@ -1059,7 +1240,9 @@ fn a_retry_batch_belongs_to_its_pass() {
         };
         let got = match ops {
             Err(e) => panic!("progress refused it first: {e:?}"),
-            Ok(mut ops) => oc::commit(&OneIndex(&ix), &v, &p, 0, &[], &[], &ctx, &mut ops).await,
+            Ok(mut ops) => {
+                oc::commit(&OneIndex(&ix), &v, &p, 0, &[], &[], &w.now, &ctx, &mut ops).await
+            }
         };
         let err = got.expect_err("an old pass's batch is refused");
         assert!(format!("{err:?}").contains("pass that ended"), "{err:?}");

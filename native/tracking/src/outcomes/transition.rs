@@ -230,6 +230,16 @@ impl Counters {
     pub fn forced_at(&self) -> u64 {
         self.forced.iter().copied().max().unwrap_or(0)
     }
+
+    /// Each counter's least of the two.
+    pub fn least(&self, o: &Counters) -> Counters {
+        let mut c = *self;
+        c.deploy = c.deploy.min(o.deploy);
+        for (f, g) in c.forced.iter_mut().zip(o.forced) {
+            *f = (*f).min(g);
+        }
+        c
+    }
 }
 
 /// Whether a retry takes `s`'s key at `now` (§9). Each clause retires

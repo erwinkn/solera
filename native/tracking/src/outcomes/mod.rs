@@ -195,6 +195,9 @@ pub struct Pass {
     pub at: u64,
     pub counters: Counters,
     pub after: Option<Key>,
+    /// The least counters a record written since the pass began carries,
+    /// by class: what the edge's last pass covers when this one ends.
+    pub low: Counters,
 }
 
 /// One per-key edge's state beside its progress.
@@ -220,7 +223,15 @@ pub struct PerKey {
     pub cond: u64,
     pub passes: u64,
     pub pass: Option<Pass>,
-    /// The counters the last completed pass ran under.
+    /// Raised each time the edge's records start over (a reset, a close):
+    /// every part B6 builds names the life it was built in and applies only
+    /// in it, since heads and counts start over too. A closed edge keeps its
+    /// life, so that a part built before applies to no edge opened later
+    /// under its name.
+    pub life: u64,
+    /// The counters the last pass covers: those it ran under, lowered to
+    /// the least a record written since carries (§9's deploy_min), so a
+    /// record a deploy or forced request has not retried yet starts a pass.
     pub last: Counters,
 }
 
@@ -231,6 +242,7 @@ impl PerKey {
             passes: self.passes,
             seen: self.seen,
             cond: self.cond,
+            life: self.life + 1,
             ..PerKey::default()
         };
     }
@@ -257,9 +269,11 @@ impl PerKey {
                 e.uv(p.at);
                 counters(e, &p.counters);
                 opt_key(e, &p.after);
+                counters(e, &p.low);
             }
         }
         counters(e, &self.last);
+        e.uv(self.life);
     }
 
     pub(crate) fn decode(d: &mut Dec<'_>) -> Result<PerKey> {
@@ -286,6 +300,7 @@ impl PerKey {
                 at: d.uv()?,
                 counters: read_counters(d)?,
                 after: read_opt_key(d)?,
+                low: read_counters(d)?,
             }),
             t => return format(format!("pass tag {t}")),
         };
@@ -300,6 +315,7 @@ impl PerKey {
             passes,
             pass,
             last: read_counters(d)?,
+            life: d.uv()?,
         })
     }
 }
@@ -360,6 +376,14 @@ pub struct Step {
     pub to: Option<Key>,
 }
 
+/// Where reverts were looked for (KEY-3): the input's commit through which,
+/// and the conditions (their id) under which.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Look {
+    pub seen: u64,
+    pub cond: u64,
+}
+
 /// What a batch commit changes of an edge's records, beside the commits of
 /// its record and clock outputs: the counts after it, the conditions it
 /// adds and the references it moves, and a retry batch's step.
@@ -375,12 +399,15 @@ pub struct Outcomes {
     /// The failure output's head the counts were computed at: the part
     /// applies only there (the output's own commit, if any, moves it on).
     pub at: u64,
-    /// Where reverts are looked for from now on: lowered to the batch's
-    /// head, so that its new records are looked after from where they were
-    /// tried.
-    pub seen: u64,
-    /// The conditions the batch ran, or the catch-up looked, under.
-    pub cond: u64,
+    /// Where reverts were looked for when the part was built, and where they
+    /// are looked for once it applies: the part applies only from there, so
+    /// that a revert is never looked for again under other conditions. Set
+    /// by a catch-up, and by a batch in which a key failed.
+    pub look: Option<(Look, Look)>,
+    /// The least counters a record it writes carries, by class.
+    pub low: Option<Counters>,
+    /// The edge's outcome life it was built in.
+    pub life: u64,
     /// The input's head the batch's failures were made at (their records'
     /// `made`) and checked for moot at: the part applies only while the
     /// input is still there, since reverts are looked for after it. None
@@ -417,8 +444,24 @@ impl Outcomes {
             }
         }
         e.uv(self.at);
-        e.uv(self.seen);
-        e.uv(self.cond);
+        match &self.look {
+            None => e.u8(0),
+            Some((from, to)) => {
+                e.u8(1);
+                for l in [from, to] {
+                    e.uv(l.seen);
+                    e.uv(l.cond);
+                }
+            }
+        }
+        match &self.low {
+            None => e.u8(0),
+            Some(c) => {
+                e.u8(1);
+                counters(e, c);
+            }
+        }
+        e.uv(self.life);
         e.uv(self.made.map_or(0, |m| m + 1));
         let mut t = crate::progress::CondTable::default();
         let mut body = Enc::new();
@@ -450,8 +493,23 @@ impl Outcomes {
             t => return format(format!("step tag {t}")),
         };
         let at = d.uv()?;
-        let seen = d.uv()?;
-        let cond = d.uv()?;
+        let look = |d: &mut Dec<'_>| -> Result<Look> {
+            Ok(Look {
+                seen: d.uv()?,
+                cond: d.uv()?,
+            })
+        };
+        let look = match d.u8()? {
+            0 => None,
+            1 => Some((look(d)?, look(d)?)),
+            t => return format(format!("look tag {t}")),
+        };
+        let low = match d.u8()? {
+            0 => None,
+            1 => Some(read_counters(d)?),
+            t => return format(format!("counters tag {t}")),
+        };
+        let life = d.uv()?;
         let made = d.uv()?.checked_sub(1);
         let table = crate::progress::CondTable::decode(d)?;
         let points = crate::progress::decode_points(d, &table)?;
@@ -463,8 +521,9 @@ impl Outcomes {
             refs,
             step,
             at,
-            seen,
-            cond,
+            look,
+            low,
+            life,
             made,
             points,
         })
@@ -472,12 +531,27 @@ impl Outcomes {
 
     pub(crate) fn check(&self, t: &Tracking) -> Result<()> {
         keyed(t, &self.edge)?;
+        if self.life != t.per_key.get(&self.edge).map_or(0, |k| k.life) {
+            return invalid(
+                "the edge's records started over since the batch's outcomes were built",
+            );
+        }
         let head = t
             .outputs
             .get(&output_id(FAILURES, &self.edge))
             .map_or(0, |o| o.head);
         if head != self.at {
             return invalid("the edge's records moved since the batch's outcomes were built");
+        }
+        if let Some((from, _)) = &self.look {
+            let k = t.per_key.get(&self.edge);
+            let now = k.map_or(Look::default(), |k| Look {
+                seen: k.seen,
+                cond: k.cond,
+            });
+            if now != *from {
+                return invalid("the edge's reverts were looked for since the part was built");
+            }
         }
         if let Some(made) = self.made {
             let input = &t.edges.get(&self.edge).expect("keyed").input;
@@ -507,8 +581,17 @@ impl Outcomes {
             }
         }
         let k = t.per_key.entry(self.edge).or_default();
-        k.seen = self.seen;
-        k.cond = self.cond;
+        if let Some((_, to)) = self.look {
+            k.seen = to.seen;
+            k.cond = to.cond;
+        }
+        if let Some(low) = self.low {
+            let last = match &mut k.pass {
+                Some(p) => &mut p.low,
+                None => &mut k.last,
+            };
+            *last = last.least(&low);
+        }
         k.counts = self.counts;
         k.classes = self.classes;
         let conds = Arc::make_mut(&mut k.conds);
@@ -528,7 +611,7 @@ impl Outcomes {
             match s.to {
                 Some(to) => p.after = Some(to),
                 None => {
-                    k.last = p.counters;
+                    k.last = p.low;
                     k.pass = None;
                     t.outputs.remove(&list);
                 }
@@ -545,6 +628,8 @@ pub struct PassStart {
     pub n: u64,
     pub at: u64,
     pub counters: Counters,
+    /// The edge's outcome life it was built in.
+    pub life: u64,
 }
 
 impl PassStart {
@@ -553,6 +638,7 @@ impl PassStart {
         e.uv(self.n);
         e.uv(self.at);
         counters(e, &self.counters);
+        e.uv(self.life);
     }
 
     pub fn decode(d: &mut Dec<'_>) -> Result<PassStart> {
@@ -561,6 +647,7 @@ impl PassStart {
             n: d.uv()?,
             at: d.uv()?,
             counters: read_counters(d)?,
+            life: d.uv()?,
         })
     }
 
@@ -573,6 +660,9 @@ impl PassStart {
         if self.n != k.map_or(0, |k| k.passes) + 1 {
             return invalid("a retry pass out of turn");
         }
+        if self.life != k.map_or(0, |k| k.life) {
+            return invalid("the edge's records started over since the pass was found due");
+        }
         Ok(())
     }
 
@@ -584,6 +674,7 @@ impl PassStart {
             at: self.at,
             counters: self.counters,
             after: None,
+            low: self.counters,
         });
     }
 }
@@ -654,7 +745,12 @@ pub(crate) fn follow(p: &Part, t: &mut Tracking) {
         }
         Part::EdgeClose(c) => {
             t.drop_records(&c.edge);
-            t.per_key.remove(&c.edge);
+            if let Some(k) = t.per_key.get_mut(&c.edge) {
+                *k = PerKey {
+                    life: k.life + 1,
+                    ..PerKey::default()
+                };
+            }
         }
         Part::EdgeRename(r) if r.from != r.to => {
             for kind in [FAILURES, DUE, PASS] {
@@ -662,7 +758,10 @@ pub(crate) fn follow(p: &Part, t: &mut Tracking) {
                     t.outputs.insert(output_id(kind, &r.to), o);
                 }
             }
-            if let Some(k) = t.per_key.remove(&r.from) {
+            if let Some(mut k) = t.per_key.remove(&r.from) {
+                if let Some(closed) = t.per_key.get(&r.to) {
+                    k.life = k.life.max(closed.life);
+                }
                 t.per_key.insert(r.to.clone(), k);
             }
         }
@@ -724,6 +823,7 @@ mod tests {
             n: 1,
             at: 0,
             counters: Counters::default(),
+            life: 0,
         };
         apply(&mut t, vec![Part::PassStart(start)]).unwrap();
         let done = Part::Outcomes(Outcomes {
@@ -738,8 +838,9 @@ mod tests {
                 to: None,
             }),
             at: 0,
-            seen: 0,
-            cond: 0,
+            look: None,
+            low: None,
+            life: 0,
             made: None,
             points: vec![],
         });

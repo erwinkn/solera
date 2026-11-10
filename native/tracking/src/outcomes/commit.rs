@@ -18,7 +18,8 @@ use crate::state::{Id, Output, Tracking};
 
 use super::transition::{transition, Counters, Reported};
 use super::{
-    cond_id, output_id, record_digest, Conds, Held, Outcomes, PerKey, Record, Step, DUE, FAILURES,
+    cond_id, output_id, record_digest, Conds, Held, Look, Outcomes, PerKey, Record, Step, DUE,
+    FAILURES,
 };
 
 /// What committing reads of the state, taken under the caller's lock.
@@ -157,6 +158,7 @@ pub async fn commit(
     input: usize,
     reported: &[(Key, Reported)],
     loaded: &[(Key, Ver)],
+    now: &Arc<crate::progress::Conditions>,
     ctx: &Ctx<'_>,
     ops: &mut Ops,
 ) -> Result<Vec<Part>> {
@@ -171,6 +173,18 @@ pub async fn commit(
     }
     if reported.windows(2).any(|w| w[0].0 >= w[1].0) {
         return invalid("reported keys are sorted and distinct");
+    }
+    let cond_now = cond_id(now);
+    let caught_up = Look {
+        seen: v.upstream.head,
+        cond: cond_now,
+    };
+    let looked = Look {
+        seen: v.per_key.seen,
+        cond: v.per_key.cond,
+    };
+    if v.failures.live > 0 && looked != caught_up {
+        return invalid("catch up first: the edge's reverts are not looked for through the input's head under the conditions now");
     }
     let keyed = v.progress.keyed().expect("a per-key edge is keyed");
     let retry = plan.pass.is_some();
@@ -279,16 +293,18 @@ pub async fn commit(
         }
     }
     // New failures are made, and checked for moot, at the view's head of the
-    // input; the commit applies only while the input is still there.
+    // input and under the conditions now; the commit applies only while the
+    // input is still there and reverts were looked for nowhere else.
     let made = next
         .values()
         .any(Option::is_some)
         .then_some(v.upstream.head);
     let mut points = Vec::new();
-    // A new failure is checked against the input's head when it commits, as
-    // the model does: one whose input already returned to what the consumer
-    // holds is moot, and the consumer keeps what it held as a point.
-    if v.upstream.head > p.head {
+    // A new failure is checked against the input's head under the conditions
+    // now, as the model does at commit: one whose input already returned to
+    // what the consumer holds is moot, and the consumer keeps what it held as
+    // a point.
+    if v.upstream.head > p.head || cond_now != on_cond {
         let fresh: Vec<Key> = next
             .iter()
             .filter(|(_, r)| r.is_some())
@@ -317,7 +333,7 @@ pub async fn commit(
         for (k, ver) in fresh.into_iter().zip(at_head) {
             let rec = next[&k].as_ref().expect("a new record");
             let held = rec.held.holding(&conds)?;
-            if owed(&held, &Holding::of(ver.as_version(), &p.conditions, &k)) {
+            if owed(&held, &Holding::of(ver.as_version(), now, &k)) {
                 continue;
             }
             points.push((k.clone(), moot_point(rec, &conds)?));
@@ -437,6 +453,16 @@ pub async fn commit(
     }
     let refs_moved = moved(&before, &refs);
     let referenced = |id: &u64| refs.get(id).is_some_and(|n| *n > 0);
+    // A failing key tried at another version than planned keeps its point
+    // even where it holds what the piece says, which is not what it was
+    // tried on: a retry's point is needless only where the piece says that.
+    for (k, rec) in &next {
+        if let Some(rec) = rec {
+            if loaded.binary_search_by(|(x, _)| x.cmp(k)).is_ok() {
+                points.push((k.clone(), moot_point(rec, &conds)?));
+            }
+        }
+    }
     points.sort_by(|a, b| a.0.cmp(&b.0));
     points.dedup_by(|a, b| a.0 == b.0);
     parts.push(Part::Outcomes(Outcomes {
@@ -447,18 +473,22 @@ pub async fn commit(
         refs: refs_moved,
         step,
         at: v.failures.head,
-        seen: if v.failures.live == 0 {
-            v.upstream.head
-        } else {
-            v.per_key.seen
-        },
-        // Records written under other conditions than the catch-up last
-        // looked under: the next catch-up looks at all of them.
-        cond: if v.failures.live == 0 || on_cond == v.per_key.cond {
-            on_cond
-        } else {
-            0
-        },
+        look: made.map(|_| (looked, caught_up)),
+        life: v.per_key.life,
+        low: next
+            .values()
+            .flatten()
+            .fold(None, |low: Option<Counters>, r| {
+                let mut c = Counters {
+                    deploy: u64::MAX,
+                    forced: [u64::MAX; 6],
+                };
+                if r.stored.outcome == super::transition::FAILED {
+                    c.deploy = r.stored.deploy;
+                }
+                c.forced[r.stored.outcome as usize] = r.stored.forced;
+                Some(low.map_or(c, |l| l.least(&c)))
+            }),
         made,
         points: vec![],
     }));
@@ -686,8 +716,15 @@ pub async fn catch_up(
         refs: moved(&before, &refs),
         step: None,
         at: v.failures.head,
-        seen: head,
-        cond,
+        look: Some((
+            Look {
+                seen,
+                cond: v.per_key.cond,
+            },
+            Look { seen: head, cond },
+        )),
+        low: None,
+        life: v.per_key.life,
         made: None,
         points,
     }));

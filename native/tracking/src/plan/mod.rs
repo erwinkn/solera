@@ -838,8 +838,9 @@ pub async fn plan(view: &View, req: &Request, ixs: &dyn Indexes, hold: &dyn Hold
             p.waiting.retain(|k| k <= hi);
         }
         p.expect = read_digest(v.progress.keyed().expect("a keyed view"), req.reset, &range);
-        p.records = p
-            .touched()
+        let touched: std::collections::BTreeSet<&Key> = p.touched().collect();
+        p.records = touched
+            .into_iter()
             .filter_map(|k| read.get(k))
             .fold(0, |a, h| a.wrapping_add(*h));
     }
