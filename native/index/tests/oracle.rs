@@ -4,6 +4,7 @@
 
 use object_store::memory::InMemory;
 use object_store::path::Path;
+use object_store::ObjectStoreExt;
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
 use solera_index::*;
@@ -46,7 +47,7 @@ struct History {
 
 impl History {
     fn gen(rng: &mut SmallRng) -> History {
-        let dirs = ["a", "a/b", "ab", "b", "é", "z/z/z", "a/b/c"];
+        let dirs = ["a", "a/b", "ab", "b", "é", "z/z/z", "a/b/c", "€😀"];
         let mut keys: Vec<Vec<u8>> = (0..rng.random_range(1..80))
             .map(|_| {
                 let mut k = dirs[rng.random_range(0..dirs.len())].to_string();
@@ -174,7 +175,7 @@ impl Q {
         let (mut inc, mut exc) = (Vec::new(), Vec::new());
         if rng.random_bool(0.4) {
             let pieces = [
-                "a", "b", "/", "*", "**", "**/", "?", "é", "a/b", "ab", "0", "z",
+                "a", "b", "/", "*", "**", "**/", "?", "é", "a/b", "ab", "0", "z", "€", "😀",
             ];
             let glob = |rng: &mut SmallRng| -> String {
                 (0..rng.random_range(1..5))
@@ -190,7 +191,7 @@ impl Q {
             }
             inc = gi.iter().map(|g| glob_regex(g)).collect();
             exc = ge.iter().map(|g| glob_regex(g)).collect();
-            q.pattern = Some(Pattern::new(&gi, &ge));
+            q.pattern = Some(Pattern::new(&gi, &ge).unwrap());
         }
         Q { q, inc, exc }
     }
@@ -613,6 +614,136 @@ fn the_disk_cache_serves_reads_after_a_write_and_after_a_restart() {
     });
     let _ = std::fs::remove_dir_all(dir);
     let _ = std::fs::remove_dir_all(fresh_dir);
+}
+
+#[test]
+fn bad_references_and_abandoned_reads_leave_the_index_working() {
+    let rt = runtime();
+    let mem = Arc::new(InMemory::new());
+    let index = |prefix: &str, disk: Option<std::path::PathBuf>| {
+        let opts = StoreOptions {
+            max_inflight: 1,
+            disk: disk.map(|dir| DiskOptions {
+                dir,
+                bytes: 1 << 30,
+            }),
+            ..Default::default()
+        };
+        let store = Store::new(mem.clone(), Path::from(prefix), rt.handle().clone(), opts).unwrap();
+        ChangeIndex::new(store, WriteOptions::default())
+    };
+    let nc = |c| NewCommit {
+        commit: c,
+        time_ms: 0,
+        producer: b"",
+        live_before: 0,
+    };
+    let one = |v: u64| {
+        let mut run = Run::new();
+        run.push_key(b"k");
+        run.push_entry(1, Version::Int(v), Version::Absent);
+        run
+    };
+    let dir = scratch("refs");
+    std::fs::create_dir_all(&dir).unwrap();
+    rt.block_on(async {
+        let ix = index("t", None);
+        let l1 = ix.write_commit("c1", nc(1), &one(1)).await.unwrap();
+        let l2 = ix.write_commit("c2", nc(2), &Run::new()).await.unwrap();
+        let q = Query::default();
+        // a flag this reader does not know is refused, even on a layer no read opens
+        let flagged = LayerRef {
+            flags: 1,
+            ..l2.clone()
+        };
+        assert!(matches!(
+            ix.scan(&[l1.clone(), flagged], 2, &q).await,
+            Err(Error::Format(_))
+        ));
+        // offsets out of order are refused before any read, and the index still reads
+        let bad = LayerRef {
+            top_start: l1.size + 1,
+            ..l1.clone()
+        };
+        assert!(matches!(
+            ix.scan(&[bad], 1, &q).await,
+            Err(Error::Invalid(_))
+        ));
+        let bad = LayerRef {
+            index_start: l1.top_start + 1,
+            ..l1.clone()
+        };
+        assert!(matches!(
+            ix.scan(&[bad], 1, &q).await,
+            Err(Error::Invalid(_))
+        ));
+        assert_eq!(ix.scan(&[l1.clone()], 1, &q).await.unwrap().run.len(), 1);
+        // a reference that does not match its file is refused with the top level cached too
+        let wrong = LayerRef {
+            entries: 5,
+            ..l1.clone()
+        };
+        assert!(matches!(
+            ix.scan(&[wrong], 1, &q).await,
+            Err(Error::Format(_))
+        ));
+        // a read dropped mid-GET gives its GET slot back: another layer's read
+        // still runs with one slot
+        let slow = Arc::new(object_store::throttle::ThrottledStore::new(
+            InMemory::new(),
+            object_store::throttle::ThrottleConfig {
+                wait_get_per_call: std::time::Duration::from_millis(30),
+                ..Default::default()
+            },
+        ));
+        let slow_index = |slots| {
+            let opts = StoreOptions {
+                max_inflight: slots,
+                ..Default::default()
+            };
+            let store =
+                Store::new(slow.clone(), Path::from(""), rt.handle().clone(), opts).unwrap();
+            ChangeIndex::new(store, WriteOptions::default())
+        };
+        let w = slow_index(4);
+        let la = [w.write_commit("la", nc(1), &one(1)).await.unwrap()];
+        let lb = [w.write_commit("lb", nc(1), &one(2)).await.unwrap()];
+        for i in 0..5 {
+            let ix = slow_index(1);
+            let wait = std::time::Duration::from_millis(5 + i * 20);
+            let _ = tokio::time::timeout(wait, ix.scan(&la, 1, &q)).await;
+            let read = tokio::time::timeout(std::time::Duration::from_secs(5), ix.scan(&lb, 1, &q));
+            assert_eq!(read.await.expect("a GET slot leaked").unwrap().run.len(), 1);
+        }
+        // a damaged length in the commits section is a format error, not an allocation
+        let got = mem.get(&Path::from("t/c1")).await.unwrap();
+        let mut b = got.bytes().await.unwrap().to_vec();
+        let t = b.len() - 48;
+        let commits_start = u64::from_le_bytes(b[t + 8..t + 16].try_into().unwrap());
+        b[commits_start as usize + 3] ^= 0x80;
+        mem.put(&Path::from("t/c1-damaged"), b.into())
+            .await
+            .unwrap();
+        let damaged = LayerRef {
+            path: "c1-damaged".into(),
+            ..l1.clone()
+        };
+        assert!(matches!(
+            ix.commits(&[damaged], 1, 1).await,
+            Err(Error::Format(_))
+        ));
+        // stores with different prefixes keep apart in one disk cache directory
+        let (a, b) = (index("a", Some(dir.clone())), index("b", Some(dir.clone())));
+        let la = a.write_commit("c1", nc(1), &one(1)).await.unwrap();
+        let lb = b.write_commit("c1", nc(1), &one(2)).await.unwrap();
+        let (ra, rb) = (
+            a.scan(&[la], 1, &q).await.unwrap(),
+            b.scan(&[lb], 1, &q).await.unwrap(),
+        );
+        assert_eq!(ra.run.new_version(0), Version::Int(1));
+        assert_eq!(rb.run.new_version(0), Version::Int(2));
+    });
+    let _ = std::fs::remove_dir_all(dir);
 }
 
 async fn ix_scan(ix: &ChangeIndex, layers: &[LayerRef]) -> usize {

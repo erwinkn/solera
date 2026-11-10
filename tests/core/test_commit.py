@@ -19,7 +19,8 @@ class Core:
         self.layers = {}
 
     def commit(self, output, changes, **kw):
-        built = self.t.build_commit(self.index, output, changes, **kw)
+        self.t.attach(output, self.index)
+        built = self.t.build_commit(output, changes, **kw)
         if built is not None:
             self.t.apply(built["event"])
             self.layers.setdefault(output, []).append(built["layer"])
@@ -81,8 +82,11 @@ def test_a_load_report_yields_to_a_later_commit(index):
 
 def test_a_commit_built_at_an_old_head_is_refused(index):
     core = Core(index)
-    a = core.t.build_commit(index, b"o", encode_changes(["k"]), version=1, path="o/a")
-    b = core.t.build_commit(index, b"o", encode_changes(["k"]), version=2, path="o/b")
+    core.t.attach(b"o", index)
+    a = core.t.build_commit(b"o", encode_changes(["k"]), version=1, path="o/a")
+    b = core.t.build_commit(b"o", encode_changes(["k"]), version=2, path="o/b")
+    with pytest.raises(ValueError, match="one output"):
+        core.t.apply(Tracking.join([a["event"], b["event"]]))
     core.t.apply(a["event"])
     with pytest.raises(ValueError, match="another head"):
         core.t.apply(b["event"])
@@ -92,11 +96,14 @@ def test_a_commit_built_at_an_old_head_is_refused(index):
 
 def test_bad_input_is_refused(index):
     t = Tracking()
+    with pytest.raises(ValueError, match="no change index attached"):
+        t.build_commit(b"o", encode_changes(["a"]), version=1, path="o/1")
+    t.attach(b"o", index)
     with pytest.raises(FormatError):
-        t.build_commit(index, b"o", b"not changes", version=1, path="o/1")
+        t.build_commit(b"o", b"not changes", version=1, path="o/1")
     with pytest.raises(ValueError):
         encode_changes(["a"], removes=["a"])
     with pytest.raises(ValueError):
         encode_changes({"a": "v" * (1 << 20)})
     with pytest.raises(ValueError):
-        t.build_commit(index, b"o", encode_changes(["a"]), version=1, path="o/1", mode="report")
+        t.build_commit(b"o", encode_changes(["a"]), version=1, path="o/1", mode="report")

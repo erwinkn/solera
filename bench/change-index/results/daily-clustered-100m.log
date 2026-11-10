@@ -1,0 +1,3 @@
+daily-clustered 100000000: 1720 commits, 32773380 entries after the load, 13 layers (max 15), merges wrote 3.95 entries per entry committed, generated in 6.9s
+layers written in 23.0s
+max RSS 6648 MB

@@ -7,9 +7,9 @@ use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList};
 use solera_tracking as tr;
 use solera_tracking::commit::{self, Change, Changes, Mode, Reader, Spec};
-use solera_tracking::plan::OneIndex;
+use solera_tracking::plan::Indexes;
 
-use crate::index_py::{self, key, layer_out, rt, ChangeIndex};
+use crate::index_py::{self, key, layer_out, rt};
 use crate::{guard, FormatError};
 
 fn err(e: tr::Error) -> PyErr {
@@ -25,7 +25,7 @@ fn err(e: tr::Error) -> PyErr {
 pub(crate) fn build_commit<'py>(
     py: Python<'py>,
     out: tr::Output,
-    index: &Bound<'py, ChangeIndex>,
+    ixs: &dyn Indexes,
     output: &[u8],
     changes: &[u8],
     version: u64,
@@ -54,12 +54,11 @@ pub(crate) fn build_commit<'py>(
         mode,
         collect,
     };
-    let ix = &index.get().ix;
     let id: tr::Id = output.into();
     let built = guard(|| {
         py.detach(|| {
             let mut src = Reader::new(changes)?;
-            rt().block_on(commit::build(&OneIndex(ix), &id, &out, spec, &mut src))
+            rt().block_on(commit::build(ixs, &id, &out, spec, &mut src))
         })
         .map_err(err)
     })?;

@@ -44,7 +44,10 @@ enum Matcher {
 impl Matcher {
     fn new(p: &Pat) -> Result<Matcher> {
         Ok(match p {
-            Pat::Glob(g) => Matcher::Glob(Glob::new(g)),
+            Pat::Glob(g) => match Glob::new(g) {
+                Ok(g) => Matcher::Glob(g),
+                Err(e) => return invalid(format!("pattern {g:?}: {e}")),
+            },
             Pat::Regex(r) => match regex::bytes::Regex::new(&format!(r"(?s)\A(?:{r})\z")) {
                 Ok(re) => Matcher::Regex(re),
                 Err(e) => return invalid(format!("pattern Regex({r:?}): {e}")),

@@ -1,0 +1,26 @@
+[package]
+name = "core-plan-bench"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# The tracking core's planner at the scale target (build plan N2 to N5, N12):
+# the change-index bench's workloads, layer schedule and simulated store
+# (bench/change-index), planned through native/tracking.
+[dependencies]
+solera-index = { path = "../../../native/index" }
+solera-tracking = { path = "../../../native/tracking" }
+async-trait = "0.1"
+bytes = "1"
+futures = "0.3"
+libc = "0.2"
+object_store = "0.14"
+rand = { version = "0.9", features = ["small_rng"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "time", "sync"] }
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+
+[profile.release]
+debug = 1
+lto = "thin"
+codegen-units = 1

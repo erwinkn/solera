@@ -15,7 +15,7 @@ mod commit_py;
 pub mod delta;
 pub mod entries;
 pub mod error;
-mod index_py;
+pub(crate) mod index_py;
 pub mod layers;
 mod layers_py;
 pub mod rows;
