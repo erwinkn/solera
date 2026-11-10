@@ -21,8 +21,8 @@ his frame the design:
   is converted, and nothing is kept for compatibility. User data stays in
   its stores (§15).
 - **Scale target.** 100M keys per output, about 1% of them changing per
-  day, 10k-key batches, one 4-vCPU engine. Every benchmark that settles a
-  choice here measures at that scale.
+  day, 10k-key batches, one 4-vCPU engine. Every measurement that settles
+  a remaining choice is taken at that scale.
 - **Tables stay exact.** A Postgres table never holds a row the log does
   not have (§8).
 
@@ -710,7 +710,7 @@ measurement the verdict still needs, on the new index.
 | Is the partition stale? | Any of its edges owes something due (STA-3: a default run would load something) | The same |
 | Upstream stale | A partition whose stale status flips tells its consumers, which tell theirs: work only where the status changes | The same |
 | Complete? (D177) | No `empty` piece owes anything: an `empty` piece's count is exactly its unprocessed upstream keys | For each `empty` piece, whether it has an upstream key: one key or none |
-| How many keys owed? | The sum of the counts: exact, except "upstream incomplete" where a gate holds the edge, which has no number until the upstream is complete (D197) | Counted when asked: the keys an unlimited plan would take, plus the failing keys whose retry is not yet due (their points); cached until the upstream or the progress changes |
+| How many keys owed? | The sum of the counts: exact, except "upstream incomplete" where a gate holds the edge, which has no number until the upstream is complete (D197) | Counted when asked: every owed key, that is the keys an unlimited plan would take plus the owed keys not yet due (failing keys waiting for their retry, and keys held back while their producer repairs an anomaly, §8), each counted once; cached until the upstream or the progress changes |
 | How many commits behind, since when? | The oldest owing piece's commit, against the head and the commit headers | The same, from progress |
 | Which keys? | The planner without a limit, on demand; costs a read proportional to the answer | The same |
 
@@ -1538,7 +1538,9 @@ was taken under:
   run history or index file is converted, and no compatibility shim is
   written (D204).
 - **Scale target.** 100M keys per output, about 1% changing per day,
-  10k-key batches, one 4-vCPU engine. Every benchmark here measures at it.
+  10k-key batches, one 4-vCPU engine. Every measurement that settles a
+  remaining choice is taken at it; some results quoted here (SOLE-3's
+  clustered workloads) were measured at 10M keys.
 - **Tables stay exact.** A Postgres table never holds a row the log does
   not have (D196).
 
