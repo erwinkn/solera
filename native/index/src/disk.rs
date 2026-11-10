@@ -126,11 +126,13 @@ impl Disk {
             if n == ".lock" || n == ".store" {
                 continue;
             }
-            if n.starts_with('.') || !mine {
+            let m = e.metadata().map_err(io)?;
+            // too short to be a layer: a fill cut off before it was renamed
+            // cannot leave one, so it is not ours to keep
+            if n.starts_with('.') || !mine || m.len() < crate::format::TRAILER as u64 {
                 let _ = std::fs::remove_file(e.path());
                 continue;
             }
-            let m = e.metadata().map_err(io)?;
             found.push((m.modified().ok(), unname(&n), m.len()));
         }
         if !mine {
@@ -389,6 +391,34 @@ mod tests {
         assert!(st.failed.contains_key(&format!("layer-{}", 3 * FAILED - 1)));
         assert_eq!(st.reserved, 0);
         drop(st);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn files_found_on_open_are_kept_within_the_budget() {
+        let dir = std::env::temp_dir().join(format!("solera-disk-found-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(".store"), "s").unwrap();
+        for i in 0..1000 {
+            std::fs::write(dir.join(format!("layer-{i}")), [0u8; 100]).unwrap();
+        }
+        // the newest, so the least likely to be evicted
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        for i in 0..1000 {
+            std::fs::write(dir.join(format!("z-empty-{i}")), b"").unwrap();
+        }
+        let d = Disk::open(DiskOptions {
+            dir: dir.clone(),
+            store: "s".into(),
+            bytes: 1000,
+        })
+        .unwrap();
+        let st = d.st.lock().unwrap();
+        assert_eq!(st.files.len(), 10);
+        assert_eq!(st.total, 1000);
+        drop(st);
+        let left = std::fs::read_dir(&dir).unwrap().count();
+        assert_eq!(left, 10 + 2);
         let _ = std::fs::remove_dir_all(dir);
     }
 }
