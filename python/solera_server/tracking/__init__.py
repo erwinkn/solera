@@ -134,6 +134,17 @@ class Core:
         minted.append([output, partition, id_])
         return id_
 
+    def named(self, output: str, partition: str) -> str:
+        """The id of an output's current life, minted and recorded at once
+        if it has none: an id a commit is built under is never another
+        event's to name first (a consumer opening an edge on it)."""
+
+        minted: list = []
+        id_ = self.output_id(output, partition, minted)
+        if minted:
+            self.engine.state.record({"type": "Core", "event": None, "outputs": minted, "edges": []})
+        return id_
+
     def edge_id(self) -> str:
         """A fresh edge id, minted as output ids are."""
 

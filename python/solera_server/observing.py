@@ -108,7 +108,8 @@ class Observing:
                 if empty is not None:
                     up = self.m.core_output(input.output, input.partition) or {}
                     patterns = json.dumps(input.spec.get("patterns"), sort_keys=True)
-                    stamp = (empty, edge[1], up.get("head", 0), patterns)
+                    walked = self._walked.get((asset, partition, input.param), 0)
+                    stamp = (empty, edge[1], up.get("head", 0), patterns, walked)
                     out.append(((asset, partition, input.param), stamp, input, {"core": empty}))
                 continue
             rec = records.get(input.param)
@@ -153,7 +154,8 @@ class Observing:
         for key, stamp, input, rec in checks:
             known = self._covers.get(key)
             if "core" in rec and (known is None or known[0] != stamp):
-                covered = not await core_stale.taken_after(self.core, input, rec["core"])
+                edge = self.m.core_edges[(asset, partition, input.param)][0]
+                covered = not await core_stale.taken_after(self.core, input, rec["core"], edge)
                 self._covers[key] = known = (stamp, covered)
             elif known is None or known[0] != stamp:
                 index, _ = self._upstream(input.output, input.partition)

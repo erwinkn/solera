@@ -40,14 +40,21 @@ async def owes(core: Core, asset: str, partition: str, input, planner, inputs) -
     return bool(summary["inputs"][0]["keys"])
 
 
-async def taken_after(core: Core, input, empty: str) -> bool:
+async def taken_after(core: Core, input, empty: str, edge: str | None = None) -> bool:
     """Whether upstream holds a key the input's patterns take past `empty`
     (`""`: anywhere): one the partition has not processed since it last
-    started over, so it is not complete (STA-10, D176). One native scan,
-    stopping at the first such key."""
+    started over, so it is not complete (STA-10, D176); with `edge`, a key
+    a key list processed there does not count. One native scan, stopping at
+    the first such key."""
 
     id_ = core.m.core_outputs.get((input.output, input.partition))
     if id_ is None:
         return False
     core.attach(id_)
-    return await core.run(core.tracking.taken, id_.encode(), input.spec.get("patterns"), empty or None)
+    return await core.run(
+        core.tracking.taken,
+        id_.encode(),
+        input.spec.get("patterns"),
+        empty or None,
+        edge.encode() if edge is not None else None,
+    )

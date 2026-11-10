@@ -257,3 +257,48 @@ async def test_a_journal_without_a_checkpoint_replays_into_the_model_that_wrote_
         assert replayed.model.cleanups == {} and replayed.model.core is not None
     finally:
         await replayed.close()
+
+
+async def test_todays_engine_on_a_namespace_a_core_engine_left_empty_runs_without_a_core(tmp_path):
+    """A namespace a core-path process opened and left with no event is
+    fresh: today's engine takes it in its own format, on a model with no
+    core, as a replay of it does."""
+
+    from solera.sdk import Output, Project, asset
+    from solera.stores import FileStore
+    from solera_server.journal import FORMAT
+    from solera_server.state import State
+
+    @asset(outputs=Output("items", key="id"))
+    def items():
+        return [{"id": "k", "v": "1"}]
+
+    first = Solera(tmp_path, "core")
+    await first._open_state()  # and dies before any event
+    today = Solera(tmp_path, "today")
+    try:
+        await today.deploy(Project(assets=[items], default_store=FileStore(tmp_path / "data")))
+        await today.run("items")
+        await today.state.durable()
+        assert today.state.journal.format == FORMAT and today.engine.core is None
+        assert today.engine.m.core is None and today.engine.m.key_count("items", "") == 1
+        replayed = await State.open((tmp_path / "state").as_uri(), "contract", writer=False)
+        try:
+            assert replayed.model.core is None
+        finally:
+            await replayed.close()
+    finally:
+        await today.close()
+
+
+async def test_a_keyed_output_committed_with_no_key_counts_zero_keys(solera, tmp_path):
+    from solera.sdk import Output, Project, asset
+    from solera.stores import FileStore
+
+    @asset(outputs=Output("items", key="id"))
+    def items():
+        return []
+
+    await solera.deploy(Project(assets=[items], default_store=FileStore(tmp_path / "data")))
+    await solera.run("items")
+    assert (await solera.head("items"))["key_count"] == 0

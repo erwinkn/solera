@@ -28,6 +28,7 @@ from .history import TERMINAL_RUN, RunFilter
 from .journal import Fenced
 from .sensors import HOST_TOKEN
 from .state import LostOwnership, State, Unavailable
+from .tracking import full as core_full
 
 log = logging.getLogger(__name__)
 
@@ -257,6 +258,8 @@ def create_app(
             "active_runs": sum(1 for r in runtime.m.runs.values() if r["status"] not in TERMINAL_RUN),
             "postgres": bool(os.environ.get("DATABASE_URL")),
             "last_error": "; ".join(f"{name}: {error}" for name, error in runtime.failing.items()) or None,
+            # a full run left midway: its readers wait until a run of its producer completes it
+            "incomplete_full_runs": core_full.stopped(runtime.core) if runtime.core is not None else [],
             # cleanup whose task ran out of tries: see and clear with `solera cleanups`
             "stuck_cleanups": [
                 {"output": output, "partition": partition, "id": e["id"]}

@@ -33,7 +33,6 @@ class Built:
     """What a batch commits on the core, built and not yet recorded."""
 
     event: bytes | None = None
-    minted: list = field(default_factory=list)  # [output, partition, id]: outputs at their first commit
     records: list = field(default_factory=list)  # [input, base64 of a batch record]
     counts: dict = field(default_factory=dict)  # output -> {id, commit, live, added, updated, removed}
     elements: dict = field(default_factory=dict)  # a dynamic partitions output -> its elements after
@@ -44,11 +43,10 @@ class Built:
     def payload(self) -> dict | None:
         """The commit's `core` field, as the model applies it."""
 
-        if self.event is None and not self.minted:
+        if self.event is None:
             return None
         return {
-            "event": b64(self.event) if self.event is not None else None,
-            "outputs": self.minted,
+            "event": b64(self.event),
             "records": self.records,
             "counts": self.counts,
             "walk": self.walk,
@@ -110,13 +108,19 @@ async def build(core: Core, task: dict, attempt: str, prepared: dict, result: di
         generation = int((claim or {}).get("generation") or 0)
         producer = canonical({"run": task["run"], "attempt": attempt})
         first = None
-        for name, entry in sorted(outputs.items()):
-            info = (prepared.get("outputs") or {}).get(name) or {}
-            if info.get("contract", {}).get("key") is None or entry.get("unchanged"):
+        clear, ends = full_run(prepared)
+        done = []  # keyed outputs whose full run this batch ends with no commit
+        for name, info in sorted((prepared.get("outputs") or {}).items()):
+            entry = outputs.get(name) or {"unchanged": True}
+            if info.get("contract", {}).get("key") is None:
                 continue
-            id_ = core.output_id(name, partition, built.minted)
+            if entry.get("unchanged"):
+                done.append(name)
+                continue
+            id_ = core.named(name, partition)
             await built.locks.enter_async_context(core.lock(id_))
             core.attach(id_)
+            ending = ends and (clear or core.tracking.full_run(id_.encode()) is not None)
             out = m.core_output(name, partition) or {"head": 0, "layers": []}
             dynamic = bool(info.get("dynamic"))
             async with changes_of(core, name, entry) as changes:
@@ -128,10 +132,13 @@ async def build(core: Core, task: dict, attempt: str, prepared: dict, result: di
                     path=core.path(id_, out["head"] + 1, attempt),
                     time_ms=int(engine.clock() * 1000),
                     producer=producer,
-                    mode="replace" if entry.get("whole") else "patch",
+                    mode="clear" if clear else "replace" if entry.get("whole") else "patch",
+                    ends_full_run=ending,
                     collect=DYNAMIC_KEYS if dynamic else 0,
                 )
             if found is None:
+                if ending:
+                    events.append(Tracking.event_full_run_done(id_.encode()))
                 continue
             events.append(found["event"])
             first = found["commit"] if first is None else first
@@ -141,6 +148,13 @@ async def build(core: Core, task: dict, attempt: str, prepared: dict, result: di
             }
             if dynamic:
                 built.elements[name] = await elements(core, name, partition, out, found)
+        for name in done if ends else ():
+            id_ = core.m.core_outputs.get((name, partition))
+            if id_ is None:
+                continue
+            await built.locks.enter_async_context(core.lock(id_))
+            if core.tracking.full_run(id_.encode()) is not None:
+                events.append(Tracking.event_full_run_done(id_.encode()))
         plan = await plan_of(core, task, attempt, prepared)
         if plan is not None:
             keyed = sorted(
@@ -151,7 +165,9 @@ async def build(core: Core, task: dict, attempt: str, prepared: dict, result: di
             reports = [
                 ([], sorted(map(tuple, (delivered.get(p) or {}).get("loaded") or ()))) for p, _ in keyed
             ]
-            progress, records, _ = await core.run(  # held-back keys: B6's, and only past a clear (PR 2)
+            # Held-back keys keep their points and stay owed for a later run (the walk goes on past
+            # them, so nothing replans them in a loop); leaving their outcomes alone is B6's.
+            progress, records, _ = await core.run(
                 core.tracking.progress_ops, plan, reports, producer=producer, output_commit=first
             )
             events.insert(0, progress)
@@ -163,6 +179,7 @@ async def build(core: Core, task: dict, attempt: str, prepared: dict, result: di
                 "after": some["after"],
                 "hi": None if ended else some["end"],
                 "reset": bool(some["full"]),
+                "keys": some.get("mode") == "keys",
             }
         if events:
             built.event = Tracking.join(events)
@@ -191,6 +208,20 @@ async def elements(core: Core, name: str, partition: str, out: dict, found: dict
             return keys
 
 
+def full_run(prepared: dict) -> tuple[bool, bool]:
+    """Whether a batch's commit starts its outputs' full run, and whether it
+    ends any it is in (the full-run verdict: the clear, plus the gate). A
+    full run's first batch of an incremental asset clears: its outputs start
+    over, and their readers wait until the run completes. The walk's last
+    batch ends it, unless the batch is a key list's, which leaves the rest
+    owed for a run that walks it."""
+
+    plans = [p for p in (prepared.get("plans") or {}).values() if p]
+    clear = bool(prepared.get("full")) and bool(plans)
+    ends = not prepared.get("more") and not any(p.get("mode") == "keys" for p in plans)
+    return clear, ends
+
+
 def unkeyed(prepared: dict) -> dict:
     """The preparation as today's path commits its unkeyed incremental
     inputs, by commit numbers: without the keyed inputs the core commits."""
@@ -205,4 +236,4 @@ def check(core: Core, built: Built) -> None:
     """The commit check of the core (§7): the event applies to the state as it
     is now, or nothing is recorded. Run in the synchronous step that records."""
 
-    core.check(built.event, built.minted)
+    core.check(built.event)

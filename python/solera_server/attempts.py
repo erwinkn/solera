@@ -428,6 +428,13 @@ class Attempts:
         if execution["kind"] == "Pool":
             needs = {k: v for k in ("cpu", "memory", "gpu") if (v := execution["options"].get(k)) is not None}
             event["pool"] = {"name": execution["executor"], "needs": needs}
+        if self.core is not None:  # ids for its keyed outputs never named: what its commit builds under
+            minted: list = []
+            for name, info in prepared["outputs"].items():
+                if info["contract"].get("key") is not None:
+                    self.core.output_id(name, task["partition"], minted)
+            if minted:
+                event["core_outputs"] = minted
         # Launch only what a restarted engine would adopt, never an orphan: until the
         # launch is durable, pool discovery does not offer it either. If it never
         # is (this engine was replaced), it never is offered.

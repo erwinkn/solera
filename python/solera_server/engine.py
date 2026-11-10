@@ -73,6 +73,7 @@ from .staleness import Staleness
 from .state import Conflict, LostOwnership, State
 from .tracking import WALK, Core, b64, output_pin
 from .tracking import commit as core_commit
+from .tracking import full as core_full
 from .tracking import prepare as core_prepare
 from .tracking import sources as core_sources
 from .upkeep import ALIVE, Upkeep
@@ -193,6 +194,8 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
         # Attempts whose end failed: (times, not adopted again before this monotonic time).
         self._crashes: dict[str, tuple[int, float]] = {}
         self._covers: dict[tuple, tuple] = {}  # an input record with gaps: is it covered? (`complete`)
+        # (asset, partition, input) -> batches committed here: what `complete` knew of an edge is old.
+        self._walked: dict[tuple, int] = {}
         # attempt id -> set when its run is controlled, so its watcher looks at once.
         self._stirred: dict[str, asyncio.Event] = {}
         # Attempts consuming a local execution slot. Pool attempts only poll
@@ -620,6 +623,8 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
             else:
                 asset_used[claimed["asset"]] = asset_used.get(claimed["asset"], 0) + 1
         held = {}
+        incomplete = core_full.incomplete(self.core) if self.core is not None else set()
+        planner = self.planner() if incomplete else None
         for task_id in self.m.due(now):
             task = self.m.task(task_id)
             if task is None or task["status"] != "queued" or task_id in self.m.claims:
@@ -649,6 +654,8 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
             cap = declared.get("concurrency")
             if holder is not None:
                 held[task_id] = ["claim", holder]
+            elif incomplete and (waiting := core_full.gate(planner, task, incomplete)) is not None:
+                held[task_id] = waiting
             elif cap is not None and asset_used.get(task["asset"], 0) >= cap:
                 held[task_id] = ["concurrency", task["asset"]]
             elif behind is not None:
@@ -1003,6 +1010,8 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
             await self._crashed(task_id, attempt, error)
         finally:
             self.m.release(task_id, attempt)
+            if self.core is not None:  # ended here, however: a plan kept for it goes (its spec has it)
+                self.core.plans.pop(attempt, None)
 
     @staticmethod
     def _released(placement, handle) -> None:
@@ -1812,6 +1821,9 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
             core_commit.check(self.core, built)
             if (core := built.payload()) is not None:
                 commit["core"] = core
+            for param in (built.walk or {}).get("inputs") or ():
+                key = (task["asset"], task["partition"], param)
+                self._walked[key] = self._walked.get(key, 0) + 1
         self._finish(
             task,
             claim,
@@ -1937,7 +1949,6 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
                     record["partitions"] = built["elements"]
                 event["core"] = {
                     "event": b64(built["event"]),
-                    "outputs": built["minted"],
                     "counts": {name: built["counts"]},
                 }
                 run["upserted"], run["deleted"] = built["upserted"], built["deleted"]

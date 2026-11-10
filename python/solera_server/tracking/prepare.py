@@ -81,6 +81,8 @@ async def prepare(core: Core, task: dict, run: dict, attempt: str | None) -> dic
     keyed = [i for i in base["incremental"] if engine._keyed(i)]
     unkeyed = [i for i in base["incremental"] if not engine._keyed(i)]
     refuse(engine, task, run, keyed)
+    if any(restarted(core, task, i) for i in keyed):  # an upstream's new life is read in full, from the start
+        full = base["full"] = True
     progress = {} if full else task.get("progress") or {}
     plans, all_empty, plan_bytes = {}, True, None
     for input in unkeyed:  # by commit numbers, as today
@@ -105,8 +107,10 @@ async def prepare(core: Core, task: dict, run: dict, attempt: str | None) -> dic
         edges = open_edges(core, task, keyed)
         core.attach(*(core.m.core_edges[(task["asset"], task["partition"], i.param)][1] for i in keyed))
         after = (mine or {}).get("key")
+        mode, named = run_mode(run, keyed)
         request = {
-            "mode": "incremental",
+            "mode": mode,
+            "keys": named,
             "reset": full,
             "after": after,
             "limit": min(int(i.spec["batch_size"]) for i in keyed),
@@ -123,7 +127,7 @@ async def prepare(core: Core, task: dict, run: dict, attempt: str | None) -> dic
             # Each input's own walk ends once it owes nothing past the batch (a full run: holds
             # nothing past it), though the others' go on.
             final = hi is None
-            if not final and len(keyed) > 1:
+            if not final and len(keyed) > 1 and mode == "incremental":
                 final = not await _more(
                     core, input, edges[input.param], conditions(engine, input, base), hi, full
                 )
@@ -139,6 +143,7 @@ async def prepare(core: Core, task: dict, run: dict, attempt: str | None) -> dic
             plans[input.param] = {
                 "kind": "core",
                 "core": n,
+                "mode": mode,
                 "output": input.output,
                 "upstream_partition": input.partition,
                 "head": found["head"],
@@ -163,10 +168,17 @@ async def prepare(core: Core, task: dict, run: dict, attempt: str | None) -> dic
     return prepared
 
 
+def restarted(core: Core, task: dict, input) -> bool:
+    """Whether a keyed input's edge reads an upstream life that is gone (a
+    reset: the output removed, or moved to another store)."""
+
+    found = core.m.core_edges.get((task["asset"], task["partition"], input.param))
+    return found is not None and found[1] != core.m.core_outputs.get((input.output, input.partition))
+
+
 def refuse(engine, task: dict, run: dict, keyed: list) -> None:
     """What the new path does not run yet, refused for good with why: per-key
-    assets (B6), stores that write in place (B8), and the run modes PR 2 of
-    B5 adds."""
+    assets (B6) and stores that write in place (B8)."""
 
     from ..engine import NonRetryable
 
@@ -182,8 +194,6 @@ def refuse(engine, task: dict, run: dict, keyed: list) -> None:
                 f"output {output['name']!r}: keyed outputs on stores that write in place do not run on "
                 "the new tracking core yet (build plan B8)"
             )
-    if run.get("keys"):
-        raise NonRetryable("key-list and all-keys runs do not run on the new tracking core yet (B5, PR 2)")
 
 
 async def _more(core: Core, input, edge: str, conds: dict, hi: str, full: bool) -> bool:
@@ -196,3 +206,17 @@ async def _more(core: Core, input, edge: str, conds: dict, hi: str, full: bool) 
         return await taken_after(core, input, hi)
     rows, _ = await core.run(core.tracking.owed, edge.encode(), conds, after=hi, limit=1)
     return bool(rows)
+
+
+def run_mode(run: dict, keyed: list) -> tuple[str, list[str]]:
+    """What a run asks of its keyed inputs (`keys=`, per upstream output): every
+    key, the rest unchanged ("all"); the keys listed ("keys"); or what is
+    owed. A batch's keys are one set across its keyed inputs, so the lists
+    of several are one list, and "all" on any is "all" on every one."""
+
+    asked = [(run.get("keys") or {}).get(i.output) for i in keyed]
+    if any(a == "all" for a in asked):
+        return "all", []
+    if any(isinstance(a, list) for a in asked):
+        return "keys", sorted({k for a in asked if isinstance(a, list) for k in a})
+    return "incremental", []

@@ -380,7 +380,10 @@ class Model:
 
         if self.core is not None:
             found = self.core_output(output, partition)
-            return None if found is None else found["live"]
+            if found is not None:
+                return found["live"]
+            keyed = (((self.manifest or {}).get("outputs") or {}).get(output) or {}).get("key") is not None
+            return 0 if keyed and (output, partition) in self.heads else None  # committed, never a key
         index = self.indexes.get((output, partition))
         return None if index is None else index.count
 
@@ -646,6 +649,8 @@ class Model:
             )
             if moved and name not in sources_before and old.get("store") in stores_before:
                 self._retire_output(now, homes.get(now, now), old, stores_before[old["store"]], e["at"])
+        if self.core is not None:
+            self._core_close(reset)
         self.changed = set()
         for asset in manifest["assets"]:
             olds = [a for a in renamed.get(asset, ()) if a in declared_before]  # renamed by this deploy
@@ -850,6 +855,8 @@ class Model:
 
         for key in [k for k in self.heads if gone(k)]:
             del self.heads[key]
+        for key in [k for k in self.core_outputs if k[0] in reset]:  # its next commit names a new life
+            del self.core_outputs[key]
         for key in [k for k in self.repairs if gone(k)]:  # what dead attempts meant to write
             index = self.index(*key)
             for intent in self.repairs.pop(key):
@@ -907,6 +914,9 @@ class Model:
                     table[target] = merge(table[target] + table.pop(key))
 
         move(self.heads, output_map, 0)
+        move(self.core_outputs, output_map, 0)  # the new path's ids: the same output, the same edges
+        move(self.core_edges, asset_map, 0)
+        move(self.core_empty, asset_map, 0)
         for old, new in output_map.items():
             if old in self.homes and new not in self.homes:
                 self.homes[new] = self.homes.pop(old)
@@ -1015,6 +1025,8 @@ class Model:
         self._event(run, "claimed", at, task["id"], attempt)
 
     def _on_AttemptLaunched(self, e):
+        for output, partition, id_ in e.get("core_outputs") or ():  # named at its launch, before any commit
+            self.core_outputs[(output, partition)] = id_
         run = self.runs.get(e["run"])
         task = run["tasks"].get(e["task"]) if run else None
         if task is None or task["status"] in TERMINAL_TASK:
@@ -1796,13 +1808,42 @@ class Model:
                 self.core_edges[(asset, partition, param)] = id_
                 self.core_empty[(asset, partition, param)] = ""
 
+    def _core_close(self, producers: set[str]) -> None:
+        """After a deploy, the new path's edges that read nothing now: of an
+        asset gone, of an input no longer a keyed incremental one, and of a
+        producer whose output a reset started over, which reads its inputs
+        in full again. Closed in the core as the deploy applies, so a replay
+        closes the same ones."""
+
+        assets, outputs = self.manifest["assets"], self.manifest["outputs"]
+        closing = []
+        for key in sorted(self.core_edges):
+            asset, _, param = key
+            spec = ((assets.get(asset) or {}).get("inputs") or {}).get(param) or {}
+            keyed = (outputs.get(spec.get("output")) or {}).get("key") is not None
+            if asset in producers or spec.get("kind") != "incremental" or not keyed:
+                closing.append(key)
+        if not closing:
+            return
+        self.core.apply(
+            Tracking.join([Tracking.event_edge_close(self.core_edges[k][0].encode()) for k in closing])
+        )
+        for key in closing:
+            del self.core_edges[key]
+            self.core_empty.pop(key, None)
+
     def _core_walk(self, asset: str, partition: str, walk: dict) -> None:
         """A batch's walk over its keyed inputs, `(after, hi]` (`hi` None: to
         the end): it fills what an edge held nothing of, from the start after a
-        reset; once a walk gets to the end, nothing is left empty."""
+        reset; once a walk gets to the end, nothing is left empty. A key
+        list's walk fills nothing, and after a reset leaves every key empty."""
 
         after, hi = walk["after"], walk["hi"]
         for param in walk["inputs"]:
+            if walk.get("keys"):  # a key list writes points only: what was empty stays so
+                if walk["reset"]:
+                    self.core_empty[(asset, partition, param)] = ""
+                continue
             key = (asset, partition, param)
             empty = "" if walk["reset"] else self.core_empty.get(key)
             if empty is None or (after is not None and after > empty):
