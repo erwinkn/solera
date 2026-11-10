@@ -224,6 +224,22 @@ TABLES["key_outcomes"] = Table(
         "at": "DOUBLE",
     },
 )
+# One committed batch's record per keyed input, on the new tracking core
+# (docs/tracking-design.md §7, "The batch record"): what lineage recomputes the
+# batch's input from (build plan B10).
+TABLES["batch_inputs"] = Table(
+    "run",
+    "at",
+    {
+        "run": "VARCHAR",
+        "attempt": "VARCHAR",  # attempts.id
+        "asset": "VARCHAR",
+        "partition": "VARCHAR",
+        "input": "VARCHAR",  # the input's parameter
+        "record": "VARCHAR",  # the core's batch record (`Record::encode`), base64
+        "at": "DOUBLE",
+    },
+)
 MAX_METADATA = 64 << 10  # bytes of JSON per output version
 
 
@@ -303,9 +319,9 @@ def batch(plans: dict | None) -> dict | None:
 
     plans = [p for _, p in sorted((plans or {}).items()) if p]
     walking = [p for p in plans if not p.get("done")]
-    if not walking or not any(p["kind"] == "observed" for p in plans):
+    if not walking or not any(p["kind"] in ("observed", "core") for p in plans):
         return None
-    keyed = [p for p in walking if p["kind"] == "observed"]
+    keyed = [p for p in walking if p["kind"] in ("observed", "core")]
     longest = next((p for p in keyed if not p["final"]), keyed[0] if keyed else None)
     return {
         "index": max(p["index"] for p in walking),
@@ -335,6 +351,21 @@ def progress(task: dict) -> dict | None:
         (not isinstance(w["key"], str), name, w) for name, w in walks.items() if w["key"] is not None
     )
     return walking[0][2] if walking else max(walks.values(), key=lambda w: w["batch"])
+
+
+def batch_input_row(run: str, attempt: str, asset: str, partition: str, record: list, at: float) -> dict:
+    """A batch record's row: `record` is `[input, base64 of its bytes]`."""
+
+    input, data = record
+    return {
+        "run": run,
+        "attempt": attempt,
+        "asset": asset,
+        "partition": partition,
+        "input": input,
+        "record": data,
+        "at": at,
+    }
 
 
 def attempt_row(run_id: str, task: dict, summary: dict, n: int) -> dict:

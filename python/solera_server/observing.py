@@ -27,6 +27,7 @@ from solera.patterns import Matcher
 
 from . import observed, owed, planning
 from .state import Conflict
+from .tracking import stale as core_stale
 
 WALK = 100  # stored outcomes a retry batch walks at most, for each key it may take
 
@@ -99,6 +100,17 @@ class Observing:
         for input in inputs:
             if input.kind != "incremental":
                 continue
+            if self.core is not None and self._keyed(input):  # the new path: the edge's empty part
+                edge = self.m.core_edges.get((asset, partition, input.param))
+                if edge is None:
+                    return None
+                empty = self.m.core_empty.get((asset, partition, input.param))
+                if empty is not None:
+                    up = self.m.core_output(input.output, input.partition) or {}
+                    patterns = json.dumps(input.spec.get("patterns"), sort_keys=True)
+                    stamp = (empty, edge[1], up.get("head", 0), patterns)
+                    out.append(((asset, partition, input.param), stamp, input, {"core": empty}))
+                continue
             rec = records.get(input.param)
             if rec is None:
                 return None
@@ -140,7 +152,10 @@ class Observing:
             return False
         for key, stamp, input, rec in checks:
             known = self._covers.get(key)
-            if known is None or known[0] != stamp:
+            if "core" in rec and (known is None or known[0] != stamp):
+                covered = not await core_stale.taken_after(self.core, input, rec["core"])
+                self._covers[key] = known = (stamp, covered)
+            elif known is None or known[0] != stamp:
                 index, _ = self._upstream(input.output, input.partition)
                 with self.m.reading(index.state.prefix):
                     covered = not await owed.uncovered(index, rec, Matcher(input.spec.get("patterns")))
@@ -158,6 +173,8 @@ class Observing:
             for key, record in self.m.partitions.items()
             if any(observed.gaps(rec) for rec in (record.get("observed") or {}).values())
         ]
+        if self.core is not None:  # the new path: edges holding nothing past some key
+            gappy += sorted({(asset, partition) for asset, partition, _ in self.m.core_empty})
         for asset, partition in gappy:
             if asset in self.manifest["assets"]:
                 await self.complete(asset, partition)

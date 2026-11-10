@@ -21,6 +21,7 @@ from solera.ids import ulid
 
 from .executors.local import _env
 from .model import commit_of
+from .tracking import sources as core_sources
 
 log = logging.getLogger(__name__)
 
@@ -139,8 +140,10 @@ class Sensors:
         snapshot = {}
         for source in sensor["commits"]:
             entry = {"head": self._head_id(source)}
-            index = self.m.indexes.get((source, ""))
-            if index is not None:
+            if self.core is not None and self.manifest["sources"][source].get("key") is not None:
+                # the new path: the keyed source's commit the tick observes
+                entry["core"] = (self.m.core_output(source, "") or {}).get("head", 0)
+            elif (index := self.m.indexes.get((source, ""))) is not None:
                 entry["index"] = index.to_json()
             snapshot[source] = entry
         now = asyncio.get_running_loop().time()
@@ -225,13 +228,21 @@ class Sensors:
             raise ValueError(f"{name} commits to {undeclared}, not in its commits=")
         if len(set(sources)) != len(sources):
             raise ValueError(f"{name}: one commit per source per tick")
-        for source in sources:  # every snapshot together: one stale source refuses the tick
-            if self._head_id(source) != claim["snapshot"][source]["head"]:
+        # The heads it validates against: one that moves before the commits are
+        # recorded refuses the tick, so no commit lands between a check and its record.
+        heads = {source: self.m.heads.get((source, "")) for source in sources}
+        for c in commits:  # every snapshot together: one stale source refuses the tick
+            source, seen = c["source"], claim["snapshot"][c["source"]]
+            if "core" in seen:  # only a key it reports changed (D193)
+                if await core_sources.moved(self.core, source, seen["core"], c):
+                    raise self.Conflict(
+                        f"source {source!r}: a key the tick reports changed since it was dispatched"
+                    )
+            elif self._head_id(source) != seen["head"]:
                 raise self.Conflict(f"source {source!r} moved since the tick was dispatched")
         for c in commits:
             if len(c.get("keys") or ()) > SENSOR_MAP_MAX:
                 raise ValueError(f"{name}: a full map over {SENSOR_MAP_MAX} keys; use a cursor")
-        heads = {source: self.m.heads.get((source, "")) for source in sources}
         by, tags = f"sensor {name}", {"sensor": name, "tick": claim["tick"]}
         prepared, planned = [], []
         try:
@@ -270,6 +281,8 @@ class Sensors:
         now, base = self.clock(), self.m.event_counter
         for event in prepared:
             event["at"] = now
+            if self.core is not None:  # each a commit of its own source: checked one by one
+                self.core.check_payload(event.get("core"))
         accepted = {
             "tick": claim["tick"],
             "runs": [run["id"] for _, run in planned],
