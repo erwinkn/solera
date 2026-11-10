@@ -14,8 +14,15 @@ use crate::error::{format, invalid, Result};
 use xxhash_rust::xxh3::xxh3_64;
 
 pub const MAGIC: [u8; 8] = *b"SOLCHG01";
+/// A key and its version word together, at most.
+pub const MAX_ROW: usize = 1 << 20;
+/// A block is cut once its encoded rows, or its keys and versions spelled
+/// out, reach these.
 const BLOCK_RAW: usize = 256 << 10;
-const MAX_RAW: u32 = 16 << 20;
+const BLOCK_EXPANDED: usize = 8 << 20;
+/// What a reader accepts of one block: the cut above plus one row.
+const MAX_RAW: u32 = 4 << 20;
+const MAX_EXPANDED: usize = 16 << 20;
 const HEADER: usize = 16;
 
 const UPSERT: u8 = 0;
@@ -102,8 +109,25 @@ impl Changes {
         self.len().checked_sub(1).map(|i| self.key(i))
     }
 
-    /// The next change; its key must follow the last one.
+    /// The next change; its key must follow the last one, and with its
+    /// version word fit in `MAX_ROW` bytes.
     pub fn push(&mut self, key: &[u8], change: Change<'_>) -> Result<()> {
+        let ver = match change {
+            Change::Upsert(Some(v)) => v.len(),
+            _ => 0,
+        };
+        if key.len() + ver > MAX_ROW {
+            return invalid(format!(
+                "{:?}: a key and its version take {} bytes, more than {MAX_ROW}",
+                String::from_utf8_lossy(&key[..key.len().min(64)]),
+                key.len() + ver
+            ));
+        }
+        if self.keys.len() + key.len() > u32::MAX as usize
+            || self.vers.len() + ver > u32::MAX as usize
+        {
+            return invalid("changes past 4 GiB: hand them over in their transport form");
+        }
         if let Some(last) = self.last_key() {
             if key <= last {
                 return invalid(format!(
@@ -133,9 +157,11 @@ impl Changes {
         let mut out = MAGIC.to_vec();
         let mut raw = Enc::new();
         let mut rows = 0u32;
+        let mut expanded = 0;
         let mut prev: &[u8] = &[];
         for i in 0..self.len() {
             let k = self.key(i);
+            expanded += k.len();
             let shared = k.iter().zip(prev).take_while(|(a, b)| a == b).count();
             raw.uv(shared as u64);
             raw.bytes(&k[shared..]);
@@ -144,15 +170,17 @@ impl Changes {
                 Change::Upsert(Some(v)) => {
                     raw.u8(UPSERT_VERSION);
                     raw.bytes(v);
+                    expanded += v.len();
                 }
                 Change::Removed => raw.u8(REMOVE),
             }
             rows += 1;
             prev = k;
-            if raw.buf.len() >= BLOCK_RAW {
+            if raw.buf.len() >= BLOCK_RAW || expanded >= BLOCK_EXPANDED {
                 block(&mut out, &raw.buf, rows);
                 raw.buf.clear();
                 rows = 0;
+                expanded = 0;
                 prev = &[];
             }
         }
@@ -249,25 +277,39 @@ impl Source for Reader<'_> {
         }
         let mut d = Dec::new(&self.raw);
         let mut key: Vec<u8> = Vec::new();
+        let mut expanded = 0;
         for _ in 0..rows {
             let shared = d.uv()? as usize;
             let suffix = d.bytes()?;
             if shared > key.len() {
                 return format("bad key prefix");
             }
+            expanded += shared + suffix.len();
+            if expanded > MAX_EXPANDED {
+                return format("a block's keys spell out past the limit");
+            }
             key.truncate(shared);
             key.extend_from_slice(suffix);
             let change = match d.u8()? {
                 UPSERT => Change::Upsert(None),
-                UPSERT_VERSION => Change::Upsert(Some(d.bytes()?)),
+                UPSERT_VERSION => {
+                    let v = d.bytes()?;
+                    expanded += v.len();
+                    Change::Upsert(Some(v))
+                }
                 REMOVE => Change::Removed,
                 k => return format(format!("bad change kind {k}")),
             };
             if self.last.as_deref().is_some_and(|l| key.as_slice() <= l) {
                 return format("changed keys do not ascend");
             }
-            out.push(&key, change)
-                .map_err(|_| crate::Error::Format("changed keys do not ascend".into()))?;
+            if expanded > MAX_EXPANDED {
+                return format("a block's keys spell out past the limit");
+            }
+            out.push(&key, change).map_err(|e| match e {
+                crate::Error::Invalid(m) => crate::Error::Format(m),
+                e => e,
+            })?;
         }
         self.last = out.last_key().map(<[u8]>::to_vec);
         d.end()?;

@@ -411,4 +411,107 @@ fn changes_round_trip_and_refuse_bad_bytes() {
         assert!(failed, "a flipped byte at {at} went unnoticed");
     }
     assert!(Changes::of(&[(b"a", Change::Removed), (b"a", Change::Upsert(None))]).is_err());
+    let big = vec![b'v'; commit::changes::MAX_ROW];
+    assert!(Changes::of(&[(b"a", Change::Upsert(Some(&big)))]).is_err());
+}
+
+/// Keys sharing a long prefix spell out to far more than their encoded
+/// bytes: the encoder cuts blocks by both, and the reader takes them back.
+#[test]
+fn long_shared_prefixes_round_trip_in_bounded_blocks() {
+    let prefix = vec![b'p'; 60_000];
+    let ks: Vec<Vec<u8>> = (0..2_000u32)
+        .map(|i| [prefix.as_slice(), format!("{i:06}").as_bytes()].concat())
+        .collect();
+    let items: Vec<(&[u8], Change<'_>)> = ks
+        .iter()
+        .map(|k| (k.as_slice(), Change::Upsert(None)))
+        .collect();
+    let c = Changes::of(&items).unwrap();
+    let bytes = c.encode();
+    let mut r = Reader::new(&bytes).unwrap();
+    let (mut back, mut chunk) = (Changes::new(), Changes::new());
+    while r.next(&mut chunk).unwrap() {
+        for i in 0..chunk.len() {
+            back.push(chunk.key(i), chunk.change(i)).unwrap();
+        }
+    }
+    assert_eq!(back, c);
+}
+
+/// Commits past one page of the head's state and one transport block: a
+/// full listing and a patch over 150,000 keys, against the fold.
+#[test]
+fn large_commits_cross_pages_and_blocks() {
+    let rt = runtime();
+    let mut rng = SmallRng::seed_from_u64(9);
+    let store = Store::new(
+        Arc::new(InMemory::new()),
+        Path::from("t"),
+        rt.handle().clone(),
+        StoreOptions::default(),
+    )
+    .unwrap();
+    let ix = ChangeIndex::new(store, WriteOptions::default());
+    let output: Id = b"big".as_slice().into();
+    let key = |i: u32| format!("site-{:02}/obj-{i:08}", i / 10_000).into_bytes();
+    let mut t = Tracking::new();
+    let mut state = State::new();
+    let words: [&[u8]; 3] = [b"", b"a", b"b"];
+    for (step, mode) in [Mode::Replace, Mode::Replace, Mode::Patch, Mode::Replace]
+        .into_iter()
+        .enumerate()
+    {
+        let version = 10 + step as u64;
+        let mut items: Vec<(Vec<u8>, Change<'_>)> = Vec::new();
+        for i in 0..150_000u32 {
+            if rng.random_bool(0.9) {
+                items.push((key(i), change(&mut rng, &words)));
+            }
+        }
+        let refs: Vec<(&[u8], Change<'_>)> =
+            items.iter().map(|(k, c)| (k.as_slice(), *c)).collect();
+        let changes = Changes::of(&refs).unwrap();
+        let mut next = if mode == Mode::Replace {
+            State::new()
+        } else {
+            state.clone()
+        };
+        for (k, c) in &items {
+            match new_of(*c, version) {
+                Some(v) => next.insert(k.clone(), v),
+                None => next.remove(k),
+            };
+        }
+        let bytes = changes.encode();
+        let out = t.outputs.get(&output).cloned().unwrap_or_default();
+        let path = format!("big/{step}");
+        let spec = Spec {
+            version,
+            time_ms: 0,
+            producer: b"",
+            path: &path,
+            mode,
+            collect: 0,
+        };
+        let built = rt
+            .block_on(commit::build(
+                &OneIndex(&ix),
+                &output,
+                &out,
+                spec,
+                &mut Reader::new(&bytes).unwrap(),
+            ))
+            .unwrap()
+            .unwrap();
+        t.apply(&Event::of(vec![Part::OutputCommit(built.part)]).encode())
+            .unwrap();
+        let o = &t.outputs[&output];
+        assert_eq!(scan_all(&rt, &ix, &o.layers, o.head), next, "step {step}");
+        assert_eq!(o.live, next.len() as u64);
+        state = next;
+    }
+    let o = &t.outputs[&output];
+    rt.block_on(ix.merge(&o.layers, 0..o.layers.len(), o.head, "big/m"))
+        .unwrap();
 }

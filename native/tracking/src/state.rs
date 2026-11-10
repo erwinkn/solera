@@ -58,6 +58,7 @@ impl Tracking {
     }
 
     pub fn apply_event(&mut self, ev: Event) -> Result<()> {
+        crate::commit::OutputCommit::check_event(&ev.parts)?;
         for p in &ev.parts {
             self.check(p)?;
         }

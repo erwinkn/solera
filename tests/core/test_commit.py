@@ -97,4 +97,6 @@ def test_bad_input_is_refused(index):
     with pytest.raises(ValueError):
         encode_changes(["a"], removes=["a"])
     with pytest.raises(ValueError):
+        encode_changes({"a": "v" * (1 << 20)})
+    with pytest.raises(ValueError):
         t.build_commit(index, b"o", encode_changes(["a"]), version=1, path="o/1", mode="report")
