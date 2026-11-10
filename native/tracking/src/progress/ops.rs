@@ -28,6 +28,11 @@ pub struct InputReport {
 pub struct Ops {
     pub parts: Vec<Part>,
     pub records: Vec<Record>,
+    /// Per keyed input, sorted: the keys this commit held back because they
+    /// were loaded at another version than planned while the input's output
+    /// was mid full run or after a clear since the plan's head. Each keeps
+    /// what it held; whether it failed is not recorded.
+    pub held_back: Vec<Vec<Key>>,
 }
 
 impl Ops {
@@ -59,6 +64,7 @@ impl Tracking {
         }
         let mut parts = Vec::new();
         let mut records = Vec::new();
+        let mut held_back = Vec::new();
         for (p, report) in plan.inputs.iter().zip(reports) {
             let Some(keyed) = self.edges.get(&p.edge).and_then(|e| e.progress.keyed()) else {
                 return invalid(format!(
@@ -82,10 +88,35 @@ impl Tracking {
                     .ok()
                     .map(|i| &report.loaded[i].1)
             };
+            let unsettled = self.outputs.get(&p.output).is_some_and(|o| {
+                o.full_run.is_some()
+                    || o.layers
+                        .iter()
+                        .flat_map(|l| &l.clears)
+                        .any(|&k| p.head < k && k <= o.head)
+            });
+            let mut held = Vec::new();
             let mut points: Vec<(Key, Point)> = Vec::new();
             let key_list = matches!(plan.mode, Mode::Keys(_));
             for c in &p.keys {
                 let wanted = Holding::of(c.version.as_version(), &p.conditions, &c.key);
+                let moved = loaded(&c.key).is_some_and(|v| {
+                    owed(&Holding::of(v.as_version(), &p.conditions, &c.key), &wanted)
+                });
+                if unsettled && moved {
+                    held.push(c.key.clone());
+                    if key_list || owed(&c.held, &wanted) {
+                        points.push((
+                            c.key.clone(),
+                            Point {
+                                holding: c.held.clone(),
+                                reason: Reason::HeldBack,
+                                seen: (!key_list).then(|| c.version.clone()),
+                            },
+                        ));
+                    }
+                    continue;
+                }
                 if failed(&c.key) {
                     if key_list || owed(&c.held, &wanted) {
                         points.push((
@@ -140,6 +171,7 @@ impl Tracking {
             } else {
                 keyed.slice(&plan.range)
             };
+            held_back.push(held);
             records.push(Record {
                 producer: producer.to_vec(),
                 edge: p.edge.clone(),
@@ -183,6 +215,10 @@ impl Tracking {
             c.check(self)?;
             parts.push(Part::Consumed(c));
         }
-        Ok(Ops { parts, records })
+        Ok(Ops {
+            parts,
+            records,
+            held_back,
+        })
     }
 }
