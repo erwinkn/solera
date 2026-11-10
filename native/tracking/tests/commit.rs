@@ -247,7 +247,10 @@ fn commits_match_the_fold() {
                 (false, Mode::Clear) => Some(head + 1),
                 _ => out.full_run,
             };
-            assert_eq!(t.outputs[&output].full_run, full_run, "seed {seed} step {step}");
+            assert_eq!(
+                t.outputs[&output].full_run, full_run,
+                "seed {seed} step {step}"
+            );
             let layers = t.outputs[&output].layers.clone();
             let c = head + 1;
             let got = rt
@@ -284,7 +287,10 @@ fn commits_match_the_fold() {
                 let written = (0..changes.len())
                     .filter(|&i| changes.change(i) != Change::Removed)
                     .count() as u64;
-                assert_eq!((built.added, built.updated, built.removed), (written, 0, out.live));
+                assert_eq!(
+                    (built.added, built.updated, built.removed),
+                    (written, 0, out.live)
+                );
                 assert_eq!(built.part.layer.clears, [c]);
             } else {
                 assert_eq!(built.added, counts(|e| e.2.is_none()));
