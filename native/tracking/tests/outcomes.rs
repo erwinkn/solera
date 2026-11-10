@@ -10,7 +10,14 @@
 //! - a retry pass takes exactly the keys eligible when it starts that are
 //!   still owed and unchanged since they failed, in key order;
 //! - a failure whose input returns to what the consumer holds is moot;
-//! - counts by outcome match the records; snapshots round-trip.
+//! - counts by outcome match the records; snapshots round-trip;
+//! - staleness (B7, D210) agrees with the planner and the retry plan: an
+//!   edge reads fresh only if no key is due and the pass under way takes
+//!   none, and stale only on a key that is due, with the reason what the
+//!   consumer holds gives, or on one the pass takes ("retry due"). Upstream
+//!   commits carry the staleness notice (on two commits in three, so a
+//!   lost one is covered); the status is checked after each, and a refresh
+//!   runs at random before and after each step's catch-up.
 //!
 //! The multi-input histories give one consumer two keyed inputs, with
 //! retries on either input taken on both (`due::plan_all`), during full
@@ -27,6 +34,7 @@ use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
 use solera_index::{ChangeIndex, LayerRef, NewCommit, Run, Store, StoreOptions, WriteOptions};
 use solera_tracking::codec::Ver;
+use solera_tracking::commit::OutputCommit;
 use solera_tracking::due;
 use solera_tracking::event::{Event, Part};
 use solera_tracking::outcomes::commit::{self as oc, records, Ctx};
@@ -39,7 +47,8 @@ use solera_tracking::progress::{
     owed, Class, Conditions, EdgeClose, EdgeOpen, EdgeRename, Holding, InputReport, Key, Ops, Pat,
     Patterns, Reset, Value,
 };
-use solera_tracking::{Output, Tracking};
+use solera_tracking::stale::{self, NoneDue, Reason as Why, SetWatch, Status, Watch};
+use solera_tracking::Tracking;
 
 fn key(s: &str) -> Key {
     s.as_bytes().into()
@@ -83,6 +92,8 @@ impl Log {
         };
         let mut run = Run::new();
         let c = self.head() + 1;
+        let mut notice =
+            (c % 3 != 0).then(|| stale::Notice::new(t, self.name.as_bytes(), c, clear, 0));
         for (k, new) in &changes {
             let old = if clear {
                 Ver::Absent
@@ -94,6 +105,9 @@ impl Log {
             }
             run.push_key(k);
             run.push_entry(c, new.as_version(), old.as_version());
+            if let Some(n) = notice.as_mut() {
+                n.push(k, new.as_version());
+            }
             match new {
                 Ver::Absent => after.remove(k),
                 v => after.insert(k.clone(), v.clone()),
@@ -117,17 +131,25 @@ impl Log {
             self.clears.push(c);
             self.full_run = Some(c);
         }
+        let was = t
+            .outputs
+            .get(self.name.as_bytes())
+            .is_some_and(|o| o.full_run.is_some());
         if ends {
             self.full_run = None;
         }
-        t.outputs.insert(
-            key(&self.name),
-            Output {
-                layers: self.layers.clone(),
-                head: c,
-                live: self.states.last().unwrap().len() as u64,
-                full_run: self.full_run,
-            },
+        let mut parts = vec![Part::OutputCommit(OutputCommit {
+            output: key(&self.name),
+            layer: self.layers.last().unwrap().clone(),
+            live: self.states.last().unwrap().len() as u64,
+            ends_full_run: ends && (clear || was),
+        })];
+        parts.extend(notice.map_or(vec![], |n| n.finish()));
+        t.apply(&Event::of(parts).encode()).unwrap();
+        let o = &t.outputs[self.name.as_bytes()];
+        assert_eq!(
+            (o.head, o.full_run, o.layers.len()),
+            (c, self.full_run, self.layers.len())
         );
         true
     }
@@ -171,6 +193,11 @@ fn trace(m: &str) {
 
 struct World {
     rng: SmallRng,
+    /// Draws for the staleness checks, apart so that they leave the
+    /// history each seed gives unchanged.
+    stale_rng: SmallRng,
+    /// Whether the edge's watch keeps the gate (rule 8).
+    gate: bool,
     t: Tracking,
     log: Log,
     universe: Vec<Key>,
@@ -182,7 +209,7 @@ struct World {
     counters: Counters,
     files: u64,
     events: u64,
-    stats: [usize; 7],
+    stats: [usize; 11],
     /// Plans held back to commit late, after the state moved on.
     stale: Vec<plan::Plan>,
     /// Every key a batch runs fails (a bad deploy).
@@ -323,6 +350,131 @@ impl World {
             .unwrap()
         {
             self.apply(parts);
+        }
+    }
+
+    /// Journals the watch the conditions now call for, refreshes at random,
+    /// and checks the status. A refresh on an edge with failure records
+    /// waits for the catch-up.
+    async fn stale_check(&mut self, ix: &ChangeIndex, caught_up: bool) {
+        let label = if caught_up {
+            "after the catch-up"
+        } else {
+            "before the catch-up"
+        };
+        let edge = self.edge();
+        let watch = self.t.stale.inputs[&edge].watch.as_ref();
+        if watch.is_none_or(|w| w.conditions != self.now || w.gate != self.gate) {
+            let part = Part::Watch(SetWatch {
+                edge: edge.clone(),
+                watch: Watch {
+                    conditions: self.now.clone(),
+                    own: None,
+                    gate: self.gate,
+                },
+            });
+            self.t.apply(&Event::of(vec![part]).encode()).unwrap();
+        }
+        if self.stale_rng.random_bool(0.6) {
+            match self.t.stale_ask(&edge) {
+                Ok(ask) => {
+                    let w = stale::refresh(&ask, &OneIndex(ix), &NoneDue, 1)
+                        .await
+                        .unwrap();
+                    if let Some(w) = w {
+                        self.t
+                            .apply(&Event::of(vec![Part::Witness(w)]).encode())
+                            .unwrap();
+                    }
+                    let status = self.t.stale_status(&edge).unwrap();
+                    assert!(
+                        !matches!(status, Status::Unknown | Status::Unwatched),
+                        "[{label}] a refresh leaves the edge known"
+                    );
+                }
+                Err(e) => {
+                    assert!(e.to_string().contains("catch up first"), "{e}");
+                    assert!(
+                        !caught_up || self.t.rebuild(&edge) != self.now.rebuild,
+                        "refused after the catch-up under the conditions staleness reads: {e}"
+                    );
+                    self.stats[10] += 1;
+                }
+            }
+        }
+        self.stale_verify(ix, label).await;
+    }
+
+    /// The status against the planner's due keys and the retry plan's.
+    async fn stale_verify(&mut self, ix: &ChangeIndex, label: &str) {
+        let edge = self.edge();
+        let status = self.t.stale_status(&edge).unwrap();
+        let held = self.gate && self.log.full_run.is_some();
+        if status != Status::Unwatched {
+            assert_eq!(
+                status == Status::Held,
+                held,
+                "[{label}] held exactly while the gate holds the input's full run"
+            );
+        }
+        if matches!(status, Status::Unknown | Status::Unwatched | Status::Held) {
+            return;
+        }
+        let ask = self.t.stale_ask(&edge).unwrap();
+        let (due, _) = ask.keys(&OneIndex(ix), &NoneDue, None, 1000).await.unwrap();
+        let retry: Vec<Key> = match &ask.retry {
+            Some(r) => due::plan(&OneIndex(ix), r, &ask.req.conditions, 1000)
+                .await
+                .unwrap()
+                .inputs[0]
+                .keys
+                .iter()
+                .map(|c| c.key.clone())
+                .collect(),
+            None => vec![],
+        };
+        let keyed = ask.keyed();
+        let now = &ask.req.conditions;
+        let other = |h: &Conditions, key: &[u8]| !h.same_processing(now) || !h.patterns.takes(key);
+        let why = |key: &[u8], held: &Holding| match held {
+            Holding::Held => Why::NeverProcessed,
+            Holding::Version(_, h) if other(h, key) || !now.patterns.takes(key) => {
+                Why::ConditionsChanged
+            }
+            Holding::Version(..) => Why::InputChanged,
+            Holding::Absent => match (keyed.point(key), keyed.value_of(key)) {
+                (None, Value::Empty | Value::Held) => Why::NeverProcessed,
+                (None, Value::At(_, h)) if other(&h, key) => Why::ConditionsChanged,
+                _ => Why::InputChanged,
+            },
+        };
+        let due_keys: Vec<(&Key, &Holding)> = due.iter().map(|c| (&c.key, &c.held)).collect();
+        let at = format!("[{label}] {status:?}; due {due_keys:?}; retry {retry:?}");
+        match &status {
+            Status::Fresh => {
+                self.stats[7] += 1;
+                assert!(
+                    due.is_empty() && retry.is_empty(),
+                    "fresh, but something is due {at}"
+                );
+            }
+            Status::Stale { key, reason, .. } => {
+                let key = key.as_ref().unwrap();
+                if *reason == Why::RetryDue {
+                    self.stats[9] += 1;
+                    assert!(
+                        retry.contains(key),
+                        "retry due on a key the pass does not take {at}"
+                    );
+                } else {
+                    self.stats[8] += 1;
+                    let Some(c) = due.iter().find(|c| c.key == *key) else {
+                        panic!("stale on a key that is not due {at}");
+                    };
+                    assert_eq!(*reason, why(key, &c.held), "the reason {at}");
+                }
+            }
+            _ => unreachable!(),
         }
     }
 
@@ -968,6 +1120,7 @@ impl World {
         }
         let ends = self.rng.random_bool(0.5);
         if self.log.commit(ix, &mut self.t, changes, false, ends).await {
+            self.stale_verify(ix, "after the commit's notice").await;
             self.reverted();
         }
     }
@@ -984,6 +1137,7 @@ impl World {
         let ends = self.rng.random_bool(0.3);
         trace("the input clears");
         if self.log.commit(ix, &mut self.t, changes, true, ends).await {
+            self.stale_verify(ix, "after the commit's notice").await;
             self.reverted();
         }
     }
@@ -1191,6 +1345,8 @@ fn world(seed: u64) -> World {
         fail_all: false,
         races: false,
         deferred: vec![],
+        stale_rng: SmallRng::seed_from_u64(seed ^ 0x5eed),
+        gate: seed % 2 == 0,
         rng,
         t: Tracking::new(),
         log: Log {
@@ -1212,7 +1368,7 @@ fn world(seed: u64) -> World {
         },
         files: 0,
         events: 0,
-        stats: [0; 7],
+        stats: [0; 11],
         stale: vec![],
         era: 0,
     };
@@ -1224,7 +1380,7 @@ fn world(seed: u64) -> World {
     w
 }
 
-async fn history(seed: u64, ix: &ChangeIndex) -> [usize; 7] {
+async fn history(seed: u64, ix: &ChangeIndex) -> [usize; 11] {
     let mut w = world(seed);
     let trace = std::env::var("OUTCOME_TRACE").is_ok();
     for step in 0..60 {
@@ -1311,7 +1467,9 @@ async fn history(seed: u64, ix: &ChangeIndex) -> [usize; 7] {
             }
             _ => unreachable!(),
         }
+        w.stale_check(ix, false).await;
         w.catch_up(ix).await;
+        w.stale_check(ix, true).await;
         if trace {
             let short = |h: &Holding| match h {
                 Holding::Version(v, c) => format!(
@@ -1391,7 +1549,7 @@ fn random_histories() {
         .enable_all()
         .build()
         .unwrap();
-    let mut total = [0usize; 7];
+    let mut total = [0usize; 11];
     let only: Option<u64> = std::env::var("OUTCOME_SEED")
         .ok()
         .and_then(|s| s.parse().ok());
@@ -1402,7 +1560,7 @@ fn random_histories() {
         }));
         match s {
             Ok(s) => {
-                for i in 0..7 {
+                for i in 0..11 {
                     total[i] += s[i];
                 }
             }
@@ -1412,7 +1570,7 @@ fn random_histories() {
             }
         }
     }
-    eprintln!("{seeds} histories: change batches {}, key lists {}, retry passes {} taking {} keys, failing keys left {}, late commits accepted {}, keys held back {}", total[0], total[1], total[2], total[3], total[4], total[5], total[6]);
+    eprintln!("{seeds} histories: change batches {}, key lists {}, retry passes {} taking {} keys, failing keys left {}, late commits accepted {}, keys held back {}; staleness checked fresh {}, stale {}, retry due {}; refreshes refused for want of a catch-up {}", total[0], total[1], total[2], total[3], total[4], total[5], total[6], total[7], total[8], total[9], total[10]);
 }
 
 /// A retry batch planned in one pass never commits in another (review F3):
