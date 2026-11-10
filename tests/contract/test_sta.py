@@ -1,7 +1,6 @@
 """STA: staleness, completeness and statuses (docs/behaviors.md)."""
 
 import asyncio
-import contextlib
 
 import pytest
 from solera import Transient
@@ -802,18 +801,31 @@ class Rebuild:
     """`feed` (a keyed source) -> `items` -> `copy` (keyed, `batch_size=2`)
     -> `archive` (keyed, incremental over `copy`) and `summary` (reading
     `copy` whole). Each producer records what it received; `pause(i)`
-    holds copy's next batch `i`, once begun, until released."""
+    holds copy's next batch `i`, once begun, until released, and
+    `failing` names the batches of copy that fail, once each. Used as
+    `async with`: leaving it releases every pause, whatever the test did."""
 
     def __init__(self, solera):
         self.solera, self.outside = solera, Outside()
         self.seen: dict[str, list[Batch]] = {}
         self.summaries: list[list[str]] = []
         self.pauses: dict[int, tuple[asyncio.Event, asyncio.Event]] = {}
+        self.failing: set[int] = set()
+        self.releases: list[asyncio.Event] = []
         self.release = asyncio.Event()
 
+    async def __aenter__(self) -> "Rebuild":
+        return self
+
+    async def __aexit__(self, *exc) -> None:
+        for release in self.releases:
+            release.set()
+
     def pause(self, index: int = 1) -> tuple[asyncio.Event, asyncio.Event]:
-        self.pauses[index] = (asyncio.Event(), asyncio.Event())
-        return self.pauses[index]
+        begun, release = asyncio.Event(), asyncio.Event()
+        self.pauses[index] = (begun, release)
+        self.releases.append(release)
+        return begun, release
 
     def project(
         self, store=None, decl: dict | None = None, archive_executor=None, version: str = "1"
@@ -828,15 +840,18 @@ class Rebuild:
             inputs={"items": Incremental(batch_size=2)},
             outputs=Output("copy", key="id", store="copies" if store else None, **(decl or {})),
             version=version,
+            retries=Retry(0),
         )
         async def copy(ctx, items: list):
             batch = ctx.batch["items"]
+            if batch.index in ex.failing:
+                ex.failing.discard(batch.index)
+                raise RuntimeError("copy fails midway")
             ex.seen.setdefault("copy", []).append(Batch.of(batch, items))
             if batch.index in ex.pauses:
                 begun, release = ex.pauses.pop(batch.index)
                 begun.set()
-                with contextlib.suppress(TimeoutError):  # a test that fails first never releases it
-                    await asyncio.wait_for(release.wait(), 5)
+                await release.wait()
             return rebuild(batch, [{"id": r["id"], "v": r["v"]} for r in items])
 
         @asset(inputs={"copy": Incremental()}, outputs=Output("archive", key="id"), executor=archive_executor)
@@ -896,12 +911,32 @@ class Rebuild:
         self.release.set()
         return await self.solera.wait(run)
 
+    async def failed_midway(self) -> dict:
+        """A full run of copy over k1, k2, k4, k5, as `midway`, whose second
+        batch fails after the first committed: the run, settled."""
+
+        await self.feed({"k5": "1"}, removes=["k3"])
+        self.failing.add(1)
+        return await self.solera.run("copy", mode="full", expect="failed")
+
 
 async def task_of(solera, run: dict, name: str) -> dict:
     """`name`'s task in the run, as `GET /runs/{id}` shows it."""
 
     [task] = [t for t in (await solera.get(f"/runs/{run['id']}"))["tasks"] if t["asset"] == name]
     return task
+
+
+async def decided(solera, run: dict, name: str) -> dict:
+    """`name`'s task in the run once the engine has decided on it: held by
+    a gate, or taken (no longer waiting)."""
+
+    async def done() -> bool:
+        task = await task_of(solera, run, name)
+        return (task.get("held") or [None])[0] == INCOMPLETE or task["status"] not in ("queued", "claimable")
+
+    await solera.until(done)
+    return await task_of(solera, run, name)
 
 
 # -- STA-3 (target) ---------------------------------------------------------------------
@@ -943,14 +978,15 @@ async def test_sta_12_a_status_right_after_a_prefixless_pattern_change_is_exact(
 
 
 async def test_sta_12_an_input_a_gate_holds_says_upstream_incomplete_with_no_number(solera):
-    r = await Rebuild(solera).start()
-    run = await r.midway()
-    reasons = await solera.stale("archive")
-    assert INCOMPLETE in reasons and INPUT not in reasons, reasons
-    assert await solera.stale_keys("archive") == {}  # no number while held
-    await r.finish(run)
-    assert await solera.stale("archive") == [INPUT]
-    assert set(await solera.stale_keys("archive")) == {"k1", "k2", "k3", "k4", "k5"}  # counted once open
+    async with Rebuild(solera) as r:
+        await r.start()
+        run = await r.midway()
+        reasons = await solera.stale("archive")
+        assert INCOMPLETE in reasons and INPUT not in reasons, reasons
+        assert await solera.stale_keys("archive") == {}  # no number while held
+        await r.finish(run)
+        assert await solera.stale("archive") == [INPUT]
+        assert set(await solera.stale_keys("archive")) == {"k1", "k2", "k3", "k4", "k5"}  # counted once open
 
 
 # -- STA-13 (target) --------------------------------------------------------------------
@@ -961,46 +997,70 @@ async def test_sta_13_every_reader_of_an_incomplete_upstream_waits_until_its_ful
     held: their runs wait, saying upstream incomplete, and start once copy
     completes, reading it whole and complete."""
 
-    r = await Rebuild(solera).start()
-    run = await r.midway()
-    archived, summarized = len(r.seen["archive"]), len(r.summaries)
-    readers = [await solera.submit(name) for name in ("archive", "summary")]
-    await solera.settle(0.5)
-    for reader, name in zip(readers, ("archive", "summary"), strict=True):
-        task = await task_of(solera, reader, name)
-        assert task["status"] == "queued" and task.get("held") == [INCOMPLETE, "copy"], task
-    assert len(r.seen["archive"]) == archived and len(r.summaries) == summarized
-    assert (await r.finish(run))["request"]["status"] == "succeeded"
-    for reader in readers:
-        assert (await solera.wait(reader))["request"]["status"] == "succeeded"
-    [batch] = r.seen["archive"][archived:]
-    assert batch.classes == (["k5"], ["k1", "k2", "k4"], ["k3"]) and not batch.reset
-    assert r.summaries[summarized:] == [["k1", "k2", "k4", "k5"]]
-    assert await solera.rows("archive") == await solera.rows("copy")
+    async with Rebuild(solera) as r:
+        await r.start()
+        run = await r.midway()
+        archived, summarized = len(r.seen["archive"]), len(r.summaries)
+        readers = [await solera.submit(name) for name in ("archive", "summary")]
+        for reader, name in zip(readers, ("archive", "summary"), strict=True):
+            task = await decided(solera, reader, name)
+            assert task["status"] == "queued" and task.get("held") == [INCOMPLETE, "copy"], task
+        assert len(r.seen["archive"]) == archived and len(r.summaries) == summarized
+        assert (await r.finish(run))["request"]["status"] == "succeeded"
+        for reader in readers:
+            assert (await solera.wait(reader))["request"]["status"] == "succeeded"
+        [batch] = r.seen["archive"][archived:]
+        assert batch.classes == (["k5"], ["k1", "k2", "k4"], ["k3"]) and not batch.reset
+        assert r.summaries[summarized:] == [["k1", "k2", "k4", "k5"]]
+        assert await solera.rows("archive") == await solera.rows("copy")
+
+
+async def held_for_good(solera, r: Rebuild) -> dict:
+    """copy is left incomplete: a run of archive is held, saying so, and an
+    alarm names copy. Running copy again completes it, the alarm goes, and
+    archive's run goes on: its detail, settled."""
+
+    assert not (await solera.head("copy"))["materialized"]
+    reader = await solera.submit("archive")
+    archived = len(r.seen["archive"])
+    task = await decided(solera, reader, "archive")
+    assert task["status"] == "queued" and task.get("held") == [INCOMPLETE, "copy"], task
+    assert len(r.seen["archive"]) == archived
+    assert await solera.alarmed("copy"), await solera.alarms()
+    await solera.run("copy")
+    detail = await solera.wait(reader)
+    assert (
+        await solera.rows("archive")
+        == await solera.rows("copy")
+        == {"k1": "1", "k2": "1", "k4": "1", "k5": "1"}
+    )
+    assert not await solera.alarmed("copy"), await solera.alarms()
+    return detail
 
 
 async def test_sta_13_a_full_run_canceled_midway_holds_its_readers_and_raises_an_alarm(solera):
     """Nothing resumes a canceled run: copy stays incomplete, archive stays
-    held, and the engine's diagnostics name copy. Running copy again
-    completes it, and archive goes on."""
+    held, and an alarm names copy until copy runs again."""
 
-    r = await Rebuild(solera).start()
-    run = await r.midway()
-    await solera.cancel(run["id"])
-    assert (await solera.wait(run))["request"]["status"] == "canceled"
-    r.release.set()
-    assert not (await solera.head("copy"))["materialized"]
-    reader = await solera.submit("archive")
-    archived = len(r.seen["archive"])
-    await solera.settle(0.5)
-    task = await task_of(solera, reader, "archive")
-    assert task["status"] == "queued" and task.get("held") == [INCOMPLETE, "copy"], task
-    assert len(r.seen["archive"]) == archived
-    assert "copy" in str(await solera.alarms()), await solera.alarms()
-    await solera.run("copy")
-    assert (await solera.wait(reader))["request"]["status"] == "succeeded"
-    assert await solera.rows("archive") == await solera.rows("copy")
-    assert "copy" not in str(await solera.alarms())
+    async with Rebuild(solera) as r:
+        await r.start()
+        run = await r.midway()
+        await solera.cancel(run["id"])
+        assert (await solera.wait(run))["request"]["status"] == "canceled"
+        r.release.set()
+        assert (await held_for_good(solera, r))["request"]["status"] == "succeeded"
+
+
+async def test_sta_13_a_full_run_failed_midway_holds_its_readers_and_raises_an_alarm(solera):
+    """copy's full run fails in its second batch, after its first committed
+    (the clear, with k1 and k2): copy stays incomplete, archive stays held,
+    and an alarm names copy until copy runs again."""
+
+    async with Rebuild(solera) as r:
+        await r.start()
+        await r.failed_midway()
+        assert await solera.rows("copy") == {"k1": "1", "k2": "1"}
+        assert (await held_for_good(solera, r))["request"]["status"] == "succeeded"
 
 
 @pytest.mark.postgres
@@ -1008,7 +1068,8 @@ async def test_sta_13_on_a_table_a_batch_in_flight_holds_back_keys_it_loaded_at_
     """archive's batch, planned with k3 and k4 updated, loads only once
     copy's full run has cleared its table and written k1 and k2: it finds k3
     and k4 absent, at another version than planned, and holds them back.
-    archive keeps their rows and still owes them; nothing is removed."""
+    archive keeps their rows and is held while copy is incomplete; once copy
+    completes, and before archive runs again, it still owes them."""
 
     import os
     import uuid
@@ -1025,23 +1086,24 @@ async def test_sta_13_on_a_table_a_batch_in_flight_holds_back_keys_it_loaded_at_
     decl = {"schema": schema, "columns": {"id": "text", "v": "text"}}
     store = PostgresStore("env:SOLERA_TEST_DATABASE_URL")
     try:
-        r = Rebuild(solera)
-        await r.start(store=store, decl=decl, archive_executor=Pool("p")())
-        archive = await solera.submit("archive")
-        await solera.work("p", r.project(store, decl, Pool("p")()))
-        await solera.wait(archive)
-        await r.feed({"k3": "2", "k4": "2"})
-        await solera.run("copy")
-        archive = await solera.submit("archive")
-        assert await solera.offered("p")  # launched: k3 and k4 planned as updated
-        run = await r.midway()  # copy's table: k1 and k2 alone
-        await solera.work("p", r.project(store, decl, Pool("p")()))
-        assert await solera.rows("archive") == {"k1": "1", "k2": "1", "k3": "1", "k4": "1"}
-        assert {"k3", "k4"} <= set(await solera.stale_keys("archive"))
-        await r.finish(run)
-        await solera.work("p", r.project(store, decl, Pool("p")()))
-        assert (await solera.wait(archive))["request"]["status"] == "succeeded"
-        assert await solera.rows("archive") == await solera.rows("copy")
+        async with Rebuild(solera) as r:
+            await r.start(store=store, decl=decl, archive_executor=Pool("p")())
+            archive = await solera.submit("archive")
+            await solera.work("p", r.project(store, decl, Pool("p")()))
+            await solera.wait(archive)
+            await r.feed({"k3": "2", "k4": "2"})
+            await solera.run("copy")
+            archive = await solera.submit("archive")
+            assert await solera.offered("p")  # launched: k3 and k4 planned as updated
+            run = await r.midway()  # copy's table: k1 and k2 alone
+            await solera.work("p", r.project(store, decl, Pool("p")()))
+            assert await solera.rows("archive") == {"k1": "1", "k2": "1", "k3": "1", "k4": "1"}
+            assert INCOMPLETE in await solera.stale("archive")
+            await r.finish(run)
+            assert {"k3", "k4"} <= set(await solera.stale_keys("archive"))  # archive has not run again
+            await solera.work("p", r.project(store, decl, Pool("p")()))
+            assert (await solera.wait(archive))["request"]["status"] == "succeeded"
+            assert await solera.rows("archive") == await solera.rows("copy")
     finally:
         with psycopg.connect(dsn, autocommit=True) as conn:
             conn.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')

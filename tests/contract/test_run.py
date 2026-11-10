@@ -11,7 +11,7 @@ from solera.stores import FileStore
 
 from tests.contract.example import Example
 from tests.contract.harness import Refused
-from tests.contract.test_sta import Rebuild, task_of
+from tests.contract.test_sta import Rebuild, decided
 
 
 class Unprocessable(Rejected):
@@ -793,14 +793,15 @@ async def test_run_15_a_selection_past_100000_partitions_is_refused_not_truncate
 
 
 async def test_run_4_a_task_held_by_an_upstream_mid_full_run_says_upstream_incomplete(solera):
-    r = await Rebuild(solera).start()
-    run = await r.midway()
-    reader = await solera.submit("archive")
-    await solera.settle(0.5)
-    task = await task_of(solera, reader, "archive")
-    assert task["status"] == "queued" and task.get("held") == ["upstream incomplete", "copy"], task
-    events = await solera.get(f"/runs/{reader['id']}/events")
-    held = [(e["reason"], e["name"]) for e in events if e["type"] == "held"]
-    assert held == [("upstream incomplete", "copy")]  # once, not every tick
-    await r.finish(run)
-    assert (await solera.wait(reader))["request"]["status"] == "succeeded"
+    async with Rebuild(solera) as r:
+        await r.start()
+        run = await r.midway()
+        reader = await solera.submit("archive")
+        task = await decided(solera, reader, "archive")
+        assert task["status"] == "queued" and task.get("held") == ["upstream incomplete", "copy"], task
+        events = await solera.get(f"/runs/{reader['id']}/events")
+        assert [(e["reason"], e["name"]) for e in events if e["type"] == "held"] == [
+            ("upstream incomplete", "copy")
+        ]
+        await r.finish(run)
+        assert (await solera.wait(reader))["request"]["status"] == "succeeded"
