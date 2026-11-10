@@ -16,6 +16,7 @@ use crate::codec::{Dec, Enc};
 use crate::error::{format, Result};
 use crate::event::{Event, Part};
 use crate::progress::Progress;
+use crate::stale::Stale;
 
 /// An opaque name the engine chooses: an output (asset, partition, output
 /// name) or an edge (consumer partition, input name), encoded by Python.
@@ -50,6 +51,8 @@ pub struct Tracking {
     pub per_key: BTreeMap<Id, crate::outcomes::PerKey>,
     /// B6: the last life given to a per-key edge.
     pub lives: u64,
+    /// B7: staleness per keyed edge.
+    pub stale: Stale,
 }
 
 impl Tracking {
@@ -106,11 +109,14 @@ impl Tracking {
             Part::Outcomes(p) => p.check(self),
             Part::PassStart(p) => p.check(self),
             Part::Rebuild(p) => p.check(self),
+            Part::Watch(p) => p.check(self),
+            Part::Witness(p) => p.check(self),
         }
     }
 
     fn apply_part(&mut self, p: Part) {
         crate::outcomes::follow(&p, self);
+        self.stale_touch(&p);
         match p {
             Part::EdgeOpen(p) => p.apply(self),
             Part::EdgeClose(p) => p.apply(self),
@@ -123,6 +129,8 @@ impl Tracking {
             Part::Outcomes(p) => p.apply(self),
             Part::PassStart(p) => p.apply(self),
             Part::Rebuild(p) => p.apply(self),
+            Part::Watch(p) => p.apply(self),
+            Part::Witness(p) => p.apply(self),
         }
     }
 
@@ -152,6 +160,7 @@ impl Tracking {
             k.encode(&mut e);
         }
         e.uv(self.lives);
+        self.stale.encode(&mut e);
         e.buf
     }
 
@@ -190,6 +199,7 @@ impl Tracking {
                 .insert(id, crate::outcomes::PerKey::decode(&mut d)?);
         }
         t.lives = d.uv()?;
+        t.stale = Stale::decode(&mut d)?;
         d.end()?;
         Ok(t)
     }

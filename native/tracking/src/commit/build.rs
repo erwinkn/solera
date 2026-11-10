@@ -74,8 +74,13 @@ pub struct Changed {
     pub removed: Vec<Box<[u8]>>,
 }
 
-struct Entries {
+/// Shown each entry of a commit as it is written, in key order: the key and
+/// its new version (B7's notice reads them).
+pub type Each<'a> = &'a mut (dyn FnMut(&[u8], Version<'_>) + Send);
+
+struct Entries<'a> {
     w: CommitWriter,
+    each: Each<'a>,
     added: u64,
     updated: u64,
     removed: u64,
@@ -84,7 +89,7 @@ struct Entries {
     version: u64,
 }
 
-impl Entries {
+impl Entries<'_> {
     async fn put(&mut self, key: &[u8], change: Change<'_>, old: Version<'_>) -> Result<()> {
         let new = match change {
             Change::Upsert(None) => Version::Int(self.version),
@@ -95,6 +100,7 @@ impl Entries {
             return Ok(());
         }
         self.w.push(key, new, old).await?;
+        (self.each)(key, new);
         match (new.is_absent(), old.is_absent()) {
             (false, true) => self.added += 1,
             (false, false) => self.updated += 1,
@@ -123,6 +129,18 @@ pub async fn build(
     spec: Spec<'_>,
     changes: &mut dyn Source,
 ) -> Result<Option<Built>> {
+    build_each(ixs, output, out, spec, changes, &mut |_, _| {}).await
+}
+
+/// `build`, showing `each` every entry it writes.
+pub async fn build_each(
+    ixs: &dyn Indexes,
+    output: &Id,
+    out: &Output,
+    spec: Spec<'_>,
+    changes: &mut dyn Source,
+    each: Each<'_>,
+) -> Result<Option<Built>> {
     let ix = ixs.index(output)?;
     let head = out.head;
     let commit = head + 1;
@@ -140,6 +158,7 @@ pub async fn build(
     };
     let mut e = Entries {
         w: ix.commit_writer(spec.path, nc)?,
+        each,
         added: 0,
         updated: 0,
         removed: 0,
@@ -192,7 +211,7 @@ async fn patch(
     out: &Output,
     mode: Mode,
     ch: &Changes,
-    e: &mut Entries,
+    e: &mut Entries<'_>,
 ) -> Result<()> {
     let keys: Vec<&[u8]> = (0..ch.len()).map(|i| ch.key(i)).collect();
     let keys = &keys;
@@ -241,7 +260,7 @@ async fn replace(
     out: &Output,
     changes: &mut dyn Source,
     ch: &mut Changes,
-    e: &mut Entries,
+    e: &mut Entries<'_>,
 ) -> Result<()> {
     let mut page = Run::new();
     let mut after: Option<Vec<u8>> = None;
