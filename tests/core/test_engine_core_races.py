@@ -428,12 +428,12 @@ async def test_a_run_cancelled_while_its_batch_is_planned_keeps_no_plan(solera, 
         assert solera.engine.core.plans == {}
 
 
-async def test_a_key_another_input_took_while_a_clear_came_in_is_held_back_once(solera, tmp_path):
+async def test_a_key_another_input_took_while_a_clear_came_in_is_planned_again_once(solera, tmp_path):
     """join reads feed and copy. Its batch takes k1, changed on feed alone,
     and runs while copy's full run clears copy: copy's input is unsettled,
-    so k1, which it did not take, is held back on both inputs and stays
-    owed. The run ends there, with no batch planned again for it; the next
-    run takes k1 once copy is complete."""
+    so k1, which it did not take, would be held back on both inputs. The
+    batch commits nothing and is planned again, once: copy is complete by
+    then, so the new batch takes k1 on both inputs."""
 
     seen = []
     entered, release = asyncio.Event(), asyncio.Event()
@@ -470,8 +470,9 @@ async def test_a_key_another_input_took_while_a_clear_came_in_is_held_back_once(
     await solera.until(entered.is_set)
     await solera.run("copy", mode="full")  # its clear comes in after join's batch was planned
     release.set()
-    assert (await solera.wait(request))["request"]["status"] == "succeeded"
-    assert seen == [["k1", "k2"], ["k1"]]  # one batch, not planned again
-    await solera.run("join")
-    assert seen[-1] == ["k1"]  # still owed on feed: held back, not processed
+    detail = await solera.wait(request)
+    assert detail["request"]["status"] == "succeeded"
+    [task] = detail["tasks"]
+    assert [a["outcome"] for a in detail["attempts"][task["id"]]] == ["replanned", "succeeded"]
+    assert seen == [["k1", "k2"], ["k1"], ["k1"]]  # planned again once, not in a loop
     assert await solera.rows("join") == {"k1": "2", "k2": "1"}

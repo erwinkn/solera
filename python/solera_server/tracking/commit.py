@@ -38,7 +38,7 @@ class Built:
     elements: dict = field(default_factory=dict)  # a dynamic partitions output -> its elements after
     progress: dict | None = None  # the run's walk over the keyed inputs: {batch, key}
     walk: dict | None = None  # the batch's range of it: {inputs, after, hi, reset}
-    empty: dict = field(default_factory=dict)  # unkeyed input -> where its walk from empty stands
+    empty: dict = field(default_factory=dict)  # unkeyed input -> [reset, done] of its walk from empty
     locks: contextlib.AsyncExitStack = field(default_factory=contextlib.AsyncExitStack)
 
     def payload(self) -> dict | None:
@@ -53,6 +53,9 @@ class Built:
             "walk": self.walk,
             "empty": self.empty,
         }
+
+
+UNSETTLED = "the input became unsettled since the batch's commit was built"  # the core's fence refusal
 
 
 class HeldBack(Conflict):
@@ -74,10 +77,10 @@ def held(ops: tuple) -> None:
 
 def unkeyed_walks(core: Core, task: dict, prepared: dict) -> dict:
     """Per unkeyed incremental input of the batch walking from empty (a full
-    run, or the first), where that walk stands after it: `reset` (it just
-    started over), `walking` or `done`. What `Model.core_empty` holds for
-    keyed inputs as a key, it holds for these as `""` until `done`:
-    completeness reads both."""
+    run, or the first): `[reset, done]`, whether this batch started it over
+    and whether it ended it. What `Model.core_empty` holds for keyed inputs
+    as a key, it holds for these as `""` until done: completeness reads
+    both."""
 
     m, asset, partition = core.m, task["asset"], task["partition"]
     observed = m.partition(asset, partition).get("observed") or {}
@@ -87,7 +90,7 @@ def unkeyed_walks(core: Core, task: dict, prepared: dict) -> dict:
             continue
         reset = plan["full"] or param not in observed
         if reset or (asset, partition, param) in m.core_empty:
-            out[param] = "done" if plan["final"] else "reset" if reset else "walking"
+            out[param] = [bool(reset), bool(plan["final"])]
     return out
 
 
@@ -295,6 +298,13 @@ def unkeyed(prepared: dict) -> dict:
 
 def check(core: Core, built: Built) -> None:
     """The commit check of the core (§7): the event applies to the state as it
-    is now, or nothing is recorded. Run in the synchronous step that records."""
+    is now, or nothing is recorded. Run in the synchronous step that records.
+    An input that cleared after the batch's progress was built would have held
+    keys back: its fence refuses the batch, which is planned again."""
 
-    core.check(built.event)
+    try:
+        core.check(built.event)
+    except Conflict as error:
+        if UNSETTLED in str(error):
+            raise HeldBack(str(error)) from None
+        raise

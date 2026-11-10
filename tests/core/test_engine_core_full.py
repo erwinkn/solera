@@ -245,19 +245,6 @@ async def test_a_key_list_that_would_hold_its_key_back_is_planned_again_and_comp
     assert await solera.engine.complete("join", "") and full.incomplete(solera.engine) == set()
 
 
-def test_a_point_that_keeps_an_absent_holding_does_not_cover_its_key(tmp_path):
-    t = Tracking()
-    t.attach(b"up", ChangeIndex(tmp_path.as_uri()))
-    t.apply(t.build_commit(b"up", encode_changes(["k"]), version=1, path="one")["event"])
-    t.apply(t.event_edge_open(b"e", b"up", True))
-    p = t.plan({"mode": "keys", "keys": ["k"], "limit": 10, "inputs": [{"edge": b"e", "conditions": {}}]})
-    t.apply(t.build_commit(b"up", encode_changes(["k"]), version=2, mode="clear", path="two")["event"])
-    event, _, held = t.progress_ops(p["plan"], [([], [("k", 2)])])
-    assert held == [["k"]]
-    t.apply(event)
-    assert t.taken(b"up", edge=b"e"), "k was held back over the empty base: never processed"
-
-
 async def test_a_whole_reader_waits_for_a_full_run_over_unkeyed_inputs(solera, tmp_path):
     entered, release, holding, seen = asyncio.Event(), asyncio.Event(), [False], []
 
@@ -404,3 +391,194 @@ async def test_proceed_lets_readers_go_on_over_a_partial_output_until_it_starts_
     await solera.wait(rebuild)
     await solera.wait(reader)
     assert seen == [1, 3]
+
+
+def test_the_engines_own_tasks_pass_the_gate(tmp_path):
+    @asset(outputs=Output("items", key="id"))
+    def items():
+        return []
+
+    project = Project(assets=[items], default_store=FileStore(tmp_path / "data"))
+    planner = Planner(project.manifest, lambda o, p: None, lambda o: {}, 0)
+    assert full.gate(planner, {"asset": "@cleanup", "partition": ""}, {("items", "")}) is None
+
+
+async def test_an_input_cleared_while_the_batch_builds_replans_it_without_spending_a_try(solera, tmp_path):
+    @asset(inputs={"feed": Incremental()}, outputs=Output("copy", key="id"))
+    def copy(feed: list):
+        return [{"id": r["id"], "v": r["v"]} for r in feed]
+
+    @asset(
+        inputs={"feed": Incremental(), "copy": Incremental()},
+        outputs=Output("join", key="id"),
+        retries=Retry(n=0),
+    )
+    def join(feed: list, copy: list):
+        return Patch([{"id": r["id"], "v": r["v"]} for r in feed])
+
+    outside = Outside()
+    stores = {"ext": SourceStore(tmp_path / "ext", outside)}
+    sources = [Source("feed", key="id", store="ext")]
+    await solera.deploy(
+        Project(
+            assets=[copy, join], sources=sources, stores=stores, default_store=FileStore(tmp_path / "data")
+        )
+    )
+    outside.feed.update({"k1": "1", "k2": "1"})
+    await solera.commit_source("feed", upsert=outside.feed)
+    await solera.run("copy")
+    await solera.run("join")
+    outside.feed["k1"] = "2"
+    await solera.commit_source("feed", upsert={"k1": "2"})  # join takes k1 from feed, not from copy
+    eng = solera.engine
+    run, entered, release = eng.core.run, asyncio.Event(), asyncio.Event()
+
+    async def join_build_waits(fn, *args, **kwargs):
+        if fn == eng.core.tracking.build_commit and args[0] == eng.m.core_outputs[("join", "")].encode():
+            if not entered.is_set():
+                entered.set()
+                await release.wait()
+        return await run(fn, *args, **kwargs)
+
+    eng.core.run = join_build_waits
+    joining = await solera.submit("join")
+    await solera.until(entered.is_set)
+    await solera.run("copy", mode="full")  # copy clears after the batch's progress was built
+    release.set()
+    detail = await solera.wait(joining)
+    assert detail["request"]["status"] == "succeeded", detail
+    assert [a["outcome"] for a in _attempts(detail, "join")] == ["replanned", "succeeded"]
+    assert await solera.rows("join") == {"k1": "2", "k2": "1"}
+
+
+async def test_finishing_one_unkeyed_walk_does_not_revoke_proceed(solera, tmp_path):
+    phase = ["fail"]
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    @asset(outputs=Output("left", incremental=True))
+    def left():
+        return Patch([{"n": 1}])
+
+    @asset(outputs=Output("right", incremental=True))
+    def right():
+        return Patch([{"n": 1}])
+
+    @asset(inputs={"left": Incremental(batch_size=1), "right": Incremental(batch_size=1)}, retries=Retry(n=0))
+    async def digest(ctx, left: list, right: list):
+        if ctx.batch["right"].index == 1:
+            if phase[0] == "fail":
+                raise RuntimeError("stop after one committed batch")
+            entered.set()
+            await release.wait()
+        return {"n": len(left) + len(right)}
+
+    @asset(inputs={"digest": In()})
+    def report(digest: dict):
+        return digest
+
+    await solera.deploy(
+        Project(assets=[left, right, digest, report], default_store=FileStore(tmp_path / "data"))
+    )
+    for _ in range(2):
+        await solera.run("left")
+    for _ in range(4):
+        await solera.run("right")
+    await solera.run("digest", expect="failed")
+    assert full.incomplete(solera.engine) == {("digest", "")}
+    await solera.post("/assets/digest/proceed", {"partition": ""})
+    assert ("digest", "") in solera.engine.m.proceeded
+    phase[0] = "resume"
+    resumed = await solera.submit("digest")
+    await solera.until(entered.is_set)
+    try:
+        reader = await solera.submit("report")
+        task = await decided(solera, reader, "report")
+        assert task.get("held") != ["upstream incomplete", "digest"], task
+        assert ("digest", "") in solera.engine.m.proceeded
+    finally:
+        release.set()
+        await solera.wait(resumed)
+
+
+async def test_time_waiting_for_incomplete_upstream_does_not_expire_replans(solera, tmp_path):
+    joins = [0]
+    join_entered = [asyncio.Event(), asyncio.Event()]
+    join_release = [asyncio.Event(), asyncio.Event()]
+    empty_entered, empty_release = asyncio.Event(), asyncio.Event()
+    stall_empty = [False]
+
+    @asset(inputs={"feed": Incremental(batch_size=1)}, outputs=Output("empty", key="id"))
+    async def empty(ctx, feed: list):
+        if stall_empty[0] and ctx.batch["feed"].index == 1:
+            empty_entered.set()
+            await empty_release.wait()
+        return []
+
+    @asset(
+        inputs={"feed": Incremental(), "empty": Incremental()},
+        outputs=Output("join", key="id"),
+        retries=Retry(n=0),
+    )
+    async def join(feed: list, empty: list):
+        joins[0] += 1
+        if joins[0] in (2, 3):
+            n = joins[0] - 2
+            join_entered[n].set()
+            await join_release[n].wait()
+        return [{"id": r["id"], "v": r["v"]} for r in feed]
+
+    outside = Outside()
+    await solera.deploy(
+        Project(
+            assets=[empty, join],
+            sources=[Source("feed", key="id", store="ext")],
+            stores={"ext": SourceStore(tmp_path / "ext", outside)},
+            default_store=FileStore(tmp_path / "data"),
+        )
+    )
+    outside.feed.update(k1="1", k2="1")
+    await solera.commit_source("feed", upsert=outside.feed)
+    await solera.run("empty")
+    await solera.run("join")
+    outside.feed["k1"] = "9"
+    await solera.commit_source("feed", upsert={"k1": "9"})
+    request = await solera.submit("join")
+    await solera.until(join_entered[0].is_set)
+    stall_empty[0] = True
+    rebuild = await solera.submit("empty", mode="full")
+    await solera.until(empty_entered.is_set)
+    join_release[0].set()
+    task = next(iter(solera.engine.m.runs[request["id"]]["tasks"].values()))
+    await solera.until(lambda: task.get("held") == ["upstream incomplete", "empty"])
+    assert task.get("outcomes") == {"replanned": 1}
+    solera.advance(901)
+    stall_empty[0] = False
+    empty_release.set()
+    await solera.wait(rebuild)
+    await solera.until(join_entered[1].is_set)
+    await solera.run("empty", mode="full")
+    join_release[1].set()
+    detail = await solera.wait(request)
+    assert detail["request"]["status"] == "succeeded", detail["tasks"]
+
+
+def test_failed_retry_does_not_erase_a_successful_key_list_removals_coverage(tmp_path):
+    t = Tracking()
+    t.attach(b"up", ChangeIndex(tmp_path.as_uri()))
+    t.apply(t.build_commit(b"up", encode_changes(["k"]), version=1, path="one")["event"])
+    t.apply(t.event_edge_open(b"e", b"up", True))
+
+    def plan():
+        return t.plan(
+            {"mode": "keys", "keys": ["k"], "limit": 10, "inputs": [{"edge": b"e", "conditions": {}}]}
+        )["plan"]
+
+    t.apply(t.progress_ops(plan(), [([], [])])[0])
+    t.apply(t.build_commit(b"up", encode_changes([], ["k"]), version=2, path="two")["event"])
+    t.apply(t.progress_ops(plan(), [([], [])])[0])
+    t.apply(t.build_commit(b"up", encode_changes(["k"]), version=3, path="three")["event"])
+    assert not t.taken(b"up", edge=b"e"), "the key list successfully processed k's removal"
+    t.apply(t.progress_ops(plan(), [(["k"], [])])[0])
+    assert not t.taken(b"up", edge=b"e"), (
+        "a failed retry must keep k's earlier coverage, as well as its holding"
+    )

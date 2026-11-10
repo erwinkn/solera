@@ -996,14 +996,19 @@ class Model:
         engine is full, their executor is, another attempt holds their
         partition, an output's merges are far behind, or an attempt is
         writing a fenced input's partition or it owes a repair (`writing`,
-        `repair`). Only a change of reason is an event."""
+        `repair`), or an upstream is incomplete (B5's gate). Only a change of
+        reason is an event."""
 
         for tid, held in sorted(e["held"].items()):
             task = self.task(tid)
             if task is None or task["status"] != "queued" or task.get("held") == held:
                 continue
             task["held"] = held
-            if held[0] in ("writing", "repair"):  # the wait has its reason: replans start afresh
+            if held[0] in (
+                "writing",
+                "repair",
+                "upstream incomplete",
+            ):  # the wait has its reason: replans start afresh
                 task.pop("replanning_since", None)
             self._event(self.runs[task["run"]], "held", e["at"], tid, reason=held[0], name=held[1])
 
@@ -1239,10 +1244,10 @@ class Model:
             self._core_apply(core)
             if core.get("walk") is not None:
                 self._core_walk(asset, partition, core["walk"])
-            for param, stands in (core.get("empty") or {}).items():  # unkeyed inputs' walks from empty
-                if stands != "walking":
+            for param, (reset, done) in (core.get("empty") or {}).items():  # unkeyed inputs' walks from empty
+                if reset:  # the partition starts over: an operator's proceed no longer holds
                     self.proceeded.pop((asset, partition), None)
-                if stands == "done":
+                if done:
                     self.core_empty.pop((asset, partition, param), None)
                 else:
                     self.core_empty[(asset, partition, param)] = ""

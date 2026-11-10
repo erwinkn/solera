@@ -53,6 +53,8 @@ def gate(planner, task: dict, incomplete: set) -> list | None:
     """Why a task waits for an upstream, if it does: the first output it
     reads, incrementally or whole, that is `incomplete`."""
 
+    if task["asset"] not in planner.manifest["assets"]:  # the engine's own task (a cleanup): it reads nothing
+        return None
     try:
         inputs = planner.inputs(task["asset"], task["partition"])
     except planning.UpstreamOnly:  # its preparation refuses it, saying why

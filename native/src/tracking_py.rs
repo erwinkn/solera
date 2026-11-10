@@ -18,7 +18,7 @@ use solera_tracking as tr;
 use tr::codec::Ver;
 use tr::event::{Event, Part};
 use tr::plan::{InputRequest, Mode, Plan, Request};
-use tr::progress::{Class, Conditions, Holding, Key, Matcher, Pat, Patterns, Point, Reason};
+use tr::progress::{Class, Conditions, Key, Matcher, Pat, Patterns};
 
 use crate::index_py::{key, layers_in, rt, version, ChangeIndex, Owned};
 use crate::{guard, FormatError};
@@ -390,8 +390,7 @@ impl Tracking {
     /// `patterns` (`solera.patterns.spec(…)`) take: a scan of its attached
     /// index, a page at a time, stopping at the first such key. Nothing
     /// crosses per key; False before its first commit. With `edge`, a key
-    /// that edge processed in a point (a key list's) does not count; a point
-    /// that keeps an absent holding (failed, held back) does not process it.
+    /// that edge holds a point for (a key list processed it) does not count.
     #[pyo3(signature = (output, patterns=None, after=None, edge=None))]
     fn taken(
         &self,
@@ -428,8 +427,7 @@ impl Tracking {
                             .state_with(&o.layers, o.head, None, &q, |k, _, _, _| {
                                 found = found
                                     || (matcher.takes(k)
-                                        && points
-                                            .is_none_or(|p| !p.point(k).is_some_and(processed)))
+                                        && points.is_none_or(|p| p.point(k).is_none()))
                             })
                             .await
                             .map_err(tr::Error::Index)?;
@@ -1045,15 +1043,4 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<KeyMatcher>()?;
     m.add_function(wrap_pyfunction!(regex_check, m)?)?;
     m.add_class::<Tracking>()
-}
-
-/// Whether a point says its consumer processed the key since its progress
-/// started over: one that keeps an absent holding (a failed or held-back
-/// key over the empty base) does not (D177).
-fn processed(p: &Point) -> bool {
-    p.holding != Holding::Absent
-        || !matches!(
-            p.reason,
-            Reason::Failed | Reason::HeldBack | Reason::Unsettled
-        )
 }
