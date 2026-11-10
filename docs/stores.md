@@ -43,8 +43,9 @@ class Store(Protocol):
 
     def can_load(self, t, selection) -> bool: ...           # at registration
     def can_store(self, t, output) -> bool: ...             # at registration
-    async def store(self, write, prior, context) -> Written: ...
+    async def store(self, write, prior, context) -> Written: ...   # Written.changed: what a keyed write changed
     async def load(self, ref, t, selection) -> Any: ...
+    async def read(self, ref, t, selection) -> Read: ...       # load, and the versions it read
 
     async def cleanup(self, output, *, home=None, partition=None, key=None,
                       generation=None, before=None) -> None: ...
@@ -153,8 +154,8 @@ idempotently — twice, or what was never written, is harmless. Each
 store satisfies a pattern as it can: FileStore and S3Store by name (the
 exact name when the pattern gives it, else a listing filtered by the
 name's last two components), PostgresStore by `DELETE … WHERE`, or `DROP
-TABLE` for the whole output. Its rows carry no generation, so a
-partition's is its fence row's last write: its rows go only if that
+TABLE` for the whole output. It matches a partition by its fence
+row's last write, not by its rows' versions: its rows go only if that
 matches, and the table is dropped only when no partition of it is
 newer.
 
@@ -191,6 +192,92 @@ command runs in, refused while the namespace that owns it is live (its
 journal written in the last 15 minutes). A store of the project's own
 may define the same three methods (`claim`, `owner`, `adopt`); one
 without them claims nothing.
+
+## What a write and a load say
+
+The new tracking core (`tracking-design.md` §8, D184) builds every
+commit from what a write says it changed, and records what a load says it
+read. Every store answers both now, beside the calls above: today's engine
+does not read the answers; the core will. Late and
+dead writers on tables (the version check per partition, repair by
+version, anomalies: D196) are not part of this section.
+
+**A write says which keys it wrote and removed.** `store` returns
+`Written(ref, changed=Changed(wrote, removed, whole))` for a keyed
+output; `changed` is None for an unkeyed one.
+
+| Field | Meaning |
+|---|---|
+| `wrote` | every key the write wrote, all at the attempt's version (`context.generation`) |
+| `removed` | every key it removed; one the partition did not hold changed nothing, and the engine's index says which did |
+| `whole` | the write was the partition's entire content: every key not in `wrote` is gone as well. The engine finds those in its index, so `removed` may leave them out |
+
+`wrote` and `removed` are sorted by their UTF-8 bytes, in chunks (lists
+of keys), pulled once after `store` returned, so a write of 100 million
+keys never lists them at once. A store that writes a `KeyedWrite` as
+given answers `write.changed()`, which says exactly that: `upserts` or
+every key of the write, its `removes`, and `whole` for a reset. An
+`Opaque` write (PostgresStore's `Sql`) replaces the partition: `wrote`
+is every key the partition holds after it, and `whole` is set.
+
+```
+partition holds a@3 b@3 c@3; attempt 7 writes:
+Patch([a, d], remove=[b])  → Changed(wrote=[[a, d]], removed=[[b]])          a@7 c@3 d@7
+[a, d] (a replacement)     → Changed(wrote=[[a, d]], whole=True)            a@7 d@7
+```
+
+**A write arrives unresolved.** Today the worker compares a keyed write
+with the key index before the store sees it. The core leaves the worker
+no index, so a keyed write reaches the store as the producer returned it,
+`KeyedWrite.of(store, value, output, prior)`: a patch, its rows and its
+explicit removals; or a replacement (`reset`, no `upserts`), done by
+version — afterwards the partition holds exactly the write's keys, all at
+the attempt's version V, and nothing below V. A store that names objects
+by version writes each key at V and deletes nothing: the commit stops
+naming the rest, and cleanup takes them. A table clears the partition and
+writes at V in one transaction. That is the same content as writing at V
+and deleting what is below V, in one statement fewer, and it also works
+when a primary key would refuse a key's second row.
+
+**A load says which versions it read.** `read(ref, t, selection)` is
+`load` plus what it read: `Read(value, versions, version)`.
+
+| Load | `versions` | `version` |
+|---|---|---|
+| keyed, `Keys` (each planned key with its planned version) | every planned key → the version read, None where the store held none | — |
+| keyed, whole | every key read → its version | — |
+| unkeyed | — | the greatest version among what it read; None when it read nothing |
+| a `Ref` | — (nothing read) | — |
+
+A store that names objects by version (FileStore, S3Store) reads a key at
+exactly its planned version, from the name it computes; an object that is
+gone is an error, never an absence. A dynamic partitions output's
+elements carry the empty version `""` (membership is all an element
+holds, `versions.md` §2): a read says `""` for each element present. A table holds its rows as they are
+now, so a key may be read at another version than planned, or be absent:
+the load reads what is there and says so, and the core records the
+deviation (design §8).
+
+**Every table row carries its version.** PostgresStore gives every table
+a `_version bigint` column and sets it, on every write path (rows,
+patches, commits, `Sql`), to the writing attempt's version: NULL only for
+a write outside an attempt. All rows of a key share one version, since one
+write wrote them. Loads take the column off the rows they return. A table
+without the column (or with one of another type) was made before rows carried their version and is
+refused, saying so: drop it, or name a new table for the output
+(`Output(..., table=…)`). There is no backfill: Solera starts fresh at
+the switch. A table you create yourself (in a migration) must carry
+`"_version" bigint`.
+
+**Cost.** A keyed write's keys come from the write itself, so returning
+them costs no request to the backend: PostgresStore's 10,000-key write
+makes the same statements and round trips with or without `changed`
+(measured on PostgreSQL 16: 1 connection, 15 statements and 1 COPY on
+main and with this contract; pulling the 10,000 keys takes about 1.5 ms
+and no request). A `Sql` write's keys are read by one query inside its
+own write transaction, so a later write's keys never enter its answer,
+through a server-side cursor into a temporary file that `keys` and
+`changed.wrote` both replay a chunk at a time.
 
 ## Values a store takes
 
@@ -507,6 +594,11 @@ the exact outcome. (`gN` is generation N; content is `{key: v}`, a row
 | all | a write repeated by its attempt lands once | g4 writes {a:1, b:1}; g4 (same worker) writes it again | same ref; a:1, b:1 |
 | all | commits append and load by range | g1 appends commit 3 {a}; g2 commit 4 {b} | whole: a, b; `Commits(4, 4)`: b |
 | all | a replacement resolved writes its keys and removes the rest | g1 writes {a:1, b:1, c:1}; g2 replaces with {a:1, b:2}, resolved against the index | a and b at g2; c removed; a:1, b:2 |
+| all | a write says which keys it wrote and removed | g1 replaces with {c, a, b}; g2 patches b:2, d:1, removes a; load b, c, d as planned | g1 said wrote a, b, c, whole; g2 wrote b, d, removed a; read at b@2, c@1, d@2 |
+| all | a replacement holds exactly its keys at its version | g1 writes {a, b, c}; g2 replaces with {a:2, d:1}, unresolved | said wrote a, d, whole; a and d read at g2; a table holds nothing else |
+| all | an unkeyed read says its version | a value at g3, then g5; commits 3 (g1) and 4 (g2) | reads at 3, then 5; the commits at 2, `Commits(3, 3)` at 1; an unkeyed write says no keys |
+| immutable | a read is at its planned versions | g5 writes {a, b}, plan; g9 patches a:2, removes b; load the plan | a:1, b:1, read at g5, g5 |
+| fenced | a read says what moved since planning | g5 writes {a, b}, plan; g9 patches a:2, removes b; load the plan | a:2; a read at g9, b absent (None) |
 | immutable | a pinned read returns its version | g5 writes {a:1}, pin; g9 writes {a:2} | the pin reads a:1; the new ref a:2 |
 | immutable | cleaning up never takes what is read | g5 writes {a:1}; g7 writes b (never committed); g9 writes {a:2}; clean up a@g5, b@g7 and a name never written, twice | the new ref reads a:2 |
 | fenced | a stale writer is refused | g5 writes {a:1}; g9 acquires, writes {a:2}; g5 writes {a:0} | g5 refused (`StoreError`); a:2 |
@@ -548,7 +640,10 @@ async def test_my_store_conforms(worker, scenario):
 store as the engine does — keyed writes as `KeyedWrite`s resolved against a
 key index the kit keeps, keyed loads through `Keys` — and raise
 `AssertionError` with the scenario's expectation when the store answers
-otherwise. FileStore, S3Store, PostgresStore and the example SQL store
+otherwise. Every keyed write a scenario makes checks what the store says
+it changed (`Written.changed`); the scenarios of "What a write and a load
+say" check `read`; the generated machine (`solera.testing.storemachine`)
+checks both after every step. FileStore, S3Store, PostgresStore and the example SQL store
 pass it in Solera's own tests (`tests/sdk/test_store_conformance.py`),
 where the example store with its fence left out fails it.
 

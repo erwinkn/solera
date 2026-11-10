@@ -325,10 +325,12 @@ are removed.
 
 **CHG-1. A definition change makes the partition stale, and its next run a full run.**
 The definition covers the asset's `version`, its input bindings, its
-outputs' migrations, its stores' versions, and the run's config. `tally`
+outputs' migrations, its stores' versions, and the run's config; not its
+stores' config (D202): rotating a password or moving a DSN changes
+nothing, and a store whose data really changed bumps its version. `tally`
 `version="1"` → `"2"`: stale ("definition changed"); the next default run
 starts over (SEL-8).
-*From* D140 (1), D93 (4), D34. *Covered* `server/test_engine.py::test_a_version_bump_starts_the_next_run_over`; `server/test_engine.py::test_config_change_reprocesses_everything`; `server/test_engine.py::test_migration_changes_fingerprint_and_marks_handle`; `server/test_each.py::test_binding_a_whole_input_to_another_head_rebuilds_every_key`. Whether store config is in it: Q11.
+*From* D140 (1), D93 (4), D34, D202 (Q11). *Covered* `server/test_engine.py::test_a_version_bump_starts_the_next_run_over`; `server/test_engine.py::test_config_change_reprocesses_everything`; `server/test_engine.py::test_migration_changes_fingerprint_and_marks_handle`; `server/test_each.py::test_binding_a_whole_input_to_another_head_rebuilds_every_key`. Store config left out: `model.py` `declaration` (no test of its own).
 
 **CHG-2. A code change alone is a new deploy, not a definition change.**
 Editing a helper module serves a new deploy: nothing goes stale; failed
@@ -343,7 +345,9 @@ it settles: it commits nothing, and its keys stay owed under version 2.
 **CHG-4. A pattern change is an input change: the next run owes the difference in membership.**
 `tally` has `include=["k1"]`; a deploy widens it to `"k*"`: stale ("input
 changed"); the next run adds k2, k3 and does not process k1 again.
-Narrowing to `"z*"` owes the removal of every held key.
+Narrowing to `"z*"` owes the removal of every held key. If `tally` has
+an `OnChange` automation, either deploy fires it, because it makes
+something owed (AUT-4).
 *From* D140 (2), D126 (amends D34's "patterns are an asset change"). *Covered* `server/test_each.py::test_a_pattern_change_cuts_over`; `server/test_observed_histories.py::test_a19_r9_excluding_every_held_key_owes_their_removal`; `server/test_staleness.py::test_a_pattern_change_that_excludes_every_held_key_leaves_it_stale`.
 
 **CHG-5. A first `include` removes what it leaves out.**
@@ -723,8 +727,10 @@ tick is skipped for a partition running or queued.
 Adding, re-adding, renaming, or changing an asset's definition: its
 `OnChange` owes one firing per partition whose inputs have heads; a
 schedule waits for its next time; with no automation, the asset shows
-stale for a run by hand.
-*From* D34 (pattern part amended by D140 (2), Q6), D33; F22. *Covered* `server/test_sim_found.py::test_an_onchange_asset_added_back_is_built`; `server/test_sim_found.py::test_an_asset_change_is_built_by_its_automation_or_marked_stale`; `server/test_sim_found.py::test_a_reset_output_is_due_for_a_rebuild`.
+stale for a run by hand. A deploy that changes an input's patterns owes
+the firing when the change makes something owed (CHG-4), and none when it
+owes nothing (CHG-7: widening to a key that never existed).
+*From* D34 (pattern part amended by D140 (2) and D200, Q6), D33; F22. The pattern part is partly built: today patterns are in `model.py` `declaration`, so every pattern change owes the firing, including one that owes nothing. *Covered* `server/test_sim_found.py::test_an_onchange_asset_added_back_is_built`; `server/test_sim_found.py::test_an_asset_change_is_built_by_its_automation_or_marked_stale`; `server/test_sim_found.py::test_a_reset_output_is_due_for_a_rebuild`.
 
 **AUT-5. `OnDeploy` fires once per new deploy.**
 Restarting on the same deploy is silent; two deploys before a tick fire
@@ -986,18 +992,10 @@ Numbers are stable: entries refer to them.
 
 ### Open, for Erwin
 
-6. **Do pattern changes still trigger the asset-change rule?** D34 lists
-   patterns among asset changes (an `OnChange` firing owed at the deploy);
-   D140 (2) makes them an input change. Does narrowing `include` still owe
-   a firing, or only make the partition stale? AUT-4, CHG-4.
 10. **A removed dynamic partition's data.** `architecture.md` §7 keeps its
     heads read-only; `stores.md` lists `cleanup(o, partition=p)` "for a
     removed dynamic partition". Is it ever cleaned up, and after what
     grace? PAR-6.
-11. **Is store config part of the definition?** `observed-set.md` lists
-    "store version and config"; `architecture.md` §4 says config is
-    deployment, not definition (D96 puts built-in store config in the
-    manifest for cleanup only). Changing a DSN: stale or not? CHG-1.
 12. **A paused consumer and retention.** `observed-set.md` decides a
     before-image so a consumer paused past the retention window owes only
     what changed (CLN-11); not built. Today: upstream history is kept for
@@ -1011,6 +1009,15 @@ Numbers are stable: entries refer to them.
     attempt spec, built in `ea2ec14`; dynamic partition list derived,
     built in `75539a9`; unkeyed lives) and D181.
     D76 and D162 were marked not okay and are superseded (D78, D168).
+
+### Resolved (2026-11-10)
+
+6. **Pattern changes and `OnChange`.** D200: a pattern change stays an
+   input change (D140 (2)), and a deploy that changes patterns fires
+   `OnChange` when the change makes something owed. AUT-4, CHG-4.
+11. **Store config and the definition.** D202: config is deployment, not
+    definition; the store's version is in it. `observed-set.md` is fixed.
+    CHG-1.
 
 ### Gaps: decided, not built
 
