@@ -24,12 +24,14 @@ from typing import Any
 from solera.sdk import KEYS, Output, Ref, TableRef
 from solera.stores import (
     MISSING,
+    Changed,
     Commits,
     KeyedWrite,
     Keys,
     Opaque,
     Patch,
     Prepared,
+    Read,
     StoreError,
     WriteContext,
     WriteError,
@@ -46,6 +48,7 @@ LEDGER_TABLE = "public.solera_migration_ledger"  # (relation, name): what ran on
 FENCE_TABLE = "public.solera_generations"
 COMMIT_COLUMN = "_commit"
 SEQ_COLUMN = "_seq"
+VERSION_COLUMN = "_version"  # every row's version: the generation of the attempt that wrote it
 KEY_CHUNK = 100_000  # keys per chunk `keys` reads
 
 
@@ -218,12 +221,17 @@ class PostgresStore:
         names = [table_name + "_" + "_".join(index) for index in indexes]
         if key_text := self._key_text(cur, output, schema, table_name):
             names.append(key_text)
-        exists = "SELECT 1 FROM information_schema.tables WHERE table_schema = %s AND table_name = %s"
+        exists = (
+            "SELECT EXISTS (SELECT 1 FROM information_schema.columns c WHERE c.table_schema = t.table_schema "
+            "AND c.table_name = t.table_name AND c.column_name = %s) AS versioned "
+            "FROM information_schema.tables t WHERE t.table_schema = %s AND t.table_name = %s"
+        )
+        here = (VERSION_COLUMN, schema, table_name)
         indexed = cur.execute(
             "SELECT count(*) AS n FROM pg_indexes WHERE schemaname = %s AND tablename = %s AND indexname = ANY(%s)",
             (schema, table_name, names),
         ).fetchone()["n"]
-        if indexed < len(names) or not cur.execute(exists, (schema, table_name)).fetchone():
+        if indexed < len(names) or not cur.execute(exists, here).fetchone():
             # Partitions write one table at once, and `IF NOT EXISTS` DDL collides until the
             # first creator commits: take turns, until the end of the transaction.
             cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (table,))
@@ -231,7 +239,7 @@ class PostgresStore:
         declared, pk = self._declared_shape(output)
         declared = {**(inferred or {}), **declared}
         columns = dict(declared)
-        existed = cur.execute(exists, (schema, table_name)).fetchone()
+        existed = cur.execute(exists, here).fetchone()
         if not existed and rows is not None:
             known = {c: _COLUMNS[k] for c, k in (kinds or {}).items() if k is not None and c not in declared}
             untyped = kinds is None or any(k is None for c, k in kinds.items() if c not in declared)
@@ -245,12 +253,20 @@ class PostgresStore:
                     table,
                     guessed,
                 )
+        columns.pop(VERSION_COLUMN, None)
         defs = [f"{_ident(c)} {_sql_type(t)}" for c, t in (columns or {"value": "jsonb"}).items()]
+        defs.append(f"{_ident(VERSION_COLUMN)} bigint")
         if pk:
             defs.append(f"PRIMARY KEY ({', '.join(_ident(c) for c in pk)})")
         cur.execute(f"CREATE TABLE IF NOT EXISTS {table} ({', '.join(defs)})")
         if existed:
             self._check_drift(cur, output, table, schema, table_name, columns, pk)
+            if not existed["versioned"]:
+                raise StoreError(
+                    f"{output.name}: table {table} has no {VERSION_COLUMN} column, which every row of a "
+                    "table this store writes carries: the table was made before rows carried their "
+                    "version. Drop it, or name a new table for the output (Output(..., table=...))"
+                )
         if key_text := self._key_text(cur, output, schema, table_name):
             # Reads and patches name keys as text (`key::text = ANY(...)`): an index on
             # the column alone serves only a text key.
@@ -346,9 +362,9 @@ class PostgresStore:
     async def cleanup(
         self, output, *, home=None, partition=None, key=None, generation=None, before=None
     ) -> None:
-        """Delete what the pattern matches (docs/stores.md § Cleanup). Rows
-        carry no generation: a partition's is its fence row's last write. So
-        a partition's rows go only if that write matches — exactly
+        """Delete what the pattern matches (docs/stores.md § Cleanup). A
+        partition is matched by its fence row's last write, not by its rows'
+        versions: its rows go only if that write matches — exactly
         `generation`, or older than `before` — and the whole output's table
         is dropped only when no partition of it is newer: a later life of the
         same name in the same table keeps what it wrote. `key` narrows it to
@@ -503,19 +519,21 @@ class PostgresStore:
             slice_where = {partition_col: context.partition} if partition_col else {}
 
             commit_number = _assigned_commit(context, prior) if output.incremental else None
-            keys = None
+            keys = changed = None
             if isinstance(write, Sql):
                 self._apply_sql(cur, output, write, context, table, slice_where)
                 if output.key:  # read once the write has committed
                     keys = self._keys(table, output.key, slice_where, None)
+                    changed = Changed(self._keys(table, output.key, slice_where, None), whole=True)
             elif output.key is not None:
                 if isinstance(write, Patch) and not output.incremental:
                     raise WriteError(f"{output.name}: Patch requires an incremental output")
                 write = KeyedWrite.of(self, write, output, prior)
+                changed = write.changed()
                 if prior is None and not (
                     write.reset or write.upserts or write.removes or len(write.prepared.rows)
                 ):
-                    return Written(None)  # a first write of nothing: no table to make
+                    return Written(None, changed=changed)  # a first write of nothing: no table to make
                 self._apply_keyed(cur, output, write, context, table, slice_where)
             elif isinstance(write, Patch):
                 if not self._apply_commit(
@@ -542,6 +560,7 @@ class PostgresStore:
                 partition=context.partition,
             ),
             keys,
+            changed,
         )
 
     def _apply_replace(self, cur, output, write, context, table, slice_where) -> None:
@@ -629,10 +648,11 @@ class PostgresStore:
             )
 
     def _stamps(self, output, context) -> dict:
-        """The columns the store sets on every row: the partition's."""
+        """The columns the store sets on every row: the partition's, and the
+        writing attempt's version (None outside an attempt)."""
 
         column = output.config.get("partition_column")
-        return {column: context.partition} if column else {}
+        return {**({column: context.partition} if column else {}), VERSION_COLUMN: context.generation}
 
     def _delete_keys(self, cur, output, table, slice_where, keys: list[str]) -> None:
         cur.execute(
@@ -670,7 +690,7 @@ class PostgresStore:
                     f"Migration ({str(e).splitlines()[0]})"
                 ) from e
             described = [(d.name, d.type_code) for d in probe.description]
-            columns = [name for name, _ in described if name != partition_col]
+            columns = [name for name, _ in described if name not in (partition_col, VERSION_COLUMN)]
             # The query's own column types, for a table it creates; declared ones win.
             types = {
                 r["oid"]: r["t"]
@@ -683,8 +703,10 @@ class PostgresStore:
             self._ensure(cur, output, table, context=context, inferred=inferred)
             self._delete_slice(cur, table, slice_where)
             selected = ", ".join(_ident(c) for c in columns)
-            into = ", ".join(_ident(c) for c in [*columns, *([partition_col] if partition_col else [])])
-            stamp = f", {sql.Literal(context.partition).as_string(source)}" if partition_col else ""
+            stamped = [*([partition_col] if partition_col else []), VERSION_COLUMN]
+            into = ", ".join(_ident(c) for c in [*columns, *stamped])
+            values = [*([context.partition] if partition_col else []), context.generation]
+            stamp = "".join(f", {sql.Literal(v).as_string(source)}" for v in values)
             if not self.sql_read_only:
                 cur.execute(
                     f"INSERT INTO {table} ({into}) SELECT {selected}{stamp} FROM {query}", prepare=True
@@ -860,8 +882,16 @@ class PostgresStore:
         return {str(r[source.key]): Loaded(r, version=str(r[version])) for r in rows}
 
     async def load(self, ref: Ref, t, selection: Keys | Commits | None) -> Any:
+        return (await self.read(ref, t, selection)).value
+
+    async def read(self, ref: Ref, t, selection: Keys | Commits | None) -> Read:
+        """`load`, and the versions it read, from each row's version column
+        (docs/stores.md, "What a write and a load say"): a table holds its
+        rows as they are now, so a key read may be at another version than
+        planned, or absent (None)."""
+
         if isinstance(t, type) and issubclass(t, Ref):
-            return ref
+            return Read(ref)
         return await asyncio.to_thread(self._load, ref, t, selection)
 
     @contextlib.asynccontextmanager
@@ -892,7 +922,7 @@ class PostgresStore:
         ).fetchone()
         return None if found is None or found["written"] is None else int(found["written"])
 
-    def _load(self, ref: Ref, t, selection: Keys | Commits | None, conn=None) -> Any:
+    def _load(self, ref: Ref, t, selection: Keys | Commits | None, conn=None) -> Read:
         handle = ref.handle or {}
         with contextlib.nullcontext(conn) if conn else self._connect() as conn, conn.cursor() as cur:
             table = handle.get("table") or _qname(handle.get("schema", "public"), handle["name"])
@@ -916,18 +946,30 @@ class PostgresStore:
                 sql += " WHERE " + " AND ".join(clauses)
             found = cur.execute(sql, params)
             rows = found.fetchall()
-            columns = [d.name for d in found.description or ()]
+            columns = [d.name for d in found.description or () if d.name != VERSION_COLUMN]
             if handle.get("commit_number") is not None:
                 internal = {COMMIT_COLUMN, SEQ_COLUMN}
                 rows = [{k: v for k, v in r.items() if k not in internal} for r in rows]
+        # Every row's version, taken off it: a key's rows share theirs (one write wrote them).
+        keyed = bool(handle.get("key")) and handle.get("commit_number") is None
+        versions: dict[str, Any] | None = {} if keyed else None
+        newest = None
+        for row in rows:
+            version = row.pop(VERSION_COLUMN, None)
+            if versions is not None:
+                versions[str(row[handle["key"]])] = version
+            elif version is not None and (newest is None or version > newest):
+                newest = version
+        if versions is not None and isinstance(selection, Keys):
+            versions = {k: versions.get(k) for k in selection.generations}
         inner = by_key_type(t)
         if inner is not MISSING and isinstance(selection, Keys):
             # Each selected key's group: a key with no rows does not exist (per-key §6).
             groups: dict[str, list] = {}
             for row in rows:
                 groups.setdefault(str(row[handle["key"]]), []).append(row)
-            return {k: _materialize(g, inner, columns) for k, g in groups.items()}
-        return _materialize(rows, t)
+            return Read({k: _materialize(g, inner, columns) for k, g in groups.items()}, versions)
+        return Read(_materialize(rows, t), versions, newest)
 
     # -- row helpers ----------------------------------------------------------
 
@@ -1018,7 +1060,7 @@ class _Reader:
         def work():
             with self.conn.cursor() as cur:
                 written = self.store._written(cur, ref)
-            return self.store._load(ref, t, selection, self.conn), written
+            return self.store._load(ref, t, selection, self.conn).value, written
 
         async with self.lock:
             return await asyncio.to_thread(work)

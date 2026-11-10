@@ -299,7 +299,7 @@ async def test_migration_can_reconcile_drift(store):
 
     out = output(key="id", primary_key=["id"])
     with store._connect() as conn, conn.cursor() as cur:
-        cur.execute(f'CREATE TABLE "{out.name}" (id text, v text, PRIMARY KEY (v))')
+        cur.execute(f'CREATE TABLE "{out.name}" (id text, v text, _version bigint, PRIMARY KEY (v))')
     with pytest.raises(StoreError, match="does not match"):
         await store.store([{"id": "a", "v": "1"}], None, context(out))
     out.migrations = (

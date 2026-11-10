@@ -130,6 +130,27 @@ class WriteContext:
     worker_id: str | None = None
 
 
+Version = int | str
+"""A key's version: the generation of the attempt that wrote it (an `int`),
+or a source's own word (a `str`). Compared only for equality."""
+
+
+@dataclass(frozen=True)
+class Changed:
+    """What a keyed write changed (docs/stores.md, "What a write and a load
+    say"): every key it `wrote`, all at the writing attempt's version, and
+    every key it `removed` — each sorted by UTF-8 bytes, in chunks (lists of
+    keys) pulled once, after `store` returned. `whole`: the write was the
+    partition's entire content, so every key it did not write is gone as
+    well; the engine finds those in its index, and `removed` may leave them
+    out. A key named in `removed` that the partition did not hold changed
+    nothing: the engine's index says which did."""
+
+    wrote: Iterable[list[str]]
+    removed: Iterable[list[str]] = ()
+    whole: bool = False
+
+
 @dataclass(frozen=True)
 class Written:
     """What a store wrote: a ref to the new content, which the worker gives
@@ -137,10 +158,29 @@ class Written:
     sees as rows (an `Opaque` write, read by the store itself): the keys the partition
     holds now, sorted by their UTF-8 bytes, in chunks — lists of keys — the
     worker pulls one at a time after `store` returned. For every other
-    write the worker reads the keys itself (§6, §9)."""
+    write the worker reads the keys itself (§6, §9).
+
+    `changed` is the new contract's answer, beside it: what a keyed write
+    changed (`Changed`), for every keyed write the store takes as given
+    (`KeyedWrite.changed`); None for an unkeyed output."""
 
     ref: Ref
     keys: Iterable | None = None
+    changed: Changed | None = None
+
+
+@dataclass(frozen=True)
+class Read:
+    """What `read` read (docs/stores.md, "What a write and a load say"):
+    the `value`, as `load` gives it, and the versions it was read at. A
+    keyed read gives `versions`, key → the version read: with `Keys`, every
+    planned key, None for one the store did not hold; whole, every key read.
+    An unkeyed read gives `version`, the greatest version among what it read
+    (None when nothing was). A read of a `Ref` reads nothing and says nothing."""
+
+    value: Any
+    versions: Mapping[str, Version | None] | None = None
+    version: Version | None = None
 
 
 @runtime_checkable
@@ -179,6 +219,7 @@ class Store(Protocol):
     def can_store(self, t: type | None, output: Output) -> bool: ...
     async def store(self, write: Any, prior: Ref | None, context: WriteContext) -> Written: ...
     async def load(self, ref: Ref, t: type, selection: Keys | Commits | None) -> Any: ...
+    async def read(self, ref: Ref, t: type, selection: Keys | Commits | None) -> Read: ...
 
     async def cleanup(
         self, output: Output, *, home=None, partition=None, key=None, generation=None, before=None
@@ -404,6 +445,35 @@ class KeyedWrite:
 
     def _grouped(self, keys: list[str]) -> list:
         return list(zip(keys, self.prepared.groups(keys), strict=True))
+
+    def changed(self, size: int = 100_000) -> Changed | None:
+        """What this write changes once its store wrote it as given
+        (`Written.changed`): the keys it writes — `upserts`, or every key of
+        the write — and its `removes`; a reset is the partition's whole
+        content. None for a write the worker resolved against the index in a
+        form whose keys only the index knows: a `DeltaKeys` selection, or a
+        reset that keeps the keys it does not write (`upserts` given)."""
+
+        if self.upserts is not None and (self.reset or not isinstance(self.upserts, Collection)):
+            return None
+        return Changed(self._wrote(size), _chunks(sorted(self.removes, key=_utf8), size), self.reset)
+
+    def _wrote(self, size: int):
+        if self.upserts is not None:
+            yield from _chunks(sorted(self.upserts, key=_utf8), size)
+            return
+        from ..keys.layers import key_str
+
+        for keys, _ in self.prepared.rows.chunks(size):
+            yield [key_str(k) for k in keys]
+
+
+def _utf8(key: str) -> bytes:
+    return key.encode("utf-8", "surrogateescape")
+
+
+def _chunks(keys: list[str], size: int) -> Iterable[list[str]]:
+    return (keys[i : i + size] for i in range(0, len(keys), size))
 
 
 def prepare(write: Any, output: Output, read: Callable | None = None) -> Prepared:
