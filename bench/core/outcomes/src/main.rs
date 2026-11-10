@@ -165,7 +165,12 @@ fn load(dir: &str) -> Output {
     let head = d.uv().unwrap();
     let live = d.uv().unwrap();
     let layers = (0..d.uv().unwrap()).map(|_| d.layer().unwrap()).collect();
-    Output { layers, head, live }
+    Output {
+        layers,
+        head,
+        live,
+        full_run: None,
+    }
 }
 
 /// One commit of the outcome output: `ids` fail (a record each) or succeed
@@ -198,6 +203,7 @@ fn commit(
         producer: b"",
         path: &path,
         mode: Mode::Patch,
+        ends_full_run: false,
         collect: 0,
     };
     let id: Box<[u8]> = b"\x00outcomes".as_slice().into();

@@ -12,21 +12,29 @@ pub mod changes;
 use solera_index::LayerRef;
 
 use crate::codec::{Dec, Enc};
-use crate::error::{invalid, Result};
+use crate::error::{format, invalid, Result};
 use crate::state::{Id, Tracking};
 
 pub use build::{build, Built, Changed, Mode, Spec};
 pub use changes::{Change, Changes, Held, Reader, Source};
 
 pub const TAG_OUTPUT_COMMIT: u8 = 0x20;
+pub const TAG_FULL_RUN_DONE: u8 = 0x21;
+
+fn in_full_run(t: &Tracking, output: &Id) -> bool {
+    t.outputs.get(output).is_some_and(|o| o.full_run.is_some())
+}
 
 /// One commit installed on one output: its layer appended, the head moved to
 /// it, the live key count after it. An output's first commit creates it.
+/// A clear starts a full run (form (a)); `ends_full_run` marks its last
+/// commit, which may be the clear itself.
 #[derive(Clone, Debug, PartialEq)]
 pub struct OutputCommit {
     pub output: Id,
     pub layer: LayerRef,
     pub live: u64,
+    pub ends_full_run: bool,
 }
 
 impl OutputCommit {
@@ -34,6 +42,7 @@ impl OutputCommit {
         e.bytes(&self.output);
         e.layer(&self.layer);
         e.uv(self.live);
+        e.u8(self.ends_full_run.into());
     }
 
     pub fn decode(d: &mut Dec<'_>) -> Result<OutputCommit> {
@@ -41,6 +50,11 @@ impl OutputCommit {
             output: d.bytes()?.into(),
             layer: d.layer()?,
             live: d.uv()?,
+            ends_full_run: match d.u8()? {
+                0 => false,
+                1 => true,
+                b => return format(format!("ends_full_run {b}")),
+            },
         })
     }
 
@@ -53,13 +67,57 @@ impl OutputCommit {
                 l.lo, l.hi
             ));
         }
+        if self.ends_full_run && l.clears.is_empty() && !in_full_run(t, &self.output) {
+            return invalid("a commit ends a full run on an output that is not in one");
+        }
         Ok(())
     }
 
     pub(crate) fn apply(self, t: &mut Tracking) {
         let o = t.outputs.entry(self.output).or_default();
+        if !self.layer.clears.is_empty() {
+            o.full_run = Some(self.layer.hi);
+        }
+        if self.ends_full_run {
+            o.full_run = None;
+        }
         o.head = self.layer.hi;
         o.live = self.live;
         o.layers.push(self.layer);
+    }
+}
+
+/// A full run ends with no commit of its own: its last batch changed
+/// nothing, or it was canceled or failed and a person let downstream proceed.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FullRunDone {
+    pub output: Id,
+}
+
+impl FullRunDone {
+    pub fn encode(&self, e: &mut Enc) {
+        e.bytes(&self.output);
+    }
+
+    pub fn decode(d: &mut Dec<'_>) -> Result<FullRunDone> {
+        Ok(FullRunDone {
+            output: d.bytes()?.into(),
+        })
+    }
+
+    pub(crate) fn check(&self, t: &Tracking) -> Result<()> {
+        if !in_full_run(t, &self.output) {
+            return invalid(format!(
+                "{} is not in a full run",
+                String::from_utf8_lossy(&self.output)
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn apply(self, t: &mut Tracking) {
+        if let Some(o) = t.outputs.get_mut(&self.output) {
+            o.full_run = None;
+        }
     }
 }

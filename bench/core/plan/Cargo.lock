@@ -1528,6 +1528,7 @@ dependencies = [
  "regex",
  "solera-index",
  "xxhash-rust",
+ "zstd",
 ]
 
 [[package]]
