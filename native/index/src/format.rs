@@ -705,7 +705,7 @@ impl Index {
             if s > prev.len() {
                 return format("index entry shares more than its predecessor's key");
             }
-            if s + l > MAX_KEY || ix.first.len() + s + l > MAX_RAW {
+            if s.saturating_add(l) > MAX_KEY || ix.first.len() + s + l > MAX_RAW {
                 return format("index keys longer than the format allows");
             }
             let start = ix.first.len();
