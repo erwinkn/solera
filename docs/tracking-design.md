@@ -199,8 +199,10 @@ flag.
    writer whose parent moved rebuilds and retries): with the engine
    building entries in commit order, the parent is always the head.
 4. **A commit may be a clear.** Only the first commit of a full run of an
-   ordinary asset is one (§10). Its own entries still carry the true
-   replaced version. It is one flag, not 100 million removal entries.
+   ordinary asset is one (§10). It is one flag, not 100 million removal
+   entries. Its own entries are stored without a replaced version, so
+   writing one reads nothing at the head; the index gives every query the
+   true replaced version, from the state just before the clear.
 
 **Why entries carry the replaced version** (**D187**, P1, Fable D2). A diff needs
 only the entries inside its window; cleanup knows which file each commit
@@ -372,8 +374,19 @@ In `native/tracking/src/commit/`, as described above:
 - **What a worker hands over** is `Changes` in its transport form: zstd
   blocks of sorted keys, at most 1 MiB a row, a block cut once it passes
   256 KiB encoded or 8 MiB expanded.
-- **Clears are not built yet**: they wait on the index's clear flag (§10,
-  form (a)).
+- **A clear** (`mode="clear"`, §10 form (a)) writes the full run's first
+  batch as entries without a replaced version and reads nothing at the
+  head. A removal in it is dropped, and it is written even when empty.
+  Its `live` is the number of keys written.
+- **An output knows it is mid full run.** `Output.full_run` holds the
+  commit of the clear that started a full run still under way. A clear
+  sets it. The run's last commit carries `ends_full_run`, which clears it;
+  a commit can't do so outside a full run unless it is the clear itself.
+  A run that ends without a commit (its last batch changed nothing, or a
+  person let downstream proceed after a cancel or failure) journals
+  `FullRunDone` instead. A flag on the commit is needed because the parts
+  of one event are checked against the state before it and may not touch
+  the same output twice. B3's gate and hold-back rule read `full_run`.
 
 ## 5. Progress: pieces and points
 
@@ -511,8 +524,16 @@ these additions:
   of §7 stay with the engine.
 - **Points stay in memory** (a sorted map per edge). Spilling past a few
   thousand is not built: not needed at the measured sizes.
-- **Clears are not built yet** (§10, form (a)): the planner needs each
-  output's clear commits, and candidates across a clear come from two scans.
+- **Clears** (§10, form (a)): the index answers every query across a
+  clear, so the candidate table is unchanged. At commit, a batch holds back
+  every key it loaded at another version than it planned while its input's
+  output is mid full run (`Output.full_run`, B4) or when a clear came in
+  since the batch's head (the layers' `clears`): the key keeps what it held,
+  even if it also failed, and stays owed. A key held back on one input is
+  held back on every input of the batch, since its output is one value
+  computed from all of them. `Ops.held_back` names those keys
+  for the key outcomes (B6). The gate that holds readers of an incomplete
+  upstream is the engine's (B5).
 
 ## 6. Staleness kept exact by propagation
 

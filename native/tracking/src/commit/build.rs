@@ -31,6 +31,9 @@ pub struct Spec<'a> {
     /// Where its layer is written.
     pub path: &'a str,
     pub mode: Mode,
+    /// The full run's last commit (see [`OutputCommit`]). When nothing
+    /// changed, nothing is built: journal a `FullRunDone` instead.
+    pub ends_full_run: bool,
     /// Keep up to this many changed keys in `Built::keys` (0: none).
     pub collect: usize,
 }
@@ -42,6 +45,11 @@ pub enum Mode {
     /// The changes name every key the output holds afterwards (a source's
     /// full listing): a key present at the head and not named is removed.
     Replace,
+    /// The first commit of a full run (form (a)): every key present at the
+    /// head is removed, then the changes' upserts apply. Nothing is read at
+    /// the head, and a removal is dropped: the clear already removed the key.
+    /// Written even when it names no key, since the clear is itself a change.
+    Clear,
     /// A load's report on a source (P13): a key's report counts only if its
     /// version at this commit, the batch's head, equals its version at the
     /// output's head.
@@ -54,6 +62,7 @@ pub struct Built {
     pub part: OutputCommit,
     pub added: u64,
     pub updated: u64,
+    /// After a clear: every key present before it, none of them in `keys`.
     pub removed: u64,
     /// The changed keys, if no more than `Spec::collect`.
     pub keys: Option<Changed>,
@@ -127,7 +136,7 @@ pub async fn build(
         time_ms: spec.time_ms,
         producer: spec.producer,
         live_before: out.live,
-        clear: false,
+        clear: spec.mode == Mode::Clear,
     };
     let mut e = Entries {
         w: ix.commit_writer(spec.path, nc)?,
@@ -139,26 +148,41 @@ pub async fn build(
         version: spec.version,
     };
     let mut ch = Changes::new();
-    if spec.mode == Mode::Replace {
-        replace(ix, out, changes, &mut ch, &mut e).await?;
-    } else {
-        while changes.next(&mut ch)? {
-            patch(ix, out, spec.mode, &ch, &mut e).await?;
+    match spec.mode {
+        Mode::Replace => replace(ix, out, changes, &mut ch, &mut e).await?,
+        Mode::Clear => {
+            while changes.next(&mut ch)? {
+                for i in 0..ch.len() {
+                    e.put(ch.key(i), ch.change(i), Version::Absent).await?;
+                }
+            }
+        }
+        _ => {
+            while changes.next(&mut ch)? {
+                patch(ix, out, spec.mode, &ch, &mut e).await?;
+            }
         }
     }
     let Some(layer) = e.w.finish().await? else {
         return Ok(None);
     };
+    let cleared = if spec.mode == Mode::Clear {
+        out.live
+    } else {
+        0
+    };
+    let removed = e.removed + cleared;
     Ok(Some(Built {
         part: OutputCommit {
             output: output.clone(),
             layer,
-            live: out.live + e.added - e.removed,
+            live: out.live + e.added - removed,
+            ends_full_run: spec.ends_full_run,
         },
         added: e.added,
         updated: e.updated,
-        removed: e.removed,
-        keys: e.keys,
+        removed,
+        keys: e.keys.filter(|_| cleared == 0),
     }))
 }
 

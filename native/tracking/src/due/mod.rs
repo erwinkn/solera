@@ -134,6 +134,7 @@ pub async fn start(
         producer: b"",
         path,
         mode: CommitMode::Patch,
+        ends_full_run: false,
         collect: 0,
     };
     let pid = output_id(PASS, &v.edge);

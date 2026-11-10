@@ -87,6 +87,7 @@ impl Log {
             time_ms: 0,
             producer: b"",
             live_before: before.len() as u64,
+            clear: false,
         };
         let path = format!("items/c{c}");
         self.layers
@@ -98,6 +99,7 @@ impl Log {
                 layers: self.layers.clone(),
                 head: c,
                 live: self.states.last().unwrap().len() as u64,
+                full_run: None,
             },
         );
         true

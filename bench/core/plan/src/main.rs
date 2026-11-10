@@ -272,6 +272,7 @@ fn scenario_state(
             layers: layers.to_vec(),
             head,
             live: 0,
+            full_run: None,
         },
     );
     for i in 0..tasks {
