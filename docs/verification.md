@@ -566,7 +566,7 @@ so none falls between them:
 | `ObservedSet.tla` | the observed set (D126, D133) and its observation record: decode, candidates and classify-once, batches reclassified from what was served, points, ranges at each batch's head and their fold, the base with its before-image, rebases, every run kind (default runs in batches, `keys=`, per-key cancels, start-overs, dropped runs), pattern, context and definition changes, upstream resets, retention cuts, a batch in flight between dispatch and commit | what an attempt is to `Execution.tla`; the key index to its tests (`key-index-design.md` § What is checked) |
 | `Attempt.tla` | the attempt control file: who owns an attempt, the gate, the sealed result or the engine's end; duplicates, zombies, retention; nobody learns of an attempt before its launch is durable (F26) | what an attempt computes to `Execution.tla` |
 | `JournalObject.tla` | the journal: fencing, appends, checkpoints and their cleanup, lost answers, failed requests | what the events mean to the others |
-| `tests/tracking` | the tracking redesign before it is built: the log of entries, progress as pieces and points, the planner, the staleness witness, full runs as a clear plus the gate, the amended P8 | today's engine to the specs above; stores that write in place with late and dead writers, cleanup and lineage: not yet |
+| `tests/tracking` | the tracking redesign before it is built: the log of entries, progress as pieces and points, the planner, the staleness witness, full runs as a clear plus the gate, the amended P8, tables with late and dead writers, the cut, exact cleanup, lineage | today's engine to the specs above; several levels rebuilding at once, per-reason witnesses: not yet |
 
 ## Formal model: execution semantics (`spec/tla/Execution.tla`)
 
@@ -1320,6 +1320,44 @@ rebuild, unless items removed it meanwhile; summary never reads a copy that is
 incomplete or mixes definitions. Once quiet (every owed run done), every
 output equals what its definition gives from items and feed.
 
+**Stores that write in place** (`fullrun.py`, `table` stores, review F1 and
+the exact-table contract of 2026-11-10). A producer's attempt plans, writes its
+rows in one transaction, and only then commits; between the two the engine may
+give up on it (a cancel, a restart, a commit refused because the definition
+changed). An attempt given up on before its write may still write later (a
+late writer); one given up on after its write leaves its rows (a dead writer).
+Recommendations 1 to 5 are rules here: `fence` (each write transaction raises
+the partition's version row, or is refused if a newer attempt has written),
+`open_txn` (the first attempt after one given up on opens a transaction even
+with nothing to write), `repair` (it lists the rows the dead attempts wrote,
+by version, deletes those the log does not have and redoes those it has; an
+output built on its own rows owes a full run instead), `hold_back` (a reader
+holds back a key it loaded at a version no commit since its head recorded, the
+dead row and the live attempt's alike, and a whole reader retries a read that
+found one), and `load_check` (an attempt whose `ctx.load()` finds a row its own
+last commit did not write cannot build on it and owes a full run). After every
+step the table equals the log except for keys a live attempt has written or a
+dead one wrote and no repair has fixed yet; no reader processes a version, or
+an absence, that no commit since its planned head recorded, and a whole reader
+reads only the committed head; tally's committed counts equal what it
+processed. The rules read the index; these checks read the brute-force states. Once quiet, after every late writer has tried, each table equals
+its log exactly.
+
+**The cut, cleanup and lineage** (`fullrun.py`, §12, §13). Each committed batch
+writes a record per edge: its range, head, conditions, the replaced slice
+(pieces and points), keys processed by name (a key list, a repair),
+deviations, held-back keys, and a digest of what it processed: every key that
+changed, and every key a key list or a repair named, changed or not. Lineage
+recomputes the batch's input from the record alone, through the index, and
+must equal the digest, at the commit and after every merge. A merge folds a
+log at the single cut, the oldest of the retained records' heads and replaced
+pieces, the live pieces, the cleanup cursor and the heads live attempts
+planned at; a query below the base fails the history. On file stores, cleanup
+deletes what commit r replaced once r is at or below the oldest head a live
+attempt holds, and an abandoned attempt's objects by version (CLN-5). Cleanup
+never deletes an object the log's head holds, nor one a live attempt planned
+to load, and once quiet the objects left are exactly the log's. Records leave history by a `retire` event, oldest first.
+
 **Calibration.** Every rule is named (`RULES` in each module) and has a
 history in `histories.py` that passes with every rule on and fails with that
 rule off (`test_each_rule_is_needed`). Rules this model had to add to the
@@ -1331,12 +1369,32 @@ design and the amendments are switched off by `ADDED`; each is a finding:
 | staleness | `held_probe`: progress reset to `held` probes, as rule 4 | the input reads fresh with every held key owed |
 | staleness | `catch_up_first`: every rule, and every change of conditions or reset, begins with rule 7's comparison | after a lost notification, rule 1 applies an old commit to newer progress or newer conditions and names a key that is not due |
 | staleness | `rearm`: a restart applies rule 5 to every retry already due | a retry whose timer fired before the restart is never noticed |
-| staleness | `hold_back`: a batch holds back a key it loaded at another commit than planned while items is mid full run, or if a clear came since it planned | checks processes a removal the clear made and adds the key back when items completes |
-| full runs | `hold_back`: a reader's batch holds back what it loaded at another version than planned while its upstream is incomplete, or if a clear came since it planned | on a table the gate does not cover a batch already in flight, nor one that loaded mid rebuild and commits after: report loads a half-built count, archive processes removals the clear made |
+| staleness | `hold_back`: a batch holds back a key it loaded at another commit than planned while items is mid full run, or if a clear came since it planned | checks processes a removal the clear made and adds the key back when items completes, a state items had only mid full run (the check records which commits fell inside one). Only the mid-full-run half bites here: this model loads at the instant of the commit, so after the full run completes it loads a finished state; the full-run model's `load` event tests the clear-since-plan half |
+| full runs | `hold_back`: a reader's batch holds back what it loaded at another version than planned while its upstream is incomplete, or if a clear came since it planned | on a table the gate does not cover a batch already in flight, nor one that loaded mid rebuild and commits after: report loads a half-built count, archive processes removals the clear made. With late and dead writers the same rule is recommendation 4 |
+| full runs | `repair_removals`: the repair also redoes the keys the dead attempts' specs named, not only the rows it finds by version | a dead attempt's delete leaves no row to list: the log keeps a key the table lost |
+| full runs | `repair_handover`: an attempt given up on after its repair hands the dead attempts it repaired to the next repair | the repair deleted a row while redoing an older dead attempt's key and died: that row is in no spec the next repair lists, and the table lacks a key the log has |
+| full runs | `cut_attempts`: the cut also holds the head every live attempt planned at | a consumer with no piece at a commit yet (it has processed nothing) plans at c0, a merge folds c0, and its commit's record and new piece name a folded commit |
 
-**Not modeled yet:** stores that write in place with late and dead writers,
-cleanup against the cut, lineage and digests, several upstream levels
-rebuilding at once, one witness per reason (STA-2), the propagation of
+The invariants are physical: they compare the table with the log, not the
+model's own record of which attempts died. So the repair rules bite rarely in
+random histories (3,000 on tables: `repair` 7, `open_txn` 1,
+`repair_at_once` 1, `repair_removals` 0, `repair_handover` 0; a
+writer-heavy generator found the last one, 22 times in 300,000 histories
+before the rule), and each has a calibration where a dead or late writer's
+row outlives the log. `open_txn` bites only when the attempt after one
+given up on has nothing to write: without the transaction it neither raises
+the fence nor repairs, so a late writer's row stays, whether it landed before
+that attempt or after. `repair_at_once` (a
+dead attempt makes its producer owed) bites only when the dead attempt's keys
+stop being owed on their own, for instance when upstream removes a key the
+dead attempt added; otherwise the keys it did not commit are still owed and
+the retry runs anyway. `load_check` is needed beside the repair: the repairing
+attempt writes the rows it found, so a dead count it built on at its start is
+overwritten, not repaired.
+
+**Not modeled yet:** several upstream levels rebuilding at once, lineage over a
+`held` replaced slice (§12, review F8: the full-run model has no held pieces
+and no pattern changes, and the staleness model keeps no records), one witness per reason (STA-2), the propagation of
 "upstream stale" down the graph, and the cost of any of it at scale.
 
 ## Trace validation: simulation runs against the specs

@@ -69,7 +69,8 @@ sublist of a history is a history.
 items commit, its notification lost or not; `("clear", changes, lost)` items'
 full run begins in the design's form; `("complete",)` it ends;
 `("plan", n)`, `("full", n)` (a full run's first batch, which resets progress),
-`("keys", keys)`; `("commit", failing keys, keys loaded at the head)`;
+`("keys", keys)`; `("commit", failing keys, keys loaded at the head)` (a key
+loaded at the head is held back if items is mid full run or cleared since the plan);
 `("cancel",)`; `("pat", i)`, `("ctx",)`, `("defn",)` change the conditions;
 `("held",)` progress can no longer be trusted; `("retry", key, by_timer)`;
 `("restart",)`.
@@ -79,4 +80,10 @@ full run begins in the design's form; `("complete",)` it ends;
 `("commit" | "cancel", asset)`; `("load", reader)` a reader's batch loads
 before it commits (archive, report); `("keys", asset, keys)`;
 `("define", asset)` a new definition; `("full", asset)` a full run by hand;
-`("restart",)`; `("summary",)` the whole reader of copy runs.
+`("restart",)`; `("summary",)` the whole reader of copy runs. A producer's
+attempt writes before it commits: `("write", asset)` runs its write
+transaction (a commit runs it first if it has not); `("giveup", asset)` ends
+the attempt without a commit; `("late", asset, newest)` the oldest (or the newest)
+attempt given up on before its write writes now. `("merge", log)` folds items, feed, copy or tally
+at the cut; `("retire",)` drops the oldest batch record from history;
+`("cleanup", asset)` runs copy's or tally's cleanup.
