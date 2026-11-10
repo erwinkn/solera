@@ -1039,24 +1039,32 @@ impl Reset {
 pub struct Consumed {
     pub edge: Id,
     pub through: u64,
+    /// What the plan read: refused unless the edge is still consumed
+    /// through it, so a stale commit cannot move progress back.
+    pub expect: u64,
 }
 
 impl Consumed {
     pub fn encode(&self, e: &mut Enc) {
         e.bytes(&self.edge);
         e.uv(self.through);
+        e.uv(self.expect);
     }
 
     pub fn decode(d: &mut Dec<'_>) -> Result<Consumed> {
         Ok(Consumed {
             edge: d.bytes()?.into(),
             through: d.uv()?,
+            expect: d.uv()?,
         })
     }
 
     pub(crate) fn check(&self, t: &Tracking) -> Result<()> {
         match edge(t, &self.edge)?.progress.as_ref() {
-            Progress::Unkeyed(_) => Ok(()),
+            Progress::Unkeyed(t) if *t == self.expect => Ok(()),
+            Progress::Unkeyed(_) => {
+                invalid("the edge's progress moved since the batch was planned")
+            }
             Progress::Keyed(_) => invalid("a keyed edge consumes by batch"),
         }
     }
