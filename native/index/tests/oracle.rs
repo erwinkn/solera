@@ -362,7 +362,12 @@ impl World {
                 .filter(|&k| q.takes(&h.keys[k]))
                 .filter(|&k| h.states[c1 as usize][k] != h.states[c2 as usize][k])
                 .map(|k| {
-                    let newest = (c1 + 1..=c2).rev().find(|&c| h.changed(k, c)).unwrap();
+                    let newest = (c1 + 1..=c2)
+                        .rev()
+                        .find(|&c| {
+                            h.changed(k, c) || h.commits[c as usize].iter().any(|e| e.0 == k)
+                        })
+                        .unwrap();
                     let (a, b) = (
                         h.states[c2 as usize][k].clone(),
                         h.states[c1 as usize][k].clone(),
@@ -751,6 +756,14 @@ fn bad_references_and_abandoned_reads_leave_the_index_working() {
             ix.scan(&[flagged], 1, &q).await,
             Err(Error::Format(_))
         ));
+        let past = LayerRef {
+            hi: u64::MAX,
+            floor: Some(u64::MAX),
+            flags: format::CLEAR,
+            clears: vec![u64::MAX],
+            ..l1.clone()
+        };
+        assert!(matches!(past.check(), Err(Error::Invalid(_))));
         // offsets out of order are refused before any read, and the index still reads
         let bad = LayerRef {
             top_start: l1.size + 1,
@@ -1456,7 +1469,39 @@ fn merges_refuse_entries_that_do_not_chain() {
             )
             .await
             .unwrap();
-        ix.merge(&[l1, l2], 1..2, 0, "m3").await.unwrap();
+        ix.merge(&[l1.clone(), l2], 1..2, 0, "m3").await.unwrap();
+        // after a clear, a key's first entry replaces nothing, wherever the
+        // merge starts
+        let clear = ix
+            .write_commit(
+                "x2",
+                NewCommit {
+                    clear: true,
+                    ..nc(2)
+                },
+                &Run::new(),
+            )
+            .await
+            .unwrap();
+        let mut run = Run::new();
+        run.push_key(b"k");
+        run.push_entry(3, Version::Int(2), Version::Int(1));
+        let l3 = ix
+            .write_commit(
+                "x3",
+                NewCommit {
+                    live_before: 1,
+                    ..nc(3)
+                },
+                &run,
+            )
+            .await
+            .unwrap();
+        let layers = vec![l1, clear, l3];
+        for (run, cut) in [(0..3, 0), (0..3, 3), (1..3, 0)] {
+            let e = ix.merge(&layers, run, cut, "m4").await.unwrap_err();
+            assert!(matches!(e, Error::Chain(_)), "{e}");
+        }
     });
 }
 

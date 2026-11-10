@@ -255,7 +255,13 @@ impl ChangeIndex {
                 else {
                     continue;
                 };
-                (c, version(&g, was), version(&g, new))
+                // a key written again at a clear changed there too
+                let written = g.rows(0).map(|r| g.commit(r)).find(|&w| w <= c2);
+                (
+                    c.max(written.unwrap_or(0)),
+                    version(&g, was),
+                    version(&g, new),
+                )
             } else {
                 let mut window = g.rows(0).filter(|&r| g.commit(r) > c1 && g.commit(r) <= c2);
                 let Some(newest) = window.next() else {
@@ -645,23 +651,26 @@ impl ChangeIndex {
                 let c = g.commit(r);
                 let since = if r + 1 < rows.end { g.commit(r + 1) } else { 0 };
                 let k = clears.partition_point(|&k| k <= c);
-                let (want, there) = if k > 0 && clears[k - 1] > since {
-                    (Version::Absent, format!("commit {} cleared", clears[k - 1]))
-                } else if r + 1 < rows.end {
-                    (
-                        g.new_version(r + 1),
-                        format!("commit {} left {:?}", g.commit(r + 1), g.new_version(r + 1)),
-                    )
-                } else if from_start {
-                    (Version::Absent, "nothing was there".to_string())
+                let cleared = k > 0 && clears[k - 1] > since;
+                let want = if cleared || r + 1 == rows.end {
+                    if !cleared && !from_start {
+                        continue;
+                    }
+                    Version::Absent
                 } else {
-                    continue;
+                    g.new_version(r + 1)
                 };
                 if g.replaced_version(r) != want {
+                    let there = if cleared {
+                        format!("commit {} cleared", clears[k - 1])
+                    } else if r + 1 < rows.end {
+                        format!("commit {} left {want:?}", g.commit(r + 1))
+                    } else {
+                        "nothing was there".to_string()
+                    };
                     return Err(Error::Chain(format!(
-                        "{:?}: commit {} replaced {:?}, but {there}",
+                        "{:?}: commit {c} replaced {:?}, but {there}",
                         lossy(g.key(0)),
-                        c,
                         g.replaced_version(r),
                     )));
                 }

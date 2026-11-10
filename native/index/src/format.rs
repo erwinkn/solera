@@ -130,7 +130,12 @@ impl LayerRef {
                 self.path, self.index_start, self.top_start, self.size
             ));
         }
-        let above = self.floor.map_or(self.lo, |f| f + 1);
+        let Some(above) = self.floor.map_or(Some(self.lo), |f| f.checked_add(1)) else {
+            return invalid(format!(
+                "{}: floor {:?} past the last commit",
+                self.path, self.floor
+            ));
+        };
         if (self.flags & CLEAR != 0) != !self.clears.is_empty()
             || self.clears.first().is_some_and(|&c| c < above)
             || self.clears.last().is_some_and(|&c| c > self.hi)
