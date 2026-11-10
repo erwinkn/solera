@@ -52,8 +52,33 @@ VERSION_COLUMN = "_version"  # every row's version: the generation of the attemp
 KEY_CHUNK = 100_000  # keys per chunk `keys` reads
 
 
-def _chunked(keys: list[str]):
-    return (keys[i : i + KEY_CHUNK] for i in range(0, len(keys), KEY_CHUNK))
+class _Spool:
+    """Keys spooled to a temporary file, NUL after each (text holds no NUL):
+    replayed from the start a chunk at a time, by every iteration."""
+
+    def __init__(self):
+        import tempfile
+
+        self.file = tempfile.TemporaryFile()
+
+    def add(self, keys: Iterable[str]) -> None:
+        self.file.write(b"".join(k.encode() + b"\0" for k in keys))
+
+    def __iter__(self):
+        import os
+
+        self.file.flush()
+        offset, rest, chunk = 0, b"", []
+        while data := os.pread(self.file.fileno(), 1 << 20, offset):
+            offset += len(data)
+            *done, rest = (rest + data).split(b"\0")
+            for key in done:
+                chunk.append(key.decode())
+                if len(chunk) == KEY_CHUNK:
+                    yield chunk
+                    chunk = []
+        if chunk:
+            yield chunk
 
 
 def _assigned_commit(context: WriteContext, prior: Ref | None) -> int:
@@ -527,9 +552,8 @@ class PostgresStore:
             if isinstance(write, Sql):
                 self._apply_sql(cur, output, write, context, table, slice_where)
                 if output.key:  # the keys it wrote, read in its own transaction: no later write's
-                    held = self._held(cur, table, output.key, slice_where)
-                    keys = _chunked(held)
-                    changed = Changed(_chunked(held), whole=True)
+                    keys = self._held(cur, table, output.key, slice_where)
+                    changed = Changed(keys, whole=True)
             elif output.key is not None:
                 if isinstance(write, Patch) and not output.incremental:
                     raise WriteError(f"{output.name}: Patch requires an incremental output")
@@ -743,17 +767,22 @@ class PostgresStore:
         handle = ref.handle or {}
         return self._keys(handle["table"], handle["key"], dict(handle.get("where") or {}), among)
 
-    def _held(self, cur, table, key_column: str, where: dict) -> list[str]:
+    def _held(self, cur, table, key_column: str, where: dict) -> _Spool:
         """The keys (as text) the partition holds as `cur`'s transaction sees
-        it, sorted by their bytes."""
+        it, sorted by their bytes: read through a server-side cursor and
+        spooled to a file, so a write of 100 million keys holds a chunk of
+        them in memory at a time."""
 
-        key = _ident(key_column)
-        found = cur.execute(
-            f"SELECT DISTINCT {key}::text AS k, convert_to({key}::text, 'UTF8') AS b FROM {table} "
-            f"WHERE {self._where_sql(where)} ORDER BY 2",
-            [where[k] for k in sorted(where)],
-        )
-        return [r["k"] for r in found]
+        key, spool = _ident(key_column), _Spool()
+        with cur.connection.cursor(name="solera_held") as held:
+            held.execute(
+                f"SELECT DISTINCT {key}::text AS k, convert_to({key}::text, 'UTF8') AS b FROM {table} "
+                f"WHERE {self._where_sql(where)} ORDER BY 2",
+                [where[k] for k in sorted(where)],
+            )
+            while chunk := held.fetchmany(KEY_CHUNK):
+                spool.add(r["k"] for r in chunk)
+        return spool
 
     def _keys(self, table, key_column: str, where: dict, among: list[str] | None):
         """The partition's keys (as text) sorted by their bytes, a chunk at a time

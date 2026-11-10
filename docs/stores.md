@@ -275,8 +275,9 @@ makes the same statements and round trips with or without `changed`
 (measured on PostgreSQL 16: 1 connection, 15 statements and 1 COPY on
 main and with this contract; pulling the 10,000 keys takes about 1.5 ms
 and no request). A `Sql` write's keys are read by one query inside its
-own write transaction, so a later write's keys never enter its answer;
-`keys` reads them from that same query.
+own write transaction, so a later write's keys never enter its answer,
+through a server-side cursor into a temporary file that `keys` and
+`changed.wrote` both replay a chunk at a time.
 
 ## Values a store takes
 
