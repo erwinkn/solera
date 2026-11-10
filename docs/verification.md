@@ -282,7 +282,7 @@ with Hypothesis drawing the inputs (in CI, a few seconds each):
   evicted within the disk budget; a resolved delta is installed at its
   commit without a GET; two indexes sharing the cache never read each
   other's files; a cold index is declined and filled.
-- **Key patterns** (`tests/sdk/test_patterns.py`): every glob matches as
+- **Key patterns** (`tests/contract/test_chg.py`, CHG-12; `tests/sdk/test_patterns.py`): every glob matches as
   an independent reference matcher does (`**/` takes whole directories or
   none, `*` and `?` stay within one, `[`, `\` and newlines are literal),
   and `include`/`exclude` combine as documented.
@@ -555,8 +555,9 @@ New sweeps since that summary:
 
 ## Formal models: which spec owns which rules
 
-Five TLA+ specs, checked by `spec/tla/check.sh` (`check.sh` alone is CI).
-Each rule has one owner, so none falls between them:
+Five TLA+ specs, checked by `spec/tla/check.sh` (`check.sh` alone is CI),
+and the tracking model in Python for the redesign. Each rule has one owner,
+so none falls between them:
 
 | Spec | Owns | Leaves to |
 |---|---|---|
@@ -565,6 +566,7 @@ Each rule has one owner, so none falls between them:
 | `ObservedSet.tla` | the observed set (D126, D133) and its observation record: decode, candidates and classify-once, batches reclassified from what was served, points, ranges at each batch's head and their fold, the base with its before-image, rebases, every run kind (default runs in batches, `keys=`, per-key cancels, start-overs, dropped runs), pattern, context and definition changes, upstream resets, retention cuts, a batch in flight between dispatch and commit | what an attempt is to `Execution.tla`; the key index to its tests (`key-index-design.md` § What is checked) |
 | `Attempt.tla` | the attempt control file: who owns an attempt, the gate, the sealed result or the engine's end; duplicates, zombies, retention; nobody learns of an attempt before its launch is durable (F26) | what an attempt computes to `Execution.tla` |
 | `JournalObject.tla` | the journal: fencing, appends, checkpoints and their cleanup, lost answers, failed requests | what the events mean to the others |
+| `tests/tracking` | the tracking redesign before it is built: the log of entries, progress as pieces and points, the planner, the staleness witness, full runs as a clear plus the gate, the amended P8 | today's engine to the specs above; stores that write in place with late and dead writers, cleanup and lineage: not yet |
 
 ## Formal model: execution semantics (`spec/tla/Execution.tla`)
 
@@ -1243,6 +1245,100 @@ swap, with this model as the reference for the protocol. Its fairness
 argument then needs the bound above: finitely many file changes per
 attempt.
 
+## The tracking model (`tests/tracking`)
+
+*The tracking redesign (`docs/tracking-design.md` on `design/tracking`), before
+it is built.* A brute-force model in Python, not of the engine. It settled the
+design's two open choices by model check (`handoffs/SOLE-7/verdict.md` in the
+Captain drive, `decisions.md` of 2026-11-10), and the new core's units test
+against it as an oracle (`tests/tracking/README.md`). It keeps only the decided
+forms: a full run is a clear plus the gate, and staleness is one witness due key
+per input. The rejected forms, P14's exact counts and a rebuild in place behind
+a floor, are in the history of solera#15. It replaces the design's own model,
+which lived outside the repository (`docs/handoff/tracking-model/model.py` on
+`handoff/2026-11-09`); everything that model checked is checked here, apart from P14's
+exact counts, which were rejected.
+
+```bash
+uv run pytest tests/tracking -q            # CI: 200 random histories per store, every short staleness history, every calibration (~20 s)
+uv run pytest tests/tracking -q --slow     # 5,000 random histories per store
+uv run python -m tests.tracking fullrun --kind table --off hold_back --shrink
+```
+
+**State.** The log of an output: commits of entries that carry both versions
+(P1), clears, and `diff`, `scan` and `get` computed from entries alone; a test
+checks all three against the true states at every pair of commits, over
+ranges, across clears and reverts. A holding records the version, the context
+and the definition: patterns only decide which keys are taken, so a pattern
+change owes only the keys that change membership (§9, CHG-4). Progress:
+pieces (`at(H, conditions)`, `empty`, `held`) and points, decoding, a planner
+that reads candidates from the log piece by piece (§7), and the batch commit
+rule (§5), with failing keys (P9), keys loaded at another version, key-list
+runs and merges at the run's progress key. A batch starts at a piece boundary
+(asserted). A key a key list processed on an empty piece keeps a point even
+when absent, so completeness (D177) counts it as processed; without it, a key
+list over one input left copy "never processed" on its other input. A history
+is a list of events; an event that does not apply is skipped, so any sublist
+is a history, and a failure shrinks to the shortest one that still breaks the
+same invariant.
+
+**Staleness** (`staleness.py`): checks reads items. Histories mix upstream
+commits that revert, an upstream full run in the design's form (a clear, then
+complete), batches planned and committed later, failing keys owed but not
+due, retries due by timer or by force, pattern, context and definition
+changes, key-list runs, a full run's resetting first batch, progress reset to
+`held`, lost notifications and restarts. The witness keeps the amendment's
+rules 1 to 8. After every step: progress decodes to what checks really holds;
+the planner's candidates equal the brute-force owed set (the count on
+request); the answer is `held` exactly while items is mid full run, else
+`stale` exactly when some key is due; the witness is due; completeness equals
+what was processed since the last reset (ranges and key lists, recorded apart
+from progress); rule 1 never takes a key that is not due. Due keys come from a
+record of failures kept apart from the engine's outcomes: a failing key's
+outcome goes once upstream returns to what checks holds (§11, KEY-3), and its
+point stays. Besides 200 random histories, CI checks every history of up to
+four events over a 35-event alphabet (about 280,000).
+
+**Full runs** (`fullrun.py`): items and feed drive copy (an ordinary keyed
+copy with feed as a second input, under definitions that keep, drop or rename
+keys) and tally (an ordinary count per group that builds on `ctx.load()`);
+archive reads copy, report reads tally, summary reads copy whole; checks is a
+per-key asset over items under the amended P8 (a full run by hand raises a
+rebuild counter in its conditions). Histories add definition changes, full
+runs by hand, `keys=` runs (as a full run's first batch too), cancels,
+restarts that kill every attempt in flight, upstream removals, and a reader's
+load as its own step before its commit. copy and tally live on one store kind
+per run: `file` (an attempt loads what it planned) or `table` (it loads the
+row as it is now). The first batch of a full run clears; readers wait while
+their upstream is incomplete (P7, P12). After every step: each log equals its
+store; scans equal the true states; every consumer's progress decodes to what
+it processed; a plan takes exactly the first due keys; copy's and tally's
+completeness equals what they processed since the clear; no reader processes a
+row a rebuild built that was unfinished when it loaded or is unfinished now;
+no keyed reader is given a key removed and then added back within one
+rebuild, unless items removed it meanwhile; summary never reads a copy that is
+incomplete or mixes definitions. Once quiet (every owed run done), every
+output equals what its definition gives from items and feed.
+
+**Calibration.** Every rule is named (`RULES` in each module) and has a
+history in `histories.py` that passes with every rule on and fails with that
+rule off (`test_each_rule_is_needed`). Rules this model had to add to the
+design and the amendments are switched off by `ADDED`; each is a finding:
+
+| Model | Rule added | Without it |
+|---|---|---|
+| staleness | `reset_probe`: a batch that resets progress (a full run's first batch) probes the whole input | rule 3 probes only the batch's range and reads fresh while the rest is owed |
+| staleness | `held_probe`: progress reset to `held` probes, as rule 4 | the input reads fresh with every held key owed |
+| staleness | `catch_up_first`: every rule, and every change of conditions or reset, begins with rule 7's comparison | after a lost notification, rule 1 applies an old commit to newer progress or newer conditions and names a key that is not due |
+| staleness | `rearm`: a restart applies rule 5 to every retry already due | a retry whose timer fired before the restart is never noticed |
+| staleness | `hold_back`: a batch holds back a key it loaded at another commit than planned while items is mid full run, or if a clear came since it planned | checks processes a removal the clear made and adds the key back when items completes |
+| full runs | `hold_back`: a reader's batch holds back what it loaded at another version than planned while its upstream is incomplete, or if a clear came since it planned | on a table the gate does not cover a batch already in flight, nor one that loaded mid rebuild and commits after: report loads a half-built count, archive processes removals the clear made |
+
+**Not modeled yet:** stores that write in place with late and dead writers,
+cleanup against the cut, lineage and digests, several upstream levels
+rebuilding at once, one witness per reason (STA-2), the propagation of
+"upstream stale" down the graph, and the cost of any of it at scale.
+
 ## Trace validation: simulation runs against the specs
 
 The specs check the design; the simulation runs the code. Trace
@@ -1377,7 +1473,7 @@ partition per asset) and comes last.
 | F32 | An `open` control file that names a worker wedges its partition (F30's class, past its fix; the control-file fuzzer): a worker never writes `open` (it swaps to `owned`), but `{"state": "open", "worker_id": "w"}` leaves the attempt waiting on that worker past any provisioning deadline, and the run never ends | P2 | fixed: `check_control` refuses a field a state cannot have (an `open` file names no worker), so the file is malformed and its attempt fails (F30's path); and the engine takes an owner only from `owned`, `writing` or `sealed`, so nothing but a worker's own swap makes it look started, and the provisioning deadline applies whatever the file says — `tests/server/test_control_file.py::test_an_open_control_file_naming_a_worker_fails_its_attempt` |
 | F33 | A consumer of a source read current misses a key for good: `feed` commits `k1` (version 3); `items`' run for it fails twice; meanwhile the client changes the outside to `{k0, k3}` and its commit fails, so the source index still says `{k1}`; `items`' third attempt loads `k1` and finds nothing (the outside lacks it now), writes only the removals, and commits. The client then puts `k1` back at version 3: the same version is the same content (versions.md §2), so nothing redelivers it, and `items` never holds `k1` (sweep Z12) | P2 | fixed (Erwin's ruling): every keyed load (an incremental batch, a whole read by `Keys`, a per-key page) checks that each key it asked for came back (`check_loaded`); one missing fails the attempt with a retryable `SourceBehind`, "the source index says k1@3 but the source has no k1". Nothing is delivered and the position stays, so the third attempt no longer commits the removals alone: the asset's retry budget bounds the retries, with its back-off, then the attempt fails with that reason. The next run delivers `k1` once the source holds it again, at any version, or its next commit removes it — `tests/server/test_source_behind.py` (the bounded retry and its message; restored; removed; a per-key page) Also `tests/server/test_sim_found.py::test_a_key_a_current_read_missed_reaches_its_consumer_once_restored` (W38's, now passing) |
 | F34 | A rename onto an earlier life's name loses that life's claim: `copy` renamed to `mirror`; `mirror`'s attempt runs; `copy` comes back without an alias (`mirror` removed, a new life); `copy`'s attempt runs; `copy` is renamed to `mirror` again. The rename re-keys `copy`'s claim over the earlier life's, still running (`claimed_partitions[(mirror, "")]`), so the engine no longer finds that attempt's claim, cannot settle it, and its run never ends (sweep Z11, unreplayable until the determinism fix) | P1 | fixed: a claim decides whether its attempt is live (`Model.claimed`), not the claim index, which gates dispatch for an asset's current life only. A removed asset's attempt in flight is an earlier life's (launched before the deploy that removed it: the commit's rule, `Model.earlier_life`): the reset drops it from the index, and so does a snapshot load, which had put it back. It still settles, its commit refused, and its task carries on in the new life (F21), behind whatever holds the name now. A rename never overwrites a claim still held: the simulation checks that every current-life claim is its partition's holder, and the journal check no longer counts a removed asset's attempts as holding the name — `tests/sim/test_replays.py::test_f34_a_rename_onto_an_earlier_lifes_name_keeps_its_attempt_settleable` |
-| F35 | An each=True partition is stale with no stale key: `fchecks` (each=True over `feed`) runs with `keys=[k1]`; `feed` then removes `k2`, which `fchecks` never held. `stale_keys` lists nothing, as K43 says (`k2` is on neither side: no output unit), yet the partition status, which rolls up as "any key", reports `stale` (found by the Staleness machine at 300 examples; its CI run is now derandomized, as the simulation's is, so a rare history cannot make CI flaky) | P3 | fixed, K38's rule: for an each=True asset, the partition is stale for an input change exactly when one of its keys is. The partition's own records (a reset, an unrecorded or moved `seen`, the position behind) filter, cheaply, and the keys confirm: the per-key scan runs only when the filter says stale, so roll-ups stay cheap. Here the pass under way had made the filter say stale, while the per-key view, which counts a removal only where the output holds the key, said nothing — `tests/server/test_staleness.py::test_a_key_neither_side_holds_leaves_an_each_partition_fresh` |
+| F35 | An each=True partition is stale with no stale key: `fchecks` (each=True over `feed`) runs with `keys=[k1]`; `feed` then removes `k2`, which `fchecks` never held. `stale_keys` lists nothing, as K43 says (`k2` is on neither side: no output unit), yet the partition status, which rolls up as "any key", reports `stale` (found by the Staleness machine at 300 examples; its CI run is now derandomized, as the simulation's is, so a rare history cannot make CI flaky) | P3 | fixed, K38's rule: for an each=True asset, the partition is stale for an input change exactly when one of its keys is. The partition's own records (a reset, an unrecorded or moved `seen`, the position behind) filter, cheaply, and the keys confirm: the per-key scan runs only when the filter says stale, so roll-ups stay cheap. Here the pass under way had made the filter say stale, while the per-key view, which counts a removal only where the output holds the key, said nothing — `tests/contract/test_sta.py::test_sta_7_a_key_neither_side_holds_leaves_an_each_partition_fresh` |
 | F36 | Collection deletes a delta file a launching attempt was handed: the engine prepares `checks`' next attempt, whose spec hands it pending delta entry 283 (it names level-4 delta file `…7JH0`, which compaction had let go of). While `_launch` writes the spec and the control file, another attempt acknowledges the entry; the launching attempt's claim names the entry's files only once `AttemptLaunched` is applied, so for that while `cleanup_reads()` holds nothing, and collection deletes the file (t=1041.70, between the spec at 1041.38 and the control file at 1041.98). The worker reads it at 1047.15: gone. Today the worker counts the entry unresolved and the other attempt has done it, so nothing is lost, but `cleanup_reads`' promise ("acknowledged by another meanwhile, it is still being read") breaks (sweep of the interleavings measurement, seed 11, under asyncio's order; it replays on a6db1a4 and stops at 2eb0e0b, which moved the timing, not the window) | P3 | fixed: the claim names the cleanup files its spec hands the attempt from `_prepare` on, as it does the delta log it reads (`reads`), not from `AttemptLaunched` on; `cleanup_reads()` holds them through the launch, so another attempt's acknowledgement meanwhile no longer lets collection take them — `tests/server/test_collection.py::test_a_delta_a_launching_attempt_was_handed_outlives_its_acknowledgement` |
 | F37 | A full pass begun before a dep moved continues after it: `checks` has never run; keys=[k2] writes k2 (generation 10), which begins the full pass it owes (`began` 10, `seen` none). `knob` moves; engine and reference agree that k1 and k2 are stale. The default run calls `checks` on k1 alone, so k2 keeps what the old `knob` gave it, and the engine reports no stale key while `seen` is still none (found writing W22's K47 histories as examples, on fae165c) | P2 | fixed: the move point (the whole and dep inputs' latest commit) is taken whenever the partition record's `seen` is absent or differs, not only when it differs, so a full pass begun before the move starts over and redoes what it wrote under the old version; and a backstop: an each=True partition is never fresh while its record says no whole and dep versions, or old ones — `tests/server/test_staleness.py::test_a_keys_run_on_a_never_built_output_leaves_it_owing_a_full_pass` |
 | F38 | A consumer of an output in a current-only store stalls for good: `items` lives in the table store (its current rows only). `copy` is in a delta pass over `items`' commit 1 (k1, k10, k2; batch 1 of 2 delivered) when `items`, its version bumped, rebuilds as commit 2 without k2. Batch 2 loads k2 by key; the store has none, so F33's check raises SourceBehind ("items: the source index says k2@106 but the source has no k2"), 28 times: the pass stays on commit 1, and the commit that removed k2 already exists, so no retry can pass. The budget runs out, no automation fires again, and `copy` and `checks` stay stale (sweep Z14, shrunk from 52 steps to 4; bisected to ba357e5, F33's fix) | P1 | fixed (the coordinator's ruling): a key missing from a current-only store is decided against the source's head index, not the pass's commit (`each.gone_since`; a delta pin carries the head). The head still names it: the store is behind its index, `SourceBehind`, retryable and bounded (F33). The head lacks it too: removed since, so the batch takes it as removed and the pass goes on. And a partition whose last outcome failed with nothing pending reports `failed`, its reasons kept, never quietly stale — `tests/sim/test_replays.py::test_f38_a_consumer_of_a_current_only_output_finishes_a_pass_its_upstream_outran`, `tests/server/test_source_behind.py::test_a_partition_whose_retries_ran_out_is_failing_not_stale`. Superseded by D153 step 4b: a fenced read names its head or the batch is planned again, and `gone_since` is gone (`tests/server/test_fenced_reads.py`) |
@@ -1386,5 +1482,5 @@ partition per asset) and comes last.
 | F41 | A consumer that read a removal keeps the key: `items` (keyed, incremental over `feed`, a source read as it is now; in the table store) goes through two rename takeovers, `seen` re-added while live, 2% errors and lost answers, and a redeploy; `feed` is then replaced by {k11}, then by {k1, k3}. After convergence `feed`'s index is {k1, k3} at its head, and `items`' position says it read through that commit, the one that removed k11; yet `items`' index still lists k11, written in the same pass as k1 and k3, and `items` reports itself fresh. A regression from 083ca73 (F38's fix): with it reverted, the same run converges. Found by the calibration run on ebaffaa, in asyncio's order; it shows with the simulation's changed timing (`checks` now a dependent of `knob`), its steps all older rules | P1 | no longer reproduces from acc65f3: its replay converges there (not bisected; 22 product commits since ebaffaa, K44's net delta and key-index step 3a among them; reverting 0f985de alone does not bring it back). Routed to the engine's seen-set rebuild (D126) to confirm — `tests/sim/test_replays.py::test_f41_a_consumer_that_read_a_removal_does_not_keep_the_key` (asyncio's order), an ordinary test |
 | F42 | A full run never finishes its pass: two full runs of `copy` (`mode='full'`, every partition), with a commit of `feed` between them. The first finishes its two-batch pass. Every attempt of the second starts the pass over — batch 0, a new `began` — delivers batch 1 of 2 and succeeds, and the next starts over again. The task relaunches without end: over a thousand attempts in one run, a cleanup run each, until memory is gone (main's Hypothesis seed 5000, out of memory at 3 GB in both orders; shrunk from 44 steps to 3). On any store and any seed. The second run was submitted while the first ran: perhaps the rule that a full run starts a full pass compares the pass's `began` with the run's submission, which every pass it begins comes after | P1 | fixed by the observed set (D153, step 4.3): a full run resets on its task's first batch only, and its walk goes on from its progress — `tests/sim/test_replays.py::test_f42_a_full_run_finishes_its_pass` |
 | F43 | Data a reader needs is deleted, then a run storm (W59's demo on FileStore, after about 15 minutes): `site_status` reads `site_events`, an append output, whole; its head spans commits 0–2,814, but commits 0–10 of some sites are gone ("commit 0 of site_events/alpha is gone"), and every upstream commit's OnChange runs it again: 7,500 failed runs in two hours. Root cause: two states shared one data root. The live demo and the console's Playwright and gate runs (fresh `SOLERA_STATE_URL`s, no data root of their own) all wrote the demo's FileStore beside its module; names carry no state, generations restart with each state, and each state's cleanups deleted what it took for its own — `site_events/delta/000000000000/` held the live commit (generation 224) beside fresh engines' 1791, 1899, 2203 | P1 | fixed: the demo's data lives under its own state's directory (`SOLERA_DATA_URL` the one variable, `file://` or `s3://`); a partition whose runs keep failing backs off its changes (60 s doubling to an hour, pending meanwhile) — `tests/test_demo_e2e.py::test_the_demo_keeps_its_data_beside_its_state`, `tests/server/test_engine.py::test_a_failing_partition_backs_off_its_changes`; a store root belongs to the namespace that first claims it, and another is refused (D167; `solera adopt-store` moves it) — `tests/sdk/test_filestore.py::test_a_root_belongs_to_the_namespace_that_first_claims_it`, `tests/server/test_engine.py::test_a_data_root_another_namespace_owns_is_refused`, `tests/server/test_cli.py::test_adopt_store_moves_a_root_once_its_namespace_is_retired` |
-| F44 | A first run classed every key as updated (W59's demo: `file_index`, `{added: 0, updated: 2}` on each batch) | — | not an engine bug: the run reported was `file_index`'s second; its first, seconds earlier, delivered every key as added, and the second's `site_feed` rewrote every file at a new generation. Kept as regression tests: `tests/server/test_changes.py::test_a_first_run_delivers_every_key_as_added` |
+| F44 | A first run classed every key as updated (W59's demo: `file_index`, `{added: 0, updated: 2}` on each batch) | — | not an engine bug: the run reported was `file_index`'s second; its first, seconds earlier, delivered every key as added, and the second's `site_feed` rewrote every file at a new generation. Kept as regression tests: `tests/contract/test_inc.py::test_inc_1_a_first_run_delivers_every_key_as_added_plain_or_per_key` |
 | F45 | A merge drops an endpoint a batch in flight reads at (the simulation, seed 65535): a keyed batch planned its head over awaits and reserved it on its claim only after them; meanwhile commit 1 landed and upkeep planned a merge of spans [0] and [1], installed once the claim had reserved head 0 — dropping endpoint 1 | P1 | fixed: the claim reserves each keyed input's head before anything is awaited — `tests/sim/test_replays.py::test_a_batch_reserves_its_head_before_it_plans` |
