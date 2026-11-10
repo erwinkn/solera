@@ -137,7 +137,7 @@ pub(crate) fn layers_in(ls: &Bound<'_, PyAny>) -> PyResult<Vec<LayerRef>> {
         .collect()
 }
 
-fn layer_out<'py>(py: Python<'py>, l: &LayerRef) -> PyResult<Bound<'py, PyDict>> {
+pub(crate) fn layer_out<'py>(py: Python<'py>, l: &LayerRef) -> PyResult<Bound<'py, PyDict>> {
     let d = PyDict::new(py);
     d.set_item("path", &l.path)?;
     d.set_item("size", l.size)?;

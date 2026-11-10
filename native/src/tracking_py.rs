@@ -624,6 +624,50 @@ impl Tracking {
         }
         Ok(PyBytes::new(py, &Event::of(parts).encode()))
     }
+
+    /// B4: builds and writes the next commit of `output` from its changed
+    /// keys (`encode_changes`'s form), on the change index attached for it;
+    /// None if nothing changed. See
+    /// `commit_py::build_commit`.
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (output, changes, *, version, path, time_ms=0, producer=Vec::new(), mode="patch", at=None, collect=0))]
+    fn build_commit<'py>(
+        &self,
+        py: Python<'py>,
+        output: &[u8],
+        changes: &[u8],
+        version: u64,
+        path: &str,
+        time_ms: u64,
+        producer: Vec<u8>,
+        mode: &str,
+        at: Option<u64>,
+        collect: usize,
+    ) -> PyResult<Option<Bound<'py, pyo3::types::PyDict>>> {
+        let out = self
+            .state
+            .read()
+            .unwrap()
+            .outputs
+            .get(output)
+            .cloned()
+            .unwrap_or_default();
+        let ixs = self.indexes.read().unwrap().clone();
+        crate::commit_py::build_commit(
+            py,
+            out,
+            ixs.as_ref(),
+            output,
+            changes,
+            version,
+            path,
+            time_ms,
+            &producer,
+            mode,
+            at,
+            collect,
+        )
+    }
 }
 
 fn one_input(
