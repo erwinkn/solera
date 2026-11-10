@@ -207,15 +207,46 @@ fn a_small_layer_of_long_keys_decodes_its_index_within_bounds() {
         mem.put(&Path::from("long"), w.take().into()).await.unwrap();
     });
     drop(w);
-    let base = NOW.load(Relaxed);
-    PEAK.store(base, Relaxed);
-    let got = rt.block_on(ix.commits(std::slice::from_ref(&l), 1, 1));
-    let held = PEAK.load(Relaxed) - base;
-    assert_eq!(got.unwrap().len(), 1);
-    assert!(
-        held < 2 * format::MAX_RAW,
-        "the index of a {} KB layer held {} MB",
-        l.size >> 10,
-        held >> 20
+    let ls = std::slice::from_ref(&l);
+    let first = Query {
+        limit: Some(1),
+        ..Default::default()
+    };
+    let some: Vec<Vec<u8>> = (0..6144u64)
+        .step_by(7)
+        .map(|i| [&prefix[..], format!("{i:08}").as_bytes()].concat())
+        .collect();
+    // a read holds one decoded segment of its own, besides its input
+    let measure = |what: &str, read: &dyn Fn() -> usize, want: usize, input: usize| {
+        let base = NOW.load(Relaxed);
+        PEAK.store(base, Relaxed);
+        assert_eq!(read(), want, "{what}");
+        let held = PEAK.load(Relaxed) - base;
+        assert!(
+            held < 2 * format::MAX_RAW + input,
+            "{what} of a {} KB layer held {} MB",
+            l.size >> 10,
+            held >> 20
+        );
+    };
+    measure(
+        "commits",
+        &|| rt.block_on(ix.commits(ls, 1, 1)).unwrap().len(),
+        1,
+        0,
+    );
+    measure(
+        "a scan of one key",
+        &|| rt.block_on(ix.scan(ls, 1, &first)).unwrap().run.len(),
+        1,
+        0,
+    );
+    let q = Query::default();
+    let input = some.iter().map(|k| k.len()).sum::<usize>() * 2;
+    measure(
+        "a get",
+        &|| rt.block_on(ix.get(ls, 1, &some, &q)).unwrap().run.len(),
+        some.len(),
+        input,
     );
 }

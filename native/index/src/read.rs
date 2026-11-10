@@ -4,7 +4,7 @@
 //! once, merged by key, newest layer first.
 
 use crate::error::{Error, Result};
-use crate::format::{Decoder, LayerRef};
+use crate::format::{parse_segment, Decoder, LayerRef};
 use crate::glob::Pattern;
 use crate::run::Run;
 use crate::store::{Cached, Part, Store, Want};
@@ -20,6 +20,9 @@ const ALL: u64 = 4 << 20;
 /// A read of listed keys keeps at most this many bytes fetched ahead of its
 /// decoding, per layer.
 const WINDOW: u64 = 16 << 20;
+/// Opening a layer fetches the index segments it needs about this many
+/// compressed bytes at a time.
+const SEG_BATCH: u64 = 16 << 20;
 
 /// The blocks of one batch, being fetched.
 type Fetch = tokio::task::JoinHandle<Result<Vec<Cached>>>;
@@ -203,73 +206,94 @@ impl Cursor {
             let k = keys.map_or(&[][..], |k| k.get(i));
             !bounds.below(k) && !bounds.above(k)
         };
+        // the listed keys in bounds, with the segment that may hold each
+        let listed: Vec<(usize, usize)> = keys.map_or(Vec::new(), |k| {
+            (0..k.len())
+                .filter(|&i| in_bounds(i))
+                .filter_map(|i| Some((i, top.segs.holding(k.get(i))?)))
+                .collect()
+        });
         let segs: Vec<usize> = match keys {
             None => top.segs.span(bounds.lo_key(), bounds.hi_key()).collect(),
-            Some(k) => {
-                let mut v: Vec<usize> = (0..k.len())
-                    .filter(|&i| in_bounds(i))
-                    .filter_map(|i| top.segs.holding(k.get(i)))
-                    .collect();
+            Some(_) => {
+                let mut v: Vec<usize> = listed.iter().map(|&(_, s)| s).collect();
                 v.dedup();
                 v
             }
         };
-        let wants = segs
-            .iter()
-            .map(|&i| {
-                let s = &top.segs;
-                (
-                    Part::Seg(i as u32),
-                    s.off[i]..s.off[i] + s.clen[i] as u64,
-                    Want::Seg {
-                        rlen: s.rlen[i],
-                        check: s.check[i],
-                        blocks: s.n[i],
-                        data_end: top.commits_start,
-                    },
-                )
-            })
-            .collect();
-        let loaded = store.load(&path, wants).await?;
+        // Segments the cache does not hold are fetched as compressed bytes,
+        // SEG_BATCH at a time, and decoded one at a time, so a read holds a
+        // bounded part of its index, however many segments it spans.
+        let s = &top.segs;
         let mut blocks: Vec<BlockRef> = Vec::new();
-        let mut push = |ix: &crate::format::Index, b: usize| {
-            blocks.push(BlockRef {
-                off: ix.off[b],
-                clen: ix.clen[b],
-                rlen: ix.rlen[b],
-                rows: ix.n[b],
-                check: ix.check[b],
-            })
-        };
-        let seg = |c: &Cached| match c {
-            Cached::Seg(s) => s.clone(),
-            _ => unreachable!(),
-        };
-        match keys {
-            None => {
-                for c in &loaded {
-                    let ix = seg(c);
-                    for b in ix.span(bounds.lo_key(), bounds.hi_key()) {
-                        push(&ix, b);
+        let mut at = 0;
+        let mut from = 0;
+        while from < segs.len() {
+            let (mut cached, mut wants, mut bytes) = (Vec::new(), Vec::new(), 0);
+            let mut to = from;
+            while to < segs.len() && bytes < SEG_BATCH {
+                let i = segs[to];
+                let c = store.cached_seg(&path, i);
+                if c.is_none() {
+                    bytes += s.clen[i] as u64;
+                    wants.push((
+                        Part::Block(s.off[i]),
+                        s.off[i]..s.off[i] + s.clen[i] as u64,
+                        Want::Block {
+                            check: s.check[i],
+                            keep: false,
+                        },
+                    ));
+                }
+                cached.push(c);
+                to += 1;
+            }
+            let mut fetched = store.load(&path, wants).await?.into_iter();
+            for (&i, c) in segs[from..to].iter().zip(cached) {
+                let ix = match c {
+                    Some(ix) => ix,
+                    None => {
+                        let Some(Cached::Block(b)) = fetched.next() else {
+                            unreachable!()
+                        };
+                        let ix = Arc::new(
+                            parse_segment(&b, s.rlen[i], s.check[i], s.n[i], top.commits_start)
+                                .map_err(|e| match e {
+                                    Error::Format(m) => Error::Format(format!("{path}: {m}")),
+                                    e => e,
+                                })?,
+                        );
+                        store.remember_seg(&path, i, ix.clone());
+                        ix
+                    }
+                };
+                let mut push = |b: usize| {
+                    blocks.push(BlockRef {
+                        off: ix.off[b],
+                        clen: ix.clen[b],
+                        rlen: ix.rlen[b],
+                        rows: ix.n[b],
+                        check: ix.check[b],
+                    })
+                };
+                match keys {
+                    None => ix
+                        .span(bounds.lo_key(), bounds.hi_key())
+                        .for_each(&mut push),
+                    Some(k) => {
+                        let mut last = None;
+                        while at < listed.len() && listed[at].1 == i {
+                            let b = ix.holding(k.get(listed[at].0));
+                            if let Some(b) = b.filter(|&b| Some(b) != last) {
+                                push(b);
+                                last = Some(b);
+                            }
+                            at += 1;
+                        }
                     }
                 }
             }
-            Some(k) => {
-                let mut last: Option<(usize, usize)> = None;
-                for i in (0..k.len()).filter(|&i| in_bounds(i)) {
-                    let key = k.get(i);
-                    let Some(s) = top.segs.holding(key) else {
-                        continue;
-                    };
-                    let at = segs.binary_search(&s).expect("segment loaded");
-                    let ix = seg(&loaded[at]);
-                    let Some(b) = ix.holding(key) else { continue };
-                    if last != Some((s, b)) {
-                        push(&ix, b);
-                        last = Some((s, b));
-                    }
-                }
-            }
+            from = to;
         }
         let keep_all = blocks.iter().map(|b| b.clen as u64).sum::<u64>() <= store.opts.cache_batch;
         Ok(Cursor {

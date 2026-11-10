@@ -134,12 +134,6 @@ pub(crate) enum Want {
     Top {
         layer: LayerRef,
     },
-    Seg {
-        rlen: u32,
-        check: u32,
-        blocks: u32,
-        data_end: u64,
-    },
     /// `keep`: cache it. A bulk read (a batch past `cache_batch`) does not,
     /// so that a scan or a merge leaves the planners' blocks where they are.
     Block {
@@ -345,6 +339,25 @@ impl Store {
         t.check(l)?;
         self.fill(l);
         Ok(t.clone())
+    }
+
+    /// A decoded segment the memory cache holds.
+    pub(crate) fn cached_seg(&self, path: &Arc<str>, i: usize) -> Option<Arc<Index>> {
+        let mut st = self.state.lock().unwrap();
+        match st.lru.get(&(path.clone(), Part::Seg(i as u32)))? {
+            Cached::Seg(s) => {
+                self.stats.hits.fetch_add(1, Relaxed);
+                Some(s)
+            }
+            _ => None,
+        }
+    }
+
+    /// Keep a decoded segment in the memory cache.
+    pub(crate) fn remember_seg(&self, path: &Arc<str>, i: usize, s: Arc<Index>) {
+        let mut st = self.state.lock().unwrap();
+        st.lru
+            .insert((path.clone(), Part::Seg(i as u32)), Cached::Seg(s));
     }
 
     /// Fetch what is wanted of one object, from the cache, from a GET already
@@ -591,14 +604,6 @@ fn parse(
             }
             Cached::Block(if *keep { Bytes::copy_from_slice(&b) } else { b })
         }
-        Want::Seg {
-            rlen,
-            check,
-            blocks,
-            data_end,
-        } => Cached::Seg(Arc::new(
-            parse_segment(&b, *rlen, *check, *blocks, *data_end).map_err(at)?,
-        )),
         Want::Top { layer } => {
             let tail = &b[(layer.top_start - start) as usize..];
             let top = Top::parse(tail, layer.top_start, layer.size).map_err(at)?;
