@@ -213,3 +213,62 @@ async def test_a_redeploy_while_a_batchs_commit_is_built_refuses_the_old_definit
     await solera.run("copy", expect=None)
     assert redeployed
     assert "1" not in installed, installed
+
+
+async def test_a_redeploy_while_a_batch_is_planned_prepares_it_under_the_new_deploy_alone(
+    solera, tmp_path, monkeypatch
+):
+    from solera_server.executors.inline import InlinePlacement
+
+    outside = Outside()
+    outside.feed["k"] = "v1"
+
+    def project(version):
+        @asset(
+            version=version,
+            inputs={"feed": Incremental()},
+            outputs=Output("copy", key="id"),
+            retries=Retry(n=0),
+        )
+        def copy(feed: list):
+            return [{"id": row["id"], "v": version} for row in feed]
+
+        return Project(
+            assets=[copy],
+            sources=[Source("feed", key="id", store="ext")],
+            stores={"ext": SourceStore(tmp_path / "ext", outside)},
+            default_store=FileStore(tmp_path / "data"),
+        )
+
+    old, new = project("1"), project("2")
+    await solera.deploy(old)
+    await solera.commit_source("feed", upsert={"k": "v1"})
+    engine = solera.engine
+    run, work, record = engine.core.run, InlinePlacement._work, solera.state.record
+    redeployed, installed = False, []
+
+    async def interleaved(fn, *args, **kwargs):
+        nonlocal redeployed
+        found = await run(fn, *args, **kwargs)
+        if fn == engine.core.tracking.plan and not redeployed:
+            redeployed = True
+            engine.redeploy(new.manifest)
+        return found
+
+    def current_worker(self, stage):  # a worker on whatever is deployed when it launches
+        if engine.manifest["deploy"] == new.manifest["deploy"]:
+            self.project = new
+        return work(self, stage)
+
+    def capture(*events, **kwargs):
+        for event in events:
+            head = ((event.get("commit") or {}).get("heads") or {}).get("copy")
+            if head is not None:
+                installed.append(head["version"])
+        return record(*events, **kwargs)
+
+    monkeypatch.setattr(engine.core, "run", interleaved)
+    monkeypatch.setattr(InlinePlacement, "_work", current_worker)
+    monkeypatch.setattr(solera.state, "record", capture)
+    await solera.run("copy", expect=None)
+    assert redeployed and installed == ["2"], installed

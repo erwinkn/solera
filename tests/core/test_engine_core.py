@@ -194,3 +194,21 @@ def test_a_commit_takes_its_changes_as_bytes_or_a_read_only_map_only(tmp_path):
     path.write_bytes(data)
     with path.open("rb") as f, mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mapped:
         assert tracking.build_commit(b"items", mapped, version=1, path="b.lay")["added"] == 1
+
+    class Exporting(mmap.mmap):  # a subclass may export any buffer, a mutable one's too
+        def __buffer__(self, flags):
+            return memoryview(bytearray(data)).toreadonly()
+
+    with path.open("rb") as f, Exporting(f.fileno(), 0, access=mmap.ACCESS_READ) as mapped:
+        with pytest.raises(TypeError):
+            tracking.build_commit(b"items", mapped, version=2, path="c.lay")
+
+
+async def test_a_launch_journals_no_layer_of_its_outputs(solera):
+    ex = await Example(solera).start(batch_size=1)
+    recorded = _recording(solera)
+    await ex.feed({f"k{i:03d}": "1" for i in range(4)})
+    launches = [e for e in recorded if e["type"] == "AttemptLaunched"]
+    assert launches and not any(
+        "core" in info for e in launches for info in e["prepared"]["outputs"].values()
+    )

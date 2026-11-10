@@ -730,12 +730,13 @@ impl Tracking {
         collect: usize,
     ) -> PyResult<Option<Bound<'py, pyo3::types::PyDict>>> {
         let mapped: PyBuffer<u8>;
-        let data: &[u8] = if let Ok(b) = changes.cast::<PyBytes>() {
+        let data: &[u8] = if let Ok(b) = changes.cast_exact::<PyBytes>() {
             b.as_bytes()
         } else {
             let refused =
                 || PyTypeError::new_err("changes: bytes, or an mmap.mmap mapped with ACCESS_READ");
-            if !changes.is_instance(&py.import("mmap")?.getattr("mmap")?)? {
+            // Exactly mmap.mmap: a subclass may export another object's buffer.
+            if !changes.get_type().is(&py.import("mmap")?.getattr("mmap")?) {
                 return Err(refused());
             }
             mapped = PyBuffer::get(changes)?;

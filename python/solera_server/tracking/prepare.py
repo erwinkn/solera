@@ -70,6 +70,7 @@ async def prepare(core: Core, task: dict, run: dict, attempt: str | None) -> dic
     with the plan's bytes under `plan` (kept out of the journal)."""
 
     engine = core.engine
+    deploy = engine.m.deploy_number
     base = engine._pin_inputs(task, run)
     # With incremental inputs, a run starts over as today's path decides (`_full_run`): a full
     # run's first batch, a definition other than the partition was built under, an input reset.
@@ -150,6 +151,8 @@ async def prepare(core: Core, task: dict, run: dict, attempt: str | None) -> dic
                 "classes": found["counts"],
             }
             all_empty = all_empty and not found["keys"]
+    if engine.m.deploy_number != deploy:  # redeployed while it planned: prepared under one deploy only
+        return await prepare(core, task, run, attempt)
     more = any(not (p["final"] or p.get("done")) for p in plans.values())
     skip = bool(base["incremental"]) and all_empty and not more and not full
     prepared = engine._prepared(task, run, attempt, base, plans, more, skip, None)

@@ -1296,6 +1296,7 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
             index = info.pop("index", None)
             if index is not None:
                 info["prefix"] = index["prefix"]
+            info.pop("core", None)  # the output's layers: the spec's, never the journal's
             outputs[name] = info
         kept = {
             k: prepared.get(k)
