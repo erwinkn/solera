@@ -2,6 +2,8 @@
 //! batches, consumers a day behind (build plan N2 to N5 and N12).
 //!
 //! `core-plan-bench workload=daily-scattered keys=100000000 dir=/data/x [tasks=50 threads=4 batch=10000 behind=24]`
+//! `core-plan-bench run=lineage keys=100000000 dir=/data/x [rounds=20 scenarios=all]`: B10's
+//! lineage beside the plan it replays.
 //!
 //! The output's layers are the change-index bench's (same workloads, seed and
 //! layer schedule), written once to `dir` and reused. One JSON line per
@@ -31,11 +33,13 @@ use solera_index::{
 use solera_tracking::codec::Ver;
 use solera_tracking::codec::{Dec, Enc};
 use solera_tracking::event::{Event, Part};
+use solera_tracking::lineage::{self, Answer};
 use solera_tracking::plan::{self, InputRequest, Mode, OneIndex, Plan, Request};
 use solera_tracking::progress::{
     read_digest, BatchProgress, Conditions, EdgeOpen, Holding, InputReport, Key, KeyRange, Keyed,
     Point, Reason, Value,
 };
+use solera_tracking::record::Record;
 use solera_tracking::{Output, Tracking};
 use std::collections::{HashMap, VecDeque};
 use std::io::Write;
@@ -309,6 +313,7 @@ fn scenario_state(
             piece: Some(value),
             points: pts,
             expect: read_digest(&Keyed::default(), false, &KeyRange::all()),
+            fence: None,
         });
         t.apply(&Event::of(vec![caught_up]).encode()).unwrap();
     }
@@ -428,6 +433,12 @@ fn main() {
             .extend(extra.as_object().unwrap().clone());
         println!("{v}");
     };
+    if a.s("run", "plan") == "lineage" {
+        lineage_runs(
+            &a, &dir, &rt, &layers, head, n, limit, behind, memory, &emit,
+        );
+        return;
+    }
     let heap0 = alloc::live();
     let t = RwLock::new(state(&layers, head, tasks, p, &cond));
     emit(
@@ -671,6 +682,214 @@ fn main() {
                     "heap_start_mb": r3(heap as f64 / 1e6), "peak_mb": r3(alloc::peak() as f64 / 1e6), "peak_above_start_mb": r3((alloc::peak() - base) as f64 / 1e6), "rss_mb": r3(rss_mb())}),
             );
         }
+    }
+}
+
+/// B10: a lineage question costs what a plan costs (N2, N4). Per scenario,
+/// one consumer plans a batch from the middle of the key space and commits
+/// it; its lineage is then recomputed from its record. Cold: the plan and
+/// the lineage each on their own cold index over the simulated network.
+/// Warm: `rounds` batches planned and committed, then each one planned again
+/// on a fresh state and its lineage recomputed, both on the warmed index.
+#[allow(clippy::too_many_arguments)]
+fn lineage_runs(
+    a: &Args,
+    dir: &std::path::Path,
+    rt: &tokio::runtime::Runtime,
+    layers: &[LayerRef],
+    head: u64,
+    n: u32,
+    limit: usize,
+    behind: u64,
+    memory: u64,
+    emit: &dyn Fn(&str, serde_json::Value),
+) {
+    let rounds = a.get::<usize>("rounds", 20);
+    let p = head - behind;
+    let cond = Arc::new(Conditions::default());
+    let old = Arc::new(Conditions {
+        context: b"old".as_slice().into(),
+        ..Default::default()
+    });
+    let items: Key = b"items".as_slice().into();
+    let seen: Vec<Ver> = {
+        let ix = index(dir, None, rt, memory);
+        let keys = point_keys(10_000, n, 0);
+        let page = rt
+            .block_on(ix.get(layers, p, &keys, &Query::default()))
+            .unwrap();
+        let mut got = HashMap::new();
+        for i in 0..page.run.len() {
+            got.insert(
+                page.run.key(i).to_vec(),
+                Ver::of(page.run.new_version(page.run.rows(i).start)),
+            );
+        }
+        keys.iter()
+            .map(|k| got.get(&k[..]).cloned().unwrap_or(Ver::Absent))
+            .collect()
+    };
+    // (scenario, the consumer's progress, failed points, mode, the head it plans at, cleanup cursor)
+    let scenarios: Vec<(&str, Option<Value>, u32, Mode, u64, u64)> = vec![
+        (
+            "day",
+            Some(Value::At(p, cond.clone())),
+            0,
+            Mode::Incremental,
+            head,
+            0,
+        ),
+        (
+            "context",
+            Some(Value::At(p, old.clone())),
+            0,
+            Mode::Incremental,
+            head,
+            0,
+        ),
+        (
+            "points",
+            Some(Value::At(p, cond.clone())),
+            10_000,
+            Mode::Incremental,
+            head,
+            0,
+        ),
+        ("empty", None, 0, Mode::Incremental, head, 0),
+        ("held", Some(Value::Held), 0, Mode::Incremental, head, 0),
+        (
+            "all",
+            Some(Value::At(p, cond.clone())),
+            0,
+            Mode::All,
+            head,
+            0,
+        ),
+        (
+            "day-old-cleaned",
+            Some(Value::At(p - behind, cond.clone())),
+            0,
+            Mode::Incremental,
+            p,
+            head,
+        ),
+    ];
+    let only = a.s("scenarios", "all");
+    let start: Option<Key> = Some(key(n / 2).into());
+    for (scenario, value, points, mode, at, cleaned) in scenarios {
+        if only != "all" && !only.split(',').any(|o| o == scenario) {
+            continue;
+        }
+        let held = value == Some(Value::Held);
+        let state = || {
+            RwLock::new(scenario_state(
+                layers,
+                at,
+                1,
+                value.clone(),
+                points,
+                n,
+                (points > 0).then_some(seen.as_slice()),
+            ))
+        };
+        let req = |after: Option<Key>| Request {
+            mode: mode.clone(),
+            reset: false,
+            after,
+            limit,
+            inputs: vec![InputRequest {
+                edge: edge(0),
+                conditions: cond.clone(),
+                own: held.then(|| items.clone()),
+            }],
+            unkeyed: vec![],
+        };
+        let commit = |t: &RwLock<Tracking>, plan: &Plan| {
+            let ops = t
+                .read()
+                .unwrap()
+                .progress_ops(
+                    plan,
+                    &[InputReport::default()],
+                    b"run/batch/attempt",
+                    Some(1),
+                )
+                .unwrap();
+            t.write().unwrap().apply(&ops.event().encode()).unwrap();
+            ops.records.into_iter().next().unwrap()
+        };
+        let replay = |t: &RwLock<Tracking>, ix: &ChangeIndex, rec: &Record| {
+            let logs = t.read().unwrap().logs(rec, held.then_some(&items[..]));
+            match rt
+                .block_on(lineage::input(&logs, rec, &OneIndex(ix), cleaned))
+                .unwrap()
+            {
+                Answer::Found(keys) => keys,
+                Answer::NotRetained { commit, .. } => panic!("not retained at {commit}"),
+            }
+        };
+
+        let t = state();
+        let ix = index(dir, Some(NET), rt, memory);
+        let (cpu, t0) = (proc_cpu(), Instant::now());
+        let plan = rt.block_on(plan_once(&t, &ix, &req(start.clone())));
+        let (plan_s, plan_cpu, pc) = (
+            t0.elapsed().as_secs_f64(),
+            proc_cpu() - cpu,
+            ix.store.stats.counts(),
+        );
+        let rec = commit(&t, &plan);
+        let ix = index(dir, Some(NET), rt, memory);
+        let (cpu, t0) = (proc_cpu(), Instant::now());
+        let got = replay(&t, &ix, &rec);
+        let (lin_s, lin_cpu, lc) = (
+            t0.elapsed().as_secs_f64(),
+            proc_cpu() - cpu,
+            ix.store.stats.counts(),
+        );
+        assert_eq!(got.len(), plan.inputs[0].keys.len());
+        emit(
+            "lineage-1",
+            json!({"scenario": scenario, "mode": "cold", "keys_in_batch": got.len(), "deleted": got.iter().filter(|r| r.deleted).count(),
+                "plan_wall_s": r3(plan_s), "plan_cpu_s": r3(plan_cpu), "plan_gets": pc.gets, "plan_mb": r3(pc.get_bytes as f64 / 1e6),
+                "lineage_wall_s": r3(lin_s), "lineage_cpu_s": r3(lin_cpu), "lineage_gets": lc.gets, "lineage_mb": r3(lc.get_bytes as f64 / 1e6)}),
+        );
+
+        let ix = index(dir, None, rt, memory);
+        let t = state();
+        let mut recs = vec![];
+        let mut after = start.clone();
+        for _ in 0..rounds {
+            let plan = rt.block_on(plan_once(&t, &ix, &req(after.clone())));
+            after = plan.range.hi.clone();
+            recs.push(commit(&t, &plan));
+            if after.is_none() {
+                break;
+            }
+        }
+        let fresh = state();
+        let (mut plan_lat, mut lin_lat, mut plan_cpu, mut lin_cpu, mut keys) =
+            (vec![], vec![], 0.0, 0.0, 0);
+        let mut after = start.clone();
+        for rec in &recs {
+            let (cpu, t0) = (proc_cpu(), Instant::now());
+            let plan = rt.block_on(plan_once(&fresh, &ix, &req(after.clone())));
+            plan_lat.push(t0.elapsed().as_secs_f64());
+            plan_cpu += proc_cpu() - cpu;
+            commit(&fresh, &plan);
+            after = plan.range.hi.clone();
+            let (cpu, t0) = (proc_cpu(), Instant::now());
+            keys += replay(&t, &ix, rec).len();
+            lin_lat.push(t0.elapsed().as_secs_f64());
+            lin_cpu += proc_cpu() - cpu;
+        }
+        emit(
+            "lineage-batches",
+            json!({"scenario": scenario, "mode": "warm", "batches": recs.len(), "keys": keys,
+                "plan_p50_s": r3(pct(&mut plan_lat.clone(), 0.5)), "plan_p99_s": r3(pct(&mut plan_lat, 0.99)), "plan_cpu_s": r3(plan_cpu),
+                "lineage_p50_s": r3(pct(&mut lin_lat.clone(), 0.5)), "lineage_p99_s": r3(pct(&mut lin_lat, 0.99)), "lineage_cpu_s": r3(lin_cpu),
+                "lineage_us_per_key": r3(lin_cpu * 1e6 / keys.max(1) as f64)}),
+        );
     }
 }
 
