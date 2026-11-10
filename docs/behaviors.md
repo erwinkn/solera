@@ -1032,7 +1032,7 @@ config holding an integer past 64 bits is a 400. A malformed body is a
 Between external inputs the engine's ticks, events and requests stay
 within `burst + rate × elapsed`. No wake floor: each loop is fixed where
 it is.
-*From* D60, D81; F20. *Covered* `contract/test_eng.py::test_eng_10_an_idle_engine_does_not_spin`; `contract/test_eng.py::test_eng_10_the_storage_count_sees_every_request`; sim "No hot loop" (`PACE`, `tests/sim/world.py`).
+*From* D60, D81; F20. *Covered* `contract/test_eng.py::test_eng_10_an_idle_engine_does_not_spin`; `contract/test_eng.py::test_eng_10_the_storage_count_sees_every_request`; `contract/test_eng.py::test_eng_10_each_storage_server_keeps_its_own_state`; sim "No hot loop" (`PACE`, `tests/sim/world.py`).
 
 **ENG-11. A restart may stretch an attempt's timeout by one, never cut it short.**
 *From* `lifecycle.md` §8. *Covered* `contract/test_eng.py::test_eng_11_a_restart_never_cuts_an_attempts_timeout_short_and_stretches_it_by_one_at_most`; `server/test_fence.py::test_an_adopted_deadline_trusts_the_launching_clock_within_bounds`.
