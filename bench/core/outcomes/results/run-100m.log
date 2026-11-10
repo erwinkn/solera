@@ -1,0 +1,31 @@
+    1000/10000 batches: 35s, live=10000000 layers=6 bytes=121.8MB merges=331 merge_cpu=25.5s rss=416MB
+    2000/10000 batches: 74s, live=20000000 layers=9 bytes=243.5MB merges=660 merge_cpu=54.3s rss=519MB
+    3000/10000 batches: 119s, live=30000000 layers=8 bytes=365.3MB merges=991 merge_cpu=88.3s rss=515MB
+    4000/10000 batches: 173s, live=40000000 layers=5 bytes=487.6MB merges=1322 merge_cpu=131.0s rss=550MB
+    5000/10000 batches: 221s, live=50000000 layers=6 bytes=609.5MB merges=1653 merge_cpu=166.6s rss=567MB
+    6000/10000 batches: 252s, live=60000000 layers=10 bytes=730.5MB merges=1985 merge_cpu=185.2s rss=561MB
+    7000/10000 batches: 302s, live=70000000 layers=9 bytes=852.6MB merges=2316 merge_cpu=223.7s rss=578MB
+    8000/10000 batches: 358s, live=80000000 layers=11 bytes=975.0MB merges=2646 merge_cpu=267.7s rss=606MB
+    9000/10000 batches: 392s, live=90000000 layers=12 bytes=1096.0MB merges=2979 merge_cpu=287.8s rss=606MB
+   10000/10000 batches: 465s, live=100000000 layers=8 bytes=1218.7MB merges=3311 merge_cpu=347.9s rss=644MB
+deploy (every key fails): 10000 commits in 464.9s wall, 483.6 CPU-s; commit p50 13.0 ms (CPU 13.2 ms), p99 25.6 ms; merges 3311 (347.9 CPU-s, 330.8s wall, longest 34.5s, 11044 MB written); commit layers 1213 MB; store after: 8 layers, 1218.7 MB, live 100000000; 12.2 bytes per live record; PUTs: 10000 commits + 3311 merges; GETs 56800 (11040 MB); peak RSS 703 MB
+lookup, 10,000 keys in one range, cold: 10.1 ms wall, 15.4 ms CPU; GETs 10 (0.4 MB) over 1 rounds
+lookup, 10,000 keys in one range, warm: 9.1 ms wall, 9.1 ms CPU; GETs 10 (0.4 MB) over 6 rounds
+lookup, 10,000 keys over 1% of the key space (a day's changes), cold: 164.8 ms wall, 167.2 ms CPU; GETs 10 (12.4 MB) over 1 rounds
+lookup, 10,000 keys over 1% of the key space (a day's changes), warm: 159.9 ms wall, 159.8 ms CPU; GETs 15 (73.1 MB) over 6 rounds
+lookup, 10,000 keys scattered over all of it (a retry pass in time order), cold: 529.1 ms wall, 751.7 ms CPU; GETs 10016 (36.7 MB) over 1 rounds
+lookup, 10,000 keys scattered over all of it (a retry pass in time order), warm: 379.4 ms wall, 618.9 ms CPU; GETs 58591 (183.6 MB) over 6 rounds
+    1000/10000 batches: 35s, live=90000000 layers=9 bytes=1339.8MB merges=333 merge_cpu=19.5s rss=396MB
+    2000/10000 batches: 74s, live=80000000 layers=13 bytes=1460.8MB merges=665 merge_cpu=42.5s rss=443MB
+    3000/10000 batches: 137s, live=70000000 layers=12 bytes=1049.8MB merges=996 merge_cpu=93.8s rss=622MB
+    4000/10000 batches: 177s, live=60000000 layers=10 bytes=1170.8MB merges=1330 merge_cpu=118.0s rss=623MB
+    5000/10000 batches: 236s, live=50000000 layers=10 bytes=817.5MB merges=1662 merge_cpu=159.0s rss=684MB
+    6000/10000 batches: 290s, live=40000000 layers=11 bytes=582.8MB merges=1993 merge_cpu=195.7s rss=689MB
+    7000/10000 batches: 340s, live=30000000 layers=8 bytes=438.3MB merges=2325 merge_cpu=226.9s rss=701MB
+    8000/10000 batches: 387s, live=20000000 layers=8 bytes=361.1MB merges=2657 merge_cpu=259.1s rss=692MB
+    9000/10000 batches: 439s, live=10000000 layers=4 bytes=135.6MB merges=2986 merge_cpu=297.5s rss=701MB
+   10000/10000 batches: 480s, live=0 layers=1 bytes=0.0MB merges=3317 merge_cpu=326.2s rss=726MB
+fix (every key succeeds): 10000 commits in 480.3s wall, 484.4 CPU-s; commit p50 15.5 ms (CPU 15.5 ms), p99 32.1 ms; merges 3317 (326.2 CPU-s, 319.0s wall, longest 31.4s, 9345 MB written); commit layers 1218 MB; store after: 1 layers, 0.0 MB, live 0; 88.0 bytes per live record; PUTs: 10000 commits + 3317 merges; GETs 69549 (12570 MB); peak RSS 768 MB
+form B, 1000000 records in memory: 0.5s, 0.5 CPU-s; RSS +248 MB = 260 bytes a record; journal 160 MB (160 bytes a record; a 10,000-key batch's event 1600 KB)
+form B, snapshot of 1000000 records: 160 MB in 0.1s (0.1 CPU-s); peak RSS 402 MB
+B3's failed points, 1000000 in memory: RSS +210 MB = 220 bytes a point

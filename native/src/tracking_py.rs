@@ -787,7 +787,115 @@ fn one_input(
     })
 }
 
+/// What a stored outcome crosses as: (outcome, tries, deploy, forced, since,
+/// last, next_at, until, message).
+type StoredTuple = (u8, u64, u64, u64, u64, u64, u64, u64, Vec<u8>);
+
+fn stored_of(t: StoredTuple) -> tr::outcomes::Stored {
+    let (outcome, tries, deploy, forced, since, last, next_at, until, message) = t;
+    tr::outcomes::Stored {
+        outcome,
+        tries,
+        deploy,
+        forced,
+        since,
+        last,
+        next_at,
+        until,
+        message: message.into(),
+    }
+}
+
+/// A key's stored outcome after what it came to (docs/per-key-processing.md
+/// §9, the transition table): None for no record. `fresh`: the try ran on
+/// other input than `prior`'s, which then counts for nothing.
+#[pyfunction]
+#[pyo3(signature = (prior, fresh, kind, message, retry_after, retry_for, now, deploy, forced, retries))]
+#[allow(clippy::too_many_arguments)]
+fn outcome_transition<'py>(
+    py: Python<'py>,
+    prior: Option<StoredTuple>,
+    fresh: bool,
+    kind: &str,
+    message: &[u8],
+    retry_after: Option<f64>,
+    retry_for: Option<f64>,
+    now: f64,
+    deploy: u64,
+    forced: u64,
+    retries: u64,
+) -> PyResult<Option<Bound<'py, PyTuple>>> {
+    let Some(kind) = tr::outcomes::Kind::parse(kind) else {
+        return Err(PyValueError::new_err(format!("no outcome kind {kind:?}")));
+    };
+    let r = tr::outcomes::Reported {
+        kind,
+        message: message.into(),
+        retry_after,
+        retry_for,
+    };
+    let prior = prior.map(stored_of);
+    let Some(s) = tr::outcomes::transition(prior.as_ref(), fresh, &r, now, deploy, forced, retries)
+    else {
+        return Ok(None);
+    };
+    let t = (
+        s.outcome,
+        s.tries,
+        s.deploy,
+        s.forced,
+        s.since,
+        s.last,
+        s.next_at,
+        s.until,
+        PyBytes::new(py, &s.message),
+    );
+    Ok(Some(t.into_pyobject(py)?))
+}
+
+/// Whether a retry takes a key with this stored outcome now (§9): `forced`
+/// is the forced-request counter per outcome code (index 0 unused).
+#[pyfunction]
+fn outcome_eligible(
+    outcome: u8,
+    next_at: u64,
+    deploy: u64,
+    forced: u64,
+    now: f64,
+    deploys: u64,
+    requests: [u64; 6],
+) -> bool {
+    let s = tr::outcomes::Stored {
+        outcome,
+        tries: 0,
+        deploy,
+        forced,
+        since: 0,
+        last: 0,
+        next_at,
+        until: 0,
+        message: Box::default(),
+    };
+    tr::outcomes::eligible(
+        &s,
+        now,
+        &tr::outcomes::Counters {
+            deploy: deploys,
+            forced: requests,
+        },
+    )
+}
+
+/// Seconds before the next try after `tries` transient failures (§9).
+#[pyfunction]
+fn outcome_backoff(tries: u64) -> f64 {
+    tr::outcomes::transition::backoff(tries)
+}
+
 pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(outcome_transition, m)?)?;
+    m.add_function(wrap_pyfunction!(outcome_eligible, m)?)?;
+    m.add_function(wrap_pyfunction!(outcome_backoff, m)?)?;
     m.add_class::<KeyMatcher>()?;
     m.add_function(wrap_pyfunction!(regex_check, m)?)?;
     m.add_class::<Tracking>()
