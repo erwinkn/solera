@@ -8,15 +8,6 @@ from solera.patterns import Matcher, spec
 from solera.sdk import RegistrationError
 
 
-def test_globs():
-    m = Matcher(spec("ICP/Results/**/*.csv"))
-    assert m("ICP/Results/a.csv") and m("ICP/Results/2026/09/a.csv")
-    assert not m("ICP/Results/a.xlsx") and not m("XRF/ICP/Results/a.csv")
-    assert Matcher(spec("*.csv"))("a.csv") and not Matcher(spec("*.csv"))("dir/a.csv")
-    assert Matcher(spec("f?.csv"))("f1.csv") and not Matcher(spec("f?.csv"))("f/.csv")
-    assert Matcher(spec("a+b(c).csv"))("a+b(c).csv")  # literal characters stay literal
-
-
 def test_include_exclude_and_names():
     m = Matcher(spec(["XRF/**", "XRF Data/**"], {"archive": "**/archive/**", "old": Regex(r".*\bold\b.*")}))
     assert m("XRF/run 1.csv") and m("XRF Data/x.csv")

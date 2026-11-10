@@ -157,6 +157,9 @@ impl ChangeIndex {
         if c1 > c2 {
             return invalid(format!("diff from {c1} to {c2}: C1 is after C2"));
         }
+        if c1 == c2 {
+            return Ok(None);
+        }
         let ls = pick(layers, c1, c2, &q.bounds());
         let Some(mut w) = self.walk(ls, q, None, false).await? else {
             return Ok(None);

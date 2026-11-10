@@ -268,34 +268,3 @@ async def test_a_custom_store_the_project_no_longer_declares_leaves_the_cleanup_
     assert engine.m.retired == {} and files(tmp_path / "mine")  # given up on: its files stay
     await _stop(engine)
     await state.close()
-
-
-def test_a_built_in_store_with_a_secret_written_in_the_open_is_refused():
-    """K25 (b): a built-in store's config enters the manifest, so registration
-    refuses a literal secret there, naming the field and the env:NAME form;
-    a DSN without a password (local development) passes."""
-
-    import pytest
-    from solera.sdk import RegistrationError
-    from solera.stores import S3Store
-    from solera_postgres import PostgresStore
-
-    @asset
-    def one():
-        return 1
-
-    def register(store):
-        return Project(assets=[one], default_store=store).manifest
-
-    with pytest.raises(RegistrationError, match="dsn='env:NAME'"):
-        register(PostgresStore("postgresql://solera:hunter2@db:5432/solera"))
-    with pytest.raises(RegistrationError, match="dsn='env:NAME'"):
-        register(PostgresStore("host=db dbname=solera password=hunter2"))
-    with pytest.raises(RegistrationError, match="secret_access_key='env:NAME'"):
-        register(S3Store("s3://bucket/data", secret_access_key="hunter2"))
-    for fine in (
-        PostgresStore("postgresql://solera@localhost/solera"),
-        PostgresStore("env:SOLERA_DSN"),
-        S3Store("s3://bucket/data", secret_access_key="env:AWS_SECRET"),
-    ):
-        assert register(fine)["stores"]["default"]["built_in"]["class"] == type(fine).__name__

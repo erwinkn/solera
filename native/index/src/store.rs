@@ -16,6 +16,10 @@ use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex};
 use tokio::sync::Semaphore;
 
+/// A small layer's top level comes with its segments, decoded at once up to
+/// about this many bytes; the rest are decoded when a read needs them.
+const EAGER_SEGS: usize = 16 << 20;
+
 #[derive(Clone, Debug)]
 pub struct StoreOptions {
     /// Bytes of blocks and metadata kept in memory, shared by every query.
@@ -130,12 +134,6 @@ pub(crate) enum Want {
     Top {
         layer: LayerRef,
     },
-    Seg {
-        rlen: u32,
-        check: u32,
-        blocks: u32,
-        data_end: u64,
-    },
     /// `keep`: cache it. A bulk read (a batch past `cache_batch`) does not,
     /// so that a scan or a merge leaves the planners' blocks where they are.
     Block {
@@ -213,8 +211,14 @@ impl Store {
         rt: tokio::runtime::Handle,
         opts: StoreOptions,
     ) -> Result<Arc<Store>> {
-        if opts.max_inflight == 0 {
-            return Err(Error::Invalid("max_inflight is at least 1".into()));
+        for (name, v) in [
+            ("max_inflight", opts.max_inflight as u64),
+            ("max_get", opts.max_get),
+            ("part_bytes", opts.part_bytes as u64),
+        ] {
+            if v == 0 {
+                return Err(Error::Invalid(format!("{name} is at least 1")));
+            }
         }
         Ok(Arc::new(Store {
             disk: opts.disk.clone().map(Disk::open).transpose()?,
@@ -299,12 +303,21 @@ impl Store {
     async fn get(&self, path: &str, r: Range<u64>) -> Result<Bytes> {
         let p = self.path(path)?;
         let _permit = self.sem.acquire().await.expect("semaphore");
-        let b = self
-            .inner
-            .get_ranges(&p, std::slice::from_ref(&r))
-            .await?
-            .pop()
-            .unwrap_or_default();
+        let b = match self.inner.get_ranges(&p, std::slice::from_ref(&r)).await {
+            Ok(mut got) => got.pop().unwrap_or_default(),
+            Err(e) => {
+                // an object shorter than its reference is damaged, not unreachable
+                if let Ok(m) = self.inner.head(&p).await {
+                    if m.size < r.end {
+                        return Err(Error::Format(format!(
+                            "{path}: {} bytes, read at {r:?}",
+                            m.size
+                        )));
+                    }
+                }
+                return Err(e.into());
+            }
+        };
         if b.len() as u64 != r.end - r.start {
             return Err(Error::Format(format!("{path}: short read at {r:?}")));
         }
@@ -334,6 +347,25 @@ impl Store {
         Ok(t.clone())
     }
 
+    /// A decoded segment the memory cache holds.
+    pub(crate) fn cached_seg(&self, path: &Arc<str>, i: usize) -> Option<Arc<Index>> {
+        let mut st = self.state.lock().unwrap();
+        match st.lru.get(&(path.clone(), Part::Seg(i as u32)))? {
+            Cached::Seg(s) => {
+                self.stats.hits.fetch_add(1, Relaxed);
+                Some(s)
+            }
+            _ => None,
+        }
+    }
+
+    /// Keep a decoded segment in the memory cache.
+    pub(crate) fn remember_seg(&self, path: &Arc<str>, i: usize, s: Arc<Index>) {
+        let mut st = self.state.lock().unwrap();
+        st.lru
+            .insert((path.clone(), Part::Seg(i as u32)), Cached::Seg(s));
+    }
+
     /// Fetch what is wanted of one object, from the cache, from a GET already
     /// in flight, or by new GETs (coalesced); in the order asked.
     pub(crate) async fn load(
@@ -343,7 +375,8 @@ impl Store {
     ) -> Result<Vec<Cached>> {
         let n = wants.len();
         let mut out: Vec<Option<Cached>> = vec![None; n];
-        let mut waits: Vec<(usize, Load, usize)> = Vec::new();
+        // (want, fetch, its place in the fetch, whether another load started it)
+        let mut waits: Vec<(usize, Load, usize, bool)> = Vec::new();
         {
             let mut st = self.state.lock().unwrap();
             let mut claims: Vec<usize> = Vec::new();
@@ -353,7 +386,7 @@ impl Store {
                     out[i] = Some(v);
                     self.stats.hits.fetch_add(1, Relaxed);
                 } else if let Some((f, j)) = st.inflight.get(&key) {
-                    waits.push((i, f.clone(), *j));
+                    waits.push((i, f.clone(), *j, true));
                     self.stats.waits.fetch_add(1, Relaxed);
                 } else {
                     claims.push(i);
@@ -387,14 +420,25 @@ impl Store {
                 for (j, &i) in claims[g..e].iter().enumerate() {
                     st.inflight
                         .insert((path.clone(), wants[i].0.clone()), (fut.clone(), j));
-                    waits.push((i, fut.clone(), j));
+                    waits.push((i, fut.clone(), j, false));
                 }
                 g = e;
             }
         }
-        let done = futures::future::join_all(waits.iter().map(|w| w.1.clone())).await;
-        for ((i, _, j), r) in waits.into_iter().zip(done) {
-            out[i] = Some(r?[j].clone());
+        // A block from another load's fetch is copied out as it arrives, so
+        // that this load holds what it asked for, not that fetch's response.
+        let done =
+            futures::future::join_all(waits.into_iter().map(|(i, f, j, other)| async move {
+                let got = f.await?;
+                Ok::<_, Error>(match &got[j] {
+                    Cached::Block(b) if other => (i, Cached::Block(Bytes::copy_from_slice(b))),
+                    c => (i, c.clone()),
+                })
+            }))
+            .await;
+        for r in done {
+            let (i, c) = r?;
+            out[i] = Some(c);
         }
         Ok(out
             .into_iter()
@@ -513,17 +557,25 @@ impl Store {
     }
 
     /// Start writing an object; its bytes go up in parts once past
-    /// `part_bytes`, and to the disk cache as they go. The disk cache never
-    /// fails a write: on a local error the object is simply not kept.
+    /// `part_bytes`, and to the disk cache as they go, within the room it can
+    /// set aside. The disk cache never fails a write: without room, or on a
+    /// local error, the object is simply not kept.
     pub(crate) fn upload(self: &Arc<Self>, path: &str) -> Result<Upload> {
+        let object = self.path(path)?;
         let tee = self
             .disk
             .as_ref()
-            .filter(|d| d.keeps(path))
-            .and_then(|d| d.temp().ok());
+            .filter(|d| d.claim(path, 0))
+            .and_then(|d| {
+                let t = d.temp().ok();
+                if t.is_none() {
+                    d.release(path, 0);
+                }
+                t
+            });
         Ok(Upload {
             store: self.clone(),
-            path: self.path(path)?,
+            path: object,
             name: path.to_string(),
             buf: Vec::new(),
             parts: None,
@@ -570,20 +622,16 @@ fn parse(
             }
             Cached::Block(if *keep { Bytes::copy_from_slice(&b) } else { b })
         }
-        Want::Seg {
-            rlen,
-            check,
-            blocks,
-            data_end,
-        } => Cached::Seg(Arc::new(
-            parse_segment(&b, *rlen, *check, *blocks, *data_end).map_err(at)?,
-        )),
         Want::Top { layer } => {
             let tail = &b[(layer.top_start - start) as usize..];
             let top = Top::parse(tail, layer.top_start, layer.size).map_err(at)?;
             top.check(layer)?;
             if start == layer.index_start {
+                let mut decoded = 0;
                 for i in 0..top.segs.len() {
+                    if decoded > EAGER_SEGS {
+                        break;
+                    }
                     let (a, n) = (
                         (top.segs.off[i] - start) as usize,
                         top.segs.clen[i] as usize,
@@ -601,6 +649,7 @@ fn parse(
                         top.commits_start,
                     )
                     .map_err(at)?;
+                    decoded += seg.bytes();
                     extra.push((Part::Seg(i as u32), Cached::Seg(Arc::new(seg))));
                 }
             }
@@ -624,6 +673,9 @@ impl Drop for Upload {
     /// An upload dropped unfinished (an error, a cancelled merge) gives its
     /// parts back: S3 keeps them, billed, until aborted.
     fn drop(&mut self) {
+        if let (Some(_), Some(d)) = (self.tee.take(), &self.store.disk) {
+            d.release(&self.name, self.size);
+        }
         if let Some(w) = self.parts.take() {
             self.store.rt.spawn(async move {
                 let _ = w.abort().await;
@@ -634,13 +686,15 @@ impl Drop for Upload {
 
 impl Upload {
     pub(crate) async fn write(&mut self, mut bytes: Vec<u8>) -> Result<()> {
-        self.size += bytes.len() as u64;
-        let room = self.store.disk.as_ref().map_or(0, |d| d.o.bytes);
-        if self.size.saturating_mul(4) > room
-            || self.tee.as_mut().is_some_and(|t| t.write(&bytes).is_err())
-        {
-            self.tee = None;
+        let n = bytes.len() as u64;
+        if let (Some(t), Some(d)) = (self.tee.as_mut(), &self.store.disk) {
+            let kept = (self.size + n).saturating_mul(4) <= d.o.bytes && d.grow(&self.name, n);
+            if !kept || t.write(&bytes).is_err() {
+                self.tee = None;
+                d.release(&self.name, self.size + if kept { n } else { 0 });
+            }
         }
+        self.size += n;
         let part = self.store.opts.part_bytes;
         if self.parts.is_none() {
             if self.buf.is_empty() {
@@ -689,10 +743,8 @@ impl Upload {
         }
         self.store.stats.puts.fetch_add(1, Relaxed);
         if let (Some(t), Some(d)) = (self.tee.take(), &self.store.disk) {
-            if d.claim(&self.name, self.size) {
-                if let Err(e) = d.commit(t, &self.name, self.size) {
-                    eprintln!("solera-index: disk cache of {} failed: {e}", self.name);
-                }
+            if let Err(e) = d.commit(t, &self.name, self.size) {
+                eprintln!("solera-index: disk cache of {} failed: {e}", self.name);
             }
         }
         Ok(())

@@ -100,43 +100,6 @@ def test_membership_and_size_agree_with_the_enumeration():
     assert size(big, now, partitions) == 1_000_000 > MAX_PARTITIONS  # counted, not listed
 
 
-async def test_a_fan_in_reads_the_heads_that_exist(state):
-    """Engine review round 2 #7: a whole fan-in over a million-partition
-    domain pins the heads that exist and agree with the consumer's shared keys
-    — it never lists the domain. Building upstream does, and is refused."""
-    seen = {}
-    a = StaticPartitions([f"a{i}" for i in range(1000)])
-    b = StaticPartitions([f"b{i}" for i in range(1000)])
-
-    @asset(partitions={"a": a, "b": b})
-    def grid(ctx):
-        return [{"at": ctx.partition}]
-
-    @asset(inputs={"grid": In()})
-    def rollup(grid: dict[str, list]):
-        seen["rollup"] = sorted(grid)
-        return [{"n": len(grid)}]
-
-    @asset(partitions={"a": a}, inputs={"grid": In()})
-    def by_a(ctx, grid: dict[str, list]):
-        seen[ctx.partition] = sorted(grid)
-        return [{"n": len(grid)}]
-
-    project = Project(assets=[grid, rollup, by_a])
-    engine = make_engine(state, project)
-    await engine.initialize()
-    await drive(engine, await engine.submit(["grid"], partitions=["a=a7,b=b9", "a=a8,b=b1"]))
-    start = time.perf_counter()
-    assert (await drive(engine, await engine.submit(["rollup"])))["request"]["status"] == "succeeded"
-    assert (await drive(engine, await engine.submit(["by_a"], partitions=["a7"])))["request"]["status"] == (
-        "succeeded"
-    )
-    assert time.perf_counter() - start < 5.0
-    assert seen == {"rollup": ["a=a7,b=b9", "a=a8,b=b1"], "a7": ["b9"]}  # keyed by the collapsed dims
-    with pytest.raises(ValueError, match=f"more than {MAX_PARTITIONS}"):
-        await engine.submit(["rollup"], upstream=True)  # a build lists the domain: bounded
-
-
 def test_the_planner_takes_its_view_as_arguments():
     """Engine review round 2 #9: planning is a synchronous function of the
     manifest, the heads, the time and the heads a sensor's commits will

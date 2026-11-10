@@ -39,8 +39,17 @@ struct DiskState {
     /// Paths being filled, and the bytes set aside for them.
     filling: HashSet<String>,
     reserved: u64,
-    /// Fills that failed, and when: not tried again for a minute.
-    failed: HashMap<String, std::time::Instant>,
+    /// Fills that failed: when, and how many times in a row. Not tried again
+    /// for a minute, doubling with each failure up to about an hour. At most
+    /// `FAILED` are remembered.
+    failed: HashMap<String, (std::time::Instant, u32)>,
+}
+
+const FAILED: usize = 1024;
+
+/// How long a fill that failed `n + 1` times in a row is not tried again.
+fn backoff(n: u32) -> std::time::Duration {
+    std::time::Duration::from_secs(60 << n.min(6))
 }
 
 /// A layer path as a file name, and back: `%`, `/` and a leading `.`
@@ -117,11 +126,13 @@ impl Disk {
             if n == ".lock" || n == ".store" {
                 continue;
             }
-            if n.starts_with('.') || !mine {
+            let m = e.metadata().map_err(io)?;
+            // too short to be a layer: a fill cut off before it was renamed
+            // cannot leave one, so it is not ours to keep
+            if n.starts_with('.') || !mine || m.len() < crate::format::TRAILER as u64 {
                 let _ = std::fs::remove_file(e.path());
                 continue;
             }
-            let m = e.metadata().map_err(io)?;
             found.push((m.modified().ok(), unname(&n), m.len()));
         }
         if !mine {
@@ -171,7 +182,7 @@ impl Disk {
         let failed = st
             .failed
             .get(path)
-            .is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(60));
+            .is_some_and(|&(t, n)| t.elapsed() < backoff(n));
         if !self.keeps(path)
             || size.saturating_mul(4) > self.o.bytes
             || st.reserved + size > self.o.bytes
@@ -181,12 +192,33 @@ impl Disk {
         {
             return false;
         }
-        st.failed.remove(path);
         st.reserved += size;
         let evict = self.make_room(&mut st);
         drop(st);
         self.remove(evict);
         true
+    }
+
+    /// Set `more` bytes aside for a claimed fill that grows as it is written
+    /// (a write-through); false, with nothing set aside, if they do not fit.
+    pub(crate) fn grow(&self, path: &str, more: u64) -> bool {
+        let mut st = self.st.lock().unwrap();
+        if !st.filling.contains(path) || st.reserved + more > self.o.bytes {
+            return false;
+        }
+        st.reserved += more;
+        let evict = self.make_room(&mut st);
+        drop(st);
+        self.remove(evict);
+        true
+    }
+
+    /// A claim given up, not failed: its room is given back.
+    pub(crate) fn release(&self, path: &str, size: u64) {
+        let mut st = self.st.lock().unwrap();
+        if st.filling.remove(path) {
+            st.reserved -= size;
+        }
     }
 
     /// A claimed fill that failed: its room is given back, and it is not
@@ -195,8 +227,19 @@ impl Disk {
         let mut st = self.st.lock().unwrap();
         if st.filling.remove(path) {
             st.reserved -= size;
+            let n = st.failed.get(path).map_or(0, |&(_, n)| n + 1);
+            if n == 0 && st.failed.len() >= FAILED {
+                st.failed.retain(|_, &mut (t, n)| t.elapsed() < backoff(n));
+                let oldest = st.failed.iter().min_by_key(|(_, &(t, _))| t);
+                if let Some(p) = oldest
+                    .filter(|_| st.failed.len() >= FAILED)
+                    .map(|(p, _)| p.clone())
+                {
+                    st.failed.remove(&p);
+                }
+            }
             st.failed
-                .insert(path.to_string(), std::time::Instant::now());
+                .insert(path.to_string(), (std::time::Instant::now(), n));
         }
     }
 
@@ -250,6 +293,7 @@ impl Disk {
         if st.filling.remove(path) {
             st.reserved -= size;
         }
+        st.failed.remove(path);
         drop(st);
         self.add(path, size);
         Ok(())
@@ -322,4 +366,59 @@ fn rand_id() -> u64 {
         ]
         .concat(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn failed_fills_are_remembered_within_a_bound() {
+        let dir = std::env::temp_dir().join(format!("solera-disk-failed-{}", std::process::id()));
+        let d = Disk::open(DiskOptions {
+            dir: dir.clone(),
+            store: "s".into(),
+            bytes: 1 << 20,
+        })
+        .unwrap();
+        for i in 0..3 * FAILED {
+            let p = format!("layer-{i}");
+            assert!(d.claim(&p, 1));
+            d.abandon(&p, 1);
+        }
+        let st = d.st.lock().unwrap();
+        assert_eq!(st.failed.len(), FAILED);
+        assert!(st.failed.contains_key(&format!("layer-{}", 3 * FAILED - 1)));
+        assert_eq!(st.reserved, 0);
+        drop(st);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn files_found_on_open_are_kept_within_the_budget() {
+        let dir = std::env::temp_dir().join(format!("solera-disk-found-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(".store"), "s").unwrap();
+        for i in 0..1000 {
+            std::fs::write(dir.join(format!("layer-{i}")), [0u8; 100]).unwrap();
+        }
+        // the newest, so the least likely to be evicted
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        for i in 0..1000 {
+            std::fs::write(dir.join(format!("z-empty-{i}")), b"").unwrap();
+        }
+        let d = Disk::open(DiskOptions {
+            dir: dir.clone(),
+            store: "s".into(),
+            bytes: 1000,
+        })
+        .unwrap();
+        let st = d.st.lock().unwrap();
+        assert_eq!(st.files.len(), 10);
+        assert_eq!(st.total, 1000);
+        drop(st);
+        let left = std::fs::read_dir(&dir).unwrap().count();
+        assert_eq!(left, 10 + 2);
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }

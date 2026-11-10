@@ -44,7 +44,7 @@ from dataclasses import dataclass, field
 
 from ..sdk import Ref
 from ..stores import Commits, KeyedWrite, Keys, Patch, StoreError, prepare_for
-from .stores import Harness, Ledger, context
+from .stores import Harness, Ledger, context, said
 
 KEYS = ["a", "b", "c", "d"]
 
@@ -71,6 +71,7 @@ class CommitModel:
     rows: dict[int, list[tuple[str, str]]] = field(
         default_factory=dict
     )  # the committed rows, by commit number
+    versions: dict[int, int] = field(default_factory=dict)  # the generation that wrote each commit
     last: tuple | None = None  # (write, prior, generation, commit, reset): the last call, to retry
 
 
@@ -145,6 +146,9 @@ def stateful(make_harness: Callable[[], Harness]):
                 return  # nothing changes against the index: the worker stores nothing
             prior = self.head
             written = self.run(self.store.store(keyed, prior, self._context(attempt)))
+            want = (sorted(upserts, key=str.encode), sorted(gone, key=str.encode), whole)
+            if said(written) != want:
+                raise AssertionError(f"a write said it changed {said(written)}; it changed {want}")
             self.exists, attempt.fenced, self.fence = True, True, max(self.fence, attempt.generation)
             attempt.last = (keyed, prior, written.ref)
             touched = set(upserts) | set(gone) | (set(self.ledger.entries) if whole else set())
@@ -263,11 +267,15 @@ def stateful(make_harness: Callable[[], Harness]):
             )
             if not selection.generations:
                 return
-            found = self.run(self.store.load(self.head, dict[str, list[dict]], selection))
-            got = {k: sorted(str(r["v"]) for r in group) for k, group in found.items()}
+            found = self.run(self.store.read(self.head, dict[str, list[dict]], selection))
+            got = {k: sorted(str(r["v"]) for r in group) for k, group in found.value.items()}
             want = {k: [self.content[k]] for k in selection.generations}
             if got != want:
                 raise AssertionError(f"a by-key load gave {got}; the index holds {want}")
+            if dict(found.versions) != selection.generations:
+                raise AssertionError(
+                    f"a by-key load said versions {found.versions}; the index holds {selection}"
+                )
 
         # -- commits --------------------------------------------------------------------
 
@@ -294,7 +302,9 @@ def stateful(make_harness: Callable[[], Harness]):
                 written = self.run(self.store.store(Patch(rows), model.head, sc))
             if reset:
                 model.rows.clear()
+                model.versions.clear()
             model.rows[commit_number] = sorted((r["id"], r["v"]) for r in rows)
+            model.versions[commit_number] = self.generation
             model.head, model.commit_number = written.ref, commit_number
             model.last = (rows, commit_number)
 
@@ -323,21 +333,31 @@ def stateful(make_harness: Callable[[], Harness]):
             if self.head is None:
                 return
             want = sorted(self.content.items())
+            versions = dict(self.ledger.entries)
             if self.kind == "immutable":
-                got = self._rows(self.head, self.ledger.keys())
+                got, read = self._read(self.head, self.ledger.keys())
             else:
-                got = [p for p in self._rows(self.head, None) if p[0] not in self.dirty]
+                got, read = self._read(self.head, None)
+                got = [p for p in got if p[0] not in self.dirty]
                 want = [p for p in want if p[0] not in self.dirty]
+                read = {k: v for k, v in read.items() if k not in self.dirty}
+                versions = {k: v for k, v in versions.items() if k not in self.dirty}
             if got != want:
                 raise AssertionError(f"the committed content reads {got}; the index holds {want}")
+            if read != versions:
+                raise AssertionError(
+                    f"the committed content reads at versions {read}; the index holds {versions}"
+                )
 
         @invariant()
         def pinned_readers_read_what_they_pinned(self):
             for pin in self.pins:
-                got = self._rows(pin.ref, Keys(dict(pin.entries)))
+                got, read = self._read(pin.ref, Keys(dict(pin.entries)))
                 want = sorted(pin.content.items())
-                if got != want:
-                    raise AssertionError(f"a pinned reader reads {got}; it pinned {want}")
+                if got != want or read != pin.entries:
+                    raise AssertionError(
+                        f"a pinned reader reads {got} at {read}; it pinned {want} at {pin.entries}"
+                    )
 
         @invariant()
         def commits_read_back(self):
@@ -348,6 +368,11 @@ def stateful(make_harness: Callable[[], Harness]):
             got = self._rows(model.head, None)
             if got != want:
                 raise AssertionError(f"the commits read {got}; committed were {want}")
+            newest = self.run(self.store.read(model.head, list[dict], None)).version
+            if newest != max(model.versions.values()):
+                raise AssertionError(
+                    f"the commits read at version {newest}; the newest wrote {model.versions}"
+                )
             lo = min(model.rows)
             for b in (lo, model.commit_number):
                 got = self._rows(model.head, Commits(b, b))
@@ -382,6 +407,12 @@ def stateful(make_harness: Callable[[], Harness]):
         def _rows(self, ref: Ref, selection) -> list[tuple[str, str]]:
             found = self.run(self.store.load(ref, list[dict], selection))
             return sorted((str(r["id"]), str(r["v"])) for r in found)
+
+        def _read(self, ref: Ref, selection) -> tuple[list[tuple[str, str]], dict]:
+            """The rows `read` gives, and the version it says each key was read at."""
+
+            found = self.run(self.store.read(ref, list[dict], selection))
+            return sorted((str(r["id"]), str(r["v"])) for r in found.value), dict(found.versions)
 
     return StoreMachine
 
