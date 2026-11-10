@@ -18,6 +18,12 @@ const MAX: u64 = 32 << 20;
 /// A read of listed keys launches its batches together, each about this size,
 /// cut only where a GET would end anyway.
 const ALL: u64 = 4 << 20;
+/// A read of listed keys keeps at most this many bytes fetched ahead of its
+/// decoding, per layer.
+const WINDOW: u64 = 16 << 20;
+
+/// The blocks of one batch, being fetched.
+type Fetch = tokio::task::JoinHandle<Result<Vec<Cached>>>;
 
 /// Sorted, distinct keys, back to back.
 #[derive(Default, Clone, Debug)]
@@ -160,10 +166,14 @@ pub(crate) struct Cursor {
     blocks: Vec<BlockRef>,
     next: usize,
     target: u64,
-    /// A read of listed keys: every batch is launched at once, and they are
-    /// decoded as they arrive.
+    /// A read of listed keys: batches are launched together, up to
+    /// `WINDOW` bytes ahead, and decoded as they arrive.
     all: bool,
-    pending: VecDeque<(Range<usize>, tokio::task::JoinHandle<Result<Vec<Cached>>>)>,
+    /// Bytes launched and not yet taken.
+    ahead: u64,
+    /// A read of listed keys small enough to keep in the memory cache.
+    keep_all: bool,
+    pending: VecDeque<(Range<usize>, Fetch)>,
     ready: VecDeque<(Bytes, BlockRef)>,
     run: Run,
     pos: usize,
@@ -190,10 +200,15 @@ impl Cursor {
     ) -> Result<Cursor> {
         let top = store.top(l).await?;
         let path: Arc<str> = Arc::from(l.path.as_str());
+        let in_bounds = |i: usize| {
+            let k = keys.map_or(&[][..], |k| k.get(i));
+            !bounds.below(k) && !bounds.above(k)
+        };
         let segs: Vec<usize> = match keys {
             None => top.segs.span(bounds.lo_key(), bounds.hi_key()).collect(),
             Some(k) => {
                 let mut v: Vec<usize> = (0..k.len())
+                    .filter(|&i| in_bounds(i))
                     .filter_map(|i| top.segs.holding(k.get(i)))
                     .collect();
                 v.dedup();
@@ -242,7 +257,7 @@ impl Cursor {
             }
             Some(k) => {
                 let mut last: Option<(usize, usize)> = None;
-                for i in 0..k.len() {
+                for i in (0..k.len()).filter(|&i| in_bounds(i)) {
                     let key = k.get(i);
                     let Some(s) = top.segs.holding(key) else {
                         continue;
@@ -257,6 +272,7 @@ impl Cursor {
                 }
             }
         }
+        let keep_all = blocks.iter().map(|b| b.clen as u64).sum::<u64>() <= store.opts.cache_batch;
         Ok(Cursor {
             store: store.clone(),
             path,
@@ -264,6 +280,8 @@ impl Cursor {
             next: 0,
             target: if all_at_once { ALL } else { FIRST },
             all: all_at_once,
+            ahead: 0,
+            keep_all,
             pending: VecDeque::new(),
             ready: VecDeque::new(),
             run: Run::new(),
@@ -273,17 +291,27 @@ impl Cursor {
         })
     }
 
+    /// Bytes a batch of blocks spans in the file, gaps included: what its
+    /// GETs fetch and hold.
+    fn span(&self, r: Range<usize>) -> u64 {
+        let (first, last) = (&self.blocks[r.start], &self.blocks[r.end - 1]);
+        last.off + last.clen as u64 - first.off
+    }
+
     fn launch(&mut self) {
         let a = self.next;
         let mut bytes = 0u64;
-        let gap = self.store.opts.coalesce;
+        let (gap, max_get) = (self.store.opts.coalesce, self.store.opts.max_get);
         while self.next < self.blocks.len() {
             let b = &self.blocks[self.next];
             let joins = self.next > a && {
                 let p = &self.blocks[self.next - 1];
                 b.off <= p.off + p.clen as u64 + gap
             };
-            if self.next > a && bytes >= self.target && !(self.all && joins) {
+            if self.next > a
+                && ((bytes >= self.target && !(self.all && joins))
+                    || self.span(a..self.next + 1) > max_get)
+            {
                 break;
             }
             bytes += b.clen as u64;
@@ -292,8 +320,9 @@ impl Cursor {
         if self.next == a {
             return;
         }
+        self.ahead += self.span(a..self.next);
         let keep = if self.all {
-            self.blocks.iter().map(|b| b.clen as u64).sum::<u64>() <= self.store.opts.cache_batch
+            self.keep_all
         } else {
             self.target = (self.target * 2).min(MAX);
             bytes <= self.store.opts.cache_batch
@@ -342,9 +371,9 @@ impl Cursor {
             }
             if self.pending.is_empty() {
                 self.launch();
-                while self.all && self.next < self.blocks.len() {
-                    self.launch();
-                }
+            }
+            while self.all && self.next < self.blocks.len() && self.ahead < WINDOW {
+                self.launch();
             }
             let Some((span, h)) = self.pending.pop_front() else {
                 return Ok(false);
@@ -352,6 +381,7 @@ impl Cursor {
             let got = h
                 .await
                 .map_err(|e| Error::Store(format!("fetch task: {e}").into()))??;
+            self.ahead -= self.span(span.clone());
             if !self.all {
                 self.launch();
             }
@@ -367,6 +397,29 @@ impl Cursor {
     #[inline]
     pub(crate) fn key(&self) -> &[u8] {
         self.run.key(self.pos)
+    }
+
+    /// Move to the first key at or after `target`, searching each decoded
+    /// block instead of stepping through it; false once the layer has none.
+    async fn seek(&mut self, target: &[u8]) -> Result<bool> {
+        loop {
+            let (mut lo, mut hi) = (self.pos, self.run.len());
+            while lo < hi {
+                let m = (lo + hi) / 2;
+                if self.run.key(m) < target {
+                    lo = m + 1;
+                } else {
+                    hi = m;
+                }
+            }
+            self.pos = lo;
+            if !self.fill().await? {
+                return Ok(false);
+            }
+            if self.key() >= target {
+                return Ok(true);
+            }
+        }
     }
 }
 
@@ -475,7 +528,6 @@ impl Walk {
             if self.bounds.above(key) {
                 return Ok(false);
             }
-            let mut take = self.pattern.as_ref().is_none_or(|p| p.matches(key));
             if let Some(keys) = &self.keys {
                 while self.kp < keys.len() && keys.get(self.kp) < key {
                     self.kp += 1;
@@ -483,8 +535,19 @@ impl Walk {
                 if self.kp == keys.len() {
                     return Ok(false);
                 }
-                take &= keys.get(self.kp) == key;
+                if key < keys.get(self.kp) {
+                    // not a listed key: jump this layer to the next one listed
+                    let want = keys.get(self.kp).to_vec();
+                    if self.curs[top].seek(&want).await? {
+                        self.sift_down();
+                    } else {
+                        self.pop();
+                    }
+                    continue;
+                }
             }
+            let key = self.curs[top].key();
+            let take = self.pattern.as_ref().is_none_or(|p| p.matches(key));
             group.push_key(key);
             while self
                 .heap

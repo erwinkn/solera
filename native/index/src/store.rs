@@ -200,6 +200,7 @@ pub struct Store {
     pub(crate) opts: StoreOptions,
     state: Mutex<State>,
     sem: Semaphore,
+    fill_slots: Arc<Semaphore>,
     disk: Option<Disk>,
     pub stats: Stats,
 }
@@ -212,8 +213,12 @@ impl Store {
         rt: tokio::runtime::Handle,
         opts: StoreOptions,
     ) -> Result<Arc<Store>> {
+        if opts.max_inflight == 0 {
+            return Err(Error::Invalid("max_inflight is at least 1".into()));
+        }
         Ok(Arc::new(Store {
             disk: opts.disk.clone().map(Disk::open).transpose()?,
+            fill_slots: Arc::new(Semaphore::new(2)),
             inner,
             prefix,
             rt,
@@ -251,8 +256,27 @@ impl Store {
         Ok(self.prefix.parts().chain(p.parts()).collect())
     }
 
-    /// One GET.
-    pub(crate) async fn get_range(&self, path: &str, r: Range<u64>) -> Result<Bytes> {
+    /// One read, parsed; a damaged copy in the disk cache is dropped and the
+    /// store's read instead.
+    pub(crate) async fn read_checked<T>(
+        &self,
+        path: &str,
+        r: Range<u64>,
+        parse: impl Fn(&[u8]) -> Result<T>,
+    ) -> Result<T> {
+        let (b, from_disk) = self.read(path, r.clone()).await?;
+        match parse(&b) {
+            Err(Error::Format(_)) if from_disk => {
+                self.disk.as_ref().unwrap().forget(path);
+                parse(&self.get(path, r).await?)
+            }
+            got => got,
+        }
+    }
+
+    /// One read, from the disk cache if it holds the layer (then `true`),
+    /// else one GET.
+    async fn read(&self, path: &str, r: Range<u64>) -> Result<(Bytes, bool)> {
         if let Some(d) = self.disk.as_ref().filter(|d| d.has(path)) {
             let (file, range) = (d.file(path), r.clone());
             let got = self
@@ -263,11 +287,16 @@ impl Store {
                 Ok(Ok(b)) => {
                     self.stats.disk_reads.fetch_add(1, Relaxed);
                     self.stats.disk_bytes.fetch_add(b.len() as u64, Relaxed);
-                    return Ok(Bytes::from(b));
+                    return Ok((Bytes::from(b), true));
                 }
                 _ => d.forget(path),
             }
         }
+        Ok((self.get(path, r).await?, false))
+    }
+
+    /// One GET.
+    async fn get(&self, path: &str, r: Range<u64>) -> Result<Bytes> {
         let p = self.path(path)?;
         let _permit = self.sem.acquire().await.expect("semaphore");
         let b = self
@@ -384,9 +413,9 @@ impl Store {
             path: &path,
             parts: &items,
         };
-        let got = self.get_range(&path, span.clone()).await;
         let mut extra: Vec<(Part, Cached)> = Vec::new();
-        let parsed: Result<Vec<Cached>> = got.and_then(|b| {
+        let mut parse_all = |b: Bytes| -> Result<Vec<Cached>> {
+            extra.clear();
             items
                 .iter()
                 .map(|(_, r, w)| {
@@ -395,8 +424,16 @@ impl Store {
                     parse(&path, w, piece, r.start, &mut extra)
                 })
                 .collect()
-        });
-        let parsed = parsed?;
+        };
+        let (b, from_disk) = self.read(&path, span.clone()).await?;
+        let parsed = match parse_all(b) {
+            // a damaged cached copy: drop it and read the store's
+            Err(Error::Format(_)) if from_disk => {
+                self.disk.as_ref().unwrap().forget(&path);
+                parse_all(self.get(&path, span.clone()).await?)?
+            }
+            r => r?,
+        };
         let mut st = self.state.lock().unwrap();
         for ((part, _, w), v) in items.iter().zip(&parsed) {
             if !matches!(w, Want::Block { keep: false, .. }) {
@@ -410,36 +447,64 @@ impl Store {
     }
 
     /// With a disk cache, fetch a layer's whole file to it in the background,
-    /// unless it is there, being fetched, or too large.
+    /// unless it is there, being fetched, too large, or failed before. Two
+    /// fills run at a time; a fill holds the store only while it reads, so
+    /// dropping the index stops it.
     fn fill(self: &Arc<Self>, l: &LayerRef) {
         let Some(d) = &self.disk else { return };
         if !d.claim(&l.path, l.size) {
             return;
         }
-        let (store, path, size) = (self.clone(), l.path.clone(), l.size);
+        let (store, slots, path, size) = (
+            Arc::downgrade(self),
+            self.fill_slots.clone(),
+            l.path.clone(),
+            l.size,
+        );
         self.rt.spawn(async move {
-            let d = store.disk.as_ref().unwrap();
-            if let Err(e) = store.download(&path, size).await {
-                eprintln!("solera-index: disk cache fill of {path} failed: {e}");
+            let Ok(_slot) = slots.acquire_owned().await else {
+                return;
+            };
+            if let Err(e) = Store::download(&store, &path, size).await {
+                if let Some(s) = store.upgrade() {
+                    s.disk.as_ref().unwrap().abandon(&path, size);
+                    eprintln!("solera-index: disk cache fill of {path} failed: {e}");
+                }
             }
-            d.unclaim(&path);
         });
     }
 
-    async fn download(&self, path: &str, size: u64) -> Result<()> {
-        let d = self.disk.as_ref().unwrap();
+    async fn download(store: &std::sync::Weak<Store>, path: &str, size: u64) -> Result<()> {
+        let gone = || Error::Store("the index was dropped".into());
         let io = |e: std::io::Error| Error::Store(format!("disk cache: {e}").into());
-        let mut t = d.temp().map_err(io)?;
+        let blocking = |e: tokio::task::JoinError| Error::Store(format!("disk cache: {e}").into());
+        let s = store.upgrade().ok_or_else(gone)?;
+        let mut t = s.disk.as_ref().unwrap().temp().map_err(io)?;
+        let step = s.opts.max_get;
+        drop(s);
         let mut at = 0;
         while at < size {
-            let end = (at + self.opts.max_get).min(size);
-            let b = self.get_range(path, at..end).await?;
-            t.write(&b).map_err(io)?;
+            let end = (at + step).min(size);
+            let b = store.upgrade().ok_or_else(gone)?.get(path, at..end).await?;
+            t = tokio::task::spawn_blocking(move || t.write(&b).map(|_| t))
+                .await
+                .map_err(blocking)?
+                .map_err(io)?;
             at = end;
         }
-        d.commit(t, path, size).map_err(io)?;
-        self.stats.fills.fetch_add(1, Relaxed);
+        let s = store.upgrade().ok_or_else(gone)?;
+        let (keep, name) = (s.clone(), path.to_string());
+        tokio::task::spawn_blocking(move || keep.disk.as_ref().unwrap().commit(t, &name, size))
+            .await
+            .map_err(blocking)?
+            .map_err(io)?;
+        s.stats.fills.fetch_add(1, Relaxed);
         Ok(())
+    }
+
+    /// Bytes the memory cache holds.
+    pub fn memory_bytes(&self) -> u64 {
+        self.state.lock().unwrap().lru.total as u64
     }
 
     /// Bytes of the disk cache in use.
@@ -570,7 +635,10 @@ impl Drop for Upload {
 impl Upload {
     pub(crate) async fn write(&mut self, mut bytes: Vec<u8>) -> Result<()> {
         self.size += bytes.len() as u64;
-        if self.tee.as_mut().is_some_and(|t| t.write(&bytes).is_err()) {
+        let room = self.store.disk.as_ref().map_or(0, |d| d.o.bytes);
+        if self.size.saturating_mul(4) > room
+            || self.tee.as_mut().is_some_and(|t| t.write(&bytes).is_err())
+        {
             self.tee = None;
         }
         let part = self.store.opts.part_bytes;
@@ -598,7 +666,6 @@ impl Upload {
     }
 
     pub(crate) async fn finish(mut self) -> Result<()> {
-        self.store.stats.puts.fetch_add(1, Relaxed);
         match self.parts.take() {
             None => {
                 self.store
@@ -620,12 +687,12 @@ impl Upload {
                     .map_err(|e| Error::Store(format!("an upload failed: {e}").into()))??;
             }
         }
+        self.store.stats.puts.fetch_add(1, Relaxed);
         if let (Some(t), Some(d)) = (self.tee.take(), &self.store.disk) {
             if d.claim(&self.name, self.size) {
                 if let Err(e) = d.commit(t, &self.name, self.size) {
                     eprintln!("solera-index: disk cache of {} failed: {e}", self.name);
                 }
-                d.unclaim(&self.name);
             }
         }
         Ok(())

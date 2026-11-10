@@ -7,7 +7,7 @@
 //! Reads the state only: run it off the event loop. The part's check refuses
 //! it if another commit reached the output meanwhile.
 
-use solera_index::{ChangeIndex, NewCommit, Query, Run, Version};
+use solera_index::{ChangeIndex, CommitWriter, NewCommit, Query, Run, Version};
 
 use crate::plan::Indexes;
 
@@ -65,28 +65,26 @@ pub struct Changed {
 }
 
 struct Entries {
-    run: Run,
+    w: CommitWriter,
     added: u64,
     updated: u64,
     removed: u64,
     keys: Option<Changed>,
     collect: usize,
-    commit: u64,
     version: u64,
 }
 
 impl Entries {
-    fn put(&mut self, key: &[u8], change: Change<'_>, old: Version<'_>) {
+    async fn put(&mut self, key: &[u8], change: Change<'_>, old: Version<'_>) -> Result<()> {
         let new = match change {
             Change::Upsert(None) => Version::Int(self.version),
             Change::Upsert(Some(v)) => Version::Bytes(v),
             Change::Removed => Version::Absent,
         };
         if new == old {
-            return;
+            return Ok(());
         }
-        self.run.push_key(key);
-        self.run.push_entry(self.commit, new, old);
+        self.w.push(key, new, old).await?;
         match (new.is_absent(), old.is_absent()) {
             (false, true) => self.added += 1,
             (false, false) => self.updated += 1,
@@ -101,6 +99,7 @@ impl Entries {
                 k.upserted.push(key.into());
             }
         }
+        Ok(())
     }
 }
 
@@ -122,14 +121,19 @@ pub async fn build(
             return invalid(format!("a load at commit {at}, after the head {head}"));
         }
     }
+    let nc = NewCommit {
+        commit,
+        time_ms: spec.time_ms,
+        producer: spec.producer,
+        live_before: out.live,
+    };
     let mut e = Entries {
-        run: Run::new(),
+        w: ix.commit_writer(spec.path, nc)?,
         added: 0,
         updated: 0,
         removed: 0,
         keys: (spec.collect > 0).then(Changed::default),
         collect: spec.collect,
-        commit,
         version: spec.version,
     };
     let mut ch = Changes::new();
@@ -140,16 +144,9 @@ pub async fn build(
             patch(ix, out, spec.mode, &ch, &mut e).await?;
         }
     }
-    if e.run.is_empty() {
+    let Some(layer) = e.w.finish().await? else {
         return Ok(None);
-    }
-    let nc = NewCommit {
-        commit,
-        time_ms: spec.time_ms,
-        producer: spec.producer,
-        live_before: out.live,
     };
-    let layer = ix.write_commit(spec.path, nc, &e.run).await?;
     Ok(Some(Built {
         part: OutputCommit {
             output: output.clone(),
@@ -193,7 +190,7 @@ async fn patch(
                 continue;
             }
         }
-        e.put(k, ch.change(i), old);
+        e.put(k, ch.change(i), old).await?;
     }
     Ok(())
 }
@@ -248,16 +245,18 @@ async fn replace(
         match (k, old) {
             (None, None) => return Ok(()),
             (Some(k), Some(o)) if k == o => {
-                e.put(k, ch.change(i), page.new_version(page.rows(j).start));
+                e.put(k, ch.change(i), page.new_version(page.rows(j).start))
+                    .await?;
                 i += 1;
                 j += 1;
             }
             (Some(k), o) if o.is_none_or(|o| k < o) => {
-                e.put(k, ch.change(i), Version::Absent);
+                e.put(k, ch.change(i), Version::Absent).await?;
                 i += 1;
             }
             (_, Some(o)) => {
-                e.put(o, Change::Removed, page.new_version(page.rows(j).start));
+                e.put(o, Change::Removed, page.new_version(page.rows(j).start))
+                    .await?;
                 j += 1;
             }
             (Some(_), None) => unreachable!(),
