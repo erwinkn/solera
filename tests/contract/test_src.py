@@ -5,6 +5,7 @@ import uuid
 
 import pytest
 from solera.sdk import (
+    Commit,
     Every,
     In,
     Incremental,
@@ -16,7 +17,9 @@ from solera.sdk import (
     RegistrationError,
     Retention,
     Retry,
+    RunRequest,
     Source,
+    Tick,
     asset,
     source,
 )
@@ -24,6 +27,7 @@ from solera.stores import FileStore
 
 from tests.contract.example import Example
 from tests.contract.harness import Outside, Refused, SourceStore, rebuild
+from tests.contract.test_eng import sensed_project
 
 
 def keyed(root, outside: Outside, got: list) -> Project:
@@ -553,3 +557,106 @@ async def test_src_11_an_observable_source_commits_on_its_schedule(solera):
     assert sorted(await solera.keys("events")) == ["y"]
     assert cursors == [None, "p1"]
     assert len(await solera.runs()) == 4  # the same version and map again commit nothing
+
+
+# -- target (PR 2) --
+
+
+# -- SRC-10 (target) --------------------------------------------------------------------
+
+
+async def test_src_10_a_commit_to_other_keys_while_a_tick_runs_does_not_refuse_it(solera):
+    """Another client commits z while a tick that saw a and z runs: the tick
+    reports a alone, so its commit, run and cursor land together."""
+
+    await solera.deploy(sensed_project())
+    await solera.commit_source("uploads", upsert={"a": "1", "z": "1"})
+    [tick] = await solera.sensor_ticks()
+    await solera.commit_source("uploads", upsert={"z": "2"})
+    before = await solera.keys("uploads")
+    outcome = Tick(cursor="c1", commits=[Commit("uploads", upsert={"a": "2"})], runs=[RunRequest("ingest")])
+    await solera.sensor_post(tick, outcome)
+    after = await solera.keys("uploads")
+    assert after["a"] != before["a"] and after["z"] == before["z"]
+    assert not (await solera.commit_source("uploads", upsert={"a": "2", "z": "2"}))["changed"]
+    assert [r["targets"] for r in await solera.runs() if "ingest" in r["targets"]] == [["ingest"]]
+    [row] = (await solera.get("/sensors/watch/ticks"))["ticks"]
+    assert row["tick"] == tick["tick"] and row["outcome"] == "accepted"
+    [tick] = await solera.sensor_ticks(wait=5)
+    assert tick["cursor"] == "c1"
+
+
+async def test_src_10_a_commit_to_a_key_the_tick_reports_refuses_it_whole(solera):
+    await solera.deploy(sensed_project())
+    await solera.commit_source("uploads", upsert={"a": "1", "z": "1"})
+    [tick] = await solera.sensor_ticks()
+    await solera.commit_source("uploads", upsert={"a": "3"})
+    before = await solera.keys("uploads")
+    outcome = Tick(cursor="c1", commits=[Commit("uploads", upsert={"a": "2"})], runs=[RunRequest("ingest")])
+    with pytest.raises(Refused) as refused:
+        await solera.sensor_post(tick, outcome)
+    assert refused.value.status == 409
+    assert await solera.keys("uploads") == before
+    assert not (await solera.commit_source("uploads", upsert={"a": "3"}))["changed"]
+    assert not [r for r in await solera.runs() if "ingest" in r["targets"]]
+    [tick] = await solera.sensor_ticks(wait=5)
+    assert tick["cursor"] is None
+
+
+# -- SRC-12 (target) --------------------------------------------------------------------
+
+
+async def test_src_12_a_load_that_finds_a_source_ahead_of_its_log_records_it(solera):
+    """feed's k1 was committed at 2; the outside moves it to 3 before any
+    commit says so, and items loads k1@3: feed's log now says k1@3 (a
+    commit saying so changes nothing), and items owes nothing."""
+
+    ex = await Example(solera).start()
+    await ex.feed({"k1": "1", "k2": "1"})
+    await ex.feed({"k1": "2"}, items=False)
+    ex.outside.feed["k1"] = "3"
+    [batch] = await ex.run("items")
+    assert batch.classes == ([], ["k1"], []) and await solera.rows("items") == {"k1": "3", "k2": "1"}
+    assert await solera.stale("items") == []
+    assert await ex.run("items") == []
+    assert not (await solera.commit_source("feed", upsert={"k1": "3"}))["changed"]
+
+
+async def test_src_12_a_log_that_moved_since_the_batchs_head_keeps_its_version(solera):
+    """As above, but a client commits k1@4 while items' batch runs: the log
+    knows better and keeps 4, and items owes k1."""
+
+    outside, steps = Outside(), []
+
+    @asset(inputs={"feed": Incremental()}, outputs=Output("items", key="id"))
+    async def items(ctx, feed: list):
+        if steps:
+            await steps.pop(0)()
+        return rebuild(ctx.batch["feed"], [{"id": r["id"], "v": r["v"]} for r in feed])
+
+    await solera.deploy(
+        Project(
+            assets=[items],
+            sources=[Source("feed", key="id", store="ext")],
+            stores={"ext": SourceStore(solera.root / "ext", outside)},
+            default_store=FileStore(solera.root / "data"),
+        )
+    )
+
+    async def commit(**upserts):
+        outside.feed.update(upserts)
+        await solera.commit_source("feed", upsert=upserts)
+
+    async def later():
+        await commit(k1="4")
+
+    await commit(k1="1")
+    await solera.run("items")
+    await commit(k1="2")
+    outside.feed["k1"] = "3"
+    steps.append(later)
+    await solera.run("items")
+    assert await solera.rows("items") == {"k1": "3"} and await solera.stale("items") == ["input changed"]
+    assert not (await solera.commit_source("feed", upsert={"k1": "4"}))["changed"]
+    await solera.run("items")
+    assert await solera.rows("items") == {"k1": "4"} and await solera.stale("items") == []

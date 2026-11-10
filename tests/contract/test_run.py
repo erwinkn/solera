@@ -11,6 +11,7 @@ from solera.stores import FileStore
 
 from tests.contract.example import Example
 from tests.contract.harness import Refused
+from tests.contract.test_sta import Rebuild, decided
 
 
 class Unprocessable(Rejected):
@@ -820,3 +821,24 @@ async def test_run_15_a_selection_past_100000_partitions_is_refused_not_truncate
         await solera.submit("grid", partitions="all")
     assert refused.value.status == 400 and "100000" in refused.value.detail
     assert await solera.runs() == []
+
+
+# -- target (PR 2) --
+
+
+# -- RUN-4 (target) ---------------------------------------------------------------------
+
+
+async def test_run_4_a_task_held_by_an_upstream_mid_full_run_says_upstream_incomplete(solera):
+    async with Rebuild(solera) as r:
+        await r.start()
+        run = await r.midway()
+        reader = await solera.submit("archive")
+        task = await decided(solera, reader, "archive")
+        assert task["status"] == "queued" and task.get("held") == ["upstream incomplete", "copy"], task
+        events = await solera.get(f"/runs/{reader['id']}/events")
+        assert [(e["reason"], e["name"]) for e in events if e["type"] == "held"] == [
+            ("upstream incomplete", "copy")
+        ]
+        await r.finish(run)
+        assert (await solera.wait(reader))["request"]["status"] == "succeeded"

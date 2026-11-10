@@ -685,6 +685,84 @@ class Solera:
         for path in [root, *(p for p in root.rglob("*") if p.is_dir())]:
             os.chmod(path, 0o555 if refused else 0o755)
 
+    # -- PERKEY+HISTORY (target) ---------------------------------------------------
+
+    async def key_log(self, asset: str, **params) -> list[dict]:
+        """What a per-key asset's keys came to, call by call, newest first
+        (`GET /assets/{name}/outcomes/history`), every page: of `params` only
+        (`run=`, `key=`, `outcome=`), if named."""
+
+        out, before = [], None
+        while True:
+            page = await self.get(
+                f"/assets/{asset}/outcomes/history", **params, **({"before": before} if before else {})
+            )
+            out += page["outcomes"]
+            if (before := page["next"]) is None:
+                return out
+
+    # -- FULLRUN+STALENESS (target) ----------------------------------------------
+
+    async def alarms(self) -> dict:
+        """What the engine's diagnostics (`GET /api/diagnostics`) raise, past
+        what names the engine itself: where an operator looks for what needs
+        a hand (stuck cleanups today; a full run left incomplete, STA-13)."""
+
+        names = ("backend", "state", "objects", "namespace", "project", "deploy", "inflight", "active_runs")
+        return {k: v for k, v in (await self.get("/api/diagnostics")).items() if k not in names and v}
+
+    # -- STORES+CLEANUP (target) -------------------------------------------------
+
+    async def at(self, output: str, head: dict, keys: dict | None = None, typ=None):
+        """An output's content as a reader planned at `head` (a head `head()`
+        gave) loads it through its store: a keyed one at `keys`, its keys
+        and versions then (`keys()` gave). None once the store no longer
+        holds it: cleanup took it."""
+
+        from obstore.exceptions import NotFoundError
+        from solera.stores import StoreError
+
+        ref, store = Ref.from_json(head["ref"]), self.project.stores[head["ref"]["store"]]
+        try:
+            if keys is None:
+                return (await self.shipped_read(store)(ref, typ or object, None)).value
+            return (await self.shipped_read(store)(ref, typ or list[dict], Keys(keys))).value
+        except (FileNotFoundError, NotFoundError, StoreError):
+            return None
+
+    async def loaded(self, output: str, keys: dict | None = None):
+        """What an output's store says it read (`Read`: the value, and the
+        versions it read) at its head: a keyed one at `keys`, keys and
+        versions as `keys()` gives them, or whole without them, every row
+        its store holds whatever the keys list."""
+
+        head = await self.head(output)
+        ref, store = Ref.from_json(head["ref"]), self.project.stores[head["ref"]["store"]]
+        return await self.shipped_read(store)(ref, list[dict], None if keys is None else Keys(keys))
+
+    @staticmethod
+    def shipped_read(store):
+        """`store.read` as the shipped store beneath it reads: what a test
+        adds to a store (a hook as a load begins, a list of the loads)
+        sees the engine's reads, never the test's own."""
+
+        import types
+
+        shipped = next(
+            (c for c in type(store).__mro__ if c.__module__.split(".")[0] in ("solera", "solera_postgres")),
+            None,
+        )
+        return store.read if shipped is None else types.MethodType(shipped.read, store)
+
+    async def alarmed(self, *words: str) -> bool:
+        """Whether the alarms the engine raises (`alarms()`) name every one of
+        `words`."""
+
+        import json
+
+        text = json.dumps(await self.alarms())
+        return all(word in text for word in words)
+
 
 class Storage:
     """An S3-compatible server (moto's) on a local port, its credentials in

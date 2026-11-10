@@ -26,6 +26,7 @@ from solera.sdk import (
     sensor,
     split_partition,
 )
+from solera.stores import FileStore
 
 from tests.contract.harness import Refused
 
@@ -468,3 +469,97 @@ async def test_par_9_a_sensors_requested_runs_see_its_own_commits(solera):
     assert [t["partition"] for t in detail["tasks"]] == ["new"]
     assert ran == ["new"]
     assert sorted(await solera.keys("sites")) == ["new"]
+
+
+# -- target (PR 2) --
+
+
+# -- PAR-6 (target) ---------------------------------------------------------------------
+
+DAY = 86400
+
+
+def sited(root, content: dict) -> Project:
+    """`site_files`, keyed, one partition per site of `sites` (dynamic)."""
+
+    @asset(outputs=Output("site_files", key="id"), partitions={"site": DynamicPartitions("sites")})
+    def site_files(ctx):
+        return [{"id": k, "v": v} for k, v in content[ctx.partition].items()]
+
+    return Project(
+        assets=[site_files], sources=[DynamicPartitions("sites")], default_store=FileStore(root / "data")
+    )
+
+
+async def gone_within_bounds(solera, output: str, partition: str, head: dict, keys: dict) -> bool:
+    """Whether `output[partition]`'s data at `head` comes to be gone while the
+    served engine works on: a barrier, its cleanup pass having run."""
+
+    async def gone():
+        return await solera.at(output, head, keys) is None
+
+    try:
+        await solera.until(gone)
+    except AssertionError:
+        return False
+    return True
+
+
+async def test_par_6_a_removed_partitions_head_stays_readable_for_cleanup_after_then_goes(solera):
+    """`sites` drops north, then west two days later: no run targets west,
+    its status is `removed`, a cleanup of its data awaits (`GET /cleanups`).
+    Once north's week is over and its data gone, west's last head still
+    reads as it was (the default `cleanup_after`, a week); a day later the
+    cleanup runs and west's data is gone."""
+
+    async def awaiting() -> list:
+        return [c for c in (await solera.get("/cleanups"))["cleanups"] if c["output"] == "site_files"]
+
+    content = {"east": {"a": 1}, "north": {"n": 1}, "west": {"b": 1}}
+    await solera.deploy(sited(solera.root, content))
+    await solera.commit_source("sites", upsert=["east", "north", "west"])
+    await solera.run("site_files", partitions="all")
+    north = await solera.head("site_files", "north"), await solera.keys("site_files", "north")
+    head, keys = await solera.head("site_files", "west"), await solera.keys("site_files", "west")
+    await solera.commit_source("sites", remove=["north"])
+    solera.advance(2 * DAY)
+    await solera.commit_source("sites", remove=["west"])
+    detail = await solera.run("site_files", partitions="all")
+    assert [t["partition"] for t in detail["tasks"]] == ["east"]
+    assert await solera.status("site_files", "west") == "removed"
+    assert await awaiting(), (await solera.get("/cleanups"))["cleanups"]
+    solera.advance(6 * DAY)  # north's week is over; west has a day to go
+    await solera.start()
+    assert await gone_within_bounds(solera, "site_files", "north", *north), "north's data stays past its week"
+    assert await solera.at("site_files", head, keys) == [{"id": "b", "v": 1}]
+    solera.advance(DAY + 60)
+
+    async def cleaned():
+        return not await awaiting()
+
+    await solera.until(cleaned)
+    assert await solera.at("site_files", head, keys) is None
+
+
+async def test_par_6_a_partition_back_within_the_window_picks_up_where_it_left_off(solera):
+    """`sites` drops north, then west four days later; three days on, once
+    north's data is gone, west comes back: its last head stands."""
+
+    content = {"east": {"a": 1}, "north": {"n": 1}, "west": {"b": 1}}
+    await solera.deploy(sited(solera.root, content))
+    await solera.commit_source("sites", upsert=["east", "north", "west"])
+    await solera.run("site_files", partitions="all")
+    north = await solera.head("site_files", "north"), await solera.keys("site_files", "north")
+    head = await solera.head("site_files", "west")
+    await solera.commit_source("sites", remove=["north"])
+    solera.advance(4 * DAY)
+    await solera.commit_source("sites", remove=["west"])
+    solera.advance(3 * DAY + 60)  # north's week is over; west is three days gone
+    await solera.start()
+    assert await gone_within_bounds(solera, "site_files", "north", *north), "north's data stays past its week"
+    await solera.commit_source("sites", upsert=["west"])
+    assert await solera.status("site_files", "west") == "materialized"
+    assert (await solera.head("site_files", "west"))["ref"] == head["ref"]
+    assert await solera.rows("site_files", "west") == {"b": 1}
+    detail = await solera.run("site_files", partitions="missing", expect=None)
+    assert [t["partition"] for t in detail["tasks"]] == []

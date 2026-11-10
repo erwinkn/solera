@@ -2,6 +2,9 @@
 
 from solera.sdk import In, Incremental, Output, Project, Result, Retry, Source, asset
 
+from tests.contract.example import Example
+from tests.contract.test_key import Checks
+
 
 @asset(tags={"team": "growth"})
 def orders(ctx):
@@ -207,3 +210,91 @@ async def test_his_4_a_commit_row_names_the_batch_that_made_it(solera):
         assert row["batch"] == {"index": made["index"], "count": made["count"]}
     assert [r["final"] for r in copies] == [False, False, True]
     assert [r["batch"] for r in await commits(solera, "files")] == [None]
+
+
+# -- target (PR 2) ---------------------------------------------------------------
+
+# -- HIS-3 (target) ----------------------------------------------------------------
+
+
+async def test_his_3_lineage_records_the_version_each_input_was_read_at(solera):
+    """`tally` reads `items` (FileStore) and `factor`, a source the outside
+    moved to w2 before any commit said so: its lineage names the version of
+    `items` it planned and the version of `factor` it was served, and no edge
+    for what `ctx.load()` read."""
+
+    ex = await Example(solera).start()
+    await ex.feed({"k1": "1"})
+    await ex.run("tally")
+    ex.outside.knob = "w2"
+    await ex.feed({"k1": "2"})
+    [batch] = await ex.run("tally")
+    assert batch.context == {"factor": "w2"}
+    made = (await solera.head("tally"))["ref"]["generation"]
+    lineage = await solera.get("/outputs/tally/lineage", depth=1)
+    edges = {
+        e["param"]: e["from"]
+        for e in lineage["edges"]
+        if e["to"] == {"output": "tally", "partition": "", "generation": made}
+    }
+    assert sorted(edges) == ["factor", "items"]  # ctx.load is not lineage
+    assert edges["items"]["generation"] == (await solera.head("items"))["ref"]["generation"]
+    factor = await solera.head("factor")
+    assert (factor["version"], edges["factor"]["generation"]) == ("w2", factor["ref"]["generation"])
+
+
+# -- HIS-5 (target) ----------------------------------------------------------------
+
+
+async def test_his_5_a_removed_key_outcome_stays_known_while_its_run_is_in_history(solera):
+    """`checks` delivers k2's removal in run R; `feed` moves on and upkeep
+    merges its history: while R is retained, k2's outcome is still `removed`."""
+
+    c = await Checks(solera).deploy()
+    await c.feed(k1="1", k2="1")
+    await c.run()
+    await c.feed(removes=["k2"])
+    await c.run()
+    assert (await solera.outcomes("checks"))["k2"]["outcome"] == "removed"
+    await solera.start()
+
+    async def merged():  # each commit adds a layer; a published merge folds them into one
+        views = [await solera.get(f"/outputs/{o}/merges") for o in ("feed", "checks")]
+        return all(view["layers"] == 1 for view in views)
+
+    for v in ("2", "3"):
+        await c.feed(k1=v)
+        await c.run()
+        await solera.until(merged)
+    [k2] = (await solera.get("/assets/checks/outcomes", key="k2"))["keys"]
+    assert k2["outcome"] == "removed"
+    assert (await solera.outcomes("checks"))["k2"]["outcome"] == "removed"
+
+
+# -- HIS-6 (target) ----------------------------------------------------------------
+
+
+async def test_his_6_the_per_key_log_keeps_failures_newest_first_not_ok_calls_and_expires_with_its_run(
+    solera,
+):
+    """Twelve keys succeed and `bad` fails, in two runs (a new deploy retries
+    it): the log holds bad's two failures, newest first, with their errors;
+    no ok call. Deleting the first run takes its failure with it."""
+
+    c = await Checks(solera).deploy()
+    c.failing["bad"] = RuntimeError("unexpected header")
+    await c.feed(bad="1", **{f"k{i:02}": "1" for i in range(12)})
+    await c.run()
+    await c.deploy(build="2")
+    await c.feed(**{f"k{i:02}": "2" for i in range(12)})
+    await c.run()
+    first, second = [r["id"] for r in reversed(await solera.runs(asset="checks"))]
+    log = await solera.key_log("checks")
+    assert [(r["run"], r["key"], r["outcome"]) for r in log] == [
+        (second, "bad", "failed"),
+        (first, "bad", "failed"),
+    ]
+    assert all("unexpected header" in r["error"] for r in log)
+    assert await solera.key_log("checks", outcome="ok") == []
+    await solera.request("DELETE", f"/runs/{first}")
+    assert [r["run"] for r in await solera.key_log("checks")] == [second]

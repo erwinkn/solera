@@ -68,8 +68,10 @@ enforces both rules.
 2. Write its test in `test_<area>.py`, named `test_<area>_<n>_<the rule>`
    (`test_inc_4_…` is INC-4's). Several tests of one entry share the prefix.
 3. Point the entry's *Covered* line at it.
-4. If the new core changes the entry, list it in `entries.CHANGED` with
-   the decision: its tests assert the target, and today's path skips them.
+4. If today's engine lacks the entry's behaviour (the new core changes or
+   adds it), list it in `entries.TARGET` with the decision: its tests assert
+   the target, and today's path skips them. `SOLERA_CONTRACT_TARGET=1` runs
+   them on today's engine anyway, to see them fail for the right reason.
 5. If it cannot be tested through what a user reaches, list it in
    `entries.PENDING` with the reason instead.
 

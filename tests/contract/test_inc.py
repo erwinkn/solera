@@ -5,7 +5,8 @@ from solera.sdk import Incremental, OnChange, Output, Project, Source, asset
 from solera.stores import FileStore, Patch
 
 from tests.contract.example import Batch, Example
-from tests.contract.harness import Outside, SourceStore
+from tests.contract.harness import Outside, SourceStore, rebuild
+from tests.contract.test_sta import Rebuild, decided
 
 
 def holds(batches: list[Batch], held=()) -> set:
@@ -623,3 +624,137 @@ async def test_inc_14_writing_the_same_rows_again_is_a_change_its_consumers_proc
     assert all(again[k] != keys[k] for k in keys)  # a new version of each
     assert await solera.rows("feed") == {"a": 1, "b": 1}
     assert fired == [(["a", "b"], []), ([], ["a", "b"])]
+
+
+# -- target (PR 2) --
+
+
+# -- INC-4 (target) ---------------------------------------------------------------------
+
+
+async def test_inc_4_an_update_reverted_to_the_processed_version_is_not_delivered(solera):
+    """feed's k1 goes 1 -> 2 -> 1 before items runs, and k2 goes 1 -> 2: items
+    is stale while k1 is at 2 and fresh once it is back; its run delivers
+    k2 alone."""
+
+    ex = await Example(solera).start()
+    await ex.feed({"k1": "1", "k2": "1"})
+    await ex.feed({"k1": "2"}, items=False)
+    assert await solera.stale("items") == ["input changed"]
+    await ex.feed({"k1": "1"}, items=False)
+    assert await solera.stale("items") == []
+    await ex.feed({"k2": "2"}, items=False)
+    [batch] = await ex.run("items")
+    assert (batch.classes, batch.rows) == (([], ["k2"], []), ["k2"])
+    assert await solera.rows("items") == {"k1": "1", "k2": "2"}
+
+
+# -- INC-8 (target) ---------------------------------------------------------------------
+
+
+def stepped(root, outside: Outside, got: list, steps: list) -> Project:
+    """feed -> items -> `copy`, a key a batch, recording each batch's classes
+    and the values its rows carry; `steps` run inside its next batches, one
+    each, in order."""
+
+    @asset(inputs={"feed": Incremental()}, outputs=Output("items", key="id"))
+    def items(ctx, feed: list):
+        return rebuild(ctx.batch["feed"], [{"id": r["id"], "v": r["v"]} for r in feed])
+
+    @asset(inputs={"items": Incremental(batch_size=1)}, outputs=Output("copy", key="id"))
+    async def copy(ctx, items: list):
+        batch = ctx.batch["items"]
+        got.append(
+            (
+                sorted(batch.added),
+                sorted(batch.updated),
+                sorted(batch.removed),
+                {r["id"]: r["v"] for r in items},
+            )
+        )
+        if steps:
+            await steps.pop(0)()
+        return rebuild(batch, [{"id": r["id"], "v": r["v"]} for r in items])
+
+    return Project(
+        assets=[items, copy],
+        sources=[Source("feed", key="id", store="ext")],
+        stores={"ext": SourceStore(root / "ext", outside)},
+        default_store=FileStore(root / "out"),
+    )
+
+
+async def test_inc_8_each_batch_reads_upstream_as_it_is_when_it_starts(solera):
+    """A run over k1, k2, a key a batch: while batch 1 has k1, k2 changes;
+    batch 2 delivers k2's new version."""
+
+    outside, got, steps = Outside(), [], []
+    await solera.deploy(stepped(solera.root, outside, got, steps))
+
+    async def change(**upserts):
+        outside.feed.update(upserts)
+        await solera.commit_source("feed", upsert=upserts)
+        await solera.run("items")
+
+    await change(k1="1", k2="1")
+    steps.append(lambda: change(k2="2"))
+    await solera.run("copy")
+    assert got == [(["k1"], [], [], {"k1": "1"}), (["k2"], [], [], {"k2": "2"})]
+    assert await solera.rows("copy") == {"k1": "1", "k2": "2"} and await solera.stale("copy") == []
+
+
+async def test_inc_8_a_batch_never_delivers_a_key_older_than_one_already_delivered(solera):
+    """k1, k2, k3 go to 2 and a run of copy begins, a key a batch. Inside its
+    first batch k2 goes to 3 and `keys=(k2)` is asked for. However the two
+    runs interleave, k2 is delivered once, at 3: never at 2 after 3."""
+
+    outside, got, steps = Outside(), [], []
+    await solera.deploy(stepped(solera.root, outside, got, steps))
+
+    async def change(**upserts):
+        outside.feed.update(upserts)
+        await solera.commit_source("feed", upsert=upserts)
+        await solera.run("items")
+
+    await change(k1="1", k2="1", k3="1")
+    await solera.run("copy")
+    await change(k1="2", k2="2", k3="2")
+    keyed = []
+
+    async def inside():
+        await change(k2="3")
+        keyed.append(await solera.submit("copy", keys={"items": ["k2"]}))
+
+    steps.append(inside)
+    del got[:]
+    await solera.run("copy")
+    await solera.wait(keyed[0])
+    delivered = [rows.get("k2") for added, updated, removed, rows in got if "k2" in added + updated + removed]
+    assert delivered == ["3"], got
+    assert await solera.rows("copy") == {"k1": "2", "k2": "3", "k3": "2"}
+    assert await solera.stale("copy") == []
+
+
+# -- INC-15 (target) --------------------------------------------------------------------
+
+
+async def test_inc_15_an_upstream_full_run_never_makes_a_keyed_reader_remove_and_add_back(solera):
+    """copy holds k1-k4 and runs full while items holds k1, k2, k4, k5, two
+    keys a batch. Its first commit is a clear and its numbering goes on;
+    archive runs no batch until copy completes, then gets one difference,
+    not reset: k1, k2, k4 updated, k3 removed, k5 added."""
+
+    async with Rebuild(solera) as r:
+        await r.start()
+        number = (await solera.head("copy"))["commit_number"]
+        run = await r.midway()
+        assert await solera.rows("copy") == {"k1": "1", "k2": "1"}  # the clear, and batch 1's keys
+        reader = await solera.submit("archive")
+        task = await decided(solera, reader, "archive")
+        assert task["status"] == "queued" and len(r.seen["archive"]) == 1, r.seen["archive"][1:]
+        await r.finish(run)
+        assert (await solera.wait(reader))["request"]["status"] == "succeeded"
+        [batch] = r.seen["archive"][1:]
+        assert not batch.reset and batch.classes == (["k5"], ["k1", "k2", "k4"], ["k3"])
+        assert (await solera.head("copy"))["commit_number"] == number + 2
+        assert await solera.rows("archive") == {"k1": "1", "k2": "1", "k4": "1", "k5": "1"}

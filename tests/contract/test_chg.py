@@ -1,16 +1,20 @@
 """CHG: definition, pattern and context changes (docs/behaviors.md)."""
 
 import asyncio
+import os
+import uuid
 
 import pytest
 from hypothesis import given, settings
 from hypothesis import strategies as st
 from solera import Incremental, Regex
 from solera.patterns import Matcher, spec
-from solera.sdk import Output, Project, asset
+from solera.sdk import In, Loaded, Output, Project, Source, asset, source
 from solera.stores import FileStore
 
 from tests.contract.example import Example
+from tests.contract.harness import Outside, SourceStore, rebuild
+from tests.contract.test_aut import automated, built_patterned, patterned
 
 
 def hold(ex: Example) -> tuple[asyncio.Event, asyncio.Event]:
@@ -340,3 +344,194 @@ def test_chg_12_a_key_is_taken_when_an_include_and_no_exclude_matches(include, e
     excluded = [n for n, g in enumerate(exclude) if _glob(g, key)]
     assert m.excluded_by(key) == (f"exclude[{excluded[0]}]" if excluded else None)
     assert m(key) == ((include is None or any(_glob(g, key) for g in include)) and not excluded)
+
+
+# -- target (PR 2) --
+
+
+# -- CHG-1 (target) ---------------------------------------------------------------------
+
+
+async def test_chg_1_a_version_bump_makes_it_stale_and_its_next_run_a_full_run(solera):
+    ex = await Example(solera).start(batch_size=2)
+    await ex.feed({"k1": "1", "k2": "1", "k3": "1"})
+    await ex.run("tally")
+    await ex.deploy(batch_size=2, version="2")
+    assert await ex.stale() == ["definition changed"]
+    batches = await ex.run("tally")
+    assert [(b.reset, b.added) for b in batches] == [(True, ["k1", "k2"]), (False, ["k3"])]
+    assert await ex.count() == 3 and await ex.stale() == []
+
+
+async def test_chg_1_a_runs_config_is_part_of_the_definition(solera):
+    ex = await Example(solera).start()
+    await ex.feed({"k1": "1", "k2": "1"})
+    await ex.run("tally")
+    [batch] = await ex.run("tally", config={"rate": 2})
+    assert batch.reset and batch.added == ["k1", "k2"]
+    assert await ex.count() == 2
+
+
+def stored(root, store, calls: list) -> Project:
+    """`files` (keyed), and `copy`, incremental over it, writing to `store`."""
+
+    @asset(outputs=Output("files", key="id"))
+    def files():
+        return [{"id": "a", "v": "1"}, {"id": "b", "v": "1"}]
+
+    @asset(inputs={"files": Incremental()}, outputs=Output("copy", key="id", store="s"))
+    def copy(ctx, files: list):
+        calls.append((ctx.batch["files"].reset, sorted(r["id"] for r in files)))
+        return rebuild(ctx.batch["files"], files)
+
+    return Project(assets=[files, copy], stores={"s": store}, default_store=FileStore(root / "data"))
+
+
+async def test_chg_1_a_stores_version_is_part_of_the_definition(solera):
+    """The store `copy` writes to says its data changed (a new version):
+    `copy` is stale, and its next run starts over."""
+
+    calls, store = [], FileStore(solera.root / "s")
+    await solera.deploy(stored(solera.root, store, calls))
+    await solera.run("copy", upstream=True)
+    store.version = "next"
+    await solera.deploy(stored(solera.root, store, calls))
+    assert await solera.stale("copy") == ["definition changed"]
+    await solera.run("copy", upstream=True)
+    assert calls[-1] == (True, ["a", "b"])
+
+
+@pytest.mark.postgres
+async def test_chg_1_a_stores_config_is_not_part_of_the_definition(solera, monkeypatch):
+    """The DSN of the Postgres store holding `files` moves to another
+    variable naming the same database (a rotated password, a new host for
+    the same data): nothing is owed, and nothing runs again."""
+
+    dsn = os.environ.get("SOLERA_TEST_DATABASE_URL")
+    if not dsn:
+        pytest.skip("SOLERA_TEST_DATABASE_URL is not set")
+    import psycopg
+    from solera_postgres import PostgresStore
+
+    schema, calls = f"contract_{uuid.uuid4().hex[:10]}", []
+    monkeypatch.setenv("CONTRACT_ROTATED_DSN", dsn)
+
+    def project(variable):
+        @asset(
+            outputs=Output("files", key="id", store="pg", schema=schema, columns={"id": "text", "v": "text"})
+        )
+        def files():
+            return [{"id": "a", "v": "1"}]
+
+        @asset(
+            inputs={"files": Incremental()},
+            outputs=Output("copy", key="id", store="pg", schema=schema, columns={"id": "text", "v": "text"}),
+        )
+        def copy(ctx, files: list):
+            calls.append(sorted(r["id"] for r in files))
+            return rebuild(ctx.batch["files"], files)
+
+        return Project(assets=[files, copy], stores={"pg": PostgresStore(f"env:{variable}")})
+
+    try:
+        await solera.deploy(project("SOLERA_TEST_DATABASE_URL"))
+        await solera.run("copy", upstream=True)
+        await solera.deploy(project("CONTRACT_ROTATED_DSN"))
+        for name in ("files", "copy"):
+            assert await solera.stale(name) == [], name
+        await solera.run("copy")
+        assert calls == [["a"]] and await solera.rows("copy") == {"a": "1"}
+    finally:
+        with psycopg.connect(dsn, autocommit=True) as conn:
+            conn.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
+
+
+# -- CHG-4 (target) ---------------------------------------------------------------------
+
+
+async def test_chg_4_widening_patterns_owes_the_keys_that_join_and_nothing_else(solera):
+    ex = await Example(solera).start(include=["k1"])
+    await ex.feed({"k1": "1", "k2": "1", "k3": "1"})
+    await ex.run("tally")
+    await ex.deploy(include=["k*"])
+    assert await ex.stale() == ["input changed"]
+    [batch] = await ex.run("tally")
+    assert (batch.classes, batch.reset) == ((["k2", "k3"], [], []), False)
+    assert await ex.count() == 3 and await ex.stale() == []
+
+
+async def test_chg_4_narrowing_patterns_owes_the_removal_of_every_held_key(solera):
+    ex = await Example(solera).start(include=["k*"])
+    await ex.feed({"k1": "1", "k2": "1", "k3": "1"})
+    await ex.run("tally")
+    await ex.deploy(include=["z*"])
+    assert await ex.stale() == ["input changed"]
+    [batch] = await ex.run("tally")
+    assert (batch.classes, batch.reset) == (([], [], ["k1", "k2", "k3"]), False)
+    assert await ex.count() == 0 and await ex.stale() == []
+
+
+async def test_chg_4_a_pattern_change_that_owes_something_fires_onchange(solera):
+    """`tally`, automated by `OnChange`, takes k1, then k*: its automation
+    fires once and adds k2 and k3; narrowed to z*, it fires again and
+    removes all three."""
+
+    calls = []
+    await built_patterned(solera, calls, include=["k1"])
+    for include, call in ((["k*"], (["k2", "k3"], [], False)), (["z*"], ([], ["k1", "k2", "k3"], False))):
+        fired = len(await automated(solera))
+        await solera.deploy(patterned(solera.root, calls, include=include))
+        await solera.until(lambda call=call: calls[-1] == call)
+        await solera.quiet()
+        assert len(await automated(solera)) == fired + 1
+        assert await solera.stale("tally") == []
+
+
+# -- CHG-13 (target) --------------------------------------------------------------------
+
+
+async def test_chg_13_a_whole_input_moving_mid_run_owes_the_keys_processed_before_it_moved(solera):
+    """`factor` moves from w1 to w2 while `checks` is in its first batch
+    (k1): its second batch (k2) reads w2, and after the run k1 alone is
+    owed again, for its input."""
+
+    outside, seen, steps = Outside(), [], []
+
+    @source
+    async def factor(keys, ctx):
+        return Loaded(outside.knob, version=outside.knob)
+
+    @asset(
+        inputs={"row": Incremental("feed", each=True, batch_size=1, concurrency=1), "factor": In()},
+        outputs=Output("checks", key="id"),
+    )
+    async def checks(ctx, row: list, factor: str):
+        seen.append((ctx.key, factor))
+        if steps:
+            await steps.pop(0)()
+        return [{"v": row[0]["v"], "factor": factor}]
+
+    await solera.deploy(
+        Project(
+            assets=[checks],
+            sources=[Source("feed", key="id", store="ext"), factor],
+            stores={"ext": SourceStore(solera.root / "ext", outside)},
+            default_store=FileStore(solera.root / "data"),
+        )
+    )
+
+    async def move():
+        outside.knob = "w2"
+        await solera.commit_source("factor", version="w2")
+
+    await solera.commit_source("factor", version="w1")
+    outside.feed.update(k1="1", k2="1")
+    await solera.commit_source("feed", upsert={"k1": "1", "k2": "1"})
+    steps.append(move)
+    await solera.run("checks")
+    assert seen == [("k1", "w1"), ("k2", "w2")]
+    assert await solera.rows("checks", column="factor") == {"k1": "w1", "k2": "w2"}
+    owed = await solera.stale_keys("checks")
+    assert list(owed) == ["k1"] and [r["kind"] for r in owed["k1"]] == ["input changed"]
+    await solera.run("checks")
+    assert seen[-1] == ("k1", "w2") and await solera.stale("checks") == []

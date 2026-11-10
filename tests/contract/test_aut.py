@@ -396,3 +396,78 @@ async def test_aut_7_automated_outputs_converge_on_their_sources(solera):
     assert await converged()
     for name in ("items", "copy", "tally", "checks"):
         assert await solera.stale(name) == [], name
+
+
+# -- target (PR 2) --
+
+
+# -- AUT-4 (target) ---------------------------------------------------------------------
+
+
+def patterned(root, calls: list, include, version: str = "1", automations=None) -> Project:
+    """`items` (keyed: k1, k2, k3, run by hand) -> `tally`, incremental over
+    the keys `include` takes, automated by `OnChange` unless told otherwise;
+    `calls` gets each batch's (added, removed, reset)."""
+
+    @asset(outputs=Output("items", key="id"))
+    def items():
+        return [{"id": k, "v": 1} for k in ("k1", "k2", "k3")]
+
+    @asset(
+        inputs={"items": Incremental(include=include)},
+        outputs=Output("tally"),
+        version=version,
+        automations=OnChange() if automations is None else automations,
+    )
+    def tally(ctx, items: list):
+        batch = ctx.batch["items"]
+        calls.append((sorted(batch.added), sorted(batch.removed), batch.reset))
+        return {"n": len(items)}
+
+    return Project(assets=[items, tally], default_store=FileStore(root / "data"))
+
+
+async def built_patterned(solera, calls: list, **decl) -> None:
+    """`patterned` served, and `tally` built by its automation."""
+
+    await solera.deploy(patterned(solera.root, calls, **decl))
+    await solera.run("items")
+    await solera.until(lambda: calls)
+    await solera.quiet()
+
+
+async def test_aut_4_a_pattern_change_that_owes_nothing_fires_nothing(solera):
+    """`tally` takes k1, then k1 and k9, a key that never existed: nothing is
+    owed, so its `OnChange` does not fire."""
+
+    calls = []
+    await built_patterned(solera, calls, include=["k1"])
+    fired = len(await automated(solera))
+    await solera.deploy(patterned(solera.root, calls, include=["k1", "k9"]))
+    await solera.settle(0.5)
+    await solera.quiet()
+    assert len(await automated(solera)) == fired and calls == [(["k1"], [], False)]
+    assert await solera.stale("tally") == []
+
+
+async def test_aut_4_a_definition_change_fires_onchange_once(solera):
+    calls = []
+    await built_patterned(solera, calls, include=["k*"])
+    fired = len(await automated(solera))
+    await solera.deploy(patterned(solera.root, calls, include=["k*"], version="2"))
+    await solera.until(lambda: len(calls) == 2)
+    await solera.quiet()
+    await solera.settle(0.3)
+    assert len(await automated(solera)) == fired + 1
+    assert calls[-1] == (["k1", "k2", "k3"], [], True)  # its next run is a full run
+    assert await solera.stale("tally") == []
+
+
+async def test_aut_4_with_no_automation_a_changed_asset_shows_stale(solera):
+    calls = []
+    await solera.deploy(patterned(solera.root, calls, include=["k*"], automations=()))
+    await solera.run(["items", "tally"])
+    await solera.deploy(patterned(solera.root, calls, include=["k*"], version="2", automations=()))
+    await solera.settle(0.3)
+    assert len(calls) == 1 and await automated(solera) == []
+    assert await solera.stale("tally") == ["definition changed"]

@@ -9,11 +9,22 @@ import time
 import obstore
 import pytest
 from solera.executors import Pool
-from solera.sdk import Commit, Output, Project, Retry, Source, Tick, asset, sensor
-from solera.stores import FileStore
+from solera.sdk import Commit, Incremental, Output, Project, Retry, Source, Tick, asset, sensor
+from solera.stores import FileStore, Patch
 
+from tests.contract import test_sto as sto
 from tests.contract.example import Example
 from tests.contract.harness import Refused, Storage
+from tests.contract.test_sto import (
+    Files,
+    attempts_of,
+    in_table,
+    items_on,
+    killed_after_writing,
+    on,
+    rows,
+    served,
+)
 
 
 class Gate:
@@ -712,3 +723,193 @@ async def test_eng_14_an_operator_clear_merges_at_once(solera):
     assert cleared["cleared"]
     await merges(solera, "feed", caught_up)  # no clock moved: at once
     await solera.commit_source("feed", upsert={"later": "1"})
+
+
+# -- target (PR 2) --
+
+table = sto.table  # the fixture: a Postgres store a test makes misbehave
+
+
+# -- ENG-7 ------------------------------------------------------------------------
+
+
+async def late_write(solera, store) -> asyncio.Event:
+    """`items` writes a=1; its next attempt sends a=2, b=2, and its worker is
+    killed before the write lands; the retry commits a=3. The returned
+    event lets the late write land."""
+
+    writes = [rows("a=1"), rows("a=2", "b=2"), rows("a=3")]
+    await served(solera, items_on(store, writes, retries=Retry(1, delay=0)))
+    await solera.run("items")
+    store.late = late = asyncio.Event()
+    run = await solera.submit("items")
+    await solera.until(store.sent.is_set)
+    assert await solera.kill_workers() == 1
+    assert (await solera.wait(run))["request"]["status"] == "succeeded"
+    return late
+
+
+@pytest.mark.postgres
+async def test_eng_7_a_late_write_to_a_table_is_refused_by_its_version_check(solera, table):
+    late = await late_write(solera, table)
+    late.set()
+    await table.landing
+    [refused] = table.outcomes
+    assert isinstance(refused, Exception), refused
+    assert in_table(await solera.loaded("items")) == {"a": ["3"]}
+    assert await solera.rows("items") == {"a": "3"}
+
+
+async def test_eng_7_a_late_write_to_files_lands_under_names_nothing_reads(solera):
+    files = Files(solera.root / "files")
+    late = await late_write(solera, files)
+    late.set()
+    await files.landing
+    assert files.outcomes == ["written"]
+    assert await solera.rows("items") == {"a": "3"}
+    await solera.run("copy")
+    assert await solera.rows("copy") == {"a": "3"}
+
+
+# -- ENG-8 ------------------------------------------------------------------------
+
+
+@pytest.mark.postgres
+async def test_eng_8_a_dead_writers_rows_are_repaired_by_the_next_attempt_and_nothing_waits_for_it(
+    solera, table
+):
+    """`items`' attempt writes c and dies, out of retries. Nothing runs on
+    its own and `copy` reads `items` at once; `items`' next attempt,
+    though it writes nothing, deletes c."""
+
+    writes = [rows("a=1", "b=1"), Patch(rows("c=1")), Patch([])]
+    await served(solera, items_on(table, writes, retries=Retry(0)))
+    first = (await solera.run("items"))["request"]["id"]
+    table.hang_after_write()
+    run = await solera.submit("items")
+    await killed_after_writing(solera, table)
+    assert (await solera.wait(run))["request"]["status"] == "failed"
+    marked = (await solera.run("marker"))["request"]["id"]  # a barrier: the engine has worked on since
+    assert [
+        r for r in await solera.runs() if r["id"] not in (first, run["id"], marked)
+    ] == []  # no repair clock
+    await solera.run("copy", timeout=5)  # its reader does not wait
+    assert await solera.rows("copy") == {"a": "1", "b": "1"}
+    assert in_table(await solera.loaded("items")) == {"a": ["1"], "b": ["1"], "c": ["1"]}
+    await solera.run("items")
+    assert in_table(await solera.loaded("items")) == {"a": ["1"], "b": ["1"]}
+    assert await solera.rows("items") == {"a": "1", "b": "1"}
+
+
+# -- ENG-17 -----------------------------------------------------------------------
+
+
+@pytest.mark.postgres
+async def test_eng_17_a_dead_writers_version_is_an_anomaly_never_a_change(solera, table):
+    """`items`' attempt A writes k2@6 and dies. `copy`, which owes k2,
+    loads it: an alarm names `items`, k2 and A; `copy` does not process
+    it, nor read it again, until `items` has redone k2; `items`' log never
+    records it."""
+
+    received = []
+    writes = [rows("k1=1", "k2=1"), Patch(rows("k2=6")), Patch(rows("k2=7"))]
+    await served(solera, items_on(table, writes, received, retries=Retry(0)))
+    first = (await solera.run("items"))["request"]["id"]
+    table.hang_after_write()
+    run = await solera.submit("items")
+    await killed_after_writing(solera, table)
+    [dead] = attempts_of(await solera.wait(run), "items")
+    await solera.run("copy", timeout=5)
+    assert await solera.alarmed("items", "k2", dead["id"])
+    assert all("k2" not in seen for _, seen in received)  # never processed as a change
+    await solera.run("copy")
+    assert all("k2" not in seen for _, seen in received)  # nor read again
+    assert [c["run"] for c in await solera.commits("items")] == [first]
+    await solera.run("items")
+    await solera.run("copy")
+    assert received[-1][1] == {"k2": "7"}
+    assert await solera.rows("copy") == {"k1": "1", "k2": "7"}
+
+
+@pytest.mark.postgres
+async def test_eng_17_a_version_of_an_attempt_still_live_is_no_anomaly(solera, table):
+    """`items`' attempt writes k2@6 and is still live when `copy`, which
+    owes k2@2, loads k2@6: `copy` processes it as loaded, no alarm, and k2
+    settles once that attempt commits."""
+
+    received, go = [], asyncio.Event()
+    writes = [rows("k1=1", "k2=1"), Patch(rows("k2=2")), Patch(rows("k2=6"))]
+    await solera.deploy(items_on(table, writes, received))
+    await solera.run("items")
+    await solera.run("copy")
+    await solera.run("items")
+    table.landed.clear()
+    table.after_write = go.wait
+    run = await solera.submit("items")
+    try:
+        await solera.until(table.landed.is_set)
+        reader = await solera.submit("copy")
+
+        async def decided():  # it ran, or it says why it waits
+            detail = await solera.get(f"/runs/{reader['id']}")
+            return detail["request"]["status"] in ("succeeded", "failed") or any(
+                t.get("held") for t in detail["tasks"]
+            )
+
+        await solera.until(decided)
+        detail = await solera.get(f"/runs/{reader['id']}")
+        assert detail["request"]["status"] == "succeeded", detail["tasks"]  # it does not wait for the writer
+    finally:
+        go.set()
+    assert received[-1] == (([], ["k2"], []), {"k2": "6"})
+    assert not await solera.alarmed("k2")
+    assert (await solera.wait(run))["request"]["status"] == "succeeded"
+    assert await solera.stale("copy") == []
+    await solera.run("copy")
+    assert len(received) == 2 and await solera.rows("copy") == {"k1": "1", "k2": "6"}
+
+
+# -- ENG-18 -----------------------------------------------------------------------
+
+
+@pytest.mark.postgres
+async def test_eng_18_an_asset_never_builds_on_a_dead_write_to_its_own_output(solera, table):
+    """`tally`, on Postgres, holds 4. Its attempt reads 4, writes 5 and dies
+    before its commit: its retry's `ctx.load()` would return 5, so `tally`
+    owes a full run instead of adding k5 to it."""
+
+    seen, feed = [], {f"k{i}": "1" for i in range(1, 5)}
+
+    @asset(outputs=Output("items", key="id"))
+    def items():
+        return [{"id": k, "v": v} for k, v in feed.items()]
+
+    @asset(
+        inputs={"items": Incremental()},
+        outputs=Output("tally", key="id", **on(table, id="text", n="bigint")),
+        retries=Retry(1, delay=0),
+    )
+    async def tally(ctx, items: list):
+        batch, held = ctx.batch["items"], await ctx.load()
+        before = 0 if batch.reset or not held else held[0]["n"]
+        seen.append((batch.reset, sorted(batch.added), before))
+        return [{"id": "total", "n": before + len(batch.added) - len(batch.removed)}]
+
+    await served(solera, Project(assets=[items, tally], stores={"s": table}))
+    await solera.run("items")
+    await solera.run("tally")
+    feed["k5"] = "1"
+    await solera.run("items")
+    table.hang_after_write()
+    run = await solera.submit("tally")
+    await killed_after_writing(solera, table)
+    await solera.wait(run)
+    for _ in range(2):
+        if not await solera.stale("tally"):
+            break
+        await solera.run("tally", expect=None)
+    assert seen[:2] == [(False, ["k1", "k2", "k3", "k4"], 0), (False, ["k5"], 4)]  # the second died
+    after = seen[2:]
+    assert all(before != 5 for _, _, before in after), after  # nothing built on the dead write
+    assert any(reset and added == sorted(feed) for reset, added, _ in after), after  # a full run instead
+    assert [r["n"] for r in await solera.read("tally")] == [5]
