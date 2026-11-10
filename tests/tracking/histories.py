@@ -70,6 +70,7 @@ CALIBRATIONS = {
         ("commit", (), ("k1",)),
     ],
     ("fullrun", "clear", "file", "reset"): [
+        ("step", "tally", 1),
         ("items", (("k1", True), ("k4", False))),
         ("items", (("k2", True), ("k4", True))),
         ("keys", "tally", ("k4",)),
@@ -128,6 +129,7 @@ CALIBRATIONS = {
     # Stores that write in place, with late and dead writers (review F1, recs 1 to 5).
     ("fullrun", "clear", "table", "fence"): [("items", (("k1", True),)), ("plan", "copy", 2), ("restart",)],
     ("fullrun", "clear", "table", "open_txn"): [
+        ("step", "copy", 1),
         ("items", (("k1", True),)),
         ("plan", "copy", 1),
         ("restart",),
@@ -135,6 +137,7 @@ CALIBRATIONS = {
         ("late", "copy"),
     ],
     ("fullrun", "clear", "table", "repair"): [
+        ("step", "copy", 1),
         ("items", (("k1", True),)),
         ("plan", "copy", 1),
         ("write", "copy"),
@@ -152,6 +155,7 @@ CALIBRATIONS = {
         ("step", "copy", 1),
     ],
     ("fullrun", "clear", "table", "repair_at_once"): [
+        ("step", "copy", 1),
         ("items", (("k1", True),)),
         ("plan", "copy", 1),
         ("write", "copy"),
@@ -198,11 +202,95 @@ CALIBRATIONS = {
         ("cleanup", "copy"),
     ],
     ("fullrun", "clear", "table", "load_check"): [
+        ("step", "tally", 1),
         ("items", (("k2", True), ("k5", True))),
         ("keys", "tally", ("k5",)),
         ("items", (("k1", True),)),
         ("write", "tally"),
         ("restart",),
+    ],
+    # A table's full run builds beside the published rows, and the store switches once (D211).
+    ("fullrun", "clear", "table", "swap"): [
+        ("items", (("k1", True), ("k4", True))),
+        ("feed", (("k3", True),)),
+    ],
+    ("fullrun", "clear", "table", "solera_build"): [("items", (("k2", True), ("k3", True)))],
+    ("fullrun", "clear", "table", "first_full"): [
+        ("feed", (("k2", True), ("k3", True))),
+        ("items", (("k3", True), ("k5", True))),
+    ],
+    ("fullrun", "clear", "table", "switch_commit"): [("items", (("k2", True), ("k3", True)))],
+    ("fullrun", "clear", "table", "switch_alone"): [
+        ("items", (("k2", True), ("k3", True), ("k4", True))),
+        ("plan", "copy", 2),
+        ("items", (("k1", False), ("k5", True))),
+        ("step", "copy", 1),
+        ("step", "copy", 1),
+        ("items", (("k2", False), ("k5", False))),
+    ],
+    ("fullrun", "clear", "table", "switch_release"): [
+        ("feed", (("k2", True), ("k3", True))),
+        ("items", (("k3", True), ("k5", True))),
+        ("step", "copy", 2),
+        ("release", "copy"),
+    ],
+    ("fullrun", "clear", "table", "switch_owed"): [
+        ("items", (("k1", False), ("k3", True))),
+        ("step", "copy", 2),
+        ("restart",),
+    ],
+    ("fullrun", "clear", "table", "switch_cleanup"): [
+        ("items", (("k1", True), ("k2", True))),
+        ("step", "copy", 1),
+        ("plan", "copy", 2),
+        ("commit", "copy"),
+        ("define", "copy"),
+        ("switch", "copy", "delayed"),
+        ("notice",),
+    ],
+    ("fullrun", "clear", "table", "build_keep"): [
+        ("items", (("k1", True), ("k4", True))),
+        ("feed", (("k3", True),)),
+    ],
+    ("fullrun", "clear", "table", "reset_replay"): [
+        ("step", "tally", 1),
+        ("switch", "tally", False),
+        ("replay", "tally"),
+    ],
+    ("fullrun", "clear", "table", "notice_match"): [
+        ("step", "copy", 2),
+        ("items", (("k2", True), ("k4", True))),
+        ("step", "copy", 2),
+        ("switch", "copy", "late"),
+        ("full", "copy"),
+    ],
+    ("fullrun", "clear", "table", "switch_quiet"): [
+        ("step", "tally", 2),
+        ("items", (("k4", True),)),
+        ("plan", "tally", 1),
+        ("write", "tally"),
+        ("switch", "tally", False),
+    ],
+    ("fullrun", "clear", "table", "switch_overtaken"): [
+        ("plan", "copy", 1),
+        ("items", (("k1", True), ("k5", True))),
+        ("commit", "copy"),
+        ("keys", "copy", ("k5",)),
+        ("restart",),
+        ("full", "copy"),
+        ("late", "copy", False),
+        ("step", "copy", 1),
+        ("switch", "copy", False),
+    ],
+    ("fullrun", "clear", "table", "byref_wait"): [
+        ("items", (("k3", True),)),
+        ("step", "copy", 1),
+        ("summary",),
+    ],
+    ("fullrun", "clear", "table", "switch_result"): [
+        ("step", "tally", 1),
+        ("switch", "tally", "delayed"),
+        ("items", (("k1", True),)),
     ],
 }
 
