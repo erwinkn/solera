@@ -4,7 +4,7 @@
 //! once, merged by key, newest layer first.
 
 use crate::error::{Error, Result};
-use crate::format::{parse_segment, Decoder, LayerRef};
+use crate::format::{parse_segment, Decoder, LayerRef, Top};
 use crate::glob::Pattern;
 use crate::run::Run;
 use crate::store::{Cached, Part, Store, Want};
@@ -23,6 +23,8 @@ const WINDOW: u64 = 16 << 20;
 /// Opening a layer fetches the index segments it needs about this many
 /// compressed bytes at a time.
 const SEG_BATCH: u64 = 16 << 20;
+/// A cursor plans at most about this many blocks ahead of its fetches.
+const PLAN_BLOCKS: usize = 1 << 16;
 
 /// The blocks of one batch, being fetched.
 type Fetch = tokio::task::JoinHandle<Result<Vec<Cached>>>;
@@ -161,12 +163,25 @@ struct BlockRef {
     check: u32,
 }
 
-/// One layer's keys in order, its blocks fetched a batch ahead.
+/// One layer's keys in order: its index segments decoded as the read goes, a
+/// bounded number of blocks planned ahead, fetched a batch ahead.
 pub(crate) struct Cursor {
     store: Arc<Store>,
     path: Arc<str>,
-    blocks: Vec<BlockRef>,
-    next: usize,
+    top: Arc<Top>,
+    /// The segments the read spans, in order, and how many are planned.
+    segs: Vec<usize>,
+    seg_next: usize,
+    /// Segments fetched and not yet planned.
+    seg_got: VecDeque<(usize, Cached)>,
+    /// A read of listed keys: each listed key in bounds with the segment that
+    /// may hold it, and the next to plan.
+    keys: Option<Arc<KeyList>>,
+    listed: Vec<(usize, usize)>,
+    at: usize,
+    /// Blocks planned and not yet launched, and their bytes.
+    blocks: VecDeque<BlockRef>,
+    planned: u64,
     target: u64,
     /// A read of listed keys: batches are launched together, up to
     /// `WINDOW` bytes ahead, and decoded as they arrive.
@@ -175,7 +190,7 @@ pub(crate) struct Cursor {
     ahead: u64,
     /// A read of listed keys small enough to keep in the memory cache.
     keep_all: bool,
-    pending: VecDeque<(Range<usize>, u64, Fetch)>,
+    pending: VecDeque<(Vec<BlockRef>, u64, Fetch)>,
     ready: VecDeque<(Bytes, BlockRef)>,
     run: Run,
     pos: usize,
@@ -197,19 +212,13 @@ impl Cursor {
         store: &Arc<Store>,
         l: &LayerRef,
         bounds: Arc<Bounds>,
-        keys: Option<&KeyList>,
+        keys: Option<Arc<KeyList>>,
         all_at_once: bool,
     ) -> Result<Cursor> {
         let top = store.top(l).await?;
-        let path: Arc<str> = Arc::from(l.path.as_str());
-        let in_bounds = |i: usize| {
-            let k = keys.map_or(&[][..], |k| k.get(i));
-            !bounds.below(k) && !bounds.above(k)
-        };
-        // the listed keys in bounds, with the segment that may hold each
-        let listed: Vec<(usize, usize)> = keys.map_or(Vec::new(), |k| {
+        let listed: Vec<(usize, usize)> = keys.as_ref().map_or(Vec::new(), |k| {
             (0..k.len())
-                .filter(|&i| in_bounds(i))
+                .filter(|&i| !bounds.below(k.get(i)) && !bounds.above(k.get(i)))
                 .filter_map(|i| Some((i, top.segs.holding(k.get(i))?)))
                 .collect()
         });
@@ -221,19 +230,60 @@ impl Cursor {
                 v
             }
         };
-        // Segments the cache does not hold are fetched as compressed bytes,
-        // SEG_BATCH at a time, and decoded one at a time, so a read holds a
-        // bounded part of its index, however many segments it spans.
-        let s = &top.segs;
-        let mut blocks: Vec<BlockRef> = Vec::new();
-        let mut at = 0;
-        let mut from = 0;
-        while from < segs.len() {
-            let (mut cached, mut wants, mut bytes) = (Vec::new(), Vec::new(), 0);
-            let mut to = from;
-            while to < segs.len() && bytes < SEG_BATCH {
-                let i = segs[to];
-                let c = store.cached_seg(&path, i);
+        let mut c = Cursor {
+            store: store.clone(),
+            path: Arc::from(l.path.as_str()),
+            top,
+            segs,
+            seg_next: 0,
+            seg_got: VecDeque::new(),
+            keys,
+            listed,
+            at: 0,
+            blocks: VecDeque::new(),
+            planned: 0,
+            target: if all_at_once { ALL } else { FIRST },
+            all: all_at_once,
+            ahead: 0,
+            keep_all: false,
+            pending: VecDeque::new(),
+            ready: VecDeque::new(),
+            run: Run::new(),
+            pos: 0,
+            dec: Decoder::default(),
+            bounds,
+        };
+        c.plan_ahead().await?;
+        c.keep_all = c.seg_next == c.segs.len() && c.planned <= store.opts.cache_batch;
+        Ok(c)
+    }
+
+    /// Plan blocks until enough are planned ahead of the fetches, or every
+    /// segment is.
+    async fn plan_ahead(&mut self) -> Result<()> {
+        let o = &self.store.opts;
+        let enough = WINDOW.max(o.max_get).max(o.cache_batch);
+        while self.seg_next < self.segs.len()
+            && self.blocks.len() < PLAN_BLOCKS
+            && self.planned <= enough
+        {
+            self.plan().await?;
+        }
+        Ok(())
+    }
+
+    /// Plan the blocks of the next segment. Segments the cache does not hold
+    /// are fetched as compressed bytes, `SEG_BATCH` at a time, and decoded one
+    /// at a time.
+    async fn plan(&mut self) -> Result<()> {
+        let s = &self.top.segs;
+        if self.seg_got.is_empty() {
+            let (mut got, mut wants, mut bytes) = (Vec::new(), Vec::new(), 0);
+            for &i in &self.segs[self.seg_next..] {
+                if bytes >= SEG_BATCH {
+                    break;
+                }
+                let c = self.store.cached_seg(&self.path, i);
                 if c.is_none() {
                     bytes += s.clen[i] as u64;
                     wants.push((
@@ -245,91 +295,74 @@ impl Cursor {
                         },
                     ));
                 }
-                cached.push(c);
-                to += 1;
+                got.push((i, c));
             }
-            let mut fetched = store.load(&path, wants).await?.into_iter();
-            for (&i, c) in segs[from..to].iter().zip(cached) {
-                let ix = match c {
-                    Some(ix) => ix,
-                    None => {
-                        let Some(Cached::Block(b)) = fetched.next() else {
-                            unreachable!()
-                        };
-                        let ix = Arc::new(
-                            parse_segment(&b, s.rlen[i], s.check[i], s.n[i], top.commits_start)
-                                .map_err(|e| match e {
-                                    Error::Format(m) => Error::Format(format!("{path}: {m}")),
-                                    e => e,
-                                })?,
-                        );
-                        store.remember_seg(&path, i, ix.clone());
-                        ix
+            let mut fetched = self.store.load(&self.path, wants).await?.into_iter();
+            for (i, c) in got {
+                let c = c.map_or_else(|| fetched.next().expect("fetched"), Cached::Seg);
+                self.seg_got.push_back((i, c));
+            }
+        }
+        let (i, c) = self.seg_got.pop_front().expect("a segment left");
+        self.seg_next += 1;
+        let ix = match c {
+            Cached::Seg(ix) => ix,
+            Cached::Block(b) => {
+                let ix = parse_segment(&b, s.rlen[i], s.check[i], s.n[i], self.top.commits_start)
+                    .map_err(|e| match e {
+                    Error::Format(m) => Error::Format(format!("{}: {m}", self.path)),
+                    e => e,
+                })?;
+                let ix = Arc::new(ix);
+                self.store.remember_seg(&self.path, i, ix.clone());
+                ix
+            }
+            _ => unreachable!(),
+        };
+        let mut push = |b: usize| {
+            self.planned += ix.clen[b] as u64;
+            self.blocks.push_back(BlockRef {
+                off: ix.off[b],
+                clen: ix.clen[b],
+                rlen: ix.rlen[b],
+                rows: ix.n[b],
+                check: ix.check[b],
+            })
+        };
+        match &self.keys {
+            None => ix
+                .span(self.bounds.lo_key(), self.bounds.hi_key())
+                .for_each(&mut push),
+            Some(k) => {
+                let mut last = None;
+                while self.at < self.listed.len() && self.listed[self.at].1 == i {
+                    let b = ix.holding(k.get(self.listed[self.at].0));
+                    if let Some(b) = b.filter(|&b| Some(b) != last) {
+                        push(b);
+                        last = Some(b);
                     }
-                };
-                let mut push = |b: usize| {
-                    blocks.push(BlockRef {
-                        off: ix.off[b],
-                        clen: ix.clen[b],
-                        rlen: ix.rlen[b],
-                        rows: ix.n[b],
-                        check: ix.check[b],
-                    })
-                };
-                match keys {
-                    None => ix
-                        .span(bounds.lo_key(), bounds.hi_key())
-                        .for_each(&mut push),
-                    Some(k) => {
-                        let mut last = None;
-                        while at < listed.len() && listed[at].1 == i {
-                            let b = ix.holding(k.get(listed[at].0));
-                            if let Some(b) = b.filter(|&b| Some(b) != last) {
-                                push(b);
-                                last = Some(b);
-                            }
-                            at += 1;
-                        }
-                    }
+                    self.at += 1;
                 }
             }
-            from = to;
         }
-        let keep_all = blocks.iter().map(|b| b.clen as u64).sum::<u64>() <= store.opts.cache_batch;
-        Ok(Cursor {
-            store: store.clone(),
-            path,
-            blocks,
-            next: 0,
-            target: if all_at_once { ALL } else { FIRST },
-            all: all_at_once,
-            ahead: 0,
-            keep_all,
-            pending: VecDeque::new(),
-            ready: VecDeque::new(),
-            run: Run::new(),
-            pos: 0,
-            dec: Decoder::default(),
-            bounds,
-        })
+        Ok(())
     }
 
     fn launch(&mut self) {
-        let a = self.next;
         let (gap, max_get) = (self.store.opts.coalesce, self.store.opts.max_get);
         // block bytes, and what the GETs fetch and hold: the blocks and the
         // gaps they coalesce across
-        let (mut bytes, mut held) = (0u64, 0u64);
-        while self.next < self.blocks.len() {
-            let b = &self.blocks[self.next];
-            let between = (self.next > a)
+        let (mut bytes, mut held, mut n) = (0u64, 0u64, 0);
+        while n < self.blocks.len() {
+            let b = &self.blocks[n];
+            let between = (n > 0)
                 .then(|| {
-                    let p = &self.blocks[self.next - 1];
+                    let p = &self.blocks[n - 1];
                     b.off.saturating_sub(p.off + p.clen as u64)
                 })
                 .filter(|&g| g <= gap);
             let more = between.unwrap_or(0) + b.clen as u64;
-            if self.next > a
+            if n > 0
                 && ((bytes >= self.target && !(self.all && between.is_some()))
                     || held + more > max_get)
             {
@@ -337,19 +370,21 @@ impl Cursor {
             }
             bytes += b.clen as u64;
             held += more;
-            self.next += 1;
+            n += 1;
         }
-        if self.next == a {
+        if n == 0 {
             return;
         }
         self.ahead += held;
+        self.planned -= bytes;
         let keep = if self.all {
             self.keep_all
         } else {
             self.target = (self.target * 2).min(max_get);
             bytes <= self.store.opts.cache_batch
         };
-        let wants: Vec<(Part, Range<u64>, Want)> = self.blocks[a..self.next]
+        let span: Vec<BlockRef> = self.blocks.drain(..n).collect();
+        let wants: Vec<(Part, Range<u64>, Want)> = span
             .iter()
             .map(|b| {
                 (
@@ -367,7 +402,7 @@ impl Cursor {
             .store
             .rt
             .spawn(async move { store.load(&path, wants).await });
-        self.pending.push_back((a..self.next, held, h));
+        self.pending.push_back((span, held, h));
     }
 
     /// Make the current key valid; false once the layer has no more.
@@ -392,9 +427,14 @@ impl Cursor {
                 continue;
             }
             if self.pending.is_empty() {
+                self.plan_ahead().await?;
                 self.launch();
             }
-            while self.all && self.next < self.blocks.len() && self.ahead < WINDOW {
+            while self.all && self.ahead < WINDOW {
+                self.plan_ahead().await?;
+                if self.blocks.is_empty() {
+                    break;
+                }
                 self.launch();
             }
             let Some((span, held, h)) = self.pending.pop_front() else {
@@ -405,13 +445,14 @@ impl Cursor {
                 .map_err(|e| Error::Store(format!("fetch task: {e}").into()))??;
             self.ahead -= held;
             if !self.all {
+                self.plan_ahead().await?;
                 self.launch();
             }
-            for (i, c) in span.zip(got) {
+            for (b, c) in span.into_iter().zip(got) {
                 let Cached::Block(bytes) = c else {
                     unreachable!()
                 };
-                self.ready.push_back((bytes, self.blocks[i]));
+                self.ready.push_back((bytes, b));
             }
         }
     }
@@ -452,7 +493,7 @@ pub(crate) struct Walk {
     heap: Vec<usize>,
     bounds: Arc<Bounds>,
     pattern: Option<Pattern>,
-    keys: Option<KeyList>,
+    keys: Option<Arc<KeyList>>,
     kp: usize,
 }
 
@@ -467,10 +508,11 @@ impl Walk {
         all_at_once: bool,
     ) -> Result<Walk> {
         let bounds = Arc::new(bounds);
+        let keys = keys.map(Arc::new);
         let mut curs = futures::future::try_join_all(
             layers
                 .iter()
-                .map(|l| Cursor::open(store, l, bounds.clone(), keys.as_ref(), all_at_once)),
+                .map(|l| Cursor::open(store, l, bounds.clone(), keys.clone(), all_at_once)),
         )
         .await?;
         let live = futures::future::try_join_all(curs.iter_mut().map(|c| c.fill())).await?;
