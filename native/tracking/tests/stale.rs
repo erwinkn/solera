@@ -10,6 +10,7 @@ use solera_index::{ChangeIndex, NewCommit, Run, Store, StoreOptions, Version, Wr
 use solera_tracking::codec::Ver;
 use solera_tracking::commit::{FullRunDone, OutputCommit};
 use solera_tracking::event::{Event, Part};
+use solera_tracking::outcomes::commit::{self as oc, Ctx};
 use solera_tracking::outcomes::transition::{Counters, Stored, FAILED};
 use solera_tracking::outcomes::{self, Held, Outcomes, PassStart, Record};
 use solera_tracking::plan::OneIndex;
@@ -487,7 +488,33 @@ fn write(
     })
 }
 
+/// What the engine does before it refreshes or counts an edge with failure
+/// records: look for reverts through the input's head (B6, KEY-3).
+fn catch_up(rt: &tokio::runtime::Runtime, ix: &ChangeIndex, t: &mut Tracking) {
+    let v = t.outcome_view(b"e").unwrap();
+    let now = t.watched(
+        b"e",
+        t.stale.inputs[b"e".as_slice()].watch.as_ref().unwrap(),
+    );
+    let ctx = Ctx {
+        now: 0.0,
+        counters: Counters::default(),
+        retries: 2,
+        time_ms: 0,
+        producer: b"",
+        failures_path: &format!("f/{}", v.upstream.head),
+        due_path: &format!("d/{}", v.upstream.head),
+    };
+    if let Some(parts) = rt
+        .block_on(oc::catch_up(&OneIndex(ix), &v, &now, &ctx))
+        .unwrap()
+    {
+        apply(t, parts);
+    }
+}
+
 fn refresh_e(rt: &tokio::runtime::Runtime, ix: &ChangeIndex, t: &mut Tracking) -> Status {
+    catch_up(rt, ix, t);
     let ask = t.stale_ask(b"e").unwrap();
     if let Some(w) = rt
         .block_on(stale::refresh(&ask, &OneIndex(ix), &NoneDue, 1))
@@ -656,6 +683,63 @@ fn a_full_run_asked_for_by_hand_raises_the_rebuild_counter_staleness_reads() {
         1,
         "nor does one in the same event"
     );
+}
+
+#[test]
+fn a_refresh_on_an_edge_with_failure_records_waits_for_the_catch_up() {
+    let (rt, ix) = index();
+    let mut t = failed_k1(&rt, &ix);
+    assert_eq!(refresh_e(&rt, &ix, &mut t), Status::Fresh, "k1 waits");
+    let removal = write_k1(&rt, &ix, b"up", 2, Version::Int(1), Version::Absent);
+    let back = write_k1(&rt, &ix, b"up", 3, Version::Absent, Version::Int(1));
+    apply(&mut t, vec![removal]);
+    apply(&mut t, vec![back]);
+    let refused = t.stale_ask(b"e").err().expect("refused").to_string();
+    assert!(refused.contains("catch up first"), "{refused}");
+    assert!(
+        matches!(
+            refresh_e(&rt, &ix, &mut t),
+            Status::Stale { key: Some(k), .. } if k == key("k1")
+        ),
+        "k1's failure went moot when upstream removed it, so its return is owed"
+    );
+}
+
+struct HoldK1;
+
+impl stale::Due for HoldK1 {
+    fn not_due(&self, _: &[u8], key: &[u8]) -> bool {
+        key == b"k1"
+    }
+    fn revision(&self, _: &[u8]) -> u64 {
+        1
+    }
+}
+
+#[test]
+fn rule_1_never_finds_due_a_key_held_back() {
+    let (rt, ix) = index();
+    let mut t = opened();
+    up(&rt, &ix, &mut t, &[("k1", Some(1))]);
+    let b = batch(&t, range(None, None), 1, false);
+    apply(&mut t, vec![b]);
+    let go = |t: &mut Tracking| {
+        let ask = t.stale_ask(EDGE).unwrap();
+        if let Some(w) = rt
+            .block_on(stale::refresh(&ask, &OneIndex(&ix), &HoldK1, 1))
+            .unwrap()
+        {
+            apply(t, vec![Part::Witness(w)]);
+        }
+        t.stale_status(EDGE).unwrap()
+    };
+    assert_eq!(go(&mut t), Status::Fresh);
+    up(&rt, &ix, &mut t, &[("k1", Some(2))]);
+    assert_eq!(go(&mut t), Status::Fresh, "rule 1 over the change");
+    let i = t.stale.inputs.get_mut(EDGE).unwrap();
+    i.known = None;
+    i.changed = stale::Changed::All;
+    assert_eq!(go(&mut t), Status::Fresh, "a probe from nothing known");
 }
 
 #[test]

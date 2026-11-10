@@ -11,19 +11,20 @@ use crate::codec::Ver;
 use crate::due::RetryView;
 use crate::error::{invalid, Result};
 use crate::event::Part;
-use crate::outcomes::{output_id, Conds, Record, FAILURES};
+use crate::outcomes::{cond_id, output_id, Conds, Record, FAILURES};
 use crate::plan::{plan, Cand, Hold, Indexes, InputRequest, Mode, Request, View};
 use crate::progress::{owed, Class, Conditions, Holding, Key, Keyed, Progress, Value};
 use crate::stale::{Changed, Input, Reason, State, Witness};
 use crate::state::{Id, Tracking};
 
-/// Keys owed but not due: failed keys waiting for their retry (B6's due
-/// index; until it lands, the lists the engine passes).
 /// Failure records read in one lookup when rule 1 settles its candidates.
 const RECORD_CHUNK: usize = 1024;
-/// Retry records a page of the retry plan reads past moot keys.
+/// Keys a page of the retry plan takes; its walk reads 4 records per key
+/// taken, so this also keeps its scans few behind records not retried.
 const RETRY_PAGE: usize = 256;
 
+/// Keys owed but not due: failed keys waiting for their retry (B6's due
+/// index; until it lands, the lists the engine passes).
 pub trait Due: Sync {
     fn not_due(&self, edge: &[u8], key: &[u8]) -> bool;
     /// Changes whenever the keys not due on `edge` change: a cached count's
@@ -165,15 +166,15 @@ impl Ask {
     }
 
     /// Rule 5: the next key of the retry pass under way (B6's retry plan),
-    /// if one is due. A key gone moot fills the plan's limit without being
-    /// taken, so past one the plan reads on in pages of `RETRY_PAGE` from
-    /// where the last stopped, until a key is taken or the pass is read.
+    /// if one is due. The plan reads in pages of `RETRY_PAGE` keys, each from
+    /// where the last stopped, past keys gone moot, until a key is taken or
+    /// the pass is read: memory stays bounded however many went moot.
     pub(super) async fn next_retry(&self, ixs: &dyn Indexes) -> Result<Option<State>> {
         let Some(r) = &self.retry else {
             return Ok(None);
         };
         let now = &self.req.conditions;
-        let mut p = crate::due::plan(ixs, r, now, 1).await?;
+        let mut p = crate::due::plan(ixs, r, now, RETRY_PAGE).await?;
         let mut from: Option<RetryView> = None;
         loop {
             if let Some(c) = p.inputs[0].keys.first() {
@@ -278,10 +279,17 @@ impl Tracking {
         } else {
             None
         };
-        let failures_head = self
-            .outputs
-            .get(&output_id(FAILURES, edge))
-            .map_or(0, |o| o.head);
+        let failures = self.outputs.get(&output_id(FAILURES, edge));
+        if failures.is_some_and(|o| o.live > 0) {
+            let k = &self.per_key[edge];
+            if (k.seen, k.cond) != (head, cond_id(&req.conditions)) {
+                return invalid(format!(
+                    "catch up first: edge {}'s reverts are not looked for through the input's head under the conditions now",
+                    String::from_utf8_lossy(edge)
+                ));
+            }
+        }
+        let failures_head = failures.map_or(0, |o| o.head);
         Ok(Ask {
             edge: edge.into(),
             output: e.input.clone(),
@@ -528,7 +536,9 @@ enum Step {
 /// Rule 1 for one change: upstream moved `key` to `new`, and the edge held
 /// what upstream had before. A key the patterns take with no point is due;
 /// a key with a point is due if its state differs from the point and the
-/// key is not waiting for a retry (unsure without `hold`).
+/// key is not waiting for a retry (unsure without `hold`). A key `hold`
+/// holds back is never due; without `hold` (the notice), only a key with a
+/// point can be held back, as a key not due is one that failed.
 fn rule1(
     keyed: &Keyed,
     now: &Arc<Conditions>,
@@ -547,7 +557,7 @@ fn rule1(
             Some(_) => Step::Due(reason_of(keyed, now, key, &p.holding)),
         };
     }
-    if !now.patterns.takes(key) {
+    if !now.patterns.takes(key) || hold.is_some_and(|h| h.held_back(0, key)) {
         return Step::Skip;
     }
     Step::Due(match keyed.value_of(key) {

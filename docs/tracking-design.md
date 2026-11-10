@@ -749,7 +749,12 @@ and conditions at one generation, as of one upstream commit.
   version already (then it waits for its retry). The probe is the planner,
   which reads the records itself. The check is bounded by the diff since
   the last exact answer plus one records lookup per 1,024 candidates, and
-  stops at the first due key. A refresh reads what
+  stops at the first due key. Records hold only after B6's catch-up has
+  looked for reverts through the head under the conditions now (KEY-3), so
+  a refresh, a count or a key list on an edge with failure records is
+  refused until then, as B6's commit is; the engine catches up first. A
+  key the engine names not due is never due by rule 1, point or not, as
+  the planner's probe holds it back. A refresh reads what
   changed since the last exact answer instead of replaying commits in
   order, so rule 7's catch-up never applies an old commit to newer progress
   or conditions.
@@ -760,10 +765,11 @@ and conditions at one generation, as of one upstream commit.
 - **Retries** (rule 5) have one definition, B6's: a retry is due while a
   retry pass is under way. Its `PassStart` starts a new generation, so a
   part computed before it is dropped, and a refresh that finds nothing
-  else due names the pass's next key, "retry due" (B6's retry plan with a
-  limit of one key; while keys gone moot fill it, the plan reads on from
-  where it stopped in pages of 256 keys, so memory stays bounded however
-  many keys went moot). A witness no
+  else due names the pass's next key, "retry due" (B6's retry plan in
+  pages of 256 keys, each from where the last stopped, until one is taken:
+  memory stays bounded however many keys went moot, and a pass by counters
+  walks its records 1,024 at a time, 0.48 s behind 1M records it does not
+  retry where a page of one key took 44.5 s). A witness no
   longer due gives way to the pass's next key before any probe.
 - **The gate** (rule 8) reads the output's full-run state (§4: a clear
   starts it; a commit with `ends_full_run`, or `FullRunDone`, ends it).
