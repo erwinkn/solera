@@ -121,8 +121,9 @@ async def test_a_keyed_write_reaches_the_store_as_its_delta(state, data):
     values["v"] = {"b": 2, "c": 1}
     await run(engine, ["scores"])
     after = {str(p.relative_to(data)) for p in (data / "scores").rglob("*.json")}
-    new = sorted(after - before)  # `b` and `c` written again; `a` dropped by the index
-    assert [n.split("/")[1] for n in new] == ["b", "c"] and (data / new[0]).read_text() == "2"
+    # `b` and `c` written again; `a` dropped by the index
+    new = sorted(after - before, key=lambda n: n.split("/")[-2])
+    assert [n.split("/")[-2] for n in new] == ["b", "c"] and (data / new[0]).read_text() == "2"
     ref = Ref.from_json(state.model.heads[("scores", "")]["ref"])
     assert await project.stores["default"].load(ref, None, await whole(state, "scores")) == {"b": 2, "c": 1}
 
