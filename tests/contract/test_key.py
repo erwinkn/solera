@@ -2,9 +2,10 @@
 
 import asyncio
 import copy
+import time
 
 import pytest
-from solera import Rejected, Transient
+from solera import Abort, Rejected, Transient
 from solera.sdk import Incremental, OnChange, Output, Project, Retry, Source, StaticPartitions, asset, job
 from solera.stores import FileStore, Patch
 
@@ -729,3 +730,316 @@ async def test_key_11_explain_a_key_restored_after_its_removal_is_pending(solera
     await solera.run("parse")
     delivered = await solera.explain("parse", "a.csv")
     assert delivered["verdict"] == "ok" and delivered["outputs"]["samples"]["present"] is True
+
+
+# -- target (PR 2) ---------------------------------------------------------------
+
+
+class Checks:
+    """`checks`, per key over `feed` (a keyed source the outside serves),
+    served. Each call is logged in `calls`; a key in `failing` raises what
+    it maps to; a key in `during` awaits that step first, once. `decl` is
+    the rest of `checks`' input (`batch_size=`), its `version=` and
+    `retries=` (none by default), and the project's `build=`."""
+
+    def __init__(self, solera, **decl):
+        self.solera, self.outside, self.decl = solera, Outside(), decl
+        self.calls: list[str] = []
+        self.failing: dict[str, BaseException] = {}
+        self.during: dict = {}
+
+    def project(self) -> Project:
+        me, decl = self, dict(self.decl)
+        build, version = decl.pop("build", None), decl.pop("version", "1")
+        retries = decl.pop("retries", Retry(0))
+
+        @asset(
+            inputs={"row": Incremental("feed", each=True, **decl)},
+            outputs=Output("checks", key="id"),
+            version=version,
+            retries=retries,
+        )
+        async def checks(ctx, row: list):
+            me.calls.append(ctx.key)
+            if (step := me.during.pop(ctx.key, None)) is not None:
+                await step()
+            if ctx.key in me.failing:
+                raise me.failing[ctx.key]
+            return [{"v": row[0]["v"]}]
+
+        root = self.solera.root
+        return Project(
+            assets=[checks],
+            sources=[Source("feed", key="id", store="ext")],
+            stores={"ext": SourceStore(root / "ext", self.outside)},
+            default_store=FileStore(root / "data"),
+            build=build,
+        )
+
+    async def deploy(self, **decl) -> "Checks":
+        self.decl |= decl
+        await self.solera.deploy(self.project(), cancel_grace=0.2, heartbeat_seconds=0.1)
+        return self
+
+    async def feed(self, *, removes=(), **upserts) -> None:
+        self.outside.feed.update(upserts)
+        for k in removes:
+            self.outside.feed.pop(k, None)
+        await self.solera.commit_source("feed", upsert=upserts, remove=list(removes))
+
+    async def run(self, **fields) -> list[str]:
+        """A run of `checks`, however it ends: the keys it called."""
+
+        before = len(self.calls)
+        await self.solera.run("checks", expect=None, **fields)
+        return sorted(self.calls[before:])
+
+
+def kinds(rows: dict) -> dict[str, str]:
+    return {k: r["outcome"] for k, r in rows.items()}
+
+
+# -- KEY-3 (target) ----------------------------------------------------------------
+
+
+async def test_key_3_a_failure_whose_input_goes_back_to_what_the_partition_held_is_moot(solera):
+    """k1 is processed at 1, then rejected at 2; feed puts k1 back at 1: its
+    failure goes, it is not stale, and no run calls it again."""
+
+    c = await Checks(solera).deploy()
+    await c.feed(k1="1", k2="1")
+    await c.run()
+    c.failing["k1"] = Unprocessable("bad row")
+    await c.feed(k1="2")
+    assert await c.run() == ["k1"]
+    assert kinds(await solera.outcomes("checks", *STORED)) == {"k1": "rejected"}
+    await c.feed(k1="1")  # back at what the partition holds
+    assert "k1" not in await solera.stale_keys("checks")
+    assert await solera.outcomes("checks", *STORED) == {}
+    assert (await solera.outcomes("checks"))["k1"]["owed"] is False
+    assert await c.run() == []
+    assert await solera.rows("checks") == {"k1": "1", "k2": "1"}
+
+
+async def test_key_3_rejected_and_failed_keys_keep_their_output_and_never_block_the_others(solera):
+    """A rejected key waits for a new input; a failed one also gets one try
+    per new deploy; both keep their previous output while `ok` commits."""
+
+    c = await Checks(solera).deploy()
+    await c.feed(a="1", b="1", ok="1")
+    await c.run()
+    c.failing |= {"a": Unprocessable("empty file"), "b": RuntimeError("bug")}
+    await c.feed(a="2", b="2", ok="2")
+    assert await c.run() == ["a", "b", "ok"]
+    assert await solera.rows("checks") == {"a": "1", "b": "1", "ok": "2"}
+    assert kinds(await solera.outcomes("checks", *STORED)) == {"a": "rejected", "b": "failed"}
+    assert await c.run() == []
+    await c.feed(a="3")
+    assert await c.run() == ["a"]  # a new input
+    await c.deploy(build="2")
+    assert await c.run() == ["b"]  # a new deploy: one try
+    assert await c.run() == []
+
+
+async def test_key_3_a_transient_key_backs_off_doubling_until_retry_for_then_fails(solera):
+    """1 min, doubling; `retry_after` honoured; past `retry_for` (24 h unless the
+    error says), failed. A key's tries are timed by the worker's clock, which
+    is the wall's: `v` gives up after a second."""
+
+    assert Transient("busy").retry_for == "24h"
+    c = await Checks(solera).deploy()
+    await c.feed(t="1", w="1", v="1")
+    c.failing |= {
+        "t": Transient("busy"),
+        "w": Transient("busy", retry_after=300),
+        "v": Transient("busy", retry_after=0, retry_for=0.2),
+    }
+    await c.run()
+    stored = await solera.outcomes("checks", *STORED)
+    assert kinds(stored) == {"t": "retrying", "w": "retrying", "v": "retrying"}
+    assert stored["t"]["next_at"] - stored["t"]["last"] == pytest.approx(60, abs=1)
+    assert stored["w"]["next_at"] - stored["w"]["last"] == pytest.approx(300, abs=1)  # retry_after
+    await asyncio.sleep(max(0.0, stored["v"]["until"] - time.time()) + 0.05)
+    assert await c.run() == ["v"]  # t and w are not due yet
+    solera.advance(61)
+    assert await c.run() == ["t"]
+    stored = await solera.outcomes("checks", *STORED)
+    assert kinds(stored) == {"t": "retrying", "w": "retrying", "v": "failed"}
+    assert (stored["t"]["tries"], stored["t"]["next_at"] - stored["t"]["last"]) == (
+        2,
+        pytest.approx(120, abs=1),
+    )
+    assert await solera.rows("checks") == {}
+
+
+async def test_key_3_abort_fails_the_whole_attempt_and_nothing_commits(solera):
+    c = await Checks(solera).deploy()
+    await c.feed(a="1", b="1")
+    await c.run()
+    c.failing["b"] = Abort("the database is down")
+    await c.feed(a="2", b="2")
+    detail = await solera.run("checks", expect="failed")
+    assert await solera.commits("checks", detail["request"]["id"]) == []
+    assert await solera.rows("checks") == {"a": "1", "b": "1"}
+    assert set(await solera.stale_keys("checks")) == {"a", "b"}
+
+
+# -- KEY-5 (target) ----------------------------------------------------------------
+
+
+async def test_key_5_a_failing_key_stays_owed_until_it_succeeds(solera):
+    """k1 ok at 5 with feed at 6: ok, owed. k2 fails at 2 while the
+    partition holds 1: failed and owed, until it succeeds."""
+
+    c = await Checks(solera).deploy()
+    await c.feed(k1="5", k2="1")
+    await c.run()
+    c.failing["k2"] = RuntimeError("bug")
+    await c.feed(k2="2")
+    await c.run()
+    await c.feed(k1="6")
+    rows = await solera.outcomes("checks")
+    assert (rows["k1"]["outcome"], rows["k1"]["owed"]) == ("ok", True)
+    assert (rows["k2"]["outcome"], rows["k2"]["owed"]) == ("failed", True)
+    c.failing.clear()
+    await c.deploy(build="2")
+    assert await c.run() == ["k1", "k2"]
+    rows = await solera.outcomes("checks")
+    assert [(rows[k]["outcome"], rows[k]["owed"]) for k in ("k1", "k2")] == [("ok", False)] * 2
+
+
+async def test_key_5_a_key_that_never_succeeded_and_is_removed_upstream_owes_nothing(solera):
+    c = await Checks(solera).deploy()
+    await c.feed(k1="1", k3="1")
+    c.failing["k3"] = RuntimeError("bug")
+    await c.run()
+    assert (await solera.outcomes("checks"))["k3"]["owed"] is True
+    await c.feed(removes=["k3"])
+    assert await solera.outcomes("checks", *STORED) == {}  # its outcome goes
+    assert not any(r["owed"] for r in (await solera.outcomes("checks")).values())
+
+
+# -- KEY-10 (target) ---------------------------------------------------------------
+
+
+async def test_key_10_a_definition_change_calls_a_failing_key_again_and_its_failure_goes_once_it_succeeds(
+    solera,
+):
+    c = await Checks(solera).deploy()
+    await c.feed(k1="1", k2="1")
+    await c.run()
+    c.failing["k1"] = RuntimeError("bug")
+    await c.feed(k1="2")
+    await c.run()
+    c.failing.clear()
+    await c.deploy(version="2")
+    assert await c.run() == ["k1", "k2"]
+    assert await solera.outcomes("checks", *STORED) == {}
+    assert await solera.rows("checks") == {"k1": "2", "k2": "1"}
+
+
+@pytest.mark.parametrize("full", ["definition", "by hand"])
+async def test_key_10_nothing_is_cleared_and_a_key_failing_again_keeps_its_failure_and_last_good_output(
+    solera, full
+):
+    """`checks`, a key a batch, has z failing at 2 over its row at 1; a full
+    run (v2, or asked for by hand) calls every key. Once its first batch has
+    committed, z still shows its failure; z fails again: still failed and
+    owed, its row still at 1."""
+
+    c = await Checks(solera, batch_size=1).deploy()
+    await c.feed(a="1", b="1", z="1")
+    await c.run()
+    c.failing["z"] = RuntimeError("bug")
+    await c.feed(z="2")
+    await c.run()
+    seen = {}
+
+    async def look():
+        seen.update(kinds(await solera.outcomes("checks", *STORED)))
+
+    c.during["b"] = look  # a's batch has committed
+    if full == "definition":
+        await c.deploy(version="2")
+    assert await c.run(**({"mode": "full"} if full == "by hand" else {})) == ["a", "b", "z"]
+    assert seen == {"z": "failed"}
+    z = (await solera.outcomes("checks"))["z"]
+    assert (z["outcome"], z["owed"]) == ("failed", True)
+    assert await solera.rows("checks") == {"a": "1", "b": "1", "z": "1"}
+
+
+# -- KEY-12 (target) ---------------------------------------------------------------
+
+
+async def test_key_12_a_key_that_never_succeeded_and_is_removed_upstream_is_owed_nothing(solera):
+    """`items` adds k6; `checks` fails on it at its first try; `items`
+    removes k6: `checks` is not stale for k6, no run delivers its removal,
+    and its outcome goes."""
+
+    ex = await Example(solera).start()
+    await ex.feed({"k1": "1"})
+    await ex.run("checks")
+    ex.failing["k6"] = RuntimeError("bug")
+    await ex.feed({"k6": "1"})
+    await ex.run("checks")
+    assert kinds(await solera.outcomes("checks", *STORED)) == {"k6": "failed"}
+    await ex.feed(removes=["k6"])
+    assert await solera.stale_keys("checks") == {}
+    assert await solera.stale("checks") == []
+    assert await solera.outcomes("checks", *STORED) == {}
+    detail = await solera.run("checks")
+    assert await solera.commits("checks", detail["request"]["id"]) == []
+    assert all("removed" not in a["keys"] for a in attempts_of(detail, "checks"))
+
+
+# -- KEY-13 (target) ---------------------------------------------------------------
+
+
+async def test_key_13_a_full_run_resets_nothing_and_never_empties_the_output(solera):
+    """`checks` holds k1, k2, x9, and `feed` holds k1, k2, k3. Its full run
+    (v2), a key a batch, calls k1, k2 and k3 and removes x9; every key it
+    holds stays readable, and it stays complete, throughout."""
+
+    c = await Checks(solera, batch_size=1).deploy()
+    await c.feed(k1="1", k2="1", x9="1")
+    await c.run()
+    await c.feed(k3="1", removes=["x9"])
+    held = []
+
+    async def look():
+        held.append((sorted(await solera.keys("checks")), (await solera.head("checks"))["materialized"]))
+
+    c.during |= {"k1": look, "k2": look, "k3": look}
+    await c.deploy(version="2")
+    assert await c.run() == ["k1", "k2", "k3"]
+    assert held == [(["k1", "k2", "x9"], True)] * 3
+    assert sorted(await solera.keys("checks")) == ["k1", "k2", "k3"]
+    assert await solera.stale("checks") == []
+
+
+async def test_key_13_a_full_run_by_hand_makes_every_key_due_and_a_canceled_one_resumes(solera):
+    """Nothing changed: a full run asked for by hand calls every key, a key a
+    batch. Canceled at k3, the next run calls k3 and k4 alone."""
+
+    c = await Checks(solera, batch_size=1).deploy()
+    await c.feed(k1="1", k2="1", k3="1", k4="1")
+    await c.run()
+    assert await c.run(mode="full") == ["k1", "k2", "k3", "k4"]
+    started, release = asyncio.Event(), asyncio.Event()
+
+    async def hang():
+        started.set()
+        await release.wait()
+
+    c.during["k3"] = hang
+    before = len(c.calls)
+    run = await solera.submit("checks", mode="full")
+    await solera.until(started.is_set)
+    await solera.cancel(run["id"])
+    assert (await solera.wait(run))["request"]["status"] == "canceled"
+    release.set()
+    assert sorted(c.calls[before:]) == ["k1", "k2", "k3"]
+    assert sorted(await solera.keys("checks")) == ["k1", "k2", "k3", "k4"]
+    assert set(await solera.stale_keys("checks")) == {"k3", "k4"}  # still due
+    assert await c.run() == ["k3", "k4"]
+    assert await c.run() == []

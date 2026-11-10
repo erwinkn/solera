@@ -475,7 +475,7 @@ its runs end, and a launched attempt is not retried.
 `gone` and `keep` read `feed`; `gone` is removed: its progress holds
 nothing from then on, and its runs still in history keep the commits
 their batches name until those runs expire.
-*From* `object-store-state.md` §2; D180. *Today* the removal lets go of everything at once (`server/test_matrix.py::test_a_removed_consumer_lets_go_of_its_upstreams_log`). *Covered* {{COVERED}}.
+*From* `object-store-state.md` §2; D180. *Today* the removal lets go of everything at once (`server/test_matrix.py::test_a_removed_consumer_lets_go_of_its_upstreams_log`). *Covered* pending in the contract (`tests/contract/entries.py`).
 
 ## SRC — sources and served versions
 
@@ -574,7 +574,7 @@ per new deploy. `Transient`: retried on backoff (1 min doubling to 6 h,
 the whole attempt fails, nothing commits. If a failing key's input goes
 back to the version the partition held before the failure, the failure is
 moot: its outcome goes, and it is not retried.
-*From* `per-key-processing.md` §8; D191. *Today* a failing key counts as processed at the version it failed on, so a revert to the version before reads as a change. *Covered* {{COVERED}}; `server/test_each.py::test_failures_are_recorded_and_never_block`; `server/test_each.py::test_transient_key_retried_when_due`; `server/test_each.py::test_a_failed_key_gets_one_try_per_deploy`; `server/test_each.py::test_abort_fails_the_attempt_and_commits_nothing`; `sdk/test_key_outcomes.py::test_transition_table`; `sdk/test_key_outcomes.py::test_transient_backoff_and_budget`.
+*From* `per-key-processing.md` §8; D191. *Today* a failing key counts as processed at the version it failed on, so a revert to the version before reads as a change. *Covered* `contract/test_key.py::test_key_3_a_failure_whose_input_goes_back_to_what_the_partition_held_is_moot`; `contract/test_key.py::test_key_3_rejected_and_failed_keys_keep_their_output_and_never_block_the_others`; `contract/test_key.py::test_key_3_a_transient_key_backs_off_doubling_until_retry_for_then_fails`; `contract/test_key.py::test_key_3_abort_fails_the_whole_attempt_and_nothing_commits`; `server/test_each.py::test_failures_are_recorded_and_never_block`; `server/test_each.py::test_transient_key_retried_when_due`; `server/test_each.py::test_a_failed_key_gets_one_try_per_deploy`; `server/test_each.py::test_abort_fails_the_attempt_and_commits_nothing`; `sdk/test_key_outcomes.py::test_transition_table`; `sdk/test_key_outcomes.py::test_transient_backoff_and_budget`.
 
 **KEY-4. Returning `None` changes nothing for that key; removing is explicit.**
 A call returns `None` for `icp_raw_data`: its previous rows stay.
@@ -593,7 +593,7 @@ holds what it held before the failure, so its row says `owed: true` until
 it succeeds. A key that never succeeded and is removed upstream owes
 nothing, and its outcome goes (KEY-12). `GET /assets/{name}/outcomes`
 pages them, filterable by outcome.
-*From* D179, D191. *Today* a failing key counts as processed at the version it failed on, so it is not owed. *Covered* {{COVERED}}; `server/test_outcomes.py::test_derived_outcomes_follow_the_observation_record`; `server/test_outcomes.py::test_a_listing_pages_in_key_order`; `server/test_console_api.py::test_stored_outcomes_list_page_and_filter`; sim `stored_counts_sum_to_the_outcome_index`.
+*From* D179, D191. *Today* a failing key counts as processed at the version it failed on, so it is not owed. *Covered* `contract/test_key.py::test_key_5_a_failing_key_stays_owed_until_it_succeeds`; `contract/test_key.py::test_key_5_a_key_that_never_succeeded_and_is_removed_upstream_owes_nothing`; `server/test_outcomes.py::test_derived_outcomes_follow_the_observation_record`; `server/test_outcomes.py::test_a_listing_pages_in_key_order`; `server/test_console_api.py::test_stored_outcomes_list_page_and_filter`; sim `stored_counts_sum_to_the_outcome_index`.
 
 **KEY-6. Failed keys come back on their own, bounded.**
 An automated per-key asset with keys due starts a run on its own when
@@ -626,7 +626,7 @@ makes them `canceled`.
 called again, and its failure goes when it succeeds. Nothing is cleared at
 the start, so a key that fails again keeps its failure and its last good
 output. A full run asked for by hand does the same (KEY-13).
-*From* `per-key-processing.md` §9; D194. *Today* the start-over clears every stored failure at the full run's first commit (`server/test_each.py::test_a_start_over_clears_the_stored_outcomes`). *Covered* {{COVERED}}.
+*From* `per-key-processing.md` §9; D194. *Today* the start-over clears every stored failure at the full run's first commit (`server/test_each.py::test_a_start_over_clears_the_stored_outcomes`). *Covered* `contract/test_key.py::test_key_10_a_definition_change_calls_a_failing_key_again_and_its_failure_goes_once_it_succeeds`; `contract/test_key.py::test_key_10_nothing_is_cleared_and_a_key_failing_again_keeps_its_failure_and_last_good_output`.
 
 **KEY-11. "Why is this key not there?" has an answer.**
 `GET /assets/checks/explain?key=k2`: `ok`, `failing`, `excluded` (naming
@@ -638,7 +638,7 @@ evidence.
 `items` adds k6; `checks` fails on it at its first try; `items` removes
 k6: `checks` is not stale for k6, no run delivers its removal, and k6's
 outcome goes.
-*From* D191. *Today* the failed key counts as processed, so its removal is owed and delivered. *Covered* {{COVERED}}.
+*From* D191. *Today* the failed key counts as processed, so its removal is owed and delivered. *Covered* `contract/test_key.py::test_key_12_a_key_that_never_succeeded_and_is_removed_upstream_is_owed_nothing`.
 
 **KEY-13. A per-key asset's full run resets nothing and never empties its output.**
 `checks` holds k1, k2, x9, and `items` holds k1, k2, k3. A full run calls
@@ -647,7 +647,7 @@ readable throughout, and the partition stays complete. A full run asked
 for by hand, with no definition change, makes every key due again (through
 a rebuild counter on each input); canceled midway, the next run resumes
 where it stopped instead of starting over.
-*From* D194 (the amended P8). *Today* a full run asked for by hand starts the partition over, so a canceled one starts again from the first key. *Covered* {{COVERED}}.
+*From* D194 (the amended P8). *Covered* `contract/test_key.py::test_key_13_a_full_run_resets_nothing_and_never_empties_the_output`; `contract/test_key.py::test_key_13_a_full_run_by_hand_makes_every_key_due_and_a_canceled_one_resumes`.
 
 ## STA — staleness, completeness and statuses
 
@@ -751,7 +751,7 @@ key added and removed again between two runs is never owed.
 stale for k3 and k5 only, and shows one failing key. Once k3 and k5 are
 processed, `checks` is fresh with k2 still failing, until k2's retry
 comes due or its input changes.
-*From* D191. *Today* a failing key counts as processed, so it is neither owed nor stale; its retry is a separate clock. *Covered* {{COVERED}}.
+*From* D191. *Today* a failing key counts as processed, so it is neither owed nor stale; its retry is a separate clock. *Covered* `contract/test_sta.py::test_sta_15_a_failing_key_not_yet_due_is_shown_not_stale`; `contract/test_sta.py::test_sta_15_a_failing_keys_new_input_makes_it_stale_before_its_retry_is_due`.
 
 ## PAR — partitions, fan-in, broadcast, dynamic partitions
 
@@ -862,7 +862,7 @@ A paused run or an engine outage is not wait.
 FileStore: the planned version. Postgres: the planned version, or the one
 loaded where it differed (HIS-8). A source read live: the version it
 served. `ctx.load` is not lineage.
-*From* `versions.md` §6; D184. *Today* a Postgres read records the version whose write it saw, `uncommitted` for a dead writer's (`server/test_lineage_reads.py::test_lineage_says_what_a_current_read_saw`). *Covered* {{COVERED}}; sim `reads_say_what_they_read`.
+*From* `versions.md` §6; D184. *Today* a Postgres read records the version whose write it saw, `uncommitted` for a dead writer's (`server/test_lineage_reads.py::test_lineage_says_what_a_current_read_saw`); a source read live records the commit it was pinned to, not the version it served. *Covered* `contract/test_his.py::test_his_3_lineage_records_the_version_each_input_was_read_at`; sim `reads_say_what_they_read`.
 
 **HIS-4. A commit row names the batch that made it.**
 `batch: {index, count}` and `final`; null for an unbatched task.
@@ -874,25 +874,25 @@ Run R's batch 2 processed k1@7 and k2@3; a month later, R still retained:
 k1@7, updated. Upstream key history is kept back to the oldest commit a
 retained run or live reader refers to. A key outcome's `removed`, and its
 processed version, stay known as long as their run.
-*From* D180. *Today* not built (T39; gap 8). *Covered* {{COVERED}}.
+*From* D180. *Today* not built (T39; gap 8): a removed key's outcome is forgotten once its upstream's history is merged past it, though its run is still in history. *Covered* `contract/test_his.py::test_his_5_a_removed_key_outcome_stays_known_while_its_run_is_in_history`.
 
 **HIS-6. Per-key history keeps failures, a duration histogram per batch, and each batch's 10 slowest keys.**
 Failures are logged per call, newest first. Ok calls are not logged one
 by one: a batch's ok keys come from lineage (HIS-5). All of it expires
 with its run.
-*From* `per-key-processing.md` §10; D179, D195. *Today* every call is logged, ok included, with its duration (`server/test_console_api.py::test_key_outcomes_page_newest_first`). *Covered* {{COVERED}}.
+*From* `per-key-processing.md` §10; D179, D195. *Today* every call is logged, ok included, with its duration (`server/test_console_api.py::test_key_outcomes_page_newest_first`). *Covered* `contract/test_his.py::test_his_6_the_per_key_log_keeps_failures_newest_first_not_ok_calls_and_expires_with_its_run`.
 
 **HIS-7. A batch's input is recomputed from its record and checked against its digest.**
 Asked what batch 2 of run R received, the engine recomputes the key list
 from the batch's record. The digest covers the planned keys, each with
 its class and version, so a mismatch is an error naming the batch, never
 a wrong list.
-*From* D184. *Covered* {{COVERED}}.
+*From* D184. *Covered* pending in the contract (`tests/contract/entries.py`).
 
 **HIS-8. Lineage lists the keys loaded at another version than planned, with the version loaded.**
 `tally` planned k2@2 and loaded k2@5 (STO-3): its batch's lineage says k2
 was planned at 2 and loaded at 5.
-*From* D184. *Covered* {{COVERED}}.
+*From* D184. *Covered* pending in the contract (`tests/contract/entries.py`).
 
 ## CLN — cleanup and retention
 

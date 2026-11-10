@@ -30,7 +30,6 @@ TARGET: dict[str, str] = {
     "HIS-3": "D184",
     "HIS-5": "D180",
     "HIS-6": "D195",
-    "RST-8": "D180",
     "CLN-4": "D183",
     "CLN-6": "D183, D201",
     "CLN-11": "D192",
@@ -48,10 +47,7 @@ TARGET: dict[str, str] = {
     "STA-14": "D183",
     "STA-15": "D191",
     "KEY-12": "D191",
-    "KEY-13": "D194",
     "CHG-13": "D184",
-    "HIS-7": "D184",
-    "HIS-8": "D184",
     "CLN-12": "D183",
     "CLN-13": "D192",
     "CLN-14": "D198",
@@ -67,6 +63,12 @@ PENDING: dict[str, str] = {
     ),
     "ENG-2": "its window, an attempt's spec written but its launch not yet durable, lies inside one engine "
     "step: no request, restart or takeover a user makes can stop the engine there without hooking its flush",
+    "HIS-7": "no route serves a batch's input recomputed from its record, and a digest mismatch needs a "
+    "batch record altered behind the engine, which no user can do: per-batch lineage is B10's",
+    "HIS-8": "no route serves a batch's per-key lineage (each key planned at one version and loaded at "
+    "another): B10 adds it; STO-3's tests check that such a key is processed as loaded",
+    "RST-8": "what a removed consumer's retained runs keep is only observable as their batches' per-key "
+    "lineage (HIS-5's question, asked of a removed asset), which no route serves: B10, with B9's cut",
     "ENG-16": "needs a namespace in an older state format, and the contract has none to open: making one "
     "means writing the engine's journal by hand, which no user does and the harness may not",
 }

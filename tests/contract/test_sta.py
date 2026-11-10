@@ -3,12 +3,13 @@
 import asyncio
 
 import pytest
+from solera import Transient
 from solera.sdk import DynamicPartitions, Incremental, Output, Project, Retry, Source, StaticPartitions, asset
 from solera.stores import FileStore
 
 from tests.contract.example import Example
 from tests.contract.harness import Outside, Refused, SourceStore, rebuild
-from tests.contract.test_key import console
+from tests.contract.test_key import STORED, Checks, console
 
 INPUT, UPSTREAM, DEFINITION = "input changed", "upstream stale", "definition changed"
 
@@ -785,3 +786,42 @@ async def test_sta_11_each_commit_logs_whether_it_was_its_runs_last_batch(solera
     detail = await f.cancel_midway(mode="full")
     rows = await solera.commits("copy", detail["request"]["id"])
     assert rows and not any(r["final"] for r in rows)
+
+
+# -- target (PR 2) ---------------------------------------------------------------
+
+# -- STA-15 (target) ---------------------------------------------------------------
+
+
+async def test_sta_15_a_failing_key_not_yet_due_is_shown_not_stale(solera):
+    """k2 fails, its retry a minute away, and feed adds k3 and k5: `checks` is
+    stale for k3 and k5 alone and shows one failing key. Once they are
+    processed it is fresh, k2 still failing, until k2's retry comes due."""
+
+    c = await Checks(solera).deploy()
+    await c.feed(k1="1", k2="1")
+    await c.run()
+    c.failing["k2"] = Transient("busy", retry_after=60)
+    await c.feed(k2="2")
+    await c.run()
+    await c.feed(k3="1", k5="1")
+    assert set(await solera.stale_keys("checks")) == {"k3", "k5"}
+    assert list(await solera.outcomes("checks", *STORED)) == ["k2"]
+    assert await c.run() == ["k3", "k5"]
+    assert await solera.stale("checks") == [] and await solera.stale_keys("checks") == {}
+    assert list(await solera.outcomes("checks", *STORED)) == ["k2"]
+    solera.advance(61)
+    assert set(await solera.stale_keys("checks")) == {"k2"}
+    assert await solera.stale("checks") != []
+
+
+async def test_sta_15_a_failing_keys_new_input_makes_it_stale_before_its_retry_is_due(solera):
+    c = await Checks(solera).deploy()
+    await c.feed(k1="1", k2="1")
+    await c.run()
+    c.failing["k2"] = Transient("busy", retry_after=3600)
+    await c.feed(k2="2")
+    await c.run()
+    assert await solera.stale_keys("checks") == {}
+    await c.feed(k2="3")
+    assert set(await solera.stale_keys("checks")) == {"k2"}
