@@ -82,6 +82,7 @@ impl Log {
             time_ms: 0,
             producer: b"",
             live_before: before.len() as u64,
+            clear: false,
         };
         self.layers
             .push(ix.write_commit(&path, nc, &run).await.unwrap());
