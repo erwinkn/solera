@@ -39,8 +39,9 @@ struct DiskState {
     /// Paths being filled, and the bytes set aside for them.
     filling: HashSet<String>,
     reserved: u64,
-    /// Fills that failed, and when: not tried again for a minute.
-    failed: HashMap<String, std::time::Instant>,
+    /// Fills that failed: when, and how many times in a row. Not tried again
+    /// for a minute, doubling with each failure up to about an hour.
+    failed: HashMap<String, (std::time::Instant, u32)>,
 }
 
 /// A layer path as a file name, and back: `%`, `/` and a leading `.`
@@ -171,7 +172,7 @@ impl Disk {
         let failed = st
             .failed
             .get(path)
-            .is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(60));
+            .is_some_and(|&(t, n)| t.elapsed() < std::time::Duration::from_secs(60 << n.min(6)));
         if !self.keeps(path)
             || size.saturating_mul(4) > self.o.bytes
             || st.reserved + size > self.o.bytes
@@ -181,7 +182,6 @@ impl Disk {
         {
             return false;
         }
-        st.failed.remove(path);
         st.reserved += size;
         let evict = self.make_room(&mut st);
         drop(st);
@@ -195,8 +195,9 @@ impl Disk {
         let mut st = self.st.lock().unwrap();
         if st.filling.remove(path) {
             st.reserved -= size;
+            let n = st.failed.get(path).map_or(0, |&(_, n)| n + 1);
             st.failed
-                .insert(path.to_string(), std::time::Instant::now());
+                .insert(path.to_string(), (std::time::Instant::now(), n));
         }
     }
 
@@ -250,6 +251,7 @@ impl Disk {
         if st.filling.remove(path) {
             st.reserved -= size;
         }
+        st.failed.remove(path);
         drop(st);
         self.add(path, size);
         Ok(())
