@@ -370,12 +370,14 @@ impl Tracking {
 
     /// Tests only, until the output commit's event part (unit B4) lands:
     /// sets an output's layers and head.
+    #[pyo3(signature = (output, layers, head, live, full_run=None))]
     fn _set_output(
         &self,
         output: Vec<u8>,
         layers: &Bound<'_, PyAny>,
         head: u64,
         live: u64,
+        full_run: Option<u64>,
     ) -> PyResult<()> {
         let layers = layers_in(layers)?;
         self.state.write().unwrap().outputs.insert(
@@ -384,7 +386,7 @@ impl Tracking {
                 layers,
                 head,
                 live,
-                full_run: None,
+                full_run,
             },
         );
         Ok(())
@@ -463,8 +465,10 @@ impl Tracking {
 
     /// What committing a plan writes to progress, from what the worker
     /// reports per keyed input: (failed keys, (key, version) loaded at
-    /// another version than planned), each sorted. Returns the event and the
-    /// batch records.
+    /// another version than planned), each sorted. Returns the event, the
+    /// batch records, and per keyed input the keys it held back (loaded at
+    /// another version than planned while upstream was mid full run or after
+    /// a clear since the plan): they keep what they held.
     #[pyo3(signature = (plan, reports, producer=Vec::new(), output_commit=None))]
     fn progress_ops<'py>(
         &self,
@@ -492,7 +496,7 @@ impl Tracking {
                 }
                 rs.push(rep);
             }
-            let (event, records) = py
+            let (event, records, held_back) = py
                 .detach(|| {
                     let plan = Plan::decode(plan)?;
                     let ops = self.state.read().unwrap().progress_ops(
@@ -504,11 +508,19 @@ impl Tracking {
                     Ok::<_, tr::Error>((
                         ops.event().encode(),
                         ops.records.iter().map(|r| r.encode()).collect::<Vec<_>>(),
+                        ops.held_back,
                     ))
                 })
                 .map_err(err)?;
             let records = PyList::new(py, records.iter().map(|r| PyBytes::new(py, r)))?;
-            (PyBytes::new(py, &event), records).into_pyobject(py)
+            let held_back = PyList::new(
+                py,
+                held_back
+                    .iter()
+                    .map(|ks| PyList::new(py, ks.iter().map(|k| key(py, k))))
+                    .collect::<PyResult<Vec<_>>>()?,
+            )?;
+            (PyBytes::new(py, &event), records, held_back).into_pyobject(py)
         })
     }
 
