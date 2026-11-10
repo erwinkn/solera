@@ -614,6 +614,36 @@ class Solera:
         for path in [root, *(p for p in root.rglob("*") if p.is_dir())]:
             os.chmod(path, 0o555 if refused else 0o755)
 
+    # -- STORES+CLEANUP (target) -------------------------------------------------
+
+    async def at(self, output: str, head: dict, keys: dict | None = None, typ=None):
+        """An output's content as a reader planned at `head` (a head `head()`
+        gave) loads it through its store: a keyed one at `keys`, its keys
+        and versions then (`keys()` gave). None once the store no longer
+        holds it: cleanup took it."""
+
+        from solera.stores import StoreError
+
+        ref, store = Ref.from_json(head["ref"]), self.project.stores[head["ref"]["store"]]
+        try:
+            if keys is None:
+                return await store.load(ref, typ or object, None)
+            return await store.load(ref, typ or list[dict], Keys(keys))
+        except StoreError:
+            return None
+
+    async def alarmed(self, *words: str) -> bool:
+        """Whether an alarm the engine raises (`GET /api/diagnostics`, where
+        its upkeep's alarms are) names every one of `words`."""
+
+        import json
+
+        body = await self.get("/api/diagnostics")
+        for field in ("backend", "state", "objects", "namespace", "project", "deploy"):
+            body.pop(field, None)
+        text = json.dumps(body)
+        return all(word in text for word in words)
+
 
 # -- the outside world, as a user's project sees it ---------------------------
 
