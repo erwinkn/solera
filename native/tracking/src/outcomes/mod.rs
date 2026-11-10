@@ -199,6 +199,10 @@ pub struct PerKey {
     /// The input's commit through which reverts were looked for: a failing
     /// key whose input returns to what the consumer holds is moot (KEY-3).
     pub seen: u64,
+    /// The conditions (their id) they were last looked for under: a failing
+    /// key whose input the conditions now take as what the consumer holds
+    /// is moot too (KEY-3).
+    pub cond: u64,
     pub passes: u64,
     pub pass: Option<Pass>,
     /// The counters the last completed pass ran under.
@@ -211,6 +215,7 @@ impl PerKey {
             rebuild: self.rebuild,
             passes: self.passes,
             seen: self.seen,
+            cond: self.cond,
             ..PerKey::default()
         };
     }
@@ -227,6 +232,7 @@ impl PerKey {
             e.uv(*n);
         }
         e.uv(self.seen);
+        e.uv(self.cond);
         e.uv(self.passes);
         match &self.pass {
             None => e.u8(0),
@@ -256,6 +262,7 @@ impl PerKey {
             *n = d.uv()?;
         }
         let seen = d.uv()?;
+        let cond = d.uv()?;
         let passes = d.uv()?;
         let pass = match d.u8()? {
             0 => None,
@@ -274,6 +281,7 @@ impl PerKey {
             counts,
             classes,
             seen,
+            cond,
             passes,
             pass,
             last: read_counters(d)?,
@@ -356,6 +364,8 @@ pub struct Outcomes {
     /// head, so that its new records are looked after from where they were
     /// tried.
     pub seen: u64,
+    /// The conditions the batch ran, or the catch-up looked, under.
+    pub cond: u64,
     /// Points to set (B3's progress): a failure gone moot outside a range
     /// batch leaves the consumer holding what its record held.
     pub points: Vec<(Key, crate::progress::Point)>,
@@ -388,6 +398,7 @@ impl Outcomes {
         }
         e.uv(self.at);
         e.uv(self.seen);
+        e.uv(self.cond);
         let mut t = crate::progress::CondTable::default();
         let mut body = Enc::new();
         crate::progress::encode_points(&mut body, &mut t, self.points.iter().map(|(k, p)| (k, p)));
@@ -419,6 +430,7 @@ impl Outcomes {
         };
         let at = d.uv()?;
         let seen = d.uv()?;
+        let cond = d.uv()?;
         let table = crate::progress::CondTable::decode(d)?;
         let points = crate::progress::decode_points(d, &table)?;
         Ok(Outcomes {
@@ -430,6 +442,7 @@ impl Outcomes {
             step,
             at,
             seen,
+            cond,
             points,
         })
     }
@@ -466,6 +479,7 @@ impl Outcomes {
         }
         let k = t.per_key.entry(self.edge).or_default();
         k.seen = self.seen;
+        k.cond = self.cond;
         k.counts = self.counts;
         k.classes = self.classes;
         let conds = Arc::make_mut(&mut k.conds);

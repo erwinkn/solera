@@ -26,6 +26,8 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Instant;
 
+mod n6;
+
 const BATCH: u64 = 10_000;
 
 /// T44's keys: `site-0042/part-17/obj-000042170123-9f3c1a2e.json`, 53 bytes, id order.
@@ -420,6 +422,7 @@ fn main() {
         "a" => form_a(&a[2], a[3].parse().unwrap(), &a[4]),
         "b" => form_b(a[2].parse().unwrap()),
         "points" => points(a[2].parse().unwrap()),
+        "n6" => n6::n6(&a[2], a[3].parse().unwrap(), &a[4]),
         _ => panic!("a <dir> <keys> <phase> | b <keys> | points <keys>"),
     }
 }

@@ -252,20 +252,65 @@ pub async fn plan(
         }
     }
     let keys: Vec<&[u8]> = found.keys().map(|k| k.as_ref()).collect();
-    let mut heads = vec![Ver::Absent; keys.len()];
-    if r.head > 0 && !keys.is_empty() {
-        let page = ixs
-            .index(&r.input)?
-            .get(&r.layers, r.head, &keys, &Query::default())
+    let recs: Vec<&Record> = found.values().collect();
+    // What upstream has now: what a key failed on, unless the input changed
+    // it since. The input's changes since the batch's oldest failure, over
+    // the batch's range, say which did (N6: a batch reads its keys' changes,
+    // not the input's state over the part of the key space it spans), as
+    // long as those changes skip the input's largest layer; else reading
+    // the state is cheaper (measured: 128 ms a batch against 179).
+    let from = recs.iter().map(|r| r.at).min().unwrap_or(r.head);
+    let window = from < r.head
+        && r.layers
+            .iter()
+            .max_by_key(|l| l.size)
+            .is_some_and(|big| big.hi <= from);
+    let known = window || from >= r.head;
+    let mut heads: Vec<Option<Ver>> = recs
+        .iter()
+        .map(|rec| (known && !rec.on.is_absent()).then(|| rec.on.clone()))
+        .collect();
+    let input = ixs.index(&r.input)?;
+    if let Some(last) = keys.last().filter(|_| window) {
+        let q = Query {
+            lo: pass.after.as_ref().map(|k| k.to_vec()),
+            hi: Some(last.to_vec()),
+            ..Default::default()
+        };
+        let mut j = 0;
+        input
+            .window_with(&r.layers, from + 1..=r.head, &q, |g| {
+                while j < keys.len() && keys[j] < g.key(0) {
+                    j += 1;
+                }
+                if j < keys.len() && keys[j] == g.key(0) {
+                    let newest = g.rows(0).start;
+                    if g.commit(newest) > recs[j].at {
+                        heads[j] = Some(Ver::of(g.new_version(newest)));
+                    }
+                }
+            })
+            .await?;
+    }
+    let unknown: Vec<&[u8]> = keys
+        .iter()
+        .zip(&heads)
+        .filter(|(_, h)| h.is_none())
+        .map(|(k, _)| *k)
+        .collect();
+    if r.head > 0 && !unknown.is_empty() {
+        let page = input
+            .get(&r.layers, r.head, &unknown, &Query::default())
             .await?;
         let mut j = 0;
         for i in 0..page.run.len() {
-            while keys[j] < page.run.key(i) {
+            while keys[j] != page.run.key(i) {
                 j += 1;
             }
-            heads[j] = Ver::of(page.run.new_version(page.run.rows(i).start));
+            heads[j] = Some(Ver::of(page.run.new_version(page.run.rows(i).start)));
         }
     }
+    let heads = heads.into_iter().map(Option::unwrap_or_default);
     let conds = &v.per_key.conds;
     let mut taken: Vec<Cand> = Vec::new();
     let mut moot: Vec<Key> = Vec::new();

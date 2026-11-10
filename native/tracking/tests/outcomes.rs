@@ -259,21 +259,17 @@ impl World {
         }
     }
 
-    /// The truth after an upstream commit: a failure whose input returns to
-    /// what the consumer holds is moot.
-    fn moot_since(&mut self, from: u64) {
-        let head = self.log.head();
-        let now = self.now.clone();
-        let mut gone = vec![];
-        for (k, f) in &self.fails {
-            let held = self.holds.get(k).cloned().unwrap_or(Holding::Absent);
-            if (from.max(f.at) + 1..=head).any(|c| {
-                let v = self.log.at(c, k);
-                v != self.log.at(c - 1, k) && !owed(&held, &Holding::of(v.as_version(), &now, k))
-            }) {
-                gone.push(k.clone());
-            }
-        }
+    /// The truth after an upstream commit, a change of conditions or a
+    /// batch's commit (the model's `reverted`): a failing key no longer owed,
+    /// because upstream returned to what the consumer holds or the conditions
+    /// now take that, is moot.
+    fn reverted(&mut self) {
+        let gone: Vec<Key> = self
+            .fails
+            .keys()
+            .filter(|k| !owed(&self.holding(k), &self.wanted(k)))
+            .cloned()
+            .collect();
         for k in gone {
             self.fails.remove(&k);
         }
@@ -387,7 +383,7 @@ impl World {
                 self.fails.remove(&c.key);
             }
         }
-        self.moot_since(ip.head);
+        self.reverted();
         ip.keys.iter().map(|c| c.key.clone()).collect()
     }
 
@@ -398,20 +394,6 @@ impl World {
         let p = plan::plan(&view, &req, &OneIndex(ix), &NoHold)
             .await
             .unwrap();
-        // A failure the batch's range meets holding what is wanted is moot.
-        let gone: Vec<Key> = self
-            .fails
-            .keys()
-            .filter(|k| {
-                p.range.lo.as_ref().is_none_or(|lo| *k > lo)
-                    && p.range.hi.as_ref().is_none_or(|hi| *k <= hi)
-            })
-            .filter(|k| !owed(&self.holding(k), &self.wanted(k)))
-            .cloned()
-            .collect();
-        for k in gone {
-            self.fails.remove(&k);
-        }
         if upstream_meanwhile {
             self.upstream(ix).await;
         }
@@ -443,9 +425,8 @@ impl World {
                 changes.insert(k, version(&mut self.rng));
             }
         }
-        let from = self.log.head();
         if self.log.commit(ix, &mut self.t, changes).await {
-            self.moot_since(from);
+            self.reverted();
         }
     }
 
@@ -655,7 +636,7 @@ async fn history(seed: u64, ix: &ChangeIndex) -> [usize; 6] {
     })]);
     let trace = std::env::var("OUTCOME_TRACE").is_ok();
     for step in 0..60 {
-        let op = w.rng.random_range(0..20);
+        let op = w.rng.random_range(0..23);
         if trace {
             eprintln!(
                 "step {step} op {op} head {} now {:?} clock {} counters {:?}",
@@ -678,6 +659,7 @@ async fn history(seed: u64, ix: &ChangeIndex) -> [usize; 6] {
                     ..(*w.now).clone()
                 });
                 w.cursor = None;
+                w.reverted();
             }
             12 => {
                 let to = w.t.rebuild(EDGE.as_bytes()) + 1;
@@ -690,6 +672,7 @@ async fn history(seed: u64, ix: &ChangeIndex) -> [usize; 6] {
                     ..(*w.now).clone()
                 });
                 w.cursor = None;
+                w.reverted();
             }
             13 => {
                 let p = patterns(&mut w.rng);
@@ -697,6 +680,7 @@ async fn history(seed: u64, ix: &ChangeIndex) -> [usize; 6] {
                     patterns: p,
                     ..(*w.now).clone()
                 });
+                w.reverted();
             }
             14 | 15 => w.clock += w.rng.random_range(0..600) as f64,
             16 => w.counters.deploy += 1,
@@ -704,8 +688,8 @@ async fn history(seed: u64, ix: &ChangeIndex) -> [usize; 6] {
                 let c = w.rng.random_range(1..6);
                 w.counters.forced[c] = w.events + 1;
             }
-            18 => w.pass(ix).await,
-            _ => {
+            18 | 20..=22 => w.pass(ix).await,
+            19 => {
                 if w.rng.random_bool(0.3) {
                     w.apply(vec![Part::Reset(Reset {
                         edge: key(EDGE),
@@ -718,6 +702,7 @@ async fn history(seed: u64, ix: &ChangeIndex) -> [usize; 6] {
                     w.t = Tracking::restore(&w.t.snapshot()).unwrap();
                 }
             }
+            _ => unreachable!(),
         }
         w.catch_up(ix).await;
         if trace {

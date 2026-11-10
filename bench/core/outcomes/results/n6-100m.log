@@ -1,0 +1,24 @@
+# N6 at 100M keys (4 vCPU, 16 GB; local filesystem store, 256 MB block cache)
+## build
+build: input 100000000 keys at c1010 (8 layers, 1680 MB), 1000000 failing (5 layers, 20.6 MB), due index 1000000 (12.5 MB); 353s, 368 CPU-s, merges 395
+## before: a retry batch reads the input's state at the head for its keys (a5a0534)
+(failures at c1000)
+pass: 101 batches, 990034 keys taken (19966 short of full batches: changed upstream since they failed), 13.5s wall, 13.5 CPU-s = 73511 due keys a second; batch p50 128 ms (CPU 129), p99 178 ms, max 200 ms; GETs 798 (1707 MB); peak RSS 311 MB
+batch 0..4 warm: 133, 132, 135, 147, 148 ms wall (median of 5 each)
+## after: it reads the input's changes since its oldest failure when they skip the input's largest layer, else the state
+== failures at c1000 (after the input's last merge, before a day's churn)
+pass start: 1000000 keys listed in 797 ms wall, 821 ms CPU; GETs 22 (12.5 MB)
+pass: 101 batches, 990034 keys taken (19966 short of full batches: changed upstream since they failed), 2.2s wall, 2.3 CPU-s = 440546 due keys a second; batch p50 20 ms (CPU 21), p99 59 ms, max 193 ms; GETs 605 (76 MB); peak RSS 311 MB
+batch 0 warm: 20 ms wall, 20 ms CPU (median of 5); GETs 0 over 5
+batch 1 warm: 19 ms wall, 19 ms CPU (median of 5); GETs 0 over 5
+batch 2 warm: 20 ms wall, 20 ms CPU (median of 5); GETs 0 over 5
+batch 3 warm: 21 ms wall, 21 ms CPU (median of 5); GETs 0 over 5
+batch 4 warm: 22 ms wall, 22 ms CPU (median of 5); GETs 0 over 5
+== failures at c1 (before the input's last merge)
+pass start: 1000000 keys listed in 786 ms wall, 810 ms CPU; GETs 22 (12.5 MB)
+pass: 101 batches, 990034 keys taken (19966 short of full batches: changed upstream since they failed), 13.6s wall, 13.6 CPU-s = 72696 due keys a second; batch p50 132 ms (CPU 132), p99 182 ms, max 186 ms; GETs 797 (1707 MB); peak RSS 302 MB
+batch 0 warm: 120 ms wall, 120 ms CPU (median of 5); GETs 5 over 5
+batch 1 warm: 130 ms wall, 130 ms CPU (median of 5); GETs 5 over 5
+batch 2 warm: 118 ms wall, 118 ms CPU (median of 5); GETs 5 over 5
+batch 3 warm: 132 ms wall, 132 ms CPU (median of 5); GETs 5 over 5
+batch 4 warm: 123 ms wall, 124 ms CPU (median of 5); GETs 5 over 5

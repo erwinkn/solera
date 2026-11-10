@@ -6,8 +6,9 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use solera_index::Query;
+use solera_index::{Query, Version};
 
+use crate::codec::Ver;
 use crate::commit::{build, Change, Changes, Held as Source, Mode, Spec};
 use crate::error::{invalid, Result};
 use crate::event::Part;
@@ -381,6 +382,11 @@ pub async fn commit(
         } else {
             v.per_key.seen.min(p.head)
         },
+        cond: if v.failures.live == 0 {
+            on_cond
+        } else {
+            v.per_key.cond
+        },
         points,
     }));
 
@@ -432,7 +438,9 @@ pub async fn catch_up(
 ) -> Result<Option<Vec<Part>>> {
     let head = v.upstream.head;
     let seen = v.per_key.seen;
-    if v.failures.live == 0 || seen >= head {
+    let cond = cond_id(now);
+    let moved_on = cond != v.per_key.cond;
+    if v.failures.live == 0 || (seen >= head && !moved_on) {
         return Ok(None);
     }
     let fid = output_id(FAILURES, &v.edge);
@@ -440,7 +448,7 @@ pub async fn catch_up(
     let ix = ixs.index(&v.input)?;
     let mut gone: BTreeMap<Key, Record> = BTreeMap::new();
     let mut after: Option<Vec<u8>> = None;
-    loop {
+    while seen < head {
         let q = Query {
             after: after.take(),
             limit: Some(65_536),
@@ -460,6 +468,61 @@ pub async fn catch_up(
             });
             if back {
                 gone.insert(k.into(), rec.clone());
+            }
+        }
+        match page.next {
+            Some(n) => after = Some(n),
+            None => break,
+        }
+    }
+    // The conditions moved on: a record is moot if the consumer holds what
+    // they now take. Only a key held absent that they no longer take, or one
+    // held under conditions that process as these do, can be.
+    while moved_on {
+        let q = Query {
+            after: after.take(),
+            limit: Some(65_536),
+            ..Default::default()
+        };
+        let page = ixs
+            .index(&fid)?
+            .scan(&v.failures.layers, v.failures.head, &q)
+            .await?;
+        let run = &page.run;
+        let mut maybe: Vec<(&[u8], Record, Holding)> = Vec::new();
+        for i in 0..run.len() {
+            let Version::Bytes(b) = run.new_version(run.rows(i).start) else {
+                return invalid("a record that is not a version word");
+            };
+            let rec = Record::decode(b)?;
+            let k = run.key(i);
+            let held = rec.held.holding(conds)?;
+            let check = match &held {
+                Holding::Absent => !now.patterns.takes(k),
+                Holding::Version(_, c) => c.same_processing(now),
+                Holding::Held => false,
+            };
+            if check {
+                maybe.push((k, rec, held));
+            }
+        }
+        let keys: Vec<&[u8]> = maybe.iter().map(|m| m.0).collect();
+        let mut at_head = vec![Ver::Absent; keys.len()];
+        if head > 0 && !keys.is_empty() {
+            let got = ix
+                .get(&v.upstream.layers, head, &keys, &Query::default())
+                .await?;
+            let mut j = 0;
+            for i in 0..got.run.len() {
+                while keys[j] != got.run.key(i) {
+                    j += 1;
+                }
+                at_head[j] = Ver::of(got.run.new_version(got.run.rows(i).start));
+            }
+        }
+        for ((k, rec, held), ver) in maybe.into_iter().zip(at_head) {
+            if !crate::progress::owed(&held, &Holding::of(ver.as_version(), now, k)) {
+                gone.insert(k.into(), rec);
             }
         }
         match page.next {
@@ -528,6 +591,7 @@ pub async fn catch_up(
         step: None,
         at: v.failures.head,
         seen: head,
+        cond,
         points,
     }));
     Ok(Some(parts))
