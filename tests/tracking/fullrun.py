@@ -61,11 +61,12 @@ RULES = {
         "switch_alone",
         "switch_release",
         "switch_owed",
-        "switch_guard",
         "switch_cleanup",
         "build_keep",
         "reset_replay",
         "notice_match",
+        "switch_quiet",
+        "switch_overtaken",
     ),
 }
 ADDED = {
@@ -81,11 +82,12 @@ ADDED = {
         "switch_alone",
         "switch_release",
         "switch_owed",
-        "switch_guard",
         "switch_cleanup",
         "build_keep",
         "reset_replay",
         "notice_match",
+        "switch_quiet",
+        "switch_overtaken",
     )
 }
 
@@ -129,9 +131,6 @@ class Output:
         ] = {}  # open builds (shadow tables), by the version that opened each
         self.published_run = 0  # the build last published
         self.loose: dict[str, int] = {}  # published keys an uncommitted write outside a full run touched
-        self.build_loose: dict[
-            int, dict[str, int]
-        ] = {}  # the same, per build, published with it at the switch
         self.ended: set[int] = set()  # builds whose full run ended in the log
         self.switched: Counter = Counter()  # build -> times the store published it
         self.superseded: set[int] = set()  # ended builds dropped unpublished: a newer run's end overtook them
@@ -173,9 +172,6 @@ class Output:
         if self.kind == "file":
             self._apply(version, writes, clear)
         self.loose = {k: v for k, v in self.loose.items() if v != version}
-        for bl in self.build_loose.values():
-            for k in [k for k, v in bl.items() if v == version]:
-                del bl[k]
         self.log.commit({k: ABSENT if v is ABSENT else version for k, v in writes.items()}, clear)
 
     def _named(self) -> dict[str, Row] | None:
@@ -217,10 +213,8 @@ class Output:
                 rows = next((self.builds[g] for g in (run, owed) if g is not None and g in self.builds), None)
                 if rows is None:
                     rows = self.published
-        if rows is self.published and not clear and (run is None or self.swap):
+        if rows is self.published and not clear and run is None:
             self.loose.update(dict.fromkeys(writes, version))
-        elif not clear and self.swap and (g := next((g for g, b in self.builds.items() if b is rows), None)):
-            self.build_loose.setdefault(g, {}).update(dict.fromkeys(writes, version))
         for k, v in writes.items():
             if v is ABSENT:
                 rows.pop(k, None)
@@ -230,10 +224,7 @@ class Output:
     def switch(self, gen: int) -> None:
         """The store's hook at the end of a full run (D211), one transaction:
         the partition's rows are replaced by the build's, and the build goes.
-        Safe to repeat; a no-op unless the build the run opened is still open
-        (switch_guard; off, it publishes the newest build open)."""
-        if not self.on("switch_guard"):
-            gen = max(self.builds, default=gen)
+        Safe to repeat: a no-op once the run's build is gone."""
         if gen not in self.builds:
             return
         build = self.builds.pop(gen)
@@ -243,8 +234,8 @@ class Output:
                 self.superseded.add(g)
         # switch_cleanup: delete the partition's rows before inserting the build's
         self.published = dict(build) if self.on("switch_cleanup") else {**self.published, **build}
-        carried = self.build_loose.pop(gen, {})  # a dead attempt's rows go out with the build, as in place
-        self.loose = carried if self.on("switch_cleanup") else {**self.loose, **carried}
+        if self.on("switch_cleanup"):
+            self.loose = {}
         self.switched[gen] += 1
         self.published_run = max(self.published_run, gen)
 
@@ -529,6 +520,7 @@ class Ordinary:
         if s.clear:
             return True
         if wrong and self.accumulates:
+            self.dead = s.repaired  # unrepaired until the full run's clear: no switch may publish its rows
             self.full_due, self.hand = True, False
             w.trace.append(f"  {self.name} owes a full run: a dead attempt wrote its own rows")
             return False
@@ -632,6 +624,10 @@ class Ordinary:
             self.full_due = False
         if s.clear:
             self.full_gen, self.released = s.version, False
+            if w.on("switch_overtaken"):
+                w.ended.pop(
+                    self.name, None
+                )  # a newer run's clear is journaled: the older one is never published
         for i, (prog, log) in enumerate(zip(self.progress, self.inputs, strict=True)):
             pieces, points = ([[s.lo, s.hi, EMPTY]], {}) if s.reset else replaced(prog, s.lo, s.hi)
             prior = dict(s.before[i])
@@ -985,7 +981,6 @@ class World:
     def owe(self, a: Ordinary, via: str) -> None:
         """A full run ended in the log: the same journal event records that the
         engine owes the store its switch (D211). Only tables have the hook."""
-        a.output.ran = True
         if a.output.kind != "table" or a.full_gen is None:
             return
         a.output.ended.add(a.full_gen)
@@ -998,7 +993,11 @@ class World:
         by a later step; without the ack (a crash after the call) it stays owed."""
         if (run := self.ended.get(name)) is None:
             return
-        self.assets[name].output.switch(run)
+        a = self.assets[name]
+        if self.on("switch_quiet") and (a.pending is not None or a.dead):
+            self.trace.append(f"the engine waits to switch {name}: an attempt is in flight or unrepaired")
+            return
+        a.output.switch(run)
         self.stats["switches called"] += 1
         self.trace.append(
             f"the engine calls {name}'s store to switch to build v{run}"
@@ -1023,6 +1022,7 @@ class World:
             out = a.output
             if a.rebuild is not None:
                 continue
+            out.ran |= out.log.head > 0 and (a.complete() or a.released)  # its first run has completed
             if out.ran and out.settled[-1] != out.log.head:
                 out.settled.append(out.log.head)
 
@@ -1311,13 +1311,16 @@ class World:
                         if bad := self.check():
                             return bad
             if not moved:
+                moved = bool(self.acks)
+                while self.acks:
+                    self.notice(*self.acks.pop(0))
+                for name in list(self.ended):
+                    self.switch(name, True)
+                    moved |= name not in self.ended
+                    if bad := self.check():
+                        return bad
+            if not moved:
                 break
-        while self.acks:
-            self.notice(*self.acks.pop(0))
-        for name in list(self.ended):
-            self.switch(name, True)
-        if bad := self.check():
-            return bad
         self.summary()
         for name in self.logs:
             self.merge(name)
