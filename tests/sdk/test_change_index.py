@@ -210,10 +210,10 @@ def test_s3_round_trip(tmp_path):
     assert {k for k, *_ in rows} == {k for k in keys if states[floor].get(k) != states[head].get(k)}
     assert ix.stats()["gets"] > 0
 
-    cached = ChangeIndex(url, options, disk_dir=str(tmp_path))
+    cached = ChangeIndex(url, options, disk_dir=str(tmp_path), disk_store=url)
     assert cached.scan(layers, head)[0] == rows_head
     with pytest.raises(ValueError):
-        ChangeIndex(url, options, disk_dir=str(tmp_path))
+        ChangeIndex(url, options, disk_dir=str(tmp_path), disk_store=url)
     for _ in range(100):
         if cached.stats()["fills"] == len(layers):
             break
@@ -221,7 +221,7 @@ def test_s3_round_trip(tmp_path):
     del cached
     for _ in range(100):
         try:
-            reopened = ChangeIndex(url, options, disk_dir=str(tmp_path))
+            reopened = ChangeIndex(url, options, disk_dir=str(tmp_path), disk_store=url)
             break
         except ValueError:
             time.sleep(0.05)

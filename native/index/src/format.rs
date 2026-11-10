@@ -42,6 +42,11 @@ pub const KNOWN_COMMIT_FLAGS: u64 = 0;
 /// whatever a damaged file says.
 pub const MAX_RAW: usize = 64 << 20;
 
+/// The longest key. With `MAX_RAW`, it bounds what a reader rebuilds from
+/// prefix-coded keys: a block's distinct keys, a segment's or the top level's
+/// first keys, at most `MAX_RAW` bytes each.
+pub const MAX_KEY: usize = 64 << 10;
+
 fn fits(what: &str, len: usize) -> Result<()> {
     if len > MAX_RAW {
         return invalid(format!(
@@ -239,6 +244,10 @@ pub struct Writer {
     entries: u64,
     keys: u64,
     first_key: Vec<u8>,
+    /// Bytes of the distinct keys in the current block, and of the top
+    /// level's first keys, as a reader rebuilds them.
+    block_keys: usize,
+    top_keys: usize,
 }
 
 impl Writer {
@@ -251,6 +260,13 @@ impl Writer {
             ));
         }
         fits("a block", o.block_bytes * 2)?;
+        if o.seg_blocks == 0 || o.seg_blocks * MAX_KEY > MAX_RAW {
+            return invalid(format!(
+                "seg_blocks {}: from 1 to {}",
+                o.seg_blocks,
+                MAX_RAW / MAX_KEY
+            ));
+        }
         let zc = zstd::bulk::Compressor::new(o.level)
             .map_err(|e| Error::Invalid(format!("zstd level {}: {e}", o.level)))?;
         Ok(Writer {
@@ -280,6 +296,8 @@ impl Writer {
             entries: 0,
             keys: 0,
             first_key: Vec::new(),
+            block_keys: 0,
+            top_keys: 0,
         })
     }
 
@@ -347,7 +365,15 @@ impl Writer {
                 lossy(key)
             ));
         }
-        if self.raw.len() >= self.o.block_bytes && !same {
+        if key.len() > MAX_KEY {
+            return invalid(format!(
+                "{:?}…: a key of {} bytes, the format allows {MAX_KEY}",
+                lossy(&key[..64]),
+                key.len()
+            ));
+        }
+        if !same && (self.raw.len() >= self.o.block_bytes || self.block_keys + key.len() > MAX_RAW)
+        {
             self.flush_block()?;
         }
         let s = if self.rows == 0 {
@@ -379,6 +405,7 @@ impl Writer {
             self.prev.clear();
             self.prev.extend_from_slice(key);
             self.keys += 1;
+            self.block_keys += key.len();
         }
         self.prev_commit = commit;
         self.prev_state = state;
@@ -428,6 +455,7 @@ impl Writer {
         self.seg_n += 1;
         self.raw.clear();
         self.rows = 0;
+        self.block_keys = 0;
         if self.seg_n as usize == self.o.seg_blocks {
             self.flush_seg()?;
         }
@@ -439,6 +467,8 @@ impl Writer {
             return Ok(());
         }
         fits("a segment", self.seg.len())?;
+        self.top_keys += self.seg_first.len();
+        fits("the top level's keys", self.top_keys)?;
         let c = self.zc.compress(&self.seg).expect("zstd compression");
         let t = &mut self.top;
         put_varint(t, self.segs.len() as u64);
@@ -652,7 +682,14 @@ impl Index {
                 u32::try_from(varint(b, &mut p)?).or_else(|_| format("index length overflows"))
             };
             let (clen, rlen, n) = (small()?, small()?, small()?);
-            if off < within.start || off + clen as u64 > within.end {
+            if clen as usize > zstd::zstd_safe::compress_bound(MAX_RAW) || rlen as usize > MAX_RAW {
+                return format(format!("index entry of {clen} bytes, {rlen} raw"));
+            }
+            if off < within.start
+                || off
+                    .checked_add(clen as u64)
+                    .is_none_or(|end| end > within.end)
+            {
                 return format(format!(
                     "index entry {off}+{clen} outside its section {within:?}"
                 ));
@@ -667,6 +704,9 @@ impl Index {
             let l = varint(b, &mut p)? as usize;
             if s > prev.len() {
                 return format("index entry shares more than its predecessor's key");
+            }
+            if s + l > MAX_KEY || ix.first.len() + s + l > MAX_RAW {
+                return format("index keys longer than the format allows");
             }
             let start = ix.first.len();
             ix.first.extend_from_within(prev.start..prev.start + s);
@@ -896,9 +936,13 @@ impl Decoder {
         let raw = &self.raw[..];
         let mut p = 0;
         let mut prev_commit = 0;
+        let mut key_bytes = 0;
         for _ in 0..rows {
             let s = varint(raw, &mut p)? as usize;
             let l = varint(raw, &mut p)? as usize;
+            if s.saturating_add(l) > MAX_KEY {
+                return format("a key longer than the format allows");
+            }
             let suffix = take(raw, &mut p, l)?;
             let commit = varint(raw, &mut p)?;
             let Some(&f) = raw.get(p) else {
@@ -941,6 +985,10 @@ impl Decoder {
                 };
                 if !ascends {
                     return format("keys do not ascend");
+                }
+                key_bytes += s + l;
+                if key_bytes > MAX_RAW {
+                    return format("a block's keys longer than the format allows");
                 }
                 out.push_key_prefixed(s, suffix);
             }

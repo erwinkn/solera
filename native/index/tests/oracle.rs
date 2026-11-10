@@ -847,29 +847,61 @@ fn a_block_is_never_decoded_past_what_its_frame_holds() {
     assert!(matches!(got, Err(Error::Format(_))));
 }
 
+fn varint(out: &mut Vec<u8>, mut n: u64) {
+    while n >= 0x80 {
+        out.push((n as u8) | 0x80);
+        n >>= 7;
+    }
+    out.push(n as u8);
+}
+
 #[test]
-fn a_segment_cannot_point_a_block_outside_the_data() {
-    let varint = |out: &mut Vec<u8>, mut n: u64| {
-        while n >= 0x80 {
-            out.push((n as u8) | 0x80);
-            n >>= 7;
-        }
-        out.push(n as u8);
-    };
-    let segment = |clen: u64| {
+fn a_segment_cannot_point_a_block_outside_the_data_or_name_keys_past_the_limit() {
+    let segment = |off: u64, clen: u64, key: usize, data_end: u64| {
         let mut raw = Vec::new();
-        for v in [0, clen, 10, 1] {
+        for v in [off, clen, 10, 1] {
             varint(&mut raw, v);
         }
-        raw.extend_from_slice(&[0, 0, 0, 0, 0, 1, b'k']);
+        raw.extend_from_slice(&[0, 0, 0, 0, 0]);
+        varint(&mut raw, key as u64);
+        raw.extend(std::iter::repeat_n(b'k', key));
         let c = zstd::bulk::compress(&raw, 1).unwrap();
         let check = xxhash_rust::xxh3::xxh3_64(&c) as u32;
-        format::parse_segment(&c, raw.len() as u32, check, 1, 100)
+        format::parse_segment(&c, raw.len() as u32, check, 1, data_end)
     };
-    assert!(segment(100).is_ok());
-    assert!(matches!(segment(101), Err(Error::Format(_))));
-    assert!(matches!(segment(u32::MAX as u64), Err(Error::Format(_))));
-    assert!(matches!(segment(1 << 40), Err(Error::Format(_))));
+    assert!(segment(0, 100, 1, 100).is_ok());
+    assert!(segment(0, 100, format::MAX_KEY, 100).is_ok());
+    for (off, clen, key, end) in [
+        (0, 101, 1, 100),
+        (0, u32::MAX as u64, 1, 100),
+        (0, 1 << 40, 1, 100),
+        (u64::MAX, 1, 1, 100),
+        (0, 1 << 30, 1, 1 << 31),
+        (0, 100, format::MAX_KEY + 1, 100),
+    ] {
+        let got = segment(off, clen, key, end);
+        assert!(
+            matches!(got, Err(Error::Format(_))),
+            "{off} {clen} {key} {end}"
+        );
+    }
+}
+
+#[test]
+fn keys_past_the_limit_are_refused_when_written_and_when_read() {
+    let mut w = Writer::new(WriteOptions::default(), 1, 1, None).unwrap();
+    let long = vec![b'k'; format::MAX_KEY + 1];
+    let got = w.push(&long, 1, Version::Int(1), Version::Absent);
+    assert!(matches!(got, Err(Error::Invalid(_))));
+    let mut raw = Vec::new();
+    varint(&mut raw, 0);
+    varint(&mut raw, long.len() as u64);
+    raw.extend_from_slice(&long);
+    varint(&mut raw, 1);
+    let c = zstd::bulk::compress(&raw, 1).unwrap();
+    let mut run = Run::new();
+    let got = format::Decoder::default().decode(&c, raw.len() as u32, 1, &mut run);
+    assert!(matches!(got, Err(Error::Format(_))));
 }
 
 async fn ix_scan(ix: &ChangeIndex, layers: &[LayerRef]) -> usize {
