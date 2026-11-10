@@ -28,7 +28,7 @@ create_exception!(
     "A merge found entries that do not chain: an entry's replaced version is not the previous entry's new one."
 );
 
-fn rt() -> &'static tokio::runtime::Runtime {
+pub(crate) fn rt() -> &'static tokio::runtime::Runtime {
     static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
     RT.get_or_init(|| {
         tokio::runtime::Builder::new_multi_thread()
@@ -40,7 +40,7 @@ fn rt() -> &'static tokio::runtime::Runtime {
     })
 }
 
-fn err(e: Error) -> PyErr {
+pub(crate) fn err(e: Error) -> PyErr {
     match e {
         Error::Format(m) => FormatError::new_err(m),
         Error::Chain(m) => ChainError::new_err(m),
@@ -49,14 +49,14 @@ fn err(e: Error) -> PyErr {
     }
 }
 
-enum Owned {
+pub(crate) enum Owned {
     Absent,
     Int(u64),
     Str(String),
 }
 
 impl Owned {
-    fn of(v: &Bound<'_, PyAny>) -> PyResult<Owned> {
+    pub(crate) fn of(v: &Bound<'_, PyAny>) -> PyResult<Owned> {
         if v.is_none() {
             Ok(Owned::Absent)
         } else if v.is_instance_of::<PyString>() {
@@ -80,7 +80,7 @@ impl Owned {
     }
 }
 
-fn version<'py>(py: Python<'py>, v: Version<'_>) -> PyResult<Bound<'py, PyAny>> {
+pub(crate) fn version<'py>(py: Python<'py>, v: Version<'_>) -> PyResult<Bound<'py, PyAny>> {
     Ok(match v {
         Version::Absent => py.None().into_bound(py),
         Version::Int(n) => n.into_pyobject(py)?.into_any(),
@@ -91,7 +91,7 @@ fn version<'py>(py: Python<'py>, v: Version<'_>) -> PyResult<Bound<'py, PyAny>> 
     })
 }
 
-fn key<'py>(py: Python<'py>, k: &[u8]) -> Bound<'py, PyAny> {
+pub(crate) fn key<'py>(py: Python<'py>, k: &[u8]) -> Bound<'py, PyAny> {
     match std::str::from_utf8(k) {
         Ok(s) => PyString::new(py, s).into_any(),
         Err(_) => PyBytes::new(py, k).into_any(),
@@ -122,7 +122,7 @@ fn layer_in(d: &Bound<'_, PyDict>) -> PyResult<LayerRef> {
     })
 }
 
-fn layers_in(ls: &Bound<'_, PyAny>) -> PyResult<Vec<LayerRef>> {
+pub(crate) fn layers_in(ls: &Bound<'_, PyAny>) -> PyResult<Vec<LayerRef>> {
     ls.try_iter()?
         .map(|l| layer_in(l?.cast::<PyDict>()?))
         .collect()
@@ -185,7 +185,7 @@ fn page<'py>(py: Python<'py>, p: &ix::Page) -> PyResult<Bound<'py, PyTuple>> {
 /// One output's change index on an object store (`file:///…`, `s3://bucket/prefix`).
 #[pyclass(module = "solera._native", frozen)]
 pub struct ChangeIndex {
-    ix: ix::ChangeIndex,
+    pub(crate) ix: ix::ChangeIndex,
 }
 
 #[pymethods]

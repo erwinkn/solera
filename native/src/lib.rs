@@ -14,7 +14,7 @@ pub mod arrow;
 pub mod delta;
 pub mod entries;
 pub mod error;
-mod index_py;
+pub(crate) mod index_py;
 pub mod layers;
 mod layers_py;
 pub mod rows;
