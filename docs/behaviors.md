@@ -1150,6 +1150,28 @@ A Postgres `numeric` key column would read `1.0` back as `1`: the write
 fails. A `bytes` key fails the write rather than vanishing.
 *From* `versions.md` §4. *Covered* `contract/test_sto.py::test_sto_7_a_byte_valued_key_fails_the_write_instead_of_vanishing`; `contract/test_sto.py::test_sto_7_a_key_its_column_would_change_fails_the_write`; `sdk/test_postgres.py::test_a_key_is_stored_as_itself`.
 
+**STO-8. A program reading a table outside Solera never sees an ordinary output's full run half done.**
+`copy` is on Postgres and holds k1, k2, k3, k4; `items` then removes k3
+and adds k5, and `copy` runs full in batches of 2. Until the run's last
+batch commits, a query outside Solera reads k1 to k4 at their old
+versions; from the switch that follows it on, k1, k2, k4 and k5 at the
+new ones; never a mix. Solera's own readers read the build as it grows,
+under the gate and the hold-back (STA-13). A Solera asset that takes
+`copy` as a `TableRef` and queries it itself reads what outsiders read,
+so the gate holds it until the switch. If publishing fails (a
+constraint only the switch can check, such as a unique index across
+partitions), outsiders keep the old rows and the full run is reported
+failed to publish: its batches all committed, and Solera's own readers
+already read its result. An output's first run is hidden
+the same way: it is a full run of an empty output, its first batch says
+`batch.reset` (SEL-9), and outside, the table is empty until the run
+completes. A full run released after a cancel (STA-13) is published as
+it stands, once no attempt it interrupted is left unrepaired (at the
+asset's next run if the cancel interrupted one). A
+per-key asset's full run (SEL-10) keeps every key readable and changes
+them a batch at a time, outside Solera as inside.
+*From* D211. *Covered* pending in the contract (`tests/contract/entries.py`); model `tracking/test_tracking.py::test_outsiders_read_copys_full_run_all_old_then_all_new`; `tracking/test_tracking.py::test_a_first_run_is_hidden_until_it_completes`; `tracking/test_tracking.py::test_a_release_publishes_the_partial_output`; `tracking/test_tracking.py::test_an_input_taken_by_reference_waits_for_the_switch`; `tracking/test_tracking.py::test_a_late_switch_call_keeps_the_debt`.
+
 ## Contradictions, gaps and open questions
 
 Numbers are stable: entries refer to them.
@@ -1247,8 +1269,8 @@ where the decided one is not built.
 | CLN cleanup, retention | 11 | 10 | 0 | 1 (CLN-11) |
 | ENG crashes, fencing | 16 | 16 | 0 | 0 |
 | DEP deploys, reload | 6 | 6 | 0 | 0 |
-| STO stores | 7 | 7 | 0 | 0 |
-| **Total** | **157** | **152** | **0** | **5** |
+| STO stores | 8 | 7 | 0 | 1 (STO-8) |
+| **Total** | **158** | **152** | **0** | **6** |
 
 ## Appendix: entries to today's mechanisms
 
