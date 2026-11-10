@@ -703,7 +703,7 @@ impl Tracking {
     /// stale is None when an input's status is unknown and none is stale.
     fn stale_graph(
         &self,
-        partitions: Vec<(Vec<Vec<u8>>, Vec<Vec<u8>>)>,
+        partitions: Vec<crate::stale_py::Names>,
     ) -> PyResult<Vec<(Option<bool>, bool)>> {
         guard(|| crate::stale_py::graph(&self.state, partitions))
     }

@@ -240,10 +240,13 @@ pub(crate) fn complete(
     py.detach(|| rt().block_on(ask.complete(ixs))).map_err(err)
 }
 
+/// One partition's input edges and outputs.
+pub(crate) type Names = (Vec<Vec<u8>>, Vec<Vec<u8>>);
+
 /// Per partition `(inputs, outputs)`: `(stale: bool | None, upstream_stale: bool)`.
 pub(crate) fn graph(
     state: &RwLock<tr::Tracking>,
-    partitions: Vec<(Vec<Vec<u8>>, Vec<Vec<u8>>)>,
+    partitions: Vec<Names>,
 ) -> PyResult<Vec<(Option<bool>, bool)>> {
     let parts: Vec<Partition> = partitions
         .into_iter()

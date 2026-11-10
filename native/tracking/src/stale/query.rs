@@ -78,7 +78,10 @@ impl Tracking {
 /// Owed counts by class (added, updated, removed), computed on request and
 /// kept until the edge's progress, its conditions or its upstream's head move.
 #[derive(Default)]
-pub struct Counts(Mutex<HashMap<Id, (u64, u64, [u64; 4])>>);
+pub struct Counts(Mutex<HashMap<Id, Counted>>);
+
+/// Counts by class, with the edge's generation and the head they hold for.
+type Counted = (u64, u64, [u64; 4]);
 
 impl Counts {
     pub async fn get(&self, ask: &Ask, ixs: &dyn Indexes) -> Result<[u64; 4]> {

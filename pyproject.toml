@@ -43,6 +43,8 @@ cache-keys = [
     { file = "native/Cargo.toml" },
     { file = "native/Cargo.lock" },
     { file = "native/src/**/*.rs" },
+    { file = "native/*/Cargo.toml" },
+    { file = "native/*/src/**/*.rs" },
 ]
 
 # One distribution ("solera") holds four Python packages under `python/` —
