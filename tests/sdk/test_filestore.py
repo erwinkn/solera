@@ -210,6 +210,21 @@ async def test_a_partition_set_is_its_element_list(store):
     assert await store.load(patched.ref, list, None) == ["Richmond", "Hobart"]
 
 
+async def test_a_partition_sets_elements_read_at_the_empty_version(store):
+    """docs/stores.md, "What a write and a load say": membership is all an
+    element holds, so each element present reads at the empty version, one
+    asked for and absent at None; the set object is at the version that
+    wrote it."""
+
+    out = DynamicPartitions("sites")
+    written = await store.store(["Richmond", "Perth"], None, context(out, generation=5))
+    patched = await store.store(Patch(["Hobart"]), written.ref, context(out, generation=9))
+    whole = await store.read(patched.ref, list, None)
+    assert (whole.versions, whole.version) == ({"Richmond": "", "Perth": "", "Hobart": ""}, 9)
+    asked = await store.read(patched.ref, list, Keys({"Perth": 5, "Darwin": 7}))
+    assert (asked.value, asked.versions) == (["Perth"], {"Perth": "", "Darwin": None})
+
+
 async def test_a_renamed_output_keeps_its_objects(store):
     old = Output("old", keyed=True)
     written = await store.store({"a": 1}, None, context(old, generation=1))

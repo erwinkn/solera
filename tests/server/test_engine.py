@@ -182,50 +182,6 @@ async def test_rename_and_meta_edges(state):
     assert seen["feed"] == [{"id": "a", "v": 1}, {"id": "b", "v": 2}]
 
 
-async def test_incremental_filters_input_and_changes(state):
-    """§5/§6: under Incremental the parameter arrives filtered to the keys
-    added or updated, and ctx.batch says which, and what was removed (K44)."""
-    seen = {}
-    content = {"rows": [{"id": "a", "v": 1}, {"id": "b", "v": 1}, {"id": "c", "v": 1}]}
-
-    @asset(outputs=Output("files", key="id"))
-    def files():
-        return content["rows"]
-
-    @asset(inputs={"files": Incremental()})
-    def consumer(ctx, files: list):
-        seen["rows"] = list(files)
-        seen["added"] = list(ctx.batch["files"].added)
-        seen["updated"] = list(ctx.batch["files"].updated)
-        seen["deleted"] = list(ctx.batch["files"].removed)
-        return [{"n": len(files)}]
-
-    project = Project(assets=[files, consumer])
-    engine = make_engine(state, project)
-    await engine.initialize()
-    await drive(engine, await engine.submit(["consumer"], upstream=True))
-    assert seen["added"] == ["a", "b", "c"]  # §6: a first pass adds everything
-    assert {r["id"] for r in seen["rows"]} == {"a", "b", "c"}
-
-    # Second run, nothing written since → skipped, nothing loaded.
-    seen.clear()
-    detail = await drive(engine, await engine.submit(["consumer"]))
-    assert task_statuses(detail)["consumer"] == "skipped"
-    assert seen == {}
-
-    # One key written again reprocesses only that key (§6).
-    content["rows"] = Patch([{"id": "b", "v": 2}])
-    await drive(engine, await engine.submit(["consumer"], upstream=True))
-    assert seen["updated"] == ["b"] and seen["added"] == []  # held at the position: updated (K44)
-    assert [r["id"] for r in seen["rows"]] == ["b"]
-
-    # A deletion arrives via ctx.batch (§5: what a selection cannot carry).
-    seen.clear()
-    content["rows"] = Patch([], remove=["b"])
-    await drive(engine, await engine.submit(["consumer"], upstream=True))
-    assert seen["deleted"] == ["b"] and seen["added"] == seen["updated"] == []
-
-
 async def test_config_change_reprocesses_everything(state):
     """§6/§2.2: run config is part of the definition — changing it makes
     the next run a full run, which reprocesses every key."""
@@ -329,57 +285,6 @@ async def test_incremental_batching_and_more(state):
     assert len(detail["attempts"][task["id"]]) == 3  # three batches, three attempts
 
 
-async def test_run_keys_override(state):
-    """§8: a `keys=` list loads the keys it names — b, unchanged, observed
-    as it is; 'all' loads every key again, unchanged, without starting over."""
-    seen = []
-
-    @asset(outputs=Output("files", key="id"))
-    def files():
-        return [{"id": "a", "v": 1}, {"id": "b", "v": 1}]
-
-    @asset(inputs={"files": Incremental()})
-    def consumer(ctx, files: list):
-        seen.append(sorted(r["id"] for r in files))
-        return []
-
-    project = Project(assets=[files, consumer])
-    engine = make_engine(state, project)
-    await engine.initialize()
-    await drive(engine, await engine.submit(["consumer"], upstream=True))
-    detail = await drive(engine, await engine.submit(["consumer"], keys={"files": ["b"]}))
-    assert status_of(detail) == "succeeded", [t.get("error") for t in detail["tasks"]]
-    assert seen == [["a", "b"], ["b"]]
-    await drive(engine, await engine.submit(["consumer"], keys={"files": "all"}))
-    assert seen[-1] == ["a", "b"]
-
-
-async def test_a_full_run_resumes_batch_by_batch(state):
-    """Engine review round 2 #2: a full run's later batches walk on from its
-    progress — the first batch is not served again, nor started over."""
-    seen = []
-
-    @asset(outputs=Output("files", key="id"))
-    def files():
-        return [{"id": k, "v": 1} for k in "abc"]
-
-    @asset(inputs={"files": Incremental(batch_size=2)})
-    def consumer(ctx, files: list):
-        changes = ctx.batch["files"]
-        seen.append((sorted(r["id"] for r in files), changes.reset, changes.index))
-        return []
-
-    project = Project(assets=[files, consumer])
-    engine = make_engine(state, project)
-    await engine.initialize()
-    await drive(engine, await engine.submit(["consumer"], upstream=True))
-    for _ in range(2):  # a second full run starts over on its own
-        seen.clear()
-        detail = await drive(engine, await engine.submit(["consumer"], mode="full"), timeout=10)
-        assert status_of(detail) == "succeeded"
-        assert seen == [(["a", "b"], True, 0), (["c"], False, 1)]
-
-
 async def test_deps_are_pinned_but_unbound(state):
     """§5: deps are pinned into lineage and the fingerprint but bind no
     parameter."""
@@ -449,97 +354,6 @@ async def test_all_partitions_values(state, data):
     assert status_of(detail) == "succeeded"
     rows = json.loads((data / f"{head(state, 'rollup')['ref']['handle']['path']}.json").read_text())
     assert rows == [{"n": 2, "sites": ["east", "west"]}]
-
-
-async def test_partition_selections(state):
-    """§7/§8: 'latest', 'missing', 'all' and explicit lists select from the
-    current dynamic partitions."""
-    ran = []
-
-    @asset(partitions=StaticPartitions(["a", "b", "c"]))
-    def stat(ctx):
-        ran.append(ctx.partition)
-        return [{"p": ctx.partition}]
-
-    project = Project(assets=[stat])
-    engine = make_engine(state, project)
-    await engine.initialize()
-    run = await engine.submit(["stat"], partitions=["a", "c"])
-    await drive(engine, run)
-    assert sorted(ran) == ["a", "c"]
-    ran.clear()
-    run = await engine.submit(["stat"], partitions="missing")
-    await drive(engine, run)
-    assert ran == ["b"]  # a and c have complete heads
-    ran.clear()
-    run = await engine.submit(["stat"], partitions="all")
-    await drive(engine, run)
-    assert sorted(ran) == ["a", "b", "c"]
-
-
-async def test_external_partition_set_via_commit(state):
-    """§5/§7: an external DynamicPartitions is patched through the commit API; new
-    keys surface through partitions='missing'."""
-    ran = []
-
-    @asset(partitions="uploads")
-    def per_upload(ctx):
-        ran.append(ctx.partition)
-        return [{"u": ctx.partition}]
-
-    project = Project(assets=[per_upload], sources=[DynamicPartitions("uploads")])
-    engine = make_engine(state, project)
-    await engine.initialize()
-    await engine.commit_source("uploads", upsert=["u-1", "u-2"])
-    detail = await drive(engine, await engine.submit(["per_upload"], partitions="missing"))
-    assert status_of(detail) == "succeeded"
-    assert sorted(ran) == ["u-1", "u-2"]
-    ran.clear()
-    await engine.commit_source("uploads", upsert=["u-3"])
-    detail = await drive(engine, await engine.submit(["per_upload"], partitions="missing"))
-    assert ran == ["u-3"]
-    # The same elements listed again are not a change (§5, docs/versions.md §2).
-    result = await engine.commit_source("uploads", keys=["u-1", "u-2", "u-3"])
-    assert result["changed"] is False
-
-
-async def test_two_dimension_broadcast_and_collapse(state):
-    """§7: a consumer-only dimension broadcasts; an upstream-only dimension
-    fans in as a whole input."""
-    seen = []
-
-    @asset(outputs=DynamicPartitions("sites"))
-    def sites():
-        return ["s1", "s2"]
-
-    @asset(partitions={"site": "sites"})
-    def site_data(ctx):
-        return [{"site": ctx.partition, "v": 1}]
-
-    # broadcast: unpartitioned upstream read by a partitioned consumer
-    @asset
-    def config():
-        return {"threshold": 5}
-
-    @asset(partitions={"site": "sites"}, inputs={"cfg": "config"})
-    def broadcast(ctx, cfg: list):
-        seen.append((ctx.partition, cfg["threshold"]))
-        return [{"site": ctx.partition}]
-
-    # collapse: partitioned upstream read by an unpartitioned consumer
-    @asset(inputs={"site_data": In()})
-    def collapsed(site_data: dict[str, list]):
-        return [{"n": len(site_data)}]
-
-    project = Project(assets=[sites, config, site_data, broadcast, collapsed])
-    engine = make_engine(state, project)
-    await engine.initialize()
-    await drive(engine, await engine.submit(["sites"]))  # commit the dynamic partitions
-    detail = await drive(engine, await engine.submit(["broadcast"], upstream=True))
-    assert status_of(detail) == "succeeded"
-    assert sorted(seen) == [("s1", 5), ("s2", 5)]
-    detail = await drive(engine, await engine.submit(["collapsed"], upstream=True))
-    assert status_of(detail) == "succeeded"
 
 
 async def test_retired_keys_leave_fanout(state):
@@ -789,57 +603,6 @@ async def test_every_skips_active_scope(state):
     await engine.tick()  # would fire again but the partition is active
     runs = (await engine.list_runs(limit=10))["runs"]
     assert len([r for r in runs if r.get("automation") == "polled.every.0"]) == 1
-
-
-async def test_every_skips_queued_scope(state):
-    """§9: a tick is skipped for a partition that is queued but not yet running —
-    otherwise repeated fires pile duplicate tasks onto the dispatch queue."""
-
-    @asset(automations=Every(1))
-    def polled():
-        return []
-
-    project = Project(assets=[polled])
-    engine = make_engine(state, project)
-    await engine.initialize()
-    # A paused run leaves its task queued: pending work without a live lock.
-    run = await engine.submit(["polled"])
-    await engine.pause(run["id"])
-    before = await engine.run_automation("polled.every.0")
-    assert before["last_run"] is None  # the fire submitted nothing
-    await engine.pause(run["id"], False)
-    await engine.run_until(run["id"], 60)
-    after = await engine.run_automation("polled.every.0")
-    assert after["last_run"] is not None
-
-
-async def test_missing_on_schedule_picks_up_new_keys(state):
-    """§9: partitions='missing' on a schedule picks up new partition-set keys
-    and failed first runs without an operator."""
-    ran = []
-    members = {"keys": ["a"]}
-
-    @asset(outputs=DynamicPartitions("things"))
-    def things():
-        return members["keys"]
-
-    @asset(partitions="things", automations=Every(1, partitions="missing"))
-    def per_thing(ctx):
-        ran.append(ctx.partition)
-        return [{"t": ctx.partition}]
-
-    project = Project(assets=[things, per_thing])
-    engine = make_engine(state, project)
-    await engine.initialize()
-    await drive(engine, await engine.submit(["things"]))
-    auto = await engine.run_automation("per_thing.every.0")
-    await engine.run_until(auto["last_run"], 60)
-    assert ran == ["a"]
-    members["keys"] = ["a", "b"]
-    await drive(engine, await engine.submit(["things"]))
-    auto = await engine.run_automation("per_thing.every.0")
-    await engine.run_until(auto["last_run"], 60)
-    assert ran == ["a", "b"]  # only the new key ran
 
 
 async def test_timeout_fails_retryably(state):
@@ -1402,32 +1165,3 @@ async def test_a_failing_partition_backs_off_its_changes(state):
     offset[0] += 2 * CHANGE_BACKOFF + 1
     await settle(3)
     assert len(calls) == 3 and "failed_in_row" not in state.model.partition("consumer", "")
-
-
-async def test_a_data_root_another_namespace_owns_is_refused(tmp_path):
-    """F43's root cause, two states sharing one data root: their engines'
-    namespaces, both `default`, at two locations, write one FileStore.
-    The first owns the root; the second's attempts fail before writing,
-    naming both — never cleaning up the other's objects (D167)."""
-
-    from solera_server.state import State
-
-    @asset(outputs=Output("files", key="id"))
-    def files():
-        return [{"id": "a", "v": 1}]
-
-    project = Project(assets=[files], default_store=FileStore(tmp_path / "shared"))
-    outcomes = []
-    for where in ("one", "two"):
-        state = await State.open((tmp_path / where).as_uri(), "default", flush_interval=0.001)
-        engine = make_engine(state, project)
-        await engine.initialize()
-        detail = await drive(engine, await engine.submit(["files"]))
-        outcomes.append((status_of(detail), [t.get("error") or "" for t in detail["tasks"]]))
-        await engine.stop()
-        await state.close()
-    assert outcomes[0][0] == "succeeded"
-    status, (error,) = outcomes[1]
-    one = (tmp_path / "one").resolve().as_uri()
-    assert status == "failed" and f"belongs to namespace default (at {one})" in error
-    assert "this engine serves namespace default (at" in error

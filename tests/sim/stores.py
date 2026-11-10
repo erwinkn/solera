@@ -16,7 +16,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from solera.sdk import Ref
-from solera.stores import MISSING, Commits, KeyedWrite, Keys, StoreError, Written, by_key_type, takes
+from solera.stores import MISSING, Commits, KeyedWrite, Keys, Read, StoreError, Written, by_key_type, takes
 
 from .core import actor
 
@@ -27,7 +27,7 @@ class Database:
 
     tables: dict[str, dict[str, list[tuple]]] = field(
         default_factory=dict
-    )  # table -> part -> [(k, commit, row)]
+    )  # table -> part -> [(k, commit, row, version)]
     fences: dict[tuple[str, str], tuple[int, str]] = field(default_factory=dict)
     # (table, partition) -> the generation of the last write transaction that committed
     # there: what a read reports with its rows (docs/stores.md, "What a read sees")
@@ -112,6 +112,7 @@ class TableStore:
         table = self._table(out, prior, context.home)  # where the content is, even when it starts over
         reset = getattr(context, "reset", False)
         base = None if reset else prior  # what the write builds on
+        version = context.generation
 
         def body(box):
             rows = box["rows"]
@@ -121,7 +122,7 @@ class TableStore:
                     rows.clear()
                 else:
                     rows[:] = [r for r in rows if r[1] != context.commit_number]
-                rows.extend((None, context.commit_number, dict(r)) for r in commit_number)
+                rows.extend((None, context.commit_number, dict(r), version) for r in commit_number)
                 return Written(
                     Ref(
                         out.name,
@@ -137,10 +138,10 @@ class TableStore:
                 keys = {k for k, _ in chunk}
                 if not keyed.reset:
                     rows[:] = [r for r in rows if r[0] not in keys]
-                rows.extend((k, None, dict(r)) for k, group in chunk for r in group)
+                rows.extend((k, None, dict(r), version) for k, group in chunk for r in group)
             if keyed.removes:
                 rows[:] = [r for r in rows if r[0] not in keyed.removes]
-            return Written(Ref(out.name, "", {"table": table}, context.partition))
+            return Written(Ref(out.name, "", {"table": table}, context.partition), changed=keyed.changed())
 
         return await self._transaction("store", context, prior, body)
 
@@ -184,6 +185,12 @@ class TableStore:
         return await self.load(ref, t, selection), self.db.written.get((table, ref.partition))
 
     async def load(self, ref, t, selection) -> list[dict]:
+        return (await self.read(ref, t, selection)).value
+
+    async def read(self, ref, t, selection) -> Read:
+        """`load`, and the version each key was read at — None for a planned
+        key the table does not hold — or an unkeyed read's newest."""
+
         table = (ref.handle or {}).get("table") or f"rows_{ref.output}"
         rows = self.db.tables.get(table, {}).get(ref.partition, [])
         if isinstance(selection, Keys):
@@ -192,9 +199,14 @@ class TableStore:
             rows = [r for r in rows if r[1] is not None and selection.lo <= r[1] <= selection.hi]
         elif (ref.handle or {}).get("commit_number") is not None:
             rows = [r for r in rows if r[1] is None or r[1] <= ref.handle["commit_number"]]
+        keyed = (ref.handle or {}).get("commit_number") is None  # this store's unkeyed outputs are commits
+        versions = {r[0]: r[3] for r in rows} if keyed else None
+        if isinstance(selection, Keys):
+            versions = {k: versions.get(k) for k in selection.generations}
+        newest = None if keyed else max((r[3] for r in rows if r[3] is not None), default=None)
         if by_key_type(t) is not MISSING:  # dict[str, T]: each key's group (a per-key page)
             groups: dict[str, list] = {}
-            for k, _, row in rows:
+            for k, _, row, _ in rows:
                 groups.setdefault(k, []).append(dict(row))
-            return groups
-        return [dict(r[2]) for r in rows]
+            return Read(groups, versions)
+        return Read([dict(r[2]) for r in rows], versions, newest)
