@@ -511,8 +511,14 @@ these additions:
   of §7 stay with the engine.
 - **Points stay in memory** (a sorted map per edge). Spilling past a few
   thousand is not built: not needed at the measured sizes.
-- **Clears are not built yet** (§10, form (a)): the planner needs each
-  output's clear commits, and candidates across a clear come from two scans.
+- **Clears** (§10, form (a)): the index answers every query across a
+  clear, so the candidate table is unchanged. At commit, a batch holds back
+  every key it loaded at another version than it planned while its input's
+  output is mid full run (`Output.full_run`, B4) or when a clear came in
+  since the batch's head (the layers' `clears`): the key keeps what it held,
+  even if it also failed, and stays owed. `Ops.held_back` names those keys
+  for the key outcomes (B6). The gate that holds readers of an incomplete
+  upstream is the engine's (B5).
 
 ## 6. Staleness kept exact by propagation
 
