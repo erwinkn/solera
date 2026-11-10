@@ -387,6 +387,75 @@ class Solera:
         await self._open_state()
         await self._serve()
 
+    # -- CHG+RST+DEP -------------------------------------------------------------
+
+    def _worker_transport(self):
+        """The engine's routes as a worker in this process reaches them."""
+
+        from solera_server.api import create_app
+        from solera_worker.channel import LocalTransport
+
+        token = self.client.headers["Authorization"].removeprefix("Bearer ")
+        app = create_app(engine=self.engine, token=token)
+        app.state.engine = self.engine
+        return LocalTransport(app, token)
+
+    async def work(self, pool: str, project: Project, timeout: float = 10) -> int:
+        """A pool worker whose code is `project` (its deploy, which need not
+        be the served one) takes the oldest attempt waiting on `pool` and
+        runs it, as `solera worker pool` does in each attempt's process:
+        its exit code."""
+
+        from solera_worker.channel import AttemptChannel
+        from solera_worker.worker import run_attempt
+
+        deadline = time.monotonic() + timeout
+        while not (stages := (await self.get(f"/pools/{pool}/work", wait=0, host="contract"))["work"]):
+            assert time.monotonic() < deadline, f"no attempt waits on pool {pool!r}"
+            await self.settle(0.02)
+        stage = stages[0]
+        channel = AttemptChannel(self._worker_transport(), self.project.manifest["name"], stage["attempt"])
+        return await run_attempt(
+            stage["objects"], stage["attempt"], project, run=stage["run"], channel=channel, pool=True
+        )
+
+    async def sensor_host(self, project: Project, executor: str = "local", **kw) -> int:
+        """A sensor host whose code is `project` serves `executor`'s sensors
+        until it stops, as `solera worker sensors` does: its exit code.
+        `kw` are the host's settings (`stale_wait=`, `max_ticks=`)."""
+
+        from solera_worker.channel import SensorChannel
+        from solera_worker.sensors import run_sensor_host
+
+        channel = SensorChannel(self._worker_transport(), self.project.manifest["name"])
+        try:
+            return await run_sensor_host(channel, project, executor, host="contract", **kw)
+        finally:
+            await channel.close()
+
+    def reloading(self, entry: str, *, poll: float = 0.05, quiet: float = 0.3):
+        """`solera serve --reload` of the project at `entry` (`path.py:name`),
+        as `async with`: it is deployed, then served again in place each
+        time the code it runs changes, until the block ends."""
+
+        import contextlib
+
+        from solera_server.reloading import reload
+        from solera_worker.worker import load_project
+
+        @contextlib.asynccontextmanager
+        async def served():
+            await self.deploy(project := load_project(entry))
+            watcher = asyncio.create_task(reload(self.engine, entry, project.files(), poll=poll, quiet=quiet))
+            try:
+                yield project
+            finally:
+                watcher.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await watcher
+
+        return served()
+
 
 # -- the outside world, as a user's project sees it ---------------------------
 

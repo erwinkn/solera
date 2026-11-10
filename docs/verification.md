@@ -282,7 +282,7 @@ with Hypothesis drawing the inputs (in CI, a few seconds each):
   evicted within the disk budget; a resolved delta is installed at its
   commit without a GET; two indexes sharing the cache never read each
   other's files; a cold index is declined and filled.
-- **Key patterns** (`tests/sdk/test_patterns.py`): every glob matches as
+- **Key patterns** (`tests/contract/test_chg.py`, CHG-12; `tests/sdk/test_patterns.py`): every glob matches as
   an independent reference matcher does (`**/` takes whole directories or
   none, `*` and `?` stay within one, `[`, `\` and newlines are literal),
   and `include`/`exclude` combine as documented.
