@@ -555,9 +555,9 @@ class PostgresStore:
         run's first write (`reset`) opens the build of its run (its own
         version), unless that run was published already: the same write
         delivered again then rewrites the same rows in place. Any other write
-        goes to the build `build_run` names while the partition registers
-        it, else in place. Every write keeps the build `build_run` names and
-        its own, and unregisters the partition's others: no run in the log
+        goes to the first build the log names (`build_run`, then
+        `owed_run`) that the partition registers, else in place. Every write
+        keeps the builds the log names and its own, and unregisters the partition's others: no run in the log
         names them, and the check has locked their writers out."""
 
         at = _Target(table, context.partition, builds=list(checked["builds"]) if checked else [])
@@ -566,11 +566,12 @@ class PostgresStore:
         if checked is None:
             raise StoreError(f"{context.output.name}: a write that builds needs its attempt's version")
         published, builds = checked["published"], at.builds
+        named = [run for run in (context.build_run, context.owed_run) if run is not None]
         if context.reset and (published is None or context.generation > published):
             at.run, at.opens = context.generation, context.generation not in builds
-        elif not context.reset and context.build_run in builds:
-            at.run = context.build_run
-        keep = {context.build_run, at.run}
+        elif not context.reset:
+            at.run = next((run for run in named if run in builds), None)
+        keep = {*named, at.run}
         at.builds = [b for b in builds if b in keep] + ([at.run] if at.opens else [])
         at.retired = any(b not in keep for b in builds)
         return at
@@ -698,7 +699,7 @@ class PostgresStore:
     async def written_at(self, versions, prior: Ref | None, context: WriteContext):
         """The keys the partition holds at any of `versions` — attempts that
         wrote and ended without a commit — where the log points (the build
-        `context.build_run` names while it is open, else the user's table),
+        a write of `context` would go to, else the user's table),
         sorted by their bytes, a chunk at a time (D196, rule 2). It first
         takes the version check for `context`, the attempt that repairs,
         in a transaction of its own that it reads in: no dead or late writer
@@ -716,10 +717,11 @@ class PostgresStore:
             checked, state = self._begin(conn, table, context, write=False)
             if output.key is None or not state["present"]:
                 return spool
-            builds = checked["builds"] if checked else []
-            run = context.build_run if context.builds and context.build_run in builds else None
+            at = self._aim(table, context, checked)
             source = (
-                table if run is None else _qname(BUILD_SCHEMA, _build_name(table, context.partition, run))
+                table
+                if at.run is None or at.opens
+                else _qname(BUILD_SCHEMA, _build_name(table, context.partition, at.run))
             )
             column = output.config.get("partition_column")
             return self._held(
@@ -846,11 +848,11 @@ class PostgresStore:
                 write = KeyedWrite.of(self, write, output, prior)
                 changed = write.changed()
                 if (
-                    prior is None
-                    and at.run is None
-                    and not (write.reset or write.upserts or write.removes or len(write.prepared.rows))
+                    at.run is None
+                    and not state["present"]
+                    and not (write.upserts or write.removes or len(write.prepared.rows))
                 ):
-                    return Written(None, changed=changed)  # a first write of nothing: no table to make
+                    return Written(None, changed=changed)  # a write of nothing and no table: none to make
                 self._apply_keyed(cur, output, write, context, at, state, slice_where)
             elif isinstance(write, Patch):
                 if not self._apply_commit(
