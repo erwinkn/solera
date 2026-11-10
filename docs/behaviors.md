@@ -828,6 +828,8 @@ live.
 *From* D167; F43. *Covered* `contract/test_cln.py::test_cln_9_a_store_root_belongs_to_one_namespace`; `server/test_cli.py::test_adopt_store_moves_a_root_once_its_namespace_is_retired`; `test_demo_e2e.py::test_the_demo_keeps_its_data_beside_its_state`.
 
 **CLN-10. Sensor tick rows last a day; a tick that committed lasts as long as its run.**
+A row lasts at least a day: rows written together go together, once the
+newest of them is a day old.
 *From* `per-key-processing.md` §12. *Covered* `contract/test_cln.py::test_cln_10_sensor_tick_rows_last_a_day`; `contract/test_cln.py::test_cln_10_a_tick_that_committed_lasts_as_long_as_its_run`; `contract/test_cln.py::test_cln_10_a_tick_that_asked_for_a_run_lasts_with_it`; `server/test_sensors.py::test_tick_rows_are_written_with_the_history_and_expire_after_a_day`.
 
 **CLN-11. A paused consumer never loses its place to retention.**
