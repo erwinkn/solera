@@ -614,8 +614,10 @@ async def test_eng_8_a_dead_writers_rows_are_repaired_by_the_next_attempt_and_no
     run = await solera.submit("items")
     await killed_after_writing(solera, table)
     assert (await solera.wait(run))["request"]["status"] == "failed"
-    await solera.settle(1.0)
-    assert [r for r in await solera.runs() if r["id"] not in (first, run["id"])] == []  # no repair clock
+    marked = (await solera.run("marker"))["request"]["id"]  # a barrier: the engine has worked on since
+    assert [
+        r for r in await solera.runs() if r["id"] not in (first, run["id"], marked)
+    ] == []  # no repair clock
     await solera.run("copy", timeout=5)  # its reader does not wait
     assert await solera.rows("copy") == {"a": "1", "b": "1"}
     assert in_table(table) == {"a": ["1"], "b": ["1"], "c": ["1"]}
@@ -673,10 +675,15 @@ async def test_eng_17_a_version_of_an_attempt_still_live_is_no_anomaly(solera, t
         await solera.until(table.landed.is_set)
         reader = await solera.submit("copy")
 
-        async def read():
-            return (await solera.get(f"/runs/{reader['id']}"))["request"]["status"] == "succeeded"
+        async def decided():  # it ran, or it says why it waits
+            detail = await solera.get(f"/runs/{reader['id']}")
+            return detail["request"]["status"] in ("succeeded", "failed") or any(
+                t.get("held") for t in detail["tasks"]
+            )
 
-        await solera.until(read, timeout=5)  # it does not wait for the writer
+        await solera.until(decided)
+        detail = await solera.get(f"/runs/{reader['id']}")
+        assert detail["request"]["status"] == "succeeded", detail["tasks"]  # it does not wait for the writer
     finally:
         go.set()
     assert received[-1] == (([], ["k2"], []), {"k2": "6"})

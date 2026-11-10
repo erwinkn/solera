@@ -930,7 +930,7 @@ override it. Added back within the week, its new data stays. An attempt
 in flight from before the removal holds the cleanup back. A removed
 dynamic partition's data follows the same window (PAR-6). A custom store
 the project no longer declares leaves the cleanup stuck, saying so.
-*From* D145, D96, D144 (2), D183, D201. *Today* a reader pinned before the removal holds it back, and a removed dynamic partition's data is never cleaned up. *Covered* `contract/test_cln.py::test_cln_6_a_removed_outputs_data_goes_after_a_week_and_one_added_back_keeps_its_new_data`; `contract/test_cln.py::test_cln_6_an_attempt_in_flight_from_before_the_move_holds_the_cleanup_back`; `contract/test_cln.py::test_cln_6_a_removed_dynamic_partitions_data_goes_after_a_week`; `contract/test_cln.py::test_cln_6_a_custom_store_the_project_no_longer_declares_leaves_the_cleanup_stuck`; `server/test_retirement.py::test_a_removed_outputs_files_go`; `server/test_retirement.py::test_a_moved_outputs_old_files_go_and_its_new_ones_stay`; `server/test_retirement.py::test_the_grace_period_is_the_stores_unless_the_output_says`; `server/test_retirement.py::test_a_store_that_says_nothing_keeps_a_removed_output_a_week`; `server/test_retirement.py::test_an_output_added_back_within_the_grace_period_keeps_its_new_data`; `server/test_retirement.py::test_a_custom_store_the_project_no_longer_declares_leaves_the_cleanup_stuck`.
+*From* D145, D96, D144 (2), D183, D201. *Today* a reader pinned before the removal holds back every removal of that deploy, whatever it reads, and a removed dynamic partition's data is never cleaned up. *Covered* `contract/test_cln.py::test_cln_6_a_removed_outputs_data_goes_after_a_week_and_one_added_back_keeps_its_new_data`; `contract/test_cln.py::test_cln_6_an_attempt_in_flight_from_before_the_move_holds_the_cleanup_back`; `contract/test_cln.py::test_cln_6_a_removed_dynamic_partitions_data_goes_after_a_week`; `contract/test_cln.py::test_cln_6_a_custom_store_the_project_no_longer_declares_leaves_the_cleanup_stuck`; `server/test_retirement.py::test_a_removed_outputs_files_go`; `server/test_retirement.py::test_a_moved_outputs_old_files_go_and_its_new_ones_stay`; `server/test_retirement.py::test_the_grace_period_is_the_stores_unless_the_output_says`; `server/test_retirement.py::test_a_store_that_says_nothing_keeps_a_removed_output_a_week`; `server/test_retirement.py::test_an_output_added_back_within_the_grace_period_keeps_its_new_data`; `server/test_retirement.py::test_a_custom_store_the_project_no_longer_declares_leaves_the_cleanup_stuck`.
 
 **CLN-7. Cleanup runs in the background; a run is settled before its cleanup is.**
 *From* D144 (2). *Covered* `contract/test_cln.py::test_cln_7_a_run_is_settled_before_its_cleanup_is`; `server/test_collection.py::test_a_run_is_settled_before_its_cleanup_has_run`.
@@ -965,13 +965,13 @@ When that attempt settles, the file goes.
 is rewritten daily: past a set multiple of `items`' live keys, an alarm
 names `copy` and its place. Releasing that place lets the history go, and
 `copy` then owes a full run.
-*From* D192 (review F5). *Covered* `contract/test_cln.py::test_cln_13_an_output_whose_history_outgrows_its_live_keys_raises_an_alarm_naming_what_holds_it`.
+*From* D192 (review F5). *Covered* `contract/test_cln.py::test_cln_13_an_output_whose_history_outgrows_its_live_keys_raises_an_alarm_naming_what_holds_it`. The command that releases a consumer's place, and the full run that consumer then owes, have no public name yet, so they are tested once the core names them.
 
 **CLN-14. An append-only output keeps everything unless it opts into a retention; a consumer behind the retention edge is warned, then owes a full run over what remains.**
 `events` keeps 30 days; `digest` reads it incrementally and is paused 40
 days: before its place falls behind, it is marked "behind retention"; its
 next run is a full run over the 30 days `events` still holds.
-*From* D198 (Q7). *Covered* `contract/test_cln.py::test_cln_14_an_append_only_output_keeps_everything_by_default`.
+*From* D198 (Q7). *Covered* `contract/test_cln.py::test_cln_14_an_append_only_output_keeps_everything_by_default`. An output's retention opt-in, the "behind retention" warning and the full run over what remains have no public name yet, so they are tested once the core names them.
 
 ## ENG — engine crashes, restarts, zombies and fencing
 
@@ -1107,12 +1107,12 @@ No store kinds. A write returns the keys it wrote and removed; a load
 returns the keys and versions it actually loaded, absent included. A store
 that writes in place keeps one version check per partition inside each
 write transaction (STO-4). Registration refuses a store missing a method.
-*From* D184, D196. *Today* a store is immutable or fenced, and registration refuses another kind (`sdk/test_store_conformance.py::test_shipped_stores_conform`). *Covered* `contract/test_sto.py::test_sto_1_a_store_declares_no_kind`; `contract/test_sto.py::test_sto_1_registration_refuses_a_store_missing_a_method`.
+*From* D184, D196. *Today* a store is immutable or fenced, and registration refuses another kind (`sdk/test_store_conformance.py::test_shipped_stores_conform`). *Covered* `contract/test_sto.py::test_sto_1_a_store_declares_no_kind`; `contract/test_sto.py::test_sto_1_registration_refuses_a_store_missing_a_method`. What a write returns (the keys it wrote and removed) and what a load returns (the keys and versions it loaded) have no public name yet, so they are tested once the core names them.
 
 **STO-2. A load says the versions it read; a store that names objects by version loads exactly the planned ones.**
 g5 writes {a:1}, a reader plans it; g9 writes {a:2}: the reader still
 loads a:1, and says it loaded g5.
-*From* D184; `stores.md`. *Covered* `contract/test_sto.py::test_sto_2_a_store_that_names_objects_by_version_loads_exactly_the_planned_ones`; sim `committed_keys_are_readable`.
+*From* D184; `stores.md`. *Covered* `contract/test_sto.py::test_sto_2_a_store_that_names_objects_by_version_loads_exactly_the_planned_ones`; sim `committed_keys_are_readable`. The versions a load says it read have no public name yet, so they are tested once the core names them.
 
 **STO-3. A key loaded at another version than planned is processed as loaded; nothing replans.**
 `items` is on Postgres; `tally`'s batch plans k1@4 and k2@2, and `items`

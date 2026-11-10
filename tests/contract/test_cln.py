@@ -1,8 +1,8 @@
 """CLN: cleanup and retention (docs/behaviors.md)."""
 
 import asyncio
+import datetime as dt
 import importlib.util
-import json
 import shutil
 
 import pytest
@@ -24,7 +24,15 @@ from solera.stores import FileStore, Keys, Patch
 from tests.contract import test_sto as sto
 from tests.contract.harness import Refused, Solera, rebuild
 from tests.contract.test_eng import sensed_project
-from tests.contract.test_sto import Files, in_table, items_on, killed_after_writing, rows, served
+from tests.contract.test_sto import (
+    Files,
+    cleanup_pass,
+    in_table,
+    items_on,
+    killed_after_writing,
+    rows,
+    served,
+)
 
 DAY = 86400
 
@@ -337,9 +345,9 @@ async def test_cln_3_a_deleted_runs_late_write_to_files_is_never_read(solera):
 
 
 async def test_cln_4_a_lagging_consumer_holds_no_superseded_version_back(solera):
-    """`items` rewrites k1 twice while `copy`, which read k1@1, lags: k1@1
-    goes, since no attempt in flight may read it; `copy` plans at the head
-    when it runs."""
+    """`items` rewrites k1 twice while `copy`, which read k1@1, lags: once
+    a cleanup pass has run, k1@1 is gone, since no attempt in flight may
+    read it; `copy` plans at the head when it runs."""
 
     received = []
     await solera.deploy(
@@ -352,7 +360,8 @@ async def test_cln_4_a_lagging_consumer_holds_no_superseded_version_back(solera)
     await solera.run("items")
     await solera.run("items")
     await solera.start()
-    await gone(solera, "items", *first)
+    await cleanup_pass(solera)
+    assert await solera.at("items", *first) is None
     await solera.run("copy")
     assert received[-1] == (([], ["k1"], []), {"k1": "3"})
 
@@ -391,7 +400,7 @@ async def test_cln_5_what_an_abandoned_attempt_wrote_to_files_goes_late(solera):
     assert (await solera.wait(run))["request"]["status"] == "succeeded"
     head = await solera.head("items")
     assert await solera.at("items", head, dead) is not None  # a late writer might still add to it
-    await asyncio.sleep(1.2)  # the asset's timeout and the cancel grace pass
+    solera.advance(2)  # the asset's timeout and the cancel grace pass
     await solera.run("items")
     await solera.start()
     await gone(solera, "items", head, dead)
@@ -412,8 +421,9 @@ async def test_cln_5_what_an_abandoned_attempt_wrote_to_a_table_goes_with_the_ne
     run = await solera.submit("items")
     await killed_after_writing(solera, table)
     assert (await solera.wait(run))["request"]["status"] == "failed"
+    solera.advance(2)  # past the asset's timeout and the cancel grace
     await solera.start()
-    await asyncio.sleep(1.5)  # past the asset's timeout and the cancel grace
+    await cleanup_pass(solera)
     assert in_table(table) == {"a": ["2"], "b": ["1"], "c": ["1"]}
     await solera.run("items")
     assert in_table(table) == {"a": ["3"], "b": ["1"]}
@@ -423,46 +433,85 @@ async def test_cln_5_what_an_abandoned_attempt_wrote_to_a_table_goes_with_the_ne
 # -- CLN-6 ------------------------------------------------------------------------
 
 
-def orders_project(store, value: str | None) -> Project:
-    """`orders` on `store` writes o1 at `value`; None: removed."""
+def removable(name: str, days: float | None = None):
+    """An asset writing `name`, an output nothing reads; once removed, its data
+    waits `days` (its store's week unless said)."""
+
+    def write():
+        return rows(f"{name}=1")
+
+    write.__name__ = name
+    after = {} if days is None else {"cleanup_after": dt.timedelta(days=days)}
+    return asset(outputs=Output(name, key="id", **after))(write)
+
+
+async def listed(solera, output: str) -> bool:
+    """Whether `output`'s old data waits for its cleanup (`GET /cleanups`)."""
+
+    return any(c["output"] == output for c in (await solera.get("/cleanups"))["cleanups"])
+
+
+async def retired(solera, output: str) -> bool:
+    """Whether `output`, listed for cleanup since its removal, comes to be
+    cleaned up while the engine works on, its clock a minute further at each
+    look: listed no more. A barrier before what a test asserts next."""
+
+    async def done():
+        solera.advance(60)
+        return not await listed(solera, output)
+
+    try:
+        await solera.until(done)
+    except AssertionError:
+        return False
+    return True
+
+
+def orders_project(store, value: str | None, *others) -> Project:
+    """`orders` on `store` writes o1 at `value`, None: removed, beside
+    `others`."""
 
     @asset(outputs=Output("orders", key="id", store="s"))
     def orders():
         return rows(f"o1={value}")
 
-    @asset
-    def other():
-        return 1
-
-    return Project(assets=[other] if value is None else [orders, other], stores={"s": store})
+    return Project(assets=[*others] if value is None else [orders, *others], stores={"s": store})
 
 
 async def test_cln_6_a_removed_outputs_data_goes_after_a_week_and_one_added_back_keeps_its_new_data(solera):
+    """`orders` and `brief` (a day's window) are removed. Three days on,
+    `brief`'s data is gone and `orders`' stays; `orders` is added back
+    and writes; past the week, its old data goes and its new data stays."""
+
     files = FileStore(solera.root / "files")
-    await solera.deploy(orders_project(files, "1"))
+    await solera.deploy(orders_project(files, "1", removable("brief", days=1)))
     await solera.run("orders")
+    await solera.run("brief")
     old = await solera.head("orders"), await solera.keys("orders")
     await solera.deploy(orders_project(files, None))
     await solera.start()
+    await solera.until(lambda: listed(solera, "brief"))
     solera.advance(3 * DAY)
-    await solera.settle(0.5)
-    assert await solera.at("orders", *old) == rows("o1=1")  # within the undo window
+    assert await retired(solera, "brief")
+    assert await solera.at("orders", *old) == rows("o1=1")  # within its week
     await solera.deploy(orders_project(files, "2"))  # added back
     await solera.run("orders")
     await solera.start()
     solera.advance(5 * DAY)
-    await gone(solera, "orders", *old)
+    assert await retired(solera, "orders")
+    assert await solera.at("orders", *old) is None
     assert await solera.rows("orders") == {"o1": "2"}
 
 
 async def test_cln_6_an_attempt_in_flight_from_before_the_move_holds_the_cleanup_back(solera):
-    """`orders` moves from store a to store b while `copy`'s attempt,
-    planned before, has not loaded it yet: the old data stays past the week
+    """`orders` moves from store a to store b, and `weekly` is removed,
+    while `copy`'s attempt, planned before, has not loaded `orders` yet.
+    Past the week `weekly`'s data is gone and `orders`' old data stays,
     until that attempt settles."""
 
     a, held, go = Files(solera.root / "a"), asyncio.Event(), asyncio.Event()
 
-    def project(store: str, value: str) -> Project:
+    def project(store: str, value: str, *others) -> Project:
         @asset(outputs=Output("orders", key="id", store=store))
         def orders():
             return rows(f"o1={value}")
@@ -471,14 +520,15 @@ async def test_cln_6_an_attempt_in_flight_from_before_the_move_holds_the_cleanup
         def copy(ctx, orders: list):
             return orders
 
-        return Project(assets=[orders, copy], stores={"a": a, "b": FileStore(solera.root / "b")})
+        return Project(assets=[orders, copy, *others], stores={"a": a, "b": FileStore(solera.root / "b")})
 
     async def hold():
         held.set()
         await go.wait()
 
-    await solera.deploy(project("a", "1"))
+    await solera.deploy(project("a", "1", removable("weekly")))
     await solera.run("orders")
+    await solera.run("weekly")
     old = await solera.head("orders"), await solera.keys("orders")
     a.before_load = hold
     run = await solera.submit("copy")
@@ -486,41 +536,47 @@ async def test_cln_6_an_attempt_in_flight_from_before_the_move_holds_the_cleanup
         await solera.until(held.is_set)
         await solera.deploy(project("b", "2"))  # moved: a new output; the old data waits a week
         await solera.start()
+        await solera.until(lambda: listed(solera, "weekly"))
         solera.advance(8 * DAY)
-        await solera.settle(1.0)
+        assert await retired(solera, "weekly"), "held by an attempt that does not read it"
         assert await solera.at("orders", *old) == rows("o1=1")
     finally:
         go.set()
     await solera.wait(run)
-    await gone(solera, "orders", *old)
+    assert await retired(solera, "orders")
+    assert await solera.at("orders", *old) is None
 
 
 async def test_cln_6_a_removed_dynamic_partitions_data_goes_after_a_week(solera):
-    """`sites` drops west: `site_files[west]` stays readable for the week,
-    then its data goes; east's stays."""
+    """`sites` drops west as `brief` (a day's window) and `weekly` are
+    removed: `site_files[west]` is readable once `brief`'s data went, and
+    gone once `weekly`'s went; east's stays."""
 
-    listed = ["east", "west"]
+    listed_sites = ["east", "west"]
 
     @asset(outputs=DynamicPartitions("sites"))
     def sites():
-        return list(listed)
+        return list(listed_sites)
 
     @asset(partitions={"site": "sites"}, outputs=Output("site_files", key="id"))
     def site_files(ctx):
         return rows(f"{ctx.partition}=1")
 
-    await solera.deploy(Project(assets=[sites, site_files]))
-    await solera.run("sites")
+    await solera.deploy(Project(assets=[sites, site_files, removable("brief", days=1), removable("weekly")]))
+    await solera.run(["sites", "brief", "weekly"])
     await solera.run("site_files", partitions="all")
     west = await solera.head("site_files", "west"), await solera.keys("site_files", "west")
-    listed.remove("west")
+    listed_sites.remove("west")
+    await solera.deploy(Project(assets=[sites, site_files]))
     await solera.run("sites")
     await solera.start()
+    await solera.until(lambda: listed(solera, "weekly"))
     solera.advance(3 * DAY)
-    await solera.settle(0.5)
-    assert await solera.at("site_files", *west) == rows("west=1")
+    assert await retired(solera, "brief")
+    assert await solera.at("site_files", *west) == rows("west=1")  # within its week
     solera.advance(5 * DAY)
-    await gone(solera, "site_files", *west)
+    assert await retired(solera, "weekly")
+    assert await solera.at("site_files", *west) is None
     assert await solera.rows("site_files", "east") == {"east": "1"}
 
 
@@ -550,7 +606,7 @@ async def test_cln_6_a_custom_store_the_project_no_longer_declares_leaves_the_cl
 
     await solera.until(stuck)
     [row] = await stuck()
-    assert row["output"] == "orders" and "no longer declared" in json.dumps(row["stuck"])
+    assert (row["output"], row["store"]) == ("orders", "mine")
     assert await mine.load(Ref.from_json(old[0]["ref"]), list[dict], Keys(old[1])) == rows("o1=1")
 
 
@@ -575,23 +631,32 @@ def paused_project(received: list, writes: list, **project) -> Project:
     return Project(assets=[items, copy], **project)
 
 
+async def expired(solera, run_id: str) -> None:
+    """A barrier: retention has deleted `run_id`."""
+
+    async def gone_run():
+        return (await solera.request("GET", f"/runs/{run_id}", ok=False)).status_code == 404
+
+    await solera.until(gone_run)
+
+
 async def test_cln_11_a_paused_consumer_never_loses_its_place_to_retention(solera):
     """`copy` is paused 40 days while `items`, whose runs are kept a week,
-    commits daily: when it runs it owes k2 (updated), k3 (removed), k4
-    (added), not a full run."""
+    commits daily: once retention has run, `copy` owes k2 (updated), k3
+    (removed), k4 (added), not a full run."""
 
     received = []
     writes = [rows("k1=0", "k2=0", "k3=0"), Patch(rows("k2=1", "k4=1"), remove=["k3"])]
     writes += [Patch(rows(f"k2={day}")) for day in range(2, 41)]
     await solera.deploy(paused_project(received, writes, retention=Retention(days=7)))
-    await solera.run("items")
+    first = (await solera.run("items"))["request"]["id"]
     await solera.run("copy")
     for _ in range(40):
         solera.advance(DAY)
         await solera.run("items")
         await solera.upkeep()
     await solera.start()
-    await solera.settle(1.5)
+    await expired(solera, first)
     await solera.run("copy")
     assert received[-1] == (False, (["k4"], ["k2"], ["k3"]), {"k2": "40", "k4": "1"})
     assert await solera.rows("copy") == {"k1": "0", "k2": "40", "k4": "1"}
@@ -602,8 +667,8 @@ async def test_cln_11_a_paused_consumer_never_loses_its_place_to_retention(soler
 
 async def test_cln_12_a_replaced_data_file_goes_once_no_live_attempt_planned_before_its_replacement(solera):
     """`items` replaces k1@1 with k1@4 while `copy`'s attempt, planned
-    before, is live: k1@1 stays, and the attempt loads it; once that attempt
-    settles, k1@1 goes."""
+    before, is live: past a cleanup pass k1@1 stays, and the attempt loads
+    it; once that attempt settles, the next pass deletes k1@1."""
 
     files, received = Files(solera.root / "files"), []
     planned, go = asyncio.Event(), asyncio.Event()
@@ -617,15 +682,18 @@ async def test_cln_12_a_replaced_data_file_goes_once_no_live_attempt_planned_bef
 
     files.before_load = replaced
     run = await solera.submit("copy")
-    await solera.until(planned.is_set)
-    await solera.run("items")
-    await solera.start()
-    await solera.settle(1.0)
-    assert await solera.at("items", *first) == rows("k1=1")  # a live attempt planned before c4
-    go.set()
+    try:
+        await solera.until(planned.is_set)
+        await solera.run("items")
+        await solera.start()
+        await cleanup_pass(solera)
+        assert await solera.at("items", *first) == rows("k1=1")  # a live attempt planned before c4
+    finally:
+        go.set()
     assert (await solera.wait(run))["request"]["status"] == "succeeded"
     assert received[0][1] == {"k1": "1"}  # it loaded k1@1
-    await gone(solera, "items", *first)
+    await cleanup_pass(solera)
+    assert await solera.at("items", *first) is None
 
 
 # -- CLN-13 -----------------------------------------------------------------------
@@ -635,22 +703,26 @@ async def test_cln_13_an_output_whose_history_outgrows_its_live_keys_raises_an_a
     solera,
 ):
     """`copy` ran once and holds its place while `items`, two keys, is
-    rewritten 40 times: an alarm names `items` and `copy`."""
+    rewritten 40 times: once retention and merges have run, an alarm names
+    `items` and `copy`."""
 
     received, writes = [], [rows(f"k1={n}", f"k2={n}") for n in range(41)]
     await solera.deploy(paused_project(received, writes, retention=Retention(days=1)))
-    await solera.run("items")
+    first = (await solera.run("items"))["request"]["id"]
     await solera.run("copy")
     for _ in range(40):
         solera.advance(3600)
         await solera.run("items")
+    layers = (await solera.get("/outputs/items/merges"))["layers"]
     solera.advance(2 * DAY)
     await solera.start()
+    await expired(solera, first)
 
-    async def alarmed():
-        return await solera.alarmed("items", "copy")
+    async def merged():
+        return (await solera.get("/outputs/items/merges"))["layers"] < layers
 
-    await solera.until(alarmed, timeout=5)
+    await solera.until(merged)
+    assert await solera.alarmed("items", "copy")
 
 
 # -- CLN-14 -----------------------------------------------------------------------
@@ -658,8 +730,8 @@ async def test_cln_13_an_output_whose_history_outgrows_its_live_keys_raises_an_a
 
 async def test_cln_14_an_append_only_output_keeps_everything_by_default(solera):
     """`events` appends daily and keeps every commit, whatever its runs'
-    retention: `digest`, paused 40 days, gets the 40 days' events, not a
-    full run."""
+    retention: `digest`, paused 40 days, gets the 40 days' events once
+    retention has run, not a full run."""
 
     day, received = [0], []
 
@@ -673,13 +745,13 @@ async def test_cln_14_an_append_only_output_keeps_everything_by_default(solera):
         return len(events)
 
     await solera.deploy(Project(assets=[events, digest], retention=Retention(days=7)))
-    await solera.run("events")
+    first = (await solera.run("events"))["request"]["id"]
     await solera.run("digest")
     for day[0] in range(1, 41):
         solera.advance(DAY)
         await solera.run("events")
         await solera.upkeep()
     await solera.start()
-    await solera.settle(1.5)
+    await expired(solera, first)
     await solera.run("digest")
     assert received == [(False, [0]), (False, list(range(1, 41)))]
