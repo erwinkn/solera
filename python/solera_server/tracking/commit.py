@@ -151,7 +151,7 @@ async def build(core: Core, task: dict, attempt: str, prepared: dict, result: di
             reports = [
                 ([], sorted(map(tuple, (delivered.get(p) or {}).get("loaded") or ()))) for p, _ in keyed
             ]
-            progress, records = await core.run(
+            progress, records, _ = await core.run(  # held-back keys: B6's, and only past a clear (PR 2)
                 core.tracking.progress_ops, plan, reports, producer=producer, output_commit=first
             )
             events.insert(0, progress)

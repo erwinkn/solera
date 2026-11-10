@@ -7,8 +7,10 @@ model's range. The core reads a real change index (one layer per upstream
 commit), applies its own journaled events, and survives restarts through
 snapshot and restore.
 
-Clears are left out of the histories: the core does not build them yet (the
-full-run form's clear lands with SOLE-6's follow-up).
+Histories include items' full runs: a clear, then completion. While items is
+mid full run the gate holds checks (the engine's part: the replay plans
+nothing), and a batch that loaded a key at another version than planned while
+items was mid full run, or after a clear since its plan, holds the key back.
 """
 
 from __future__ import annotations
@@ -36,6 +38,7 @@ class Core:
         self.ix = ChangeIndex(f"file://{root}")
         self.logs: dict[bytes, tuple[list, int, int]] = {ITEMS: ([], 0, 0), OWN: ([], 0, 0)}
         self.own: set[str] = set()
+        self.full_run: int | None = None  # items' clear while its full run is under way
         self.t = self.boot(Tracking())
         self.t.apply(Tracking.event_edge_open(EDGE, ITEMS, True))
         self.pending: tuple[bytes, list[str], object] | None = None
@@ -43,15 +46,21 @@ class Core:
     def boot(self, t: Tracking) -> Tracking:
         for out, (layers, head, live) in self.logs.items():
             t.attach(out, self.ix)
-            t._set_output(out, layers, head, live)
+            t._set_output(out, layers, head, live, self.full_run if out == ITEMS else None)
         return t
 
-    def commit(self, out: bytes, entries: list[tuple[str, object, object]]) -> None:
+    def commit(self, out: bytes, entries: list[tuple[str, object, object]], clear: bool = False) -> None:
         layers, head, live = self.logs[out]
-        layer = self.ix.write_commit(f"{out.decode()}/{head + 1}", head + 1, entries, live_before=live)
-        live += sum(r is None for _, _, r in entries) - sum(n is None for _, n, _ in entries)
+        layer = self.ix.write_commit(
+            f"{out.decode()}/{head + 1}", head + 1, entries, live_before=live, clear=clear
+        )
+        if clear:
+            live = len(entries)
+            self.full_run = head + 1
+        else:
+            live += sum(r is None for _, _, r in entries) - sum(n is None for _, n, _ in entries)
         self.logs[out] = ([*layers, layer], head + 1, live)
-        self.t._set_output(out, *self.logs[out])
+        self.t._set_output(out, *self.logs[out], self.full_run if out == ITEMS else None)
 
     def sync_own(self, holds: dict) -> None:
         """The consumer's own output holds a key exactly when the consumer does."""
@@ -99,8 +108,21 @@ def replay(events: list[tuple], root) -> int:
             w.apply(ev)
             if w.up.head != before:
                 core.commit(ITEMS, [(k, new, old) for k, (new, old) in sorted(w.up.entries[-1].items())])
+        elif kind == "clear":
+            before = w.up.head
+            w.apply(ev)
+            if w.up.head != before:
+                core.commit(
+                    ITEMS, [(k, new, None) for k, (new, _) in sorted(w.up.entries[-1].items())], clear=True
+                )
+        elif kind == "complete":
+            mid = w.incomplete
+            w.apply(ev)
+            if mid:
+                core.t.apply(Tracking.event_full_run_done(ITEMS))
+                core.full_run = None
         elif kind in ("plan", "full", "keys"):
-            if w.pending is not None:
+            if w.pending is not None or w.incomplete:  # the gate holds checks while items is mid full run
                 w.apply(ev)
                 continue
             if kind == "keys":
@@ -136,12 +158,12 @@ def replay(events: list[tuple], root) -> int:
             failed = sorted(k for k in taken if k in fails)
             planned = dict(zip(taken, Tracking.plan_keys(plan, 0)[2], strict=True))
             loaded = []
-            for k in sorted(set(moved) & set(taken) - set(fails)):
+            for k in sorted(set(moved) & set(taken)):
                 v = w.up.states[-1].get(k)
                 if v != planned[k]:
                     loaded.append((k, v))
-            event, records = core.t.progress_ops(plan, [(failed, loaded)])
-            assert len(records) == 1, where
+            event, records, held_back = core.t.progress_ops(plan, [(failed, loaded)])
+            assert len(records) == len(held_back) == 1, where
             core.t.apply(event)
             core.sync_own(w.holds)
         elif kind == "cancel":
@@ -169,7 +191,7 @@ def replay(events: list[tuple], root) -> int:
 def histories(n: int, seed: int):
     rnd = random.Random(seed)
     for _ in range(n):
-        yield [ev for ev in staleness.history(rnd, rnd.randint(5, 50)) if ev[0] not in ("clear", "complete")]
+        yield staleness.history(rnd, rnd.randint(5, 50))
 
 
 @pytest.mark.parametrize("seed", range(4))
