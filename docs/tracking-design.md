@@ -705,12 +705,12 @@ measurement the verdict still needs, on the new index.
 
 | Question | Form (a) | Form (b) |
 |---|---|---|
-| Is anything owed on this edge? | Any piece count or due point above zero | The edge has a witness |
+| Is anything due on this edge? | Any piece count or due point above zero | The edge has a witness |
 | Why? | The reason of each owing piece: input changed (behind the head), patterns, context, definition or rebuild counter changed (its conditions differ from now), never processed (`empty`), to reconcile (`held`), upstream incomplete (held by a gate, §10) | The reason of each witness kept, one per kind |
 | Is the partition stale? | Any of its edges owes something due (STA-3: a default run would load something) | The same |
 | Upstream stale | A partition whose stale status flips tells its consumers, which tell theirs: work only where the status changes | The same |
 | Complete? (D177) | No `empty` piece owes anything: an `empty` piece's count is exactly its unprocessed upstream keys | For each `empty` piece, whether it has an upstream key: one key or none |
-| How many keys owed? | The sum of the counts: exact, except "upstream incomplete" where a gate holds the edge, which has no number until the upstream is complete (D197) | The planner counts, when asked; cached until the upstream or the progress changes |
+| How many keys owed? | The sum of the counts: exact, except "upstream incomplete" where a gate holds the edge, which has no number until the upstream is complete (D197) | Counted when asked: the keys an unlimited plan would take, plus the failing keys whose retry is not yet due (their points); cached until the upstream or the progress changes |
 | How many commits behind, since when? | The oldest owing piece's commit, against the head and the commit headers | The same, from progress |
 | Which keys? | The planner without a limit, on demand; costs a read proportional to the answer | The same |
 
@@ -817,7 +817,7 @@ its own head and its own record.
 
 ## 8. The store contract
 
-**Settled (D184).**
+**Settled (D184, amended by D196 for stores that write in place).**
 
 | Call | Takes | Returns |
 |---|---|---|
@@ -1456,8 +1456,9 @@ reads and writes object storage itself, or works on bytes that Python
 fetched for it. The thread building the index core measures both at the
 scale target and decides.
 
-**The order of the work is in a separate build plan**, being written now.
-It also names what the model must check before each part is built (review
+**The order of the work is in a separate build plan** (ERW-9, being
+written now as `plans/build-plan.md` in the crew's shared drive). It also
+names what the model must check before each part is built (review
 F6): the store contract with late and dead writers, the full-run form, and
 cleanup against the cut.
 
@@ -1472,7 +1473,7 @@ target that depends on a form still waiting for the model's verdict (§6,
 
 | Entry | Today | Target | From |
 |---|---|---|---|
-| INC-4 | An update reverted to the processed version is delivered as updated | Not delivered, and never stale: diff sees equal ends | D187 |
+| INC-4 | An update reverted to the processed version is delivered as updated | Not delivered: diff sees equal ends. Stale only between the change and the revert, fresh once the versions match again, with no run spent | D187 |
 | INC-8 | Nothing goes back in time | Unchanged rule; on in-place stores it rests on the version check per partition (D196) instead of today's fence protocol | D196 |
 | KEY-3 | A Rejected or Failed key is retried when its input changes | Also: if its input reverts to the version the consumer holds, the failure is moot and goes without a retry. Same output, another outcome shown | D191 |
 | KEY-5 | A failing key counts as processed at the version it failed on | A failing key is owed (its point keeps what it held) and shows `owed: true`; a key that never succeeded and is removed upstream owes nothing, and its outcome goes | D191 |
@@ -1525,6 +1526,22 @@ target that depends on a form still waiting for the model's verdict (§6,
 
 ## 17. Decisions
 
+### The frame (Erwin, 2026-11-10)
+
+Not decisions of the design itself, but the terms every decision below
+was taken under:
+
+- **Settle by experiment.** The shape and API are agreed; every remaining
+  choice is settled by performance, storage, request counts or a model
+  check, and recorded with its evidence.
+- **Fresh start.** Nothing runs on Solera yet; no engine state, progress,
+  run history or index file is converted, and no compatibility shim is
+  written (D204).
+- **Scale target.** 100M keys per output, about 1% changing per day,
+  10k-key batches, one 4-vCPU engine. Every benchmark here measures at it.
+- **Tables stay exact.** A Postgres table never holds a row the log does
+  not have (D196).
+
 ### Settled before this round
 
 | Decision | What it fixes here |
@@ -1561,7 +1578,21 @@ The "Was" column gives the proposal or question each one settles.
 | D203 | The new core is written in Rust from the start, behind PyO3; server, worker and SDK stay Python; one crossing per call, never per key | Q13 | §1, §15 | Delegated. T45: the engine's event loop is 82 to 90% busy, mostly with about 5 µs per key of Python classification |
 | D204 | Build the new core once, beside today's engine, and switch at a fresh start, with no conversion | The migration plan | §15 | Erwin: a fresh start is fine. SOLE-4 F7: the nine-step plan wrote several steps twice |
 
-**Approved as they stand** (Q12): D178, D181, D182, D185 and D186.
+**Approved as they stand** (Q12), decisions taken earlier without Erwin:
+
+- **D178:** a batch's keys are read from its attempt spec at commit, not
+  copied into the journal; a head's list of dynamic partitions is derived
+  from the index.
+- **D182:** refines D178: the list stays on the head, computed by the
+  engine at each commit (the previous list plus the commit's entries).
+- **D181:** a merge that keeps failing backs off (after 3 failures, 10
+  minutes, doubling up to 4 hours) and raises an alarm, instead of
+  stopping for good.
+- **D185:** the format benchmark read both formats through the same I/O
+  code, so it compares formats, not readers (§4).
+- **D186:** the planner streams: a batch costs its own keys, not the key
+  space's (a 10k-key plan at 100M keys takes 1.9 to 3.4 s at the median,
+  where a batch took 706 s at 10M keys before).
 
 **Superseded.** D156 (a reverted update is delivered as updated) gives way
 to D187 (INC-4). The contradiction between D34 and D140 (2) on pattern
