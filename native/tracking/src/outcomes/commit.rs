@@ -234,6 +234,11 @@ pub async fn commit(
         id
     };
     let on_cond = learn(&p.conditions, &mut conds);
+    // What B3 held back keeps what it held, and its record as it is: the
+    // hold-back comes before the failure check (D205).
+    let Some(held_back) = ops.held_back.get(input).cloned() else {
+        return invalid("the batch's ops name no held-back keys for this input");
+    };
     let mut next: BTreeMap<Key, Option<Record>> = BTreeMap::new();
     let mut rep = reported.iter().peekable();
     for c in &p.keys {
@@ -241,6 +246,9 @@ pub async fn commit(
             rep.next();
         }
         let r = rep.next_if(|(k, _)| *k == c.key).map(|(_, r)| r);
+        if held_back.binary_search(&c.key).is_ok() {
+            continue;
+        }
         let prior = priors.get(&c.key);
         let tried = loaded
             .binary_search_by(|(k, _)| k.cmp(&c.key))
