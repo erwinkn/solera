@@ -6,7 +6,7 @@ from solera.stores import FileStore, Patch
 
 from tests.contract.example import Batch, Example
 from tests.contract.harness import Outside, SourceStore, rebuild
-from tests.contract.test_sta import Rebuild
+from tests.contract.test_sta import Rebuild, decided
 
 
 def holds(batches: list[Batch], held=()) -> set:
@@ -745,16 +745,17 @@ async def test_inc_15_an_upstream_full_run_never_makes_a_keyed_reader_remove_and
     archive runs no batch until copy completes, then gets one difference,
     not reset: k1, k2, k4 updated, k3 removed, k5 added."""
 
-    r = await Rebuild(solera).start()
-    number = (await solera.head("copy"))["commit_number"]
-    run = await r.midway()
-    assert await solera.rows("copy") == {"k1": "1", "k2": "1"}  # the clear, and batch 1's keys
-    reader = await solera.submit("archive")
-    await solera.settle(0.5)
-    assert len(r.seen["archive"]) == 1, r.seen["archive"][1:]  # no batch over an incomplete copy
-    await r.finish(run)
-    assert (await solera.wait(reader))["request"]["status"] == "succeeded"
-    [batch] = r.seen["archive"][1:]
-    assert not batch.reset and batch.classes == (["k5"], ["k1", "k2", "k4"], ["k3"])
-    assert (await solera.head("copy"))["commit_number"] == number + 2
-    assert await solera.rows("archive") == {"k1": "1", "k2": "1", "k4": "1", "k5": "1"}
+    async with Rebuild(solera) as r:
+        await r.start()
+        number = (await solera.head("copy"))["commit_number"]
+        run = await r.midway()
+        assert await solera.rows("copy") == {"k1": "1", "k2": "1"}  # the clear, and batch 1's keys
+        reader = await solera.submit("archive")
+        task = await decided(solera, reader, "archive")
+        assert task["status"] == "queued" and len(r.seen["archive"]) == 1, r.seen["archive"][1:]
+        await r.finish(run)
+        assert (await solera.wait(reader))["request"]["status"] == "succeeded"
+        [batch] = r.seen["archive"][1:]
+        assert not batch.reset and batch.classes == (["k5"], ["k1", "k2", "k4"], ["k3"])
+        assert (await solera.head("copy"))["commit_number"] == number + 2
+        assert await solera.rows("archive") == {"k1": "1", "k2": "1", "k4": "1", "k5": "1"}

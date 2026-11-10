@@ -9,7 +9,7 @@ from solera.stores import FileStore, Patch
 
 from tests.contract.example import Example
 from tests.contract.harness import Outside, Refused, SourceStore
-from tests.contract.test_sta import INCOMPLETE, Rebuild, task_of
+from tests.contract.test_sta import INCOMPLETE, Rebuild, decided
 
 
 def files_project(root, content: dict, fn, version: str = "1", **input) -> Project:
@@ -491,21 +491,21 @@ async def test_sel_12_a_keys_run_may_be_a_full_runs_first_batch_and_a_default_ru
     its commit clears copy, which holds k1 alone and owes k2 and k3. archive
     is held until a default run finishes copy, then gets one difference."""
 
-    r = await Rebuild(solera).start(keys=("k1", "k2", "k3"))
-    await r.deploy(version="2")
-    await solera.run("copy", keys={"items": ["k1"]})
-    [batch] = r.seen["copy"][-1:]
-    assert (batch.reset, batch.rows) == (True, ["k1"])
-    assert await solera.rows("copy") == {"k1": "1"} and not (await solera.head("copy"))["materialized"]
-    assert await solera.stale("copy") != []
-    reader = await solera.submit("archive")
-    await solera.settle(0.5)
-    task = await task_of(solera, reader, "archive")
-    assert task["status"] == "queued" and task.get("held") == [INCOMPLETE, "copy"], task
-    batches = len(r.seen["copy"])
-    await solera.run("copy")
-    assert [(b.reset, b.added) for b in r.seen["copy"][batches:]] == [(False, ["k2", "k3"])]
-    assert (await solera.head("copy"))["materialized"] and await solera.stale("copy") == []
-    assert (await solera.wait(reader))["request"]["status"] == "succeeded"
-    assert r.seen["archive"][-1].classes == ([], ["k1", "k2", "k3"], [])
-    assert await solera.rows("archive") == await solera.rows("copy") == {"k1": "1", "k2": "1", "k3": "1"}
+    async with Rebuild(solera) as r:
+        await r.start(keys=("k1", "k2", "k3"))
+        await r.deploy(version="2")
+        await solera.run("copy", keys={"items": ["k1"]})
+        [batch] = r.seen["copy"][-1:]
+        assert (batch.reset, batch.rows) == (True, ["k1"])
+        assert await solera.rows("copy") == {"k1": "1"} and not (await solera.head("copy"))["materialized"]
+        assert await solera.stale("copy") != []
+        reader = await solera.submit("archive")
+        task = await decided(solera, reader, "archive")
+        assert task["status"] == "queued" and task.get("held") == [INCOMPLETE, "copy"], task
+        batches = len(r.seen["copy"])
+        await solera.run("copy")
+        assert [(b.reset, b.added) for b in r.seen["copy"][batches:]] == [(False, ["k2", "k3"])]
+        assert (await solera.head("copy"))["materialized"] and await solera.stale("copy") == []
+        assert (await solera.wait(reader))["request"]["status"] == "succeeded"
+        assert r.seen["archive"][-1].classes == ([], ["k1", "k2", "k3"], [])
+        assert await solera.rows("archive") == await solera.rows("copy") == {"k1": "1", "k2": "1", "k3": "1"}

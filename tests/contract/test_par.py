@@ -492,9 +492,13 @@ def sited(root, content: dict) -> Project:
 
 
 async def test_par_6_a_removed_partitions_head_stays_readable_for_cleanup_after_then_goes(solera):
-    """`sites` drops west: no run targets it, its status is `removed`, and
-    its last head reads as it was for a week (the default `cleanup_after`);
-    then its data is cleaned up."""
+    """`sites` drops west: no run targets it, its status is `removed`, a
+    cleanup of its data awaits (`GET /cleanups`), and its last head reads
+    as it was for a week (the default `cleanup_after`); then the cleanup
+    runs and the data is gone."""
+
+    async def awaiting() -> list:
+        return [c for c in (await solera.get("/cleanups"))["cleanups"] if c["output"] == "site_files"]
 
     content = {"east": {"a": 1}, "west": {"b": 1}}
     await solera.deploy(sited(solera.root, content))
@@ -505,16 +509,18 @@ async def test_par_6_a_removed_partitions_head_stays_readable_for_cleanup_after_
     detail = await solera.run("site_files", partitions="all")
     assert [t["partition"] for t in detail["tasks"]] == ["east"]
     assert await solera.status("site_files", "west") == "removed"
+    assert await awaiting(), (await solera.get("/cleanups"))["cleanups"]
     solera.advance(6 * DAY)
     await solera.upkeep()
     assert await solera.at("site_files", head, keys) == [{"id": "b", "v": 1}]
     solera.advance(DAY + 60)
     await solera.start()
 
-    async def gone():
-        return await solera.at("site_files", head, keys) is None
+    async def cleaned():
+        return not await awaiting()
 
-    await solera.until(gone, timeout=3)
+    await solera.until(cleaned)
+    assert await solera.at("site_files", head, keys) is None
 
 
 async def test_par_6_a_partition_back_within_the_window_picks_up_where_it_left_off(solera):
