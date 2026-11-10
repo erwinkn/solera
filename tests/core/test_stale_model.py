@@ -216,7 +216,8 @@ def replay(
                 v = word(w.up.states[-1].get(k))
                 if v != planned[k]:
                     loaded.append((k, v))
-            event, _ = core.t.progress_ops(plan, [(failed, loaded)])
+            event, _, held_back = core.t.progress_ops(plan, [(failed, loaded)])
+            assert not any(held_back)
             core.t.apply(event)
             core.sync_own(w.holds)
         elif kind in ("pat", "ctx", "defn"):
