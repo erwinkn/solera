@@ -417,10 +417,12 @@ rerun.
 *From* `versions.md` §7. *Covered* `contract/test_chg.py::test_chg_11_a_whole_input_written_again_with_the_same_content_is_a_change`; `server/test_matrix.py::test_a_value_written_again_is_a_new_version_its_readers_reread`.
 
 **CHG-12. Patterns match keys by path segments.**
-`**` crosses `/`, `*` does not; `Regex(…)` too. `exclude="k1*"` is one
+`**` crosses `/`, `*` does not; `Regex(…)` too, in Rust's `regex` dialect
+against the whole key (no lookaround or backreferences: refused when
+declared). `exclude="k1*"` is one
 pattern, not its characters; `**/*old*` matches `Gold_ore.csv`, so word
 rules want segment-anchored patterns.
-*From* F1; `per-key-processing.md` §11. *Covered* `contract/test_chg.py::test_chg_12_globs_match_by_path_segments`; `contract/test_chg.py::test_chg_12_one_exclude_pattern_is_a_pattern_not_its_characters`; `contract/test_chg.py::test_chg_12_a_word_rule_wants_a_segment_anchored_pattern`; `contract/test_chg.py::test_chg_12_a_glob_matches_as_the_reference_does`; `contract/test_chg.py::test_chg_12_a_key_is_taken_when_an_include_and_no_exclude_matches`.
+*From* F1; `per-key-processing.md` §11. *Covered* `contract/test_chg.py::test_chg_12_globs_match_by_path_segments`; `contract/test_chg.py::test_chg_12_one_exclude_pattern_is_a_pattern_not_its_characters`; `contract/test_chg.py::test_chg_12_a_word_rule_wants_a_segment_anchored_pattern`; `contract/test_chg.py::test_chg_12_a_glob_matches_as_the_reference_does`; `contract/test_chg.py::test_chg_12_a_key_is_taken_when_an_include_and_no_exclude_matches`; `sdk/test_patterns.py::test_regex_is_rusts_dialect_matched_against_the_whole_key`.
 
 **CHG-13. A whole input that moves mid-run makes the keys processed before it moved owed again.**
 `factor` moves from w1 to w2 while `checks`' run is between its first and
