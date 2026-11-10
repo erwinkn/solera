@@ -179,7 +179,9 @@ same rows again: a new version, and consumers process them again
 clear, and `copy`'s commits keep their numbering, so `archive` is not
 reset. While `copy` is incomplete `archive` runs no batch over it
 (STA-13). Once `copy` completes, `archive` gets one difference: k1, k2, k4
-updated, k3 removed, k5 added; never k4 removed and then added back.
+updated, k3 removed, k5 added; never k4 removed and then added back. A
+difference whose window holds a clear is two scans, `copy` as `archive`
+last read it and `copy` now, never a replay of each commit.
 *From* P7, P12; the full-run verdict (form (a), SOLE-7, solera#15). *Today* a keyed full run starts a new
 life of its output, and its readers see removals and then re-adds. *Covered* {{COVERED}}.
 
@@ -720,7 +722,7 @@ cancelled run logs no `true`.
 
 **STA-12. Freshness is exact whenever asked; there is no `pending` status.**
 Whether a partition is stale is kept exact at every upstream commit and
-every batch commit (one due key per input, §6 of the design); the number
+every batch commit (one witness due key per input, §6 of the design); the number
 of owed keys is counted when asked and cached until the upstream or the
 progress moves. A status asked right after a prefixless pattern change on
 100M keys is exact: never guessed, never `pending`. Where a gate holds an
@@ -731,9 +733,9 @@ input (STA-13), its reason is `upstream incomplete`, with no number.
 `copy` runs full in two batches; between them, `archive` (keyed),
 `summary` (reading `copy` whole) and every other reader are held: a run
 of theirs waits, saying `upstream incomplete` (RUN-4), and starts once
-`copy` completes. On a store that writes in place, a reader's batch
-already in flight when the full run began holds back every key it loaded
-at another version than planned; those keys stay owed. An input may opt
+`copy` completes. On a table, a held reader's batch that was already in
+flight when the full run began holds back every key it loaded at another
+version than it planned; those keys stay owed. An input may opt
 out of the gate to read partial data. A full run canceled or failed
 midway raises an alarm, and one command lets downstream proceed.
 *From* P12; the full-run verdict (form (a), SOLE-7, solera#15); review F2. *Today* readers run over a half-rebuilt upstream. *Covered* {{COVERED}}.
