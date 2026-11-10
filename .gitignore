@@ -9,6 +9,8 @@ dist/
 node_modules/
 apps/console/test-results/
 native/target/
+native/index/target/
+bench/change-index/target/
 python/solera/_native*.so
 spec/tla/.tools/
 spec/tla/states/

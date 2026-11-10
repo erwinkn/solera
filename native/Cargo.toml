@@ -19,6 +19,11 @@ zstd = "0.13"
 arrow-array = { version = "60", default-features = false, features = ["ffi"] }
 arrow-schema = "60"
 arrow-buffer = "60"
+solera-index = { path = "index" }
+tokio = { version = "1", features = ["rt-multi-thread"] }
+
+[workspace]
+members = ["index"]
 
 [profile.release]
 lto = "thin"

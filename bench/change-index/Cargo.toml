@@ -1,0 +1,25 @@
+[package]
+name = "change-index-bench"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# The change index (native/index) at the scale target: the format benchmark's
+# workloads, layer schedule, simulated store and queries (T44, branch
+# exp/layer-format), read through the shipped reader.
+[dependencies]
+solera-index = { path = "../../native/index" }
+async-trait = "0.1"
+bytes = "1"
+futures = "0.3"
+libc = "0.2"
+object_store = "0.14"
+rand = { version = "0.9", features = ["small_rng"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "time", "sync"] }
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+
+[profile.release]
+debug = 1
+lto = "thin"
+codegen-units = 1
