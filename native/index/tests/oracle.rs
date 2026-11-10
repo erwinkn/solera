@@ -1182,10 +1182,28 @@ fn a_commit_writer_writes_what_write_commit_writes() {
             }
         };
         assert_eq!(bytes("t/a").await, bytes("t/b").await);
-        assert_eq!(
-            ix.commits(&[a], 1, 1).await.unwrap()[0].live,
-            10 + 6667 - 6666
-        );
+        let h = CommitHeader {
+            commit: 1,
+            time_ms: 5,
+            producer: b"p".to_vec(),
+            added: 6667,
+            updated: 6667,
+            removed: 6666,
+            live: 10 + 6667 - 6666,
+            min_key: b"k000000".to_vec(),
+            max_key: b"k019999".to_vec(),
+            ..Default::default()
+        };
+        assert_eq!(ix.commits(&[a], 1, 1).await.unwrap(), vec![h.clone()]);
+        // the same bytes as the format's writer, given that header
+        let mut fw = Writer::new(WriteOptions::default(), 1, 1, None).unwrap();
+        for i in 0..run.len() {
+            let r = run.rows(i).start;
+            fw.push(run.key(i), 1, run.new_version(r), run.replaced_version(r))
+                .unwrap();
+        }
+        fw.finish(&[h]).unwrap();
+        assert_eq!(bytes("t/b").await, fw.take());
         // nothing pushed: nothing written
         let w = ix.commit_writer("e", nc).unwrap();
         assert!(w.finish().await.unwrap().is_none());
