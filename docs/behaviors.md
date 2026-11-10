@@ -512,7 +512,7 @@ commit.
 **KEY-1. A per-key asset is called once per owed key; removed keys lose their rows without a call.**
 `checks` over k1, k2 (changed) and k3 (removed): two calls; one store
 write per output holds k1's and k2's rows and removes k3's.
-*From* `per-key-processing.md` §5. *Covered* `contract/test_key.py::test_key_1_a_per_key_asset_is_called_once_per_owed_key`; `contract/test_key.py::test_key_1_removed_keys_lose_their_rows_without_a_call`; `server/test_each.py::test_one_call_per_key_many_rows_one_write`.
+*From* `per-key-processing.md` §5. *Covered* `contract/test_key.py::test_key_1_a_per_key_asset_is_called_once_per_owed_key`; `contract/test_key.py::test_key_1_removed_keys_lose_their_rows_without_a_call`; `contract/test_sto.py::test_sto_6_one_call_per_key_many_rows_one_write`.
 
 **KEY-2. `batch_size` is keys per commit; `concurrency` is keys at once.**
 Defaults 10,000 and 64. `@asset(concurrency=4)` with per-key
@@ -532,7 +532,7 @@ the whole attempt fails, nothing commits.
 A call returns `None` for `icp_raw_data`: its previous rows stay.
 `Patch(None, remove=[ctx.key])` removes it. A key given no rows does not
 exist.
-*From* `per-key-processing.md` §16. *Covered* `contract/test_key.py::test_key_4_returning_none_changes_nothing_and_removing_is_explicit`; `contract/test_key.py::test_key_4_a_key_given_no_rows_does_not_exist`; `server/test_each.py::test_none_is_no_change_and_removal_is_explicit`; `server/test_keys.py::test_a_key_given_no_rows_does_not_exist`.
+*From* `per-key-processing.md` §16. *Covered* `contract/test_key.py::test_key_4_returning_none_changes_nothing_and_removing_is_explicit`; `contract/test_key.py::test_key_4_a_key_given_no_rows_does_not_exist`; `server/test_each.py::test_none_is_no_change_and_removal_is_explicit`; `contract/test_sto.py::test_sto_6_a_key_given_no_rows_does_not_exist`.
 
 **KEY-5. Every key of a per-key partition has a latest outcome.**
 `rejected`, `failed`, `retrying`, `canceled`, `timed_out` (stored, with
