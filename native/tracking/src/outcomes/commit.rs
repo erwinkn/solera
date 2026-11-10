@@ -187,8 +187,9 @@ pub async fn commit(
         return invalid("catch up first: the edge's reverts are not looked for through the input's head under the conditions now");
     }
     let keyed = v.progress.keyed().expect("a per-key edge is keyed");
-    let retry = plan.pass.is_some();
-    let step = if let Some(id) = plan.pass {
+    let pass = plan.pass.as_ref().filter(|id| id.edge == v.edge);
+    let retry = pass.is_some();
+    let step = if let Some(id) = pass {
         if id.life != v.per_key.life {
             return invalid("a retry batch of a pass in an earlier life of the edge");
         }
@@ -493,10 +494,16 @@ pub async fn commit(
         at: v.failures.head,
         look: made.map(|_| (looked, caught_up)),
         life: v.per_key.life,
-        low: next.values().flatten().fold(None, |mut low, r| {
-            cover(&mut low, &r.stored);
-            low
-        }),
+        // A held-back key was not retried: it waits for its retry again, so
+        // it lowers what the pass covers like a record written.
+        low: next
+            .values()
+            .flatten()
+            .chain(held_back.iter().filter_map(|k| priors.get(k)))
+            .fold(None, |mut low, r| {
+                cover(&mut low, &r.stored);
+                low
+            }),
         made,
         points: vec![],
     }));
