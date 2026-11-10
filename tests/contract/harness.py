@@ -258,12 +258,6 @@ class Solera:
 
     # -- upkeep, waiting, a sensor host ------------------------------------------
 
-    async def upkeep(self) -> None:
-        """Storage upkeep does one pass, as a served engine's does every
-        second: retention among it."""
-
-        await self.engine.upkeep.tick()
-
     async def until(self, condition, timeout: float = 10) -> None:
         """The engine works, as in `settle`, until `condition()` (awaited when
         it returns an awaitable) holds; fails past `timeout` seconds."""

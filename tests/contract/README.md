@@ -35,7 +35,7 @@ engine's HTTP API, the stores and a worker. The `solera` fixture
   backoffs, schedules, retention). Heartbeats, cancels, timeouts, sensor
   schedules and upkeep run on real time: tests shorten them with serve
   settings (`deploy(project, heartbeat_seconds=0.2, cancel_grace=…)`);
-- waiting: `until(condition)`, `quiet()`, `upkeep()`;
+- waiting: `until(condition)`, `quiet()`;
 - outcomes and history: `outcomes`, `explain`, `retry_keys`, `commits`;
 - workers, hosts and processes a test plays: `workers(boot=)` and
   `kill_workers()`, `work(pool, project)` and `worker(stage)` (a pool
