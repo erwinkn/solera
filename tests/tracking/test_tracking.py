@@ -232,3 +232,5 @@ def test_the_oracle_refuses_keys_outside_the_models_key_space():
         oracle.replay_staleness([("up", (("order-123", 1),), False)])
     with pytest.raises(ValueError, match="key space"):
         oracle.replay_fullrun([("keys", "copy", ("k9",))])
+    for kind in ("up", "clear"):
+        oracle.replay_staleness([(kind, (("k1", "v1"),), False)])
