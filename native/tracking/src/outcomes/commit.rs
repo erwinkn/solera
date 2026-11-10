@@ -440,8 +440,8 @@ pub async fn commit(
         producer: ctx.producer,
         path,
         mode: Mode::Patch,
-        collect: 0,
         ends_full_run: false,
+        collect: 0,
     };
     let mut parts = Vec::new();
     if let Some(b) = build(
@@ -699,8 +699,8 @@ pub async fn catch_up(
         producer: ctx.producer,
         path,
         mode: Mode::Patch,
-        collect: 0,
         ends_full_run: false,
+        collect: 0,
     };
     let mut parts = Vec::new();
     if let Some(b) = build(

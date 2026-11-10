@@ -1715,3 +1715,64 @@ fn a_writer_refuses_seg_blocks_past_its_limit() {
     let max = Writer::new(WriteOptions::default(), 1, u64::MAX, Some(u64::MAX));
     assert!(matches!(max, Err(Error::Invalid(_))));
 }
+
+#[test]
+fn a_limited_read_fetches_the_index_its_page_needs() {
+    let rt = runtime();
+    let mem = Arc::new(InMemory::new());
+    let o = WriteOptions {
+        block_bytes: 512,
+        level: 1,
+        seg_blocks: 16,
+    };
+    let n = 1_500_000u64;
+    let mut w = Writer::new(o, 1, 1, None).unwrap();
+    let mut bytes = Vec::new();
+    for i in 0..n {
+        let key = format!("{i:012}/{:064x}", u128::from(i) * 0x9E37_79B9_7F4A_7C15);
+        w.push(key.as_bytes(), 1, Version::Int(i), Version::Absent)
+            .unwrap();
+        if w.pending() > 1 << 20 {
+            bytes.extend_from_slice(&w.take());
+        }
+    }
+    let h = CommitHeader {
+        commit: 1,
+        added: n,
+        live: n,
+        ..Default::default()
+    };
+    let mut l = w.finish(&[h]).unwrap();
+    bytes.extend_from_slice(&w.take());
+    l.path = "big".into();
+    let index = l.top_start - l.index_start;
+    rt.block_on(async {
+        mem.put(&Path::from("big"), bytes.into()).await.unwrap();
+        let opts = StoreOptions {
+            one_get: 0,
+            ..Default::default()
+        };
+        let store = Store::new(mem.clone(), Path::from(""), rt.handle().clone(), opts).unwrap();
+        let ix = ChangeIndex::new(store, WriteOptions::default());
+        let ls = std::slice::from_ref(&l);
+        let mut after = None;
+        let mut fetched = Vec::new();
+        for _ in 0..4 {
+            let before = ix.store.stats.counts().get_bytes;
+            let q = Query {
+                limit: Some(100),
+                after,
+                ..Default::default()
+            };
+            let p = ix.scan(ls, 1, &q).await.unwrap();
+            assert_eq!(p.run.len(), 100);
+            after = p.next;
+            fetched.push(ix.store.stats.counts().get_bytes - before);
+        }
+        assert!(index > 3 << 20, "{index}");
+        assert!(
+            fetched[1..].iter().all(|&f| f < 1 << 20),
+            "{fetched:?} of {index}"
+        );
+    });
+}

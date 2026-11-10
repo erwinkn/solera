@@ -134,8 +134,8 @@ pub async fn start(
         producer: b"",
         path,
         mode: CommitMode::Patch,
-        collect: 0,
         ends_full_run: false,
+        collect: 0,
     };
     let pid = output_id(PASS, &v.edge);
     let Some(built) = build(ixs, &pid, pass_list, spec, &mut Source(Some(&ch))).await? else {

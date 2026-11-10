@@ -529,7 +529,9 @@ these additions:
   every key it loaded at another version than it planned while its input's
   output is mid full run (`Output.full_run`, B4) or when a clear came in
   since the batch's head (the layers' `clears`): the key keeps what it held,
-  even if it also failed, and stays owed. `Ops.held_back` names those keys
+  even if it also failed, and stays owed. A key held back on one input is
+  held back on every input of the batch, since its output is one value
+  computed from all of them. `Ops.held_back` names those keys
   for the key outcomes (B6). The gate that holds readers of an incomplete
   upstream is the engine's (B5).
 

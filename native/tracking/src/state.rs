@@ -95,10 +95,10 @@ impl Tracking {
             Part::Batch(p) => p.check(self),
             Part::Consumed(p) => p.check(self),
             Part::OutputCommit(p) => p.check(self),
+            Part::FullRunDone(p) => p.check(self),
             Part::Outcomes(p) => p.check(self),
             Part::PassStart(p) => p.check(self),
             Part::Rebuild(p) => p.check(self),
-            Part::FullRunDone(p) => p.check(self),
         }
     }
 
@@ -112,10 +112,10 @@ impl Tracking {
             Part::Batch(p) => p.apply(self),
             Part::Consumed(p) => p.apply(self),
             Part::OutputCommit(p) => p.apply(self),
+            Part::FullRunDone(p) => p.apply(self),
             Part::Outcomes(p) => p.apply(self),
             Part::PassStart(p) => p.apply(self),
             Part::Rebuild(p) => p.apply(self),
-            Part::FullRunDone(p) => p.apply(self),
         }
     }
 
