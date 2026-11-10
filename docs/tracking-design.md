@@ -1289,9 +1289,10 @@ described above, with these choices:
   key list, each other keyed input the same keys at its head, and the
   worker loads and reports the key on each. So the union hold-back rule
   applies unchanged, and only the pass's input moves the pass on
-  (`PassId` names its edge). A key the batch holds back was not retried,
-  so it lowers what the pass covers like a record written, and the next
-  pass takes it again.
+  (`PassId` names its edge). A key held back while its own input read it
+  as planned (another input moved) was not retried and its input did not
+  move, so it lowers what the pass covers like a record written, and the
+  next pass takes it again.
 
 ## 12. History
 
