@@ -13,8 +13,10 @@
 //! - [`progress`]: pieces and points per edge (B3).
 //! - [`plan`]: the planner (B3).
 //! - [`record`]: the batch record (B3).
+//! - [`commit`]: output and source commits (B4).
 
 pub mod codec;
+pub mod commit;
 pub mod error;
 pub mod event;
 pub mod plan;

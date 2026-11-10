@@ -9,6 +9,7 @@ publish = false
 solera-index = { path = "../index" }
 regex = "1"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
+zstd = "0.13"
 
 [dev-dependencies]
 object_store = "0.14"
