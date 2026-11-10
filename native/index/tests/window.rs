@@ -144,3 +144,25 @@ fn a_commit_writer_holds_parts_not_the_commit() {
     );
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[test]
+fn a_commit_count_allocates_only_for_the_headers_read() {
+    let _one = ONE_AT_A_TIME.lock().unwrap();
+    let mut raw = vec![0xff, 0xff, 0xff, 0x03];
+    raw.resize(64 << 20, 0);
+    let c = zstd::bulk::compress(&raw, 1).unwrap();
+    let mut b = (raw.len() as u32).to_le_bytes().to_vec();
+    b.extend((xxhash_rust::xxh3::xxh3_64(&c) as u32).to_le_bytes());
+    b.extend(&c);
+    drop(raw);
+    let base = NOW.load(Relaxed);
+    PEAK.store(base, Relaxed);
+    let got = format::parse_commits(&b);
+    let held = PEAK.load(Relaxed) - base;
+    assert!(matches!(got, Err(Error::Format(_))), "{got:?}");
+    assert!(
+        held < 128 << 20,
+        "a damaged commits section held {} MB",
+        held >> 20
+    );
+}

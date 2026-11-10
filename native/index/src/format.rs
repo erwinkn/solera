@@ -891,7 +891,7 @@ pub fn parse_commits(b: &[u8]) -> Result<Vec<CommitHeader>> {
             raw.len()
         ));
     }
-    let mut out = Vec::with_capacity(n as usize);
+    let mut out = Vec::new();
     for _ in 0..n {
         let len = varint(&raw, &mut p)? as usize;
         let rec = take(&raw, &mut p, len)?;

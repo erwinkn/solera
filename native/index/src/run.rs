@@ -15,6 +15,12 @@ pub const NEW_BYTES: u8 = 4;
 pub const REPLACED_BYTES: u8 = 8;
 pub(crate) const KNOWN_FLAGS: u8 = NEW | REPLACED | NEW_BYTES | REPLACED_BYTES;
 
+/// A byte-string version is stored as its offset in the run's arena and its
+/// length, in one word: lengths up to 256 MiB (a block holds at most 64 MiB),
+/// offsets up to 64 GiB.
+const VLEN_BITS: u32 = 28;
+const VLEN_MASK: u64 = (1 << VLEN_BITS) - 1;
+
 /// A version: an opaque token compared only for equality. The engine's own
 /// versions are integers (an attempt's generation); a source's are strings.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -33,8 +39,8 @@ impl Version<'_> {
 #[derive(Default, Clone, Debug)]
 pub struct Run {
     keys: Vec<u8>,
-    key_end: Vec<u32>,
-    ent_end: Vec<u32>,
+    key_end: Vec<usize>,
+    ent_end: Vec<usize>,
     commit: Vec<u64>,
     flags: Vec<u8>,
     new: Vec<u64>,
@@ -76,19 +82,15 @@ impl Run {
     pub fn bytes(&self) -> usize {
         self.keys.capacity()
             + self.vbytes.capacity()
-            + (self.key_end.capacity() + self.ent_end.capacity()) * 4
+            + (self.key_end.capacity() + self.ent_end.capacity()) * size_of::<usize>()
             + (self.commit.capacity() + self.new.capacity() + self.replaced.capacity()) * 8
             + self.flags.capacity()
     }
 
     #[inline]
     pub fn key(&self, i: usize) -> &[u8] {
-        let a = if i == 0 {
-            0
-        } else {
-            self.key_end[i - 1] as usize
-        };
-        &self.keys[a..self.key_end[i] as usize]
+        let a = if i == 0 { 0 } else { self.key_end[i - 1] };
+        &self.keys[a..self.key_end[i]]
     }
 
     #[inline]
@@ -99,12 +101,8 @@ impl Run {
     /// The rows of key `i`'s entries, newest first.
     #[inline]
     pub fn rows(&self, i: usize) -> Range<usize> {
-        let a = if i == 0 {
-            0
-        } else {
-            self.ent_end[i - 1] as usize
-        };
-        a..self.ent_end[i] as usize
+        let a = if i == 0 { 0 } else { self.ent_end[i - 1] };
+        a..self.ent_end[i]
     }
 
     #[inline]
@@ -139,7 +137,7 @@ impl Run {
         } else if f & bytes == 0 {
             Version::Int(v)
         } else {
-            let (a, n) = ((v >> 32) as usize, (v & 0xffff_ffff) as usize);
+            let (a, n) = ((v >> VLEN_BITS) as usize, (v & VLEN_MASK) as usize);
             Version::Bytes(&self.vbytes[a..a + n])
         }
     }
@@ -148,8 +146,8 @@ impl Run {
     #[inline]
     pub fn push_key(&mut self, key: &[u8]) {
         self.keys.extend_from_slice(key);
-        self.key_end.push(self.keys.len() as u32);
-        self.ent_end.push(self.commit.len() as u32);
+        self.key_end.push(self.keys.len());
+        self.ent_end.push(self.commit.len());
     }
 
     /// Start a new key from the first `shared` bytes of the last key plus a
@@ -157,15 +155,11 @@ impl Run {
     #[inline]
     pub(crate) fn push_key_prefixed(&mut self, shared: usize, suffix: &[u8]) {
         let n = self.key_end.len();
-        let start = if n >= 2 {
-            self.key_end[n - 2] as usize
-        } else {
-            0
-        };
+        let start = if n >= 2 { self.key_end[n - 2] } else { 0 };
         self.keys.extend_from_within(start..start + shared);
         self.keys.extend_from_slice(suffix);
-        self.key_end.push(self.keys.len() as u32);
-        self.ent_end.push(self.commit.len() as u32);
+        self.key_end.push(self.keys.len());
+        self.ent_end.push(self.commit.len());
     }
 
     /// An entry of the last key.
@@ -182,7 +176,7 @@ impl Run {
         self.flags.push(flags);
         self.new.push(new);
         self.replaced.push(replaced);
-        *self.ent_end.last_mut().expect("an entry needs a key") = self.commit.len() as u32;
+        *self.ent_end.last_mut().expect("an entry needs a key") = self.commit.len();
     }
 
     /// Row `row` of `other`, as an entry of this run's last key.
@@ -210,8 +204,14 @@ impl Run {
             Version::Int(n) => (present, n),
             Version::Bytes(b) => {
                 let a = self.vbytes.len() as u64;
+                assert!(
+                    (b.len() as u64) <= VLEN_MASK && a < 1 << (64 - VLEN_BITS),
+                    "a version of {} bytes at {a}: a run holds versions up to {VLEN_MASK} bytes, {} in all",
+                    b.len(),
+                    1u64 << (64 - VLEN_BITS)
+                );
                 self.vbytes.extend_from_slice(b);
-                (present | bytes, a << 32 | b.len() as u64)
+                (present | bytes, a << VLEN_BITS | b.len() as u64)
             }
         }
     }
