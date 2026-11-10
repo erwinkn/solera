@@ -555,8 +555,9 @@ New sweeps since that summary:
 
 ## Formal models: which spec owns which rules
 
-Five TLA+ specs, checked by `spec/tla/check.sh` (`check.sh` alone is CI).
-Each rule has one owner, so none falls between them:
+Five TLA+ specs, checked by `spec/tla/check.sh` (`check.sh` alone is CI),
+and the tracking model in Python for the redesign. Each rule has one owner,
+so none falls between them:
 
 | Spec | Owns | Leaves to |
 |---|---|---|
@@ -565,6 +566,7 @@ Each rule has one owner, so none falls between them:
 | `ObservedSet.tla` | the observed set (D126, D133) and its observation record: decode, candidates and classify-once, batches reclassified from what was served, points, ranges at each batch's head and their fold, the base with its before-image, rebases, every run kind (default runs in batches, `keys=`, per-key cancels, start-overs, dropped runs), pattern, context and definition changes, upstream resets, retention cuts, a batch in flight between dispatch and commit | what an attempt is to `Execution.tla`; the key index to its tests (`key-index-design.md` § What is checked) |
 | `Attempt.tla` | the attempt control file: who owns an attempt, the gate, the sealed result or the engine's end; duplicates, zombies, retention; nobody learns of an attempt before its launch is durable (F26) | what an attempt computes to `Execution.tla` |
 | `JournalObject.tla` | the journal: fencing, appends, checkpoints and their cleanup, lost answers, failed requests | what the events mean to the others |
+| `tests/tracking` | the tracking redesign before it is built: the log of entries, progress as pieces and points, the planner, both staleness forms, both full-run forms, the amended P8 | today's engine to the specs above; stores that write in place with late and dead writers, cleanup and lineage: not yet |
 
 ## Formal model: execution semantics (`spec/tla/Execution.tla`)
 
@@ -1242,6 +1244,91 @@ its attempts can carry the file's states and the end as a read and a
 swap, with this model as the reference for the protocol. Its fairness
 argument then needs the bound above: finitely many file changes per
 attempt.
+
+## The tracking model (`tests/tracking`)
+
+*The tracking redesign (`docs/tracking-design.md` on `design/tracking`), before
+it is built.* A brute-force model in Python, not of the engine: it settles the
+design's open choices by model check, and the new core's units test against it
+as an oracle (`tests/tracking/README.md`). It replaces the design's own model,
+which lived outside the repository (`docs/handoff/tracking-model/model.py` on
+`handoff/2026-11-09`); everything that model checked is checked here.
+
+```bash
+uv run pytest tests/tracking -q            # CI: 200 histories per form and store, every calibration (~10 s)
+uv run pytest tests/tracking -q --slow     # 5,000 per form and store
+uv run python -m tests.tracking fullrun --kind table --off hold_back --shrink
+```
+
+**State.** The log of an output: commits of entries that carry both versions
+(P1), clears, and `diff`, `scan` and `get` computed from entries alone. Progress:
+pieces (`at(H, conditions)`, `empty`, `held`) and points, decoding, a planner
+that reads candidates from the log piece by piece (§7), and the batch commit
+rule (§5), with failing keys (P9), keys loaded at another version, key-list
+runs and merges at the run's progress key. A history is a list of events; an
+event that does not apply is skipped, so any sublist is a history, and a
+failure shrinks to the shortest one that still breaks the same invariant.
+
+**Staleness** (`staleness.py`): checks reads items. Histories mix upstream
+commits that revert, an upstream full run in the design's form (a clear, then
+complete), batches planned and committed later, failing keys owed but not
+due, retries due by timer or by force, pattern, context and definition
+changes, key-list runs, a full run's resetting first batch, progress reset to
+`held`, lost notifications and restarts. Two forms run over the same
+histories: `counts` (P14's exact owed counts per piece, with its four events, the
+`since` shortcut, the split rule and replay after a restart) and `witness`
+(the amendment's one due key per input, rules 1 to 8). After every step:
+progress decodes to what checks really holds; the planner's candidates equal
+the brute-force owed set (the count on request); the answer is `held` exactly
+while items is mid full run, else `stale` exactly when some key is due; a
+witness is due; `counts`' every piece count equals brute force; completeness
+(D177) equals brute force; rule 1 never takes a key that is not due.
+
+**Full runs** (`fullrun.py`): items and feed drive copy (an ordinary keyed
+copy with feed as a second input, under definitions that keep, drop or rename
+keys) and tally (an ordinary count per group that builds on `ctx.load()`);
+archive reads copy, report reads tally, summary reads copy whole; checks is a
+per-key asset over items under the amended P8 (a full run by hand raises a
+rebuild counter in its conditions). Histories add definition changes, full
+runs by hand, `keys=` runs (as a full run's first batch too), cancels,
+restarts that kill every attempt in flight, and upstream removals. copy and
+tally live on one store kind per run: `file` (an attempt loads what it
+planned) or `table` (it loads the row as it is now). Two forms: `clear` (P7,
+P12: the first batch clears, readers wait while the upstream is incomplete)
+and `floor` (rebuild in place: the first batch sets the floor, `ctx.load()`
+hides rows below it, the completing commit removes them, by a commit of the
+engine's own when the run completes with no batch; only readers of an
+accumulating output and whole readers wait). After every step: each log
+equals its store; scans equal the true states; every consumer's progress
+decodes to what it processed; a plan takes exactly the first due keys; a
+floor never goes down; `ctx.load()` returns no row below the floor; a
+completed rebuild leaves no row below its floor; no reader loads a row an
+unfinished rebuild of an accumulating output built; no keyed reader is given
+a key removed and then added back within one rebuild, unless items removed
+it meanwhile; checks never removes a key items has; summary never reads a copy
+that is incomplete or mixes definitions. Once quiet (every owed run done),
+every output equals what its definition gives from items and feed.
+
+**Calibration.** Every rule a form needs is named (`RULES` in each module) and
+has a history in `histories.py` that passes with every rule on and fails with
+that rule off (`test_each_rule_is_needed`). Rules this model had to add to
+the design and the amendments are switched off by `ADDED`; each is a finding:
+
+| Form | Rule added | Without it |
+|---|---|---|
+| `counts` | `new_piece_conditions`: a batch committed under other conditions than it was planned under counts its new piece by scan | the piece counts only `diff(H, head)` and misses keys owed by the change (review F8, confirmed) |
+| `counts` | `split_recount`: the remainder of a cut piece recounted while the batch was in flight is counted by scan | the split rule subtracts what was owed at H from a count taken after H |
+| `counts` | `keys`: a key-list run moves the key's piece count when it adds or drops a point; a failing key always keeps a point | the piece keeps counting a key its point now covers |
+| `witness` | `reset_probe`: a batch that resets progress (a full run's first batch) probes the whole input | rule 3 probes only the batch's range and reads fresh while the rest is owed |
+| `witness` | `held_probe`: progress reset to `held` probes, as rule 4 | the input reads fresh with every held key owed |
+| `witness` | `catch_up_first`: every rule begins with rule 7's comparison | after a lost notification, rule 1 applies an old commit to newer progress and names a key that is not due |
+| `witness` | `rearm`: a restart applies rule 5 to every retry already due | a retry whose timer fired before the restart is never noticed |
+| `clear`, `floor` | `hold_back`: a held reader's batch in flight holds back what it loads at another version than planned | on a table the gate does not cover a batch already in flight: report loads a half-built count (both forms), archive processes removals the clear made (`clear` only) |
+
+**Not modeled yet:** stores that write in place with late and dead writers,
+cleanup against the cut, lineage and digests, several upstream levels
+rebuilding at once, one witness per reason (STA-2), the propagation of
+"upstream stale" down the graph, and the cost of any of it at scale.
 
 ## Trace validation: simulation runs against the specs
 
