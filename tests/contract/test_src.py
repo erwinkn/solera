@@ -134,11 +134,14 @@ async def test_src_2_each_commit_that_changes_something_is_a_run_with_no_tasks(s
     assert view["created_at"] == pytest.approx(solera.clock() - 60, abs=1)
     assert [r["id"] for r in await solera.runs()] == [second["run"], first["run"]]
     solera.advance(2 * 86400)
-    await solera.upkeep()
-    assert await solera.runs() == []  # expired under the project's default
-    with pytest.raises(Refused) as gone:
-        await solera.get(f"/runs/{first['run']}")
-    assert gone.value.status == 404
+    await solera.start()  # served as `solera serve` runs it, upkeep included
+
+    async def expired():
+        response = await solera.request("GET", f"/runs/{first['run']}", ok=False)
+        return response.status_code == 404
+
+    await solera.until(expired)  # expired under the project's default
+    assert await solera.runs() == []
 
 
 async def test_src_3_a_keyed_loader_serves_rows_with_their_versions(solera):
@@ -332,6 +335,7 @@ async def test_src_7_a_file_source_serves_objects_at_the_stores_version(solera):
     data = solera.root / "data"
     (data / "incoming").mkdir(parents=True)
     (data / "incoming" / "a.txt").write_text("one")
+    (data / "incoming" / "b.txt").write_text("two")
     seen = {}
 
     @asset(inputs={"docs": Incremental()})
@@ -353,12 +357,20 @@ async def test_src_7_a_file_source_serves_objects_at_the_stores_version(solera):
         default_store=FileStore(data),
     )
     await solera.deploy(project)
-    for name in ("docs", "hashed"):
-        await solera.commit_source(name, upsert={"a.txt": "v1"})
+    await solera.commit_source("docs", upsert={"a.txt": "v1", "b.txt": "v1"})
+    await solera.commit_source("hashed", upsert={"a.txt": "v1"})
     await solera.run(["sizes", "hashes"])
     (content, served), hashed = seen["docs"], seen["hashed"]
-    assert content == {"a.txt": b"one"} and served["a.txt"]  # the file's stamp
+    assert content == {"a.txt": b"one", "b.txt": b"two"} and served["a.txt"] and served["b.txt"]
+    assert served["a.txt"] != served["b.txt"]  # each file's own stamp
     assert hashed == {"a.txt": "sha256:7692c3ad3540bb803c020b3aee66cd8887123234ea0c6e7143c0add73ff431ed"}
+
+    (data / "incoming" / "a.txt").write_text("three")  # changed outside Solera; no commit says so
+    await solera.run("sizes", keys={"docs": ["a.txt", "b.txt"]})
+    content, again = seen["docs"]
+    assert content == {"a.txt": b"three", "b.txt": b"two"}
+    assert again["a.txt"] != served["a.txt"]  # the file moved: so did its version
+    assert again["b.txt"] == served["b.txt"]  # untouched: the same version
 
 
 async def test_src_7_an_unkeyed_file_source_serves_the_objects_bytes(solera):

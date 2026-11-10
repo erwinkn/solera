@@ -285,14 +285,14 @@ async def test_aut_5_two_deploys_before_a_tick_fire_once_for_the_latest(solera):
 
 async def test_aut_6_a_failing_partitions_changes_back_off(solera):
     """`consumer` fails the same way on every change: its firings wait 60 s,
-    doubling with each failure in a row, and a success ends the wait. It
-    stays visibly failed meanwhile."""
+    doubling with each failure in a row up to an hour, and a success ends
+    the wait. It stays visibly failed meanwhile."""
 
-    calls, broken = [], {"on": True}
+    calls, broken, outside = [], {"on": True}, {"v": "0"}
 
-    @asset(outputs=Output("feed", key="id"))
-    def feed():
-        return [{"id": "a", "v": len(calls)}]
+    @source(key="id")
+    async def feed(keys, ctx):
+        return {k: Loaded({"id": k, "v": outside["v"]}, version=outside["v"]) for k in keys}
 
     @asset(inputs={"feed": Incremental()}, automations=OnChange(), retries=Retry(n=0))
     def consumer(feed: list):
@@ -301,29 +301,35 @@ async def test_aut_6_a_failing_partitions_changes_back_off(solera):
             raise RuntimeError("the input is broken")
         return []
 
-    await solera.deploy(Project(assets=[feed, consumer]))
-    await solera.run("feed")
+    async def change():
+        outside["v"] = str(int(outside["v"]) + 1)
+        await solera.commit_source("feed", upsert={"a": outside["v"]})
+
+    await solera.deploy(Project(assets=[consumer], sources=[feed]))
+    await change()
     await solera.until(lambda: calls)
     await solera.quiet()
     assert await solera.status("consumer") == "failed"
-    for _ in range(2):  # changes while it backs off: no runs
-        await solera.run("feed")
-        await solera.settle(0.05)
-    assert len(calls) == 1 and await solera.status("consumer") == "failed"
-    solera.advance(61)  # its wait is over: one run takes every change
-    await solera.until(lambda: len(calls) == 2)
-    await solera.quiet()
+    for wait in (60, 120, 240, 480, 960, 1920, 3600, 3600):  # doubling, then an hour at most
+        failed = len(calls)
+        await change()
+        await change()
+        solera.advance(wait - 30)
+        if wait in (60, 120, 3600):  # changes while it backs off: no runs
+            await solera.settle(0.05)
+            assert len(calls) == failed and await solera.status("consumer") == "failed"
+        solera.advance(31)  # its wait is over: one run takes every change
+        await solera.until(lambda: len(calls) == failed + 1)  # noqa: B023
+        await solera.wait((await solera.runs(origin="automation"))[0])
+    assert len(calls) == 9
     broken["on"] = False
-    await solera.run("feed")
-    solera.advance(61)
-    await solera.settle(0.1)
-    assert len(calls) == 2  # still waiting: the second wait is twice the first
-    solera.advance(61)
-    await solera.until(lambda: len(calls) == 3)
+    await change()
+    solera.advance(3601)
+    await solera.until(lambda: len(calls) == 10)
     await solera.quiet()
     assert await solera.status("consumer") != "failed"
-    await solera.run("feed")  # the success ended the wait
-    await solera.until(lambda: len(calls) == 4)
+    await change()  # the success ended the wait
+    await solera.until(lambda: len(calls) == 11)
 
 
 async def test_aut_7_automated_outputs_converge_on_their_sources(solera):
