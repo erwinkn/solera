@@ -277,13 +277,13 @@ def patches(reads: Reads) -> list[tuple]:
             reads.ended(model, e)
         return apply(model, e)
 
-    def restoring(model, snap):
+    def restoring(model, snap, **kw):
         """A model restored from a checkpoint knows of no launch before it: the
         attempts it holds start over (a journal opened again, after another
         engine wrote, restores the same model from a newer checkpoint)."""
 
         model.__dict__.pop("_sim_claims", None)
-        return restore(model, snap)
+        return restore(model, snap, **kw)
 
     def cutting(model, e):
         key = (e["output"], e["partition"])
