@@ -447,9 +447,9 @@ input change, which the commit check lets through, and the piece's
 conditions then make its keys owed. Inside that range the batch leaves a
 point for exactly the keys whose holding differs from what the new piece
 says: failed keys, keys held back from the batch, and keys loaded at
-another version. Each point written carries its reason (failed, held back,
-deviation, key list), which lineage needs (§12). Every other point in the
-range is dropped.
+another version. Each point written carries its reason (failed, held back
+by the planner, held back at commit, deviation, key list), which lineage
+needs (§12). Every other point in the range is dropped.
 
 **Why it is correct.** A key in the range that the batch did not take was
 not owed at H, which means it already held what `at(H)` says.
@@ -532,8 +532,26 @@ these additions:
   even if it also failed, and stays owed. A key held back on one input is
   held back on every input of the batch, since its output is one value
   computed from all of them. `Ops.held_back` names those keys
-  for the key outcomes (B6). The gate that holds readers of an incomplete
-  upstream is the engine's (B5).
+  for the key outcomes (B6), and their points carry their own reason,
+  `Unsettled`, apart from the planner's `HeldBack`, so lineage can tell a
+  key the batch never took from one it took and held back. The gate that
+  holds readers of an incomplete upstream is the engine's (B5).
+- **The commit is fenced against what decides a hold-back.** A batch that
+  kept a key loaded at another version on a settled input carries a fence:
+  that input's output and the head it planned at. The event is refused if
+  the edge reads another output by then, or the input has become unsettled,
+  since the key would then have been held back. A batch that held keys back
+  carries no fence for that input: holding back is always safe, and at worst
+  costs a later batch. The fence names the output among the things its part
+  touches, so no other part of the same event (a clear of that output) can
+  change what it reads.
+- **What the commit cannot check, it refuses.** `progress_ops`, and a
+  fenced event when it applies, refuse once a fold of the input's layers
+  has passed the batch's head (a layer's `floor` above it): the fold
+  dropped the clears after the head, so whether one came in is no longer
+  known. `progress_ops` also refuses a plan whose edge now reads another
+  output than it planned on, and a report that names a key the batch did
+  not take.
 
 ## 6. Staleness kept exact by propagation
 
@@ -812,7 +830,8 @@ About 200 bytes plus the replaced slice, usually one piece.
   a wrong list.
 - **Points written** carry the deviations (§8): keys loaded at another
   version than planned, with the version loaded. Each point names its
-  reason: failed, held back, deviation, or key list.
+  reason: failed, held back by the planner, held back at commit (§10 rule
+  4), deviation, or key list.
 - **A key-list run records its key list**, the one case where planned keys
   are stored: the user's input cannot be derived.
 
@@ -1115,10 +1134,15 @@ upstream's clear still makes its consumer run full (INC-13 stays).
    than it planned, if its upstream is incomplete, **or if a clear has
    come since the batch planned** (in the commits after its head H), even
    when that rebuild has completed by the time the batch commits. The key
-   keeps its old point and stays owed; a later batch retries it. On stores
-   that name objects by version a load is exact, so this never fires. On a
-   table it is the same rule as §8's rule 4, and is built as one rule with
-   it. To tell which rebuild, if any, a key loaded as absent belongs to,
+   keeps its old point and stays owed; a later batch retries it. A key held
+   back on any input of a batch is held back on every input of that batch,
+   because the key's output is one value computed from all its inputs:
+   holding it back on one input only would either keep an output built on
+   a load from the middle of a rebuild, or throw that output away while the
+   other inputs record their new versions as processed, so the key would
+   never be retried for them. On stores that name objects by version a load
+   is exact, so this never fires. On a table it is the same rule as §8's
+   rule 4, and is built as one rule with it. To tell which rebuild, if any, a key loaded as absent belongs to,
    the engine looks at the commit that last removed it (by a clear or by
    an ordinary removal): the last removal at or before H when the batch
    planned the key absent, and, only on a table for a key planned present

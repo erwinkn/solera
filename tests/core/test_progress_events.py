@@ -1,7 +1,7 @@
 """Events on the tracking core's state: refused whole, never half applied."""
 
 import pytest
-from solera._native import ChangeIndex, Tracking
+from solera._native import ChangeIndex, Tracking, encode_changes
 
 
 def items(tmp_path, n: int) -> Tracking:
@@ -112,7 +112,7 @@ def test_a_key_loaded_at_another_version_with_no_full_run_is_a_deviation(tmp_pat
     assert t.owed(b"e", {}) == ([], None)
 
 
-def test_a_commit_is_refused_when_a_full_run_starts_or_ends_after_it_was_built(tmp_path):
+def test_a_commit_is_refused_when_a_full_run_starts_after_it_was_built(tmp_path):
     t, ix, layers = upstream(tmp_path)
     plan = plan_all(t)
     layers.append(ix.write_commit("items/2", 2, [("k1", 2, 1)], live_before=2))
@@ -120,7 +120,7 @@ def test_a_commit_is_refused_when_a_full_run_starts_or_ends_after_it_was_built(t
     event = t.progress_ops(plan, [([], [("k1", 2)])])[0]  # k1 is a deviation
     layers.append(ix.write_commit("items/3", 3, [("k1", 2, None)], live_before=2, clear=True))
     t._set_output(b"items", layers, 3, 1, 3)
-    with pytest.raises(ValueError, match="full run moved"):
+    with pytest.raises(ValueError, match="became unsettled"):
         t.apply(event)
     held = t.progress_ops(plan, [([], [("k1", 2)])])
     assert held[2] == [["k1"]]
@@ -129,7 +129,9 @@ def test_a_commit_is_refused_when_a_full_run_starts_or_ends_after_it_was_built(t
     t.apply(unmoved)  # loaded as planned: the full run's state did not decide anything
 
 
-def test_a_commit_held_mid_full_run_is_refused_once_the_full_run_has_ended(tmp_path):
+def test_a_commit_held_mid_full_run_applies_once_the_full_run_has_ended(tmp_path):
+    """Holding back is always safe: the key stays owed and the next batch
+    takes it, so the end of the full run does not refuse the commit."""
     ix = ChangeIndex(f"file://{tmp_path}")
     t = Tracking()
     t.attach(b"items", ix)
@@ -142,8 +144,8 @@ def test_a_commit_held_mid_full_run_is_refused_once_the_full_run_has_ended(tmp_p
     event, _, held_back = t.progress_ops(plan, [([], [("k1", 2)])])
     assert held_back == [["k1"]]
     t.apply(Tracking.event_full_run_done(b"items"))
-    with pytest.raises(ValueError, match="full run moved"):
-        t.apply(event)
+    t.apply(event)
+    assert t.owed(b"e", {}) == ([("k1", "added")], None)
 
 
 def test_a_key_held_back_on_one_input_is_held_back_on_every_input(tmp_path):
@@ -165,3 +167,73 @@ def test_a_key_held_back_on_one_input_is_held_back_on_every_input(tmp_path):
     assert held_back == [["k"], ["k"]]
     t.apply(event)
     assert t.owed(b"r/b", {}) == ([("k", "added")], None)
+
+
+def test_a_commit_is_refused_once_its_edge_reads_another_output(tmp_path):
+    """Whether a load is held back is decided on the output the plan read: a
+    commit for an edge renamed to read another output since is refused."""
+    t, ix, layers = upstream(tmp_path)
+    t.attach(b"other", ix)
+    other = [ix.write_commit("other/1", 1, [("k1", 1, None)], live_before=0, clear=True)]
+    t._set_output(b"other", other, 1, 1, 1)
+    plan = plan_all(t)
+    layers.append(ix.write_commit("items/2", 2, [("k1", 2, 1)], live_before=2))
+    t._set_output(b"items", layers, 2, 2)
+    event = t.progress_ops(plan, [([], [("k1", 2)])])[0]
+    t.apply(Tracking.event_edge_rename(b"e", b"e", b"other"))
+    with pytest.raises(ValueError, match="reads another output"):
+        t.apply(event)
+    with pytest.raises(ValueError, match="reads another output"):
+        t.progress_ops(plan, [([], [("k1", 2)])])
+
+
+def test_a_commit_is_refused_once_a_fold_passes_the_head_it_planned_at(tmp_path):
+    """A fold through a commit after the plan's head drops the clears it
+    covered, so the commit can no longer tell whether its loads are safe."""
+    t, ix, layers = upstream(tmp_path)
+    plan = plan_all(t)
+    layers.append(ix.write_commit("items/2", 2, [("k1", 2, None)], live_before=2, clear=True))
+    layers.append(ix.write_commit("items/3", 3, [("k2", 3, None)], live_before=1))
+    t._set_output(b"items", layers, 3, 2)
+    assert t.progress_ops(plan, [([], [("k1", 2)])])[2] == [["k1"]]
+    t._set_output(b"items", [ix.merge(layers, 0, 3, 3, "items/m")], 3, 2)
+    with pytest.raises(ValueError, match="no longer reach back"):
+        t.progress_ops(plan, [([], [("k1", 2)])])
+
+
+def test_a_fenced_commit_is_refused_once_a_fold_passes_the_head_it_planned_at(tmp_path):
+    t, ix, layers = upstream(tmp_path)
+    plan = plan_all(t)
+    layers.append(ix.write_commit("items/2", 2, [("k1", 2, 1)], live_before=2))
+    t._set_output(b"items", layers, 2, 2)
+    event = t.progress_ops(plan, [([], [("k1", 2)])])[0]
+    t._set_output(b"items", [ix.merge(layers, 0, 2, 2, "items/m")], 2, 2)
+    with pytest.raises(ValueError, match="no longer reach back"):
+        t.apply(event)
+
+
+def test_a_fenced_commit_cannot_share_an_event_with_a_commit_to_the_output_it_reads(tmp_path):
+    """The fence reads the input's output, so no other part of its event may
+    change it: the event's outcome would depend on the order of its parts."""
+    ix = ChangeIndex(f"file://{tmp_path}")
+    t = Tracking()
+    t.attach(b"items", ix)
+    t.apply(t.build_commit(b"items", encode_changes(["k1", "k2"], []), version=1, path="items/1")["event"])
+    t.apply(Tracking.event_edge_open(b"e", b"items", True))
+    plan = plan_all(t)
+    t.apply(t.build_commit(b"items", encode_changes(["k1"], []), version=2, path="items/2")["event"])
+    event, _, held_back = t.progress_ops(plan, [([], [("k1", 2)])])
+    assert held_back == [[]]
+    clear = t.build_commit(b"items", encode_changes(["k1"], []), version=3, path="items/3", mode="clear")
+    with pytest.raises(ValueError, match="two parts of one event change output items"):
+        t.apply(Tracking.join([clear["event"], event]))
+
+
+def test_a_report_naming_a_key_the_batch_did_not_take_is_refused(tmp_path):
+    t, _, _ = upstream(tmp_path)
+    plan = plan_all(t)
+    with pytest.raises(ValueError, match="did not take"):
+        t.progress_ops(plan, [(["zz"], [])])
+    with pytest.raises(ValueError, match="did not take"):
+        t.progress_ops(plan, [([], [("k0", 1)])])
+    t.apply(t.progress_ops(plan, [(["k2"], [("k1", 1)])])[0])

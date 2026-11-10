@@ -71,6 +71,29 @@ impl Tracking {
         }) {
             return invalid("a report's keys are sorted and distinct");
         }
+        let taken = |p: &InputPlan, k: &Key| p.keys.binary_search_by(|c| c.key.cmp(k)).is_ok();
+        if plan.inputs.iter().zip(reports).any(|(p, r)| {
+            !r.failed.iter().all(|k| taken(p, k)) || !r.loaded.iter().all(|(k, _)| taken(p, k))
+        }) {
+            return invalid("a report names a key the batch did not take");
+        }
+        let mut keyed = Vec::with_capacity(plan.inputs.len());
+        for p in &plan.inputs {
+            let Some((input, k)) = self
+                .edges
+                .get(&p.edge)
+                .and_then(|e| Some((&e.input, e.progress.keyed()?)))
+            else {
+                return invalid(format!("no keyed edge {}", String::from_utf8_lossy(&p.edge)));
+            };
+            if **input != *p.output {
+                return invalid("the edge reads another output than the batch planned");
+            }
+            if read_digest(k, plan.reset, &plan.range) != p.expect {
+                return invalid("the edge's progress moved since the batch was planned");
+            }
+            keyed.push(k);
+        }
         let moved = |p: &InputPlan, r: &InputReport, c: &Cand| {
             r.loaded
                 .binary_search_by(|(x, _)| x.cmp(&c.key))
@@ -80,11 +103,11 @@ impl Tracking {
                     owed(&got, &wanted)
                 })
         };
-        let unsettled: Vec<bool> = plan
+        let unsettled = plan
             .inputs
             .iter()
             .map(|p| unsettled(self, &p.output, p.head))
-            .collect();
+            .collect::<Result<Vec<bool>>>()?;
         let hold: BTreeSet<&Key> = plan
             .inputs
             .iter()
@@ -97,16 +120,9 @@ impl Tracking {
         let mut parts = Vec::new();
         let mut records = Vec::new();
         let mut held_back = Vec::new();
-        for ((p, report), &unsettled) in plan.inputs.iter().zip(reports).zip(&unsettled) {
-            let Some(keyed) = self.edges.get(&p.edge).and_then(|e| e.progress.keyed()) else {
-                return invalid(format!(
-                    "no keyed edge {}",
-                    String::from_utf8_lossy(&p.edge)
-                ));
-            };
-            if read_digest(keyed, plan.reset, &plan.range) != p.expect {
-                return invalid("the edge's progress moved since the batch was planned");
-            }
+        for (((p, report), &unsettled), keyed) in
+            plan.inputs.iter().zip(reports).zip(&unsettled).zip(keyed)
+        {
             let failed = |k: &Key| report.failed.binary_search(k).is_ok();
             let loaded = |k: &Key| {
                 report
@@ -115,13 +131,12 @@ impl Tracking {
                     .ok()
                     .map(|i| &report.loaded[i].1)
             };
-            let mut any_moved = false;
+            let mut kept_moved = false;
             let mut held = Vec::new();
             let mut points: Vec<(Key, Point)> = Vec::new();
             let key_list = matches!(plan.mode, Mode::Keys(_));
             for c in &p.keys {
                 let wanted = Holding::of(c.version.as_version(), &p.conditions, &c.key);
-                any_moved |= moved(p, report, c);
                 if hold.contains(&c.key) {
                     held.push(c.key.clone());
                     if key_list || owed(&c.held, &wanted) {
@@ -129,13 +144,14 @@ impl Tracking {
                             c.key.clone(),
                             Point {
                                 holding: c.held.clone(),
-                                reason: Reason::HeldBack,
+                                reason: Reason::Unsettled,
                                 seen: (!key_list).then(|| c.version.clone()),
                             },
                         ));
                     }
                     continue;
                 }
+                kept_moved |= moved(p, report, c);
                 if failed(&c.key) {
                     if key_list || owed(&c.held, &wanted) {
                         points.push((
@@ -224,7 +240,7 @@ impl Tracking {
                 piece: (!key_list).then(|| Value::At(p.head, p.conditions.clone())),
                 points,
                 expect: p.expect,
-                fence: any_moved.then_some((p.head, unsettled)),
+                fence: (kept_moved && !unsettled).then(|| (p.output.clone(), p.head)),
             }));
         }
         for u in &plan.unkeyed {
