@@ -155,6 +155,23 @@ fn a_retry_drops_every_part_computed_before_it() {
         (1, &stale("k1", 10)),
         "a notice built before the retry came due does not make the edge fresh"
     );
+
+    let mut t = opened();
+    know(&mut t, 1, State::Fresh);
+    let retry = Part::Witness(Witness {
+        edge: EDGE.into(),
+        gen: t.stale.inputs[EDGE].gen,
+        x: 1,
+        state: stale("k1", 10),
+        retry: true,
+    });
+    know(&mut t, 2, State::Fresh);
+    apply(&mut t, vec![retry]);
+    let i = &t.stale.inputs[EDGE];
+    assert!(
+        i.current().is_none() && i.changed == stale::Changed::All,
+        "a retry that lost the race to a later notice still makes the edge unknown"
+    );
 }
 
 #[test]

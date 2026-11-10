@@ -434,8 +434,9 @@ pub struct Witness {
     pub x: u64,
     pub state: State,
     /// A failed key's retry came due: what is due changed with no change to
-    /// progress, so the part starts a new generation and every part computed
-    /// before it is dropped.
+    /// progress, so the part starts a new generation (every part computed
+    /// before it is dropped, and the edge is probed from its first key unless
+    /// the part installs a witness). `Fresh` here means none of the keys is due.
     pub retry: bool,
 }
 
@@ -464,12 +465,18 @@ impl Witness {
 
     /// Installs what was found, unless the edge moved since it was computed
     /// or something newer is already known. An edge that stays stale keeps
-    /// the moment it went stale.
+    /// the moment it went stale. A retry's part starts a new generation
+    /// first, whether or not it installs anything.
     pub(crate) fn apply(self, t: &mut Tracking) {
         let Some(i) = t.stale.inputs.get_mut(&self.edge) else {
             return;
         };
-        if self.gen != i.gen || i.current().is_some_and(|k| k.x > self.x) {
+        let fits = self.gen == i.gen && !i.current().is_some_and(|k| k.x > self.x);
+        if self.retry {
+            t.stale.gens += 1;
+            i.moved(t.stale.gens, None);
+        }
+        if !fits || self.retry && self.state == State::Fresh {
             return;
         }
         let state = match (self.state, i.known.as_ref().map(|k| &k.state)) {
@@ -482,10 +489,6 @@ impl Witness {
             }
             (s, _) => s,
         };
-        if self.retry {
-            t.stale.gens += 1;
-            i.gen = t.stale.gens;
-        }
         i.known = Some(Known {
             gen: i.gen,
             x: self.x,

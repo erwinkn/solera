@@ -748,8 +748,9 @@ generation, as of one upstream commit.
   dropped and recomputed. A lost or late notice delays an answer, never
   changes it.
 - **Retries** (rule 5): a failed key whose retry came due makes a fresh edge
-  stale, and starts a new generation, since what is due changed with no
-  change to progress; at startup the engine applies it to every retry
+  stale, and always starts a new generation, since what is due changed with
+  no change to progress (a notice or refresh computed before it is dropped,
+  and one that wins the race leaves the edge unknown); at startup the engine applies it to every retry
   already due. Generations come from one counter and are never reused, so
   a part for an edge since closed never applies to one reopened under its
   name.

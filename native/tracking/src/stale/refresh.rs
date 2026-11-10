@@ -273,8 +273,12 @@ fn since(state: State, time_ms: u64) -> State {
 }
 
 /// Rule 5: some of an edge's failed keys came due for a retry (their backoff
-/// ended, or one was forced). A fresh edge becomes stale with the first of
-/// them that is due. Also applied at startup to every retry already due.
+/// ended, or one was forced). What is due changed with no change to
+/// progress, so the part always starts a new generation. A fresh edge
+/// becomes stale with the first of them that is due; a stale one keeps its
+/// witness; if none is due, the part carries `Fresh` and installs nothing.
+/// Also applied at startup to every retry already due. None while the gate
+/// holds the edge: lifting it probes the edge anyway.
 pub async fn retry_due(
     ask: &Ask,
     ixs: &dyn Indexes,
@@ -282,26 +286,31 @@ pub async fn retry_due(
     keys: &[Key],
     time_ms: u64,
 ) -> Result<Option<Witness>> {
-    if ask.held
-        || ask
-            .input
-            .current()
-            .is_some_and(|k| matches!(k.state, State::Stale { .. }))
-    {
+    if ask.held {
         return Ok(None);
     }
-    for k in keys {
-        if let Some(state) = ask.recheck(ixs, due, k).await? {
-            return Ok(Some(Witness {
-                edge: ask.edge.clone(),
-                gen: ask.input.gen,
-                x: ask.head,
-                state: since(state, time_ms),
-                retry: true,
-            }));
+    let mut part = Witness {
+        edge: ask.edge.clone(),
+        gen: ask.input.gen,
+        x: ask.head,
+        state: State::Fresh,
+        retry: true,
+    };
+    match ask.input.current() {
+        Some(k) if matches!(k.state, State::Stale { .. }) => {
+            part.x = k.x;
+            part.state = k.state.clone();
+        }
+        _ => {
+            for k in keys {
+                if let Some(state) = ask.recheck(ixs, due, k).await? {
+                    part.state = since(state, time_ms);
+                    break;
+                }
+            }
         }
     }
-    Ok(None)
+    Ok(Some(part))
 }
 
 /// Rules 1 and 2 at commit `commit` of `output`, from the commit's entries
