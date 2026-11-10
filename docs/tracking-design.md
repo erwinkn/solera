@@ -536,8 +536,8 @@ key it finds, or finds none.
    startup**, the engine applies this rule to every retry already due in
    that index, since a timer that fired before a restart may not have been
    recorded.
-6. **The probe** returns a witness, or nothing, and then the edge is fresh
-   as of the head.
+6. **The probe** returns a witness, and the edge is stale with it; or it
+   returns nothing, and the edge is fresh as of the head.
 7. **Asking, and catching up.** Compare X with the upstream's head; if the
    head is newer, run the commits in between through rules 1 and 2, in
    order. A lost notification can delay an answer by one comparison, never
@@ -621,7 +621,7 @@ scattered daily changes.
 | Is the partition stale? | Any of its edges has a witness (STA-3: a default run would load something) |
 | Upstream stale | A partition whose stale status flips tells its consumers, which tell theirs: work only where the status changes |
 | Complete? (D177) | For each `empty` piece, whether it has an upstream key: one key or none |
-| How many keys owed? | Counted when asked: the keys an unlimited plan would take plus the owed keys not yet due (failing keys waiting for their retry, and keys held back while their producer repairs an anomaly, §8), each counted once; cached until the upstream or the progress changes. No number while a gate holds the edge (D197) |
+| How many keys owed? | Counted when asked: the keys an unlimited plan would take plus the owed keys not yet due (failing keys waiting for their retry, and keys held back while their producer repairs an anomaly, §8), each counted once; cached until the upstream, the progress or the conditions (patterns, context, definition, rebuild counter) change. No number while a gate holds the edge (D197) |
 | How many commits behind, since when? | The oldest owing piece's commit, against the head and the commit headers; "since" from the witness |
 | Which keys? | The planner without a limit, on demand; costs a read proportional to the answer |
 
@@ -917,7 +917,9 @@ key, without one) and no exclude. A pattern is a glob over the key string
 **Settled (D209): a `Regex` uses the Rust `regex` dialect, matched against
 the whole key.** The SDK validates it when the input is declared, through
 the same native matcher the core uses, and refuses lookaround and
-backreferences with an error that names what the dialect lacks. Python's
+backreferences with an error that names what the dialect lacks. Today's
+Python path matches through that matcher too, never through Python's
+`re`. Python's
 `re` and Rust's `regex` differ in syntax and in Unicode classes, so two
 dialects would let the SDK and the core disagree on which keys are owed;
 matching in Python instead would cross into Python once per key (D203).
@@ -1010,10 +1012,12 @@ upstream's clear still makes its consumer run full (INC-13 stays).
    keeps its old point and stays owed; a later batch retries it. On stores
    that name objects by version a load is exact, so this never fires. On a
    table it is the same rule as §8's rule 4, and is built as one rule with
-   it. To tell which rebuild a key loaded as absent belongs to, the engine
-   takes the clear at or before H that removed it, and only on a table,
-   for a key planned present that loads absent, the last clear at load
-   time. It records this when the batch loads, not when it commits.
+   it. To tell which rebuild, if any, a key loaded as absent belongs to,
+   the engine looks at the commit that last removed it (by a clear or by
+   an ordinary removal): the last removal at or before H when the batch
+   planned the key absent, and, only on a table for a key planned present
+   that loads absent, the last removal at load time. It records this when
+   the batch loads, not when it commits.
 5. **A canceled or failed full run** leaves the upstream incomplete, and
    nothing resumes a run by itself (RUN-10). It raises an alarm, and one
    operator command lets downstream proceed over the partial output.
@@ -1422,7 +1426,7 @@ executable contract tests, as part of the build (T41).
 
 | Proposed id | Rule | Example | From |
 |---|---|---|---|
-| INC-15 | An upstream full run reaches downstream as one change; downstream keeps its progress and never removes a key to add it back | §10: archive gets k1, k2, k4 updated, k3 removed, k5 added in one diff | D205 |
+| INC-15 | An upstream full run reaches downstream as one change; downstream keeps its progress, and the rebuild alone never makes it remove a key and add it back (a key upstream really removed and re-added still is) | §10: archive gets k1, k2, k4 updated, k3 removed, k5 added in one diff | D205 |
 | INC-16 | A reader's batch holds back every key it loaded at another version than it planned, while its upstream is incomplete or if a clear came since it planned; the key stays owed | §10: archive's batch in flight loads k3, k4 absent after copy's clear | D205 |
 | STA-13 | Every reader of an incomplete upstream (keyed, accumulating, whole) runs no batch over it, by default; an input may opt out. A canceled or failed full run raises an alarm, and one command lets downstream proceed | §10: archive is held while copy's full run is between batches | D205 |
 | STA-14 | No false alarms: a partition is stale only if something is due; changes that cancel out start nothing | §6: feed's k1 v1 → v2 → v1 | D183 |
@@ -1521,10 +1525,10 @@ store is exact" stands: D196 keeps it.
 | # | Decision | Was | Where | Evidence |
 |---|---|---|---|---|
 | D205 | Full runs: the clear at the first batch, plus the gate on every reader of an incomplete upstream (keyed, accumulating, whole), with an opt-out per input; a reader's batch holds back what it loaded at another version than planned while its upstream is incomplete or if a clear came since it planned; a canceled or failed full run raises an alarm and has one command that lets downstream proceed. No new life | P7, P12 (review F2) | §4, §7, §10 | Model (`tests/tracking`): both forms pass every invariant over 5,000 histories × 60 steps on file and table stores; the clear needs 6 rules where the floor needs 7 plus an SDK declaration, writes 17% fewer entries, and needs no second mechanism for single-value outputs. The rebuild in place would have kept readers available (archive held 5,499 times in 2,000 histories under the clear, 0 under the floor) |
-| D206 | Staleness: one witness due key per input, kept exact at every upstream commit, counts on request; with the model's fixes (catch up first, a reset probes the whole input, a reset to `held` probes, a restart re-arms due retries, an outcome never outlives its point). P14's eager counts are not built | P14 (review F3) | §6, §11 | Model: both forms exact over 5,000 histories × 40 steps once fixed (P14 as written miscounted in three cases); one key and one commit number per input; 124 model lines against 150; 4,079 entries read against 43,860 adjusted. Count-on-request cost at scale: measured by unit B7 |
-| D207 | The engine builds every commit, on a thread off its event loop; nothing goes to a worker | Review F4 | §4, §7 | SOLE-12 at 100M keys: a 10k-key batch in one range about 10 ms CPU, 11–15 GETs cold, one 62 KB PUT; a 100M-key commit streamed about 30 s CPU, 579 MB peak. The scattered 10k-key batch (2.6–2.9 s) is the index's `get`, fixed there |
+| D206 | Staleness: one witness due key per input, kept exact at every upstream commit, counts on request; with the model's fixes (catch up first, a reset probes the whole input, a reset to `held` probes, a restart re-arms due retries, an outcome never outlives its point). P14's eager counts are not built | P14 (review F3) | §6, §11 | Model: both forms exact over 5,000 histories × 40 steps once fixed (P14 as written miscounted in three cases); one key and one commit number per input; 124 model lines against 150; 4,079 entries read against 43,860 adjusted. Count-on-request cost at scale: still to be measured, by unit B7 |
+| D207 | The engine builds every commit, on a thread off its event loop; nothing goes to a worker | Review F4 | §4, §7 | SOLE-12 at 100M keys: a 10k-key batch in one range about 10 ms CPU, 11–15 GETs cold, one 62 KB PUT; a 100M-key commit streamed about 30 s CPU, 579 MB peak. The scattered 10k-key batch (2.6–2.9 s) is the index's `get`, to be fixed there |
 | D208 | The core does its own I/O in Rust (`object_store`), with one shared memory cache, single-flight fetches and an on-disk cache of layer files; synchronous calls that release the GIL; heavy queries capped by the engine | The I/O boundary | §1, §15 | SOLE-6, 50 concurrent queries on local files, S3 and S3 + 30 ms: equal on small queries; on 1K scattered gets Python fetching cost 100–120 µs more CPU per GET, stalled the event loop up to 0.76 s (Rust under 60 ms) and was 3–93% slower. Cost: +60 s release build, +8 MB |
-| D209 | A `Regex(...)` key pattern uses the Rust `regex` dialect, matched against the whole key, validated at declaration by the native matcher; lookaround and backreferences are refused | A contract choice in the build (SOLE-11) | §9 | Two dialects would make the SDK and the core disagree on which keys are owed; matching in Python would cross once per key; the Rust dialect is linear-time. Pre-usage, so no pattern breaks. Visible to users |
+| D209 | A `Regex(...)` key pattern uses the Rust `regex` dialect, matched against the whole key, validated at declaration by the native matcher, which today's Python path also matches through; lookaround and backreferences are refused | A contract choice in the build (SOLE-11) | §9 | Two dialects would make the SDK and the core disagree on which keys are owed; matching in Python would cross once per key; the Rust dialect is linear-time. Pre-usage, so no pattern breaks. Visible to users |
 
 Nothing in this design is pending. What remains to measure (the cost of a
 count on request at the scale target, among others) is listed with the
@@ -1594,7 +1598,8 @@ and batches that start at a piece boundary (asserted).
   equals its store; every consumer's progress decodes to what it
   processed; a plan takes exactly the first due keys; completeness is
   exact; no reader processes a row of an unfinished rebuild; no keyed
-  reader is given a key removed and then added back within one rebuild;
+  reader is given a key removed and then added back within one rebuild,
+  unless `items` really removed and re-added it meanwhile;
   `summary` never reads a copy that is incomplete or mixes definitions.
   Once quiet, every output equals what its definition gives from its
   inputs.
