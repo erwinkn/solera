@@ -91,7 +91,14 @@ async def prepare(core: Core, task: dict, run: dict, attempt: str | None) -> dic
         all_empty = all_empty and empty
     mine = progress.get("core")
     if keyed and mine is not None and mine["key"] is None:  # walked to the end in this task
-        for input in keyed:
+        # While unkeyed inputs go on, each keyed one is delivered empty and final, its edge left be.
+        index = int(mine["batch"]) + 1
+        for n, input in enumerate(keyed):
+            pins[input.param] = {
+                "ref": engine._pin_at(input.output, input.partition),
+                "core": n,
+                "batch": {"index": index, "count": index + 1, "final": True, "reset": False},
+            }
             plans[input.param] = {"kind": "core", "output": input.output, "final": True, "done": True}
     elif keyed:
         edges = open_edges(core, task, keyed)

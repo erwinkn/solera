@@ -18,15 +18,18 @@ from ..state import Conflict
 from . import Core
 
 SOURCE_KEYS_RECORDED = 1000  # a source commit's run lists changed keys up to this many, else counts
+PAGE = 10_000  # history entries a tick's staleness check reads at a time
 
 
 async def build(
-    core: Core, name: str, generation: int, keys, upsert, remove, listed: str | None
+    core: Core, name: str, generation: int, run: str, keys, upsert, remove, listed: str | None, at: int | None
 ) -> dict | None:
     """Build a keyed source's next commit: `{"event", "minted", "counts",
     "upserted", "deleted", "elements"}`, or None when it changes nothing.
-    Its layer is written; the caller checks and records the event, or
-    leaves the layer an orphan (build plan B9 sweeps them)."""
+    Its layer is named by its run, which no other build shares; the caller
+    checks and records the event, or leaves the layer an orphan (build plan
+    B9 sweeps them). With `at`, it is a load's report (SRC-12): a key counts
+    only if the log holds the same version for it at `at` and at the head."""
 
     def versions(given) -> dict:
         if isinstance(given, dict):
@@ -38,7 +41,7 @@ async def build(
     else:
         new = versions(upsert)
         changes = encode_changes(new, [str(k) for k in remove or [] if str(k) not in new])
-        mode = "patch"
+        mode = "patch" if at is None else "report"
     minted: list = []
     id_ = core.output_id(name, "", minted)
     core.attach(id_)
@@ -48,10 +51,11 @@ async def build(
         id_.encode(),
         changes,
         version=generation,
-        path=core.path(id_, out["head"] + 1, f"g{generation}"),
+        path=core.path(id_, out["head"] + 1, run),
         time_ms=int(core.engine.clock() * 1000),
         producer=f"source:{generation}".encode(),
         mode=mode,
+        at=at,
         collect=max(2 * SOURCE_KEYS_RECORDED, 1_000_000 if listed is not None else 0),
     )
     if found is None:
@@ -74,9 +78,10 @@ async def build(
 
 
 async def moved(core: Core, name: str, since: int, commit: dict) -> bool:
-    """Whether a sensor tick's commit to source `name` is stale (D193): a key
-    it reports changed since the tick observed the source at commit `since`.
-    A full map reports every key, so any commit since makes it stale."""
+    """Whether a sensor tick's commit to keyed source `name` is stale (D193):
+    a key it reports has an entry in a commit after `since`, the commit the
+    tick observed, removals included. A full map reports every key, so any
+    commit since makes it stale."""
 
     found = core.m.core_output(name, "")
     head = found["head"] if found is not None else 0
@@ -84,24 +89,36 @@ async def moved(core: Core, name: str, since: int, commit: dict) -> bool:
         return False
     if commit.get("keys") is not None:
         return True
-    keys = sorted({str(k) for k in commit.get("upsert") or ()} | {str(k) for k in commit.get("remove") or ()})
+    keys = {str(k) for k in commit.get("upsert") or ()} | {str(k) for k in commit.get("remove") or ()}
     if not keys:
         return False
     core.attach(core.m.core_outputs[(name, "")])
-    now, _ = await core.run(core.index.get, found["layers"], head, keys)
-    then, _ = await core.run(core.index.get, found["layers"], since, keys) if since else ([], None)
-    return any(row[1] > since for row in now) or bool({row[0] for row in then} - {row[0] for row in now})
+    after = None
+    while True:
+        rows, after = await core.run(
+            core.index.history,
+            found["layers"],
+            commits=(since + 1, head),
+            hi=max(keys),
+            after=after,
+            limit=PAGE,
+        )
+        if any(key in keys for key, _ in rows):
+            return True
+        if after is None:
+            return False
 
 
 async def record_loads(engine, attempt: str, prepared: dict, result: dict) -> None:
     """A batch that loaded a source's key at another version than its log
     says records it in the log (SRC-12, D193): a commit of the source by the
-    load, unless the log changed the key since the batch's head (it then
-    knows better). A key found absent is not: the log lists it until a
-    commit says otherwise (SRC-5). Recorded after the batch's commit; lost in a crash
-    between the two, the key is owed again, as on today's path."""
+    load, as a report against the batch's head, so a key the log changed
+    since then is dropped (it knows better). A key found absent is not: the
+    log lists it until a commit says otherwise (SRC-5). Recorded after the
+    batch's commit; lost in a crash between the two, or refused because the
+    source moved meanwhile, the key is owed again, as on today's path."""
 
-    core, delivered = engine.core, result.get("delivered") or {}
+    delivered = result.get("delivered") or {}
     for param, plan in (prepared.get("plans") or {}).items():
         if (
             (plan or {}).get("kind") != "core"
@@ -109,16 +126,9 @@ async def record_loads(engine, attempt: str, prepared: dict, result: dict) -> No
             or plan["output"] not in engine.manifest["sources"]
         ):
             continue
-        loaded = [kv for kv in (delivered.get(param) or {}).get("loaded") or () if kv[1] is not None]
-        found = core.m.core_output(plan["output"], "")
-        if not loaded or found is None:
-            continue
-        keys = sorted(k for k, _ in loaded)
-        core.attach(core.m.core_outputs[(plan["output"], "")])
-        now, _ = await core.run(core.index.get, found["layers"], found["head"], keys)
-        then, _ = await core.run(core.index.get, found["layers"], plan["head"], keys)
-        moved = {r[0] for r in now} ^ {r[0] for r in then} | {r[0] for r in now if r[1] > plan["head"]}
-        upsert = {k: v for k, v in loaded if v is not None and k not in moved}
+        upsert = {k: v for k, v in (delivered.get(param) or {}).get("loaded") or () if v is not None}
         if upsert:
-            with contextlib.suppress(Conflict):  # the log moved meanwhile: it knows better
-                await engine.commit_source(plan["output"], upsert=upsert, by=f"load {attempt}")
+            with contextlib.suppress(Conflict):
+                await engine.commit_source(
+                    plan["output"], upsert=upsert, by=f"load {attempt}", at=plan["head"]
+                )

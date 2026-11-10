@@ -10,6 +10,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 
+use pyo3::buffer::PyBuffer;
 use pyo3::exceptions::{PyKeyError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList, PyTuple};
@@ -119,9 +120,19 @@ impl KeyMatcher {
     }
 
     fn __call__(&self, key: &str) -> bool {
-        self.included(key) && self.excluded_by(key).is_none()
+        self.takes(key.as_bytes())
     }
 }
+
+impl KeyMatcher {
+    fn takes(&self, key: &[u8]) -> bool {
+        (self.include.is_empty() || self.include.iter().any(|m| m.matches(key)))
+            && !self.exclude.iter().any(|(_, m)| m.matches(key))
+    }
+}
+
+/// Keys a `Tracking.taken` scan reads in one page.
+const TAKEN_PAGE: u64 = 64 << 10;
 
 /// Refuses a pattern outside Solera's regex dialect, with what it lacks.
 #[pyfunction]
@@ -371,6 +382,52 @@ impl Tracking {
         }
         d.set_item("layers", layers)?;
         Ok(Some(d))
+    }
+
+    /// Whether `output` holds at its head a key after `after` that
+    /// `patterns` (`solera.patterns.spec(…)`) take: a scan of its attached
+    /// index, a page at a time, stopping at the first such key. Nothing
+    /// crosses per key; False before its first commit.
+    #[pyo3(signature = (output, patterns=None, after=None))]
+    fn taken(
+        &self,
+        py: Python<'_>,
+        output: &[u8],
+        patterns: Option<&Bound<'_, PyAny>>,
+        after: Option<String>,
+    ) -> PyResult<bool> {
+        guard(|| {
+            let matcher = KeyMatcher::new(patterns)?;
+            let Some(o) = self.state.read().unwrap().outputs.get(output).cloned() else {
+                return Ok(false);
+            };
+            let ixs = self.indexes.read().unwrap().clone();
+            py.detach(|| {
+                rt().block_on(async {
+                    let ix = tr::plan::Indexes::index(ixs.as_ref(), output)?;
+                    let mut q = ix::Query {
+                        after: after.map(String::into_bytes),
+                        limit: Some(TAKEN_PAGE),
+                        ..Default::default()
+                    };
+                    loop {
+                        let mut found = false;
+                        let next = ix
+                            .state_with(&o.layers, o.head, None, &q, |k, _, _, _| {
+                                found = found || matcher.takes(k)
+                            })
+                            .await
+                            .map_err(tr::Error::Index)?;
+                        match next {
+                            _ if found => return Ok(true),
+                            Some(n) => q.after = Some(n),
+                            None => return Ok(false),
+                        }
+                    }
+                })
+            })
+            .map_err(err)
+        })
     }
 
     /// The change index that holds `output`'s layers (runtime configuration, not
@@ -653,14 +710,16 @@ impl Tracking {
     /// B4: builds and writes the next commit of `output` from its changed
     /// keys (`encode_changes`'s form), on the change index attached for it;
     /// None if nothing changed. See
-    /// `commit_py::build_commit`.
+    /// `commit_py::build_commit`. `changes` is any read-only buffer: `bytes`,
+    /// or a file mapped with `mmap`, so a large write's changes are read in
+    /// place rather than held in memory.
     #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (output, changes, *, version, path, time_ms=0, producer=Vec::new(), mode="patch", at=None, collect=0))]
     fn build_commit<'py>(
         &self,
         py: Python<'py>,
         output: &[u8],
-        changes: &[u8],
+        changes: PyBuffer<u8>,
         version: u64,
         path: &str,
         time_ms: u64,
@@ -669,6 +728,16 @@ impl Tracking {
         at: Option<u64>,
         collect: usize,
     ) -> PyResult<Option<Bound<'py, pyo3::types::PyDict>>> {
+        if !changes.readonly() || !changes.is_c_contiguous() {
+            return Err(PyTypeError::new_err(
+                "changes: a read-only contiguous buffer (bytes, or a file mapped read-only)",
+            ));
+        }
+        // SAFETY: `changes` holds the buffer's export until it drops, after the build, and
+        // the exporter is read-only, so these bytes neither move nor change meanwhile.
+        let data = unsafe {
+            std::slice::from_raw_parts(changes.buf_ptr() as *const u8, changes.len_bytes())
+        };
         let out = self
             .state
             .read()
@@ -683,7 +752,7 @@ impl Tracking {
             out,
             ixs.as_ref(),
             output,
-            changes,
+            data,
             version,
             path,
             time_ms,

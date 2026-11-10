@@ -6,12 +6,8 @@ would, records nothing, and runs as a heavy call."""
 
 from __future__ import annotations
 
-from solera.patterns import Matcher
-
 from . import Core
 from .prepare import conditions
-
-COVER_PAGE = 10_000  # keys a completeness check reads at a time
 
 
 async def owes(core: Core, asset: str, partition: str, input, planner, inputs) -> bool:
@@ -47,19 +43,11 @@ async def owes(core: Core, asset: str, partition: str, input, planner, inputs) -
 async def taken_after(core: Core, input, empty: str) -> bool:
     """Whether upstream holds a key the input's patterns take past `empty`
     (`""`: anywhere): one the partition has not processed since it last
-    started over, so it is not complete (STA-10, D176). Pages until the
-    first such key."""
+    started over, so it is not complete (STA-10, D176). One native scan,
+    stopping at the first such key."""
 
-    found = core.m.core_output(input.output, input.partition)
-    if found is None:
+    id_ = core.m.core_outputs.get((input.output, input.partition))
+    if id_ is None:
         return False
-    core.attach(found["id"])
-    taken, after = Matcher(input.spec.get("patterns")), empty or None
-    while True:
-        rows, after = await core.run(
-            core.index.scan, found["layers"], found["head"], after=after, limit=COVER_PAGE
-        )
-        if any(taken(row[0]) for row in rows):
-            return True
-        if after is None:
-            return False
+    core.attach(id_)
+    return await core.run(core.tracking.taken, id_.encode(), input.spec.get("patterns"), empty or None)

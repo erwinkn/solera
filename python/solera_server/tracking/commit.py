@@ -15,8 +15,12 @@ of keys.
 from __future__ import annotations
 
 import contextlib
+import mmap
+import tempfile
 from dataclasses import dataclass, field
 
+import obstore
+from obstore.exceptions import NotFoundError
 from solera._native import Tracking
 
 from ..state import Conflict
@@ -68,19 +72,28 @@ async def plan_of(core: Core, task: dict, attempt: str, prepared: dict) -> bytes
     return unb64(spec["plan"])
 
 
-async def changes_of(core: Core, name: str, entry: dict) -> bytes:
+@contextlib.asynccontextmanager
+async def changes_of(core: Core, name: str, entry: dict):
     """A write's changed keys: in the result, or in the file the worker put
-    beside its output when they were too many for it (N13)."""
+    beside its output when they were too many for it (N13), streamed to a
+    local file and mapped, so the engine never holds a large write's keys."""
 
     if entry.get("changes") is not None:
-        return unb64(entry["changes"])
+        yield unb64(entry["changes"])
+        return
     path = entry.get("changes_path")
     if path is None:
         raise Conflict(f"keyed output {name}: the result carries no changed keys", retryable=False)
-    data = await core.engine.state.get_object(path)
-    if data is None:
-        raise Conflict(f"keyed output {name}: its changed keys at {path} are gone")
-    return data
+    try:
+        found = await obstore.get_async(core.engine.state.objects, path)
+    except (NotFoundError, FileNotFoundError):
+        raise Conflict(f"keyed output {name}: its changed keys at {path} are gone") from None
+    with tempfile.TemporaryFile() as f:
+        async for chunk in found.stream():
+            f.write(chunk)
+        f.flush()
+        with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as data:
+            yield data
 
 
 async def build(core: Core, task: dict, attempt: str, prepared: dict, result: dict, outputs: dict) -> Built:
@@ -102,23 +115,23 @@ async def build(core: Core, task: dict, attempt: str, prepared: dict, result: di
             info = (prepared.get("outputs") or {}).get(name) or {}
             if info.get("contract", {}).get("key") is None or entry.get("unchanged"):
                 continue
-            changes = await changes_of(core, name, entry)
             id_ = core.output_id(name, partition, built.minted)
             await built.locks.enter_async_context(core.lock(id_))
             core.attach(id_)
             out = m.core_output(name, partition) or {"head": 0, "layers": []}
             dynamic = bool(info.get("dynamic"))
-            found = await core.run(
-                core.tracking.build_commit,
-                id_.encode(),
-                changes,
-                version=generation,
-                path=core.path(id_, out["head"] + 1, attempt),
-                time_ms=int(engine.clock() * 1000),
-                producer=producer,
-                mode="replace" if entry.get("whole") else "patch",
-                collect=DYNAMIC_KEYS if dynamic else 0,
-            )
+            async with changes_of(core, name, entry) as changes:
+                found = await core.run(
+                    core.tracking.build_commit,
+                    id_.encode(),
+                    changes,
+                    version=generation,
+                    path=core.path(id_, out["head"] + 1, attempt),
+                    time_ms=int(engine.clock() * 1000),
+                    producer=producer,
+                    mode="replace" if entry.get("whole") else "patch",
+                    collect=DYNAMIC_KEYS if dynamic else 0,
+                )
             if found is None:
                 continue
             events.append(found["event"])

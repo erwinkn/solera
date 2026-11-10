@@ -1641,9 +1641,33 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
         # cover only the batch it was given, and a moved input changes the
         # next attempt's definition. Refusing here would only strand a write
         # a shared-table store has already made.
-        # Output heads must be unchanged since the claim, and no output it writes or
-        # reads incrementally reset since it launched (removed, or moved to another
-        # store): what it built belongs to the output's earlier life.
+        self._commit_guards(task, prepared)
+        settle = {"outcome": outcome, "error": error, "retryable": retryable, "delay": delay}
+        if self.core is not None:
+            outputs = current_names(prepared, result.get("outputs") or {})
+            built = await core_commit.build(self.core, task, attempt, prepared, result, outputs)
+            async with built.locks:  # the outputs it built: their commits are recorded in turn
+                observations = await self._observations(task, core_commit.unkeyed(prepared), result, attempt)
+                if built.progress is not None:
+                    observations.setdefault("progress", {})["core"] = built.progress
+                if self.m.claimed(attempt) is not claim:
+                    raise LostOwnership(attempt)
+                self._commit_guards(task, prepared)  # again: the build and its observations awaited
+                out = await self._install(
+                    task, claim, attempt, prepared, result, observations, built, **settle
+                )
+            await core_sources.record_loads(self, attempt, prepared, result)
+            return out
+        observations = await self._observations(task, prepared, result, attempt)
+        if self.m.claimed(attempt) is not claim:
+            raise LostOwnership(attempt)
+        return await self._install(task, claim, attempt, prepared, result, observations, None, **settle)
+
+    def _commit_guards(self, task: dict, prepared: dict) -> None:
+        """Output heads must be unchanged since the claim, and no output it writes
+        or reads incrementally reset since it launched (removed, or moved to
+        another store): what it built belongs to the output's earlier life."""
+
         for output, info in (prepared.get("outputs") or {}).items():
             if commit_of(self.m.heads.get((output, task["partition"]))) != commit_of(info["head"]):
                 raise Conflict(f"output {output} head changed since this attempt was claimed")
@@ -1662,25 +1686,6 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
             digest(self._declaration(task["asset"])),
         ):
             raise Conflict(f"asset {task['asset']} changed since this attempt launched")
-        settle = {"outcome": outcome, "error": error, "retryable": retryable, "delay": delay}
-        if self.core is not None:
-            outputs = current_names(prepared, result.get("outputs") or {})
-            built = await core_commit.build(self.core, task, attempt, prepared, result, outputs)
-            async with built.locks:  # the outputs it built: their commits are recorded in turn
-                observations = await self._observations(task, core_commit.unkeyed(prepared), result, attempt)
-                if built.progress is not None:
-                    observations.setdefault("progress", {})["core"] = built.progress
-                if self.m.claimed(attempt) is not claim:
-                    raise LostOwnership(attempt)
-                out = await self._install(
-                    task, claim, attempt, prepared, result, observations, built, **settle
-                )
-            await core_sources.record_loads(self, attempt, prepared, result)
-            return out
-        observations = await self._observations(task, prepared, result, attempt)
-        if self.m.claimed(attempt) is not claim:
-            raise LostOwnership(attempt)
-        return await self._install(task, claim, attempt, prepared, result, observations, None, **settle)
 
     async def _install(
         self, task, claim, attempt, prepared, result, observations, built, *, outcome, error, retryable, delay
@@ -1824,7 +1829,15 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
     # -- sources commit API (§5) ------------------------------------------------------
 
     async def commit_source(
-        self, name: str, *, version=None, keys=None, upsert=None, remove=None, by: str | None = None
+        self,
+        name: str,
+        *,
+        version=None,
+        keys=None,
+        upsert=None,
+        remove=None,
+        by: str | None = None,
+        at: int | None = None,
     ):
         """Advance a source without moving data (§2.3, §6; docs/versions.md
         §2). A keyed source commit is checked against the source's key index
@@ -1837,13 +1850,15 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
 
         Every change is recorded as a run with no tasks (§7):
         `{"id", "source", "by", "batch", "upserted", "deleted"}` — or `version`
-        for an unkeyed source. `by` says where the commit came from."""
+        for an unkeyed source. `by` says where the commit came from. `at`
+        (the new path) makes `upsert` a load's report on the source's log at
+        that commit (`tracking.sources.record_loads`)."""
 
         head = self.m.heads.get((name, ""))
         # Its delta is named by nothing until recorded: its index is held as read
         # meanwhile, so the orphan collector leaves it be.
         with self.m.reading(self.m.index(name, "").prefix):
-            event, ref = await self._prepare_commit(name, version, keys, upsert, remove, by)
+            event, ref = await self._prepare_commit(name, version, keys, upsert, remove, by, at=at)
             if event is None:
                 return {"changed": False, "ref": ref}
             if commit_of(self.m.heads.get((name, ""))) != commit_of(head):
@@ -1856,7 +1871,7 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
         self._committed_keys([event])
         return {"changed": True, "ref": ref, "run": event["run"]["id"]}
 
-    async def _prepare_commit(self, name, version, keys, upsert, remove, by, tags=None):
+    async def _prepare_commit(self, name, version, keys, upsert, remove, by, tags=None, at=None):
         """A source commit's `SourceCommitted`, its delta file written but
         nothing recorded, and the ref it installs; no event if it changes
         nothing. Whoever does not record it drops it (`_drop_prepared`).
@@ -1904,7 +1919,15 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
 
             if self.core is not None:  # the new tracking core builds the commit
                 built = await core_sources.build(
-                    self.core, name, generation, keys, upsert, remove, "" if listed is not None else None
+                    self.core,
+                    name,
+                    generation,
+                    run_id,
+                    keys,
+                    upsert,
+                    remove,
+                    "" if listed is not None else None,
+                    at,
                 )
                 if built is None:
                     return None, head["ref"] if head is not None else source["head"]

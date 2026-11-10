@@ -140,7 +140,8 @@ class Sensors:
         snapshot = {}
         for source in sensor["commits"]:
             entry = {"head": self._head_id(source)}
-            if self.core is not None:  # the new path: the source's commit the tick observes
+            if self.core is not None and self.manifest["sources"][source].get("key") is not None:
+                # the new path: the keyed source's commit the tick observes
                 entry["core"] = (self.m.core_output(source, "") or {}).get("head", 0)
             elif (index := self.m.indexes.get((source, ""))) is not None:
                 entry["index"] = index.to_json()
@@ -227,9 +228,12 @@ class Sensors:
             raise ValueError(f"{name} commits to {undeclared}, not in its commits=")
         if len(set(sources)) != len(sources):
             raise ValueError(f"{name}: one commit per source per tick")
+        # The heads it validates against: one that moves before the commits are
+        # recorded refuses the tick, so no commit lands between a check and its record.
+        heads = {source: self.m.heads.get((source, "")) for source in sources}
         for c in commits:  # every snapshot together: one stale source refuses the tick
             source, seen = c["source"], claim["snapshot"][c["source"]]
-            if self.core is not None and "core" in seen:  # only a key it reports changed (D193)
+            if "core" in seen:  # only a key it reports changed (D193)
                 if await core_sources.moved(self.core, source, seen["core"], c):
                     raise self.Conflict(
                         f"source {source!r}: a key the tick reports changed since it was dispatched"
@@ -239,7 +243,6 @@ class Sensors:
         for c in commits:
             if len(c.get("keys") or ()) > SENSOR_MAP_MAX:
                 raise ValueError(f"{name}: a full map over {SENSOR_MAP_MAX} keys; use a cursor")
-        heads = {source: self.m.heads.get((source, "")) for source in sources}
         by, tags = f"sensor {name}", {"sensor": name, "tick": claim["tick"]}
         prepared, planned = [], []
         try:

@@ -20,6 +20,8 @@ the attempt's control file (N13).
 from __future__ import annotations
 
 import asyncio
+import bisect
+import tempfile
 from base64 import b64decode, b64encode
 
 import obstore
@@ -30,6 +32,7 @@ from solera.keys.layers import key_str
 from solera.stores import KeyedWrite, WriteError, prepare_for
 
 CHANGES_INLINE = 64 << 10  # changed keys' bytes a result carries; past it, a file (N13)
+CHANGES_CHUNK = 64 << 10  # keys encoded at a time
 CLASSES = ("added", "updated", "removed", "unchanged")
 
 
@@ -39,8 +42,10 @@ def on_core(spec: dict) -> bool:
 
 def planned(spec: dict, pin: dict) -> tuple[list, list, list]:
     """A keyed input's keys in this batch, with their classes and the
-    versions they are planned at."""
+    versions they are planned at: none once its walk is done (no plan)."""
 
+    if spec.get("plan") is None:
+        return [], [], []
     return Tracking.plan_keys(b64decode(spec["plan"]), int(pin["core"]))
 
 
@@ -105,19 +110,39 @@ def unchanged(o) -> bool:
 async def changes(objects, spec: dict, name: str, o) -> dict:
     """The keys a stored write changed, as the engine builds its commit from
     them: `whole` for a replacement, and `changes` (base64) or, when too big
-    for the result, `changes_path`, a file beside the attempt's control file."""
+    for the result, `changes_path`, a file beside the attempt's control file.
+    Encoded a chunk of keys at a time into a local file, so a write of any
+    size is handed over in bounded memory."""
 
-    def encode() -> bytes:
-        keys = [key_str(k) for k in o.prepared.rows.entries()[0]]
-        upserts = dict.fromkeys(keys, "") if o.output.is_dynamic_partitions else keys
-        return encode_changes(upserts, [] if o.replace else [str(k) for k in o.prepared.removes])
-
-    data = await asyncio.to_thread(encode)
     entry = {"whole": o.replace}
-    if len(data) <= CHANGES_INLINE:
-        entry["changes"] = b64encode(data).decode()
-        return entry
-    path = f"{lifecycle.base(spec['run']['id'], spec['attempt'])}changes-{name}"
-    await obstore.put_async(objects, path, data)
+    with tempfile.TemporaryFile() as f:
+        size = await asyncio.to_thread(_encode, o, f)
+        f.seek(0)
+        if size <= CHANGES_INLINE:
+            entry["changes"] = b64encode(f.read()).decode()
+            return entry
+        path = f"{lifecycle.base(spec['run']['id'], spec['attempt'])}changes-{name}"
+        await obstore.put_async(objects, path, f)
     entry["changes_path"] = path
     return entry
+
+
+def _encode(o, f) -> int:
+    """Writes the changes' transport form to `f`: its header, then each
+    chunk's blocks (a block stands alone, and keys ascend across chunks, a
+    removal joining the chunk whose keys it falls among). Returns its size."""
+
+    word = "" if o.output.is_dynamic_partitions else None
+    removes = [] if o.replace else sorted(str(k) for k in o.prepared.removes)
+    header = encode_changes([])
+    f.write(header)
+    done = 0
+    for chunk, _ in o.prepared.rows.chunks(CHANGES_CHUNK):
+        keys = [key_str(k) for k in chunk]
+        end = bisect.bisect_right(removes, keys[-1], done)
+        upserts = keys if word is None else dict.fromkeys(keys, word)
+        f.write(encode_changes(upserts, removes[done:end])[len(header) :])
+        done = end
+    if done < len(removes):
+        f.write(encode_changes([], removes[done:])[len(header) :])
+    return f.tell()

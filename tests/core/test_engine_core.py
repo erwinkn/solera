@@ -133,11 +133,13 @@ async def test_n13_an_attempt_costs_todays_requests_and_at_most_its_layer_more(t
 async def test_changed_keys_too_big_for_the_result_travel_as_a_file(solera, monkeypatch):
     """N13's other PUT: a write whose changed keys pass `CHANGES_INLINE` puts
     them in one file beside the attempt's control file, which the engine
-    reads to build the commit."""
+    reads to build the commit. The worker encodes it a chunk of keys at a
+    time, removals joining the chunk whose keys they fall among."""
 
     from solera_worker import batch
 
     monkeypatch.setattr(batch, "CHANGES_INLINE", 0)
+    monkeypatch.setattr(batch, "CHANGES_CHUNK", 7)
     ex = await Example(solera).start(batch_size=100)
     recorded = _recording(solera)
     await ex.feed(KEYS)
@@ -146,3 +148,10 @@ async def test_changed_keys_too_big_for_the_result_travel_as_a_file(solera, monk
     assert finished["commit"]["core"]["counts"]["items"]["added"] == len(KEYS)
     found = await solera.state.list_objects("")
     assert any(path.endswith("changes-items") for path in found)
+    names = sorted(KEYS)
+    updated, removed = {k: "2" for k in names[::3]}, names[1::3]
+    await ex.feed(updated, removes=removed)
+    last = [e for e in recorded if e["type"] == "AttemptFinished" and e.get("commit")][-1]
+    counts = last["commit"]["core"]["counts"]["items"]
+    assert (counts["updated"], counts["removed"]) == (len(updated), len(removed))
+    assert await solera.rows("items") == {k: updated.get(k, v) for k, v in KEYS.items() if k not in removed}
