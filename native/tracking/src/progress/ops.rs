@@ -6,7 +6,7 @@ use crate::error::{invalid, Result};
 use crate::event::{Event, Part};
 use crate::plan::{Mode, Plan, PLANNER_VERSION};
 use crate::progress::{
-    owed, read_digest, BatchProgress, Consumed, Holding, Key, Point, Reason, Value,
+    owed, read_digest, unsettled, BatchProgress, Consumed, Holding, Key, Point, Reason, Value,
 };
 use crate::record::Record;
 use crate::state::Tracking;
@@ -88,13 +88,8 @@ impl Tracking {
                     .ok()
                     .map(|i| &report.loaded[i].1)
             };
-            let unsettled = self.outputs.get(&p.output).is_some_and(|o| {
-                o.full_run.is_some()
-                    || o.layers
-                        .iter()
-                        .flat_map(|l| &l.clears)
-                        .any(|&k| p.head < k && k <= o.head)
-            });
+            let unsettled = unsettled(self, &p.output, p.head);
+            let mut any_moved = false;
             let mut held = Vec::new();
             let mut points: Vec<(Key, Point)> = Vec::new();
             let key_list = matches!(plan.mode, Mode::Keys(_));
@@ -103,6 +98,7 @@ impl Tracking {
                 let moved = loaded(&c.key).is_some_and(|v| {
                     owed(&Holding::of(v.as_version(), &p.conditions, &c.key), &wanted)
                 });
+                any_moved |= moved;
                 if unsettled && moved {
                     held.push(c.key.clone());
                     if key_list || owed(&c.held, &wanted) {
@@ -205,6 +201,7 @@ impl Tracking {
                 piece: (!key_list).then(|| Value::At(p.head, p.conditions.clone())),
                 points,
                 expect: p.expect,
+                fence: any_moved.then_some((p.head, unsettled)),
             }));
         }
         for u in &plan.unkeyed {

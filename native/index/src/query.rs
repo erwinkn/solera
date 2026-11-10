@@ -181,6 +181,17 @@ impl ChangeIndex {
         ChangeIndex { store, write }
     }
 
+    /// Clears decide what a read reads, so a layer that lists any at or
+    /// below `c` is checked against its file even if none of its rows is
+    /// read. (A layer that lists none is trusted until it is read, as its key
+    /// bounds are.)
+    async fn check_clears(&self, layers: &[LayerRef], c: u64) -> Result<()> {
+        for l in layers.iter().filter(|l| !l.clears.is_empty() && l.lo <= c) {
+            self.store.top(l).await?;
+        }
+        Ok(())
+    }
+
     async fn walk(
         &self,
         layers: Vec<&LayerRef>,
@@ -226,6 +237,7 @@ impl ChangeIndex {
         if c1 == c2 {
             return Ok(None);
         }
+        self.check_clears(layers, c2).await?;
         // A clear in the window: the states at C1 and at C2 are compared, which
         // reads the whole state at C1.
         let (k1, k2) = (clear_at(layers, c1), clear_at(layers, c2));
@@ -311,6 +323,7 @@ impl ChangeIndex {
     ) -> Result<Option<Vec<u8>>> {
         let range = check_layers(layers)?;
         at(c, range, "commit")?;
+        self.check_clears(layers, c).await?;
         let k = clear_at(layers, c);
         let ls = pick(layers, k.saturating_sub(1), c, &q.bounds());
         let all_at_once = keys.is_some();
@@ -404,6 +417,7 @@ impl ChangeIndex {
         if lo > hi {
             return Ok(None);
         }
+        self.check_clears(layers, hi).await?;
         let clears: Vec<u64> = layers
             .iter()
             .flat_map(|l| l.clears.iter().copied())

@@ -223,3 +223,31 @@ impl<'a> Dec<'a> {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_layer_round_trips_with_its_clears() {
+        let l = LayerRef {
+            path: "p/c4".into(),
+            size: 900,
+            index_start: 700,
+            top_start: 800,
+            lo: 2,
+            hi: 200,
+            floor: Some(1),
+            entries: 5,
+            keys: 4,
+            first_key: b"a".to_vec(),
+            last_key: b"z".to_vec(),
+            flags: solera_index::format::CLEAR,
+            clears: vec![2, 4, 129],
+        };
+        let mut e = Enc::new();
+        e.layer(&l);
+        let mut d = Dec::new(&e.buf);
+        assert_eq!(d.layer().unwrap(), l);
+    }
+}
