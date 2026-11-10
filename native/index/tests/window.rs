@@ -206,3 +206,80 @@ fn a_small_layer_of_long_keys_decodes_its_index_within_bounds() {
         input,
     );
 }
+
+#[test]
+fn a_read_of_a_layer_of_many_short_blocks_plans_a_bounded_window() {
+    let _one = ONE_AT_A_TIME.lock().unwrap();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let o = WriteOptions {
+        block_bytes: 1,
+        level: 1,
+        seg_blocks: 1024,
+    };
+    let n = 4_000_000u64;
+    let mut w = Writer::new(o, 1, 1, None).unwrap();
+    let mut bytes = Vec::new();
+    for i in 0..n {
+        w.push(&i.to_be_bytes(), 1, Version::Int(i), Version::Absent)
+            .unwrap();
+        if w.pending() > 1 << 20 {
+            bytes.extend_from_slice(&w.take());
+        }
+    }
+    let h = CommitHeader {
+        commit: 1,
+        added: n,
+        live: n,
+        ..Default::default()
+    };
+    let mut l = w.finish(&[h]).unwrap();
+    bytes.extend_from_slice(&w.take());
+    drop(w);
+    l.path = "short".into();
+    let mem = Arc::new(object_store::memory::InMemory::new());
+    let opts = StoreOptions {
+        memory_bytes: 0,
+        ..Default::default()
+    };
+    let store = Store::new(mem.clone(), Path::from(""), rt.handle().clone(), opts).unwrap();
+    let ix = ChangeIndex::new(store, WriteOptions::default());
+    rt.block_on(async {
+        use object_store::ObjectStoreExt;
+        mem.put(&Path::from("short"), bytes.into()).await.unwrap();
+    });
+    let ls = std::slice::from_ref(&l);
+    let some: Vec<Vec<u8>> = (0..n)
+        .step_by(4001)
+        .map(|i| i.to_be_bytes().to_vec())
+        .collect();
+    let measure = |what: &str, read: &dyn Fn() -> usize, want: usize| {
+        let base = NOW.load(Relaxed);
+        PEAK.store(base, Relaxed);
+        assert_eq!(read(), want, "{what}");
+        let held = PEAK.load(Relaxed) - base;
+        assert!(
+            held < 40 << 20,
+            "{what} of a layer of {n} blocks held {} MB",
+            held >> 20
+        );
+    };
+    let first = Query {
+        limit: Some(1),
+        ..Default::default()
+    };
+    measure(
+        "a scan of one key",
+        &|| rt.block_on(ix.scan(ls, 1, &first)).unwrap().run.len(),
+        1,
+    );
+    let q = Query::default();
+    measure(
+        "a get",
+        &|| rt.block_on(ix.get(ls, 1, &some, &q)).unwrap().run.len(),
+        some.len(),
+    );
+}
