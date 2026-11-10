@@ -742,9 +742,10 @@ impl Tracking {
     /// `commit_py::build_commit`. `changes` is `bytes`, or the path of a
     /// local file holding them, which nothing writes while the build runs
     /// (the engine's own temporary file): mapped here, so a large write's
-    /// changes are read in place rather than held in memory.
+    /// changes are read in place rather than held in memory. A key in
+    /// `skip` (sorted) is left out: the output keeps it as it was.
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (output, changes, *, version, path, time_ms=0, producer=Vec::new(), mode="patch", at=None, ends_full_run=false, collect=0))]
+    #[pyo3(signature = (output, changes, *, version, path, time_ms=0, producer=Vec::new(), mode="patch", at=None, ends_full_run=false, collect=0, skip=Vec::new()))]
     fn build_commit<'py>(
         &self,
         py: Python<'py>,
@@ -758,7 +759,14 @@ impl Tracking {
         at: Option<u64>,
         ends_full_run: bool,
         collect: usize,
+        skip: Vec<String>,
     ) -> PyResult<Option<Bound<'py, pyo3::types::PyDict>>> {
+        let skip: Vec<Vec<u8>> = skip.into_iter().map(String::into_bytes).collect();
+        if skip.windows(2).any(|w| w[0] >= w[1]) {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "skip: sorted and distinct keys",
+            ));
+        }
         let mapped: memmap2::Mmap;
         let data: &[u8] = if let Ok(b) = changes.cast_exact::<PyBytes>() {
             b.as_bytes()
@@ -797,6 +805,7 @@ impl Tracking {
             at,
             ends_full_run,
             collect,
+            &skip,
         )
     }
 

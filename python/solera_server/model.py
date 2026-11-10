@@ -200,6 +200,7 @@ class Model:
             data["core_outputs"] = _nest(self.core_outputs, 2)
             data["core_edges"] = _nest(self.core_edges, 3)
             data["core_empty"] = _nest(self.core_empty, 3)
+            data["proceeded"] = _nest(self.proceeded, 2)
         return copy.deepcopy(data) if copied else data
 
     def restore(self, snap: dict | None, core: bool = False) -> None:
@@ -282,6 +283,8 @@ class Model:
         # (asset, partition, input) -> the key past which the edge holds nothing since it last
         # started over ("": every key), until a walk gets to the end: what completeness reads.
         self.core_empty: dict[tuple, str] = _flatten(snap.get("core_empty"), 3)
+        # (asset, partition): incomplete, and an operator let its readers proceed (until it starts over)
+        self.proceeded: dict[tuple, float] = _flatten(snap.get("proceeded"), 2)
         # derived from launched attempts, plus memory-only claims of attempts preparing
         # task id -> {attempt, started_at, pin, status, launched?, reads?}; `pin`: `applied` at the claim
         self.claims: dict[str, dict] = {}
@@ -917,6 +920,7 @@ class Model:
         move(self.core_outputs, output_map, 0)  # the new path's ids: the same output, the same edges
         move(self.core_edges, asset_map, 0)
         move(self.core_empty, asset_map, 0)
+        move(self.proceeded, asset_map, 0)
         for old, new in output_map.items():
             if old in self.homes and new not in self.homes:
                 self.homes[new] = self.homes.pop(old)
@@ -1808,20 +1812,37 @@ class Model:
                 self.core_edges[(asset, partition, param)] = id_
                 self.core_empty[(asset, partition, param)] = ""
 
+    def _on_Proceeded(self, e):
+        """An operator lets the readers of an incomplete partition proceed
+        over its partial output (D205), until it starts over."""
+
+        self._core_apply(e)  # the keyed outputs' full runs it ends
+        self.proceeded[(e["asset"], e["partition"])] = e["at"]
+
     def _core_close(self, producers: set[str]) -> None:
         """After a deploy, the new path's edges that read nothing now: of an
-        asset gone, of an input no longer a keyed incremental one, and of a
-        producer whose output a reset started over, which reads its inputs
-        in full again. Closed in the core as the deploy applies, so a replay
-        closes the same ones."""
+        asset gone, of an input no longer a keyed incremental one or bound
+        to another upstream, and of a producer whose output a reset started
+        over, which reads its inputs in full again. Closed in the core as the
+        deploy applies, so a replay closes the same ones. An operator's
+        `proceed` goes with them."""
 
         assets, outputs = self.manifest["assets"], self.manifest["outputs"]
+        for key in [k for k in self.proceeded if k[0] not in assets or k[0] in producers]:
+            del self.proceeded[key]
+        owner = {id_: output for (output, _), id_ in self.core_outputs.items()}
         closing = []
         for key in sorted(self.core_edges):
             asset, _, param = key
             spec = ((assets.get(asset) or {}).get("inputs") or {}).get(param) or {}
             keyed = (outputs.get(spec.get("output")) or {}).get("key") is not None
-            if asset in producers or spec.get("kind") != "incremental" or not keyed:
+            upstream = owner.get(self.core_edges[key][1], spec.get("output"))
+            if (
+                asset in producers
+                or spec.get("kind") != "incremental"
+                or not keyed
+                or upstream != spec.get("output")
+            ):
                 closing.append(key)
         if not closing:
             return
@@ -1839,6 +1860,8 @@ class Model:
         list's walk fills nothing, and after a reset leaves every key empty."""
 
         after, hi = walk["after"], walk["hi"]
+        if walk["reset"]:
+            self.proceeded.pop((asset, partition), None)
         for param in walk["inputs"]:
             if walk.get("keys"):  # a key list writes points only: what was empty stays so
                 if walk["reset"]:

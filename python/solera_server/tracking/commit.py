@@ -109,6 +109,33 @@ async def build(core: Core, task: dict, attempt: str, prepared: dict, result: di
         producer = canonical({"run": task["run"], "attempt": attempt})
         first = None
         clear, ends = full_run(prepared)
+        plan = await plan_of(core, task, attempt, prepared)
+        keyed, reports, skip, ops, foreseen = [], [], [], None, None
+        if plan is not None:
+            keyed = sorted(
+                ((p, plan) for p, plan in prepared["plans"].items() if "core" in (plan or {})),
+                key=lambda item: item[1]["core"],
+            )
+            delivered = result.get("delivered") or {}
+            reports = [
+                ([], sorted(map(tuple, (delivered.get(p) or {}).get("loaded") or ()))) for p, _ in keyed
+            ]
+            # A key held back on its inputs is left as it was in the batch's outputs too: a key's
+            # output is one value computed from all its inputs. The batch records name the output
+            # commit, built after: its number is foreseen (one call of 4 ms per 10k keys, not two).
+            foreseen = next(
+                (
+                    (m.core_output(name, partition) or {"head": 0})["head"] + 1
+                    for name, info in sorted((prepared.get("outputs") or {}).items())
+                    if info.get("contract", {}).get("key") is not None
+                    and not (outputs.get(name) or {"unchanged": True}).get("unchanged")
+                ),
+                None,
+            )
+            ops = await core.run(
+                core.tracking.progress_ops, plan, reports, producer=producer, output_commit=foreseen
+            )
+            skip = sorted({k for keys in ops[2] for k in keys})
         done = []  # keyed outputs whose full run this batch ends with no commit
         for name, info in sorted((prepared.get("outputs") or {}).items()):
             entry = outputs.get(name) or {"unchanged": True}
@@ -135,6 +162,7 @@ async def build(core: Core, task: dict, attempt: str, prepared: dict, result: di
                     mode="clear" if clear else "replace" if entry.get("whole") else "patch",
                     ends_full_run=ending,
                     collect=DYNAMIC_KEYS if dynamic else 0,
+                    skip=skip,
                 )
             if found is None:
                 if ending:
@@ -155,21 +183,16 @@ async def build(core: Core, task: dict, attempt: str, prepared: dict, result: di
             await built.locks.enter_async_context(core.lock(id_))
             if core.tracking.full_run(id_.encode()) is not None:
                 events.append(Tracking.event_full_run_done(id_.encode()))
-        plan = await plan_of(core, task, attempt, prepared)
         if plan is not None:
-            keyed = sorted(
-                ((p, plan) for p, plan in prepared["plans"].items() if "core" in (plan or {})),
-                key=lambda item: item[1]["core"],
-            )
-            delivered = result.get("delivered") or {}
-            reports = [
-                ([], sorted(map(tuple, (delivered.get(p) or {}).get("loaded") or ()))) for p, _ in keyed
-            ]
             # Held-back keys keep their points and stay owed for a later run (the walk goes on past
             # them, so nothing replans them in a loop); leaving their outcomes alone is B6's.
-            progress, records, _ = await core.run(
-                core.tracking.progress_ops, plan, reports, producer=producer, output_commit=first
-            )
+            if first != foreseen:  # an output built nothing, or moved meanwhile
+                ops = await core.run(
+                    core.tracking.progress_ops, plan, reports, producer=producer, output_commit=first
+                )
+            progress, records, held = ops
+            if sorted({k for keys in held for k in keys}) != skip:
+                raise Conflict("a clear came while the batch built its outputs: it holds back other keys now")
             events.insert(0, progress)
             built.records = [[p, b64(r)] for (p, _), r in zip(keyed, records, strict=True)]
             some, ended = keyed[0][1], all(p["final"] for _, p in keyed)
@@ -213,8 +236,8 @@ def full_run(prepared: dict) -> tuple[bool, bool]:
     ends any it is in (the full-run verdict: the clear, plus the gate). A
     full run's first batch of an incremental asset clears: its outputs start
     over, and their readers wait until the run completes. The walk's last
-    batch ends it, unless the batch is a key list's, which leaves the rest
-    owed for a run that walks it."""
+    batch ends it; a key list's never does, and once its producer is
+    complete anyway the tick ends the run (`full.settle`)."""
 
     plans = [p for p in (prepared.get("plans") or {}).values() if p]
     clear = bool(prepared.get("full")) and bool(plans)

@@ -444,6 +444,7 @@ pub async fn commit(
         mode: Mode::Patch,
         ends_full_run: false,
         collect: 0,
+        skip: &[],
     };
     let mut parts = Vec::new();
     if let Some(b) = build(
@@ -703,6 +704,7 @@ pub async fn catch_up(
         mode: Mode::Patch,
         ends_full_run: false,
         collect: 0,
+        skip: &[],
     };
     let mut parts = Vec::new();
     if let Some(b) = build(

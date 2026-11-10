@@ -382,6 +382,8 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
 
         self._adopt()
         await self._cover_tick()
+        if self.core is not None:
+            await core_full.settle(self)
         self._cleanup_job()
         self._dispatch_due()
         self._sensor_sweep()
@@ -623,7 +625,7 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
             else:
                 asset_used[claimed["asset"]] = asset_used.get(claimed["asset"], 0) + 1
         held = {}
-        incomplete = core_full.incomplete(self.core) if self.core is not None else set()
+        incomplete = core_full.incomplete(self) if self.core is not None else set()
         planner = self.planner() if incomplete else None
         for task_id in self.m.due(now):
             task = self.m.task(task_id)
@@ -2394,6 +2396,18 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
             # aborted by its wait loop — or, if already writing, committed (§8).
             self._control(run_id, "cancel", by)
         return self._run_view(self.m.runs.get(run_id) or run)
+
+    async def proceed(self, asset: str, partition: str = "", by: str | None = None) -> dict:
+        """Let the readers of a partition whose run stopped midway go on over
+        its partial output (D205; `core_full.proceed`)."""
+
+        if self.core is None:
+            raise Conflict(
+                "proceed: readers wait for an incomplete upstream on the new tracking core only", False
+            )
+        if asset not in self.manifest["assets"]:
+            raise KeyError(asset)
+        return await core_full.proceed(self, asset, partition, by or "api")
 
     async def pause(self, run_id: str, paused=True, by: str | None = None):
         run = self.m.runs.get(run_id)
