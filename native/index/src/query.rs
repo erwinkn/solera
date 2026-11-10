@@ -537,7 +537,9 @@ impl ChangeIndex {
 pub struct Entries(Walk);
 
 impl Entries {
-    /// The next key and its entries, newest first, into `group`; false at the end.
+    /// The next key and its entries, newest first, into `group`; false at the
+    /// end. Not cancel-safe: a call dropped before it returns leaves the
+    /// reader unusable.
     pub async fn next(&mut self, group: &mut Run) -> Result<bool> {
         self.0.next(group).await
     }
@@ -565,9 +567,9 @@ pub fn pick_merge(layers: &[LayerRef], cut: u64) -> Option<Range<usize>> {
     let n = layers.len() - b;
     let sizes: Vec<u64> = layers.iter().map(|l| l.size).collect();
     let fits = |a: usize, e: usize| {
-        let size: u64 = sizes[a..e].iter().sum();
-        let newer: u64 = sizes[e..].iter().sum();
-        size <= 4 * newer + MIB
+        let size = sizes[a..e].iter().fold(0u64, |t, &x| t.saturating_add(x));
+        let newer = sizes[e..].iter().fold(0u64, |t, &x| t.saturating_add(x));
+        size <= newer.saturating_mul(4).saturating_add(MIB)
     };
     if n >= 4 {
         for a in (b..=layers.len() - 4).rev() {
@@ -585,7 +587,9 @@ pub fn pick_merge(layers: &[LayerRef], cut: u64) -> Option<Range<usize>> {
     }
     let below = layers[b..].iter().take_while(|l| l.hi <= cut).count();
     if below > 0 {
-        let size: u64 = sizes[b..b + below].iter().sum();
+        let size = sizes[b..b + below]
+            .iter()
+            .fold(0u64, |t, &x| t.saturating_add(x));
         let base = if b == 1 { sizes[0] } else { 0 };
         if size * 4 >= base {
             return Some(0..b + below);

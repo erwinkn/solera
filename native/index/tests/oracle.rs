@@ -812,12 +812,14 @@ fn bad_references_and_abandoned_reads_leave_the_index_working() {
         mem.put(&Path::from("t/late"), c1.into()).await.unwrap();
         assert_eq!(ix.scan(&[late], 1, &q).await.unwrap().run.len(), 1);
         // a path too long for a cache file name is written, just not kept on disk
-        let long = index("long", Some(dir.join("long")));
+        let long_dir = scratch("refs-long");
+        let long = index("long", Some(long_dir.clone()));
         let path = ["d".repeat(100), "e".repeat(100), "f".repeat(100)].join("/");
         let ll = long.write_commit(&path, nc(1), &one(3)).await.unwrap();
         let rl = long.scan(&[ll], 1, &q).await.unwrap();
         assert_eq!(rl.run.new_version(0), Version::Int(3));
         drop(long);
+        let _ = std::fs::remove_dir_all(long_dir);
         // a trailer cannot make the commits section larger than the format allows
         let c2 = mem
             .get(&Path::from("t/c2"))
@@ -927,6 +929,117 @@ fn keys_past_the_limit_are_refused_when_written_and_when_read() {
     let mut run = Run::new();
     let got = format::Decoder::default().decode(&c, raw.len() as u32, 1, &mut run);
     assert!(matches!(got, Err(Error::Format(_))));
+}
+
+#[test]
+fn the_caches_do_what_they_promise() {
+    let rt = runtime();
+    let slow = Arc::new(object_store::throttle::ThrottledStore::new(
+        InMemory::new(),
+        object_store::throttle::ThrottleConfig {
+            wait_get_per_call: std::time::Duration::from_millis(20),
+            ..Default::default()
+        },
+    ));
+    let small = WriteOptions {
+        block_bytes: 1 << 10,
+        ..Default::default()
+    };
+    let index = |opts: StoreOptions| {
+        let store = Store::new(slow.clone(), Path::from("t"), rt.handle().clone(), opts).unwrap();
+        ChangeIndex::new(store, small)
+    };
+    let nc = |c| NewCommit {
+        commit: c,
+        time_ms: 0,
+        producer: b"",
+        live_before: 0,
+    };
+    let layer = |i: u64| {
+        let mut run = Run::new();
+        for k in 0..5000u64 {
+            run.push_key(format!("k{k:05}").as_bytes());
+            run.push_entry(1, Version::Int(k * 7 + i), Version::Absent);
+        }
+        run
+    };
+    let (dir, q) = (scratch("caches"), Query::default());
+    rt.block_on(async {
+        let w = index(StoreOptions::default());
+        let mut ls = Vec::new();
+        for i in 0..5 {
+            ls.push(
+                w.write_commit(&format!("c{i}"), nc(1), &layer(i))
+                    .await
+                    .unwrap(),
+            );
+        }
+        let one = [ls[0].clone()];
+        // single flight: eight reads of one layer at once make one read's GETs
+        let alone = index(StoreOptions::default());
+        alone.scan(&one, 1, &q).await.unwrap();
+        let shared = index(StoreOptions::default());
+        let reads = (0..8).map(|_| shared.scan(&one, 1, &q));
+        for r in futures::future::join_all(reads).await {
+            assert_eq!(r.unwrap().run.len(), 5000);
+        }
+        let (a, s) = (alone.store.stats.counts(), shared.store.stats.counts());
+        assert_eq!(s.gets, a.gets);
+        assert!(s.waits > 0);
+        // reads up to cache_batch are kept, bulk reads are not
+        for (batch, kept) in [(64 << 20, true), (1 << 10, false)] {
+            let ix = index(StoreOptions {
+                cache_batch: batch,
+                ..Default::default()
+            });
+            ix.scan(&one, 1, &q).await.unwrap();
+            let before = ix.store.stats.counts().gets;
+            ix.scan(&one, 1, &q).await.unwrap();
+            assert_eq!(
+                ix.store.stats.counts().gets == before,
+                kept,
+                "cache_batch {batch}"
+            );
+        }
+        // the memory cache holds what it weighs, within its budget
+        let budget = 16 << 10;
+        let ix = index(StoreOptions {
+            memory_bytes: budget,
+            ..Default::default()
+        });
+        for l in &ls {
+            ix.scan(std::slice::from_ref(l), 1, &q).await.unwrap();
+            let held = ix.store.memory_bytes();
+            assert!(held > 0 && held <= budget, "{held}");
+        }
+        // the disk cache keeps within its size, and drops a damaged copy
+        let size = ls[0].size;
+        let ix = index(StoreOptions {
+            disk: Some(DiskOptions {
+                dir: dir.clone(),
+                bytes: size * 9 / 2,
+                store: "t".into(),
+            }),
+            memory_bytes: 0,
+            ..Default::default()
+        });
+        for i in 5..10 {
+            ix.write_commit(&format!("c{i}"), nc(1), &layer(i))
+                .await
+                .unwrap();
+            assert!(ix.store.disk_bytes() <= size * 9 / 2);
+        }
+        let newest = ix.write_commit("c10", nc(1), &layer(10)).await.unwrap();
+        let file = dir.join("c10");
+        let mut b = std::fs::read(&file).unwrap();
+        b[10] ^= 0xff;
+        std::fs::write(&file, b).unwrap();
+        let held = ix.store.disk_bytes();
+        let got = ix.scan(std::slice::from_ref(&newest), 1, &q).await.unwrap();
+        assert_eq!(got.run.new_version(0), Version::Int(10));
+        assert_eq!(ix.store.disk_bytes(), held - newest.size);
+    });
+    let _ = std::fs::remove_dir_all(dir);
 }
 
 async fn ix_scan(ix: &ChangeIndex, layers: &[LayerRef]) -> usize {

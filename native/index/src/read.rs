@@ -18,6 +18,9 @@ const MAX: u64 = 32 << 20;
 /// A read of listed keys launches its batches together, each about this size,
 /// cut only where a GET would end anyway.
 const ALL: u64 = 4 << 20;
+/// A read of listed keys keeps at most this many bytes fetched ahead of its
+/// decoding, per layer.
+const WINDOW: u64 = 16 << 20;
 
 /// Sorted, distinct keys, back to back.
 #[derive(Default, Clone, Debug)]
@@ -160,9 +163,11 @@ pub(crate) struct Cursor {
     blocks: Vec<BlockRef>,
     next: usize,
     target: u64,
-    /// A read of listed keys: every batch is launched at once, and they are
-    /// decoded as they arrive.
+    /// A read of listed keys: batches are launched together, up to
+    /// `WINDOW` bytes ahead, and decoded as they arrive.
     all: bool,
+    /// Bytes launched and not yet taken.
+    ahead: u64,
     pending: VecDeque<(Range<usize>, tokio::task::JoinHandle<Result<Vec<Cached>>>)>,
     ready: VecDeque<(Bytes, BlockRef)>,
     run: Run,
@@ -190,10 +195,15 @@ impl Cursor {
     ) -> Result<Cursor> {
         let top = store.top(l).await?;
         let path: Arc<str> = Arc::from(l.path.as_str());
+        let in_bounds = |i: usize| {
+            let k = keys.map_or(&[][..], |k| k.get(i));
+            !bounds.below(k) && !bounds.above(k)
+        };
         let segs: Vec<usize> = match keys {
             None => top.segs.span(bounds.lo_key(), bounds.hi_key()).collect(),
             Some(k) => {
                 let mut v: Vec<usize> = (0..k.len())
+                    .filter(|&i| in_bounds(i))
                     .filter_map(|i| top.segs.holding(k.get(i)))
                     .collect();
                 v.dedup();
@@ -242,7 +252,7 @@ impl Cursor {
             }
             Some(k) => {
                 let mut last: Option<(usize, usize)> = None;
-                for i in 0..k.len() {
+                for i in (0..k.len()).filter(|&i| in_bounds(i)) {
                     let key = k.get(i);
                     let Some(s) = top.segs.holding(key) else {
                         continue;
@@ -264,6 +274,7 @@ impl Cursor {
             next: 0,
             target: if all_at_once { ALL } else { FIRST },
             all: all_at_once,
+            ahead: 0,
             pending: VecDeque::new(),
             ready: VecDeque::new(),
             run: Run::new(),
@@ -292,6 +303,7 @@ impl Cursor {
         if self.next == a {
             return;
         }
+        self.ahead += bytes;
         let keep = if self.all {
             self.blocks.iter().map(|b| b.clen as u64).sum::<u64>() <= self.store.opts.cache_batch
         } else {
@@ -342,9 +354,9 @@ impl Cursor {
             }
             if self.pending.is_empty() {
                 self.launch();
-                while self.all && self.next < self.blocks.len() {
-                    self.launch();
-                }
+            }
+            while self.all && self.next < self.blocks.len() && self.ahead < WINDOW {
+                self.launch();
             }
             let Some((span, h)) = self.pending.pop_front() else {
                 return Ok(false);
@@ -352,6 +364,10 @@ impl Cursor {
             let got = h
                 .await
                 .map_err(|e| Error::Store(format!("fetch task: {e}").into()))??;
+            self.ahead -= self.blocks[span.clone()]
+                .iter()
+                .map(|b| b.clen as u64)
+                .sum::<u64>();
             if !self.all {
                 self.launch();
             }

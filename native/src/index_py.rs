@@ -15,7 +15,7 @@ use std::sync::OnceLock;
 use pyo3::create_exception;
 use pyo3::exceptions::{PyKeyError, PyOSError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyDict, PyInt, PyList, PyString, PyTuple};
+use pyo3::types::{PyBool, PyBytes, PyDict, PyInt, PyList, PyString, PyTuple};
 use solera_index as ix;
 use solera_index::{Error, LayerRef, Query, Run, Version};
 
@@ -28,16 +28,25 @@ create_exception!(
     "A merge found entries that do not chain: an entry's replaced version is not the previous entry's new one."
 );
 
+/// The runtime, made by this process: its threads do not survive a fork, so
+/// a forked child that calls in fails loudly instead of hanging.
 fn rt() -> &'static tokio::runtime::Runtime {
-    static RT: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
-    RT.get_or_init(|| {
-        tokio::runtime::Builder::new_multi_thread()
+    static RT: OnceLock<(tokio::runtime::Runtime, u32)> = OnceLock::new();
+    let (rt, pid) = RT.get_or_init(|| {
+        let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .thread_name("solera-index")
             .enable_all()
             .build()
-            .expect("the change index's runtime")
-    })
+            .expect("the change index's runtime");
+        (rt, std::process::id())
+    });
+    assert_eq!(
+        *pid,
+        std::process::id(),
+        "the change index cannot be used in a process forked after its first use"
+    );
+    rt
 }
 
 fn err(e: Error) -> PyErr {
@@ -61,7 +70,7 @@ impl Owned {
             Ok(Owned::Absent)
         } else if v.is_instance_of::<PyString>() {
             Ok(Owned::Str(v.extract()?))
-        } else if v.is_instance_of::<PyInt>() {
+        } else if v.is_instance_of::<PyInt>() && !v.is_instance_of::<PyBool>() {
             Ok(Owned::Int(v.extract()?))
         } else {
             Err(PyTypeError::new_err(format!(

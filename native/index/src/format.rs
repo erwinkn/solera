@@ -259,7 +259,7 @@ impl Writer {
                 "a layer covers commits lo..=hi with 1 <= lo <= hi and lo <= floor <= hi, got {lo}..={hi}, floor {floor:?}"
             ));
         }
-        fits("a block", o.block_bytes * 2)?;
+        fits("a block", o.block_bytes.saturating_mul(2))?;
         if o.seg_blocks == 0 || o.seg_blocks * MAX_KEY > MAX_RAW {
             return invalid(format!(
                 "seg_blocks {}: from 1 to {}",

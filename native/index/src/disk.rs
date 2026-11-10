@@ -36,7 +36,11 @@ struct DiskState {
     order: BTreeMap<u64, String>,
     tick: u64,
     total: u64,
+    /// Paths being filled, and the bytes set aside for them.
     filling: HashSet<String>,
+    reserved: u64,
+    /// Fills that failed: not tried again by this process.
+    failed: HashSet<String>,
 }
 
 /// A layer path as a file name, and back: `%`, `/` and a leading `.`
@@ -71,7 +75,8 @@ impl DiskState {
 impl Disk {
     /// The cache in `o.dir` for the store `o.store` names, with the complete
     /// files already there. The directory is this store's alone while it is
-    /// open (a lock file); files another store left there are removed.
+    /// open (a lock file, waited on briefly); files another store's cache left
+    /// there are removed. A non-empty directory that is not a cache is refused.
     pub(crate) fn open(o: DiskOptions) -> Result<Disk> {
         let io =
             |e: std::io::Error| Error::Store(format!("disk cache {}: {e}", o.dir.display()).into());
@@ -82,14 +87,30 @@ impl Disk {
             .write(true)
             .open(o.dir.join(".lock"))
             .map_err(io)?;
-        if lock.try_lock().is_err() {
+        let mut tries = 0;
+        while lock.try_lock().is_err() {
+            tries += 1;
+            if tries == 100 {
+                return Err(Error::Invalid(format!(
+                    "disk cache {}: another store has it open",
+                    o.dir.display()
+                )));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let owner = o.dir.join(".store");
+        let marked = std::fs::read(&owner).ok();
+        let mine = marked.as_deref() == Some(o.store.as_bytes());
+        if marked.is_none()
+            && std::fs::read_dir(&o.dir)
+                .map_err(io)?
+                .any(|e| e.is_ok_and(|e| e.file_name() != ".lock"))
+        {
             return Err(Error::Invalid(format!(
-                "disk cache {}: another store has it open",
+                "disk cache {}: the directory holds files and is not a cache",
                 o.dir.display()
             )));
         }
-        let owner = o.dir.join(".store");
-        let mine = std::fs::read(&owner).is_ok_and(|b| b == o.store.as_bytes());
         let mut found = Vec::new();
         for e in std::fs::read_dir(&o.dir).map_err(io)? {
             let e = e.map_err(io)?;
@@ -143,17 +164,55 @@ impl Disk {
         name(path).len() <= 240
     }
 
-    /// Claim the fill of `path` if it is worth caching and nobody has it.
+    /// Claim the fill of `path` if it is worth caching, nobody has it and it
+    /// has not failed; room is made for it now, so the fill never needs more
+    /// than the cache's size. The claim ends with `commit` or `abandon`.
     pub(crate) fn claim(&self, path: &str, size: u64) -> bool {
         let mut st = self.st.lock().unwrap();
-        self.keeps(path)
-            && size.saturating_mul(4) <= self.o.bytes
-            && !st.files.contains_key(path)
-            && st.filling.insert(path.to_string())
+        if !self.keeps(path)
+            || size.saturating_mul(4) > self.o.bytes
+            || st.files.contains_key(path)
+            || st.failed.contains(path)
+            || !st.filling.insert(path.to_string())
+        {
+            return false;
+        }
+        st.reserved += size;
+        let evict = self.make_room(&mut st);
+        drop(st);
+        self.remove(evict);
+        true
     }
 
-    pub(crate) fn unclaim(&self, path: &str) {
-        self.st.lock().unwrap().filling.remove(path);
+    /// A claimed fill that failed: its room is given back, and it is not
+    /// tried again.
+    pub(crate) fn abandon(&self, path: &str, size: u64) {
+        let mut st = self.st.lock().unwrap();
+        st.filling.remove(path);
+        st.reserved -= size;
+        st.failed.insert(path.to_string());
+    }
+
+    /// Evict least recently used files until the files and the room set
+    /// aside fit the cache's size.
+    fn make_room(&self, st: &mut DiskState) -> Vec<String> {
+        let mut evict = Vec::new();
+        while st.total + st.reserved > self.o.bytes {
+            let Some((_, p)) = st.order.pop_first() else {
+                break;
+            };
+            if let Some((s, _)) = st.files.remove(&p) {
+                st.total -= s;
+            }
+            evict.push(p);
+        }
+        evict
+    }
+
+    fn remove(&self, paths: Vec<String>) {
+        for p in paths {
+            let _ = std::fs::remove_file(self.file(&p));
+        }
     }
 
     /// A temporary file in the cache's directory, to become a layer's by
@@ -168,39 +227,38 @@ impl Disk {
         })
     }
 
-    /// The temporary file `t` is complete: it becomes `path`'s.
+    /// The temporary file `t` of a claimed fill is complete: it becomes
+    /// `path`'s, and the claim ends (abandoned if the rename fails).
     pub(crate) fn commit(&self, mut t: Temp, path: &str, size: u64) -> std::io::Result<()> {
-        t.file.flush()?;
-        std::fs::rename(&t.path, self.file(path))?;
+        if let Err(e) = t
+            .file
+            .flush()
+            .and_then(|_| std::fs::rename(&t.path, self.file(path)))
+        {
+            self.abandon(path, size);
+            return Err(e);
+        }
         t.kept = true;
+        let mut st = self.st.lock().unwrap();
+        st.filling.remove(path);
+        st.reserved -= size;
+        drop(st);
         self.add(path, size);
         Ok(())
     }
 
     fn add(&self, path: &str, size: u64) {
-        let mut evict = Vec::new();
-        {
-            let mut st = self.st.lock().unwrap();
-            if !st.touch(path) {
-                st.tick += 1;
-                let t = st.tick;
-                st.files.insert(path.to_string(), (size, t));
-                st.order.insert(t, path.to_string());
-                st.total += size;
-            }
-            while st.total > self.o.bytes {
-                let Some((_, p)) = st.order.pop_first() else {
-                    break;
-                };
-                if let Some((s, _)) = st.files.remove(&p) {
-                    st.total -= s;
-                }
-                evict.push(p);
-            }
+        let mut st = self.st.lock().unwrap();
+        if !st.touch(path) {
+            st.tick += 1;
+            let t = st.tick;
+            st.files.insert(path.to_string(), (size, t));
+            st.order.insert(t, path.to_string());
+            st.total += size;
         }
-        for p in evict {
-            let _ = std::fs::remove_file(self.file(&p));
-        }
+        let evict = self.make_room(&mut st);
+        drop(st);
+        self.remove(evict);
     }
 
     pub(crate) fn total(&self) -> u64 {
