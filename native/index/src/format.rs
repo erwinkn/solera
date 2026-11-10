@@ -767,6 +767,11 @@ impl Top {
         if ts != top_start || commits_start > index_start || index_start > top_start {
             return format("trailer offsets do not match the layer reference");
         }
+        if !(8..=8 + zstd::zstd_safe::compress_bound(MAX_RAW) as u64)
+            .contains(&(index_start - commits_start))
+        {
+            return format("commits section length out of bounds");
+        }
         let c = &tail[..tail.len() - TRAILER];
         if checksum(c) != u32_at(t, 28) {
             return format("top level checksum mismatch");

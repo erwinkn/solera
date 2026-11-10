@@ -448,15 +448,14 @@ impl Store {
     }
 
     /// Start writing an object; its bytes go up in parts once past
-    /// `part_bytes`, and to the disk cache as they go.
+    /// `part_bytes`, and to the disk cache as they go. The disk cache never
+    /// fails a write: on a local error the object is simply not kept.
     pub(crate) fn upload(self: &Arc<Self>, path: &str) -> Result<Upload> {
-        let tee = match &self.disk {
-            Some(d) => Some(
-                d.temp()
-                    .map_err(|e| Error::Store(format!("disk cache: {e}").into()))?,
-            ),
-            None => None,
-        };
+        let tee = self
+            .disk
+            .as_ref()
+            .filter(|d| d.keeps(path))
+            .and_then(|d| d.temp().ok());
         Ok(Upload {
             store: self.clone(),
             path: self.path(path)?,
@@ -571,9 +570,8 @@ impl Drop for Upload {
 impl Upload {
     pub(crate) async fn write(&mut self, mut bytes: Vec<u8>) -> Result<()> {
         self.size += bytes.len() as u64;
-        if let Some(t) = &mut self.tee {
-            t.write(&bytes)
-                .map_err(|e| Error::Store(format!("disk cache: {e}").into()))?;
+        if self.tee.as_mut().is_some_and(|t| t.write(&bytes).is_err()) {
+            self.tee = None;
         }
         let part = self.store.opts.part_bytes;
         if self.parts.is_none() {
@@ -624,9 +622,10 @@ impl Upload {
         }
         if let (Some(t), Some(d)) = (self.tee.take(), &self.store.disk) {
             if d.claim(&self.name, self.size) {
-                let kept = d.commit(t, &self.name, self.size);
+                if let Err(e) = d.commit(t, &self.name, self.size) {
+                    eprintln!("solera-index: disk cache of {} failed: {e}", self.name);
+                }
                 d.unclaim(&self.name);
-                kept.map_err(|e| Error::Store(format!("disk cache: {e}").into()))?;
             }
         }
         Ok(())

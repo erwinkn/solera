@@ -138,10 +138,16 @@ impl Disk {
         let _ = std::fs::remove_file(self.file(path));
     }
 
+    /// Whether `path` can be kept: its file name fits a directory entry.
+    pub(crate) fn keeps(&self, path: &str) -> bool {
+        name(path).len() <= 240
+    }
+
     /// Claim the fill of `path` if it is worth caching and nobody has it.
     pub(crate) fn claim(&self, path: &str, size: u64) -> bool {
         let mut st = self.st.lock().unwrap();
-        size.saturating_mul(4) <= self.o.bytes
+        self.keeps(path)
+            && size.saturating_mul(4) <= self.o.bytes
             && !st.files.contains_key(path)
             && st.filling.insert(path.to_string())
     }

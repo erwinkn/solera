@@ -811,6 +811,31 @@ fn bad_references_and_abandoned_reads_leave_the_index_working() {
             .unwrap();
         mem.put(&Path::from("t/late"), c1.into()).await.unwrap();
         assert_eq!(ix.scan(&[late], 1, &q).await.unwrap().run.len(), 1);
+        // a path too long for a cache file name is written, just not kept on disk
+        let long = index("long", Some(dir.join("long")));
+        let path = ["d".repeat(100), "e".repeat(100), "f".repeat(100)].join("/");
+        let ll = long.write_commit(&path, nc(1), &one(3)).await.unwrap();
+        let rl = long.scan(&[ll], 1, &q).await.unwrap();
+        assert_eq!(rl.run.new_version(0), Version::Int(3));
+        drop(long);
+        // a trailer cannot make the commits section larger than the format allows
+        let c2 = mem
+            .get(&Path::from("t/c2"))
+            .await
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+        let mut tail = c2[l2.top_start as usize..].to_vec();
+        let t = tail.len() - 48;
+        let far = 1u64 << 40;
+        tail[t..t + 8].copy_from_slice(&far.to_le_bytes());
+        tail[t + 8..t + 16].copy_from_slice(&0u64.to_le_bytes());
+        tail[t + 16..t + 24].copy_from_slice(&far.to_le_bytes());
+        let check = xxhash_rust::xxh3::xxh3_64(&tail[t..t + 36]) as u32;
+        tail[t + 36..t + 40].copy_from_slice(&check.to_le_bytes());
+        let got = format::Top::parse(&tail, far, far + tail.len() as u64);
+        assert!(matches!(got, Err(Error::Format(_))));
         // a disk cache directory serves one store at a time, never another's files
         let a = index("a", Some(dir.clone()));
         let again = StoreOptions {
