@@ -714,6 +714,53 @@ measurement the verdict still needs, on the new index.
 | How many commits behind, since when? | The oldest owing piece's commit, against the head and the commit headers | The same, from progress |
 | Which keys? | The planner without a limit, on demand; costs a read proportional to the answer | The same |
 
+### As built (B7, `native/tracking/src/stale/`)
+
+Form (b) was decided (P14 in the Captain's decisions) and is built as
+follows. Per keyed edge the core keeps its conditions now (a watch event,
+journaled when the edge opens and whenever a deploy changes them), a
+generation, and what is known: fresh, or stale with a witness, its reason
+and since when, exact for the edge's progress and conditions at one
+generation, as of one upstream commit.
+
+- **Applying an event never reads the index.** A batch commit, a reset, a
+  rename or new conditions raise the edge's generation and record which key
+  ranges changed (a reset or new conditions: all of them). What is known
+  then stops being current, and the status reads "unknown" until a refresh.
+- **At an upstream commit** (rules 1 and 2), the commit builder hands the
+  commit's entries to staleness, which adds a witness part to the commit's
+  own event for every current edge reading the output: fresh, the first
+  entry the patterns take with no point makes it stale; stale, a commit
+  that does not touch the witness changes nothing. An edge the entries
+  cannot decide (the commit touches its witness, or a point differs) is
+  left for a refresh.
+- **A refresh** (rules 3, 4, 6, 7) brings an edge current from the index: a
+  stale witness is rechecked at the head, and a probe looks for another
+  only if it is no longer due; fresh as of commit x, rule 1 runs over the
+  diff from x to the head outside the changed ranges (there the edge still
+  holds what upstream had at x), then one probe from the first changed
+  range; otherwise one probe from the first key. A refresh uses what changed
+  since the last exact answer instead of replaying commits in order, so the
+  model's ordering fixes (catch up before a batch commit, a pattern change
+  or a reset to `held`) hold by construction.
+- **A witness part applies only to the generation it was computed for** and
+  never moves x back: a part computed against progress that moved is
+  dropped and recomputed. A lost or late notice delays an answer, never
+  changes it.
+- **Retries** (rule 5): a failed key whose retry came due makes a fresh edge
+  stale; at startup the engine applies it to every retry already due.
+- **The gate** (rule 8): one event per output marks its full run started or
+  completed; meanwhile readers that keep the gate read "held: upstream
+  incomplete", and when it lifts they are probed again.
+- **Counts** are the planner's owed count, cached until the edge's
+  generation or its upstream's head moves. One reason per edge (the
+  witness's); one witness per kind of reason is not built.
+
+At 100M keys (`bench/core/stale/`): a notice costs 0.08 to 0.18 µs per
+edge, and about 100 ns per entry per edge when no entry matters; a count
+costs 1.1 s cold for an edge a day behind and 16 s for 30 days behind,
+within 6% of the index's own diff for a day.
+
 ## 7. A batch from start to finish
 
 **Settled (D183): the engine plans**, because its warm on-disk index cache
