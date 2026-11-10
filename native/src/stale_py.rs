@@ -189,26 +189,30 @@ pub(crate) fn status<'py>(
     Ok(out)
 }
 
-/// How many keys the edge owes, by class; cached until it or its upstream
-/// moves. None while the gate holds it (D197).
+/// How many keys the edge owes, by class, and every reason that holds;
+/// cached until it or its upstream moves. None while the gate holds it (D197).
 pub(crate) fn count<'py>(
     py: Python<'py>,
     state: &RwLock<tr::Tracking>,
     ixs: &dyn Indexes,
     counts: &Counts,
     edge: Vec<u8>,
+    not_due: Option<&Bound<'py, PyDict>>,
 ) -> PyResult<Option<Bound<'py, PyDict>>> {
+    let due = NotDue::of(not_due)?;
     let ask = state.read().unwrap().stale_ask(&edge).map_err(err)?;
-    let Some(n) = py
-        .detach(|| rt().block_on(counts.get(&ask, ixs)))
+    let Some(o) = py
+        .detach(|| rt().block_on(counts.get(&ask, ixs, &due)))
         .map_err(err)?
     else {
         return Ok(None);
     };
     let d = PyDict::new(py);
-    for (name, v) in ["added", "updated", "removed"].into_iter().zip(n) {
+    for (name, v) in ["added", "updated", "removed"].into_iter().zip(o.counts) {
         d.set_item(name, v)?;
     }
+    let reasons: Vec<&str> = o.reasons.iter().map(|r| r.name()).collect();
+    d.set_item("reasons", reasons)?;
     Ok(Some(d))
 }
 

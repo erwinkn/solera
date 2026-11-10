@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use solera_index::{LayerRef, Query, Run, Version};
 
+use crate::codec::Ver;
 use crate::error::{invalid, Result};
 use crate::event::Part;
 use crate::plan::{plan, Cand, Hold, Indexes, InputRequest, Mode, Request, View};
@@ -101,7 +102,13 @@ impl Ask {
     fn stale(&self, c: &Cand) -> State {
         State::Stale {
             key: c.key.clone(),
-            reason: reason_of(self.keyed(), &self.req.conditions, c),
+            reason: reason_of(
+                self.keyed(),
+                &self.req.conditions,
+                &c.key,
+                &c.held,
+                &c.version,
+            ),
             since_ms: 0,
         }
     }
@@ -221,16 +228,11 @@ pub async fn refresh(
     let state = match (&i.known, &i.changed) {
         (
             Some(super::Known {
-                state: State::Stale { key, reason, .. },
+                state: State::Stale { key, .. },
                 ..
             }),
             _,
         ) => match ask.recheck(ixs, due, key).await? {
-            Some(_) if i.current().is_some() => State::Stale {
-                key: key.clone(),
-                reason: *reason,
-                since_ms: 0,
-            },
             Some(s) => s,
             None => ask.probe(ixs, due, None).await?,
         },
@@ -424,13 +426,18 @@ fn rule1(
     hold: Option<&dyn Hold>,
 ) -> Step {
     if let Some(p) = keyed.point(key) {
-        if !owed(&p.holding, &Holding::of(new, now, key)) {
+        let wanted = Holding::of(new, now, key);
+        if !owed(&p.holding, &wanted) {
             return Step::Skip;
         }
+        let version = match wanted {
+            Holding::Absent => Ver::Absent,
+            _ => Ver::of(new),
+        };
         return match hold {
             None => Step::Unsure,
             Some(h) if h.held_back(0, key) => Step::Skip,
-            Some(_) => Step::Due(Reason::InputChanged),
+            Some(_) => Step::Due(reason_of(keyed, now, key, &p.holding, &version)),
         };
     }
     if !now.patterns.takes(key) {
@@ -438,27 +445,38 @@ fn rule1(
     }
     Step::Due(match keyed.value_of(key) {
         Value::Empty | Value::Held => Reason::NeverProcessed,
+        Value::At(_, h) if !h.same_processing(now) || !h.patterns.takes(key) => {
+            Reason::ConditionsChanged
+        }
         Value::At(..) => Reason::InputChanged,
     })
 }
 
 /// Why a due key is due.
-fn reason_of(keyed: &Keyed, now: &Conditions, c: &Cand) -> Reason {
-    let point = keyed.point(&c.key);
-    if point.is_some_and(|p| {
-        p.reason == progress::Reason::Failed && p.seen.as_ref() == Some(&c.version)
-    }) {
+pub(super) fn reason_of(
+    keyed: &Keyed,
+    now: &Conditions,
+    key: &[u8],
+    held: &Holding,
+    version: &Ver,
+) -> Reason {
+    let point = keyed.point(key);
+    if point
+        .is_some_and(|p| p.reason == progress::Reason::Failed && p.seen.as_ref() == Some(version))
+    {
         return Reason::RetryDue;
     }
-    match &c.held {
+    match held {
         Holding::Held => Reason::NeverProcessed,
-        Holding::Version(_, h) if !h.same_processing(now) || !now.patterns.takes(&c.key) => {
+        Holding::Version(_, h) if !h.same_processing(now) || !now.patterns.takes(key) => {
             Reason::ConditionsChanged
         }
         Holding::Version(..) => Reason::InputChanged,
-        Holding::Absent => match (point, keyed.value_of(&c.key)) {
+        Holding::Absent => match (point, keyed.value_of(key)) {
             (None, Value::Empty | Value::Held) => Reason::NeverProcessed,
-            (None, Value::At(_, h)) if !h.patterns.takes(&c.key) => Reason::ConditionsChanged,
+            (None, Value::At(_, h)) if !h.same_processing(now) || !h.patterns.takes(key) => {
+                Reason::ConditionsChanged
+            }
             _ => Reason::InputChanged,
         },
     }

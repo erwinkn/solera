@@ -32,7 +32,7 @@ Two kinds of label appear below:
 
 - **Settled.** Decided, with its decision number: D180, D183, D184 from
   before, D187 to D204 from Erwin's answers of 2026-11-10, and D205 to
-  D209 from the experiments and the build that followed. §17 lists each
+  D210 from the experiments and the build that followed. §17 lists each
   with its evidence. Nothing in this design is pending.
 - **P1 to P16** are the names this design gave its proposals before they
   were decided. They are kept as names, so that §17 can map each to its
@@ -501,9 +501,14 @@ was last brought up to.
 - **stale(w, reason, since, X)**: key w, the **witness**, is due as of X,
   for this reason, and the edge has been stale since that moment.
 
-To keep STA-2 ("a stale partition says every reason that holds"), the
-edge keeps one witness per kind of reason: input changed, conditions
-changed, never processed, retry due.
+**Settled (D210): every reason that holds is listed when asked** (STA-2,
+"a stale partition says every reason that holds"). The status names the
+witness's reason at once. The full list (input changed, conditions
+changed, never processed, retry due) comes with the count, from the same
+walk of the planner, and is cached with it. No witness is kept per kind of
+reason, and an upstream commit does no extra work for reasons. `OnChange`
+needs only stale or fresh; the console shows the status at once and the
+reasons when they arrive.
 
 ### The rules
 
@@ -617,11 +622,11 @@ scattered daily changes.
 | Question | Answer |
 |---|---|
 | Is anything due on this edge? | The edge has a witness |
-| Why? | The reason of each witness kept, one per kind: input changed (behind the head), conditions changed (patterns, context, definition or rebuild counter), never processed (`empty`), retry due; or "upstream incomplete" while a gate holds the edge |
+| Why? | The witness's reason at once; every reason that holds when asked, with the count (D210): input changed (behind the head), conditions changed (patterns, context, definition or rebuild counter), never processed (`empty`), retry due; or "upstream incomplete" while a gate holds the edge |
 | Is the partition stale? | Any of its edges has a witness (STA-3: a default run would load something) |
 | Upstream stale | A partition whose stale status flips tells its consumers, which tell theirs: work only where the status changes |
 | Complete? (D177) | For each `empty` piece, whether it has an upstream key: one key or none |
-| How many keys owed? | Counted when asked: the keys an unlimited plan would take plus the owed keys not yet due (failing keys waiting for their retry, and keys held back while their producer repairs an anomaly, §8), each counted once; cached until the upstream, the progress or the conditions (patterns, context, definition, rebuild counter) change. No number while a gate holds the edge (D197) |
+| How many keys owed? | Counted when asked: the keys an unlimited plan would take plus the owed keys not yet due (failing keys waiting for their retry, and keys held back while their producer repairs an anomaly, §8), each counted once; cached until the upstream, the progress or the conditions (patterns, context, definition, rebuild counter) change. The reasons that hold come with it (D210). No number while a gate holds the edge (D197) |
 | How many commits behind, since when? | The oldest owing piece's commit, against the head and the commit headers; "since" from the witness |
 | Which keys? | The planner without a limit, on demand; costs a read proportional to the answer |
 
@@ -671,14 +676,17 @@ and conditions at one generation, as of one upstream commit.
   incomplete", with no count, and when it lifts they are probed again.
 - **Counts** are the planner's owed count, cached until the edge's
   generation (its progress or conditions) or its upstream's head moves.
-- **One reason per edge**, the witness's. One witness per kind of reason
-  (STA-2) is not built yet.
+- **Reasons** (D210): the status names the witness's reason; a count also
+  lists every reason that holds for a due key, from the same walk. A key
+  owed by a piece processed under other conditions reads "conditions
+  changed", whatever upstream did since; the notice, the probe and the count
+  give each key the same reason.
 
 At 100M keys (`bench/core/stale/`): a notice costs 0.08 to 0.18 µs per
-edge, and about 100 ns per entry per edge when no entry matters; a count
-costs 1.1 s cold for an edge a day behind and 16 s for 30 days behind,
-where the index's diff alone takes 0.9 s and 5.5 s
-(`bench/core/stale/results/run-100m.log`).
+edge, and about 100 ns per entry per edge when no entry matters; a count,
+reasons included, costs 1.1 s cold and 0.6 to 0.7 s warm for an edge a day
+behind and 15 s cold for 30 days behind, where the index's diff alone
+takes 0.9 s and 5.7 s cold (`bench/core/stale/results/run-100m.log`).
 
 ## 7. A batch from start to finish
 
@@ -1584,6 +1592,7 @@ store is exact" stands: D196 keeps it.
 | D207 | The engine builds every commit, on a thread off its event loop; nothing goes to a worker | Review F4 | §4, §7 | SOLE-12 at 100M keys: a 10k-key batch in one range about 10 ms CPU, 11–15 GETs cold, one 62 KB PUT; a 100M-key commit streamed about 30 s CPU, 579 MB peak. The scattered 10k-key batch (2.6–2.9 s) is the index's `get`, to be fixed there |
 | D208 | The core does its own I/O in Rust (`object_store`), with one shared memory cache, single-flight fetches and an on-disk cache of layer files; synchronous calls that release the GIL; heavy queries capped by the engine | The I/O boundary | §1, §15 | SOLE-6, 50 concurrent queries on local files, S3 and S3 + 30 ms: equal on small queries; on 1K scattered gets Python fetching cost 100–120 µs more CPU per GET, stalled the event loop up to 0.76 s (Rust under 60 ms) and was 3–93% slower. Cost: +60 s release build, +8 MB |
 | D209 | A `Regex(...)` key pattern uses the Rust `regex` dialect, matched against the whole key, validated at declaration by the native matcher, which today's Python path also matches through; lookaround and backreferences are refused | A contract choice in the build (SOLE-11) | §9 | Two dialects would make the SDK and the core disagree on which keys are owed; matching in Python would cross once per key; the Rust dialect is linear-time. Pre-usage, so no pattern breaks. Visible to users |
+| D210 | Staleness reasons (STA-2): an edge's status names its witness's reason at once; every reason that holds is computed when asked, by the same walk as the count, and cached with it. No witness per kind of reason, no extra work at commits | §6's one witness per kind of reason | §6 | B7 at 100M keys: listing the reasons adds nothing measurable to a count a day behind (0.58 to 0.71 s warm with them, 0.58 to 0.70 s without), once a memo per piece keeps the per-key pattern match out. Four witnesses would mean up to four probes after a batch and four states per edge, for a list only the console shows |
 
 Nothing in this design is pending. What remains to measure (the cost of a
 count on request at the scale target, among others) is listed with the
@@ -1669,8 +1678,8 @@ hold-back.
 
 **What it does not check yet:** stores that write in place with late and
 dead writers (§8), cleanup against the cut (§13), lineage and digests
-(§12), several upstream levels rebuilding at once, one witness per kind of
-reason (STA-2), the propagation of "upstream stale" down the graph, and the
+(§12), several upstream levels rebuilding at once, the list of reasons
+that hold (STA-2, D210), the propagation of "upstream stale" down the graph, and the
 cost of any of it at the scale target. The first three are the model's
 next phase, before the units that build them (§15). The checks in §3, §4,
 §7, §8, §12 and §13 that the model does not cover were done by hand; the

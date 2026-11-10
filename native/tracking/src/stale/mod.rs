@@ -40,7 +40,7 @@ use crate::event::Part;
 use crate::progress::{Conditions, Key, KeyRange};
 use crate::state::{Id, Tracking};
 
-pub use query::{graph, Counts, Partition, Status};
+pub use query::{graph, Counts, Owed, Partition, Status};
 pub use refresh::{notice, refresh, retry_due, Ask, Due, NoneDue};
 
 pub const TAG_WATCH: u8 = 0x40;

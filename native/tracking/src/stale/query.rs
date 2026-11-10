@@ -3,14 +3,15 @@
 //! owed keys, completeness (D177), and staleness down the graph.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use solera_index::Query;
 
 use crate::error::Result;
-use crate::plan::{owed_count, owed_keys, Cand, Indexes};
-use crate::progress::{Key, Progress, Value};
-use crate::stale::{Ask, Reason, State};
+use crate::plan::{owed_count_each, owed_keys, Cand, Indexes};
+use crate::progress::{Conditions, Holding, Key, Progress, Value};
+use crate::stale::refresh::reason_of;
+use crate::stale::{Ask, Due, Reason, State};
 use crate::state::{Id, Tracking};
 
 /// What an edge's staleness is now.
@@ -75,32 +76,82 @@ impl Tracking {
     }
 }
 
-/// Owed counts by class (added, updated, removed), computed on request and
-/// kept until the edge's progress, its conditions or its upstream's head move.
-/// While the gate holds the edge there is no number (D197): None.
+/// The reason of every owed key without a point that a piece holds under
+/// `h`, if it does not depend on the key: conditions changed, or the same
+/// conditions (the input changed). Keeps `reason_of`'s pattern match per key
+/// out of a count.
+fn piece_reason(h: &Conditions, now: &Conditions) -> Option<Reason> {
+    if !h.same_processing(now) {
+        Some(Reason::ConditionsChanged)
+    } else if h.patterns == now.patterns {
+        Some(Reason::InputChanged)
+    } else {
+        None
+    }
+}
+
+/// What an edge owes: the count by class (added, updated, removed, and
+/// unchanged, always 0 here), and every reason that holds for a due key
+/// (STA-2), in `Reason` order.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Owed {
+    pub counts: [u64; 4],
+    pub reasons: Vec<Reason>,
+}
+
+/// What an edge owes, computed on request by one walk of the planner and
+/// kept until the edge's generation (its progress, its conditions, a retry)
+/// or its upstream's head moves. While the gate holds the edge there is no
+/// number (D197): None.
 #[derive(Default)]
 pub struct Counts(Mutex<HashMap<Id, Counted>>);
 
-/// Counts by class, with the edge's generation and the head they hold for.
-type Counted = (u64, u64, [u64; 4]);
+/// What is owed, with the edge's generation and the head it holds for.
+type Counted = (u64, u64, Owed);
 
 impl Counts {
-    pub async fn get(&self, ask: &Ask, ixs: &dyn Indexes) -> Result<Option<[u64; 4]>> {
+    pub async fn get(&self, ask: &Ask, ixs: &dyn Indexes, due: &dyn Due) -> Result<Option<Owed>> {
         if ask.held {
             return Ok(None);
         }
         let at = (ask.input.gen, ask.head);
-        if let Some(&(g, h, n)) = self.0.lock().unwrap().get(&ask.edge) {
-            if (g, h) == at {
-                return Ok(Some(n));
+        if let Some((g, h, o)) = self.0.lock().unwrap().get(&ask.edge) {
+            if (*g, *h) == at {
+                return Ok(Some(o.clone()));
             }
         }
-        let n = owed_count(&ask.view, &ask.req, ixs).await?;
+        let (keyed, now) = (ask.keyed(), &ask.req.conditions);
+        let all = [
+            Reason::InputChanged,
+            Reason::ConditionsChanged,
+            Reason::NeverProcessed,
+            Reason::RetryDue,
+        ];
+        let mut seen = [false; 4];
+        let mut piece: (usize, Option<Reason>) = (0, None);
+        let counts = owed_count_each(&ask.view, &ask.req, ixs, &mut |key, held, version| {
+            if seen == [true; 4] || due.not_due(&ask.edge, key) {
+                return;
+            }
+            if let (Holding::Version(_, h), None) = (held, keyed.point(key)) {
+                if piece.0 != Arc::as_ptr(h) as usize {
+                    piece = (Arc::as_ptr(h) as usize, piece_reason(h, now));
+                }
+                if let Some(r) = piece.1 {
+                    seen[r as usize - 1] = true;
+                    return;
+                }
+            }
+            seen[reason_of(keyed, now, key, held, version) as usize - 1] = true;
+        })
+        .await?;
+        let reasons = all.into_iter().filter(|r| seen[*r as usize - 1]).collect();
+        let o = Owed { counts, reasons };
         self.0
             .lock()
             .unwrap()
-            .insert(ask.edge.clone(), (at.0, at.1, n));
-        Ok(Some(n))
+            .insert(ask.edge.clone(), (at.0, at.1, o.clone()));
+        Ok(Some(o))
     }
 
     /// Drops what is kept for edges that are gone.

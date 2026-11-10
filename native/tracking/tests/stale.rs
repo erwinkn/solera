@@ -258,7 +258,7 @@ fn the_gate_holds_readers_of_an_incomplete_upstream_and_releases_them_to_a_probe
     let (rt, ix) = index();
     let ask = t.stale_ask(EDGE).unwrap();
     assert_eq!(
-        rt.block_on(stale::Counts::default().get(&ask, &OneIndex(&ix)))
+        rt.block_on(stale::Counts::default().get(&ask, &OneIndex(&ix), &NoneDue))
             .unwrap(),
         None,
         "a held edge has no count (D197)"
@@ -308,9 +308,11 @@ fn entries(keys: &[(&str, Option<u64>)], commit: u64) -> Run {
 
 fn commit_part(t: &Tracking) -> Part {
     let head = t.outputs.get(ITEMS).map_or(0, |o| o.head);
-    let mut layer = solera_index::LayerRef::default();
-    layer.lo = head + 1;
-    layer.hi = head + 1;
+    let layer = solera_index::LayerRef {
+        lo: head + 1,
+        hi: head + 1,
+        ..Default::default()
+    };
     Part::OutputCommit(OutputCommit {
         output: ITEMS.into(),
         layer,
@@ -485,8 +487,12 @@ fn a_refresh_catches_up_over_commits_and_batches_at_once() {
     let ask = t.stale_ask(EDGE).unwrap();
     let counts = stale::Counts::default();
     assert_eq!(
-        rt.block_on(counts.get(&ask, &OneIndex(&ix))).unwrap(),
-        Some([0, 0, 1, 0])
+        rt.block_on(counts.get(&ask, &OneIndex(&ix), &NoneDue))
+            .unwrap(),
+        Some(stale::Owed {
+            counts: [0, 0, 1, 0],
+            reasons: vec![Reason::InputChanged]
+        })
     );
     assert!(rt.block_on(ask.complete(&OneIndex(&ix))).unwrap());
     apply(
@@ -498,6 +504,47 @@ fn a_refresh_catches_up_over_commits_and_batches_at_once() {
     );
     let ask = t.stale_ask(EDGE).unwrap();
     assert!(!rt.block_on(ask.complete(&OneIndex(&ix))).unwrap());
+}
+
+#[test]
+fn a_count_says_every_reason_that_holds() {
+    let (rt, ix) = index();
+    let mut t = opened();
+    up(&rt, &ix, &mut t, &[("k1", Some(1)), ("k2", Some(1))]);
+    let b = batch(&t, range(None, Some("k1")), 1, false);
+    apply(&mut t, vec![b]);
+    up(&rt, &ix, &mut t, &[("k1", Some(2)), ("k3", Some(1))]);
+    struct Waiting;
+    impl stale::Due for Waiting {
+        fn not_due(&self, _: &[u8], key: &[u8]) -> bool {
+            key == b"k1"
+        }
+    }
+    let get = |t: &Tracking, due: &dyn stale::Due| {
+        let ask = t.stale_ask(EDGE).unwrap();
+        let o = rt.block_on(stale::Counts::default().get(&ask, &OneIndex(&ix), due));
+        o.unwrap().unwrap()
+    };
+    let o = get(&t, &NoneDue);
+    assert_eq!(o.counts, [2, 1, 0, 0]);
+    assert_eq!(
+        o.reasons,
+        vec![Reason::InputChanged, Reason::NeverProcessed]
+    );
+    assert_eq!(
+        get(&t, &Waiting).reasons,
+        vec![Reason::NeverProcessed],
+        "a key waiting for its retry is owed, but gives no reason"
+    );
+    let other = Arc::new(Conditions {
+        context: b"w2".as_slice().into(),
+        ..Default::default()
+    });
+    apply(&mut t, vec![watch(&other)]);
+    assert_eq!(
+        get(&t, &NoneDue).reasons,
+        vec![Reason::ConditionsChanged, Reason::NeverProcessed]
+    );
 }
 
 #[test]

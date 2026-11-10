@@ -177,12 +177,16 @@ fn main() {
                 if pass != "cached" {
                     counts.retain(&Tracking::new());
                 }
-                let n = rt.block_on(counts.get(&ask, &OneIndex(&ix))).unwrap().unwrap();
+                let o = rt
+                    .block_on(counts.get(&ask, &OneIndex(&ix), &NoneDue))
+                    .unwrap()
+                    .unwrap();
+                let n = o.counts;
                 let (wall, cpu) = (t0.elapsed().as_secs_f64(), proc_cpu() - c0);
                 let s = ix.store.stats.counts();
                 emit(
                     "count",
-                    json!({"behind_days": behind / 24, "mode": pass, "wall_s": r3(wall), "cpu_s": r3(cpu), "gets": s.gets - s0.gets, "mb": r3((s.get_bytes - s0.get_bytes) as f64 / 1e6), "owed": n.iter().sum::<u64>(), "added": n[0], "updated": n[1], "removed": n[2]}),
+                    json!({"behind_days": behind / 24, "mode": pass, "wall_s": r3(wall), "cpu_s": r3(cpu), "gets": s.gets - s0.gets, "mb": r3((s.get_bytes - s0.get_bytes) as f64 / 1e6), "owed": n.iter().sum::<u64>(), "added": n[0], "updated": n[1], "removed": n[2], "reasons": o.reasons.iter().map(|r| r.name()).collect::<Vec<_>>()}),
                 );
             }
         }

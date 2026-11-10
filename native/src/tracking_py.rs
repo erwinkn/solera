@@ -674,15 +674,18 @@ impl Tracking {
         guard(|| crate::stale_py::status(py, &self.state, edges))
     }
 
-    /// B7: how many keys `edge` owes, by class; cached until it or its upstream
-    /// moves. None while the gate holds it (D197).
+    /// B7: how many keys `edge` owes, by class, and every reason that holds
+    /// (STA-2); cached until it or its upstream moves. None while the gate
+    /// holds it (D197).
+    #[pyo3(signature = (edge, *, not_due=None))]
     fn stale_count<'py>(
         &self,
         py: Python<'py>,
         edge: Vec<u8>,
+        not_due: Option<&Bound<'py, PyDict>>,
     ) -> PyResult<Option<Bound<'py, PyDict>>> {
         let ixs = self.indexes.read().unwrap().clone();
-        guard(|| crate::stale_py::count(py, &self.state, ixs.as_ref(), &self.counts, edge))
+        guard(|| crate::stale_py::count(py, &self.state, ixs.as_ref(), &self.counts, edge, not_due))
     }
 
     /// B7: a page of the keys `edge` owes: `([(key, class), ...], next)`.

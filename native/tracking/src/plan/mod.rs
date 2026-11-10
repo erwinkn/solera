@@ -333,9 +333,16 @@ impl<'a> Src<'a> {
     }
 }
 
+/// A callback shown each owed key a walk counts: the key, what the consumer
+/// held, and the version to hold.
+pub type Each<'a> = &'a mut (dyn FnMut(&[u8], &Holding, &Ver) + Send);
+
 /// What a walk found.
-struct Found {
+struct Found<'a> {
     keep: bool,
+    /// Sees every owed key the walk counts, kept or not: the key, what the
+    /// consumer held, and the version to hold.
+    each: Option<Each<'a>>,
     limit: usize,
     keys: Vec<Cand>,
     held_back: Vec<HeldBack>,
@@ -343,10 +350,11 @@ struct Found {
     n: usize,
 }
 
-impl Found {
-    fn new(limit: usize, keep: bool) -> Found {
+impl Found<'_> {
+    fn new(limit: usize, keep: bool) -> Self {
         Found {
             keep,
+            each: None,
             limit,
             keys: vec![],
             held_back: vec![],
@@ -374,7 +382,7 @@ struct Walker<'a> {
 }
 
 impl Walker<'_> {
-    async fn walk(&self, after: Option<&Key>, out: &mut Found) -> Result<()> {
+    async fn walk(&self, after: Option<&Key>, out: &mut Found<'_>) -> Result<()> {
         let r = KeyRange {
             lo: after.cloned(),
             hi: None,
@@ -388,7 +396,7 @@ impl Walker<'_> {
         Ok(())
     }
 
-    async fn piece(&self, r: &KeyRange, value: &Value, out: &mut Found) -> Result<()> {
+    async fn piece(&self, r: &KeyRange, value: &Value, out: &mut Found<'_>) -> Result<()> {
         let page = (out.limit - out.n).saturating_add(1) as u64;
         let now_pat = self.now.patterns.index_pattern();
         let mut srcs: Vec<Src<'_>> = Vec::new();
@@ -562,7 +570,7 @@ impl Walker<'_> {
         }
     }
 
-    fn take(&self, key: Key, held: Holding, version: Ver, out: &mut Found) {
+    fn take(&self, key: Key, held: Holding, version: Ver, out: &mut Found<'_>) {
         let wanted = Holding::of(version.as_version(), self.now, &key);
         let version = if matches!(wanted, Holding::Absent) {
             Ver::Absent
@@ -584,6 +592,9 @@ impl Walker<'_> {
         };
         out.n += 1;
         out.counts[class as usize - 1] += 1;
+        if let Some(each) = out.each.as_mut() {
+            each(&key, &held, &version);
+        }
         if out.keep {
             out.keys.push(Cand {
                 key,
@@ -804,6 +815,19 @@ pub async fn owed_keys(
 /// How many keys of one edge are owed, by class: added, updated, removed.
 pub async fn owed_count(view: &View, req: &InputRequest, ixs: &dyn Indexes) -> Result<[u64; 4]> {
     let mut found = Found::new(usize::MAX, false);
+    walker(view, req, ixs)?.walk(None, &mut found).await?;
+    Ok(found.counts)
+}
+
+/// `owed_count`, showing `each` every owed key it counts.
+pub async fn owed_count_each(
+    view: &View,
+    req: &InputRequest,
+    ixs: &dyn Indexes,
+    each: Each<'_>,
+) -> Result<[u64; 4]> {
+    let mut found = Found::new(usize::MAX, false);
+    found.each = Some(each);
     walker(view, req, ixs)?.walk(None, &mut found).await?;
     Ok(found.counts)
 }

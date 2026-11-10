@@ -136,8 +136,12 @@ def check(w, core: Core, where: str, refreshed: bool) -> None:
         assert due and s["key"] in due, (where, s, sorted(due))
     if not refreshed:
         return
-    n = core.t.stale_count(EDGE)
+    n = core.t.stale_count(EDGE, not_due=core.not_due(w))
+    reasons = n.pop("reasons")
     assert sum(n.values()) == len(owed), (where, n, sorted(owed))
+    assert bool(reasons) == bool(due), (where, reasons, sorted(due))
+    if s["state"] == "stale":
+        assert s["reason"] in reasons, (where, s, reasons)
     keys, nxt = core.t.stale_keys(EDGE, limit=100)
     assert nxt is None and [k for k, _ in keys] == sorted(owed), (where, keys)
     assert core.t.stale_complete(EDGE) == complete(w, core), where
