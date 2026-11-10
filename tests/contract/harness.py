@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import secrets
+import threading
 import time
 from pathlib import Path
 
@@ -21,6 +22,7 @@ from solera.sdk import Loaded, Project, Ref
 from solera.stores import FileStore, Keys, Patch
 
 PATHS = ("today", "core")
+_CLI = threading.Lock()  # held while a `Solera.cli` call's entry point runs
 
 
 def engine_options(path: str) -> dict:
@@ -588,11 +590,16 @@ class Solera:
 
     async def cli(self, *argv: str, timeout: float = 120):
         """The `solera` CLI on this namespace, as an operator runs it: its exit
-        code, stdout and stderr; fails past `timeout` seconds. Its entry
-        point runs in this process, in a thread of its own, not as a
-        `solera` process: such a process can crash as it exits, its work
-        done (exit 139, a SIGSEGV, in about 2 of 60 runs of `solera migrate`)."""
+        code, stdout and stderr; fails past `timeout` seconds.
 
+        The entry point runs in this process, in a thread of its own, not as
+        a `solera` process: such a process can crash as it exits, its work
+        done (exit 139, a SIGSEGV, in a few runs of 100 of `solera migrate`).
+        One call runs at a time. A call past its timeout gives the process
+        its argv, stdout and stderr back at once; its thread, a daemon, runs
+        on, and a later call fails while it does."""
+
+        import contextlib
         import io
         import sys
         import traceback
@@ -600,28 +607,61 @@ class Solera:
         from solera_server.cli import main
 
         command = ["solera", "--state-url", (self.root / "state").as_uri(), "--namespace", "contract", *argv]
+        deadline = time.monotonic() + 1
+        while not _CLI.acquire(blocking=False):
+            if time.monotonic() > deadline:
+                raise AssertionError("a previous solera CLI call is still running")
+            await asyncio.sleep(0.05)
+        out, err = io.StringIO(), io.StringIO()
+        saved = sys.argv, sys.stdout, sys.stderr
+        sys.argv, sys.stdout, sys.stderr = command, out, err
+
+        def restore():
+            """The process's argv and streams back, where they are still this call's."""
+
+            if sys.argv is command:
+                sys.argv = saved[0]
+            if sys.stdout is out:
+                sys.stdout = saved[1]
+            if sys.stderr is err:
+                sys.stderr = saved[2]
+
+        loop = asyncio.get_running_loop()
+        done = loop.create_future()
+
+        def finish(code: int):
+            if not done.done():
+                done.set_result(code)
 
         def run():
-            out, err, code = io.StringIO(), io.StringIO(), 0
-            saved = sys.argv, sys.stdout, sys.stderr
-            sys.argv, sys.stdout, sys.stderr = command, out, err
+            code = 1
             try:
                 main()
+                code = 0
             except SystemExit as exit:
                 if isinstance(exit.code, str):
                     print(exit.code, file=err)
                 code = exit.code if isinstance(exit.code, int) else int(exit.code is not None)
             except Exception:
                 traceback.print_exc(file=err)
-                code = 1
             finally:
-                sys.argv, sys.stdout, sys.stderr = saved
-            return code, out.getvalue(), err.getvalue()
+                restore()
+                _CLI.release()
+                with contextlib.suppress(RuntimeError):
+                    loop.call_soon_threadsafe(finish, code)
 
         try:
-            return await asyncio.wait_for(asyncio.to_thread(run), timeout)
+            try:
+                threading.Thread(target=run, name="solera cli", daemon=True).start()
+            except RuntimeError:
+                _CLI.release()
+                raise
+            code = await asyncio.wait_for(done, timeout)
         except TimeoutError:
             raise AssertionError(f"solera {' '.join(argv)} did not return within {timeout} s") from None
+        finally:
+            restore()
+        return code, out.getvalue(), err.getvalue()
 
     def storage_server(self) -> Storage:
         """The namespace's state lives on an S3-compatible server from here on,
