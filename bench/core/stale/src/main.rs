@@ -13,8 +13,12 @@ mod sim;
 
 use object_store::path::Path;
 use serde_json::json;
-use solera_index::{ChangeIndex, LayerRef, Query, Run, Store, StoreOptions, WriteOptions};
-use solera_tracking::codec::Dec;
+use solera_index::{
+    ChangeIndex, LayerRef, NewCommit, Query, Run, Store, StoreOptions, WriteOptions,
+};
+use solera_tracking::codec::{Dec, Ver};
+use solera_tracking::outcomes::transition::{Stored, FAILED};
+use solera_tracking::outcomes::{self, Held, Record};
 use solera_tracking::event::{Event, Part};
 use solera_tracking::plan::OneIndex;
 use solera_tracking::progress::{
@@ -104,15 +108,16 @@ fn state(
             points: vec![],
             expect: read_digest(&Keyed::default(), false, &KeyRange::all()),
         }));
-        parts.push(Part::Watch(SetWatch {
+        t.apply_event(Event::of(parts)).unwrap();
+        t.apply_event(Event::of(vec![Part::Watch(SetWatch {
             edge: edge(i),
             watch: Watch {
                 conditions: cond.clone(),
                 own: None,
                 gate: true,
             },
-        }));
-        t.apply_event(Event::of(parts)).unwrap();
+        })]))
+        .unwrap();
         if let Some((x, s)) = &known {
             let gen = t.stale.inputs[&edge(i)].gen;
             t.apply_event(Event::of(vec![Part::Witness(Witness {
@@ -126,6 +131,88 @@ fn state(
         }
     }
     t
+}
+
+/// Edge 0's failure records (B6): `n` records in all, failed under `c`, on
+/// keys spread over the key space; with `waiting`, among them every key of
+/// `commit`, tried at the version the commit gives it (waiting for its
+/// retry). Written once to `dir` and reused.
+fn failures(
+    t: &mut Tracking,
+    ix: &ChangeIndex,
+    rt: &tokio::runtime::Runtime,
+    commit: &Run,
+    waiting: bool,
+    n: usize,
+    c: &Arc<Conditions>,
+) {
+    let cid = outcomes::cond_id(c);
+    let rec = |on: Ver| {
+        Record {
+            stored: Stored {
+                outcome: FAILED,
+                tries: 1,
+                deploy: 0,
+                forced: 0,
+                since: 0,
+                last: 0,
+                next_at: u64::MAX,
+                until: 0,
+                message: b"error".as_slice().into(),
+            },
+            on,
+            on_cond: cid,
+            at: 1,
+            held: Held::Absent,
+        }
+        .encode()
+    };
+    let mut recs: std::collections::BTreeMap<Vec<u8>, Vec<u8>> = Default::default();
+    if waiting {
+        for i in 0..commit.len() {
+            let on = Ver::of(commit.new_version(commit.rows(i).start));
+            recs.insert(commit.key(i).to_vec(), rec(on));
+        }
+    }
+    let mut i = 0u64;
+    while recs.len() < n {
+        let h = i.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 20;
+        let k = format!(
+            "site-{:04}/part-{:02}/obj-{:012}-fail.json",
+            h % 10_000,
+            (h >> 14) % 100,
+            i
+        );
+        recs.insert(k.into_bytes(), rec(Ver::Int(1)));
+        i += 1;
+    }
+    let mut run = Run::new();
+    for (k, v) in &recs {
+        run.push_key(k);
+        run.push_entry(1, solera_index::Version::Bytes(v), solera_index::Version::Absent);
+    }
+    let path = format!("stale-failures-{n}-{waiting}");
+    let nc = NewCommit {
+        commit: 1,
+        time_ms: 0,
+        producer: b"",
+        live_before: 0,
+        clear: false,
+    };
+    let layer = rt.block_on(ix.write_commit(&path, nc, &run)).unwrap();
+    t.outputs.insert(
+        outcomes::output_id(outcomes::FAILURES, &edge(0)),
+        Output {
+            layers: vec![layer],
+            head: 1,
+            live: recs.len() as u64,
+            full_run: None,
+        },
+    );
+    let k = t.per_key.entry(edge(0)).or_default();
+    k.conds = Arc::new([(cid, c.clone())].into_iter().collect());
+    k.counts[FAILED as usize] = recs.len() as u64;
+    k.classes = [recs.len() as u64, 0, 0];
 }
 
 fn cond(include: &[&str], exclude: &[&str]) -> Arc<Conditions> {
@@ -408,6 +495,62 @@ fn main() {
                     m,
                     &ix,
                     &refresh,
+                );
+            }
+        }
+    }
+
+    // N10 and N11 on an edge with B6 failure records: no notice, so every
+    // upstream commit is a refresh, which reads the records of rule 1's
+    // candidates.
+    if run("records") {
+        let n: usize = a.get("records").map_or(1_000_000, |v| v.parse().unwrap());
+        for (case, waiting, at) in [
+            (
+                "fresh as of head-1, the head commit touches no failing key",
+                false,
+                head - 1,
+            ),
+            (
+                "fresh as of head-1, every key of the head commit is a failing key waiting for its retry",
+                true,
+                head - 1,
+            ),
+        ] {
+            let mut t = state(&layers, head, 1, at, &all, Some((at, State::Fresh)));
+            failures(&mut t, &ix, &rt, &commit, waiting, n, &all);
+            for (mode, net) in modes {
+                let ix = index(&dir, net, &rt);
+                for m in [mode, "warm"] {
+                    timed(
+                        "refresh-records",
+                        json!({"case": case, "records": n, "commit_entries": commit.len()}),
+                        &t,
+                        0,
+                        m,
+                        &ix,
+                        &refresh,
+                    );
+                }
+            }
+        }
+        let mut t = state(&layers, head, 1, head - 24, &all, None);
+        failures(&mut t, &ix, &rt, &commit, false, n, &all);
+        let ask = t.stale_ask(&edge(0)).unwrap();
+        for (mode, net) in modes {
+            let ix = index(&dir, net, &rt);
+            let counts = Counts::default();
+            for pass in [mode, "warm"] {
+                counts.retain(&Tracking::new());
+                let (c0, t0, s0) = (proc_cpu(), Instant::now(), ix.store.stats.counts());
+                let o = rt
+                    .block_on(counts.get(&ask, &OneIndex(&ix), &NoneDue))
+                    .unwrap()
+                    .unwrap();
+                let s = ix.store.stats.counts();
+                emit(
+                    "count-records",
+                    json!({"behind_days": 1, "records": n, "mode": pass, "wall_s": r3(t0.elapsed().as_secs_f64()), "cpu_s": r3(proc_cpu() - c0), "gets": s.gets - s0.gets, "mb": r3((s.get_bytes - s0.get_bytes) as f64 / 1e6), "owed": o.counts.iter().sum::<u64>()}),
                 );
             }
         }
