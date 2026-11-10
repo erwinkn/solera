@@ -32,7 +32,7 @@ use crate::progress::{
 use crate::state::{Id, Output, Tracking};
 
 pub const PLANNER_VERSION: u64 = 1;
-pub const PLAN_FORMAT: u8 = 2;
+pub const PLAN_FORMAT: u8 = 3;
 const POINT_CHUNK: usize = 1024;
 /// Owed keys whose records are read in one lookup, where the edge has any.
 const RECORD_CHUNK: usize = 1024;
@@ -211,9 +211,12 @@ pub struct Plan {
 }
 
 /// A retry pass: its number, which starts over with the edge's records, and
-/// the life of the edge it runs in.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// the life of the edge it runs in. A retry batch of a consumer with several
+/// keyed inputs takes its keys on each of them, and is a step of the pass of
+/// this edge only.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PassId {
+    pub edge: Id,
     pub life: u64,
     pub n: u64,
 }
@@ -244,6 +247,12 @@ struct Failures {
 }
 
 impl View {
+    /// The digest of an input's progress over a range, as a plan reads it.
+    pub(crate) fn expect(&self, input: usize, range: &KeyRange) -> u64 {
+        let keyed = self.inputs[input].progress.keyed().expect("a keyed view");
+        read_digest(keyed, false, range)
+    }
+
     /// B6: the first input's failure records of `keys` and the conditions
     /// they name, or None when the edge has no records.
     pub async fn failure_records(
@@ -1148,9 +1157,10 @@ impl Plan {
             e.uv(u.head);
             e.uv(u.through);
         }
-        e.opt_u64(self.pass.map(|p| p.life));
-        if let Some(p) = self.pass {
+        e.opt_u64(self.pass.as_ref().map(|p| p.life));
+        if let Some(p) = &self.pass {
             e.uv(p.n);
+            e.bytes(&p.edge);
         }
         let mut out = Enc::new();
         out.u8(PLAN_FORMAT);
@@ -1253,7 +1263,11 @@ impl Plan {
             });
         }
         let pass = match d.opt_u64()? {
-            Some(life) => Some(PassId { life, n: d.uv()? }),
+            Some(life) => Some(PassId {
+                life,
+                n: d.uv()?,
+                edge: d.bytes()?.into(),
+            }),
             None => None,
         };
         d.end()?;

@@ -1541,6 +1541,18 @@ described above, with these choices:
 - **The hold-back at commit** (D205, §10): a key in B3's `Ops.held_back`
   keeps its record as it is, failed or not, and B3's `Unsettled` point
   stands.
+- **A retry on a consumer with several keyed inputs takes the key on
+  every one of them** (`due::plan_all`): the pass's input gets the pass's
+  key list, each other keyed input the same keys at its head, and the
+  worker loads and reports the key on each. So the union hold-back rule
+  applies unchanged, and only the pass's input moves the pass on
+  (`PassId` names its edge); unkeyed inputs are planned as for any batch.
+  A key held back while its own input read it as planned, at the version
+  its record failed on (another input moved), was not retried and its
+  input did not move, so it lowers what the pass covers like a record
+  written, and the next pass takes it again. So while one of a consumer's
+  keyed inputs is mid full run, the engine starts no retry pass for the
+  consumer: each would be held back and come due again at once.
 
 ## 12. History
 
