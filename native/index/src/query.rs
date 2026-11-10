@@ -160,15 +160,6 @@ fn replay(
     }
 }
 
-/// The newest-first layers a read at commits `(c1, c2]` needs.
-fn pick<'a>(layers: &'a [LayerRef], c1: u64, c2: u64, b: &Bounds) -> Vec<&'a LayerRef> {
-    layers
-        .iter()
-        .rev()
-        .filter(|l| l.hi > c1 && l.lo <= c2 && b.overlaps(l))
-        .collect()
-}
-
 /// The change index over one object store: queries, commits and merges. The
 /// store's cache is shared by every call.
 pub struct ChangeIndex {
@@ -181,20 +172,17 @@ impl ChangeIndex {
         ChangeIndex { store, write }
     }
 
-    /// Clears decide what a read reads, so a layer that lists any at or
-    /// below `c` is checked against its file even if none of its rows is
-    /// read. (A layer that lists none is trusted until it is read, as its key
-    /// bounds are.)
-    async fn check_clears(&self, layers: &[LayerRef], c: u64) -> Result<()> {
-        for l in layers.iter().filter(|l| !l.clears.is_empty() && l.lo <= c) {
-            self.store.top(l).await?;
-        }
-        Ok(())
-    }
-
+    /// Walks the layers a read at commits `(c1, c2]` needs, newest first:
+    /// those holding any of these commits that `q`'s key bounds reach.
+    /// Clears decide what a read reads, so a layer of these commits that
+    /// lists any is checked against its file even when the key bounds leave
+    /// it out. (A layer that lists none is trusted until it is read, as its
+    /// key bounds are.)
     async fn walk(
         &self,
-        layers: Vec<&LayerRef>,
+        layers: &[LayerRef],
+        c1: u64,
+        c2: u64,
         q: &Query,
         keys: Option<KeyList>,
         all_at_once: bool,
@@ -203,16 +191,16 @@ impl ChangeIndex {
         if b.is_empty() || q.limit == Some(0) || keys.as_ref().is_some_and(|k| k.is_empty()) {
             return Ok(None);
         }
+        let mut ls = Vec::new();
+        for l in layers.iter().rev().filter(|l| l.hi > c1 && l.lo <= c2) {
+            if b.overlaps(l) {
+                ls.push(l);
+            } else if !l.clears.is_empty() {
+                self.store.top(l).await?;
+            }
+        }
         Ok(Some(
-            Walk::open(
-                &self.store,
-                &layers,
-                b,
-                keys,
-                q.pattern.clone(),
-                all_at_once,
-            )
-            .await?,
+            Walk::open(&self.store, &ls, b, keys, q.pattern.clone(), all_at_once).await?,
         ))
     }
 
@@ -237,7 +225,6 @@ impl ChangeIndex {
         if c1 == c2 {
             return Ok(None);
         }
-        self.check_clears(layers, c2).await?;
         // A clear in the window: the states at C1 and at C2 are compared, which
         // reads the whole state at C1.
         let (k1, k2) = (clear_at(layers, c1), clear_at(layers, c2));
@@ -248,13 +235,8 @@ impl ChangeIndex {
             .filter(|&k| k > c1 && k <= c2)
             .collect();
         let mut changes: Vec<Change> = Vec::new();
-        let ls = pick(
-            layers,
-            if across { k1.saturating_sub(1) } else { c1 },
-            c2,
-            &q.bounds(),
-        );
-        let Some(mut w) = self.walk(ls, q, None, false).await? else {
+        let from = if across { k1.saturating_sub(1) } else { c1 };
+        let Some(mut w) = self.walk(layers, from, c2, q, None, false).await? else {
             return Ok(None);
         };
         let mut g = Run::new();
@@ -323,11 +305,10 @@ impl ChangeIndex {
     ) -> Result<Option<Vec<u8>>> {
         let range = check_layers(layers)?;
         at(c, range, "commit")?;
-        self.check_clears(layers, c).await?;
         let k = clear_at(layers, c);
-        let ls = pick(layers, k.saturating_sub(1), c, &q.bounds());
         let all_at_once = keys.is_some();
-        let Some(mut w) = self.walk(ls, q, keys, all_at_once).await? else {
+        let from = k.saturating_sub(1);
+        let Some(mut w) = self.walk(layers, from, c, q, keys, all_at_once).await? else {
             return Ok(None);
         };
         let mut g = Run::new();
@@ -417,7 +398,6 @@ impl ChangeIndex {
         if lo > hi {
             return Ok(None);
         }
-        self.check_clears(layers, hi).await?;
         let clears: Vec<u64> = layers
             .iter()
             .flat_map(|l| l.clears.iter().copied())
@@ -426,8 +406,8 @@ impl ChangeIndex {
         if !clears.is_empty() {
             return self.changes_with(layers, commits, &clears, q, on).await;
         }
-        let ls = pick(layers, lo.saturating_sub(1), hi, &q.bounds());
-        let Some(mut w) = self.walk(ls, q, None, false).await? else {
+        let from = lo.saturating_sub(1);
+        let Some(mut w) = self.walk(layers, from, hi, q, None, false).await? else {
             return Ok(None);
         };
         let all = lo == 0 && hi == u64::MAX;
@@ -471,8 +451,8 @@ impl ChangeIndex {
     ) -> Result<Option<Vec<u8>>> {
         let (lo, hi) = (*commits.start(), *commits.end());
         let start = clear_at(layers, lo.saturating_sub(1));
-        let ls = pick(layers, start.saturating_sub(1), hi, &q.bounds());
-        let Some(mut w) = self.walk(ls, q, None, false).await? else {
+        let from = start.saturating_sub(1);
+        let Some(mut w) = self.walk(layers, from, hi, q, None, false).await? else {
             return Ok(None);
         };
         let (mut g, mut f) = (Run::new(), Run::new());
