@@ -9,7 +9,9 @@ use object_store::path::Path;
 use rand::rngs::SmallRng;
 use rand::{Rng, SeedableRng};
 use solera_index::*;
-use solera_tracking::commit::{self, Change, Changes, Held, Mode, Reader, Source, Spec};
+use solera_tracking::commit::{
+    self, Change, Changes, FullRunDone, Held, Mode, Reader, Source, Spec,
+};
 use solera_tracking::plan::OneIndex;
 use solera_tracking::{Event, Id, Part, Tracking};
 use std::collections::BTreeMap;
@@ -104,7 +106,8 @@ fn new_of(c: Change<'_>, version: u64) -> Option<V> {
     }
 }
 
-/// What one commit should write, by brute force: (key, new, replaced).
+/// What one commit should change, by brute force: (key, new, replaced). A
+/// clear's are its effective changes, as a diff across it returns them.
 fn expected(
     states: &[State],
     changes: &Changes,
@@ -115,7 +118,10 @@ fn expected(
     let mut named: BTreeMap<Vec<u8>, Option<V>> = (0..changes.len())
         .map(|i| (changes.key(i).to_vec(), new_of(changes.change(i), version)))
         .collect();
-    if mode == Mode::Replace {
+    if mode == Mode::Clear {
+        named.retain(|_, v| v.is_some());
+    }
+    if matches!(mode, Mode::Replace | Mode::Clear) {
         for k in now.keys() {
             named.entry(k.clone()).or_insert(None);
         }
@@ -165,9 +171,10 @@ fn commits_match_the_fold() {
             let out = t.outputs.get(&output).cloned().unwrap_or_default();
             let head = out.head;
             assert_eq!(states.len() as u64, head + 1);
-            let mode = match rng.random_range(0..6) {
+            let mode = match rng.random_range(0..7) {
                 0 => Mode::Replace,
                 1 => Mode::Report(rng.random_range(check_layers(&out.layers).unwrap().0..=head)),
+                2 => Mode::Clear,
                 _ => Mode::Patch,
             };
             let named: Vec<&Vec<u8>> = universe
@@ -182,6 +189,7 @@ fn commits_match_the_fold() {
             version += 1 + rng.random_range(0..3);
             let want = expected(&states, &changes, mode, version);
             let collect = rng.random_range(0..8);
+            let ends = rng.random_bool(0.25);
             let path = format!("l/{seed}-{step}");
             let spec = Spec {
                 version,
@@ -189,6 +197,7 @@ fn commits_match_the_fold() {
                 producer: b"test",
                 path: &path,
                 mode,
+                ends_full_run: ends,
                 collect,
             };
             let bytes = changes.encode();
@@ -211,14 +220,34 @@ fn commits_match_the_fold() {
                 .unwrap();
             let Some(built) = built else {
                 assert!(
-                    want.is_empty(),
+                    want.is_empty() && mode != Mode::Clear,
                     "seed {seed} step {step}: nothing built, {want:?} expected"
                 );
+                if ends {
+                    let ev = Event::of(vec![Part::FullRunDone(FullRunDone {
+                        output: output.clone(),
+                    })])
+                    .encode();
+                    let ok = out.full_run.is_some();
+                    assert_eq!(t.apply(&ev).is_ok(), ok, "seed {seed} step {step}");
+                    assert_eq!(replay.apply(&ev).is_ok(), ok);
+                    assert_eq!(t.outputs.get(&output).and_then(|o| o.full_run), None);
+                }
                 continue;
             };
             let ev = Event::of(vec![Part::OutputCommit(built.part.clone())]).encode();
+            if ends && mode != Mode::Clear && out.full_run.is_none() {
+                assert!(t.apply(&ev).is_err(), "seed {seed} step {step}");
+                continue;
+            }
             t.apply(&ev).unwrap();
             replay.apply(&ev).unwrap();
+            let full_run = match (ends, mode) {
+                (true, _) => None,
+                (false, Mode::Clear) => Some(head + 1),
+                _ => out.full_run,
+            };
+            assert_eq!(t.outputs[&output].full_run, full_run, "seed {seed} step {step}");
             let layers = t.outputs[&output].layers.clone();
             let c = head + 1;
             let got = rt
@@ -251,10 +280,19 @@ fn commits_match_the_fold() {
             let counts = |f: fn(&(Vec<u8>, Option<V>, Option<V>)) -> bool| {
                 want.iter().filter(|e| f(e)).count() as u64
             };
-            assert_eq!(built.added, counts(|e| e.2.is_none()));
-            assert_eq!(built.removed, counts(|e| e.1.is_none()));
-            assert_eq!(built.updated, counts(|e| e.1.is_some() && e.2.is_some()));
+            if mode == Mode::Clear {
+                let written = (0..changes.len())
+                    .filter(|&i| changes.change(i) != Change::Removed)
+                    .count() as u64;
+                assert_eq!((built.added, built.updated, built.removed), (written, 0, out.live));
+                assert_eq!(built.part.layer.clears, [c]);
+            } else {
+                assert_eq!(built.added, counts(|e| e.2.is_none()));
+                assert_eq!(built.removed, counts(|e| e.1.is_none()));
+                assert_eq!(built.updated, counts(|e| e.1.is_some() && e.2.is_some()));
+            }
             match &built.keys {
+                _ if mode == Mode::Clear && out.live > 0 => assert!(built.keys.is_none()),
                 Some(k) => {
                     assert!(want.len() <= collect);
                     let up: Vec<&[u8]> = want
@@ -326,6 +364,7 @@ fn a_commit_built_at_an_old_head_is_refused() {
         producer: b"",
         path,
         mode: Mode::Patch,
+        ends_full_run: false,
         collect: 0,
     };
     let c = Changes::of(&[(b"k", Change::Upsert(None))]).unwrap();
@@ -492,6 +531,7 @@ fn large_commits_cross_pages_and_blocks() {
             producer: b"",
             path: &path,
             mode,
+            ends_full_run: false,
             collect: 0,
         };
         let built = rt

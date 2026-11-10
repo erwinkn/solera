@@ -46,6 +46,8 @@ pub enum Part {
     Consumed(progress::Consumed),
     /// B4: a commit on an output: its layer, its head, its live count.
     OutputCommit(commit::OutputCommit),
+    /// B4: an output's full run ends without a commit of its own.
+    FullRunDone(commit::FullRunDone),
 }
 
 impl Part {
@@ -62,6 +64,7 @@ impl Part {
             Part::Batch(p) => vec![("edge", &p.edge)],
             Part::Consumed(p) => vec![("edge", &p.edge)],
             Part::OutputCommit(p) => vec![("output", &p.output)],
+            Part::FullRunDone(p) => vec![("output", &p.output)],
         }
     }
 
@@ -74,6 +77,7 @@ impl Part {
             Part::Batch(_) => progress::TAG_BATCH,
             Part::Consumed(_) => progress::TAG_CONSUMED,
             Part::OutputCommit(_) => commit::TAG_OUTPUT_COMMIT,
+            Part::FullRunDone(_) => commit::TAG_FULL_RUN_DONE,
         }
     }
 
@@ -86,6 +90,7 @@ impl Part {
             Part::Batch(p) => p.encode(e),
             Part::Consumed(p) => p.encode(e),
             Part::OutputCommit(p) => p.encode(e),
+            Part::FullRunDone(p) => p.encode(e),
         }
     }
 
@@ -98,6 +103,7 @@ impl Part {
             progress::TAG_BATCH => Part::Batch(progress::BatchProgress::decode(d)?),
             progress::TAG_CONSUMED => Part::Consumed(progress::Consumed::decode(d)?),
             commit::TAG_OUTPUT_COMMIT => Part::OutputCommit(commit::OutputCommit::decode(d)?),
+            commit::TAG_FULL_RUN_DONE => Part::FullRunDone(commit::FullRunDone::decode(d)?),
             t => return format(format!("unknown part tag {t:#04x}")),
         })
     }

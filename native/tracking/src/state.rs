@@ -30,6 +30,8 @@ pub struct Output {
     pub layers: Vec<LayerRef>,
     pub head: u64,
     pub live: u64,
+    /// The clear that started a full run still under way.
+    pub full_run: Option<u64>,
 }
 
 /// One input of one consumer partition.
@@ -88,6 +90,7 @@ impl Tracking {
             Part::Batch(p) => p.check(self),
             Part::Consumed(p) => p.check(self),
             Part::OutputCommit(p) => p.check(self),
+            Part::FullRunDone(p) => p.check(self),
         }
     }
 
@@ -100,6 +103,7 @@ impl Tracking {
             Part::Batch(p) => p.apply(self),
             Part::Consumed(p) => p.apply(self),
             Part::OutputCommit(p) => p.apply(self),
+            Part::FullRunDone(p) => p.apply(self),
         }
     }
 
@@ -111,6 +115,7 @@ impl Tracking {
             e.bytes(id);
             e.uv(o.head);
             e.uv(o.live);
+            e.opt_u64(o.full_run);
             e.uv(o.layers.len() as u64);
             for l in &o.layers {
                 e.layer(l);
@@ -136,8 +141,17 @@ impl Tracking {
             let id: Id = d.bytes()?.into();
             let head = d.uv()?;
             let live = d.uv()?;
+            let full_run = d.opt_u64()?;
             let layers = (0..d.count()?).map(|_| d.layer()).collect::<Result<_>>()?;
-            t.outputs.insert(id, Output { layers, head, live });
+            t.outputs.insert(
+                id,
+                Output {
+                    layers,
+                    head,
+                    live,
+                    full_run,
+                },
+            );
         }
         for _ in 0..d.count()? {
             let id: Id = d.bytes()?.into();

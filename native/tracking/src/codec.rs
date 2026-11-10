@@ -101,6 +101,10 @@ impl Enc {
         self.bytes(&l.first_key);
         self.bytes(&l.last_key);
         self.uv(l.flags);
+        self.uv(l.clears.len() as u64);
+        for &c in &l.clears {
+            self.uv(c);
+        }
     }
 }
 
@@ -213,6 +217,9 @@ impl<'a> Dec<'a> {
             first_key: self.bytes()?.to_vec(),
             last_key: self.bytes()?.to_vec(),
             flags: self.uv()?,
+            clears: (0..self.count()?)
+                .map(|_| self.uv())
+                .collect::<Result<_>>()?,
         })
     }
 }
