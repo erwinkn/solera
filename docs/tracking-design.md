@@ -664,8 +664,8 @@ and conditions at one generation, as of one upstream commit.
   stale. The part always starts a new generation, since what is due
   changed with no change to progress: a notice or refresh computed before
   it is dropped, and if one wins the race the edge reads unknown until a
-  refresh. At startup the engine applies the rule to every retry already
-  due.
+  refresh. At startup the engine must apply the rule to every retry
+  already due; that call belongs to B7's engine half, not built yet.
 - **The gate** (rule 8): one event per output marks its full run started or
   completed; meanwhile readers that keep the gate read "held: upstream
   incomplete", with no count, and when it lifts they are probed again.
@@ -677,7 +677,8 @@ and conditions at one generation, as of one upstream commit.
 At 100M keys (`bench/core/stale/`): a notice costs 0.08 to 0.18 µs per
 edge, and about 100 ns per entry per edge when no entry matters; a count
 costs 1.1 s cold for an edge a day behind and 16 s for 30 days behind,
-within 6% of the index's own diff for a day.
+where the index's diff alone takes 0.9 s and 5.5 s
+(`bench/core/stale/results/run-100m.log`).
 
 ## 7. A batch from start to finish
 
