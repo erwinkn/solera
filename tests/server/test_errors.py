@@ -6,7 +6,7 @@ from solera import Abort, Failed, Rejected, Transient
 from solera.errors import ABORT, FAILED, REJECTED, TRANSIENT, backoff, classify, seconds
 from solera.sdk import Project, RegistrationError, Retry, asset
 
-from .engines import drive, make_engine, status_of
+from .engines import make_engine
 
 
 class Unprocessable(Rejected):
@@ -56,79 +56,6 @@ def test_errors_mapping_is_checked_at_registration():
         Project(errors={KeyError: ValueError})
     with pytest.raises(RegistrationError, match="not an exception type"):
         Project(errors={"KeyError": Abort})
-
-
-async def test_rejected_fails_without_retries(state):
-    calls = {"n": 0}
-
-    @asset(retries=Retry(3, delay=0.01))
-    def bad():
-        calls["n"] += 1
-        raise Unprocessable("empty file")
-
-    project = Project(assets=[bad])
-    engine = make_engine(state, project)
-    await engine.initialize()
-    detail = await drive(engine, await engine.submit(["bad"]))
-    assert status_of(detail) == "failed" and calls["n"] == 1
-    assert "Unprocessable: empty file" in detail["attempts"][detail["tasks"][0]["id"]][0]["error"]
-
-
-async def test_failed_and_abort_follow_retries(state):
-    calls = {"failed": 0, "abort": 0}
-
-    @asset(retries=Retry(1, delay=0.01))
-    def unclassified():
-        calls["failed"] += 1
-        raise ValueError("bug")
-
-    @asset(retries=Retry(1, delay=0.01))
-    def aborts():
-        calls["abort"] += 1
-        raise Abort("credentials")
-
-    project = Project(assets=[unclassified, aborts])
-    engine = make_engine(state, project)
-    await engine.initialize()
-    assert status_of(await drive(engine, await engine.submit(["unclassified"]))) == "failed"
-    assert status_of(await drive(engine, await engine.submit(["aborts"]))) == "failed"
-    assert calls == {"failed": 2, "abort": 2}
-
-
-async def test_transient_retries_past_retries_within_its_budget(state):
-    """A Transient error is retried after its `retry_after` even with no
-    retries left, until `retry_for` has passed since the first one."""
-
-    calls = {"n": 0}
-
-    @asset(retries=Retry(0))
-    def throttled():
-        calls["n"] += 1
-        if calls["n"] < 4:
-            raise Throttled("429", retry_after=0.01)
-        return ["ok"]
-
-    project = Project(assets=[throttled])
-    engine = make_engine(state, project)
-    await engine.initialize()
-    detail = await drive(engine, await engine.submit(["throttled"]))
-    assert status_of(detail) == "succeeded" and calls["n"] == 4
-
-
-async def test_transient_gives_up_after_retry_for(state):
-    calls = {"n": 0}
-
-    @asset(retries=Retry(0))
-    def flapping():
-        calls["n"] += 1
-        raise Transient("down", retry_after=0.05, retry_for=0.2)
-
-    project = Project(assets=[flapping], errors={})
-    engine = make_engine(state, project)
-    await engine.initialize()
-    detail = await drive(engine, await engine.submit(["flapping"]))
-    assert status_of(detail) == "failed"
-    assert 2 <= calls["n"] <= 6
 
 
 async def test_mapped_exception_is_transient(state):

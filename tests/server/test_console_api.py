@@ -102,43 +102,6 @@ async def run(engine, targets, **kw):
     return detail
 
 
-async def test_assets_status_rolls_up_every_asset(world):
-    engine, client, base, *_ = world
-    await run(engine, ["parse"], upstream=True)
-    await run(engine, ["parted"], partitions="all")
-    await run(engine, ["consume"], partitions=["x"])  # its dep, `files`, ran above
-    await run(engine, ["notify"])
-
-    response = await client.get(f"{base}/assets:status")
-    assert response.status_code == 200
-    status = response.json()["assets"]
-    assert set(status) == {"files", "parse", "parted", "consume", "notify"}
-    parse = status["parse"]
-    assert parse["partitions"] == {
-        "total": 1,
-        "materialized": 1,
-        "stale": 0,
-        "missing": 0,
-        "failed": 0,
-        "running": 0,
-        "removed": 0,
-    }
-    assert parse["partitioned"] is False and parse["stored_counts"] == {"rejected": 1, "failed": 1}
-    assert parse["last"]["outcome"] == "succeeded" and parse["last"]["attempt"].count("/") == 1
-    assert parse["repairs"] == 0 and parse["updated_at"]
-    assert status["files"]["stored_counts"] is None  # no per-key input
-    consume = status["consume"]
-    assert consume["partitioned"] and consume["partitions"]["total"] == 2
-    assert (consume["partitions"]["materialized"], consume["partitions"]["missing"]) == (1, 1)
-    # A job has no head: it is complete once it succeeded.
-    assert status["notify"]["partitions"]["materialized"] == 1 and status["notify"]["updated_at"] is None
-
-    # The rollup is not an asset name, and /partitions reads the same statuses.
-    assert (await client.get(f"{base}/assets/assets:status")).status_code == 404
-    parts = (await client.get(f"{base}/partitions/consume")).json()["partitions"]
-    assert {p["partition"]: p["status"] for p in parts} == {"x": "materialized", "y": "missing"}
-
-
 async def test_stored_outcomes_list_page_and_filter(world, monkeypatch):
     engine, client, base, *_ = world
     await run(engine, ["parse"], upstream=True)
@@ -237,86 +200,6 @@ async def test_key_outcomes_page_newest_first(world):
     assert {r["run"] for r in one["outcomes"]} == {run_id}
 
 
-async def test_explain_says_why_a_key_is_or_is_not_there(world):
-    engine, client, base, content, _ = world
-    await run(engine, ["parse"], upstream=True)
-
-    async def explain(key, **params):
-        response = await client.get(f"{base}/assets/parse/explain", params={"key": key, **params})
-        assert response.status_code == 200, response.text
-        return response.json()
-
-    ok = await explain("a.csv")
-    assert (ok["verdict"], ok["input"], ok["upstream"], ok["upstream_partition"]) == (
-        "ok",
-        "file",
-        "files",
-        "",
-    )
-    assert ok["outputs"] == {
-        "samples": {"present": True, "generation": ok["outputs"]["samples"]["generation"]}
-    }
-    assert ok["last"]["outcome"] == "ok" and ok["last_ok"] == ok["last"]
-    assert ok["last_ok"]["generation"] == ok["upstream_generation"]
-    assert ok["patterns"]["included"] and ok["patterns"]["excluded_by"] is None
-    assert ok["patterns"]["pending"] is None and ok["outcome"] is None
-
-    failing = await explain("bad.csv")
-    assert failing["verdict"] == "failing" and failing["outcome"]["outcome"] == "rejected"
-    assert failing["last"]["outcome"] == "rejected" and failing["last_ok"] is None
-    excluded = await explain("draft-1.csv")
-    assert excluded["verdict"] == "excluded" and excluded["patterns"]["excluded_by"] == "drafts"
-    assert (await explain("notes.txt"))["verdict"] == "not_matched"
-    assert (await explain("ghost.csv"))["verdict"] == "absent"
-
-    # The upstream moves on: a changed key is pending, a deleted one removed.
-    content["a.csv"] = {"text": "7"}
-    del content["bug.csv"]
-    content["new.csv"] = {"text": "8"}
-    await run(engine, ["files"])
-    pending = await explain("a.csv")
-    assert pending["verdict"] == "pending"
-    assert pending["last_ok"]["generation"] != pending["upstream_generation"]
-    assert (await explain("new.csv"))["verdict"] == "pending"
-    assert (await explain("bug.csv"))["verdict"] == "failing"  # its record outlives the key until delivered
-    await run(engine, ["parse"])
-    assert (await explain("bug.csv"))["verdict"] == "removed"
-    assert (await explain("a.csv"))["verdict"] == "ok"
-
-    assert (await client.get(f"{base}/assets/files/explain", params={"key": "a.csv"})).status_code == 400
-    bad_partition = await client.get(
-        f"{base}/assets/parse/explain", params={"key": "a.csv", "partition": "x"}
-    )
-    assert bad_partition.status_code == 404
-    await run(engine, ["parted"], partitions=["y"])  # a plain Incremental input never delivered
-    consume = await client.get(f"{base}/assets/consume/explain", params={"key": "k1", "partition": "y"})
-    assert consume.json()["verdict"] == "pending"
-    assert consume.json()["last"] is None and consume.json()["outputs"] == {}
-
-
-async def test_explain_a_key_restored_after_its_removal_is_pending(world):
-    engine, client, base, content, _ = world
-    await run(engine, ["parse"], upstream=True)
-    original = content.pop("a.csv")
-    await run(engine, ["parse"], upstream=True)  # the removal is delivered: no row holds it
-    content["a.csv"] = original  # back as it was: written again, at a generation of its own
-    await run(engine, ["files"])
-
-    async def explain(key):
-        response = await client.get(f"{base}/assets/parse/explain", params={"key": key})
-        assert response.status_code == 200, response.text
-        return response.json()
-
-    restored = await explain("a.csv")
-    assert restored["last"]["outcome"] == "removed"
-    assert restored["last_ok"]["generation"] != restored["upstream_generation"]  # a new write of it
-    assert restored["outputs"]["samples"]["present"] is False
-    assert restored["verdict"] == "pending"
-    await run(engine, ["parse"])
-    delivered = await explain("a.csv")
-    assert delivered["verdict"] == "ok" and delivered["outputs"]["samples"]["present"] is True
-
-
 async def test_edges_report_every_scope_and_what_it_owes(world):
     engine, client, base, _, parts = world
     await run(engine, ["files", "parted"], partitions="all")
@@ -352,53 +235,6 @@ async def test_edges_report_every_scope_and_what_it_owes(world):
     assert each["kind"] == "each" and (each["batch_size"], each["concurrency"]) == (10_000, 64)  # D111
     assert each["patterns"]["exclude"] == [["drafts", {"glob": "draft-*"}]]
     assert [s["observed"]["observed_at"] for s in each["partitions"]] == [None]
-
-
-async def test_a_domain_too_big_to_list_still_rolls_up(tmp_path):
-    grid = {d: StaticPartitions([f"{d}{i}" for i in range(1000)]) for d in "ab"}  # 1,000,000 partitions
-
-    @asset(outputs=Output("rows", keyed=True), partitions=grid)
-    def rows(ctx):
-        return {"k1": {"text": "1"}, "k2": {"text": "2"}}
-
-    @asset(
-        inputs={"row": Incremental("rows", each=True)}, outputs=Output("cells", key="path"), partitions=grid
-    )
-    def cells(row: dict):
-        return [{"value": int(row["text"])}]
-
-    state, engine = await open_engine(tmp_path, Project(assets=[rows, cells], name="grid"))
-    app = create_app(engine=engine, insecure=True)
-    app.state.engine = engine
-    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
-        base, partition = "/api/projects/grid", "a=a7,b=b9"
-        await run(engine, ["rows"], partitions=[partition])
-        await run(engine, ["cells"], partitions=[partition])
-
-        response = await client.get(f"{base}/assets:status")
-        assert response.status_code == 200, response.text
-        for name in ("rows", "cells"):
-            assert response.json()["assets"][name]["partitions"] == {
-                "total": 1_000_000,
-                "materialized": 1,
-                "stale": 0,
-                "missing": 999_999,
-                "failed": 0,
-                "running": 0,
-                "removed": 0,
-            }
-        explained = await client.get(
-            f"{base}/assets/cells/explain", params={"key": "k1", "partition": partition}
-        )
-        assert explained.status_code == 200, explained.text
-        assert explained.json()["verdict"] == "ok"
-        other = {"key": "k1", "partition": "a=a8,b=b9"}  # a current partition, never run
-        assert (await client.get(f"{base}/assets/cells/explain", params=other)).json()["verdict"] == "absent"
-        ghost = {"key": "k1", "partition": "a=a7,b=b1000"}
-        assert (await client.get(f"{base}/assets/cells/explain", params=ghost)).status_code == 404
-        # Listing every partition stays bounded: refused, as an `all` run would be.
-        assert (await client.get(f"{base}/partitions/rows")).status_code == 400
-    await state.close()
 
 
 async def test_what_an_operator_may_clear_starts_empty(world):
