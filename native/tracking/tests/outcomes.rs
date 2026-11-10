@@ -2763,13 +2763,24 @@ impl Multi {
             trace(&format!("the batch is refused: {e}"));
             return false;
         }
-        // The truth: a key loaded at another version than planned on an
-        // input mid full run, or cleared since the plan, is held back on
-        // every input (D205, the union rule).
+        // The truth: on an input mid full run, or cleared since the plan, a
+        // key loaded at another version than planned, or a key of the batch
+        // the input did not take, is held back on every input (D205, the
+        // union rule, #36).
+        let batch: BTreeSet<&Key> = p
+            .inputs
+            .iter()
+            .flat_map(|ip| ip.keys.iter().map(|c| &c.key))
+            .collect();
         let mut union: BTreeSet<Key> = BTreeSet::new();
         for (j, ip) in p.inputs.iter().enumerate() {
             if !self.sides[j].unsettled(ip.head) {
                 continue;
+            }
+            for k in &batch {
+                if !ip.keys.iter().any(|c| c.key == **k) {
+                    union.insert((*k).clone());
+                }
             }
             for c in &ip.keys {
                 let moved = loaded[j].iter().any(|(k, v)| {

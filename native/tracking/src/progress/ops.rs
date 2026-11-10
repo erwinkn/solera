@@ -86,7 +86,10 @@ impl Tracking {
                 .get(&p.edge)
                 .and_then(|e| Some((&e.input, e.progress.keyed()?)))
             else {
-                return invalid(format!("no keyed edge {}", String::from_utf8_lossy(&p.edge)));
+                return invalid(format!(
+                    "no keyed edge {}",
+                    String::from_utf8_lossy(&p.edge)
+                ));
             };
             if **input != *p.output {
                 return invalid("the edge reads another output than the batch planned");
@@ -274,12 +277,10 @@ fn moved<'a>(p: &'a InputPlan, r: &'a InputReport) -> impl Iterator<Item = &'a K
     r.loaded
         .iter()
         .filter(|(k, got)| {
-            p.keys
-                .binary_search_by(|c| c.key.cmp(k))
-                .is_ok_and(|i| {
-                    let wanted = Holding::of(p.keys[i].version.as_version(), &p.conditions, k);
-                    owed(&Holding::of(got.as_version(), &p.conditions, k), &wanted)
-                })
+            p.keys.binary_search_by(|c| c.key.cmp(k)).is_ok_and(|i| {
+                let wanted = Holding::of(p.keys[i].version.as_version(), &p.conditions, k);
+                owed(&Holding::of(got.as_version(), &p.conditions, k), &wanted)
+            })
         })
         .map(|(k, _)| k)
 }
