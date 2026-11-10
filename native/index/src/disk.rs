@@ -40,8 +40,16 @@ struct DiskState {
     filling: HashSet<String>,
     reserved: u64,
     /// Fills that failed: when, and how many times in a row. Not tried again
-    /// for a minute, doubling with each failure up to about an hour.
+    /// for a minute, doubling with each failure up to about an hour. At most
+    /// `FAILED` are remembered.
     failed: HashMap<String, (std::time::Instant, u32)>,
+}
+
+const FAILED: usize = 1024;
+
+/// How long a fill that failed `n + 1` times in a row is not tried again.
+fn backoff(n: u32) -> std::time::Duration {
+    std::time::Duration::from_secs(60 << n.min(6))
 }
 
 /// A layer path as a file name, and back: `%`, `/` and a leading `.`
@@ -172,7 +180,7 @@ impl Disk {
         let failed = st
             .failed
             .get(path)
-            .is_some_and(|&(t, n)| t.elapsed() < std::time::Duration::from_secs(60 << n.min(6)));
+            .is_some_and(|&(t, n)| t.elapsed() < backoff(n));
         if !self.keeps(path)
             || size.saturating_mul(4) > self.o.bytes
             || st.reserved + size > self.o.bytes
@@ -218,6 +226,16 @@ impl Disk {
         if st.filling.remove(path) {
             st.reserved -= size;
             let n = st.failed.get(path).map_or(0, |&(_, n)| n + 1);
+            if n == 0 && st.failed.len() >= FAILED {
+                st.failed.retain(|_, &mut (t, n)| t.elapsed() < backoff(n));
+                let oldest = st.failed.iter().min_by_key(|(_, &(t, _))| t);
+                if let Some(p) = oldest
+                    .filter(|_| st.failed.len() >= FAILED)
+                    .map(|(p, _)| p.clone())
+                {
+                    st.failed.remove(&p);
+                }
+            }
             st.failed
                 .insert(path.to_string(), (std::time::Instant::now(), n));
         }
@@ -346,4 +364,31 @@ fn rand_id() -> u64 {
         ]
         .concat(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn failed_fills_are_remembered_within_a_bound() {
+        let dir = std::env::temp_dir().join(format!("solera-disk-failed-{}", std::process::id()));
+        let d = Disk::open(DiskOptions {
+            dir: dir.clone(),
+            store: "s".into(),
+            bytes: 1 << 20,
+        })
+        .unwrap();
+        for i in 0..3 * FAILED {
+            let p = format!("layer-{i}");
+            assert!(d.claim(&p, 1));
+            d.abandon(&p, 1);
+        }
+        let st = d.st.lock().unwrap();
+        assert_eq!(st.failed.len(), FAILED);
+        assert!(st.failed.contains_key(&format!("layer-{}", 3 * FAILED - 1)));
+        assert_eq!(st.reserved, 0);
+        drop(st);
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }
