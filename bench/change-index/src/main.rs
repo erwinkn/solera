@@ -326,6 +326,8 @@ fn main() {
         ("scan-head", Q::Scan(head, None)),
         ("scan-head-range1pct", Q::Scan(head, narrow)),
         ("scan-1d-range1pct", Q::Scan(head - day, narrow)),
+        ("get-30", Q::Get(head, probe.iter().step_by(33).copied().collect())),
+        ("get-100", Q::Get(head, probe.iter().step_by(10).copied().collect())),
         ("get-1k", Q::Get(head, probe.clone())),
         ("get-10k", Q::Get(head, batch)),
     ];

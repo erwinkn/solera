@@ -1182,10 +1182,28 @@ fn a_commit_writer_writes_what_write_commit_writes() {
             }
         };
         assert_eq!(bytes("t/a").await, bytes("t/b").await);
-        assert_eq!(
-            ix.commits(&[a], 1, 1).await.unwrap()[0].live,
-            10 + 6667 - 6666
-        );
+        let h = CommitHeader {
+            commit: 1,
+            time_ms: 5,
+            producer: b"p".to_vec(),
+            added: 6667,
+            updated: 6667,
+            removed: 6666,
+            live: 10 + 6667 - 6666,
+            min_key: b"k000000".to_vec(),
+            max_key: b"k019999".to_vec(),
+            ..Default::default()
+        };
+        assert_eq!(ix.commits(&[a], 1, 1).await.unwrap(), vec![h.clone()]);
+        // the same bytes as the format's writer, given that header
+        let mut fw = Writer::new(WriteOptions::default(), 1, 1, None).unwrap();
+        for i in 0..run.len() {
+            let r = run.rows(i).start;
+            fw.push(run.key(i), 1, run.new_version(r), run.replaced_version(r))
+                .unwrap();
+        }
+        fw.finish(&[h]).unwrap();
+        assert_eq!(bytes("t/b").await, fw.take());
         // nothing pushed: nothing written
         let w = ix.commit_writer("e", nc).unwrap();
         assert!(w.finish().await.unwrap().is_none());
@@ -1208,6 +1226,122 @@ fn a_commit_writer_writes_what_write_commit_writes() {
             Err(Error::Invalid(_))
         ));
     });
+}
+
+#[test]
+fn a_commit_count_past_its_section_is_a_format_error() {
+    let raw = [0x80u8, 0x80, 0x40];
+    let c = zstd::bulk::compress(&raw, 1).unwrap();
+    let mut b = (raw.len() as u32).to_le_bytes().to_vec();
+    b.extend((xxhash_rust::xxh3::xxh3_64(&c) as u32).to_le_bytes());
+    b.extend(&c);
+    match format::parse_commits(&b) {
+        Err(Error::Format(m)) => assert!(m.contains("1048576 commit headers"), "{m}"),
+        got => panic!("{got:?}"),
+    }
+}
+
+#[test]
+fn a_truncated_layer_is_a_format_error() {
+    let rt = runtime();
+    let dir = scratch("short");
+    std::fs::create_dir_all(&dir).unwrap();
+    let index = || {
+        let local = Arc::new(object_store::local::LocalFileSystem::new_with_prefix(&dir).unwrap());
+        let store = Store::new(
+            local,
+            Path::from(""),
+            rt.handle().clone(),
+            StoreOptions::default(),
+        )
+        .unwrap();
+        ChangeIndex::new(store, WriteOptions::default())
+    };
+    let mut run = Run::new();
+    run.push_key(b"k");
+    run.push_entry(1, Version::Int(1), Version::Absent);
+    let nc = NewCommit {
+        commit: 1,
+        time_ms: 0,
+        producer: b"",
+        live_before: 0,
+    };
+    let l = rt.block_on(index().write_commit("c1", nc, &run)).unwrap();
+    let file = dir.join("c1");
+    let b = std::fs::read(&file).unwrap();
+    std::fs::write(&file, &b[..b.len() - 1]).unwrap();
+    let got = rt.block_on(index().scan(&[l], 1, &Query::default()));
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(matches!(got, Err(Error::Format(_))), "{got:?}");
+}
+
+#[test]
+fn write_throughs_stay_within_the_disk_cache() {
+    let rt = runtime();
+    let dir = scratch("tee");
+    let slow = Arc::new(object_store::throttle::ThrottledStore::new(
+        InMemory::new(),
+        object_store::throttle::ThrottleConfig {
+            wait_put_per_call: std::time::Duration::from_millis(300),
+            ..Default::default()
+        },
+    ));
+    let index = |disk: Option<u64>| {
+        let opts = StoreOptions {
+            disk: disk.map(|bytes| DiskOptions {
+                dir: dir.clone(),
+                bytes,
+                store: "t".into(),
+            }),
+            ..Default::default()
+        };
+        let store = Store::new(slow.clone(), Path::from("t"), rt.handle().clone(), opts).unwrap();
+        ChangeIndex::new(store, WriteOptions::default())
+    };
+    let one = |v: u64| {
+        let mut run = Run::new();
+        run.push_key(b"k");
+        run.push_entry(1, Version::Int(v), Version::Absent);
+        run
+    };
+    let nc = NewCommit {
+        commit: 1,
+        time_ms: 0,
+        producer: b"",
+        live_before: 0,
+    };
+    let in_dir = |dir: &std::path::Path| -> u64 {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| !e.file_name().to_string_lossy().starts_with(".l"))
+            .filter(|e| e.file_name() != ".store")
+            .map(|e| e.metadata().unwrap().len())
+            .sum()
+    };
+    rt.block_on(async {
+        let size = index(None)
+            .write_commit("w0", nc, &one(1))
+            .await
+            .unwrap()
+            .size;
+        let bytes = size * 9 / 2;
+        let ix = index(Some(bytes));
+        let runs: Vec<(String, Run)> = (1..=8).map(|i| (format!("w{i}"), one(i))).collect();
+        let writes = futures::future::join_all(runs.iter().map(|(p, r)| ix.write_commit(p, nc, r)));
+        let probe = async {
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            in_dir(&dir)
+        };
+        let (done, used) = tokio::join!(writes, probe);
+        assert!(done.iter().all(|w| w.is_ok()));
+        assert!(
+            used <= bytes,
+            "{used} bytes on disk, the cache holds {bytes}"
+        );
+        assert!(in_dir(&dir) <= bytes && ix.store.disk_bytes() <= bytes);
+    });
+    let _ = std::fs::remove_dir_all(dir);
 }
 
 async fn ix_scan(ix: &ChangeIndex, layers: &[LayerRef]) -> usize {
@@ -1278,7 +1412,7 @@ fn merges_refuse_entries_that_do_not_chain() {
 }
 
 #[test]
-fn a_flipped_byte_is_a_format_error() {
+fn a_flipped_byte_or_a_cut_file_is_a_format_error() {
     let rt = runtime();
     let mut rng = SmallRng::seed_from_u64(5);
     for trial in 0..200u64 {
@@ -1329,7 +1463,11 @@ fn a_flipped_byte_is_a_format_error() {
                 .unwrap()
                 .to_vec();
             let at = rng.random_range(0..b.len());
-            b[at] ^= 1 << rng.random_range(0..8);
+            if trial % 2 == 0 {
+                b[at] ^= 1 << rng.random_range(0..8);
+            } else {
+                b.truncate(at);
+            }
             mem.put(&path, b.into()).await.unwrap();
             let ix = ChangeIndex::new(store(&mem).unwrap(), WriteOptions::default());
             let all = ix.history(&w.layers, &Query::default()).await;
@@ -1337,9 +1475,49 @@ fn a_flipped_byte_is_a_format_error() {
             let failed = [all.err(), commits.err()];
             assert!(
                 failed.iter().any(|e| matches!(e, Some(Error::Format(_)))),
-                "trial {trial}: byte {at} of {} flipped, nothing noticed: {failed:?}",
+                "trial {trial}: byte {at} of {} flipped or cut, nothing noticed: {failed:?}",
                 l.size
             );
         });
     }
+}
+
+#[test]
+fn a_store_refuses_zero_for_its_sizes() {
+    let rt = runtime();
+    for o in [
+        StoreOptions {
+            max_inflight: 0,
+            ..Default::default()
+        },
+        StoreOptions {
+            max_get: 0,
+            ..Default::default()
+        },
+        StoreOptions {
+            part_bytes: 0,
+            ..Default::default()
+        },
+    ] {
+        let got = Store::new(
+            Arc::new(InMemory::new()),
+            Path::from(""),
+            rt.handle().clone(),
+            o,
+        );
+        assert!(matches!(got, Err(Error::Invalid(_))));
+    }
+}
+
+#[test]
+fn a_writer_refuses_seg_blocks_past_its_limit() {
+    for seg_blocks in [0, format::MAX_RAW / format::MAX_KEY + 1, 1 << 48] {
+        let o = WriteOptions {
+            seg_blocks,
+            ..Default::default()
+        };
+        assert!(matches!(Writer::new(o, 1, 1, None), Err(Error::Invalid(_))));
+    }
+    let max = Writer::new(WriteOptions::default(), 1, u64::MAX, Some(u64::MAX));
+    assert!(matches!(max, Err(Error::Invalid(_))));
 }
