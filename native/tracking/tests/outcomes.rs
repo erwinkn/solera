@@ -87,6 +87,7 @@ impl Log {
             time_ms: 0,
             producer: b"",
             live_before: before.len() as u64,
+            clear: false,
         };
         let path = format!("items/c{c}");
         self.layers
