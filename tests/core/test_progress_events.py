@@ -326,3 +326,31 @@ def test_an_input_keeps_its_fence_for_a_moved_key_no_other_input_holds_back(tmp_
     t._set_output(b"b", logs[b"b"], 3, 1, 3)
     with pytest.raises(ValueError, match="became unsettled"):
         t.apply(event)
+
+
+def test_pattern_split_edges_on_one_output_hold_back_only_what_their_patterns_take(tmp_path):
+    """e1 takes a*, e2 takes b*, both on items. A clear since the plan holds
+    back what each loaded at another version, but a key one edge took is not
+    held back for the other, whose patterns do not take it: nothing loads it
+    there."""
+    ix = ChangeIndex(f"file://{tmp_path}")
+    t = Tracking()
+    t.attach(b"items", ix)
+    layers = [ix.write_commit("items/1", 1, [("a1", 1, None), ("b1", 1, None)], live_before=0)]
+    t._set_output(b"items", layers, 1, 2)
+    conds = [{"patterns": {"include": [{"glob": g}]}} for g in ("a*", "b*")]
+    for e in (b"e1", b"e2"):
+        t.apply(Tracking.event_edge_open(e, b"items", True))
+    inputs = [{"edge": b"e1", "conditions": conds[0]}, {"edge": b"e2", "conditions": conds[1]}]
+    plan = t.plan({"inputs": inputs, "limit": 10})["plan"]
+    assert Tracking.plan_keys(plan, 0)[0] == ["a1"] and Tracking.plan_keys(plan, 1)[0] == ["b1"]
+    layers.append(
+        ix.write_commit("items/2", 2, [("a1", 2, None), ("b1", 2, None)], live_before=2, clear=True)
+    )
+    t._set_output(b"items", layers, 2, 2)
+    assert t.progress_ops(plan, [([], [("a1", 2)]), ([], [])])[2] == [["a1"], []]
+    event, _, held_back = t.progress_ops(plan, [([], []), ([], [])])
+    assert held_back == [[], []]
+    t.apply(event)
+    assert t.owed(b"e1", conds[0]) == ([("a1", "updated")], None)
+    assert t.owed(b"e2", conds[1]) == ([("b1", "updated")], None)

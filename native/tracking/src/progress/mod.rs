@@ -422,10 +422,12 @@ pub enum Reason {
     Deviation = 3,
     /// The key was processed through an explicit key list.
     KeyList = 4,
-    /// The batch loaded the key, on this input or another, at another
-    /// version than planned while that input was mid full run or cleared
-    /// since the plan, and held it back at commit: the consumer keeps what
-    /// it held. Unlike `HeldBack`, the key was in the batch's plan.
+    /// The batch took the key and held it back at commit: on an input of the
+    /// batch that was mid full run or cleared since the plan, the key was
+    /// loaded at another version than planned, or that input's patterns take
+    /// it but the input did not (another input did), so its load there had
+    /// no planned version. The consumer keeps what it held. Unlike
+    /// `HeldBack`, the key was in the batch's plan.
     Unsettled = 5,
 }
 
@@ -1097,12 +1099,13 @@ pub struct BatchProgress {
     /// The digest of the progress the plan read (the range's slice; with a
     /// reset, all of it): the commit applies only over that progress.
     pub expect: u64,
-    /// When the batch kept a key loaded at another version than planned,
-    /// its input then being settled: that input's output and the head the
-    /// batch planned at. Refused if the edge reads another output, or the
-    /// input became `unsettled`, before the event applies, since the load
-    /// would then have been held back. The other way needs no fence: holding
-    /// back is safe.
+    /// When the batch kept, on an input then settled, a key it would have
+    /// held back had the input been unsettled (loaded at another version than
+    /// planned, or taken by the input's patterns but not by the input): that
+    /// input's output and the head the batch planned at. Refused if the edge
+    /// reads another output, or the input became `unsettled`, before the
+    /// event applies, since the key would then have been held back. The other
+    /// way needs no fence: holding back is safe.
     pub fence: Option<(Id, u64)>,
 }
 

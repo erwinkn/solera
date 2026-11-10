@@ -17,9 +17,11 @@
 //! the state as it was before the event, and only then applies them in order,
 //! so an event applies whole or not at all. Applying a checked part cannot
 //! fail. Parts of one event change distinct things ([`Part::touches`]; an
-//! event where two parts name the same edge or output is refused), so no
-//! part's check depends on another's effect: an edge is opened by an event
-//! of its own.
+//! event where two parts name the same edge or output is refused). A part's
+//! check may read what another part changes (a fenced batch reads the output
+//! that a commit beside it changes): checks read the state before the event,
+//! so the event applies as if the reading part came first, which its check
+//! makes valid. An edge is opened by an event of its own.
 
 use crate::codec::{Dec, Enc};
 use crate::commit;

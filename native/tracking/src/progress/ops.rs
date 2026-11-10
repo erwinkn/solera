@@ -32,10 +32,10 @@ pub struct Ops {
     pub records: Vec<Record>,
     /// Per keyed input, sorted: the keys this commit held back. On an input
     /// whose output was mid full run, or cleared since the plan's head, a key
-    /// loaded at another version than planned, or a key of the batch the
-    /// input did not take (its load there had no planned version to check),
-    /// is held back on every input of the batch, since its output is one
-    /// value computed from all of them.
+    /// loaded at another version than planned, or a key of the batch that the
+    /// input's patterns take but the input did not (a load of it there would
+    /// have no planned version to check), is held back on every input of the batch,
+    /// since its output is one value computed from all of them.
     /// Each keeps what it held; whether it failed is not recorded.
     pub held_back: Vec<Vec<Key>>,
 }
@@ -115,7 +115,12 @@ impl Tracking {
             .zip(reports)
             .map(|(p, r)| {
                 moved(p, r)
-                    .chain(batch.iter().copied().filter(|k| !taken(p, k)))
+                    .chain(
+                        batch
+                            .iter()
+                            .copied()
+                            .filter(|k| !taken(p, k) && p.conditions.patterns.takes(k)),
+                    )
                     .collect()
             })
             .collect();
