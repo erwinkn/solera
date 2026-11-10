@@ -856,9 +856,9 @@ In `native/tracking/src/plan/` and `record/`, called from Python as
   patterns by the planner, which pages on. A `Regex` is in the Rust `regex`
   dialect, matched against the whole key, and today's Python matching uses
   the same native matcher.
-- **Points are looked up in chunks** of up to 1,024 keys, no further than
-  the sources have read while any has more to read, so a batch fetches at
-  most one chunk of points beyond its range.
+- **Points are looked up in chunks** of up to 1,024 keys, bounded by the
+  unfinished sources' read frontier; the lookahead may fetch points beyond
+  the final batch range.
 - **Keys owed but not due** (§11) come from a hook (`plan::Hold`) that B6
   implements over its due index. They are listed as held back and keep
   what they held.
