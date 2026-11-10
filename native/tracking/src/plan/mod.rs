@@ -207,7 +207,15 @@ pub struct Plan {
     pub inputs: Vec<InputPlan>,
     pub unkeyed: Vec<UnkeyedPlan>,
     /// The retry pass a retry batch belongs to (B6).
-    pub pass: Option<u64>,
+    pub pass: Option<PassId>,
+}
+
+/// A retry pass: its number, which starts over with the edge's records, and
+/// the life of the edge it runs in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PassId {
+    pub life: u64,
+    pub n: u64,
 }
 
 /// What a plan reads of the state, taken under a short lock.
@@ -1065,7 +1073,10 @@ impl Plan {
             e.uv(u.head);
             e.uv(u.through);
         }
-        e.opt_u64(self.pass);
+        e.opt_u64(self.pass.map(|p| p.life));
+        if let Some(p) = self.pass {
+            e.uv(p.n);
+        }
         let mut out = Enc::new();
         out.u8(PLAN_FORMAT);
         t.encode(&mut out);
@@ -1166,7 +1177,10 @@ impl Plan {
                 through: d.uv()?,
             });
         }
-        let pass = d.opt_u64()?;
+        let pass = match d.opt_u64()? {
+            Some(life) => Some(PassId { life, n: d.uv()? }),
+            None => None,
+        };
         d.end()?;
         Ok(Plan {
             mode,

@@ -32,7 +32,7 @@ use crate::event::Part;
 use crate::outcomes::commit::{records, View};
 use crate::outcomes::transition::{eligible, Counters, FAILED, NAMES};
 use crate::outcomes::{output_id, record_digest, PassStart, Record, DUE, FAILURES, PASS};
-use crate::plan::{Cand, Indexes, InputPlan, Mode, Plan};
+use crate::plan::{Cand, Indexes, InputPlan, Mode, PassId, Plan};
 use crate::progress::{owed, read_digest, Class, Conditions, Holding, Key, KeyRange};
 use crate::state::{Id, Output, Tracking};
 
@@ -362,6 +362,9 @@ pub async fn plan(
         range,
         inputs: vec![input],
         unkeyed: vec![],
-        pass: Some(pass.n),
+        pass: Some(PassId {
+            life: v.per_key.life,
+            n: pass.n,
+        }),
     })
 }

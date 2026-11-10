@@ -188,8 +188,11 @@ pub async fn commit(
     }
     let keyed = v.progress.keyed().expect("a per-key edge is keyed");
     let retry = plan.pass.is_some();
-    let step = if let Some(n) = plan.pass {
-        let Some(pass) = v.per_key.pass.as_ref().filter(|p| p.n == n) else {
+    let step = if let Some(id) = plan.pass {
+        if id.life != v.per_key.life {
+            return invalid("a retry batch of a pass in an earlier life of the edge");
+        }
+        let Some(pass) = v.per_key.pass.as_ref().filter(|p| p.n == id.n) else {
             return invalid("a retry batch of a pass that ended");
         };
         Some(Step {

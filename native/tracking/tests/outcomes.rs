@@ -880,11 +880,10 @@ impl World {
             .t
             .per_key
             .get(EDGE.as_bytes())
-            .and_then(|k| k.pass.as_ref())
-            .map(|p| p.n);
+            .and_then(|k| k.pass.as_ref().map(|p| (k.life, p.n)));
         if self.run(ix, &p, p.pass.is_some()).await.is_some() {
             assert!(
-                p.pass.is_none() || p.pass == pass,
+                p.pass.is_none() || p.pass.map(|p| (p.life, p.n)) == pass,
                 "a retry batch of pass {:?} commits in pass {pass:?}",
                 p.pass
             );
@@ -2132,4 +2131,61 @@ fn a_key_a_pass_left_while_its_input_had_changed_gets_its_deploy_retry() {
         w.apply(start.expect("k1 waits for the deploy's retry"));
         assert_eq!(taken(&w.retry_plan(&ix, 10).await), [key("k1")]);
     });
+}
+
+/// A retry plan names the life its pass runs in (review, round 7). Pass
+/// numbers start over with the edge's records, so a retry plan held across a
+/// restart would otherwise meet a pass of the same number, with the same
+/// points and no records read, and end it before it retried anything.
+#[test]
+fn a_retry_batch_of_a_pass_in_an_earlier_life_is_refused() {
+    let rt = runtime();
+    let mut met = 0;
+    for restart in restarts() {
+        let ix = index(&rt);
+        rt.block_on(async {
+            let mut w = scripted();
+            let k1 = Mode::Keys(vec![key("k1")]);
+            let c1 = w.counters;
+            w.input(&ix, &[("k1", 5)]).await;
+            let first = w.planned(&ix, None, 10, k1.clone()).await;
+            let ev = w
+                .commit_of(&ix, &first, &[("k1", Kind::Failed)], &[], c1)
+                .await
+                .unwrap();
+            w.apply(ev);
+            w.counters.deploy = 2;
+            w.input(&ix, &[("k1", 6)]).await;
+            if let Some(parts) = w.caught(&ix).await {
+                w.apply(parts);
+            }
+            let start = w.start_of(&ix).await.expect("the deploy starts a pass");
+            w.apply(start);
+            let old = w.retry_plan(&ix, 10).await;
+            assert!(taken(&old).is_empty());
+            for part in restart {
+                w.apply(vec![part]);
+            }
+            let c2 = w.counters;
+            let p = w.planned(&ix, None, 10, k1.clone()).await;
+            let ev = w
+                .commit_of(&ix, &p, &[("k1", Kind::Failed)], &[], c2)
+                .await
+                .unwrap();
+            w.apply(ev);
+            w.counters.deploy = 3;
+            let start = w.start_of(&ix).await.expect("the deploy starts a pass");
+            w.apply(start);
+            if old.pass.unwrap().n == w.t.per_key[EDGE.as_bytes()].pass.as_ref().unwrap().n {
+                met += 1;
+            }
+            let c3 = w.counters;
+            if let Ok(ev) = w.commit_of(&ix, &old, &[], &[], c3).await {
+                assert!(w.t.apply(&Event::of(ev).encode()).is_err());
+            }
+            assert!(w.t.per_key[EDGE.as_bytes()].pass.is_some());
+            assert_eq!(taken(&w.retry_plan(&ix, 10).await), [key("k1")]);
+        });
+    }
+    assert!(met > 0, "no restart gave the new pass the old one's number");
 }
