@@ -314,7 +314,7 @@ def items_on(store, writes: list, received: list | None = None, **decl) -> Proje
     """`items`, keyed by `id` on `store`, writes the next of `writes` each
     time it runs, the last one from then on; `copy`, on the default store,
     reads it incrementally and records what each batch received:
-    `(classes, {key: value})`."""
+    `(classes, {key: value})`; `marker`, read by nothing, is `cleanup_pass`'s."""
 
     received = [] if received is None else received
 
@@ -329,7 +329,40 @@ def items_on(store, writes: list, received: list | None = None, **decl) -> Proje
         received.append((classes, {str(r["id"]): r["v"] for r in items}))
         return rebuild(batch, [{"id": r["id"], "v": r["v"]} for r in items])
 
-    return Project(assets=[items, copy], stores={"s": store})
+    return Project(assets=[items, copy, marker()], stores={"s": store})
+
+
+def marker():
+    """`marker`, an output nothing reads, rewritten each time it runs."""
+
+    n = [0]
+
+    @asset(outputs=Output("marker", key="id"))
+    def marker():
+        n[0] += 1
+        return rows(f"m={n[0]}")
+
+    return marker
+
+
+async def cleanup_pass(solera) -> None:
+    """A barrier: the cleanups due by now have had their pass. `marker` is
+    written twice; once the version its second write superseded is gone,
+    and no cleanup run is queued or running, the engine has cleaned up
+    after every commit before it. The clock moves a minute at each look,
+    so that cleanups spaced out in time come due."""
+
+    await solera.run("marker")
+    superseded = await solera.head("marker"), await solera.keys("marker")
+    await solera.run("marker")
+
+    async def passed():
+        solera.advance(60)
+        if await solera.at("marker", *superseded) is not None:
+            return False
+        return not await solera.runs(status=["queued", "running"], origin=["cleanup"])
+
+    await solera.until(passed)
 
 
 async def served(solera, project) -> None:
