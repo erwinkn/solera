@@ -756,6 +756,34 @@ fn bad_references_and_abandoned_reads_leave_the_index_working() {
             ix.scan(&[flagged], 1, &q).await,
             Err(Error::Format(_))
         ));
+        // a layer's clears decide what a read reads, even when it holds no rows
+        let cl = |c| NewCommit {
+            clear: true,
+            ..nc(c)
+        };
+        let x2 = ix.write_commit("x2", cl(2), &Run::new()).await.unwrap();
+        let x3 = ix.write_commit("x3", nc(3), &Run::new()).await.unwrap();
+        let m = ix
+            .merge(&[l1.clone(), x2, x3], 1..3, 0, "xm")
+            .await
+            .unwrap();
+        assert_eq!((m.entries, m.clears.clone()), (0, vec![2]));
+        assert_eq!(
+            ix.scan(&[l1.clone(), m.clone()], 2, &q)
+                .await
+                .unwrap()
+                .run
+                .len(),
+            0
+        );
+        let moved = LayerRef {
+            clears: vec![3],
+            ..m
+        };
+        assert!(matches!(
+            ix.scan(&[l1.clone(), moved], 2, &q).await,
+            Err(Error::Format(_))
+        ));
         let past = LayerRef {
             hi: u64::MAX,
             floor: Some(u64::MAX),
@@ -1251,7 +1279,10 @@ fn a_commit_writer_writes_what_write_commit_writes() {
             max_key: b"k019999".to_vec(),
             ..Default::default()
         };
-        assert_eq!(ix.commits(&[a], 1, 1).await.unwrap(), vec![h.clone()]);
+        assert_eq!(
+            ix.commits(std::slice::from_ref(&a), 1, 1).await.unwrap(),
+            vec![h.clone()]
+        );
         // the same bytes as the format's writer, given that header
         let mut fw = Writer::new(WriteOptions::default(), 1, 1, None).unwrap();
         for i in 0..run.len() {
@@ -1265,6 +1296,22 @@ fn a_commit_writer_writes_what_write_commit_writes() {
         let w = ix.commit_writer("e", nc).unwrap();
         assert!(w.finish().await.unwrap().is_none());
         assert!(mem.head(&Path::from("t/e")).await.is_err());
+        // but a clear that writes nothing removes everything
+        let clear = NewCommit {
+            commit: 2,
+            clear: true,
+            ..nc
+        };
+        let w = ix.commit_writer("e", clear).unwrap();
+        let e = w.finish().await.unwrap().unwrap();
+        assert_eq!(
+            (e.flags, e.clears.clone(), e.entries),
+            (format::CLEAR, vec![2], 0)
+        );
+        let hs = ix.commits(&[a.clone(), e.clone()], 2, 2).await.unwrap();
+        assert_eq!((hs[0].flags, hs[0].live), (format::CLEAR, 0));
+        let q = Query::default();
+        assert_eq!(ix.scan(&[a.clone(), e], 2, &q).await.unwrap().run.len(), 0);
         // one entry per key, keys ascending
         let mut w = ix.commit_writer("d", nc).unwrap();
         w.push(b"k", Version::Int(1), Version::Absent)
