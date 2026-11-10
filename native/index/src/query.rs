@@ -44,8 +44,9 @@ impl Query {
 /// A query's result: one key per group, in key order, and where the next page
 /// starts if the limit stopped it.
 ///
-/// - `diff`: one entry per key: the newest commit in the window that changed
-///   it, `new` the version at C2, `replaced` the version at C1.
+/// - `diff`: one entry per key: the newest commit in the window that wrote
+///   or removed it, `new` the version at C2, `replaced` the version at C1.
+///   A key written again with the version it had still counts that write.
 /// - `scan`, `get`: one entry per key present at C: the entry that set its
 ///   version.
 /// - `history`: every retained entry, newest first. A base's entries at or
@@ -205,8 +206,10 @@ impl ChangeIndex {
     }
 
     /// Keys whose state differs between C1 and C2: `on(key, newest commit
-    /// in the window that changed it, version at C2, version at C1)` for
-    /// each, in key order. A key a clear removed changed at that clear.
+    /// in the window that wrote or removed it, version at C2, version at
+    /// C1)` for each, in key order. A key a clear removed changed at that
+    /// clear, and a key a later clear wrote again with the same version
+    /// reports that clear, as `scan` would.
     /// Returns where the next page starts if the limit stopped it.
     pub async fn diff_with(
         &self,
