@@ -828,7 +828,7 @@ live.
 *From* D167; F43. *Covered* `contract/test_cln.py::test_cln_9_a_store_root_belongs_to_one_namespace`; `server/test_cli.py::test_adopt_store_moves_a_root_once_its_namespace_is_retired`; `test_demo_e2e.py::test_the_demo_keeps_its_data_beside_its_state`.
 
 **CLN-10. Sensor tick rows last a day; a tick that committed lasts as long as its run.**
-*From* `per-key-processing.md` §12. *Covered* `contract/test_cln.py::test_cln_10_sensor_ticks_last_a_day_and_a_tick_that_asked_for_a_run_lasts_with_it`; `server/test_sensors.py::test_tick_rows_are_written_with_the_history_and_expire_after_a_day`.
+*From* `per-key-processing.md` §12. *Covered* `contract/test_cln.py::test_cln_10_sensor_tick_rows_last_a_day`; `contract/test_cln.py::test_cln_10_a_tick_that_committed_lasts_as_long_as_its_run`; `contract/test_cln.py::test_cln_10_a_tick_that_asked_for_a_run_lasts_with_it`; `server/test_sensors.py::test_tick_rows_are_written_with_the_history_and_expire_after_a_day`.
 
 **CLN-11. A paused consumer never loses its place to retention.**
 `tally` paused 40 days under a 30-day window: when it runs, it owes k2
@@ -885,7 +885,7 @@ of that partition wait for the repair.
 A malformed control file or result fails its attempt, retryably. A run
 config holding an integer past 64 bits is a 400. A malformed body is a
 422.
-*From* F27, F28, F30, F32. *Covered* `contract/test_eng.py::test_eng_9_a_config_value_past_64_bits_is_a_400_and_the_engine_goes_on`; `contract/test_eng.py::test_eng_9_a_malformed_body_is_a_422_and_the_engine_goes_on`; `contract/test_eng.py::test_eng_9_a_malformed_control_file_fails_its_attempt_retryably`; `contract/test_eng.py::test_eng_9_a_malformed_worker_result_is_settled_without_its_bad_parts`; `server/test_control_file.py::test_a_malformed_control_file_fails_its_attempt_and_is_ended`; `server/test_control_file.py::test_an_open_control_file_naming_a_worker_fails_its_attempt`; `server/test_fence.py::test_a_malformed_worker_result_is_settled_without_its_bad_parts`; `server/test_api.py::test_a_value_no_checkpoint_can_hold_is_a_400`; `server/test_api_bodies.py::test_a_malformed_body_on_a_raw_route_is_refused`.
+*From* F27, F28, F30, F32. *Covered* `contract/test_eng.py::test_eng_9_a_config_value_past_64_bits_is_a_400_and_the_engine_goes_on`; `contract/test_eng.py::test_eng_9_a_malformed_body_is_a_422_and_the_engine_goes_on`; `contract/test_eng.py::test_eng_9_a_malformed_control_file_fails_its_attempt_retryably`; `contract/test_eng.py::test_eng_9_a_result_the_engine_cannot_use_fails_its_attempt_retryably`; `contract/test_eng.py::test_eng_9_malformed_telemetry_in_a_result_is_dropped_and_the_attempt_settles`; `server/test_control_file.py::test_a_malformed_control_file_fails_its_attempt_and_is_ended`; `server/test_control_file.py::test_an_open_control_file_naming_a_worker_fails_its_attempt`; `server/test_fence.py::test_a_malformed_worker_result_is_settled_without_its_bad_parts`; `server/test_api.py::test_a_value_no_checkpoint_can_hold_is_a_400`; `server/test_api_bodies.py::test_a_malformed_body_on_a_raw_route_is_refused`.
 
 **ENG-10. No hot loops.**
 Between external inputs the engine's ticks, events and requests stay
@@ -908,7 +908,7 @@ and a source commit to it is refused, retryable.
 An output's merges fail three times: it waits 10 minutes, doubling,
 alarmed, and tries again; an operator can clear the wait; merges cut short
 by the engine's own stop count for nothing.
-*From* D181 (Q13). *Covered* `contract/test_eng.py::test_eng_14_upkeep_that_keeps_failing_backs_off_alarms_and_tries_again`; `contract/test_eng.py::test_eng_14_an_operator_clear_merges_at_once`; `server/test_keys.py::test_a_merge_that_keeps_failing_backs_off_and_resumes`; `server/test_keys.py::test_an_operator_clear_merges_at_once`; `server/test_keys.py::test_merges_the_engine_stops_count_for_nothing`.
+*From* D181 (Q13). *Covered* `contract/test_eng.py::test_eng_14_upkeep_that_keeps_failing_backs_off_alarms_and_tries_again`; `contract/test_eng.py::test_eng_14_an_operator_clear_merges_at_once`; `contract/test_eng.py::test_eng_14_merges_cut_short_by_the_engines_stop_count_for_nothing`; `server/test_keys.py::test_a_merge_that_keeps_failing_backs_off_and_resumes`; `server/test_keys.py::test_an_operator_clear_merges_at_once`; `server/test_keys.py::test_merges_the_engine_stops_count_for_nothing`.
 
 **ENG-15. `SIGTERM` stops `solera serve` cleanly, exit 0.**
 *From* commit `4275ca0` (no ledger entry). *Covered* `contract/test_eng.py::test_eng_15_a_sigterm_stops_solera_serve_cleanly`.
@@ -979,7 +979,7 @@ keys the output lists, as written by its head.
 A replacement is the whole content; a patch changes only its keys; a key
 with zero rows does not exist; many rows of one key are its group; the
 same attempt writing again is one write.
-*From* `stores.md` (invariants 1–2); `per-key-processing.md` §6. *Covered* `contract/test_sto.py::test_sto_6_writes_mean_the_same_on_every_store`; `contract/test_sto.py::test_sto_6_a_key_given_no_rows_does_not_exist`; `contract/test_sto.py::test_sto_6_one_call_per_key_many_rows_one_write`; `sdk/test_store_conformance.py::test_shipped_stores_conform`.
+*From* `stores.md` (invariants 1–2); `per-key-processing.md` §6. *Covered* `contract/test_sto.py::test_sto_6_writes_mean_the_same_on_every_store`; `contract/test_sto.py::test_sto_6_a_key_given_no_rows_does_not_exist`; `contract/test_sto.py::test_sto_6_the_same_attempt_writing_again_is_one_write`; `contract/test_sto.py::test_sto_6_one_call_per_key_many_rows_one_write`; `sdk/test_store_conformance.py::test_shipped_stores_conform`.
 
 **STO-7. A key is stored as itself, or the write fails.**
 A Postgres `numeric` key column would read `1.0` back as `1`: the write

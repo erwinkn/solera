@@ -6,7 +6,7 @@ import shutil
 
 import pytest
 from solera.executors import Pool
-from solera.sdk import Incremental, Output, Project, Retention, RunRequest, Tick, asset
+from solera.sdk import Commit, Incremental, Output, Project, Retention, RunRequest, Tick, asset
 from solera.stores import FileStore, Patch
 
 from tests.contract.harness import Refused, Solera
@@ -208,7 +208,7 @@ async def test_cln_9_a_store_root_belongs_to_one_namespace(solera, tmp_path):
     spec = importlib.util.spec_from_file_location("shared_project", module)
     spec.loader.exec_module(loaded := importlib.util.module_from_spec(spec))
     project = loaded.project
-    staging = Solera(tmp_path / "staging")
+    staging = Solera(tmp_path / "staging", solera.path)
     try:
         await staging.deploy(project)
         await staging.run("files")  # staging claims the root
@@ -231,13 +231,12 @@ async def test_cln_9_a_store_root_belongs_to_one_namespace(solera, tmp_path):
     assert await solera.rows("files") == {"a": 1}
 
 
-async def test_cln_10_sensor_ticks_last_a_day_and_a_tick_that_asked_for_a_run_lasts_with_it(solera):
-    await solera.deploy(sensed_project())
-    [tick] = await solera.sensor_ticks()
-    await solera.sensor_post(tick, Tick(cursor="a", runs=[RunRequest("ingest")]))
-    [run] = await solera.runs()
+async def past_a_day(solera, tick: dict) -> None:
+    """Served for a day and more after `tick`: its row stands under a day old
+    and is gone after."""
+
     [row] = (await solera.get("/sensors/watch/ticks"))["ticks"]
-    assert row["tick"] == tick["tick"] and row["runs"] == [run["id"]]
+    assert row["tick"] == tick["tick"]
     solera.advance(DAY - 60)
     await solera.start()
     await asyncio.sleep(1.2)  # upkeep looks
@@ -248,5 +247,36 @@ async def test_cln_10_sensor_ticks_last_a_day_and_a_tick_that_asked_for_a_run_la
         return (await solera.get("/sensors/watch/ticks"))["ticks"] == []
 
     await until(solera, expired)
-    detail = await solera.get(f"/runs/{run['id']}")  # the run it asked for keeps it
+
+
+async def test_cln_10_sensor_tick_rows_last_a_day(solera):
+    await solera.deploy(sensed_project())
+    [tick] = await solera.sensor_ticks()
+    await solera.sensor_post(tick, Tick(cursor="a"))
+    await past_a_day(solera, tick)
+
+
+async def test_cln_10_a_tick_that_committed_lasts_as_long_as_its_run(solera):
+    await solera.deploy(sensed_project())
+    [tick] = await solera.sensor_ticks()
+    await solera.sensor_post(tick, Tick(cursor="a", commits=[Commit("uploads", upsert={"a": "1"})]))
+    [run] = await solera.runs()
+    await past_a_day(solera, tick)
+    detail = await solera.get(f"/runs/{run['id']}")  # its commit's run keeps it: what changed, and who
+    assert detail["request"]["status"] == "succeeded"
+    assert detail["request"]["by"] == "sensor watch"
+    [listed] = await solera.runs()
+    assert listed["source"] == "uploads" and listed["tags"] == {"sensor": "watch", "tick": tick["tick"]}
+    assert (await solera.keys("uploads")).keys() == {"a"}
+
+
+async def test_cln_10_a_tick_that_asked_for_a_run_lasts_with_it(solera):
+    await solera.deploy(sensed_project())
+    [tick] = await solera.sensor_ticks()
+    await solera.sensor_post(tick, Tick(cursor="a", runs=[RunRequest("ingest")]))
+    [run] = await solera.runs()
+    [row] = (await solera.get("/sensors/watch/ticks"))["ticks"]
+    assert row["runs"] == [run["id"]]
+    await past_a_day(solera, tick)
+    detail = await solera.get(f"/runs/{run['id']}")
     assert detail["request"]["tags"] == {"sensor": "watch", "tick": tick["tick"]}
