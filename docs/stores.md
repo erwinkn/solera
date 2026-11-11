@@ -116,7 +116,7 @@ the store takes — see **Values a store takes** below. Without it, the
 store takes plain Python.
 
 **`load(ref, t, selection)`** materializes `t` (`list[dict]`, a DataFrame,
-…). `selection` is `None` (everything), `Keys` (key → the generation that
+an Arrow table, …: see **Values a store takes**). `selection` is `None` (everything), `Keys` (key → the generation that
 last wrote it: only those keys) or `Commits(lo, hi)`. An immutable store
 needs `Keys` to find a keyed output's objects, which it names by those
 generations. With `Keys`, `t` may be `dict[str, T]`
@@ -301,8 +301,11 @@ producer's return annotation.
   `solera.stores.takes(t, output)` — the forms the framework defines, per
   kind of output, once.
 - **DataFrames and Arrow:** `solera.stores.frames` reads them, importing
-  pandas or pyarrow only for a value of their type. FileStore, S3Store
-  and PostgresStore use it:
+  pandas or pyarrow only for a value of their type, and makes them for a
+  load: an input annotated `pd.DataFrame` or `pa.Table` gets one when its
+  store's `load` returns `frames.materialize(rows, t)`. FileStore, S3Store
+  and PostgresStore use it both ways; a store that does not is not obliged
+  to load either type, and its `can_load` says so:
 
   ```python
   from solera.stores import frames, takes
@@ -313,7 +316,16 @@ producer's return annotation.
 
       def can_store(self, t, output):
           return takes(t, output, frames=True)
+
+      def can_load(self, t, selection):
+          return t in (list, list[dict]) or frames.is_frame_type(t) or frames.is_table_type(t)
+
+      async def load(self, ref, t, selection):
+          return frames.materialize(await self._rows(ref, selection), t)
   ```
+
+  The payload's shape is the store's and `frames`' business only: the
+  engine sees keys, versions and classes, never a table.
 
 - **A type of your own:** build the `Prepared` yourself — native `Rows`
   of its keys, and `take(indices)`, the rows it stores:
@@ -461,6 +473,37 @@ its version fails the load. An unkeyed one returns the value, or
 `Loaded(value, version=…)`: the version is optional there, with one caveat —
 an edit reverted between the commit and the read can leave a consumer one
 revision ahead until the next change.
+
+**As one Arrow table.** A keyed function may instead return one
+`Loaded(table, version=column)`: a pyarrow `Table` holding the source's key
+column (the one `key=` names, strings or integers) and a column of string
+versions, named by `version=`. Only those two columns are read, once, in
+native code; the rest of the table is handed to the consumer as it is. It
+is the same batch as the dict form: the rows of the keys asked, in key
+order, without the version column, as the parameter asks (a list, a
+DataFrame, a `pa.Table`); a key with no row was served absent; rows of keys
+not asked are dropped. A table that cannot say what it served fails the
+load, never a pick: a key in two rows, a null key or version, no key or
+version column, versions that are not strings.
+
+Before, one `Loaded` per row — a million rows is a million Python objects
+built by the loader and read back one by one:
+
+```python
+@source(key="id", version="1")
+async def orders(keys, ctx):
+    rows = await db.fetch("select id, amount, updated_at::text as v from orders where id = any($1)", keys)
+    return {r["id"]: Loaded({"id": r["id"], "amount": r["amount"]}, version=r["v"]) for r in rows}
+```
+
+After, one table, read in place:
+
+```python
+@source(key="id", version="1")
+async def orders(keys, ctx):
+    table = await db.fetch_arrow("select id, amount, updated_at::text as v from orders where id = any($1)", keys)
+    return Loaded(table, version="v")  # consumers get id and amount
+```
 
 **Through a store.** A store backs a source when it defines
 `serve(source, keys, ctx)`, answering as a function does, and

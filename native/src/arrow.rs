@@ -3,7 +3,7 @@
 
 use crate::error::{Error, Result};
 use crate::rows::Arena;
-use crate::sort::Keys;
+use crate::sort::{is_sorted, order as sort_order, Keys};
 use arrow_array::cast::AsArray;
 use arrow_array::types::*;
 use arrow_array::{Array, ArrayRef, RecordBatch};
@@ -180,4 +180,108 @@ pub fn unique_columns(schema: &arrow_schema::Schema) -> Result<()> {
         return err(format!("column {:?} appears twice", w[0]));
     }
     Ok(())
+}
+
+// -- a source's table -------------------------------------------------------------------
+
+/// What a keyed source served as one Arrow table (`Loaded(table, version=…)`),
+/// read from its key and version columns alone: `keys`, those asked (with
+/// none asked, the table's own), each with the version it was served at, or
+/// None when the table has no row for it; `rows`, the table row of each key
+/// served, in the order of `keys`, and `at`, which of `keys` each is.
+pub struct ServedTable {
+    pub keys: Arena,
+    pub versions: Vec<Option<Box<str>>>,
+    pub rows: Vec<u32>,
+    pub at: Vec<usize>,
+}
+
+/// A table that cannot say what it served is an error, never a pick: a key
+/// twice, a key or version missing (no column, or a null), a version that
+/// is not a string.
+pub fn served(
+    batches: &[RecordBatch],
+    key: &str,
+    version: &str,
+    asked: Option<Arena>,
+) -> Result<ServedTable> {
+    if key == version {
+        return err(format!(
+            "the version column cannot be the key column {key:?}"
+        ));
+    }
+    let keys = self::keys(batches, key, false)?;
+    let cols = column(batches, version)?;
+    let is_text = |a: &ArrayRef| {
+        matches!(
+            a.data_type(),
+            DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
+        )
+    };
+    if let Some(a) = cols.iter().find(|a| !is_text(a)) {
+        return err(format!(
+            "version column {version:?} must hold strings, not {}",
+            a.data_type()
+        ));
+    }
+    let chunks: Vec<Bytes> = cols.iter().filter_map(Bytes::of).collect();
+    let at = Chunks::new(cols.iter().map(|a| a.len()));
+    let version_of = |i: usize| -> Box<str> {
+        let (c, j) = at.locate(i);
+        String::from_utf8_lossy(chunks[c].value(j)).into()
+    };
+    let n = keys.len();
+    let order: Vec<u32> = if is_sorted(&*keys) {
+        (0..n as u32).collect()
+    } else {
+        sort_order(&*keys)
+    };
+    if let Some(w) = order
+        .windows(2)
+        .find(|w| keys.key(w[0] as usize) == keys.key(w[1] as usize))
+    {
+        return err(format!(
+            "key {:?} has two rows",
+            String::from_utf8_lossy(keys.key(w[0] as usize))
+        ));
+    }
+    let Some(asked) = asked else {
+        let mut all = Arena::default();
+        for i in 0..n {
+            all.push(keys.key(i));
+        }
+        return Ok(ServedTable {
+            keys: all,
+            versions: (0..n).map(|i| Some(version_of(i))).collect(),
+            rows: (0..n as u32).collect(),
+            at: (0..n).collect(),
+        });
+    };
+    let mut by: Vec<usize> = (0..asked.len()).collect();
+    by.sort_by(|&a, &b| asked.get(a).cmp(asked.get(b)));
+    let mut row_of = vec![None; asked.len()];
+    let mut t = 0;
+    for &a in &by {
+        let k = asked.get(a);
+        while t < n && keys.key(order[t] as usize) < k {
+            t += 1;
+        }
+        if t < n && keys.key(order[t] as usize) == k {
+            row_of[a] = Some(order[t]);
+        }
+    }
+    let (mut versions, mut rows, mut at) = (Vec::with_capacity(asked.len()), vec![], vec![]);
+    for (a, r) in row_of.into_iter().enumerate() {
+        versions.push(r.map(|r| version_of(r as usize)));
+        if let Some(r) = r {
+            rows.push(r);
+            at.push(a);
+        }
+    }
+    Ok(ServedTable {
+        keys: asked,
+        versions,
+        rows,
+        at,
+    })
 }

@@ -149,14 +149,55 @@ def rows_of(value: Any, name: str) -> list[dict]:
     raise WriteError(f"{name}: expected rows (list[dict], a DataFrame or Arrow), got {type(value).__name__}")
 
 
-def materialize(items: list, t: Any):
-    """Loaded rows as `t`: a DataFrame when asked for one, else the list."""
+def is_table(value: Any) -> bool:
+    """A pyarrow Table, told by its type's name and module."""
 
+    t = type(value)
+    return t.__name__ == "Table" and t.__module__.split(".")[0] == "pyarrow"
+
+
+def is_table_type(t: Any) -> bool:
+    return isinstance(t, type) and t.__name__ == "Table" and t.__module__.split(".")[0] == "pyarrow"
+
+
+def materialize(items: Any, t: Any, columns: list[str] | None = None):
+    """Loaded rows as `t`: a DataFrame or an Arrow table when asked for one,
+    else a list of rows. `items` is a list of rows, or an Arrow table read
+    in place (a keyed source's, `served`). `columns` name an empty list's."""
+
+    table = is_table(items)
+    if is_table_type(t):
+        if table:
+            return items
+        import pyarrow as pa
+
+        if not items and columns:
+            return pa.table({c: pa.nulls(0) for c in columns})
+        return pa.Table.from_pylist(items)
     if is_frame_type(t):
+        if table:
+            return items.to_pandas()
         import pandas as pd
 
-        return pd.DataFrame(items)
-    return items
+        return pd.DataFrame(items, columns=columns if not items and columns else None)
+    return _arrow_taker(items)(None) if table else items
+
+
+def served(table: Any, take: bytes | None, version: str, t: Any, names: list | None = None):
+    """A keyed source's rows served as one Arrow table (`Loaded(table,
+    version=column)`) as `t`, without the version column: the rows `take`
+    names (row numbers, u32; None: every row, as it is), in its order. With
+    `names`, the key each row is, `t` is each key's own: `{key: T}`, each a
+    group of one row, as a dict answer's are."""
+
+    import pyarrow as pa
+
+    table = table.drop_columns([version])
+    if take is not None:
+        table = table.take(pa.Array.from_buffers(pa.uint32(), len(take) // 4, [None, pa.py_buffer(take)]))
+    if names is None:
+        return materialize(table, t)
+    return {k: materialize([row], t) for k, row in zip(names, materialize(table, list), strict=True)}
 
 
 def _frame(frame: Any, name: str) -> tuple[list[str], list[list]]:
