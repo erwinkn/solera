@@ -263,8 +263,8 @@ def test_a_table_answer_makes_the_dict_answers_dataframe():
     from solera.stores import frames
 
     rows = [
-        {"id": "b", "m": {"x": 1}, "at": dt.datetime(2026, 1, 2, 3, 4, 5, 6), "n": 2},
-        {"id": "a", "m": {}, "at": dt.datetime(2026, 1, 1), "n": None},
+        {"id": "b", "m": {"x": 1}, "at": dt.datetime(2026, 1, 2, 3, 4, 5, 6), "n": 2, "i": 1, "o": None},
+        {"id": "a", "m": {}, "at": dt.datetime(2026, 1, 1), "n": None, "i": 2, "o": None},
     ]
     schema = pa.schema(
         [
@@ -272,6 +272,8 @@ def test_a_table_answer_makes_the_dict_answers_dataframe():
             ("m", pa.map_(pa.string(), pa.int64())),
             ("at", pa.timestamp("us")),
             ("n", pa.int64()),
+            ("i", pa.int32()),
+            ("o", pa.int64()),
         ]
     )
     plain = pa.Table.from_pylist(rows, schema=schema)
@@ -282,12 +284,23 @@ def test_a_table_answer_makes_the_dict_answers_dataframe():
         take, _ = Served().read_table(table, "id", "v", ["a", "b"])
         wanted, _ = Served().read(answer, ["a", "b"], Loaded)
         pd.testing.assert_frame_equal(frames.served(table, take, "v", pd.DataFrame), pd.DataFrame(wanted))
+    far = [
+        {"id": "a", "at": dt.datetime(1000, 1, 1), "d": dt.timedelta(seconds=10**10)},
+        {"id": "b", "at": dt.datetime(2026, 1, 1), "d": dt.timedelta(seconds=1)},
+    ]
+    table = pa.Table.from_pylist(
+        far, pa.schema([("id", pa.string()), ("at", pa.timestamp("us")), ("d", pa.duration("s"))])
+    )
+    table = table.append_column("v", pa.array(["1", "2"]))
+    take, _ = Served().read_table(table, "id", "v", ["a", "b"])
+    wanted, _ = Served().read({r["id"]: Loaded(r, version="1") for r in far}, ["a", "b"], Loaded)
+    pd.testing.assert_frame_equal(frames.served(table, take, "v", pd.DataFrame), pd.DataFrame(wanted))
     meta = pa.Table.from_pandas(pd.DataFrame({"id": ["a"], "v": ["1"], "n": [1]}).set_index("id"))
     take, _ = Served().read_table(meta, "id", "v", ["a"])
     assert frames.served(meta, take, "v", pd.DataFrame).to_dict("records") == [{"n": 1, "id": "a"}]
 
 
-def test_view_columns_are_taken_as_their_large_forms():
+def test_columns_arrow_cannot_take_are_served_in_their_own_types():
     import pyarrow as pa
     from solera.stores import frames
 
@@ -297,12 +310,31 @@ def test_view_columns_are_taken_as_their_large_forms():
             "p": pa.array([["x"], ["y"]], pa.list_view(pa.string_view())),
             "s": pa.array([{"z": b"1"}, {"z": b"2"}], pa.struct([("z", pa.binary_view())])),
             "etag": pa.array(["1", "2"], pa.string_view()),
+            "e": pa.ExtensionArray.from_storage(_view_extension(), pa.array(["x", "y"], pa.string_view())),
         }
     )
     served = Served()
     take, _ = served.read_table(table, "id", "etag", ["a", "b", "c"])
     assert served.items() == [("a", "2"), ("b", "1"), ("c", None)]
     assert frames.served(table, take, "etag", list) == [
-        {"id": "a", "p": ["y"], "s": {"z": b"2"}},
-        {"id": "b", "p": ["x"], "s": {"z": b"1"}},
+        {"id": "a", "p": ["y"], "s": {"z": b"2"}, "e": "y"},
+        {"id": "b", "p": ["x"], "s": {"z": b"1"}, "e": "x"},
     ]
+    assert frames.served(table, take, "etag", pa.Table).schema == table.drop_columns(["etag"]).schema
+
+
+def _view_extension():
+    import pyarrow as pa
+
+    class ViewExtension(pa.ExtensionType):
+        def __init__(self):
+            super().__init__(pa.string_view(), "solera.test.view")
+
+        def __arrow_ext_serialize__(self):
+            return b""
+
+        @classmethod
+        def __arrow_ext_deserialize__(cls, storage_type, serialized):
+            return cls()
+
+    return ViewExtension()

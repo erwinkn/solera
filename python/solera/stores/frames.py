@@ -175,10 +175,13 @@ def materialize(items: Any, t: Any, columns: list[str] | None = None):
             return pa.table({c: pa.nulls(0) for c in columns})
         return pa.Table.from_pylist(items)
     if is_frame_type(t):
-        if table:  # as from its rows: nested values as they read, the pandas index as a column
-            maps = {"maps_as_pydicts": "strict"} if any(_has_map(c) for c in items.schema.types) else {}
-            return items.to_pandas(ignore_metadata=True, coerce_temporal_nanoseconds=True, **maps)
         import pandas as pd
+
+        if table:  # the DataFrame its rows make, built by column: the dict form's, dtypes included
+            maps = {"maps_as_pydicts": "strict"} if any(_has_map(c) for c in items.schema.types) else {}
+            return pd.DataFrame(
+                {n: c.to_pylist(**maps) for n, c in zip(items.column_names, items.columns, strict=True)}
+            )
 
         return pd.DataFrame(items, columns=columns if not items and columns else None)
     return _arrow_taker(items)(None) if table else items
@@ -195,8 +198,7 @@ def served(table: Any, take: bytes | None, version: str, t: Any, names: list | N
 
     table = table.drop_columns([version])
     if take is not None:
-        table = pa.table([_takeable(c) for c in table.columns], names=table.column_names)
-        table = table.take(pa.Array.from_buffers(pa.uint32(), len(take) // 4, [None, pa.py_buffer(take)]))
+        table = _take(table, pa.Array.from_buffers(pa.uint32(), len(take) // 4, [None, pa.py_buffer(take)]))
     if names is None:
         return materialize(table, t)
     return {k: materialize([row], t) for k, row in zip(names, materialize(table, list), strict=True)}
@@ -259,15 +261,14 @@ def _arrow_taker(data: Any) -> Callable:
 
         if table is None:
             table = data if isinstance(data, pa.Table) else pa.table(data)
-            table = pa.table([_takeable(c) for c in table.columns], names=table.column_names)
         if rows is None:
             taken = table
         elif isinstance(rows, range) and rows.step == 1:
             taken = table.slice(rows.start, len(rows))
         elif isinstance(rows, memoryview):
-            taken = table.take(pa.Array.from_buffers(pa.uint32(), len(rows), [None, pa.py_buffer(rows)]))
+            taken = _take(table, pa.Array.from_buffers(pa.uint32(), len(rows), [None, pa.py_buffer(rows)]))
         else:
-            taken = table.take(list(rows))
+            taken = _take(table, pa.array(list(rows), pa.uint32()))
         if any(_has_map(t) for t in table.schema.types):  # a third the speed: only where a map is
             return taken.to_pylist(maps_as_pydicts="strict")
         return taken.to_pylist()
@@ -280,62 +281,31 @@ def _has_map(t: Any) -> bool:
 
     import pyarrow as pa
 
-    return _holds(t, pa.types.is_map)
-
-
-def _holds(t: Any, kind: Callable) -> bool:
-    """Whether an Arrow type is of `kind` or holds one, at any depth."""
-
-    import pyarrow as pa
-
-    if kind(t):
+    if pa.types.is_map(t):
         return True
     if isinstance(t, pa.BaseExtensionType):
-        return _holds(t.storage_type, kind)
+        return _has_map(t.storage_type)
     if pa.types.is_dictionary(t):
-        return _holds(t.value_type, kind)
-    return any(_holds(t.field(i).type, kind) for i in range(t.num_fields))
+        return _has_map(t.value_type)
+    return any(_has_map(t.field(i).type) for i in range(t.num_fields))
 
 
-def _takeable(column: Any) -> Any:
-    """A column Arrow's `take` reads: views (string, binary, list), at any
-    depth, as their large forms; others as they are."""
-
-    import pyarrow as pa
-
-    t = _viewless(column.type)
-    if t == column.type:
-        return column
-    if _holds(column.type, lambda x: pa.types.is_list_view(x) or pa.types.is_large_list_view(x)):
-        return pa.chunked_array([pa.array(column.to_pylist(), t)], t)  # pyarrow 25 casts list views unsoundly
-    return column.cast(t)
-
-
-def _viewless(t: Any) -> Any:
-    """An Arrow type with every string, binary and list view, at any depth,
-    as its large form, which Arrow's `take` reads."""
+def _take(table: Any, rows: Any) -> Any:
+    """An Arrow table's rows by row number (`rows`, u32), in that order, of
+    the table's own types. Arrow's take has no kernel for some (string and
+    binary views, alone or inside a struct or an extension): such a column is
+    built again from its values."""
 
     import pyarrow as pa
 
-    if pa.types.is_string_view(t):
-        return pa.large_string()
-    if pa.types.is_binary_view(t):
-        return pa.large_binary()
-    if (
-        pa.types.is_list_view(t)
-        or pa.types.is_large_list_view(t)
-        or pa.types.is_large_list(t)
-        or pa.types.is_list(t)
-    ):
-        item = t.value_field.with_type(_viewless(t.value_type))
-        return pa.list_(item) if pa.types.is_list(t) else pa.large_list(item)
-    if pa.types.is_fixed_size_list(t):
-        return pa.list_(t.value_field.with_type(_viewless(t.value_type)), t.list_size)
-    if pa.types.is_map(t):
-        return pa.map_(_viewless(t.key_type), t.item_field.with_type(_viewless(t.item_type)), t.keys_sorted)
-    if pa.types.is_struct(t):
-        return pa.struct([t.field(i).with_type(_viewless(t.field(i).type)) for i in range(t.num_fields)])
-    return t
+    columns = []
+    for column in table.columns:
+        try:
+            columns.append(column.take(rows))
+        except pa.ArrowNotImplementedError:
+            values = column.to_pylist()
+            columns.append(pa.array([values[i] for i in rows.to_pylist()], column.type))
+    return pa.table(columns, schema=table.schema)
 
 
 # -- kinds --------------------------------------------------------------------------------

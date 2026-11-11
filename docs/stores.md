@@ -482,7 +482,9 @@ native code; the rest of the table is handed to the consumer as it is. It
 is the same batch as the dict form: the rows of the keys asked, in key
 order, without the version column, as the parameter asks (a list, a
 DataFrame, a `pa.Table`); a key with no row was served absent; rows of keys
-not asked are dropped. A table that cannot say what it served fails the
+not asked are dropped. A `pa.Table` parameter gets the table's own column
+types; a DataFrame is the one the dict form's rows make, dtypes included
+(built column by column from the table's values, pandas metadata ignored). A table that cannot say what it served fails the
 load, never a pick: a key in two rows, a null key or version, no key or
 version column, versions that are not strings.
 
