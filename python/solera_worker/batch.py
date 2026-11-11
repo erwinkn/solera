@@ -21,17 +21,14 @@ the attempt's control file (N13).
 from __future__ import annotations
 
 import asyncio
-import heapq
-import itertools
 import tempfile
 from base64 import b64decode, b64encode
 from collections.abc import Mapping
 
 import obstore
 from solera import lifecycle
-from solera._native import PlannedKeys, encode_changes
+from solera._native import PlannedKeys
 from solera.change_index import shared
-from solera.keys.layers import key_str
 from solera.stores import KeyedWrite, WriteError, prepare_for
 
 CHANGES_INLINE = 64 << 10  # changed keys' bytes a result carries; past it, a file (N13)
@@ -158,16 +155,6 @@ def _encode(o, f) -> int:
     Returns its size."""
 
     word = "" if o.output.is_dynamic_partitions else None
-    upserts = ((key_str(k), False) for chunk, _ in o.prepared.rows.chunks(CHANGES_CHUNK) for k in chunk)
-    removes = () if o.replace else ((k, True) for k in sorted(str(k) for k in o.prepared.removes))
-    header = encode_changes([])
-    f.write(header)
-    for chunk in itertools.batched(heapq.merge(upserts, removes), CHANGES_CHUNK):
-        written = [k for k, removed in chunk if not removed]
-        f.write(
-            encode_changes(
-                written if word is None else dict.fromkeys(written, word),
-                [k for k, removed in chunk if removed],
-            )[len(header) :]
-        )
+    for part in o.prepared.rows.changes(() if o.replace else o.prepared.removes, word, CHANGES_CHUNK):
+        f.write(part)
     return f.tell()
