@@ -14,9 +14,9 @@ one line per producer or store call in `stats/{pid}.jsonl`, with its wall and
 CPU seconds. `$SCALE_FORM` picks the data's form: `dict`, a `Loaded` and a
 dict per row and packs pickled by key, or `arrow`, one Arrow table per load
 and batch and packs written from the producer's table. A producer's line
-counts the rows it was handed (`keys`) and the keys its batch planned (`planned`: added, updated, removed and unchanged); a
-keyed write's line counts the keys it writes (`keys`) and removes
-(`removed`)."""
+counts the rows it was handed (`keys`) and the keys its batch planned
+(`planned`: added, updated, removed and unchanged); a keyed write's line
+counts the keys it writes (`keys`) and removes (`removed`)."""
 
 from __future__ import annotations
 
