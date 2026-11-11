@@ -28,6 +28,7 @@ use crate::commit;
 use crate::error::{format, Result};
 use crate::outcomes;
 use crate::progress;
+use crate::retain;
 use crate::stale;
 use std::borrow::Cow;
 
@@ -83,6 +84,14 @@ pub enum Part {
     Watch(stale::SetWatch),
     /// B7: what a refresh or a notice found for an edge.
     Witness(stale::Witness),
+    /// B9: a merge replaces adjacent layers of an output.
+    Merged(retain::Merged),
+    /// B9: an output's cleanup cursor starts.
+    Track(retain::Track),
+    /// B9: an output's cleanup cursor moves.
+    Cleaned(retain::Cleaned),
+    /// B9: an output leaves the state with its data.
+    Retire(retain::Retire),
 }
 
 impl Part {
@@ -132,6 +141,10 @@ impl Part {
             Part::Rebuild(p) => vec![on("outcomes", &p.edge)],
             Part::Watch(p) => vec![on("edge", &p.edge)],
             Part::Witness(p) => vec![on("witness", &p.edge)],
+            Part::Merged(p) => vec![on("output", &p.output)],
+            Part::Track(p) => vec![on("cursor", &p.output)],
+            Part::Cleaned(p) => vec![on("cursor", &p.output)],
+            Part::Retire(p) => vec![on("output", &p.output), on("cursor", &p.output)],
         }
     }
 
@@ -150,6 +163,10 @@ impl Part {
             Part::Rebuild(_) => outcomes::TAG_REBUILD,
             Part::Watch(_) => stale::TAG_WATCH,
             Part::Witness(_) => stale::TAG_WITNESS,
+            Part::Merged(_) => retain::TAG_MERGED,
+            Part::Track(_) => retain::TAG_TRACK,
+            Part::Cleaned(_) => retain::TAG_CLEANED,
+            Part::Retire(_) => retain::TAG_RETIRE,
         }
     }
 
@@ -168,6 +185,10 @@ impl Part {
             Part::Rebuild(p) => p.encode(e),
             Part::Watch(p) => p.encode(e),
             Part::Witness(p) => p.encode(e),
+            Part::Merged(p) => p.encode(e),
+            Part::Track(p) => p.encode(e),
+            Part::Cleaned(p) => p.encode(e),
+            Part::Retire(p) => p.encode(e),
         }
     }
 
@@ -186,6 +207,10 @@ impl Part {
             outcomes::TAG_REBUILD => Part::Rebuild(outcomes::Rebuild::decode(d)?),
             stale::TAG_WATCH => Part::Watch(stale::SetWatch::decode(d)?),
             stale::TAG_WITNESS => Part::Witness(stale::Witness::decode(d)?),
+            retain::TAG_MERGED => Part::Merged(retain::Merged::decode(d)?),
+            retain::TAG_TRACK => Part::Track(retain::Track::decode(d)?),
+            retain::TAG_CLEANED => Part::Cleaned(retain::Cleaned::decode(d)?),
+            retain::TAG_RETIRE => Part::Retire(retain::Retire::decode(d)?),
             t => return format(format!("unknown part tag {t:#04x}")),
         })
     }
