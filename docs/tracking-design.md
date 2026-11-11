@@ -1153,9 +1153,12 @@ by reference; none of it knows how a store uses them.
 
 **What the store must do.** These are the store's obligations. How
 PostgresStore meets them (schema, lock order, constraints on the build,
-failures) is B8's to settle in code against PostgreSQL; the recipe and
-every probe it must pass are in `handoffs/SOLE-17/table-swap.md` in the
-Captain's drive, unverified until B8's tests run them.
+failures) is settled in code against PostgreSQL (B8):
+`python/solera_postgres`, described in `stores.md` ("PostgresStore: the
+version check, and full runs built beside"), with every probe of
+`handoffs/SOLE-17/table-swap.md` (the Captain's drive) a test in
+`tests/sdk/test_postgres_builds.py`, and a random history checked against
+this model's table.
 
 1. **A full run writes beside the published rows.** The first write of a
    full run (`context.reset`) opens a build for the run, named by the

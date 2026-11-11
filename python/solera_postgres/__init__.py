@@ -557,9 +557,9 @@ class PostgresStore:
         run's first write (`reset`) opens the build of its run (its own
         version), unless that run was published already: the same write
         delivered again then rewrites the same rows in place. Any other write
-        goes to the first build the log names (`build_run`, then
-        `owed_run`) that the partition registers, else in place. Every write
-        keeps the builds the log names and its own, and unregisters the partition's others: no run in the log
+        goes to the build `build_run` names while the partition registers
+        it, else in place. Every write keeps the build `build_run` names and
+        its own, and unregisters the partition's others: no run in the log
         names them, and the check has locked their writers out."""
 
         at = _Target(table, context.partition, builds=list(checked["builds"]) if checked else [])
@@ -568,12 +568,11 @@ class PostgresStore:
         if checked is None:
             raise StoreError(f"{context.output.name}: a write that builds needs its attempt's version")
         published, builds = checked["published"], at.builds
-        named = [run for run in (context.build_run, context.owed_run) if run is not None]
         if context.reset and (published is None or context.generation > published):
             at.run, at.opens = context.generation, context.generation not in builds
-        elif not context.reset:
-            at.run = next((run for run in named if run in builds), None)
-        keep = {*named, at.run}
+        elif not context.reset and context.build_run in builds:
+            at.run = context.build_run
+        keep = {context.build_run, at.run}
         at.builds = [b for b in builds if b in keep] + ([at.run] if at.opens else [])
         at.retired = any(b not in keep for b in builds)
         return at

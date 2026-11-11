@@ -37,7 +37,7 @@ def output(name=None, **config) -> Output:
     return Output(name or f"t_{uuid.uuid4().hex[:12]}", store="postgres", **config)
 
 
-def at(out, generation, *, reset=False, run=None, owed=None, partition="", worker="w") -> WriteContext:
+def at(out, generation, *, reset=False, run=None, partition="", worker="w") -> WriteContext:
     """The new core's write context: the attempt's version, and the full run
     whose build the write targets (`build_run`)."""
 
@@ -49,7 +49,6 @@ def at(out, generation, *, reset=False, run=None, owed=None, partition="", worke
         worker_id=worker,
         reset=reset,
         build_run=run,
-        owed_run=owed,
         builds=True,
     )
 
@@ -336,27 +335,6 @@ async def test_every_write_keeps_the_builds_the_log_names(store):
     assert await store.full_run_ended(out, "", 5, 9) is False  # overtaken, never published
     assert await store.full_run_ended(out, "", 8, 9) is True
     assert outside(store, out) == {"a": "8", "b": "8", "c": "9"}
-
-
-async def test_a_run_owed_its_switch_keeps_its_build_while_the_next_run_builds(store):
-    """Run 5 ended in the log and its switch is owed (switch_owed) when run 8
-    starts: every write of run 8 names 5 as owed and keeps its build, Solera
-    reads 8's, and the owed switch still publishes 5, then 8's publishes 8."""
-
-    out = output(incremental=True)
-    first = await store.store(rows(a="1"), None, at(out, 1))
-    five = await store.store(rows(a="5"), first.ref, at(out, 5, reset=True))
-    eight = await store.store(rows(a="8"), five.ref, at(out, 8, reset=True, owed=5))
-    nine = await store.store(Patch(rows(b="9")), eight.ref, at(out, 9, run=8, owed=5))
-    assert builds(store, out) == [5, 8] and registry(store, out)[2] == [5, 8]
-    assert await solera(store, nine.ref) == {"a": "8", "b": "9"}
-    assert await store.full_run_ended(out, "", 5, 9) is True
-    assert outside(store, out) == {"a": "5"} and builds(store, out) == [8]
-    assert await solera(store, nine.ref) == {"a": "8", "b": "9"}
-    ten = await store.store(Patch(rows(c="10")), nine.ref, at(out, 10, run=8))
-    assert await solera(store, ten.ref) == {"a": "8", "b": "9", "c": "10"}
-    assert await store.full_run_ended(out, "", 8, 10) is True
-    assert outside(store, out) == {"a": "8", "b": "9", "c": "10"} and registry(store, out) == (10, 8, [])
 
 
 async def test_a_dead_first_writes_build_is_dropped_by_the_next_write(store):
@@ -961,7 +939,7 @@ def _random_history(store, out, seed: int, steps: int) -> None:
         if not refused:
             model.fence = max(model.fence, v)
             model.write(v, writes, clear, None, ctx)
-        context = at(out, v, reset=clear, run=ctx[0], owed=ctx[1], partition=p)
+        context = at(out, v, reset=clear, run=ctx[0] if ctx[0] is not None else ctx[1], partition=p)
         upserts = [{"id": k, "v": f"{v}{k}"} for k, value in sorted(writes.items()) if value is not ABSENT]
         removes = sorted(k for k, value in writes.items() if value is ABSENT)
         data = upserts if clear else Patch(upserts, remove=removes)
@@ -1001,8 +979,7 @@ def _random_history(store, out, seed: int, steps: int) -> None:
             writes = {k: ABSENT if not clear and rng.random() < 0.3 else version for k in keys}
             named = [None, *clears[p][-3:]]
             run = rng.choice(named)
-            owed = rng.choice([g for g in named if g != run or g is None])
-            attempt = (version, writes, clear, (run, owed))
+            attempt = (version, writes, clear, (run, None) if rng.random() < 0.5 else (None, run))
             if clear:
                 clears[p].append(version)
             if rng.random() < 0.2:

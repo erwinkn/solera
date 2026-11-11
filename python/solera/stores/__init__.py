@@ -138,14 +138,13 @@ class WriteContext:
     generation: int | None = None
     worker_id: str | None = None
     # D211, the new core's writes only (`builds`): a full run builds beside the
-    # published rows. The log names up to two runs, by the version of the
-    # attempt that wrote each one's clear: `build_run`, its full run in
-    # progress, and `owed_run`, the one that ended whose end the store was
-    # not yet told (`full_run_ended`). A write goes to the first of them whose
-    # build is open, else in place. Today's path leaves `builds` off and
-    # writes in place; the flag goes at the switch to the new core (B11).
+    # published rows. `build_run` is the run the log names, by the version of
+    # the attempt that wrote its clear: its full run in progress, else the run
+    # whose end the store was not yet told (`full_run_ended`); a newer run's
+    # journaled clear drops the older debt, so never both. Today's path leaves
+    # `builds` off and writes in place; the flag goes at the switch to the new
+    # core (B11).
     build_run: int | None = None
-    owed_run: int | None = None
     builds: bool = False
 
 
