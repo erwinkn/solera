@@ -391,16 +391,178 @@ async def test_an_empty_full_run_publishes_an_empty_partition(store):
     assert outside(store, out) == {}
 
 
-async def test_a_first_run_builds_beside_an_empty_table(store):
-    """An ordinary output's first run is a full run: its rows appear whole."""
+async def test_a_full_run_into_a_partition_holding_no_rows_writes_in_place(store):
+    """Erwin, 2026-11-11: an ordinary output's first run is a full run, and a
+    partition holding no rows has no old rows to keep from outsiders. The
+    run's first write goes in place and records the run as published:
+    outsiders see it fill, its later writes go in place too, and its switch
+    does nothing but say published."""
 
     out = output(incremental=True)
     one = await store.store(rows(a="1"), None, at(out, 5, reset=True))
-    assert outside(store, out) == {}
-    await store.store(Patch(rows(b="1")), one.ref, at(out, 6, run=5))
-    assert outside(store, out) == {}
-    assert await store.full_run_ended(out, "", 5, 6)
-    assert outside(store, out) == {"a": "1", "b": "1"}
+    assert "build" not in one.ref.handle and outside(store, out) == {"a": "1"}
+    assert registry(store, out) == (5, 5, []) and builds(store, out) == []
+    two = await store.store(Patch(rows(b="1")), one.ref, at(out, 6, run=5))
+    assert "build" not in two.ref.handle and outside(store, out) == {"a": "1", "b": "1"}
+    assert await store.full_run_ended(out, "", 5, 6) is True
+    assert outside(store, out) == {"a": "1", "b": "1"} and registry(store, out) == (6, 5, [])
+    assert await solera(store, two.ref) == {"a": "1", "b": "1"}
+
+
+async def test_a_partition_holding_a_dead_first_runs_rows_builds_beside(store):
+    """A dead first run's rows stay visible until the next run, which finds
+    the partition holding rows and builds beside: outsiders see the dead
+    rows, then the new run whole. Another partition's rows do not count."""
+
+    out = output(incremental=True, partition_column="site")
+    table, _, _ = store._table(out)
+    sql(f"CREATE TABLE {table} (id text, v text, site text, _version bigint)")
+    await store.store(rows(z="2"), None, at(out, 1, partition="p2", builds=False))
+    dead = await store.store(rows(a="dead"), None, at(out, 5, reset=True, partition="p1"))
+    assert "build" not in dead.ref.handle and outside(store, out, "p1") == {"a": "dead"}
+    again = await store.store(rows(b="7"), None, at(out, 7, reset=True, partition="p1"))
+    assert again.ref.handle["build"] == 7 and builds(store, out, "p1") == [7]
+    assert outside(store, out, "p1") == {"a": "dead"} and registry(store, out, "p1") == (7, 5, [7])
+    assert await store.full_run_ended(out, "p1", 7, 7) is True
+    assert outside(store, out, "p1") == {"b": "7"} and outside(store, out, "p2") == {"z": "2"}
+
+
+async def test_a_full_run_builds_beside_while_another_runs_build_is_registered(store):
+    """A run whose switch is still owed keeps its build registered: a newer
+    run into the partition, empty as the build left it, builds beside too,
+    so the older switch cannot replace rows written in place."""
+
+    out = output(incremental=True)
+    table, _, _ = store._table(out)
+    sql(f"CREATE TABLE {table} (id text, v text, _version bigint)")
+    await store.store(rows(a="old"), None, at(out, 1, builds=False))
+    await store.store(rows(b="3"), None, at(out, 3, reset=True))
+    sql(f"DELETE FROM {table}")
+    newer = await store.store(rows(c="5"), None, at(out, 5, reset=True, run=3))
+    assert newer.ref.handle["build"] == 5 and registry(store, out) == (5, None, [3, 5])
+
+
+def after_begin(store, monkeypatch, *statements) -> None:
+    """Run the statements once, from another connection, after a write's
+    first round trip read the catalog and before the rest of the write."""
+
+    begin, pending = store._begin, list(statements)
+
+    def late(*args, **kwargs):
+        found = begin(*args, **kwargs)
+        while pending:
+            sql(pending.pop(0))
+        return found
+
+    monkeypatch.setattr(store, "_begin", late)
+
+
+@pytest.mark.parametrize("held", [False, True])
+async def test_row_security_enabled_after_a_full_run_began_refuses_its_first_write(store, monkeypatch, held):
+    """Sol R8-1, Astra A9: row security enabled after the write's first round
+    trip read the catalog could hide the partition's rows from the read that
+    decides where the run writes. That read follows the table's lock, in one
+    statement with the catalog: the write is refused, and outsiders keep what
+    they read."""
+
+    out = output(incremental=True)
+    table, _, _ = store._table(out)
+    sql(f"CREATE TABLE {table} (id text, v text, _version bigint)")
+    if held:
+        await store.store(rows(a="old"), None, at(out, 1, builds=False))
+    after_begin(store, monkeypatch, f"ALTER TABLE {table} ENABLE ROW LEVEL SECURITY")
+    with pytest.raises(PublicationRefused, match="publishing a full run built beside it"):
+        await store.store(rows(b="new"), None, at(out, 5, reset=True))
+    assert outside(store, out) == ({"a": "old"} if held else {})
+
+
+async def test_a_table_made_after_a_full_run_began_holding_its_rows_builds_beside(store, monkeypatch):
+    """A table absent when the write began can be made before the write makes
+    it: another partition's first write, or by hand. The write decides under
+    the table's lock, after the table is there: a partition that now holds
+    rows builds beside."""
+
+    out = output(incremental=True)
+    table, _, _ = store._table(out)
+    after_begin(
+        store,
+        monkeypatch,
+        f"CREATE TABLE {table} (id text, v text, _version bigint)",
+        f"INSERT INTO {table} VALUES ('a', 'old', 1)",
+    )
+    written = await store.store(rows(b="new"), None, at(out, 5, reset=True))
+    assert written.ref.handle["build"] == 5 and builds(store, out) == [5]
+    assert outside(store, out) == {"a": "old"} and registry(store, out)[2] == [5]
+    assert await store.full_run_ended(out, "", 5, 5) is True
+    assert outside(store, out) == {"b": "new"}
+
+
+@pytest.mark.parametrize("partitioned", [False, True], ids=["whole", "partitioned"])
+@pytest.mark.parametrize("kind", ["keyed_empty", "keyed_remove", "commit_empty"])
+async def test_an_empty_first_write_racing_a_table_made_with_rows_leaves_its_run_pending(
+    store, monkeypatch, kind, partitioned
+):
+    """Sol R9-1 (repros/empty_creation.py): a full run's first write has no
+    rows and no shape, and the table, holding the partition's old rows, is
+    made after the write's first round trip found none. The write makes
+    nothing, so it decides nothing: the run stays pending, and its switch
+    clears the old rows."""
+
+    out = output(
+        incremental=True,
+        key=None if kind == "commit_empty" else "id",
+        **({"partition_column": "site"} if partitioned else {}),
+    )
+    table, _, _ = store._table(out)
+    part = "p1" if partitioned else ""
+    site = ", site text" if partitioned else ""
+    commits = ", _commit integer, _seq integer, PRIMARY KEY (" + ("site, " if partitioned else "")
+    commits = commits + "_commit, _seq)" if kind == "commit_empty" else ""
+    values = {"id": "old", "v": "old", "_version": 1, **({"site": part} if partitioned else {})}
+    values |= {"_commit": 0, "_seq": 0} if kind == "commit_empty" else {}
+    after_begin(
+        store,
+        monkeypatch,
+        f"CREATE TABLE {table} (id text, v text, _version bigint{site}{commits})",
+        f"INSERT INTO {table} ({', '.join(values)}) VALUES ("
+        + ", ".join(f"'{v}'" if isinstance(v, str) else str(v) for v in values.values())
+        + ")",
+    )
+    write = (
+        [] if kind == "keyed_empty" else Patch([], remove=["old"]) if kind == "keyed_remove" else Patch([])
+    )
+    first = await store.store(write, None, at(out, 5, reset=True, partition=part))
+    assert first.ref is None and registry(store, out, part) == (5, None, [])
+    assert sql("SELECT pending FROM solera_versions WHERE rel = %s AND part = %s", (table, part)) == [([5],)]
+    assert await store.full_run_ended(out, part, 5, 5) is True
+    assert sql(f"SELECT id FROM {table}") == []
+
+
+@pytest.mark.parametrize("kind", ["keyed", "commit"])
+async def test_an_empty_first_write_racing_a_table_made_with_rows_and_delivered_again(
+    store, monkeypatch, kind
+):
+    """Astra A11 (repros/empty_race.py): as above, and the same first write
+    delivered again once the table holds the old rows decides then, under
+    the table's lock: the partition holds rows, so the run builds beside, and
+    its switch publishes the run alone."""
+
+    out = output(incremental=True, key="id" if kind == "keyed" else None)
+    table, _, _ = store._table(out)
+    commits = "" if kind == "keyed" else ", _commit integer, _seq integer, PRIMARY KEY (_commit, _seq)"
+    after_begin(
+        store,
+        monkeypatch,
+        f"CREATE TABLE {table} (id text, _version bigint{commits})",
+        f"INSERT INTO {table} VALUES ('old', 1{'' if kind == 'keyed' else ', 0, 0'})",
+    )
+    write = [] if kind == "keyed" else Patch([])
+    first = await store.store(write, None, at(out, 5, reset=True))
+    assert first.ref is None and sql(f"SELECT id FROM {table}") == [("old",)]
+    again = await store.store(write, None, at(out, 5, reset=True))
+    assert again.ref.handle["build"] == 5 and sql(f"SELECT id FROM {table}") == [("old",)]
+    assert await store.full_run_ended(out, "", 5, 5) is True
+    assert sql(f"SELECT id FROM {table}") == [] and registry(store, out) == (5, 5, [])
 
 
 async def test_unkeyed_sql_and_commit_writes_build_beside(store):
@@ -957,20 +1119,19 @@ async def test_a_key_listing_racing_the_switchs_drop_reads_the_published_keys(st
 # -- empty first runs, migrations, lost builds (Fable, B8 round 1) -------------------------
 
 
-async def test_an_empty_first_write_with_no_shape_makes_no_table_and_the_runs_first_rows_open_its_build(
-    store,
-):
+async def test_an_empty_first_write_with_no_shape_makes_no_table_and_the_runs_first_rows_decide(store):
     """M1: a full run's first batch is empty, no table exists and no columns
-    are declared: there is no shape to make one from, so nothing is made.
-    The run's first batch with rows opens its build; outside, no table
-    until the switch, then all of the run."""
+    are declared: there is no shape to make one from, so nothing is made and
+    nothing decided: the run is pending. Its first batch with rows makes the
+    table, finds the partition holding none, and writes in place."""
 
     out = output(incremental=True)
     empty = await store.store([], None, at(out, 5, reset=True))
     assert empty.ref is None and sql("SELECT to_regclass(%s)", (store._table(out)[0],)) == [(None,)]
+    assert registry(store, out) == (5, None, [])
     batch = await store.store(Patch(rows(a="1")), None, at(out, 6, run=5))
-    assert batch.ref.handle["build"] == 5 and builds(store, out) == [5]
-    assert outside(store, out) == {} and await solera(store, batch.ref) == {"a": "1"}
+    assert "build" not in batch.ref.handle and builds(store, out) == [] and registry(store, out) == (6, 5, [])
+    assert outside(store, out) == {"a": "1"} and await solera(store, batch.ref) == {"a": "1"}
     assert await store.full_run_ended(out, "", 5, 6)
     assert outside(store, out) == {"a": "1"}
 
@@ -1005,12 +1166,12 @@ async def test_an_empty_first_write_with_declared_columns_makes_the_table_as_tod
     assert written.ref is None
 
 
-async def test_a_pending_run_opens_its_build_though_another_partition_made_the_table(store):
+async def test_a_pending_run_decides_at_its_first_rows_though_another_partition_made_the_table(store):
     """Sol R2-5, Fable R2-1: a run whose first batch made nothing is recorded
     as pending, not inferred from the table being absent: once another
-    partition makes the table, the run's first rows still open its build,
-    and its switch publishes them. A pending run that never wrote a row
-    publishes an empty partition."""
+    partition makes the table, the run's first rows decide where it writes
+    (`_decide`), and its partition, holding none, fills in place. A pending
+    run that never wrote a row publishes an empty partition."""
 
     out = output(incremental=True, partition_column="site")
     assert (await store.store([], None, at(out, 5, reset=True, partition="p1"))).ref is None
@@ -1018,8 +1179,8 @@ async def test_a_pending_run_opens_its_build_though_another_partition_made_the_t
     assert sql("SELECT to_regclass(%s)", (store._table(out)[0],)) == [(None,)]
     await store.store(rows(z="other"), None, at(out, 1, partition="p2", builds=False))
     batch = await store.store(Patch(rows(a="first")), None, at(out, 7, run=5, partition="p1"))
-    assert batch.ref.handle["build"] == 5 and builds(store, out, "p1") == [5]
-    assert outside(store, out, "p1") == {} and await solera(store, batch.ref) == {"a": "first"}
+    assert "build" not in batch.ref.handle and builds(store, out, "p1") == []
+    assert outside(store, out, "p1") == {"a": "first"} and registry(store, out, "p1") == (7, 5, [])
     assert await store.full_run_ended(out, "p1", 5, 7)
     assert outside(store, out, "p1") == {"a": "first"} and registry(store, out, "p1") == (7, 5, [])
     assert await store.full_run_ended(out, "p3", 6, 6)
@@ -1604,6 +1765,8 @@ async def test_two_first_builds_make_the_build_schema_once():
         dsn = re.sub(r"/[^/?]+(\?|$)", f"/{name}\\1", DSN, count=1)
         store = PostgresStore(dsn)
         outs = [output(incremental=True) for _ in range(4)]
+        for o in outs:  # a partition holding rows: its full run builds beside
+            await store.store(rows(z="0"), None, at(o, 1, builds=False))
         await asyncio.gather(*(store.store(rows(a="1"), None, at(o, 5, reset=True)) for o in outs))
         with psycopg.connect(dsn) as conn:
             assert conn.execute(
@@ -1709,7 +1872,9 @@ def _random_history(store, out, seed: int, steps: int, bare: bool = False) -> No
         refused = model.fence > v
         if not refused:
             model.fence = max(model.fence, v)
-            model.write(v, writes, clear, None, ctx)
+            present = sql("SELECT to_regclass(%s) IS NOT NULL", (table,))[0][0]
+            made = present or any(value is not ABSENT for value in writes.values())
+            model.write(v, writes, clear, None, ctx, made)
         context = at(out, v, reset=clear, run=ctx[0] if ctx[0] is not None else ctx[1], partition=p)
         upserts = [{"id": k, "v": f"{v}{k}"} for k, value in sorted(writes.items()) if value is not ABSENT]
         removes = sorted(k for k, value in writes.items() if value is ABSENT)
@@ -1738,16 +1903,18 @@ def _random_history(store, out, seed: int, steps: int, bare: bool = False) -> No
         assert {k: (v, g) for k, v, g in found or []} == {
             k: (f"{r.version}{k}", r.version) for k, r in model.published.items()
         }, (seed, p, "published")
-        registered, pending = (
-            sql(f"SELECT builds, pending FROM {VERSIONS_TABLE} WHERE rel = %s AND part = %s", (table, p))
-            or [([], [])]
+        registered, pending, published = (
+            sql(
+                f"SELECT builds, pending, published FROM {VERSIONS_TABLE} WHERE rel = %s AND part = %s",
+                (table, p),
+            )
+            or [([], [], None)]
         )[0]
-        assert sorted(registered + pending) == sorted(model.builds), (seed, p, "runs")
+        assert sorted(registered) == sorted(model.builds), (seed, p, "runs")
+        assert sorted(pending) == sorted(model.pending), (seed, p, "pending")
+        assert (published or 0) == model.published_run, (seed, p, "published")
         assert sorted(registered) == builds(store, out, p), (seed, p, "builds")
-        assert all(not model.builds[run] for run in pending), (seed, p, "pending")
         for run, rows_ in model.builds.items():
-            if run in pending:
-                continue
             found = sql(f"SELECT id, v, _version FROM {_qname(BUILD_SCHEMA, _build_name(table, p, run))}")
             assert {k: (v, g) for k, v, g in found} == {
                 k: (f"{r.version}{k}", r.version) for k, r in rows_.items()

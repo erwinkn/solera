@@ -1174,15 +1174,17 @@ so the gate holds it until the switch. If publishing fails (a
 constraint only the switch can check, such as a unique index across
 partitions), outsiders keep the old rows and the full run is reported
 failed to publish: its batches all committed, and Solera's own readers
-already read its result. An output's first run is hidden
-the same way: it is a full run of an empty output, its first batch says
-`batch.reset` (SEL-9), and outside, the table is empty until the run
-completes. A full run released after a cancel (STA-13) is published as
+already read its result. An output's first run is a full run of an
+empty output, and its first batch says `batch.reset` (SEL-9). The one
+exception (Erwin, 2026-11-11): a full run into a partition holding no
+rows has no old rows to keep, so it writes in place. Outsiders may see it
+fill, and a dead first run's partial rows stay visible until the next
+run, which finds rows and builds beside. A full run released after a cancel (STA-13) is published as
 it stands, once no attempt it interrupted is left unrepaired (at the
 asset's next run if the cancel interrupted one). A
 per-key asset's full run (SEL-10) keeps every key readable and changes
 them a batch at a time, outside Solera as inside.
-*From* D211. *Covered* pending in the contract (`tests/contract/entries.py`); model `tracking/test_tracking.py::test_outsiders_read_copys_full_run_all_old_then_all_new`; `tracking/test_tracking.py::test_a_first_run_is_hidden_until_it_completes`; `tracking/test_tracking.py::test_a_release_publishes_the_partial_output`; `tracking/test_tracking.py::test_an_input_taken_by_reference_waits_for_the_switch`; `tracking/test_tracking.py::test_a_late_switch_call_keeps_the_debt`.
+*From* D211. *Covered* pending in the contract (`tests/contract/entries.py`); model `tracking/test_tracking.py::test_outsiders_read_copys_full_run_all_old_then_all_new`; `tracking/test_tracking.py::test_a_first_run_into_an_empty_partition_fills_in_place`; `tracking/test_tracking.py::test_a_release_publishes_the_partial_output`; `tracking/test_tracking.py::test_an_input_taken_by_reference_waits_for_the_switch`; `tracking/test_tracking.py::test_a_late_switch_call_keeps_the_debt`.
 
 ## Contradictions, gaps and open questions
 

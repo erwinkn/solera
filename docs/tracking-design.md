@@ -1244,16 +1244,27 @@ itself) reads what outsiders read, so the gate counts its upstream
 incomplete until the notice, not only until the run ends.
 
 **An ordinary output's first run is a full run** of an empty output: its
-first batch says `batch.reset` and commits a clear, so a first run also
-builds beside and appears whole. Downstream already treated a first run as
-incomplete (D205, the gate).
+first batch says `batch.reset` and commits a clear. Downstream already
+treated a first run as incomplete (D205, the gate).
+
+**The one exception** (Erwin, 2026-11-11): a full run into a partition
+holding no rows writes in place, and is published as it begins. A first
+run is usually one. Outsiders may see such a partition fill, and a dead
+run's partial rows stay visible until the next full run, which finds rows
+and builds beside. The store decides where a run writes once, at the
+run's first write that reaches a table, under the table's lock, and
+records it (`stores.md`, PostgresStore). A write that reaches no table
+decides nothing.
 
 **What outsiders see**, as the model checks it after every step: (i) a
 program outside Solera reads the log's state at a commit where the output
 was neither mid full run nor in an unfinished first run, and never an
 earlier one than it read before; the only keys excused are those an
 uncommitted write outside a full run touched in place, never a full run's
-writes; (ii) Solera reads the log, as before; (iii) the store switches to
+writes. The one exception's run, filling a partition that held no rows,
+is read as in-place writes are: each of its commits is one outsiders may
+read, and the keys its own attempts touched and did not commit are
+excused, never another run's; (ii) Solera reads the log, as before; (iii) the store switches to
 a build at most once, and only once its run ended in the log; (iv) after a
 switch, no row of an older build is left. At rest, every ended run's build
 was published or overtaken, no build is left that a live attempt wrote,
@@ -1261,8 +1272,7 @@ and outsiders read what the log says. A released run is published as it
 stands, once no attempt it interrupted is left unrepaired: outsiders and
 downstream then read the same partial output, and the rest fills in place.
 A by-reference reader the gate lets through reads the log's head state,
-except keys an uncommitted write outside a full run touched in place, the
-same exception outsiders have.
+except the keys outsiders are excused, the same exception outsiders have.
 
 **Dead and late writers** keep this section's five rules. The version
 check is the same row, so a late writer is refused whether or not a build
@@ -2136,7 +2146,7 @@ and batches that start at a piece boundary (asserted).
   5,000 histories (a load whose build a newer run overtook falls back to
   older rows, and the hold-back holds it). The model lets the engine switch whenever the partition
   is quiet; running it before the next batch, as §8 says, is one such
-  order. Sixteen rules: `swap` (build beside), `solera_build` (Solera
+  order. Seventeen rules: `swap` (build beside), `solera_build` (Solera
   reads the build), `first_full` (a first run is a full run),
   `switch_commit`, `switch_alone` and `switch_release` (each way a run
   ends owes the switch), `switch_owed` (the owed switch is journaled and
@@ -2148,8 +2158,9 @@ and batches that start at a piece boundary (asserted).
   place), `switch_cleanup` (the switch deletes the old rows first),
   `byref_wait` (an input taken by reference waits for the switch),
   `switch_result` (the notice is journaled only when the store says the run
-  is published) and `switch_newest` (a call delivered after a newer
-  attempt wrote does nothing).
+  is published), `switch_newest` (a call delivered after a newer
+  attempt wrote does nothing) and `fill_empty` (a full run writes in
+  place only into a partition holding no rows).
 
 **Every rule is needed.** Each rule is named, and `histories.py` holds one
 shrunk history per rule that passes with every rule on and fails with
