@@ -43,6 +43,7 @@ ROOT = Path(os.environ.get("SCALE_ROOT", ".solera/scale"))
 BATCH = int(os.environ.get("SCALE_BATCH", "10000"))
 ARROW = os.environ.get("SCALE_FORM", "dict") == "arrow"
 Rows = pa.Table if ARROW else list
+EMPTY = pa.table({"id": pa.array([], pa.string()), "v": pa.array([], pa.int64())})
 GROUPS = 16
 ABSENT = 255
 POOL = Pool("scale")()
@@ -155,9 +156,9 @@ class PackStore(FileStore):
         for (generation, keys), table in zip(
             wanted.items(), await self._many(pack, list(wanted)), strict=True
         ):
-            asked = pa.array(keys, pa.string())
-            part = table.filter(pc.is_in(table[column], value_set=asked))
-            if missing := set(keys) - set(pc.unique(part[column]).to_pylist()):
+            part = table.filter(pc.is_in(table[column], value_set=pa.array(keys, pa.string())))
+            if pc.count_distinct(part[column]).as_py() != len(keys):
+                missing = set(keys) - set(part[column].to_pylist())
                 raise StoreError(f"key {min(missing)!r}: {base}/{generation} does not hold it")
             parts.append(part)
         table = pa.concat_tables(parts) if parts else None
@@ -194,7 +195,8 @@ def feed(keys, ctx):
     start, days = clocks(), versions()
     if ARROW:
         ids = pa.array(keys, pa.string())
-        day = np.frombuffer(days, np.uint8)[pc.cast(pc.utf8_slice_codeunits(ids, 1), pa.int64()).to_numpy()]
+        index = pc.cast(pc.utf8_slice_codeunits(ids, 1), pa.int64()).to_numpy()
+        day = np.frombuffer(days, np.uint8)[index].astype(np.int64)
         table = pa.table({"id": ids, "v": day, "version": pc.cast(day, pa.string())})
         served = Loaded(table.filter(pa.array(day != ABSENT)), version="version")
         record("produce", start, asset="feed", keys=len(keys))
@@ -215,7 +217,10 @@ def planned(batch) -> int:
 def copied(name: str, changes, rows: list[dict], start):
     """A keyed copy's write: a full run starts over, every other batch patches."""
 
-    rows = rows.select(["id", "v"]) if ARROW else [{"id": r["id"], "v": r["v"]} for r in rows]
+    if ARROW:
+        rows = rows.select(["id", "v"]) if rows.num_columns else EMPTY
+    else:
+        rows = [{"id": r["id"], "v": r["v"]} for r in rows]
     write = rows if changes.reset else Patch(rows, remove=list(changes.removed))
     record("produce", start, asset=name, keys=len(rows), planned=planned(changes))
     return write
