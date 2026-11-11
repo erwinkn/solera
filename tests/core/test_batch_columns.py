@@ -300,41 +300,33 @@ def test_a_table_answer_makes_the_dict_answers_dataframe():
     assert frames.served(meta, take, "v", pd.DataFrame).to_dict("records") == [{"n": 1, "id": "a"}]
 
 
-def test_columns_arrow_cannot_take_are_served_in_their_own_types():
+def test_a_table_arrow_cannot_select_rows_of_is_refused_whatever_keys_are_asked():
+    import pyarrow as pa
+    from solera.stores import frames
+
+    nested = pa.array([{"z": b"1"}, {"z": b"2"}], pa.struct([("z", pa.binary_view())]))
+    for column in (pa.array(["x", "y"], pa.string_view()), nested):
+        table = pa.table({"id": ["a", "b"], "c": column, "etag": ["1", "2"]})
+        for keys in (["a", "b"], ["b", "a"], None):
+            take, _ = Served().read_table(table, "id", "etag", keys)
+            with pytest.raises(ValueError, match="Arrow cannot select rows of this table"):
+                frames.served(table, take, "etag", list)
+
+
+def test_a_table_answer_keeps_its_own_column_types():
     import pyarrow as pa
     from solera.stores import frames
 
     table = pa.table(
         {
-            "id": pa.array(["b", "a"], pa.string_view()),
-            "p": pa.array([["x"], ["y"]], pa.list_view(pa.string_view())),
-            "s": pa.array([{"z": b"1"}, {"z": b"2"}], pa.struct([("z", pa.binary_view())])),
-            "etag": pa.array(["1", "2"], pa.string_view()),
-            "e": pa.ExtensionArray.from_storage(_view_extension(), pa.array(["x", "y"], pa.string_view())),
+            "id": pa.array(["b", "a"], pa.large_string()),
+            "p": pa.array([[1], [2, 3]], pa.list_view(pa.int32())),
+            "t": pa.array([1, 999], pa.time64("ns")),
+            "etag": ["1", "2"],
         }
     )
-    served = Served()
-    take, _ = served.read_table(table, "id", "etag", ["a", "b", "c"])
-    assert served.items() == [("a", "2"), ("b", "1"), ("c", None)]
-    assert frames.served(table, take, "etag", list) == [
-        {"id": "a", "p": ["y"], "s": {"z": b"2"}, "e": "y"},
-        {"id": "b", "p": ["x"], "s": {"z": b"1"}, "e": "x"},
-    ]
-    assert frames.served(table, take, "etag", pa.Table).schema == table.drop_columns(["etag"]).schema
-
-
-def _view_extension():
-    import pyarrow as pa
-
-    class ViewExtension(pa.ExtensionType):
-        def __init__(self):
-            super().__init__(pa.string_view(), "solera.test.view")
-
-        def __arrow_ext_serialize__(self):
-            return b""
-
-        @classmethod
-        def __arrow_ext_deserialize__(cls, storage_type, serialized):
-            return cls()
-
-    return ViewExtension()
+    take, _ = Served().read_table(table, "id", "etag", ["a", "b"])
+    served = frames.served(table, take, "etag", pa.Table)
+    assert served.schema == table.drop_columns(["etag"]).schema
+    assert served.column("t").cast(pa.int64()).to_pylist() == [999, 1]
+    assert served.column("p").to_pylist() == [[2, 3], [1]]

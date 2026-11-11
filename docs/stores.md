@@ -484,7 +484,11 @@ order, without the version column, as the parameter asks (a list, a
 DataFrame, a `pa.Table`); a key with no row was served absent; rows of keys
 not asked are dropped. A `pa.Table` parameter gets the table's own column
 types; a DataFrame is the one the dict form's rows make, dtypes included
-(built column by column from the table's values, pandas metadata ignored). A table that cannot say what it served fails the
+(built column by column from the table's values, pandas metadata ignored).
+Rows are selected with Arrow's `take`, which keeps every value as it is;
+a table with a column Arrow cannot take (pyarrow 25: string and binary
+views, alone or nested) fails the load whatever keys are asked: cast such
+columns to `large_string` or `large_binary` first. A table that cannot say what it served fails the
 load, never a pick: a key in two rows, a null key or version, no key or
 version column, versions that are not strings.
 

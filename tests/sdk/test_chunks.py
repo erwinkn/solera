@@ -132,6 +132,11 @@ def test_an_extension_type_over_a_map_is_read_as_dicts():
     assert chunk.rows == [{"id": "a", "e": {"x": 1}}]
 
 
+@pytest.mark.xfail(
+    strict=True,
+    raises=pa.ArrowNotImplementedError,
+    reason="as on main: Arrow has no take for string views; a store write of one out of key order fails (SOLE-24 R3)",
+)
 def test_view_columns_are_read_in_key_order():
     table = pa.table(
         {

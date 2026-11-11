@@ -197,8 +197,17 @@ def served(table: Any, take: bytes | None, version: str, t: Any, names: list | N
     import pyarrow as pa
 
     table = table.drop_columns([version])
+    rows = (
+        pa.array([], pa.uint32())
+        if take is None
+        else pa.Array.from_buffers(pa.uint32(), len(take) // 4, [None, pa.py_buffer(take)])
+    )
+    try:  # every table, so whether it loads never hangs on the keys asked
+        taken = table.take(rows)
+    except pa.ArrowNotImplementedError as e:
+        raise ValueError(f"Arrow cannot select rows of this table, so it cannot serve keys: {e}") from None
     if take is not None:
-        table = _take(table, pa.Array.from_buffers(pa.uint32(), len(take) // 4, [None, pa.py_buffer(take)]))
+        table = taken
     if names is None:
         return materialize(table, t)
     return {k: materialize([row], t) for k, row in zip(names, materialize(table, list), strict=True)}
@@ -266,9 +275,9 @@ def _arrow_taker(data: Any) -> Callable:
         elif isinstance(rows, range) and rows.step == 1:
             taken = table.slice(rows.start, len(rows))
         elif isinstance(rows, memoryview):
-            taken = _take(table, pa.Array.from_buffers(pa.uint32(), len(rows), [None, pa.py_buffer(rows)]))
+            taken = table.take(pa.Array.from_buffers(pa.uint32(), len(rows), [None, pa.py_buffer(rows)]))
         else:
-            taken = _take(table, pa.array(list(rows), pa.uint32()))
+            taken = table.take(list(rows))
         if any(_has_map(t) for t in table.schema.types):  # a third the speed: only where a map is
             return taken.to_pylist(maps_as_pydicts="strict")
         return taken.to_pylist()
@@ -288,24 +297,6 @@ def _has_map(t: Any) -> bool:
     if pa.types.is_dictionary(t):
         return _has_map(t.value_type)
     return any(_has_map(t.field(i).type) for i in range(t.num_fields))
-
-
-def _take(table: Any, rows: Any) -> Any:
-    """An Arrow table's rows by row number (`rows`, u32), in that order, of
-    the table's own types. Arrow's take has no kernel for some (string and
-    binary views, alone or inside a struct or an extension): such a column is
-    built again from its values."""
-
-    import pyarrow as pa
-
-    columns = []
-    for column in table.columns:
-        try:
-            columns.append(column.take(rows))
-        except pa.ArrowNotImplementedError:
-            values = column.to_pylist()
-            columns.append(pa.array([values[i] for i in rows.to_pylist()], column.type))
-    return pa.table(columns, schema=table.schema)
 
 
 # -- kinds --------------------------------------------------------------------------------
