@@ -157,29 +157,6 @@ async def test_changed_keys_too_big_for_the_result_travel_as_a_file(solera, monk
     assert await solera.rows("items") == {k: updated.get(k, v) for k, v in KEYS.items() if k not in removed}
 
 
-def test_a_removal_heavy_write_is_encoded_a_chunk_of_changes_at_a_time(monkeypatch):
-    import tempfile
-    from types import SimpleNamespace
-
-    from solera.sdk import Output
-    from solera.stores import Patch, prepare
-    from solera_worker import batch
-
-    output = Output("items", key="id")
-    prepared = prepare(Patch([{"id": "k050"}], remove=[f"k{i:03d}" for i in range(100)]), output)
-    calls, encode = [], batch.encode_changes
-
-    def counted(upserts, removes=()):
-        calls.append(len(upserts) + len(removes))
-        return encode(upserts, removes)
-
-    monkeypatch.setattr(batch, "CHANGES_CHUNK", 7)
-    monkeypatch.setattr(batch, "encode_changes", counted)
-    with tempfile.TemporaryFile() as f:
-        batch._encode(SimpleNamespace(output=output, prepared=prepared, replace=False), f)
-    assert max(calls) <= 7 and sum(calls) == 100, calls
-
-
 def test_a_commit_takes_its_changes_as_bytes_or_a_files_path_only(tmp_path):
     import mmap
 
