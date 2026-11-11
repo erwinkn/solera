@@ -472,15 +472,10 @@ impl Tracking {
         full_run: Option<u64>,
     ) -> PyResult<()> {
         let layers = layers_in(layers)?;
-        self.state.write().unwrap().outputs.insert(
-            output.into(),
-            tr::Output {
-                layers,
-                head,
-                live,
-                full_run,
-            },
-        );
+        self.state
+            .write()
+            .unwrap()
+            .set_output(output.into(), layers, head, live, full_run);
         Ok(())
     }
 

@@ -719,7 +719,7 @@ impl Tracking {
         self.per_key.get(edge).map_or(0, |k| k.rebuild)
     }
 
-    fn next_life(&mut self) -> u64 {
+    pub(crate) fn next_life(&mut self) -> u64 {
         self.lives += 1;
         self.lives
     }

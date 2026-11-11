@@ -23,12 +23,18 @@ use crate::stale::Stale;
 /// name) or an edge (consumer partition, input name), encoded by Python.
 pub type Id = Box<[u8]>;
 
-pub const SNAPSHOT_FORMAT: u8 = 3;
+pub const SNAPSHOT_FORMAT: u8 = 4;
 
 /// One output's log: its layer list, oldest first, and its head. B4's
 /// commit part appends to it.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Output {
+    /// The output's one life: given from [Tracking::lives] when its first
+    /// commit starts it. A retired output's commit numbers start again at 1
+    /// (B9), so an id and a commit name a version only within a life: a
+    /// batch record names the lives it read, and a cleanup step the life it
+    /// was taken in.
+    pub life: u64,
     pub layers: Vec<LayerRef>,
     pub head: u64,
     pub live: u64,
@@ -50,7 +56,7 @@ pub struct Tracking {
     pub edges: BTreeMap<Id, Edge>,
     /// B6: per-key edges' counters, outcome counts and retry passes.
     pub per_key: BTreeMap<Id, crate::outcomes::PerKey>,
-    /// B6: the last life given to a per-key edge.
+    /// The last life given to a per-key edge (B6) or an output.
     pub lives: u64,
     /// B7: staleness per keyed edge.
     pub stale: Stale,
@@ -151,12 +157,39 @@ impl Tracking {
         }
     }
 
+    /// Sets an output's log by hand, for tests and benches that write its
+    /// layers themselves: it keeps the output's life, or starts a new one.
+    pub fn set_output(
+        &mut self,
+        id: Id,
+        layers: Vec<LayerRef>,
+        head: u64,
+        live: u64,
+        full_run: Option<u64>,
+    ) {
+        let life = match self.outputs.get(&id) {
+            Some(o) => o.life,
+            None => self.next_life(),
+        };
+        self.outputs.insert(
+            id,
+            Output {
+                life,
+                layers,
+                head,
+                live,
+                full_run,
+            },
+        );
+    }
+
     pub fn snapshot(&self) -> Vec<u8> {
         let mut e = Enc::new();
         e.u8(SNAPSHOT_FORMAT);
         e.uv(self.outputs.len() as u64);
         for (id, o) in &self.outputs {
             e.bytes(id);
+            e.uv(o.life);
             e.uv(o.head);
             e.uv(o.live);
             e.opt_u64(o.full_run);
@@ -191,6 +224,7 @@ impl Tracking {
         let mut t = Tracking::new();
         for _ in 0..d.count()? {
             let id: Id = d.bytes()?.into();
+            let life = d.uv()?;
             let head = d.uv()?;
             let live = d.uv()?;
             let full_run = d.opt_u64()?;
@@ -198,6 +232,7 @@ impl Tracking {
             t.outputs.insert(
                 id,
                 Output {
+                    life,
                     layers,
                     head,
                     live,

@@ -32,7 +32,7 @@ use crate::progress::{
 use crate::state::{Id, Output, Tracking};
 
 pub const PLANNER_VERSION: u64 = 1;
-pub const PLAN_FORMAT: u8 = 3;
+pub const PLAN_FORMAT: u8 = 4;
 const POINT_CHUNK: usize = 1024;
 /// Owed keys whose records are read in one lookup, where the edge has any.
 const RECORD_CHUNK: usize = 1024;
@@ -78,7 +78,8 @@ pub enum Mode {
 }
 
 impl Mode {
-    fn tag(&self) -> u8 {
+    /// The mode as a batch record stores it.
+    pub fn tag(&self) -> u8 {
         match self {
             Mode::Incremental => 0,
             Mode::All => 1,
@@ -136,8 +137,13 @@ pub struct InputPlan {
     pub edge: Id,
     pub output: Id,
     pub head: u64,
+    /// The input's life ([crate::Output::life]) at plan, 0 before its first
+    /// commit: the commit refuses a plan of another life.
+    pub life: u64,
     pub conditions: Arc<Conditions>,
     pub own_head: Option<u64>,
+    /// The own output's life at plan: 0 where the plan read no commit of it.
+    pub own_life: u64,
     pub keys: Vec<Cand>,
     pub held_back: Vec<HeldBack>,
     /// Keys in the range whose failure is moot: the consumer holds what
@@ -175,14 +181,19 @@ impl InputPlan {
 
     /// A digest of the batch's input: lineage recomputes it (§7).
     pub fn digest(&self) -> u64 {
-        let mut e = Enc::new();
-        for c in &self.keys {
-            e.bytes(&c.key);
-            e.u8(c.class as u8);
-            e.version(c.version.as_version());
-        }
-        xxh3_64(&e.buf)
+        digest(&self.keys)
     }
+}
+
+/// A digest of a batch's keys, classes and versions.
+pub fn digest(keys: &[Cand]) -> u64 {
+    let mut e = Enc::new();
+    for c in keys {
+        e.bytes(&c.key);
+        e.u8(c.class as u8);
+        e.version(c.version.as_version());
+    }
+    xxh3_64(&e.buf)
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -232,8 +243,9 @@ struct InputView {
     output: Id,
     layers: Vec<LayerRef>,
     head: u64,
+    life: u64,
     progress: Arc<Progress>,
-    own: Option<(Id, Vec<LayerRef>, u64)>,
+    own: Option<(Id, Vec<LayerRef>, u64, u64)>,
     failures: Option<Failures>,
 }
 
@@ -280,7 +292,7 @@ impl Tracking {
         let output = |id: &[u8]| {
             self.outputs
                 .get(id)
-                .map_or((vec![], 0), |o| (o.layers.clone(), o.head))
+                .map_or((vec![], 0, 0), |o| (o.layers.clone(), o.head, o.life))
         };
         let mut inputs = Vec::with_capacity(req.inputs.len());
         for i in &req.inputs {
@@ -293,10 +305,10 @@ impl Tracking {
                     String::from_utf8_lossy(&i.edge)
                 ));
             }
-            let (layers, head) = output(&e.input);
+            let (layers, head, life) = output(&e.input);
             let own = i.own.as_ref().map(|o| {
-                let (l, h) = output(o);
-                (o.clone(), l, h)
+                let (l, h, life) = output(o);
+                (o.clone(), l, h, life)
             });
             let fid = output_id(FAILURES, &i.edge);
             let failures = self.outputs.get(&fid).filter(|o| o.live > 0).map(|o| {
@@ -313,6 +325,7 @@ impl Tracking {
                 output: e.input.clone(),
                 layers,
                 head,
+                life,
                 progress: e.progress.clone(),
                 own,
                 failures,
@@ -834,7 +847,7 @@ pub async fn plan(view: &View, req: &Request, ixs: &dyn Indexes, hold: &dyn Hold
         let keyed = if req.reset { empty_keyed() } else { real };
         let ix = ixs.index(&v.output)?;
         let own = match &v.own {
-            Some((o, layers, head)) => Some((ixs.index(o)?, layers.as_slice(), *head)),
+            Some((o, layers, head, _)) => Some((ixs.index(o)?, layers.as_slice(), *head)),
             None => None,
         };
         let w = Walker {
@@ -861,8 +874,10 @@ pub async fn plan(view: &View, req: &Request, ixs: &dyn Indexes, hold: &dyn Hold
             edge: v.edge.clone(),
             output: v.output.clone(),
             head: v.head,
+            life: v.life,
             conditions: r.conditions.clone(),
             own_head: v.own.as_ref().map(|o| o.2),
+            own_life: v.own.as_ref().map_or(0, |o| o.3),
             keys: found.keys,
             held_back: found.held_back,
             moot: found.moot,
@@ -910,6 +925,57 @@ pub async fn plan(view: &View, req: &Request, ixs: &dyn Indexes, hold: &dyn Hold
         unkeyed: view.unkeyed.clone(),
         pass: None,
     })
+}
+
+/// What a batch's lineage replays (§12): the progress its record says it
+/// replaced, read the way `plan` read it.
+pub(crate) struct Replay<'a> {
+    pub ix: &'a ChangeIndex,
+    pub layers: &'a [LayerRef],
+    pub head: u64,
+    pub conditions: &'a Arc<Conditions>,
+    /// The replaced slice; empty for a full run's first batch.
+    pub keyed: &'a Keyed,
+    pub own: Option<(&'a ChangeIndex, &'a [LayerRef], u64)>,
+    pub all: bool,
+    /// The keys the batch left out: held back, or waiting for their retry.
+    pub hold: &'a dyn Hold,
+}
+
+impl Replay<'_> {
+    fn walker(&self) -> Walker<'_> {
+        Walker {
+            ix: self.ix,
+            layers: self.layers,
+            head: self.head,
+            now: self.conditions,
+            keyed: self.keyed,
+            own: self.own,
+            all: self.all,
+            input: 0,
+            hold: self.hold,
+            fails: None,
+        }
+    }
+
+    /// The keys a range batch planned over `range`, stopping past `limit`.
+    pub async fn range(&self, range: &KeyRange, limit: usize) -> Result<Vec<Cand>> {
+        let w = self.walker();
+        let mut found = Found::new(limit.saturating_add(1), true);
+        for piece in self.keyed.pieces(range) {
+            w.piece(&piece.range, &piece.value, &mut found).await?;
+            if found.full() {
+                break;
+            }
+        }
+        Ok(found.keys)
+    }
+
+    /// `keys` (sorted, distinct) as a key list plans them: each one the
+    /// consumer held or upstream has under the conditions, in its class.
+    pub async fn keys(&self, keys: &[Key]) -> Result<Vec<Cand>> {
+        Ok(listed_keys(&self.walker(), keys).await?.0)
+    }
 }
 
 /// The versions of `keys` (sorted, distinct) at commit `c`.
@@ -1089,7 +1155,7 @@ fn walker<'a>(
         return invalid("the view holds no keyed edge");
     };
     let own = match &v.own {
-        Some((o, layers, head)) => Some((ixs.index(o)?, layers.as_slice(), *head)),
+        Some((o, layers, head, _)) => Some((ixs.index(o)?, layers.as_slice(), *head)),
         None => None,
     };
     let keyed = v.progress.keyed().expect("a keyed view");
@@ -1126,8 +1192,10 @@ impl Plan {
             e.bytes(&p.edge);
             e.bytes(&p.output);
             e.uv(p.head);
+            e.uv(p.life);
             e.uv(t.add(&p.conditions) as u64);
             e.opt_u64(p.own_head);
+            e.uv(p.own_life);
             e.uv(p.expect);
             e.uv(p.records);
             e.uv(p.keys.len() as u64);
@@ -1209,8 +1277,10 @@ impl Plan {
             let edge = d.bytes()?.into();
             let output = d.bytes()?.into();
             let head = d.uv()?;
+            let life = d.uv()?;
             let conditions = cond(d.uv()?)?;
             let own_head = d.opt_u64()?;
+            let own_life = d.uv()?;
             let expect = d.uv()?;
             let records = d.uv()?;
             let mut keys = Vec::new();
@@ -1243,8 +1313,10 @@ impl Plan {
                 edge,
                 output,
                 head,
+                life,
                 conditions,
                 own_head,
+                own_life,
                 keys,
                 held_back,
                 moot,

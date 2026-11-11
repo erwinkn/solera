@@ -549,8 +549,9 @@ pub async fn commit(
             _ => false,
         }
     };
-    // The points this commit sets go with the batch's own, in its progress
-    // part and its record alike: one part per edge.
+    // The points this commit sets go with the batch's own in its progress
+    // part: one part per edge. Its record keeps the batch's marks, which say
+    // what it did with each key, not what progress needs.
     let set = |into: &mut Vec<(Key, Point)>| {
         into.retain(|(k, pt)| !needless(k, pt.reason, &pt.holding));
         for (k, pt) in &points {
@@ -569,7 +570,6 @@ pub async fn commit(
     }
     for r in &mut ops.records {
         if r.edge == v.edge {
-            set(&mut r.points);
             // What the consumer held where a record said so: lineage
             // recomputes the batch's input from this slice alone (§7).
             for (k, prior) in &priors {
