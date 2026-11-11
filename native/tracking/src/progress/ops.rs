@@ -8,7 +8,8 @@ use crate::error::{invalid, Result};
 use crate::event::{Event, Part};
 use crate::plan::{InputPlan, Mode, Plan, PLANNER_VERSION};
 use crate::progress::{
-    owed, read_digest, unsettled, BatchProgress, Consumed, Holding, Key, Point, Reason, Value,
+    owed, planned_lives, read_digest, unsettled, BatchProgress, Consumed, Holding, Key, Point,
+    Reason, Value,
 };
 use crate::record::{Mark, Record};
 use crate::state::Tracking;
@@ -101,9 +102,12 @@ impl Tracking {
             if **input != *p.output {
                 return invalid("the edge reads another output than the batch planned");
             }
-            if p.life != 0 && p.life != crate::retain::life(self, &p.output) {
-                return invalid("the batch was planned in an earlier life of its input");
-            }
+            planned_lives(
+                self,
+                input,
+                p.life,
+                p.own.as_ref().map(|o| (&o.output[..], o.life)),
+            )?;
             if read_digest(k, plan.reset, &plan.range) != p.expect {
                 return invalid("the edge's progress moved since the batch was planned");
             }
@@ -269,15 +273,15 @@ impl Tracking {
                 reset: plan.reset,
                 range: plan.range.clone(),
                 head: p.head,
-                life: crate::retain::life(self, &p.output),
+                life: p.life,
                 conditions: p.conditions.clone(),
                 replaced,
                 marks,
                 counts: p.counts(),
                 digest: p.digest(),
                 planner: PLANNER_VERSION,
-                own_head: p.own_head,
-                own_life: p.own_life,
+                own_head: p.own.as_ref().map(|o| o.head),
+                own_life: p.own.as_ref().map_or(0, |o| o.life),
                 output_commit,
                 keys: match &plan.mode {
                     Mode::Keys(_) => Some(p.keys.iter().map(|c| c.key.clone()).collect()),
@@ -291,14 +295,17 @@ impl Tracking {
                 range: plan.range.clone(),
                 piece: (!key_list).then(|| Value::At(p.head, p.conditions.clone())),
                 head: p.head,
+                life: p.life,
+                own: p.own.as_ref().map(|o| (o.output.clone(), o.life)),
                 points,
                 expect: p.expect,
-                fence: (kept_unsure && !unsettled).then(|| (p.output.clone(), p.head)),
+                fence: (kept_unsure && !unsettled).then_some(p.head),
             }));
         }
         for u in &plan.unkeyed {
             let c = Consumed {
                 edge: u.edge.clone(),
+                life: u.life,
                 through: u.head,
                 expect: u.through,
             };

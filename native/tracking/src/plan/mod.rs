@@ -32,11 +32,19 @@ use crate::progress::{
 use crate::state::{Id, Output, Tracking};
 
 pub const PLANNER_VERSION: u64 = 1;
-pub const PLAN_FORMAT: u8 = 4;
+pub const PLAN_FORMAT: u8 = 5;
 const POINT_CHUNK: usize = 1024;
 /// Owed keys whose records are read in one lookup, where the edge has any.
 const RECORD_CHUNK: usize = 1024;
 const MAX_PAGE: u64 = 1 << 20;
+
+/// A life a plan names: never 0, since every output it reads is named.
+fn alive(life: u64) -> Result<u64> {
+    if life == 0 {
+        return format("a plan names life 0");
+    }
+    Ok(life)
+}
 
 /// The change index of each output's object store.
 pub trait Indexes: Sync {
@@ -124,6 +132,14 @@ pub struct Cand {
     pub held: Holding,
 }
 
+/// An output a plan read at `head` in life `life` (never 0).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Own {
+    pub output: Id,
+    pub head: u64,
+    pub life: u64,
+}
+
 /// An owed key left out of the batch, inside its range.
 #[derive(Clone, Debug, PartialEq)]
 pub struct HeldBack {
@@ -137,13 +153,12 @@ pub struct InputPlan {
     pub edge: Id,
     pub output: Id,
     pub head: u64,
-    /// The input's life ([crate::Output::life]) at plan, 0 before its first
-    /// commit: the commit refuses a plan of another life.
+    /// The input's life ([crate::Output::life]) at plan, never 0: the commit
+    /// refuses a plan of another life.
     pub life: u64,
     pub conditions: Arc<Conditions>,
-    pub own_head: Option<u64>,
-    /// The own output's life at plan: 0 where the plan read no commit of it.
-    pub own_life: u64,
+    /// The consumer's own output as the plan read it, where it read it.
+    pub own: Option<Own>,
     pub keys: Vec<Cand>,
     pub held_back: Vec<HeldBack>,
     /// Keys in the range whose failure is moot: the consumer holds what
@@ -201,6 +216,8 @@ pub struct UnkeyedPlan {
     pub edge: Id,
     pub output: Id,
     pub head: u64,
+    /// The input's life at plan, never 0: the commit refuses another.
+    pub life: u64,
     pub through: u64,
 }
 
@@ -281,6 +298,15 @@ impl View {
         )))
     }
 
+    /// The own output of input `input` as this view read it, where it did.
+    pub(crate) fn own(&self, input: usize) -> Option<Own> {
+        self.inputs[input].own.as_ref().map(|o| Own {
+            output: o.0.clone(),
+            head: o.2,
+            life: o.3,
+        })
+    }
+
     /// B6: whether the first input has failure records.
     pub fn has_failures(&self) -> bool {
         self.inputs.first().is_some_and(|v| v.failures.is_some())
@@ -289,10 +315,12 @@ impl View {
 
 impl Tracking {
     pub fn view(&self, req: &Request) -> Result<View> {
-        let output = |id: &[u8]| {
-            self.outputs
-                .get(id)
-                .map_or((vec![], 0, 0), |o| (o.layers.clone(), o.head, o.life))
+        let output = |id: &[u8], what: &str| match self.outputs.get(id) {
+            Some(o) => Ok((o.layers.clone(), o.head, o.life)),
+            None => invalid(format!(
+                "{what} {} has no life: declare it first",
+                String::from_utf8_lossy(id)
+            )),
         };
         let mut inputs = Vec::with_capacity(req.inputs.len());
         for i in &req.inputs {
@@ -305,11 +333,14 @@ impl Tracking {
                     String::from_utf8_lossy(&i.edge)
                 ));
             }
-            let (layers, head, life) = output(&e.input);
-            let own = i.own.as_ref().map(|o| {
-                let (l, h, life) = output(o);
-                (o.clone(), l, h, life)
-            });
+            let (layers, head, life) = output(&e.input, "the input")?;
+            let own = match &i.own {
+                Some(o) => {
+                    let (l, h, life) = output(o, "the own output")?;
+                    Some((o.clone(), l, h, life))
+                }
+                None => None,
+            };
             let fid = output_id(FAILURES, &i.edge);
             let failures = self.outputs.get(&fid).filter(|o| o.live > 0).map(|o| {
                 let k = self.per_key.get(&i.edge).cloned().unwrap_or_default();
@@ -339,11 +370,12 @@ impl Tracking {
             let Progress::Unkeyed(through) = *e.progress else {
                 return invalid(format!("edge {} is keyed", String::from_utf8_lossy(id)));
             };
-            let head = self.outputs.get(&e.input).map_or(0, |o| o.head);
+            let (_, head, life) = output(&e.input, "the input")?;
             unkeyed.push(UnkeyedPlan {
                 edge: id.clone(),
                 output: e.input.clone(),
                 head,
+                life,
                 through,
             });
         }
@@ -876,8 +908,7 @@ pub async fn plan(view: &View, req: &Request, ixs: &dyn Indexes, hold: &dyn Hold
             head: v.head,
             life: v.life,
             conditions: r.conditions.clone(),
-            own_head: v.own.as_ref().map(|o| o.2),
-            own_life: v.own.as_ref().map_or(0, |o| o.3),
+            own: view.own(i),
             keys: found.keys,
             held_back: found.held_back,
             moot: found.moot,
@@ -1194,8 +1225,15 @@ impl Plan {
             e.uv(p.head);
             e.uv(p.life);
             e.uv(t.add(&p.conditions) as u64);
-            e.opt_u64(p.own_head);
-            e.uv(p.own_life);
+            match &p.own {
+                None => e.u8(0),
+                Some(o) => {
+                    e.u8(1);
+                    e.bytes(&o.output);
+                    e.uv(o.head);
+                    e.uv(o.life);
+                }
+            }
             e.uv(p.expect);
             e.uv(p.records);
             e.uv(p.keys.len() as u64);
@@ -1223,6 +1261,7 @@ impl Plan {
             e.bytes(&u.edge);
             e.bytes(&u.output);
             e.uv(u.head);
+            e.uv(u.life);
             e.uv(u.through);
         }
         e.opt_u64(self.pass.as_ref().map(|p| p.life));
@@ -1277,10 +1316,17 @@ impl Plan {
             let edge = d.bytes()?.into();
             let output = d.bytes()?.into();
             let head = d.uv()?;
-            let life = d.uv()?;
+            let life = alive(d.uv()?)?;
             let conditions = cond(d.uv()?)?;
-            let own_head = d.opt_u64()?;
-            let own_life = d.uv()?;
+            let own = match d.u8()? {
+                0 => None,
+                1 => Some(Own {
+                    output: d.bytes()?.into(),
+                    head: d.uv()?,
+                    life: alive(d.uv()?)?,
+                }),
+                t => return format(format!("own tag {t}")),
+            };
             let expect = d.uv()?;
             let records = d.uv()?;
             let mut keys = Vec::new();
@@ -1315,8 +1361,7 @@ impl Plan {
                 head,
                 life,
                 conditions,
-                own_head,
-                own_life,
+                own,
                 keys,
                 held_back,
                 moot,
@@ -1331,6 +1376,7 @@ impl Plan {
                 edge: d.bytes()?.into(),
                 output: d.bytes()?.into(),
                 head: d.uv()?,
+                life: alive(d.uv()?)?,
                 through: d.uv()?,
             });
         }

@@ -52,7 +52,7 @@ fn outcome_state(edge: &[u8]) -> impl Iterator<Item = Touch<'_>> {
     )
 }
 
-pub const FORMAT: u8 = 1;
+pub const FORMAT: u8 = 2;
 
 /// One part of an event. Each unit adds its variants and the lines that
 /// dispatch to its module.
@@ -74,6 +74,7 @@ pub enum Part {
     OutputCommit(commit::OutputCommit),
     /// B4: an output's full run ends without a commit of its own.
     FullRunDone(commit::FullRunDone),
+    Declare(commit::Declare),
     /// B6: a batch's outcomes: an edge's counts, conditions and retry step.
     Outcomes(outcomes::Outcomes),
     /// B6: a retry pass begins.
@@ -124,6 +125,8 @@ impl Part {
             Part::Consumed(p) => vec![on("edge", &p.edge)],
             Part::OutputCommit(p) => vec![on("output", &p.output)],
             Part::FullRunDone(p) => vec![on("output", &p.output)],
+            // naming keeps a life an output has, so it commutes with every part
+            Part::Declare(_) => vec![],
             Part::Outcomes(p) => {
                 let mut v = vec![on("outcomes", &p.edge)];
                 if !p.points.is_empty() {
@@ -158,6 +161,7 @@ impl Part {
             Part::Consumed(_) => progress::TAG_CONSUMED,
             Part::OutputCommit(_) => commit::TAG_OUTPUT_COMMIT,
             Part::FullRunDone(_) => commit::TAG_FULL_RUN_DONE,
+            Part::Declare(_) => commit::TAG_DECLARE,
             Part::Outcomes(_) => outcomes::TAG_OUTCOMES,
             Part::PassStart(_) => outcomes::TAG_PASS_START,
             Part::Rebuild(_) => outcomes::TAG_REBUILD,
@@ -180,6 +184,7 @@ impl Part {
             Part::Consumed(p) => p.encode(e),
             Part::OutputCommit(p) => p.encode(e),
             Part::FullRunDone(p) => p.encode(e),
+            Part::Declare(p) => p.encode(e),
             Part::Outcomes(p) => p.encode(e),
             Part::PassStart(p) => p.encode(e),
             Part::Rebuild(p) => p.encode(e),
@@ -202,6 +207,7 @@ impl Part {
             progress::TAG_CONSUMED => Part::Consumed(progress::Consumed::decode(d)?),
             commit::TAG_OUTPUT_COMMIT => Part::OutputCommit(commit::OutputCommit::decode(d)?),
             commit::TAG_FULL_RUN_DONE => Part::FullRunDone(commit::FullRunDone::decode(d)?),
+            commit::TAG_DECLARE => Part::Declare(commit::Declare::decode(d)?),
             outcomes::TAG_OUTCOMES => Part::Outcomes(outcomes::Outcomes::decode(d)?),
             outcomes::TAG_PASS_START => Part::PassStart(outcomes::PassStart::decode(d)?),
             outcomes::TAG_REBUILD => Part::Rebuild(outcomes::Rebuild::decode(d)?),

@@ -350,6 +350,8 @@ impl Model {
             range: a.range.clone(),
             piece: Some(Value::At(a.head, self.cond.clone())),
             head: a.head,
+            life: self.t.life(&self.t.edges[&a.edge].input),
+            own: None,
             points: vec![],
             expect: a.expect,
             fence: None,
@@ -364,7 +366,7 @@ impl Model {
             reset: false,
             range: a.range,
             head: a.head,
-            life: super::life(&self.t, ITEMS),
+            life: self.t.life(ITEMS),
             conditions: self.cond.clone(),
             replaced: a.slice,
             marks: vec![],
@@ -783,6 +785,8 @@ fn a_merge_is_refused_unless_it_replaces_adjacent_layers_folds_within_the_cut_an
         range: KeyRange::all(),
         piece: Some(Value::At(1, m.cond.clone())),
         head: 1,
+        life: m.t.life(ITEMS),
+        own: None,
         points: vec![],
         expect: read_digest(&Default::default(), false, &KeyRange::all()),
         fence: None,
@@ -861,6 +865,8 @@ fn a_merge_to_a_held_path_writes_nothing_and_a_merge_shares_no_event() {
         range: KeyRange::all(),
         piece: Some(Value::At(2, m.cond.clone())),
         head: 2,
+        life: m.t.life(ITEMS),
+        own: None,
         points: vec![],
         expect: read_digest(&Default::default(), false, &KeyRange::all()),
         fence: None,
@@ -888,6 +894,7 @@ fn a_batch_whose_input_folded_past_its_head_is_refused() {
         layer,
     }))
     .unwrap();
+    let life = m.t.life(ITEMS);
     let batch = |h, key_list: bool| {
         Part::Batch(BatchProgress {
             edge: EDGES[1].into(),
@@ -895,6 +902,8 @@ fn a_batch_whose_input_folded_past_its_head_is_refused() {
             range: KeyRange::all(),
             piece: (!key_list).then(|| Value::At(h, Arc::new(Conditions::default()))),
             head: h,
+            life,
+            own: None,
             points: vec![],
             expect: read_digest(&Default::default(), false, &KeyRange::all()),
             fence: None,
@@ -914,7 +923,7 @@ fn a_batch_whose_input_folded_past_its_head_is_refused() {
 fn the_cursor_moves_only_from_where_it_is_and_within_the_head() {
     let rt = runtime();
     let mut m = commits(&rt, 3);
-    let life = super::life(&m.t, ITEMS);
+    let life = m.t.life(ITEMS);
     let step = |from, to| {
         Part::Cleaned(Cleaned {
             output: items(),
@@ -972,7 +981,7 @@ fn the_cursor_moves_only_from_where_it_is_and_within_the_head() {
 fn cleaned(t: &Tracking, from: u64, to: u64) -> Part {
     Part::Cleaned(Cleaned {
         output: items(),
-        life: super::life(t, ITEMS),
+        life: t.life(ITEMS),
         from,
         to,
     })
@@ -1239,13 +1248,7 @@ fn an_edge_moves_to_an_input_only_above_its_floor() {
     }))
     .unwrap();
     let other: Id = b"other".as_slice().into();
-    m.t.outputs.insert(
-        other.clone(),
-        Output {
-            head: 1,
-            ..Default::default()
-        },
-    );
+    m.t.set_output(other.clone(), vec![], 1, 0, None);
     let edge: Id = b"moved".as_slice().into();
     m.apply(Part::EdgeOpen(EdgeOpen {
         edge: edge.clone(),
@@ -1259,6 +1262,8 @@ fn an_edge_moves_to_an_input_only_above_its_floor() {
         range: KeyRange::all(),
         piece: Some(Value::At(1, m.cond.clone())),
         head: 1,
+        life: m.t.life(&other),
+        own: None,
         points: vec![],
         expect: read_digest(&Default::default(), false, &KeyRange::all()),
         fence: None,
@@ -1274,7 +1279,7 @@ fn an_edge_moves_to_an_input_only_above_its_floor() {
     let e =
         m.t.check_event(&Event::of(vec![rename(&items())]))
             .unwrap_err();
-    assert!(e.to_string().contains("below its new input's floor"), "{e}");
+    assert!(e.to_string().contains("reset it first"), "{e}");
     m.apply(rename(&other)).unwrap();
     // a per-key edge whose keys fail holds its seen, with no piece at all
     let failing: Id = b"failing".as_slice().into();
@@ -1291,14 +1296,7 @@ fn an_edge_moves_to_an_input_only_above_its_floor() {
             ..Default::default()
         },
     );
-    m.t.outputs.insert(
-        output_id(FAILURES, &failing),
-        Output {
-            live: 1,
-            head: 1,
-            ..Default::default()
-        },
-    );
+    m.t.set_output(output_id(FAILURES, &failing), vec![], 1, 1, None);
     let e = m
         .apply(Part::EdgeRename(EdgeRename {
             from: failing.clone(),
@@ -1306,5 +1304,5 @@ fn an_edge_moves_to_an_input_only_above_its_floor() {
             input: items(),
         }))
         .unwrap_err();
-    assert!(e.to_string().contains("Seen"), "{e}");
+    assert!(e.to_string().contains("reset it first"), "{e}");
 }

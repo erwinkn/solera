@@ -141,6 +141,7 @@ impl Log {
         }
         let mut parts = vec![Part::OutputCommit(OutputCommit {
             output: key(&self.name),
+            life: t.life(self.name.as_bytes()),
             layer: self.layers.last().unwrap().clone(),
             live: self.states.last().unwrap().len() as u64,
             ends_full_run: ends && (clear || was),
@@ -561,8 +562,7 @@ impl World {
             head: rec.head,
             life: rec.life,
             conditions: rec.conditions.clone(),
-            own_head: None,
-            own_life: 0,
+            own: None,
             keys,
             held_back: vec![],
             moot: vec![],
@@ -2025,8 +2025,16 @@ fn a_part_built_before_the_records_started_over_is_refused() {
             w.apply(ev);
             let before = w.t.snapshot();
             for stale in [commit, start, rebuild] {
-                let err = w.t.apply(&Event::of(stale).encode()).unwrap_err();
-                assert!(err.to_string().contains("started over"), "{err}");
+                let err =
+                    w.t.apply(&Event::of(stale).encode())
+                        .unwrap_err()
+                        .to_string();
+                // the records' output started a new life too: a commit to it
+                // built before is refused on that first
+                assert!(
+                    err.contains("started over") || err.contains(" in life "),
+                    "{err}"
+                );
             }
             assert_eq!(w.t.snapshot(), before);
         });

@@ -148,7 +148,7 @@ impl Logs {
         };
         let missing =
             |id: &Id, named: u64, (life, layers): (u64, &[LayerRef]), commits: Vec<u64>| {
-                if named > 0 && named != life {
+                if named != life {
                     return Ok(Some(Answer::Retired { output: id.clone() }));
                 }
                 let (floor, head) = span(layers);

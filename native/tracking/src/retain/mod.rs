@@ -70,11 +70,6 @@ impl Retain {
     }
 }
 
-/// The output's life: 0 before its first commit.
-pub(crate) fn life(t: &Tracking, output: &[u8]) -> u64 {
-    t.outputs.get(output).map_or(0, |o| o.life)
-}
-
 fn head(t: &Tracking, output: &[u8]) -> u64 {
     t.outputs.get(output).map_or(0, |o| o.head)
 }
@@ -223,6 +218,12 @@ impl Track {
     }
 
     pub(crate) fn check(&self, t: &Tracking) -> Result<()> {
+        if crate::state::core_owned(&self.output) {
+            return invalid(format!(
+                "{} is the core's: it is not cleaned",
+                name(&self.output)
+            ));
+        }
         if t.retain.cursors.contains_key(&self.output) {
             return invalid(format!("{} is already cleaned", name(&self.output)));
         }
@@ -237,7 +238,9 @@ impl Track {
         Ok(())
     }
 
+    /// Names the output: its cursor is of the life it starts in.
     pub(crate) fn apply(self, t: &mut Tracking) {
+        t.name(&self.output);
         t.retain.cursors.insert(self.output, Cursor { at: self.at });
     }
 }
@@ -273,13 +276,13 @@ impl Cleaned {
 
     pub fn check(&self, t: &Tracking) -> Result<()> {
         let at = t.retain.cursors.get(&self.output);
-        if at != Some(&Cursor { at: self.from }) || self.life != life(t, &self.output) {
+        if at != Some(&Cursor { at: self.from }) || self.life != t.life(&self.output) {
             return invalid(format!(
                 "a cleanup step of {} from {} in life {}, its cursor is {at:?} in life {}",
                 name(&self.output),
                 self.from,
                 self.life,
-                life(t, &self.output)
+                t.life(&self.output)
             ));
         }
         if self.to <= self.from || self.to > head(t, &self.output) {
@@ -324,7 +327,7 @@ impl Retire {
     }
 
     pub(crate) fn check(&self, t: &Tracking) -> Result<()> {
-        if !t.outputs.contains_key(&self.output) && !t.retain.cursors.contains_key(&self.output) {
+        if !t.outputs.contains_key(&self.output) {
             return invalid(format!("no output {} to retire", name(&self.output)));
         }
         if let Some((e, _)) = t.edges.iter().find(|(_, e)| e.input == self.output) {
@@ -347,8 +350,7 @@ impl Retire {
     }
 
     pub(crate) fn apply(self, t: &mut Tracking) {
-        t.outputs.remove(&self.output);
-        t.retain.cursors.remove(&self.output);
+        t.end(&self.output);
     }
 }
 

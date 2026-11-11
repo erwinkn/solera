@@ -89,6 +89,8 @@ fn batch(t: &Tracking, range: KeyRange, at: u64, reset: bool) -> Part {
         range: range.clone(),
         piece: Some(Value::At(at, Arc::default())),
         head: at,
+        life: t.life(&t.edges[EDGE].input),
+        own: None,
         points: vec![],
         expect: read_digest(k, reset, &range),
         fence: None,
@@ -377,7 +379,7 @@ fn failed(rt: &tokio::runtime::Runtime, ix: &ChangeIndex, keys: &[&str]) -> Trac
         .iter()
         .map(|k| (*k, Version::Absent, Version::Int(1)))
         .collect();
-    let u = write(rt, ix, b"up", 1, 0, &ups);
+    let u = write(rt, ix, b"up", t.life(b"up"), 1, 0, &ups);
     apply(&mut t, vec![u]);
     let b = Part::Batch(BatchProgress {
         edge: key("e"),
@@ -385,6 +387,8 @@ fn failed(rt: &tokio::runtime::Runtime, ix: &ChangeIndex, keys: &[&str]) -> Trac
         range: KeyRange::all(),
         piece: Some(Value::At(1, c.clone())),
         head: 1,
+        life: t.life(b"up"),
+        own: None,
         points: vec![],
         expect: read_digest(
             t.edges[b"e".as_slice()].progress.keyed().unwrap(),
@@ -417,7 +421,7 @@ fn failed(rt: &tokio::runtime::Runtime, ix: &ChangeIndex, keys: &[&str]) -> Trac
         .iter()
         .map(|k| (*k, Version::Absent, Version::Bytes(&rec)))
         .collect();
-    let f = write(rt, ix, &fid, 1, 0, &recs);
+    let f = write(rt, ix, &fid, t.life(&fid), 1, 0, &recs);
     let o = Part::Outcomes(Outcomes {
         edge: key("e"),
         counts: [0, keys.len() as u64, 0, 0, 0, 0],
@@ -440,6 +444,7 @@ fn write_k1(
     rt: &tokio::runtime::Runtime,
     ix: &ChangeIndex,
     output: &[u8],
+    life: u64,
     commit: u64,
     old: Version<'_>,
     new: Version<'_>,
@@ -448,6 +453,7 @@ fn write_k1(
         rt,
         ix,
         output,
+        life,
         commit,
         (commit > 1) as u64,
         &[("k1", old, new)],
@@ -459,6 +465,7 @@ fn write(
     rt: &tokio::runtime::Runtime,
     ix: &ChangeIndex,
     output: &[u8],
+    life: u64,
     commit: u64,
     live: u64,
     entries: &[(&str, Version<'_>, Version<'_>)],
@@ -484,6 +491,7 @@ fn write(
     let layer = rt.block_on(ix.write_commit(&path, nc, &r)).unwrap();
     Part::OutputCommit(OutputCommit {
         output: output.into(),
+        life,
         layer,
         live: after as u64,
         ends_full_run: false,
@@ -537,7 +545,15 @@ fn a_failing_key_is_owed_by_what_its_record_holds() {
         "k1 waits for its retry"
     );
 
-    let removal = write_k1(&rt, &ix, b"up", 2, Version::Int(1), Version::Absent);
+    let removal = write_k1(
+        &rt,
+        &ix,
+        b"up",
+        t.life(b"up"),
+        2,
+        Version::Int(1),
+        Version::Absent,
+    );
     let mut n = stale::Notice::new(&t, b"up", 2, false, 7);
     n.push(b"k1", Version::Absent);
     assert!(
@@ -551,7 +567,15 @@ fn a_failing_key_is_owed_by_what_its_record_holds() {
         "upstream removed k1 and the consumer holds nothing: nothing is owed"
     );
 
-    let back = write_k1(&rt, &ix, b"up", 3, Version::Absent, Version::Int(3));
+    let back = write_k1(
+        &rt,
+        &ix,
+        b"up",
+        t.life(b"up"),
+        3,
+        Version::Absent,
+        Version::Int(3),
+    );
     apply(&mut t, vec![back]);
     assert_eq!(
         refresh_e(&rt, &ix, &mut t),
@@ -692,8 +716,24 @@ fn a_refresh_on_an_edge_with_failure_records_waits_for_the_catch_up() {
     let (rt, ix) = index();
     let mut t = failed_k1(&rt, &ix);
     assert_eq!(refresh_e(&rt, &ix, &mut t), Status::Fresh, "k1 waits");
-    let removal = write_k1(&rt, &ix, b"up", 2, Version::Int(1), Version::Absent);
-    let back = write_k1(&rt, &ix, b"up", 3, Version::Absent, Version::Int(1));
+    let removal = write_k1(
+        &rt,
+        &ix,
+        b"up",
+        t.life(b"up"),
+        2,
+        Version::Int(1),
+        Version::Absent,
+    );
+    let back = write_k1(
+        &rt,
+        &ix,
+        b"up",
+        t.life(b"up"),
+        3,
+        Version::Absent,
+        Version::Int(1),
+    );
     apply(&mut t, vec![removal]);
     apply(&mut t, vec![back]);
     let refused = t.stale_ask(b"e").err().expect("refused").to_string();
@@ -753,6 +793,7 @@ fn a_retry_pass_reads_past_keys_gone_moot() {
         &rt,
         &ix,
         b"up",
+        t.life(b"up"),
         2,
         2,
         &[("k1", Version::Int(1), Version::Absent)],
@@ -816,6 +857,7 @@ fn commit_part(t: &Tracking) -> Part {
     };
     Part::OutputCommit(OutputCommit {
         output: ITEMS.into(),
+        life: t.life(ITEMS),
         layer,
         live: 0,
         ends_full_run: false,
@@ -988,6 +1030,7 @@ fn up(
         t,
         vec![Part::OutputCommit(OutputCommit {
             output: ITEMS.into(),
+            life: t.life(ITEMS),
             layer,
             live: (live as i64 + delta) as u64,
             ends_full_run: false,

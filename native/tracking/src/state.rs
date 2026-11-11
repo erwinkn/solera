@@ -23,17 +23,28 @@ use crate::stale::Stale;
 /// name) or an edge (consumer partition, input name), encoded by Python.
 pub type Id = Box<[u8]>;
 
-pub const SNAPSHOT_FORMAT: u8 = 4;
+pub const SNAPSHOT_FORMAT: u8 = 5;
+
+/// Whether the core owns `id`: a per-key edge's record outputs
+/// (`outcomes::output_id`, a zero byte first). Their lives follow their
+/// edge's (dropped at a reset or close, moved at a rename), so nothing else
+/// names them: no edge reads one, none is declared or cleaned.
+pub fn core_owned(id: &[u8]) -> bool {
+    id.first() == Some(&0)
+}
 
 /// One output's log: its layer list, oldest first, and its head. B4's
 /// commit part appends to it.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Output {
-    /// The output's one life: given from [Tracking::lives] when its first
-    /// commit starts it. A retired output's commit numbers start again at 1
-    /// (B9), so an id and a commit name a version only within a life: a
-    /// batch record names the lives it read, and a cleanup step the life it
-    /// was taken in.
+    /// The output's one life, never 0: given from [Tracking::lives] when the
+    /// output is first named ([Tracking::name]: an edge opens on it, it is
+    /// declared or tracked, or its first commit lands), and ended only by
+    /// [Tracking::end]. A retired output's commit numbers start again at 1
+    /// (B9), so an id and a commit name a version only within a life: a plan
+    /// names the lives it reads, its commit applies only in them, and its
+    /// record stores them; a cleanup step names the life it was taken in.
+    /// An entry may hold no commit yet (head 0, no layers).
     pub life: u64,
     pub layers: Vec<LayerRef>,
     pub head: u64,
@@ -121,6 +132,7 @@ impl Tracking {
             Part::Consumed(p) => p.check(self),
             Part::OutputCommit(p) => p.check(self),
             Part::FullRunDone(p) => p.check(self),
+            Part::Declare(p) => p.check(self),
             Part::Outcomes(p) => p.check(self),
             Part::PassStart(p) => p.check(self),
             Part::Rebuild(p) => p.check(self),
@@ -145,6 +157,7 @@ impl Tracking {
             Part::Consumed(p) => p.apply(self),
             Part::OutputCommit(p) => p.apply(self),
             Part::FullRunDone(p) => p.apply(self),
+            Part::Declare(p) => p.apply(self),
             Part::Outcomes(p) => p.apply(self),
             Part::PassStart(p) => p.apply(self),
             Part::Rebuild(p) => p.apply(self),
@@ -157,8 +170,51 @@ impl Tracking {
         }
     }
 
+    /// Names an output: gives it a life if it has none, and returns its life.
+    pub(crate) fn name(&mut self, id: &[u8]) -> u64 {
+        if let Some(o) = self.outputs.get(id) {
+            return o.life;
+        }
+        let life = self.next_life();
+        self.outputs.insert(
+            id.into(),
+            Output {
+                life,
+                ..Output::default()
+            },
+        );
+        life
+    }
+
+    /// Ends an output's life: its entry and its cleanup cursor leave the
+    /// state, and the next naming gives it a new life. Its callers make sure
+    /// no edge reads it (`Retire` refuses that, and no edge reads a per-key
+    /// edge's record outputs: see [`core_owned`]).
+    pub(crate) fn end(&mut self, id: &[u8]) -> Option<Output> {
+        self.retain.cursors.remove(id);
+        self.outputs.remove(id)
+    }
+
+    /// The output's life now, 0 when it has none.
+    pub fn life(&self, id: &[u8]) -> u64 {
+        self.outputs.get(id).map_or(0, |o| o.life)
+    }
+
+    /// Refused unless `id` has life `life` now: what a plan, a commit or a
+    /// cleanup step read is of the output's life that the state holds.
+    pub(crate) fn in_life(&self, id: &[u8], life: u64, what: &str) -> Result<()> {
+        let now = self.life(id);
+        if now != life {
+            return crate::error::invalid(format!(
+                "{what} {} in life {life}, its life is {now}: it was retired, dropped or started again since",
+                String::from_utf8_lossy(id)
+            ));
+        }
+        Ok(())
+    }
+
     /// Sets an output's log by hand, for tests and benches that write its
-    /// layers themselves: it keeps the output's life, or starts a new one.
+    /// layers themselves: it keeps the output's life, or names it.
     pub fn set_output(
         &mut self,
         id: Id,
@@ -167,10 +223,7 @@ impl Tracking {
         live: u64,
         full_run: Option<u64>,
     ) {
-        let life = match self.outputs.get(&id) {
-            Some(o) => o.life,
-            None => self.next_life(),
-        };
+        let life = self.name(&id);
         self.outputs.insert(
             id,
             Output {
@@ -181,6 +234,38 @@ impl Tracking {
                 full_run,
             },
         );
+    }
+
+    /// What every state holds: each output's life is above 0, at most the
+    /// counter and its own; every edge's input and every cleaned output has
+    /// a life, and none is the core's. Restore refuses a snapshot that
+    /// breaks it.
+    pub fn check_lives(&self) -> Result<()> {
+        let mut seen = std::collections::HashSet::new();
+        for (id, o) in &self.outputs {
+            if o.life == 0 || o.life > self.lives || !seen.insert(o.life) {
+                return format(format!(
+                    "output {} has life {}, of {} given",
+                    String::from_utf8_lossy(id),
+                    o.life,
+                    self.lives
+                ));
+            }
+        }
+        let named = |id: &[u8]| self.outputs.contains_key(id) && !core_owned(id);
+        if let Some((e, _)) = self.edges.iter().find(|(_, e)| !named(&e.input)) {
+            return format(format!(
+                "edge {} reads an output with no life, or the core's",
+                String::from_utf8_lossy(e)
+            ));
+        }
+        if let Some(id) = self.retain.cursors.keys().find(|id| !named(id)) {
+            return format(format!(
+                "cleaned output {} has no life, or is the core's",
+                String::from_utf8_lossy(id)
+            ));
+        }
+        Ok(())
     }
 
     pub fn snapshot(&self) -> Vec<u8> {
@@ -255,6 +340,7 @@ impl Tracking {
         t.stale = Stale::decode(&mut d)?;
         t.retain = Retain::decode(&mut d)?;
         d.end()?;
+        t.check_lives()?;
         Ok(t)
     }
 }
@@ -280,14 +366,7 @@ mod tests {
             t.apply(&ev.encode()).unwrap();
         }
         assert!(t.apply(&open("tally/items", true).encode()).is_err());
-        t.outputs.insert(
-            b"items".as_slice().into(),
-            Output {
-                head: 3,
-                live: 7,
-                ..Default::default()
-            },
-        );
+        t.set_output(b"items".as_slice().into(), vec![], 3, 7, None);
         let back = Tracking::restore(&t.snapshot()).unwrap();
         assert_eq!(back, t);
         let close = Event::of(vec![Part::EdgeClose(EdgeClose {

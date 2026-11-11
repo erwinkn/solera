@@ -197,6 +197,7 @@ pub async fn build_each(
     Ok(Some(Built {
         part: OutputCommit {
             output: output.clone(),
+            life: out.life,
             layer,
             live: out.live + e.added - removed,
             ends_full_run: spec.ends_full_run,

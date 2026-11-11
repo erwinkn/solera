@@ -605,7 +605,7 @@ impl Outcomes {
                 None => {
                     k.last = p.low;
                     k.pass = None;
-                    t.outputs.remove(&list);
+                    t.end(&list);
                 }
             }
         }
@@ -726,7 +726,7 @@ impl Tracking {
 
     fn drop_records(&mut self, edge: &[u8]) {
         for kind in [FAILURES, DUE, PASS] {
-            self.outputs.remove(&output_id(kind, edge));
+            self.end(&output_id(kind, edge));
         }
     }
 }
