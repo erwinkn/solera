@@ -243,7 +243,9 @@ impl Track {
     pub(crate) fn apply(self, t: &mut Tracking) {
         t.retain.lives += 1;
         let life = t.retain.lives;
-        t.retain.cursors.insert(self.output, Cursor { life, at: self.at });
+        t.retain
+            .cursors
+            .insert(self.output, Cursor { life, at: self.at });
     }
 }
 
@@ -278,7 +280,12 @@ impl Cleaned {
 
     pub fn check(&self, t: &Tracking) -> Result<()> {
         let at = t.retain.cursors.get(&self.output);
-        if at != Some(&Cursor { life: self.life, at: self.from }) {
+        if at
+            != Some(&Cursor {
+                life: self.life,
+                at: self.from,
+            })
+        {
             return invalid(format!(
                 "a cleanup step of {} from {} in life {}, its cursor is {at:?}",
                 name(&self.output),
@@ -300,7 +307,9 @@ impl Cleaned {
 
     pub(crate) fn apply(self, t: &mut Tracking) {
         let life = self.life;
-        t.retain.cursors.insert(self.output, Cursor { life, at: self.to });
+        t.retain
+            .cursors
+            .insert(self.output, Cursor { life, at: self.to });
     }
 }
 

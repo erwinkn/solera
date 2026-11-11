@@ -231,7 +231,8 @@ fn retain_merge_plan(
     })
 }
 
-/// Builds `plan`'s merge at `path` (a fresh random token, never reused):
+/// Builds `plan`'s merge at `path` (a fresh random token, never reused;
+/// refused before anything is written if any output's list holds it now):
 /// `{"event", "replaced": [path, ...], "layer"}`. Reads and writes the
 /// whole run: call it off the event loop. Its event is refused if another
 /// merge took its layers since, or the output was retired. Once `event`
@@ -244,6 +245,18 @@ fn retain_merge<'py>(
     path: &str,
 ) -> PyResult<Bound<'py, PyDict>> {
     guard(|| {
+        let held = tracking
+            .state
+            .read()
+            .unwrap()
+            .outputs
+            .values()
+            .any(|o| o.layers.iter().any(|l| l.path == path));
+        if held {
+            return Err(PyValueError::new_err(format!(
+                "the layer path {path} is written twice"
+            )));
+        }
         let ixs = tracking.indexes.read().unwrap().clone();
         let ix = ixs.index(&plan.output).map_err(err)?;
         let (output, layers, cut) = (&plan.output, &plan.layers, plan.cut);

@@ -305,7 +305,8 @@ pub async fn released(
 /// the part to journal, or None when no merge is due. `cut` is [`cut`]'s,
 /// taken with the engine's pins from the state `layers` were read from.
 /// `path` is fresh (the engine's random token): refused, before anything
-/// is written, if the list holds it. It reads and writes the whole run, so
+/// is written, if `layers` holds it (the binding also checks every
+/// output's list at build time). It reads and writes the whole run, so
 /// the engine runs it off its event loop. Once the part applies, its
 /// replaced files may go.
 pub async fn merge(

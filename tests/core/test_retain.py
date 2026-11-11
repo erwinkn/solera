@@ -107,6 +107,15 @@ def test_a_merge_to_a_path_the_list_holds_is_refused_before_it_writes(t, tmp_pat
     assert (tmp_path / "items" / "10").read_bytes() == before
 
 
+def test_a_merge_to_a_path_written_since_its_plan_is_refused_before_it_writes(t, tmp_path):
+    plan = retain_merge_plan(t, b"items")
+    commit(t, ["d"], version=50)
+    before = (tmp_path / "items" / "50").read_bytes()
+    with pytest.raises(ValueError, match="written twice"):
+        retain_merge(t, plan, "items/50")
+    assert (tmp_path / "items" / "50").read_bytes() == before
+
+
 def test_a_merge_is_an_event_of_its_own(t):
     t.apply(retain_step(t, b"items")[2])
     merged = retain_merge(t, retain_merge_plan(t, b"items"), "items/m1")

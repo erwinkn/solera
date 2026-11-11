@@ -773,8 +773,7 @@ fn a_merge_is_refused_unless_it_replaces_adjacent_layers_folds_within_the_cut_an
     let e =
         m.t.check_event(&Event::of(vec![Part::Merged(fold.clone())]));
     assert!(format!("{e:?}").contains("Cursor"), "{e:?}");
-    m.apply(cleaned(&m.t, 0, 4))
-    .unwrap();
+    m.apply(cleaned(&m.t, 0, 4)).unwrap();
     // a consumer's piece at 1 holds it now
     m.apply(Part::Batch(BatchProgress {
         edge: EDGES[0].into(),
@@ -836,8 +835,7 @@ fn a_merge_is_refused_unless_it_replaces_adjacent_layers_folds_within_the_cut_an
 fn a_merge_to_a_held_path_writes_nothing_and_a_merge_shares_no_event() {
     let rt = runtime();
     let mut m = commits(&rt, 4);
-    m.apply(cleaned(&m.t, 0, 4))
-    .unwrap();
+    m.apply(cleaned(&m.t, 0, 4)).unwrap();
     let layers = m.layers();
     let held = layers[0].path.clone();
     let bytes = |m: &Model| {
@@ -876,8 +874,7 @@ fn a_merge_to_a_held_path_writes_nothing_and_a_merge_shares_no_event() {
 fn a_batch_whose_input_folded_past_its_head_is_refused() {
     let rt = runtime();
     let mut m = commits(&rt, 4);
-    m.apply(cleaned(&m.t, 0, 4))
-    .unwrap();
+    m.apply(cleaned(&m.t, 0, 4)).unwrap();
     // an attempt of a fresh consumer planned at 2, unpinned: a merge folds to 3
     let layers = m.layers();
     let layer = rt
@@ -987,8 +984,7 @@ fn step_of(t: &Tracking, pins: &[Pin]) -> Option<(u64, u64)> {
 fn a_per_key_edge_with_failing_keys_holds_the_cut_at_seen() {
     let rt = runtime();
     let mut m = commits(&rt, 4);
-    m.apply(cleaned(&m.t, 0, 4))
-    .unwrap();
+    m.apply(cleaned(&m.t, 0, 4)).unwrap();
     let edge: Id = EDGES[2].into();
     m.t.per_key.insert(
         edge.clone(),
@@ -1020,8 +1016,7 @@ fn the_alarm_names_what_holds_the_cut() {
     let rt = runtime();
     let mut m = commits(&rt, 12);
     let head = m.head();
-    m.apply(cleaned(&m.t, 0, head))
-    .unwrap();
+    m.apply(cleaned(&m.t, 0, head)).unwrap();
     let run = Pin {
         output: items(),
         commit: 1,
@@ -1272,7 +1267,9 @@ fn an_edge_moves_to_an_input_only_above_its_floor() {
             input: input.clone(),
         })
     };
-    let e = m.t.check_event(&Event::of(vec![rename(&items())])).unwrap_err();
+    let e =
+        m.t.check_event(&Event::of(vec![rename(&items())]))
+            .unwrap_err();
     assert!(e.to_string().contains("below its new input's floor"), "{e}");
     m.apply(rename(&other)).unwrap();
     // a per-key edge whose keys fail holds its seen, with no piece at all
