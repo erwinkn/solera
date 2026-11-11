@@ -6,6 +6,7 @@ use object_store::memory::InMemory;
 use object_store::path::Path;
 use object_store::ObjectStoreExt;
 use rand::rngs::SmallRng;
+use rand::seq::SliceRandom;
 use rand::{Rng, SeedableRng};
 use solera_index::*;
 use std::sync::Arc;
@@ -430,6 +431,43 @@ impl World {
                 q.page(want),
                 "{}",
                 ctx(&format!("get({c1}, {ask:?}, {:?})", q.q))
+            );
+            // a dense list: a run of the keys in order, with keys between,
+            // before and after them that no layer holds; sorted as a commit
+            // lists its keys, or shuffled with repeats
+            let mut sorted = h.keys.clone();
+            sorted.sort();
+            let a = rng.random_range(0..=sorted.len());
+            let b = rng.random_range(a..=sorted.len());
+            let mut ask: Vec<Vec<u8>> = Vec::new();
+            if rng.random_bool(0.3) {
+                ask.push(b"\x00".to_vec());
+            }
+            for k in &sorted[a..b] {
+                if rng.random_bool(0.9) {
+                    ask.push(k.clone());
+                }
+                if rng.random_bool(0.3) {
+                    ask.push([&k[..], b"\x00"].concat());
+                }
+            }
+            if rng.random_bool(0.3) {
+                ask.push(b"\xff\xff".to_vec());
+            }
+            if rng.random_bool(0.3) {
+                ask.extend_from_within(..ask.len() / 2);
+                ask.shuffle(rng);
+            }
+            let page = self.ix.get(&self.layers, c1, &ask, &q.q).await.unwrap();
+            let want: Got = (0..h.keys.len())
+                .filter(|&k| q.takes(&h.keys[k]) && ask.contains(&h.keys[k]))
+                .filter_map(|k| present(k, c1))
+                .collect();
+            assert_eq!(
+                strip(got(&page)),
+                q.page(want),
+                "{}",
+                ctx(&format!("dense get({c1}, {ask:?}, {:?})", q.q))
             );
             // history: every entry above the floor, and the state at the floor
             let want: Got = (0..h.keys.len())
@@ -1774,6 +1812,46 @@ fn a_limited_read_fetches_the_index_its_page_needs() {
             fetched[1..].iter().all(|&f| f < 1 << 20),
             "{fetched:?} of {index}"
         );
+    });
+}
+
+/// A read of listed keys opens only the layers whose key span holds one of
+/// them: here the newer layer's file is missing, which a read of keys
+/// outside its span never sees.
+#[test]
+fn a_read_of_listed_keys_skips_the_layers_its_keys_miss() {
+    let rt = runtime();
+    let mem = Arc::new(InMemory::new());
+    let layer = |c: u64, prefix: &str| {
+        let mut w = Writer::new(WriteOptions::default(), c, c, None).unwrap();
+        for i in 0..1000u64 {
+            let key = format!("{prefix}{i:04}");
+            w.push(key.as_bytes(), c, Version::Int(i), Version::Absent)
+                .unwrap();
+        }
+        let h = CommitHeader {
+            commit: c,
+            added: 1000,
+            live: 1000 * c,
+            ..Default::default()
+        };
+        let mut l = w.finish(&[h]).unwrap();
+        l.path = format!("c{c}");
+        (l, w.take())
+    };
+    let (l1, b1) = layer(1, "a");
+    let (l2, _) = layer(2, "z");
+    rt.block_on(async {
+        mem.put(&Path::from("c1"), b1.into()).await.unwrap();
+        let store =
+            Store::new(mem, Path::from(""), rt.handle().clone(), Default::default()).unwrap();
+        let ix = ChangeIndex::new(store, WriteOptions::default());
+        let ls = [l1, l2];
+        let q = Query::default();
+        let p = ix.get(&ls, 2, &[b"a0007", b"m0000"], &q).await.unwrap();
+        assert_eq!(p.run.len(), 1);
+        assert_eq!(p.run.key(0), b"a0007");
+        assert!(ix.get(&ls, 2, &[b"a0007", b"z0007"], &q).await.is_err());
     });
 }
 

@@ -96,9 +96,17 @@ cleanup is one place (K25).
 - A keyed output's write arrives as a `KeyedWrite`, already resolved
   against the engine's key index. A store reads it three ways: `reset` —
   the write is the partition's entire content, so clear the partition first;
-  `chunks()` — the keys to write, a chunk at a time, each `(key, rows)`,
-  only that chunk taken from the write (`iter_chunks()` for a store
-  writing on a thread of its own); and `removes` — the keys to delete.
+  `chunks()` — the keys to write, a `Chunk` of them at a time (`iter_chunks()`
+  for a store writing on a thread of its own); and `removes` — the keys to
+  delete. A chunk is read as columns, each taken from the write only when
+  the store asks: `keys`, sorted; `rows`, every key's rows, a key's after
+  the previous key's; `indices`, where those rows are in what the write was
+  read from (a `range` when they are a run), for a store that writes the
+  producer's Arrow table as it is; and `groups()`, each `(key, rows)`, for
+  a store that writes one object per key. A store writing rows reads
+  `keys` and `rows` and pays nothing per key in Python. Each is taken
+  on the thread that asks, so an async store asks on a thread of its own
+  (`asyncio.to_thread`), as FileStore does for `groups()`.
   Every other key stays as it is. An immutable store writes a key at
   most once per generation (a retried call, the same bytes): the
   generation names its object. A key with zero rows
@@ -562,6 +570,22 @@ then for each of `write.chunks()`, delete its keys and insert their rows
 DISTINCT` of the key column over the partition, through a server-side cursor. A complete
 example, which passes the conformance kit, is
 [`examples/json_table_store.py`](../examples/json_table_store.py).
+
+A chunk is read as columns or, when a store writes one object per key, as
+groups:
+
+```python
+for chunk in write.iter_chunks():  # on the store's own thread
+    # Columns: the chunk's keys, sorted, and every key's rows, a key's after
+    # the previous key's. No Python per key.
+    delete(chunk.keys)
+    insert(chunk.rows)  # or chunk.indices, to take from the producer's Arrow table
+
+async for chunk in write.chunks():  # on the event loop
+    # Groups: each (key, rows). Taken off the loop, as each column is.
+    for key, rows in await asyncio.to_thread(chunk.groups):
+        await put(key, rows)
+```
 
 ### PostgresStore: the version check, and full runs built beside
 

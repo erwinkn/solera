@@ -107,15 +107,19 @@ class JsonTableStore:
             write = KeyedWrite.of(self, write, out, prior)
             if write.reset:  # the partition's whole content: clear it first
                 cur.execute(f"DELETE FROM {table} WHERE part = %s", (context.partition,))
-            for chunk in write.iter_chunks():  # the keys to write: (key, rows)
-                keys = [k for k, _ in chunk]
+            for chunk in write.iter_chunks():  # the keys to write, and each key's rows
                 if not write.reset:
                     cur.execute(
-                        f"DELETE FROM {table} WHERE part = %s AND k = ANY(%s)", (context.partition, keys)
+                        f"DELETE FROM {table} WHERE part = %s AND k = ANY(%s)",
+                        (context.partition, chunk.keys),
                     )
                 cur.executemany(
                     f"INSERT INTO {table} VALUES (%s, %s, NULL, %s, %s)",
-                    [(context.partition, k, Jsonb(dict(r)), version) for k, group in chunk for r in group],
+                    [
+                        (context.partition, k, Jsonb(dict(r)), version)
+                        for k, group in chunk.groups()
+                        for r in group
+                    ],
                 )
             if write.removes:
                 cur.execute(

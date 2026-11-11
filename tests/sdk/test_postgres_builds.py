@@ -1172,7 +1172,8 @@ async def test_a_version_column_of_a_domain_over_bigint_is_written(store):
 
 
 @pytest.mark.xfail(
-    strict=True, reason="also on main: an in-place reset trusts its DELETE (Sol, B8 restarted round 2)"
+    strict=True,
+    reason="ERW-32, also on main: an in-place reset trusts its DELETE (Sol, B8 restarted round 2)",
 )
 async def test_an_in_place_reset_leaves_no_row_an_inheriting_tables_trigger_kept(store):
     """Sol F5 (restarted rounds 1 and 2, also on main): DELETE recurses into a

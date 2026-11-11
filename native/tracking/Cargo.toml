@@ -12,6 +12,11 @@ xxhash-rust = { version = "0.8", features = ["xxh3"] }
 zstd = "0.13"
 
 [dev-dependencies]
+libc = "0.2"
 object_store = "0.14"
 rand = { version = "0.9", features = ["small_rng"] }
 tokio = { version = "1", features = ["rt-multi-thread"] }
+
+[[bench]]
+name = "bulk"
+harness = false

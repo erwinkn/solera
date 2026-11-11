@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
 import os
 import pickle
@@ -373,12 +374,13 @@ def _rows(value: Any, name: str) -> list[dict]:
 @dataclass(frozen=True)
 class Prepared:
     """A keyed write's content, read once (§4, §6): the key index resolves
-    its keys, and the store writes its groups from it.
+    its keys, and the store writes its chunks from it (`KeyedWrite.chunks`).
 
     `rows` are its keys, sorted, each the group of the rows that carry it
     (`solera.keys.Rows`): only the key of a row is read (docs/versions.md).
-    `take(indices)` gives the write's rows at those
-    indices — every row for None — as the store persists them: mappings for
+    `take(indices)` gives the write's rows at those indices — a sequence of
+    ints: a `range` when they are a run, else a `memoryview` — or every row
+    for None, as the store persists them: mappings for
     a rows output, `(key, value)` items for `keyed=True`, a dynamic partitions's
     elements; a store reading types of its own gives its own. A `Patch` also
     names the keys it `removes`, none of them written. `kinds`, when the
@@ -392,22 +394,50 @@ class Prepared:
     removes: tuple[str, ...] = ()
     kinds: Mapping[str, str] | None = None
 
-    def groups(self, keys: Sequence[str]) -> list:
-        """Each key's group, as its store writes it: the list of its rows, a
-        `keyed=True` output's value, or a dynamic partitions's element."""
 
-        try:
-            rows, ends = self.rows.find(list(keys))
-        except KeyError as e:
-            raise StoreError(
-                f"{self.output.name}: asked to write key {e.args[0]!r}, which the write does not hold"
-            ) from None
-        picked = self.take(rows)
-        if self.output.is_dynamic_partitions:
-            return picked
-        if self.output.key == KEYS:
-            return [value for _, value in picked]
-        return [picked[a:b] for a, b in zip([0, *ends], ends, strict=False)]
+class Chunk:
+    """A chunk of a keyed write's keys to write (`KeyedWrite.chunks`), read
+    from the write as columns: `keys`, sorted; `indices`, the positions of
+    every key's rows among the rows the write was read from, a key's after
+    the previous key's, each key's in the write's order — a `range` when
+    they are a run, else a `memoryview` of unsigned ints; `rows`, those rows
+    as `Prepared.take` gives them; and `groups()`, each key with its group,
+    for a store that writes a key at a time. Each is read from the write
+    when the store first asks for it, so a store pays only for what it
+    reads: one that writes the producer's Arrow table as it is takes
+    `indices` from it, and no row becomes a Python object. Each is taken on
+    the thread that asks: an async store asks on a thread of its own."""
+
+    def __init__(self, prepared: Prepared, span: Any):
+        self._prepared, self._span = prepared, span
+
+    def __len__(self) -> int:
+        return len(self._span)
+
+    @functools.cached_property
+    def keys(self) -> list[str]:
+        return self._span.keys()
+
+    @functools.cached_property
+    def indices(self) -> Sequence[int]:
+        return self._span.rows()
+
+    @functools.cached_property
+    def rows(self) -> list:
+        return self._prepared.take(self.indices)
+
+    def groups(self) -> list[tuple[str, Any]]:
+        """Each key with its group, as its store writes it: the list of its
+        rows, a `keyed=True` output's value, or a dynamic partitions's
+        element."""
+
+        output, keys, rows = self._prepared.output, self.keys, self.rows
+        if output.is_dynamic_partitions:
+            return list(zip(keys, rows, strict=True))
+        if output.key == KEYS:
+            return [(key, value) for key, (_, value) in zip(keys, rows, strict=True)]
+        ends = self._span.ends()
+        return [(key, rows[a:b]) for key, a, b in zip(keys, [0, *ends][:-1], ends, strict=True)]
 
 
 @dataclass(frozen=True)
@@ -415,8 +445,8 @@ class KeyedWrite:
     """A keyed output's write as its store takes it: read once
     (`prepared`), resolved against the key index (§4, §6). A store needs
     three things of it: whether it is a `reset`, the partition's whole
-    content (clear the partition first), its `removes`, and its `chunks()` — the keys to write,
-    each with its group.
+    content (clear the partition first), its `removes`, and its `chunks()` — the keys to write
+    and their rows, a `Chunk` at a time.
 
     `upserts` are the keys to write: a collection of them; a
     `solera.keys.layers.DeltaKeys` reading them from the commit's delta
@@ -446,16 +476,16 @@ class KeyedWrite:
         return cls(prepared, removes=frozenset(prepared.removes), value=write)
 
     async def chunks(self, size: int = 100_000):
-        """The keys to write, sorted, a chunk at a time: `(key, group)` each.
-        Only a chunk's groups are taken from the write at once."""
+        """The keys to write, sorted, `size` keys at a time: a `Chunk` each,
+        whose rows are taken from the write only when the store asks."""
 
         if self.upserts is None or isinstance(self.upserts, Collection):
             chunks = self.iter_chunks(size)
             while (chunk := await asyncio.to_thread(next, chunks, None)) is not None:
                 yield chunk
             return
-        async for chunk in self.upserts.chunks(size):
-            yield await asyncio.to_thread(self._grouped, chunk)
+        async for keys in self.upserts.chunks(size):
+            yield await asyncio.to_thread(self._chunk, keys)
 
     def iter_chunks(self, size: int = 100_000):
         """`chunks()`, for a store that writes on a thread of its own. Not for
@@ -463,19 +493,22 @@ class KeyedWrite:
         read it asynchronously."""
 
         if self.upserts is None:
-            from ..keys.layers import key_str
-
-            for keys, _ in self.prepared.rows.chunks(size):
-                yield self._grouped([key_str(k) for k in keys])
+            for span in self.prepared.rows.spans(size):
+                yield Chunk(self.prepared, span)
         elif isinstance(self.upserts, Collection):
             keys = sorted(self.upserts)
             for i in range(0, len(keys), size):
-                yield self._grouped(keys[i : i + size])
+                yield self._chunk(keys[i : i + size])
         else:
             raise StoreError(f"{self.prepared.output.name}: a delta's selection is paged asynchronously")
 
-    def _grouped(self, keys: list[str]) -> list:
-        return list(zip(keys, self.prepared.groups(keys), strict=True))
+    def _chunk(self, keys: list[str]) -> Chunk:
+        try:
+            return Chunk(self.prepared, self.prepared.rows.span(keys))
+        except KeyError as e:
+            raise StoreError(
+                f"{self.prepared.output.name}: asked to write key {e.args[0]!r}, which the write does not hold"
+            ) from None
 
     def changed(self, size: int = 100_000) -> Changed | None:
         """What this write changes once its store wrote it as given
@@ -546,7 +579,7 @@ def prepare(write: Any, output: Output, read: Callable | None = None) -> Prepare
                 payload, empty = flat
             if payload is None:
                 payload = []
-            if not isinstance(payload, list) or not all(isinstance(r, Mapping) for r in payload):
+            if not isinstance(payload, list):  # its rows are mappings: `Rows.records` checks each
                 raise WriteError(
                     f"{name}: this store reads plain rows (a list of mappings), got {type(payload).__name__}"
                 )
@@ -564,7 +597,22 @@ def prepare(write: Any, output: Output, read: Callable | None = None) -> Prepare
 
 
 def _taker(items: list) -> Callable:
-    return lambda rows: items if rows is None else [items[r] for r in rows]
+    return functools.partial(take_list, items)
+
+
+def take_list(items: list, rows: Sequence[int] | None) -> list:
+    """`items` at `rows` (`Prepared.take`): a slice of a run, else one
+    native gather of a `memoryview` of ints."""
+
+    if rows is None:
+        return items
+    if isinstance(rows, range) and rows.step == 1:
+        return items[rows.start : rows.stop]
+    if isinstance(rows, memoryview):
+        from .._native import gather
+
+        return gather(items, rows)
+    return [items[r] for r in rows]
 
 
 def prepare_for(store: Any, write: Any, output: Output) -> Prepared:
