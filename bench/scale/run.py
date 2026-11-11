@@ -719,9 +719,14 @@ def _state_bytes(state: Path) -> dict:
     """Bytes under the engine's state, by its top two directories."""
 
     sizes: Counter = Counter()
-    for path in state.rglob("*"):
-        if path.is_file():
-            sizes["/".join(path.relative_to(state).parts[:2])] += path.stat().st_size
+    for directory, _, names in os.walk(state):
+        for name in names:
+            path = Path(directory, name)
+            try:
+                size = path.stat().st_size
+            except FileNotFoundError:
+                continue
+            sizes["/".join(path.relative_to(state).parts[:2])] += size
     return dict(sizes)
 
 
