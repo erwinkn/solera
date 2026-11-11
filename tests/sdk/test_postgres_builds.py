@@ -1171,6 +1171,29 @@ async def test_a_version_column_of_a_domain_over_bigint_is_written(store):
     assert await store.full_run_ended(out, "", 5, 5) and await solera(store, run.ref) == {"a": "5"}
 
 
+@pytest.mark.xfail(
+    strict=True, reason="also on main: an in-place reset trusts its DELETE (Sol, B8 restarted round 2)"
+)
+async def test_an_in_place_reset_leaves_no_row_an_inheriting_tables_trigger_kept(store):
+    """Sol F5 (restarted rounds 1 and 2, also on main): DELETE recurses into a
+    table that inherits from the output's, and that table's BEFORE DELETE
+    trigger can keep an old row, which Solera then reads beside the reset's.
+    A build refuses such a table; the in-place path does not check for
+    survivors yet."""
+
+    out = output(incremental=True)
+    table, _, _ = store._table(out)
+    child = f'"public"."{out.name}_child"'
+    sql(f"CREATE TABLE {table} (id text, v text, _version bigint)")
+    sql(f"CREATE TABLE {child} () INHERITS ({table})")
+    old = await store.store(rows(a="old"), None, at(out, 1, builds=False))
+    sql(f"INSERT INTO {child} SELECT * FROM ONLY {table}")
+    sql(f"DELETE FROM ONLY {table}")
+    make_trigger(child, f"public.{out.name}_mark", "RETURN NULL;", "BEFORE DELETE")
+    written = await store.store(rows(b="new"), old.ref, at(out, 5, reset=True, builds=False))
+    assert await solera(store, written.ref) == {"b": "new"}
+
+
 async def test_a_partition_cleanup_holds_off_the_partitions_first_writer(store, monkeypatch):
     """Sol R2-1: a cleanup of a partition no version row lists yet locks a
     row of its own for it, so the partition's first writer waits for the
