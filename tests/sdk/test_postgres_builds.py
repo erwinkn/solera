@@ -37,7 +37,7 @@ def output(name=None, **config) -> Output:
     return Output(name or f"t_{uuid.uuid4().hex[:12]}", store="postgres", **config)
 
 
-def at(out, generation, *, reset=False, run=None, partition="", worker="w") -> WriteContext:
+def at(out, generation, *, reset=False, run=None, partition="", worker="w", builds=True) -> WriteContext:
     """The new core's write context: the attempt's version, and the full run
     whose build the write targets (`build_run`)."""
 
@@ -49,7 +49,7 @@ def at(out, generation, *, reset=False, run=None, partition="", worker="w") -> W
         worker_id=worker,
         reset=reset,
         build_run=run,
-        builds=True,
+        builds=builds,
     )
 
 
@@ -555,44 +555,92 @@ async def test_partial_unique_and_exclusion_indexes_fail_the_batch(store):
     assert await solera(store, run.ref) == {"a": "x", "b": "x"}
 
 
-def make_trigger(table, function, body):
+def make_trigger(table, function, body, when="BEFORE INSERT", each="ROW"):
     sql(f"CREATE OR REPLACE FUNCTION {function}() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN {body} END $$")
-    sql(f"CREATE OR REPLACE TRIGGER mark BEFORE INSERT ON {table} FOR EACH ROW EXECUTE FUNCTION {function}()")
+    sql(f"CREATE OR REPLACE TRIGGER mark {when} ON {table} FOR EACH {each} EXECUTE FUNCTION {function}()")
 
 
-async def test_a_table_with_a_before_insert_trigger_runs_its_full_runs_in_place(store):
-    """A switch would run the table's BEFORE INSERT row trigger on rows Solera
-    has already read (Sol, B8 round 1, F2), and the store never alters the
-    user's table to stop it: such a table's full run writes in place, as
-    today, and is published at its first write. A trigger that changes the
-    key fails the write, as in place."""
+# What a switch would run on rows Solera read in the build, which writing them there did not.
+TRIGGERS = {
+    "before insert": ("BEFORE INSERT", "ROW", "NEW.v = NEW.v || '+'; RETURN NEW;"),
+    "after insert, updating its row": (
+        "AFTER INSERT",
+        "ROW",
+        "UPDATE {table} SET v = v || '+' WHERE id = NEW.id; RETURN NULL;",
+    ),
+    "after insert, a statement's": (
+        "AFTER INSERT",
+        "STATEMENT",
+        "UPDATE {table} SET v = v || '+'; RETURN NULL;",
+    ),
+    "before delete": ("BEFORE DELETE", "ROW", "RETURN NULL;"),
+}
 
-    out = output(incremental=True)
+
+@pytest.mark.parametrize("kind", [*TRIGGERS, "insert rule", "a partition's"])
+async def test_a_table_with_a_trigger_never_opens_a_build(store, kind):
+    """A switch would run the table's trigger or rule on rows Solera has
+    read in the build, which writing them there did not (Sol, B8 rounds 1
+    and 2: F2, R2-4; Fable R2-7), and the store never alters the user's
+    table to stop it. A full run of such a table, or of one whose partition
+    has one, is refused at its first write (`PublicationRefused`) and
+    changes nothing; today's path writes in place as before."""
+
+    out = output(incremental=True, partition_column="site")
     table, _, _ = store._table(out)
-    sql(f"CREATE TABLE {table} (id text, v text, _version bigint)")
-    make_trigger(table, f"public.{out.name}_mark", "NEW.v = NEW.v || '+'; RETURN NEW;")
-    first = await store.store(rows(a="old"), None, at(out, 1))
-    run = await store.store(rows(b="new"), first.ref, at(out, 5, reset=True))
-    assert "build" not in run.ref.handle and builds(store, out) == []
-    assert registry(store, out) == (5, 5, [])
-    more = await store.store(Patch(rows(c="more")), run.ref, at(out, 6, run=5))
-    assert await solera(store, more.ref) == outside(store, out) == {"b": "new+", "c": "more+"}
-    assert await store.full_run_ended(out, "", 5, 6)
-    assert outside(store, out) == {"b": "new+", "c": "more+"}
-    make_trigger(table, f"public.{out.name}_mark", "NEW.id = upper(NEW.id); RETURN NEW;")
-    with pytest.raises(WriteError, match="stored as another key"):
-        await store.store(rows(d="next"), more.ref, at(out, 7, reset=True))
+    leaf = f'"public"."{out.name}_rest"'
+    sql(f"CREATE TABLE {table} (id text, v text, site text, _version bigint) PARTITION BY LIST (site)")
+    sql(f"CREATE TABLE {leaf} PARTITION OF {table} DEFAULT")
+    first = await store.store(rows(a="old"), None, at(out, 1, partition="p", builds=False))
+    if kind == "a partition's":
+        make_trigger(leaf, f"public.{out.name}_mark", "NEW.id = upper(NEW.id); RETURN NEW;")
+    elif kind == "insert rule":
+        sql(f"CREATE RULE mark AS ON INSERT TO {leaf} DO ALSO NOTIFY solera_mark")
+    else:
+        when, each, body = TRIGGERS[kind]
+        make_trigger(table, f"public.{out.name}_mark", body.format(table=table), when, each)
+    with pytest.raises(PublicationRefused, match="trigger or rule"):
+        await store.store(rows(b="new"), first.ref, at(out, 5, reset=True, partition="p"))
+    assert outside(store, out, "p") == {"a": "old"}
+    assert registry(store, out, "p") == (1, None, []) and builds(store, out, "p") == []
+    if kind == "before insert":
+        written = await store.store(
+            rows(b="new"), first.ref, at(out, 5, reset=True, partition="p", builds=False)
+        )
+        assert await solera(store, written.ref) == outside(store, out, "p") == {"b": "new+"}
 
 
-async def test_a_before_insert_trigger_added_during_a_full_run_refuses_its_publication(store):
+async def test_a_trigger_added_during_a_full_run_refuses_its_publication(store):
     out = output(incremental=True)
     table, _, _ = store._table(out)
     first = await store.store(rows(a="old"), None, at(out, 1))
     await store.store(rows(b="new"), first.ref, at(out, 5, reset=True))
     make_trigger(table, f"public.{out.name}_mark", "NEW.v = NEW.v || '+'; RETURN NEW;")
-    with pytest.raises(PublicationRefused, match="BEFORE INSERT row trigger"):
+    with pytest.raises(PublicationRefused, match="trigger or rule"):
         await store.full_run_ended(out, "", 5, 5)
     assert outside(store, out) == {"a": "old"} and registry(store, out) == (5, None, [5])
+
+
+async def test_a_trigger_committed_as_the_switch_begins_refuses_it(store, monkeypatch):
+    """Sol R2-3: a trigger committed after the switch began, before its
+    DELETE locks the table, fires on its rows; the switch reads the catalog
+    after them, so it sees the trigger, and refuses the publication whole.
+    One committed after that waits for the switch to commit."""
+
+    out = output(incremental=True)
+    table, _, _ = store._table(out)
+    first = await store.store(rows(a="old"), None, at(out, 1))
+    run = await store.store(rows(a="new"), first.ref, at(out, 5, reset=True))
+    delete = store._delete_slice
+
+    def and_a_trigger(cur, target, where):
+        make_trigger(table, f"public.{out.name}_mark", "NEW.id = upper(NEW.id); RETURN NEW;")
+        delete(cur, target, where)
+
+    monkeypatch.setattr(store, "_delete_slice", and_a_trigger)
+    with pytest.raises(PublicationRefused, match="trigger or rule"):
+        await store.full_run_ended(out, "", 5, 5)
+    assert outside(store, out) == {"a": "old"} and await solera(store, run.ref) == {"a": "new"}
 
 
 async def test_a_build_keeps_only_its_unique_and_key_indexes(store):
@@ -950,6 +998,127 @@ async def test_an_empty_first_write_with_declared_columns_makes_the_table_as_tod
     assert written.ref is None
 
 
+async def test_a_pending_run_opens_its_build_though_another_partition_made_the_table(store):
+    """Sol R2-5, Fable R2-1: a run whose first batch made nothing is recorded
+    as pending, not inferred from the table being absent: once another
+    partition makes the table, the run's first rows still open its build,
+    and its switch publishes them. A pending run that never wrote a row
+    publishes an empty partition."""
+
+    out = output(incremental=True, partition_column="site")
+    assert (await store.store([], None, at(out, 5, reset=True, partition="p1"))).ref is None
+    assert (await store.store([], None, at(out, 6, reset=True, partition="p3"))).ref is None
+    assert sql("SELECT to_regclass(%s)", (store._table(out)[0],)) == [(None,)]
+    await store.store(rows(z="other"), None, at(out, 1, partition="p2", builds=False))
+    batch = await store.store(Patch(rows(a="first")), None, at(out, 7, run=5, partition="p1"))
+    assert batch.ref.handle["build"] == 5 and builds(store, out, "p1") == [5]
+    assert outside(store, out, "p1") == {} and await solera(store, batch.ref) == {"a": "first"}
+    assert await store.full_run_ended(out, "p1", 5, 7)
+    assert outside(store, out, "p1") == {"a": "first"} and registry(store, out, "p1") == (7, 5, [])
+    assert await store.full_run_ended(out, "p3", 6, 6)
+    assert outside(store, out, "p3") == {} and registry(store, out, "p3") == (6, 6, [])
+    assert sql("SELECT pending FROM public.solera_versions WHERE rel = %s", (store._table(out)[0],)) == [
+        ([],),
+        ([],),
+        ([],),
+    ]
+
+
+async def test_a_build_lost_with_its_table_fails_its_runs_writes(store):
+    """Sol R2-2, Fable R2-3: the user's table and the build both gone (a
+    restore, or a migration that drops the table): the run's next batch
+    fails (`RunLost`) rather than open the build again, empty."""
+
+    from solera.stores import RunLost
+    from solera_postgres import BUILD_SCHEMA, _build_name, _qname
+
+    out = output(incremental=True)
+    table, _, _ = store._table(out)
+    old = await store.store(rows(z="old"), None, at(out, 1))
+    run = await store.store(rows(a="committed"), old.ref, at(out, 5, reset=True))
+    sql(f"DROP TABLE {_qname(BUILD_SCHEMA, _build_name(table, '', 5))}")
+    sql(f"DROP TABLE {table}")
+    with pytest.raises(RunLost):
+        await store.store(Patch(rows(b="next")), run.ref, at(out, 6, run=5))
+    with pytest.raises(RunLost):
+        await store.store(rows(a="committed"), old.ref, at(out, 5, reset=True))
+    assert await store.full_run_ended(out, "", 5, 6) is False
+    other = output(incremental=True)
+    first = await store.store(rows(a="1"), None, at(other, 1))
+    await store.store(rows(a="5"), first.ref, at(other, 5, reset=True))
+    await store.migrate(
+        other, [Migration("drop", f"DROP TABLE {store._table(other)[0]}")], at(other, 6), first.ref
+    )
+    with pytest.raises(RunLost):
+        await store.store(Patch(rows(b="6")), None, at(other, 7, run=5))
+
+
+async def test_a_partition_cleanup_holds_off_the_partitions_first_writer(store, monkeypatch):
+    """Sol R2-1: a cleanup of a partition no version row lists yet locks a
+    row of its own for it, so the partition's first writer waits for the
+    cleanup to commit, and the cleanup never deletes what that writer
+    wrote."""
+
+    out = output(incremental=True, partition_column="site")
+    await store.store(rows(z="other"), None, at(out, 1, partition="p2"))
+    entered, release = threading.Event(), threading.Event()
+    builds_of = store._builds_of
+
+    def paused(cur, table, partitions):
+        if "p1" in partitions:
+            entered.set()
+            assert release.wait(10)
+        return builds_of(cur, table, partitions)
+
+    monkeypatch.setattr(store, "_builds_of", paused)
+    cleanup = in_thread(store.cleanup(out, partition="p1", before=5))
+    assert entered.wait(10)
+    writer = in_thread(store.store(rows(a="new-life"), None, at(out, 10, partition="p1")))
+    assert not writer[1].wait(1)
+    release.set()
+    for thread, done, errors, _ in (cleanup, writer):
+        thread.join(10)
+        assert done.is_set() and not errors, errors
+    assert outside(store, out, "p1") == {"a": "new-life"} and registry(store, out, "p1") == (10, None, [])
+
+
+async def test_a_remove_with_no_table_writes_nothing(store):
+    """Fable R2-10: a Patch of removes alone, with no table and no declared
+    columns, has no row to remove and no shape to make a table from."""
+
+    from solera.sdk import TableRef
+
+    out = output(incremental=True)
+    prior = TableRef(
+        output=out.name, store="", handle={"table": store._table(out)[0], "where": {}, "key": "id"}
+    )
+    written = await store.store(Patch([], remove=["a"]), prior, at(out, 3))
+    assert written.ref is None and sql("SELECT to_regclass(%s)", (store._table(out)[0],)) == [(None,)]
+
+
+async def test_a_migration_that_meets_a_load_of_a_build_runs_again(store):
+    """Fable R2-5: a migration that cannot drop a build a load is reading
+    fails with a retryable error and changes nothing."""
+
+    import psycopg
+    from solera_postgres import BUILD_SCHEMA, BuildInUse, _build_name, _qname
+
+    out = output(incremental=True)
+    table, _, _ = store._table(out)
+    first = await store.store(rows(a="1"), None, at(out, 1))
+    await store.store(rows(a="5"), first.ref, at(out, 5, reset=True))
+    with psycopg.connect(DSN) as reader:
+        reader.execute(f"SELECT * FROM {_qname(BUILD_SCHEMA, _build_name(table, '', 5))}").fetchall()
+        with pytest.raises(BuildInUse) as refused:
+            await store.migrate(
+                out, [Migration("n", f"ALTER TABLE {table} ADD COLUMN n bigint")], at(out, 6), first.ref
+            )
+    assert refused.value.retryable and builds(store, out) == [5]
+    assert await store.migrate(
+        out, [Migration("n", f"ALTER TABLE {table} ADD COLUMN n bigint")], at(out, 6), first.ref
+    ) == ["n"]
+
+
 async def test_a_migration_drops_the_builds_and_their_run_starts_over(store):
     """M2: a migration changes the user's table alone, so a build would
     publish rows from before it. The migration drops the table's builds,
@@ -1230,13 +1399,15 @@ async def test_the_version_check_is_one_statement_in_the_writes_first_round_trip
 # -- a random history against the decided model -------------------------------------------
 
 
-def _random_history(store, out, seed: int, steps: int) -> None:
+def _random_history(store, out, seed: int, steps: int, bare: bool = False) -> None:
     """Writes, late writes, replays and switches on two partitions of one
     table, each partition against the model the design was checked with
     (tests/tracking/fullrun.py, a table with every rule on): after every step
-    the published rows, the registered builds and each build's rows, with
+    the published rows, the registered runs and each build's rows, with
     their versions, are the model's, and no build is left that the registry
-    does not list. Each call's outcome (refused, published) is the model's."""
+    does not list. Each call's outcome (refused, published) is the model's.
+    `bare`: no table to begin with and no declared columns, so a run whose
+    first writes are empty is pending until one has rows."""
 
     from solera.sdk import TableRef
     from solera_postgres import BUILD_SCHEMA, _build_name, _qname
@@ -1275,25 +1446,40 @@ def _random_history(store, out, seed: int, steps: int) -> None:
             return
         assert not refused, (seed, attempt, "the store took a write the model refuses")
         last[p] = attempt
+        if written.ref is None:  # nothing made: no table, and the write had no rows
+            assert not model.builds.get(context.generation if clear else context.build_run), (seed, attempt)
+            assert not model.published, (seed, attempt)
+            return
         expected = model.builds.get(written.ref.handle.get("build"), model.published)
         loaded = {r["id"]: r["v"] for r in asyncio.run(store.load(written.ref, list[dict], None))}
         assert loaded == {k: f"{row.version}{k}" for k, row in expected.items()}, (seed, attempt)
 
     def check(p):
+        from solera_postgres import VERSIONS_TABLE
+
         model = models[p]
-        found = sql(f"SELECT id, v, _version FROM {table} WHERE site = %s", (p,)) or []
-        assert {k: (v, g) for k, v, g in found} == {
+        present = sql("SELECT to_regclass(%s) IS NOT NULL", (table,))[0][0]
+        found = sql(f"SELECT id, v, _version FROM {table} WHERE site = %s", (p,)) if present else []
+        assert {k: (v, g) for k, v, g in found or []} == {
             k: (f"{r.version}{k}", r.version) for k, r in model.published.items()
         }, (seed, p, "published")
-        registered = (registry(store, out, p) or (0, None, []))[2]
-        assert sorted(registered) == sorted(model.builds) == builds(store, out, p), (seed, p, "builds")
+        registered, pending = (
+            sql(f"SELECT builds, pending FROM {VERSIONS_TABLE} WHERE rel = %s AND part = %s", (table, p))
+            or [([], [])]
+        )[0]
+        assert sorted(registered + pending) == sorted(model.builds), (seed, p, "runs")
+        assert sorted(registered) == builds(store, out, p), (seed, p, "builds")
+        assert all(not model.builds[run] for run in pending), (seed, p, "pending")
         for run, rows_ in model.builds.items():
+            if run in pending:
+                continue
             found = sql(f"SELECT id, v, _version FROM {_qname(BUILD_SCHEMA, _build_name(table, p, run))}")
             assert {k: (v, g) for k, v, g in found} == {
                 k: (f"{r.version}{k}", r.version) for k, r in rows_.items()
             }, (seed, p, run)
 
-    sql(f"CREATE TABLE {table} (id text, v text, site text, _version bigint)")
+    if not bare:
+        sql(f"CREATE TABLE {table} (id text, v text, site text, _version bigint)")
     for _ in range(steps):
         p = rng.choice(sorted(models))
         model, roll = models[p], rng.random()
@@ -1326,5 +1512,6 @@ def _random_history(store, out, seed: int, steps: int) -> None:
 
 
 @pytest.mark.parametrize("seed", range(int(os.environ.get("SOLERA_RANDOM_HISTORIES", "12"))))
-def test_a_random_history_matches_the_model(store, seed):
-    _random_history(store, output(incremental=True, partition_column="site"), seed, steps=40)
+@pytest.mark.parametrize("bare", [False, True], ids=["table", "bare"])
+def test_a_random_history_matches_the_model(store, seed, bare):
+    _random_history(store, output(incremental=True, partition_column="site"), seed, steps=40, bare=bare)

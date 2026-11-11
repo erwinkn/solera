@@ -1232,6 +1232,9 @@ commits or the engine restarts. A write of a run whose build is gone (a
 migration drops a table's builds before it runs; a restore may lose
 them) fails with `RunLost` and changes nothing: the engine starts the
 partition's full run over, and the lost run's call says not published.
+A full run's first write to a table with a trigger or rule that an
+`INSERT` or a `DELETE` runs fails with `PublicationRefused`: the switch
+would run it on rows Solera has read. Such an output is written in place.
 A call the engine gave up on at a restart is never noticed. It calls again after a crash, and as obligation 5 says
 while the call fails; a repeat for a published run does nothing and says published. **An input taken by reference** (a `TableRef` its consumer queries
 itself) reads what outsiders read, so the gate counts its upstream
