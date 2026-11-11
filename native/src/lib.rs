@@ -729,7 +729,7 @@ impl ChangeBlocks {
                 (Some(k), Some(r)) if k < r => (k, Change::Upsert(word)),
                 (_, Some(r)) => (r, Change::Removed),
             };
-            changes.push(key, change).map_err(commit_py::err)?;
+            changes.push(key, change).map_err(tracking_py::err)?;
             match change {
                 Change::Removed => self.next += 1,
                 Change::Upsert(_) => self.held = false,

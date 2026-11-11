@@ -10,6 +10,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 
+use pyo3::create_exception;
 use pyo3::exceptions::{PyKeyError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList, PyString, PyTuple};
@@ -23,11 +24,19 @@ use tr::progress::{Class, Conditions, Key, Matcher, Pat, Patterns};
 use crate::index_py::{key, layers_in, rt, version, ChangeIndex, Owned};
 use crate::{guard, FormatError};
 
+create_exception!(
+    _native,
+    UnsettledError,
+    PyValueError,
+    "A batch's fence refuses its commit: the input became unsettled since the commit was built."
+);
+
 pub(crate) fn err(e: tr::Error) -> PyErr {
     match e {
         tr::Error::Format(m) => FormatError::new_err(m),
         tr::Error::Invalid(m) => PyValueError::new_err(m),
         tr::Error::Index(e) => crate::index_py::err(e),
+        tr::Error::Unsettled => UnsettledError::new_err(tr::error::UNSETTLED),
     }
 }
 
@@ -1032,6 +1041,7 @@ fn outcome_backoff(tries: u64) -> f64 {
 }
 
 pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add("UnsettledError", m.py().get_type::<UnsettledError>())?;
     m.add_function(wrap_pyfunction!(outcome_transition, m)?)?;
     m.add_function(wrap_pyfunction!(outcome_eligible, m)?)?;
     m.add_function(wrap_pyfunction!(outcome_backoff, m)?)?;
