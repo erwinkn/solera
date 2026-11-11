@@ -134,6 +134,54 @@ def test_dep_1_outside_git_the_modules_are_the_build(tmp_path, monkeypatch):
     assert build(pkg)["id"] != first["id"]
 
 
+POOLED = """
+from solera.executors import Pool
+from solera.sdk import Project, asset
+from solera.stores import FileStore
+
+
+@asset(executor=Pool("workers")())
+def made():
+    return {{"v": 1}}
+
+
+project = Project(assets=[made], default_store=FileStore({data!r}))
+"""
+
+
+def imported(path) -> Project:
+    """The project a fresh import of `path` builds, as a worker's process does."""
+
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(f"pooled_{uuid.uuid4().hex}", path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module.project
+
+
+async def test_dep_1_a_commit_of_the_same_code_is_the_same_deploy(solera, repo):
+    """The commit is shown, not digested: an attempt launched before a commit
+    of unchanged code, and one launched after it, both run on a worker that
+    imported the project after it."""
+
+    pkg = repo / "pkg"
+    (pkg / "pooled.py").write_text(POOLED.format(data=str(solera.root / "data")))
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "two")
+    served = imported(pkg / "pooled.py")
+    await solera.deploy(served)
+    first = await solera.submit("made")
+    git(repo, "commit", "--allow-empty", "-qm", "three")
+    after = imported(pkg / "pooled.py")
+    assert after.manifest["build"]["commit"] != served.manifest["build"]["commit"]
+    assert after.manifest["deploy"] == served.manifest["deploy"]
+    for run in (first, await solera.submit("made")):
+        assert await solera.work("workers", imported(pkg / "pooled.py")) == 0
+        assert (await solera.wait(run))["request"]["status"] == "succeeded"
+
+
 def test_dep_1_the_error_policy_changes_the_deploy(monkeypatch):
     """Review 9: classifying an error differently is a different project."""
 

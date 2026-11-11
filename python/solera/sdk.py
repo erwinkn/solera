@@ -1933,6 +1933,7 @@ class Project:
                 raise RegistrationError(f"store {name!r}: {error}") from None
             if built_in is not None:
                 store_records[name]["built_in"] = built_in
+        build = build_identity(self.home, self.build, build_modules(self.home, self._roots()))
         body = {
             "name": self.name,
             "assets": manifest_assets,
@@ -1945,11 +1946,12 @@ class Project:
             "automations": automation_records,
             "sensors": sensor_records,
             "retention": self.retention.spec() if self.retention else None,
-            "build": build_identity(self.home, self.build, build_modules(self.home, self._roots())),
+            # The git commit is shown, not digested: a commit of the same code is the same deploy.
+            "build": {k: v for k, v in build.items() if k != "commit"},
             # How user errors are classified changes what failures become (per-key §8).
             "errors": describe_errors(self.errors),
         }
-        return {**body, "deploy": digest(body)}
+        return {**body, "build": build, "deploy": digest(body)}
 
     def files(self) -> list[str]:
         """The source files of the code the project runs (`solera.build.modules`):

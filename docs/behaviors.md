@@ -1077,9 +1077,10 @@ its commit. The retry's `ctx.load()` would return 5, which is not
 
 **DEP-1. A deploy is the manifest plus the code the project runs.**
 Editing `helpers.py` (committed or not) is a new deploy; a note or data
-file beside the project is not. `SOLERA_BUILD` wins when set. The engine
+file beside the project is not, and neither is a commit of unchanged code:
+the commit is shown, not digested. `SOLERA_BUILD` wins when set. The engine
 numbers deploys as it serves them.
-*From* D174. *Covered* `contract/test_dep.py::test_dep_1_an_explicit_build_wins`; `contract/test_dep.py::test_dep_1_the_build_is_the_code_the_project_runs`; `contract/test_dep.py::test_dep_1_outside_git_the_modules_are_the_build`; `contract/test_dep.py::test_dep_1_the_error_policy_changes_the_deploy`; `contract/test_dep.py::test_dep_1_the_engine_numbers_deploys_as_it_serves_them`; `sdk/test_build.py::test_the_deploy_number_counts_served_deploys`.
+*From* D174. *Covered* `contract/test_dep.py::test_dep_1_an_explicit_build_wins`; `contract/test_dep.py::test_dep_1_a_commit_of_the_same_code_is_the_same_deploy`; `contract/test_dep.py::test_dep_1_the_build_is_the_code_the_project_runs`; `contract/test_dep.py::test_dep_1_outside_git_the_modules_are_the_build`; `contract/test_dep.py::test_dep_1_the_error_policy_changes_the_deploy`; `contract/test_dep.py::test_dep_1_the_engine_numbers_deploys_as_it_serves_them`; `sdk/test_build.py::test_the_deploy_number_counts_served_deploys`.
 
 **DEP-2. A local serve reloads on code changes; a broken edit keeps the current deploy.**
 On by default for `--insecure` loopback serves, `--reload` elsewhere.
