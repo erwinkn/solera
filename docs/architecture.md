@@ -899,7 +899,9 @@ attempts that fit and have not started, oldest first; they race for each
 attempt by swapping its control file to `owned`, and the winner runs it
 like any attempt. No registration, no leases: a pool worker's liveness is
 its attempt's heartbeat. An owner that never reports is ended, classified
-from its control file, and retried under a new attempt id.
+from its control file, and retried under a new attempt id. Each attempt
+is a process of its own, forked from a forkserver that imported the
+project once per deploy (`lifecycle.md` §10).
 
 ## 11. Registration
 

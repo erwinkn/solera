@@ -328,23 +328,75 @@ project = Project(assets=[lingering])
 """
 
 
+SOCKET_AT_IMPORT = """
+import socket
+from solera.executors import Pool
+from solera.sdk import Project, asset
+
+client = socket.socketpair()  # a client's connection, opened at import
+
+@asset(executor=Pool("ingest")())
+def lingering() -> int:
+    return 1
+
+project = Project(assets=[lingering])
+"""
+
+
+async def offered(engine, run_id: str, pool: str = "ingest") -> dict:
+    """The stage of `run_id`'s attempt once `pool`'s workers are offered it."""
+
+    for _ in range(3000):  # offered once its launch is durable (F26): a loaded machine flushes late
+        await engine.tick()
+        for stage in await engine.pool_work(pool, {}, "w1", 0):
+            if stage["run"] == run_id:
+                return stage
+        await asyncio.sleep(0.02)
+    raise AssertionError(f"no attempt of {run_id} was offered")
+
+
+async def ticking(engine, work):
+    """Await `work` while the engine ticks, as a served engine would."""
+
+    work = asyncio.ensure_future(work)
+    while not work.done():
+        await engine.tick()
+        await asyncio.wait([work], timeout=0.05)
+    return work.result()
+
+
+def imported(path) -> list[str]:
+    """Each import of a project that records them: the pid that imported it."""
+
+    return path.read_text().split()
+
+
 @pytest.mark.parametrize(
-    "source",
-    [LINGERING.format(executor='(executor=Pool("ingest")())'), ABANDONED_CALL, LOCKED_AT_IMPORT],
-    ids=["thread", "executor-call", "locked-at-import"],
+    ("source", "preloaded"),
+    [
+        (LINGERING.format(executor='(executor=Pool("ingest")())'), None),
+        (ABANDONED_CALL, None),
+        (LOCKED_AT_IMPORT, "left 1 thread(s) running"),
+        (SOCKET_AT_IMPORT, "left 2 socket(s) or pipe(s) open"),
+    ],
+    ids=["thread", "executor-call", "thread-at-import", "socket-at-import"],
 )
-async def test_a_pool_attempt_runs_in_a_child_of_the_warm_worker(state, tmp_path, monkeypatch, source):
-    """D5: the pool worker forks a child per attempt from its imported
-    project; the child ends with its attempt, threads it left included — a
-    call left in the loop's executor too (review round 3, #3)."""
+async def test_a_pool_attempt_runs_in_a_child_of_the_forkserver(
+    state, tmp_path, monkeypatch, source, preloaded
+):
+    """D5: the pool worker forks a child per attempt from its forkserver;
+    the child ends with its attempt, threads it left included — a call left
+    in the loop's executor too (review round 3, #3). The forkserver keeps
+    the project it imported, and the attempt imports nothing, unless that
+    import left a thread (one holding a lock the child would inherit held)
+    or a socket behind: then it says why, and the attempt imports the
+    project itself (ERW-36)."""
 
     import subprocess
     import sys
 
     imports = tmp_path / "imports.txt"
-    recorded = (
-        f"open({str(imports)!r}, 'a').write('imported\\n')\n"  # each import of the project leaves a line
-    )
+    recorded = f"import os; open({str(imports)!r}, 'a').write(f'{{os.getpid()}}\\n')\n"
     entrypoint = write_project(tmp_path, recorded + source)
     monkeypatch.setenv("SOLERA_PROJECT", entrypoint)
     # A short grace: the engine reads the claim and the result without the worker's
@@ -352,17 +404,15 @@ async def test_a_pool_attempt_runs_in_a_child_of_the_warm_worker(state, tmp_path
     engine = make_engine(state, entrypoint, heartbeat_seconds=0.2, pool_offered_grace=0.5)
     await engine.initialize()
     run = await engine.submit(["lingering"])
-    for _ in range(3000):  # offered once its launch is durable (F26): a loaded machine flushes late
-        await engine.tick()
-        if offered := await engine.pool_work("ingest", {}, "w1", 0):
-            break
-        await asyncio.sleep(0.02)
-    [stage] = offered
-    # A pool worker's own process; its attempts start from a forkserver with the project imported.
+    stage = await offered(engine, run["id"])
+    # A pool worker's own process; it prints its forkserver's pid and the attempt's exit code.
     worker = (
-        "import asyncio, json, sys\n"
-        "from solera_worker.worker import _forked\n"
-        "print(asyncio.run(_forked(json.loads(sys.argv[1]), None)))\n"
+        "import json, sys\n"
+        "from solera_worker.forkserver import Attempts\n"
+        "attempts = Attempts(sys.argv[2])\n"
+        "code = attempts.run(json.loads(sys.argv[1]), None)\n"
+        "print(attempts.server.process.pid, code)\n"
+        "attempts.close()\n"
     )
     started = asyncio.get_running_loop().time()
     done = await asyncio.to_thread(
@@ -372,12 +422,191 @@ async def test_a_pool_attempt_runs_in_a_child_of_the_warm_worker(state, tmp_path
         text=True,
         timeout=55,
     )
-    assert done.stdout.strip().splitlines()[-1] == "0", done.stderr
+    server, code = done.stdout.strip().splitlines()[-1].split()
+    assert code == "0", done.stderr
     assert asyncio.get_running_loop().time() - started < 45  # not the lingering minute, under load too
-    # By this test's engine, and by the attempt's child: never in the forkserver it was forked from.
-    assert imports.read_text().count("imported") == 2
+    pids = imported(imports)
+    assert pids[0] == str(os.getpid())  # this test's engine
+    if preloaded is None:
+        assert pids[1:] == [server] and "warning" not in done.stderr  # the forkserver's: the attempt's is its
+    else:
+        # A forkserver that refused the project, then the attempt's own process.
+        assert len(pids) == 3 and server not in pids
+        assert (
+            f"warning: attempts import the project themselves: importing the project {preloaded}"
+            in done.stderr
+        )
     detail = await engine.run_until(run["id"], 60)
     assert detail["request"]["status"] == "succeeded"
+
+
+PRELOADS = """
+import json, os, socket, sys, threading, time
+from solera_worker.forkserver import _preload, _threads
+
+done = threading.Event()
+
+def project(left):
+    def load(entrypoint):
+        if left == "raise":
+            raise ImportError("no module named numpi")
+        if left == "exit":
+            sys.exit(2)
+        if left == "thread":
+            load.kept = threading.Thread(target=done.wait)
+            load.kept.start()
+        if left == "socket":
+            load.kept = socket.socketpair()
+        if left == "pipe":
+            load.kept = os.pipe()
+        return "project"
+
+    return load
+
+found = {}
+for left in ("nothing", "raise", "exit", "thread", "socket", "pipe"):
+    load = project(left)
+    found[left] = _preload("p", load)
+    if left == "thread":
+        done.set()
+        load.kept.join()
+        while _threads() > 1:  # joined, and its OS thread gone too
+            time.sleep(0.01)
+print(json.dumps(found))
+"""
+
+
+def test_the_forkserver_keeps_only_a_project_whose_import_left_nothing_running():
+    """ERW-36: a forkserver keeps the project only if importing it raised
+    nothing and left no thread, socket or pipe behind; else it says why.
+    Run as a forkserver is: in a process of one thread."""
+
+    import subprocess
+    import sys
+
+    done = subprocess.run([sys.executable, "-c", PRELOADS], capture_output=True, text=True, timeout=60)
+    found = json.loads(done.stdout.strip().splitlines()[-1])
+    assert found["nothing"] == ["project", None]
+    assert found["raise"] == [None, "importing the project raised ImportError: no module named numpi"]
+    assert found["exit"] == [None, "importing the project raised SystemExit: 2"]
+    assert found["thread"] == [None, "importing the project left 1 thread(s) running beside the main one"]
+    for left in ("socket", "pipe"):
+        assert found[left] == [
+            None,
+            "importing the project left 2 socket(s) or pipe(s) open, which every attempt would share",
+        ]
+
+
+HELD = """
+import os, time
+from solera.executors import Pool
+from solera.sdk import Project, asset
+
+@asset(executor=Pool("ingest")())
+def held() -> int:
+    open({ran!r}, "a").write(f"{{os.getpid()}}\\n")
+    while os.path.exists({hold!r}):  # until the test lets go: only a forced cancel ends it sooner
+        time.sleep(0.05)
+    return 1
+
+project = Project(assets=[held])
+"""
+
+
+async def test_a_forced_cancel_ends_its_attempt_and_not_the_forkserver(state, tmp_path, monkeypatch):
+    """ERW-36: an attempt forked from a preloaded forkserver is still a
+    process of its own. A forced cancel ends it, its forkserver lives on,
+    and the next attempt is forked from the same forkserver, importing
+    nothing."""
+
+    from solera_worker.forkserver import Attempts
+
+    ran, hold = tmp_path / "ran.txt", tmp_path / "hold"
+    hold.touch()
+    entrypoint = write_project(tmp_path, HELD.format(ran=str(ran), hold=str(hold)))
+    monkeypatch.setenv("SOLERA_PROJECT", entrypoint)
+    engine = make_engine(state, entrypoint, heartbeat_seconds=0.2, pool_offered_grace=0.5, cancel_grace=0.3)
+    await engine.initialize()
+    attempts = Attempts(entrypoint)
+    try:
+        first = await engine.submit(["held"])
+        attempt = asyncio.create_task(
+            asyncio.to_thread(attempts.run, await offered(engine, first["id"]), None)
+        )
+
+        async def computing():
+            while not ran.exists():
+                await asyncio.sleep(0.02)
+
+        await ticking(engine, computing())
+        server = attempts.server.process
+        [child] = map(int, imported(ran))
+        assert child != server.pid
+        await engine.cancel(first["id"])
+        assert await ticking(engine, attempt) == 3  # ENDED: the engine forced it
+        assert (await engine.run_until(first["id"], 60))["request"]["status"] == "canceled"
+        with pytest.raises(ProcessLookupError):
+            os.kill(child, 0)  # ended, and reaped by its forkserver
+        assert server.poll() is None and attempts.server.process is server
+        hold.unlink()
+        second = await engine.submit(["held"])
+        stage = await offered(engine, second["id"])
+        assert await ticking(engine, asyncio.to_thread(attempts.run, stage, None)) == 0
+        assert attempts.server.process is server and server.poll() is None
+        assert (await engine.run_until(second["id"], 60))["request"]["status"] == "succeeded"
+    finally:
+        attempts.close()
+
+
+VERSIONED = """
+import os
+from solera.executors import Pool
+from solera.sdk import Project, asset
+
+@asset(executor=Pool("ingest")())
+def versioned() -> int:
+    open({ran!r}, "a").write("{version}\\n")
+    return {version}
+
+project = Project(assets=[versioned])
+"""
+
+
+async def test_a_redeploy_reaches_the_next_pool_attempt(state, tmp_path, monkeypatch):
+    """ERW-36: a forkserver serves the deploy it imported. When the engine
+    serves another (a reload of changed code), the next attempt's spec names
+    it: the forkserver is replaced, and the attempt runs the new code, not
+    the code imported before and not a deploy mismatch."""
+
+    from solera_worker.forkserver import Attempts
+
+    ran = tmp_path / "ran.txt"
+    entrypoint = write_project(tmp_path, VERSIONED.format(ran=str(ran), version=1))
+    monkeypatch.setenv("SOLERA_PROJECT", entrypoint)
+    engine = make_engine(state, entrypoint, heartbeat_seconds=0.2, pool_offered_grace=0.5)
+    await engine.initialize()
+    attempts = Attempts(entrypoint)
+    try:
+        first = await engine.submit(["versioned"])
+        assert (
+            await ticking(engine, asyncio.to_thread(attempts.run, await offered(engine, first["id"]), None))
+            == 0
+        )
+        assert (await engine.run_until(first["id"], 60))["request"]["status"] == "succeeded"
+        before = attempts.server
+        write_project(tmp_path, VERSIONED.format(ran=str(ran), version=2))
+        assert engine.redeploy(load_project(entrypoint).manifest)
+        second = await engine.submit(["versioned"])
+        assert (
+            await ticking(engine, asyncio.to_thread(attempts.run, await offered(engine, second["id"]), None))
+            == 0
+        )
+        assert (await engine.run_until(second["id"], 60))["request"]["status"] == "succeeded"
+        assert ran.read_text().split() == ["1", "2"]
+        assert attempts.server is not before and before.process.poll() is not None
+        assert attempts.server.deploy == engine.manifest["deploy"] != before.deploy
+    finally:
+        attempts.close()
 
 
 def test_a_worker_of_plain_rows_imports_no_dataframe_library(tmp_path):

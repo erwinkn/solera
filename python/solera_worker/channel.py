@@ -17,8 +17,19 @@ raises `Ended` when the engine says the attempt is over for this worker
 from __future__ import annotations
 
 import asyncio
+import functools
 
 from solera.lifecycle import Ended
+
+
+@functools.cache
+def _ssl_context():
+    """One SSL context for every client of the process: each costs a read of
+    the CA bundle (about 13 ms), and a forkserver's children inherit it."""
+
+    import httpx
+
+    return httpx.create_ssl_context()
 
 
 class HttpTransport:
@@ -29,7 +40,7 @@ class HttpTransport:
         import httpx
 
         headers = {"Authorization": f"Bearer {token}"} if token else {}
-        kw = {"base_url": url.rstrip("/"), "headers": headers, "timeout": timeout}
+        kw = {"base_url": url.rstrip("/"), "headers": headers, "timeout": timeout, "verify": _ssl_context()}
         if transport is not None:
             kw["transport"] = transport
         self.client = httpx.Client(**kw)  # for the reporting thread's beats

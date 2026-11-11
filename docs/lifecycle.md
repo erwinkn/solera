@@ -1162,14 +1162,45 @@ control file:
 - **Engine down:** pool workers finish their attempts and get no new ones.
 - The handle is `{attempt, pool}`. A cancel before a worker owns it withdraws the
   attempt from discovery and ends it; after it, cancel is §7.
-- **One process per attempt.** A pool worker runs each attempt it gets in
-  a child forked from a forkserver that imported the framework and nothing
-  else: it starts no thread and never uses the object store, so forking
-  from it is safe on any OS (the worker itself has threads: fork copies
-  only the forking one, which macOS does not survive). The child imports
-  the project itself — project code may start threads or hold locks a fork
-  would copy without them. The child is the attempt's process: a forced
-  cancel ends it, and it exits the moment its result is published.
+- **One process per attempt, nothing imported per attempt.** A pool
+  worker runs each attempt it gets in a child forked from a forkserver
+  (`solera_worker/forkserver.py`): a process of its own, started on the
+  first attempt, that imported the framework, its HTTP client with the SSL
+  context every client shares, and the project. It starts no thread and
+  never uses the object store, so forking from it is safe on any OS (the
+  worker itself has threads: fork copies only the forking one, which macOS
+  does not survive). The child is the attempt's process: a forced cancel
+  ends it and nothing else, and it exits the moment its result is
+  published. An attempt forked this way imports nothing: on bench/scale
+  (1M keys, 10k-key batches, 8 pool workers) the history's `importing`
+  step went from 210–280 ms to 27 ms, most of it the `start` call, and an
+  attempt from 280–370 ms to 125–138 ms (ERW-36). Every pool worker
+  offered an attempt forks for it, the losers of the race to own it too,
+  so their cost counts as well.
+- **The project stays in the forkserver only if importing it changed
+  nothing a fork would copy wrong.** Fork copies only the forking thread:
+  a lock another thread held, or a connection another thread used, would
+  reach every attempt held or half-used. So if the import raised, left a
+  thread running beside the main one (counted by the OS where it can, so
+  a native library's threads count), or left a socket or pipe open, which
+  every attempt would share, the forkserver says why and exits; the pool
+  worker logs one warning with that reason and starts a forkserver with
+  the framework alone, whose attempts import the project themselves, as
+  before. Until the pool worker restarts it does not try again. A file the
+  import left open is shared too, its offset included, and so is any state
+  the import made, a random generator's seed say: open files and seed
+  generators in the asset, not at import.
+- **A preloaded forkserver serves one deploy**: the manifest's `deploy`
+  digest of the code it imported, whose build identity hashed the files as
+  they were imported (`architecture.md` §11). A child whose spec names
+  another deploy exits `STALE` (5) right after reading the spec, before
+  it owns the attempt or writes anything; the pool worker replaces the
+  forkserver, which imports the code afresh, and runs the same attempt
+  from the new one. A forkserver that has just imported the code runs the
+  attempt whatever its spec says, so a spec the code on disk does not
+  match fails with a deploy mismatch, as an import of its own would. A
+  host whose code changes under one `SOLERA_BUILD` keeps serving the code
+  it imported: an explicit build id must change with the code.
 
 **Every attempt process exits at once** (`os._exit`) once its sealed
 result is published, or once it cannot be: Local, ECS and Kubernetes
