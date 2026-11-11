@@ -2158,6 +2158,37 @@ fn r7_a_first_input_commit_in_the_batch_event_names_its_life() {
     });
 }
 
+/// A first commit built while its output had no life lands once an edge
+/// opened on the output named it meanwhile: the life has no commit, so it
+/// holds what the commit was built on (the engine builds an output's first
+/// commit while a consumer may open its edge).
+#[test]
+fn a_first_commit_lands_in_the_life_an_edge_opening_gave_its_output() {
+    let rt = runtime();
+    let ix = index(&rt);
+    rt.block_on(async {
+        let mut t = Tracking::new();
+        let mut staging = Tracking::new();
+        let mut x = Log::new("x");
+        x.commit(&ix, &mut staging, [(key("k"), Ver::Int(1))].into())
+            .await;
+        let first = commit_part(&t, "x", &x.layers[0], 1);
+        apply(
+            &mut t,
+            vec![Part::EdgeOpen(EdgeOpen {
+                edge: key("e"),
+                input: key("x"),
+                keyed: true,
+            })],
+        );
+        let life = t.life(b"x");
+        apply(&mut t, vec![first.clone()]);
+        assert_eq!((t.life(b"x"), t.outputs[b"x".as_slice()].head), (life, 1));
+        let e = t.check_event(&Event::of(vec![first])).unwrap_err();
+        assert!(e.to_string().contains("another head"), "{e}");
+    });
+}
+
 // Strict xfails owned by B5 PR 3 (ERW-34's deferrals): each needs the
 // binding (native/src/tracking_py.rs, PR #40's file) or the engine to pass
 // a life, and must keep failing until it does; then drop its should_panic.

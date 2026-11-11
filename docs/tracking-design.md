@@ -1699,9 +1699,10 @@ Called from Python as `lineage_input`, `lineage_trace` and `lineage_flow`
   refuses an own output with no life), and the batch's progress parts
   (`BatchProgress`, `Consumed`) carry them to the event, which checks
   them when it applies; an output commit names the life it was built on
-  (0 only for a first commit, which applies only while the output has no
-  life; once the engine declares every output first, B5 refuses 0 there
-  too);
+  (0 only for a first commit built while the output had no life: the
+  head check lets it land only on an output with no commit, whatever life
+  a naming gave it since, since a life with no commit holds nothing; once
+  the engine declares every output first, B5 refuses 0 there too);
   a cleanup step names the life of its cursor (§13). A record stores the
   plan's lives (`life`, `own_life`; `RECORD_FORMAT` 5). Three rules keep a
   life from changing under a reader: `Retire` is refused while an edge

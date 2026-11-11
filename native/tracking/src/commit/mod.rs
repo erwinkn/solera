@@ -35,9 +35,12 @@ pub struct OutputCommit {
     pub output: Id,
     /// The output's life it was built on (its replaced versions and live
     /// count are that life's): it applies only in that life. 0 when the
-    /// output had no life: it applies only while the output still has none
-    /// (a first commit names it), so it may land after a whole life began
-    /// and ended (strict xfail, B5 PR 3, which declares every output first).
+    /// output had no life: a first commit, which the head check lets land
+    /// only on an output with no commit, in whatever life a naming gave it
+    /// since (an edge opening on it while the commit is built): a life with
+    /// no commit holds what no life holds. So it may also land after a whole
+    /// life began and ended (strict xfail, B5 PR 3, which declares every
+    /// output before its first commit and then refuses 0 here).
     pub life: u64,
     pub layer: LayerRef,
     pub live: u64,
@@ -68,16 +71,8 @@ impl OutputCommit {
     }
 
     pub(crate) fn check(&self, t: &Tracking) -> Result<()> {
-        match t.outputs.get(&self.output) {
-            Some(o) if self.life == 0 => {
-                return invalid(format!(
-                    "the commit was built before {} had a life: it is in life {} now",
-                    String::from_utf8_lossy(&self.output),
-                    o.life
-                ));
-            }
-            None if self.life == 0 => {}
-            _ => t.in_life(&self.output, self.life, "the commit was built")?,
+        if self.life != 0 {
+            t.in_life(&self.output, self.life, "the commit was built")?;
         }
         let head = t.outputs.get(&self.output).map_or(0, |o| o.head);
         let l = &self.layer;
