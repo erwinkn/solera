@@ -151,20 +151,20 @@ def _build_name(table: str, partition: str, run: int) -> str:
     return f"b_{digest}_{run}"
 
 
-# A trigger or rule that an INSERT or a DELETE of the table runs, enabled for an ordinary session,
-# on the table or any of its partitions: what a switch would run on the rows Solera read in the
-# build, which writing them there did not (`_aim`, `_full_run_ended`).
-# (pg_partition_tree lists a partitioned table and its partitions, and nothing for a plain table.)
-_TRIGGERED = """EXISTS (SELECT 1 FROM pg_trigger t WHERE NOT t.tgisinternal AND t.tgtype & 12 <> 0
-    AND t.tgenabled IN ('O', 'A') AND t.tgrelid IN (SELECT {rel} UNION ALL SELECT relid FROM pg_partition_tree({rel})))
-  OR EXISTS (SELECT 1 FROM pg_rewrite w WHERE w.ev_type IN ('3', '4') AND w.ev_enabled IN ('O', 'A')
-    AND w.ev_class IN (SELECT {rel} UNION ALL SELECT relid FROM pg_partition_tree({rel})))"""
+# A trigger or rule, in any state, on the table or any table that inherits from it (a partition
+# among them): a switch's DELETE and INSERT could run one on the rows Solera read in the build,
+# which writing them there did not. Which one would run depends on its events, its level, the
+# session's replication role and the statement's target, so the store does not guess: any refuses.
+_TRIGGERED = """EXISTS (WITH RECURSIVE tree(oid) AS (SELECT {rel}::oid
+    UNION SELECT i.inhrelid FROM pg_inherits i JOIN tree ON i.inhparent = tree.oid)
+  SELECT 1 FROM tree WHERE EXISTS (SELECT 1 FROM pg_trigger t WHERE t.tgrelid = tree.oid AND NOT t.tgisinternal)
+    OR EXISTS (SELECT 1 FROM pg_rewrite w WHERE w.ev_class = tree.oid AND w.rulename <> '_RETURN'))"""
 
-# What the catalog holds of a table, read in a write's first round trip (`_begin`).
 _STATE = (
     """
 SELECT r.oid IS NOT NULL AS present,
-  coalesce((SELECT jsonb_object_agg(a.attname, format_type(a.atttypid, NULL)) FROM pg_attribute a
+  coalesce((SELECT jsonb_object_agg(a.attname, format_type(CASE WHEN t.typtype = 'd' THEN t.typbasetype
+      ELSE a.atttypid END, NULL)) FROM pg_attribute a JOIN pg_type t ON t.oid = a.atttypid
     WHERE a.attrelid = r.oid AND a.attnum > 0 AND NOT a.attisdropped), '{}') AS columns,
   coalesce((SELECT array_agg(a.attname::text ORDER BY k.i) FROM pg_constraint c
     CROSS JOIN unnest(c.conkey) WITH ORDINALITY AS k(n, i)
@@ -179,7 +179,7 @@ SELECT r.oid IS NOT NULL AS present,
     WHERE n.nspname = %(build)s AND c.relname >= %(first)s::name AND c.relname < %(past)s::name
     AND c.relkind = 'r'), '{}') AS built,
   r.oid IS NOT NULL AND ("""
-    + _TRIGGERED.format(rel="r.oid::regclass")
+    + _TRIGGERED.format(rel="r.oid")
     + """) AS triggered
 FROM (SELECT (SELECT c.oid FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
   WHERE n.nspname = %(schema)s AND c.relname = %(name)s AND c.relkind IN ('r', 'p')) AS oid) AS r
@@ -629,10 +629,10 @@ class PostgresStore:
         registered build it no longer holds is lost (a migration dropped it,
         or a restore lost it): a write of its run fails (`RunLost`) and
         changes nothing, for the rows it held are gone. A table with a
-        trigger or rule that an INSERT or a DELETE runs, on it or on one of
-        its partitions, never opens a build (`PublicationRefused`): the
-        switch would run it on rows Solera has read, which writing them did
-        not, and the store never alters the user's table to stop it. A
+        trigger or rule, in any state, on it or on a table that inherits from
+        it, never opens a build (`PublicationRefused`): the switch could run
+        it on rows Solera has read, which writing them did not, and the store
+        never alters the user's table to stop it. A
         build of the partition the write does not keep makes it sweep after
         it commits."""
 
@@ -663,10 +663,9 @@ class PostgresStore:
             at.run, at.opens = run, run not in at.builds
         if at.opens and state["triggered"]:
             raise PublicationRefused(
-                f"{context.output.name} {context.partition!r}: {table} has a trigger or rule that an "
-                "INSERT or a DELETE runs, on it or on one of its partitions: publishing a full run "
-                "built beside it would run it on rows Solera has read. Drop it, or write the output "
-                "in place"
+                f"{context.output.name} {context.partition!r}: {table} has a trigger or rule, on it or "
+                "on a table that inherits from it: publishing a full run built beside it could run it "
+                "on rows Solera has read. Drop it, or write the output in place"
             )
         keep = {context.build_run, at.run}
         at.builds = [b for b in at.builds if b in keep] + ([at.run] if at.opens else [])
@@ -789,12 +788,17 @@ class PostgresStore:
                 for part in taken:
                     where = {column: part} if column else {}
                     sql, params = self._where_sql(where), [where[k] for k in sorted(where)]
-                    if key is not None:
-                        sql, params = f"{sql} AND {_ident(output.key)}::text = %s", [*params, str(key)]
-                    if present:
-                        cur.execute(f"DELETE FROM {table} WHERE {sql}", params)
                     if key is None:
+                        if present:
+                            cur.execute(f"DELETE FROM {table} WHERE {sql}", params)
                         self._forget(cur, table, [part])
+                        continue
+                    # A key's rows wherever the partition holds them: published, and in its builds.
+                    keyed = _ident(COMMIT_COLUMN if output.key is None else output.key)
+                    sql, params = f"{sql} AND {keyed}::text = %s", [*params, str(key)]
+                    builds = [_qname(BUILD_SCHEMA, n) for n in self._builds_of(cur, table, [part])]
+                    for target in ([table] if present else []) + builds:
+                        cur.execute(f"DELETE FROM {target} WHERE {sql}", params)
             if placed:
                 cur.execute(f"DELETE FROM {VERSIONS_TABLE} WHERE rel = %s AND part = %s", (table, partition))
 
@@ -898,8 +902,7 @@ class PostgresStore:
         all old rows, then all new, and wait for nothing; it never changes the
         check's version. A constraint only the published rows can check
         refuses the publication whole (`PublicationRefused`), and so does a
-        trigger or rule added since the run began that an INSERT or a DELETE
-        runs (`_aim`), read under the lock its DELETE takes, so none can be
+        trigger or rule added since the run began (`_aim`), read under the lock its DELETE takes, so none can be
         added in between, and again after the rows. The
         build's
         table is dropped after, by a sweep. Idempotent; it may take minutes,
@@ -983,9 +986,9 @@ class PostgresStore:
     def _refuse_triggered(self, cur, output, partition, table) -> None:
         if cur.execute(_TRIGGERS, {"t": table}).fetchone()["triggered"]:
             raise PublicationRefused(
-                f"{output.name} {partition!r}: {table} has a trigger or rule that an INSERT or a DELETE "
-                "runs, added after the full run began: publishing would run it on rows Solera has read, "
-                "so the published rows stay as they were. Drop it, or write the output in place"
+                f"{output.name} {partition!r}: {table} has a trigger or rule, on it or on a table that "
+                "inherits from it, added after the full run began: publishing could run it on rows Solera "
+                "has read, so the published rows stay as they were. Drop it, or write the output in place"
             )
 
     # -- writes ---------------------------------------------------------------

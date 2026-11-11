@@ -584,15 +584,19 @@ A full run's first write opens a build,
 `solera_build.b_<md5(table, partition)>_<run>`: the user's table's shape
 with its CHECK constraints, generated columns, unique and exclusion
 indexes, and identity columns that draw from the user's table's sequences.
-A table with a trigger or rule that an `INSERT` or a `DELETE` runs, on it
-or on one of its partitions, never opens a build: the switch's `DELETE`
-and `INSERT` would run it on rows Solera has already read in the build,
-which writing them there did not, and the store never alters the user's
-table to stop it. A full run's first write there fails with
+A table with a trigger or a rule, in any state, on it or on a table that
+inherits from it (a partition among them), never opens a build: the
+switch's `DELETE` and `INSERT` could run one on rows Solera has already
+read in the build, which writing them there did not, and the store never
+alters the user's table to stop it. Which one would run depends on its
+events, its level, its state, the session's replication role and the
+statement's target, so the store does not guess. A full run's first write there fails with
 `PublicationRefused` and changes nothing; write such an output in place
-(today's path). The switch reads the catalog again after its rows, so a
-trigger added during the run, even one committed as the switch begins,
-refuses the publication. A run whose first writes are empty, with no
+(today's path). The switch takes its `DELETE`'s lock on the table and
+every partition before it reads the catalog again, so a trigger added
+during the run refuses the publication, and none can be added while it
+publishes. A cleanup of one key deletes its rows from the partition's
+builds too. A run whose first writes are empty, with no
 table and no declared columns to make one from, makes nothing: its
 version row records it as pending, and its first batch with rows opens
 the build, whatever another partition made meanwhile. A pending run that

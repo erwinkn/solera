@@ -1097,20 +1097,78 @@ async def test_a_trigger_that_raises_added_during_a_run_refuses_its_publication(
     assert outside(store, out) == {"z": "old"}
 
 
-async def test_disabled_and_replica_triggers_and_rules_do_not_refuse_a_build(store):
-    """Sol R3-3: what an ordinary session's INSERT or DELETE cannot run does
-    not refuse a build."""
+@pytest.mark.parametrize(
+    "kind", ["disabled rule", "replica trigger", "a partition's statement trigger", "an inheriting table's"]
+)
+async def test_any_trigger_or_rule_refuses_a_build(store, kind):
+    """Which trigger or rule a switch would run depends on its events, its
+    level, its state, the session's replication role and the statement's
+    target (Sol, B8 restarted round 1: F1, F2, F5), so the store does not
+    guess: any, on the table or any table that inherits from it, refuses a
+    build. Today's path writes such a table in place, as before."""
 
     out = output(incremental=True)
     table, _, _ = store._table(out)
+    other = f'"public"."{out.name}_other"'
+    if kind == "a partition's statement trigger":
+        sql(f"CREATE TABLE {table} (id text, v text, _version bigint) PARTITION BY LIST (id)")
+        sql(f"CREATE TABLE {other} PARTITION OF {table} DEFAULT")
+    else:
+        sql(f"CREATE TABLE {table} (id text, v text, _version bigint)")
     old = await store.store(rows(z="old"), None, at(out, 1, builds=False))
-    sql(f"CREATE RULE guard AS ON DELETE TO {table} DO ALSO NOTIFY solera_mark")
-    sql(f"ALTER TABLE {table} DISABLE RULE guard")
-    make_trigger(table, f"public.{out.name}_mark", "NEW.v = NEW.v || '+'; RETURN NEW;")
-    sql(f"ALTER TABLE {table} ENABLE REPLICA TRIGGER mark")
-    run = await store.store(rows(a="new"), old.ref, at(out, 5, reset=True))
-    assert await store.full_run_ended(out, "", 5, 5)
-    assert await solera(store, run.ref) == outside(store, out) == {"a": "new"}
+    if kind == "disabled rule":
+        sql(f"CREATE RULE guard AS ON DELETE TO {table} DO ALSO NOTIFY solera_mark")
+        sql(f"ALTER TABLE {table} DISABLE RULE guard")
+    elif kind == "replica trigger":
+        make_trigger(table, f"public.{out.name}_mark", "NEW.v = NEW.v || '+'; RETURN NEW;")
+        sql(f"ALTER TABLE {table} ENABLE REPLICA TRIGGER mark")
+    elif kind == "a partition's statement trigger":
+        make_trigger(other, f"public.{out.name}_mark", "RETURN NULL;", "AFTER INSERT", "STATEMENT")
+    else:
+        sql(f"CREATE TABLE {other} () INHERITS ({table})")
+        make_trigger(other, f"public.{out.name}_mark", "RETURN NULL;", "BEFORE DELETE")
+    with pytest.raises(PublicationRefused, match="trigger or rule"):
+        await store.store(rows(a="new"), old.ref, at(out, 5, reset=True))
+    assert outside(store, out) == {"z": "old"} and registry(store, out) == (1, None, [])
+    written = await store.store(rows(a="new"), old.ref, at(out, 5, reset=True, builds=False))
+    assert await solera(store, written.ref) == {"a": "new"}
+
+
+async def test_a_key_cleanup_deletes_the_keys_rows_from_the_builds_too(store):
+    """Sol F3 (restarted round 1): a dead attempt's key in a build goes with
+    the cleanup of that key, as it goes from the published rows."""
+
+    out = output(incremental=True)
+    old = await store.store(rows(z="old"), None, at(out, 1))
+    run = await store.store(rows(a="5"), old.ref, at(out, 5, reset=True))
+    await store.store(Patch(rows(x="6")), run.ref, at(out, 6, run=5))
+    await store.acquire(at(out, 7, run=5), run.ref)
+    await store.cleanup(out, partition="", key="x", generation=None)
+    assert await solera(store, run.ref) == {"a": "5"}
+    assert await store.full_run_ended(out, "", 5, 7) and outside(store, out) == {"a": "5"}
+
+
+async def test_a_key_cleanup_of_an_unkeyed_commit_names_its_commit(store):
+    """Sol F6 (restarted round 1, also on main): an unkeyed incremental
+    output's key is its commit number."""
+
+    out = output(key=None, incremental=True)
+    written = await store.store(Patch([{"v": "first"}]), None, at(out, 5, builds=False))
+    await store.cleanup(out, partition="", key=0, generation=5)
+    assert await store.load(written.ref, list[dict], None) == []
+
+
+async def test_a_version_column_of_a_domain_over_bigint_is_written(store):
+    """Sol F4 (restarted round 1): a column's type is its domain's base type,
+    as main read it."""
+
+    out = output(incremental=True)
+    table, _, _ = store._table(out)
+    sql(f"CREATE DOMAIN public.{out.name}_v AS bigint")
+    sql(f"CREATE TABLE {table} (id text, v text, _version public.{out.name}_v)")
+    first = await store.store(rows(a="1"), None, at(out, 1, builds=False))
+    run = await store.store(rows(a="5"), first.ref, at(out, 5, reset=True))
+    assert await store.full_run_ended(out, "", 5, 5) and await solera(store, run.ref) == {"a": "5"}
 
 
 async def test_a_partition_cleanup_holds_off_the_partitions_first_writer(store, monkeypatch):

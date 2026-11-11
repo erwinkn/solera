@@ -19,7 +19,7 @@ _schemas = itertools.count()
 
 
 # The columns PostgresStore gives its versions table (`solera_postgres.VERSIONS_DDL`).
-FENCE_COLUMNS = {"rel", "part", "generation", "worker_id", "written", "published", "builds"}
+FENCE_COLUMNS = {"rel", "part", "generation", "worker_id", "written", "published", "builds", "pending"}
 _fence_checked = False
 
 
