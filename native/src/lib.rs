@@ -42,6 +42,8 @@ use pyo3::types::{
 use error::Error;
 use rayon::prelude::*;
 use rows::{Arena, Constant, Cursor, Payloads, Source, Table};
+use solera_tracking::commit::changes::MAGIC;
+use solera_tracking::commit::{Change, Changes};
 
 create_exception!(
     _native,
@@ -459,6 +461,43 @@ impl Rows {
         })
     }
 
+    /// The changes this write makes, in their transport form
+    /// (`encode_changes`), a part at a time: the header, then the blocks of
+    /// each `size` changes in key order — every key of the write an upsert,
+    /// carrying `word` when given, and `removes` merged among them. A key
+    /// both written and removed is a `ValueError`.
+    #[pyo3(signature = (removes, word=None, size=65536))]
+    fn changes(
+        &self,
+        removes: Vec<Bound<'_, PyAny>>,
+        word: Option<String>,
+        size: usize,
+    ) -> PyResult<ChangeBlocks> {
+        guard(|| {
+            if size == 0 {
+                return Err(PyValueError::new_err("a block holds at least one change"));
+            }
+            let mut removes = removes
+                .iter()
+                .map(|k| {
+                    let mut b = Vec::new();
+                    row_key(k, &mut b).map(|()| b)
+                })
+                .collect::<PyResult<Vec<_>>>()?;
+            removes.sort_unstable();
+            Ok(ChangeBlocks {
+                cursor: Cursor::new(self.table.clone()),
+                held: false,
+                read: false,
+                removes,
+                next: 0,
+                word,
+                size,
+                started: false,
+            })
+        })
+    }
+
     /// Every key, in key order, `size` keys at a time: a `Span` each.
     fn spans(&self, size: usize) -> PyResult<Spans> {
         guard(|| {
@@ -615,6 +654,71 @@ impl Spans {
                 }
             };
             Ok(Some(Span { keys, ends, rows }))
+        })
+    }
+}
+
+/// A write's changes in their transport form, a part at a time
+/// (`Rows.changes`).
+#[pyclass(module = "solera._native")]
+struct ChangeBlocks {
+    cursor: Cursor,
+    /// The cursor holds a key not yet taken.
+    held: bool,
+    /// The cursor has read its last key.
+    read: bool,
+    removes: Vec<Vec<u8>>,
+    next: usize,
+    word: Option<String>,
+    size: usize,
+    started: bool,
+}
+
+impl ChangeBlocks {
+    /// The next `size` changes, encoded; None when none are left.
+    fn block(&mut self) -> PyResult<Option<Vec<u8>>> {
+        let mut changes = Changes::new();
+        let word = self.word.as_deref().map(str::as_bytes);
+        while changes.len() < self.size {
+            if !self.held && !self.read {
+                self.held = self.cursor.read().map_err(to_py)?;
+                self.read = !self.held;
+            }
+            let removed = self.removes.get(self.next).map(Vec::as_slice);
+            let written = self.held.then(|| self.cursor.entry().0);
+            let (key, change) = match (written, removed) {
+                (None, None) => break,
+                (Some(k), None) => (k, Change::Upsert(word)),
+                (Some(k), Some(r)) if k < r => (k, Change::Upsert(word)),
+                (_, Some(r)) => (r, Change::Removed),
+            };
+            changes.push(key, change).map_err(commit_py::err)?;
+            match change {
+                Change::Removed => self.next += 1,
+                Change::Upsert(_) => self.held = false,
+            }
+        }
+        if changes.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(changes.encode()[MAGIC.len()..].to_vec()))
+    }
+}
+
+#[pymethods]
+impl ChangeBlocks {
+    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    fn __next__<'py>(&mut self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyBytes>>> {
+        guard(|| {
+            if !self.started {
+                self.started = true;
+                return Ok(Some(PyBytes::new(py, &MAGIC)));
+            }
+            let block = py.detach(|| self.block())?;
+            Ok(block.map(|b| PyBytes::new(py, &b)))
         })
     }
 }
@@ -841,6 +945,7 @@ fn solera_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Rows>()?;
     m.add_class::<Chunks>()?;
     m.add_class::<Span>()?;
+    m.add_class::<ChangeBlocks>()?;
     m.add_class::<Spans>()?;
     m.add_function(wrap_pyfunction!(gather, m)?)?;
     layers_py::register(m)?;
