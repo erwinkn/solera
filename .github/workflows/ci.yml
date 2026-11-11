@@ -31,7 +31,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: native
-      - run: cargo fmt --check --manifest-path native/Cargo.toml
+      - run: cargo fmt --all --check --manifest-path native/Cargo.toml
       - run: cargo check --manifest-path native/Cargo.toml
       - run: cargo test --release --manifest-path native/Cargo.toml -p solera-index
       - run: cargo test --release --manifest-path native/Cargo.toml -p solera-tracking
