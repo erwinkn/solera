@@ -163,9 +163,7 @@ class PostgresStore:
         inner = by_key_type(t)
         if inner is not MISSING:  # dict[str, T]: a keyed read, each key's group as T (per-key §5)
             return selection is not None and inner is not None and self.can_load(inner, selection)
-        if getattr(t, "__module__", "").split(".")[0] in ("pandas", "geopandas") and getattr(
-            t, "__name__", ""
-        ) in ("DataFrame", "GeoDataFrame"):
+        if frames.is_frame_type(t) or frames.is_table_type(t):
             return True
         import typing
 
@@ -1016,8 +1014,8 @@ class PostgresStore:
             groups: dict[str, list] = {}
             for row in rows:
                 groups.setdefault(str(row[handle["key"]]), []).append(row)
-            return Read({k: _materialize(g, inner, columns) for k, g in groups.items()}, versions)
-        return Read(_materialize(rows, t), versions, newest)
+            return Read({k: frames.materialize(g, inner, columns) for k, g in groups.items()}, versions)
+        return Read(frames.materialize(rows, t), versions, newest)
 
     # -- row helpers ----------------------------------------------------------
 
@@ -1116,22 +1114,3 @@ class _Reader:
 
 def _sql_type(decl: str) -> str:
     return re.sub(r"\bstring\b", "text", str(decl))
-
-
-def _materialize(rows: list[dict], t, columns: list[str] | None = None):
-    import typing
-
-    if (
-        t is None
-        or t is list
-        or t is dict
-        or (typing.get_origin(t) is list and typing.get_args(t) == (dict,))
-    ):
-        return rows
-    if getattr(t, "__module__", "").split(".")[0] in ("pandas", "geopandas") and getattr(
-        t, "__name__", ""
-    ) in ("DataFrame", "GeoDataFrame"):
-        import pandas as pd
-
-        return pd.DataFrame(rows, columns=columns if not rows and columns else None)
-    return rows

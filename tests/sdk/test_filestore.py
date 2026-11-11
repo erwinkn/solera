@@ -185,6 +185,19 @@ async def test_rows_by_key_column(store):
         await store.store([{"v": 1}], None, context(out, generation=4))
 
 
+async def test_a_keyed_load_as_an_arrow_table(store):
+    """`pa.Table`, whole or by key (`solera.stores.frames`)."""
+
+    pa = pytest.importorskip("pyarrow")
+    out = Output("files", key="id")
+    rows = [{"id": 1, "v": "1"}, {"id": 2, "v": "2"}]
+    written = await store.store(rows, None, context(out, generation=1))
+    table = await store.load(written.ref, pa.Table, at(out, rows, 1))
+    assert table.to_pylist() == rows
+    groups = await store.load(written.ref, dict[str, pa.Table], at(out, rows, 1))
+    assert {k: g.to_pylist() for k, g in groups.items()} == {"1": rows[:1], "2": rows[1:]}
+
+
 async def test_unkeyed_incremental_is_one_object_per_commit(store):
     out = Output("events", incremental=True)
     with pytest.raises(WriteError, match="Patch"):

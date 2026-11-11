@@ -95,3 +95,54 @@ def test_a_row_that_is_not_a_mapping_is_refused():
 
     with pytest.raises(WriteError, match="a row is a list, not a mapping"):
         prepare([{"id": "a"}, ["b"]], Output("t", key="id"))
+
+
+def test_arrow_maps_are_read_as_dicts_at_any_depth():
+    m = pa.map_(pa.string(), pa.int64())
+    table = pa.table(
+        {
+            "id": ["a", "b"],
+            "m": pa.array([[("x", 1)], [("y", 2)]], m),
+            "s": pa.array([{"inner": [("z", 3)]}, {"inner": []}], pa.struct([("inner", m)])),
+        }
+    )
+    [chunk] = read(KeyedWrite(prepare_frames(table, Output("t", key="id")), reset=True), 5)
+    assert chunk.rows == [
+        {"id": "a", "m": {"x": 1}, "s": {"inner": {"z": 3}}},
+        {"id": "b", "m": {"y": 2}, "s": {"inner": {}}},
+    ]
+
+
+class _MapExtension(pa.ExtensionType):
+    def __init__(self):
+        super().__init__(pa.map_(pa.string(), pa.int64()), "solera.test.map")
+
+    def __arrow_ext_serialize__(self):
+        return b""
+
+    @classmethod
+    def __arrow_ext_deserialize__(cls, storage_type, serialized):
+        return cls()
+
+
+def test_an_extension_type_over_a_map_is_read_as_dicts():
+    storage = pa.array([[("x", 1)]], pa.map_(pa.string(), pa.int64()))
+    table = pa.table({"id": ["a"], "e": pa.ExtensionArray.from_storage(_MapExtension(), storage)})
+    [chunk] = read(KeyedWrite(prepare_frames(table, Output("t", key="id")), reset=True), 5)
+    assert chunk.rows == [{"id": "a", "e": {"x": 1}}]
+
+
+@pytest.mark.xfail(
+    strict=True,
+    raises=pa.ArrowNotImplementedError,
+    reason="as on main: Arrow has no take for string views; a store write of one out of key order fails (SOLE-24 R3)",
+)
+def test_view_columns_are_read_in_key_order():
+    table = pa.table(
+        {
+            "id": pa.array(["b", "a"], pa.string_view()),
+            "p": pa.array([["x"], ["y"]], pa.list_view(pa.string_view())),
+        }
+    )
+    [chunk] = read(KeyedWrite(prepare_frames(table, Output("t", key="id")), reset=True), 5)
+    assert sorted(chunk.rows, key=lambda r: r["id"]) == [{"id": "a", "p": ["y"]}, {"id": "b", "p": ["x"]}]

@@ -149,14 +149,71 @@ def rows_of(value: Any, name: str) -> list[dict]:
     raise WriteError(f"{name}: expected rows (list[dict], a DataFrame or Arrow), got {type(value).__name__}")
 
 
-def materialize(items: list, t: Any):
-    """Loaded rows as `t`: a DataFrame when asked for one, else the list."""
+def is_table(value: Any) -> bool:
+    """A pyarrow Table, told by its type's name and module."""
 
+    t = type(value)
+    return t.__name__ == "Table" and t.__module__.split(".")[0] == "pyarrow"
+
+
+def is_table_type(t: Any) -> bool:
+    return isinstance(t, type) and t.__name__ == "Table" and t.__module__.split(".")[0] == "pyarrow"
+
+
+def materialize(items: Any, t: Any, columns: list[str] | None = None):
+    """Loaded rows as `t`: a DataFrame or an Arrow table when asked for one,
+    else a list of rows. `items` is a list of rows, or an Arrow table read
+    in place (a keyed source's, `served`). `columns` name an empty list's."""
+
+    table = is_table(items)
+    if is_table_type(t):
+        if table:
+            return items
+        import pyarrow as pa
+
+        if not items and columns:
+            return pa.table({c: pa.nulls(0) for c in columns})
+        names = dict.fromkeys(k for row in items for k in row)  # every row's columns, as a DataFrame's
+        return pa.table({n: [row.get(n) for row in items] for n in names})
     if is_frame_type(t):
         import pandas as pd
 
-        return pd.DataFrame(items)
-    return items
+        if table:  # the DataFrame its rows make, built by column: the dict form's, dtypes included
+            maps = {"maps_as_pydicts": "strict"} if any(_has_map(c) for c in items.schema.types) else {}
+            return pd.DataFrame(
+                {n: c.to_pylist(**maps) for n, c in zip(items.column_names, items.columns, strict=True)}
+            )
+
+        return pd.DataFrame(items, columns=columns if not items and columns else None)
+    return _arrow_taker(items)(None) if table else items
+
+
+def served(table: Any, take: bytes | None, version: str, t: Any, names: list | None = None):
+    """A keyed source's rows served as one Arrow table (`Loaded(table,
+    version=column)`) as `t`, without the version column: the rows `take`
+    names (row numbers, u32; None: every row, as it is), in its order. With
+    `names`, the key each row is, `t` is each key's own: `{key: T}`, each a
+    group of one row, as a dict answer's are."""
+
+    import pyarrow as pa
+
+    table = table.drop_columns([version])
+    rows = (
+        pa.array([], pa.uint32())
+        if take is None
+        else pa.Array.from_buffers(pa.uint32(), len(take) // 4, [None, pa.py_buffer(take)])
+    )
+    try:  # every table, so whether it loads never hangs on the keys asked
+        taken = table.take(rows)
+    except pa.ArrowNotImplementedError as e:
+        raise ValueError(f"Arrow cannot select rows of this table, so it cannot serve keys: {e}") from None
+    if take is not None:
+        table = taken
+    if not table.num_rows:  # no rows say no columns, as the dict form's
+        return materialize([], t) if names is None else {}
+    if names is None:
+        return materialize(table, t)
+    return {k: materialize(table.slice(i, 1), t) for i, k in enumerate(names)}
 
 
 def _frame(frame: Any, name: str) -> tuple[list[str], list[list]]:
@@ -224,9 +281,25 @@ def _arrow_taker(data: Any) -> Callable:
             taken = table.take(pa.Array.from_buffers(pa.uint32(), len(rows), [None, pa.py_buffer(rows)]))
         else:
             taken = table.take(list(rows))
-        return taken.to_pylist(maps_as_pydicts="strict")
+        if any(_has_map(t) for t in table.schema.types):  # a third the speed: only where a map is
+            return taken.to_pylist(maps_as_pydicts="strict")
+        return taken.to_pylist()
 
     return take
+
+
+def _has_map(t: Any) -> bool:
+    """Whether an Arrow type holds a map, at any depth."""
+
+    import pyarrow as pa
+
+    if pa.types.is_map(t):
+        return True
+    if isinstance(t, pa.BaseExtensionType):
+        return _has_map(t.storage_type)
+    if pa.types.is_dictionary(t):
+        return _has_map(t.value_type)
+    return any(_has_map(t.field(i).type) for i in range(t.num_fields))
 
 
 # -- kinds --------------------------------------------------------------------------------

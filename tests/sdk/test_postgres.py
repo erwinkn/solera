@@ -204,6 +204,20 @@ async def test_dataframe_round_trip(store):
     assert list(loaded["id"]) == ["a"]
 
 
+async def test_arrow_table_loads(store):
+    """An input annotated `pa.Table` loads as one, whole or by key; an empty
+    group keeps its columns."""
+
+    pa = pytest.importorskip("pyarrow")
+    out = output(key="id", primary_key=["id"])
+    written = await store.store([{"id": "a", "v": "1"}, {"id": "b", "v": "2"}], None, context(out))
+    assert store.can_load(pa.Table, None) and store.can_load(dict[str, pa.Table], Keys)
+    loaded = await store.load(written.ref, pa.Table, None)
+    assert sorted(loaded.column("id").to_pylist()) == ["a", "b"]
+    groups = await store.load(written.ref, dict[str, pa.Table], Keys({"a": (b"", 0)}))
+    assert [r["v"] for r in groups["a"].to_pylist()] == ["1"]
+
+
 def _ledger(store, output):
     """The migrations the ledger says ran on `output`'s table."""
 
