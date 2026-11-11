@@ -554,6 +554,22 @@ DISTINCT` of the key column over the partition, through a server-side cursor. A 
 example, which passes the conformance kit, is
 [`examples/json_table_store.py`](../examples/json_table_store.py).
 
+A chunk is read as columns or, when a store writes one object per key, as
+groups:
+
+```python
+for chunk in write.iter_chunks():  # on the store's own thread
+    # Columns: the chunk's keys, sorted, and every key's rows, a key's after
+    # the previous key's. No Python per key.
+    delete(chunk.keys)
+    insert(chunk.rows)  # or chunk.indices, to take from the producer's Arrow table
+
+async for chunk in write.chunks():  # on the event loop
+    # Groups: each (key, rows). Taken off the loop, as each column is.
+    for key, rows in await asyncio.to_thread(chunk.groups):
+        await put(key, rows)
+```
+
 ### An object store: immutable names
 
 Name each object with the writing attempt's generation and write it
