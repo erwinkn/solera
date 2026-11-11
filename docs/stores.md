@@ -582,28 +582,44 @@ behind a switch of another partition.
 A full run's first write opens a build,
 `solera_build.b_<md5(table, partition)>_<run>`: the user's table's shape
 with its CHECK constraints, generated columns, unique and exclusion
-indexes, identity columns that draw from the user's table's sequences, and
-the user's table's row triggers that fire before a change, so each row is
-what it would be in place.
+indexes, and identity columns that draw from the user's table's sequences.
+A table with a BEFORE INSERT row trigger runs its full runs in place, as
+today, published at their first write: the switch would run the trigger
+on rows Solera has already read, and the store never alters the user's
+table to stop it. A trigger added during a run refuses its publication
+(`PublicationRefused`). A run whose first writes are empty, with no table
+and no declared columns to make one from, makes nothing until its first
+batch with rows, which opens the build.
 Writes of the run go there while the registry lists it; a load reads the
 build its ref names while the registry lists it, else the user's table,
 and reads the user's table again if the build was dropped under it. The
 switch (`full_run_ended`) holds the version row, deletes the partition's
 rows and inserts the build's in one transaction, then unregisters it;
 outside readers see all old rows, then all new, and wait for nothing. The
-insert does not fire the BEFORE row triggers the build's rows already went
-through: the switch disables them in its transaction and restores them
-before it commits, which on such a table makes writes of its other
-partitions wait for the switch. The DROP comes after, in a short
-transaction of its own that gives up rather than wait for a load; the
+DROP comes after, in a short transaction of its own that gives up rather
+than wait for a load, and never fails the call that committed; the
 partition's next write or call finds the build in the catalog and drops
 it then. An `ALTER TABLE` issued during a switch waits for it, and every
 query after it waits too.
 
+A migration changes the user's table alone, so before it runs it drops
+every build of the table and leaves each registered, as lost; a restore
+that leaves `solera_build` behind does the same. A write of a lost build's
+run fails with `RunLost` and changes nothing, and the run's switch
+unregisters it and says not published: the engine starts the partition's
+full run over. A load of a build makes the migration fail and retry rather
+than wait while it holds every writer of the table.
+
 A cleanup deletes a partition's version row with its rows, unless an
 attempt took the check after the partition's last write (a repair that
 listed what a dead attempt left): that row stays, emptied, so no older
-attempt can write again.
+attempt can write again. A cleanup of one partition of a partitioned
+table holds the shared write domain and that partition's version row, so
+it runs beside writes and switches of the others.
+
+`written_at` reads the partition's rows at the dead versions with no index
+on `_version`: a repair scans the partition, which only runs after an
+attempt died having written.
 
 ### An object store: immutable names
 

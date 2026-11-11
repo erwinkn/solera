@@ -555,33 +555,44 @@ async def test_partial_unique_and_exclusion_indexes_fail_the_batch(store):
     assert await solera(store, run.ref) == {"a": "x", "b": "x"}
 
 
-async def test_a_before_trigger_runs_once_for_a_row_as_in_place(store):
-    """The table's BEFORE row triggers run on the build's rows as they are
-    written, so Solera reads what it would in place; the switch does not
-    run them again, and leaves them as they were (Sol, B8 round 1, F2). A
-    trigger that changes the key fails the write, as in place."""
+def make_trigger(table, function, body):
+    sql(f"CREATE OR REPLACE FUNCTION {function}() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN {body} END $$")
+    sql(f"CREATE OR REPLACE TRIGGER mark BEFORE INSERT ON {table} FOR EACH ROW EXECUTE FUNCTION {function}()")
+
+
+async def test_a_table_with_a_before_insert_trigger_runs_its_full_runs_in_place(store):
+    """A switch would run the table's BEFORE INSERT row trigger on rows Solera
+    has already read (Sol, B8 round 1, F2), and the store never alters the
+    user's table to stop it: such a table's full run writes in place, as
+    today, and is published at its first write. A trigger that changes the
+    key fails the write, as in place."""
 
     out = output(incremental=True)
     table, _, _ = store._table(out)
-    function = f"public.{out.name}_mark"
     sql(f"CREATE TABLE {table} (id text, v text, _version bigint)")
-    sql(
-        f"CREATE FUNCTION {function}() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN NEW.v = NEW.v || '+'; RETURN NEW; END $$"
-    )
-    sql(f"CREATE TRIGGER mark BEFORE INSERT OR UPDATE ON {table} FOR EACH ROW EXECUTE FUNCTION {function}()")
-    sql(f"ALTER TABLE {table} ENABLE ALWAYS TRIGGER mark")
+    make_trigger(table, f"public.{out.name}_mark", "NEW.v = NEW.v || '+'; RETURN NEW;")
     first = await store.store(rows(a="old"), None, at(out, 1))
-    assert outside(store, out) == {"a": "old+"}
     run = await store.store(rows(b="new"), first.ref, at(out, 5, reset=True))
-    assert await solera(store, run.ref) == {"b": "new+"}
-    assert await store.full_run_ended(out, "", 5, 5)
-    assert await solera(store, run.ref) == outside(store, out) == {"b": "new+"}
-    assert sql("SELECT tgenabled::text FROM pg_trigger WHERE tgrelid = %s::regclass", (table,)) == [("A",)]
-    sql(
-        f"CREATE OR REPLACE FUNCTION {function}() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN NEW.id = upper(NEW.id); RETURN NEW; END $$"
-    )
+    assert "build" not in run.ref.handle and builds(store, out) == []
+    assert registry(store, out) == (5, 5, [])
+    more = await store.store(Patch(rows(c="more")), run.ref, at(out, 6, run=5))
+    assert await solera(store, more.ref) == outside(store, out) == {"b": "new+", "c": "more+"}
+    assert await store.full_run_ended(out, "", 5, 6)
+    assert outside(store, out) == {"b": "new+", "c": "more+"}
+    make_trigger(table, f"public.{out.name}_mark", "NEW.id = upper(NEW.id); RETURN NEW;")
     with pytest.raises(WriteError, match="stored as another key"):
-        await store.store(rows(c="next"), run.ref, at(out, 7, reset=True))
+        await store.store(rows(d="next"), more.ref, at(out, 7, reset=True))
+
+
+async def test_a_before_insert_trigger_added_during_a_full_run_refuses_its_publication(store):
+    out = output(incremental=True)
+    table, _, _ = store._table(out)
+    first = await store.store(rows(a="old"), None, at(out, 1))
+    await store.store(rows(b="new"), first.ref, at(out, 5, reset=True))
+    make_trigger(table, f"public.{out.name}_mark", "NEW.v = NEW.v || '+'; RETURN NEW;")
+    with pytest.raises(PublicationRefused, match="BEFORE INSERT row trigger"):
+        await store.full_run_ended(out, "", 5, 5)
+    assert outside(store, out) == {"a": "old"} and registry(store, out) == (5, None, [5])
 
 
 async def test_a_build_keeps_only_its_unique_and_key_indexes(store):
@@ -880,6 +891,166 @@ async def test_a_key_listing_racing_the_switchs_drop_reads_the_published_keys(st
     gone = _qname(BUILD_SCHEMA, _build_name(store._table(out)[0], "", 5))
     monkeypatch.setattr(store, "_source", lambda cur, ref: gone)  # the lookup made before the switch
     assert list(store.keys(run.ref)) == [["b"]]
+
+
+# -- empty first runs, migrations, lost builds (Fable, B8 round 1) -------------------------
+
+
+async def test_an_empty_first_write_with_no_shape_makes_no_table_and_the_runs_first_rows_open_its_build(
+    store,
+):
+    """M1: a full run's first batch is empty, no table exists and no columns
+    are declared: there is no shape to make one from, so nothing is made.
+    The run's first batch with rows opens its build; outside, no table
+    until the switch, then all of the run."""
+
+    out = output(incremental=True)
+    empty = await store.store([], None, at(out, 5, reset=True))
+    assert empty.ref is None and sql("SELECT to_regclass(%s)", (store._table(out)[0],)) == [(None,)]
+    batch = await store.store(Patch(rows(a="1")), None, at(out, 6, run=5))
+    assert batch.ref.handle["build"] == 5 and builds(store, out) == [5]
+    assert outside(store, out) == {} and await solera(store, batch.ref) == {"a": "1"}
+    assert await store.full_run_ended(out, "", 5, 6)
+    assert outside(store, out) == {"a": "1"}
+
+
+async def test_a_full_run_that_wrote_nothing_and_made_no_table_is_published(store):
+    out = output(incremental=True)
+    assert (await store.store([], None, at(out, 5, reset=True))).ref is None
+    assert await store.full_run_ended(out, "", 5, 5) is True
+    assert registry(store, out) == (5, 5, [])
+
+
+async def test_an_empty_first_commit_with_no_shape_makes_no_table(store):
+    out = output(key=None, incremental=True)
+    assert (await store.store(Patch([]), None, at(out, 5, reset=True))).ref is None
+    batch = await store.store(Patch([{"x": 1}]), None, at(out, 6, run=5))
+    assert await store.full_run_ended(out, "", 5, 6)
+    assert [r["x"] for r in await store.load(batch.ref, list[dict], None)] == [1]
+
+
+async def test_an_empty_first_write_with_declared_columns_makes_the_table_as_today(store):
+    """Today's path (no builds): a whole write of nothing with declared
+    columns makes the table and names it, as main does; with no declared
+    columns and no table it makes none."""
+
+    out = output(columns={"id": "text", "v": "text"})
+    written = await store.store([], None, WriteContext(output=out, partition="", generation=1, worker_id="w"))
+    assert written.ref is not None and outside(store, out) == {}
+    bare = output()
+    written = await store.store(
+        [], None, WriteContext(output=bare, partition="", generation=1, worker_id="w")
+    )
+    assert written.ref is None
+
+
+async def test_a_migration_drops_the_builds_and_their_run_starts_over(store):
+    """M2: a migration changes the user's table alone, so a build would
+    publish rows from before it. The migration drops the table's builds,
+    which stay registered as lost: the run's next batch fails (RunLost),
+    its switch says not published, and the next full run builds on the
+    migrated table."""
+
+    from solera.stores import RunLost
+
+    out = output(incremental=True, columns={"id": "text", "v": "text", "n": "bigint"})
+    first = await store.store([{"id": "a", "v": "1", "n": 1}], None, at(out, 1))
+    await store.store([{"id": "a", "v": "2", "n": 10}], first.ref, at(out, 5, reset=True))
+    table, _, _ = store._table(out)
+    await store.migrate(out, [Migration("scale", f"UPDATE {table} SET n = n * 100")], at(out, 6), first.ref)
+    assert builds(store, out) == [] and registry(store, out)[2] == [5]
+    with pytest.raises(RunLost, match="full run 5 is gone"):
+        await store.store(Patch([{"id": "b", "v": "2", "n": 2}]), first.ref, at(out, 7, run=5))
+    assert await store.full_run_ended(out, "", 5, 7) is False
+    assert registry(store, out)[2] == [] and outside(store, out) == {"a": "1"}
+    again = await store.store([{"id": "a", "v": "8", "n": 10}], first.ref, at(out, 8, reset=True))
+    assert await store.full_run_ended(out, "", 8, 8)
+    assert await solera(store, again.ref) == {"a": "8"}
+
+
+async def test_a_migration_can_replace_a_table_whose_build_draws_from_its_sequence(store):
+    out = output(incremental=True)
+    table, _, _ = store._table(out)
+    sql(f"CREATE TABLE {table} (n bigint GENERATED ALWAYS AS IDENTITY, id text, v text, _version bigint)")
+    first = await store.store(rows(a="1"), None, at(out, 1))
+    await store.store(rows(a="5"), first.ref, at(out, 5, reset=True))
+    await store.migrate(
+        out, [Migration("drop-n", f"ALTER TABLE {table} DROP COLUMN n")], at(out, 6), first.ref
+    )
+    assert builds(store, out) == [] and outside(store, out) == {"a": "1"}
+
+
+async def test_a_build_lost_by_a_restore_fails_its_runs_writes_and_is_not_published(store):
+    """M3: the registry lists build 5, whose table is gone. Its run's writes
+    fail (RunLost), and its repair; its switch unregisters it and says not
+    published; a new full run builds."""
+
+    from solera.stores import RunLost
+    from solera_postgres import BUILD_SCHEMA, _build_name, _qname
+
+    out = output(incremental=True)
+    first = await store.store(rows(a="1"), None, at(out, 1))
+    await store.store(rows(a="5"), first.ref, at(out, 5, reset=True))
+    sql(f"DROP TABLE {_qname(BUILD_SCHEMA, _build_name(store._table(out)[0], '', 5))}")
+    with pytest.raises(RunLost):
+        await store.store(Patch(rows(b="6")), first.ref, at(out, 6, run=5))
+    with pytest.raises(RunLost):
+        await store.written_at([6], first.ref, at(out, 7, run=5))
+    assert await store.full_run_ended(out, "", 5, 7) is False
+    assert registry(store, out)[2] == [] and outside(store, out) == {"a": "1"}
+    again = await store.store(rows(a="8"), first.ref, at(out, 8, reset=True))
+    assert await store.full_run_ended(out, "", 8, 8) and await solera(store, again.ref) == {"a": "8"}
+
+
+async def test_a_sweep_that_fails_never_fails_the_call_that_committed(store, monkeypatch):
+    """L2: the write and the switch have committed when they sweep; a sweep
+    that fails leaves the build to a later one."""
+
+    import psycopg
+
+    out = output(incremental=True)
+    first = await store.store(rows(a="1"), None, at(out, 1))
+    await store.store(rows(a="5"), first.ref, at(out, 5, reset=True))
+
+    def fails(cur, table, partition):
+        raise psycopg.errors.QueryCanceled("canceling statement due to statement timeout")
+
+    monkeypatch.setattr(store, "_builds_of", fails)
+    assert await store.full_run_ended(out, "", 5, 5) is True
+    monkeypatch.undo()
+    assert builds(store, out) == [5]
+    await store.store(Patch(rows(b="6")), first.ref, at(out, 6))
+    assert builds(store, out) == []
+
+
+async def test_a_partition_cleanup_does_not_wait_for_a_switch_of_another(store):
+    """L3: a partitioned table's cleanup of one partition takes the shared
+    domain and that partition's version row, so it runs beside a switch of
+    another, and holds no writer of a third."""
+
+    out = output(incremental=True, partition_column="site")
+    refs = {p: (await store.store(rows(a=p), None, at(out, 1, partition=p))).ref for p in ("p1", "p2", "p3")}
+    switch = open_switch(store, out, "p1")
+    try:
+        await asyncio.wait_for(store.cleanup(out, partition="p3"), 5)
+        await asyncio.wait_for(store.store(Patch(rows(b="2")), refs["p2"], at(out, 2, partition="p2")), 5)
+    finally:
+        switch.rollback()
+        switch.close()
+    assert outside(store, out, "p3") == {} and outside(store, out, "p2") == {"a": "p2", "b": "2"}
+
+
+async def test_a_build_beside_an_index_over_an_oddly_named_column(store):
+    """L6: the build drops the table's plain indexes by their generated
+    names, which may need quoting."""
+
+    out = output(incremental=True)
+    table, _, _ = store._table(out)
+    sql(f'CREATE TABLE {table} (id text, v text, "Order Date" date, _version bigint)')
+    sql(f'CREATE INDEX ON {table} ("Order Date")')
+    first = await store.store(rows(a="1"), None, at(out, 1))
+    run = await store.store(rows(a="5"), first.ref, at(out, 5, reset=True))
+    assert await store.full_run_ended(out, "", 5, 5) and await solera(store, run.ref) == {"a": "5"}
 
 
 # -- what outsiders see (probe P6) ---------------------------------------------------------

@@ -32,6 +32,15 @@ class PublicationRefused(StoreError):
     (docs/tracking-design.md §8, D211)."""
 
 
+class RunLost(StoreError):
+    """A write of a full run whose build is gone (a migration dropped it, or
+    a restore lost it), and the rows it held with it. Nothing changed; it
+    can never succeed, and `full_run_ended` for the run says not
+    published: the engine starts the partition's full run over
+    (docs/stores.md, "PostgresStore: the version check, and full runs
+    built beside")."""
+
+
 class SourceBehind(StoreError):
     """A load by `Keys` answered without a key the index names: a
     source read as it is now no longer holds a key its commits say it has.
@@ -243,11 +252,12 @@ class Store(Protocol):
         self, output: Output, *, home=None, partition=None, key=None, generation=None, before=None
     ) -> None: ...
 
-    # fenced:    async def acquire(self, partition: Partition, prior: Ref | None) -> None
+    # fenced:    async def acquire(self, context: WriteContext, prior: Ref | None) -> None
     #            def keys(self, ref: Ref, among: list[str] | None) -> Iterable[list[str]]
     # in place:  async def written_at(self, versions, prior, context) -> Iterable[list[str]]
-    #            async def full_run_ended(self, output, partition, run, newest, *, home=None) -> bool
-    #            (D196, D211: docs/stores.md, "Tables: dead writers and full runs")
+    #            async def full_run_ended(self, output, partition, run, newest, *, prior=None, home=None) -> bool
+    #            (D196, D211: docs/stores.md, "The contract" and "PostgresStore: the version check,
+    #            and full runs built beside")
 
 
 def resolve_env(value: Any) -> Any:
