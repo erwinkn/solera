@@ -185,6 +185,7 @@ async def _prepare(core: Core, task: dict, run: dict, attempt: str | None) -> di
                 "mode": mode,
                 "output": input.output,
                 "upstream_partition": input.partition,
+                "edge": edges[input.param],  # what the batch's progress names as the walk's (`restarted`)
                 "head": found["head"],
                 "index": index,
                 "count": count,
@@ -209,18 +210,23 @@ async def _prepare(core: Core, task: dict, run: dict, attempt: str | None) -> di
 
 
 def restarted(core: Core, task: dict, input) -> bool:
-    """Whether a keyed input must start over: what its committed progress
-    reads (`Model.core_read`, which only a commit writes) is an upstream life
-    that is gone (a reset: the output removed, or moved to another store),
-    or nothing though the partition has committed or the task's walk has
-    gone some way (its edge was closed and opened again by deploys since: a
-    reset of the output clears what the partition was built under, not the
-    walk of a run under way)."""
+    """Whether a keyed input must start over. A task's walk goes on only over
+    the edge it walked, which its progress names: a deploy that closed it (a
+    reset of either side, a rebind) starts the walk over, whatever another
+    run committed since. A task with no walk yet starts over if what the
+    partition's committed progress reads (`Model.core_read`, which only a
+    commit writes) is an upstream life that is gone, or nothing though one
+    of the asset's outputs still holds content to clear."""
 
     m, asset, partition = core.m, task["asset"], task["partition"]
+    edge = m.core_edges.get((asset, partition, input.param))
+    if (mine := (task.get("progress") or {}).get(WALK)) is not None:
+        walked = (mine.get("edges") or {}).get(input.param)
+        return walked is None or edge is None or walked != edge[0]
     read = m.core_read.get((asset, partition, input.param))
     if read is None:
-        return "definition" in m.partition(asset, partition) or WALK in (task.get("progress") or {})
+        outputs = (m.manifest["assets"].get(asset) or {}).get("outputs") or ()
+        return any((o["name"], partition) in m.heads for o in outputs)
     return read != m.core_outputs.get((input.output, input.partition))
 
 

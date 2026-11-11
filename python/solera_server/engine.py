@@ -1003,9 +1003,22 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
                 )
                 return
             if prepared.get("skip") and self.core is not None:  # its progress still moves to the heads
-                await self.commit_attempt(
-                    attempt, prepared, {"outputs": {}, "skipped": True}, outcome="skipped"
-                )
+                try:
+                    await self.commit_attempt(
+                        attempt, prepared, {"outputs": {}, "skipped": True}, outcome="skipped"
+                    )
+                except Conflict as error:
+                    if not getattr(error, "replan", False):
+                        raise
+                    self._finish(  # as `_settle` does: planned again, no try spent
+                        task,
+                        claim,
+                        "replanned",
+                        error=error,
+                        retryable=True,
+                        delay=REPLAN_DELAY,
+                        reason="held back",
+                    )
                 return
             if prepared.get("skip"):
                 commit = {**await self._observations(task, prepared, {}), **self._made(prepared)}

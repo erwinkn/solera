@@ -234,7 +234,13 @@ async def build(core: Core, task: dict, attempt: str, prepared: dict, result: di
                 built.records = [[p, b64(r)] for (p, _), r in zip(keyed, records, strict=True)]
                 some = keyed[0][1]
                 ended = some["end"] is None  # the plan's walk, not one input's own end
-                built.progress = {"batch": some["index"], "key": None if ended else some["end"]}
+                built.progress = {
+                    "batch": some["index"],
+                    "key": None if ended else some["end"],
+                    "edges": {
+                        p: plan["edge"] for p, plan in keyed
+                    },  # the walk's own: a closed one starts it over
+                }
                 built.walk = {
                     "inputs": [p for p, _ in keyed],
                     "after": some["after"],

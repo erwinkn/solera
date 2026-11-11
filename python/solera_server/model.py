@@ -1908,8 +1908,13 @@ class Model:
         for name, (was, head_before) in before.items():
             key, head = self.span_key(name, partition), self.axis_head(name, partition)
             spans = [list(s) for s in self.partial_spans.get(key, ())] if key == was else []
-            if restart and spans and spans[-1][1] is None and head != head_before:
-                spans[-1][1] = head_before + 1  # a start-over that did not move the head keeps it partial
+            if restart and spans and spans[-1][1] is None:
+                # A start-over is a new epoch: the old span (proceeded or not) keeps what came before it,
+                # and the head it did not move is the new walk's, partial and not proceeded.
+                moved = head != head_before
+                spans[-1][1] = head_before + 1 if moved else head_before
+                if not moved:
+                    spans.append([head_before, None, False])
             if spans and spans[-1][1] is None:
                 if not pending:
                     spans[-1][1] = head

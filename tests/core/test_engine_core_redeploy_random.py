@@ -12,13 +12,14 @@ import asyncio
 import json
 import os
 import random
+import re
 
 import pytest
 from solera.sdk import In, Incremental, Output, Project, Retry, asset
 from solera.stores import FileStore
 from solera_server.state import State
 
-from tests.contract.harness import Solera, rebuild
+from tests.contract.harness import Refused, Solera, rebuild
 
 SEEDS = [int(s) for s in os.environ.get("REDEPLOY_SEEDS", "0,1,2,3,4,5").split(",")]
 STABLE = ["a0", "m0", "z0"]  # never removed: a whole read without one of them read partial content
@@ -238,13 +239,16 @@ async def test_deploys_at_every_await(tmp_path, monkeypatch, seed):
                 else:
                     h.rows[churn] = h.rng.randint(2, 9)
                 await s.run("files", expect=None)
-            elif op == "producer":
-                runs.append(await s.submit(h.variant["name"], mode=h.rng.choice(["full", "incremental"])))
-            elif op == "report":
-                runs.append(await s.submit("report"))
-            elif op == "nxt" and "nxt" in s.engine.manifest["assets"]:
-                runs.append(await s.submit("nxt"))
-            elif op == "cancel" and runs:
+            try:  # a deploy may land between naming a target and the request: refused, as it should be
+                if op == "producer":
+                    runs.append(await s.submit(h.variant["name"], mode=h.rng.choice(["full", "incremental"])))
+                elif op == "report":
+                    runs.append(await s.submit("report"))
+                elif op == "nxt" and "nxt" in s.engine.manifest["assets"]:
+                    runs.append(await s.submit("nxt"))
+            except Refused as error:
+                assert error.status == 400 and "Unknown asset" in str(error), error
+            if op == "cancel" and runs:
                 await s.cancel(h.rng.choice(runs)["id"])
             await s.settle(h.rng.choice([0.05, 0.2]))
         h.armed = False
@@ -262,6 +266,13 @@ async def test_deploys_at_every_await(tmp_path, monkeypatch, seed):
                     tries.append([(a["outcome"], a.get("error")) for t in d["attempts"].values() for a in t])
                     tries[-1].insert(0, [(t["asset"], t["status"], t.get("held")) for t in d["tasks"]])
                 raise AssertionError((h.fired, tries)) from None
+        # No attempt fails by the engine's own error (a try spent on a deploy), but one whose asset a
+        # deploy removed while it was claimed (ERW-27).
+        crashed = []
+        for run in runs:
+            for tries in (await s.get(f"/runs/{run['id']}"))["attempts"].values():
+                crashed += [a["error"] for a in tries if (a.get("error") or "").startswith("engine:")]
+        assert not [e for e in crashed if not re.fullmatch(r"engine: '\w+'", e)], (crashed, h.fired)
         base = {"name": "copy", "axis": "keyed", "store": "default", "edge": True}
         h.variant = base
         s.engine.redeploy(h.project(base).manifest)
