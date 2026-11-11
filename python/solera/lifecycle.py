@@ -27,10 +27,32 @@ def base(run: str, attempt: str) -> str:
 SPEC = ".spec"  # immutable, the engine's
 CONTROL = ".control"  # who owns the attempt, the gate, the sealed result or the end (§2.4)
 BEAT = ".beat"  # the owner's reports while HTTP fails: evidence, never a decision
+# The new tracking path's, written before the spec that names it, deleted once the attempt's end
+# is durable: what the spec would carry per key of its batch and per layer of what it reads.
+SIDECAR = ".core"
 
 
 def chunk(n: int) -> str:
     return f".log.{n:06d}"
+
+
+def sidecar(plan: bytes | None, layers: list) -> bytes:
+    """An attempt's sidecar: its plan's bytes, and the layers of each keyed
+    output it reads, `[output id, head, layers]`. A 4-byte length, the
+    JSON of `{"plan", "layers"}` (`plan`: whether there is one), then
+    the plan's bytes as they are."""
+
+    header = json.dumps({"plan": plan is not None, "layers": layers}, allow_nan=False).encode()
+    return b"".join((len(header).to_bytes(4, "little"), header, plan or b""))
+
+
+def read_sidecar(data: bytes) -> tuple[bytes | None, dict]:
+    """A sidecar's plan (None: it has none) and its layers by (output id, head)."""
+
+    size = int.from_bytes(data[:4], "little")
+    header = json.loads(data[4 : 4 + size])
+    layers = {(id_, head): found for id_, head, found in header["layers"]}
+    return (data[4 + size :] if header["plan"] else None), layers
 
 
 # -- write-completion evidence (§2.3) ------------------------------------------------

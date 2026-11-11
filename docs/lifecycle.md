@@ -78,12 +78,13 @@ engine                                   object store                         wo
 ### 2.1 Attempt objects
 
 All under `runs/{run}/`, all named after the attempt. Only the owner
-writes anything but the spec and the control file's `open` and `ended`
-(§4), so no name needs the worker token.
+writes anything but the spec, its sidecar and the control file's `open`
+and `ended` (§4), so no name needs the worker token.
 
 | Object | Written by | Mode | Meaning |
 |---|---|---|---|
 | `{attempt}.spec` | engine, before `AttemptLaunched` | create-only, immutable | what to run, with `engine` (HTTPS URL), `token` (§5.2), `generation` (§9.7) |
+| `{attempt}.core` | engine, on the new tracking path, before the spec that names it (`sidecar`) | create-only, immutable; deleted once the attempt's end is durable, else with the run | the plan's bytes and the layers of each keyed output the attempt reads, by output id and head: what the spec would carry per key of its batch and per layer (ERW-30). The worker reads it once, when a pin first needs it; an engine that adopts the attempt reads the plan back from it |
 | `{attempt}.control` | the engine creates it before the launch; then the owner and the engine | created once, then only swapped (`If-Match`) | who owns the attempt, whether writing began and its intents, the sealed result, or the engine's end (§2.4) |
 | `{attempt}.beat` | the owner, only while HTTP fails (§6) | overwritten | `{"worker", "seq", "timeline", "usage"}`: evidence the worker lives, never a decision |
 | `{attempt}.log.{n:06d}` | worker | create-only, immutable | a gzip member of the log, flushed every 30 s or 1 MB; a short log has none (§13) |

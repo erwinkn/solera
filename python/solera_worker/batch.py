@@ -2,15 +2,17 @@
 what a worker does differently when its spec says `"tracking": "core"`.
 
 A keyed incremental input loads the keys its plan names: the plan's bytes
-are in the spec, and `PlannedKeys` reads each input's keys, classes and
-versions out of them as columns, which the batch keeps (Python and Rust
-cross once per batch, never per key). A source served live may serve a key
+are in the attempt's sidecar (`Sidecar`), and `PlannedKeys` reads each
+input's keys, classes and versions out of them as columns, which the
+batch keeps (Python and Rust cross once per batch, never per key). A
+source served live may serve a key
 at another version than planned, or not at all: the batch's classes follow
 what it served, and each such key goes back in the result with the version
 it was served at (`delivered[input]["loaded"]`), for the engine to record.
 
 A keyed whole read names its objects from the output's layers in the change
-index (`pages`).
+index (`pages`), which the sidecar lists: the spec names the output's id and
+head alone.
 
 A keyed output's write is stored as its store takes it, every key at the
 attempt's generation, and the keys it changed go back to the engine, which
@@ -22,7 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import tempfile
-from base64 import b64decode, b64encode
+from base64 import b64encode
 from collections.abc import Mapping
 
 import obstore
@@ -39,13 +41,38 @@ def on_core(spec: dict) -> bool:
     return spec.get("tracking") == "core"
 
 
-def planned(spec: dict, pin: dict) -> PlannedKeys:
+class Sidecar:
+    """The attempt's sidecar (`spec["sidecar"]`, `lifecycle.sidecar`): its
+    plan, and the layers of the keyed outputs it reads. Read once, when a
+    batch or a whole read first needs it."""
+
+    def __init__(self, objects, spec: dict):
+        self._objects, self._path = objects, spec.get("sidecar")
+        self._read: tuple[bytes | None, dict] | None = None
+        self._lock = asyncio.Lock()
+
+    async def _parts(self) -> tuple[bytes | None, dict]:
+        async with self._lock:
+            if self._read is None:
+                found = await obstore.get_async(self._objects, self._path)
+                self._read = lifecycle.read_sidecar(bytes(await found.bytes_async()))
+        return self._read
+
+    async def plan(self) -> bytes | None:
+        return None if self._path is None else (await self._parts())[0]
+
+    async def layers(self, pin: dict) -> list:
+        return (await self._parts())[1][(pin["id"], int(pin["head"]))]
+
+
+async def planned(sidecar: Sidecar, pin: dict) -> PlannedKeys:
     """A keyed input's keys in this batch, with their classes and the
     versions they are planned at: none once its walk is done (no plan)."""
 
-    if spec.get("plan") is None:
+    plan = await sidecar.plan()
+    if plan is None:
         return PlannedKeys()
-    return PlannedKeys.decode(b64decode(spec["plan"]), int(pin["core"]))
+    return PlannedKeys.decode(plan, int(pin["core"]))
 
 
 class KeyVersions(Mapping):
@@ -93,18 +120,16 @@ class KeyVersions(Mapping):
         return self._planned.load_keys(sorted=True)
 
 
-async def pages(pin: dict | None, size: int):
+async def pages(sidecar: Sidecar, pin: dict | None, size: int):
     """A keyed output's live keys at its head, each with its version, a page
     at a time: always one page at least."""
 
     if pin is None:
         yield {}
         return
-    index, after = shared(pin["url"]), None
+    index, layers, after = shared(pin["url"]), await sidecar.layers(pin), None
     while True:
-        rows, after = await asyncio.to_thread(
-            index.scan, pin["layers"], int(pin["head"]), after=after, limit=size
-        )
+        rows, after = await asyncio.to_thread(index.scan, layers, int(pin["head"]), after=after, limit=size)
         yield {row[0]: row[2] for row in rows}
         if after is None:
             return

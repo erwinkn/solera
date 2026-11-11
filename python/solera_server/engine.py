@@ -571,7 +571,10 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
             event["read"] = worker["read"]  # what its inputs' reads saw, for lineage
         if keys:
             event["keys"] = keys  # a per-key attempt's keys by outcome
+        launched = (task.get("launched") or {}).get("attempt") == claim["attempt"]
         self.state.record(event)
+        if self.core is not None and launched:
+            self.tasks.spawn(self._drop_sidecar(task["run"], claim["attempt"]))
         if commit is not None:
             # What the commit let go of goes at once, if no reader needs it: a cleanup task.
             cleanup = task.get("cleanup") or {}
@@ -592,6 +595,15 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
             for name, keys in ((commit or {}).get("keys") or {}).items() if outcome == "succeeded" else ():
                 self._cache_commit(name, task["partition"], keys)
             self.keys.ended(claim["attempt"])
+
+    async def _drop_sidecar(self, run: str, attempt: str) -> None:
+        """An ended attempt's sidecar, once its end is durable: no engine
+        adopts the attempt again, so none reads its plan. Best effort: the
+        run's purge deletes whatever is left (`State.delete_run`)."""
+
+        with contextlib.suppress(Exception):
+            await self.state.durable()
+            await self.state.delete_objects([f"{lifecycle.base(run, attempt)}{lifecycle.SIDECAR}"])
 
     def _cache_commit(self, name: str, partition: str, keys: dict | None) -> None:
         """Keep the engine's cache warm with what a commit installed (§5)."""
@@ -1181,6 +1193,7 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
         except planning.UpstreamOnly as error:
             raise Conflict(str(error)) from None
         pins = {}
+        layers: dict = {}  # the new path's: what its pins read, by (output id, head), for the sidecar
         incremental = []
         for input in inputs:
             param, output = input.param, input.output
@@ -1189,7 +1202,9 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
                 refs = self._whole_fan_in(planner, input)
                 pins[param] = {"refs": refs, "load": load}
                 indexes = (
-                    {k: self._whole_index(output, ref) for k, ref in refs.items()} if load == "data" else {}
+                    {k: self._whole_index(output, ref, layers) for k, ref in refs.items()}
+                    if load == "data"
+                    else {}
                 )
                 if any(i is not None for i in indexes.values()):
                     pins[param]["indexes"] = {k: i for k, i in indexes.items() if i is not None}
@@ -1205,7 +1220,10 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
                 incremental.append(input)
             else:
                 pins[param] = {"ref": self._pin_at(output, input.partition), "load": load}
-                if load == "data" and (index := self._whole_index(output, pins[param]["ref"])) is not None:
+                if (
+                    load == "data"
+                    and (index := self._whole_index(output, pins[param]["ref"], layers)) is not None
+                ):
                     pins[param]["index"] = index
         return {
             "asset": asset,
@@ -1214,6 +1232,7 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
             "planner": planner,
             "inputs": inputs,
             "pins": pins,
+            "layers": layers,
             "incremental": incremental,
             "definition": self._definition(task["asset"], run),
             # The whole and dep versions read, which the commit records (its context).
@@ -1269,7 +1288,7 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
                 info["commit_number"] = int((head or {}).get("commit_number", -1)) + 1
             if output.get("key") is not None:
                 if self.core is not None:
-                    info["core"] = output_pin(self.core, name, partition)
+                    info["core"] = output_pin(self.core, name, partition, base["layers"])
                 else:
                     info["index"] = self.m.index(name, partition).to_json()
                 if (name, partition) in self.m.repairs:
@@ -1295,6 +1314,7 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
             "declaration": digest(self._declaration(task["asset"])),
             "prefixes": self._prefixes(pins, outputs, task),
             "inputs": pins,
+            "layers": base["layers"],  # the new path's: the sidecar's (`Core.spec`), never the journal's
             "lineage": lineage,
             "plans": plans,
             "more": more,
@@ -1384,9 +1404,10 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
             raise Retryable(f"input {output!r} has no head for partition {upstream_partition!r}")
         return head["ref"]
 
-    def _whole_index(self, output: str, ref: dict) -> dict | None:
+    def _whole_index(self, output: str, ref: dict, layers: dict) -> dict | None:
         """The pinned key index a whole read of a keyed output on an immutable
-        store needs to name its objects (docs/lifecycle.md §9.8)."""
+        store needs to name its objects (docs/lifecycle.md §9.8); on the new
+        path, its layers go in `layers` (`output_pin`)."""
 
         record = self.manifest["outputs"].get(output) or {}
         store = self.manifest["stores"].get(record.get("store")) or {}
@@ -1397,7 +1418,7 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
         ):
             return None
         if self.core is not None:  # the new path: the layers the worker names its objects from
-            return {"core": output_pin(self.core, output, ref.get("partition") or "")}
+            return {"core": output_pin(self.core, output, ref.get("partition") or "", layers)}
         return self.m.index(output, ref.get("partition") or "").to_json()
 
     @staticmethod

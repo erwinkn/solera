@@ -209,9 +209,10 @@ class Ctx:
         timeline,
         keys_io=None,
         observed=None,
+        sidecar=None,
     ):
         self._objects, self._shipper, self._timeline = objects, shipper, timeline
-        self._keys_io = keys_io
+        self._keys_io, self._sidecar = keys_io, sidecar
         self._observed = observed if observed is not None else Observed()
         # The pinned key indexes of keyed inputs, for whole reads of immutable stores.
         self._indexes: dict[tuple, dict] = {}
@@ -301,7 +302,7 @@ class Ctx:
                 index = {"core": info["core"]}
         store = self._stores[ref.store]
         index = index or self._indexes.get((ref.output, ref.partition))
-        value = await _load_whole(_unobserved, store, ref, t, self._keys_io, index)
+        value = await _load_whole(_unobserved, store, ref, t, self._keys_io, index, sidecar=self._sidecar)
         self._timeline.add("loaded", ref.output, _rows(value), optional=True)
         return value
 
@@ -343,7 +344,7 @@ class Ctx:
         return out
 
 
-async def _resolve_inputs(spec, project, asset, keys_io, timeline, observed: Observed):
+async def _resolve_inputs(spec, project, asset, keys_io, timeline, observed: Observed, sidecar):
     """Load each pin by annotation; build call args + ctx.batch (§5, §10).
 
     An Incremental input over a keyed upstream loads the keys of the batch
@@ -382,6 +383,7 @@ async def _resolve_inputs(spec, project, asset, keys_io, timeline, observed: Obs
                     keys_io,
                     indexes.get(key),
                     _key_column(project, ref.output),
+                    sidecar=sidecar,
                 )
             args[param] = out
             timeline.add("loaded", param)
@@ -405,7 +407,7 @@ async def _resolve_inputs(spec, project, asset, keys_io, timeline, observed: Obs
                 timeline.add("loaded", param, _rows(args[param]))
                 continue
             if "core" in pin:  # the new tracking core: the keys its plan names
-                planned = core.planned(spec, pin)
+                planned = await core.planned(sidecar, pin)
                 args[param] = await observed.load(store, ref, t, Keys(core.KeyVersions(planned)))
                 served = getattr(store, "served", None)
                 classes, loaded = planned.observe(served)
@@ -452,7 +454,14 @@ async def _resolve_inputs(spec, project, asset, keys_io, timeline, observed: Obs
             args[param] = ref
         else:
             args[param] = await _load_whole(
-                observed.load, store, ref, t, keys_io, pin.get("index"), _key_column(project, ref.output)
+                observed.load,
+                store,
+                ref,
+                t,
+                keys_io,
+                pin.get("index"),
+                _key_column(project, ref.output),
+                sidecar=sidecar,
             )
             timeline.add("loaded", param, _rows(args[param]))
     # Every keyed batch held keys, and a source served none of them that changes
@@ -477,7 +486,7 @@ def _key_column(project, output: str) -> str | None:
     return None
 
 
-async def _load_whole(load, store, ref, t, keys_io, index_json, key: str | None = None):
+async def _load_whole(load, store, ref, t, keys_io, index_json, key: str | None = None, *, sidecar=None):
     """A whole read. From an immutable store, a keyed one names its objects
     from the live entries of its pinned index (`Keys`), since a listing would
     also show superseded and abandoned ones (docs/lifecycle.md §9.8): it is
@@ -487,7 +496,7 @@ async def _load_whole(load, store, ref, t, keys_io, index_json, key: str | None 
     if index_json is None or store.writes != "immutable":
         return await load(store, ref, t, None)
     if "core" in index_json:  # the new tracking core: the output's layers in the change index
-        pages = core.pages(index_json["core"], REPAIR_PAGE)
+        pages = core.pages(sidecar, index_json["core"], REPAIR_PAGE)
     else:
         pages = _layer_pages(LayerIndex(keys_io, LayerState.from_json(index_json)))
     paged = _plain(t)  # a type of the store's own (a DataFrame): one read, which the store makes
@@ -1310,9 +1319,12 @@ async def _execute(
         # Index files straight from the store; small writes are the engine's
         # (docs/resolved-commits.md §4).
         keys_io = ObjectIO(objects)
-        args, batch, delivered = await _resolve_inputs(spec, project, asset, keys_io, timeline, observed)
+        sidecar = core.Sidecar(objects, spec)
+        args, batch, delivered = await _resolve_inputs(
+            spec, project, asset, keys_io, timeline, observed, sidecar
+        )
         nothing = delivered.pop("*nothing", False)
-        ctx = Ctx(spec, asset, project, objects, batch, shipper, timeline, keys_io, observed)
+        ctx = Ctx(spec, asset, project, objects, batch, shipper, timeline, keys_io, observed, sidecar)
         signature = inspect.signature(asset.fn)
         if "ctx" in signature.parameters:
             args["ctx"] = ctx

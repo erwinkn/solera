@@ -27,6 +27,7 @@ import secrets
 from base64 import b64decode, b64encode
 
 import orjson
+from solera import lifecycle
 from solera.change_index import open_index
 from solera.threads import in_thread
 
@@ -53,15 +54,17 @@ def canonical(value) -> bytes:
     return orjson.dumps(value, option=orjson.OPT_SORT_KEYS)
 
 
-def output_pin(core: Core, output: str, partition: str) -> dict | None:
+def output_pin(core: Core, output: str, partition: str, layers: dict) -> dict | None:
     """A keyed output as a worker reads it whole: the change index it is in,
-    and its layers and head there, from which it names the output's objects
-    (None: never committed)."""
+    and its id and head there (None: never committed). Its layers at that
+    head, from which the worker names the output's objects, go in `layers`
+    by (id, head), for the attempt's sidecar: the spec never lists them."""
 
     found = core.m.core_output(output, partition)
     if found is None:
         return None
-    return {"url": core.engine.state.objects_url, "layers": found["layers"], "head": found["head"]}
+    layers.setdefault((found["id"], found["head"]), found["layers"])
+    return {"url": core.engine.state.objects_url, "id": found["id"], "head": found["head"]}
 
 
 class Redeployed(Conflict):
@@ -117,7 +120,7 @@ class Core:
             self.index = open_index(url)
         self.heavy = asyncio.Semaphore(HEAVY)
         self.locks: dict[str, asyncio.Lock] = {}  # output id -> held while a commit of it is built
-        self.plans: dict[str, bytes] = {}  # attempt -> its plan, while it runs here (else its spec's)
+        self.plans: dict[str, bytes] = {}  # attempt -> its plan, while it runs here (else its sidecar's)
         self._attached: tuple[int, set[str]] = (0, set())
         # Ids minted by this process: with the event counter, unique in the namespace. An id
         # minted and never recorded names nothing; one recorded moved the counter on.
@@ -203,14 +206,19 @@ class Core:
 
         return f"core/{id_}/{commit:012d}-{by}-{secrets.token_hex(8)}.lay"
 
-    def spec(self, prepared: dict) -> dict:
-        """What the new path adds to an attempt's spec: the field that sends
-        its worker down the new path, and the plan's bytes."""
+    def spec(self, prepared: dict, base: str) -> tuple[dict, bytes | None]:
+        """What the new path adds to an attempt's spec, whose objects are at
+        `base`: the field that sends its worker down the new path, and the
+        name of its sidecar. With the sidecar's bytes, to write before the
+        spec: the plan, and the layers of the keyed outputs it reads (ERW-30).
+        So a spec's size is neither its batch's nor its outputs' history's."""
 
         out = {"tracking": "core"}
-        if prepared.get("plan") is not None:
-            out["plan"] = b64(prepared["plan"])
-        return out
+        plan, layers = prepared.get("plan"), prepared.get("layers") or {}
+        if plan is None and not layers:
+            return out, None
+        out["sidecar"] = f"{base}{lifecycle.SIDECAR}"
+        return out, lifecycle.sidecar(plan, [[id_, head, found] for (id_, head), found in layers.items()])
 
     def check(self, event: bytes | None, minted=()) -> None:
         """Refuse an event the core would not apply, applying nothing; and ids

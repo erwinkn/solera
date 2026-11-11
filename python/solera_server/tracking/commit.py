@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 
 import obstore
 from obstore.exceptions import NotFoundError
+from solera import lifecycle
 from solera._native import Tracking
 
 from ..state import Conflict
@@ -98,7 +99,7 @@ def unkeyed_walks(core: Core, task: dict, prepared: dict) -> dict:
 
 async def plan_of(core: Core, task: dict, attempt: str, prepared: dict) -> bytes | None:
     """The attempt's plan: kept in memory since it was prepared here, else
-    read back from its spec (an engine that adopted it after a restart)."""
+    read back from its sidecar (an engine that adopted it after a restart)."""
 
     if not any(
         (p or {}).get("kind") == "core" and not p.get("done") for p in (prepared.get("plans") or {}).values()
@@ -106,10 +107,11 @@ async def plan_of(core: Core, task: dict, attempt: str, prepared: dict) -> bytes
         return None
     if (plan := core.plans.get(attempt)) is not None:
         return plan
-    spec = await core.engine.state.attempt_spec(task["run"], attempt)
-    if spec is None or spec.get("plan") is None:
-        raise Conflict(f"attempt {attempt}: its spec and the plan in it are gone")
-    return unb64(spec["plan"])
+    data = await core.engine.state.get_object(f"{lifecycle.base(task['run'], attempt)}{lifecycle.SIDECAR}")
+    plan = None if data is None else lifecycle.read_sidecar(data)[0]
+    if plan is None:
+        raise Conflict(f"attempt {attempt}: its sidecar and the plan in it are gone")
+    return plan
 
 
 @contextlib.asynccontextmanager

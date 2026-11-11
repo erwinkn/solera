@@ -120,13 +120,15 @@ async def _attempt_requests(tmp_path, path: str) -> dict:
         storage.close()
 
 
-async def test_n13_an_attempt_costs_todays_requests_and_at_most_its_layer_more(tmp_path):
+async def test_n13_an_attempt_costs_todays_requests_and_at_most_its_layer_and_sidecar_more(tmp_path):
     """N13: outside the index, an attempt's requests are today's, plus at
-    most the commit's layer (its changed keys fit the result)."""
+    most the commit's layer (its changed keys fit the result) and its
+    sidecar (ERW-30): the plan and layers its spec no longer carries. The
+    worker's one GET of the sidecar costs no more than today's reads."""
 
     today = await _attempt_requests(tmp_path, "today")
     core = await _attempt_requests(tmp_path, "core")
-    assert core.get("PUT", 0) <= today.get("PUT", 0) + 1, (today, core)
+    assert core.get("PUT", 0) <= today.get("PUT", 0) + 2, (today, core)
     assert core.get("GET", 0) <= today.get("GET", 0), (today, core)
 
 

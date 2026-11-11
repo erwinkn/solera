@@ -397,13 +397,17 @@ class Attempts:
             "token": lifecycle.token(await self._load_secret(), attempt),
             "generation": claim["generation"],  # chosen before the spec (§9.7)
         }
+        base = lifecycle.base(task["run"], attempt)
+        sidecar = None
         if self.core is not None:  # the new tracking path (build plan rule 4)
-            spec.update(self.core.spec(prepared))
+            fields, sidecar = self.core.spec(prepared, base)
+            spec.update(fields)
         if prepared["cursor"] is not None:
             spec["cursor"] = prepared["cursor"]
         if prepared.get("cleanup") is not None:  # a cleanup task's work (§9.8, K25)
             spec["cleanup"] = prepared["cleanup"]
-        base = lifecycle.base(task["run"], attempt)
+        if sidecar is not None:  # before the spec that names it
+            await self.state.create_object(spec["sidecar"], sidecar)
         await self.state.create_object(f"{base}{lifecycle.SPEC}", json.dumps(spec).encode())
         # Its control file, before the launch: a worker never creates it, so one that
         # finds none stops (§2.4). An engine replaced before `AttemptLaunched` is
