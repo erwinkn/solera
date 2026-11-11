@@ -132,7 +132,7 @@ A store still:
 1. writes each upsert's rows, deletes each remove, clears the partition for a
    whole write;
 2. is `immutable` or `fenced` (`stores.md`);
-3. if immutable, names a key's object `{output}/{partition}/{key}/{generation}`
+3. if immutable, names a key's object `{output}/{partition}/{bucket}/{key}/{generation}`
    and cleanups by `("key", key, generation)`;
 4. if fenced, keeps the fence row's `written` generation and offers
    `reads()`;
