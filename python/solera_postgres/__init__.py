@@ -399,6 +399,8 @@ class PostgresStore:
         if not state["build_schema"]:  # two first builds making it at once collide (probe P8)
             cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (BUILD_SCHEMA,))
             cur.execute(f"CREATE SCHEMA IF NOT EXISTS {_ident(BUILD_SCHEMA)}")
+        # A table of the same name the registry no longer lists: a sweep that has not dropped it yet.
+        cur.execute(f"DROP TABLE IF EXISTS {build}")
         cur.execute(
             f"CREATE TABLE {build} (LIKE {at.table} INCLUDING DEFAULTS INCLUDING CONSTRAINTS "
             "INCLUDING GENERATED INCLUDING INDEXES)"

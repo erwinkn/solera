@@ -7,6 +7,7 @@ SOLERA_TEST_DATABASE_URL points at a scratch database."""
 
 import asyncio
 import os
+import random
 import re
 import tempfile
 import threading
@@ -921,3 +922,107 @@ async def test_the_version_check_is_one_statement_in_the_writes_first_round_trip
     assert len(first_trip) == 3 and "pg_advisory_xact_lock_shared" in first_trip[0]
     assert "solera_versions" in first_trip[1]  # the third is the catalog lookup (_STATE), on lines of its own
     assert len(trips) <= 6  # BEGIN, that pipeline, the DELETE, the COPY, the key check, COMMIT
+
+
+# -- a random history against the decided model -------------------------------------------
+
+
+def _random_history(store, out, seed: int, steps: int) -> None:
+    """Writes, late writes, replays and switches on two partitions of one
+    table, each partition against the model the design was checked with
+    (tests/tracking/fullrun.py, a table with every rule on): after every step
+    the published rows, the registered builds and each build's rows, with
+    their versions, are the model's, and no build is left that the registry
+    does not list. Each call's outcome (refused, published) is the model's."""
+
+    from solera.sdk import TableRef
+    from solera_postgres import BUILD_SCHEMA, _build_name, _qname
+
+    from tests.tracking.core import ABSENT
+    from tests.tracking.fullrun import Output as Model
+
+    rng = random.Random(seed)
+    table, _, _ = store._table(out)
+    models = {p: Model(p, "table") for p in ("p1", "p2")}
+    clears = {p: [] for p in models}
+    held = {p: [] for p in models}  # attempts that planned and stall: written late, if ever
+    last = {p: None for p in models}
+    version = 0
+
+    def prior(p):
+        return TableRef(
+            output=out.name, store="", handle={"table": table, "where": {"site": p}, "key": "id"}, partition=p
+        )
+
+    def write(p, attempt):
+        v, writes, clear, ctx = attempt
+        model = models[p]
+        refused = model.fence > v
+        if not refused:
+            model.fence = max(model.fence, v)
+            model.write(v, writes, clear, None, ctx)
+        context = at(out, v, reset=clear, run=ctx[0], owed=ctx[1], partition=p)
+        upserts = [{"id": k, "v": f"{v}{k}"} for k, value in sorted(writes.items()) if value is not ABSENT]
+        removes = sorted(k for k, value in writes.items() if value is ABSENT)
+        data = upserts if clear else Patch(upserts, remove=removes)
+        try:
+            written = asyncio.run(store.store(data, prior(p), context))
+        except StoreError as error:
+            assert refused and "newer attempt" in str(error), (seed, attempt, error)
+            return
+        assert not refused, (seed, attempt, "the store took a write the model refuses")
+        last[p] = attempt
+        expected = model.builds.get(written.ref.handle.get("build"), model.published)
+        loaded = {r["id"]: r["v"] for r in asyncio.run(store.load(written.ref, list[dict], None))}
+        assert loaded == {k: f"{row.version}{k}" for k, row in expected.items()}, (seed, attempt)
+
+    def check(p):
+        model = models[p]
+        found = sql(f"SELECT id, v, _version FROM {table} WHERE site = %s", (p,)) or []
+        assert {k: (v, g) for k, v, g in found} == {
+            k: (f"{r.version}{k}", r.version) for k, r in model.published.items()
+        }, (seed, p, "published")
+        registered = (registry(store, out, p) or (0, None, []))[2]
+        assert sorted(registered) == sorted(model.builds) == builds(store, out, p), (seed, p, "builds")
+        for run, rows_ in model.builds.items():
+            found = sql(f"SELECT id, v, _version FROM {_qname(BUILD_SCHEMA, _build_name(table, p, run))}")
+            assert {k: (v, g) for k, v, g in found} == {
+                k: (f"{r.version}{k}", r.version) for k, r in rows_.items()
+            }, (seed, p, run)
+
+    sql(f"CREATE TABLE {table} (id text, v text, site text, _version bigint)")
+    for _ in range(steps):
+        p = rng.choice(sorted(models))
+        model, roll = models[p], rng.random()
+        if roll < 0.55:
+            version += 1
+            clear = rng.random() < 0.3
+            keys = rng.sample("abcde", rng.randint(0 if clear else 1, 3))
+            writes = {k: ABSENT if not clear and rng.random() < 0.3 else version for k in keys}
+            named = [None, *clears[p][-3:]]
+            run = rng.choice(named)
+            owed = rng.choice([g for g in named if g != run or g is None])
+            attempt = (version, writes, clear, (run, owed))
+            if clear:
+                clears[p].append(version)
+            if rng.random() < 0.2:
+                held[p].append(attempt)
+            else:
+                write(p, attempt)
+        elif roll < 0.67 and held[p]:
+            write(p, held[p].pop(rng.randrange(len(held[p]))))
+        elif roll < 0.75 and last[p] is not None:
+            write(p, last[p])
+        elif clears[p]:
+            run = rng.choice(clears[p][-3:])
+            newest = model.fence - (1 if rng.random() < 0.2 else 0)
+            expected = model.switch(run, newest)
+            assert asyncio.run(store.full_run_ended(out, p, run, newest)) is expected, (seed, p, run, newest)
+        check(p)
+    for p in models:
+        check(p)
+
+
+@pytest.mark.parametrize("seed", range(int(os.environ.get("SOLERA_RANDOM_HISTORIES", "12"))))
+def test_a_random_history_matches_the_model(store, seed):
+    _random_history(store, output(incremental=True, partition_column="site"), seed, steps=40)
