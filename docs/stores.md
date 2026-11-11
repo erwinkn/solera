@@ -92,9 +92,15 @@ cleanup is one place (K25).
 - A keyed output's write arrives as a `KeyedWrite`, already resolved
   against the engine's key index. A store reads it three ways: `reset` —
   the write is the partition's entire content, so clear the partition first;
-  `chunks()` — the keys to write, a chunk at a time, each `(key, rows)`,
-  only that chunk taken from the write (`iter_chunks()` for a store
-  writing on a thread of its own); and `removes` — the keys to delete.
+  `chunks()` — the keys to write, a `Chunk` of them at a time (`iter_chunks()`
+  for a store writing on a thread of its own); and `removes` — the keys to
+  delete. A chunk is read as columns, each taken from the write only when
+  the store asks: `keys`, sorted; `rows`, every key's rows, a key's after
+  the previous key's; `indices`, where those rows are in what the write was
+  read from (a `range` when they are a run), for a store that writes the
+  producer's Arrow table as it is; and `groups()`, each `(key, rows)`, for
+  a store that writes one object per key. A store writing rows reads
+  `keys` and `rows` and pays nothing per key in Python.
   Every other key stays as it is. An immutable store writes a key at
   most once per generation (a retried call, the same bytes): the
   generation names its object. A key with zero rows

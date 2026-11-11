@@ -34,7 +34,10 @@ use pyo3::create_exception;
 use pyo3::exceptions::{PyKeyError, PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::pybacked::PyBackedBytes;
-use pyo3::types::{PyBool, PyBytes, PyCapsule, PyDict, PyInt, PyList, PyString};
+use pyo3::buffer::PyBuffer;
+use pyo3::types::{
+    PyBool, PyBytes, PyCapsule, PyDict, PyInt, PyList, PyMapping, PyMemoryView, PyRange, PyString,
+};
 
 use error::Error;
 use rayon::prelude::*;
@@ -184,6 +187,10 @@ fn field<'py>(
 ) -> PyResult<Option<Bound<'py, PyAny>>> {
     match row.cast::<PyDict>() {
         Ok(d) => d.get_item(name),
+        Err(_) if !row.is_instance_of::<PyMapping>() => Err(PyValueError::new_err(format!(
+            "a row is a {}, not a mapping",
+            row.get_type().name()?
+        ))),
         Err(_) => match row.get_item(name) {
             Ok(v) => Ok(Some(v)),
             Err(e) if e.is_instance_of::<PyKeyError>(row.py()) => Ok(None),
@@ -452,15 +459,23 @@ impl Rows {
         })
     }
 
-    /// The rows of each of `keys`, as indices into what the rows were made
-    /// from, each key's in their order there: `(rows, ends)`, key `i`'s rows
-    /// at `rows[ends[i - 1]:ends[i]]`. A key the write does not hold is a
-    /// `KeyError`.
-    fn find<'py>(
-        &self,
-        py: Python<'py>,
-        keys: Vec<Bound<'py, PyAny>>,
-    ) -> PyResult<(Bound<'py, PyList>, Bound<'py, PyList>)> {
+    /// Every key, in key order, `size` keys at a time: a `Span` each.
+    fn spans(&self, size: usize) -> PyResult<Spans> {
+        guard(|| {
+            if size == 0 {
+                return Err(PyValueError::new_err("a span holds at least one key"));
+            }
+            Ok(Spans {
+                cursor: Cursor::new(self.table.clone()),
+                table: self.table.clone(),
+                size,
+            })
+        })
+    }
+
+    /// The `Span` of `keys`, in their order. A key the write does not hold
+    /// is a `KeyError`.
+    fn span<'py>(&self, py: Python<'py>, keys: Vec<Bound<'py, PyAny>>) -> PyResult<Span> {
         guard(|| {
             let packed = packed_keys(&keys)?;
             let table = self.table.clone();
@@ -470,19 +485,19 @@ impl Rows {
                     .map(|i| table.find(packed.get(i)))
                     .collect()
             });
-            let (rows, ends) = (PyList::empty(py), PyList::empty(py));
-            let mut n = 0usize;
+            let (mut rows, mut ends) = (Vec::new(), Vec::with_capacity(found.len()));
             for (i, f) in found.into_iter().enumerate() {
                 let Some(f) = f else {
                     return Err(PyKeyError::new_err(keys[i].clone().unbind()));
                 };
-                n += f.len();
-                for r in f {
-                    rows.append(r)?;
-                }
-                ends.append(n)?;
+                rows.extend(f);
+                ends.push(rows.len() as u32);
             }
-            Ok((rows, ends))
+            Ok(Span {
+                keys: packed,
+                ends,
+                rows: Picked::Rows(rows),
+            })
         })
     }
 
@@ -494,6 +509,128 @@ impl Rows {
             Ok(self.table.find(&k).is_some())
         })
     }
+}
+
+/// A key as `key_str` gives it: UTF-8, its lone surrogates escaped as
+/// `row_key` encoded them.
+fn key_str<'py>(py: Python<'py>, k: &[u8]) -> PyResult<Bound<'py, PyAny>> {
+    match std::str::from_utf8(k) {
+        Ok(s) => Ok(PyString::new(py, s).into_any()),
+        Err(_) => PyBytes::new(py, k).call_method1("decode", ("utf-8", "surrogateescape")),
+    }
+}
+
+/// Rows as indices into what they were made from: a run of them, or each.
+enum Picked {
+    Range(usize, usize),
+    Rows(Vec<u32>),
+}
+
+/// A run of a write's keys and their rows (`Rows.spans`, `Rows.span`): the
+/// keys, where each key's rows end, and the rows, as indices into what the
+/// rows were made from, each key's in their order there.
+#[pyclass(module = "solera._native", frozen)]
+struct Span {
+    keys: Arena,
+    ends: Vec<u32>,
+    rows: Picked,
+}
+
+#[pymethods]
+impl Span {
+    /// Keys, not rows.
+    fn __len__(&self) -> usize {
+        self.ends.len()
+    }
+
+    fn keys<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+        let keys = (0..self.keys.len())
+            .map(|i| key_str(py, self.keys.get(i)))
+            .collect::<PyResult<Vec<_>>>()?;
+        PyList::new(py, keys)
+    }
+
+    /// Where each key's rows end among `rows()`.
+    fn ends<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
+        PyList::new(py, &self.ends)
+    }
+
+    /// The rows, each key's after the previous key's: a `range` when they
+    /// are a run of what the rows were made from, else a `memoryview` of
+    /// unsigned 32-bit ints.
+    fn rows<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        match &self.rows {
+            Picked::Range(a, b) => Ok(PyRange::new(py, *a as isize, *b as isize)?.into_any()),
+            Picked::Rows(rows) => {
+                let bytes: Vec<u8> = rows.iter().flat_map(|r| r.to_ne_bytes()).collect();
+                let view = PyMemoryView::from(&PyBytes::new(py, &bytes).into_any())?;
+                view.call_method1("cast", ("I",))
+            }
+        }
+    }
+}
+
+/// A pass over `Rows`, a `Span` of keys at a time (`Rows.spans`).
+#[pyclass(module = "solera._native")]
+struct Spans {
+    cursor: Cursor,
+    table: Arc<Table>,
+    size: usize,
+}
+
+#[pymethods]
+impl Spans {
+    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    fn __next__(&mut self) -> PyResult<Option<Span>> {
+        guard(|| {
+            let (mut keys, mut ends) = (Arena::default(), Vec::new());
+            let (mut from, mut to) = (None, 0);
+            while keys.len() < self.size && self.cursor.read().map_err(to_py)? {
+                let (a, b) = self.cursor.span();
+                let first = *from.get_or_insert(a);
+                to = b;
+                keys.push(self.cursor.entry().0);
+                ends.push((b - first) as u32);
+            }
+            let Some(from) = from else {
+                return Ok(None);
+            };
+            let rows = match self.table.rows_between(from, to) {
+                None => Picked::Range(from, to),
+                Some(order) => {
+                    let mut rows = order.to_vec();
+                    let mut a = 0;
+                    for &b in &ends {
+                        rows[a..b as usize].sort_unstable();
+                        a = b as usize;
+                    }
+                    Picked::Rows(rows)
+                }
+            };
+            Ok(Some(Span { keys, ends, rows }))
+        })
+    }
+}
+
+/// `items[r]` for each `r` of `rows`, a buffer of unsigned 32-bit ints
+/// (`Span.rows`): one pass, no Python per item.
+#[pyfunction]
+fn gather<'py>(
+    py: Python<'py>,
+    items: &Bound<'py, PyList>,
+    rows: &Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyList>> {
+    guard(|| {
+        let rows = PyBuffer::<u32>::get(rows)?.to_vec(py)?;
+        let n = items.len();
+        if let Some(&r) = rows.iter().find(|&&r| r as usize >= n) {
+            return Err(PyValueError::new_err(format!("row {r} of {n}")));
+        }
+        PyList::new(py, rows.iter().map(|&r| items.get_item(r as usize).unwrap()))
+    })
 }
 
 /// A chunk of a sorted stream of keys: a list of keys (`str`, `int` or
@@ -696,6 +833,9 @@ fn solera_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<SortedEntries>()?;
     m.add_class::<Rows>()?;
     m.add_class::<Chunks>()?;
+    m.add_class::<Span>()?;
+    m.add_class::<Spans>()?;
+    m.add_function(wrap_pyfunction!(gather, m)?)?;
     layers_py::register(m)?;
     index_py::register(m)?;
     tracking_py::register(m)?;

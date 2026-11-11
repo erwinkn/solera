@@ -155,6 +155,12 @@ impl Table {
         self.order.as_ref().map_or(p as u32, |o| o[p])
     }
 
+    /// The rows at sorted positions `from..to`; None when the rows arrived
+    /// sorted, so they are the rows `from..to` themselves.
+    pub fn rows_between(&self, from: usize, to: usize) -> Option<&[u32]> {
+        self.order.as_ref().map(|o| &o[from..to])
+    }
+
     /// The first sorted position whose key is not below `key`.
     fn lower(&self, key: &[u8]) -> usize {
         let (mut lo, mut hi) = (0, self.keys.len());
@@ -193,6 +199,8 @@ pub struct Cursor {
     wpays: Vec<Option<Vec<u8>>>,
     start: usize,
     pos: usize,
+    /// The sorted position of the current key's first row.
+    first: usize,
     group: Group,
     ready: bool,
 }
@@ -206,6 +214,7 @@ impl Cursor {
             wpays: Vec::new(),
             start: 0,
             pos: 0,
+            first: 0,
             group: Group::default(),
             ready: false,
         }
@@ -237,6 +246,7 @@ impl Cursor {
             return Ok(false);
         }
         self.fill()?;
+        self.first = self.pos;
         self.group.start(self.wkeys.get(self.pos - self.start));
         loop {
             let i = self.pos - self.start;
@@ -257,6 +267,12 @@ impl Cursor {
     /// The current key and its payload, after `read` returned true.
     pub fn entry(&self) -> (&[u8], Option<&[u8]>) {
         (&self.group.key, self.group.payload.as_deref())
+    }
+
+    /// The sorted positions of the current key's rows, after `read`
+    /// returned true.
+    pub fn span(&self) -> (usize, usize) {
+        (self.first, self.pos)
     }
 }
 
