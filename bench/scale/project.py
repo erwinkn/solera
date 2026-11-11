@@ -18,6 +18,7 @@ keyed write's line counts the keys it writes (`keys`) and removes
 
 from __future__ import annotations
 
+import asyncio
 import json
 import mmap
 import os
@@ -85,7 +86,7 @@ class PackStore(FileStore):
         start = clocks()
         rows: dict = {}
         async for chunk in write.chunks():
-            rows.update(chunk)
+            rows.update(await asyncio.to_thread(chunk.groups))
         await create(self._objects(), f"{base}/{generation}.pkl", pickle.dumps(rows, protocol=5))
         record("store_write", start, output=context.output.name, keys=len(rows), removed=len(write.removes))
         ref = self._ref(context, {"mode": "keyed", "path": base, "key": context.output.key})
