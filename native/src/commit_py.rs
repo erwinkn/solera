@@ -13,7 +13,7 @@ use solera_tracking::plan::Indexes;
 use crate::index_py::{self, key, layer_out, rt};
 use crate::{guard, FormatError};
 
-fn err(e: tr::Error) -> PyErr {
+pub(crate) fn err(e: tr::Error) -> PyErr {
     match e {
         tr::Error::Format(m) => FormatError::new_err(m),
         tr::Error::Invalid(m) => PyValueError::new_err(m),
