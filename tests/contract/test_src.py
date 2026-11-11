@@ -660,3 +660,202 @@ async def test_src_12_a_log_that_moved_since_the_batchs_head_keeps_its_version(s
     assert not (await solera.commit_source("feed", upsert={"k1": "4"}))["changed"]
     await solera.run("items")
     assert await solera.rows("items") == {"k1": "4"} and await solera.stale("items") == []
+
+
+# -- SRC-13: a keyed loader may serve one Arrow table ------------------------------------------
+
+
+def arrow_rows(rows: list[dict]):
+    """`rows`, each with its `etag`, as one Arrow table: its columns even when empty."""
+
+    import pyarrow as pa
+
+    schema = pa.schema([("id", pa.string()), ("v", pa.int64()), ("etag", pa.string())])
+    return pa.Table.from_pylist(rows, schema=schema)
+
+
+async def test_src_13_a_keyed_loader_may_serve_one_arrow_table(solera):
+    """`Loaded(table, version="etag")`: the consumer gets the rows of the keys
+    asked, in key order and without the version column, whatever the table's
+    order and whatever else it holds; `served` each key's version from its
+    column. A key with no row was served absent."""
+
+    outside = {"a": 1, "b": 2, "z": 9}  # z is never asked
+    seen = []
+
+    @source(key="id")
+    async def files(keys, ctx):
+        rows = [{"id": k, "v": v, "etag": f"etag-{v}"} for k, v in outside.items()]
+        return Loaded(arrow_rows(rows[::-1]), version="etag")
+
+    @asset(inputs={"files": Incremental()}, outputs=Output("copy", key="id"))
+    def copy(ctx, files: list):
+        b = ctx.batch["files"]
+        seen.append((files, {k: v for k, v in b.served.items() if v}, sorted(b.removed)))
+        return rebuild(b, files)
+
+    await solera.deploy(Project(assets=[copy], sources=[files], default_store=FileStore(solera.root / "out")))
+    await solera.commit_source("files", upsert={"a": "1", "b": "2"})
+    await solera.run("copy")
+    assert seen == [([{"id": "a", "v": 1}, {"id": "b", "v": 2}], {"a": "etag-1", "b": "etag-2"}, [])]
+    del outside["b"]
+    outside["a"] = 3
+    await solera.commit_source("files", upsert={"a": "3", "b": "3"})
+    await solera.run("copy")
+    assert seen[-1] == ([{"id": "a", "v": 3}], {"a": "etag-3"}, ["b"])  # b has no row: served absent
+    assert await solera.rows("copy") == {"a": 3}
+
+
+@pytest.mark.parametrize("form", ["table", "dict"])
+async def test_src_13_the_rows_come_as_the_parameter_asks(solera, form):
+    """The same rows, served as a table or a dict, to a list, a DataFrame and
+    an Arrow table."""
+
+    import pandas as pd
+    import pyarrow as pa
+
+    got = {}
+
+    @source(key="id")
+    async def files(keys, ctx):
+        if form == "dict":
+            return {k: Loaded({"id": k, "v": int(k[1:])}, version="e") for k in keys}
+        return Loaded(arrow_rows([{"id": k, "v": int(k[1:]), "etag": "e"} for k in keys]), version="etag")
+
+    @asset(inputs={"files": Incremental()})
+    def as_list(files: list):
+        got["list"] = files
+
+    @asset(inputs={"files": Incremental()})
+    def as_frame(files: pd.DataFrame):
+        got["frame"] = files.to_dict("records")
+
+    @asset(inputs={"files": Incremental()})
+    def as_table(files: pa.Table):
+        got["table"] = (files.schema.names, files.to_pylist())
+
+    await solera.deploy(Project(assets=[as_list, as_frame, as_table], sources=[files]))
+    await solera.commit_source("files", upsert={"k1": "1", "k2": "2"})
+    await solera.run(["as_list", "as_frame", "as_table"])
+    rows = [{"id": "k1", "v": 1}, {"id": "k2", "v": 2}]
+    assert got == {"list": rows, "frame": rows, "table": (["id", "v"], rows)}
+
+
+async def test_src_13_a_per_key_consumer_gets_each_keys_row(solera):
+    got = {}
+
+    @source(key="id")
+    async def files(keys, ctx):
+        return Loaded(arrow_rows([{"id": k, "v": int(k[1:]), "etag": "e"} for k in keys]), version="etag")
+
+    @asset(inputs={"row": Incremental("files", each=True)}, outputs=Output("each", key="id"))
+    def each(ctx, row: list):
+        got[ctx.key] = row
+        return row
+
+    await solera.deploy(Project(assets=[each], sources=[files]))
+    await solera.commit_source("files", upsert={"k1": "1", "k2": "2"})
+    await solera.run("each")
+    assert got == {"k1": [{"id": "k1", "v": 1}], "k2": [{"id": "k2", "v": 2}]}
+
+
+@pytest.mark.parametrize(
+    ("columns", "error"),
+    [
+        ({"id": ["a", "a"], "etag": ["1", "2"]}, 'key "a" has two rows'),
+        ({"id": ["a", None], "etag": ["1", "2"]}, 'column "id" has nulls'),
+        ({"etag": ["1"]}, 'no column "id"'),
+        ({"id": ["a"]}, 'no column "etag"'),
+        ({"id": ["a"], "etag": [1]}, 'version column "etag" must hold strings, not Int64'),
+        ({"id": ["a", "b"], "etag": ["1", None]}, 'column "etag" has nulls'),
+    ],
+    ids=[
+        "duplicate key",
+        "null key",
+        "no key column",
+        "no version column",
+        "version not a string",
+        "null version",
+    ],
+)
+async def test_src_13_a_table_that_cannot_say_what_it_served_fails_the_load(solera, columns, error):
+    import pyarrow as pa
+
+    @source(key="id")
+    async def files(keys, ctx):
+        return Loaded(pa.table(columns), version="etag")
+
+    @asset(inputs={"files": Incremental()})
+    def count(files: list):
+        return len(files)
+
+    await solera.deploy(Project(assets=[count], sources=[files]))
+    await solera.commit_source("files", upsert={"a": "1"})
+    detail = await solera.run("count", expect="failed")
+    [[attempt]] = detail["attempts"].values()
+    assert f"source 'files': {error}" in attempt["error"]
+
+
+@pytest.mark.parametrize("seed", range(4))
+async def test_src_13_the_table_and_dict_forms_serve_alike(solera, seed):
+    """Random histories, the same for two sources: `d` answers a dict of
+    `Loaded` rows, `t` one Arrow table, shuffled and holding keys not asked.
+    Commits name versions behind, at and ahead of what is served, and keys
+    the outside has lost; some runs are full. Each consumer's loads ask the
+    same keys, and its batches get the same classes, served versions and
+    rows; the outputs end equal."""
+
+    import random
+
+    rng = random.Random(seed)
+    universe = [f"k{i:02}" for i in range(14)]
+    outside: dict[str, int] = {}
+    asked = {"d": [], "t": []}
+    seen = {"d": [], "t": []}
+
+    @source(key="id")
+    async def d(keys, ctx):
+        asked["d"].append(list(keys))
+        return {k: Loaded({"id": k, "v": v}, version=f"e{v}") for k, v in outside.items()}
+
+    @source(key="id")
+    async def t(keys, ctx):
+        asked["t"].append(list(keys))
+        rows = [{"id": k, "v": v, "etag": f"e{v}"} for k, v in outside.items()]
+        random.Random(repr(keys)).shuffle(rows)
+        return Loaded(arrow_rows(rows), version="etag")
+
+    def record(b, rows):
+        served = dict(b.served.items())
+        return (b.index, b.reset, b.added, b.updated, b.removed, b.unchanged, served, rows)
+
+    @asset(inputs={"d": Incremental(batch_size=4)}, outputs=Output("out_d", key="id"))
+    def use_d(ctx, d: list):
+        seen["d"].append(record(ctx.batch["d"], d))
+        return rebuild(ctx.batch["d"], d)
+
+    @asset(inputs={"t": Incremental(batch_size=4)}, outputs=Output("out_t", key="id"))
+    def use_t(ctx, t: list):
+        seen["t"].append(record(ctx.batch["t"], t))
+        return rebuild(ctx.batch["t"], t)
+
+    await solera.deploy(
+        Project(assets=[use_d, use_t], sources=[d, t], default_store=FileStore(solera.root / "out"))
+    )
+    for _ in range(8):
+        for k in rng.sample(universe, 5):  # the outside moves: a key added or moved, or lost
+            if rng.random() < 0.3:
+                outside.pop(k, None)
+            else:
+                outside[k] = outside.get(k, 0) + 1
+        upsert = {k: f"e{outside.get(k, 0) + rng.choice([-1, 0, 0, 1])}" for k in rng.sample(universe, 6)}
+        remove = [k for k in rng.sample(universe, 2) if k not in upsert]
+        for name in ("d", "t"):
+            await solera.commit_source(name, upsert=upsert, remove=remove)
+        mode = {"mode": "full"} if rng.random() < 0.15 else {}
+        await solera.run("use_d", **mode)
+        await solera.run("use_t", **mode)
+    assert asked["t"] == asked["d"]
+    assert seen["t"] == seen["d"]
+    assert any(b[2] or b[3] for b in seen["d"]) and any(b[4] for b in seen["d"])
+    assert await solera.rows("out_t") == await solera.rows("out_d")
