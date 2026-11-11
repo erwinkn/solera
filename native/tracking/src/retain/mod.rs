@@ -103,7 +103,10 @@ impl Merged {
     /// Where the replaced layers start in the output's list.
     fn start(&self, t: &Tracking) -> Result<usize> {
         let Some(o) = t.outputs.get(&self.output) else {
-            return invalid(format!("a merge of {}, which has no layers", name(&self.output)));
+            return invalid(format!(
+                "a merge of {}, which has no layers",
+                name(&self.output)
+            ));
         };
         let start = o
             .layers
@@ -238,7 +241,7 @@ impl Cleaned {
         })
     }
 
-    pub(crate) fn check(&self, t: &Tracking) -> Result<()> {
+    pub fn check(&self, t: &Tracking) -> Result<()> {
         let at = t.retain.cursors.get(&self.output);
         if at != Some(&self.from) {
             return invalid(format!(
@@ -286,8 +289,7 @@ impl Retire {
     }
 
     pub(crate) fn check(&self, t: &Tracking) -> Result<()> {
-        if !t.outputs.contains_key(&self.output) && !t.retain.cursors.contains_key(&self.output)
-        {
+        if !t.outputs.contains_key(&self.output) && !t.retain.cursors.contains_key(&self.output) {
             return invalid(format!("no output {} to retire", name(&self.output)));
         }
         if let Some((e, _)) = t.edges.iter().find(|(_, e)| e.input == self.output) {

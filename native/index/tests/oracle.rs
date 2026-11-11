@@ -1825,9 +1825,12 @@ fn a_layer_damaged_in_the_store_is_not_downloaded_after_every_read() {
             }
         }
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        assert_eq!(ix.store.stats.counts().fills, 1, "one download of a damaged layer");
+        assert_eq!(
+            ix.store.stats.counts().fills,
+            1,
+            "one download of a damaged layer"
+        );
         assert_eq!(ix.store.disk_bytes(), 0);
     });
     let _ = std::fs::remove_dir_all(dir);
 }
-

@@ -18,6 +18,7 @@ pub mod error;
 pub(crate) mod index_py;
 pub mod layers;
 mod layers_py;
+mod retain_py;
 pub mod rows;
 pub mod sort;
 mod stale_py;
@@ -698,6 +699,7 @@ fn solera_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     index_py::register(m)?;
     tracking_py::register(m)?;
     commit_py::register(m)?;
+    retain_py::register(m)?;
     m.add_function(wrap_pyfunction!(content_digest, m)?)?;
     m.add_function(wrap_pyfunction!(_panic, m)?)?;
     Ok(())

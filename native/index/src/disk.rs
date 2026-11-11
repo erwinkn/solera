@@ -75,7 +75,8 @@ impl DiskState {
     fn fail(&mut self, path: &str) {
         let n = self.failed.get(path).map_or(0, |&(_, n)| n + 1);
         if n == 0 && self.failed.len() >= FAILED {
-            self.failed.retain(|_, &mut (t, n)| t.elapsed() < backoff(n));
+            self.failed
+                .retain(|_, &mut (t, n)| t.elapsed() < backoff(n));
             let oldest = self.failed.iter().min_by_key(|(_, &(t, _))| t);
             if let Some(p) = oldest
                 .filter(|_| self.failed.len() >= FAILED)

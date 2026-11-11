@@ -72,6 +72,8 @@ enum Off {
     Pieces,
     /// Core: the cut ignores the cleanup cursor.
     Cursor,
+    /// Core: the cut ignores B6's `seen` of a per-key edge with failing keys.
+    Seen,
     /// Engine: the cut ignores retained runs' records.
     Records,
     /// Engine: the cut ignores live attempts' heads.
@@ -230,7 +232,11 @@ impl Model {
         let items_: Vec<(&[u8], Change<'_>)> = named.iter().map(|(k, c)| (&k[..], *c)).collect();
         let changes = Changes::of(&items_).unwrap();
         let old = self.states.last().unwrap().clone();
-        let mut now = if mode == Mode::Patch { old.clone() } else { St::new() };
+        let mut now = if mode == Mode::Patch {
+            old.clone()
+        } else {
+            St::new()
+        };
         for (k, ch) in &named {
             match ch {
                 Change::Removed => {
@@ -252,9 +258,15 @@ impl Model {
             ends_full_run: mode == Mode::Clear,
             collect: 0,
         };
-        let built = build(&OneIndex(&self.ix), &items(), &out, spec, &mut Held(Some(&changes)))
-            .await
-            .map_err(|e| format!("commit {c}: {e}"))?;
+        let built = build(
+            &OneIndex(&self.ix),
+            &items(),
+            &out,
+            spec,
+            &mut Held(Some(&changes)),
+        )
+        .await
+        .map_err(|e| format!("commit {c}: {e}"))?;
         let Some(b) = built else {
             return (now == old)
                 .then_some(())
@@ -276,7 +288,10 @@ impl Model {
     }
 
     fn range(&mut self) -> KeyRange {
-        let (a, b) = (self.rng.random_range(0..=KEYS), self.rng.random_range(0..=KEYS));
+        let (a, b) = (
+            self.rng.random_range(0..=KEYS),
+            self.rng.random_range(0..=KEYS),
+        );
         let (lo, hi) = (a.min(b), a.max(b));
         if lo == hi {
             return KeyRange::all();
@@ -356,7 +371,8 @@ impl Model {
             waiting: vec![],
         };
         let run = self.name("r");
-        self.runs.push_back(record_pins(&rec, b"own", run.as_bytes()));
+        self.runs
+            .push_back(record_pins(&rec, b"own", run.as_bytes()));
         while self.runs.len() > self.keep {
             self.runs.pop_front();
         }
@@ -371,7 +387,10 @@ impl Model {
                 .map_err(|e| format!("a merge built earlier was refused: {e}"))?;
             if self.rng.random_bool(0.8) {
                 for p in replaced {
-                    self.mem.delete(&Path::from(format!("t/{p}"))).await.unwrap();
+                    self.mem
+                        .delete(&Path::from(format!("t/{p}")))
+                        .await
+                        .unwrap();
                 }
             }
             return Ok(());
@@ -441,6 +460,22 @@ impl Model {
             .map_err(|e| format!("a cleanup step was refused: {e}"))
     }
 
+    /// B6 looks for reverts on an edge through the head (its `seen` only
+    /// rises), and some of its keys fail or none do. While some do, its
+    /// next look reads the window after `seen`.
+    fn pass(&mut self) {
+        let edge: Id = EDGES[self.rng.random_range(0..EDGES.len())].into();
+        let head = self.head();
+        let k = self.t.per_key.entry(edge.clone()).or_default();
+        k.seen = k.seen.max(head);
+        let failing = Output {
+            live: self.rng.random_range(0..2),
+            head: 1,
+            ..Default::default()
+        };
+        self.t.outputs.insert(output_id(FAILURES, &edge), failing);
+    }
+
     /// A person releases a consumer's place: it owes a full run.
     fn release(&mut self) {
         let edge = EDGES[self.rng.random_range(0..EDGES.len())];
@@ -470,7 +505,10 @@ impl Model {
             if layers.iter().any(|l| l.path == p) || building.contains(&p) {
                 return Err(format!("{p} is live, and named an orphan"));
             }
-            self.mem.delete(&Path::from(format!("t/{p}"))).await.unwrap();
+            self.mem
+                .delete(&Path::from(format!("t/{p}")))
+                .await
+                .unwrap();
         }
         Ok(())
     }
@@ -487,19 +525,46 @@ impl Model {
         let got: St = (0..page.run.len())
             .map(|i| {
                 let r = page.run.rows(i).start;
-                (page.run.key(i).to_vec(), int(page.run.new_version(r)).unwrap())
+                (
+                    page.run.key(i).to_vec(),
+                    int(page.run.new_version(r)).unwrap(),
+                )
             })
             .collect();
         if &got != want {
-            return Err(format!("the index at {head} holds {got:?}, the log {want:?}"));
+            return Err(format!(
+                "the index at {head} holds {got:?}, the log {want:?}"
+            ));
         }
         let mut marks: Vec<(u64, String)> = vec![];
         for (id, e) in &self.t.edges {
             let k = e.progress.keyed().unwrap();
-            marks.extend(k.commits().map(|c| (c, format!("{}'s piece", String::from_utf8_lossy(id)))));
+            marks.extend(
+                k.commits()
+                    .map(|c| (c, format!("{}'s piece", String::from_utf8_lossy(id)))),
+            );
         }
-        marks.extend(self.runs.iter().flatten().map(|p| (p.commit, "a retained record".into())));
-        marks.extend(self.attempts.iter().map(|a| (a.head, "a live attempt's head".into())));
+        marks.extend(
+            self.runs
+                .iter()
+                .flatten()
+                .map(|p| (p.commit, "a retained record".into())),
+        );
+        marks.extend(
+            self.attempts
+                .iter()
+                .map(|a| (a.head, "a live attempt's head".into())),
+        );
+        for (id, k) in &self.t.per_key {
+            if self
+                .t
+                .outputs
+                .get(&output_id(FAILURES, id))
+                .is_some_and(|o| o.live > 0)
+            {
+                marks.push((k.seen, format!("{}'s seen", String::from_utf8_lossy(id))));
+            }
+        }
         let cursor = self.t.retain.cursors.get(ITEMS).copied();
         marks.extend(cursor.map(|c| (c, "the cleanup cursor".into())));
         for (c, what) in marks {
@@ -512,13 +577,21 @@ impl Model {
             let mut seen = BTreeSet::new();
             for i in 0..page.run.len() {
                 let (k, r) = (page.run.key(i), page.run.rows(i).start);
-                let (new, old) = (int(page.run.new_version(r)), int(page.run.replaced_version(r)));
+                let (new, old) = (
+                    int(page.run.new_version(r)),
+                    int(page.run.replaced_version(r)),
+                );
                 if new != want.get(k).copied() || old != was.get(k).copied() {
-                    return Err(format!("{what}: diff {c}..{head} of {k:?} is {old:?} -> {new:?}"));
+                    return Err(format!(
+                        "{what}: diff {c}..{head} of {k:?} is {old:?} -> {new:?}"
+                    ));
                 }
                 seen.insert(k.to_vec());
             }
-            let moved = was.keys().chain(want.keys()).any(|k| was.get(k) != want.get(k) && !seen.contains(k));
+            let moved = was
+                .keys()
+                .chain(want.keys())
+                .any(|k| was.get(k) != want.get(k) && !seen.contains(k));
             if moved {
                 return Err(format!("{what}: diff {c}..{head} misses a key"));
             }
@@ -560,7 +633,8 @@ impl Model {
                     }
                 }
                 65..80 => self.merge().await?,
-                80..90 => self.clean().await?,
+                80..87 => self.clean().await?,
+                87..90 => self.pass(),
                 90..93 => self.release(),
                 93..96 => {
                     self.runs.pop_front();
@@ -585,6 +659,7 @@ fn history(seed: u64, off: Off, rt: &tokio::runtime::Runtime) -> Res {
         o.set(match off {
             Off::Pieces => rules::PIECES,
             Off::Cursor => rules::CURSOR,
+            Off::Seen => rules::SEEN,
             _ => 0,
         })
     });
@@ -610,6 +685,7 @@ fn each_rule_switched_off_breaks_a_history() {
     for off in [
         Off::Pieces,
         Off::Cursor,
+        Off::Seen,
         Off::Records,
         Off::CutAttempts,
         Off::CleanupAttempts,
@@ -667,12 +743,15 @@ fn parts_and_cursors_round_trip() {
 }
 
 #[test]
-fn a_merge_is_refused_unless_it_replaces_adjacent_layers_folds_within_the_cut_and_writes_a_new_path() {
+fn a_merge_is_refused_unless_it_replaces_adjacent_layers_folds_within_the_cut_and_writes_a_new_path(
+) {
     let rt = runtime();
     let mut m = commits(&rt, 4);
     let layers = m.layers();
     let built = |m: &Model, run: std::ops::Range<usize>, cut: u64, path: &str| {
-        let layer = rt.block_on(m.ix.merge(&layers, run.clone(), cut, path)).unwrap();
+        let layer = rt
+            .block_on(m.ix.merge(&layers, run.clone(), cut, path))
+            .unwrap();
         Merged {
             output: items(),
             replaced: layers[run].iter().map(|l| l.path.clone()).collect(),
@@ -681,7 +760,8 @@ fn a_merge_is_refused_unless_it_replaces_adjacent_layers_folds_within_the_cut_an
     };
     // the cursor at 0 holds the cut: no fold
     let fold = built(&m, 0..2, 2, "items/f.lay");
-    let e = m.t.check_event(&Event::of(vec![Part::Merged(fold.clone())]));
+    let e =
+        m.t.check_event(&Event::of(vec![Part::Merged(fold.clone())]));
     assert!(format!("{e:?}").contains("Cursor"), "{e:?}");
     m.apply(Part::Cleaned(Cleaned {
         output: items(),
@@ -706,11 +786,17 @@ fn a_merge_is_refused_unless_it_replaces_adjacent_layers_folds_within_the_cut_an
     // the same path as a layer in the list
     let mut twice = ok.clone();
     twice.layer.path = layers[3].path.clone();
-    assert!(m.t.check_event(&Event::of(vec![Part::Merged(twice)])).is_err());
+    assert!(m
+        .t
+        .check_event(&Event::of(vec![Part::Merged(twice)]))
+        .is_err());
     // replaced layers not adjacent
     let mut gap = ok.clone();
     gap.replaced = vec![layers[0].path.clone(), layers[2].path.clone()];
-    assert!(m.t.check_event(&Event::of(vec![Part::Merged(gap)])).is_err());
+    assert!(m
+        .t
+        .check_event(&Event::of(vec![Part::Merged(gap)]))
+        .is_err());
     m.apply(Part::Merged(ok.clone())).unwrap();
     assert_eq!(m.layers().len(), 3);
     assert_eq!(m.layers()[0].floor, Some(1));
@@ -887,7 +973,10 @@ fn the_alarm_names_what_holds_the_cut() {
     assert_eq!(got.len(), 1);
     assert_eq!((got[0].above, &got[0].cut.by), (above, &run.by));
     assert!(alarms(&m.t, cuts, multiple + 1).is_empty());
-    assert!(alarms(&m.t, super::cuts(&m.t, &[]), 0).is_empty(), "nothing is above the head");
+    assert!(
+        alarms(&m.t, super::cuts(&m.t, &[]), 0).is_empty(),
+        "nothing is above the head"
+    );
 }
 
 #[test]
@@ -961,8 +1050,10 @@ fn an_output_retires_once_no_edge_reads_it() {
     let retire = || Part::Retire(Retire { output: items() });
     assert!(m.apply(retire()).is_err());
     for e in EDGES {
-        m.apply(Part::EdgeClose(crate::progress::EdgeClose { edge: e.into() }))
-            .unwrap();
+        m.apply(Part::EdgeClose(crate::progress::EdgeClose {
+            edge: e.into(),
+        }))
+        .unwrap();
     }
     m.apply(retire()).unwrap();
     assert!(!m.t.outputs.contains_key(ITEMS));
