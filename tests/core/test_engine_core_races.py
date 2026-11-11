@@ -7,7 +7,19 @@ import asyncio
 import threading
 
 import pytest
-from solera.sdk import Commit, Incremental, Output, Project, Retry, Source, Tick, asset, sensor
+from solera.sdk import (
+    Commit,
+    DynamicPartitions,
+    In,
+    Incremental,
+    Output,
+    Project,
+    Retry,
+    Source,
+    Tick,
+    asset,
+    sensor,
+)
 from solera.stores import FileStore, Patch
 from solera_server.state import Conflict
 from solera_server.tracking import sources
@@ -359,3 +371,172 @@ async def test_an_engine_on_the_same_host_as_its_predecessor_serves_on_s3(tmp_pa
             await second.close()
         await first.close()
         storage.close()
+
+
+class _Gate:
+    """Holds `engine.core.run` after its first call of one native function,
+    until released."""
+
+    def __init__(self, engine, name: str):
+        self.name, self.run, self.calls = name, engine.core.run, 0
+        self.reached, self.release = asyncio.Event(), asyncio.Event()
+        engine.core.run = self
+
+    async def __call__(self, fn, *args, **kwargs):
+        out = await self.run(fn, *args, **kwargs)
+        if getattr(fn, "__name__", "") == self.name:
+            self.calls += 1
+            if self.calls == 1:
+                self.reached.set()
+                await self.release.wait()
+        return out
+
+
+async def test_a_consumer_opening_its_edge_while_an_outputs_first_commit_is_built_refuses_nothing(
+    solera, tmp_path
+):
+    @asset(outputs=Output("items", key="id"), retries=Retry(n=0))
+    def items():
+        return [{"id": "k", "v": "1"}]
+
+    @asset(inputs={"items": Incremental()}, outputs=Output("copy", key="id"))
+    def copy(items: list):
+        return [{"id": r["id"], "v": r["v"]} for r in items]
+
+    await solera.deploy(Project(assets=[items, copy], default_store=FileStore(tmp_path / "data")))
+    gate = _Gate(solera.engine, "build_commit")
+    request = await solera.submit("items")
+    driving = asyncio.create_task(solera.engine.run_until(request["id"], 30))
+    await asyncio.wait_for(gate.reached.wait(), 10)
+    await solera.submit("copy")  # its edge names items' id while items' first commit is built
+    await solera.until(lambda: any(e[1] for e in solera.engine.m.core_edges.values()), 10)
+    gate.release.set()
+    await driving
+    detail = await solera.get(f"/runs/{request['id']}")
+    assert detail["request"]["status"] == "succeeded", detail
+
+
+async def test_a_run_cancelled_while_its_batch_is_planned_keeps_no_plan(solera, tmp_path):
+    @asset(outputs=Output("items", key="id"))
+    def items():
+        return [{"id": f"k{n}", "v": "1"} for n in range(6)]
+
+    @asset(inputs={"items": Incremental(batch_size=3)}, outputs=Output("copy", key="id"))
+    def copy(items: list):
+        return [{"id": r["id"], "v": r["v"]} for r in items]
+
+    await solera.deploy(Project(assets=[items, copy], default_store=FileStore(tmp_path / "data")))
+    await solera.run("items")
+    for _ in range(3):
+        gate = _Gate(solera.engine, "plan")
+        request = await solera.submit("copy")
+        driving = asyncio.create_task(solera.engine.run_until(request["id"], 30))
+        await asyncio.wait_for(gate.reached.wait(), 10)
+        await solera.engine.cancel(request["id"])
+        gate.release.set()
+        await asyncio.gather(driving, return_exceptions=True)
+        solera.engine.core.run = gate.run
+        await solera.settle(0.2)
+        assert solera.engine.core.plans == {}
+
+
+async def test_a_key_another_input_took_while_a_clear_came_in_is_planned_again_once(solera, tmp_path):
+    """join reads feed and copy. Its batch takes k1, changed on feed alone,
+    and runs while copy's full run clears copy: copy's input is unsettled,
+    so k1, which it did not take, would be held back on both inputs. The
+    batch commits nothing and is planned again, once: copy is complete by
+    then, so the new batch takes k1 on both inputs."""
+
+    seen = []
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    @asset(inputs={"feed": Incremental()}, outputs=Output("copy", key="id"))
+    def copy(feed: list):
+        return [{"id": r["id"], "v": r["v"]} for r in feed]
+
+    @asset(inputs={"feed": Incremental(), "copy": Incremental()}, outputs=Output("join", key="id"))
+    async def join(ctx, feed: list, copy: list):
+        seen.append(sorted(r["id"] for r in feed))
+        if not entered.is_set() and len(seen) == 2:
+            entered.set()
+            await release.wait()
+        rows = {r["id"]: r["v"] for r in copy} | {r["id"]: r["v"] for r in feed}
+        return [{"id": k, "v": v} for k, v in rows.items()]
+
+    outside = Outside()
+    await solera.deploy(
+        Project(
+            assets=[copy, join],
+            sources=[Source("feed", key="id", store="ext")],
+            stores={"ext": SourceStore(tmp_path / "ext", outside)},
+            default_store=FileStore(tmp_path / "data"),
+        )
+    )
+    outside.feed.update({"k1": "1", "k2": "1"})
+    await solera.commit_source("feed", upsert={"k1": "1", "k2": "1"})
+    await solera.run("copy")
+    await solera.run("join")
+    outside.feed["k1"] = "2"
+    await solera.commit_source("feed", upsert={"k1": "2"})
+    request = await solera.submit("join")
+    await solera.until(entered.is_set)
+    await solera.run("copy", mode="full")  # its clear comes in after join's batch was planned
+    release.set()
+    detail = await solera.wait(request)
+    assert detail["request"]["status"] == "succeeded"
+    [task] = detail["tasks"]
+    assert [a["outcome"] for a in detail["attempts"][task["id"]]] == ["replanned", "succeeded"]
+    assert seen == [["k1", "k2"], ["k1"], ["k1"]]  # planned again once, not in a loop
+    assert await solera.rows("join") == {"k1": "2", "k2": "1"}
+
+
+@pytest.mark.parametrize("dynamic", [False, True])
+async def test_a_rename_while_a_commit_is_built_sends_the_batch_back(solera, monkeypatch, dynamic):
+    rows = ["a"]
+
+    def project(name, aliases=()):
+        def body():
+            return list(rows) if dynamic else [{"id": k, "v": 1} for k in rows]
+
+        body.__name__ = body.__qualname__ = name
+        made = asset(outputs=DynamicPartitions() if dynamic else Output(key="id"), aliases=list(aliases))(
+            body
+        )
+
+        @asset(inputs={"members": In(name)})
+        def report(members: list):
+            return members
+
+        return Project(assets=[made, report], default_store=FileStore(solera.root / "data"))
+
+    await solera.deploy(project("old"))
+    await solera.run("old")
+    from solera_server.executors.inline import InlinePlacement
+
+    rows.append("b")
+    engine = solera.engine
+    run, work = engine.core.run, InlinePlacement._work
+    new, renamed = project("new", ["old"]), []
+
+    async def interleaved(fn, *args, **kwargs):
+        found = await run(fn, *args, **kwargs)
+        if fn == engine.core.tracking.build_commit and not renamed:
+            renamed.append(True)
+            engine.redeploy(new.manifest)
+        return found
+
+    def current_worker(self, stage):
+        if engine.manifest["deploy"] == new.manifest["deploy"]:
+            self.project = new
+        return work(self, stage)
+
+    monkeypatch.setattr(engine.core, "run", interleaved)
+    monkeypatch.setattr(InlinePlacement, "_work", current_worker)
+    detail = await solera.run("old", expect=None)
+    outcomes = [a["outcome"] for a in sum(detail["attempts"].values(), [])]
+    assert renamed and outcomes == ["replanned", "succeeded"], detail["attempts"]
+    assert engine.m.heads["new", ""]["commit_number"] == engine.m.core_output("new", "")["head"]
+    if dynamic:
+        await solera.deploy(new)
+        await solera.run("report")
+        assert await solera.read("report") == ["a", "b"]

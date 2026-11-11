@@ -238,10 +238,14 @@ class Planner:
         now: float,
         projected: Mapping[tuple[str, str], dict] | None = None,
         complete: Callable[[str, str], bool] = lambda asset, partition: False,
+        any_head: bool = False,
     ):
         self.manifest, self.now = manifest, now
         self.projected = dict(projected or {})
         self._head, self._heads_of, self._complete = head, heads_of, complete
+        # The new tracking core: a whole fan-in reads every agreeing head, and its batch waits
+        # while one is partial (`tracking.full`), so completeness never chooses what it reads.
+        self.any_head = any_head
         self.time = dt.datetime.fromtimestamp(now, dt.UTC)
         self._groups: dict[tuple, dict] = {}
 
@@ -347,7 +351,7 @@ class Planner:
             e["kind"] == "in" and self.owner(e["output"]) == producer and (lacks or e.get("all_partitions"))
             for e in inputs
         )
-        return not whole or self.complete(producer, partition)
+        return not whole or self.any_head or self.complete(producer, partition)
 
     def reach(self, producer: str | None, partition: str, target: str) -> list[str]:
         """The target partitions a change of `producer` at `partition` reaches (§7,
@@ -428,7 +432,11 @@ class Planner:
                     groups.setdefault(tuple(parts[n] for n in names), {})[upstream_partition] = head
             self._groups[(input.output, names)] = groups
         heads = groups.get(tuple(input.pinned[n] for n in names)) or {}
-        return {s: h for s, h in heads.items() if not materialized or self.head_materialized(input.output, s)}
+        return {
+            s: h
+            for s, h in heads.items()
+            if not materialized or self.any_head or self.head_materialized(input.output, s)
+        }
 
     def spread(self, input: Input) -> list[str]:
         """Every upstream partition an input could read: for a fan-in, the domain

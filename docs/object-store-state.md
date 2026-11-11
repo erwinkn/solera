@@ -279,6 +279,8 @@ status are derived inside `apply`; they are not events.
 | `KeysRetryRequested` | `asset`, `partition?`, `classes`, `by` | a forced retry of a per-key asset's stored outcomes of those classes (`per-key-processing.md` §9), identified by its event counter |
 | `RepairRunSubmitted` | `output`, `partition`, `at` | the repair clock ran the partition again for its repair: counted, so it stops after a few (§8) |
 | `CleanupsCleared` | `output`, `partition`, `ids`, `retired`, `by`, `at` | an operator gave up on stuck cleanups (a stuck cursor step's deltas, `delta:{n}`, included); their objects stay |
+| `Proceeded` | `asset`, `partition`, `event?`, `by`, `at` | an operator let the readers of a partition whose run stopped midway go on over its partial output (`solera proceed`, D205): its outputs' open partial spans are marked proceeded, until the partition starts over; `event`, the core's `FullRunDone` of its keyed outputs mid full run |
+| `Settled` | `asset`, `partition` | the tick found a partition with partial spans complete with no batch to say so (a key list took the rest, or the rest was deleted upstream; made under today's definition, reading no partial upstream head): its outputs' open spans close at their heads (`full.settle`) |
 | `MergeAttempted` | `output`, `partition`, `life`, `inputs` (the attempt key), `at` | counts an upload of one merge before it starts; after three, none published, the index backs off (10 minutes, doubling to 4 hours) |
 | `MergeInterrupted` | `output`, `partition`, `life`, `inputs`, `at` | the engine's own stop cut that upload short: it counts for nothing |
 | `MergesCleared` | `output`, `partition`, `by`, `at` | an operator's clear: the index's merges are tried again at once |

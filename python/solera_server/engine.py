@@ -51,7 +51,7 @@ from solera.sdk import default_placement, digest
 from solera.tasks import Tasks
 
 from . import history, owed, planning
-from .attempts import POOL_OFFERED_GRACE, Attempts, Live, current_names, worker_report
+from .attempts import POOL_OFFERED_GRACE, REPLAN_DELAY, Attempts, Live, current_names, worker_report
 from .executors import PlacementContext, Registry
 from .history import MAX_METADATA, History, RunFilter
 from .journal import CORE_FORMAT, FORMAT
@@ -71,8 +71,9 @@ from .observing import Observing
 from .sensors import Sensors
 from .staleness import Staleness
 from .state import Conflict, LostOwnership, State
-from .tracking import WALK, Core, b64, output_pin
+from .tracking import WALK, Core, Generation, Redeployed, b64, output_pin
 from .tracking import commit as core_commit
+from .tracking import full as core_full
 from .tracking import prepare as core_prepare
 from .tracking import sources as core_sources
 from .upkeep import ALIVE, Upkeep
@@ -193,6 +194,8 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
         # Attempts whose end failed: (times, not adopted again before this monotonic time).
         self._crashes: dict[str, tuple[int, float]] = {}
         self._covers: dict[tuple, tuple] = {}  # an input record with gaps: is it covered? (`complete`)
+        # (asset, partition, input) -> batches committed here: what `complete` knew of an edge is old.
+        self._walked: dict[tuple, int] = {}
         # attempt id -> set when its run is controlled, so its watcher looks at once.
         self._stirred: dict[str, asyncio.Event] = {}
         # Attempts consuming a local execution slot. Pool attempts only poll
@@ -379,6 +382,8 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
 
         self._adopt()
         await self._cover_tick()
+        if self.core is not None:
+            await core_full.settle(self)
         self._cleanup_job()
         self._dispatch_due()
         self._sensor_sweep()
@@ -465,6 +470,7 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
             self.clock(),
             projected,
             self._complete_known,
+            any_head=self.core is not None,
         )
 
     def _plan_run(
@@ -620,6 +626,8 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
             else:
                 asset_used[claimed["asset"]] = asset_used.get(claimed["asset"], 0) + 1
         held = {}
+        incomplete = core_full.waiting(self) if self.core is not None else set()
+        planner = self.planner() if incomplete else None
         for task_id in self.m.due(now):
             task = self.m.task(task_id)
             if task is None or task["status"] != "queued" or task_id in self.m.claims:
@@ -649,6 +657,11 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
             cap = declared.get("concurrency")
             if holder is not None:
                 held[task_id] = ["claim", holder]
+            elif (
+                incomplete
+                and (waiting := core_full.gate(planner, task, lambda o, p: (o, p) in incomplete)) is not None
+            ):
+                held[task_id] = waiting
             elif cap is not None and asset_used.get(task["asset"], 0) >= cap:
                 held[task_id] = ["concurrency", task["asset"]]
             elif behind is not None:
@@ -968,6 +981,19 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
                 else:
                     prepared = self._prepare(task, run, attempt, await self._observe(task, run, attempt))
             except (Retryable, NonRetryable, Conflict) as error:
+                if getattr(
+                    error, "replan", False
+                ):  # an upstream became incomplete: planned again, no try spent
+                    self._finish(
+                        task,
+                        claim,
+                        "replanned",
+                        error=error,
+                        retryable=True,
+                        delay=REPLAN_DELAY,
+                        reason=core_full.INCOMPLETE,
+                    )
+                    return
                 self._finish(
                     task,
                     claim,
@@ -977,9 +1003,22 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
                 )
                 return
             if prepared.get("skip") and self.core is not None:  # its progress still moves to the heads
-                await self.commit_attempt(
-                    attempt, prepared, {"outputs": {}, "skipped": True}, outcome="skipped"
-                )
+                try:
+                    await self.commit_attempt(
+                        attempt, prepared, {"outputs": {}, "skipped": True}, outcome="skipped"
+                    )
+                except Conflict as error:
+                    if not getattr(error, "replan", False):
+                        raise
+                    self._finish(  # as `_settle` does: planned again, no try spent
+                        task,
+                        claim,
+                        "replanned",
+                        error=error,
+                        retryable=True,
+                        delay=REPLAN_DELAY,
+                        reason="held back",
+                    )
                 return
             if prepared.get("skip"):
                 commit = {**await self._observations(task, prepared, {}), **self._made(prepared)}
@@ -987,7 +1026,19 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
                 commit["final"] = not more
                 self._finish(task, claim, "skipped", commit=commit, more=more)
                 return
-            stage = await self._launch(task, run, attempt, prepared)
+            try:  # under the deploy it was prepared under: nothing awaited since `prepare` returned
+                stage = await self._launch(task, run, attempt, prepared, Generation(self.m, "it launched"))
+            except Redeployed as error:  # its outputs' names may be another deploy's: planned again
+                self._finish(
+                    task,
+                    claim,
+                    "replanned",
+                    error=error,
+                    retryable=True,
+                    delay=REPLAN_DELAY,
+                    reason="redeployed",
+                )
+                return
             try:
                 self._authority()  # `_launch` awaited: still ours?
                 handle = await placement.launch(stage)
@@ -1003,6 +1054,8 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
             await self._crashed(task_id, attempt, error)
         finally:
             self.m.release(task_id, attempt)
+            if self.core is not None:  # ended here, however: a plan kept for it goes (its spec has it)
+                self.core.plans.pop(attempt, None)
 
     @staticmethod
     def _released(placement, handle) -> None:
@@ -1316,6 +1369,8 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
                 "cleanup",  # a cleanup task's entry (K25)
             )
         }
+        if "gate" in prepared:  # the new path's: the upstream heads it read, checked again (`full.held`)
+            kept["gate"] = prepared["gate"]
         return {**kept, "outputs": outputs}
 
     def _pin_at(self, output: str, upstream_partition: str):
@@ -1368,7 +1423,7 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
     @staticmethod
     def _whole_fan_in(planner: planning.Planner, input: planning.Input) -> dict:
         """A whole fan-in pins every current upstream partition with a complete
-        head that agrees with this partition's shared keys, keyed by the dimensions
+        head (any head on the new core, whose gate holds a partial one) that agrees with this partition's shared keys, keyed by the dimensions
         it collapses (§7) — every dimension, with `all_partitions` — chosen
         among the heads that exist, never by expanding the partition domain."""
 
@@ -1648,15 +1703,18 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
             outputs = current_names(prepared, result.get("outputs") or {})
             built = await core_commit.build(self.core, task, attempt, prepared, result, outputs)
             async with built.locks:  # the outputs it built: their commits are recorded in turn
-                observations = await self._observations(task, core_commit.unkeyed(prepared), result, attempt)
-                if built.progress is not None:
-                    observations.setdefault("progress", {})[WALK] = built.progress
-                if self.m.claimed(attempt) is not claim:
-                    raise LostOwnership(attempt)
-                self._commit_guards(task, prepared)  # again: the build and its observations awaited
-                out = await self._install(
-                    task, claim, attempt, prepared, result, observations, built, **settle
-                )
+                with built.generation:  # checked again where it is recorded (`core_commit.check`)
+                    observations = await self._observations(
+                        task, core_commit.unkeyed(prepared), result, attempt
+                    )
+                    if built.progress is not None:
+                        observations.setdefault("progress", {})[WALK] = built.progress
+                    if self.m.claimed(attempt) is not claim:
+                        raise LostOwnership(attempt)
+                    self._commit_guards(task, prepared)  # again: the build and its observations awaited
+                    out = await self._install(
+                        task, claim, attempt, prepared, result, observations, built, **settle
+                    )
             await core_sources.record_loads(self, attempt, prepared, result)
             return out
         observations = await self._observations(task, prepared, result, attempt)
@@ -1808,10 +1866,17 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
         worked = bool((task.get("outcomes") or {}).get("succeeded"))
         if outcome == "succeeded" and result.get("skipped") and not more and not worked:
             outcome = "skipped"  # the patterns took none of its keys: it did nothing (per-key §11)
+        if self.core is not None and (why := core_full.held(self.m, prepared.get("gate") or ())) is not None:
+            raise core_commit.HeldBack(
+                f"{why[0]}: {why[1]}"
+            )  # a head it read is partial: never, by `prepare`
         if built is not None:  # checked, then recorded with nothing awaited between (rule 3)
             core_commit.check(self.core, built)
             if (core := built.payload()) is not None:
                 commit["core"] = core
+            for param in (built.walk or {}).get("inputs") or ():
+                key = (task["asset"], task["partition"], param)
+                self._walked[key] = self._walked.get(key, 0) + 1
         self._finish(
             task,
             claim,
@@ -1855,14 +1920,15 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
         (the new path) makes `upsert` a load's report on the source's log at
         that commit (`tracking.sources.record_loads`)."""
 
-        head = self.m.heads.get((name, ""))
+        head, generation = self.m.heads.get((name, "")), Generation(self.m)
         # Its delta is named by nothing until recorded: its index is held as read
         # meanwhile, so the orphan collector leaves it be.
         with self.m.reading(self.m.index(name, "").prefix):
             event, ref = await self._prepare_commit(name, version, keys, upsert, remove, by, at=at)
             if event is None:
                 return {"changed": False, "ref": ref}
-            if commit_of(self.m.heads.get((name, ""))) != commit_of(head):
+            redeployed = self.core is not None and generation.moved
+            if commit_of(self.m.heads.get((name, ""))) != commit_of(head) or redeployed:
                 await self._drop_prepared([event])
                 raise Conflict(f"source {name!r} moved while committing; retry")
             event["at"] = self.clock()
@@ -1937,7 +2003,6 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
                     record["partitions"] = built["elements"]
                 event["core"] = {
                     "event": b64(built["event"]),
-                    "outputs": built["minted"],
                     "counts": {name: built["counts"]},
                 }
                 run["upserted"], run["deleted"] = built["upserted"], built["deleted"]
@@ -2383,6 +2448,18 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
             # aborted by its wait loop — or, if already writing, committed (§8).
             self._control(run_id, "cancel", by)
         return self._run_view(self.m.runs.get(run_id) or run)
+
+    async def proceed(self, asset: str, partition: str = "", by: str | None = None) -> dict:
+        """An operator's `solera proceed` (D205): refused on both paths for now.
+        On the new tracking core it waits for ERW-42, so no span is ever
+        proceeded there and a reader of a partial head holds until a run of
+        its producer completes it (`core_full.proceed` is ERW-42's to call)."""
+
+        if self.core is None:
+            raise Conflict(
+                "proceed: readers wait for an incomplete upstream on the new tracking core only", False
+            )
+        raise core_full.ProceedNotYet(asset, partition)
 
     async def pause(self, run_id: str, paused=True, by: str | None = None):
         run = self.m.runs.get(run_id)
