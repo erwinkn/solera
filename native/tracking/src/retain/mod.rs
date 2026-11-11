@@ -308,8 +308,8 @@ impl Cleaned {
 /// anew at commit 1 (a cleanup step or merge of the old life is refused in
 /// the new one: steps name the output's life, merges their layers'
 /// paths). The engine deletes its layer files and objects. Refused while an
-/// edge reads it, and for the record outputs of a per-key edge in the
-/// state (they go with the edge).
+/// edge reads it or a watch names it as its own output, and for the record
+/// outputs of a per-key edge in the state (they go with the edge).
 #[derive(Clone, Debug, PartialEq)]
 pub struct Retire {
     pub output: Id,

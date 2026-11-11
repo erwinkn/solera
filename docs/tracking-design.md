@@ -548,11 +548,12 @@ these additions:
 - **The commit is fenced against what decides a hold-back.** A batch that
   kept a key on a settled input that it would have held back had the input
   been unsettled (loaded at another version, or not taken there though its
-  patterns take it) carries a
-  fence. The event is refused if the input has become unsettled at the head
-  the batch planned at. The batch names the input's life (§12), so the event
-  is also refused if the edge reads another output by then. A batch that held all such keys back carries no fence for that
-  input: holding back is always safe, and at worst costs a later batch.
+  patterns take it) carries a fence. The event is refused if the input
+  has become unsettled at the head the batch planned at. The batch names
+  the input's life (§12), so the event is also refused if the edge reads
+  another output by then. A batch that held all such keys back carries no
+  fence for that input: holding back is always safe, and at worst costs a
+  later batch.
   Every part of an event is checked on the state before it, so the fence
   answers for the batch applied ahead of the rest of its event; another
   part may commit to the output it reads, as a source load report does
@@ -1674,24 +1675,28 @@ Called from Python as `lineage_input`, `lineage_trace` and `lineage_flow`
 - **An output's life.** Each output has one life (`Output::life`), never
   0, given from the state's one counter (`Tracking::lives`) when the
   output is first named: an edge opens on it or is renamed to it
-  (`EdgeOpen`, `EdgeRename`), its cleanup starts (`Track`), it is
-  declared (`Declare`, which the engine journals when it deploys an
+  (`EdgeOpen`, `EdgeRename`), its cleanup starts (`Track`), a watch
+  names it as the consumer's own output (`SetWatch`), it is declared (`Declare`, which the engine journals when it deploys an
   output, so a consumer's own output has a life before its first plan),
   or its first commit lands with no life before. It ends when the output
   is retired, or for a per-key edge's record outputs when the records are
   dropped; the next naming gives a new life. A retired output's commits
   start again at 1 (§13), so an id and a commit name a version only within
   a life. Every reader names the life it read, and the state refuses it in
-  any other, with no exemption: a plan names each input's life and its own
+  any other, and never in life 0: a plan names each input's life and its own
   output's (`InputPlan::life`, `Own`, `UnkeyedPlan::life`; a view
   refuses an own output with no life), and the batch's progress parts
   (`BatchProgress`, `Consumed`) carry them to the event, which checks
-  them when it applies; an output commit names the life it was built on;
+  them when it applies; an output commit names the life it was built on
+  (0 only for a first commit, which applies only while the output has no
+  life; once the engine declares every output first, B5 refuses 0 there
+  too);
   a cleanup step names the life of its cursor (§13). A record stores the
-  plan's lives (`life`, `own_life`; `RECORD_FORMAT` 5). Two rules keep a
-  life from changing under a reader: no edge reads, and no cleanup tracks,
-  a per-key edge's record outputs (their life follows that edge), and an
-  edge moves to another output only with progress as a reset leaves it (no
+  plan's lives (`life`, `own_life`; `RECORD_FORMAT` 5). Three rules keep a
+  life from changing under a reader: `Retire` is refused while an edge
+  reads the output or a watch names it as its own output; no edge or watch
+  reads, and no cleanup tracks, a per-key edge's record outputs (their life
+  follows that edge); and an edge moves to another output only with progress as a reset leaves it (no
   commit, point or failure record of the output it read). This is the
   identity the engine keys an output's persisted facts by.
 - **Retired** when a life the record names is not the output's life now:

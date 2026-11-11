@@ -38,9 +38,9 @@ pub fn core_owned(id: &[u8]) -> bool {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Output {
     /// The output's one life, never 0: given from [Tracking::lives] when the
-    /// output is first named ([Tracking::name]: an edge opens on it, it is
-    /// declared or tracked, or its first commit lands), and ended only by
-    /// [Tracking::end]. A retired output's commit numbers start again at 1
+    /// output is first named ([Tracking::name]: an edge opens on it or moves
+    /// to it, it is declared, tracked or a watch's own output, or its first
+    /// commit lands), and ended only by [Tracking::end]. A retired output's commit numbers start again at 1
     /// (B9), so an id and a commit name a version only within a life: a plan
     /// names the lives it reads, its commit applies only in them, and its
     /// record stores them; a cleanup step names the life it was taken in.
@@ -188,8 +188,8 @@ impl Tracking {
 
     /// Ends an output's life: its entry and its cleanup cursor leave the
     /// state, and the next naming gives it a new life. Its callers make sure
-    /// no edge reads it (`Retire` refuses that, and no edge reads a per-key
-    /// edge's record outputs: see [`core_owned`]).
+    /// no edge or watch reads it (`Retire` refuses that, and none reads a
+    /// per-key edge's record outputs: see [`core_owned`]).
     pub(crate) fn end(&mut self, id: &[u8]) {
         self.retain.cursors.remove(id);
         self.outputs.remove(id);
@@ -244,9 +244,10 @@ impl Tracking {
     }
 
     /// What every state holds: each output's and per-key edge's life is above
-    /// 0, at most the counter and its own; every edge's input, cleaned output
-    /// and watch's own output has a life, and none is the core's. Restore refuses a snapshot that
-    /// breaks it.
+    /// 0, at most the counter and its own; exactly the keyed edges have
+    /// per-key state; every edge's input, cleaned output and watch's own
+    /// output has a life, and none is the core's. Restore refuses a snapshot
+    /// that breaks it.
     pub fn check_lives(&self) -> Result<()> {
         let mut seen = std::collections::HashSet::new();
         let lives = self.outputs.iter().map(|(id, o)| (id, o.life));
@@ -258,6 +259,15 @@ impl Tracking {
                     self.lives
                 ));
             }
+        }
+        let keyed = |e: &Edge| matches!(e.progress.as_ref(), Progress::Keyed(_));
+        let per_key = self
+            .edges
+            .iter()
+            .filter(|(_, e)| keyed(e))
+            .map(|(id, _)| id);
+        if !per_key.eq(self.per_key.keys()) {
+            return format("the per-key state is not exactly the keyed edges'");
         }
         let named = |id: &[u8]| self.outputs.contains_key(id) && !core_owned(id);
         if let Some((e, _)) = self.edges.iter().find(|(_, e)| !named(&e.input)) {
@@ -367,6 +377,57 @@ impl Tracking {
 mod tests {
     use super::*;
     use crate::progress::{EdgeClose, EdgeOpen, Reset};
+
+    /// Restore refuses a state no events reach: an output or a per-key edge
+    /// with life 0 or a life given twice, per-key state other than the keyed
+    /// edges', and an edge's input or a watch's own output with no life.
+    #[test]
+    fn restore_refuses_broken_lives() {
+        use crate::stale::{SetWatch, Watch};
+        let mut t = Tracking::new();
+        let parts = vec![
+            Part::EdgeOpen(EdgeOpen {
+                edge: b"e".as_slice().into(),
+                input: b"items".as_slice().into(),
+                keyed: true,
+            }),
+            Part::Watch(SetWatch {
+                edge: b"e".as_slice().into(),
+                watch: Watch {
+                    conditions: Arc::default(),
+                    own: Some(b"own".as_slice().into()),
+                    gate: false,
+                },
+            }),
+        ];
+        for part in parts {
+            t.apply(&Event::of(vec![part]).encode()).unwrap();
+        }
+        Tracking::restore(&t.snapshot()).unwrap();
+        let refused = |b: Tracking, why: &str| {
+            let e = Tracking::restore(&b.snapshot()).unwrap_err();
+            assert!(e.to_string().contains(why), "{e}");
+        };
+        let mut b = t.clone();
+        b.outputs.get_mut(b"items".as_slice()).unwrap().life = 0;
+        refused(b, "has life 0");
+        let mut b = t.clone();
+        let own = b.outputs[b"own".as_slice()].life;
+        b.outputs.get_mut(b"items".as_slice()).unwrap().life = own;
+        refused(b, "has life");
+        let mut b = t.clone();
+        b.per_key.get_mut(b"e".as_slice()).unwrap().life = 0;
+        refused(b, "has life 0");
+        let mut b = t.clone();
+        b.per_key.clear();
+        refused(b, "per-key state");
+        let mut b = t.clone();
+        b.outputs.remove(b"items".as_slice());
+        refused(b, "reads an output with no life");
+        let mut b = t.clone();
+        b.outputs.remove(b"own".as_slice());
+        refused(b, "a watch's own output");
+    }
 
     #[test]
     fn events_and_snapshots_round_trip() {

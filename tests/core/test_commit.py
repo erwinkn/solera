@@ -94,7 +94,7 @@ def test_a_commit_built_at_an_old_head_is_refused(index):
     with pytest.raises(ValueError, match="two parts of one event"):
         core.t.apply(Tracking.join([a["event"], b["event"]]))
     core.t.apply(a["event"])
-    with pytest.raises(ValueError, match="built in life 0, and o is in life 1"):
+    with pytest.raises(ValueError, match="built before o had a life: it is in life 1 now"):
         core.t.apply(b["event"])
     restored = Tracking.restore(core.t.snapshot())
     assert restored.snapshot() == core.t.snapshot()

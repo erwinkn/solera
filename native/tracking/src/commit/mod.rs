@@ -68,8 +68,16 @@ impl OutputCommit {
     }
 
     pub(crate) fn check(&self, t: &Tracking) -> Result<()> {
-        if self.life != 0 || t.outputs.contains_key(&self.output) {
-            t.in_life(&self.output, self.life, "the commit was built")?;
+        match t.outputs.get(&self.output) {
+            Some(o) if self.life == 0 => {
+                return invalid(format!(
+                    "the commit was built before {} had a life: it is in life {} now",
+                    String::from_utf8_lossy(&self.output),
+                    o.life
+                ));
+            }
+            None if self.life == 0 => {}
+            _ => t.in_life(&self.output, self.life, "the commit was built")?,
         }
         let head = t.outputs.get(&self.output).map_or(0, |o| o.head);
         let l = &self.layer;

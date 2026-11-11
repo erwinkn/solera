@@ -1218,6 +1218,11 @@ fn a_watch_names_its_own_output() {
             },
         })
     };
+    let core = solera_tracking::outcomes::output_id(solera_tracking::outcomes::FAILURES, EDGE);
+    let e = t
+        .check_event(&Event::of(vec![watch(Some(core))]))
+        .unwrap_err();
+    assert!(e.to_string().contains("no watch reads them"), "{e}");
     apply(&mut t, vec![watch(Some(key("own")))]);
     assert!(t.life(b"own") > 0);
     Tracking::restore(&t.snapshot()).unwrap();
@@ -1225,6 +1230,25 @@ fn a_watch_names_its_own_output() {
     let retire = Part::Retire(Retire { output: key("own") });
     let e = t.check_event(&Event::of(vec![retire.clone()])).unwrap_err();
     assert!(e.to_string().contains("watch reads"), "{e}");
+    // the watch moves with its edge, and still holds its own output
+    apply(
+        &mut t,
+        vec![Part::EdgeRename(EdgeRename {
+            from: EDGE.into(),
+            to: key("moved"),
+            input: ITEMS.into(),
+        })],
+    );
+    let e = t.check_event(&Event::of(vec![retire.clone()])).unwrap_err();
+    assert!(e.to_string().contains("edge moved's watch reads"), "{e}");
+    apply(
+        &mut t,
+        vec![Part::EdgeRename(EdgeRename {
+            from: key("moved"),
+            to: EDGE.into(),
+            input: ITEMS.into(),
+        })],
+    );
     apply(&mut t, vec![watch(None)]);
     apply(&mut t, vec![retire]);
     t.stale_ask(EDGE).unwrap();
