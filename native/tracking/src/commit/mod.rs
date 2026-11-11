@@ -13,7 +13,7 @@ use solera_index::LayerRef;
 
 use crate::codec::{Dec, Enc};
 use crate::error::{format, invalid, Result};
-use crate::state::{Id, Tracking};
+use crate::state::{Id, Output, Tracking};
 
 pub use build::{build, build_each, Built, Changed, Each, Mode, Spec};
 pub use changes::{Change, Changes, Held, Reader, Source};
@@ -80,7 +80,17 @@ impl OutputCommit {
     }
 
     pub(crate) fn apply(self, t: &mut Tracking) {
-        let o = t.outputs.entry(self.output).or_default();
+        if !t.outputs.contains_key(&self.output) {
+            let life = t.next_life();
+            t.outputs.insert(
+                self.output.clone(),
+                Output {
+                    life,
+                    ..Output::default()
+                },
+            );
+        }
+        let o = t.outputs.get_mut(&self.output).expect("started");
         if !self.layer.clears.is_empty() {
             o.full_run = Some(self.layer.hi);
         }

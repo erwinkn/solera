@@ -166,6 +166,7 @@ fn main() {
     t.outputs.insert(
         o.clone(),
         Output {
+            life: 1,
             layers: vec![base],
             head: 1,
             live,
