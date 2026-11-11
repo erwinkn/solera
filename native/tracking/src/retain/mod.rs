@@ -42,40 +42,37 @@ pub const TAG_RETIRE: u8 = 0x53;
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Retain {
     pub cursors: BTreeMap<Id, Cursor>,
-    /// The last life given to a cursor.
-    pub lives: u64,
 }
 
-/// A cleanup cursor. Its life tells one life of an output id from the
-/// next: a retired output's commit numbers start again at 1, so a step
-/// names the life it was taken in.
+/// A cleanup cursor. A retired output's commit numbers start again at 1,
+/// so a step names the output's life ([crate::Output::life]) it was taken in.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Cursor {
-    pub life: u64,
     pub at: u64,
 }
 
 impl Retain {
     pub fn encode(&self, e: &mut Enc) {
-        e.uv(self.lives);
         e.uv(self.cursors.len() as u64);
         for (id, c) in &self.cursors {
             e.bytes(id);
-            e.uv(c.life);
             e.uv(c.at);
         }
     }
 
     pub fn decode(d: &mut Dec<'_>) -> Result<Retain> {
-        let lives = d.uv()?;
         let mut cursors = BTreeMap::new();
         for _ in 0..d.count()? {
             let id: Id = d.bytes()?.into();
-            let (life, at) = (d.uv()?, d.uv()?);
-            cursors.insert(id, Cursor { life, at });
+            cursors.insert(id, Cursor { at: d.uv()? });
         }
-        Ok(Retain { cursors, lives })
+        Ok(Retain { cursors })
     }
+}
+
+/// The output's life: 0 before its first commit.
+pub(crate) fn life(t: &Tracking, output: &[u8]) -> u64 {
+    t.outputs.get(output).map_or(0, |o| o.life)
 }
 
 fn head(t: &Tracking, output: &[u8]) -> u64 {
@@ -241,11 +238,7 @@ impl Track {
     }
 
     pub(crate) fn apply(self, t: &mut Tracking) {
-        t.retain.lives += 1;
-        let life = t.retain.lives;
-        t.retain
-            .cursors
-            .insert(self.output, Cursor { life, at: self.at });
+        t.retain.cursors.insert(self.output, Cursor { at: self.at });
     }
 }
 
@@ -280,17 +273,13 @@ impl Cleaned {
 
     pub fn check(&self, t: &Tracking) -> Result<()> {
         let at = t.retain.cursors.get(&self.output);
-        if at
-            != Some(&Cursor {
-                life: self.life,
-                at: self.from,
-            })
-        {
+        if at != Some(&Cursor { at: self.from }) || self.life != life(t, &self.output) {
             return invalid(format!(
-                "a cleanup step of {} from {} in life {}, its cursor is {at:?}",
+                "a cleanup step of {} from {} in life {}, its cursor is {at:?} in life {}",
                 name(&self.output),
                 self.from,
-                self.life
+                self.life,
+                life(t, &self.output)
             ));
         }
         if self.to <= self.from || self.to > head(t, &self.output) {
@@ -306,10 +295,7 @@ impl Cleaned {
     }
 
     pub(crate) fn apply(self, t: &mut Tracking) {
-        let life = self.life;
-        t.retain
-            .cursors
-            .insert(self.output, Cursor { life, at: self.to });
+        t.retain.cursors.insert(self.output, Cursor { at: self.to });
     }
 }
 
@@ -317,7 +303,7 @@ impl Cleaned {
 /// dynamic partition once its `cleanup_after` window has passed): its
 /// layers and its cursor leave the state, and a later commit starts it
 /// anew at commit 1 (a cleanup step or merge of the old life is refused in
-/// the new one: steps name their cursor's life, merges their layers'
+/// the new one: steps name the output's life, merges their layers'
 /// paths). The engine deletes its layer files and objects. Refused while an
 /// edge reads it, and for the record outputs of a per-key edge in the
 /// state (they go with the edge).

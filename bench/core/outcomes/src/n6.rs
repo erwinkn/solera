@@ -82,6 +82,7 @@ fn load_as(dir: &str, name: &str) -> Output {
     let live = d.uv().unwrap();
     let layers = (0..d.uv().unwrap()).map(|_| d.layer().unwrap()).collect();
     Output {
+        life: 1,
         layers,
         head,
         live,

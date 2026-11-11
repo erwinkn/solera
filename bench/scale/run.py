@@ -23,6 +23,7 @@ import random
 import secrets
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import time
@@ -719,9 +720,15 @@ def _state_bytes(state: Path) -> dict:
     """Bytes under the engine's state, by its top two directories."""
 
     sizes: Counter = Counter()
-    for path in state.rglob("*"):
-        if path.is_file():
-            sizes["/".join(path.relative_to(state).parts[:2])] += path.stat().st_size
+    for directory, _, names in os.walk(state):
+        for name in names:
+            path = Path(directory, name)
+            try:
+                info = path.stat()
+            except OSError:
+                continue
+            if stat.S_ISREG(info.st_mode):
+                sizes["/".join(path.relative_to(state).parts[:2])] += info.st_size
     return dict(sizes)
 
 
