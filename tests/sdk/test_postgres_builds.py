@@ -599,7 +599,7 @@ async def test_a_table_with_a_trigger_never_opens_a_build(store, kind):
     else:
         when, each, body = TRIGGERS[kind]
         make_trigger(table, f"public.{out.name}_mark", body.format(table=table), when, each)
-    with pytest.raises(PublicationRefused, match="trigger or rule"):
+    with pytest.raises(PublicationRefused, match="a trigger, a rule"):
         await store.store(rows(b="new"), first.ref, at(out, 5, reset=True, partition="p"))
     assert outside(store, out, "p") == {"a": "old"}
     assert registry(store, out, "p") == (1, None, []) and builds(store, out, "p") == []
@@ -616,7 +616,7 @@ async def test_a_trigger_added_during_a_full_run_refuses_its_publication(store):
     first = await store.store(rows(a="old"), None, at(out, 1))
     await store.store(rows(b="new"), first.ref, at(out, 5, reset=True))
     make_trigger(table, f"public.{out.name}_mark", "NEW.v = NEW.v || '+'; RETURN NEW;")
-    with pytest.raises(PublicationRefused, match="trigger or rule"):
+    with pytest.raises(PublicationRefused, match="a trigger, a rule"):
         await store.full_run_ended(out, "", 5, 5)
     assert outside(store, out) == {"a": "old"} and registry(store, out) == (5, None, [5])
 
@@ -1092,7 +1092,7 @@ async def test_a_trigger_that_raises_added_during_a_run_refuses_its_publication(
     old = await store.store(rows(z="old"), None, at(out, 1))
     await store.store(rows(a="new"), old.ref, at(out, 5, reset=True))
     make_trigger(table, f"public.{out.name}_mark", "RAISE EXCEPTION 'guard'; RETURN NEW;")
-    with pytest.raises(PublicationRefused, match="trigger or rule"):
+    with pytest.raises(PublicationRefused, match="a trigger, a rule"):
         await store.full_run_ended(out, "", 5, 5)
     assert outside(store, out) == {"z": "old"}
 
@@ -1127,7 +1127,7 @@ async def test_any_trigger_or_rule_refuses_a_build(store, kind):
     else:
         sql(f"CREATE TABLE {other} () INHERITS ({table})")
         make_trigger(other, f"public.{out.name}_mark", "RETURN NULL;", "BEFORE DELETE")
-    with pytest.raises(PublicationRefused, match="trigger or rule"):
+    with pytest.raises(PublicationRefused, match="a trigger, a rule"):
         await store.store(rows(a="new"), old.ref, at(out, 5, reset=True))
     assert outside(store, out) == {"z": "old"} and registry(store, out) == (1, None, [])
     written = await store.store(rows(a="new"), old.ref, at(out, 5, reset=True, builds=False))
@@ -1193,6 +1193,131 @@ async def test_an_in_place_reset_leaves_no_row_an_inheriting_tables_trigger_kept
     make_trigger(child, f"public.{out.name}_mark", "RETURN NULL;", "BEFORE DELETE")
     written = await store.store(rows(b="new"), old.ref, at(out, 5, reset=True, builds=False))
     assert await solera(store, written.ref) == {"b": "new"}
+
+
+@pytest.mark.parametrize(
+    "kind", ["row security", "a policy", "a partition's own generated expression", "a view"]
+)
+async def test_a_table_a_build_cannot_stand_in_for_refuses_a_build(store, kind):
+    """A build copies the table's shape, not what a statement on the table
+    does with its rows (Astra, B8 round 1: A1, A2, A5): row security would
+    hide rows Solera read in the build, a partition's generated expression
+    would recompute them, and a view runs its own rule. Any refuses a
+    build, as a trigger does; today's path writes it in place, as before."""
+
+    from solera_postgres import Sql
+
+    out = output(incremental=True)
+    table, _, _ = store._table(out)
+    base = f'"public"."{out.name}_base"'
+    if kind == "a partition's own generated expression":
+        out = output(out.name, incremental=True, key="k", partition_column="site")
+        sql(
+            f"CREATE TABLE {table} (id text, site text, k text GENERATED ALWAYS AS (upper(id)) STORED, "
+            "_version bigint) PARTITION BY LIST (site)"
+        )
+        sql(
+            f"CREATE TABLE {base} (id text, site text, k text GENERATED ALWAYS AS (lower(id)) STORED, "
+            "_version bigint)"
+        )
+        sql(f"ALTER TABLE {table} ATTACH PARTITION {base} FOR VALUES IN ('')")
+    elif kind == "a view":  # writable as a whole, as on main: no index on a key
+        out = output(out.name, key=None)
+        sql(f"CREATE TABLE {base} (id text, v text, _version bigint)")
+        sql(f"CREATE VIEW {table} AS SELECT * FROM {base}")
+    else:
+        sql(f"CREATE TABLE {table} (id text, v text, _version bigint)")
+        if kind == "row security":
+            sql(f"ALTER TABLE {table} ENABLE ROW LEVEL SECURITY")
+        else:
+            sql(f"CREATE POLICY visible ON {table} FOR SELECT USING (true)")
+    query = Sql(
+        "SELECT 'Hello'::text AS id"
+        + ("" if kind == "a partition's own generated expression" else ", 'v'::text AS v")
+    )
+    with pytest.raises(PublicationRefused, match="a partition's own generated expression"):
+        await store.store(query, None, at(out, 5, reset=True))
+    assert registry(store, out) is None
+    written = await store.store(query, None, at(out, 5, reset=True, builds=False))
+    expected = (
+        [{"k": "hello"}] if kind == "a partition's own generated expression" else [{"id": "Hello", "v": "v"}]
+    )
+    assert [
+        {k: r[k] for k in expected[0]} for r in await store.load(written.ref, list[dict], None)
+    ] == expected
+
+
+async def test_a_switch_reads_the_catalog_as_it_is_whatever_the_sessions_isolation(store, monkeypatch):
+    """Astra A3 (B8 round 1): with a connection whose default isolation is
+    REPEATABLE READ, the switch's catalog reads would use a snapshot taken
+    before its lock, and miss a trigger committed in between. Every store
+    transaction is READ COMMITTED."""
+
+    from urllib.parse import quote
+
+    from solera_postgres import PostgresStore
+
+    repeatable = PostgresStore(
+        DSN + "?options=" + quote(r"-c default_transaction_isolation=repeatable\ read")
+    )
+    out = output(incremental=True)
+    table, _, _ = repeatable._table(out)
+    old = await repeatable.store(rows(z="old"), None, at(out, 1))
+    await repeatable.store(rows(a="new"), old.ref, at(out, 5, reset=True))
+    domain = repeatable._domain
+
+    def then_a_trigger(cur, t, exclusive=False):
+        domain(cur, t, exclusive)
+        make_trigger(table, f"public.{out.name}_mark", "NEW.v = NEW.v || '+'; RETURN NEW;")
+
+    monkeypatch.setattr(repeatable, "_domain", then_a_trigger)
+    with pytest.raises(PublicationRefused, match="since the full run began"):
+        await repeatable.full_run_ended(out, "", 5, 5)
+    assert outside(repeatable, out) == {"z": "old"}
+
+
+async def test_a_cleanup_deletes_rows_written_with_no_version(store):
+    """Astra A4 (B8 round 1): a write with no attempt's version leaves no
+    version row, and its partition's cleanup deletes its rows, as on main."""
+
+    out = output()
+    written = await store.store(rows(a="old"), None, at(out, None, builds=False))
+    await store.cleanup(out, partition="", key="a")
+    assert await solera(store, written.ref) == {}
+    written = await store.store(rows(a="old"), None, at(out, None, builds=False))
+    await store.cleanup(out, partition="")
+    assert outside(store, out) == {}
+
+
+@pytest.mark.xfail(
+    strict=True, reason="also on main: a partition's version row is keyed by its text (Astra A7, B8)"
+)
+async def test_two_spellings_of_one_partition_share_its_version_check(store):
+    """Astra A7 (B8 round 1, also on main): with a bigint partition column,
+    '1' and '01' name the same rows but different version rows, so an
+    older attempt writing '01' replaces a newer one's '1'."""
+
+    out = output(incremental=True, partition_column="site", columns={"id": "text", "site": "bigint"})
+    newer = await store.store([{"id": "a"}], None, at(out, 10, partition="1", builds=False))
+    with pytest.raises(StoreError):
+        await store.store([{"id": "old"}], None, at(out, 5, partition="01", builds=False))
+    assert [r["id"] for r in await store.load(newer.ref, list[dict], None)] == ["a"]
+
+
+@pytest.mark.xfail(
+    strict=True, raises=BaseException, reason="also on main: an empty Arrow patch (Sol, B8 merge delta)"
+)
+async def test_an_empty_arrow_patch_removes_its_keys(store):
+    """Sol (B8, the delta on main a377d13, also on main): a Patch of an empty
+    Arrow table panics in the chunk lookup rather than remove its keys."""
+
+    import pyarrow as pa
+
+    out = output(incremental=True)
+    first = await store.store(rows(a="old"), None, at(out, 1, builds=False))
+    empty = pa.table({"id": pa.array([], type=pa.string()), "v": pa.array([], type=pa.string())})
+    written = await store.store(Patch(empty, remove=["a"]), first.ref, at(out, 2, builds=False))
+    assert await solera(store, written.ref) == {}
 
 
 async def test_a_partition_cleanup_holds_off_the_partitions_first_writer(store, monkeypatch):

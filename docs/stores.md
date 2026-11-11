@@ -608,18 +608,24 @@ A full run's first write opens a build,
 `solera_build.b_<md5(table, partition)>_<run>`: the user's table's shape
 with its CHECK constraints, generated columns, unique and exclusion
 indexes, and identity columns that draw from the user's table's sequences.
-A table with a trigger or a rule, in any state, on it or on a table that
-inherits from it (a partition among them), never opens a build: the
-switch's `DELETE` and `INSERT` could run one on rows Solera has already
-read in the build, which writing them there did not, and the store never
-alters the user's table to stop it. Which one would run depends on its
-events, its level, its state, the session's replication role and the
-statement's target, so the store does not guess. A full run's first write there fails with
-`PublicationRefused` and changes nothing; write such an output in place
-(today's path). The switch takes its `DELETE`'s lock on the table and
-every partition before it reads the catalog again, so a trigger added
-during the run refuses the publication, and none can be added while it
-publishes. A cleanup of one key deletes its rows from the partition's
+A build copies the table's shape, not what a statement on the table does
+with its rows. So a table a build cannot stand in for never opens one: a
+view or a foreign table, or a table with a trigger, a rule, row security
+or a policy, or a partition whose generated column has an expression of
+its own, in any state, on it or on a table that inherits from it (a
+partition among them). The switch's `DELETE` and `INSERT` would publish
+rows other than the ones Solera has read in the build: a trigger or a
+partition's expression changes them, a policy hides them. The store never
+alters the user's table to stop it, and which of them a statement would
+run depends on its events, its level, its state, the session's role and
+the statement's target, so the store does not guess. A full run's first
+write there fails with `PublicationRefused` and changes nothing; write such
+an output in place (today's path). The switch takes its `DELETE`'s lock on
+the table and every partition before it reads the catalog again, so any
+of them added during the run refuses the publication, and none can be
+added while it publishes. Every transaction of the store is READ
+COMMITTED, whatever the connection's default, so each catalog read sees
+the catalog as it is then. A cleanup of one key deletes its rows from the partition's
 builds too. A run whose first writes are empty, with no
 table and no declared columns to make one from, makes nothing: its
 version row records it as pending, and its first batch with rows opens

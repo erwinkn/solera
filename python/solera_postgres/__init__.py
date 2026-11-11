@@ -151,14 +151,25 @@ def _build_name(table: str, partition: str, run: int) -> str:
     return f"b_{digest}_{run}"
 
 
-# A trigger or rule, in any state, on the table or any table that inherits from it (a partition
-# among them): a switch's DELETE and INSERT could run one on the rows Solera read in the build,
-# which writing them there did not. Which one would run depends on its events, its level, the
-# session's replication role and the statement's target, so the store does not guess: any refuses.
-_TRIGGERED = """EXISTS (WITH RECURSIVE tree(oid) AS (SELECT {rel}::oid
+# What a build cannot stand in for: a switch's DELETE and INSERT would give rows other than the
+# ones Solera read in the build, or hide them. On the table or any table that inherits from it (a
+# partition among them), in any state: a relation other than a plain or partitioned table (a view,
+# a foreign table), a trigger, a rule, row security or a policy, or a generated column whose
+# expression differs from the table's (the build computes the table's). Which of them a statement
+# would run depends on its events, its level, the session's role and the statement's target, so
+# the store does not guess: any refuses.
+_UNBUILDABLE = """EXISTS (WITH RECURSIVE tree(oid) AS (SELECT {rel}::oid
     UNION SELECT i.inhrelid FROM pg_inherits i JOIN tree ON i.inhparent = tree.oid)
-  SELECT 1 FROM tree WHERE EXISTS (SELECT 1 FROM pg_trigger t WHERE t.tgrelid = tree.oid AND NOT t.tgisinternal)
-    OR EXISTS (SELECT 1 FROM pg_rewrite w WHERE w.ev_class = tree.oid AND w.rulename <> '_RETURN'))"""
+  SELECT 1 FROM tree JOIN pg_class c ON c.oid = tree.oid
+  WHERE c.relkind NOT IN ('r', 'p') OR c.relrowsecurity
+    OR EXISTS (SELECT 1 FROM pg_policy y WHERE y.polrelid = tree.oid)
+    OR EXISTS (SELECT 1 FROM pg_trigger t WHERE t.tgrelid = tree.oid AND NOT t.tgisinternal)
+    OR EXISTS (SELECT 1 FROM pg_rewrite w WHERE w.ev_class = tree.oid AND w.rulename <> '_RETURN')
+    OR EXISTS (SELECT 1 FROM pg_attribute a JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum
+      WHERE a.attrelid = tree.oid AND a.attgenerated <> '' AND pg_get_expr(d.adbin, d.adrelid) IS DISTINCT FROM
+        (SELECT pg_get_expr(e.adbin, e.adrelid) FROM pg_attribute b JOIN pg_attrdef e
+          ON e.adrelid = b.attrelid AND e.adnum = b.attnum
+          WHERE b.attrelid = {rel}::oid AND b.attname = a.attname AND b.attgenerated <> '')))"""
 
 _STATE = (
     """
@@ -179,14 +190,18 @@ SELECT r.oid IS NOT NULL AS present,
     WHERE n.nspname = %(build)s AND c.relname >= %(first)s::name AND c.relname < %(past)s::name
     AND c.relkind = 'r'), '{}') AS built,
   r.oid IS NOT NULL AND ("""
-    + _TRIGGERED.format(rel="r.oid")
-    + """) AS triggered
+    + _UNBUILDABLE.format(rel="r.oid")
+    + """) AS unbuildable
 FROM (SELECT (SELECT c.oid FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
-  WHERE n.nspname = %(schema)s AND c.relname = %(name)s AND c.relkind IN ('r', 'p')) AS oid) AS r
+  WHERE n.nspname = %(schema)s AND c.relname = %(name)s AND c.relkind IN ('r', 'p', 'v', 'f')) AS oid) AS r
 """
 )
 
-_TRIGGERS = "SELECT " + _TRIGGERED.format(rel="%(t)s::regclass") + " AS triggered"
+_UNBUILDABLE_WHY = (
+    "is a view or foreign table, or has a trigger, a rule, row security or a partition's own generated "
+    "expression, on it or on a table that inherits from it"
+)
+_UNBUILDABLE_NOW = "SELECT " + _UNBUILDABLE.format(rel="%(t)s::regclass") + " AS unbuildable"
 
 # A new build's indexes it does not keep (neither unique nor exclusion), and the user's
 # table's identity columns with their sequences.
@@ -308,7 +323,11 @@ class PostgresStore:
         import psycopg
         from psycopg.rows import dict_row
 
-        return psycopg.connect(resolve_env(self.dsn), row_factory=dict_row, autocommit=False)
+        conn = psycopg.connect(resolve_env(self.dsn), row_factory=dict_row, autocommit=False)
+        conn.isolation_level = (
+            psycopg.IsolationLevel.READ_COMMITTED
+        )  # each check reads the catalog as it is now
+        return conn
 
     def _table(self, output: Output, prior: Ref | None = None, home: str | None = None) -> str:
         """Where the output's content lives: the committed head's table, so a
@@ -628,11 +647,13 @@ class PostgresStore:
         (`state`, from the write's first round trip) says three things. A
         registered build it no longer holds is lost (a migration dropped it,
         or a restore lost it): a write of its run fails (`RunLost`) and
-        changes nothing, for the rows it held are gone. A table with a
-        trigger or rule, in any state, on it or on a table that inherits from
-        it, never opens a build (`PublicationRefused`): the switch could run
-        it on rows Solera has read, which writing them did not, and the store
-        never alters the user's table to stop it. A
+        changes nothing, for the rows it held are gone. A table a build
+        cannot stand in for (`_UNBUILDABLE`: a view or foreign table, a
+        trigger, a rule, row security, a partition's own generated expression,
+        on it or on a table that inherits from it) never opens a build
+        (`PublicationRefused`): the switch would publish rows other than the
+        ones Solera has read, and the store never alters the user's table to
+        stop it. A
         build of the partition the write does not keep makes it sweep after
         it commits."""
 
@@ -661,11 +682,11 @@ class PostgresStore:
             )
         if run is not None:
             at.run, at.opens = run, run not in at.builds
-        if at.opens and state["triggered"]:
+        if at.opens and state["unbuildable"]:
             raise PublicationRefused(
-                f"{context.output.name} {context.partition!r}: {table} has a trigger or rule, on it or "
-                "on a table that inherits from it: publishing a full run built beside it could run it "
-                "on rows Solera has read. Drop it, or write the output in place"
+                f"{context.output.name} {context.partition!r}: {table} {_UNBUILDABLE_WHY}: publishing a "
+                "full run built beside it would publish rows other than the ones Solera has read. "
+                "Write the output in place"
             )
         keep = {context.build_run, at.run}
         at.builds = [b for b in at.builds if b in keep] + ([at.run] if at.opens else [])
@@ -774,7 +795,7 @@ class PostgresStore:
 
             parts = list(written) if partition is None else [partition]
             taken = [p for p in parts if due(p)]
-            if not column and len(taken) != len(written):
+            if not column and set(written) - set(taken):
                 return  # unpartitioned, partitions share the rows: a newer one keeps them
             if key is None:  # before the table: a build's identity default names its sequence
                 cur.execute("SET LOCAL lock_timeout = '2s'")  # a load of a build: retry the cleanup later
@@ -901,9 +922,10 @@ class PostgresStore:
         every column the database does not generate, so outside readers see
         all old rows, then all new, and wait for nothing; it never changes the
         check's version. A constraint only the published rows can check
-        refuses the publication whole (`PublicationRefused`), and so does a
-        trigger or rule added since the run began (`_aim`), read under the lock its DELETE takes, so none can be
-        added in between, and again after the rows. The
+        refuses the publication whole (`PublicationRefused`), and so does
+        what makes the table one a build cannot stand in for (`_aim`) added
+        since the run began, read under the lock its DELETE takes, so none
+        can be added in between, and again after the rows. The
         build's
         table is dropped after, by a sweep. Idempotent; it may take minutes,
         and sets no statement timeout. `prior` (the committed head) and
@@ -947,11 +969,11 @@ class PostgresStore:
                     ]
                     cur.execute("SET LOCAL statement_timeout = 0")
                     if present:
-                        # The lock the DELETE takes, on every partition, first: no trigger or rule can be
-                        # added or enabled until this commits, so the catalog read next is the one the
-                        # rows meet, before any of them runs.
+                        # The lock the DELETE takes, on every partition, first: no trigger, rule, policy or
+                        # partition can be added or enabled until this commits, so the catalog read next
+                        # (READ COMMITTED: as it is now) is the one the rows meet.
                         cur.execute(f"LOCK TABLE {table} IN ROW EXCLUSIVE MODE")
-                        self._refuse_triggered(cur, output, partition, table)
+                        self._refuse_unbuildable(cur, output, partition, table)
                         self._delete_slice(cur, table, {column: partition} if column else {})
                     if run in found["builds"]:
                         columns = ", ".join(
@@ -966,7 +988,7 @@ class PostgresStore:
                             f"INSERT INTO {table} ({columns}) OVERRIDING SYSTEM VALUE SELECT {columns} FROM {build}"
                         )
                     if present:  # and after them: a partition attached meanwhile takes no lock it waits for
-                        self._refuse_triggered(cur, output, partition, table)
+                        self._refuse_unbuildable(cur, output, partition, table)
                     cur.execute(
                         f"UPDATE {VERSIONS_TABLE} SET published = %s, "
                         "builds = ARRAY(SELECT b FROM unnest(builds) AS b WHERE b > %s), "
@@ -983,12 +1005,12 @@ class PostgresStore:
         self._sweep(table, partition)
         return published
 
-    def _refuse_triggered(self, cur, output, partition, table) -> None:
-        if cur.execute(_TRIGGERS, {"t": table}).fetchone()["triggered"]:
+    def _refuse_unbuildable(self, cur, output, partition, table) -> None:
+        if cur.execute(_UNBUILDABLE_NOW, {"t": table}).fetchone()["unbuildable"]:
             raise PublicationRefused(
-                f"{output.name} {partition!r}: {table} has a trigger or rule, on it or on a table that "
-                "inherits from it, added after the full run began: publishing could run it on rows Solera "
-                "has read, so the published rows stay as they were. Drop it, or write the output in place"
+                f"{output.name} {partition!r}: {table} {_UNBUILDABLE_WHY}, since the full run began: "
+                "publishing would publish rows other than the ones Solera has read, so the published rows "
+                "stay as they were. Write the output in place"
             )
 
     # -- writes ---------------------------------------------------------------
