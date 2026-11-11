@@ -582,16 +582,28 @@ behind a switch of another partition.
 A full run's first write opens a build,
 `solera_build.b_<md5(table, partition)>_<run>`: the user's table's shape
 with its CHECK constraints, generated columns, unique and exclusion
-indexes, and identity columns that draw from the user's table's sequences.
+indexes, identity columns that draw from the user's table's sequences, and
+the user's table's row triggers that fire before a change, so each row is
+what it would be in place.
 Writes of the run go there while the registry lists it; a load reads the
 build its ref names while the registry lists it, else the user's table,
 and reads the user's table again if the build was dropped under it. The
 switch (`full_run_ended`) holds the version row, deletes the partition's
 rows and inserts the build's in one transaction, then unregisters it;
 outside readers see all old rows, then all new, and wait for nothing. The
-DROP comes after, in a short transaction of its own that gives up rather
-than wait for a load (the next write or call sweeps it). An `ALTER TABLE`
-issued during a switch waits for it, and every query after it waits too.
+insert does not fire the BEFORE row triggers the build's rows already went
+through: the switch disables them in its transaction and restores them
+before it commits, which on such a table makes writes of its other
+partitions wait for the switch. The DROP comes after, in a short
+transaction of its own that gives up rather than wait for a load; the
+partition's next write or call finds the build in the catalog and drops
+it then. An `ALTER TABLE` issued during a switch waits for it, and every
+query after it waits too.
+
+A cleanup deletes a partition's version row with its rows, unless an
+attempt took the check after the partition's last write (a repair that
+listed what a dead attempt left): that row stays, emptied, so no older
+attempt can write again.
 
 ### An object store: immutable names
 
