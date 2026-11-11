@@ -93,7 +93,7 @@ fn batch(t: &Tracking, range: KeyRange, at: u64, reset: bool) -> Part {
         own: None,
         points: vec![],
         expect: read_digest(k, reset, &range),
-        fence: None,
+        fence: false,
     })
 }
 
@@ -395,7 +395,7 @@ fn failed(rt: &tokio::runtime::Runtime, ix: &ChangeIndex, keys: &[&str]) -> Trac
             false,
             &KeyRange::all(),
         ),
-        fence: None,
+        fence: false,
     });
     let cid = outcomes::cond_id(&c);
     let rec = Record {
@@ -1191,4 +1191,41 @@ fn staleness_flows_down_the_graph() {
         *t.edges[b"tally/checks".as_slice()].progress,
         Progress::Unkeyed(0)
     ));
+}
+
+/// A watch reads its own output: it names it, so the edge's staleness can
+/// be asked before the output is declared, and the output is not retired
+/// while a watch reads it.
+#[test]
+fn a_watch_names_its_own_output() {
+    use solera_tracking::retain::Retire;
+    let mut t = Tracking::new();
+    apply(
+        &mut t,
+        vec![Part::EdgeOpen(EdgeOpen {
+            edge: EDGE.into(),
+            input: ITEMS.into(),
+            keyed: true,
+        })],
+    );
+    let watch = |own: Option<Box<[u8]>>| {
+        Part::Watch(SetWatch {
+            edge: EDGE.into(),
+            watch: Watch {
+                conditions: Arc::default(),
+                own,
+                gate: true,
+            },
+        })
+    };
+    apply(&mut t, vec![watch(Some(key("own")))]);
+    assert!(t.life(b"own") > 0);
+    Tracking::restore(&t.snapshot()).unwrap();
+    t.stale_ask(EDGE).unwrap();
+    let retire = Part::Retire(Retire { output: key("own") });
+    let e = t.check_event(&Event::of(vec![retire.clone()])).unwrap_err();
+    assert!(e.to_string().contains("watch reads"), "{e}");
+    apply(&mut t, vec![watch(None)]);
+    apply(&mut t, vec![retire]);
+    t.stale_ask(EDGE).unwrap();
 }

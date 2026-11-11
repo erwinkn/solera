@@ -337,6 +337,17 @@ impl Retire {
                 name(e)
             ));
         }
+        if let Some((e, _)) = t.stale.inputs.iter().find(|(_, i)| {
+            i.watch
+                .as_ref()
+                .is_some_and(|w| w.own.as_deref() == Some(&self.output[..]))
+        }) {
+            return invalid(format!(
+                "{} is still the own output edge {}'s watch reads",
+                name(&self.output),
+                name(e)
+            ));
+        }
         if let [0, kind, edge @ ..] = &self.output[..] {
             if [FAILURES, DUE, PASS].contains(kind) && t.per_key.contains_key(edge) {
                 return invalid(format!(

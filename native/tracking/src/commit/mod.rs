@@ -34,8 +34,10 @@ fn in_full_run(t: &Tracking, output: &Id) -> bool {
 pub struct OutputCommit {
     pub output: Id,
     /// The output's life it was built on (its replaced versions and live
-    /// count are that life's), 0 when the output had none: it applies only
-    /// in that life.
+    /// count are that life's): it applies only in that life. 0 when the
+    /// output had no life: it applies only while the output still has none
+    /// (a first commit names it), so it may land after a whole life began
+    /// and ended (strict xfail, B5 PR 3, which declares every output first).
     pub life: u64,
     pub layer: LayerRef,
     pub live: u64,
@@ -66,7 +68,9 @@ impl OutputCommit {
     }
 
     pub(crate) fn check(&self, t: &Tracking) -> Result<()> {
-        t.in_life(&self.output, self.life, "a commit built on")?;
+        if self.life != 0 || t.outputs.contains_key(&self.output) {
+            t.in_life(&self.output, self.life, "the commit was built")?;
+        }
         let head = t.outputs.get(&self.output).map_or(0, |o| o.head);
         let l = &self.layer;
         if l.lo != head + 1 || l.hi != l.lo || l.floor.is_some() {

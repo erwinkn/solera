@@ -181,7 +181,7 @@ def test_a_commit_is_refused_once_its_edge_reads_another_output(tmp_path):
     t._set_output(b"items", layers, 2, 2)
     event = t.progress_ops(plan, [([], [("k1", 2)])])[0]
     t.apply(Tracking.event_edge_rename(b"e", b"e", b"other"))
-    with pytest.raises(ValueError, match="reads another output"):
+    with pytest.raises(ValueError, match="planned in life 1, but other is in life"):
         t.apply(event)
     with pytest.raises(ValueError, match="reads another output"):
         t.progress_ops(plan, [([], [("k1", 2)])])

@@ -190,9 +190,9 @@ impl Tracking {
     /// state, and the next naming gives it a new life. Its callers make sure
     /// no edge reads it (`Retire` refuses that, and no edge reads a per-key
     /// edge's record outputs: see [`core_owned`]).
-    pub(crate) fn end(&mut self, id: &[u8]) -> Option<Output> {
+    pub(crate) fn end(&mut self, id: &[u8]) {
         self.retain.cursors.remove(id);
-        self.outputs.remove(id)
+        self.outputs.remove(id);
     }
 
     /// The output's life now, 0 when it has none.
@@ -200,13 +200,20 @@ impl Tracking {
         self.outputs.get(id).map_or(0, |o| o.life)
     }
 
-    /// Refused unless `id` has life `life` now: what a plan, a commit or a
-    /// cleanup step read is of the output's life that the state holds.
+    /// Refused unless `id` has life `life` now, and so always for life 0:
+    /// what a plan, a commit or a cleanup step read is of the output's life
+    /// that the state holds.
     pub(crate) fn in_life(&self, id: &[u8], life: u64, what: &str) -> Result<()> {
         let now = self.life(id);
+        if life == 0 {
+            return crate::error::invalid(format!(
+                "{what} in life 0, and {} is in life {now}: a life is never 0",
+                String::from_utf8_lossy(id)
+            ));
+        }
         if now != life {
             return crate::error::invalid(format!(
-                "{what} {} in life {life}, its life is {now}: it was retired, dropped or started again since",
+                "{what} in life {life}, but {} is in life {now}",
                 String::from_utf8_lossy(id)
             ));
         }
@@ -236,18 +243,18 @@ impl Tracking {
         );
     }
 
-    /// What every state holds: each output's life is above 0, at most the
-    /// counter and its own; every edge's input and every cleaned output has
-    /// a life, and none is the core's. Restore refuses a snapshot that
+    /// What every state holds: each output's and per-key edge's life is above
+    /// 0, at most the counter and its own; every edge's input, cleaned output
+    /// and watch's own output has a life, and none is the core's. Restore refuses a snapshot that
     /// breaks it.
     pub fn check_lives(&self) -> Result<()> {
         let mut seen = std::collections::HashSet::new();
-        for (id, o) in &self.outputs {
-            if o.life == 0 || o.life > self.lives || !seen.insert(o.life) {
+        let lives = self.outputs.iter().map(|(id, o)| (id, o.life));
+        for (id, life) in lives.chain(self.per_key.iter().map(|(id, k)| (id, k.life))) {
+            if life == 0 || life > self.lives || !seen.insert(life) {
                 return format(format!(
-                    "output {} has life {}, of {} given",
+                    "output or edge {} has life {life}, of {} given",
                     String::from_utf8_lossy(id),
-                    o.life,
                     self.lives
                 ));
             }
@@ -262,6 +269,17 @@ impl Tracking {
         if let Some(id) = self.retain.cursors.keys().find(|id| !named(id)) {
             return format(format!(
                 "cleaned output {} has no life, or is the core's",
+                String::from_utf8_lossy(id)
+            ));
+        }
+        let mut owns = self
+            .stale
+            .inputs
+            .values()
+            .filter_map(|i| i.watch.as_ref()?.own.as_ref());
+        if let Some(id) = owns.find(|id| !named(id)) {
+            return format(format!(
+                "a watch's own output {} has no life, or is the core's",
                 String::from_utf8_lossy(id)
             ));
         }

@@ -25,11 +25,11 @@ use solera_tracking::commit::Declare;
 use solera_tracking::event::{Event, Part};
 use solera_tracking::lineage::{self, Answer, Received};
 use solera_tracking::plan::{self, Hold, InputRequest, Mode, OneIndex, Request};
+use solera_tracking::progress::{BatchProgress, EdgeClose, EdgeRename};
 use solera_tracking::progress::{
     Class, Conditions, EdgeOpen, Holding, InputReport, Key, KeyRange, Pat, Patterns, Reason, Reset,
     Value,
 };
-use solera_tracking::progress::{EdgeClose, EdgeRename};
 use solera_tracking::record::Record;
 use solera_tracking::retain::Retire;
 use solera_tracking::Tracking;
@@ -393,9 +393,10 @@ fn held_plan_request() -> Request {
 }
 
 /// A batch planned before its input's first commit can load what that
-/// commit wrote (Sol, round 6): its record names the input's life at
-/// commit, so once the input is retired its lineage is retired, never a
-/// version of another life.
+/// commit wrote (Sol, round 6): its plan names the life the edge's opening
+/// gave the input, which that commit keeps, and its record stores it, so
+/// once the input is retired its lineage is retired, never a version of
+/// another life.
 #[test]
 fn a_batch_planned_before_its_input_started_names_the_life_it_loaded() {
     let rt = runtime();
@@ -595,9 +596,9 @@ fn a_batch_whose_own_output_was_retired_answers_retired() {
     });
 }
 
-/// An output's life is given when a commit starts it, from one counter for
-/// every output, kept across commits and a snapshot, and given anew once it
-/// was retired; a cleanup step names it.
+/// An output's life is given when the output is first named, from one
+/// counter for every output, kept across commits and a snapshot, and given
+/// anew once it was retired; a cleanup step names it.
 #[test]
 fn an_output_life_follows_its_starts() {
     use solera_tracking::retain::{Cleaned, Track};
@@ -2217,6 +2218,92 @@ fn an_output_commit_needs_the_own_output_the_plan_read() {
             t.progress_ops(&p, &[InputReport::default()], b"run/batch", Some(1))
                 .is_err(),
             "an output commit with no own output's life (strict xfail, B5 PR 3)"
+        );
+    });
+}
+
+/// A batch's parts never name life 0: an output with no life is read by no
+/// plan, so a part naming 0 is refused, even beside a part that names it.
+#[test]
+fn a_batch_part_naming_life_0_is_refused() {
+    let rt = runtime();
+    let ix = index(&rt);
+    rt.block_on(async {
+        let mut t = Tracking::new();
+        let mut items = Log::new("items");
+        items
+            .commit(&ix, &mut t, [(key("k"), Ver::Int(1))].into())
+            .await;
+        apply(
+            &mut t,
+            vec![Part::EdgeOpen(EdgeOpen {
+                edge: key("e"),
+                input: key("items"),
+                keyed: true,
+            })],
+        );
+        let req = Request {
+            inputs: vec![InputRequest {
+                own: None,
+                ..held_plan_request().inputs[0].clone()
+            }],
+            ..held_plan_request()
+        };
+        let p = plan::plan(&t.view(&req).unwrap(), &req, &OneIndex(&ix), &plan::NoHold)
+            .await
+            .unwrap();
+        let ops = t
+            .progress_ops(&p, &[InputReport::default()], b"run/batch", None)
+            .unwrap();
+        let mut parts = vec![Part::Declare(Declare {
+            output: key("ghost"),
+        })];
+        for part in ops.parts {
+            parts.push(match part {
+                Part::Batch(b) => Part::Batch(BatchProgress {
+                    own: Some((key("ghost"), 0)),
+                    ..b
+                }),
+                part => part,
+            });
+        }
+        let ev = Event::decode(&Event::of(parts).encode()).unwrap();
+        let e = t.check_event(&ev).unwrap_err();
+        assert!(e.to_string().contains("a life is never 0"), "{e}");
+    });
+}
+
+/// A first commit built while its output had no life lands only while it
+/// still has none: built before a life began and held past its end, it does
+/// not become the next life's first commit (Fable, round 1: a commit naming
+/// life 0 matches every stretch with no entry). B5 PR 3 declares every
+/// output before its first commit; then a commit naming 0 is refused.
+#[test]
+#[should_panic(expected = "B5 PR 3")]
+fn a_first_commit_built_before_a_whole_life_does_not_apply() {
+    let rt = runtime();
+    let ix = index(&rt);
+    rt.block_on(async {
+        let mut t = Tracking::new();
+        let mut staging = Tracking::new();
+        let mut a = Log::new("x");
+        a.commit(&ix, &mut staging, [(key("k"), Ver::Int(1))].into())
+            .await;
+        let pending = commit_part(&t, "x", &a.layers[0], 1);
+        assert!(matches!(&pending, Part::OutputCommit(c) if c.life == 0));
+        apply(&mut t, vec![Part::Declare(Declare { output: key("x") })]);
+        let mut staging = Tracking::new();
+        let mut b = Log {
+            files: a.files,
+            ..Log::new("x")
+        };
+        b.commit(&ix, &mut staging, [(key("k"), Ver::Int(7))].into())
+            .await;
+        commit_to(&mut t, "x", &b.layers[0], 1);
+        apply(&mut t, vec![Part::Retire(Retire { output: key("x") })]);
+        assert!(
+            t.check_event(&Event::of(vec![pending])).is_err(),
+            "a first commit built before a whole life applies after it (strict xfail, B5 PR 3)"
         );
     });
 }

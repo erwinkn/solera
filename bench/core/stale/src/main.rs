@@ -111,7 +111,7 @@ fn state(
             own: None,
             points: vec![],
             expect: read_digest(&Keyed::default(), false, &KeyRange::all()),
-            fence: None,
+            fence: false,
         }));
         t.apply_event(Event::of(parts)).unwrap();
         t.apply_event(Event::of(vec![Part::Watch(SetWatch {
@@ -498,7 +498,7 @@ fn main() {
             own: None,
             points: vec![],
             expect: read_digest(&k, false, &range),
-            fence: None,
+            fence: false,
         })]))
         .unwrap();
         for (mode, net) in modes {

@@ -363,7 +363,7 @@ fn scenario_state(
             own: None,
             points: pts,
             expect: read_digest(&Keyed::default(), false, &KeyRange::all()),
-            fence: None,
+            fence: false,
         });
         t.apply(&Event::of(vec![caught_up]).encode()).unwrap();
     }

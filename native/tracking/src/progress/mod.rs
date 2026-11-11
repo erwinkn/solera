@@ -1162,7 +1162,7 @@ impl Consumed {
 
     pub(crate) fn check(&self, t: &Tracking) -> Result<()> {
         let e = edge(t, &self.edge)?;
-        t.in_life(&e.input, self.life, "the batch was planned on")?;
+        t.in_life(&e.input, self.life, "the batch was planned")?;
         match e.progress.as_ref() {
             Progress::Unkeyed(t) if *t == self.expect => Ok(()),
             Progress::Unkeyed(_) => {
@@ -1204,11 +1204,11 @@ pub struct BatchProgress {
     pub expect: u64,
     /// When the batch kept, on an input then settled, a key it would have
     /// held back had the input been unsettled (loaded at another version than
-    /// planned, or taken by the input's patterns but not by the input): that
-    /// input's head the batch planned at. Refused if the input became
-    /// `unsettled` before the event applies, since the key would then have
-    /// been held back. The other way needs no fence: holding back is safe.
-    pub fence: Option<u64>,
+    /// planned, or taken by the input's patterns but not by the input).
+    /// Refused if the input became `unsettled` at the batch's `head` before
+    /// the event applies, since the key would then have been held back. The
+    /// other way needs no fence: holding back is safe.
+    pub fence: bool,
 }
 
 /// Refused unless the batch's input is in the life its plan read, and so is
@@ -1221,7 +1221,7 @@ pub(crate) fn planned_lives(
     life: u64,
     own: Option<(&[u8], u64)>,
 ) -> Result<()> {
-    t.in_life(input, life, "the batch was planned on")?;
+    t.in_life(input, life, "the batch was planned")?;
     if let Some((own, life)) = own {
         t.in_life(own, life, "the batch's plan read its own output")?;
     }
@@ -1271,7 +1271,7 @@ impl BatchProgress {
         }
         encode_points(&mut body, &mut t, self.points.iter().map(|(k, p)| (k, p)));
         body.uv(self.expect);
-        body.opt_u64(self.fence);
+        body.u8(self.fence.into());
         t.encode(e);
         e.buf.extend_from_slice(&body.buf);
     }
@@ -1295,7 +1295,11 @@ impl BatchProgress {
         };
         let points = decode_points(d, &conds)?;
         let expect = d.uv()?;
-        let fence = d.opt_u64()?;
+        let fence = match d.u8()? {
+            0 => false,
+            1 => true,
+            t => return format(format!("fence tag {t}")),
+        };
         Ok(BatchProgress {
             edge,
             reset,
@@ -1332,8 +1336,8 @@ impl BatchProgress {
         if floor.is_some_and(|f| f > self.head) {
             return invalid("the input's layers no longer reach back to the batch's head: a merge folded past it");
         }
-        if let Some(head) = self.fence {
-            if unsettled(t, input, head)? {
+        if self.fence {
+            if unsettled(t, input, self.head)? {
                 return invalid("the input became unsettled since the batch's commit was built");
             }
         }

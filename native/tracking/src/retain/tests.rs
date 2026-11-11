@@ -29,8 +29,8 @@ use crate::event::{Event, Part};
 use crate::outcomes::{output_id, PerKey, DUE, FAILURES};
 use crate::plan::OneIndex;
 use crate::progress::{
-    read_digest, BatchProgress, Conditions, EdgeClose, EdgeOpen, EdgeRename, KeyRange, Reset,
-    Slice, Value,
+    read_digest, BatchProgress, Conditions, Consumed, EdgeClose, EdgeOpen, EdgeRename, Holding,
+    Key, KeyRange, Point, Reason, Reset, Slice, Value,
 };
 use crate::record::Record;
 use crate::state::Output;
@@ -354,7 +354,7 @@ impl Model {
             own: None,
             points: vec![],
             expect: a.expect,
-            fence: None,
+            fence: false,
         };
         self.apply(Part::Batch(part))
             .map_err(|e| format!("a batch planned at {} was refused: {e}", a.head))?;
@@ -789,7 +789,7 @@ fn a_merge_is_refused_unless_it_replaces_adjacent_layers_folds_within_the_cut_an
         own: None,
         points: vec![],
         expect: read_digest(&Default::default(), false, &KeyRange::all()),
-        fence: None,
+        fence: false,
     }))
     .unwrap();
     let e = m.t.check_event(&Event::of(vec![Part::Merged(fold)]));
@@ -869,7 +869,7 @@ fn a_merge_to_a_held_path_writes_nothing_and_a_merge_shares_no_event() {
         own: None,
         points: vec![],
         expect: read_digest(&Default::default(), false, &KeyRange::all()),
-        fence: None,
+        fence: false,
     });
     let e =
         m.t.check_event(&Event::of(vec![Part::Merged(ok.clone()), batch]))
@@ -906,7 +906,7 @@ fn a_batch_whose_input_folded_past_its_head_is_refused() {
             own: None,
             points: vec![],
             expect: read_digest(&Default::default(), false, &KeyRange::all()),
-            fence: None,
+            fence: false,
         })
     };
     for key_list in [false, true] {
@@ -1232,63 +1232,87 @@ fn cleanup_refuses_a_replaced_version_that_is_not_a_generation() {
     assert!(e.to_string().contains("not a generation"), "{e}");
 }
 
+/// An edge moves to another output only holding nothing of the one it
+/// reads (a reset leaves it so): no commit (a piece, or an unkeyed edge's
+/// consumed counter), no point and no failure. What it held names commits of
+/// the output it read, which another output's commits do not continue.
 #[test]
-fn an_edge_moves_to_an_input_only_above_its_floor() {
+fn an_edge_moves_to_another_output_only_holding_nothing_of_the_one_it_reads() {
     let rt = runtime();
-    let mut m = commits(&rt, 4);
-    m.apply(cleaned(&m.t, 0, 4)).unwrap();
-    let layers = m.layers();
-    let layer = rt
-        .block_on(m.ix.merge(&layers, 0..3, 3, "items/f.lay"))
-        .unwrap();
-    m.apply(Part::Merged(Merged {
-        output: items(),
-        replaced: layers[0..3].iter().map(|l| l.path.clone()).collect(),
-        layer,
-    }))
-    .unwrap();
+    let mut m = commits(&rt, 1);
     let other: Id = b"other".as_slice().into();
     m.t.set_output(other.clone(), vec![], 1, 0, None);
-    let edge: Id = b"moved".as_slice().into();
-    m.apply(Part::EdgeOpen(EdgeOpen {
-        edge: edge.clone(),
-        input: other.clone(),
-        keyed: true,
-    }))
-    .unwrap();
-    m.apply(Part::Batch(BatchProgress {
-        edge: edge.clone(),
-        reset: false,
-        range: KeyRange::all(),
-        piece: Some(Value::At(1, m.cond.clone())),
-        head: 1,
-        life: m.t.life(&other),
-        own: None,
-        points: vec![],
-        expect: read_digest(&Default::default(), false, &KeyRange::all()),
-        fence: None,
-    }))
-    .unwrap();
-    let rename = |input: &Id| {
+    let rename = |edge: &Id, input: &Id| {
         Part::EdgeRename(EdgeRename {
             from: edge.clone(),
             to: edge.clone(),
             input: input.clone(),
         })
     };
-    let e =
-        m.t.check_event(&Event::of(vec![rename(&items())]))
-            .unwrap_err();
-    assert!(e.to_string().contains("reset it first"), "{e}");
-    m.apply(rename(&other)).unwrap();
-    // a per-key edge whose keys fail holds its seen, with no piece at all
-    let failing: Id = b"failing".as_slice().into();
-    m.apply(Part::EdgeOpen(EdgeOpen {
-        edge: failing.clone(),
-        input: other.clone(),
-        keyed: true,
+    let refused = |m: &Model, part: Part| {
+        let e = m.t.check_event(&Event::of(vec![part])).unwrap_err();
+        assert!(e.to_string().contains("reset it first"), "{e}");
+    };
+    let open = |m: &mut Model, edge: &Id, keyed: bool| {
+        m.apply(Part::EdgeOpen(EdgeOpen {
+            edge: edge.clone(),
+            input: other.clone(),
+            keyed,
+        }))
+        .unwrap();
+    };
+    let batch = |m: &Model, edge: &Id, piece: Option<Value>, points: Vec<(Key, Point)>| {
+        Part::Batch(BatchProgress {
+            edge: edge.clone(),
+            reset: false,
+            range: KeyRange::all(),
+            piece,
+            head: 1,
+            life: m.t.life(&other),
+            own: None,
+            points,
+            expect: read_digest(&Default::default(), false, &KeyRange::all()),
+            fence: false,
+        })
+    };
+    // holding nothing, an edge moves, and names the output it moves to
+    let empty: Id = b"empty".as_slice().into();
+    open(&mut m, &empty, true);
+    let fresh: Id = b"fresh".as_slice().into();
+    m.apply(rename(&empty, &fresh)).unwrap();
+    assert!(m.t.life(&fresh) > 0);
+    // a commit (a piece)
+    let piece: Id = b"piece".as_slice().into();
+    open(&mut m, &piece, true);
+    let part = batch(&m, &piece, Some(Value::At(1, m.cond.clone())), vec![]);
+    m.apply(part).unwrap();
+    refused(&m, rename(&piece, &items()));
+    m.apply(rename(&piece, &other)).unwrap();
+    // points only
+    let points: Id = b"points".as_slice().into();
+    open(&mut m, &points, true);
+    let point = Point {
+        holding: Holding::Held,
+        reason: Reason::Failed,
+        seen: None,
+    };
+    let part = batch(&m, &points, None, vec![(b"k".as_slice().into(), point)]);
+    m.apply(part).unwrap();
+    refused(&m, rename(&points, &items()));
+    // an unkeyed edge's consumed counter
+    let unkeyed: Id = b"unkeyed".as_slice().into();
+    open(&mut m, &unkeyed, false);
+    m.apply(Part::Consumed(Consumed {
+        edge: unkeyed.clone(),
+        life: m.t.life(&other),
+        through: 1,
+        expect: 0,
     }))
     .unwrap();
+    refused(&m, rename(&unkeyed, &items()));
+    // a per-key edge whose keys fail holds its failures, with no piece at all
+    let failing: Id = b"failing".as_slice().into();
+    open(&mut m, &failing, true);
     m.t.per_key.insert(
         failing.clone(),
         PerKey {
@@ -1297,12 +1321,5 @@ fn an_edge_moves_to_an_input_only_above_its_floor() {
         },
     );
     m.t.set_output(output_id(FAILURES, &failing), vec![], 1, 1, None);
-    let e = m
-        .apply(Part::EdgeRename(EdgeRename {
-            from: failing.clone(),
-            to: failing.clone(),
-            input: items(),
-        }))
-        .unwrap_err();
-    assert!(e.to_string().contains("reset it first"), "{e}");
+    refused(&m, rename(&failing, &items()));
 }

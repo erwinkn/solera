@@ -299,7 +299,7 @@ impl Tracking {
                 own: p.own.as_ref().map(|o| (o.output.clone(), o.life)),
                 points,
                 expect: p.expect,
-                fence: (kept_unsure && !unsettled).then_some(p.head),
+                fence: kept_unsure && !unsettled,
             }));
         }
         for u in &plan.unkeyed {

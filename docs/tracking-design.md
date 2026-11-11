@@ -549,9 +549,9 @@ these additions:
   kept a key on a settled input that it would have held back had the input
   been unsettled (loaded at another version, or not taken there though its
   patterns take it) carries a
-  fence: that input's output and the head it planned at. The event is
-  refused if the edge reads another output by then, or the input has become
-  unsettled. A batch that held all such keys back carries no fence for that
+  fence. The event is refused if the input has become unsettled at the head
+  the batch planned at. The batch names the input's life (§12), so the event
+  is also refused if the edge reads another output by then. A batch that held all such keys back carries no fence for that
   input: holding back is always safe, and at worst costs a later batch.
   Every part of an event is checked on the state before it, so the fence
   answers for the batch applied ahead of the rest of its event; another
