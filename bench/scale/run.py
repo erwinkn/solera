@@ -306,6 +306,7 @@ class Run:
             "loop_busy": round(busy / (busy + idle), 3) if busy + idle else None,
             "loop_longest_ms": round(1000 * max(x["longest"] for x in window), 1),
             "engine_rss_peak_mb": round(max(x["rss"] for x in window) / 2**20),
+            "engine_rss_peak_so_far_mb": round(last["peak_rss"] / 2**20),
             "batches": sum(commits.values()),
             "batches_by_asset": commits,
             "keys_delivered": planned,
@@ -535,7 +536,7 @@ def report(results: dict) -> str:
         ("N9 batches per second end to end, worst full run", worst(full, "batches_per_s", min), "≥ 30"),
         ("N9 event loop busy, worst phase", worst(phases, "loop_busy"), "≤ 0.5"),
         ("N9 longest event-loop stall (ms), worst phase", worst(phases, "loop_longest_ms"), "≤ 50"),
-        ("N12 engine memory peak (MB)", worst(phases, "engine_rss_peak_mb"), "≤ 1,536"),
+        ("N12 engine memory peak (MB)", worst(phases, "engine_rss_peak_so_far_mb"), "≤ 1,536"),
         *(
             (f"Engine CPU of the full run of {p['phase']} (s)", p["engine_cpu_s"], f"< {FULL_RUN_TARGET_S}")
             for p in full
