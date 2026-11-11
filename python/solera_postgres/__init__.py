@@ -96,6 +96,14 @@ class _Spool:
             yield chunk
 
 
+class BuildGone(StoreError):
+    """A load in one snapshot (`reads()`) of a ref to a full run's build that
+    a switch published and dropped after the snapshot began: in that
+    snapshot the user's table still holds the old rows. Read again."""
+
+    retryable = True
+
+
 @dataclass
 class _Target:
     """Where a write goes (`PostgresStore._aim`): the user's `table`, or the
@@ -596,16 +604,8 @@ class PostgresStore:
 
         import psycopg
 
-        prefix = _build_name(table, partition, 0)[:-1]
         with psycopg.connect(resolve_env(self.dsn), autocommit=True) as conn:
-            names = [
-                name
-                for (name,) in conn.execute(
-                    "SELECT c.relname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
-                    "WHERE n.nspname = %s AND c.relkind = 'r' AND starts_with(c.relname, %s)",
-                    (BUILD_SCHEMA, prefix),
-                )
-            ]
+            names = self._builds_of(conn.cursor(), table, partition)
             if not names:
                 return
             found = conn.execute(
@@ -620,6 +620,17 @@ class PostgresStore:
                     conn.execute(f"DROP TABLE IF EXISTS {_qname(BUILD_SCHEMA, name)}")
                 except psycopg.errors.LockNotAvailable:
                     log.info("build %s is still being read: the next sweep drops it", name)
+
+    def _builds_of(self, cur, table: str, partition: str) -> list[str]:
+        """The names of the partition's build tables, registered or not."""
+
+        prefix = _build_name(table, partition, 0)[:-1]
+        found = cur.execute(
+            "SELECT c.relname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+            "WHERE n.nspname = %s AND c.relkind = 'r' AND starts_with(c.relname, %s)",
+            (BUILD_SCHEMA, prefix),
+        ).fetchall()
+        return [r["relname"] if isinstance(r, dict) else r[0] for r in found]
 
     async def cleanup(
         self, output, *, home=None, partition=None, key=None, generation=None, before=None
@@ -652,10 +663,15 @@ class PostgresStore:
 
             parts = list(written) if partition is None else [partition]
             taken = [p for p in parts if due(p)]
+            if not column and len(taken) != len(written):
+                return  # unpartitioned, partitions share the rows: a newer one keeps them
+            if key is None:  # before the table: a build's identity default names its sequence
+                for name in [n for p in taken for n in self._builds_of(cur, table, p)]:
+                    cur.execute(f"DROP TABLE IF EXISTS {_qname(BUILD_SCHEMA, name)}")
             if partition is None and key is None and len(taken) == len(written):
                 cur.execute(f"DROP TABLE IF EXISTS {table}")
                 cur.execute(f"DELETE FROM {VERSIONS_TABLE} WHERE rel = %s", (table,))
-            elif column or len(taken) == len(written):  # unpartitioned, partitions share the rows
+            else:
                 for part in taken:
                     where = {column: part} if column else {}
                     sql, params = self._where_sql(where), [where[k] for k in sorted(where)]
@@ -667,10 +683,6 @@ class PostgresStore:
                         cur.execute(
                             f"DELETE FROM {VERSIONS_TABLE} WHERE rel = %s AND part = %s", (table, part)
                         )
-            else:
-                taken = []
-        for part in taken if key is None else []:
-            self._sweep(table, part)
 
     async def acquire(self, context: WriteContext, prior: Ref | None = None) -> None:
         """Today's path: take the attempt's version check for the partition it
@@ -1291,7 +1303,7 @@ class PostgresStore:
     def _read(self, ref: Ref, t, selection: Keys | Commits | None, conn=None) -> Read:
         import psycopg
 
-        handle = ref.handle or {}
+        handle, handed = ref.handle or {}, conn is not None
         with contextlib.nullcontext(conn) if conn else self._connect() as conn, conn.cursor() as cur:
             table = handle.get("table") or _qname(handle.get("schema", "public"), handle["name"])
             source = self._source(cur, ref)
@@ -1320,8 +1332,14 @@ class PostgresStore:
             except psycopg.errors.UndefinedTable:
                 if source == table:
                     raise
-                # A switch published the build and dropped it after the lookup: its rows are
-                # the user's table's now (probes P2, sol1/read_drop.py, sol2/load_retry.py).
+                if handed:  # a snapshot from before the switch: the user's table holds the old rows there
+                    raise BuildGone(
+                        f"{ref.output}: run {handle.get('build')}'s build was published and dropped after "
+                        "this read's snapshot began; read again"
+                    ) from None
+                # A switch published the build and dropped it after the lookup: its rows are the
+                # user's table's now, which a new statement sees (probes P2, sol1/read_drop.py,
+                # sol2/load_retry.py).
                 found = cur.execute(sql.format(table), params)
                 rows = found.fetchall()
             columns = [d.name for d in found.description or () if d.name != VERSION_COLUMN]

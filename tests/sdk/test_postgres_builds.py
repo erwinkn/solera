@@ -452,6 +452,20 @@ async def test_a_cleanup_takes_the_outputs_builds(store):
     assert builds(store, out, "p1") == [] and registry(store, out, "p1") is None
 
 
+async def test_a_cleanup_drops_a_table_whose_build_draws_from_its_sequence(store):
+    """A build's identity column draws from the user's table's sequence, so
+    the table cannot be dropped while the build stands: cleanup drops the
+    builds first."""
+
+    out = output(incremental=True)
+    table, _, _ = store._table(out)
+    sql(f"CREATE TABLE {table} (id text, v text, n bigint GENERATED ALWAYS AS IDENTITY, _version bigint)")
+    first = await store.store(rows(a="1"), None, at(out, 1))
+    await store.store(rows(a="5"), first.ref, at(out, 5, reset=True))
+    await store.cleanup(out)
+    assert sql("SELECT to_regclass(%s)", (table,)) == [(None,)] and builds(store, out) == []
+
+
 # -- the build's columns and constraints (probes P5, R4, R5, R9) ----------------------------
 
 
@@ -688,6 +702,25 @@ async def test_a_load_racing_the_switchs_drop_reads_the_published_rows(store, mo
     assert await store.full_run_ended(out, "", 5, 5)
     gone = _qname(BUILD_SCHEMA, _build_name(store._table(out)[0], "", 5))
     monkeypatch.setattr(store, "_source", lambda cur, ref: gone)  # the lookup made before the switch
+    assert await solera(store, run.ref) == {"a": "5"}
+
+
+async def test_a_snapshot_from_before_the_switch_never_reads_the_old_rows_for_the_build(store):
+    """A reader's snapshot (`reads()`) began before the switch; the build is
+    published and dropped before it loads the build's ref. In that snapshot
+    the user's table still holds the old rows: the load refuses, retryably,
+    rather than return them for the run's."""
+
+    from solera_postgres import BuildGone
+
+    out = output(incremental=True)
+    first = await store.store(rows(a="1"), None, at(out, 1))
+    run = await store.store(rows(a="5"), first.ref, at(out, 5, reset=True))
+    async with store.reads() as reader:
+        assert (await reader.load(first.ref, list[dict], None))[0] == [{"id": "a", "v": "1"}]
+        assert await store.full_run_ended(out, "", 5, 5) and builds(store, out) == []
+        with pytest.raises(BuildGone):
+            await reader.load(run.ref, list[dict], None)
     assert await solera(store, run.ref) == {"a": "5"}
 
 
