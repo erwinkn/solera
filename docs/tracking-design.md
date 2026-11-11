@@ -925,7 +925,7 @@ per edge.
 | Head | c4 |
 | Conditions | patterns p1, no context, definition d1 |
 | Replaced slice | (−∞, k2] at c1, no points |
-| Points written | none (each would carry its reason) |
+| Marks | none (each would carry its reason) |
 | Counts | updated 2 |
 | Digest | hash of [(k1, 4, updated), (k2, 2, updated)] |
 | Planner version | 1 |
@@ -941,10 +941,11 @@ About 200 bytes plus the replaced slice, usually one piece.
 - **The digest makes recomputation honest.** Lineage recomputes the key
   list; if its hash differs, the answer is an error naming the batch, never
   a wrong list.
-- **Points written** carry the deviations (§8): keys loaded at another
-  version than planned, with the version loaded. Each point names its
-  reason: failed, held back by the planner, held back at commit (§10 rule
-  4), deviation, or key list.
+- **Marks** carry the deviations (§8): every key the batch did not load as
+  planned and settle, with the version loaded where it was not the one
+  planned. Each mark names its reason: failed, held back by the planner,
+  held back at commit (§10 rule 4), or deviation. Progress keeps a point
+  only where it needs one; the record marks every such key either way.
 - **A key-list run records its key list**, the one case where planned keys
   are stored: the user's input cannot be derived.
 
@@ -1626,7 +1627,7 @@ one part of its replaced slice at a time, the way the planner built it
 
 The **digest covers the planned key list**, with each key's class and
 version at the head: check it on the list just recomputed. Then apply the
-points written (dropping held-back keys, replacing deviations by the
+marks (dropping held-back keys, replacing deviations by the
 versions loaded) to get what the batch actually received. The output side
 is the entries of its output commit.
 
@@ -1660,6 +1661,39 @@ included, with its duration, so this changes HIS-6.
 **Honest answers.** "k1 was at version 1 then; that file has since been
 deleted." "Run not retained." A digest mismatch is an error naming the
 batch.
+
+### As built (B10, `native/tracking/src/lineage/`)
+
+Called from Python as `lineage_input`, `lineage_trace` and `lineage_flow`
+(`native/src/lineage_py.rs`), one call per question.
+
+- **A batch's input** replays the planner's own walk (`plan::Replay`) over
+  the record's replaced slice, at its head, under its conditions, in its
+  mode, leaving out the keys it held back and those waiting for their
+  retry, then checks the digest. Its reads are the plan's.
+- **The record's marks** (`RECORD_FORMAT` 3) give each key's reason and
+  the version loaded, a failed or unsettled key's included. Marks, a key
+  list and the replaced pieces must be in key order, or the record does
+  not decode.
+- **The key trace** is `history(key)` on the output plus, for each record
+  given, what that batch received of the key. A record whose range, key
+  list or held-back keys leave the key out costs nothing; any other is
+  recomputed whole and checked against its digest, at one plan's cost per
+  batch.
+- **Not retained** when a commit the record names (its head, each `At`
+  piece of its replaced slice without a reset, the consumer's own head for
+  a `held` piece) is below the floor of that output's index. A key list
+  reads only its keys' pieces, but cleanup keeps whole replaced slices
+  (above), so the rule is the record's. A named commit past the output's
+  head is an error.
+- **Deleted** when a commit after the batch's head and at or below the
+  cleanup cursor replaced the version the batch read (the one loaded where
+  it deviated), and no later commit wrote that version again. This assumes
+  cleanup never deletes a version a later commit wrote again (B9). It
+  reads the batch's keys from its head to the output's, so with cleanup
+  past the batch it costs a second read of the batch's keys.
+- **Flow** per window of time comes from each record's counts: batches,
+  full runs, keys by class.
 
 ## 13. Retention and cleanup
 
