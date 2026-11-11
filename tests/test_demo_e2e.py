@@ -86,7 +86,8 @@ def pool_worker(demo):
 def test_demo_end_to_end(demo, pool_worker):
     # A connection is never reused: uvicorn closes one idle for 5 s and httpx
     # reuses one idle for less than 5 s by its own clock, which starts later.
-    # A request sent between the two, as after the tick wait below, is lost.
+    # A request sent between the two, as after the tick wait below, can race
+    # the server closing the connection and get no answer.
     client = httpx.Client(base_url=demo, timeout=15, limits=httpx.Limits(max_keepalive_connections=0))
     base = "/api/projects/demo"
 
