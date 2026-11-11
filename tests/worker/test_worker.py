@@ -391,6 +391,25 @@ project = Project(assets=[lingering])
 """
 
 
+HANDLER_AT_IMPORT = """
+import signal
+from solera.executors import Pool
+from solera.sdk import Project, asset
+
+signal.signal(signal.SIGUSR1, lambda *_: None)  # a project that handles a signal
+
+@asset(executor=Pool("ingest")())
+def lingering() -> int:
+    if not callable(signal.getsignal(signal.SIGUSR1)):
+        raise RuntimeError("the attempt lost the handler its project's import set")
+    if signal.pthread_sigmask(signal.SIG_BLOCK, ()):
+        raise RuntimeError("the attempt starts with signals blocked")
+    return 1
+
+project = Project(assets=[lingering])
+"""
+
+
 async def offered(engine, run_id: str, pool: str = "ingest") -> dict:
     """The stage of `run_id`'s attempt once `pool`'s workers are offered it."""
 
@@ -439,8 +458,9 @@ def imported(path) -> list[str]:
         (LOCKED_AT_IMPORT, "left 1 thread(s) running"),
         (SOCKET_AT_IMPORT, "left 2 socket(s) or pipe(s) open"),
         (SLOW_AT_IMPORT, "took more than 5 s"),
-        (SIGCHLD_AT_IMPORT, "set how SIGCHLD is handled"),
+        (SIGCHLD_AT_IMPORT, "ignored SIGCHLD"),
         (SIGINT_IGNORED_AT_IMPORT, None),
+        (HANDLER_AT_IMPORT, None),
     ],
     ids=[
         "thread",
@@ -450,6 +470,7 @@ def imported(path) -> list[str]:
         "slow-import",
         "sigchld-at-import",
         "sigint-ignored",
+        "handler-at-import",
     ],
 )
 async def test_a_pool_attempt_runs_in_a_child_of_the_forkserver(
@@ -529,10 +550,13 @@ async def test_a_pool_attempt_runs_in_a_child_of_the_forkserver(
 
 
 PRELOADS = """
-import json, os, signal, socket, sys, threading, time
+import gc, json, os, signal, socket, sys, threading, time
 from solera_worker.forkserver import _preload, _threads
 
 done = threading.Event()
+mask = signal.pthread_sigmask(signal.SIG_BLOCK, ())
+waitpid = os.waitpid
+ran = []
 
 def project(left):
     def load(entrypoint):
@@ -550,50 +574,97 @@ def project(left):
         if left == "sigchld":
             signal.signal(signal.SIGCHLD, signal.SIG_IGN)
         if left == "sigchld-handler":
-            signal.signal(signal.SIGCHLD, lambda *_: None)
+            signal.signal(signal.SIGCHLD, lambda *_: ran.append("SIGCHLD"))
+        if left == "handler":
+            signal.signal(signal.SIGUSR1, lambda *_: ran.append("SIGUSR1"))
+        if left == "timer":
+            signal.setitimer(signal.ITIMER_REAL, 100)
+        if left == "mask":
+            signal.pthread_sigmask(signal.SIG_BLOCK, [signal.SIGUSR2])
+        if left == "at-fork":
+            os.register_at_fork(after_in_parent=lambda: None)
+        if left == "at-fork-in-child":
+            os.register_at_fork(after_in_child=lambda: None)
+        if left == "audit-hook":
+            sys.addaudithook(lambda *_: None)
+        if left == "trace":
+            sys.settrace(lambda *_: None)
+        if left == "gc-callback":
+            gc.callbacks.append(lambda *_: None)
+        if left == "replaced":
+            os.waitpid = lambda *args: waitpid(*args)
+        if left == "stdout":
+            sys.stdout = open(os.devnull, "w")
         return "project"
 
     return load
 
 found = {}
-for left in ("nothing", "raise", "exit", "thread", "socket", "pipe", "sigchld", "sigchld-handler"):
+for left in (
+    "nothing", "raise", "exit", "thread", "socket", "pipe", "sigchld", "sigchld-handler", "handler", "timer",
+    "mask", "at-fork", "at-fork-in-child", "audit-hook", "trace", "gc-callback", "replaced", "stdout",
+):
     load = project(left)
     found[left] = _preload("p", load)
-    signal.signal(signal.SIGCHLD, signal.SIG_DFL)
+    if left == "handler":  # due now, while the forkserver would serve: it must not run here
+        os.kill(os.getpid(), signal.SIGUSR1)
+        time.sleep(0.05)
+        found["handler-ran"] = list(ran)
+    for number in (signal.SIGCHLD, signal.SIGUSR1):
+        signal.signal(number, signal.SIG_IGN)  # what is pending goes, unrun
+        signal.signal(number, signal.SIG_DFL)
+    signal.setitimer(signal.ITIMER_REAL, 0)
+    signal.pthread_sigmask(signal.SIG_SETMASK, mask)
+    sys.settrace(None)
+    gc.callbacks.clear()
+    os.waitpid, sys.stdout = waitpid, sys.__stdout__
     if left == "thread":
         done.set()
         load.kept.join()
         while _threads() > 1:  # joined, and its OS thread gone too
             time.sleep(0.01)
+found["ran"] = ran
 print(json.dumps(found))
 """
 
 
 def test_the_forkserver_keeps_only_a_project_whose_import_left_nothing_running():
     """ERW-36: a forkserver keeps the project only if importing it raised
-    nothing, left no thread, socket or pipe behind and left its children its
-    own to wait for; else it says why.
-    Run as a forkserver is: in a process of one thread."""
+    nothing and left nothing that would run project code in the forkserver
+    or make an attempt differ from a fresh import: no thread, socket or
+    pipe, SIGCHLD not ignored, the signal mask as it was, no timer, no
+    at-fork hook run in the parent, audit hook, trace function or garbage
+    collector callback, and no function or stream the forkserver calls
+    replaced; else it says why. A signal handler may stay: every signal is
+    blocked in the forkserver once the import returns, so it runs in the
+    attempts alone. Run as a forkserver is: in a process of one thread."""
 
     import subprocess
     import sys
 
     done = subprocess.run([sys.executable, "-c", PRELOADS], capture_output=True, text=True, timeout=60)
     found = json.loads(done.stdout.strip().splitlines()[-1])
-    assert found["nothing"] == ["project", None]
-    assert found["raise"] == [None, "importing the project raised ImportError: no module named numpi"]
-    assert found["exit"] == [None, "importing the project raised SystemExit: 2"]
-    assert found["thread"] == [None, "importing the project left 1 thread(s) running beside the main one"]
-    for left in ("sigchld", "sigchld-handler"):
-        assert found[left] == [
-            None,
-            "importing the project set how SIGCHLD is handled, which the forkserver needs as it was",
-        ]
-    for left in ("socket", "pipe"):
-        assert found[left] == [
-            None,
-            "importing the project left 2 socket(s) or pipe(s) open, which every attempt would share",
-        ]
+    for left in ("nothing", "sigchld-handler", "handler", "at-fork-in-child"):
+        assert found[left] == ["project", None], left
+    assert found["handler-ran"] == [] and found["ran"] == []
+    refused = {
+        "raise": "raised ImportError: no module named numpi",
+        "exit": "raised SystemExit: 2",
+        "thread": "left 1 thread(s) running beside the main one",
+        "socket": "left 2 socket(s) or pipe(s) open, which every attempt would share",
+        "pipe": "left 2 socket(s) or pipe(s) open, which every attempt would share",
+        "sigchld": "ignored SIGCHLD, so the forkserver could not wait for its attempts",
+        "timer": "left a timer running, which no attempt forked from it would have",
+        "mask": "changed which signals are blocked",
+        "at-fork": "registered an at-fork hook, which would run its code here",
+        "audit-hook": "registered an audit hook, which would run its code here",
+        "trace": "registered a trace function, which would run its code here",
+        "gc-callback": "registered a garbage collector callback, which would run its code here",
+        "replaced": "replaced os.waitpid, which the forkserver calls",
+        "stdout": "replaced sys.stdout, which the forkserver calls",
+    }
+    for left, reason in refused.items():
+        assert found[left] == [None, f"importing the project {reason}"], left
 
 
 HELD = """
@@ -724,6 +795,64 @@ def test_closing_a_pool_worker_while_its_forkserver_imports_forks_nothing(tmp_pa
         hold.unlink()
         attempts.close()
         runner.join(10)
+
+
+def test_closing_a_pool_worker_on_two_threads_returns_once_its_forkserver_is_gone(tmp_path):
+    """ERW-36 review round 4: a second close waits for the first one's
+    teardown, and a run that had not sent its request by then returns LOST
+    and forks nothing."""
+
+    import threading
+    from unittest.mock import patch
+
+    from solera_worker.forkserver import Attempts, Forkserver
+
+    forked = tmp_path / "forked"
+    entrypoint = write_project(
+        tmp_path,
+        f"import os\nos.register_at_fork(after_in_child=lambda: open({str(forked)!r}, 'w').close())\n"
+        + HELD.format(ran=str(tmp_path / "ran"), hold="/nowhere"),
+    )
+    attempts = Attempts(entrypoint)
+    server = attempts._start()
+    assert server is not None and server.deploy is not None
+    forked.unlink(missing_ok=True)  # the forkserver's own probe
+    at_run, resume_run, at_close, resume_close = (threading.Event() for _ in range(4))
+    run, close = Forkserver.run, Forkserver.close
+
+    def held_run(self, *args):
+        at_run.set()
+        resume_run.wait(10)
+        return run(self, *args)
+
+    def held_close(self):
+        at_close.set()
+        resume_close.wait(10)
+        return close(self)
+
+    result = []
+    with patch.object(Forkserver, "run", held_run), patch.object(Forkserver, "close", held_close):
+        runner = threading.Thread(target=lambda: result.append(attempts.run({}, None)))
+        runner.start()
+        try:
+            assert at_run.wait(10)
+            first = threading.Thread(target=attempts.close)
+            first.start()
+            assert at_close.wait(10)
+            second = threading.Thread(target=attempts.close)
+            second.start()
+            second.join(0.5)
+            assert second.is_alive()  # until the first close's forkserver is gone
+            resume_close.set()
+            first.join(10)
+            second.join(10)
+            assert not second.is_alive() and server.process.poll() is not None
+        finally:
+            resume_close.set()
+            resume_run.set()
+            runner.join(10)
+    assert result == [4]  # LOST
+    assert not forked.exists()
 
 
 VERSIONED = """

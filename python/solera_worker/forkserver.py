@@ -4,21 +4,36 @@ the project, and forks each attempt from that state. An attempt still has
 a process of its own, so a forced cancel ends it and nothing else, but it
 imports nothing again.
 
-Fork copies only the forking thread: a lock another thread held, or a
-connection another thread used, would reach every attempt held or
-half-used. So the forkserver keeps the project only if importing it left
-the process as it found it: no exception, no thread but the main one
-(counted by the OS, so a native library's threads count; refused where it
-cannot be counted), no new socket or pipe, which every attempt forked from
-it would share, and SIGCHLD as it was; and within `PRELOAD_TIMEOUT`: the import runs before an attempt
-owns anything, where nothing could cancel it. Otherwise it says why and
-exits, and the pool worker starts one with the framework alone, whose
-attempts import the project themselves, for as long as the pool worker
-runs. The forkserver sets SIGCHLD to its default before it imports
-anything and refuses an import that changed it, so it can always wait for
-its children and no project code runs in it when one ends; it sets no
-other disposition, so an attempt has the ones the project's import left,
-as if it had imported it itself.
+Two rules make that safe: after the import, the forkserver runs no project
+code; and each attempt starts from what a fresh import would have left.
+The first holds by construction where it can: once the import returns the
+forkserver blocks every signal (each attempt restores the mask), so no
+handler the project installed runs in it; it freezes what the import made
+out of the garbage collector, so no finalizer runs in it; and it leaves
+through `os._exit`, so no exit handler does. The rest it checks, and keeps
+the project only if importing it raised nothing, within `PRELOAD_TIMEOUT`
+(the import runs before an attempt owns anything, where nothing could
+cancel it), and left:
+
+- no thread but the main one: fork copies only the forking thread, so a
+  lock another thread held would reach every attempt held. Counted by the
+  OS, so a native library's threads count; refused where it cannot count.
+- no new socket or pipe, which every attempt would share half-used.
+- SIGCHLD not ignored, natively either (`SA_NOCLDWAIT`), so the
+  forkserver can wait for its attempts. It sets SIGCHLD to its default
+  before it imports anything; a handler the project installs is blocked
+  here and runs in its attempts.
+- the signal mask as it was, and no timer running, which no attempt forked
+  from it would have.
+- nothing the interpreter or the forkserver would call later with project
+  code in it: an at-fork hook that runs in the parent, an audit hook, a
+  trace, profile, monitoring or garbage collector callback, or a function
+  or stream of a module the forkserver calls (gevent's `os.fork`, a new
+  `sys.stdout`).
+
+Otherwise it says why and exits, and the pool worker starts one with the
+framework alone, whose attempts import the project themselves, for as long
+as the pool worker runs.
 
 A preloaded forkserver serves one deploy: the manifest digest of the code
 it imported, its files hashed as they were imported (`Project.manifest`).
@@ -29,8 +44,10 @@ afresh, and runs the attempt from the new one.
 
 from __future__ import annotations
 
+import builtins
 import contextlib
 import ctypes
+import gc
 import json
 import os
 import signal
@@ -48,9 +65,9 @@ PRELOAD_TIMEOUT = 60.0  # seconds a forkserver may take to import the project be
 class Attempts:
     """A pool worker's attempts, each in a child of its forkserver, which
     starts with the first attempt and is replaced when the deploy changes.
-    `run` blocks: call it on a thread. Once `close` is called, from any
-    thread, no forkserver starts and nothing more is forked: a `run` under
-    way returns `LOST`, and an attempt already forked runs on."""
+    `run` blocks: call it on a thread. Once `close` returns, on any thread,
+    no forkserver starts and no request reaches one: a `run` under way
+    returns `LOST`, and an attempt already requested runs on."""
 
     def __init__(self, entrypoint: str, preload_timeout: float = PRELOAD_TIMEOUT):
         self.entrypoint, self.preload_timeout = entrypoint, preload_timeout
@@ -136,11 +153,11 @@ class Attempts:
         server.close()
 
     def close(self) -> None:
-        with self.lock:
+        with self.lock:  # every caller returns once the forkserver is gone: a request sent later fails
             self.closed = True
-            server, self.server = self.server, None
-        if server is not None:
-            server.close()
+            if self.server is not None:
+                self.server.close()
+                self.server = None
 
 
 class Forkserver:
@@ -223,51 +240,62 @@ def serve() -> None:
     """The forkserver: `python -c ... FD ENTRYPOINT PRELOAD PGID SYS_PATH`,
     PRELOAD empty for the framework alone, PGID the pool worker's process
     group. It says hello, then forks one attempt per request, waits for it
-    and answers with its exit code. It sets one signal disposition, before
-    it imports anything: SIGCHLD's to the default, so it can wait for its
-    children whatever the pool worker's was. An attempt has the
-    dispositions its project's import left, as if it imported it."""
+    and answers with its exit code. Before it imports anything it sets
+    SIGCHLD to the default, so it can wait for its children whatever the
+    pool worker's was; once it has, it blocks every signal, and each
+    attempt restores the mask it started with: an attempt has the handlers
+    and dispositions the project's import left, as if it imported it."""
 
     signal.signal(signal.SIGCHLD, signal.SIG_DFL)
     connection = socket.socket(fileno=int(sys.argv[1]))
     stream = connection.makefile("rwb")
 
-    def send(message: dict) -> None:
-        stream.write(json.dumps(message).encode() + b"\n")
-        stream.flush()
+    def send(message: dict) -> bool:
+        """False once the pool worker hung up."""
+
+        try:
+            stream.write(json.dumps(message).encode() + b"\n")
+            stream.flush()
+        except OSError:
+            return False
+        return True
 
     from . import worker
 
     _warm()
-    entrypoint, project, group = sys.argv[2], None, int(sys.argv[4])
+    entrypoint, project, refused, group = sys.argv[2], None, None, int(sys.argv[4])
+    mask = signal.pthread_sigmask(signal.SIG_BLOCK, ())
     if sys.argv[3]:
         project, refused = _preload(entrypoint, worker.load_project)
-        if refused is not None:
-            send({"refused": refused})
-            return
-    send({"deploy": project.manifest["deploy"] if project is not None else None})
-    for line in stream:
-        request = json.loads(line)
-        sys.stdout.flush()  # or each child would write what is buffered here once more
+    signal.pthread_sigmask(signal.SIG_BLOCK, signal.valid_signals())
+    if refused is not None:
+        send({"refused": refused})
+    elif send({"deploy": project.manifest["deploy"] if project is not None else None}):
+        for line in stream:
+            request = json.loads(line)
+            sys.stdout.flush()  # or each child would write what is buffered here once more
+            sys.stderr.flush()
+            with contextlib.suppress(Exception):
+                ctypes.CDLL(None).fflush(None)  # C's stdio buffers too
+            pid = os.fork()
+            if pid == 0:
+                try:
+                    signal.pthread_sigmask(signal.SIG_SETMASK, mask)
+                    stream.close()
+                    connection.close()  # the pool worker's and this server's alone
+                    with contextlib.suppress(OSError):
+                        os.setpgid(0, group)
+                    stale = request["check"] and project is not None
+                    worker._child(request["stage"], request["engine"], project or entrypoint, stale=stale)
+                finally:
+                    os._exit(LOST)
+            _, status = os.waitpid(pid, 0)
+            if not send({"code": os.waitstatus_to_exitcode(status)}):
+                break  # the pool worker is gone
+    with contextlib.suppress(OSError, ValueError):
+        sys.stdout.flush()
         sys.stderr.flush()
-        with contextlib.suppress(Exception):
-            ctypes.CDLL(None).fflush(None)  # C's stdio buffers too
-        pid = os.fork()
-        if pid == 0:
-            try:
-                stream.close()
-                connection.close()  # the pool worker's and this server's alone
-                with contextlib.suppress(OSError):
-                    os.setpgid(0, group)
-                stale = request["check"] and project is not None
-                worker._child(request["stage"], request["engine"], project or entrypoint, stale=stale)
-            finally:
-                os._exit(LOST)
-        _, status = os.waitpid(pid, 0)
-        try:
-            send({"code": os.waitstatus_to_exitcode(status)})
-        except OSError:
-            return  # the pool worker is gone
+    os._exit(0)
 
 
 def _warm() -> None:
@@ -288,15 +316,38 @@ def _warm() -> None:
 
 def _preload(entrypoint: str, load):
     """`(project, None)`, the project imported here, or `(None, reason)`:
-    why it cannot stay."""
+    why it cannot stay. Every signal is blocked as soon as the import
+    returns, and a handler already due runs then, before the checks: none
+    can run here after them. What the import registers through the
+    interpreter's own functions is recorded as it registers it."""
 
-    before = _channels()
+    mask, channels = signal.pthread_sigmask(signal.SIG_BLOCK, ()), _channels()
+    framework, hooks, registered = _framework(), _hooks(), []
+    register_at_fork, addaudithook = os.register_at_fork, sys.addaudithook
+
+    def at_fork(**callbacks) -> None:
+        if callbacks.keys() & {"before", "after_in_parent"}:
+            registered.append("an at-fork hook")
+        register_at_fork(**callbacks)
+
+    def audit(hook) -> None:
+        registered.append("an audit hook")
+        addaudithook(hook)
+
+    os.register_at_fork, sys.addaudithook = at_fork, audit
     try:
         project = load(entrypoint)
     except BaseException as error:  # SystemExit too: each attempt reports its own import's
         return None, f"importing the project raised {type(error).__name__}: {error}"
-    if not _waits():
-        return None, "importing the project set how SIGCHLD is handled, which the forkserver needs as it was"
+    finally:
+        os.register_at_fork, sys.addaudithook = register_at_fork, addaudithook
+        blocked = signal.pthread_sigmask(signal.SIG_BLOCK, signal.valid_signals())
+    if replaced := sorted(
+        f"{module.__name__}.{name}"
+        for (module, name), value in framework.items()
+        if module.__dict__.get(name) is not value
+    ):
+        return None, f"importing the project replaced {', '.join(replaced)}, which the forkserver calls"
     threads = _threads()
     if threads is None:
         return (
@@ -305,10 +356,28 @@ def _preload(entrypoint: str, load):
         )
     if threads > 1:
         return None, f"importing the project left {threads - 1} thread(s) running beside the main one"
-    if opened := _channels() - before:
+    if opened := _channels() - channels:
         return (
             None,
             f"importing the project left {len(opened)} socket(s) or pipe(s) open, which every attempt would share",
+        )
+    if _ignored() & 1 << (signal.SIGCHLD - 1):
+        return (
+            None,
+            "importing the project ignored SIGCHLD, so the forkserver could not wait for its attempts",
+        )
+    if blocked != mask:
+        return None, "importing the project changed which signals are blocked"
+    if any(
+        signal.getitimer(timer)[0]
+        for timer in (signal.ITIMER_REAL, signal.ITIMER_VIRTUAL, signal.ITIMER_PROF)
+    ):
+        return None, "importing the project left a timer running, which no attempt forked from it would have"
+    registered += [name for name, value in _hooks().items() if hooks[name] != value]
+    if registered:
+        return (
+            None,
+            f"importing the project registered {', '.join(registered)}, which would run its code here",
         )
     pid = os.fork()  # SIGCHLD's default, but with SA_NOCLDWAIT set natively: no child to wait for
     if pid == 0:
@@ -317,25 +386,40 @@ def _preload(entrypoint: str, load):
         os.waitpid(pid, 0)
     except ChildProcessError:
         return None, "importing the project left the forkserver no child to wait for (SA_NOCLDWAIT)"
+    gc.freeze()
     return project, None
 
 
-def _waits() -> bool:
-    """SIGCHLD has its default disposition, from Python and in the kernel
-    (where native code may have set it): neither ignored, so its children
-    stay its to wait for, nor handled, so no project code runs here when
-    one ends."""
+def _framework() -> dict:
+    """What the forkserver calls after the import, by (module, name): every
+    function of the modules it calls, and the streams it flushes."""
 
-    if signal.getsignal(signal.SIGCHLD) != signal.SIG_DFL:
-        return False
+    found = {(sys, name): getattr(sys, name) for name in ("stdout", "stderr")}
+    for module in (builtins, contextlib, ctypes, gc, json, os, os.path, signal, stat):
+        found |= {(module, name): value for name, value in vars(module).items() if callable(value)}
+    return found
+
+
+def _hooks() -> dict[str, object]:
+    """What the interpreter calls on its own, by what it is."""
+
+    return {
+        "a trace function": sys.gettrace(),
+        "a profile function": sys.getprofile(),
+        "a monitoring tool": [sys.monitoring.get_tool(tool) for tool in range(6)],
+        "a garbage collector callback": list(gc.callbacks),
+    }
+
+
+def _ignored() -> int:
+    """The signals this process ignores (/proc/self/status SigIgn), as a
+    mask: native code's settings included."""
+
     with open("/proc/self/status") as status:
         for line in status:
-            if (
-                line.startswith(("SigIgn:", "SigCgt:"))
-                and int(line.split()[1], 16) >> (signal.SIGCHLD - 1) & 1
-            ):
-                return False
-    return True
+            if line.startswith("SigIgn:"):
+                return int(line.split()[1], 16)
+    return 0
 
 
 def _threads() -> int | None:

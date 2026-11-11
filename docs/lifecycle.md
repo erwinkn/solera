@@ -1177,28 +1177,40 @@ control file:
   attempt from 280–370 ms to 125–138 ms (ERW-36). Every pool worker
   offered an attempt forks for it, the losers of the race to own it too,
   so their cost counts as well.
-- **The project stays in the forkserver only if importing it changed
-  nothing a fork would copy wrong.** Fork copies only the forking thread:
-  a lock another thread held, or a connection another thread used, would
-  reach every attempt held or half-used. So if the import raised, left a
-  thread running beside the main one (counted by the OS, so a native
-  library's threads count; where the OS gives no count, as on macOS, the
-  project is never kept), left a socket or pipe open, which every attempt
-  would share, changed how `SIGCHLD` is handled (by Python or native
-  code: the forkserver must wait for its attempts, and run no project code
-  when one ends), or took more than 60 s (it
-  runs before any attempt owns anything, so nothing else could stop it),
-  the forkserver says why and exits; the pool worker logs one warning with that reason and starts a forkserver with
-  the framework alone, whose attempts import the project themselves, as
-  before. Until the pool worker restarts it does not try again. A file the
-  import left open is shared too, its offset included, and so is any state
-  the import made, a random generator's seed say: open files and seed
-  generators in the asset, not at import. The forkserver sets one signal
-  disposition, `SIGCHLD` to the default before it imports anything, and
-  no other, so an attempt has the ones its project's import left, as if
-  it had imported it. The forkserver runs in a process group of its
-  own and each attempt joins the pool worker's, so a Ctrl-C reaches the
-  pool worker and its attempts, not the forkserver.
+- **After the import the forkserver runs no project code, and an attempt
+  starts from what a fresh import would leave.** Where it can, the
+  forkserver holds the first by construction: once the import returns it
+  blocks every signal (each attempt restores the mask it started with), so
+  a handler the project installed runs in its attempts, never in the
+  forkserver; it freezes what the import made out of the garbage
+  collector, so no finalizer runs there; and it leaves through
+  `os._exit`, so no exit handler does. The rest it checks. Fork copies
+  only the forking thread: a lock another thread held, or a connection
+  another thread used, would reach every attempt held or half-used. So if
+  the import raised; left a thread running beside the main one (counted by
+  the OS, so a native library's threads count; where the OS gives no
+  count, as on macOS, the project is never kept); left a socket or pipe
+  open, which every attempt would share; ignored `SIGCHLD`, by Python or
+  native code (`SA_NOCLDWAIT` too: the forkserver must wait for its
+  attempts); changed the signal mask or left a timer running, which no
+  forked attempt would have; registered anything the interpreter would
+  call in the forkserver later (an at-fork hook that runs in the parent,
+  an audit hook, a trace, profile, monitoring or garbage collector
+  callback); replaced a function or stream the forkserver calls (gevent's
+  `os.fork`, a new `sys.stdout`); or took more than 60 s (it runs
+  before any attempt owns anything, so nothing else could stop it), the
+  forkserver says why and exits; the pool worker logs one warning with
+  that reason and starts a forkserver with the framework alone, whose
+  attempts import the project themselves, as before. Until the pool worker
+  restarts it does not try again. A file the import left open is shared
+  too, its offset included, and so is any state the import made, a random
+  generator's seed say: open files and seed generators in the asset, not
+  at import. The forkserver sets one signal disposition, `SIGCHLD` to the
+  default before it imports anything, and no other, so an attempt has the
+  ones its project's import left, as if it had imported it. The forkserver
+  runs in a process group of its own and each attempt joins the pool
+  worker's, so a Ctrl-C reaches the pool worker and its attempts, not the
+  forkserver.
 - **A preloaded forkserver serves one deploy**: the manifest's `deploy`
   digest of the code it imported, whose build identity hashed the files as
   they were imported (`architecture.md` §11). A child whose spec names
