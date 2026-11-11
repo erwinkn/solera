@@ -294,7 +294,7 @@ fn one_event(part: Part) -> Vec<u8> {
 }
 
 /// The change indexes outputs are attached to.
-struct Attached(HashMap<Key, ix::ChangeIndex>);
+pub(crate) struct Attached(HashMap<Key, ix::ChangeIndex>);
 
 impl tr::plan::Indexes for Attached {
     fn index(&self, output: &[u8]) -> tr::Result<&ix::ChangeIndex> {
@@ -311,9 +311,9 @@ impl tr::plan::Indexes for Attached {
 /// The tracking core's state: what every consumer holds of its inputs, and
 /// every output's layers. Changed only by `apply(event)`.
 #[pyclass(frozen, name = "Tracking", module = "solera._native")]
-struct Tracking {
-    state: RwLock<tr::Tracking>,
-    indexes: RwLock<Arc<Attached>>,
+pub(crate) struct Tracking {
+    pub(crate) state: RwLock<tr::Tracking>,
+    pub(crate) indexes: RwLock<Arc<Attached>>,
     /// B7: owed counts, kept until the edge or its upstream moves.
     counts: tr::stale::Counts,
 }

@@ -431,7 +431,9 @@ fn reads_of_many_segments_hold_a_bounded_batch_of_them() {
     let ix = ChangeIndex::new(store, WriteOptions::default());
     let ls = std::slice::from_ref(&l);
     let q = Query::default();
-    let one = [n.to_be_bytes()];
+    // opens the layer (its top level) before the measured read: a listed key
+    // within the layer's keys and not in it
+    let one = [[&1u64.to_be_bytes()[..], &[0]].concat()];
     assert_eq!(rt.block_on(ix.get(ls, 1, &one, &q)).unwrap().run.len(), 0);
     let some: Vec<Vec<u8>> = (0..n)
         .step_by(2001)

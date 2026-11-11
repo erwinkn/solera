@@ -73,6 +73,13 @@ impl Tracking {
         }) {
             return invalid("a report's keys are sorted and distinct");
         }
+        if plan
+            .inputs
+            .iter()
+            .any(|p| p.keys.windows(2).any(|w| w[0].key >= w[1].key))
+        {
+            return invalid("a plan's keys are sorted and distinct");
+        }
         let taken = |p: &InputPlan, k: &Key| p.keys.binary_search_by(|c| c.key.cmp(k)).is_ok();
         if plan.inputs.iter().zip(reports).any(|(p, r)| {
             !r.failed.iter().all(|k| taken(p, k)) || !r.loaded.iter().all(|(k, _)| taken(p, k))
@@ -104,24 +111,33 @@ impl Tracking {
             .iter()
             .map(|p| unsettled(self, &p.output, p.head))
             .collect::<Result<Vec<bool>>>()?;
-        let batch: BTreeSet<&Key> = plan
-            .inputs
-            .iter()
-            .flat_map(|p| p.keys.iter().map(|c| &c.key))
-            .collect();
+        // With one input the batch is its keys, so every key was taken.
+        let mut batch: Vec<&Key> = match plan.inputs.len() {
+            1 => Vec::new(),
+            _ => plan
+                .inputs
+                .iter()
+                .flat_map(|p| p.keys.iter().map(|c| &c.key))
+                .collect(),
+        };
+        // each input's keys are a sorted run, which the stable sort merges
+        batch.sort();
+        batch.dedup();
         let unsure: Vec<Vec<&Key>> = plan
             .inputs
             .iter()
             .zip(reports)
             .map(|(p, r)| {
-                moved(p, r)
-                    .chain(
-                        batch
-                            .iter()
-                            .copied()
-                            .filter(|k| !taken(p, k) && p.conditions.patterns.takes(k)),
-                    )
-                    .collect()
+                // the batch's keys this input did not take, by one merge of
+                // two sorted lists
+                let mut j = 0;
+                let untaken = batch.iter().copied().filter(move |&k| {
+                    while p.keys.get(j).is_some_and(|c| &c.key < k) {
+                        j += 1;
+                    }
+                    p.keys.get(j).is_none_or(|c| &c.key != k) && p.conditions.patterns.takes(k)
+                });
+                moved(p, r).chain(untaken).collect()
             })
             .collect();
         let hold: BTreeSet<&Key> = unsure
@@ -255,6 +271,7 @@ impl Tracking {
                 reset: plan.reset,
                 range: plan.range.clone(),
                 piece: (!key_list).then(|| Value::At(p.head, p.conditions.clone())),
+                head: p.head,
                 points,
                 expect: p.expect,
                 fence: (kept_unsure && !unsettled).then(|| (p.output.clone(), p.head)),

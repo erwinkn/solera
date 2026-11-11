@@ -67,6 +67,12 @@ impl OutputCommit {
                 l.lo, l.hi
             ));
         }
+        if t.outputs
+            .get(&self.output)
+            .is_some_and(|o| o.layers.iter().any(|x| x.path == l.path))
+        {
+            return invalid(format!("the layer path {} is written twice", l.path));
+        }
         if self.ends_full_run && l.clears.is_empty() && !in_full_run(t, &self.output) {
             return invalid("a commit ends a full run on an output that is not in one");
         }

@@ -17,11 +17,12 @@ pandas' dtypes.
 
 from __future__ import annotations
 
+import functools
 from collections.abc import Callable, Mapping
 from typing import Any
 
 from ..sdk import KEYS, Output
-from . import WriteError, key_text
+from . import WriteError, key_text, take_list
 from . import prepare as _prepare
 
 KINDS = (
@@ -96,12 +97,8 @@ def read(content: Any, output: Output):
             content = pa.table(content)
         return Rows.arrow(content, output.key), _arrow_taker(content), empty, arrow_kinds(content)
     if by_key:  # DataFrames among lists of rows: rows, every one
-        return Rows.records(content, output.key), _list_taker(content), empty, None
+        return Rows.records(content, output.key), functools.partial(take_list, content), empty, None
     return None
-
-
-def _list_taker(items: list) -> Callable:
-    return lambda rows: items if rows is None else [items[r] for r in rows]
 
 
 def _by_key(content: Mapping, output: Output):
@@ -215,11 +212,19 @@ def _arrow_taker(data: Any) -> Callable:
 
     def take(rows):
         nonlocal table
-        if table is None:
-            import pyarrow as pa
+        import pyarrow as pa
 
+        if table is None:
             table = data if isinstance(data, pa.Table) else pa.table(data)
-        return (table if rows is None else table.take(rows)).to_pylist(maps_as_pydicts="strict")
+        if rows is None:
+            taken = table
+        elif isinstance(rows, range) and rows.step == 1:
+            taken = table.slice(rows.start, len(rows))
+        elif isinstance(rows, memoryview):
+            taken = table.take(pa.Array.from_buffers(pa.uint32(), len(rows), [None, pa.py_buffer(rows)]))
+        else:
+            taken = table.take(list(rows))
+        return taken.to_pylist(maps_as_pydicts="strict")
 
     return take
 

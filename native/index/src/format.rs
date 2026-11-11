@@ -119,6 +119,9 @@ impl LayerRef {
                 self.path, self.flags
             ));
         }
+        if self.entries > 0 && self.first_key > self.last_key {
+            return invalid(format!("{}: first key past its last key", self.path));
+        }
         if self.index_start > self.top_start
             || self
                 .top_start
