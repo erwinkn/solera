@@ -495,8 +495,8 @@ default retention.
 *From* `object-store-state.md` §11. *Covered* `contract/test_src.py::test_src_2_each_commit_that_changes_something_is_a_run_with_no_tasks`; `server/test_retention.py::test_source_commits_are_recorded_as_runs`.
 
 **SRC-3. Sources are read live, and every load says which version it served.**
-A keyed loader returns `{key: Loaded(row, version=…)}`; a key it leaves
-out was served absent. `ctx.batch[input].served` shows each key's served
+A keyed loader returns `{key: Loaded(row, version=…)}` (or one table,
+SRC-13); a key it leaves out was served absent. `ctx.batch[input].served` shows each key's served
 version. A keyed loader that omits versions fails the load.
 *From* D146, D147. *Covered* `contract/test_src.py::test_src_3_a_keyed_loader_serves_rows_with_their_versions`; `contract/test_src.py::test_src_3_a_keyed_loader_that_omits_versions_fails_the_load`; `server/test_sources.py::test_a_key_the_loader_leaves_out_was_observed_absent`.
 
@@ -554,6 +554,17 @@ changed k1 since the batch's head (it then knows better). Two consumers of
 a source that changes on every read may trigger each other, bounded by
 the engine's pace (ENG-10).
 *From* D193 (P13, sources only). *Today* the load corrects the batch's classes but the source's log keeps @2, so `items` is owed k1 again. *Covered* `contract/test_src.py::test_src_12_a_load_that_finds_a_source_ahead_of_its_log_records_it`; `contract/test_src.py::test_src_12_a_log_that_moved_since_the_batchs_head_keeps_its_version`.
+
+**SRC-13. A keyed loader may serve one Arrow table.**
+`Loaded(table, version="etag")`: the key column is the one `key=` names,
+each row's version its `etag`. Before, `{k: Loaded(row, version=etag)}`
+per key; after, one table, of which only the two columns are read. The
+consumer gets the same batch as from the dict form: the rows of the keys
+asked, in key order, without `etag`, as its parameter asks (a list, a
+DataFrame, a `pa.Table`). A key with no row was served absent. A table
+that cannot say what it served fails the load: a key twice, a null key or
+version, no key or version column, a version not a string.
+*From* the Captain's brief for ERW-25 (Erwin, 2026-11-11). *Covered* `contract/test_src.py::test_src_13_a_keyed_loader_may_serve_one_arrow_table`; `contract/test_src.py::test_src_13_the_rows_come_as_the_parameter_asks`; `contract/test_src.py::test_src_13_a_per_key_consumer_gets_each_keys_row`; `contract/test_src.py::test_src_13_a_table_that_cannot_say_what_it_served_fails_the_load`; `contract/test_src.py::test_src_13_the_table_and_dict_forms_serve_alike`.
 
 ## KEY — per-key assets and key outcomes
 

@@ -426,6 +426,64 @@ impl Served {
         })
     }
 
+    /// A keyed loader's answer as one Arrow table, `Loaded(table,
+    /// version=column)`, read from its `key` and `version` columns alone
+    /// (`arrow::served`) and added to what this reader served, as `read`
+    /// adds a dict's. Returns which rows to keep, in the order of `keys`
+    /// (None: every row, as it is; else their row numbers, u32 in native
+    /// order) and, with `grouped`, the key each kept row is.
+    #[pyo3(signature = (table, key, version, keys, grouped=false))]
+    fn read_table<'py>(
+        &mut self,
+        py: Python<'py>,
+        table: &Bound<'py, PyAny>,
+        key: &str,
+        version: &str,
+        keys: Option<Bound<'py, PyList>>,
+        grouped: bool,
+    ) -> PyResult<(Option<Bound<'py, PyBytes>>, Option<Bound<'py, PyList>>)> {
+        guard(|| {
+            let (schema, batches) = crate::arrow_stream(py, table)?;
+            let asked = match &keys {
+                None => None,
+                Some(names) => {
+                    let mut asked = Arena::default();
+                    asked.ends.reserve(names.len());
+                    let mut b = Vec::new();
+                    for name in names.iter() {
+                        b.clear();
+                        key_bytes(&name, &mut b)?;
+                        asked.push(&b);
+                    }
+                    Some(asked)
+                }
+            };
+            let s = crate::arrow::served(&schema, &batches, key, version, asked)
+                .map_err(crate::to_py)?;
+            let n: usize = batches.iter().map(|b| b.num_rows()).sum();
+            let names = match grouped {
+                false => None,
+                true => Some(PyList::new(
+                    py,
+                    s.at.iter()
+                        .map(|&i| match &keys {
+                            Some(names) => names.get_item(i),
+                            None => Ok(crate::index_py::key(py, s.keys.get(i))),
+                        })
+                        .collect::<PyResult<Vec<_>>>()?,
+                )?),
+            };
+            let every =
+                s.rows.len() == n && s.rows.iter().enumerate().all(|(i, &r)| r as usize == i);
+            let take = (!every).then(|| {
+                let bytes: Vec<u8> = s.rows.iter().flat_map(|r| r.to_ne_bytes()).collect();
+                PyBytes::new(py, &bytes)
+            });
+            self.absorb(s.keys, s.versions);
+            Ok((take, names))
+        })
+    }
+
     /// The version `k` was served at; `default` when it was served absent or
     /// not asked for (the per-key path reads it as a dict).
     #[pyo3(signature = (k, default=None))]

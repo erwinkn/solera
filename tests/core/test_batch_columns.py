@@ -180,3 +180,205 @@ def test_a_batch_read_from_columns_equals_one_built_whole():
             assert (rows, added) == ([1], ())
     with pytest.raises(AttributeError):
         lazy.rows = []
+
+
+def test_a_table_answer_serves_as_the_same_dict_answer_would():
+    """`Loaded(table, version=column)` over random tables — shuffled, in
+    several chunks, keyed by strings or integers, holding keys not asked —
+    against the dict answer of the same rows: the same servings, and through
+    `frames.served` the same rows, flat or grouped, whole or by keys asked."""
+
+    import pyarrow as pa
+    from solera.stores import frames
+
+    rnd = random.Random(7)
+    for _ in range(300):
+        ints = rnd.random() < 0.3
+        held = rnd.sample(range(40), rnd.randint(0, 20))
+        rows = [
+            {"id": k if ints else f"k{k}", "n": rnd.randint(0, 9), "etag": f"e{rnd.randint(0, 3)}"}
+            for k in held
+        ]
+        schema = pa.schema(
+            [("id", pa.int64() if ints else pa.string()), ("n", pa.int64()), ("etag", pa.string())]
+        )
+        table = pa.Table.from_pylist(rows, schema=schema)
+        if len(rows) > 1:  # in chunks
+            cut = rnd.randint(1, len(rows) - 1)
+            table = pa.concat_tables([table.slice(0, cut), table.slice(cut)])
+        answer = {str(r["id"]): Loaded({"id": str(r["id"]), "n": r["n"]}, version=r["etag"]) for r in rows}
+        keys = (
+            None
+            if rnd.random() < 0.2
+            else sorted(rnd.sample([f"{k}" if ints else f"k{k}" for k in range(40)], 10))
+        )
+        grouped = keys is not None and rnd.random() < 0.3
+        served, want = Served(), Served()
+        take, names = served.read_table(table, "id", "etag", keys, grouped=grouped)
+        got = frames.served(table, take, "etag", list, names)
+        wanted, bad = want.read(answer, keys, Loaded, grouped=grouped)
+        assert bad is None and served.items() == want.items()
+        same = (lambda r: {**r, "id": str(r["id"])}) if ints else (lambda r: r)
+        if grouped:
+            assert {k: [same(r) for r in g] for k, g in got.items()} == wanted
+        else:
+            assert [same(r) for r in got] == wanted
+
+
+@pytest.mark.parametrize(
+    ("columns", "error"),
+    [
+        ({"id": ["a", "b", "a"], "v": ["1", "2", "3"]}, 'key "a" has two rows'),
+        ({"id": ["a", None], "v": ["1", "2"]}, 'column "id" has nulls'),
+        ({"v": ["1"]}, 'no column "id"'),
+        ({"id": ["a"]}, 'no column "v"'),
+        ({"id": ["a"], "v": [b"1"]}, 'version column "v" must hold strings, not Binary'),
+        ({"id": [1.5], "v": ["1"]}, 'key column "id" must hold strings or integers, not Float64'),
+    ],
+)
+def test_a_table_that_cannot_say_what_it_served_serves_nothing(columns, error):
+    import pyarrow as pa
+
+    served = Served()
+    with pytest.raises(ValueError, match=error):
+        served.read_table(pa.table(columns), "id", "v", ["a"])
+    empty = pa.table(columns).slice(0, 0)
+    if not any(w in error for w in ("two rows", "nulls")):  # empty, and with no record batch: its schema says
+        for table in (empty, pa.Table.from_batches([], empty.schema)):
+            with pytest.raises(ValueError, match=error):
+                served.read_table(table, "id", "v", ["a"])
+    assert served.items() == []
+    with pytest.raises(ValueError, match="cannot be the key column"):
+        served.read_table(pa.table({"id": ["a"]}), "id", "id", None)
+
+
+def test_a_table_answer_makes_the_dict_answers_dataframe():
+    """Nested values as their rows read (a map as a dict), the pandas index a
+    column like any other, timestamps at pandas' nanoseconds."""
+
+    import datetime as dt
+
+    import pandas as pd
+    import pyarrow as pa
+    from solera.stores import frames
+
+    rows = [
+        {"id": "b", "m": {"x": 1}, "at": dt.datetime(2026, 1, 2, 3, 4, 5, 6), "n": 2, "i": 1, "o": None},
+        {"id": "a", "m": {}, "at": dt.datetime(2026, 1, 1), "n": None, "i": 2, "o": None},
+    ]
+    schema = pa.schema(
+        [
+            ("id", pa.string()),
+            ("m", pa.map_(pa.string(), pa.int64())),
+            ("at", pa.timestamp("us")),
+            ("n", pa.int64()),
+            ("i", pa.int32()),
+            ("o", pa.int64()),
+        ]
+    )
+    plain = pa.Table.from_pylist(rows, schema=schema)
+    index = pa.Table.from_pandas(pd.DataFrame({"id": ["b", "a"], "n": [2, None]}).set_index("id"))
+    for table in (plain, plain.replace_schema_metadata(index.schema.metadata)):
+        table = table.append_column("v", pa.array(["1", "2"]))
+        answer = {r["id"]: Loaded(r, version="1") for r in rows}
+        take, _ = Served().read_table(table, "id", "v", ["a", "b"])
+        wanted, _ = Served().read(answer, ["a", "b"], Loaded)
+        pd.testing.assert_frame_equal(frames.served(table, take, "v", pd.DataFrame), pd.DataFrame(wanted))
+    far = [
+        {"id": "a", "at": dt.datetime(1000, 1, 1), "d": dt.timedelta(seconds=10**10)},
+        {"id": "b", "at": dt.datetime(2026, 1, 1), "d": dt.timedelta(seconds=1)},
+    ]
+    table = pa.Table.from_pylist(
+        far, pa.schema([("id", pa.string()), ("at", pa.timestamp("us")), ("d", pa.duration("s"))])
+    )
+    table = table.append_column("v", pa.array(["1", "2"]))
+    take, _ = Served().read_table(table, "id", "v", ["a", "b"])
+    wanted, _ = Served().read({r["id"]: Loaded(r, version="1") for r in far}, ["a", "b"], Loaded)
+    pd.testing.assert_frame_equal(frames.served(table, take, "v", pd.DataFrame), pd.DataFrame(wanted))
+    meta = pa.Table.from_pandas(pd.DataFrame({"id": ["a"], "v": ["1"], "n": [1]}).set_index("id"))
+    take, _ = Served().read_table(meta, "id", "v", ["a"])
+    assert frames.served(meta, take, "v", pd.DataFrame).to_dict("records") == [{"n": 1, "id": "a"}]
+
+
+def test_a_table_arrow_cannot_select_rows_of_is_refused_whatever_keys_are_asked():
+    import pyarrow as pa
+    from solera.stores import frames
+
+    nested = pa.array([{"z": b"1"}, {"z": b"2"}], pa.struct([("z", pa.binary_view())]))
+    for column in (pa.array(["x", "y"], pa.string_view()), nested):
+        table = pa.table({"id": ["a", "b"], "c": column, "etag": ["1", "2"]})
+        for keys in (["a", "b"], ["b", "a"], None):
+            take, _ = Served().read_table(table, "id", "etag", keys)
+            with pytest.raises(ValueError, match="Arrow cannot select rows of this table"):
+                frames.served(table, take, "etag", list)
+
+
+def test_a_table_answer_keeps_its_own_column_types():
+    import pyarrow as pa
+    from solera.stores import frames
+
+    table = pa.table(
+        {
+            "id": pa.array(["b", "a"], pa.large_string()),
+            "p": pa.array([[1], [2, 3]], pa.list_view(pa.int32())),
+            "t": pa.array([1, 999], pa.time64("ns")),
+            "etag": ["1", "2"],
+        }
+    )
+    take, _ = Served().read_table(table, "id", "etag", ["a", "b"])
+    served = frames.served(table, take, "etag", pa.Table)
+    assert served.schema == table.drop_columns(["etag"]).schema
+    assert served.column("t").cast(pa.int64()).to_pylist() == [999, 1]
+    assert served.column("p").to_pylist() == [[2, 3], [1]]
+
+
+def test_a_table_answer_per_key_keeps_its_values_and_types():
+    import pyarrow as pa
+    from solera.stores import frames
+
+    table = pa.table(
+        {
+            "id": pa.array(["b", "a"], pa.large_string()),
+            "n": pa.array([1, 2], pa.int32()),
+            "t": pa.array([1, 999], pa.time64("ns")),
+            "etag": ["1", "2"],
+        }
+    )
+    served = Served()
+    take, names = served.read_table(table, "id", "etag", ["a", "b"], grouped=True)
+    groups = frames.served(table, take, "etag", pa.Table, names)
+    assert list(groups) == ["a", "b"]
+    for key, row in (("a", 1), ("b", 0)):
+        assert groups[key].schema == table.drop_columns(["etag"]).schema
+        assert groups[key].column("t").cast(pa.int64()).to_pylist() == [
+            table.column("t").cast(pa.int64())[row].as_py()
+        ]
+
+
+def test_dict_rows_as_a_table_hold_every_rows_columns():
+    import pyarrow as pa
+    from solera.stores import frames
+
+    rows = [{"id": "a"}, {"id": "b", "value": 42}]
+    assert frames.materialize(rows, pa.Table).to_pylist() == [
+        {"id": "a", "value": None},
+        {"id": "b", "value": 42},
+    ]
+
+
+def test_no_rows_served_from_a_table_are_the_dict_forms_no_rows():
+    import pandas as pd
+    import pyarrow as pa
+    from solera.stores import frames
+
+    table = pa.table({"id": ["a", "b"], "n": [1, 2], "etag": ["1", "2"]})
+    for t in (list, pd.DataFrame, pa.Table):
+        take, _ = Served().read_table(table, "id", "etag", ["missing"])
+        wanted, _ = Served().read({"a": Loaded({"id": "a", "n": 1}, version="1")}, ["missing"], Loaded)
+        got, want = frames.served(table, take, "etag", t), frames.materialize(wanted, t)
+        if t is pd.DataFrame:
+            pd.testing.assert_frame_equal(got, want)
+        else:
+            assert got == want
+    take, names = Served().read_table(table, "id", "etag", ["missing"], grouped=True)
+    assert frames.served(table, take, "etag", pa.Table, names) == {}

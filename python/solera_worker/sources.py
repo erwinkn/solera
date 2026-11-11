@@ -1,7 +1,9 @@
 """Reading a source through its loader (docs/stores.md, "Sources: how data is
 loaded"): its function (`@source`), or its store's `serve`. Either says, of
 every key it serves, the version it served it at; a key it leaves out was
-observed absent."""
+observed absent. A keyed answer is a dict of `Loaded` rows, or one Arrow
+table: of it, only the key and version columns are read here, and its rows
+become what the asset asked for in `solera.stores.frames`."""
 
 from __future__ import annotations
 
@@ -45,11 +47,20 @@ class SourceLoader:
             answer = await answer
         if self.source.key is None:
             return answer.value if isinstance(answer, Loaded) else answer
+        inner = by_key_type(t)
+        if isinstance(answer, Loaded) and frames.is_table(answer.value) and isinstance(answer.version, str):
+            try:  # one Arrow table: only its key and version columns are read here
+                take, names = self.served.read_table(
+                    answer.value, self.source.key, answer.version, keys, grouped=inner is not MISSING
+                )
+            except ValueError as e:
+                raise StoreError(f"source {self.source.name!r}: {e}") from None
+            return frames.served(answer.value, take, answer.version, t if names is None else inner, names)
         if not isinstance(answer, Mapping):
             raise StoreError(
-                f"source {self.source.name!r}: a keyed loader returns {{key: Loaded(row, version=…)}}"
+                f"source {self.source.name!r}: a keyed loader returns {{key: Loaded(row, version=…)}}, "
+                "or Loaded(table, version=column): an Arrow table and its version column's name"
             )
-        inner = by_key_type(t)
         rows, bad = self.served.read(answer, keys, Loaded, grouped=inner is not MISSING)
         if bad is not None:
             raise StoreError(
@@ -57,8 +68,6 @@ class SourceLoader:
                 "return Loaded(row, version=…)"
             )
         if inner is not MISSING:  # dict[str, T]: each key's group, as T
-            if not frames.is_frame_type(inner):
-                return rows
             return {k: frames.materialize(group, inner) for k, group in rows.items()}
         return frames.materialize(rows, t)
 
