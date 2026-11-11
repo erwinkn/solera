@@ -599,13 +599,16 @@ Name each object with the writing attempt's generation and write it
 create-only:
 
 ```
-{output}/{partition}/{key}/{generation}.json             a key, as a generation wrote it
+{output}/{partition}/{bucket}/{key}/{generation}.json    a key, as a generation wrote it
 {output}/{partition}@{generation}.json                  a value
 {output}/{partition}/{commit_number:012d}/{generation}.json      a commit
 ```
 
-A keyed load computes names from `Keys` (each key's generation → the
-object), never by listing. Commits: several attempts may write commit n
+`bucket` spreads a keyed output's keys over directories by a hash of the
+key (FileStore: `crc32(key) % 4096`, three hex digits): ext4 without
+`dir_nlink` refuses a directory's 64,999th subdirectory, and without
+`dir_index` every lookup scans its directory. A keyed load computes names
+from `Keys` (each key's generation → the object), never by listing. Commits: several attempts may write commit n
 (a retry reuses its number); the committed one is the highest generation.
 `cleanup` matches names: a generation is a name's last component, a key
 or commit the one before it. FileStore and S3Store
