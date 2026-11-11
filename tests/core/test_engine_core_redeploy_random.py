@@ -4,10 +4,10 @@ move that resets the output, an edge closed by removing a reader) after any nati
 before any output lock, after the state's awaits a launch and a build make, and when a worker
 starts. No tick raises, a whole reader never reads
 its upstream's partial content, every run ends, everything converges once the deploys stop,
-and a replay rebuilds the same model. Each history starts with an operator's proceed over a
-stopped full run of the producer, whose reader `nxt` has a reader of its own (`tail`), and
-proceeds again at random: `report` may read the content the operator released, `tail` never
-reads partial content. `REDEPLOY_SEEDS` sets the seeds (default 0-5),
+and a replay rebuilds the same model. Each history starts with a full run of the producer
+stopped midway, whose reader `nxt` has a reader of its own (`tail`), and asks to proceed at
+random: the new core refuses (ERW-42), no span is ever proceeded, and no reader reads partial
+content; the held readers go on once the producer is whole. `REDEPLOY_SEEDS` sets the seeds (default 0-5),
 `REDEPLOY_TRACE=1` prints what each commit was planned under, `REDEPLOY_FIRED=<file>` appends
 where each seed's deploys landed."""
 
@@ -20,7 +20,7 @@ import re
 import pytest
 from solera.sdk import In, Incremental, Output, Project, Retry, asset
 from solera.stores import FileStore
-from solera_server.state import Conflict, State
+from solera_server.state import State
 from solera_server.tracking import full
 
 from tests.contract.harness import Refused, Solera, rebuild
@@ -36,11 +36,7 @@ class History:
         self.rows = {k: 1 for k in [*STABLE, "c1", "k1", "t1"]}
         self.projects, self.fired, self.budget, self.armed = {}, [], 8, False
         self.reads, self.read, self.committed, self.trace = 0, {}, [], []
-        self.removed, self.released, self.proceeds = (
-            set(),
-            set(),
-            0,
-        )  # assets a deploy removed; proceeded content
+        self.removed, self.refused, self.proceeded = set(), 0, []  # assets a deploy removed
         self.hold, self.waiting, self.stop = asyncio.Event(), False, None
         self.hold.set()
 
@@ -56,7 +52,7 @@ class History:
         async def body(ctx, files: list):
             await asyncio.sleep(0.005)
             b = ctx.batch["files"]
-            if h.stop is not None and b.index >= h.stop:  # stopped midway, for a proceed
+            if h.stop is not None and b.index >= h.stop:  # stopped midway
                 h.waiting = True
                 await h.hold.wait()
             if keyed:
@@ -134,22 +130,18 @@ class History:
         self.s.engine.redeploy(manifest)
 
     async def proceed(self):
-        """An operator lets readers go on over the producer's stopped run: what
-        it holds now is released to its readers (not to theirs)."""
+        """An operator asks to proceed over the producer's stopped run: the new
+        core refuses it until ERW-42."""
 
-        name, armed = self.variant["name"], self.armed
+        name = self.variant["name"]
         if not any(p["asset"] == name for p in full.stopped(self.s.engine)):
             return
-        self.armed = False
         try:
-            ids = await (self.s.rows(name) if self.variant["axis"] == "keyed" else self.s.read(name))
             await self.s.engine.proceed(name, "", "test")
-            self.released.add(tuple(sorted(ids)))
-            self.proceeds += 1
-        except Conflict:
-            pass
-        finally:
-            self.armed = armed
+        except full.ProceedNotYet:
+            self.refused += 1
+        else:
+            raise AssertionError("proceed was not refused on the new core")
 
     def instrument(self, monkeypatch):
         from solera_server.executors.inline import InlinePlacement
@@ -189,6 +181,7 @@ class History:
             if e.get("type") == "AttemptFinished":
                 pre = ((engine.m.task(e["task"]) or {}).get("launched") or {}).get("prepared") or {}
             out = apply(e)
+            h.proceeded += [str(k) for k, v in engine.m.partial_spans.items() if any(f for *_, f in v)]
             if os.environ.get("REDEPLOY_TRACE"):  # what each commit was planned under and made
                 m, core = engine.m, ((commit or {}).get("core") or {})
                 if e.get("type") == "AttemptFinished":
@@ -272,9 +265,11 @@ async def test_deploys_at_every_await(tmp_path, monkeypatch, seed):
         h.stop = None
         h.hold.set()
         await h.proceed()
-        assert h.proceeds == 1
-        await s.run("nxt")
-        tails = [await s.submit("tail")]  # held until copy is whole again: waited for at the end
+        assert h.refused == 1
+        tails = [
+            await s.submit("nxt"),
+            await s.submit("tail"),
+        ]  # held until copy is whole: waited for at the end
         h.instrument(monkeypatch)
         h.armed = True
         runs = []
@@ -349,17 +344,12 @@ async def test_deploys_at_every_await(tmp_path, monkeypatch, seed):
         await s.run("tail")
         for run in tails:  # held while copy was partial; each ends once it is whole
             await s.wait(run, 30)
+        assert not h.proceeded, h.proceeded[:3]
         await s.settle(0.3)
         assert await s.read("report") == sorted(h.rows), (await s.read("report"), h.fired)
         assert sorted(await s.rows("nxt")) == sorted(h.rows), h.fired
         assert await s.read("tail") == sorted(h.rows), (await s.read("tail"), h.fired)
-        bad = [
-            h.read[t]
-            for t in h.committed
-            if t in h.read
-            and not set(STABLE) <= set(h.read[t][0])
-            and not (h.read[t][3] == "report" and tuple(h.read[t][0]) in h.released)
-        ]
+        bad = [h.read[t] for t in h.committed if t in h.read and not set(STABLE) <= set(h.read[t][0])]
         if bad and os.environ.get("REDEPLOY_TRACE"):
             last = None
             for t in h.trace:

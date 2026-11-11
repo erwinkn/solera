@@ -343,6 +343,7 @@ async def test_a_rebound_input_closes_its_edge_at_deploy(solera, tmp_path):
     assert ("copy", "", "data") not in solera.engine.m.core_edges
 
 
+@pytest.mark.xfail(strict=True, reason="ERW-42: proceed is refused on the new tracking core")
 async def test_proceed_lets_readers_go_on_over_a_partial_output_until_it_starts_over(solera, tmp_path):
     files, seen = Files(solera, {"a": 1, "b": 1, "c": 1}), []
 
@@ -454,6 +455,7 @@ async def test_an_input_cleared_while_the_batch_builds_replans_it_without_spendi
     assert await solera.rows("join") == {"k1": "2", "k2": "1"}
 
 
+@pytest.mark.xfail(strict=True, reason="ERW-42: proceed is refused on the new tracking core")
 async def test_finishing_one_unkeyed_walk_does_not_revoke_proceed(solera, tmp_path):
     phase = ["fail"]
     entered, release = asyncio.Event(), asyncio.Event()

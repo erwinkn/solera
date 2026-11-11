@@ -215,8 +215,10 @@ def restarted(core: Core, task: dict, input) -> bool:
     reset of either side, a rebind) starts the walk over, whatever another
     run committed since. A task with no walk yet starts over if what the
     partition's committed progress reads (`Model.core_read`, which only a
-    commit writes) is an upstream life that is gone, or nothing though one
-    of the asset's outputs still holds content to clear."""
+    commit writes) is an upstream life that is gone, or nothing though the
+    partition has committed (a job, with no output, has only its record) or
+    one of the asset's outputs still holds content to clear (a reset of a
+    sibling output clears the record, not the content)."""
 
     m, asset, partition = core.m, task["asset"], task["partition"]
     edge = m.core_edges.get((asset, partition, input.param))
@@ -226,7 +228,9 @@ def restarted(core: Core, task: dict, input) -> bool:
     read = m.core_read.get((asset, partition, input.param))
     if read is None:
         outputs = (m.manifest["assets"].get(asset) or {}).get("outputs") or ()
-        return any((o["name"], partition) in m.heads for o in outputs)
+        return "definition" in m.partition(asset, partition) or any(
+            (o["name"], partition) in m.heads for o in outputs
+        )
     return read != m.core_outputs.get((input.output, input.partition))
 
 

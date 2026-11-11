@@ -1870,8 +1870,6 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
             raise core_commit.HeldBack(
                 f"{why[0]}: {why[1]}"
             )  # a head it read is partial: never, by `prepare`
-        if self.core is not None and core_full.over_proceeded(self.m, prepared.get("gate") or ()):
-            commit["over_proceeded"] = True  # its outputs are partial: `Model._spans`
         if built is not None:  # checked, then recorded with nothing awaited between (rule 3)
             core_commit.check(self.core, built)
             if (core := built.payload()) is not None:
@@ -2452,16 +2450,16 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
         return self._run_view(self.m.runs.get(run_id) or run)
 
     async def proceed(self, asset: str, partition: str = "", by: str | None = None) -> dict:
-        """Let the readers of a partition whose run stopped midway go on over
-        its partial output (D205; `core_full.proceed`)."""
+        """An operator's `solera proceed` (D205): refused on both paths for now.
+        On the new tracking core it waits for ERW-42, so no span is ever
+        proceeded there and a reader of a partial head holds until a run of
+        its producer completes it (`core_full.proceed` is ERW-42's to call)."""
 
         if self.core is None:
             raise Conflict(
                 "proceed: readers wait for an incomplete upstream on the new tracking core only", False
             )
-        if asset not in self.manifest["assets"]:
-            raise KeyError(asset)
-        return await core_full.proceed(self, asset, partition, by or "api")
+        raise core_full.ProceedNotYet(asset, partition)
 
     async def pause(self, run_id: str, paused=True, by: str | None = None):
         run = self.m.runs.get(run_id)

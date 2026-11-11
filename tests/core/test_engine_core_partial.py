@@ -395,6 +395,7 @@ async def test_a_producer_stopped_midway_is_not_complete_because_its_upstream_is
 # test_fan_in_owner.py: Which partitions a whole fan-in reads is decided by Planner.head_materialized ->
 
 
+@pytest.mark.xfail(strict=True, reason="ERW-42: proceed is refused on the new tracking core")
 async def test_after_proceed_a_fan_in_reads_without_the_partial_partition(solera):
     rows = {"a": 1, "b": 1, "c": 1}
     hold, waiting, seen = asyncio.Event(), [False], []
@@ -805,7 +806,7 @@ async def test_proceed_api_answers(solera, capsys):
     with capsys.disabled():
         print("\nproceed:", out)
     assert out["nope"][0] in (404, 400, 409), out
-    assert out["copy"][0] in (409, 400), out
+    assert out["copy"][0] == 409 and "ERW-42" in out["copy"][1], out  # refused on the new core for now
 
 
 async def test_after_a_premature_end_the_gate_still_holds(solera, tmp_path):

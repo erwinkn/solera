@@ -20,6 +20,7 @@ async def solera(tmp_path):
     await s.close()
 
 
+@pytest.mark.xfail(strict=True, reason="ERW-42: proceed is refused on the new tracking core")
 async def test_a_start_over_after_proceed_holds_readers_again(solera):
     rows = {k: 1 for k in "abcd"}
     hold, waiting, seen, stop_at = asyncio.Event(), [False], [], [0]
@@ -93,6 +94,7 @@ async def test_a_start_over_after_proceed_holds_readers_again(solera):
     )
 
 
+@pytest.mark.xfail(strict=True, reason="ERW-42: proceed is refused on the new tracking core")
 async def test_new_commits_after_an_omitted_startover_do_not_inherit_proceed(tmp_path):
     s = Solera(tmp_path, "core")
     release, entered = asyncio.Event(), asyncio.Event()

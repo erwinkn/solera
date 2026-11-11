@@ -1305,7 +1305,7 @@ class Model:
         if self.core is not None:
             walk = (core or {}).get("walk") or {}
             restart = bool(walk.get("reset")) or any(r for r, _ in ((core or {}).get("empty") or {}).values())
-            self._spans(asset, partition, heads_before, restart, bool(commit.get("over_proceeded")))
+            self._spans(asset, partition, heads_before, restart)
         record = self._partition(asset, partition)
         for field in ("definition", "config", "context"):  # what it was made under: staleness compares
             if field in commit:
@@ -1897,17 +1897,15 @@ class Model:
             for lo, hi, flag in self.partial_spans.get(self.span_key(output, partition), ())
         )
 
-    def _spans(self, asset: str, partition: str, before: dict, restart: bool, over_proceeded: bool) -> None:
+    def _spans(self, asset: str, partition: str, before: dict, restart: bool) -> None:
         """A producer partition's commit, applied: its outputs' partial spans
         (D205). A walk that starts over closes each open span: a head it moved
         stays with the old span, one it did not opens the new walk's, partial
-        and not proceeded. While a walk from empty is pending, or the batch
-        read a head an operator let it proceed over (a proceed lets readers of
-        that output go on, not readers of theirs), each output this commit
-        made opens a span at it; otherwise every open one closes at the head,
-        which is complete."""
+        and not proceeded. While a walk from empty is pending, each output this
+        commit made opens a span at it; once none is, every open one closes at
+        the head, which is complete."""
 
-        pending = over_proceeded or any(k[0] == asset and k[1] == partition for k in self.core_empty)
+        pending = any(k[0] == asset and k[1] == partition for k in self.core_empty)
         for name, (was, head_before) in before.items():
             key, head = self.span_key(name, partition), self.axis_head(name, partition)
             spans = [list(s) for s in self.partial_spans.get(key, ())] if key == was else []

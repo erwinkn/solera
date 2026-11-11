@@ -6,14 +6,16 @@ partition still had a walk from empty pending after it applied (a first run,
 a full run, a start-over not walked to the end). `Model.partial_spans`
 holds those commits per output life, written only by its producer's
 commits, by `settle` (`Settled`) and by an operator's `proceed`
-(`Proceeded`); `Model.partial` answers for one commit. A batch that read a
-head inside a proceeded span (`over_proceeded`) makes its outputs partial too:
-a proceed lets readers of that output go on, not readers of theirs. A span
-opens only at a new commit and only shrinks after the fact, so whether a
-given head is partial goes from yes to no, with one way back: a start-over
-that does not move a proceeded head makes it the new walk's, partial and not
-proceeded, until the partition's walk ends (D205: a proceed holds until the
-partition starts over). A batch planned before then is refused at commit.
+(`Proceeded`); `Model.partial` answers for one commit. A span opens only at
+a new commit and only shrinks after the fact, so whether a given head is
+partial goes from yes to no, with one way back: a start-over that does not
+move a proceeded head makes it the new walk's, partial and not proceeded,
+until the partition's walk ends (D205: a proceed holds until the partition
+starts over). A batch planned before then is refused at commit.
+
+An operator's proceed is refused for now (`ProceedNotYet`, ERW-42): the fact
+"this partition holds content read at a proceeded head" has no owner yet, so
+no `Proceeded` is journaled on the new path and no span is ever proceeded.
 
 A batch reads no partial commit, keyed or whole (STA-13, RUN-4): its task is
 held at dispatch while an upstream's head is partial (advisory), its
@@ -106,15 +108,17 @@ def held(m, heads) -> list | None:
     return None
 
 
-def over_proceeded(m, heads) -> bool:
-    """Whether a batch that `held` let commit read a head inside a span an
-    operator let readers proceed over: its own outputs are then partial."""
+class ProceedNotYet(Conflict):
+    """An operator's proceed on the new tracking core, refused until ERW-42:
+    the readers of a partial output hold until a run of its producer
+    completes it."""
 
-    return any(
-        not (life and life[0] != m.life(output, partition))
-        and m.partial(output, partition, at, proceeded=True)
-        for output, partition, at, *life in heads
-    )
+    def __init__(self, asset: str, partition: str):
+        super().__init__(
+            f"proceed {asset} {partition!r}: not yet available on the new tracking core (ERW-42); "
+            f"its readers wait until a run of {asset} completes",
+            False,
+        )
 
 
 def stopped(engine) -> list[dict]:

@@ -62,6 +62,7 @@ class W:
         return Project(assets=[files, mid, copy, report], default_store=FileStore(w.s.root / "data"))
 
 
+@pytest.mark.xfail(strict=True, reason="ERW-42: proceed is refused on the new tracking core")
 async def test_a_walk_that_ends_in_a_skip_completes_its_outputs(solera):
     w = W(solera)
     await solera.deploy(w.project(), cancel_grace=0.2, heartbeat_seconds=0.1)

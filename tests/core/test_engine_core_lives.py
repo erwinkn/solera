@@ -74,6 +74,7 @@ class World:
         self.hold.set()
 
 
+@pytest.mark.xfail(strict=True, reason="ERW-42: proceed is refused on the new tracking core")
 async def test_proceed_rechecks_lives_after_awaiting_locks(solera):
     w = World(solera)
     await solera.deploy(w.project(), cancel_grace=0.1, heartbeat_seconds=0.1)

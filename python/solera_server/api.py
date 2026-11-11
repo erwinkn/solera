@@ -263,8 +263,8 @@ def create_app(
             "active_runs": sum(1 for r in runtime.m.runs.values() if r["status"] not in TERMINAL_RUN),
             "postgres": bool(os.environ.get("DATABASE_URL")),
             "last_error": "; ".join(f"{name}: {error}" for name, error in runtime.failing.items()) or None,
-            # a run left midway: its readers wait until a run of its producer completes it, or
-            # `solera proceed` lets them go on over the partial output
+            # a run left midway: its readers wait until a run of its producer completes it
+            # (`solera proceed` waits for ERW-42 on the new path)
             "incomplete_full_runs": core_full.stopped(runtime) if runtime.core is not None else [],
             # cleanup whose task ran out of tries: see and clear with `solera cleanups`
             "stuck_cleanups": [

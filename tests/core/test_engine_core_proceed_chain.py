@@ -18,6 +18,7 @@ async def solera(tmp_path):
     await s.close()
 
 
+@pytest.mark.xfail(strict=True, reason="ERW-42: proceed is refused on the new tracking core")
 async def test_a_walk_over_a_proceeded_head_does_not_complete_its_reader(solera):
     hold, waiting, seen = asyncio.Event(), [False], []
     hold.set()
