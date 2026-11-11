@@ -583,11 +583,12 @@ A full run's first write opens a build,
 `solera_build.b_<md5(table, partition)>_<run>`: the user's table's shape
 with its CHECK constraints, generated columns, unique and exclusion
 indexes, and identity columns that draw from the user's table's sequences.
-A table with a BEFORE INSERT row trigger runs its full runs in place, as
-today, published at their first write: the switch would run the trigger
-on rows Solera has already read, and the store never alters the user's
-table to stop it. A trigger added during a run refuses its publication
-(`PublicationRefused`). A run whose first writes are empty, with no table
+A table with a BEFORE INSERT row trigger or an INSERT rule runs its full
+runs in place, as today, published at their first write: the switch's
+`INSERT` would change rows Solera has already read (a trigger runs again;
+a rule applies where a write's `COPY` skipped it), and the store never
+alters the user's table to stop it. One added during a run refuses its
+publication (`PublicationRefused`). A run whose first writes are empty, with no table
 and no declared columns to make one from, makes nothing until its first
 batch with rows, which opens the build.
 Writes of the run go there while the registry lists it; a load reads the
@@ -605,9 +606,11 @@ query after it waits too.
 A migration changes the user's table alone, so before it runs it drops
 every build of the table and leaves each registered, as lost; a restore
 that leaves `solera_build` behind does the same. A write of a lost build's
-run fails with `RunLost` and changes nothing, and the run's switch
-unregisters it and says not published: the engine starts the partition's
-full run over. A load of a build makes the migration fail and retry rather
+run fails with `RunLost` and changes nothing, and the run's switch says
+not published; the build stays registered, as lost, so its run's writes
+keep failing (in place, the rows its clear removed are still there) until
+the engine starts the partition's full run over, whose first write drops
+it. A load of a build makes the migration fail and retry rather
 than wait while it holds every writer of the table.
 
 A cleanup deletes a partition's version row with its rows, unless an

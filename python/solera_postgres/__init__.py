@@ -149,15 +149,18 @@ SELECT r.oid IS NOT NULL AS present,
     WHERE n.nspname = %(build)s AND c.relname >= %(first)s::name AND c.relname < %(past)s::name
     AND c.relkind = 'r'), '{}') AS built,
   EXISTS (SELECT 1 FROM pg_trigger t WHERE t.tgrelid = r.oid AND NOT t.tgisinternal
-    AND t.tgtype & 7 = 7 AND t.tgenabled IN ('O', 'A')) AS before_insert
+    AND t.tgtype & 7 = 7 AND t.tgenabled IN ('O', 'A'))
+    OR EXISTS (SELECT 1 FROM pg_rewrite w WHERE w.ev_class = r.oid AND w.ev_type = '3') AS before_insert
 FROM (SELECT (SELECT c.oid FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
   WHERE n.nspname = %(schema)s AND c.relname = %(name)s AND c.relkind IN ('r', 'p')) AS oid) AS r
 """
 
-# A BEFORE INSERT row trigger of a table, enabled for an ordinary session (as in `_STATE`).
+# A BEFORE INSERT row trigger of a table, enabled for an ordinary session, or an INSERT rule (as in
+# `_STATE`): what an INSERT of the build's rows would change, which writing them did not.
 _BEFORE_INSERT = (
-    "SELECT 1 FROM pg_trigger WHERE tgrelid = %s::regclass AND NOT tgisinternal "
-    "AND tgtype & 7 = 7 AND tgenabled IN ('O', 'A') LIMIT 1"
+    "SELECT 1 FROM pg_trigger WHERE tgrelid = %(t)s::regclass AND NOT tgisinternal "
+    "AND tgtype & 7 = 7 AND tgenabled IN ('O', 'A') "
+    "UNION ALL SELECT 1 FROM pg_rewrite WHERE ev_class = %(t)s::regclass AND ev_type = '3' LIMIT 1"
 )
 
 # A new build's indexes it does not keep (neither unique nor exclusion), and the user's
@@ -592,14 +595,16 @@ class PostgresStore:
         its own, and unregisters the partition's others: no run in the log
         names them, and the check has locked their writers out.
 
-        Three cases read the catalog (`state`, from the write's first round
-        trip). A table with a BEFORE INSERT row trigger runs its full runs in
-        place, published at their first write: the switch would run the
-        trigger on rows Solera has already read. A run whose first writes
+        Four cases read the catalog (`state`, from the write's first round
+        trip). A table with a BEFORE INSERT row trigger or an INSERT rule
+        runs its full runs in place, published at their first write: the
+        switch's INSERT would change rows Solera has already read. A run whose first writes
         were empty and found no table opens its build at its first write
         that has rows. A registered build the catalog no longer holds (a
         migration dropped it, or a restore lost it) is unregistered, and a
-        write of its run fails (`RunLost`): the rows it held are gone. A build
+        write of its run fails (`RunLost`): the rows it held are gone, and in
+        place the rows its clear removed are still there. Any write that
+        succeeds unregisters it, a new full run's first among them. A build
         the catalog holds and the partition no longer registers makes the
         write sweep after it commits."""
 
@@ -837,14 +842,15 @@ class PostgresStore:
         `newest` has written (a call delivered late), it does nothing and
         says not published; a run published before says published; a build
         that is not registered (overtaken) or is gone (a migration dropped it,
-        or a restore lost it) says not published, and a run that never opened
+        or a restore lost it; it stays registered, as lost, until a new full
+        run starts) says not published, and a run that never opened
         one (it wrote nothing, and no table exists) says published.
         Otherwise it deletes the partition's rows and inserts the build's,
         every column the database does not generate, so outside readers see
         all old rows, then all new, and wait for nothing; it never changes the
         check's version. A constraint only the published rows can check
         refuses the publication whole (`PublicationRefused`), and so does a
-        BEFORE INSERT row trigger added to the table since the run began
+        BEFORE INSERT row trigger or INSERT rule added since the run began
         (`_aim`). The build's
         table is dropped after, by a sweep. Idempotent; it may take minutes,
         and sets no statement timeout. `prior` (the committed head) and
@@ -884,15 +890,13 @@ class PostgresStore:
                     "SELECT to_regclass(%s) IS NOT NULL AS ok",
                     (build := _qname(BUILD_SCHEMA, _build_name(table, partition, run)),),
                 ).fetchone()["ok"]:
-                    cur.execute(  # lost: a migration dropped it, or a restore left it behind
-                        f"UPDATE {VERSIONS_TABLE} SET builds = array_remove(builds, %s) WHERE rel = %s AND part = %s",
-                        (run, table, partition),
-                    )
+                    # Lost (a migration dropped it, or a restore): it stays registered, so a write
+                    # naming the run fails (`RunLost`) until a new full run's first write drops it.
                     published = False
                 else:
-                    if cur.execute(_BEFORE_INSERT, (table,)).fetchone():
+                    if cur.execute(_BEFORE_INSERT, {"t": table}).fetchone():
                         raise PublicationRefused(
-                            f"{output.name} {partition!r}: {table} has a BEFORE INSERT row trigger, added "
+                            f"{output.name} {partition!r}: {table} has a BEFORE INSERT row trigger or an INSERT rule, added "
                             "after the full run began: publishing would change rows Solera has read, so "
                             "the published rows stay as they were. Drop the trigger, or run the output again"
                         )
@@ -1196,24 +1200,40 @@ class PostgresStore:
                 spool.add(r["k"] for r in chunk)
         return spool
 
-    def _source(self, cur, ref: Ref) -> str:
+    def _source(self, cur, ref: Ref, handed: bool = False) -> str:
         """The table a ref's rows are in: the build of the run its handle names
         while the partition registers it, else the user's table (D211,
         obligation 3). Asked in the reader's transaction; a build no commit
-        names is read by no one."""
+        names is read by no one. A registered build the catalog no longer
+        holds is lost (`RunLost`): its rows are nowhere. Inside a snapshot
+        (`handed`) the registry is the snapshot's and the catalog is now's,
+        so a build a switch published and dropped since looks the same: read
+        again (`BuildGone`), in a snapshot that tells them apart."""
 
         handle = ref.handle or {}
         table = handle.get("table") or _qname(handle.get("schema", "public"), handle["name"])
         run = handle.get("build")
         if run is None:
             return table
+        build = _qname(BUILD_SCHEMA, _build_name(table, ref.partition, run))
         found = cur.execute(
-            f"SELECT %s = ANY(builds) AS open FROM {VERSIONS_TABLE} WHERE rel = %s AND part = %s",
-            (run, table, ref.partition),
+            f"SELECT %s = ANY(builds) AS open, to_regclass(%s) IS NULL AS gone FROM {VERSIONS_TABLE} "
+            "WHERE rel = %s AND part = %s",
+            (run, build, table, ref.partition),
         ).fetchone()
-        return (
-            _qname(BUILD_SCHEMA, _build_name(table, ref.partition, run)) if found and found["open"] else table
-        )
+        if not (found and found["open"]):
+            return table
+        if found["gone"] and handed:
+            raise BuildGone(
+                f"{ref.output}: run {run}'s build was published and dropped after this read's snapshot "
+                "began, or is lost; read again"
+            )
+        if found["gone"]:
+            raise RunLost(
+                f"{ref.output} {ref.partition!r}: the build of full run {run} is gone (a migration "
+                "dropped it, or a restore lost it): the rows this commit names are nowhere"
+            )
+        return build
 
     def _keys(self, ref: Ref, key_column: str, where: dict, among: list[str] | None):
         """The partition's keys (as text) sorted by their bytes, a chunk at a time
@@ -1242,8 +1262,8 @@ class PostgresStore:
                 try:
                     with conn.transaction():  # a savepoint: the build may be gone by the time it is read
                         cur.execute(query.format(source), params)
-                except psycopg.errors.UndefinedTable:  # published and dropped after the lookup, as `_read`
-                    cur.execute(query.format(table), params)
+                except psycopg.errors.UndefinedTable:  # dropped after the lookup: look again, as `_read`
+                    cur.execute(query.format(self._source(conn.cursor(), ref)), params)
             while chunk := cur.fetchmany(KEY_CHUNK):
                 yield [k for k, _ in chunk]
 
@@ -1446,7 +1466,7 @@ class PostgresStore:
         handle, handed = ref.handle or {}, conn is not None
         with contextlib.nullcontext(conn) if conn else self._connect() as conn, conn.cursor() as cur:
             table = handle.get("table") or _qname(handle.get("schema", "public"), handle["name"])
-            source = self._source(cur, ref)
+            source = self._source(cur, ref, handed)
             where = dict(handle.get("where") or {})
             sql, params = "SELECT * FROM {}", []
             clauses = [f"{_ident(k)} = %s" for k in sorted(where)]
@@ -1477,10 +1497,10 @@ class PostgresStore:
                         f"{ref.output}: run {handle.get('build')}'s build was published and dropped after "
                         "this read's snapshot began; read again"
                     ) from None
-                # A switch published the build and dropped it after the lookup: its rows are the
-                # user's table's now, which a new statement sees (probes P2, sol1/read_drop.py,
-                # sol2/load_retry.py).
-                found = cur.execute(sql.format(table), params)
+                # Dropped after the lookup: a switch published it, and its rows are the user's table's
+                # now, which a new statement sees (probes P2, sol1/read_drop.py, sol2/load_retry.py);
+                # or a migration dropped it, and it is lost. Looking again tells them apart.
+                found = cur.execute(sql.format(self._source(cur, ref)), params)
                 rows = found.fetchall()
             columns = [d.name for d in found.description or () if d.name != VERSION_COLUMN]
             if handle.get("commit_number") is not None:

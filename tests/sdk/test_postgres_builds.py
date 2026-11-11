@@ -758,7 +758,10 @@ async def test_a_load_racing_the_switchs_drop_reads_the_published_rows(store, mo
     run = await store.store(rows(a="5"), first.ref, at(out, 5, reset=True))
     assert await store.full_run_ended(out, "", 5, 5)
     gone = _qname(BUILD_SCHEMA, _build_name(store._table(out)[0], "", 5))
-    monkeypatch.setattr(store, "_source", lambda cur, ref: gone)  # the lookup made before the switch
+    stale, source = [gone], store._source  # the lookup made before the switch, then a fresh one
+    monkeypatch.setattr(
+        store, "_source", lambda cur, ref, handed=False: stale.pop() if stale else source(cur, ref)
+    )
     assert await solera(store, run.ref) == {"a": "5"}
 
 
@@ -889,7 +892,10 @@ async def test_a_key_listing_racing_the_switchs_drop_reads_the_published_keys(st
     run = await store.store(rows(b="5"), first.ref, at(out, 5, reset=True))
     assert await store.full_run_ended(out, "", 5, 5)
     gone = _qname(BUILD_SCHEMA, _build_name(store._table(out)[0], "", 5))
-    monkeypatch.setattr(store, "_source", lambda cur, ref: gone)  # the lookup made before the switch
+    stale, source = [gone], store._source  # the lookup made before the switch, then a fresh one
+    monkeypatch.setattr(
+        store, "_source", lambda cur, ref, handed=False: stale.pop() if stale else source(cur, ref)
+    )
     assert list(store.keys(run.ref)) == [["b"]]
 
 
@@ -962,8 +968,9 @@ async def test_a_migration_drops_the_builds_and_their_run_starts_over(store):
     with pytest.raises(RunLost, match="full run 5 is gone"):
         await store.store(Patch([{"id": "b", "v": "2", "n": 2}]), first.ref, at(out, 7, run=5))
     assert await store.full_run_ended(out, "", 5, 7) is False
-    assert registry(store, out)[2] == [] and outside(store, out) == {"a": "1"}
-    again = await store.store([{"id": "a", "v": "8", "n": 10}], first.ref, at(out, 8, reset=True))
+    assert registry(store, out)[2] == [5] and outside(store, out) == {"a": "1"}
+    again = await store.store([{"id": "a", "v": "8", "n": 10}], first.ref, at(out, 8, reset=True, run=5))
+    assert registry(store, out)[2] == [8]
     assert await store.full_run_ended(out, "", 8, 8)
     assert await solera(store, again.ref) == {"a": "8"}
 
@@ -982,8 +989,9 @@ async def test_a_migration_can_replace_a_table_whose_build_draws_from_its_sequen
 
 async def test_a_build_lost_by_a_restore_fails_its_runs_writes_and_is_not_published(store):
     """M3: the registry lists build 5, whose table is gone. Its run's writes
-    fail (RunLost), and its repair; its switch unregisters it and says not
-    published; a new full run builds."""
+    fail (RunLost), and its repair; its switch says not published, and it
+    stays registered, so its run's writes fail until a new full run's first
+    write drops it."""
 
     from solera.stores import RunLost
     from solera_postgres import BUILD_SCHEMA, _build_name, _qname
@@ -997,9 +1005,37 @@ async def test_a_build_lost_by_a_restore_fails_its_runs_writes_and_is_not_publis
     with pytest.raises(RunLost):
         await store.written_at([6], first.ref, at(out, 7, run=5))
     assert await store.full_run_ended(out, "", 5, 7) is False
-    assert registry(store, out)[2] == [] and outside(store, out) == {"a": "1"}
-    again = await store.store(rows(a="8"), first.ref, at(out, 8, reset=True))
+    with pytest.raises(RunLost):  # after the call too: in place, the rows its clear removed are there
+        await store.store(Patch(rows(b="6")), first.ref, at(out, 7, run=5))
+    assert registry(store, out)[2] == [5] and outside(store, out) == {"a": "1"}
+    again = await store.store(rows(a="8"), first.ref, at(out, 8, reset=True, run=5))
+    assert registry(store, out)[2] == [8]
     assert await store.full_run_ended(out, "", 8, 8) and await solera(store, again.ref) == {"a": "8"}
+
+
+async def test_a_load_of_a_lost_builds_commit_fails_rather_than_read_the_published_rows(store, monkeypatch):
+    """The rows a commit of a lost build names are nowhere: a load and a key
+    listing fail (RunLost), before their query or after it found no table,
+    and never read the user's table in their place."""
+
+    from solera.stores import RunLost
+    from solera_postgres import BUILD_SCHEMA, _build_name, _qname
+
+    out = output(incremental=True)
+    first = await store.store(rows(a="1"), None, at(out, 1))
+    run = await store.store(rows(b="5"), first.ref, at(out, 5, reset=True))
+    build = _qname(BUILD_SCHEMA, _build_name(store._table(out)[0], "", 5))
+    sql(f"DROP TABLE {build}")
+    with pytest.raises(RunLost):
+        await solera(store, run.ref)
+    with pytest.raises(RunLost):
+        list(store.keys(run.ref))
+    stale, source = [build], store._source  # looked up before the migration dropped it
+    monkeypatch.setattr(
+        store, "_source", lambda cur, ref, handed=False: stale.pop() if stale else source(cur, ref)
+    )
+    with pytest.raises(RunLost):
+        await solera(store, run.ref)
 
 
 async def test_a_sweep_that_fails_never_fails_the_call_that_committed(store, monkeypatch):
