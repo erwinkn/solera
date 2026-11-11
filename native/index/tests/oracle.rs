@@ -6,6 +6,7 @@ use object_store::memory::InMemory;
 use object_store::path::Path;
 use object_store::ObjectStoreExt;
 use rand::rngs::SmallRng;
+use rand::seq::SliceRandom;
 use rand::{Rng, SeedableRng};
 use solera_index::*;
 use std::sync::Arc;
@@ -430,6 +431,43 @@ impl World {
                 q.page(want),
                 "{}",
                 ctx(&format!("get({c1}, {ask:?}, {:?})", q.q))
+            );
+            // a dense list: a run of the keys in order, with keys between,
+            // before and after them that no layer holds; sorted as a commit
+            // lists its keys, or shuffled with repeats
+            let mut sorted = h.keys.clone();
+            sorted.sort();
+            let a = rng.random_range(0..=sorted.len());
+            let b = rng.random_range(a..=sorted.len());
+            let mut ask: Vec<Vec<u8>> = Vec::new();
+            if rng.random_bool(0.3) {
+                ask.push(b"\x00".to_vec());
+            }
+            for k in &sorted[a..b] {
+                if rng.random_bool(0.9) {
+                    ask.push(k.clone());
+                }
+                if rng.random_bool(0.3) {
+                    ask.push([&k[..], b"\x00"].concat());
+                }
+            }
+            if rng.random_bool(0.3) {
+                ask.push(b"\xff\xff".to_vec());
+            }
+            if rng.random_bool(0.3) {
+                ask.extend_from_within(..ask.len() / 2);
+                ask.shuffle(rng);
+            }
+            let page = self.ix.get(&self.layers, c1, &ask, &q.q).await.unwrap();
+            let want: Got = (0..h.keys.len())
+                .filter(|&k| q.takes(&h.keys[k]) && ask.contains(&h.keys[k]))
+                .filter_map(|k| present(k, c1))
+                .collect();
+            assert_eq!(
+                strip(got(&page)),
+                q.page(want),
+                "{}",
+                ctx(&format!("dense get({c1}, {ask:?}, {:?})", q.q))
             );
             // history: every entry above the floor, and the state at the floor
             let want: Got = (0..h.keys.len())

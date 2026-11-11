@@ -4,7 +4,7 @@
 //! once, merged by key, newest layer first.
 
 use crate::error::{Error, Result};
-use crate::format::{parse_segment, Decoder, LayerRef, Top};
+use crate::format::{parse_segment, Decoder, Index, LayerRef, Top};
 use crate::glob::Pattern;
 use crate::run::Run;
 use crate::store::{Cached, Part, Store, Want};
@@ -45,13 +45,21 @@ pub struct KeyList {
 impl KeyList {
     /// The keys, sorted and deduplicated.
     pub fn new<K: AsRef<[u8]>>(keys: &[K]) -> KeyList {
-        let mut ix: Vec<usize> = (0..keys.len()).collect();
-        ix.sort_unstable_by(|&a, &b| keys[a].as_ref().cmp(keys[b].as_ref()));
-        ix.dedup_by(|a, b| keys[*a].as_ref() == keys[*b].as_ref());
-        let mut l = KeyList::default();
-        for i in ix {
-            l.buf.extend_from_slice(keys[i].as_ref());
+        let mut l = KeyList {
+            buf: Vec::with_capacity(keys.iter().map(|k| k.as_ref().len()).sum()),
+            end: Vec::with_capacity(keys.len()),
+        };
+        let mut push = |k: &[u8]| {
+            l.buf.extend_from_slice(k);
             l.end.push(l.buf.len());
+        };
+        if keys.windows(2).all(|w| w[0].as_ref() < w[1].as_ref()) {
+            keys.iter().for_each(|k| push(k.as_ref()));
+        } else {
+            let mut ix: Vec<usize> = (0..keys.len()).collect();
+            ix.sort_unstable_by(|&a, &b| keys[a].as_ref().cmp(keys[b].as_ref()));
+            ix.dedup_by(|a, b| keys[*a].as_ref() == keys[*b].as_ref());
+            ix.into_iter().for_each(|i| push(keys[i].as_ref()));
         }
         l
     }
@@ -67,6 +75,57 @@ impl KeyList {
     pub fn get(&self, i: usize) -> &[u8] {
         let a = if i == 0 { 0 } else { self.end[i - 1] };
         &self.buf[a..self.end[i]]
+    }
+
+    /// The first place in `from..end` whose key is not `before` (`end` if
+    /// none), `before` holding for a prefix of the keys: a galloping search
+    /// from `from`, so its cost grows with the log of the distance moved.
+    pub(crate) fn seek(&self, from: usize, end: usize, before: impl Fn(&[u8]) -> bool) -> usize {
+        let (mut a, mut n) = (from, 1);
+        while a + n <= end && before(self.get(a + n - 1)) {
+            a += n;
+            n *= 2;
+        }
+        let mut b = (a + n - 1).min(end);
+        while a < b {
+            let m = (a + b) / 2;
+            if before(self.get(m)) {
+                a = m + 1;
+            } else {
+                b = m;
+            }
+        }
+        a
+    }
+
+    /// Whether a listed key lies in `lo..=hi`.
+    pub(crate) fn any_within(&self, lo: &[u8], hi: &[u8]) -> bool {
+        let i = self.seek(0, self.len(), |k| k < lo);
+        i < self.len() && self.get(i) <= hi
+    }
+}
+
+/// The items of `ix` (segments, or the blocks of a segment) that may hold
+/// the listed keys `keys`, in order, each with the places of the listed keys
+/// it may hold: one search of `ix` and one of the list per item, so a dense
+/// run of keys costs per item, not per key.
+fn spans(ix: &Index, list: &KeyList, keys: Range<usize>, mut on: impl FnMut(usize, Range<usize>)) {
+    let (mut i, end) = (keys.start, keys.end);
+    while i < end {
+        let Some(s) = ix.holding(list.get(i)) else {
+            if ix.is_empty() {
+                return;
+            }
+            i = list.seek(i, end, |k| k < ix.first(0));
+            continue;
+        };
+        let j = if s + 1 < ix.len() {
+            list.seek(i + 1, end, |k| k < ix.first(s + 1))
+        } else {
+            end
+        };
+        on(s, i..j);
+        i = j;
     }
 }
 
@@ -176,17 +235,15 @@ pub(crate) struct Cursor {
     path: Arc<str>,
     top: Arc<Top>,
     /// The segments the read spans and the next to plan: segment numbers, or
-    /// for a read of listed keys, places in `listed_segs`.
+    /// for a read of listed keys, places in `listed`.
     segs: Range<usize>,
     seg_next: usize,
-    listed_segs: Vec<usize>,
     /// Segments fetched and not yet planned.
     seg_got: VecDeque<(usize, Cached)>,
-    /// A read of listed keys: each listed key in bounds with the segment that
-    /// may hold it, and the next to plan.
+    /// A read of listed keys: each segment that may hold a listed key in
+    /// bounds, with the places of those keys in the list.
     keys: Option<Arc<KeyList>>,
-    listed: Vec<(usize, usize)>,
-    at: usize,
+    listed: Vec<(usize, Range<usize>)>,
     /// Blocks planned and not yet launched, and their bytes.
     blocks: VecDeque<BlockRef>,
     planned: u64,
@@ -227,18 +284,20 @@ impl Cursor {
         all_at_once: bool,
     ) -> Result<Cursor> {
         let top = store.top(l).await?;
-        let listed: Vec<(usize, usize)> = keys.as_ref().map_or(Vec::new(), |k| {
-            (0..k.len())
-                .filter(|&i| !bounds.below(k.get(i)) && !bounds.above(k.get(i)))
-                .filter_map(|i| Some((i, top.segs.holding(k.get(i))?)))
-                .collect()
-        });
-        let mut listed_segs: Vec<usize> = listed.iter().map(|&(_, s)| s).collect();
-        listed_segs.dedup();
+        let mut listed = Vec::new();
+        if let Some(k) = &keys {
+            let a = k.seek(0, k.len(), |x| {
+                bounds.below(x) || x < l.first_key.as_slice()
+            });
+            let b = k.seek(a, k.len(), |x| {
+                !bounds.above(x) && x <= l.last_key.as_slice()
+            });
+            spans(&top.segs, k, a..b, |s, r| listed.push((s, r)));
+        }
         let seg_target = if keys.is_some() { SEG_BATCH } else { FIRST };
         let segs = match keys {
             None => top.segs.span(bounds.lo_key(), bounds.hi_key()),
-            Some(_) => 0..listed_segs.len(),
+            Some(_) => 0..listed.len(),
         };
         let mut c = Cursor {
             store: store.clone(),
@@ -246,11 +305,9 @@ impl Cursor {
             top,
             seg_next: segs.start,
             segs,
-            listed_segs,
             seg_got: VecDeque::new(),
             keys,
             listed,
-            at: 0,
             blocks: VecDeque::new(),
             planned: 0,
             target: if all_at_once { ALL } else { FIRST },
@@ -298,7 +355,7 @@ impl Cursor {
             for j in self.seg_next..self.segs.end {
                 let i = match self.keys {
                     None => j,
-                    Some(_) => self.listed_segs[j],
+                    Some(_) => self.listed[j].0,
                 };
                 if held >= self.seg_target || got.len() >= PARTS {
                     break;
@@ -332,6 +389,7 @@ impl Cursor {
             }
         }
         let (i, c) = self.seg_got.pop_front().expect("a segment left");
+        let at = self.seg_next;
         self.seg_next += 1;
         let ix = match c {
             Cached::Seg(ix) => ix,
@@ -361,17 +419,7 @@ impl Cursor {
             None => ix
                 .span(self.bounds.lo_key(), self.bounds.hi_key())
                 .for_each(&mut push),
-            Some(k) => {
-                let mut last = None;
-                while self.at < self.listed.len() && self.listed[self.at].1 == i {
-                    let b = ix.holding(k.get(self.listed[self.at].0));
-                    if let Some(b) = b.filter(|&b| Some(b) != last) {
-                        push(b);
-                        last = Some(b);
-                    }
-                    self.at += 1;
-                }
-            }
+            Some(k) => spans(&ix, k, self.listed[at].1.clone(), |b, _| push(b)),
         }
         Ok(())
     }
