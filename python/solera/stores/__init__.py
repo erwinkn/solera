@@ -374,7 +374,8 @@ class Chunk:
     for a store that writes a key at a time. Each is read from the write
     when the store first asks for it, so a store pays only for what it
     reads: one that writes the producer's Arrow table as it is takes
-    `indices` from it, and no row becomes a Python object."""
+    `indices` from it, and no row becomes a Python object. Each is taken on
+    the thread that asks: an async store asks on a thread of its own."""
 
     def __init__(self, prepared: Prepared, span: Any):
         self._prepared, self._span = prepared, span
@@ -405,7 +406,7 @@ class Chunk:
         if output.key == KEYS:
             return [(key, value) for key, (_, value) in zip(keys, rows, strict=True)]
         ends = self._span.ends()
-        return [(key, rows[a:b]) for key, a, b in zip(keys, [0, *ends[:-1]], ends, strict=True)]
+        return [(key, rows[a:b]) for key, a, b in zip(keys, [0, *ends][:-1], ends, strict=True)]
 
 
 @dataclass(frozen=True)

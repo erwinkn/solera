@@ -55,8 +55,21 @@ def test_chunks_give_each_key_its_rows(seed):
             assert prepared.take(c.indices) == c.rows
     if want:
         picked = sorted(rnd.sample([k for k, _ in want], rnd.randint(1, len(want))))
-        chunks = read(KeyedWrite(prepare(rows, out), upserts=set(picked)), size)
+        prepared = prepare(rows, out)
+        chunks = read(KeyedWrite(prepared, upserts=set(picked)), size)
         assert [g for c in chunks for g in c.groups()] == [g for g in want if g[0] in picked]
+        for c in chunks:
+            assert prepared.take(c.indices) == c.rows
+
+
+def test_a_selection_whose_rows_are_a_run_is_a_range_and_an_empty_one_is_empty():
+    from solera.stores import Chunk
+
+    prepared = prepare([{"id": k} for k in "abcd"], Output("t", key="id"))
+    assert prepared.rows.span(["b", "c"]).rows() == range(1, 3)
+    assert list(prepared.rows.span(["a", "c"]).rows()) == [0, 2]
+    empty = Chunk(prepared, prepared.rows.span([]))
+    assert (len(empty), empty.keys, empty.rows, empty.groups()) == (0, [], [], [])
 
 
 def test_a_dataframe_and_a_keyed_dict_are_chunked_by_key():

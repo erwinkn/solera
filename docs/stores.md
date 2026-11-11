@@ -100,7 +100,9 @@ cleanup is one place (K25).
   read from (a `range` when they are a run), for a store that writes the
   producer's Arrow table as it is; and `groups()`, each `(key, rows)`, for
   a store that writes one object per key. A store writing rows reads
-  `keys` and `rows` and pays nothing per key in Python.
+  `keys` and `rows` and pays nothing per key in Python. Each is taken
+  on the thread that asks, so an async store asks on a thread of its own
+  (`asyncio.to_thread`), as FileStore does for `groups()`.
   Every other key stays as it is. An immutable store writes a key at
   most once per generation (a retried call, the same bytes): the
   generation names its object. A key with zero rows

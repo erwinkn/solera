@@ -30,11 +30,11 @@ use std::sync::Arc;
 
 use arrow_array::ffi_stream::{ArrowArrayStreamReader, FFI_ArrowArrayStream};
 use arrow_array::RecordBatch;
+use pyo3::buffer::PyBuffer;
 use pyo3::create_exception;
 use pyo3::exceptions::{PyKeyError, PyRuntimeError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::pybacked::PyBackedBytes;
-use pyo3::buffer::PyBuffer;
 use pyo3::types::{
     PyBool, PyBytes, PyCapsule, PyDict, PyInt, PyList, PyMapping, PyMemoryView, PyRange, PyString,
 };
@@ -491,12 +491,16 @@ impl Rows {
                     return Err(PyKeyError::new_err(keys[i].clone().unbind()));
                 };
                 rows.extend(f);
-                ends.push(rows.len() as u32);
+                ends.push(rows.len());
             }
+            let run = rows.windows(2).all(|w| w[1] == w[0] + 1);
             Ok(Span {
                 keys: packed,
                 ends,
-                rows: Picked::Rows(rows),
+                rows: match rows.first() {
+                    Some(&a) if run => Picked::Range(a as usize, a as usize + rows.len()),
+                    _ => Picked::Rows(rows),
+                },
             })
         })
     }
@@ -532,7 +536,7 @@ enum Picked {
 #[pyclass(module = "solera._native", frozen)]
 struct Span {
     keys: Arena,
-    ends: Vec<u32>,
+    ends: Vec<usize>,
     rows: Picked,
 }
 
@@ -593,7 +597,7 @@ impl Spans {
                 let first = *from.get_or_insert(a);
                 to = b;
                 keys.push(self.cursor.entry().0);
-                ends.push((b - first) as u32);
+                ends.push(b - first);
             }
             let Some(from) = from else {
                 return Ok(None);
@@ -604,8 +608,8 @@ impl Spans {
                     let mut rows = order.to_vec();
                     let mut a = 0;
                     for &b in &ends {
-                        rows[a..b as usize].sort_unstable();
-                        a = b as usize;
+                        rows[a..b].sort_unstable();
+                        a = b;
                     }
                     Picked::Rows(rows)
                 }
@@ -629,7 +633,10 @@ fn gather<'py>(
         if let Some(&r) = rows.iter().find(|&&r| r as usize >= n) {
             return Err(PyValueError::new_err(format!("row {r} of {n}")));
         }
-        PyList::new(py, rows.iter().map(|&r| items.get_item(r as usize).unwrap()))
+        PyList::new(
+            py,
+            rows.iter().map(|&r| items.get_item(r as usize).unwrap()),
+        )
     })
 }
 

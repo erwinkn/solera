@@ -218,7 +218,7 @@ class FileStore:
             await self._put(self.key_name(base, key, generation), group)
 
         async for chunk in write.chunks():
-            await self._many(put, chunk.groups())
+            await self._many(put, await asyncio.to_thread(chunk.groups))
         ref = self._ref(context, {"mode": "keyed", "path": base, "key": context.output.key})
         return Written(ref, changed=write.changed())
 
