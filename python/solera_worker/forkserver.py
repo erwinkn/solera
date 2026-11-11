@@ -9,9 +9,13 @@ connection another thread used, would reach every attempt held or
 half-used. So the forkserver keeps the project only if importing it left
 the process as it found it: no exception, no thread but the main one
 (counted by the OS where it can, so a native library's threads count), and
-no new socket or pipe, which every attempt forked from it would share.
-Otherwise it says why and exits, and the pool worker starts one with the
-framework alone, whose attempts import the project themselves.
+no new socket or pipe, which every attempt forked from it would share,
+and within `PRELOAD_TIMEOUT`: the import runs before an attempt owns
+anything, where nothing could cancel it. Otherwise it says why and exits,
+and the pool worker starts one with the framework alone, whose attempts
+import the project themselves, for as long as the pool worker runs. Signal
+dispositions the import set are the attempts', not the forkserver's: it
+restores its own and its children set the project's again.
 
 A preloaded forkserver serves one deploy: the manifest digest of the code
 it imported, its files hashed as they were imported (`Project.manifest`).
@@ -23,6 +27,7 @@ afresh, and runs the attempt from the new one.
 from __future__ import annotations
 
 import contextlib
+import ctypes
 import json
 import os
 import signal
@@ -30,9 +35,10 @@ import socket
 import stat
 import subprocess
 import sys
-import threading
 
 from .worker import LOST, STALE
+
+PRELOAD_TIMEOUT = 60.0  # seconds a forkserver may take to import the project before it is refused
 
 
 class Attempts:
@@ -40,9 +46,10 @@ class Attempts:
     starts with the first attempt and is replaced when the deploy changes.
     `run` blocks: call it on a thread."""
 
-    def __init__(self, entrypoint: str):
-        self.entrypoint = entrypoint
+    def __init__(self, entrypoint: str, preload_timeout: float = PRELOAD_TIMEOUT):
+        self.entrypoint, self.preload_timeout = entrypoint, preload_timeout
         self.server: Forkserver | None = None
+        self.preload = True  # until a forkserver refuses the project
 
     def run(self, stage: dict, engine: str | None) -> int:
         """Run one attempt in a process of its own; its exit code."""
@@ -64,31 +71,41 @@ class Attempts:
         One that has just imported the code runs it as an import of its own
         would."""
 
+        server = self.server
+        if server is None:  # closed meanwhile
+            return LOST
         try:
-            return self.server.run(stage, engine, check)
-        except OSError as error:  # the forkserver died: how its attempt ended is the engine's to find
+            return server.run(stage, engine, check)
+        except (
+            OSError,
+            ValueError,
+        ) as error:  # it died, or was closed: how its attempt ended is the engine's to find
             print(f"[pool] the forkserver failed: {error}", file=sys.stderr, flush=True)
             self.close()
             return LOST
 
     def _start(self) -> Forkserver:
-        server = Forkserver(self.entrypoint)
-        if server.refused is None:
-            return server
-        print(
-            f"[pool] warning: attempts import the project themselves: {server.refused}",
-            file=sys.stderr,
-            flush=True,
-        )
-        server = Forkserver(self.entrypoint, preload=False)
+        if self.preload:
+            server = Forkserver(self.entrypoint, timeout=self.preload_timeout)
+            if server.refused is None:
+                return server
+            self.preload = False
+            print(
+                f"[pool] warning: attempts import the project themselves: {server.refused}",
+                file=sys.stderr,
+                flush=True,
+            )
+        server = Forkserver(self.entrypoint, preload=False, timeout=self.preload_timeout)
         if server.refused is not None:  # the framework alone did not start: no attempt can
             raise RuntimeError(f"the forkserver did not start: {server.refused}")
         return server
 
     def close(self) -> None:
-        if self.server is not None:
-            self.server.close()
-            self.server = None
+        """Safe while `run` waits on another thread: that run returns `LOST`."""
+
+        server, self.server = self.server, None
+        if server is not None:
+            server.close()
 
 
 class Forkserver:
@@ -96,7 +113,7 @@ class Forkserver:
     it imported (None with the framework alone), or `refused`, why it could
     not keep the project; that one has exited."""
 
-    def __init__(self, entrypoint: str, preload: bool = True):
+    def __init__(self, entrypoint: str, preload: bool = True, timeout: float = PRELOAD_TIMEOUT):
         ours, theirs = socket.socketpair()
         boot = "import json, sys; sys.path[:] = json.loads(sys.argv[4]); from solera_worker.forkserver import serve; serve()"
         with theirs:
@@ -113,10 +130,18 @@ class Forkserver:
                 pass_fds=[theirs.fileno()],
             )
         self.socket, self.stream = ours, ours.makefile("rwb")
-        line = self.stream.readline()
-        hello = (
-            json.loads(line) if line else {"refused": "the forkserver exited while it imported the project"}
-        )
+        ours.settimeout(timeout)
+        try:
+            line = self.stream.readline()
+            hello = (
+                json.loads(line)
+                if line
+                else {"refused": "the forkserver exited while it imported the project"}
+            )
+        except TimeoutError:
+            self.process.kill()
+            hello = {"refused": f"importing the project took more than {timeout:g} s"}
+        ours.settimeout(None)
         self.deploy, self.refused = hello.get("deploy"), hello.get("refused")
         if self.refused is not None:
             self.close()
@@ -133,13 +158,17 @@ class Forkserver:
         return json.loads(line)["code"]
 
     def close(self) -> None:
-        """At the end of its stream it exits; an attempt it forked runs on."""
+        """At the end of its stream it exits, or is killed if it waits on an
+        attempt; that attempt runs on. A `run` waiting on another thread
+        returns at once."""
 
         with contextlib.suppress(OSError):
+            self.socket.shutdown(socket.SHUT_RDWR)
+        with contextlib.suppress(OSError, ValueError):
             self.stream.close()
         self.socket.close()
         try:
-            self.process.wait(10)
+            self.process.wait(1)
         except subprocess.TimeoutExpired:
             self.process.kill()
             self.process.wait()
@@ -161,23 +190,35 @@ def serve() -> None:
     from . import worker
 
     _warm()
-    entrypoint, project = sys.argv[2], None
+    entrypoint, project, theirs = sys.argv[2], None, {}
     if sys.argv[3]:
+        own = _dispositions()
         project, refused = _preload(entrypoint, worker.load_project)
         if refused is not None:
             send({"refused": refused})
             return
+        theirs = {
+            number: handler
+            for number, handler in _dispositions().items()
+            if own.get(number, handler) != handler
+        }
+        for number in theirs:
+            signal.signal(number, own[number])  # SIGCHLD ignored would leave no child to wait for
     send({"deploy": project.manifest["deploy"] if project is not None else None})
     for line in stream:
         request = json.loads(line)
         sys.stdout.flush()  # or each child would write what is buffered here once more
         sys.stderr.flush()
+        with contextlib.suppress(Exception):
+            ctypes.CDLL(None).fflush(None)  # C's stdio buffers too
         pid = os.fork()
         if pid == 0:
             try:
                 stream.close()
                 connection.close()  # the pool worker's and this server's alone
                 signal.signal(signal.SIGINT, signal.default_int_handler)
+                for number, handler in theirs.items():
+                    signal.signal(number, handler)
                 stale = request["check"] and project is not None
                 worker._child(request["stage"], request["engine"], project or entrypoint, stale=stale)
             finally:
@@ -214,7 +255,13 @@ def _preload(entrypoint: str, load):
         project = load(entrypoint)
     except BaseException as error:  # SystemExit too: each attempt reports its own import's
         return None, f"importing the project raised {type(error).__name__}: {error}"
-    if (threads := _threads()) > 1:
+    threads = _threads()
+    if threads is None:
+        return (
+            None,
+            "this platform does not count a process's threads, so none left by the import can be seen",
+        )
+    if threads > 1:
         return None, f"importing the project left {threads - 1} thread(s) running beside the main one"
     if opened := _channels() - before:
         return (
@@ -224,14 +271,26 @@ def _preload(entrypoint: str, load):
     return project, None
 
 
-def _threads() -> int:
-    """This process's threads: the OS's count where it gives one, so a
-    native library's threads count too."""
+def _threads() -> int | None:
+    """This process's threads as the OS counts them, a native library's
+    included; None where it gives no count (no /proc): Python's own count
+    would miss those."""
 
     try:
         return len(os.listdir("/proc/self/task"))
     except OSError:
-        return threading.active_count()
+        return None
+
+
+def _dispositions() -> dict[int, object]:
+    """This process's signal dispositions set from Python, by signal."""
+
+    found = {}
+    for number in signal.valid_signals():
+        with contextlib.suppress(OSError, ValueError):
+            if (handler := signal.getsignal(number)) is not None:
+                found[number] = handler
+    return found
 
 
 def _channels() -> set[tuple[int, int, int]]:

@@ -1542,7 +1542,7 @@ async def run_pool(pool: str, server: str, token: str | None = None, *, project:
                     break
     finally:
         await channel.close()
-        attempts.close()
+        await asyncio.get_running_loop().run_in_executor(None, attempts.close)
 
 
 LOST = 4  # the exit code of an attempt that could not publish: the engine treats it as dead

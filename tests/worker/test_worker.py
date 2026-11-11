@@ -343,6 +343,37 @@ project = Project(assets=[lingering])
 """
 
 
+SLOW_AT_IMPORT = """
+import time
+from solera.executors import Pool
+from solera.sdk import Project, asset
+
+if len(open(IMPORTS).read().split()) == 2:  # the forkserver's import, after the engine's: it hangs
+    time.sleep(600)
+
+@asset(executor=Pool("ingest")())
+def lingering() -> int:
+    return 1
+
+project = Project(assets=[lingering])
+"""
+
+
+SIGCHLD_AT_IMPORT = """
+import signal
+from solera.executors import Pool
+from solera.sdk import Project, asset
+
+signal.signal(signal.SIGCHLD, signal.SIG_IGN)  # a library that never waits for its children
+
+@asset(executor=Pool("ingest")())
+def lingering() -> int:
+    return 1
+
+project = Project(assets=[lingering])
+"""
+
+
 async def offered(engine, run_id: str, pool: str = "ingest") -> dict:
     """The stage of `run_id`'s attempt once `pool`'s workers are offered it."""
 
@@ -353,6 +384,18 @@ async def offered(engine, run_id: str, pool: str = "ingest") -> dict:
                 return stage
         await asyncio.sleep(0.02)
     raise AssertionError(f"no attempt of {run_id} was offered")
+
+
+async def computing(ran, attempt) -> None:
+    """Until the attempt's asset wrote `ran`; raises if the attempt ended first."""
+
+    for _ in range(3000):
+        if ran.exists():
+            return
+        if attempt.done():
+            raise AssertionError(f"the attempt ended before its asset ran: {attempt.result()}")
+        await asyncio.sleep(0.02)
+    raise AssertionError("the attempt's asset never ran")
 
 
 async def ticking(engine, work):
@@ -378,8 +421,17 @@ def imported(path) -> list[str]:
         (ABANDONED_CALL, None),
         (LOCKED_AT_IMPORT, "left 1 thread(s) running"),
         (SOCKET_AT_IMPORT, "left 2 socket(s) or pipe(s) open"),
+        (SLOW_AT_IMPORT, "took more than 5 s"),
+        (SIGCHLD_AT_IMPORT, None),
     ],
-    ids=["thread", "executor-call", "thread-at-import", "socket-at-import"],
+    ids=[
+        "thread",
+        "executor-call",
+        "thread-at-import",
+        "socket-at-import",
+        "slow-import",
+        "sigchld-at-import",
+    ],
 )
 async def test_a_pool_attempt_runs_in_a_child_of_the_forkserver(
     state, tmp_path, monkeypatch, source, preloaded
@@ -389,19 +441,25 @@ async def test_a_pool_attempt_runs_in_a_child_of_the_forkserver(
     in the loop's executor too (review round 3, #3). The forkserver keeps
     the project it imported, and the attempt imports nothing, unless that
     import left a thread (one holding a lock the child would inherit held)
-    or a socket behind: then it says why, and the attempt imports the
-    project itself (ERW-36)."""
+    or a socket behind, or did not finish in time: then it says why, and the
+    attempt imports the project itself. A signal the import ignores is the
+    attempt's to ignore, not the forkserver's, which still reaps it
+    (ERW-36)."""
 
     import subprocess
     import sys
 
     imports = tmp_path / "imports.txt"
-    recorded = f"import os; open({str(imports)!r}, 'a').write(f'{{os.getpid()}}\\n')\n"
+    recorded = f"import os; IMPORTS = {str(imports)!r}; open(IMPORTS, 'a').write(f'{{os.getpid()}}\\n')\n"
     entrypoint = write_project(tmp_path, recorded + source)
     monkeypatch.setenv("SOLERA_PROJECT", entrypoint)
     # A short grace: the engine reads the claim and the result without the worker's
     # channel, which this worker has none of, a moment after the offer, not 10 s.
+    children = signal.getsignal(signal.SIGCHLD)
     engine = make_engine(state, entrypoint, heartbeat_seconds=0.2, pool_offered_grace=0.5)
+    signal.signal(
+        signal.SIGCHLD, children
+    )  # what the engine's own import of the project set is not this test's
     await engine.initialize()
     run = await engine.submit(["lingering"])
     stage = await offered(engine, run["id"])
@@ -409,7 +467,7 @@ async def test_a_pool_attempt_runs_in_a_child_of_the_forkserver(
     worker = (
         "import json, sys\n"
         "from solera_worker.forkserver import Attempts\n"
-        "attempts = Attempts(sys.argv[2])\n"
+        "attempts = Attempts(sys.argv[2], preload_timeout=float(sys.argv[3]))\n"
         "code = attempts.run(json.loads(sys.argv[1]), None)\n"
         "print(attempts.server.process.pid, code)\n"
         "attempts.close()\n"
@@ -417,7 +475,14 @@ async def test_a_pool_attempt_runs_in_a_child_of_the_forkserver(
     started = asyncio.get_running_loop().time()
     done = await asyncio.to_thread(
         subprocess.run,
-        [sys.executable, "-c", worker, json.dumps(stage), entrypoint],
+        [
+            sys.executable,
+            "-c",
+            worker,
+            json.dumps(stage),
+            entrypoint,
+            "5" if "took" in (preloaded or "") else "60",
+        ],
         capture_output=True,
         text=True,
         timeout=55,
@@ -534,11 +599,7 @@ async def test_a_forced_cancel_ends_its_attempt_and_not_the_forkserver(state, tm
             asyncio.to_thread(attempts.run, await offered(engine, first["id"]), None)
         )
 
-        async def computing():
-            while not ran.exists():
-                await asyncio.sleep(0.02)
-
-        await ticking(engine, computing())
+        await ticking(engine, computing(ran, attempt))
         server = attempts.server.process
         [child] = map(int, imported(ran))
         assert child != server.pid
@@ -554,6 +615,40 @@ async def test_a_forced_cancel_ends_its_attempt_and_not_the_forkserver(state, tm
         assert await ticking(engine, asyncio.to_thread(attempts.run, stage, None)) == 0
         assert attempts.server.process is server and server.poll() is None
         assert (await engine.run_until(second["id"], 60))["request"]["status"] == "succeeded"
+    finally:
+        attempts.close()
+
+
+async def test_closing_a_pool_worker_ends_its_wait_and_not_its_attempt(state, tmp_path, monkeypatch):
+    """ERW-36: a pool worker that stops while an attempt runs stops waiting
+    at once (the attempt is LOST to it) and leaves the attempt running: it
+    reports to the engine on its own and finishes."""
+
+    import time
+
+    from solera_worker.forkserver import Attempts
+
+    ran, hold = tmp_path / "ran.txt", tmp_path / "hold"
+    hold.touch()
+    entrypoint = write_project(tmp_path, HELD.format(ran=str(ran), hold=str(hold)))
+    monkeypatch.setenv("SOLERA_PROJECT", entrypoint)
+    engine = make_engine(state, entrypoint, heartbeat_seconds=0.2, pool_offered_grace=0.5)
+    await engine.initialize()
+    attempts = Attempts(entrypoint)
+    try:
+        run = await engine.submit(["held"])
+        attempt = asyncio.create_task(asyncio.to_thread(attempts.run, await offered(engine, run["id"]), None))
+        await ticking(engine, computing(ran, attempt))
+        server = attempts.server.process
+        started = time.monotonic()
+        await asyncio.to_thread(attempts.close)
+        assert await attempt == 4  # LOST: no longer this pool worker's to wait for
+        assert time.monotonic() - started < 5
+        assert server.poll() is not None
+        [child] = map(int, imported(ran))
+        os.kill(child, 0)  # still running
+        hold.unlink()
+        assert (await engine.run_until(run["id"], 60))["request"]["status"] == "succeeded"
     finally:
         attempts.close()
 
@@ -594,7 +689,8 @@ async def test_a_redeploy_reaches_the_next_pool_attempt(state, tmp_path, monkeyp
         )
         assert (await engine.run_until(first["id"], 60))["request"]["status"] == "succeeded"
         before = attempts.server
-        write_project(tmp_path, VERSIONED.format(ran=str(ran), version=2))
+        # Another size, so the bytecode cache sees it (the same size within one second: test below).
+        write_project(tmp_path, VERSIONED.format(ran=str(ran), version=22))
         assert engine.redeploy(load_project(entrypoint).manifest)
         second = await engine.submit(["versioned"])
         assert (
@@ -602,11 +698,34 @@ async def test_a_redeploy_reaches_the_next_pool_attempt(state, tmp_path, monkeyp
             == 0
         )
         assert (await engine.run_until(second["id"], 60))["request"]["status"] == "succeeded"
-        assert ran.read_text().split() == ["1", "2"]
+        assert ran.read_text().split() == ["1", "22"]
         assert attempts.server is not before and before.process.poll() is not None
         assert attempts.server.deploy == engine.manifest["deploy"] != before.deploy
     finally:
         attempts.close()
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="pre-existing: the project loader trusts a bytecode cache keyed on mtime and size, "
+    "while the deploy digest hashes the source (found in ERW-36's review)",
+)
+def test_an_edit_of_the_same_size_within_a_second_runs_the_new_code(tmp_path):
+    """A process importing a project after its source changed runs the new
+    source, even when the edit kept its size and its mtime second."""
+
+    import subprocess
+    import sys
+
+    path = tmp_path / "proj.py"
+    show = "import sys; sys.path.insert(0, sys.argv[2]); from solera_worker.worker import _load_module; from pathlib import Path; print(_load_module(Path(sys.argv[1])).VERSION)"
+    path.write_text("VERSION = 1\n")
+    mtime = path.stat().st_mtime_ns
+    run = [sys.executable, "-c", show, str(path), str(tmp_path)]
+    assert subprocess.run(run, capture_output=True, text=True, check=True).stdout.strip() == "1"
+    path.write_text("VERSION = 2\n")
+    os.utime(path, ns=(mtime, mtime))
+    assert subprocess.run(run, capture_output=True, text=True, check=True).stdout.strip() == "2"
 
 
 def test_a_worker_of_plain_rows_imports_no_dataframe_library(tmp_path):
