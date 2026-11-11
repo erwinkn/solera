@@ -29,7 +29,7 @@ impl Chunks {
         let mut lookup = Vec::with_capacity((n >> 12) + 1);
         let mut c = 0u32;
         for j in 0..=(n >> 12) {
-            while starts[c as usize + 1] <= j << 12 && (c as usize) + 2 < starts.len() {
+            while (c as usize) + 2 < starts.len() && starts[c as usize + 1] <= j << 12 {
                 c += 1;
             }
             lookup.push(c);

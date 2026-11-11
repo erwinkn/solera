@@ -180,3 +180,68 @@ def test_a_batch_read_from_columns_equals_one_built_whole():
             assert (rows, added) == ([1], ())
     with pytest.raises(AttributeError):
         lazy.rows = []
+
+
+def test_a_table_answer_serves_as_the_same_dict_answer_would():
+    """`Loaded(table, version=column)` over random tables — shuffled, in
+    several chunks, keyed by strings or integers, holding keys not asked —
+    against the dict answer of the same rows: the same servings, and through
+    `frames.served` the same rows, flat or grouped, whole or by keys asked."""
+
+    import pyarrow as pa
+    from solera.stores import frames
+
+    rnd = random.Random(7)
+    for _ in range(300):
+        ints = rnd.random() < 0.3
+        held = rnd.sample(range(40), rnd.randint(0, 20))
+        rows = [
+            {"id": k if ints else f"k{k}", "n": rnd.randint(0, 9), "etag": f"e{rnd.randint(0, 3)}"}
+            for k in held
+        ]
+        schema = pa.schema(
+            [("id", pa.int64() if ints else pa.string()), ("n", pa.int64()), ("etag", pa.string())]
+        )
+        table = pa.Table.from_pylist(rows, schema=schema)
+        if len(rows) > 1:  # in chunks
+            cut = rnd.randint(1, len(rows) - 1)
+            table = pa.concat_tables([table.slice(0, cut), table.slice(cut)])
+        answer = {str(r["id"]): Loaded({"id": str(r["id"]), "n": r["n"]}, version=r["etag"]) for r in rows}
+        keys = (
+            None
+            if rnd.random() < 0.2
+            else sorted(rnd.sample([f"{k}" if ints else f"k{k}" for k in range(40)], 10))
+        )
+        grouped = keys is not None and rnd.random() < 0.3
+        served, want = Served(), Served()
+        take, names = served.read_table(table, "id", "etag", keys, grouped=grouped)
+        got = frames.served(table, take, "etag", list, names)
+        wanted, bad = want.read(answer, keys, Loaded, grouped=grouped)
+        assert bad is None and served.items() == want.items()
+        same = (lambda r: {**r, "id": str(r["id"])}) if ints else (lambda r: r)
+        if grouped:
+            assert {k: [same(r) for r in g] for k, g in got.items()} == wanted
+        else:
+            assert [same(r) for r in got] == wanted
+
+
+@pytest.mark.parametrize(
+    ("columns", "error"),
+    [
+        ({"id": ["a", "b", "a"], "v": ["1", "2", "3"]}, 'key "a" has two rows'),
+        ({"id": ["a", None], "v": ["1", "2"]}, 'column "id" has nulls'),
+        ({"v": ["1"]}, 'no column "id"'),
+        ({"id": ["a"]}, 'no column "v"'),
+        ({"id": ["a"], "v": [b"1"]}, 'version column "v" must hold strings, not Binary'),
+        ({"id": [1.5], "v": ["1"]}, 'key column "id" must hold strings or integers, not Float64'),
+    ],
+)
+def test_a_table_that_cannot_say_what_it_served_serves_nothing(columns, error):
+    import pyarrow as pa
+
+    served = Served()
+    with pytest.raises(ValueError, match=error):
+        served.read_table(pa.table(columns), "id", "v", ["a"])
+    assert served.items() == []
+    with pytest.raises(ValueError, match="cannot be the key column"):
+        served.read_table(pa.table({"id": ["a"]}), "id", "id", None)
