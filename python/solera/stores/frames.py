@@ -265,9 +265,23 @@ def _arrow_taker(data: Any) -> Callable:
             taken = table.take(pa.Array.from_buffers(pa.uint32(), len(rows), [None, pa.py_buffer(rows)]))
         else:
             taken = table.take(list(rows))
-        return taken.to_pylist(maps_as_pydicts="strict")
+        if any(_has_map(t) for t in table.schema.types):  # a third the speed: only where a map is
+            return taken.to_pylist(maps_as_pydicts="strict")
+        return taken.to_pylist()
 
     return take
+
+
+def _has_map(t: Any) -> bool:
+    """Whether an Arrow type holds a map, at any depth."""
+
+    import pyarrow as pa
+
+    if pa.types.is_map(t):
+        return True
+    if pa.types.is_dictionary(t):
+        return _has_map(t.value_type)
+    return any(_has_map(t.field(i).type) for i in range(t.num_fields))
 
 
 # -- kinds --------------------------------------------------------------------------------

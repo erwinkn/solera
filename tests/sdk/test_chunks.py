@@ -95,3 +95,19 @@ def test_a_row_that_is_not_a_mapping_is_refused():
 
     with pytest.raises(WriteError, match="a row is a list, not a mapping"):
         prepare([{"id": "a"}, ["b"]], Output("t", key="id"))
+
+
+def test_arrow_maps_are_read_as_dicts_at_any_depth():
+    m = pa.map_(pa.string(), pa.int64())
+    table = pa.table(
+        {
+            "id": ["a", "b"],
+            "m": pa.array([[("x", 1)], [("y", 2)]], m),
+            "s": pa.array([{"inner": [("z", 3)]}, {"inner": []}], pa.struct([("inner", m)])),
+        }
+    )
+    [chunk] = read(KeyedWrite(prepare_frames(table, Output("t", key="id")), reset=True), 5)
+    assert chunk.rows == [
+        {"id": "a", "m": {"x": 1}, "s": {"inner": {"z": 3}}},
+        {"id": "b", "m": {"y": 2}, "s": {"inner": {}}},
+    ]
