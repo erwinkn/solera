@@ -16,13 +16,14 @@ use crate::codec::{Dec, Enc};
 use crate::error::{format, Result};
 use crate::event::{Event, Part};
 use crate::progress::Progress;
+use crate::retain::Retain;
 use crate::stale::Stale;
 
 /// An opaque name the engine chooses: an output (asset, partition, output
 /// name) or an edge (consumer partition, input name), encoded by Python.
 pub type Id = Box<[u8]>;
 
-pub const SNAPSHOT_FORMAT: u8 = 2;
+pub const SNAPSHOT_FORMAT: u8 = 3;
 
 /// One output's log: its layer list, oldest first, and its head. B4's
 /// commit part appends to it.
@@ -53,6 +54,8 @@ pub struct Tracking {
     pub lives: u64,
     /// B7: staleness per keyed edge.
     pub stale: Stale,
+    /// B9: the cleanup cursors.
+    pub retain: Retain,
 }
 
 impl Tracking {
@@ -77,6 +80,12 @@ impl Tracking {
     /// Whether `apply` would take the event, applying nothing: the engine
     /// checks a commit's event before it journals it.
     pub fn check_event(&self, ev: &Event) -> Result<()> {
+        let alone = |p: &Part| matches!(p, Part::Merged(_) | Part::Cleaned(_) | Part::Retire(_));
+        if ev.parts.len() > 1 && ev.parts.iter().any(alone) {
+            return crate::error::invalid(
+                "a merge, a cleanup step or a retirement is an event of its own: each part is checked on the state before the event",
+            );
+        }
         let mut touched = std::collections::HashSet::new();
         for p in &ev.parts {
             for t in p.touches() {
@@ -111,6 +120,10 @@ impl Tracking {
             Part::Rebuild(p) => p.check(self),
             Part::Watch(p) => p.check(self),
             Part::Witness(p) => p.check(self),
+            Part::Merged(p) => p.check(self),
+            Part::Track(p) => p.check(self),
+            Part::Cleaned(p) => p.check(self),
+            Part::Retire(p) => p.check(self),
         }
     }
 
@@ -131,6 +144,10 @@ impl Tracking {
             Part::Rebuild(p) => p.apply(self),
             Part::Watch(p) => p.apply(self),
             Part::Witness(p) => p.apply(self),
+            Part::Merged(p) => p.apply(self),
+            Part::Track(p) => p.apply(self),
+            Part::Cleaned(p) => p.apply(self),
+            Part::Retire(p) => p.apply(self),
         }
     }
 
@@ -161,6 +178,7 @@ impl Tracking {
         }
         e.uv(self.lives);
         self.stale.encode(&mut e);
+        self.retain.encode(&mut e);
         e.buf
     }
 
@@ -200,6 +218,7 @@ impl Tracking {
         }
         t.lives = d.uv()?;
         t.stale = Stale::decode(&mut d)?;
+        t.retain = Retain::decode(&mut d)?;
         d.end()?;
         Ok(t)
     }

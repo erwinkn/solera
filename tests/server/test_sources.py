@@ -15,4 +15,4 @@ async def test_a_key_the_loader_leaves_out_was_observed_absent():
 
     reader = SourceLoader(files)
     rows = await reader.load(Ref("files", "default", {}, ""), list, Keys({"a": 1, "b": 2}))
-    assert rows == [{"id": "a"}] and reader.served == {"a": "e1", "b": None}
+    assert rows == [{"id": "a"}] and dict(reader.served.items()) == {"a": "e1", "b": None}
