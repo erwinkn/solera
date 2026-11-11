@@ -476,6 +476,101 @@ async def test_row_security_enabled_after_a_full_run_began_refuses_its_first_wri
     assert outside(store, out) == ({"a": "old"} if held else {})
 
 
+DECIDING_DDL = {  # kind: (setup, the DDL), with {t} the table and {p}, {q} two partitions or children
+    "attach": (
+        "CREATE TABLE {q} (LIKE {t}); INSERT INTO {q} VALUES ('old', 'old', 'q', 1)",
+        "ALTER TABLE {t} ATTACH PARTITION {q} FOR VALUES IN ('q')",
+    ),
+    "partition of": ("", "CREATE TABLE {q} PARTITION OF {t} FOR VALUES IN ('q')"),
+    "a partition's trigger": (
+        "",
+        "CREATE TRIGGER skip BEFORE DELETE ON {p} FOR EACH ROW EXECUTE FUNCTION suppress_redundant_updates_trigger()",
+    ),
+    "inherit": ("CREATE TABLE {q} (LIKE {t})", "ALTER TABLE {q} INHERIT {t}"),
+    "trigger": (
+        "",
+        "CREATE TRIGGER skip BEFORE DELETE ON {t} FOR EACH ROW EXECUTE FUNCTION suppress_redundant_updates_trigger()",
+    ),
+    "rule": ("", "CREATE RULE skip AS ON DELETE TO {t} DO INSTEAD NOTHING"),
+    "policy": ("", "CREATE POLICY visible ON {t} USING (true)"),
+    "row security": ("", "ALTER TABLE {t} ENABLE ROW LEVEL SECURITY"),
+}
+
+
+@pytest.mark.parametrize("kind", list(DECIDING_DDL))
+async def test_no_ddl_that_would_change_the_decision_runs_until_the_deciding_write_commits(
+    store, monkeypatch, kind
+):
+    """Sol R1-1, Astra R1-1: a partition attached, or a table made to
+    inherit, after the decision's lock and before the write commits could
+    bring rows, and a trigger, rule or policy added in that time could keep
+    the run's clear from deleting them: the run, published in place, would
+    publish rows it never read. Each DDL that changes what the decision
+    reads waits for the deciding write, on the table or on a partition of
+    it, and the run fills the partition as it decided."""
+
+    import psycopg
+
+    partitioned = kind in ("attach", "partition of", "a partition's trigger")
+    out = output(incremental=True, **({"partition_column": "site"} if partitioned else {}))
+    table, _, _ = store._table(out)
+    names = {"t": table, "p": f'"public"."{out.name}_p"', "q": f'"public"."{out.name}_q"'}
+    if partitioned:
+        sql(f"CREATE TABLE {table} (id text, v text, site text, _version bigint) PARTITION BY LIST (site)")
+        sql(f"CREATE TABLE {names['p']} PARTITION OF {table} FOR VALUES IN ('p')")
+    else:
+        sql(f"CREATE TABLE {table} (id text, v text, _version bigint)")
+    partition = "p" if partitioned else ""
+    await store.store(rows(a="old"), None, at(out, 1, partition=partition, builds=False))
+    sql(f"DELETE FROM {table}")  # the table and its index made, as a lock-free decision would find them
+    setup, ddl = (s.format(**names) for s in DECIDING_DDL[kind])
+    for statement in filter(None, setup.split("; ")):
+        sql(statement)
+    decide, waited = store._decide, []
+
+    def decided(*args):
+        decide(*args)
+        with psycopg.connect(DSN, autocommit=True) as conn:
+            conn.execute("SET lock_timeout = '200ms'")
+            with pytest.raises(psycopg.errors.LockNotAvailable):
+                conn.execute(ddl)
+        waited.append(kind)
+
+    monkeypatch.setattr(store, "_decide", decided)
+    written = await store.store(rows(b="new"), None, at(out, 5, reset=True, partition=partition))
+    assert waited == [kind] and "build" not in written.ref.handle and outside(store, out) == {"b": "new"}
+    assert await store.full_run_ended(out, partition, 5, 5) is True
+
+
+@pytest.mark.parametrize("partition", [False, True])
+async def test_a_foreign_table_refuses_a_full_runs_first_write(store, partition):
+    """Sol R1-L1, Astra R1-3: a build cannot stand in for a foreign table,
+    whole or as a partition, and PostgreSQL cannot lock one: the run's first
+    write is refused (`PublicationRefused`), as on main, not failed by the
+    lock."""
+
+    out = output(key=None, **({"partition_column": "site"} if partition else {}))
+    table, _, _ = store._table(out)
+    name = out.name
+    sql(f"CREATE FOREIGN DATA WRAPPER {name} NO HANDLER")
+    sql(f"CREATE SERVER {name} FOREIGN DATA WRAPPER {name}")
+    try:
+        if partition:
+            sql(f"CREATE TABLE {table} (v text, site text, _version bigint) PARTITION BY LIST (site)")
+            sql(
+                f'CREATE FOREIGN TABLE "public"."{name}_f" PARTITION OF {table} FOR VALUES IN (\'f\') SERVER {name}'
+            )
+        else:
+            sql(f"CREATE FOREIGN TABLE {table} (v text, _version bigint) SERVER {name}")
+        with pytest.raises(PublicationRefused, match="publishing a full run built beside it"):
+            await store.store(
+                [{"v": "new"}], None, at(out, 5, reset=True, partition="p" if partition else "")
+            )
+    finally:
+        sql(f"DROP SERVER {name} CASCADE")
+        sql(f"DROP FOREIGN DATA WRAPPER {name}")
+
+
 async def test_a_table_made_after_a_full_run_began_holding_its_rows_builds_beside(store, monkeypatch):
     """A table absent when the write began can be made before the write makes
     it: another partition's first write, or by hand. The write decides under

@@ -690,18 +690,19 @@ run's first write that reaches a table, and recorded in the partition's
 version row: in place, the row's `published` is set to the run, so its
 later writes go in place and its switch says published and does nothing;
 beside, its build is registered. That write takes the table's
-`ROW EXCLUSIVE` lock (the one the switch's `DELETE` takes, on every
-partition too) and then reads, in one statement, whether the partition
-holds a row and whether the table is one a build cannot stand in for. A
-table made since the write began is seen, and no trigger, rule, policy
-or row security can be added before the write commits. It writes in place
+`SHARE UPDATE EXCLUSIVE` lock, on every partition and inheriting table
+too, and then reads, in one statement, whether the partition holds a
+row and whether the table is one a build cannot stand in for. A table
+made since the write began is seen, and no partition can be attached,
+no table made to inherit, and no trigger, rule, policy or row security
+added before the write commits. The lock does not conflict with other
+partitions' writes and switches; another partition's deciding write
+waits for it. It writes in place
 only if the partition holds no row and no other run is registered there.
 A table a build cannot stand in for is refused all the same, empty or
 not, because row security could hide rows from the read. So outsiders
 may see such a partition fill. A dead run's partial rows stay visible
-until the next full run, which finds them and builds beside. As at the
-switch, a partition attached after the read takes no lock that the read
-waits for, so the read does not see it. A run whose write reaches no
+until the next full run, which finds them and builds beside. A run whose write reaches no
 table (it is empty, there is no table, and no columns are declared to
 make one from) decides nothing. Its version row records it as pending,
 and its first write that reaches a table decides, whatever another

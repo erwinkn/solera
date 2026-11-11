@@ -510,20 +510,34 @@ class PostgresStore:
 
         Both inputs are read under the locks that hold them still. The
         version check (`_begin`) keeps every other Solera writer out of the
-        partition and its registry. The table's lock, the one a switch's
-        DELETE takes, on it and every table that inherits from it, is taken
-        before the read, so the one statement after it (READ COMMITTED: the
-        catalog and rows as they are now) sees a table made or attached, a
-        row written, or row security enabled before it, and no trigger,
-        rule, policy or row security can be added until the write commits.
-        A table a build cannot stand in for (`_UNBUILDABLE`) is refused,
-        empty or not (`PublicationRefused`): row security could hide its
-        rows from the read, and a build would publish rows other than the
-        ones Solera has read."""
+        partition and its registry. SHARE UPDATE EXCLUSIVE on the table and
+        every table that inherits from it, taken before the read, is the
+        weakest lock that conflicts with all the DDL that changes either
+        input: attaching a partition or inheriting a table (which bring
+        rows), and adding a trigger, rule, policy or row security. So the one
+        statement after it (READ COMMITTED: the catalog and rows as they are
+        now) sees what such DDL did before it, and none can run until the
+        write commits. Writes and switches of other partitions take ROW
+        EXCLUSIVE, which it does not conflict with; another partition's
+        deciding write, a VACUUM or an ANALYZE of the table waits for it, or
+        it for them (autovacuum gives way). A table a build cannot stand in
+        for (`_UNBUILDABLE`, a foreign table among them, which cannot be
+        locked) is refused, empty or not (`PublicationRefused`): row
+        security could hide its rows from the read, and a build would
+        publish rows other than the ones Solera has read."""
+
+        import psycopg
 
         column = output.config.get("partition_column")
         where = {column: at.partition} if column else {}
-        cur.execute(f"LOCK TABLE {at.table} IN ROW EXCLUSIVE MODE")
+        refused = PublicationRefused(
+            f"{output.name} {at.partition!r}: {at.table} {_UNBUILDABLE_WHY}: publishing a full run built "
+            "beside it would publish rows other than the ones Solera has read. Write the output in place"
+        )
+        try:
+            cur.execute(f"LOCK TABLE {at.table} IN SHARE UPDATE EXCLUSIVE MODE")
+        except psycopg.errors.WrongObjectType as e:  # a foreign table
+            raise refused from e
         found = cur.execute(
             f"SELECT EXISTS (SELECT FROM {at.table} WHERE {self._where_sql(where)}) AS held, "
             + _UNBUILDABLE.format(rel="%s::regclass")
@@ -531,10 +545,7 @@ class PostgresStore:
             [*(where[k] for k in sorted(where)), at.table, at.table],
         ).fetchone()
         if found["unbuildable"]:
-            raise PublicationRefused(
-                f"{output.name} {at.partition!r}: {at.table} {_UNBUILDABLE_WHY}: publishing a full run built "
-                "beside it would publish rows other than the ones Solera has read. Write the output in place"
-            )
+            raise refused
         if not found["held"] and at.builds == [at.run] and not at.pending:
             at.builds, at.publishes, at.run, at.opens = [], at.run, None, False
 
@@ -1015,7 +1026,7 @@ class PostgresStore:
                         # The lock the DELETE takes, on every partition, first: no trigger, rule, policy or
                         # partition can be added or enabled until this commits, so the catalog read next
                         # (READ COMMITTED: as it is now) is the one the rows meet.
-                        cur.execute(f"LOCK TABLE {table} IN ROW EXCLUSIVE MODE")
+                        cur.execute(f"LOCK TABLE {table} IN SHARE UPDATE EXCLUSIVE MODE")
                         self._refuse_unbuildable(cur, output, partition, table)
                         self._delete_slice(cur, table, {column: partition} if column else {})
                     if run in found["builds"]:

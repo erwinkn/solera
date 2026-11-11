@@ -144,7 +144,9 @@ class Output:
             int, dict[str, Row]
         ] = {}  # open builds (shadow tables), by the version that opened each
         self.published_run = 0  # the build last published
-        self.loose: dict[str, int] = {}  # published keys an uncommitted write in place touched (`filling`)
+        self.loose: dict[
+            str, tuple[int, object]
+        ] = {}  # key -> (version, what it left) of an uncommitted write in place
         self.ended: set[int] = set()  # builds whose full run ended in the log
         self.switched: Counter = Counter()  # build -> times the store published it
         self.superseded: set[int] = set()  # ended builds dropped unpublished: a newer run's end overtook them
@@ -189,7 +191,7 @@ class Output:
             self.removals.setdefault(k, []).append((c, rebuild))
         if self.kind == "file":
             self._apply(version, writes, clear)
-        self.loose = {k: v for k, v in self.loose.items() if v != version}
+        self.loose = {k: w for k, w in self.loose.items() if w[0] != version}
         self.log.commit({k: ABSENT if v is ABSENT else version for k, v in writes.items()}, clear)
 
     def _named(self) -> dict[str, Row] | None:
@@ -245,7 +247,7 @@ class Output:
                     rows.clear()
         fills = self.filling is not None and (version == self.filling or (not clear and run == self.filling))
         if rows is self.published and ((not clear and run is None) or fills):
-            self.loose.update(dict.fromkeys(writes, version))  # in place, uncommitted
+            self.loose.update({k: (version, ABSENT if v is ABSENT else version) for k, v in writes.items()})
         for k, v in writes.items():
             if v is ABSENT:
                 rows.pop(k, None)
@@ -267,6 +269,15 @@ class Output:
             self.filling = run if empty else None  # the excuse is the exception's, never the rule's
         else:
             self.builds[run] = {}
+
+    def agrees(self, view: dict[str, Row], state: dict) -> bool:
+        """Whether the rows read are the state's, but where an uncommitted
+        write in place left a key as it wrote it (`loose`)."""
+        return all(
+            (seen := r.version if (r := view.get(k)) else ABSENT) == state.get(k)
+            or seen == self.loose.get(k, (None, None))[1]
+            for k in set(view) | set(state)
+        )
 
     def switch(self, gen: int, newest: int) -> bool:
         """The store's hook at the end of a full run (D211), one transaction:
@@ -1296,10 +1307,7 @@ class World:
             self.held["by reference"] += 1
             return
         view, state = out.outside(), out.log.states[-1]
-        if any(
-            (r.version if (r := view.get(k)) else ABSENT) != state.get(k)
-            for k in (set(view) | set(state)) - set(out.loose)
-        ):
+        if not out.agrees(view, state):
             self.violation = (
                 f"a reader of copy by reference reads {_rows(view)}, copy#{out.log.head} records {state}"
             )
@@ -1374,15 +1382,11 @@ class World:
                 return f"{a.name}'s store switched to build v{g}, whose full run had not ended"
         if out.swap and (old := {k: r for k, r in view.items() if r.version < out.published_run}):
             return f"{a.name}'s store still holds {_rows(old)} of an older build after its switch"
-        dirty = set(out.loose)
         self.stats["outside reads during a build"] += bool(out.builds)
         self.stats["outside reads of a partition filling"] += out.filling is not None
         for c in out.settled:
             st = out.log.states[c]
-            if c >= out.shown and all(
-                (r.version if (r := view.get(k)) else ABSENT) == st.get(k)
-                for k in (set(view) | set(st)) - dirty
-            ):
+            if c >= out.shown and out.agrees(view, st):
                 out.shown = c
                 break
         else:

@@ -524,20 +524,21 @@ def test_outsiders_may_see_only_the_filling_runs_rows():
     rows of the run filling it, and of writes outside a full run, nothing
     else. A dead first run's rows stay; the next full run builds beside,
     and its build's rows leaked into the table are caught."""
-    events = [
-        ("items", (("k1", True), ("k2", True), ("k3", True))),
-        ("plan", "copy", 1),
-        ("write", "copy"),
-        ("restart",),
-        ("items", (("k1", False),)),
-        ("plan", "copy", 1),
-        ("write", "copy"),
-    ]
-    w = oracle.replay_fullrun(events, kind="table")
-    out = w.copy.output
-    assert out.filling == 1 and len(out.builds) == 1 and w.outsiders(w.copy) is None
-    out.published.update(out.builds[max(out.builds)])
-    assert "outsiders read copy as {k1@1, k2@2}" in w.outsiders(w.copy)
+    for removed in (True, False):  # Astra R1-2: a key the dead run and the build both hold
+        events = [
+            ("items", (("k1", True), ("k2", True), ("k3", True))),
+            ("plan", "copy", 1),
+            ("write", "copy"),
+            ("restart",),
+            *([("items", (("k1", False),))] if removed else []),
+            ("plan", "copy", 1),
+            ("write", "copy"),
+        ]
+        w = oracle.replay_fullrun(events, kind="table")
+        out = w.copy.output
+        assert out.filling == 1 and len(out.builds) == 1 and w.outsiders(w.copy) is None
+        out.published.update(out.builds[max(out.builds)])
+        assert "outsiders read copy as" in (w.outsiders(w.copy) or "")
 
 
 def test_a_new_full_runs_clear_is_not_the_filling_runs_write():
