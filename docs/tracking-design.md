@@ -1155,9 +1155,12 @@ by reference; none of it knows how a store uses them.
 
 **What the store must do.** These are the store's obligations. How
 PostgresStore meets them (schema, lock order, constraints on the build,
-failures) is B8's to settle in code against PostgreSQL; the recipe and
-every probe it must pass are in `handoffs/SOLE-17/table-swap.md` in the
-Captain's drive, unverified until B8's tests run them.
+failures) is settled in code against PostgreSQL (B8):
+`python/solera_postgres`, described in `stores.md` ("PostgresStore: the
+version check, and full runs built beside"), with every probe of
+`handoffs/SOLE-17/table-swap.md` (the Captain's drive) a test in
+`tests/sdk/test_postgres_builds.py`, and a random history checked against
+this model's table.
 
 1. **A full run writes beside the published rows.** The first write of a
    full run (`context.reset`) opens a build for the run, named by the
@@ -1227,8 +1230,16 @@ planned an attempt of the partition since it issued the call, the call
 was late, and the engine calls again once the partition is quiet;
 otherwise the build is gone (or a writer the engine does not know of has
 written), so it raises an alarm and does not call again until an attempt
-commits or the engine restarts. A call the engine gave up on at a restart
-is never noticed. It calls again after a crash, and as obligation 5 says
+commits or the engine restarts. A write of a run whose build is gone (a
+migration drops a table's builds before it runs; a restore may lose
+them) fails with `RunLost` and changes nothing: the engine starts the
+partition's full run over, and the lost run's call says not published.
+A full run's first write to a table a build cannot stand in for (a view,
+a trigger, a rule, row security, a generated column a build computes
+otherwise, on it or on a table that inherits from it) fails with `PublicationRefused`:
+the switch would publish rows other than the ones Solera has read. Such an
+output is written in place.
+A call the engine gave up on at a restart is never noticed. It calls again after a crash, and as obligation 5 says
 while the call fails; a repeat for a published run does nothing and says published. **An input taken by reference** (a `TableRef` its consumer queries
 itself) reads what outsiders read, so the gate counts its upstream
 incomplete until the notice, not only until the run ends.
@@ -2138,7 +2149,7 @@ and batches that start at a piece boundary (asserted).
   5,000 histories (a load whose build a newer run overtook falls back to
   older rows, and the hold-back holds it). The model lets the engine switch whenever the partition
   is quiet; running it before the next batch, as §8 says, is one such
-  order. Fifteen rules: `swap` (build beside), `solera_build` (Solera
+  order. Sixteen rules: `swap` (build beside), `solera_build` (Solera
   reads the build), `first_full` (a first run is a full run),
   `switch_commit`, `switch_alone` and `switch_release` (each way a run
   ends owes the switch), `switch_owed` (the owed switch is journaled and
@@ -2148,9 +2159,10 @@ and batches that start at a piece boundary (asserted).
   unrepaired), `build_keep` (a write never drops a build the log names),
   `reset_replay` (a reset delivered again after its switch writes in
   place), `switch_cleanup` (the switch deletes the old rows first),
-  `byref_wait` (an input taken by reference waits for the switch) and
+  `byref_wait` (an input taken by reference waits for the switch),
   `switch_result` (the notice is journaled only when the store says the run
-  is published).
+  is published) and `switch_newest` (a call delivered after a newer
+  attempt wrote does nothing).
 
 **Every rule is needed.** Each rule is named, and `histories.py` holds one
 shrunk history per rule that passes with every rule on and fails with
