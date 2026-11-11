@@ -1384,7 +1384,7 @@ async def test_a_cleanup_deletes_rows_written_with_no_version(store):
 
 
 @pytest.mark.xfail(
-    strict=True, reason="also on main: a partition's version row is keyed by its text (Astra A7, B8)"
+    strict=True, reason="ERW-51, also on main: a partition's version row is keyed by its text (Astra A7, B8)"
 )
 async def test_two_spellings_of_one_partition_share_its_version_check(store):
     """Astra A7 (B8 round 1, also on main): with a bigint partition column,
