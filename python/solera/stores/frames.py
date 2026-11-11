@@ -173,7 +173,8 @@ def materialize(items: Any, t: Any, columns: list[str] | None = None):
 
         if not items and columns:
             return pa.table({c: pa.nulls(0) for c in columns})
-        return pa.Table.from_pylist(items)
+        names = dict.fromkeys(k for row in items for k in row)  # every row's columns, as a DataFrame's
+        return pa.table({n: [row.get(n) for row in items] for n in names})
     if is_frame_type(t):
         import pandas as pd
 
@@ -208,9 +209,11 @@ def served(table: Any, take: bytes | None, version: str, t: Any, names: list | N
         raise ValueError(f"Arrow cannot select rows of this table, so it cannot serve keys: {e}") from None
     if take is not None:
         table = taken
+    if not table.num_rows:  # no rows say no columns, as the dict form's
+        return materialize([], t) if names is None else {}
     if names is None:
         return materialize(table, t)
-    return {k: materialize([row], t) for k, row in zip(names, materialize(table, list), strict=True)}
+    return {k: materialize(table.slice(i, 1), t) for i, k in enumerate(names)}
 
 
 def _frame(frame: Any, name: str) -> tuple[list[str], list[list]]:

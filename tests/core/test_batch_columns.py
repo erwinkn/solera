@@ -330,3 +330,55 @@ def test_a_table_answer_keeps_its_own_column_types():
     assert served.schema == table.drop_columns(["etag"]).schema
     assert served.column("t").cast(pa.int64()).to_pylist() == [999, 1]
     assert served.column("p").to_pylist() == [[2, 3], [1]]
+
+
+def test_a_table_answer_per_key_keeps_its_values_and_types():
+    import pyarrow as pa
+    from solera.stores import frames
+
+    table = pa.table(
+        {
+            "id": pa.array(["b", "a"], pa.large_string()),
+            "n": pa.array([1, 2], pa.int32()),
+            "t": pa.array([1, 999], pa.time64("ns")),
+            "etag": ["1", "2"],
+        }
+    )
+    served = Served()
+    take, names = served.read_table(table, "id", "etag", ["a", "b"], grouped=True)
+    groups = frames.served(table, take, "etag", pa.Table, names)
+    assert list(groups) == ["a", "b"]
+    for key, row in (("a", 1), ("b", 0)):
+        assert groups[key].schema == table.drop_columns(["etag"]).schema
+        assert groups[key].column("t").cast(pa.int64()).to_pylist() == [
+            table.column("t").cast(pa.int64())[row].as_py()
+        ]
+
+
+def test_dict_rows_as_a_table_hold_every_rows_columns():
+    import pyarrow as pa
+    from solera.stores import frames
+
+    rows = [{"id": "a"}, {"id": "b", "value": 42}]
+    assert frames.materialize(rows, pa.Table).to_pylist() == [
+        {"id": "a", "value": None},
+        {"id": "b", "value": 42},
+    ]
+
+
+def test_no_rows_served_from_a_table_are_the_dict_forms_no_rows():
+    import pandas as pd
+    import pyarrow as pa
+    from solera.stores import frames
+
+    table = pa.table({"id": ["a", "b"], "n": [1, 2], "etag": ["1", "2"]})
+    for t in (list, pd.DataFrame, pa.Table):
+        take, _ = Served().read_table(table, "id", "etag", ["missing"])
+        wanted, _ = Served().read({"a": Loaded({"id": "a", "n": 1}, version="1")}, ["missing"], Loaded)
+        got, want = frames.served(table, take, "etag", t), frames.materialize(wanted, t)
+        if t is pd.DataFrame:
+            pd.testing.assert_frame_equal(got, want)
+        else:
+            assert got == want
+    take, names = Served().read_table(table, "id", "etag", ["missing"], grouped=True)
+    assert frames.served(table, take, "etag", pa.Table, names) == {}

@@ -485,6 +485,9 @@ DataFrame, a `pa.Table`); a key with no row was served absent; rows of keys
 not asked are dropped. A `pa.Table` parameter gets the table's own column
 types; a DataFrame is the one the dict form's rows make, dtypes included
 (built column by column from the table's values, pandas metadata ignored).
+A per-key parameter (`dict[str, pa.Table]`) gets each key's row as a
+one-row slice of the table. No rows served are the dict form's no rows,
+whatever `t`: an empty list, DataFrame or table with no columns.
 Rows are selected with Arrow's `take`, which keeps every value as it is;
 a table with a column Arrow cannot take (pyarrow 25: string and binary
 views, alone or nested) fails the load whatever keys are asked: cast such
