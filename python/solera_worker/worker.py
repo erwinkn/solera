@@ -1503,7 +1503,8 @@ async def run_pool(pool: str, server: str, token: str | None = None, *, project:
     pool's routes and nothing else.
 
     Each attempt runs in a child forked from a forkserver — a process that
-    has imported the framework and nothing else, and started no thread —
+    has imported the framework and warmed its HTTP client (warm.py), and
+    nothing else, and started no thread —
     and imports the project itself: no project code's threads or locks are
     ever forked half-held. The child is the attempt's own process: a forced
     cancel ends it, and with it any thread the attempt left running. (This
@@ -1541,14 +1542,14 @@ LOST = 4  # the exit code of an attempt that could not publish: the engine treat
 
 
 def _attempts():
-    """Where pool attempts start: a forkserver with the framework imported,
-    never the project — project code may start threads or hold locks a
-    fork would copy without them."""
+    """Where pool attempts start: a forkserver with the framework imported
+    and its HTTP client warmed (warm.py), never the project — project code
+    may start threads or hold locks a fork would copy without them."""
 
     import multiprocessing
 
     context = multiprocessing.get_context("forkserver")
-    context.set_forkserver_preload(["solera_worker.worker"])
+    context.set_forkserver_preload(["solera_worker.worker", "solera_worker.warm"])
     return context
 
 

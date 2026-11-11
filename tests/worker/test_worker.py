@@ -380,6 +380,87 @@ async def test_a_pool_attempt_runs_in_a_child_of_the_warm_worker(state, tmp_path
     assert detail["request"]["status"] == "succeeded"
 
 
+FORKSERVER_PROBE = """
+import json, os, sys
+from solera_worker.worker import _attempts
+
+
+def child(conn):
+    from solera_worker import channel
+
+    spare = len(channel._spare)
+    imported = [name in sys.modules for name in ("httpx", "httpcore._backends.anyio", "anyio._backends._asyncio")]
+    tasks = f"/proc/{os.getppid()}/task"
+    threads = len(os.listdir(tasks)) if os.path.isdir(tasks) else None
+    contexts = None
+    if spare:
+        first, second = channel.HttpTransport("https://engine", None), channel.HttpTransport("https://engine", None)
+        pools = [t.client._transport._pool for t in (first, second)]
+        pools += [t.async_client._transport._pool for t in (first, second)]
+        contexts = len({id(pool._ssl_context) for pool in pools})
+    conn.send([spare, imported, threads, contexts, len(channel._spare)])
+
+
+if __name__ == "__main__":
+    context = _attempts()
+    ours, theirs = context.Pipe()
+    process = context.Process(target=child, args=(theirs,))
+    process.start()
+    print(json.dumps(ours.recv()))
+    process.join()
+"""
+
+
+@pytest.mark.parametrize("warm", ["warm", "warm-up fails"])
+def test_a_pool_attempt_inherits_a_warmed_http_client_and_never_shares_an_ssl_context(tmp_path, warm):
+    """ERW-36: the pool's forkserver imports httpx and its transports and
+    builds two SSL contexts that an attempt forked from it takes, and stays
+    a process of one thread. Every client has its own context (httpcore
+    writes a context's ALPN on each connection). A failed warm-up leaves the
+    forkserver serving attempts that do the work themselves."""
+
+    import subprocess
+    import sys
+
+    probe = tmp_path / "probe.py"
+    probe.write_text(FORKSERVER_PROBE)
+    env = {**os.environ, "PYTHONPATH": os.pathsep.join(sys.path)}
+    if warm == "warm-up fails":
+        env["SSL_CERT_FILE"] = str(tmp_path / "missing.pem")
+    done = subprocess.run([sys.executable, str(probe)], capture_output=True, text=True, timeout=60, env=env)
+    assert done.returncode == 0, done.stderr
+    spare, imported, threads, contexts, left = json.loads(done.stdout.strip().splitlines()[-1])
+    assert imported == [True, True, True]
+    assert threads in (1, None)
+    if warm == "warm":
+        assert (spare, contexts, left) == (2, 4, 0)
+    else:
+        assert (spare, contexts) == (0, None)
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="pre-existing: the project loader trusts a bytecode cache keyed on mtime and size, "
+    "while the deploy digest hashes the source (found in ERW-36's review)",
+)
+def test_an_edit_of_the_same_size_within_a_second_runs_the_new_code(tmp_path):
+    """A process importing a project after its source changed runs the new
+    source, even when the edit kept its size and its mtime second."""
+
+    import subprocess
+    import sys
+
+    path = tmp_path / "proj.py"
+    show = "import sys; sys.path.insert(0, sys.argv[2]); from solera_worker.worker import _load_module; from pathlib import Path; print(_load_module(Path(sys.argv[1])).VERSION)"
+    path.write_text("VERSION = 1\n")
+    mtime = path.stat().st_mtime_ns
+    run = [sys.executable, "-c", show, str(path), str(tmp_path)]
+    assert subprocess.run(run, capture_output=True, text=True, check=True).stdout.strip() == "1"
+    path.write_text("VERSION = 2\n")
+    os.utime(path, ns=(mtime, mtime))
+    assert subprocess.run(run, capture_output=True, text=True, check=True).stdout.strip() == "2"
+
+
 def test_a_worker_of_plain_rows_imports_no_dataframe_library(tmp_path):
     """A project whose outputs are lists of dicts — keyed, batched, a value —
     runs in workers that never import pandas, pyarrow or duckdb, nor the
