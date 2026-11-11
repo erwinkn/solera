@@ -621,26 +621,33 @@ async def test_a_trigger_added_during_a_full_run_refuses_its_publication(store):
     assert outside(store, out) == {"a": "old"} and registry(store, out) == (5, None, [5])
 
 
-async def test_a_trigger_committed_as_the_switch_begins_refuses_it(store, monkeypatch):
-    """Sol R2-3: a trigger committed after the switch began, before its
-    DELETE locks the table, fires on its rows; the switch reads the catalog
-    after them, so it sees the trigger, and refuses the publication whole.
-    One committed after that waits for the switch to commit."""
+async def test_a_trigger_cannot_be_added_while_the_switch_publishes(store, monkeypatch):
+    """Sol R2-3: the switch takes the lock its DELETE takes before it reads
+    the catalog, so a trigger created as it publishes waits for it to
+    commit, and never fires on its rows."""
 
     out = output(incremental=True)
     table, _, _ = store._table(out)
     first = await store.store(rows(a="old"), None, at(out, 1))
     run = await store.store(rows(a="new"), first.ref, at(out, 5, reset=True))
-    delete = store._delete_slice
+    delete, created = store._delete_slice, []
 
     def and_a_trigger(cur, target, where):
-        make_trigger(table, f"public.{out.name}_mark", "NEW.id = upper(NEW.id); RETURN NEW;")
+        thread = threading.Thread(
+            target=make_trigger,
+            args=(table, f"public.{out.name}_mark", "NEW.id = upper(NEW.id); RETURN NEW;"),
+        )
+        thread.start()
+        thread.join(1)
+        created.append((thread, thread.is_alive()))
         delete(cur, target, where)
 
     monkeypatch.setattr(store, "_delete_slice", and_a_trigger)
-    with pytest.raises(PublicationRefused, match="trigger or rule"):
-        await store.full_run_ended(out, "", 5, 5)
-    assert outside(store, out) == {"a": "old"} and await solera(store, run.ref) == {"a": "new"}
+    assert await store.full_run_ended(out, "", 5, 5)
+    thread, waited = created[0]
+    thread.join(10)
+    assert waited and not thread.is_alive()
+    assert outside(store, out) == await solera(store, run.ref) == {"a": "new"}
 
 
 async def test_a_build_keeps_only_its_unique_and_key_indexes(store):
@@ -1053,6 +1060,59 @@ async def test_a_build_lost_with_its_table_fails_its_runs_writes(store):
         await store.store(Patch(rows(b="6")), None, at(other, 7, run=5))
 
 
+async def test_a_lost_run_the_log_names_stays_lost_after_a_new_run_dies(store):
+    """Sol R3-1: run 5 committed, then its build was lost. A new full run's
+    first attempt (8) writes and dies before its commit: the log still names
+    run 5, so its loads and its repair's writes still fail (`RunLost`),
+    never read or patch the published rows the log does not hold."""
+
+    from solera.stores import RunLost
+
+    out = output(incremental=True)
+    old = await store.store(rows(z="old"), None, at(out, 1))
+    committed = await store.store(rows(a="5"), old.ref, at(out, 5, reset=True))
+    await store.migrate(out, [Migration("touch", "SELECT 1")], at(out, 6, run=5), committed.ref)
+    await store.store(rows(x="8"), committed.ref, at(out, 8, reset=True, run=5))
+    with pytest.raises(RunLost):
+        await solera(store, committed.ref)
+    with pytest.raises(RunLost):
+        await store.written_at([8], committed.ref, at(out, 9, run=5))
+    with pytest.raises(RunLost):
+        await store.store(Patch(rows(b="9")), committed.ref, at(out, 9, run=5))
+    assert outside(store, out) == {"z": "old"}
+
+
+async def test_a_trigger_that_raises_added_during_a_run_refuses_its_publication(store):
+    """Sol R3-2: the switch reads the catalog before its rows, under the lock
+    its DELETE takes, so a trigger that would raise refuses the publication
+    rather than fail it with the trigger's error."""
+
+    out = output(incremental=True)
+    table, _, _ = store._table(out)
+    old = await store.store(rows(z="old"), None, at(out, 1))
+    await store.store(rows(a="new"), old.ref, at(out, 5, reset=True))
+    make_trigger(table, f"public.{out.name}_mark", "RAISE EXCEPTION 'guard'; RETURN NEW;")
+    with pytest.raises(PublicationRefused, match="trigger or rule"):
+        await store.full_run_ended(out, "", 5, 5)
+    assert outside(store, out) == {"z": "old"}
+
+
+async def test_disabled_and_replica_triggers_and_rules_do_not_refuse_a_build(store):
+    """Sol R3-3: what an ordinary session's INSERT or DELETE cannot run does
+    not refuse a build."""
+
+    out = output(incremental=True)
+    table, _, _ = store._table(out)
+    old = await store.store(rows(z="old"), None, at(out, 1, builds=False))
+    sql(f"CREATE RULE guard AS ON DELETE TO {table} DO ALSO NOTIFY solera_mark")
+    sql(f"ALTER TABLE {table} DISABLE RULE guard")
+    make_trigger(table, f"public.{out.name}_mark", "NEW.v = NEW.v || '+'; RETURN NEW;")
+    sql(f"ALTER TABLE {table} ENABLE REPLICA TRIGGER mark")
+    run = await store.store(rows(a="new"), old.ref, at(out, 5, reset=True))
+    assert await store.full_run_ended(out, "", 5, 5)
+    assert await solera(store, run.ref) == outside(store, out) == {"a": "new"}
+
+
 async def test_a_partition_cleanup_holds_off_the_partitions_first_writer(store, monkeypatch):
     """Sol R2-1: a cleanup of a partition no version row lists yet locks a
     row of its own for it, so the partition's first writer waits for the
@@ -1139,7 +1199,7 @@ async def test_a_migration_drops_the_builds_and_their_run_starts_over(store):
     assert await store.full_run_ended(out, "", 5, 7) is False
     assert registry(store, out)[2] == [5] and outside(store, out) == {"a": "1"}
     again = await store.store([{"id": "a", "v": "8", "n": 10}], first.ref, at(out, 8, reset=True, run=5))
-    assert registry(store, out)[2] == [8]
+    assert registry(store, out)[2] == [5, 8]  # the log names run 5 until run 8 commits
     assert await store.full_run_ended(out, "", 8, 8)
     assert await solera(store, again.ref) == {"a": "8"}
 
@@ -1178,8 +1238,9 @@ async def test_a_build_lost_by_a_restore_fails_its_runs_writes_and_is_not_publis
         await store.store(Patch(rows(b="6")), first.ref, at(out, 7, run=5))
     assert registry(store, out)[2] == [5] and outside(store, out) == {"a": "1"}
     again = await store.store(rows(a="8"), first.ref, at(out, 8, reset=True, run=5))
-    assert registry(store, out)[2] == [8]
+    assert registry(store, out)[2] == [5, 8]  # lost, while the log names it: run 8 has not committed
     assert await store.full_run_ended(out, "", 8, 8) and await solera(store, again.ref) == {"a": "8"}
+    assert registry(store, out)[2] == []
 
 
 async def test_a_load_of_a_lost_builds_commit_fails_rather_than_read_the_published_rows(store, monkeypatch):

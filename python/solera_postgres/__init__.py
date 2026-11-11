@@ -157,7 +157,7 @@ def _build_name(table: str, partition: str, run: int) -> str:
 # (pg_partition_tree lists a partitioned table and its partitions, and nothing for a plain table.)
 _TRIGGERED = """EXISTS (SELECT 1 FROM pg_trigger t WHERE NOT t.tgisinternal AND t.tgtype & 12 <> 0
     AND t.tgenabled IN ('O', 'A') AND t.tgrelid IN (SELECT {rel} UNION ALL SELECT relid FROM pg_partition_tree({rel})))
-  OR EXISTS (SELECT 1 FROM pg_rewrite w WHERE w.ev_type IN ('3', '4')
+  OR EXISTS (SELECT 1 FROM pg_rewrite w WHERE w.ev_type IN ('3', '4') AND w.ev_enabled IN ('O', 'A')
     AND w.ev_class IN (SELECT {rel} UNION ALL SELECT relid FROM pg_partition_tree({rel})))"""
 
 # What the catalog holds of a table, read in a write's first round trip (`_begin`).
@@ -669,7 +669,7 @@ class PostgresStore:
                 "in place"
             )
         keep = {context.build_run, at.run}
-        at.builds = [b for b in at.builds if b in keep and b not in lost] + ([at.run] if at.opens else [])
+        at.builds = [b for b in at.builds if b in keep] + ([at.run] if at.opens else [])
         at.pending = [b for b in at.pending if b in keep and not (at.opens and b == at.run)]
         kept = {_build_name(table, context.partition, b) for b in at.builds}
         at.retired = any(name not in kept for name in built)
@@ -899,7 +899,8 @@ class PostgresStore:
         check's version. A constraint only the published rows can check
         refuses the publication whole (`PublicationRefused`), and so does a
         trigger or rule added since the run began that an INSERT or a DELETE
-        runs (`_aim`), read after the rows, so none can slip in between. The
+        runs (`_aim`), read under the lock its DELETE takes, so none can be
+        added in between, and again after the rows. The
         build's
         table is dropped after, by a sweep. Idempotent; it may take minutes,
         and sets no statement timeout. `prior` (the committed head) and
@@ -943,6 +944,11 @@ class PostgresStore:
                     ]
                     cur.execute("SET LOCAL statement_timeout = 0")
                     if present:
+                        # The lock the DELETE takes, on every partition, first: no trigger or rule can be
+                        # added or enabled until this commits, so the catalog read next is the one the
+                        # rows meet, before any of them runs.
+                        cur.execute(f"LOCK TABLE {table} IN ROW EXCLUSIVE MODE")
+                        self._refuse_triggered(cur, output, partition, table)
                         self._delete_slice(cur, table, {column: partition} if column else {})
                     if run in found["builds"]:
                         columns = ", ".join(
@@ -956,14 +962,8 @@ class PostgresStore:
                         cur.execute(
                             f"INSERT INTO {table} ({columns}) OVERRIDING SYSTEM VALUE SELECT {columns} FROM {build}"
                         )
-                    # After the rows: a trigger committed since holds off until this commits.
-                    if present and cur.execute(_TRIGGERS, {"t": table}).fetchone()["triggered"]:
-                        raise PublicationRefused(
-                            f"{output.name} {partition!r}: {table} has a trigger or rule that an INSERT or a "
-                            "DELETE runs, added after the full run began: publishing would run it on rows "
-                            "Solera has read, so the published rows stay as they were. Drop it, or write "
-                            "the output in place"
-                        )
+                    if present:  # and after them: a partition attached meanwhile takes no lock it waits for
+                        self._refuse_triggered(cur, output, partition, table)
                     cur.execute(
                         f"UPDATE {VERSIONS_TABLE} SET published = %s, "
                         "builds = ARRAY(SELECT b FROM unnest(builds) AS b WHERE b > %s), "
@@ -979,6 +979,14 @@ class PostgresStore:
             ) from e
         self._sweep(table, partition)
         return published
+
+    def _refuse_triggered(self, cur, output, partition, table) -> None:
+        if cur.execute(_TRIGGERS, {"t": table}).fetchone()["triggered"]:
+            raise PublicationRefused(
+                f"{output.name} {partition!r}: {table} has a trigger or rule that an INSERT or a DELETE "
+                "runs, added after the full run began: publishing would run it on rows Solera has read, "
+                "so the published rows stay as they were. Drop it, or write the output in place"
+            )
 
     # -- writes ---------------------------------------------------------------
 
