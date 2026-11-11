@@ -111,12 +111,17 @@ impl Tracking {
             .iter()
             .map(|p| unsettled(self, &p.output, p.head))
             .collect::<Result<Vec<bool>>>()?;
-        let mut batch: Vec<&Key> = plan
-            .inputs
-            .iter()
-            .flat_map(|p| p.keys.iter().map(|c| &c.key))
-            .collect();
-        batch.sort_unstable();
+        // With one input the batch is its keys, so every key was taken.
+        let mut batch: Vec<&Key> = match plan.inputs.len() {
+            1 => Vec::new(),
+            _ => plan
+                .inputs
+                .iter()
+                .flat_map(|p| p.keys.iter().map(|c| &c.key))
+                .collect(),
+        };
+        // each input's keys are a sorted run, which the stable sort merges
+        batch.sort();
         batch.dedup();
         let unsure: Vec<Vec<&Key>> = plan
             .inputs
