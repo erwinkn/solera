@@ -8,8 +8,11 @@ from __future__ import annotations
 import inspect
 from collections.abc import Mapping
 
+from solera._native import Served
 from solera.sdk import Loaded, Source, is_ref_type
 from solera.stores import MISSING, Keys, StoreError, by_key_type, frames
+
+from .batch import KeyVersions
 
 
 class SourceContext:
@@ -22,15 +25,19 @@ class SourceContext:
 class SourceLoader:
     """A source read through its loader, shaped as a store's `load`: its rows
     as the parameter's type asks, and in `served` the version each key was
-    served at (None: it had none), across every load of this reader."""
+    served at (None: it had none), across every load of this reader. The
+    loader's answer is read once, in one native call (`Served.read`)."""
 
     def __init__(self, source: Source, store=None):
-        self.source, self.store, self.served = source, store, {}
+        self.source, self.store, self.served = source, store, Served()
 
     async def load(self, ref, t, selection):
         if is_ref_type(t):
             return ref
-        keys = sorted(selection.generations) if isinstance(selection, Keys) else None
+        keys = None
+        if isinstance(selection, Keys):
+            generations = selection.generations
+            keys = generations.sorted() if isinstance(generations, KeyVersions) else sorted(generations)
         ctx = SourceContext(self.source.name, ref.partition or "")
         load = self.source.loader if self.source.loader is not None else self.store.serve
         answer = load(keys, ctx) if self.source.loader is not None else load(self.source, keys, ctx)
@@ -42,23 +49,18 @@ class SourceLoader:
             raise StoreError(
                 f"source {self.source.name!r}: a keyed loader returns {{key: Loaded(row, version=…)}}"
             )
-        groups: dict[str, list] = {}
-        for key in answer if keys is None else keys:
-            loaded = answer.get(key)
-            if loaded is None:  # observed absent
-                self.served[key] = None
-                continue
-            if not isinstance(loaded, Loaded) or loaded.version is None:
-                raise StoreError(
-                    f"source {self.source.name!r}: key {key!r} came without the version it was served at: "
-                    "return Loaded(row, version=…)"
-                )
-            self.served[key] = str(loaded.version)
-            groups[key] = loaded.value if isinstance(loaded.value, list) else [loaded.value]
         inner = by_key_type(t)
+        rows, bad = self.served.read(answer, keys, Loaded, grouped=inner is not MISSING)
+        if bad is not None:
+            raise StoreError(
+                f"source {self.source.name!r}: key {bad[0]!r} came without the version it was served at: "
+                "return Loaded(row, version=…)"
+            )
         if inner is not MISSING:  # dict[str, T]: each key's group, as T
-            return {k: frames.materialize(rows, inner) for k, rows in groups.items()}
-        return frames.materialize([row for rows in groups.values() for row in rows], t)
+            if not frames.is_frame_type(inner):
+                return rows
+            return {k: frames.materialize(group, inner) for k, group in rows.items()}
+        return frames.materialize(rows, t)
 
 
 def reader(project, ref):
