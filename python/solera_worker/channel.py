@@ -17,16 +17,20 @@ raises `Ended` when the engine says the attempt is over for this worker
 from __future__ import annotations
 
 import asyncio
-import functools
 
 from solera.lifecycle import Ended
 
+_spare = []  # SSL contexts built ahead (warm.py), each to be handed to one client
 
-@functools.cache
+
 def _ssl_context():
-    """One SSL context for every client of the process: each costs a read of
-    the CA bundle (about 13 ms), and a forkserver's children inherit it."""
+    """A client's own SSL context: httpcore sets its ALPN on every connection,
+    so a context two clients share is written by one thread while another
+    reads it. Each costs a read of the CA bundle (about 13 ms), so the pool's
+    forkserver builds an attempt's two ahead and its children take them."""
 
+    if _spare:
+        return _spare.pop()
     import httpx
 
     return httpx.create_ssl_context()
@@ -40,11 +44,15 @@ class HttpTransport:
         import httpx
 
         headers = {"Authorization": f"Bearer {token}"} if token else {}
-        kw = {"base_url": url.rstrip("/"), "headers": headers, "timeout": timeout, "verify": _ssl_context()}
+        kw = {"base_url": url.rstrip("/"), "headers": headers, "timeout": timeout}
         if transport is not None:
             kw["transport"] = transport
-        self.client = httpx.Client(**kw)  # for the reporting thread's beats
-        self.async_client = httpx.AsyncClient(**kw)
+
+        def verify():
+            return _ssl_context() if transport is None else True
+
+        self.client = httpx.Client(**kw, verify=verify())  # for the reporting thread's beats
+        self.async_client = httpx.AsyncClient(**kw, verify=verify())
 
     def send(self, method: str, path: str, **kw):
         return self.client.request(method, path, **kw)

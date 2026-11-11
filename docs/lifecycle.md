@@ -1164,9 +1164,9 @@ control file:
   attempt from discovery and ends it; after it, cancel is §7.
 - **One process per attempt.** A pool worker runs each attempt it gets in
   a child forked from a forkserver that imported the framework and warmed
-  what an attempt's HTTP client needs (httpx, its transports, and the one
-  SSL context every client shares, about 90 ms an attempt would otherwise
-  pay), and nothing else: it starts no thread and never uses the object
+  what an attempt's HTTP client needs (httpx, its transports, and the two
+  SSL contexts the attempt's clients take, one each: about 90 ms an attempt
+  would otherwise pay), and nothing else: it starts no thread and never uses the object
   store, so forking from it is safe on any OS (the worker itself has
   threads: fork copies only the forking one, which macOS does not
   survive). The child imports
