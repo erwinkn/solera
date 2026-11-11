@@ -139,6 +139,8 @@ class State:
             writer=writer,
             format=format,
         )
+        if (journal.format == CORE_FORMAT) != (model.core is not None):  # a fresh namespace took `format`
+            model.restore(None, core=journal.format == CORE_FORMAT)
         return cls(
             store,
             url=url,

@@ -389,20 +389,29 @@ impl Tracking {
     /// Whether `output` holds at its head a key after `after` that
     /// `patterns` (`solera.patterns.spec(…)`) take: a scan of its attached
     /// index, a page at a time, stopping at the first such key. Nothing
-    /// crosses per key; False before its first commit.
-    #[pyo3(signature = (output, patterns=None, after=None))]
+    /// crosses per key; False before its first commit. With `edge`, a key
+    /// that edge holds a point for (a key list processed it) does not count.
+    #[pyo3(signature = (output, patterns=None, after=None, edge=None))]
     fn taken(
         &self,
         py: Python<'_>,
         output: &[u8],
         patterns: Option<&Bound<'_, PyAny>>,
         after: Option<String>,
+        edge: Option<Vec<u8>>,
     ) -> PyResult<bool> {
         guard(|| {
             let matcher = KeyMatcher::new(patterns)?;
-            let Some(o) = self.state.read().unwrap().outputs.get(output).cloned() else {
+            let (o, progress) = {
+                let state = self.state.read().unwrap();
+                let progress =
+                    edge.and_then(|e| state.edges.get(e.as_slice()).map(|e| e.progress.clone()));
+                (state.outputs.get(output).cloned(), progress)
+            };
+            let Some(o) = o else {
                 return Ok(false);
             };
+            let points = progress.as_deref().and_then(tr::progress::Progress::keyed);
             let ixs = self.indexes.read().unwrap().clone();
             py.detach(|| {
                 rt().block_on(async {
@@ -416,7 +425,9 @@ impl Tracking {
                         let mut found = false;
                         let next = ix
                             .state_with(&o.layers, o.head, None, &q, |k, _, _, _| {
-                                found = found || matcher.takes(k)
+                                found = found
+                                    || (matcher.takes(k)
+                                        && points.is_none_or(|p| p.point(k).is_none()))
                             })
                             .await
                             .map_err(tr::Error::Index)?;

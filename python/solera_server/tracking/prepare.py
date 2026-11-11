@@ -20,7 +20,9 @@ import math
 
 from solera._native import Tracking
 
-from . import WALK, Core, b64, canonical
+from . import WALK, Core, Generation, Redeployed, b64, canonical
+from .commit import HeldBack
+from .full import dynamic_sets, held
 
 
 def conditions(engine, input, base: dict) -> dict:
@@ -66,12 +68,42 @@ def open_edges(core: Core, task: dict, keyed: list) -> dict:
 
 
 async def prepare(core: Core, task: dict, run: dict, attempt: str | None) -> dict:
-    """An attempt's preparation on the new path: `Engine._prepare`'s result,
-    with the plan's bytes under `plan` (kept out of the journal)."""
+    """`_prepare` under one deploy (`Generation`): a deploy while it planned
+    starts it again, so what it read by name is of the deploy it returns
+    under."""
 
-    engine = core.engine
-    deploy = engine.m.deploy_number
+    while True:
+        generation = Generation(core.m)
+        try:
+            with generation:
+                prepared = await _prepare(core, task, run, attempt)
+            generation.check()
+            return prepared
+        except Redeployed:
+            if not generation.moved:
+                raise
+            continue
+
+
+async def _prepare(core: Core, task: dict, run: dict, attempt: str | None) -> dict:
+    """An attempt's preparation on the new path: `Engine._prepare`'s result,
+    with the plan's bytes under `plan` (kept out of the journal), and under
+    `gate` every upstream head it reads, `[output, partition, commit]`: a
+    whole input's as pinned, a keyed input's as planned, an unkeyed input's
+    planned end. A partial one sends it back to wait (`HeldBack`); its commit
+    checks them again (`full.held`)."""
+
+    engine, m = core.engine, core.m
     base = engine._pin_inputs(task, run)
+    heads = []
+    for input in base["inputs"]:  # in the step that pinned them: the heads the pins name
+        if input.kind == "in":
+            parts = base["planner"].fan_in(input, materialized=True) if input.fan_in else (input.partition,)
+            heads += [[input.output, p, m.axis_head(input.output, p), m.life(input.output, p)] for p in parts]
+            if input.fan_in:  # which partitions it reads: each dynamic dimension's set output says
+                heads += [[s, "", m.axis_head(s, ""), m.life(s, "")] for s in dynamic_sets(input)]
+    if (why := held(m, heads)) is not None:
+        raise HeldBack(f"{why[0]}: {why[1]}")
     # With incremental inputs, a run starts over as today's path decides (`_full_run`): a full
     # run's first batch, a definition other than the partition was built under, an input reset.
     if base["incremental"]:
@@ -81,6 +113,8 @@ async def prepare(core: Core, task: dict, run: dict, attempt: str | None) -> dic
     keyed = [i for i in base["incremental"] if engine._keyed(i)]
     unkeyed = [i for i in base["incremental"] if not engine._keyed(i)]
     refuse(engine, task, run, keyed)
+    if any(restarted(core, task, i) for i in keyed):  # an upstream's new life is read in full, from the start
+        full = base["full"] = True
     progress = {} if full else task.get("progress") or {}
     plans, all_empty, plan_bytes = {}, True, None
     for input in unkeyed:  # by commit numbers, as today
@@ -89,6 +123,8 @@ async def prepare(core: Core, task: dict, run: dict, attempt: str | None) -> dic
         o = engine._commits(input, record, mine, full)
         pin, plan, empty = engine._commits_pin(input, engine._pin_at(input.output, input.partition), o)
         pins[input.param], plans[input.param] = pin, plan
+        if not plan.get("done"):  # the commit its walk goes to: pages before it are the walk's own
+            heads.append([input.output, input.partition, o["head"], m.life(input.output, input.partition)])
         all_empty = all_empty and empty
     mine = progress.get(WALK)
     if keyed and mine is not None and mine["key"] is None:  # walked to the end in this task
@@ -105,8 +141,10 @@ async def prepare(core: Core, task: dict, run: dict, attempt: str | None) -> dic
         edges = open_edges(core, task, keyed)
         core.attach(*(core.m.core_edges[(task["asset"], task["partition"], i.param)][1] for i in keyed))
         after = (mine or {}).get("key")
+        mode, named = run_mode(run, keyed)
         request = {
-            "mode": "incremental",
+            "mode": mode,
+            "keys": named,
             "reset": full,
             "after": after,
             "limit": min(int(i.spec["batch_size"]) for i in keyed),
@@ -120,27 +158,34 @@ async def prepare(core: Core, task: dict, run: dict, attempt: str | None) -> dic
         index = 0 if mine is None else int(mine["batch"]) + 1
         for n, input in enumerate(keyed):
             found = summary["inputs"][n]
-            # Each input's own walk ends once it owes nothing past the batch (a full run: holds
-            # nothing past it), though the others' go on.
+            heads.append(
+                [input.output, input.partition, found["head"], m.life(input.output, input.partition)]
+            )
+            # The walk ends where the plan says (`hi` None). The worker is told each input's
+            # own end too: it owes nothing past the batch (a full run: holds nothing past it),
+            # though the others' go on.
             final = hi is None
-            if not final and len(keyed) > 1:
-                final = not await _more(
+            own = final
+            if not final and len(keyed) > 1 and mode == "incremental":
+                own = not await _more(
                     core, input, edges[input.param], conditions(engine, input, base), hi, full
                 )
             upstream = core.m.core_output(input.output, input.partition)
             size = int(input.spec["batch_size"])
             live = (upstream or {}).get("live", 0)
-            count = index + 1 if final else max(index + 2, math.ceil(live / size))
+            count = index + 1 if own else max(index + 2, math.ceil(live / size))
             pins[input.param] = {
                 "ref": engine._pin_at(input.output, input.partition),
                 "core": n,
-                "batch": {"index": index, "count": count, "final": final, "reset": full},
+                "batch": {"index": index, "count": count, "final": own, "reset": full},
             }
             plans[input.param] = {
                 "kind": "core",
                 "core": n,
+                "mode": mode,
                 "output": input.output,
                 "upstream_partition": input.partition,
+                "edge": edges[input.param],  # what the batch's progress names as the walk's (`restarted`)
                 "head": found["head"],
                 "index": index,
                 "count": count,
@@ -151,11 +196,12 @@ async def prepare(core: Core, task: dict, run: dict, attempt: str | None) -> dic
                 "classes": found["counts"],
             }
             all_empty = all_empty and not found["keys"]
-    if engine.m.deploy_number != deploy:  # redeployed while it planned: prepared under one deploy only
-        return await prepare(core, task, run, attempt)
+    if (why := held(m, heads)) is not None:  # a head it planned on is partial
+        raise HeldBack(f"{why[0]}: {why[1]}")
     more = any(not (p["final"] or p.get("done")) for p in plans.values())
     skip = bool(base["incremental"]) and all_empty and not more and not full
     prepared = engine._prepared(task, run, attempt, base, plans, more, skip, None)
+    prepared["gate"] = heads
     if plan_bytes is not None:
         prepared["plan"] = plan_bytes
         if attempt is not None:
@@ -163,10 +209,34 @@ async def prepare(core: Core, task: dict, run: dict, attempt: str | None) -> dic
     return prepared
 
 
+def restarted(core: Core, task: dict, input) -> bool:
+    """Whether a keyed input must start over. A task's walk goes on only over
+    the edge it walked, which its progress names: a deploy that closed it (a
+    reset of either side, a rebind) starts the walk over, whatever another
+    run committed since. A task with no walk yet starts over if what the
+    partition's committed progress reads (`Model.core_read`, which only a
+    commit writes) is an upstream life that is gone, or nothing though the
+    partition has committed (a job, with no output, has only its record) or
+    one of the asset's outputs still holds content to clear (a reset of a
+    sibling output clears the record, not the content)."""
+
+    m, asset, partition = core.m, task["asset"], task["partition"]
+    edge = m.core_edges.get((asset, partition, input.param))
+    if (mine := (task.get("progress") or {}).get(WALK)) is not None:
+        walked = (mine.get("edges") or {}).get(input.param)
+        return walked is None or edge is None or walked != edge[0]
+    read = m.core_read.get((asset, partition, input.param))
+    if read is None:
+        outputs = (m.manifest["assets"].get(asset) or {}).get("outputs") or ()
+        return "definition" in m.partition(asset, partition) or any(
+            (o["name"], partition) in m.heads for o in outputs
+        )
+    return read != m.core_outputs.get((input.output, input.partition))
+
+
 def refuse(engine, task: dict, run: dict, keyed: list) -> None:
     """What the new path does not run yet, refused for good with why: per-key
-    assets (B6), stores that write in place (B8), and the run modes PR 2 of
-    B5 adds."""
+    assets (B6) and stores that write in place (B8)."""
 
     from ..engine import NonRetryable
 
@@ -182,8 +252,6 @@ def refuse(engine, task: dict, run: dict, keyed: list) -> None:
                 f"output {output['name']!r}: keyed outputs on stores that write in place do not run on "
                 "the new tracking core yet (build plan B8)"
             )
-    if run.get("keys"):
-        raise NonRetryable("key-list and all-keys runs do not run on the new tracking core yet (B5, PR 2)")
 
 
 async def _more(core: Core, input, edge: str, conds: dict, hi: str, full: bool) -> bool:
@@ -196,3 +264,17 @@ async def _more(core: Core, input, edge: str, conds: dict, hi: str, full: bool) 
         return await taken_after(core, input, hi)
     rows, _ = await core.run(core.tracking.owed, edge.encode(), conds, after=hi, limit=1)
     return bool(rows)
+
+
+def run_mode(run: dict, keyed: list) -> tuple[str, list[str]]:
+    """What a run asks of its keyed inputs (`keys=`, per upstream output): every
+    key, the rest unchanged ("all"); the keys listed ("keys"); or what is
+    owed. A batch's keys are one set across its keyed inputs, so the lists
+    of several are one list, and "all" on any is "all" on every one."""
+
+    asked = [(run.get("keys") or {}).get(i.output) for i in keyed]
+    if any(a == "all" for a in asked):
+        return "all", []
+    if any(isinstance(a, list) for a in asked):
+        return "keys", sorted({k for a in asked if isinstance(a, list) for k in a})
+    return "incremental", []
