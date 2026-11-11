@@ -36,8 +36,10 @@ pub struct Record {
     pub reset: bool,
     pub range: KeyRange,
     pub head: u64,
-    /// The input's life ([crate::Output::life]) the batch read: 0 at head 0.
-    /// A commit number names a version only within its life.
+    /// The input's life ([crate::Output::life]) at commit, 0 when it had
+    /// none: every version the batch planned or loaded is of it, since the
+    /// input is not retired while the edge reads it and the commit refuses a
+    /// plan of another life. A commit number names a version only within it.
     pub life: u64,
     pub conditions: Arc<Conditions>,
     /// The progress the batch replaced: its range's slice, or with a reset all of it.

@@ -359,6 +359,312 @@ fn random_histories() {
     eprintln!("{steps} steps over {seeds} histories; batches planned by mode (incremental, all, keys, full): {planned:?}");
 }
 
+fn commit_part(output: &str, layer: &LayerRef, live: u64) -> Part {
+    Part::OutputCommit(solera_tracking::commit::OutputCommit {
+        output: key(output),
+        layer: layer.clone(),
+        live,
+        ends_full_run: false,
+    })
+}
+
+fn held_plan_request() -> Request {
+    Request {
+        mode: Mode::Incremental,
+        reset: false,
+        after: None,
+        limit: 10,
+        inputs: vec![InputRequest {
+            edge: key("e"),
+            conditions: Arc::default(),
+            own: Some(key("own")),
+        }],
+        unkeyed: vec![],
+    }
+}
+
+/// A batch planned before its input's first commit can load what that
+/// commit wrote (Sol, round 6): its record names the input's life at
+/// commit, so once the input is retired its lineage is retired, never a
+/// version of another life.
+#[test]
+fn a_batch_planned_before_its_input_started_names_the_life_it_loaded() {
+    let rt = runtime();
+    let ix = index(&rt);
+    rt.block_on(async {
+        let mut t = Tracking::new();
+        let mut own = Log::new("own");
+        own.commit(&ix, &mut t, [(key("k"), Ver::Int(90))].into())
+            .await;
+        apply(
+            &mut t,
+            vec![Part::EdgeOpen(EdgeOpen {
+                edge: key("e"),
+                input: key("items"),
+                keyed: true,
+            })],
+        );
+        apply(
+            &mut t,
+            vec![Part::Reset(Reset {
+                edge: key("e"),
+                held: true,
+            })],
+        );
+        let req = held_plan_request();
+        let p = plan::plan(&t.view(&req).unwrap(), &req, &OneIndex(&ix), &plan::NoHold)
+            .await
+            .unwrap();
+        assert_eq!(
+            (p.inputs[0].head, p.inputs[0].life, p.inputs[0].keys.len()),
+            (0, 0, 1)
+        );
+        let mut items = Log::new("items");
+        let mut staging = Tracking::new();
+        items
+            .commit(&ix, &mut staging, [(key("k"), Ver::Int(10))].into())
+            .await;
+        apply(&mut t, vec![commit_part("items", &items.layers[0], 1)]);
+        let report = InputReport {
+            failed: vec![],
+            loaded: vec![(key("k"), Ver::Int(10))],
+        };
+        let ops = t.progress_ops(&p, &[report], b"run/batch", None).unwrap();
+        apply(&mut t, ops.parts);
+        let rec = &ops.records[0];
+        assert_eq!(rec.life, t.outputs[b"items".as_slice()].life);
+        let found = lineage::input(&t.logs(rec, Some(b"own")), rec, &OneIndex(&ix), 0)
+            .await
+            .unwrap();
+        assert!(
+            matches!(&found, Answer::Found(rs) if rs[0].loaded == Some(Ver::Int(10))),
+            "{found:?}"
+        );
+        apply(&mut t, vec![Part::EdgeClose(EdgeClose { edge: key("e") })]);
+        apply(
+            &mut t,
+            vec![Part::Retire(Retire {
+                output: key("items"),
+            })],
+        );
+        let retired = Answer::Retired {
+            output: key("items"),
+        };
+        let mut next = Log {
+            files: items.files,
+            ..Log::new("items")
+        };
+        next.commit(&ix, &mut staging, [(key("k"), Ver::Int(10))].into())
+            .await;
+        for gone in [false, true] {
+            if gone {
+                apply(&mut t, vec![commit_part("items", &next.layers[0], 1)]);
+            }
+            let logs = t.logs(rec, Some(b"own"));
+            assert_eq!(
+                lineage::input(&logs, rec, &OneIndex(&ix), 1).await.unwrap(),
+                retired
+            );
+            assert_eq!(
+                lineage::received_key(&logs, rec, b"k", &OneIndex(&ix), 1)
+                    .await
+                    .unwrap(),
+                Answer::Retired {
+                    output: key("items")
+                }
+            );
+        }
+    });
+}
+
+/// A plan made in one life of its input does not commit in the next.
+#[test]
+fn a_plan_of_an_earlier_life_of_its_input_does_not_commit() {
+    let rt = runtime();
+    let ix = index(&rt);
+    rt.block_on(async {
+        let mut t = Tracking::new();
+        let mut items = Log::new("items");
+        items
+            .commit(&ix, &mut t, [(key("k"), Ver::Int(1))].into())
+            .await;
+        let open = Part::EdgeOpen(EdgeOpen {
+            edge: key("e"),
+            input: key("items"),
+            keyed: true,
+        });
+        apply(&mut t, vec![open.clone()]);
+        let req = Request {
+            inputs: vec![InputRequest {
+                own: None,
+                ..held_plan_request().inputs[0].clone()
+            }],
+            ..held_plan_request()
+        };
+        let p = plan::plan(&t.view(&req).unwrap(), &req, &OneIndex(&ix), &plan::NoHold)
+            .await
+            .unwrap();
+        apply(&mut t, vec![Part::EdgeClose(EdgeClose { edge: key("e") })]);
+        apply(
+            &mut t,
+            vec![Part::Retire(Retire {
+                output: key("items"),
+            })],
+        );
+        let mut next = Log {
+            files: items.files,
+            ..Log::new("items")
+        };
+        next.commit(&ix, &mut t, [(key("k"), Ver::Int(1))].into())
+            .await;
+        apply(&mut t, vec![open]);
+        let e = t
+            .progress_ops(&p, &[InputReport::default()], b"run/batch", None)
+            .unwrap_err();
+        assert!(e.to_string().contains("earlier life"), "{e}");
+    });
+}
+
+/// A record whose held progress read the own output answers retired once
+/// that output is retired and started again.
+#[test]
+fn a_batch_whose_own_output_was_retired_answers_retired() {
+    let rt = runtime();
+    let ix = index(&rt);
+    rt.block_on(async {
+        let mut t = Tracking::new();
+        let mut own = Log::new("own");
+        let mut input = Log::new("items");
+        own.commit(&ix, &mut t, [(key("k"), Ver::Int(1))].into())
+            .await;
+        input
+            .commit(&ix, &mut t, [(key("k"), Ver::Int(10))].into())
+            .await;
+        apply(
+            &mut t,
+            vec![Part::EdgeOpen(EdgeOpen {
+                edge: key("e"),
+                input: key("items"),
+                keyed: true,
+            })],
+        );
+        apply(
+            &mut t,
+            vec![Part::Reset(Reset {
+                edge: key("e"),
+                held: true,
+            })],
+        );
+        let req = held_plan_request();
+        let p = plan::plan(&t.view(&req).unwrap(), &req, &OneIndex(&ix), &plan::NoHold)
+            .await
+            .unwrap();
+        let ops = t
+            .progress_ops(&p, &[InputReport::default()], b"run/batch", None)
+            .unwrap();
+        apply(&mut t, ops.parts.clone());
+        let rec = &ops.records[0];
+        apply(&mut t, vec![Part::Retire(Retire { output: key("own") })]);
+        let mut next = Log {
+            files: own.files,
+            ..Log::new("own")
+        };
+        next.commit(&ix, &mut t, [(key("k"), Ver::Int(2))].into())
+            .await;
+        let logs = t.logs(rec, Some(b"own"));
+        assert_eq!(
+            lineage::input(&logs, rec, &OneIndex(&ix), 0).await.unwrap(),
+            Answer::Retired { output: key("own") }
+        );
+        assert_eq!(
+            lineage::received_key(&logs, rec, b"k", &OneIndex(&ix), 0)
+                .await
+                .unwrap(),
+            Answer::Retired { output: key("own") }
+        );
+    });
+}
+
+/// An output's life is given when a commit starts it, from one counter for
+/// every output, kept across commits and a snapshot, and given anew once it
+/// was retired; a cleanup step names it.
+#[test]
+fn an_output_life_follows_its_starts() {
+    use solera_tracking::retain::{Cleaned, Track};
+    let rt = runtime();
+    let ix = index(&rt);
+    rt.block_on(async {
+        let mut staging = Tracking::new();
+        let mut log = Log::new("staging");
+        log.commit(&ix, &mut staging, [(key("k"), Ver::Int(1))].into())
+            .await;
+        log.commit(&ix, &mut staging, [(key("k"), Ver::Int(2))].into())
+            .await;
+        let commit = |output: Key, i: usize| {
+            Part::OutputCommit(solera_tracking::commit::OutputCommit {
+                output,
+                layer: log.layers[i].clone(),
+                live: 1,
+                ends_full_run: false,
+            })
+        };
+        let mut t = Tracking::new();
+        let life = |t: &Tracking, id: &[u8]| {
+            t.outputs
+                .get(id)
+                .unwrap_or_else(|| panic!("no output {:?}", String::from_utf8_lossy(id)))
+                .life
+        };
+        apply(
+            &mut t,
+            vec![Part::Track(Track {
+                output: key("items"),
+                at: 0,
+            })],
+        );
+        apply(&mut t, vec![commit(key("items"), 0)]);
+        let first = life(&t, b"items");
+        assert!(first > 0);
+        apply(&mut t, vec![commit(key("items"), 1)]);
+        assert_eq!(life(&t, b"items"), first);
+        let stale = Cleaned {
+            output: key("items"),
+            life: first,
+            from: 0,
+            to: 2,
+        };
+        stale.check(&t).unwrap();
+        apply(&mut t, vec![commit(key("other"), 0)]);
+        let other = life(&t, b"other");
+        assert!(other > first);
+        t = Tracking::restore(&t.snapshot()).unwrap();
+        assert_eq!((life(&t, b"items"), life(&t, b"other")), (first, other));
+        apply(
+            &mut t,
+            vec![Part::Retire(Retire {
+                output: key("items"),
+            })],
+        );
+        apply(
+            &mut t,
+            vec![Part::Track(Track {
+                output: key("items"),
+                at: 0,
+            })],
+        );
+        apply(&mut t, vec![commit(key("items"), 0)]);
+        apply(&mut t, vec![commit(key("items"), 1)]);
+        assert!(life(&t, b"items") > other);
+        assert!(stale.check(&t).is_err());
+        Cleaned {
+            life: life(&t, b"items"),
+            ..stale
+        }
+        .check(&t)
+        .unwrap();
+    });
+}
+
 async fn history(rng: &mut SmallRng, ix: &ChangeIndex, planned: &mut [usize; 4]) -> usize {
     let mut universe: Vec<Key> = (1..=rng.random_range(3..8))
         .map(|i| key(&format!("k{i}")))
@@ -394,8 +700,14 @@ async fn history(rng: &mut SmallRng, ix: &ChangeIndex, planned: &mut [usize; 4])
     let mut cursor: Option<Key> = None;
     let mut stored: Vec<Stored> = vec![];
     let n = rng.random_range(5..45);
-    for _ in 0..n {
-        let r: f64 = rng.random();
+    for step in 0..n {
+        // Sometimes a held reset comes first, so a batch plans at its
+        // input's head 0 and loads what the input's first commit wrote.
+        let r: f64 = if step == 0 && rng.random_bool(0.3) {
+            0.0
+        } else {
+            rng.random()
+        };
         if r < 0.03 {
             // A held reset (an upstream deleted and declared again).
             let mut changes = BTreeMap::new();
@@ -775,6 +1087,7 @@ async fn batch(
             rec: rec.clone(),
             input: i,
             gen: inputs[i].gen,
+            read: inputs[i].log.head() > 0,
             expected,
         });
     }
@@ -785,8 +1098,11 @@ async fn batch(
 struct Stored {
     rec: Record,
     input: usize,
-    /// The input's generation the batch read.
+    /// The input's generation at the batch's commit.
     gen: u32,
+    /// Whether the input had a commit by then: the batch planned or loaded
+    /// a version of that generation.
+    read: bool,
     expected: Vec<Received>,
 }
 
@@ -829,7 +1145,7 @@ async fn check_lineage(
         let got = lineage::input(&logs, &s.rec, &OneIndex(ix), cleaned)
             .await
             .unwrap();
-        if s.gen != inputs[s.input].gen && s.rec.head > 0 {
+        if s.gen != inputs[s.input].gen && s.read {
             let retired = Answer::Retired {
                 output: log.name.clone(),
             };
@@ -895,15 +1211,21 @@ async fn check_lineage(
                 .await
                 .is_err());
         }
+        assert_eq!(
+            s.rec.life > 0,
+            s.read,
+            "a record names a life when it read one"
+        );
         let other_life = Record {
             life: s.rec.life + 1,
             ..s.rec.clone()
         };
+        let now = t.outputs.get(&log.name[..]).map_or(0, |o| o.life);
         assert_eq!(
             lineage::input(&logs, &other_life, &OneIndex(ix), cleaned)
                 .await
                 .unwrap(),
-            if s.rec.head > 0 {
+            if other_life.life != now {
                 Answer::Retired {
                     output: log.name.clone(),
                 }

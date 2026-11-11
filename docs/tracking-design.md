@@ -1674,15 +1674,18 @@ Called from Python as `lineage_input`, `lineage_trace` and `lineage_flow`
 - **An output's life.** Each output has one life (`Output::life`), given
   from the state's one counter (`Tracking::lives`) when its first commit
   starts it. A retired output's commits start again at 1 (§13), so an id
-  and a commit name a version only within a life. A record stores the life
-  of its input and of the consumer's own output as the plan read them
-  (`life`, `own_life`, `RECORD_FORMAT` 4), and a cleanup step names the
-  output's life (§13). This is the identity the engine keys an output's
-  persisted facts by.
-- **Retired** when the life of an output the record names a commit of
-  (above 0) is not the output's life now: the output was retired since, and
-  its new life's commits are other versions under the same numbers. It is
-  checked before anything is read, then not retained, then the replay.
+  and a commit name a version only within a life. A record stores its
+  input's life at commit (`life`): every version the batch planned or
+  loaded is of that life, since an input is not retired while an edge
+  reads it and the commit refuses a plan of another life. It stores the
+  own output's life as the plan read it (`own_life`; `RECORD_FORMAT` 4).
+  A cleanup step names the output's life (§13). This is the identity the
+  engine keys an output's persisted facts by.
+- **Retired** when a life the record names (0 names none: nothing of that
+  output was read) is not the output's life now: the output was retired
+  since, and its new life's commits are other versions under the same
+  numbers. It is checked before anything is read, then not retained, then
+  the replay.
 - **The record's marks** (`RECORD_FORMAT` 4) give each key's reason and
   the version loaded, a failed or unsettled key's included. Marks, a key
   list and the replaced pieces must be in key order, or the record does

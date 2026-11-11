@@ -133,8 +133,9 @@ impl Logs {
     /// before anything else: the commits are its head, each `At` piece of
     /// the slice it replaced (without a reset) and, for a held piece, the
     /// consumer's own head at plan. An output whose life is not the one the
-    /// record names a commit of is `Retired`; otherwise the oldest commit
-    /// below its floor is `NotRetained`. Every piece counts whatever the
+    /// record names for it (0 names none: nothing of it was read) is
+    /// `Retired`; otherwise the oldest commit below its floor is
+    /// `NotRetained`. Every piece counts whatever the
     /// mode, though a key list reads only its keys' pieces: the cut keeps
     /// every commit a retained record names (§13), so the rule is the
     /// record's, not the plan's. A commit past an output's head is an error:
@@ -147,7 +148,7 @@ impl Logs {
         };
         let missing =
             |id: &Id, named: u64, (life, layers): (u64, &[LayerRef]), commits: Vec<u64>| {
-                if commits.iter().any(|&c| c > 0) && named != life {
+                if named > 0 && named != life {
                     return Ok(Some(Answer::Retired { output: id.clone() }));
                 }
                 let (floor, head) = span(layers);

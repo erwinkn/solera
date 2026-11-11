@@ -137,7 +137,8 @@ pub struct InputPlan {
     pub edge: Id,
     pub output: Id,
     pub head: u64,
-    /// The input's life ([crate::Output::life]) at plan: 0 at head 0.
+    /// The input's life ([crate::Output::life]) at plan, 0 before its first
+    /// commit: the commit refuses a plan of another life.
     pub life: u64,
     pub conditions: Arc<Conditions>,
     pub own_head: Option<u64>,

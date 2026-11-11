@@ -101,6 +101,9 @@ impl Tracking {
             if **input != *p.output {
                 return invalid("the edge reads another output than the batch planned");
             }
+            if p.life != 0 && p.life != crate::retain::life(self, &p.output) {
+                return invalid("the batch was planned in an earlier life of its input");
+            }
             if read_digest(k, plan.reset, &plan.range) != p.expect {
                 return invalid("the edge's progress moved since the batch was planned");
             }
@@ -266,7 +269,7 @@ impl Tracking {
                 reset: plan.reset,
                 range: plan.range.clone(),
                 head: p.head,
-                life: p.life,
+                life: crate::retain::life(self, &p.output),
                 conditions: p.conditions.clone(),
                 replaced,
                 marks,
