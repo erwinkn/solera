@@ -172,14 +172,22 @@ async def test_dep_1_a_commit_of_the_same_code_is_the_same_deploy(solera, repo):
     git(repo, "commit", "-qm", "two")
     served = imported(pkg / "pooled.py")
     await solera.deploy(served)
-    first = await solera.submit("made")
+    first, stages = await solera.submit("made"), []
+
+    async def launched():
+        stages.extend((await solera.get("/pools/workers/work", wait=0, host="contract"))["work"])
+        return stages
+
+    await solera.until(launched)
     git(repo, "commit", "--allow-empty", "-qm", "three")
     after = imported(pkg / "pooled.py")
     assert after.manifest["build"]["commit"] != served.manifest["build"]["commit"]
     assert after.manifest["deploy"] == served.manifest["deploy"]
-    for run in (first, await solera.submit("made")):
-        assert await solera.work("workers", imported(pkg / "pooled.py")) == 0
-        assert (await solera.wait(run))["request"]["status"] == "succeeded"
+    assert await solera.worker(stages[0], after) == 0
+    assert (await solera.wait(first))["request"]["status"] == "succeeded"
+    second = await solera.submit("made")
+    assert await solera.work("workers", imported(pkg / "pooled.py")) == 0
+    assert (await solera.wait(second))["request"]["status"] == "succeeded"
 
 
 def test_dep_1_the_error_policy_changes_the_deploy(monkeypatch):
