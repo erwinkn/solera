@@ -443,7 +443,7 @@ impl Served {
         grouped: bool,
     ) -> PyResult<(Option<Bound<'py, PyBytes>>, Option<Bound<'py, PyList>>)> {
         guard(|| {
-            let batches = crate::arrow_batches(py, table)?;
+            let (schema, batches) = crate::arrow_stream(py, table)?;
             let asked = match &keys {
                 None => None,
                 Some(names) => {
@@ -458,7 +458,8 @@ impl Served {
                     Some(asked)
                 }
             };
-            let s = crate::arrow::served(&batches, key, version, asked).map_err(crate::to_py)?;
+            let s = crate::arrow::served(&schema, &batches, key, version, asked)
+                .map_err(crate::to_py)?;
             let n: usize = batches.iter().map(|b| b.num_rows()).sum();
             let names = match grouped {
                 false => None,

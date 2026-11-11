@@ -198,8 +198,10 @@ pub struct ServedTable {
 
 /// A table that cannot say what it served is an error, never a pick: a key
 /// twice, a key or version missing (no column, or a null), a version that
-/// is not a string.
+/// is not a string; checked on the schema too, so an empty table is held to
+/// it. At most `u32::MAX` rows, the row numbers' width.
 pub fn served(
+    schema: &arrow_schema::Schema,
     batches: &[RecordBatch],
     key: &str,
     version: &str,
@@ -210,27 +212,39 @@ pub fn served(
             "the version column cannot be the key column {key:?}"
         ));
     }
-    let keys = self::keys(batches, key, false)?;
-    let cols = column(batches, version)?;
-    let is_text = |a: &ArrayRef| {
-        matches!(
-            a.data_type(),
-            DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
-        )
+    let is_text =
+        |t: &DataType| matches!(t, DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View);
+    let type_of = |name: &str| match schema.field_with_name(name) {
+        Ok(f) => Ok(f.data_type().clone()),
+        Err(_) => err(format!("no column {name:?}")),
     };
-    if let Some(a) = cols.iter().find(|a| !is_text(a)) {
+    let t = type_of(key)?;
+    if !is_text(&t) && !t.is_integer() {
         return err(format!(
-            "version column {version:?} must hold strings, not {}",
-            a.data_type()
+            "key column {key:?} must hold strings or integers, not {t}"
         ));
     }
+    let t = type_of(version)?;
+    if !is_text(&t) {
+        return err(format!(
+            "version column {version:?} must hold strings, not {t}"
+        ));
+    }
+    let keys = self::keys(batches, key, false)?;
+    let n = keys.len();
+    if n > u32::MAX as usize {
+        return err(format!(
+            "a table of {n} rows: at most {} are read",
+            u32::MAX
+        ));
+    }
+    let cols = column(batches, version)?;
     let chunks: Vec<Bytes> = cols.iter().filter_map(Bytes::of).collect();
     let at = Chunks::new(cols.iter().map(|a| a.len()));
     let version_of = |i: usize| -> Box<str> {
         let (c, j) = at.locate(i);
         String::from_utf8_lossy(chunks[c].value(j)).into()
     };
-    let n = keys.len();
     let order: Vec<u32> = if is_sorted(&*keys) {
         (0..n as u32).collect()
     } else {

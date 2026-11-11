@@ -242,6 +242,67 @@ def test_a_table_that_cannot_say_what_it_served_serves_nothing(columns, error):
     served = Served()
     with pytest.raises(ValueError, match=error):
         served.read_table(pa.table(columns), "id", "v", ["a"])
+    empty = pa.table(columns).slice(0, 0)
+    if not any(w in error for w in ("two rows", "nulls")):  # empty, and with no record batch: its schema says
+        for table in (empty, pa.Table.from_batches([], empty.schema)):
+            with pytest.raises(ValueError, match=error):
+                served.read_table(table, "id", "v", ["a"])
     assert served.items() == []
     with pytest.raises(ValueError, match="cannot be the key column"):
         served.read_table(pa.table({"id": ["a"]}), "id", "id", None)
+
+
+def test_a_table_answer_makes_the_dict_answers_dataframe():
+    """Nested values as their rows read (a map as a dict), the pandas index a
+    column like any other, timestamps at pandas' nanoseconds."""
+
+    import datetime as dt
+
+    import pandas as pd
+    import pyarrow as pa
+    from solera.stores import frames
+
+    rows = [
+        {"id": "b", "m": {"x": 1}, "at": dt.datetime(2026, 1, 2, 3, 4, 5, 6), "n": 2},
+        {"id": "a", "m": {}, "at": dt.datetime(2026, 1, 1), "n": None},
+    ]
+    schema = pa.schema(
+        [
+            ("id", pa.string()),
+            ("m", pa.map_(pa.string(), pa.int64())),
+            ("at", pa.timestamp("us")),
+            ("n", pa.int64()),
+        ]
+    )
+    plain = pa.Table.from_pylist(rows, schema=schema)
+    index = pa.Table.from_pandas(pd.DataFrame({"id": ["b", "a"], "n": [2, None]}).set_index("id"))
+    for table in (plain, plain.replace_schema_metadata(index.schema.metadata)):
+        table = table.append_column("v", pa.array(["1", "2"]))
+        answer = {r["id"]: Loaded(r, version="1") for r in rows}
+        take, _ = Served().read_table(table, "id", "v", ["a", "b"])
+        wanted, _ = Served().read(answer, ["a", "b"], Loaded)
+        pd.testing.assert_frame_equal(frames.served(table, take, "v", pd.DataFrame), pd.DataFrame(wanted))
+    meta = pa.Table.from_pandas(pd.DataFrame({"id": ["a"], "v": ["1"], "n": [1]}).set_index("id"))
+    take, _ = Served().read_table(meta, "id", "v", ["a"])
+    assert frames.served(meta, take, "v", pd.DataFrame).to_dict("records") == [{"n": 1, "id": "a"}]
+
+
+def test_view_columns_are_taken_as_their_large_forms():
+    import pyarrow as pa
+    from solera.stores import frames
+
+    table = pa.table(
+        {
+            "id": pa.array(["b", "a"], pa.string_view()),
+            "p": pa.array([["x"], ["y"]], pa.list_view(pa.string_view())),
+            "s": pa.array([{"z": b"1"}, {"z": b"2"}], pa.struct([("z", pa.binary_view())])),
+            "etag": pa.array(["1", "2"], pa.string_view()),
+        }
+    )
+    served = Served()
+    take, _ = served.read_table(table, "id", "etag", ["a", "b", "c"])
+    assert served.items() == [("a", "2"), ("b", "1"), ("c", None)]
+    assert frames.served(table, take, "etag", list) == [
+        {"id": "a", "p": ["y"], "s": {"z": b"2"}},
+        {"id": "b", "p": ["x"], "s": {"z": b"1"}},
+    ]
