@@ -224,7 +224,7 @@ class Core:
         try:
             self.tracking.check(event)
         except ValueError as error:
-            raise Conflict(f"the tracking core refused the commit: {error}") from None
+            raise Conflict(f"the tracking core refused the commit: {error}") from error
 
     def check_payload(self, payload: dict | None) -> None:
         """`check`, for a commit's `core` field as the model will apply it."""
