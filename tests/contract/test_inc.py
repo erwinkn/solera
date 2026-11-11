@@ -620,6 +620,8 @@ async def test_inc_14_writing_the_same_rows_again_is_a_change_its_consumers_proc
     keys = await solera.keys("feed")
     await solera.run("feed")
     await solera.until(lambda: len(fired) == 2)
+    await solera.quiet()
+    await solera.settle(0.3)
     again = await solera.keys("feed")
     assert set(again) == set(keys) == {"a", "b"}
     assert all(again[k] != keys[k] for k in keys)  # a new version of each
