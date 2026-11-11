@@ -23,6 +23,7 @@ import random
 import secrets
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import time
@@ -723,10 +724,11 @@ def _state_bytes(state: Path) -> dict:
         for name in names:
             path = Path(directory, name)
             try:
-                size = path.stat().st_size
-            except FileNotFoundError:
+                info = path.stat()
+            except OSError:
                 continue
-            sizes["/".join(path.relative_to(state).parts[:2])] += size
+            if stat.S_ISREG(info.st_mode):
+                sizes["/".join(path.relative_to(state).parts[:2])] += info.st_size
     return dict(sizes)
 
 
