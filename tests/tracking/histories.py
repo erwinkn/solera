@@ -292,6 +292,17 @@ CALIBRATIONS = {
         ("switch", "tally", "delayed"),
         ("items", (("k1", True),)),
     ],
+    # The call to switch reaches the store after a newer attempt wrote k1 and
+    # before it committed: published, outsiders would read a row no commit
+    # recorded (Fable, SOLE-17 round 3, low 5).
+    ("fullrun", "clear", "table", "switch_newest"): [
+        ("items", (("k1", True),)),
+        ("step", "tally", 1),
+        ("switch", "tally", "delayed"),
+        ("keys", "tally", ("k1",)),
+        ("write", "tally"),
+        ("notice",),
+    ],
 }
 
 # archive loads k1 as a dead attempt of copy left it: a version no commit

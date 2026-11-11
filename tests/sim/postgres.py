@@ -18,8 +18,8 @@ DSN = os.environ.get("SOLERA_TEST_DATABASE_URL")
 _schemas = itertools.count()
 
 
-# The columns PostgresStore gives its fence table (`solera_postgres._fence_table`).
-FENCE_COLUMNS = {"relid", "part", "generation", "worker_id", "written"}
+# The columns PostgresStore gives its versions table (`solera_postgres.VERSIONS_DDL`).
+FENCE_COLUMNS = {"rel", "part", "generation", "worker_id", "written", "published", "builds", "pending"}
 _fence_checked = False
 
 
@@ -39,11 +39,11 @@ def fresh_schema() -> str:
                 name
                 for (name,) in conn.execute(
                     "SELECT column_name FROM information_schema.columns "
-                    "WHERE table_schema = 'public' AND table_name = 'solera_generations'"
+                    "WHERE table_schema = 'public' AND table_name = 'solera_versions'"
                 )
             }
             if columns and columns != FENCE_COLUMNS:
-                conn.execute("DROP TABLE public.solera_generations")
+                conn.execute("DROP TABLE public.solera_versions")
         _fence_checked = True
     return f"sim_{os.getpid()}_{next(_schemas)}"
 
