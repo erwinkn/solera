@@ -135,10 +135,10 @@ class TableStore:
             if keyed.reset or reset:
                 rows.clear()
             for chunk in keyed.iter_chunks():
-                keys = {k for k, _ in chunk}
+                keys = set(chunk.keys)
                 if not keyed.reset:
                     rows[:] = [r for r in rows if r[0] not in keys]
-                rows.extend((k, None, dict(r), version) for k, group in chunk for r in group)
+                rows.extend((k, None, dict(r), version) for k, group in chunk.groups() for r in group)
             if keyed.removes:
                 rows[:] = [r for r in rows if r[0] not in keyed.removes]
             return Written(Ref(out.name, "", {"table": table}, context.partition), changed=keyed.changed())

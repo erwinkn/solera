@@ -639,11 +639,10 @@ class PostgresStore:
         if write.reset:
             self._delete_slice(cur, table, slice_where)
         for chunk in write.iter_chunks():
-            keys = [key for key, _ in chunk]
             if not write.reset:
-                self._delete_keys(cur, output, table, slice_where, keys)
-            self._insert(cur, output, table, [row for _, group in chunk for row in group], stamps)
-            self._check_keys(cur, output, table, slice_where, keys)
+                self._delete_keys(cur, output, table, slice_where, chunk.keys)
+            self._insert(cur, output, table, chunk.rows, stamps)
+            self._check_keys(cur, output, table, slice_where, chunk.keys)
         if write.removes and not write.reset:
             self._delete_keys(cur, output, table, slice_where, sorted(write.removes))
 

@@ -402,7 +402,7 @@ async def test_a_store_reads_its_own_types(store):
 
 
 def test_a_write_with_no_selection_is_paged_natively():
-    """`KeyedWrite.iter_pages`: every key of the write, a page at a time, with
+    """`KeyedWrite.iter_chunks`: every key of the write, a chunk at a time, with
     its group — never every entry at once."""
 
     out = Output("t", key="id")
@@ -410,7 +410,7 @@ def test_a_write_with_no_selection_is_paged_natively():
     write = KeyedWrite(prepare(rows, out), reset=True)
     pages = list(write.iter_chunks(2))
     assert [len(p) for p in pages] == [2, 2, 1]
-    assert [(k, g) for p in pages for k, g in p] == [(r["id"], [r]) for r in rows]
+    assert [(k, g) for p in pages for k, g in p.groups()] == [(r["id"], [r]) for r in rows]
 
 
 async def test_a_root_belongs_to_the_namespace_that_first_claims_it(tmp_path):
