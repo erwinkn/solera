@@ -14,6 +14,7 @@
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList, PyTuple};
+use solera_index::{pick_merge, LayerRef};
 use solera_tracking as tr;
 use tr::event::{Event, Part};
 use tr::plan::Indexes;
@@ -67,7 +68,8 @@ fn one_event(part: Part) -> Vec<u8> {
     Event::of(vec![part]).encode()
 }
 
-/// Every output's cut: `{output: (commit, holder, name)}`.
+/// Every output's cut: `{output: (commit, holder, name)}`, from the state
+/// and `pins` of one loop tick: call it on the event loop.
 #[pyfunction]
 #[pyo3(signature = (tracking, pins=vec![]))]
 fn retain_cuts<'py>(
@@ -137,7 +139,8 @@ fn retain_record_pins<'py>(
 }
 
 /// The cleanup cursor's next step on `output`: `(from, to, event)`, or
-/// None when nothing is released. Delete every version
+/// None when nothing is released. Call it on the event loop, with the pins
+/// of that tick. Delete every version
 /// `retain_released(tracking, event)` lists, then journal `event`.
 #[pyfunction]
 #[pyo3(signature = (tracking, output, pins=vec![]))]
@@ -194,46 +197,65 @@ fn retain_released<'py>(
     })
 }
 
-/// The next merge of `output`'s layers the size rule asks for, written at
-/// `path` (a fresh random token, never reused): `{"event", "replaced":
-/// [path, ...], "layer", "cut"}`, or None when none is due. It folds within
-/// the cut of the state it reads and `pins`, the engine's pins taken on
-/// the event loop (pins only rise, so a later one never falls below it).
-/// Reads and writes the whole run: call it off the event loop. Once
-/// `event` applies, the replaced files may be deleted.
+/// An output's layers and cut at one instant: `retain_merge_plan` takes
+/// them on the event loop, `retain_merge` builds from them off it.
+#[pyclass(frozen, module = "solera._native")]
+pub struct MergePlan {
+    output: Vec<u8>,
+    layers: Vec<LayerRef>,
+    #[pyo3(get)]
+    cut: u64,
+}
+
+/// The merge the size rule asks for on `output` now, or None when none is
+/// due: its layers and its cut, from the state and `pins`, the engine's
+/// pins, read in one loop tick. Pins only rise, so the cut holds until the
+/// merge applies, however long the build waits. Call it on the event loop.
 #[pyfunction]
-#[pyo3(signature = (tracking, output, path, pins=vec![]))]
+#[pyo3(signature = (tracking, output, pins=vec![]))]
+fn retain_merge_plan(
+    tracking: PyRef<'_, Tracking>,
+    output: &[u8],
+    pins: Vec<PinIn>,
+) -> PyResult<Option<MergePlan>> {
+    guard(|| {
+        let pins = pins_in(pins)?;
+        let t = tracking.state.read().unwrap();
+        let layers = t.outputs.get(output).map_or(vec![], |o| o.layers.clone());
+        let cut = tr::retain::cut(&t, output, &pins).commit;
+        Ok(pick_merge(&layers, cut).map(|_| MergePlan {
+            output: output.into(),
+            layers,
+            cut,
+        }))
+    })
+}
+
+/// Builds `plan`'s merge at `path` (a fresh random token, never reused):
+/// `{"event", "replaced": [path, ...], "layer"}`. Reads and writes the
+/// whole run: call it off the event loop. Its event is refused if another
+/// merge took its layers since, or the output was retired. Once `event`
+/// applies, the replaced files may be deleted.
+#[pyfunction]
 fn retain_merge<'py>(
     py: Python<'py>,
     tracking: PyRef<'py, Tracking>,
-    output: &[u8],
+    plan: PyRef<'py, MergePlan>,
     path: &str,
-    pins: Vec<PinIn>,
-) -> PyResult<Option<Bound<'py, PyDict>>> {
+) -> PyResult<Bound<'py, PyDict>> {
     guard(|| {
-        let pins = pins_in(pins)?;
-        let (layers, cut) = {
-            let t = tracking.state.read().unwrap();
-            let layers = t.outputs.get(output).map(|o| o.layers.clone());
-            (
-                layers.unwrap_or_default(),
-                tr::retain::cut(&t, output, &pins).commit,
-            )
-        };
         let ixs = tracking.indexes.read().unwrap().clone();
-        let ix = ixs.index(output).map_err(err)?;
-        let Some(m) = py
-            .detach(|| rt().block_on(tr::retain::merge(ix, output, &layers, cut, path)))
+        let ix = ixs.index(&plan.output).map_err(err)?;
+        let (output, layers, cut) = (&plan.output, &plan.layers, plan.cut);
+        let m = py
+            .detach(|| rt().block_on(tr::retain::merge(ix, output, layers, cut, path)))
             .map_err(err)?
-        else {
-            return Ok(None);
-        };
+            .expect("the plan picked a merge");
         let d = PyDict::new(py);
         d.set_item("replaced", &m.replaced)?;
         d.set_item("layer", layer_out(py, &m.layer)?)?;
-        d.set_item("cut", cut)?;
         d.set_item("event", PyBytes::new(py, &one_event(Part::Merged(m))))?;
-        Ok(Some(d))
+        Ok(d)
     })
 }
 
@@ -288,6 +310,8 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(retain_record_pins, m)?)?;
     m.add_function(wrap_pyfunction!(retain_step, m)?)?;
     m.add_function(wrap_pyfunction!(retain_released, m)?)?;
+    m.add_class::<MergePlan>()?;
+    m.add_function(wrap_pyfunction!(retain_merge_plan, m)?)?;
     m.add_function(wrap_pyfunction!(retain_merge, m)?)?;
     m.add_function(wrap_pyfunction!(retain_orphans, m)?)?;
     m.add_function(wrap_pyfunction!(retain_event_track, m)?)?;

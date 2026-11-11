@@ -1275,4 +1275,35 @@ fn an_edge_moves_to_an_input_only_above_its_floor() {
     let e = m.t.check_event(&Event::of(vec![rename(&items())])).unwrap_err();
     assert!(e.to_string().contains("below its new input's floor"), "{e}");
     m.apply(rename(&other)).unwrap();
+    // a per-key edge whose keys fail holds its seen, with no piece at all
+    let failing: Id = b"failing".as_slice().into();
+    m.apply(Part::EdgeOpen(EdgeOpen {
+        edge: failing.clone(),
+        input: other.clone(),
+        keyed: true,
+    }))
+    .unwrap();
+    m.t.per_key.insert(
+        failing.clone(),
+        PerKey {
+            seen: 1,
+            ..Default::default()
+        },
+    );
+    m.t.outputs.insert(
+        output_id(FAILURES, &failing),
+        Output {
+            live: 1,
+            head: 1,
+            ..Default::default()
+        },
+    );
+    let e = m
+        .apply(Part::EdgeRename(EdgeRename {
+            from: failing.clone(),
+            to: failing.clone(),
+            input: items(),
+        }))
+        .unwrap_err();
+    assert!(e.to_string().contains("Seen"), "{e}");
 }

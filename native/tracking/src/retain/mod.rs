@@ -204,7 +204,8 @@ impl Merged {
 /// An output's cleanup starts, at its head `at`: from here on, merges never
 /// fold past its cursor. The engine journals it when it deploys an output
 /// on a store that names objects by version, before its first commit or in
-/// the same event.
+/// the same event. A cleaned output's versions are generations: the engine
+/// writes no version word to it, which cleanup refuses to release.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Track {
     pub output: Id,

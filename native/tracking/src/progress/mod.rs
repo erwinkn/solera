@@ -1008,10 +1008,11 @@ impl EdgeRename {
             .get(&self.input)
             .and_then(|o| o.layers.first()?.floor)
             .unwrap_or(0);
-        if let Some(c) = e.progress.keyed().and_then(|k| k.commits().min()) {
+        let held = crate::retain::cut::edge_holds(t, &self.from, e);
+        if let Some((c, by)) = held.into_iter().min_by_key(|(c, _)| *c) {
             if c < floor {
                 return invalid(format!(
-                    "the edge holds a piece at commit {c}, below its new input's floor {floor}: reset it first"
+                    "the edge holds commit {c} ({by:?}), below its new input's floor {floor}: reset it first"
                 ));
             }
         }

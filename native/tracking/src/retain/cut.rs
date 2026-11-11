@@ -32,7 +32,7 @@ use crate::error::{invalid, Result};
 use crate::outcomes::{output_id, FAILURES};
 use crate::progress::{Key, Value};
 use crate::record::Record;
-use crate::state::{Id, Output, Tracking};
+use crate::state::{Edge, Id, Output, Tracking};
 
 /// What holds an output's commit.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -111,24 +111,32 @@ fn lowest(t: &Tracking, pins: &[Pin], want: impl Fn(&[u8]) -> bool) -> BTreeMap<
         }
     }
     for (id, e) in t.edges.iter().filter(|(_, e)| want(&e.input)) {
-        if let Some(k) = e.progress.keyed().filter(|_| on(PIECES)) {
-            for c in k.commits() {
-                hold(&e.input, c, &|| Holder::Piece(id.clone()));
-            }
-        }
-        let failing = || {
-            t.outputs
-                .get(&output_id(FAILURES, id))
-                .is_some_and(|o| o.live > 0)
-        };
-        if let Some(k) = t.per_key.get(id).filter(|_| on(SEEN) && failing()) {
-            hold(&e.input, k.seen, &|| Holder::Seen(id.clone()));
+        for (c, by) in edge_holds(t, id, e) {
+            hold(&e.input, c, &|| by.clone());
         }
     }
     for p in pins {
         hold(&p.output, p.commit, &|| p.by.clone());
     }
     cuts
+}
+
+/// The commits of its input an edge holds: its live pieces' and, while
+/// its per-key keys fail, B6's `seen`.
+pub(crate) fn edge_holds(t: &Tracking, id: &Id, e: &Edge) -> Vec<(u64, Holder)> {
+    let mut held = vec![];
+    if let Some(k) = e.progress.keyed().filter(|_| on(PIECES)) {
+        held.extend(k.commits().map(|c| (c, Holder::Piece(id.clone()))));
+    }
+    let failing = || {
+        t.outputs
+            .get(&output_id(FAILURES, id))
+            .is_some_and(|o| o.live > 0)
+    };
+    if let Some(k) = t.per_key.get(id).filter(|_| on(SEEN) && failing()) {
+        held.push((k.seen, Holder::Seen(id.clone())));
+    }
+    held
 }
 
 /// Every output's cut.
@@ -321,7 +329,8 @@ pub async fn merge(
     }))
 }
 
-/// The layer files that may be deleted: those `listed` that no output's
+/// The layer files that may be deleted (one call per sweep, over the
+/// whole listing: it reads every output's list): those `listed` that no output's
 /// layer list names (paths are the index store's, whatever output id holds
 /// them: a rename moves layers to another id) and that no build in flight
 /// (`building`: the paths of commits and merges started and neither
