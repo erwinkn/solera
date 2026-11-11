@@ -2,11 +2,12 @@
 what a worker does differently when its spec says `"tracking": "core"`.
 
 A keyed incremental input loads the keys its plan names: the plan's bytes
-are in the spec, and `Tracking.plan_keys` reads each input's keys, classes
-and versions out of them. A source served live may serve a key at another
-version than planned, or not at all: the batch's classes follow what it
-served, and each such key goes back in the result with the version it was
-served at (`delivered[input]["loaded"]`), for the engine to record.
+are in the spec, and `PlannedKeys` reads each input's keys, classes and
+versions out of them as columns, which the batch keeps (Python and Rust
+cross once per batch, never per key). A source served live may serve a key
+at another version than planned, or not at all: the batch's classes follow
+what it served, and each such key goes back in the result with the version
+it was served at (`delivered[input]["loaded"]`), for the engine to record.
 
 A keyed whole read names its objects from the output's layers in the change
 index (`pages`).
@@ -24,53 +25,54 @@ import heapq
 import itertools
 import tempfile
 from base64 import b64decode, b64encode
+from collections.abc import Mapping
 
 import obstore
 from solera import lifecycle
-from solera._native import Tracking, encode_changes
+from solera._native import PlannedKeys, encode_changes
 from solera.change_index import shared
 from solera.keys.layers import key_str
 from solera.stores import KeyedWrite, WriteError, prepare_for
 
 CHANGES_INLINE = 64 << 10  # changed keys' bytes a result carries; past it, a file (N13)
 CHANGES_CHUNK = 64 << 10  # keys encoded at a time
-CLASSES = ("added", "updated", "removed", "unchanged")
 
 
 def on_core(spec: dict) -> bool:
     return spec.get("tracking") == "core"
 
 
-def planned(spec: dict, pin: dict) -> tuple[list, list, list]:
+def planned(spec: dict, pin: dict) -> PlannedKeys:
     """A keyed input's keys in this batch, with their classes and the
     versions they are planned at: none once its walk is done (no plan)."""
 
     if spec.get("plan") is None:
-        return [], [], []
-    return Tracking.plan_keys(b64decode(spec["plan"]), int(pin["core"]))
+        return PlannedKeys()
+    return PlannedKeys.decode(b64decode(spec["plan"]), int(pin["core"]))
 
 
-def observe(keys: list, classes: list, versions: list, served: dict | None) -> tuple[dict, list]:
-    """The batch's classes, and the keys a source served otherwise than
-    planned, each with the version it served (None: absent). A key served
-    absent is removed if the consumer held it, else not delivered; one
-    served at another word than planned is updated if it was unchanged. A
-    key planned at a generation has no word to compare."""
+class KeyVersions(Mapping):
+    """A batch's `Keys.generations`: the keys it loads, each with the version
+    it is planned at, read from the plan's columns instead of copied into a
+    dict, so a store pays per key only for what it reads. In the plan's
+    order; `sorted()` lists them sorted in one call."""
 
-    out: dict[str, list[str]] = {c: [] for c in CLASSES}
-    loaded = []
-    for key, cls, version in zip(keys, classes, versions, strict=True):
-        if served is not None and cls != "removed":
-            got = served.get(key)
-            if got is None:
-                loaded.append([key, None])
-                cls = None if cls == "added" else "removed"
-            elif isinstance(version, str) and got != version:
-                loaded.append([key, got])
-                cls = "updated" if cls == "unchanged" else cls
-        if cls is not None:
-            out[cls].append(key)
-    return out, loaded
+    __slots__ = ("_planned",)
+
+    def __init__(self, planned: PlannedKeys):
+        self._planned = planned
+
+    def __getitem__(self, key):
+        return self._planned.version(key)
+
+    def __iter__(self):
+        return iter(self._planned.load_keys())
+
+    def __len__(self) -> int:
+        return self._planned.loads()
+
+    def sorted(self) -> list[str]:
+        return self._planned.load_keys(sorted=True)
 
 
 async def pages(pin: dict | None, size: int):

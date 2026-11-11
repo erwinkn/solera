@@ -12,7 +12,7 @@ import sys
 import types
 import typing
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import FrozenInstanceError, dataclass, field
 from typing import Any, ClassVar
 from urllib.parse import quote, unquote
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -490,7 +490,6 @@ class Upstream:
     commits: range | None = None
 
 
-@dataclass(frozen=True)
 class Batch:
     """What an `Incremental` input delivered to a parameter (§5.1). The rows
     arrive as the parameter; `ctx.batch[name]` says what they are and where
@@ -536,21 +535,100 @@ class Batch:
         before = 0 if batch.reset else (await ctx.load())["count"]
         return {"count": before + len(batch.added) - len(batch.removed)}"""
 
-    rows: Any = ()
-    added: tuple = ()
-    updated: tuple = ()
-    removed: tuple = ()
-    unchanged: tuple = ()
-    reset: bool = False
-    index: int = 0
-    count: int = 1
-    final: bool = True
-    upstream: Upstream = field(default_factory=Upstream)
-    served: dict = field(default_factory=dict)
+    __slots__ = ("rows", "reset", "index", "count", "final", "upstream", "_keys", "_served", "_columns")
+    _FIELDS = (
+        "rows",
+        "added",
+        "updated",
+        "removed",
+        "unchanged",
+        "reset",
+        "index",
+        "count",
+        "final",
+        "upstream",
+        "served",
+    )
+
+    def __init__(
+        self,
+        rows: Any = (),
+        added: tuple = (),
+        updated: tuple = (),
+        removed: tuple = (),
+        unchanged: tuple = (),
+        reset: bool = False,
+        index: int = 0,
+        count: int = 1,
+        final: bool = True,
+        upstream: Upstream | None = None,
+        served: dict | None = None,
+    ):
+        keys = {"added": added, "updated": updated, "removed": removed, "unchanged": unchanged}
+        for name, value in (
+            ("rows", rows),
+            ("reset", reset),
+            ("index", index),
+            ("count", count),
+            ("final", final),
+            ("upstream", Upstream() if upstream is None else upstream),
+            ("_keys", keys),
+            ("_served", {} if served is None else served),
+            ("_columns", None),
+        ):
+            object.__setattr__(self, name, value)
+
+    @classmethod
+    def _of_columns(cls, classes: Any, served: Any, **fields) -> Batch:
+        """A batch of the worker's: its keys by class, and what a source
+        served, read from the worker's columns (`classes.keys(name)`,
+        `served.versions()`) the first time each is asked for, so a
+        producer pays nothing for what it does not read."""
+
+        batch = cls(**fields)
+        object.__setattr__(batch, "_keys", {})
+        object.__setattr__(batch, "_served", None)
+        object.__setattr__(batch, "_columns", (classes, served))
+        return batch
+
+    def _class(self, name: str) -> tuple:
+        if name not in self._keys:
+            self._keys[name] = self._columns[0].keys(name)
+        return self._keys[name]
+
+    added = property(lambda self: self._class("added"))
+    updated = property(lambda self: self._class("updated"))
+    removed = property(lambda self: self._class("removed"))
+    unchanged = property(lambda self: self._class("unchanged"))
+
+    @property
+    def served(self) -> dict:
+        if self._served is None:
+            source = self._columns[1]
+            object.__setattr__(self, "_served", {} if source is None else source.versions())
+        return self._served
 
     @property
     def first(self) -> bool:
         return self.index == 0
+
+    def _values(self) -> tuple:
+        return tuple(getattr(self, name) for name in self._FIELDS)
+
+    def __eq__(self, other):
+        return self._values() == other._values() if type(other) is type(self) else NotImplemented
+
+    def __hash__(self):
+        return hash(self._values())
+
+    def __repr__(self):
+        return f"Batch({', '.join(f'{name}={getattr(self, name)!r}' for name in self._FIELDS)})"
+
+    def __setattr__(self, name, value):
+        raise FrozenInstanceError(f"cannot assign to field {name!r}")
+
+    def __delattr__(self, name):
+        raise FrozenInstanceError(f"cannot delete field {name!r}")
 
 
 # ---------------------------------------------------------------------------
