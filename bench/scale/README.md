@@ -29,6 +29,13 @@ batch's keys by grouping them by generation and loading each pack once. It never
 because a pack still holds other keys' live rows, so the data directory only grows. No number
 in the report measures the store's bytes.
 
+`--form` picks the data's form. With `dict`, the default, feed's loader returns a `Loaded` and a
+dict per key, the copies take and return lists of dicts, and a pack is the write's `{key: rows}`,
+pickled. With `arrow`, feed's loader returns one Arrow table (`Loaded(table, version=...)`), the
+copies take and return `pa.Table`, and a pack, `{output}/{generation}.arrow`, is an Arrow IPC file
+of the producer's rows, taken from its table by each chunk's `indices` with no Python object per
+row. Run both to tell the product's per-key cost from the harness's.
+
 ## Phases
 
 1. `source`: feed's keys, in source commits of 1M keys.
