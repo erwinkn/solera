@@ -733,6 +733,16 @@ class Attempts:
                 retry_for=error.get("retry_for") if transient else None,
             )
             return
+        if status != "succeeded":
+            await self._fail(
+                task_id,
+                attempt,
+                f"the worker's result has an unknown status: {status!r}",
+                retryable=True,
+                result=result,
+                reason="unknown status",
+            )
+            return
         try:
             await self.commit_attempt(attempt, prepared, result)
         except LostOwnership:

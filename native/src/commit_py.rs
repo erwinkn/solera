@@ -10,16 +10,9 @@ use solera_tracking as tr;
 use solera_tracking::commit::{self, Change, Changes, Mode, Reader, Spec};
 use solera_tracking::plan::Indexes;
 
-use crate::index_py::{self, key, layer_out, rt};
-use crate::{guard, FormatError};
-
-pub(crate) fn err(e: tr::Error) -> PyErr {
-    match e {
-        tr::Error::Format(m) => FormatError::new_err(m),
-        tr::Error::Invalid(m) => PyValueError::new_err(m),
-        tr::Error::Index(e) => index_py::err(e),
-    }
-}
+use crate::guard;
+use crate::index_py::{key, layer_out, rt};
+use crate::tracking_py::err;
 
 /// `Tracking.build_commit`: the next commit of `output`, as the state holds it.
 #[allow(clippy::too_many_arguments)]

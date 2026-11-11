@@ -564,3 +564,15 @@ def test_a_cleanup_entrys_delta_outlives_the_attempt_holding_it():
     assert path in m.cleanup_reads()  # A2 still reads it
     del m.claims["t1"]  # A2 ended
     assert path not in m.cleanup_reads()
+
+
+def test_a_journaled_proceeded_is_refused_on_replay():
+    """An operator's proceed waits for ERW-42 on the new tracking core, so
+    replaying a journaled `Proceeded` is refused and no span is proceeded."""
+
+    m = Model()
+    m.restore(None, core=True)
+    m.partial_spans[("@life", "o1")] = [[1, None, False]]
+    with pytest.raises(ValueError, match="ERW-42"):
+        m.apply({"type": "Proceeded", "asset": "copy", "partition": "", "by": "test", "at": 0, "event": None})
+    assert m.partial_spans == {("@life", "o1"): [[1, None, False]]}

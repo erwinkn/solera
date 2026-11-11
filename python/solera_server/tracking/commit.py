@@ -21,7 +21,7 @@ from dataclasses import dataclass, field
 import obstore
 from obstore.exceptions import NotFoundError
 from solera import lifecycle
-from solera._native import Tracking
+from solera._native import Tracking, UnsettledError
 
 from ..state import Conflict
 from . import Core, Generation, b64, canonical, unb64
@@ -56,9 +56,6 @@ class Built:
             "walk": self.walk,
             "empty": self.empty,
         }
-
-
-UNSETTLED = "the input became unsettled since the batch's commit was built"  # the core's fence refusal
 
 
 class HeldBack(Conflict):
@@ -309,6 +306,6 @@ def check(core: Core, built: Built) -> None:
     try:
         core.check(built.event)
     except Conflict as error:
-        if UNSETTLED in str(error):
+        if isinstance(error.__cause__, UnsettledError):  # the core's fence refusal
             raise HeldBack(str(error)) from None
         raise
