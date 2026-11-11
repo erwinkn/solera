@@ -27,6 +27,7 @@ from solera.patterns import Matcher
 
 from . import observed, owed, planning
 from .state import Conflict
+from .tracking import Generation, Redeployed
 from .tracking import stale as core_stale
 
 WALK = 100  # stored outcomes a retry batch walks at most, for each key it may take
@@ -85,7 +86,8 @@ class Observing:
 
     def _gappy(self, asset: str, partition: str) -> list | None:
         """What deciding whether a partition is complete takes: None if it is
-        not — never committed, or an incremental input with no record —
+        not — never committed, or an incremental input with no record or
+        (on the core) an unkeyed one's walk from empty not done —
         else each keyed input record with gaps (`observed.gaps`), as
         `(key, stamp, input, rec)`, `stamp` what its answer depends on."""
 
@@ -94,7 +96,7 @@ class Observing:
             return None
         try:
             inputs = self.planner().inputs(asset, partition)
-        except planning.UpstreamOnly:
+        except (planning.UpstreamOnly, ValueError):  # a partition that no longer fits its dimensions
             return None
         records, out = record.get("observed") or {}, []
         for input in inputs:
@@ -102,18 +104,22 @@ class Observing:
                 continue
             if self.core is not None and self._keyed(input):  # the new path: the edge's empty part
                 edge = self.m.core_edges.get((asset, partition, input.param))
-                if edge is None:
-                    return None
+                read = self.m.core_read.get((asset, partition, input.param))
+                if edge is None or read != self.m.core_outputs.get((input.output, input.partition)):
+                    return None  # never read, or what it committed is of a life of its upstream that is gone
                 empty = self.m.core_empty.get((asset, partition, input.param))
                 if empty is not None:
                     up = self.m.core_output(input.output, input.partition) or {}
                     patterns = json.dumps(input.spec.get("patterns"), sort_keys=True)
-                    stamp = (empty, edge[1], up.get("head", 0), patterns)
+                    walked = self._walked.get((asset, partition, input.param), 0)
+                    stamp = (empty, edge[1], up.get("head", 0), patterns, walked)
                     out.append(((asset, partition, input.param), stamp, input, {"core": empty}))
                 continue
             rec = records.get(input.param)
-            if rec is None:
-                return None
+            if rec is None or (
+                self.core is not None and (asset, partition, input.param) in self.m.core_empty
+            ):
+                return None  # never read, or a walk from empty not done (an unkeyed input's, on the core)
             holes = observed.gaps(rec)
             if not holes:
                 continue
@@ -147,13 +153,20 @@ class Observing:
         upstream, a scan of each gap stopping at the first key
         (`owed.uncovered`). Derived and live, never stored."""
 
-        checks = self._gappy(asset, partition)
+        checks, generation = self._gappy(asset, partition), Generation(self.m)
         if checks is None:
             return False
         for key, stamp, input, rec in checks:
             known = self._covers.get(key)
             if "core" in rec and (known is None or known[0] != stamp):
-                covered = not await core_stale.taken_after(self.core, input, rec["core"])
+                try:
+                    with generation:
+                        generation.check()
+                        edge = self.m.core_edges[(asset, partition, input.param)][0]
+                        covered = not await core_stale.taken_after(self.core, input, rec["core"], edge)
+                    generation.check()
+                except Redeployed:  # a deploy while a check awaited: not known, the next tick asks again
+                    return False
                 self._covers[key] = known = (stamp, covered)
             elif known is None or known[0] != stamp:
                 index, _ = self._upstream(input.output, input.partition)
