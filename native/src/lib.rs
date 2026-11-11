@@ -493,7 +493,7 @@ impl Rows {
                 rows.extend(f);
                 ends.push(rows.len());
             }
-            let run = rows.windows(2).all(|w| w[1] == w[0] + 1);
+            let run = rows.windows(2).all(|w| w[0].checked_add(1) == Some(w[1]));
             Ok(Span {
                 keys: packed,
                 ends,
