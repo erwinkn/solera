@@ -11,7 +11,7 @@ use crate::error::{format, Result};
 use crate::progress::{Conditions, Key, KeyRange, Reason, Slice};
 use crate::state::Id;
 
-pub const RECORD_FORMAT: u8 = 3;
+pub const RECORD_FORMAT: u8 = 4;
 
 /// What a batch did with one key it did not load as planned and settle:
 /// failed, held back by the planner, held back at commit (`Unsettled`), or
@@ -36,6 +36,9 @@ pub struct Record {
     pub reset: bool,
     pub range: KeyRange,
     pub head: u64,
+    /// The input's life ([crate::Output::life]) the batch read: 0 at head 0.
+    /// A commit number names a version only within its life.
+    pub life: u64,
     pub conditions: Arc<Conditions>,
     /// The progress the batch replaced: its range's slice, or with a reset all of it.
     pub replaced: Slice,
@@ -50,6 +53,8 @@ pub struct Record {
     pub planner: u64,
     /// The consumer's own head at plan, read where the replaced slice is held.
     pub own_head: Option<u64>,
+    /// The own output's life at plan: 0 where the batch read no commit of it.
+    pub own_life: u64,
     /// The output commit the batch made, if it wrote anything.
     pub output_commit: Option<u64>,
     /// A key list's keys: the one input a record cannot derive.
@@ -70,6 +75,7 @@ impl Record {
         e.u8(self.reset as u8);
         self.range.encode(&mut e);
         e.uv(self.head);
+        e.uv(self.life);
         self.conditions.encode(&mut e);
         self.replaced.encode(&mut e);
         e.uv(self.marks.len() as u64);
@@ -90,6 +96,7 @@ impl Record {
         e.uv(self.digest);
         e.uv(self.planner);
         e.opt_u64(self.own_head);
+        e.uv(self.own_life);
         e.opt_u64(self.output_commit);
         match &self.keys {
             None => e.u8(0),
@@ -121,6 +128,7 @@ impl Record {
         let reset = d.u8()? == 1;
         let range = KeyRange::decode(&mut d)?;
         let head = d.uv()?;
+        let life = d.uv()?;
         let conditions = Arc::new(Conditions::decode(&mut d)?);
         let replaced = Slice::decode(&mut d)?;
         let marks: Vec<(Key, Mark)> = (0..d.count()?)
@@ -142,6 +150,7 @@ impl Record {
         let digest = d.uv()?;
         let planner = d.uv()?;
         let own_head = d.opt_u64()?;
+        let own_life = d.uv()?;
         let output_commit = d.opt_u64()?;
         if marks.windows(2).any(|w| w[0].0 >= w[1].0) {
             return format("marks out of order");
@@ -173,6 +182,7 @@ impl Record {
             reset,
             range,
             head,
+            life,
             conditions,
             replaced,
             marks,
@@ -180,6 +190,7 @@ impl Record {
             digest,
             planner,
             own_head,
+            own_life,
             output_commit,
             keys,
             waiting,
@@ -205,6 +216,7 @@ mod tests {
             reset: false,
             range: KeyRange::all(),
             head: 1,
+            life: 1,
             conditions: Arc::default(),
             replaced: Slice::default(),
             marks: vec![],
@@ -212,6 +224,7 @@ mod tests {
             digest: 0,
             planner: 0,
             own_head: None,
+            own_life: 0,
             output_commit: None,
             keys: None,
             waiting: vec![],

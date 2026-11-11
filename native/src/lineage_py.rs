@@ -4,6 +4,8 @@
 //! the GIL. Records cross as the bytes `Record::encode` wrote.
 //!
 //! An answer that history no longer reaches is
+//! `{"state": "retired", "output": bytes}`: an output the batch read was
+//! retired since, and its new life is another log; or
 //! `{"state": "not_retained", "output": bytes, "commit": int}`: the input's
 //! index was cut past a commit the record names.
 
@@ -69,6 +71,10 @@ fn answer<'py, T>(
             d.set_item("state", "not_retained")?;
             d.set_item("output", PyBytes::new(py, output))?;
             d.set_item("commit", *commit)?;
+        }
+        Answer::Retired { output } => {
+            d.set_item("state", "retired")?;
+            d.set_item("output", PyBytes::new(py, output))?;
         }
     }
     Ok(d)

@@ -889,7 +889,7 @@ Asked what batch 2 of run R received, the engine recomputes the key list
 from the batch's record. The digest covers the planned keys, each with
 its class and version, so a mismatch is an error naming the batch, never
 a wrong list.
-*From* D184. *Core* `native/tracking/tests/histories.rs::random_histories` (every batch, every mode, a digest or planner mismatch an error), `core/test_lineage.py`. *Covered* pending in the contract (`tests/contract/entries.py`): the engine's lineage route is B10's Python half.
+*From* D184. *Core* `native/tracking/tests/histories.rs::random_histories` (every batch, every mode, a digest or planner mismatch an error, a batch of an input retired since answers retired), `core/test_lineage.py`. *Covered* pending in the contract (`tests/contract/entries.py`): the engine's lineage route is B10's Python half.
 
 **HIS-8. Lineage lists the keys loaded at another version than planned, with the version loaded.**
 `tally` planned k2@2 and loaded k2@5 (STO-3): its batch's lineage says k2

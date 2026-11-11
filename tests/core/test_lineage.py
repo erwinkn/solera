@@ -2,7 +2,14 @@
 recomputed from its record; a key's trace; flow; the honest answers."""
 
 import pytest
-from solera._native import ChangeIndex, Tracking, lineage_flow, lineage_input, lineage_trace
+from solera._native import (
+    ChangeIndex,
+    Tracking,
+    lineage_flow,
+    lineage_input,
+    lineage_trace,
+    retain_event_retire,
+)
 
 HOUR = 3_600_000
 
@@ -100,12 +107,23 @@ def test_a_record_its_input_no_longer_recomputes_to_is_an_error(tally, tmp_path)
         lineage_trace(t, b"items", "k1", [(first, None)])
 
 
-def test_a_record_past_its_output_head_is_an_error(tally, tmp_path):
-    _, _, _, first = tally
-    t = Tracking()
-    t.attach(b"items", ChangeIndex(f"file://{tmp_path}/empty"))
+def test_a_record_past_its_output_head_is_an_error(tally):
+    t, _, _, first = tally
+    t._set_output(b"items", [], 0, 0)
     with pytest.raises(ValueError, match="whose index ends at 0"):
         lineage_input(t, first)
+
+
+def test_a_batch_of_an_input_retired_since_answers_retired(tally):
+    t, ix, _, first = tally
+    t.apply(Tracking.event_edge_close(b"e"))
+    t.apply(retain_event_retire(b"items"))
+    t._set_output(b"items", [ix.write_commit("items/new/1", 1, [("k1", 9, None)], live_before=0)], 1, 1)
+    retired = {"state": "retired", "output": b"items"}
+    assert lineage_input(t, first) == retired
+    assert lineage_trace(t, b"items", "k1", [(first, None)])["batches"] == [retired]
+    t.apply(Tracking.event_edge_open(b"e", b"items", True))
+    assert keys(lineage_input(t, batch(t))) == [("k1", "added", None, 9, "-")]
 
 
 def test_a_key_trace_alternates_history_and_the_batches_that_held_it(tally):

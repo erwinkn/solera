@@ -319,6 +319,7 @@ fn scenario_state(
     t.outputs.insert(
         b"items".as_slice().into(),
         Output {
+            life: 1,
             layers: layers.to_vec(),
             head,
             live: 0,
@@ -880,6 +881,7 @@ fn lineage_runs(
             {
                 Answer::Found(keys) => keys,
                 Answer::NotRetained { commit, .. } => panic!("not retained at {commit}"),
+                Answer::Retired { .. } => panic!("retired"),
             }
         };
 

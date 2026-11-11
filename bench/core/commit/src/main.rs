@@ -585,6 +585,7 @@ fn core_commit(
         ch.push(&k, Change::Upsert(None)).unwrap();
     }
     let out = solera_tracking::Output {
+        life: 1,
         layers: layers.to_vec(),
         head: c - 1,
         live: 0,
@@ -664,6 +665,7 @@ fn core_rewrite(env: &Env, layers: &[LayerRef], n: u64, how: &str) {
         "first" => (solera_tracking::Output::default(), Mode::Patch),
         "patch" | "replace" => (
             solera_tracking::Output {
+                life: 1,
                 layers: layers.to_vec(),
                 head: layers.last().unwrap().hi,
                 live: 0,

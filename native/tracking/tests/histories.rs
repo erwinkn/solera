@@ -4,9 +4,10 @@
 //! the first N owed keys after the cursor in key order, with the right
 //! classes, versions and held-back keys, in every mode, over one or two
 //! keyed inputs, with batches committed several upstream commits after they
-//! were planned, loads at other versions, failures, resets and merges.
-//! Every batch's lineage, recomputed from its record then and at every later
-//! step, is what the batch received, or says its history was cut.
+//! were planned, loads at other versions, failures, resets, merges, and
+//! inputs retired and started again. Every batch's lineage, recomputed from
+//! its record then and at every later step, is what the batch received, or
+//! says its history was cut or its input retired.
 //! `HISTORY_SEEDS` sets how many histories run.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -23,12 +24,14 @@ use solera_tracking::codec::Ver;
 use solera_tracking::event::{Event, Part};
 use solera_tracking::lineage::{self, Answer, Received};
 use solera_tracking::plan::{self, Hold, InputRequest, Mode, OneIndex, Request};
+use solera_tracking::progress::EdgeClose;
 use solera_tracking::progress::{
     Class, Conditions, EdgeOpen, Holding, InputReport, Key, KeyRange, Pat, Patterns, Reason, Reset,
     Value,
 };
 use solera_tracking::record::Record;
-use solera_tracking::{Output, Tracking};
+use solera_tracking::retain::Retire;
+use solera_tracking::Tracking;
 
 fn key(s: &str) -> Key {
     s.as_bytes().into()
@@ -107,14 +110,12 @@ impl Log {
 
     fn sync(&self, t: &mut Tracking) {
         let live = self.states.last().unwrap().len() as u64;
-        t.outputs.insert(
+        t.set_output(
             self.name.clone(),
-            Output {
-                layers: self.layers.clone(),
-                head: self.head(),
-                live,
-                full_run: None,
-            },
+            self.layers.clone(),
+            self.head(),
+            live,
+            None,
         );
     }
 }
@@ -123,6 +124,8 @@ impl Log {
 struct Input {
     edge: Key,
     log: Log,
+    /// Bumped each time the input is retired and started again.
+    gen: u32,
     now: Arc<Conditions>,
     holds: BTreeMap<Key, Holding>,
 }
@@ -370,6 +373,7 @@ async fn history(rng: &mut SmallRng, ix: &ChangeIndex, planned: &mut [usize; 4])
         .map(|i| Input {
             edge: key(&format!("consumer/in{i}")),
             log: Log::new(&format!("up{i}")),
+            gen: 0,
             now: Arc::new(Conditions {
                 patterns: patterns(rng),
                 ..Default::default()
@@ -419,6 +423,39 @@ async fn history(rng: &mut SmallRng, ix: &ChangeIndex, planned: &mut [usize; 4])
                 .map(|k| (k.clone(), Holding::Held))
                 .collect();
             cursor = None;
+        } else if r < 0.05 && inputs.iter().all(|i| i.log.head() > 0) {
+            // An input is retired (its edge closed first) and started again:
+            // its commits start at 1 in a new life. The consumer reads it anew.
+            let inp = &mut inputs[rng.random_range(0..n_inputs)];
+            apply(
+                &mut t,
+                vec![Part::EdgeClose(EdgeClose {
+                    edge: inp.edge.clone(),
+                })],
+            );
+            apply(
+                &mut t,
+                vec![Part::Retire(Retire {
+                    output: inp.log.name.clone(),
+                })],
+            );
+            apply(
+                &mut t,
+                vec![Part::EdgeOpen(EdgeOpen {
+                    edge: inp.edge.clone(),
+                    input: inp.log.name.clone(),
+                    keyed: true,
+                })],
+            );
+            let name = String::from_utf8_lossy(&inp.log.name).into_owned();
+            inp.log = Log {
+                files: inp.log.files,
+                ..Log::new(&name)
+            };
+            inp.gen += 1;
+            inp.holds.clear();
+            cursor = None;
+            upstream_commit(rng, ix, &mut t, inp, &universe).await;
         } else if r < 0.10 {
             let inp = &mut inputs[rng.random_range(0..n_inputs)];
             let mut c = (*inp.now).clone();
@@ -737,6 +774,7 @@ async fn batch(
         stored.push(Stored {
             rec: rec.clone(),
             input: i,
+            gen: inputs[i].gen,
             expected,
         });
     }
@@ -747,6 +785,8 @@ async fn batch(
 struct Stored {
     rec: Record,
     input: usize,
+    /// The input's generation the batch read.
+    gen: u32,
     expected: Vec<Received>,
 }
 
@@ -766,11 +806,13 @@ fn floor(layers: &[LayerRef]) -> u64 {
 }
 
 /// Every stored batch's lineage, at a random cleanup cursor: what the batch
-/// received, or "not retained" exactly when a commit the record names (its
-/// head, and without a reset its replaced pieces' commits) is below its log's
-/// floor. A record that disagrees with its digest or planner, or whose held
-/// progress has no own output to read, is an error. One key's trace agrees
-/// with the batch's, and a key's history is its log's.
+/// received; "retired" exactly when the batch read a commit of an input that
+/// has been retired and started again since; "not retained" exactly when a
+/// commit the record names (its head, and without a reset its replaced
+/// pieces' commits) is below its log's floor. A record that disagrees with
+/// its digest or planner, names another life of an output it read, or whose
+/// held progress has no own output to read, is an error or retired. One
+/// key's trace agrees with the batch's, and a key's history is its log's.
 async fn check_lineage(
     rng: &mut SmallRng,
     ix: &ChangeIndex,
@@ -787,6 +829,29 @@ async fn check_lineage(
         let got = lineage::input(&logs, &s.rec, &OneIndex(ix), cleaned)
             .await
             .unwrap();
+        if s.gen != inputs[s.input].gen && s.rec.head > 0 {
+            let retired = Answer::Retired {
+                output: log.name.clone(),
+            };
+            assert_eq!(got, retired, "a batch of an earlier life of its input");
+            for k in universe {
+                let one = lineage::received_key(&logs, &s.rec, k, &OneIndex(ix), cleaned)
+                    .await
+                    .unwrap();
+                if s.expected.iter().any(|r| r.key == *k) {
+                    assert!(
+                        matches!(&one, Answer::Retired { output } if *output == log.name),
+                        "the trace of a key it took: {one:?}"
+                    );
+                } else {
+                    assert!(
+                        matches!(one, Answer::Found(None) | Answer::Retired { .. }),
+                        "{one:?}"
+                    );
+                }
+            }
+            continue;
+        }
         let pieces = if s.rec.reset {
             &[][..]
         } else {
@@ -810,6 +875,7 @@ async fn check_lineage(
                 continue;
             }
             Answer::Found(got) => got,
+            Answer::Retired { output } => panic!("{output:?} retired in the life the batch read"),
         };
         assert_eq!(
             cut, None,
@@ -829,11 +895,43 @@ async fn check_lineage(
                 .await
                 .is_err());
         }
+        let other_life = Record {
+            life: s.rec.life + 1,
+            ..s.rec.clone()
+        };
+        assert_eq!(
+            lineage::input(&logs, &other_life, &OneIndex(ix), cleaned)
+                .await
+                .unwrap(),
+            if s.rec.head > 0 {
+                Answer::Retired {
+                    output: log.name.clone(),
+                }
+            } else {
+                Answer::Found(got.clone())
+            },
+            "a record of another life of its input"
+        );
         if !s.rec.reset && s.rec.replaced.pieces.iter().any(|p| p.value == Value::Held) {
             let none = t.logs(&s.rec, None);
             assert!(lineage::input(&none, &s.rec, &OneIndex(ix), cleaned)
                 .await
                 .is_err());
+            if s.rec.own_head > Some(0) {
+                let other_own = Record {
+                    own_life: s.rec.own_life + 1,
+                    ..s.rec.clone()
+                };
+                assert_eq!(
+                    lineage::input(&logs, &other_own, &OneIndex(ix), cleaned)
+                        .await
+                        .unwrap(),
+                    Answer::Retired {
+                        output: own.name.clone(),
+                    },
+                    "a record of another life of its own output"
+                );
+            }
         }
         let want: Vec<Received> = s
             .expected

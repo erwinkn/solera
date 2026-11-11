@@ -250,6 +250,7 @@ impl Tracking {
                 reset: plan.reset,
                 range: plan.range.clone(),
                 head: p.head,
+                life: p.life,
                 conditions: p.conditions.clone(),
                 replaced,
                 marks,
@@ -257,6 +258,7 @@ impl Tracking {
                 digest: p.digest(),
                 planner: PLANNER_VERSION,
                 own_head: p.own_head,
+                own_life: p.own_life,
                 output_commit,
                 keys: match &plan.mode {
                     Mode::Keys(_) => Some(p.keys.iter().map(|c| c.key.clone()).collect()),

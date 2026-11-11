@@ -7,9 +7,10 @@
 //! keys failed, were held back at commit, or were loaded at another version,
 //! with the version loaded.
 //!
-//! An answer is exact or says why not. A commit the record names that the
-//! input's index no longer answers at is `NotRetained`; a version that
-//! cleanup has released is marked deleted.
+//! An answer is exact or says why not. An output the batch read that has
+//! since been retired is `Retired`, whatever its new life holds; a commit
+//! the record names that the input's index no longer answers at is
+//! `NotRetained`; a version that cleanup has released is marked deleted.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
@@ -22,10 +23,11 @@ use crate::progress::{Class, Holding, Key, Keyed, Reason, Value};
 use crate::record::Record;
 use crate::state::{Id, Tracking};
 
-/// The logs a lineage question reads, taken from the state under a short lock.
+/// The logs a lineage question reads, taken from the state under a short
+/// lock: each output's life (0 when it has none) and layers.
 pub struct Logs {
-    input: Vec<LayerRef>,
-    own: Option<(Id, Vec<LayerRef>)>,
+    input: (u64, Vec<LayerRef>),
+    own: Option<(Id, u64, Vec<LayerRef>)>,
 }
 
 impl Tracking {
@@ -33,10 +35,17 @@ impl Tracking {
     /// consumer's own output), that output's, which a replaced `held` piece
     /// reads.
     pub fn logs(&self, rec: &Record, own: Option<&[u8]>) -> Logs {
-        let layers = |id: &[u8]| self.outputs.get(id).map_or(vec![], |o| o.layers.clone());
+        let log = |id: &[u8]| {
+            self.outputs
+                .get(id)
+                .map_or((0, vec![]), |o| (o.life, o.layers.clone()))
+        };
         Logs {
-            input: layers(&rec.output),
-            own: own.map(|o| (o.into(), layers(o))),
+            input: log(&rec.output),
+            own: own.map(|o| {
+                let (life, layers) = log(o);
+                (o.into(), life, layers)
+            }),
         }
     }
 }
@@ -45,6 +54,12 @@ impl Tracking {
 #[derive(Clone, Debug, PartialEq)]
 pub enum Answer<T> {
     Found(T),
+    /// `output`, which the batch read, has been retired since (B9): the
+    /// life the record names is gone, and a later life's commits are other
+    /// versions under the same numbers.
+    Retired {
+        output: Id,
+    },
     /// The index of `output` no longer answers at `commit`, which the record
     /// names: retention cut its history there (§13).
     NotRetained {
@@ -114,12 +129,15 @@ fn span(layers: &[LayerRef]) -> (u64, u64) {
 }
 
 impl Logs {
-    /// The oldest commit the record names that its logs no longer answer
-    /// at: its head, each `At` piece of the slice it replaced (without a
-    /// reset) and, for a held piece, the consumer's own head at plan. Every
-    /// piece counts whatever the mode, though a key list reads only its keys'
-    /// pieces: the cut keeps every commit a retained record names (§13), so
-    /// the rule is the record's, not the plan's. A commit past an output's head is an error:
+    /// Why the logs no longer answer for a commit the record names, read
+    /// before anything else: the commits are its head, each `At` piece of
+    /// the slice it replaced (without a reset) and, for a held piece, the
+    /// consumer's own head at plan. An output whose life is not the one the
+    /// record names a commit of is `Retired`; otherwise the oldest commit
+    /// below its floor is `NotRetained`. Every piece counts whatever the
+    /// mode, though a key list reads only its keys' pieces: the cut keeps
+    /// every commit a retained record names (§13), so the rule is the
+    /// record's, not the plan's. A commit past an output's head is an error:
     /// that is not the index the batch read.
     fn gone<T>(&self, rec: &Record) -> Result<Option<Answer<T>>> {
         let pieces = if rec.reset {
@@ -127,42 +145,46 @@ impl Logs {
         } else {
             &rec.replaced.pieces[..]
         };
-        let missing = |id: &Id, layers: &[LayerRef], commits: Vec<u64>| {
-            let (floor, head) = span(layers);
-            if let Some(c) = commits.iter().find(|&&c| c > head) {
-                return invalid(format!(
-                    "batch {}: its record names commit {c} of {}, whose index ends at {head}",
-                    producer(rec),
-                    String::from_utf8_lossy(id)
-                ));
-            }
-            Ok(commits
-                .into_iter()
-                .filter(|&c| c < floor)
-                .min()
-                .map(|commit| Answer::NotRetained {
-                    output: id.clone(),
-                    commit,
-                }))
-        };
+        let missing =
+            |id: &Id, named: u64, (life, layers): (u64, &[LayerRef]), commits: Vec<u64>| {
+                if commits.iter().any(|&c| c > 0) && named != life {
+                    return Ok(Some(Answer::Retired { output: id.clone() }));
+                }
+                let (floor, head) = span(layers);
+                if let Some(c) = commits.iter().find(|&&c| c > head) {
+                    return invalid(format!(
+                        "batch {}: its record names commit {c} of {}, whose index ends at {head}",
+                        producer(rec),
+                        String::from_utf8_lossy(id)
+                    ));
+                }
+                Ok(commits
+                    .into_iter()
+                    .filter(|&c| c < floor)
+                    .min()
+                    .map(|commit| Answer::NotRetained {
+                        output: id.clone(),
+                        commit,
+                    }))
+            };
         let mut need = vec![rec.head];
         need.extend(pieces.iter().filter_map(|p| match p.value {
             Value::At(c, _) => Some(c),
             _ => None,
         }));
-        if let Some(a) = missing(&rec.output, &self.input, need)? {
+        if let Some(a) = missing(&rec.output, rec.life, (self.input.0, &self.input.1), need)? {
             return Ok(Some(a));
         }
         if !pieces.iter().any(|p| p.value == Value::Held) {
             return Ok(None);
         }
-        let (Some((id, layers)), Some(own_head)) = (&self.own, rec.own_head) else {
+        let (Some((id, life, layers)), Some(own_head)) = (&self.own, rec.own_head) else {
             return invalid(format!(
                 "batch {}: progress was held, so its lineage needs the consumer's own output",
                 producer(rec)
             ));
         };
-        missing(id, layers, vec![own_head])
+        missing(id, rec.own_life, (*life, layers), vec![own_head])
     }
 
     fn replay<'a>(
@@ -173,12 +195,12 @@ impl Logs {
         left: &'a Left,
     ) -> Result<Replay<'a>> {
         let own = match (&self.own, rec.own_head) {
-            (Some((id, layers)), Some(h)) => Some((ixs.index(id)?, layers.as_slice(), h)),
+            (Some((id, _, layers)), Some(h)) => Some((ixs.index(id)?, layers.as_slice(), h)),
             _ => None,
         };
         Ok(Replay {
             ix: ixs.index(&rec.output)?,
-            layers: &self.input,
+            layers: &self.input.1,
             head: rec.head,
             conditions: &rec.conditions,
             keyed,
@@ -200,13 +222,13 @@ impl Logs {
         cleaned: u64,
     ) -> Result<BTreeMap<Key, Vec<Ver>>> {
         let mut out: BTreeMap<Key, Vec<Ver>> = BTreeMap::new();
-        let head = span(&self.input).1;
+        let head = span(&self.input.1).1;
         if cleaned.min(head) <= rec.head || keys.is_empty() {
             return Ok(out);
         }
         ixs.index(&rec.output)?
             .window_keys_with(
-                &self.input,
+                &self.input.1,
                 rec.head + 1..=head,
                 keys,
                 &Query::default(),
@@ -336,6 +358,7 @@ pub async fn input(
         Answer::NotRetained { output, commit } => {
             return Ok(Answer::NotRetained { output, commit })
         }
+        Answer::Retired { output } => return Ok(Answer::Retired { output }),
     };
     let keys: Vec<&[u8]> = cands.iter().map(|c| &c.key[..]).collect();
     let released = logs.released(ixs, rec, &keys, cleaned).await?;
@@ -371,6 +394,7 @@ pub async fn received_key(
         Answer::NotRetained { output, commit } => {
             return Ok(Answer::NotRetained { output, commit })
         }
+        Answer::Retired { output } => return Ok(Answer::Retired { output }),
     };
     let Some(c) = cands.into_iter().find(|c| *c.key == *key) else {
         return Ok(Answer::Found(None));
