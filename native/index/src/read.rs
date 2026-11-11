@@ -45,21 +45,24 @@ pub struct KeyList {
 impl KeyList {
     /// The keys, sorted and deduplicated.
     pub fn new<K: AsRef<[u8]>>(keys: &[K]) -> KeyList {
+        if keys.windows(2).all(|w| w[0].as_ref() < w[1].as_ref()) {
+            return KeyList::of(keys.iter().map(AsRef::as_ref));
+        }
+        let mut ix: Vec<usize> = (0..keys.len()).collect();
+        ix.sort_unstable_by(|&a, &b| keys[a].as_ref().cmp(keys[b].as_ref()));
+        ix.dedup_by(|a, b| keys[*a].as_ref() == keys[*b].as_ref());
+        KeyList::of(ix.into_iter().map(|i| keys[i].as_ref()))
+    }
+
+    /// Sorted, distinct keys, each copied once into a buffer of their size.
+    fn of<'k>(keys: impl ExactSizeIterator<Item = &'k [u8]> + Clone) -> KeyList {
         let mut l = KeyList {
-            buf: Vec::with_capacity(keys.iter().map(|k| k.as_ref().len()).sum()),
+            buf: Vec::with_capacity(keys.clone().map(<[u8]>::len).sum()),
             end: Vec::with_capacity(keys.len()),
         };
-        let mut push = |k: &[u8]| {
+        for k in keys {
             l.buf.extend_from_slice(k);
             l.end.push(l.buf.len());
-        };
-        if keys.windows(2).all(|w| w[0].as_ref() < w[1].as_ref()) {
-            keys.iter().for_each(|k| push(k.as_ref()));
-        } else {
-            let mut ix: Vec<usize> = (0..keys.len()).collect();
-            ix.sort_unstable_by(|&a, &b| keys[a].as_ref().cmp(keys[b].as_ref()));
-            ix.dedup_by(|a, b| keys[*a].as_ref() == keys[*b].as_ref());
-            ix.into_iter().for_each(|i| push(keys[i].as_ref()));
         }
         l
     }
@@ -713,5 +716,20 @@ impl Walk {
                 return Ok(true);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::KeyList;
+
+    #[test]
+    fn a_key_list_holds_its_distinct_keys_bytes_not_its_inputs() {
+        let key = vec![7u8; 4096];
+        let keys = vec![key.as_slice(); 1 << 12];
+        let l = KeyList::new(&keys);
+        assert_eq!(l.len(), 1);
+        assert!(l.buf.capacity() < 2 * 4096);
+        assert!(l.end.capacity() < 2);
     }
 }

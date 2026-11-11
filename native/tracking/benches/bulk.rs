@@ -2,10 +2,13 @@
 //! by `commit::build` from the transport form the worker hands over, and the
 //! prior-version read inside it (one `get` per chunk at the head).
 //!
-//! `cargo bench -p solera-tracking --bench bulk -- <dir> setup <keys> <layers>`
+//! `cargo bench -p solera-tracking --bench bulk -- <dir> setup <keys> <layers> [interleaved]`
 //!   writes an output of <keys> keys `k000000000`.. under <dir>: a first run's
 //!   clear of <keys>/<layers> keys, then <layers>-1 commits of as many new keys
 //!   each, every one a key range after the last (a keyed first run in batches).
+//!   With `interleaved` after <layers>, commit i writes every <layers>-th key
+//!   from key i instead, so every layer spans the whole output (an output
+//!   patched by scattered commits).
 //! `cargo bench -p solera-tracking --bench bulk -- <dir> run <case> <keys> [reps]`
 //!   builds one commit on that output and throws it away, <reps> times:
 //!   - `empty`: <keys> new keys into an empty output (a first run's first batch)
@@ -193,15 +196,23 @@ fn main() {
         "setup" => {
             let n: u64 = args[2].parse().unwrap();
             let layers: u64 = args[3].parse().unwrap();
+            assert!(
+                layers > 0 && n % layers == 0,
+                "setup takes a key count that the layer count divides"
+            );
+            let interleaved = args.get(4).is_some_and(|a| a == "interleaved");
             let per = n / layers;
             let mut out = Output::default();
             for i in 0..layers {
                 let t = Instant::now();
                 let path: &'static str = format!("c{}.layer", i + 1).leak();
                 let mode = if i == 0 { Mode::Clear } else { Mode::Patch };
-                let mut src = Gen {
-                    ids: i * per..(i + 1) * per,
+                let ids: Box<dyn Iterator<Item = u64>> = if interleaved {
+                    Box::new((i..n).step_by(layers as usize))
+                } else {
+                    Box::new(i * per..(i + 1) * per)
                 };
+                let mut src = Gen { ids };
                 let b = rt
                     .block_on(commit::build(
                         &ixs,

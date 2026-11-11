@@ -1814,3 +1814,43 @@ fn a_limited_read_fetches_the_index_its_page_needs() {
         );
     });
 }
+
+/// A read of listed keys opens only the layers whose key span holds one of
+/// them: here the newer layer's file is missing, which a read of keys
+/// outside its span never sees.
+#[test]
+fn a_read_of_listed_keys_skips_the_layers_its_keys_miss() {
+    let rt = runtime();
+    let mem = Arc::new(InMemory::new());
+    let layer = |c: u64, prefix: &str| {
+        let mut w = Writer::new(WriteOptions::default(), c, c, None).unwrap();
+        for i in 0..1000u64 {
+            let key = format!("{prefix}{i:04}");
+            w.push(key.as_bytes(), c, Version::Int(i), Version::Absent)
+                .unwrap();
+        }
+        let h = CommitHeader {
+            commit: c,
+            added: 1000,
+            live: 1000 * c,
+            ..Default::default()
+        };
+        let mut l = w.finish(&[h]).unwrap();
+        l.path = format!("c{c}");
+        (l, w.take())
+    };
+    let (l1, b1) = layer(1, "a");
+    let (l2, _) = layer(2, "z");
+    rt.block_on(async {
+        mem.put(&Path::from("c1"), b1.into()).await.unwrap();
+        let store =
+            Store::new(mem, Path::from(""), rt.handle().clone(), Default::default()).unwrap();
+        let ix = ChangeIndex::new(store, WriteOptions::default());
+        let ls = [l1, l2];
+        let q = Query::default();
+        let p = ix.get(&ls, 2, &[b"a0007", b"m0000"], &q).await.unwrap();
+        assert_eq!(p.run.len(), 1);
+        assert_eq!(p.run.key(0), b"a0007");
+        assert!(ix.get(&ls, 2, &[b"a0007", b"z0007"], &q).await.is_err());
+    });
+}
