@@ -364,13 +364,15 @@ impl Model {
             reset: false,
             range: a.range,
             head: a.head,
+            life: super::life(&self.t, ITEMS),
             conditions: self.cond.clone(),
             replaced: a.slice,
-            points: vec![],
+            marks: vec![],
             counts: [0; 4],
             digest: 0,
             planner: 0,
             own_head: None,
+            own_life: 0,
             output_commit: None,
             keys: None,
             waiting: vec![],
@@ -912,7 +914,7 @@ fn a_batch_whose_input_folded_past_its_head_is_refused() {
 fn the_cursor_moves_only_from_where_it_is_and_within_the_head() {
     let rt = runtime();
     let mut m = commits(&rt, 3);
-    let life = m.t.retain.cursors[ITEMS].life;
+    let life = super::life(&m.t, ITEMS);
     let step = |from, to| {
         Part::Cleaned(Cleaned {
             output: items(),
@@ -970,7 +972,7 @@ fn the_cursor_moves_only_from_where_it_is_and_within_the_head() {
 fn cleaned(t: &Tracking, from: u64, to: u64) -> Part {
     Part::Cleaned(Cleaned {
         output: items(),
-        life: t.retain.cursors.get(ITEMS).map_or(0, |c| c.life),
+        life: super::life(t, ITEMS),
         from,
         to,
     })
@@ -1053,16 +1055,18 @@ fn record_pins_hold_the_oldest_replaced_piece_and_the_own_head() {
         reset: false,
         range: KeyRange::all(),
         head: 9,
+        life: 1,
         conditions: cond.clone(),
         replaced: Slice {
             pieces: vec![piece(5), piece(3)],
             points: vec![],
         },
-        points: vec![],
+        marks: vec![],
         counts: [0; 4],
         digest: 0,
         planner: 0,
         own_head: Some(4),
+        own_life: 2,
         output_commit: None,
         keys: None,
         waiting: vec![],

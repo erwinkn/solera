@@ -432,7 +432,7 @@ pub enum Reason {
 }
 
 impl Reason {
-    fn from_u8(b: u8) -> Result<Reason> {
+    pub(crate) fn from_u8(b: u8) -> Result<Reason> {
         Ok(match b {
             1 => Reason::Failed,
             2 => Reason::HeldBack,
@@ -568,7 +568,20 @@ impl Slice {
                     value: Value::decode(d, &conds)?,
                 })
             })
-            .collect::<Result<_>>()?;
+            .collect::<Result<Vec<Piece>>>()?;
+        let below =
+            |a: &Option<Key>, b: &Option<Key>| matches!((a, b), (Some(a), Some(b)) if a < b);
+        let empty = |p: &Piece| {
+            p.range.lo.is_some() && p.range.hi.is_some() && !below(&p.range.lo, &p.range.hi)
+        };
+        let overlap = |w: &[Piece]| {
+            w[0].range.hi.is_none()
+                || below(&w[1].range.lo, &w[0].range.hi)
+                || w[1].range.lo.is_none()
+        };
+        if pieces.iter().any(empty) || pieces.windows(2).any(overlap) {
+            return format("pieces out of order");
+        }
         let points = decode_points(d, &conds)?;
         Ok(Slice { pieces, points })
     }
@@ -635,6 +648,39 @@ impl Keyed {
             values: vec![v],
             points: BTreeMap::new(),
         }
+    }
+
+    /// What `s` says over its range, `Empty` elsewhere, in one pass: its
+    /// pieces are in key order and adjacent.
+    pub fn of_slice(s: &Slice) -> Keyed {
+        let mut k = Keyed {
+            bounds: vec![],
+            values: vec![],
+            points: s.points.iter().cloned().collect(),
+        };
+        let mut push = |hi: Option<Key>, v: Value| {
+            if k.values.last() == Some(&v) {
+                match hi {
+                    Some(hi) => *k.bounds.last_mut().unwrap() = hi,
+                    None => _ = k.bounds.pop(),
+                }
+                return;
+            }
+            k.bounds.extend(hi);
+            k.values.push(v);
+        };
+        let mut end: Option<Option<&Key>> = None;
+        for p in &s.pieces {
+            if end.map_or(p.range.lo.is_some(), |e| e != p.range.lo.as_ref()) {
+                push(p.range.lo.clone(), Value::Empty);
+            }
+            push(p.range.hi.clone(), p.value.clone());
+            end = Some(p.range.hi.as_ref());
+        }
+        if end != Some(None) {
+            push(None, Value::Empty);
+        }
+        k
     }
 
     /// The commits its pieces are at.

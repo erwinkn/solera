@@ -512,9 +512,33 @@ impl World {
         let page = self.ix.window(&self.layers, w1..=w2, &q.q).await.unwrap();
         assert_eq!(
             got(&page),
-            q.page(want),
+            q.page(want.clone()),
             "{}",
             ctx(&format!("window({w1}..={w2}, {:?})", q.q))
+        );
+        // the same window over listed keys only
+        let mut ask: Vec<Vec<u8>> = (0..rng.random_range(0..12))
+            .map(|_| {
+                if rng.random_bool(0.8) {
+                    h.keys[rng.random_range(0..h.keys.len())].clone()
+                } else {
+                    b"a/nothing".to_vec()
+                }
+            })
+            .collect();
+        let page = self
+            .ix
+            .window_keys(&self.layers, w1..=w2, &ask, &q.q)
+            .await
+            .unwrap();
+        ask.sort();
+        ask.dedup();
+        let want: Got = want.into_iter().filter(|(k, _)| ask.contains(k)).collect();
+        assert_eq!(
+            got(&page),
+            q.page(want),
+            "{}",
+            ctx(&format!("window_keys({w1}..={w2}, {ask:?}, {:?})", q.q))
         );
         // commit headers above the floor
         let hs = self.ix.commits(&self.layers, 0, head).await.unwrap();

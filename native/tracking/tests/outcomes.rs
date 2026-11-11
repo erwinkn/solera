@@ -37,6 +37,7 @@ use solera_tracking::codec::Ver;
 use solera_tracking::commit::OutputCommit;
 use solera_tracking::due;
 use solera_tracking::event::{Event, Part};
+use solera_tracking::lineage::{self, Answer};
 use solera_tracking::outcomes::commit::{self as oc, records, Ctx};
 use solera_tracking::outcomes::transition::{
     eligible, transition, Counters, Kind, Reported, Stored, FAILED,
@@ -45,7 +46,7 @@ use solera_tracking::outcomes::{output_id, record_digest, Rebuild, FAILURES};
 use solera_tracking::plan::{self, InputRequest, Mode, NoHold, OneIndex, Request};
 use solera_tracking::progress::{
     owed, Class, Conditions, EdgeClose, EdgeOpen, EdgeRename, Holding, InputReport, Key, Ops, Pat,
-    Patterns, Reset, Value,
+    Patterns, Reason, Reset, Value,
 };
 use solera_tracking::stale::{self, NoneDue, Reason as Why, SetWatch, Status, Watch};
 use solera_tracking::Tracking;
@@ -558,8 +559,10 @@ impl World {
             edge: rec.edge.clone(),
             output: rec.output.clone(),
             head: rec.head,
+            life: rec.life,
             conditions: rec.conditions.clone(),
             own_head: None,
+            own_life: 0,
             keys,
             held_back: vec![],
             moot: vec![],
@@ -573,6 +576,71 @@ impl World {
             "lineage of a batch over {:?}: {:?}",
             rec.range,
             replay.keys
+        );
+    }
+
+    /// Lineage (§12) in every mode: the batch's keys recomputed from its
+    /// record, past its failing keys waiting for their retry, are its plan's,
+    /// each with what the worker reported and whether the commit held it.
+    async fn replay(
+        &self,
+        ix: &ChangeIndex,
+        p: &plan::Plan,
+        rec: &solera_tracking::record::Record,
+        report: &InputReport,
+        held: &[Key],
+    ) {
+        assert_eq!(
+            &solera_tracking::record::Record::decode(&rec.encode()).unwrap(),
+            rec
+        );
+        let got = lineage::input(&self.t.logs(rec, None), rec, &OneIndex(ix), 0)
+            .await
+            .unwrap();
+        let Answer::Found(got) = got else {
+            panic!("a batch just committed is retained: {got:?}");
+        };
+        let want: Vec<_> = p.inputs[0]
+            .keys
+            .iter()
+            .map(|c| {
+                let dev = report
+                    .loaded
+                    .iter()
+                    .find(|(k, _)| *k == c.key)
+                    .map(|(_, v)| v.clone())
+                    .filter(|v| *v != c.version);
+                let reason = if held.contains(&c.key) {
+                    Some(Reason::Unsettled)
+                } else if report.failed.contains(&c.key) {
+                    Some(Reason::Failed)
+                } else {
+                    dev.is_some().then_some(Reason::Deviation)
+                };
+                (
+                    c.key.clone(),
+                    c.class,
+                    c.held.clone(),
+                    c.version.clone(),
+                    reason,
+                    dev,
+                )
+            })
+            .collect();
+        assert_eq!(
+            got.iter()
+                .map(|r| (
+                    r.key.clone(),
+                    r.class,
+                    r.held.clone(),
+                    r.planned.clone(),
+                    r.reason,
+                    r.loaded.clone()
+                ))
+                .collect::<Vec<_>>(),
+            want,
+            "lineage of a batch over {:?}",
+            rec.range
         );
     }
 
@@ -610,8 +678,13 @@ impl World {
                     self.upstream(ix).await;
                 }
             }
+            let rec = b.ops.records[0].clone();
+            let held = b.ops.held_back[0].clone();
             match self.land(b) {
-                Some(keys) => return Some(keys),
+                Some(keys) => {
+                    self.replay(ix, p, &rec, &report, &held).await;
+                    return Some(keys);
+                }
                 None if race => continue,
                 None => return None,
             }
@@ -717,19 +790,47 @@ impl World {
         if p.reset {
             self.era += 1;
         }
-        for part in &ops.parts {
-            if let Part::Batch(b) = part {
-                assert_eq!(
-                    ops.records[0].points, b.points,
-                    "the batch record holds the points the batch set"
-                );
-            }
-        }
+        let ip = &p.inputs[0];
+        let mut want: Vec<(Key, Reason, Option<Ver>)> = ip
+            .keys
+            .iter()
+            .filter_map(|c| {
+                let dev = loaded
+                    .iter()
+                    .find(|(k, _)| *k == c.key)
+                    .map(|(_, v)| v.clone())
+                    .filter(|v| *v != c.version);
+                let reason = if ops.held_back[0].contains(&c.key) {
+                    Reason::Unsettled
+                } else if failed.iter().any(|(k, _)| *k == c.key) {
+                    Reason::Failed
+                } else if dev.is_some() {
+                    Reason::Deviation
+                } else {
+                    return None;
+                };
+                Some((c.key.clone(), reason, dev))
+            })
+            .chain(
+                ip.held_back
+                    .iter()
+                    .map(|h| (h.key.clone(), Reason::HeldBack, None)),
+            )
+            .collect();
+        want.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            ops.records[0]
+                .marks
+                .iter()
+                .map(|(k, m)| (k.clone(), m.reason, m.loaded.clone()))
+                .collect::<Vec<_>>(),
+            want,
+            "the batch record marks what the worker and the commit did with each key"
+        );
         if p.mode == Mode::Incremental && !p.reset {
             self.lineage(&ops.records[0]);
         }
         // The truth.
-        let ip = &p.inputs[0];
         let fails: BTreeMap<Key, Reported> = failed.into_iter().collect();
         let loaded: BTreeMap<Key, Ver> = loaded.into_iter().collect();
         // A key loaded at another version than planned while the input was
