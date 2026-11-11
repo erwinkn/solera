@@ -238,7 +238,7 @@ pub fn step(t: &Tracking, output: &[u8], pins: &[Pin]) -> Option<Cleaned> {
         .fold(head(t, output), u64::min);
     (to > c.at).then(|| Cleaned {
         output: output.into(),
-        life: c.life,
+        life: super::life(t, output),
         from: c.at,
         to,
     })

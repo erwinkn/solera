@@ -398,6 +398,31 @@ impl ChangeIndex {
         layers: &[LayerRef],
         commits: RangeInclusive<u64>,
         q: &Query,
+        on: impl FnMut(&Run),
+    ) -> Result<Option<Vec<u8>>> {
+        self.window_in(layers, commits, None, q, on).await
+    }
+
+    /// `window_with` over the listed keys only, reading their blocks and no
+    /// others.
+    pub async fn window_keys_with<K: AsRef<[u8]>>(
+        &self,
+        layers: &[LayerRef],
+        commits: RangeInclusive<u64>,
+        keys: &[K],
+        q: &Query,
+        on: impl FnMut(&Run),
+    ) -> Result<Option<Vec<u8>>> {
+        self.window_in(layers, commits, Some(KeyList::new(keys)), q, on)
+            .await
+    }
+
+    async fn window_in(
+        &self,
+        layers: &[LayerRef],
+        commits: RangeInclusive<u64>,
+        keys: Option<KeyList>,
+        q: &Query,
         mut on: impl FnMut(&Run),
     ) -> Result<Option<Vec<u8>>> {
         let bounds = check_layers(layers)?;
@@ -414,10 +439,13 @@ impl ChangeIndex {
             .filter(|c| commits.contains(c))
             .collect();
         if !clears.is_empty() {
-            return self.changes_with(layers, commits, &clears, q, on).await;
+            return self
+                .changes_with(layers, commits, &clears, keys, q, on)
+                .await;
         }
         let from = lo.saturating_sub(1);
-        let Some(mut w) = self.walk(layers, from, hi, q, None, false).await? else {
+        let all_at_once = keys.is_some();
+        let Some(mut w) = self.walk(layers, from, hi, q, keys, all_at_once).await? else {
             return Ok(None);
         };
         let all = lo == 0 && hi == u64::MAX;
@@ -456,13 +484,15 @@ impl ChangeIndex {
         layers: &[LayerRef],
         commits: RangeInclusive<u64>,
         clears: &[u64],
+        keys: Option<KeyList>,
         q: &Query,
         mut on: impl FnMut(&Run),
     ) -> Result<Option<Vec<u8>>> {
         let (lo, hi) = (*commits.start(), *commits.end());
         let start = clear_at(layers, lo.saturating_sub(1));
         let from = start.saturating_sub(1);
-        let Some(mut w) = self.walk(layers, from, hi, q, None, false).await? else {
+        let all_at_once = keys.is_some();
+        let Some(mut w) = self.walk(layers, from, hi, q, keys, all_at_once).await? else {
             return Ok(None);
         };
         let (mut g, mut f) = (Run::new(), Run::new());
@@ -498,6 +528,22 @@ impl ChangeIndex {
         let mut run = Run::new();
         let next = self
             .window_with(layers, commits, q, |g| run.push_key_from(g, 0))
+            .await?;
+        Ok(Page { run, next })
+    }
+
+    /// The entries of the commits in `commits` of the listed keys, as
+    /// `window_keys_with`.
+    pub async fn window_keys<K: AsRef<[u8]>>(
+        &self,
+        layers: &[LayerRef],
+        commits: RangeInclusive<u64>,
+        keys: &[K],
+        q: &Query,
+    ) -> Result<Page> {
+        let mut run = Run::new();
+        let next = self
+            .window_keys_with(layers, commits, keys, q, |g| run.push_key_from(g, 0))
             .await?;
         Ok(Page { run, next })
     }

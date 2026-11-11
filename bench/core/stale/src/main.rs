@@ -86,6 +86,7 @@ fn state(
     t.outputs.insert(
         ITEMS.into(),
         Output {
+            life: 1,
             layers: layers.to_vec(),
             head,
             live: 0,
@@ -209,6 +210,7 @@ fn failures(
     t.outputs.insert(
         outcomes::output_id(outcomes::FAILURES, &edge(0)),
         Output {
+            life: 1,
             layers: vec![layer],
             head: 1,
             live: recs.len() as u64,
