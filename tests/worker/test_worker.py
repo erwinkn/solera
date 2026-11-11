@@ -374,6 +374,23 @@ project = Project(assets=[lingering])
 """
 
 
+SIGINT_IGNORED_AT_IMPORT = """
+import signal
+from solera.executors import Pool
+from solera.sdk import Project, asset
+
+signal.signal(signal.SIGINT, signal.SIG_IGN)  # a project that outlives a Ctrl-C
+
+@asset(executor=Pool("ingest")())
+def lingering() -> int:
+    if signal.getsignal(signal.SIGINT) != signal.SIG_IGN:
+        raise RuntimeError("the attempt does not ignore SIGINT as its project's import set")
+    return 1
+
+project = Project(assets=[lingering])
+"""
+
+
 async def offered(engine, run_id: str, pool: str = "ingest") -> dict:
     """The stage of `run_id`'s attempt once `pool`'s workers are offered it."""
 
@@ -422,7 +439,8 @@ def imported(path) -> list[str]:
         (LOCKED_AT_IMPORT, "left 1 thread(s) running"),
         (SOCKET_AT_IMPORT, "left 2 socket(s) or pipe(s) open"),
         (SLOW_AT_IMPORT, "took more than 5 s"),
-        (SIGCHLD_AT_IMPORT, None),
+        (SIGCHLD_AT_IMPORT, "ignored SIGCHLD"),
+        (SIGINT_IGNORED_AT_IMPORT, None),
     ],
     ids=[
         "thread",
@@ -431,6 +449,7 @@ def imported(path) -> list[str]:
         "socket-at-import",
         "slow-import",
         "sigchld-at-import",
+        "sigint-ignored",
     ],
 )
 async def test_a_pool_attempt_runs_in_a_child_of_the_forkserver(
@@ -441,10 +460,10 @@ async def test_a_pool_attempt_runs_in_a_child_of_the_forkserver(
     in the loop's executor too (review round 3, #3). The forkserver keeps
     the project it imported, and the attempt imports nothing, unless that
     import left a thread (one holding a lock the child would inherit held)
-    or a socket behind, or did not finish in time: then it says why, and the
-    attempt imports the project itself. A signal the import ignores is the
-    attempt's to ignore, not the forkserver's, which still reaps it
-    (ERW-36)."""
+    or a socket behind, ignored SIGCHLD (the forkserver could not wait for
+    its children), or did not finish in time: then it says why, and the
+    attempt imports the project itself. The attempt has the signal
+    dispositions the project's import set (ERW-36)."""
 
     import subprocess
     import sys
@@ -455,11 +474,11 @@ async def test_a_pool_attempt_runs_in_a_child_of_the_forkserver(
     monkeypatch.setenv("SOLERA_PROJECT", entrypoint)
     # A short grace: the engine reads the claim and the result without the worker's
     # channel, which this worker has none of, a moment after the offer, not 10 s.
-    children = signal.getsignal(signal.SIGCHLD)
+    # What the engine's own import of the project sets is not this test's.
+    dispositions = {number: signal.getsignal(number) for number in (signal.SIGCHLD, signal.SIGINT)}
     engine = make_engine(state, entrypoint, heartbeat_seconds=0.2, pool_offered_grace=0.5)
-    signal.signal(
-        signal.SIGCHLD, children
-    )  # what the engine's own import of the project set is not this test's
+    for number, handler in dispositions.items():
+        signal.signal(number, handler)
     await engine.initialize()
     run = await engine.submit(["lingering"])
     stage = await offered(engine, run["id"])
@@ -506,7 +525,7 @@ async def test_a_pool_attempt_runs_in_a_child_of_the_forkserver(
 
 
 PRELOADS = """
-import json, os, socket, sys, threading, time
+import json, os, signal, socket, sys, threading, time
 from solera_worker.forkserver import _preload, _threads
 
 done = threading.Event()
@@ -524,14 +543,17 @@ def project(left):
             load.kept = socket.socketpair()
         if left == "pipe":
             load.kept = os.pipe()
+        if left == "sigchld":
+            signal.signal(signal.SIGCHLD, signal.SIG_IGN)
         return "project"
 
     return load
 
 found = {}
-for left in ("nothing", "raise", "exit", "thread", "socket", "pipe"):
+for left in ("nothing", "raise", "exit", "thread", "socket", "pipe", "sigchld"):
     load = project(left)
     found[left] = _preload("p", load)
+    signal.signal(signal.SIGCHLD, signal.SIG_DFL)
     if left == "thread":
         done.set()
         load.kept.join()
@@ -543,7 +565,8 @@ print(json.dumps(found))
 
 def test_the_forkserver_keeps_only_a_project_whose_import_left_nothing_running():
     """ERW-36: a forkserver keeps the project only if importing it raised
-    nothing and left no thread, socket or pipe behind; else it says why.
+    nothing, left no thread, socket or pipe behind and left its children its
+    own to wait for; else it says why.
     Run as a forkserver is: in a process of one thread."""
 
     import subprocess
@@ -555,6 +578,10 @@ def test_the_forkserver_keeps_only_a_project_whose_import_left_nothing_running()
     assert found["raise"] == [None, "importing the project raised ImportError: no module named numpi"]
     assert found["exit"] == [None, "importing the project raised SystemExit: 2"]
     assert found["thread"] == [None, "importing the project left 1 thread(s) running beside the main one"]
+    assert found["sigchld"] == [
+        None,
+        "importing the project ignored SIGCHLD, so the forkserver could not wait for its attempts",
+    ]
     for left in ("socket", "pipe"):
         assert found[left] == [
             None,
@@ -651,6 +678,45 @@ async def test_closing_a_pool_worker_ends_its_wait_and_not_its_attempt(state, tm
         assert (await engine.run_until(run["id"], 60))["request"]["status"] == "succeeded"
     finally:
         attempts.close()
+
+
+def test_closing_a_pool_worker_while_its_forkserver_imports_forks_nothing(tmp_path):
+    """ERW-36: closing the pool worker's attempts while its forkserver still
+    imports the project ends that forkserver: the run under way returns
+    LOST and forks no attempt."""
+
+    import threading
+    import time
+
+    from solera_worker.forkserver import Attempts
+
+    importing, hold = tmp_path / "importing", tmp_path / "hold"
+    hold.touch()
+    entrypoint = write_project(
+        tmp_path,
+        f"import os, time\nopen({str(importing)!r}, 'w').close()\n"
+        f"while os.path.exists({str(hold)!r}):\n    time.sleep(0.02)\n"
+        + HELD.format(ran=str(tmp_path / "ran"), hold="/nowhere"),
+    )
+    attempts = Attempts(entrypoint)
+    result = []
+    runner = threading.Thread(target=lambda: result.append(attempts.run({}, None)))
+    runner.start()
+    try:
+        for _ in range(1500):
+            if importing.exists():
+                break
+            time.sleep(0.02)
+        server = attempts.server
+        assert server is not None and server.deploy is None
+        attempts.close()
+        runner.join(10)
+        assert result == [4]  # LOST
+        assert server.process.poll() is not None
+    finally:
+        hold.unlink()
+        attempts.close()
+        runner.join(10)
 
 
 VERSIONED = """

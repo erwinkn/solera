@@ -1184,17 +1184,19 @@ control file:
   thread running beside the main one (counted by the OS, so a native
   library's threads count; where the OS gives no count, as on macOS, the
   project is never kept), left a socket or pipe open, which every attempt
-  would share, or took more than 60 s (it runs before any attempt owns
-  anything, so nothing else could stop it), the forkserver says why and
-  exits; the pool
-  worker logs one warning with that reason and starts a forkserver with
+  would share, ignored `SIGCHLD` (by Python or native code: the
+  forkserver could not wait for its attempts), or took more than 60 s (it
+  runs before any attempt owns anything, so nothing else could stop it),
+  the forkserver says why and exits; the pool worker logs one warning with that reason and starts a forkserver with
   the framework alone, whose attempts import the project themselves, as
   before. Until the pool worker restarts it does not try again. A file the
   import left open is shared too, its offset included, and so is any state
   the import made, a random generator's seed say: open files and seed
-  generators in the asset, not at import. A signal disposition the import
-  set, `SIGCHLD` ignored say, is the attempts': the forkserver restores
-  its own, so it still reaps them, and each child sets the project's.
+  generators in the asset, not at import. The forkserver sets no signal
+  disposition, so an attempt has the ones its project's import left, as
+  if it had imported it. The forkserver runs in a process group of its
+  own and each attempt joins the pool worker's, so a Ctrl-C reaches the
+  pool worker and its attempts, not the forkserver.
 - **A preloaded forkserver serves one deploy**: the manifest's `deploy`
   digest of the code it imported, whose build identity hashed the files as
   they were imported (`architecture.md` §11). A child whose spec names
@@ -1205,9 +1207,7 @@ control file:
   attempt whatever its spec says, so a spec the code on disk does not
   match fails with a deploy mismatch, as an import of its own would. A
   host whose code changes under one `SOLERA_BUILD` keeps serving the code
-  it imported: an explicit build id must change with the code. While the
-  digest also hashes the git commit, a commit that changes no code
-  replaces the forkserver too: one import more, no stale code.
+  it imported: an explicit build id must change with the code.
 
 **Every attempt process exits at once** (`os._exit`) once its sealed
 result is published, or once it cannot be: Local, ECS and Kubernetes
