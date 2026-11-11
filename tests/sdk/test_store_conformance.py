@@ -56,7 +56,7 @@ def postgres_harness(tmp_path):
         conn = store._connect()
         cur = conn.cursor()
         store._domain(cur, table)
-        store._fence(cur, table, partition)
+        store._check(cur, table, partition)
         try:
             yield
         finally:

@@ -51,6 +51,8 @@ class Store(Protocol):
                       generation=None, before=None) -> None: ...
     async def acquire(self, context, prior) -> None: ...          # fenced
     def keys(self, ref, among) -> Iterable[list[str]]: ...      # fenced
+    async def written_at(self, versions, prior, context): ...  # fenced, the new core: repair by version
+    async def full_run_ended(self, output, partition, run, newest, *, prior=None, home=None) -> bool: ...  # optional (D211)
     async def migrate(self, output, migrations, context=None, prior=None) -> list[str]: ...  # optional
     def prepare(self, write, output) -> Prepared: ...          # optional: types of its own
     def reads(self) -> AsyncContextManager[Reader]: ...       # optional: a store of current rows
@@ -71,6 +73,8 @@ class Reader(Protocol):                                        # what `reads()` 
 | `attempt` | the writing attempt's id |
 | `generation` | a number the engine assigns each attempt on a partition, larger for every later attempt; `None` outside an attempt |
 | `worker_id` | which process runs the attempt: an attempt started twice has one generation and two workers, and only the one that owns it may write |
+| `builds` | the new core's writes (D211): a full run builds beside the published rows. Off, every write goes in place (today's path) |
+| `build_run` | with `builds`: the full run the log names, by the version of the attempt that wrote its clear — the run in progress, else the run whose end the store was not yet told |
 
 **`store(write, prior, context) -> Written(ref)`** applies a write and
 returns a ref to the new content; the worker stamps the ref with the
@@ -178,6 +182,19 @@ among `among`, or all of them for None — in sorted chunks, by their
 bytes; never a value. A repair asks it after a dead writer (which of the
 keys it meant to change landed), and so does the reconciliation of an
 opaque write that died (every key the partition holds), `versions.md` §5.
+
+**`written_at(versions, prior, context)`** (fenced, the new core) yields
+the keys the partition holds at any of `versions` — attempts that wrote
+and ended without a commit — where a write of `context` would go, in
+sorted chunks. It first takes `context`'s version check, so no dead or
+late writer adds a row after the list is read (D196, rules 2 and 3).
+
+**`full_run_ended(output, partition, run, newest)`** (optional, D211)
+publishes the full run whose clear the attempt at version `run` wrote,
+and says whether it is published (`tracking-design.md` §8, obligations 4
+and 5). A store that names objects by version has nothing to publish;
+the engine treats a store without the method as published. A
+publication the data refuses raises `PublicationRefused`.
 
 **Errors.** Raise `WriteError` for a malformed write (duplicate keys, a
 wrong shape), `StoreError` for anything else the store refuses. A store
@@ -621,6 +638,92 @@ async for chunk in write.chunks():  # on the event loop
     for key, rows in await asyncio.to_thread(chunk.groups):
         await put(key, rows)
 ```
+
+### PostgresStore: the version check, and full runs built beside
+
+PostgresStore keeps one row per table and partition in
+`public.solera_versions` (`rel` the table's qualified name, `part`, the
+`generation` and `worker_id` of the newest attempt that wrote or
+checked, `written`, the `published` run, and the registered runs: with a
+build (`builds`), or with none made yet (`pending`)). Keyed
+by the table's name, it holds before any table exists, so the first write
+after a dead attempt locks it out even when it writes nothing. Every write
+transaction sends three statements in one round trip before anything
+else: the table's write domain (a shared advisory lock), the version
+check (the upsert above, which locks the row and returns `published` and
+`builds`), and the catalog lookup, read under the check's lock. It changes
+the catalog only where that lookup says something is missing: `CREATE …
+IF NOT EXISTS` takes its lock even when the object exists, and would queue
+behind a switch of another partition.
+
+A full run's first write opens a build,
+`solera_build.b_<md5(table, partition)>_<run>`: the user's table's shape
+with its CHECK constraints, generated columns, unique and exclusion
+indexes, and identity columns that draw from the user's table's sequences.
+A build copies the table's shape, not what a statement on the table does
+with its rows. So a table a build cannot stand in for never opens one: a
+view or a foreign table, or a table with a trigger, a rule, row security
+or a policy, or a generated column a build computes otherwise (a
+partition's own expression, or one that reads `tableoid`, which in the
+build is the build's), in any state, on it or on a table that inherits
+from it (a partition among them). The switch's `DELETE` and `INSERT` would
+publish rows other than the ones Solera has read in the build: a trigger
+or such a generated column changes them, a policy hides them. The store never
+alters the user's table to stop it, and which of them a statement would
+run depends on its events, its level, its state, the session's role and
+the statement's target, so the store does not guess. A full run's first
+write there fails with `PublicationRefused` and changes nothing; write such
+an output in place (today's path). The switch takes its `DELETE`'s lock on
+the table and every partition before it reads the catalog again, so any
+of them added during the run refuses the publication, and it reads the
+catalog once more after the rows, for a partition attached meanwhile
+takes no lock it waits for. Every transaction of the store that writes,
+switches or cleans up is READ COMMITTED, whatever the connection's
+default, so each catalog read sees the catalog as it is then; a snapshot
+read (`reads()`) keeps its REPEATABLE READ.
+
+A cleanup of one key deletes its rows from the partition's
+builds too. A run whose first writes are empty, with no
+table and no declared columns to make one from, makes nothing: its
+version row records it as pending, and its first batch with rows opens
+the build, whatever another partition made meanwhile. A pending run that
+ends publishes an empty partition.
+Writes of the run go there while the registry lists it; a load reads the
+build its ref names while the registry lists it, else the user's table,
+and reads the user's table again if the build was dropped under it. The
+switch (`full_run_ended`) holds the version row, deletes the partition's
+rows and inserts the build's in one transaction, then unregisters it;
+outside readers see all old rows, then all new, and wait for nothing. The
+DROP comes after, in a short transaction of its own that gives up rather
+than wait for a load (100 ms), and never fails the call that committed; the
+partition's next write or call finds the build in the catalog and drops
+it then. An `ALTER TABLE` issued during a switch waits for it, and every
+query after it waits too.
+
+A migration changes the user's table alone, so before it runs it drops
+every build of the table and leaves each registered, as lost; a restore
+that leaves `solera_build` behind does the same. A write of a lost build's
+run fails with `RunLost` and changes nothing, and the run's switch says
+not published; the build stays registered, as lost, so its run's writes
+keep failing (in place, the rows its clear removed are still there) until
+the engine starts the partition's full run over, whose first write drops
+it. A table dropped with its builds is the same: the run's next write
+fails with `RunLost`, never opens the build again empty. A load of a build
+makes the migration fail with `BuildInUse`, which is retryable, rather
+than wait while it holds every writer of the table.
+
+A cleanup deletes a partition's version row with its rows, unless an
+attempt took the check after the partition's last write (a repair that
+listed what a dead attempt left): that row stays, emptied, so no older
+attempt can write again. A cleanup of one partition of a partitioned
+table holds the shared write domain and that partition's version row
+(one it inserts for the cleanup when the partition has none yet, so the
+partition's first writer waits for it), so it runs beside writes and
+switches of the others.
+
+`written_at` reads the partition's rows at the dead versions with no index
+on `_version`: a repair scans the partition, which only runs after an
+attempt died having written.
 
 ### An object store: immutable names
 
