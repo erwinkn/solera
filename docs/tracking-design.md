@@ -1244,11 +1244,8 @@ itself) reads what outsiders read, so the gate counts its upstream
 incomplete until the notice, not only until the run ends.
 
 **An ordinary output's first run is a full run** of an empty output: its
-first batch says `batch.reset` and commits a clear. **A full run into a
-partition holding no rows writes in place** (Erwin, 2026-11-11): its
-first write, finding no row and no registered run, writes in place and
-records the run as published, so its switch does nothing. A partition
-that holds rows, a dead first run's leftovers included, builds beside. Downstream already treated a first run as
+first batch says `batch.reset` and commits a clear, so a first run also
+builds beside and appears whole. Downstream already treated a first run as
 incomplete (D205, the gate).
 
 **What outsiders see**, as the model checks it after every step: (i) a
@@ -1256,11 +1253,7 @@ program outside Solera reads the log's state at a commit where the output
 was neither mid full run nor in an unfinished first run, and never an
 earlier one than it read before; the only keys excused are those an
 uncommitted write outside a full run touched in place, never a full run's
-writes, except that a partition holding no rows may be seen filling during
-its first run, and a dead first run's partial rows stay visible until the
-next run (in the model: rows of that run's attempts and of writes
-outside a full run, nothing else, until its switch is due or a later
-run's switch); (ii) Solera reads the log, as before; (iii) the store switches to
+writes; (ii) Solera reads the log, as before; (iii) the store switches to
 a build at most once, and only once its run ended in the log; (iv) after a
 switch, no row of an older build is left. At rest, every ended run's build
 was published or overtaken, no build is left that a live attempt wrote,
@@ -1268,9 +1261,8 @@ and outsiders read what the log says. A released run is published as it
 stands, once no attempt it interrupted is left unrepaired: outsiders and
 downstream then read the same partial output, and the rest fills in place.
 A by-reference reader the gate lets through reads the log's head state,
-except keys an uncommitted write touched in place (outside a full run, or
-the first write of one into a partition holding no rows), the same
-exception outsiders have.
+except keys an uncommitted write outside a full run touched in place, the
+same exception outsiders have.
 
 **Dead and late writers** keep this section's five rules. The version
 check is the same row, so a late writer is refused whether or not a build
@@ -1280,8 +1272,7 @@ before the switch can run. Under D205 alone, a full run's first write
 deleted the partition's rows before its clear reached the journal, and
 only rule 4 covered a reader that loaded in between. Under D211 that
 window is gone for every reader: the first write only creates a build that
-no commit names until the clear is journaled, or, on a partition holding
-no rows, deletes nothing.
+no commit names until the clear is journaled.
 
 **Cost, measured on PostgreSQL 16** (`handoffs/SOLE-17/table-swap.md` in
 the Captain's drive). Outside queries keep their plan: the user's table
@@ -1966,7 +1957,7 @@ executable contract tests, as part of the build (T41).
 | SRC-12 | A load that finds a source at another version than its log records it in the source's log, unless the log changed that key since the batch's head. Two consumers of a source that changes on every read may trigger each other, bounded by ENG-10 | A source's file changed before its sensor saw it | D193 |
 | ENG-17 | A loaded version, or absence, of a produced output that neither its log nor a live attempt explains is alarmed; the consumer's key is not due until the producer redoes it; it never enters the log | §8: tally loads k2@6 from dead attempt A | D196 |
 | ENG-18 | An asset whose `ctx.load()` returns a version other than its own last commit owes a full run | §8: tally after a dead write of 5 | D196 |
-| STO-8 | A program reading a table outside Solera never sees an ordinary output's full run half done: all old rows until the run ends, then all new; a partition holding no rows may be seen filling during its first run, and a dead first run's partial rows stay visible until the next run; a released run is published as it stands; an asset that queries the table by reference waits until the switch | §8: copy's full run in batches of 2 | D211 |
+| STO-8 | A program reading a table outside Solera never sees an ordinary output's full run half done: all old rows until the run ends, then all new; a first run shows nothing until it completes; a released run is published as it stands; an asset that queries the table by reference waits until the switch | §8: copy's full run in batches of 2 | D211 |
 
 ## 17. Decisions
 
@@ -2145,7 +2136,7 @@ and batches that start at a piece boundary (asserted).
   5,000 histories (a load whose build a newer run overtook falls back to
   older rows, and the hold-back holds it). The model lets the engine switch whenever the partition
   is quiet; running it before the next batch, as §8 says, is one such
-  order. Seventeen rules: `swap` (build beside), `solera_build` (Solera
+  order. Sixteen rules: `swap` (build beside), `solera_build` (Solera
   reads the build), `first_full` (a first run is a full run),
   `switch_commit`, `switch_alone` and `switch_release` (each way a run
   ends owes the switch), `switch_owed` (the owed switch is journaled and
@@ -2157,9 +2148,8 @@ and batches that start at a piece boundary (asserted).
   place), `switch_cleanup` (the switch deletes the old rows first),
   `byref_wait` (an input taken by reference waits for the switch),
   `switch_result` (the notice is journaled only when the store says the run
-  is published), `switch_newest` (a call delivered after a newer attempt
-  wrote does nothing) and `fill_empty` (a full run writes in place only
-  into a partition holding no rows).
+  is published) and `switch_newest` (a call delivered after a newer
+  attempt wrote does nothing).
 
 **Every rule is needed.** Each rule is named, and `histories.py` holds one
 shrunk history per rule that passes with every rule on and fails with

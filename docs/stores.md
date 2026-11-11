@@ -682,33 +682,11 @@ switches or cleans up is READ COMMITTED, whatever the connection's
 default, so each catalog read sees the catalog as it is then; a snapshot
 read (`reads()`) keeps its REPEATABLE READ.
 
-A full run into a partition holding no rows writes in place (Erwin,
-2026-11-11): there are no old rows to keep from outsiders, so building
-beside would only double the work. A first write that would open a build,
-of a partition with no registered run and no row, writes in place
-instead and records its run as published, so the run's writes go in
-place and its switch does nothing. It is paid one statement, by that
-write and by a reset's repair listing (`written_at`) alone: whether the
-partition holds a row (with a partition column and no index on it, a scan
-of the table, which the switch's `DELETE` would scan too), read with the
-catalog again under the lock that statement takes on the table. The
-catalog read the write's first round trip made may be stale, but row
-security, a policy and a rule take a lock that one conflicts with, so
-none can hide rows from the check unseen; a table that is made after the
-write began is read again under its DDL lock, and one holding the
-partition's rows takes a build. So outside readers
-see all old rows, then all new, except that a partition holding no rows
-may be seen filling during its first run, and a dead first run's partial
-rows stay visible until the next run. A partition that holds rows,
-including a dead first run's leftovers, builds beside and switches. A
-table a build cannot stand in for is refused all the same, empty or not:
-row security can hide rows from the check. A cleanup of one key deletes its rows from the partition's
+A cleanup of one key deletes its rows from the partition's
 builds too. A run whose first writes are empty, with no
-table and no declared columns to make one from, makes nothing; with no
-table the partition holds no rows, so such a run writes in place unless a
-run is registered there. A run that opens no build that way is pending:
-its version row records it, and its first batch with rows opens the
-build, whatever another partition made meanwhile. A pending run that
+table and no declared columns to make one from, makes nothing: its
+version row records it as pending, and its first batch with rows opens
+the build, whatever another partition made meanwhile. A pending run that
 ends publishes an empty partition.
 Writes of the run go there while the registry lists it; a load reads the
 build its ref names while the registry lists it, else the user's table,

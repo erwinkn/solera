@@ -498,46 +498,15 @@ def test_outsiders_read_copys_full_run_all_old_then_all_new():
     assert out.builds == {} and w.ended == {} and w.check() is None
 
 
-def test_a_first_run_into_an_empty_partition_fills_in_place():
-    """An output's first run is a full run of an empty output, and a partition
-    holding no rows has no old rows to keep (Erwin, 2026-11-11): the run
-    writes in place, outsiders see it fill, and its switch publishes
-    nothing. The next full run finds rows and builds beside."""
-    events = [("items", K4), ("step", "copy", 2)]
-    w = oracle.replay_fullrun(events, kind="table")
+def test_a_first_run_is_hidden_until_it_completes():
+    """An output's first run is a full run of an empty output: outsiders read
+    nothing until it completes, then all of it."""
+    w = oracle.replay_fullrun([("items", K4), ("step", "copy", 2)], kind="table")
     out = w.copy.output
-    assert sorted(out.outside()) == ["k1", "k2"] and not out.builds and out.filling == 1
-    events += [("step", "copy", 2), ("switch", "copy", True)]
-    w = oracle.replay_fullrun(events, kind="table")
-    out = w.copy.output
-    assert sorted(out.outside()) == ["k1", "k2", "k3", "k4"] and out.filling is None
-    assert out.in_place == {1} and not out.switched
-    events += [("full", "copy"), ("step", "copy", 2)]
-    w = oracle.replay_fullrun(events, kind="table")
-    out = w.copy.output
-    assert len(out.builds) == 1 and {r.version for r in out.outside().values()} == {1, 2}
-    assert fullrun.run(events, "clear", "table") is None
-
-
-def test_outsiders_may_see_only_the_filling_runs_rows():
-    """Sol R8-2, Astra A10: while a partition fills, outsiders may see the
-    rows of the run filling it, and of writes outside a full run, nothing
-    else. A dead first run's rows stay; the next full run builds beside,
-    and its build's rows leaked into the table are caught."""
-    events = [
-        ("items", (("k1", True), ("k2", True), ("k3", True))),
-        ("plan", "copy", 1),
-        ("write", "copy"),
-        ("restart",),
-        ("items", (("k1", False),)),
-        ("plan", "copy", 1),
-        ("write", "copy"),
-    ]
-    w = oracle.replay_fullrun(events, kind="table")
-    out = w.copy.output
-    assert out.filling == 1 and len(out.builds) == 1 and w.outsiders(w.copy) is None
-    out.published.update(out.builds[max(out.builds)])
-    assert "which v1, filling it, did not write" in w.outsiders(w.copy)
+    assert sorted(out.rows) == ["k1", "k2"] and out.outside() == {} and list(out.builds) == [1]
+    w.apply(("step", "copy", 2))
+    w.apply(("switch", "copy", True))
+    assert sorted(out.outside()) == ["k1", "k2", "k3", "k4"]
 
 
 def test_a_release_publishes_the_partial_output():
@@ -578,8 +547,8 @@ def test_a_switch_a_newer_full_run_overtook_is_skipped():
     assert _versions(out.outside()) == {"k1": 1, "k2": 1} and w.ended == {}
     w.apply(("step", "copy", 1))
     w.apply(("switch", "copy", True))
-    assert _versions(out.outside()) == {"k1": 3, "k2": 4} and out.switched == {3: 1}
-    assert out.superseded == {2} and out.in_place == {1}  # the first run filled the empty partition
+    assert _versions(out.outside()) == {"k1": 3, "k2": 4} and out.switched == {1: 1, 3: 1}
+    assert out.superseded == {2}
     assert fullrun.run(events, "clear", "table") is None
 
 
@@ -719,13 +688,10 @@ def test_a_late_notice_of_an_older_switch_keeps_the_newer_one_owed():
 
 
 def test_outsiders_are_checked_at_once_not_only_at_rest():
-    """Without the build, the uncommitted first write of a full run over rows
-    shows outsiders rows no commit recorded, and the check after that very
-    step says so (Sol review, 4)."""
+    """Without the build, an uncommitted first write shows outsiders a row no
+    commit recorded, and the check after that very step says so (Sol review, 4)."""
     w = fullrun.World("clear", "table", frozenset({"swap"}))
-    events = [("items", (("k4", True), ("k5", True))), ("step", "tally", 2), ("switch", "tally", True)]
-    for ev in [*events, ("full", "tally"), ("plan", "tally", 1), ("write", "tally")]:
-        assert w.check() is None
+    for ev in [("items", (("k4", True), ("k5", True))), ("plan", "tally", 1), ("write", "tally")]:
         w.apply(ev)
     assert "outsiders read tally" in (w.check() or "")
 
@@ -743,9 +709,6 @@ def test_every_write_keeps_the_builds_the_log_names():
     (the run in progress and the run owed a switch) and the reset's own new
     build; drop the others (Sol review 2 of #37, 3)."""
     out = fullrun.Output("copy", "table")
-    out.published = {
-        "k0": fullrun.Row(0, ("z", None, 0), None)
-    }  # the partition holds a row: runs build beside
     out.write(1, {"k1": ("a", None, 0)}, True, 1)  # run 1 opens build 1
     out.write(2, {"k1": ("b", None, 0)}, True, 2, (None, 1))  # run 1 ended, owed; run 2 opens build 2
     out.write(3, {"k1": ("c", None, 0)}, True, 3, (2, 1))  # run 2 in progress; a reset opens build 3
