@@ -927,7 +927,7 @@ the claim's event counter, in the spec), which is also the key's version
 (`versions.md`):
 
 ```
-site_files/alpha/f-1/184467.json                 a key, as generation 184467 wrote it
+site_files/alpha/455/f-1/184467.json             a key, as generation 184467 wrote it
 site_status/alpha@184467.json                    a value
 site_events/alpha/000000000042/184467.json       commit 42 of an append output, by generation 184467
 ```
