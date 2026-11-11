@@ -1956,13 +1956,11 @@ class Model:
             self._keep_spans(key, spans)
 
     def _on_Proceeded(self, e):
-        """An operator lets the readers of an incomplete partition proceed
-        over its partial output (D205), until it starts over."""
+        """An operator's proceed (D205) is refused until ERW-42 gives "read at
+        a proceeded head" an owner, so no journal holds one and no span is
+        ever proceeded: replaying one is refused, not applied."""
 
-        self._core_apply(e)  # the keyed outputs' full runs it ends
-        for _, key, spans in list(self._open_spans(e["asset"], e["partition"])):
-            spans[-1][2] = True
-            self._keep_spans(key, spans)
+        raise ValueError(f"a journaled Proceeded of {e.get('asset')!r}: proceed waits for ERW-42")
 
     def _core_close(self, producers: set[str]) -> None:
         """After a deploy, the new path's edges that read nothing now: of an
