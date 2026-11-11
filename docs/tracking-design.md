@@ -1258,8 +1258,9 @@ earlier one than it read before; the only keys excused are those an
 uncommitted write outside a full run touched in place, never a full run's
 writes, except that a partition holding no rows may be seen filling during
 its first run, and a dead first run's partial rows stay visible until the
-next run (in the model: rows of that run, until its switch is due or a
-later run's switch); (ii) Solera reads the log, as before; (iii) the store switches to
+next run (in the model: rows of that run's attempts and of writes
+outside a full run, nothing else, until its switch is due or a later
+run's switch); (ii) Solera reads the log, as before; (iii) the store switches to
 a build at most once, and only once its run ended in the log; (iv) after a
 switch, no row of an older build is left. At rest, every ended run's build
 was published or overtaken, no build is left that a live attempt wrote,

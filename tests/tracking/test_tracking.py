@@ -519,6 +519,27 @@ def test_a_first_run_into_an_empty_partition_fills_in_place():
     assert fullrun.run(events, "clear", "table") is None
 
 
+def test_outsiders_may_see_only_the_filling_runs_rows():
+    """Sol R8-2, Astra A10: while a partition fills, outsiders may see the
+    rows of the run filling it, and of writes outside a full run, nothing
+    else. A dead first run's rows stay; the next full run builds beside,
+    and its build's rows leaked into the table are caught."""
+    events = [
+        ("items", (("k1", True), ("k2", True), ("k3", True))),
+        ("plan", "copy", 1),
+        ("write", "copy"),
+        ("restart",),
+        ("items", (("k1", False),)),
+        ("plan", "copy", 1),
+        ("write", "copy"),
+    ]
+    w = oracle.replay_fullrun(events, kind="table")
+    out = w.copy.output
+    assert out.filling == 1 and len(out.builds) == 1 and w.outsiders(w.copy) is None
+    out.published.update(out.builds[max(out.builds)])
+    assert "which v1, filling it, did not write" in w.outsiders(w.copy)
+
+
 def test_a_release_publishes_the_partial_output():
     """D205's release ends the full run in the log (FullRunDone): outsiders and
     downstream alike then read the partial output, and the rest fills in place."""

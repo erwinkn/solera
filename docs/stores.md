@@ -635,9 +635,16 @@ A full run into a partition holding no rows writes in place (Erwin,
 beside would only double the work. A first write that would open a build,
 of a partition with no registered run and no row, writes in place
 instead and records its run as published, so the run's writes go in
-place and its switch does nothing. It is paid one `SELECT EXISTS`, by
-that write alone (with a partition column and no index on it, a scan of
-the table, which the switch's `DELETE` would scan too). So outside readers
+place and its switch does nothing. It is paid one statement, by that
+write and by a reset's repair listing (`written_at`) alone: whether the
+partition holds a row (with a partition column and no index on it, a scan
+of the table, which the switch's `DELETE` would scan too), read with the
+catalog again under the lock that statement takes on the table. The
+catalog read the write's first round trip made may be stale, but row
+security, a policy and a rule take a lock that one conflicts with, so
+none can hide rows from the check unseen; a table that is made after the
+write began is read again under its DDL lock, and one holding the
+partition's rows takes a build. So outside readers
 see all old rows, then all new, except that a partition holding no rows
 may be seen filling during its first run, and a dead first run's partial
 rows stay visible until the next run. A partition that holds rows,

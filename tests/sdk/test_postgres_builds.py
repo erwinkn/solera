@@ -427,6 +427,61 @@ async def test_a_partition_holding_a_dead_first_runs_rows_builds_beside(store):
     assert outside(store, out, "p1") == {"b": "7"} and outside(store, out, "p2") == {"z": "2"}
 
 
+def after_begin(store, monkeypatch, *statements) -> None:
+    """Run the statements once, from another connection, after a write's
+    first round trip read the catalog and before the rest of the write."""
+
+    begin, pending = store._begin, list(statements)
+
+    def late(*args, **kwargs):
+        found = begin(*args, **kwargs)
+        while pending:
+            sql(pending.pop(0))
+        return found
+
+    monkeypatch.setattr(store, "_begin", late)
+
+
+@pytest.mark.parametrize("held", [False, True])
+async def test_row_security_enabled_after_a_full_run_began_refuses_its_first_write(store, monkeypatch, held):
+    """Sol R8-1, Astra A9: row security enabled after the write's first round
+    trip read the catalog can hide the partition's rows from the check that
+    decides whether it fills in place. The check reads the catalog again in
+    its own statement, under its lock on the table: the write is refused,
+    and outsiders keep what they read."""
+
+    out = output(incremental=True)
+    table, _, _ = store._table(out)
+    sql(f"CREATE TABLE {table} (id text, v text, _version bigint)")
+    if held:
+        await store.store(rows(a="old"), None, at(out, 1, builds=False))
+    after_begin(store, monkeypatch, f"ALTER TABLE {table} ENABLE ROW LEVEL SECURITY")
+    with pytest.raises(PublicationRefused, match="since the write began"):
+        await store.store(rows(b="new"), None, at(out, 5, reset=True))
+    assert outside(store, out) == ({"a": "old"} if held else {})
+
+
+async def test_a_table_made_after_a_full_run_began_holding_its_rows_builds_beside(store, monkeypatch):
+    """A table absent when the write began can be made before the write makes
+    it: another partition's first write, or by hand. The write reads the
+    catalog again under the table's DDL lock, and a partition that now holds
+    rows builds beside."""
+
+    out = output(incremental=True)
+    table, _, _ = store._table(out)
+    after_begin(
+        store,
+        monkeypatch,
+        f"CREATE TABLE {table} (id text, v text, _version bigint)",
+        f"INSERT INTO {table} VALUES ('a', 'old', 1)",
+    )
+    written = await store.store(rows(b="new"), None, at(out, 5, reset=True))
+    assert written.ref.handle["build"] == 5 and builds(store, out) == [5]
+    assert outside(store, out) == {"a": "old"} and registry(store, out)[2] == [5]
+    assert await store.full_run_ended(out, "", 5, 5) is True
+    assert outside(store, out) == {"b": "new"}
+
+
 async def test_unkeyed_sql_and_commit_writes_build_beside(store):
     """Every full run builds beside, whatever the output's shape: a value
     replaced whole, commits appended, a Sql query materialized."""

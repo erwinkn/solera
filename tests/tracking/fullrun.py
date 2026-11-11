@@ -151,6 +151,8 @@ class Output:
         self.shown = 0  # the settled commit the outside view last matched
         # A full run begun on a partition holding no rows, until its switch is due or done.
         self.filling: int | None = None
+        # The writes outsiders may see while it fills: its run's attempts, and writes outside a full run.
+        self.fillers: set[int] = set()
         self.in_place: set[int] = set()  # full runs that wrote in place, published as they began
         self.objects: dict[tuple[str, int], Row] = {}  # every version written, as files keep them
         self.removals: dict[
@@ -210,7 +212,9 @@ class Output:
     def _apply(self, version: int, writes: dict, clear: bool, ctx: tuple = (None, None)) -> None:
         run, owed = ctx
         if clear and not self.published and not self.builds:
-            self.filling = version  # outsiders may see it fill: the one exception to all old, then all new
+            self.filling, self.fillers = version, set()  # outsiders may see it fill: the one exception
+        if self.filling is not None and (self.filling in (version, run) or (run is None and not clear)):
+            self.fillers.add(version)
         if not self.swap:
             if clear:
                 self.published = {}
@@ -1352,10 +1356,8 @@ class World:
         self.stats["outside reads during a build"] += bool(out.builds)
         if out.filling is not None:
             self.stats["outside reads of a partition filling"] += 1
-            if old := {k: r for k, r in view.items() if r.version < out.filling}:
-                return (
-                    f"outsiders read {a.name}'s {_rows(old)}, older than v{out.filling}, which is filling it"
-                )
+            if other := {k: r for k, r in view.items() if r.version not in out.fillers}:
+                return f"outsiders read {a.name}'s {_rows(other)}, which v{out.filling}, filling it, did not write"
             return None
         for c in out.settled:
             st = out.log.states[c]

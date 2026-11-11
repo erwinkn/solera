@@ -404,6 +404,9 @@ class PostgresStore:
         if not state["present"]:
             # Partitions write one table at once: its first writers take turns.
             state = self._locked_state(cur, table)
+            if state["present"] and at.publishes is not None and self._holds_rows(cur, at, output):
+                # Made since the write began, and holding the partition's rows: it builds beside.
+                at.run, at.opens, at.publishes, at.builds = at.publishes, True, None, [at.publishes]
         if state["present"]:
             self._check_drift(output, table, state, declared, pk)
         else:
@@ -650,13 +653,13 @@ class PostgresStore:
 
         A full run into a partition holding no rows has nothing to keep
         outsiders from: a first write that would open a build, of a partition
-        with no registered run and no row (one `EXISTS`, paid by that write
-        alone), writes in place instead and records its run as published, so
-        its writes go in place and `full_run_ended` does nothing for it. Outside
-        readers may so see the partition fill, and a dead run's rows stay
-        until the next run's switch (Erwin, 2026-11-11). A table a build cannot
-        stand in for is refused all the same: row security can hide rows from
-        the check.
+        with no registered run and no row (`_holds_rows`, one statement, paid
+        by that write and by a reset's repair listing alone), writes in place
+        instead and records its run as published, so its writes go in place
+        and `full_run_ended` does nothing for it. Outside readers may so see
+        the partition fill, and a dead run's rows stay until the next run's
+        switch (Erwin, 2026-11-11). A table a build cannot stand in for is
+        refused all the same: row security can hide rows from the check.
 
         A run's state is recorded in its version row, never inferred from
         the catalog: registered with a build (`builds`), or with none made
@@ -701,15 +704,7 @@ class PostgresStore:
         if run is not None:
             at.run, at.opens = run, run not in at.builds
         if at.opens and not (at.builds or at.pending or state["unbuildable"]):
-            column = context.output.config.get("partition_column")
-            where = {column: context.partition} if column else {}
-            if (
-                not state["present"]
-                or not cur.execute(
-                    f"SELECT EXISTS (SELECT FROM {table} WHERE {self._where_sql(where)}) AS held",
-                    [where[k] for k in sorted(where)],
-                ).fetchone()["held"]
-            ):
+            if not (state["present"] and self._holds_rows(cur, at, context.output)):
                 at.run, at.opens, at.publishes = None, False, run
         if at.opens and state["unbuildable"]:
             raise PublicationRefused(
@@ -723,6 +718,34 @@ class PostgresStore:
         kept = {_build_name(table, context.partition, b) for b in at.builds}
         at.retired = any(name not in kept for name in built)
         return at
+
+    def _holds_rows(self, cur, at: _Target, output: Output) -> bool:
+        """Whether the partition holds a row, for a full run's first write
+        into a table that has no build of it. One statement reads it with
+        the catalog (`_UNBUILDABLE`), under the lock the statement takes on
+        the table: what the catalog read at `_begin` may be stale (READ
+        COMMITTED), but DDL committed before this lock is seen here, and row
+        security, a policy or a rule, which take a lock this one conflicts
+        with, cannot commit after it until the write's transaction ends.
+        Row security could hide the rows from the check (Sol R8-1, Astra
+        A9): a table a build cannot stand in for is refused, as `_aim`
+        refuses it."""
+
+        column = output.config.get("partition_column")
+        where = {column: at.partition} if column else {}
+        found = cur.execute(
+            "SELECT "
+            + _UNBUILDABLE.format(rel="%s::regclass")
+            + f" AS unbuildable, EXISTS (SELECT FROM {at.table} WHERE {self._where_sql(where)}) AS held",
+            [at.table, at.table, *(where[k] for k in sorted(where))],
+        ).fetchone()
+        if found["unbuildable"]:
+            raise PublicationRefused(
+                f"{output.name} {at.partition!r}: {at.table} {_UNBUILDABLE_WHY}, since the write began: "
+                "a full run can neither tell whether it holds rows nor build beside it. Write the "
+                "output in place"
+            )
+        return found["held"]
 
     def _register(self, cur, at: _Target, checked: dict | None) -> None:
         if checked is not None and (at.builds, at.pending, at.publishes) != (
