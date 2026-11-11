@@ -593,7 +593,8 @@ async def _written(solera, content: dict) -> list:
 
     await solera.deploy(Project(assets=[feed, consumer], default_store=FileStore(solera.root / "data")))
     await solera.run("feed")
-    await solera.settle(0.3)
+    await solera.until(lambda: fired)
+    await solera.quiet()
     return fired
 
 
@@ -618,7 +619,7 @@ async def test_inc_14_writing_the_same_rows_again_is_a_change_its_consumers_proc
     fired = await _written(solera, content)
     keys = await solera.keys("feed")
     await solera.run("feed")
-    await solera.settle(0.3)
+    await solera.until(lambda: len(fired) == 2)
     again = await solera.keys("feed")
     assert set(again) == set(keys) == {"a", "b"}
     assert all(again[k] != keys[k] for k in keys)  # a new version of each
