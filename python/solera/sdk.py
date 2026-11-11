@@ -490,6 +490,9 @@ class Upstream:
     commits: range | None = None
 
 
+_NEW = object()  # a `Batch` field not given, or not yet read from the worker's columns
+
+
 class Batch:
     """What an `Incremental` input delivered to a parameter (§5.1). The rows
     arrive as the parameter; `ctx.batch[name]` says what they are and where
@@ -536,6 +539,12 @@ class Batch:
         return {"count": before + len(batch.added) - len(batch.removed)}"""
 
     __slots__ = ("rows", "reset", "index", "count", "final", "upstream", "_keys", "_served", "_columns")
+    rows: Any
+    reset: bool
+    index: int
+    count: int
+    final: bool
+    upstream: Upstream
     _FIELDS = (
         "rows",
         "added",
@@ -549,6 +558,7 @@ class Batch:
         "upstream",
         "served",
     )
+    __match_args__ = _FIELDS
 
     def __init__(
         self,
@@ -561,8 +571,8 @@ class Batch:
         index: int = 0,
         count: int = 1,
         final: bool = True,
-        upstream: Upstream | None = None,
-        served: dict | None = None,
+        upstream: Upstream = _NEW,
+        served: dict = _NEW,
     ):
         keys = {"added": added, "updated": updated, "removed": removed, "unchanged": unchanged}
         for name, value in (
@@ -571,9 +581,9 @@ class Batch:
             ("index", index),
             ("count", count),
             ("final", final),
-            ("upstream", Upstream() if upstream is None else upstream),
+            ("upstream", Upstream() if upstream is _NEW else upstream),
             ("_keys", keys),
-            ("_served", {} if served is None else served),
+            ("_served", {} if served is _NEW else served),
             ("_columns", None),
         ):
             object.__setattr__(self, name, value)
@@ -587,7 +597,7 @@ class Batch:
 
         batch = cls(**fields)
         object.__setattr__(batch, "_keys", {})
-        object.__setattr__(batch, "_served", None)
+        object.__setattr__(batch, "_served", _NEW)
         object.__setattr__(batch, "_columns", (classes, served))
         return batch
 
@@ -596,14 +606,25 @@ class Batch:
             self._keys[name] = self._columns[0].keys(name)
         return self._keys[name]
 
-    added = property(lambda self: self._class("added"))
-    updated = property(lambda self: self._class("updated"))
-    removed = property(lambda self: self._class("removed"))
-    unchanged = property(lambda self: self._class("unchanged"))
+    @property
+    def added(self) -> tuple:
+        return self._class("added")
+
+    @property
+    def updated(self) -> tuple:
+        return self._class("updated")
+
+    @property
+    def removed(self) -> tuple:
+        return self._class("removed")
+
+    @property
+    def unchanged(self) -> tuple:
+        return self._class("unchanged")
 
     @property
     def served(self) -> dict:
-        if self._served is None:
+        if self._served is _NEW:
             source = self._columns[1]
             object.__setattr__(self, "_served", {} if source is None else source.versions())
         return self._served
@@ -622,7 +643,11 @@ class Batch:
         return hash(self._values())
 
     def __repr__(self):
-        return f"Batch({', '.join(f'{name}={getattr(self, name)!r}' for name in self._FIELDS)})"
+        fields = ", ".join(f"{name}={getattr(self, name)!r}" for name in self._FIELDS)
+        return f"{type(self).__qualname__}({fields})"
+
+    def __reduce__(self):
+        return type(self), self._values()
 
     def __setattr__(self, name, value):
         raise FrozenInstanceError(f"cannot assign to field {name!r}")

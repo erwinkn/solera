@@ -53,10 +53,12 @@ class SourceLoader:
         rows, bad = self.served.read(answer, keys, Loaded, grouped=inner is not MISSING)
         if bad is not None:
             raise StoreError(
-                f"source {self.source.name!r}: key {bad!r} came without the version it was served at: "
+                f"source {self.source.name!r}: key {bad[0]!r} came without the version it was served at: "
                 "return Loaded(row, version=…)"
             )
         if inner is not MISSING:  # dict[str, T]: each key's group, as T
+            if not frames.is_frame_type(inner):
+                return rows
             return {k: frames.materialize(group, inner) for k, group in rows.items()}
         return frames.materialize(rows, t)
 

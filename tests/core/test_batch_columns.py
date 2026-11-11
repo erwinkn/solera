@@ -48,6 +48,10 @@ def answer(rnd, keys, words):
     return out
 
 
+def _rows(value):
+    return value if isinstance(value, list) else [value]
+
+
 @pytest.mark.parametrize("seed", range(40))
 def test_columns_follow_the_per_key_rule(tmp_path, seed):
     rnd = random.Random(seed)
@@ -80,15 +84,81 @@ def test_columns_follow_the_per_key_rule(tmp_path, seed):
         load = {k: v for k, c, v in zip(keys, classes, versions, strict=True) if c != "removed"}
         view = KeyVersions(planned)
         assert list(view) == list(load) and dict(view.items()) == load and view.sorted() == sorted(load)
-        served = None
+        served, model = None, None
         if rnd.random() < 0.8:
-            served = Served()
-            for _ in range(rnd.randint(1, 2)):
-                rows, bad = served.read(answer(rnd, sorted(load), words), sorted(load), Loaded)
+            served, model = Served(), {}
+            for _ in range(rnd.randint(1, 3)):
+                asked = sorted(rnd.sample(sorted(load), rnd.randint(0, len(load))))
+                given = answer(rnd, asked, words)
+                rows, bad = served.read(given, asked, Loaded)
                 assert bad is None
+                assert rows == [r for k in asked if given.get(k) for r in _rows(given[k].value)]
+                model.update({k: None if given.get(k) is None else given[k].version for k in asked})
+            assert served.items() == sorted(model.items(), key=lambda kv: kv[0].encode())
         got, loaded = planned.observe(served)
-        want, want_loaded = observe(keys, classes, versions, None if served is None else dict(served.items()))
+        want, want_loaded = observe(keys, classes, versions, model)
         assert {c: list(got.keys(c)) for c in CLASSES} == want
         assert loaded == want_loaded
         assert got.any() == any(want.values())
         t.apply(t.progress_ops(p, [([], [tuple(x) for x in loaded])])[0])
+
+
+def test_a_whole_answer_is_read_in_its_order_and_grouped_on_request():
+    answer = {
+        "b": Loaded([{"id": "b"}, {"id": "b2"}], version="1"),
+        "a": Loaded({"id": "a"}, version=2),
+        "c": None,
+    }
+    served = Served()
+    assert served.read(answer, None, Loaded) == ([{"id": "b"}, {"id": "b2"}, {"id": "a"}], None)
+    assert served.items() == [("a", "2"), ("b", "1"), ("c", None)]
+    grouped, bad = Served().read(answer, ["a", "z"], Loaded, grouped=True)
+    assert grouped == {"a": [{"id": "a"}]} and bad is None
+
+
+def test_a_bad_answer_names_its_key_and_leaves_it_as_it_was_served():
+    served = Served()
+    served.read({"a": Loaded(1, version="1")}, ["a"], Loaded)
+    rows, bad = served.read({"a": Loaded(2, version=None), None: 3}, ["a"], Loaded)
+    assert bad == ("a",) and served.get("a") == "1"
+    assert Served().read({None: object()}, None, Loaded)[1] == (None,)
+
+
+def test_a_mapping_answer_is_read_through_its_get():
+    class Answer(dict):
+        def get(self, key, default=None):
+            return Loaded({"id": key}, version="mine")
+
+    served = Served()
+    assert served.read(Answer(), ["k"], Loaded) == ([{"id": "k"}], None)
+    assert served["k"] == "mine" and served.get("x", 0) == 0
+    with pytest.raises(KeyError):
+        served["x"]
+
+
+def test_loads_out_of_key_order_keep_each_keys_last_serving():
+    served = Served()
+    served.read({"m": Loaded(0, version="1"), "z": Loaded(0, version="1")}, None, Loaded)
+    served.read({"a": Loaded(0, version="2"), "m": None, "q": Loaded(0, version="2")}, None, Loaded)
+    served.read({"z": Loaded(0, version="3")}, None, Loaded)
+    assert served.items() == [("a", "2"), ("m", None), ("q", "2"), ("z", "3")]
+    assert served.versions() == {"a": "2", "q": "2", "z": "3"}
+
+
+def test_a_batch_read_from_columns_equals_one_built_whole():
+    import copy
+    import pickle
+
+    from solera.sdk import Batch
+
+    p = PlannedKeys()
+    classes, loaded = p.observe(None)
+    lazy = Batch._of_columns(classes, None, rows=[1], index=2, count=3)
+    whole = Batch(rows=[1], index=2, count=3)
+    assert lazy == whole and repr(lazy) == repr(whole) and loaded == []
+    assert copy.deepcopy(lazy) == whole and pickle.loads(pickle.dumps(lazy)) == whole
+    match lazy:
+        case Batch(rows, added):
+            assert (rows, added) == ([1], ())
+    with pytest.raises(AttributeError):
+        lazy.rows = []

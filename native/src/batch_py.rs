@@ -6,9 +6,9 @@
 
 use pyo3::exceptions::{PyKeyError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList, PyString, PyTuple, PyType};
+use pyo3::types::{PyBytes, PyDict, PyList, PyString, PyTuple, PyType};
 use solera_tracking as tr;
-use std::borrow::Cow;
+use std::cmp::Ordering;
 use std::sync::Arc;
 use tr::codec::Ver;
 use tr::plan::Plan;
@@ -37,16 +37,6 @@ struct Planned {
     loads: Vec<u32>,
 }
 
-impl Planned {
-    /// The position of a key the batch loads.
-    fn find(&self, k: &[u8]) -> Option<usize> {
-        self.loads
-            .binary_search_by(|&p| self.keys.get(p as usize).cmp(k))
-            .ok()
-            .map(|i| self.loads[i] as usize)
-    }
-}
-
 /// One keyed input's keys in a batch, with their classes and the versions
 /// they are planned at, from a plan's bytes.
 #[pyclass(module = "solera._native", frozen)]
@@ -68,6 +58,13 @@ impl PlannedKeys {
                     )));
                 }
                 let cands = std::mem::take(&mut plan.inputs[input].keys);
+                if u32::try_from(cands.len()).is_err() {
+                    return Err(PyValueError::new_err(format!(
+                        "a batch of {} keys: at most {} on one input",
+                        cands.len(),
+                        u32::MAX
+                    )));
+                }
                 let mut keys = Arena::default();
                 keys.ends.reserve(cands.len());
                 let mut classes = Vec::with_capacity(cands.len());
@@ -137,13 +134,18 @@ impl PlannedKeys {
         )
     }
 
-    /// The version a loaded key is planned at (None: none); a `KeyError`
-    /// for a key the batch does not load.
-    fn version<'py>(&self, py: Python<'py>, k: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PyAny>> {
-        match text(k).and_then(|t| self.inner.find(t.as_bytes())) {
-            Some(i) => version(py, self.inner.versions[i].as_version()),
-            None => Err(PyKeyError::new_err(k.clone().unbind())),
+    /// The keys the batch loads, in the plan's order, each with the version
+    /// it is planned at (None: none).
+    fn versions<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let p = &*self.inner;
+        let d = PyDict::new(py);
+        for i in (0..p.classes.len()).filter(|&i| p.classes[i] != REMOVED) {
+            d.set_item(
+                key(py, p.keys.get(i)),
+                version(py, p.versions[i].as_version())?,
+            )?;
         }
+        Ok(d)
     }
 
     /// The batch's classes, from what a source served (None: the input is
@@ -230,13 +232,28 @@ impl Classes {
     }
 }
 
-fn text<'a>(k: &'a Bound<'_, PyAny>) -> Option<Cow<'a, str>> {
-    k.cast::<PyString>().ok().and_then(|s| s.to_cow().ok())
+/// A key's bytes as a loader names it: a `str` (lone surrogates escaped,
+/// as `key_bytes` encodes them), `bytes`, else its text.
+fn key_bytes(k: &Bound<'_, PyAny>, out: &mut Vec<u8>) -> PyResult<()> {
+    if let Ok(s) = k.cast::<PyString>() {
+        match s.to_cow() {
+            Ok(t) => out.extend_from_slice(t.as_bytes()),
+            Err(_) => out.extend_from_slice(
+                s.call_method1("encode", ("utf-8", "surrogateescape"))?
+                    .cast::<PyBytes>()?
+                    .as_bytes(),
+            ),
+        }
+    } else if let Ok(b) = k.cast::<PyBytes>() {
+        out.extend_from_slice(b.as_bytes());
+    } else {
+        out.extend_from_slice(k.str()?.to_cow()?.as_bytes());
+    }
+    Ok(())
 }
 
 /// What a source's loader served of the keys asked of it, across every load
 /// of one reader: each key with the version it was served at, or absent.
-/// Read by Python as a mapping, `key -> version` (None: served absent).
 #[pyclass(module = "solera._native")]
 #[derive(Default)]
 pub(crate) struct Served {
@@ -246,52 +263,74 @@ pub(crate) struct Served {
 }
 
 impl Served {
-    fn position(&self, k: &[u8]) -> Option<usize> {
+    /// The version `k` was served at; None when it was served absent or
+    /// not asked for.
+    fn lookup(&self, k: &[u8]) -> Option<&str> {
         let (mut lo, mut hi) = (0, self.keys.len());
         while lo < hi {
             let mid = (lo + hi) / 2;
             match self.keys.get(mid).cmp(k) {
-                std::cmp::Ordering::Less => lo = mid + 1,
-                std::cmp::Ordering::Greater => hi = mid,
-                std::cmp::Ordering::Equal => return Some(mid),
+                Ordering::Less => lo = mid + 1,
+                Ordering::Greater => hi = mid,
+                Ordering::Equal => return self.versions[mid].as_deref(),
             }
         }
         None
     }
 
-    /// The version `k` was served at; None when it was served absent or
-    /// not asked for.
-    fn lookup(&self, k: &[u8]) -> Option<&str> {
-        self.position(k).and_then(|i| self.versions[i].as_deref())
-    }
-
-    /// Sorted, each key once: a later serving of a key replaces an earlier.
-    fn normalize(&mut self) {
-        let n = self.keys.len();
-        if (1..n).all(|i| self.keys.get(i - 1) < self.keys.get(i)) {
+    /// Adds one load's servings: sorted first, a key served twice keeping
+    /// its later version, then merged in, a key served before taking the
+    /// new version. A load whose keys all follow the last served (pages in
+    /// key order) is appended: linear in the load, not in what came before.
+    fn absorb(&mut self, keys: Arena, mut versions: Vec<Option<Box<str>>>) {
+        let mut order: Vec<usize> = (0..keys.len()).collect();
+        order.sort_by(|&a, &b| keys.get(a).cmp(keys.get(b)));
+        order.dedup_by(|later, earlier| {
+            let same = keys.get(*later) == keys.get(*earlier);
+            if same {
+                *earlier = *later;
+            }
+            same
+        });
+        let follows = match (order.first(), self.keys.len()) {
+            (None, _) => return,
+            (_, 0) => true,
+            (Some(&f), n) => keys.get(f) > self.keys.get(n - 1),
+        };
+        if follows {
+            for i in order {
+                self.keys.push(keys.get(i));
+                self.versions.push(versions[i].take());
+            }
             return;
         }
-        let mut order: Vec<usize> = (0..n).collect();
-        order.sort_by(|&a, &b| self.keys.get(a).cmp(self.keys.get(b)));
-        let mut keys = Arena::default();
-        let mut versions: Vec<Option<Box<str>>> = Vec::with_capacity(n);
-        for (j, &i) in order.iter().enumerate() {
-            let last = order
-                .get(j + 1)
-                .is_none_or(|&next| self.keys.get(next) != self.keys.get(i));
-            if last {
-                keys.push(self.keys.get(i));
-                versions.push(self.versions[i].take());
+        let (old_keys, mut old_versions) = (
+            std::mem::take(&mut self.keys),
+            std::mem::take(&mut self.versions),
+        );
+        let (mut a, mut b) = (0, 0);
+        while a < old_keys.len() || b < order.len() {
+            let take_new = match (a < old_keys.len(), b < order.len()) {
+                (true, true) => match keys.get(order[b]).cmp(old_keys.get(a)) {
+                    Ordering::Less => true,
+                    Ordering::Equal => {
+                        a += 1;
+                        true
+                    }
+                    Ordering::Greater => false,
+                },
+                (false, _) => true,
+                (true, false) => false,
+            };
+            if take_new {
+                self.keys.push(keys.get(order[b]));
+                self.versions.push(versions[order[b]].take());
+                b += 1;
+            } else {
+                self.keys.push(old_keys.get(a));
+                self.versions.push(old_versions[a].take());
+                a += 1;
             }
-        }
-        self.keys = keys;
-        self.versions = versions;
-    }
-
-    fn version_at<'py>(&self, py: Python<'py>, i: usize) -> Bound<'py, PyAny> {
-        match &self.versions[i] {
-            Some(v) => PyString::new(py, v).into_any(),
-            None => py.None().into_bound(py),
         }
     }
 }
@@ -308,8 +347,9 @@ impl Served {
     /// key it answered), whether it was served and at which version (a key
     /// served again takes its later version). Returns its rows (every key's,
     /// flat, in the order of `keys`, a value that is a list being that key's
-    /// rows; or with `grouped` a dict of each key's) and the first key whose
-    /// answer is not a `loaded` with a version (None when every one is).
+    /// rows; or with `grouped` a dict of each key's) and, when a key's
+    /// answer is not a `loaded` with a version, `(key,)` of the first such
+    /// key, which is not added (None when every answer is).
     #[pyo3(signature = (answer, keys, loaded, grouped=false))]
     fn read<'py>(
         &mut self,
@@ -318,9 +358,9 @@ impl Served {
         keys: Option<Bound<'py, PyList>>,
         loaded: &Bound<'py, PyType>,
         grouped: bool,
-    ) -> PyResult<(Bound<'py, PyAny>, Option<Bound<'py, PyAny>>)> {
+    ) -> PyResult<(Bound<'py, PyAny>, Option<Bound<'py, PyTuple>>)> {
         guard(|| {
-            let dict = answer.cast::<PyDict>().ok();
+            let dict = answer.cast_exact::<PyDict>().ok();
             let names: Vec<Bound<'py, PyAny>> = match &keys {
                 Some(k) => k.iter().collect(),
                 None => answer.try_iter()?.collect::<PyResult<_>>()?,
@@ -329,18 +369,21 @@ impl Served {
             let value_attr = PyString::intern(py, "value");
             let rows = PyList::empty(py);
             let groups = PyDict::new(py);
-            let served = self;
-            served.keys.ends.reserve(names.len());
-            served.versions.reserve(names.len());
+            let mut served = Arena::default();
+            served.ends.reserve(names.len());
+            let mut versions = Vec::with_capacity(names.len());
+            let mut name_bytes = Vec::new();
             let mut bad = None;
             for name in &names {
                 let item = match dict {
                     Some(d) => d.get_item(name)?,
                     None => Some(answer.call_method1("get", (name,))?),
                 };
-                served.keys.push(name.str()?.to_cow()?.as_bytes());
+                name_bytes.clear();
+                key_bytes(name, &mut name_bytes)?;
                 let Some(item) = item.filter(|v| !v.is_none()) else {
-                    served.versions.push(None); // observed absent
+                    served.push(&name_bytes); // observed absent
+                    versions.push(None);
                     continue;
                 };
                 let v = match item.is_instance(loaded)? {
@@ -348,12 +391,13 @@ impl Served {
                     false => py.None().into_bound(py),
                 };
                 if v.is_none() {
-                    served.versions.push(None);
-                    bad = Some(name.clone());
+                    bad = Some(PyTuple::new(py, [name])?);
                     break;
                 }
-                served.versions.push(Some(v.str()?.to_cow()?.into()));
+                let version: Box<str> = v.str()?.to_cow()?.into();
                 let value = item.getattr(&value_attr)?;
+                served.push(&name_bytes);
+                versions.push(Some(version));
                 if grouped {
                     let group = match value.cast::<PyList>() {
                         Ok(l) => l.clone(),
@@ -368,7 +412,7 @@ impl Served {
                     rows.append(value)?;
                 }
             }
-            served.normalize();
+            self.absorb(served, versions);
             let out = if grouped {
                 groups.into_any()
             } else {
@@ -376,6 +420,39 @@ impl Served {
             };
             Ok((out, bad))
         })
+    }
+
+    /// The version `k` was served at; `default` when it was served absent or
+    /// not asked for (the per-key path reads it as a dict).
+    #[pyo3(signature = (k, default=None))]
+    fn get<'py>(
+        &self,
+        py: Python<'py>,
+        k: &Bound<'py, PyAny>,
+        default: Option<Bound<'py, PyAny>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        guard(|| {
+            let mut b = Vec::new();
+            key_bytes(k, &mut b)?;
+            Ok(match self.lookup(&b) {
+                Some(v) => PyString::new(py, v).into_any(),
+                None => default.unwrap_or_else(|| py.None().into_bound(py)),
+            })
+        })
+    }
+
+    /// The version `k` was served at: a `KeyError` when it was served absent
+    /// or not asked for.
+    fn __getitem__<'py>(
+        &self,
+        py: Python<'py>,
+        k: &Bound<'py, PyAny>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let got = self.get(py, k, None)?;
+        if got.is_none() {
+            return Err(PyKeyError::new_err(k.clone().unbind()));
+        }
+        Ok(got)
     }
 
     /// Every key served at a version, with that version.
@@ -389,51 +466,19 @@ impl Served {
         Ok(d)
     }
 
-    fn __len__(&self) -> usize {
-        self.keys.len()
-    }
-
-    fn __contains__(&self, k: &Bound<'_, PyAny>) -> bool {
-        text(k).is_some_and(|t| self.position(t.as_bytes()).is_some())
-    }
-
-    fn __getitem__<'py>(
-        &self,
-        py: Python<'py>,
-        k: &Bound<'py, PyAny>,
-    ) -> PyResult<Bound<'py, PyAny>> {
-        match text(k).and_then(|t| self.position(t.as_bytes())) {
-            Some(i) => Ok(self.version_at(py, i)),
-            None => Err(PyKeyError::new_err(k.clone().unbind())),
-        }
-    }
-
-    #[pyo3(signature = (k, default=None))]
-    fn get<'py>(
-        &self,
-        py: Python<'py>,
-        k: &Bound<'py, PyAny>,
-        default: Option<Bound<'py, PyAny>>,
-    ) -> Bound<'py, PyAny> {
-        match text(k).and_then(|t| self.position(t.as_bytes())) {
-            Some(i) => self.version_at(py, i),
-            None => default.unwrap_or_else(|| py.None().into_bound(py)),
-        }
-    }
-
-    fn __iter__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        Ok(self.keys(py)?.into_any().try_iter()?.into_any())
-    }
-
-    fn keys<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
-        PyList::new(py, (0..self.keys.len()).map(|i| key(py, self.keys.get(i))))
-    }
-
+    /// Every key asked of the loader, in key order, with the version it was
+    /// served at (None: absent).
     fn items<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
-        PyList::new(
-            py,
-            (0..self.keys.len()).map(|i| (key(py, self.keys.get(i)), self.version_at(py, i))),
-        )
+        let items = (0..self.keys.len())
+            .map(|i| {
+                let v = match &self.versions[i] {
+                    Some(v) => PyString::new(py, v).into_any(),
+                    None => py.None().into_bound(py),
+                };
+                (key(py, self.keys.get(i)), v)
+            })
+            .collect::<Vec<_>>();
+        PyList::new(py, items)
     }
 }
 

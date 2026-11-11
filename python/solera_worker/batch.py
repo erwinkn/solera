@@ -53,17 +53,38 @@ def planned(spec: dict, pin: dict) -> PlannedKeys:
 
 class KeyVersions(Mapping):
     """A batch's `Keys.generations`: the keys it loads, each with the version
-    it is planned at, read from the plan's columns instead of copied into a
-    dict, so a store pays per key only for what it reads. In the plan's
-    order; `sorted()` lists them sorted in one call."""
+    it is planned at, in the plan's order. Read from the plan's columns when
+    a store first asks, a whole column in one call: the keys alone (`iter`,
+    `sorted()` for a source's loader), or the dict of their versions, for a
+    store that looks keys up."""
 
-    __slots__ = ("_planned",)
+    __slots__ = ("_planned", "_versions")
 
     def __init__(self, planned: PlannedKeys):
-        self._planned = planned
+        self._planned, self._versions = planned, None
+
+    def _dict(self) -> dict:
+        if self._versions is None:
+            self._versions = self._planned.versions()
+        return self._versions
 
     def __getitem__(self, key):
-        return self._planned.version(key)
+        return self._dict()[key]
+
+    def __contains__(self, key) -> bool:
+        return key in self._dict()
+
+    def get(self, key, default=None):
+        return self._dict().get(key, default)
+
+    def items(self):
+        return self._dict().items()
+
+    def values(self):
+        return self._dict().values()
+
+    def __repr__(self) -> str:
+        return f"KeyVersions({len(self)} keys)"
 
     def __iter__(self):
         return iter(self._planned.load_keys())
