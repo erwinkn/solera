@@ -174,7 +174,8 @@ impl ChangeIndex {
     }
 
     /// Walks the layers a read at commits `(c1, c2]` needs, newest first:
-    /// those holding any of these commits that `q`'s key bounds reach.
+    /// those holding any of these commits that `q`'s key bounds reach and,
+    /// for a read of listed keys, whose keys span one of them.
     /// Clears decide what a read reads, so a layer of these commits that
     /// lists any is checked against its file even when the key bounds leave
     /// it out. (A layer that lists none is trusted until it is read, as its
@@ -194,7 +195,10 @@ impl ChangeIndex {
         }
         let mut ls = Vec::new();
         for l in layers.iter().rev().filter(|l| l.hi > c1 && l.lo <= c2) {
-            if b.overlaps(l) {
+            let listed = keys
+                .as_ref()
+                .is_none_or(|k| k.any_within(&l.first_key, &l.last_key));
+            if b.overlaps(l) && listed {
                 ls.push(l);
             } else if !l.clears.is_empty() {
                 self.store.top(l).await?;
