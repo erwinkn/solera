@@ -732,10 +732,10 @@ class PostgresStore:
         column = output.config.get("partition_column")
         where = {column: at.partition} if column else {}
         found = cur.execute(
-            "SELECT "
+            f"SELECT EXISTS (SELECT FROM {at.table} WHERE {self._where_sql(where)}) AS held, "
             + _UNBUILDABLE.format(rel="%s::regclass")
-            + f" AS unbuildable, EXISTS (SELECT FROM {at.table} WHERE {self._where_sql(where)}) AS held",
-            [at.table, at.table, *(where[k] for k in sorted(where))],
+            + " AS unbuildable",
+            [*(where[k] for k in sorted(where)), at.table, at.table],
         ).fetchone()
         if found["unbuildable"]:
             raise PublicationRefused(

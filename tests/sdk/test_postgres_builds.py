@@ -1398,12 +1398,10 @@ async def test_two_spellings_of_one_partition_share_its_version_check(store):
     assert [r["id"] for r in await store.load(newer.ref, list[dict], None)] == ["a"]
 
 
-@pytest.mark.xfail(
-    strict=True, raises=BaseException, reason="also on main: an empty Arrow patch (Sol, B8 merge delta)"
-)
 async def test_an_empty_arrow_patch_removes_its_keys(store):
-    """Sol (B8, the delta on main a377d13, also on main): a Patch of an empty
-    Arrow table panics in the chunk lookup rather than remove its keys."""
+    """Sol (B8, the delta on main a377d13): a Patch of an empty Arrow table
+    panicked in the chunk lookup rather than remove its keys; fixed on main
+    by #56."""
 
     import pyarrow as pa
 
