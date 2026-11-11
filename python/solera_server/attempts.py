@@ -373,7 +373,7 @@ class Attempts:
 
     # -- launching (§3) ------------------------------------------------------------------
 
-    async def _launch(self, task, run, attempt, prepared) -> dict:
+    async def _launch(self, task, run, attempt, prepared, generation) -> dict:
         """Write the spec and make the launch durable (§3): from here on, the
         attempt outlives this engine. Returns the placement's stage."""
 
@@ -428,6 +428,14 @@ class Attempts:
         if execution["kind"] == "Pool":
             needs = {k: v for k in ("cpu", "memory", "gpu") if (v := execution["options"].get(k)) is not None}
             event["pool"] = {"name": execution["executor"], "needs": needs}
+        if self.core is not None:  # ids for its keyed outputs never named: what its commit builds under
+            generation.check()  # by name, so under the deploy it was prepared under
+            minted: list = []
+            for name, info in prepared["outputs"].items():
+                if info["contract"].get("key") is not None:
+                    self.core.output_id(name, task["partition"], minted)
+            if minted:
+                event["core_outputs"] = minted
         # Launch only what a restarted engine would adopt, never an orphan: until the
         # launch is durable, pool discovery does not offer it either. If it never
         # is (this engine was replaced), it never is offered.
@@ -726,6 +734,18 @@ class Attempts:
         except LostOwnership:
             return
         except self.Conflict as error:
+            if getattr(error, "replan", False):  # it would hold keys back: planned again, no try spent
+                await self._fail(
+                    task_id,
+                    attempt,
+                    str(error),
+                    outcome="replanned",
+                    retryable=True,
+                    delay=REPLAN_DELAY,
+                    result=result,
+                    reason="held back",
+                )
+                return
             await self._fail(
                 task_id,
                 attempt,
