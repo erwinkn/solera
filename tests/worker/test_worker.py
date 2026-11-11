@@ -439,7 +439,7 @@ def imported(path) -> list[str]:
         (LOCKED_AT_IMPORT, "left 1 thread(s) running"),
         (SOCKET_AT_IMPORT, "left 2 socket(s) or pipe(s) open"),
         (SLOW_AT_IMPORT, "took more than 5 s"),
-        (SIGCHLD_AT_IMPORT, "ignored SIGCHLD"),
+        (SIGCHLD_AT_IMPORT, "set how SIGCHLD is handled"),
         (SIGINT_IGNORED_AT_IMPORT, None),
     ],
     ids=[
@@ -460,8 +460,9 @@ async def test_a_pool_attempt_runs_in_a_child_of_the_forkserver(
     in the loop's executor too (review round 3, #3). The forkserver keeps
     the project it imported, and the attempt imports nothing, unless that
     import left a thread (one holding a lock the child would inherit held)
-    or a socket behind, ignored SIGCHLD (the forkserver could not wait for
-    its children), or did not finish in time: then it says why, and the
+    or a socket behind, changed SIGCHLD (the forkserver must wait for its
+    children, and run no project code when one ends), or did not finish in
+    time: then it says why, and the
     attempt imports the project itself. The attempt has the signal
     dispositions the project's import set (ERW-36)."""
 
@@ -484,7 +485,9 @@ async def test_a_pool_attempt_runs_in_a_child_of_the_forkserver(
     stage = await offered(engine, run["id"])
     # A pool worker's own process; it prints its forkserver's pid and the attempt's exit code.
     worker = (
-        "import json, sys\n"
+        "import json, signal, sys\n"
+        "if sys.argv[4]:  # as a pool worker's own import of such a project leaves it\n"
+        "    signal.signal(signal.SIGCHLD, signal.SIG_IGN)\n"
         "from solera_worker.forkserver import Attempts\n"
         "attempts = Attempts(sys.argv[2], preload_timeout=float(sys.argv[3]))\n"
         "code = attempts.run(json.loads(sys.argv[1]), None)\n"
@@ -501,6 +504,7 @@ async def test_a_pool_attempt_runs_in_a_child_of_the_forkserver(
             json.dumps(stage),
             entrypoint,
             "5" if "took" in (preloaded or "") else "60",
+            "ignore" if "SIGCHLD" in (preloaded or "") else "",
         ],
         capture_output=True,
         text=True,
@@ -545,12 +549,14 @@ def project(left):
             load.kept = os.pipe()
         if left == "sigchld":
             signal.signal(signal.SIGCHLD, signal.SIG_IGN)
+        if left == "sigchld-handler":
+            signal.signal(signal.SIGCHLD, lambda *_: None)
         return "project"
 
     return load
 
 found = {}
-for left in ("nothing", "raise", "exit", "thread", "socket", "pipe", "sigchld"):
+for left in ("nothing", "raise", "exit", "thread", "socket", "pipe", "sigchld", "sigchld-handler"):
     load = project(left)
     found[left] = _preload("p", load)
     signal.signal(signal.SIGCHLD, signal.SIG_DFL)
@@ -578,10 +584,11 @@ def test_the_forkserver_keeps_only_a_project_whose_import_left_nothing_running()
     assert found["raise"] == [None, "importing the project raised ImportError: no module named numpi"]
     assert found["exit"] == [None, "importing the project raised SystemExit: 2"]
     assert found["thread"] == [None, "importing the project left 1 thread(s) running beside the main one"]
-    assert found["sigchld"] == [
-        None,
-        "importing the project ignored SIGCHLD, so the forkserver could not wait for its attempts",
-    ]
+    for left in ("sigchld", "sigchld-handler"):
+        assert found[left] == [
+            None,
+            "importing the project set how SIGCHLD is handled, which the forkserver needs as it was",
+        ]
     for left in ("socket", "pipe"):
         assert found[left] == [
             None,

@@ -10,13 +10,15 @@ half-used. So the forkserver keeps the project only if importing it left
 the process as it found it: no exception, no thread but the main one
 (counted by the OS, so a native library's threads count; refused where it
 cannot be counted), no new socket or pipe, which every attempt forked from
-it would share, and its children still its to wait for (no SIGCHLD
-ignored); and within `PRELOAD_TIMEOUT`: the import runs before an attempt
+it would share, and SIGCHLD as it was; and within `PRELOAD_TIMEOUT`: the import runs before an attempt
 owns anything, where nothing could cancel it. Otherwise it says why and
 exits, and the pool worker starts one with the framework alone, whose
 attempts import the project themselves, for as long as the pool worker
-runs. The forkserver sets no signal disposition, so an attempt has the
-ones the project's import left, as if it had imported it itself.
+runs. The forkserver sets SIGCHLD to its default before it imports
+anything and refuses an import that changed it, so it can always wait for
+its children and no project code runs in it when one ends; it sets no
+other disposition, so an attempt has the ones the project's import left,
+as if it had imported it itself.
 
 A preloaded forkserver serves one deploy: the manifest digest of the code
 it imported, its files hashed as they were imported (`Project.manifest`).
@@ -31,6 +33,7 @@ import contextlib
 import ctypes
 import json
 import os
+import signal
 import socket
 import stat
 import subprocess
@@ -94,7 +97,7 @@ class Attempts:
         """A forkserver ready to fork, or None once closed."""
 
         if self.preload:
-            server = self._ready(Forkserver(self.entrypoint))
+            server = self._ready(preload=True)
             if server is None or server.refused is None:
                 return server
             self.preload = False
@@ -103,24 +106,22 @@ class Attempts:
                 file=sys.stderr,
                 flush=True,
             )
-        server = self._ready(Forkserver(self.entrypoint, preload=False))
+        server = self._ready(preload=False)
         if (
             server is not None and server.refused is not None
         ):  # the framework alone did not start: no attempt can
             raise RuntimeError(f"the forkserver did not start: {server.refused}")
         return server
 
-    def _ready(self, server: Forkserver) -> Forkserver | None:
-        """`server` once it said hello, or None if closed meanwhile: it is
-        published first, so `close` ends its import too."""
+    def _ready(self, preload: bool) -> Forkserver | None:
+        """A forkserver once it said hello, or None if closed first or
+        meanwhile: it starts and is published under the lock, so `close`
+        ends its import too."""
 
         with self.lock:
-            published = not self.closed
-            if published:
-                self.server = server
-        if not published:
-            server.close()
-            return None
+            if self.closed:
+                return None
+            server = self.server = Forkserver(self.entrypoint, preload)
         server.hello(self.preload_timeout)
         if self.closed:
             return None
@@ -173,8 +174,8 @@ class Forkserver:
     def hello(self, timeout: float) -> None:
         """Wait for it to import what it imports, within `timeout` seconds."""
 
-        self.socket.settimeout(timeout)
         try:
+            self.socket.settimeout(timeout)
             line = self.stream.readline()
             hello = (
                 json.loads(line)
@@ -222,9 +223,12 @@ def serve() -> None:
     """The forkserver: `python -c ... FD ENTRYPOINT PRELOAD PGID SYS_PATH`,
     PRELOAD empty for the framework alone, PGID the pool worker's process
     group. It says hello, then forks one attempt per request, waits for it
-    and answers with its exit code. It sets no signal disposition: an
-    attempt has those its project's import left, as if it imported it."""
+    and answers with its exit code. It sets one signal disposition, before
+    it imports anything: SIGCHLD's to the default, so it can wait for its
+    children whatever the pool worker's was. An attempt has the
+    dispositions its project's import left, as if it imported it."""
 
+    signal.signal(signal.SIGCHLD, signal.SIG_DFL)
     connection = socket.socket(fileno=int(sys.argv[1]))
     stream = connection.makefile("rwb")
 
@@ -291,6 +295,8 @@ def _preload(entrypoint: str, load):
         project = load(entrypoint)
     except BaseException as error:  # SystemExit too: each attempt reports its own import's
         return None, f"importing the project raised {type(error).__name__}: {error}"
+    if not _waits():
+        return None, "importing the project set how SIGCHLD is handled, which the forkserver needs as it was"
     threads = _threads()
     if threads is None:
         return (
@@ -304,17 +310,32 @@ def _preload(entrypoint: str, load):
             None,
             f"importing the project left {len(opened)} socket(s) or pipe(s) open, which every attempt would share",
         )
-    pid = os.fork()  # a child it cannot wait for: SIGCHLD ignored, by Python or native code
+    pid = os.fork()  # SIGCHLD's default, but with SA_NOCLDWAIT set natively: no child to wait for
     if pid == 0:
         os._exit(0)
     try:
         os.waitpid(pid, 0)
     except ChildProcessError:
-        return (
-            None,
-            "importing the project ignored SIGCHLD, so the forkserver could not wait for its attempts",
-        )
+        return None, "importing the project left the forkserver no child to wait for (SA_NOCLDWAIT)"
     return project, None
+
+
+def _waits() -> bool:
+    """SIGCHLD has its default disposition, from Python and in the kernel
+    (where native code may have set it): neither ignored, so its children
+    stay its to wait for, nor handled, so no project code runs here when
+    one ends."""
+
+    if signal.getsignal(signal.SIGCHLD) != signal.SIG_DFL:
+        return False
+    with open("/proc/self/status") as status:
+        for line in status:
+            if (
+                line.startswith(("SigIgn:", "SigCgt:"))
+                and int(line.split()[1], 16) >> (signal.SIGCHLD - 1) & 1
+            ):
+                return False
+    return True
 
 
 def _threads() -> int | None:
