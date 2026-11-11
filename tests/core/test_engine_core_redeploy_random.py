@@ -4,7 +4,10 @@ move that resets the output, an edge closed by removing a reader) after any nati
 before any output lock, after the state's awaits a launch and a build make, and when a worker
 starts. No tick raises, a whole reader never reads
 its upstream's partial content, every run ends, everything converges once the deploys stop,
-and a replay rebuilds the same model. `REDEPLOY_SEEDS` sets the seeds (default 0-5),
+and a replay rebuilds the same model. Each history starts with an operator's proceed over a
+stopped full run of the producer, whose reader `nxt` has a reader of its own (`tail`), and
+proceeds again at random: `report` may read the content the operator released, `tail` never
+reads partial content. `REDEPLOY_SEEDS` sets the seeds (default 0-5),
 `REDEPLOY_TRACE=1` prints what each commit was planned under, `REDEPLOY_FIRED=<file>` appends
 where each seed's deploys landed."""
 
@@ -17,7 +20,8 @@ import re
 import pytest
 from solera.sdk import In, Incremental, Output, Project, Retry, asset
 from solera.stores import FileStore
-from solera_server.state import State
+from solera_server.state import Conflict, State
+from solera_server.tracking import full
 
 from tests.contract.harness import Refused, Solera, rebuild
 
@@ -32,6 +36,13 @@ class History:
         self.rows = {k: 1 for k in [*STABLE, "c1", "k1", "t1"]}
         self.projects, self.fired, self.budget, self.armed = {}, [], 8, False
         self.reads, self.read, self.committed, self.trace = 0, {}, [], []
+        self.removed, self.released, self.proceeds = (
+            set(),
+            set(),
+            0,
+        )  # assets a deploy removed; proceeded content
+        self.hold, self.waiting, self.stop = asyncio.Event(), False, None
+        self.hold.set()
 
     def project(self, variant):
         h, name = self, variant["name"]
@@ -45,6 +56,9 @@ class History:
         async def body(ctx, files: list):
             await asyncio.sleep(0.005)
             b = ctx.batch["files"]
+            if h.stop is not None and b.index >= h.stop:  # stopped midway, for a proceed
+                h.waiting = True
+                await h.hold.wait()
             if keyed:
                 return rebuild(b, [{"id": r["id"], "v": r["v"]} for r in files])
             held = {} if b.reset else dict(await ctx.load() or {})
@@ -59,9 +73,9 @@ class History:
             inputs={"files": Incremental(batch_size=1)}, outputs=out, aliases=[other], retries=Retry(n=1)
         )(body)
 
-        def seen(ctx, ids):
+        def seen(ctx, ids, who="report"):
             h.reads += 1
-            h.read[h.reads] = (ids, dict(h.variant), list(h.fired))
+            h.read[h.reads] = (ids, dict(h.variant), list(h.fired), who)
             ctx.metadata(tok=h.reads)
             return ids
 
@@ -88,7 +102,11 @@ class History:
             async def nxt(ctx, rows: list):
                 return rebuild(ctx.batch["rows"], [{"id": r["id"], "v": r["v"]} for r in rows])
 
-            assets.append(nxt)
+            @asset(inputs={"rows": In("nxt")}, retries=Retry(n=1))
+            async def tail(ctx, rows: list):
+                return seen(ctx, sorted(r["id"] for r in rows), "tail")
+
+            assets += [nxt, tail]
         stores = {"other": FileStore(self.s.root / "other")}
         made = Project(assets=assets, stores=stores, default_store=FileStore(self.s.root / "data"))
         self.projects[made.manifest["deploy"]] = made
@@ -111,7 +129,27 @@ class History:
         self.variant = variant
         self.fired.append((where, what))
         self.trace.append(("FIRE", where, what, dict(variant)))
-        self.s.engine.redeploy(self.project(variant).manifest)
+        manifest = self.project(variant).manifest
+        self.removed |= set(self.s.engine.manifest["assets"]) - set(manifest["assets"])
+        self.s.engine.redeploy(manifest)
+
+    async def proceed(self):
+        """An operator lets readers go on over the producer's stopped run: what
+        it holds now is released to its readers (not to theirs)."""
+
+        name, armed = self.variant["name"], self.armed
+        if not any(p["asset"] == name for p in full.stopped(self.s.engine)):
+            return
+        self.armed = False
+        try:
+            ids = await (self.s.rows(name) if self.variant["axis"] == "keyed" else self.s.read(name))
+            await self.s.engine.proceed(name, "", "test")
+            self.released.add(tuple(sorted(ids)))
+            self.proceeds += 1
+        except Conflict:
+            pass
+        finally:
+            self.armed = armed
 
     def instrument(self, monkeypatch):
         from solera_server.executors.inline import InlinePlacement
@@ -225,12 +263,35 @@ async def test_deploys_at_every_await(tmp_path, monkeypatch, seed):
         await s.deploy(h.project(h.variant))
         await s.run("files")
         await s.run(h.variant["name"])
+        h.stop = 1
+        h.hold.clear()
+        stopped = await s.submit(h.variant["name"], mode="full")
+        await s.until(lambda: h.waiting)
+        await s.cancel(stopped["id"])
+        await s.wait(stopped)
+        h.stop = None
+        h.hold.set()
+        await h.proceed()
+        assert h.proceeds == 1
+        await s.run("nxt")
+        tails = [await s.submit("tail")]  # held until copy is whole again: waited for at the end
         h.instrument(monkeypatch)
         h.armed = True
         runs = []
         for _ in range(24):
             op = h.rng.choice(
-                ["files", "producer", "producer", "report", "report", "nxt", "settle", "cancel"]
+                [
+                    "files",
+                    "producer",
+                    "producer",
+                    "report",
+                    "report",
+                    "nxt",
+                    "tail",
+                    "settle",
+                    "cancel",
+                    "proceed",
+                ]
             )
             if op == "files":
                 churn = h.rng.choice(["c1", "k1", "t1", "c2", "k2"])
@@ -246,10 +307,14 @@ async def test_deploys_at_every_await(tmp_path, monkeypatch, seed):
                     runs.append(await s.submit("report"))
                 elif op == "nxt" and "nxt" in s.engine.manifest["assets"]:
                     runs.append(await s.submit("nxt"))
+                elif op == "tail" and "tail" in s.engine.manifest["assets"]:
+                    tails.append(await s.submit("tail"))
             except Refused as error:
                 assert error.status == 400 and "Unknown asset" in str(error), error
             if op == "cancel" and runs:
                 await s.cancel(h.rng.choice(runs)["id"])
+            if op == "proceed":
+                await h.proceed()
             await s.settle(h.rng.choice([0.05, 0.2]))
         h.armed = False
         await s.settle(1.0)
@@ -272,7 +337,8 @@ async def test_deploys_at_every_await(tmp_path, monkeypatch, seed):
         for run in runs:
             for tries in (await s.get(f"/runs/{run['id']}"))["attempts"].values():
                 crashed += [a["error"] for a in tries if (a.get("error") or "").startswith("engine:")]
-        assert not [e for e in crashed if not re.fullmatch(r"engine: '\w+'", e)], (crashed, h.fired)
+        removed = [e for e in crashed if (m := re.fullmatch(r"engine: '(\w+)'", e)) and m[1] in h.removed]
+        assert len(removed) == len(crashed), (crashed, h.removed, h.fired)
         base = {"name": "copy", "axis": "keyed", "store": "default", "edge": True}
         h.variant = base
         s.engine.redeploy(h.project(base).manifest)
@@ -280,10 +346,20 @@ async def test_deploys_at_every_await(tmp_path, monkeypatch, seed):
         await s.run("copy", mode="full")
         await s.run("report")
         await s.run("nxt")
+        await s.run("tail")
+        for run in tails:  # held while copy was partial; each ends once it is whole
+            await s.wait(run, 30)
         await s.settle(0.3)
         assert await s.read("report") == sorted(h.rows), (await s.read("report"), h.fired)
         assert sorted(await s.rows("nxt")) == sorted(h.rows), h.fired
-        bad = [h.read[t] for t in h.committed if t in h.read and not set(STABLE) <= set(h.read[t][0])]
+        assert await s.read("tail") == sorted(h.rows), (await s.read("tail"), h.fired)
+        bad = [
+            h.read[t]
+            for t in h.committed
+            if t in h.read
+            and not set(STABLE) <= set(h.read[t][0])
+            and not (h.read[t][3] == "report" and tuple(h.read[t][0]) in h.released)
+        ]
         if bad and os.environ.get("REDEPLOY_TRACE"):
             last = None
             for t in h.trace:

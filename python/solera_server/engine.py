@@ -1870,6 +1870,8 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
             raise core_commit.HeldBack(
                 f"{why[0]}: {why[1]}"
             )  # a head it read is partial: never, by `prepare`
+        if self.core is not None and core_full.over_proceeded(self.m, prepared.get("gate") or ()):
+            commit["over_proceeded"] = True  # its outputs are partial: `Model._spans`
         if built is not None:  # checked, then recorded with nothing awaited between (rule 3)
             core_commit.check(self.core, built)
             if (core := built.payload()) is not None:
