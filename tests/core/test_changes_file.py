@@ -111,6 +111,8 @@ def test_a_change_names_each_key_once_in_byte_order():
         rows.changes([], size=0)
     with pytest.raises(TypeError):
         rows.changes([None])
+    with pytest.raises(TypeError):
+        rows.changes("ac")
     assert b"".join(rows.changes(iter({"c", "a"}), "w")) == encode_changes({"7": "w", "b": "w"}, ["a", "c"])
     # A failed iterator ends: it never hands out the blocks after the one that failed.
     blocks = Rows.records([{"id": k} for k in "abc"], "id").changes(["b"], size=4)

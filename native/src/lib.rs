@@ -479,6 +479,9 @@ impl Rows {
             if size == 0 {
                 return Err(PyValueError::new_err("a block holds at least one change"));
             }
+            if removes.is_instance_of::<PyString>() {
+                return Err(PyTypeError::new_err("removes are keys, not a str"));
+            }
             let mut removes = removes
                 .try_iter()?
                 .map(|k| k?.extract::<String>())
@@ -691,22 +694,21 @@ impl ChangeBlocks {
             if !self.held && !self.read {
                 self.held = self.cursor.read().map_err(to_py)?;
                 self.read = !self.held;
+                let k = self.cursor.entry().0;
+                if self.held && std::str::from_utf8(k).is_err() {
+                    let k = String::from_utf8_lossy(k);
+                    return Err(PyValueError::new_err(format!(
+                        "{k:?}: a changed key is UTF-8 text"
+                    )));
+                }
             }
             let removed = self.removes.get(self.next).map(String::as_bytes);
             let written = self.held.then(|| self.cursor.entry().0);
-            if let Some(k) = written {
-                if std::str::from_utf8(k).is_err() {
-                    return Err(PyValueError::new_err(format!(
-                        "{:?}: a changed key is UTF-8 text",
-                        String::from_utf8_lossy(k)
-                    )));
-                }
-                if removed == Some(k) {
-                    return Err(PyValueError::new_err(format!(
-                        "{:?} is both written and removed",
-                        String::from_utf8_lossy(k)
-                    )));
-                }
+            if let Some(k) = written.filter(|&k| removed == Some(k)) {
+                return Err(PyValueError::new_err(format!(
+                    "{:?} is both written and removed",
+                    String::from_utf8_lossy(k)
+                )));
             }
             let (key, change) = match (written, removed) {
                 (None, None) => break,
@@ -742,9 +744,10 @@ impl ChangeBlocks {
             if self.done {
                 return Ok(None);
             }
-            let block = py.detach(|| self.block());
-            self.done = !matches!(block, Ok(Some(_)));
-            Ok(block?.map(|b| PyBytes::new(py, &b[MAGIC.len()..])))
+            self.done = true;
+            let block = py.detach(|| self.block())?;
+            self.done = block.is_none();
+            Ok(block.map(|b| PyBytes::new(py, &b[MAGIC.len()..])))
         })
     }
 }
