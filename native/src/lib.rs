@@ -128,6 +128,15 @@ type Columns<'py> = (
 /// Takes a whole Arrow C stream (`__arrow_c_stream__`), without the GIL: a
 /// producer may need it on another thread.
 fn arrow_batches(py: Python<'_>, obj: &Bound<'_, PyAny>) -> PyResult<Vec<RecordBatch>> {
+    Ok(arrow_stream(py, obj)?.1)
+}
+
+/// `arrow_batches` with the stream's schema, which holds even when it has
+/// no batch.
+fn arrow_stream(
+    py: Python<'_>,
+    obj: &Bound<'_, PyAny>,
+) -> PyResult<(arrow_schema::SchemaRef, Vec<RecordBatch>)> {
     let capsule = obj
         .call_method1("__arrow_c_stream__", (py.None(),))?
         .cast_into::<PyCapsule>()
@@ -143,9 +152,12 @@ fn arrow_batches(py: Python<'_>, obj: &Bound<'_, PyAny>) -> PyResult<Vec<RecordB
         ArrowArrayStreamReader::try_new(stream)
             .map_err(|e| PyValueError::new_err(e.to_string()))?,
     );
-    arrow::unique_columns(&arrow_array::RecordBatchReader::schema(&reader.0)).map_err(to_py)?;
-    py.detach(move || reader.0.collect::<Result<Vec<_>, _>>())
-        .map_err(|e| PyValueError::new_err(e.to_string()))
+    let schema = arrow_array::RecordBatchReader::schema(&reader.0);
+    arrow::unique_columns(&schema).map_err(to_py)?;
+    let batches = py
+        .detach(move || reader.0.collect::<Result<Vec<_>, _>>())
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    Ok((schema, batches))
 }
 
 fn key_of(obj: &Bound<'_, PyAny>, out: &mut Vec<u8>) -> PyResult<()> {

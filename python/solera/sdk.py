@@ -360,7 +360,9 @@ class Source:
 class Loaded:
     """What a source's loader served: a key's row, or an unkeyed source's
     value, with the version it was served at — the source's own word (an
-    etag, an `updated_at`). docs/stores.md, "Sources: how data is loaded"."""
+    etag, an `updated_at`). A keyed source may also serve one Arrow table,
+    `Loaded(table, version=column)`: `version` then names the table's column
+    of versions. docs/stores.md, "Sources: how data is loaded"."""
 
     value: Any
     version: str | None = None
@@ -369,7 +371,8 @@ class Loaded:
 def source(fn=None, *, key: str | None = None, version: str = "1"):
     """A source loaded through a function, `async def name(keys, ctx)`.
     Keyed, it is called with the keys a batch reads and returns `{key:
-    Loaded(row, version=…)}`: a key it leaves out was observed absent.
+    Loaded(row, version=…)}`, or one Arrow table, `Loaded(table,
+    version=column)`: a key it leaves out was observed absent.
     Unkeyed, it is called with None and returns the value, or
     `Loaded(value, version=…)`. `version` is the loader's own: bump it when
     what it serves for the same data changes."""
