@@ -3,9 +3,9 @@
 //! batch replaced over its range, so the planner's own walk over that slice,
 //! at the batch's head and under its conditions, gives the planned keys back
 //! with the reads the plan made: a lineage question costs what a plan costs.
-//! The record's digest checks the list; the points the batch wrote then say
-//! which keys failed, were held back at commit, or were loaded at another
-//! version.
+//! The record's digest checks the list; the record's marks then say which
+//! keys failed, were held back at commit, or were loaded at another version,
+//! with the version loaded.
 //!
 //! An answer is exact or says why not. A commit the record names that the
 //! input's index no longer answers at is `NotRetained`; a version that
@@ -13,7 +13,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use solera_index::{Glob, LayerRef, Pattern, Query};
+use solera_index::{LayerRef, Query};
 
 use crate::codec::Ver;
 use crate::error::{invalid, Result};
@@ -63,9 +63,8 @@ pub struct Received {
     pub planned: Ver,
     /// The version loaded, where it was not the one planned (HIS-8).
     pub loaded: Option<Ver>,
-    /// The point the batch left on the key, if any: it failed, it was held
-    /// back at commit, it was loaded at another version, or it came from a
-    /// key list.
+    /// The batch's mark on the key, if any: it failed, it was held back at
+    /// commit (`Unsettled`), or it was loaded at another version.
     pub reason: Option<Reason>,
     /// Cleanup has since deleted the version the batch read.
     pub deleted: bool,
@@ -89,9 +88,9 @@ struct Left(BTreeSet<Key>);
 impl Left {
     fn of(rec: &Record) -> Left {
         Left(
-            rec.points
+            rec.marks
                 .iter()
-                .filter(|(_, p)| p.reason == Reason::HeldBack)
+                .filter(|(_, m)| m.reason == Reason::HeldBack)
                 .map(|(k, _)| k.clone())
                 .chain(rec.waiting.iter().cloned())
                 .collect(),
@@ -171,20 +170,22 @@ impl Logs {
     /// Per key, the versions cleanup has released since the batch's head:
     /// those replaced by a commit at or below `cleaned` (§13's cleanup
     /// cursor), a key written again at its own version aside.
+    /// Per key of `keys`, the versions commits after the batch's head, through
+    /// `cleaned`, replaced: cleanup has released them. Reads those keys only.
     async fn released(
         &self,
         ixs: &dyn Indexes,
         rec: &Record,
-        q: &Query,
+        keys: &[&[u8]],
         cleaned: u64,
     ) -> Result<BTreeMap<Key, Vec<Ver>>> {
         let mut out: BTreeMap<Key, Vec<Ver>> = BTreeMap::new();
         let to = cleaned.min(span(&self.input).1);
-        if to <= rec.head {
+        if to <= rec.head || keys.is_empty() {
             return Ok(out);
         }
         ixs.index(&rec.output)?
-            .window_with(&self.input, rec.head + 1..=to, q, |g| {
+            .window_keys_with(&self.input, rec.head + 1..=to, keys, &Query::default(), |g| {
                 let vs: Vec<Ver> = g
                     .rows(0)
                     .filter(|&r| g.replaced_version(r) != g.new_version(r))
@@ -206,15 +207,10 @@ fn producer(rec: &Record) -> String {
 
 /// The replaced slice as the plan read it: nothing for a full run's first batch.
 fn replaced(rec: &Record) -> Keyed {
-    let mut k = Keyed::default();
     if rec.reset {
-        return k;
+        return Keyed::default();
     }
-    for p in &rec.replaced.pieces {
-        k.write(&p.range, p.value.clone());
-    }
-    k.points.extend(rec.replaced.points.iter().cloned());
-    k
+    Keyed::of_slice(&rec.replaced)
 }
 
 fn check(rec: &Record) -> Result<()> {
@@ -228,21 +224,15 @@ fn check(rec: &Record) -> Result<()> {
     Ok(())
 }
 
-/// What the batch received of a planned key: the point it wrote, and whether
-/// the version it read is gone.
+/// What the batch received of a planned key: its mark, and whether the
+/// version it read is gone.
 fn received(rec: &Record, c: Cand, released: &BTreeMap<Key, Vec<Ver>>) -> Received {
-    let point = rec
-        .points
+    let mark = rec
+        .marks
         .binary_search_by(|(k, _)| k.cmp(&c.key))
         .ok()
-        .map(|i| &rec.points[i].1);
-    let loaded = point
-        .filter(|p| matches!(p.reason, Reason::Deviation | Reason::KeyList))
-        .map(|p| match &p.holding {
-            Holding::Version(v, _) => v.clone(),
-            _ => Ver::Absent,
-        })
-        .filter(|v| *v != c.version);
+        .map(|i| &rec.marks[i].1);
+    let loaded = mark.and_then(|m| m.loaded.clone());
     let read = loaded.as_ref().unwrap_or(&c.version);
     let deleted = !read.is_absent() && released.get(&c.key).is_some_and(|vs| vs.contains(read));
     Received {
@@ -250,15 +240,15 @@ fn received(rec: &Record, c: Cand, released: &BTreeMap<Key, Vec<Ver>>) -> Receiv
         held: c.held,
         planned: c.version,
         loaded,
-        reason: point.map(|p| p.reason),
+        reason: mark.map(|m| m.reason),
         deleted,
         key: c.key,
     }
 }
 
 /// What batch `rec` received (HIS-7), key by key: its planned keys
-/// recomputed from its record and checked against its digest, then the
-/// points it wrote. `cleaned` is the input's cleanup cursor (0 before any
+/// recomputed from its record and checked against its digest, then its
+/// marks. `cleaned` is the input's cleanup cursor (0 before any
 /// cleanup). A digest that does not match is an error naming the batch.
 pub async fn input(
     logs: &Logs,
@@ -291,38 +281,14 @@ pub async fn input(
             rec.digest
         ));
     }
-    let q = Query {
-        lo: rec.range.lo.as_deref().map(<[u8]>::to_vec),
-        hi: rec.range.hi.as_deref().map(<[u8]>::to_vec),
-        ..Default::default()
-    };
-    let released = logs.released(ixs, rec, &q, cleaned).await?;
+    let keys: Vec<&[u8]> = cands.iter().map(|c| &c.key[..]).collect();
+    let released = logs.released(ixs, rec, &keys, cleaned).await?;
     Ok(Answer::Found(
         cands
             .into_iter()
             .map(|c| received(rec, c, &released))
             .collect(),
     ))
-}
-
-/// A query for exactly `key`: its glob takes the key (a `*` or `?` in it as
-/// any one character), and the caller keeps the key itself.
-fn exactly(key: &[u8]) -> Result<Query> {
-    let Ok(s) = std::str::from_utf8(key) else {
-        return invalid("a key is UTF-8");
-    };
-    let glob: String = s
-        .chars()
-        .map(|c| if c == '*' || c == '?' { '?' } else { c })
-        .collect();
-    Ok(Query {
-        hi: Some(key.to_vec()),
-        pattern: Some(Pattern {
-            include: vec![Glob::new(&glob)?],
-            exclude: vec![],
-        }),
-        ..Default::default()
-    })
 }
 
 /// What batch `rec` received of `key` (the key trace, §12): None when the
@@ -354,7 +320,7 @@ pub async fn received_key(
     let Some(c) = r.keys(std::slice::from_ref(&key)).await?.pop().filter(taken) else {
         return Ok(Answer::Found(None));
     };
-    let released = logs.released(ixs, rec, &exactly(&key)?, cleaned).await?;
+    let released = logs.released(ixs, rec, &[&key[..]], cleaned).await?;
     Ok(Answer::Found(Some(received(rec, c, &released))))
 }
 
@@ -371,10 +337,7 @@ pub async fn history(
         at_floor: None,
         changes: vec![],
     };
-    ix.history_with(layers, &exactly(key)?, |g| {
-        if g.key(0) != key {
-            return;
-        }
+    ix.window_keys_with(layers, 0..=u64::MAX, &[key], &Query::default(), |g| {
         for r in g.rows(0) {
             let c = g.commit(r);
             if c <= floor && floor > 0 {

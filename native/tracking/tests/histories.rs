@@ -24,7 +24,7 @@ use solera_tracking::event::{Event, Part};
 use solera_tracking::lineage::{self, Answer, Received};
 use solera_tracking::plan::{self, Hold, InputRequest, Mode, OneIndex, Request};
 use solera_tracking::progress::{
-    owed, Class, Conditions, EdgeOpen, Holding, InputReport, Key, KeyRange, Pat, Patterns, Reason,
+    Class, Conditions, EdgeOpen, Holding, InputReport, Key, KeyRange, Pat, Patterns, Reason,
     Reset, Value,
 };
 use solera_tracking::record::Record;
@@ -671,6 +671,9 @@ async fn batch(
         for c in &ip.keys {
             if rng.random_bool(0.15) {
                 report.failed.push(c.key.clone());
+                if rng.random_bool(0.3) {
+                    report.loaded.push((c.key.clone(), inp.log.at(inp.log.head(), &c.key)));
+                }
                 continue;
             }
             let mut v = c.version.clone();
@@ -696,36 +699,27 @@ async fn batch(
         *cursor = p.range.hi.clone();
     }
 
-    // What each input received: the plan's keys, then what the worker did.
-    let key_list = matches!(mode, Mode::Keys(_));
+    // What each input received: the plan's keys, each with what the worker
+    // did (the version it loaded where it was not the one planned, failed or
+    // not) and what the commit did (held it back on every input).
     let mut stored = vec![];
     for (i, ((rec, ip), report)) in ops.records.iter().zip(&p.inputs).zip(&reports).enumerate() {
         let expected = ip
             .keys
             .iter()
             .map(|c| {
-                let wanted = Holding::of(c.version.as_version(), &ip.conditions, &c.key);
-                let pointed = key_list || owed(&c.held, &wanted);
-                let got = report
+                let loaded = report
                     .loaded
                     .iter()
                     .find(|(k, _)| *k == c.key)
-                    .map(|(_, v)| match Holding::of(v.as_version(), &ip.conditions, &c.key) {
-                        Holding::Version(v, _) => v,
-                        _ => Ver::Absent,
-                    });
-                let (reason, loaded) = if ops.held_back[i].contains(&c.key) {
-                    (pointed.then_some(Reason::Unsettled), None)
+                    .map(|(_, v)| v.clone())
+                    .filter(|v| *v != c.version);
+                let reason = if ops.held_back[i].contains(&c.key) {
+                    Some(Reason::Unsettled)
                 } else if report.failed.contains(&c.key) {
-                    (pointed.then_some(Reason::Failed), None)
+                    Some(Reason::Failed)
                 } else {
-                    let loaded = got.filter(|v| *v != c.version);
-                    let reason = if key_list {
-                        Some(Reason::KeyList)
-                    } else {
-                        loaded.is_some().then_some(Reason::Deviation)
-                    };
-                    (reason, loaded)
+                    loaded.is_some().then_some(Reason::Deviation)
                 };
                 Received {
                     key: c.key.clone(),
@@ -1210,10 +1204,14 @@ fn a_key_held_back_at_commit_is_recorded_apart_from_one_the_planner_held_back() 
         ];
         assert_eq!(reasons, want);
         let rec: Vec<_> = ops.records[0]
-            .points
+            .marks
             .iter()
-            .map(|(k, p)| (k.clone(), p.reason))
+            .map(|(k, m)| (k.clone(), m.reason, m.loaded.clone()))
             .collect();
-        assert_eq!(rec, want, "the record tells the two apart");
+        let want = vec![
+            (key("k1"), Reason::Unsettled, Some(Ver::Int(2))),
+            (key("k2"), Reason::HeldBack, None),
+        ];
+        assert_eq!(rec, want, "the record tells the two apart, with the version loaded");
     });
 }

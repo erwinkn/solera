@@ -10,12 +10,12 @@ use crate::plan::{InputPlan, Mode, Plan, PLANNER_VERSION};
 use crate::progress::{
     owed, read_digest, unsettled, BatchProgress, Consumed, Holding, Key, Point, Reason, Value,
 };
-use crate::record::Record;
+use crate::record::{Mark, Record};
 use crate::state::Tracking;
 
 /// What the worker reports for one keyed input: the keys that failed, and the
-/// version each other key was actually loaded at. A key it does not name was
-/// loaded as planned.
+/// version each key was actually loaded at, a failed key's included, where it
+/// was loaded. A key `loaded` does not name was loaded as planned.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct InputReport {
     /// Sorted, distinct.
@@ -152,11 +152,17 @@ impl Tracking {
             let kept_unsure = unsure.iter().any(|k| !hold.contains(k));
             let mut held = Vec::new();
             let mut points: Vec<(Key, Point)> = Vec::new();
+            let mut marks: Vec<(Key, Mark)> = Vec::new();
             let key_list = matches!(plan.mode, Mode::Keys(_));
             for c in &p.keys {
                 let wanted = Holding::of(c.version.as_version(), &p.conditions, &c.key);
+                let mark = |reason| {
+                    let loaded = loaded(&c.key).filter(|v| **v != c.version).cloned();
+                    (c.key.clone(), Mark { reason, loaded })
+                };
                 if hold.contains(&c.key) {
                     held.push(c.key.clone());
+                    marks.push(mark(Reason::Unsettled));
                     if key_list || owed(&c.held, &wanted) {
                         points.push((
                             c.key.clone(),
@@ -170,6 +176,7 @@ impl Tracking {
                     continue;
                 }
                 if failed(&c.key) {
+                    marks.push(mark(Reason::Failed));
                     if key_list || owed(&c.held, &wanted) {
                         points.push((
                             c.key.clone(),
@@ -181,6 +188,9 @@ impl Tracking {
                         ));
                     }
                     continue;
+                }
+                if loaded(&c.key).is_some_and(|v| *v != c.version) {
+                    marks.push(mark(Reason::Deviation));
                 }
                 let got = loaded(&c.key).unwrap_or(&c.version);
                 let holding = Holding::of(got.as_version(), &p.conditions, &c.key);
@@ -205,6 +215,13 @@ impl Tracking {
                 }
             }
             for h in &p.held_back {
+                marks.push((
+                    h.key.clone(),
+                    Mark {
+                        reason: Reason::HeldBack,
+                        loaded: None,
+                    },
+                ));
                 let wanted = Holding::of(h.version.as_version(), &p.conditions, &h.key);
                 if owed(&h.held, &wanted) {
                     points.push((
@@ -218,6 +235,7 @@ impl Tracking {
                 }
             }
             points.sort_by(|a, b| a.0.cmp(&b.0));
+            marks.sort_by(|a, b| a.0.cmp(&b.0));
             let replaced = if plan.reset {
                 keyed.slice(&crate::progress::KeyRange::all())
             } else {
@@ -238,7 +256,7 @@ impl Tracking {
                 head: p.head,
                 conditions: p.conditions.clone(),
                 replaced,
-                points: points.clone(),
+                marks,
                 counts: p.counts(),
                 digest: p.digest(),
                 planner: PLANNER_VERSION,

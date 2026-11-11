@@ -46,7 +46,7 @@ use solera_tracking::outcomes::{output_id, record_digest, Rebuild, FAILURES};
 use solera_tracking::plan::{self, InputRequest, Mode, NoHold, OneIndex, Request};
 use solera_tracking::progress::{
     owed, Class, Conditions, EdgeClose, EdgeOpen, EdgeRename, Holding, InputReport, Key, Ops, Pat,
-    Patterns, Reset, Value,
+    Patterns, Reason, Reset, Value,
 };
 use solera_tracking::stale::{self, NoneDue, Reason as Why, SetWatch, Status, Watch};
 use solera_tracking::Tracking;
@@ -578,18 +578,47 @@ impl World {
     }
 
     /// Lineage (§12) in every mode: the batch's keys recomputed from its
-    /// record, past its failing keys waiting for their retry, are its plan's.
-    async fn replay(&self, ix: &ChangeIndex, p: &plan::Plan, rec: &solera_tracking::record::Record) {
+    /// record, past its failing keys waiting for their retry, are its plan's,
+    /// each with what the worker reported and whether the commit held it.
+    async fn replay(
+        &self,
+        ix: &ChangeIndex,
+        p: &plan::Plan,
+        rec: &solera_tracking::record::Record,
+        report: &InputReport,
+        held: &[Key],
+    ) {
         let got = lineage::input(&self.t.logs(rec, None), rec, &OneIndex(ix), 0)
             .await
             .unwrap();
         let Answer::Found(got) = got else {
             panic!("a batch just committed is retained: {got:?}");
         };
-        let keys = |k: &Key, c: Class, v: &Ver| (k.clone(), c, v.clone());
+        let want: Vec<_> = p.inputs[0]
+            .keys
+            .iter()
+            .map(|c| {
+                let dev = report
+                    .loaded
+                    .iter()
+                    .find(|(k, _)| *k == c.key)
+                    .map(|(_, v)| v.clone())
+                    .filter(|v| *v != c.version);
+                let reason = if held.contains(&c.key) {
+                    Some(Reason::Unsettled)
+                } else if report.failed.contains(&c.key) {
+                    Some(Reason::Failed)
+                } else {
+                    dev.is_some().then_some(Reason::Deviation)
+                };
+                (c.key.clone(), c.class, c.version.clone(), reason, dev)
+            })
+            .collect();
         assert_eq!(
-            got.iter().map(|r| keys(&r.key, r.class, &r.planned)).collect::<Vec<_>>(),
-            p.inputs[0].keys.iter().map(|c| keys(&c.key, c.class, &c.version)).collect::<Vec<_>>(),
+            got.iter()
+                .map(|r| (r.key.clone(), r.class, r.planned.clone(), r.reason, r.loaded.clone()))
+                .collect::<Vec<_>>(),
+            want,
             "lineage of a batch over {:?}",
             rec.range
         );
@@ -630,9 +659,10 @@ impl World {
                 }
             }
             let rec = b.ops.records[0].clone();
+            let held = b.ops.held_back[0].clone();
             match self.land(b) {
                 Some(keys) => {
-                    self.replay(ix, p, &rec).await;
+                    self.replay(ix, p, &rec, &report, &held).await;
                     return Some(keys);
                 }
                 None if race => continue,
@@ -740,19 +770,43 @@ impl World {
         if p.reset {
             self.era += 1;
         }
-        for part in &ops.parts {
-            if let Part::Batch(b) = part {
-                assert_eq!(
-                    ops.records[0].points, b.points,
-                    "the batch record holds the points the batch set"
-                );
-            }
-        }
+        let ip = &p.inputs[0];
+        let mut want: Vec<(Key, Reason, Option<Ver>)> = ip
+            .keys
+            .iter()
+            .filter_map(|c| {
+                let dev = loaded
+                    .iter()
+                    .find(|(k, _)| *k == c.key)
+                    .map(|(_, v)| v.clone())
+                    .filter(|v| *v != c.version);
+                let reason = if ops.held_back[0].contains(&c.key) {
+                    Reason::Unsettled
+                } else if failed.iter().any(|(k, _)| *k == c.key) {
+                    Reason::Failed
+                } else if dev.is_some() {
+                    Reason::Deviation
+                } else {
+                    return None;
+                };
+                Some((c.key.clone(), reason, dev))
+            })
+            .chain(ip.held_back.iter().map(|h| (h.key.clone(), Reason::HeldBack, None)))
+            .collect();
+        want.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            ops.records[0]
+                .marks
+                .iter()
+                .map(|(k, m)| (k.clone(), m.reason, m.loaded.clone()))
+                .collect::<Vec<_>>(),
+            want,
+            "the batch record marks what the worker and the commit did with each key"
+        );
         if p.mode == Mode::Incremental && !p.reset {
             self.lineage(&ops.records[0]);
         }
         // The truth.
-        let ip = &p.inputs[0];
         let fails: BTreeMap<Key, Reported> = failed.into_iter().collect();
         let loaded: BTreeMap<Key, Ver> = loaded.into_iter().collect();
         // A key loaded at another version than planned while the input was

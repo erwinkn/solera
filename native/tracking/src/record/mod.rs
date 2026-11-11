@@ -6,12 +6,23 @@
 
 use std::sync::Arc;
 
-use crate::codec::{Dec, Enc};
+use crate::codec::{Dec, Enc, Ver};
 use crate::error::{format, Result};
-use crate::progress::{Conditions, Key, KeyRange, Point, Slice};
+use crate::progress::{Conditions, Key, KeyRange, Reason, Slice};
 use crate::state::Id;
 
-pub const RECORD_FORMAT: u8 = 2;
+pub const RECORD_FORMAT: u8 = 3;
+
+/// What a batch did with one key it did not load as planned and settle:
+/// failed, held back by the planner, held back at commit (`Unsettled`), or
+/// loaded at another version (`Deviation`). `loaded` is the version the
+/// worker loaded where it was not the one planned, a failed or unsettled
+/// key's included (HIS-3, HIS-8).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Mark {
+    pub reason: Reason,
+    pub loaded: Option<Ver>,
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Record {
@@ -28,8 +39,10 @@ pub struct Record {
     pub conditions: Arc<Conditions>,
     /// The progress the batch replaced: its range's slice, or with a reset all of it.
     pub replaced: Slice,
-    /// The points the batch wrote, each with its reason.
-    pub points: Vec<(Key, Point)>,
+    /// Sorted by key: every key the batch did not load as planned and
+    /// settle (§7, "Points written"), whether or not progress needed a point
+    /// for it.
+    pub marks: Vec<(Key, Mark)>,
     /// Keys by class: added, updated, removed, unchanged.
     pub counts: [u64; 4],
     /// The digest of the batch's keys, classes and versions.
@@ -59,11 +72,18 @@ impl Record {
         e.uv(self.head);
         self.conditions.encode(&mut e);
         self.replaced.encode(&mut e);
-        Slice {
-            pieces: vec![],
-            points: self.points.clone(),
+        e.uv(self.marks.len() as u64);
+        for (k, m) in &self.marks {
+            e.bytes(k);
+            e.u8(m.reason as u8);
+            match &m.loaded {
+                None => e.u8(0),
+                Some(v) => {
+                    e.u8(1);
+                    e.version(v.as_version());
+                }
+            }
         }
-        .encode(&mut e);
         for c in self.counts {
             e.uv(c);
         }
@@ -103,7 +123,18 @@ impl Record {
         let head = d.uv()?;
         let conditions = Arc::new(Conditions::decode(&mut d)?);
         let replaced = Slice::decode(&mut d)?;
-        let points = Slice::decode(&mut d)?.points;
+        let marks = (0..d.count()?)
+            .map(|_| {
+                let k = Key::from(d.bytes()?);
+                let reason = Reason::from_u8(d.u8()?)?;
+                let loaded = match d.u8()? {
+                    0 => None,
+                    1 => Some(d.ver()?),
+                    t => return format(format!("loaded tag {t}")),
+                };
+                Ok((k, Mark { reason, loaded }))
+            })
+            .collect::<Result<_>>()?;
         let mut counts = [0; 4];
         for c in &mut counts {
             *c = d.uv()?;
@@ -135,7 +166,7 @@ impl Record {
             head,
             conditions,
             replaced,
-            points,
+            marks,
             counts,
             digest,
             planner,

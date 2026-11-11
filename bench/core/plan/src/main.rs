@@ -773,6 +773,14 @@ fn lineage_runs(
             p,
             head,
         ),
+        (
+            "keys-old-cleaned",
+            Some(Value::At(p - behind, cond.clone())),
+            0,
+            Mode::Keys(point_keys(10_000, n, 1)),
+            p,
+            head,
+        ),
     ];
     let only = a.s("scenarios", "all");
     let start: Option<Key> = Some(key(n / 2).into());

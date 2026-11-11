@@ -60,6 +60,18 @@ def test_a_deviation_names_the_version_loaded(tally):
     assert got["keys"][0]["reason"] == "deviation"
 
 
+def test_a_failed_key_names_the_version_it_loaded(tally):
+    t, ix, layers, _ = tally
+    plan = t.plan({"inputs": [{"edge": b"e", "conditions": {}}], "limit": 10})["plan"]
+    commit(t, ix, layers, [("k1", 5, 4)], 2)
+    event, records, _ = t.progress_ops(plan, [(["k1"], [("k1", 5)])])
+    t.apply(event)
+    got = lineage_input(t, records[0], cleaned=3)
+    assert keys(got) == [("k1", "updated", 1, 4, 5)]
+    assert got["keys"][0]["reason"] == "failed"
+    assert not got["keys"][0]["deleted"]  # c3 released k1@4, but the batch read k1@5
+
+
 def test_a_version_cleanup_released_is_deleted(tally):
     t, _, _, first = tally
     rows = {r["key"]: r["deleted"] for r in lineage_input(t, first, cleaned=2)["keys"]}
