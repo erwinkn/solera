@@ -246,11 +246,7 @@ impl Tracking {
                 producer: producer.to_vec(),
                 edge: p.edge.clone(),
                 output: p.output.clone(),
-                mode: match plan.mode {
-                    Mode::Incremental => 0,
-                    Mode::All => 1,
-                    Mode::Keys(_) => 2,
-                },
+                mode: plan.mode.tag(),
                 reset: plan.reset,
                 range: plan.range.clone(),
                 head: p.head,

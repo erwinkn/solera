@@ -112,7 +112,10 @@ fn lineage_input<'py>(
 /// above the floor of the output's index; `at_floor` is the key's version
 /// there once older changes were folded. `batches` answers each of
 /// `records` (`(record, own)` pairs, each reading `output`): None when the
-/// batch did not take the key, else `{"state": "found", "key": row}`.
+/// batch did not take the key, else `{"state": "found", "key": row}`. A
+/// record whose range, key list or held-back keys leave the key out costs
+/// nothing; any other is recomputed and checked against its digest as
+/// `lineage_input` does, at one plan's cost, and a mismatch raises.
 #[pyfunction]
 #[pyo3(signature = (tracking, output, key, records, cleaned=0))]
 fn lineage_trace<'py>(

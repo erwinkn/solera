@@ -78,7 +78,8 @@ pub enum Mode {
 }
 
 impl Mode {
-    fn tag(&self) -> u8 {
+    /// The mode as a batch record stores it.
+    pub fn tag(&self) -> u8 {
         match self {
             Mode::Incremental => 0,
             Mode::All => 1,

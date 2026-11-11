@@ -123,7 +123,7 @@ impl Record {
         let head = d.uv()?;
         let conditions = Arc::new(Conditions::decode(&mut d)?);
         let replaced = Slice::decode(&mut d)?;
-        let marks = (0..d.count()?)
+        let marks: Vec<(Key, Mark)> = (0..d.count()?)
             .map(|_| {
                 let k = Key::from(d.bytes()?);
                 let reason = Reason::from_u8(d.u8()?)?;
@@ -143,7 +143,10 @@ impl Record {
         let planner = d.uv()?;
         let own_head = d.opt_u64()?;
         let output_commit = d.opt_u64()?;
-        let keys = match d.u8()? {
+        if marks.windows(2).any(|w| w[0].0 >= w[1].0) {
+            return format("marks out of order");
+        }
+        let keys: Option<Vec<Key>> = match d.u8()? {
             0 => None,
             1 => Some(
                 (0..d.count()?)
@@ -152,6 +155,9 @@ impl Record {
             ),
             t => return format(format!("keys tag {t}")),
         };
+        if keys.as_ref().is_some_and(|ks| ks.windows(2).any(|w| w[0] >= w[1])) {
+            return format("key list out of order");
+        }
         let waiting = (0..d.count()?)
             .map(|_| d.bytes().map(Key::from))
             .collect::<Result<_>>()?;
@@ -175,5 +181,83 @@ impl Record {
             keys,
             waiting,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::progress::{Piece, Value};
+
+    fn k(s: &str) -> Key {
+        s.as_bytes().into()
+    }
+
+    fn rec() -> Record {
+        Record {
+            producer: b"run/batch/attempt".to_vec(),
+            edge: k("e"),
+            output: k("items"),
+            mode: 0,
+            reset: false,
+            range: KeyRange::all(),
+            head: 1,
+            conditions: Arc::default(),
+            replaced: Slice::default(),
+            marks: vec![],
+            counts: [0; 4],
+            digest: 0,
+            planner: 0,
+            own_head: None,
+            output_commit: None,
+            keys: None,
+            waiting: vec![],
+        }
+    }
+
+    /// Lineage binary-searches marks and keys and walks pieces in order, so a
+    /// record whose lists are out of order is malformed, not a wrong answer.
+    #[test]
+    fn a_record_out_of_order_does_not_decode() {
+        let mark = Mark {
+            reason: Reason::Failed,
+            loaded: None,
+        };
+        let piece = |lo: Option<&str>, hi: Option<&str>| Piece {
+            range: KeyRange {
+                lo: lo.map(k),
+                hi: hi.map(k),
+            },
+            value: Value::Empty,
+        };
+        let mut bad = vec![];
+        for ks in [["k3", "k1"], ["k1", "k1"]] {
+            let mut r = rec();
+            r.marks = ks.iter().map(|s| (k(s), mark.clone())).collect();
+            bad.push(r);
+            let mut r = rec();
+            r.keys = Some(ks.iter().map(|s| k(s)).collect());
+            bad.push(r);
+        }
+        for pieces in [
+            vec![piece(None, None), piece(Some("a"), Some("b"))],
+            vec![piece(None, Some("c")), piece(Some("b"), None)],
+            vec![piece(Some("b"), Some("b"))],
+        ] {
+            let mut r = rec();
+            r.replaced.pieces = pieces;
+            bad.push(r);
+        }
+        for r in bad {
+            assert!(
+                matches!(Record::decode(&r.encode()), Err(crate::Error::Format(_))),
+                "{r:?}"
+            );
+        }
+        let mut r = rec();
+        r.marks = vec![(k("k1"), mark.clone()), (k("k3"), mark)];
+        r.keys = Some(vec![k("k1"), k("k3")]);
+        r.replaced.pieces = vec![piece(None, Some("b")), piece(Some("c"), None)];
+        assert_eq!(Record::decode(&r.encode()).unwrap(), r);
     }
 }

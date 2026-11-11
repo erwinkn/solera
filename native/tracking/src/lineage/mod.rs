@@ -17,12 +17,10 @@ use solera_index::{LayerRef, Query};
 
 use crate::codec::Ver;
 use crate::error::{invalid, Result};
-use crate::plan::{digest, Cand, Hold, Indexes, Replay, PLANNER_VERSION};
+use crate::plan::{digest, Cand, Hold, Indexes, Mode, Replay, PLANNER_VERSION};
 use crate::progress::{Class, Holding, Key, Keyed, Reason, Value};
 use crate::record::Record;
 use crate::state::{Id, Tracking};
-
-const ALL: u8 = 1;
 
 /// The logs a lineage question reads, taken from the state under a short lock.
 pub struct Logs {
@@ -113,23 +111,37 @@ fn span(layers: &[LayerRef]) -> (u64, u64) {
 }
 
 impl Logs {
-    /// The oldest commit the record names that its logs no longer answer at.
+    /// The oldest commit the record names that its logs no longer answer
+    /// at: its head, each `At` piece of the slice it replaced (without a
+    /// reset) and, for a held piece, the consumer's own head at plan. Every
+    /// piece counts whatever the mode, though a key list reads only its keys'
+    /// pieces: cleanup keeps whole replaced slices (§13), so the rule is the
+    /// record's, not the plan's. A commit past an output's head is an error:
+    /// that is not the index the batch read.
     fn gone<T>(&self, rec: &Record) -> Result<Option<Answer<T>>> {
         let pieces = if rec.reset { &[][..] } else { &rec.replaced.pieces[..] };
         let missing = |id: &Id, layers: &[LayerRef], commits: Vec<u64>| {
             let (floor, head) = span(layers);
-            let commit = commits.into_iter().filter(|&c| c < floor || c > head).min()?;
-            Some(Answer::NotRetained {
-                output: id.clone(),
-                commit,
-            })
+            if let Some(c) = commits.iter().find(|&&c| c > head) {
+                return invalid(format!(
+                    "batch {}: its record names commit {c} of {}, whose index ends at {head}",
+                    producer(rec),
+                    String::from_utf8_lossy(id)
+                ));
+            }
+            Ok(commits.into_iter().filter(|&c| c < floor).min().map(|commit| {
+                Answer::NotRetained {
+                    output: id.clone(),
+                    commit,
+                }
+            }))
         };
         let mut need = vec![rec.head];
         need.extend(pieces.iter().filter_map(|p| match p.value {
             Value::At(c, _) => Some(c),
             _ => None,
         }));
-        if let Some(a) = missing(&rec.output, &self.input, need) {
+        if let Some(a) = missing(&rec.output, &self.input, need)? {
             return Ok(Some(a));
         }
         if !pieces.iter().any(|p| p.value == Value::Held) {
@@ -141,7 +153,7 @@ impl Logs {
                 producer(rec)
             ));
         };
-        Ok(missing(id, layers, vec![own_head]))
+        missing(id, layers, vec![own_head])
     }
 
     fn replay<'a>(
@@ -162,16 +174,15 @@ impl Logs {
             conditions: &rec.conditions,
             keyed,
             own,
-            all: rec.mode == ALL,
+            all: rec.mode == Mode::All.tag(),
             hold: left,
         })
     }
 
-    /// Per key, the versions cleanup has released since the batch's head:
-    /// those replaced by a commit at or below `cleaned` (§13's cleanup
-    /// cursor), a key written again at its own version aside.
-    /// Per key of `keys`, the versions commits after the batch's head, through
-    /// `cleaned`, replaced: cleanup has released them. Reads those keys only.
+    /// Per key of `keys`, the versions cleanup has released since the
+    /// batch's head: replaced by a commit after it and at or below `cleaned`
+    /// (§13's cleanup cursor), and not written again by a later commit. Reads
+    /// those keys only, from the batch's head to the output's.
     async fn released(
         &self,
         ixs: &dyn Indexes,
@@ -180,17 +191,31 @@ impl Logs {
         cleaned: u64,
     ) -> Result<BTreeMap<Key, Vec<Ver>>> {
         let mut out: BTreeMap<Key, Vec<Ver>> = BTreeMap::new();
-        let to = cleaned.min(span(&self.input).1);
-        if to <= rec.head || keys.is_empty() {
+        let head = span(&self.input).1;
+        if cleaned.min(head) <= rec.head || keys.is_empty() {
             return Ok(out);
         }
         ixs.index(&rec.output)?
-            .window_keys_with(&self.input, rec.head + 1..=to, keys, &Query::default(), |g| {
-                let vs: Vec<Ver> = g
+            .window_keys_with(&self.input, rec.head + 1..=head, keys, &Query::default(), |g| {
+                let rows: Vec<(u64, Ver, Ver)> = g
                     .rows(0)
-                    .filter(|&r| g.replaced_version(r) != g.new_version(r))
-                    .map(|r| Ver::of(g.replaced_version(r)))
-                    .filter(|v| !v.is_absent())
+                    .map(|r| {
+                        (
+                            g.commit(r),
+                            Ver::of(g.new_version(r)),
+                            Ver::of(g.replaced_version(r)),
+                        )
+                    })
+                    .collect();
+                let vs: Vec<Ver> = rows
+                    .iter()
+                    .filter(|(c, new, was)| {
+                        *c <= cleaned
+                            && was != new
+                            && !was.is_absent()
+                            && !rows.iter().any(|(later, v, _)| later > c && v == was)
+                    })
+                    .map(|(_, _, was)| was.clone())
                     .collect();
                 if !vs.is_empty() {
                     out.insert(g.key(0).into(), vs);
@@ -292,8 +317,9 @@ pub async fn input(
 }
 
 /// What batch `rec` received of `key` (the key trace, §12): None when the
-/// batch did not take it. One key's reads, not the batch's, so the digest is
-/// not checked: `input` checks it.
+/// batch did not take it. A key outside the batch's range or key list, or one
+/// it left out, needs no read; otherwise the batch's input is recomputed and
+/// checked against its digest, as `input` does, at one plan's cost.
 pub async fn received_key(
     logs: &Logs,
     rec: &Record,
@@ -306,22 +332,13 @@ pub async fn received_key(
         .keys
         .as_ref()
         .is_none_or(|ks| ks.binary_search_by(|k| k.as_ref().cmp(key)).is_ok());
-    let left = Left::of(rec);
-    if !rec.range.contains(key) || !listed || left.0.contains(key) {
+    if !rec.range.contains(key) || !listed || Left::of(rec).0.contains(key) {
         return Ok(Answer::Found(None));
     }
-    if let Some(gone) = logs.gone(rec)? {
-        return Ok(gone);
-    }
-    let keyed = replaced(rec);
-    let r = logs.replay(rec, ixs, &keyed, &left)?;
-    let key: Key = key.into();
-    let taken = |c: &Cand| rec.keys.is_some() || rec.mode == ALL || c.class != Class::Unchanged;
-    let Some(c) = r.keys(std::slice::from_ref(&key)).await?.pop().filter(taken) else {
-        return Ok(Answer::Found(None));
-    };
-    let released = logs.released(ixs, rec, &[&key[..]], cleaned).await?;
-    Ok(Answer::Found(Some(received(rec, c, &released))))
+    Ok(match input(logs, rec, ixs, cleaned).await? {
+        Answer::Found(rows) => Answer::Found(rows.into_iter().find(|r| *r.key == *key)),
+        Answer::NotRetained { output, commit } => Answer::NotRetained { output, commit },
+    })
 }
 
 /// Every retained change of `key` on an output (the key trace's first step):

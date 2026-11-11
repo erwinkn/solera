@@ -79,6 +79,27 @@ def test_a_version_cleanup_released_is_deleted(tally):
     assert not any(r["deleted"] for r in lineage_input(t, first, cleaned=1)["keys"])
 
 
+def test_a_version_written_again_is_not_deleted(tally):
+    t, ix, layers, first = tally
+    commit(t, ix, layers, [("k1", 1, 4)], 2)  # c3: k1 is at 1 again
+    assert not lineage_input(t, first, cleaned=3)["keys"][0]["deleted"]
+    commit(t, ix, layers, [("k1", 5, 1)], 2)  # c4 replaces it again
+    assert not lineage_input(t, first, cleaned=3)["keys"][0]["deleted"]
+    assert lineage_input(t, first, cleaned=4)["keys"][0]["deleted"]
+
+
+def test_a_record_its_input_no_longer_recomputes_to_is_an_error(tally, tmp_path):
+    _, _, _, first = tally
+    ix = ChangeIndex(f"file://{tmp_path}/other")
+    t = Tracking()
+    t.attach(b"items", ix)
+    commit(t, ix, [], [("k1", 1, None)], 0)  # items answers with another history
+    with pytest.raises(ValueError, match="record says 2 keys"):
+        lineage_input(t, first)
+    with pytest.raises(ValueError, match="record says 2 keys"):
+        lineage_trace(t, b"items", "k1", [(first, None)])
+
+
 def test_a_key_trace_alternates_history_and_the_batches_that_held_it(tally):
     t, _, _, first = tally
     second = batch(t)

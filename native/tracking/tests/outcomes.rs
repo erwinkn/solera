@@ -611,12 +611,12 @@ impl World {
                 } else {
                     dev.is_some().then_some(Reason::Deviation)
                 };
-                (c.key.clone(), c.class, c.version.clone(), reason, dev)
+                (c.key.clone(), c.class, c.held.clone(), c.version.clone(), reason, dev)
             })
             .collect();
         assert_eq!(
             got.iter()
-                .map(|r| (r.key.clone(), r.class, r.planned.clone(), r.reason, r.loaded.clone()))
+                .map(|r| (r.key.clone(), r.class, r.held.clone(), r.planned.clone(), r.reason, r.loaded.clone()))
                 .collect::<Vec<_>>(),
             want,
             "lineage of a batch over {:?}",

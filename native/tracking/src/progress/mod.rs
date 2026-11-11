@@ -568,7 +568,13 @@ impl Slice {
                     value: Value::decode(d, &conds)?,
                 })
             })
-            .collect::<Result<_>>()?;
+            .collect::<Result<Vec<Piece>>>()?;
+        let below = |a: &Option<Key>, b: &Option<Key>| matches!((a, b), (Some(a), Some(b)) if a < b);
+        let empty = |p: &Piece| p.range.lo.is_some() && p.range.hi.is_some() && !below(&p.range.lo, &p.range.hi);
+        let overlap = |w: &[Piece]| w[0].range.hi.is_none() || below(&w[1].range.lo, &w[0].range.hi) || w[1].range.lo.is_none();
+        if pieces.iter().any(empty) || pieces.windows(2).any(overlap) {
+            return format("pieces out of order");
+        }
         let points = decode_points(d, &conds)?;
         Ok(Slice { pieces, points })
     }

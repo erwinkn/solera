@@ -749,9 +749,14 @@ struct Stored {
 }
 
 /// Whether cleanup, through commit `cleaned`, has released version `r` of `k`,
-/// which the log held at `head`: a later commit up to `cleaned` replaced it.
+/// which the log held at `head`: a later commit up to `cleaned` replaced it,
+/// and no commit after that one wrote it again.
 fn released(log: &Log, k: &[u8], r: &Ver, head: u64, cleaned: u64) -> bool {
-    !r.is_absent() && (head + 1..=cleaned.min(log.head())).any(|c| log.at(c - 1, k) == *r && log.at(c, k) != *r)
+    !r.is_absent()
+        && (head + 1..=cleaned.min(log.head()))
+            .rev()
+            .find(|&c| log.at(c - 1, k) == *r && log.at(c, k) != *r)
+            .is_some_and(|c| (c + 1..=log.head()).all(|later| log.at(later, k) != *r))
 }
 
 fn floor(layers: &[LayerRef]) -> u64 {
@@ -759,9 +764,11 @@ fn floor(layers: &[LayerRef]) -> u64 {
 }
 
 /// Every stored batch's lineage, at a random cleanup cursor: what the batch
-/// received, or "not retained" exactly when a commit the plan read (its head,
-/// and without a reset its replaced pieces' commits) is below its log's floor. One
-/// key's trace agrees with the batch's, and a key's history is its log's.
+/// received, or "not retained" exactly when a commit the record names (its
+/// head, and without a reset its replaced pieces' commits) is below its log's
+/// floor. A record that disagrees with its digest or planner, or whose held
+/// progress has no own output to read, is an error. One key's trace agrees
+/// with the batch's, and a key's history is its log's.
 async fn check_lineage(
     rng: &mut SmallRng,
     ix: &ChangeIndex,
@@ -789,12 +796,28 @@ async fn check_lineage(
         let got = match got {
             Answer::NotRetained { output, commit } => {
                 assert_eq!(output, log.name, "only the input's history is cut");
-                assert_eq!(Some(commit), cut, "not retained: the oldest commit the plan read, below the floor");
+                assert_eq!(Some(commit), cut, "not retained: the oldest commit the record names, below the floor");
                 continue;
             }
             Answer::Found(got) => got,
         };
-        assert_eq!(cut, None, "found although the plan read commit {cut:?}, below the floor");
+        assert_eq!(cut, None, "found although the record names commit {cut:?}, below the floor");
+        for bad in [
+            Record {
+                digest: s.rec.digest ^ 1,
+                ..s.rec.clone()
+            },
+            Record {
+                planner: s.rec.planner + 1,
+                ..s.rec.clone()
+            },
+        ] {
+            assert!(lineage::input(&logs, &bad, &OneIndex(ix), cleaned).await.is_err());
+        }
+        if !s.rec.reset && s.rec.replaced.pieces.iter().any(|p| p.value == Value::Held) {
+            let none = t.logs(&s.rec, None);
+            assert!(lineage::input(&none, &s.rec, &OneIndex(ix), cleaned).await.is_err());
+        }
         let want: Vec<Received> = s
             .expected
             .iter()

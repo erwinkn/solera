@@ -2,8 +2,13 @@
 //! batches, consumers a day behind (build plan N2 to N5 and N12).
 //!
 //! `core-plan-bench workload=daily-scattered keys=100000000 dir=/data/x [tasks=50 threads=4 batch=10000 behind=24]`
-//! `core-plan-bench run=lineage keys=100000000 dir=/data/x [rounds=20 scenarios=all]`: B10's
-//! lineage beside the plan it replays.
+//! `core-plan-bench run=lineage keys=100000000 dir=/data/x [rounds=20 scenarios=all layers=N]`:
+//! B10's lineage beside the plan it replays.
+//!
+//! `layers=N` writes the output as the engine leaves it before merges: one
+//! layer holding every commit up to the newest N - 1, then one layer per
+//! commit (N = 1: one layer for the whole history). Without it, the layers
+//! follow the change-index bench's merge schedule.
 //!
 //! The output's layers are the change-index bench's (same workloads, seed and
 //! layer schedule), written once to `dir` and reused. One JSON line per
@@ -80,18 +85,20 @@ fn entries_of(w: &Workload, lo: u64, hi: u64) -> Vec<(u32, u32, u64, u64)> {
     v
 }
 
-/// One layer of the schedule (as bench/change-index writes it).
+/// One layer of the schedule (as bench/change-index writes it). A base holds
+/// the state at `fold`, and the changes above it up to its `hi`.
 fn write_layer(
     dir: &std::path::Path,
     path: &str,
     spec: &sched::Spec,
+    fold: u64,
     w: &Workload,
     o: &Oracle,
 ) -> LayerRef {
     let mut file =
         std::io::BufWriter::with_capacity(1 << 20, std::fs::File::create(dir.join(path)).unwrap());
     let (lo, floor) = if spec.base {
-        (1, Some(spec.hi))
+        (1, Some(fold))
     } else {
         (spec.lo, None)
     };
@@ -102,29 +109,40 @@ fn write_layer(
             file.write_all(&wr.take()).unwrap();
         }
     };
-    let mut headers = Vec::new();
-    if spec.base {
-        for id in 0..o.space() {
-            let (v, c) = o.at(id, spec.hi);
-            if v != NONE {
-                key_of(id, &mut buf);
-                wr.push(&buf, c, Version::Int(v), Version::Absent).unwrap();
-                drain(&mut wr, &mut file);
-            }
-        }
+    let (changed, folded) = if spec.base {
+        (fold + 1, Some(fold))
     } else {
-        for e in entries_of(w, spec.lo, spec.hi) {
+        (spec.lo, None)
+    };
+    let changes = entries_of(w, changed, spec.hi);
+    let mut next = changes.iter().peekable();
+    let mut push = |wr: &mut Writer, id: u32| {
+        while let Some(e) = next.next_if(|e| e.0 <= id) {
             key_of(e.0, &mut buf);
             wr.push(&buf, e.1 as u64, ver(e.2), ver(e.3)).unwrap();
-            drain(&mut wr, &mut file);
+            drain(wr, &mut file);
         }
-        for c in spec.lo..=spec.hi {
-            headers.push(CommitHeader {
-                commit: c,
-                ..Default::default()
-            });
+        let Some(f) = folded else { return };
+        let (v, c) = o.at(id, f);
+        if v != NONE {
+            key_of(id, &mut buf);
+            wr.push(&buf, c, Version::Int(v), Version::Absent).unwrap();
+            drain(wr, &mut file);
         }
+    };
+    if folded.is_some() {
+        for id in 0..o.space() {
+            push(&mut wr, id);
+        }
+    } else if let Some(last) = changes.last() {
+        push(&mut wr, last.0);
     }
+    let headers: Vec<CommitHeader> = (changed..=spec.hi)
+        .map(|commit| CommitHeader {
+            commit,
+            ..Default::default()
+        })
+        .collect();
     let mut l = wr.finish(&headers).unwrap();
     file.write_all(&wr.take()).unwrap();
     file.flush().unwrap();
@@ -168,8 +186,23 @@ fn layers(a: &Args, dir: &std::path::Path) -> (Vec<LayerRef>, u64) {
         }
         live[i] = n_live as u64;
     }
-    let sch = sched::schedule(&counts, LOAD, |c| live[c as usize], per_day, 7, Some(LOAD));
+    let mut sch = sched::schedule(&counts, LOAD, |c| live[c as usize], per_day, 7, Some(LOAD));
     let head = w.commits.len() as u64 - 1;
+    let split = a.get::<u64>("layers", 0);
+    if split > 0 {
+        let one = |lo: u64, hi: u64| sched::Spec {
+            lo,
+            hi,
+            base: false,
+            entries: 0,
+        };
+        sch.layers = std::iter::once(sched::Spec {
+            base: true,
+            ..one(1, head + 1 - split)
+        })
+        .chain((head + 2 - split..=head).map(|c| one(c, c)))
+        .collect();
+    }
     let next = std::sync::atomic::AtomicUsize::new(0);
     let built = Mutex::new(Vec::new());
     std::thread::scope(|s| {
@@ -180,7 +213,8 @@ fn layers(a: &Args, dir: &std::path::Path) -> (Vec<LayerRef>, u64) {
                     return;
                 };
                 let path = format!("{i:03}-{}-{}", spec.lo, spec.hi);
-                let l = write_layer(dir, &path, spec, &w, &oracle);
+                let fold = if split > 0 { LOAD } else { spec.hi };
+                let l = write_layer(dir, &path, spec, fold, &w, &oracle);
                 built.lock().unwrap().push((i, l));
             });
         }
@@ -426,8 +460,7 @@ fn main() {
         .unwrap();
     let cond = Arc::new(Conditions::default());
     let emit = |q: &str, extra: serde_json::Value| {
-        let mut v =
-            json!({"workload": name, "keys": n, "query": q, "batch": limit, "behind": behind});
+        let mut v = json!({"workload": name, "keys": n, "layers": layers.len(), "query": q, "batch": limit, "behind": behind});
         v.as_object_mut()
             .unwrap()
             .extend(extra.as_object().unwrap().clone());
