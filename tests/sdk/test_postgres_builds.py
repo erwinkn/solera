@@ -452,6 +452,23 @@ async def test_a_cleanup_takes_the_outputs_builds(store):
     assert builds(store, out, "p1") == [] and registry(store, out, "p1") is None
 
 
+async def test_a_cleanup_never_erases_a_newer_attempts_check(store):
+    """Attempt 5 wrote a dead `a`; repair 6 listed it, taking the check. A
+    cleanup of version 5 deletes its rows but keeps the check: late attempt
+    5 still cannot add `b` behind the repair's list (Sol, B8 round 1, F1)."""
+
+    out = output(incremental=True)
+    first = await store.store(rows(a="committed"), None, at(out, 1))
+    await store.store(Patch(rows(a="dead")), first.ref, at(out, 5))
+    assert [k for chunk in await store.written_at([5], first.ref, at(out, 6)) for k in chunk] == ["a"]
+    await store.cleanup(out, partition="", generation=5)
+    assert registry(store, out) == (6, None, [])
+    with pytest.raises(StoreError, match="newer attempt"):
+        await store.store(Patch(rows(b="late")), first.ref, at(out, 5))
+    repair = await store.store(Patch(rows(a="repaired")), first.ref, at(out, 6))
+    assert await solera(store, repair.ref) == outside(store, out) == {"a": "repaired"}
+
+
 async def test_a_cleanup_drops_a_table_whose_build_draws_from_its_sequence(store):
     """A build's identity column draws from the user's table's sequence, so
     the table cannot be dropped while the build stands: cleanup drops the
@@ -536,6 +553,35 @@ async def test_partial_unique_and_exclusion_indexes_fail_the_batch(store):
     )
     assert await store.full_run_ended(out, "", 7, 7)
     assert await solera(store, run.ref) == {"a": "x", "b": "x"}
+
+
+async def test_a_before_trigger_runs_once_for_a_row_as_in_place(store):
+    """The table's BEFORE row triggers run on the build's rows as they are
+    written, so Solera reads what it would in place; the switch does not
+    run them again, and leaves them as they were (Sol, B8 round 1, F2). A
+    trigger that changes the key fails the write, as in place."""
+
+    out = output(incremental=True)
+    table, _, _ = store._table(out)
+    function = f"public.{out.name}_mark"
+    sql(f"CREATE TABLE {table} (id text, v text, _version bigint)")
+    sql(
+        f"CREATE FUNCTION {function}() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN NEW.v = NEW.v || '+'; RETURN NEW; END $$"
+    )
+    sql(f"CREATE TRIGGER mark BEFORE INSERT OR UPDATE ON {table} FOR EACH ROW EXECUTE FUNCTION {function}()")
+    sql(f"ALTER TABLE {table} ENABLE ALWAYS TRIGGER mark")
+    first = await store.store(rows(a="old"), None, at(out, 1))
+    assert outside(store, out) == {"a": "old+"}
+    run = await store.store(rows(b="new"), first.ref, at(out, 5, reset=True))
+    assert await solera(store, run.ref) == {"b": "new+"}
+    assert await store.full_run_ended(out, "", 5, 5)
+    assert await solera(store, run.ref) == outside(store, out) == {"b": "new+"}
+    assert sql("SELECT tgenabled::text FROM pg_trigger WHERE tgrelid = %s::regclass", (table,)) == [("A",)]
+    sql(
+        f"CREATE OR REPLACE FUNCTION {function}() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN NEW.id = upper(NEW.id); RETURN NEW; END $$"
+    )
+    with pytest.raises(WriteError, match="stored as another key"):
+        await store.store(rows(c="next"), run.ref, at(out, 7, reset=True))
 
 
 async def test_a_build_keeps_only_its_unique_and_key_indexes(store):
@@ -795,6 +841,45 @@ async def test_a_crash_after_the_switch_leaves_its_build_to_the_next_sweep(store
     monkeypatch.setattr(store, "_sweep", sweep)
     assert await store.full_run_ended(out, "", 5, 5)
     assert builds(store, out) == []
+
+
+async def test_a_build_a_sweep_could_not_drop_is_dropped_by_a_later_write(store):
+    """Write 6 unregistered dead build 5 while a load held it, so its sweep
+    gave up. Once the load ends, the next write drops it: the catalog, not
+    the registry, says what is left to sweep (Sol, B8 round 1, F3)."""
+
+    from solera_postgres import BUILD_SCHEMA, _build_name, _qname
+
+    out = output(incremental=True)
+    first = await store.store(rows(a="1"), None, at(out, 1))
+    await store.store(rows(x="dead"), first.ref, at(out, 5, reset=True))
+    reader = store._connect()
+    reader.execute(
+        f"SELECT * FROM {_qname(BUILD_SCHEMA, _build_name(store._table(out)[0], '', 5))}"
+    ).fetchall()
+    try:
+        await store.store(Patch(rows(a="6")), first.ref, at(out, 6))
+        assert builds(store, out) == [5] and registry(store, out)[2] == []
+    finally:
+        reader.close()
+    await store.store(Patch(rows(a="7")), first.ref, at(out, 7))
+    assert builds(store, out) == []
+
+
+async def test_a_key_listing_racing_the_switchs_drop_reads_the_published_keys(store, monkeypatch):
+    """As a load (P2): `keys` looked the build up, then a switch published and
+    dropped it before the listing's query ran. It lists the user's table,
+    which now holds the build's keys (Sol, B8 round 1, F4)."""
+
+    from solera_postgres import BUILD_SCHEMA, _build_name, _qname
+
+    out = output(incremental=True)
+    first = await store.store(rows(a="1"), None, at(out, 1))
+    run = await store.store(rows(b="5"), first.ref, at(out, 5, reset=True))
+    assert await store.full_run_ended(out, "", 5, 5)
+    gone = _qname(BUILD_SCHEMA, _build_name(store._table(out)[0], "", 5))
+    monkeypatch.setattr(store, "_source", lambda cur, ref: gone)  # the lookup made before the switch
+    assert list(store.keys(run.ref)) == [["b"]]
 
 
 # -- what outsiders see (probe P6) ---------------------------------------------------------

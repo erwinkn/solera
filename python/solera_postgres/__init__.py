@@ -142,7 +142,10 @@ SELECT r.oid IS NOT NULL AS present,
     WHERE x.indrelid = r.oid), '{}') AS indexes,
   coalesce((SELECT array_agg(g.rolname::text) FROM pg_roles g WHERE g.rolname = ANY(%(grants)s)
     AND NOT (r.oid IS NOT NULL AND has_table_privilege(g.oid, r.oid, 'SELECT'))), '{}') AS ungranted,
-  EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = %(build)s) AS build_schema
+  EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = %(build)s) AS build_schema,
+  coalesce((SELECT array_agg(c.relname::text) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE n.nspname = %(build)s AND c.relname >= %(first)s::name AND c.relname < %(past)s::name
+    AND c.relkind = 'r'), '{}') AS built
 FROM (SELECT (SELECT c.oid FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
   WHERE n.nspname = %(schema)s AND c.relname = %(name)s AND c.relkind IN ('r', 'p')) AS oid) AS r
 """
@@ -156,6 +159,16 @@ SELECT i.relname::text AS index, NULL::text AS identity, NULL::text AS sequence
 UNION ALL
 SELECT NULL, a.attname::text, pg_get_serial_sequence(%(table)s, a.attname)
   FROM pg_attribute a WHERE a.attrelid = %(table)s::regclass AND a.attidentity <> '' AND NOT a.attisdropped
+"""
+
+
+# A table's row triggers that fire before a change (enabled for an ordinary session), as
+# `CREATE TRIGGER` statements, with the name they print the table under.
+_BEFORE_TRIGGERS = """
+SELECT t.tgname::text AS name, t.tgenabled::text AS enabled, (t.tgtype & 4) <> 0 AS on_insert,
+  pg_get_triggerdef(t.oid) AS definition, quote_ident(n.nspname) || '.' || quote_ident(c.relname) AS printed
+FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE t.tgrelid = %s::regclass AND NOT t.tgisinternal AND t.tgtype & 3 = 3 AND t.tgenabled IN ('O', 'A')
 """
 
 
@@ -394,6 +407,8 @@ class PostgresStore:
         shape (`LIKE`) with its CHECK constraints, generated columns, unique
         and exclusion indexes, so a row that breaks one fails the batch that
         writes it, as in place; of its other indexes only Solera's on the key.
+        Its row triggers that fire before a change are the table's, so a row
+        is what it would be in place; the switch does not fire them again.
         An identity column draws from the user's table's sequence, never one
         of the build's own (probes P5, R4, R9)."""
 
@@ -413,6 +428,8 @@ class PostgresStore:
             f"CREATE TABLE {build} (LIKE {at.table} INCLUDING DEFAULTS INCLUDING CONSTRAINTS "
             "INCLUDING GENERATED INCLUDING INDEXES)"
         )
+        for found in cur.execute(_BEFORE_TRIGGERS, (at.table,)).fetchall():
+            cur.execute(found["definition"].replace(f" ON {found['printed']} ", f" ON {build} ", 1))
         for found in cur.execute(_BUILD_EXTRAS, {"build": build, "table": at.table}).fetchall():
             if found["index"] is not None:
                 cur.execute(f"DROP INDEX {_qname(BUILD_SCHEMA, found['index'])}")
@@ -529,13 +546,21 @@ class PostgresStore:
             self._domain(domain, table)
             if fenced:
                 check.execute(*self._check_sql(table, context, write))
-            state.execute(_STATE, self._state_params(table))
+            state.execute(_STATE, self._state_params(table, context.partition if context else ""))
             taken, found = (check.fetchone() if fenced else None), state.fetchone()
         return (self._checked(taken, context) if fenced else None), found
 
-    def _state_params(self, table: str) -> dict:
+    def _state_params(self, table: str, partition: str = "") -> dict:
         schema, name = _split(table)
-        return {"schema": schema, "name": name, "grants": list(self.grants), "build": BUILD_SCHEMA}
+        prefix = _build_name(table, partition, 0)[:-1]  # the partition's builds: names in [first, past)
+        return {
+            "schema": schema,
+            "name": name,
+            "grants": list(self.grants),
+            "build": BUILD_SCHEMA,
+            "first": prefix,
+            "past": prefix[:-1] + chr(ord(prefix[-1]) + 1),
+        }
 
     def _state(self, cur, table: str) -> dict:
         return cur.execute(_STATE, self._state_params(table)).fetchone()
@@ -559,7 +584,7 @@ class PostgresStore:
         lock = "pg_advisory_xact_lock" if exclusive else "pg_advisory_xact_lock_shared"
         cur.execute(f"SELECT {lock}(hashtext(%s))", (f"solera-domain:{table}",))
 
-    def _aim(self, table: str, context: WriteContext, checked: dict | None) -> _Target:
+    def _aim(self, table: str, context: WriteContext, checked: dict | None, built=()) -> _Target:
         """Where a write goes (D211; docs/tracking-design.md §8, obligations 1
         and 2). Today's path (`context.builds` off) writes in place. A full
         run's first write (`reset`) opens the build of its run (its own
@@ -568,7 +593,10 @@ class PostgresStore:
         goes to the build `build_run` names while the partition registers
         it, else in place. Every write keeps the build `build_run` names and
         its own, and unregisters the partition's others: no run in the log
-        names them, and the check has locked their writers out."""
+        names them, and the check has locked their writers out. A build the
+        catalog holds (`built`) and the partition no longer registers —
+        unregistered now, or earlier by a write whose sweep could not drop it
+        — makes the write sweep after it commits."""
 
         at = _Target(table, context.partition, builds=list(checked["builds"]) if checked else [])
         if not context.builds:
@@ -582,7 +610,8 @@ class PostgresStore:
             at.run = context.build_run
         keep = {context.build_run, at.run}
         at.builds = [b for b in builds if b in keep] + ([at.run] if at.opens else [])
-        at.retired = any(b not in keep for b in builds)
+        kept = {_build_name(table, context.partition, b) for b in at.builds}
+        at.retired = any(name not in kept for name in built)
         return at
 
     def _register(self, cur, at: _Target, checked: dict | None) -> None:
@@ -670,7 +699,7 @@ class PostgresStore:
                     cur.execute(f"DROP TABLE IF EXISTS {_qname(BUILD_SCHEMA, name)}")
             if partition is None and key is None and len(taken) == len(written):
                 cur.execute(f"DROP TABLE IF EXISTS {table}")
-                cur.execute(f"DELETE FROM {VERSIONS_TABLE} WHERE rel = %s", (table,))
+                self._forget(cur, table, list(written))
             else:
                 for part in taken:
                     where = {column: part} if column else {}
@@ -680,9 +709,24 @@ class PostgresStore:
                     if present:
                         cur.execute(f"DELETE FROM {table} WHERE {sql}", params)
                     if key is None:
-                        cur.execute(
-                            f"DELETE FROM {VERSIONS_TABLE} WHERE rel = %s AND part = %s", (table, part)
-                        )
+                        self._forget(cur, table, [part])
+
+    def _forget(self, cur, table: str, parts: list[str]) -> None:
+        """The version rows of partitions a cleanup deleted. A row whose check
+        an attempt took after the partition's last write stays, emptied: it
+        fences out every older attempt, which deleting it would let write
+        again (a late writer of the version cleaned up, under a repair that
+        already listed what that version left)."""
+
+        cur.execute(
+            f"DELETE FROM {VERSIONS_TABLE} WHERE rel = %s AND part = ANY(%s) AND generation = written",
+            (table, parts),
+        )
+        cur.execute(
+            f"UPDATE {VERSIONS_TABLE} SET written = NULL, published = NULL, builds = '{{}}' "
+            "WHERE rel = %s AND part = ANY(%s)",
+            (table, parts),
+        )
 
     async def acquire(self, context: WriteContext, prior: Ref | None = None) -> None:
         """Today's path: take the attempt's version check for the partition it
@@ -801,10 +845,23 @@ class PostgresStore:
                             (table,),
                         )
                     )
+                    # The build's rows went through the table's own BEFORE triggers when written.
+                    cloned = {f["name"] for f in cur.execute(_BEFORE_TRIGGERS, (build,)) if f["on_insert"]}
+                    fired = [
+                        (sql.Identifier(f["name"]).as_string(cur), f["enabled"])
+                        for f in cur.execute(_BEFORE_TRIGGERS, (table,)).fetchall()
+                        if f["on_insert"] and f["name"] in cloned
+                    ]
+                    for name, _ in fired:
+                        cur.execute(f"ALTER TABLE {table} DISABLE TRIGGER {name}")
                     self._delete_slice(cur, table, {column: partition} if column else {})
                     cur.execute(
                         f"INSERT INTO {table} ({columns}) OVERRIDING SYSTEM VALUE SELECT {columns} FROM {build}"
                     )
+                    for name, enabled in fired:
+                        cur.execute(
+                            f"ALTER TABLE {table} ENABLE {'ALWAYS ' if enabled == 'A' else ''}TRIGGER {name}"
+                        )
                     cur.execute(
                         f"UPDATE {VERSIONS_TABLE} SET published = %s, "
                         "builds = ARRAY(SELECT b FROM unnest(builds) AS b WHERE b > %s) "
@@ -843,7 +900,7 @@ class PostgresStore:
             prior = None  # a full run keeps nothing of the content
         with self._connect() as conn, conn.cursor() as cur:
             checked, state = self._begin(conn, table, context)
-            at = self._aim(table, context, checked)
+            at = self._aim(table, context, checked, state["built"])
             self._register(cur, at, checked)
             partition_col = output.config.get("partition_column")
             slice_where = {partition_col: context.partition} if partition_col else {}
@@ -1115,6 +1172,7 @@ class PostgresStore:
         from a server-side cursor, read once the iteration starts — after a
         write has committed."""
 
+        import psycopg
         from psycopg.rows import tuple_row
 
         key = _ident(key_column)
@@ -1122,13 +1180,22 @@ class PostgresStore:
         only = ""
         if among is not None:
             only, params = f" AND {key}::text = ANY(%s)", [*params, sorted(among)]
+        query = (
+            f"SELECT DISTINCT {key}::text, convert_to({key}::text, 'UTF8') FROM {{}} "
+            f"WHERE {self._where_sql(where)}{only} ORDER BY 2"
+        )
+        handle = ref.handle or {}
+        table = handle.get("table") or _qname(handle.get("schema", "public"), handle["name"])
         with self._connect() as conn, conn.cursor(name="solera_keys", row_factory=tuple_row) as cur:
-            table = self._source(conn.cursor(), ref)
-            cur.execute(
-                f"SELECT DISTINCT {key}::text, convert_to({key}::text, 'UTF8') FROM {table} "
-                f"WHERE {self._where_sql(where)}{only} ORDER BY 2",
-                params,
-            )
+            source = self._source(conn.cursor(), ref)
+            if source == table:
+                cur.execute(query.format(table), params)
+            else:
+                try:
+                    with conn.transaction():  # a savepoint: the build may be gone by the time it is read
+                        cur.execute(query.format(source), params)
+                except psycopg.errors.UndefinedTable:  # published and dropped after the lookup, as `_read`
+                    cur.execute(query.format(table), params)
             while chunk := cur.fetchmany(KEY_CHUNK):
                 yield [k for k, _ in chunk]
 
