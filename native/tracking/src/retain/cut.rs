@@ -22,13 +22,13 @@
 //! built from it off the loop applies, and [`super::Merged`]'s check refuses
 //! it if the state's own pins say otherwise.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 use solera_index::{pick_merge, ChangeIndex, LayerRef, Query};
 
 use super::{head, Cleaned, Merged};
 use crate::codec::Ver;
-use crate::error::Result;
+use crate::error::{invalid, Result};
 use crate::outcomes::{output_id, FAILURES};
 use crate::progress::{Key, Value};
 use crate::record::Record;
@@ -106,8 +106,8 @@ fn lowest(t: &Tracking, pins: &[Pin], want: impl Fn(&[u8]) -> bool) -> BTreeMap<
         }
     };
     if on(CURSOR) {
-        for (id, &c) in &t.retain.cursors {
-            hold(id, c, &|| Holder::Cursor);
+        for (id, c) in &t.retain.cursors {
+            hold(id, c.at, &|| Holder::Cursor);
         }
     }
     for (id, e) in t.edges.iter().filter(|(_, e)| want(&e.input)) {
@@ -175,17 +175,16 @@ pub fn record_pins(rec: &Record, own: &[u8], run: &[u8]) -> Vec<Pin> {
     pins
 }
 
-/// The entries an output's index holds above `cut`, from its layer list:
-/// every entry of a layer that reaches above it, less a base's one entry
-/// per key.
+/// An upper bound, from the layer list alone, of the entries an output's
+/// index holds above `cut`: every entry of a layer that reaches above it.
+/// It also counts the entries at or below the cut in those layers (a
+/// base's state included), so it never hides an alarm and may raise one
+/// early by at most those.
 pub fn above(o: &Output, cut: u64) -> u64 {
     o.layers
         .iter()
         .filter(|l| l.hi > cut)
-        .map(|l| match l.floor {
-            Some(_) => l.entries.saturating_sub(l.keys),
-            None => l.entries,
-        })
+        .map(|l| l.entries)
         .sum()
 }
 
@@ -199,7 +198,7 @@ pub struct Alarm {
 }
 
 /// The alarm (P11, review F5): every output whose entries above its cut
-/// pass `multiple` times its live keys, with what holds the cut. A consumer
+/// ([`above`]'s bound) pass `multiple` times its live keys, with what holds the cut. A consumer
 /// holding it is released by resetting its progress to held (B3's
 /// `Reset { held: true }`: it owes a full run and its pieces go); a run, by
 /// letting its records go.
@@ -223,15 +222,16 @@ pub fn alarms(t: &Tracking, cuts: BTreeMap<Id, Cut>, multiple: u64) -> Vec<Alarm
 /// none is live. None if the output is not cleaned or nothing is released.
 /// The engine deletes what [`released`] lists, then journals the step.
 pub fn step(t: &Tracking, output: &[u8], pins: &[Pin]) -> Option<Cleaned> {
-    let from = *t.retain.cursors.get(output)?;
+    let c = *t.retain.cursors.get(output)?;
     let to = pins
         .iter()
         .filter(|p| *p.output == *output && matches!(p.by, Holder::Attempt(_)))
         .map(|p| p.commit)
         .fold(head(t, output), u64::min);
-    (to > from).then(|| Cleaned {
+    (to > c.at).then(|| Cleaned {
         output: output.into(),
-        from,
+        life: c.life,
+        from: c.at,
         to,
     })
 }
@@ -250,7 +250,10 @@ pub struct Released {
 /// key present before it). `layers` are the output's now: its cursor, at
 /// `from` until the step is journaled, keeps every entry above it. Versions
 /// of a cleaned output are never written twice for a key (an upsert gets
-/// its attempt's generation), so a released version is never live again.
+/// its attempt's generation), so a released version is never live again: a
+/// replaced version that is not a generation, which a later commit may
+/// write again, is refused. So is a page of no keys, which would read as
+/// nothing released.
 pub async fn released(
     ix: &ChangeIndex,
     layers: &[LayerRef],
@@ -258,31 +261,45 @@ pub async fn released(
     after: Option<Vec<u8>>,
     limit: u64,
 ) -> Result<Released> {
+    if limit == 0 {
+        return invalid("a page of released versions holds at least one key");
+    }
     let q = Query {
         after,
         limit: Some(limit),
         ..Default::default()
     };
-    let mut versions = vec![];
+    let (mut versions, mut named) = (vec![], None);
     let next = ix
         .window_with(layers, s.from + 1..=s.to, &q, |run| {
             for i in 0..run.len() {
                 for r in run.rows(i) {
-                    let v = run.replaced_version(r);
-                    if !v.is_absent() {
-                        versions.push((run.key(i).into(), Ver::of(v)));
+                    match Ver::of(run.replaced_version(r)) {
+                        Ver::Absent => {}
+                        v @ Ver::Int(_) => versions.push((run.key(i).into(), v)),
+                        Ver::Bytes(_) if named.is_none() => named = Some(run.key(i).to_vec()),
+                        Ver::Bytes(_) => {}
                     }
                 }
             }
         })
         .await?;
+    if let Some(k) = named {
+        return invalid(format!(
+            "{}: a cleaned output replaced a version it named, not a generation, which may be live again",
+            String::from_utf8_lossy(&k)
+        ));
+    }
     Ok(Released { versions, next })
 }
 
 /// The next merge SOLE-6's size rule asks for at `cut`, written at `path`:
-/// the part to journal, or None when no merge is due. It reads and writes
-/// the whole run, so the engine runs it off its event loop, with a cut it
-/// took on the loop. Once the part applies, its replaced files may go.
+/// the part to journal, or None when no merge is due. `cut` is [`cut`]'s,
+/// taken with the engine's pins from the state `layers` were read from.
+/// `path` is fresh (the engine's random token): refused, before anything
+/// is written, if the list holds it. It reads and writes the whole run, so
+/// the engine runs it off its event loop. Once the part applies, its
+/// replaced files may go.
 pub async fn merge(
     ix: &ChangeIndex,
     output: &[u8],
@@ -290,6 +307,9 @@ pub async fn merge(
     cut: u64,
     path: &str,
 ) -> Result<Option<Merged>> {
+    if layers.iter().any(|l| l.path == path) {
+        return invalid(format!("the layer path {path} is written twice"));
+    }
     let Some(run) = pick_merge(layers, cut) else {
         return Ok(None);
     };
@@ -301,19 +321,25 @@ pub async fn merge(
     }))
 }
 
-/// The layer files of `output` that may be deleted: those `listed` under its
-/// prefix that its layer list does not name and that no build in flight
-/// (`building`: the paths of commits and merges started and neither journaled
-/// nor given up) will. List first, then call this on the event loop: a file
-/// listed whose build journaled since is in the list by now; one whose event
-/// was refused, or whose engine died, is in neither. That covers a write
-/// with no journal event, a merge's replaced files, and the files of an
-/// output no longer in the state.
-pub fn orphans(t: &Tracking, output: &[u8], listed: &[String], building: &[String]) -> Vec<String> {
-    let layers = t.outputs.get(output).map_or(&[][..], |o| &o.layers[..]);
+/// The layer files that may be deleted: those `listed` that no output's
+/// layer list names (paths are the index store's, whatever output id holds
+/// them: a rename moves layers to another id) and that no build in flight
+/// (`building`: the paths of commits and merges started and neither
+/// journaled nor given up) will. List first, then call this on the event
+/// loop: a file listed whose build journaled since is in a list by now; one
+/// whose event was refused, or whose engine died, is in neither. That
+/// covers a write with no journal event, a merge's replaced files, and the
+/// files of an output no longer in the state.
+pub fn orphans(t: &Tracking, listed: &[String], building: &[String]) -> Vec<String> {
+    let live: HashSet<&str> = t
+        .outputs
+        .values()
+        .flat_map(|o| o.layers.iter().map(|l| l.path.as_str()))
+        .chain(building.iter().map(String::as_str))
+        .collect();
     listed
         .iter()
-        .filter(|p| !layers.iter().any(|l| l.path == **p) && !building.contains(p))
+        .filter(|p| !live.contains(p.as_str()))
         .cloned()
         .collect()
 }

@@ -80,6 +80,12 @@ impl Tracking {
     /// Whether `apply` would take the event, applying nothing: the engine
     /// checks a commit's event before it journals it.
     pub fn check_event(&self, ev: &Event) -> Result<()> {
+        let alone = |p: &Part| matches!(p, Part::Merged(_) | Part::Cleaned(_) | Part::Retire(_));
+        if ev.parts.len() > 1 && ev.parts.iter().any(alone) {
+            return crate::error::invalid(
+                "a merge, a cleanup step or a retirement is an event of its own: each part is checked on the state before the event",
+            );
+        }
         let mut touched = std::collections::HashSet::new();
         for p in &ev.parts {
             for t in p.touches() {

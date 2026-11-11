@@ -49,7 +49,7 @@ struct DiskState {
 
 const FAILED: usize = 1024;
 
-/// How long a fill that failed `n + 1` times in a row is not tried again.
+/// How long a fill that failed `n + 1` times is not tried again.
 fn backoff(n: u32) -> std::time::Duration {
     std::time::Duration::from_secs(60 << n.min(6))
 }
@@ -73,7 +73,10 @@ fn unname(n: &str) -> String {
 impl DiskState {
     /// Note one more failure of `path`, within the bound.
     fn fail(&mut self, path: &str) {
-        let n = self.failed.get(path).map_or(0, |&(_, n)| n + 1);
+        let n = match self.failed.get(path) {
+            Some(&(t, n)) if t.elapsed() < 2 * backoff(n) => n + 1,
+            _ => 0,
+        };
         if n == 0 && self.failed.len() >= FAILED {
             self.failed
                 .retain(|_, &mut (t, n)| t.elapsed() < backoff(n));
@@ -185,8 +188,8 @@ impl Disk {
         if let Some((size, tick)) = st.files.remove(path) {
             st.order.remove(&tick);
             st.total -= size;
+            st.fail(path);
         }
-        st.fail(path);
         let _ = std::fs::remove_file(self.file(path));
     }
 

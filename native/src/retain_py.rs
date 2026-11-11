@@ -17,7 +17,7 @@ use pyo3::types::{PyBytes, PyDict, PyList, PyTuple};
 use solera_tracking as tr;
 use tr::event::{Event, Part};
 use tr::plan::Indexes;
-use tr::retain::{Cleaned, Cut, Holder, Pin, Retire, Track};
+use tr::retain::{Cut, Holder, Pin, Retire, Track};
 
 use crate::guard;
 use crate::index_py::{key, layer_out, rt, version};
@@ -138,7 +138,7 @@ fn retain_record_pins<'py>(
 
 /// The cleanup cursor's next step on `output`: `(from, to, event)`, or
 /// None when nothing is released. Delete every version
-/// `retain_released(..., from, to)` lists, then journal `event`.
+/// `retain_released(tracking, event)` lists, then journal `event`.
 #[pyfunction]
 #[pyo3(signature = (tracking, output, pins=vec![]))]
 fn retain_step<'py>(
@@ -158,33 +158,30 @@ fn retain_step<'py>(
     })
 }
 
-/// A page of the versions the step `from_ + 1..=to` of `output` releases,
+/// A page of the versions the step `event` (from `retain_step`) releases,
 /// at most `limit` keys after `after`: `([(key, version), ...], next)`.
-/// Refused unless the cursor is at `from_`.
+/// Refused unless the step still applies (its cursor, in its life).
 #[pyfunction]
-#[pyo3(signature = (tracking, output, from_, to, *, after=None, limit=10_000))]
+#[pyo3(signature = (tracking, event, *, after=None, limit=10_000))]
 fn retain_released<'py>(
     py: Python<'py>,
     tracking: PyRef<'py, Tracking>,
-    output: &[u8],
-    from_: u64,
-    to: u64,
+    event: &[u8],
     after: Option<String>,
     limit: u64,
 ) -> PyResult<Bound<'py, PyTuple>> {
     guard(|| {
-        let s = Cleaned {
-            output: output.into(),
-            from: from_,
-            to,
+        let s = match &Event::decode(event).map_err(err)?.parts[..] {
+            [Part::Cleaned(s)] => s.clone(),
+            _ => return Err(PyValueError::new_err("not a cleanup step's event")),
         };
         let layers = {
             let t = tracking.state.read().unwrap();
             s.check(&t).map_err(err)?;
-            t.outputs[output].layers.clone()
+            t.outputs[&s.output].layers.clone()
         };
         let ixs = tracking.indexes.read().unwrap().clone();
-        let ix = ixs.index(output).map_err(err)?;
+        let ix = ixs.index(&s.output).map_err(err)?;
         let after = after.map(String::into_bytes);
         let r = py
             .detach(|| rt().block_on(tr::retain::released(ix, &layers, &s, after, limit)))
@@ -197,28 +194,32 @@ fn retain_released<'py>(
     })
 }
 
-/// The next merge of `output`'s layers the size rule asks for at `cut`
-/// (from `retain_cuts`, taken on the event loop), written at `path`:
-/// `{"event", "replaced": [path, ...], "layer"}`, or None when none is
-/// due. Reads and writes the whole run: call it off the event loop. Once
+/// The next merge of `output`'s layers the size rule asks for, written at
+/// `path` (a fresh random token, never reused): `{"event", "replaced":
+/// [path, ...], "layer", "cut"}`, or None when none is due. It folds within
+/// the cut of the state it reads and `pins`, the engine's pins taken on
+/// the event loop (pins only rise, so a later one never falls below it).
+/// Reads and writes the whole run: call it off the event loop. Once
 /// `event` applies, the replaced files may be deleted.
 #[pyfunction]
+#[pyo3(signature = (tracking, output, path, pins=vec![]))]
 fn retain_merge<'py>(
     py: Python<'py>,
     tracking: PyRef<'py, Tracking>,
     output: &[u8],
-    cut: u64,
     path: &str,
+    pins: Vec<PinIn>,
 ) -> PyResult<Option<Bound<'py, PyDict>>> {
     guard(|| {
-        let layers = tracking
-            .state
-            .read()
-            .unwrap()
-            .outputs
-            .get(output)
-            .map(|o| o.layers.clone())
-            .unwrap_or_default();
+        let pins = pins_in(pins)?;
+        let (layers, cut) = {
+            let t = tracking.state.read().unwrap();
+            let layers = t.outputs.get(output).map(|o| o.layers.clone());
+            (
+                layers.unwrap_or_default(),
+                tr::retain::cut(&t, output, &pins).commit,
+            )
+        };
         let ixs = tracking.indexes.read().unwrap().clone();
         let ix = ixs.index(output).map_err(err)?;
         let Some(m) = py
@@ -230,26 +231,25 @@ fn retain_merge<'py>(
         let d = PyDict::new(py);
         d.set_item("replaced", &m.replaced)?;
         d.set_item("layer", layer_out(py, &m.layer)?)?;
+        d.set_item("cut", cut)?;
         d.set_item("event", PyBytes::new(py, &one_event(Part::Merged(m))))?;
         Ok(Some(d))
     })
 }
 
-/// The layer files of `output` that may be deleted: those `listed` under
-/// its prefix that neither its layer list nor a build in flight
-/// (`building`: paths of commits and merges started and neither journaled
-/// nor given up) names. List first, then call this on the event loop.
+/// The layer files that may be deleted: those `listed` that neither any
+/// output's layer list nor a build in flight (`building`: paths of commits
+/// and merges started and neither journaled nor given up) names. List
+/// first, then call this on the event loop.
 #[pyfunction]
 fn retain_orphans(
     tracking: PyRef<'_, Tracking>,
-    output: &[u8],
     listed: Vec<String>,
     building: Vec<String>,
 ) -> PyResult<Vec<String>> {
     guard(|| {
         Ok(tr::retain::orphans(
             &tracking.state.read().unwrap(),
-            output,
             &listed,
             &building,
         ))

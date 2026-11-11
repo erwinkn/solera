@@ -121,6 +121,7 @@ struct Totals {
     merges: u64,
     folds: u64,
     rewritten: u64,
+    folded: u64,
     merge_s: f64,
     merge_cpu: f64,
     merge_max_s: f64,
@@ -222,7 +223,10 @@ fn main() {
                 };
                 let took = l0.elapsed().as_secs_f64() - loop_s;
                 tot.merges += 1;
-                tot.folds += merged.layer.floor.is_some() as u64;
+                if merged.layer.floor.is_some() {
+                    tot.folds += 1;
+                    tot.folded += merged.layer.entries;
+                }
                 tot.rewritten += merged.layer.entries;
                 tot.merge_s += took;
                 tot.merge_cpu += cpu() - c0;
@@ -262,13 +266,15 @@ fn main() {
         let bytes: u64 = out.layers.iter().map(|l| l.size).sum();
         let entries: u64 = out.layers.iter().map(|l| l.entries).sum();
         println!(
-            "day {day}: head={c} layers={} stored_mb={:.1} entries={entries} bytes_per_entry={:.2} committed={} rewritten={} rewritten_per_committed={:.2} merges={} folds={} merge_s={:.1} merge_cpu={:.1} merge_max_s={:.2} loop_ms_total={:.2} loop_ms_max={:.3} released={} clean_s={:.1} peak_rss_mb={:.0}",
+            "day {day}: head={c} layers={} stored_mb={:.1} entries={entries} bytes_per_entry={:.2} committed={} rewritten={} rewritten_per_committed={:.2} merges_alone_per_committed={:.2} folded={} merges={} folds={} merge_s={:.1} merge_cpu={:.1} merge_max_s={:.2} loop_ms_total={:.2} loop_ms_max={:.3} released={} clean_s={:.1} peak_rss_mb={:.0}",
             out.layers.len(),
             bytes as f64 / 1e6,
             bytes as f64 / entries as f64,
             tot.committed,
             tot.rewritten,
             tot.rewritten as f64 / tot.committed as f64,
+            (tot.rewritten - tot.folded) as f64 / tot.committed as f64,
+            tot.folded,
             tot.merges,
             tot.folds,
             tot.merge_s,

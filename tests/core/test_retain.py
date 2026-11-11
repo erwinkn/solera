@@ -30,10 +30,10 @@ def commit(t: Tracking, upserts, removes=(), *, version: int) -> dict:
     return built
 
 
-def released(t: Tracking, start: int, end: int, limit: int) -> list:
+def released(t: Tracking, step: bytes, limit: int) -> list:
     out, after = [], None
     while True:
-        page, after = retain_released(t, b"items", start, end, after=after, limit=limit)
+        page, after = retain_released(t, step, after=after, limit=limit)
         out += page
         if after is None:
             return out
@@ -57,15 +57,20 @@ def test_cleanup_releases_every_version_its_commits_replaced_a_page_at_a_time_th
     assert retain_cuts(t) == {b"items": (0, "cursor", None)}
     start, end, event = retain_step(t, b"items")
     assert (start, end) == (0, 4)
-    assert released(t, 0, 4, limit=2) == [("a", 10), ("b", 10), ("c", 10)]
-    assert released(t, 0, 2, limit=10) == [("a", 10)]
+    assert released(t, event, limit=2) == [("a", 10), ("b", 10), ("c", 10)]
+    _, _, to_2 = retain_step(t, b"items", [(b"items", 2, "attempt", b"a-1")])
+    assert released(t, to_2, limit=10) == [("a", 10)]
+    with pytest.raises(ValueError, match="at least one key"):
+        retain_released(t, event, limit=0)
     t.apply(event)
     assert retain_cuts(t) == {b"items": (4, "head", None)}
     assert retain_step(t, b"items") is None
-    with pytest.raises(ValueError, match="cursor is at Some\\(4\\)"):
-        retain_released(t, b"items", 0, 4)
-    with pytest.raises(ValueError, match="cursor is at"):
+    with pytest.raises(ValueError, match="its cursor is Some"):
+        retain_released(t, event)
+    with pytest.raises(ValueError, match="its cursor is Some"):
         t.apply(event)
+    with pytest.raises(ValueError, match="not a cleanup step"):
+        retain_released(t, retain_event_track(b"items", 4))
 
 
 def test_a_live_attempt_holds_cleanup_and_the_cut_at_the_head_it_planned_at(t):
@@ -81,21 +86,39 @@ def test_a_live_attempt_holds_cleanup_and_the_cut_at_the_head_it_planned_at(t):
 
 def test_a_merge_folds_within_the_cut_and_the_files_it_replaced_become_orphans(t):
     t.apply(retain_step(t, b"items")[2])
-    merged = retain_merge(t, b"items", 4, "items/m1")
-    assert merged is not None and merged["layer"]["floor"] == 4
+    merged = retain_merge(t, b"items", "items/m1")
+    assert merged is not None and merged["layer"]["floor"] == 4 and merged["cut"] == 4
     assert merged["replaced"] == [f"items/{v}" for v in (10, 20, 30, 40)]
     t.apply(merged["event"])
     listed = [*merged["replaced"], "items/m1", "items/stray", "items/building"]
-    assert retain_orphans(t, b"items", listed, ["items/building"]) == [*merged["replaced"], "items/stray"]
+    assert retain_orphans(t, listed, ["items/building"]) == [*merged["replaced"], "items/stray"]
     with pytest.raises(ValueError, match="no longer adjacent"):
         t.apply(merged["event"])
 
 
-def test_a_merge_never_folds_past_the_cleanup_cursor(t):
-    merged = retain_merge(t, b"items", 4, "items/m1")
-    assert merged is not None
-    with pytest.raises(ValueError, match="past 0, which Cursor holds"):
-        t.apply(merged["event"])
+def test_a_merge_to_a_path_the_list_holds_is_refused_before_it_writes(t, tmp_path):
+    t.apply(retain_step(t, b"items")[2])
+    before = (tmp_path / "items" / "10").read_bytes()
+    with pytest.raises(ValueError, match="written twice"):
+        retain_merge(t, b"items", "items/10")
+    assert (tmp_path / "items" / "10").read_bytes() == before
+
+
+def test_a_merge_is_an_event_of_its_own(t):
+    t.apply(retain_step(t, b"items")[2])
+    merged = retain_merge(t, b"items", "items/m1")
+    with pytest.raises(ValueError, match="an event of its own"):
+        t.apply(Tracking.join([merged["event"], Tracking.event_edge_open(b"e", b"items", True)]))
+    t.apply(merged["event"])
+
+
+def test_a_merge_folds_within_the_cut_of_the_state_it_reads_and_the_engine_pins(t):
+    merged = retain_merge(t, b"items", "items/m1")
+    assert merged is not None and merged["cut"] == 0 and merged["layer"]["floor"] is None
+    t.apply(retain_step(t, b"items")[2])
+    attempt = [(b"items", 2, "attempt", b"a-1")]
+    merged = retain_merge(t, b"items", "items/m2", attempt)
+    assert merged is not None and merged["cut"] == 2
 
 
 def test_the_alarm_names_the_run_whose_records_hold_the_cut(t):
@@ -128,4 +151,4 @@ def test_an_output_retires_once_nothing_reads_it_and_then_every_file_is_an_orpha
     t.apply(Tracking.event_edge_close(b"e"))
     t.apply(retain_event_retire(b"items"))
     assert retain_cuts(t) == {}
-    assert retain_orphans(t, b"items", ["items/10"], []) == ["items/10"]
+    assert retain_orphans(t, ["items/10"], []) == ["items/10"]

@@ -22,6 +22,7 @@ use solera_index::LayerRef;
 
 use crate::codec::{Dec, Enc};
 use crate::error::{invalid, Result};
+use crate::outcomes::{DUE, FAILURES, PASS};
 use crate::state::{Id, Tracking};
 
 pub use cut::{
@@ -40,25 +41,40 @@ pub const TAG_RETIRE: u8 = 0x53;
 /// nothing.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Retain {
-    pub cursors: BTreeMap<Id, u64>,
+    pub cursors: BTreeMap<Id, Cursor>,
+    /// The last life given to a cursor.
+    pub lives: u64,
+}
+
+/// A cleanup cursor. Its life tells one life of an output id from the
+/// next: a retired output's commit numbers start again at 1, so a step
+/// names the life it was taken in.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Cursor {
+    pub life: u64,
+    pub at: u64,
 }
 
 impl Retain {
     pub fn encode(&self, e: &mut Enc) {
+        e.uv(self.lives);
         e.uv(self.cursors.len() as u64);
         for (id, c) in &self.cursors {
             e.bytes(id);
-            e.uv(*c);
+            e.uv(c.life);
+            e.uv(c.at);
         }
     }
 
     pub fn decode(d: &mut Dec<'_>) -> Result<Retain> {
+        let lives = d.uv()?;
         let mut cursors = BTreeMap::new();
         for _ in 0..d.count()? {
             let id: Id = d.bytes()?.into();
-            cursors.insert(id, d.uv()?);
+            let (life, at) = (d.uv()?, d.uv()?);
+            cursors.insert(id, Cursor { life, at });
         }
-        Ok(Retain { cursors })
+        Ok(Retain { cursors, lives })
     }
 }
 
@@ -159,6 +175,18 @@ impl Merged {
             }
             _ => {}
         }
+        let floor = l.floor.unwrap_or(0);
+        let clears: Vec<u64> = run
+            .iter()
+            .flat_map(|x| x.clears.iter().copied())
+            .filter(|&c| c > floor)
+            .collect();
+        if l.clears != clears {
+            return invalid(format!(
+                "a merged layer clears at {:?}, the layers it replaces at {clears:?} above {floor}",
+                l.clears
+            ));
+        }
         if o.layers.iter().any(|x| x.path == l.path) {
             return invalid(format!("the layer path {} is written twice", l.path));
         }
@@ -212,16 +240,20 @@ impl Track {
     }
 
     pub(crate) fn apply(self, t: &mut Tracking) {
-        t.retain.cursors.insert(self.output, self.at);
+        t.retain.lives += 1;
+        let life = t.retain.lives;
+        t.retain.cursors.insert(self.output, Cursor { life, at: self.at });
     }
 }
 
 /// Cleanup deleted every version commits `from + 1..=to` replaced
 /// ([`cut::released`]), and its cursor moves to `to`. Refused unless the
-/// cursor is at `from`, so a step is never journaled twice.
+/// cursor is at `from` in the life the step was taken in, so a step is
+/// never journaled twice, nor in a later life of the output.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Cleaned {
     pub output: Id,
+    pub life: u64,
     pub from: u64,
     pub to: u64,
 }
@@ -229,6 +261,7 @@ pub struct Cleaned {
 impl Cleaned {
     pub fn encode(&self, e: &mut Enc) {
         e.bytes(&self.output);
+        e.uv(self.life);
         e.uv(self.from);
         e.uv(self.to);
     }
@@ -236,6 +269,7 @@ impl Cleaned {
     pub fn decode(d: &mut Dec<'_>) -> Result<Cleaned> {
         Ok(Cleaned {
             output: d.bytes()?.into(),
+            life: d.uv()?,
             from: d.uv()?,
             to: d.uv()?,
         })
@@ -243,11 +277,12 @@ impl Cleaned {
 
     pub fn check(&self, t: &Tracking) -> Result<()> {
         let at = t.retain.cursors.get(&self.output);
-        if at != Some(&self.from) {
+        if at != Some(&Cursor { life: self.life, at: self.from }) {
             return invalid(format!(
-                "a cleanup step of {} from {}, its cursor is at {at:?}",
+                "a cleanup step of {} from {} in life {}, its cursor is {at:?}",
                 name(&self.output),
-                self.from
+                self.from,
+                self.life
             ));
         }
         if self.to <= self.from || self.to > head(t, &self.output) {
@@ -263,15 +298,19 @@ impl Cleaned {
     }
 
     pub(crate) fn apply(self, t: &mut Tracking) {
-        t.retain.cursors.insert(self.output, self.to);
+        let life = self.life;
+        t.retain.cursors.insert(self.output, Cursor { life, at: self.to });
     }
 }
 
 /// An output is gone, with its data (CLN-6, Q10: a removed output or
 /// dynamic partition once its `cleanup_after` window has passed): its
 /// layers and its cursor leave the state, and a later commit starts it
-/// anew. The engine deletes its layer files and objects. Refused while an
-/// edge reads it.
+/// anew at commit 1 (a cleanup step or merge of the old life is refused in
+/// the new one: steps name their cursor's life, merges their layers'
+/// paths). The engine deletes its layer files and objects. Refused while an
+/// edge reads it, and for the record outputs of a per-key edge in the
+/// state (they go with the edge).
 #[derive(Clone, Debug, PartialEq)]
 pub struct Retire {
     pub output: Id,
@@ -298,6 +337,15 @@ impl Retire {
                 name(&self.output),
                 name(e)
             ));
+        }
+        if let [0, kind, edge @ ..] = &self.output[..] {
+            if [FAILURES, DUE, PASS].contains(kind) && t.per_key.contains_key(edge) {
+                return invalid(format!(
+                    "{} holds the records of edge {}, and goes with it",
+                    name(&self.output),
+                    name(edge)
+                ));
+            }
         }
         Ok(())
     }

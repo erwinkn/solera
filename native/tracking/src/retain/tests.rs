@@ -26,10 +26,11 @@ use super::*;
 use crate::codec::Ver;
 use crate::commit::{build, Change, Changes, Held, Mode, Spec};
 use crate::event::{Event, Part};
-use crate::outcomes::{output_id, PerKey, FAILURES};
+use crate::outcomes::{output_id, PerKey, DUE, FAILURES};
 use crate::plan::OneIndex;
 use crate::progress::{
-    read_digest, BatchProgress, Conditions, EdgeOpen, KeyRange, Reset, Slice, Value,
+    read_digest, BatchProgress, Conditions, EdgeClose, EdgeOpen, EdgeRename, KeyRange, Reset,
+    Slice, Value,
 };
 use crate::record::Record;
 use crate::state::Output;
@@ -106,8 +107,10 @@ struct Model {
     runs: VecDeque<Vec<Pin>>,
     keep: usize,
     deleted: BTreeSet<(Vec<u8>, u64)>,
-    /// A merge built and not yet journaled.
-    building: Option<Merged>,
+    /// Merges built and not yet journaled, each with how many merges had
+    /// applied when it was built (two may be built from one list).
+    building: Vec<(Merged, u64)>,
+    merges: u64,
     n: u64,
 }
 
@@ -165,7 +168,8 @@ impl Model {
             runs: VecDeque::new(),
             keep,
             deleted: BTreeSet::new(),
-            building: None,
+            building: vec![],
+            merges: 0,
             n: 0,
         }
     }
@@ -345,6 +349,7 @@ impl Model {
             reset: false,
             range: a.range.clone(),
             piece: Some(Value::At(a.head, self.cond.clone())),
+            head: a.head,
             points: vec![],
             expect: a.expect,
             fence: None,
@@ -381,10 +386,15 @@ impl Model {
 
     /// A merge: built from a cut now, journaled now or a few steps later.
     async fn merge(&mut self) -> Res {
-        if let Some(m) = self.building.take() {
+        if self.building.len() == 2 || !self.building.is_empty() && self.rng.random_bool(0.5) {
+            let i = self.rng.random_range(0..self.building.len());
+            let (m, at) = self.building.remove(i);
             let replaced = m.replaced.clone();
-            self.apply(Part::Merged(m))
-                .map_err(|e| format!("a merge built earlier was refused: {e}"))?;
+            match self.apply(Part::Merged(m)) {
+                Ok(()) => self.merges += 1,
+                Err(_) if at < self.merges => return Ok(()),
+                Err(e) => return Err(format!("a merge built earlier was refused: {e}")),
+            }
             if self.rng.random_bool(0.8) {
                 for p in replaced {
                     self.mem
@@ -425,7 +435,7 @@ impl Model {
         let Some(m) = m.map_err(|e| format!("a merge at cut {cut}: {e}"))? else {
             return Ok(());
         };
-        self.building = Some(m);
+        self.building.push((m, self.merges));
         if self.rng.random_bool(0.5) {
             return Box::pin(self.merge()).await;
         }
@@ -499,9 +509,13 @@ impl Model {
             .into_iter()
             .map(|o| o.location.as_ref().strip_prefix("t/").unwrap().to_string())
             .collect();
-        let building: Vec<String> = self.building.iter().map(|m| m.layer.path.clone()).collect();
+        let building: Vec<String> = self
+            .building
+            .iter()
+            .map(|(m, _)| m.layer.path.clone())
+            .collect();
         let layers = self.layers();
-        for p in orphans(&self.t, ITEMS, &listed, &building) {
+        for p in orphans(&self.t, &listed, &building) {
             if layers.iter().any(|l| l.path == p) || building.contains(&p) {
                 return Err(format!("{p} is live, and named an orphan"));
             }
@@ -565,7 +579,7 @@ impl Model {
                 marks.push((k.seen, format!("{}'s seen", String::from_utf8_lossy(id))));
             }
         }
-        let cursor = self.t.retain.cursors.get(ITEMS).copied();
+        let cursor = self.t.retain.cursors.get(ITEMS).map(|c| c.at);
         marks.extend(cursor.map(|c| (c, "the cleanup cursor".into())));
         for (c, what) in marks {
             let page = self
@@ -727,11 +741,7 @@ fn parts_and_cursors_round_trip() {
             output: items(),
             at: 4,
         }),
-        Part::Cleaned(Cleaned {
-            output: items(),
-            from: 1,
-            to: 3,
-        }),
+        cleaned(&m.t, 1, 3),
         Part::Retire(Retire { output: items() }),
     ] {
         let ev = Event::of(vec![p]);
@@ -739,7 +749,7 @@ fn parts_and_cursors_round_trip() {
     }
     let back = Tracking::restore(&m.t.snapshot()).unwrap();
     assert_eq!(back, m.t);
-    assert_eq!(back.retain.cursors[ITEMS], 0);
+    assert_eq!(back.retain.cursors[ITEMS].at, 0);
 }
 
 #[test]
@@ -763,11 +773,7 @@ fn a_merge_is_refused_unless_it_replaces_adjacent_layers_folds_within_the_cut_an
     let e =
         m.t.check_event(&Event::of(vec![Part::Merged(fold.clone())]));
     assert!(format!("{e:?}").contains("Cursor"), "{e:?}");
-    m.apply(Part::Cleaned(Cleaned {
-        output: items(),
-        from: 0,
-        to: 4,
-    }))
+    m.apply(cleaned(&m.t, 0, 4))
     .unwrap();
     // a consumer's piece at 1 holds it now
     m.apply(Part::Batch(BatchProgress {
@@ -775,6 +781,7 @@ fn a_merge_is_refused_unless_it_replaces_adjacent_layers_folds_within_the_cut_an
         reset: false,
         range: KeyRange::all(),
         piece: Some(Value::At(1, m.cond.clone())),
+        head: 1,
         points: vec![],
         expect: read_digest(&Default::default(), false, &KeyRange::all()),
         fence: None,
@@ -789,6 +796,13 @@ fn a_merge_is_refused_unless_it_replaces_adjacent_layers_folds_within_the_cut_an
     assert!(m
         .t
         .check_event(&Event::of(vec![Part::Merged(twice)]))
+        .is_err());
+    // a merged layer that drops or invents a clear
+    let mut clears = ok.clone();
+    clears.layer.clears.push(ok.layer.hi);
+    assert!(m
+        .t
+        .check_event(&Event::of(vec![Part::Merged(clears)]))
         .is_err());
     // replaced layers not adjacent
     let mut gap = ok.clone();
@@ -819,14 +833,50 @@ fn a_merge_is_refused_unless_it_replaces_adjacent_layers_folds_within_the_cut_an
 }
 
 #[test]
+fn a_merge_to_a_held_path_writes_nothing_and_a_merge_shares_no_event() {
+    let rt = runtime();
+    let mut m = commits(&rt, 4);
+    m.apply(cleaned(&m.t, 0, 4))
+    .unwrap();
+    let layers = m.layers();
+    let held = layers[0].path.clone();
+    let bytes = |m: &Model| {
+        rt.block_on(m.mem.get(&Path::from(format!("t/{held}"))))
+            .unwrap()
+    };
+    let before = rt.block_on(bytes(&m).bytes()).unwrap();
+    let e = rt
+        .block_on(merge(&m.ix, ITEMS, &layers, 4, &held))
+        .unwrap_err();
+    assert!(e.to_string().contains("written twice"), "{e}");
+    assert_eq!(rt.block_on(bytes(&m).bytes()).unwrap(), before);
+    let ok = rt
+        .block_on(merge(&m.ix, ITEMS, &layers, 4, "items/m.lay"))
+        .unwrap()
+        .unwrap();
+    let edge = EDGES[0];
+    let batch = Part::Batch(BatchProgress {
+        edge: edge.into(),
+        reset: false,
+        range: KeyRange::all(),
+        piece: Some(Value::At(2, m.cond.clone())),
+        head: 2,
+        points: vec![],
+        expect: read_digest(&Default::default(), false, &KeyRange::all()),
+        fence: None,
+    });
+    let e =
+        m.t.check_event(&Event::of(vec![Part::Merged(ok.clone()), batch]))
+            .unwrap_err();
+    assert!(e.to_string().contains("an event of its own"), "{e}");
+    m.apply(Part::Merged(ok)).unwrap();
+}
+
+#[test]
 fn a_batch_whose_input_folded_past_its_head_is_refused() {
     let rt = runtime();
     let mut m = commits(&rt, 4);
-    m.apply(Part::Cleaned(Cleaned {
-        output: items(),
-        from: 0,
-        to: 4,
-    }))
+    m.apply(cleaned(&m.t, 0, 4))
     .unwrap();
     // an attempt of a fresh consumer planned at 2, unpinned: a merge folds to 3
     let layers = m.layers();
@@ -839,29 +889,37 @@ fn a_batch_whose_input_folded_past_its_head_is_refused() {
         layer,
     }))
     .unwrap();
-    let batch = |h| {
+    let batch = |h, key_list: bool| {
         Part::Batch(BatchProgress {
             edge: EDGES[1].into(),
             reset: false,
             range: KeyRange::all(),
-            piece: Some(Value::At(h, Arc::new(Conditions::default()))),
+            piece: (!key_list).then(|| Value::At(h, Arc::new(Conditions::default()))),
+            head: h,
             points: vec![],
             expect: read_digest(&Default::default(), false, &KeyRange::all()),
             fence: None,
         })
     };
-    let e = m.t.check_event(&Event::of(vec![batch(2)])).unwrap_err();
-    assert!(e.to_string().contains("folded past"), "{e}");
-    m.apply(batch(3)).unwrap();
+    for key_list in [false, true] {
+        let e =
+            m.t.check_event(&Event::of(vec![batch(2, key_list)]))
+                .unwrap_err();
+        assert!(e.to_string().contains("folded past"), "{e}");
+    }
+    m.apply(batch(3, true)).unwrap();
+    m.apply(batch(3, false)).unwrap();
 }
 
 #[test]
 fn the_cursor_moves_only_from_where_it_is_and_within_the_head() {
     let rt = runtime();
     let mut m = commits(&rt, 3);
+    let life = m.t.retain.cursors[ITEMS].life;
     let step = |from, to| {
         Part::Cleaned(Cleaned {
             output: items(),
+            life,
             from,
             to,
         })
@@ -869,6 +927,11 @@ fn the_cursor_moves_only_from_where_it_is_and_within_the_head() {
     assert!(m.apply(step(1, 2)).is_err());
     assert!(m.apply(step(0, 4)).is_err());
     assert!(m.apply(step(0, 0)).is_err());
+    let s = super::step(&m.t, ITEMS, &[]).unwrap();
+    let e = rt
+        .block_on(released(&m.ix, &m.layers(), &s, None, 0))
+        .unwrap_err();
+    assert!(e.to_string().contains("at least one key"), "{e}");
     m.apply(step(0, 2)).unwrap();
     assert!(m.apply(step(0, 2)).is_err(), "a step journaled twice");
     // a step stops at the oldest head a live attempt planned at
@@ -907,6 +970,15 @@ fn the_cursor_moves_only_from_where_it_is_and_within_the_head() {
     assert_eq!(cut(&m.t, &other, &[]).commit, 0);
 }
 
+fn cleaned(t: &Tracking, from: u64, to: u64) -> Part {
+    Part::Cleaned(Cleaned {
+        output: items(),
+        life: t.retain.cursors.get(ITEMS).map_or(0, |c| c.life),
+        from,
+        to,
+    })
+}
+
 fn step_of(t: &Tracking, pins: &[Pin]) -> Option<(u64, u64)> {
     step(t, ITEMS, pins).map(|s| (s.from, s.to))
 }
@@ -915,11 +987,7 @@ fn step_of(t: &Tracking, pins: &[Pin]) -> Option<(u64, u64)> {
 fn a_per_key_edge_with_failing_keys_holds_the_cut_at_seen() {
     let rt = runtime();
     let mut m = commits(&rt, 4);
-    m.apply(Part::Cleaned(Cleaned {
-        output: items(),
-        from: 0,
-        to: 4,
-    }))
+    m.apply(cleaned(&m.t, 0, 4))
     .unwrap();
     let edge: Id = EDGES[2].into();
     m.t.per_key.insert(
@@ -952,11 +1020,7 @@ fn the_alarm_names_what_holds_the_cut() {
     let rt = runtime();
     let mut m = commits(&rt, 12);
     let head = m.head();
-    m.apply(Part::Cleaned(Cleaned {
-        output: items(),
-        from: 0,
-        to: head,
-    }))
+    m.apply(cleaned(&m.t, 0, head))
     .unwrap();
     let run = Pin {
         output: items(),
@@ -1037,10 +1101,16 @@ fn orphans_are_the_listed_files_no_layer_and_no_build_names() {
         .chain(["items/crashed.lay".into(), "items/merging.lay".into()])
         .collect();
     assert_eq!(
-        orphans(&m.t, ITEMS, &listed, &["items/merging.lay".into()]),
+        orphans(&m.t, &listed, &["items/merging.lay".into()]),
         vec!["items/crashed.lay".to_string()]
     );
-    assert_eq!(orphans(&m.t, b"gone", &layers, &[]), layers);
+    // a path is live whatever output id holds it (B6 renames move layers)
+    let mut moved = m.t.clone();
+    let o = moved.outputs.remove(ITEMS).unwrap();
+    moved.outputs.insert(b"renamed".as_slice().into(), o);
+    assert_eq!(orphans(&moved, &layers, &[]), Vec::<String>::new());
+    moved.outputs.clear();
+    assert_eq!(orphans(&moved, &layers, &[]), layers);
 }
 
 #[test]
@@ -1059,4 +1129,150 @@ fn an_output_retires_once_no_edge_reads_it() {
     assert!(!m.t.outputs.contains_key(ITEMS));
     assert!(m.t.retain.cursors.is_empty());
     assert!(m.apply(retire()).is_err());
+    // a per-key edge's records go with the edge, not alone
+    let edge: Id = EDGES[2].into();
+    let records = output_id(DUE, &edge);
+    m.t.per_key.insert(edge.clone(), PerKey::default());
+    m.t.outputs.insert(
+        records.clone(),
+        Output {
+            head: 1,
+            ..Default::default()
+        },
+    );
+    let e = m
+        .apply(Part::Retire(Retire {
+            output: records.clone(),
+        }))
+        .unwrap_err();
+    assert!(e.to_string().contains("goes with it"), "{e}");
+    m.t.per_key.remove(&edge);
+    m.apply(Part::Retire(Retire { output: records })).unwrap();
+}
+
+#[test]
+fn a_step_or_merge_of_an_earlier_life_is_refused_in_the_next() {
+    let rt = runtime();
+    let mut m = commits(&rt, 4);
+    let stale = super::step(&m.t, ITEMS, &[]).unwrap();
+    let layers = m.layers();
+    let layer = rt
+        .block_on(m.ix.merge(&layers, 1..3, 0, "items/old.lay"))
+        .unwrap();
+    let old_merge = Merged {
+        output: items(),
+        replaced: layers[1..3].iter().map(|l| l.path.clone()).collect(),
+        layer,
+    };
+    for e in EDGES {
+        m.apply(Part::EdgeClose(EdgeClose { edge: e.into() }))
+            .unwrap();
+    }
+    m.apply(Part::Retire(Retire { output: items() })).unwrap();
+    m.apply(Part::Track(Track {
+        output: items(),
+        at: 0,
+    }))
+    .unwrap();
+    (m.states, m.replaced) = (vec![St::new()], vec![vec![]]);
+    while m.head() < 4 {
+        rt.block_on(m.commit()).unwrap();
+    }
+    let fresh = super::step(&m.t, ITEMS, &[]).unwrap();
+    assert_eq!((fresh.from, fresh.to), (stale.from, stale.to));
+    assert_ne!(fresh.life, stale.life);
+    let e = m.apply(Part::Cleaned(stale)).unwrap_err();
+    assert!(e.to_string().contains("in life"), "{e}");
+    let e = m.apply(Part::Merged(old_merge)).unwrap_err();
+    assert!(e.to_string().contains("no longer adjacent"), "{e}");
+    m.apply(Part::Cleaned(fresh)).unwrap();
+}
+
+#[test]
+fn cleanup_refuses_a_replaced_version_that_is_not_a_generation() {
+    let rt = runtime();
+    let mut m = commits(&rt, 0);
+    for (c, v) in [(1u64, &b"v1"[..]), (2, b"v2"), (3, b"v1")] {
+        let changes = Changes::of(&[(&b"k"[..], Change::Upsert(Some(v)))]).unwrap();
+        let out = m.t.outputs.get(ITEMS).cloned().unwrap_or_default();
+        let path = format!("items/b{c}.lay");
+        let spec = Spec {
+            version: c,
+            time_ms: 0,
+            producer: b"p",
+            path: &path,
+            mode: Mode::Patch,
+            ends_full_run: false,
+            collect: 0,
+        };
+        let b = rt
+            .block_on(build(
+                &OneIndex(&m.ix),
+                &items(),
+                &out,
+                spec,
+                &mut Held(Some(&changes)),
+            ))
+            .unwrap()
+            .unwrap();
+        m.apply(Part::OutputCommit(b.part)).unwrap();
+    }
+    let s = super::step(&m.t, ITEMS, &[]).unwrap();
+    let e = rt
+        .block_on(released(&m.ix, &m.layers(), &s, None, 10))
+        .unwrap_err();
+    assert!(e.to_string().contains("not a generation"), "{e}");
+}
+
+#[test]
+fn an_edge_moves_to_an_input_only_above_its_floor() {
+    let rt = runtime();
+    let mut m = commits(&rt, 4);
+    m.apply(cleaned(&m.t, 0, 4)).unwrap();
+    let layers = m.layers();
+    let layer = rt
+        .block_on(m.ix.merge(&layers, 0..3, 3, "items/f.lay"))
+        .unwrap();
+    m.apply(Part::Merged(Merged {
+        output: items(),
+        replaced: layers[0..3].iter().map(|l| l.path.clone()).collect(),
+        layer,
+    }))
+    .unwrap();
+    let other: Id = b"other".as_slice().into();
+    m.t.outputs.insert(
+        other.clone(),
+        Output {
+            head: 1,
+            ..Default::default()
+        },
+    );
+    let edge: Id = b"moved".as_slice().into();
+    m.apply(Part::EdgeOpen(EdgeOpen {
+        edge: edge.clone(),
+        input: other.clone(),
+        keyed: true,
+    }))
+    .unwrap();
+    m.apply(Part::Batch(BatchProgress {
+        edge: edge.clone(),
+        reset: false,
+        range: KeyRange::all(),
+        piece: Some(Value::At(1, m.cond.clone())),
+        head: 1,
+        points: vec![],
+        expect: read_digest(&Default::default(), false, &KeyRange::all()),
+        fence: None,
+    }))
+    .unwrap();
+    let rename = |input: &Id| {
+        Part::EdgeRename(EdgeRename {
+            from: edge.clone(),
+            to: edge.clone(),
+            input: input.clone(),
+        })
+    };
+    let e = m.t.check_event(&Event::of(vec![rename(&items())])).unwrap_err();
+    assert!(e.to_string().contains("below its new input's floor"), "{e}");
+    m.apply(rename(&other)).unwrap();
 }

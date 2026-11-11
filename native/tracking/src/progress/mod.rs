@@ -999,9 +999,21 @@ impl EdgeRename {
     }
 
     pub(crate) fn check(&self, t: &Tracking) -> Result<()> {
-        edge(t, &self.from)?;
+        let e = edge(t, &self.from)?;
         if self.from != self.to && t.edges.contains_key(&self.to) {
             return invalid("the new name is taken");
+        }
+        let floor = t
+            .outputs
+            .get(&self.input)
+            .and_then(|o| o.layers.first()?.floor)
+            .unwrap_or(0);
+        if let Some(c) = e.progress.keyed().and_then(|k| k.commits().min()) {
+            if c < floor {
+                return invalid(format!(
+                    "the edge holds a piece at commit {c}, below its new input's floor {floor}: reset it first"
+                ));
+            }
         }
         Ok(())
     }
@@ -1102,6 +1114,8 @@ pub struct BatchProgress {
     pub range: KeyRange,
     /// `At(head, the conditions it was planned under)`; `None` for a key list.
     pub piece: Option<Value>,
+    /// The input's head the batch planned at. Refused once a fold passed it.
+    pub head: u64,
     /// Sorted by key.
     pub points: Vec<(Key, Point)>,
     /// The digest of the progress the plan read (the range's slice; with a
@@ -1148,6 +1162,7 @@ impl BatchProgress {
                 v.encode(&mut body, &mut t);
             }
         }
+        body.uv(self.head);
         encode_points(&mut body, &mut t, self.points.iter().map(|(k, p)| (k, p)));
         body.uv(self.expect);
         match &self.fence {
@@ -1172,6 +1187,7 @@ impl BatchProgress {
             1 => Some(Value::decode(d, &conds)?),
             t => return format(format!("piece tag {t}")),
         };
+        let head = d.uv()?;
         let points = decode_points(d, &conds)?;
         let expect = d.uv()?;
         let fence = match d.u8()? {
@@ -1184,6 +1200,7 @@ impl BatchProgress {
             reset,
             range,
             piece,
+            head,
             points,
             expect,
             fence,
@@ -1201,12 +1218,10 @@ impl BatchProgress {
         if read_digest(k, self.reset, &self.range) != self.expect {
             return invalid("the edge's progress moved since the batch was planned");
         }
-        if let Some(Value::At(h, _)) = &self.piece {
-            let input = &t.edges[&self.edge].input;
-            let floor = t.outputs.get(input).and_then(|o| o.layers.first()?.floor);
-            if floor.is_some_and(|f| f > *h) {
-                return invalid("the input's layers no longer reach back to the batch's head: a merge folded past it");
-            }
+        let input = &t.edges[&self.edge].input;
+        let floor = t.outputs.get(input).and_then(|o| o.layers.first()?.floor);
+        if floor.is_some_and(|f| f > self.head) {
+            return invalid("the input's layers no longer reach back to the batch's head: a merge folded past it");
         }
         if let Some((output, head)) = &self.fence {
             if *t.edges[&self.edge].input != **output {

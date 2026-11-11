@@ -142,6 +142,9 @@ pub async fn build_each(
     each: Each<'_>,
 ) -> Result<Option<Built>> {
     let ix = ixs.index(output)?;
+    if out.layers.iter().any(|l| l.path == spec.path) {
+        return invalid(format!("the layer path {} is written twice", spec.path));
+    }
     let head = out.head;
     let commit = head + 1;
     if let Mode::Report(at) = spec.mode {
