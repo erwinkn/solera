@@ -611,25 +611,45 @@ indexes, and identity columns that draw from the user's table's sequences.
 A build copies the table's shape, not what a statement on the table does
 with its rows. So a table a build cannot stand in for never opens one: a
 view or a foreign table, or a table with a trigger, a rule, row security
-or a policy, or a partition whose generated column has an expression of
-its own, in any state, on it or on a table that inherits from it (a
-partition among them). The switch's `DELETE` and `INSERT` would publish
-rows other than the ones Solera has read in the build: a trigger or a
-partition's expression changes them, a policy hides them. The store never
+or a policy, or a generated column a build computes otherwise (a
+partition's own expression, or one that reads `tableoid`, which in the
+build is the build's), in any state, on it or on a table that inherits
+from it (a partition among them). The switch's `DELETE` and `INSERT` would
+publish rows other than the ones Solera has read in the build: a trigger
+or such a generated column changes them, a policy hides them. The store never
 alters the user's table to stop it, and which of them a statement would
 run depends on its events, its level, its state, the session's role and
 the statement's target, so the store does not guess. A full run's first
 write there fails with `PublicationRefused` and changes nothing; write such
 an output in place (today's path). The switch takes its `DELETE`'s lock on
 the table and every partition before it reads the catalog again, so any
-of them added during the run refuses the publication, and none can be
-added while it publishes. Every transaction of the store is READ
-COMMITTED, whatever the connection's default, so each catalog read sees
-the catalog as it is then. A cleanup of one key deletes its rows from the partition's
+of them added during the run refuses the publication, and it reads the
+catalog once more after the rows, for a partition attached meanwhile
+takes no lock it waits for. Every transaction of the store that writes,
+switches or cleans up is READ COMMITTED, whatever the connection's
+default, so each catalog read sees the catalog as it is then; a snapshot
+read (`reads()`) keeps its REPEATABLE READ.
+
+A full run into a partition holding no rows writes in place (Erwin,
+2026-11-11): there are no old rows to keep from outsiders, so building
+beside would only double the work. A first write that would open a build,
+of a partition with no registered run and no row, writes in place
+instead and records its run as published, so the run's writes go in
+place and its switch does nothing. It is paid one `SELECT EXISTS`, by
+that write alone (with a partition column and no index on it, a scan of
+the table, which the switch's `DELETE` would scan too). So outside readers
+see all old rows, then all new, except that a partition holding no rows
+may be seen filling during its first run, and a dead first run's partial
+rows stay visible until the next run. A partition that holds rows,
+including a dead first run's leftovers, builds beside and switches. A
+table a build cannot stand in for is refused all the same, empty or not:
+row security can hide rows from the check. A cleanup of one key deletes its rows from the partition's
 builds too. A run whose first writes are empty, with no
-table and no declared columns to make one from, makes nothing: its
-version row records it as pending, and its first batch with rows opens
-the build, whatever another partition made meanwhile. A pending run that
+table and no declared columns to make one from, makes nothing; with no
+table the partition holds no rows, so such a run writes in place unless a
+run is registered there. A run that opens no build that way is pending:
+its version row records it, and its first batch with rows opens the
+build, whatever another partition made meanwhile. A pending run that
 ends publishes an empty partition.
 Writes of the run go there while the registry lists it; a load reads the
 build its ref names while the registry lists it, else the user's table,

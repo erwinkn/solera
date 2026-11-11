@@ -10,7 +10,8 @@ attempt reads (`acquire`).
 
 A full run builds beside the published rows (D211): its writes go to a build
 table in `solera_build`, which the same row registers, and
-`full_run_ended` publishes it in one transaction.
+`full_run_ended` publishes it in one transaction. A full run into a
+partition holding no rows writes in place, and is published as it starts.
 
 `psycopg` is imported lazily so project files can declare the store without a
 driver installed; only `store`/`load` need it (in the worker).
@@ -118,8 +119,9 @@ class _Target:
     """Where a write goes (`PostgresStore._aim`): the user's `table`, or the
     build of full run `run` of `partition`, which the write `opens`; the
     partition's registered runs after it, with a build (`builds`) or with
-    none made yet (`pending`), and whether the catalog holds a build of the
-    partition it does not keep (`retired`)."""
+    none made yet (`pending`), the full run it records as published as it
+    starts, in place (`publishes`), and whether the catalog holds a build of
+    the partition it does not keep (`retired`)."""
 
     table: str
     partition: str
@@ -127,6 +129,7 @@ class _Target:
     opens: bool = False
     builds: list = field(default_factory=list)
     pending: list = field(default_factory=list)
+    publishes: int | None = None
     retired: bool = False
 
     def made_nothing(self) -> None:
@@ -154,8 +157,9 @@ def _build_name(table: str, partition: str, run: int) -> str:
 # What a build cannot stand in for: a switch's DELETE and INSERT would give rows other than the
 # ones Solera read in the build, or hide them. On the table or any table that inherits from it (a
 # partition among them), in any state: a relation other than a plain or partitioned table (a view,
-# a foreign table), a trigger, a rule, row security or a policy, or a generated column whose
-# expression differs from the table's (the build computes the table's). Which of them a statement
+# a foreign table), a trigger, a rule, row security or a policy, or a generated column a build
+# computes otherwise: one whose expression differs from the table's (the build computes the
+# table's), or one that reads a system column, tableoid (the build computes its own). Which of them a statement
 # would run depends on its events, its level, the session's role and the statement's target, so
 # the store does not guess: any refuses.
 _UNBUILDABLE = """EXISTS (WITH RECURSIVE tree(oid) AS (SELECT {rel}::oid
@@ -169,7 +173,10 @@ _UNBUILDABLE = """EXISTS (WITH RECURSIVE tree(oid) AS (SELECT {rel}::oid
       WHERE a.attrelid = tree.oid AND a.attgenerated <> '' AND pg_get_expr(d.adbin, d.adrelid) IS DISTINCT FROM
         (SELECT pg_get_expr(e.adbin, e.adrelid) FROM pg_attribute b JOIN pg_attrdef e
           ON e.adrelid = b.attrelid AND e.adnum = b.attnum
-          WHERE b.attrelid = {rel}::oid AND b.attname = a.attname AND b.attgenerated <> '')))"""
+          WHERE b.attrelid = {rel}::oid AND b.attname = a.attname AND b.attgenerated <> ''))
+    OR EXISTS (SELECT 1 FROM pg_attrdef d JOIN pg_depend p ON p.classid = 'pg_attrdef'::regclass
+      AND p.objid = d.oid AND p.refclassid = 'pg_class'::regclass AND p.refobjid = d.adrelid
+      AND p.refobjsubid < 0 WHERE d.adrelid = tree.oid))"""
 
 _STATE = (
     """
@@ -198,8 +205,9 @@ FROM (SELECT (SELECT c.oid FROM pg_class c JOIN pg_namespace n ON n.oid = c.reln
 )
 
 _UNBUILDABLE_WHY = (
-    "is a view or foreign table, or has a trigger, a rule, row security or a partition's own generated "
-    "expression, on it or on a table that inherits from it"
+    "is a view or foreign table, or has a trigger, a rule, row security, or a generated column a build "
+    "computes otherwise (a partition's own expression, or one reading tableoid), on it or on a table that "
+    "inherits from it"
 )
 _UNBUILDABLE_NOW = "SELECT " + _UNBUILDABLE.format(rel="%(t)s::regclass") + " AS unbuildable"
 
@@ -628,7 +636,7 @@ class PostgresStore:
         lock = "pg_advisory_xact_lock" if exclusive else "pg_advisory_xact_lock_shared"
         cur.execute(f"SELECT {lock}(hashtext(%s))", (f"solera-domain:{table}",))
 
-    def _aim(self, table: str, context: WriteContext, checked: dict | None, state: dict) -> _Target:
+    def _aim(self, cur, table: str, context: WriteContext, checked: dict | None, state: dict) -> _Target:
         """Where a write goes (D211; docs/tracking-design.md §8, obligations 1
         and 2). Today's path (`context.builds` off) writes in place. A full
         run's first write (`reset`) opens the build of its run (its own
@@ -640,6 +648,16 @@ class PostgresStore:
         others: no run in the log names them, and the check has locked their
         writers out.
 
+        A full run into a partition holding no rows has nothing to keep
+        outsiders from: a first write that would open a build, of a partition
+        with no registered run and no row (one `EXISTS`, paid by that write
+        alone), writes in place instead and records its run as published, so
+        its writes go in place and `full_run_ended` does nothing for it. Outside
+        readers may so see the partition fill, and a dead run's rows stay
+        until the next run's switch (Erwin, 2026-11-11). A table a build cannot
+        stand in for is refused all the same: row security can hide rows from
+        the check.
+
         A run's state is recorded in its version row, never inferred from
         the catalog: registered with a build (`builds`), or with none made
         yet (`pending`: its writes so far had no rows, and no shape to make
@@ -649,8 +667,8 @@ class PostgresStore:
         or a restore lost it): a write of its run fails (`RunLost`) and
         changes nothing, for the rows it held are gone. A table a build
         cannot stand in for (`_UNBUILDABLE`: a view or foreign table, a
-        trigger, a rule, row security, a partition's own generated expression,
-        on it or on a table that inherits from it) never opens a build
+        trigger, a rule, row security, a generated column a build computes
+        otherwise, on it or on a table that inherits from it) never opens a build
         (`PublicationRefused`): the switch would publish rows other than the
         ones Solera has read, and the store never alters the user's table to
         stop it. A
@@ -682,6 +700,17 @@ class PostgresStore:
             )
         if run is not None:
             at.run, at.opens = run, run not in at.builds
+        if at.opens and not (at.builds or at.pending or state["unbuildable"]):
+            column = context.output.config.get("partition_column")
+            where = {column: context.partition} if column else {}
+            if (
+                not state["present"]
+                or not cur.execute(
+                    f"SELECT EXISTS (SELECT FROM {table} WHERE {self._where_sql(where)}) AS held",
+                    [where[k] for k in sorted(where)],
+                ).fetchone()["held"]
+            ):
+                at.run, at.opens, at.publishes = None, False, run
         if at.opens and state["unbuildable"]:
             raise PublicationRefused(
                 f"{context.output.name} {context.partition!r}: {table} {_UNBUILDABLE_WHY}: publishing a "
@@ -696,13 +725,15 @@ class PostgresStore:
         return at
 
     def _register(self, cur, at: _Target, checked: dict | None) -> None:
-        if checked is not None and (at.builds, at.pending) != (
+        if checked is not None and (at.builds, at.pending, at.publishes) != (
             list(checked["builds"]),
             list(checked["pending"]),
+            None,
         ):
             cur.execute(
-                f"UPDATE {VERSIONS_TABLE} SET builds = %s, pending = %s WHERE rel = %s AND part = %s",
-                (at.builds, at.pending, at.table, at.partition),
+                f"UPDATE {VERSIONS_TABLE} SET builds = %s, pending = %s, published = coalesce(%s, published) "
+                "WHERE rel = %s AND part = %s",
+                (at.builds, at.pending, at.publishes, at.table, at.partition),
             )
 
     def _sweep(self, table: str, partition: str) -> None:
@@ -886,7 +917,7 @@ class PostgresStore:
             checked, state = self._begin(conn, table, context, write=False)
             if output.key is None or not state["present"]:
                 return spool
-            at = self._aim(table, context, checked, state)
+            at = self._aim(cur, table, context, checked, state)
             source = (
                 table
                 if at.run is None or at.opens
@@ -912,7 +943,8 @@ class PostgresStore:
         docs/tracking-design.md §8, obligations 4 and 5). One transaction
         holding the partition's version check: if an attempt newer than
         `newest` has written (a call delivered late), it does nothing and
-        says not published; a run published before says published; a run
+        says not published; a run published before, or one that wrote in place
+        into a partition holding no rows (`_aim`), says published; a run
         that is not registered (overtaken), or whose build is gone (a
         migration dropped it, or a restore lost it; it stays registered, as
         lost, until a new full run starts), says not published. A pending
@@ -1036,7 +1068,7 @@ class PostgresStore:
             prior = None  # a full run keeps nothing of the content
         with self._connect() as conn, conn.cursor() as cur:
             checked, state = self._begin(conn, table, context)
-            at = self._aim(table, context, checked, state)
+            at = self._aim(cur, table, context, checked, state)
             partition_col = output.config.get("partition_column")
             slice_where = {partition_col: context.partition} if partition_col else {}
 
