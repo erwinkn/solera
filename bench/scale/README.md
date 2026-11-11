@@ -45,20 +45,25 @@ in the report measures the store's bytes.
 |---|---|
 | wall_s | Driver clock, from one engine sample line to a later one. serve.py writes one line a second. |
 | engine_cpu_s, engine_cores | /proc/{engine}/stat |
-| loop_busy, loop_longest_ms | serve.py wraps the event loop's selector: time outside `select` is busy, and the longest stretch is the longest stall |
+| loop_busy, loop_longest_ms | serve.py wraps the event loop's selector: time outside `select` is busy, and the longest stretch is the longest stall. Each sample line covers the second before it: the line before the phase is only the baseline of the cumulative counters, and extrema come from the lines after it |
 | engine_rss_peak_mb | serve.py, one sample a second |
+| engine_rss_peak_so_far_mb | serve.py, the kernel's high-water mark of the engine's RSS |
 | engine_write_bytes | /proc/{engine}/io write_bytes: everything the engine wrote, journal and run history included |
-| batches, batches_by_asset | Change in each output head's commit number |
-| keys_delivered, keys_per_s | Keys the producers were handed (project.py stats) |
-| engine_cpu_ms_per_batch | engine_cpu_s over batches |
-| state_bytes_added, index_bytes_per_entry | Bytes added under the state, by directory. The change index is `scale/keys` (today) or `scale/core` (core); index_bytes_per_entry is its growth over the entries committed (source keys plus keys written) |
+| batches, batches_by_asset | Succeeded attempts by asset, from the run's detail: one attempt is one batch |
+| keys_planned, keys_per_s | Keys the producers' batches planned (added, updated, removed and unchanged), from project.py stats; keys_per_s is over the phase's wall time |
+| rows_produced | Rows the producers were handed (removed keys have none) |
+| engine_cpu_ms_per_batch | engine_cpu_s over batches: the whole engine, source commits and the API included |
+| keys_per_planning_cpu_s, commit_cpu_ms_per_batch | With `--profile`: keys planned over the engine CPU py-spy puts in planning, and the CPU it puts in building commits over batches |
+| state_bytes_added, index_bytes_per_entry | Bytes added under the state, by directory. The change index is `scale/keys` (today) or `scale/core` (core); index_bytes_per_entry is its growth over the entries committed: source keys changed, plus each keyed output's keys written and removed |
 | attempts, attempt_steps_s | Sum of each attempt's lifecycle steps (preparing … settling), from the run's detail |
-| workers | Each producer and store call's wall and CPU seconds, from `stats/{pid}.jsonl` |
+| workers | Each producer and store call's wall and CPU seconds and key counts, from `stats/{pid}.jsonl`, tally's own load and write included |
 | engine_cpu_by_part_s | With `--profile`: the engine's CPU split by `BUCKETS` (journaling, source commits, building commits, planning, API, upkeep, other), in proportion to py-spy samples |
 
-`report.md` puts N1, N3, N9 and N12 (plans/build-plan.md) beside their thresholds. It also shows
-the engine CPU of each full run against the six-minute target, and the engine CPU per batch for
-keys in one range against scattered keys.
+`report.md` puts N1, N3, N7 and N9 (plans/build-plan.md) beside their thresholds. N3 and N7 need
+`--profile`: they are the CPU py-spy puts in planning and in building commits. Without it, the
+report gives only the proxies, which are the whole run's wall time and the whole engine's CPU. It
+also shows the engine CPU of each full run against the six-minute target, and the engine's peak
+memory.
 
 What is not measured:
 
@@ -66,12 +71,20 @@ What is not measured:
   gives the engine's bytes written per entry instead, which includes rewrites and also the
   journal.
 - N3 is measured with the cast's four consumers, not 50 tasks.
+- N12 (engine memory under 50 tasks) is not exercised: the cast has four. The report gives the
+  peak for this cast with no threshold.
+- py-spy's split is by sampled stacks (`BUCKETS` in run.py), so N3 and N7 are as exact as the
+  bucket patterns.
 
 ## Checks
 
-At the end, every keyed output must hold exactly the live keys, and tally must count them. Up to
+At the end, every keyed output must hold exactly the live keys: the driver streams each output's
+keys in key order against `versions`, at any scale. Tally's every group must hold its count. Up to
 1M keys (`VERIFY`), the driver also reads every key's value back after every day and compares it
 with `versions`. The run exits non-zero if any of this fails.
+
+`--change` and `--adds` run from 0 to 0.5: a day removes as many keys as it adds, from the keys it
+changes, so the live count stays `--keys`.
 
 The randomized check of the harness itself is the same run, small, with heavy churn, over several
 seeds, on both paths:

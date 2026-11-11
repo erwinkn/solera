@@ -79,7 +79,7 @@ class Run:
             "SOLERA_CONCURRENCY": str(args.concurrency),
             "PYTHONPATH": os.pathsep.join(filter(None, [str(REPO), os.environ.get("PYTHONPATH")])),
         }
-        self.processes: list[subprocess.Popen] = []
+        self.processes: dict[str, subprocess.Popen] = {}
         self.phases: list[dict] = []
         self.rng = random.Random(args.seed)
         self.live = args.keys
@@ -129,18 +129,30 @@ class Run:
         process = subprocess.Popen(
             command, env=self.env, stdout=log, stderr=subprocess.STDOUT, cwd=REPO, start_new_session=True
         )
-        self.processes.append(process)
+        self.processes[name] = process
         return process
 
+    def alive(self) -> None:
+        """Raise if the engine or a worker exited: nothing would finish the work."""
+
+        for name, process in self.processes.items():
+            if process.poll() is not None:
+                raise RuntimeError(
+                    f"{name} exited ({process.returncode}): see {self.root / 'logs' / name}.log"
+                )
+
     def stop(self) -> None:
-        for process in reversed(self.processes):
-            if process.poll() is None:
-                os.killpg(process.pid, signal.SIGTERM)
-        for process in self.processes:
+        """End every process group it started, the leader's descendants too,
+        whether the leader is still alive or not."""
+
+        for process in reversed(self.processes.values()):
+            _signal_group(process.pid, signal.SIGTERM)
+        for process in self.processes.values():
             try:
                 process.wait(30)
             except subprocess.TimeoutExpired:
-                os.killpg(process.pid, signal.SIGKILL)
+                pass
+            _signal_group(process.pid, signal.SIGKILL)
 
     # -- the API ---------------------------------------------------------------------
 
@@ -156,8 +168,7 @@ class Run:
         )
         deadline = time.monotonic() + 300
         while time.monotonic() < deadline:
-            if self.engine.poll() is not None:
-                raise RuntimeError(f"the engine exited: see {self.root / 'logs' / 'engine.log'}")
+            self.alive()
             try:
                 if (await self.client.get("/healthz")).status_code == 200:
                     return
@@ -178,7 +189,8 @@ class Run:
         return encoded
 
     async def run(self, targets: list[str]) -> dict:
-        """Run `targets` to the end; the attempts' time by step (lifecycle.md).
+        """Run `targets` to the end; its batches (its succeeded attempts, by
+        asset) and the attempts' time by step (lifecycle.md).
 
         It polls the newest run of the listing, not the run's detail: the
         detail holds every attempt, and at 100M keys a run has 10,000."""
@@ -188,18 +200,23 @@ class Run:
             await asyncio.sleep(1.0)
             listing = await self.call("GET", "/runs", params={"limit": 1})
             rows = listing.get("runs", listing.get("items")) if isinstance(listing, dict) else listing
-            status = next(r["status"] for r in rows if r["id"] == run["id"])
+            status = next((r["status"] for r in rows if r["id"] == run["id"]), None)
+            if status is None:  # not the newest: a run that took nothing ended at once
+                status = (await self.call("GET", f"/runs/{run['id']}"))["request"]["status"]
             if status in ("succeeded", "failed", "canceled", "blocked"):
                 break
-            if self.engine.poll() is not None:
-                raise RuntimeError("the engine exited mid-run")
+            self.alive()
         detail = await self.call("GET", f"/runs/{run['id']}")
         if status != "succeeded":
             errors = [t.get("error") for t in detail.get("tasks", []) if t.get("error")]
             raise RuntimeError(f"run of {targets} ended {status}: {errors[:3]}")
         attempts = [a for task in detail["attempts"].values() for a in task]
         steps = {s: round(sum(a.get(s) or 0 for a in attempts), 1) for s in STEPS}
+        batches = Counter({name: 0 for name in targets})
+        for task in detail["tasks"]:
+            batches[task["asset"]] += sum(a["outcome"] == "succeeded" for a in detail["attempts"][task["id"]])
         return {
+            "batches_by_asset": dict(batches),
             "attempts": len(attempts),
             "attempt_wall_s": round(sum(a["finished_at"] - a["started_at"] for a in attempts), 1),
             "attempt_steps_s": steps,
@@ -219,17 +236,21 @@ class Run:
         stored = _state_bytes(self.root / "state")
         before = await self.snapshot()
         profile = self.profile(name) if self.args.profile else None
-        result = await work()
-        if profile is not None:
-            profile.send_signal(signal.SIGINT)
-            profile.wait(120)
+        try:
+            result = await work()
+        finally:
+            if profile is not None:
+                profile.send_signal(signal.SIGINT)
+                profile.wait(120)
         after = await self.snapshot()
         measured = self.measure(name, before, after, result or {})
         grown = Counter(_state_bytes(self.root / "state"))
         grown.subtract(stored)
         measured["state_bytes_added"] = {k: v for k, v in grown.most_common() if v}
         written = measured.get("source_keys", 0) + sum(
-            v["keys"] for k, v in measured["workers"].items() if k.startswith("store_write:")
+            measured["workers"].get(f"store_write:{name}", {}).get(field, 0)
+            for name in KEYED
+            for field in ("keys", "removed")
         )
         measured["entries_committed"] = written
         if written:
@@ -265,8 +286,11 @@ class Run:
     async def snapshot(self) -> dict:
         """The counters now, at a fresh line of the engine's (one a second)."""
 
-        lines = self.engine_lines()
+        lines, deadline = self.engine_lines(), time.monotonic() + 60
         while len(self.engine_lines()) <= len(lines):
+            self.alive()
+            if time.monotonic() > deadline:
+                raise RuntimeError("the engine wrote no sample line for 60 s")
             await asyncio.sleep(0.1)
         lines = self.engine_lines()
         with open("/proc/stat") as f:
@@ -287,15 +311,18 @@ class Run:
     def measure(self, name: str, before: dict, after: dict, extra: dict) -> dict:
         wall = after["at"] - before["at"]
         lines = [json.loads(x) for x in self.engine_lines()]
-        window = lines[before["engine_lines"] - 1 : after["engine_lines"]]
-        first, last = window[0], window[-1]
+        # A line covers the second before it: the one before the phase is the
+        # baseline of the cumulative counters, the phase's are those after it.
+        first = lines[before["engine_lines"] - 1]
+        window = lines[before["engine_lines"] : after["engine_lines"]]
+        last = window[-1]
         busy, idle = last["busy"] - first["busy"], last["idle"] - first["idle"]
         engine_cpu = after["engine_cpu"] - before["engine_cpu"]
-        commits = {n: _commit(after["heads"][n]) - _commit(before["heads"][n]) for n in CAST}
+        commits = extra.pop("batches_by_asset", {})
+        batches = sum(commits.values())
         workers = self.worker_stats(before["at"], after["at"])
-        planned = sum(
-            v["keys"] for (what, asset), v in workers.items() if what == "produce" and asset in CAST
-        )
+        produced = [v for (what, asset), v in workers.items() if what == "produce" and asset in CAST]
+        planned = sum(v.get("planned", 0) for v in produced)
         out = {
             "phase": name,
             "wall_s": round(wall, 1),
@@ -307,13 +334,12 @@ class Run:
             "loop_longest_ms": round(1000 * max(x["longest"] for x in window), 1),
             "engine_rss_peak_mb": round(max(x["rss"] for x in window) / 2**20),
             "engine_rss_peak_so_far_mb": round(last["peak_rss"] / 2**20),
-            "batches": sum(commits.values()),
+            "batches": batches,
             "batches_by_asset": commits,
-            "keys_delivered": planned,
-            "batches_per_s": round(sum(commits.values()) / wall, 2) if wall else None,
-            "engine_cpu_ms_per_batch": round(1000 * engine_cpu / sum(commits.values()), 1)
-            if any(commits.values())
-            else None,
+            "keys_planned": planned,
+            "rows_produced": sum(v.get("keys", 0) for v in produced),
+            "batches_per_s": round(batches / wall, 2) if wall else None,
+            "engine_cpu_ms_per_batch": round(1000 * engine_cpu / batches, 1) if batches else None,
             "keys_per_s": round(planned / wall) if wall else None,
             "key_counts": {n: (after["heads"][n] or {}).get("key_count") for n in KEYED},
             "workers": {f"{what}:{asset}": v for (what, asset), v in sorted(workers.items())},
@@ -322,6 +348,12 @@ class Run:
         breakdown = self.breakdown(name, engine_cpu)
         if breakdown:
             out["engine_cpu_by_part_s"] = breakdown
+            if planning := breakdown.get("planning"):
+                out["keys_per_planning_cpu_s"] = round(planned / planning)
+            if batches:
+                out["commit_cpu_ms_per_batch"] = round(
+                    1000 * breakdown.get("building commits", 0) / batches, 1
+                )
         return out
 
     def worker_stats(self, lo: float, hi: float) -> dict:
@@ -332,9 +364,10 @@ class Run:
                 if lo <= row["at"] <= hi:
                     t = totals[(row["what"], row.get("asset") or row.get("output"))]
                     t["calls"] += 1
-                    t["keys"] += row.get("keys", 0)
                     t["wall_s"] += row["wall"]
                     t["cpu_s"] += row["cpu"]
+                    for field in ("keys", "planned", "removed", "packs"):
+                        t[field] += row.get(field, 0)
         return {k: {f: round(v, 2) for f, v in t.items()} for k, t in totals.items()}
 
     def breakdown(self, name: str, engine_cpu: float) -> dict | None:
@@ -356,7 +389,9 @@ class Run:
     # -- the run ---------------------------------------------------------------------
 
     def adds(self) -> int:
-        return max(1, int(self.args.keys * self.args.change * self.args.adds))
+        """Keys a day adds, and removes: the live count stays `--keys`."""
+
+        return int(self.args.keys * self.args.change * self.args.adds)
 
     async def source(self) -> dict:
         encoded = 0.0
@@ -369,7 +404,7 @@ class Run:
         """About `--change` of the keys change: `--adds` of them are new keys,
         as many live ones are removed, the rest are updated."""
 
-        changes = int(self.live * self.args.change)
+        changes = int(self.args.keys * self.args.change)
         adds = removes = self.adds()
         chosen: set[int] = set()
         while len(chosen) < changes - adds:
@@ -406,43 +441,72 @@ class Run:
         }
 
     async def check(self) -> dict:
-        """Every keyed output holds the live keys, and tally counts them. Up to
-        VERIFY keys, every key's value is also the day it last changed: the
-        driver's model (the versions file) against what the store holds."""
+        """Every keyed output holds exactly the live keys, and tally's every
+        group counts them: each output's keys streamed against the driver's
+        model (the versions file), in key order. Up to VERIFY keys, every
+        key's value is also the day it last changed."""
 
         from solera.sdk import Ref
         from solera.stores import Keys
 
         sys.path.insert(0, str(HERE))
         os.environ["SCALE_ROOT"] = str(self.root)
-        from project import project
+        from project import GROUPS, project
 
         heads = await self.heads()
-        counts = {n: heads[n]["key_count"] for n in KEYED}
+        days = self.versions[:]
+        live = len(days) - days.count(ABSENT)
+        groups = [0] * GROUPS
+        for i, day in enumerate(days):
+            if day != ABSENT:
+                groups[i % GROUPS] += 1
         ref = Ref.from_json(heads["tally"]["ref"])
-        tally = sum(await project.stores[ref.store].load(ref, object, None))
-        ok = all(c == self.live for c in counts.values()) and tally == self.live
-        out = {"live": self.live, "key_counts": counts, "tally": tally}
-        if self.args.keys <= VERIFY:
-            model = {key_of(i): day for i, day in enumerate(self.versions[:]) if day != ABSENT}
-            wrong = {}
-            for name in KEYED:
-                generations, after = {}, None
-                while True:
-                    params = {"limit": 100_000, **({"after": after} if after else {})}
-                    page = await self.call("GET", f"/outputs/{name}/keys", params=params)
-                    generations.update(page["keys"])
-                    if (after := page["next"]) is None:
-                        break
+        tally = list(await project.stores[ref.store].load(ref, object, None))
+        out = {"live": live, "key_counts": {n: heads[n]["key_count"] for n in KEYED}, "tally": tally}
+        out["keys_wrong"], wrong = {}, {}
+        for name in KEYED:
+            expected = (i for i, day in enumerate(days) if day != ABSENT)
+            want, missing, extra, generations = next(expected, None), 0, 0, {}
+            async for page in self.keys(name):
+                if live <= VERIFY:
+                    generations.update(page)
+                for key in page:
+                    got = int(key[1:])
+                    while want is not None and want < got:
+                        missing, want = missing + 1, next(expected, None)
+                    if want == got and key == key_of(got):
+                        want = next(expected, None)
+                    else:
+                        extra += 1
+            missing += (want is not None) + sum(1 for _ in expected)
+            out["keys_wrong"][name] = missing + extra
+            if live <= VERIFY:
                 ref = Ref.from_json(heads[name]["ref"])
                 rows = await project.stores[ref.store].load(ref, list, Keys(generations))
-                held = {r["id"]: r["v"] for r in rows}
-                wrong[name] = sum(held.get(k) != v for k, v in model.items()) + len(
-                    held.keys() - model.keys()
+                wrong[name] = sum(r["v"] != days[int(r["id"][1:])] for r in rows) + abs(
+                    len(rows) - len(generations)
                 )
+        if live <= VERIFY:
             out["values_wrong"] = wrong
-            ok = ok and not any(wrong.values())
+        ok = (
+            live == self.live
+            and all(c == live for c in out["key_counts"].values())
+            and tally == groups
+            and not any(out["keys_wrong"].values())
+            and not any(wrong.values())
+        )
         return {**out, "ok": ok}
+
+    async def keys(self, name: str):
+        """An output's keys and generations, a page at a time, in key order."""
+
+        after = None
+        while True:
+            params = {"limit": 100_000, **({"after": after} if after else {})}
+            page = await self.call("GET", f"/outputs/{name}/keys", params=params)
+            yield page["keys"]
+            if (after := page["next"]) is None:
+                return
 
     def results(self) -> dict:
         head = subprocess.run(
@@ -465,19 +529,15 @@ class Run:
         (self.root / "report.md").write_text(report(results))
 
     async def main(self) -> None:
-        self.start()
         try:
+            self.start()
             await self.ready()
             await self.phase("source", self.source)
             for name in CAST:
                 await self.phase(name, lambda name=name: self.run([name]))
             for day in range(1, self.args.days + 1):
                 await self.phase(f"day {day}", lambda day=day: self.day(day))
-                if (
-                    self.args.keys <= VERIFY
-                    and day < self.args.days
-                    and not (checked := await self.check())["ok"]
-                ):
+                if self.live <= VERIFY and day < self.args.days and not (checked := await self.check())["ok"]:
                     raise SystemExit(f"day {day}: the outputs do not hold the source's keys: {checked}")
             checked = await self.check()
             print(json.dumps(checked), flush=True)
@@ -506,7 +566,7 @@ def report(results: dict) -> str:
     ]
     if "check" in results:
         out += [
-            f"Check: {'every output holds the source keys' if results['check']['ok'] else 'FAILED'} "
+            f"Check: {'every output holds exactly the live keys, and tally counts each group' if results['check']['ok'] else 'FAILED'} "
             f"({results['check']['live']:,} live keys).",
             "",
         ]
@@ -532,25 +592,40 @@ def report(results: dict) -> str:
             ratio(days, "engine_write_bytes", "entries_committed"),
             "—",
         ),
-        ("N3 keys planned per second, whole engine, best full run", worst(full, "keys_per_s"), "≥ 500,000"),
+        (
+            "N3 keys planned per engine CPU second spent planning (py-spy), worst full run",
+            worst(full, "keys_per_planning_cpu_s", min),
+            "≥ 500,000",
+        ),
+        (
+            "Proxy for N3: keys planned per second of the whole run's wall time, worst full run",
+            worst(full, "keys_per_s", min),
+            "— (loading, writing and polling included)",
+        ),
         ("N9 batches per second end to end, worst full run", worst(full, "batches_per_s", min), "≥ 30"),
         ("N9 event loop busy, worst phase", worst(phases, "loop_busy"), "≤ 0.5"),
         ("N9 longest event-loop stall (ms), worst phase", worst(phases, "loop_longest_ms"), "≤ 50"),
-        ("N12 engine memory peak (MB)", worst(phases, "engine_rss_peak_so_far_mb"), "≤ 1,536"),
+        (
+            "Engine memory peak (MB), this four-asset cast",
+            worst(phases, "engine_rss_peak_so_far_mb"),
+            "— (N12's ≤ 1,536 is for 50 tasks, not run here)",
+        ),
         *(
             (f"Engine CPU of the full run of {p['phase']} (s)", p["engine_cpu_s"], f"< {FULL_RUN_TARGET_S}")
             for p in full
         ),
         (
-            "Engine CPU per batch, full runs, written keys in one range (ms)",
-            worst(full, "engine_cpu_ms_per_batch"),
-            "≤ 50 (N7)",
+            "N7 engine CPU building commits per batch (py-spy), full runs, keys in one range (ms)",
+            worst(full, "commit_cpu_ms_per_batch"),
+            "≤ 50",
         ),
         (
-            "Engine CPU per batch, daily runs, written keys scattered (ms)",
-            worst(days, "engine_cpu_ms_per_batch"),
+            "Engine CPU building commits per batch (py-spy), daily runs, keys scattered (ms)",
+            worst(days, "commit_cpu_ms_per_batch"),
             "—",
         ),
+        ("Proxy: whole engine CPU per batch, full runs (ms)", worst(full, "engine_cpu_ms_per_batch"), "—"),
+        ("Proxy: whole engine CPU per batch, daily runs (ms)", worst(days, "engine_cpu_ms_per_batch"), "—"),
     ]
     out += ["| Number | Measured | Threshold |", "|---|---|---|"]
     out += [f"| {name} | {'—' if v is None else f'{v:,}'} | {t} |" for name, v, t in rows]
@@ -559,8 +634,10 @@ def report(results: dict) -> str:
         "batches",
         "batches_per_s",
         "keys_per_s",
+        "keys_per_planning_cpu_s",
         "engine_cpu_s",
         "engine_cpu_ms_per_batch",
+        "commit_cpu_ms_per_batch",
         "loop_busy",
         "loop_longest_ms",
         "engine_rss_peak_mb",
@@ -609,8 +686,11 @@ def _process_write_bytes(pid: int) -> int:
         return next(int(line.split()[1]) for line in f if line.startswith("write_bytes:"))
 
 
-def _commit(head: dict | None) -> int:
-    return (head or {}).get("commit_number") or 0
+def _signal_group(pid: int, sig: int) -> None:
+    try:
+        os.killpg(pid, sig)
+    except ProcessLookupError:
+        pass
 
 
 def _state_bytes(state: Path) -> dict:
@@ -647,6 +727,12 @@ def parse() -> argparse.Namespace:
     args = parser.parse_args()
     if args.days > 254:
         parser.error("--days: at most 254 (a key's day is one byte)")
+    if not 0 <= args.change <= 0.5:
+        parser.error("--change: from 0 to 0.5 (a day draws its changed keys from the live ones)")
+    if not 0 <= args.adds <= 0.5:
+        parser.error("--adds: from 0 to 0.5 (a day removes as many keys as it adds, from those it changes)")
+    if args.keys >= 10**9:
+        parser.error("--keys: under 1e9 (a key is k and nine digits)")
     return args
 
 
