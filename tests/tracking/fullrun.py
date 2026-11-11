@@ -70,6 +70,7 @@ RULES = {
         "switch_overtaken",
         "byref_wait",
         "switch_result",
+        "switch_newest",
     ),
 }
 ADDED = {
@@ -93,6 +94,7 @@ ADDED = {
         "switch_overtaken",
         "byref_wait",
         "switch_result",
+        "switch_newest",
     )
 }
 
@@ -232,7 +234,7 @@ class Output:
         Returns whether the run is published. A call delivered after an attempt
         newer than `newest` wrote does nothing and says not published; a
         repeat after the switch does nothing and says published."""
-        if self.fence > newest:
+        if self.on("switch_newest") and self.fence > newest:
             return False
         if gen not in self.builds:
             return gen <= self.published_run

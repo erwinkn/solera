@@ -428,7 +428,7 @@ async def test_a_takeover_waits_for_an_older_writers_transaction(store):
     table, _, _ = store._table(out)
     conn = store._connect()
     cur = conn.cursor()
-    store._fence(cur, table, fenced(out, 5))  # the older writer's open transaction
+    store._check(cur, table, fenced(out, 5))  # the older writer's open transaction
     acquired = threading.Event()
 
     def take():
@@ -453,7 +453,7 @@ async def test_the_first_write_creates_and_acquires(store):
     it, in the same transaction; a stale writer arriving later is refused."""
 
     out = output(key="id")
-    await store.acquire(fenced(out, 3))  # no table yet: nothing to take
+    await store.acquire(fenced(out, 3))  # no table yet: the check is taken all the same
     first = await store.store([{"id": "a", "v": "1"}], None, fenced(out, 3))
     with pytest.raises(StoreError, match="newer attempt"):
         await store.store([{"id": "a", "v": "0"}], first.ref, fenced(out, 2))
@@ -461,8 +461,8 @@ async def test_the_first_write_creates_and_acquires(store):
 
 
 async def test_a_migration_that_replaces_the_table_keeps_its_fence(store):
-    """A migration that recreates the relation gives it a new OID; the fence
-    row moves with it, so a stale writer is still refused."""
+    """A migration that recreates the relation gives it a new OID; the version
+    check is keyed by the table's name, so a stale writer is still refused."""
 
     from solera.sdk import Migration
 
@@ -635,7 +635,7 @@ async def test_a_migration_waits_for_every_slices_open_writer(store):
     conn = store._connect()
     cur = conn.cursor()
     store._domain(cur, table)  # p2's writer, open: as every write transaction begins
-    store._fence(cur, table, context(out, partition="p2", generation=3, worker_id="i"))
+    store._check(cur, table, context(out, partition="p2", generation=3, worker_id="i"))
     p1 = context(out, partition="p1", generation=4, worker_id="i")
     migrating, migrated, errors = in_thread(
         store.migrate(out, [Migration("all", f"UPDATE {table} SET v = 'm'")], p1)
@@ -662,7 +662,7 @@ async def test_a_sql_write_is_a_query_never_a_statement(store):
     first = await store.store([{"id": "a", "v": "1"}], None, fenced(out, 4, partition="a"))
     table, _, _ = store._table(out)
     with store._connect() as conn, conn.cursor() as cur:
-        relid = store._relid(cur, table)
+        relid = cur.execute("SELECT to_regclass(%s)::oid AS r", (table,)).fetchone()["r"]
     refused = [
         f"UPDATE {table} SET v = 'stale'",
         f"DELETE FROM {table}",
@@ -675,7 +675,7 @@ async def test_a_sql_write_is_a_query_never_a_statement(store):
         with pytest.raises(WriteError, match="one query"):
             await store.store(Sql(stmt), first.ref, fenced(out, 5, partition="a"))
     with store._connect() as conn, conn.cursor() as cur:
-        assert store._relid(cur, table) == relid
+        assert cur.execute("SELECT to_regclass(%s)::oid AS r", (table,)).fetchone()["r"] == relid
     assert await store.load(other.ref, list[dict], None) == [{"id": "b", "v": "9", "part": "b"}]
     assert await store.load(first.ref, list[dict], None) == [{"id": "a", "v": "1", "part": "a"}]
     for query in [
