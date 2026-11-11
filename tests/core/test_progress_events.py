@@ -1,7 +1,7 @@
 """Events on the tracking core's state: refused whole, never half applied."""
 
 import pytest
-from solera._native import ChangeIndex, Tracking, encode_changes
+from solera._native import ChangeIndex, Tracking, UnsettledError, encode_changes
 
 
 def items(tmp_path, n: int) -> Tracking:
@@ -120,7 +120,7 @@ def test_a_commit_is_refused_when_a_full_run_starts_after_it_was_built(tmp_path)
     event = t.progress_ops(plan, [([], [("k1", 2)])])[0]  # k1 is a deviation
     layers.append(ix.write_commit("items/3", 3, [("k1", 2, None)], live_before=2, clear=True))
     t._set_output(b"items", layers, 3, 1, 3)
-    with pytest.raises(ValueError, match="became unsettled"):
+    with pytest.raises(UnsettledError):
         t.apply(event)
     held = t.progress_ops(plan, [([], [("k1", 2)])])
     assert held[2] == [["k1"]]
@@ -269,7 +269,7 @@ def test_a_key_another_input_took_is_held_back_while_this_input_is_unsettled(tmp
     assert held_back == [[], []]
     logs[b"a"].append(ix.write_commit("a/2", 2, [("m", 2, None)], live_before=1, clear=True))
     t._set_output(b"a", logs[b"a"], 2, 1, 2)
-    with pytest.raises(ValueError, match="became unsettled"):
+    with pytest.raises(UnsettledError):
         t.apply(event)
     event, _, held_back = t.progress_ops(plan, [([], []), ([], [])])
     assert held_back == [[], ["k"]]
@@ -324,7 +324,7 @@ def test_an_input_keeps_its_fence_for_a_moved_key_no_other_input_holds_back(tmp_
     assert held_back == [["k1"], ["k1"]]
     logs[b"b"].append(ix.write_commit("b/3", 3, [("k1", 3, None)], live_before=2, clear=True))
     t._set_output(b"b", logs[b"b"], 3, 1, 3)
-    with pytest.raises(ValueError, match="became unsettled"):
+    with pytest.raises(UnsettledError):
         t.apply(event)
 
 
