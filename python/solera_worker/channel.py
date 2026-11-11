@@ -20,6 +20,21 @@ import asyncio
 
 from solera.lifecycle import Ended
 
+_spare = []  # SSL contexts built ahead (warm.py), each to be handed to one client
+
+
+def _ssl_context():
+    """A client's own SSL context: httpcore sets its ALPN on every connection,
+    so a context two clients share is written by one thread while another
+    reads it. Each costs a read of the CA bundle (about 13 ms), so the pool's
+    forkserver builds an attempt's two ahead and its children take them."""
+
+    if _spare:
+        return _spare.pop()
+    import httpx
+
+    return httpx.create_ssl_context()
+
 
 class HttpTransport:
     """The engine's routes over HTTPS, with a token. `transport`: an httpx
@@ -32,8 +47,12 @@ class HttpTransport:
         kw = {"base_url": url.rstrip("/"), "headers": headers, "timeout": timeout}
         if transport is not None:
             kw["transport"] = transport
-        self.client = httpx.Client(**kw)  # for the reporting thread's beats
-        self.async_client = httpx.AsyncClient(**kw)
+
+        def verify():
+            return _ssl_context() if transport is None else True
+
+        self.client = httpx.Client(**kw, verify=verify())  # for the reporting thread's beats
+        self.async_client = httpx.AsyncClient(**kw, verify=verify())
 
     def send(self, method: str, path: str, **kw):
         return self.client.request(method, path, **kw)
