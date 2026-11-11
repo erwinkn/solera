@@ -497,7 +497,9 @@ async def test_finishing_one_unkeyed_walk_does_not_revoke_proceed(solera, tmp_pa
         reader = await solera.submit("report")
         task = await decided(solera, reader, "report")
         assert task.get("held") != ["upstream incomplete", "digest"], task
-        assert full.waiting(solera.engine) == set()
+        # report read digest's proceeded head, so its own output is partial: a proceed lets
+        # readers of digest go on, not readers of theirs (round 4, the proceed chain).
+        assert full.waiting(solera.engine) == {("report", "")}
     finally:
         release.set()
         await solera.wait(resumed)

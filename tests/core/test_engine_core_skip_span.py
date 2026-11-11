@@ -1,8 +1,8 @@
-"""A walk that ends in a batch with nothing to load (a skip) ends the walk from empty but
-closes no span: the skip's event carries no outputs, so `Model._spans` visits none. The
-design note says completion holds for a skip [Fa]. `settle` closes it a tick later, unless
-it refuses (an upstream head inside a proceeded span): then the partition stays "stopped"
-though its walk is done, and running it again skips again (round 2, Fable)."""
+"""A walk that ends in a batch with nothing to load (a skip) ends the walk from empty, and the
+skip's event visits the asset's declared outputs (round 2, Fable). Here the skip reads a head
+an operator proceeded over, so the walk's end leaves copy partial (a proceed lets readers of
+mid go on, not readers of theirs: round 4, the proceed chain) until mid is whole again; then
+copy's next run completes it."""
 
 import asyncio
 
@@ -103,7 +103,15 @@ async def test_a_walk_that_ends_in_a_skip_completes_its_outputs(solera):
     ended = [e for e in events if e[0] == "AttemptFinished"]
     copy_spans = eng.m.partial_spans.get(eng.m.span_key("copy", ""))
     assert ("copy", "", "mid") not in eng.m.core_empty, (before, events)
-    assert not copy_spans or copy_spans[-1][1] is not None, (
-        f"copy's walk from empty ended (run {detail['request']['status']}, attempts {ended}) and its span is still open: "
-        f"{copy_spans}; stopped {full.stopped(eng)}; before the run: {before}"
+    assert copy_spans and copy_spans[-1][1] is None and not copy_spans[-1][2], (
+        f"copy's walk ended over mid's proceeded head (run {detail['request']['status']}, attempts {ended}), "
+        f"so copy stays partial: {copy_spans}; before the run: {before}"
     )
+    eng.m.apply = apply
+    await solera.run("mid", mode="full")  # mid is whole again
+    await solera.run("copy")
+    await solera.settle(0.5)
+    copy_spans = eng.m.partial_spans.get(eng.m.span_key("copy", ""))
+    assert not copy_spans or copy_spans[-1][1] is not None, (copy_spans, full.stopped(eng))
+    await solera.run("report")
+    assert w.seen[-1] == sorted(w.rows), w.seen
