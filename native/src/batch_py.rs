@@ -404,9 +404,13 @@ impl Served {
                         Err(_) => PyList::new(py, [value])?,
                     };
                     groups.set_item(name, group)?;
-                } else if let Ok(l) = value.cast::<PyList>() {
+                } else if let Ok(l) = value.cast_exact::<PyList>() {
                     for r in l.iter() {
                         rows.append(r)?;
+                    }
+                } else if value.is_instance_of::<PyList>() {
+                    for r in value.try_iter()? {
+                        rows.append(r?)?;
                     }
                 } else {
                     rows.append(value)?;
@@ -453,6 +457,11 @@ impl Served {
             return Err(PyKeyError::new_err(k.clone().unbind()));
         }
         Ok(got)
+    }
+
+    /// Whether `k` was served at a version.
+    fn __contains__(&self, py: Python<'_>, k: &Bound<'_, PyAny>) -> PyResult<bool> {
+        Ok(!self.get(py, k, None)?.is_none())
     }
 
     /// Every key served at a version, with that version.

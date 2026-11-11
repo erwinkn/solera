@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import datetime as dt
 import hashlib
 import inspect
@@ -490,7 +491,7 @@ class Upstream:
     commits: range | None = None
 
 
-_NEW = object()  # a `Batch` field not given, or not yet read from the worker's columns
+_NEW: Any = object()  # a `Batch` field not given, or not yet read from the worker's columns
 
 
 class Batch:
@@ -648,6 +649,12 @@ class Batch:
 
     def __reduce__(self):
         return type(self), self._values()
+
+    def __deepcopy__(self, memo):
+        new = object.__new__(type(self))
+        memo[id(self)] = new
+        Batch.__init__(new, *copy.deepcopy(self._values(), memo))
+        return new
 
     def __setattr__(self, name, value):
         raise FrozenInstanceError(f"cannot assign to field {name!r}")

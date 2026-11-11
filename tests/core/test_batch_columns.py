@@ -143,6 +143,19 @@ def test_loads_out_of_key_order_keep_each_keys_last_serving():
     served.read({"z": Loaded(0, version="3")}, None, Loaded)
     assert served.items() == [("a", "2"), ("m", None), ("q", "2"), ("z", "3")]
     assert served.versions() == {"a": "2", "q": "2", "z": "3"}
+    assert "a" in served and "m" not in served and "2" not in served
+    twice = Served()
+    twice.read({1: Loaded(0, version="x"), "1": Loaded(0, version="y")}, None, Loaded)
+    assert twice.items() == [("1", "y")]
+
+
+def test_a_list_subclass_is_read_through_its_iterator():
+    class Visible(list):
+        def __iter__(self):
+            return iter([r for r in super().__iter__() if r != "hidden"])
+
+    rows, _ = Served().read({"k": Loaded(Visible(["hidden", "seen"]), version="1")}, ["k"], Loaded)
+    assert rows == ["seen"]
 
 
 def test_a_batch_read_from_columns_equals_one_built_whole():
@@ -157,6 +170,11 @@ def test_a_batch_read_from_columns_equals_one_built_whole():
     whole = Batch(rows=[1], index=2, count=3)
     assert lazy == whole and repr(lazy) == repr(whole) and loaded == []
     assert copy.deepcopy(lazy) == whole and pickle.loads(pickle.dumps(lazy)) == whole
+    held = []
+    looped = Batch(rows=held)
+    held.append(looped)
+    copied = copy.deepcopy(looped)
+    assert copied.rows[0] is copied
     match lazy:
         case Batch(rows, added):
             assert (rows, added) == ([1], ())
