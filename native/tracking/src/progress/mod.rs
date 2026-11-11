@@ -14,7 +14,7 @@ use solera_index::{Glob, Pattern, Version};
 use xxhash_rust::xxh3::xxh3_64;
 
 use crate::codec::{Dec, Enc, Ver};
-use crate::error::{format, invalid, Result};
+use crate::error::{format, invalid, Error, Result};
 use crate::state::{Edge, Id, Tracking};
 
 mod ops;
@@ -1275,7 +1275,7 @@ impl BatchProgress {
                 return invalid("the edge reads another output than the batch planned");
             }
             if unsettled(t, output, *head)? {
-                return invalid("the input became unsettled since the batch's commit was built");
+                return Err(Error::Unsettled);
             }
         }
         Ok(())

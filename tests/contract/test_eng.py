@@ -343,9 +343,6 @@ async def test_eng_9_a_result_the_engine_cannot_use_fails_its_attempt_retryably(
     assert await solera.read("trained") == {"w": 2}  # the retry's: nothing of the malformed result
 
 
-@pytest.mark.xfail(
-    strict=True, reason="today's engine accepts a result with an unknown status (gap, behaviors.md ENG-9)"
-)
 async def test_eng_9_a_result_with_an_unknown_status_fails_its_attempt_retryably(solera):
     calls = []
     await solera.deploy(pool_project(calls))
