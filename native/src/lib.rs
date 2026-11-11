@@ -11,6 +11,7 @@
 //! where an entry carries none), generations as `int`.
 
 pub mod arrow;
+mod batch_py;
 mod commit_py;
 pub mod delta;
 pub mod entries;
@@ -698,6 +699,7 @@ fn solera_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     index_py::register(m)?;
     tracking_py::register(m)?;
     commit_py::register(m)?;
+    batch_py::register(m)?;
     m.add_function(wrap_pyfunction!(content_digest, m)?)?;
     m.add_function(wrap_pyfunction!(_panic, m)?)?;
     Ok(())

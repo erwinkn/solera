@@ -405,28 +405,23 @@ async def _resolve_inputs(spec, project, asset, keys_io, timeline, observed: Obs
                 timeline.add("loaded", param, _rows(args[param]))
                 continue
             if "core" in pin:  # the new tracking core: the keys its plan names
-                keys, classes, versions = core.planned(spec, pin)
-                args[param] = await observed.load(
-                    store,
-                    ref,
-                    t,
-                    Keys({k: v for k, c, v in zip(keys, classes, versions, strict=True) if c != "removed"}),
-                )
+                planned = core.planned(spec, pin)
+                args[param] = await observed.load(store, ref, t, Keys(core.KeyVersions(planned)))
                 served = getattr(store, "served", None)
-                classes, loaded = core.observe(keys, classes, versions, served)
-                batch[param] = Batch(
+                classes, loaded = planned.observe(served)
+                batch[param] = Batch._of_columns(
+                    classes,
+                    served,
                     rows=args[param],
-                    **{c: tuple(classes[c]) for c in core.CLASSES},
                     reset=reset,
                     index=int(ch["index"]),
                     count=int(ch["count"]),
                     final=bool(ch["final"]),
                     upstream=Upstream(ref.output),
-                    served={k: v for k, v in (served or {}).items() if v is not None},
                 )
                 delivered[param] = {"loaded": loaded}
                 if not reset:
-                    nothing.append(bool(keys) and not any(classes.values()))
+                    nothing.append(len(planned) > 0 and not classes.any())
                 timeline.add("loaded", param, _rows(args[param]))
                 continue
             keys = ch["keys"]
