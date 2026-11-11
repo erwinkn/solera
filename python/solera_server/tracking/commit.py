@@ -23,7 +23,7 @@ from obstore.exceptions import NotFoundError
 from solera._native import Tracking
 
 from ..state import Conflict
-from . import Core, b64, canonical, unb64
+from . import Core, Generation, b64, canonical, unb64
 
 DYNAMIC_KEYS = 1_000_000  # a dynamic partitions output's elements, read from its commit's keys up to this
 
@@ -40,6 +40,7 @@ class Built:
     walk: dict | None = None  # the batch's range of it: {inputs, after, hi, reset}
     empty: dict = field(default_factory=dict)  # unkeyed input -> [reset, done] of its walk from empty
     partition: str = ""
+    generation: Generation | None = None  # the deploy it was built under
     locks: contextlib.AsyncExitStack = field(default_factory=contextlib.AsyncExitStack)
 
     def payload(self) -> dict | None:
@@ -143,105 +144,108 @@ async def build(core: Core, task: dict, attempt: str, prepared: dict, result: di
 
     engine, m = core.engine, core.m
     partition = task["partition"]
-    built = Built(partition=partition)
+    built = Built(partition=partition, generation=Generation(m, "its commit was built"))
     events = []
     try:
-        claim = m.claimed(attempt)
-        generation = int((claim or {}).get("generation") or 0)
-        producer = canonical({"run": task["run"], "attempt": attempt})
-        clear = full_run(prepared)
-        plan = await plan_of(core, task, attempt, prepared)
-        keyed, reports, ops, foreseen = [], [], None, None
-        keyed_outputs = [
-            (name, info, outputs.get(name) or {"unchanged": True})
-            for name, info in sorted((prepared.get("outputs") or {}).items())
-            if info.get("contract", {}).get("key") is not None
-        ]
-        if plan is not None:
-            keyed = sorted(
-                ((p, plan) for p, plan in prepared["plans"].items() if "core" in (plan or {})),
-                key=lambda item: item[1]["core"],
-            )
-            delivered = result.get("delivered") or {}
-            reports = [
-                ([], sorted(map(tuple, (delivered.get(p) or {}).get("loaded") or ()))) for p, _ in keyed
+        with built.generation:  # an error under a newer deploy: planned again
+            claim = m.claimed(attempt)
+            generation = int((claim or {}).get("generation") or 0)
+            producer = canonical({"run": task["run"], "attempt": attempt})
+            clear = full_run(prepared)
+            plan = await plan_of(core, task, attempt, prepared)
+            keyed, reports, ops, foreseen = [], [], None, None
+            keyed_outputs = [
+                (name, info, outputs.get(name) or {"unchanged": True})
+                for name, info in sorted((prepared.get("outputs") or {}).items())
+                if info.get("contract", {}).get("key") is not None
             ]
-            # The batch records name the output commit, built after: its number is foreseen,
-            # so the batch costs one call (4 ms per 10k keys), not two.
-            foreseen = next(
-                (
-                    (m.core_output(n, partition) or {"head": 0})["head"] + 1
-                    for n, _, e in keyed_outputs
-                    if not e.get("unchanged")
-                ),
-                None,
-            )
-            ops = await core.run(
-                core.tracking.progress_ops, plan, reports, producer=producer, output_commit=foreseen
-            )
-            held(ops)
-        # Every output lock the batch needs, in the order of the lives' ids, as any other taker of
-        # several does: an id is never renamed.
-        ids = {
-            name: core.named(name, partition)
-            for name, _, entry in keyed_outputs
-            if not entry.get("unchanged")
-        }
-        for id_ in sorted(ids.values()):
-            await built.locks.enter_async_context(core.lock(id_))
-        first = None
-        for name, info, entry in keyed_outputs:
-            if name not in ids:
-                continue
-            id_ = ids[name]
-            core.attach(id_)
-            out = m.core_output(name, partition) or {"head": 0, "layers": []}
-            dynamic = bool(info.get("dynamic"))
-            async with changes_of(core, name, entry) as changes:
-                found = await core.run(
-                    core.tracking.build_commit,
-                    id_.encode(),
-                    changes,
-                    version=generation,
-                    path=core.path(id_, out["head"] + 1, attempt),
-                    time_ms=int(engine.clock() * 1000),
-                    producer=producer,
-                    mode="clear" if clear else "replace" if entry.get("whole") else "patch",
-                    collect=DYNAMIC_KEYS if dynamic else 0,
+            if plan is not None:
+                keyed = sorted(
+                    ((p, plan) for p, plan in prepared["plans"].items() if "core" in (plan or {})),
+                    key=lambda item: item[1]["core"],
                 )
-            if found is None:
-                continue
-            events.append(found["event"])
-            first = found["commit"] if first is None else first
-            built.counts[name] = {
-                "id": id_,
-                **{k: found[k] for k in ("commit", "live", "added", "updated", "removed")},
-            }
-            if dynamic:
-                built.elements[name] = await elements(core, name, partition, out, found)
-        if plan is not None:
-            if first != foreseen:  # an output built nothing, or moved meanwhile
+                delivered = result.get("delivered") or {}
+                reports = [
+                    ([], sorted(map(tuple, (delivered.get(p) or {}).get("loaded") or ()))) for p, _ in keyed
+                ]
+                # The batch records name the output commit, built after: its number is foreseen,
+                # so the batch costs one call (4 ms per 10k keys), not two.
+                foreseen = next(
+                    (
+                        (m.core_output(n, partition) or {"head": 0})["head"] + 1
+                        for n, _, e in keyed_outputs
+                        if not e.get("unchanged")
+                    ),
+                    None,
+                )
                 ops = await core.run(
-                    core.tracking.progress_ops, plan, reports, producer=producer, output_commit=first
+                    core.tracking.progress_ops, plan, reports, producer=producer, output_commit=foreseen
                 )
-                held(ops)  # a clear may have come in while the outputs were built
-            progress, records, _ = ops
-            events.insert(0, progress)
-            built.records = [[p, b64(r)] for (p, _), r in zip(keyed, records, strict=True)]
-            some = keyed[0][1]
-            ended = some["end"] is None  # the plan's walk, not one input's own end
-            built.progress = {"batch": some["index"], "key": None if ended else some["end"]}
-            built.walk = {
-                "inputs": [p for p, _ in keyed],
-                "after": some["after"],
-                "hi": None if ended else some["end"],
-                "reset": bool(some["full"]),
-                "keys": some.get("mode") == "keys",
+                held(ops)
+            # Every output lock the batch needs, in the order of the lives' ids, as any other taker of
+            # several does: an id is never renamed. Its names are read now, so under the deploy it
+            # planned under, or a life would be minted for a name the deploy took away.
+            built.generation.check()
+            ids = {
+                name: core.named(name, partition)
+                for name, _, entry in keyed_outputs
+                if not entry.get("unchanged")
             }
-        built.empty = unkeyed_walks(core, task, prepared)
-        if events:
-            built.event = Tracking.join(events)
-        return built
+            for id_ in sorted(ids.values()):
+                await built.locks.enter_async_context(core.lock(id_))
+            first = None
+            for name, info, entry in keyed_outputs:
+                if name not in ids:
+                    continue
+                id_ = ids[name]
+                core.attach(id_)
+                out = m.core_output(name, partition) or {"head": 0, "layers": []}
+                dynamic = bool(info.get("dynamic"))
+                async with changes_of(core, name, entry) as changes:
+                    found = await core.run(
+                        core.tracking.build_commit,
+                        id_.encode(),
+                        changes,
+                        version=generation,
+                        path=core.path(id_, out["head"] + 1, attempt),
+                        time_ms=int(engine.clock() * 1000),
+                        producer=producer,
+                        mode="clear" if clear else "replace" if entry.get("whole") else "patch",
+                        collect=DYNAMIC_KEYS if dynamic else 0,
+                    )
+                if found is None:
+                    continue
+                events.append(found["event"])
+                first = found["commit"] if first is None else first
+                built.counts[name] = {
+                    "id": id_,
+                    **{k: found[k] for k in ("commit", "live", "added", "updated", "removed")},
+                }
+                if dynamic:
+                    built.elements[name] = await elements(core, name, partition, out, found)
+            if plan is not None:
+                if first != foreseen:  # an output built nothing, or moved meanwhile
+                    ops = await core.run(
+                        core.tracking.progress_ops, plan, reports, producer=producer, output_commit=first
+                    )
+                    held(ops)  # a clear may have come in while the outputs were built
+                progress, records, _ = ops
+                events.insert(0, progress)
+                built.records = [[p, b64(r)] for (p, _), r in zip(keyed, records, strict=True)]
+                some = keyed[0][1]
+                ended = some["end"] is None  # the plan's walk, not one input's own end
+                built.progress = {"batch": some["index"], "key": None if ended else some["end"]}
+                built.walk = {
+                    "inputs": [p for p, _ in keyed],
+                    "after": some["after"],
+                    "hi": None if ended else some["end"],
+                    "reset": bool(some["full"]),
+                    "keys": some.get("mode") == "keys",
+                }
+            built.empty = unkeyed_walks(core, task, prepared)
+            if events:
+                built.event = Tracking.join(events)
+            return built
     except BaseException:
         await built.locks.aclose()
         raise
@@ -287,23 +291,13 @@ def unkeyed(prepared: dict) -> dict:
     return {**prepared, "plans": plans}
 
 
-def named(core: Core, built: Built) -> None:
-    """A batch's outputs are still the lives it built under their names: a
-    deploy that renamed one, or started it over, while the commit was built
-    sends the batch back to be planned again."""
-
-    for name, counts in built.counts.items():
-        if core.m.core_outputs.get((name, built.partition)) != counts["id"]:
-            raise HeldBack(f"output {name}: renamed or started over while its commit was built")
-
-
 def check(core: Core, built: Built) -> None:
     """The commit check of the core (§7): the event applies to the state as it
     is now, or nothing is recorded. Run in the synchronous step that records.
     An input that cleared after the batch's progress was built would have held
     keys back: its fence refuses the batch, which is planned again."""
 
-    named(core, built)
+    built.generation.check()  # a deploy since it was built: its names may be another output's
     try:
         core.check(built.event)
     except Conflict as error:

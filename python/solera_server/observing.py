@@ -27,6 +27,7 @@ from solera.patterns import Matcher
 
 from . import observed, owed, planning
 from .state import Conflict
+from .tracking import Generation, Redeployed
 from .tracking import stale as core_stale
 
 WALK = 100  # stored outcomes a retry batch walks at most, for each key it may take
@@ -152,14 +153,20 @@ class Observing:
         upstream, a scan of each gap stopping at the first key
         (`owed.uncovered`). Derived and live, never stored."""
 
-        checks = self._gappy(asset, partition)
+        checks, generation = self._gappy(asset, partition), Generation(self.m)
         if checks is None:
             return False
         for key, stamp, input, rec in checks:
             known = self._covers.get(key)
             if "core" in rec and (known is None or known[0] != stamp):
-                edge = self.m.core_edges[(asset, partition, input.param)][0]
-                covered = not await core_stale.taken_after(self.core, input, rec["core"], edge)
+                try:
+                    with generation:
+                        generation.check()
+                        edge = self.m.core_edges[(asset, partition, input.param)][0]
+                        covered = not await core_stale.taken_after(self.core, input, rec["core"], edge)
+                    generation.check()
+                except Redeployed:  # a deploy while a check awaited: not known, the next tick asks again
+                    return False
                 self._covers[key] = known = (stamp, covered)
             elif known is None or known[0] != stamp:
                 index, _ = self._upstream(input.output, input.partition)

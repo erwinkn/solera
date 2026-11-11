@@ -20,7 +20,7 @@ import math
 
 from solera._native import Tracking
 
-from . import WALK, Core, b64, canonical
+from . import WALK, Core, Generation, Redeployed, b64, canonical
 from .commit import HeldBack
 from .full import dynamic_sets, held
 
@@ -68,6 +68,24 @@ def open_edges(core: Core, task: dict, keyed: list) -> dict:
 
 
 async def prepare(core: Core, task: dict, run: dict, attempt: str | None) -> dict:
+    """`_prepare` under one deploy (`Generation`): a deploy while it planned
+    starts it again, so what it read by name is of the deploy it returns
+    under."""
+
+    while True:
+        generation = Generation(core.m)
+        try:
+            with generation:
+                prepared = await _prepare(core, task, run, attempt)
+            generation.check()
+            return prepared
+        except Redeployed:
+            if not generation.moved:
+                raise
+            continue
+
+
+async def _prepare(core: Core, task: dict, run: dict, attempt: str | None) -> dict:
     """An attempt's preparation on the new path: `Engine._prepare`'s result,
     with the plan's bytes under `plan` (kept out of the journal), and under
     `gate` every upstream head it reads, `[output, partition, commit]`: a
@@ -76,7 +94,6 @@ async def prepare(core: Core, task: dict, run: dict, attempt: str | None) -> dic
     checks them again (`full.held`)."""
 
     engine, m = core.engine, core.m
-    deploy = m.deploy_number
     base = engine._pin_inputs(task, run)
     heads = []
     for input in base["inputs"]:  # in the step that pinned them: the heads the pins name
@@ -178,8 +195,6 @@ async def prepare(core: Core, task: dict, run: dict, attempt: str | None) -> dic
                 "classes": found["counts"],
             }
             all_empty = all_empty and not found["keys"]
-    if engine.m.deploy_number != deploy:  # redeployed while it planned: prepared under one deploy only
-        return await prepare(core, task, run, attempt)
     if (why := held(m, heads)) is not None:  # a head it planned on is partial
         raise HeldBack(f"{why[0]}: {why[1]}")
     more = any(not (p["final"] or p.get("done")) for p in plans.values())
@@ -197,13 +212,15 @@ def restarted(core: Core, task: dict, input) -> bool:
     """Whether a keyed input must start over: what its committed progress
     reads (`Model.core_read`, which only a commit writes) is an upstream life
     that is gone (a reset: the output removed, or moved to another store),
-    or nothing though the partition has committed (its edge was closed and
-    opened again by deploys since)."""
+    or nothing though the partition has committed or the task's walk has
+    gone some way (its edge was closed and opened again by deploys since: a
+    reset of the output clears what the partition was built under, not the
+    walk of a run under way)."""
 
     m, asset, partition = core.m, task["asset"], task["partition"]
     read = m.core_read.get((asset, partition, input.param))
     if read is None:
-        return "definition" in m.partition(asset, partition)
+        return "definition" in m.partition(asset, partition) or WALK in (task.get("progress") or {})
     return read != m.core_outputs.get((input.output, input.partition))
 
 

@@ -30,7 +30,7 @@ import orjson
 from solera.change_index import open_index
 from solera.threads import in_thread
 
-from ..state import Conflict
+from ..state import Conflict, LostOwnership
 
 HEAVY = 4  # plans and commit builds running at once: the engine's cores (N9, D208)
 # The keyed inputs' walk in a task's progress, beside unkeyed inputs': never a parameter's name.
@@ -62,6 +62,46 @@ def output_pin(core: Core, output: str, partition: str) -> dict | None:
     if found is None:
         return None
     return {"url": core.engine.state.objects_url, "layers": found["layers"], "head": found["head"]}
+
+
+class Redeployed(Conflict):
+    """A deploy landed while an operation awaited: what it read by name (a
+    name's life, an edge, an axis, a store) may be another thing's now, so
+    nothing it decided is acted on. Each operation says what that means for
+    it, starting over or "not known" (`Generation`); a batch is planned
+    again, no try spent."""
+
+    replan = True
+
+
+class Generation:
+    """The deploy an operation on the new path runs under, the one owner of
+    "which deploy this decision was made under" (pr2-design.md, the deploy
+    generation rule). Every operation that reads deploy-dependent state
+    across an await takes one when it starts: `check` raises `Redeployed`
+    once a deploy has landed, at the step that acts on what it read, and in
+    its block an error raised under a newer deploy is `Redeployed` too (a
+    native call on an edge or a life the deploy closed), but for a lost
+    claim, which is no one's to plan again."""
+
+    def __init__(self, m, what: str = "it awaited") -> None:
+        self.m, self.deploy, self.what = m, m.deploy_number, what
+
+    @property
+    def moved(self) -> bool:
+        return self.m.deploy_number != self.deploy
+
+    def check(self) -> None:
+        if self.moved:
+            raise Redeployed(f"a deploy came in while {self.what}")
+
+    def __enter__(self) -> Generation:
+        return self
+
+    def __exit__(self, kind, error, _tb) -> None:
+        if isinstance(error, Exception) and not getattr(error, "replan", False) and self.moved:
+            if not isinstance(error, LostOwnership):
+                raise Redeployed(f"a deploy came in while {self.what}") from error
 
 
 class Core:
@@ -126,6 +166,9 @@ class Core:
         id_ = self.m.core_outputs.get((output, partition))
         if id_ is not None:
             return id_
+        if ((self.m.manifest or {}).get("outputs", {}).get(output) or {}).get("key") is None:
+            # A life is the current deploy's keyed output's alone (`Generation` keeps names current).
+            raise Conflict(f"output {output!r} is no keyed output of this deploy: no life is minted for it")
         for o, p, i in minted:
             if (o, p) == (output, partition):
                 return i

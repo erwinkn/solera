@@ -26,7 +26,7 @@ from solera._native import Tracking
 
 from .. import planning
 from ..state import Conflict
-from . import b64
+from . import Generation, b64
 
 INCOMPLETE = "upstream incomplete"
 
@@ -156,6 +156,7 @@ async def settle(engine) -> None:
                 engine.state.record({"type": "Settled", "asset": asset, "partition": partition})
         except Exception:  # one partition that no longer plans (a dimension changed) stops no other
             log.exception("settling %s %r", asset, partition)
+    generation = Generation(m)
     for (output, partition), id_ in sorted(m.core_outputs.items()):
         if core.tracking.full_run(id_.encode()) is None:
             continue
@@ -163,6 +164,8 @@ async def settle(engine) -> None:
         if spans and spans[-1][1] is None:
             continue
         async with core.lock(id_):
+            if generation.moved:  # a deploy while it waited: the next tick goes on
+                return
             if (
                 core.m.core_outputs.get((output, partition)) != id_
                 or core.tracking.full_run(id_.encode()) is None
@@ -189,11 +192,11 @@ async def proceed(engine, asset: str, partition: str, by: str) -> dict:
         return sorted(i for o in names if (i := core.m.core_outputs.get((o, partition))) is not None)
 
     while True:
-        ids = lives()
+        generation, ids = Generation(core.m), lives()
         async with contextlib.AsyncExitStack() as locks:
             for id_ in ids:  # in life-id order, as a batch's commit takes them
                 await locks.enter_async_context(core.lock(id_))
-            if lives() != ids:  # a deploy changed its lives while it waited: lock the current ones
+            if generation.moved:  # a deploy while it waited: start over under the new one
                 continue
             stuck = [
                 s["output"] for s in stopped(engine) if (s["asset"], s["partition"]) == (asset, partition)

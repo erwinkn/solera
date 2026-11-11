@@ -855,7 +855,7 @@ class Model:
             or (self.core is not None and axes.get(name, axis(outputs[name])) != axis(outputs[name]))
         }
         for name in reset:
-            self.reset_at[("output", name)] = self.deploy_number
+            self.reset_at[("output", name)] = self.reset_at[("life", name)] = self.deploy_number
         reset |= {k[0] for k in self.heads} - set(outputs)  # any other name no longer declared
         for name in reset | (set(self.homes) - set(outputs)):
             self.homes.pop(name, None)
@@ -940,6 +940,8 @@ class Model:
         for old, new in output_map.items():
             if old in self.homes and new not in self.homes:
                 self.homes[new] = self.homes.pop(old)
+            # Lives by name (`life`): both names' are new, so a name reused later is never the old life's.
+            self.reset_at[("life", old)] = self.reset_at[("life", new)] = self.deploy_number
         move(self.indexes, output_map, 0)
         # A partition's record goes whole: a name that already has one keeps its own.
         move(self.partitions, asset_map, 0)
@@ -1256,7 +1258,9 @@ class Model:
             self.retired.pop(commit.get("cleaned"), None)
             return
         asset, partition, at = task["asset"], task["partition"], e["finished_at"]
-        names = sorted(prepared.get("outputs") or {})
+        # A skip has no preparation (nothing launched): its walk's outputs are the asset's.
+        declared = ((self.manifest or {}).get("assets", {}).get(asset) or {}).get("outputs") or ()
+        names = sorted(prepared.get("outputs") or (o["name"] for o in declared))
         heads_before = {
             name: (self.span_key(name, partition), self.axis_head(name, partition)) for name in names
         }
@@ -1858,11 +1862,11 @@ class Model:
 
     def life(self, output: str, partition: str) -> str | int:
         """Which life of an output a head belongs to: its core id, else the
-        deploy that last reset the name. A gate entry of another life than
-        the current one names a life that gets no commit any more."""
+        deploy that last reset or renamed the name. A gate entry of another
+        life than the current one names a life that gets no commit any more."""
 
         id_ = self.core_outputs.get((output, partition))
-        return id_ if id_ is not None else self.reset_at.get(("output", output), 0)
+        return id_ if id_ is not None else self.reset_at.get(("life", output), 0)
 
     def axis_head(self, output: str, partition: str) -> int | None:
         """An output's head on its commit axis: its core life's commit, an
@@ -1904,8 +1908,8 @@ class Model:
         for name, (was, head_before) in before.items():
             key, head = self.span_key(name, partition), self.axis_head(name, partition)
             spans = [list(s) for s in self.partial_spans.get(key, ())] if key == was else []
-            if restart and spans and spans[-1][1] is None:
-                spans[-1][1] = head_before + 1
+            if restart and spans and spans[-1][1] is None and head != head_before:
+                spans[-1][1] = head_before + 1  # a start-over that did not move the head keeps it partial
             if spans and spans[-1][1] is None:
                 if not pending:
                     spans[-1][1] = head

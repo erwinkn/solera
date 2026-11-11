@@ -71,7 +71,7 @@ from .observing import Observing
 from .sensors import Sensors
 from .staleness import Staleness
 from .state import Conflict, LostOwnership, State
-from .tracking import WALK, Core, b64, output_pin
+from .tracking import WALK, Core, Generation, Redeployed, b64, output_pin
 from .tracking import commit as core_commit
 from .tracking import full as core_full
 from .tracking import prepare as core_prepare
@@ -1013,7 +1013,19 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
                 commit["final"] = not more
                 self._finish(task, claim, "skipped", commit=commit, more=more)
                 return
-            stage = await self._launch(task, run, attempt, prepared)
+            try:  # under the deploy it was prepared under: nothing awaited since `prepare` returned
+                stage = await self._launch(task, run, attempt, prepared, Generation(self.m, "it launched"))
+            except Redeployed as error:  # its outputs' names may be another deploy's: planned again
+                self._finish(
+                    task,
+                    claim,
+                    "replanned",
+                    error=error,
+                    retryable=True,
+                    delay=REPLAN_DELAY,
+                    reason="redeployed",
+                )
+                return
             try:
                 self._authority()  # `_launch` awaited: still ours?
                 handle = await placement.launch(stage)
@@ -1341,10 +1353,11 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
                 "lineage",
                 "outcomes",
                 "definition",
-                "gate",  # the upstream heads it read: its commit checks them again (`full.held`)
                 "cleanup",  # a cleanup task's entry (K25)
             )
         }
+        if "gate" in prepared:  # the new path's: the upstream heads it read, checked again (`full.held`)
+            kept["gate"] = prepared["gate"]
         return {**kept, "outputs": outputs}
 
     def _pin_at(self, output: str, upstream_partition: str):
@@ -1677,16 +1690,18 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
             outputs = current_names(prepared, result.get("outputs") or {})
             built = await core_commit.build(self.core, task, attempt, prepared, result, outputs)
             async with built.locks:  # the outputs it built: their commits are recorded in turn
-                observations = await self._observations(task, core_commit.unkeyed(prepared), result, attempt)
-                if built.progress is not None:
-                    observations.setdefault("progress", {})[WALK] = built.progress
-                if self.m.claimed(attempt) is not claim:
-                    raise LostOwnership(attempt)
-                self._commit_guards(task, prepared)  # again: the build and its observations awaited
-                core_commit.named(self.core, built)
-                out = await self._install(
-                    task, claim, attempt, prepared, result, observations, built, **settle
-                )
+                with built.generation:  # checked again where it is recorded (`core_commit.check`)
+                    observations = await self._observations(
+                        task, core_commit.unkeyed(prepared), result, attempt
+                    )
+                    if built.progress is not None:
+                        observations.setdefault("progress", {})[WALK] = built.progress
+                    if self.m.claimed(attempt) is not claim:
+                        raise LostOwnership(attempt)
+                    self._commit_guards(task, prepared)  # again: the build and its observations awaited
+                    out = await self._install(
+                        task, claim, attempt, prepared, result, observations, built, **settle
+                    )
             await core_sources.record_loads(self, attempt, prepared, result)
             return out
         observations = await self._observations(task, prepared, result, attempt)
@@ -1892,14 +1907,15 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
         (the new path) makes `upsert` a load's report on the source's log at
         that commit (`tracking.sources.record_loads`)."""
 
-        head = self.m.heads.get((name, ""))
+        head, generation = self.m.heads.get((name, "")), Generation(self.m)
         # Its delta is named by nothing until recorded: its index is held as read
         # meanwhile, so the orphan collector leaves it be.
         with self.m.reading(self.m.index(name, "").prefix):
             event, ref = await self._prepare_commit(name, version, keys, upsert, remove, by, at=at)
             if event is None:
                 return {"changed": False, "ref": ref}
-            if commit_of(self.m.heads.get((name, ""))) != commit_of(head):
+            redeployed = self.core is not None and generation.moved
+            if commit_of(self.m.heads.get((name, ""))) != commit_of(head) or redeployed:
                 await self._drop_prepared([event])
                 raise Conflict(f"source {name!r} moved while committing; retry")
             event["at"] = self.clock()

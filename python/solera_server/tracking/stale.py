@@ -6,7 +6,7 @@ would, records nothing, and runs as a heavy call."""
 
 from __future__ import annotations
 
-from . import Core
+from . import Core, Generation, Redeployed
 from .prepare import conditions
 
 
@@ -36,7 +36,13 @@ async def owes(core: Core, asset: str, partition: str, input, planner, inputs) -
         "limit": 1,
         "inputs": [{"edge": edge[0].encode(), "conditions": conditions(core.engine, input, base)}],
     }
-    summary = await core.run(core.tracking.plan, request)
+    generation = Generation(m)
+    try:
+        with generation:
+            summary = await core.run(core.tracking.plan, request)
+        generation.check()
+    except Redeployed:  # a deploy while it planned: not known, so owed
+        return True
     return bool(summary["inputs"][0]["keys"])
 
 

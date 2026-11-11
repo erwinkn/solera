@@ -21,6 +21,7 @@ from solera.ids import ulid
 
 from .executors.local import _env
 from .model import commit_of
+from .tracking import Generation
 from .tracking import sources as core_sources
 
 log = logging.getLogger(__name__)
@@ -231,6 +232,7 @@ class Sensors:
         # The heads it validates against: one that moves before the commits are
         # recorded refuses the tick, so no commit lands between a check and its record.
         heads = {source: self.m.heads.get((source, "")) for source in sources}
+        generation = Generation(self.m)
         for c in commits:  # every snapshot together: one stale source refuses the tick
             source, seen = c["source"], claim["snapshot"][c["source"]]
             if "core" in seen:  # only a key it reports changed (D193)
@@ -271,6 +273,8 @@ class Sensors:
                 commit_of(self.m.heads.get((source, ""))) != commit_of(head) for source, head in heads.items()
             ):
                 raise self.Conflict("a source moved while the tick was applied")
+            if self.core is not None and generation.moved:
+                raise self.Conflict("a deploy landed while the tick was applied")
         except BaseException:
             await self._drop_prepared(prepared)
             raise

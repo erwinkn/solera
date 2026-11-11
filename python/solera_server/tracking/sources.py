@@ -15,7 +15,7 @@ import contextlib
 from solera._native import encode_changes
 
 from ..state import Conflict
-from . import Core
+from . import Core, Generation, Redeployed
 
 SOURCE_KEYS_RECORDED = 1000  # a source commit's run lists changed keys up to this many, else counts
 PAGE = 10_000  # history entries a tick's staleness check reads at a time
@@ -81,7 +81,7 @@ async def moved(core: Core, name: str, since: int, commit: dict) -> bool:
     tick observed, removals included. A full map reports every key, so any
     commit since makes it stale."""
 
-    found = core.m.core_output(name, "")
+    found, generation = core.m.core_output(name, ""), Generation(core.m)
     head = found["head"] if found is not None else 0
     if head == since:
         return False
@@ -93,14 +93,19 @@ async def moved(core: Core, name: str, since: int, commit: dict) -> bool:
     core.attach(core.m.core_outputs[(name, "")])
     after = None
     while True:
-        rows, after = await core.run(
-            core.index.history,
-            found["layers"],
-            commits=(since + 1, head),
-            hi=max(keys),
-            after=after,
-            limit=PAGE,
-        )
+        try:
+            with generation:
+                rows, after = await core.run(
+                    core.index.history,
+                    found["layers"],
+                    commits=(since + 1, head),
+                    hi=max(keys),
+                    after=after,
+                    limit=PAGE,
+                )
+            generation.check()
+        except Redeployed:  # a deploy while it read: not known, so stale; the tick is refused and comes again
+            return True
         if any(key in keys for key, _ in rows):
             return True
         if after is None:
