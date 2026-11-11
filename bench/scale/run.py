@@ -81,6 +81,7 @@ class Run:
             "SOLERA_PROJECT": str(HERE / "project.py"),
             "SOLERA_TRACKING": self.path,
             "SOLERA_CONCURRENCY": str(args.concurrency),
+            "SCALE_FORM": args.form,
             "PYTHONPATH": os.pathsep.join(filter(None, [str(REPO), os.environ.get("PYTHONPATH")])),
         }
         self.processes: dict[str, subprocess.Popen] = {}
@@ -462,6 +463,7 @@ class Run:
 
         sys.path.insert(0, str(HERE))
         os.environ["SCALE_ROOT"] = str(self.root)
+        os.environ["SCALE_FORM"] = self.args.form
         from project import GROUPS, project
 
         heads = await self.heads()
@@ -578,7 +580,7 @@ def report(results: dict) -> str:
         "",
         f"Commit {results['commit'][:10]}; {results['machine']['cpus']} CPUs, {results['machine']['memory_gb']} GB; "
         f"engine on CPUs `{a['engine_cpus'] or 'all'}`, {a['workers']} workers, concurrency {a['concurrency']}, "
-        f"batches of {a['batch']:,}, {a['change']:.0%} of the keys changing a day.",
+        f"batches of {a['batch']:,}, {a['change']:.0%} of the keys changing a day, data as {a['form']}.",
         "",
     ]
     if "check" in results:
@@ -747,6 +749,12 @@ def parse() -> argparse.Namespace:
     )
     parser.add_argument("--workers", type=int, default=8, help="pool worker processes")
     parser.add_argument("--concurrency", type=int, default=8, help="the engine's attempts at once")
+    parser.add_argument(
+        "--form",
+        choices=("dict", "arrow"),
+        default="dict",
+        help="feed's loads, the batches and packs: dicts or Arrow tables",
+    )
     parser.add_argument("--engine-cpus", default="0-3", help="taskset CPU list for the engine ('' for none)")
     parser.add_argument("--worker-cpus", default="", help="taskset CPU list for the workers ('' for none)")
     parser.add_argument("--root", default=".solera/scale")
