@@ -1050,7 +1050,6 @@ class ControlFile:
 
 
 ENDED = ABORTED = 3  # the exit code of an attempt the engine ended: no result was published
-STALE = 5  # the exit code of an attempt whose spec names another deploy than its preloaded project's
 LOSER_POLL = 30.0  # how often an worker that lost the claim looks for the owner's result
 
 
@@ -1065,7 +1064,6 @@ async def run_attempt(
     pool: bool = False,
     own_process: bool = False,
     loser_poll: float = LOSER_POLL,
-    stale: bool = False,
 ) -> int:
     """Run one attempt (docs/lifecycle.md §3): read its spec, own it, run
     it, seal its result — each a swap of its control file (§2.4).
@@ -1080,9 +1078,7 @@ async def run_attempt(
     failed result, and 3 when the engine ended the attempt first: then no
     result is published. Raises if the result could not be published.
     `own_process` says the process runs this attempt alone: its peak memory
-    is the attempt's, and a forced cancel exits it at once. `stale`, for a
-    project imported before its spec was known (a forkserver's): return 5
-    (`STALE`), touching nothing, if the spec names another deploy."""
+    is the attempt's, and a forced cancel exits it at once."""
 
     timeline = Timeline(own_process)
     timeline.add("booted", socket.gethostname())
@@ -1092,8 +1088,6 @@ async def run_attempt(
     if data is None:
         raise StoreError(f"No spec at {base}{lifecycle.SPEC}")
     spec = json.loads(data)
-    if stale and spec["deploy"] != entrypoint.manifest["deploy"]:
-        return STALE
     worker_id = secrets.token_hex(8)
     claim = {"host": socket.gethostname(), "pid": os.getpid(), "at": time.time()}
     if channel is None and (engine_url or spec.get("engine")):
@@ -1508,23 +1502,23 @@ async def run_pool(pool: str, server: str, token: str | None = None, *, project:
     the project's name, by default its manifest's: a pool token reaches the
     pool's routes and nothing else.
 
-    Each attempt runs in a child forked from a forkserver (forkserver.py), a
-    process that imported the framework and, when that left no thread,
-    socket or pipe behind, the project: an attempt imports nothing. The
-    child is the attempt's own process: a forced cancel ends it, and with it
-    any thread the attempt left running. (This process has threads, an HTTP
-    client's name lookups, and fork copies only the forking one: unsafe on
-    macOS.)"""
+    Each attempt runs in a child forked from a forkserver — a process that
+    has imported the framework and warmed its HTTP client (warm.py), and
+    nothing else, and started no thread —
+    and imports the project itself: no project code's threads or locks are
+    ever forked half-held. The child is the attempt's own process: a forced
+    cancel ends it, and with it any thread the attempt left running. (This
+    process has threads — an HTTP client's name lookups — and fork copies
+    only the forking one: unsafe on macOS.)"""
 
     import httpx
 
     from .channel import HttpTransport, PoolChannel
-    from .forkserver import Attempts
 
     capacity = {"cpu": os.cpu_count(), "memory": None, "gpu": None}
     host = f"{socket.gethostname()}:{os.getpid()}"
     project = project or load_project(os.environ["SOLERA_PROJECT"]).manifest["name"]
-    attempts = Attempts(os.environ["SOLERA_PROJECT"])
+    context = _attempts()
     channel = PoolChannel(HttpTransport(server, token, timeout=60), project, pool)
     try:
         print(f"[pool] {host} polls pool {pool!r}", flush=True)
@@ -1536,22 +1530,43 @@ async def run_pool(pool: str, server: str, token: str | None = None, *, project:
                 await asyncio.sleep(1.0)
                 continue
             for stage in stages:
-                code = await asyncio.get_running_loop().run_in_executor(None, attempts.run, stage, server)
+                code = await _forked(stage, server, context)
                 print(f"[pool] {stage['attempt']} exited {code}", flush=True)
                 if code != LOST:  # it ran: ask again, what waits has changed
                     break
     finally:
         await channel.close()
-        await asyncio.get_running_loop().run_in_executor(None, attempts.close)
 
 
 LOST = 4  # the exit code of an attempt that could not publish: the engine treats it as dead
 
 
-def _child(stage: dict, server: str | None, project: Project | str, *, stale: bool) -> None:
-    """A pool attempt, in its own process, forked from the forkserver:
-    `project` is the project it imported, or its entrypoint, which the
-    attempt imports itself (a failure goes in its result)."""
+def _attempts():
+    """Where pool attempts start: a forkserver with the framework imported
+    and its HTTP client warmed (warm.py), never the project — project code
+    may start threads or hold locks a fork would copy without them."""
+
+    import multiprocessing
+
+    context = multiprocessing.get_context("forkserver")
+    context.set_forkserver_preload(["solera_worker.worker", "solera_worker.warm"])
+    return context
+
+
+async def _forked(stage: dict, server: str | None, context=None) -> int:
+    """Run one pool attempt in a process of its own, forked from the
+    forkserver; its exit code."""
+
+    child = (context or _attempts()).Process(
+        target=_child, args=(stage, server), name=f"attempt {stage['attempt']}"
+    )
+    child.start()
+    await asyncio.get_running_loop().run_in_executor(None, child.join)
+    return child.exitcode
+
+
+def _child(stage: dict, server: str | None) -> None:
+    project = os.environ["SOLERA_PROJECT"]  # imported here, by the attempt: a failure goes in its result
 
     async def attempt():
         code = LOST
@@ -1564,7 +1579,6 @@ def _child(stage: dict, server: str | None, project: Project | str, *, stale: bo
                 engine_url=server,
                 pool=True,
                 own_process=True,
-                stale=stale,
             )
         except BaseException:
             traceback.print_exc()
