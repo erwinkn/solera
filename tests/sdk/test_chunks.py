@@ -21,7 +21,10 @@ def expected(rows, column):
 
 
 def random_rows(rnd):
-    keys = [rnd.choice(["a", "b", "é", "z", "10", "9", "k\u00e9", "x"]) + str(i) for i in range(rnd.randint(1, 12))]
+    keys = [
+        rnd.choice(["a", "b", "é", "z", "10", "9", "k\u00e9", "x"]) + str(i)
+        for i in range(rnd.randint(1, 12))
+    ]
     rows = [{"id": rnd.choice(keys), "n": i} for i in range(rnd.randint(0, 40))]
     if rnd.random() < 0.3:
         rows.sort(key=lambda r: r["id"].encode())
