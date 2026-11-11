@@ -24,8 +24,8 @@ use solera_tracking::event::{Event, Part};
 use solera_tracking::lineage::{self, Answer, Received};
 use solera_tracking::plan::{self, Hold, InputRequest, Mode, OneIndex, Request};
 use solera_tracking::progress::{
-    Class, Conditions, EdgeOpen, Holding, InputReport, Key, KeyRange, Pat, Patterns, Reason,
-    Reset, Value,
+    Class, Conditions, EdgeOpen, Holding, InputReport, Key, KeyRange, Pat, Patterns, Reason, Reset,
+    Value,
 };
 use solera_tracking::record::Record;
 use solera_tracking::{Output, Tracking};
@@ -672,7 +672,9 @@ async fn batch(
             if rng.random_bool(0.15) {
                 report.failed.push(c.key.clone());
                 if rng.random_bool(0.3) {
-                    report.loaded.push((c.key.clone(), inp.log.at(inp.log.head(), &c.key)));
+                    report
+                        .loaded
+                        .push((c.key.clone(), inp.log.at(inp.log.head(), &c.key)));
                 }
                 continue;
             }
@@ -785,7 +787,11 @@ async fn check_lineage(
         let got = lineage::input(&logs, &s.rec, &OneIndex(ix), cleaned)
             .await
             .unwrap();
-        let pieces = if s.rec.reset { &[][..] } else { &s.rec.replaced.pieces[..] };
+        let pieces = if s.rec.reset {
+            &[][..]
+        } else {
+            &s.rec.replaced.pieces[..]
+        };
         let cut = std::iter::once(s.rec.head)
             .chain(pieces.iter().filter_map(|p| match p.value {
                 Value::At(c, _) => Some(c),
@@ -796,12 +802,19 @@ async fn check_lineage(
         let got = match got {
             Answer::NotRetained { output, commit } => {
                 assert_eq!(output, log.name, "only the input's history is cut");
-                assert_eq!(Some(commit), cut, "not retained: the oldest commit the record names, below the floor");
+                assert_eq!(
+                    Some(commit),
+                    cut,
+                    "not retained: the oldest commit the record names, below the floor"
+                );
                 continue;
             }
             Answer::Found(got) => got,
         };
-        assert_eq!(cut, None, "found although the record names commit {cut:?}, below the floor");
+        assert_eq!(
+            cut, None,
+            "found although the record names commit {cut:?}, below the floor"
+        );
         for bad in [
             Record {
                 digest: s.rec.digest ^ 1,
@@ -812,17 +825,27 @@ async fn check_lineage(
                 ..s.rec.clone()
             },
         ] {
-            assert!(lineage::input(&logs, &bad, &OneIndex(ix), cleaned).await.is_err());
+            assert!(lineage::input(&logs, &bad, &OneIndex(ix), cleaned)
+                .await
+                .is_err());
         }
         if !s.rec.reset && s.rec.replaced.pieces.iter().any(|p| p.value == Value::Held) {
             let none = t.logs(&s.rec, None);
-            assert!(lineage::input(&none, &s.rec, &OneIndex(ix), cleaned).await.is_err());
+            assert!(lineage::input(&none, &s.rec, &OneIndex(ix), cleaned)
+                .await
+                .is_err());
         }
         let want: Vec<Received> = s
             .expected
             .iter()
             .map(|r| Received {
-                deleted: released(log, &r.key, r.loaded.as_ref().unwrap_or(&r.planned), s.rec.head, cleaned),
+                deleted: released(
+                    log,
+                    &r.key,
+                    r.loaded.as_ref().unwrap_or(&r.planned),
+                    s.rec.head,
+                    cleaned,
+                ),
                 ..r.clone()
             })
             .collect();
@@ -1235,6 +1258,9 @@ fn a_key_held_back_at_commit_is_recorded_apart_from_one_the_planner_held_back() 
             (key("k1"), Reason::Unsettled, Some(Ver::Int(2))),
             (key("k2"), Reason::HeldBack, None),
         ];
-        assert_eq!(rec, want, "the record tells the two apart, with the version loaded");
+        assert_eq!(
+            rec, want,
+            "the record tells the two apart, with the version loaded"
+        );
     });
 }

@@ -1800,3 +1800,61 @@ fn a_limited_read_fetches_the_index_its_page_needs() {
         );
     });
 }
+
+#[test]
+fn a_layer_damaged_in_the_store_is_not_downloaded_after_every_read() {
+    let rt = runtime();
+    let mem = Arc::new(InMemory::new());
+    let dir = scratch("damaged");
+    let index = |disk: bool| {
+        let opts = StoreOptions {
+            memory_bytes: 0,
+            disk: disk.then(|| DiskOptions {
+                dir: dir.clone(),
+                bytes: 1 << 30,
+                store: "t".into(),
+            }),
+            ..Default::default()
+        };
+        let store = Store::new(mem.clone(), Path::from("t"), rt.handle().clone(), opts).unwrap();
+        ChangeIndex::new(store, WriteOptions::default())
+    };
+    let nc = NewCommit {
+        commit: 1,
+        time_ms: 0,
+        producer: b"",
+        live_before: 0,
+        clear: false,
+    };
+    let mut run = Run::new();
+    for i in 0..1000u64 {
+        run.push_key(format!("k{i:04}").as_bytes());
+        run.push_entry(1, Version::Int(i), Version::Absent);
+    }
+    rt.block_on(async {
+        let l = index(false).write_commit("a", nc, &run).await.unwrap();
+        let p = Path::from("t/a");
+        let mut b = mem.get(&p).await.unwrap().bytes().await.unwrap().to_vec();
+        b[10] ^= 0xff;
+        mem.put(&p, b.into()).await.unwrap();
+        let ix = index(true);
+        let q = Query::default();
+        for _ in 0..4 {
+            assert!(ix.scan(std::slice::from_ref(&l), 1, &q).await.is_err());
+            for _ in 0..50 {
+                if ix.store.stats.counts().fills >= 1 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(
+            ix.store.stats.counts().fills,
+            1,
+            "one download of a damaged layer"
+        );
+        assert_eq!(ix.store.disk_bytes(), 0);
+    });
+    let _ = std::fs::remove_dir_all(dir);
+}

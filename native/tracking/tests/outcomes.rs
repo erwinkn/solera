@@ -36,8 +36,8 @@ use solera_index::{ChangeIndex, LayerRef, NewCommit, Run, Store, StoreOptions, W
 use solera_tracking::codec::Ver;
 use solera_tracking::commit::OutputCommit;
 use solera_tracking::due;
-use solera_tracking::lineage::{self, Answer};
 use solera_tracking::event::{Event, Part};
+use solera_tracking::lineage::{self, Answer};
 use solera_tracking::outcomes::commit::{self as oc, records, Ctx};
 use solera_tracking::outcomes::transition::{
     eligible, transition, Counters, Kind, Reported, Stored, FAILED,
@@ -588,7 +588,10 @@ impl World {
         report: &InputReport,
         held: &[Key],
     ) {
-        assert_eq!(&solera_tracking::record::Record::decode(&rec.encode()).unwrap(), rec);
+        assert_eq!(
+            &solera_tracking::record::Record::decode(&rec.encode()).unwrap(),
+            rec
+        );
         let got = lineage::input(&self.t.logs(rec, None), rec, &OneIndex(ix), 0)
             .await
             .unwrap();
@@ -612,12 +615,26 @@ impl World {
                 } else {
                     dev.is_some().then_some(Reason::Deviation)
                 };
-                (c.key.clone(), c.class, c.held.clone(), c.version.clone(), reason, dev)
+                (
+                    c.key.clone(),
+                    c.class,
+                    c.held.clone(),
+                    c.version.clone(),
+                    reason,
+                    dev,
+                )
             })
             .collect();
         assert_eq!(
             got.iter()
-                .map(|r| (r.key.clone(), r.class, r.held.clone(), r.planned.clone(), r.reason, r.loaded.clone()))
+                .map(|r| (
+                    r.key.clone(),
+                    r.class,
+                    r.held.clone(),
+                    r.planned.clone(),
+                    r.reason,
+                    r.loaded.clone()
+                ))
                 .collect::<Vec<_>>(),
             want,
             "lineage of a batch over {:?}",
@@ -792,7 +809,11 @@ impl World {
                 };
                 Some((c.key.clone(), reason, dev))
             })
-            .chain(ip.held_back.iter().map(|h| (h.key.clone(), Reason::HeldBack, None)))
+            .chain(
+                ip.held_back
+                    .iter()
+                    .map(|h| (h.key.clone(), Reason::HeldBack, None)),
+            )
             .collect();
         want.sort_by(|a, b| a.0.cmp(&b.0));
         assert_eq!(

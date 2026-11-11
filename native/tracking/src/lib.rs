@@ -18,6 +18,7 @@
 //! - [`commit`]: output and source commits (B4).
 //! - [`stale`]: staleness kept exact at every commit (B7).
 //! - [`lineage`]: what a batch received, recomputed from its record (B10).
+//! - [`retain`]: the cut, merges and cleanup (B9).
 
 pub mod codec;
 pub mod commit;
@@ -29,6 +30,7 @@ pub mod outcomes;
 pub mod plan;
 pub mod progress;
 pub mod record;
+pub mod retain;
 pub mod stale;
 pub mod state;
 

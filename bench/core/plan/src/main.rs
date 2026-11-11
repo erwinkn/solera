@@ -357,6 +357,7 @@ fn scenario_state(
             reset: false,
             range: KeyRange::all(),
             piece: Some(value),
+            head,
             points: pts,
             expect: read_digest(&Keyed::default(), false, &KeyRange::all()),
             fence: None,

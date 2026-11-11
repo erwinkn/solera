@@ -569,9 +569,16 @@ impl Slice {
                 })
             })
             .collect::<Result<Vec<Piece>>>()?;
-        let below = |a: &Option<Key>, b: &Option<Key>| matches!((a, b), (Some(a), Some(b)) if a < b);
-        let empty = |p: &Piece| p.range.lo.is_some() && p.range.hi.is_some() && !below(&p.range.lo, &p.range.hi);
-        let overlap = |w: &[Piece]| w[0].range.hi.is_none() || below(&w[1].range.lo, &w[0].range.hi) || w[1].range.lo.is_none();
+        let below =
+            |a: &Option<Key>, b: &Option<Key>| matches!((a, b), (Some(a), Some(b)) if a < b);
+        let empty = |p: &Piece| {
+            p.range.lo.is_some() && p.range.hi.is_some() && !below(&p.range.lo, &p.range.hi)
+        };
+        let overlap = |w: &[Piece]| {
+            w[0].range.hi.is_none()
+                || below(&w[1].range.lo, &w[0].range.hi)
+                || w[1].range.lo.is_none()
+        };
         if pieces.iter().any(empty) || pieces.windows(2).any(overlap) {
             return format("pieces out of order");
         }
@@ -674,6 +681,14 @@ impl Keyed {
             push(None, Value::Empty);
         }
         k
+    }
+
+    /// The commits its pieces are at.
+    pub fn commits(&self) -> impl Iterator<Item = u64> + '_ {
+        self.values.iter().filter_map(|v| match v {
+            Value::At(c, _) => Some(*c),
+            _ => None,
+        })
     }
 
     pub fn piece_count(&self) -> usize {
@@ -1030,9 +1045,22 @@ impl EdgeRename {
     }
 
     pub(crate) fn check(&self, t: &Tracking) -> Result<()> {
-        edge(t, &self.from)?;
+        let e = edge(t, &self.from)?;
         if self.from != self.to && t.edges.contains_key(&self.to) {
             return invalid("the new name is taken");
+        }
+        let floor = t
+            .outputs
+            .get(&self.input)
+            .and_then(|o| o.layers.first()?.floor)
+            .unwrap_or(0);
+        let held = crate::retain::cut::edge_holds(t, &self.from, e);
+        if let Some((c, by)) = held.into_iter().min_by_key(|(c, _)| *c) {
+            if c < floor {
+                return invalid(format!(
+                    "the edge holds commit {c} ({by:?}), below its new input's floor {floor}: reset it first"
+                ));
+            }
         }
         Ok(())
     }
@@ -1133,6 +1161,8 @@ pub struct BatchProgress {
     pub range: KeyRange,
     /// `At(head, the conditions it was planned under)`; `None` for a key list.
     pub piece: Option<Value>,
+    /// The input's head the batch planned at. Refused once a fold passed it.
+    pub head: u64,
     /// Sorted by key.
     pub points: Vec<(Key, Point)>,
     /// The digest of the progress the plan read (the range's slice; with a
@@ -1179,6 +1209,7 @@ impl BatchProgress {
                 v.encode(&mut body, &mut t);
             }
         }
+        body.uv(self.head);
         encode_points(&mut body, &mut t, self.points.iter().map(|(k, p)| (k, p)));
         body.uv(self.expect);
         match &self.fence {
@@ -1203,6 +1234,7 @@ impl BatchProgress {
             1 => Some(Value::decode(d, &conds)?),
             t => return format(format!("piece tag {t}")),
         };
+        let head = d.uv()?;
         let points = decode_points(d, &conds)?;
         let expect = d.uv()?;
         let fence = match d.u8()? {
@@ -1215,6 +1247,7 @@ impl BatchProgress {
             reset,
             range,
             piece,
+            head,
             points,
             expect,
             fence,
@@ -1231,6 +1264,11 @@ impl BatchProgress {
         }
         if read_digest(k, self.reset, &self.range) != self.expect {
             return invalid("the edge's progress moved since the batch was planned");
+        }
+        let input = &t.edges[&self.edge].input;
+        let floor = t.outputs.get(input).and_then(|o| o.layers.first()?.floor);
+        if floor.is_some_and(|f| f > self.head) {
+            return invalid("the input's layers no longer reach back to the batch's head: a merge folded past it");
         }
         if let Some((output, head)) = &self.fence {
             if *t.edges[&self.edge].input != **output {

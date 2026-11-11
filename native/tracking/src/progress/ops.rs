@@ -269,6 +269,7 @@ impl Tracking {
                 reset: plan.reset,
                 range: plan.range.clone(),
                 piece: (!key_list).then(|| Value::At(p.head, p.conditions.clone())),
+                head: p.head,
                 points,
                 expect: p.expect,
                 fence: (kept_unsure && !unsettled).then(|| (p.output.clone(), p.head)),

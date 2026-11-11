@@ -88,6 +88,7 @@ fn batch(t: &Tracking, range: KeyRange, at: u64, reset: bool) -> Part {
         reset,
         range: range.clone(),
         piece: Some(Value::At(at, Arc::default())),
+        head: at,
         points: vec![],
         expect: read_digest(k, reset, &range),
         fence: None,
@@ -383,6 +384,7 @@ fn failed(rt: &tokio::runtime::Runtime, ix: &ChangeIndex, keys: &[&str]) -> Trac
         reset: false,
         range: KeyRange::all(),
         piece: Some(Value::At(1, c.clone())),
+        head: 1,
         points: vec![],
         expect: read_digest(
             t.edges[b"e".as_slice()].progress.keyed().unwrap(),

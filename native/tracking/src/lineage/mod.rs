@@ -47,7 +47,10 @@ pub enum Answer<T> {
     Found(T),
     /// The index of `output` no longer answers at `commit`, which the record
     /// names: retention cut its history there (§13).
-    NotRetained { output: Id, commit: u64 },
+    NotRetained {
+        output: Id,
+        commit: u64,
+    },
 }
 
 /// One key a batch received.
@@ -119,7 +122,11 @@ impl Logs {
     /// the rule is the record's, not the plan's. A commit past an output's head is an error:
     /// that is not the index the batch read.
     fn gone<T>(&self, rec: &Record) -> Result<Option<Answer<T>>> {
-        let pieces = if rec.reset { &[][..] } else { &rec.replaced.pieces[..] };
+        let pieces = if rec.reset {
+            &[][..]
+        } else {
+            &rec.replaced.pieces[..]
+        };
         let missing = |id: &Id, layers: &[LayerRef], commits: Vec<u64>| {
             let (floor, head) = span(layers);
             if let Some(c) = commits.iter().find(|&&c| c > head) {
@@ -129,12 +136,14 @@ impl Logs {
                     String::from_utf8_lossy(id)
                 ));
             }
-            Ok(commits.into_iter().filter(|&c| c < floor).min().map(|commit| {
-                Answer::NotRetained {
+            Ok(commits
+                .into_iter()
+                .filter(|&c| c < floor)
+                .min()
+                .map(|commit| Answer::NotRetained {
                     output: id.clone(),
                     commit,
-                }
-            }))
+                }))
         };
         let mut need = vec![rec.head];
         need.extend(pieces.iter().filter_map(|p| match p.value {
@@ -196,30 +205,40 @@ impl Logs {
             return Ok(out);
         }
         ixs.index(&rec.output)?
-            .window_keys_with(&self.input, rec.head + 1..=head, keys, &Query::default(), |g| {
-                let mut rows: Vec<(u64, Ver, Ver)> = g
-                    .rows(0)
-                    .map(|r| {
-                        (
-                            g.commit(r),
-                            Ver::of(g.new_version(r)),
-                            Ver::of(g.replaced_version(r)),
-                        )
-                    })
-                    .collect();
-                rows.sort_unstable_by(|a, b| b.0.cmp(&a.0));
-                let mut written_later = HashSet::new();
-                let mut vs = vec![];
-                for (c, new, was) in rows {
-                    if c <= cleaned && was != new && !was.is_absent() && !written_later.contains(&was) {
-                        vs.push(was);
+            .window_keys_with(
+                &self.input,
+                rec.head + 1..=head,
+                keys,
+                &Query::default(),
+                |g| {
+                    let mut rows: Vec<(u64, Ver, Ver)> = g
+                        .rows(0)
+                        .map(|r| {
+                            (
+                                g.commit(r),
+                                Ver::of(g.new_version(r)),
+                                Ver::of(g.replaced_version(r)),
+                            )
+                        })
+                        .collect();
+                    rows.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+                    let mut written_later = HashSet::new();
+                    let mut vs = vec![];
+                    for (c, new, was) in rows {
+                        if c <= cleaned
+                            && was != new
+                            && !was.is_absent()
+                            && !written_later.contains(&was)
+                        {
+                            vs.push(was);
+                        }
+                        written_later.insert(new);
                     }
-                    written_later.insert(new);
-                }
-                if !vs.is_empty() {
-                    out.insert(g.key(0).into(), vs);
-                }
-            })
+                    if !vs.is_empty() {
+                        out.insert(g.key(0).into(), vs);
+                    }
+                },
+            )
             .await?;
         Ok(out)
     }
@@ -314,7 +333,9 @@ pub async fn input(
 ) -> Result<Answer<Vec<Received>>> {
     let cands = match planned(logs, rec, ixs).await? {
         Answer::Found(cands) => cands,
-        Answer::NotRetained { output, commit } => return Ok(Answer::NotRetained { output, commit }),
+        Answer::NotRetained { output, commit } => {
+            return Ok(Answer::NotRetained { output, commit })
+        }
     };
     let keys: Vec<&[u8]> = cands.iter().map(|c| &c.key[..]).collect();
     let released = logs.released(ixs, rec, &keys, cleaned).await?;
@@ -347,7 +368,9 @@ pub async fn received_key(
     }
     let cands = match planned(logs, rec, ixs).await? {
         Answer::Found(cands) => cands,
-        Answer::NotRetained { output, commit } => return Ok(Answer::NotRetained { output, commit }),
+        Answer::NotRetained { output, commit } => {
+            return Ok(Answer::NotRetained { output, commit })
+        }
     };
     let Some(c) = cands.into_iter().find(|c| *c.key == *key) else {
         return Ok(Answer::Found(None));
@@ -375,11 +398,8 @@ pub async fn history(
             if c <= floor && floor > 0 {
                 out.at_floor = Some(Ver::of(g.new_version(r)));
             } else {
-                out.changes.push((
-                    c,
-                    Ver::of(g.new_version(r)),
-                    Ver::of(g.replaced_version(r)),
-                ));
+                out.changes
+                    .push((c, Ver::of(g.new_version(r)), Ver::of(g.replaced_version(r))));
             }
         }
     })
@@ -400,7 +420,10 @@ pub struct Flow {
 }
 
 /// Flow per window of `bucket_ms`, oldest first, from `(time_ms, record)`.
-pub fn flow<'a>(records: impl IntoIterator<Item = (u64, &'a Record)>, bucket_ms: u64) -> Result<Vec<Flow>> {
+pub fn flow<'a>(
+    records: impl IntoIterator<Item = (u64, &'a Record)>,
+    bucket_ms: u64,
+) -> Result<Vec<Flow>> {
     if bucket_ms == 0 {
         return invalid("a flow window lasts at least a millisecond");
     }

@@ -421,10 +421,13 @@ impl ChangeIndex {
         q: &Query,
         mut on: impl FnMut(&Run),
     ) -> Result<Option<Vec<u8>>> {
-        check_layers(layers)?;
+        let bounds = check_layers(layers)?;
         let (lo, hi) = (*commits.start(), *commits.end());
         if lo > hi {
             return Ok(None);
+        }
+        if !(lo == 0 && hi == u64::MAX) {
+            at(lo.saturating_sub(1), (bounds.0, u64::MAX), "a window from")?;
         }
         let clears: Vec<u64> = layers
             .iter()
@@ -432,7 +435,9 @@ impl ChangeIndex {
             .filter(|c| commits.contains(c))
             .collect();
         if !clears.is_empty() {
-            return self.changes_with(layers, commits, &clears, keys, q, on).await;
+            return self
+                .changes_with(layers, commits, &clears, keys, q, on)
+                .await;
         }
         let from = lo.saturating_sub(1);
         let all_at_once = keys.is_some();

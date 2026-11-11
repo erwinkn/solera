@@ -155,7 +155,10 @@ impl Record {
             ),
             t => return format(format!("keys tag {t}")),
         };
-        if keys.as_ref().is_some_and(|ks| ks.windows(2).any(|w| w[0] >= w[1])) {
+        if keys
+            .as_ref()
+            .is_some_and(|ks| ks.windows(2).any(|w| w[0] >= w[1]))
+        {
             return format("key list out of order");
         }
         let waiting = (0..d.count()?)
