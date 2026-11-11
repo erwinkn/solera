@@ -313,6 +313,9 @@ async def test_deploys_at_every_await(tmp_path, monkeypatch, seed):
             await s.settle(h.rng.choice([0.05, 0.2]))
         h.armed = False
         await s.settle(1.0)
+        # The history started with the producer stopped midway and proceed is refused, so its readers
+        # hold until a run of it completes; one may have failed on a deploy (its worker's project).
+        await s.run(h.variant["name"], mode="full")
         for run in runs:
             try:
                 await s.wait(run, 30)
