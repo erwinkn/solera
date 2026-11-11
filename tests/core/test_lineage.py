@@ -100,6 +100,14 @@ def test_a_record_its_input_no_longer_recomputes_to_is_an_error(tally, tmp_path)
         lineage_trace(t, b"items", "k1", [(first, None)])
 
 
+def test_a_record_past_its_output_head_is_an_error(tally, tmp_path):
+    _, _, _, first = tally
+    t = Tracking()
+    t.attach(b"items", ChangeIndex(f"file://{tmp_path}/empty"))
+    with pytest.raises(ValueError, match="whose index ends at 0"):
+        lineage_input(t, first)
+
+
 def test_a_key_trace_alternates_history_and_the_batches_that_held_it(tally):
     t, _, _, first = tally
     second = batch(t)

@@ -11,7 +11,7 @@
 //! input's index no longer answers at is `NotRetained`; a version that
 //! cleanup has released is marked deleted.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use solera_index::{LayerRef, Query};
 
@@ -115,8 +115,8 @@ impl Logs {
     /// at: its head, each `At` piece of the slice it replaced (without a
     /// reset) and, for a held piece, the consumer's own head at plan. Every
     /// piece counts whatever the mode, though a key list reads only its keys'
-    /// pieces: cleanup keeps whole replaced slices (§13), so the rule is the
-    /// record's, not the plan's. A commit past an output's head is an error:
+    /// pieces: the cut keeps every commit a retained record names (§13), so
+    /// the rule is the record's, not the plan's. A commit past an output's head is an error:
     /// that is not the index the batch read.
     fn gone<T>(&self, rec: &Record) -> Result<Option<Answer<T>>> {
         let pieces = if rec.reset { &[][..] } else { &rec.replaced.pieces[..] };
@@ -197,7 +197,7 @@ impl Logs {
         }
         ixs.index(&rec.output)?
             .window_keys_with(&self.input, rec.head + 1..=head, keys, &Query::default(), |g| {
-                let rows: Vec<(u64, Ver, Ver)> = g
+                let mut rows: Vec<(u64, Ver, Ver)> = g
                     .rows(0)
                     .map(|r| {
                         (
@@ -207,16 +207,15 @@ impl Logs {
                         )
                     })
                     .collect();
-                let vs: Vec<Ver> = rows
-                    .iter()
-                    .filter(|(c, new, was)| {
-                        *c <= cleaned
-                            && was != new
-                            && !was.is_absent()
-                            && !rows.iter().any(|(later, v, _)| later > c && v == was)
-                    })
-                    .map(|(_, _, was)| was.clone())
-                    .collect();
+                rows.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+                let mut written_later = HashSet::new();
+                let mut vs = vec![];
+                for (c, new, was) in rows {
+                    if c <= cleaned && was != new && !was.is_absent() && !written_later.contains(&was) {
+                        vs.push(was);
+                    }
+                    written_later.insert(new);
+                }
                 if !vs.is_empty() {
                     out.insert(g.key(0).into(), vs);
                 }
@@ -271,16 +270,10 @@ fn received(rec: &Record, c: Cand, released: &BTreeMap<Key, Vec<Ver>>) -> Receiv
     }
 }
 
-/// What batch `rec` received (HIS-7), key by key: its planned keys
-/// recomputed from its record and checked against its digest, then its
-/// marks. `cleaned` is the input's cleanup cursor (0 before any
-/// cleanup). A digest that does not match is an error naming the batch.
-pub async fn input(
-    logs: &Logs,
-    rec: &Record,
-    ixs: &dyn Indexes,
-    cleaned: u64,
-) -> Result<Answer<Vec<Received>>> {
+/// The batch's planned keys, recomputed from its record and checked
+/// against its digest. A digest that does not match is an error naming the
+/// batch.
+async fn planned(logs: &Logs, rec: &Record, ixs: &dyn Indexes) -> Result<Answer<Vec<Cand>>> {
     check(rec)?;
     if let Some(gone) = logs.gone(rec)? {
         return Ok(gone);
@@ -306,6 +299,23 @@ pub async fn input(
             rec.digest
         ));
     }
+    Ok(Answer::Found(cands))
+}
+
+/// What batch `rec` received (HIS-7), key by key: its planned keys
+/// recomputed from its record and checked against its digest, then its
+/// marks. `cleaned` is the input's cleanup cursor (0 before any
+/// cleanup).
+pub async fn input(
+    logs: &Logs,
+    rec: &Record,
+    ixs: &dyn Indexes,
+    cleaned: u64,
+) -> Result<Answer<Vec<Received>>> {
+    let cands = match planned(logs, rec, ixs).await? {
+        Answer::Found(cands) => cands,
+        Answer::NotRetained { output, commit } => return Ok(Answer::NotRetained { output, commit }),
+    };
     let keys: Vec<&[u8]> = cands.iter().map(|c| &c.key[..]).collect();
     let released = logs.released(ixs, rec, &keys, cleaned).await?;
     Ok(Answer::Found(
@@ -318,8 +328,9 @@ pub async fn input(
 
 /// What batch `rec` received of `key` (the key trace, §12): None when the
 /// batch did not take it. A key outside the batch's range or key list, or one
-/// it left out, needs no read; otherwise the batch's input is recomputed and
-/// checked against its digest, as `input` does, at one plan's cost.
+/// it left out, needs no read; otherwise the batch's planned keys are
+/// recomputed and checked against its digest, as `input` does, at one
+/// plan's cost, and only `key` is read for what cleanup released.
 pub async fn received_key(
     logs: &Logs,
     rec: &Record,
@@ -327,7 +338,6 @@ pub async fn received_key(
     ixs: &dyn Indexes,
     cleaned: u64,
 ) -> Result<Answer<Option<Received>>> {
-    check(rec)?;
     let listed = rec
         .keys
         .as_ref()
@@ -335,10 +345,15 @@ pub async fn received_key(
     if !rec.range.contains(key) || !listed || Left::of(rec).0.contains(key) {
         return Ok(Answer::Found(None));
     }
-    Ok(match input(logs, rec, ixs, cleaned).await? {
-        Answer::Found(rows) => Answer::Found(rows.into_iter().find(|r| *r.key == *key)),
-        Answer::NotRetained { output, commit } => Answer::NotRetained { output, commit },
-    })
+    let cands = match planned(logs, rec, ixs).await? {
+        Answer::Found(cands) => cands,
+        Answer::NotRetained { output, commit } => return Ok(Answer::NotRetained { output, commit }),
+    };
+    let Some(c) = cands.into_iter().find(|c| *c.key == *key) else {
+        return Ok(Answer::Found(None));
+    };
+    let released = logs.released(ixs, rec, &[key], cleaned).await?;
+    Ok(Answer::Found(Some(received(rec, c, &released))))
 }
 
 /// Every retained change of `key` on an output (the key trace's first step):

@@ -40,7 +40,7 @@ pub struct Record {
     /// The progress the batch replaced: its range's slice, or with a reset all of it.
     pub replaced: Slice,
     /// Sorted by key: every key the batch did not load as planned and
-    /// settle (§7, "Points written"), whether or not progress needed a point
+    /// settle (§7, Marks), whether or not progress needed a point
     /// for it.
     pub marks: Vec<(Key, Mark)>,
     /// Keys by class: added, updated, removed, unchanged.

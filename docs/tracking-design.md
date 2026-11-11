@@ -1683,15 +1683,16 @@ Called from Python as `lineage_input`, `lineage_trace` and `lineage_flow`
 - **Not retained** when a commit the record names (its head, each `At`
   piece of its replaced slice without a reset, the consumer's own head for
   a `held` piece) is below the floor of that output's index. A key list
-  reads only its keys' pieces, but cleanup keeps whole replaced slices
-  (above), so the rule is the record's. A named commit past the output's
+  reads only its keys' pieces, but the cut keeps every commit a retained
+  record names (§13), so the rule is the record's. A named commit past the output's
   head is an error.
 - **Deleted** when a commit after the batch's head and at or below the
   cleanup cursor replaced the version the batch read (the one loaded where
   it deviated), and no later commit wrote that version again. This assumes
   cleanup never deletes a version a later commit wrote again (B9). It
   reads the batch's keys from its head to the output's, so with cleanup
-  past the batch it costs a second read of the batch's keys.
+  past the batch it costs a second read of the batch's keys; the trace
+  reads only its key.
 - **Flow** per window of time comes from each record's counts: batches,
   full runs, keys by class.
 

@@ -588,6 +588,7 @@ impl World {
         report: &InputReport,
         held: &[Key],
     ) {
+        assert_eq!(&solera_tracking::record::Record::decode(&rec.encode()).unwrap(), rec);
         let got = lineage::input(&self.t.logs(rec, None), rec, &OneIndex(ix), 0)
             .await
             .unwrap();

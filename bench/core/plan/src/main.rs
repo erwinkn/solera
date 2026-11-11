@@ -157,7 +157,14 @@ fn layers(a: &Args, dir: &std::path::Path) -> (Vec<LayerRef>, u64) {
         let mut d = Dec::new(&bytes);
         let head = d.uv().unwrap();
         let n = d.count().unwrap();
-        let layers = (0..n).map(|_| d.layer().unwrap()).collect();
+        let layers: Vec<LayerRef> = (0..n).map(|_| d.layer().unwrap()).collect();
+        let split = a.get::<usize>("layers", 0);
+        assert!(
+            split == 0 || layers.len() == split,
+            "{} holds {} layers, not {split}: use one dir per layer count",
+            dir.display(),
+            layers.len()
+        );
         return (layers, head);
     }
     std::fs::create_dir_all(dir).unwrap();
@@ -189,6 +196,11 @@ fn layers(a: &Args, dir: &std::path::Path) -> (Vec<LayerRef>, u64) {
     let mut sch = sched::schedule(&counts, LOAD, |c| live[c as usize], per_day, 7, Some(LOAD));
     let head = w.commits.len() as u64 - 1;
     let split = a.get::<u64>("layers", 0);
+    assert!(
+        split <= head - LOAD,
+        "at most {} layers after the load",
+        head - LOAD
+    );
     if split > 0 {
         let one = |lo: u64, hi: u64| sched::Spec {
             lo,
