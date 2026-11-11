@@ -1684,3 +1684,339 @@ fn a_key_held_back_at_commit_is_recorded_apart_from_one_the_planner_held_back() 
         );
     });
 }
+
+// Strict xfails (round 7 of #49): each test fails today and must keep
+// failing until ERW-34 lands; then drop its `should_panic`. An output's life
+// is given at its first commit, so a plan made before it names life 0 and the
+// commit infers the life its batch loaded from the state now (ERW-34 starts
+// the life when the output is first named and requires the plan's life at
+// commit). A refused commit counts as the fixed answer.
+
+/// A batch plans at its input's head 0, loads what the first commit wrote,
+/// then the input leaves the edge (path 0: a retarget and back; 1: close,
+/// retire, reopen with the same held progress; 2: a reset of the owner of a
+/// per-key record output another edge reads) and starts again. The commit
+/// is accepted and the record does not answer retired (Astra, R7-A1; Sol,
+/// R7-2).
+async fn r7_load_then_remove_input(ix: &ChangeIndex, path: u8, restart_before_commit: bool) {
+    use solera_tracking::outcomes::{output_id, FAILURES};
+    use solera_tracking::progress::EdgeRename;
+
+    let mut t = Tracking::new();
+    let mut own = Log::new("own");
+    own.commit(ix, &mut t, [(key("k"), Ver::Int(90))].into())
+        .await;
+    let input = if path == 2 {
+        output_id(FAILURES, b"owner")
+    } else {
+        key("items")
+    };
+    let name = std::str::from_utf8(&input).unwrap();
+    if path == 2 {
+        apply(
+            &mut t,
+            vec![Part::EdgeOpen(EdgeOpen {
+                edge: key("owner"),
+                input: key("source"),
+                keyed: true,
+            })],
+        );
+    }
+    let open = Part::EdgeOpen(EdgeOpen {
+        edge: key("e"),
+        input: input.clone(),
+        keyed: true,
+    });
+    let held = Part::Reset(Reset {
+        edge: key("e"),
+        held: true,
+    });
+    apply(&mut t, vec![open.clone()]);
+    apply(&mut t, vec![held.clone()]);
+    let req = held_plan_request();
+    let p = plan::plan(&t.view(&req).unwrap(), &req, &OneIndex(ix), &plan::NoHold)
+        .await
+        .unwrap();
+    assert_eq!(
+        (p.inputs[0].head, p.inputs[0].life, p.inputs[0].keys.len()),
+        (0, 0, 1)
+    );
+    let mut items = Log::new("probe-input");
+    let mut staging = Tracking::new();
+    items
+        .commit(ix, &mut staging, [(key("k"), Ver::Int(10))].into())
+        .await;
+    apply(&mut t, vec![commit_part(name, &items.layers[0], 1)]);
+    let loaded_life = t.outputs[&input].life;
+    let loaded = InputReport {
+        failed: vec![],
+        loaded: vec![(key("k"), Ver::Int(10))],
+    };
+    match path {
+        0 => {
+            apply(
+                &mut t,
+                vec![Part::EdgeRename(EdgeRename {
+                    from: key("e"),
+                    to: key("e"),
+                    input: key("parking"),
+                })],
+            );
+            apply(
+                &mut t,
+                vec![Part::Retire(Retire {
+                    output: input.clone(),
+                })],
+            );
+            apply(
+                &mut t,
+                vec![Part::EdgeRename(EdgeRename {
+                    from: key("e"),
+                    to: key("e"),
+                    input: input.clone(),
+                })],
+            );
+        }
+        1 => {
+            apply(&mut t, vec![Part::EdgeClose(EdgeClose { edge: key("e") })]);
+            apply(
+                &mut t,
+                vec![Part::Retire(Retire {
+                    output: input.clone(),
+                })],
+            );
+            apply(&mut t, vec![open]);
+            apply(&mut t, vec![held]);
+        }
+        2 => {
+            apply(
+                &mut t,
+                vec![Part::Reset(Reset {
+                    edge: key("owner"),
+                    held: false,
+                })],
+            );
+            assert_eq!(t.edges[b"e".as_slice()].input, input);
+        }
+        _ => unreachable!(),
+    }
+    assert!(!t.outputs.contains_key(&input));
+    let mut next = Log {
+        files: items.files,
+        ..Log::new("probe-input")
+    };
+    if restart_before_commit {
+        next.commit(ix, &mut staging, [(key("k"), Ver::Int(20))].into())
+            .await;
+        apply(&mut t, vec![commit_part(name, &next.layers[0], 1)]);
+    }
+    let before = t.snapshot();
+    let ops = match t.progress_ops(&p, &[loaded], b"r7/batch", None) {
+        Err(_) => {
+            assert_eq!(before, t.snapshot());
+            return;
+        }
+        Ok(ops) => ops,
+    };
+    apply(&mut t, ops.parts.clone());
+    let rec = &ops.records[0];
+    let answer = lineage::input(&t.logs(rec, Some(b"own")), rec, &OneIndex(ix), 0)
+        .await
+        .unwrap();
+    eprintln!(
+        "path={path}, loaded life {loaded_life}, record life {}: {answer:?}",
+        rec.life
+    );
+    if restart_before_commit {
+        use solera_tracking::retain::{Cleaned, Track};
+        apply(
+            &mut t,
+            vec![Part::Track(Track {
+                output: input.clone(),
+                at: 1,
+            })],
+        );
+        next.commit(ix, &mut staging, [(key("k"), Ver::Int(10))].into())
+            .await;
+        apply(&mut t, vec![commit_part(name, &next.layers[1], 1)]);
+        next.commit(ix, &mut staging, [(key("k"), Ver::Int(30))].into())
+            .await;
+        apply(&mut t, vec![commit_part(name, &next.layers[2], 1)]);
+        let life = t.outputs[&input].life;
+        apply(
+            &mut t,
+            vec![Part::Cleaned(Cleaned {
+                output: input.clone(),
+                life,
+                from: 1,
+                to: 3,
+            })],
+        );
+        let after_cleanup = lineage::input(&t.logs(rec, Some(b"own")), rec, &OneIndex(ix), 3)
+            .await
+            .unwrap();
+        eprintln!("path={path}, after cleanup of the next life: {after_cleanup:?}");
+    }
+    assert_eq!(
+        answer,
+        Answer::Retired { output: input },
+        "a load of a retired life is not answered retired (strict xfail, ERW-34)"
+    );
+}
+
+#[test]
+#[should_panic(expected = "ERW-34")]
+fn r7_head_zero_load_survives_retarget_retire_and_return() {
+    let rt = runtime();
+    let ix = index(&rt);
+    rt.block_on(r7_load_then_remove_input(&ix, 0, false));
+}
+
+#[test]
+#[should_panic(expected = "ERW-34")]
+fn r7_head_zero_load_survives_close_retire_reopen() {
+    let rt = runtime();
+    let ix = index(&rt);
+    rt.block_on(r7_load_then_remove_input(&ix, 1, true));
+}
+
+#[test]
+#[should_panic(expected = "ERW-34")]
+fn r7_record_output_reset_drops_an_active_readers_input() {
+    let rt = runtime();
+    let ix = index(&rt);
+    rt.block_on(r7_load_then_remove_input(&ix, 2, true));
+}
+
+/// An unkeyed plan checks only the consumed counter, not its input's life:
+/// a plan made before the input was retired and started again commits, and
+/// the new input reads as consumed (Astra, R7-A2; older than #49, and the
+/// same on main). ERW-34's plan life covers unkeyed plans too.
+#[test]
+#[should_panic(expected = "ERW-34")]
+fn r7_preexisting_unkeyed_plan_crosses_input_restart() {
+    let rt = runtime();
+    let ix = index(&rt);
+    rt.block_on(async {
+        let mut t = Tracking::new();
+        let mut input = Log::new("items");
+        input
+            .commit(&ix, &mut t, [(key("k"), Ver::Int(10))].into())
+            .await;
+        input
+            .commit(&ix, &mut t, [(key("k"), Ver::Int(20))].into())
+            .await;
+        let open = Part::EdgeOpen(EdgeOpen {
+            edge: key("u"),
+            input: key("items"),
+            keyed: false,
+        });
+        apply(&mut t, vec![open.clone()]);
+        let req = Request {
+            inputs: vec![],
+            unkeyed: vec![key("u")],
+            ..held_plan_request()
+        };
+        let p = plan::plan(&t.view(&req).unwrap(), &req, &OneIndex(&ix), &plan::NoHold)
+            .await
+            .unwrap();
+        assert_eq!((p.unkeyed[0].head, p.unkeyed[0].through), (2, 0));
+        apply(&mut t, vec![Part::EdgeClose(EdgeClose { edge: key("u") })]);
+        apply(
+            &mut t,
+            vec![Part::Retire(Retire {
+                output: key("items"),
+            })],
+        );
+        let mut next = Log {
+            files: input.files,
+            ..Log::new("items")
+        };
+        next.commit(&ix, &mut t, [(key("k"), Ver::Int(30))].into())
+            .await;
+        apply(&mut t, vec![open]);
+        let Ok(ops) = t.progress_ops(&p, &[], b"stale", None) else {
+            return;
+        };
+        assert!(ops.records.is_empty());
+        apply(&mut t, ops.parts);
+        let now = plan::plan(&t.view(&req).unwrap(), &req, &OneIndex(&ix), &plan::NoHold)
+            .await
+            .unwrap();
+        assert!(
+            now.unkeyed[0].owed(),
+            "the restarted input was never consumed (strict xfail, ERW-34): {:?}",
+            now.unkeyed
+        );
+    });
+}
+
+/// The input's first commit is in the batch's own event: the record reads
+/// the state before that event and names life 0, so retiring the input
+/// does not answer retired (Sol, R7-1).
+#[test]
+#[should_panic(expected = "ERW-34")]
+fn r7_a_first_input_commit_in_the_batch_event_names_its_life() {
+    let rt = runtime();
+    let ix = index(&rt);
+    rt.block_on(async {
+        let mut t = Tracking::new();
+        let mut own = Log::new("own");
+        own.commit(&ix, &mut t, [(key("k"), Ver::Int(90))].into())
+            .await;
+        apply(
+            &mut t,
+            vec![Part::EdgeOpen(EdgeOpen {
+                edge: key("e"),
+                input: key("items"),
+                keyed: true,
+            })],
+        );
+        apply(
+            &mut t,
+            vec![Part::Reset(Reset {
+                edge: key("e"),
+                held: true,
+            })],
+        );
+        let req = held_plan_request();
+        let p = plan::plan(&t.view(&req).unwrap(), &req, &OneIndex(&ix), &plan::NoHold)
+            .await
+            .unwrap();
+        assert_eq!(
+            (p.inputs[0].head, p.inputs[0].life, p.inputs[0].keys.len()),
+            (0, 0, 1)
+        );
+        let mut staging = Tracking::new();
+        let mut items = Log::new("items");
+        items
+            .commit(&ix, &mut staging, [(key("k"), Ver::Int(10))].into())
+            .await;
+        let report = InputReport {
+            failed: vec![],
+            loaded: vec![(key("k"), Ver::Int(10))],
+        };
+        let mut ops = t.progress_ops(&p, &[report], b"run/batch", None).unwrap();
+        ops.parts.push(commit_part("items", &items.layers[0], 1));
+        apply(&mut t, ops.parts);
+        let rec = &ops.records[0];
+        apply(&mut t, vec![Part::EdgeClose(EdgeClose { edge: key("e") })]);
+        apply(
+            &mut t,
+            vec![Part::Retire(Retire {
+                output: key("items"),
+            })],
+        );
+        let got = lineage::input(&t.logs(rec, Some(b"own")), rec, &OneIndex(&ix), 0)
+            .await
+            .unwrap();
+        assert_eq!(
+            got,
+            Answer::Retired {
+                output: key("items")
+            },
+            "the record names life {} (strict xfail, ERW-34)",
+            rec.life
+        );
+    });
+}

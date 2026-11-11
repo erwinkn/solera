@@ -1680,7 +1680,11 @@ Called from Python as `lineage_input`, `lineage_trace` and `lineage_flow`
   reads it and the commit refuses a plan of another life. It stores the
   own output's life as the plan read it (`own_life`; `RECORD_FORMAT` 4).
   A cleanup step names the output's life (§13). This is the identity the
-  engine keys an output's persisted facts by.
+  engine keys an output's persisted facts by. Its assignment rule is
+  incomplete and tracked in ERW-34: a plan made before its input's first
+  commit names life 0, so a retire and restart before the commit, or that
+  first commit in the batch's own event, can make a record name the wrong
+  life (the strict xfails `r7_*` in `tests/histories.rs`).
 - **Retired** when a life the record names (0 names none: nothing of that
   output was read) is not the output's life now: the output was retired
   since, and its new life's commits are other versions under the same
