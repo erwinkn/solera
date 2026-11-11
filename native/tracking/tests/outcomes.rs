@@ -2484,6 +2484,35 @@ fn a_held_back_key_keeps_its_record() {
     });
 }
 
+/// The untaken keys are found by merging sorted lists, so a plan whose keys
+/// are out of order or repeated is refused rather than misread.
+#[test]
+fn a_plan_whose_keys_are_not_sorted_and_distinct_is_refused() {
+    let rt = runtime();
+    let ix = index(&rt);
+    rt.block_on(async {
+        let mut w = scripted();
+        w.input(&ix, &[("k1", 5), ("k2", 5)]).await;
+        let p = w.planned(&ix, None, 10, Mode::Incremental).await;
+        assert_eq!(taken(&p), [key("k1"), key("k2")]);
+        let report = || InputReport {
+            failed: vec![],
+            loaded: vec![],
+        };
+        assert!(w.t.progress_ops(&p, &[report()], b"", None).is_ok());
+        let mut swapped = p.clone();
+        swapped.inputs[0].keys.swap(0, 1);
+        let mut repeated = p.clone();
+        repeated.inputs[0].keys[1] = repeated.inputs[0].keys[0].clone();
+        for bad in [swapped, repeated] {
+            let err = w.t.progress_ops(&bad, &[report()], b"", None).unwrap_err();
+            assert!(err
+                .to_string()
+                .contains("a plan's keys are sorted and distinct"));
+        }
+    });
+}
+
 /// A retry batch whose only key B3 holds back (D205) still moves its pass
 /// on, and the key's record stays as it is, so the pass ends covering a
 /// deploy the key was not retried under. The key gets that retry all the
