@@ -465,11 +465,13 @@ impl Rows {
     /// (`encode_changes`), a part at a time: the header, then the blocks of
     /// each `size` changes in key order — every key of the write an upsert,
     /// carrying `word` when given, and `removes` merged among them. A key
-    /// both written and removed is a `ValueError`.
+    /// removed twice, both written and removed, or not UTF-8 text is a
+    /// `ValueError`, and the iterator ends there.
     #[pyo3(signature = (removes, word=None, size=65536))]
     fn changes(
         &self,
-        removes: Vec<Bound<'_, PyAny>>,
+        py: Python<'_>,
+        removes: &Bound<'_, PyAny>,
         word: Option<String>,
         size: usize,
     ) -> PyResult<ChangeBlocks> {
@@ -478,13 +480,16 @@ impl Rows {
                 return Err(PyValueError::new_err("a block holds at least one change"));
             }
             let mut removes = removes
-                .iter()
-                .map(|k| {
-                    let mut b = Vec::new();
-                    row_key(k, &mut b).map(|()| b)
-                })
+                .try_iter()?
+                .map(|k| k?.extract::<String>())
                 .collect::<PyResult<Vec<_>>>()?;
-            removes.sort_unstable();
+            py.detach(|| removes.sort_unstable());
+            if let Some(w) = removes.windows(2).find(|w| w[0] == w[1]) {
+                return Err(PyValueError::new_err(format!(
+                    "{:?} is removed twice",
+                    w[0]
+                )));
+            }
             Ok(ChangeBlocks {
                 cursor: Cursor::new(self.table.clone()),
                 held: false,
@@ -494,6 +499,7 @@ impl Rows {
                 word,
                 size,
                 started: false,
+                done: false,
             })
         })
     }
@@ -667,11 +673,13 @@ struct ChangeBlocks {
     held: bool,
     /// The cursor has read its last key.
     read: bool,
-    removes: Vec<Vec<u8>>,
+    removes: Vec<String>,
     next: usize,
     word: Option<String>,
     size: usize,
     started: bool,
+    /// Every block is out, or one failed.
+    done: bool,
 }
 
 impl ChangeBlocks {
@@ -684,8 +692,22 @@ impl ChangeBlocks {
                 self.held = self.cursor.read().map_err(to_py)?;
                 self.read = !self.held;
             }
-            let removed = self.removes.get(self.next).map(Vec::as_slice);
+            let removed = self.removes.get(self.next).map(String::as_bytes);
             let written = self.held.then(|| self.cursor.entry().0);
+            if let Some(k) = written {
+                if std::str::from_utf8(k).is_err() {
+                    return Err(PyValueError::new_err(format!(
+                        "{:?}: a changed key is UTF-8 text",
+                        String::from_utf8_lossy(k)
+                    )));
+                }
+                if removed == Some(k) {
+                    return Err(PyValueError::new_err(format!(
+                        "{:?} is both written and removed",
+                        String::from_utf8_lossy(k)
+                    )));
+                }
+            }
             let (key, change) = match (written, removed) {
                 (None, None) => break,
                 (Some(k), None) => (k, Change::Upsert(word)),
@@ -701,7 +723,7 @@ impl ChangeBlocks {
         if changes.is_empty() {
             return Ok(None);
         }
-        Ok(Some(changes.encode()[MAGIC.len()..].to_vec()))
+        Ok(Some(changes.encode()))
     }
 }
 
@@ -717,8 +739,12 @@ impl ChangeBlocks {
                 self.started = true;
                 return Ok(Some(PyBytes::new(py, &MAGIC)));
             }
-            let block = py.detach(|| self.block())?;
-            Ok(block.map(|b| PyBytes::new(py, &b)))
+            if self.done {
+                return Ok(None);
+            }
+            let block = py.detach(|| self.block());
+            self.done = !matches!(block, Ok(Some(_)));
+            Ok(block?.map(|b| PyBytes::new(py, &b[MAGIC.len()..])))
         })
     }
 }

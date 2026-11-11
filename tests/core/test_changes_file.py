@@ -102,15 +102,26 @@ def test_a_change_names_each_key_once_in_byte_order():
         encode_changes({"7": "w"}, ["a"])[n:],
         encode_changes({"b": "w"}, ["c"])[n:],
     ]
-    with pytest.raises(ValueError, match="repeats"):
-        b"".join(rows.changes(["b"]))
-    with pytest.raises(ValueError, match="repeats"):
-        b"".join(rows.changes(["a", "a"]))
+    for removes, size in [(["b"], 64), (["b"], 1), (["a", "a"], 64)]:
+        with pytest.raises(ValueError, match="both written and removed|removed twice"):
+            b"".join(rows.changes(removes, size=size))
+    with pytest.raises(ValueError, match="removed twice"):
+        Rows.records([], "id").changes(["a", "a"], size=1)
     with pytest.raises(ValueError, match="at least one"):
         rows.changes([], size=0)
-    with pytest.raises(ValueError, match="str or an int"):
+    with pytest.raises(TypeError):
         rows.changes([None])
-    # A key that is not valid UTF-8 is its key_bytes, written or removed alike.
-    lone = Rows.records([{"id": "\udcff"}], "id")
-    data = b"".join(lone.changes(["\udcfe", "z"]))
-    assert b"\xfe" in data and b"\xff" in data
+    assert b"".join(rows.changes(iter({"c", "a"}), "w")) == encode_changes({"7": "w", "b": "w"}, ["a", "c"])
+    # A failed iterator ends: it never hands out the blocks after the one that failed.
+    blocks = Rows.records([{"id": k} for k in "abc"], "id").changes(["b"], size=4)
+    next(blocks)
+    with pytest.raises(ValueError, match="both written and removed"):
+        next(blocks)
+    assert list(blocks) == []
+    # A key that is not UTF-8 text is refused, written or removed, as encode_changes refuses it.
+    with pytest.raises(ValueError, match="UTF-8"):
+        b"".join(Rows.records([{"id": "\udcff"}], "id").changes([]))
+    with pytest.raises(UnicodeEncodeError):
+        Rows.records([], "id").changes(["\udcfe"])
+    with pytest.raises(UnicodeEncodeError):
+        encode_changes(["\udcff"])
