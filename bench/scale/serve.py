@@ -7,8 +7,13 @@ loop timed. run.py starts it, pinned to the engine's CPUs.
 
 Every second it appends a line to `$SCALE_ROOT/engine.jsonl`: the loop's busy
 and idle seconds so far, its longest iteration since the last line (a stall:
-nothing else ran on the loop meanwhile), and the process's CPU seconds and
-resident memory. The API token is `$SOLERA_API_TOKEN`."""
+nothing else ran on the loop meanwhile), the process's CPU seconds and
+resident memory, and the CPU seconds so far of native work on threads
+(`in_thread`: the core's plans and commit builds, the index's reads), by the
+part of the engine that awaited it (run.py's `BUCKETS`, matched against the
+awaiting stack as py-spy would write it). A sampler sees such a thread's stack
+end where the native call starts, so only this says whose work it was. The
+API token is `$SOLERA_API_TOKEN`."""
 
 from __future__ import annotations
 
@@ -18,8 +23,11 @@ import os
 import resource
 import sys
 import time
+import traceback
+from collections import defaultdict
 from pathlib import Path
 
+import solera.threads
 import uvicorn
 from solera_server.api import create_app
 from solera_server.engine import Engine
@@ -27,9 +35,40 @@ from solera_server.executors.local import load_manifest
 from solera_server.state import State
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from run import BUCKETS  # noqa: E402
+
 from tests.contract.harness import engine_options, state_options  # noqa: E402
 
 ROOT = Path(os.environ.get("SCALE_ROOT", ".solera/scale"))
+THREADS: defaultdict[str, float] = defaultdict(float)  # thread CPU seconds by BUCKETS part
+_in_thread = solera.threads.in_thread
+_PREFIXES = sorted({p.rstrip("/") + "/" for p in sys.path if p}, key=len, reverse=True)
+
+
+def _short(filename: str) -> str:
+    return next((filename[len(p) :] for p in _PREFIXES if filename.startswith(p)), filename)
+
+
+async def in_thread(fn, /, *args, **kwargs):
+    """`solera.threads.in_thread`, its thread's CPU added to the awaiting part's."""
+
+    stack = ";".join(f"{f.name} ({_short(f.filename)}:{f.lineno})" for f in traceback.extract_stack())
+    part = next((b for b, patterns in BUCKETS if any(p in stack for p in patterns)), "other")
+
+    def timed(*a, **k):
+        start = time.thread_time()
+        try:
+            return fn(*a, **k)
+        finally:
+            THREADS[part] += time.thread_time() - start
+
+    return await _in_thread(timed, *args, **kwargs)
+
+
+for _module in list(sys.modules.values()):
+    if getattr(_module, "in_thread", None) is _in_thread:
+        _module.in_thread = in_thread
 
 
 class Loop:
@@ -71,6 +110,7 @@ class Loop:
                     "cpu": usage.ru_utime + usage.ru_stime,
                     "rss": _rss(),
                     "peak_rss": usage.ru_maxrss * 1024,
+                    "threads": dict(THREADS),
                 }
                 self.longest = 0.0
                 f.write(json.dumps(line) + "\n")

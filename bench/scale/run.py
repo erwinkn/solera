@@ -53,6 +53,9 @@ BUCKETS = (
     ("API", ("api.py", "starlette", "fastapi", "uvicorn", "pydantic", "h11")),
     ("upkeep", ("upkeep.py", "_cleanup", "merge")),
 )
+# A sampled stack on an executor thread: its native call has no frame of its
+# own, so serve.py times that work exactly (`threads`), by its awaiting part.
+THREAD = "(concurrent/futures/thread.py:"
 
 
 def key_of(i: int) -> str:
@@ -345,15 +348,19 @@ class Run:
             "workers": {f"{what}:{asset}": v for (what, asset), v in sorted(workers.items())},
             **extra,
         }
+        held, was = last.get("threads", {}), first.get("threads", {})
+        threads = {part: v - was.get(part, 0) for part, v in held.items()}
+        out["engine_thread_cpu_by_part_s"] = {k: round(v, 2) for k, v in threads.items() if v}
         breakdown = self.breakdown(name, engine_cpu)
         if breakdown:
-            out["engine_cpu_by_part_s"] = breakdown
-            if planning := breakdown.get("planning"):
+            out["engine_cpu_by_part_s"] = {k: round(v, 2) for k, v in breakdown.items()}
+            if planning := breakdown.get("planning", 0) + threads.get("planning", 0):
+                out["planning_cpu_s"] = round(planning, 2)
                 out["keys_per_planning_cpu_s"] = round(planned / planning)
+            commits = breakdown.get("building commits", 0) + threads.get("building commits", 0)
+            out["commit_cpu_s"] = round(commits, 2)
             if batches:
-                out["commit_cpu_ms_per_batch"] = round(
-                    1000 * breakdown.get("building commits", 0) / batches, 1
-                )
+                out["commit_cpu_ms_per_batch"] = round(1000 * commits / batches, 1)
         return out
 
     def worker_stats(self, lo: float, hi: float) -> dict:
@@ -371,7 +378,9 @@ class Run:
         return {k: {f: round(v, 2) for f, v in t.items()} for k, t in totals.items()}
 
     def breakdown(self, name: str, engine_cpu: float) -> dict | None:
-        """The phase's engine CPU split by `BUCKETS`, in proportion to py-spy's samples."""
+        """The phase's engine CPU split by `BUCKETS`, in proportion to py-spy's
+        samples; samples on executor threads are `threads`, whose split serve.py
+        measures. Unrounded: ratios are taken of it."""
 
         path = self.root / "profiles" / f"{name}.txt"
         if not path.exists():
@@ -379,12 +388,13 @@ class Run:
         samples: Counter = Counter()
         for line in path.read_text().splitlines():
             stack, _, count = line.rpartition(" ")
-            part = next((b for b, patterns in BUCKETS if any(p in stack for p in patterns)), "other")
+            if THREAD in stack:
+                part = "threads"
+            else:
+                part = next((b for b, patterns in BUCKETS if any(p in stack for p in patterns)), "other")
             samples[part] += int(count)
         total = sum(samples.values())
-        return (
-            {part: round(engine_cpu * n / total, 1) for part, n in samples.most_common()} if total else None
-        )
+        return {part: engine_cpu * n / total for part, n in samples.most_common()} if total else None
 
     # -- the run ---------------------------------------------------------------------
 
@@ -483,8 +493,14 @@ class Run:
             if live <= VERIFY:
                 ref = Ref.from_json(heads[name]["ref"])
                 rows = await project.stores[ref.store].load(ref, list, Keys(generations))
-                wrong[name] = sum(r["v"] != days[int(r["id"][1:])] for r in rows) + abs(
-                    len(rows) - len(generations)
+                held: dict = {}
+                for row in rows:
+                    wrong[name] = wrong.get(name, 0) + (row["id"] in held)  # a key's second row
+                    held[row["id"]] = row["v"]
+                wrong[name] = (
+                    wrong.get(name, 0)
+                    + len(held.keys() ^ generations.keys())
+                    + sum(v != days[int(k[1:])] for k, v in held.items() if k in generations)
                 )
         if live <= VERIFY:
             out["values_wrong"] = wrong
@@ -667,11 +683,17 @@ def report(results: dict) -> str:
         out.append(f"- {p['phase']}: {calls or 'none'}")
     parts = [p for p in phases if "engine_cpu_by_part_s" in p]
     if parts:
-        out += ["", "## Engine CPU by part (seconds, from py-spy samples)", ""]
+        out += ["", "## Engine CPU by part (seconds, from py-spy samples; `threads` is split below)", ""]
         out += [
             f"- {p['phase']}: " + ", ".join(f"{k} {v}" for k, v in p["engine_cpu_by_part_s"].items())
             for p in parts
         ]
+    out += ["", "## Engine CPU of native work on threads, by the part awaiting it (seconds, measured)", ""]
+    out += [
+        f"- {p['phase']}: "
+        + (", ".join(f"{k} {v}" for k, v in p.get("engine_thread_cpu_by_part_s", {}).items()) or "none")
+        for p in phases
+    ]
     return "\n".join(out) + "\n"
 
 
@@ -731,8 +753,8 @@ def parse() -> argparse.Namespace:
         parser.error("--change: from 0 to 0.5 (a day draws its changed keys from the live ones)")
     if not 0 <= args.adds <= 0.5:
         parser.error("--adds: from 0 to 0.5 (a day removes as many keys as it adds, from those it changes)")
-    if args.keys >= 10**9:
-        parser.error("--keys: under 1e9 (a key is k and nine digits)")
+    if args.keys + args.days * int(args.keys * args.change * args.adds) >= 10**9:
+        parser.error("--keys: with the keys the days add, under 1e9 (a key is k and nine digits)")
     return args
 
 

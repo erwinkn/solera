@@ -53,14 +53,15 @@ in the report measures the store's bytes.
 | keys_planned, keys_per_s | Keys the producers' batches planned (added, updated, removed and unchanged), from project.py stats; keys_per_s is over the phase's wall time |
 | rows_produced | Rows the producers were handed (removed keys have none) |
 | engine_cpu_ms_per_batch | engine_cpu_s over batches: the whole engine, source commits and the API included |
-| keys_per_planning_cpu_s, commit_cpu_ms_per_batch | With `--profile`: keys planned over the engine CPU py-spy puts in planning, and the CPU it puts in building commits over batches |
+| engine_thread_cpu_by_part_s | serve.py: the CPU of native work on threads (`in_thread`: the core's plans and commit builds, the index's reads), measured on the thread and added to the part of the engine that awaited it (`BUCKETS`, matched against the awaiting stack) |
+| planning_cpu_s, keys_per_planning_cpu_s, commit_cpu_s, commit_cpu_ms_per_batch | With `--profile`: planning's CPU is py-spy's share of the engine's own threads plus the measured thread CPU awaited by planning, and keys planned over it. Building commits is the same, over batches |
 | state_bytes_added, index_bytes_per_entry | Bytes added under the state, by directory. The change index is `scale/keys` (today) or `scale/core` (core); index_bytes_per_entry is its growth over the entries committed: source keys changed, plus each keyed output's keys written and removed |
 | attempts, attempt_steps_s | Sum of each attempt's lifecycle steps (preparing … settling), from the run's detail |
 | workers | Each producer and store call's wall and CPU seconds and key counts, from `stats/{pid}.jsonl`, tally's own load and write included |
-| engine_cpu_by_part_s | With `--profile`: the engine's CPU split by `BUCKETS` (journaling, source commits, building commits, planning, API, upkeep, other), in proportion to py-spy samples |
+| engine_cpu_by_part_s | With `--profile`: the engine's CPU split by `BUCKETS` (journaling, source commits, building commits, planning, API, upkeep, other), in proportion to py-spy samples. Samples on executor threads are `threads`: a native call there has no frame of its own, so a sample cannot say whose it is, and engine_thread_cpu_by_part_s splits it |
 
 `report.md` puts N1, N3, N7 and N9 (plans/build-plan.md) beside their thresholds. N3 and N7 need
-`--profile`: they are the CPU py-spy puts in planning and in building commits. Without it, the
+`--profile`: they are planning's and building commits' CPU, as described above. Without it, the
 report gives only the proxies, which are the whole run's wall time and the whole engine's CPU. It
 also shows the engine CPU of each full run against the six-minute target, and the engine's peak
 memory.
