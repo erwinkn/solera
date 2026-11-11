@@ -542,19 +542,29 @@ async def test_no_ddl_that_would_change_the_decision_runs_until_the_deciding_wri
     assert await store.full_run_ended(out, partition, 5, 5) is True
 
 
-@pytest.mark.parametrize("partition", [False, True])
+@pytest.mark.parametrize("partition", [False, True, "pending"])
 async def test_a_foreign_table_refuses_a_full_runs_first_write(store, partition):
     """Sol R1-L1, Astra R1-3: a build cannot stand in for a foreign table,
     whole or as a partition, and PostgreSQL cannot lock one: the run's first
     write is refused (`PublicationRefused`), as on main, not failed by the
-    lock."""
+    lock. So is the switch of a run left pending before the table was made
+    a foreign one (Sol R2-2, Astra R2-3)."""
 
-    out = output(key=None, **({"partition_column": "site"} if partition else {}))
+    out = output(
+        key="id" if partition == "pending" else None,
+        **({"partition_column": "site"} if partition is True else {}),
+    )
     table, _, _ = store._table(out)
     name = out.name
     sql(f"CREATE FOREIGN DATA WRAPPER {name} NO HANDLER")
     sql(f"CREATE SERVER {name} FOREIGN DATA WRAPPER {name}")
     try:
+        if partition == "pending":
+            await store.store([], None, at(out, 5, reset=True))
+            sql(f"CREATE FOREIGN TABLE {table} (id text, _version bigint) SERVER {name}")
+            with pytest.raises(PublicationRefused, match="foreign table"):
+                await store.full_run_ended(out, "", 5, 5)
+            return
         if partition:
             sql(f"CREATE TABLE {table} (v text, site text, _version bigint) PARTITION BY LIST (site)")
             sql(
@@ -569,6 +579,42 @@ async def test_a_foreign_table_refuses_a_full_runs_first_write(store, partition)
     finally:
         sql(f"DROP SERVER {name} CASCADE")
         sql(f"DROP FOREIGN DATA WRAPPER {name}")
+
+
+async def test_a_switch_held_open_holds_off_no_other_partitions_switch_or_deciding_write(store, monkeypatch):
+    """Astra R2-2, Sol R2-1: a switch runs for minutes at 100M rows. Held at
+    its DELETE, it holds the lock the DELETE takes and no stronger one, so
+    another partition's switch and another partition's deciding write go on."""
+
+    out = output(incremental=True, partition_column="site")
+    table, _, _ = store._table(out)
+    for p in ("p1", "p2", "p3"):
+        await store.store(rows(a="old"), None, at(out, 1, partition=p, builds=False))
+    for p in ("p1", "p2"):
+        await store.store(rows(a="new"), None, at(out, 5, reset=True, partition=p))
+    sql(f"DELETE FROM {table} WHERE site = 'p3'")
+    entered, release, delete = threading.Event(), threading.Event(), store._delete_slice
+
+    def held(cur, target, where):
+        if where.get("site") == "p1":
+            entered.set()
+            release.wait(10)
+        return delete(cur, target, where)
+
+    monkeypatch.setattr(store, "_delete_slice", held)
+    switch = threading.Thread(target=lambda: asyncio.run(store.full_run_ended(out, "p1", 5, 5)))
+    switch.start()
+    try:
+        assert entered.wait(5)
+        assert await asyncio.wait_for(store.full_run_ended(out, "p2", 5, 5), 5) is True
+        written = await asyncio.wait_for(
+            store.store(rows(c="3"), None, at(out, 5, reset=True, partition="p3")), 5
+        )
+        assert "build" not in written.ref.handle
+    finally:
+        release.set()
+        switch.join(10)
+    assert [outside(store, out, p) for p in ("p1", "p2", "p3")] == [{"a": "new"}, {"a": "new"}, {"c": "3"}]
 
 
 async def test_a_table_made_after_a_full_run_began_holding_its_rows_builds_beside(store, monkeypatch):

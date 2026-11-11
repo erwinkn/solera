@@ -560,7 +560,20 @@ def test_a_new_full_runs_clear_is_not_the_filling_runs_write():
     assert out.filling == 1 and out.loose == {} and list(out.builds) == [2]
     assert w.outsiders(w.copy) is None
     out.published.update(out.builds[2])
-    assert "outsiders read copy as" in w.outsiders(w.copy)
+    assert "outsiders read copy as" in (w.outsiders(w.copy) or "")
+
+
+def test_only_a_key_the_filling_run_left_uncommitted_is_excused():
+    """Astra R2-1: a key no uncommitted write in place touched is never
+    excused, a missing row included: the rows of a published run, all
+    deleted, are caught."""
+    w = oracle.replay_fullrun(
+        [("items", (("k1", True), ("k2", True))), ("step", "copy", 2), ("switch", "copy", True)], kind="table"
+    )
+    out = w.copy.output
+    assert out.loose == {} and w.outsiders(w.copy) is None
+    out.published.clear()
+    assert "outsiders read copy as" in (w.outsiders(w.copy) or "")
 
 
 def test_a_release_publishes_the_partial_output():

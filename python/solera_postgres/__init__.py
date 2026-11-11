@@ -1026,7 +1026,10 @@ class PostgresStore:
                         # The lock the DELETE takes, on every partition, first: no trigger, rule, policy or
                         # partition can be added or enabled until this commits, so the catalog read next
                         # (READ COMMITTED: as it is now) is the one the rows meet.
-                        cur.execute(f"LOCK TABLE {table} IN SHARE UPDATE EXCLUSIVE MODE")
+                        try:
+                            cur.execute(f"LOCK TABLE {table} IN ROW EXCLUSIVE MODE")
+                        except psycopg.errors.WrongObjectType as e:  # a foreign table
+                            raise self._unbuildable(output, partition, table) from e
                         self._refuse_unbuildable(cur, output, partition, table)
                         self._delete_slice(cur, table, {column: partition} if column else {})
                     if run in found["builds"]:
@@ -1061,11 +1064,14 @@ class PostgresStore:
 
     def _refuse_unbuildable(self, cur, output, partition, table) -> None:
         if cur.execute(_UNBUILDABLE_NOW, {"t": table}).fetchone()["unbuildable"]:
-            raise PublicationRefused(
-                f"{output.name} {partition!r}: {table} {_UNBUILDABLE_WHY}, since the full run began: "
-                "publishing would publish rows other than the ones Solera has read, so the published rows "
-                "stay as they were. Write the output in place"
-            )
+            raise self._unbuildable(output, partition, table)
+
+    def _unbuildable(self, output, partition, table) -> PublicationRefused:
+        return PublicationRefused(
+            f"{output.name} {partition!r}: {table} {_UNBUILDABLE_WHY}, since the full run began: "
+            "publishing would publish rows other than the ones Solera has read, so the published rows "
+            "stay as they were. Write the output in place"
+        )
 
     # -- writes ---------------------------------------------------------------
 

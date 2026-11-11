@@ -275,7 +275,7 @@ class Output:
         write in place left a key as it wrote it (`loose`)."""
         return all(
             (seen := r.version if (r := view.get(k)) else ABSENT) == state.get(k)
-            or seen == self.loose.get(k, (None, None))[1]
+            or (k in self.loose and seen == self.loose[k][1])
             for k in set(view) | set(state)
         )
 
