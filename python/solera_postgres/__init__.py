@@ -10,7 +10,8 @@ attempt reads (`acquire`).
 
 A full run builds beside the published rows (D211): its writes go to a build
 table in `solera_build`, which the same row registers, and
-`full_run_ended` publishes it in one transaction.
+`full_run_ended` publishes it in one transaction. A full run into a
+partition holding no rows writes in place instead (`_decide`).
 
 `psycopg` is imported lazily so project files can declare the store without a
 driver installed; only `store`/`load` need it (in the worker).
@@ -118,8 +119,9 @@ class _Target:
     """Where a write goes (`PostgresStore._aim`): the user's `table`, or the
     build of full run `run` of `partition`, which the write `opens`; the
     partition's registered runs after it, with a build (`builds`) or with
-    none made yet (`pending`), and whether the catalog holds a build of the
-    partition it does not keep (`retired`)."""
+    none made yet (`pending`), the run it records as published because it
+    writes in place (`publishes`, `PostgresStore._decide`), and whether
+    the catalog holds a build of the partition it does not keep (`retired`)."""
 
     table: str
     partition: str
@@ -127,12 +129,14 @@ class _Target:
     opens: bool = False
     builds: list = field(default_factory=list)
     pending: list = field(default_factory=list)
+    publishes: int | None = None
     retired: bool = False
 
     def made_nothing(self) -> None:
-        """The write that opens the run's build had no rows, and no shape to
-        make one from: the run stays registered, pending, and its first
-        write with rows opens it."""
+        """The write that would decide where the run writes (`_decide`) had
+        no rows, and no shape to make a table from: it decides nothing. The
+        run stays registered, pending, and its first write that reaches a
+        table decides."""
 
         if self.opens:
             self.builds.remove(self.run)
@@ -175,8 +179,7 @@ _UNBUILDABLE = """EXISTS (WITH RECURSIVE tree(oid) AS (SELECT {rel}::oid
       AND p.objid = d.oid AND p.refclassid = 'pg_class'::regclass AND p.refobjid = d.adrelid
       AND p.refobjsubid < 0 WHERE d.adrelid = tree.oid))"""
 
-_STATE = (
-    """
+_STATE = """
 SELECT r.oid IS NOT NULL AS present,
   coalesce((SELECT jsonb_object_agg(a.attname, format_type(CASE WHEN t.typtype = 'd' THEN t.typbasetype
       ELSE a.atttypid END, NULL)) FROM pg_attribute a JOIN pg_type t ON t.oid = a.atttypid
@@ -192,14 +195,10 @@ SELECT r.oid IS NOT NULL AS present,
   EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = %(build)s) AS build_schema,
   coalesce((SELECT array_agg(c.relname::text) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
     WHERE n.nspname = %(build)s AND c.relname >= %(first)s::name AND c.relname < %(past)s::name
-    AND c.relkind = 'r'), '{}') AS built,
-  r.oid IS NOT NULL AND ("""
-    + _UNBUILDABLE.format(rel="r.oid")
-    + """) AS unbuildable
+    AND c.relkind = 'r'), '{}') AS built
 FROM (SELECT (SELECT c.oid FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
   WHERE n.nspname = %(schema)s AND c.relname = %(name)s AND c.relkind IN ('r', 'p', 'v', 'f')) AS oid) AS r
 """
-)
 
 _UNBUILDABLE_WHY = (
     "is a view or foreign table, or has a trigger, a rule, row security, or a generated column a build "
@@ -463,6 +462,8 @@ class PostgresStore:
 
         from psycopg import sql
 
+        if at.opens:
+            self._decide(cur, output, at)
         if at.run is None:
             return at.table
         build = _qname(BUILD_SCHEMA, _build_name(at.table, at.partition, at.run))
@@ -493,6 +494,60 @@ class PostgresStore:
             elif list(state["pk"][:1]) != [output.key]:
                 cur.execute(f"CREATE INDEX ON {build} ({key})")
         return build
+
+    def _decide(self, cur, output: Output, at: _Target) -> None:
+        """Where full run `at.run` writes: the one place it is decided, by the
+        run's first write that puts anything in a table (each reaches it
+        through `_ensure`), and recorded in the partition's version row
+        (`_register`) for every later write and the switch to read. The run
+        writes in place, and is published as it starts (`publishes`), when
+        the partition holds no row and no other run is registered there
+        (Erwin, 2026-11-11): there are no old rows to keep from outsiders,
+        and no switch of another run will replace what it writes. Otherwise
+        it opens its build. A write of the run that puts nothing anywhere
+        leaves it pending, undecided (`_Target.made_nothing`): its switch
+        clears the partition, and its first write with rows decides.
+
+        Both inputs are read under the locks that hold them still. The
+        version check (`_begin`) keeps every other Solera writer out of the
+        partition and its registry. SHARE UPDATE EXCLUSIVE on the table and
+        every table that inherits from it, taken before the read, is the
+        weakest lock that conflicts with all the DDL that changes either
+        input: attaching a partition or inheriting a table (which bring
+        rows), and adding a trigger, rule, policy or row security. So the one
+        statement after it (READ COMMITTED: the catalog and rows as they are
+        now) sees what such DDL did before it, and none can run until the
+        write commits. Writes and switches of other partitions take ROW
+        EXCLUSIVE, which it does not conflict with; another partition's
+        deciding write, a VACUUM or an ANALYZE of the table waits for it, or
+        it for them (autovacuum gives way). A table a build cannot stand in
+        for (`_UNBUILDABLE`, a foreign table among them, which cannot be
+        locked) is refused, empty or not (`PublicationRefused`): row
+        security could hide its rows from the read, and a build would
+        publish rows other than the ones Solera has read."""
+
+        import psycopg
+
+        column = output.config.get("partition_column")
+        where = {column: at.partition} if column else {}
+        refused = PublicationRefused(
+            f"{output.name} {at.partition!r}: {at.table} {_UNBUILDABLE_WHY}: publishing a full run built "
+            "beside it would publish rows other than the ones Solera has read. Write the output in place"
+        )
+        try:
+            cur.execute(f"LOCK TABLE {at.table} IN SHARE UPDATE EXCLUSIVE MODE")
+        except psycopg.errors.WrongObjectType as e:  # a foreign table
+            raise refused from e
+        found = cur.execute(
+            f"SELECT EXISTS (SELECT FROM {at.table} WHERE {self._where_sql(where)}) AS held, "
+            + _UNBUILDABLE.format(rel="%s::regclass")
+            + " AS unbuildable",
+            [*(where[k] for k in sorted(where)), at.table, at.table],
+        ).fetchone()
+        if found["unbuildable"]:
+            raise refused
+        if not found["held"] and at.builds == [at.run] and not at.pending:
+            at.builds, at.publishes, at.run, at.opens = [], at.run, None, False
 
     def _check_drift(self, output: Output, table: str, state: dict, declared: dict, pk: list) -> None:
         """A pre-existing table must already match the declaration; evolving
@@ -645,20 +700,19 @@ class PostgresStore:
 
         A run's state is recorded in its version row, never inferred from
         the catalog: registered with a build (`builds`), or with none made
-        yet (`pending`: its writes so far had no rows, and no shape to make
-        one from), whose first write with rows opens it. The catalog
-        (`state`, from the write's first round trip) says three things. A
-        registered build it no longer holds is lost (a migration dropped it,
-        or a restore lost it): a write of its run fails (`RunLost`) and
-        changes nothing, for the rows it held are gone. A table a build
+        yet (`pending`: its writes so far put nothing in a table), or
+        published (`published`: switched, or written in place). A write
+        that opens a run only aims at it here: where the run writes is
+        decided once, under the table's lock, by its first write that puts
+        anything in a table (`_decide`), which also refuses a table a build
         cannot stand in for (`_UNBUILDABLE`: a view or foreign table, a
         trigger, a rule, row security, a generated column a build computes
-        otherwise, on it or on a table that inherits from it) never opens a build
-        (`PublicationRefused`): the switch would publish rows other than the
-        ones Solera has read, and the store never alters the user's table to
-        stop it. A
-        build of the partition the write does not keep makes it sweep after
-        it commits."""
+        otherwise, on it or on a table that inherits from it). The catalog
+        (`state`, from the write's first round trip) says two things. A
+        registered build it no longer holds is lost (a migration dropped it,
+        or a restore lost it): a write of its run fails (`RunLost`) and
+        changes nothing, for the rows it held are gone. A build of the
+        partition the write does not keep makes it sweep after it commits."""
 
         at = _Target(
             table,
@@ -685,12 +739,6 @@ class PostgresStore:
             )
         if run is not None:
             at.run, at.opens = run, run not in at.builds
-        if at.opens and state["unbuildable"]:
-            raise PublicationRefused(
-                f"{context.output.name} {context.partition!r}: {table} {_UNBUILDABLE_WHY}: publishing a "
-                "full run built beside it would publish rows other than the ones Solera has read. "
-                "Write the output in place"
-            )
         keep = {context.build_run, at.run}
         at.builds = [b for b in at.builds if b in keep] + ([at.run] if at.opens else [])
         at.pending = [b for b in at.pending if b in keep and not (at.opens and b == at.run)]
@@ -699,13 +747,15 @@ class PostgresStore:
         return at
 
     def _register(self, cur, at: _Target, checked: dict | None) -> None:
-        if checked is not None and (at.builds, at.pending) != (
+        if checked is not None and (at.builds, at.pending, at.publishes) != (
             list(checked["builds"]),
             list(checked["pending"]),
+            None,
         ):
             cur.execute(
-                f"UPDATE {VERSIONS_TABLE} SET builds = %s, pending = %s WHERE rel = %s AND part = %s",
-                (at.builds, at.pending, at.table, at.partition),
+                f"UPDATE {VERSIONS_TABLE} SET builds = %s, pending = %s, published = greatest(published, %s) "
+                "WHERE rel = %s AND part = %s",
+                (at.builds, at.pending, at.publishes, at.table, at.partition),
             )
 
     def _sweep(self, table: str, partition: str) -> None:
@@ -915,7 +965,8 @@ class PostgresStore:
         docs/tracking-design.md §8, obligations 4 and 5). One transaction
         holding the partition's version check: if an attempt newer than
         `newest` has written (a call delivered late), it does nothing and
-        says not published; a run published before says published; a run
+        says not published; a run published before, by a switch or because
+        it wrote in place (`_decide`), says published; a run
         that is not registered (overtaken), or whose build is gone (a
         migration dropped it, or a restore lost it; it stays registered, as
         lost, until a new full run starts), says not published. A pending
@@ -975,7 +1026,10 @@ class PostgresStore:
                         # The lock the DELETE takes, on every partition, first: no trigger, rule, policy or
                         # partition can be added or enabled until this commits, so the catalog read next
                         # (READ COMMITTED: as it is now) is the one the rows meet.
-                        cur.execute(f"LOCK TABLE {table} IN ROW EXCLUSIVE MODE")
+                        try:
+                            cur.execute(f"LOCK TABLE {table} IN ROW EXCLUSIVE MODE")
+                        except psycopg.errors.WrongObjectType as e:  # a foreign table
+                            raise self._unbuildable(output, partition, table) from e
                         self._refuse_unbuildable(cur, output, partition, table)
                         self._delete_slice(cur, table, {column: partition} if column else {})
                     if run in found["builds"]:
@@ -1010,11 +1064,14 @@ class PostgresStore:
 
     def _refuse_unbuildable(self, cur, output, partition, table) -> None:
         if cur.execute(_UNBUILDABLE_NOW, {"t": table}).fetchone()["unbuildable"]:
-            raise PublicationRefused(
-                f"{output.name} {partition!r}: {table} {_UNBUILDABLE_WHY}, since the full run began: "
-                "publishing would publish rows other than the ones Solera has read, so the published rows "
-                "stay as they were. Write the output in place"
-            )
+            raise self._unbuildable(output, partition, table)
+
+    def _unbuildable(self, output, partition, table) -> PublicationRefused:
+        return PublicationRefused(
+            f"{output.name} {partition!r}: {table} {_UNBUILDABLE_WHY}, since the full run began: "
+            "publishing would publish rows other than the ones Solera has read, so the published rows "
+            "stay as they were. Write the output in place"
+        )
 
     # -- writes ---------------------------------------------------------------
 
