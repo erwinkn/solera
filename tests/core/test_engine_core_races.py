@@ -20,7 +20,7 @@ from solera.sdk import (
     asset,
     sensor,
 )
-from solera.stores import FileStore, Patch
+from solera.stores import FileStore
 from solera_server.state import Conflict
 from solera_server.tracking import sources
 from solera_server.tracking.sources import record_loads
@@ -100,47 +100,6 @@ async def test_a_loads_report_never_overwrites_a_source_commit_made_since_the_ba
     await record_loads(engine, "old-attempt", plans, {"delivered": {"feed": {"loaded": [["k", "v2"]]}}})
     assert newer
     assert await _state(engine, "feed") == {"k": "v3"}
-
-
-@pytest.mark.parametrize("param", ["log", "core"])  # "core": never the keyed walk's own progress
-async def test_a_finished_keyed_input_is_delivered_empty_while_unkeyed_inputs_go_on(solera, tmp_path, param):
-    outside, seen = Outside(), []
-    outside.feed.update({"k": "v1"})
-
-    @asset(outputs=Output("log", incremental=True))
-    def log():
-        return Patch([{"v": 1}])
-
-    def log_input(ctx, feed: list, log: list):
-        seen.append((len(feed), len(log)))
-        return len(log)
-
-    def core_input(ctx, feed: list, core: list):
-        seen.append((len(feed), len(core)))
-        return len(core)
-
-    body = {"log": log_input, "core": core_input}[param]
-    body.__name__ = body.__qualname__ = "consumer"
-    consumer = asset(
-        inputs={"feed": Incremental(batch_size=1), param: Incremental("log", batch_size=1)},
-        retries=Retry(n=0),
-    )(body)
-
-    await solera.deploy(
-        Project(
-            assets=[log, consumer],
-            sources=[Source("feed", key="id", store="ext")],
-            stores={"ext": SourceStore(tmp_path / "ext", outside)},
-            default_store=FileStore(tmp_path / "data"),
-        )
-    )
-    await solera.commit_source("feed", upsert={"k": "v1"})
-    for _ in range(3):
-        await solera.run("log")
-    detail = await solera.run("consumer", expect=None)
-    errors = [attempt.get("error") for attempts in detail["attempts"].values() for attempt in attempts]
-    assert detail["request"]["status"] == "succeeded", errors
-    assert seen == [(1, 1), (0, 1), (0, 1)]
 
 
 async def test_a_tick_is_refused_when_a_key_it_reports_moves_while_it_is_validated(solera, monkeypatch):

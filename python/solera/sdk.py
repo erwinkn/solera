@@ -140,14 +140,8 @@ class TableRef(Ref):
     def where(self) -> dict:
         return self.handle.get("where") or {}
 
-    @property
-    def commit_number(self) -> int | None:
-        return self.handle.get("commit_number")
-
     def where_sql(self) -> str:
         clauses = [f"{_ident(k)} = {_literal(v)}" for k, v in sorted(self.where.items())]
-        if self.commit_number is not None:
-            clauses.append(f"_commit <= {int(self.commit_number)}")
         return " AND ".join(clauses) or "TRUE"
 
     def sql(self) -> str:
@@ -211,8 +205,9 @@ class Migration:
 
 
 class Output:
-    """A named slot on a store (§2). `incremental=True` emits a per-commit
-    delta; `key=` implies it. Public `mode=` is gone (§2.1).
+    """A named slot on a store (§2). A keyed output (`key=` or `keyed=True`)
+    is incremental: a consumer reads the keys it changed. An unkeyed output
+    is a single value, replaced whole by every write and read whole (§2.1).
 
     `keyed=True` makes the value a `dict[str, Any]`, one entry per key;
     `key="id"` makes it rows, keyed by their `id` column. `cleanup_after`
@@ -227,7 +222,6 @@ class Output:
         name: str | None = None,
         store: str | None = None,
         key: str | None = None,
-        incremental: bool | None = None,
         migrations: tuple | list = (),
         keyed: bool = False,
         cleanup_after: dt.timedelta | None = None,
@@ -237,22 +231,19 @@ class Output:
             not isinstance(cleanup_after, dt.timedelta) or cleanup_after < dt.timedelta(0)
         ):
             raise RegistrationError(f"Output {name or '?'}: cleanup_after= is a timedelta of zero or more")
-        if "mode" in config:
-            raise RegistrationError(
-                f"Output {name or '?'}: mode= was removed; declare incremental= instead (§2.1)"
-            )
+        for removed in ("mode", "incremental"):
+            if removed in config:
+                raise RegistrationError(
+                    f"Output {name or '?'}: {removed}= was removed; a keyed output (key= or keyed=True) "
+                    "is incremental, an unkeyed one a single value (§2.1)"
+                )
         if keyed:
             if key is not None:
                 raise RegistrationError(
                     f"Output {name or '?'}: keyed=True takes a dict[str, Any]; key= is for rows"
                 )
             key = KEYS
-        if incremental is None:
-            incremental = key is not None
-        elif not incremental and key is not None:
-            raise RegistrationError(f"Output {name or '?'}: key= implies incremental=True (§2.1)")
-        self.name, self.store = name, store
-        self.key, self.incremental = key, bool(incremental)
+        self.name, self.store, self.key = name, store, key
         self.config = config
         self.migrations = tuple(migrations)
         self.cleanup_after = cleanup_after
@@ -263,7 +254,7 @@ class Output:
             "name": name,
             "store": self.store or DEFAULT_STORE,
             "key": self.key,
-            "incremental": self.incremental,
+            "incremental": self.key is not None,
             "migrations": [m.name for m in self.migrations],
             "config": self.config,
             "dynamic_partitions": self.is_dynamic_partitions,
@@ -277,7 +268,7 @@ class DynamicPartitions(Output):
     is_dynamic_partitions = True
 
     def __init__(self, name: str | None = None, store: str | None = None, **config: Any):
-        super().__init__(name, store, key="<partitions>", incremental=True, **config)
+        super().__init__(name, store, key="<partitions>", **config)
 
 
 class Source:
@@ -430,9 +421,9 @@ class In:
 
 
 class Incremental(In):
-    """An incremental input: the position-planned changes since its last
-    pass (§5, §6). On a keyed upstream, `include` and `exclude` select the
-    keys it takes by name (`solera.patterns`, docs/per-key-processing.md
+    """An incremental input: the keys of a keyed upstream changed since its
+    last pass, as positions planned them (§5, §6). `include` and `exclude`
+    select the keys it takes by name (`solera.patterns`, docs/per-key-processing.md
     §11).
 
     `each=True` makes it per-key incremental (docs/per-key-processing.md
@@ -486,12 +477,9 @@ class Incremental(In):
 
 @dataclass(frozen=True)
 class Upstream:
-    """Facts about the upstream a batch came from (§5.1): its `output`, and —
-    for an unkeyed upstream — the range of upstream `commits` the batch
-    covers."""
+    """Facts about the upstream a batch came from (§5.1): its `output`."""
 
     output: str | None = None
-    commits: range | None = None
 
 
 _NEW: Any = object()  # a `Batch` field not given, or not yet read from the worker's columns
@@ -503,7 +491,7 @@ class Batch:
     they sit in their run:
 
     - `rows`: the delivered rows (the object the parameter received);
-    - `added`, `updated` and `removed` (keyed upstreams): each key's change
+    - `added`, `updated` and `removed`: each key's change
       against what this partition last processed of it, under the input's
       patterns now. `added`: not held, present now; `updated`: held, at
       another version; `removed`: held, absent or no longer taken now.
@@ -1498,7 +1486,7 @@ class Project:
                     "source": False,
                     "store": output.store or DEFAULT_STORE,
                     "key": output.key,
-                    "incremental": output.incremental,
+                    "incremental": output.key is not None,
                     "migrations": [m.name for m in output.migrations],
                     "config": output.config,
                     "dynamic_partitions": output.is_dynamic_partitions,
@@ -1536,13 +1524,11 @@ class Project:
         return entry.output
 
     @staticmethod
-    def _check_each(name: str, asset: Asset, info: dict, param: str, upstream: dict) -> None:
+    def _check_each(name: str, asset: Asset, info: dict, param: str) -> None:
         """A per-key incremental input (`each=True`, docs/per-key-processing.md
-        §5): one per asset, over a keyed upstream, the asset's only
-        incremental input, and every output keyed by the input's key."""
+        §5): one per asset, the asset's only incremental input, and every
+        output keyed by the input's key."""
 
-        if upstream["key"] is None:
-            raise RegistrationError(f"{name}: per-key input {param!r} (each=True) needs a keyed upstream")
         others = [p for p, e in info["inputs"].items() if p != param and isinstance(e, Incremental)]
         if others:
             raise RegistrationError(
@@ -1634,35 +1620,30 @@ class Project:
                         raise RegistrationError(
                             f"{name}: dimension {d!r} differs from upstream {output_name}"
                         )
-                if isinstance(input, Incremental) and input.each:
-                    self._check_each(name, asset, info, param, upstream)
                 if isinstance(input, Incremental):
                     if missing:
                         raise RegistrationError(
                             f"{name}: Incremental input {param!r} cannot have upstream-only dimensions (§7)"
                         )
-                    if not upstream["incremental"]:
+                    if upstream["key"] is None:
                         raise RegistrationError(
-                            f"{name}: Incremental input {param!r} upstream {output_name} "
-                            "is not incremental (declare incremental=True) (§2.1)"
+                            f"{name}: Incremental input {param!r} reads the keys {output_name} changed, "
+                            f"and {output_name} has none: give it a key= (§2.1)"
                         )
-                    if input.patterns is not None and upstream["key"] is None:
-                        raise RegistrationError(
-                            f"{name}: include=/exclude= on {param!r} select keys; {output_name} has none"
-                        )
+                    if input.each:
+                        self._check_each(name, asset, info, param)
                     if is_ref_type(annotation):
                         raise RegistrationError(
                             f"{name}: Incremental input {param!r} cannot be ref-annotated (§5)"
                         )
                     if annotation is None:
                         raise RegistrationError(f"{name}: store-bound input {param!r} is unannotated (§11)")
-                    Keys, Commits = _selection_classes()
-                    selection = Keys if upstream["key"] is not None else Commits
+                    from .stores import Keys
+
                     loaded = dict[str, annotation] if input.each else annotation
-                    if not store.can_load(loaded, selection):
+                    if not store.can_load(loaded, Keys):
                         raise RegistrationError(
-                            f"{name}: store {upstream['store']} cannot load {annotation} "
-                            f"under {selection.__name__}"
+                            f"{name}: store {upstream['store']} cannot load {annotation} under Keys"
                         )
                 elif missing or input.all_partitions:  # a whole fan-in: by upstream partition
                     inner = dict_arg(annotation)
@@ -1988,12 +1969,6 @@ class Project:
         if owner is None:
             return {}
         return assets[owner]["dims"] or {}
-
-
-def _selection_classes():
-    from .stores import Commits, Keys
-
-    return Keys, Commits
 
 
 def _builtin_kinds() -> dict:

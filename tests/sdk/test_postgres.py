@@ -6,7 +6,6 @@ import uuid
 from decimal import Decimal as D
 
 import pytest
-from solera.keys import SortedEntries
 from solera.sdk import Output
 from solera.stores import KeyedWrite, Keys, Patch, StoreError, WriteError, prepare_for
 from solera_postgres import Sql
@@ -170,20 +169,6 @@ async def test_a_renamed_output_keeps_its_table(store):
     assert missing is None  # nothing was created, or renamed, under the new name
 
 
-async def test_batch_snapshot_at_pinned_version(store):
-    """§3/§2.1: an unkeyed incremental ref's load returns rows up to the
-    pinned batch, even after later writes."""
-
-    out = output(incremental=True, partition_column="site")
-    first = await store.store(Patch([{"e": 1}]), None, context(out, partition="s1", commit_number=0))
-    second = await store.store(Patch([{"e": 2}]), first.ref, context(out, partition="s1", commit_number=1))
-    assert first.ref.handle["commit_number"] == 0 and second.ref.handle["commit_number"] == 1
-    at_first = await store.load(first.ref, list[dict], None)
-    assert [r["e"] for r in at_first] == [1]
-    at_second = await store.load(second.ref, list[dict], None)
-    assert [r["e"] for r in at_second] == [1, 2]
-
-
 async def test_keys_selection(store):
     """§4: load under Keys returns only the selected keys."""
 
@@ -338,7 +323,7 @@ async def test_every_row_carries_the_version_that_wrote_it(store):
     `Sql` query, even one copying `_version` from another table — and a
     load takes the column off the rows it returns."""
 
-    out = output(key="id", incremental=True)
+    out = output(key="id")
     first = await store.store([{"id": "a", "v": "1"}, {"id": "b", "v": "1"}], None, fenced(out, 3))
     table = first.ref.handle["table"]
     second = await store.store(Patch([{"id": "b", "v": "2"}]), first.ref, fenced(out, 5))
@@ -347,11 +332,6 @@ async def test_every_row_carries_the_version_that_wrote_it(store):
     copied = output(key="id")
     sql = await store.store(Sql(f"SELECT * FROM {table}"), None, fenced(copied, 8))
     assert _versions(store, sql.ref.handle["table"]) == [("a", 8), ("b", 8)]
-    commits = output(incremental=True)
-    batch = await store.store(Patch([{"e": 1}]), None, fenced(commits, 4))
-    with store._connect() as conn, conn.cursor() as cur:
-        found = cur.execute(f"SELECT _version FROM {batch.ref.handle['table']}").fetchall()
-    assert [r["_version"] for r in found] == [4]
 
 
 async def test_a_table_made_before_versions_is_refused(store):
@@ -405,7 +385,7 @@ async def test_a_repair_writing_no_rows_still_marks_the_slice_written(store):
     written by the repairing generation, not by the dead attempt it repaired,
     which no commit has."""
 
-    out = output(key="id", incremental=True)
+    out = output(key="id")
     first = await store.store([{"id": "a", "v": "1"}], None, fenced(out, 12))
     await store.acquire(fenced(out, 15), first.ref)
     nothing = KeyedWrite(prepare_for(store, Patch([]), out), None, frozenset())
@@ -488,62 +468,6 @@ async def test_a_patch_refuses_requested_keys_it_does_not_hold(store):
     with pytest.raises(StoreError, match="does not hold"):
         patch = prepare_for(store, Patch([{"id": "a", "v": "2"}]), out)
         await store.store(KeyedWrite(patch, frozenset(["a", "zzz"])), first.ref, context(out))
-
-
-async def test_reconciliation_streams_the_slice_s_keys(store, monkeypatch):
-    """docs/versions.md §5: after a dead `Sql` writer, a patch reconciles the
-    whole partition — the keys it holds read back through `keys` a chunk at a
-    time, never a value — at the patch's generation, with its own keys and
-    removes laid over them; a live key the store lacks is removed. A by-key
-    patch reconciles like any: a key it gives no rows is removed."""
-
-    from obstore.store import MemoryStore
-    from solera import _native
-    from solera.keys.io import ObjectIO
-    from solera.keys.layers import LayerIndex, LayerState
-    from solera_worker import worker
-
-    out = output(key="id", partition_column="site")
-    rows = [{"id": "a", "x": 1}, {"id": "c", "x": 3}, {"id": "e", "x": 5}]
-    written = await store.store(rows, None, context(out, partition="oakland"))
-    io = ObjectIO(MemoryStore())
-    state = LayerState(prefix="keys/", life="1")
-    files, _ = await LayerIndex(io, state).write_replace(
-        prepare_for(store, rows + [{"id": "f", "x": 6}], out).rows, name="000000000000-w1", generation=1
-    )
-    state = state.committed(0, files)
-
-    async def no_load(*args, **kwargs):
-        raise AssertionError("reconciliation reads keys, never values")
-
-    monkeypatch.setattr(store, "load", no_load)
-    monkeypatch.setattr("solera_postgres.KEY_CHUNK", 1)  # every key in a chunk of its own
-    # A row may carry the stamped column, or not.
-    for attempt, patch in enumerate(
-        (
-            Patch([{"id": "b", "x": 2, "site": "oakland"}], remove=["c"]),
-            Patch({"b": [{"x": 2}], "d": []}, remove=["c"]),
-        )
-    ):
-        o = worker._Out(
-            "t",
-            out,
-            store,
-            {"commit_number": 1, "repairs": [{"unknown": True}], "before": written.ref.to_json()},
-            patch,
-        )
-        o.index = LayerIndex(io, state)
-        o.prepared = prepare_for(store, patch, out)
-        o.run = SortedEntries.from_rows(o.prepared.rows, [k.encode() for k in o.prepared.removes])
-        g = attempt + 2
-        delta, _ = await worker._reconcile(o, {"attempt": f"w{g}", "generation": g})
-        got = [
-            (e[0], e[4], int(not e[1]))
-            for f in delta.part.files
-            for e in _native.layers_decode(await io.read_whole(state.path(f.name), f.size), 1, g)
-        ]
-        # What the store holds is written again at g; `f`, which it lacks, removed.
-        assert got == [(b"a", g, 0), (b"b", g, 0), (b"c", g, 1), (b"e", g, 0), (b"f", g, 1)]
 
 
 def in_thread(coroutine) -> tuple:
@@ -915,59 +839,6 @@ async def test_a_write_waits_on_a_thread_not_on_the_event_loop(store):
     ticking = asyncio.create_task(tick())
     await asyncio.sleep(0)  # the tick is asleep before the write starts
     await store.store(Sql("SELECT 'a'::text AS id, pg_sleep(0.4)::text AS slept"), None, context(out))
-    await ticking
-    assert late[0] < 0.2, late
-
-
-async def test_a_repair_read_back_waits_off_the_event_loop(store, monkeypatch):
-    """After a failed Sql write, the store's keys are read back (`keys`) a
-    chunk at a time on a thread: a slow read leaves the event loop free."""
-
-    import asyncio
-    import time
-
-    from obstore.store import MemoryStore
-    from solera.keys.io import ObjectIO
-    from solera.keys.layers import LayerIndex, LayerState
-    from solera_worker import worker
-
-    out = output(key="id")
-    rows = [{"id": "a", "x": 1}]
-    written = await store.store(rows, None, context(out))
-    io = ObjectIO(MemoryStore())
-    state = LayerState(prefix="keys/", life="1")
-    files, _ = await LayerIndex(io, state).write_replace(
-        prepare_for(store, rows, out).rows, name="000000000000-w1", generation=1
-    )
-    state = state.committed(0, files)
-    keys = store.keys
-
-    def slow(ref, among=None):
-        time.sleep(0.4)  # a database that takes its time
-        yield from keys(ref, among)
-
-    monkeypatch.setattr(store, "keys", slow)
-    patch = Patch([{"id": "b", "x": 2}])
-    o = worker._Out(
-        "t",
-        out,
-        store,
-        {"commit_number": 1, "repairs": [{"unknown": True}], "before": written.ref.to_json()},
-        patch,
-    )
-    o.index = LayerIndex(io, state)
-    o.prepared = prepare_for(store, patch, out)
-    o.run = SortedEntries.from_rows(o.prepared.rows)
-    late = []
-
-    async def tick():
-        start = time.perf_counter()
-        await asyncio.sleep(0.02)
-        late.append(time.perf_counter() - start)
-
-    ticking = asyncio.create_task(tick())
-    await asyncio.sleep(0)
-    await worker._reconcile(o, {"attempt": "w2", "generation": 2})
     await ticking
     assert late[0] < 0.2, late
 

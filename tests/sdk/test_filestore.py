@@ -1,4 +1,4 @@
-"""§4: FileStore and S3Store — one object per value, key or commit, each
+"""§4: FileStore and S3Store — one object per value or key, each
 written once under a name that carries the writing attempt's generation
 (docs/lifecycle.md §9.8, docs/versions.md); JSON when it round-trips,
 pickle otherwise. The store never works out what changed; the worker
@@ -16,7 +16,6 @@ import pytest
 from solera.keys.layers import key_str
 from solera.sdk import KEYS, DynamicPartitions, Output, Ref, RegistrationError
 from solera.stores import (
-    Commits,
     FileStore,
     KeyedWrite,
     Keys,
@@ -156,7 +155,7 @@ async def test_a_keyed_output_takes_a_dict_of_str(store):
 
 
 def test_keyed_registration():
-    assert Output("u", keyed=True).key == KEYS and Output("u", keyed=True).incremental
+    assert Output("u", keyed=True).key == KEYS
     with pytest.raises(RegistrationError):
         Output("u", keyed=True, key="id")
     fs = FileStore()
@@ -196,36 +195,6 @@ async def test_a_keyed_load_as_an_arrow_table(store):
     assert table.to_pylist() == rows
     groups = await store.load(written.ref, dict[str, pa.Table], at(out, rows, 1))
     assert {k: g.to_pylist() for k, g in groups.items()} == {"1": rows[:1], "2": rows[1:]}
-
-
-async def test_unkeyed_incremental_is_one_object_per_commit(store):
-    out = Output("events", incremental=True)
-    with pytest.raises(WriteError, match="Patch"):
-        await store.store([{"e": 0}], None, context(out, commit_number=0))
-    first = await store.store(Patch([{"e": 1}]), None, context(out, commit_number=3, generation=10))
-    second = await store.store(
-        Patch([{"e": 2}, {"e": 3}]), first.ref, context(out, commit_number=4, generation=11)
-    )
-    assert second.ref.handle == {"mode": "commits", "path": "events", "commits": [3, 4]}
-    assert await store.load(second.ref, None, None) == [{"e": 1}, {"e": 2}, {"e": 3}]
-    assert await store.load(second.ref, None, Commits(4, 4)) == [{"e": 2}, {"e": 3}]
-    assert (
-        await store.store(Patch([]), second.ref, context(out, commit_number=5, generation=12))
-    ).ref is second.ref
-
-
-async def test_a_commits_object_is_its_highest_generation(store):
-    """Retries reuse a commit number: a dead attempt's commit 4 (generation 11)
-    and its retry's (generation 12) are both there, and the retry, which
-    committed, is the one read. A full run starts over at a later commit."""
-
-    out = Output("events", incremental=True)
-    first = await store.store(Patch([{"e": 1}]), None, context(out, commit_number=3, generation=10))
-    await store.store(Patch([{"e": "dead"}]), first.ref, context(out, commit_number=4, generation=11))
-    retry = await store.store(Patch([{"e": 2}]), first.ref, context(out, commit_number=4, generation=12))
-    assert await store.load(retry.ref, None, None) == [{"e": 1}, {"e": 2}]
-    reset = await store.store(Patch([{"e": 9}]), None, context(out, commit_number=6, generation=13))
-    assert await store.load(reset.ref, None, None) == [{"e": 9}]
 
 
 async def test_a_partition_set_is_its_element_list(store):
@@ -282,43 +251,6 @@ def test_the_default_path(tmp_path, monkeypatch):
     assert Path(store._objects().prefix) == tmp_path / ".solera" / "data"
     monkeypatch.setenv("SOLERA_DATA_URL", (tmp_path / "elsewhere").as_uri())
     assert Path(store._objects().prefix) == tmp_path / "elsewhere"
-
-
-async def test_one_commit_is_read_without_listing_the_history(store, monkeypatch):
-    """A consumer reading one commit — the newest, or the first of a long
-    history — lists that commit's objects, not the output's whole history
-    (§6: hot-path work does not grow with history). A range past the ref's
-    last commit stops at it: a commit number not committed yet is not read."""
-
-    import obstore
-
-    out = Output("events", incremental=True)
-    ref = None
-    for commit_number in range(200):
-        ref = (
-            await store.store(
-                Patch([{"e": commit_number}]),
-                ref,
-                context(out, commit_number=commit_number, generation=commit_number + 1),
-            )
-        ).ref
-    listed = []
-    real = obstore.list
-
-    def counting(*args, **kwargs):
-        async def chunks():
-            async for chunk in real(*args, **kwargs):
-                listed.append(len(chunk))  # a page: one request to a bucket
-                yield chunk
-
-        return chunks()
-
-    await store.store(Patch([{"e": "uncommitted"}]), ref, context(out, commit_number=200, generation=300))
-    monkeypatch.setattr(obstore, "list", counting)
-    for lo, hi, read in ((199, 199, [{"e": 199}]), (0, 0, [{"e": 0}]), (199, 205, [{"e": 199}])):
-        listed.clear()
-        assert await store.load(ref, None, Commits(lo, hi)) == read
-        assert len(listed) <= 1, (lo, hi, listed)
 
 
 async def test_many_objects_are_never_many_tasks_at_once(store):
@@ -378,12 +310,6 @@ async def test_a_missing_object_a_commit_names_fails_the_read(store, data):
     await obstore.delete_async(store._objects(), f"{gone}.json")
     with pytest.raises(StoreError, match="'a'.* is gone"):
         await store.load(written.ref, None, keys)
-    events = Output("events", incremental=True)
-    commit_number = await store.store(Patch([{"e": 1}]), None, context(events, commit_number=0, generation=1))
-    names = await store._commits(commit_number.ref.handle["path"], 0, 0)
-    await obstore.delete_async(store._objects(), f"{names[0]}.json")
-    with pytest.raises(StoreError, match="is gone"):
-        await store.load(commit_number.ref, None, None)
 
 
 async def test_a_store_reads_its_own_types(store):

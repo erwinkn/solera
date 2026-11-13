@@ -31,7 +31,6 @@ from solera.sdk import KEYS, Output, Ref, TableRef
 from solera.stores import (
     MISSING,
     Changed,
-    Commits,
     KeyedWrite,
     Keys,
     Opaque,
@@ -64,8 +63,6 @@ VERSIONS_DDL = (
     "builds bigint[] NOT NULL DEFAULT '{}', pending bigint[] NOT NULL DEFAULT '{}', PRIMARY KEY (rel, part))"
 )
 BUILD_SCHEMA = "solera_build"  # a full run's build: "solera_build"."b_<table and partition>_<run>"
-COMMIT_COLUMN = "_commit"
-SEQ_COLUMN = "_seq"
 VERSION_COLUMN = "_version"  # every row's version: the generation of the attempt that wrote it
 KEY_CHUNK = 100_000  # keys per chunk `keys` reads
 
@@ -219,13 +216,6 @@ SELECT NULL, a.attname::text, pg_get_serial_sequence(%(table)s, a.attname)
 """
 
 
-def _assigned_commit(context: WriteContext, prior: Ref | None) -> int:
-    if context.commit_number is not None:
-        return context.commit_number
-    last = (prior.handle or {}).get("commit_number") if prior is not None else None
-    return int(last) + 1 if last is not None else 0
-
-
 def _ident(name: str) -> str:
     if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", str(name)):
         raise StoreError(f"Unsafe identifier: {name!r}")
@@ -353,18 +343,10 @@ class PostgresStore:
         partition_col = output.config.get("partition_column")
         if partition_col:
             columns.setdefault(partition_col, "text")
-        commit_mode = output.incremental and output.key is None
-        if commit_mode:
-            columns.setdefault(COMMIT_COLUMN, "integer")
-            columns.setdefault(SEQ_COLUMN, "integer")
         # A key names a group of rows, not one: it is never a primary key by itself.
         pk = list(output.config.get("primary_key") or [])
-        if partition_col and partition_col not in pk and (pk or commit_mode):
+        if partition_col and partition_col not in pk and pk:
             pk = [*pk, partition_col]
-        if commit_mode:
-            for c in (COMMIT_COLUMN, SEQ_COLUMN):
-                if c not in pk:
-                    pk = [*pk, c]
         return columns, pk
 
     def _ensure(
@@ -868,7 +850,7 @@ class PostgresStore:
                         self._forget(cur, table, [part])
                         continue
                     # A key's rows wherever the partition holds them: published, and in its builds.
-                    keyed = _ident(COMMIT_COLUMN if output.key is None else output.key)
+                    keyed = _ident(output.key)
                     sql, params = f"{sql} AND {keyed}::text = %s", [*params, str(key)]
                     builds = [_qname(BUILD_SCHEMA, n) for n in self._builds_of(cur, table, [part])]
                     for target in ([table] if present else []) + builds:
@@ -1100,7 +1082,6 @@ class PostgresStore:
             partition_col = output.config.get("partition_column")
             slice_where = {partition_col: context.partition} if partition_col else {}
 
-            commit_number = _assigned_commit(context, prior) if output.incremental else None
             keys = changed = None
             made = True
             if isinstance(write, Sql):
@@ -1109,8 +1090,6 @@ class PostgresStore:
                     keys = self._held(cur, target, output.key, slice_where)
                     changed = Changed(keys, whole=True)
             elif output.key is not None:
-                if isinstance(write, Patch) and not output.incremental:
-                    raise WriteError(f"{output.name}: Patch requires an incremental output")
                 write = KeyedWrite.of(self, write, output, prior)
                 changed = write.changed()
                 # Nothing to write, and no table: none to make (a remove finds no row).
@@ -1123,14 +1102,8 @@ class PostgresStore:
                 if made:
                     self._apply_keyed(cur, output, write, context, at, state, slice_where)
             elif isinstance(write, Patch):
-                made = self._apply_commit(
-                    cur, output, write, context, at, state, slice_where, prior, commit_number
-                )
+                raise WriteError(f"{output.name}: Patch requires a keyed output")
             else:
-                if output.incremental:
-                    raise WriteError(
-                        f"{output.name}: an unkeyed incremental output only accepts Patch writes"
-                    )
                 self._apply_replace(cur, output, write, context, at, state, slice_where)
             if not made:
                 at.made_nothing()
@@ -1139,13 +1112,7 @@ class PostgresStore:
             self._sweep(table, context.partition)
         if not made:
             return Written(prior if output.key is None else None, changed=changed)
-        commit_mode = output.key is None and output.incremental
-        handle = {
-            "table": table,
-            "where": slice_where,
-            "key": COMMIT_COLUMN if commit_mode else output.key,
-            "commit_number": commit_number if commit_mode else None,
-        }
+        handle = {"table": table, "where": slice_where, "key": output.key}
         if at.run is not None:
             handle["build"] = at.run  # Solera reads the build while it is open (D211, obligation 3)
         return Written(
@@ -1162,28 +1129,6 @@ class PostgresStore:
         target = self._ensure(cur, output, at, state, lambda: rows, kinds=kinds)
         self._delete_slice(cur, target, slice_where)
         self._insert(cur, output, target, rows, self._stamps(output, context))
-
-    def _apply_commit(self, cur, output, write: Patch, context, at, state, slice_where, prior, commit_number):
-        """An unkeyed incremental output's commit: its rows stamped with the
-        commit columns, in place of this commit's (a retry's) — or, with no
-        prior (a first write, or a reset), of every commit."""
-
-        if not output.incremental:
-            raise WriteError(f"{output.name}: Patch requires an incremental output")
-        if write.remove:
-            raise WriteError(f"{output.name}: remove is not allowed on an unkeyed incremental output")
-        rows = frames.rows_of(write.rows, output.name)
-        if not rows and (prior is not None or not (state["present"] or output.config.get("columns"))):
-            return False  # nothing to write; with no table and no declared columns, no shape to make one
-        rows = [{**row, SEQ_COLUMN: i} for i, row in enumerate(rows)]
-        target = self._ensure(cur, output, at, state, lambda: rows)
-        self._delete_slice(
-            cur, target, slice_where if prior is None else {**slice_where, COMMIT_COLUMN: commit_number}
-        )
-        self._insert(
-            cur, output, target, rows, {**self._stamps(output, context), COMMIT_COLUMN: commit_number}
-        )
-        return True
 
     def _apply_keyed(self, cur, output, write: KeyedWrite, context, at, state, slice_where) -> None:
         """Every key is the group of rows that carry it. A whole write is the
@@ -1571,10 +1516,10 @@ class PostgresStore:
             return Loaded(rows, version=newest if version else None)
         return {str(r[source.key]): Loaded(r, version=str(r[version])) for r in rows}
 
-    async def load(self, ref: Ref, t, selection: Keys | Commits | None) -> Any:
+    async def load(self, ref: Ref, t, selection: Keys | None) -> Any:
         return (await self.read(ref, t, selection)).value
 
-    async def read(self, ref: Ref, t, selection: Keys | Commits | None) -> Read:
+    async def read(self, ref: Ref, t, selection: Keys | None) -> Read:
         """`load`, and the versions it read, from each row's version column
         (docs/stores.md, "What a write and a load say"): a table holds its
         rows as they are now, so a key read may be at another version than
@@ -1612,10 +1557,10 @@ class PostgresStore:
         ).fetchone()
         return None if found is None or found["written"] is None else int(found["written"])
 
-    def _load(self, ref: Ref, t, selection: Keys | Commits | None, conn=None) -> Any:
+    def _load(self, ref: Ref, t, selection: Keys | None, conn=None) -> Any:
         return self._read(ref, t, selection, conn).value
 
-    def _read(self, ref: Ref, t, selection: Keys | Commits | None, conn=None) -> Read:
+    def _read(self, ref: Ref, t, selection: Keys | None, conn=None) -> Read:
         import psycopg
 
         handle, handed = ref.handle or {}, conn is not None
@@ -1626,13 +1571,7 @@ class PostgresStore:
             sql, params = "SELECT * FROM {}", []
             clauses = [f"{_ident(k)} = %s" for k in sorted(where)]
             params += [where[k] for k in sorted(where)]
-            if handle.get("commit_number") is not None:
-                clauses.append(f"{_ident(COMMIT_COLUMN)} <= %s")
-                params.append(handle["commit_number"])
-            if isinstance(selection, Commits):
-                clauses.append(f"{_ident(COMMIT_COLUMN)} BETWEEN %s AND %s")
-                params += [selection.lo, selection.hi]
-            elif selection is not None:
+            if selection is not None:
                 key_col = handle.get("key")
                 if not key_col:
                     raise StoreError(f"{ref.output}: no key column for a Keys selection")
@@ -1658,11 +1597,8 @@ class PostgresStore:
                 found = cur.execute(sql.format(self._source(cur, ref)), params)
                 rows = found.fetchall()
             columns = [d.name for d in found.description or () if d.name != VERSION_COLUMN]
-            if handle.get("commit_number") is not None:
-                internal = {COMMIT_COLUMN, SEQ_COLUMN}
-                rows = [{k: v for k, v in r.items() if k not in internal} for r in rows]
         # Every row's version, taken off it: a key's rows share theirs (one write wrote them).
-        keyed = bool(handle.get("key")) and handle.get("commit_number") is None
+        keyed = bool(handle.get("key"))
         versions: dict[str, Any] | None = {} if keyed else None
         newest = None
         for row in rows:
@@ -1764,7 +1700,7 @@ class _Reader:
     def __init__(self, store: PostgresStore, conn):
         self.store, self.conn, self.lock = store, conn, asyncio.Lock()
 
-    async def load(self, ref: Ref, t, selection: Keys | Commits | None) -> tuple[Any, int | None]:
+    async def load(self, ref: Ref, t, selection: Keys | None) -> tuple[Any, int | None]:
         if isinstance(t, type) and issubclass(t, Ref):
             return ref, None  # nothing read: the producer reads it itself
 

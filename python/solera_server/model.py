@@ -5,7 +5,7 @@ The model is plain data changed only by `apply(event)`, so replaying the
 journal reproduces it exactly. It has three layers:
 
 - **Durable**: the project, heads, key indexes, each asset partition's record
-  (cursor, last outcome, completeness, what its inputs observed, failing keys),
+  (cursor, last outcome, what its last commit was made under),
   automation state, active runs
   (tasks nested inside, each launched attempt on its task), outputs owing a repair, idempotency
   receipts, files awaiting deletion, and the run history's files and the
@@ -34,7 +34,7 @@ from base64 import b64decode, b64encode
 from solera._native import Tracking
 from solera.keys.layers import LayerState, delta_names, index_prefix
 
-from . import history, observed
+from . import history
 from .lake import LakeState
 
 TERMINAL_TASK = frozenset({"succeeded", "skipped", "failed", "blocked", "canceled"})
@@ -207,12 +207,8 @@ class Model:
         # deleted runs whose directories are still to be deleted (§11)
         self.deleted: list[str] = snap.get("deleted") or []
         # (asset, partition) -> the partition's record (§5): its `cursor`; `last`, its last
-        # terminal outcome;
-        # `observed` {input: what it observed — a keyed input's observation record, an
-        # unkeyed one's last commit read}; the `definition` they were observed under;
-        # and a per-key asset's `outcomes` record
-        # (docs/per-key-processing.md §9), whose index lives in `indexes` under
-        # ("@asset", partition). A rename moves it, retirement trims it: one record.
+        # terminal outcome; the `definition`, `config` and `context` its last commit was made
+        # under. A rename moves it.
         self.partitions = Grouped(_flatten(snap.get("partitions"), 2))
         # (output, partition) -> intents of attempts that died while writing it (§8)
         self.repairs: dict[tuple, list] = _flatten(snap.get("repairs"), 2)
@@ -360,8 +356,6 @@ class Model:
             return found["live"]
         keyed = (((self.manifest or {}).get("outputs") or {}).get(output) or {}).get("key") is not None
         return 0 if keyed and (output, partition) in self.heads else None  # committed, never a key
-        index = self.indexes.get((output, partition))
-        return None if index is None else index.count
 
     def heads_of(self, output: str) -> list[tuple[str, dict]]:
         return sorted(self.heads.of(output).items())
@@ -596,7 +590,6 @@ class Model:
             before = declared_before.get(asset, declared_before.get(olds[0]) if olds else None)
             if before is None or olds or before != declaration(manifest, asset, self.homes) or asset in reset:
                 self.changed.add(asset)
-        self._unsubscribe()
         automations = {}
         for name, auto in manifest["automations"].items():
             existing = self.automations.get(name)
@@ -699,34 +692,6 @@ class Model:
         self.unfinished.pop(task["id"], None)
         self._finished(run, task, "canceled", None, at)
 
-    def _subscribed(self, asset: str, input: str, rec: dict) -> bool:
-        """Whether the project still declares the Incremental input a record
-        is what it observed of: the same asset, parameter and upstream output."""
-
-        spec = ((self.manifest or {}).get("assets") or {}).get(asset, {}).get("inputs", {}).get(input) or {}
-        return spec.get("kind") == "incremental" and spec.get("output") == rec["upstream"][0]
-
-    def _unsubscribe(self, asset: str | None = None, partition: str | None = None) -> None:
-        """Retire what inputs the project no longer declares observed (a
-        removed consumer, a renamed parameter, another upstream): records
-        that would keep the upstream's endpoints for good. A partition with
-        an attempt in flight keeps them until it settles: that attempt still
-        reads them. With `asset` and `partition`, only that partition's — one
-        whose attempt ended."""
-
-        live = {(t["asset"], t["partition"]) for tid in self.claims if (t := self.task(tid)) is not None}
-        keys = list(self.partitions) if asset is None else [(asset, partition)]
-        for key in keys:
-            if key in live or key not in self.partitions:
-                continue
-            held = self.partitions[key].get("observed")
-            if not held:
-                continue
-            for input in [i for i, rec in held.items() if not self._subscribed(key[0], i, rec)]:
-                del held[input]
-            if not held:
-                del self.partitions[key]["observed"]
-
     def _retire_output(self, output: str, home: str, old: dict, store: dict, at: float) -> None:
         """Record an output life's leftovers for a cleanup task (K25): the
         store it was on — a built-in one's class and config, else its name
@@ -754,17 +719,17 @@ class Model:
         on another store than `stores` says it was on, resets it: what comes
         back under that name, or what the new store holds, is a new one (K10).
         An output's heads, key indexes (their files become garbage) and repair
-        intents go now, and what its asset's partitions observed: its
+        intents go now, and what its asset's partitions were made under: its
         producer starts over, and every consumer's next run is a full run. A
-        removed asset's partition records go — cursor, observations, failed
-        keys — a job's included, which has no output. `reset_at` keeps the
+        removed asset's partition records go, a job's included, which has no
+        output. `reset_at` keeps the
         deploy number, by output and by asset; an attempt launched before the
         reset commits nothing of it (`Engine.commit_attempt`), so nothing
         waits for one in flight. History keeps the records, and pending
         cleanups stay: their objects are still owed. Returns the assets whose
         outputs were reset: changed, so the deploy owes their OnChange
         automations a firing (`FiringsOwed`). On the new path, an output whose
-        commit axis changes (`axis`: keyed, append-only, single value) is reset
+        commit axis changes (`axis`: keyed, single value) is reset
         too: its partial spans are on the old axis."""
 
         manifest = self.manifest or {}
@@ -815,17 +780,8 @@ class Model:
                 del self.partitions[key]
                 continue
             if key[0] in producers:  # a new life: never built, so missing, not stale
-                for field in ("observed", "definition", "config", "context"):
+                for field in ("definition", "config", "context"):
                     self.partitions[key].pop(field, None)
-            # What an input observed of a reset upstream stays, its next run a full run: a
-            # keyed record's layers name the upstream's earlier life; an unkeyed one is marked.
-            records = self.partitions[key].get("observed") or {}
-            gone = [rec for rec in records.values() if rec["upstream"][0] in reset]
-            for rec in gone:
-                if "commit" in rec:
-                    rec["reset"] = True
-            if gone and key[0] not in producers:
-                self._drop_outcomes(*key)  # failed against keys that are no longer the input's (K47)
         return producers
 
     def _apply_aliases(self, manifest) -> tuple[dict[str, list[str]], dict[str, str]]:
@@ -878,9 +834,6 @@ class Model:
         move(self.repairs, output_map, 0, merge=list)
         move(self.cleanups, output_map, 0)
         move(self.cleaning, output_map, 0, merge=lambda q: sorted(q, key=lambda d: d["n"]))
-        for record in self.partitions.values():
-            for rec in (record.get("observed") or {}).values():
-                rec["upstream"][0] = output_map.get(rec["upstream"][0], rec["upstream"][0])
         for auto in self.automations.values():
             auto["pending"] = [[asset_map.get(a, a), s] for a, s in auto.get("pending") or []]
         return renamed, output_map
@@ -1013,7 +966,6 @@ class Model:
         if task is None:
             return None
         self._release_claim(task["id"], e["attempt"])
-        self._unsubscribe(task["asset"], task["partition"])  # what it read under an input since removed
         outcome, at = e["outcome"], e["finished_at"]
         prepared, execution = {}, {}
         launched = task.get("launched")
@@ -1199,11 +1151,6 @@ class Model:
             for param in (core.get("walk") or {}).get("inputs") or ():  # the lives its progress reads now
                 if (edge := self.core_edges.get((asset, partition, param))) is not None:
                     self.core_read[(asset, partition, param)] = edge[1]
-            for param, (_, done) in (core.get("empty") or {}).items():  # unkeyed inputs' walks from empty
-                if done:
-                    self.core_empty.pop((asset, partition, param), None)
-                else:
-                    self.core_empty[(asset, partition, param)] = ""
             for record in core.get("records") or ():
                 self._record(
                     "batch_inputs",
@@ -1234,14 +1181,6 @@ class Model:
                 record.pop("cursor", None)
             else:
                 record["cursor"] = commit["cursor"]
-        for input, ops in (commit.get("observed") or {}).items():
-            records = record.setdefault("observed", {})
-            if isinstance(ops, dict):  # an unkeyed input: the last commit it read
-                records[input] = ops
-            else:
-                observed.apply(records.setdefault(input, {}), ops)  # a new record's begin with its reset
-            if not self._subscribed(asset, input, records[input]):  # an input removed while it ran
-                del records[input]
         for input, progress in (commit.get("progress") or {}).items():  # the run's walk (D155)
             task.setdefault("progress", {})[input] = progress
         if "outcomes" in commit:
@@ -1548,7 +1487,7 @@ class Model:
 
     def span_key(self, output: str, partition: str) -> tuple:
         """Where an output's partial spans are kept: under its core life, or
-        by name for an output with no core id (append-only, single value)."""
+        by name for an output with no core id (a single value)."""
 
         id_ = self.core_outputs.get((output, partition))
         return ("@life", id_) if id_ is not None else (output, partition)
@@ -1562,8 +1501,8 @@ class Model:
         return id_ if id_ is not None else self.reset_at.get(("life", output), 0)
 
     def axis_head(self, output: str, partition: str) -> int | None:
-        """An output's head on its commit axis: its core life's commit, an
-        append-only output's commit number, else its ref's generation."""
+        """An output's head on its commit axis: its core life's commit, else
+        its ref's generation."""
 
         id_ = self.core_outputs.get((output, partition))
         if id_ is not None:
@@ -1573,8 +1512,6 @@ class Model:
         head = self.heads.get((output, partition))
         if head is None:
             return None
-        if head.get("commit_number") is not None:
-            return int(head["commit_number"])
         return int(head["ref"].get("generation") or 0)
 
     def partial(self, output: str, partition: str, at: int | None) -> bool:
@@ -1642,8 +1579,7 @@ class Model:
         asset gone, of an input no longer a keyed incremental one or bound
         to another upstream, and of a producer whose output a reset started
         over, which reads its inputs in full again. Closed in the core as the
-        deploy applies, so a replay closes the same ones. So does an unkeyed
-        input's walk from empty that reads nothing now."""
+        deploy applies, so a replay closes the same ones."""
 
         assets, outputs = self.manifest["assets"], self.manifest["outputs"]
         for key in [k for k in self.core_read if k[0] not in assets]:
@@ -1662,12 +1598,6 @@ class Model:
                 or upstream != spec.get("output")
             ):
                 closing.append(key)
-        for key in [k for k in self.core_empty if k not in self.core_edges]:  # unkeyed inputs' walks
-            asset, _, param = key
-            spec = ((assets.get(asset) or {}).get("inputs") or {}).get(param) or {}
-            keyed = (outputs.get(spec.get("output")) or {}).get("key") is not None
-            if asset in producers or spec.get("kind") != "incremental" or keyed:
-                del self.core_empty[key]
         if not closing:
             return
         self.core.apply(
@@ -1775,10 +1705,9 @@ class Model:
 
 def axis(output: dict) -> str:
     """An output's commit axis (D205's partial spans): a keyed output's core
-    life, an append-only output's commit numbers, a single value's ref
-    generations."""
+    life, a single value's ref generations."""
 
-    return "keyed" if output.get("key") is not None else "append" if output.get("incremental") else "value"
+    return "keyed" if output.get("key") is not None else "value"
 
 
 def declaration(manifest: dict, asset: str, homes: dict | None = None) -> dict:

@@ -1,4 +1,4 @@
-"""An output whose commit axis changes in place (keyed, append-only, single value) is
+"""An output whose commit axis changes in place (keyed, single value) is
 reset on the new tracking core, so no partial span is read on the wrong axis (Fable's
 probes of PR 2's redesign, round 1)."""
 
@@ -6,7 +6,7 @@ import asyncio
 
 import pytest
 from solera.sdk import In, Incremental, Output, Project, Retry, asset
-from solera.stores import FileStore, Patch
+from solera.stores import FileStore
 from solera_server.tracking import full
 
 from tests.contract.harness import Solera, rebuild
@@ -130,7 +130,6 @@ class W:
         output = {
             "keyed": Output("copy", key="id"),
             "value": Output("copy"),
-            "append": Output("copy", incremental=True),
         }[kind]
 
         @asset(inputs={"files": Incremental(batch_size=1)}, outputs=output, retries=Retry(n=0))
@@ -147,8 +146,6 @@ class W:
             out = [{"id": r["id"], "v": r["v"]} for r in files]
             if kind == "keyed":
                 return rebuild(b, out)
-            if kind == "append":
-                return Patch(out)
             held = None if b.reset else await ctx.load()
             return [*(held or []), *out]
 
@@ -231,28 +228,4 @@ async def test_settle_journals_at_most_once_after_an_unkeyed_output_became_keyed
     await solera.settle(1.0)
     assert kinds.count("Settled") <= 1, (
         f"{kinds.count('Settled')} Settled events in a second of idle ticks; spans {dict(eng.m.partial_spans)}"
-    )
-
-
-async def test_a_value_output_that_becomes_append_only_is_complete_after_a_full_run(solera):
-    w = W(solera)
-    await w.deploy("value")
-    await solera.run("files")
-    await solera.run("copy")  # 4 batches: its first 3 commits are partial, on the generation axis
-    eng = solera.engine
-    spans = [list(s) for s in eng.m.partial_spans[("copy", "")]]
-    await w.deploy("append")
-    eng = solera.engine
-    await solera.run("copy")  # a full run under the new definition: commits 0..3
-    n = 0
-    while not any(lo <= eng.m.axis_head("copy", "") < hi for lo, hi in spans if hi is not None):
-        n += 1
-        w.rows[f"k{n:03d}"] = 1
-        await solera.run("files")
-        await solera.run("copy")
-        assert n < 60, (spans, eng.m.axis_head("copy", ""))
-    await solera.settle(0.5)
-    assert full.stopped(eng) == [] and sorted(full.waiting(eng)) == [], (
-        f"copy is complete at commit {eng.m.axis_head('copy', '')} and counts as partial: spans "
-        f"{dict(eng.m.partial_spans)}, stopped {full.stopped(eng)}"
     )

@@ -38,7 +38,6 @@ class Built:
     elements: dict = field(default_factory=dict)  # a dynamic partitions output -> its elements after
     progress: dict | None = None  # the run's walk over the keyed inputs: {batch, key}
     walk: dict | None = None  # the batch's range of it: {inputs, after, hi, reset}
-    empty: dict = field(default_factory=dict)  # unkeyed input -> [reset, done] of its walk from empty
     partition: str = ""
     generation: Generation | None = None  # the deploy it was built under
     locks: contextlib.AsyncExitStack = field(default_factory=contextlib.AsyncExitStack)
@@ -46,14 +45,13 @@ class Built:
     def payload(self) -> dict | None:
         """The commit's `core` field, as the model applies it."""
 
-        if self.event is None and not self.empty:
+        if self.event is None:
             return None
         return {
-            "event": b64(self.event) if self.event is not None else None,
+            "event": b64(self.event),
             "records": self.records,
             "counts": self.counts,
             "walk": self.walk,
-            "empty": self.empty,
         }
 
 
@@ -72,25 +70,6 @@ def held(ops: tuple) -> None:
 
     if keys := sorted({k for keys in ops[2] for k in keys}):
         raise HeldBack(f"a clear came in on an input since the batch planned: {len(keys)} keys held back")
-
-
-def unkeyed_walks(core: Core, task: dict, prepared: dict) -> dict:
-    """Per unkeyed incremental input of the batch walking from empty (a full
-    run, or the first): `[reset, done]`, whether this batch started it over
-    and whether it ended it. What `Model.core_empty` holds for keyed inputs
-    as a key, it holds for these as `""` until done: completeness reads
-    both."""
-
-    m, asset, partition = core.m, task["asset"], task["partition"]
-    observed = m.partition(asset, partition).get("observed") or {}
-    out = {}
-    for param, plan in (prepared.get("plans") or {}).items():
-        if (plan or {}).get("kind") != "commits" or plan.get("done"):
-            continue
-        reset = plan["full"] or param not in observed
-        if reset or (asset, partition, param) in m.core_empty:
-            out[param] = [bool(reset), bool(plan["final"])]
-    return out
 
 
 async def plan_of(core: Core, task: dict, attempt: str, prepared: dict) -> bytes | None:
@@ -245,7 +224,6 @@ async def build(core: Core, task: dict, attempt: str, prepared: dict, result: di
                     "reset": bool(some["full"]),
                     "keys": some.get("mode") == "keys",
                 }
-            built.empty = unkeyed_walks(core, task, prepared)
             if events:
                 built.event = Tracking.join(events)
             return built
@@ -282,16 +260,6 @@ def full_run(prepared: dict) -> bool:
 
     plans = [p for p in (prepared.get("plans") or {}).values() if p]
     return bool(prepared.get("full")) and bool(plans)
-
-
-def unkeyed(prepared: dict) -> dict:
-    """The preparation as today's path commits its unkeyed incremental
-    inputs, by commit numbers: without the keyed inputs the core commits."""
-
-    plans = {
-        p: plan for p, plan in (prepared.get("plans") or {}).items() if (plan or {}).get("kind") == "commits"
-    }
-    return {**prepared, "plans": plans}
 
 
 def check(core: Core, built: Built) -> None:

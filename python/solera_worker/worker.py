@@ -54,7 +54,6 @@ from solera.sdk import (
     split_partition,
 )
 from solera.stores import (
-    Commits,
     KeyedWrite,
     Keys,
     Opaque,
@@ -325,7 +324,7 @@ class Ctx:
 async def _resolve_inputs(spec, project, asset, keys_io, timeline, observed: Observed):
     """Load each pin by annotation; build call args + ctx.batch (§5, §10).
 
-    An Incremental input over a keyed upstream loads the keys of the batch
+    An Incremental input loads the keys of the batch
     the engine planned, each with its class, classed again from what a
     source served (`each.observe`); `delivered` reports what it observed of
     each, for the engine's record (docs/observed-set.md). Each input loaded
@@ -367,42 +366,28 @@ async def _resolve_inputs(spec, project, asset, keys_io, timeline, observed: Obs
             continue
         ref = Ref.from_json(pin["ref"])
         store = reader(project, ref)
-        if "batch" in pin:  # Incremental: selection + ctx.batch (§5.1)
+        if "batch" in pin and "core" in pin:  # Incremental: the keys its plan names, and ctx.batch (§5.1)
             ch = pin["batch"]
             reset = bool(ch.get("reset"))
-            if "commits" in ch:
-                lo, hi = (int(v) for v in ch["commits"])
-                args[param] = await observed.load(store, ref, t, Commits(lo, hi))
-                batch[param] = Batch(
-                    rows=args[param],
-                    reset=reset,
-                    index=int(ch.get("index") or 0),
-                    count=int(ch.get("count") or 1),
-                    final=not ch.get("more"),
-                    upstream=Upstream(ref.output, range(lo, hi + 1)),
-                )
-                timeline.add("loaded", param, _rows(args[param]))
-                continue
-            if "core" in pin:  # the new tracking core: the keys its plan names
-                planned = core.planned(spec, pin)
-                args[param] = await observed.load(store, ref, t, Keys(core.KeyVersions(planned)))
-                served = getattr(store, "served", None)
-                classes, loaded = planned.observe(served)
-                batch[param] = Batch._of_columns(
-                    classes,
-                    served,
-                    rows=args[param],
-                    reset=reset,
-                    index=int(ch["index"]),
-                    count=int(ch["count"]),
-                    final=bool(ch["final"]),
-                    upstream=Upstream(ref.output),
-                )
-                delivered[param] = {"loaded": loaded}
-                if not reset:
-                    nothing.append(len(planned) > 0 and not classes.any())
-                timeline.add("loaded", param, _rows(args[param]))
-                continue
+            planned = core.planned(spec, pin)
+            args[param] = await observed.load(store, ref, t, Keys(core.KeyVersions(planned)))
+            served = getattr(store, "served", None)
+            classes, loaded = planned.observe(served)
+            batch[param] = Batch._of_columns(
+                classes,
+                served,
+                rows=args[param],
+                reset=reset,
+                index=int(ch["index"]),
+                count=int(ch["count"]),
+                final=bool(ch["final"]),
+                upstream=Upstream(ref.output),
+            )
+            delivered[param] = {"loaded": loaded}
+            if not reset:
+                nothing.append(len(planned) > 0 and not classes.any())
+            timeline.add("loaded", param, _rows(args[param]))
+            continue
         if pin.get("load", "data") == "ref":  # decided at registration, as the engine read for it
             args[param] = ref
         else:
@@ -646,7 +631,6 @@ class _Out:
             output=self.output,
             partition=spec["partition"],
             home=self.info.get("home"),
-            commit_number=self.info.get("commit_number"),
             attempt=spec["attempt"],
             reset=self.reset,
             generation=spec.get("generation"),
@@ -685,8 +669,8 @@ async def _prepare(o: _Out, spec, keys_io) -> None:
         await core.prepare(o)
         return
     if o.info.get("index") is None:
-        if o.opaque and o.output.incremental:
-            raise WriteError(f"{o.output.name}: an opaque write needs a keyed output")
+        if o.opaque and o.output.key is not None:
+            raise WriteError(f"{o.output.name}: an opaque write of a keyed output needs its key index")
         return
 
 
@@ -1091,9 +1075,7 @@ async def _retire(entry: dict, project, writes, state: str) -> dict:
         )
         return _failed(gone, False)
     decl = entry.get("decl") or {}
-    output = Output(
-        entry["output"], key=decl.get("key"), incremental=decl.get("incremental"), **decl.get("config", {})
-    )
+    output = Output(entry["output"], key=decl.get("key"), **decl.get("config", {}))
     await claim([store], state)
     await writes.call(store.cleanup(output, home=entry["home"], before=entry["before"]))
     return {"status": "succeeded", "outputs": {}, "cleaned": entry["id"]}
