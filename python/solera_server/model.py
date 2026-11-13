@@ -288,9 +288,9 @@ class Model:
         # reads: only a commit writes it, so a reader whose upstream started over starts over
         # too until one of its batches commits (`prepare.restarted`).
         self.core_read: dict[tuple, str] = _flatten(snap.get("core_read"), 3)
-        # An output life's partial commits (D205): `span_key` -> [[from, to, proceeded], ...],
-        # `[from, to)` on its commit axis (`axis_head`), `to` None while open. Written only by
-        # its producer's commits, `settle`'s `Settled` and `Proceeded` (`_spans`).
+        # An output life's partial commits (D205): `span_key` -> [[from, to], ...], `[from, to)`
+        # on its commit axis (`axis_head`), `to` None while open. Written only by its
+        # producer's commits and `settle`'s `Settled` (`_spans`).
         self.partial_spans: dict[tuple, list] = {tuple(k): v for k, v in snap.get("partial_spans") or ()}
         # derived from launched attempts, plus memory-only claims of attempts preparing
         # task id -> {attempt, started_at, pin, status, launched?, reads?}; `pin`: `applied` at the claim
@@ -1303,9 +1303,7 @@ class Model:
                         [index.path(name), self.event_counter] for name in delta_names(intent)
                     )
         if self.core is not None:
-            walk = (core or {}).get("walk") or {}
-            restart = bool(walk.get("reset")) or any(r for r, _ in ((core or {}).get("empty") or {}).values())
-            self._spans(asset, partition, heads_before, restart)
+            self._spans(asset, partition, heads_before)
         record = self._partition(asset, partition)
         for field in ("definition", "config", "context"):  # what it was made under: staleness compares
             if field in commit:
@@ -1884,43 +1882,32 @@ class Model:
             return int(head["commit_number"])
         return int(head["ref"].get("generation") or 0)
 
-    def partial(self, output: str, partition: str, at: int | None, proceeded: bool = False) -> bool:
+    def partial(self, output: str, partition: str, at: int | None) -> bool:
         """Whether commit `at` of an output's current life is partial: its
-        producer partition had a walk from empty pending when it was made. A
-        span an operator let readers proceed over counts only with
-        `proceeded`."""
+        producer partition had a walk from empty pending when it was made."""
 
         if at is None:
             return False
         return any(
-            lo <= at and (hi is None or at < hi) and (proceeded or not flag)
-            for lo, hi, flag in self.partial_spans.get(self.span_key(output, partition), ())
+            lo <= at and (hi is None or at < hi)
+            for lo, hi in self.partial_spans.get(self.span_key(output, partition), ())
         )
 
-    def _spans(self, asset: str, partition: str, before: dict, restart: bool) -> None:
+    def _spans(self, asset: str, partition: str, before: dict) -> None:
         """A producer partition's commit, applied: its outputs' partial spans
-        (D205). A walk that starts over closes each open span: a head it moved
-        stays with the old span, one it did not opens the new walk's, partial
-        and not proceeded. While a walk from empty is pending, each output this
-        commit made opens a span at it; once none is, every open one closes at
-        the head, which is complete."""
+        (D205). While a walk from empty is pending, each output this commit
+        made opens a span at it; once none is, every open one closes at the
+        head, which is complete."""
 
         pending = any(k[0] == asset and k[1] == partition for k in self.core_empty)
         for name, (was, head_before) in before.items():
             key, head = self.span_key(name, partition), self.axis_head(name, partition)
             spans = [list(s) for s in self.partial_spans.get(key, ())] if key == was else []
-            if restart and spans and spans[-1][1] is None:
-                # A start-over is a new epoch: the old span (proceeded or not) keeps what came before it,
-                # and the head it did not move is the new walk's, partial and not proceeded.
-                moved = head != head_before
-                spans[-1][1] = head_before + 1 if moved else head_before
-                if not moved:
-                    spans.append([head_before, None, False])
             if spans and spans[-1][1] is None:
                 if not pending:
                     spans[-1][1] = head
             elif pending and head is not None and (key != was or head != head_before):
-                spans.append([head, None, False])
+                spans.append([head, None])
             self._keep_spans(key, spans)
 
     def _keep_spans(self, key: tuple, spans: list) -> None:
@@ -1928,7 +1915,7 @@ class Model:
         for span in spans:
             if span[1] is not None and span[1] <= span[0]:
                 continue
-            if merged and merged[-1][1] == span[0] and merged[-1][2] == span[2]:
+            if merged and merged[-1][1] == span[0]:
                 merged[-1][1] = span[1]
             else:
                 merged.append(span)
@@ -1955,21 +1942,13 @@ class Model:
             spans[-1][1] = self.axis_head(output, e["partition"])
             self._keep_spans(key, spans)
 
-    def _on_Proceeded(self, e):
-        """An operator's proceed (D205) is refused until ERW-42 gives "read at
-        a proceeded head" an owner, so no journal holds one and no span is
-        ever proceeded: replaying one is refused, not applied."""
-
-        raise ValueError(f"a journaled Proceeded of {e.get('asset')!r}: proceed waits for ERW-42")
-
     def _core_close(self, producers: set[str]) -> None:
         """After a deploy, the new path's edges that read nothing now: of an
         asset gone, of an input no longer a keyed incremental one or bound
         to another upstream, and of a producer whose output a reset started
         over, which reads its inputs in full again. Closed in the core as the
-        deploy applies, so a replay closes the same ones. An operator's
-        `proceed` goes with them, and so does an unkeyed input's walk from
-        empty that reads nothing now."""
+        deploy applies, so a replay closes the same ones. So does an unkeyed
+        input's walk from empty that reads nothing now."""
 
         assets, outputs = self.manifest["assets"], self.manifest["outputs"]
         for key in [k for k in self.core_read if k[0] not in assets]:

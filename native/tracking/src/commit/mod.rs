@@ -110,7 +110,7 @@ impl OutputCommit {
 }
 
 /// A full run ends with no commit of its own: its last batch changed
-/// nothing, or it was canceled or failed and a person let downstream proceed.
+/// nothing.
 #[derive(Clone, Debug, PartialEq)]
 pub struct FullRunDone {
     pub output: Id,

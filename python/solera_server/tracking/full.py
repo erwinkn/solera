@@ -5,34 +5,24 @@ One fact decides it: an output commit is partial when its producer
 partition still had a walk from empty pending after it applied (a first run,
 a full run, a start-over not walked to the end). `Model.partial_spans`
 holds those commits per output life, written only by its producer's
-commits, by `settle` (`Settled`) and by an operator's `proceed`
-(`Proceeded`); `Model.partial` answers for one commit. A span opens only at
-a new commit and only shrinks after the fact, so whether a given head is
-partial goes from yes to no, with one way back: a start-over that does not
-move a proceeded head makes it the new walk's, partial and not proceeded,
-until the partition's walk ends (D205: a proceed holds until the partition
-starts over). A batch planned before then is refused at commit.
-
-An operator's proceed is refused for now (`ProceedNotYet`, ERW-42): the fact
-"this partition holds content read at a proceeded head" has no owner yet, so
-no `Proceeded` is journaled on the new path and no span is ever proceeded.
+commits and by `settle` (`Settled`); `Model.partial` answers for one commit.
+A span opens only at a new commit and only shrinks after the fact, so
+whether a given head is partial goes from yes to no.
 
 A batch reads no partial commit, keyed or whole (STA-13, RUN-4): its task is
 held at dispatch while an upstream's head is partial (advisory), its
 preparation checks the heads it planned on, and its commit checks them again
 in the step that records it (`held`). A run that stops midway leaves its
 outputs' heads partial; an alarm names each one with no run of its producer
-under way, and `proceed` lets readers go on over the partial output."""
+under way, and its readers wait until a run of the producer completes it."""
 
 from __future__ import annotations
 
-import contextlib
 import logging
 
 from solera._native import Tracking
 
 from .. import planning
-from ..state import Conflict
 from . import Generation, b64
 
 INCOMPLETE = "upstream incomplete"
@@ -108,19 +98,6 @@ def held(m, heads) -> list | None:
     return None
 
 
-class ProceedNotYet(Conflict):
-    """An operator's proceed on the new tracking core, refused until ERW-42:
-    the readers of a partial output hold until a run of its producer
-    completes it."""
-
-    def __init__(self, asset: str, partition: str):
-        super().__init__(
-            f"proceed {asset} {partition!r}: not yet available on the new tracking core (ERW-42); "
-            f"its readers wait until a run of {asset} completes",
-            False,
-        )
-
-
 def stopped(engine) -> list[dict]:
     """The partial outputs with no run of their producer under way to
     complete them: what an operator must see."""
@@ -137,7 +114,7 @@ def stopped(engine) -> list[dict]:
 def settles(engine, asset: str, partition: str) -> bool:
     """Whether a partition with open spans is complete with no batch to say
     so: complete as known (D177), made under today's definition, and reading
-    no partial head of an upstream, proceeded or not."""
+    no partial head of an upstream."""
 
     m = engine.m
     if asset not in engine.manifest["assets"] or not engine._complete_known(asset, partition):
@@ -150,7 +127,7 @@ def settles(engine, asset: str, partition: str) -> bool:
     except planning.UpstreamOnly:
         return False
     return not any(
-        m.partial(i.output, i.partition, m.axis_head(i.output, i.partition), proceeded=True)
+        m.partial(i.output, i.partition, m.axis_head(i.output, i.partition))
         for i in inputs
         if i.kind == "incremental"
     )
@@ -197,50 +174,3 @@ async def settle(engine) -> None:
             event = Tracking.event_full_run_done(id_.encode())
             core.check(event)
             engine.state.record({"type": "Core", "event": b64(event), "outputs": [], "edges": []})
-
-
-async def proceed(engine, asset: str, partition: str, by: str) -> dict:
-    """An operator's `solera proceed`: the readers of a partition whose run
-    stopped midway go on over its partial output (D205). Its open spans are
-    marked proceeded, until the partition starts over, and its keyed
-    outputs' full runs end (`FullRunDone`)."""
-
-    core = engine.core
-
-    def lives() -> list[str]:
-        names = [o["name"] for o in (engine.manifest["assets"].get(asset) or {}).get("outputs") or ()]
-        return sorted(i for o in names if (i := core.m.core_outputs.get((o, partition))) is not None)
-
-    while True:
-        generation, ids = Generation(core.m), lives()
-        async with contextlib.AsyncExitStack() as locks:
-            for id_ in ids:  # in life-id order, as a batch's commit takes them
-                await locks.enter_async_context(core.lock(id_))
-            if generation.moved:  # a deploy while it waited: start over under the new one
-                continue
-            stuck = [
-                s["output"] for s in stopped(engine) if (s["asset"], s["partition"]) == (asset, partition)
-            ]
-            if not stuck:
-                raise Conflict(
-                    f"{asset} {partition!r}: no incomplete output, or a run of it is under way",
-                    retryable=False,
-                )
-            ending = [
-                Tracking.event_full_run_done(i.encode())
-                for i in ids
-                if core.tracking.full_run(i.encode()) is not None
-            ]
-            event = Tracking.join(ending) if ending else None
-            core.check(event)
-            engine.state.record(
-                {
-                    "type": "Proceeded",
-                    "asset": asset,
-                    "partition": partition,
-                    "by": by,
-                    "at": engine.clock(),
-                    "event": b64(event) if event is not None else None,
-                }
-            )
-        return {"asset": asset, "partition": partition, "outputs": stuck}

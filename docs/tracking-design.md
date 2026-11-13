@@ -382,9 +382,8 @@ In `native/tracking/src/commit/`, as described above:
   commit of the clear that started a full run still under way. A clear
   sets it. The run's last commit carries `ends_full_run`, which clears it;
   a commit can't do so outside a full run unless it is the clear itself.
-  A run that ends without a commit (its last batch changed nothing, or a
-  person let downstream proceed after a cancel or failure) journals
-  `FullRunDone` instead. A flag on the commit is needed because the parts
+  A run that ends without a commit (its last batch changed nothing)
+  journals `FullRunDone` instead. A flag on the commit is needed because the parts
   of one event are checked against the state before it and may not touch
   the same output twice. B3's gate and hold-back rule read `full_run`.
 
@@ -1419,7 +1418,7 @@ upstream's clear still makes its consumer run full (INC-13 stays).
    output that accumulates (a count kept through `ctx.load()`), and readers
    that take it whole. The engine checks this before every spec, so a
    downstream run already in flight pauses too ("held: upstream
-   incomplete"). Each input can opt out if it wants partial data.
+   incomplete").
 4. **Hold back what a rebuild changed under a batch.** When a reader's
    batch commits, it holds back every key it loaded at another version
    than it planned, if its upstream is incomplete, **or if a clear has
@@ -1444,8 +1443,8 @@ upstream's clear still makes its consumer run full (INC-13 stays).
    that loads absent, the last removal at load time. It records this when
    the batch loads, not when it commits.
 5. **A canceled or failed full run** leaves the upstream incomplete, and
-   nothing resumes a run by itself (RUN-10). It raises an alarm, and one
-   operator command lets downstream proceed over the partial output.
+   nothing resumes a run by itself (RUN-10). It raises an alarm, and its
+   readers wait until a run of the producer completes it.
 
 **Example: the gate.** `copy` holds `copy#1`: k1@1, k2@1, k3@1, k4@1
 (copied from c2). Its definition changes, so it runs full at c4, where
@@ -1967,7 +1966,7 @@ executable contract tests, as part of the build (T41).
 |---|---|---|---|
 | INC-15 | An upstream full run reaches downstream as one change; downstream keeps its progress, and the rebuild alone never makes it remove a key and add it back (a key upstream really removed and re-added still is) | §10: archive gets k1, k2, k4 updated, k3 removed, k5 added in one diff | D205 |
 | INC-16 | A reader's batch holds back every key it loaded at another version than it planned, while its upstream is incomplete or if a clear came since it planned; the key stays owed | §10: archive's batch in flight loads k3, k4 absent after copy's clear | D205 |
-| STA-13 | Every reader of an incomplete upstream (keyed, accumulating, whole) runs no batch over it, by default; an input may opt out. A canceled or failed full run raises an alarm, and one command lets downstream proceed | §10: archive is held while copy's full run is between batches | D205 |
+| STA-13 | Every reader of an incomplete upstream (keyed, accumulating, whole) runs no batch over it. A canceled or failed full run raises an alarm, and its readers wait until a run of the producer completes it | §10: archive is held while copy's full run is between batches | D205 |
 | STA-14 | No false alarms: a partition is stale only if something is due; changes that cancel out start nothing | §6: feed's k1 v1 → v2 → v1 | D183 |
 | STA-15 | Failing keys not yet due are shown, not stale | §11: checks shows k2 failing, stale only for k3 and k5 | D191 |
 | KEY-12 | A key that never succeeded and is removed upstream owes nothing | items adds k6; checks fails on it at its first try; items removes k6: no removal is delivered, and the outcome goes | D191 |
@@ -2064,7 +2063,7 @@ store is exact" stands: D196 keeps it.
 
 | # | Decision | Was | Where | Evidence |
 |---|---|---|---|---|
-| D205 | Full runs: the clear at the first batch, plus the gate on every reader of an incomplete upstream (keyed, accumulating, whole), with an opt-out per input; a reader's batch holds back what it loaded at another version than planned while its upstream is incomplete or if a clear came since it planned; a canceled or failed full run raises an alarm and has one command that lets downstream proceed. No new life | P7, P12 (review F2) | §4, §7, §10 | Model (`tests/tracking`): both forms pass every invariant over 5,000 histories × 60 steps on file and table stores; the clear needs 6 rules where the floor needs 7 plus an SDK declaration, writes 17% fewer entries, and needs no second mechanism for single-value outputs. The rebuild in place would have kept readers available (archive held 5,499 times in 2,000 histories under the clear, 0 under the floor) |
+| D205 | Full runs: the clear at the first batch, plus the gate on every reader of an incomplete upstream (keyed, accumulating, whole); a reader's batch holds back what it loaded at another version than planned while its upstream is incomplete or if a clear came since it planned; a canceled or failed full run raises an alarm, and its readers wait until a run of the producer completes it. No new life | P7, P12 (review F2) | §4, §7, §10 | Model (`tests/tracking`): both forms pass every invariant over 5,000 histories × 60 steps on file and table stores; the clear needs 6 rules where the floor needs 7 plus an SDK declaration, writes 17% fewer entries, and needs no second mechanism for single-value outputs. The rebuild in place would have kept readers available (archive held 5,499 times in 2,000 histories under the clear, 0 under the floor) |
 | D206 | Staleness: one witness due key per input, kept exact at every upstream commit, counts on request; with the model's fixes (catch up first, a reset probes the whole input, a reset to `held` probes, a restart re-arms due retries, an outcome never outlives its point). P14's eager counts are not built | P14 (review F3) | §6, §11 | Model: both forms exact over 5,000 histories × 40 steps once fixed (P14 as written miscounted in three cases); one key and one commit number per input; 124 model lines against 150; 4,079 entries read against 43,860 adjusted. Count-on-request cost at scale: still to be measured, by unit B7 |
 | D207 | The engine builds every commit, on a thread off its event loop; nothing goes to a worker | Review F4 | §4, §7 | SOLE-12 at 100M keys: a 10k-key batch in one range about 10 ms CPU, 11–15 GETs cold, one 62 KB PUT; a 100M-key commit streamed about 30 s CPU, 579 MB peak. The scattered 10k-key batch (2.6–2.9 s) is the index's `get`, to be fixed there |
 | D208 | The core does its own I/O in Rust (`object_store`), with one shared memory cache, single-flight fetches and an on-disk cache of layer files; synchronous calls that release the GIL; heavy queries capped by the engine | The I/O boundary | §1, §15 | SOLE-6, 50 concurrent queries on local files, S3 and S3 + 30 ms: equal on small queries; on 1K scattered gets Python fetching cost 100–120 µs more CPU per GET, stalled the event loop up to 0.76 s (Rust under 60 ms) and was 3–93% slower. Cost: +60 s release build, +8 MB |
@@ -2084,7 +2083,7 @@ unit that measures it in the build plan (§15).
 | Context per batch or per run? | Per batch (D184) |
 | Stage, then publish, for non-object stores? | No (D184). One version check per partition instead (D196) |
 | The default grace period T? | No T (D183) |
-| Incomplete upstream: block or warn? | Block every reader by default, with an opt-out per input (D205) |
+| Incomplete upstream: block or warn? | Block every reader (D205) |
 | Rejected keys stay owed and held back? | Yes (D191): owed, not due |
 | Duration per ok key? | Not stored; a histogram and the 10 slowest keys per batch (D195) |
 | Circuit breaker for mass failure? | Not now: points and outcomes spill to files. Revisit if a mass failure shows up in practice |

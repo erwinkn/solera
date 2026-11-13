@@ -904,7 +904,7 @@ impl Tracking {
     }
 
     /// B4: the event that ends `output`'s full run without a commit: its last
-    /// batch changed nothing, or a person let downstream proceed.
+    /// batch changed nothing.
     #[staticmethod]
     fn event_full_run_done<'py>(py: Python<'py>, output: Vec<u8>) -> Bound<'py, PyBytes> {
         PyBytes::new(

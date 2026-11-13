@@ -1,7 +1,7 @@
 """A start-over batch that does not commit an output whose span is open closes that span
 just above its head and opens none: the head stays in a closed span. If the walk then ends
-without committing that output, completion, settle and proceed (which act on open spans
-only) never free it (round 2, Fable). Here the asset returns `Result(outputs={})` for a
+without committing that output, completion and settle (which act on open spans only)
+never free it. Here the asset returns `Result(outputs={})` for a
 batch with no row to write."""
 
 import asyncio
@@ -21,19 +21,7 @@ async def solera(tmp_path):
     await s.close()
 
 
-@pytest.mark.parametrize(
-    "then",
-    [
-        "to the end",
-        pytest.param(
-            "stopped again, then proceed",
-            marks=pytest.mark.xfail(
-                strict=True, reason="ERW-42: proceed is refused on the new tracking core"
-            ),
-        ),
-    ],
-)
-async def test_a_start_over_that_writes_nothing_frees_its_output_at_the_end(solera, then):
+async def test_a_start_over_that_writes_nothing_frees_its_output_at_the_end(solera):
     rows = {k: 1 for k in "abcd"}
     hold, waiting, seen = asyncio.Event(), [False], []
     hold.set()
@@ -81,12 +69,7 @@ async def test_a_start_over_that_writes_nothing_frees_its_output_at_the_end(sole
     for k in rows:
         rows[k] = 0  # no row qualifies any more
     await solera.run("files")
-    answered = None
-    if then == "to the end":
-        await solera.run("copy", mode="full")
-    else:
-        await stop_midway(mode="full")
-        answered = await eng.proceed("copy", "", "test")
+    await solera.run("copy", mode="full")
     await solera.settle(0.5)
     reader = await solera.submit("report")
     try:
@@ -101,7 +84,6 @@ async def test_a_start_over_that_writes_nothing_frees_its_output_at_the_end(sole
         "axis head": eng.m.axis_head("copy", ""),
         "core_empty": dict(eng.m.core_empty),
         "stopped": full.stopped(eng),
-        "proceed answered": answered,
     }
     await solera.cancel(reader["id"])
     assert task["status"] == "succeeded", state

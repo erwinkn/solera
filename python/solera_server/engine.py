@@ -2449,18 +2449,6 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
             self._control(run_id, "cancel", by)
         return self._run_view(self.m.runs.get(run_id) or run)
 
-    async def proceed(self, asset: str, partition: str = "", by: str | None = None) -> dict:
-        """An operator's `solera proceed` (D205): refused on both paths for now.
-        On the new tracking core it waits for ERW-42, so no span is ever
-        proceeded there and a reader of a partial head holds until a run of
-        its producer completes it (`core_full.proceed` is ERW-42's to call)."""
-
-        if self.core is None:
-            raise Conflict(
-                "proceed: readers wait for an incomplete upstream on the new tracking core only", False
-            )
-        raise core_full.ProceedNotYet(asset, partition)
-
     async def pause(self, run_id: str, paused=True, by: str | None = None):
         run = self.m.runs.get(run_id)
         if run is None:

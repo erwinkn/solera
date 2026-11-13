@@ -392,67 +392,6 @@ async def test_a_producer_stopped_midway_is_not_complete_because_its_upstream_is
     )
 
 
-# test_fan_in_owner.py: Which partitions a whole fan-in reads is decided by Planner.head_materialized ->
-
-
-@pytest.mark.xfail(strict=True, reason="ERW-42: proceed is refused on the new tracking core")
-async def test_after_proceed_a_fan_in_reads_without_the_partial_partition(solera):
-    rows = {"a": 1, "b": 1, "c": 1}
-    hold, waiting, seen = asyncio.Event(), [False], []
-    hold.set()
-    site = {"site": StaticPartitions(["east", "west"])}
-
-    @asset(outputs=Output("files", key="id"))
-    def files():
-        return [{"id": k, "v": v} for k, v in rows.items()]
-
-    @asset(partitions=site, inputs={"files": Incremental(batch_size=1)}, outputs=Output("copy", key="id"))
-    async def copy(ctx, files: list):
-        if ctx.batch["files"].index > 0:
-            waiting[0] = True
-            await hold.wait()
-            waiting[0] = False
-        return rebuild(ctx.batch["files"], [{"id": r["id"], "v": r["v"]} for r in files])
-
-    @asset(inputs={"copy": In(all_partitions=True)})
-    def total(copy: dict[str, list]):
-        seen.append({k: sorted(r["id"] for r in v) for k, v in copy.items()})
-        return sum(len(v) for v in copy.values())
-
-    project = Project(assets=[files, copy, total], default_store=FileStore(solera.root / "data"))
-    await solera.deploy(project, cancel_grace=0.2, heartbeat_seconds=0.1)
-    east = canonical_partition(["site"], {"site": "east"})
-    west = canonical_partition(["site"], {"site": "west"})
-    await solera.run("files")
-    await solera.run("copy", partitions=[east, west])
-    await solera.run("total")
-    assert seen == [{east: ["a", "b", "c"], west: ["a", "b", "c"]}], seen
-
-    hold.clear()
-    stopped = await solera.submit("copy", partitions=[west], mode="full")
-    await solera.until(lambda: waiting[0])
-    await solera.cancel(stopped["id"])
-    await solera.wait(stopped)
-    hold.set()
-    eng = solera.engine
-    assert await solera.rows("copy", west) == {"a": 1}
-    reader = await solera.submit("total")
-    await solera.settle(0.4)
-    [task] = [t for t in (await solera.get(f"/runs/{reader['id']}"))["tasks"] if t["asset"] == "total"]
-    assert task.get("held") == ["upstream incomplete", "copy"], task
-    assert len(seen) == 1
-
-    await eng.proceed("copy", west, "test")
-    await solera.wait(reader)
-    print(
-        "\nafter proceed, total read:", seen[1:], "complete_known(west)=", eng._complete_known("copy", west)
-    )
-    assert seen[1:] == [{east: ["a", "b", "c"], west: ["a"]}], (
-        f"after proceed the fan-in read {seen[1:]}: the partial partition was left out, not read "
-        f"(complete_known={eng._complete_known('copy', west)}, incomplete={sorted(full.waiting(eng))})"
-    )
-
-
 # test_fan_in_after_move.py: After an upstream's store move, a partition that has not yet started over is 'not complete'
 
 
@@ -790,23 +729,6 @@ async def test_one_stale_queued_task_does_not_stop_the_dispatch_pass(solera):
         f"'other' never ran: status {detail['request']['status']}; the stale task's run is "
         f"{stale['request']['status']}; {len(errors)} of 40 ticks raised: {errors[:1]}"
     )
-
-
-async def test_proceed_api_answers(solera, capsys):
-    await World(solera, {"a": 1, "b": 1}).deploy()
-    await solera.run("files")
-    await solera.run("copy")
-    out = {}
-    for name in ("nope", "copy", "files"):
-        try:
-            response = await solera.request("POST", f"/assets/{name}/proceed", ok=False, json={})
-            out[name] = (response.status_code, response.text[:200])
-        except Exception as error:
-            out[name] = ("raised", type(error).__name__, str(error)[:200])
-    with capsys.disabled():
-        print("\nproceed:", out)
-    assert out["nope"][0] in (404, 400, 409), out
-    assert out["copy"][0] == 409 and "ERW-42" in out["copy"][1], out  # refused on the new core for now
 
 
 async def test_after_a_premature_end_the_gate_still_holds(solera, tmp_path):

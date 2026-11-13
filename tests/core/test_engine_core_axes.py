@@ -98,17 +98,13 @@ async def test_readers_of_an_output_that_was_keyed_and_stopped_midway_go_on_once
     await solera.run("copy")  # a whole run under the new definition: complete
     await solera.settle(0.5)
     assert sorted(r["id"] for r in await solera.read("copy")) == ["a", "b", "c", "d"]
-    proceeded = None
-    if full.stopped(eng):
-        proceeded = await eng.proceed("copy", "", "test")
-        await solera.settle(0.3)
     reader = await solera.submit("report")
     try:
         await solera.wait(reader, 5)
     except TimeoutError:
         [task] = [t for t in (await solera.get(f"/runs/{reader['id']}"))["tasks"] if t["asset"] == "report"]
         raise AssertionError(
-            f"copy is complete and report still waits: {task.get('held')}, proceed answered {proceeded}, "
+            f"copy is complete and report still waits: {task.get('held')}, "
             f"waiting {sorted(full.waiting(eng))}, spans {dict(eng.m.partial_spans)}, axis head {eng.m.axis_head('copy', '')}"
         ) from None
     assert w.seen == [["a", "b", "c", "d"]], w.seen
@@ -249,7 +245,7 @@ async def test_a_value_output_that_becomes_append_only_is_complete_after_a_full_
     eng = solera.engine
     await solera.run("copy")  # a full run under the new definition: commits 0..3
     n = 0
-    while not any(lo <= eng.m.axis_head("copy", "") < hi for lo, hi, _ in spans if hi is not None):
+    while not any(lo <= eng.m.axis_head("copy", "") < hi for lo, hi in spans if hi is not None):
         n += 1
         w.rows[f"k{n:03d}"] = 1
         await solera.run("files")

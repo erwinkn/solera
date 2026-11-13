@@ -5,9 +5,8 @@ before any output lock, after the state's awaits a launch and a build make, and 
 starts. No tick raises, a whole reader never reads
 its upstream's partial content, every run ends, everything converges once the deploys stop,
 and a replay rebuilds the same model. Each history starts with a full run of the producer
-stopped midway, whose reader `nxt` has a reader of its own (`tail`), and asks to proceed at
-random: the new core refuses (ERW-42), no span is ever proceeded, and no reader reads partial
-content; the held readers go on once the producer is whole. `REDEPLOY_SEEDS` sets the seeds (default 0-5),
+stopped midway, whose reader `nxt` has a reader of its own (`tail`): no reader reads partial
+content, and the held readers go on once the producer is whole. `REDEPLOY_SEEDS` sets the seeds (default 0-5),
 `REDEPLOY_TRACE=1` prints what each commit was planned under, `REDEPLOY_FIRED=<file>` appends
 where each seed's deploys landed."""
 
@@ -21,7 +20,6 @@ import pytest
 from solera.sdk import In, Incremental, Output, Project, Retry, asset
 from solera.stores import FileStore
 from solera_server.state import State
-from solera_server.tracking import full
 
 from tests.contract.harness import Refused, Solera, rebuild
 
@@ -36,7 +34,7 @@ class History:
         self.rows = {k: 1 for k in [*STABLE, "c1", "k1", "t1"]}
         self.projects, self.fired, self.budget, self.armed = {}, [], 8, False
         self.reads, self.read, self.committed, self.trace = 0, {}, [], []
-        self.removed, self.refused, self.proceeded = set(), 0, []  # assets a deploy removed
+        self.removed = set()  # assets a deploy removed
         self.hold, self.waiting, self.stop = asyncio.Event(), False, None
         self.hold.set()
 
@@ -129,20 +127,6 @@ class History:
         self.removed |= set(self.s.engine.manifest["assets"]) - set(manifest["assets"])
         self.s.engine.redeploy(manifest)
 
-    async def proceed(self):
-        """An operator asks to proceed over the producer's stopped run: the new
-        core refuses it until ERW-42."""
-
-        name = self.variant["name"]
-        if not any(p["asset"] == name for p in full.stopped(self.s.engine)):
-            return
-        try:
-            await self.s.engine.proceed(name, "", "test")
-        except full.ProceedNotYet:
-            self.refused += 1
-        else:
-            raise AssertionError("proceed was not refused on the new core")
-
     def instrument(self, monkeypatch):
         from solera_server.executors.inline import InlinePlacement
 
@@ -181,7 +165,6 @@ class History:
             if e.get("type") == "AttemptFinished":
                 pre = ((engine.m.task(e["task"]) or {}).get("launched") or {}).get("prepared") or {}
             out = apply(e)
-            h.proceeded += [str(k) for k, v in engine.m.partial_spans.items() if any(f for *_, f in v)]
             if os.environ.get("REDEPLOY_TRACE"):  # what each commit was planned under and made
                 m, core = engine.m, ((commit or {}).get("core") or {})
                 if e.get("type") == "AttemptFinished":
@@ -196,7 +179,7 @@ class History:
                         )
                         + (core.get("counts"), core.get("walk"), e.get("error"))
                     )
-                elif e.get("type") in ("ProjectRegistered", "Settled", "Proceeded", "Core"):
+                elif e.get("type") in ("ProjectRegistered", "Settled", "Core"):
                     h.trace.append((e["type"], m.deploy_number))
                 spans = {str(k): v for k, v in m.partial_spans.items()}
                 h.trace.append(
@@ -264,8 +247,6 @@ async def test_deploys_at_every_await(tmp_path, monkeypatch, seed):
         await s.wait(stopped)
         h.stop = None
         h.hold.set()
-        await h.proceed()
-        assert h.refused == 1
         tails = [
             await s.submit("nxt"),
             await s.submit("tail"),
@@ -285,7 +266,7 @@ async def test_deploys_at_every_await(tmp_path, monkeypatch, seed):
                     "tail",
                     "settle",
                     "cancel",
-                    "proceed",
+                    "settle",
                 ]
             )
             if op == "files":
@@ -308,13 +289,11 @@ async def test_deploys_at_every_await(tmp_path, monkeypatch, seed):
                 assert error.status == 400 and "Unknown asset" in str(error), error
             if op == "cancel" and runs:
                 await s.cancel(h.rng.choice(runs)["id"])
-            if op == "proceed":
-                await h.proceed()
             await s.settle(h.rng.choice([0.05, 0.2]))
         h.armed = False
         await s.settle(1.0)
-        # The history started with the producer stopped midway and proceed is refused, so its readers
-        # hold until a run of it completes; one may have failed on a deploy (its worker's project).
+        # The history started with the producer stopped midway, so its readers hold until a run of
+        # it completes; one may have failed on a deploy (its worker's project).
         await s.run(h.variant["name"], mode="full")
         for run in runs:
             try:
@@ -347,7 +326,6 @@ async def test_deploys_at_every_await(tmp_path, monkeypatch, seed):
         await s.run("tail")
         for run in tails:  # held while copy was partial; each ends once it is whole
             await s.wait(run, 30)
-        assert not h.proceeded, h.proceeded[:3]
         await s.settle(0.3)
         assert await s.read("report") == sorted(h.rows), (await s.read("report"), h.fired)
         assert sorted(await s.rows("nxt")) == sorted(h.rows), h.fired
