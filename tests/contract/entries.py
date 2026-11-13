@@ -30,7 +30,6 @@ PENDING: dict[str, str] = {
 LATER: dict[str, str] = {
     "test_aut_7_automated_outputs_converge_on_their_sources": "B6: its project has a per-key asset",
     **dict.fromkeys(["KEY", "STA-15", "HIS-6"], "B6: per-key assets"),
-    **dict.fromkeys(["STA-12", "STA-14", "AUT-4", "CHG-4"], "B7: staleness kept current"),
     **dict.fromkeys(
         ["STO-1", "STO-3", "STO-4", "STO-5", "ENG-7", "ENG-8", "ENG-17", "ENG-18"], "B8: exact tables"
     ),

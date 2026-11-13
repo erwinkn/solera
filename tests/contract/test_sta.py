@@ -1135,7 +1135,8 @@ async def test_sta_14_a_change_reverted_before_a_run_leaves_it_fresh_and_starts_
     await ex.feed({"k1": "1"}, items=False)
     assert await solera.status("items") == "materialized" and await solera.stale("items") == []
     detail = await solera.run("items")
-    assert not any(detail["attempts"].values()) and ex.seen["items"][-1].added == ["k1", "k2"]
+    outcomes = [a["outcome"] for attempts in detail["attempts"].values() for a in attempts]
+    assert outcomes == ["skipped"] and ex.seen["items"][-1].added == ["k1", "k2"]
 
 
 async def test_sta_14_a_key_added_and_removed_between_two_runs_is_never_owed(solera):
