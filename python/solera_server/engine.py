@@ -463,7 +463,6 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
         delay=0.0,
         commit=None,
         more=False,
-        repairs=None,
         worker=None,
         end=None,
         reason=None,
@@ -502,8 +501,6 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
             event["late_writes"] = float(info.get("timeout") or 3600) + self.cancel_grace
         if more:
             event["more"] = True
-        if repairs:
-            event["intents"] = repairs
         worker = worker_report(worker)  # values the model applies with no parsing
         if keys is not None:
             keys = worker_report({"keys": keys}).get("keys")
@@ -618,10 +615,10 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
     def _writing(self, task: dict) -> list | None:
         """Why a task must wait for a fenced input's partition, or None: an
         attempt of its upstream holds it — its rows may be visible before its
-        commit is installed — or it owes a repair, a dead writer's rows
-        visible. A batch read now would read a write its head does not hold,
-        and be planned again (docs/observed-set.md): it waits instead, for
-        as long as the upstream's write takes."""
+        commit is installed. A batch read now would read a write its head
+        does not hold: it waits instead, for as long as the upstream's write
+        takes. It never waits for a dead writer's rows to be repaired: the
+        upstream's next attempt does that (D196)."""
 
         manifest = self.manifest
         fenced = set()
@@ -643,8 +640,6 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
             holder = self.m.claimed_partitions.get((input.owner, input.partition))
             if input.owner is not None and holder is not None and self.m.claimed(holder) is not None:
                 return ["writing", where]
-            if (input.output, input.partition) in self.m.repairs:
-                return ["repair", where]
         return None
 
     def _spawn(self, run_id: str, attempt: str, is_pool: bool, executor: str, work):
@@ -1144,13 +1139,6 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
             "cursor": cursor,
             "definition": base["definition"],  # what its inputs' observations are made under
             "outputs": outputs,
-            # A per-key batch's outcome delta, for cleaning up if it never commits.
-            "outcomes": None
-            if each_page is None
-            else {
-                "prefix": self.m.index(f"@{task['asset']}", partition).prefix,
-                "commit_number": each_page["commit_number"],
-            },
         }
 
     def _prefixes(self, inputs: dict, outputs: dict, task: dict) -> list[str]:
@@ -1199,6 +1187,8 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
             if index is not None:
                 info["prefix"] = index["prefix"]
             info.pop("core", None)  # the output's layers: the spec's, never the journal's
+            if "log" in info:  # its layers too; the commit needs where its layer was to go
+                info["log"] = {k: v for k, v in info["log"].items() if k != "pin"}
             outputs[name] = info
         kept = {
             k: prepared.get(k)
@@ -1213,7 +1203,6 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
                 "more",
                 "full",
                 "lineage",
-                "outcomes",
                 "definition",
                 "cleanup",  # a cleanup task's entry (K25)
             )
@@ -1474,11 +1463,7 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
             commit["metadata"] = metadata
         if rows:
             commit["rows"] = rows
-        repaired = sorted(
-            name
-            for name, entry in outputs.items()
-            if ((prepared.get("outputs") or {}).get(name) or {}).get("repairs") and not entry.get("unchanged")
-        )
+        repaired = sorted(name for name, entry in outputs.items() if entry.get("repaired"))
         if repaired:
             commit["repaired"] = repaired
         if result.get("cursor", UNSET) is not UNSET:

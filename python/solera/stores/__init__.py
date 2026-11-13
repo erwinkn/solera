@@ -221,10 +221,10 @@ class Store(Protocol):
     `writes` says how a writer the engine gave up on is kept from writing
     over a newer one — every store declares one (docs/stores.md):
     `"immutable"`, it writes only names no other attempt uses; or
-    `"fenced"`, it implements `acquire`, every write checks the attempt's
-    generation atomically (`solera.fencing`), and `keys(ref, among)` says
-    which keys the partition holds — for a repair after a writer died
-    (docs/versions.md §5).
+    `"fenced"`, every write transaction checks the attempt's version
+    atomically (`solera.fencing`), and `written_at(versions, prior,
+    context)` says which keys the partition holds at a dead writer's
+    version, for the next attempt to repair (docs/stores.md).
 
     Every store implements `cleanup(output, *, partition, key, generation,
     before)`: delete every object of the output the pattern matches — any field left out matches anything,
@@ -250,9 +250,8 @@ class Store(Protocol):
         self, output: Output, *, partition=None, key=None, generation=None, before=None
     ) -> None: ...
 
-    # fenced:    async def acquire(self, context: WriteContext, prior: Ref | None) -> None
-    #            def keys(self, ref: Ref, among: list[str] | None) -> Iterable[list[str]]
-    # in place:  async def written_at(self, versions, prior, context) -> Iterable[list[str]]
+    # fenced:    def keys(self, ref: Ref, among: list[str] | None) -> Iterable[list[str]]
+    #            async def written_at(self, versions, prior, context) -> Iterable[list[str]]
     #            async def full_run_ended(self, output, partition, run, newest, *, prior=None) -> bool
     #            (D196, D211: docs/stores.md, "The contract" and "PostgresStore: the version check,
     #            and full runs built beside")

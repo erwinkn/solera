@@ -243,22 +243,12 @@ def restarted(core: Core, task: dict, input) -> bool:
 
 def refuse(engine, task: dict, run: dict, keyed: list) -> None:
     """What the new path does not run yet, refused for good with why: per-key
-    assets (B6) and stores that write in place (B8)."""
+    assets (B6)."""
 
     from ..engine import NonRetryable
 
-    asset = engine.manifest["assets"][task["asset"]]
     if any(i.spec.get("each") is not None for i in keyed):
         raise NonRetryable("per-key assets do not run on the new tracking core yet (build plan B6)")
-    for output in asset["outputs"]:
-        if (
-            output.get("key") is not None
-            and engine.manifest["stores"][output["store"]]["writes"] != "immutable"
-        ):
-            raise NonRetryable(
-                f"output {output['name']!r}: keyed outputs on stores that write in place do not run on "
-                "the new tracking core yet (build plan B8)"
-            )
 
 
 async def _more(core: Core, input, edge: bytes, conds: dict, hi: str, full: bool) -> bool:

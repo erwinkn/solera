@@ -4,13 +4,13 @@ with its key, batch and version alongside: a keyed output's rows, an
 unkeyed one's (its whole content, or batches), loaded as a list — or, by
 key, as `Each` reads a page. A write says which keys it changed
 (`KeyedWrite.changed`), and `read` the version each key was read at
-(docs/stores.md, "What a write and a load say"). The committed head names the table, so a renamed
-output keeps it. `fence()` at the top of every write transaction, and as
-`acquire`, is all the fencing it needs; `reads`
+(docs/stores.md, "What a write and a load say"). The committed head names the table.
+`fence()` at the top of every write transaction is all the version check it
+needs: nothing is taken before a read. `reads`
 reads an attempt's inputs at one moment, each with the generation that
-wrote what it read (`written()`); `keys` says which keys a partition holds,
-for the repair after a writer died. Each call's transaction runs on a
-thread, off the worker's event loop. The conformance kit
+wrote what it read (`written()`); `written_at` says which keys a partition
+holds at a dead writer's version, for the next attempt to repair. Each
+call's transaction runs on a thread, off the worker's event loop. The conformance kit
 (`solera.testing.stores`) checks it like any store."""
 
 from __future__ import annotations
@@ -42,11 +42,10 @@ class JsonTableStore:
     def can_store(self, t, output) -> bool:
         return takes(t, output, values=False)  # rows as Python: it defines no `prepare` of its own
 
-    def _table(self, output, prior, home=None) -> str:
-        """The committed head's table; for a first write, the output life's:
-        every partition of one life in one table (`home`, docs/stores.md)."""
+    def _table(self, output, prior) -> str:
+        """The committed head's table; for a first write, the output's."""
 
-        return (prior.handle or {}).get("table") if prior is not None else f'"rows_{home or output.name}"'
+        return (prior.handle or {}).get("table") if prior is not None else f'"rows_{output.name}"'
 
     def _transaction(self, table):
         conn = psycopg.connect(self.dsn)  # `with` commits, or rolls back on an exception
@@ -58,20 +57,30 @@ class JsonTableStore:
         )
         return conn, cur
 
-    async def acquire(self, context, prior) -> None:
-        await asyncio.to_thread(self._acquire, context, prior)
+    async def written_at(self, versions, prior, context) -> list[list[str]]:
+        """The keys the partition holds at any of `versions`, the attempts
+        that wrote and ended without a commit, in chunks sorted by their
+        bytes. It takes the version check for `context` first, so no older
+        writer can add a row afterwards."""
 
-    def _acquire(self, context, prior) -> None:
-        table = self._table(context.output, prior, context.home)
+        return await asyncio.to_thread(self._written_at, list(versions), prior, context)
+
+    def _written_at(self, versions, prior, context) -> list[list[str]]:
+        table = self._table(context.output, prior)
         conn, cur = self._transaction(table)
         with conn:
             fence(cur, context, table)
+            cur.execute(
+                f"SELECT DISTINCT k FROM {table} WHERE part = %s AND k IS NOT NULL AND version = ANY(%s)",
+                (context.partition, versions),
+            )
+            return [sorted((k for (k,) in cur.fetchall()), key=str.encode)]
 
     async def store(self, write, prior, context) -> Written:
         return await asyncio.to_thread(self._store, write, prior, context)
 
     def _store(self, write, prior, context) -> Written:
-        out, table = context.output, self._table(context.output, prior, context.home)
+        out, table = context.output, self._table(context.output, prior)
         if context.reset:
             prior = None  # a full run keeps nothing of the content
         conn, cur = self._transaction(table)
@@ -129,15 +138,15 @@ class JsonTableStore:
             ref = Ref(out.name, "", {**handle, "key": out.key}, context.partition)
             return Written(ref, changed=write.changed())
 
-    async def cleanup(self, output, *, home=None, partition=None, key=None, generation=None, before=None):
+    async def cleanup(self, output, *, partition=None, key=None, generation=None, before=None):
         """Delete what the pattern matches (docs/stores.md § Cleanup): the
         partitions `cleaned` takes by the generation that last wrote them —
         or a key's rows of them — and the table once the whole output goes."""
 
-        await asyncio.to_thread(self._cleanup, output, home, partition, key, generation, before)
+        await asyncio.to_thread(self._cleanup, output, partition, key, generation, before)
 
-    def _cleanup(self, output, home, partition, key, generation, before) -> None:
-        table = self._table(output, None, home)
+    def _cleanup(self, output, partition, key, generation, before) -> None:
+        table = self._table(output, None)
         conn, cur = self._transaction(table)
         with conn:
             parts, everything = cleaned(

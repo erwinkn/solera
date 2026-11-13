@@ -308,10 +308,6 @@ def table():
     from solera_postgres import PostgresStore
 
     class Table(Faults, PostgresStore):
-        async def acquire(self, *args, **kw):
-            self.calls.append("acquire")
-            return await super().acquire(*args, **kw)
-
         @contextlib.asynccontextmanager
         async def reads(self):
             self.calls.append("load")

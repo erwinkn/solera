@@ -1444,7 +1444,7 @@ async def test_a_key_cleanup_deletes_the_keys_rows_from_the_builds_too(store):
     old = await store.store(rows(z="old"), None, at(out, 1))
     run = await store.store(rows(a="5"), old.ref, at(out, 5, reset=True))
     await store.store(Patch(rows(x="6")), run.ref, at(out, 6, run=5))
-    await store.acquire(at(out, 7, run=5), run.ref)
+    await store.written_at([], run.ref, at(out, 7, run=5))
     await store.cleanup(out, partition="", key="x", generation=None)
     assert await solera(store, run.ref) == {"a": "5"}
     assert await store.full_run_ended(out, "", 5, 7) and outside(store, out) == {"a": "5"}

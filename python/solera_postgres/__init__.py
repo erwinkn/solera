@@ -890,22 +890,6 @@ class PostgresStore:
             (table, parts),
         )
 
-    async def acquire(self, context: WriteContext, prior: Ref | None = None) -> None:
-        """Today's path: take the attempt's version check for the partition it
-        writes — in the table `prior`, the committed head, names — in a
-        transaction of its own, before any read of the store: from here on
-        no older attempt can change it."""
-
-        if context.generation is None:
-            return
-        await asyncio.to_thread(self._acquire, context, prior)
-
-    def _acquire(self, context: WriteContext, prior: Ref | None) -> None:
-        table, _, _ = self._table(context.output, prior)
-        with self._connect() as conn, conn.cursor() as cur:
-            self._domain(cur, table)
-            self._check(cur, table, context, write=False)
-
     def _indexes(self, output: Output) -> list[list[str]]:
         """The table's indexes: the declared ones, and one on the key column."""
 

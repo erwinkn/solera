@@ -133,8 +133,10 @@ async def test_the_engine_ends_on_what_it_read(tmp_path, monkeypatch):
 async def test_an_attempt_ended_from_writing_owes_a_repair(tmp_path):
     """`Classify`. The worker takes the gate and goes silent mid-write: the
     engine ends A from `writing`, so its evidence is `writing`, never
-    `none`, and the outputs it meant to change are owed a repair (TLC
-    without the rule: recorded `none`, while its write landed)."""
+    `none` (TLC without the rule: recorded `none`, while its write
+    landed). A keyed output in a table would owe a repair for it
+    (tests/core/test_engine_core_dead_writers.py); a single value owes
+    none, since its next write replaces it whole."""
 
     state = await State.open(tmp_path.as_uri(), "test", flush_interval=0.001)
     engine = engine_for(state, REMOTE, cancel_grace=0.1)
@@ -147,7 +149,7 @@ async def test_an_attempt_ended_from_writing_owes_a_repair(tmp_path):
     await engine.cancel(run["id"])
     await until(engine, lambda: state.model.claimed(attempt) is None)
     assert await fence(state, run["id"], attempt) == ("ended", "writing")
-    assert [r["attempt"] for r in state.model.repairs[("remote", "")]] == [attempt]
+    assert state.model.repairs == {}
     late = lifecycle.control(lifecycle.SEALED, worker_id="w", result={"status": "succeeded"})
     with pytest.raises(Conflict):  # the worker, back: its seal, on the version it held, is refused
         await swap(state.objects, f"{state.attempt_path(run['id'], attempt)}{lifecycle.CONTROL}", late, held)

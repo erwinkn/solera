@@ -1905,7 +1905,7 @@ class Project:
             # partition holds, for a repair (docs/versions.md §5). Either kind cleans up
             # an output removed or moved away from it (K25).
             writes = getattr(store, "writes", None)
-            needs = {"immutable": ("cleanup",), "fenced": ("acquire", "keys", "cleanup")}.get(writes)
+            needs = {"immutable": ("cleanup",), "fenced": ("written_at", "keys", "cleanup")}.get(writes)
             if needs is None:
                 raise RegistrationError(
                     f"store {name!r}: writes must be 'immutable' or 'fenced' (docs/stores.md)"

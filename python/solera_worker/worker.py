@@ -488,19 +488,17 @@ async def _store_outputs(
     worker_id=None,
     channel=None,
 ):
-    """Store each returned output (§4, §6, §8, §9), in two phases.
+    """Store each returned output (§4, §6, §8, §9).
 
-    Planning compares each keyed output's write with its key index as pinned
-    in the spec, and writes the changes as the commit's delta file: every key
-    written is one, at the attempt's generation (docs/versions.md), and a
-    write that changes nothing — an empty patch, a set listed again — is
-    not stored at all and keeps the head. Then
-    `fence(intents, gated)` begins writing: on stores that take a gate
-    (all but `immutable` ones), it takes the attempt's gate first, listing
-    their delta files — the keys this attempt is about to change — and only
-    then do the stores write. An engine that finds the fence taken by a worker that then
-    died keeps the outputs owing a repair, and their intents, for the next attempt
-    to repair (`_repair`). Returns `{name: entry}` and the cursor."""
+    Each keyed write is read once; a write that changes nothing (an empty
+    patch, a set listed again) is not stored at all and keeps the head. Then
+    `fence` begins writing: for a store that writes in place, it first takes
+    the attempt's gate in its control file, so an engine that ended the
+    attempt knows whether its worker may have written. An output such a dead
+    writer may have left rows in is repaired first (`batch.repair`), then
+    the stores write, each write transaction checking the attempt's version
+    itself: nothing is asked of a store before. Returns `{name: entry}` and
+    the cursor."""
 
     manifest_asset = project.manifest["assets"][asset.name]
     declared = {o["name"]: o for o in manifest_asset["outputs"]}
@@ -518,16 +516,14 @@ async def _store_outputs(
     else:
         raise StoreError(f"{asset.name}: multi-output assets must return Result(outputs={{...}})")
 
-    # Acquire: a fenced store's generation, before anything reads the store —
-    # repair included (docs/lifecycle.md §9.7).
     outs: dict[str, _Out] = {}
     for name, value in values.items():
         if name not in decls:
             raise StoreError(f"{asset.name}: returned undeclared output {name!r}")
         store = project.stores[declared[name]["store"]]
-        o = outs[name] = _Out(name, decls[name], store, pinned.get(name) or {}, value)
-        if o.kind == "fenced":
-            await store.acquire(o.context(spec, worker_id), o.prior)
+        outs[name] = _Out(name, decls[name], store, pinned.get(name) or {}, value)
+    # The outputs a dead writer may have left rows in (a table's): repaired before anything is written.
+    dead = {name: o for name, o in outs.items() if o.info.get("repairs")}
 
     # Prepare: each keyed write read once; the engine builds its commit from the changes.
     for o in outs.values():
@@ -543,8 +539,10 @@ async def _store_outputs(
                 del outs[name]
             else:  # no data to write, but migrations to apply: the same content under the new schema
                 o.schema_only = True
-    if outs:  # only by a worker about to write; a gate only for stores that take one (§2.4, §9.6)
-        await fence({}, any(o.kind != "immutable" for o in outs.values()))
+    if outs or dead:  # only by a worker about to write; a gate only for stores that take one (§2.4, §9.6)
+        await fence({}, any(o.kind != "immutable" for o in (*outs.values(), *dead.values())))
+    for o in dead.values():
+        await writes.call(core.repair(o, o.context(spec, worker_id)))
 
     # Write: nothing reaches a store before the fence is ours.
     for name, o in outs.items():
@@ -605,6 +603,8 @@ async def _store_outputs(
             entry["rows"] = rows
         entries[name] = entry
         timeline.add("stored", name, rows)
+    for name in dead:  # the engine forgets the dead versions once this attempt commits
+        entries.setdefault(name, {"unchanged": True})["repaired"] = True
     return entries, cursor
 
 

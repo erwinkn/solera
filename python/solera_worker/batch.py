@@ -170,6 +170,28 @@ def _encode(o, f) -> int:
     return f.tell()
 
 
+async def repair(o, context) -> None:
+    """Delete what dead writers left in a keyed output's table (D196): the
+    attempts whose versions `info["repairs"]` lists wrote, perhaps, and ended
+    without a commit. The store says which keys the partition holds at those
+    versions, after taking this attempt's version check, which locks every
+    older writer out for good. A key the output's log lacks is deleted: no
+    commit ever recorded it. A key the log has keeps its dead row until its
+    producer writes it again; the log's version says it is not the row's."""
+
+    held = await o.store.written_at(o.info["repairs"], o.prior, context)
+    pin, lacking = o.info.get("core"), []
+    for chunk in held:
+        found = set()
+        if pin is not None:
+            rows, _ = await asyncio.to_thread(shared(pin["url"]).get, pin["layers"], int(pin["head"]), chunk)
+            found = {row[0] for row in rows}
+        lacking += [key for key in chunk if key not in found]
+    if lacking:
+        prepared = await asyncio.to_thread(prepare_for, o.store, Patch([], remove=lacking), o.output)
+        await o.store.store(KeyedWrite(prepared, removes=frozenset(lacking)), o.prior, context)
+
+
 # -- logs ----------------------------------------------------------------------------
 
 PART_BYTES = 1 << 20  # about what a part of a log's commit holds, encoded

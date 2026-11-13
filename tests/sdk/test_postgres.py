@@ -146,7 +146,7 @@ async def test_a_renamed_output_keeps_its_table(store):
     old = output(key="id", primary_key=["id"])
     first = await store.store([{"id": "a", "v": "1"}], None, fenced(old, 1))
     new = output(key="id", primary_key=["id"])
-    await store.acquire(fenced(new, 2), first.ref)
+    await store.written_at([], first.ref, fenced(new, 2))
     moved = await store.store(Patch([{"id": "b", "v": "1"}]), first.ref, fenced(new, 2))
     assert moved.ref.table == first.ref.table and new.name not in moved.ref.table
     assert sorted(r["id"] for r in await store.load(moved.ref, list[dict], None)) == ["a", "b"]
@@ -388,12 +388,12 @@ async def test_a_newer_generation_fences_older_writers(store):
 
     out = output(key="id")
     first = await store.store([{"id": "a", "v": "1"}], None, fenced(out, 5))
-    await store.acquire(fenced(out, 7))
+    await store.written_at([], None, fenced(out, 7))
     with pytest.raises(StoreError, match="newer attempt"):
         await store.store([{"id": "a", "v": "0"}], first.ref, fenced(out, 5))
     with pytest.raises(StoreError, match="newer attempt"):
-        await store.acquire(fenced(out, 7, "a duplicate"))
-    await store.acquire(fenced(out, 7))
+        await store.written_at([], None, fenced(out, 7, "a duplicate"))
+    await store.written_at([], None, fenced(out, 7))
     written = await store.store([{"id": "a", "v": "2"}], first.ref, fenced(out, 7))
     assert await store.load(written.ref, list[dict], None) == [{"id": "a", "v": "2"}]
 
@@ -406,7 +406,7 @@ async def test_a_repair_writing_no_rows_still_marks_the_slice_written(store):
 
     out = output(key="id", incremental=True)
     first = await store.store([{"id": "a", "v": "1"}], None, fenced(out, 12))
-    await store.acquire(fenced(out, 15), first.ref)
+    await store.written_at([], first.ref, fenced(out, 15))
     nothing = KeyedWrite(prepare_for(store, Patch([]), out), None, frozenset())
     repaired = await store.store(nothing, first.ref, fenced(out, 15))
     async with store.reads() as reader:
@@ -431,7 +431,7 @@ async def test_a_takeover_waits_for_an_older_writers_transaction(store):
     acquired = threading.Event()
 
     def take():
-        asyncio.run(store.acquire(fenced(out, 9)))
+        asyncio.run(store.written_at([], None, fenced(out, 9)))
         acquired.set()
 
     thread = threading.Thread(target=take)
@@ -452,7 +452,7 @@ async def test_the_first_write_creates_and_acquires(store):
     it, in the same transaction; a stale writer arriving later is refused."""
 
     out = output(key="id")
-    await store.acquire(fenced(out, 3))  # no table yet: the check is taken all the same
+    await store.written_at([], None, fenced(out, 3))  # no table yet: the check is taken all the same
     first = await store.store([{"id": "a", "v": "1"}], None, fenced(out, 3))
     with pytest.raises(StoreError, match="newer attempt"):
         await store.store([{"id": "a", "v": "0"}], first.ref, fenced(out, 2))
@@ -532,7 +532,7 @@ async def test_a_migration_runs_between_acquisitions_never_under_one(store):
         store.migrate(out, [Migration("backfill", backfill)], fenced(out, 5))
     )
     assert inside.wait(10)
-    acquiring, acquired, _ = in_thread(store.acquire(fenced(out, 9)))
+    acquiring, acquired, _ = in_thread(store.written_at([], None, fenced(out, 9)))
     assert not acquired.wait(0.5)  # waits behind the migration
     go.set()
     assert migrated.wait(10) and acquired.wait(10) and not errors
@@ -552,7 +552,7 @@ async def test_an_older_attempts_migration_is_refused(store):
     out = output(key="id")
     first = await store.store([{"id": "a", "v": "1"}], None, fenced(out, 5))
     table, _, _ = store._table(out)
-    await store.acquire(fenced(out, 9))
+    await store.written_at([], None, fenced(out, 9))
     with pytest.raises(StoreError, match="newer attempt"):
         await store.migrate(out, [Migration("stale", f"UPDATE {table} SET v = 'stale'")], fenced(out, 5))
     assert await store.load(first.ref, list[dict], None) == [{"id": "a", "v": "1"}]
@@ -718,7 +718,7 @@ async def test_a_partitions_first_write_waits_for_a_migration(store):
     p2 = context(out, partition="p2", generation=5, worker_id="i")
 
     async def first_write():
-        await store.acquire(p2)
+        await store.written_at([], None, p2)
         return await store.store([{"id": "b", "v": "1"}], None, p2)
 
     writing, written, write_errors = in_thread(first_write())

@@ -32,8 +32,9 @@ import math
 from base64 import b64decode, b64encode
 
 import orjson
+from solera import lifecycle
 from solera._native import Tracking
-from solera.keys.layers import LayerState, delta_names, index_prefix
+from solera.keys.layers import LayerState, index_prefix
 
 from . import history
 from .lake import LakeState
@@ -206,7 +207,8 @@ class Model:
         # terminal outcome; the `definition`, `config` and `context` its last commit was made
         # under; `edges`, each incremental input's edge life as its last commit over it left it.
         self.partitions = Grouped(_flatten(snap.get("partitions"), 2))
-        # (output, partition) -> intents of attempts that died while writing it (§8)
+        # (output, partition) -> the versions of attempts that may have written its table and
+        # ended without a commit: the next attempt repairs what they left (`_dead_writer`)
         self.repairs: dict[tuple, list] = _flatten(snap.get("repairs"), 2)
         # (output, partition) -> cleanup of an immutable store, each entry at the
         # event counter that let go of it: for the partition's next attempt to clean up
@@ -699,10 +701,8 @@ class Model:
             del self.heads[key]
         for key in [k for k in self.partial_spans if k[0] in reset]:  # they go with the life
             del self.partial_spans[key]
-        for key in [k for k in self.repairs if gone(k)]:  # what dead attempts meant to write
-            index = self.index(*key)
-            for intent in self.repairs.pop(key):
-                self.garbage.extend([index.path(name), self.event_counter] for name in delta_names(intent))
+        for key in [k for k in self.repairs if gone(k)]:  # what dead writers left went with the table
+            del self.repairs[key]
         for key in [k for k in self.indexes if gone(k)]:
             index = self.indexes.pop(key)
             self.garbage.extend([index.path(name), self.event_counter] for name in sorted(index.referenced()))
@@ -859,16 +859,8 @@ class Model:
             launched = None
             self._claimed(run, task, e["attempt"], e["started_at"])
         times = self._attempt_events(run, task, e, launched)
-        for output, intent in (e.get("intents") or {}).items():
-            if self.reset_at.get(("output", output), 0) > prepared.get("deploy_number", self.deploy_number):
-                # Reset since it launched: what it meant to write was the old output's,
-                # which owes no repair. Its files go, from where it wrote them.
-                prefix = ((prepared.get("outputs") or {}).get(output) or {}).get("prefix")
-                index = LayerState(prefix=prefix) if prefix else self.index(output, task["partition"])
-                self.garbage.extend([index.path(name), self.event_counter] for name in delta_names(intent))
-                continue
-            intents = self.repairs.setdefault((output, task["partition"]), [])
-            intents.append({**intent, "run": e["run"], "attempt": e["attempt"]})
+        if launched is not None and "commit" not in e and e.get("write", lifecycle.NONE) != lifecycle.NONE:
+            self._dead_writer(task["partition"], launched)
         self._cleaned_up((task.get("cleanup") or {}).get("partition", task["partition"]), e, prepared)
         if launched is not None and not e.get("commit") and False:
             self._abandoned(task["partition"], e["attempt"], launched, at + float(e.get("late_writes") or 0))
@@ -1033,14 +1025,8 @@ class Model:
             if before is None or before["ref"].get("generation") != head["ref"].get("generation"):
                 changed.append(name)
             self.heads[(name, partition)] = {**head, "run": e["run"], "attempt": e["attempt"], "at": at}
-            if name in commit.get("repaired", ()):
-                # The commit's delta took in what the dead attempts left (§8):
-                # their intent files are no longer needed.
-                index = self.index(name, partition)
-                for intent in self.repairs.pop((name, partition), ()):
-                    self.garbage.extend(
-                        [index.path(name), self.event_counter] for name in delta_names(intent)
-                    )
+        for name in commit.get("repaired", ()):  # its attempt deleted what dead writers left
+            self.repairs.pop((name, partition), None)
         self._spans(asset, partition, heads_before)
         record = self._partition(asset, partition)
         for field in ("definition", "config", "context"):  # what it was made under: staleness compares
@@ -1295,6 +1281,25 @@ class Model:
             self.cleaning.pop(key, None)
         for entry_id in e.get("retired") or ():  # a stuck cleanup task's output life (K25)
             self.retired.pop(entry_id, None)
+
+    def _dead_writer(self, partition: str, launched: dict) -> None:
+        """An attempt that may have written ended without a commit (D196). On
+        a store that writes in place, its rows may sit in a keyed output's
+        table, each at the attempt's version: the version is kept, and the
+        output's next attempt asks the store which keys hold it, deletes
+        those the log lacks, and locks the dead writer out. A store of files
+        needs none of it: what a dead writer left there, nothing names."""
+
+        prepared = launched["prepared"]
+        for output, info in (prepared.get("outputs") or {}).items():
+            contract = info["contract"]
+            if contract.get("key") is None or contract["writes"] == "immutable":
+                continue
+            if self.reset_at.get(("output", output), 0) > prepared.get("deploy_number", self.deploy_number):
+                continue  # reset since it launched: what it wrote was the old output's
+            versions = self.repairs.setdefault((output, partition), [])
+            if launched["generation"] not in versions:
+                versions.append(launched["generation"])
 
     def _on_FilesCleanedUp(self, e):
         gone = set(e["paths"])
