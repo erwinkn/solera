@@ -1,6 +1,6 @@
 """Output lives across deploys on the new tracking core: a gate entry names the life it
-read, a kind change ends a core life, proceed locks the lives of now, and a rebind away
-from a removed upstream closes its edge (Sol's probes of PR 2's redesign, round 1)."""
+read, a kind change ends a core life, and a rebind away from a removed upstream closes
+its edge."""
 
 import asyncio
 
@@ -72,43 +72,6 @@ class World:
         await self.s.cancel(request["id"])
         await self.s.wait(request)
         self.hold.set()
-
-
-@pytest.mark.xfail(strict=True, reason="ERW-42: proceed is refused on the new tracking core")
-async def test_proceed_rechecks_lives_after_awaiting_locks(solera):
-    w = World(solera)
-    await solera.deploy(w.project(), cancel_grace=0.1, heartbeat_seconds=0.1)
-    await solera.run("files")
-    await solera.run("copy")
-    await w.cancel_midway(mode="full")
-    eng = solera.engine
-    old_id = eng.m.core_outputs["copy", ""]
-    lock = eng.core.lock(old_id)
-    await lock.acquire()
-    proceeding = asyncio.create_task(eng.proceed("copy"))
-    await asyncio.sleep(0.05)
-    new = w.project(store="other")
-    eng.redeploy(new.manifest)
-    solera.project = new
-    from solera_server.executors.inline import InlinePlacement
-
-    # A new InlinePlacement is selected from the current project for the new run.
-    original = InlinePlacement._work
-
-    def work(self, stage):
-        self.project = new
-        return original(self, stage)
-
-    from unittest.mock import patch
-
-    with patch.object(InlinePlacement, "_work", work):
-        await w.cancel_midway(mode="full")
-    new_id = eng.m.core_outputs["copy", ""]
-    assert new_id != old_id and eng.core.tracking.full_run(new_id.encode()) is not None
-    lock.release()
-    await proceeding
-    assert full.waiting(eng) == set()
-    assert eng.core.tracking.full_run(new_id.encode()) is None, "proceed left the new life full-run marked"
 
 
 async def test_old_whole_pin_is_not_reinterpreted_on_new_lifes_axis(solera):

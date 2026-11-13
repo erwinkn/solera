@@ -197,13 +197,6 @@ def _main():
     cleanups.add_argument("output")
     cleanups.add_argument("partition", nargs="?", default="")
     cleanups.add_argument("--clear", action="store_true", help="Forget the stuck entries; their objects stay")
-    proceed = commands.add_parser(
-        "proceed",
-        help="Let the readers of a partition whose run stopped midway go on over its partial output "
-        "(docs/tracking-design.md §10, D205)",
-    )
-    proceed.add_argument("asset")
-    proceed.add_argument("partition", nargs="?", default="")
     merges = commands.add_parser(
         "merges",
         help="A key index's failed merges, and when upkeep tries them again (docs/key-index-design.md § Compaction)",
@@ -536,11 +529,6 @@ async def _remote(args, parser):
             response = await client.post(f"{base}/cleanups:clear", json=body)
             response.raise_for_status()
             print(json.dumps(response.json(), indent=2))
-        elif args.command == "proceed":
-            body = {"partition": args.partition, "by": "cli"}
-            response = await client.post(f"{base}/assets/{args.asset}/proceed", json=body)
-            response.raise_for_status()
-            print(json.dumps(response.json(), indent=2))
         elif args.command == "merges" and args.clear:
             body = {"output": args.output, "partition": args.partition, "by": "cli"}
             response = await client.post(f"{base}/merges:clear", json=body)
@@ -649,8 +637,6 @@ async def _local(args, parser):
                 else runtime.partition_cleanups(args.output, args.partition)
             )
             print(json.dumps(view, indent=2))
-        elif args.command == "proceed":
-            print(json.dumps(await runtime.proceed(args.asset, args.partition, "cli"), indent=2))
         elif args.command == "merges":
             view = (
                 runtime.clear_merges(args.output, args.partition, "cli")

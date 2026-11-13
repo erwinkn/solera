@@ -1,6 +1,6 @@
 """Full runs on the engine's new tracking core (B5, D205): the gate on every
-reader of an incomplete upstream, how a full run ends, what a batch holds
-back, and the operator's `proceed`."""
+reader of an incomplete upstream, how a full run ends, and what a batch holds
+back."""
 
 import asyncio
 
@@ -19,12 +19,11 @@ from solera.sdk import (
 )
 from solera.stores import FileStore, Patch
 from solera_server.planning import Planner
-from solera_server.state import Conflict, State
 from solera_server.tracking import b64, full
 from solera_server.tracking import prepare as prepare_module
 
 from tests.contract.example import Example
-from tests.contract.harness import Outside, Refused, Solera, SourceStore, rebuild
+from tests.contract.harness import Outside, Solera, SourceStore, rebuild
 from tests.contract.test_run import hold
 from tests.contract.test_sta import INCOMPLETE, Files, decided
 
@@ -290,35 +289,6 @@ async def test_a_whole_reader_waits_for_a_full_run_over_unkeyed_inputs(solera, t
     assert seen == [3] and full.waiting(solera.engine) == set()
 
 
-async def test_proceed_and_a_commit_of_several_outputs_take_their_locks_in_one_order(solera, tmp_path):
-    @asset(outputs=[Output("z", key="id"), Output("a", key="id")])
-    def two():
-        return {"z": [{"id": "k"}], "a": [{"id": "k"}]}
-
-    await solera.deploy(Project(assets=[two], default_store=FileStore(tmp_path / "data")))
-    eng = solera.engine
-    run, entered, release = eng.core.run, asyncio.Event(), asyncio.Event()
-
-    async def first_build_waits(fn, *args, **kwargs):
-        result = await run(fn, *args, **kwargs)
-        if fn == eng.core.tracking.build_commit and not entered.is_set():
-            entered.set()
-            await release.wait()
-        return result
-
-    eng.core.run = first_build_waits
-    request = await solera.submit("two")
-    await solera.until(entered.is_set)
-    ids = eng.m.core_outputs
-    assert ids[("z", "")] < ids[("a", "")], ids  # id order and name order differ
-    proceeding = asyncio.create_task(eng.proceed("two"))
-    release.set()
-    detail = await solera.wait(request, timeout=5)
-    assert detail["request"]["status"] == "succeeded"
-    with pytest.raises(Conflict):  # nothing to let through: refused, not stuck
-        await asyncio.wait_for(proceeding, 5)
-
-
 async def test_a_rebound_input_closes_its_edge_at_deploy(solera, tmp_path):
     def project(up):
         @asset(outputs=Output("left", key="id"))
@@ -341,60 +311,6 @@ async def test_a_rebound_input_closes_its_edge_at_deploy(solera, tmp_path):
     assert ("copy", "", "data") in solera.engine.m.core_edges
     await solera.deploy(project("right"))
     assert ("copy", "", "data") not in solera.engine.m.core_edges
-
-
-@pytest.mark.xfail(strict=True, reason="ERW-42: proceed is refused on the new tracking core")
-async def test_proceed_lets_readers_go_on_over_a_partial_output_until_it_starts_over(solera, tmp_path):
-    files, seen = Files(solera, {"a": 1, "b": 1, "c": 1}), []
-
-    @asset(inputs={"copy": In()})
-    def report(copy: list):
-        seen.append(len(copy))
-        return len(copy)
-
-    project = files.project()
-    await solera.deploy(
-        Project(
-            assets=[*project.assets.values(), report],
-            stores=project.stores,
-            default_store=FileStore(solera.root / "data"),
-        ),
-        cancel_grace=0.2,
-        heartbeat_seconds=0.1,
-    )
-    await solera.run("files")
-    await solera.run("copy")
-    with pytest.raises(Refused):  # nothing to let through
-        await solera.post("/assets/copy/proceed", {"partition": ""})
-    await files.cancel_midway(mode="full")
-    assert await solera.alarmed("copy")
-    reader = await solera.submit("report")
-    task = await decided(solera, reader, "report")
-    assert task.get("held") == [INCOMPLETE, "copy"] and seen == [], task
-    done = await solera.post("/assets/copy/proceed", {"partition": "", "by": "test"})
-    assert done["outputs"] == ["copy"]
-    await solera.wait(reader)
-    assert seen == [1] and not await solera.alarmed("copy"), "over the partial output: a, the first batch's"
-    assert full.running(solera.engine.core) == set(), "its full run ended"
-    await solera.state.durable()
-    replay = await State.open((tmp_path / "state").as_uri(), "contract", writer=False)
-    try:
-        assert replay.model.partial_spans == solera.engine.m.partial_spans != {}
-        assert full.waiting(solera.engine) == set(), "every span of copy's is proceeded"
-    finally:
-        await replay.close()
-    files.waiting = False  # the canceled batch never got past its hold
-    files.hold.clear()  # the next full run starts over: its readers wait again
-    rebuild = await solera.submit("copy", mode="full")
-    await solera.until(lambda: files.waiting)
-    assert full.waiting(solera.engine) == {("copy", "")}
-    reader = await solera.submit("report")
-    task = await decided(solera, reader, "report")
-    assert task.get("held") == [INCOMPLETE, "copy"], task
-    files.hold.set()
-    await solera.wait(rebuild)
-    await solera.wait(reader)
-    assert seen == [1, 3]
 
 
 def test_the_engines_own_tasks_pass_the_gate(tmp_path):
@@ -453,58 +369,6 @@ async def test_an_input_cleared_while_the_batch_builds_replans_it_without_spendi
     assert detail["request"]["status"] == "succeeded", detail
     assert [a["outcome"] for a in _attempts(detail, "join")] == ["replanned", "succeeded"]
     assert await solera.rows("join") == {"k1": "2", "k2": "1"}
-
-
-@pytest.mark.xfail(strict=True, reason="ERW-42: proceed is refused on the new tracking core")
-async def test_finishing_one_unkeyed_walk_does_not_revoke_proceed(solera, tmp_path):
-    phase = ["fail"]
-    entered, release = asyncio.Event(), asyncio.Event()
-
-    @asset(outputs=Output("left", incremental=True))
-    def left():
-        return Patch([{"n": 1}])
-
-    @asset(outputs=Output("right", incremental=True))
-    def right():
-        return Patch([{"n": 1}])
-
-    @asset(inputs={"left": Incremental(batch_size=1), "right": Incremental(batch_size=1)}, retries=Retry(n=0))
-    async def digest(ctx, left: list, right: list):
-        if ctx.batch["right"].index == 1:
-            if phase[0] == "fail":
-                raise RuntimeError("stop after one committed batch")
-            entered.set()
-            await release.wait()
-        return {"n": len(left) + len(right)}
-
-    @asset(inputs={"digest": In()})
-    def report(digest: dict):
-        return digest
-
-    await solera.deploy(
-        Project(assets=[left, right, digest, report], default_store=FileStore(tmp_path / "data"))
-    )
-    for _ in range(2):
-        await solera.run("left")
-    for _ in range(4):
-        await solera.run("right")
-    await solera.run("digest", expect="failed")
-    assert full.waiting(solera.engine) == {("digest", "")}
-    await solera.post("/assets/digest/proceed", {"partition": ""})
-    assert full.waiting(solera.engine) == set()
-    phase[0] = "resume"
-    resumed = await solera.submit("digest")
-    await solera.until(entered.is_set)
-    try:
-        reader = await solera.submit("report")
-        task = await decided(solera, reader, "report")
-        assert task.get("held") != ["upstream incomplete", "digest"], task
-        # report read digest's proceeded head, so its own output is partial: a proceed lets
-        # readers of digest go on, not readers of theirs (round 4, the proceed chain).
-        assert full.waiting(solera.engine) == {("report", "")}
-    finally:
-        release.set()
-        await solera.wait(resumed)
 
 
 async def test_time_waiting_for_incomplete_upstream_does_not_expire_replans(solera, tmp_path):

@@ -81,11 +81,6 @@ class CleanupsClearInput(BaseModel):
     by: str | None = Field(default=None, max_length=200)
 
 
-class ProceedInput(BaseModel):
-    partition: str = ""
-    by: str | None = Field(default=None, max_length=200)
-
-
 class MergesClearInput(BaseModel):
     output: str
     partition: str = ""
@@ -264,7 +259,6 @@ def create_app(
             "postgres": bool(os.environ.get("DATABASE_URL")),
             "last_error": "; ".join(f"{name}: {error}" for name, error in runtime.failing.items()) or None,
             # a run left midway: its readers wait until a run of its producer completes it
-            # (`solera proceed` waits for ERW-42 on the new path)
             "incomplete_full_runs": core_full.stopped(runtime) if runtime.core is not None else [],
             # cleanup whose task ran out of tries: see and clear with `solera cleanups`
             "stuck_cleanups": [
@@ -651,13 +645,6 @@ def create_app(
     async def clear_cleanups(p: str, body: CleanupsClearInput, request: Request):
         runtime = await project_engine(request, p)
         return runtime.clear_cleanups(body.output, body.partition, body.by or "api")
-
-    @app.post("/api/projects/{p}/assets/{name}/proceed")
-    async def proceed(p: str, name: str, body: ProceedInput, request: Request):
-        """Let the readers of a partition whose run stopped midway go on over its partial output (D205)."""
-
-        runtime = await project_engine(request, p)
-        return await runtime.proceed(name, body.partition, body.by or "api")
 
     @app.get("/api/projects/{p}/outputs/{name}/merges")
     async def output_merges(p: str, name: str, request: Request, partition: str = ""):
