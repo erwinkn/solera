@@ -321,18 +321,17 @@ class PostgresStore:
         )  # each check reads the catalog as it is now
         return conn
 
-    def _table(self, output: Output, prior: Ref | None = None, home: str | None = None) -> str:
-        """Where the output's content lives: the committed head's table, so a
-        renamed output keeps its table, and every ref to it stays readable
-        (§2); the declaration's (`schema`, `table`, else the name its life
-        began under, `home`: one table for every partition, K25) only for a
-        first write."""
+    def _table(self, output: Output, prior: Ref | None = None) -> str:
+        """Where the output's content lives: the committed head's table, so
+        every ref to it stays readable (§2); the declaration's (`schema`,
+        `table`, else the output's name: one table for every partition) only
+        for a first write."""
 
         committed = (prior.handle or {}).get("table") if prior is not None else None
         if committed:
             return (committed, *_split(committed))
         schema = output.config.get("schema", "public")
-        table = output.config.get("table", home or output.name)
+        table = output.config.get("table", output.name)
         return _qname(schema, table), schema, table
 
     def _declared_shape(self, output: Output) -> tuple[dict, list]:
@@ -787,9 +786,7 @@ class PostgresStore:
         ).fetchall()
         return [r["relname"] if isinstance(r, dict) else r[0] for r in found]
 
-    async def cleanup(
-        self, output, *, home=None, partition=None, key=None, generation=None, before=None
-    ) -> None:
+    async def cleanup(self, output, *, partition=None, key=None, generation=None, before=None) -> None:
         """Delete what the pattern matches (docs/stores.md § Cleanup). A
         partition is matched by its version row's last write, not by its rows'
         versions: its rows go only if that write matches — exactly
@@ -798,10 +795,10 @@ class PostgresStore:
         same name in the same table keeps what it wrote. `key` narrows it to
         that key's rows. A partition that goes takes its builds. Idempotent."""
 
-        await asyncio.to_thread(self._cleanup, output, home, partition, key, generation, before)
+        await asyncio.to_thread(self._cleanup, output, partition, key, generation, before)
 
-    def _cleanup(self, output, home, partition, key, generation, before) -> None:
-        table, _, _ = self._table(output, None, home)
+    def _cleanup(self, output, partition, key, generation, before) -> None:
+        table, _, _ = self._table(output)
         column = output.config.get("partition_column")
         self._ready()
         alone = partition is not None and bool(column)  # a partition's rows are its own
@@ -886,7 +883,7 @@ class PostgresStore:
         await asyncio.to_thread(self._acquire, context, prior)
 
     def _acquire(self, context: WriteContext, prior: Ref | None) -> None:
-        table, _, _ = self._table(context.output, prior, context.home)
+        table, _, _ = self._table(context.output, prior)
         with self._connect() as conn, conn.cursor() as cur:
             self._domain(cur, table)
             self._check(cur, table, context, write=False)
@@ -916,7 +913,7 @@ class PostgresStore:
 
     def _written_at(self, versions: list[int], prior: Ref | None, context: WriteContext) -> _Spool:
         output, spool = context.output, _Spool()
-        table, _, _ = self._table(output, prior, context.home)
+        table, _, _ = self._table(output, prior)
         with self._connect() as conn, conn.cursor() as cur:
             checked, state = self._begin(conn, table, context, write=False)
             if output.key is None or not state["present"]:
@@ -940,7 +937,6 @@ class PostgresStore:
         newest: int,
         *,
         prior: Ref | None = None,
-        home: str | None = None,
     ) -> bool:
         """The full run of `partition` whose clear the attempt at version
         `run` wrote has ended in the log: publish its build (D211,
@@ -964,16 +960,16 @@ class PostgresStore:
         can be added in between, and again after the rows. The
         build's
         table is dropped after, by a sweep. Idempotent; it may take minutes,
-        and sets no statement timeout. `prior` (the committed head) and
-        `home` say where the table is, as for a write."""
+        and sets no statement timeout. `prior` (the committed head) says
+        where the table is, as for a write."""
 
-        return await asyncio.to_thread(self._full_run_ended, output, partition, run, newest, prior, home)
+        return await asyncio.to_thread(self._full_run_ended, output, partition, run, newest, prior)
 
-    def _full_run_ended(self, output, partition, run, newest, prior, home) -> bool:
+    def _full_run_ended(self, output, partition, run, newest, prior) -> bool:
         import psycopg
         from psycopg import sql
 
-        table, _, _ = self._table(output, prior, home)
+        table, _, _ = self._table(output, prior)
         self._ready()
         try:
             with self._connect() as conn, conn.cursor() as cur:
@@ -1071,9 +1067,7 @@ class PostgresStore:
 
     def _store(self, write, prior: Ref | None, context: WriteContext) -> Written:
         output = context.output
-        table, _, _ = self._table(
-            output, prior, context.home
-        )  # where it is, even when a full run starts it over
+        table, _, _ = self._table(output, prior)  # where it is, even when a full run starts it over
         if context.reset:
             prior = None  # a full run keeps nothing of the content
         with self._connect() as conn, conn.cursor() as cur:
@@ -1397,7 +1391,7 @@ class PostgresStore:
     ) -> list[str]:
 
         applied = []
-        table, _, _ = self._table(output, prior, context.home if context is not None else None)
+        table, _, _ = self._table(output, prior)
         self._ready()
         # What already ran, read with no lock: an attempt that finds nothing pending takes no
         # exclusive domain, so it never waits out a switch (probe R7).

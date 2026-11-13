@@ -221,12 +221,9 @@ class FileStore:
 
         return f"{base}/{zlib.crc32(key.encode()) % BUCKETS:03x}/{_segment(key)}/{int(generation)}"
 
-    async def cleanup(
-        self, output, *, home=None, partition=None, key=None, generation=None, before=None
-    ) -> None:
+    async def cleanup(self, output, *, partition=None, key=None, generation=None, before=None) -> None:
         """Delete every object of `output` the pattern matches (docs/stores.md
-        § Cleanup), each field left out matching anything: the life kept
-        under `home` (else its own name), its `partition`, its `key`, exactly
+        § Cleanup), each field left out matching anything: its `partition`, its `key`, exactly
         `generation`, or every generation older than `before`. Objects are
         found by name: a generation is every name's last component —
         `{base}@{g}` for a value, `{base}/{bucket}/{key}/{g}` for a key — and
@@ -234,7 +231,7 @@ class FileStore:
 
         import obstore
 
-        root = _segment(home or output.name)
+        root = _segment(output.name)
         base = root if not partition else f"{root}/{_segment(partition)}"
         if key is not None and generation is not None and partition is not None:  # one name: no listing
             await self._delete(self.key_name(base, key, generation))
@@ -396,13 +393,12 @@ class FileStore:
     @staticmethod
     def _base(output, context, prior) -> str:
         """Where the partition's content lives: the prior's place, else under
-        the output life's home, so every partition of a renamed output stays
-        in one place (§2, K25)."""
+        the output's name."""
 
         handle = (prior.handle or {}) if prior is not None else {}
         if "base" in handle or "path" in handle:
             return handle.get("base") or handle["path"]
-        name = _segment(context.home or output.name)
+        name = _segment(output.name)
         return f"{name}/{_segment(context.partition)}" if context.partition else name
 
     async def _put(self, base: str, value) -> None:

@@ -163,7 +163,6 @@ class Model:
             "cleanups": _nest(self.cleanups, 2),
             "cleaning": _nest(self.cleaning, 2),
             "retired": dict(self.retired),
-            "homes": dict(self.homes),
             "reset_at": _nest(self.reset_at, 2),
             "automations": {
                 name: {k: auto[k] for k in AUTOMATION_STATE if k in auto}
@@ -208,7 +207,7 @@ class Model:
         self.deleted: list[str] = snap.get("deleted") or []
         # (asset, partition) -> the partition's record (§5): its `cursor`; `last`, its last
         # terminal outcome; the `definition`, `config` and `context` its last commit was made
-        # under. A rename moves it.
+        # under.
         self.partitions = Grouped(_flatten(snap.get("partitions"), 2))
         # (output, partition) -> intents of attempts that died while writing it (§8)
         self.repairs: dict[tuple, list] = _flatten(snap.get("repairs"), 2)
@@ -224,9 +223,6 @@ class Model:
         # Output lives removed or moved away, whose data a cleanup task deletes (K25):
         # id -> where it was, what it was, and when it may go.
         self.retired: dict[str, dict] = dict(snap.get("retired") or {})
-        # Output -> the name its life began under: where its store keeps every partition
-        # of it, renamed or not (K25). A rename carries it; a reset starts a new one.
-        self.homes: dict[str, str] = dict(snap.get("homes") or {})
         # ("output" | "asset", name) -> the deploy number that last reset it:
         # removed, or (an output) moved to another store. An attempt launched
         # under an earlier one commits nothing of it.
@@ -271,7 +267,7 @@ class Model:
         # sensor -> the tick dispatched and not yet decided: {tick, cursor, snapshot, pin, ...}
         self.ticks: dict[str, dict] = {}
         self.readers: dict[object, tuple] = {}  # the engine's own readers: (event counter, domains)
-        # the assets the last deploy changed: added (again), renamed, their declarations
+        # the assets the last deploy changed: added (again), their declarations
         # changed, or reset. Memory only: the engine reads it as it records the deploy,
         # for what its OnChange automations owe (`FiringsOwed`, an event of its own).
         self.changed: set[str] = set()
@@ -562,43 +558,32 @@ class Model:
         stores_before = (self.manifest or {}).get("stores") or {}
         sources_before = set((self.manifest or {}).get("sources") or ())
         assets_before = set((self.manifest or {}).get("assets") or ())
-        declared_before = {a: declaration(self.manifest, a, self.homes) for a in assets_before}
+        declared_before = {a: declaration(self.manifest, a) for a in assets_before}
         self.deploy, self.manifest, self.project = e["deploy"], manifest, e.get("project")
-        renamed, output_map = self._apply_aliases(manifest)
-        self._reconcile_tasks(manifest, renamed, output_map, e["at"])
-        carried = {old for olds in renamed.values() for old in olds}  # by an alias: not removed
-        homes = dict(self.homes)  # the reset starts new lives: the old ones' homes, for their cleanup
+        self._reconcile_tasks(manifest, e["at"])
         reset = self._reset(
-            {output_map.get(name, name): o.get("store") for name, o in previous.items()},
-            assets_before - carried,
-            {output_map.get(name, name): axis(o) for name, o in previous.items()},
+            {name: o.get("store") for name, o in previous.items()},
+            assets_before,
+            {name: axis(o) for name, o in previous.items()},
         )
         # What an output life left in the store it was removed or moved from: a cleanup
         # task deletes it, once due and no pin predates the reset (K25). A source's data
         # is not ours.
         for name, old in previous.items():
-            now = output_map.get(name, name)
-            moved = now not in manifest["outputs"] or manifest["outputs"][now].get("store") != old.get(
+            moved = name not in manifest["outputs"] or manifest["outputs"][name].get("store") != old.get(
                 "store"
             )
             if moved and name not in sources_before and old.get("store") in stores_before:
-                self._retire_output(now, homes.get(now, now), old, stores_before[old["store"]], e["at"])
+                self._retire_output(name, old, stores_before[old["store"]], e["at"])
         self._core_close(reset)
-        self.changed = set()
-        for asset in manifest["assets"]:
-            olds = [a for a in renamed.get(asset, ()) if a in declared_before]  # renamed by this deploy
-            before = declared_before.get(asset, declared_before.get(olds[0]) if olds else None)
-            if before is None or olds or before != declaration(manifest, asset, self.homes) or asset in reset:
-                self.changed.add(asset)
+        self.changed = {
+            asset
+            for asset in manifest["assets"]
+            if asset in reset or declared_before.get(asset) != declaration(manifest, asset)
+        }
         automations = {}
         for name, auto in manifest["automations"].items():
             existing = self.automations.get(name)
-            if existing is None:
-                owner, _, rest = name.partition(".")
-                for old in renamed.get(owner, ()):
-                    existing = self.automations.get(f"{old}.{rest}")
-                    if existing is not None:
-                        break
             # `since`: when it was declared, which a schedule's first time counts from.
             record = {
                 **auto,
@@ -627,56 +612,21 @@ class Model:
                     "n": self.event_counter,
                 }
 
-    def _reconcile_tasks(self, manifest: dict, renamed: dict, output_map: dict, at: float) -> None:
-        """Outstanding work under a new project. A task of a renamed asset
-        carries on under its new name: its claim, and a launched
-        attempt's output records — which keep the contract and the places
-        it was launched with, and the names its worker knows them by
-        (`as`) — go with it, so one writer owns the partition, and its commit
-        lands under the new names. A task not yet launched of an asset that
-        is gone is canceled, saying why — its dependents blocked, its run
-        rolled up; a launched one settles its attempt first, then ends the
-        same way (`_ready`): no task is ever queued for an asset the
+    def _reconcile_tasks(self, manifest: dict, at: float) -> None:
+        """Outstanding work under a new project. A task not yet launched of an
+        asset that is gone is canceled, saying why: its dependents blocked,
+        its run rolled up. A launched one settles its attempt first, then
+        ends the same way (`_ready`): no task is ever queued for an asset the
         manifest lacks."""
 
-        new_name = {old: new for new, olds in renamed.items() for old in olds}
         for run in list(self.runs.values()):
             if run["status"] in TERMINAL_RUN:
                 continue
             for tid, task in sorted(run["tasks"].items()):
-                if task["status"] in TERMINAL_TASK:
-                    continue
-                old, partition = task["asset"], task["partition"]
-                if old in new_name:
-                    new = task["asset"] = new_name[old]
-                    bucket = self.pending.get((old, partition))
-                    if bucket is not None and tid in bucket:
-                        bucket.discard(tid)
-                        if not bucket:
-                            del self.pending[(old, partition)]
-                        self.pending.setdefault((new, partition), set()).add(tid)
-                    if (old, partition) in self.claimed_partitions:
-                        # Never over a claim still held: an earlier life's left the index
-                        # at its reset, so only two live assets merged by a rename meet here,
-                        # and the one already under the name keeps it.
-                        holder = self.claimed_partitions.pop((old, partition))
-                        current = self.claimed_partitions.get((new, partition))
-                        if current is None or self.claimed(current) is None:
-                            self.claimed_partitions[(new, partition)] = holder
-                    launched = task.get("launched")
-                    if launched is not None:
-                        outputs = launched["prepared"].get("outputs") or {}
-                        launched["prepared"]["outputs"] = {
-                            output_map.get(n, n): {**info, "as": info.get("as", n)}
-                            if n in output_map
-                            else info
-                            for n, info in outputs.items()
-                        }
-                        if launched["attempt"] in self.pool:
-                            self.pool[launched["attempt"]]["asset"] = new
-                elif (
-                    old not in manifest["assets"]
-                    and old != CLEANUP
+                if (
+                    task["status"] not in TERMINAL_TASK
+                    and task["asset"] not in manifest["assets"]
+                    and task["asset"] != CLEANUP
                     and not task.get("launched")
                     and tid not in self.claims
                 ):
@@ -692,10 +642,10 @@ class Model:
         self.unfinished.pop(task["id"], None)
         self._finished(run, task, "canceled", None, at)
 
-    def _retire_output(self, output: str, home: str, old: dict, store: dict, at: float) -> None:
+    def _retire_output(self, output: str, old: dict, store: dict, at: float) -> None:
         """Record an output life's leftovers for a cleanup task (K25): the
         store it was on — a built-in one's class and config, else its name
-        alone — its home, its declaration, and `before`, the first generation
+        alone — its declaration, and `before`, the first generation
         after this deploy: a later life of the name in that store keeps what
         it writes. Due `cleanup_after` from now: the output's, else its
         store's."""
@@ -706,7 +656,6 @@ class Model:
         self.retired[entry_id] = {
             "id": entry_id,
             "output": output,
-            "home": home,
             "store": old["store"],
             "built_in": store.get("built_in"),
             "decl": {k: old[k] for k in ("key", "incremental", "config") if k in old},
@@ -748,12 +697,8 @@ class Model:
             or axes.get(name, axis(outputs[name])) != axis(outputs[name])
         }
         for name in reset:
-            self.reset_at[("output", name)] = self.reset_at[("life", name)] = self.deploy_number
+            self.reset_at[("output", name)] = self.deploy_number
         reset |= {k[0] for k in self.heads} - set(outputs)  # any other name no longer declared
-        for name in reset | (set(self.homes) - set(outputs)):
-            self.homes.pop(name, None)
-        for name in outputs:
-            self.homes.setdefault(name, name)
         producers = {outputs[name].get("asset") for name in reset if name in outputs} - {None}
 
         def gone(key) -> bool:
@@ -783,60 +728,6 @@ class Model:
                 for field in ("definition", "config", "context"):
                     self.partitions[key].pop(field, None)
         return producers
-
-    def _apply_aliases(self, manifest) -> tuple[dict[str, list[str]], dict[str, str]]:
-        """Move everything held under an asset's former names to its current
-        one (§2): its partition records, pending automation entries, a per-key
-        asset's stored outcomes, and — for outputs named after the asset — heads,
-        key indexes, repair intents and pending cleanups. A new name never
-        releases a write domain. An index keeps its files where they are (its
-        `prefix`). Returns `{asset: [aliases]}`, for the automations and tasks
-        to follow, and the outputs renamed with their assets, `{old: new}`."""
-
-        assets = {n: a for n, a in manifest["assets"].items() if a.get("aliases")}
-        renamed = {}
-        for name, info in assets.items():
-            renamed[name] = [a for a in info["aliases"] if a not in manifest["assets"]]
-        asset_map = {old: new for new, olds in renamed.items() for old in olds}
-        if not asset_map:
-            return renamed, {}
-        outputs = manifest["outputs"]
-        output_map = {
-            old: new
-            for old, new in asset_map.items()
-            if old not in outputs and (outputs.get(new) or {}).get("asset") == new
-        }
-
-        def move(table: dict, rename, slot: int, merge=None):
-            for key in [k for k in table if k[slot] in rename]:
-                target = (*key[:slot], rename[key[slot]], *key[slot + 1 :])
-                if target not in table:
-                    table[target] = table.pop(key)
-                elif merge is not None:  # lists: both names' entries are owed
-                    table[target] = merge(table[target] + table.pop(key))
-
-        move(self.heads, output_map, 0)
-        move(self.core_outputs, output_map, 0)  # the new path's ids: the same output, the same edges
-        move(self.core_edges, asset_map, 0)
-        move(self.core_empty, asset_map, 0)
-        move(self.core_read, asset_map, 0)
-        move(self.partial_spans, output_map, 0)  # an output with no core id: its spans by name
-        for old, new in output_map.items():
-            if old in self.homes and new not in self.homes:
-                self.homes[new] = self.homes.pop(old)
-            # Lives by name (`life`): both names' are new, so a name reused later is never the old life's.
-            self.reset_at[("life", old)] = self.reset_at[("life", new)] = self.deploy_number
-        move(self.indexes, output_map, 0)
-        # A partition's record goes whole: a name that already has one keeps its own.
-        move(self.partitions, asset_map, 0)
-        # A per-key asset's stored outcomes (`@asset`), whose files stay under their prefix.
-        move(self.indexes, {f"@{old}": f"@{new}" for old, new in asset_map.items()}, 0)
-        move(self.repairs, output_map, 0, merge=list)
-        move(self.cleanups, output_map, 0)
-        move(self.cleaning, output_map, 0, merge=lambda q: sorted(q, key=lambda d: d["n"]))
-        for auto in self.automations.values():
-            auto["pending"] = [[asset_map.get(a, a), s] for a, s in auto.get("pending") or []]
-        return renamed, output_map
 
     def _on_RunSubmitted(self, e):
         run = e["run"]
@@ -1494,11 +1385,11 @@ class Model:
 
     def life(self, output: str, partition: str) -> str | int:
         """Which life of an output a head belongs to: its core id, else the
-        deploy that last reset or renamed the name. A gate entry of another
+        deploy that last reset the name. A gate entry of another
         life than the current one names a life that gets no commit any more."""
 
         id_ = self.core_outputs.get((output, partition))
-        return id_ if id_ is not None else self.reset_at.get(("life", output), 0)
+        return id_ if id_ is not None else self.reset_at.get(("output", output), 0)
 
     def axis_head(self, output: str, partition: str) -> int | None:
         """An output's head on its commit axis: its core life's commit, else
@@ -1710,10 +1601,10 @@ def axis(output: dict) -> str:
     return "keyed" if output.get("key") is not None else "value"
 
 
-def declaration(manifest: dict, asset: str, homes: dict | None = None) -> dict:
+def declaration(manifest: dict, asset: str) -> dict:
     """An asset's definition, in its one canonical form: what its
     outputs are built under. Its version; its inputs and deps — what each
-    reads, by that output's home, so a rename changes nothing; how (kind,
+    reads; how (kind,
     flags, patterns, batch size); and its store's version; its outputs'
     declarations (key, incremental, migrations, config) and store versions,
     not their names, nor which store holds them — that is the reset rule's
@@ -1723,11 +1614,10 @@ def declaration(manifest: dict, asset: str, homes: dict | None = None) -> dict:
     (`Engine._definition`): new patterns are compared, and a batch size
     only pages."""
 
-    homes = homes or {}
     entry, stores, outputs = manifest["assets"][asset], manifest["stores"], manifest["outputs"]
 
     def read(name: str) -> dict:
-        return {"output": homes.get(name, name), "store_version": stores[outputs[name]["store"]]["version"]}
+        return {"output": name, "store_version": stores[outputs[name]["store"]]["version"]}
 
     inputs = {
         param: {**{k: v for k, v in i.items() if k not in ("meta", "output")}, **read(i["output"])}
@@ -1745,7 +1635,7 @@ def declaration(manifest: dict, asset: str, homes: dict | None = None) -> dict:
         "version": entry["version"],
         "inputs": inputs,
         "deps": deps,
-        "deps_all_partitions": sorted(homes.get(d, d) for d in entry.get("deps_all_partitions") or ()),
+        "deps_all_partitions": sorted(entry.get("deps_all_partitions") or ()),
         "outputs": written,
     }
 

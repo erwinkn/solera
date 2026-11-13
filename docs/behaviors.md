@@ -42,7 +42,7 @@ Areas: [INC](#inc--incremental-delivery-and-classification) ·
 [RUN](#run--runs-tasks-batches-attempts-retries-cancel) ·
 [SEL](#sel--keys-lists-all-full-runs-batchreset) ·
 [CHG](#chg--definition-pattern-and-context-changes) ·
-[RST](#rst--upstream-resets-removals-moves-and-renames) ·
+[RST](#rst--upstream-resets-removals-and-moves) ·
 [SRC](#src--sources-and-served-versions) ·
 [KEY](#key--per-key-assets-and-key-outcomes) ·
 [STA](#sta--staleness-completeness-and-statuses) ·
@@ -349,7 +349,7 @@ rules want segment-anchored patterns.
 second batch: later batches read w2, and after the run the keys of the
 first batch are owed again, reason "input changed".
 
-## RST — upstream resets, removals, moves and renames
+## RST — upstream resets, removals and moves
 
 **RST-1. Moving an output to another store makes it a new output.**
 `items` moves from FileStore to Postgres: its head and keys start empty;
@@ -365,17 +365,6 @@ reset all the same, and keeps no key from before.
 `copy` removed, then declared again: no cursor, no processed keys, no
 failing keys from before. An attempt of the first life, still running,
 commits nothing into the second. Same for a job.
-
-**RST-4. A rename with `aliases=` keeps everything.**
-`copy` → `mirror` (`aliases=["copy"]`): heads, keys, cursor, what each
-input processed, failing keys, owed repairs and cleanups, automation
-state all follow; consumers continue incrementally. Data stays where it
-is: `mirror`'s new partition b is written under `copy/`.
-
-**RST-5. An attempt launched before a rename settles under the new name.**
-`copy`'s attempt runs; `copy` is renamed `mirror`: the attempt commits
-into `mirror` and its run ends. Renamed onto an earlier life's name, the
-earlier life's attempt still settles.
 
 **RST-6. A removed asset's queued work is cancelled, saying why.**
 A deploy drops `doomed`: its queued tasks are cancelled with the reason,
@@ -693,7 +682,7 @@ after, so no change is consumed by work that could not see it.
 tick is skipped for a partition running or queued.
 
 **AUT-4. An asset change leaves its automations to decide; with none, it shows stale.**
-Adding, re-adding, renaming, or changing an asset's definition: its
+Adding, re-adding, or changing an asset's definition: its
 `OnChange` owes one firing per partition whose inputs have heads; a
 schedule waits for its next time; with no automation, the asset shows
 stale for a run by hand. A deploy that changes an input's patterns owes
@@ -778,7 +767,7 @@ deleted after the asset's timeout plus the cancel grace. On a table, the
 next attempt's repair deletes the rows whose key the log lacks, and the
 producer rewrites the others (ENG-8).
 
-**CLN-6. A removed, moved, or renamed-without-alias output's old data goes after `cleanup_after`.**
+**CLN-6. A removed or moved output's old data goes after `cleanup_after`.**
 A week by default on every store (an undo window); an output may
 override it. Added back within the week, its new data stays. An attempt
 in flight from before the removal holds the cleanup back. A removed

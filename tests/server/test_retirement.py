@@ -151,8 +151,8 @@ async def test_the_grace_period_is_the_stores_unless_the_output_says(tmp_path):
 
 async def test_a_store_that_says_nothing_keeps_a_removed_output_a_week(tmp_path):
     """D145: whole-output cleanup waits `cleanup_after`, a week on every store
-    that says nothing, so a removed — or renamed without `aliases=` — output
-    can still come back."""
+    that says nothing, so a removed output can still
+    come back."""
 
     state = await State.open((tmp_path / "state").as_uri(), "test", flush_interval=0.001)
     clock = Clock()

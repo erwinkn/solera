@@ -41,7 +41,7 @@ from solera.sdk import default_placement, digest
 from solera.tasks import Tasks
 
 from . import history, planning
-from .attempts import POOL_OFFERED_GRACE, REPLAN_DELAY, Attempts, Live, current_names, worker_report
+from .attempts import POOL_OFFERED_GRACE, REPLAN_DELAY, Attempts, Live, worker_report
 from .executors import PlacementContext, Registry
 from .history import MAX_METADATA, History, RunFilter
 from .model import (
@@ -513,10 +513,9 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
             event["reason"] = str(reason)[:200]
         if write is not None:
             event["write"] = write
-        prepared = (task.get("launched") or {}).get("prepared") or {}
         for field in ("cleaned_up", "cleanup_unresolved", "cleaned_to"):  # cleanup (§9.8)
             if worker.get(field):
-                event[field] = current_names(prepared, worker[field])
+                event[field] = worker[field]
         if worker.get("read"):
             event["read"] = worker["read"]  # what its inputs' reads saw, for lineage
         if keys:
@@ -825,7 +824,7 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
             # The deltas its spec hands it are read from now, not from `AttemptLaunched`
             # on: a step acknowledged meanwhile must not let collection take them.
             claim["cleanups"] = _delta_files(step["deltas"])
-        info = {"cleanup": entries, "home": self.m.homes.get(output, output)}
+        info = {"cleanup": entries}
         if step is not None:
             info["deltas"] = step
         return {
@@ -1097,7 +1096,6 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
             # Whether the write starts the content over: a first write (an output
             # reset by a move holds no head), or a full run.
             info["reset"] = reset or head is None
-            info["home"] = self.m.homes.get(name, name)  # where its store keeps it (K25)
             if output.get("incremental"):
                 info["commit_number"] = int((head or {}).get("commit_number", -1)) + 1
             if output.get("key") is not None:
@@ -1288,9 +1286,9 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
     def _declaration(self, asset: str) -> dict:
         """The asset's canonical definition (`model.declaration`): a change makes a
         full pass due, and an attempt claimed before it does not commit
-        (docs/observed-set.md, "The commit check"). A rename keeps everything."""
+        (docs/observed-set.md, "The commit check")."""
 
-        return declaration(self.manifest, asset, self.m.homes)
+        return declaration(self.manifest, asset)
 
     # -- the placement loop (§10) ---------------------------------------------------
 
@@ -1336,7 +1334,7 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
         # a shared-table store has already made.
         self._commit_guards(task, prepared)
         settle = {"outcome": outcome, "error": error, "retryable": retryable, "delay": delay}
-        outputs = current_names(prepared, result.get("outputs") or {})
+        outputs = result.get("outputs") or {}
         built = await core_commit.build(self.core, task, attempt, prepared, result, outputs)
         async with built.locks:  # the outputs it built: their commits are recorded in turn
             with built.generation:  # checked again where it is recorded (`core_commit.check`)
@@ -1380,7 +1378,7 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
 
         from solera.sdk import UNSET
 
-        outputs = current_names(prepared, result.get("outputs") or {})
+        outputs = result.get("outputs") or {}
         # Settled under the contract it was launched with, not today's manifest.
         declared = {name: info["contract"] for name, info in (prepared.get("outputs") or {}).items()}
         more = bool(prepared.get("more"))

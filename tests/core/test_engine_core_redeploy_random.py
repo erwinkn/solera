@@ -40,7 +40,6 @@ class History:
 
     def project(self, variant):
         h, name = self, variant["name"]
-        other = "copy2" if name == "copy" else "copy"
         keyed = variant["axis"] == "keyed"
 
         @asset(outputs=Output("files", key="id"))
@@ -63,9 +62,7 @@ class History:
 
         body.__name__ = body.__qualname__ = name
         out = Output(key="id", store=variant["store"]) if keyed else Output(store=variant["store"])
-        producer = asset(
-            inputs={"files": Incremental(batch_size=1)}, outputs=out, aliases=[other], retries=Retry(n=1)
-        )(body)
+        producer = asset(inputs={"files": Incremental(batch_size=1)}, outputs=out, retries=Retry(n=1))(body)
 
         def seen(ctx, ids, who="report"):
             h.reads += 1

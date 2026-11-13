@@ -630,7 +630,6 @@ class _Out:
         return WriteContext(
             output=self.output,
             partition=spec["partition"],
-            home=self.info.get("home"),
             attempt=spec["attempt"],
             reset=self.reset,
             generation=spec.get("generation"),
@@ -1056,7 +1055,7 @@ async def _execute(
 
 async def _retire(entry: dict, project, writes, state: str) -> dict:
     """A cleanup task (K25): delete what an output life left in a store it
-    was removed or moved from — `store.cleanup(output, home, before=G)`, G
+    was removed or moved from — `store.cleanup(output, before=G)`, G
     the first generation after, so a later life of the name keeps what it
     wrote. A built-in store is rebuilt from its manifest description; a
     store of the project's own is the one of that name it still declares,
@@ -1077,7 +1076,7 @@ async def _retire(entry: dict, project, writes, state: str) -> dict:
     decl = entry.get("decl") or {}
     output = Output(entry["output"], key=decl.get("key"), **decl.get("config", {}))
     await claim([store], state)
-    await writes.call(store.cleanup(output, home=entry["home"], before=entry["before"]))
+    await writes.call(store.cleanup(output, before=entry["before"]))
     return {"status": "succeeded", "outputs": {}, "cleaned": entry["id"]}
 
 
