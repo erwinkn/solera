@@ -345,8 +345,7 @@ pub async fn plan(
         head: r.head,
         life: v.upstream.life,
         conditions: now.clone(),
-        own_head: None,
-        own_life: 0,
+        own: None,
         keys: taken,
         held_back: vec![],
         moot,
@@ -392,6 +391,7 @@ pub async fn plan_all(
         return invalid("the request names no input of the pass's edge");
     };
     let mut p = plan(ixs, r, &req.inputs[i].conditions, limit).await?;
+    p.inputs[0].own = view.own(i);
     if req.inputs.len() == 1 && req.unkeyed.is_empty() {
         return Ok(p);
     }

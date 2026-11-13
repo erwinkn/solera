@@ -11,7 +11,7 @@ use crate::error::{format, Result};
 use crate::progress::{Conditions, Key, KeyRange, Reason, Slice};
 use crate::state::Id;
 
-pub const RECORD_FORMAT: u8 = 4;
+pub const RECORD_FORMAT: u8 = 5;
 
 /// What a batch did with one key it did not load as planned and settle:
 /// failed, held back by the planner, held back at commit (`Unsettled`), or
@@ -36,10 +36,10 @@ pub struct Record {
     pub reset: bool,
     pub range: KeyRange,
     pub head: u64,
-    /// The input's life ([crate::Output::life]) at commit, 0 when it had
-    /// none: every version the batch planned or loaded is of it, since the
-    /// input is not retired while the edge reads it and the commit refuses a
-    /// plan of another life. A commit number names a version only within it.
+    /// The input's life ([crate::Output::life]) the batch planned in, never
+    /// 0: every version it planned or loaded is of it, since the commit
+    /// refuses a plan of another life. A commit number names a version only
+    /// within it.
     pub life: u64,
     pub conditions: Arc<Conditions>,
     /// The progress the batch replaced: its range's slice, or with a reset all of it.
@@ -55,7 +55,7 @@ pub struct Record {
     pub planner: u64,
     /// The consumer's own head at plan, read where the replaced slice is held.
     pub own_head: Option<u64>,
-    /// The own output's life at plan: 0 where the batch read no commit of it.
+    /// The own output's life at plan, never 0 where `own_head` is set, else 0.
     pub own_life: u64,
     /// The output commit the batch made, if it wrote anything.
     pub output_commit: Option<u64>,
@@ -154,6 +154,11 @@ impl Record {
         let own_head = d.opt_u64()?;
         let own_life = d.uv()?;
         let output_commit = d.opt_u64()?;
+        if life == 0 || (own_life == 0) != own_head.is_none() {
+            return format(format!(
+                "a record names life {life}, own life {own_life} at own head {own_head:?}"
+            ));
+        }
         if marks.windows(2).any(|w| w[0].0 >= w[1].0) {
             return format("marks out of order");
         }

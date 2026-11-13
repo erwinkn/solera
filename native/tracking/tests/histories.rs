@@ -21,10 +21,11 @@ use solera_index::{
     pick_merge, ChangeIndex, LayerRef, NewCommit, Run, Store, StoreOptions, Version, WriteOptions,
 };
 use solera_tracking::codec::Ver;
+use solera_tracking::commit::Declare;
 use solera_tracking::event::{Event, Part};
 use solera_tracking::lineage::{self, Answer, Received};
 use solera_tracking::plan::{self, Hold, InputRequest, Mode, OneIndex, Request};
-use solera_tracking::progress::EdgeClose;
+use solera_tracking::progress::{BatchProgress, EdgeClose, EdgeRename};
 use solera_tracking::progress::{
     Class, Conditions, EdgeOpen, Holding, InputReport, Key, KeyRange, Pat, Patterns, Reason, Reset,
     Value,
@@ -126,6 +127,8 @@ struct Input {
     log: Log,
     /// Bumped each time the input is retired and started again.
     gen: u32,
+    /// The life of generation `gen`, given when the edge first named it.
+    life: u64,
     now: Arc<Conditions>,
     holds: BTreeMap<Key, Holding>,
 }
@@ -359,13 +362,19 @@ fn random_histories() {
     eprintln!("{steps} steps over {seeds} histories; batches planned by mode (incremental, all, keys, full): {planned:?}");
 }
 
-fn commit_part(output: &str, layer: &LayerRef, live: u64) -> Part {
+fn commit_part(t: &Tracking, output: &str, layer: &LayerRef, live: u64) -> Part {
     Part::OutputCommit(solera_tracking::commit::OutputCommit {
         output: key(output),
+        life: t.life(output.as_bytes()),
         layer: layer.clone(),
         live,
         ends_full_run: false,
     })
+}
+
+fn commit_to(t: &mut Tracking, output: &str, layer: &LayerRef, live: u64) {
+    let p = commit_part(t, output, layer, live);
+    apply(t, vec![p]);
 }
 
 fn held_plan_request() -> Request {
@@ -384,9 +393,10 @@ fn held_plan_request() -> Request {
 }
 
 /// A batch planned before its input's first commit can load what that
-/// commit wrote (Sol, round 6): its record names the input's life at
-/// commit, so once the input is retired its lineage is retired, never a
-/// version of another life.
+/// commit wrote (Sol, round 6): its plan names the life the edge's opening
+/// gave the input, which that commit keeps, and its record stores it, so
+/// once the input is retired its lineage is retired, never a version of
+/// another life.
 #[test]
 fn a_batch_planned_before_its_input_started_names_the_life_it_loaded() {
     let rt = runtime();
@@ -417,14 +427,15 @@ fn a_batch_planned_before_its_input_started_names_the_life_it_loaded() {
             .unwrap();
         assert_eq!(
             (p.inputs[0].head, p.inputs[0].life, p.inputs[0].keys.len()),
-            (0, 0, 1)
+            (0, t.life(b"items"), 1)
         );
+        assert!(p.inputs[0].life > 0, "the edge named its input");
         let mut items = Log::new("items");
         let mut staging = Tracking::new();
         items
             .commit(&ix, &mut staging, [(key("k"), Ver::Int(10))].into())
             .await;
-        apply(&mut t, vec![commit_part("items", &items.layers[0], 1)]);
+        commit_to(&mut t, "items", &items.layers[0], 1);
         let report = InputReport {
             failed: vec![],
             loaded: vec![(key("k"), Ver::Int(10))],
@@ -458,7 +469,7 @@ fn a_batch_planned_before_its_input_started_names_the_life_it_loaded() {
             .await;
         for gone in [false, true] {
             if gone {
-                apply(&mut t, vec![commit_part("items", &next.layers[0], 1)]);
+                commit_to(&mut t, "items", &next.layers[0], 1);
             }
             let logs = t.logs(rec, Some(b"own"));
             assert_eq!(
@@ -521,7 +532,7 @@ fn a_plan_of_an_earlier_life_of_its_input_does_not_commit() {
         let e = t
             .progress_ops(&p, &[InputReport::default()], b"run/batch", None)
             .unwrap_err();
-        assert!(e.to_string().contains("earlier life"), "{e}");
+        assert!(e.to_string().contains(" in life "), "{e}");
     });
 }
 
@@ -585,9 +596,9 @@ fn a_batch_whose_own_output_was_retired_answers_retired() {
     });
 }
 
-/// An output's life is given when a commit starts it, from one counter for
-/// every output, kept across commits and a snapshot, and given anew once it
-/// was retired; a cleanup step names it.
+/// An output's life is given when the output is first named, from one
+/// counter for every output, kept across commits and a snapshot, and given
+/// anew once it was retired; a cleanup step names it.
 #[test]
 fn an_output_life_follows_its_starts() {
     use solera_tracking::retain::{Cleaned, Track};
@@ -600,13 +611,15 @@ fn an_output_life_follows_its_starts() {
             .await;
         log.commit(&ix, &mut staging, [(key("k"), Ver::Int(2))].into())
             .await;
-        let commit = |output: Key, i: usize| {
-            Part::OutputCommit(solera_tracking::commit::OutputCommit {
+        let commit = |t: &mut Tracking, output: Key, i: usize| {
+            let p = Part::OutputCommit(solera_tracking::commit::OutputCommit {
+                life: t.life(&output),
                 output,
                 layer: log.layers[i].clone(),
                 live: 1,
                 ends_full_run: false,
-            })
+            });
+            apply(t, vec![p]);
         };
         let mut t = Tracking::new();
         let life = |t: &Tracking, id: &[u8]| {
@@ -622,10 +635,10 @@ fn an_output_life_follows_its_starts() {
                 at: 0,
             })],
         );
-        apply(&mut t, vec![commit(key("items"), 0)]);
+        commit(&mut t, key("items"), 0);
         let first = life(&t, b"items");
         assert!(first > 0);
-        apply(&mut t, vec![commit(key("items"), 1)]);
+        commit(&mut t, key("items"), 1);
         assert_eq!(life(&t, b"items"), first);
         let stale = Cleaned {
             output: key("items"),
@@ -634,7 +647,7 @@ fn an_output_life_follows_its_starts() {
             to: 2,
         };
         stale.check(&t).unwrap();
-        apply(&mut t, vec![commit(key("other"), 0)]);
+        commit(&mut t, key("other"), 0);
         let other = life(&t, b"other");
         assert!(other > first);
         t = Tracking::restore(&t.snapshot()).unwrap();
@@ -652,8 +665,8 @@ fn an_output_life_follows_its_starts() {
                 at: 0,
             })],
         );
-        apply(&mut t, vec![commit(key("items"), 0)]);
-        apply(&mut t, vec![commit(key("items"), 1)]);
+        commit(&mut t, key("items"), 0);
+        commit(&mut t, key("items"), 1);
         assert!(life(&t, b"items") > other);
         assert!(stale.check(&t).is_err());
         Cleaned {
@@ -674,12 +687,21 @@ async fn history(rng: &mut SmallRng, ix: &ChangeIndex, planned: &mut [usize; 4])
     }
     let mut t = Tracking::new();
     let mut own = Log::new("own");
+    let mut lives = Lives::default();
+    apply(
+        &mut t,
+        vec![Part::Declare(Declare {
+            output: own.name.clone(),
+        })],
+    );
+    lives.own_life = lives.fresh(t.life(&own.name));
     let n_inputs = if rng.random_bool(0.3) { 2 } else { 1 };
     let mut inputs: Vec<Input> = (0..n_inputs)
         .map(|i| Input {
             edge: key(&format!("consumer/in{i}")),
             log: Log::new(&format!("up{i}")),
             gen: 0,
+            life: 0,
             now: Arc::new(Conditions {
                 patterns: patterns(rng),
                 ..Default::default()
@@ -687,7 +709,7 @@ async fn history(rng: &mut SmallRng, ix: &ChangeIndex, planned: &mut [usize; 4])
             holds: BTreeMap::new(),
         })
         .collect();
-    for inp in &inputs {
+    for inp in &mut inputs {
         apply(
             &mut t,
             vec![Part::EdgeOpen(EdgeOpen {
@@ -696,6 +718,7 @@ async fn history(rng: &mut SmallRng, ix: &ChangeIndex, planned: &mut [usize; 4])
                 keyed: true,
             })],
         );
+        inp.life = lives.fresh(t.life(&inp.log.name));
     }
     let mut cursor: Option<Key> = None;
     let mut stored: Vec<Stored> = vec![];
@@ -736,38 +759,12 @@ async fn history(rng: &mut SmallRng, ix: &ChangeIndex, planned: &mut [usize; 4])
                 .collect();
             cursor = None;
         } else if r < 0.05 && inputs.iter().all(|i| i.log.head() > 0) {
-            // An input is retired (its edge closed first) and started again:
-            // its commits start at 1 in a new life. The consumer reads it anew.
-            let inp = &mut inputs[rng.random_range(0..n_inputs)];
-            apply(
-                &mut t,
-                vec![Part::EdgeClose(EdgeClose {
-                    edge: inp.edge.clone(),
-                })],
-            );
-            apply(
-                &mut t,
-                vec![Part::Retire(Retire {
-                    output: inp.log.name.clone(),
-                })],
-            );
-            apply(
-                &mut t,
-                vec![Part::EdgeOpen(EdgeOpen {
-                    edge: inp.edge.clone(),
-                    input: inp.log.name.clone(),
-                    keyed: true,
-                })],
-            );
-            let name = String::from_utf8_lossy(&inp.log.name).into_owned();
-            inp.log = Log {
-                files: inp.log.files,
-                ..Log::new(&name)
-            };
-            inp.gen += 1;
-            inp.holds.clear();
+            let i = rng.random_range(0..n_inputs);
+            restart(rng, ix, &mut t, &mut inputs[i], &universe, &mut lives).await;
             cursor = None;
-            upstream_commit(rng, ix, &mut t, inp, &universe).await;
+        } else if r < 0.06 {
+            restart_own(&mut t, &mut inputs[0], &mut own, &mut lives);
+            cursor = None;
         } else if r < 0.10 {
             let inp = &mut inputs[rng.random_range(0..n_inputs)];
             let mut c = (*inp.now).clone();
@@ -792,7 +789,8 @@ async fn history(rng: &mut SmallRng, ix: &ChangeIndex, planned: &mut [usize; 4])
                     ix,
                     &mut t,
                     &mut inputs,
-                    &own,
+                    &mut own,
+                    &mut lives,
                     &universe,
                     &mut cursor,
                     planned,
@@ -801,9 +799,150 @@ async fn history(rng: &mut SmallRng, ix: &ChangeIndex, planned: &mut [usize; 4])
             );
         }
         check(ix, &t, &inputs, &own, &universe).await;
-        check_lineage(rng, ix, &t, &inputs, &own, &universe, &stored).await;
+        check_lineage(
+            rng,
+            ix,
+            &t,
+            &inputs,
+            &own,
+            lives.own_gen,
+            &universe,
+            &stored,
+        )
+        .await;
     }
     n
+}
+
+/// The model of lives: every life the state gave an output, and the own
+/// output's generation and life. Distinct generations have distinct lives.
+#[derive(Default)]
+struct Lives {
+    seen: BTreeSet<u64>,
+    own_gen: u32,
+    own_life: u64,
+}
+
+impl Lives {
+    fn fresh(&mut self, life: u64) -> u64 {
+        assert!(life > 0, "a named output has a life");
+        assert!(self.seen.insert(life), "life {life} was given before");
+        life
+    }
+}
+
+/// The input leaves its edge, is retired and starts again in a new life,
+/// its commits from 1: by a close and a reopen, or by a retarget away and
+/// back where the edge's progress names nothing of the input (else the
+/// retarget is refused). The consumer reads it anew.
+async fn restart(
+    rng: &mut SmallRng,
+    ix: &ChangeIndex,
+    t: &mut Tracking,
+    inp: &mut Input,
+    universe: &[Key],
+    lives: &mut Lives,
+) {
+    let rename = |input: Key| {
+        Event::of(vec![Part::EdgeRename(EdgeRename {
+            from: inp.edge.clone(),
+            to: inp.edge.clone(),
+            input,
+        })])
+    };
+    let mut away = rng.random_bool(0.5);
+    if away {
+        let ev = rename(key("parking"));
+        match t.check_event(&ev) {
+            Ok(()) => {
+                t.apply_event(ev).unwrap();
+                lives.seen.insert(t.life(b"parking"));
+            }
+            Err(e) => {
+                assert!(e.to_string().contains("reset it first"), "{e}");
+                away = false;
+            }
+        }
+    }
+    if !away {
+        apply(
+            t,
+            vec![Part::EdgeClose(EdgeClose {
+                edge: inp.edge.clone(),
+            })],
+        );
+        inp.holds.clear();
+    }
+    apply(
+        t,
+        vec![Part::Retire(Retire {
+            output: inp.log.name.clone(),
+        })],
+    );
+    if away {
+        t.apply_event(rename(inp.log.name.clone())).unwrap();
+    } else {
+        apply(
+            t,
+            vec![Part::EdgeOpen(EdgeOpen {
+                edge: inp.edge.clone(),
+                input: inp.log.name.clone(),
+                keyed: true,
+            })],
+        );
+    }
+    let name = String::from_utf8_lossy(&inp.log.name).into_owned();
+    inp.log = Log {
+        files: inp.log.files,
+        ..Log::new(&name)
+    };
+    inp.gen += 1;
+    inp.life = lives.fresh(t.life(&inp.log.name));
+    upstream_commit(rng, ix, t, inp, universe).await;
+}
+
+/// The consumer's own output is retired and declared again, in a new life;
+/// the first input, whose held progress read it, is reset.
+fn restart_own(t: &mut Tracking, first: &mut Input, own: &mut Log, lives: &mut Lives) {
+    for part in [
+        Part::Reset(Reset {
+            edge: first.edge.clone(),
+            held: false,
+        }),
+        Part::Retire(Retire {
+            output: own.name.clone(),
+        }),
+        Part::Declare(Declare {
+            output: own.name.clone(),
+        }),
+    ] {
+        apply(t, vec![part]);
+    }
+    first.holds.clear();
+    *own = Log {
+        files: own.files,
+        ..Log::new("own")
+    };
+    lives.own_gen += 1;
+    lives.own_life = lives.fresh(t.life(&own.name));
+}
+
+/// Starts input `i` again, or the own output where `i` is past the inputs.
+#[allow(clippy::too_many_arguments)]
+async fn restart_one(
+    rng: &mut SmallRng,
+    ix: &ChangeIndex,
+    t: &mut Tracking,
+    inputs: &mut [Input],
+    own: &mut Log,
+    lives: &mut Lives,
+    universe: &[Key],
+    i: usize,
+) {
+    match inputs.get_mut(i) {
+        Some(inp) => restart(rng, ix, t, inp, universe, lives).await,
+        None => restart_own(t, &mut inputs[0], own, lives),
+    }
 }
 
 async fn upstream_commit(
@@ -841,7 +980,8 @@ async fn batch(
     ix: &ChangeIndex,
     t: &mut Tracking,
     inputs: &mut [Input],
-    own: &Log,
+    own: &mut Log,
+    lives: &mut Lives,
     universe: &[Key],
     cursor: &mut Option<Key>,
     planned: &mut [usize; 4],
@@ -901,6 +1041,14 @@ async fn batch(
         plan::Plan::decode(&p.encode()).unwrap(),
         p,
         "a plan round-trips"
+    );
+    for (ip, inp) in p.inputs.iter().zip(inputs.iter()) {
+        assert_eq!(ip.life, inp.life, "a plan names the life of its input now");
+    }
+    assert_eq!(
+        p.inputs[0].own.as_ref().map(|o| o.life),
+        Some(lives.own_life),
+        "a plan names the life of its own output now"
     );
 
     // The plan is exactly what brute force owes.
@@ -1010,6 +1158,22 @@ async fn batch(
         upstream_commit(rng, ix, t, &mut inputs[i], universe).await;
     }
 
+    // Sometimes an input, or the own output, starts a new life before the
+    // batch commits: before its commit is built, or between that and the
+    // event's apply. Either refuses the commit.
+    let restarts = rng
+        .random_bool(0.15)
+        .then(|| rng.random_range(0..=inputs.len()));
+    let built_first = rng.random_bool(0.5);
+    if !built_first {
+        if let Some(i) = restarts {
+            restart_one(rng, ix, t, inputs, own, lives, universe, i).await;
+            *cursor = None;
+        }
+    }
+    let before = t.snapshot();
+    let holds: Vec<_> = inputs.iter().map(|i| i.holds.clone()).collect();
+
     // The worker: some keys fail, some load at another version.
     let mut reports = vec![];
     for (ip, inp) in p.inputs.iter().zip(inputs.iter_mut()) {
@@ -1039,11 +1203,37 @@ async fn batch(
         }
         reports.push(report);
     }
-    let ops = t.progress_ops(&p, &reports, b"run/batch", None).unwrap();
+    let ops = t.progress_ops(&p, &reports, b"run/batch", None);
+    if let Some(i) = restarts {
+        for (inp, h) in inputs.iter_mut().zip(holds) {
+            inp.holds = h;
+        }
+        let e = if built_first {
+            let ops = ops.unwrap();
+            restart_one(rng, ix, t, inputs, own, lives, universe, i).await;
+            *cursor = None;
+            t.check_event(&ops.event()).unwrap_err()
+        } else {
+            let e = ops.unwrap_err();
+            assert!(t.snapshot() == before, "a refused commit changes nothing");
+            e
+        };
+        assert!(e.to_string().contains(" in life "), "{e}");
+        return vec![];
+    }
+    let ops = ops.unwrap();
     for (rec, ip) in ops.records.iter().zip(&p.inputs) {
         let back = Record::decode(&rec.encode()).unwrap();
         assert_eq!(&back, rec);
         assert_eq!(rec.counts, ip.counts());
+        assert_eq!(rec.life, ip.life, "a record names the life its batch read");
+        assert_eq!(
+            (rec.own_head, rec.own_life),
+            ip.own
+                .as_ref()
+                .map_or((None, 0), |o| (Some(o.head), o.life)),
+            "a record names the own output's life its batch read"
+        );
     }
     apply(t, ops.parts.clone());
     if !matches!(mode, Mode::Keys(_)) {
@@ -1087,7 +1277,8 @@ async fn batch(
             rec: rec.clone(),
             input: i,
             gen: inputs[i].gen,
-            read: inputs[i].log.head() > 0,
+            life: inputs[i].life,
+            own_gen: lives.own_gen,
             expected,
         });
     }
@@ -1098,11 +1289,11 @@ async fn batch(
 struct Stored {
     rec: Record,
     input: usize,
-    /// The input's generation at the batch's commit.
+    /// The input's generation at the batch's plan and commit, and its life.
     gen: u32,
-    /// Whether the input had a commit by then: the batch planned or loaded
-    /// a version of that generation.
-    read: bool,
+    life: u64,
+    /// The own output's generation then.
+    own_gen: u32,
     expected: Vec<Received>,
 }
 
@@ -1135,6 +1326,7 @@ async fn check_lineage(
     t: &Tracking,
     inputs: &[Input],
     own: &Log,
+    own_gen: u32,
     universe: &[Key],
     stored: &[Stored],
 ) {
@@ -1145,7 +1337,7 @@ async fn check_lineage(
         let got = lineage::input(&logs, &s.rec, &OneIndex(ix), cleaned)
             .await
             .unwrap();
-        if s.gen != inputs[s.input].gen && s.read {
+        if s.gen != inputs[s.input].gen {
             let retired = Answer::Retired {
                 output: log.name.clone(),
             };
@@ -1180,7 +1372,16 @@ async fn check_lineage(
             }))
             .filter(|&c| c < floor(&log.layers))
             .min();
+        let own_gone =
+            s.input == 0 && s.own_gen != own_gen && pieces.iter().any(|p| p.value == Value::Held);
         let got = match got {
+            Answer::Retired { output } if output == own.name => {
+                assert!(
+                    own_gone,
+                    "the own output retired in the life the batch read"
+                );
+                continue;
+            }
             Answer::NotRetained { output, commit } => {
                 assert_eq!(output, log.name, "only the input's history is cut");
                 assert_eq!(
@@ -1197,6 +1398,7 @@ async fn check_lineage(
             cut, None,
             "found although the record names commit {cut:?}, below the floor"
         );
+        assert!(!own_gone, "found although its own output was retired");
         for bad in [
             Record {
                 digest: s.rec.digest ^ 1,
@@ -1212,9 +1414,8 @@ async fn check_lineage(
                 .is_err());
         }
         assert_eq!(
-            s.rec.life > 0,
-            s.read,
-            "a record names a life when it read one"
+            s.rec.life, s.life,
+            "a record names the one life its batch read"
         );
         let other_life = Record {
             life: s.rec.life + 1,
@@ -1685,22 +1886,20 @@ fn a_key_held_back_at_commit_is_recorded_apart_from_one_the_planner_held_back() 
     });
 }
 
-// Strict xfails (round 7 of #49): each test fails today and must keep
-// failing until ERW-34 lands; then drop its `should_panic`. An output's life
-// is given at its first commit, so a plan made before it names life 0 and the
-// commit infers the life its batch loaded from the state now (ERW-34 starts
-// the life when the output is first named and requires the plan's life at
-// commit). A refused commit counts as the fixed answer.
+// Round 7 of #49 (Sol R7-1, R7-2; Astra R7-A1, R7-A2), strict xfails until
+// ERW-34: a plan made before its input's first commit named life 0, and the
+// commit inferred the life its batch loaded from the state now. An output's
+// life now starts when it is first named, every plan names it, and the
+// commit requires it: each probe is refused, or answers retired.
 
-/// A batch plans at its input's head 0, loads what the first commit wrote,
-/// then the input leaves the edge (path 0: a retarget and back; 1: close,
-/// retire, reopen with the same held progress; 2: a reset of the owner of a
-/// per-key record output another edge reads) and starts again. The commit
-/// is accepted and the record does not answer retired (Astra, R7-A1; Sol,
-/// R7-2).
+/// A batch plans at its input's head 0 and loads what the first commit
+/// wrote, then the input leaves the edge (path 0: a retarget away, a retire
+/// and back; 1: close, retire, reopen with the same held progress) and starts
+/// again. The commit is refused. Path 2, a reset of the owner of a per-key
+/// record output another edge reads, cannot happen: no edge reads a record
+/// output.
 async fn r7_load_then_remove_input(ix: &ChangeIndex, path: u8, restart_before_commit: bool) {
     use solera_tracking::outcomes::{output_id, FAILURES};
-    use solera_tracking::progress::EdgeRename;
 
     let mut t = Tracking::new();
     let mut own = Log::new("own");
@@ -1712,6 +1911,11 @@ async fn r7_load_then_remove_input(ix: &ChangeIndex, path: u8, restart_before_co
         key("items")
     };
     let name = std::str::from_utf8(&input).unwrap();
+    let open = Part::EdgeOpen(EdgeOpen {
+        edge: key("e"),
+        input: input.clone(),
+        keyed: true,
+    });
     if path == 2 {
         apply(
             &mut t,
@@ -1721,12 +1925,10 @@ async fn r7_load_then_remove_input(ix: &ChangeIndex, path: u8, restart_before_co
                 keyed: true,
             })],
         );
+        let e = t.check_event(&Event::of(vec![open])).unwrap_err();
+        assert!(e.to_string().contains("no edge reads them"), "{e}");
+        return;
     }
-    let open = Part::EdgeOpen(EdgeOpen {
-        edge: key("e"),
-        input: input.clone(),
-        keyed: true,
-    });
     let held = Part::Reset(Reset {
         edge: key("e"),
         held: true,
@@ -1737,45 +1939,40 @@ async fn r7_load_then_remove_input(ix: &ChangeIndex, path: u8, restart_before_co
     let p = plan::plan(&t.view(&req).unwrap(), &req, &OneIndex(ix), &plan::NoHold)
         .await
         .unwrap();
+    let life = t.life(&input);
+    assert!(life > 0, "the edge named its input");
     assert_eq!(
         (p.inputs[0].head, p.inputs[0].life, p.inputs[0].keys.len()),
-        (0, 0, 1)
+        (0, life, 1)
     );
     let mut items = Log::new("probe-input");
     let mut staging = Tracking::new();
     items
         .commit(ix, &mut staging, [(key("k"), Ver::Int(10))].into())
         .await;
-    apply(&mut t, vec![commit_part(name, &items.layers[0], 1)]);
-    let loaded_life = t.outputs[&input].life;
+    commit_to(&mut t, name, &items.layers[0], 1);
+    assert_eq!(t.life(&input), life, "a commit keeps the life");
     let loaded = InputReport {
         failed: vec![],
         loaded: vec![(key("k"), Ver::Int(10))],
     };
     match path {
         0 => {
-            apply(
-                &mut t,
+            let rename = |to: Key| {
                 vec![Part::EdgeRename(EdgeRename {
                     from: key("e"),
                     to: key("e"),
-                    input: key("parking"),
-                })],
-            );
+                    input: to,
+                })]
+            };
+            apply(&mut t, rename(key("parking")));
             apply(
                 &mut t,
                 vec![Part::Retire(Retire {
                     output: input.clone(),
                 })],
             );
-            apply(
-                &mut t,
-                vec![Part::EdgeRename(EdgeRename {
-                    from: key("e"),
-                    to: key("e"),
-                    input: input.clone(),
-                })],
-            );
+            apply(&mut t, rename(input.clone()));
         }
         1 => {
             apply(&mut t, vec![Part::EdgeClose(EdgeClose { edge: key("e") })]);
@@ -1788,84 +1985,30 @@ async fn r7_load_then_remove_input(ix: &ChangeIndex, path: u8, restart_before_co
             apply(&mut t, vec![open]);
             apply(&mut t, vec![held]);
         }
-        2 => {
-            apply(
-                &mut t,
-                vec![Part::Reset(Reset {
-                    edge: key("owner"),
-                    held: false,
-                })],
-            );
-            assert_eq!(t.edges[b"e".as_slice()].input, input);
-        }
         _ => unreachable!(),
     }
-    assert!(!t.outputs.contains_key(&input));
-    let mut next = Log {
-        files: items.files,
-        ..Log::new("probe-input")
-    };
+    assert!(
+        t.life(&input) > life,
+        "the input starts again in a new life"
+    );
     if restart_before_commit {
+        let mut next = Log {
+            files: items.files,
+            ..Log::new("probe-input")
+        };
         next.commit(ix, &mut staging, [(key("k"), Ver::Int(20))].into())
             .await;
-        apply(&mut t, vec![commit_part(name, &next.layers[0], 1)]);
+        commit_to(&mut t, name, &next.layers[0], 1);
     }
     let before = t.snapshot();
-    let ops = match t.progress_ops(&p, &[loaded], b"r7/batch", None) {
-        Err(_) => {
-            assert_eq!(before, t.snapshot());
-            return;
-        }
-        Ok(ops) => ops,
-    };
-    apply(&mut t, ops.parts.clone());
-    let rec = &ops.records[0];
-    let answer = lineage::input(&t.logs(rec, Some(b"own")), rec, &OneIndex(ix), 0)
-        .await
-        .unwrap();
-    eprintln!(
-        "path={path}, loaded life {loaded_life}, record life {}: {answer:?}",
-        rec.life
-    );
-    if restart_before_commit {
-        use solera_tracking::retain::{Cleaned, Track};
-        apply(
-            &mut t,
-            vec![Part::Track(Track {
-                output: input.clone(),
-                at: 1,
-            })],
-        );
-        next.commit(ix, &mut staging, [(key("k"), Ver::Int(10))].into())
-            .await;
-        apply(&mut t, vec![commit_part(name, &next.layers[1], 1)]);
-        next.commit(ix, &mut staging, [(key("k"), Ver::Int(30))].into())
-            .await;
-        apply(&mut t, vec![commit_part(name, &next.layers[2], 1)]);
-        let life = t.outputs[&input].life;
-        apply(
-            &mut t,
-            vec![Part::Cleaned(Cleaned {
-                output: input.clone(),
-                life,
-                from: 1,
-                to: 3,
-            })],
-        );
-        let after_cleanup = lineage::input(&t.logs(rec, Some(b"own")), rec, &OneIndex(ix), 3)
-            .await
-            .unwrap();
-        eprintln!("path={path}, after cleanup of the next life: {after_cleanup:?}");
-    }
-    assert_eq!(
-        answer,
-        Answer::Retired { output: input },
-        "a load of a retired life is not answered retired (strict xfail, ERW-34)"
-    );
+    let e = t
+        .progress_ops(&p, &[loaded], b"r7/batch", None)
+        .unwrap_err();
+    assert!(e.to_string().contains(" in life "), "{e}");
+    assert_eq!(before, t.snapshot());
 }
 
 #[test]
-#[should_panic(expected = "ERW-34")]
 fn r7_head_zero_load_survives_retarget_retire_and_return() {
     let rt = runtime();
     let ix = index(&rt);
@@ -1873,7 +2016,6 @@ fn r7_head_zero_load_survives_retarget_retire_and_return() {
 }
 
 #[test]
-#[should_panic(expected = "ERW-34")]
 fn r7_head_zero_load_survives_close_retire_reopen() {
     let rt = runtime();
     let ix = index(&rt);
@@ -1881,19 +2023,18 @@ fn r7_head_zero_load_survives_close_retire_reopen() {
 }
 
 #[test]
-#[should_panic(expected = "ERW-34")]
 fn r7_record_output_reset_drops_an_active_readers_input() {
     let rt = runtime();
     let ix = index(&rt);
     rt.block_on(r7_load_then_remove_input(&ix, 2, true));
 }
 
-/// An unkeyed plan checks only the consumed counter, not its input's life:
-/// a plan made before the input was retired and started again commits, and
-/// the new input reads as consumed (Astra, R7-A2; older than #49, and the
-/// same on main). ERW-34's plan life covers unkeyed plans too.
+/// An unkeyed plan names its input's life too, so a plan made before the
+/// input was retired and started again does not commit, and the new input
+/// stays owed (Astra, R7-A2: the consumed counter alone cannot tell lives
+/// apart, since a reopened edge restarts it at 0 and the output's commits
+/// restart at 1).
 #[test]
-#[should_panic(expected = "ERW-34")]
 fn r7_preexisting_unkeyed_plan_crosses_input_restart() {
     let rt = runtime();
     let ix = index(&rt);
@@ -1920,7 +2061,10 @@ fn r7_preexisting_unkeyed_plan_crosses_input_restart() {
         let p = plan::plan(&t.view(&req).unwrap(), &req, &OneIndex(&ix), &plan::NoHold)
             .await
             .unwrap();
-        assert_eq!((p.unkeyed[0].head, p.unkeyed[0].through), (2, 0));
+        assert_eq!(
+            (p.unkeyed[0].head, p.unkeyed[0].life, p.unkeyed[0].through),
+            (2, t.life(b"items"), 0)
+        );
         apply(&mut t, vec![Part::EdgeClose(EdgeClose { edge: key("u") })]);
         apply(
             &mut t,
@@ -1935,27 +2079,19 @@ fn r7_preexisting_unkeyed_plan_crosses_input_restart() {
         next.commit(&ix, &mut t, [(key("k"), Ver::Int(30))].into())
             .await;
         apply(&mut t, vec![open]);
-        let Ok(ops) = t.progress_ops(&p, &[], b"stale", None) else {
-            return;
-        };
-        assert!(ops.records.is_empty());
-        apply(&mut t, ops.parts);
+        let e = t.progress_ops(&p, &[], b"stale", None).unwrap_err();
+        assert!(e.to_string().contains(" in life "), "{e}");
         let now = plan::plan(&t.view(&req).unwrap(), &req, &OneIndex(&ix), &plan::NoHold)
             .await
             .unwrap();
-        assert!(
-            now.unkeyed[0].owed(),
-            "the restarted input was never consumed (strict xfail, ERW-34): {:?}",
-            now.unkeyed
-        );
+        assert!(now.unkeyed[0].owed(), "{:?}", now.unkeyed);
     });
 }
 
-/// The input's first commit is in the batch's own event: the record reads
-/// the state before that event and names life 0, so retiring the input
-/// does not answer retired (Sol, R7-1).
+/// The input's first commit is in the batch's own event: the plan named the
+/// life the edge gave the input, the commit keeps it, and the record names
+/// it, so retiring the input answers retired (Sol, R7-1).
 #[test]
-#[should_panic(expected = "ERW-34")]
 fn r7_a_first_input_commit_in_the_batch_event_names_its_life() {
     let rt = runtime();
     let ix = index(&rt);
@@ -1983,9 +2119,10 @@ fn r7_a_first_input_commit_in_the_batch_event_names_its_life() {
         let p = plan::plan(&t.view(&req).unwrap(), &req, &OneIndex(&ix), &plan::NoHold)
             .await
             .unwrap();
+        let life = t.life(b"items");
         assert_eq!(
             (p.inputs[0].head, p.inputs[0].life, p.inputs[0].keys.len()),
-            (0, 0, 1)
+            (0, life, 1)
         );
         let mut staging = Tracking::new();
         let mut items = Log::new("items");
@@ -1997,9 +2134,11 @@ fn r7_a_first_input_commit_in_the_batch_event_names_its_life() {
             loaded: vec![(key("k"), Ver::Int(10))],
         };
         let mut ops = t.progress_ops(&p, &[report], b"run/batch", None).unwrap();
-        ops.parts.push(commit_part("items", &items.layers[0], 1));
+        ops.parts
+            .push(commit_part(&t, "items", &items.layers[0], 1));
         apply(&mut t, ops.parts);
         let rec = &ops.records[0];
+        assert_eq!((rec.life, t.life(b"items")), (life, life));
         apply(&mut t, vec![Part::EdgeClose(EdgeClose { edge: key("e") })]);
         apply(
             &mut t,
@@ -2014,9 +2153,188 @@ fn r7_a_first_input_commit_in_the_batch_event_names_its_life() {
             got,
             Answer::Retired {
                 output: key("items")
-            },
-            "the record names life {} (strict xfail, ERW-34)",
-            rec.life
+            }
+        );
+    });
+}
+
+/// A first commit built while its output had no life lands once an edge
+/// opened on the output named it meanwhile: the life has no commit, so it
+/// holds what the commit was built on (the engine builds an output's first
+/// commit while a consumer may open its edge).
+#[test]
+fn a_first_commit_lands_in_the_life_an_edge_opening_gave_its_output() {
+    let rt = runtime();
+    let ix = index(&rt);
+    rt.block_on(async {
+        let mut t = Tracking::new();
+        let mut staging = Tracking::new();
+        let mut x = Log::new("x");
+        x.commit(&ix, &mut staging, [(key("k"), Ver::Int(1))].into())
+            .await;
+        let first = commit_part(&t, "x", &x.layers[0], 1);
+        apply(
+            &mut t,
+            vec![Part::EdgeOpen(EdgeOpen {
+                edge: key("e"),
+                input: key("x"),
+                keyed: true,
+            })],
+        );
+        let life = t.life(b"x");
+        apply(&mut t, vec![first.clone()]);
+        assert_eq!((t.life(b"x"), t.outputs[b"x".as_slice()].head), (life, 1));
+        let e = t.check_event(&Event::of(vec![first])).unwrap_err();
+        assert!(e.to_string().contains("another head"), "{e}");
+    });
+}
+
+// Strict xfails owned by B5 PR 3 (ERW-34's deferrals): each needs the
+// binding (native/src/tracking_py.rs, PR #40's file) or the engine to pass
+// a life, and must keep failing until it does; then drop its should_panic.
+
+/// A full run's end names no life: one built in an earlier life of its
+/// output ends the next life's full run (the binding builds the part at
+/// tracking_py.rs:887-896; B5 PR 3 gives it the life it was built on).
+#[test]
+#[should_panic(expected = "B5 PR 3")]
+fn a_full_run_end_of_an_earlier_life_does_not_apply() {
+    use solera_tracking::commit::FullRunDone;
+    let mut t = Tracking::new();
+    t.set_output(key("x"), vec![], 1, 0, Some(1));
+    let done = Event::of(vec![Part::FullRunDone(FullRunDone { output: key("x") })]);
+    t.check_event(&done).unwrap();
+    apply(&mut t, vec![Part::Retire(Retire { output: key("x") })]);
+    t.set_output(key("x"), vec![], 1, 0, Some(1));
+    assert!(
+        t.check_event(&done).is_err(),
+        "a full run's end of an earlier life applies (strict xfail, B5 PR 3)"
+    );
+}
+
+/// A batch's output commit lands in its own output's life only if the plan
+/// read that life: a plan with no own output lets the commit land in any
+/// (the engine passes output_commit with no own, commit.py:155; B5 PR 3
+/// passes own on every plan, then progress_ops refuses this).
+#[test]
+#[should_panic(expected = "B5 PR 3")]
+fn an_output_commit_needs_the_own_output_the_plan_read() {
+    let rt = runtime();
+    let ix = index(&rt);
+    rt.block_on(async {
+        let mut t = Tracking::new();
+        let mut items = Log::new("items");
+        items
+            .commit(&ix, &mut t, [(key("k"), Ver::Int(1))].into())
+            .await;
+        apply(
+            &mut t,
+            vec![Part::EdgeOpen(EdgeOpen {
+                edge: key("e"),
+                input: key("items"),
+                keyed: true,
+            })],
+        );
+        let req = Request {
+            inputs: vec![InputRequest {
+                own: None,
+                ..held_plan_request().inputs[0].clone()
+            }],
+            ..held_plan_request()
+        };
+        let p = plan::plan(&t.view(&req).unwrap(), &req, &OneIndex(&ix), &plan::NoHold)
+            .await
+            .unwrap();
+        assert!(
+            t.progress_ops(&p, &[InputReport::default()], b"run/batch", Some(1))
+                .is_err(),
+            "an output commit with no own output's life (strict xfail, B5 PR 3)"
+        );
+    });
+}
+
+/// A batch's parts never name life 0: an output with no life is read by no
+/// plan, so a part naming 0 is refused, even beside a part that names it.
+#[test]
+fn a_batch_part_naming_life_0_is_refused() {
+    let rt = runtime();
+    let ix = index(&rt);
+    rt.block_on(async {
+        let mut t = Tracking::new();
+        let mut items = Log::new("items");
+        items
+            .commit(&ix, &mut t, [(key("k"), Ver::Int(1))].into())
+            .await;
+        apply(
+            &mut t,
+            vec![Part::EdgeOpen(EdgeOpen {
+                edge: key("e"),
+                input: key("items"),
+                keyed: true,
+            })],
+        );
+        let req = Request {
+            inputs: vec![InputRequest {
+                own: None,
+                ..held_plan_request().inputs[0].clone()
+            }],
+            ..held_plan_request()
+        };
+        let p = plan::plan(&t.view(&req).unwrap(), &req, &OneIndex(&ix), &plan::NoHold)
+            .await
+            .unwrap();
+        let ops = t
+            .progress_ops(&p, &[InputReport::default()], b"run/batch", None)
+            .unwrap();
+        let mut parts = vec![Part::Declare(Declare {
+            output: key("ghost"),
+        })];
+        for part in ops.parts {
+            parts.push(match part {
+                Part::Batch(b) => Part::Batch(BatchProgress {
+                    own: Some((key("ghost"), 0)),
+                    ..b
+                }),
+                part => part,
+            });
+        }
+        let ev = Event::decode(&Event::of(parts).encode()).unwrap();
+        let e = t.check_event(&ev).unwrap_err();
+        assert!(e.to_string().contains("a life is never 0"), "{e}");
+    });
+}
+
+/// A first commit built while its output had no life lands only while it
+/// still has none: built before a life began and held past its end, it does
+/// not become the next life's first commit (Fable, round 1: a commit naming
+/// life 0 matches every stretch with no entry). B5 PR 3 declares every
+/// output before its first commit; then a commit naming 0 is refused.
+#[test]
+#[should_panic(expected = "B5 PR 3")]
+fn a_first_commit_built_before_a_whole_life_does_not_apply() {
+    let rt = runtime();
+    let ix = index(&rt);
+    rt.block_on(async {
+        let mut t = Tracking::new();
+        let mut staging = Tracking::new();
+        let mut a = Log::new("x");
+        a.commit(&ix, &mut staging, [(key("k"), Ver::Int(1))].into())
+            .await;
+        let pending = commit_part(&t, "x", &a.layers[0], 1);
+        assert!(matches!(&pending, Part::OutputCommit(c) if c.life == 0));
+        apply(&mut t, vec![Part::Declare(Declare { output: key("x") })]);
+        let mut staging = Tracking::new();
+        let mut b = Log {
+            files: a.files,
+            ..Log::new("x")
+        };
+        b.commit(&ix, &mut staging, [(key("k"), Ver::Int(7))].into())
+            .await;
+        commit_to(&mut t, "x", &b.layers[0], 1);
+        apply(&mut t, vec![Part::Retire(Retire { output: key("x") })]);
+        assert!(
+            t.check_event(&Event::of(vec![pending])).is_err(),
+            "a first commit built before a whole life applies after it (strict xfail, B5 PR 3)"
         );
     });
 }

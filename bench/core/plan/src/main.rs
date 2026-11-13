@@ -359,9 +359,11 @@ fn scenario_state(
             range: KeyRange::all(),
             piece: Some(value),
             head,
+            life: t.life(b"items"),
+            own: None,
             points: pts,
             expect: read_digest(&Keyed::default(), false, &KeyRange::all()),
-            fence: None,
+            fence: false,
         });
         t.apply(&Event::of(vec![caught_up]).encode()).unwrap();
     }

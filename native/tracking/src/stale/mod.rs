@@ -472,10 +472,23 @@ impl SetWatch {
     }
 
     pub(crate) fn check(&self, t: &Tracking) -> Result<()> {
-        keyed_input(t, &self.edge).map(|_| ())
+        keyed_input(t, &self.edge)?;
+        if self
+            .watch
+            .own
+            .as_deref()
+            .is_some_and(crate::state::core_owned)
+        {
+            return invalid("a per-key edge's record outputs are the core's: no watch reads them");
+        }
+        Ok(())
     }
 
+    /// Names the watch's own output: the edge's staleness reads it.
     pub(crate) fn apply(self, t: &mut Tracking) {
+        if let Some(own) = &self.watch.own {
+            t.name(own);
+        }
         let i = t.stale.inputs.get_mut(&self.edge).expect("checked");
         if i.watch.as_ref() != Some(&self.watch) {
             i.watch = Some(self.watch);

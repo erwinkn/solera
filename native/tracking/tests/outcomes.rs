@@ -141,6 +141,7 @@ impl Log {
         }
         let mut parts = vec![Part::OutputCommit(OutputCommit {
             output: key(&self.name),
+            life: t.life(self.name.as_bytes()),
             layer: self.layers.last().unwrap().clone(),
             live: self.states.last().unwrap().len() as u64,
             ends_full_run: ends && (clear || was),
@@ -561,8 +562,7 @@ impl World {
             head: rec.head,
             life: rec.life,
             conditions: rec.conditions.clone(),
-            own_head: None,
-            own_life: 0,
+            own: None,
             keys,
             held_back: vec![],
             moot: vec![],
@@ -2024,10 +2024,21 @@ fn a_part_built_before_the_records_started_over_is_refused() {
                 .unwrap();
             w.apply(ev);
             let before = w.t.snapshot();
-            for stale in [commit, start, rebuild] {
-                let err = w.t.apply(&Event::of(stale).encode()).unwrap_err();
-                assert!(err.to_string().contains("started over"), "{err}");
-            }
+            let refused = |t: &mut Tracking, parts: Vec<Part>, why: &str| {
+                let err = t.apply(&Event::of(parts).encode()).unwrap_err();
+                assert!(err.to_string().contains(why), "{err}");
+            };
+            // the records' output started a new life too: the commit to it
+            // is refused on that, and its outcomes alone on the records' life
+            let outcomes = commit
+                .iter()
+                .filter(|p| matches!(p, Part::Outcomes(_)))
+                .cloned()
+                .collect();
+            refused(&mut w.t, commit, "the commit was built in life");
+            refused(&mut w.t, outcomes, "started over");
+            refused(&mut w.t, start, "started over");
+            refused(&mut w.t, rebuild, "started over");
             assert_eq!(w.t.snapshot(), before);
         });
     }

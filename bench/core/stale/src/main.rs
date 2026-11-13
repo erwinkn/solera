@@ -107,9 +107,11 @@ fn state(
             range: KeyRange::all(),
             piece: Some(Value::At(at, cond.clone())),
             head: at,
+            life: t.life(ITEMS),
+            own: None,
             points: vec![],
             expect: read_digest(&Keyed::default(), false, &KeyRange::all()),
-            fence: None,
+            fence: false,
         }));
         t.apply_event(Event::of(parts)).unwrap();
         t.apply_event(Event::of(vec![Part::Watch(SetWatch {
@@ -492,9 +494,11 @@ fn main() {
             range: range.clone(),
             piece: Some(Value::At(head, all.clone())),
             head,
+            life: t.life(ITEMS),
+            own: None,
             points: vec![],
             expect: read_digest(&k, false, &range),
-            fence: None,
+            fence: false,
         })]))
         .unwrap();
         for (mode, net) in modes {

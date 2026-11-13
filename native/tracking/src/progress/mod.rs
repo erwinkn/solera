@@ -979,10 +979,12 @@ impl EdgeOpen {
         if t.edges.contains_key(&self.edge) {
             return invalid("the edge is already open");
         }
-        Ok(())
+        readable(&self.input)
     }
 
+    /// Names its input: a plan of the edge reads the input's life.
     pub(crate) fn apply(self, t: &mut Tracking) {
+        t.name(&self.input);
         let progress = Arc::new(Progress::new(self.keyed));
         t.edges.insert(
             self.edge,
@@ -1020,8 +1022,19 @@ impl EdgeClose {
     }
 }
 
+/// No edge reads a per-key edge's record outputs: their lives follow that
+/// edge, not the reader's (see [crate::state::core_owned]).
+fn readable(input: &[u8]) -> Result<()> {
+    if crate::state::core_owned(input) {
+        return invalid("a per-key edge's record outputs are the core's: no edge reads them");
+    }
+    Ok(())
+}
+
 /// An edge is renamed, keeping its progress: its consumer or input was
-/// renamed, or the output it reads (`input`).
+/// renamed. It moves to another output (`input`) only with progress as a
+/// reset leaves it: no commit, point or failure record of the output it
+/// read, so nothing it holds names a commit of another output's life.
 #[derive(Clone, Debug, PartialEq)]
 pub struct EdgeRename {
     pub from: Id,
@@ -1049,23 +1062,32 @@ impl EdgeRename {
         if self.from != self.to && t.edges.contains_key(&self.to) {
             return invalid("the new name is taken");
         }
-        let floor = t
+        if e.input == self.input {
+            return Ok(());
+        }
+        readable(&self.input)?;
+        let holds = match e.progress.as_ref() {
+            Progress::Unkeyed(through) => *through > 0,
+            Progress::Keyed(k) => k.commits().next().is_some() || !k.points.is_empty(),
+        };
+        let failing = t
             .outputs
-            .get(&self.input)
-            .and_then(|o| o.layers.first()?.floor)
-            .unwrap_or(0);
-        let held = crate::retain::cut::edge_holds(t, &self.from, e);
-        if let Some((c, by)) = held.into_iter().min_by_key(|(c, _)| *c) {
-            if c < floor {
-                return invalid(format!(
-                    "the edge holds commit {c} ({by:?}), below its new input's floor {floor}: reset it first"
-                ));
-            }
+            .get(&crate::outcomes::output_id(
+                crate::outcomes::FAILURES,
+                &self.from,
+            ))
+            .is_some_and(|o| o.live > 0);
+        if holds || failing {
+            return invalid(
+                "the edge holds commits, points or failures of the output it reads: reset it first, then move it to another output",
+            );
         }
         Ok(())
     }
 
+    /// Names its new input.
     pub(crate) fn apply(self, t: &mut Tracking) {
+        t.name(&self.input);
         let mut e = t.edges.remove(&self.from).expect("checked");
         e.input = self.input;
         t.edges.insert(self.to, e);
@@ -1113,6 +1135,8 @@ impl Reset {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Consumed {
     pub edge: Id,
+    /// The input's life the plan read: refused in any other.
+    pub life: u64,
     pub through: u64,
     /// What the plan read: refused unless the edge is still consumed
     /// through it, so a stale commit cannot move progress back.
@@ -1122,6 +1146,7 @@ pub struct Consumed {
 impl Consumed {
     pub fn encode(&self, e: &mut Enc) {
         e.bytes(&self.edge);
+        e.uv(self.life);
         e.uv(self.through);
         e.uv(self.expect);
     }
@@ -1129,13 +1154,16 @@ impl Consumed {
     pub fn decode(d: &mut Dec<'_>) -> Result<Consumed> {
         Ok(Consumed {
             edge: d.bytes()?.into(),
+            life: d.uv()?,
             through: d.uv()?,
             expect: d.uv()?,
         })
     }
 
     pub(crate) fn check(&self, t: &Tracking) -> Result<()> {
-        match edge(t, &self.edge)?.progress.as_ref() {
+        let e = edge(t, &self.edge)?;
+        t.in_life(&e.input, self.life, "the batch was planned")?;
+        match e.progress.as_ref() {
             Progress::Unkeyed(t) if *t == self.expect => Ok(()),
             Progress::Unkeyed(_) => {
                 invalid("the edge's progress moved since the batch was planned")
@@ -1163,6 +1191,12 @@ pub struct BatchProgress {
     pub piece: Option<Value>,
     /// The input's head the batch planned at. Refused once a fold passed it.
     pub head: u64,
+    /// The input's life the batch planned in: refused in any other, so the
+    /// edge reads the output the batch planned (lives are unique).
+    pub life: u64,
+    /// The consumer's own output and the life the plan read it in, where the
+    /// plan read it: refused in any other.
+    pub own: Option<(Id, u64)>,
     /// Sorted by key.
     pub points: Vec<(Key, Point)>,
     /// The digest of the progress the plan read (the range's slice; with a
@@ -1170,12 +1204,28 @@ pub struct BatchProgress {
     pub expect: u64,
     /// When the batch kept, on an input then settled, a key it would have
     /// held back had the input been unsettled (loaded at another version than
-    /// planned, or taken by the input's patterns but not by the input): that
-    /// input's output and the head the batch planned at. Refused if the edge
-    /// reads another output, or the input became `unsettled`, before the
-    /// event applies, since the key would then have been held back. The other
-    /// way needs no fence: holding back is safe.
-    pub fence: Option<(Id, u64)>,
+    /// planned, or taken by the input's patterns but not by the input).
+    /// Refused if the input became `unsettled` at the batch's `head` before
+    /// the event applies, since the key would then have been held back. The
+    /// other way needs no fence: holding back is safe.
+    pub fence: bool,
+}
+
+/// Refused unless the batch's input is in the life its plan read, and so is
+/// its own output where the plan read it. The batch commit and
+/// [`Tracking::progress_ops`] both run it, so `progress_ops` never returns
+/// records for an event the state refuses.
+pub(crate) fn planned_lives(
+    t: &Tracking,
+    input: &[u8],
+    life: u64,
+    own: Option<(&[u8], u64)>,
+) -> Result<()> {
+    t.in_life(input, life, "the batch was planned")?;
+    if let Some((own, life)) = own {
+        t.in_life(own, life, "the batch's plan read its own output")?;
+    }
+    Ok(())
 }
 
 /// Whether a batch planned at `head` holds back what it loaded at another
@@ -1210,16 +1260,18 @@ impl BatchProgress {
             }
         }
         body.uv(self.head);
-        encode_points(&mut body, &mut t, self.points.iter().map(|(k, p)| (k, p)));
-        body.uv(self.expect);
-        match &self.fence {
+        body.uv(self.life);
+        match &self.own {
             None => body.u8(0),
-            Some((output, head)) => {
+            Some((output, life)) => {
                 body.u8(1);
                 body.bytes(output);
-                body.uv(*head);
+                body.uv(*life);
             }
         }
+        encode_points(&mut body, &mut t, self.points.iter().map(|(k, p)| (k, p)));
+        body.uv(self.expect);
+        body.u8(self.fence.into());
         t.encode(e);
         e.buf.extend_from_slice(&body.buf);
     }
@@ -1235,11 +1287,17 @@ impl BatchProgress {
             t => return format(format!("piece tag {t}")),
         };
         let head = d.uv()?;
+        let life = d.uv()?;
+        let own = match d.u8()? {
+            0 => None,
+            1 => Some((d.bytes()?.into(), d.uv()?)),
+            t => return format(format!("own tag {t}")),
+        };
         let points = decode_points(d, &conds)?;
         let expect = d.uv()?;
         let fence = match d.u8()? {
-            0 => None,
-            1 => Some((d.bytes()?.into(), d.uv()?)),
+            0 => false,
+            1 => true,
             t => return format(format!("fence tag {t}")),
         };
         Ok(BatchProgress {
@@ -1248,6 +1306,8 @@ impl BatchProgress {
             range,
             piece,
             head,
+            life,
+            own,
             points,
             expect,
             fence,
@@ -1256,6 +1316,13 @@ impl BatchProgress {
 
     pub(crate) fn check(&self, t: &Tracking) -> Result<()> {
         let k = keyed_edge(t, &self.edge)?;
+        let input = &t.edges[&self.edge].input;
+        planned_lives(
+            t,
+            input,
+            self.life,
+            self.own.as_ref().map(|(o, l)| (&o[..], *l)),
+        )?;
         if self.points.iter().any(|(key, _)| !self.range.contains(key)) {
             return invalid("a point outside the batch's range");
         }
@@ -1265,16 +1332,12 @@ impl BatchProgress {
         if read_digest(k, self.reset, &self.range) != self.expect {
             return invalid("the edge's progress moved since the batch was planned");
         }
-        let input = &t.edges[&self.edge].input;
         let floor = t.outputs.get(input).and_then(|o| o.layers.first()?.floor);
         if floor.is_some_and(|f| f > self.head) {
             return invalid("the input's layers no longer reach back to the batch's head: a merge folded past it");
         }
-        if let Some((output, head)) = &self.fence {
-            if *t.edges[&self.edge].input != **output {
-                return invalid("the edge reads another output than the batch planned");
-            }
-            if unsettled(t, output, *head)? {
+        if self.fence {
+            if unsettled(t, input, self.head)? {
                 return Err(Error::Unsettled);
             }
         }
