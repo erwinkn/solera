@@ -632,8 +632,9 @@ class Attempts:
             )
             return
         if status == "replan":
-            # A fenced read saw a newer write than the batch's head: planned again at
-            # the newer head shortly, never a failure (docs/observed-set.md).
+            # The worker stopped before it wrote, for a reason that is no failure: planned
+            # again shortly. `restart`: its asset read a dead write to its own output, and
+            # its next attempt runs in full (D196 rule 5).
             output, partition = result.get("moved") or ("?", "")
             await self._fail(
                 task_id,
@@ -644,6 +645,7 @@ class Attempts:
                 delay=REPLAN_DELAY,
                 result=result,
                 reason=f"{output}/{partition}",
+                restart=bool(result.get("restart")),
             )
             return
         if status == "failed":
@@ -814,6 +816,7 @@ class Attempts:
         end=None,
         reason=None,
         retry_for=None,
+        restart=False,
     ):
         """End a launched attempt without a commit. With no result, its
         control file is ended first, so it can never write after this, and
@@ -848,6 +851,7 @@ class Attempts:
             reason=reason,
             write=write,
             retry_for=retry_for,
+            restart=restart,
         )
 
     def _last_report(self, attempt: str) -> dict:

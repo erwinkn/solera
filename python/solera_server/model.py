@@ -861,6 +861,10 @@ class Model:
         times = self._attempt_events(run, task, e, launched)
         if launched is not None and "commit" not in e and e.get("write", lifecycle.NONE) != lifecycle.NONE:
             self._dead_writer(task["partition"], launched)
+        if e.get("restart"):  # until its next commit: that attempt runs in full
+            task["restart"] = True
+        elif e.get("commit"):
+            task.pop("restart", None)
         self._cleaned_up((task.get("cleanup") or {}).get("partition", task["partition"]), e, prepared)
         if launched is not None and not e.get("commit") and False:
             self._abandoned(task["partition"], e["attempt"], launched, at + float(e.get("late_writes") or 0))

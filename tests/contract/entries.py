@@ -37,12 +37,6 @@ LATER: dict[str, str] = {
         ],
         "B8: stores still declare how they write (`writes`)",
     ),
-    **dict.fromkeys(
-        [
-            "ENG-18",
-        ],
-        "B8: a full run owed after a dead write to an asset's own output comes next",
-    ),
     **dict.fromkeys(["CLN", "RST-8", "PAR-6", "ENG-13", "ENG-14"], "B9: retention and upkeep"),
     **dict.fromkeys(["HIS-3", "HIS-5", "HIS-7", "HIS-8"], "B10: lineage"),
 }

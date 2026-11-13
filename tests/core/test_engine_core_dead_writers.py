@@ -8,7 +8,7 @@ it writes in place and answers `written_at` as a table would."""
 from dataclasses import replace
 
 import pytest
-from solera.sdk import Retry
+from solera.sdk import Incremental, Output, Project, Retry, asset
 from solera.stores import FileStore, KeyedWrite, Patch
 
 from tests.contract.harness import Solera
@@ -33,12 +33,13 @@ class Table(Faults, FileStore):
         super().__init__(*args, **kw)
         self.left, self.asked, self.removed = [], [], []
         self.holds = {}  # key -> the version a read says it found it at, whatever was planned
+        self.value_at = None  # the version a read of a single value says it found
 
     async def read(self, ref, t, selection):
         found = await super().read(ref, t, selection)
-        if not self.holds or found.versions is None:
-            return found
-        return replace(found, versions={**found.versions, **self.holds})
+        if found.versions is None:
+            return found if self.value_at is None else replace(found, version=self.value_at)
+        return replace(found, versions={**found.versions, **self.holds}) if self.holds else found
 
     async def written_at(self, versions, prior, context):
         self.asked.append((list(versions), context.generation))
@@ -118,3 +119,40 @@ async def test_a_version_nothing_explains_is_held_back_and_raises_an_alarm(soler
     await solera.run("copy")
     assert [sorted(seen) for _, seen in received] == [["k1"], ["k2"]]
     assert await solera.stale("copy") == []
+
+
+async def test_an_asset_never_builds_on_a_write_to_its_own_output_no_commit_recorded(solera):
+    """`tally` keeps a count in a table and adds to it through `ctx.load()`.
+    The table says it holds a version `tally` never committed (a writer
+    died after writing): the attempt that reads it stops before the asset
+    adds to it, and `tally` runs in full instead, from nothing."""
+
+    table, seen, feed = Table(solera.root / "table"), [], ["k1", "k2"]
+
+    @asset(outputs=Output("items", key="id"))
+    def items():
+        return [{"id": key} for key in feed]
+
+    @asset(inputs={"items": Incremental()}, outputs=Output("tally", store="s"))
+    async def tally(ctx, items: list):
+        batch, held = ctx.batch["items"], await ctx.load()
+        before = 0 if batch.reset or held is None else held["n"]
+        seen.append((batch.reset, sorted(batch.added), before))
+        return {"n": before + len(batch.added)}
+
+    await solera.deploy(Project(assets=[items, tally], stores={"s": table}))
+    await solera.run("items")
+    await solera.run("tally")
+    feed.append("k3")
+    await solera.run("items")
+    table.value_at = 999
+    detail = await solera.run("tally")
+    [task] = detail["tasks"]
+    assert [a["outcome"] for a in detail["attempts"][task["id"]]] == ["replanned", "succeeded"]
+    assert seen == [(False, ["k1", "k2"], 0), (True, ["k1", "k2", "k3"], 0)]
+    table.value_at = None
+    assert (await solera.read("tally"))["n"] == 3
+    feed.append("k4")
+    await solera.run("items")
+    await solera.run("tally")
+    assert seen[-1] == (False, ["k4"], 3), "an ordinary batch again: the full run was owed once"
