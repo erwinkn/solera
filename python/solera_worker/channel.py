@@ -122,6 +122,12 @@ class AttemptChannel:
     async def finished(self, body: dict) -> None:
         await self._post("finished", body)
 
+    async def loaded(self, body: dict) -> dict:
+        """Which of the keys a batch loaded otherwise than planned it must
+        hold back: `{"held": {input: [key, ...]}}`."""
+
+        return await self._post("loaded", body)
+
     async def close(self) -> None:
         await self.transport.close()
 

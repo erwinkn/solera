@@ -154,6 +154,9 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
         self.pool_offered_grace = pool_offered_grace
         self.secret: bytes | None = None  # signs attempt tokens; stable across restarts
         self.live: dict[str, Live] = {}  # attempt id -> what its worker reported
+        # (output, partition) -> key -> what a batch loaded of it that nothing explains: an alarm,
+        # in memory, until the output's next commit (`tracking.loaded`)
+        self.anomalies: dict[tuple, dict] = {}
         self.pollers: dict[str, dict] = {}  # pool workers that asked for work lately
         self._pool_changed = asyncio.Event()
         self.eval_interval = eval_interval
@@ -593,8 +596,6 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
                 held[task_id] = waiting
             elif cap is not None and asset_used.get(task["asset"], 0) >= cap:
                 held[task_id] = ["concurrency", task["asset"]]
-            elif (writing := self._writing(task)) is not None:
-                held[task_id] = writing
             elif not is_pool and engine_used >= self.concurrency:
                 held[task_id] = ["engine", None]
             elif limit is not None and executor_used.get(executor, 0) >= limit:
@@ -611,36 +612,6 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
             self._spawn(task["run"], attempt, is_pool, executor, self._attempt(task_id, attempt, placement))
         if held:
             self.state.record({"type": "TasksHeld", "held": held, "at": now})
-
-    def _writing(self, task: dict) -> list | None:
-        """Why a task must wait for a fenced input's partition, or None: an
-        attempt of its upstream holds it — its rows may be visible before its
-        commit is installed. A batch read now would read a write its head
-        does not hold: it waits instead, for as long as the upstream's write
-        takes. It never waits for a dead writer's rows to be repaired: the
-        upstream's next attempt does that (D196)."""
-
-        manifest = self.manifest
-        fenced = set()
-        for spec in ((manifest["assets"].get(task["asset"]) or {}).get("inputs") or {}).values():
-            out = manifest["outputs"].get(spec.get("output")) or {}
-            store = (manifest.get("stores") or {}).get(out.get("store")) or {}
-            if (
-                spec.get("kind") == "incremental"
-                and out.get("key") is not None
-                and store.get("writes") == "fenced"
-            ):
-                fenced.add(spec["output"])
-        if not fenced:
-            return None
-        for input in self.planner().inputs(task["asset"], task["partition"]):
-            if input.output not in fenced or input.partition is None:
-                continue
-            where = f"{input.output}/{input.partition}"
-            holder = self.m.claimed_partitions.get((input.owner, input.partition))
-            if input.owner is not None and holder is not None and self.m.claimed(holder) is not None:
-                return ["writing", where]
-        return None
 
     def _spawn(self, run_id: str, attempt: str, is_pool: bool, executor: str, work):
         """Drive one attempt in the background, holding its execution slots."""
@@ -1109,7 +1080,7 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
             if output.get("key") is not None:
                 info["core"] = output_pin(self.core, name, partition)
                 if (name, partition) in self.m.repairs:
-                    info["repairs"] = self.m.repairs[(name, partition)]
+                    info["repairs"] = [version for version, _ in self.m.repairs[(name, partition)]]
                 if output.get("dynamic_partitions") or name in self._dynamic_dims:
                     info["dynamic"] = True  # its elements, the engine's to work out at commit
             outputs[name] = info
@@ -1405,6 +1376,7 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
         outcomes = None
         for plan in (prepared.get("plans") or {}).values():
             more = more or not (plan is None or plan["final"] or plan.get("done"))  # the walk goes on
+        more = more or bool((built.progress or {}).get("held"))  # keys held back under a rebuild
         heads = {}
         for name, entry in outputs.items():
             if name not in declared:
@@ -1435,6 +1407,7 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
                 if info.get("dynamic"):
                     head["partitions"] = built.elements.get(name, (before or {}).get("partitions") or [])
             heads[name] = head
+            self.anomalies.pop((name, task["partition"]), None)  # raised again if a batch still finds one
         for name in set(declared) - set(outputs):
             # A per-key batch whose keys all failed writes nothing, and makes no head yet;
             # nor does a batch whose keys the input's patterns all left out.

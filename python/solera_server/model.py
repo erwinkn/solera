@@ -207,8 +207,8 @@ class Model:
         # terminal outcome; the `definition`, `config` and `context` its last commit was made
         # under; `edges`, each incremental input's edge life as its last commit over it left it.
         self.partitions = Grouped(_flatten(snap.get("partitions"), 2))
-        # (output, partition) -> the versions of attempts that may have written its table and
-        # ended without a commit: the next attempt repairs what they left (`_dead_writer`)
+        # (output, partition) -> `[version, attempt]` of each attempt that may have written its
+        # table and ended without a commit: the next attempt repairs what they left (`_dead_writer`)
         self.repairs: dict[tuple, list] = _flatten(snap.get("repairs"), 2)
         # (output, partition) -> cleanup of an immutable store, each entry at the
         # event counter that let go of it: for the partition's next attempt to clean up
@@ -1298,8 +1298,8 @@ class Model:
             if self.reset_at.get(("output", output), 0) > prepared.get("deploy_number", self.deploy_number):
                 continue  # reset since it launched: what it wrote was the old output's
             versions = self.repairs.setdefault((output, partition), [])
-            if launched["generation"] not in versions:
-                versions.append(launched["generation"])
+            if [launched["generation"], launched["attempt"]] not in versions:
+                versions.append([launched["generation"], launched["attempt"]])
 
     def _on_FilesCleanedUp(self, e):
         gone = set(e["paths"])

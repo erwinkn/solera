@@ -5,6 +5,8 @@ that attempt commits. Postgres itself is exercised by the contract's STO-5
 and ENG-8, which CI does not run; here the store is one of files that says
 it writes in place and answers `written_at` as a table would."""
 
+from dataclasses import replace
+
 import pytest
 from solera.sdk import Retry
 from solera.stores import FileStore, KeyedWrite, Patch
@@ -30,6 +32,13 @@ class Table(Faults, FileStore):
     def __init__(self, *args, **kw):
         super().__init__(*args, **kw)
         self.left, self.asked, self.removed = [], [], []
+        self.holds = {}  # key -> the version a read says it found it at, whatever was planned
+
+    async def read(self, ref, t, selection):
+        found = await super().read(ref, t, selection)
+        if not self.holds or found.versions is None:
+            return found
+        return replace(found, versions={**found.versions, **self.holds})
 
     async def written_at(self, versions, prior, context):
         self.asked.append((list(versions), context.generation))
@@ -89,3 +98,23 @@ async def test_a_failure_before_any_write_leaves_nothing_to_repair(solera):
     fail[0] = False
     await solera.run("items")
     assert table.asked == [] and sorted(await solera.keys("items")) == ["a"]
+
+
+async def test_a_version_nothing_explains_is_held_back_and_raises_an_alarm(solera):
+    """`copy` reads `items` from a table that says it holds k2 at version
+    999: no commit of `items` and no live attempt wrote that. `copy`'s batch
+    processes k1 and holds k2 back; an alarm names `items` and k2; k2 stays
+    owed, and is processed once the table holds what the log lists."""
+
+    table, received = Table(solera.root / "table"), []
+    await solera.deploy(items_on(table, [rows("k1=1", "k2=1")], received))
+    await solera.run("items")
+    table.holds = {"k2": 999}
+    await solera.run("copy")
+    assert [sorted(seen) for _, seen in received] == [["k1"]]
+    assert await solera.alarmed("items", "k2", "999")
+    assert await solera.stale("copy") != []
+    table.holds = {}
+    await solera.run("copy")
+    assert [sorted(seen) for _, seen in received] == [["k1"], ["k2"]]
+    assert await solera.stale("copy") == []

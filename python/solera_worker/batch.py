@@ -170,6 +170,21 @@ def _encode(o, f) -> int:
     return f.tell()
 
 
+async def hold(ask, param: str, loaded: list) -> list[str]:
+    """The keys of `loaded`, which a table held otherwise than planned
+    (`[key, version]`, None: absent), that the batch must not process. The
+    engine knows: a key its producer committed again since the plan, or one
+    a live attempt of its producer wrote, is processed as loaded; one a
+    rebuild under way or a dead writer changed is held back, and stays owed.
+    With no engine to ask, or none that answers, every one is held back: an
+    engine out of reach costs a later batch, never a wrong one."""
+
+    answer = await ask({param: loaded}) if ask is not None else None
+    if answer is None:
+        return sorted(key for key, _ in loaded)
+    return sorted(answer.get(param) or ())
+
+
 async def repair(o, context) -> None:
     """Delete what dead writers left in a keyed output's table (D196): the
     attempts whose versions `info["repairs"]` lists wrote, perhaps, and ended
