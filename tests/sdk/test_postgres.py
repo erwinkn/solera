@@ -1,13 +1,18 @@
 """§3/§4: PostgresStore — Patch, batch snapshots, partition partitions,
-Sql writes. Skips unless SOLERA_TEST_DATABASE_URL points at a scratch database."""
+Sql writes, and the version check that locks out late and dead writers
+(D196). Skips unless SOLERA_TEST_DATABASE_URL points at a scratch database."""
 
+import asyncio
 import os
+import tempfile
+import threading
+import time
 import uuid
 from decimal import Decimal as D
 
 import pytest
-from solera.sdk import Output
-from solera.stores import KeyedWrite, Keys, Patch, StoreError, WriteError, prepare_for
+from solera.sdk import Migration, Output
+from solera.stores import KeyedWrite, Keys, Patch, StoreError, WriteContext, WriteError, prepare_for
 from solera_postgres import Sql
 
 from tests.conftest import context
@@ -967,3 +972,459 @@ async def test_a_migration_applies_to_each_schemas_table_of_one_name(store):
                 (schema, name),
             ).fetchall()
             assert "note" in {r["column_name"] for r in columns}, schema
+
+
+# -- the version check (D196): helpers ----------------------------------------------------
+
+
+def keyed_output(name=None, **config) -> Output:
+    config.setdefault("key", "id")
+    return output(name, **config)
+
+
+def at(out, generation, *, reset=False, partition="", worker="w") -> WriteContext:
+    """A write context of the attempt at version `generation`."""
+
+    return WriteContext(
+        output=out,
+        partition=partition,
+        attempt=f"a{generation}",
+        generation=generation,
+        worker_id=worker,
+        reset=reset,
+    )
+
+
+def rows(**values) -> list[dict]:
+    return [{"id": k, "v": v} for k, v in values.items()]
+
+
+def sql(statement, params=()):
+    import psycopg
+
+    with psycopg.connect(DSN, autocommit=True) as conn:
+        found = conn.execute(statement, params)
+        return found.fetchall() if found.description else None
+
+
+def outside(store, out, partition=None) -> dict:
+    """What a program reading the table outside Solera sees."""
+
+    table, _, _ = store._table(out)
+    column = out.config.get("partition_column")
+    where, params = (f" WHERE {column} = %s", (partition,)) if partition is not None else ("", ())
+    return {r[0]: r[1] for r in sql(f"SELECT id, v FROM {table}{where}", params)}
+
+
+async def solera(store, ref) -> dict:
+    """What Solera reads through a commit's ref."""
+
+    return {r["id"]: r["v"] for r in await store.load(ref, list[dict], None)}
+
+
+def registry(store, out, partition="") -> tuple | None:
+    """The partition's version row: (generation, written)."""
+
+    from solera_postgres import VERSIONS_TABLE
+
+    table, _, _ = store._table(out)
+    found = sql(
+        f"SELECT generation, written FROM {VERSIONS_TABLE} WHERE rel = %s AND part = %s", (table, partition)
+    )
+    return tuple(found[0]) if found else None
+
+
+def open_write(store, out, partition):
+    """A write of the partition in progress, held open: the write domain, the
+    partition's version row, and its rows deleted (ROW EXCLUSIVE on the
+    user's table), as a full run's first write holds them."""
+
+    from solera_postgres import VERSIONS_TABLE
+
+    table, _, _ = store._table(out)
+    conn = store._connect()
+    cur = conn.cursor()
+    store._domain(cur, table)
+    cur.execute(f"SELECT 1 FROM {VERSIONS_TABLE} WHERE rel = %s AND part = %s FOR UPDATE", (table, partition))
+    column = out.config.get("partition_column")
+    cur.execute(
+        f"DELETE FROM {table} WHERE {column} = %s" if column else f"DELETE FROM {table}",
+        (partition,) if column else (),
+    )
+    return conn
+
+
+def make_trigger(table, function, body, when="BEFORE INSERT", each="ROW"):
+    sql(f"CREATE OR REPLACE FUNCTION {function}() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN {body} END $$")
+    sql(f"CREATE OR REPLACE TRIGGER mark {when} ON {table} FOR EACH {each} EXECUTE FUNCTION {function}()")
+
+
+# -- late and dead writers (review F1) -------------------------------------------------------
+
+
+async def test_a_late_insert_of_a_removed_key_is_refused(store):
+    """F1's first reproduction. The table holds k2 at 2. Attempt 6 plans k2 and
+    stalls; the engine gives up on it. Its retry 7 removes k2 and commits.
+    Attempt 6's write lands late: there is no row to compare with, but the
+    partition's version check is 7, so the write is refused whole."""
+
+    out = keyed_output(incremental=True)
+    first = await store.store(rows(k1="1", k2="2"), None, at(out, 2))
+    retry = await store.store(Patch([], remove=["k2"]), first.ref, at(out, 7))
+    with pytest.raises(StoreError, match="newer attempt"):
+        await store.store(Patch(rows(k2="late")), first.ref, at(out, 6))
+    assert outside(store, out) == {"k1": "1"}
+    assert await solera(store, retry.ref) == {"k1": "1"}
+
+
+async def test_a_late_insert_of_a_key_never_held_is_refused(store):
+    """F1's second reproduction. feed adds k6; attempt 6 plans it and stalls;
+    feed removes k6 again, so the retry 7 has nothing to write for it. The
+    first attempt after one that ended without committing writes all the
+    same, even nothing (D196, rule 3): attempt 6's insert of k6 is refused."""
+
+    out = keyed_output(incremental=True)
+    first = await store.store(rows(k1="1"), None, at(out, 2))
+    await store.store(Patch([]), first.ref, at(out, 7))  # the retry's write of nothing
+    with pytest.raises(StoreError, match="newer attempt"):
+        await store.store(Patch(rows(k6="late")), first.ref, at(out, 6))
+    assert outside(store, out) == {"k1": "1"}
+
+
+async def test_a_first_write_of_nothing_takes_the_check_before_any_table_exists(store):
+    """The check is keyed by the table's name, so the first attempt after a
+    dead one locks it out even when no table exists yet, and creates none."""
+
+    out = keyed_output(incremental=True)
+    await store.store(Patch([]), None, at(out, 7))
+    assert registry(store, out)[0] == 7
+    assert sql("SELECT to_regclass(%s)", (store._table(out)[0],)) == [(None,)]
+    with pytest.raises(StoreError, match="newer attempt"):
+        await store.store(rows(k6="late"), None, at(out, 6))
+
+
+async def test_a_repair_lists_a_dead_attempts_keys_by_version(store):
+    """Repair by version (D196, rule 2): attempt 5 wrote b and c, then attempt
+    6 rewrote c, and both died without a commit. Attempt 9 asks which keys
+    the partition holds at version 5: b alone. Asking takes the version
+    check first (rule 3), so attempt 5 can add nothing after the list."""
+
+    out = keyed_output(incremental=True)
+    first = await store.store(rows(a="1"), None, at(out, 1))
+    await store.store(Patch(rows(b="1", c="1")), first.ref, at(out, 5))
+    await store.store(Patch(rows(c="2")), first.ref, at(out, 6))
+    listed = [k for chunk in await store.written_at([5], first.ref, at(out, 9)) for k in chunk]
+    assert listed == ["b"]
+    with pytest.raises(StoreError, match="newer attempt"):
+        await store.store(Patch(rows(d="late")), first.ref, at(out, 5))
+    assert sorted(k for chunk in await store.written_at([5, 6], first.ref, at(out, 9)) for k in chunk) == [
+        "b",
+        "c",
+    ]
+
+
+async def test_an_unkeyed_output_lists_no_keys(store):
+    out = keyed_output(key=None)
+    first = await store.store([{"v": "1"}], None, at(out, 1))
+    assert [k for chunk in await store.written_at([1], first.ref, at(out, 2)) for k in chunk] == []
+
+
+# -- cleanup ---------------------------------------------------------------------------------
+
+
+async def test_a_cleanup_never_erases_a_newer_attempts_check(store):
+    """Attempt 5 wrote a dead `a`; repair 6 listed it, taking the check. A
+    cleanup of version 5 deletes its rows but keeps the check: late attempt
+    5 still cannot add `b` behind the repair's list (Sol, B8 round 1, F1)."""
+
+    out = keyed_output(incremental=True)
+    first = await store.store(rows(a="committed"), None, at(out, 1))
+    await store.store(Patch(rows(a="dead")), first.ref, at(out, 5))
+    assert [k for chunk in await store.written_at([5], first.ref, at(out, 6)) for k in chunk] == ["a"]
+    await store.cleanup(out, partition="", generation=5)
+    assert registry(store, out) == (6, None)
+    with pytest.raises(StoreError, match="newer attempt"):
+        await store.store(Patch(rows(b="late")), first.ref, at(out, 5))
+    repair = await store.store(Patch(rows(a="repaired")), first.ref, at(out, 6))
+    assert await solera(store, repair.ref) == outside(store, out) == {"a": "repaired"}
+
+
+async def test_a_cleanup_deletes_rows_written_with_no_version(store):
+    """Astra A4 (B8 round 1): a write with no attempt's version leaves no
+    version row, and its partition's cleanup deletes its rows, as on main."""
+
+    out = keyed_output()
+    written = await store.store(rows(a="old"), None, at(out, None))
+    await store.cleanup(out, partition="", key="a")
+    assert await solera(store, written.ref) == {}
+    written = await store.store(rows(a="old"), None, at(out, None))
+    await store.cleanup(out, partition="")
+    assert outside(store, out) == {}
+
+
+async def test_a_key_cleanup_of_an_unkeyed_commit_names_its_commit(store):
+    """Sol F6 (restarted round 1, also on main): an unkeyed incremental
+    output's key is its commit number."""
+
+    out = keyed_output(key=None, incremental=True)
+    written = await store.store(Patch([{"v": "first"}]), None, at(out, 5))
+    await store.cleanup(out, partition="", key=0, generation=5)
+    assert await store.load(written.ref, list[dict], None) == []
+
+
+async def test_a_partition_cleanup_holds_off_the_partitions_first_writer(store, monkeypatch):
+    """Sol R2-1: a cleanup of a partition no version row lists yet locks a
+    row of its own for it, so the partition's first writer waits for the
+    cleanup to commit, and the cleanup never deletes what that writer
+    wrote."""
+
+    out = keyed_output(incremental=True, partition_column="site")
+    await store.store(rows(z="other"), None, at(out, 1, partition="p2"))
+    entered, release = threading.Event(), threading.Event()
+    forget = store._forget
+
+    def paused(cur, table, parts):
+        if "p1" in parts:
+            entered.set()
+            assert release.wait(10)
+        return forget(cur, table, parts)
+
+    monkeypatch.setattr(store, "_forget", paused)
+    cleanup = in_thread(store.cleanup(out, partition="p1", before=5))
+    assert entered.wait(10)
+    writer = in_thread(store.store(rows(a="new-life"), None, at(out, 10, partition="p1")))
+    assert not writer[1].wait(1)
+    release.set()
+    for thread, done, errors in (cleanup, writer):
+        thread.join(10)
+        assert done.is_set() and not errors, errors
+    assert outside(store, out, "p1") == {"a": "new-life"} and registry(store, out, "p1") == (10, 10)
+
+
+# -- the table -------------------------------------------------------------------------------
+
+
+async def test_a_remove_with_no_table_writes_nothing(store):
+    """Fable R2-10: a Patch of removes alone, with no table and no declared
+    columns, has no row to remove and no shape to make a table from."""
+
+    from solera.sdk import TableRef
+
+    out = keyed_output(incremental=True)
+    prior = TableRef(
+        output=out.name, store="", handle={"table": store._table(out)[0], "where": {}, "key": "id"}
+    )
+    written = await store.store(Patch([], remove=["a"]), prior, at(out, 3))
+    assert written.ref is None and sql("SELECT to_regclass(%s)", (store._table(out)[0],)) == [(None,)]
+
+
+async def test_an_empty_first_write_with_declared_columns_makes_the_table(store):
+    """A whole write of nothing with declared columns makes the table and
+    names it; with no declared columns and no table it makes none."""
+
+    out = keyed_output(columns={"id": "text", "v": "text"})
+    written = await store.store([], None, WriteContext(output=out, partition="", generation=1, worker_id="w"))
+    assert written.ref is not None and outside(store, out) == {}
+    bare = keyed_output()
+    written = await store.store(
+        [], None, WriteContext(output=bare, partition="", generation=1, worker_id="w")
+    )
+    assert written.ref is None
+
+
+async def test_a_version_column_of_a_domain_over_bigint_is_written(store):
+    """Sol F4 (restarted round 1): a column's type is its domain's base type,
+    as main read it."""
+
+    out = keyed_output(incremental=True)
+    table, _, _ = store._table(out)
+    sql(f"CREATE DOMAIN public.{out.name}_v AS bigint")
+    sql(f"CREATE TABLE {table} (id text, v text, _version public.{out.name}_v)")
+    first = await store.store(rows(a="1"), None, at(out, 1))
+    run = await store.store(rows(a="5"), first.ref, at(out, 5, reset=True))
+    assert await solera(store, run.ref) == {"a": "5"}
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="ERW-32, also on main: an in-place reset trusts its DELETE (Sol, B8 restarted round 2)",
+)
+async def test_an_in_place_reset_leaves_no_row_an_inheriting_tables_trigger_kept(store):
+    """Sol F5 (restarted rounds 1 and 2, also on main): DELETE recurses into a
+    table that inherits from the output's, and that table's BEFORE DELETE
+    trigger can keep an old row, which Solera then reads beside the reset's.
+    The store does not check for survivors yet."""
+
+    out = keyed_output(incremental=True)
+    table, _, _ = store._table(out)
+    child = f'"public"."{out.name}_child"'
+    sql(f"CREATE TABLE {table} (id text, v text, _version bigint)")
+    sql(f"CREATE TABLE {child} () INHERITS ({table})")
+    old = await store.store(rows(a="old"), None, at(out, 1))
+    sql(f"INSERT INTO {child} SELECT * FROM ONLY {table}")
+    sql(f"DELETE FROM ONLY {table}")
+    make_trigger(child, f"public.{out.name}_mark", "RETURN NULL;", "BEFORE DELETE")
+    written = await store.store(rows(b="new"), old.ref, at(out, 5, reset=True))
+    assert await solera(store, written.ref) == {"b": "new"}
+
+
+@pytest.mark.xfail(
+    strict=True, reason="ERW-51, also on main: a partition's version row is keyed by its text (Astra A7, B8)"
+)
+async def test_two_spellings_of_one_partition_share_its_version_check(store):
+    """Astra A7 (B8 round 1, also on main): with a bigint partition column,
+    '1' and '01' name the same rows but different version rows, so an
+    older attempt writing '01' replaces a newer one's '1'."""
+
+    out = keyed_output(incremental=True, partition_column="site", columns={"id": "text", "site": "bigint"})
+    newer = await store.store([{"id": "a"}], None, at(out, 10, partition="1"))
+    with pytest.raises(StoreError):
+        await store.store([{"id": "old"}], None, at(out, 5, partition="01"))
+    assert [r["id"] for r in await store.load(newer.ref, list[dict], None)] == ["a"]
+
+
+async def test_an_empty_arrow_patch_removes_its_keys(store):
+    """Sol (B8, the delta on main a377d13): a Patch of an empty Arrow table
+    panicked in the chunk lookup rather than remove its keys; fixed on main
+    by #56."""
+
+    import pyarrow as pa
+
+    out = keyed_output(incremental=True)
+    first = await store.store(rows(a="old"), None, at(out, 1))
+    empty = pa.table({"id": pa.array([], type=pa.string()), "v": pa.array([], type=pa.string())})
+    written = await store.store(Patch(empty, remove=["a"]), first.ref, at(out, 2))
+    assert await solera(store, written.ref) == {}
+
+
+# -- lock order and the catalog (probes P1, P1c, R7, R8) -------------------------------------
+
+
+async def test_a_write_does_not_wait_for_an_open_write_of_another_partition(store):
+    """P1, P1c: an open write holds ROW EXCLUSIVE on the user's table, for
+    minutes at 100M rows. A write of another partition changes the catalog
+    only when it lacks something (CREATE INDEX IF NOT EXISTS takes SHARE
+    even when the index exists, and would queue behind the open write): it
+    does not wait."""
+
+    out = keyed_output(incremental=True, partition_column="site", indexes=[["v"]])
+    await store.store(rows(a="1"), None, at(out, 1, partition="p1"))
+    p2 = await store.store(rows(b="1"), None, at(out, 2, partition="p2"))
+    writing = open_write(store, out, "p1")
+    try:
+        started = time.monotonic()
+        await asyncio.wait_for(store.store(Patch(rows(b="3")), p2.ref, at(out, 3, partition="p2")), 5)
+        assert time.monotonic() - started < 2
+    finally:
+        writing.rollback()
+        writing.close()
+
+
+async def test_a_migration_with_nothing_pending_does_not_wait_out_an_open_write(store):
+    """R7: an attempt of an output with migrations reads the ledger with no
+    lock; only a pending migration takes the write domain exclusively."""
+
+    out = keyed_output(incremental=True)
+    first = await store.store(rows(a="1"), None, at(out, 1))
+    applied = Migration("noop", "SELECT 1")
+    await store.migrate(out, [applied], at(out, 2), first.ref)
+    writing = open_write(store, out, "")
+    try:
+        await asyncio.wait_for(store.migrate(out, [applied], at(out, 3), first.ref), 3)
+    finally:
+        writing.rollback()
+        writing.close()
+
+
+async def test_a_partition_cleanup_does_not_wait_for_an_open_write_of_another(store):
+    """L3: a partitioned table's cleanup of one partition takes the shared
+    domain and that partition's version row, so it runs beside an open
+    write of another, and holds no writer of a third."""
+
+    out = keyed_output(incremental=True, partition_column="site")
+    refs = {p: (await store.store(rows(a=p), None, at(out, 1, partition=p))).ref for p in ("p1", "p2", "p3")}
+    writing = open_write(store, out, "p1")
+    try:
+        await asyncio.wait_for(store.cleanup(out, partition="p3"), 5)
+        await asyncio.wait_for(store.store(Patch(rows(b="2")), refs["p2"], at(out, 2, partition="p2")), 5)
+    finally:
+        writing.rollback()
+        writing.close()
+    assert outside(store, out, "p3") == {} and outside(store, out, "p2") == {"a": "p2", "b": "2"}
+
+
+async def test_first_writers_with_grants_do_not_collide(store):
+    """R8: every writer used to GRANT; two at once collided ("tuple
+    concurrently updated"). A grant is given only when missing."""
+
+    role = "solera_b8_reader"
+    if not sql("SELECT 1 FROM pg_roles WHERE rolname = %s", (role,)):
+        sql(f"CREATE ROLE {role}")
+    from solera_postgres import PostgresStore
+
+    granting = PostgresStore(DSN, grants=[role])
+    out = keyed_output(incremental=True, partition_column="site")
+    await granting.store(rows(a="0"), None, at(out, 1, partition="p0"))
+    await asyncio.gather(
+        *(granting.store(rows(a=str(i)), None, at(out, 10 + i, partition=f"p{i}")) for i in range(1, 9))
+    )
+    table, _, _ = granting._table(out)
+    assert sql("SELECT has_table_privilege(%s, %s, 'SELECT')", (role, table)) == [(True,)]
+
+
+# -- the cost: one statement, no extra round trip ------------------------------------------
+
+
+def round_trips(store, monkeypatch) -> list:
+    """Record what the next write sends, as the statements of each round trip."""
+
+    import psycopg
+
+    connect, traces = store._connect, []
+
+    def traced():
+        conn = connect()
+        trace = tempfile.TemporaryFile("w+")
+        conn.pgconn.trace(trace.fileno())
+        conn.pgconn.set_trace_flags(psycopg.pq.Trace.SUPPRESS_TIMESTAMPS)
+        traces.append(trace)
+        return conn
+
+    monkeypatch.setattr(store, "_connect", traced)
+    return traces
+
+
+def trips_of(trace) -> list[list[str]]:
+    trace.seek(0)
+    trips, current = [], []
+    for line in trace.read().splitlines():
+        parts = line.split("\t")
+        if len(parts) < 3 or parts[0] != "F":
+            continue
+        kind = parts[2].split(" ")[0]
+        if kind in ("Parse", "Query"):
+            current.append(" ".join(parts[2:]))
+        if kind in ("Sync", "Query", "CopyDone", "CopyFail"):
+            trips.append(current)
+            current = []
+    return [t for t in trips if t]
+
+
+async def test_the_version_check_is_one_statement_in_the_writes_first_round_trip(store, monkeypatch):
+    """The check is one statement per write transaction, sent in one pipeline
+    with the write domain's lock and the catalog lookup, so it adds no round
+    trip to the write."""
+
+    out = keyed_output(incremental=True)
+    first = await store.store(rows(a="1", b="1"), None, at(out, 1))
+    ref = (await store.store(Patch(rows(a="2")), first.ref, at(out, 2))).ref
+    traces = round_trips(store, monkeypatch)
+    await store.store(Patch(rows(b="3")), ref, at(out, 3))
+    assert len(traces) == 1
+    trips = trips_of(traces[0])
+    versions = [s for trip in trips for s in trip if "solera_versions" in s]
+    assert len(versions) == 1
+    first_trip = next(trip for trip in trips if any("solera_versions" in s for s in trip))
+    assert len(first_trip) == 3 and "pg_advisory_xact_lock_shared" in first_trip[0]
+    assert "solera_versions" in first_trip[1]  # the third is the catalog lookup (_STATE), on lines of its own
+    assert len(trips) <= 6  # BEGIN, that pipeline, the DELETE, the COPY, the key check, COMMIT
