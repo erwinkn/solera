@@ -2,7 +2,7 @@
 
 One end-to-end run of a small cast at the scale target: 100M keys per output, about 1% of them
 changing a day, 10,000-key batches, one 4-vCPU engine. It goes through the real engine, its API
-and pool workers, on the tracking path that `SOLERA_TRACKING` names (`today` or `core`). It
+and pool workers. It
 times each part of the work separately and writes `report.md` and `results.json`.
 
     uv run --no-sync python bench/scale/run.py --keys 100000000 --days 30 --root /data/scale
@@ -95,12 +95,12 @@ with `versions`. The run exits non-zero if any of this fails.
 changes, so the live count stays `--keys`.
 
 The randomized check of the harness itself is the same run, small, with heavy churn, over several
-seeds, on both paths:
+seeds:
 
-    for seed in 1 2 3; do for path in today core; do
-      SOLERA_TRACKING=$path uv run --no-sync python bench/scale/run.py --keys 3000 --days 4 \
+    for seed in 1 2 3; do
+      uv run --no-sync python bench/scale/run.py --keys 3000 --days 4 \
         --change 0.3 --adds 0.3 --batch 500 --workers 3 --engine-cpus '' --seed $seed --root /tmp/scale-model
-    done; done
+    done
 
 ## Options
 

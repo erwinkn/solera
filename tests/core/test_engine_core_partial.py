@@ -24,7 +24,7 @@ from tests.contract.harness import Outside, Solera, SourceStore, rebuild
 
 @pytest.fixture
 async def solera(tmp_path):
-    namespace = Solera(tmp_path, "core")
+    namespace = Solera(tmp_path)
     yield namespace
     await namespace.close()
 
@@ -438,9 +438,9 @@ async def test_a_fan_in_after_its_upstreams_upstream_moved(solera, capsys):
     except Exception as error:
         status = f"refused: {str(error)[:120]}"
     with capsys.disabled():
-        print(f"\n[{solera.path}] total: {status}; read {seen}")
+        print(f"\ntotal: {status}; read {seen}")
     assert seen == [{east: ["a", "b", "c"], west: ["a", "b", "c"]}] or not seen, (
-        f"[{solera.path}] the fan-in ran without a partition whose content is whole: {seen}"
+        f"the fan-in ran without a partition whose content is whole: {seen}"
     )
 
 
@@ -707,8 +707,7 @@ async def test_one_stale_queued_task_does_not_stop_the_dispatch_pass(solera):
     await solera.cancel(stopped["id"])
     state["hold"].set()
     await solera.wait(stopped)
-    if solera.path == "core":
-        assert full.waiting(solera.engine) == {("copy", "")}
+    assert full.waiting(solera.engine) == {("copy", "")}
     east = canonical_partition(["site"], {"site": "east"})
     queued = await solera.submit(
         "sited", partitions=[east]

@@ -269,7 +269,7 @@ class Upkeep:
             return
         floors, read = self.m.floors(), self.m.cleanup_reads()  # pending cleanups still read them
         # The engine's own fills and fetches of index files hold back index files only.
-        cache = self.keys.floor() if self.keys is not None else math.inf
+        cache = math.inf
 
         def due_now(path: str, n: int) -> bool:
             if path in read or (path.startswith("keys/") and n > cache):
@@ -283,8 +283,6 @@ class Upkeep:
         await self._delete(due)
         self.history.lake.evict(due)  # their cached copies live exactly as long
         self.state.record({"type": "FilesCleanedUp", "paths": due})
-        if self.keys is not None:  # what the engine's cache held of them goes too
-            self.keys.retired(due)
 
     async def collect_orphans(self) -> None:
         """Every `ORPHAN_SECONDS`, find the index files nothing names

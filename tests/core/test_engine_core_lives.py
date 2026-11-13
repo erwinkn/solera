@@ -14,7 +14,7 @@ from tests.contract.harness import Solera, rebuild
 
 @pytest.fixture
 async def solera(tmp_path):
-    s = Solera(tmp_path, "core")
+    s = Solera(tmp_path)
     yield s
     await s.close()
 
@@ -109,7 +109,7 @@ async def test_keyed_to_value_output_uses_new_commits_axis(solera):
 
 
 async def test_rebinding_away_from_removed_output_closes_the_old_edge(tmp_path):
-    s = Solera(tmp_path, "core")
+    s = Solera(tmp_path)
 
     def project(old):
         @asset(outputs=Output("left", key="id"))

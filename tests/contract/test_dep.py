@@ -547,7 +547,7 @@ async def test_dep_5_each_schemas_table_gets_its_own_migrations(solera, tmp_path
 
         return Project(assets=[orders], stores={"pg": PostgresStore("env:SOLERA_TEST_DATABASE_URL")})
 
-    staging = Solera(tmp_path / "staging", solera.path)
+    staging = Solera(tmp_path / "staging")
     try:
         for namespace, schema in zip((solera, staging), schemas, strict=True):
             await namespace.deploy(project(schema))

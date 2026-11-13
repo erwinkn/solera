@@ -131,47 +131,6 @@ async def test_quiet_runs_are_recorded_as_skipped(state, clock):
     assert [r["id"] for r in skipped] == [quiet]
 
 
-async def test_source_commits_are_recorded_as_runs(state, clock):
-    """§7: each source commit that changes something is a run with no tasks,
-    saying who committed and what changed; the default policy expires it."""
-
-    from solera.sdk import Loaded, source
-
-    @asset(inputs={"uploads": Incremental()})
-    def ingest(uploads: list):
-        return []
-
-    @source(key="id")
-    async def uploads(keys, ctx):
-        return {k: Loaded({"id": k}, version="1") for k in keys}
-
-    project = Project(assets=[ingest], sources=[uploads], retention=Retention(days=1))
-    engine = engine_for(state, project, clock)
-    await engine.initialize()
-    first = await engine.commit_source("uploads", keys={"u-6": "1", "u-7": "1"}, by="sharepoint-webhook")
-    assert not (await engine.commit_source("uploads", upsert={"u-7": "1"}))["changed"]  # no change, no run
-    clock.now += 60
-    second = await engine.commit_source("uploads", keys={"u-7": "2"}, by="api")
-    record = await engine.history.run(second["run"])
-    assert record == {
-        "id": second["run"],
-        "source": "uploads",
-        "by": "api",
-        "commit_number": 1,
-        "upserted": ["u-7"],
-        "deleted": ["u-6"],
-    }
-    assert state.model.heads[("uploads", "")]["run"] == second["run"]
-    view = (await engine.run_detail(first["run"]))["request"]
-    assert view["by"] == "sharepoint-webhook" and view["status"] == "succeeded" and view["tasks"] == []
-    assert view["created_at"] == pytest.approx(clock.now - 60, abs=0.01)
-    listed = [r["id"] for r in (await engine.list_runs())["runs"]]
-    assert listed[:2] == [second["run"], first["run"]]
-    clock.now += 2 * 86400
-    await engine.upkeep.tick()
-    assert await history_ids(engine) == []  # expired under the project default
-
-
 @asset
 def plain():
     return {"n": 1}

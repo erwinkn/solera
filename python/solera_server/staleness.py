@@ -76,7 +76,7 @@ class Staleness:
 
         keyed = any(self._keyed(i) for i in inputs)
         for input in inputs:
-            if self._keyed(input) and self.core is not None:  # the new path: a plan of one key
+            if self._keyed(input):  # the new path: a plan of one key
                 if await core_stale.owes(self.core, asset, partition, input, planner, inputs):
                     return True
             elif self._keyed(input):

@@ -92,42 +92,6 @@ def feed_project(**decl):
     return Project(assets=[ingest], sources=sources, sensors=[watch])
 
 
-async def test_a_tick_commits_and_requests_runs_in_one_record(tmp_path):
-    """Source commits, run submissions, the cursor and the accepted outcome
-    go in one `record()`, so one journal segment holds all or none."""
-
-    project = feed_project()
-    state, engine = await open_engine(tmp_path, project)
-    tick = await dispatch(engine, "watch")
-    assert tick["cursor"] is None and set(tick["snapshot"]) == {"uploads", "feed"}
-    calls = recording(state)
-    outcome = Tick(
-        cursor="page-2",
-        commits=[Commit("uploads", upsert={"a": "1", "b": "1"}), Commit("feed", version="v7")],
-        runs=[RunRequest("ingest")],
-    ).to_json()
-    answer = await engine.sensor_post("watch", tick["tick"], outcome)
-    assert answer["accepted"] and len(answer["runs"]) == 1 and set(answer["commits"]) == {"uploads", "feed"}
-    assert len(calls) == 1
-    assert [e["type"] for e in calls[0]] == [
-        "SourceCommitted",
-        "SourceCommitted",
-        "RunSubmitted",
-        "SensorAdvanced",
-    ]
-    m = state.model
-    assert m.sensors["watch"]["cursor"] == "page-2"
-    assert m.heads[("feed", "")]["version"] == "v7"
-    for source, head in answer["commits"].items():
-        assert engine._head_id(source) == head
-    run = m.runs[answer["runs"][0]]
-    assert run["tags"] == {"sensor": "watch", "tick": tick["tick"]} and run["by"] == "sensor watch"
-    detail = await engine.run_until(run["id"], 60)
-    assert detail["request"]["status"] == "succeeded"
-    assert rows(engine, "watch")[-1]["outcome"] == "requested"
-    await state.close()
-
-
 async def test_nothing_changed_records_nothing_and_a_cursor_alone_only_advances(tmp_path):
     """ "Unchanged" is no version, no key change and no new cursor: nothing
     is recorded. A new cursor alone is `SensorAdvanced`: no commit, no
@@ -183,33 +147,6 @@ async def test_a_tick_that_saw_a_source_since_moved_is_refused_whole(tmp_path):
     tick = await dispatch(engine, "watch")  # the next tick observes again
     await engine.sensor_post("watch", tick["tick"], Tick(commits=[Commit("feed", version="v3")]).to_json())
     assert state.model.heads[("feed", "")]["version"] == "v3"
-    await state.close()
-
-
-async def test_a_source_moving_while_the_tick_is_prepared_refuses_it(tmp_path, monkeypatch):
-    """Preparing reads the key index (an await): a commit landing meanwhile
-    refuses the tick, and the delta file it wrote goes."""
-
-    project = feed_project()
-    state, engine = await open_engine(tmp_path, project)
-    tick = await dispatch(engine, "watch")
-    prepare, raced = engine._prepare_commit, []
-
-    async def racing(*args, **kw):
-        prepared = await prepare(*args, **kw)
-        if not raced:
-            raced.append(True)
-            await engine.commit_source("uploads", upsert={"z": "1"})
-        return prepared
-
-    monkeypatch.setattr(engine, "_prepare_commit", racing)
-    files = set(await state.list_objects("keys/"))
-    with pytest.raises(Conflict, match="moved while"):
-        await engine.sensor_post(
-            "watch", tick["tick"], Tick(commits=[Commit("uploads", keys={"a": "1"})]).to_json()
-        )
-    assert list((await engine.list_keys("uploads"))["keys"]) == ["z"]  # the API's commit, not the tick's
-    assert len(set(await state.list_objects("keys/")) - files) == 1  # the API commit's delta alone
     await state.close()
 
 
@@ -270,21 +207,6 @@ async def test_what_a_sensor_may_not_do_is_refused_whole(tmp_path):
             await engine.sensor_post("watch", tick["tick"], outcome.to_json())
         assert state.recorded == before and rows(engine)[-1]["outcome"] == "failed"
     assert state.model.heads[("feed", "")]["version"] == "v1"
-    await state.close()
-
-
-async def test_a_tick_pins_what_it_reads_until_decided(tmp_path):
-    """The snapshot names a keyed source's pinned index; the tick's reader
-    pin keeps those files from collection until it is decided (§11.3)."""
-
-    project = feed_project()
-    state, engine = await open_engine(tmp_path, project)
-    await engine.commit_source("uploads", keys={"a": "1"})
-    tick = await dispatch(engine, "watch")
-    assert tick["snapshot"]["uploads"]["index"]["layers"]
-    assert state.model.pin_floor() == state.model.ticks["watch"]["pin"]
-    await engine.sensor_post("watch", tick["tick"], {})
-    assert state.model.pin_floor() == float("inf")
     await state.close()
 
 

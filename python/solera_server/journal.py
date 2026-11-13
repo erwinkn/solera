@@ -72,12 +72,9 @@ log = logging.getLogger(__name__)
 # key outcomes, a per-key asset's `failures` record renamed `outcomes` (T37); 4:
 # the history's `commits.key_count` (T36), a column of the rows a checkpoint
 # buffers; 5: merge attempts with when (`Model.merges`), for their backoff. A
-# journal with no format is from before 2. 6: the new tracking core's state
-# (docs/tracking-design.md §15), which only an engine on the new path writes
-# and reads (build plan rule 4): one namespace, one path.
-FORMAT = 5
-CORE_FORMAT = 6
-FORMATS = (FORMAT, CORE_FORMAT)
+# journal with no format is from before 2. 6: the tracking core's state
+# (docs/tracking-design.md §15).
+FORMAT = 6
 
 
 def _unreadable(journal: str, found, readable) -> str:
@@ -151,7 +148,6 @@ class Journal:
         self.clock = clock
 
         self.engine: str | None = None
-        self.format = FORMAT  # the namespace's, as read; a fresh one takes its first engine's
         self.epoch = 0  # this engine's: one past its predecessor's, durable once it opened
         self.checkpoint: str | None = None  # the checkpoint the journal names
         self.stopped: Stopped | None = None  # why this journal writes no more
@@ -179,9 +175,7 @@ class Journal:
 
     def _body(self, engine: str | None, epoch: int, checkpoint: str | None, events: list[bytes]) -> bytes:
         head = _dumps({"checkpoint": checkpoint, "engine": engine, "epoch": epoch})  # sorts before "events"
-        return (
-            head[:-1] + b',"events":[' + b",".join(events) + b'],"format":' + str(self.format).encode() + b"}"
-        )
+        return head[:-1] + b',"events":[' + b",".join(events) + b'],"format":' + str(FORMAT).encode() + b"}"
 
     # -- opening ----------------------------------------------------------------------
 
@@ -192,14 +186,12 @@ class Journal:
         snapshot: Callable[[], dict],
         *,
         writer: bool = True,
-        format: int | None = None,
     ) -> OpenResult:
         """Read the journal, load its checkpoint and apply its events, then
         fence: from here on this process is the only writer. `writer=False`
         opens read-only: nothing is fenced and appends fail — for tools that
-        inspect a namespace a server may be writing. A writer that will write
-        `format` is refused a namespace written in another (`use`) before it
-        fences anyone."""
+        inspect a namespace a server may be writing. A namespace written in another
+        format is refused before anyone is fenced."""
 
         self._snapshot = snapshot
         while True:
@@ -208,9 +200,8 @@ class Journal:
                 body = orjson.loads(found[0]) if found is not None else {"checkpoint": None, "events": []}
             except orjson.JSONDecodeError as error:
                 raise JournalCorrupt(f"{self._journal}: {error}") from None
-            if found is not None and body.get("format", 1) not in FORMATS:
-                raise OldNamespace(_unreadable(self._journal, body.get("format", 1), FORMATS))
-            self.format = body.get("format", 1) if found is not None else FORMAT
+            if found is not None and body.get("format", 1) != FORMAT:
+                raise OldNamespace(_unreadable(self._journal, body.get("format", 1), (FORMAT,)))
             checkpoint = body["checkpoint"]
             try:
                 state = await self._load(checkpoint) if checkpoint is not None else None
@@ -230,8 +221,6 @@ class Journal:
                 self.stopped = Stopped("opened read-only")
                 self.ended.set()
                 return OpenResult(engine=None, replayed=replayed, checkpoint=checkpoint)
-            if format is not None:
-                self.use(format)
             engine = secrets.token_hex(8)  # no two processes share one (§10)
             epoch = int(body.get("epoch") or 0) + 1
             try:
@@ -258,17 +247,6 @@ class Journal:
             raise JournalCorrupt(f"checkpoint {name}: {error}") from None
         self._last_checkpoint_size = len(data)
         return body["state"]
-
-    def use(self, format: int) -> None:
-        """Write the namespace in `format` (build plan rule 4): a fresh
-        namespace, with no checkpoint and no event yet, takes it; one already
-        written in another is refused, never converted."""
-
-        if format == self.format:
-            return
-        if self.checkpoint is not None or self._events or self._buffer or self.appended:
-            raise OldNamespace(_unreadable(self._journal, self.format, (format,)))
-        self.format = format
 
     # -- appending ----------------------------------------------------------------------
 

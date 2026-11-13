@@ -28,12 +28,11 @@ from __future__ import annotations
 
 import contextlib
 import copy
-import dataclasses
 import math
 from base64 import b64decode, b64encode
 
 from solera._native import Tracking
-from solera.keys.layers import DeltaFiles, Layer, LayerState, delta_names, index_prefix
+from solera.keys.layers import LayerState, delta_names, index_prefix
 
 from . import history, observed
 from .lake import LakeState
@@ -116,16 +115,6 @@ def _flatten(nested: dict, depth: int) -> dict:
     return out
 
 
-def _renumbered(entries: list[dict]) -> list[dict]:
-    """Two names' clean up entries as one partition's: in order, ids unique again."""
-
-    out, seen = [], {}
-    for d in sorted(entries, key=lambda d: d["n"]):
-        ordinal = seen[d["n"]] = seen.get(d["n"], -1) + 1
-        out.append({**d, "id": f"{d['n']}.{ordinal}"})
-    return out
-
-
 def commit_of(head: dict | None) -> tuple | None:
     """What identifies the commit that installed a head — not the figures
     upkeep corrects on it: whether a writer came in
@@ -140,14 +129,6 @@ def commit_of(head: dict | None) -> tuple | None:
         head.get("commit_number"),
         head.get("n"),
     )
-
-
-def _delta(keys: dict, generation: int | None) -> DeltaFiles:
-    """A commit's delta, at `generation`, the one its writes carried, when
-    its head records it."""
-
-    delta = DeltaFiles.from_json(keys)
-    return delta if generation is None else dataclasses.replace(delta, generation=int(generation))
 
 
 def _delta_files(deltas) -> frozenset[str]:
@@ -195,19 +176,16 @@ class Model:
             "receipts": list(self.receipts.items()),
             "history": self.history.to_json(),
         }
-        if self.core is not None:  # the new tracking core (format 6): its state, opaque bytes
-            data["core"] = b64encode(self.core.snapshot()).decode()
-            data["core_outputs"] = _nest(self.core_outputs, 2)
-            data["core_edges"] = _nest(self.core_edges, 3)
-            data["core_empty"] = _nest(self.core_empty, 3)
-            data["core_read"] = _nest(self.core_read, 3)
-            data["partial_spans"] = [[list(k), v] for k, v in self.partial_spans.items()]
+        data["core"] = b64encode(self.core.snapshot()).decode()
+        data["core_outputs"] = _nest(self.core_outputs, 2)
+        data["core_edges"] = _nest(self.core_edges, 3)
+        data["core_empty"] = _nest(self.core_empty, 3)
+        data["core_read"] = _nest(self.core_read, 3)
+        data["partial_spans"] = [[list(k), v] for k, v in self.partial_spans.items()]
         return copy.deepcopy(data) if copied else data
 
-    def restore(self, snap: dict | None, core: bool = False) -> None:
-        """Load a snapshot (None: the empty state). `core`: the namespace is
-        written on the new tracking core, so the model has a core even before
-        its first core event, as the engine that wrote it had."""
+    def restore(self, snap: dict | None) -> None:
+        """Load a snapshot (None: the empty state)."""
 
         snap = copy.deepcopy(snap) if snap else {}
         # durable
@@ -272,13 +250,11 @@ class Model:
         self.receipts: dict[str, str] = dict(snap.get("receipts") or [])
         # the run history (§7): per table, its files and the rows awaiting a flush
         self.history = LakeState(history.TABLES, snap.get("history"))
-        # The new tracking core (docs/tracking-design.md; None on today's path): its state,
-        # changed only by the core events this model applies, and the ids it knows things by.
+        # The tracking core (docs/tracking-design.md): its state, changed only by the core
+        # events this model applies, and the ids it knows things by.
         # (output, partition) -> the core's id of that output's current life; (asset,
         # partition, input) -> the core's id of that edge. Renames move them; a reset drops them.
-        self.core: Tracking | None = (
-            Tracking.restore(b64decode(snap["core"])) if "core" in snap else Tracking() if core else None
-        )
+        self.core: Tracking = Tracking.restore(b64decode(snap["core"])) if "core" in snap else Tracking()
         self.core_outputs: dict[tuple, str] = _flatten(snap.get("core_outputs"), 2)
         self.core_edges: dict[tuple, str] = _flatten(snap.get("core_edges"), 3)
         # (asset, partition, input) -> the key past which the edge holds nothing since it last
@@ -371,12 +347,6 @@ class Model:
         run_id = self.task_run.get(task_id)
         return self.runs[run_id]["tasks"][task_id] if run_id else None
 
-    def status_of(self, task: dict) -> str:
-        """The task's live status: its durable one, or its claim's."""
-
-        claim = self.claims.get(task["id"])
-        return claim["status"] if claim else task["status"]
-
     def index(self, output: str, partition: str) -> LayerState:
         """The output's key index, or an empty one where a new index would go."""
 
@@ -387,40 +357,13 @@ class Model:
 
     def key_count(self, output: str, partition: str) -> int | None:
         """A keyed output's live keys, as its index counts them (None: unkeyed)."""
-
-        if self.core is not None:
-            found = self.core_output(output, partition)
-            if found is not None:
-                return found["live"]
-            keyed = (((self.manifest or {}).get("outputs") or {}).get(output) or {}).get("key") is not None
-            return 0 if keyed and (output, partition) in self.heads else None  # committed, never a key
+        found = self.core_output(output, partition)
+        if found is not None:
+            return found["live"]
+        keyed = (((self.manifest or {}).get("outputs") or {}).get(output) or {}).get("key") is not None
+        return 0 if keyed and (output, partition) in self.heads else None  # committed, never a key
         index = self.indexes.get((output, partition))
         return None if index is None else index.count
-
-    def observed_commits(self, output: str, partition: str) -> list[int]:
-        """The commits of an upstream index its readers hold: every commit its
-        consumers' observation records were observed at — their bases' and
-        ranges' heads, in its current life — and the head each batch in
-        flight classed its keys at."""
-
-        state = self.indexes.get((output, partition))
-        life = state.life if state is not None else ""
-        commits = []
-        for record in self.partitions.values():
-            for rec in (record.get("observed") or {}).values():
-                if rec.get("upstream") == [output, partition] and observed.lives(rec) == {life}:
-                    commits += [layer["endpoint"] for layer in [rec["base"], *rec["ranges"]]]
-        for claim in self.claims.values():
-            commits += [
-                read[2] for read in claim.get("reads") or () if (read[0], read[1]) == (output, partition)
-            ]
-        return [int(c) for c in commits if c is not None]
-
-    def oldest_observed(self, output: str, partition: str) -> int | None:
-        """The oldest commit of an upstream index any reader holds (None:
-        none): the index's cut never passes it (A31 R3)."""
-
-        return min(self.observed_commits(output, partition), default=None)
 
     def heads_of(self, output: str) -> list[tuple[str, dict]]:
         return sorted(self.heads.of(output).items())
@@ -445,9 +388,6 @@ class Model:
             record["failed_in_row"] = int(record.get("failed_in_row") or 0) + 1
         elif outcome in ("succeeded", "skipped"):
             record.pop("failed_in_row", None)
-
-    def pending_partitions(self, asset: str) -> set[str]:
-        return {partition for (a, partition), ids in self.pending.items() if a == asset and ids}
 
     def is_pending(self, asset: str, partition: str) -> bool:
         return bool(self.pending.get((asset, partition)))
@@ -660,8 +600,7 @@ class Model:
             )
             if moved and name not in sources_before and old.get("store") in stores_before:
                 self._retire_output(now, homes.get(now, now), old, stores_before[old["store"]], e["at"])
-        if self.core is not None:
-            self._core_close(reset)
+        self._core_close(reset)
         self.changed = set()
         for asset in manifest["assets"]:
             olds = [a for a in renamed.get(asset, ()) if a in declared_before]  # renamed by this deploy
@@ -852,7 +791,7 @@ class Model:
             for name, store in stores.items()
             if name not in outputs
             or outputs[name].get("store") != store
-            or (self.core is not None and axes.get(name, axis(outputs[name])) != axis(outputs[name]))
+            or axes.get(name, axis(outputs[name])) != axis(outputs[name])
         }
         for name in reset:
             self.reset_at[("output", name)] = self.reset_at[("life", name)] = self.deploy_number
@@ -948,7 +887,7 @@ class Model:
         # A per-key asset's stored outcomes (`@asset`), whose files stay under their prefix.
         move(self.indexes, {f"@{old}": f"@{new}" for old, new in asset_map.items()}, 0)
         move(self.repairs, output_map, 0, merge=list)
-        move(self.cleanups, output_map, 0, merge=_renumbered)
+        move(self.cleanups, output_map, 0)
         move(self.cleaning, output_map, 0, merge=lambda q: sorted(q, key=lambda d: d["n"]))
         for record in self.partitions.values():
             for rec in (record.get("observed") or {}).values():
@@ -1113,7 +1052,7 @@ class Model:
             intents = self.repairs.setdefault((output, task["partition"]), [])
             intents.append({**intent, "run": e["run"], "attempt": e["attempt"]})
         self._cleaned_up((task.get("cleanup") or {}).get("partition", task["partition"]), e, prepared)
-        if launched is not None and not e.get("commit") and self.core is None:
+        if launched is not None and not e.get("commit") and False:
             self._abandoned(task["partition"], e["attempt"], launched, at + float(e.get("late_writes") or 0))
         usage = (e.get("worker") or {}).get("usage") or {}
         summary = {
@@ -1282,18 +1221,12 @@ class Model:
                     history.batch_input_row(e["run"], e["attempt"], asset, partition, record, at),
                 )
         reads = history.read_lineage(prepared.get("lineage"), e.get("read"))
-        contracts = prepared.get("outputs") or {}
         changed = []
         for name, head in commit.get("heads", {}).items():
-            before, keys = self.heads.get((name, partition)), (commit.get("keys") or {}).get(name)
-            prefix = contracts[name].get("prefix")  # where its delta files are
+            before = self.heads.get((name, partition))
             if before is None or before["ref"].get("generation") != head["ref"].get("generation"):
                 changed.append(name)
-            if contracts[name]["contract"]["writes"] == "immutable" and self.core is None:
-                # The new path deletes nothing until retention is built on it (build plan B9).
-                self._superseded(name, partition, before, head, keys, prefix)
             self.heads[(name, partition)] = {**head, "run": e["run"], "attempt": e["attempt"], "at": at}
-            self._commit_keys(name, partition, keys, prefix, head["ref"].get("generation"))
             if name in commit.get("repaired", ()):
                 # The commit's delta took in what the dead attempts left (§8):
                 # their intent files are no longer needed.
@@ -1302,8 +1235,7 @@ class Model:
                     self.garbage.extend(
                         [index.path(name), self.event_counter] for name in delta_names(intent)
                     )
-        if self.core is not None:
-            self._spans(asset, partition, heads_before)
+        self._spans(asset, partition, heads_before)
         record = self._partition(asset, partition)
         for field in ("definition", "config", "context"):  # what it was made under: staleness compares
             if field in commit:
@@ -1349,28 +1281,6 @@ class Model:
                 self._record("lineage", row)
         self._pend_onchange(asset, partition, changed)
 
-    def _stored(self, asset: str, partition: str, f: dict) -> None:
-        """A per-key batch's commit to its stored outcome: the stored outcomes'
-        delta, and the counts, bounds and retry-pass state the engine worked
-        out from it (docs/per-key-processing.md §9)."""
-
-        record = self._partition(asset, partition).setdefault("outcomes", {"commit_number": -1, "forced": {}})
-        if f.get("start_over"):  # a start-over's stored outcomes start over (K47): the batch's alone
-            self._drop_outcomes(asset, partition)
-            record = self._partition(asset, partition)["outcomes"] = {
-                "commit_number": record["commit_number"],
-                "forced": record.get("forced") or {},
-            }
-        keys = f.get("keys") or {}
-        if delta_names(keys):
-            name = f"@{asset}"
-            index = self.index(name, partition).committed(f["commit_number"], DeltaFiles.from_json(keys))
-            self.indexes[(name, partition)] = index
-            record["commit_number"] = f["commit_number"]
-        for field in ("counts", "due", "deploy_min", "retry", "passes", "done_forced", "last"):
-            if field in f:
-                record[field] = f[field]
-
     def _drop_outcomes(self, asset: str, partition: str) -> None:
         """A per-key partition's stored outcomes go: their index's files become
         garbage, and the next write starts a new index (a new life)."""
@@ -1379,16 +1289,6 @@ class Model:
         if index is not None:
             self.garbage.extend([index.path(name), self.event_counter] for name in sorted(index.referenced()))
         self._partition(asset, partition).pop("outcomes", None)
-
-    def _on_KeysRetryRequested(self, e):
-        """`solera retry ASSET --failed …`: a forced request, identified by its
-        event counter, for each class it names
-        (docs/per-key-processing.md §9)."""
-
-        for partition, record in self.partitions.of(e["asset"]).items():
-            if "outcomes" in record and e.get("partition") in (None, partition):
-                for name in e["classes"]:
-                    record["outcomes"].setdefault("forced", {})[name] = self.event_counter
 
     def _pend_onchange(self, asset: str | None, partition: str, changed: list[str]) -> None:
         if not changed:
@@ -1503,29 +1403,7 @@ class Model:
         else:
             run["status"] = "running"
 
-    def _commit_keys(
-        self, output: str, partition: str, keys: dict | None, prefix: str | None, generation: int | None
-    ) -> None:
-        """Add a commit's delta to the output's key index (§6), as its layer,
-        at the generation its writes carried: even an empty one, so the layers
-        keep no holes. An output's first index starts
-        where its attempt wrote them, `prefix` — under the name it launched
-        with, when a rename came since."""
-
-        if keys is not None:
-            index = self.index(output, partition)
-            if (output, partition) not in self.indexes and prefix is not None:
-                index = LayerState(prefix=prefix, life=str(self.event_counter))
-            self.indexes[(output, partition)] = index.committed(
-                keys["commit_number"], _delta(keys, generation)
-            )
-
     # -- cleanup of immutable stores (docs/lifecycle.md §9.8) -----------------------
-
-    def immutable(self, output: str) -> bool:
-        manifest = self.manifest or {}
-        record = (manifest.get("outputs") or {}).get(output) or {}
-        return ((manifest.get("stores") or {}).get(record.get("store")) or {}).get("writes") == "immutable"
 
     def cleanup_reads(self) -> set[str]:
         """The delta files cleanup still reads (they name what their changes
@@ -1535,70 +1413,6 @@ class Model:
 
         pending = _delta_files(d for queue in self.cleaning.values() for d in queue)
         return pending.union(*(claim.get("cleanups") or () for claim in self.claims.values()))
-
-    def _collect(self, output: str, partition: str, entry: dict) -> None:
-        """Queue cleanup let go of now: `n`, the event counter, is
-        when it may be collected; `id`, unique in its partition, is what an
-        attempt acknowledges — one event can let go of several entries."""
-
-        entries = self.cleanups.setdefault((output, partition), [])
-        ordinal = sum(1 for d in entries if d["n"] == self.event_counter)
-        entries.append({"n": self.event_counter, "id": f"{self.event_counter}.{ordinal}", **entry})
-
-    def _superseded(
-        self, output: str, partition: str, before: dict | None, head: dict, keys: dict | None, prefix=None
-    ) -> None:
-        """What a commit on an immutable store let go of: the generations its
-        delta's updates and removes replaced (its delta queued for the
-        partition's cleanup cursor), a value's previous object, or — when an
-        append output starts over — its earlier commits."""
-
-        delta = DeltaFiles.from_json(keys) if keys else None
-        if delta is not None and delta.part.entries > delta.added:  # an update or a remove
-            index = self.index(output, partition)
-            self.cleaning.setdefault((output, partition), []).append(
-                {
-                    "n": self.event_counter,
-                    "life": index.life,
-                    "commit": int(head["commit_number"]),
-                    "generation": delta.generation,
-                    "prefix": prefix or index.prefix,
-                    "files": [f.name for f in delta.part.files],
-                }
-            )
-        old, new = (
-            ((before or {}).get("ref") or {}).get("handle") or {},
-            (head.get("ref") or {}).get("handle") or {},
-        )
-        if old.get("mode") in ("value", "set") and old.get("path") != new.get("path"):
-            self._collect(
-                output, partition, {"kind": "version", "generation": int(before["ref"]["generation"])}
-            )
-        if old.get("mode") == "commits" and new.get("mode") == "commits":
-            first, last = old["commits"]
-            if int(new["commits"][0]) > int(first):
-                self._collect(
-                    output,
-                    partition,
-                    {"kind": "commits", "from": int(first), "to": int(new["commits"][0]) - 1},
-                )
-
-    def _abandoned(self, partition: str, attempt: str, launched: dict, after: float) -> None:
-        """An attempt that ended without committing: whatever it wrote on an
-        immutable store carries its generation, which no other attempt uses.
-        One cleanup takes it all, run late (the sweep, §9.8): due `after`, its
-        end plus the asset's timeout and cancel grace, by when a worker that
-        outlives it and honours cancellation has written its last."""
-
-        for name, info in (launched["prepared"].get("outputs") or {}).items():
-            if info["contract"]["writes"] == "immutable":
-                entry = {
-                    "kind": "abandoned",
-                    "attempt": attempt,
-                    "generation": launched["generation"],
-                    "after": after,
-                }
-                self._collect(name, partition, entry)
 
     def _cleaned_up(self, partition: str, e: dict, prepared: dict | None = None) -> None:
         """A cleanup task cleaned up a partition: its entries go, and the index-side
@@ -1684,113 +1498,12 @@ class Model:
         for entry_id in e.get("retired") or ():  # a stuck cleanup task's output life (K25)
             self.retired.pop(entry_id, None)
 
-    def _replace_index(self, key: tuple, index: LayerState) -> None:
-        """Swap in a new index state; files it no longer references await deletion."""
-
-        before = self.indexes[key]
-        self.indexes[key] = index
-        for name in sorted(before.referenced() - index.referenced()):
-            self.garbage.append([before.path(name), self.event_counter])
-
-    def merge_record(self, key: tuple, life: str) -> dict:
-        """What merges of this index's life `life` tried: another life's count
-        for nothing."""
-
-        rec = self.merges.get(key)
-        return rec if rec is not None and rec["life"] == life else {"life": life, "attempts": {}}
-
-    def _merge_record(self, key: tuple, life: str) -> dict:
-        rec = self.merge_record(key, life)
-        self.merges[key] = rec
-        return rec
-
-    def _on_MergeAttempted(self, e):
-        """A merge of these input files is about to upload: counted before it
-        does, whatever comes of it, and when."""
-
-        rec = self._merge_record((e["output"], e["partition"]), e["life"])
-        tried = rec["attempts"].get(e["inputs"]) or {"n": 0}
-        rec["attempts"][e["inputs"]] = {"n": tried["n"] + 1, "at": e["at"]}
-
-    def _on_MergeInterrupted(self, e):
-        """The engine stopped while that merge uploaded (a deploy, a
-        restart): the attempt counts for nothing."""
-
-        rec = self.merge_record((e["output"], e["partition"]), e["life"])
-        tried = rec["attempts"].get(e["inputs"])
-        if tried is not None and tried["n"] <= 1:
-            del rec["attempts"][e["inputs"]]
-        elif tried is not None:
-            tried["n"] -= 1
-
-    def _on_MergesCleared(self, e):
-        """An operator's clear: the index's merges are tried again at once."""
-
-        rec = self.merges.get((e["output"], e["partition"]))
-        if rec is not None:
-            rec["attempts"] = {}
-
-    def _prune_merges(self, key: tuple) -> None:
-        """Forget what merges tried of files the index no longer holds, and
-        another life's record."""
-
-        rec, index = self.merges.get(key), self.indexes.get(key)
-        if rec is None:
-            return
-        if index is None or rec["life"] != index.life:
-            del self.merges[key]
-            return
-        held = {x.id for x in index.layers}
-        rec["attempts"] = {
-            k: n for k, n in rec["attempts"].items() if all(i in held for i in k.split("|", 1)[-1].split(","))
-        }
-
-    def _on_IndexMerged(self, e):
-        """A merge of adjacent layers published: installed if the index is the
-        life it was planned against and still holds exactly its inputs; else
-        refused, its output let go of (docs/key-index-design.md § Lifecycles).
-        Names never repeat across lives (each carries the life, an epoch and
-        a unique id), and the life check refuses an old life's merge of
-        empty layers, whose ids could match."""
-
-        key = (e["output"], e["partition"])
-        layer = Layer.from_json(e["layer"])
-        index = self.indexes.get(key)
-        if index is None or index.life != e["life"] or not index.holds(e["ids"]):
-            prefix = e.get("prefix") or (index.prefix if index is not None else "")
-            self.garbage.extend([f"{prefix}{name}", self.event_counter] for name in layer.names())
-            self._prune_merges(key)
-            return
-        self._replace_index(key, index.merged(e["ids"], layer))
-        self._prune_merges(key)
-
-    def _on_IndexCut(self, e):
-        """The index's cut rose: the oldest P its readers hold (in-flight
-        batches' heads included), so merges may drop flips at or below it."""
-
-        key = (e["output"], e["partition"])
-        index = self.indexes.get(key)
-        if index is not None and index.life == e["life"]:
-            self.indexes[key] = index.with_cut(int(e["cut"]))
-
-    def _on_OrphansFound(self, e):
-        """Index files nothing names (`Upkeep.collect_orphans`): garbage now,
-        deleted once no pin predates this event."""
-
-        known = {g[0] for g in self.garbage}
-        self.garbage.extend([p, self.event_counter] for p in e["paths"] if p not in known)
-
-    def _on_FilesCleanedUp(self, e):
-        gone = set(e["paths"])
-        self.garbage = [g for g in self.garbage if g[0] not in gone]
-
     def _on_SourceCommitted(self, e):
         before = self.heads.get((e["source"], ""))
         head = e["head"]
         if (core := e.get("core")) is not None:
             self._core_apply(core)
         self.heads[(e["source"], "")] = {**head, "at": e["at"], "n": self.event_counter}
-        self._commit_keys(e["source"], "", e.get("keys"), None, head["ref"].get("generation"))
         run = e.get("run")
         if run is not None:
             self._record("runs", history.source_run_row(run, e["at"]))
@@ -1833,9 +1546,6 @@ class Model:
         checked it before recording it. Then the ids it mints or retires:
         `outputs` `[[output, partition, id | None], ...]`, `edges`
         `[[asset, partition, input, id | None], ...]`."""
-
-        if self.core is None:
-            self.core = Tracking()
         if part.get("event") is not None:
             self.core.apply(b64decode(part["event"]))
         for output, partition, id_ in part.get("outputs") or ():
@@ -1871,7 +1581,7 @@ class Model:
         append-only output's commit number, else its ref's generation."""
 
         id_ = self.core_outputs.get((output, partition))
-        if id_ is not None and self.core is not None:
+        if id_ is not None:
             if (found := self.core.output(id_.encode())) is not None:
                 return int(found["head"])
             return 0 if (output, partition) in self.heads else None  # a head, and no commit yet: empty
@@ -2009,7 +1719,7 @@ class Model:
         or None before its life's first commit."""
 
         id_ = self.core_outputs.get((output, partition))
-        if id_ is None or self.core is None:
+        if id_ is None:
             return None
         found = self.core.output(id_.encode())
         return None if found is None else {"id": id_, **found}

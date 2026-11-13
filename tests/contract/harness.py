@@ -2,11 +2,7 @@
 stands (docs/behaviors.md). A test declares a project with the SDK, deploys
 it, and then does only what a user can: call the engine's HTTP API, commit
 sources, run, cancel, restart or replace the engine, let time pass, and read
-outputs through their stores. It never reads the engine's state.
-
-`Solera(root, path)` serves the namespace on one tracking path: `"today"`,
-the engine as it is, or `"core"`, the new core (docs/tracking-design.md
-§15). `engine_options` is the one place that tells them apart."""
+outputs through their stores. It never reads the engine's state."""
 
 from __future__ import annotations
 
@@ -21,23 +17,8 @@ import pytest
 from solera.sdk import Loaded, Project, Ref
 from solera.stores import FileStore, Keys, Patch
 
-PATHS = ("today", "core")
-NOT_YET = "on the new tracking core yet"  # what the new path refuses until a later unit builds it
+NOT_YET = "on the new tracking core yet"  # what the engine refuses until a later unit builds it
 _CLI = threading.Lock()  # held while a `Solera.cli` call's entry point runs
-
-
-def engine_options(path: str) -> dict:
-    """The `Engine` arguments that select a tracking path (build plan, rule 4)."""
-
-    return {} if path == "today" else {"tracking": path}
-
-
-def state_options(path: str) -> dict:
-    """The `State.open` arguments for a tracking path: the format it writes."""
-
-    from solera_server.journal import CORE_FORMAT
-
-    return {} if path == "today" else {"format": CORE_FORMAT}
 
 
 class Refused(AssertionError):
@@ -51,8 +32,8 @@ class Refused(AssertionError):
 class Solera:
     """A namespace under `root`, served by one engine at a time."""
 
-    def __init__(self, root: Path, path: str = "today"):
-        self.root, self.path = Path(root), path
+    def __init__(self, root: Path):
+        self.root = Path(root)
         self.offset = 0.0  # seconds `advance` moved the clock past the wall
         self.state = self.engine = self.project = self.client = None
         self.engine_kw: dict = {}
@@ -95,7 +76,6 @@ class Solera:
             "contract",
             clock=self.clock,
             flush_interval=0.001,
-            **state_options(self.path),
         )
 
     async def _serve(self) -> None:
@@ -107,7 +87,7 @@ class Solera:
         kw.setdefault("eval_interval", 0.05)
         kw.setdefault("clock", self.clock)
         kw.setdefault("placements", {"Local": lambda s, c: InlinePlacement(c, project)})
-        self.engine = Engine(self.state, project.manifest, **kw, **engine_options(self.path))
+        self.engine = Engine(self.state, project.manifest, **kw)
         await self.engine.initialize()
         token = secrets.token_hex(16)
         app = create_app(engine=self.engine, token=token)
@@ -501,7 +481,7 @@ class Solera:
         rolling deploy's new one): its `deploy()` takes the namespace over
         while this one still runs. The caller closes it."""
 
-        other = Solera(self.root, self.path)
+        other = Solera(self.root)
         other.clock = self.clock
         return other
 
@@ -575,11 +555,7 @@ class Solera:
     async def serve_process(self, **env):
         """`solera serve` as its own process, as an operator starts it, on a
         state beside this namespace's (`env` adds to its environment): the
-        process, once it listens. `solera serve` runs today's engine until the
-        switch (build plan rule 4): on another path there is none to start."""
-
-        if self.path != "today":
-            pytest.skip("solera serve runs today's engine until the switch (build plan rule 4)")
+        process, once it listens."""
 
         import os
         import socket

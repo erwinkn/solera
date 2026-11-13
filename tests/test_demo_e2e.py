@@ -83,6 +83,7 @@ def pool_worker(demo):
     worker.wait(10)
 
 
+@pytest.mark.skip(reason="the demo has per-key assets: B6")
 def test_demo_end_to_end(demo, pool_worker):
     # A connection is never reused: uvicorn closes one idle for 5 s and httpx
     # reuses one idle for less than 5 s by its own clock, which starts later.

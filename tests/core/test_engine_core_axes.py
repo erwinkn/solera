@@ -14,7 +14,7 @@ from tests.contract.harness import Solera, rebuild
 
 @pytest.fixture
 async def solera(tmp_path):
-    namespace = Solera(tmp_path, "core")
+    namespace = Solera(tmp_path)
     yield namespace
     await namespace.close()
 

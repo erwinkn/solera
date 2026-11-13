@@ -14,7 +14,7 @@ from tests.contract.harness import Solera, rebuild
 
 
 async def test_a_reset_while_a_run_walks_starts_the_walk_over_on_the_new_life(tmp_path, monkeypatch):
-    s = Solera(tmp_path, "core")
+    s = Solera(tmp_path)
     rows = {k: 1 for k in "abcd"}
     hold, waiting, seen = asyncio.Event(), [], []
     hold.set()

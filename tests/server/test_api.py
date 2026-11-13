@@ -309,33 +309,6 @@ async def test_worker_pull_path_and_channel(engine, monkeypatch):
         assert sent.json() == again.json() == {"offset": 2}  # a retried batch is not shown twice
         assert engine.attempt_lines(stage["attempt"]) == lines
 
-        # The resolver's route (docs/resolved-commits.md §4): binary, versioned, the attempt's own.
-        from solera.keys import SortedEntries, resolver
-
-        ask = resolver.Ask("nope", "", "patch", 0, 1, "keys/nope/_/", -1, SortedEntries.of([], []))
-        body = resolver.request("mine", [ask])
-        assert (await client.post(f"{routes}/resolve", content=body)).status_code == 401
-        old = await client.post(f"{routes}/resolve", content=b"\x09" + body[1:], headers=token)
-        assert old.status_code == 415
-        stranger = await client.post(
-            f"{routes}/resolve", content=resolver.request("theirs", [ask]), headers=token
-        )
-        assert stranger.status_code == 409
-        for nobody in ("", None):  # no identity is never the owner's, bound or not
-            anonymous = resolver.frame({"worker_id": nobody, "outputs": []}, [])
-            assert (
-                await client.post(f"{routes}/resolve", content=anonymous, headers=token)
-            ).status_code == 409
-        torn = resolver.frame({"worker_id": "mine", "outputs": [{"name": "x", "offset": 0, "size": 9}]}, [])
-        assert (await client.post(f"{routes}/resolve", content=torn, headers=token)).status_code == 400
-        huge = await client.post(
-            f"{routes}/resolve", content=b"\x01" + bytes(resolver.MAX_BODY), headers=token
-        )
-        assert huge.status_code == 413
-        answered = await client.post(f"{routes}/resolve", content=body, headers=token)
-        assert answered.headers["content-type"] == resolver.CONTENT_TYPE
-        assert resolver.answers(answered.content)["nope"][0]["reason"] == "not_live"  # no such keyed output
-
         other = lifecycle.token(engine.secret, "another-attempt")
         forged = await client.post(
             f"{routes}/beat",

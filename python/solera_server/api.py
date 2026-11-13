@@ -259,7 +259,7 @@ def create_app(
             "postgres": bool(os.environ.get("DATABASE_URL")),
             "last_error": "; ".join(f"{name}: {error}" for name, error in runtime.failing.items()) or None,
             # a run left midway: its readers wait until a run of its producer completes it
-            "incomplete_full_runs": core_full.stopped(runtime) if runtime.core is not None else [],
+            "incomplete_full_runs": core_full.stopped(runtime),
             # cleanup whose task ran out of tries: see and clear with `solera cleanups`
             "stuck_cleanups": [
                 {"output": output, "partition": partition, "id": e["id"]}

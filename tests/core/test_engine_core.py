@@ -16,7 +16,7 @@ KEYS = {f"unique-key-{n:03d}": "1" for n in range(40)}
 
 @pytest.fixture
 async def solera(tmp_path):
-    namespace = Solera(tmp_path, "core")
+    namespace = Solera(tmp_path)
     yield namespace
     await namespace.close()
 
@@ -88,48 +88,6 @@ async def test_the_commit_check_refuses_a_batch_its_inputs_progress_moved_past(s
         solera.engine.core.check(event)
 
 
-async def test_a_today_namespace_and_a_core_one_refuse_each_other(tmp_path):
-    from solera_server.journal import OldNamespace
-
-    today = Solera(tmp_path, "today")
-    ex = await Example(today).start()
-    await ex.feed({"k1": "1"})
-    await today.close()
-    core = Solera(tmp_path, "core")
-    with pytest.raises(OldNamespace):
-        await Example(core).start()
-    await core.close()
-
-
-async def _attempt_requests(tmp_path, path: str) -> dict:
-    """The state store's requests, by method, while one keyed incremental
-    attempt of 40 keys runs and commits, on a bucket."""
-
-    solera = Solera(tmp_path / path, path)
-    storage = solera.storage_server()
-    try:
-        ex = await Example(solera).start(batch_size=100)
-        await ex.feed(KEYS, items=False)
-        await solera.settle(0.2)
-        before = dict(storage.methods)
-        [batch] = await ex.run("items")
-        assert len(batch.added) == len(KEYS)
-        return {m: n - before.get(m, 0) for m, n in storage.methods.items()}
-    finally:
-        await solera.close()
-        storage.close()
-
-
-async def test_n13_an_attempt_costs_todays_requests_and_at_most_its_layer_more(tmp_path):
-    """N13: outside the index, an attempt's requests are today's, plus at
-    most the commit's layer (its changed keys fit the result)."""
-
-    today = await _attempt_requests(tmp_path, "today")
-    core = await _attempt_requests(tmp_path, "core")
-    assert core.get("PUT", 0) <= today.get("PUT", 0) + 1, (today, core)
-    assert core.get("GET", 0) <= today.get("GET", 0), (today, core)
-
-
 async def test_changed_keys_too_big_for_the_result_travel_as_a_file(solera, monkeypatch):
     """N13's other PUT: a write whose changed keys pass `CHANGES_INLINE` puts
     them in one file beside the attempt's control file, which the engine
@@ -183,89 +141,6 @@ async def test_a_launch_journals_no_layer_of_its_outputs(solera):
     assert launches and not any(
         "core" in info for e in launches for info in e["prepared"]["outputs"].values()
     )
-
-
-async def test_an_engine_on_the_other_path_is_refused_before_it_fences_the_running_one(solera, tmp_path):
-    import obstore
-    from solera_server.journal import OldNamespace
-    from solera_server.state import State
-
-    ex = await Example(solera).start()
-    await ex.feed({"k1": "1"})
-    await solera.state.durable()
-
-    async def journal() -> dict:
-        found = await obstore.get_async(solera.state.objects, "control/journal.json")
-        return json.loads(bytes(await found.bytes_async()))
-
-    before = await journal()
-    with pytest.raises(OldNamespace):
-        await State.open((tmp_path / "state").as_uri(), "contract")  # today's path, format 5
-    after = await journal()
-    assert (after["engine"], after["epoch"]) == (before["engine"], before["epoch"])
-    await ex.feed({"k2": "1"})  # the running engine still writes
-
-
-async def test_a_journal_without_a_checkpoint_replays_into_the_model_that_wrote_it(solera, tmp_path):
-    """Events before a namespace's first core event are replayed on the new
-    path too: today's cleanup bookkeeping, which the new path skips, stays
-    empty, so a successor never cleans up what the live engine kept."""
-
-    from solera.sdk import Output, Project, asset
-    from solera.stores import FileStore
-    from solera_server.state import State
-
-    @asset
-    def value():
-        return {"n": 1}
-
-    @asset(outputs=Output("items", key="id"))
-    def items():
-        return [{"id": "k", "v": "1"}]
-
-    await solera.deploy(Project(assets=[value, items], default_store=FileStore(tmp_path / "data")))
-    await solera.run("value")
-    await solera.run("value")  # today's path would queue the first version's cleanup
-    await solera.run("items")  # the journal's first core event comes after
-    await solera.state.durable()
-    assert solera.state.journal.checkpoint is None and solera.engine.m.cleanups == {}
-    replayed = await State.open((tmp_path / "state").as_uri(), "contract", writer=False)
-    try:
-        assert replayed.model.cleanups == {} and replayed.model.core is not None
-    finally:
-        await replayed.close()
-
-
-async def test_todays_engine_on_a_namespace_a_core_engine_left_empty_runs_without_a_core(tmp_path):
-    """A namespace a core-path process opened and left with no event is
-    fresh: today's engine takes it in its own format, on a model with no
-    core, as a replay of it does."""
-
-    from solera.sdk import Output, Project, asset
-    from solera.stores import FileStore
-    from solera_server.journal import FORMAT
-    from solera_server.state import State
-
-    @asset(outputs=Output("items", key="id"))
-    def items():
-        return [{"id": "k", "v": "1"}]
-
-    first = Solera(tmp_path, "core")
-    await first._open_state()  # and dies before any event
-    today = Solera(tmp_path, "today")
-    try:
-        await today.deploy(Project(assets=[items], default_store=FileStore(tmp_path / "data")))
-        await today.run("items")
-        await today.state.durable()
-        assert today.state.journal.format == FORMAT and today.engine.core is None
-        assert today.engine.m.core is None and today.engine.m.key_count("items", "") == 1
-        replayed = await State.open((tmp_path / "state").as_uri(), "contract", writer=False)
-        try:
-            assert replayed.model.core is None
-        finally:
-            await replayed.close()
-    finally:
-        await today.close()
 
 
 async def test_a_keyed_output_committed_with_no_key_counts_zero_keys(solera, tmp_path):

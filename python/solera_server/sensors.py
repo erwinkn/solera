@@ -141,7 +141,7 @@ class Sensors:
         snapshot = {}
         for source in sensor["commits"]:
             entry = {"head": self._head_id(source)}
-            if self.core is not None and self.manifest["sources"][source].get("key") is not None:
+            if self.manifest["sources"][source].get("key") is not None:
                 # the new path: the keyed source's commit the tick observes
                 entry["core"] = (self.m.core_output(source, "") or {}).get("head", 0)
             elif (index := self.m.indexes.get((source, ""))) is not None:
@@ -273,7 +273,7 @@ class Sensors:
                 commit_of(self.m.heads.get((source, ""))) != commit_of(head) for source, head in heads.items()
             ):
                 raise self.Conflict("a source moved while the tick was applied")
-            if self.core is not None and generation.moved:
+            if generation.moved:
                 raise self.Conflict("a deploy landed while the tick was applied")
         except BaseException:
             await self._drop_prepared(prepared)
@@ -285,8 +285,7 @@ class Sensors:
         now, base = self.clock(), self.m.event_counter
         for event in prepared:
             event["at"] = now
-            if self.core is not None:  # each a commit of its own source: checked one by one
-                self.core.check_payload(event.get("core"))
+            self.core.check_payload(event.get("core"))
         accepted = {
             "tick": claim["tick"],
             "runs": [run["id"] for _, run in planned],

@@ -31,7 +31,7 @@ from tests.contract.test_eng import sensed_project
 
 @pytest.fixture
 async def solera(tmp_path):
-    namespace = Solera(tmp_path, "core")
+    namespace = Solera(tmp_path)
     yield namespace
     await namespace.close()
 
@@ -298,7 +298,7 @@ async def test_an_engine_that_lost_its_namespace_never_overwrites_its_successors
         return [{"id": "k", "v": "1"}]
 
     project = Project(assets=[items], default_store=FileStore(tmp_path / "data"))
-    first, second = Solera(tmp_path, "core"), None
+    first, second = Solera(tmp_path), None
     release, entered = threading.Event(), threading.Event()
     try:
         await first.deploy(project)
@@ -351,7 +351,7 @@ async def test_an_engine_on_the_same_host_as_its_predecessor_serves_on_s3(tmp_pa
     import solera_server.engine as engine_module
 
     monkeypatch.setattr(engine_module, "cache_root", lambda url: str(tmp_path / "cache"))
-    first, second = Solera(tmp_path, "core"), None
+    first, second = Solera(tmp_path), None
     storage = first.storage_server()
     try:
         project = Project(sources=[Source("feed", key="id")])

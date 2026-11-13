@@ -10,7 +10,7 @@ from tests.contract.harness import Solera, rebuild
 
 @pytest.fixture
 async def solera(tmp_path):
-    s = Solera(tmp_path, "core")
+    s = Solera(tmp_path)
     yield s
     await s.close()
 

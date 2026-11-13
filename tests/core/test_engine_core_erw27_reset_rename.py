@@ -5,7 +5,6 @@ under the output's current name, and `_apply_aliases` does not move `reset_at` t
 guard misses the reset: the old life's attempt is not refused."""
 
 import asyncio
-import os
 
 import pytest
 from solera.sdk import In, Incremental, Output, Project, Retry, asset
@@ -13,8 +12,6 @@ from solera.stores import FileStore
 from solera_server.executors.inline import InlinePlacement
 
 from tests.contract.harness import Solera, rebuild
-
-PATH = os.environ.get("TRACKING_PATH", "core")
 
 
 @pytest.mark.parametrize("kind", ["incremental", "whole"])
@@ -32,7 +29,7 @@ PATH = os.environ.get("TRACKING_PATH", "core")
     ],
 )
 async def test_an_attempt_in_flight_across_a_reset_and_then_a_rename(tmp_path, monkeypatch, kind, order):
-    s = Solera(tmp_path, PATH)
+    s = Solera(tmp_path)
     rows = {"a": 1, "b": 1}
     hold, waiting, projects, wrote = asyncio.Event(), asyncio.Event(), {}, []
 

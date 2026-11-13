@@ -1,9 +1,6 @@
 """The run history (docs/object-store-state.md §7): rows born in the model,
 flushed to Parquet, merged, hidden when deleted, and queried with DuckDB."""
 
-import copy
-from pathlib import Path
-
 import pytest
 from solera.sdk import In, Output, Project, Result, Retry, Source, asset
 from solera_server.engine import Conflict, Engine
@@ -180,82 +177,6 @@ async def test_a_query_builds_only_the_live_rows_it_reads(state, clock, monkeypa
     assert sorted(r["id"] for r in listed) == sorted(r["id"] for r in paused) and built == []
     found = await engine.history.tasks(run=paused[0]["id"])
     assert [t["asset"] for t in found["tasks"]] == ["orders"] and built == [paused[0]["id"]]
-
-
-async def test_a_run_reads_the_same_once_archived(state, clock):
-    engine = engine_for(state, clock)
-    await engine.initialize()
-    details = {}
-    record = state.record
-
-    def spy(*events, **kw):  # the run just before it moves into the history
-        for e in events:
-            if e["type"] == "RunArchived":
-                details[e["run"]] = copy.deepcopy(state.model.runs[e["run"]])
-        record(*events, **kw)
-
-    state.record = spy
-    failed = await run(engine, clock, ["revenue"], upstream=True, config={"fail": True}, tags={"env": "prod"})
-    commit = await engine.commit_source("uploads", upsert=["a", "b"], by="api")
-    state.record = record
-    # Its attempts were in the history all along: the same rows, live or archived.
-    before = engine._detail(details[failed["id"]], True, await engine.history.attempts(failed["id"]))
-    events = await engine.history.events(failed["id"])
-    assert [e["n"] for e in events] == list(range(1, len(events) + 1))
-    assert [e["type"] for e in events if e["task"] is None] == ["submitted", "failed"]
-    assert {a.get("executor") for t in before["attempts"].values() for a in t} == {"local"}
-    assert await engine.run_detail(failed["id"]) == before
-    record = await engine.history.run(commit["run"])
-    assert record == {
-        "id": commit["run"],
-        "source": "uploads",
-        "by": "api",
-        "commit_number": 0,
-        "upserted": ["a", "b"],
-        "deleted": [],
-    }
-
-
-async def test_flush_merge_delete_and_purge(state, clock):
-    engine = engine_for(state, clock, flush_rows=1, merge_width=2, purge_seconds=100)
-    await engine.initialize()
-    runs = []
-    for i in range(4):
-        runs.append((await run(engine, clock, ["orders"], config={"n": i}))["id"])
-        for cleanup in [r for r in engine.m.runs.values() if r["kind"] == "cleanup"]:
-            await engine.run_until(cleanup["id"], 60)  # what each commit let go of: a run too
-    await engine.history.lake.tick()
-    files = state.model.history.files
-    assert not any(state.model.history.rows.values())
-    listed = (await engine.list_runs(RunFilter(origin=["cleanup"])))["runs"]
-    cleanups = len(listed)
-    assert cleanups == 3  # each commit but the first superseded a version
-    assert [r["partitions"] for r in listed] == [[""]] * 3  # its scope: the one partition it cleans up
-    # Each run's rows went out in its own flush; pairs of them were merged.
-    assert sum(f["rows"] for f in files["runs"]) == 4 + cleanups
-    lake = engine.history.lake
-    await lake.stop()
-    while lake.plan():
-        lake.maintain()
-        await lake.job
-    assert len(files["runs"]) == 1
-    assert [r["id"] for r in (await engine.list_runs())["runs"]] == runs[::-1]
-
-    runs_dir = Path(str(state.objects.prefix)) / "runs"
-    assert (runs_dir / runs[1]).is_dir()
-    await engine.delete_run(runs[1])
-    assert not (runs_dir / runs[1]).exists()  # a local directory goes with its objects
-    hidden = files["runs"][0]
-    assert hidden["hidden"] == [runs[1]]
-    assert runs[1] not in [r["id"] for r in (await engine.list_runs())["runs"]]
-    assert await engine.history.run(runs[1]) is None
-    clock.now += 101  # the file is rewritten without the run
-    lake.maintain()
-    await lake.job
-    assert "hidden" not in files["runs"][0] and files["runs"][0]["rows"] == 3 + cleanups
-    assert hidden["path"] in {path for path, _ in state.model.garbage}
-    made = (await engine.history.commits(outputs=["orders"]))["commits"]
-    assert runs[1] not in {m["run"] for m in made}
 
 
 async def test_stale_flush_is_discarded(state, clock):

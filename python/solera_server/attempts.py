@@ -24,7 +24,6 @@ from solera.objects import Conflict, swap
 from solera.tasks import retrying
 
 from .state import LostOwnership, Unavailable
-from .upkeep import MERGE_ATTEMPTS, merge_due
 
 log = logging.getLogger(__name__)
 
@@ -117,24 +116,7 @@ def worker_report(worker: dict | None) -> dict:
         keys := {str(k): int(v) for k, v in keys.items() if _number(v) is not None}
     ):
         out["keys"] = keys
-    if read := [r for r in map(_read, worker.get("read") or ()) if r is not None]:
-        out["read"] = read
     return out
-
-
-def _read(entry) -> dict | None:
-    """One partition a worker's read saw (`solera_worker.observed`): its output
-    and partition, and the generation whose write it saw (None: no fenced write
-    says, as for an external table)."""
-
-    if not isinstance(entry, dict) or not isinstance(entry.get("output"), str):
-        return None
-    generation = entry.get("generation")
-    return {
-        "output": entry["output"],
-        "partition": str(entry.get("partition") or ""),
-        "generation": int(generation) if _number(generation) is not None else None,
-    }
 
 
 @dataclass
@@ -270,61 +252,6 @@ class Attempts:
         live.finished = True
         self._stir(attempt)
 
-    async def attempt_resolve(self, attempt: str, body: bytes) -> bytes | None:
-        """A small write's delta from the engine's cache (docs/resolved-commits.md
-        §4), or None when the engine keeps no cache. Every output is checked
-        against what the engine prepared for the attempt, never trusted."""
-
-        self._serving()
-        from solera.keys.resolver import MAX_BODY, Malformed, Prepared, _outputs, unframe
-
-        live = self._live(attempt)
-        if len(body) > MAX_BODY:
-            raise Malformed(f"a body over {MAX_BODY} bytes")
-        header, payloads = unframe(body)
-        outputs_asked = _outputs(header, payloads)
-        worker_id = header.get("worker_id")
-        if not isinstance(worker_id, str) or not worker_id:
-            raise Ended("not_owner")  # no identity is never the owner's
-        await self._bind(attempt, live, worker_id)
-        if self.keys is None:
-            return None
-        task = self.m.task(self.m.attempts[attempt])
-        launched = task.get("launched") or {}
-        partition, outputs = task["partition"], (launched.get("prepared") or {}).get("outputs") or {}
-
-        def prepared(name):
-            info = outputs.get(name)
-            if not info or "prefix" not in info or "commit_number" not in info:
-                return None
-            index = self.m.indexes.get((name, partition))
-            head = self.m.heads.get((name, partition)) or {}
-            if index is None and int(info["commit_number"]) == 0:
-                index = self.m.index(name, partition)  # the first write of the output
-            if index is None or index.prefix != info["prefix"]:
-                return None
-            return Prepared(
-                partition,
-                int(info["commit_number"]),
-                int(launched["generation"]),
-                index,
-                int(head.get("commit_number", -1)),
-                True,
-                self.m.event_counter,  # the index as of now: what a fill of it reads
-                replaced=info["contract"]["writes"] == "immutable",  # its cleanup reads them
-            )
-
-        def still_live():
-            if self.m.claimed(attempt) is None:
-                return False
-            return live.cancel is None or live.cancel.phase != "forced"
-
-        asked = current_names(
-            launched.get("prepared") or {}, {o["name"]: o["name"] for o, _ in outputs_asked}
-        )
-        resolved = {name: prepared(current) for current, name in asked.items()}  # by the worker's names
-        return await self.keys.resolve(attempt, body, resolved.get, still_live, self.m.event_counter)
-
     def attempt_lines(self, attempt: str) -> list[str] | None:
         live = self.live.get(attempt)
         return list(live.lines) if live is not None else None
@@ -397,8 +324,7 @@ class Attempts:
             "token": lifecycle.token(await self._load_secret(), attempt),
             "generation": claim["generation"],  # chosen before the spec (§9.7)
         }
-        if self.core is not None:  # the new tracking path (build plan rule 4)
-            spec.update(self.core.spec(prepared))
+        spec.update(self.core.spec(prepared))
         if prepared["cursor"] is not None:
             spec["cursor"] = prepared["cursor"]
         if prepared.get("cleanup") is not None:  # a cleanup task's work (§9.8, K25)
@@ -428,14 +354,13 @@ class Attempts:
         if execution["kind"] == "Pool":
             needs = {k: v for k in ("cpu", "memory", "gpu") if (v := execution["options"].get(k)) is not None}
             event["pool"] = {"name": execution["executor"], "needs": needs}
-        if self.core is not None:  # ids for its keyed outputs never named: what its commit builds under
-            generation.check()  # by name, so under the deploy it was prepared under
-            minted: list = []
-            for name, info in prepared["outputs"].items():
-                if info["contract"].get("key") is not None:
-                    self.core.output_id(name, task["partition"], minted)
-            if minted:
-                event["core_outputs"] = minted
+        generation.check()  # by name, so under the deploy it was prepared under
+        minted: list = []
+        for name, info in prepared["outputs"].items():
+            if info["contract"].get("key") is not None:
+                self.core.output_id(name, task["partition"], minted)
+        if minted:
+            event["core_outputs"] = minted
         # Launch only what a restarted engine would adopt, never an orphan: until the
         # launch is durable, pool discovery does not offer it either. If it never
         # is (this engine was replaced), it never is offered.
@@ -827,40 +752,6 @@ class Attempts:
             event = {"output": output, "partition": partition, "ids": stuck, "by": by, "at": self.clock()}
             self.state.record({"type": "CleanupsCleared", **event, "retired": retired})
         return {"output": output, "partition": partition, "cleared": stuck + retired}
-
-    def merges_view(self, output: str, partition: str) -> dict:
-        """An index's merges that failed in its current life: per input set,
-        its uploads (none published), the last one's start, and when the next
-        may start (`merge_due`; null: at once)."""
-
-        index = self.m.indexes.get((output, partition))
-        rec = self.m.merge_record((output, partition), index.life) if index is not None else {"attempts": {}}
-        return {
-            "output": output,
-            "partition": partition,
-            "layers": len(index.layers) if index is not None else 0,
-            "backlogged": index is not None and index.backlogged(),
-            "failed": [
-                {
-                    "inputs": k,
-                    "uploads": t["n"],
-                    "at": t["at"],
-                    "due": merge_due(t) if t["n"] >= MERGE_ATTEMPTS else None,
-                }
-                for k, t in sorted(rec["attempts"].items())
-            ],
-        }
-
-    def clear_merges(self, output: str, partition: str, by: str) -> dict:
-        """An operator's `solera merges --clear`: forget what the index's
-        merges tried, so that upkeep tries them again at once."""
-
-        index = self.m.indexes.get((output, partition))
-        cleared = sorted(self.m.merge_record((output, partition), index.life)["attempts"]) if index else []
-        if cleared:
-            event = {"output": output, "partition": partition, "by": by, "at": self.clock()}
-            self.state.record({"type": "MergesCleared", **event})  # upkeep's next round merges
-        return {"output": output, "partition": partition, "cleared": cleared}
 
     async def _end(self, run_id: str, attempt: str) -> dict | None:
         """End the attempt in its control file (§2.4), on what it reads

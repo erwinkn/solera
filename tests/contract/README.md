@@ -8,8 +8,7 @@ the new core.
 ## Running
 
 ```
-uv run pytest tests/contract                          # today's engine
-SOLERA_TRACKING=core uv run pytest tests/contract     # the new core
+uv run pytest tests/contract
 uv run python -m tests.contract.check                 # entries, tests, pending
 ```
 
@@ -67,20 +66,11 @@ enforces both rules.
 1. Give the entry its id and text in `docs/behaviors.md`.
 2. Write its test in `test_<area>.py`, named `test_<area>_<n>_<the rule>`
    (`test_inc_4_…` is INC-4's). Several tests of one entry share the prefix.
-3. Point the entry's *Covered* line at it.
-4. If today's engine lacks the entry's behaviour (the new core changes or
-   adds it), list it in `entries.TARGET` with the decision: its tests assert
-   the target, and today's path skips them. `SOLERA_CONTRACT_TARGET=1` runs
-   them on today's engine anyway, to see them fail for the right reason.
-5. If it cannot be tested through what a user reaches, list it in
+3. If the engine does not build it yet, list it in `entries.LATER` with the
+   unit that will: its tests are skipped until then.
+4. If it cannot be tested through what a user reaches, list it in
    `entries.PENDING` with the reason instead.
 
 `test_completeness.py` fails when an entry has neither a test nor a
 pending reason, when a test names no entry, or when a test imports an
 internal.
-
-## The two paths
-
-`SOLERA_TRACKING` selects the path; `harness.engine_options` turns it into
-the engine's constructor arguments. Until the new core exists (build plan
-B5), `core` skips every test that serves a namespace.

@@ -2,20 +2,16 @@
 Its next run must be a full run (batch.reset on its first batch), as for any consumer of a reset
 output (docs/observed-set.md: "An upstream reset is a full run for its consumers")."""
 
-import os
-
 import pytest
 from solera.sdk import Incremental, Output, Project, Result, Retry, asset, job
 from solera.stores import FileStore
 
 from tests.contract.harness import Solera
 
-PATH = os.environ.get("TRACKING_PATH", "core")
-
 
 @pytest.mark.parametrize("shape", ["job", "asset-with-output"])
 async def test_a_job_whose_upstream_moved_is_told_to_start_over(tmp_path, shape):
-    s = Solera(tmp_path, PATH)
+    s = Solera(tmp_path)
     rows = {"a": 1, "b": 1, "c": 1}
     batches = []
 
