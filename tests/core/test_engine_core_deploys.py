@@ -5,6 +5,7 @@ redesign, round 2)."""
 
 from solera.sdk import Incremental, Output, Project, asset
 from solera.stores import FileStore
+from solera_server.model import edge_id
 from solera_server.tracking import stale
 
 from tests.contract.harness import Solera
@@ -37,7 +38,7 @@ async def test_a_deploy_during_a_coverage_check_stops_no_tick(tmp_path, monkeypa
         await s.run("second")
         await s.run("join", keys={"first": ["a"], "second": ["a"]})
         engine = s.engine
-        assert sorted(engine.m.core_empty) == [("join", "", "a"), ("join", "", "b")]
+        assert sorted(engine.m.core.walking()) == [edge_id("join", "", "a"), edge_id("join", "", "b")]
         engine._covers.clear()
         original, changed = stale.taken_after, []
 

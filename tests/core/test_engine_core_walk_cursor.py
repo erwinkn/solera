@@ -56,7 +56,7 @@ async def test_another_runs_commit_does_not_validate_a_pre_reset_task_cursor(tmp
             result = record(*events, **kw)
             if not entered.is_set() and any(
                 e.get("type") == "AttemptFinished"
-                and ((e.get("commit") or {}).get("core") or {}).get("walk", {}).get("hi") == "b"
+                and ((e.get("commit") or {}).get("progress") or {}).get("(core)", {}).get("key") == "b"
                 for e in events
             ):
                 s.engine._control(old["id"], "pause", "test")
@@ -82,7 +82,7 @@ async def test_another_runs_commit_does_not_validate_a_pre_reset_task_cursor(tmp
         state = {
             "status": detail["request"]["status"],
             "rows": sorted(await s.rows("copy")),
-            "empty": dict(s.engine.m.core_empty),
+            "walking": sorted(s.engine.m.walking()),
             "waiting": full.waiting(s.engine),
             "attempts": detail["attempts"],
         }

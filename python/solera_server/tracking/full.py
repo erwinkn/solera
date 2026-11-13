@@ -20,10 +20,12 @@ from __future__ import annotations
 
 import logging
 
+import orjson
 from solera._native import Tracking
 
 from .. import planning
-from . import Generation, b64
+from ..model import output_id
+from . import Generation
 
 INCOMPLETE = "upstream incomplete"
 
@@ -35,7 +37,7 @@ def running(core) -> set[tuple[str, str]]:
     `(output, partition)`."""
 
     tracking = core.tracking
-    return {key for key, id_ in core.m.core_outputs.items() if tracking.full_run(id_.encode()) is not None}
+    return {tuple(orjson.loads(id_)) for id_ in tracking.outputs() if tracking.full_run(id_) is not None}
 
 
 def waiting(engine) -> set[tuple[str, str]]:
@@ -43,13 +45,7 @@ def waiting(engine) -> set[tuple[str, str]]:
     and the alarm read."""
 
     m = engine.m
-    owner = {("@life", id_): key for key, id_ in m.core_outputs.items()}
-    out = set()
-    for key in m.partial_spans:
-        output, partition = owner.get(key, key)
-        if output != "@life" and m.partial(output, partition, m.axis_head(output, partition)):
-            out.add((output, partition))
-    return out
+    return {key for key in m.partial_spans if m.partial(*key, m.axis_head(*key))}
 
 
 def gate(planner, task: dict, waits) -> list | None:
@@ -140,11 +136,9 @@ async def settle(engine) -> None:
     late, and a late end only holds back more."""
 
     m, core = engine.m, engine.core
-    owner = {("@life", id_): key for key, id_ in m.core_outputs.items()}
     partitions = set()
-    for key, spans in m.partial_spans.items():
-        output, partition = owner.get(key, key)
-        if output != "@life" and spans[-1][1] is None:
+    for (output, partition), spans in m.partial_spans.items():
+        if spans[-1][1] is None:
             if (asset := (engine.manifest["outputs"].get(output) or {}).get("asset")) is not None:
                 partitions.add((asset, partition))
     for asset, partition in sorted(partitions):
@@ -154,23 +148,17 @@ async def settle(engine) -> None:
         except Exception:  # one partition that no longer plans (a dimension changed) stops no other
             log.exception("settling %s %r", asset, partition)
     generation = Generation(m)
-    for (output, partition), id_ in sorted(m.core_outputs.items()):
-        if core.tracking.full_run(id_.encode()) is None:
+
+    def open_span(key: tuple[str, str]) -> bool:
+        spans = m.partial_spans.get(key) or ()
+        return bool(spans) and spans[-1][1] is None
+
+    for key in sorted(running(core)):
+        if open_span(key):
             continue
-        spans = m.partial_spans.get(("@life", id_)) or ()
-        if spans and spans[-1][1] is None:
-            continue
+        id_ = output_id(*key)
         async with core.lock(id_):
             if generation.moved:  # a deploy while it waited: the next tick goes on
                 return
-            if (
-                core.m.core_outputs.get((output, partition)) != id_
-                or core.tracking.full_run(id_.encode()) is None
-            ):
-                continue
-            spans = m.partial_spans.get(("@life", id_)) or ()
-            if spans and spans[-1][1] is None:
-                continue
-            event = Tracking.event_full_run_done(id_.encode())
-            core.check(event)
-            engine.state.record({"type": "Core", "event": b64(event), "outputs": [], "edges": []})
+            if core.tracking.full_run(id_) is not None and not open_span(key):
+                core.record(Tracking.event_full_run_done(id_))

@@ -174,14 +174,12 @@ class History:
                             pre.get("deploy_number"),
                             pre.get("full"),
                         )
-                        + (core.get("counts"), core.get("walk"), e.get("error"))
+                        + (core.get("counts"), core.get("walked"), e.get("error"))
                     )
                 elif e.get("type") in ("ProjectRegistered", "Settled", "Core"):
                     h.trace.append((e["type"], m.deploy_number))
                 spans = {str(k): v for k, v in m.partial_spans.items()}
-                h.trace.append(
-                    ("state", spans, {str(k): v for k, v in m.core_empty.items()}, dict(m.core_outputs))
-                )
+                h.trace.append(("state", spans, sorted(m.walking())))
             return out
 
         def awaited(owner, name):
@@ -206,10 +204,6 @@ async def assert_replay(s):
     def view(m):
         return {
             "core": m.core.snapshot() if m.core is not None else None,
-            "outputs": {str(k): v for k, v in m.core_outputs.items()},
-            "edges": {str(k): list(v) for k, v in m.core_edges.items()},
-            "empty": {str(k): v for k, v in m.core_empty.items()},
-            "read": {str(k): v for k, v in m.core_read.items()},
             "spans": json.dumps({str(k): v for k, v in m.partial_spans.items()}, sort_keys=True),
             "reset_at": {str(k): v for k, v in m.reset_at.items()},
             "heads": {

@@ -55,7 +55,6 @@ async def test_a_job_whose_upstream_moved_is_told_to_start_over(tmp_path, shape)
         m = s.engine.m
         state = {
             "batches": batches,
-            "core_read": {str(k): v for k, v in getattr(m, "core_read", {}).items()},
             "definition": "definition" in m.partition("sink", ""),
             "heads": sorted(str(k) for k in m.heads),
         }

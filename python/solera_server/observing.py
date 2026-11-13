@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 
 from . import planning
+from .model import edge_id
 from .tracking import Generation, Redeployed
 from .tracking import stale as core_stale
 
@@ -49,14 +50,13 @@ class Observing:
             if input.kind != "incremental":
                 continue
             key = (asset, partition, input.param)
-            edge, read = self.m.core_edges.get(key), self.m.core_read.get(key)
-            if edge is None or read != self.m.core_outputs.get((input.output, input.partition)):
-                return None  # never read, or what it committed is of a life of its upstream that is gone
-            empty = self.m.core_empty.get(key)
-            if empty is not None:
+            edge = self.m.edge(*key)
+            if edge is None or not edge["read"]:
+                return None  # never read, or a deploy closed its edge since
+            if (empty := edge["empty"]) is not None:
                 up = self.m.core_output(input.output, input.partition) or {}
                 patterns = json.dumps(input.spec.get("patterns"), sort_keys=True)
-                stamp = (empty, edge[1], up.get("head", 0), patterns, self._walked.get(key, 0))
+                stamp = (empty, up.get("life"), up.get("head", 0), patterns, self._walked.get(key, 0))
                 out.append((key, stamp, input, empty))
         return out
 
@@ -87,9 +87,7 @@ class Observing:
                 try:
                     with generation:
                         generation.check()
-                        covered = not await core_stale.taken_after(
-                            self.core, input, empty, self.m.core_edges[key][0]
-                        )
+                        covered = not await core_stale.taken_after(self.core, input, empty, edge_id(*key))
                     generation.check()
                 except Redeployed:  # a deploy while a check awaited: not known, the next tick asks again
                     return False
@@ -102,7 +100,7 @@ class Observing:
         """Bring `_complete_known` up to date: every partition with an edge
         not walked to the end, for the upstream as it is now."""
 
-        for asset, partition in sorted({(asset, partition) for asset, partition, _ in self.m.core_empty}):
+        for asset, partition in sorted(self.m.walking()):
             if asset in self.manifest["assets"]:
                 await self.complete(asset, partition)
 

@@ -366,7 +366,7 @@ async def test_a_consumer_opening_its_edge_while_an_outputs_first_commit_is_buil
     driving = asyncio.create_task(solera.engine.run_until(request["id"], 30))
     await asyncio.wait_for(gate.reached.wait(), 10)
     await solera.submit("copy")  # its edge names items' id while items' first commit is built
-    await solera.until(lambda: any(e[1] for e in solera.engine.m.core_edges.values()), 10)
+    await solera.until(lambda: solera.engine.m.core.edges(), 10)
     gate.release.set()
     await driving
     detail = await solera.get(f"/runs/{request['id']}")
