@@ -51,6 +51,7 @@ from .model import (
     _delta_files,
     commit_of,
     declaration,
+    is_log,
     reads,
 )
 from .observing import Observing
@@ -1096,8 +1097,17 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
             # Whether the write starts the content over: a first write (an output
             # reset by a move holds no head), or a full run.
             info["reset"] = reset or head is None
-            if output.get("incremental"):
-                info["commit_number"] = int((head or {}).get("commit_number", -1)) + 1
+            if is_log(output):
+                # Where its commit goes: the engine names the layer, the worker writes it.
+                found = self.m.core.output(self.core.named(name, partition))
+                info["log"] = {
+                    "pin": output_pin(self.core, name, partition),
+                    "url": self.state.objects_url,
+                    "path": self.core.path(found["life"], found["head"] + 1, attempt or "-"),
+                    "commit": found["head"] + 1,
+                    "live": found["live"],
+                    "clear": info["reset"],  # a full run starts the log over
+                }
             if output.get("key") is not None:
                 info["core"] = output_pin(self.core, name, partition)
                 if (name, partition) in self.m.repairs:
@@ -1214,10 +1224,15 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
 
     def _whole_index(self, output: str, ref: dict) -> dict | None:
         """The pinned key index a whole read of a keyed output on an immutable
-        store needs to name its objects (docs/lifecycle.md §9.8)."""
+        store needs to name its objects (docs/lifecycle.md §9.8); for a log,
+        the layers its rows are in."""
 
         record = self.manifest["outputs"].get(output) or {}
         store = self.manifest["stores"].get(record.get("store")) or {}
+        if is_log(record):  # the core's to read, unless its store keeps the rows
+            if store.get("writes") != "immutable":
+                return None
+            return {"log": output_pin(self.core, output, ref.get("partition") or "")}
         if (
             record.get("key") is None
             or record.get("dynamic_partitions")
@@ -1225,6 +1240,11 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
         ):
             return None
         return {"core": output_pin(self.core, output, ref.get("partition") or "")}
+
+    def _log(self, input: planning.Input) -> bool:
+        """Whether an input reads a log."""
+
+        return is_log(self.manifest["outputs"].get(input.output))
 
     @staticmethod
     def _versioned(input: planning.Input) -> bool:
@@ -1400,7 +1420,7 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
                 if ref is None or ref["partition"] != task["partition"]:
                     raise Conflict(f"output {name}: ref partition != {task['partition']!r}", retryable=False)
             head = {"ref": ref, "version": prepared["version"]}
-            if decl.get("key") is not None:
+            if decl.get("incremental"):
                 counts = built.counts.get(name)
                 schema = (ref.get("handle") or {}).get("schema")
                 if (
@@ -1622,7 +1642,7 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
         if (output, partition) not in self.m.heads:
             raise KeyError(f"{output}/{partition}")
         found = self.m.core_output(output, partition)
-        if found is None:
+        if found is None or is_log(self.manifest["outputs"].get(output)):  # a log has rows, no keys
             return {"total": 0, "keys": {}, "next": None}
         rows, cursor = [], after
         while len(rows) < offset + limit:

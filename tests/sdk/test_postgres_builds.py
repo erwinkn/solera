@@ -152,7 +152,7 @@ async def test_a_late_insert_of_a_removed_key_is_refused(store):
     Attempt 6's write lands late: there is no row to compare with, but the
     partition's version check is 7, so the write is refused whole."""
 
-    out = output()
+    out = output(incremental=True)
     first = await store.store(rows(k1="1", k2="2"), None, at(out, 2))
     retry = await store.store(Patch([], remove=["k2"]), first.ref, at(out, 7))
     with pytest.raises(StoreError, match="newer attempt"):
@@ -167,7 +167,7 @@ async def test_a_late_insert_of_a_key_never_held_is_refused(store):
     first attempt after one that ended without committing writes all the
     same, even nothing (D196, rule 3): attempt 6's insert of k6 is refused."""
 
-    out = output()
+    out = output(incremental=True)
     first = await store.store(rows(k1="1"), None, at(out, 2))
     await store.store(Patch([]), first.ref, at(out, 7))  # the retry's write of nothing
     with pytest.raises(StoreError, match="newer attempt"):
@@ -179,7 +179,7 @@ async def test_a_first_write_of_nothing_takes_the_check_before_any_table_exists(
     """The check is keyed by the table's name, so the first attempt after a
     dead one locks it out even when no table exists yet, and creates none."""
 
-    out = output()
+    out = output(incremental=True)
     await store.store(Patch([]), None, at(out, 7))
     assert registry(store, out)[0] == 7
     assert sql("SELECT to_regclass(%s)", (store._table(out)[0],)) == [(None,)]
@@ -193,7 +193,7 @@ async def test_a_repair_lists_a_dead_attempts_keys_by_version(store):
     the partition holds at version 5: b alone. Asking takes the version
     check first (rule 3), so attempt 5 can add nothing after the list."""
 
-    out = output()
+    out = output(incremental=True)
     first = await store.store(rows(a="1"), None, at(out, 1))
     await store.store(Patch(rows(b="1", c="1")), first.ref, at(out, 5))
     await store.store(Patch(rows(c="2")), first.ref, at(out, 6))
@@ -211,7 +211,7 @@ async def test_a_repair_lists_where_the_log_points(store):
     """During a full run the dead attempt wrote into the build: the repair
     lists the build's rows, not the published ones."""
 
-    out = output()
+    out = output(incremental=True)
     first = await store.store(rows(a="1", b="1"), None, at(out, 1))
     run = await store.store(rows(a="2"), first.ref, at(out, 5, reset=True))
     await store.store(Patch(rows(b="dead")), run.ref, at(out, 6, run=5))
@@ -235,7 +235,7 @@ async def test_a_full_run_builds_beside_and_switches_once(store):
     full_run_ended publishes the run in one step: outsiders see the new
     rows, the build is gone, and a ref to the build reads the published rows."""
 
-    out = output()
+    out = output(incremental=True)
     first = await store.store(rows(a="1", b="1", c="1", d="1"), None, at(out, 1))
     one = await store.store(rows(a="3", b="3"), first.ref, at(out, 5, reset=True))
     assert one.ref.handle["build"] == 5 and one.ref.handle["table"] == first.ref.handle["table"]
@@ -265,7 +265,7 @@ async def test_a_late_switch_call_does_nothing_and_says_not_published(store):
     It changes nothing and says not published; the engine keeps the debt and
     calls again once the partition is quiet."""
 
-    out = output()
+    out = output(incremental=True)
     first = await store.store(rows(a="1"), None, at(out, 1))
     run = await store.store(rows(a="2"), first.ref, at(out, 5, reset=True))
     await store.store(Patch(rows(b="7")), run.ref, at(out, 7, run=5))  # not committed yet
@@ -279,7 +279,7 @@ async def test_a_switch_never_lowers_the_check(store):
     """After the switch, a late writer of the run is still refused, in the
     build and in place."""
 
-    out = output()
+    out = output(incremental=True)
     first = await store.store(rows(a="1"), None, at(out, 1))
     run = await store.store(rows(a="2"), first.ref, at(out, 5, reset=True))
     await store.store(Patch(rows(b="6")), run.ref, at(out, 6, run=5))
@@ -295,7 +295,7 @@ async def test_a_reset_delivered_again_after_its_switch_rewrites_in_place(store)
     time after its run was published. It rewrites the same rows in place,
     and opens no build that a repeated switch could publish twice."""
 
-    out = output()
+    out = output(incremental=True)
     first = await store.store(rows(a="1", b="1"), None, at(out, 1))
     run = await store.store(rows(a="2"), first.ref, at(out, 5, reset=True))
     assert await store.full_run_ended(out, "", 5, 5)
@@ -307,7 +307,7 @@ async def test_a_reset_delivered_again_after_its_switch_rewrites_in_place(store)
 
 
 async def test_a_reset_delivered_again_before_its_switch_rewrites_its_build(store):
-    out = output()
+    out = output(incremental=True)
     first = await store.store(rows(a="1"), None, at(out, 1))
     await store.store(rows(a="2", b="2"), first.ref, at(out, 5, reset=True))
     again = await store.store(rows(a="2", b="2"), first.ref, at(out, 5, reset=True))
@@ -322,7 +322,7 @@ async def test_every_write_keeps_the_builds_the_log_names(store):
     5's. The next write after the clear names run 8 alone (run 5 never
     ended) and drops 5's build."""
 
-    out = output()
+    out = output(incremental=True)
     first = await store.store(rows(a="1"), None, at(out, 1))
     five = await store.store(rows(a="5"), first.ref, at(out, 5, reset=True))
     eight = await store.store(rows(a="8", b="8"), five.ref, at(out, 8, reset=True, run=5))
@@ -342,7 +342,7 @@ async def test_a_dead_first_writes_build_is_dropped_by_the_next_write(store):
     clear was journaled: no commit names the build, nobody reads it, and the
     next write (an ordinary one: the log names no run) drops it."""
 
-    out = output()
+    out = output(incremental=True)
     first = await store.store(rows(a="1"), None, at(out, 1))
     await store.store(rows(a="dead"), first.ref, at(out, 5, reset=True))
     after = await store.store(Patch(rows(b="6")), first.ref, at(out, 6))
@@ -357,7 +357,7 @@ async def test_a_switch_publishes_only_its_partition(store):
     """Two partitions of one table mid-run: each has its own build, and a
     switch of one leaves the other's build and published rows alone."""
 
-    out = output(partition_column="site")
+    out = output(incremental=True, partition_column="site")
     p1 = await store.store(rows(a="1"), None, at(out, 1, partition="p1"))
     p2 = await store.store(rows(b="1"), None, at(out, 2, partition="p2"))
     r1 = await store.store(rows(a="5"), p1.ref, at(out, 5, reset=True, partition="p1"))
@@ -372,7 +372,7 @@ async def test_a_switch_publishes_only_its_partition(store):
 
 
 async def test_an_output_with_no_partition_column_switches_every_row(store):
-    out = output()
+    out = output(incremental=True)
     first = await store.store(rows(a="1", b="1"), None, at(out, 1))
     await store.store(rows(c="5"), first.ref, at(out, 5, reset=True))
     assert await store.full_run_ended(out, "", 5, 5)
@@ -383,7 +383,7 @@ async def test_an_empty_full_run_publishes_an_empty_partition(store):
     """A run whose first write holds nothing still opens its build, so its
     switch removes every old row."""
 
-    out = output()
+    out = output(incremental=True)
     first = await store.store(rows(a="1"), None, at(out, 1))
     await store.store([], first.ref, at(out, 5, reset=True))
     assert outside(store, out) == {"a": "1"}
@@ -398,7 +398,7 @@ async def test_a_full_run_into_a_partition_holding_no_rows_writes_in_place(store
     outsiders see it fill, its later writes go in place too, and its switch
     does nothing but say published."""
 
-    out = output()
+    out = output(incremental=True)
     one = await store.store(rows(a="1"), None, at(out, 5, reset=True))
     assert "build" not in one.ref.handle and outside(store, out) == {"a": "1"}
     assert registry(store, out) == (5, 5, []) and builds(store, out) == []
@@ -414,7 +414,7 @@ async def test_a_partition_holding_a_dead_first_runs_rows_builds_beside(store):
     the partition holding rows and builds beside: outsiders see the dead
     rows, then the new run whole. Another partition's rows do not count."""
 
-    out = output(partition_column="site")
+    out = output(incremental=True, partition_column="site")
     table, _, _ = store._table(out)
     sql(f"CREATE TABLE {table} (id text, v text, site text, _version bigint)")
     await store.store(rows(z="2"), None, at(out, 1, partition="p2", builds=False))
@@ -432,7 +432,7 @@ async def test_a_full_run_builds_beside_while_another_runs_build_is_registered(s
     run into the partition, empty as the build left it, builds beside too,
     so the older switch cannot replace rows written in place."""
 
-    out = output()
+    out = output(incremental=True)
     table, _, _ = store._table(out)
     sql(f"CREATE TABLE {table} (id text, v text, _version bigint)")
     await store.store(rows(a="old"), None, at(out, 1, builds=False))
@@ -465,7 +465,7 @@ async def test_row_security_enabled_after_a_full_run_began_refuses_its_first_wri
     statement with the catalog: the write is refused, and outsiders keep what
     they read."""
 
-    out = output()
+    out = output(incremental=True)
     table, _, _ = store._table(out)
     sql(f"CREATE TABLE {table} (id text, v text, _version bigint)")
     if held:
@@ -512,7 +512,7 @@ async def test_no_ddl_that_would_change_the_decision_runs_until_the_deciding_wri
     import psycopg
 
     partitioned = kind in ("attach", "partition of", "a partition's trigger")
-    out = output(**({"partition_column": "site"} if partitioned else {}))
+    out = output(incremental=True, **({"partition_column": "site"} if partitioned else {}))
     table, _, _ = store._table(out)
     names = {"t": table, "p": f'"public"."{out.name}_p"', "q": f'"public"."{out.name}_q"'}
     if partitioned:
@@ -586,7 +586,7 @@ async def test_a_switch_held_open_holds_off_no_other_partitions_switch_or_decidi
     its DELETE, it holds the lock the DELETE takes and no stronger one, so
     another partition's switch and another partition's deciding write go on."""
 
-    out = output(partition_column="site")
+    out = output(incremental=True, partition_column="site")
     table, _, _ = store._table(out)
     for p in ("p1", "p2", "p3"):
         await store.store(rows(a="old"), None, at(out, 1, partition=p, builds=False))
@@ -623,7 +623,7 @@ async def test_a_table_made_after_a_full_run_began_holding_its_rows_builds_besid
     the table's lock, after the table is there: a partition that now holds
     rows builds beside."""
 
-    out = output()
+    out = output(incremental=True)
     table, _, _ = store._table(out)
     after_begin(
         store,
@@ -639,7 +639,7 @@ async def test_a_table_made_after_a_full_run_began_holding_its_rows_builds_besid
 
 
 @pytest.mark.parametrize("partitioned", [False, True], ids=["whole", "partitioned"])
-@pytest.mark.parametrize("kind", ["keyed_empty", "keyed_remove"])
+@pytest.mark.parametrize("kind", ["keyed_empty", "keyed_remove", "commit_empty"])
 async def test_an_empty_first_write_racing_a_table_made_with_rows_leaves_its_run_pending(
     store, monkeypatch, kind, partitioned
 ):
@@ -649,20 +649,29 @@ async def test_an_empty_first_write_racing_a_table_made_with_rows_leaves_its_run
     nothing, so it decides nothing: the run stays pending, and its switch
     clears the old rows."""
 
-    out = output(**({"partition_column": "site"} if partitioned else {}))
+    out = output(
+        incremental=True,
+        key=None if kind == "commit_empty" else "id",
+        **({"partition_column": "site"} if partitioned else {}),
+    )
     table, _, _ = store._table(out)
     part = "p1" if partitioned else ""
     site = ", site text" if partitioned else ""
+    commits = ", _commit integer, _seq integer, PRIMARY KEY (" + ("site, " if partitioned else "")
+    commits = commits + "_commit, _seq)" if kind == "commit_empty" else ""
     values = {"id": "old", "v": "old", "_version": 1, **({"site": part} if partitioned else {})}
+    values |= {"_commit": 0, "_seq": 0} if kind == "commit_empty" else {}
     after_begin(
         store,
         monkeypatch,
-        f"CREATE TABLE {table} (id text, v text, _version bigint{site})",
+        f"CREATE TABLE {table} (id text, v text, _version bigint{site}{commits})",
         f"INSERT INTO {table} ({', '.join(values)}) VALUES ("
         + ", ".join(f"'{v}'" if isinstance(v, str) else str(v) for v in values.values())
         + ")",
     )
-    write = [] if kind == "keyed_empty" else Patch([], remove=["old"])
+    write = (
+        [] if kind == "keyed_empty" else Patch([], remove=["old"]) if kind == "keyed_remove" else Patch([])
+    )
     first = await store.store(write, None, at(out, 5, reset=True, partition=part))
     assert first.ref is None and registry(store, out, part) == (5, None, [])
     assert sql("SELECT pending FROM solera_versions WHERE rel = %s AND part = %s", (table, part)) == [([5],)]
@@ -670,21 +679,25 @@ async def test_an_empty_first_write_racing_a_table_made_with_rows_leaves_its_run
     assert sql(f"SELECT id FROM {table}") == []
 
 
-async def test_an_empty_first_write_racing_a_table_made_with_rows_and_delivered_again(store, monkeypatch):
+@pytest.mark.parametrize("kind", ["keyed", "commit"])
+async def test_an_empty_first_write_racing_a_table_made_with_rows_and_delivered_again(
+    store, monkeypatch, kind
+):
     """Astra A11 (repros/empty_race.py): as above, and the same first write
     delivered again once the table holds the old rows decides then, under
     the table's lock: the partition holds rows, so the run builds beside, and
     its switch publishes the run alone."""
 
-    out = output()
+    out = output(incremental=True, key="id" if kind == "keyed" else None)
     table, _, _ = store._table(out)
+    commits = "" if kind == "keyed" else ", _commit integer, _seq integer, PRIMARY KEY (_commit, _seq)"
     after_begin(
         store,
         monkeypatch,
-        f"CREATE TABLE {table} (id text, _version bigint)",
-        f"INSERT INTO {table} VALUES ('old', 1)",
+        f"CREATE TABLE {table} (id text, _version bigint{commits})",
+        f"INSERT INTO {table} VALUES ('old', 1{'' if kind == 'keyed' else ', 0, 0'})",
     )
-    write = []
+    write = [] if kind == "keyed" else Patch([])
     first = await store.store(write, None, at(out, 5, reset=True))
     assert first.ref is None and sql(f"SELECT id FROM {table}") == [("old",)]
     again = await store.store(write, None, at(out, 5, reset=True))
@@ -693,9 +706,9 @@ async def test_an_empty_first_write_racing_a_table_made_with_rows_and_delivered_
     assert sql(f"SELECT id FROM {table}") == [] and registry(store, out) == (5, 5, [])
 
 
-async def test_unkeyed_and_sql_writes_build_beside(store):
+async def test_unkeyed_sql_and_commit_writes_build_beside(store):
     """Every full run builds beside, whatever the output's shape: a value
-    replaced whole, a Sql query materialized."""
+    replaced whole, commits appended, a Sql query materialized."""
 
     from solera_postgres import Sql
 
@@ -705,6 +718,21 @@ async def test_unkeyed_and_sql_writes_build_beside(store):
     assert sql(f"SELECT v FROM {store._table(value)[0]}") == [("1",)]
     assert await store.full_run_ended(value, "", 5, 5)
     assert sql(f"SELECT v FROM {store._table(value)[0]}") == [("2",)]
+
+    log = output(key=None, incremental=True)
+    first = await store.store(
+        Patch([{"v": "1"}]),
+        None,
+        WriteContext(log, "", commit_number=0, attempt="a1", generation=1, worker_id="w", builds=True),
+    )
+    clear = WriteContext(
+        log, "", commit_number=1, attempt="a5", generation=5, worker_id="w", reset=True, builds=True
+    )
+    run = await store.store(Patch([{"v": "2"}]), first.ref, clear)
+    assert await store.load(run.ref, list[dict], None) == [{"v": "2"}]
+    assert sql(f"SELECT v FROM {store._table(log)[0]}") == [("1",)]
+    assert await store.full_run_ended(log, "", 5, 5)
+    assert sql(f"SELECT v, _commit FROM {store._table(log)[0]}") == [("2", 1)]
 
     keyed = output()
     first = await store.store(Sql("SELECT 'a'::text AS id, '1'::text AS v"), None, at(keyed, 1))
@@ -717,7 +745,7 @@ async def test_unkeyed_and_sql_writes_build_beside(store):
 
 
 async def test_a_cleanup_takes_the_outputs_builds(store):
-    out = output(partition_column="site")
+    out = output(incremental=True, partition_column="site")
     first = await store.store(rows(a="1"), None, at(out, 1, partition="p1"))
     await store.store(rows(a="5"), first.ref, at(out, 5, reset=True, partition="p1"))
     await store.store(rows(b="6"), None, at(out, 6, reset=True, partition="p2"))
@@ -732,7 +760,7 @@ async def test_a_cleanup_never_erases_a_newer_attempts_check(store):
     cleanup of version 5 deletes its rows but keeps the check: late attempt
     5 still cannot add `b` behind the repair's list (Sol, B8 round 1, F1)."""
 
-    out = output()
+    out = output(incremental=True)
     first = await store.store(rows(a="committed"), None, at(out, 1))
     await store.store(Patch(rows(a="dead")), first.ref, at(out, 5))
     assert [k for chunk in await store.written_at([5], first.ref, at(out, 6)) for k in chunk] == ["a"]
@@ -749,7 +777,7 @@ async def test_a_cleanup_drops_a_table_whose_build_draws_from_its_sequence(store
     the table cannot be dropped while the build stands: cleanup drops the
     builds first."""
 
-    out = output()
+    out = output(incremental=True)
     table, _, _ = store._table(out)
     sql(f"CREATE TABLE {table} (id text, v text, n bigint GENERATED ALWAYS AS IDENTITY, _version bigint)")
     first = await store.store(rows(a="1"), None, at(out, 1))
@@ -774,7 +802,7 @@ async def test_identity_serial_and_generated_columns_publish_what_solera_read(st
     generate (OVERRIDING SYSTEM VALUE): the rows published are the rows
     Solera loaded from the build."""
 
-    out = output()
+    out = output(incremental=True)
     table = user_table(
         store,
         out,
@@ -792,7 +820,7 @@ async def test_identity_serial_and_generated_columns_publish_what_solera_read(st
 
 
 async def test_a_check_constraint_fails_the_batch_that_breaks_it(store):
-    out = output()
+    out = output(incremental=True)
     user_table(store, out, "CHECK (v <> 'bad')")
     first = await store.store(rows(a="1"), None, at(out, 1))
     with pytest.raises(WriteError):
@@ -804,7 +832,7 @@ async def test_partial_unique_and_exclusion_indexes_fail_the_batch(store):
     """R9: INCLUDING INDEXES brings partial and exclusion indexes to the
     build, so it refuses what the user's table would refuse, in the batch."""
 
-    out = output()
+    out = output(incremental=True)
     sql("CREATE EXTENSION IF NOT EXISTS btree_gist")
     table = user_table(store, out, "r int4range, EXCLUDE USING gist (r WITH &&)")
     sql(f"CREATE UNIQUE INDEX ON {table} (v) WHERE v <> 'x'")
@@ -861,7 +889,7 @@ async def test_a_table_with_a_trigger_never_opens_a_build(store, kind):
     has one, is refused at its first write (`PublicationRefused`) and
     changes nothing; today's path writes in place as before."""
 
-    out = output(partition_column="site")
+    out = output(incremental=True, partition_column="site")
     table, _, _ = store._table(out)
     leaf = f'"public"."{out.name}_rest"'
     sql(f"CREATE TABLE {table} (id text, v text, site text, _version bigint) PARTITION BY LIST (site)")
@@ -886,7 +914,7 @@ async def test_a_table_with_a_trigger_never_opens_a_build(store, kind):
 
 
 async def test_a_trigger_added_during_a_full_run_refuses_its_publication(store):
-    out = output()
+    out = output(incremental=True)
     table, _, _ = store._table(out)
     first = await store.store(rows(a="old"), None, at(out, 1))
     await store.store(rows(b="new"), first.ref, at(out, 5, reset=True))
@@ -901,7 +929,7 @@ async def test_a_trigger_cannot_be_added_while_the_switch_publishes(store, monke
     the catalog, so a trigger created as it publishes waits for it to
     commit, and never fires on its rows."""
 
-    out = output()
+    out = output(incremental=True)
     table, _, _ = store._table(out)
     first = await store.store(rows(a="old"), None, at(out, 1))
     run = await store.store(rows(a="new"), first.ref, at(out, 5, reset=True))
@@ -931,7 +959,7 @@ async def test_a_build_keeps_only_its_unique_and_key_indexes(store):
 
     from solera_postgres import BUILD_SCHEMA, _build_name
 
-    out = output(indexes=[["v"]])
+    out = output(incremental=True, indexes=[["v"]])
     first = await store.store(rows(a="1"), None, at(out, 1))
     await store.store(rows(a="2"), first.ref, at(out, 5, reset=True))
     build = _build_name(store._table(out)[0], "", 5)
@@ -950,7 +978,7 @@ async def test_a_unique_index_across_partitions_refuses_the_publication(store):
     the build stays registered for the next call, and a later call
     publishes once the data changes."""
 
-    out = output(partition_column="site")
+    out = output(incremental=True, partition_column="site")
     p1 = await store.store(rows(a="1"), None, at(out, 1, partition="p1"))
     await store.store(rows(b="1"), None, at(out, 2, partition="p2"))
     sql(f"CREATE UNIQUE INDEX ON {store._table(out)[0]} (id)")
@@ -973,7 +1001,7 @@ async def test_a_write_does_not_wait_for_a_switch_of_another_partition(store):
     something (CREATE INDEX IF NOT EXISTS takes SHARE even when the index
     exists, and would queue behind the switch): it does not wait."""
 
-    out = output(partition_column="site", indexes=[["v"]])
+    out = output(incremental=True, partition_column="site", indexes=[["v"]])
     await store.store(rows(a="1"), None, at(out, 1, partition="p1"))
     p2 = await store.store(rows(b="1"), None, at(out, 2, partition="p2"))
     switch = open_switch(store, out, "p1")
@@ -991,7 +1019,7 @@ async def test_a_write_of_the_switching_partition_waits_then_writes_where_the_lo
     row, and once the switch commits it writes the published rows (the build
     is no longer registered): it never names the dropped build."""
 
-    out = output()
+    out = output(incremental=True)
     first = await store.store(rows(a="1"), None, at(out, 1))
     run = await store.store(rows(a="5"), first.ref, at(out, 5, reset=True))
     holder = open_switch(store, out, "")
@@ -1014,7 +1042,7 @@ async def test_a_build_made_while_a_writer_waited_is_found(store):
     the build: the registry is read in the row's lock, never before it
     (to_regclass before a wait does not see the build)."""
 
-    out = output()
+    out = output(incremental=True)
     first = await store.store(rows(a="1"), None, at(out, 1))
     started = threading.Event()
     real = store._register
@@ -1042,7 +1070,7 @@ async def test_a_migration_with_nothing_pending_does_not_wait_out_a_switch(store
     """R7: an attempt of an output with migrations reads the ledger with no
     lock; only a pending migration takes the write domain exclusively."""
 
-    out = output()
+    out = output(incremental=True)
     first = await store.store(rows(a="1"), None, at(out, 1))
     applied = Migration("noop", "SELECT 1")
     await store.migrate(out, [applied], at(out, 2), first.ref)
@@ -1064,7 +1092,7 @@ async def test_first_writers_with_grants_do_not_collide(store):
     from solera_postgres import PostgresStore
 
     granting = PostgresStore(DSN, grants=[role])
-    out = output(partition_column="site")
+    out = output(incremental=True, partition_column="site")
     await granting.store(rows(a="0"), None, at(out, 1, partition="p0"))
     await asyncio.gather(
         *(granting.store(rows(a=str(i)), None, at(out, 10 + i, partition=f"p{i}")) for i in range(1, 9))
@@ -1083,7 +1111,7 @@ async def test_a_load_racing_the_switchs_drop_reads_the_published_rows(store, mo
 
     from solera_postgres import BUILD_SCHEMA, _build_name, _qname
 
-    out = output()
+    out = output(incremental=True)
     first = await store.store(rows(a="1"), None, at(out, 1))
     run = await store.store(rows(a="5"), first.ref, at(out, 5, reset=True))
     assert await store.full_run_ended(out, "", 5, 5)
@@ -1103,7 +1131,7 @@ async def test_a_snapshot_from_before_the_switch_never_reads_the_old_rows_for_th
 
     from solera_postgres import BuildGone
 
-    out = output()
+    out = output(incremental=True)
     first = await store.store(rows(a="1"), None, at(out, 1))
     run = await store.store(rows(a="5"), first.ref, at(out, 5, reset=True))
     async with store.reads() as reader:
@@ -1119,7 +1147,7 @@ async def test_loads_racing_switches_always_read_the_runs_rows(store):
     each reads the build or, after the switch, the published rows (the same
     rows), and none fails."""
 
-    out = output()
+    out = output(incremental=True)
     first = await store.store(rows(**{f"k{i}": "1" for i in range(200)}), None, at(out, 1))
     run = await store.store(rows(**{f"k{i}": "5" for i in range(300)}), first.ref, at(out, 5, reset=True))
     expected = {f"k{i}": "5" for i in range(300)}
@@ -1152,7 +1180,7 @@ async def test_a_switch_never_waits_for_a_load_of_its_build(store):
 
     from solera_postgres import BUILD_SCHEMA, _build_name, _qname
 
-    out = output()
+    out = output(incremental=True)
     first = await store.store(rows(a="1"), None, at(out, 1))
     await store.store(rows(a="5"), first.ref, at(out, 5, reset=True))
     reader = store._connect()
@@ -1175,7 +1203,7 @@ async def test_a_crash_after_the_switch_leaves_its_build_to_the_next_sweep(store
     is unregistered; the next call (the engine repeats it after a restart)
     or the partition's next write drops it."""
 
-    out = output()
+    out = output(incremental=True)
     first = await store.store(rows(a="1"), None, at(out, 1))
     await store.store(rows(a="5"), first.ref, at(out, 5, reset=True))
     sweep = store._sweep
@@ -1194,7 +1222,7 @@ async def test_a_build_a_sweep_could_not_drop_is_dropped_by_a_later_write(store)
 
     from solera_postgres import BUILD_SCHEMA, _build_name, _qname
 
-    out = output()
+    out = output(incremental=True)
     first = await store.store(rows(a="1"), None, at(out, 1))
     await store.store(rows(x="dead"), first.ref, at(out, 5, reset=True))
     reader = store._connect()
@@ -1217,7 +1245,7 @@ async def test_a_key_listing_racing_the_switchs_drop_reads_the_published_keys(st
 
     from solera_postgres import BUILD_SCHEMA, _build_name, _qname
 
-    out = output()
+    out = output(incremental=True)
     first = await store.store(rows(a="1"), None, at(out, 1))
     run = await store.store(rows(b="5"), first.ref, at(out, 5, reset=True))
     assert await store.full_run_ended(out, "", 5, 5)
@@ -1238,7 +1266,7 @@ async def test_an_empty_first_write_with_no_shape_makes_no_table_and_the_runs_fi
     nothing decided: the run is pending. Its first batch with rows makes the
     table, finds the partition holding none, and writes in place."""
 
-    out = output()
+    out = output(incremental=True)
     empty = await store.store([], None, at(out, 5, reset=True))
     assert empty.ref is None and sql("SELECT to_regclass(%s)", (store._table(out)[0],)) == [(None,)]
     assert registry(store, out) == (5, None, [])
@@ -1250,10 +1278,18 @@ async def test_an_empty_first_write_with_no_shape_makes_no_table_and_the_runs_fi
 
 
 async def test_a_full_run_that_wrote_nothing_and_made_no_table_is_published(store):
-    out = output()
+    out = output(incremental=True)
     assert (await store.store([], None, at(out, 5, reset=True))).ref is None
     assert await store.full_run_ended(out, "", 5, 5) is True
     assert registry(store, out) == (5, 5, [])
+
+
+async def test_an_empty_first_commit_with_no_shape_makes_no_table(store):
+    out = output(key=None, incremental=True)
+    assert (await store.store(Patch([]), None, at(out, 5, reset=True))).ref is None
+    batch = await store.store(Patch([{"x": 1}]), None, at(out, 6, run=5))
+    assert await store.full_run_ended(out, "", 5, 6)
+    assert [r["x"] for r in await store.load(batch.ref, list[dict], None)] == [1]
 
 
 async def test_an_empty_first_write_with_declared_columns_makes_the_table_as_today(store):
@@ -1278,7 +1314,7 @@ async def test_a_pending_run_decides_at_its_first_rows_though_another_partition_
     (`_decide`), and its partition, holding none, fills in place. A pending
     run that never wrote a row publishes an empty partition."""
 
-    out = output(partition_column="site")
+    out = output(incremental=True, partition_column="site")
     assert (await store.store([], None, at(out, 5, reset=True, partition="p1"))).ref is None
     assert (await store.store([], None, at(out, 6, reset=True, partition="p3"))).ref is None
     assert sql("SELECT to_regclass(%s)", (store._table(out)[0],)) == [(None,)]
@@ -1305,7 +1341,7 @@ async def test_a_build_lost_with_its_table_fails_its_runs_writes(store):
     from solera.stores import RunLost
     from solera_postgres import BUILD_SCHEMA, _build_name, _qname
 
-    out = output()
+    out = output(incremental=True)
     table, _, _ = store._table(out)
     old = await store.store(rows(z="old"), None, at(out, 1))
     run = await store.store(rows(a="committed"), old.ref, at(out, 5, reset=True))
@@ -1316,7 +1352,7 @@ async def test_a_build_lost_with_its_table_fails_its_runs_writes(store):
     with pytest.raises(RunLost):
         await store.store(rows(a="committed"), old.ref, at(out, 5, reset=True))
     assert await store.full_run_ended(out, "", 5, 6) is False
-    other = output()
+    other = output(incremental=True)
     first = await store.store(rows(a="1"), None, at(other, 1))
     await store.store(rows(a="5"), first.ref, at(other, 5, reset=True))
     await store.migrate(
@@ -1334,7 +1370,7 @@ async def test_a_lost_run_the_log_names_stays_lost_after_a_new_run_dies(store):
 
     from solera.stores import RunLost
 
-    out = output()
+    out = output(incremental=True)
     old = await store.store(rows(z="old"), None, at(out, 1))
     committed = await store.store(rows(a="5"), old.ref, at(out, 5, reset=True))
     await store.migrate(out, [Migration("touch", "SELECT 1")], at(out, 6, run=5), committed.ref)
@@ -1353,7 +1389,7 @@ async def test_a_trigger_that_raises_added_during_a_run_refuses_its_publication(
     its DELETE takes, so a trigger that would raise refuses the publication
     rather than fail it with the trigger's error."""
 
-    out = output()
+    out = output(incremental=True)
     table, _, _ = store._table(out)
     old = await store.store(rows(z="old"), None, at(out, 1))
     await store.store(rows(a="new"), old.ref, at(out, 5, reset=True))
@@ -1373,7 +1409,7 @@ async def test_any_trigger_or_rule_refuses_a_build(store, kind):
     guess: any, on the table or any table that inherits from it, refuses a
     build. Today's path writes such a table in place, as before."""
 
-    out = output()
+    out = output(incremental=True)
     table, _, _ = store._table(out)
     other = f'"public"."{out.name}_other"'
     if kind == "a partition's statement trigger":
@@ -1404,7 +1440,7 @@ async def test_a_key_cleanup_deletes_the_keys_rows_from_the_builds_too(store):
     """Sol F3 (restarted round 1): a dead attempt's key in a build goes with
     the cleanup of that key, as it goes from the published rows."""
 
-    out = output()
+    out = output(incremental=True)
     old = await store.store(rows(z="old"), None, at(out, 1))
     run = await store.store(rows(a="5"), old.ref, at(out, 5, reset=True))
     await store.store(Patch(rows(x="6")), run.ref, at(out, 6, run=5))
@@ -1414,11 +1450,21 @@ async def test_a_key_cleanup_deletes_the_keys_rows_from_the_builds_too(store):
     assert await store.full_run_ended(out, "", 5, 7) and outside(store, out) == {"a": "5"}
 
 
+async def test_a_key_cleanup_of_an_unkeyed_commit_names_its_commit(store):
+    """Sol F6 (restarted round 1, also on main): an unkeyed incremental
+    output's key is its commit number."""
+
+    out = output(key=None, incremental=True)
+    written = await store.store(Patch([{"v": "first"}]), None, at(out, 5, builds=False))
+    await store.cleanup(out, partition="", key=0, generation=5)
+    assert await store.load(written.ref, list[dict], None) == []
+
+
 async def test_a_version_column_of_a_domain_over_bigint_is_written(store):
     """Sol F4 (restarted round 1): a column's type is its domain's base type,
     as main read it."""
 
-    out = output()
+    out = output(incremental=True)
     table, _, _ = store._table(out)
     sql(f"CREATE DOMAIN public.{out.name}_v AS bigint")
     sql(f"CREATE TABLE {table} (id text, v text, _version public.{out.name}_v)")
@@ -1438,7 +1484,7 @@ async def test_an_in_place_reset_leaves_no_row_an_inheriting_tables_trigger_kept
     A build refuses such a table; the in-place path does not check for
     survivors yet."""
 
-    out = output()
+    out = output(incremental=True)
     table, _, _ = store._table(out)
     child = f'"public"."{out.name}_child"'
     sql(f"CREATE TABLE {table} (id text, v text, _version bigint)")
@@ -1465,11 +1511,11 @@ async def test_a_table_a_build_cannot_stand_in_for_refuses_a_build(store, kind):
 
     from solera_postgres import Sql
 
-    out = output()
+    out = output(incremental=True)
     table, _, _ = store._table(out)
     base = f'"public"."{out.name}_base"'
     if kind == "a partition's own generated expression":
-        out = output(out.name, key="k", partition_column="site")
+        out = output(out.name, incremental=True, key="k", partition_column="site")
         sql(
             f"CREATE TABLE {table} (id text, site text, k text GENERATED ALWAYS AS (upper(id)) STORED, "
             "_version bigint) PARTITION BY LIST (site)"
@@ -1480,7 +1526,7 @@ async def test_a_table_a_build_cannot_stand_in_for_refuses_a_build(store, kind):
         )
         sql(f"ALTER TABLE {table} ATTACH PARTITION {base} FOR VALUES IN ('')")
     elif kind == "tableoid":
-        out = output(out.name, key="k")
+        out = output(out.name, incremental=True, key="k")
         sql(
             f"CREATE TABLE {table} (id text, k text GENERATED ALWAYS AS (id || ':' || tableoid::text) STORED, "
             "_version bigint)"
@@ -1525,7 +1571,7 @@ async def test_a_switch_reads_the_catalog_as_it_is_whatever_the_sessions_isolati
     repeatable = PostgresStore(
         DSN + "?options=" + quote(r"-c default_transaction_isolation=repeatable\ read")
     )
-    out = output()
+    out = output(incremental=True)
     table, _, _ = repeatable._table(out)
     old = await repeatable.store(rows(z="old"), None, at(out, 1))
     await repeatable.store(rows(a="new"), old.ref, at(out, 5, reset=True))
@@ -1562,7 +1608,7 @@ async def test_two_spellings_of_one_partition_share_its_version_check(store):
     '1' and '01' name the same rows but different version rows, so an
     older attempt writing '01' replaces a newer one's '1'."""
 
-    out = output(partition_column="site", columns={"id": "text", "site": "bigint"})
+    out = output(incremental=True, partition_column="site", columns={"id": "text", "site": "bigint"})
     newer = await store.store([{"id": "a"}], None, at(out, 10, partition="1", builds=False))
     with pytest.raises(StoreError):
         await store.store([{"id": "old"}], None, at(out, 5, partition="01", builds=False))
@@ -1576,7 +1622,7 @@ async def test_an_empty_arrow_patch_removes_its_keys(store):
 
     import pyarrow as pa
 
-    out = output()
+    out = output(incremental=True)
     first = await store.store(rows(a="old"), None, at(out, 1, builds=False))
     empty = pa.table({"id": pa.array([], type=pa.string()), "v": pa.array([], type=pa.string())})
     written = await store.store(Patch(empty, remove=["a"]), first.ref, at(out, 2, builds=False))
@@ -1589,7 +1635,7 @@ async def test_a_partition_cleanup_holds_off_the_partitions_first_writer(store, 
     cleanup to commit, and the cleanup never deletes what that writer
     wrote."""
 
-    out = output(partition_column="site")
+    out = output(incremental=True, partition_column="site")
     await store.store(rows(z="other"), None, at(out, 1, partition="p2"))
     entered, release = threading.Event(), threading.Event()
     builds_of = store._builds_of
@@ -1618,7 +1664,7 @@ async def test_a_remove_with_no_table_writes_nothing(store):
 
     from solera.sdk import TableRef
 
-    out = output()
+    out = output(incremental=True)
     prior = TableRef(
         output=out.name, store="", handle={"table": store._table(out)[0], "where": {}, "key": "id"}
     )
@@ -1633,7 +1679,7 @@ async def test_a_migration_that_meets_a_load_of_a_build_runs_again(store):
     import psycopg
     from solera_postgres import BUILD_SCHEMA, BuildInUse, _build_name, _qname
 
-    out = output()
+    out = output(incremental=True)
     table, _, _ = store._table(out)
     first = await store.store(rows(a="1"), None, at(out, 1))
     await store.store(rows(a="5"), first.ref, at(out, 5, reset=True))
@@ -1658,7 +1704,7 @@ async def test_a_migration_drops_the_builds_and_their_run_starts_over(store):
 
     from solera.stores import RunLost
 
-    out = output(columns={"id": "text", "v": "text", "n": "bigint"})
+    out = output(incremental=True, columns={"id": "text", "v": "text", "n": "bigint"})
     first = await store.store([{"id": "a", "v": "1", "n": 1}], None, at(out, 1))
     await store.store([{"id": "a", "v": "2", "n": 10}], first.ref, at(out, 5, reset=True))
     table, _, _ = store._table(out)
@@ -1675,7 +1721,7 @@ async def test_a_migration_drops_the_builds_and_their_run_starts_over(store):
 
 
 async def test_a_migration_can_replace_a_table_whose_build_draws_from_its_sequence(store):
-    out = output()
+    out = output(incremental=True)
     table, _, _ = store._table(out)
     sql(f"CREATE TABLE {table} (n bigint GENERATED ALWAYS AS IDENTITY, id text, v text, _version bigint)")
     first = await store.store(rows(a="1"), None, at(out, 1))
@@ -1695,7 +1741,7 @@ async def test_a_build_lost_by_a_restore_fails_its_runs_writes_and_is_not_publis
     from solera.stores import RunLost
     from solera_postgres import BUILD_SCHEMA, _build_name, _qname
 
-    out = output()
+    out = output(incremental=True)
     first = await store.store(rows(a="1"), None, at(out, 1))
     await store.store(rows(a="5"), first.ref, at(out, 5, reset=True))
     sql(f"DROP TABLE {_qname(BUILD_SCHEMA, _build_name(store._table(out)[0], '', 5))}")
@@ -1721,7 +1767,7 @@ async def test_a_load_of_a_lost_builds_commit_fails_rather_than_read_the_publish
     from solera.stores import RunLost
     from solera_postgres import BUILD_SCHEMA, _build_name, _qname
 
-    out = output()
+    out = output(incremental=True)
     first = await store.store(rows(a="1"), None, at(out, 1))
     run = await store.store(rows(b="5"), first.ref, at(out, 5, reset=True))
     build = _qname(BUILD_SCHEMA, _build_name(store._table(out)[0], "", 5))
@@ -1744,7 +1790,7 @@ async def test_a_sweep_that_fails_never_fails_the_call_that_committed(store, mon
 
     import psycopg
 
-    out = output()
+    out = output(incremental=True)
     first = await store.store(rows(a="1"), None, at(out, 1))
     await store.store(rows(a="5"), first.ref, at(out, 5, reset=True))
 
@@ -1764,7 +1810,7 @@ async def test_a_partition_cleanup_does_not_wait_for_a_switch_of_another(store):
     domain and that partition's version row, so it runs beside a switch of
     another, and holds no writer of a third."""
 
-    out = output(partition_column="site")
+    out = output(incremental=True, partition_column="site")
     refs = {p: (await store.store(rows(a=p), None, at(out, 1, partition=p))).ref for p in ("p1", "p2", "p3")}
     switch = open_switch(store, out, "p1")
     try:
@@ -1780,7 +1826,7 @@ async def test_a_build_beside_an_index_over_an_oddly_named_column(store):
     """L6: the build drops the table's plain indexes by their generated
     names, which may need quoting."""
 
-    out = output()
+    out = output(incremental=True)
     table, _, _ = store._table(out)
     sql(f'CREATE TABLE {table} (id text, v text, "Order Date" date, _version bigint)')
     sql(f'CREATE INDEX ON {table} ("Order Date")')
@@ -1800,7 +1846,7 @@ async def test_outside_readers_see_all_old_then_all_new_and_never_wait(store, is
 
     import psycopg
 
-    out = output()
+    out = output(incremental=True)
     table, _, _ = store._table(out)
     first = await store.store([{"id": f"k{i}", "v": "1"} for i in range(50_000)], None, at(out, 1))
     await store.store([{"id": f"k{i}", "v": "5"} for i in range(50_000)], first.ref, at(out, 5, reset=True))
@@ -1859,7 +1905,7 @@ async def test_two_first_builds_make_the_build_schema_once():
     try:
         dsn = re.sub(r"/[^/?]+(\?|$)", f"/{name}\\1", DSN, count=1)
         store = PostgresStore(dsn)
-        outs = [output() for _ in range(4)]
+        outs = [output(incremental=True) for _ in range(4)]
         for o in outs:  # a partition holding rows: its full run builds beside
             await store.store(rows(z="0"), None, at(o, 1, builds=False))
         await asyncio.gather(*(store.store(rows(a="1"), None, at(o, 5, reset=True)) for o in outs))
@@ -1914,7 +1960,7 @@ async def test_the_version_check_is_one_statement_in_the_writes_first_round_trip
     with the write domain's lock and the catalog lookup, so it adds no round
     trip to the write."""
 
-    out = output()
+    out = output(incremental=True)
     first = await store.store(rows(a="1", b="1"), None, at(out, 1))
     ref = (await store.store(Patch(rows(a="2")), first.ref, at(out, 2))).ref
     traces = round_trips(store, monkeypatch)
@@ -2051,4 +2097,4 @@ def _random_history(store, out, seed: int, steps: int, bare: bool = False) -> No
 @pytest.mark.parametrize("seed", range(int(os.environ.get("SOLERA_RANDOM_HISTORIES", "12"))))
 @pytest.mark.parametrize("bare", [False, True], ids=["table", "bare"])
 def test_a_random_history_matches_the_model(store, seed, bare):
-    _random_history(store, output(partition_column="site"), seed, steps=40, bare=bare)
+    _random_history(store, output(incremental=True, partition_column="site"), seed, steps=40, bare=bare)

@@ -2,7 +2,7 @@
 //!
 //! A keyed edge holds **pieces**, key ranges with one value that never
 //! overlap and cover the key space, and **points**, single keys whose value
-//! overrides their piece. An unkeyed edge holds "consumed through commit c".
+//! overrides their piece. A log's edge holds "consumed through commit c".
 //! Progress changes only by a batch commit ([`BatchProgress`]) or a reset
 //! ([`Reset`]); nothing relabels it (no fold).
 
@@ -879,8 +879,32 @@ impl Keyed {
 #[derive(Clone, Debug, PartialEq)]
 pub enum Progress {
     Keyed(Keyed),
+    Log(Log),
+}
+
+/// What a consumer holds of a log ([`crate::log`]): its commits in order,
+/// up to one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Log {
     /// Consumed through this commit of the input (0: nothing).
-    Unkeyed(u64),
+    pub through: u64,
+    /// Its walk from the log's start has not reached the head it planned
+    /// at: the consumer holds only part of the log. Set when the edge opens
+    /// or starts over, cleared by the first batch that reaches the head.
+    pub walking: bool,
+}
+
+impl Log {
+    pub const EMPTY: Log = Log {
+        through: 0,
+        walking: true,
+    };
+
+    /// Whether the log started over past what the consumer read of it: it
+    /// holds rows the log no longer does, and starts over too.
+    pub fn restarted(&self, layers: &[solera_index::LayerRef]) -> bool {
+        self.through > 0 && self.through < crate::log::cleared(layers)
+    }
 }
 
 impl Progress {
@@ -888,14 +912,21 @@ impl Progress {
         if keyed {
             Progress::Keyed(Keyed::default())
         } else {
-            Progress::Unkeyed(0)
+            Progress::Log(Log::EMPTY)
         }
     }
 
     pub fn keyed(&self) -> Option<&Keyed> {
         match self {
             Progress::Keyed(k) => Some(k),
-            Progress::Unkeyed(_) => None,
+            Progress::Log(_) => None,
+        }
+    }
+
+    pub fn log(&self) -> Option<&Log> {
+        match self {
+            Progress::Keyed(_) => None,
+            Progress::Log(l) => Some(l),
         }
     }
 
@@ -905,9 +936,10 @@ impl Progress {
                 e.u8(0);
                 k.encode(e);
             }
-            Progress::Unkeyed(c) => {
+            Progress::Log(l) => {
                 e.u8(1);
-                e.uv(*c);
+                e.uv(l.through);
+                e.u8(l.walking as u8);
             }
         }
     }
@@ -915,7 +947,10 @@ impl Progress {
     pub fn decode(d: &mut Dec<'_>) -> Result<Progress> {
         match d.u8()? {
             0 => Ok(Progress::Keyed(Keyed::decode(d)?)),
-            1 => Ok(Progress::Unkeyed(d.uv()?)),
+            1 => Ok(Progress::Log(Log {
+                through: d.uv()?,
+                walking: bool_of(d)?,
+            })),
             t => format(format!("progress tag {t}")),
         }
     }
@@ -947,7 +982,7 @@ fn keyed_mut<'a>(t: &'a mut Tracking, id: &[u8]) -> &'a mut Keyed {
     let e = t.edges.get_mut(id).expect("checked");
     match Arc::make_mut(&mut e.progress) {
         Progress::Keyed(k) => k,
-        Progress::Unkeyed(_) => unreachable!("checked"),
+        Progress::Log(_) => unreachable!("checked"),
     }
 }
 
@@ -1067,7 +1102,7 @@ impl EdgeRename {
         }
         readable(&self.input)?;
         let holds = match e.progress.as_ref() {
-            Progress::Unkeyed(through) => *through > 0,
+            Progress::Log(l) => l.through > 0,
             Progress::Keyed(k) => k.commits().next().is_some() || !k.points.is_empty(),
         };
         let failing = t
@@ -1126,55 +1161,71 @@ impl Reset {
         e.progress = Arc::new(match (keyed, self.held) {
             (true, true) => Progress::Keyed(Keyed::of(Value::Held)),
             (true, false) => Progress::Keyed(Keyed::of(Value::Empty)),
-            (false, _) => Progress::Unkeyed(0),
+            (false, _) => Progress::Log(Log::EMPTY),
         });
     }
 }
 
-/// An unkeyed edge consumed its input through `through`.
+/// A batch consumed a log through `through`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Consumed {
     pub edge: Id,
     /// The input's life the plan read: refused in any other.
     pub life: u64,
+    /// The input's head the plan read: refused if the log started over
+    /// after it, since the batch read rows the log no longer holds.
+    pub head: u64,
     pub through: u64,
     /// What the plan read: refused unless the edge is still consumed
     /// through it, so a stale commit cannot move progress back.
     pub expect: u64,
+    /// Whether the walk from the log's start goes on after this batch.
+    pub walking: bool,
 }
 
 impl Consumed {
     pub fn encode(&self, e: &mut Enc) {
         e.bytes(&self.edge);
         e.uv(self.life);
+        e.uv(self.head);
         e.uv(self.through);
         e.uv(self.expect);
+        e.u8(self.walking as u8);
     }
 
     pub fn decode(d: &mut Dec<'_>) -> Result<Consumed> {
         Ok(Consumed {
             edge: d.bytes()?.into(),
             life: d.uv()?,
+            head: d.uv()?,
             through: d.uv()?,
             expect: d.uv()?,
+            walking: bool_of(d)?,
         })
     }
 
     pub(crate) fn check(&self, t: &Tracking) -> Result<()> {
         let e = edge(t, &self.edge)?;
         t.in_life(&e.input, self.life, "the batch was planned")?;
-        match e.progress.as_ref() {
-            Progress::Unkeyed(t) if *t == self.expect => Ok(()),
-            Progress::Unkeyed(_) => {
-                invalid("the edge's progress moved since the batch was planned")
-            }
-            Progress::Keyed(_) => invalid("a keyed edge consumes by batch"),
+        let Progress::Log(l) = e.progress.as_ref() else {
+            return invalid("a keyed edge consumes by batch");
+        };
+        if l.through != self.expect {
+            return invalid("the edge's progress moved since the batch was planned");
         }
+        let layers = t.outputs.get(&e.input).map_or(&[][..], |o| &o.layers);
+        if crate::log::cleared(layers) > self.head {
+            return Err(Error::Unsettled);
+        }
+        Ok(())
     }
 
     pub(crate) fn apply(self, t: &mut Tracking) {
         let e = t.edges.get_mut(&self.edge).expect("checked");
-        e.progress = Arc::new(Progress::Unkeyed(self.through));
+        e.progress = Arc::new(Progress::Log(Log {
+            through: self.through,
+            walking: self.walking,
+        }));
     }
 }
 

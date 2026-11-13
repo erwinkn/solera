@@ -9,7 +9,8 @@ from types import SimpleNamespace
 import pytest
 from solera.sdk import Incremental, Output, Project, Ref, RegistrationError, Retry, asset
 from solera.stores import Changed, FileStore, Keys, Patch, StoreError, WriteContext
-from solera.testing.stores import Ledger, now, write
+from solera.testing.stores import Ledger, context, now, write
+from solera.testing.stores import rows as stored_rows
 
 from tests.contract.harness import rebuild
 
@@ -83,8 +84,8 @@ async def test_sto_6_writes_mean_the_same_on_every_store(solera, store):
 async def test_sto_6_the_same_attempt_writing_again_is_one_write(store):
     """A retried call: the same attempt — one generation, one worker — gives
     the store the same write twice, as the worker does
-    (`solera.testing.stores`). A replacement and a patch each land once:
-    the same ref, their rows once."""
+    (`solera.testing.stores`). A replacement, a patch and an incremental
+    output's commit each land once: the same ref, their rows once."""
 
     store, decl = store
     h = SimpleNamespace(store=store)
@@ -97,6 +98,15 @@ async def test_sto_6_the_same_attempt_writing_again_is_one_write(store):
     second = await write(h, out, patch, 2, ledger, first, remove=["a"], patch=True)
     assert await write(h, out, patch, 2, ledger, first, remove=["a"], patch=True) == second
     assert await now(h, second, ledger) == [("b", "2"), ("c", "1")]
+
+    if store.writes == "immutable":
+        return  # a store of files holds no log: the engine keeps an incremental output's commits
+    out = Output(f"t_{uuid.uuid4().hex[:12]}", incremental=True, store="s", **decl)
+    commit = [{"id": "a", "v": "1"}]
+    first = await store.store(Patch(commit), None, context(out, 1, commit_number=3))
+    again = await store.store(Patch(commit), None, context(out, 1, commit_number=3))
+    assert again.ref == first.ref
+    assert await stored_rows(h, again.ref, None) == [("a", "1")]
 
 
 async def test_sto_6_a_key_given_no_rows_does_not_exist(solera):

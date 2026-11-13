@@ -16,12 +16,22 @@ A keyed output's write is stored as its store takes it, every key at the
 attempt's generation, and the keys it changed go back to the engine, which
 builds the commit (D207): in the result when small, else in one file beside
 the attempt's control file (N13).
+
+A log's rows are the core's to keep, in the output's layers of the change
+index. A write is one commit: its rows, encoded a part at a time, written as
+the layer the engine named, which goes back in the result for the engine to
+install. A read is the rows of a range of commits, or of all of them. On a
+store that writes in place (a table), the store keeps the rows, each stamped
+with its commit, and the layer says only that the commit is.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
+import pickle
 import tempfile
+import time
 from base64 import b64decode, b64encode
 from collections.abc import Mapping
 
@@ -29,7 +39,7 @@ import obstore
 from solera import lifecycle
 from solera._native import PlannedKeys
 from solera.change_index import shared
-from solera.stores import KeyedWrite, WriteError, prepare_for
+from solera.stores import KeyedWrite, Patch, StoreError, WriteError, encode, frames, prepare_for
 
 CHANGES_INLINE = 64 << 10  # changed keys' bytes a result carries; past it, a file (N13)
 CHANGES_CHUNK = 64 << 10  # keys encoded at a time
@@ -158,3 +168,105 @@ def _encode(o, f) -> int:
     for part in o.prepared.rows.changes(() if o.replace else o.prepared.removes, word, CHANGES_CHUNK):
         f.write(part)
     return f.tell()
+
+
+# -- logs ----------------------------------------------------------------------------
+
+PART_BYTES = 1 << 20  # about what a part of a log's commit holds, encoded
+PART_MAX = 32 << 20  # past this a part is split: the index holds an entry in one block
+FORMATS = {"json": b"j", "pkl": b"p", "kept": b"s"}  # a part's first byte
+
+
+def log_rows(o) -> list:
+    """What a write appends to a log: a `Patch` of rows, removing none."""
+
+    name, write = o.output.name, o.value
+    if not isinstance(write, Patch):
+        raise WriteError(f"{name}: an unkeyed incremental output only accepts Patch writes")
+    if write.remove:
+        raise WriteError(f"{name}: remove is not allowed on an unkeyed incremental output")
+    rows = write.rows if isinstance(write.rows, list) else frames.rows_of(write.rows, name)
+    return rows
+
+
+def log_parts(rows: list) -> list[bytes]:
+    """A commit's rows as its parts: consecutive rows, about `PART_BYTES`
+    encoded each, as JSON when it round-trips exactly, pickle otherwise
+    (`encode`). Rows are sized from the first of them; a part that comes out
+    far larger is split."""
+
+    if not rows:
+        return []
+    sample = rows[:64]
+    each = max(1, len(encode(sample)[0]) // len(sample))
+    step, out = max(1, PART_BYTES // each), []
+
+    def put(chunk: list) -> None:
+        data, fmt = encode(chunk)
+        if len(data) > PART_MAX and len(chunk) > 1:
+            put(chunk[: len(chunk) // 2])
+            put(chunk[len(chunk) // 2 :])
+        else:
+            out.append(FORMATS[fmt] + data)
+
+    for start in range(0, len(rows), step):
+        put(rows[start : start + step])
+    return out
+
+
+def _part_rows(part: bytes) -> list:
+    body = memoryview(part)[1:]
+    if part[:1] == FORMATS["json"]:
+        return json.loads(bytes(body))
+    if part[:1] == FORMATS["pkl"]:
+        return pickle.loads(body)
+    raise StoreError("this log's rows are its store's to read, not the engine's")
+
+
+def log_kept(rows: list) -> list[bytes]:
+    """The one part of a commit whose rows a store keeps (a store that
+    writes in place, each row stamped with its commit): how many they are.
+    The core holds the commit all the same, so a reader's place, a start
+    over and staleness are one mechanism for every log."""
+
+    return [FORMATS["kept"] + str(len(rows)).encode()]
+
+
+async def log_write(spec: dict, o, parts, rows: list) -> dict:
+    """Write a log's commit, the layer the engine named for this attempt
+    (`info["log"]`), and return it: its rows as `parts` makes them. A commit
+    that starts the log over (`clear`) is written even with no row."""
+
+    planned = o.info["log"]
+    # As the engine names a commit's producer: JSON, keys sorted.
+    producer = json.dumps(
+        {"attempt": spec["attempt"], "run": spec["run"]["id"]}, sort_keys=True, separators=(",", ":")
+    ).encode()
+    parts = await asyncio.to_thread(parts, rows)
+    return await asyncio.to_thread(
+        shared(planned["url"]).log_write,
+        planned["path"],
+        int(planned["commit"]),
+        parts,
+        time_ms=int(time.time() * 1000),
+        producer=producer,
+        live_before=int(planned["live"]),
+        clear=bool(planned["clear"]),
+    )
+
+
+async def log_read(pin: dict | None, lo: int = 0, hi: int | None = None) -> list:
+    """The rows of a log's commits `lo + 1..=hi` (to its head by default),
+    in the order they were appended: none before its first commit."""
+
+    if pin is None:
+        return []
+    index, head, after, rows = shared(pin["url"]), int(pin["head"]), None, []
+    while True:
+        parts, after = await asyncio.to_thread(
+            index.log_read, pin["layers"], head, lo, head if hi is None else hi, after=after
+        )
+        for _, part in parts:
+            rows += _part_rows(part)
+        if after is None:
+            return rows

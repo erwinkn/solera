@@ -34,6 +34,13 @@ use solera_tracking::record::Record;
 use solera_tracking::retain::Retire;
 use solera_tracking::Tracking;
 
+fn log_request(edge: &str) -> plan::LogRequest {
+    plan::LogRequest {
+        edge: key(edge),
+        limit: 10,
+    }
+}
+
 fn key(s: &str) -> Key {
     s.as_bytes().into()
 }
@@ -388,7 +395,7 @@ fn held_plan_request() -> Request {
             conditions: Arc::default(),
             own: Some(key("own")),
         }],
-        unkeyed: vec![],
+        logs: vec![],
     }
 }
 
@@ -1033,7 +1040,7 @@ async fn batch(
                 own: (i == 0).then(|| own.name.clone()),
             })
             .collect(),
-        unkeyed: vec![],
+        logs: vec![],
     };
     let view = t.view(&req).unwrap();
     let p = plan::plan(&view, &req, &OneIndex(ix), &hold).await.unwrap();
@@ -1531,7 +1538,7 @@ async fn check(ix: &ChangeIndex, t: &Tracking, inputs: &[Input], own: &Log, univ
                 conditions: inp.now.clone(),
                 own: (i == 0).then(|| own.name.clone()),
             }],
-            unkeyed: vec![],
+            logs: vec![],
         };
         let view = t.view(&req).unwrap();
         let brute = brute_owed(inp, false, false, None, universe, &SetHold(BTreeSet::new()));
@@ -1568,7 +1575,7 @@ async fn check(ix: &ChangeIndex, t: &Tracking, inputs: &[Input], own: &Log, univ
 }
 
 #[test]
-fn unkeyed_edges_consume_through_the_head_they_planned_at() {
+fn a_log_s_edge_consumes_through_the_head_it_planned_at() {
     let rt = runtime();
     let ix = index(&rt);
     rt.block_on(async {
@@ -1590,12 +1597,12 @@ fn unkeyed_edges_consume_through_the_head_they_planned_at() {
             after: None,
             limit: 10,
             inputs: vec![],
-            unkeyed: vec![key("report/totals")],
+            logs: vec![log_request("report/totals")],
         };
         let p = plan::plan(&t.view(&req).unwrap(), &req, &OneIndex(&ix), &plan::NoHold)
             .await
             .unwrap();
-        assert!(p.unkeyed[0].owed());
+        assert!(p.logs[0].owed());
         log.commit(&ix, &mut t, [(key("v"), Ver::Int(2))].into())
             .await;
         let ops = t.progress_ops(&p, &[], b"", None).unwrap();
@@ -1604,7 +1611,7 @@ fn unkeyed_edges_consume_through_the_head_they_planned_at() {
             .await
             .unwrap();
         assert_eq!(
-            (p.unkeyed[0].through, p.unkeyed[0].head),
+            (p.logs[0].through, p.logs[0].head),
             (1, 2),
             "the commit after the plan stays owed"
         );
@@ -1642,7 +1649,7 @@ fn a_commit_over_progress_that_moved_is_refused() {
                 conditions: Arc::new(Conditions::default()),
                 own: None,
             }],
-            unkeyed: vec![],
+            logs: vec![],
         };
         let p1 = plan::plan(&t.view(&req).unwrap(), &req, &OneIndex(&ix), &plan::NoHold)
             .await
@@ -1698,7 +1705,7 @@ fn the_worked_example_tally() {
                     conditions: cond.clone(),
                     own: None,
                 }],
-                unkeyed: vec![],
+                logs: vec![],
             };
             let view = t.view(&req).unwrap();
             (req, view)
@@ -1842,7 +1849,7 @@ fn a_key_held_back_at_commit_is_recorded_apart_from_one_the_planner_held_back() 
                 conditions: Arc::new(Conditions::default()),
                 own: None,
             }],
-            unkeyed: vec![],
+            logs: vec![],
         };
         let hold = SetHold([key("k2")].into());
         let p = plan::plan(&t.view(&req).unwrap(), &req, &OneIndex(&ix), &hold)
@@ -2029,13 +2036,13 @@ fn r7_record_output_reset_drops_an_active_readers_input() {
     rt.block_on(r7_load_then_remove_input(&ix, 2, true));
 }
 
-/// An unkeyed plan names its input's life too, so a plan made before the
+/// A log's plan names its input's life too, so a plan made before the
 /// input was retired and started again does not commit, and the new input
 /// stays owed (Astra, R7-A2: the consumed counter alone cannot tell lives
 /// apart, since a reopened edge restarts it at 0 and the output's commits
 /// restart at 1).
 #[test]
-fn r7_preexisting_unkeyed_plan_crosses_input_restart() {
+fn r7_preexisting_log_plan_crosses_input_restart() {
     let rt = runtime();
     let ix = index(&rt);
     rt.block_on(async {
@@ -2055,14 +2062,14 @@ fn r7_preexisting_unkeyed_plan_crosses_input_restart() {
         apply(&mut t, vec![open.clone()]);
         let req = Request {
             inputs: vec![],
-            unkeyed: vec![key("u")],
+            logs: vec![log_request("u")],
             ..held_plan_request()
         };
         let p = plan::plan(&t.view(&req).unwrap(), &req, &OneIndex(&ix), &plan::NoHold)
             .await
             .unwrap();
         assert_eq!(
-            (p.unkeyed[0].head, p.unkeyed[0].life, p.unkeyed[0].through),
+            (p.logs[0].head, p.logs[0].life, p.logs[0].through),
             (2, t.life(b"items"), 0)
         );
         apply(&mut t, vec![Part::EdgeClose(EdgeClose { edge: key("u") })]);
@@ -2084,7 +2091,7 @@ fn r7_preexisting_unkeyed_plan_crosses_input_restart() {
         let now = plan::plan(&t.view(&req).unwrap(), &req, &OneIndex(&ix), &plan::NoHold)
             .await
             .unwrap();
-        assert!(now.unkeyed[0].owed(), "{:?}", now.unkeyed);
+        assert!(now.logs[0].owed(), "{:?}", now.logs);
     });
 }
 

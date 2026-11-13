@@ -18,7 +18,7 @@ use solera_index as ix;
 use solera_tracking as tr;
 use tr::codec::Ver;
 use tr::event::{Event, Part};
-use tr::plan::{InputRequest, Mode, Plan, Request};
+use tr::plan::{InputRequest, LogRequest, Mode, Plan, Request};
 use tr::progress::{Class, Conditions, Key, Matcher, Pat, Patterns};
 
 use crate::index_py::{key, layers_in, rt, version, ChangeIndex, Owned};
@@ -231,10 +231,17 @@ fn request(d: &Bound<'_, PyDict>) -> PyResult<Request> {
             inputs.push(input(&i?)?);
         }
     }
-    let mut unkeyed = vec![];
-    if let Some(us) = item(d, "unkeyed")? {
-        for u in us.try_iter()? {
-            unkeyed.push(u?.extract::<Vec<u8>>()?.into());
+    let mut logs = vec![];
+    if let Some(ls) = item(d, "logs")? {
+        for l in ls.try_iter()? {
+            let l = l?;
+            let l = l
+                .cast::<PyDict>()
+                .map_err(|_| PyTypeError::new_err("a log is a dict: edge, limit"))?;
+            logs.push(LogRequest {
+                edge: need(l, "edge", "a log")?.extract::<Vec<u8>>()?.into(),
+                limit: need(l, "limit", "a log")?.extract()?,
+            });
         }
     }
     Ok(Request {
@@ -246,7 +253,7 @@ fn request(d: &Bound<'_, PyDict>) -> PyResult<Request> {
         after: item(d, "after")?.map(|k| key_in(&k)).transpose()?,
         limit: need(d, "limit", "a plan")?.extract()?,
         inputs,
-        unkeyed,
+        logs,
     })
 }
 
@@ -388,15 +395,16 @@ impl Tracking {
             .collect()
     }
 
-    /// The edges with an empty piece: a walk from empty has not reached the end.
+    /// The edges whose walk from empty has not reached the end: a keyed one
+    /// with an empty piece, a log's that is still walking.
     fn walking<'py>(&self, py: Python<'py>) -> Vec<Bound<'py, PyBytes>> {
         let state = self.state.read().unwrap();
-        let empty = |e: &tr::state::Edge| {
-            e.progress.keyed().is_some_and(|k| {
-                k.pieces(&tr::progress::KeyRange::all())
-                    .iter()
-                    .any(|p| p.value == tr::progress::Value::Empty)
-            })
+        let empty = |e: &tr::state::Edge| match e.progress.as_ref() {
+            tr::progress::Progress::Keyed(k) => k
+                .pieces(&tr::progress::KeyRange::all())
+                .iter()
+                .any(|p| p.value == tr::progress::Value::Empty),
+            tr::progress::Progress::Log(l) => l.walking,
         };
         state
             .edges
@@ -444,18 +452,33 @@ impl Tracking {
     /// One edge as the state holds it, or None when it has none: `input`, the
     /// output it reads; `life`, which changes each time it opens or starts
     /// over; `empty`, the key its first empty piece starts after ("": from
-    /// the first key), None once a walk has reached the end.
+    /// the first key), None once a walk has reached the end. A log's edge
+    /// has `log` instead of `empty`: `through`, the commit it consumed
+    /// through; `walking`, whether its walk from the log's start goes on;
+    /// `restarted`, whether the log started over past what it read.
     fn edge<'py>(&self, py: Python<'py>, edge: &[u8]) -> PyResult<Option<Bound<'py, PyDict>>> {
-        let (e, life) = {
+        let (e, life, restarted) = {
             let state = self.state.read().unwrap();
             let Some(e) = state.edges.get(edge).cloned() else {
                 return Ok(None);
             };
-            (e, state.per_key.get(edge).map_or(0, |k| k.life))
+            let restarted = e.progress.log().is_some_and(|l| {
+                let input = state.outputs.get(&e.input);
+                l.restarted(input.map_or(&[][..], |o| &o.layers))
+            });
+            (e, state.per_key.get(edge).map_or(0, |k| k.life), restarted)
         };
         let d = PyDict::new(py);
         d.set_item("input", PyBytes::new(py, &e.input))?;
         d.set_item("life", life)?;
+        if let Some(l) = e.progress.log() {
+            let log = PyDict::new(py);
+            log.set_item("through", l.through)?;
+            log.set_item("walking", l.walking)?;
+            log.set_item("restarted", restarted)?;
+            d.set_item("log", log)?;
+            return Ok(Some(d));
+        }
         let empty = e.progress.keyed().and_then(|k| {
             let pieces = k.pieces(&tr::progress::KeyRange::all());
             let first = pieces
@@ -470,6 +493,34 @@ impl Tracking {
         });
         d.set_item("empty", empty)?;
         Ok(Some(d))
+    }
+
+    /// The event that installs on the log `output` the layer its writer
+    /// wrote (`ChangeIndex.log_write`), with what it leaves: `(event,
+    /// {"commit", "live"})`. Refused unless the layer is the commit after
+    /// the head.
+    #[pyo3(signature = (output, layer, ends_full_run=false))]
+    fn log_commit<'py>(
+        &self,
+        py: Python<'py>,
+        output: &[u8],
+        layer: &Bound<'py, PyDict>,
+        ends_full_run: bool,
+    ) -> PyResult<Bound<'py, PyTuple>> {
+        guard(|| {
+            let layer = crate::index_py::layer_in(layer)?;
+            let commit = self
+                .state
+                .read()
+                .unwrap()
+                .log_commit(output, layer, ends_full_run)
+                .map_err(err)?;
+            let d = PyDict::new(py);
+            d.set_item("commit", commit.layer.hi)?;
+            d.set_item("live", commit.live)?;
+            let event = one_event(Part::OutputCommit(commit));
+            (PyBytes::new(py, &event), d).into_pyobject(py)
+        })
     }
 
     /// One output as the state holds it: `{"life", "head", "live", "layers"}`,
@@ -584,8 +635,10 @@ impl Tracking {
     }
 
     /// Plans one batch. Returns the plan's bytes (they go into the attempt's
-    /// spec untouched) and a summary: its range, and per input its head and
-    /// its keys by class.
+    /// spec untouched) and a summary: its range, per keyed input its head and
+    /// its keys by class, and per log its head and the commits the batch
+    /// reads, `from + 1..=to`. Refused with `UnsettledError` when a log
+    /// started over past what its edge read and the request is no reset.
     fn plan<'py>(
         &self,
         py: Python<'py>,
@@ -618,16 +671,16 @@ impl Tracking {
                 inputs.append(i)?;
             }
             d.set_item("inputs", inputs)?;
-            let unkeyed = PyList::empty(py);
-            for u in &plan.unkeyed {
+            let logs = PyList::empty(py);
+            for l in &plan.logs {
                 let i = PyDict::new(py);
-                i.set_item("edge", PyBytes::new(py, &u.edge))?;
-                i.set_item("head", u.head)?;
-                i.set_item("through", u.through)?;
-                i.set_item("owed", u.owed())?;
-                unkeyed.append(i)?;
+                i.set_item("edge", PyBytes::new(py, &l.edge))?;
+                i.set_item("head", l.head)?;
+                i.set_item("from", l.from)?;
+                i.set_item("to", l.to)?;
+                logs.append(i)?;
             }
-            d.set_item("unkeyed", unkeyed)?;
+            d.set_item("logs", logs)?;
             Ok(d)
         })
     }
@@ -1026,7 +1079,7 @@ fn one_input(
             conditions: self::conditions(conditions)?,
             own: own.map(Into::into),
         }],
-        unkeyed: vec![],
+        logs: vec![],
     })
 }
 

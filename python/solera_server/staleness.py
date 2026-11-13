@@ -159,7 +159,7 @@ class Staleness:
             pages = [
                 await core_stale.owed_keys(self.core, asset, partition, i, planner, inputs, after, limit)
                 for i in inputs
-                if i.kind == "incremental"
+                if i.kind == "incremental" and not self._log(i)
             ]
             if pages and None not in pages:
                 # No further than the shortest page that goes on: a key past it may be another's.

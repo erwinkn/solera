@@ -118,14 +118,27 @@ class Keys:
 
 
 @dataclass(frozen=True)
+class Commits:
+    """An inclusive `[lo, hi]` range of commits passed to `store.load` on a
+    log the store keeps (§2.2): an unkeyed incremental output, on a store
+    that writes in place."""
+
+    lo: int
+    hi: int
+
+
+@dataclass(frozen=True)
 class WriteContext:
     """A write partition (§9): `attempt` is the writing attempt's id. `reset`
     says the write starts the content over (a full run): `prior` still says
     where the content is, but nothing of it is kept. What a keyed write
-    changes is the write's own (`KeyedWrite`)."""
+    changes is the write's own (`KeyedWrite`). `commit_number` is the commit
+    a write to a log is: the engine gives it, and a write stamps its rows
+    with it."""
 
     output: Output
     partition: str
+    commit_number: int | None = None
     attempt: str | None = None
     reset: bool = False
     # The attempt's generation and worker, for a `fenced` store to check
@@ -230,8 +243,8 @@ class Store(Protocol):
     def can_load(self, t: type | None, selection: type | None) -> bool: ...
     def can_store(self, t: type | None, output: Output) -> bool: ...
     async def store(self, write: Any, prior: Ref | None, context: WriteContext) -> Written: ...
-    async def load(self, ref: Ref, t: type, selection: Keys | None) -> Any: ...
-    async def read(self, ref: Ref, t: type, selection: Keys | None) -> Read: ...
+    async def load(self, ref: Ref, t: type, selection: Keys | Commits | None) -> Any: ...
+    async def read(self, ref: Ref, t: type, selection: Keys | Commits | None) -> Read: ...
 
     async def cleanup(
         self, output: Output, *, partition=None, key=None, generation=None, before=None
@@ -280,8 +293,9 @@ def takes(t: Any, output: Output, *, frames: bool = False, values: bool = True) 
     forms the framework defines, once, for a store's `can_store` (which
     registration asks). A `keyed=True` output takes a dict of values; a
     keyed rows output rows — a list of mappings — or rows by key, a dict of
-    lists of them; a dynamic partitions its elements, a list or a set; any
-    other output a value, anything — unless not `values`, for a store of rows only.
+    lists of them; a dynamic partitions its elements, a list or a set; a
+    log a batch of rows, a list; any other output a value, anything —
+    unless not `values`, for a store of rows only.
     `frames`: a DataFrame or an Arrow table wherever rows go. Unannotated
     (`t` None) is anything: what a write holds is checked when it is read."""
 
@@ -298,6 +312,8 @@ def takes(t: Any, output: Output, *, frames: bool = False, values: bool = True) 
         return listed or origin in (set, frozenset)
     if output.key is not None:
         return rows or by_key
+    if output.incremental:
+        return rows
     return values or rows
 
 

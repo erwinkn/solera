@@ -913,7 +913,19 @@ async def test_a_batch_says_where_it_sits_in_its_pass(state):
         rebuilt["keys"] += [r["id"] for r in files]
         return [{"n": len(files)}]
 
-    project = Project(assets=[files, consumer])
+    @asset(outputs=Output("log", incremental=True))
+    def log(ctx):
+        return Patch([{"n": int(ctx.cursor or 0)}])
+
+    batch_pages = []
+
+    @asset(inputs={"log": Incremental(batch_size=1)})
+    def tail(ctx, log: list):
+        ch = ctx.batch["log"]
+        batch_pages.append((ch.index, ch.count, ch.first, ch.final, list(ch.upstream.commits), ch.reset))
+        return [{"n": len(log)}]
+
+    project = Project(assets=[files, consumer, log, tail])
     engine = make_engine(state, project)
     await engine.initialize()
     await drive(engine, await engine.submit(["consumer"], upstream=True))
@@ -926,6 +938,18 @@ async def test_a_batch_says_where_it_sits_in_its_pass(state):
     written["keys"] = ["k0", "k2", "k4", "k6"]
     await drive(engine, await engine.submit(["consumer"], upstream=True))
     assert pages == [(0, 3, True, False, False), (1, 2, False, True, False)]  # exact once final
+    for _ in range(3):
+        await drive(engine, await engine.submit(["log"]))
+    await drive(engine, await engine.submit(["tail"]))
+    assert batch_pages == [
+        (0, 3, True, False, [0], False),
+        (1, 3, False, False, [1], False),
+        (2, 3, False, True, [2], False),
+    ]
+    batch_pages.clear()
+    await drive(engine, await engine.submit(["log"]))
+    await drive(engine, await engine.submit(["tail"]))
+    assert batch_pages == [(0, 1, True, True, [3], False)]  # then a delta
 
 
 async def test_the_batch_plan_is_an_estimate_but_final_is_not(state):

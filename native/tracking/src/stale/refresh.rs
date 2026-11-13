@@ -92,7 +92,7 @@ impl Ask {
             after,
             limit: 1,
             inputs: vec![self.req.clone()],
-            unkeyed: vec![],
+            logs: vec![],
         }
     }
 
@@ -267,7 +267,7 @@ impl Tracking {
             after: None,
             limit: 1,
             inputs: vec![req.clone()],
-            unkeyed: vec![],
+            logs: vec![],
         })?;
         let (layers, head) = self
             .outputs

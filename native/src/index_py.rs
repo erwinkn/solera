@@ -114,7 +114,7 @@ fn field<'py, T: for<'a> FromPyObject<'a, 'py>>(d: &Bound<'py, PyDict>, name: &s
     }
 }
 
-fn layer_in(d: &Bound<'_, PyDict>) -> PyResult<LayerRef> {
+pub(crate) fn layer_in(d: &Bound<'_, PyDict>) -> PyResult<LayerRef> {
     Ok(LayerRef {
         path: field(d, "path")?,
         size: field(d, "size")?,
@@ -314,6 +314,74 @@ impl ChangeIndex {
                 .detach(|| rt().block_on(self.ix.write_commit(path, nc, &run)))
                 .map_err(err)?;
             layer_out(py, &l)
+        })
+    }
+
+    /// Write commit `commit` of a log at `path`: its rows, encoded by the
+    /// caller a few to a part, each part one entry in order (`native/tracking`,
+    /// `log`). Returns the layer. `clear`: the commit starts the log over.
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (path, commit, parts, *, time_ms=0, producer=Vec::new(), live_before=0, clear=false))]
+    fn log_write<'py>(
+        &self,
+        py: Python<'py>,
+        path: &str,
+        commit: u64,
+        parts: Vec<pyo3::pybacked::PyBackedBytes>,
+        time_ms: u64,
+        producer: Vec<u8>,
+        live_before: u64,
+        clear: bool,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        guard(|| {
+            let nc = ix::NewCommit {
+                commit,
+                time_ms,
+                producer: &producer,
+                live_before,
+                clear,
+            };
+            let l = py
+                .detach(|| rt().block_on(solera_tracking::log::write(&self.ix, path, nc, &parts)))
+                .map_err(crate::tracking_py::err)?;
+            layer_out(py, &l)
+        })
+    }
+
+    /// The parts of a log's commits `lo + 1..=hi` present at `head`, in the
+    /// order they were appended, a page at a time: `(parts, next)`, each
+    /// part as `(commit, bytes)`, `next` what to pass as `after` for the
+    /// following page (None at the end).
+    #[pyo3(signature = (layers, head, lo, hi, *, after=None, limit=64))]
+    fn log_read<'py>(
+        &self,
+        py: Python<'py>,
+        layers: &Bound<'py, PyAny>,
+        head: u64,
+        lo: u64,
+        hi: u64,
+        after: Option<Vec<u8>>,
+        limit: u64,
+    ) -> PyResult<Bound<'py, PyTuple>> {
+        guard(|| {
+            let ls = layers_in(layers)?;
+            let (parts, next) = py
+                .detach(|| {
+                    rt().block_on(solera_tracking::log::read(
+                        &self.ix,
+                        &ls,
+                        head,
+                        (lo, hi),
+                        after,
+                        limit,
+                    ))
+                })
+                .map_err(crate::tracking_py::err)?;
+            let out = PyList::empty(py);
+            for (commit, part) in &parts {
+                out.append((commit, PyBytes::new(py, part)))?;
+            }
+            (out, next.map(|k| PyBytes::new(py, &k))).into_pyobject(py)
         })
     }
 

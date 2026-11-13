@@ -1,7 +1,7 @@
 """What a partition was made under and whether its content is complete: the
 context a batch is processed under (the versions of its whole and dep
 inputs), why a batch starts its partition over, and completeness (D176),
-derived from its keyed inputs' edges and never stored."""
+derived from its incremental inputs' edges and never stored."""
 
 from __future__ import annotations
 
@@ -53,6 +53,10 @@ class Observing:
             edge = self.m.edge(*key)
             if edge is None or not edge["read"]:
                 return None  # never read, or a deploy closed its edge since
+            if (log := edge.get("log")) is not None:
+                if log["walking"]:
+                    return None  # its walk from the log's start goes on
+                continue
             if (empty := edge["empty"]) is not None:
                 up = self.m.core_output(input.output, input.partition) or {}
                 patterns = json.dumps(input.spec.get("patterns"), sort_keys=True)

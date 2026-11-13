@@ -128,6 +128,10 @@ pub(crate) fn edge_holds(t: &Tracking, id: &Id, e: &Edge) -> Vec<(u64, Holder)> 
     if let Some(k) = e.progress.keyed().filter(|_| on(PIECES)) {
         held.extend(k.commits().map(|c| (c, Holder::Piece(id.clone()))));
     }
+    // A log's reader holds its place: a clear above it tells it to start over.
+    if let Some(l) = e.progress.log().filter(|l| on(PIECES) && l.through > 0) {
+        held.push((l.through, Holder::Piece(id.clone())));
+    }
     let failing = || {
         t.outputs
             .get(&output_id(FAILURES, id))

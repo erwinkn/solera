@@ -1,12 +1,13 @@
-"""Staleness on the new tracking core (build plan B5): whether a keyed
-incremental input owes a partition anything, answered on demand by a plan of
-one key from the start of its edge (SOLE-14's stale index replaces it, B7).
+"""Staleness on the new tracking core (build plan B5): whether an
+incremental input owes a partition anything. A keyed one is answered on
+demand by a plan of one key from the start of its edge (SOLE-14's stale index
+replaces it, B7); a log's by its head and what the edge consumed.
 The plan reads the edge's progress and the upstream's layers as an attempt's
 would, records nothing, and runs as a heavy call."""
 
 from __future__ import annotations
 
-from ..model import edge_id, output_id
+from ..model import edge_id, is_log, output_id
 from . import Core, Generation, Redeployed
 from .prepare import conditions
 
@@ -22,8 +23,11 @@ async def owes(core: Core, asset: str, partition: str, input, planner, inputs) -
     if found is None:
         return False
     edge = edge_id(asset, partition, input.param)
-    if not (m.edge(asset, partition, input.param) or {}).get("read"):
+    held = m.edge(asset, partition, input.param) or {}
+    if not held.get("read"):
         return found["live"] > 0
+    if is_log(m.manifest["outputs"].get(input.output)):  # the commits after the last it read
+        return "log" not in held or found["head"] > held["log"]["through"]
     core.attach(upstream)
     request = {
         "mode": "incremental",

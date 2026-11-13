@@ -1189,7 +1189,7 @@ fn staleness_flows_down_the_graph() {
     );
     assert!(matches!(
         *t.edges[b"tally/checks".as_slice()].progress,
-        Progress::Unkeyed(0)
+        Progress::Log(l) if l.through == 0
     ));
 }
 

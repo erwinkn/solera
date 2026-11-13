@@ -334,10 +334,10 @@ class Model:
 
     def key_count(self, output: str, partition: str) -> int | None:
         """A keyed output's live keys, as its index counts them (None: unkeyed)."""
-        found = self.core_output(output, partition)
+        keyed = (((self.manifest or {}).get("outputs") or {}).get(output) or {}).get("key") is not None
+        found = self.core_output(output, partition) if keyed else None
         if found is not None:
             return found["live"]
-        keyed = (((self.manifest or {}).get("outputs") or {}).get(output) or {}).get("key") is not None
         return 0 if keyed and (output, partition) in self.heads else None  # committed, never a key
 
     def heads_of(self, output: str) -> list[tuple[str, dict]]:
@@ -1465,6 +1465,8 @@ class Model:
         found = self.core.edge(edge_id(asset, partition, param))
         if found is None:
             return None
+        if (log := found.get("log")) is not None:  # a log always has a commit to read
+            return {**found, "read": log["through"] > 0}
         committed = (self.partition(asset, partition).get("edges") or {}).get(param)
         return {**found, "read": committed == found["life"]}
 
@@ -1550,11 +1552,21 @@ def edge_id(asset: str, partition: str, param: str) -> bytes:
     return orjson.dumps([asset, partition, param])
 
 
-def axis(output: dict) -> str:
-    """An output's commit axis (D205's partial spans): a keyed output's core
-    life, a single value's ref generations."""
+def is_log(output: dict | None) -> bool:
+    """Whether an output's declaration is a log's: incremental, with no key.
+    Each write appends a commit of rows, and the core keeps them."""
 
-    return "keyed" if output.get("key") is not None else "value"
+    return bool(output) and bool(output.get("incremental")) and output.get("key") is None
+
+
+def axis(output: dict) -> str:
+    """An output's commit axis (D205's partial spans): a keyed output's or a
+    log's core life, a single value's ref generations. An output that moves
+    from one to another starts over."""
+
+    if output.get("key") is not None:
+        return "keyed"
+    return "log" if is_log(output) else "value"
 
 
 def declaration(manifest: dict, asset: str) -> dict:

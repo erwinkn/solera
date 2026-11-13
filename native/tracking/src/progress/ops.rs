@@ -52,8 +52,8 @@ impl Tracking {
     /// batch's range at the head it planned at, under the conditions it was
     /// planned under, and a point for exactly the keys whose holding differs
     /// from what that piece says (failed, held back, loaded at another
-    /// version); a key list writes points only. Per unkeyed input, consumed
-    /// through the head it planned at.
+    /// version); a key list writes points only. Per log, consumed through
+    /// the batch's last commit.
     pub fn progress_ops(
         &self,
         plan: &Plan,
@@ -302,12 +302,14 @@ impl Tracking {
                 fence: kept_unsure && !unsettled,
             }));
         }
-        for u in &plan.unkeyed {
+        for l in &plan.logs {
             let c = Consumed {
-                edge: u.edge.clone(),
-                life: u.life,
-                through: u.head,
-                expect: u.through,
+                edge: l.edge.clone(),
+                life: l.life,
+                head: l.head,
+                through: l.to,
+                expect: l.through,
+                walking: l.walking,
             };
             c.check(self)?;
             parts.push(Part::Consumed(c));

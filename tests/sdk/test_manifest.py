@@ -137,9 +137,8 @@ def test_incremental_rejects_ref_annotation():
         Project(assets=[up, down])
 
 
-def test_incremental_requires_a_keyed_upstream():
-    """§2.1, §11: an Incremental input reads the keys its upstream changed;
-    an unkeyed upstream, a single value, has none."""
+def test_incremental_requires_incremental_upstream():
+    """§11: an Incremental input's upstream output must be incremental."""
 
     @asset
     def up():
@@ -149,7 +148,7 @@ def test_incremental_requires_a_keyed_upstream():
     def down(up: list):
         return up
 
-    with pytest.raises(RegistrationError, match="up has none: give it a key="):
+    with pytest.raises(RegistrationError, match="not incremental"):
         Project(assets=[up, down])
 
 
@@ -172,16 +171,13 @@ def test_incremental_requires_selection_capable_store():
         Project(assets=[up, down], stores={"nosel": NoSelection()})
 
 
-def test_output_mode_and_incremental_are_removed():
-    """§2.1: a keyed output is incremental and an unkeyed one a single
-    value; neither mode= nor incremental= chooses."""
+def test_output_mode_is_removed():
+    """§2/§11: Output(mode=) is gone; incremental= replaces it."""
 
     with pytest.raises(RegistrationError, match="mode="):
         Output("x", key="id", mode="append")
-    with pytest.raises(RegistrationError, match="incremental="):
-        Output("x", incremental=True)
-    with pytest.raises(RegistrationError, match="incremental="):
-        Output("x", key="id", incremental=True)
+    with pytest.raises(RegistrationError, match="key= implies"):
+        Output("x", key="id", incremental=False)
 
 
 def test_store_must_accept_output_type():

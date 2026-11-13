@@ -16,6 +16,9 @@ import httpx
 import pytest
 from solera.sdk import Loaded, Project, Ref
 from solera.stores import FileStore, Keys, Patch
+from solera_server.model import is_log
+from solera_server.tracking import output_pin
+from solera_worker.batch import log_read
 
 NOT_YET = "on the new tracking core yet"  # what the engine refuses until a later unit builds it
 _CLI = threading.Lock()  # held while a `Solera.cli` call's entry point runs
@@ -237,11 +240,14 @@ class Solera:
     async def read(self, output: str, partition: str = "", typ=None):
         """An output's content at its head, read through its store as a
         downstream user would: a keyed one as its rows at the versions its
-        keys list. None before its first commit."""
+        keys list, a log as the rows of every commit it holds, which the
+        engine keeps. None before its first commit."""
 
         head = await self.head(output, partition)
         if head is None:
             return None
+        if is_log(self.project.manifest["outputs"][output]):
+            return await log_read(output_pin(self.engine.core, output, partition))
         ref, store = Ref.from_json(head["ref"]), self.project.stores[head["ref"]["store"]]
         if self.project.manifest["outputs"][output]["key"] is None:
             return await store.load(ref, typ or object, None)

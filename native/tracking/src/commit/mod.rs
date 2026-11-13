@@ -109,6 +109,38 @@ impl OutputCommit {
     }
 }
 
+impl Tracking {
+    /// The commit that installs on a log the layer its writer wrote for it
+    /// ([`crate::log::write`]): one commit, the head's next, that clears or
+    /// not as the layer says.
+    pub fn log_commit(
+        &self,
+        output: &[u8],
+        layer: LayerRef,
+        ends_full_run: bool,
+    ) -> Result<OutputCommit> {
+        let Some(o) = self.outputs.get(output) else {
+            return invalid(format!(
+                "{} has no life: declare it first",
+                String::from_utf8_lossy(output)
+            ));
+        };
+        if layer.clears.iter().any(|c| *c != layer.lo) {
+            return invalid("a commit's layer clears at its own commit only");
+        }
+        let before = if layer.clears.is_empty() { o.live } else { 0 };
+        let commit = OutputCommit {
+            output: output.into(),
+            life: o.life,
+            live: before + layer.keys,
+            layer,
+            ends_full_run,
+        };
+        commit.check(self)?;
+        Ok(commit)
+    }
+}
+
 /// A full run ends with no commit of its own: its last batch changed
 /// nothing.
 #[derive(Clone, Debug, PartialEq)]

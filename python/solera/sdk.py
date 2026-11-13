@@ -140,8 +140,14 @@ class TableRef(Ref):
     def where(self) -> dict:
         return self.handle.get("where") or {}
 
+    @property
+    def commit_number(self) -> int | None:
+        return self.handle.get("commit_number")
+
     def where_sql(self) -> str:
         clauses = [f"{_ident(k)} = {_literal(v)}" for k, v in sorted(self.where.items())]
+        if self.commit_number is not None:
+            clauses.append(f"_commit <= {int(self.commit_number)}")
         return " AND ".join(clauses) or "TRUE"
 
     def sql(self) -> str:
@@ -207,7 +213,10 @@ class Migration:
 class Output:
     """A named slot on a store (§2). A keyed output (`key=` or `keyed=True`)
     is incremental: a consumer reads the keys it changed. An unkeyed output
-    is a single value, replaced whole by every write and read whole (§2.1).
+    is a single value, replaced whole by every write and read whole, unless
+    it is declared `incremental=True`: then it is a log, each write (a
+    `Patch` of rows) appends a commit, and a consumer reads the commits
+    after the last it read (§2.1).
 
     `keyed=True` makes the value a `dict[str, Any]`, one entry per key;
     `key="id"` makes it rows, keyed by their `id` column. `cleanup_after`
@@ -222,6 +231,7 @@ class Output:
         name: str | None = None,
         store: str | None = None,
         key: str | None = None,
+        incremental: bool | None = None,
         migrations: tuple | list = (),
         keyed: bool = False,
         cleanup_after: dt.timedelta | None = None,
@@ -231,19 +241,22 @@ class Output:
             not isinstance(cleanup_after, dt.timedelta) or cleanup_after < dt.timedelta(0)
         ):
             raise RegistrationError(f"Output {name or '?'}: cleanup_after= is a timedelta of zero or more")
-        for removed in ("mode", "incremental"):
-            if removed in config:
-                raise RegistrationError(
-                    f"Output {name or '?'}: {removed}= was removed; a keyed output (key= or keyed=True) "
-                    "is incremental, an unkeyed one a single value (§2.1)"
-                )
+        if "mode" in config:
+            raise RegistrationError(
+                f"Output {name or '?'}: mode= was removed; declare incremental= instead (§2.1)"
+            )
         if keyed:
             if key is not None:
                 raise RegistrationError(
                     f"Output {name or '?'}: keyed=True takes a dict[str, Any]; key= is for rows"
                 )
             key = KEYS
-        self.name, self.store, self.key = name, store, key
+        if incremental is None:
+            incremental = key is not None
+        elif not incremental and key is not None:
+            raise RegistrationError(f"Output {name or '?'}: key= implies incremental=True (§2.1)")
+        self.name, self.store = name, store
+        self.key, self.incremental = key, bool(incremental)
         self.config = config
         self.migrations = tuple(migrations)
         self.cleanup_after = cleanup_after
@@ -254,7 +267,7 @@ class Output:
             "name": name,
             "store": self.store or DEFAULT_STORE,
             "key": self.key,
-            "incremental": self.key is not None,
+            "incremental": self.incremental,
             "migrations": [m.name for m in self.migrations],
             "config": self.config,
             "dynamic_partitions": self.is_dynamic_partitions,
@@ -268,7 +281,7 @@ class DynamicPartitions(Output):
     is_dynamic_partitions = True
 
     def __init__(self, name: str | None = None, store: str | None = None, **config: Any):
-        super().__init__(name, store, key="<partitions>", **config)
+        super().__init__(name, store, key="<partitions>", incremental=True, **config)
 
 
 class Source:
@@ -421,10 +434,12 @@ class In:
 
 
 class Incremental(In):
-    """An incremental input: the keys of a keyed upstream changed since its
-    last pass, as positions planned them (§5, §6). `include` and `exclude`
-    select the keys it takes by name (`solera.patterns`, docs/per-key-processing.md
-    §11).
+    """An incremental input: what its upstream changed since its last pass
+    (§5, §6). Of a keyed upstream, the keys that changed; `include` and
+    `exclude` select the keys it takes by name (`solera.patterns`,
+    docs/per-key-processing.md §11). Of a log (`Output(incremental=True)`
+    with no key), the rows of the commits after the last it read;
+    `batch_size` counts commits.
 
     `each=True` makes it per-key incremental (docs/per-key-processing.md
     §5): the asset is written for one key, the parameter receives one key's
@@ -477,9 +492,11 @@ class Incremental(In):
 
 @dataclass(frozen=True)
 class Upstream:
-    """Facts about the upstream a batch came from (§5.1): its `output`."""
+    """Facts about the upstream a batch came from (§5.1): its `output`, and,
+    for a log, the range of its `commits` the batch covers."""
 
     output: str | None = None
+    commits: range | None = None
 
 
 _NEW: Any = object()  # a `Batch` field not given, or not yet read from the worker's columns
@@ -491,7 +508,7 @@ class Batch:
     they sit in their run:
 
     - `rows`: the delivered rows (the object the parameter received);
-    - `added`, `updated` and `removed`: each key's change
+    - `added`, `updated` and `removed` (keyed upstreams): each key's change
       against what this partition last processed of it, under the input's
       patterns now. `added`: not held, present now; `updated`: held, at
       another version; `removed`: held, absent or no longer taken now.
@@ -1484,7 +1501,7 @@ class Project:
                     "source": False,
                     "store": output.store or DEFAULT_STORE,
                     "key": output.key,
-                    "incremental": output.key is not None,
+                    "incremental": output.incremental,
                     "migrations": [m.name for m in output.migrations],
                     "config": output.config,
                     "dynamic_partitions": output.is_dynamic_partitions,
@@ -1610,10 +1627,19 @@ class Project:
                         raise RegistrationError(
                             f"{name}: Incremental input {param!r} cannot have upstream-only dimensions (§7)"
                         )
-                    if upstream["key"] is None:
+                    if not upstream["incremental"]:
                         raise RegistrationError(
-                            f"{name}: Incremental input {param!r} reads the keys {output_name} changed, "
-                            f"and {output_name} has none: give it a key= (§2.1)"
+                            f"{name}: Incremental input {param!r} upstream {output_name} "
+                            "is not incremental (declare key= or incremental=True) (§2.1)"
+                        )
+                    log = upstream["key"] is None
+                    if log and input.patterns is not None:
+                        raise RegistrationError(
+                            f"{name}: include=/exclude= on {param!r} select keys; {output_name} has none"
+                        )
+                    if log and input.each:
+                        raise RegistrationError(
+                            f"{name}: per-key input {param!r} (each=True) needs a keyed upstream"
                         )
                     if input.each:
                         self._check_each(name, asset, info, param)
@@ -1623,10 +1649,15 @@ class Project:
                         )
                     if annotation is None:
                         raise RegistrationError(f"{name}: store-bound input {param!r} is unannotated (§11)")
-                    from .stores import Keys
+                    from .stores import Commits, Keys
 
                     loaded = dict[str, annotation] if input.each else annotation
-                    if not store.can_load(loaded, Keys):
+                    if log:  # the engine keeps a log's rows, unless its store writes in place
+                        if store.writes != "immutable" and not store.can_load(loaded, Commits):
+                            raise RegistrationError(
+                                f"{name}: store {upstream['store']} cannot load {annotation} under Commits"
+                            )
+                    elif not store.can_load(loaded, Keys):
                         raise RegistrationError(
                             f"{name}: store {upstream['store']} cannot load {annotation} under Keys"
                         )

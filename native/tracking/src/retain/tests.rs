@@ -1233,8 +1233,8 @@ fn cleanup_refuses_a_replaced_version_that_is_not_a_generation() {
 }
 
 /// An edge moves to another output only holding nothing of the one it
-/// reads (a reset leaves it so): no commit (a piece, or an unkeyed edge's
-/// consumed counter), no point and no failure. What it held names commits of
+/// reads (a reset leaves it so): no commit (a piece, or what a log's edge
+/// consumed), no point and no failure. What it held names commits of
 /// the output it read, which another output's commits do not continue.
 #[test]
 fn an_edge_moves_to_another_output_only_holding_nothing_of_the_one_it_reads() {
@@ -1299,14 +1299,16 @@ fn an_edge_moves_to_another_output_only_holding_nothing_of_the_one_it_reads() {
     let part = batch(&m, &points, None, vec![(b"k".as_slice().into(), point)]);
     m.apply(part).unwrap();
     refused(&m, rename(&points, &items()));
-    // an unkeyed edge's consumed counter
+    // what a log's edge consumed
     let unkeyed: Id = b"unkeyed".as_slice().into();
     open(&mut m, &unkeyed, false);
     m.apply(Part::Consumed(Consumed {
         edge: unkeyed.clone(),
         life: m.t.life(&other),
+        head: 1,
         through: 1,
         expect: 0,
+        walking: false,
     }))
     .unwrap();
     refused(&m, rename(&unkeyed, &items()));
