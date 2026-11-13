@@ -1498,6 +1498,10 @@ class Model:
         for entry_id in e.get("retired") or ():  # a stuck cleanup task's output life (K25)
             self.retired.pop(entry_id, None)
 
+    def _on_FilesCleanedUp(self, e):
+        gone = set(e["paths"])
+        self.garbage = [g for g in self.garbage if g[0] not in gone]
+
     def _on_SourceCommitted(self, e):
         before = self.heads.get((e["source"], ""))
         head = e["head"]
