@@ -25,7 +25,7 @@ pub enum Status {
     /// What is known no longer holds: refresh it.
     Unknown,
     Fresh,
-    /// Something is due. `key` is the witness (None on an unkeyed edge).
+    /// Something is due. `key` is the witness (None on a log's edge).
     Stale {
         key: Option<Key>,
         reason: Reason,
@@ -41,8 +41,8 @@ impl Tracking {
             return crate::error::invalid(format!("no edge {}", String::from_utf8_lossy(edge)));
         };
         let head = self.outputs.get(&e.input).map_or(0, |o| o.head);
-        if let Progress::Unkeyed(through) = *e.progress {
-            return Ok(if head > through {
+        if let Progress::Log(l) = *e.progress {
+            return Ok(if head > l.through {
                 Status::Stale {
                     key: None,
                     reason: Reason::InputChanged,

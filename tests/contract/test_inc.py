@@ -388,7 +388,8 @@ async def test_inc_9_a_key_removed_during_a_run_before_its_batch_is_delivered_on
 
 def _paged(root, content: dict, pages: list, include=None) -> Project:
     """`files` (keyed: `content["v"]`, its rows or a Patch) -> `consumer`, which
-    records every field of each batch it gets."""
+    records every field of each batch it gets; `log` (unkeyed, appending) ->
+    `tail`, which does the same."""
 
     @asset(outputs=Output("files", key="id"))
     def files():
@@ -404,19 +405,31 @@ def _paged(root, content: dict, pages: list, include=None) -> Project:
                 "classes": (sorted(b.added), sorted(b.updated), sorted(b.removed), sorted(b.unchanged)),
                 "rows": sorted(r["id"] for r in files),
                 "rows_are_the_parameter": b.rows is files,
-                "upstream": b.upstream.output,
+                "upstream": (b.upstream.output, b.upstream.commits),
             }
         )
         return {"n": len(files)}
 
-    return Project(assets=[files, consumer], default_store=FileStore(root / "data"))
+    @asset(outputs=Output("log", incremental=True))
+    def log(ctx):
+        return Patch([{"n": 1}])
+
+    @asset(inputs={"log": Incremental(batch_size=1)}, outputs=Output("tail"))
+    def tail(ctx, log: list):
+        b = ctx.batch["log"]
+        pages.append(
+            {"at": (b.index, b.first, b.final, b.reset), "upstream": (b.upstream.output, b.upstream.commits)}
+        )
+        return {"n": len(log)}
+
+    return Project(assets=[files, consumer, log, tail], default_store=FileStore(root / "data"))
 
 
 async def test_inc_10_a_batch_says_where_it_sits_in_its_run(solera):
     """Seven keys in batches of three: `index` 0, 1, 2, `first` on batch 0,
     `final` only on the last, `reset` on none; `count` is an estimate, so
     only its type is checked. A delta of four keys: two batches, `final`
-    on the second."""
+    on the second. An unkeyed upstream's batches say their commits."""
 
     pages, content = [], {"v": [{"id": f"k{i}", "v": 1} for i in range(7)]}
     await solera.deploy(_paged(solera.root, content, pages))
@@ -428,13 +441,28 @@ async def test_inc_10_a_batch_says_where_it_sits_in_its_run(solera):
     ]
     assert all(isinstance(p["count"], int) and p["count"] >= 1 for p in pages)
     assert [p["rows"] for p in pages] == [["k0", "k1", "k2"], ["k3", "k4", "k5"], ["k6"]]
-    assert all(p["upstream"] == "files" for p in pages)
+    assert all(p["upstream"] == ("files", None) for p in pages)
 
     pages.clear()
     content["v"] = Patch([{"id": k, "v": 2} for k in ("k0", "k2", "k4", "k6")])
     await solera.run("consumer", upstream=True)
     assert [p["at"] for p in pages] == [(0, True, False, False), (1, False, True, False)]
     assert [p["rows"] for p in pages] == [["k0", "k2", "k4"], ["k6"]]
+
+    pages.clear()
+    for _ in range(3):
+        await solera.run("log")
+    await solera.run("tail")
+    assert [p["at"] for p in pages] == [
+        (0, True, False, False),
+        (1, False, False, False),
+        (2, False, True, False),
+    ]
+    assert [p["upstream"] for p in pages] == [
+        ("log", range(0, 1)),
+        ("log", range(1, 2)),
+        ("log", range(2, 3)),
+    ]
 
 
 async def test_inc_10_final_is_on_the_last_real_batch_whatever_the_plan(solera):
@@ -505,6 +533,45 @@ async def test_inc_12_a_task_walks_what_it_owes_in_key_order_batch_size_keys_a_c
 def test_inc_12_the_default_batch_size_is_ten_thousand_keys():
     assert Incremental().batch_size == 10_000
     assert Incremental(each=True).batch_size == 10_000
+
+
+# -- INC-13 ---------------------------------------------------------------------------
+
+
+async def test_inc_13_an_unkeyed_upstream_delivers_the_commits_after_the_last_read(solera):
+    """`events` (unkeyed, appending) commits 0–9; `digest` read through 6:
+    its next batch gets commits 7–9. `events` run `full` starts over, and
+    `digest` starts over with it rather than receiving the reset as a delta."""
+
+    seen = []
+
+    @asset(outputs=Output("events", incremental=True))
+    def events(ctx):
+        return Patch([{"n": 1}])
+
+    @asset(inputs={"events": Incremental()}, outputs=Output("digest"))
+    async def digest(ctx, events: list):
+        b = ctx.batch["events"]
+        seen.append((b.reset, list(b.upstream.commits), len(events)))
+        before = 0 if b.reset else (await ctx.load() or {"rows": 0})["rows"]
+        return {"rows": before + len(events)}
+
+    await solera.deploy(Project(assets=[events, digest], default_store=FileStore(solera.root / "data")))
+    for _ in range(7):
+        await solera.run("events")
+    await solera.run("digest")
+    assert seen == [(False, list(range(7)), 7)]
+    for _ in range(3):
+        await solera.run("events")
+    await solera.run("digest")
+    assert seen[-1] == (False, [7, 8, 9], 3)
+    assert (await solera.read("digest"))["rows"] == 10
+    await solera.run("events", mode="full")
+    assert await solera.stale("digest") != []
+    await solera.run("digest")
+    reset, _, rows = seen[-1]
+    assert reset and rows == 1, seen
+    assert (await solera.read("digest"))["rows"] == 1 == len(await solera.read("events"))
 
 
 # -- INC-14 ---------------------------------------------------------------------------
@@ -694,3 +761,49 @@ async def test_inc_15_an_upstream_full_run_never_makes_a_keyed_reader_remove_and
         assert not batch.reset and batch.classes == (["k5"], ["k1", "k2", "k4"], ["k3"])
         assert (await solera.head("copy"))["commit_number"] == number + 2
         assert await solera.rows("archive") == {"k1": "1", "k2": "1", "k4": "1", "k5": "1"}
+
+
+@pytest.mark.postgres
+async def test_inc_13_a_log_in_a_table_delivers_its_commits_the_same_way(solera):
+    """INC-13 on a store that writes in place: `events` keeps its rows in a
+    table, each stamped with its commit, and `digest` reads the commits after
+    the last it read, then starts over when `events` does."""
+
+    import os
+    import uuid
+
+    if not os.environ.get("SOLERA_TEST_DATABASE_URL"):
+        pytest.skip("SOLERA_TEST_DATABASE_URL is not set")
+    from solera_postgres import PostgresStore
+
+    seen, n = [], [0]
+    decl = {"schema": f"contract_{uuid.uuid4().hex[:10]}", "columns": {"n": "integer"}}
+
+    @asset(outputs=Output("events", incremental=True, store="pg", **decl))
+    def events(ctx):
+        n[0] += 1
+        return Patch([{"n": n[0]}])
+
+    @asset(inputs={"events": Incremental(batch_size=2)}, outputs=Output("digest"))
+    def digest(ctx, events: list[dict]):
+        b = ctx.batch["events"]
+        seen.append((b.reset, list(b.upstream.commits), [e["n"] for e in events]))
+        return {"rows": len(events)}
+
+    project = Project(
+        assets=[events, digest],
+        stores={"pg": PostgresStore("env:SOLERA_TEST_DATABASE_URL")},
+        default_store=FileStore(solera.root / "data"),
+    )
+    await solera.deploy(project)
+    for _ in range(3):
+        await solera.run("events")
+    await solera.run("digest")
+    assert seen == [(False, [0, 1], [1, 2]), (False, [2], [3])]
+    await solera.run("events")
+    await solera.run("digest")
+    assert seen[-1] == (False, [3], [4])
+    await solera.run("events", mode="full")
+    assert await solera.stale("digest") != []
+    await solera.run("digest")
+    assert seen[-1] == (True, [4], [5])

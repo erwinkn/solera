@@ -81,7 +81,7 @@
           },
           "dynamic_partitions": false,
           "incremental": true,
-          "key": "event_id",
+          "key": null,
           "migrations": [],
           "name": "change_events",
           "store": "postgres"
@@ -1016,7 +1016,7 @@
     "id": "snapshot",
     "source": "explicit"
   },
-  "deploy": "92f12771f2d7af61ff2a108abc3d2aff5445f3015e8ee311a501206b5dde6eaf",
+  "deploy": "42d43f28a2e153971cb2a68ccc61cdaaaa0fdec0b7082c35773b2f63236fbbab",
   "errors": [],
   "executors": {
     "ingest": {
@@ -1046,7 +1046,7 @@
       },
       "dynamic_partitions": false,
       "incremental": true,
-      "key": "event_id",
+      "key": null,
       "migrations": [],
       "name": "change_events",
       "source": false,

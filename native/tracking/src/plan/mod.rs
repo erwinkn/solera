@@ -22,17 +22,17 @@ use solera_index::{ChangeIndex, LayerRef, Pattern, Query, Run, Version};
 use xxhash_rust::xxh3::xxh3_64;
 
 use crate::codec::{Dec, Enc, Ver};
-use crate::error::{format, invalid, Result};
+use crate::error::{format, invalid, Error, Result};
 use crate::outcomes::commit::records;
 use crate::outcomes::{output_id, record_digest, Conds, FAILURES};
 use crate::progress::{
-    owed, read_digest, Class, CondTable, Conditions, Holding, Key, KeyRange, Keyed, Point,
+    owed, read_digest, Class, CondTable, Conditions, Holding, Key, KeyRange, Keyed, Log, Point,
     Progress, Value,
 };
-use crate::state::{Id, Output, Tracking};
+use crate::state::{Edge, Id, Output, Tracking};
 
 pub const PLANNER_VERSION: u64 = 1;
-pub const PLAN_FORMAT: u8 = 5;
+pub const PLAN_FORMAT: u8 = 6;
 const POINT_CHUNK: usize = 1024;
 /// Owed keys whose records are read in one lookup, where the edge has any.
 const RECORD_CHUNK: usize = 1024;
@@ -116,8 +116,16 @@ pub struct Request {
     /// The batch size: distinct keys over every keyed input.
     pub limit: usize,
     pub inputs: Vec<InputRequest>,
-    /// Unkeyed incremental inputs.
-    pub unkeyed: Vec<Id>,
+    /// The logs it reads.
+    pub logs: Vec<LogRequest>,
+}
+
+/// One log a batch reads.
+#[derive(Clone, Debug)]
+pub struct LogRequest {
+    pub edge: Id,
+    /// The batch size: commits of the log.
+    pub limit: u64,
 }
 
 /// One key of a batch.
@@ -211,19 +219,58 @@ pub fn digest(keys: &[Cand]) -> u64 {
     xxh3_64(&e.buf)
 }
 
+/// What a batch reads of one log: its commits `from + 1..=to`.
 #[derive(Clone, Debug, PartialEq)]
-pub struct UnkeyedPlan {
+pub struct LogPlan {
     pub edge: Id,
     pub output: Id,
     pub head: u64,
     /// The input's life at plan, never 0: the commit refuses another.
     pub life: u64,
+    /// What the edge had consumed through at plan.
     pub through: u64,
+    pub from: u64,
+    pub to: u64,
+    /// Whether the walk from the log's start goes on after this batch.
+    pub walking: bool,
 }
 
-impl UnkeyedPlan {
+impl LogPlan {
+    /// Whether the batch reads a commit.
     pub fn owed(&self) -> bool {
-        self.head > self.through
+        self.to > self.from
+    }
+
+    /// Whether more commits follow the batch.
+    pub fn more(&self) -> bool {
+        self.head > self.to
+    }
+
+    /// The batch of `limit` commits after what `held` consumed, on a log
+    /// with these layers. A batch that starts over (`reset`) reads from the
+    /// log's start; so does one whose edge consumed nothing. A log that
+    /// started over past what the edge read is refused: its consumer starts
+    /// over, which is the caller's to ask for.
+    fn of(req: &LogRequest, e: &Edge, o: &Output, held: Log, reset: bool) -> Result<LogPlan> {
+        if req.limit == 0 {
+            return invalid("a batch takes at least one commit of a log");
+        }
+        if !reset && held.restarted(&o.layers) {
+            return Err(Error::Unsettled);
+        }
+        let through = if reset { 0 } else { held.through };
+        let from = through.max(crate::log::start(&o.layers).saturating_sub(1));
+        let to = o.head.min(from.saturating_add(req.limit)).max(from);
+        Ok(LogPlan {
+            edge: req.edge.clone(),
+            output: e.input.clone(),
+            head: o.head,
+            life: o.life,
+            through: held.through,
+            from,
+            to,
+            walking: (reset || held.walking) && to < o.head,
+        })
     }
 }
 
@@ -233,7 +280,7 @@ pub struct Plan {
     pub reset: bool,
     pub range: KeyRange,
     pub inputs: Vec<InputPlan>,
-    pub unkeyed: Vec<UnkeyedPlan>,
+    pub logs: Vec<LogPlan>,
     /// The retry pass a retry batch belongs to (B6).
     pub pass: Option<PassId>,
 }
@@ -252,7 +299,7 @@ pub struct PassId {
 /// What a plan reads of the state, taken under a short lock.
 pub struct View {
     inputs: Vec<InputView>,
-    unkeyed: Vec<UnkeyedPlan>,
+    logs: Vec<LogPlan>,
 }
 
 struct InputView {
@@ -362,24 +409,26 @@ impl Tracking {
                 failures,
             });
         }
-        let mut unkeyed = Vec::with_capacity(req.unkeyed.len());
-        for id in &req.unkeyed {
-            let Some(e) = self.edges.get(id) else {
-                return invalid(format!("no edge {}", String::from_utf8_lossy(id)));
+        let mut logs = Vec::with_capacity(req.logs.len());
+        for l in &req.logs {
+            let Some(e) = self.edges.get(&l.edge) else {
+                return invalid(format!("no edge {}", String::from_utf8_lossy(&l.edge)));
             };
-            let Progress::Unkeyed(through) = *e.progress else {
-                return invalid(format!("edge {} is keyed", String::from_utf8_lossy(id)));
+            let Progress::Log(held) = *e.progress else {
+                return invalid(format!(
+                    "edge {} is keyed",
+                    String::from_utf8_lossy(&l.edge)
+                ));
             };
-            let (_, head, life) = output(&e.input, "the input")?;
-            unkeyed.push(UnkeyedPlan {
-                edge: id.clone(),
-                output: e.input.clone(),
-                head,
-                life,
-                through,
-            });
+            let Some(o) = self.outputs.get(&e.input) else {
+                return invalid(format!(
+                    "the input {} has no life: declare it first",
+                    String::from_utf8_lossy(&e.input)
+                ));
+            };
+            logs.push(LogPlan::of(l, e, o, held, req.reset)?);
         }
-        Ok(View { inputs, unkeyed })
+        Ok(View { inputs, logs })
     }
 }
 
@@ -953,7 +1002,7 @@ pub async fn plan(view: &View, req: &Request, ixs: &dyn Indexes, hold: &dyn Hold
         reset: req.reset,
         range,
         inputs,
-        unkeyed: view.unkeyed.clone(),
+        logs: view.logs.clone(),
         pass: None,
     })
 }
@@ -1256,13 +1305,16 @@ impl Plan {
                 }
             }
         }
-        e.uv(self.unkeyed.len() as u64);
-        for u in &self.unkeyed {
-            e.bytes(&u.edge);
-            e.bytes(&u.output);
-            e.uv(u.head);
-            e.uv(u.life);
-            e.uv(u.through);
+        e.uv(self.logs.len() as u64);
+        for l in &self.logs {
+            e.bytes(&l.edge);
+            e.bytes(&l.output);
+            e.uv(l.head);
+            e.uv(l.life);
+            e.uv(l.through);
+            e.uv(l.from);
+            e.uv(l.to);
+            e.u8(l.walking as u8);
         }
         e.opt_u64(self.pass.as_ref().map(|p| p.life));
         if let Some(p) = &self.pass {
@@ -1370,14 +1422,17 @@ impl Plan {
                 records,
             });
         }
-        let mut unkeyed = Vec::new();
+        let mut logs = Vec::new();
         for _ in 0..d.count()? {
-            unkeyed.push(UnkeyedPlan {
+            logs.push(LogPlan {
                 edge: d.bytes()?.into(),
                 output: d.bytes()?.into(),
                 head: d.uv()?,
                 life: alive(d.uv()?)?,
                 through: d.uv()?,
+                from: d.uv()?,
+                to: d.uv()?,
+                walking: d.u8()? != 0,
             });
         }
         let pass = match d.opt_u64()? {
@@ -1394,7 +1449,7 @@ impl Plan {
             reset,
             range,
             inputs,
-            unkeyed,
+            logs,
             pass,
         })
     }

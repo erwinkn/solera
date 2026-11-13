@@ -3,11 +3,12 @@ the incremental half of preparing an attempt, which `Engine._prepare` does
 on today's path.
 
 The engine's shared half (`Engine._pin_inputs`) pins every input that is not
-incremental. Here every keyed incremental input's edge is opened if it is
-new (one `Core` event, recorded before anything is awaited), and every keyed
-input is planned by one `Tracking.plan` call, off the event loop: from the
-task's progress key, the next `batch_size` keys owed on any of them, in key
-order, with their classes, each input at its own head. The plan's bytes go
+incremental. Here every incremental input's edge is opened if it is
+new (one `Core` event, recorded before anything is awaited), and every one
+is planned by one `Tracking.plan` call, off the event loop. Of the keyed
+inputs: from the task's progress key, the next `batch_size` keys owed on any
+of them, in key order, with their classes, each input at its own head. Of
+each log: its next `batch_size` commits after the last the partition read. The plan's bytes go
 into the attempt's spec untouched (`spec["plan"]`); the engine keeps them in
 memory for the commit, which reads them back from the spec after a restart.
 """
@@ -16,10 +17,10 @@ from __future__ import annotations
 
 import math
 
-from solera._native import Tracking
+from solera._native import Tracking, UnsettledError
 
 from ..model import edge_id, output_id
-from . import WALK, Core, Generation, Redeployed, canonical
+from . import WALK, Core, Generation, Redeployed, canonical, output_pin
 from .commit import HeldBack
 from .full import dynamic_sets, held
 
@@ -37,22 +38,23 @@ def conditions(engine, input, base: dict) -> dict:
     }
 
 
-def open_edges(core: Core, task: dict, keyed: list) -> dict:
+def open_edges(core: Core, task: dict, inputs: list) -> dict:
     """Each incremental input's edge, opening those the core does not hold:
     recorded as one event, at once. Opening an edge names its upstream. An
-    edge that reads another output than the input does now is closed and
-    opened again: what it held is of an output it no longer reads."""
+    edge that reads another output than the input does now, or read it as
+    another kind (keyed, or a log), is closed and opened again: what it held
+    is of an output it no longer reads."""
 
     events, out = [], {}
-    for input in keyed:
+    for input in inputs:
         upstream = output_id(input.output, input.partition)
         edge = out[input.param] = edge_id(task["asset"], task["partition"], input.param)
-        found = core.tracking.edge(edge)
-        if found is not None and found["input"] == upstream:
+        found, log = core.tracking.edge(edge), core.engine._log(input)
+        if found is not None and found["input"] == upstream and ("log" in found) == log:
             continue
         if found is not None:
             events.append(Tracking.event_edge_close(edge))
-        events.append(Tracking.event_edge_open(edge, upstream, True))
+        events.append(Tracking.event_edge_open(edge, upstream, not log))
     if events:
         core.record(Tracking.join(events))
     return out
@@ -99,30 +101,68 @@ async def _prepare(core: Core, task: dict, run: dict, attempt: str | None) -> di
         base["full"] = engine._full_run(task, run) is not None
     full = base["full"]
     pins = base["pins"]
-    keyed = base["incremental"]
+    keyed = [i for i in base["incremental"] if not engine._log(i)]
+    logs = [i for i in base["incremental"] if engine._log(i)]
     refuse(engine, task, run, keyed)
-    if any(restarted(core, task, i) for i in keyed):  # an upstream's new life is read in full, from the start
+    # An upstream's new life, or a log that started over, is read in full, from the start.
+    if any(restarted(core, task, i) for i in base["incremental"]):
         full = base["full"] = True
     progress = {} if full else task.get("progress") or {}
     plans, all_empty, plan_bytes = {}, True, None
     mine = progress.get(WALK)
-    if keyed:
-        edges = open_edges(core, task, keyed)
+    if base["incremental"]:
+        edges = open_edges(core, task, base["incremental"])
         core.attach(*(output_id(i.output, i.partition) for i in keyed))
         after = (mine or {}).get("key")
         mode, named = run_mode(run, keyed)
+        if mine is not None and after is None:  # its keyed inputs' walk ended: only its logs go on
+            mode, named = "keys", []
         request = {
             "mode": mode,
             "keys": named,
             "reset": full,
             "after": after,
-            "limit": min(int(i.spec["batch_size"]) for i in keyed),
+            "limit": min((int(i.spec["batch_size"]) for i in keyed), default=1),
             "inputs": [{"edge": edges[i.param], "conditions": conditions(engine, i, base)} for i in keyed],
+            "logs": [{"edge": edges[i.param], "limit": int(i.spec["batch_size"])} for i in logs],
         }
-        summary = await core.run(core.tracking.plan, request)
+        try:
+            summary = await core.run(core.tracking.plan, request)
+        except UnsettledError:  # a log started over since `restarted` read it: planned again, in full
+            raise HeldBack("an upstream started over while the batch was planned") from None
         plan_bytes = summary["plan"]
         hi = summary["hi"]
         index = 0 if mine is None else int(mine["batch"]) + 1
+        for input, found in zip(logs, summary["logs"], strict=True):
+            heads.append(
+                [input.output, input.partition, found["head"], m.life(input.output, input.partition)]
+            )
+            final = found["to"] == found["head"]
+            left = math.ceil((found["head"] - found["to"]) / int(input.spec["batch_size"]))
+            count = index + 1 + left
+            pins[input.param] = {
+                "ref": engine._pin_at(input.output, input.partition),
+                # The rows of its commits `from + 1..=to`, in the layers the plan read.
+                "log": {
+                    **output_pin(core, input.output, input.partition),
+                    "from": found["from"],
+                    "to": found["to"],
+                },
+                "batch": {"index": index, "count": count, "final": final, "reset": full},
+            }
+            plans[input.param] = {
+                "kind": "log",
+                "output": input.output,
+                "upstream_partition": input.partition,
+                "head": found["head"],
+                "index": index,
+                "count": count,
+                "from": found["from"],
+                "to": found["to"],
+                "final": final,
+                "full": full,
+            }
+            all_empty = all_empty and found["to"] == found["from"]
         for n, input in enumerate(keyed):
             found = summary["inputs"][n]
             heads.append(
@@ -176,7 +216,9 @@ async def _prepare(core: Core, task: dict, run: dict, attempt: str | None) -> di
 
 
 def restarted(core: Core, task: dict, input) -> bool:
-    """Whether an incremental input must start over. A task's walk goes on
+    """Whether an incremental input must start over. A log that started over
+    past what the partition read of it starts it over: it holds rows the log
+    no longer does. Otherwise a task's walk goes on
     unless a deploy since its last commit reset either side of the edge (its
     asset, one of its outputs, the upstream), whatever another run committed
     meanwhile; a rebind changes the definition, which starts it over too
@@ -186,10 +228,13 @@ def restarted(core: Core, task: dict, input) -> bool:
 
     m, asset, partition = core.m, task["asset"], task["partition"]
     outputs = [o["name"] for o in (m.manifest["assets"].get(asset) or {}).get("outputs") or ()]
+    edge = m.edge(asset, partition, input.param) or {}
+    if (edge.get("log") or {}).get("restarted"):
+        return True
     if (mine := (task.get("progress") or {}).get(WALK)) is not None:
         sides = [("asset", asset), ("output", input.output), *(("output", name) for name in outputs)]
         return any(m.reset_at.get(side, 0) > mine["deploy"] for side in sides)
-    if (m.edge(asset, partition, input.param) or {}).get("read"):
+    if edge.get("read"):
         return False
     return "definition" in m.partition(asset, partition) or any(
         (name, partition) in m.heads for name in outputs

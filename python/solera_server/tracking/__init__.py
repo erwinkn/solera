@@ -174,14 +174,14 @@ class Core:
         return self.locks.setdefault(id_, asyncio.Lock())
 
     def named(self, output: str, partition: str) -> bytes:
-        """The core's name of a keyed output, declared at once if the core
-        does not hold it: a commit is built in a life the state gives it."""
+        """The core's name of a keyed output or a log, declared at once if the
+        core does not hold it: a commit is built in a life the state gives it."""
 
         id_ = output_id(output, partition)
         if self.tracking.output(id_) is None:
-            if ((self.m.manifest or {}).get("outputs", {}).get(output) or {}).get("key") is None:
-                # A life is the current deploy's keyed output's alone (`Generation` keeps names current).
-                raise Conflict(f"output {output!r} is no keyed output of this deploy: it has no life")
+            if not ((self.m.manifest or {}).get("outputs", {}).get(output) or {}).get("incremental"):
+                # A life is the current deploy's incremental output's alone (`Generation` keeps names current).
+                raise Conflict(f"output {output!r} is no incremental output of this deploy: it has no life")
             self.record(Tracking.event_declare(id_))
         return id_
 

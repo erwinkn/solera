@@ -107,8 +107,8 @@ uploads = DynamicPartitions("uploads")
 
 # ---------------------------------------------------------------------------
 # Ingress: polling lives in the graph. One cursor asset per site both keeps
-# an event log, keyed by event, and maintains the keyed file inventory that
-# Incremental edges diff against.
+# an unkeyed incremental event log (one delta batch per commit) and
+# maintains the keyed file inventory that Incremental edges diff against.
 # ---------------------------------------------------------------------------
 
 
@@ -118,7 +118,7 @@ uploads = DynamicPartitions("uploads")
             "change_events",
             store="postgres",
             schema="sharepoint",
-            key="event_id",
+            incremental=True,
             partition_column="site",
         ),
         Output("qaqc_files", key="file_id"),
@@ -137,9 +137,9 @@ def graph_delta(ctx, graph: GraphClient):
     kept = {w["file_id"] for w in workbooks}
     return Result(
         outputs={
-            # An event is a file at a version: a retry, or the same change
-            # seen twice, writes the same key again, never a second row.
-            "change_events": Patch([{**e, "event_id": f"{e['file_id']}@{e['version']}"} for e in events]),
+            # An unkeyed incremental Patch is one new batch; a retry after a
+            # rejected commit replaces its own orphan batch rows.
+            "change_events": Patch(events),
             # Every file_id in `workbooks` is re-owned; touched files that are
             # deleted or not QAQC workbooks leave the inventory. The store
             # computes the committed delta for this site.

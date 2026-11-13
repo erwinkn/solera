@@ -91,8 +91,12 @@ now: one life keeps every partition in one place, so `copy` renamed
 cleanup is one place (K25).
 
 - An unkeyed, non-incremental output's write is a value: replace it.
-- An unkeyed incremental output's write is a `Patch` of rows: append it as
-  commit `context.commit_number` — or, reset, start the commits over at it.
+- An unkeyed incremental output's write is a `Patch` of rows, one commit.
+  A store that writes in place appends it as commit
+  `context.commit_number`, each row stamped with it, or, reset, starts the
+  commits over at it. A store of files is never given one: the engine
+  keeps those rows itself, packed in the same layer files as its key
+  index, and reads them back by commit.
 - A keyed output's write arrives as a `KeyedWrite`, already resolved
   against the engine's key index. A store reads it three ways: `reset` —
   the write is the partition's entire content, so clear the partition first;
@@ -797,11 +801,12 @@ the exact outcome. (`gN` is generation N; content is `{key: v}`, a row
 | all | a patch changes only its keys | g1 writes {a:1, b:1, d:1}; g2 patches b:2, c:1, removes a | b:2, c:1, d:1 |
 | all | an empty replacement holds no key | g1 writes {a:1}; g2 replaces with zero rows | nothing |
 | all | a write repeated by its attempt lands once | g4 writes {a:1, b:1}; g4 (same worker) writes it again | same ref; a:1, b:1 |
-| all | commits append and load by range | g1 appends commit 3 {a}; g2 commit 4 {b} | whole: a, b; `Commits(4, 4)`: b |
+| fenced | commits append and load by range | g1 appends commit 3 {a}; g2 commit 4 {b} | whole: a, b; `Commits(4, 4)`: b |
 | all | a replacement resolved writes its keys and removes the rest | g1 writes {a:1, b:1, c:1}; g2 replaces with {a:1, b:2}, resolved against the index | a and b at g2; c removed; a:1, b:2 |
 | all | a write says which keys it wrote and removed | g1 replaces with {c, a, b}; g2 patches b:2, d:1, removes a; load b, c, d as planned | g1 said wrote a, b, c, whole; g2 wrote b, d, removed a; read at b@2, c@1, d@2 |
 | all | a replacement holds exactly its keys at its version | g1 writes {a, b, c}; g2 replaces with {a:2, d:1}, unresolved | said wrote a, d, whole; a and d read at g2; a table holds nothing else |
-| all | an unkeyed read says its version | a value at g3, then g5; commits 3 (g1) and 4 (g2) | reads at 3, then 5; the commits at 2, `Commits(3, 3)` at 1; an unkeyed write says no keys |
+| all | an unkeyed read says its version | a value at g3, then g5 | reads at 3, then 5; an unkeyed write says no keys |
+| fenced | a read of commits says its version | commits 3 (g1) and 4 (g2) | whole: read at 2; `Commits(3, 3)` at 1 |
 | immutable | a read is at its planned versions | g5 writes {a, b}, plan; g9 patches a:2, removes b; load the plan | a:1, b:1, read at g5, g5 |
 | fenced | a read says what moved since planning | g5 writes {a, b}, plan; g9 patches a:2, removes b; load the plan | a:2; a read at g9, b absent (None) |
 | immutable | a pinned read returns its version | g5 writes {a:1}, pin; g9 writes {a:2} | the pin reads a:1; the new ref a:2 |
@@ -841,7 +846,7 @@ async def test_my_store_conforms(worker, scenario):
 `output(**decl)` must return a fresh output on your store each call
 (scenarios never share data), accepting the declarations the scenarios use:
 `key="id"` (rows `{"id", "v"}` keyed by `id`),
-`incremental=True` (commits of rows), or none. The scenarios drive the
+`incremental=True` (commits of rows, on a fenced store), or none. The scenarios drive the
 store as the engine does — keyed writes as `KeyedWrite`s resolved against a
 key index the kit keeps, keyed loads through `Keys` — and raise
 `AssertionError` with the scenario's expectation when the store answers

@@ -189,8 +189,8 @@ def data(tmp_path, monkeypatch):
     return path
 
 
-def context(output: Output, partition: str = "", **kw) -> WriteContext:
-    return WriteContext(output=output, partition=partition, attempt="test", **kw)
+def context(output: Output, partition: str = "", commit_number=None, **kw) -> WriteContext:
+    return WriteContext(output=output, partition=partition, commit_number=commit_number, attempt="test", **kw)
 
 
 async def whole(state, output: str, partition: str = ""):

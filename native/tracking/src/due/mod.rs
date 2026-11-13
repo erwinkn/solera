@@ -363,7 +363,7 @@ pub async fn plan(
         reset: false,
         range,
         inputs: vec![input],
-        unkeyed: vec![],
+        logs: vec![],
         pass: Some(PassId {
             edge: v.edge.clone(),
             life: v.per_key.life,
@@ -377,7 +377,7 @@ pub async fn plan(
 /// its order) at its head: the worker loads each key on each input and
 /// reports it there, so a load mid full run is held back (D205) and the
 /// other inputs' progress follows what the worker read. On the other inputs
-/// it is a key list over the pass's range; the request's unkeyed inputs are
+/// it is a key list over the pass's range; the request's logs are
 /// planned as for any batch.
 pub async fn plan_all(
     ixs: &dyn Indexes,
@@ -392,7 +392,7 @@ pub async fn plan_all(
     };
     let mut p = plan(ixs, r, &req.inputs[i].conditions, limit).await?;
     p.inputs[0].own = view.own(i);
-    if req.inputs.len() == 1 && req.unkeyed.is_empty() {
+    if req.inputs.len() == 1 && req.logs.is_empty() {
         return Ok(p);
     }
     let keys: Vec<Key> = p.inputs[0].keys.iter().map(|c| c.key.clone()).collect();
@@ -402,7 +402,7 @@ pub async fn plan_all(
         after: None,
         limit: keys.len().max(1),
         inputs: req.inputs.clone(),
-        unkeyed: req.unkeyed.clone(),
+        logs: req.logs.clone(),
     };
     let mut all = crate::plan::plan(view, &listed, ixs, hold).await?;
     for (j, input) in all.inputs.iter_mut().enumerate() {
@@ -414,7 +414,7 @@ pub async fn plan_all(
         reset: false,
         range: p.range,
         inputs: all.inputs,
-        unkeyed: all.unkeyed,
+        logs: all.logs,
         pass: p.pass,
     })
 }

@@ -179,8 +179,8 @@ def upload_drop(ctx) -> Tick | None:
 
 
 # ---------------------------------------------------------------------------
-# Per-site cursor asset: an event log keyed by event and a file inventory
-# keyed by file, patched both ways; the feed's cursor is the cursor (§2, §5, §6).
+# Per-site cursor asset: an unkeyed incremental event log and a keyed file
+# inventory, patched both ways; the feed's cursor is the cursor (§2, §5, §6).
 # ---------------------------------------------------------------------------
 
 
@@ -189,7 +189,7 @@ def upload_drop(ctx) -> Tick | None:
         Output(
             "site_events",
             store=RELATIONAL,
-            key="event_id",
+            incremental=True,
             partition_column="site",
             migrations=postgres_migrations("site_events"),
         ),
@@ -214,8 +214,7 @@ def site_feed(ctx, feed: FeedClient):
     ctx.log("polled", site=ctx.partition, events=len(events))
     return Result(
         outputs={
-            # An event is a file at a version: polled again, it is the same key.
-            "site_events": Patch([{**e, "event_id": f"{e['file_id']}@{e['version']}"} for e in events]),
+            "site_events": Patch(events),
             # An empty delta means "nothing changed", not "everything gone" —
             # removals only apply once the feed reports the current file set.
             "site_files": Patch(events, remove=sorted(prior_ids - kept) if events else []),

@@ -76,9 +76,7 @@ async def plan_of(core: Core, task: dict, attempt: str, prepared: dict) -> bytes
     """The attempt's plan: kept in memory since it was prepared here, else
     read back from its spec (an engine that adopted it after a restart)."""
 
-    if not any(
-        (p or {}).get("kind") == "core" and not p.get("done") for p in (prepared.get("plans") or {}).values()
-    ):
+    if not any((p or {}).get("kind") in ("core", "log") for p in (prepared.get("plans") or {}).values()):
         return None
     if (plan := core.plans.get(attempt)) is not None:
         return plan
@@ -129,7 +127,7 @@ async def build(core: Core, task: dict, attempt: str, prepared: dict, result: di
             producer = canonical({"run": task["run"], "attempt": attempt})
             clear = full_run(prepared)
             plan = await plan_of(core, task, attempt, prepared)
-            keyed, reports, ops, foreseen = [], [], None, None
+            keyed, logs, reports, ops, foreseen = [], [], [], None, None
             keyed_outputs = [
                 (name, info, outputs.get(name) or {"unchanged": True})
                 for name, info in sorted((prepared.get("outputs") or {}).items())
@@ -140,6 +138,7 @@ async def build(core: Core, task: dict, attempt: str, prepared: dict, result: di
                     ((p, plan) for p, plan in prepared["plans"].items() if "core" in (plan or {})),
                     key=lambda item: item[1]["core"],
                 )
+                logs = [p for p, plan in prepared["plans"].items() if (plan or {}).get("kind") == "log"]
                 delivered = result.get("delivered") or {}
                 reports = [
                     ([], sorted(map(tuple, (delivered.get(p) or {}).get("loaded") or ()))) for p, _ in keyed
@@ -154,21 +153,24 @@ async def build(core: Core, task: dict, attempt: str, prepared: dict, result: di
                     ),
                     None,
                 )
-                ops = await core.run(
-                    core.tracking.progress_ops, plan, reports, producer=producer, output_commit=foreseen
-                )
-                held(ops)
+                ops = await progress(core, plan, reports, producer, foreseen)
             # Every output lock the batch needs, in the order of the lives' ids, as any other taker of
             # several does: an id is never renamed. Its names are read now, so under the deploy it
             # planned under, or a life would be minted for a name the deploy took away.
             built.generation.check()
             ids = {
                 name: core.named(name, partition)
-                for name, _, entry in keyed_outputs
-                if not entry.get("unchanged")
+                for name, info in sorted((prepared.get("outputs") or {}).items())
+                if info["contract"].get("incremental")
+                and not (outputs.get(name) or {"unchanged": True}).get("unchanged")
             }
             for id_ in sorted(ids.values()):
                 await built.locks.enter_async_context(core.lock(id_))
+            for name, info in sorted((prepared.get("outputs") or {}).items()):
+                if "log" in info and name in ids:  # the layer its worker wrote, as the head's next commit
+                    event, found = log_commit(core, name, ids[name], info["log"], outputs[name], clear)
+                    events.append(event)
+                    built.counts[name] = found
             first = None
             for name, info, entry in keyed_outputs:
                 if name not in ids:
@@ -198,27 +200,54 @@ async def build(core: Core, task: dict, attempt: str, prepared: dict, result: di
                     built.elements[name] = await elements(core, name, partition, out, found)
             if plan is not None:
                 if first != foreseen:  # an output built nothing, or moved meanwhile
-                    ops = await core.run(
-                        core.tracking.progress_ops, plan, reports, producer=producer, output_commit=first
-                    )
-                    held(ops)  # a clear may have come in while the outputs were built
-                progress, records, _ = ops
-                events.insert(0, progress)
+                    # a clear may have come in while the outputs were built
+                    ops = await progress(core, plan, reports, producer, first)
+                moved, records, _ = ops
+                events.insert(0, moved)
                 built.records = [[p, b64(r)] for (p, _), r in zip(keyed, records, strict=True)]
-                some = keyed[0][1]
-                ended = some["end"] is None  # the plan's walk, not one input's own end
+                some = keyed[0][1] if keyed else prepared["plans"][logs[0]]
                 built.progress = {
                     "batch": some["index"],
-                    "key": None if ended else some["end"],
+                    "key": some.get("end"),  # where the keyed inputs' walk goes on, None once it ended
                     "deploy": m.deploy_number,  # a reset since starts the walk over (`prepare.restarted`)
                 }
-                built.walked = [p for p, _ in keyed]
+                built.walked = [p for p, _ in keyed] + logs
             if events:
                 built.event = Tracking.join(events)
             return built
     except BaseException:
         await built.locks.aclose()
         raise
+
+
+async def progress(core: Core, plan: bytes, reports: list, producer: bytes, output_commit) -> tuple:
+    """What committing the plan writes to its inputs' edges (`progress_ops`),
+    refusing a batch that holds a key back, or whose log started over since
+    it was planned: it read rows the log no longer holds."""
+
+    try:
+        ops = await core.run(
+            core.tracking.progress_ops, plan, reports, producer=producer, output_commit=output_commit
+        )
+    except UnsettledError:
+        raise HeldBack("an upstream started over since the batch planned") from None
+    held(ops)
+    return ops
+
+
+def log_commit(core: Core, name: str, id_: bytes, planned: dict, entry: dict, walk: bool) -> tuple:
+    """The event that installs the layer a worker wrote for a log, and what
+    it leaves (`{"commit", "live"}`): the layer the engine named at prepare,
+    as the commit after the head. A full run of one commit ends with it; a
+    walk's ends when the walk does (`full.settle`)."""
+
+    layer = entry.get("layer")
+    if layer is None or layer["path"] != planned["path"] or bool(layer["clears"]) != planned["clear"]:
+        raise Conflict(f"output {name}: the result's layer is not the one this attempt was to write")
+    try:
+        return core.tracking.log_commit(id_, layer, ends_full_run=planned["clear"] and not walk)
+    except ValueError as error:
+        raise Conflict(f"output {name}: {error}") from error
 
 
 async def elements(core: Core, name: str, partition: str, out: dict, found: dict) -> list[str]:

@@ -28,20 +28,21 @@ def test_an_event_that_changes_one_edge_twice_is_refused_and_leaves_the_state_as
     t.apply(Tracking.event_edge_close(b"e"))
 
 
-def test_a_stale_unkeyed_commit_is_refused_and_never_moves_progress_back(tmp_path):
+def test_a_stale_commit_over_a_log_is_refused_and_never_moves_progress_back(tmp_path):
+    request = {"logs": [{"edge": b"u", "limit": 10}], "limit": 1}
     t = items(tmp_path, 1)
     t.apply(Tracking.event_edge_open(b"u", b"items", False))
-    old = t.plan({"unkeyed": [b"u"], "limit": 1})["plan"]
+    old = t.plan(request)["plan"]
     stale = t.progress_ops(old, [])[0]
     t2 = items(tmp_path / "two", 2)
     t2.apply(Tracking.event_edge_open(b"u", b"items", False))
-    t2.apply(t2.progress_ops(t2.plan({"unkeyed": [b"u"], "limit": 1})["plan"], [])[0])
-    assert t2.plan({"unkeyed": [b"u"], "limit": 1})["unkeyed"][0]["through"] == 2
+    t2.apply(t2.progress_ops(t2.plan(request)["plan"], [])[0])
+    assert t2.edge(b"u")["log"] == {"through": 2, "walking": False, "restarted": False}
     with pytest.raises(ValueError, match="moved since the batch was planned"):
         t2.apply(stale)
     with pytest.raises(ValueError, match="moved since the batch was planned"):
         t2.progress_ops(old, [])
-    assert t2.plan({"unkeyed": [b"u"], "limit": 1})["unkeyed"][0]["through"] == 2
+    assert t2.edge(b"u")["log"]["through"] == 2
 
 
 def test_a_batch_limit_past_the_counter_is_refused(tmp_path):

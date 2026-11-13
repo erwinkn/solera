@@ -349,11 +349,11 @@ class Attempts:
             needs = {k: v for k in ("cpu", "memory", "gpu") if (v := execution["options"].get(k)) is not None}
             event["pool"] = {"name": execution["executor"], "needs": needs}
         generation.check()  # by name, so under the deploy it was prepared under
-        # Its keyed outputs are named before it writes: a life each, before any commit.
+        # Its incremental outputs are named before it writes: a life each, before any commit.
         new = [
             id_
             for name, info in prepared["outputs"].items()
-            if info["contract"].get("key") is not None
+            if info["contract"].get("incremental")
             and self.m.core.output(id_ := output_id(name, task["partition"])) is None
         ]
         if new:

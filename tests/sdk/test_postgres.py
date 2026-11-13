@@ -169,6 +169,20 @@ async def test_a_renamed_output_keeps_its_table(store):
     assert missing is None  # nothing was created, or renamed, under the new name
 
 
+async def test_batch_snapshot_at_pinned_version(store):
+    """§3/§2.1: an unkeyed incremental ref's load returns rows up to the
+    pinned batch, even after later writes."""
+
+    out = output(incremental=True, partition_column="site")
+    first = await store.store(Patch([{"e": 1}]), None, context(out, partition="s1", commit_number=0))
+    second = await store.store(Patch([{"e": 2}]), first.ref, context(out, partition="s1", commit_number=1))
+    assert first.ref.handle["commit_number"] == 0 and second.ref.handle["commit_number"] == 1
+    at_first = await store.load(first.ref, list[dict], None)
+    assert [r["e"] for r in at_first] == [1]
+    at_second = await store.load(second.ref, list[dict], None)
+    assert [r["e"] for r in at_second] == [1, 2]
+
+
 async def test_keys_selection(store):
     """§4: load under Keys returns only the selected keys."""
 
@@ -323,7 +337,7 @@ async def test_every_row_carries_the_version_that_wrote_it(store):
     `Sql` query, even one copying `_version` from another table — and a
     load takes the column off the rows it returns."""
 
-    out = output(key="id")
+    out = output(key="id", incremental=True)
     first = await store.store([{"id": "a", "v": "1"}, {"id": "b", "v": "1"}], None, fenced(out, 3))
     table = first.ref.handle["table"]
     second = await store.store(Patch([{"id": "b", "v": "2"}]), first.ref, fenced(out, 5))
@@ -332,6 +346,11 @@ async def test_every_row_carries_the_version_that_wrote_it(store):
     copied = output(key="id")
     sql = await store.store(Sql(f"SELECT * FROM {table}"), None, fenced(copied, 8))
     assert _versions(store, sql.ref.handle["table"]) == [("a", 8), ("b", 8)]
+    commits = output(incremental=True)
+    batch = await store.store(Patch([{"e": 1}]), None, fenced(commits, 4))
+    with store._connect() as conn, conn.cursor() as cur:
+        found = cur.execute(f"SELECT _version FROM {batch.ref.handle['table']}").fetchall()
+    assert [r["_version"] for r in found] == [4]
 
 
 async def test_a_table_made_before_versions_is_refused(store):
@@ -385,7 +404,7 @@ async def test_a_repair_writing_no_rows_still_marks_the_slice_written(store):
     written by the repairing generation, not by the dead attempt it repaired,
     which no commit has."""
 
-    out = output(key="id")
+    out = output(key="id", incremental=True)
     first = await store.store([{"id": "a", "v": "1"}], None, fenced(out, 12))
     await store.acquire(fenced(out, 15), first.ref)
     nothing = KeyedWrite(prepare_for(store, Patch([]), out), None, frozenset())

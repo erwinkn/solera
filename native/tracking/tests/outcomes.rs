@@ -330,7 +330,7 @@ impl World {
                 conditions: self.now.clone(),
                 own: None,
             }],
-            unkeyed: vec![],
+            logs: vec![],
         }
     }
 
@@ -2843,7 +2843,7 @@ impl Multi {
                     own: None,
                 })
                 .collect(),
-            unkeyed: vec![],
+            logs: vec![],
         }
     }
 
@@ -3516,10 +3516,10 @@ fn a_held_back_key_planned_at_another_version_than_its_record_lowers_nothing() {
     });
 }
 
-/// A retry plan keeps the consumer's unkeyed inputs, with one keyed input
+/// A retry plan keeps the logs the consumer reads, with one keyed input
 /// or several, so the batch consumes them as any batch does.
 #[test]
-fn a_retry_plan_keeps_the_unkeyed_inputs() {
+fn a_retry_plan_keeps_the_logs() {
     let rt = runtime();
     let ix = index(&rt);
     rt.block_on(async {
@@ -3563,7 +3563,10 @@ fn a_retry_plan_keeps_the_unkeyed_inputs() {
         for keyed in [vec![1], vec![0, 1]] {
             let mut req = w.request(None, 10);
             req.inputs = keyed.iter().map(|&j| req.inputs[j].clone()).collect();
-            req.unkeyed = vec![key("c/u")];
+            req.logs = vec![plan::LogRequest {
+                edge: key("c/u"),
+                limit: 10,
+            }];
             let view = w.t.view(&req).unwrap();
             let r = w.t.retry_view(&w.sides[1].edge).unwrap();
             let p = due::plan_all(&OneIndex(&ix), &r, &view, &req, &NoHold, 10)
@@ -3572,8 +3575,8 @@ fn a_retry_plan_keeps_the_unkeyed_inputs() {
             let want = plan::plan(&view, &req, &OneIndex(&ix), &NoHold)
                 .await
                 .unwrap();
-            assert!(want.unkeyed[0].owed());
-            assert_eq!(p.unkeyed, want.unkeyed, "{} keyed inputs", keyed.len());
+            assert!(want.logs[0].owed());
+            assert_eq!(p.logs, want.logs, "{} keyed inputs", keyed.len());
             assert_eq!(p.inputs.last().unwrap().keys.len(), 1, "b retries k1");
         }
     });

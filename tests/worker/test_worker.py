@@ -473,7 +473,7 @@ def test_a_worker_of_plain_rows_imports_no_dataframe_library(tmp_path):
             def items():
                 return [{"id": "a", "n": 1}, {"id": "b", "n": 2}]
 
-            @asset(outputs=Output("events", key="e"))
+            @asset(outputs=Output("events", incremental=True))
             def events(items: list[dict]):
                 return Patch([{"e": len(items)}])
 

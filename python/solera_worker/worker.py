@@ -54,6 +54,7 @@ from solera.sdk import (
     split_partition,
 )
 from solera.stores import (
+    Commits,
     KeyedWrite,
     Keys,
     Opaque,
@@ -63,6 +64,7 @@ from solera.stores import (
     WriteContext,
     WriteError,
     check_loaded,
+    frames,
     resolve_env,
 )
 from solera.tasks import Tasks, retrying
@@ -277,6 +279,8 @@ class Ctx:
             ref, index = Ref.from_json(info["before"]), info.get("index")
             if "core" in info:
                 index = {"core": info["core"]}
+            elif "log" in info and self._stores[ref.store].writes == "immutable":
+                index = {"log": info["log"]["pin"]}
         store = self._stores[ref.store]
         index = index or self._indexes.get((ref.output, ref.partition))
         value = await _load_whole(_unobserved, store, ref, t, self._keys_io, index)
@@ -366,6 +370,22 @@ async def _resolve_inputs(spec, project, asset, keys_io, timeline, observed: Obs
             continue
         ref = Ref.from_json(pin["ref"])
         store = reader(project, ref)
+        if "batch" in pin and "log" in pin:  # Incremental over a log: the rows of its next commits
+            ch, log = pin["batch"], pin["log"]
+            if store.writes == "immutable":  # the core keeps them
+                args[param] = frames.materialize(await core.log_read(log, log["from"], log["to"]), t)
+            else:  # its store does, each row stamped with its commit
+                args[param] = await observed.load(store, ref, t, Commits(log["from"], log["to"] - 1))
+            batch[param] = Batch(
+                rows=args[param],
+                reset=bool(ch.get("reset")),
+                index=int(ch["index"]),
+                count=int(ch["count"]),
+                final=bool(ch["final"]),
+                upstream=Upstream(ref.output, range(int(log["from"]), int(log["to"]))),
+            )
+            timeline.add("loaded", param, _rows(args[param]))
+            continue
         if "batch" in pin and "core" in pin:  # Incremental: the keys its plan names, and ctx.batch (§5.1)
             ch = pin["batch"]
             reset = bool(ch.get("reset"))
@@ -424,6 +444,8 @@ async def _load_whole(load, store, ref, t, keys_io, index_json, key: str | None 
     loaded a page of the index at a time, and the pages put together. Every
     key the index names must come back (`check_loaded`)."""
 
+    if index_json is not None and "log" in index_json:  # a log: the rows of every commit it holds
+        return frames.materialize(await core.log_read(index_json["log"]), t)
     if index_json is None or store.writes != "immutable":
         return await load(store, ref, t, None)
     pages = core.pages(index_json["core"], REPAIR_PAGE)  # the output's layers in the change index
@@ -512,7 +534,10 @@ async def _store_outputs(
         await _prepare(o, spec, keys_io)
     entries = {}
     for name, o in list(outs.items()):
-        if "core" in o.info and core.unchanged(o) and o.prior is not None:
+        if "log" in o.info and not o.rows and not o.info["log"]["clear"]:
+            entries[name] = {"unchanged": True}  # it appends nothing: no commit
+            del outs[name]
+        elif "core" in o.info and core.unchanged(o) and o.prior is not None:
             if not _schema_due(o):
                 entries[name] = {"unchanged": True}
                 del outs[name]
@@ -525,6 +550,19 @@ async def _store_outputs(
     for name, o in outs.items():
         output, store, store_name = o.output, o.store, declared[name]["store"]
         context = o.context(spec, worker_id)
+        if "log" in o.info and o.kind == "immutable":
+            # The core keeps a log's rows: its commit's layer, for the engine to install.
+            layer = await writes.call(core.log_write(spec, o, core.log_parts, o.rows))
+            ref = Ref(
+                output=name,
+                store=store_name,
+                handle={"mode": "log"},
+                partition=spec["partition"],
+                generation=int(spec.get("generation") or 0),
+            )
+            entries[name] = {"ref": ref.to_json(), "layer": layer, "rows": len(o.rows)}
+            timeline.add("stored", name, len(o.rows))
+            continue
         schema = None
         if output.migrations:
             migrate = getattr(store, "migrate", None)
@@ -552,6 +590,8 @@ async def _store_outputs(
         entry = {}
         if "core" in o.info:
             entry.update(await core.changes(objects, spec, name, o))
+        if "log" in o.info:  # a store that writes in place keeps a log's rows: the core, that the commit is
+            entry["layer"] = await writes.call(core.log_write(spec, o, core.log_kept, o.rows))
         if written.ref is None:
             continue
         ref = dataclasses.replace(written.ref, store=store_name)
@@ -595,6 +635,7 @@ class _Out:
     files: DeltaFiles | None = None
     changed: tuple | None = None  # ([written key], [removed key]), or None past LISTED
     write: KeyedWrite | None = None
+    rows: list | None = None  # what the write appends to a log
     schema_only: bool = False  # unchanged content, migrations to apply
 
     @property
@@ -630,6 +671,8 @@ class _Out:
         return WriteContext(
             output=self.output,
             partition=spec["partition"],
+            # A log's commits are numbered from 0 for whoever reads them (`upstream.commits`).
+            commit_number=self.info["log"]["commit"] - 1 if "log" in self.info else None,
             attempt=spec["attempt"],
             reset=self.reset,
             generation=spec.get("generation"),
@@ -664,6 +707,9 @@ async def _prepare(o: _Out, spec, keys_io) -> None:
     (`_repair`), or — after an unknown opaque write — reconciled whole
     (`_reconcile`), which resolves the write too (docs/versions.md §5)."""
 
+    if "log" in o.info:
+        o.rows = core.log_rows(o)
+        return
     if "core" in o.info:  # the new tracking core: the engine builds the commit
         await core.prepare(o)
         return
