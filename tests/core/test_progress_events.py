@@ -45,6 +45,23 @@ def test_a_stale_commit_over_a_log_is_refused_and_never_moves_progress_back(tmp_
     assert t2.edge(b"u")["log"]["through"] == 2
 
 
+def test_a_key_the_worker_held_back_keeps_what_was_held_and_stays_owed(tmp_path):
+    """A batch of k0, k1 and k2 whose worker did not process k1 (what it
+    loaded of it could not be trusted): the commit reports it held back,
+    and k1 alone is owed afterwards."""
+
+    t = items(tmp_path, 3)
+    t.apply(Tracking.event_edge_open(b"e", b"items", True))
+    request = {"inputs": [{"edge": b"e", "conditions": {}}], "limit": 10}
+    plan = t.plan(request)["plan"]
+    event, _, held_back = t.progress_ops(plan, [([], [], ["k1"])])
+    assert held_back == [["k1"]]
+    t.apply(event)
+    assert Tracking.plan_keys(t.plan(request)["plan"], 0)[0] == ["k1"]
+    with pytest.raises(ValueError, match="did not take"):
+        t.progress_ops(t.plan(request)["plan"], [([], [], ["k9"])])
+
+
 def test_a_batch_limit_past_the_counter_is_refused(tmp_path):
     t = items(tmp_path, 3)
     t.apply(Tracking.event_edge_open(b"e", b"items", True))

@@ -24,6 +24,7 @@ from solera._native import Tracking, UnsettledError
 
 from ..state import Conflict
 from . import Core, Generation, b64, canonical, unb64
+from .loaded import rebuilding
 
 DYNAMIC_KEYS = 1_000_000  # a dynamic partitions output's elements, read from its commit's keys up to this
 
@@ -65,10 +66,13 @@ class HeldBack(Conflict):
     replan = True
 
 
-def held(ops: tuple) -> None:
-    """Refuse a batch `progress_ops` holds keys back in (§7 step 4)."""
+def held(ops: tuple, reports: list) -> None:
+    """Refuse a batch `progress_ops` holds back a key of that its worker
+    processed (§7 step 4). A key the worker itself held back, at load, was
+    never given to the asset: the batch commits, and the key stays owed."""
 
-    if keys := sorted({k for keys in ops[2] for k in keys}):
+    spared = {key for report in reports for key in report[2]}
+    if keys := sorted({k for keys in ops[2] for k in keys} - spared):
         raise HeldBack(f"a clear came in on an input since the batch planned: {len(keys)} keys held back")
 
 
@@ -141,7 +145,12 @@ async def build(core: Core, task: dict, attempt: str, prepared: dict, result: di
                 logs = [p for p, plan in prepared["plans"].items() if (plan or {}).get("kind") == "log"]
                 delivered = result.get("delivered") or {}
                 reports = [
-                    ([], sorted(map(tuple, (delivered.get(p) or {}).get("loaded") or ()))) for p, _ in keyed
+                    (
+                        [],
+                        sorted(map(tuple, (delivered.get(p) or {}).get("loaded") or ())),
+                        sorted((delivered.get(p) or {}).get("held") or ()),
+                    )
+                    for p, _ in keyed
                 ]
                 # The batch records name the output commit, built after: its number is foreseen,
                 # so the batch costs one call (4 ms per 10k keys), not two.
@@ -211,6 +220,13 @@ async def build(core: Core, task: dict, attempt: str, prepared: dict, result: di
                     "key": some.get("end"),  # where the keyed inputs' walk goes on, None once it ended
                     "deploy": m.deploy_number,  # a reset since starts the walk over (`prepare.restarted`)
                 }
+                # Keys held back under a rebuild are this run's to take once the rebuild is done:
+                # its walk goes on, from the first key, over what is still owed.
+                if any(
+                    report[2] and rebuilding(core, plan["output"], plan["upstream_partition"], plan["head"])
+                    for (_, plan), report in zip(keyed, reports, strict=True)
+                ):
+                    built.progress.update(key="", held=True)
                 built.walked = [p for p, _ in keyed] + logs
             if events:
                 built.event = Tracking.join(events)
@@ -231,7 +247,7 @@ async def progress(core: Core, plan: bytes, reports: list, producer: bytes, outp
         )
     except UnsettledError:
         raise HeldBack("an upstream started over since the batch planned") from None
-    held(ops)
+    held(ops, reports)
     return ops
 
 

@@ -27,6 +27,7 @@ from solera.tasks import retrying
 from .model import output_id
 from .state import LostOwnership, Unavailable
 from .tracking import b64
+from .tracking import loaded as core_loaded
 
 log = logging.getLogger(__name__)
 
@@ -238,6 +239,17 @@ class Attempts:
         live.lines.extend(new)
         live.log_offset += len(new)
         return {"offset": live.log_offset}
+
+    async def attempt_loaded(self, attempt: str, body: dict) -> dict:
+        """A worker's question as it loads a batch: of the keys a table held
+        otherwise than planned, which it must hold back (`tracking.loaded`)."""
+
+        self._serving()
+        live = self._live(attempt)
+        await self._bind(attempt, live, body["worker_id"])
+        task = self.m.task(self.m.attempts[attempt])
+        prepared = self._launched(task, attempt)["prepared"]
+        return {"held": await core_loaded.held(self.core, prepared, body["inputs"])}
 
     async def attempt_finished(self, attempt: str, body: dict) -> None:
         self._serving()

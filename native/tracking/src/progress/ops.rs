@@ -23,6 +23,11 @@ pub struct InputReport {
     pub failed: Vec<Key>,
     /// Sorted by key, distinct.
     pub loaded: Vec<(Key, Ver)>,
+    /// Sorted, distinct: the keys the worker did not process, because what
+    /// it loaded of them could not be trusted (a rebuild or a dead writer
+    /// changed them under the batch). Each keeps what it held, on every
+    /// input of the batch, and stays owed.
+    pub held: Vec<Key>,
 }
 
 /// The event parts a batch commit applies to progress, and one record per
@@ -71,6 +76,7 @@ impl Tracking {
         if reports.iter().any(|r| {
             r.failed.windows(2).any(|w| w[0] >= w[1])
                 || r.loaded.windows(2).any(|w| w[0].0 >= w[1].0)
+                || r.held.windows(2).any(|w| w[0] >= w[1])
         }) {
             return invalid("a report's keys are sorted and distinct");
         }
@@ -83,7 +89,9 @@ impl Tracking {
         }
         let taken = |p: &InputPlan, k: &Key| p.keys.binary_search_by(|c| c.key.cmp(k)).is_ok();
         if plan.inputs.iter().zip(reports).any(|(p, r)| {
-            !r.failed.iter().all(|k| taken(p, k)) || !r.loaded.iter().all(|(k, _)| taken(p, k))
+            !r.failed.iter().all(|k| taken(p, k))
+                || !r.loaded.iter().all(|(k, _)| taken(p, k))
+                || !r.held.iter().all(|k| taken(p, k))
         }) {
             return invalid("a report names a key the batch did not take");
         }
@@ -152,6 +160,7 @@ impl Tracking {
             .zip(&unsettled)
             .filter(|(_, &u)| u)
             .flat_map(|(ks, _)| ks.iter().copied())
+            .chain(reports.iter().flat_map(|r| &r.held))
             .collect();
         let mut parts = Vec::new();
         let mut records = Vec::new();

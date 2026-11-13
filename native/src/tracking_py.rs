@@ -709,7 +709,8 @@ impl Tracking {
 
     /// What committing a plan writes to progress, from what the worker
     /// reports per keyed input: (failed keys, (key, version) loaded at
-    /// another version than planned), each sorted. Returns the event, the
+    /// another version than planned, and optionally the keys it did not
+    /// process and holds back), each sorted. Returns the event, the
     /// batch records, and per keyed input the keys it held back: on an input
     /// mid full run or cleared since the plan, a key loaded at another version
     /// than planned, or one this input did not take, another input did, and
@@ -729,9 +730,9 @@ impl Tracking {
             let mut rs = vec![];
             for r in reports.try_iter()? {
                 let r = r?;
-                let t = r
-                    .cast::<PyTuple>()
-                    .map_err(|_| PyTypeError::new_err("a report is (failed, loaded)"))?;
+                let t = r.cast::<PyTuple>().map_err(|_| {
+                    PyTypeError::new_err("a report is (failed, loaded) or (failed, loaded, held)")
+                })?;
                 let mut rep = tr::progress::InputReport::default();
                 for k in t.get_item(0)?.try_iter()? {
                     rep.failed.push(key_in(&k?)?);
@@ -740,6 +741,11 @@ impl Tracking {
                     let e = e?;
                     rep.loaded
                         .push((key_in(&e.get_item(0)?)?, owned(&e.get_item(1)?)?));
+                }
+                if t.len() > 2 {
+                    for k in t.get_item(2)?.try_iter()? {
+                        rep.held.push(key_in(&k?)?);
+                    }
                 }
                 rs.push(rep);
             }

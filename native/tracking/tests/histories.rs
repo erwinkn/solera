@@ -446,6 +446,7 @@ fn a_batch_planned_before_its_input_started_names_the_life_it_loaded() {
         let report = InputReport {
             failed: vec![],
             loaded: vec![(key("k"), Ver::Int(10))],
+            held: vec![],
         };
         let ops = t.progress_ops(&p, &[report], b"run/batch", None).unwrap();
         apply(&mut t, ops.parts);
@@ -1861,6 +1862,7 @@ fn a_key_held_back_at_commit_is_recorded_apart_from_one_the_planner_held_back() 
         let report = InputReport {
             failed: vec![],
             loaded: vec![(key("k1"), Ver::Int(2))],
+            held: vec![],
         };
         let ops = t.progress_ops(&p, &[report], b"", None).unwrap();
         assert_eq!(ops.held_back, vec![vec![key("k1")]]);
@@ -1962,6 +1964,7 @@ async fn r7_load_then_remove_input(ix: &ChangeIndex, path: u8, restart_before_co
     let loaded = InputReport {
         failed: vec![],
         loaded: vec![(key("k"), Ver::Int(10))],
+        held: vec![],
     };
     match path {
         0 => {
@@ -2139,6 +2142,7 @@ fn r7_a_first_input_commit_in_the_batch_event_names_its_life() {
         let report = InputReport {
             failed: vec![],
             loaded: vec![(key("k"), Ver::Int(10))],
+            held: vec![],
         };
         let mut ops = t.progress_ops(&p, &[report], b"run/batch", None).unwrap();
         ops.parts

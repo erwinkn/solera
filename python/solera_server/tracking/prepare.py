@@ -117,6 +117,8 @@ async def _prepare(core: Core, task: dict, run: dict, attempt: str | None) -> di
         mode, named = run_mode(run, keyed)
         if mine is not None and after is None:  # its keyed inputs' walk ended: only its logs go on
             mode, named = "keys", []
+        elif (mine or {}).get("held"):  # keys held back under a rebuild: what is still owed, whatever
+            mode, named = "incremental", []  # the run asked for
         request = {
             "mode": mode,
             "keys": named,

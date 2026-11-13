@@ -651,6 +651,7 @@ impl World {
         let report = InputReport {
             failed: failed.iter().map(|(k, _)| k.clone()).collect(),
             loaded: loaded.clone(),
+            held: vec![],
         };
         let counters = match (
             &self
@@ -942,6 +943,7 @@ impl World {
         let report = InputReport {
             failed: failed.iter().map(|(k, _)| k.clone()).collect(),
             loaded: loaded.clone(),
+            held: vec![],
         };
         let Ok(planned) = self.t.progress_ops(&p, &[report], b"", None) else {
             return;
@@ -1038,6 +1040,7 @@ impl World {
             let report = InputReport {
                 failed: failed.iter().map(|(k, _)| k.clone()).collect(),
                 loaded: loaded.clone(),
+                held: vec![],
             };
             let Ok(planned) = self.t.progress_ops(&p, &[report], b"", None) else {
                 return;
@@ -1856,6 +1859,7 @@ impl World {
         let report = InputReport {
             failed: failed.iter().map(|(k, _)| k.clone()).collect(),
             loaded: loaded.clone(),
+            held: vec![],
         };
         let mut ops = self
             .t
@@ -2610,6 +2614,7 @@ fn a_plan_whose_keys_are_not_sorted_and_distinct_is_refused() {
         let report = || InputReport {
             failed: vec![],
             loaded: vec![],
+            held: vec![],
         };
         assert!(w.t.progress_ops(&p, &[report()], b"", None).is_ok());
         let mut swapped = p.clone();
@@ -3002,6 +3007,7 @@ impl Multi {
             .map(|(ip, l)| InputReport {
                 failed: reported(ip).into_iter().map(|(k, _)| k).collect(),
                 loaded: l.clone(),
+                held: vec![],
             })
             .collect();
         let mut ops = match self.t.progress_ops(p, &reports, b"", None) {
@@ -3654,6 +3660,7 @@ fn a_held_back_key_planned_under_other_conditions_than_its_record_lowers_nothing
                 InputReport {
                     failed: vec![],
                     loaded: vec![(key("k1"), Ver::Int(2))],
+                    held: vec![],
                 },
                 InputReport::default(),
             ];

@@ -39,11 +39,9 @@ LATER: dict[str, str] = {
     ),
     **dict.fromkeys(
         [
-            "ENG-17",
             "ENG-18",
-            "test_sta_13_on_a_table_a_batch_in_flight_holds_back_keys_it_loaded_at_another_version",
         ],
-        "B8: holding back, at load, a key a rebuild or a dead writer changed under a batch comes next",
+        "B8: a full run owed after a dead write to an asset's own output comes next",
     ),
     **dict.fromkeys(["CLN", "RST-8", "PAR-6", "ENG-13", "ENG-14"], "B9: retention and upkeep"),
     **dict.fromkeys(["HIS-3", "HIS-5", "HIS-7", "HIS-8"], "B10: lineage"),

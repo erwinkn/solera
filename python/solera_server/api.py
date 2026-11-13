@@ -32,7 +32,7 @@ from .tracking import full as core_full
 
 log = logging.getLogger(__name__)
 
-ATTEMPT_ROUTE = re.compile(r"^/api/projects/[^/]+/attempts/([^/]+)/(start|beat|logs|finished)$")
+ATTEMPT_ROUTE = re.compile(r"^/api/projects/[^/]+/attempts/([^/]+)/(start|beat|logs|loaded|finished)$")
 POOL_ROUTE = re.compile(r"^/api/projects/[^/]+/pools/[^/]+/work$")
 SENSOR_ROUTE = re.compile(r"^/api/projects/[^/]+/sensors/(next|[^/]+/ticks/[^/]+)$")
 
@@ -249,6 +249,9 @@ def create_app(
             "last_error": "; ".join(f"{name}: {error}" for name, error in runtime.failing.items()) or None,
             # a run left midway: its readers wait until a run of its producer completes it
             "incomplete_full_runs": core_full.stopped(runtime),
+            # a batch loaded, from a table, a version or an absence nothing explains: it held the
+            # key back, which stays owed until its producer writes it again
+            "anomalies": [found for keys in runtime.anomalies.values() for found in keys.values()],
             # cleanup whose task ran out of tries: see and clear with `solera cleanups`
             "stuck_cleanups": [
                 {"output": output, "partition": partition, "id": e["id"]}
@@ -592,6 +595,11 @@ def create_app(
     async def attempt_live_logs(p: str, attempt: str, request: Request):
         runtime = await project_engine(request, p)
         return await runtime.attempt_logs(attempt, await request.json())
+
+    @app.post("/api/projects/{p}/attempts/{attempt}/loaded")
+    async def attempt_loaded(p: str, attempt: str, request: Request):
+        runtime = await project_engine(request, p)
+        return await runtime.attempt_loaded(attempt, await request.json())
 
     @app.post("/api/projects/{p}/attempts/{attempt}/finished", status_code=204)
     async def attempt_finished(p: str, attempt: str, request: Request):

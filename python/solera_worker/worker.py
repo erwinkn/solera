@@ -325,13 +325,15 @@ class Ctx:
         return out
 
 
-async def _resolve_inputs(spec, project, asset, keys_io, timeline, observed: Observed):
+async def _resolve_inputs(spec, project, asset, keys_io, timeline, observed: Observed, ask=None):
     """Load each pin by annotation; build call args + ctx.batch (§5, §10).
 
     An Incremental input loads the keys of the batch
     the engine planned, each with its class, classed again from what a
-    source served (`each.observe`); `delivered` reports what it observed of
-    each, for the engine's record (docs/observed-set.md). Each input loaded
+    source served or a table held (`PlannedKeys.observe`); `delivered`
+    reports what it observed of each, for the engine's record. A key a
+    table held otherwise than planned is processed as loaded, unless the
+    engine, asked through `ask`, says to hold it back (`batch.hold`). Each input loaded
     is a `loaded` event; `observed` records what each read saw."""
 
     manifest_asset = project.manifest["assets"][asset.name]
@@ -402,6 +404,13 @@ async def _resolve_inputs(spec, project, asset, keys_io, timeline, observed: Obs
             else:
                 args[param] = await observed.load(store, ref, t, Keys(core.KeyVersions(planned)))
             classes, loaded = planned.observe(served, read)
+            held = await core.hold(ask, param, loaded) if read is not None and loaded else []
+            if held:  # not processed: what was loaded of them cannot be trusted
+                if any(read.get(key) is not None for key in held):  # rows of theirs: read without them
+                    trusted = {k: v for k, v in planned.versions().items() if k not in set(held)}
+                    found = await store.read(ref, t, Keys(trusted))
+                    args[param], read = found.value, found.versions
+                classes, loaded = planned.observe(served, read, set(held))
             batch[param] = Batch._of_columns(
                 classes,
                 served,
@@ -412,9 +421,9 @@ async def _resolve_inputs(spec, project, asset, keys_io, timeline, observed: Obs
                 final=bool(ch["final"]),
                 upstream=Upstream(ref.output),
             )
-            delivered[param] = {"loaded": loaded}
-            if not reset:
-                nothing.append(len(planned) > 0 and not classes.any())
+            delivered[param] = {"loaded": loaded, "held": held} if held else {"loaded": loaded}
+            if not reset:  # keys held back are no reason to skip the producer: its batch is just smaller
+                nothing.append(len(planned) > 0 and not classes.any() and not held)
             timeline.add("loaded", param, _rows(args[param]))
             continue
         if pin.get("load", "data") == "ref":  # decided at registration, as the engine read for it
@@ -1052,7 +1061,22 @@ async def _execute(
         # Index files straight from the store; small writes are the engine's
         # (docs/resolved-commits.md §4).
         keys_io = ObjectIO(objects)
-        args, batch, delivered = await _resolve_inputs(spec, project, asset, keys_io, timeline, observed)
+
+        async def ask(found: dict) -> dict | None:
+            """The engine's word on keys a table held otherwise than planned
+            (`batch.hold`); None when it cannot be reached."""
+
+            if shipper.channel is None:
+                return None
+            try:
+                answer = await shipper.channel.loaded({"worker_id": shipper.worker_id, "inputs": found})
+            except Ended:
+                raise
+            except Exception:
+                return None
+            return answer.get("held") or {}
+
+        args, batch, delivered = await _resolve_inputs(spec, project, asset, keys_io, timeline, observed, ask)
         nothing = delivered.pop("*nothing", False)
         ctx = Ctx(spec, asset, project, objects, batch, shipper, timeline, keys_io, observed)
         signature = inspect.signature(asset.fn)

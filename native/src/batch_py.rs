@@ -156,21 +156,32 @@ impl PlannedKeys {
     /// generation has no word of its to compare. `read`: the versions a
     /// store's read said, key → version, None or missing for a key it did
     /// not hold (a table read in place may hold a newer write than the one
-    /// planned). With neither, the classes are the plan's.
-    #[pyo3(signature = (served=None, read=None))]
+    /// planned). With neither, the classes are the plan's. `hold`: keys the
+    /// batch must not process (what it loaded of them cannot be trusted):
+    /// they are not delivered, in any class, and not reported.
+    #[pyo3(signature = (served=None, read=None, hold=None))]
     fn observe<'py>(
         &self,
         py: Python<'py>,
         served: Option<PyRef<'py, Served>>,
         read: Option<Bound<'py, PyAny>>,
+        hold: Option<Bound<'py, PyAny>>,
     ) -> PyResult<(Classes, Bound<'py, PyList>)> {
         guard(|| {
             let p = &*self.inner;
             let mut classes = p.classes.clone();
             let loaded = PyList::empty(py);
+            let mut held = vec![false; classes.len()];
+            if let Some(hold) = hold {
+                for (i, cls) in classes.iter_mut().enumerate() {
+                    if hold.contains(key(py, p.keys.get(i)))? {
+                        (held[i], *cls) = (true, NONE);
+                    }
+                }
+            }
             if let Some(read) = read {
                 for (i, cls) in classes.iter_mut().enumerate() {
-                    if *cls == REMOVED {
+                    if *cls == REMOVED || held[i] {
                         continue;
                     }
                     let k = key(py, p.keys.get(i));
@@ -204,7 +215,7 @@ impl PlannedKeys {
             }
             if let Some(s) = served {
                 for (i, cls) in classes.iter_mut().enumerate() {
-                    if *cls == REMOVED {
+                    if *cls == REMOVED || held[i] {
                         continue;
                     }
                     let k = p.keys.get(i);
