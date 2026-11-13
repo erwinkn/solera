@@ -1,6 +1,8 @@
 """The run history (docs/object-store-state.md §7): rows born in the model,
 flushed to Parquet, merged, hidden when deleted, and queried with DuckDB."""
 
+from pathlib import Path
+
 import pytest
 from solera.sdk import In, Output, Project, Result, Retry, Source, asset
 from solera_server.engine import Conflict, Engine
@@ -177,6 +179,44 @@ async def test_a_query_builds_only_the_live_rows_it_reads(state, clock, monkeypa
     assert sorted(r["id"] for r in listed) == sorted(r["id"] for r in paused) and built == []
     found = await engine.history.tasks(run=paused[0]["id"])
     assert [t["asset"] for t in found["tasks"]] == ["orders"] and built == [paused[0]["id"]]
+
+
+async def test_flush_merge_delete_and_purge(state, clock):
+    engine = engine_for(state, clock, flush_rows=1, merge_width=2, purge_seconds=100)
+    await engine.initialize()
+    runs = [(await run(engine, clock, ["orders"], config={"n": i}))["id"] for i in range(4)]
+    await engine.history.lake.tick()
+    files = state.model.history.files
+    assert not any(state.model.history.rows.values())
+    # Each run's rows went out in its own flush; pairs of them were merged.
+    assert sum(f["rows"] for f in files["runs"]) == 4
+    lake = engine.history.lake
+    await lake.stop()
+    while lake.plan():
+        lake.maintain()
+        await lake.job
+    assert len(files["runs"]) == 1
+    assert [r["id"] for r in (await engine.list_runs())["runs"]] == runs[::-1]
+
+    runs_dir = Path(str(state.objects.prefix)) / "runs"
+    assert (runs_dir / runs[1]).is_dir()
+    await engine.delete_run(runs[1])
+    assert not (runs_dir / runs[1]).exists()  # a local directory goes with its objects
+    hidden = files["runs"][0]
+    assert hidden["hidden"] == [runs[1]]
+    assert runs[1] not in [r["id"] for r in (await engine.list_runs())["runs"]]
+    assert await engine.history.run(runs[1]) is None
+    clock.now += 101  # the file is rewritten without the run
+    lake.maintain()
+    await lake.job
+    assert "hidden" not in files["runs"][0] and files["runs"][0]["rows"] == 3
+    assert hidden["path"] in {path for path, _ in state.model.garbage}
+    made = (await engine.history.commits(outputs=["orders"]))["commits"]
+    assert runs[1] not in {m["run"] for m in made}
+    # The files compaction replaced are garbage: upkeep deletes them and says so.
+    await engine.upkeep.collect()
+    assert state.model.garbage == []
+    assert await state.get_object(hidden["path"]) is None
 
 
 async def test_stale_flush_is_discarded(state, clock):
