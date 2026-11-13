@@ -30,7 +30,7 @@ from tests.contract.test_sta import INCOMPLETE, Files, decided
 
 @pytest.fixture
 async def solera(tmp_path):
-    namespace = Solera(tmp_path, "core")
+    namespace = Solera(tmp_path)
     yield namespace
     await namespace.close()
 

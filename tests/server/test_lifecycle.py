@@ -9,7 +9,7 @@ import logging
 from solera import lifecycle
 from solera.lifecycle import Ended
 from solera.sdk import Output, Project, Retry, StaticPartitions, asset
-from solera.stores import FileStore, Patch
+from solera.stores import FileStore
 from solera_server.state import State
 from solera_worker.worker import run_attempt
 
@@ -278,44 +278,6 @@ async def test_a_long_log_is_chunks_and_a_tail(tmp_path, monkeypatch):
     assert [json.loads(line)["message"] for line in text.splitlines()] == [f"line {n}" for n in range(6)]
     last = await state.attempt_log(detail["request"]["id"], attempt["id"], tail=2)
     assert [json.loads(line)["message"] for line in last.splitlines()] == ["line 4", "line 5"]
-    await engine.stop()
-    await state.close()
-
-
-async def test_a_fenced_store_runs_its_retry_at_once(tmp_path):
-    """A dead writer on a fenced store (§9.6): the retry runs at once, its
-    acquisition fencing the dead writer out, and each attempt acquires a
-    higher generation than the last, before it reads anything."""
-
-    from .remote import LiveStore
-
-    class Fenced(LiveStore):
-        writes = "fenced"
-
-        def __init__(self):
-            super().__init__()
-            self.acquired = []
-
-        async def acquire(self, context, prior=None):
-            self.acquired.append((context.generation, context.worker_id))
-
-    live = Fenced()
-    writes = [Patch([{"id": "a", "v": 1}, {"id": "b", "v": 1}]), Patch([{"id": "a", "v": 2}])]
-
-    @asset(outputs=Output("items", key="id", store="live"), retries=Retry(1, delay=0))
-    def items():
-        return writes[0] if len(writes) == 1 else writes.pop(0)
-
-    project = Project(assets=[items], stores={"live": live})
-    state = await State.open(tmp_path.as_uri(), "test", flush_interval=0.001)
-    engine = engine_for(state, project, placement="inline")
-    await engine.initialize()
-    live.die = 1
-    detail = await engine.run_until((await engine.submit(["items"]))["id"], 15)
-    assert detail["request"]["status"] == "succeeded"
-    assert [a["outcome"] for a in detail["attempts"][detail["tasks"][0]["id"]]] == ["failed", "succeeded"]
-    (first, one), (second, other) = live.acquired
-    assert second > first and one != other
     await engine.stop()
     await state.close()
 

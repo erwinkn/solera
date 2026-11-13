@@ -15,7 +15,7 @@ from tests.contract.harness import Solera
 async def test_a_rename_and_back_while_a_commit_is_built_sends_the_batch_back(tmp_path, monkeypatch):
     from solera_server.executors.inline import InlinePlacement
 
-    s = Solera(tmp_path, "core")
+    s = Solera(tmp_path)
     delta = ["a"]
 
     def project(name, aliases=()):
@@ -76,7 +76,7 @@ async def test_a_rename_and_back_while_a_commit_is_built_sends_the_batch_back(tm
 
 
 async def test_a_deploy_during_a_coverage_check_stops_no_tick(tmp_path, monkeypatch):
-    s = Solera(tmp_path, "core")
+    s = Solera(tmp_path)
 
     def project(two):
         @asset(outputs=Output("first", key="id"))
@@ -121,7 +121,7 @@ async def test_a_deploy_during_a_coverage_check_stops_no_tick(tmp_path, monkeypa
 
 
 async def test_an_append_output_name_reused_after_a_rename_is_a_new_life(tmp_path):
-    s = Solera(tmp_path, "core")
+    s = Solera(tmp_path)
     report_entered, report_release = asyncio.Event(), asyncio.Event()
     copy_entered, copy_release = asyncio.Event(), asyncio.Event()
     copy_release.set()

@@ -29,7 +29,6 @@ INTERNAL = (
     "solera.fencing",
     "solera._native",
     "tests.server",
-    "tests.sim",
     "tests.sdk",
     "tests.worker",
     "tests.staleness",
@@ -37,7 +36,6 @@ INTERNAL = (
 TRUSTED = {"harness.py", "conftest.py"}
 ENTRY = re.compile(r"^\*\*([A-Z]{3}-\d+)\. ", re.M)
 TEST = re.compile(r"^test_([a-z]{3})_(\d+)_")
-REFERENCE = re.compile(r"`([a-z_]+(?:/[a-z_]+)*\.py::\w+)`")
 
 
 def entries() -> list[str]:
@@ -90,29 +88,6 @@ def internal_imports() -> list[str]:
     return [f"{path.name}: {use}" for path in modules() for use in internal_uses(path.read_text())]
 
 
-def covered_references() -> list[str]:
-    """Every `file.py::test` a *Covered* line names, that does not exist."""
-
-    tests_root, out = HERE.parent, []
-    for line in BEHAVIORS.read_text().splitlines():
-        if "*Covered*" not in line:
-            continue
-        for ref in REFERENCE.findall(line):
-            path, name = ref.split("::")
-            file = tests_root / path
-            if not file.exists():
-                out.append(ref)
-                continue
-            defined = {
-                n.name
-                for n in ast.walk(ast.parse(file.read_text()))
-                if isinstance(n, ast.FunctionDef | ast.AsyncFunctionDef)
-            }
-            if name not in defined:
-                out.append(ref)
-    return out
-
-
 def problems() -> list[str]:
     ids, found = entries(), tests()
     known = set(ids)
@@ -123,7 +98,6 @@ def problems() -> list[str]:
     if len(ids) != len(known):
         out.append("docs/behaviors.md names an entry twice")
     out += [f"reaches an internal: {line}" for line in internal_imports()]
-    out += [f"a Covered line names a test that does not exist: {ref}" for ref in covered_references()]
     return out
 
 

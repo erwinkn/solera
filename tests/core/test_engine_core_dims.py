@@ -4,7 +4,6 @@ stops no tick, and a fan-in reader in flight commits what it planned (Fable's pr
 PR 2's redesign, round 1)."""
 
 import asyncio
-import os
 
 import pytest
 from solera.sdk import (
@@ -22,12 +21,10 @@ from solera_server.tracking import full
 
 from tests.contract.harness import Solera, rebuild
 
-PATH = os.environ.get("TRACKING_PATH", "core")
-
 
 @pytest.fixture
 async def solera(tmp_path):
-    namespace = Solera(tmp_path, "core")
+    namespace = Solera(tmp_path)
     yield namespace
     await namespace.close()
 
@@ -77,8 +74,6 @@ async def test_a_fan_in_across_a_dimension_whose_set_is_mid_full_run_waits(soler
     await solera.settle(0.6)
     task = [t for t in (await solera.get(f"/runs/{reader['id']}"))["tasks"] if t["asset"] == "rollup"][0]
     print("rollup task:", task["status"], task.get("held"), "seen:", seen)
-    if PATH == "core":
-        print("waiting:", sorted(full.waiting(solera.engine)), "spans:", dict(m.partial_spans))
     hold.set()
     await solera.wait(rebuild_run)
     await solera.wait(reader)

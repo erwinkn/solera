@@ -26,7 +26,7 @@ async def source_versions(engine):
     strict=True, reason="ERW-27: a source's load report names a commit without the source's life"
 )
 async def test_source_report_does_not_cross_a_source_life(tmp_path, monkeypatch):
-    s = Solera(tmp_path, "core")
+    s = Solera(tmp_path)
     try:
 
         def project(store):
@@ -75,7 +75,7 @@ async def test_source_report_does_not_cross_a_source_life(tmp_path, monkeypatch)
 
 @pytest.mark.xfail(strict=True, reason="ERW-27: the staleness views keep their inputs across an await")
 async def test_staleness_restarts_when_its_asset_is_removed(tmp_path, monkeypatch):
-    s = Solera(tmp_path, "core")
+    s = Solera(tmp_path)
     try:
 
         @asset(outputs=Output("files", key="id"))
@@ -112,7 +112,7 @@ async def test_staleness_restarts_when_its_asset_is_removed(tmp_path, monkeypatc
 
 @pytest.mark.xfail(strict=True, reason="ERW-27: a sensor tick checks the deploy only on its success path")
 async def test_sensor_deploy_during_prepare_is_refused_not_failed(tmp_path, monkeypatch):
-    s = Solera(tmp_path, "core")
+    s = Solera(tmp_path)
 
     def project(two):
         @sensor(every=1, commits=["a", "b"] if two else ["a"])
@@ -151,7 +151,7 @@ async def test_sensor_deploy_during_prepare_is_refused_not_failed(tmp_path, monk
 
 @pytest.mark.xfail(strict=True, reason="ERW-27: a sensor snapshot names a commit without the source's life")
 async def test_sensor_snapshot_does_not_cross_source_lives(tmp_path):
-    s = Solera(tmp_path, "core")
+    s = Solera(tmp_path)
 
     def project(store):
         @sensor(every=1, commits=["feed"])
@@ -188,7 +188,7 @@ async def test_sensor_snapshot_does_not_cross_source_lives(tmp_path):
 
 @pytest.mark.xfail(strict=True, reason="ERW-27: the sensor long-poll keeps the deploy it started under")
 async def test_old_deploy_sensor_long_poll_cannot_claim_a_new_deploy_tick(tmp_path):
-    s = Solera(tmp_path, "core")
+    s = Solera(tmp_path)
 
     def project(new):
         def body(ctx):
@@ -217,7 +217,7 @@ async def test_old_deploy_sensor_long_poll_cannot_claim_a_new_deploy_tick(tmp_pa
     strict=True, reason="ERW-27: a source's load report names a commit without the source's life"
 )
 async def test_a_finished_attempt_never_reports_an_old_load_into_a_new_source_life(tmp_path, monkeypatch):
-    s = Solera(tmp_path, "core")
+    s = Solera(tmp_path)
     first, before, after = Outside(), Outside(), Outside()
     first.feed["k"] = before.feed["k"] = "v2"
     after.feed["k"] = "v2"

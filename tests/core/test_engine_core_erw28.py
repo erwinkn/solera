@@ -14,9 +14,9 @@ from tests.contract.harness import Solera, rebuild
 ERW28 = "ERW-28: two runs of one reader walk from their own progress and read a batch twice"
 
 
-@pytest.fixture(params=["core", "today"])
-async def solera(tmp_path, request):
-    namespace = Solera(tmp_path, request.param)
+@pytest.fixture
+async def solera(tmp_path):
+    namespace = Solera(tmp_path)
     yield namespace
     await namespace.close()
 

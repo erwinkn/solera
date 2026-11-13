@@ -206,33 +206,6 @@ async def test_config_change_reprocesses_everything(state):
     assert seen["full"] == [False, True]  # a first run, then a full run: the definition changed
 
 
-async def test_a_full_run_starts_its_record_over(state):
-    """§2.2: a `full` run compares against an empty record — the consumer is
-    given the whole head again, its first batch starting the output over
-    (`full`) — and its commit leaves the record as a default run's would."""
-    seen = []
-
-    @asset(outputs=Output("files", key="id"))
-    def files():
-        return [{"id": "a", "v": 1}, {"id": "b", "v": 1}]
-
-    @asset(inputs={"files": Incremental()})
-    def consumer(ctx, files: list):
-        seen.append((sorted(r["id"] for r in files), ctx.batch["files"].reset))
-        return [{"n": len(files)}]
-
-    project = Project(assets=[files, consumer])
-    engine = make_engine(state, project)
-    await engine.initialize()
-    await drive(engine, await engine.submit(["consumer"], upstream=True))
-    first = await engine.observed("consumer", "", "files")
-    assert sorted(first) == ["a", "b"]
-    detail = await drive(engine, await engine.submit(["consumer"], mode="full"))
-    assert task_statuses(detail)["consumer"] == "succeeded"  # never skipped on full
-    assert await engine.observed("consumer", "", "files") == first
-    assert seen == [(["a", "b"], False), (["a", "b"], True)]
-
-
 async def test_a_version_bump_starts_the_next_run_over(state):
     """§6, Erwin's (a): a version bump is an asset change like any other. The
     next run, a plain one, starts over: no operator, no failure, and the

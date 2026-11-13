@@ -15,25 +15,15 @@ from solera_server.tracking import full
 from tests.contract.harness import Solera, rebuild
 
 
-@pytest.fixture(
-    params=[
-        "core",
-        pytest.param(
-            "today",
-            marks=pytest.mark.xfail(
-                strict=True, reason="ERW-27: today's path runs no clear after a sibling's reset"
-            ),
-        ),
-    ]
-)
-async def solera(tmp_path, request):
-    s = Solera(tmp_path, request.param)
+@pytest.fixture
+async def solera(tmp_path):
+    s = Solera(tmp_path)
     yield s
     await s.close()
 
 
 async def test_another_runs_commit_does_not_validate_a_pre_reset_task_cursor(tmp_path, monkeypatch):
-    s = Solera(tmp_path, "core")
+    s = Solera(tmp_path)
     entered = asyncio.Event()
 
     def project(store):

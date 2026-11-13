@@ -102,7 +102,7 @@ class Observing:
         for input in inputs:
             if input.kind != "incremental":
                 continue
-            if self.core is not None and self._keyed(input):  # the new path: the edge's empty part
+            if self._keyed(input):  # the new path: the edge's empty part
                 edge = self.m.core_edges.get((asset, partition, input.param))
                 read = self.m.core_read.get((asset, partition, input.param))
                 if edge is None or read != self.m.core_outputs.get((input.output, input.partition)):
@@ -116,9 +116,7 @@ class Observing:
                     out.append(((asset, partition, input.param), stamp, input, {"core": empty}))
                 continue
             rec = records.get(input.param)
-            if rec is None or (
-                self.core is not None and (asset, partition, input.param) in self.m.core_empty
-            ):
+            if rec is None or (asset, partition, input.param) in self.m.core_empty:
                 return None  # never read, or a walk from empty not done (an unkeyed input's, on the core)
             holes = observed.gaps(rec)
             if not holes:
@@ -186,8 +184,7 @@ class Observing:
             for key, record in self.m.partitions.items()
             if any(observed.gaps(rec) for rec in (record.get("observed") or {}).values())
         ]
-        if self.core is not None:  # the new path: edges holding nothing past some key
-            gappy += sorted({(asset, partition) for asset, partition, _ in self.m.core_empty})
+        gappy += sorted({(asset, partition) for asset, partition, _ in self.m.core_empty})
         for asset, partition in gappy:
             if asset in self.manifest["assets"]:
                 await self.complete(asset, partition)

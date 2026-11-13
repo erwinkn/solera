@@ -1,6 +1,5 @@
 """The generated conformance kit (`solera.testing.storemachine`) against the
-shipped stores, the guide's example store and the simulation's in-memory
-fenced store: random sequences of attempts, stale writers, duplicates,
+shipped stores and the guide's example store: random sequences of attempts, stale writers, duplicates,
 retries, pinned readers, cleanups and batches, checked after every step."""
 
 import os
@@ -11,35 +10,14 @@ import pytest
 from hypothesis import HealthCheck, settings
 from solera.testing.storemachine import stateful
 
-from .test_store_conformance import HARNESSES, fresh
+from .test_store_conformance import HARNESSES
 
 RUNS = int(os.environ.get("SOLERA_STORE_MACHINE_RUNS", 30))
 
 
-def table_harness(_tmp):
-    import contextlib
-
-    from solera.testing.stores import Harness
-
-    from ..sim.stores import Database, TableStore
-
-    store = TableStore(Database())
-
-    @contextlib.asynccontextmanager
-    async def hold(partition):
-        """The older writer's transaction, open: the partition's lock held, its fence taken."""
-
-        table = store._table(partition.output, None)
-        async with store.db.lock(table, partition.partition):
-            store.db.fences[(table, partition.partition)] = store._fence(partition, table)
-            yield
-
-    return Harness(store, fresh("db"), hold)
-
-
-@pytest.mark.parametrize("name", ["file", "table", "postgres", "example", "s3"])
+@pytest.mark.parametrize("name", ["file", "postgres", "example", "s3"])
 def test_a_store_conforms_under_random_sequences(name, request):
-    make = table_harness if name == "table" else HARNESSES[name]
+    make = HARNESSES[name]
     make(Path(tempfile.mkdtemp()))  # skips here, not inside Hypothesis, when its backend is absent
     machine = stateful(lambda: make(Path(tempfile.mkdtemp())))
     slow = request.config.getoption("--slow")

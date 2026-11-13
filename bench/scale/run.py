@@ -1,6 +1,5 @@
 """The scale harness's driver (README.md): one end-to-end run of the cast at
-scale, through the real engine, its API and pool workers, on the tracking
-path `$SOLERA_TRACKING` names.
+scale, through the real engine, its API and pool workers.
 
     uv run --no-sync python bench/scale/run.py --keys 100000000 --days 30 --root /data/scale
 
@@ -70,7 +69,6 @@ def cpus(spec: str) -> list[str]:
 class Run:
     def __init__(self, args):
         self.args, self.root = args, Path(args.root).resolve()
-        self.path = os.environ.get("SOLERA_TRACKING", "today")
         self.token = secrets.token_hex(16)
         self.url = f"http://127.0.0.1:{args.port}"
         self.env = {
@@ -79,7 +77,6 @@ class Run:
             "SCALE_BATCH": str(args.batch),
             "SOLERA_API_TOKEN": self.token,
             "SOLERA_PROJECT": str(HERE / "project.py"),
-            "SOLERA_TRACKING": self.path,
             "SOLERA_CONCURRENCY": str(args.concurrency),
             "SCALE_FORM": args.form,
             "PYTHONPATH": os.pathsep.join(filter(None, [str(REPO), os.environ.get("PYTHONPATH")])),
@@ -536,7 +533,6 @@ class Run:
             "memory_gb": round(os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE") / 2**30),
         }
         return {
-            "path": self.path,
             "commit": head,
             "machine": machine,
             "args": vars(self.args),
@@ -576,7 +572,7 @@ def report(results: dict) -> str:
     days = [p for p in phases if p["phase"].startswith("day ")]
     a = results["args"]
     out = [
-        f"# Scale run: {a['keys']:,} keys, {a['days']} days, `{results['path']}` path",
+        f"# Scale run: {a['keys']:,} keys, {a['days']} days",
         "",
         f"Commit {results['commit'][:10]}; {results['machine']['cpus']} CPUs, {results['machine']['memory_gb']} GB; "
         f"engine on CPUs `{a['engine_cpus'] or 'all'}`, {a['workers']} workers, concurrency {a['concurrency']}, "

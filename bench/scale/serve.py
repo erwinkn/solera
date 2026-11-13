@@ -1,7 +1,5 @@
 """The scale harness's engine (README.md): the engine and its API as
-`solera serve` runs them, on the tracking path `$SOLERA_TRACKING` names
-(`today` or `core`, as the contract harness selects it), with its event
-loop timed. run.py starts it, pinned to the engine's CPUs.
+`solera serve` runs them, with its event loop timed. run.py starts it, pinned to the engine's CPUs.
 
     python bench/scale/serve.py STATE_URL PROJECT PORT
 
@@ -37,8 +35,6 @@ from solera_server.state import State
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from run import BUCKETS  # noqa: E402
-
-from tests.contract.harness import engine_options, state_options  # noqa: E402
 
 ROOT = Path(os.environ.get("SCALE_ROOT", ".solera/scale"))
 THREADS: defaultdict[str, float] = defaultdict(float)  # thread CPU seconds by BUCKETS part
@@ -123,17 +119,15 @@ def _rss() -> int:
 
 
 async def serve(state_url: str, project: str, port: int) -> None:
-    path = os.environ.get("SOLERA_TRACKING", "today")
     loop = Loop(asyncio.get_running_loop())
     manifest = await load_manifest(project)
-    state = await State.open(state_url, "scale", **state_options(path))
+    state = await State.open(state_url, "scale")
     engine = Engine(
         state,
         manifest,
         project=project,
         concurrency=int(os.environ.get("SOLERA_CONCURRENCY", "4")),
         engine_url=f"http://127.0.0.1:{port}",
-        **engine_options(path),
     )
     await engine.initialize()
     app = create_app(engine=engine, token=os.environ["SOLERA_API_TOKEN"])

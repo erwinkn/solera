@@ -4,7 +4,6 @@ append-only input is a commit number without the upstream's life. After the upst
 its old commit number on the new life."""
 
 import asyncio
-import os
 
 import pytest
 from solera.sdk import Incremental, Output, Project, Retry, asset
@@ -13,14 +12,12 @@ from solera_server.executors.inline import InlinePlacement
 
 from tests.contract.harness import Solera
 
-PATH = os.environ.get("TRACKING_PATH", "core")
-
 
 @pytest.mark.xfail(
     strict=True, reason="ERW-28: the commit cursor of an append-only input does not name the upstream life"
 )
 async def test_a_paused_runs_commit_cursor_survives_its_upstreams_reset(tmp_path, monkeypatch):
-    s = Solera(tmp_path, PATH)
+    s = Solera(tmp_path)
     n, pages, projects = [0], [], {}
 
     def project(store):

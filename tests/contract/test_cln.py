@@ -215,7 +215,7 @@ async def test_cln_9_a_store_root_belongs_to_one_namespace(solera, tmp_path):
     spec = importlib.util.spec_from_file_location("shared_project", module)
     spec.loader.exec_module(loaded := importlib.util.module_from_spec(spec))
     project = loaded.project
-    staging = Solera(tmp_path / "staging", solera.path)
+    staging = Solera(tmp_path / "staging")
     try:
         await staging.deploy(project)
         await staging.run("files")  # staging claims the root

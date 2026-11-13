@@ -233,7 +233,7 @@ async def assert_replay(s):
 
 @pytest.mark.parametrize("seed", SEEDS)
 async def test_deploys_at_every_await(tmp_path, monkeypatch, seed):
-    s = Solera(tmp_path, "core")
+    s = Solera(tmp_path)
     h = History(s, seed)
     try:
         await s.deploy(h.project(h.variant))

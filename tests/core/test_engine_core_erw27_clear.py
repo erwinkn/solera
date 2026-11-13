@@ -10,7 +10,7 @@ from tests.contract.harness import Solera, rebuild
 
 @pytest.mark.parametrize("moved", ["upstream", "own value output", "own keyed output"])
 async def test_c1_value_outputs_and_a_reset(tmp_path, moved):
-    s = Solera(tmp_path, "core")
+    s = Solera(tmp_path)
     rows = {"a": 1, "b": 1, "c": 1}
     batches = []
 
@@ -71,9 +71,8 @@ async def test_c1_value_outputs_and_a_reset(tmp_path, moved):
     strict=True, reason="ERW-27: a full run's clear rides on its first batch's commit of each output"
 )
 async def test_c3_a_start_over_whose_first_batch_omits_an_output_never_clears_it(tmp_path):
-    import os
 
-    s = Solera(tmp_path, os.environ.get("TRACKING_PATH", "core"))
+    s = Solera(tmp_path)
     rows, omit = {"a": 1, "b": 1, "c": 1}, [False]
 
     @asset(outputs=Output("files", key="id"))
