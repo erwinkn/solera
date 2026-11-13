@@ -10,8 +10,6 @@ task's progress key, the next `batch_size` keys owed on any of them, in key
 order, with their classes, each input at its own head. The plan's bytes go
 into the attempt's spec untouched (`spec["plan"]`); the engine keeps them in
 memory for the commit, which reads them back from the spec after a restart.
-Unkeyed incremental inputs are planned as today's path plans them, by
-commit numbers.
 """
 
 from __future__ import annotations
@@ -88,10 +86,10 @@ async def prepare(core: Core, task: dict, run: dict, attempt: str | None) -> dic
 async def _prepare(core: Core, task: dict, run: dict, attempt: str | None) -> dict:
     """An attempt's preparation on the new path: `Engine._prepare`'s result,
     with the plan's bytes under `plan` (kept out of the journal), and under
-    `gate` every upstream head it reads, `[output, partition, commit]`: a
-    whole input's as pinned, a keyed input's as planned, an unkeyed input's
-    planned end. A partial one sends it back to wait (`HeldBack`); its commit
-    checks them again (`full.held`)."""
+    `gate` every upstream head it reads, `[output, partition, commit, life]`:
+    a whole input's as pinned, an incremental input's as planned. A partial
+    one sends it back to wait (`HeldBack`); its commit checks them again
+    (`full.held`)."""
 
     engine, m = core.engine, core.m
     base = engine._pin_inputs(task, run)
@@ -104,40 +102,18 @@ async def _prepare(core: Core, task: dict, run: dict, attempt: str | None) -> di
                 heads += [[s, "", m.axis_head(s, ""), m.life(s, "")] for s in dynamic_sets(input)]
     if (why := held(m, heads)) is not None:
         raise HeldBack(f"{why[0]}: {why[1]}")
-    # With incremental inputs, a run starts over as today's path decides (`_full_run`): a full
-    # run's first batch, a definition other than the partition was built under, an input reset.
-    if base["incremental"]:
-        base["full"] = engine._full_run(task, run, base["incremental"]) is not None
+    if base["incremental"]:  # a full run's first batch, or a definition the partition was not built under
+        base["full"] = engine._full_run(task, run) is not None
     full = base["full"]
     pins = base["pins"]
-    keyed = [i for i in base["incremental"] if engine._keyed(i)]
-    unkeyed = [i for i in base["incremental"] if not engine._keyed(i)]
+    keyed = base["incremental"]
     refuse(engine, task, run, keyed)
     if any(restarted(core, task, i) for i in keyed):  # an upstream's new life is read in full, from the start
         full = base["full"] = True
     progress = {} if full else task.get("progress") or {}
     plans, all_empty, plan_bytes = {}, True, None
-    for input in unkeyed:  # by commit numbers, as today
-        mine = progress.get(input.param)
-        record = (engine.m.partition(task["asset"], task["partition"]).get("observed") or {}).get(input.param)
-        o = engine._commits(input, record, mine, full)
-        pin, plan, empty = engine._commits_pin(input, engine._pin_at(input.output, input.partition), o)
-        pins[input.param], plans[input.param] = pin, plan
-        if not plan.get("done"):  # the commit its walk goes to: pages before it are the walk's own
-            heads.append([input.output, input.partition, o["head"], m.life(input.output, input.partition)])
-        all_empty = all_empty and empty
     mine = progress.get(WALK)
-    if keyed and mine is not None and mine["key"] is None:  # walked to the end in this task
-        # While unkeyed inputs go on, each keyed one is delivered empty and final, its edge left be.
-        index = int(mine["batch"]) + 1
-        for n, input in enumerate(keyed):
-            pins[input.param] = {
-                "ref": engine._pin_at(input.output, input.partition),
-                "core": n,
-                "batch": {"index": index, "count": index + 1, "final": True, "reset": False},
-            }
-            plans[input.param] = {"kind": "core", "output": input.output, "final": True, "done": True}
-    elif keyed:
+    if keyed:
         edges = open_edges(core, task, keyed)
         core.attach(*(core.m.core_edges[(task["asset"], task["partition"], i.param)][1] for i in keyed))
         after = (mine or {}).get("key")

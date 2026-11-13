@@ -250,45 +250,6 @@ async def test_a_key_list_that_would_hold_its_key_back_is_planned_again_and_comp
     assert await solera.engine.complete("join", "") and full.waiting(solera.engine) == set()
 
 
-async def test_a_whole_reader_waits_for_a_full_run_over_unkeyed_inputs(solera, tmp_path):
-    entered, release, holding, seen = asyncio.Event(), asyncio.Event(), [False], []
-
-    @asset(outputs=Output("events", incremental=True))
-    def events():
-        return Patch([{"n": 1}])
-
-    @asset(inputs={"events": Incremental(batch_size=1)})
-    async def digest(ctx, events: list):
-        b = ctx.batch["events"]
-        if holding[0] and b.index == 1:
-            entered.set()
-            await release.wait()
-        prior = 0 if b.reset else (await ctx.load() or {"n": 0})["n"]
-        return {"n": prior + len(events)}
-
-    @asset(inputs={"digest": In()})
-    def report(digest: dict):
-        seen.append(digest["n"])
-        return digest
-
-    await solera.deploy(Project(assets=[events, digest, report], default_store=FileStore(tmp_path / "data")))
-    for _ in range(3):
-        await solera.run("events")
-    await solera.run("digest")
-    holding[0] = True
-    rebuild = await solera.submit("digest", mode="full")
-    await solera.until(entered.is_set)
-    try:
-        reader = await solera.submit("report")
-        task = await decided(solera, reader, "report")
-        assert task.get("held") == [INCOMPLETE, "digest"] and seen == [], (task, seen)
-    finally:
-        release.set()
-        await solera.wait(rebuild)
-    await solera.wait(reader)
-    assert seen == [3] and full.waiting(solera.engine) == set()
-
-
 async def test_a_rebound_input_closes_its_edge_at_deploy(solera, tmp_path):
     def project(up):
         @asset(outputs=Output("left", key="id"))

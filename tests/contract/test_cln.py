@@ -753,36 +753,3 @@ async def test_cln_13_an_output_whose_history_outgrows_its_live_keys_raises_an_a
 
     await solera.until(merged)
     assert await solera.alarmed("items", "copy")
-
-
-# -- CLN-14 -----------------------------------------------------------------------
-
-
-async def test_cln_14_an_append_only_output_keeps_everything_by_default(solera):
-    """`events` appends daily and keeps every commit, whatever its runs'
-    retention: `digest`, paused 40 days, gets the 40 days' events once
-    retention has run, not a full run."""
-
-    day, received = [0], []
-
-    @asset(outputs=Output("events", incremental=True))
-    def events():
-        return Patch([{"day": day[0]}])
-
-    @asset(inputs={"events": Incremental()})
-    def digest(ctx, events: list):
-        received.append((ctx.batch["events"].reset, [e["day"] for e in events]))
-        return len(events)
-
-    await solera.deploy(Project(assets=[events, digest], retention=Retention(days=7)))
-    await solera.run("events")
-    await solera.run("digest")
-    await solera.start()
-    runs = []
-    for day[0] in range(1, 41):
-        solera.advance(DAY)
-        runs.append((await solera.run("events"))["request"]["id"])
-        if day[0] % 10 == 0:  # every ten days, retention has cut: the run of eight days ago is gone
-            await expired(solera, runs[day[0] - 9])
-    await solera.run("digest")
-    assert received == [(False, [0]), (False, list(range(1, 41)))]

@@ -7,7 +7,7 @@ import asyncio
 
 import pytest
 from solera.sdk import Incremental, Output, Project, Retry, asset
-from solera.stores import FileStore, Patch
+from solera.stores import FileStore
 
 from tests.contract.harness import Solera, rebuild
 
@@ -19,47 +19,6 @@ async def solera(tmp_path):
     namespace = Solera(tmp_path)
     yield namespace
     await namespace.close()
-
-
-@pytest.mark.xfail(strict=True, reason=ERW28)
-async def test_two_runs_of_a_paged_append_reader(solera):
-    rows, pages = {k: 1 for k in "abcdef"}, []
-
-    @asset(outputs=Output("files", key="id"))
-    def files():
-        return [{"id": k, "v": v} for k, v in rows.items()]
-
-    @asset(inputs={"files": Incremental(batch_size=1)}, outputs=Output("log", incremental=True))
-    def log(ctx, files: list):
-        return Patch([{"id": r["id"]} for r in files])
-
-    @asset(inputs={"log": Incremental(batch_size=2)}, outputs=Output("tail"), retries=Retry(n=0))
-    async def tail(ctx, log: list):
-        b = ctx.batch["log"]
-        held = [] if b.reset else (await ctx.load() or [])
-        pages.append(
-            (
-                ctx.run_id if hasattr(ctx, "run_id") else None,
-                b.index,
-                b.reset,
-                [b.upstream.commits[0], b.upstream.commits[-1]],
-            )
-        )
-        import asyncio
-
-        await asyncio.sleep(0.2)
-        return held + [r["id"] for r in log]
-
-    await solera.deploy(Project(assets=[files, log, tail], default_store=FileStore(solera.root / "data")))
-    await solera.run("files")
-    await solera.run("log")
-    one = await solera.submit("tail", mode="full")
-    two = await solera.submit("tail", mode="full")
-    await solera.wait(one, 30)
-    await solera.wait(two, 30)
-    got = await solera.read("tail")
-    print("PAGES", pages, "GOT", got)
-    assert sorted(got) == sorted(set(got)), (got, pages)
 
 
 @pytest.mark.parametrize(

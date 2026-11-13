@@ -116,7 +116,7 @@ and unchanged; removed keys have none, and `rows` is the parameter),
 `index` (0-based in the run), `count` (batches planned, an estimate),
 `first`, `final` (no batch of this run follows; never inferred from
 `count`), `reset` (the first batch of a full run, SEL-9), `upstream` (its
-output; for an unkeyed upstream the commit range). A run of 3 batches
+output). A run of 3 batches
 gives `index` 0, 1, 2 and `final` only on the last.
 
 **INC-11. `ctx.load()` returns the asset's own output as materialized; `None` before its first commit.**
@@ -128,11 +128,6 @@ what was materialized before it (SEL-9).
 **INC-12. A task walks what it owes in key order, `batch_size` keys a commit.**
 Seven owed keys, `batch_size=3`: three batches, three commits. Default
 `batch_size` is 10,000 for every incremental input.
-
-**INC-13. An unkeyed incremental upstream delivers the commits after the last one read; its reset is delivered as a start-over.**
-`events` (unkeyed, append) commits 0–9; `digest` read through 6; its next
-batch gets commits 7–9 (`upstream.commits`). If `events` is run `full`,
-`digest` starts over rather than receiving the reset as a delta.
 
 **INC-14. Writing is changing; writing nothing wakes nothing.**
 `items` returns an empty `Patch`: no commit, no `OnChange`. It writes the
@@ -819,11 +814,6 @@ When that attempt settles, the file goes.
 is rewritten daily: past a set multiple of `items`' live keys, an alarm
 names `copy` and its place. Releasing that place lets the history go, and
 `copy` then owes a full run.
-
-**CLN-14. An append-only output keeps everything unless it opts into a retention; a consumer behind the retention edge is warned, then owes a full run over what remains.**
-`events` keeps 30 days; `digest` reads it incrementally and is paused 40
-days: before its place falls behind, it is marked "behind retention"; its
-next run is a full run over the 30 days `events` still holds.
 
 ## ENG — engine crashes, restarts, zombies and fencing
 

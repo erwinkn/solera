@@ -73,14 +73,11 @@ class Staleness:
     async def input_changed(self, asset: str, partition: str, planner, inputs) -> bool:
         """An input owes it something (the module docstring)."""
 
-        keyed = any(self._keyed(i) for i in inputs)
-        for input in inputs:
-            if self._keyed(input):  # the new path: a plan of one key
-                if await core_stale.owes(self.core, asset, partition, input, planner, inputs):
-                    return True
-            elif input.kind == "incremental" and self._input_behind(asset, partition, input):
+        incremental = [i for i in inputs if i.kind == "incremental"]
+        for input in incremental:  # a plan of one key
+            if await core_stale.owes(self.core, asset, partition, input, planner, inputs):
                 return True
-        if keyed or not any(self._versioned(i) for i in inputs):
+        if incremental or not any(self._versioned(i) for i in inputs):
             return False
         return self.m.partition(asset, partition).get("context") != self._context(planner, inputs)
 
@@ -117,19 +114,6 @@ class Staleness:
         if input.fan_in:
             return list(planner.fan_in(input, materialized=True))
         return [input.partition]
-
-    def _input_behind(self, asset: str, partition: str, input) -> bool:
-        """Whether an unkeyed incremental input has commits past the last one
-        it read — or what it read no longer holds (its upstream started
-        over), or it never read one."""
-
-        rec = (self.m.partition(asset, partition).get("observed") or {}).get(input.param)
-        head = self.m.heads.get((input.output, input.partition))
-        if head is None:
-            return False
-        if rec is None or not self._still(rec, input):
-            return True
-        return int(rec["commit"]) < int(head.get("commit_number", -1))
 
     async def stale_keys(
         self, asset: str, partition: str = "", *, after: str | None = None, limit=1000

@@ -16,7 +16,7 @@ from solera.sdk import (
     asset,
     canonical_partition,
 )
-from solera.stores import FileStore, Patch
+from solera.stores import FileStore
 from solera_server.tracking import full
 
 from tests.contract.harness import Outside, Solera, SourceStore, rebuild
@@ -447,69 +447,6 @@ async def test_a_fan_in_after_its_upstreams_upstream_moved(solera, capsys):
 # test_append_reader.py: What an unkeyed incremental reader of an append-only output reads after its producer's full run:
 
 
-async def test_what_the_reader_of_an_append_only_output_reads_after_a_full_run(solera, capsys):
-    rows = {"a": 1, "b": 1, "c": 1}
-    pages, commits = [], []
-
-    @asset(outputs=Output("files", key="id"))
-    def files():
-        return [{"id": k, "v": v} for k, v in rows.items()]
-
-    @asset(inputs={"files": Incremental(batch_size=1)}, outputs=Output("log", incremental=True))
-    def log(ctx, files: list):
-        return Patch([{"id": r["id"]} for r in files])
-
-    @asset(inputs={"log": Incremental(batch_size=10)}, outputs=Output("tail"))
-    def tail(ctx, log: list):
-        b = ctx.batch["log"]
-        pages.append({"reset": b.reset, "commits": b.upstream.commits, "rows": sorted(r["id"] for r in log)})
-        return {"n": len(log)}
-
-    await solera.deploy(Project(assets=[files, log, tail], default_store=FileStore(solera.root / "data")))
-    eng = solera.engine
-
-    def spy():
-        record = solera.state.record
-
-        def spied(*events, **kw):
-            out = record(*events, **kw)
-            for e in events:
-                if e.get("type") == "AttemptFinished" and e.get("commit"):
-                    head = eng.m.heads.get(("log", "")) or {}
-                    commits.append(
-                        {
-                            "task": eng.m.task(e["task"])["asset"] if eng.m.task(e["task"]) else None,
-                            "log head": (head.get("commit_number"), head.get("base")),
-                            "empty": {k[0] + "." + k[2]: v for k, v in eng.m.core_empty.items()},
-                        }
-                    )
-            return out
-
-        solera.state.record = spied
-
-    spy()
-    await solera.run("files")
-    await solera.run("log")
-    await solera.run("tail")
-    first = list(commits), list(pages)
-    commits.clear(), pages.clear()
-    await solera.run("log", mode="full")
-    after_full = list(commits)
-    commits.clear()
-    plan = eng._commits(
-        next(i for i in eng.planner().inputs("tail", "") if i.param == "log"),
-        (eng.m.partition("tail", "").get("observed") or {}).get("log"),
-        None,
-        True,
-    )
-    await solera.run("tail")
-    with capsys.disabled():
-        print("\nfirst runs:", first)
-        print("log full run commits:", after_full)
-        print("tail's next plan (full, since the base moved):", plan)
-        print("tail read:", pages)
-
-
 # test_deploy_round_trip.py: A deploy closes an input's edge (the input becomes In(), or its parameter is renamed) and a
 
 
@@ -730,50 +667,6 @@ async def test_one_stale_queued_task_does_not_stop_the_dispatch_pass(solera):
     )
 
 
-async def test_after_a_premature_end_the_gate_still_holds(solera, tmp_path):
-    rows = {"a": 1, "b": 1, "c": 1}
-    seen = []
-
-    def project(version):
-        @asset(outputs=Output("files", key="id"))
-        def files():
-            return [{"id": k, "v": v} for k, v in rows.items()]
-
-        @asset(outputs=Output("events", incremental=True))
-        def events():
-            return Patch([{"n": 1}])
-
-        @asset(
-            inputs={"files": Incremental(batch_size=2), "events": Incremental(batch_size=1)},
-            outputs=Output("copy", key="id"),
-            version=version,
-        )
-        async def copy(ctx, files: list, events: list):
-            return rebuild(ctx.batch["files"], [{"id": r["id"], "v": r["v"]} for r in files])
-
-        @asset(inputs={"copy": In()})
-        def report(copy: list):
-            seen.append(sorted(r["id"] for r in copy))
-            return len(copy)
-
-        return Project(assets=[files, events, copy, report], default_store=FileStore(tmp_path / "data"))
-
-    await solera.deploy(project("1"))
-    await solera.run("files")
-    for _ in range(3):
-        await solera.run("events")
-    await solera.run("copy")
-    await solera.deploy(project("2"))
-    await solera.run("copy", keys={"files": ["a"]})
-    eng = solera.engine
-    reader = await solera.submit("report")
-    await solera.settle(0.5)
-    assert ("copy", "") in full.waiting(eng), full.waiting(eng)
-    assert seen == [], seen
-    assert [s["output"] for s in full.stopped(eng)] == ["copy"]
-    await solera.cancel(reader["id"])
-
-
 # test_regress_complete.py: A producer stopped midway is complete once the rest is deleted upstream (STA-10). A key
 
 
@@ -908,30 +801,3 @@ async def test_a_first_run_by_a_key_list_that_takes_nothing_holds_its_readers(so
     await solera.run("copy")
     await solera.settle(1.0)
     assert seen[-1] == ["a", "b", "c"] and sorted(sum(batches, [])) == ["a", "b", "c"]
-
-
-@pytest.mark.parametrize("size", [1, 2, 3])
-async def test_a_paged_reader_of_an_append_only_output_reads_the_whole_run(solera, size):
-    rows, pages = {"a": 1, "b": 1, "c": 1}, []
-
-    @asset(outputs=Output("files", key="id"))
-    def files():
-        return [{"id": k, "v": v} for k, v in rows.items()]
-
-    @asset(inputs={"files": Incremental(batch_size=1)}, outputs=Output("log", incremental=True))
-    def log(ctx, files: list):
-        return Patch([{"id": r["id"]} for r in files])
-
-    @asset(inputs={"log": Incremental(batch_size=size)}, outputs=Output("tail"), retries=Retry(n=0))
-    async def tail(ctx, log: list):
-        b = ctx.batch["log"]
-        held = [] if b.reset else (await ctx.load() or [])
-        pages.append([b.upstream.commits[0], b.upstream.commits[-1]])
-        return held + [r["id"] for r in log]
-
-    await solera.deploy(Project(assets=[files, log, tail], default_store=FileStore(solera.root / "data")))
-    await solera.run("files")
-    await solera.run("log")
-    detail = await solera.wait(await solera.submit("tail"), 10)
-    assert detail["request"]["status"] == "succeeded", detail
-    assert await solera.read("tail") == ["a", "b", "c"], pages

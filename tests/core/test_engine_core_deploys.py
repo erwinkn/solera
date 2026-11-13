@@ -3,11 +3,9 @@ sends the batch back (a rename and back included), a deploy during a coverage ch
 tick, and an append-only name reused after a rename is a new life (Sol's probes of PR 2's
 redesign, round 2)."""
 
-import asyncio
-
-from solera.sdk import DynamicPartitions, In, Incremental, Output, Project, Retry, asset
+from solera.sdk import DynamicPartitions, In, Incremental, Output, Project, asset
 from solera.stores import FileStore, Patch
-from solera_server.tracking import full, stale
+from solera_server.tracking import stale
 
 from tests.contract.harness import Solera
 
@@ -117,70 +115,4 @@ async def test_a_deploy_during_a_coverage_check_stops_no_tick(tmp_path, monkeypa
         await engine.tick()
         assert changed
     finally:
-        await s.close()
-
-
-async def test_an_append_output_name_reused_after_a_rename_is_a_new_life(tmp_path):
-    s = Solera(tmp_path)
-    report_entered, report_release = asyncio.Event(), asyncio.Event()
-    copy_entered, copy_release = asyncio.Event(), asyncio.Event()
-    copy_release.set()
-
-    def project(renamed=False, reuse=False):
-        @asset(outputs=Output("files", key="id"))
-        def files():
-            return [{"id": k} for k in "abc"]
-
-        def producer(name, aliases=()):
-            async def body(ctx, files: list):
-                if ctx.batch["files"].index > 0:
-                    copy_entered.set()
-                    await copy_release.wait()
-                return Patch(files)
-
-            body.__name__ = body.__qualname__ = name
-            return asset(
-                inputs={"files": Incremental(batch_size=1)},
-                outputs=Output(incremental=True),
-                aliases=list(aliases),
-                retries=Retry(n=0),
-            )(body)
-
-        @asset(inputs={"rows": In("new" if renamed else "old")}, retries=Retry(n=0))
-        async def report(rows: list):
-            report_entered.set()
-            await report_release.wait()
-            return len(rows)
-
-        assets = [files, producer("new", [] if reuse else ["old"]) if renamed else producer("old"), report]
-        if reuse:
-            assets.append(producer("old"))
-        return Project(assets=assets, default_store=FileStore(tmp_path / "data"))
-
-    try:
-        await s.deploy(project(), cancel_grace=0.1, heartbeat_seconds=0.1)
-        await s.run("files")
-        await s.run("old")
-        reader = await s.submit("report")
-        await s.until(report_entered.is_set)
-        task = next(t for t in s.engine.m.runs[reader["id"]]["tasks"].values() if t["asset"] == "report")
-        pin = task["launched"]["prepared"]["gate"]
-        await s.deploy(project(renamed=True), cancel_grace=0.1, heartbeat_seconds=0.1)
-        await s.deploy(project(renamed=True, reuse=True), cancel_grace=0.1, heartbeat_seconds=0.1)
-        copy_entered.clear()
-        copy_release.clear()
-        partial = await s.submit("old")
-        await s.until(copy_entered.is_set)
-        await s.cancel(partial["id"])
-        await s.wait(partial)
-        copy_release.set()
-        assert full.waiting(s.engine) == {("old", "")}
-        assert full.held(s.engine.m, pin) is None
-        report_release.set()
-        detail = await s.wait(reader, 10)
-        outcomes = [a["outcome"] for a in sum(detail["attempts"].values(), [])]
-        assert detail["request"]["status"] == "succeeded" and outcomes == ["succeeded"], outcomes
-    finally:
-        report_release.set()
-        copy_release.set()
         await s.close()
