@@ -28,13 +28,6 @@ PENDING: dict[str, str] = {
 LATER: dict[str, str] = {
     "test_aut_7_automated_outputs_converge_on_their_sources": "B6: its project has a per-key asset",
     **dict.fromkeys(["KEY", "STA-15", "HIS-6"], "B6: per-key assets"),
-    **dict.fromkeys(
-        [
-            "test_sto_1_a_store_declares_no_kind",
-            "test_sto_1_registration_refuses_a_store_missing_a_method",
-        ],
-        "B8: stores still declare how they write (`writes`)",
-    ),
     **dict.fromkeys(["CLN", "RST-8", "PAR-6", "ENG-13", "ENG-14"], "B9: retention and upkeep"),
     **dict.fromkeys(["HIS-3", "HIS-5", "HIS-7", "HIS-8"], "B10: lineage"),
 }

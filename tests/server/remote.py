@@ -25,8 +25,6 @@ class Gated(FileStore):
     """FileStore's layout, declared `fenced`: its attempts take a gate and
     intents, so tests can watch them (docs/lifecycle.md §9.6)."""
 
-    writes = "fenced"
-
     async def written_at(self, versions, prior, context):
         return []
 
@@ -150,8 +148,6 @@ class LiveStore(FileStore):
     then kills the worker; `hold`, an event, keeps a write open once its
     rows landed — the store committed, the engine not yet told; `before_read`,
     a coroutine function, runs once as the next read takes its snapshot."""
-
-    writes = "fenced"
 
     def __init__(self):
         super().__init__()

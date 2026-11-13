@@ -1016,7 +1016,7 @@
     "id": "snapshot",
     "source": "explicit"
   },
-  "deploy": "42d43f28a2e153971cb2a68ccc61cdaaaa0fdec0b7082c35773b2f63236fbbab",
+  "deploy": "f4811f67e6b744399ffd7b41e64aaa4812869f91b80a2cf0b0ef284962217a0b",
   "errors": [],
   "executors": {
     "ingest": {
@@ -1582,9 +1582,9 @@
         }
       },
       "cleanup_after": 604800.0,
+      "in_place": false,
       "ref": "object",
-      "version": "4",
-      "writes": "immutable"
+      "version": "4"
     },
     "default": {
       "built_in": {
@@ -1594,9 +1594,9 @@
         }
       },
       "cleanup_after": 604800.0,
+      "in_place": false,
       "ref": "object",
-      "version": "4",
-      "writes": "immutable"
+      "version": "4"
     },
     "postgres": {
       "built_in": {
@@ -1611,9 +1611,9 @@
         }
       },
       "cleanup_after": 604800.0,
+      "in_place": true,
       "ref": "table",
-      "version": "1",
-      "writes": "fenced"
+      "version": "1"
     }
   }
 }

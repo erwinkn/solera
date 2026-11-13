@@ -57,7 +57,6 @@ class FileStore:
     `.solera/data` next to the project file."""
 
     version = "4"
-    writes = "immutable"
     ref_type = ObjectRef
     shared_table = False
 

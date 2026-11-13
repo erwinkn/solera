@@ -28,8 +28,6 @@ ROWS = (None, list, list[dict])  # what a load gives: rows, as a list
 
 
 class JsonTableStore:
-    writes = "fenced"
-
     def __init__(self, dsn: str):
         self.dsn = dsn
 

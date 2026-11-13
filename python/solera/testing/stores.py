@@ -28,7 +28,18 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from ..sdk import Output, Ref
-from ..stores import Changed, Commits, KeyedWrite, Keys, Patch, StoreError, WriteContext, Written, prepare_for
+from ..stores import (
+    Changed,
+    Commits,
+    KeyedWrite,
+    Keys,
+    Patch,
+    StoreError,
+    WriteContext,
+    Written,
+    in_place,
+    prepare_for,
+)
 
 
 @dataclass
@@ -49,7 +60,7 @@ class Harness:
     opaque: Callable[[list[dict]], Any] | None = None
 
     def __post_init__(self):
-        if self.store.writes == "fenced" and self.hold is None:
+        if in_place(self.store) and self.hold is None:
             raise ValueError("a fenced store's Harness needs hold: a write transaction held open")
 
 
@@ -172,7 +183,7 @@ async def now(h: Harness, ref: Ref, ledger: Ledger) -> list[tuple[str, str]]:
     """The partition's content as a reader of `ref` gets it: an immutable store's
     through the keys the index names; a fenced store's whole, as it is."""
 
-    return await rows(h, ref, ledger.keys() if h.store.writes == "immutable" else None)
+    return await rows(h, ref, None if in_place(h.store) else ledger.keys())
 
 
 def keyed(h: Harness) -> Output:
@@ -329,7 +340,7 @@ async def a_replacement_holds_exactly_its_keys_at_its_version(h: Harness) -> Non
     assert said(second) == (["a", "d"], [], True)
     held = Ledger({"a": 2, "d": 2})
     assert await read(h, second.ref, held.keys()) == ([("a", "2"), ("d", "1")], {"a": 2, "d": 2}, None)
-    if h.store.writes != "immutable":  # a table's rows, whole: nothing below version 2 is left
+    if in_place(h.store):  # a table's rows, whole: nothing below version 2 is left
         assert await read(h, second.ref, None) == ([("a", "2"), ("d", "1")], {"a": 2, "d": 2}, None)
 
 
@@ -676,5 +687,5 @@ def scenarios(store: Any, *, opaque: bool = False) -> list[Callable]:
     kind's, a current-read store's (`reads`), and, for one that takes an
     `Opaque` write (`opaque`, its harness then makes one), those."""
 
-    found = EVERY + {"immutable": IMMUTABLE, "fenced": FENCED}[store.writes]
+    found = EVERY + (FENCED if in_place(store) else IMMUTABLE)
     return found + (READS if callable(getattr(store, "reads", None)) else []) + (OPAQUE if opaque else [])

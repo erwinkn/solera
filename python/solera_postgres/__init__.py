@@ -189,7 +189,6 @@ class PostgresStore:
     version = "1"
     ref_type = TableRef
     shared_table = True
-    writes = "fenced"
 
     def __init__(self, dsn: str, grants: list[str] | tuple = (), sql_read_only: bool = False):
         """`grants`: roles given SELECT on every table the store creates.

@@ -19,25 +19,26 @@ engine never committed — a key regressed to older rows, a deleted key
 back, a commit replaced.
 
 Waiting longer only makes that less likely. So every store guarantees it
-cannot happen, in one of two ways — its **kind**:
+cannot happen, in one of two ways:
 
-| Kind | How a late writer is made harmless | Implement | A read sees |
-|---|---|---|---|
-| `immutable` | It writes only names no other attempt uses. A late write creates an object nothing references; the engine has it deleted later. | — | exactly the pinned generation |
-| `fenced` | Every write transaction first raises the partition's version to its attempt's, or is refused whole if a newer attempt already wrote. Nothing is taken before a read. | `written_at`, `keys` | the current rows |
+| How it writes | How a late writer is made harmless | A read sees |
+|---|---|---|
+| Every object under a name of its own, by the version that wrote it (files) | A late write creates an object nothing references; the engine has it deleted later. | exactly the pinned version |
+| In place (a table, a key-value store) | Every write transaction first raises the partition's version to its attempt's, or is refused whole if a newer attempt already wrote. Nothing is taken before a read. | the current rows |
 
-Both kinds implement `cleanup`: an immutable store for what commits let
-go of and what late writers left, both for an output removed or moved
-away.
+A store declares no kind. One that writes in place implements
+`written_at`, which says what a dead writer left for the next attempt to
+repair, and having that method is what tells the engine (`stores.in_place`).
+Older text below still says `immutable` for the first and `fenced` for the
+second.
 
-There is no third kind: registration refuses a store that declares
-anything else, or lacks the method its kind needs.
+Registration refuses a store that lacks `store`, `load`, `read` or
+`cleanup`.
 
 ## The contract
 
 ```python
 class Store(Protocol):
-    writes: str                    # "immutable" or "fenced"
     version: str = "1"             # bump when the stored format changes
     ref_type: type[Ref] = Ref
 
@@ -568,30 +569,29 @@ when what it serves for the same data changes.
 
 ### A SQL table: `fence()` in every write transaction
 
-`solera.fencing.fence(cur, context, domain)` makes a SQL store fenced. Call
-it first in every write transaction, and as `acquire`:
+`solera.fencing.fence(cur, context, domain)` is the version check of a SQL
+store. Call it first in every write transaction, and in `written_at`:
 
 ```python
 from solera.fencing import fence, fence_table
 
 class EventsStore:
-    writes = "fenced"
-
-    async def acquire(self, context, prior):
-        with connect(self.dsn) as conn, conn.cursor() as cur:
-            fence(cur, context, "public.events")
-
     async def store(self, write, prior, context):
         with connect(self.dsn) as conn, conn.cursor() as cur:   # one transaction
-            fence(cur, context, "public.events")                   # before any change
+            fence(cur, context, "public.events", write=True)      # before any change
             ...                                                   # DELETE / INSERT / MERGE
+
+    async def written_at(self, versions, prior, context):
+        with connect(self.dsn) as conn, conn.cursor() as cur:
+            fence(cur, context, "public.events")                   # locks older writers out
+            ...                                                   # the keys at those versions
 ```
 
 `fence` upserts `(domain, partition) → (generation, worker_id)` in the
 `solera_fences` table (`fence_table(cur)` creates it, once), keeps the row
 locked until the transaction ends, and raises `StoreError` when a newer
 generation or another worker holds it. The row lock is what makes a
-newer `acquire` wait for an older open transaction. The SQL is
+newer writer wait for an older open transaction. The SQL is
 PostgreSQL's; `param=` adapts placeholders for another driver, and any
 database with `INSERT … ON CONFLICT … DO UPDATE … WHERE … RETURNING` and
 row locks works the same way.
