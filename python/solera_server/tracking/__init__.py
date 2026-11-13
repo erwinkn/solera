@@ -14,7 +14,7 @@ refused event never reaches the journal and a recorded one always applies
 (rule 3).
 
 Modules: `prepare` plans a batch, `commit` commits one, `sources` commits a
-source, `stale` answers staleness on demand. `engine-seams.md` in the crew's
+source, `stale` answers staleness on demand, `merge` keeps layer lists short. `engine-seams.md` in the crew's
 drive lists the hooks later units add.
 """
 
@@ -152,7 +152,8 @@ class Core:
         what it holds, the call holds."""
 
         async with self.heavy:
-            return await in_thread(fn, *args, **kwargs)
+            with self.m.reading():  # the layer files it reads outlive a merge that lands meanwhile
+                return await in_thread(fn, *args, **kwargs)
 
     def attach(self, *ids: bytes) -> None:
         """The outputs a call reads or writes, attached to the change index:
@@ -185,11 +186,15 @@ class Core:
             self.record(Tracking.event_declare(id_))
         return id_
 
-    def record(self, event: bytes) -> None:
-        """Check a core event and record it, in one step."""
+    def record(self, event: bytes, garbage: list[str] | tuple = ()) -> None:
+        """Check a core event and record it, in one step. `garbage`: the
+        layer files the event lets go of (a merge's replaced ones)."""
 
         self.check(event)
-        self.engine.state.record({"type": "Core", "event": b64(event)})
+        record = {"type": "Core", "event": b64(event)}
+        if garbage:
+            record["garbage"] = list(garbage)
+        self.engine.state.record(record)
 
     @staticmethod
     def path(life: int, commit: int, by) -> str:

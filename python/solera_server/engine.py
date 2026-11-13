@@ -52,6 +52,7 @@ from .model import (
     commit_of,
     declaration,
     is_log,
+    output_id,
     reads,
 )
 from .observing import Observing
@@ -61,6 +62,7 @@ from .state import Conflict, LostOwnership, State
 from .tracking import WALK, Core, Generation, Redeployed, b64, cache_root, output_pin
 from .tracking import commit as core_commit
 from .tracking import full as core_full
+from .tracking import merge as core_merge
 from .tracking import prepare as core_prepare
 from .tracking import sources as core_sources
 from .upkeep import ALIVE, Upkeep
@@ -339,6 +341,7 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
         self._adopt()
         await self._cover_tick()
         await core_full.settle(self)
+        core_merge.start(self)
         self._cleanup_job()
         self._dispatch_due()
         self._sensor_sweep()
@@ -1157,14 +1160,22 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
         its pins name (an outcome index). Collection elsewhere waits for no
         attempt that reads none of it."""
 
-        found = {self.m.index(name, task["partition"]).prefix for name in outputs}
+        found = set()
+
+        def reads(output: str, partition: str) -> None:
+            found.add(self.m.index(output, partition).prefix)
+            if (held := self.m.core.output(output_id(output, partition))) is not None:
+                found.add(f"core/{held['life']}/")  # its layers in the change index (`Core.path`)
+
+        for name in outputs:
+            reads(name, task["partition"])
 
         def walk(value) -> None:
             if isinstance(value, dict):
                 if isinstance(value.get("prefix"), str):
                     found.add(value["prefix"])
                 if isinstance(value.get("output"), str) and "handle" in value:  # a ref
-                    found.add(self.m.index(value["output"], value.get("partition") or "").prefix)
+                    reads(value["output"], value.get("partition") or "")
                 for item in value.values():
                     walk(item)
             elif isinstance(value, list):

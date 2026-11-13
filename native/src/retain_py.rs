@@ -207,6 +207,23 @@ pub struct MergePlan {
     cut: u64,
 }
 
+/// The outputs the size rule would merge layers of now with every entry
+/// kept (a cut of 0, so nothing folds into a base): the engine's outputs,
+/// never a per-key edge's record outputs. It reads every output's list and
+/// copies none: call it on the event loop.
+#[pyfunction]
+fn retain_merges_due<'py>(
+    py: Python<'py>,
+    tracking: PyRef<'py, Tracking>,
+) -> Vec<Bound<'py, PyBytes>> {
+    let t = tracking.state.read().unwrap();
+    t.outputs
+        .iter()
+        .filter(|(id, o)| !tr::state::core_owned(id) && pick_merge(&o.layers, 0).is_some())
+        .map(|(id, _)| PyBytes::new(py, id))
+        .collect()
+}
+
 /// The merge the size rule asks for on `output` now, or None when none is
 /// due: its layers and its cut, from the state and `pins`, the engine's
 /// pins, read in one loop tick. Pins only rise, so the cut holds until the
@@ -324,6 +341,7 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(retain_step, m)?)?;
     m.add_function(wrap_pyfunction!(retain_released, m)?)?;
     m.add_class::<MergePlan>()?;
+    m.add_function(wrap_pyfunction!(retain_merges_due, m)?)?;
     m.add_function(wrap_pyfunction!(retain_merge_plan, m)?)?;
     m.add_function(wrap_pyfunction!(retain_merge, m)?)?;
     m.add_function(wrap_pyfunction!(retain_orphans, m)?)?;
