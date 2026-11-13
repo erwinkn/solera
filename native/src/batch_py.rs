@@ -148,22 +148,60 @@ impl PlannedKeys {
         Ok(d)
     }
 
-    /// The batch's classes, from what a source served (None: the input is
-    /// not a source's, and its classes are the plan's), and the keys it
-    /// served otherwise than planned, `[key, version]` each (None: absent).
-    /// A key served absent is removed if the consumer held it, else not
-    /// delivered; one served at another word than planned is updated if it
-    /// was unchanged. A key planned at a generation has no word to compare.
-    #[pyo3(signature = (served=None))]
+    /// The batch's classes, from what its load found, and the keys found
+    /// otherwise than planned, `[key, version]` each (None: absent). A key
+    /// found absent is removed if the consumer held it, else not delivered;
+    /// one found at another version than planned is updated if it was
+    /// unchanged. `served`: what a source served; a key planned at a
+    /// generation has no word of its to compare. `read`: the versions a
+    /// store's read said, key → version, None or missing for a key it did
+    /// not hold (a table read in place may hold a newer write than the one
+    /// planned). With neither, the classes are the plan's.
+    #[pyo3(signature = (served=None, read=None))]
     fn observe<'py>(
         &self,
         py: Python<'py>,
         served: Option<PyRef<'py, Served>>,
+        read: Option<Bound<'py, PyAny>>,
     ) -> PyResult<(Classes, Bound<'py, PyList>)> {
         guard(|| {
             let p = &*self.inner;
             let mut classes = p.classes.clone();
             let loaded = PyList::empty(py);
+            if let Some(read) = read {
+                for (i, cls) in classes.iter_mut().enumerate() {
+                    if *cls == REMOVED {
+                        continue;
+                    }
+                    let k = key(py, p.keys.get(i));
+                    let got = read
+                        .call_method1("get", (&k,))?
+                        .extract::<Option<Bound<'py, PyAny>>>()?;
+                    let Some(got) = got else {
+                        loaded.append(PyList::new(py, [k, py.None().into_bound(py)])?)?;
+                        *cls = if *cls == Class::Added as u8 {
+                            NONE
+                        } else {
+                            REMOVED
+                        };
+                        continue;
+                    };
+                    let same = match &p.versions[i] {
+                        Ver::Absent => false,
+                        Ver::Int(n) => got.extract::<u64>().is_ok_and(|g| g == *n),
+                        Ver::Bytes(b) => {
+                            got.extract::<String>().is_ok_and(|g| g.as_bytes() == &**b)
+                        }
+                    };
+                    if same {
+                        continue;
+                    }
+                    loaded.append(PyList::new(py, [k, got])?)?;
+                    if *cls == Class::Unchanged as u8 {
+                        *cls = Class::Updated as u8;
+                    }
+                }
+            }
             if let Some(s) = served {
                 for (i, cls) in classes.iter_mut().enumerate() {
                     if *cls == REMOVED {

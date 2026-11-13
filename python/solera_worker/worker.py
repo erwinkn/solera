@@ -390,9 +390,18 @@ async def _resolve_inputs(spec, project, asset, keys_io, timeline, observed: Obs
             ch = pin["batch"]
             reset = bool(ch.get("reset"))
             planned = core.planned(spec, pin)
-            args[param] = await observed.load(store, ref, t, Keys(core.KeyVersions(planned)))
-            served = getattr(store, "served", None)
-            classes, loaded = planned.observe(served)
+            served, read = getattr(store, "served", None), None
+            if served is None and callable(getattr(store, "read", None)):
+                # A store says the version it read each key at: a table read in place may
+                # hold a newer write than the one planned, and the batch is processed as loaded.
+                selection = Keys(core.KeyVersions(planned))
+                found = await store.read(ref, t, selection)
+                args[param] = found.value
+                if found.versions is not selection.generations:  # else read as planned, by construction
+                    read = found.versions
+            else:
+                args[param] = await observed.load(store, ref, t, Keys(core.KeyVersions(planned)))
+            classes, loaded = planned.observe(served, read)
             batch[param] = Batch._of_columns(
                 classes,
                 served,
