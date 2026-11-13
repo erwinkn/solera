@@ -1464,7 +1464,7 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
         core_commit.check(self.core, built)  # checked, then recorded with nothing awaited between (rule 3)
         if (core := built.payload()) is not None:
             commit["core"] = core
-        for param in (built.walk or {}).get("inputs") or ():
+        for param in built.walked:
             key = (task["asset"], task["partition"], param)
             self._walked[key] = self._walked.get(key, 0) + 1
         self._finish(

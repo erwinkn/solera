@@ -11,6 +11,7 @@ import pytest
 from solera.sdk import Commit, Incremental, Output, Project, Source, Tick, asset, sensor
 from solera.stores import FileStore
 from solera_server.executors.inline import InlinePlacement
+from solera_server.model import output_id
 from solera_server.tracking.sources import record_loads
 
 from tests.contract.harness import Outside, Solera, SourceStore
@@ -256,7 +257,7 @@ async def test_a_finished_attempt_never_reports_an_old_load_into_a_new_source_li
         await engine.commit_source("feed", upsert={"k": "v0.5"})
         await engine.commit_source("feed", upsert={"k": "v1"})
         native, fired = engine.core.run, False
-        first_id = engine.m.core_outputs["first", ""]
+        first_id = output_id("first", "")
         moved = project(moved=True)
         work = InlinePlacement._work
 
@@ -270,7 +271,7 @@ async def test_a_finished_attempt_never_reports_an_old_load_into_a_new_source_li
         async def move_after_first_report(fn, *args, **kw):
             nonlocal fired
             result = await native(fn, *args, **kw)
-            if not fired and fn == engine.core.tracking.build_commit and args[0] == first_id.encode():
+            if not fired and fn == engine.core.tracking.build_commit and args[0] == first_id:
                 fired = True
                 engine.redeploy(moved.manifest)
                 await engine.commit_source("feed", upsert={"k": "v1"})

@@ -14,6 +14,7 @@ import contextlib
 
 from solera._native import encode_changes
 
+from ..model import output_id
 from ..state import Conflict
 from . import Core, Generation, Redeployed
 
@@ -44,13 +45,13 @@ async def build(
         mode = "patch" if at is None else "report"
     id_ = core.named(name, "")
     core.attach(id_)
-    out = core.m.core_output(name, "") or {"head": 0, "layers": []}
+    out = core.m.core_output(name, "")
     found = await core.run(
         core.tracking.build_commit,
-        id_.encode(),
+        id_,
         changes,
         version=generation,
-        path=core.path(id_, out["head"] + 1, run),
+        path=core.path(out["life"], out["head"] + 1, run),
         time_ms=int(core.engine.clock() * 1000),
         producer=f"source:{generation}".encode(),
         mode=mode,
@@ -61,7 +62,7 @@ async def build(
         return None
     built = {
         "event": found["event"],
-        "counts": {k: found[k] for k in ("commit", "live", "added", "updated", "removed")} | {"id": id_},
+        "counts": {k: found[k] for k in ("commit", "live", "added", "updated", "removed")},
     }
     for field, changed, count in (
         ("upserted", found["upserted_keys"], found["added"] + found["updated"]),
@@ -90,7 +91,7 @@ async def moved(core: Core, name: str, since: int, commit: dict) -> bool:
     keys = {str(k) for k in commit.get("upsert") or ()} | {str(k) for k in commit.get("remove") or ()}
     if not keys:
         return False
-    core.attach(core.m.core_outputs[(name, "")])
+    core.attach(output_id(name, ""))
     after = None
     while True:
         try:

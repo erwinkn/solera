@@ -7,6 +7,7 @@ import asyncio
 import pytest
 from solera.sdk import In, Incremental, Output, Project, Retry, asset
 from solera.stores import FileStore
+from solera_server.model import edge_id
 from solera_server.tracking import full
 
 from tests.contract.harness import Solera, rebuild
@@ -132,9 +133,8 @@ async def test_rebinding_away_from_removed_output_closes_the_old_edge(tmp_path):
         await s.deploy(project(True))
         await s.run("left")
         await s.run("copy")
-        old = s.engine.m.core_edges["copy", "", "data"]
+        assert s.engine.m.core.edge(edge_id("copy", "", "data")) is not None
         await s.deploy(project(False))
-        assert ("copy", "", "data") not in s.engine.m.core_edges, old
-        assert ("copy", "", "data") not in s.engine.m.core_read
+        assert s.engine.m.core.edge(edge_id("copy", "", "data")) is None
     finally:
         await s.close()

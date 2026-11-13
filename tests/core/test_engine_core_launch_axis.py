@@ -87,7 +87,7 @@ async def test_a_launch_that_races_an_axis_change_leaves_no_core_id_on_the_unkey
     new = w.project("value")
     eng.redeploy(new.manifest)  # copy is a single value now: its axis changed, its life is reset
     solera.project = new
-    assert ("copy", "") not in eng.m.core_outputs
+    assert eng.m.core_output("copy", "") is None
     gate.set()
     original = InlinePlacement._work
 
@@ -100,7 +100,7 @@ async def test_a_launch_that_races_an_axis_change_leaves_no_core_id_on_the_unkey
             await solera.wait(first, 10)
         except TimeoutError:
             pass
-        stale_id = eng.m.core_outputs.get(("copy", ""))
+        stale_id = eng.m.core_output("copy", "")
         # copy under its new definition, to the end; then a full run of it stopped midway.
         await solera.run("copy", expect=None)
         await solera.run("copy", expect=None)

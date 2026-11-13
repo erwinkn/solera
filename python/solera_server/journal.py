@@ -74,7 +74,7 @@ log = logging.getLogger(__name__)
 # buffers; 5: merge attempts with when (`Model.merges`), for their backoff. A
 # journal with no format is from before 2. 6: the tracking core's state
 # (docs/tracking-design.md §15).
-FORMAT = 6
+FORMAT = 7
 
 
 def _unreadable(journal: str, found, readable) -> str:

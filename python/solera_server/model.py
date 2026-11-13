@@ -31,6 +31,7 @@ import copy
 import math
 from base64 import b64decode, b64encode
 
+import orjson
 from solera._native import Tracking
 from solera.keys.layers import LayerState, delta_names, index_prefix
 
@@ -174,10 +175,6 @@ class Model:
             "history": self.history.to_json(),
         }
         data["core"] = b64encode(self.core.snapshot()).decode()
-        data["core_outputs"] = _nest(self.core_outputs, 2)
-        data["core_edges"] = _nest(self.core_edges, 3)
-        data["core_empty"] = _nest(self.core_empty, 3)
-        data["core_read"] = _nest(self.core_read, 3)
         data["partial_spans"] = [[list(k), v] for k, v in self.partial_spans.items()]
         return copy.deepcopy(data) if copied else data
 
@@ -207,7 +204,7 @@ class Model:
         self.deleted: list[str] = snap.get("deleted") or []
         # (asset, partition) -> the partition's record (§5): its `cursor`; `last`, its last
         # terminal outcome; the `definition`, `config` and `context` its last commit was made
-        # under.
+        # under; `edges`, each incremental input's edge life as its last commit over it left it.
         self.partitions = Grouped(_flatten(snap.get("partitions"), 2))
         # (output, partition) -> intents of attempts that died while writing it (§8)
         self.repairs: dict[tuple, list] = _flatten(snap.get("repairs"), 2)
@@ -241,22 +238,12 @@ class Model:
         # the run history (§7): per table, its files and the rows awaiting a flush
         self.history = LakeState(history.TABLES, snap.get("history"))
         # The tracking core (docs/tracking-design.md): its state, changed only by the core
-        # events this model applies, and the ids it knows things by.
-        # (output, partition) -> the core's id of that output's current life; (asset,
-        # partition, input) -> the core's id of that edge. Renames move them; a reset drops them.
+        # events this model applies. It knows an output partition and an edge by name
+        # (`tracking.output_id`, `tracking.edge_id`).
         self.core: Tracking = Tracking.restore(b64decode(snap["core"])) if "core" in snap else Tracking()
-        self.core_outputs: dict[tuple, str] = _flatten(snap.get("core_outputs"), 2)
-        self.core_edges: dict[tuple, str] = _flatten(snap.get("core_edges"), 3)
-        # (asset, partition, input) -> the key past which the edge holds nothing since it last
-        # started over ("": every key), until a walk gets to the end: what completeness reads.
-        self.core_empty: dict[tuple, str] = _flatten(snap.get("core_empty"), 3)
-        # (asset, partition, input) -> the upstream life a keyed input's committed progress
-        # reads: only a commit writes it, so a reader whose upstream started over starts over
-        # too until one of its batches commits (`prepare.restarted`).
-        self.core_read: dict[tuple, str] = _flatten(snap.get("core_read"), 3)
-        # An output life's partial commits (D205): `span_key` -> [[from, to], ...], `[from, to)`
-        # on its commit axis (`axis_head`), `to` None while open. Written only by its
-        # producer's commits and `settle`'s `Settled` (`_spans`).
+        # An output's partial commits (D205): (output, partition) -> [[from, to], ...],
+        # `[from, to)` on its commit axis (`axis_head`), `to` None while open. Written only by
+        # its producer's commits and `settle`'s `Settled` (`_spans`); a reset drops them.
         self.partial_spans: dict[tuple, list] = {tuple(k): v for k, v in snap.get("partial_spans") or ()}
         # derived from launched attempts, plus memory-only claims of attempts preparing
         # task id -> {attempt, started_at, pin, status, launched?, reads?}; `pin`: `applied` at the claim
@@ -561,7 +548,7 @@ class Model:
         declared_before = {a: declaration(self.manifest, a) for a in assets_before}
         self.deploy, self.manifest, self.project = e["deploy"], manifest, e.get("project")
         self._reconcile_tasks(manifest, e["at"])
-        reset = self._reset(
+        reset, producers = self._reset(
             {name: o.get("store") for name, o in previous.items()},
             assets_before,
             {name: axis(o) for name, o in previous.items()},
@@ -575,11 +562,11 @@ class Model:
             )
             if moved and name not in sources_before and old.get("store") in stores_before:
                 self._retire_output(name, old, stores_before[old["store"]], e["at"])
-        self._core_close(reset)
+        self._core_close(reset, producers)
         self.changed = {
             asset
             for asset in manifest["assets"]
-            if asset in reset or declared_before.get(asset) != declaration(manifest, asset)
+            if asset in producers or declared_before.get(asset) != declaration(manifest, asset)
         }
         automations = {}
         for name, auto in manifest["automations"].items():
@@ -663,7 +650,9 @@ class Model:
             "due": at + float(after),
         }
 
-    def _reset(self, stores: dict[str, str], assets_before: set[str], axes: dict[str, str]) -> set[str]:
+    def _reset(
+        self, stores: dict[str, str], assets_before: set[str], axes: dict[str, str]
+    ) -> tuple[set[str], set[str]]:
         """A deploy that removes an asset, or removes an output or declares it
         on another store than `stores` says it was on, resets it: what comes
         back under that name, or what the new store holds, is a new one (K10).
@@ -708,10 +697,7 @@ class Model:
 
         for key in [k for k in self.heads if gone(k)]:
             del self.heads[key]
-        lives = {("@life", id_) for k, id_ in self.core_outputs.items() if k[0] in reset}
-        for key in [k for k in self.core_outputs if k[0] in reset]:  # its next commit names a new life
-            del self.core_outputs[key]
-        for key in [k for k in self.partial_spans if k in lives or k[0] in reset]:  # they go with the life
+        for key in [k for k in self.partial_spans if k[0] in reset]:  # they go with the life
             del self.partial_spans[key]
         for key in [k for k in self.repairs if gone(k)]:  # what dead attempts meant to write
             index = self.index(*key)
@@ -725,9 +711,9 @@ class Model:
                 del self.partitions[key]
                 continue
             if key[0] in producers:  # a new life: never built, so missing, not stale
-                for field in ("definition", "config", "context"):
+                for field in ("definition", "config", "context", "edges"):
                     self.partitions[key].pop(field, None)
-        return producers
+        return reset, producers
 
     def _on_RunSubmitted(self, e):
         run = e["run"]
@@ -824,8 +810,8 @@ class Model:
         self._event(run, "claimed", at, task["id"], attempt)
 
     def _on_AttemptLaunched(self, e):
-        for output, partition, id_ in e.get("core_outputs") or ():  # named at its launch, before any commit
-            self.core_outputs[(output, partition)] = id_
+        if e.get("core") is not None:  # its keyed outputs, named at its launch, before any commit
+            self.core.apply(b64decode(e["core"]))
         run = self.runs.get(e["run"])
         task = run["tasks"].get(e["task"]) if run else None
         if task is None or task["status"] in TERMINAL_TASK:
@@ -1032,16 +1018,9 @@ class Model:
         # A skip has no preparation (nothing launched): its walk's outputs are the asset's.
         declared = ((self.manifest or {}).get("assets", {}).get(asset) or {}).get("outputs") or ()
         names = sorted(prepared.get("outputs") or (o["name"] for o in declared))
-        heads_before = {
-            name: (self.span_key(name, partition), self.axis_head(name, partition)) for name in names
-        }
+        heads_before = {name: self.axis_head(name, partition) for name in names}
         if (core := commit.get("core")) is not None:  # first: what follows reads it
-            self._core_apply(core)
-            if core.get("walk") is not None:
-                self._core_walk(asset, partition, core["walk"])
-            for param in (core.get("walk") or {}).get("inputs") or ():  # the lives its progress reads now
-                if (edge := self.core_edges.get((asset, partition, param))) is not None:
-                    self.core_read[(asset, partition, param)] = edge[1]
+            self.core.apply(b64decode(core["event"]))
             for record in core.get("records") or ():
                 self._record(
                     "batch_inputs",
@@ -1072,6 +1051,14 @@ class Model:
                 record.pop("cursor", None)
             else:
                 record["cursor"] = commit["cursor"]
+        # The life of each edge the batch walked, as its commit left it: what the partition
+        # has read (`edge`).
+        lives = {
+            param: self.core.edge(edge_id(asset, partition, param))["life"]
+            for param in (commit.get("core") or {}).get("walked") or ()
+        }
+        if lives:
+            record["edges"] = {**record.get("edges", {}), **lives}
         for input, progress in (commit.get("progress") or {}).items():  # the run's walk (D155)
             task.setdefault("progress", {})[input] = progress
         if "outcomes" in commit:
@@ -1317,7 +1304,7 @@ class Model:
         before = self.heads.get((e["source"], ""))
         head = e["head"]
         if (core := e.get("core")) is not None:
-            self._core_apply(core)
+            self.core.apply(b64decode(core["event"]))
         self.heads[(e["source"], "")] = {**head, "at": e["at"], "n": self.event_counter}
         run = e.get("run")
         if run is not None:
@@ -1354,55 +1341,26 @@ class Model:
     # -- the new tracking core (format 6) -------------------------------------------------
 
     def _on_Core(self, e):
-        self._core_apply(e)
-
-    def _core_apply(self, part: dict) -> None:
-        """Apply a core event (`event`: its bytes, base64), whole: the engine
-        checked it before recording it. Then the ids it mints or retires:
-        `outputs` `[[output, partition, id | None], ...]`, `edges`
-        `[[asset, partition, input, id | None], ...]`."""
-        if part.get("event") is not None:
-            self.core.apply(b64decode(part["event"]))
-        for output, partition, id_ in part.get("outputs") or ():
-            if id_ is None:
-                self.core_outputs.pop((output, partition), None)
-            else:
-                self.core_outputs[(output, partition)] = id_
-        for asset, partition, param, id_ in part.get("edges") or ():
-            if id_ is None:
-                self.core_edges.pop((asset, partition, param), None)
-                self.core_empty.pop((asset, partition, param), None)
-            else:
-                self.core_edges[(asset, partition, param)] = id_
-                self.core_empty[(asset, partition, param)] = ""
-
-    def span_key(self, output: str, partition: str) -> tuple:
-        """Where an output's partial spans are kept: under its core life, or
-        by name for an output with no core id (a single value)."""
-
-        id_ = self.core_outputs.get((output, partition))
-        return ("@life", id_) if id_ is not None else (output, partition)
+        self.core.apply(b64decode(e["event"]))
 
     def life(self, output: str, partition: str) -> str | int:
-        """Which life of an output a head belongs to: its core id, else the
-        deploy that last reset the name. A gate entry of another
-        life than the current one names a life that gets no commit any more."""
+        """Which life of an output a head belongs to: the core's, else the
+        deploy that last reset the name. A gate entry of another life than
+        the current one names a life that gets no commit any more."""
 
-        id_ = self.core_outputs.get((output, partition))
-        return id_ if id_ is not None else self.reset_at.get(("output", output), 0)
+        found = self.core.output(output_id(output, partition))
+        return f"life {found['life']}" if found is not None else self.reset_at.get(("output", output), 0)
 
     def axis_head(self, output: str, partition: str) -> int | None:
-        """An output's head on its commit axis: its core life's commit, else
-        its ref's generation."""
+        """An output's head on its commit axis, None while it has no head: a
+        keyed output's commit in the core (0: a head, and no commit yet), a
+        single value's ref generation."""
 
-        id_ = self.core_outputs.get((output, partition))
-        if id_ is not None:
-            if (found := self.core.output(id_.encode())) is not None:
-                return int(found["head"])
-            return 0 if (output, partition) in self.heads else None  # a head, and no commit yet: empty
         head = self.heads.get((output, partition))
         if head is None:
             return None
+        if (found := self.core.output(output_id(output, partition))) is not None:
+            return int(found["head"])
         return int(head["ref"].get("generation") or 0)
 
     def partial(self, output: str, partition: str, at: int | None) -> bool:
@@ -1412,8 +1370,7 @@ class Model:
         if at is None:
             return False
         return any(
-            lo <= at and (hi is None or at < hi)
-            for lo, hi in self.partial_spans.get(self.span_key(output, partition), ())
+            lo <= at and (hi is None or at < hi) for lo, hi in self.partial_spans.get((output, partition), ())
         )
 
     def _spans(self, asset: str, partition: str, before: dict) -> None:
@@ -1422,16 +1379,22 @@ class Model:
         made opens a span at it; once none is, every open one closes at the
         head, which is complete."""
 
-        pending = any(k[0] == asset and k[1] == partition for k in self.core_empty)
-        for name, (was, head_before) in before.items():
-            key, head = self.span_key(name, partition), self.axis_head(name, partition)
-            spans = [list(s) for s in self.partial_spans.get(key, ())] if key == was else []
+        pending = (asset, partition) in self.walking()
+        for name, head_before in before.items():
+            key, head = (name, partition), self.axis_head(name, partition)
+            spans = [list(s) for s in self.partial_spans.get(key, ())]
             if spans and spans[-1][1] is None:
                 if not pending:
                     spans[-1][1] = head
-            elif pending and head is not None and (key != was or head != head_before):
+            elif pending and head is not None and head != head_before:
                 spans.append([head, None])
             self._keep_spans(key, spans)
+
+    def walking(self) -> set[tuple[str, str]]:
+        """The asset partitions with an input whose walk from empty has not
+        reached the end: the core's edges with an empty piece."""
+
+        return {tuple(orjson.loads(edge)[:2]) for edge in self.core.walking()}
 
     def _keep_spans(self, key: tuple, spans: list) -> None:
         merged = []
@@ -1451,7 +1414,7 @@ class Model:
         """The open spans of an asset partition's outputs: `(output, key, spans)`."""
 
         for output in (self.manifest or {}).get("assets", {}).get(asset, {}).get("outputs") or ():
-            key = self.span_key(output["name"], partition)
+            key = (output["name"], partition)
             spans = [list(s) for s in self.partial_spans.get(key, ())]
             if spans and spans[-1][1] is None:
                 yield output["name"], key, spans
@@ -1465,70 +1428,51 @@ class Model:
             spans[-1][1] = self.axis_head(output, e["partition"])
             self._keep_spans(key, spans)
 
-    def _core_close(self, producers: set[str]) -> None:
-        """After a deploy, the new path's edges that read nothing now: of an
-        asset gone, of an input no longer a keyed incremental one or bound
-        to another upstream, and of a producer whose output a reset started
-        over, which reads its inputs in full again. Closed in the core as the
-        deploy applies, so a replay closes the same ones."""
+    def _core_close(self, reset: set[str], producers: set[str]) -> None:
+        """After a deploy, in the core: the edges that read nothing now are
+        closed (of an asset gone, of an input no longer incremental or bound
+        to another upstream, of an upstream that was reset, and of a producer
+        whose output a reset started over, which reads its inputs in full
+        again), then every reset output's life ends. Done as the deploy
+        applies, so a replay does the same."""
 
-        assets, outputs = self.manifest["assets"], self.manifest["outputs"]
-        for key in [k for k in self.core_read if k[0] not in assets]:
-            del self.core_read[key]
-        owner = {id_: output for (output, _), id_ in self.core_outputs.items()}
+        assets = self.manifest["assets"]
         closing = []
-        for key in sorted(self.core_edges):
-            asset, _, param = key
+        for edge, input in self.core.edges():
+            asset, _, param = orjson.loads(edge)
+            upstream = orjson.loads(input)[0]
             spec = ((assets.get(asset) or {}).get("inputs") or {}).get(param) or {}
-            keyed = (outputs.get(spec.get("output")) or {}).get("key") is not None
-            upstream = owner.get(self.core_edges[key][1])  # by its own life only: a gone one closes it
             if (
                 asset in producers
+                or upstream in reset
                 or spec.get("kind") != "incremental"
-                or not keyed
-                or upstream != spec.get("output")
+                or spec.get("output") != upstream
             ):
-                closing.append(key)
-        if not closing:
-            return
-        self.core.apply(
-            Tracking.join([Tracking.event_edge_close(self.core_edges[k][0].encode()) for k in closing])
-        )
-        for key in closing:
-            del self.core_edges[key]
-            self.core_empty.pop(key, None)
-            self.core_read.pop(key, None)  # what it read is no input's now: a later edge starts over
+                closing.append(edge)
+        if closing:
+            self.core.apply(Tracking.join([Tracking.event_edge_close(edge) for edge in closing]))
+        for id_ in self.core.outputs():
+            if orjson.loads(id_)[0] in reset:
+                self.core.apply(Tracking.event_retire(id_))
 
-    def _core_walk(self, asset: str, partition: str, walk: dict) -> None:
-        """A batch's walk over its keyed inputs, `(after, hi]` (`hi` None: to
-        the end): it fills what an edge held nothing of, from the start after a
-        reset; once a walk gets to the end, nothing is left empty. A key
-        list's walk fills nothing, and after a reset leaves every key empty."""
+    def edge(self, asset: str, partition: str, param: str) -> dict | None:
+        """An incremental input's edge as the core holds it, with `read`:
+        whether the partition has committed a batch over it in its current
+        life. A commit may leave an edge as empty as a new one (a key list
+        that starts over and takes none of its keys), so the core's progress
+        alone does not say."""
 
-        after, hi = walk["after"], walk["hi"]
-        for param in walk["inputs"]:
-            if walk.get("keys"):  # a key list writes points only: what was empty stays so
-                if walk["reset"]:
-                    self.core_empty[(asset, partition, param)] = ""
-                continue
-            key = (asset, partition, param)
-            empty = "" if walk["reset"] else self.core_empty.get(key)
-            if empty is None or (after is not None and after > empty):
-                continue
-            if hi is None:
-                self.core_empty.pop(key, None)
-            elif hi > empty:
-                self.core_empty[key] = hi
+        found = self.core.edge(edge_id(asset, partition, param))
+        if found is None:
+            return None
+        committed = (self.partition(asset, partition).get("edges") or {}).get(param)
+        return {**found, "read": committed == found["life"]}
 
     def core_output(self, output: str, partition: str) -> dict | None:
-        """A keyed output as the core holds it: `{"id", "head", "live", "layers"}`,
-        or None before its life's first commit."""
+        """A keyed output as the core holds it: `{"life", "head", "live", "layers"}`,
+        or None while nothing has named it."""
 
-        id_ = self.core_outputs.get((output, partition))
-        if id_ is None:
-            return None
-        found = self.core.output(id_.encode())
-        return None if found is None else {"id": id_, **found}
+        return self.core.output(output_id(output, partition))
 
     def _on_SensorAdvanced(self, e):
         self.sensors[e["sensor"]] = {"cursor": e.get("cursor"), "accepted": e["accepted"]}
@@ -1592,6 +1536,18 @@ class Model:
     def _on_RunsPurged(self, e):
         gone = set(e["runs"])
         self.deleted = [r for r in self.deleted if r not in gone]
+
+
+def output_id(output: str, partition: str) -> bytes:
+    """The tracking core's name of an output partition."""
+
+    return orjson.dumps([output, partition])
+
+
+def edge_id(asset: str, partition: str, param: str) -> bytes:
+    """The tracking core's name of an edge: one incremental input of one consumer partition."""
+
+    return orjson.dumps([asset, partition, param])
 
 
 def axis(output: dict) -> str:

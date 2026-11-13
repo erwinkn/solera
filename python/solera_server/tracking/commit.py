@@ -34,10 +34,10 @@ class Built:
 
     event: bytes | None = None
     records: list = field(default_factory=list)  # [input, base64 of a batch record]
-    counts: dict = field(default_factory=dict)  # output -> {id, commit, live, added, updated, removed}
+    counts: dict = field(default_factory=dict)  # output -> {commit, live, added, updated, removed}
     elements: dict = field(default_factory=dict)  # a dynamic partitions output -> its elements after
     progress: dict | None = None  # the run's walk over the keyed inputs: {batch, key}
-    walk: dict | None = None  # the batch's range of it: {inputs, after, hi, reset}
+    walked: list = field(default_factory=list)  # the inputs whose edges the batch wrote
     partition: str = ""
     generation: Generation | None = None  # the deploy it was built under
     locks: contextlib.AsyncExitStack = field(default_factory=contextlib.AsyncExitStack)
@@ -51,7 +51,7 @@ class Built:
             "event": b64(self.event),
             "records": self.records,
             "counts": self.counts,
-            "walk": self.walk,
+            "walked": self.walked,
         }
 
 
@@ -175,15 +175,15 @@ async def build(core: Core, task: dict, attempt: str, prepared: dict, result: di
                     continue
                 id_ = ids[name]
                 core.attach(id_)
-                out = m.core_output(name, partition) or {"head": 0, "layers": []}
+                out = m.core_output(name, partition)
                 dynamic = bool(info.get("dynamic"))
                 async with changes_of(core, name, entry) as changes:
                     found = await core.run(
                         core.tracking.build_commit,
-                        id_.encode(),
+                        id_,
                         changes,
                         version=generation,
-                        path=core.path(id_, out["head"] + 1, attempt),
+                        path=core.path(out["life"], out["head"] + 1, attempt),
                         time_ms=int(engine.clock() * 1000),
                         producer=producer,
                         mode="clear" if clear else "replace" if entry.get("whole") else "patch",
@@ -193,10 +193,7 @@ async def build(core: Core, task: dict, attempt: str, prepared: dict, result: di
                     continue
                 events.append(found["event"])
                 first = found["commit"] if first is None else first
-                built.counts[name] = {
-                    "id": id_,
-                    **{k: found[k] for k in ("commit", "live", "added", "updated", "removed")},
-                }
+                built.counts[name] = {k: found[k] for k in ("commit", "live", "added", "updated", "removed")}
                 if dynamic:
                     built.elements[name] = await elements(core, name, partition, out, found)
             if plan is not None:
@@ -213,17 +210,9 @@ async def build(core: Core, task: dict, attempt: str, prepared: dict, result: di
                 built.progress = {
                     "batch": some["index"],
                     "key": None if ended else some["end"],
-                    "edges": {
-                        p: plan["edge"] for p, plan in keyed
-                    },  # the walk's own: a closed one starts it over
+                    "deploy": m.deploy_number,  # a reset since starts the walk over (`prepare.restarted`)
                 }
-                built.walk = {
-                    "inputs": [p for p, _ in keyed],
-                    "after": some["after"],
-                    "hi": None if ended else some["end"],
-                    "reset": bool(some["full"]),
-                    "keys": some.get("mode") == "keys",
-                }
+                built.walked = [p for p, _ in keyed]
             if events:
                 built.event = Tracking.join(events)
             return built
@@ -269,6 +258,8 @@ def check(core: Core, built: Built) -> None:
     keys back: its fence refuses the batch, which is planned again."""
 
     built.generation.check()  # a deploy since it was built: its names may be another output's
+    if built.event is None:
+        return
     try:
         core.check(built.event)
     except Conflict as error:

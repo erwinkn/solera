@@ -1,8 +1,8 @@
 """The engine on the new tracking core (docs/tracking-design.md; build plan B5).
 
-`Core` is what an engine on the new path holds beside its model: the change
-index every output's layers live in, the ids the core knows outputs and
-edges by, and the cap on heavy core calls. The core's state itself is the
+`Core` is what an engine holds beside its model: the change index every
+output's layers live in and the cap on heavy core calls. The core knows an
+output partition and an edge by name (`output_id`, `edge_id`). The core's state itself is the
 model's (`Model.core`), changed only by the events the model applies, so a
 replay of the journal rebuilds it.
 
@@ -30,9 +30,11 @@ from base64 import b64decode, b64encode
 from urllib.parse import unquote, urlsplit
 
 import orjson
+from solera._native import Tracking
 from solera.change_index import open_index
 from solera.threads import in_thread
 
+from ..model import output_id
 from ..state import Conflict, LostOwnership
 
 HEAVY = 4  # plans and commit builds running at once: the engine's cores (N9, D208)
@@ -132,12 +134,9 @@ class Core:
             log.warning("the change index runs without a disk cache: %s", error)
             self.index = open_index(url)
         self.heavy = asyncio.Semaphore(HEAVY)
-        self.locks: dict[str, asyncio.Lock] = {}  # output id -> held while a commit of it is built
+        self.locks: dict[bytes, asyncio.Lock] = {}  # output id -> held while a commit of it is built
         self.plans: dict[str, bytes] = {}  # attempt -> its plan, while it runs here (else its spec's)
-        self._attached: tuple[int, set[str]] = (0, set())
-        # Ids minted by this process: with the event counter, unique in the namespace. An id
-        # minted and never recorded names nothing; one recorded moved the counter on.
-        self._minted = 0
+        self._attached: tuple[int, set[bytes]] = (0, set())
 
     @property
     def m(self):
@@ -155,7 +154,7 @@ class Core:
         async with self.heavy:
             return await in_thread(fn, *args, **kwargs)
 
-    def attach(self, *ids: str) -> None:
+    def attach(self, *ids: bytes) -> None:
         """The outputs a call reads or writes, attached to the change index:
         runtime configuration, not state, so every engine attaches again."""
 
@@ -165,59 +164,41 @@ class Core:
         seen = self._attached[1]
         for id_ in ids:
             if id_ not in seen:
-                tracking.attach(id_.encode(), self.index)
+                tracking.attach(id_, self.index)
                 seen.add(id_)
 
-    def lock(self, id_: str) -> asyncio.Lock:
+    def lock(self, id_: bytes) -> asyncio.Lock:
         """Held while a commit of output `id_` is built and recorded: an
         output's commits are built one at a time, in commit order."""
 
         return self.locks.setdefault(id_, asyncio.Lock())
 
-    def output_id(self, output: str, partition: str, minted: list) -> str:
-        """The core's id of an output's current life. A new one is minted and
-        added to `minted`, for the event that first names it to record;
-        `check` refuses it if another event named one first."""
+    def named(self, output: str, partition: str) -> bytes:
+        """The core's name of a keyed output, declared at once if the core
+        does not hold it: a commit is built in a life the state gives it."""
 
-        id_ = self.m.core_outputs.get((output, partition))
-        if id_ is not None:
-            return id_
-        if ((self.m.manifest or {}).get("outputs", {}).get(output) or {}).get("key") is None:
-            # A life is the current deploy's keyed output's alone (`Generation` keeps names current).
-            raise Conflict(f"output {output!r} is no keyed output of this deploy: no life is minted for it")
-        for o, p, i in minted:
-            if (o, p) == (output, partition):
-                return i
-        self._minted += 1
-        id_ = f"o{self.m.event_counter}.{self._minted}"
-        minted.append([output, partition, id_])
+        id_ = output_id(output, partition)
+        if self.tracking.output(id_) is None:
+            if ((self.m.manifest or {}).get("outputs", {}).get(output) or {}).get("key") is None:
+                # A life is the current deploy's keyed output's alone (`Generation` keeps names current).
+                raise Conflict(f"output {output!r} is no keyed output of this deploy: it has no life")
+            self.record(Tracking.event_declare(id_))
         return id_
 
-    def named(self, output: str, partition: str) -> str:
-        """The id of an output's current life, minted and recorded at once
-        if it has none: an id a commit is built under is never another
-        event's to name first (a consumer opening an edge on it)."""
+    def record(self, event: bytes) -> None:
+        """Check a core event and record it, in one step."""
 
-        minted: list = []
-        id_ = self.output_id(output, partition, minted)
-        if minted:
-            self.engine.state.record({"type": "Core", "event": None, "outputs": minted, "edges": []})
-        return id_
-
-    def edge_id(self) -> str:
-        """A fresh edge id, minted as output ids are."""
-
-        self._minted += 1
-        return f"e{self.m.event_counter}.{self._minted}"
+        self.check(event)
+        self.engine.state.record({"type": "Core", "event": b64(event)})
 
     @staticmethod
-    def path(id_: str, commit: int, by) -> str:
-        """Where a commit's layer goes: under its output's id, named by its
+    def path(life: int, commit: int, by) -> str:
+        """Where a commit's layer goes: under its output's life, named by its
         commit, who made it, and this build alone. Two builds never share an
         object: an engine that lost its namespace may still be uploading one
         while its successor builds the same commit again."""
 
-        return f"core/{id_}/{commit:012d}-{by}-{secrets.token_hex(8)}.lay"
+        return f"core/{life}/{commit:012d}-{by}-{secrets.token_hex(8)}.lay"
 
     def spec(self, prepared: dict) -> dict:
         """What the new path adds to an attempt's spec: the field that sends
@@ -228,15 +209,9 @@ class Core:
             out["plan"] = b64(prepared["plan"])
         return out
 
-    def check(self, event: bytes | None, minted=()) -> None:
-        """Refuse an event the core would not apply, applying nothing; and ids
-        minted for outputs another event has named since."""
+    def check(self, event: bytes) -> None:
+        """Refuse an event the core would not apply, applying nothing."""
 
-        for output, partition, id_ in minted:
-            if self.m.core_outputs.get((output, partition), id_) != id_:
-                raise Conflict(f"output {output!r} was first committed elsewhere meanwhile; retry")
-        if event is None:
-            return
         try:
             self.tracking.check(event)
         except ValueError as error:
@@ -246,5 +221,4 @@ class Core:
         """`check`, for a commit's `core` field as the model will apply it."""
 
         if payload is not None:
-            event = payload.get("event")
-            self.check(unb64(event) if event is not None else None, payload.get("outputs") or ())
+            self.check(unb64(payload["event"]))

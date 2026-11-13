@@ -18,12 +18,15 @@ from collections import deque
 from dataclasses import dataclass, field
 
 from solera import errors, lifecycle
+from solera._native import Tracking
 from solera.build import method_note
 from solera.lifecycle import Cancel, Ended
 from solera.objects import Conflict, swap
 from solera.tasks import retrying
 
+from .model import output_id
 from .state import LostOwnership, Unavailable
+from .tracking import b64
 
 log = logging.getLogger(__name__)
 
@@ -346,12 +349,15 @@ class Attempts:
             needs = {k: v for k in ("cpu", "memory", "gpu") if (v := execution["options"].get(k)) is not None}
             event["pool"] = {"name": execution["executor"], "needs": needs}
         generation.check()  # by name, so under the deploy it was prepared under
-        minted: list = []
-        for name, info in prepared["outputs"].items():
-            if info["contract"].get("key") is not None:
-                self.core.output_id(name, task["partition"], minted)
-        if minted:
-            event["core_outputs"] = minted
+        # Its keyed outputs are named before it writes: a life each, before any commit.
+        new = [
+            id_
+            for name, info in prepared["outputs"].items()
+            if info["contract"].get("key") is not None
+            and self.m.core.output(id_ := output_id(name, task["partition"])) is None
+        ]
+        if new:
+            event["core"] = b64(Tracking.join([Tracking.event_declare(id_) for id_ in new]))
         # Launch only what a restarted engine would adopt, never an orphan: until the
         # launch is durable, pool discovery does not offer it either. If it never
         # is (this engine was replaced), it never is offered.

@@ -60,18 +60,9 @@ async def test_a_batch_commits_journal_event_names_no_key_but_bounds(solera):
 async def test_a_restart_rebuilds_the_cores_state_from_the_journal(solera):
     ex = await Example(solera).start()
     await ex.feed(KEYS)
-    before = (
-        solera.engine.m.core.snapshot(),
-        dict(solera.engine.m.core_outputs),
-        dict(solera.engine.m.core_edges),
-    )
+    before = solera.engine.m.core.snapshot()
     await solera.restart()
-    after = (
-        solera.engine.m.core.snapshot(),
-        dict(solera.engine.m.core_outputs),
-        dict(solera.engine.m.core_edges),
-    )
-    assert after == before
+    assert solera.engine.m.core.snapshot() == before
     await ex.feed({"unique-key-000": "2"}, items=False)
     [batch] = await ex.run("items")
     assert batch.classes == ([], ["unique-key-000"], [])

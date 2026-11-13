@@ -65,7 +65,7 @@ async def test_a_start_over_that_writes_nothing_frees_its_output_at_the_end(sole
 
     await solera.run("files")
     await stop_midway()  # copy holds "a": partial
-    spans1 = [list(x) for x in eng.m.partial_spans[eng.m.span_key("copy", "")]]
+    spans1 = [list(x) for x in eng.m.partial_spans[("copy", "")]]
     for k in rows:
         rows[k] = 0  # no row qualifies any more
     await solera.run("files")
@@ -82,7 +82,7 @@ async def test_a_start_over_that_writes_nothing_frees_its_output_at_the_end(sole
         "spans before": spans1,
         "spans": dict(eng.m.partial_spans),
         "axis head": eng.m.axis_head("copy", ""),
-        "core_empty": dict(eng.m.core_empty),
+        "walking": sorted(eng.m.walking()),
         "stopped": full.stopped(eng),
     }
     await solera.cancel(reader["id"])

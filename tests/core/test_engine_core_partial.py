@@ -17,6 +17,7 @@ from solera.sdk import (
     canonical_partition,
 )
 from solera.stores import FileStore
+from solera_server.model import output_id
 from solera_server.tracking import full
 
 from tests.contract.harness import Outside, Solera, SourceStore, rebuild
@@ -376,7 +377,7 @@ async def test_a_producer_stopped_midway_is_not_complete_because_its_upstream_is
         "running": sorted(full.running(eng.core)),
         "stopped": full.stopped(eng),
         "leaf complete_known": eng._complete_known("leaf", ""),
-        "core_empty": {str(k): v for k, v in eng.m.core_empty.items()},
+        "walking": sorted(eng.m.walking()),
     }
     w.hold["mid"].set()
     await solera.wait(rebuilding)
@@ -762,9 +763,7 @@ async def test_every_taker_of_several_output_locks_takes_them_in_life_id_order(s
 
     eng.core.lock = recording
     await solera.run("pair", mode="full")
-    ids = {name: eng.m.core_outputs[(name, "")] for name in ("a_out", "z_out")}
-    assert sorted(ids.values()) != [ids["a_out"], ids["z_out"]], "the names sort otherwise than the ids"
-    assert taken == sorted(ids.values()), taken
+    assert taken == [output_id("a_out", ""), output_id("z_out", "")], taken
 
 
 async def test_a_first_run_by_a_key_list_that_takes_nothing_holds_its_readers(solera):

@@ -18,6 +18,7 @@ from solera.sdk import (
     canonical_partition,
 )
 from solera.stores import FileStore, Patch
+from solera_server.model import edge_id, output_id
 from solera_server.planning import Planner
 from solera_server.tracking import b64, full
 from solera_server.tracking import prepare as prepare_module
@@ -269,9 +270,9 @@ async def test_a_rebound_input_closes_its_edge_at_deploy(solera, tmp_path):
     await solera.deploy(project("left"))
     await solera.run("left")
     await solera.run("copy")
-    assert ("copy", "", "data") in solera.engine.m.core_edges
+    assert solera.engine.m.core.edge(edge_id("copy", "", "data")) is not None
     await solera.deploy(project("right"))
-    assert ("copy", "", "data") not in solera.engine.m.core_edges
+    assert solera.engine.m.core.edge(edge_id("copy", "", "data")) is None
 
 
 def test_the_engines_own_tasks_pass_the_gate(tmp_path):
@@ -315,7 +316,7 @@ async def test_an_input_cleared_while_the_batch_builds_replans_it_without_spendi
     run, entered, release = eng.core.run, asyncio.Event(), asyncio.Event()
 
     async def join_build_waits(fn, *args, **kwargs):
-        if fn == eng.core.tracking.build_commit and args[0] == eng.m.core_outputs[("join", "")].encode():
+        if fn == eng.core.tracking.build_commit and args[0] == output_id("join", ""):
             if not entered.is_set():
                 entered.set()
                 await release.wait()
@@ -516,9 +517,9 @@ async def test_a_walk_ends_where_its_plan_ends_not_where_one_inputs_probe_does(s
 
     eng.core.run = shrink_after_plan
     await solera.run("copy", mode="full")
-    edge = eng.m.core_edges[("copy", "", "left")][0].encode()
+    edge = edge_id("copy", "", "left")
     event = eng.core.tracking.event_watch(edge, {})
-    eng.state.record({"type": "Core", "event": b64(event), "outputs": [], "edges": []})
+    eng.state.record({"type": "Core", "event": b64(event)})
     assert await eng.complete("copy", "") == await eng.core.run(eng.core.tracking.stale_complete, edge)
     assert sorted(r["id"] for r in await solera.read("copy")) == ["a", "b"]
 

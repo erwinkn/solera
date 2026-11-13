@@ -378,13 +378,108 @@ impl Tracking {
         })
     }
 
-    /// One output as the state holds it: `{"head", "live", "layers"}`, or
-    /// None before its first commit.
+    /// Every edge the state holds, as `(edge, the output it reads)`.
+    fn edges<'py>(&self, py: Python<'py>) -> Vec<(Bound<'py, PyBytes>, Bound<'py, PyBytes>)> {
+        let state = self.state.read().unwrap();
+        state
+            .edges
+            .iter()
+            .map(|(id, e)| (PyBytes::new(py, id), PyBytes::new(py, &e.input)))
+            .collect()
+    }
+
+    /// The edges with an empty piece: a walk from empty has not reached the end.
+    fn walking<'py>(&self, py: Python<'py>) -> Vec<Bound<'py, PyBytes>> {
+        let state = self.state.read().unwrap();
+        let empty = |e: &tr::state::Edge| {
+            e.progress.keyed().is_some_and(|k| {
+                k.pieces(&tr::progress::KeyRange::all())
+                    .iter()
+                    .any(|p| p.value == tr::progress::Value::Empty)
+            })
+        };
+        state
+            .edges
+            .iter()
+            .filter(|(_, e)| empty(e))
+            .map(|(id, _)| PyBytes::new(py, id))
+            .collect()
+    }
+
+    /// Every output the engine named (never a per-key edge's record outputs).
+    fn outputs<'py>(&self, py: Python<'py>) -> Vec<Bound<'py, PyBytes>> {
+        let state = self.state.read().unwrap();
+        state
+            .outputs
+            .keys()
+            .filter(|id| !tr::state::core_owned(id))
+            .map(|id| PyBytes::new(py, id))
+            .collect()
+    }
+
+    /// The event that names `output`, so it has a life before anything reads
+    /// or writes it. It keeps the life it has.
+    #[staticmethod]
+    fn event_declare<'py>(py: Python<'py>, output: Vec<u8>) -> Bound<'py, PyBytes> {
+        PyBytes::new(
+            py,
+            &one_event(Part::Declare(tr::commit::Declare {
+                output: output.into(),
+            })),
+        )
+    }
+
+    /// The event that ends `output`'s life: it leaves the state, and its next
+    /// naming starts a new one. Refused while an edge reads it.
+    #[staticmethod]
+    fn event_retire<'py>(py: Python<'py>, output: Vec<u8>) -> Bound<'py, PyBytes> {
+        PyBytes::new(
+            py,
+            &one_event(Part::Retire(tr::retain::Retire {
+                output: output.into(),
+            })),
+        )
+    }
+
+    /// One edge as the state holds it, or None when it has none: `input`, the
+    /// output it reads; `life`, which changes each time it opens or starts
+    /// over; `empty`, the key its first empty piece starts after ("": from
+    /// the first key), None once a walk has reached the end.
+    fn edge<'py>(&self, py: Python<'py>, edge: &[u8]) -> PyResult<Option<Bound<'py, PyDict>>> {
+        let (e, life) = {
+            let state = self.state.read().unwrap();
+            let Some(e) = state.edges.get(edge).cloned() else {
+                return Ok(None);
+            };
+            (e, state.per_key.get(edge).map_or(0, |k| k.life))
+        };
+        let d = PyDict::new(py);
+        d.set_item("input", PyBytes::new(py, &e.input))?;
+        d.set_item("life", life)?;
+        let empty = e.progress.keyed().and_then(|k| {
+            let pieces = k.pieces(&tr::progress::KeyRange::all());
+            let first = pieces
+                .into_iter()
+                .find(|p| p.value == tr::progress::Value::Empty)?;
+            Some(
+                first
+                    .range
+                    .lo
+                    .map_or_else(String::new, |lo| String::from_utf8_lossy(&lo).into_owned()),
+            )
+        });
+        d.set_item("empty", empty)?;
+        Ok(Some(d))
+    }
+
+    /// One output as the state holds it: `{"life", "head", "live", "layers"}`,
+    /// or None while nothing has named it.
     fn output<'py>(&self, py: Python<'py>, output: &[u8]) -> PyResult<Option<Bound<'py, PyDict>>> {
         let Some(o) = self.state.read().unwrap().outputs.get(output).cloned() else {
             return Ok(None);
         };
         let d = PyDict::new(py);
+        d.set_item("life", o.life)?;
         d.set_item("head", o.head)?;
         d.set_item("live", o.live)?;
         let layers = PyList::empty(py);

@@ -18,7 +18,8 @@ import math
 
 from solera._native import Tracking
 
-from . import WALK, Core, Generation, Redeployed, b64, canonical
+from ..model import edge_id, output_id
+from . import WALK, Core, Generation, Redeployed, canonical
 from .commit import HeldBack
 from .full import dynamic_sets, held
 
@@ -37,31 +38,23 @@ def conditions(engine, input, base: dict) -> dict:
 
 
 def open_edges(core: Core, task: dict, keyed: list) -> dict:
-    """Each keyed input's edge, opening those that are new and minting the
-    ids of upstream outputs never committed: recorded as one event, at once.
-    An edge whose upstream is another output's life than the one it read is
-    closed and opened again: what it held is of an output that is gone."""
+    """Each incremental input's edge, opening those the core does not hold:
+    recorded as one event, at once. Opening an edge names its upstream. An
+    edge that reads another output than the input does now is closed and
+    opened again: what it held is of an output it no longer reads."""
 
-    m, asset, partition = core.m, task["asset"], task["partition"]
-    minted, edges, events, out = [], [], [], {}
+    events, out = [], {}
     for input in keyed:
-        upstream = core.output_id(input.output, input.partition, minted)
-        found = m.core_edges.get((asset, partition, input.param))
-        if found is not None and found[1] == upstream:
-            out[input.param] = found[0]
+        upstream = output_id(input.output, input.partition)
+        edge = out[input.param] = edge_id(task["asset"], task["partition"], input.param)
+        found = core.tracking.edge(edge)
+        if found is not None and found["input"] == upstream:
             continue
         if found is not None:
-            events.append(Tracking.event_edge_close(found[0].encode()))
-        edge = core.edge_id()
-        events.append(Tracking.event_edge_open(edge.encode(), upstream.encode(), True))
-        edges.append([asset, partition, input.param, [edge, upstream]])
-        out[input.param] = edge
-    if events or minted:
-        event = Tracking.join(events) if events else None
-        core.check(event, minted)
-        core.engine.state.record(
-            {"type": "Core", "event": b64(event) if event else None, "outputs": minted, "edges": edges}
-        )
+            events.append(Tracking.event_edge_close(edge))
+        events.append(Tracking.event_edge_open(edge, upstream, True))
+    if events:
+        core.record(Tracking.join(events))
     return out
 
 
@@ -115,7 +108,7 @@ async def _prepare(core: Core, task: dict, run: dict, attempt: str | None) -> di
     mine = progress.get(WALK)
     if keyed:
         edges = open_edges(core, task, keyed)
-        core.attach(*(core.m.core_edges[(task["asset"], task["partition"], i.param)][1] for i in keyed))
+        core.attach(*(output_id(i.output, i.partition) for i in keyed))
         after = (mine or {}).get("key")
         mode, named = run_mode(run, keyed)
         request = {
@@ -124,9 +117,7 @@ async def _prepare(core: Core, task: dict, run: dict, attempt: str | None) -> di
             "reset": full,
             "after": after,
             "limit": min(int(i.spec["batch_size"]) for i in keyed),
-            "inputs": [
-                {"edge": edges[i.param].encode(), "conditions": conditions(engine, i, base)} for i in keyed
-            ],
+            "inputs": [{"edge": edges[i.param], "conditions": conditions(engine, i, base)} for i in keyed],
         }
         summary = await core.run(core.tracking.plan, request)
         plan_bytes = summary["plan"]
@@ -161,7 +152,6 @@ async def _prepare(core: Core, task: dict, run: dict, attempt: str | None) -> di
                 "mode": mode,
                 "output": input.output,
                 "upstream_partition": input.partition,
-                "edge": edges[input.param],  # what the batch's progress names as the walk's (`restarted`)
                 "head": found["head"],
                 "index": index,
                 "count": count,
@@ -186,28 +176,24 @@ async def _prepare(core: Core, task: dict, run: dict, attempt: str | None) -> di
 
 
 def restarted(core: Core, task: dict, input) -> bool:
-    """Whether a keyed input must start over. A task's walk goes on only over
-    the edge it walked, which its progress names: a deploy that closed it (a
-    reset of either side, a rebind) starts the walk over, whatever another
-    run committed since. A task with no walk yet starts over if what the
-    partition's committed progress reads (`Model.core_read`, which only a
-    commit writes) is an upstream life that is gone, or nothing though the
-    partition has committed (a job, with no output, has only its record) or
-    one of the asset's outputs still holds content to clear (a reset of a
-    sibling output clears the record, not the content)."""
+    """Whether an incremental input must start over. A task's walk goes on
+    unless a deploy since its last commit reset either side of the edge (its
+    asset, one of its outputs, the upstream), whatever another run committed
+    meanwhile; a rebind changes the definition, which starts it over too
+    (`_full_run`). A task with no walk yet starts over if the partition has
+    not read its edge, yet it has committed (a job, with no output, has only
+    its record) or one of the asset's outputs still holds content to clear."""
 
     m, asset, partition = core.m, task["asset"], task["partition"]
-    edge = m.core_edges.get((asset, partition, input.param))
+    outputs = [o["name"] for o in (m.manifest["assets"].get(asset) or {}).get("outputs") or ()]
     if (mine := (task.get("progress") or {}).get(WALK)) is not None:
-        walked = (mine.get("edges") or {}).get(input.param)
-        return walked is None or edge is None or walked != edge[0]
-    read = m.core_read.get((asset, partition, input.param))
-    if read is None:
-        outputs = (m.manifest["assets"].get(asset) or {}).get("outputs") or ()
-        return "definition" in m.partition(asset, partition) or any(
-            (o["name"], partition) in m.heads for o in outputs
-        )
-    return read != m.core_outputs.get((input.output, input.partition))
+        sides = [("asset", asset), ("output", input.output), *(("output", name) for name in outputs)]
+        return any(m.reset_at.get(side, 0) > mine["deploy"] for side in sides)
+    if (m.edge(asset, partition, input.param) or {}).get("read"):
+        return False
+    return "definition" in m.partition(asset, partition) or any(
+        (name, partition) in m.heads for name in outputs
+    )
 
 
 def refuse(engine, task: dict, run: dict, keyed: list) -> None:
@@ -230,7 +216,7 @@ def refuse(engine, task: dict, run: dict, keyed: list) -> None:
             )
 
 
-async def _more(core: Core, input, edge: str, conds: dict, hi: str, full: bool) -> bool:
+async def _more(core: Core, input, edge: bytes, conds: dict, hi: str, full: bool) -> bool:
     """Whether one keyed input's walk goes on past `hi`: it owes a key past
     it, or in a full run, upstream holds one its patterns take."""
 
@@ -238,7 +224,7 @@ async def _more(core: Core, input, edge: str, conds: dict, hi: str, full: bool) 
         from .stale import taken_after
 
         return await taken_after(core, input, hi)
-    rows, _ = await core.run(core.tracking.owed, edge.encode(), conds, after=hi, limit=1)
+    rows, _ = await core.run(core.tracking.owed, edge, conds, after=hi, limit=1)
     return bool(rows)
 
 
