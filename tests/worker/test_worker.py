@@ -579,7 +579,7 @@ def test_the_sdk_and_worker_import_graph_holds_no_server_or_dataframe_library():
 
     code = (
         "import sys, solera, solera.stores, solera.keys, solera_worker.worker, solera_worker.channel, "
-        "solera_worker.sensors, solera_worker.each, solera_postgres\n"
+        "solera_worker.sensors, solera_postgres\n"
         "banned = ('pandas', 'pyarrow', 'duckdb', 'numpy', 'fastapi', 'starlette', 'uvicorn', 'psycopg')\n"
         "print(','.join(m for m in banned if m in sys.modules))"
     )

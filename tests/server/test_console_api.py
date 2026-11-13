@@ -101,7 +101,6 @@ async def run(engine, targets, **kw):
 
 async def test_what_an_operator_may_clear_starts_empty(world):
     engine, client, base, *_ = world
-    assert (await client.get(f"{base}/repairs")).json() == {"repairs": []}
     assert (await client.get(f"{base}/cleanups")).json() == {"cleanups": []}
 
 

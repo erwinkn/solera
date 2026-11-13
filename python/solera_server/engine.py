@@ -48,11 +48,8 @@ from . import history, planning
 from .attempts import POOL_OFFERED_GRACE, REPLAN_DELAY, Attempts, Live, current_names, worker_report
 from .executors import PlacementContext, Registry
 from .history import MAX_METADATA, History, RunFilter
-from .keyservice import KeyService, cache_root
 from .model import (
     CLEANUP,
-    REPAIR_RUNS,
-    REPAIR_SPACING,
     TERMINAL_RUN,
     TERMINAL_TASK,
     _delta_files,
@@ -64,7 +61,7 @@ from .observing import Observing
 from .sensors import Sensors
 from .staleness import Staleness
 from .state import Conflict, LostOwnership, State
-from .tracking import WALK, Core, Generation, Redeployed, b64, output_pin
+from .tracking import WALK, Core, Generation, Redeployed, b64, cache_root, output_pin
 from .tracking import commit as core_commit
 from .tracking import full as core_full
 from .tracking import prepare as core_prepare
@@ -179,12 +176,9 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
         self.engine_inflight: set[str] = set()
         self.executor_inflight: dict[str, int] = {}
         self._io: ObjectIO | None = None
-        # The key cache and resolver (docs/resolved-commits.md §4–§5): where
-        # `resolve_cache` says, else beside `file://` state or in a temporary
-        # directory; None or False: off.
-        self.keys: KeyService | None = None
+        # The core and its change index, whose disk cache is where `resolve_cache` says, else
+        # beside `file://` state or in a temporary directory; None or False: no disk cache.
         root = resolve_cache if isinstance(resolve_cache, str) else cache_root(state.objects_url)
-        # The new path: the core and its change index, whose disk cache sits beside the key cache's.
         self.core = Core(self, root if resolve_cache else None)
         # What fails now, by name — the eval loop, upkeep, a key index, the history, an
         # automation — each entry cleared by its own next success: the one place it shows.
@@ -198,7 +192,6 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
             clock=self.clock,
             concurrency=maintenance_concurrency,
             retention_interval=retention_interval,
-            keys=self.keys,
             failing=self.failing,
         )
         self._sensors_init(sensor_host)
@@ -353,8 +346,6 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
         self._dispatch_due()
         self._sensor_sweep()
         self._automation_tick()
-        await self._retry_tick()
-        await self._repair_tick()
         self._archive_due()
 
     async def run_until(self, run_id: str, timeout: float = 120.0):
@@ -596,8 +587,6 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
             if holder is None or self.m.claimed(holder) is None:
                 holder = retiring.get(key)
             declared = self.manifest["assets"].get(task["asset"]) or {}  # a cleanup task's: none
-            written = [o["name"] for o in declared.get("outputs", ())]
-            behind = self._merges_behind([*written, f"@{task['asset']}"], task["partition"])
             cap = declared.get("concurrency")
             if holder is not None:
                 held[task_id] = ["claim", holder]
@@ -608,8 +597,6 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
                 held[task_id] = waiting
             elif cap is not None and asset_used.get(task["asset"], 0) >= cap:
                 held[task_id] = ["concurrency", task["asset"]]
-            elif behind is not None:
-                held[task_id] = ["merges", behind]
             elif (writing := self._writing(task)) is not None:
                 held[task_id] = writing
             elif not is_pool and engine_used >= self.concurrency:
@@ -659,20 +646,6 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
                 return ["writing", where]
             if (input.output, input.partition) in self.m.repairs:
                 return ["repair", where]
-        return None
-
-    def _merges_behind(self, names: list[str], partition: str) -> str | None:
-        """The first of the key indexes `names` in `partition` that upkeep has
-        let fall far behind (`LayerState.backlogged`), or None. Every index
-        writer waits until merges catch up (writer backpressure,
-        docs/key-index-design.md § Compaction): a task writing one is held
-        (`merges`), its outputs and a per-key asset's outcome index alike, and
-        a source commit is refused, retryable."""
-
-        for name in names:
-            index = self.m.indexes.get((name, partition))
-            if index is not None and index.backlogged():
-                return name
         return None
 
     def _spawn(self, run_id: str, attempt: str, is_pool: bool, executor: str, work):
@@ -1613,10 +1586,6 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
         source = self.manifest["sources"].get(name)
         if source is None:
             raise KeyError(name)
-        if self._merges_behind([name], "") is not None:
-            raise Conflict(
-                f"source {name!r}: its key index is far behind on merges; retry once upkeep catches up"
-            )
         # Adapters say "no removals" as an empty list: the same as none, for any source.
         remove = remove or None
         head = self.m.heads.get((name, ""))
@@ -1841,80 +1810,6 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
                 self._fire_ondeploy(auto)
             else:
                 self._fire(auto, auto.get("partitions") or "latest")
-
-    async def _retry_tick(self):
-        """The retry clock (docs/per-key-processing.md §9): an automated Each
-        asset whose stored outcomes has keys due again runs for that partition, even
-        when nothing upstream changed. An asset run by hand picks them up on
-        its next run. A partition whose inputs have no head waits for them: its
-        run could not plan, and would be submitted again every tick."""
-
-        automated = {t for auto in self.m.automations.values() if auto["enabled"] for t in auto["targets"]}
-        for (asset, partition), state in list(self.m.partitions.items()):
-            if asset not in automated or asset not in self.manifest["assets"] or "outcomes" not in state:
-                continue
-            if self._partition_active(asset, partition) or self.m.is_pending(asset, partition):
-                continue
-            if self._has_retries(state["outcomes"]):
-                await self.submit_retries(asset, [partition], "retry clock", skip_missing_inputs=True)
-
-    async def _repair_tick(self):
-        """The repair clock (docs/lifecycle.md §9.6): a partition a dead writer left
-        owing a repair, once nothing else will run it (its task out of retries,
-        or canceled), runs again on its own — its consumers' reads wait on the
-        repair. At most `REPAIR_RUNS` runs, `REPAIR_SPACING` apart and doubling;
-        then it waits, stuck and visible (`repairs_view`), for a run of a
-        user's or a trigger's."""
-
-        owner = {o["name"]: a for a, info in self.manifest["assets"].items() for o in info["outputs"]}
-        now = self.clock()
-        for output, partition in list(self.m.repairs):
-            asset = owner.get(output)
-            if (
-                asset is None
-                or self._partition_active(asset, partition)
-                or self.m.is_pending(asset, partition)
-            ):
-                continue
-            runs, at = self.m.repair_runs(output, partition)
-            if runs >= REPAIR_RUNS or (at is not None and now < at + REPAIR_SPACING * 2 ** (runs - 1)):
-                continue
-            self.state.record(
-                {"type": "RepairRunSubmitted", "output": output, "partition": partition, "at": now}
-            )
-            await self.submit(
-                [asset], partitions=[partition], skip_active=True, skip_missing_inputs=True, by="repair clock"
-            )
-
-    def retry_keys(self, asset: str, classes, partition: str | None = None, by: str | None = None) -> dict:
-        """`solera keys retry`: a forced request for a per-key asset's failing
-        keys of `classes` (`failed`, `rejected`, `canceled`, `retrying`,
-        `timed_out`, or `all`), every partition or one. Its event
-        counter is its identity; a retry pass takes each such key once (§9)."""
-
-        from solera.key_outcomes import NAMES
-
-        if not any(
-            e.get("each") for e in (self.manifest["assets"].get(asset) or {}).get("inputs", {}).values()
-        ):
-            raise ValueError(f"{asset} has no per-key input: it keeps no failing keys")
-        classes = sorted(set(NAMES.values()) if "all" in classes else set(classes))
-        unknown = set(classes) - set(NAMES.values())
-        if unknown or not classes:
-            raise ValueError(f"unknown key classes: {sorted(unknown) or classes}")
-        self.state.record(
-            {
-                "type": "KeysRetryRequested",
-                "asset": asset,
-                "partition": partition,
-                "classes": classes,
-                "by": by,
-            }
-        )
-        partitions = sorted(
-            s for s, r in self.m.partitions.of(asset).items() if "outcomes" in r and partition in (None, s)
-        )
-        return {"asset": asset, "classes": classes, "partitions": partitions}
 
     def _automation_run(self, auto, partitions, targets=None) -> dict | None:
         """The run a firing becomes, in the run's own vocabulary (§9); `None`
@@ -2264,7 +2159,7 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
             for o in info["outputs"]
         }
         observed = {
-            param: self._observed_at(rec)
+            param: None if rec is None else int(rec["commit"])
             for param, rec in (self.m.partition(asset, partition).get("observed") or {}).items()
         }
         dims = self.planner().dims(asset)

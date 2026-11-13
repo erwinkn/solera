@@ -385,3 +385,25 @@ async def test_a_namespace_of_another_state_format_is_refused(store):
         await open_journal(store)
     after = orjson.loads(bytes(await (await obstore.get_async(store, "control/journal.json")).bytes_async()))
     assert after == old  # not fenced, not rewritten
+
+
+def test_every_event_the_code_records_has_a_handler_and_every_handler_an_event():
+    """`State.record` applies an event through `Model._on_{type}`: one with no
+    handler breaks the engine at its first recording, and a handler nothing
+    records is dead."""
+
+    import re
+    from pathlib import Path
+
+    from solera_server import model
+    from solera_server.model import Model
+
+    source = "\n".join(p.read_text() for p in Path(model.__file__).parent.rglob("*.py"))
+    recorded = set(re.findall(r'"type": "([A-Z][A-Za-z]+)"', source)) - {"VARCHAR", "GPU"}
+    recorded |= {
+        "HistoryFlushed",
+        "HistoryCompacted",
+    }  # the lake's, named `{name}Flushed` and `{name}Compacted`
+    handled = {name[4:] for name in dir(Model) if name.startswith("_on_")}
+    assert recorded - handled == set(), "recorded, with no handler"
+    assert handled - recorded == set(), "handled, never recorded"

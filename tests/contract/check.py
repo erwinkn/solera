@@ -24,14 +24,12 @@ INTERNAL = (
     "solera_server",
     "solera_worker",
     "solera.keys",
-    "solera.key_outcomes",
     "solera.lifecycle",
     "solera.fencing",
     "solera._native",
     "tests.server",
     "tests.sdk",
     "tests.worker",
-    "tests.staleness",
 )
 TRUSTED = {"harness.py", "conftest.py"}
 ENTRY = re.compile(r"^\*\*([A-Z]{3}-\d+)\. ", re.M)

@@ -122,17 +122,6 @@ class AttemptChannel:
     async def finished(self, body: dict) -> None:
         await self._post("finished", body)
 
-    async def resolve(self, body: bytes) -> bytes:
-        """A small write's delta, from the engine's cache (docs/resolved-commits.md §4)."""
-
-        from solera.keys.resolver import CONTENT_TYPE
-
-        headers = {"Content-Type": CONTENT_TYPE}
-        response = await self.transport.asend(
-            "POST", f"{self.base}/resolve", content=body, headers=headers, timeout=30.0
-        )
-        return _answer(response).content
-
     async def close(self) -> None:
         await self.transport.close()
 

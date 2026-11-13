@@ -226,9 +226,9 @@ async def test_dep_1_the_engine_numbers_deploys_as_it_serves_them(solera, monkey
     for build_id in ("r1", "r1", "r2", "r1"):  # the second r1 serves no new deploy
         monkeypatch.setenv("SOLERA_BUILD", build_id)
         await ex.deploy()
-        numbers.append((await solera.get("/assets/checks/outcomes"))["deploy"])
+        numbers.append((await solera.get("/api/diagnostics"))["deploy_number"])
     await solera.restart()
-    numbers.append((await solera.get("/assets/checks/outcomes"))["deploy"])
+    numbers.append((await solera.get("/api/diagnostics"))["deploy_number"])
     assert numbers == [1, 1, 2, 3, 3]
 
 
@@ -268,7 +268,7 @@ async def test_dep_2_a_local_serve_reloads_on_code_changes_and_keeps_its_deploy_
         """The deploy's number, the deploy served, and what fails. The number
         first: a reload serves its deploy before it numbers it."""
 
-        number = (await solera.get("/assets/parsed/outcomes"))["deploy"]
+        number = (await solera.get("/api/diagnostics"))["deploy_number"]
         diagnostics = await solera.get("/api/diagnostics")
         return number, diagnostics["deploy"], diagnostics["last_error"]
 

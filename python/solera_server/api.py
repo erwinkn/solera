@@ -32,7 +32,7 @@ from .tracking import full as core_full
 
 log = logging.getLogger(__name__)
 
-ATTEMPT_ROUTE = re.compile(r"^/api/projects/[^/]+/attempts/([^/]+)/(start|beat|logs|resolve|finished)$")
+ATTEMPT_ROUTE = re.compile(r"^/api/projects/[^/]+/attempts/([^/]+)/(start|beat|logs|finished)$")
 POOL_ROUTE = re.compile(r"^/api/projects/[^/]+/pools/[^/]+/work$")
 SENSOR_ROUTE = re.compile(r"^/api/projects/[^/]+/sensors/(next|[^/]+/ticks/[^/]+)$")
 
@@ -69,19 +69,7 @@ class PruneInput(BaseModel):
     dry_run: bool = False
 
 
-class KeysRetryInput(BaseModel):
-    classes: list[str] = Field(default_factory=lambda: ["failed"], max_length=10)
-    partition: str | None = None
-    by: str | None = Field(default=None, max_length=200)
-
-
 class CleanupsClearInput(BaseModel):
-    output: str
-    partition: str = ""
-    by: str | None = Field(default=None, max_length=200)
-
-
-class MergesClearInput(BaseModel):
     output: str
     partition: str = ""
     by: str | None = Field(default=None, max_length=200)
@@ -254,6 +242,7 @@ def create_app(
             "namespace": runtime.state.namespace,
             "project": runtime.manifest["name"],
             "deploy": runtime.manifest["deploy"],
+            "deploy_number": runtime.m.deploy_number,
             "inflight": len(runtime.watchers),
             "active_runs": sum(1 for r in runtime.m.runs.values() if r["status"] not in TERMINAL_RUN),
             "postgres": bool(os.environ.get("DATABASE_URL")),
@@ -301,31 +290,6 @@ def create_app(
         ]
         return detail
 
-    @app.get("/api/projects/{p}/assets/{name}/inputs")
-    async def asset_inputs(p: str, name: str, request: Request):
-        runtime = await asset_engine(request, p, name)
-        return await runtime.asset_inputs(name)
-
-    @app.get("/api/projects/{p}/assets/{name}/outcomes")
-    async def asset_outcomes(
-        p: str,
-        name: str,
-        request: Request,
-        partition: str | None = None,
-        key: str | None = None,
-        after: str | None = None,
-        limit: int = Query(default=100, ge=1, le=1000),
-    ):
-        """A per-key asset's key outcomes (docs/per-key-processing.md §9):
-        each key's latest outcome, `?outcome=failed&outcome=ok` keeping those;
-        `?key=` that key's alone."""
-
-        runtime = await asset_engine(request, p, name)
-        outcomes = [v for v in request.query_params.getlist("outcome") if v]
-        return await runtime.latest_outcomes(
-            name, partition, key=key, outcomes=outcomes, after=after, limit=limit
-        )
-
     @app.get("/api/projects/{p}/assets/{name}/stale-keys")
     async def asset_stale_keys(
         p: str,
@@ -348,35 +312,6 @@ def create_app(
 
         runtime = await asset_engine(request, p, name)
         return await runtime.stale_keys(name, partition, after=after, limit=limit)
-
-    @app.get("/api/projects/{p}/assets/{name}/outcomes/history")
-    async def asset_outcome_history(
-        p: str,
-        name: str,
-        request: Request,
-        partition: str | None = None,
-        key: str | None = None,
-        q: str | None = None,
-        run: str | None = None,
-        before: str | None = None,
-        limit: int = Query(default=100, ge=1, le=1000),
-    ):
-        """The log of what a per-key asset's keys came to (§10), run by run,
-        newest first; repeat `outcome` to match any of several."""
-
-        runtime = await asset_engine(request, p, name)
-        outcomes = [v for v in request.query_params.getlist("outcome") if v]
-        page = await runtime.history.key_outcomes(
-            name, partition=partition, key=key, q=q, outcomes=outcomes, run=run, before=before, limit=limit
-        )
-        return {"asset": name, **page}
-
-    @app.get("/api/projects/{p}/assets/{name}/explain")
-    async def asset_explain(
-        p: str, name: str, request: Request, key: str, partition: str = "", input: str | None = None
-    ):
-        runtime = await asset_engine(request, p, name)
-        return await runtime.explain(name, key, partition, input)
 
     @app.get("/api/projects/{p}/outputs/{name}/heads")
     async def output_heads(p: str, name: str, request: Request):
@@ -631,11 +566,6 @@ def create_app(
             raise KeyError(f"{run_id}/{attempt}: no result yet")
         return result
 
-    @app.get("/api/projects/{p}/repairs")
-    async def repairs(p: str, request: Request):
-        runtime = await project_engine(request, p)
-        return {"repairs": runtime.repairs_view()}
-
     @app.get("/api/projects/{p}/cleanups")
     async def cleanups(p: str, request: Request):
         runtime = await project_engine(request, p)
@@ -645,28 +575,6 @@ def create_app(
     async def clear_cleanups(p: str, body: CleanupsClearInput, request: Request):
         runtime = await project_engine(request, p)
         return runtime.clear_cleanups(body.output, body.partition, body.by or "api")
-
-    @app.get("/api/projects/{p}/outputs/{name}/merges")
-    async def output_merges(p: str, name: str, request: Request, partition: str = ""):
-        """A key index's failed merges, and when upkeep tries them again."""
-
-        runtime = await project_engine(request, p)
-        return runtime.merges_view(name, partition)
-
-    @app.post("/api/projects/{p}/merges:clear")
-    async def clear_merges(p: str, body: MergesClearInput, request: Request):
-        """Forget what an index's merges tried: upkeep tries them again at once."""
-
-        runtime = await project_engine(request, p)
-        return runtime.clear_merges(body.output, body.partition, body.by or "api")
-
-    @app.post("/api/projects/{p}/assets/{name}/keys:retry")
-    async def retry_keys(p: str, name: str, body: KeysRetryInput, request: Request):
-        runtime = await project_engine(request, p)
-        found = runtime.retry_keys(name, body.classes, body.partition, body.by or "api")
-        if found["partitions"]:
-            await runtime.submit_retries(name, found["partitions"], body.by or "api")
-        return found
 
     # -- the worker channel (docs/lifecycle.md §5) ----------------------------------------
 
@@ -684,29 +592,6 @@ def create_app(
     async def attempt_live_logs(p: str, attempt: str, request: Request):
         runtime = await project_engine(request, p)
         return await runtime.attempt_logs(attempt, await request.json())
-
-    @app.post("/api/projects/{p}/attempts/{attempt}/resolve")
-    async def attempt_resolve(p: str, attempt: str, request: Request):
-        """A small write's delta from the engine's cache (docs/resolved-commits.md §4):
-        binary, versioned framing both ways."""
-
-        from solera.keys.resolver import CONTENT_TYPE, MAX_BODY, Malformed, UnsupportedVersion
-
-        runtime = await project_engine(request, p)
-        received = bytearray()
-        async for chunk in request.stream():  # never more than a request may be
-            received += chunk
-            if len(received) > MAX_BODY:
-                return JSONResponse({"detail": f"a body over {MAX_BODY} bytes"}, status_code=413)
-        try:
-            body = await runtime.attempt_resolve(attempt, bytes(received))
-        except UnsupportedVersion as e:
-            return JSONResponse({"detail": str(e)}, status_code=415)
-        except Malformed as e:
-            return JSONResponse({"detail": str(e)}, status_code=400)
-        if body is None:
-            return Response(status_code=503)
-        return Response(content=body, media_type=CONTENT_TYPE)
 
     @app.post("/api/projects/{p}/attempts/{attempt}/finished", status_code=204)
     async def attempt_finished(p: str, attempt: str, request: Request):
