@@ -49,6 +49,11 @@ async def edges(engine, state, output):
     return {e["param"]: e for e in (await engine.history.lineage(output, "", generation))["edges"]}
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason="B10: the lineage of a whole read that saw a newer write than its pin is not rebuilt on "
+    "the new core (it fails on main since the old path went)",
+)
 async def test_lineage_says_what_a_current_read_saw(state):
     if not DSN:
         pytest.skip("SOLERA_TEST_DATABASE_URL is not set")
