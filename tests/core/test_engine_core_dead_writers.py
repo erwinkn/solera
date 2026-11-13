@@ -5,11 +5,12 @@ that attempt commits. Postgres itself is exercised by the contract's STO-5
 and ENG-8, which CI does not run; here the store is one of files that says
 it writes in place and answers `written_at` as a table would."""
 
+import os
 from dataclasses import replace
 
 import pytest
 from solera.sdk import Incremental, Output, Project, Retry, asset
-from solera.stores import FileStore, KeyedWrite, Patch
+from solera.stores import FileStore, KeyedWrite, Keys, Patch
 
 from tests.contract.harness import Solera
 from tests.contract.test_sto import Faults, items_on, killed_after_writing, rows, served
@@ -36,10 +37,22 @@ class Table(Faults, FileStore):
         self.value_at = None  # the version a read of a single value says it found
 
     async def read(self, ref, t, selection):
+        handle = ref.handle or {}
+        if selection is None and handle.get("mode") == "keyed":  # whole, as a table is read: no index
+            newest = {}
+            for folder, _, names in os.walk(os.path.join(self.where(), handle["path"])):
+                for name in names:
+                    key, version = os.path.basename(folder), int(name.split(".")[0])
+                    newest[key] = max(version, newest.get(key, 0))
+            selection = Keys(newest)
         found = await super().read(ref, t, selection)
         if found.versions is None:
             return found if self.value_at is None else replace(found, version=self.value_at)
-        return replace(found, versions={**found.versions, **self.holds}) if self.holds else found
+        if not self.holds:
+            return found
+        gone = {key for key, version in self.holds.items() if version is None}
+        value = [row for row in found.value if row["id"] not in gone]  # a key it lacks has no row
+        return replace(found, value=value, versions={**found.versions, **self.holds})
 
     async def written_at(self, versions, prior, context):
         self.asked.append((list(versions), context.generation))
@@ -156,3 +169,48 @@ async def test_an_asset_never_builds_on_a_write_to_its_own_output_no_commit_reco
     await solera.run("items")
     await solera.run("tally")
     assert seen[-1] == (False, ["k4"], 3), "an ordinary batch again: the full run was owed once"
+
+
+async def test_a_batch_in_flight_holds_back_what_a_rebuild_took_from_under_it(solera):
+    """STA-13 on a store that writes in place and builds nothing beside:
+    archive's batch, planned with k3 and k4 updated, loads only once copy's
+    full run has cleared the table and written k1 and k2. It finds k3 and
+    k4 absent, holds them back and commits the rest: archive keeps their
+    rows, and its run takes them once copy's run is over."""
+
+    from solera.executors import Pool
+
+    from tests.contract.test_sta import INCOMPLETE, Rebuild
+
+    table = Table(solera.root / "table")
+    async with Rebuild(solera) as r:
+        await r.start(store=table, archive_executor=Pool("p")())
+        archive = await solera.submit("archive")
+        await solera.work("p", r.project(table, None, Pool("p")()))
+        await solera.wait(archive)
+        await r.feed({"k3": "2", "k4": "2"})
+        await solera.run("copy")
+        archive = await solera.submit("archive")
+        [stage] = await solera.offered("p")  # launched: k3 and k4 planned as updated
+        run = await r.midway()
+        table.holds = {"k3": None, "k4": None}  # what a table cleared by copy's first batch holds
+        await solera.work("p", r.project(table, None, Pool("p")()))
+
+        async def attempts() -> list[dict]:
+            detail = await solera.get(f"/runs/{archive['id']}")
+            [task] = [t for t in detail["tasks"] if t["asset"] == "archive"]
+            return detail["attempts"].get(task["id"], [])
+
+        async def settled() -> bool:
+            return all(a["outcome"] not in ("claimable", "running") for a in await attempts())
+
+        await solera.until(settled)  # copy is still paused mid full run
+        assert [(a["id"], a["outcome"]) for a in await attempts()] == [(stage["attempt"], "succeeded")]
+        assert await solera.rows("archive") == {"k1": "1", "k2": "1", "k3": "1", "k4": "1"}
+        assert INCOMPLETE in await solera.stale("archive")
+        table.holds = {}
+        await r.finish(run)
+        assert {"k3", "k4"} <= set(await solera.stale_keys("archive"))  # archive has not run again
+        await solera.work("p", r.project(table, None, Pool("p")()))
+        assert (await solera.wait(archive))["request"]["status"] == "succeeded"
+        assert await solera.rows("archive") == await solera.rows("copy")

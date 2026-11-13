@@ -1069,6 +1069,14 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
             # Whether the write starts the content over: a first write (an output
             # reset by a move holds no head), or a full run.
             info["reset"] = reset or head is None
+            # A full run in several batches (STO-8): whether an earlier batch of it committed
+            # (the core's mark of a full run under way), and whether this batch ends the walk.
+            # A store that others read in place swaps the old rows for the new at the last one.
+            info["final"] = not more
+            info["building"] = (
+                bool(output.get("incremental"))
+                and self.m.core.full_run(output_id(name, partition)) is not None
+            )
             if is_log(output):
                 # Where its commit goes: the engine names the layer, the worker writes it.
                 found = self.m.core.output(self.core.named(name, partition))

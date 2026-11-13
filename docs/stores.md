@@ -654,9 +654,28 @@ the store that writes or cleans up is READ COMMITTED, whatever the
 connection's default, so each catalog read sees the catalog as it is
 then; a snapshot read (`reads()`) keeps its REPEATABLE READ.
 
-A full run writes in place: its first write clears the partition, and
-each batch adds its rows. A program reading the table outside Solera can
-see the partition fill.
+A full run in several batches builds beside the table (STO-8), so a
+program reading the table outside Solera never sees it half done. The
+engine tells each write where it stands (`WriteContext.reset`, `building`,
+`final`):
+
+- the run's first write makes a build, a table of the same columns,
+  defaults and CHECK constraints in the `solera_build` schema, one per
+  table and partition, and writes there;
+- the following writes go to the build;
+- the last write is followed, in its own transaction, by the switch: the
+  partition's rows are deleted from the table, the build's rows inserted,
+  and the build dropped. If the table refuses them (a unique index), the
+  transaction fails with the write, and the old rows and the build stay.
+
+Whether a build is open is read from the catalog under the partition's
+version check; nothing else records it. A write that is not part of a
+full run drops a build it finds: one a first write made and never
+committed. A full run into a partition holding no rows, or of one batch,
+writes in place. A ref written during the run names the build, and a read
+of it reads the build while it exists, else the table. A cleanup and a
+migration drop the builds of what they touch; a migration is a change of
+the asset's definition, so the run that made a build starts over.
 
 A migration holds the table's write domain exclusively: it waits for
 every partition's open write transaction and holds off new ones until it

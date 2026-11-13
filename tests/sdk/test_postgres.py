@@ -1428,3 +1428,160 @@ async def test_the_version_check_is_one_statement_in_the_writes_first_round_trip
     assert len(first_trip) == 3 and "pg_advisory_xact_lock_shared" in first_trip[0]
     assert "solera_versions" in first_trip[1]  # the third is the catalog lookup (_STATE), on lines of its own
     assert len(trips) <= 6  # BEGIN, that pipeline, the DELETE, the COPY, the key check, COMMIT
+
+
+# -- a full run in several batches builds beside the table, and switches once (STO-8) ------
+
+
+def batch(out, generation, *, first=False, last=False, partition="") -> WriteContext:
+    """The write of one batch of a full run in several: its `first` starts
+    the content over, the others follow an earlier batch that committed, and
+    its `last` ends the run."""
+
+    return WriteContext(
+        output=out,
+        partition=partition,
+        attempt=f"a{generation}",
+        generation=generation,
+        worker_id="w",
+        reset=first,
+        building=not first,
+        final=last,
+    )
+
+
+def builds() -> list[str]:
+    return [r[0] for r in sql("SELECT relname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+                              "WHERE n.nspname = 'solera_build' AND c.relkind = 'r'")]  # fmt: skip
+
+
+async def test_a_full_run_in_batches_keeps_the_old_rows_for_outsiders_until_its_last(store):
+    """`copy` holds k1 to k4. Its full run writes k1 and k2, then k4 and k5:
+    a query of the table reads the four old rows until the last batch, then
+    the four new ones, and never a mix. Solera reads the run's rows as they
+    are written, through each batch's ref."""
+
+    out = keyed_output()
+    old = await store.store(rows(k1="1", k2="1", k3="1", k4="1"), None, at(out, 1))
+    one = await store.store(Patch(rows(k1="2", k2="2")), old.ref, batch(out, 2, first=True))
+    assert outside(store, out) == {"k1": "1", "k2": "1", "k3": "1", "k4": "1"}
+    assert await solera(store, one.ref) == {"k1": "2", "k2": "2"}
+    two = await store.store(Patch(rows(k4="3", k5="3")), one.ref, batch(out, 3, last=True))
+    assert outside(store, out) == {"k1": "2", "k2": "2", "k4": "3", "k5": "3"}
+    assert await solera(store, two.ref) == outside(store, out) == await solera(store, one.ref)
+    assert "build" not in two.ref.handle
+    table, _, _ = store._table(out)
+    assert not sql("SELECT to_regclass(%s)", (one.ref.handle["build"],))[0][0], "the build is gone"
+    versions = dict(sql(f"SELECT id, _version FROM {table}"))
+    assert versions == {"k1": 2, "k2": 2, "k4": 3, "k5": 3}
+
+
+async def test_a_full_run_into_an_empty_partition_or_of_one_batch_writes_in_place(store):
+    """With no old rows there is nothing to keep for outsiders: the run's
+    first batch fills the table as it goes. A full run of one batch
+    replaces the partition in its one transaction."""
+
+    out = keyed_output(columns={"id": "text", "v": "text"})
+    one = await store.store(Patch(rows(a="1")), None, batch(out, 1, first=True))
+    assert outside(store, out) == {"a": "1"} and "build" not in one.ref.handle
+    two = await store.store(Patch(rows(b="2")), one.ref, batch(out, 2, last=True))
+    assert outside(store, out) == {"a": "1", "b": "2"}
+    whole = await store.store(rows(c="3"), two.ref, batch(out, 3, first=True, last=True))
+    assert outside(store, out) == {"c": "3"} and "build" not in whole.ref.handle
+
+
+async def test_a_first_batch_that_never_committed_leaves_nothing_behind(store):
+    """A run's first batch opens the build and its attempt dies. The next
+    write of the partition, of no full run, is in place and drops the build;
+    a full run started again builds afresh."""
+
+    out = keyed_output()
+    old = await store.store(rows(a="1", b="1"), None, at(out, 1))
+    dead = await store.store(Patch(rows(a="2")), old.ref, batch(out, 2, first=True))
+    assert dead.ref.handle["build"].split(".")[1].strip('"') in builds()
+    again = await store.store(Patch(rows(c="3")), old.ref, batch(out, 3, first=True))
+    assert await solera(store, again.ref) == {"c": "3"}, "nothing of the dead attempt's build"
+    plain = await store.store(Patch(rows(b="4")), old.ref, at(out, 4))
+    assert outside(store, out) == {"a": "1", "b": "4"} == await solera(store, plain.ref)
+    assert dead.ref.handle["build"].split(".")[1].strip('"') not in builds()
+
+
+async def test_a_switch_the_table_refuses_fails_the_last_batch_and_keeps_the_old_rows(store):
+    """Two partitions share a table with a unique index on `v`. A full run
+    of one writes a value the other holds: only the switch can tell, and it
+    fails with the run's last write. Outsiders keep the old rows, and the
+    run's rows stay in its build."""
+
+    out = keyed_output(partition_column="site", columns={"site": "text", "id": "text", "v": "text"})
+    await store.store(rows(a="1"), None, at(out, 1, partition="x"))
+    old = await store.store(rows(b="2"), None, at(out, 2, partition="y"))
+    table, _, _ = store._table(out)
+    sql(f"CREATE UNIQUE INDEX ON {table} (v)")
+    one = await store.store(Patch(rows(b="1")), old.ref, batch(out, 3, first=True, partition="y"))
+    with pytest.raises(WriteError):
+        await store.store(Patch(rows(c="5")), one.ref, batch(out, 4, last=True, partition="y"))
+    assert outside(store, out, "y") == {"b": "2"} and outside(store, out, "x") == {"a": "1"}
+    assert await solera(store, one.ref) == {"b": "1"}
+
+
+async def test_a_switch_publishes_only_its_partition_and_the_table_computes_its_own_columns(store):
+    """The switch replaces one partition's rows. The table's identity and
+    generated columns are its own: the build's values of them are not
+    copied."""
+
+    out = keyed_output(partition_column="site", columns={"site": "text", "id": "text", "v": "text"})
+    await store.store(rows(a="1"), None, at(out, 1, partition="x"))
+    old = await store.store(rows(b="1", c="1"), None, at(out, 2, partition="y"))
+    table, _, _ = store._table(out)
+    sql(f"ALTER TABLE {table} ADD COLUMN n bigint GENERATED ALWAYS AS IDENTITY, "
+        "ADD COLUMN shout text GENERATED ALWAYS AS (upper(v)) STORED")  # fmt: skip
+    one = await store.store(Patch(rows(b="two")), old.ref, batch(out, 3, first=True, partition="y"))
+    await store.store(Patch(rows(d="four")), one.ref, batch(out, 4, last=True, partition="y"))
+    assert outside(store, out, "x") == {"a": "1"}
+    found = sql(f"SELECT id, shout, n FROM {table} WHERE site = 'y' ORDER BY id")
+    assert [(r[0], r[1]) for r in found] == [("b", "TWO"), ("d", "FOUR")]
+    assert len({r[2] for r in sql(f"SELECT id, shout, n FROM {table}")}) == 3, "identities stay unique"
+
+
+async def test_a_cleanup_and_a_migration_take_the_builds_with_them(store):
+    out = keyed_output(partition_column="site", columns={"site": "text", "id": "text", "v": "text"})
+    old = await store.store(rows(a="1"), None, at(out, 1, partition="x"))
+    await store.store(Patch(rows(a="2")), old.ref, batch(out, 2, first=True, partition="x"))
+    assert len(builds_of(store, out)) == 1
+    await store.cleanup(out, partition="x")
+    assert builds_of(store, out) == []
+    old = await store.store(rows(a="1"), None, at(out, 3, partition="x"))
+    await store.store(Patch(rows(a="2")), old.ref, batch(out, 4, first=True, partition="x"))
+    table, _, _ = store._table(out)
+    migration = Migration("add-note", f"ALTER TABLE {table} ADD COLUMN note text")
+    await store.migrate(out, [migration], at(out, 5, partition="x"), old.ref)
+    assert builds_of(store, out) == []
+
+
+def builds_of(store, out) -> list[str]:
+    from solera_postgres import _builds
+
+    table, _, _ = store._table(out)
+    return [name for name in builds() if name.startswith(_builds(table))]
+
+
+async def test_a_log_s_full_run_in_batches_switches_once_too(store):
+    """An unkeyed incremental output: its commits go to the build with their
+    numbers, and the table gets them at the last batch."""
+
+    out = output(incremental=True, columns={"n": "integer"})
+    table, _, _ = store._table(out)
+    old = await store.store(Patch([{"n": 1}]), None, context(out, 1, commit_number=0))
+    one = await store.store(
+        Patch([{"n": 10}]),
+        old.ref,
+        WriteContext(out, "", commit_number=1, generation=2, worker_id="w", reset=True, final=False),
+    )
+    assert [r[0] for r in sql(f"SELECT n FROM {table}")] == [1]
+    two = await store.store(
+        Patch([{"n": 20}]),
+        one.ref,
+        WriteContext(out, "", commit_number=2, generation=3, worker_id="w", building=True),
+    )
+    assert sorted(sql(f"SELECT n, _commit FROM {table}")) == [(10, 1), (20, 2)]
+    assert [r["n"] for r in await store.load(two.ref, list[dict], None)] == [10, 20]

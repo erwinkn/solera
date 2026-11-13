@@ -127,6 +127,11 @@ class WriteContext:
     # (docs/lifecycle.md §9.7); `None` outside an attempt.
     generation: int | None = None
     worker_id: str | None = None
+    # A full run in several batches (STO-8): `building`, an earlier batch of it committed and
+    # the run is not over; `final`, this write is the run's last. A store whose rows others
+    # read in place keeps the old rows for them until the last batch, then swaps them at once.
+    building: bool = False
+    final: bool = True
 
 
 Version = int | str
