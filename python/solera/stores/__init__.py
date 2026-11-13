@@ -122,14 +122,10 @@ class WriteContext:
     """A write partition (§9): `attempt` is the writing attempt's id. `reset`
     says the write starts the content over (a full run): `prior` still says
     where the content is, but nothing of it is kept. What a keyed write
-    changes is the write's own (`KeyedWrite`). `home` is the name the
-    output's life began under: a store keeps every partition of one life in
-    one place derived from it, so a renamed output's new partitions go
-    where its old ones are (K25); `None` means the output's own name."""
+    changes is the write's own (`KeyedWrite`)."""
 
     output: Output
     partition: str
-    home: str | None = None
     attempt: str | None = None
     reset: bool = False
     # The attempt's generation and worker, for a `fenced` store to check
@@ -217,9 +213,8 @@ class Store(Protocol):
     which keys the partition holds — for a repair after a writer died
     (docs/versions.md §5).
 
-    Every store implements `cleanup(output, *, home, partition, key,
-    generation, before)`: delete every object of the output life kept
-    under `home` the pattern matches — any field left out matches anything,
+    Every store implements `cleanup(output, *, partition, key, generation,
+    before)`: delete every object of the output the pattern matches — any field left out matches anything,
     `before` is every generation older than it — idempotently. The engine
     asks only for what no pin can read (docs/stores.md § Cleanup).
 
@@ -239,13 +234,13 @@ class Store(Protocol):
     async def read(self, ref: Ref, t: type, selection: Keys | None) -> Read: ...
 
     async def cleanup(
-        self, output: Output, *, home=None, partition=None, key=None, generation=None, before=None
+        self, output: Output, *, partition=None, key=None, generation=None, before=None
     ) -> None: ...
 
     # fenced:    async def acquire(self, context: WriteContext, prior: Ref | None) -> None
     #            def keys(self, ref: Ref, among: list[str] | None) -> Iterable[list[str]]
     # in place:  async def written_at(self, versions, prior, context) -> Iterable[list[str]]
-    #            async def full_run_ended(self, output, partition, run, newest, *, prior=None, home=None) -> bool
+    #            async def full_run_ended(self, output, partition, run, newest, *, prior=None) -> bool
     #            (D196, D211: docs/stores.md, "The contract" and "PostgresStore: the version check,
     #            and full runs built beside")
 

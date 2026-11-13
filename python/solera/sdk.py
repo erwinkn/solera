@@ -1211,12 +1211,10 @@ class Asset:
         version: str = "1",
         retention: Retention | None = None,
         automations: Any = (),
-        aliases: tuple | list = (),
         tags: dict[str, str] | None = None,
     ):
         self.fn = fn
         self.name = fn.__name__
-        self.aliases = tuple(str(a) for a in aliases)
         self.tags = _tags(tags, self.name)
         if outputs is None:
             outputs = (Output(fn.__name__),)
@@ -1547,19 +1545,6 @@ class Project:
             if not NAME.fullmatch(store_name):
                 raise RegistrationError(f"Invalid store name: {store_name!r}")
         outputs = self._output_table()
-        claimed = {}
-        for asset in self.assets.values():
-            for alias in asset.aliases:
-                if not NAME.fullmatch(alias) or alias == asset.name:
-                    raise RegistrationError(f"{asset.name}: invalid alias {alias!r}")
-                if alias in self.assets or alias in outputs:
-                    raise RegistrationError(f"{asset.name}: alias {alias!r} names a current asset or output")
-                if alias in claimed:
-                    raise RegistrationError(
-                        f"{asset.name}: alias {alias!r} is also claimed by {claimed[alias]}"
-                    )
-                claimed[alias] = asset.name
-
         # Resolve every asset's inputs/deps/partitions and validate inputs.
         assets = {}
         for asset in self.assets.values():
@@ -1847,7 +1832,6 @@ class Project:
                 "concurrency": asset.concurrency,
                 "version": asset.version,
                 "retention": asset.retention.spec() if asset.retention else None,
-                "aliases": list(asset.aliases),
                 "tags": asset.tags,
                 "doc": inspect.getdoc(asset.fn) or "",
                 "types": {

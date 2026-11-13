@@ -8,8 +8,7 @@ import logging
 
 from solera import lifecycle
 from solera.lifecycle import Ended
-from solera.sdk import Output, Project, Retry, StaticPartitions, asset
-from solera.stores import FileStore
+from solera.sdk import Output, Project, Retry, asset
 from solera_server.state import State
 from solera_worker.worker import run_attempt
 
@@ -279,61 +278,4 @@ async def test_a_long_log_is_chunks_and_a_tail(tmp_path, monkeypatch):
     last = await state.attempt_log(detail["request"]["id"], attempt["id"], tail=2)
     assert [json.loads(line)["message"] for line in last.splitlines()] == ["line 4", "line 5"]
     await engine.stop()
-    await state.close()
-
-
-async def test_a_renamed_asset_keeps_what_its_scope_owes(tmp_path):
-    """Review P1-3: renaming an asset (`aliases=`) moves its owing a repair
-    intents and its pending cleanups with it: a new name never lets a dead
-    writer's keys go unrepaired, nor its garbage go uncollected."""
-
-    @asset(outputs=Output("items", key="id"))
-    def items():
-        return [{"id": "a", "v": 1}]
-
-    state = await State.open(tmp_path.as_uri(), "test", flush_interval=0.001)
-    engine = engine_for(state, Project(assets=[items]), placement="inline")
-    await engine.initialize()
-    m = state.model
-    m.repairs[("items", "")] = [{"files": [], "run": "r", "attempt": "dead"}]
-    m.cleanups[("items", "")] = [{"n": 1, "id": "1.0", "kind": "version", "generation": 1}]
-
-    @asset(outputs=Output(key="id"), aliases=["items"])
-    def catalog():
-        return [{"id": "a", "v": 3}]
-
-    engine = engine_for(state, Project(assets=[catalog]), placement="inline")
-    await engine.initialize()
-    assert m.repairs[("catalog", "")][0]["attempt"] == "dead" and ("items", "") not in m.repairs
-    assert [d["n"] for d in m.cleanups[("catalog", "")]] == [1] and ("items", "") not in m.cleanups
-    await state.close()
-
-
-async def test_a_renamed_outputs_new_partitions_go_where_its_old_ones_are(tmp_path):
-    """K25: a store keeps one output life in one place. `copy` writes
-    partition a; renamed `mirror`, it writes partition b for the first time:
-    b goes under copy/ beside a, not under mirror/, so a whole-output
-    cleanup of that life is one place."""
-
-    @asset(partitions={"site": StaticPartitions(["a"])})
-    def copy(ctx):
-        return {"site": ctx.partition}
-
-    @asset(partitions={"site": StaticPartitions(["a", "b"])}, aliases=["copy"])
-    def mirror(ctx):
-        return {"site": ctx.partition}
-
-    def project(one):
-        return Project(assets=[one], default_store=FileStore(tmp_path / "data"))
-
-    state = await State.open(tmp_path.as_uri(), "test", flush_interval=0.001)
-    engine = engine_for(state, project(copy), placement="inline")
-    await engine.initialize()
-    await engine.run_until((await engine.submit(["copy"], partitions=["a"]))["id"], 10)
-    engine = engine_for(state, project(mirror), placement="inline")
-    await engine.initialize()
-    await engine.run_until((await engine.submit(["mirror"], partitions=["b"]))["id"], 10)
-    handles = {p: state.model.heads[("mirror", p)]["ref"]["handle"] for p in "ab"}
-    assert all((h.get("base") or h["path"]).startswith("copy/") for h in handles.values()), handles
-    assert state.model.homes["mirror"] == "copy"
     await state.close()

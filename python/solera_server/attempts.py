@@ -67,15 +67,6 @@ def worker_output(info: dict) -> dict:
     return {**{k: v for k, v in info.items() if k != "head"}, "before": head["ref"] if head else None}
 
 
-def current_names(prepared: dict, by_output: dict) -> dict:
-    """What a worker reports by output, under the outputs' current names: it
-    knows them by the names it was launched with (`as`), which a rename
-    while it ran has since moved (§2)."""
-
-    names = {info.get("as", name): name for name, info in (prepared.get("outputs") or {}).items()}
-    return {names.get(name, name): value for name, value in by_output.items()}
-
-
 def worker_report(worker: dict | None) -> dict:
     """What a worker's result or report may put in an event, as values the
     model applies with no parsing (review round 3, B5): its timeline
@@ -824,7 +815,7 @@ class Attempts:
         else:
             final = result
         write = final.get("write", lifecycle.NONE)
-        repairs = current_names(prepared, final.get("intents") or {})
+        repairs = final.get("intents") or {}
         worker = result if result is not None else self._last_report(attempt)
         claim = self.m.claimed(attempt)
         if claim is None:

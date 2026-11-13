@@ -1,12 +1,10 @@
 """RST: upstream resets, removals, moves and renames (docs/behaviors.md)."""
 
 import asyncio
-import os
 import re
-import uuid
 
 import pytest
-from solera.sdk import Incremental, Output, Project, Result, Retry, StaticPartitions, asset, job
+from solera.sdk import Incremental, Output, Project, Result, Retry, asset, job
 from solera.stores import FileStore
 
 from tests.contract.example import Example
@@ -32,7 +30,7 @@ def held_commit(detail: dict) -> str:
     return f"{detail['request']['id']}/{attempts[0]['id']}"
 
 
-def parsing(root, name: str | None = "parse", aliases=(), fail=("a",), calls=None) -> Project:
+def parsing(root, name: str | None = "parse", fail=("a",), calls=None) -> Project:
     """`files` (a, b) → `name`, per key, writing `rows`; the keys in `fail` raise.
     No `name`: `files` alone."""
 
@@ -50,7 +48,6 @@ def parsing(root, name: str | None = "parse", aliases=(), fail=("a",), calls=Non
     parse = asset(
         inputs={"file": Incremental("files", each=True)},
         outputs=Output("rows", key="id"),
-        aliases=list(aliases),
     )(body)
     return Project(assets=[files, parse] if name else [files], default_store=FileStore(root / "data"))
 
@@ -143,7 +140,7 @@ async def test_rst_3_an_asset_removed_and_declared_again_starts_a_new_life(soler
     ex = await Example(solera).start()
     await ex.feed({"k1": "1", "k2": "1"})
     await ex.run("copy")
-    await ex.deploy(copy_name="mirror")  # `copy` removed: no alias carries it over
+    await ex.deploy(copy_name="mirror")  # `copy` removed
     await ex.deploy()  # `copy` declared again
     assert await solera.head("copy") is None and await solera.keys("copy") == {}
     [batch] = await ex.run("copy")
@@ -241,179 +238,6 @@ async def test_rst_3_a_job_declared_again_does_not_take_its_first_lifes_commit(s
     assert cursors and all(c in (None, {"life": "2"}) for c in cursors), cursors
 
 
-# -- RST-4, RST-5: renames ----------------------------------------------------------
-
-
-async def test_rst_4_a_rename_with_aliases_keeps_its_heads_keys_and_progress(solera):
-    ex = await Example(solera).start()
-    await ex.feed({"k1": "1", "k2": "1"})
-    await ex.run("copy")
-    await ex.feed({"k1": "2"})
-    await ex.run("copy")
-    head, keys = await solera.head("copy"), await solera.keys("copy")
-    await ex.deploy(copy_name="mirror", aliases=["copy"])
-    renamed = await solera.head("mirror")
-    assert renamed["commit"] == head["commit"] and await solera.keys("mirror") == keys
-    assert (await solera.request("GET", "/outputs/copy/heads", ok=False)).status_code == 404
-    assert await solera.rows("mirror") == {"k1": "2", "k2": "1"}
-    assert await solera.stale("mirror") == []
-    await ex.feed({"k2": "2"})
-    [batch] = await ex.run("mirror")
-    assert not batch.reset and batch.classes == ([], ["k2"], [])  # it continues incrementally
-    assert await solera.rows("mirror") == {"k1": "2", "k2": "2"}
-
-
-async def test_rst_4_a_renamed_per_key_asset_keeps_its_failing_and_processed_keys(solera):
-    calls: list = []
-    await solera.deploy(parsing(solera.root, calls=calls))
-    await solera.run("parse", upstream=True, expect=None)
-    await solera.deploy(parsing(solera.root, "parsed", aliases=["parse"], fail=(), calls=calls))
-    assert await failing(solera, "parsed") == {"a": "failed", "b": "ok"}
-    await solera.run("parsed")
-    assert sorted(calls) == ["a", "a", "b"]  # b was processed: only the failing key runs again
-    assert await failing(solera, "parsed") == {"a": "ok", "b": "ok"}
-
-
-async def test_rst_4_a_renamed_job_keeps_its_cursor(solera):
-    cursors, rows = [], [{"id": "a"}]
-
-    def project(name, aliases=()):
-        @asset(outputs=Output("items", key="id"))
-        def items():
-            return rows
-
-        async def body(ctx, items: list):
-            cursors.append(ctx.cursor)
-            return Result(outputs={}, cursor={"runs": (ctx.cursor or {"runs": 0})["runs"] + 1})
-
-        body.__name__ = name
-        counted = job(inputs={"items": Incremental()}, aliases=list(aliases))(body)
-        return Project(assets=[items, counted], default_store=FileStore(solera.root / "data"))
-
-    await solera.deploy(project("count"))
-    await solera.run("count", upstream=True)
-    await solera.deploy(project("tally", aliases=["count"]))
-    rows.append({"id": "b"})
-    await solera.run("tally", upstream=True)
-    assert cursors == [None, {"runs": 1}]
-
-
-async def test_rst_4_a_renamed_outputs_data_stays_where_it_is(solera):
-    def project(name, sites, aliases=()):
-        def body(ctx):
-            return {"site": ctx.partition, "by": name}
-
-        body.__name__ = name
-        made = asset(partitions={"site": StaticPartitions(sites)}, aliases=list(aliases))(body)
-        return Project(assets=[made], default_store=FileStore(solera.root / "data"))
-
-    await solera.deploy(project("copy", ["a"]))
-    await solera.run("copy", partitions=["a"])
-    await solera.deploy(project("mirror", ["a", "b"], aliases=["copy"]))
-    await solera.run("mirror", partitions=["b"])
-    assert await solera.read("mirror", "a") == {"site": "a", "by": "copy"}
-    assert await solera.read("mirror", "b") == {"site": "b", "by": "mirror"}
-    assert not (solera.root / "data" / "mirror").exists()  # b is written where a is
-
-
-@pytest.mark.postgres
-async def test_rst_4_a_renamed_postgres_output_stays_in_its_table(solera):
-    dsn = os.environ.get("SOLERA_TEST_DATABASE_URL")
-    if not dsn:
-        pytest.skip("SOLERA_TEST_DATABASE_URL is not set")
-    import psycopg
-    from solera_postgres import PostgresStore
-
-    schema, rows = f"s_{uuid.uuid4().hex[:8]}", {"v": [{"id": "a", "v": "1"}]}
-
-    def project(name, aliases=()):
-        def body():
-            return rows["v"]
-
-        body.__name__ = name
-        output = Output(key="id", store="pg", schema=schema, columns={"id": "text", "v": "text"})
-        made = asset(outputs=output, aliases=list(aliases))(body)
-        return Project(assets=[made], stores={"pg": PostgresStore("env:SOLERA_TEST_DATABASE_URL")})
-
-    await solera.deploy(project("old"))
-    await solera.run("old")
-    await solera.deploy(project("new", aliases=["old"]))
-    assert await solera.rows("new") == {"a": "1"}
-    await solera.run("new")  # the same rows, written again
-    rows["v"] = [{"id": "a", "v": "2"}]
-    await solera.run("new")
-    assert await solera.rows("new") == {"a": "2"}
-    with psycopg.connect(dsn, autocommit=True) as conn:
-        tables = conn.execute(
-            "SELECT table_name FROM information_schema.tables WHERE table_schema = %s", (schema,)
-        ).fetchall()
-        assert ("new",) not in tables and ("old",) in tables
-        conn.execute(f'DROP SCHEMA "{schema}" CASCADE')
-
-
-def renaming(root, name: str, gate: Gate | None, aliases=()) -> Project:
-    """`files` (a) → `name`, an unkeyed count saying who wrote it; it waits at
-    `gate` when given one."""
-
-    @asset(outputs=Output("files", key="id"))
-    def files():
-        return [{"id": "a"}]
-
-    async def body(files: list):
-        if gate is not None and not gate.released.is_set():
-            await gate.wait()
-        return {"n": len(files), "by": name}
-
-    body.__name__ = name
-    made = asset(inputs={"files": Incremental()}, aliases=list(aliases))(body)
-    return Project(assets=[files, made], default_store=FileStore(root / "data"))
-
-
-async def test_rst_5_an_attempt_launched_before_a_rename_settles_under_the_new_name(solera):
-    gate, later = Gate(), Gate()
-    await solera.deploy(renaming(solera.root, "old", None))
-    await solera.run("old", upstream=True)
-    await solera.deploy(renaming(solera.root, "old", gate))
-    run = await solera.submit("old", mode="full")
-    await solera.until(gate.entered.is_set)
-    await solera.deploy(renaming(solera.root, "new", later, aliases=["old"]))
-    again = await solera.submit("new", mode="full")
-    await solera.settle(0.3)
-    assert not later.entered.is_set()  # one writer: the next attempt waits for the one in flight
-    gate.released.set()
-    detail = await solera.wait(run)
-    assert detail["request"]["status"] == "succeeded"
-    assert (await solera.head("new"))["commit"] == held_commit(detail)  # committed into `new`
-    assert await solera.read("new") == {"n": 1, "by": "old"}
-    await solera.until(later.entered.is_set)
-    later.released.set()
-    assert (await solera.wait(again))["request"]["status"] == "succeeded"
-    assert await solera.read("new") == {"n": 1, "by": "new"}
-
-
-async def test_rst_5_a_rename_onto_an_earlier_lifes_name_keeps_its_attempt_settleable(solera):
-    """`copy` renamed `mirror`, whose attempt runs; `copy` comes back
-    without an alias (`mirror` removed), and its attempt runs; `copy` is
-    renamed `mirror` again. Both attempts settle, both runs end."""
-
-    first, second = Gate(), Gate()
-    await solera.deploy(renaming(solera.root, "copy", None))
-    await solera.run("copy", upstream=True)
-    await solera.deploy(renaming(solera.root, "mirror", first, aliases=["copy"]))
-    runs = [await solera.submit("mirror", mode="full")]
-    await solera.until(first.entered.is_set)
-    await solera.deploy(renaming(solera.root, "copy", second))
-    runs.append(await solera.submit("copy", mode="full"))
-    await solera.until(second.entered.is_set)
-    await solera.deploy(renaming(solera.root, "mirror", None, aliases=["copy"]))
-    first.released.set()
-    second.released.set()
-    for run in runs:
-        assert (await solera.wait(run))["request"]["status"] in ENDED
-    await solera.run("mirror", mode="full")
-    assert await solera.read("mirror") == {"n": 1, "by": "mirror"}
-
-
 # -- RST-6, RST-7 --------------------------------------------------------------------
 
 
@@ -427,30 +251,17 @@ async def test_rst_6_a_removed_assets_queued_work_is_cancelled_saying_why(solera
         return doomed
 
     @asset
-    def old_name():
-        return [2]
-
-    @asset(aliases=["old_name"])
-    def new_name():
-        return [2]
-
-    @asset
     def other():
         return [3]
 
     store = FileStore(solera.root / "data")
-    await solera.deploy(Project(assets=[doomed, after, old_name], default_store=store))
+    await solera.deploy(Project(assets=[doomed, after], default_store=store))
     gone = await solera.submit("after", upstream=True)
-    renamed = await solera.submit("old_name")
-    for run in (gone, renamed):
-        await solera.post(f"/runs/{run['id']}/pause")
-    await solera.deploy(Project(assets=[new_name, other], default_store=store))
+    await solera.post(f"/runs/{gone['id']}/pause")
+    await solera.deploy(Project(assets=[other], default_store=store))
     assert await cancelled_as_removed(solera, gone) == ["after", "doomed"]
     assert (await solera.get(f"/runs/{gone['id']}"))["request"]["status"] == "failed"
     await solera.run("other")
-    await solera.post(f"/runs/{renamed['id']}/resume")
-    detail = await solera.wait(renamed)
-    assert {t["asset"]: t["status"] for t in detail["tasks"]} == {"new_name": "succeeded"}
 
 
 async def test_rst_6_a_removed_assets_last_attempt_ends_its_run(solera):

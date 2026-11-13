@@ -62,7 +62,7 @@ class Example:
     """The running example served by `solera`. `deploy(**decl)` serves it
     again with another declaration: `include=` (tally's, copy's and checks'
     patterns), `batch_size=`, `version=` (tally's and checks'), `items_store=`
-    ("other" moves items), `copy_name=` with `aliases=`."""
+    ("other" moves items), `copy_name=`."""
 
     def __init__(self, solera: Solera):
         self.solera, self.outside = solera, Outside()
@@ -88,7 +88,6 @@ class Example:
         version: str = "1",
         items_store: str | None = None,
         copy_name: str = "copy",
-        aliases=(),
     ) -> Project:
         example, root = self, self.solera.root
 
@@ -130,7 +129,6 @@ class Example:
         copy = asset(
             inputs={"items": Incremental(include=include, batch_size=batch_size)},
             outputs=Output(copy_name, key="id"),
-            aliases=list(aliases),
         )(copy_fn)
 
         @asset(

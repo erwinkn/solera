@@ -9,8 +9,6 @@ import threading
 import pytest
 from solera.sdk import (
     Commit,
-    DynamicPartitions,
-    In,
     Incremental,
     Output,
     Project,
@@ -447,55 +445,3 @@ async def test_a_key_another_input_took_while_a_clear_came_in_is_planned_again_o
     assert [a["outcome"] for a in detail["attempts"][task["id"]]] == ["replanned", "succeeded"]
     assert seen == [["k1", "k2"], ["k1"], ["k1"]]  # planned again once, not in a loop
     assert await solera.rows("join") == {"k1": "2", "k2": "1"}
-
-
-@pytest.mark.parametrize("dynamic", [False, True])
-async def test_a_rename_while_a_commit_is_built_sends_the_batch_back(solera, monkeypatch, dynamic):
-    rows = ["a"]
-
-    def project(name, aliases=()):
-        def body():
-            return list(rows) if dynamic else [{"id": k, "v": 1} for k in rows]
-
-        body.__name__ = body.__qualname__ = name
-        made = asset(outputs=DynamicPartitions() if dynamic else Output(key="id"), aliases=list(aliases))(
-            body
-        )
-
-        @asset(inputs={"members": In(name)})
-        def report(members: list):
-            return members
-
-        return Project(assets=[made, report], default_store=FileStore(solera.root / "data"))
-
-    await solera.deploy(project("old"))
-    await solera.run("old")
-    from solera_server.executors.inline import InlinePlacement
-
-    rows.append("b")
-    engine = solera.engine
-    run, work = engine.core.run, InlinePlacement._work
-    new, renamed = project("new", ["old"]), []
-
-    async def interleaved(fn, *args, **kwargs):
-        found = await run(fn, *args, **kwargs)
-        if fn == engine.core.tracking.build_commit and not renamed:
-            renamed.append(True)
-            engine.redeploy(new.manifest)
-        return found
-
-    def current_worker(self, stage):
-        if engine.manifest["deploy"] == new.manifest["deploy"]:
-            self.project = new
-        return work(self, stage)
-
-    monkeypatch.setattr(engine.core, "run", interleaved)
-    monkeypatch.setattr(InlinePlacement, "_work", current_worker)
-    detail = await solera.run("old", expect=None)
-    outcomes = [a["outcome"] for a in sum(detail["attempts"].values(), [])]
-    assert renamed and outcomes == ["replanned", "succeeded"], detail["attempts"]
-    assert engine.m.heads["new", ""]["commit_number"] == engine.m.core_output("new", "")["head"]
-    if dynamic:
-        await solera.deploy(new)
-        await solera.run("report")
-        assert await solera.read("report") == ["a", "b"]

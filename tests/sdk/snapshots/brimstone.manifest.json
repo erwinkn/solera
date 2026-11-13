@@ -1,7 +1,6 @@
 {
   "assets": {
     "fleet_dashboard": {
-      "aliases": [],
       "automations": [
         "fleet_dashboard.onchange.0"
       ],
@@ -66,7 +65,6 @@
       "version": "1"
     },
     "graph_delta": {
-      "aliases": [],
       "automations": [
         "graph_delta.every.0"
       ],
@@ -132,7 +130,6 @@
       "version": "1"
     },
     "hillshade": {
-      "aliases": [],
       "automations": [
         "hillshade.every.0"
       ],
@@ -198,7 +195,6 @@
       "version": "1"
     },
     "leach": {
-      "aliases": [],
       "automations": [],
       "concurrency": null,
       "deps": [],
@@ -314,7 +310,6 @@
       "version": "1"
     },
     "manual_upload": {
-      "aliases": [],
       "automations": [
         "manual_upload.every.0"
       ],
@@ -375,7 +370,6 @@
       "version": "1"
     },
     "psa_mean_data": {
-      "aliases": [],
       "automations": [
         "psa_mean_data.onchange.0"
       ],
@@ -453,7 +447,6 @@
       "version": "1"
     },
     "qaqc_samples": {
-      "aliases": [],
       "automations": [
         "qaqc_samples.onchange.0"
       ],
@@ -537,7 +530,6 @@
       "version": "2"
     },
     "region_rollup": {
-      "aliases": [],
       "automations": [
         "region_rollup.onchange.0"
       ],
@@ -613,7 +605,6 @@
       "version": "1"
     },
     "site_health": {
-      "aliases": [],
       "automations": [
         "site_health.onchange.0"
       ],
@@ -678,7 +669,6 @@
       "version": "1"
     },
     "sites": {
-      "aliases": [],
       "automations": [
         "sites.cron.0",
         "sites.ondeploy.0"
@@ -732,7 +722,6 @@
       "version": "1"
     },
     "weekly_report": {
-      "aliases": [],
       "automations": [
         "weekly_report.cron.0"
       ],
@@ -1027,7 +1016,7 @@
     "id": "snapshot",
     "source": "explicit"
   },
-  "deploy": "b264091d64a914e59f49dde3acaa5fc48414083bb7fc6e294f51f390aa889ba9",
+  "deploy": "92f12771f2d7af61ff2a108abc3d2aff5445f3015e8ee311a501206b5dde6eaf",
   "errors": [],
   "executors": {
     "ingest": {
