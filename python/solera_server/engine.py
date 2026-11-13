@@ -472,6 +472,7 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
         write=None,
         retry_for=None,
         keys=None,
+        restart=False,
     ):
         """End an attempt. `worker` is what its worker reported — its result,
         or its last heartbeat: the events it recorded and what it used. `end`
@@ -504,6 +505,8 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
             event["late_writes"] = float(info.get("timeout") or 3600) + self.cancel_grace
         if more:
             event["more"] = True
+        if restart:  # its asset read a dead write to its own output: its next attempt runs in full
+            event["restart"] = True
         worker = worker_report(worker)  # values the model applies with no parsing
         if keys is not None:
             keys = worker_report({"keys": keys}).get("keys")
@@ -969,7 +972,7 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
 
         asset = self.manifest["assets"][task["asset"]]
         partition = task["partition"]
-        full = run["mode"] == "full"
+        full = run["mode"] == "full" or bool(task.get("restart"))
         heads = {}
         for output in asset["outputs"]:
             head = heads[output["name"]] = self.m.heads.get((output["name"], partition))

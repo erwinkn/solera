@@ -110,10 +110,13 @@ class Observing:
 
     def _full_run(self, task: dict, run: dict) -> str | None:
         """Why the task's next batch is a full run's, if it is: its run is
-        one (on its first batch), or the partition's definition is not the
-        one it was made under."""
+        one (on its first batch), its last attempt found a dead write in the
+        asset's own output (`restart`, D196 rule 5), or the partition's
+        definition is not the one it was made under."""
 
         record = self.m.partition(task["asset"], task["partition"])
+        if task.get("restart"):
+            return "its own output held a write no commit recorded"
         if not task.get("progress") and run["mode"] == "full":
             return "full run"
         if record.get("definition") not in (None, self._definition(task["asset"], run)):

@@ -129,6 +129,13 @@ async def _get(objects, key: str) -> bytes | None:
     return bytes(await result.bytes_async())
 
 
+class OwesFullRun(Exception):
+    """An asset read its own output and found a version its last commit does
+    not list: a writer died after writing and before its commit. Building on
+    it would keep the dead write for good (a count added to twice), so the
+    attempt stops here and the task's next attempt is a full run."""
+
+
 class Aborted(Exception):
     """The engine took the attempt's gate first: it may write nothing."""
 
@@ -281,6 +288,13 @@ class Ctx:
                 index = {"core": info["core"]}
             elif "log" in info and self._stores[ref.store].writes == "immutable":
                 index = {"log": info["log"]["pin"]}
+            store = self._stores[ref.store]
+            if store.writes != "immutable" and not info.get("reset") and "log" not in info:
+                # A table is read in place: it may hold what a writer that died before its
+                # commit left. The asset never builds on that (D196 rule 5).
+                value = await _own(store, ref, t, index)
+                self._timeline.add("loaded", ref.output, _rows(value), optional=True)
+                return value
         store = self._stores[ref.store]
         index = index or self._indexes.get((ref.output, ref.partition))
         value = await _load_whole(_unobserved, store, ref, t, self._keys_io, index)
@@ -437,6 +451,28 @@ async def _resolve_inputs(spec, project, asset, keys_io, timeline, observed: Obs
     # anything: nothing to call the producer with; its observations commit.
     delivered["*nothing"] = bool(nothing) and all(nothing)
     return args, batch, delivered
+
+
+async def _own(store, ref, t, index: dict | None):
+    """An asset's own output on a store that writes in place, read whole:
+    its value, if every version read is the one its log lists (a keyed
+    output's keys, from its pinned index; a single value's, its head's).
+    Otherwise `OwesFullRun`."""
+
+    found = await store.read(ref, t, None)
+    if index is not None and "core" in index:
+        listed = {}
+        async for page in core.pages(index["core"], REPAIR_PAGE):
+            listed.update(page)
+        same = dict(found.versions or {}) == listed
+    else:
+        same = found.version in (None, ref.generation)
+    if not same:
+        raise OwesFullRun(
+            f"{ref.output}: its table holds a write no commit recorded (an attempt died after "
+            "writing): the asset runs in full instead of building on it"
+        )
+    return found.value
 
 
 async def _unobserved(store, ref, t, selection):
@@ -1123,6 +1159,8 @@ async def _execute(
         return None
     except _Stop:
         raise
+    except OwesFullRun as error:  # planned again, as a full run: no try spent
+        return {"status": "replan", "restart": True, "error": str(error), "moved": [asset.name, ""]}
     except StoreError as error:
         return _failed(error, getattr(error, "retryable", False))
     except Exception as error:
