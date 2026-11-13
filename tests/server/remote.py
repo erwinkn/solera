@@ -27,8 +27,8 @@ class Gated(FileStore):
 
     writes = "fenced"
 
-    async def acquire(self, context, prior=None):
-        pass
+    async def written_at(self, versions, prior, context):
+        return []
 
     def keys(self, ref, among=None):
         raise AssertionError("no test of Gated repairs a slice")
@@ -161,8 +161,8 @@ class LiveStore(FileStore):
         self.hold: asyncio.Event | None = None
         self.before_read = None
 
-    async def acquire(self, context, prior=None):
-        pass
+    async def written_at(self, versions, prior, context):
+        return []
 
     def can_load(self, t, selection):
         return True

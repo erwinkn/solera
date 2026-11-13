@@ -812,7 +812,6 @@ class Attempts:
         `result` is the worker's, when it sealed one."""
 
         task = self.m.task(task_id)
-        prepared = self._launched(task, attempt)["prepared"]
         if result is None:
             final = await self._end(task["run"], attempt) or {}
             if final.get("state") == lifecycle.SEALED:
@@ -821,7 +820,6 @@ class Attempts:
         else:
             final = result
         write = final.get("write", lifecycle.NONE)
-        repairs = final.get("intents") or {}
         worker = result if result is not None else self._last_report(attempt)
         claim = self.m.claimed(attempt)
         if claim is None:
@@ -833,37 +831,16 @@ class Attempts:
             error=error,
             retryable=retryable,
             delay=delay,
-            repairs=repairs,
             worker=worker,
             end=end,
             reason=reason,
             write=write,
             retry_for=retry_for,
         )
-        await self._cleanup(attempt, prepared, keep=set(repairs))
 
     def _last_report(self, attempt: str) -> dict:
         live = self.live.get(attempt)
         return dict(live.report) if live is not None else {}
-
-    async def _cleanup(self, attempt: str, prepared: dict, keep=()):
-        """Delete the delta files an attempt wrote but never committed, except
-        the intents of outputs it left owing a repair. They are named after the
-        attempt, so nothing else can hold them (§6)."""
-
-        for name, info in (prepared.get("outputs") or {}).items():
-            if info.get("prefix") is None or name in keep or info["contract"]["writes"] == "immutable":
-                continue  # an immutable output's are collected with what they name (§9.8)
-            prefix = f"{info['prefix']}{int(info['commit_number']):012d}-{attempt}"
-            self._authority()
-            with contextlib.suppress(Exception):
-                await self.state.delete_objects(await self.state.list_objects(prefix))
-        outcomes = prepared.get("outcomes")
-        if outcomes is not None:  # a per-key batch's outcome delta (docs/per-key-processing.md §9)
-            prefix = f"{outcomes['prefix']}{int(outcomes['commit_number']):012d}-{attempt}"
-            self._authority()
-            with contextlib.suppress(Exception):
-                await self.state.delete_objects(await self.state.list_objects(prefix))
 
     def _transient_delay(self, task, error: dict) -> float:
         """A `Transient` failure's wait (docs/per-key-processing.md §8):

@@ -149,8 +149,9 @@ async def test_a_dead_pool_claim_expires_into_a_new_attempt(state):
 
 async def test_a_dead_pool_claim_that_took_its_gate_is_still_writing(state):
     """The claimant took its gate and entered a store call before it could
-    report again: the engine finds `writing`, so its write is `writing`
-    and the intents stay owing a repair — whatever its reports showed."""
+    report again: the engine finds `writing`, so its write is `writing`,
+    whatever its reports showed. Its output is a single value, which the
+    next write replaces whole: no version is kept to repair."""
 
     from solera import lifecycle
 
@@ -169,7 +170,8 @@ async def test_a_dead_pool_claim_that_took_its_gate_is_still_writing(state):
     await as_worker(state, run["id"], first, lifecycle.WRITING, "dead", intents=intents)
     detail = await engine.run_until(run["id"], 30)  # a margin that holds under load
     assert detail["request"]["status"] == "failed"
-    assert state.model.repairs[("job", "")][0]["attempt"] == first
+    assert await fence(state, run["id"], first) == ("ended", "writing")
+    assert state.model.repairs == {}
 
 
 async def test_a_pool_attempt_canceled_before_its_claim_is_withdrawn(state):

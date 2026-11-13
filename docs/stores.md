@@ -24,7 +24,7 @@ cannot happen, in one of two ways — its **kind**:
 | Kind | How a late writer is made harmless | Implement | A read sees |
 |---|---|---|---|
 | `immutable` | It writes only names no other attempt uses. A late write creates an object nothing references; the engine has it deleted later. | — | exactly the pinned generation |
-| `fenced` | Every write checks, atomically, that its attempt still holds the partition. A newer attempt takes it first (`acquire`), so the older one is refused. | `acquire`, `keys` | the current rows |
+| `fenced` | Every write transaction first raises the partition's version to its attempt's, or is refused whole if a newer attempt already wrote. Nothing is taken before a read. | `written_at`, `keys` | the current rows |
 
 Both kinds implement `cleanup`: an immutable store for what commits let
 go of and what late writers left, both for an output removed or moved
@@ -49,9 +49,8 @@ class Store(Protocol):
 
     async def cleanup(self, output, *, home=None, partition=None, key=None,
                       generation=None, before=None) -> None: ...
-    async def acquire(self, context, prior) -> None: ...          # fenced
     def keys(self, ref, among) -> Iterable[list[str]]: ...      # fenced
-    async def written_at(self, versions, prior, context): ...  # fenced, the new core: repair by version
+    async def written_at(self, versions, prior, context): ...  # fenced: a dead writer's keys, for the repair
     async def full_run_ended(self, output, partition, run, newest, *, prior=None, home=None) -> bool: ...  # optional (D211)
     async def migrate(self, output, migrations, context=None, prior=None) -> list[str]: ...  # optional
     def prepare(self, write, output) -> Prepared: ...          # optional: types of its own
@@ -175,11 +174,15 @@ row's last write, not by its rows' versions: its rows go only if that
 matches, and the table is dropped only when no partition of it is
 newer.
 
-**`acquire(context, prior)`** (fenced) takes the partition for
-`context.generation` and `context.worker_id`, in a transaction of its own,
-before the attempt reads anything from the store. It must wait for an older writer's open
-transaction on the partition, and refuse (`StoreError`) when a newer
-generation, or another worker of this generation, holds it.
+**`written_at(versions, prior, context)`** (fenced) yields, in chunks
+sorted by their bytes, the keys the partition holds at any of `versions`:
+attempts that wrote, perhaps, and ended without a commit. It first takes
+the version check for `context.generation` and `context.worker_id`, in a
+transaction of its own, so no older writer can add a row afterwards. The
+output's next attempt calls it before it writes, deletes the keys the
+output's log lacks, and leaves the others for their producer to write
+again. Nothing else is asked of a store before a write: an attempt reads
+without taking anything.
 
 **`keys(ref, among)`** (fenced) yields the keys `ref`'s partition holds now —
 among `among`, or all of them for None — in sorted chunks, by their
@@ -400,15 +403,15 @@ An `immutable` store:
 
 A `fenced` store:
 
-6. **A stale writer changes nothing.** Once generation g acquired a partition,
-   every write of an older generation to it is refused, before it changes
+6. **A stale writer changes nothing.** Once generation g wrote a partition (or
+   took its check in `written_at`), every write of an older generation to it is refused, before it changes
    anything — including writes already queued at the backend.
 7. **One generation, one worker.** A second worker of the
-   generation holding the partition can neither acquire nor write; the holding
-   worker acquiring again succeeds (its own retry).
-8. **A newer writer waits for an open older one.** `acquire` waits until an
-   older writer's open transaction ends, so the newer attempt's repair
-   reads see everything the older one committed; from then on the older
+   generation holding the partition cannot write; the holding worker
+   writing again succeeds (its own retry).
+8. **A newer writer waits for an open older one.** Its version check waits
+   until an older writer's open transaction ends, so the newer attempt's
+   repair sees everything the older one committed; from then on the older
    one is refused.
 9. **Fencing covers the whole write domain.** If one write can affect
    several partitions' data (a table-wide migration, a shared table

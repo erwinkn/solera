@@ -105,7 +105,7 @@ def stateful(make_harness: Callable[[], Harness]):
             self.generation += 1
             self.current = Attempt(self.generation, f"i{self.generation}")
             if self.kind == "fenced":
-                self.run(self.store.acquire(self._context(self.current), self.head))
+                self.run(self.store.written_at([], self.head, self._context(self.current)))
                 if self.exists:  # a partition not written yet is acquired by its first write
                     self.current.fenced, self.fence = True, self.generation
 
@@ -205,7 +205,7 @@ def stateful(make_harness: Callable[[], Harness]):
 
             twin = Attempt(self.current.generation, self.current.worker_id + "-twin")
             with _refused("a duplicate worker's acquire"):
-                self.run(self.store.acquire(self._context(twin), self.head))
+                self.run(self.store.written_at([], self.head, self._context(twin)))
             rows = [{"id": "a", "v": "0"}]
             keyed, _, _, _ = self._resolve("patch", rows, [])
             with _refused("a duplicate worker's write"):
