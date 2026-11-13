@@ -25,25 +25,22 @@ the machine plays the engine for it:
 - **collection** (immutable stores). The names no committed index and no
   pinned reader references — superseded, abandoned, or never written —
   are cleaned up, twice over.
-- **commits.** An unkeyed incremental output appends engine-numbered
-  commits, retries one, starts over, and a stale writer rewrites one.
 
 After every step: the committed content reads back exactly (an immutable
 store through the index's keys; a fenced one whole, but for rows a dead
 writer left that the next commit settles); every pinned reader reads what
-it pinned; the commits read back whole and by range. Unlike the scenarios,
-a step here assumes no particular store: what it expects follows from the
-kind."""
+it pinned. Unlike the scenarios, a step here assumes no particular store:
+what it expects follows from the kind."""
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from ..sdk import Ref
-from ..stores import Commits, KeyedWrite, Keys, Patch, StoreError, prepare_for
+from ..stores import KeyedWrite, Keys, Patch, StoreError, prepare_for
 from .stores import Harness, Ledger, context, said
 
 KEYS = ["a", "b", "c", "d"]
@@ -62,17 +59,6 @@ class Pin:
     ref: Ref
     entries: dict[str, int]  # key -> generation, as the index held them
     content: dict[str, str]  # key -> its `v`, as committed
-
-
-@dataclass
-class CommitModel:
-    head: Ref | None = None
-    commit_number: int = -1  # the last committed
-    rows: dict[int, list[tuple[str, str]]] = field(
-        default_factory=dict
-    )  # the committed rows, by commit number
-    versions: dict[int, int] = field(default_factory=dict)  # the generation that wrote each commit
-    last: tuple | None = None  # (write, prior, generation, commit, reset): the last call, to retry
 
 
 def stateful(make_harness: Callable[[], Harness]):
@@ -101,8 +87,6 @@ def stateful(make_harness: Callable[[], Harness]):
             self.fence = 0  # the newest generation holding the partition (fenced)
             self.written: set[tuple[str, int]] = set()  # (key, generation) names ever written
             self.pins: list[Pin] = []
-            self.commits_out = None
-            self.commits = CommitModel()
 
         def teardown(self):
             self.loop.close()
@@ -277,55 +261,6 @@ def stateful(make_harness: Callable[[], Harness]):
                     f"a by-key load said versions {found.versions}; the index holds {selection}"
                 )
 
-        # -- commits --------------------------------------------------------------------
-
-        @rule(n=st.integers(1, 3), retried=st.booleans(), reset=st.booleans())
-        def append(self, n, retried, reset):
-            """The next commit of an unkeyed incremental output: appended, or
-            (reset) starting the output over; maybe sent twice."""
-
-            if self.commits_out is None:
-                self.commits_out = self.h.output(incremental=True)
-            model = self.commits
-            self.generation += 1
-            commit_number = model.commit_number + 1
-            rows = [{"id": f"r{commit_number}-{i}", "v": str(commit_number)} for i in range(n)]
-            sc = context(
-                self.commits_out,
-                self.generation,
-                f"i{self.generation}",
-                commit_number=commit_number,
-                reset=reset,
-            )
-            written = None
-            for _ in range(2 if retried else 1):
-                written = self.run(self.store.store(Patch(rows), model.head, sc))
-            if reset:
-                model.rows.clear()
-                model.versions.clear()
-            model.rows[commit_number] = sorted((r["id"], r["v"]) for r in rows)
-            model.versions[commit_number] = self.generation
-            model.head, model.commit_number = written.ref, commit_number
-            model.last = (rows, commit_number)
-
-        @precondition(lambda self: self.commits.last is not None)
-        @rule()
-        def stale_commit(self):
-            """An attempt the engine gave up on rewrites the last commit with
-            other rows; then the next commit is written as usual. A fenced
-            store refuses the stale write; an immutable one keeps, per commit,
-            what the highest generation wrote."""
-
-            model = self.commits
-            rows, commit_number = model.last
-            stale = context(self.commits_out, 0, "stale", commit_number=commit_number)
-            junk = Patch([{"id": f"stale-{commit_number}", "v": "x"}])
-            if self.kind == "fenced":
-                with contextlib.suppress(StoreError):
-                    self.run(self.store.store(junk, model.head, stale))
-            else:
-                self.run(self.store.store(junk, model.head, stale))
-
         # -- invariants -------------------------------------------------------------------
 
         @invariant()
@@ -359,26 +294,6 @@ def stateful(make_harness: Callable[[], Harness]):
                         f"a pinned reader reads {got} at {read}; it pinned {want} at {pin.entries}"
                     )
 
-        @invariant()
-        def commits_read_back(self):
-            model = self.commits
-            if model.head is None:
-                return
-            want = sorted(p for rows in model.rows.values() for p in rows)
-            got = self._rows(model.head, None)
-            if got != want:
-                raise AssertionError(f"the commits read {got}; committed were {want}")
-            newest = self.run(self.store.read(model.head, list[dict], None)).version
-            if newest != max(model.versions.values()):
-                raise AssertionError(
-                    f"the commits read at version {newest}; the newest wrote {model.versions}"
-                )
-            lo = min(model.rows)
-            for b in (lo, model.commit_number):
-                got = self._rows(model.head, Commits(b, b))
-                if got != model.rows[b]:
-                    raise AssertionError(f"commit {b} reads {got}; committed was {model.rows[b]}")
-
         # -- helpers ----------------------------------------------------------------------
 
         def _context(self, attempt: Attempt):
@@ -403,10 +318,6 @@ def stateful(make_harness: Callable[[], Harness]):
             gone = set(entries) - set(upserts)
             keyed = KeyedWrite(prepared, upserts=frozenset(upserts), removes=frozenset(gone), value=rows)
             return keyed, upserts, gone, False
-
-        def _rows(self, ref: Ref, selection) -> list[tuple[str, str]]:
-            found = self.run(self.store.load(ref, list[dict], selection))
-            return sorted((str(r["id"]), str(r["v"])) for r in found)
 
         def _read(self, ref: Ref, selection) -> tuple[list[tuple[str, str]], dict]:
             """The rows `read` gives, and the version it says each key was read at."""

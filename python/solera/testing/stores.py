@@ -28,15 +28,14 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from ..sdk import Output, Ref
-from ..stores import Changed, Commits, KeyedWrite, Keys, Patch, StoreError, WriteContext, Written, prepare_for
+from ..stores import Changed, KeyedWrite, Keys, Patch, StoreError, WriteContext, Written, prepare_for
 
 
 @dataclass
 class Harness:
     """What a scenario needs of the store under test. `output(**decl)` makes
     a fresh `Output` on it — a new name each call, so scenarios never share
-    data — with the declaration given (`key="id"`, `incremental=True`, or
-    none). `hold(partition)`, which a fenced store's
+    data — with the declaration given (`key="id"`, or none). `hold(partition)`, which a fenced store's
     worker must give, is an async context manager that opens a write
     transaction of `partition` holding its fence until the block ends, then
     commits it: a newer writer waits for it. `opaque(rows)`, which a store
@@ -68,14 +67,12 @@ def context(
     out: Output,
     generation: int,
     worker_id: str = "i",
-    commit_number: int | None = None,
     reset: bool = False,
     partition: str = "",
 ) -> WriteContext:
     return WriteContext(
         output=out,
         partition=partition,
-        commit_number=commit_number,
         reset=reset,
         attempt=f"kit-{generation}",
         generation=generation,
@@ -245,40 +242,6 @@ async def a_write_repeated_by_its_attempt_lands_once(h: Harness) -> None:
     assert await now(h, again, ledger) == [("a", "1"), ("b", "1")]
 
 
-async def commits_append_and_load_by_range(h: Harness) -> None:
-    """An unkeyed incremental output: commit 3, then commit 4, read whole and
-    by range."""
-
-    out = h.output(incremental=True)
-    first = await h.store.store(Patch([{"id": "a", "v": "1"}]), None, context(out, 1, commit_number=3))
-    second = await h.store.store(Patch([{"id": "b", "v": "1"}]), first.ref, context(out, 2, commit_number=4))
-    assert await rows(h, second.ref, None) == [("a", "1"), ("b", "1")]
-    assert await rows(h, second.ref, Commits(4, 4)) == [("b", "1")]
-
-
-async def a_commit_written_again_lands_once(h: Harness) -> None:
-    """Commit 3, written twice by its attempt (a retried call): its rows once."""
-
-    out = h.output(incremental=True)
-    first = await h.store.store(Patch([{"id": "a", "v": "1"}]), None, context(out, 1, commit_number=3))
-    again = await h.store.store(Patch([{"id": "a", "v": "1"}]), None, context(out, 1, commit_number=3))
-    second = await h.store.store(Patch([{"id": "b", "v": "1"}]), first.ref, context(out, 2, commit_number=4))
-    second = await h.store.store(Patch([{"id": "b", "v": "1"}]), first.ref, context(out, 2, commit_number=4))
-    assert await rows(h, again.ref, None) == [("a", "1")]
-    assert await rows(h, second.ref, None) == [("a", "1"), ("b", "1")]
-
-
-async def a_full_run_starts_the_commits_over(h: Harness) -> None:
-    """Commit 3, then commit 4 reset (a full run): only commit 4."""
-
-    out = h.output(incremental=True)
-    first = await h.store.store(Patch([{"id": "a", "v": "1"}]), None, context(out, 1, commit_number=3))
-    reset = await h.store.store(
-        Patch([{"id": "b", "v": "1"}]), first.ref, context(out, 2, commit_number=4, reset=True)
-    )
-    assert await rows(h, reset.ref, None) == [("b", "1")]
-
-
 async def a_replacement_resolved_writes_its_keys_and_removes_the_rest(h: Harness) -> None:
     """{a, b, c}, then the replacement {a, b at 2} as the worker resolves it
     — not a whole write: its keys, and the keys it removes. a and b written
@@ -335,8 +298,7 @@ async def a_replacement_holds_exactly_its_keys_at_its_version(h: Harness) -> Non
 
 async def an_unkeyed_read_says_its_version(h: Harness) -> None:
     """An unkeyed value written at 3, then at 5: a read says the version it
-    read. Commits 3 (at 1) and 4 (at 2): a read says the newest version
-    among them, a range only its own; an unkeyed write says no keys."""
+    read; an unkeyed write says no keys."""
 
     out = h.output()
     first = await h.store.store([{"id": "a", "v": "1"}], None, context(out, 3))
@@ -344,11 +306,6 @@ async def an_unkeyed_read_says_its_version(h: Harness) -> None:
     assert await read(h, first.ref, None) == ([("a", "1")], None, 3)
     second = await h.store.store([{"id": "b", "v": "1"}], first.ref, context(out, 5))
     assert await read(h, second.ref, None) == ([("b", "1")], None, 5)
-    out = h.output(incremental=True)
-    one = await h.store.store(Patch([{"id": "a", "v": "1"}]), None, context(out, 1, commit_number=3))
-    two = await h.store.store(Patch([{"id": "b", "v": "1"}]), one.ref, context(out, 2, commit_number=4))
-    assert (await read(h, two.ref, None))[2] == 2
-    assert await read(h, two.ref, Commits(3, 3)) == ([("a", "1")], None, 1)
 
 
 # -- immutable stores ----------------------------------------------------------------------
@@ -632,9 +589,6 @@ EVERY = [
     a_patch_changes_only_its_keys,
     an_empty_replacement_holds_no_key,
     a_write_repeated_by_its_attempt_lands_once,
-    commits_append_and_load_by_range,
-    a_commit_written_again_lands_once,
-    a_full_run_starts_the_commits_over,
     a_replacement_resolved_writes_its_keys_and_removes_the_rest,
     a_write_says_which_keys_it_wrote_and_removed,
     a_replacement_holds_exactly_its_keys_at_its_version,

@@ -1,4 +1,4 @@
-"""FileStore and S3Store (§4): one object per value, key or commit, each
+"""FileStore and S3Store (§4): one object per value or key, each
 written once under a name no other attempt writes. They take plain
 Python, pandas DataFrames and Arrow data (`frames`)."""
 
@@ -15,7 +15,6 @@ from ..sdk import KEYS, Loaded, ObjectRef, Ref, is_ref_type
 from . import (
     MISSING,
     PARALLEL,
-    Commits,
     KeyedWrite,
     Keys,
     Patch,
@@ -36,7 +35,7 @@ from . import (
 
 class FileStore:
     """The default store (§4): what an asset returns, as files — one per
-    value, per key, or per commit — each written once, under a name no other
+    value or per key — each written once, under a name no other
     attempt writes (docs/lifecycle.md §9.8):
 
         {root}/rollup@184467.json               a value, by generation 184467
@@ -45,16 +44,12 @@ class FileStore:
                                                 under one of 4,096 buckets by the key's hash
         {root}/site_files/alpha/455/f-1/184467.json
                                                 keyed and partitioned: the key's rows
-        {root}/site_events/alpha/000000000042/184467.json
-                                                an unkeyed incremental output: one per commit
 
     A name carries the writing attempt's generation (`WriteContext.generation`) —
     a key's version (docs/versions.md) — and a write is create-only: a dead
     writer only ever leaves objects nothing references, and a reader gets
     exactly what it was pinned to. A keyed read names its objects from the
-    generations the key index holds (`Keys`); a range of commits keeps, per
-    commit, the highest generation, which committed it — listed commit by
-    commit, so reading one never lists the others. Superseded objects
+    generations the key index holds (`Keys`). Superseded objects
     are deleted by `cleanup`, once nothing can read them.
 
     Content is JSON when it round-trips exactly, pickle otherwise. `path`
@@ -172,9 +167,8 @@ class FileStore:
         output = context.output
         if prior is not None and prior.meta.get("source"):
             raise WriteError(f"{output.name}: cannot write an external source ref")
-        patch = isinstance(write, Patch)
-        if patch and not output.incremental:
-            raise WriteError(f"{output.name}: Patch requires an incremental output")
+        if isinstance(write, Patch) and output.key is None:
+            raise WriteError(f"{output.name}: Patch requires a keyed output")
         base = self._base(output, context, prior)
         if context.reset:
             prior = None  # where the content is, but nothing of it is kept
@@ -185,10 +179,6 @@ class FileStore:
             if output.is_dynamic_partitions:
                 return await self._store_set(write, prior, context, base, generation)
             return await self._store_keyed(write, prior, context, base, generation)
-        if output.incremental:
-            if not patch:
-                raise WriteError(f"{output.name}: an unkeyed incremental output only accepts Patch writes")
-            return await self._store_commit(write, prior, context, base, generation)
         name = f"{base}@{generation}"
         await self._put(name, write)
         return Written(self._ref(context, {"mode": "value", "path": name, "base": base}))
@@ -222,30 +212,6 @@ class FileStore:
         ref = self._ref(context, {"mode": "keyed", "path": base, "key": context.output.key})
         return Written(ref, changed=write.changed())
 
-    async def _store_commit(self, write: Patch, prior, context, base, generation) -> Written:
-        """An unkeyed incremental write: its items, as one object per commit.
-        With no prior (a first write, or a reset) the output starts over at
-        this commit; earlier ones are no longer read, and go with `cleanup`."""
-
-        output = context.output
-        if write.remove:
-            raise WriteError(f"{output.name}: remove is not allowed on an unkeyed incremental output")
-        items = write.rows
-        if not isinstance(items, list):
-            items = frames.rows_of(items, output.name)
-        if not isinstance(items, list):
-            raise WriteError(f"{output.name}: a commit is a list, got {type(items).__name__}")
-        if not items and prior is not None:
-            return Written(prior)
-        if context.commit_number is not None:
-            commit_number = context.commit_number
-        else:
-            commit_number = int(prior.handle["commits"][1]) + 1 if prior is not None else 0
-        await self._put(_commit_name(base, commit_number, generation), items)
-        first = commit_number if prior is None else int(prior.handle["commits"][0])
-        handle = {"mode": "commits", "path": base, "commits": [first, commit_number]}
-        return Written(self._ref(context, handle))
-
     @staticmethod
     def key_name(base: str, key: str, generation: int) -> str:
         """`{base}/{bucket}/{key}/{generation}`: each key's directory sits in one
@@ -260,25 +226,20 @@ class FileStore:
     ) -> None:
         """Delete every object of `output` the pattern matches (docs/stores.md
         § Cleanup), each field left out matching anything: the life kept
-        under `home` (else its own name), its `partition`, its `key` (an
-        unkeyed incremental output's commit number), exactly `generation`,
-        or every generation older than `before`. Objects are found by name:
-        a generation is every name's last component — `{base}@{g}` for a
-        value, `{base}/{bucket}/{key}/{g}` otherwise — and a key, or commit, the one
-        before it. Names are never reused, so deleting one twice is no harm."""
+        under `home` (else its own name), its `partition`, its `key`, exactly
+        `generation`, or every generation older than `before`. Objects are
+        found by name: a generation is every name's last component —
+        `{base}@{g}` for a value, `{base}/{bucket}/{key}/{g}` for a key — and
+        a key the one before it. Names are never reused, so deleting one twice is no harm."""
 
         import obstore
 
         root = _segment(home or output.name)
         base = root if not partition else f"{root}/{_segment(partition)}"
         if key is not None and generation is not None and partition is not None:  # one name: no listing
-            await self._delete(
-                self.key_name(base, key, generation)
-                if isinstance(key, str)
-                else _commit_name(base, key, generation)
-            )
+            await self._delete(self.key_name(base, key, generation))
             return
-        wanted = None if key is None else _segment(key) if isinstance(key, str) else f"{int(key):012d}"
+        wanted = None if key is None else _segment(key)
 
         def matches(path: str) -> bool:
             name = path.rsplit(".", 1)[0]
@@ -317,15 +278,15 @@ class FileStore:
 
     # -- reads ------------------------------------------------------------------
 
-    async def load(self, ref: Ref, t, selection: Keys | Commits | None) -> Any:
+    async def load(self, ref: Ref, t, selection: Keys | None) -> Any:
         return (await self.read(ref, t, selection)).value
 
-    async def read(self, ref: Ref, t, selection: Keys | Commits | None) -> Read:
+    async def read(self, ref: Ref, t, selection: Keys | None) -> Read:
         """`load`, and the versions it read (docs/stores.md, "What a write and
         a load say"). Every object's name carries the version that wrote it,
         and a keyed read names its objects from the planned versions: it reads
         exactly those, or fails when one is gone. An unkeyed read is at its
-        object's version — a range of commits at its newest's."""
+        object's version."""
 
         if is_ref_type(t):
             return Read(ref)
@@ -333,22 +294,6 @@ class FileStore:
         mode, base = handle.get("mode"), handle.get("path")
         if base is None:
             raise StoreError(f"{ref.output}: not a {type(self).__name__} ref")
-        if mode == "commits":
-            if isinstance(selection, Keys):
-                raise StoreError(f"{ref.output}: an unkeyed incremental output takes Batches")
-            first, last = (int(b) for b in handle["commits"])
-            lo, hi = (
-                (max(first, selection.lo), min(last, selection.hi))
-                if selection is not None
-                else (first, last)
-            )
-            names = await self._commits(base, lo, hi)
-            # The ref's commits run first..last without a gap: every one was committed.
-            if missing := [b for b in range(lo, hi + 1) if b not in names]:
-                raise StoreError(f"{ref.output}: commit {missing[0]} of {base} is gone")
-            commits = await self._many(self._found, [names[b] for b in sorted(names)])
-            newest = max((_generation(name) for name in names.values()), default=None)
-            return Read(frames.materialize([item for b in commits for item in b], t), version=newest)
         if mode == "keyed":
             if not isinstance(selection, Keys):
                 raise StoreError(
@@ -446,37 +391,6 @@ class FileStore:
             raise StoreError(f"{what}{base} is gone")
         return value
 
-    async def _commits(self, base: str, lo: int, hi: int) -> dict[int, str]:
-        """Commit `n` -> its committed object, in `[lo, hi]`: of the objects
-        under `n`'s name, the highest generation's. The attempts that used
-        commit number `n` all ran one at a time, after commit `n - 1`, and
-        the one that committed `n` was the last of them."""
-
-        import obstore
-        from obstore.store import LocalStore
-
-        objects = self._objects()
-        best: dict[int, int] = {}
-
-        async def scan(prefix: str, offset: str | None = None) -> None:
-            async for chunk in obstore.list(objects, prefix=prefix, offset=offset):
-                for meta in chunk:
-                    if (found := _commit_of(base, meta["path"])) is None:
-                        continue
-                    commit_number, generation = found
-                    if commit_number > hi:
-                        return  # listed in key order: none further is in range
-                    if commit_number >= lo and generation > best.get(commit_number, -1):
-                        best[commit_number] = generation
-
-        if isinstance(objects, LocalStore):
-            # A directory lists in any order, to its end: each commit's own, then.
-            await self._many(lambda b: scan(f"{base}/{b:012d}/"), range(lo, hi + 1))
-        else:
-            # An object store lists in key order, from `lo`: it stops past `hi`.
-            await scan(f"{base}/", f"{base}/{lo:012d}")
-        return {b: f"{base}/{b:012d}/{g}" for b, g in best.items()}
-
     # -- objects ----------------------------------------------------------------
 
     @staticmethod
@@ -559,24 +473,9 @@ def data_path() -> str | None:
 
 
 def _generation(name: str) -> int:
-    """The generation an object's name ends with: `{base}@{g}` or `{base}/{g}`."""
+    """The generation a value's name ends with: `{base}@{g}`."""
 
-    return int(name.rpartition("@" if "@" in name.rpartition("/")[2] else "/")[2])
-
-
-def _commit_name(base: str, commit_number: int, generation: int) -> str:
-    return f"{base}/{int(commit_number):012d}/{int(generation)}"
-
-
-def _commit_of(base: str, path: str) -> tuple[int, int] | None:
-    """An object's `(commit, generation)`, from its name under `base`:
-    `{commit:012d}/{generation}.{format}`. None for any other object."""
-
-    commit_number, _, name = path[len(base) + 1 :].partition("/")
-    generation, _, fmt = name.partition(".")
-    if commit_number.isdigit() and generation.isdigit() and fmt in ("json", "pkl"):
-        return int(commit_number), int(generation)
-    return None
+    return int(name.rpartition("@")[2])
 
 
 class S3Store(FileStore):

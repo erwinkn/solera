@@ -404,7 +404,7 @@ def _paged(root, content: dict, pages: list, include=None) -> Project:
                 "classes": (sorted(b.added), sorted(b.updated), sorted(b.removed), sorted(b.unchanged)),
                 "rows": sorted(r["id"] for r in files),
                 "rows_are_the_parameter": b.rows is files,
-                "upstream": (b.upstream.output, b.upstream.commits),
+                "upstream": b.upstream.output,
             }
         )
         return {"n": len(files)}
@@ -428,7 +428,7 @@ async def test_inc_10_a_batch_says_where_it_sits_in_its_run(solera):
     ]
     assert all(isinstance(p["count"], int) and p["count"] >= 1 for p in pages)
     assert [p["rows"] for p in pages] == [["k0", "k1", "k2"], ["k3", "k4", "k5"], ["k6"]]
-    assert all(p["upstream"] == ("files", None) for p in pages)
+    assert all(p["upstream"] == "files" for p in pages)
 
     pages.clear()
     content["v"] = Patch([{"id": k, "v": 2} for k in ("k0", "k2", "k4", "k6")])
