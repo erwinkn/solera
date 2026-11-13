@@ -4,11 +4,13 @@ what is there now — never a stored dirty flag.
 
 A built partition is stale for one or more reasons:
 
-- `input changed`: an input owes it something — a keyed incremental input a
-  key (its observation record compared with upstream now, under the current
-  patterns and context: a whole or dep input that moved is in every layer's
-  context), an unkeyed one a commit past the last it read; with no keyed
-  input, a whole or dep input at another version than its last commit read;
+- `upstream incomplete`: an upstream it reads is mid full run or mid first
+  run; what it owes is known once that run completes, so `input changed`
+  is not said meanwhile;
+- `input changed`: an input owes it something — an incremental input a key
+  (a plan of one key, under the current patterns and context: a whole or
+  dep input that moved is in the context); with no incremental input, a
+  whole or dep input at another version than its last commit read;
 - `upstream stale`: a partition it reads is itself stale, to any depth;
 - `definition changed`: its asset's definition is not the one its last
   commit was made under — its next run is a full run.
@@ -23,7 +25,9 @@ import logging
 from solera.patterns import Matcher
 
 from . import planning
+from .tracking import full as core_full
 from .tracking import stale as core_stale
+from .tracking.full import INCOMPLETE
 
 log = logging.getLogger(__name__)
 
@@ -52,7 +56,11 @@ class Staleness:
         except planning.UpstreamOnly:
             inputs = []
         reasons = []
-        if await self.input_changed(asset, partition, planner, inputs):
+        waiting = core_full.waiting(self)
+        task = {"asset": asset, "partition": partition}
+        if core_full.gate(planner, task, lambda output, part: (output, part) in waiting) is not None:
+            reasons.append(INCOMPLETE)  # what it owes is known once the upstream is complete (D197)
+        elif await self.input_changed(asset, partition, planner, inputs):
             reasons.append(INPUT)
         if await self.upstream_stale(asset, partition, planner, inputs, memo):
             reasons.append(UPSTREAM)
@@ -137,7 +145,7 @@ class Staleness:
         reasons = await self.stale_reasons(asset, partition)
         if not keyed:
             return {"tracked": False, "keys": [], "next": None, "reasons": reasons}
-        if not reasons:
+        if not reasons or INCOMPLETE in reasons:  # fresh, or held by a gate: no number while held
             return {"tracked": True, "keys": [], "next": None, "reasons": reasons}
         if self._each_input(asset) is not None:
             stale = await self._each_keys(asset, partition, {})
@@ -145,6 +153,22 @@ class Staleness:
             more = len(page) == limit and page[-1] != max(stale)
             keys = [{"key": k, "reasons": stale[k]} for k in page]
             return {"tracked": True, "keys": keys, "next": page[-1] if more else None, "reasons": reasons}
+        if INPUT in reasons:  # the keys its incremental inputs owe it: the planner's answer
+            planner = self.planner()
+            inputs = planner.inputs(asset, partition)
+            pages = [
+                await core_stale.owed_keys(self.core, asset, partition, i, planner, inputs, after, limit)
+                for i in inputs
+                if i.kind == "incremental"
+            ]
+            if pages and None not in pages:
+                # No further than the shortest page that goes on: a key past it may be another's.
+                bound = min((rows[-1] for rows, more in pages if more is not None and rows), default=None)
+                owed = sorted({k for rows, _ in pages for k in rows if bound is None or k <= bound})[:limit]
+                more = bound is not None or len({k for rows, _ in pages for k in rows}) > len(owed)
+                keys = [{"key": k, "reasons": []} for k in owed]
+                next_ = owed[-1] if more and owed else None
+                return {"tracked": True, "keys": keys, "next": next_, "reasons": reasons}
         if (keyed[0], partition) not in self.m.heads:
             return {"tracked": True, "keys": [], "next": None, "reasons": reasons}
         page = await self.list_keys(keyed[0], partition, after=after, limit=limit)

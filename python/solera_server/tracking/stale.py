@@ -24,18 +24,13 @@ async def owes(core: Core, asset: str, partition: str, input, planner, inputs) -
     edge = edge_id(asset, partition, input.param)
     if not (m.edge(asset, partition, input.param) or {}).get("read"):
         return found["live"] > 0
-    record = m.partition(asset, partition)
-    base = {
-        "context": core.engine._context(planner, inputs),
-        "definition": record.get("definition") or "",
-    }
     core.attach(upstream)
     request = {
         "mode": "incremental",
         "reset": False,
         "after": None,
         "limit": 1,
-        "inputs": [{"edge": edge, "conditions": conditions(core.engine, input, base)}],
+        "inputs": [{"edge": edge, "conditions": _conditions(core, asset, partition, input, planner, inputs)}],
     }
     generation = Generation(m)
     try:
@@ -45,6 +40,36 @@ async def owes(core: Core, asset: str, partition: str, input, planner, inputs) -
     except Redeployed:  # a deploy while it planned: not known, so owed
         return True
     return bool(summary["inputs"][0]["keys"])
+
+
+def _conditions(core: Core, asset: str, partition: str, input, planner, inputs) -> dict:
+    """The conditions `input`'s keys would be processed under now."""
+
+    definition = core.m.partition(asset, partition).get("definition") or ""
+    base = {"context": core.engine._context(planner, inputs), "definition": definition}
+    return conditions(core.engine, input, base)
+
+
+async def owed_keys(
+    core: Core, asset: str, partition: str, input, planner, inputs, after: str | None, limit: int
+) -> tuple[list[str], str | None] | None:
+    """A page of the keys `input` owes the partition, in key order, and where
+    the next page starts: the planner's answer, with no batch made. None
+    where the core cannot say: the input has no edge yet, or a deploy came
+    in while it read."""
+
+    edge = edge_id(asset, partition, input.param)
+    if core.tracking.edge(edge) is None:
+        return None
+    core.attach(output_id(input.output, input.partition))
+    conds, generation = _conditions(core, asset, partition, input, planner, inputs), Generation(core.m)
+    try:
+        with generation:
+            rows, next_ = await core.run(core.tracking.owed, edge, conds, after=after, limit=limit)
+        generation.check()
+    except Redeployed:
+        return None
+    return [key for key, _ in rows], next_
 
 
 async def taken_after(core: Core, input, empty: str, edge: bytes | None = None) -> bool:
