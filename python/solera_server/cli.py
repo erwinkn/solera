@@ -58,7 +58,7 @@ def _reads(args) -> bool:
     command, action = args.command, getattr(args, "runs_command", None)
     if command == "runs":
         return action is None or (action == "prune" and args.dry_run)
-    if command in ("cleanups", "merges"):
+    if command == "cleanups":
         return not args.clear
     if command == "automations":
         return not args.action
@@ -197,31 +197,11 @@ def _main():
     cleanups.add_argument("output")
     cleanups.add_argument("partition", nargs="?", default="")
     cleanups.add_argument("--clear", action="store_true", help="Forget the stuck entries; their objects stay")
-    merges = commands.add_parser(
-        "merges",
-        help="A key index's failed merges, and when upkeep tries them again (docs/key-index-design.md § Compaction)",
-    )
-    merges.add_argument("output")
-    merges.add_argument("partition", nargs="?", default="")
-    merges.add_argument(
-        "--clear", action="store_true", help="Forget what its merges tried: try them again at once"
-    )
-
     stale = commands.add_parser(
         "stale", help="Whether an asset's partition is stale, why, and its stale keys", parents=[common]
     )
     stale.add_argument("asset")
     stale.add_argument("partition", nargs="?", default="", help="Its partition; none when unpartitioned")
-
-    keys = commands.add_parser(
-        "keys", help="A per-key asset's key outcomes (per-key-processing.md §9)", parents=[common]
-    )
-    keys_sub = keys.add_subparsers(dest="keys_command", required=True)
-    keys_retry = keys_sub.add_parser("retry", help="Retry a per-key asset's failing keys now")
-    keys_retry.add_argument("asset")
-    keys_retry.add_argument("--partition", default=None, help="One partition only")
-    for name in ("failed", "rejected", "canceled", "retrying", "timed-out", "all"):
-        keys_retry.add_argument(f"--{name}", action="store_true")
 
     run_show = commands.add_parser("run-show", help="Show a run's tasks and attempts", parents=[common])
     run_show.add_argument("run_id")
@@ -482,13 +462,6 @@ def _prune_payload(args):
     return {"before": before, "asset": args.asset, "keep": args.keep, "dry_run": args.dry_run}
 
 
-def _key_classes(args) -> list[str]:
-    """`solera keys retry --failed --rejected …`; `--failed` when none is given."""
-
-    names = ("failed", "rejected", "canceled", "retrying", "timed_out", "all")
-    return [n for n in names if getattr(args, n)] or ["failed"]
-
-
 def _commit_payload(args):
     keys = json.loads(args.keys) if args.keys else None
     upsert = json.loads(args.upsert) if args.upsert else None
@@ -529,16 +502,6 @@ async def _remote(args, parser):
             response = await client.post(f"{base}/cleanups:clear", json=body)
             response.raise_for_status()
             print(json.dumps(response.json(), indent=2))
-        elif args.command == "merges" and args.clear:
-            body = {"output": args.output, "partition": args.partition, "by": "cli"}
-            response = await client.post(f"{base}/merges:clear", json=body)
-            response.raise_for_status()
-            print(json.dumps(response.json(), indent=2))
-        elif args.command == "merges":
-            params = {"partition": args.partition}
-            response = await client.get(f"{base}/outputs/{args.output}/merges", params=params)
-            response.raise_for_status()
-            print(json.dumps(response.json(), indent=2))
         elif args.command == "cleanups":
             response = await client.get(f"{base}/cleanups")
             response.raise_for_status()
@@ -553,11 +516,6 @@ async def _remote(args, parser):
                 return response.json()
 
             print(json.dumps(await _stale_pages(page), indent=2))
-        elif args.command == "keys":
-            body = {"classes": _key_classes(args), "partition": args.partition, "by": "cli"}
-            response = await client.post(f"{base}/assets/{args.asset}/keys:retry", json=body)
-            response.raise_for_status()
-            print(json.dumps(response.json(), indent=2))
         elif args.command == "runs" and args.runs_command == "delete":
             response = await client.delete(f"{base}/runs/{args.run_id}")
             response.raise_for_status()
@@ -637,22 +595,6 @@ async def _local(args, parser):
                 else runtime.partition_cleanups(args.output, args.partition)
             )
             print(json.dumps(view, indent=2))
-        elif args.command == "merges":
-            view = (
-                runtime.clear_merges(args.output, args.partition, "cli")
-                if args.clear
-                else runtime.merges_view(args.output, args.partition)
-            )
-            print(json.dumps(view, indent=2))
-        elif args.command == "keys":
-            found = runtime.retry_keys(args.asset, _key_classes(args), args.partition, "cli")
-            runs = (
-                await runtime.submit_retries(args.asset, found["partitions"], "cli")
-                if found["partitions"]
-                else []
-            )
-            found["runs"] = [(await runtime.run_until(r["id"]))["request"]["status"] for r in runs]
-            print(json.dumps(found, indent=2))
         elif args.command == "runs" and args.runs_command == "delete":
             await runtime.delete_run(args.run_id)
             print(json.dumps({"deleted": [args.run_id]}, indent=2))

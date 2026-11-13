@@ -267,8 +267,6 @@ async def test_eng_9_a_config_value_past_64_bits_is_a_400_and_the_engine_goes_on
     [
         ("/runs", "x"),
         ("/runs", {"targets": 5}),
-        ("/assets/items/keys:retry", None),
-        ("/assets/items/keys:retry", []),
         ("/cleanups:clear", {"output": []}),
         ("/sources/feed/commit", 1),
     ],

@@ -20,10 +20,9 @@ from __future__ import annotations
 
 import logging
 
-from solera.keys.layers import LayerIndex, key_str
 from solera.patterns import Matcher
 
-from . import observed, owed, planning
+from . import planning
 from .tracking import stale as core_stale
 
 log = logging.getLogger(__name__)
@@ -79,35 +78,11 @@ class Staleness:
             if self._keyed(input):  # the new path: a plan of one key
                 if await core_stale.owes(self.core, asset, partition, input, planner, inputs):
                     return True
-            elif self._keyed(input):
-                if await self._owed(asset, partition, input, planner, inputs, first=True):
-                    return True
             elif input.kind == "incremental" and self._input_behind(asset, partition, input):
                 return True
         if keyed or not any(self._versioned(i) for i in inputs):
             return False
         return self.m.partition(asset, partition).get("context") != self._context(planner, inputs)
-
-    async def _owed(self, asset: str, partition: str, input, planner, inputs, *, first=False) -> list:
-        """What a keyed incremental input owes (`owed.Owe`s): its record
-        compared with upstream now — all of upstream if its record names an
-        upstream's earlier life. `first`: the first owed key, if any."""
-
-        rec = (self.m.partition(asset, partition).get("observed") or {}).get(input.param)
-        index, life = self._upstream(input.output, input.partition)
-        each = input.spec.get("each") is not None
-        if rec is None or not self._decodable(rec, input.output, input.partition):
-            rec = observed.record(life, held=each and rec is not None)
-        now = owed.Now(index.state.head, input.spec.get("patterns"), self._context(planner, inputs), life)
-        held = self._held(asset, partition) if each else None
-        out = []
-        with self.m.reading(index.state.prefix, *(h.state.prefix for h in held or ())):
-            async for o in owed.candidates(index, rec, now, None, held):
-                if o.cls is not None:
-                    out.append(o)
-                    if first:
-                        break
-        return out
 
     async def upstream_stale(self, asset: str, partition: str, planner, inputs, memo: dict) -> bool:
         """A partition it reads is itself stale, to any depth (K46). Along an
@@ -191,79 +166,3 @@ class Staleness:
         page = await self.list_keys(keyed[0], partition, after=after, limit=limit)
         keys = [{"key": k, "reasons": []} for k in page["keys"]]
         return {"tracked": True, "keys": keys, "next": page.get("next"), "reasons": reasons}
-
-    async def _each_keys(self, asset: str, partition: str, memo: dict) -> dict[str, list]:
-        """An `each=True` partition's stale keys, each with its own reasons
-        (`stale_keys`): those its input owes (`_each_own`), and along an each
-        chain those whose upstream key is stale; any other stale upstream,
-        partition-wide, makes every key it holds stale."""
-
-        if (asset, partition) in memo:
-            return memo[(asset, partition)]
-        memo[(asset, partition)] = {}
-        planner = self.planner()
-        try:
-            inputs = planner.inputs(asset, partition)
-        except planning.UpstreamOnly:
-            inputs = []
-        if not self.built(asset, partition, planner):
-            return {}
-        param, spec = self._each_input(asset)
-        keys = await self._each_own(asset, partition, planner, inputs)
-        taken = Matcher(spec.get("patterns"))
-        output = next((o["name"] for o in self.manifest["assets"][asset]["outputs"] if o.get("key")), None)
-        for i in inputs:
-            for upstream_partition in self._upstreams(planner, i):
-                if i.owner is None or not await self.stale_reasons(i.owner, upstream_partition):
-                    continue
-                if i.param == param and self._each_input(i.owner) is not None:
-                    for k in await self._each_keys(i.owner, upstream_partition, memo):
-                        if taken(k):
-                            keys.setdefault(k, []).append(
-                                {"kind": UPSTREAM, "input": i.param, "upstream_partition": upstream_partition}
-                            )
-                else:  # a stale upstream every key depends on: partition-wide
-                    async for k, _, _ in _entries(self, self.m.indexes.get((output, partition))):
-                        keys.setdefault(k, [])
-        memo[(asset, partition)] = keys
-        return keys
-
-    async def _each_own(self, asset: str, partition: str, planner, inputs) -> dict[str, list]:
-        """An `each=True` partition's stale keys by its own input (`_each_keys`):
-        the keys it owes — and, its definition changed, a full run due,
-        every key upstream has under the patterns and every key it holds,
-        for that partition-wide reason alone."""
-
-        param, spec = self._each_input(asset)
-        input = next((i for i in inputs if i.param == param), None)
-        output = next((o["name"] for o in self.manifest["assets"][asset]["outputs"] if o.get("key")), None)
-        if input is None or output is None:
-            return {}
-        owed = {o.key for o in await self._owed(asset, partition, input, planner, inputs)}
-        reason = {"kind": INPUT, "input": param, "upstream_partition": input.partition}
-        keys = {k: [dict(reason)] for k in sorted(owed)}
-        if self.definition_changed(asset, partition):
-            taken = Matcher(spec.get("patterns"))
-            async for k, _, _ in _entries(self, self.m.indexes.get((input.output, input.partition))):
-                if taken(k):
-                    keys.setdefault(k, [])
-            for name in (output, f"@{asset}"):
-                async for k, _, _ in _entries(self, self.m.indexes.get((name, partition))):
-                    keys.setdefault(k, [])
-        return keys
-
-
-async def _entries(engine, state):
-    """An index's live entries in key order: `(key, generation, payload)`."""
-
-    if state is None:
-        return
-    with engine.m.reading(state.prefix):
-        index = LayerIndex(engine._key_io(), state, cache=engine._key_cache())
-        after = None
-        while True:
-            rows, after = await index.delta(None, after=after, first=BEHIND_PAGE)
-            for k, _, _, g, p in rows:
-                yield key_str(k), g, p
-            if after is None:
-                return

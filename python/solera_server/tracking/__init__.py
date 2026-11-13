@@ -21,10 +21,13 @@ drive lists the hooks later units add.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import os
 import secrets
+import tempfile
 from base64 import b64decode, b64encode
+from urllib.parse import unquote, urlsplit
 
 import orjson
 from solera.change_index import open_index
@@ -37,6 +40,19 @@ HEAVY = 4  # plans and commit builds running at once: the engine's cores (N9, D2
 WALK = "(core)"
 
 log = logging.getLogger(__name__)
+
+
+def cache_root(objects_url: str) -> str:
+    """Where the engine keeps the change index's disk cache by default: beside
+    `file://` state (`{its directory}/.key-cache/{its name}`), else in a
+    temporary directory named after the store."""
+
+    u = urlsplit(objects_url)
+    if u.scheme == "file":
+        path = unquote(u.path).rstrip("/")
+        return os.path.join(os.path.dirname(path), ".key-cache", os.path.basename(path))
+    name = hashlib.sha256(objects_url.encode()).hexdigest()[:16]
+    return os.path.join(tempfile.gettempdir(), "solera-key-cache", name)
 
 
 def b64(data: bytes) -> str:

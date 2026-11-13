@@ -14,9 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import copy
 import dataclasses
-import functools
 import importlib
 import importlib.util
 import inspect
@@ -38,17 +36,8 @@ from solera.keys import SortedEntries
 from solera.keys.io import ObjectIO
 from solera.keys.layers import (
     DeltaFiles,
-    DeltaKeys,
     LayerIndex,
-    LayerState,
-    Part,
-    delta_keys,
-    delta_names,
-    key_bytes,
-    key_str,
-    replaced_entries,
 )
-from solera.keys.resolver import Ask, answers, delta_files, request
 from solera.lifecycle import Cancel, Ended
 from solera.objects import Conflict, swap
 from solera.sdk import (
@@ -75,13 +64,11 @@ from solera.stores import (
     WriteContext,
     WriteError,
     check_loaded,
-    prepare_for,
     resolve_env,
 )
 from solera.tasks import Tasks, retrying
 
 from . import batch as core
-from . import each
 from .observed import Observed
 from .reporting import LogShipper, Reporter
 from .sources import reader
@@ -245,14 +232,6 @@ class Ctx:
         # version it runs at (docs/per-key-processing.md §5, docs/versions.md).
         self.key: str | None = None
         self.generation: int | None = None
-
-    def _for_key(self, key: str, generation: int) -> Ctx:
-        """The `ctx` of one per-key call: the same attempt, its key named, its log
-        lines tagged with it."""
-
-        one = copy.copy(self)
-        one.key, one.generation = key, generation
-        return one
 
     def _window(self, project, asset):
         declared = project.manifest["assets"][asset.name]["partitions"]
@@ -424,30 +403,6 @@ async def _resolve_inputs(spec, project, asset, keys_io, timeline, observed: Obs
                     nothing.append(len(planned) > 0 and not classes.any())
                 timeline.add("loaded", param, _rows(args[param]))
                 continue
-            keys = ch["keys"]
-            load = {k: g for k, cls, _, g, _ in keys if cls != "removed"}
-            args[param] = await observed.load(store, ref, t, Keys(load))
-            served = getattr(store, "served", None)
-            each.check_read(store, ref, observed)  # rows and classes: one state
-            classes, seen = each.observe(keys, served)
-            batch[param] = Batch(
-                rows=args[param],
-                added=tuple(classes["added"]),
-                updated=tuple(classes["updated"]),
-                removed=tuple(classes["removed"]),
-                unchanged=tuple(classes["unchanged"]),
-                reset=reset,
-                index=int(ch["index"]),
-                count=int(ch["count"]),
-                final=bool(ch["final"]),
-                upstream=Upstream(ref.output),
-                served={k: v for k, v in seen.items() if v is not None},
-            )
-            delivered[param] = {"observed": seen}
-            if not reset:  # a full run's first batch starts its consumer over, keys or none
-                nothing.append(keys and not any(classes.values()))
-            timeline.add("loaded", param, _rows(args[param]))
-            continue
         if pin.get("load", "data") == "ref":  # decided at registration, as the engine read for it
             args[param] = ref
         else:
@@ -486,10 +441,7 @@ async def _load_whole(load, store, ref, t, keys_io, index_json, key: str | None 
 
     if index_json is None or store.writes != "immutable":
         return await load(store, ref, t, None)
-    if "core" in index_json:  # the new tracking core: the output's layers in the change index
-        pages = core.pages(index_json["core"], REPAIR_PAGE)
-    else:
-        pages = _layer_pages(LayerIndex(keys_io, LayerState.from_json(index_json)))
+    pages = core.pages(index_json["core"], REPAIR_PAGE)  # the output's layers in the change index
     paged = _plain(t)  # a type of the store's own (a DataFrame): one read, which the store makes
     parts, entries = [], {}
     async for page in pages:
@@ -507,17 +459,6 @@ async def _load_whole(load, store, ref, t, keys_io, index_json, key: str | None 
     if all(isinstance(p, Mapping) for p in parts):
         return {k: v for p in parts for k, v in p.items()}
     return [item for p in parts for item in p]
-
-
-async def _layer_pages(index: LayerIndex):
-    """An index's live keys, each with its generation, a page at a time."""
-
-    after = None
-    while True:
-        rows, after = await index.delta(None, after=after, first=REPAIR_PAGE)
-        yield {key_str(r[0]): r[3] for r in rows}
-        if after is None:
-            return
 
 
 def _plain(t) -> bool:
@@ -581,15 +522,10 @@ async def _store_outputs(
         if o.kind == "fenced":
             await store.acquire(o.context(spec, worker_id), o.prior)
 
-    # Prepare and resolve: each keyed write read once, and compared with its key
-    # index as pinned in the spec; its changes are the commit's delta file. Small
-    # writes are resolved by the engine from its cache, all of an attempt's in one
-    # request (docs/resolved-commits.md §4); the rest, and any it declines, here.
+    # Prepare: each keyed write read once; the engine builds its commit from the changes.
     for o in outs.values():
         await _prepare(o, spec, keys_io)
-    asks = [_ask_for(o, spec) for o in outs.values() if o.asks()]
-    engine = await _ask_engine(channel, worker_id, asks)
-    intents, entries = {}, {}
+    entries = {}
     for name, o in list(outs.items()):
         if "core" in o.info and core.unchanged(o) and o.prior is not None:
             if not _schema_due(o):
@@ -597,46 +533,8 @@ async def _store_outputs(
                 del outs[name]
             else:  # no data to write, but migrations to apply: the same content under the new schema
                 o.schema_only = True
-            continue
-        if o.index is None:
-            continue
-        if o.opaque:
-            # Rows the worker never sees: the store reports the whole new key
-            # map once it wrote, so its delta comes after — and needs no repair.
-            # Unknown writes: if this attempt dies after its gate, no key list says what landed
-            # (docs/lifecycle.md §9.6): the next attempt reconciles the whole partition.
-            intents[name] = {
-                **DeltaFiles(Part(), 0, 0, int(spec.get("generation") or 0)).to_json(),
-                "unknown": True,
-            }
-            continue
-        if o.files is None:
-            await _resolve(o, spec, engine.get(name))
-        if not o.files.part.files and o.prior is not None and not o.repairs:
-            if not _schema_due(o):
-                entries[name] = {"unchanged": True}
-                del outs[name]
-                continue
-            # No data to write, but migrations to apply: through the gate, then
-            # the same content under the new schema (§4).
-            o.schema_only = True
-            intents[name] = o.files.to_json()
-            continue
-        intents[name] = o.files.to_json()
-        o.write = dataclasses.replace(_keyed_write(o, keys_io), value=o.value)
-
-    gated = {n for n, o in outs.items() if o.kind != "immutable"}
-    try:
-        if outs:  # only by a worker about to write; a gate only for stores that take one (§2.4, §9.6)
-            await fence({n: i for n, i in intents.items() if n in gated}, bool(gated))
-    except Aborted:
-        # The engine has cleaned up this attempt's delta files; these came after.
-        import obstore
-
-        paths = [outs[n].index.state.path(f) for n, files in intents.items() for f in delta_names(files)]
-        with contextlib.suppress(Exception):
-            await obstore.delete_async(objects, paths)
-        raise
+    if outs:  # only by a worker about to write; a gate only for stores that take one (§2.4, §9.6)
+        await fence({}, any(o.kind != "immutable" for o in outs.values()))
 
     # Write: nothing reaches a store before the fence is ours.
     for name, o in outs.items():
@@ -664,25 +562,11 @@ async def _store_outputs(
             entries[name] = {"ref": dataclasses.replace(ref, handle=handle).to_json()}
             if "core" in o.info:
                 entries[name].update(await core.changes(objects, spec, name, o))
-            else:
-                entries[name]["keys"] = intents[name]
             continue
         written = await writes.call(store.store(o.write or o.value, o.prior, context))
         entry = {}
         if "core" in o.info:
             entry.update(await core.changes(objects, spec, name, o))
-        elif o.index is not None and o.opaque:
-            if written.keys is None:
-                raise StoreError(f"{output.name}: store {store_name!r} reported no keys for an opaque write")
-            files, _ = await o.index.write_replace(
-                chunks=written.keys,
-                name=f"{int(o.info['commit_number']):012d}-{spec['attempt']}",
-                generation=int(spec.get("generation") or 0),
-                replaced=o.kind == "immutable",
-            )
-            entry["keys"] = files.to_json()
-        elif o.index is not None:
-            entry["keys"] = intents[name]
         if written.ref is None:
             continue
         ref = dataclasses.replace(written.ref, store=store_name)
@@ -757,10 +641,6 @@ class _Out:
 
         return not isinstance(self.value, Patch) or self.reset
 
-    @property
-    def repairs(self) -> list:
-        return self.info.get("repairs") or []
-
     def context(self, spec, worker_id) -> WriteContext:
         return WriteContext(
             output=self.output,
@@ -808,175 +688,6 @@ async def _prepare(o: _Out, spec, keys_io) -> None:
         if o.opaque and o.output.incremental:
             raise WriteError(f"{o.output.name}: an opaque write needs a keyed output")
         return
-    o.index = LayerIndex(keys_io, LayerState.from_json(o.info["index"]))
-    if o.opaque:
-        if o.output.is_dynamic_partitions:
-            raise WriteError(f"{o.output.name}: an opaque write needs a table output")
-        return
-    o.prepared = await asyncio.to_thread(prepare_for, o.store, o.value, o.output)
-    if o.replace:
-        return
-    removes = [key_bytes(k) for k in o.prepared.removes]
-    try:
-        o.run = await asyncio.to_thread(SortedEntries.from_rows, o.prepared.rows, removes)
-    except ValueError as e:  # a key both written and removed
-        raise WriteError(f"{o.output.name}: {e}") from e
-    if any(intent.get("unknown") for intent in o.repairs):
-        # A dead opaque writer's keys are unknown (docs/versions.md §5): the index takes
-        # every key the store holds, with this patch on top, and the store writes
-        # this patch's keys, every one.
-        o.files, _ = await _reconcile(o, spec)
-        return
-    if o.repairs:
-        o.intended = frozenset(await _intended(o.info, keys_io, o.repairs))
-        left = [k for k in o.intended if k not in o.prepared.rows and k not in o.prepared.removes]
-        if left:
-            o.run = await _repair(o, sorted(left))
-
-
-async def _resolve(o: _Out, spec, answer) -> None:
-    """The write's delta: the engine's answer, uploaded as this attempt's
-    own; or a replacement streamed against the whole index; or a patch."""
-
-    name = f"{int(o.info['commit_number']):012d}-{spec['attempt']}"
-    generation = int(spec.get("generation") or 0)  # each key's version (docs/versions.md)
-    replaced = o.kind == "immutable"  # its cleanup deletes what each change replaced
-    if answer is not None:
-        o.files, o.changed = await _upload(o.index, name, generation, answer)
-    elif o.replace:
-        o.files, o.changed = await o.index.write_replace(
-            o.prepared.rows, name=name, generation=generation, replaced=replaced, collect=LISTED
-        )
-    else:
-        o.files, o.changed = await o.index.write_patch(
-            o.run, name=name, generation=generation, replaced=replaced, collect=LISTED
-        )
-
-
-def _keyed_write(o: _Out, keys_io) -> KeyedWrite:
-    """What the store is given: the keys it writes, and the keys it
-    deletes — or the write whole."""
-
-    p, changed = o.prepared, o.changed
-    if changed is not None:
-        upserted = frozenset(map(key_str, changed[0]))
-        deleted = frozenset(map(key_str, changed[1]))
-    if o.kind == "immutable":
-        # Every object it writes must be named by an index entry, or nothing ever
-        # collects it: exactly the keys the delta writes, paged from its files
-        # when there are too many to list (docs/lifecycle.md §9.8).
-        if changed is None:
-            return KeyedWrite(
-                p, DeltaKeys(keys_io, o.index.state.prefix, o.files.part, o.files.generation), reset=o.replace
-            )
-        return KeyedWrite(p, upserted, deleted, reset=o.replace)
-    if o.reset or (o.replace and (changed is None or o.repairs)):
-        # A first write, or a replacement with more changes than it lists, or with
-        # dead attempts': the partition rewritten.
-        return KeyedWrite(p, reset=True)
-    if o.replace:
-        return KeyedWrite(p, upserted, deleted)
-    # A patch: its own keys — not those a repair found in the store, which are
-    # there already — and its removes, of keys the index holds or a dead attempt
-    # may have written; past what it lists, all of its own keys.
-    removes = frozenset(p.removes)
-    if changed is None:
-        return KeyedWrite(p, None, removes)
-    return KeyedWrite(p, frozenset(k for k in upserted if k in p.rows), deleted | (removes & o.intended))
-
-
-def _ask_for(o: _Out, spec: dict) -> Ask:
-    run = SortedEntries.from_rows(o.prepared.rows) if o.replace else o.run
-    commit_number = int(o.info["commit_number"])
-    return Ask(
-        o.name,
-        spec["partition"],
-        "replace" if o.replace else "patch",
-        commit_number,
-        int(spec.get("generation") or 0),
-        o.info["index"]["prefix"],
-        commit_number - 1,
-        run,
-    )
-
-
-async def _ask_engine(channel, worker_id, asks: list[Ask]) -> dict[str, tuple[dict, bytes | None]]:
-    """The engine's answers to the outputs it resolved: a delta or "empty".
-    Unreachable, slow, declining: no answer, and the worker resolves itself."""
-
-    if not asks or channel is None or not hasattr(channel, "resolve"):
-        return {}
-    try:
-        body = await asyncio.wait_for(channel.resolve(request(worker_id, asks)), RESOLVE_TIMEOUT)
-        got = answers(body)
-    except Exception:
-        return {}
-    return {name: a for name, a in got.items() if a[0]["result"] in ("delta", "empty")}
-
-
-async def _upload(index: LayerIndex, name: str, generation: int, answer) -> tuple[DeltaFiles, tuple]:
-    """The engine's delta, uploaded as this attempt's own (`name`: its commit and attempt)."""
-
-    a, data = answer
-    if data is None:
-        return DeltaFiles(Part(), 0, 0, generation), ([], [])
-    await index.io.write(index.state.path(f"{name}-0.lay"), data)
-    return delta_files(a, name, generation), delta_keys(data, generation)
-
-
-async def _intended(info, keys_io, repairs) -> list[str]:
-    """The keys dead attempts meant to change (§8): each repair intent
-    names the delta of an attempt that died while writing (`DeltaFiles`),
-    and any of those writes may have landed: every key it writes or removes."""
-
-    prefix, found = info["index"]["prefix"], set()
-    for intent in repairs:
-        delta = DeltaFiles.from_json(intent)
-        for f in delta.part.files:
-            data = await keys_io.read_whole(f"{prefix}{f.name}", f.size)
-            written, removed = delta_keys(data, delta.generation)
-            found.update(map(key_str, written + removed))
-    return sorted(found)
-
-
-async def _repair(o: _Out, left: list[str]) -> SortedEntries:
-    """Take in what dead attempts left in the store (docs/versions.md §5),
-    whose fence this attempt holds: they can write nothing more. Keys this
-    patch writes or removes end as it says either way; of the others
-    (`left`), the store says which it holds (`keys`), never their values. A
-    key it holds takes this attempt's generation — whether or not the dead
-    write landed, it changed — and one it lacks is removed: a tombstone if
-    the index holds it, nothing if not."""
-
-    held: set[str] = set()
-    for i in range(0, len(left), REPAIR_PAGE):
-        page = left[i : i + REPAIR_PAGE]
-        chunks = await asyncio.to_thread(lambda page=page: list(o.store.keys(o.prior, page)))
-        held.update(k for chunk in chunks for k in chunk)
-    keys, payloads = o.prepared.rows.entries()
-    keys += [key_bytes(k) for k in sorted(held)]
-    payloads += [None] * len(held)
-    removes = [key_bytes(k) for k in (*o.prepared.removes, *(k for k in left if k not in held))]
-    return SortedEntries.of(keys, payloads, removes)
-
-
-async def _reconcile(o: _Out, spec):
-    """The delta of a patch over a store a dead opaque writer changed in ways no
-    key list records (docs/versions.md §5): every key the store holds —
-    streamed back sorted a chunk at a time by its `keys` — at this attempt's
-    generation, with the patch's run laid over them (its keys in place of
-    the store's, its removes gone), against the pinned index: a streamed
-    replacement, so a live key the store lacks is removed. Memory is a chunk
-    and the patch."""
-
-    return await o.index.write_replace(
-        chunks=o.store.keys(o.prior, None),
-        overlay=o.run,
-        name=f"{int(o.info['commit_number']):012d}-{spec['attempt']}",
-        generation=int(spec.get("generation") or 0),
-        replaced=o.kind == "immutable",
-        collect=LISTED,
-    )
 
 
 class Writes:
@@ -1110,9 +821,6 @@ async def run_attempt(
         control["cancel"] = record
         if record.phase == "forced":
             on_ended()
-        elif control.get("drain") is not None:
-            # A per-key batch drains (per-key §5): no key starts, finished ones are stored.
-            loop.call_soon_threadsafe(control["drain"].set)
         elif not control["writing"] and not control["stopped"]:
             control["stopped"] = True  # requested: stop computing; a writer drains instead
             loop.call_soon_threadsafe(execution.cancel)
@@ -1294,13 +1002,9 @@ async def _execute(
         failed = _failed(StoreError(mismatch), False)
         failed["error"]["build"] = project.manifest.get("build")  # how this host computed its deploy
         return failed
-    if (cleanup := spec.get("cleanup")) is not None:  # a cleanup task: no asset of its own (§9.8, K25)
+    if (cleanup := spec.get("cleanup")) is not None:  # an output life's leftovers (§9.8, K25)
         try:
-            if "outputs" in cleanup:  # a partition's entries, deleted through its output's store
-                await claim(_stores_of(project, cleanup["asset"]), state)
-                done = await _cleanup_due(cleanup, project, project.assets[cleanup["asset"]], objects, writes)
-                return {"status": "succeeded", "outputs": {}, **done}
-            return await _retire(cleanup, project, writes, state)  # an output life's leftovers
+            return await _retire(cleanup, project, writes, state)
         except Exception as error:  # a store that refused: retried within the task's budget
             return _failed(error, getattr(error, "retryable", True))
     asset = project.assets[spec["asset"]]
@@ -1319,16 +1023,7 @@ async def _execute(
         for name, resource in project.resources.items():
             if name in signature.parameters:
                 args[name] = resolve_env(resource)  # env: secrets resolve in the worker (§5)
-        each_input = next(((p, pin) for p, pin in spec["inputs"].items() if "each" in pin), None)
-        if each_input is not None:
-            control["drain"] = asyncio.Event()
-            ran = await each.run(spec, project, asset, *each_input, args, ctx, keys_io, timeline, control)
-            await observed.close()
-            if "abort" in ran:
-                return _user_failed(ran["abort"], project)
-            value = Result(outputs=ran["values"])
-            delivered[each_input[0]] = ran["delivered"]
-        elif nothing:
+        if nothing:
             # A source served none of the batch's keys that changes anything: the producer
             # has nothing to see, and the batch commits only what it observed.
             return {"status": "succeeded", "skipped": True, "outputs": {}, "delivered": delivered}
@@ -1359,17 +1054,6 @@ async def _execute(
         result = {"status": "succeeded", "outputs": outputs, "delivered": delivered}
         if read := observed.report():
             result["read"] = read
-        if each_input is not None:
-            # A drained batch commits what finished (docs/lifecycle.md §7). Its interrupted
-            # keys follow the cancel record it is sealed with, as latched now — after its
-            # store writes — and the result carries that record, not a later one (§2.2).
-            cancel = control.get("cancel")
-            result.update(await ran["finish"](cancel))
-            result["status"] = "canceled" if ran["drained"] else "succeeded"
-            if cancel is not None:
-                result["cancel"] = cancel.to_json()
-            if ran["skipped"]:
-                result["skipped"] = True
         if cursor is not UNSET:
             result["cursor"] = cursor
         return result
@@ -1377,8 +1061,6 @@ async def _execute(
         return None
     except _Stop:
         raise
-    except each.Moved as moved:  # before the producer ran: nothing written, planned again
-        return {"status": "replan", "error": str(moved), "moved": [moved.output, moved.partition]}
     except StoreError as error:
         return _failed(error, getattr(error, "retryable", False))
     except Exception as error:
@@ -1433,66 +1115,6 @@ def _stores_of(project, asset: str) -> list:
 
     names = {o["store"] for o in project.manifest["assets"][asset]["outputs"]}
     return [project.stores[n] for n in sorted(names)]
-
-
-async def _cleanup_due(spec, project, asset, objects, writes) -> dict:
-    """Clean up what the engine handed this cleanup task (docs/lifecycle.md
-    §9.8) — all past every reader pin — as identity patterns for
-    `store.cleanup` (docs/stores.md § Cleanup), through the store and
-    declaration of the output's asset; the engine runs no store code:
-
-    - a step of the partition's cleanup cursor (`deltas`): the deltas of its
-      commits, in order, each naming the generations its updates and removes
-      replaced — deleted, and the cursor moves past them (`cleaned_to`). A
-      crash before that replays the step: deletes are idempotent;
-    - entries: what attempts that never committed wrote, a value's previous
-      object, an append output's earlier commits (`cleaned_up`).
-
-    Returns what was done, for the result."""
-
-    declared = {o["name"]: o for o in project.manifest["assets"][asset.name]["outputs"]}
-    decls = {o.name or asset.name: o for o in asset.outputs}
-    cleaned_up, cleaned_to = {}, {}
-
-    for name, info in (spec.get("outputs") or {}).items():
-        store = project.stores[declared[name]["store"]]
-        if store.writes != "immutable" or not (info.get("cleanup") or info.get("deltas")):
-            continue
-        clean = functools.partial(
-            store.cleanup, decls[name], home=info.get("home"), partition=spec["partition"]
-        )
-
-        async def delete(patterns, clean=clean):
-            for i in range(0, len(patterns), CLEANUPS_AT_ONCE):
-                await writes.call(asyncio.gather(*(clean(**p) for p in patterns[i : i + CLEANUPS_AT_ONCE])))
-
-        step = info.get("deltas")
-        for d in (step or {}).get("deltas") or ():  # in commit order
-            for f in d["files"]:
-                if not f.endswith(".lay"):
-                    continue
-                data = await _get(objects, f"{d['prefix']}{f}")
-                if data is None:  # kept until the cursor passes it: lost, not owed
-                    raise RuntimeError(f"cleanup of {name}: delta file {d['prefix']}{f} is missing")
-                replaced = replaced_entries(data, int(d["generation"]))
-                await delete([{"key": key_str(k), "generation": g} for k, g in replaced])
-        if step:
-            cleaned_to[name] = int(step["to"])
-        patterns, done = [], []
-        for entry in info.get("cleanup") or ():
-            kind = entry["kind"]
-            if kind in ("abandoned", "version"):  # all an uncommitted attempt wrote; a value's object
-                patterns.append({"generation": entry["generation"]})  # an abandoned delta: the orphan rule
-            elif kind == "commits":  # an append output started over: its earlier commits
-                patterns += [{"key": n} for n in range(int(entry["from"]), int(entry["to"]) + 1)]
-            done.append(entry["id"])
-        await delete(patterns)
-        if done:
-            cleaned_up[name] = done
-    out = {"cleaned_up": cleaned_up} if cleaned_up else {}
-    if cleaned_to:
-        out["cleaned_to"] = cleaned_to
-    return out
 
 
 async def run_pool(pool: str, server: str, token: str | None = None, *, project: str | None = None):

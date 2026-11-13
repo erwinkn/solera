@@ -38,7 +38,7 @@ class Engine:
 
     def __getattr__(self, name):
         async def answer(*args, **kwargs):
-            return b"" if name == "attempt_resolve" else {"work": []} if name == "pool_work" else {}
+            return {"work": []} if name == "pool_work" else {}
 
         return answer
 
