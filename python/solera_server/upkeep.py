@@ -1,12 +1,9 @@
 """Storage upkeep (docs/object-store-state.md §6, §7, §11): background work
 that keeps the object store tidy. The engine never waits on it.
 
-- key indexes: adjacent layers merged by the rule (docs/key-index-design.md
-  § Compaction), on worker threads; the cut raised as readers move on;
-- garbage: files nothing references any more are deleted once the events
-  that let go of them are durable, and no attempt that may read them runs;
-  merge outputs no state ever referenced (their merge failed, or its engine
-  stopped before publishing) are found by listing, every `ORPHAN_SECONDS`;
+- garbage: files nothing references any more (the layers a merge replaced,
+  `tracking.merge`) are deleted once the events that let go of them are
+  durable, and no attempt that may read them runs;
 - retention: finished runs every asset they ran has let go of are deleted;
 - liveness: while runs are in progress, a note every `ALIVE_SECONDS` that
   the engine is up, so the next one knows when it went down.
@@ -22,7 +19,6 @@ import json
 import logging
 import math
 
-from solera.keys.layers import LayerState
 from solera.tasks import Tasks
 
 from . import history
@@ -32,10 +28,6 @@ log = logging.getLogger(__name__)
 
 ALIVE = "engine/alive.json"  # when the engine last said it was up, while runs were in progress
 ALIVE_SECONDS = 30.0
-MERGE_ATTEMPTS = 3  # uploads of one input set, none published, before its index backs off, alarmed
-MERGE_BACKOFF = 600.0  # the first wait after them, doubling with each further upload
-MERGE_BACKOFF_MAX = 4 * 3600.0
-ORPHAN_SECONDS = 600.0
 
 
 class Upkeep:
@@ -55,15 +47,10 @@ class Upkeep:
         self.concurrency = concurrency
         self.retention_interval, self.interval = retention_interval, interval
         self.tasks = Tasks("upkeep")  # its tick
-        self.jobs = Tasks("upkeep jobs")  # merges running, by (index key, lane)
+        self.jobs = Tasks("upkeep jobs")  # the merge running (`tracking.merge`)
         self.failing = {} if failing is None else failing  # what fails now, by name: the engine's
-        self._checked: dict[tuple, LayerState] = {}  # the state last found needing nothing
-        self._busy: dict[
-            tuple, frozenset
-        ] = {}  # the input layers (ids) of each merge running, by (key, lane)
         self._swept = -math.inf
         self._alive = -math.inf
-        self._orphans_at = -math.inf
         self.retiring = asyncio.Lock()  # one retirement at a time
         self._purging = asyncio.Lock()
 
@@ -91,8 +78,6 @@ class Upkeep:
         if self.m.runs and (force or now - self._alive >= ALIVE_SECONDS):
             self._alive = now
             await self.state.put_object(ALIVE, json.dumps({"at": now}).encode())
-
-    # -- key indexes (§6) --------------------------------------------------------------
 
     # -- garbage ---------------------------------------------------------------------
 

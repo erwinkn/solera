@@ -1342,6 +1342,8 @@ class Model:
 
     def _on_Core(self, e):
         self.core.apply(b64decode(e["event"]))
+        # What a merge replaced: deleted once no reader pinned before it still runs.
+        self.garbage.extend([path, self.event_counter] for path in e.get("garbage") or ())
 
     def life(self, output: str, partition: str) -> str | int:
         """Which life of an output a head belongs to: the core's, else the
