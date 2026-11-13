@@ -103,6 +103,47 @@ def test_columns_follow_the_per_key_rule(tmp_path, seed):
         t.apply(t.progress_ops(p, [([], [tuple(x) for x in loaded])])[0])
 
 
+def test_a_store_s_read_at_other_versions_than_planned_is_the_batch_as_loaded(tmp_path):
+    """A table read in place says the version it read each key at. `items`
+    holds k1@1, k2@1 and k3@1, and a consumer that read them at 1 plans all
+    three again at commit 2 (k1, k2 updated to 2; k3 named by the run). The
+    table then says k1@2 as planned, k2@5 (a newer write landed), and no
+    k3: k2 is reported at 5, k3 is removed, and once the batch commits
+    with that report k2 is not owed for commit 3, which wrote it at 5."""
+
+    ix = ChangeIndex(f"file://{tmp_path}")
+    t = Tracking()
+    t.attach(b"items", ix)
+    t.apply(Tracking.event_edge_open(b"e", b"items", True))
+
+    def commit(n: int, keys: list[str]) -> None:
+        t.apply(t.build_commit(b"items", encode_changes(keys, []), version=n, path=f"items/{n}")["event"])
+
+    request = {"inputs": [{"edge": b"e", "conditions": {}}], "limit": 10}
+    commit(1, ["k1", "k2", "k3"])
+    t.apply(t.progress_ops(t.plan(request)["plan"], [([], [])])[0])
+    commit(2, ["k1", "k2"])
+    plan = t.plan({**request, "mode": "keys", "keys": ["k1", "k2", "k3"]})["plan"]
+    planned = PlannedKeys.decode(plan, 0)
+    assert planned.versions() == {"k1": 2, "k2": 2, "k3": 1}
+    classes, loaded = planned.observe(None, {"k1": 2, "k2": 5, "k3": None})
+    assert loaded == [["k2", 5], ["k3", None]]
+    assert {c: list(classes.keys(c)) for c in CLASSES} == {
+        "added": [],
+        "updated": ["k1", "k2"],
+        "removed": ["k3"],
+        "unchanged": [],
+    }
+    same, nothing = planned.observe(None, planned.versions())
+    assert nothing == [] and list(same.keys("unchanged")) == ["k3"]
+    commit(5, ["k2"])
+    t.apply(t.progress_ops(plan, [([], [tuple(x) for x in loaded])])[0])
+    owed = t.plan(request)
+    assert Tracking.plan_keys(owed["plan"], 0)[0] == ["k3"], (
+        "k2 was processed at 5; k3, found absent, is owed"
+    )
+
+
 def test_a_whole_answer_is_read_in_its_order_and_grouped_on_request():
     answer = {
         "b": Loaded([{"id": "b"}, {"id": "b2"}], version="1"),
