@@ -102,7 +102,8 @@ SELECT r.oid IS NOT NULL AS present,
   coalesce((SELECT array_agg(i.relname::text) FROM pg_index x JOIN pg_class i ON i.oid = x.indexrelid
     WHERE x.indrelid = r.oid), '{}') AS indexes,
   coalesce((SELECT array_agg(g.rolname::text) FROM pg_roles g WHERE g.rolname = ANY(%(grants)s)
-    AND NOT (r.oid IS NOT NULL AND has_table_privilege(g.oid, r.oid, 'SELECT'))), '{}') AS ungranted
+    AND NOT (r.oid IS NOT NULL AND has_table_privilege(g.oid, r.oid, 'SELECT'))), '{}') AS ungranted,
+  to_regclass(%(build)s) IS NOT NULL AS building
 FROM (SELECT (SELECT c.oid FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
   WHERE n.nspname = %(schema)s AND c.relname = %(name)s AND c.relkind IN ('r', 'p', 'v', 'f')) AS oid) AS r
 """
@@ -467,13 +468,18 @@ class PostgresStore:
             self._domain(domain, table)
             if fenced:
                 check.execute(*self._check_sql(table, context, write))
-            state.execute(_STATE, self._state_params(table))
+            state.execute(_STATE, self._state_params(table, context.partition if context else ""))
             taken, found = (check.fetchone() if fenced else None), state.fetchone()
         return (self._checked(taken, context) if fenced else None), found
 
-    def _state_params(self, table: str) -> dict:
+    def _state_params(self, table: str, partition: str = "") -> dict:
         schema, name = _split(table)
-        return {"schema": schema, "name": name, "grants": list(self.grants)}
+        return {
+            "schema": schema,
+            "name": name,
+            "grants": list(self.grants),
+            "build": _build(table, partition),  # whether a full run of the partition builds beside
+        }
 
     def _state(self, cur, table: str) -> dict:
         return cur.execute(_STATE, self._state_params(table)).fetchone()
@@ -708,14 +714,14 @@ class PostgresStore:
         full run of one batch is in place too: its write replaces the
         partition in one transaction already.
 
-        Whether a build is open is read from the catalog, under the
-        partition's version check: the check keeps every other writer of the
-        partition out until this transaction ends."""
+        Whether a build is open is read from the catalog with the write's
+        first round trip (`_begin`), under the partition's version check: the
+        check keeps every other writer of the partition out until this
+        transaction ends."""
 
         if context.generation is None:  # outside an attempt, nothing says where a run stands
             return None
-        build = _build(table, context.partition)
-        found = cur.execute("SELECT to_regclass(%s) IS NOT NULL AS open", (build,)).fetchone()["open"]
+        build, found = _build(table, context.partition), state["building"]
         if context.reset and not context.final and state["present"]:
             where, params = self._where_sql(slice_where), [slice_where[k] for k in sorted(slice_where)]
             if cur.execute(f"SELECT EXISTS (SELECT FROM {table} WHERE {where}) AS held", params).fetchone()[

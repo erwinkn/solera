@@ -1571,7 +1571,7 @@ async def test_a_log_s_full_run_in_batches_switches_once_too(store):
 
     out = output(incremental=True, columns={"n": "integer"})
     table, _, _ = store._table(out)
-    old = await store.store(Patch([{"n": 1}]), None, context(out, 1, commit_number=0))
+    old = await store.store(Patch([{"n": 1}]), None, context(out, commit_number=0))
     one = await store.store(
         Patch([{"n": 10}]),
         old.ref,
