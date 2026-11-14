@@ -23,7 +23,7 @@ use crate::stale::Stale;
 /// name) or an edge (consumer partition, input name), encoded by Python.
 pub type Id = Box<[u8]>;
 
-pub const SNAPSHOT_FORMAT: u8 = 5;
+pub const SNAPSHOT_FORMAT: u8 = 6;
 
 /// Whether the core owns `id`: a per-key edge's record outputs
 /// (`outcomes::output_id`, a zero byte first). Their lives follow their
@@ -136,6 +136,7 @@ impl Tracking {
             Part::Outcomes(p) => p.check(self),
             Part::PassStart(p) => p.check(self),
             Part::Rebuild(p) => p.check(self),
+            Part::Forced(p) => p.check(self),
             Part::Watch(p) => p.check(self),
             Part::Witness(p) => p.check(self),
             Part::Merged(p) => p.check(self),
@@ -161,6 +162,7 @@ impl Tracking {
             Part::Outcomes(p) => p.apply(self),
             Part::PassStart(p) => p.apply(self),
             Part::Rebuild(p) => p.apply(self),
+            Part::Forced(p) => p.apply(self),
             Part::Watch(p) => p.apply(self),
             Part::Witness(p) => p.apply(self),
             Part::Merged(p) => p.apply(self),

@@ -424,7 +424,7 @@ fn failed(rt: &tokio::runtime::Runtime, ix: &ChangeIndex, keys: &[&str]) -> Trac
     let f = write(rt, ix, &fid, t.life(&fid), 1, 0, &recs);
     let o = Part::Outcomes(Outcomes {
         edge: key("e"),
-        counts: [0, keys.len() as u64, 0, 0, 0, 0],
+        counts: [0, 0, keys.len() as u64, 0, 0, 0], // FAILED is code 2
         classes: [keys.len() as u64, 0, 0],
         conds: vec![(cid, c)],
         refs: vec![(cid, keys.len() as u64)],

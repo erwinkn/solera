@@ -81,6 +81,7 @@ pub enum Part {
     PassStart(outcomes::PassStart),
     /// B6: a full run of a per-key asset asked for by hand raises its input's rebuild counter.
     Rebuild(outcomes::Rebuild),
+    Forced(outcomes::Forced),
     /// B7: an edge's conditions now.
     Watch(stale::SetWatch),
     /// B7: what a refresh or a notice found for an edge.
@@ -142,6 +143,7 @@ impl Part {
             }
             Part::PassStart(p) => vec![on("outcomes", &p.edge)],
             Part::Rebuild(p) => vec![on("outcomes", &p.edge)],
+            Part::Forced(p) => vec![on("outcomes", &p.edge)],
             Part::Watch(p) => vec![on("edge", &p.edge)],
             Part::Witness(p) => vec![on("witness", &p.edge)],
             Part::Merged(p) => vec![on("output", &p.output)],
@@ -165,6 +167,7 @@ impl Part {
             Part::Outcomes(_) => outcomes::TAG_OUTCOMES,
             Part::PassStart(_) => outcomes::TAG_PASS_START,
             Part::Rebuild(_) => outcomes::TAG_REBUILD,
+            Part::Forced(_) => outcomes::TAG_FORCED,
             Part::Watch(_) => stale::TAG_WATCH,
             Part::Witness(_) => stale::TAG_WITNESS,
             Part::Merged(_) => retain::TAG_MERGED,
@@ -188,6 +191,7 @@ impl Part {
             Part::Outcomes(p) => p.encode(e),
             Part::PassStart(p) => p.encode(e),
             Part::Rebuild(p) => p.encode(e),
+            Part::Forced(p) => p.encode(e),
             Part::Watch(p) => p.encode(e),
             Part::Witness(p) => p.encode(e),
             Part::Merged(p) => p.encode(e),
@@ -211,6 +215,7 @@ impl Part {
             outcomes::TAG_OUTCOMES => Part::Outcomes(outcomes::Outcomes::decode(d)?),
             outcomes::TAG_PASS_START => Part::PassStart(outcomes::PassStart::decode(d)?),
             outcomes::TAG_REBUILD => Part::Rebuild(outcomes::Rebuild::decode(d)?),
+            outcomes::TAG_FORCED => Part::Forced(outcomes::Forced::decode(d)?),
             stale::TAG_WATCH => Part::Watch(stale::SetWatch::decode(d)?),
             stale::TAG_WITNESS => Part::Witness(stale::Witness::decode(d)?),
             retain::TAG_MERGED => Part::Merged(retain::Merged::decode(d)?),

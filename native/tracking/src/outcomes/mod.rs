@@ -21,7 +21,7 @@
 //!
 //! Event parts (tags 0x30-0x3f): [`Outcomes`] with a batch commit,
 //! [`PassStart`] when a retry pass begins, [`Rebuild`] for a full run asked
-//! for by hand (the amended P8).
+//! for by hand (the amended P8), [`Forced`] for a retry asked for by hand.
 
 pub mod commit;
 pub mod transition;
@@ -40,6 +40,7 @@ pub use transition::{eligible, transition, Counters, Kind, Reported, Stored};
 pub const TAG_OUTCOMES: u8 = 0x30;
 pub const TAG_PASS_START: u8 = 0x31;
 pub const TAG_REBUILD: u8 = 0x32;
+pub const TAG_FORCED: u8 = 0x33;
 
 /// The outputs the core keeps for a per-key edge: its records, its retry
 /// clock and its retry pass. Ids starting with a zero byte are the core's;
@@ -226,6 +227,10 @@ pub struct PerKey {
     /// the least a record written since carries (§9's deploy_min), so a
     /// record a deploy or forced request has not retried yet starts a pass.
     pub last: Counters,
+    /// The latest retry asked for by hand, per stored outcome: the
+    /// request's number (0: never asked). A record is due to a request
+    /// numbered above the one its last try ran under (KEY-7).
+    pub forced: [u64; 6],
 }
 
 impl PerKey {
@@ -267,6 +272,9 @@ impl PerKey {
         }
         counters(e, &self.last);
         e.uv(self.life);
+        for f in &self.forced[1..] {
+            e.uv(*f);
+        }
     }
 
     pub(crate) fn decode(d: &mut Dec<'_>) -> Result<PerKey> {
@@ -297,7 +305,7 @@ impl PerKey {
             }),
             t => return format(format!("pass tag {t}")),
         };
-        Ok(PerKey {
+        let mut k = PerKey {
             rebuild,
             conds: Arc::new(conds),
             refs,
@@ -309,7 +317,12 @@ impl PerKey {
             pass,
             last: read_counters(d)?,
             life: d.uv()?,
-        })
+            forced: [0; 6],
+        };
+        for f in &mut k.forced[1..] {
+            *f = d.uv()?;
+        }
+        Ok(k)
     }
 }
 
@@ -713,7 +726,103 @@ impl Rebuild {
     }
 }
 
+/// A retry asked for by hand (KEY-7): the records of the outcomes named
+/// become due at once, whatever their time. `forced` is the edge's request
+/// numbers after it: the outcomes asked for carry the new request's number,
+/// one above the highest before.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Forced {
+    pub edge: Id,
+    pub forced: [u64; 6],
+    /// The edge's outcome life it was asked for in: the numbers start over
+    /// with the records.
+    pub life: u64,
+}
+
+impl Forced {
+    pub fn encode(&self, e: &mut Enc) {
+        e.bytes(&self.edge);
+        for f in &self.forced[1..] {
+            e.uv(*f);
+        }
+        e.uv(self.life);
+    }
+
+    pub fn decode(d: &mut Dec<'_>) -> Result<Forced> {
+        let edge = d.bytes()?.into();
+        let mut forced = [0; 6];
+        for f in &mut forced[1..] {
+            *f = d.uv()?;
+        }
+        Ok(Forced {
+            edge,
+            forced,
+            life: d.uv()?,
+        })
+    }
+
+    pub(crate) fn check(&self, t: &Tracking) -> Result<()> {
+        keyed(t, &self.edge)?;
+        let none = PerKey::default();
+        let k = t.per_key.get(&self.edge).unwrap_or(&none);
+        if self.life != k.life {
+            return invalid("the edge's records started over since the retry was asked for");
+        }
+        let n = k.forced.iter().max().copied().unwrap_or(0) + 1;
+        let moved = |(new, old): (&u64, &u64)| new != old;
+        if self.forced[0] != 0
+            || !self.forced.iter().zip(&k.forced).any(moved)
+            || self
+                .forced
+                .iter()
+                .zip(&k.forced)
+                .filter(|p| moved(*p))
+                .any(|(new, _)| *new != n)
+        {
+            return invalid("a forced retry out of turn");
+        }
+        Ok(())
+    }
+
+    pub(crate) fn apply(self, t: &mut Tracking) {
+        t.per_key.entry(self.edge).or_default().forced = self.forced;
+    }
+}
+
 impl Tracking {
+    /// The part that asks for a retry of the edge's records of `outcomes`
+    /// (stored outcome codes) by hand.
+    pub fn force(&self, edge: &[u8], outcomes: &[u8]) -> Result<Forced> {
+        keyed(self, edge)?;
+        let none = PerKey::default();
+        let k = self.per_key.get(edge).unwrap_or(&none);
+        let n = k.forced.iter().max().copied().unwrap_or(0) + 1;
+        let mut forced = k.forced;
+        if outcomes.is_empty() {
+            return invalid("a forced retry names the outcomes it retries");
+        }
+        for o in outcomes {
+            match forced.get_mut(*o as usize) {
+                Some(f) if *o != 0 => *f = n,
+                _ => return invalid("a forced retry of an outcome that is not stored"),
+            }
+        }
+        Ok(Forced {
+            edge: edge.into(),
+            forced,
+            life: k.life,
+        })
+    }
+
+    /// The counters a retry of the edge runs under at deploy number
+    /// `deploy`: the deploy, and the edge's forced requests.
+    pub fn counters(&self, edge: &[u8], deploy: u64) -> Counters {
+        Counters {
+            deploy,
+            forced: self.per_key.get(edge).map_or([0; 6], |k| k.forced),
+        }
+    }
+
     /// The edge's rebuild counter (0 until a full run is asked for by hand).
     pub fn rebuild(&self, edge: &[u8]) -> u64 {
         self.per_key.get(edge).map_or(0, |k| k.rebuild)
