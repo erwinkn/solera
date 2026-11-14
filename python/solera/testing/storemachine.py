@@ -40,7 +40,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 from ..sdk import Ref
-from ..stores import KeyedWrite, Keys, Patch, StoreError, prepare_for
+from ..stores import KeyedWrite, Keys, Patch, StoreError, in_place, prepare_for
 from .stores import Harness, Ledger, context, said
 
 KEYS = ["a", "b", "c", "d"]
@@ -74,7 +74,7 @@ def stateful(make_harness: Callable[[], Harness]):
             self.loop = asyncio.new_event_loop()
             self.h = make_harness()
             self.store = self.h.store
-            self.kind = self.store.writes
+            self.kind = "fenced" if in_place(self.store) else "immutable"
             self.out = self.h.output(key="id")
             self.ledger = Ledger()  # what the index holds
             self.content: dict[str, str] = {}  # each committed key's `v`

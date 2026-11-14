@@ -1297,7 +1297,7 @@ class Model:
         prepared = launched["prepared"]
         for output, info in (prepared.get("outputs") or {}).items():
             contract = info["contract"]
-            if contract.get("key") is None or contract["writes"] == "immutable":
+            if contract.get("key") is None or not contract.get("in_place"):
                 continue
             if self.reset_at.get(("output", output), 0) > prepared.get("deploy_number", self.deploy_number):
                 continue  # reset since it launched: what it wrote was the old output's

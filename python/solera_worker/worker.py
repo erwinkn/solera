@@ -65,6 +65,7 @@ from solera.stores import (
     WriteError,
     check_loaded,
     frames,
+    in_place,
     resolve_env,
 )
 from solera.tasks import Tasks, retrying
@@ -286,10 +287,10 @@ class Ctx:
             ref, index = Ref.from_json(info["before"]), info.get("index")
             if "core" in info:
                 index = {"core": info["core"]}
-            elif "log" in info and self._stores[ref.store].writes == "immutable":
+            elif "log" in info and not in_place(self._stores[ref.store]):
                 index = {"log": info["log"]["pin"]}
             store = self._stores[ref.store]
-            if store.writes != "immutable" and not info.get("reset") and "log" not in info:
+            if in_place(store) and not info.get("reset") and "log" not in info:
                 # A table is read in place: it may hold what a writer that died before its
                 # commit left. The asset never builds on that (D196 rule 5).
                 value = await _own(store, ref, t, index)
@@ -388,7 +389,7 @@ async def _resolve_inputs(spec, project, asset, keys_io, timeline, observed: Obs
         store = reader(project, ref)
         if "batch" in pin and "log" in pin:  # Incremental over a log: the rows of its next commits
             ch, log = pin["batch"], pin["log"]
-            if store.writes == "immutable":  # the core keeps them
+            if not in_place(store):  # the core keeps them
                 args[param] = frames.materialize(await core.log_read(log, log["from"], log["to"]), t)
             else:  # its store does, each row stamped with its commit
                 args[param] = await observed.load(store, ref, t, Commits(log["from"], log["to"] - 1))
@@ -500,7 +501,7 @@ async def _load_whole(load, store, ref, t, keys_io, index_json, key: str | None 
 
     if index_json is not None and "log" in index_json:  # a log: the rows of every commit it holds
         return frames.materialize(await core.log_read(index_json["log"]), t)
-    if index_json is None or store.writes != "immutable":
+    if index_json is None or in_place(store):
         return await load(store, ref, t, None)
     pages = core.pages(index_json["core"], REPAIR_PAGE)  # the output's layers in the change index
     paged = _plain(t)  # a type of the store's own (a DataFrame): one read, which the store makes
@@ -587,7 +588,7 @@ async def _store_outputs(
         await _prepare(o, spec, keys_io)
     entries = {}
     for name, o in list(outs.items()):
-        if o.final and o.info.get("building") and o.kind != "immutable":
+        if o.final and o.info.get("building") and o.in_place:
             continue  # the last write of a full run built beside its table: it publishes, even empty
         if "log" in o.info and not o.rows and not o.info["log"]["clear"]:
             entries[name] = {"unchanged": True}  # it appends nothing: no commit
@@ -599,7 +600,7 @@ async def _store_outputs(
             else:  # no data to write, but migrations to apply: the same content under the new schema
                 o.schema_only = True
     if outs or dead:  # only by a worker about to write; a gate only for stores that take one (§2.4, §9.6)
-        await fence({}, any(o.kind != "immutable" for o in (*outs.values(), *dead.values())))
+        await fence({}, any(o.in_place for o in (*outs.values(), *dead.values())))
     for o in dead.values():
         await writes.call(core.repair(o, o.context(spec, worker_id)))
 
@@ -607,7 +608,7 @@ async def _store_outputs(
     for name, o in outs.items():
         output, store, store_name = o.output, o.store, declared[name]["store"]
         context = o.context(spec, worker_id)
-        if "log" in o.info and o.kind == "immutable":
+        if "log" in o.info and not o.in_place:
             # The core keeps a log's rows: its commit's layer, for the engine to install.
             layer = await writes.call(core.log_write(spec, o, core.log_parts, o.rows))
             ref = Ref(
@@ -702,8 +703,8 @@ class _Out:
     schema_only: bool = False  # unchanged content, migrations to apply
 
     @property
-    def kind(self) -> str:
-        return self.store.writes
+    def in_place(self) -> bool:
+        return in_place(self.store)
 
     @property
     def prior(self) -> Ref | None:

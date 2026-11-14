@@ -1061,7 +1061,7 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
                 # by it, whatever is served by then.
                 "contract": {
                     "store": output["store"],
-                    "writes": self.manifest["stores"][output["store"]]["writes"],
+                    "in_place": bool(self.manifest["stores"][output["store"]].get("in_place")),
                     "key": output.get("key"),
                     "incremental": output.get("incremental"),
                 },
@@ -1212,14 +1212,10 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
         record = self.manifest["outputs"].get(output) or {}
         store = self.manifest["stores"].get(record.get("store")) or {}
         if is_log(record):  # the core's to read, unless its store keeps the rows
-            if store.get("writes") != "immutable":
+            if store.get("in_place"):
                 return None
             return {"log": output_pin(self.core, output, ref.get("partition") or "")}
-        if (
-            record.get("key") is None
-            or record.get("dynamic_partitions")
-            or store.get("writes") != "immutable"
-        ):
+        if record.get("key") is None or record.get("dynamic_partitions") or store.get("in_place"):
             return None
         return {"core": output_pin(self.core, output, ref.get("partition") or "")}
 

@@ -196,13 +196,13 @@ class Store(Protocol):
     by-key `{key: rows}`, dicts and elements; `solera.stores.frames` reads
     DataFrames and Arrow, for a store that takes them.
 
-    `writes` says how a writer the engine gave up on is kept from writing
-    over a newer one — every store declares one (docs/stores.md):
-    `"immutable"`, it writes only names no other attempt uses; or
-    `"fenced"`, every write transaction checks the attempt's version
-    atomically (`solera.fencing`), and `written_at(versions, prior,
-    context)` says which keys the partition holds at a dead writer's
-    version, for the next attempt to repair (docs/stores.md).
+    A store declares no kind. How it keeps a writer the engine gave up on
+    from writing over a newer one is its own (docs/stores.md): it writes
+    only names no other attempt uses; or it writes in place, every write
+    transaction checks the attempt's version atomically (`solera.fencing`),
+    and `written_at(versions, prior, context)` says which keys the
+    partition holds at a dead writer's version, for the next attempt to
+    repair. Having `written_at` is what tells the engine (`in_place`).
 
     Every store implements `cleanup(output, *, partition, key, generation,
     before)`: delete every object of the output the pattern matches — any field left out matches anything,
@@ -216,7 +216,6 @@ class Store(Protocol):
 
     version: str = "1"
     ref_type: type[Ref] = Ref
-    writes: str  # "immutable" or "fenced"
 
     def can_load(self, t: type | None, selection: type | None) -> bool: ...
     def can_store(self, t: type | None, output: Output) -> bool: ...
@@ -228,7 +227,7 @@ class Store(Protocol):
         self, output: Output, *, partition=None, key=None, generation=None, before=None
     ) -> None: ...
 
-    # fenced:    def keys(self, ref: Ref, among: list[str] | None) -> Iterable[list[str]]
+    # A store that writes in place (`in_place`):
     #            async def written_at(self, versions, prior, context) -> Iterable[list[str]]
     #            (D196: docs/stores.md, "The contract" and "PostgresStore: the version check")
 
@@ -261,6 +260,17 @@ def encode(value: Any) -> tuple[bytes, str]:
     except (TypeError, ValueError):
         pass
     return pickle.dumps(value, protocol=pickle.HIGHEST_PROTOCOL), "pkl"
+
+
+def in_place(store: Any) -> bool:
+    """Whether a store writes in place (a table, a key-value store): its rows
+    are read as they are now, and a writer that died may have left some. Such
+    a store says which keys hold a dead writer's version (`written_at`), and
+    having that method is what tells: a store declares no kind. A store that
+    names every object by the version that wrote it (files) has none, and
+    needs none: nothing reads what a dead writer left there."""
+
+    return callable(getattr(store, "written_at", None))
 
 
 def takes(t: Any, output: Output, *, frames: bool = False, values: bool = True) -> bool:

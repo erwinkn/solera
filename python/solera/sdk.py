@@ -1649,11 +1649,11 @@ class Project:
                         )
                     if annotation is None:
                         raise RegistrationError(f"{name}: store-bound input {param!r} is unannotated (§11)")
-                    from .stores import Commits, Keys
+                    from .stores import Commits, Keys, in_place
 
                     loaded = dict[str, annotation] if input.each else annotation
                     if log:  # the engine keeps a log's rows, unless its store writes in place
-                        if store.writes != "immutable" and not store.can_load(loaded, Commits):
+                        if in_place(store) and not store.can_load(loaded, Commits):
                             raise RegistrationError(
                                 f"{name}: store {upstream['store']} cannot load {annotation} under Commits"
                             )
@@ -1899,28 +1899,21 @@ class Project:
             for name, s in self.sources.items()
         }
         for name, store in self.stores.items():
-            # How a store keeps a writer the engine gave up on from writing over a
-            # newer one (docs/stores.md): it writes only names no one else uses, or
-            # every write checks the attempt's generation — and says which keys a
-            # partition holds, for a repair (docs/versions.md §5). Either kind cleans up
-            # an output removed or moved away from it (K25).
-            writes = getattr(store, "writes", None)
-            needs = {"immutable": ("cleanup",), "fenced": ("written_at", "keys", "cleanup")}.get(writes)
-            if needs is None:
-                raise RegistrationError(
-                    f"store {name!r}: writes must be 'immutable' or 'fenced' (docs/stores.md)"
-                )
-            for method in needs:
+            # One contract, no kinds (STO-1): a write says what it wrote, a load what it
+            # loaded, and a cleanup takes what an output left (K25).
+            for method in ("store", "load", "read", "cleanup"):
                 if not callable(getattr(store, method, None)):
-                    raise RegistrationError(
-                        f"store {name!r}: a {writes} store implements {method}() (docs/stores.md)"
-                    )
+                    raise RegistrationError(f"store {name!r}: a store implements {method}() (docs/stores.md)")
+        from .stores import in_place
+
         store_records = {}
         for name, store in self.stores.items():
             store_records[name] = {
                 "version": getattr(store, "version", "1"),
                 "ref": getattr(getattr(store, "ref_type", None), "kind", None) or "ref",
-                "writes": store.writes,
+                # Its rows are read as they are now, and a dead writer may have left some
+                # (`stores.in_place`): the engine keeps such a writer's version for the repair.
+                "in_place": in_place(store),
                 # How long a removed or moved output's data stays (K25): a week unless it says.
                 "cleanup_after": getattr(store, "cleanup_after", CLEANUP_AFTER).total_seconds(),
             }

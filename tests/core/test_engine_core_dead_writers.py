@@ -28,8 +28,6 @@ class Table(Faults, FileStore):
     version holds, `asked` the versions the engine asked about, `removed`
     the keys a repair deleted."""
 
-    writes = "fenced"
-
     def __init__(self, *args, **kw):
         super().__init__(*args, **kw)
         self.left, self.asked, self.removed = [], [], []

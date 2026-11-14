@@ -8,7 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 from solera.sdk import Incremental, Output, Project, Ref, RegistrationError, Retry, asset
-from solera.stores import Changed, FileStore, Keys, Patch, StoreError, WriteContext
+from solera.stores import Changed, FileStore, Keys, Patch, StoreError, WriteContext, in_place
 from solera.testing.stores import Ledger, context, now, write
 from solera.testing.stores import rows as stored_rows
 
@@ -99,7 +99,7 @@ async def test_sto_6_the_same_attempt_writing_again_is_one_write(store):
     assert await write(h, out, patch, 2, ledger, first, remove=["a"], patch=True) == second
     assert await now(h, second, ledger) == [("b", "2"), ("c", "1")]
 
-    if store.writes == "immutable":
+    if not in_place(store):
         return  # a store of files holds no log: the engine keeps an incremental output's commits
     out = Output(f"t_{uuid.uuid4().hex[:12]}", incremental=True, store="s", **decl)
     commit = [{"id": "a", "v": "1"}]
@@ -435,10 +435,10 @@ def attempts_of(detail: dict, name: str) -> list[dict]:
 
 
 class Plain:
-    """A user's store: FileStore's methods but `hidden`; with `writes` hidden
-    (the default), it declares no kind."""
+    """A user's store: FileStore's methods but `hidden`. It declares no kind,
+    as no store does."""
 
-    def __init__(self, path, hidden=("writes",)):
+    def __init__(self, path, hidden=()):
         self._files, self._hidden = FileStore(path), set(hidden)
 
     def __getattr__(self, name):
