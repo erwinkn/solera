@@ -63,6 +63,7 @@ from .tracking import WALK, Core, Generation, Redeployed, b64, cache_root, outpu
 from .tracking import commit as core_commit
 from .tracking import full as core_full
 from .tracking import merge as core_merge
+from .tracking import outcomes as core_outcomes
 from .tracking import prepare as core_prepare
 from .tracking import sources as core_sources
 from .upkeep import ALIVE, Upkeep
@@ -1335,11 +1336,20 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
         outputs = result.get("outputs") or {}
         built = await core_commit.build(self.core, task, attempt, prepared, result, outputs)
         async with built.locks:  # the outputs it built: their commits are recorded in turn
-            with built.generation:  # checked again where it is recorded (`core_commit.check`)
-                if self.m.claimed(attempt) is not claim:
-                    raise LostOwnership(attempt)
-                self._commit_guards(task, prepared)  # again: the build awaited
-                out = self._install(task, claim, attempt, prepared, result, built, **settle)
+            while True:
+                with built.generation:  # checked again where it is recorded (`core_commit.check`)
+                    if self.m.claimed(attempt) is not claim:
+                        raise LostOwnership(attempt)
+                    self._commit_guards(task, prepared)  # again: the build awaited
+                    try:
+                        out = self._install(task, claim, attempt, prepared, result, built, **settle)
+                        break
+                    except Conflict as error:
+                        if not core_commit.moved(built, error):
+                            raise
+                # A per-key batch's outcomes, built from a state that moved since: built again.
+                await core_commit.rebuild(self.core, built)
+        await core_outcomes.settle(self, [(name, task["partition"]) for name in built.counts])
         await core_sources.record_loads(self, attempt, prepared, result)
         return out
 
@@ -1380,7 +1390,6 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
         # Settled under the contract it was launched with, not today's manifest.
         declared = {name: info["contract"] for name, info in (prepared.get("outputs") or {}).items()}
         more = bool(prepared.get("more"))
-        outcomes = None
         for plan in (prepared.get("plans") or {}).values():
             more = more or not (plan is None or plan["final"] or plan.get("done"))  # the walk goes on
         more = more or bool((built.progress or {}).get("held"))  # keys held back under a rebuild
@@ -1418,16 +1427,19 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
         for name in set(declared) - set(outputs):
             # A per-key batch whose keys all failed writes nothing, and makes no head yet;
             # nor does a batch whose keys the input's patterns all left out.
-            if prepared["outputs"][name]["head"] is None and outcomes is None and not result.get("skipped"):
+            if (
+                prepared["outputs"][name]["head"] is None
+                and result.get("key_outcomes") is None
+                and not result.get("skipped")
+            ):
                 raise Conflict(f"omitted output {name} has no head to keep (§2)", retryable=False)
         commit = {"heads": heads, **self._made(prepared)}
         if built.progress is not None:
             commit["progress"] = {WALK: built.progress}
         commit["final"] = not more and outcome in SUCCESS  # a canceled run has no final commit
-        if outcomes is not None:
-            commit["outcomes"] = outcomes
-            if result.get("key_outcomes"):  # the history reads them from the result (D178)
-                commit["key_outcomes"] = True
+        if result.get("key_outcomes"):  # the history reads them from the result (D178)
+            # with the stored outcome of each key the core made other than its class says
+            commit["key_outcomes"] = {"stored": core_outcomes.stored(result, built.stored)}
         # What the attempt said of each output version, for the history (§7).
         metadata, rows = {}, {}
         for name, entry in outputs.items():
@@ -1474,7 +1486,7 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
             error=error,
             retryable=retryable,
             delay=delay,
-            keys=result.get("keys"),
+            keys=core_outcomes.counts(result, built.stored),
         )
         return {"run": task["run"], "attempt": attempt, "outputs": outputs}
 
@@ -1520,7 +1532,7 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
             event["at"] = self.clock()
             self.core.check_payload(event.get("core"))
             self.state.record(event)
-        self._committed_keys([event])
+        await self._committed_sources([event])
         return {"changed": True, "ref": ref, "run": event["run"]["id"]}
 
     async def _prepare_commit(self, name, version, keys, upsert, remove, by, tags=None, at=None):
@@ -1585,8 +1597,11 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
         event["run"] = run
         return event, ref
 
-    def _committed_keys(self, events: list[dict]) -> None:
-        """Warm the key cache with what recorded source commits installed."""
+    async def _committed_sources(self, events: list[dict]) -> None:
+        """After source commits are recorded: the per-key edges that read them
+        drop the failures gone moot (KEY-3, KEY-12)."""
+
+        await core_outcomes.settle(self, [(e["source"], "") for e in events])
 
     async def _drop_prepared(self, events: list[dict]) -> None:
         """Delete the delta files of prepared commits never recorded."""

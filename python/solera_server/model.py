@@ -1051,8 +1051,12 @@ class Model:
             record["edges"] = {**record.get("edges", {}), **lives}
         for input, progress in (commit.get("progress") or {}).items():  # the run's walk (D155)
             task.setdefault("progress", {})[input] = progress
-        if commit.get("key_outcomes"):  # its keys' rows: the attempt's result holds them
+        if found := commit.get("key_outcomes"):  # its keys' rows: the attempt's result holds them
             row = {"run": e["run"], "attempt": e["attempt"], "asset": asset, "partition": partition, "at": at}
+            if isinstance(found, dict) and found.get(
+                "stored"
+            ):  # what the core made of some, other than their class
+                row["outcome"] = orjson.dumps(found["stored"]).decode()
             self._record("key_outcomes", row)
         for name in changed:
             head = self.heads[(name, partition)]

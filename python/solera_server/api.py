@@ -316,6 +316,49 @@ def create_app(
         runtime = await asset_engine(request, p, name)
         return await runtime.stale_keys(name, partition, after=after, limit=limit)
 
+    @app.get("/api/projects/{p}/assets/{name}/outcomes")
+    async def asset_outcomes(
+        p: str,
+        name: str,
+        request: Request,
+        partition: str | None = None,
+        key: str | None = None,
+        after: str | None = None,
+        limit: int = Query(default=100, ge=1, le=1000),
+    ):
+        """A per-key asset's keys with their latest outcome (KEY-5): `{key,
+        partition, outcome, owed, version, ...}` each, a failing key's record
+        too (tries, since, last, next_at, message). `?outcome=failed&outcome=ok`
+        keeps those; `?key=` that key's rows alone; `?after=` a page's `next`."""
+
+        runtime = await asset_engine(request, p, name)
+        outcomes = [v for v in request.query_params.getlist("outcome") if v]
+        return await runtime.latest_outcomes(
+            name, partition, key=key, outcomes=outcomes, after=after, limit=limit
+        )
+
+    @app.get("/api/projects/{p}/assets/{name}/outcomes/history")
+    async def asset_outcome_history(
+        p: str,
+        name: str,
+        request: Request,
+        partition: str | None = None,
+        key: str | None = None,
+        q: str | None = None,
+        run: str | None = None,
+        before: str | None = None,
+        limit: int = Query(default=100, ge=1, le=1000),
+    ):
+        """The log of what a per-key asset's keys came to (§10), run by run,
+        newest first; repeat `outcome` to match any of several."""
+
+        runtime = await asset_engine(request, p, name)
+        outcomes = [v for v in request.query_params.getlist("outcome") if v]
+        page = await runtime.history.key_outcomes(
+            name, partition=partition, key=key, q=q, outcomes=outcomes, run=run, before=before, limit=limit
+        )
+        return {"asset": name, **page}
+
     @app.get("/api/projects/{p}/outputs/{name}/heads")
     async def output_heads(p: str, name: str, request: Request):
         runtime = await project_engine(request, p)

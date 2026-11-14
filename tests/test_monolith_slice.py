@@ -6,7 +6,7 @@ observes that view, and a per-key asset parses the workbooks one folder
 holds into a table of its own, keyed by path.
 
 Everything a real slice does to the cache is played: a file added, edited,
-deleted, a folder renamed. Skips unless SOLERA_TEST_DATABASE_URL points at a
+deleted, a folder renamed, and a sheet that cannot be parsed. Skips unless SOLERA_TEST_DATABASE_URL points at a
 Postgres server."""
 
 import pytest
@@ -215,9 +215,53 @@ async def test_the_first_slice_follows_the_file_cache(solera, slice_):
     assert parsed == ["f1"]
     assert table() == [(moved, "f1", "s1", 4.0), (moved, "f1", "s9", 4.1)]
 
-    # Nothing changed: nothing is stale, and nothing is parsed.
+    # A sheet that cannot be parsed is recorded, and the others commit all the same.
+    parsed.clear()
+    put(query, sheets, "f5", "d1", "Alumina Density Data Sheet E.xlsx", "2026-11-03T08:00:00Z", None)
+    put(
+        query,
+        sheets,
+        "f6",
+        "d1",
+        "Alumina Density Data Sheet F.xlsx",
+        "2026-11-03T08:00:00Z",
+        [{"sample": "s6", "density": 3.7}],
+    )
+    await synced(solera)
+    bad, good = (f"Alumina Density/Archive 2026/Alumina Density Data Sheet {x}.xlsx" for x in "EF")
+    assert sorted(parsed) == ["f5", "f6"]
+    assert table() == [(moved, "f1", "s1", 4.0), (moved, "f1", "s9", 4.1), (good, "f6", "s6", 3.7)]
+    failing = await solera.outcomes("sga_alumina_density", "rejected", "failed")
+    assert {k: (r["outcome"], r["message"]) for k, r in failing.items()} == {
+        bad: ("rejected", "Unprocessable: not a data sheet")
+    }
+
+    # The run history logs the failure too. The file's version is a timestamp, not a number.
+    [logged] = await solera.key_log("sga_alumina_density")
+    assert (logged["key"], logged["outcome"], logged["error"]) == (
+        bad,
+        "rejected",
+        "Unprocessable: not a data sheet",
+    )
+
+    # Nothing changed: nothing is stale, and nothing is parsed, the bad sheet included.
     parsed.clear()
     await solera.sensors(1)
     assert await solera.stale("sga_alumina_density") == []
     await solera.run("sga_alumina_density")
     assert parsed == []
+
+    # The bad sheet is fixed: it alone is parsed, and its failure goes.
+    put(
+        query,
+        sheets,
+        "f5",
+        "d1",
+        "Alumina Density Data Sheet E.xlsx",
+        "2026-11-04T08:00:00Z",
+        [{"sample": "s5", "density": 3.6}],
+    )
+    await synced(solera)
+    assert parsed == ["f5"]
+    assert await solera.outcomes("sga_alumina_density", "rejected", "failed") == {}
+    assert (bad, "f5", "s5", 3.6) in table()

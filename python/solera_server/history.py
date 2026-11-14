@@ -814,6 +814,7 @@ class History:
             name="History",
             clock=clock,
             volatile=VOLATILE,
+            expand={"key_outcomes": self._attempt_outcomes},
             pin=lambda: state.model.reading("history/"),
             **lake,
         )
@@ -822,6 +823,42 @@ class History:
     @property
     def m(self):
         return self.state.model
+
+    async def _attempt_outcomes(self, values: list) -> list[list]:
+        """A buffered `key_outcomes` row with no key stands for its attempt's
+        failing keys' rows, which the attempt's sealed result holds: the
+        commit journals none of them (up to a batch's 10,000 keys each). Ok
+        calls are not logged one by one (HIS-6). A failing key's row
+        says its class there; it becomes the stored outcome the class makes,
+        or the one the core made of it where they differ (`stored`, which the
+        placeholder's `outcome` holds as JSON). Nothing, if the run was
+        deleted since."""
+
+        from .tracking.outcomes import MADE  # the tracking package imports this module
+
+        names = list(TABLES["key_outcomes"].columns)
+        row = dict(zip(names, values, strict=True))
+        if row["key"] is not None:
+            return [values]
+        result = await self.state.attempt_result(row["run"], row["attempt"]) or {}
+        stored = json.loads(row["outcome"]) if row["outcome"] else {}
+        stamp = {k: row[k] for k in ("run", "attempt", "asset", "partition", "at")}
+        out = []
+        for found in result.get("key_outcomes") or ():
+            if found["outcome"] in (
+                "ok",
+                "removed",
+                "unmatched",
+            ):  # failures are logged, not ok calls (HIS-6)
+                continue
+            found = {**found, **stamp}
+            found["outcome"] = stored.get(found["key"]) or MADE.get(found["outcome"], found["outcome"])
+            # The column is a number: a key an asset wrote has one (its commit's); a source's key
+            # served at a text version (an etag, a timestamp) has none.
+            if not isinstance(found.get("generation"), int):
+                found["generation"] = None
+            out.append([found.get(c) for c in names])
+        return out
 
     def start(self) -> None:
         self.lake.start()
@@ -1186,6 +1223,58 @@ class History:
         last = found[-1] if more and found else None
         cursor = json.dumps([last["at"], last["output"], last["partition"]]) if last else None
         return {"commits": found, "next": cursor}
+
+    async def key_outcomes(
+        self,
+        asset: str,
+        *,
+        partition: str | None = None,
+        key: str | None = None,
+        q: str | None = None,
+        outcomes: list[str] | None = None,
+        run: str | None = None,
+        before: str | None = None,
+        limit: int = 100,
+    ) -> dict:
+        """What the keys of a per-key asset came to (per-key-processing.md §10),
+        newest first: `key` exactly, or keys containing `q` (any case). Rows
+        are appended when a batch commits, so a run in progress shows the
+        batches it has committed. `next` is the `before` cursor of the
+        following page: `[at, partition, key]` as JSON."""
+
+        clauses, params = ["asset = ?"], [asset]
+        for column, value in (("partition", partition), ("key", key), ("run", run)):
+            if value is not None:
+                clauses.append(f'"{column}" = ?')
+                params.append(value)
+        if q:
+            clauses.append("contains(lower(key), lower(?))")
+            params.append(q)
+        if outcomes:
+            clauses.append("list_contains(?::VARCHAR[], outcome)")
+            params.append(list(outcomes))
+        until = None
+        if before:
+            at, at_partition, at_key = json.loads(before)
+            clauses.append('("at" < ? OR ("at" = ? AND (partition > ? OR (partition = ? AND key > ?))))')
+            params.extend([at, at, at_partition, at_partition, at_key])
+            until = math.nextafter(at, math.inf)
+        where = " AND ".join(clauses)
+
+        def work(con):
+            return _dicts(
+                con.execute(
+                    f'SELECT * FROM key_outcomes WHERE {where} ORDER BY "at" DESC, partition, key LIMIT ?',
+                    [*params, limit + 1],
+                )
+            )
+
+        found = await self.query(work, ("key_outcomes",), until=until, run=run, live=False)
+        more = len(found) > limit
+        found = found[:limit]
+        last = found[-1] if more and found else None
+        cursor = json.dumps([last["at"], last["partition"], last["key"]]) if last else None
+        return {"outcomes": found, "next": cursor}
 
     async def lineage(
         self, output: str, partition: str, generation: int, *, downstream: bool = False, depth: int = 5

@@ -1015,7 +1015,7 @@ async def test_key_12_a_key_that_never_succeeded_and_is_removed_upstream_is_owed
     assert await solera.outcomes("checks", *STORED) == {}
     detail = await solera.run("checks")
     assert await solera.commits("checks", detail["request"]["id"]) == []
-    assert all("removed" not in a["keys"] for a in attempts_of(detail, "checks"))
+    assert all("removed" not in a.get("keys", {}) for a in attempts_of(detail, "checks"))
 
 
 # -- KEY-13 (target) ---------------------------------------------------------------

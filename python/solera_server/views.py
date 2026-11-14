@@ -5,13 +5,14 @@ A mixin of the engine, as `Attempts` and `Sensors` are."""
 
 from __future__ import annotations
 
+import json
 from collections import Counter
+
+import orjson
 
 from . import planning
 from .model import BAD_OUTCOME
-
-SCAN = 100  # an outcome listing reads at most this many entries per key it returns
-PAGE = 1000  # keys whose outcomes are derived at a time
+from .tracking import outcomes as core_outcomes
 
 
 class Views:
@@ -130,10 +131,11 @@ class Views:
                     "at": view["at"],
                     "attempt": view["last_attempt"],
                 }
-        for (asset, _), state in self.m.partitions.items():
+        for asset, _, edge in self._each_edges():  # its failing keys, by stored outcome
             if (counts := (out.get(asset) or {}).get("stored_counts")) is not None:
-                for name, n in ((state.get("outcomes") or {}).get("counts") or {}).items():
-                    counts[name] = counts.get(name, 0) + n
+                for name, n in self.m.core.outcome_counts(edge).items():
+                    if n:
+                        counts[name] = counts.get(name, 0) + n
         for output, _ in self.m.repairs:
             if (entry := out.get(owner.get(output))) is not None:
                 entry["repairs"] += 1
@@ -144,6 +146,83 @@ class Views:
     def _each_input(self, asset: str) -> tuple[str, dict] | None:
         inputs = self.manifest["assets"][asset]["inputs"]
         return next(((p, e) for p, e in inputs.items() if e.get("each") is not None), None)
+
+    def _each_edges(self, asset: str | None = None) -> list[tuple[str, str, bytes]]:
+        """The per-key edges the core holds, `(asset, partition, edge)`: of
+        `asset` alone, if named. A per-key partition's outcomes are its edge's."""
+
+        out = []
+        for edge, _ in self.m.core.edges():
+            owner, partition, param = orjson.loads(edge)
+            if owner not in self.manifest["assets"] or asset not in (None, owner):
+                continue
+            if (self._each_input(owner) or (None,))[0] == param:
+                out.append((owner, partition, edge))
+        return sorted(out)
+
+    async def latest_outcomes(
+        self,
+        asset: str,
+        partition: str | None = None,
+        *,
+        key: str | None = None,
+        outcomes=(),
+        after: str | None = None,
+        limit: int = 100,
+    ) -> dict:
+        """A per-key asset's keys with their latest outcome (KEY-5,
+        `tracking.outcomes.latest`), in partition and key order: of
+        `partition` alone, if named; `key`'s rows alone, if named; else a
+        page of the outcomes in `outcomes`, if any. `after` is the previous
+        page's `next`, `[partition, key]` as JSON. `partitions` counts each
+        partition's failing keys by stored outcome."""
+
+        each = self._each_input(asset)
+        if each is None:
+            raise ValueError(f"{asset} has no per-key input: it has no key outcomes")
+        if unknown := set(outcomes) - set(core_outcomes.OUTCOMES):
+            raise ValueError(f"unknown key outcomes: {sorted(unknown)}")
+        start = json.loads(after) if after else None
+        if start is not None and not (isinstance(start, list) and [type(s) for s in start] == [str, str]):
+            raise ValueError("after= takes a page's `next`")
+        edges = [(p, e) for _, p, e in self._each_edges(asset) if partition in (None, p)]
+        rows, nxt = [], None
+        for s, _ in edges:
+            if start is not None and s < start[0]:
+                continue
+            found = await core_outcomes.latest(
+                self,
+                asset,
+                s,
+                each[0],
+                keys=None if key is None else [key],
+                after=start[1] if start is not None and s == start[0] else None,
+                limit=limit - len(rows),
+                outcomes=outcomes,
+            )
+            if found is None:
+                continue
+            rows += found[0]
+            if found[1] is not None:
+                nxt = [s, found[1]]
+                break
+            if len(rows) >= limit:  # the next page goes on after this one's last key
+                nxt = [s, rows[-1]["key"]] if s != edges[-1][0] else None
+                break
+        return {
+            "asset": asset,
+            "partitions": [
+                {
+                    "partition": s,
+                    "stored_counts": {n: c for n, c in self.m.core.outcome_counts(e).items() if c},
+                }
+                for s, e in edges
+            ],
+            "deploy": self.m.deploy_number,
+            "now": self.clock(),
+            "keys": rows,
+            "next": json.dumps(nxt) if nxt else None,
+        }
 
     # -- inputs (§6; per-key-processing.md §11) -----------------------------------------------
 

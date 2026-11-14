@@ -1161,7 +1161,7 @@ async def _execute(
             if each is not None:  # a per-key asset: one call per key
                 each["exists"] = {n for n, info in (spec.get("outputs") or {}).items() if info.get("before")}
                 each["loaded"] = args.pop(each["param"])  # each key's value: one call each
-                value = await core.each(asset, ctx, args, each["param"], each, timeline)
+                value = await core.each(asset, project, ctx, args, each["param"], each, timeline)
             else:
                 timeline.add("computing")
                 value = asset.fn(**args)
@@ -1190,6 +1190,8 @@ async def _execute(
         if each is not None:  # a per-key attempt's keys, by outcome
             result["keys"] = {name: n for name, n in each["keys"].items() if n}
             result["key_outcomes"] = each["rows"]
+            if each["outcomes"]:  # its keys that did not succeed, for the engine to record
+                result["outcomes"] = {each["param"]: each["outcomes"]}
         if read := observed.report():
             result["read"] = read
         if cursor is not UNSET:

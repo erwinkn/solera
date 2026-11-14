@@ -302,7 +302,7 @@ class Sensors:
                 "accepted": accepted,
             },
         )
-        self._committed_keys(prepared)
+        await self._committed_sources(prepared)
         status = "requested" if planned else "committed" if prepared else "advanced"
         self._tick_row(name, claim, status, runs=accepted["runs"])
         return {"accepted": True, "runs": accepted["runs"], "commits": accepted["commits"]}

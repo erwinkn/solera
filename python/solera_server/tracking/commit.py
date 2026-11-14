@@ -10,6 +10,12 @@ input's new piece, points and batch record. Everything joins into one core
 event, which `Engine.commit_attempt` checks and records in one synchronous
 step, inside the same locks. The event names layers and counts, never a list
 of keys.
+
+A per-key batch also commits its keys' outcomes (B6): the keys that did not
+succeed are its input's failed keys, and `progress_ops` builds their records
+into the same event, from the edge's state as it reads it. Should the state
+move before the event is recorded (an upstream commit, a catch-up), its
+progress and outcomes are built again (`rebuild`), its outputs' commits kept.
 """
 
 from __future__ import annotations
@@ -20,10 +26,11 @@ from dataclasses import dataclass, field
 
 import obstore
 from obstore.exceptions import NotFoundError
-from solera._native import Tracking, UnsettledError
+from solera._native import OutcomesMovedError, Tracking, UnsettledError
 
+from ..model import edge_id
 from ..state import Conflict
-from . import Core, Generation, b64, canonical, unb64
+from . import Core, Generation, b64, canonical, outcomes, unb64
 from .loaded import rebuilding
 
 DYNAMIC_KEYS = 1_000_000  # a dynamic partitions output's elements, read from its commit's keys up to this
@@ -42,6 +49,12 @@ class Built:
     partition: str = ""
     generation: Generation | None = None  # the deploy it was built under
     locks: contextlib.AsyncExitStack = field(default_factory=contextlib.AsyncExitStack)
+    # A per-key batch's failing keys, each with the stored outcome the core made of it.
+    stored: dict = field(default_factory=dict)
+    commits: list = field(default_factory=list)  # its outputs' commit events, which a rebuild keeps
+    # What its progress is built from, again if the state moves: (plan, reports, producer, commit, each, params).
+    again: tuple | None = None
+    rebuilds: int = 0
 
     def payload(self) -> dict | None:
         """The commit's `core` field, as the model applies it."""
@@ -131,7 +144,7 @@ async def build(core: Core, task: dict, attempt: str, prepared: dict, result: di
             producer = canonical({"run": task["run"], "attempt": attempt})
             clear = full_run(prepared)
             plan = await plan_of(core, task, attempt, prepared)
-            keyed, logs, reports, ops, foreseen = [], [], [], None, None
+            keyed, logs, reports, ops, foreseen, each = [], [], [], None, None, None
             keyed_outputs = [
                 (name, info, outputs.get(name) or {"unchanged": True})
                 for name, info in sorted((prepared.get("outputs") or {}).items())
@@ -144,14 +157,16 @@ async def build(core: Core, task: dict, attempt: str, prepared: dict, result: di
                 )
                 logs = [p for p, plan in prepared["plans"].items() if (plan or {}).get("kind") == "log"]
                 delivered = result.get("delivered") or {}
+                failed = result.get("outcomes") or {}  # a per-key batch's keys that did not succeed
                 reports = [
                     (
-                        [],
+                        [row[0] for row in failed.get(p) or ()],
                         sorted(map(tuple, (delivered.get(p) or {}).get("loaded") or ())),
                         sorted((delivered.get(p) or {}).get("held") or ()),
                     )
                     for p, _ in keyed
                 ]
+                each = per_key(core, task, attempt, prepared, keyed, failed)
                 # The batch records name the output commit, built after: its number is foreseen,
                 # so the batch costs one call (4 ms per 10k keys), not two.
                 foreseen = next(
@@ -162,7 +177,7 @@ async def build(core: Core, task: dict, attempt: str, prepared: dict, result: di
                     ),
                     None,
                 )
-                ops = await progress(core, plan, reports, producer, foreseen)
+                ops = await progress(core, plan, reports, producer, foreseen, each)
             # Every output lock the batch needs, in the order of the lives' ids, as any other taker of
             # several does: an id is never renamed. Its names are read now, so under the deploy it
             # planned under, or a life would be minted for a name the deploy took away.
@@ -207,13 +222,13 @@ async def build(core: Core, task: dict, attempt: str, prepared: dict, result: di
                 built.counts[name] = {k: found[k] for k in ("commit", "live", "added", "updated", "removed")}
                 if dynamic:
                     built.elements[name] = await elements(core, name, partition, out, found)
+            built.commits = list(events)
             if plan is not None:
                 if first != foreseen:  # an output built nothing, or moved meanwhile
                     # a clear may have come in while the outputs were built
-                    ops = await progress(core, plan, reports, producer, first)
-                moved, records, _ = ops
-                events.insert(0, moved)
-                built.records = [[p, b64(r)] for (p, _), r in zip(keyed, records, strict=True)]
+                    ops = await progress(core, plan, reports, producer, first, each)
+                built.again = (plan, reports, producer, first, each, [p for p, _ in keyed])
+                take(built, ops)
                 some = keyed[0][1] if keyed else prepared["plans"][logs[0]]
                 built.progress = {
                     "batch": some["index"],
@@ -228,7 +243,7 @@ async def build(core: Core, task: dict, attempt: str, prepared: dict, result: di
                 ):
                     built.progress.update(key="", held=True)
                 built.walked = [p for p, _ in keyed] + logs
-            if events:
+            elif events:
                 built.event = Tracking.join(events)
             return built
     except BaseException:
@@ -236,19 +251,96 @@ async def build(core: Core, task: dict, attempt: str, prepared: dict, result: di
         raise
 
 
-async def progress(core: Core, plan: bytes, reports: list, producer: bytes, output_commit) -> tuple:
+def per_key(core: Core, task: dict, attempt: str, prepared: dict, keyed: list, failed: dict) -> dict | None:
+    """A per-key batch's outcomes as `progress` commits them: its per-key
+    input's edge and place in the plan, the keys that did not succeed as the
+    worker reported them, and the conditions the batch was planned under
+    (`prepare.conditions`, from what the attempt was prepared under)."""
+
+    from .prepare import conditions  # prepare imports this module
+
+    inputs = core.m.manifest["assets"][task["asset"]]["inputs"]
+    found = next(((p, plan) for p, plan in keyed if (inputs.get(p) or {}).get("each") is not None), None)
+    if found is None:
+        return None
+    param, plan = found
+    base = {"context": prepared.get("context"), "definition": prepared.get("definition") or ""}
+    return {
+        "edge": edge_id(task["asset"], task["partition"], param),
+        "asset": task["asset"],
+        "by": attempt,
+        "input": plan["core"],
+        "reported": [tuple(row) for row in failed.get(param) or ()],
+        "conditions": conditions(inputs[param], base),
+    }
+
+
+async def progress(
+    core: Core, plan: bytes, reports: list, producer: bytes, output_commit, each: dict | None = None
+) -> tuple:
     """What committing the plan writes to its inputs' edges (`progress_ops`),
     refusing a batch that holds a key back, or whose log started over since
-    it was planned: it read rows the log no longer holds."""
+    it was planned: it read rows the log no longer holds. With `each` (a
+    per-key batch, `per_key`), its keys' outcomes too, once its edge has
+    caught up; refused when the edge's records moved since it was planned."""
 
-    try:
-        ops = await core.run(
-            core.tracking.progress_ops, plan, reports, producer=producer, output_commit=output_commit
-        )
-    except UnsettledError:
-        raise HeldBack("an upstream started over since the batch planned") from None
-    held(ops, reports)
-    return ops
+    for _ in range(outcomes.TRIES):
+        more = {}
+        if each is not None:
+            await outcomes.catch_up(core, each["edge"], each["conditions"], each["asset"])
+            more["outcomes"] = {
+                "input": each["input"],
+                "reported": each["reported"],
+                "conditions": each["conditions"],
+                **outcomes.clock(core, each["edge"], each["asset"], each["by"]),
+            }
+        try:
+            ops = await core.run(
+                core.tracking.progress_ops,
+                plan,
+                reports,
+                producer=producer,
+                output_commit=output_commit,
+                **more,
+            )
+        except OutcomesMovedError:  # the edge moved since it caught up: again
+            continue
+        except UnsettledError as error:  # a log started over, or the edge's records moved, since it planned
+            raise HeldBack(f"planned again: {error}") from None
+        held(ops, reports)
+        return ops
+    raise HeldBack("the per-key records kept moving while the batch's commit was built")
+
+
+def take(built: Built, ops: tuple) -> None:
+    """What `progress_ops` built becomes the batch's: its event, with the
+    outputs' commits after it, its records and its keys' stored outcomes."""
+
+    params = built.again[5]
+    built.event = Tracking.join([ops[0], *built.commits])
+    built.records = [[p, b64(r)] for p, r in zip(params, ops[1], strict=True)]
+    built.stored = ops[3] if len(ops) > 3 else {}
+
+
+def moved(built: Built, error: Exception) -> bool:
+    """Whether a refusal of `built` is of outcomes the state moved under
+    since they were built: then they are built again (`rebuild`), a few
+    times at most."""
+
+    return (
+        isinstance(error.__cause__, OutcomesMovedError)
+        and built.again is not None
+        and built.rebuilds < outcomes.TRIES
+    )
+
+
+async def rebuild(core: Core, built: Built) -> None:
+    """Build a per-key batch's progress and outcomes again, from the state
+    as it is now, its outputs' commits kept."""
+
+    built.rebuilds += 1
+    plan, reports, producer, commit, each, _ = built.again
+    take(built, await progress(core, plan, reports, producer, commit, each))
 
 
 def log_commit(core: Core, name: str, id_: bytes, planned: dict, entry: dict, walk: bool) -> tuple:

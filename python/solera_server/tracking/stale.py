@@ -7,6 +7,8 @@ would, records nothing, and runs as a heavy call."""
 
 from __future__ import annotations
 
+from solera._native import Tracking
+
 from ..model import edge_id, is_log, output_id
 from . import Core, Generation, Redeployed
 from .prepare import conditions
@@ -15,7 +17,9 @@ from .prepare import conditions
 async def owes(core: Core, asset: str, partition: str, input, planner, inputs) -> bool:
     """Whether `input` owes the partition a key: under its patterns and the
     conditions it would be processed under now. An edge the partition has not
-    read owes whatever upstream holds."""
+    read owes whatever upstream holds. A per-key edge's failing key is owed
+    only once its input changes (STA-3, STA-15): retries are not run yet
+    (B6 step 3), so one whose retry would be due is not stale either."""
 
     m = core.m
     upstream = output_id(input.output, input.partition)
@@ -28,13 +32,15 @@ async def owes(core: Core, asset: str, partition: str, input, planner, inputs) -
         return found["live"] > 0
     if is_log(m.manifest["outputs"].get(input.output)):  # the commits after the last it read
         return "log" not in held or found["head"] > held["log"]["through"]
-    core.attach(upstream)
+    core.attach(upstream, *Tracking.outcome_outputs(edge))  # a per-key edge's records, where it has any
     request = {
         "mode": "incremental",
         "reset": False,
         "after": None,
         "limit": 1,
-        "inputs": [{"edge": edge, "conditions": _conditions(core, asset, partition, input, planner, inputs)}],
+        "inputs": [
+            {"edge": edge, "conditions": conditions_now(core, asset, partition, input, planner, inputs)}
+        ],
     }
     generation = Generation(m)
     try:
@@ -46,12 +52,12 @@ async def owes(core: Core, asset: str, partition: str, input, planner, inputs) -
     return bool(summary["inputs"][0]["keys"])
 
 
-def _conditions(core: Core, asset: str, partition: str, input, planner, inputs) -> dict:
+def conditions_now(core: Core, asset: str, partition: str, input, planner, inputs) -> dict:
     """The conditions `input`'s keys would be processed under now."""
 
     definition = core.m.partition(asset, partition).get("definition") or ""
     base = {"context": core.engine._context(planner, inputs), "definition": definition}
-    return conditions(core.engine, input, base)
+    return conditions(input.spec, base)
 
 
 async def owed_keys(
@@ -65,8 +71,8 @@ async def owed_keys(
     edge = edge_id(asset, partition, input.param)
     if core.tracking.edge(edge) is None:
         return None
-    core.attach(output_id(input.output, input.partition))
-    conds, generation = _conditions(core, asset, partition, input, planner, inputs), Generation(core.m)
+    core.attach(output_id(input.output, input.partition), *Tracking.outcome_outputs(edge))
+    conds, generation = conditions_now(core, asset, partition, input, planner, inputs), Generation(core.m)
     try:
         with generation:
             rows, next_ = await core.run(core.tracking.owed, edge, conds, after=after, limit=limit)
