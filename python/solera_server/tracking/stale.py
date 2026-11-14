@@ -10,7 +10,7 @@ from __future__ import annotations
 from solera._native import Tracking
 
 from ..model import edge_id, is_log, output_id
-from . import Core, Generation, Redeployed
+from . import Core, Generation, Redeployed, outcomes
 from .prepare import conditions
 
 
@@ -18,8 +18,8 @@ async def owes(core: Core, asset: str, partition: str, input, planner, inputs) -
     """Whether `input` owes the partition a key: under its patterns and the
     conditions it would be processed under now. An edge the partition has not
     read owes whatever upstream holds. A per-key edge's failing key is owed
-    only once its input changes (STA-3, STA-15): retries are not run yet
-    (B6 step 3), so one whose retry would be due is not stale either."""
+    once its input changes, or once its retry clock reaches it (STA-3,
+    STA-15): a default run would take it."""
 
     m = core.m
     upstream = output_id(input.output, input.partition)
@@ -46,10 +46,11 @@ async def owes(core: Core, asset: str, partition: str, input, planner, inputs) -
     try:
         with generation:
             summary = await core.run(core.tracking.plan, request)
+            owed = bool(summary["inputs"][0]["keys"]) or await outcomes.due_now(core, edge)
         generation.check()
     except Redeployed:  # a deploy while it planned: not known, so owed
         return True
-    return bool(summary["inputs"][0]["keys"])
+    return owed
 
 
 def conditions_now(core: Core, asset: str, partition: str, input, planner, inputs) -> dict:
@@ -66,7 +67,8 @@ async def owed_keys(
     """A page of the keys `input` owes the partition, in key order, and where
     the next page starts: the planner's answer, with no batch made. None
     where the core cannot say: the input has no edge yet, or a deploy came
-    in while it read."""
+    in while it read. A failing key due by its retry clock is owed too, but
+    not listed here (`outcomes.due_keys`)."""
 
     edge = edge_id(asset, partition, input.param)
     if core.tracking.edge(edge) is None:

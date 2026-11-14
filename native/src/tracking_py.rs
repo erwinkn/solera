@@ -312,6 +312,37 @@ impl tr::plan::Hold for NotDue {
     }
 }
 
+/// A plan as `plan` and `retry_plan` return it: its bytes (they go into the
+/// attempt's spec untouched) and a summary of it.
+fn summary<'py>(py: Python<'py>, plan: &Plan) -> PyResult<Bound<'py, PyDict>> {
+    let d = PyDict::new(py);
+    d.set_item("plan", PyBytes::new(py, &plan.encode()))?;
+    d.set_item("lo", plan.range.lo.as_deref().map(|k| key(py, k)))?;
+    d.set_item("hi", plan.range.hi.as_deref().map(|k| key(py, k)))?;
+    let inputs = PyList::empty(py);
+    for p in &plan.inputs {
+        let i = PyDict::new(py);
+        i.set_item("edge", PyBytes::new(py, &p.edge))?;
+        i.set_item("head", p.head)?;
+        i.set_item("keys", p.keys.len())?;
+        i.set_item("held_back", p.held_back.len())?;
+        i.set_item("counts", counts(py, p.counts())?)?;
+        inputs.append(i)?;
+    }
+    d.set_item("inputs", inputs)?;
+    let logs = PyList::empty(py);
+    for l in &plan.logs {
+        let i = PyDict::new(py);
+        i.set_item("edge", PyBytes::new(py, &l.edge))?;
+        i.set_item("head", l.head)?;
+        i.set_item("from", l.from)?;
+        i.set_item("to", l.to)?;
+        logs.append(i)?;
+    }
+    d.set_item("logs", logs)?;
+    Ok(d)
+}
+
 fn one_event(part: Part) -> Vec<u8> {
     Event::of(vec![part]).encode()
 }
@@ -484,9 +515,11 @@ impl Tracking {
     /// the first key), None once a walk has reached the end. A log's edge
     /// has `log` instead of `empty`: `through`, the commit it consumed
     /// through; `walking`, whether its walk from the log's start goes on;
-    /// `restarted`, whether the log started over past what it read.
+    /// `restarted`, whether the log started over past what it read. A
+    /// per-key edge's `pass`: the number of the retry pass under way, if
+    /// any (B6).
     fn edge<'py>(&self, py: Python<'py>, edge: &[u8]) -> PyResult<Option<Bound<'py, PyDict>>> {
-        let (e, life, restarted) = {
+        let (e, life, pass, restarted) = {
             let state = self.state.read().unwrap();
             let Some(e) = state.edges.get(edge).cloned() else {
                 return Ok(None);
@@ -495,11 +528,18 @@ impl Tracking {
                 let input = state.outputs.get(&e.input);
                 l.restarted(input.map_or(&[][..], |o| &o.layers))
             });
-            (e, state.per_key.get(edge).map_or(0, |k| k.life), restarted)
+            let k = state.per_key.get(edge);
+            (
+                e,
+                k.map_or(0, |k| k.life),
+                k.and_then(|k| k.pass.as_ref()).map(|p| p.n),
+                restarted,
+            )
         };
         let d = PyDict::new(py);
         d.set_item("input", PyBytes::new(py, &e.input))?;
         d.set_item("life", life)?;
+        d.set_item("pass", pass)?;
         if let Some(l) = e.progress.log() {
             let log = PyDict::new(py);
             log.set_item("through", l.through)?;
@@ -677,41 +717,156 @@ impl Tracking {
             let req = self::request(request)?;
             let not_due = NotDue::of(request)?;
             let (view, ixs) = self.view(&req)?;
-            let (plan, bytes) = py
+            let plan = py
+                .detach(|| rt().block_on(tr::plan::plan(&view, &req, ixs.as_ref(), &not_due)))
+                .map_err(err)?;
+            summary(py, &plan)
+        })
+    }
+
+    /// B6: the next retry batch of the pass under way on per-key `edge`,
+    /// one of the request's keyed inputs (`due::plan_all`): planned as
+    /// `plan` plans a batch, and summed up the same way. Its range is the
+    /// pass's (`hi` None: the batch ends the pass).
+    fn retry_plan<'py>(
+        &self,
+        py: Python<'py>,
+        edge: Vec<u8>,
+        request: &Bound<'py, PyDict>,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        guard(|| {
+            let req = self::request(request)?;
+            let not_due = NotDue::of(request)?;
+            let (view, retry) = {
+                let state = self.state.read().unwrap();
+                (
+                    state.view(&req).map_err(err)?,
+                    state.retry_view(&edge).map_err(err)?,
+                )
+            };
+            let ixs = self.indexes.read().unwrap().clone();
+            let plan = py
                 .detach(|| {
-                    let plan =
-                        rt().block_on(tr::plan::plan(&view, &req, ixs.as_ref(), &not_due))?;
-                    let bytes = plan.encode();
-                    Ok::<_, tr::Error>((plan, bytes))
+                    rt().block_on(tr::due::plan_all(
+                        ixs.as_ref(),
+                        &retry,
+                        &view,
+                        &req,
+                        &not_due,
+                        req.limit,
+                    ))
                 })
                 .map_err(err)?;
-            let d = PyDict::new(py);
-            d.set_item("plan", PyBytes::new(py, &bytes))?;
-            d.set_item("lo", plan.range.lo.as_deref().map(|k| key(py, k)))?;
-            d.set_item("hi", plan.range.hi.as_deref().map(|k| key(py, k)))?;
-            let inputs = PyList::empty(py);
-            for p in &plan.inputs {
-                let i = PyDict::new(py);
-                i.set_item("edge", PyBytes::new(py, &p.edge))?;
-                i.set_item("head", p.head)?;
-                i.set_item("keys", p.keys.len())?;
-                i.set_item("held_back", p.held_back.len())?;
-                i.set_item("counts", counts(py, p.counts())?)?;
-                inputs.append(i)?;
-            }
-            d.set_item("inputs", inputs)?;
-            let logs = PyList::empty(py);
-            for l in &plan.logs {
-                let i = PyDict::new(py);
-                i.set_item("edge", PyBytes::new(py, &l.edge))?;
-                i.set_item("head", l.head)?;
-                i.set_item("from", l.from)?;
-                i.set_item("to", l.to)?;
-                logs.append(i)?;
-            }
-            d.set_item("logs", logs)?;
-            Ok(d)
+            summary(py, &plan)
         })
+    }
+
+    /// B6: when per-key `edge`'s first retry by its clock comes due (None:
+    /// none), and whether a deploy (number `deploy`) or a retry asked for by
+    /// hand makes one due at once (`due::by_counters`).
+    fn retry_due(
+        &self,
+        py: Python<'_>,
+        edge: Vec<u8>,
+        deploy: u64,
+    ) -> PyResult<(Option<u64>, bool)> {
+        guard(|| {
+            let (view, counters) = {
+                let state = self.state.read().unwrap();
+                (
+                    state.outcome_view(&edge).map_err(err)?,
+                    state.counters(&edge, deploy),
+                )
+            };
+            let ixs = self.indexes.read().unwrap().clone();
+            let next = py
+                .detach(|| rt().block_on(tr::due::next_due(ixs.as_ref(), &edge, &view.due)))
+                .map_err(err)?;
+            Ok((next, tr::due::by_counters(&view, &counters)))
+        })
+    }
+
+    /// B6: the keys due by per-key `edge`'s clock at `now`, sorted: those a
+    /// retry pass begun then would list.
+    fn retry_keys<'py>(
+        &self,
+        py: Python<'py>,
+        edge: Vec<u8>,
+        now: u64,
+    ) -> PyResult<Bound<'py, PyList>> {
+        guard(|| {
+            let view = self
+                .state
+                .read()
+                .unwrap()
+                .outcome_view(&edge)
+                .map_err(err)?;
+            let ixs = self.indexes.read().unwrap().clone();
+            let keys = py
+                .detach(|| {
+                    rt().block_on(tr::due::due_by_clock(ixs.as_ref(), &edge, &view.due, now))
+                })
+                .map_err(err)?;
+            PyList::new(py, keys.iter().map(|k| key(py, k)))
+        })
+    }
+
+    /// B6: the event that begins a retry pass on per-key `edge` at `now`
+    /// (whole seconds), under deploy number `deploy` and the edge's retries
+    /// asked for by hand; `path` is where its key list's layer goes. None
+    /// when nothing is due. Refused while a pass is under way.
+    fn retry_start<'py>(
+        &self,
+        py: Python<'py>,
+        edge: Vec<u8>,
+        now: u64,
+        deploy: u64,
+        path: String,
+    ) -> PyResult<Option<Bound<'py, PyBytes>>> {
+        guard(|| {
+            let (retry, counters) = {
+                let state = self.state.read().unwrap();
+                (
+                    state.retry_view(&edge).map_err(err)?,
+                    state.counters(&edge, deploy),
+                )
+            };
+            let ixs = self.indexes.read().unwrap().clone();
+            let parts = py
+                .detach(|| {
+                    rt().block_on(tr::due::start(
+                        ixs.as_ref(),
+                        &retry.outcomes,
+                        &retry.pass_list,
+                        now,
+                        counters,
+                        &path,
+                    ))
+                })
+                .map_err(err)?;
+            Ok(parts.map(|p| PyBytes::new(py, &Event::of(p).encode())))
+        })
+    }
+
+    /// B6: the event that asks for a retry of per-key `edge`'s keys of the
+    /// stored `outcomes` by hand (KEY-7): each such key is due once.
+    fn event_force<'py>(
+        &self,
+        py: Python<'py>,
+        edge: Vec<u8>,
+        outcomes: Vec<String>,
+    ) -> PyResult<Bound<'py, PyBytes>> {
+        let codes = outcomes
+            .iter()
+            .map(|n| outcome_code(n))
+            .collect::<PyResult<Vec<u8>>>()?;
+        let forced = self
+            .state
+            .read()
+            .unwrap()
+            .force(&edge, &codes)
+            .map_err(err)?;
+        Ok(PyBytes::new(py, &one_event(Part::Forced(forced))))
     }
 
     /// One keyed input's keys, classes and versions, from a plan's bytes.
@@ -814,7 +969,8 @@ impl Tracking {
                                             .into(),
                                     )));
                                 }
-                                Some(state.outcome_view(&p.edge)?)
+                                let counters = state.counters(&p.edge, o.clock.deploy);
+                                Some((state.outcome_view(&p.edge)?, counters))
                             }
                         };
                         let ops = state.progress_ops(&plan, &rs, &producer, output_commit)?;
@@ -822,7 +978,7 @@ impl Tracking {
                     };
                     let mut after = None;
                     let mut parts = vec![];
-                    if let (Some(o), Some(v)) = (&outcomes, &view) {
+                    if let (Some(o), Some((v, counters))) = (&outcomes, &view) {
                         let loaded = rs.get(o.input).map_or(&[][..], |r| &r.loaded[..]);
                         let built = rt().block_on(o.commit(
                             ixs.as_ref(),
@@ -830,6 +986,7 @@ impl Tracking {
                             &plan,
                             loaded,
                             &producer,
+                            *counters,
                             &mut ops,
                         ))?;
                         match built {
@@ -1052,15 +1209,23 @@ impl Tracking {
         )
     }
 
-    /// B6: the ids of a per-key edge's record outputs, `(failures, due)`:
-    /// the core's own, attached to the change index like any output.
+    /// B6: the ids of a per-key edge's record outputs, `(failures, due,
+    /// pass)`: the core's own, attached to the change index like any output.
     #[staticmethod]
     fn outcome_outputs<'py>(
         py: Python<'py>,
         edge: &[u8],
-    ) -> (Bound<'py, PyBytes>, Bound<'py, PyBytes>) {
+    ) -> (
+        Bound<'py, PyBytes>,
+        Bound<'py, PyBytes>,
+        Bound<'py, PyBytes>,
+    ) {
         let id = |kind| PyBytes::new(py, &tr::outcomes::output_id(kind, edge));
-        (id(tr::outcomes::FAILURES), id(tr::outcomes::DUE))
+        (
+            id(tr::outcomes::FAILURES),
+            id(tr::outcomes::DUE),
+            id(tr::outcomes::PASS),
+        )
     }
 
     /// B6: the event that drops a per-key edge's failures gone moot since it
@@ -1092,12 +1257,13 @@ impl Tracking {
                 failures_path,
                 due_path,
             };
-            let view = self
-                .state
-                .read()
-                .unwrap()
-                .outcome_view(&edge)
-                .map_err(err)?;
+            let (view, counters) = {
+                let state = self.state.read().unwrap();
+                (
+                    state.outcome_view(&edge).map_err(err)?,
+                    state.counters(&edge, deploy),
+                )
+            };
             let ixs = self.indexes.read().unwrap().clone();
             let parts = py
                 .detach(|| {
@@ -1105,7 +1271,7 @@ impl Tracking {
                         ixs.as_ref(),
                         &view,
                         &conds,
-                        &clock.ctx(b""),
+                        &clock.ctx(b"", counters),
                     ))
                 })
                 .map_err(err)?;
@@ -1369,7 +1535,7 @@ fn record_dict<'py>(py: Python<'py>, r: &tr::outcomes::Record) -> PyResult<Bound
 }
 
 /// The clock and the layer paths a per-key edge's record commits are
-/// built with. Forced retries are not counted yet: their counters are 0.
+/// built with.
 struct Clock {
     now: f64,
     deploy: u64,
@@ -1392,13 +1558,15 @@ impl Clock {
         })
     }
 
-    fn ctx<'a>(&'a self, producer: &'a [u8]) -> tr::outcomes::commit::Ctx<'a> {
+    /// Under `counters`, the state's (`Tracking::counters`) at the deploy.
+    fn ctx<'a>(
+        &'a self,
+        producer: &'a [u8],
+        counters: tr::outcomes::Counters,
+    ) -> tr::outcomes::commit::Ctx<'a> {
         tr::outcomes::commit::Ctx {
             now: self.now,
-            counters: tr::outcomes::Counters {
-                deploy: self.deploy,
-                forced: [0; 6],
-            },
+            counters,
             retries: self.retries,
             time_ms: self.time_ms,
             producer,
@@ -1474,6 +1642,7 @@ impl OutcomesIn {
         plan: &Plan,
         loaded: &[(Key, Ver)],
         producer: &[u8],
+        counters: tr::outcomes::Counters,
         ops: &mut tr::progress::Ops,
     ) -> tr::Result<Result<(Vec<Part>, Vec<(Key, u8)>), Refused>> {
         use tr::outcomes::{commit as oc, output_id, record_digest, FAILURES};
@@ -1487,7 +1656,7 @@ impl OutcomesIn {
                     .into(),
             )));
         }
-        let ctx = self.clock.ctx(producer);
+        let ctx = self.clock.ctx(producer, counters);
         let fid = output_id(FAILURES, &v.edge);
         let parts = match oc::commit(
             ixs,

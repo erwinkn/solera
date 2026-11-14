@@ -191,4 +191,4 @@ def test_a_batch_whose_records_moved_since_it_was_planned_is_planned_again(tmp_p
 
 
 def test_an_edges_record_outputs_are_named_as_the_core_names_them():
-    assert Tracking.outcome_outputs(b"e") == (b"\x00fe", b"\x00de")
+    assert Tracking.outcome_outputs(b"e") == (b"\x00fe", b"\x00de", b"\x00pe")

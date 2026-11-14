@@ -16,8 +16,13 @@ builds:
   of which the core refuses otherwise, and after each commit of an output a
   per-key edge reads (`settle`), so such a failure goes at once.
 
-Retries coming due (a pass of the retry clock, a deploy's or a forced
-retry) are a later unit's: forced counters are 0 here.
+Failing keys come back in retry passes (KEY-6 to KEY-8), which the core
+starts and plans: a pass is due when the edge's retry clock reaches a key,
+or when a new deploy or a retry asked for by hand (`Tracking.event_force`)
+makes a class of keys due at once. A per-key batch begins one when it is
+due (`begin`); its run then takes turns between new changes and the pass's
+batches (`prepare`). An automated asset with a pass due runs on its own
+(`retry_clock`).
 """
 
 from __future__ import annotations
@@ -47,22 +52,27 @@ def retries(core: Core, asset: str) -> int:
 def clock(core: Core, edge: bytes, asset: str, by: str) -> dict:
     """What a record commit of `edge` is built with: the engine's clock, the
     deploy number, the asset's `retries=`, and where each record output's
-    next layer goes (`Core.path`, under the output's life; 0 before its
-    first commit, which gives it one). Attaches the record outputs."""
+    next layer goes. Attaches the record outputs."""
 
-    failures, due = Tracking.outcome_outputs(edge)
+    failures, due, _ = Tracking.outcome_outputs(edge)
     core.attach(failures, due)
     now = core.engine.clock()
-    out = {
+    return {
         "now": now,
         "deploy": core.m.deploy_number,
         "retries": retries(core, asset),
         "time_ms": int(now * 1000),
+        "failures_path": next_path(core, failures, by),
+        "due_path": next_path(core, due, by),
     }
-    for name, id_ in (("failures_path", failures), ("due_path", due)):
-        found = core.tracking.output(id_) or {"life": 0, "head": 0}
-        out[name] = core.path(found["life"], found["head"] + 1, by)
-    return out
+
+
+def next_path(core: Core, id_: bytes, by: str) -> str:
+    """Where a record output's next layer goes (`Core.path`), under the
+    output's life: 0 before its first commit, which gives it one."""
+
+    found = core.tracking.output(id_) or {"life": 0, "head": 0}
+    return core.path(found["life"], found["head"] + 1, by)
 
 
 def failing(core: Core, edge: bytes) -> bool:
@@ -119,6 +129,81 @@ async def settle(engine, outputs) -> None:
             await catch_up(core, edge, conditions, asset)
         except Exception as error:  # noqa: BLE001 - the commits stand; the edge catches up before it plans
             log.warning("per-key edge %s did not catch up: %s", edge.decode(errors="replace"), error)
+
+
+# -- retries (KEY-6, KEY-7, KEY-8) -----------------------------------------------------------
+
+
+async def begin(core: Core, edge: bytes, by: str) -> bool:
+    """Whether a retry pass is under way on per-key `edge`, beginning one
+    (recorded at once) when one is due now: its keys come due by the
+    edge's clock, or a deploy or a retry asked for by hand makes some due."""
+
+    if core.tracking.edge(edge)["pass"] is not None:
+        return True
+    if not failing(core, edge):
+        return False
+    ids = Tracking.outcome_outputs(edge)
+    core.attach(*ids)
+    now, deploy = int(core.engine.clock()), core.m.deploy_number
+    event = await core.run(core.tracking.retry_start, edge, now, deploy, next_path(core, ids[2], by))
+    if event is None:
+        return False
+    core.record(event)
+    return True
+
+
+# What is due by the retry clock, for staleness (STA-3, STA-15): a read, which begins no
+# pass. What a deploy or a retry asked for by hand makes due is not counted: a code change
+# makes nothing stale (CHG-2), and a retry asked for starts its own runs.
+
+
+async def due_now(core: Core, edge: bytes) -> bool:
+    """Whether a key of per-key `edge` is due by its retry clock now."""
+
+    if not failing(core, edge):
+        return False
+    core.attach(*Tracking.outcome_outputs(edge))
+    next_at, _ = await core.run(core.tracking.retry_due, edge, core.m.deploy_number)
+    return next_at is not None and next_at <= core.engine.clock()
+
+
+async def due_keys(core: Core, edge: bytes) -> list[str]:
+    """Every key of per-key `edge` due by its retry clock now, sorted."""
+
+    if not failing(core, edge):
+        return []
+    core.attach(*Tracking.outcome_outputs(edge))
+    return await core.run(core.tracking.retry_keys, edge, int(core.engine.clock()))
+
+
+async def retry_clock(engine) -> None:
+    """The retry clock (KEY-6): an automated per-key partition with a retry
+    due and nothing in flight runs on its own. One run by hand picks its due
+    keys up on its next run. A partition whose inputs have no head waits:
+    its run could not plan. One whose runs keep failing waits as a change
+    would (`Engine._backing_off`)."""
+
+    core, m = engine.core, engine.m
+    automated = {t for auto in m.automations.values() if auto["enabled"] for t in auto["targets"]}
+    now = engine.clock()
+    for asset, partition, edge in engine._each_edges():
+        if asset not in automated or not failing(core, edge):
+            continue
+        if engine._partition_active(asset, partition) or engine._backing_off(asset, partition):
+            continue
+        core.attach(*Tracking.outcome_outputs(edge))
+        next_at, by_counters = await core.run(core.tracking.retry_due, edge, m.deploy_number)
+        if not (by_counters or (next_at is not None and next_at <= now)):
+            continue
+        try:
+            await engine.submit(
+                [asset], [partition], skip_active=True, skip_missing_inputs=True, by="retry clock"
+            )
+        except Exception as error:  # noqa: BLE001 - one partition's refusal stops no other's
+            engine.failing[f"retry clock {asset}"] = str(error)
+        else:
+            engine.failing.pop(f"retry clock {asset}", None)
 
 
 # -- what a batch's keys came to ------------------------------------------------------------
