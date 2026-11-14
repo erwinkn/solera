@@ -28,17 +28,21 @@ with its commit, and the layer says only that the commit is.
 from __future__ import annotations
 
 import asyncio
+import functools
+import inspect
 import json
 import pickle
 import tempfile
 import time
 from base64 import b64decode, b64encode
 from collections.abc import Mapping
+from concurrent.futures import ThreadPoolExecutor
 
 import obstore
-from solera import lifecycle
+from solera import errors, lifecycle
 from solera._native import PlannedKeys
 from solera.change_index import shared
+from solera.sdk import UNSET, Result
 from solera.stores import KeyedWrite, Patch, StoreError, WriteError, encode, frames, prepare_for
 
 CHANGES_INLINE = 64 << 10  # changed keys' bytes a result carries; past it, a file (N13)
@@ -205,6 +209,123 @@ async def repair(o, context) -> None:
     if lacking:
         prepared = await asyncio.to_thread(prepare_for, o.store, Patch([], remove=lacking), o.output)
         await o.store.store(KeyedWrite(prepared, removes=frozenset(lacking)), o.prior, context)
+
+
+# -- per-key assets --------------------------------------------------------------------
+
+NOT_YET = "on the new tracking core yet"  # what a refusal of something a later unit builds says
+
+
+async def each(asset, ctx, args: dict, param: str, batch: dict, timeline):
+    """A per-key asset's batch (docs/per-key-processing.md §5): the asset is
+    called once for each key of `batch["loaded"]` (key -> its upstream
+    value), `batch["concurrency"]` at a time, with `ctx.key` and
+    `ctx.generation` set for the call. What the calls return becomes one
+    write per output, `Patch({key: value}, remove=[...])`: a key whose call
+    returned None for an output keeps what it had there, one that returned
+    `Patch(None, remove=[ctx.key])` loses its rows, and the keys upstream
+    removed (`batch["removed"]`) lose theirs with no call."""
+
+    loaded, versions = batch["loaded"], batch["versions"]
+    decls = {o.name or asset.name: o for o in asset.outputs}
+    is_async = inspect.iscoroutinefunction(asset.fn)
+    signature = inspect.signature(asset.fn)
+    at_once = max(1, min(int(batch["concurrency"]), len(loaded)))
+    pool = None if is_async else ThreadPoolExecutor(max_workers=at_once)
+    loop, todo, outputs, durations = asyncio.get_running_loop(), iter(list(loaded)), {}, {}
+
+    def split(key: str, value) -> dict:
+        """One call's value per output: a bare value for a single output, or
+        `Result(outputs=...)`."""
+
+        if isinstance(value, Result):
+            if value.cursor is not UNSET:
+                raise errors.Failed("a per-key asset keeps no cursor: its input is its iteration")
+            if unknown := set(value.outputs) - set(decls):
+                raise errors.Failed(f"returned undeclared output {sorted(unknown)[0]!r}")
+            values = dict(value.outputs)
+        elif len(decls) == 1:
+            values = {next(iter(decls)): value}
+        else:
+            raise errors.Failed("a multi-output per-key asset returns Result(outputs={...})")
+        for name, v in values.items():
+            if isinstance(v, Patch) and (v.rows or [str(k) for k in v.remove] != [key]):
+                raise errors.Failed(
+                    f"{name}: a per-key call removes its own key, Patch(None, remove=[ctx.key]), nothing else"
+                )
+        return values
+
+    async def call(key: str) -> None:
+        kwargs = {**args, param: loaded[key]}
+        if "ctx" in signature.parameters:
+            kwargs["ctx"] = ctx._for_key(key, versions.get(key))
+        start = time.monotonic()
+        try:
+            if is_async:
+                value = await asset.fn(**kwargs)
+            else:
+                value = await loop.run_in_executor(pool, functools.partial(asset.fn, **kwargs))
+                if inspect.isawaitable(value):
+                    value = await value
+        finally:
+            durations[key] = time.monotonic() - start
+        outputs[key] = split(key, value)
+
+    async def worker() -> None:
+        """Calls key after key: `concurrency` workers pulling from the batch,
+        never a task per key."""
+
+        for key in todo:
+            try:
+                await call(key)
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                # One bad key must not block the others (KEY-3): its outcome is the core's to
+                # record, which the engine does not ask of it yet.
+                raise StoreError(
+                    f"key {key!r} failed ({type(error).__name__}: {error}): a failing key of a per-key "
+                    f"asset is not recorded {NOT_YET} (build plan B6)"
+                ) from error
+
+    timeline.add("computing")
+    try:
+        await asyncio.gather(*(worker() for _ in range(at_once)))
+    finally:
+        if pool is not None:
+            pool.shutdown(wait=False, cancel_futures=True)
+    timeline.add("computed")
+    groups = {name: {} for name in decls}
+    removes = {name: set(batch["removed"]) for name in decls}
+    for key, values in outputs.items():
+        for name in decls:
+            value = values.get(name)
+            if isinstance(value, Patch):  # an explicit removal of this key
+                removes[name].add(key)
+            elif value is not None:  # None, or not returned: no change for this key
+                groups[name][key] = value
+    batch["keys"] = {"ok": len(outputs), "removed": len(batch["removed"])}  # its keys, by outcome
+    # One row per key, for the history: the version it ran at, how it ended, how long it took.
+    batch["rows"] = [
+        {
+            "key": key,
+            "generation": versions.get(key),
+            "outcome": "ok",
+            "error": None,
+            "duration": round(durations.get(key, 0.0), 6),
+        }
+        for key in sorted(outputs)
+    ] + [
+        {"key": key, "generation": None, "outcome": "removed", "error": None, "duration": 0.0}
+        for key in sorted(batch["removed"])
+    ]
+    return Result(
+        outputs={
+            name: Patch(groups[name], remove=sorted(removes[name] - set(groups[name])))
+            for name in decls
+            if groups[name] or (removes[name] and name in batch["exists"])
+        }
+    )
 
 
 # -- logs ----------------------------------------------------------------------------

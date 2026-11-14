@@ -24,6 +24,8 @@ from . import WALK, Core, Generation, Redeployed, canonical, output_pin
 from .commit import HeldBack
 from .full import dynamic_sets, held
 
+NOT_YET = "on the new tracking core yet"  # what a refusal of something a later unit builds says
+
 
 def conditions(engine, input, base: dict) -> dict:
     """What a keyed input's keys are processed under (§9): its patterns, the
@@ -103,9 +105,18 @@ async def _prepare(core: Core, task: dict, run: dict, attempt: str | None) -> di
     pins = base["pins"]
     keyed = [i for i in base["incremental"] if not engine._log(i)]
     logs = [i for i in base["incremental"] if engine._log(i)]
-    refuse(engine, task, run, keyed)
     # An upstream's new life, or a log that started over, is read in full, from the start.
-    if any(restarted(core, task, i) for i in base["incremental"]):
+    again = any(restarted(core, task, i) for i in base["incremental"])
+    per_key = next((i for i in keyed if i.spec.get("each") is not None), None)
+    if per_key is not None:
+        # A per-key asset starts nothing over (D194): each key keeps its rows until its own
+        # call replaces them, and a new definition makes every key owed through the conditions.
+        if run["mode"] == "full":
+            from ..engine import NonRetryable
+
+            raise NonRetryable(f"a full run of a per-key asset asked for by hand does not run {NOT_YET}")
+        full = base["full"] = False
+    elif again:
         full = base["full"] = True
     progress = {} if full else task.get("progress") or {}
     plans, all_empty, plan_bytes = {}, True, None
@@ -113,6 +124,16 @@ async def _prepare(core: Core, task: dict, run: dict, attempt: str | None) -> di
     if base["incremental"]:
         edges = open_edges(core, task, base["incremental"])
         core.attach(*(output_id(i.output, i.partition) for i in keyed))
+        own = None
+        if per_key is not None:
+            # What the partition holds is its own output's keys: where its edge cannot say
+            # (an upstream's new life), a key it holds that upstream lacks is removed.
+            name = engine.manifest["assets"][task["asset"]]["outputs"][0]["name"]
+            if m.core.output(output_id(name, task["partition"])) is not None:
+                own = output_id(name, task["partition"])
+                core.attach(own)
+            if again and own is not None:
+                core.record(Tracking.event_reset(edges[per_key.param], True))
         after = (mine or {}).get("key")
         mode, named = run_mode(run, keyed)
         if mine is not None and after is None:  # its keyed inputs' walk ended: only its logs go on
@@ -125,7 +146,14 @@ async def _prepare(core: Core, task: dict, run: dict, attempt: str | None) -> di
             "reset": full,
             "after": after,
             "limit": min((int(i.spec["batch_size"]) for i in keyed), default=1),
-            "inputs": [{"edge": edges[i.param], "conditions": conditions(engine, i, base)} for i in keyed],
+            "inputs": [
+                {
+                    "edge": edges[i.param],
+                    "conditions": conditions(engine, i, base),
+                    **({"own": own} if i is per_key and own is not None else {}),
+                }
+                for i in keyed
+            ],
             "logs": [{"edge": edges[i.param], "limit": int(i.spec["batch_size"])} for i in logs],
         }
         try:
@@ -188,6 +216,8 @@ async def _prepare(core: Core, task: dict, run: dict, attempt: str | None) -> di
                 "core": n,
                 "batch": {"index": index, "count": count, "final": own, "reset": full},
             }
+            if input.spec.get("each") is not None:  # one call per key, this many at once
+                pins[input.param]["each"] = input.spec["each"]
             plans[input.param] = {
                 "kind": "core",
                 "core": n,
@@ -241,16 +271,6 @@ def restarted(core: Core, task: dict, input) -> bool:
     return "definition" in m.partition(asset, partition) or any(
         (name, partition) in m.heads for name in outputs
     )
-
-
-def refuse(engine, task: dict, run: dict, keyed: list) -> None:
-    """What the new path does not run yet, refused for good with why: per-key
-    assets (B6)."""
-
-    from ..engine import NonRetryable
-
-    if any(i.spec.get("each") is not None for i in keyed):
-        raise NonRetryable("per-key assets do not run on the new tracking core yet (build plan B6)")
 
 
 async def _more(core: Core, input, edge: bytes, conds: dict, hi: str, full: bool) -> bool:

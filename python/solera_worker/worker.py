@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import copy
 import dataclasses
 import importlib
 import importlib.util
@@ -242,6 +243,13 @@ class Ctx:
         self.key: str | None = None
         self.generation: int | None = None
 
+    def _for_key(self, key: str, generation):
+        """This context for one key's call of a per-key asset."""
+
+        mine = copy.copy(self)
+        mine.key, mine.generation = key, generation
+        return mine
+
     def _window(self, project, asset):
         declared = project.manifest["assets"][asset.name]["partitions"]
         if not declared:
@@ -354,11 +362,11 @@ async def _resolve_inputs(spec, project, asset, keys_io, timeline, observed: Obs
     manifest_asset = project.manifest["assets"][asset.name]
     inputs = manifest_asset["inputs"]
     hints = project.hints[asset.name]  # resolved once, at registration
-    args, batch, delivered = {}, {}, {}
+    args, batch, delivered, each = {}, {}, {}, None
     nothing = []  # per keyed batch: whether a source served none of its classes
     for name, pin in spec["inputs"].items():
         input = inputs.get(name)
-        if input is None or "each" in pin:  # a dep pin: recorded, never bound; a per-key batch: per key
+        if input is None:  # a dep pin: recorded, never bound
             continue
         param = name
         t = hints.get(param)
@@ -407,6 +415,8 @@ async def _resolve_inputs(spec, project, asset, keys_io, timeline, observed: Obs
             ch = pin["batch"]
             reset = bool(ch.get("reset"))
             planned = core.planned(spec, pin)
+            if "each" in pin:  # a per-key asset: its keys' values by key, one call each (`batch.each`)
+                t = dict[str, t]
             served, read = getattr(store, "served", None), None
             if served is None and callable(getattr(store, "read", None)):
                 # A store says the version it read each key at: a table read in place may
@@ -437,6 +447,13 @@ async def _resolve_inputs(spec, project, asset, keys_io, timeline, observed: Obs
                 upstream=Upstream(ref.output),
             )
             delivered[param] = {"loaded": loaded, "held": held} if held else {"loaded": loaded}
+            if "each" in pin:
+                each = {
+                    "param": param,
+                    "versions": planned.versions(),
+                    "removed": list(classes.keys("removed")),
+                    "concurrency": pin["each"]["concurrency"],
+                }
             if not reset:  # keys held back are no reason to skip the producer: its batch is just smaller
                 nothing.append(len(planned) > 0 and not classes.any() and not held)
             timeline.add("loaded", param, _rows(args[param]))
@@ -451,7 +468,7 @@ async def _resolve_inputs(spec, project, asset, keys_io, timeline, observed: Obs
     # Every keyed batch held keys, and a source served none of them that changes
     # anything: nothing to call the producer with; its observations commit.
     delivered["*nothing"] = bool(nothing) and all(nothing)
-    return args, batch, delivered
+    return args, batch, delivered, each
 
 
 async def _own(store, ref, t, index: dict | None):
@@ -1124,7 +1141,9 @@ async def _execute(
                 return None
             return answer.get("held") or {}
 
-        args, batch, delivered = await _resolve_inputs(spec, project, asset, keys_io, timeline, observed, ask)
+        args, batch, delivered, each = await _resolve_inputs(
+            spec, project, asset, keys_io, timeline, observed, ask
+        )
         nothing = delivered.pop("*nothing", False)
         ctx = Ctx(spec, asset, project, objects, batch, shipper, timeline, keys_io, observed)
         signature = inspect.signature(asset.fn)
@@ -1139,11 +1158,16 @@ async def _execute(
             return {"status": "succeeded", "skipped": True, "outputs": {}, "delivered": delivered}
         else:
             await observed.close()  # the inputs' moment ends: a long producer holds no snapshot
-            timeline.add("computing")
-            value = asset.fn(**args)
-            if inspect.isawaitable(value):
-                value = await value
-            timeline.add("computed")
+            if each is not None:  # a per-key asset: one call per key
+                each["exists"] = {n for n, info in (spec.get("outputs") or {}).items() if info.get("before")}
+                each["loaded"] = args.pop(each["param"])  # each key's value: one call each
+                value = await core.each(asset, ctx, args, each["param"], each, timeline)
+            else:
+                timeline.add("computing")
+                value = asset.fn(**args)
+                if inspect.isawaitable(value):
+                    value = await value
+                timeline.add("computed")
         metadata = ctx._recorded(value)
         outputs, cursor = await _store_outputs(
             spec,
@@ -1163,6 +1187,9 @@ async def _execute(
             if values and "ref" in outputs.get(name, {}):
                 outputs[name]["metadata"] = values
         result = {"status": "succeeded", "outputs": outputs, "delivered": delivered}
+        if each is not None:  # a per-key attempt's keys, by outcome
+            result["keys"] = {name: n for name, n in each["keys"].items() if n}
+            result["key_outcomes"] = each["rows"]
         if read := observed.report():
             result["read"] = read
         if cursor is not UNSET:
