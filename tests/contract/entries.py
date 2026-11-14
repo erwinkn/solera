@@ -62,9 +62,6 @@ LATER: dict[str, str] = {
         ],
         "B6 step 4: no route explains a key yet",
     ),
-    "test_key_12_a_key_that_never_succeeded_and_is_removed_upstream_is_owed_nothing": (
-        "reads `keys` of every attempt, which a run's detail leaves out of an attempt with none"
-    ),
     **dict.fromkeys(["CLN", "RST-8", "PAR-6", "ENG-13", "ENG-14"], "B9: retention and upkeep"),
     **dict.fromkeys(["HIS-3", "HIS-5", "HIS-7", "HIS-8"], "B10: lineage"),
 }

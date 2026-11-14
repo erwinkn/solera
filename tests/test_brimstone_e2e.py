@@ -126,12 +126,14 @@ async def test_sharepoint_ingestion_runs_end_to_end(solera, brimstone):
     project, graph, sharepoint, mailer, query = brimstone
     await solera.deploy(project)
 
-    # The site list, then each site's feed: two workbooks at alpha, one at bravo, and a
-    # file that is no QAQC workbook.
+    # The site list, then each site's feed: two workbooks at alpha and an empty one, one
+    # at bravo, and a file that is no QAQC workbook.
     await solera.run("sites")
     sharepoint.write("f1", [sample("s1", 1.0), sample("s2", 2.0)])
     sharepoint.write("f2", [sample("s3", 3.0)])
     sharepoint.write("f3", [sample("s4", 4.0)])
+    sharepoint.files["f9"] = b""
+    graph.touch("alpha", "f9", 1)
     graph.touch("alpha", "f1", 1)
     graph.touch("alpha", "f2", 1)
     graph.touch("alpha", "notes", 1, path="/notes.txt")
@@ -141,13 +143,19 @@ async def test_sharepoint_ingestion_runs_end_to_end(solera, brimstone):
     assert [(e["site"], e["file_id"]) for e in events] == [
         ("alpha", "f1"),
         ("alpha", "f2"),
+        ("alpha", "f9"),
         ("alpha", "notes"),
         ("bravo", "f3"),
     ]
 
-    # One call per workbook, each site's samples in its rows of the table.
+    # One call per workbook, each site's samples in its rows of the table. The empty
+    # workbook is rejected: it is recorded, and the others commit all the same.
     await solera.run("qaqc_samples", partitions="all")
-    assert sorted(sharepoint.reads) == ["f1", "f2", "f3"]
+    assert sorted(sharepoint.reads) == ["f1", "f2", "f3", "f9"]
+    rejected = await solera.outcomes("qaqc_samples", "rejected", "failed")
+    assert {k: (r["partition"], r["outcome"], r["message"]) for k, r in rejected.items()} == {
+        "f9": ("alpha", "rejected", "Unprocessable: empty workbook")
+    }
     rows = query("SELECT site, file_id, sample_id, value FROM qaqc.qaqc_samples ORDER BY sample_id")
     assert [(r["site"], r["file_id"], r["sample_id"]) for r in rows] == [
         ("alpha", "f1", "s1"),
@@ -159,7 +167,8 @@ async def test_sharepoint_ingestion_runs_end_to_end(solera, brimstone):
         "SELECT column_name FROM information_schema.columns WHERE table_name = 'qaqc_samples' AND column_name = 'analyst'"
     )
 
-    # A workbook changes and another is deleted: only those two keys move.
+    # A workbook changes and another is deleted: only those two keys move. The empty
+    # one has not changed, so it is not read again.
     sharepoint.reads.clear()
     sharepoint.write("f1", [sample("s1", 10.0)])
     graph.touch("alpha", "f1", 2)
@@ -178,7 +187,7 @@ async def test_sharepoint_ingestion_runs_end_to_end(solera, brimstone):
     health = query("SELECT site, status, n FROM ops.site_health ORDER BY site, status")
     assert [(h["site"], h["status"], h["n"]) for h in health] == [
         ("alpha", "deleted", 1),
-        ("alpha", "modified", 4),
+        ("alpha", "modified", 5),
         ("bravo", "modified", 1),
     ]
     assert {r["site"] for r in query("SELECT site FROM ops.fleet_dashboard")} == {"alpha", "bravo"}
@@ -192,6 +201,16 @@ async def test_sharepoint_ingestion_runs_end_to_end(solera, brimstone):
     # Nothing changed outside: nothing is stale, and a run has nothing to do.
     for name in ("qaqc_samples", "site_health", "fleet_dashboard", "region_rollup"):
         assert await solera.stale(name) == [], name
+
+    # The empty workbook is filled in: it is read again, and its failure goes.
+    sharepoint.reads.clear()
+    sharepoint.write("f9", [sample("s9", 9.0)])
+    graph.touch("alpha", "f9", 2)
+    await solera.run("graph_delta", partitions="all")
+    await solera.run("qaqc_samples", partitions="all")
+    assert sharepoint.reads == ["f9"]
+    assert await solera.outcomes("qaqc_samples", "rejected", "failed") == {}
+    assert query("SELECT value FROM qaqc.qaqc_samples WHERE file_id = 'f9'") == [{"value": 9.0}]
 
 
 async def test_first_migrations_of_many_partitions_at_once_do_not_collide(own_database):  # noqa: F811
