@@ -236,6 +236,14 @@ async def test_the_first_slice_follows_the_file_cache(solera, slice_):
         bad: ("rejected", "Unprocessable: not a data sheet")
     }
 
+    # The run history logs the failure too. The file's version is a timestamp, not a number.
+    [logged] = await solera.key_log("sga_alumina_density")
+    assert (logged["key"], logged["outcome"], logged["error"]) == (
+        bad,
+        "rejected",
+        "Unprocessable: not a data sheet",
+    )
+
     # Nothing changed: nothing is stale, and nothing is parsed, the bad sheet included.
     parsed.clear()
     await solera.sensors(1)
