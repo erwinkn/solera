@@ -529,9 +529,12 @@ pub async fn commit(
     }));
 
     // A failing key the worker tried at another version than planned keeps
-    // its point: the piece no longer says what it was tried on.
+    // its point: the piece no longer says what it was tried on. So does a
+    // canceled key (KEY-9): its point leaves it owed to the next batch,
+    // where a failure waits for its retry.
+    let canceled = |key: &Key| matches!(next.get(key), Some(Some(r)) if r.stored.outcome == super::transition::CANCELED);
     let needless = |key: &Key, reason: Reason, holding: &Holding| -> bool {
-        if loaded.binary_search_by(|(k, _)| k.cmp(key)).is_ok() {
+        if canceled(key) || loaded.binary_search_by(|(k, _)| k.cmp(key)).is_ok() {
             return false;
         }
         if range_batch {

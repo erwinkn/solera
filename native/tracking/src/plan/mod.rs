@@ -814,7 +814,7 @@ impl Walker<'_> {
     /// holds what the consumer really holds; a key whose failure is moot
     /// (it holds what upstream has now) is not owed, and its record goes
     /// at the commit; a failing key tried at what upstream has now waits
-    /// for its retry: owed, not due.
+    /// for its retry: owed, not due. A canceled key does not wait (KEY-9).
     async fn flush(&self, out: &mut Found<'_>) -> Result<()> {
         let Some((ixs, f)) = self.fails else {
             return Ok(());
@@ -843,7 +843,7 @@ impl Walker<'_> {
                 if out.keep {
                     out.moot.push(p.key.clone());
                 }
-            } else if !owed(&tried, &p.wanted) {
+            } else if rec.waits(&p.key, &f.conds, &p.wanted)? {
                 if out.waiting {
                     out.waits[Class::of(&held, &p.wanted) as usize - 1] += 1;
                 }

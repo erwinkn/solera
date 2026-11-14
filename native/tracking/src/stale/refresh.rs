@@ -579,7 +579,7 @@ fn stale_at(key: &[u8], reason: Reason) -> State {
 
 /// What a failing key's record (B6) says of it with upstream at `version`:
 /// what the consumer holds if the key is owed and not waiting for its retry
-/// (tried at `version` already), else None.
+/// ([`Record::waits`]), else None.
 fn due_by_record(
     r: &Record,
     conds: &Conds,
@@ -589,7 +589,7 @@ fn due_by_record(
 ) -> Result<Option<Holding>> {
     let wanted = Holding::of(version.as_version(), now, key);
     let held = r.held.holding(conds)?;
-    if !owed(&held, &wanted) || !owed(&r.tried(key, conds)?, &wanted) {
+    if !owed(&held, &wanted) || r.waits(key, conds, &wanted)? {
         return Ok(None);
     }
     Ok(Some(held))
