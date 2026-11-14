@@ -541,8 +541,10 @@ async def _store_outputs(
     timeline,
     worker_id=None,
     channel=None,
+    final=True,
 ):
-    """Store each returned output (§4, §6, §8, §9).
+    """Store each returned output (§4, §6, §8, §9). `final`: the batch is the
+    last of its run as far as the worker knows (it held no key back).
 
     Each keyed write is read once; a write that changes nothing (an empty
     patch, a set listed again) is not stored at all and keeps the head. Then
@@ -575,7 +577,8 @@ async def _store_outputs(
         if name not in decls:
             raise StoreError(f"{asset.name}: returned undeclared output {name!r}")
         store = project.stores[declared[name]["store"]]
-        outs[name] = _Out(name, decls[name], store, pinned.get(name) or {}, value)
+        o = outs[name] = _Out(name, decls[name], store, pinned.get(name) or {}, value)
+        o.final = final and bool(o.info.get("final", True))
     # The outputs a dead writer may have left rows in (a table's): repaired before anything is written.
     dead = {name: o for name, o in outs.items() if o.info.get("repairs")}
 
@@ -584,6 +587,8 @@ async def _store_outputs(
         await _prepare(o, spec, keys_io)
     entries = {}
     for name, o in list(outs.items()):
+        if o.final and o.info.get("building") and o.kind != "immutable":
+            continue  # the last write of a full run built beside its table: it publishes, even empty
         if "log" in o.info and not o.rows and not o.info["log"]["clear"]:
             entries[name] = {"unchanged": True}  # it appends nothing: no commit
             del outs[name]
@@ -642,11 +647,14 @@ async def _store_outputs(
         entry = {}
         if "core" in o.info:
             entry.update(await core.changes(objects, spec, name, o))
-        if "log" in o.info:  # a store that writes in place keeps a log's rows: the core, that the commit is
-            entry["layer"] = await writes.call(core.log_write(spec, o, core.log_kept, o.rows))
         if written.ref is None:
             continue
         ref = dataclasses.replace(written.ref, store=store_name)
+        if "log" in o.info:  # a store that writes in place keeps a log's rows: the core, that the commit is
+            if ref == o.prior:  # it appended nothing (a full run's last, empty batch): no commit
+                entries[name] = {"unchanged": True}
+                continue
+            entry["layer"] = await writes.call(core.log_write(spec, o, core.log_kept, o.rows))
         if ref != o.prior:  # a store that wrote nothing gives back its prior: the head stands
             ref = dataclasses.replace(ref, generation=int(spec.get("generation") or 0))
         if schema is not None:
@@ -689,6 +697,7 @@ class _Out:
     files: DeltaFiles | None = None
     changed: tuple | None = None  # ([written key], [removed key]), or None past LISTED
     write: KeyedWrite | None = None
+    final: bool = True  # the write is the last of its run: a full run built beside a table is published
     rows: list | None = None  # what the write appends to a log
     schema_only: bool = False  # unchanged content, migrations to apply
 
@@ -731,6 +740,8 @@ class _Out:
             reset=self.reset,
             generation=spec.get("generation"),
             worker_id=worker_id,
+            building=bool(self.info.get("building")),
+            final=self.final,
         )
 
     def asks(self) -> bool:
@@ -1145,6 +1156,7 @@ async def _execute(
             timeline,
             worker_id,
             shipper.channel,
+            final=not any(isinstance(d, dict) and d.get("held") for d in delivered.values()),
         )
         for name, values in metadata.items():
             if values and "ref" in outputs.get(name, {}):

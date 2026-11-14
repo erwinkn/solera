@@ -1064,12 +1064,14 @@ async def test_sta_13_a_full_run_failed_midway_holds_its_readers_and_raises_an_a
 
 
 @pytest.mark.postgres
-async def test_sta_13_on_a_table_a_batch_in_flight_holds_back_keys_it_loaded_at_another_version(solera):
+async def test_sta_13_on_a_table_a_batch_in_flight_reads_what_it_planned_while_the_rebuild_builds_beside(
+    solera,
+):
     """archive's batch, planned with k3 and k4 updated, loads only once
-    copy's full run has cleared its table and written k1 and k2: it finds k3
-    and k4 absent, at another version than planned, and holds them back.
-    archive keeps their rows and is held while copy is incomplete; once copy
-    completes, and before archive runs again, it still owes them."""
+    copy's full run has committed its first batch. On Postgres that run
+    builds beside the table (STO-8), which still holds the rows the batch
+    planned: it loads them as planned and commits them. archive is then held
+    while copy is incomplete, and catches up once copy completes."""
 
     import os
     import uuid
@@ -1094,25 +1096,14 @@ async def test_sta_13_on_a_table_a_batch_in_flight_holds_back_keys_it_loaded_at_
             await r.feed({"k3": "2", "k4": "2"})
             await solera.run("copy")
             archive = await solera.submit("archive")
-            [stage] = await solera.offered("p")  # launched: k3 and k4 planned as updated
-            run = await r.midway()  # copy's table: k1 and k2 alone
+            await solera.offered("p")  # launched: k3 and k4 planned as updated
+            run = await r.midway()  # copy's build: k1 and k2 alone; its table: every old row
             await solera.work("p", r.project(store, decl, Pool("p")()))
-
-            async def attempts() -> list[dict]:
-                detail = await solera.get(f"/runs/{archive['id']}")
-                [task] = [t for t in detail["tasks"] if t["asset"] == "archive"]
-                return detail["attempts"].get(task["id"], [])
-
-            async def settled() -> bool:
-                return all(a["outcome"] not in ("claimable", "running") for a in await attempts())
-
-            await solera.until(settled)  # copy is still paused mid full run
-            outcomes = [(a["id"], a["outcome"]) for a in await attempts()]
-            assert outcomes == [(stage["attempt"], "succeeded")], outcomes  # it committed, not planned again
-            assert await solera.rows("archive") == {"k1": "1", "k2": "1", "k3": "1", "k4": "1"}
+            assert (await solera.wait(archive))["request"]["status"] == "succeeded"
+            assert await solera.rows("archive") == {"k1": "1", "k2": "1", "k3": "2", "k4": "2"}
             assert INCOMPLETE in await solera.stale("archive")
             await r.finish(run)
-            assert {"k3", "k4"} <= set(await solera.stale_keys("archive"))  # archive has not run again
+            archive = await solera.submit("archive")
             await solera.work("p", r.project(store, decl, Pool("p")()))
             assert (await solera.wait(archive))["request"]["status"] == "succeeded"
             assert await solera.rows("archive") == await solera.rows("copy")

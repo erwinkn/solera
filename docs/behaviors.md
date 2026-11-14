@@ -960,22 +960,19 @@ fails. A `bytes` key fails the write rather than vanishing.
 **STO-8. A program reading a table outside Solera never sees an ordinary output's full run half done.**
 `copy` is on Postgres and holds k1, k2, k3, k4; `items` then removes k3
 and adds k5, and `copy` runs full in batches of 2. Until the run's last
-batch commits, a query outside Solera reads k1 to k4 at their old
-versions; from the switch that follows it on, k1, k2, k4 and k5 at the
-new ones; never a mix. Solera's own readers read the build as it grows,
-under the gate and the hold-back (STA-13). A Solera asset that takes
-`copy` as a `TableRef` and queries it itself reads what outsiders read,
-so the gate holds it until the switch. If publishing fails (a
-constraint only the switch can check, such as a unique index across
-partitions), outsiders keep the old rows and the full run is reported
-failed to publish: its batches all committed, and Solera's own readers
-already read its result. An output's first run is a full run of an
-empty output, and its first batch says `batch.reset` (SEL-9). The one
-exception (Erwin, 2026-11-11): a full run into a partition holding no
-rows has no old rows to keep, so it writes in place. Outsiders may see it
-fill, and a dead first run's partial rows stay visible until the next
-run, which finds rows and builds beside. A full run released after a cancel (STA-13) is published as
-it stands, once no attempt it interrupted is left unrepaired (at the
-asset's next run if the cancel interrupted one). A
-per-key asset's full run (SEL-10) keeps every key readable and changes
-them a batch at a time, outside Solera as inside.
+batch, a query outside Solera reads k1 to k4 at their old versions; from
+the switch, which is part of that last batch's write, k1, k2, k4 and k5
+at the new ones; never a mix. Meanwhile the run's rows sit in a build
+beside the table, which the run alone reads; Solera's other readers wait
+at the gate (STA-13), and an asset that takes `copy` as a `TableRef` and
+queries it itself waits there too. If the switch fails (a constraint
+only the table can check, such as a unique index across partitions), the
+run's last batch fails with it: outsiders keep the old rows, and the run
+fails like any other. An output's first run is a full run of an empty
+output, and its first batch says `batch.reset` (SEL-9). A full run into
+a partition holding no rows has no old rows to keep, so it writes in
+place: outsiders may see it fill, and a dead first run's partial rows
+stay visible until the next run, which finds rows and builds beside. A
+full run of one batch writes in place too: its one write replaces the
+partition at once. A per-key asset's full run (SEL-10) keeps every key
+readable and changes them a batch at a time, outside Solera as inside.

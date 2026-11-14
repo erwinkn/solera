@@ -657,3 +657,46 @@ async def test_sto_5_a_table_never_holds_a_row_its_log_does_not_have(solera, tab
     read = await solera.loaded("items")
     assert in_table(read) == {"a": ["2"], "b": ["1"]}
     assert read.versions == await solera.keys("items")
+
+
+# -- STO-8 ------------------------------------------------------------------------
+
+
+@pytest.mark.postgres
+async def test_sto_8_a_reader_outside_solera_never_sees_a_full_run_half_done(solera):
+    """`copy`, on Postgres, holds k1 to k4; `items` removes k3 and adds k5,
+    and `copy` runs full in two batches. A query of the table reads the four
+    old rows, at their old versions, while the second batch runs; once the
+    run is over, k1, k2, k4 and k5 at the run's versions; never a mix."""
+
+    if not DSN:
+        pytest.skip("SOLERA_TEST_DATABASE_URL is not set")
+    import psycopg
+    from solera_postgres import PostgresStore
+
+    from tests.contract.test_sta import Rebuild
+
+    schema = f"contract_{uuid.uuid4().hex[:10]}"
+    decl = {"schema": schema, "columns": {"id": "text", "v": "text"}}
+
+    def outside() -> dict:
+        with psycopg.connect(DSN, autocommit=True) as conn:
+            return dict(conn.execute(f'SELECT id, _version FROM "{schema}"."copy"').fetchall())
+
+    try:
+        async with Rebuild(solera) as r:
+            await r.start(store=PostgresStore("env:SOLERA_TEST_DATABASE_URL"), decl=decl)
+            old = outside()
+            assert sorted(old) == ["k1", "k2", "k3", "k4"]
+            run = await r.midway()  # its first batch committed k1 and k2; its second has begun
+            assert outside() == old, "outsiders keep every old row until the run's last batch"
+            assert (await r.finish(run))["request"]["status"] == "succeeded"
+            new = outside()
+            assert sorted(new) == ["k1", "k2", "k4", "k5"]
+            assert min(new.values()) > max(old.values()), "every row is the run's"
+            assert await solera.rows("copy") == dict.fromkeys(new, "1")
+            await solera.run(["archive", "summary"])
+            assert await solera.rows("archive") == await solera.rows("copy")
+    finally:
+        with psycopg.connect(DSN, autocommit=True) as conn:
+            conn.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')

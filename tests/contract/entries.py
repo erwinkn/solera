@@ -16,8 +16,6 @@ PENDING: dict[str, str] = {
     "another): B10 adds it; STO-3's tests check that such a key is processed as loaded",
     "RST-8": "what a removed consumer's retained runs keep is only observable as their batches' per-key "
     "lineage (HIS-5's question, asked of a removed asset), which no route serves: B10, with B9's cut",
-    "STO-8": "B8 builds the store's build and switch and the engine's full_run_ended hook (D211); until "
-    "then the model checks the rule (tests/tracking: test_outsiders_read_copys_full_run_all_old_then_all_new)",
     "ENG-16": "needs a namespace in an older state format, and the contract has none to open: making one "
     "means writing the engine's journal by hand, which no user does and the harness may not",
 }
