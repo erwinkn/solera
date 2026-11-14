@@ -1013,6 +1013,15 @@ class PostgresStore:
     # -- migrations (§4) --------------------------------------------------------
 
     def _ensure_ledger(self, cur):
+        """The migrations ledger, made once: two first migrations making it
+        at once would collide (`CREATE TABLE IF NOT EXISTS` does not take
+        turns), so they do, and the second finds it there."""
+
+        if not cur.execute("SELECT to_regclass(%s) IS NULL AS missing", (LEDGER_TABLE,)).fetchone()[
+            "missing"
+        ]:
+            return
+        cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (LEDGER_TABLE,))
         cur.execute(
             f"CREATE TABLE IF NOT EXISTS {LEDGER_TABLE} ("
             "relation text NOT NULL, name text NOT NULL, "
