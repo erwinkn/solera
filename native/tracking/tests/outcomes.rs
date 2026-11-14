@@ -40,7 +40,7 @@ use solera_tracking::event::{Event, Part};
 use solera_tracking::lineage::{self, Answer};
 use solera_tracking::outcomes::commit::{self as oc, records, Ctx};
 use solera_tracking::outcomes::transition::{
-    eligible, transition, Counters, Kind, Reported, Stored, FAILED,
+    eligible, transition, Counters, Kind, Reported, Stored, CANCELED, FAILED,
 };
 use solera_tracking::outcomes::{output_id, record_digest, Rebuild, FAILURES};
 use solera_tracking::plan::{self, InputRequest, Mode, NoHold, OneIndex, Request};
@@ -293,10 +293,12 @@ impl World {
         Holding::of(self.log.at(self.log.head(), k).as_version(), &self.now, k)
     }
 
+    /// A failing key tried on what upstream has now waits for its retry. A
+    /// canceled key never does (KEY-9): the next batch takes it.
     fn waiting(&self, k: &[u8]) -> bool {
         self.fails
             .get(k)
-            .is_some_and(|f| !owed(&f.tried, &self.wanted(k)))
+            .is_some_and(|f| f.stored.outcome != CANCELED && !owed(&f.tried, &self.wanted(k)))
     }
 
     fn owed(&self) -> Vec<Key> {
@@ -1689,7 +1691,8 @@ fn a_retry_batch_belongs_to_its_pass() {
         .unwrap();
     let ix = index(&rt);
     rt.block_on(async {
-        let mut w = world(7);
+        // A seed under which no key ends canceled (checked below).
+        let mut w = world(3);
         w.now = Arc::new(Conditions {
             definition: b"d1".as_slice().into(),
             ..Default::default()
@@ -1735,6 +1738,9 @@ fn a_retry_batch_belongs_to_its_pass() {
             .await
             .expect("the pass's batch commits");
         assert!(w.t.per_key[EDGE.as_bytes()].pass.is_none());
+        // A canceled key keeps a point (KEY-9), and progress would refuse the
+        // old batch for it before the pass is looked at.
+        assert!(w.fails.values().all(|f| f.stored.outcome != CANCELED));
         let (v, f) = start(&mut w);
         let list = w.t.retry_view(EDGE.as_bytes()).unwrap().pass_list;
         let parts = due::start(
@@ -2740,7 +2746,7 @@ impl Side {
     fn waiting(&self, k: &[u8], now: &Arc<Conditions>) -> bool {
         self.fails
             .get(k)
-            .is_some_and(|f| !owed(&f.tried, &self.wanted(k, now)))
+            .is_some_and(|f| f.stored.outcome != CANCELED && !owed(&f.tried, &self.wanted(k, now)))
     }
 
     fn unsettled(&self, planned: u64) -> bool {
@@ -3885,5 +3891,41 @@ fn a_retry_asked_for_by_hand_takes_each_key_of_its_outcomes_once() {
         let err = w.t.apply(&Event::of(vec![Part::Forced(ask)]).encode());
         assert!(err.unwrap_err().to_string().contains("started over"));
         assert_eq!(w.t.counters(edge, 3).forced, [0; 6]);
+    });
+}
+
+/// KEY-9: a key a user's cancel interrupted is owed to the next run of its
+/// partition, whatever starts it. Its record says `canceled` and makes it
+/// wait for nothing: the next batch takes it with no change upstream and no
+/// retry pass, and its record goes when it succeeds. A failed key beside it
+/// waits for its retry as before.
+#[test]
+fn a_canceled_key_is_taken_by_the_next_batch() {
+    let rt = runtime();
+    let ix = index(&rt);
+    rt.block_on(async {
+        let mut w = scripted();
+        w.input(&ix, &[("k1", 5), ("k2", 5)]).await;
+        let first = w.planned(&ix, None, 10, Mode::Incremental).await;
+        let ev = w
+            .commit_of(
+                &ix,
+                &first,
+                &[("k1", Kind::Canceled), ("k2", Kind::Failed)],
+                &[],
+                w.counters,
+            )
+            .await
+            .unwrap();
+        w.apply(ev);
+        assert_eq!(w.stored(&ix).await.len(), 2);
+
+        let next = w.planned(&ix, None, 10, Mode::Incremental).await;
+        assert_eq!(taken(&next), [key("k1")], "k2 waits for its retry");
+        let ev = w.commit_of(&ix, &next, &[], &[], w.counters).await.unwrap();
+        w.apply(ev);
+        let left = w.stored(&ix).await;
+        assert_eq!(left.keys().collect::<Vec<_>>(), [&key("k2")]);
+        assert!(taken(&w.planned(&ix, None, 10, Mode::Incremental).await).is_empty());
     });
 }

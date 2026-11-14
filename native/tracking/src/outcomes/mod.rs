@@ -177,6 +177,15 @@ impl Record {
         ))
     }
 
+    /// Whether the key, owed with upstream at `wanted`, waits for its retry
+    /// rather than for the next batch: it was tried on that already. A
+    /// canceled key never waits (KEY-9): nothing about it failed, so the
+    /// next run of its partition, whatever starts it, processes it.
+    pub fn waits(&self, key: &[u8], conds: &Conds, wanted: &Holding) -> Result<bool> {
+        Ok(self.stored.outcome != transition::CANCELED
+            && !crate::progress::owed(&self.tried(key, conds)?, wanted))
+    }
+
     pub(crate) fn conds(&self) -> impl Iterator<Item = u64> {
         [Some(self.on_cond), self.held.cond()].into_iter().flatten()
     }
