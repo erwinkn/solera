@@ -19,7 +19,7 @@ use solera_tracking as tr;
 use tr::codec::Ver;
 use tr::event::{Event, Part};
 use tr::plan::{InputRequest, LogRequest, Mode, Plan, Request};
-use tr::progress::{Class, Conditions, Key, Matcher, Pat, Patterns};
+use tr::progress::{read_digest, Class, Conditions, Key, Matcher, Pat, Patterns};
 
 use crate::index_py::{key, layers_in, rt, version, ChangeIndex, Owned};
 use crate::{guard, FormatError};
@@ -28,7 +28,14 @@ create_exception!(
     _native,
     UnsettledError,
     PyValueError,
-    "A batch's fence refuses its commit: the input became unsettled since the commit was built."
+    "A batch's commit is refused for good, and the batch is planned again: its input became unsettled since the commit was built (its fence), or a per-key edge's progress or records moved since it was planned."
+);
+
+create_exception!(
+    _native,
+    OutcomesMovedError,
+    PyValueError,
+    "A per-key batch's outcomes were built from a state that has moved since: catch up and build them again."
 );
 
 pub(crate) fn err(e: tr::Error) -> PyErr {
@@ -377,11 +384,33 @@ impl Tracking {
         guard(|| self.state.write().unwrap().apply(event).map_err(err))
     }
 
-    /// Whether `apply` would take the event, applying nothing.
+    /// Whether `apply` would take the event, applying nothing. Refused with
+    /// `OutcomesMovedError` when its per-key outcomes are what the state
+    /// refuses: they were built from a state that moved since, and are
+    /// built again.
     fn check(&self, event: &[u8]) -> PyResult<()> {
         guard(|| {
             let ev = Event::decode(event).map_err(err)?;
-            self.state.read().unwrap().check_event(&ev).map_err(err)
+            let state = self.state.read().unwrap();
+            let Err(e) = state.check_event(&ev) else {
+                return Ok(());
+            };
+            let own: Vec<Part> = ev
+                .parts
+                .iter()
+                .filter(|p| match p {
+                    Part::Outcomes(_) => true,
+                    Part::OutputCommit(c) => tr::state::core_owned(&c.output),
+                    _ => false,
+                })
+                .cloned()
+                .collect();
+            if !matches!(e, tr::Error::Unsettled) && !own.is_empty() {
+                if let Err(moved) = state.check_event(&Event::of(own)) {
+                    return Err(OutcomesMovedError::new_err(moved.to_string()));
+                }
+            }
+            Err(err(e))
         })
     }
 
@@ -717,7 +746,15 @@ impl Tracking {
     /// this input's patterns take; held back on every input, they keep what
     /// they held. A report
     /// names only keys its own input took.
-    #[pyo3(signature = (plan, reports, producer=Vec::new(), output_commit=None))]
+    ///
+    /// With `outcomes` (a per-key batch, B6), the event also commits the
+    /// outcomes of one keyed input's keys (`OutcomesIn`), and a fourth item
+    /// says what each reported key's record holds after: `{key: outcome}`,
+    /// none for a key left with no record. Refused with `OutcomesMovedError`
+    /// when the edge must catch up first (`outcome_catch_up`), and with
+    /// `UnsettledError` when its progress or records moved since the batch
+    /// was planned (a catch-up dropped a failure it took): it is planned again.
+    #[pyo3(signature = (plan, reports, producer=Vec::new(), output_commit=None, outcomes=None))]
     fn progress_ops<'py>(
         &self,
         py: Python<'py>,
@@ -725,6 +762,7 @@ impl Tracking {
         reports: &Bound<'py, PyAny>,
         producer: Vec<u8>,
         output_commit: Option<u64>,
+        outcomes: Option<&Bound<'py, PyDict>>,
     ) -> PyResult<Bound<'py, PyTuple>> {
         guard(|| {
             let mut rs = vec![];
@@ -749,22 +787,67 @@ impl Tracking {
                 }
                 rs.push(rep);
             }
-            let (event, records, held_back) = py
+            let outcomes = outcomes.map(OutcomesIn::of).transpose()?;
+            let ixs = self.indexes.read().unwrap().clone();
+            let (event, records, held_back, after) = py
                 .detach(|| {
                     let plan = Plan::decode(plan)?;
-                    let ops = self.state.read().unwrap().progress_ops(
-                        &plan,
-                        &rs,
-                        &producer,
-                        output_commit,
-                    )?;
-                    Ok::<_, tr::Error>((
-                        ops.event().encode(),
+                    let (mut ops, view) = {
+                        let state = self.state.read().unwrap();
+                        let view = match &outcomes {
+                            None => None,
+                            Some(o) => {
+                                let Some(p) = plan.inputs.get(o.input) else {
+                                    return Err(tr::Error::Invalid(
+                                        "no such keyed input in the plan".into(),
+                                    ));
+                                };
+                                // A catch-up sets points where it drops a failure: a per-key
+                                // edge's progress moves under a batch that took the key.
+                                let moved = state.edges.get(&p.edge).and_then(|e| {
+                                    let k = e.progress.keyed()?;
+                                    Some(read_digest(k, plan.reset, &plan.range) != p.expect)
+                                });
+                                if moved == Some(true) {
+                                    return Ok(Err(Refused::Replan(
+                                        "the per-key edge's progress moved since the batch was planned"
+                                            .into(),
+                                    )));
+                                }
+                                Some(state.outcome_view(&p.edge)?)
+                            }
+                        };
+                        let ops = state.progress_ops(&plan, &rs, &producer, output_commit)?;
+                        (ops, view)
+                    };
+                    let mut after = None;
+                    let mut parts = vec![];
+                    if let (Some(o), Some(v)) = (&outcomes, &view) {
+                        let loaded = rs.get(o.input).map_or(&[][..], |r| &r.loaded[..]);
+                        let built = rt().block_on(o.commit(
+                            ixs.as_ref(),
+                            v,
+                            &plan,
+                            loaded,
+                            &producer,
+                            &mut ops,
+                        ))?;
+                        match built {
+                            Ok((p, a)) => (parts, after) = (p, Some(a)),
+                            Err(refused) => return Ok(Err(refused)),
+                        }
+                    }
+                    let mut event = ops.event();
+                    event.parts.extend(parts);
+                    Ok::<_, tr::Error>(Ok((
+                        event.encode(),
                         ops.records.iter().map(|r| r.encode()).collect::<Vec<_>>(),
                         ops.held_back,
-                    ))
+                        after,
+                    )))
                 })
-                .map_err(err)?;
+                .map_err(err)?
+                .map_err(Refused::err)?;
             let records = PyList::new(py, records.iter().map(|r| PyBytes::new(py, r)))?;
             let held_back = PyList::new(
                 py,
@@ -773,7 +856,15 @@ impl Tracking {
                     .map(|ks| PyList::new(py, ks.iter().map(|k| key(py, k))))
                     .collect::<PyResult<Vec<_>>>()?,
             )?;
-            (PyBytes::new(py, &event), records, held_back).into_pyobject(py)
+            let event = PyBytes::new(py, &event);
+            let Some(after) = after else {
+                return (event, records, held_back).into_pyobject(py);
+            };
+            let stored = PyDict::new(py);
+            for (k, code) in &after {
+                stored.set_item(key(py, k), tr::outcomes::transition::NAMES[*code as usize])?;
+            }
+            (event, records, held_back, stored).into_pyobject(py)
         })
     }
 
@@ -961,6 +1052,182 @@ impl Tracking {
         )
     }
 
+    /// B6: the ids of a per-key edge's record outputs, `(failures, due)`:
+    /// the core's own, attached to the change index like any output.
+    #[staticmethod]
+    fn outcome_outputs<'py>(
+        py: Python<'py>,
+        edge: &[u8],
+    ) -> (Bound<'py, PyBytes>, Bound<'py, PyBytes>) {
+        let id = |kind| PyBytes::new(py, &tr::outcomes::output_id(kind, edge));
+        (id(tr::outcomes::FAILURES), id(tr::outcomes::DUE))
+    }
+
+    /// B6: the event that drops a per-key edge's failures gone moot since it
+    /// last looked (KEY-3, KEY-12): a failing key whose input went back to
+    /// what the consumer holds, under `conditions` (the edge's now). None
+    /// when there is nothing to record. Run after its input's commits and
+    /// before the edge is planned or its batch committed.
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (edge, conditions, *, now, deploy, retries, time_ms, failures_path, due_path))]
+    fn outcome_catch_up<'py>(
+        &self,
+        py: Python<'py>,
+        edge: Vec<u8>,
+        conditions: &Bound<'py, PyAny>,
+        now: f64,
+        deploy: u64,
+        retries: u64,
+        time_ms: u64,
+        failures_path: String,
+        due_path: String,
+    ) -> PyResult<Option<Bound<'py, PyBytes>>> {
+        guard(|| {
+            let conds = self::conditions(conditions)?;
+            let clock = Clock {
+                now,
+                deploy,
+                retries,
+                time_ms,
+                failures_path,
+                due_path,
+            };
+            let view = self
+                .state
+                .read()
+                .unwrap()
+                .outcome_view(&edge)
+                .map_err(err)?;
+            let ixs = self.indexes.read().unwrap().clone();
+            let parts = py
+                .detach(|| {
+                    rt().block_on(tr::outcomes::commit::catch_up(
+                        ixs.as_ref(),
+                        &view,
+                        &conds,
+                        &clock.ctx(b""),
+                    ))
+                })
+                .map_err(err)?;
+            Ok(parts.map(|p| PyBytes::new(py, &Event::of(p).encode())))
+        })
+    }
+
+    /// B6: a per-key edge's stored outcomes, one row per failing key in key
+    /// order: `(key, {outcome, tries, deploy, forced, since, last, next_at,
+    /// until, message, tried})`, `tried` the version it last failed on,
+    /// `next_at` and `until` None where they do not apply. `keys`: those
+    /// keys' rows; else a page after `after`, of the outcomes named in
+    /// `outcomes` if any, and where the next page starts.
+    #[pyo3(signature = (edge, *, keys=None, after=None, limit=1000, outcomes=None))]
+    fn outcome_records<'py>(
+        &self,
+        py: Python<'py>,
+        edge: Vec<u8>,
+        keys: Option<Vec<String>>,
+        after: Option<String>,
+        limit: usize,
+        outcomes: Option<Vec<String>>,
+    ) -> PyResult<Bound<'py, PyTuple>> {
+        guard(|| {
+            let codes = match outcomes {
+                None => None,
+                Some(names) => Some(
+                    names
+                        .iter()
+                        .map(|n| outcome_code(n))
+                        .collect::<PyResult<Vec<u8>>>()?,
+                ),
+            };
+            let fid = tr::outcomes::output_id(tr::outcomes::FAILURES, &edge);
+            let out = self
+                .state
+                .read()
+                .unwrap()
+                .outputs
+                .get(&fid)
+                .cloned()
+                .unwrap_or_default();
+            let ixs = self.indexes.read().unwrap().clone();
+            let wanted = |r: &tr::outcomes::Record| {
+                codes.as_ref().is_none_or(|c| c.contains(&r.stored.outcome))
+            };
+            let (rows, next) = py
+                .detach(|| {
+                    rt().block_on(async {
+                        if let Some(mut keys) = keys {
+                            keys.sort_unstable();
+                            keys.dedup();
+                            let ks: Vec<&[u8]> = keys.iter().map(|k| k.as_bytes()).collect();
+                            let found =
+                                tr::outcomes::commit::records(ixs.as_ref(), &fid, &out, &ks)
+                                    .await?;
+                            let rows = found.into_iter().filter(|(_, r)| wanted(r)).collect();
+                            return Ok::<_, tr::Error>((rows, None));
+                        }
+                        let mut rows: Vec<(Key, tr::outcomes::Record)> = vec![];
+                        if out.live == 0 || limit == 0 {
+                            return Ok((rows, None));
+                        }
+                        let ix = tr::plan::Indexes::index(ixs.as_ref(), &fid)?;
+                        let mut q = ix::Query {
+                            after: after.map(String::into_bytes),
+                            limit: Some(limit.max(1024) as u64),
+                            ..Default::default()
+                        };
+                        loop {
+                            let page = ix.scan(&out.layers, out.head, &q).await?;
+                            for i in 0..page.run.len() {
+                                let ix::Version::Bytes(b) =
+                                    page.run.new_version(page.run.rows(i).start)
+                                else {
+                                    return Err(tr::Error::Format(
+                                        "a record that is not a version word".into(),
+                                    ));
+                                };
+                                let r = tr::outcomes::Record::decode(b)?;
+                                if !wanted(&r) {
+                                    continue;
+                                }
+                                if rows.len() == limit {
+                                    let last = rows[limit - 1].0.clone();
+                                    return Ok((rows, Some(last)));
+                                }
+                                rows.push((page.run.key(i).into(), r));
+                            }
+                            match page.next {
+                                Some(n) => q.after = Some(n),
+                                None => return Ok((rows, None)),
+                            }
+                        }
+                    })
+                })
+                .map_err(err)?;
+            let list = PyList::empty(py);
+            for (k, r) in &rows {
+                list.append((key(py, k), record_dict(py, r)?))?;
+            }
+            (list, next.as_deref().map(|k| key(py, k))).into_pyobject(py)
+        })
+    }
+
+    /// B6: how many of a per-key edge's keys each stored outcome holds:
+    /// `{outcome: n}`, every outcome named.
+    fn outcome_counts<'py>(&self, py: Python<'py>, edge: &[u8]) -> PyResult<Bound<'py, PyDict>> {
+        let counts = self
+            .state
+            .read()
+            .unwrap()
+            .per_key
+            .get(edge)
+            .map_or([0; 6], |k| k.counts);
+        let d = PyDict::new(py);
+        for (code, name) in tr::outcomes::transition::NAMES.iter().enumerate().skip(1) {
+            d.set_item(*name, counts[code])?;
+        }
+        Ok(d)
+    }
+
     /// B7: the event telling the core an edge's conditions now (journal it
     /// when the edge opens and whenever they change). `gate`: the edge waits
     /// while its upstream is in the middle of a full run.
@@ -1067,6 +1334,212 @@ impl Tracking {
                 output: output.into(),
             })),
         )
+    }
+}
+
+fn outcome_code(name: &str) -> PyResult<u8> {
+    match tr::outcomes::transition::NAMES
+        .iter()
+        .position(|n| *n == name)
+    {
+        Some(c) if c > 0 => Ok(c as u8),
+        _ => Err(PyValueError::new_err(format!(
+            "no stored outcome {name:?}: rejected, failed, retrying, canceled or timed_out"
+        ))),
+    }
+}
+
+fn record_dict<'py>(py: Python<'py>, r: &tr::outcomes::Record) -> PyResult<Bound<'py, PyDict>> {
+    let s = &r.stored;
+    let d = PyDict::new(py);
+    d.set_item(
+        "outcome",
+        tr::outcomes::transition::NAMES[s.outcome as usize],
+    )?;
+    d.set_item("tries", s.tries)?;
+    d.set_item("deploy", s.deploy)?;
+    d.set_item("forced", s.forced)?;
+    d.set_item("since", s.since)?;
+    d.set_item("last", s.last)?;
+    d.set_item("next_at", (s.next_at > 0).then_some(s.next_at))?;
+    d.set_item("until", (s.until > 0).then_some(s.until))?;
+    d.set_item("message", String::from_utf8_lossy(&s.message))?;
+    d.set_item("tried", version(py, r.on.as_version())?)?;
+    Ok(d)
+}
+
+/// The clock and the layer paths a per-key edge's record commits are
+/// built with. Forced retries are not counted yet: their counters are 0.
+struct Clock {
+    now: f64,
+    deploy: u64,
+    retries: u64,
+    time_ms: u64,
+    failures_path: String,
+    due_path: String,
+}
+
+impl Clock {
+    fn of(d: &Bound<'_, PyDict>) -> PyResult<Clock> {
+        let what = "outcomes";
+        Ok(Clock {
+            now: need(d, "now", what)?.extract()?,
+            deploy: need(d, "deploy", what)?.extract()?,
+            retries: need(d, "retries", what)?.extract()?,
+            time_ms: need(d, "time_ms", what)?.extract()?,
+            failures_path: need(d, "failures_path", what)?.extract()?,
+            due_path: need(d, "due_path", what)?.extract()?,
+        })
+    }
+
+    fn ctx<'a>(&'a self, producer: &'a [u8]) -> tr::outcomes::commit::Ctx<'a> {
+        tr::outcomes::commit::Ctx {
+            now: self.now,
+            counters: tr::outcomes::Counters {
+                deploy: self.deploy,
+                forced: [0; 6],
+            },
+            retries: self.retries,
+            time_ms: self.time_ms,
+            producer,
+            failures_path: &self.failures_path,
+            due_path: &self.due_path,
+        }
+    }
+}
+
+/// Why a per-key batch's outcomes were not built.
+enum Refused {
+    /// The edge must catch up first: the engine catches up and builds again.
+    Moved(String),
+    /// The edge's records moved since the batch was planned: it is planned again.
+    Replan(String),
+}
+
+impl Refused {
+    fn err(self) -> PyErr {
+        match self {
+            Refused::Moved(m) => OutcomesMovedError::new_err(m),
+            Refused::Replan(m) => UnsettledError::new_err(m),
+        }
+    }
+}
+
+/// `progress_ops`'s `outcomes=`: one keyed input's (`input`, its index in
+/// the plan) keys that did not succeed, `(key, kind, message, retry_after,
+/// retry_for)` sorted by key, and the conditions the batch was planned
+/// under (`plan` takes them so).
+struct OutcomesIn {
+    input: usize,
+    reported: Vec<(Key, tr::outcomes::Reported)>,
+    conditions: Arc<Conditions>,
+    clock: Clock,
+}
+
+impl OutcomesIn {
+    fn of(d: &Bound<'_, PyDict>) -> PyResult<OutcomesIn> {
+        let what = "outcomes";
+        let mut reported = vec![];
+        for r in need(d, "reported", what)?.try_iter()? {
+            let r = r?;
+            let kind: String = r.get_item(1)?.extract()?;
+            let Some(kind) = tr::outcomes::Kind::parse(&kind) else {
+                return Err(PyValueError::new_err(format!("no outcome kind {kind:?}")));
+            };
+            let message: Option<String> = r.get_item(2)?.extract()?;
+            reported.push((
+                key_in(&r.get_item(0)?)?,
+                tr::outcomes::Reported {
+                    kind,
+                    message: message.unwrap_or_default().into_bytes().into(),
+                    retry_after: r.get_item(3)?.extract()?,
+                    retry_for: r.get_item(4)?.extract()?,
+                },
+            ));
+        }
+        Ok(OutcomesIn {
+            input: need(d, "input", what)?.extract()?,
+            reported,
+            conditions: conditions(&need(d, "conditions", what)?)?,
+            clock: Clock::of(d)?,
+        })
+    }
+
+    /// The outcome parts of the batch's event, and each reported key's
+    /// stored outcome after it (`(key, code)`, for keys left with a record).
+    async fn commit(
+        &self,
+        ixs: &Attached,
+        v: &tr::outcomes::commit::View,
+        plan: &Plan,
+        loaded: &[(Key, Ver)],
+        producer: &[u8],
+        ops: &mut tr::progress::Ops,
+    ) -> tr::Result<Result<(Vec<Part>, Vec<(Key, u8)>), Refused>> {
+        use tr::outcomes::{commit as oc, output_id, record_digest, FAILURES};
+        // The core refuses a commit an edge did not catch up for: said here, so
+        // that the engine catches up and builds again.
+        let looked = (v.per_key.seen, v.per_key.cond);
+        let now = (v.upstream.head, tr::outcomes::cond_id(&self.conditions));
+        if v.failures.live > 0 && looked != now {
+            return Ok(Err(Refused::Moved(
+                "catch up first: the edge's failures were not looked at through its input's head"
+                    .into(),
+            )));
+        }
+        let ctx = self.clock.ctx(producer);
+        let fid = output_id(FAILURES, &v.edge);
+        let parts = match oc::commit(
+            ixs,
+            v,
+            plan,
+            self.input,
+            &self.reported,
+            loaded,
+            &self.conditions,
+            &ctx,
+            ops,
+        )
+        .await
+        {
+            Ok(parts) => parts,
+            Err(e @ tr::Error::Invalid(_)) => {
+                let p = &plan.inputs[self.input];
+                let mut touched: Vec<&[u8]> = p.touched().map(|k| k.as_ref()).collect();
+                touched.sort_unstable();
+                touched.dedup();
+                let read = oc::records(ixs, &fid, &v.failures, &touched)
+                    .await?
+                    .iter()
+                    .map(|(k, r)| record_digest(k, r))
+                    .fold(0, u64::wrapping_add);
+                if read != p.records {
+                    return Ok(Err(Refused::Replan(
+                        "the edge's per-key records moved since the batch was planned".into(),
+                    )));
+                }
+                return Err(e);
+            }
+            Err(e) => return Err(e),
+        };
+        // What the records hold after: the output with the commit's layer on top.
+        let mut out = v.failures.clone();
+        for part in &parts {
+            if let Part::OutputCommit(c) = part {
+                if c.output == fid {
+                    out.layers.push(c.layer.clone());
+                    out.head = c.layer.hi;
+                    out.live = c.live;
+                }
+            }
+        }
+        let keys: Vec<&[u8]> = self.reported.iter().map(|(k, _)| k.as_ref()).collect();
+        let after = oc::records(ixs, &fid, &out, &keys)
+            .await?
+            .into_iter()
+            .map(|(k, r)| (k, r.stored.outcome))
+            .collect();
+        Ok(Ok((parts, after)))
     }
 }
 
@@ -1196,6 +1669,10 @@ fn outcome_backoff(tries: u64) -> f64 {
 
 pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("UnsettledError", m.py().get_type::<UnsettledError>())?;
+    m.add(
+        "OutcomesMovedError",
+        m.py().get_type::<OutcomesMovedError>(),
+    )?;
     m.add_function(wrap_pyfunction!(outcome_transition, m)?)?;
     m.add_function(wrap_pyfunction!(outcome_eligible, m)?)?;
     m.add_function(wrap_pyfunction!(outcome_backoff, m)?)?;

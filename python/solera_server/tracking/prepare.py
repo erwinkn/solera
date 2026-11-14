@@ -20,20 +20,20 @@ import math
 from solera._native import Tracking, UnsettledError
 
 from ..model import edge_id, output_id
-from . import WALK, Core, Generation, Redeployed, canonical, output_pin
+from . import WALK, Core, Generation, Redeployed, canonical, outcomes, output_pin
 from .commit import HeldBack
 from .full import dynamic_sets, held
 
 NOT_YET = "on the new tracking core yet"  # what a refusal of something a later unit builds says
 
 
-def conditions(engine, input, base: dict) -> dict:
-    """What a keyed input's keys are processed under (§9): its patterns, the
-    context (the heads of the whole and dep inputs), the definition, and its
-    rebuild counter (a per-key asset's, B6)."""
+def conditions(spec: dict, base: dict) -> dict:
+    """What a keyed input's keys are processed under (§9): its patterns (of
+    its manifest `spec`), the context (the heads of the whole and dep
+    inputs), the definition, and its rebuild counter (a per-key asset's, B6)."""
 
     return {
-        "patterns": input.spec.get("patterns"),
+        "patterns": spec.get("patterns"),
         "context": canonical(base["context"]),
         "definition": base["definition"].encode(),
         "rebuild": 0,
@@ -126,6 +126,9 @@ async def _prepare(core: Core, task: dict, run: dict, attempt: str | None) -> di
         core.attach(*(output_id(i.output, i.partition) for i in keyed))
         own = None
         if per_key is not None:
+            core.attach(
+                *Tracking.outcome_outputs(edges[per_key.param])
+            )  # the plan reads its failing keys' records
             # What the partition holds is its own output's keys: where its edge cannot say
             # (an upstream's new life), a key it holds that upstream lacks is removed.
             name = engine.manifest["assets"][task["asset"]]["outputs"][0]["name"]
@@ -134,6 +137,8 @@ async def _prepare(core: Core, task: dict, run: dict, attempt: str | None) -> di
                 core.attach(own)
             if again and own is not None:
                 core.record(Tracking.event_reset(edges[per_key.param], True))
+            # Its failures gone moot since it last looked go first: the plan reads the records.
+            await outcomes.catch_up(core, edges[per_key.param], conditions(per_key.spec, base), task["asset"])
         after = (mine or {}).get("key")
         mode, named = run_mode(run, keyed)
         if mine is not None and after is None:  # its keyed inputs' walk ended: only its logs go on
@@ -149,7 +154,7 @@ async def _prepare(core: Core, task: dict, run: dict, attempt: str | None) -> di
             "inputs": [
                 {
                     "edge": edges[i.param],
-                    "conditions": conditions(engine, i, base),
+                    "conditions": conditions(i.spec, base),
                     **({"own": own} if i is per_key and own is not None else {}),
                 }
                 for i in keyed
@@ -204,9 +209,7 @@ async def _prepare(core: Core, task: dict, run: dict, attempt: str | None) -> di
             final = hi is None
             own = final
             if not final and len(keyed) > 1 and mode == "incremental":
-                own = not await _more(
-                    core, input, edges[input.param], conditions(engine, input, base), hi, full
-                )
+                own = not await _more(core, input, edges[input.param], conditions(input.spec, base), hi, full)
             upstream = core.m.core_output(input.output, input.partition)
             size = int(input.spec["batch_size"])
             live = (upstream or {}).get("live", 0)

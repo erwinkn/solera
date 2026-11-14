@@ -213,10 +213,8 @@ async def repair(o, context) -> None:
 
 # -- per-key assets --------------------------------------------------------------------
 
-NOT_YET = "on the new tracking core yet"  # what a refusal of something a later unit builds says
 
-
-async def each(asset, ctx, args: dict, param: str, batch: dict, timeline):
+async def each(asset, project, ctx, args: dict, param: str, batch: dict, timeline):
     """A per-key asset's batch (docs/per-key-processing.md §5): the asset is
     called once for each key of `batch["loaded"]` (key -> its upstream
     value), `batch["concurrency"]` at a time, with `ctx.key` and
@@ -224,7 +222,14 @@ async def each(asset, ctx, args: dict, param: str, batch: dict, timeline):
     write per output, `Patch({key: value}, remove=[...])`: a key whose call
     returned None for an output keeps what it had there, one that returned
     `Patch(None, remove=[ctx.key])` loses its rows, and the keys upstream
-    removed (`batch["removed"]`) lose theirs with no call."""
+    removed (`batch["removed"]`) lose theirs with no call.
+
+    A key whose call raises is classified (`solera.errors`, KEY-3): it writes
+    nothing and keeps what it had, and its outcome goes to the engine
+    (`batch["outcomes"]`, `[key, kind, message, retry_after, retry_for]` in
+    key order), which records it on the core. One bad key never blocks the
+    others. `Abort` alone fails the whole attempt: no key starts after it,
+    and it is raised once the calls in flight end."""
 
     loaded, versions = batch["loaded"], batch["versions"]
     decls = {o.name or asset.name: o for o in asset.outputs}
@@ -233,6 +238,8 @@ async def each(asset, ctx, args: dict, param: str, batch: dict, timeline):
     at_once = max(1, min(int(batch["concurrency"]), len(loaded)))
     pool = None if is_async else ThreadPoolExecutor(max_workers=at_once)
     loop, todo, outputs, durations = asyncio.get_running_loop(), iter(list(loaded)), {}, {}
+    failed: dict[str, list] = {}  # key -> [kind, message, retry_after, retry_for]
+    abort: list[BaseException] = []
 
     def split(key: str, value) -> dict:
         """One call's value per output: a bare value for a single output, or
@@ -267,26 +274,28 @@ async def each(asset, ctx, args: dict, param: str, batch: dict, timeline):
                 value = await loop.run_in_executor(pool, functools.partial(asset.fn, **kwargs))
                 if inspect.isawaitable(value):
                     value = await value
+            outputs[key] = split(key, value)
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            kind, timing = errors.classify(error, project.errors)
+            if kind == errors.ABORT:
+                abort.append(error)
+                return
+            message = f"{type(error).__name__}: {error}"
+            failed[key] = [kind, message, timing.get("retry_after"), timing.get("retry_for")]
+            ctx._for_key(key, versions.get(key)).log(message, "error")
         finally:
             durations[key] = time.monotonic() - start
-        outputs[key] = split(key, value)
 
     async def worker() -> None:
         """Calls key after key: `concurrency` workers pulling from the batch,
-        never a task per key."""
+        never a task per key, until the keys run out or one aborts."""
 
         for key in todo:
-            try:
-                await call(key)
-            except asyncio.CancelledError:
-                raise
-            except Exception as error:
-                # One bad key must not block the others (KEY-3): its outcome is the core's to
-                # record, which the engine does not ask of it yet.
-                raise StoreError(
-                    f"key {key!r} failed ({type(error).__name__}: {error}): a failing key of a per-key "
-                    f"asset is not recorded {NOT_YET} (build plan B6)"
-                ) from error
+            if abort:
+                return
+            await call(key)
 
     timeline.add("computing")
     try:
@@ -295,6 +304,8 @@ async def each(asset, ctx, args: dict, param: str, batch: dict, timeline):
         if pool is not None:
             pool.shutdown(wait=False, cancel_futures=True)
     timeline.add("computed")
+    if abort:
+        raise abort[0]
     groups = {name: {} for name in decls}
     removes = {name: set(batch["removed"]) for name in decls}
     for key, values in outputs.items():
@@ -304,18 +315,24 @@ async def each(asset, ctx, args: dict, param: str, batch: dict, timeline):
                 removes[name].add(key)
             elif value is not None:  # None, or not returned: no change for this key
                 groups[name][key] = value
-    batch["keys"] = {"ok": len(outputs), "removed": len(batch["removed"])}  # its keys, by outcome
+    batch["outcomes"] = [[key, *failed[key]] for key in sorted(failed)]
+    # Its keys, by outcome: a failing key by its class, which the engine's record makes a stored outcome.
+    counts = {"ok": len(outputs), "removed": len(batch["removed"])}
+    for kind, *_ in failed.values():
+        counts[kind] = counts.get(kind, 0) + 1
+    batch["keys"] = counts
     # One row per key, for the history: the version it ran at, how it ended, how long it took.
-    batch["rows"] = [
+    rows = [
         {
             "key": key,
             "generation": versions.get(key),
-            "outcome": "ok",
-            "error": None,
+            "outcome": "ok" if key in outputs else failed[key][0],
+            "error": None if key in outputs else failed[key][1],
             "duration": round(durations.get(key, 0.0), 6),
         }
-        for key in sorted(outputs)
-    ] + [
+        for key in sorted({*outputs, *failed})
+    ]
+    batch["rows"] = rows + [
         {"key": key, "generation": None, "outcome": "removed", "error": None, "duration": 0.0}
         for key in sorted(batch["removed"])
     ]
