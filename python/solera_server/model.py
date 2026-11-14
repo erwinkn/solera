@@ -1051,8 +1051,6 @@ class Model:
             record["edges"] = {**record.get("edges", {}), **lives}
         for input, progress in (commit.get("progress") or {}).items():  # the run's walk (D155)
             task.setdefault("progress", {})[input] = progress
-        if "outcomes" in commit:
-            self._stored(asset, partition, commit["outcomes"])
         if commit.get("key_outcomes"):  # its keys' rows: the attempt's result holds them
             row = {"run": e["run"], "attempt": e["attempt"], "asset": asset, "partition": partition, "at": at}
             self._record("key_outcomes", row)

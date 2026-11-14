@@ -106,6 +106,71 @@ class Staleness:
                     return True
         return False
 
+    async def _each_keys(self, asset: str, partition: str, memo: dict) -> dict[str, list]:
+        """A per-key partition's stale keys, each with its own reasons
+        (`stale_keys`): the keys its per-key input owes it; with its
+        definition changed, every key upstream has under its patterns and
+        every key it holds, for that partition-wide reason alone; along a
+        chain of per-key assets, the keys whose upstream key is stale; and
+        under any other stale upstream, every key it holds."""
+
+        if (asset, partition) in memo:
+            return memo[(asset, partition)]
+        memo[(asset, partition)] = {}
+        planner = self.planner()
+        try:
+            inputs = planner.inputs(asset, partition)
+        except planning.UpstreamOnly:
+            inputs = []
+        param, spec = self._each_input(asset)
+        input = next((i for i in inputs if i.param == param), None)
+        if input is None or not self.built(asset, partition, planner):
+            return {}
+        output = next(o["name"] for o in self.manifest["assets"][asset]["outputs"] if o.get("key"))
+        taken = Matcher(spec.get("patterns"))
+        own = [{"kind": INPUT, "input": param, "upstream_partition": input.partition}]
+        keys, after = {}, None
+        while True:  # what its input owes it, as the planner lists it
+            page = await core_stale.owed_keys(
+                self.core, asset, partition, input, planner, inputs, after, 10_000
+            )
+            owed, after = page if page is not None else ([], None)
+            keys.update((key, list(own)) for key in owed)
+            if after is None:
+                break
+        if self.definition_changed(asset, partition):
+            for key in await self._held_keys(input.output, input.partition):
+                if taken(key):
+                    keys.setdefault(key, [])
+            for key in await self._held_keys(output, partition):
+                keys.setdefault(key, [])
+        for i in inputs:
+            for upstream in self._upstreams(planner, i):
+                if i.owner is None or not await self.stale_reasons(i.owner, upstream):
+                    continue
+                if i.param == param and self._each_input(i.owner) is not None:
+                    why = {"kind": UPSTREAM, "input": i.param, "upstream_partition": upstream}
+                    for key in await self._each_keys(i.owner, upstream, memo):
+                        if taken(key):
+                            keys.setdefault(key, []).append(why)
+                else:  # a stale upstream every key depends on: partition-wide
+                    for key in await self._held_keys(output, partition):
+                        keys.setdefault(key, [])
+        memo[(asset, partition)] = keys
+        return keys
+
+    async def _held_keys(self, output: str, partition: str) -> list[str]:
+        """Every key an output partition holds now."""
+
+        if (output, partition) not in self.m.heads:
+            return []
+        keys, after = [], None
+        while True:
+            page = await self.list_keys(output, partition, after=after, limit=10_000)
+            keys += page["keys"]
+            if (after := page.get("next")) is None:
+                return keys
+
     def built(self, asset: str, partition: str, planner=None) -> bool:
         """Whether a partition was built since its outputs were last reset — a
         head of one of its outputs, or a commit (a keys= run that took no key
@@ -153,7 +218,10 @@ class Staleness:
             more = len(page) == limit and page[-1] != max(stale)
             keys = [{"key": k, "reasons": stale[k]} for k in page]
             return {"tracked": True, "keys": keys, "next": page[-1] if more else None, "reasons": reasons}
-        if INPUT in reasons:  # the keys its incremental inputs owe it: the planner's answer
+        # A keyed output that is not per-key: its keys go stale together (STA-6), with the
+        # keys its incremental inputs owe it that it does not hold yet (the planner's answer).
+        pages = []
+        if INPUT in reasons:
             planner = self.planner()
             inputs = planner.inputs(asset, partition)
             pages = [
@@ -161,16 +229,18 @@ class Staleness:
                 for i in inputs
                 if i.kind == "incremental" and not self._log(i)
             ]
-            if pages and None not in pages:
-                # No further than the shortest page that goes on: a key past it may be another's.
-                bound = min((rows[-1] for rows, more in pages if more is not None and rows), default=None)
-                owed = sorted({k for rows, _ in pages for k in rows if bound is None or k <= bound})[:limit]
-                more = bound is not None or len({k for rows, _ in pages for k in rows}) > len(owed)
-                keys = [{"key": k, "reasons": []} for k in owed]
-                next_ = owed[-1] if more and owed else None
-                return {"tracked": True, "keys": keys, "next": next_, "reasons": reasons}
-        if (keyed[0], partition) not in self.m.heads:
-            return {"tracked": True, "keys": [], "next": None, "reasons": reasons}
-        page = await self.list_keys(keyed[0], partition, after=after, limit=limit)
-        keys = [{"key": k, "reasons": []} for k in page["keys"]]
-        return {"tracked": True, "keys": keys, "next": page.get("next"), "reasons": reasons}
+        if (keyed[0], partition) in self.m.heads:
+            held = await self.list_keys(keyed[0], partition, after=after, limit=limit)
+            pages.append((list(held["keys"]), held.get("next")))
+        pages = [page for page in pages if page is not None]
+        # No further than the shortest page that goes on: a key past it may be another's.
+        bound = min((rows[-1] for rows, more in pages if more is not None and rows), default=None)
+        found = sorted({k for rows, _ in pages for k in rows if bound is None or k <= bound})[:limit]
+        more = bound is not None or len({k for rows, _ in pages for k in rows}) > len(found)
+        keys = [{"key": k, "reasons": []} for k in found]
+        return {
+            "tracked": True,
+            "keys": keys,
+            "next": found[-1] if more and found else None,
+            "reasons": reasons,
+        }

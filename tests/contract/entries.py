@@ -26,8 +26,17 @@ PENDING: dict[str, str] = {
 # skips on its own; these are the ones that would fail instead, or assert something a
 # refused run never reaches.
 LATER: dict[str, str] = {
-    "test_aut_7_automated_outputs_converge_on_their_sources": "B6: its project has a per-key asset",
-    **dict.fromkeys(["KEY", "STA-15", "HIS-6"], "B6: per-key assets"),
+    **dict.fromkeys(
+        [
+            "test_key_2_a_cancel_interrupts_keys_still_waiting_for_a_slot",
+            "test_key_9_a_user_cancel_commits_finished_keys_and_leaves_the_rest_owed",
+            "test_key_9_a_timeout_counts_a_try_comes_due_after_backoff_and_fails_past_retries",
+            "test_key_9_a_user_cancel_during_a_timeout_drain_makes_its_keys_canceled",
+        ],
+        "B6: a canceled per-key batch does not commit its finished keys yet",
+    ),
+    "test_key_4_a_key_given_no_rows_does_not_exist": "B6: no route serves a key's outcome yet",
+    "test_sta_5_a_domain_too_big_to_list_still_rolls_up": "B6: no route explains a key yet",
     **dict.fromkeys(["CLN", "RST-8", "PAR-6", "ENG-13", "ENG-14"], "B9: retention and upkeep"),
     **dict.fromkeys(["HIS-3", "HIS-5", "HIS-7", "HIS-8"], "B10: lineage"),
 }

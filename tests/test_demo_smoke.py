@@ -174,7 +174,7 @@ def clean(text: str) -> None:
         assert marker not in text, text[max(0, text.find(marker) - 2000) : text.find(marker) + 3000]
 
 
-@pytest.mark.skip(reason="the demo has per-key assets: B6")
+@pytest.mark.skip(reason="B9: it waits for a cleanup task, and no cleanup runs on the new core yet")
 def test_the_demo_serves_every_page_through_flushes_and_restarts(tmp_path):
     serve = Serve(tmp_path, "first")
     try:
