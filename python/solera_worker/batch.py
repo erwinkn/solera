@@ -322,12 +322,10 @@ async def each(asset, project, ctx, args: dict, param: str, batch: dict, timelin
         counts[kind] = counts.get(kind, 0) + 1
     batch["keys"] = counts
     # One row per key, for the history: the version it ran at, how it ended, how long it took.
-    # The history's column is a number: a key an asset wrote has one (its commit's), a source's
-    # key served at a text version (an etag, a timestamp) has none.
     rows = [
         {
             "key": key,
-            "generation": versions.get(key) if isinstance(versions.get(key), int) else None,
+            "generation": versions.get(key),
             "outcome": "ok" if key in outputs else failed[key][0],
             "error": None if key in outputs else failed[key][1],
             "duration": round(durations.get(key, 0.0), 6),

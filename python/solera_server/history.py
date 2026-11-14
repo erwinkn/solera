@@ -853,6 +853,10 @@ class History:
                 continue
             found = {**found, **stamp}
             found["outcome"] = stored.get(found["key"]) or MADE.get(found["outcome"], found["outcome"])
+            # The column is a number: a key an asset wrote has one (its commit's); a source's key
+            # served at a text version (an etag, a timestamp) has none.
+            if not isinstance(found.get("generation"), int):
+                found["generation"] = None
             out.append([found.get(c) for c in names])
         return out
 
