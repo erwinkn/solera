@@ -37,6 +37,7 @@ use std::sync::Arc;
 use crate::codec::{Dec, Enc};
 use crate::error::{format, invalid, Result};
 use crate::event::Part;
+use crate::outcomes::{Forced, PassStart};
 use crate::progress::{Conditions, Key, KeyRange};
 use crate::state::{Id, Tracking};
 
@@ -293,8 +294,8 @@ impl Stale {
                     i.moved(self.gens, None);
                 }
             }
-            Part::PassStart(p) => {
-                if let Some(i) = self.inputs.get_mut(&p.edge) {
+            Part::PassStart(PassStart { edge, .. }) | Part::Forced(Forced { edge, .. }) => {
+                if let Some(i) = self.inputs.get_mut(edge) {
                     self.gens += 1;
                     i.retried(self.gens);
                 }

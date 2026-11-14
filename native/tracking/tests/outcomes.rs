@@ -3804,3 +3804,86 @@ fn boom() -> Reported {
         retry_for: None,
     }
 }
+
+/// KEY-7: a retry asked for by hand is a request the core stores per
+/// outcome. A rejected key, which no clock and no deploy retries, is taken
+/// once by the pass the request starts; a failed key the request did not
+/// name is left, and the request starts no second pass.
+#[test]
+fn a_retry_asked_for_by_hand_takes_each_key_of_its_outcomes_once() {
+    use solera_tracking::outcomes::transition::{FAILED, REJECTED};
+    let rt = runtime();
+    let ix = index(&rt);
+    rt.block_on(async {
+        let mut w = scripted();
+        let edge = EDGE.as_bytes();
+        w.input(&ix, &[("k1", 5), ("k2", 5)]).await;
+        let first = w.planned(&ix, None, 10, Mode::Incremental).await;
+        let ev = w
+            .commit_of(
+                &ix,
+                &first,
+                &[("k1", Kind::Rejected), ("k2", Kind::Failed)],
+                &[],
+                w.counters,
+            )
+            .await
+            .unwrap();
+        w.apply(ev);
+        // The edge's first pass covers the deploy it runs under, and finds
+        // both keys already tried under it.
+        let start = w.start_of(&ix).await.expect("the deploy's pass");
+        w.apply(start);
+        let none = w.retry_plan(&ix, 10).await;
+        assert!(taken(&none).is_empty());
+        let ev = w.commit_of(&ix, &none, &[], &[], w.counters).await.unwrap();
+        w.apply(ev);
+        assert!(w.start_of(&ix).await.is_none(), "nothing is due by itself");
+
+        let ask = w.t.force(edge, &[REJECTED]).unwrap();
+        assert_eq!(ask.forced, [0, 1, 0, 0, 0, 0]);
+        w.apply(vec![Part::Forced(ask.clone())]);
+        let err = w.t.apply(&Event::of(vec![Part::Forced(ask)]).encode());
+        assert!(err.unwrap_err().to_string().contains("out of turn"));
+        w.counters = w.t.counters(edge, w.counters.deploy);
+        let kept = Tracking::restore(&w.t.snapshot()).unwrap();
+        assert_eq!(kept.counters(edge, 0).forced, [0, 1, 0, 0, 0, 0]);
+
+        let start = w.start_of(&ix).await.expect("the request's pass");
+        w.apply(start);
+        let retry = w.retry_plan(&ix, 10).await;
+        assert_eq!(
+            taken(&retry),
+            [key("k1")],
+            "the failed key was not asked for"
+        );
+        let ev = w
+            .commit_of(&ix, &retry, &[("k1", Kind::Rejected)], &[], w.counters)
+            .await
+            .unwrap();
+        w.apply(ev);
+        assert!(w.t.per_key[edge].pass.is_none());
+        assert!(
+            w.start_of(&ix).await.is_none(),
+            "k1 had the request's retry"
+        );
+
+        // A second request, for both: its number is above every one before.
+        let ask = w.t.force(edge, &[REJECTED, FAILED]).unwrap();
+        assert_eq!(ask.forced, [0, 2, 2, 0, 0, 0]);
+        assert!(w.t.force(edge, &[]).is_err());
+        assert!(w.t.force(edge, &[0]).is_err());
+        assert!(w.t.force(edge, &[6]).is_err());
+        assert!(w.t.force(b"no such edge", &[REJECTED]).is_err());
+
+        // The records start over: the request built before is refused, and
+        // the numbers start over with them.
+        w.apply(vec![Part::Reset(Reset {
+            edge: edge.into(),
+            held: false,
+        })]);
+        let err = w.t.apply(&Event::of(vec![Part::Forced(ask)]).encode());
+        assert!(err.unwrap_err().to_string().contains("started over"));
+        assert_eq!(w.t.counters(edge, 3).forced, [0; 6]);
+    });
+}
