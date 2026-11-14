@@ -25,7 +25,9 @@ import logging
 from solera.patterns import Matcher
 
 from . import planning
+from .model import edge_id
 from .tracking import full as core_full
+from .tracking import outcomes as core_outcomes
 from .tracking import stale as core_stale
 from .tracking.full import INCOMPLETE
 
@@ -138,6 +140,9 @@ class Staleness:
             keys.update((key, list(own)) for key in owed)
             if after is None:
                 break
+        if page is not None:  # and the failing keys its retry clock has reached (STA-15)
+            edge = edge_id(asset, partition, param)
+            keys.update((key, list(own)) for key in await core_outcomes.due_keys(self.core, edge))
         if self.definition_changed(asset, partition):
             for key in await self._held_keys(input.output, input.partition):
                 if taken(key):

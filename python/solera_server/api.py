@@ -69,6 +69,12 @@ class PruneInput(BaseModel):
     dry_run: bool = False
 
 
+class KeysRetryInput(BaseModel):
+    classes: list[str] = Field(default_factory=lambda: ["failed"], max_length=10)
+    partition: str | None = None
+    by: str | None = Field(default=None, max_length=200)
+
+
 class CleanupsClearInput(BaseModel):
     output: str
     partition: str = ""
@@ -616,6 +622,15 @@ def create_app(
     async def cleanups(p: str, request: Request):
         runtime = await project_engine(request, p)
         return {"cleanups": runtime.cleanups_view()}
+
+    @app.post("/api/projects/{p}/assets/{name}/keys:retry")
+    async def retry_keys(p: str, name: str, body: KeysRetryInput, request: Request):
+        """KEY-7: call a per-key asset's failing keys of `classes` once more
+        each (`all`: every stored outcome), now: `{asset, classes,
+        partitions, runs}`, the runs it started."""
+
+        runtime = await asset_engine(request, p, name)
+        return await runtime.retry_keys(name, body.classes, body.partition, body.by or "api")
 
     @app.post("/api/projects/{p}/cleanups:clear")
     async def clear_cleanups(p: str, body: CleanupsClearInput, request: Request):
