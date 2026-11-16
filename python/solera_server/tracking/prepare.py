@@ -119,7 +119,7 @@ async def _prepare(core: Core, task: dict, run: dict, attempt: str | None) -> di
     elif again:
         full = base["full"] = True
     progress = {} if full else task.get("progress") or {}
-    plans, all_empty, plan_bytes = {}, True, None
+    plans, all_empty, plan_bytes, retry = {}, True, None, False
     mine = progress.get(WALK)
     if base["incremental"]:
         edges = open_edges(core, task, base["incremental"])
@@ -140,8 +140,19 @@ async def _prepare(core: Core, task: dict, run: dict, attempt: str | None) -> di
             # Its failures gone moot since it last looked go first: the plan reads the records.
             await outcomes.catch_up(core, edges[per_key.param], conditions(per_key.spec, base), task["asset"])
         after = (mine or {}).get("key")
+        index = 0 if mine is None else int(mine["batch"]) + 1
         mode, named = run_mode(run, keyed)
-        if mine is not None and after is None:  # its keyed inputs' walk ended: only its logs go on
+        # A per-key run takes turns (KEY-8): while a retry pass and new changes are both owed,
+        # its odd batches are the pass's. It begins a pass when one is due, and finishes it.
+        passing = (
+            per_key is not None
+            and mode == "incremental"
+            and not (mine or {}).get("held")
+            and await outcomes.begin(core, edges[per_key.param], attempt or "-")
+        )
+        ended = mine is not None and after is None
+        retry = passing and (ended or index % 2 == 1)
+        if ended:  # its keyed inputs' walk ended: only its logs, and its retries, go on
             mode, named = "keys", []
         elif (mine or {}).get("held"):  # keys held back under a rebuild: what is still owed, whatever
             mode, named = "incremental", []  # the run asked for
@@ -162,12 +173,18 @@ async def _prepare(core: Core, task: dict, run: dict, attempt: str | None) -> di
             "logs": [{"edge": edges[i.param], "limit": int(i.spec["batch_size"])} for i in logs],
         }
         try:
-            summary = await core.run(core.tracking.plan, request)
+            if not retry:
+                summary = await core.run(core.tracking.plan, request)
+                if passing and summary["hi"] is None and not any(i["keys"] for i in summary["inputs"]):
+                    ended = retry = True  # no new change: the pass's turn
+            if retry:
+                summary = await core.run(core.tracking.retry_plan, edges[per_key.param], request)
         except UnsettledError:  # a log started over since `restarted` read it: planned again, in full
             raise HeldBack("an upstream started over while the batch was planned") from None
         plan_bytes = summary["plan"]
-        hi = summary["hi"]
-        index = 0 if mine is None else int(mine["batch"]) + 1
+        hi = summary["hi"]  # a retry batch's is the pass's: None, it ends the pass
+        end = (None if ended else after) if retry else hi  # a retry batch leaves the walk where it is
+        done = hi is None and (ended if retry else not passing)
         for input, found in zip(logs, summary["logs"], strict=True):
             heads.append(
                 [input.output, input.partition, found["head"], m.life(input.output, input.partition)]
@@ -203,12 +220,12 @@ async def _prepare(core: Core, task: dict, run: dict, attempt: str | None) -> di
             heads.append(
                 [input.output, input.partition, found["head"], m.life(input.output, input.partition)]
             )
-            # The walk ends where the plan says (`hi` None). The worker is told each input's
-            # own end too: it owes nothing past the batch (a full run: holds nothing past it),
-            # though the others' go on.
-            final = hi is None
+            # The walk ends where the plan says (`hi` None), and its retry pass with it. The worker
+            # is told each input's own end too: it owes nothing past the batch (a full run: holds
+            # nothing past it), though the others' go on.
+            final = done
             own = final
-            if not final and len(keyed) > 1 and mode == "incremental":
+            if not final and len(keyed) > 1 and mode == "incremental" and not retry:
                 own = not await _more(core, input, edges[input.param], conditions(input.spec, base), hi, full)
             upstream = core.m.core_output(input.output, input.partition)
             size = int(input.spec["batch_size"])
@@ -231,7 +248,7 @@ async def _prepare(core: Core, task: dict, run: dict, attempt: str | None) -> di
                 "index": index,
                 "count": count,
                 "after": after,
-                "end": hi,
+                "end": end,
                 "final": final,
                 "full": full,
                 "classes": found["counts"],
@@ -240,7 +257,9 @@ async def _prepare(core: Core, task: dict, run: dict, attempt: str | None) -> di
     if (why := held(m, heads)) is not None:  # a head it planned on is partial
         raise HeldBack(f"{why[0]}: {why[1]}")
     more = any(not (p["final"] or p.get("done")) for p in plans.values())
-    skip = bool(base["incremental"]) and all_empty and not more and not full
+    # A retry batch that takes no key (its keys moved on, or were tried under these counters)
+    # launches nothing either: its commit moves the pass on.
+    skip = bool(base["incremental"]) and all_empty and (not more or retry) and not full
     prepared = engine._prepared(task, run, attempt, base, plans, more, skip, None)
     prepared["gate"] = heads
     if plan_bytes is not None:

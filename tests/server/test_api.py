@@ -101,6 +101,23 @@ async def test_health_and_diagnostics(client, base):
     assert diag["state"].startswith("file://")
 
 
+async def test_a_history_row_that_cannot_be_written_shows_in_diagnostics(engine, client):
+    """A run's timeline row with text where the table holds a number: the
+    flush writes the run's other rows and raises an alarm naming the bad one."""
+
+    engine.state.model.history.append("run_timeline", {"run": "r1", "n": 1, "at": 1.0, "type": "RunQueued"})
+    engine.state.model.history.append("run_timeline", {"run": "r1", "n": 2, "at": 2.0, "rows": "many"})
+    await engine.history.lake.flush(force=True)
+
+    [skipped] = (await client.get("/api/diagnostics")).json()["skipped_history_rows"]
+    assert skipped["table"] == "run_timeline" and skipped["row"]["rows"] == "'many'"
+    assert "numerical" in skipped["error"]
+    written = await engine.history.lake.query(
+        lambda con: con.execute("SELECT n FROM run_timeline").fetchall(), ("run_timeline",)
+    )
+    assert written == [(1,)] and not engine.state.model.history.rows["run_timeline"]
+
+
 async def test_auth_rejected_and_accepted(engine):
     """With a token configured every /api route requires the bearer header."""
 

@@ -489,3 +489,73 @@ async def test_real_attempts_flush_and_read_back_from_an_older_checkpoint(state,
         detail = await engine.run_detail(request["id"])
         attempts = [a for found in detail["attempts"].values() for a in found]
         assert attempts and all(a["outcome"] == "succeeded" and a.get("handle") is None for a in attempts)
+
+
+async def test_a_malformed_key_outcome_is_skipped_and_the_others_logged(state, clock, monkeypatch):
+    """An attempt's result lists its failing keys; the history reads them as
+    it flushes. One entry no worker of this version writes (not a dict, no
+    key, a list where the outcome goes) is skipped with an alarm; the good
+    ones are logged, and the next flush is not held back by it."""
+
+    engine = engine_for(state, clock)
+    entries = [
+        {"key": "a", "generation": 3, "outcome": "failed", "error": "Failed: boom", "duration": 0.5},
+        "not an entry",
+        {"generation": 4, "outcome": "failed"},
+        {"key": "c", "outcome": ["failed"]},
+        {"key": "d", "generation": 5, "outcome": "rejected", "error": "Rejected: empty", "duration": 0.1},
+    ]
+
+    async def result(run, attempt):
+        return {"key_outcomes": entries}
+
+    monkeypatch.setattr(state, "attempt_result", result)
+    stamp = {"run": "r1", "attempt": "a1", "asset": "checks", "partition": "", "at": clock.now}
+    state.model.history.append("key_outcomes", stamp)
+    await engine.history.lake.flush(force=True)
+
+    logged = await engine.history.lake.query(
+        lambda con: con.execute("SELECT key, outcome FROM key_outcomes ORDER BY key").fetchall(),
+        ("key_outcomes",),
+    )
+    assert logged == [("a", "failed"), ("d", "rejected")]
+    skipped = engine.history.lake.skipped
+    assert [s["row"]["entry"] for s in skipped] == [
+        "'not an entry'",
+        "{'generation': 4, 'outcome': 'failed'}",
+        "{'key': 'c', 'outcome': ['failed']}",
+    ]
+    assert all(s["table"] == "key_outcomes" and s["row"]["run"] == "'r1'" for s in skipped)
+    assert not state.model.history.rows["key_outcomes"]
+
+
+async def test_an_attempt_result_this_version_cannot_read_is_skipped(state, clock, monkeypatch):
+    """A per-key attempt's failing keys are read from its control file as
+    the history flushes. A file no writer of this version writes will never
+    be read: it is skipped with an alarm, and the other rows are written. A
+    store that cannot be reached keeps every row for the next flush."""
+
+    from solera.lifecycle import Malformed
+
+    engine = engine_for(state, clock)
+    answers = [ConnectionError("the store is unreachable"), Malformed("not JSON", "etag")]
+
+    async def result(run, attempt):
+        raise answers.pop(0)
+
+    monkeypatch.setattr(state, "attempt_result", result)
+    state.model.history.append("key_outcomes", {"run": "r1", "attempt": "a1", "asset": "checks", "at": 1.0})
+    state.model.history.append("runs", {"id": "r1", "created_at": 1.0, "status": "succeeded"})
+    try:
+        await engine.history.lake.flush(force=True)
+    except ConnectionError:
+        pass
+    else:
+        raise AssertionError("the flush must fail")
+    assert len(state.model.history.rows["key_outcomes"]) == 1 and not engine.history.lake.skipped
+
+    await engine.history.lake.flush(force=True)
+    [skipped] = engine.history.lake.skipped
+    assert skipped["row"]["attempt"] == "'a1'" and "not JSON" in skipped["error"]
+    assert not state.model.history.rows["key_outcomes"] and not state.model.history.rows["runs"]
+    assert state.model.history.files["runs"][0]["rows"] == 1
