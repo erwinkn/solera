@@ -20,7 +20,7 @@ from solera.sdk import (
 from solera.stores import FileStore, Patch
 from solera_server.model import edge_id, output_id
 from solera_server.planning import Planner
-from solera_server.tracking import b64, full
+from solera_server.tracking import full
 from solera_server.tracking import prepare as prepare_module
 
 from tests.contract.example import Example
@@ -517,10 +517,7 @@ async def test_a_walk_ends_where_its_plan_ends_not_where_one_inputs_probe_does(s
 
     eng.core.run = shrink_after_plan
     await solera.run("copy", mode="full")
-    edge = edge_id("copy", "", "left")
-    event = eng.core.tracking.event_watch(edge, {})
-    eng.state.record({"type": "Core", "event": b64(event)})
-    assert await eng.complete("copy", "") == await eng.core.run(eng.core.tracking.stale_complete, edge)
+    assert await eng.complete("copy", "")
     assert sorted(r["id"] for r in await solera.read("copy")) == ["a", "b"]
 
 

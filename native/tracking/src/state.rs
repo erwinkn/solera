@@ -17,13 +17,12 @@ use crate::error::{format, Result};
 use crate::event::{Event, Part};
 use crate::progress::Progress;
 use crate::retain::Retain;
-use crate::stale::Stale;
 
 /// An opaque name the engine chooses: an output (asset, partition, output
 /// name) or an edge (consumer partition, input name), encoded by Python.
 pub type Id = Box<[u8]>;
 
-pub const SNAPSHOT_FORMAT: u8 = 6;
+pub const SNAPSHOT_FORMAT: u8 = 7;
 
 /// Whether the core owns `id`: a per-key edge's record outputs
 /// (`outcomes::output_id`, a zero byte first). Their lives follow their
@@ -39,7 +38,7 @@ pub fn core_owned(id: &[u8]) -> bool {
 pub struct Output {
     /// The output's one life, never 0: given from [Tracking::lives] when the
     /// output is first named ([Tracking::name]: an edge opens on it or moves
-    /// to it, it is declared, tracked or a watch's own output, or its first
+    /// to it, it is declared or tracked, or its first
     /// commit lands), and ended only by [Tracking::end]. A retired output's commit numbers start again at 1
     /// (B9), so an id and a commit name a version only within a life: a plan
     /// names the lives it reads, its commit applies only in them, and its
@@ -69,8 +68,6 @@ pub struct Tracking {
     pub per_key: BTreeMap<Id, crate::outcomes::PerKey>,
     /// The last life given to a per-key edge (B6) or an output.
     pub lives: u64,
-    /// B7: staleness per keyed edge.
-    pub stale: Stale,
     /// B9: the cleanup cursors.
     pub retain: Retain,
 }
@@ -137,8 +134,6 @@ impl Tracking {
             Part::PassStart(p) => p.check(self),
             Part::Rebuild(p) => p.check(self),
             Part::Forced(p) => p.check(self),
-            Part::Watch(p) => p.check(self),
-            Part::Witness(p) => p.check(self),
             Part::Merged(p) => p.check(self),
             Part::Track(p) => p.check(self),
             Part::Cleaned(p) => p.check(self),
@@ -148,7 +143,6 @@ impl Tracking {
 
     fn apply_part(&mut self, p: Part) {
         crate::outcomes::follow(&p, self);
-        self.stale_touch(&p);
         match p {
             Part::EdgeOpen(p) => p.apply(self),
             Part::EdgeClose(p) => p.apply(self),
@@ -163,8 +157,6 @@ impl Tracking {
             Part::PassStart(p) => p.apply(self),
             Part::Rebuild(p) => p.apply(self),
             Part::Forced(p) => p.apply(self),
-            Part::Watch(p) => p.apply(self),
-            Part::Witness(p) => p.apply(self),
             Part::Merged(p) => p.apply(self),
             Part::Track(p) => p.apply(self),
             Part::Cleaned(p) => p.apply(self),
@@ -190,7 +182,7 @@ impl Tracking {
 
     /// Ends an output's life: its entry and its cleanup cursor leave the
     /// state, and the next naming gives it a new life. Its callers make sure
-    /// no edge or watch reads it (`Retire` refuses that, and none reads a
+    /// no edge reads it (`Retire` refuses that, and none reads a
     /// per-key edge's record outputs: see [`core_owned`]).
     pub(crate) fn end(&mut self, id: &[u8]) {
         self.retain.cursors.remove(id);
@@ -247,8 +239,8 @@ impl Tracking {
 
     /// What every state holds: each output's and per-key edge's life is above
     /// 0, at most the counter and its own; exactly the keyed edges have
-    /// per-key state; every edge's input, cleaned output and watch's own
-    /// output has a life, and none is the core's. Restore refuses a snapshot
+    /// per-key state; every edge's input and cleaned output has a life,
+    /// and none is the core's. Restore refuses a snapshot
     /// that breaks it.
     pub fn check_lives(&self) -> Result<()> {
         let mut seen = std::collections::HashSet::new();
@@ -284,17 +276,6 @@ impl Tracking {
                 String::from_utf8_lossy(id)
             ));
         }
-        let mut owns = self
-            .stale
-            .inputs
-            .values()
-            .filter_map(|i| i.watch.as_ref()?.own.as_ref());
-        if let Some(id) = owns.find(|id| !named(id)) {
-            return format(format!(
-                "a watch's own output {} has no life, or is the core's",
-                String::from_utf8_lossy(id)
-            ));
-        }
         Ok(())
     }
 
@@ -325,7 +306,6 @@ impl Tracking {
             k.encode(&mut e);
         }
         e.uv(self.lives);
-        self.stale.encode(&mut e);
         self.retain.encode(&mut e);
         e.buf
     }
@@ -367,7 +347,6 @@ impl Tracking {
                 .insert(id, crate::outcomes::PerKey::decode(&mut d)?);
         }
         t.lives = d.uv()?;
-        t.stale = Stale::decode(&mut d)?;
         t.retain = Retain::decode(&mut d)?;
         d.end()?;
         t.check_lives()?;
@@ -382,29 +361,16 @@ mod tests {
 
     /// Restore refuses a state no events reach: an output or a per-key edge
     /// with life 0 or a life given twice, per-key state other than the keyed
-    /// edges', and an edge's input or a watch's own output with no life.
+    /// edges', and an edge's input with no life.
     #[test]
     fn restore_refuses_broken_lives() {
-        use crate::stale::{SetWatch, Watch};
         let mut t = Tracking::new();
-        let parts = vec![
-            Part::EdgeOpen(EdgeOpen {
-                edge: b"e".as_slice().into(),
-                input: b"items".as_slice().into(),
-                keyed: true,
-            }),
-            Part::Watch(SetWatch {
-                edge: b"e".as_slice().into(),
-                watch: Watch {
-                    conditions: Arc::default(),
-                    own: Some(b"own".as_slice().into()),
-                    gate: false,
-                },
-            }),
-        ];
-        for part in parts {
-            t.apply(&Event::of(vec![part]).encode()).unwrap();
-        }
+        let open = Part::EdgeOpen(EdgeOpen {
+            edge: b"e".as_slice().into(),
+            input: b"items".as_slice().into(),
+            keyed: true,
+        });
+        t.apply(&Event::of(vec![open]).encode()).unwrap();
         Tracking::restore(&t.snapshot()).unwrap();
         let refused = |b: Tracking, why: &str| {
             let e = Tracking::restore(&b.snapshot()).unwrap_err();
@@ -414,8 +380,8 @@ mod tests {
         b.outputs.get_mut(b"items".as_slice()).unwrap().life = 0;
         refused(b, "has life 0");
         let mut b = t.clone();
-        let own = b.outputs[b"own".as_slice()].life;
-        b.outputs.get_mut(b"items".as_slice()).unwrap().life = own;
+        let edge = b.per_key[b"e".as_slice()].life;
+        b.outputs.get_mut(b"items".as_slice()).unwrap().life = edge;
         refused(b, "has life");
         let mut b = t.clone();
         b.per_key.get_mut(b"e".as_slice()).unwrap().life = 0;
@@ -426,9 +392,6 @@ mod tests {
         let mut b = t.clone();
         b.outputs.remove(b"items".as_slice());
         refused(b, "reads an output with no life");
-        let mut b = t.clone();
-        b.outputs.remove(b"own".as_slice());
-        refused(b, "a watch's own output");
     }
 
     #[test]

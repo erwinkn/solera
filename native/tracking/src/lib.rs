@@ -16,7 +16,6 @@
 //! - [`outcomes`]: key outcomes of per-key assets, held with their points (B6).
 //! - [`due`]: what is due by time, and retry passes (B6).
 //! - [`commit`]: output and source commits (B4).
-//! - [`stale`]: staleness kept exact at every commit (B7).
 //! - [`log`]: outputs that only append, read by commit.
 //! - [`lineage`]: what a batch received, recomputed from its record (B10).
 //! - [`retain`]: the cut, merges and cleanup (B9).
@@ -33,7 +32,6 @@ pub mod plan;
 pub mod progress;
 pub mod record;
 pub mod retain;
-pub mod stale;
 pub mod state;
 
 pub use error::{Error, Result};
