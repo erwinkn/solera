@@ -231,12 +231,14 @@ def create_app(
 
     @app.get("/healthz")
     async def health(request: Request):
+        # A liveness probe: 503 only when a restart is the fix, the journal stopped or the state
+        # broken. Something failing in the background (a merge, an automation, a reload) is
+        # degraded: a restart would fix none of it, and its error is in /api/diagnostics only,
+        # since this route is unauthenticated.
         runtime = engine_of(request)
-        healthy = not runtime.state.poisoned and not runtime.failing
-        return JSONResponse(
-            {"status": "ok" if healthy else "unavailable", "backend": "object-store"},
-            status_code=200 if healthy else 503,
-        )
+        if runtime.state.poisoned:
+            return JSONResponse({"status": "unavailable", "backend": "object-store"}, status_code=503)
+        return {"status": "degraded" if runtime.failing else "ok", "backend": "object-store"}
 
     @app.get("/api/diagnostics")
     async def diagnostics(request: Request):

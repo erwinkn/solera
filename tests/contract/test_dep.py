@@ -296,7 +296,8 @@ async def test_dep_2_a_local_serve_reloads_on_code_changes_and_keeps_its_deploy_
         broken = await until(lambda now: now[2] is not None)
         assert broken[:2] == second[:2]  # the burst made one deploy, and the broken edit none
         assert "previous deploy" in broken[2]
-        assert (await solera.client.get("/healthz")).status_code == 503
+        health = await solera.client.get("/healthz")  # alive: a restart would load the same broken code
+        assert (health.status_code, health.json()["status"]) == (200, "degraded")
         helpers.write_text("def f(): return 5\n")
         third = await until(lambda now: now[0] > second[0])
         assert third[1] != second[1] and third[2] is None
