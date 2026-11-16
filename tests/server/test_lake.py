@@ -297,3 +297,89 @@ async def test_a_mirror_that_failed_does_not_poison_later_queries(tmp_path, monk
     except ValueError:
         pass
     assert failed and await lake.query(rows, ("events",)) == [("a", 1)]
+
+
+async def test_a_row_that_cannot_be_encoded_is_skipped_and_the_others_written(tmp_path):
+    """A text value in a number column: the flush halves the rows until it
+    finds the one to blame, writes the other four, and keeps the bad one as
+    an alarm. The buffer empties: the next flush does not trip on it again."""
+
+    store = Store(tmp_path)
+    lake = Lake(store, SCHEMA, lambda: store.lake, name="Log", clock=lambda: 100.0)
+    for n in range(5):
+        store.lake.append("events", {"run": f"r{n}", "at": float(n), "n": "x" * 500 if n == 3 else n})
+    await lake.flush(force=True)
+
+    assert await lake.query(rows, ("events",)) == [("r0", 0), ("r1", 1), ("r2", 2), ("r4", 4)]
+    assert not store.lake.rows["events"] and store.lake.files["events"][0]["rows"] == 4
+    [skipped] = lake.skipped
+    assert skipped["table"] == "events" and skipped["row"]["run"] == "'r3'" and skipped["at"] == 100.0
+    assert skipped["row"]["n"].endswith("… (502 characters)") and len(skipped["row"]["n"]) < 250
+    store.lake.append("events", {"run": "r5", "at": 5.0, "n": 5})
+    await lake.flush(force=True)
+    assert len(store.lake.files["events"]) == 2 and len(lake.skipped) == 1
+
+
+async def test_bad_rows_in_two_tables_are_skipped_alone(tmp_path):
+    """One table whose rows are all bad has no file, yet its rows leave the
+    buffer; the other table's good rows are written beside its bad one."""
+
+    schema = {
+        **SCHEMA,
+        "marks": Table("run", "at", {"run": "VARCHAR", "at": "DOUBLE", "value": "DOUBLE"}),
+    }
+    store = Store(tmp_path)
+    store.lake = LakeState(schema)
+    lake = Lake(store, schema, lambda: store.lake, name="Log")
+    store.lake.append("events", {"run": "a", "at": 1.0, "n": 1})
+    store.lake.append("events", {"run": "b", "at": 2.0, "n": "two"})
+    store.lake.append("marks", {"run": "a", "at": 1.0, "value": float("nan")})  # JSON has no NaN
+    await lake.flush(force=True)
+
+    assert await lake.query(rows, ("events",)) == [("a", 1)]
+    assert "marks" not in store.lake.files and not store.lake.rows["marks"] and not store.lake.rows["events"]
+    assert sorted((s["table"], s["row"]["run"]) for s in lake.skipped) == [
+        ("events", "'b'"),
+        ("marks", "'a'"),
+    ]
+
+
+async def test_a_failure_to_store_or_to_use_the_disk_keeps_every_row(tmp_path, monkeypatch):
+    """The store is down, or the local disk is full: no row is to blame, so
+    none is skipped. Every row stays buffered, bad one included, and the
+    next flush, once the store is back, writes the good ones."""
+
+    store = Store(tmp_path)
+    lake = Lake(store, SCHEMA, lambda: store.lake, name="Log")
+    store.lake.append("events", {"run": "a", "at": 1.0, "n": 1})
+    store.lake.append("events", {"run": "b", "at": 2.0, "n": "two"})
+    create = store.create_object
+
+    async def down(path, data):
+        raise ConnectionError("the store is unreachable")
+
+    store.create_object = down
+    try:
+        await lake.flush(force=True)
+    except ConnectionError:
+        pass
+    else:
+        raise AssertionError("the flush must fail")
+    encode = lake._encode
+
+    def full(table, rows):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(lake, "_encode", full)
+    try:
+        await lake.flush(force=True)
+    except OSError:
+        pass
+    else:
+        raise AssertionError("the flush must fail")
+    assert len(store.lake.rows["events"]) == 2 and not lake.skipped and not list(tmp_path.rglob("*.parquet"))
+
+    store.create_object = create
+    monkeypatch.setattr(lake, "_encode", encode)
+    await lake.flush(force=True)
+    assert await lake.query(rows, ("events",)) == [("a", 1)] and len(lake.skipped) == 1
