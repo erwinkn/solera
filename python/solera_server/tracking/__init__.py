@@ -137,6 +137,7 @@ class Core:
         self.locks: dict[bytes, asyncio.Lock] = {}  # output id -> held while a commit of it is built
         self.plans: dict[str, bytes] = {}  # attempt -> its plan, while it runs here (else its spec's)
         self._attached: tuple[int, set[bytes]] = (0, set())
+        self.merges_failed: dict[bytes, float] = {}  # output id -> when its last merge failed
 
     @property
     def m(self):

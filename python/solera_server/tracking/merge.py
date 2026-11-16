@@ -21,6 +21,8 @@ need comes with cleanup (build plan B9).
 from __future__ import annotations
 
 import logging
+import math
+import time
 
 from solera._native import retain_merge, retain_merge_plan, retain_merges_due
 
@@ -33,29 +35,48 @@ JOB = "merge"  # the one merge running, among upkeep's jobs
 
 
 def start(engine) -> None:
-    """Start the next merge that is due, unless one is running."""
+    """Start the next merge that is due, unless one is running. An output
+    whose last merge failed goes behind the others, the least recently
+    failed first: one that cannot merge (a layer it cannot read) never
+    holds up the others' merges."""
 
     jobs = engine.upkeep.jobs
     if JOB in jobs:
         return
-    due = retain_merges_due(engine.m.core)
+    due, failed = retain_merges_due(engine.m.core), engine.core.merges_failed
+    for id_ in set(failed) - set(due):  # merged since, or retired: nothing to alarm about
+        del failed[id_]
+        engine.failing.pop(_alarm(id_), None)
+    due.sort(key=lambda id_: failed.get(id_, -math.inf))
     if due:
         jobs.spawn(merge(engine.core, due[0]), JOB)
 
 
+def _alarm(id_: bytes) -> str:
+    return f"merge {id_.decode(errors='replace')}"
+
+
 async def merge(core: Core, id_: bytes) -> bool:
     """Merge the layers the size rule picks on output `id_`, and record it.
-    False when there was nothing to do, or the output moved on meanwhile."""
+    False when there was nothing to do, or the output moved on meanwhile.
+    A merge that fails is alarmed (`failing`) until one of the output succeeds."""
 
     m, generation = core.m, Generation(core.m)
     life = (m.core.output(id_) or {}).get("life")
-    # Held at commit 0: every entry is kept, none folds into a base.
-    plan = retain_merge_plan(m.core, id_, [(id_, 0, "run", b"history")])
-    if plan is None:
-        return False
-    core.attach(id_)
-    path = core.path(life, 0, "merge")
-    found = await core.run(retain_merge, m.core, plan, path)
+    try:
+        # Held at commit 0: every entry is kept, none folds into a base.
+        plan = retain_merge_plan(m.core, id_, [(id_, 0, "run", b"history")])
+        if plan is None:
+            return False
+        core.attach(id_)
+        path = core.path(life, 0, "merge")
+        found = await core.run(retain_merge, m.core, plan, path)
+    except Exception as error:
+        core.merges_failed[id_] = time.monotonic()
+        core.engine.failing[_alarm(id_)] = f"{type(error).__name__}: {error}"
+        raise
+    core.merges_failed.pop(id_, None)
+    core.engine.failing.pop(_alarm(id_), None)
     try:
         generation.check()  # a deploy may have retired the output and named another
         core.record(found["event"], garbage=found["replaced"])
