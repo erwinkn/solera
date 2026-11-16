@@ -866,8 +866,6 @@ class Model:
         elif e.get("commit"):
             task.pop("restart", None)
         self._cleaned_up((task.get("cleanup") or {}).get("partition", task["partition"]), e, prepared)
-        if launched is not None and not e.get("commit") and False:
-            self._abandoned(task["partition"], e["attempt"], launched, at + float(e.get("late_writes") or 0))
         usage = (e.get("worker") or {}).get("usage") or {}
         summary = {
             "id": e["attempt"],

@@ -103,7 +103,8 @@ SELECT r.oid IS NOT NULL AS present,
     WHERE x.indrelid = r.oid), '{}') AS indexes,
   coalesce((SELECT array_agg(g.rolname::text) FROM pg_roles g WHERE g.rolname = ANY(%(grants)s)
     AND NOT (r.oid IS NOT NULL AND has_table_privilege(g.oid, r.oid, 'SELECT'))), '{}') AS ungranted,
-  to_regclass(%(build)s) IS NOT NULL AS building
+  to_regclass(%(build)s) IS NOT NULL AS building,
+  CASE WHEN row_security_active(r.oid) THEN current_user::text END AS hidden_from
 FROM (SELECT (SELECT c.oid FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
   WHERE n.nspname = %(schema)s AND c.relname = %(name)s AND c.relkind IN ('r', 'p', 'v', 'f')) AS oid) AS r
 """
@@ -457,7 +458,11 @@ class PostgresStore:
         (`_STATE`), read after the check's lock is held, never before: a
         lookup made before a wait does not see what the transaction it
         waited for did (probes P3, P4, R10, R11). The three statements go
-        in one pipeline."""
+        in one pipeline.
+
+        A table whose row security applies to our role is refused: a
+        delete would remove only the rows the role sees, and the hidden
+        ones would stay beside the new. The refusal rolls the check back."""
 
         fenced = context is not None and context.generation is not None
         if fenced:
@@ -469,6 +474,12 @@ class PostgresStore:
                 check.execute(*self._check_sql(table, context, write))
             state.execute(_STATE, self._state_params(table, context.partition if context else ""))
             taken, found = (check.fetchone() if fenced else None), state.fetchone()
+        if found["hidden_from"] is not None:
+            raise StoreError(
+                f"{table}: row security applies to role {found['hidden_from']}, so a write would "
+                "delete only the rows it can see. Connect as a role that bypasses it: the table's "
+                "owner, if the table does not FORCE ROW LEVEL SECURITY, or a role with BYPASSRLS"
+            )
         return (self._checked(taken, context) if fenced else None), found
 
     def _state_params(self, table: str, partition: str = "") -> dict:

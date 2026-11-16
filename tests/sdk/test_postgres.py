@@ -1585,3 +1585,71 @@ async def test_a_log_s_full_run_in_batches_switches_once_too(store):
     )
     assert sorted(sql(f"SELECT n, _commit FROM {table}")) == [(10, 1), (20, 2)]
     assert [r["n"] for r in await store.load(two.ref, list[dict], None)] == [10, 20]
+
+
+async def test_a_build_a_failed_switch_left_is_continued_by_the_runs_next_write(store):
+    """The last batch's switch fails and leaves the build (above). The run's
+    next write, that batch again once the conflict is gone, writes to the
+    build and switches: the table gets the first batch's rows and its own."""
+
+    out = keyed_output(partition_column="site", columns={"site": "text", "id": "text", "v": "text"})
+    await store.store(rows(a="1"), None, at(out, 1, partition="x"))
+    old = await store.store(rows(b="2"), None, at(out, 2, partition="y"))
+    table, _, _ = store._table(out)
+    sql(f"CREATE UNIQUE INDEX {out.name}_v ON {table} (v)")
+    one = await store.store(Patch(rows(b="1")), old.ref, batch(out, 3, first=True, partition="y"))
+    with pytest.raises(WriteError):
+        await store.store(Patch(rows(c="5")), one.ref, batch(out, 4, last=True, partition="y"))
+    sql(f"DROP INDEX public.{out.name}_v")
+    again = await store.store(Patch(rows(c="5")), one.ref, batch(out, 5, last=True, partition="y"))
+    assert outside(store, out, "y") == {"b": "1", "c": "5"} == await solera(store, again.ref)
+    assert builds_of(store, out) == []
+
+
+# -- row security ----------------------------------------------------------------------------
+
+
+@pytest.fixture
+def owner():
+    """A store connected as a plain role that is a member of the tables'
+    owner, so the tables are its own: a superuser, as the tests connect,
+    bypasses row security even when a table forces it."""
+
+    import psycopg
+    from solera_postgres import PostgresStore
+
+    role = f"solera_rls_{uuid.uuid4().hex[:8]}"
+    sql(f"CREATE ROLE {role} IN ROLE {sql('SELECT current_user')[0][0]}")
+    yield PostgresStore(psycopg.conninfo.make_conninfo(DSN, options=f"-c role={role}")), role
+    sql(f"DROP ROLE {role}")
+
+
+async def test_a_write_is_refused_when_row_security_applies_to_its_role(store, owner):
+    """With row security on our role, a delete removes only the rows the
+    role sees, and the hidden ones would stay beside the new. The write is
+    refused before it changes anything: its version check is rolled back."""
+
+    plain, role = owner
+    out = keyed_output(incremental=True)
+    first = await store.store(rows(a="1", b="1"), None, at(out, 1))
+    table, _, _ = store._table(out)
+    sql(f"ALTER TABLE {table} ENABLE ROW LEVEL SECURITY, FORCE ROW LEVEL SECURITY")
+    sql(f"CREATE POLICY hide_b ON {table} USING (id <> 'b')")  # a reset would keep b
+    with pytest.raises(StoreError, match=f"row security applies to role {role}") as refused:
+        await plain.store(rows(c="2"), first.ref, at(out, 2, reset=True))
+    assert table in str(refused.value) and "BYPASSRLS" in str(refused.value)
+    assert outside(store, out) == {"a": "1", "b": "1"} and registry(store, out) == (1, 1)
+
+
+async def test_a_write_is_not_refused_when_row_security_does_not_apply_to_its_role(store, owner):
+    """Row security enabled but not forced does not apply to the table's
+    owner: with no policy it would hide every row from anyone else."""
+
+    plain, _ = owner
+    out = keyed_output(incremental=True)
+    first = await store.store(rows(a="1", b="1"), None, at(out, 1))
+    table, _, _ = store._table(out)
+    sql(f"ALTER TABLE {table} ENABLE ROW LEVEL SECURITY")
+    written = await plain.store(Patch(rows(b="2")), first.ref, at(out, 2))
+    assert outside(store, out) == {"a": "1", "b": "2"} == await solera(plain, written.ref)
+    assert registry(store, out) == (2, 2)
