@@ -140,3 +140,52 @@ async def test_replaced_layers_outlive_whoever_was_reading_them(solera):
     ref = engine.m.heads[("events", "")]["ref"]
     life = engine.m.core.output(output_id("events", ""))["life"]
     assert f"core/{life}/" in engine._prefixes({"events": {"ref": ref}}, {}, {"partition": ""})
+
+
+async def test_an_output_that_cannot_merge_holds_up_no_other(solera, monkeypatch):
+    """`events` and `others` both have layers to merge; every merge of the
+    first fails (a layer it cannot read). `others` merges all the same, and
+    the failure is alarmed until `events` merges too."""
+
+    @asset(outputs=Output("events", incremental=True))
+    def events():
+        return Patch([{"n": 1}])
+
+    @asset(outputs=Output("others", incremental=True))
+    def others():
+        return Patch([{"n": 2}])
+
+    await solera.deploy(Project(assets=[events, others], default_store=FileStore(solera.root / "data")))
+    start = merge.start
+    monkeypatch.setattr(merge, "start", lambda engine: None)  # their layers pile up meanwhile
+    for _ in range(8):
+        await solera.run("events")
+        await solera.run("others")
+    monkeypatch.setattr(merge, "start", start)
+    engine, real, plan_of = solera.engine, merge.retain_merge, merge.retain_merge_plan
+    [first, *_] = merge.retain_merges_due(engine.m.core)  # the one tried first, until now always
+    broken, fine = ("events", "others") if first == output_id("events", "") else ("others", "events")
+    planned = {}  # a plan's object id -> its output's
+
+    def plan(tracking, id_, pins):
+        found = plan_of(tracking, id_, pins)
+        planned[id(found)] = id_
+        return found
+
+    def unreadable(tracking, plan, path):
+        if planned[id(plan)] == output_id(broken, ""):
+            raise OSError("a layer cannot be read")
+        return real(tracking, plan, path)
+
+    monkeypatch.setattr(merge, "retain_merge_plan", plan)
+    monkeypatch.setattr(merge, "retain_merge", unreadable)
+    for _ in range(20):
+        await engine.tick()
+        if job := engine.upkeep.jobs.get(merge.JOB):
+            await asyncio.wait([job])
+    assert len(layers(solera, fine)) < 6 and len(layers(solera, broken)) == 8
+    assert engine.failing == {f"merge {output_id(broken, '').decode()}": "OSError: a layer cannot be read"}
+
+    monkeypatch.setattr(merge, "retain_merge", real)
+    await merged(solera)
+    assert len(layers(solera, broken)) < 6 and engine.failing == {}

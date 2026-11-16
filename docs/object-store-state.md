@@ -290,7 +290,7 @@ status are derived inside `apply`; they are not events.
 | `AutomationChanged` | `name`, `enabled` | |
 | `AutomationFired` | `name`, `at`, `run` | clears its pending set |
 | `RunArchived` | `run`, `at` | drops a finished run from memory; its rows join the pending history (§7) |
-| `HistoryFlushed` | `files` {table: file}, `upto` {table: row seq} | installs one Parquet file per table and drops the rows it holds |
+| `HistoryFlushed` | `files` {table: file}, `upto` {table: row seq} | installs one Parquet file per table and drops the buffered rows up to `upto` (a table whose rows all failed to encode has no file) |
 | `HistoryCompacted` | `changes` [{`table`, `removed` [path], `added?` file}], `at` | swaps merged or purged files in; the removed ones become garbage |
 | `RunsDeleted` | `runs`, `files`, `at` | retires runs for good: drops their pending rows, hides them in files that may hold them, and queues the directories of `files` (runs that launched anything) for deletion (§11) |
 | `RunsPurged` | `runs` | their directories are deleted |
@@ -636,7 +636,10 @@ column order, so the checkpoint doesn't repeat column names on every row.
 file (zstd, sorted by the table's time column), and `HistoryFlushed`
 installs them. It happens once 2,000 rows are buffered or the oldest has
 waited a minute, so the checkpoint never carries more than a minute or so
-of history.
+of history. A row that cannot be encoded (a text value in a number column)
+is found by halving the table's rows, left out, logged at error level and
+listed under `skipped_history_rows` in `/api/diagnostics`; the others are
+written. A failure to store a file keeps every row buffered for the next try.
 
 **Merging.** The lake keeps each file's row count, time range and key
 range. Files are grouped in size tiers — up to 1,000 rows, then ×4 per

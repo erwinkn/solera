@@ -134,3 +134,26 @@ async def test_a_sibling_output_loses_removed_keys_after_one_output_moves(solera
     await solera.run("both", expect=None)  # anything owed is taken now
     state["y after another run"] = sorted(await solera.rows("y"))
     assert state["y after another run"] == ["a", "b"], f"y keeps a key removed upstream: {state}"
+
+
+async def test_a_partition_whose_completeness_cannot_be_checked_stops_no_other(solera, monkeypatch):
+    """Every eval tick first checks whether the partitions still walking an
+    input are complete. One whose check raises (an upstream layer it cannot
+    read) is logged; the tick goes on, and other work still dispatches."""
+
+    @asset
+    def lonely():
+        return 1
+
+    await solera.deploy(Project(assets=[lonely], default_store=FileStore(solera.root / "data")))
+    engine = solera.engine
+    complete = engine.complete
+
+    async def unreadable(asset, partition):
+        if asset == "lonely":
+            raise OSError("a layer cannot be read")
+        return await complete(asset, partition)
+
+    monkeypatch.setattr(engine.m, "walking", lambda: {("lonely", "")})
+    monkeypatch.setattr(engine, "complete", unreadable)
+    await solera.run("lonely", timeout=5)

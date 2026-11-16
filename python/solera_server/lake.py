@@ -7,7 +7,8 @@ carries. A `Lake`, memory only, does the rest:
 
 - flush: once a buffer holds `flush_rows` rows, or its oldest row has waited
   `flush_seconds`, each table's rows go out as one Parquet file under
-  `{prefix}/{table}/`;
+  `{prefix}/{table}/`; a row that cannot be encoded is left out, logged and
+  kept in `skipped`, so one bad row never holds the others back;
 - merge: small files are rewritten into bigger ones, `merge_width` neighbours
   of one size tier at a time, on a worker thread;
 - forget: rows are deleted by key — at once from the buffer, and from files
@@ -119,9 +120,13 @@ class LakeState:
                     f.setdefault("hidden_at", at)
 
     def flushed(self, files: dict[str, dict], upto: dict[str, int]) -> None:
-        for table, f in files.items():
-            self.files.setdefault(table, []).append(f)
-            self.rows[table] = [r for r in self.rows.get(table, ()) if r[0] > upto[table]]
+        """Install the files written and drop the rows they hold. A table
+        whose rows all failed to encode has no file: its rows go all the same."""
+
+        for table, seq in upto.items():
+            if table in files:
+                self.files.setdefault(table, []).append(files[table])
+            self.rows[table] = [r for r in self.rows.get(table, ()) if r[0] > seq]
 
     def compacted(self, changes: list[dict]) -> list[str]:
         """Swap merged files in, each where the first it replaces was; the
@@ -184,6 +189,8 @@ class Lake:
         self.check_seconds = min(flush_seconds, 1.0)
         self.tasks = Tasks(self.prefix)  # its tick, then the merge under way (one at a time)
         self.failing: dict[str, str] = {}  # what fails now, by name: the engine's, once it has this lake
+        # rows a flush left out because they could not be encoded, latest last: an alarm, in memory
+        self.skipped: list[dict] = []
         self._db = None  # in-memory DuckDB mirroring the buffers
         self._mirrored: dict[str, tuple] = {}  # table -> (state, generation, first seq, last seq)
         # One thread mirrors the buffers and opens queries' transactions, in the
@@ -248,10 +255,13 @@ class Lake:
         for t, rows in volatile.items():
             batches[t] = batches.get(t, []) + rows
             upto.setdefault(t, 0)
-        files = {}
+        files, skipped = {}, []
         try:
             for table, rows in batches.items():
-                files[table] = await self._write(table, rows)
+                written, left = await self._write(table, rows)
+                if written is not None:
+                    files[table] = written
+                skipped += [(table, values, error) for values, error in left]
         except BaseException:
             await self._cleanup([f["path"] for f in files.values()])
             raise
@@ -262,9 +272,21 @@ class Lake:
                 await self._cleanup([f["path"] for f in files.values()])
                 return
         self.state.record({"type": f"{self.name}Flushed", "files": files, "upto": upto})
+        for table, values, error in skipped:
+            self.skip(table, dict(zip(self.schema[table].columns, values, strict=True)), error)
         for table, rows in volatile.items():
             del self.volatile[table][: len(rows)]
         self._expanded = {k: v for k, v in self._expanded.items() if k[1] > upto.get(k[0], 0)}
+
+    def skip(self, table: str, row: dict, error: Exception) -> None:
+        """Report a row left out of `table`, so the others are not held
+        back: logged at error level and kept in `skipped`, its values cut
+        to 200 characters."""
+
+        shown = {c: _shown(v) for c, v in row.items()}
+        log.error("%s: a %s row is skipped: %s: %s", self.prefix, table, error, shown)
+        self.skipped.append({"table": table, "row": shown, "error": str(error), "at": self.clock()})
+        del self.skipped[:-SKIPPED_KEPT]
 
     async def _expand(self, tables) -> None:
         """Read what the buffered rows of `tables` stand for (`expand`), each
@@ -292,12 +314,46 @@ class Lake:
         spec = self.schema[table]
         return values[list(spec.columns).index(spec.time)]
 
-    async def _write(self, table: str, rows: list[list]) -> dict:
-        path = f"{self.prefix}/{table}/{ulid(self.clock())}.parquet"
-        data, stats = await asyncio.to_thread(self._encode, table, rows)
+    async def _write(self, table: str, rows: list[list]) -> tuple[dict | None, list[tuple]]:
+        """Write `rows` as one file, less any row that cannot be encoded: the
+        file (None if no row is left), and the rows left out, `(values,
+        error)`. A failure to store the file raises: the flush is void, and
+        every row stays buffered."""
+
+        path, skipped = f"{self.prefix}/{table}/{ulid(self.clock())}.parquet", []
+        if not rows:  # buffered rows that stand for none (`expand`): a file would have no key range
+            return None, skipped
+        try:
+            data, stats = await asyncio.to_thread(self._encode, table, rows)
+        except MACHINE_ERRORS:
+            raise
+        except Exception as error:
+            rows, skipped = await self._encodable(table, rows, error)
+            if not rows:
+                return None, skipped
+            data, stats = await asyncio.to_thread(self._encode, table, rows)
         await self.state.create_object(path, data)
         self._keep(path, data)
-        return {"path": path, **stats, "bytes": len(data)}
+        return {"path": path, **stats, "bytes": len(data)}, skipped
+
+    async def _encodable(self, table: str, rows: list[list], error: Exception) -> tuple[list, list]:
+        """Of `rows`, which failed to encode with `error`, the rows that
+        encode and those to blame, `(values, error)`: each half is tried
+        alone, down to single rows."""
+
+        if len(rows) == 1:
+            return [], [(rows[0], error)]
+        good, bad = [], []
+        for half in (rows[: len(rows) // 2], rows[len(rows) // 2 :]):
+            try:
+                await asyncio.to_thread(self._encode, table, half)
+                good += half
+            except MACHINE_ERRORS:
+                raise
+            except Exception as failed:
+                kept, blamed = await self._encodable(table, half, failed)
+                good, bad = good + kept, bad + blamed
+        return good, bad
 
     def _encode(self, table: str, rows: list[list]) -> tuple[bytes, dict]:
         """Rows as a Parquet file, sorted by the table's time column."""
@@ -650,6 +706,21 @@ class Lake:
                 return work(con)
             finally:
                 con.close()
+
+
+# What fails to encode for the machine's sake, not the rows': the local disk, memory.
+# The flush is tried again later with every row, as when the store fails.
+MACHINE_ERRORS = (OSError, MemoryError, duckdb.OperationalError)
+SKIPPED_KEPT = 100  # skipped rows the alarm keeps, the latest
+
+
+def _shown(value, limit: int = 200) -> str | None:
+    """A value as a log shows it, cut to `limit` characters."""
+
+    if value is None:
+        return None
+    text = repr(value)
+    return text if len(text) <= limit else f"{text[:limit]}… ({len(text)} characters)"
 
 
 def _sql_str(value: str) -> str:

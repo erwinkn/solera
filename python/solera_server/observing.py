@@ -6,11 +6,14 @@ derived from its incremental inputs' edges and never stored."""
 from __future__ import annotations
 
 import json
+import logging
 
 from . import planning
 from .model import edge_id
 from .tracking import Generation, Redeployed
 from .tracking import stale as core_stale
+
+log = logging.getLogger(__name__)
 
 
 class Observing:
@@ -106,7 +109,10 @@ class Observing:
 
         for asset, partition in sorted(self.m.walking()):
             if asset in self.manifest["assets"]:
-                await self.complete(asset, partition)
+                try:
+                    await self.complete(asset, partition)
+                except Exception:  # one partition's check (an upstream layer it cannot read) stops no other
+                    log.exception("checking whether %s %r is complete", asset, partition)
 
     def _full_run(self, task: dict, run: dict) -> str | None:
         """Why the task's next batch is a full run's, if it is: its run is
