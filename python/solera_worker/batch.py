@@ -345,6 +345,27 @@ async def each(asset, project, ctx, args: dict, param: str, batch: dict, timelin
     )
 
 
+async def refuse(batch: dict, o, refused: Mapping[str, str]) -> None:
+    """Keys of a per-key batch whose rows the table refused (`Written.refused`):
+    failing keys, as if their call had raised an unexpected error (`failed`),
+    with the table's message. The store wrote nothing of them, so they keep
+    what they had (KEY-3): the write the engine commits (`o`, read again)
+    leaves them out, and so do the batch's counts and history rows."""
+
+    for key, message in refused.items():
+        batch["outcomes"].append([key, errors.FAILED, message, None, None])
+    batch["outcomes"].sort(key=lambda row: row[0])
+    counts = batch["keys"]
+    counts["ok"] -= len(refused)
+    counts[errors.FAILED] = counts.get(errors.FAILED, 0) + len(refused)
+    for row in batch["rows"]:
+        if row["key"] in refused:
+            row.update(outcome=errors.FAILED, error=refused[row["key"]])
+    rows = {key: value for key, value in o.value.rows.items() if key not in refused}
+    o.value = Patch(rows, remove=o.value.remove)
+    await prepare(o)
+
+
 # -- logs ----------------------------------------------------------------------------
 
 PART_BYTES = 1 << 20  # about what a part of a log's commit holds, encoded
