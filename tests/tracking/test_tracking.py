@@ -23,103 +23,95 @@ HISTORIES = int(os.environ.get("SOLERA_TRACKING_HISTORIES", "200"))
 SLOW = 5000
 
 
-def _staleness(form: str, histories: int) -> None:
+def _staleness(histories: int) -> None:
     for seed in range(histories):
         events = staleness.history(random.Random(seed), 40)
-        r = staleness.run(events, form)
+        r = staleness.run(events)
         assert r is None, f"seed {seed}, step {r[0]} {events[r[0]]}: {r[1]}"
 
 
-def _fullrun(form: str, kind: str, histories: int) -> None:
+def _fullrun(kind: str, histories: int) -> None:
     for seed in range(histories):
         events = fullrun.history(random.Random(seed), 60)
-        r = fullrun.run(events, form, kind)
+        r = fullrun.run(events, kind)
         assert r is None, f"seed {seed}, step {r[0]}: {r[1]}"
 
 
-@pytest.mark.parametrize("form", staleness.RULES)
-def test_a_staleness_form_answers_exactly(form):
-    _staleness(form, HISTORIES)
+def test_staleness_answers_exactly():
+    _staleness(HISTORIES)
 
 
 @pytest.mark.parametrize("kind", ["file", "table"])
-@pytest.mark.parametrize("form", fullrun.RULES)
-def test_a_full_run_form_ends_where_it_should_and_misleads_no_reader(form, kind):
-    _fullrun(form, kind, HISTORIES)
+def test_a_full_run_ends_where_it_should_and_misleads_no_reader(kind):
+    _fullrun(kind, HISTORIES)
 
 
 @pytest.mark.slow
-@pytest.mark.parametrize("form", staleness.RULES)
-def test_a_staleness_form_answers_exactly_long(form):
-    _staleness(form, SLOW)
+def test_staleness_answers_exactly_long():
+    _staleness(SLOW)
 
 
 @pytest.mark.slow
 @pytest.mark.parametrize("kind", ["file", "table"])
-@pytest.mark.parametrize("form", fullrun.RULES)
-def test_a_full_run_form_holds_long(form, kind):
-    _fullrun(form, kind, SLOW)
+def test_a_full_run_holds_long(kind):
+    _fullrun(kind, SLOW)
 
 
 def _run(key: tuple, off: frozenset[str]):
-    model, form, kind, _ = key
+    model, kind, _ = key
     events = CALIBRATIONS[key]
-    return staleness.run(events, form, off) if model == "staleness" else fullrun.run(events, form, kind, off)
+    return staleness.run(events, off) if model == "staleness" else fullrun.run(events, kind, off)
 
 
 @pytest.mark.parametrize("key", list(CALIBRATIONS), ids=lambda k: "-".join(k))
 def test_each_rule_is_needed(key):
     assert _run(key, frozenset()) is None
-    assert _run(key, frozenset({key[3]})) is not None
+    assert _run(key, frozenset({key[2]})) is not None
 
 
 def test_every_rule_has_its_history():
-    rules = {("staleness", f, r) for f, rs in staleness.RULES.items() for r in rs}
-    rules |= {("fullrun", f, r) for f, rs in fullrun.RULES.items() for r in rs}
-    assert {(m, f, r) for m, f, _, r in CALIBRATIONS} == rules
+    rules = {("staleness", r) for r in staleness.RULES} | {("fullrun", r) for r in fullrun.RULES}
+    assert {(m, r) for m, _, r in CALIBRATIONS} == rules
 
 
-@pytest.mark.parametrize("form", fullrun.RULES)
-def test_a_reader_of_an_accumulating_table_holds_back_what_its_batch_in_flight_finds_half_built(form):
-    assert fullrun.run(REPORT_IN_FLIGHT, form, "table") is None
-    r = fullrun.run(REPORT_IN_FLIGHT, form, "table", frozenset({"hold_back"}))
+def test_a_reader_of_an_accumulating_table_holds_back_what_its_batch_in_flight_finds_half_built():
+    assert fullrun.run(REPORT_IN_FLIGHT, "table") is None
+    r = fullrun.run(REPORT_IN_FLIGHT, "table", frozenset({"hold_back"}))
     assert r is not None and "unfinished rebuild" in r[1]
 
 
 # -- the design's examples ---------------------------------------------------------
 TALLY = [  # §3's story: tally reads items with batch_size=2
-    ("up", (("k1", 1), ("k2", 1), ("k3", 1)), False),
+    ("up", (("k1", 1), ("k2", 1), ("k3", 1))),
     ("plan", 2),
     ("commit", (), ()),
-    ("up", (("k2", 2), ("k4", 2)), False),
+    ("up", (("k2", 2), ("k4", 2))),
     ("plan", 2),
     ("commit", (), ()),
-    ("up", (("k3", None), ("k5", 3)), False),
-    ("up", (("k1", 4),), False),
+    ("up", (("k3", None), ("k5", 3))),
+    ("up", (("k1", 4),)),
     ("plan", 2),
     ("commit", (), ()),
     ("cancel",),
 ]
 
 
-def test_tallys_witness_follows_the_amendment():
-    witness = oracle.replay_staleness(TALLY)
-    assert witness.prog.pieces[0][2][1] == 4 and witness.prog.pieces[1][2][1] == 2
-    assert witness.form.state == ("stale", "k3")  # the amendment: "probe finds k3, removed at c3"
-    assert oracle.due(witness) == ["k3", "k5"]
+def test_tally_is_stale_by_what_its_canceled_run_left():
+    w = oracle.replay_staleness(TALLY)
+    assert w.prog.pieces[0][2][1] == 4 and w.prog.pieces[1][2][1] == 2
+    assert w.stale() and oracle.due(w) == ["k3", "k5"]  # k3 was removed at c3
 
 
 def test_a_revert_raises_no_alarm():
     events = [
-        ("up", (("k1", 1),), False),
+        ("up", (("k1", 1),)),
         ("plan", 2),
         ("commit", (), ()),
-        ("up", (("k1", 2),), False),
-        ("up", (("k1", 1),), False),
+        ("up", (("k1", 2),)),
+        ("up", (("k1", 1),)),
     ]
-    for form in staleness.RULES:
-        w = oracle.replay_staleness(events, form)
-        assert w.form.answer() == ("fresh",) and oracle.due(w) == []
+    w = oracle.replay_staleness(events)
+    assert not w.stale() and oracle.due(w) == []
 
 
 def test_archive_sees_a_full_run_of_copy_the_way_the_design_tells_it():
@@ -170,42 +162,37 @@ def test_the_log_answers_from_entries_what_its_states_say():
 
 def test_a_pattern_change_owes_only_the_keys_that_change_membership():
     w = oracle.replay_staleness(
-        [("up", (("k2", 1), ("k3", 1), ("x1", 1)), False), ("plan", 6), ("commit", (), ()), ("pat", 2)]
+        [("up", (("k2", 1), ("k3", 1), ("x1", 1))), ("plan", 6), ("commit", (), ()), ("pat", 2)]
     )
     assert oracle.due(w) == ["k3"]
 
 
 def test_a_feed_removal_does_not_excuse_churn():
-    events = list(CALIBRATIONS[("fullrun", "clear", "table", "hold_back")])
+    events = list(CALIBRATIONS[("fullrun", "table", "hold_back")])
     events.insert(-1, ("feed", (("k3", False), ("k4", False))))
-    assert fullrun.run(events, "clear", "table") is None
-    assert fullrun.run(events, "clear", "table", frozenset({"hold_back"})) is not None
+    assert fullrun.run(events, "table") is None
+    assert fullrun.run(events, "table", frozenset({"hold_back"})) is not None
 
 
 def test_the_oracle_refuses_keys_outside_the_models_key_space():
     with pytest.raises(ValueError, match="key space"):
-        oracle.replay_staleness([("up", (("order-123", 1),), False)])
+        oracle.replay_staleness([("up", (("order-123", 1),))])
     with pytest.raises(ValueError, match="key space"):
         oracle.replay_fullrun([("keys", "copy", ("k9",))])
     for kind in ("up", "clear"):
-        oracle.replay_staleness([(kind, (("k1", "v1"),), False)])
+        oracle.replay_staleness([(kind, (("k1", "v1"),))])
 
 
 ALPHABET = [
-    ("up", (("k1", 1),), False),
-    ("up", (("k1", 2),), False),
-    ("up", (("k1", None),), False),
-    ("up", (("k2", 1),), False),
-    ("up", (("k2", None),), False),
-    ("up", (("x1", 1),), False),
-    ("up", (("x1", None),), False),
-    ("up", (("k1", 1),), True),
-    ("up", (("k1", 2),), True),
-    ("up", (("k1", None),), True),
-    ("up", (("x1", None),), True),
-    ("up", (("k2", 1),), True),
-    ("clear", (("k1", 3),), False),
-    ("clear", (), True),
+    ("up", (("k1", 1),)),
+    ("up", (("k1", 2),)),
+    ("up", (("k1", None),)),
+    ("up", (("k2", 1),)),
+    ("up", (("k2", None),)),
+    ("up", (("x1", 1),)),
+    ("up", (("x1", None),)),
+    ("clear", (("k1", 3),)),
+    ("clear", ()),
     ("complete",),
     ("plan", 1),
     ("plan", 2),
@@ -224,8 +211,7 @@ ALPHABET = [
     ("ctx",),
     ("defn",),
     ("held",),
-    ("retry", "k1", True),
-    ("retry", "k1", False),
+    ("retry", "k1"),
     ("restart",),
 ]
 
@@ -238,7 +224,7 @@ def _exhaust(depth: int) -> int:
 
     def dfs(prefix: list[tuple]) -> None:
         nonlocal seen
-        w = staleness.World("witness")
+        w = staleness.World()
         for ev in prefix[:-1]:
             w.apply(ev)
         before = len(w.trace)
@@ -258,34 +244,20 @@ def _exhaust(depth: int) -> int:
 
 
 def test_every_staleness_history_of_four_events_answers_exactly():
-    assert _exhaust(4) > 100_000
-
-
-def test_a_change_of_conditions_or_a_reset_catches_up_first():
-    for events in (
-        [("pat", 1), ("up", (("x1", 1),), False), ("up", (("x1", None),), True), ("pat", 0)],
-        [
-            ("up", (("k1", 1),), False),
-            ("plan", 2),
-            ("commit", ("k1",), ()),
-            ("up", (("k1", None),), True),
-            ("held",),
-        ],
-    ):
-        oracle.replay_staleness(events)
+    assert _exhaust(4) > 80_000
 
 
 def test_a_failing_keys_outcome_goes_when_upstream_reverts():
     w = oracle.replay_staleness(
         [
-            ("up", (("k1", 1),), False),
+            ("up", (("k1", 1),)),
             ("plan", 2),
             ("commit", (), ()),
-            ("up", (("k1", 2),), False),
+            ("up", (("k1", 2),)),
             ("plan", 2),
             ("commit", ("k1",), ()),
-            ("up", (("k1", 1),), False),
-            ("up", (("k1", 2),), False),
+            ("up", (("k1", 1),)),
+            ("up", (("k1", 2),)),
         ]
     )
     assert oracle.due(w) == ["k1"]
@@ -302,7 +274,7 @@ def test_the_oracle_answers_nothing_due_for_a_held_reader():
         and oracle.due(w, "archive") == []
         and oracle.next_plan(w, "archive") == ([], POS)
     )
-    s = oracle.replay_staleness([("up", (("k1", 1),), False), ("clear", (("k2", 2),), False)])
+    s = oracle.replay_staleness([("up", (("k1", 1),)), ("clear", (("k2", 2),))])
     assert oracle.held(s) and oracle.due(s) == []
 
 
@@ -310,8 +282,8 @@ def test_the_oracle_answers_nothing_due_for_a_held_reader():
     "events", [REPORT_LOADS_MID_REBUILD, ARCHIVE_LOADS_MID_REBUILD], ids=["report", "archive"]
 )
 def test_a_reader_that_loaded_mid_rebuild_holds_back_after_it_completes(events):
-    assert fullrun.run(events, "clear", "table") is None
-    assert fullrun.run(events, "clear", "table", frozenset({"hold_back"})) is not None
+    assert fullrun.run(events, "table") is None
+    assert fullrun.run(events, "table", frozenset({"hold_back"})) is not None
 
 
 def test_a_key_list_counts_as_processed_on_every_input():
@@ -323,16 +295,16 @@ def test_a_key_list_counts_as_processed_on_every_input():
 
 def test_a_failing_key_waits_on_the_version_it_loaded():
     w = oracle.replay_staleness(
-        [("up", (("k1", 1),), False), ("plan", 2), ("up", (("k1", 2),), False), ("commit", ("k1",), ("k1",))]
+        [("up", (("k1", 1),)), ("plan", 2), ("up", (("k1", 2),)), ("commit", ("k1",), ("k1",))]
     )
     assert oracle.due(w) == []
-    w.apply(("up", (("k1", 3),), False))
+    w.apply(("up", (("k1", 3),)))
     assert oracle.due(w) == ["k1"]
 
 
 def test_a_failing_key_the_patterns_drop_loses_its_outcome():
     w = oracle.replay_staleness(
-        [("up", (("k1", 1),), False), ("plan", 2), ("commit", ("k1",), ()), ("pat", 2), ("pat", 0)]
+        [("up", (("k1", 1),)), ("plan", 2), ("commit", ("k1",), ()), ("pat", 2), ("pat", 0)]
     )
     assert oracle.due(w) == ["k1"]
 
@@ -353,12 +325,12 @@ def test_a_removal_loaded_before_a_rebuild_is_not_the_rebuilds():
         ("commit", "copy"),
         ("commit", "archive"),
     ]
-    assert fullrun.run(events, "clear", "table") is None
+    assert fullrun.run(events, "table") is None
 
 
 def test_a_reader_holds_back_a_row_no_commit_recorded():
-    assert fullrun.run(DEAD_ROW, "clear", "table") is None
-    r = fullrun.run(DEAD_ROW, "clear", "table", frozenset({"hold_back"}))
+    assert fullrun.run(DEAD_ROW, "table") is None
+    r = fullrun.run(DEAD_ROW, "table", frozenset({"hold_back"}))
     assert r is not None and "no commit" in r[1]
 
 
@@ -369,15 +341,15 @@ def test_an_empty_key_list_processes_nothing():
 
 @pytest.mark.parametrize("rule", ["open_txn", "repair"])
 def test_a_dead_writers_row_outlives_the_log_without_its_rule(rule):
-    events = CALIBRATIONS[("fullrun", "clear", "table", rule)]
-    assert fullrun.run(events, "clear", "table") is None
-    r = fullrun.run(events, "clear", "table", frozenset({rule}))
+    events = CALIBRATIONS[("fullrun", "table", rule)]
+    assert fullrun.run(events, "table") is None
+    r = fullrun.run(events, "table", frozenset({rule}))
     assert r is not None and r[1] == "at rest copy's log says {}, its store {k1@2}"
 
 
 def test_lineage_needs_the_keys_a_key_list_names(monkeypatch):
     events = [("items", (("k1", True),)), ("step", "copy", 1), ("keys", "copy", ("k1",)), ("commit", "copy")]
-    assert fullrun.run(events, "clear", "file") is None
+    assert fullrun.run(events, "file") is None
     record = fullrun.World.record
 
     def unlisted(self, rec):
@@ -385,19 +357,19 @@ def test_lineage_needs_the_keys_a_key_list_names(monkeypatch):
         record(self, rec)
 
     monkeypatch.setattr(fullrun.World, "record", unlisted)
-    r = fullrun.run(events, "clear", "file")
+    r = fullrun.run(events, "file")
     assert r is not None and "lineage" in r[1]
 
 
 def test_cleanup_never_deletes_a_current_file(monkeypatch):
     events = [("items", (("k1", True),)), ("step", "copy", 1), ("cleanup", "copy")]
-    assert fullrun.run(events, "clear", "file") is None
+    assert fullrun.run(events, "file") is None
 
     def everything(self):
         self.output.deleted |= set(self.output.objects)
 
     monkeypatch.setattr(fullrun.Ordinary, "cleanup", everything)
-    r = fullrun.run(events, "clear", "file")
+    r = fullrun.run(events, "file")
     assert r is not None and "deleted" in r[1]
 
 
@@ -419,7 +391,7 @@ def test_lineage_needs_the_keys_a_repair_redid(monkeypatch):
         record(self, rec)
 
     monkeypatch.setattr(fullrun.World, "record", unlisted)
-    r = fullrun.run(events, "clear", "table")
+    r = fullrun.run(events, "table")
     assert r is not None and "lineage" in r[1]
 
 
@@ -452,8 +424,8 @@ def test_lineage_needs_the_keys_a_repair_redid(monkeypatch):
     ids=["a dead removal", "an uncommitted clear"],
 )
 def test_a_reader_never_processes_what_no_commit_recorded(events):
-    assert fullrun.run(events, "clear", "table") is None
-    r = fullrun.run(events, "clear", "table", frozenset({"hold_back"}))
+    assert fullrun.run(events, "table") is None
+    r = fullrun.run(events, "table", frozenset({"hold_back"}))
     assert r is not None and "no commit" in r[1]
 
 
@@ -477,7 +449,7 @@ def test_a_release_lets_downstream_read_the_partial_output():
     ]
     w = oracle.replay_fullrun(events, kind="table")
     assert sorted(w.copy.output.rows) == ["k1", "k2"] and not w.archive.held()
-    assert fullrun.run(events, "clear", "table") is None
+    assert fullrun.run(events, "table") is None
 
 
 def test_a_canceled_full_run_asked_for_by_hand_leaves_nothing_in_the_way():
@@ -489,7 +461,7 @@ def test_a_canceled_full_run_asked_for_by_hand_leaves_nothing_in_the_way():
     w = oracle.replay_fullrun(events, kind="table")
     assert not w.copy.full_due
     assert _versions(w.copy.output.rows) == dict(sorted(w.copy.output.log.states[-1].items()))
-    assert fullrun.run(events, "clear", "table") is None
+    assert fullrun.run(events, "table") is None
 
 
 def test_a_replayed_write_carries_what_its_repair_added():
@@ -501,4 +473,4 @@ def test_a_replayed_write_carries_what_its_repair_added():
     events += [("plan", "copy", 1), ("write", "copy"), ("replay", "copy"), ("commit", "copy")]
     w = oracle.replay_fullrun(events, kind="table")
     assert w.copy.output.log.states[-1] == {"k2": 3, "k3": 3} == _versions(w.copy.output.rows)
-    assert fullrun.run(events, "clear", "table") is None
+    assert fullrun.run(events, "table") is None

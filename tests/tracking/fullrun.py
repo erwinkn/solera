@@ -31,32 +31,29 @@ from .core import ABSENT, EMPTY, NEG, POS, Cond, Folded, Log, Progress, within
 KEYS = ("k1", "k2", "k3", "k4", "k5")
 EVEN = {"k2", "k4"}
 ALL = frozenset(KEYS) | {k.upper() for k in KEYS} | {"odd", "even"}  # every key an output can hold
-FORMS = ("clear",)
-RULES = {
-    "clear": (
-        "reset",
-        "clear",
-        "two_scans",
-        "gate",
-        "gate_accumulating",
-        "gate_whole",
-        "hold_back",
-        "counter",
-        "fence",
-        "open_txn",
-        "repair",
-        "repair_removals",
-        "repair_at_once",
-        "repair_handover",
-        "load_check",
-        "cut_records",
-        "cut_pieces",
-        "cut_cursor",
-        "cut_attempts",
-        "cleanup_held",
-    ),
-}
-ADDED = {"clear": ("hold_back", "repair_removals", "repair_handover", "cut_attempts")}
+RULES = (
+    "reset",
+    "clear",
+    "two_scans",
+    "gate",
+    "gate_accumulating",
+    "gate_whole",
+    "hold_back",
+    "counter",
+    "fence",
+    "open_txn",
+    "repair",
+    "repair_removals",
+    "repair_at_once",
+    "repair_handover",
+    "load_check",
+    "cut_records",
+    "cut_pieces",
+    "cut_cursor",
+    "cut_attempts",
+    "cleanup_held",
+)
+ADDED = ("hold_back", "repair_removals", "repair_handover", "cut_attempts")
 
 
 def fmap(d: int, k: str) -> str | None:
@@ -804,10 +801,8 @@ class Mirror:
 
 
 class World:
-    def __init__(self, form: str, kind: str, off: frozenset[str] = frozenset()) -> None:
-        if form not in FORMS:
-            raise ValueError(f"unknown form {form!r}: the model keeps {list(FORMS)}")
-        self.form, self.kind, self.off = form, kind, off
+    def __init__(self, kind: str, off: frozenset[str] = frozenset()) -> None:
+        self.kind, self.off = kind, off
         self.version = 0
         self.rebuilds = 0
         self.removed_during: dict[int, set[str]] = {}  # per rebuild: the items keys removed since it planned
@@ -1160,10 +1155,8 @@ def history(rnd: random.Random, steps: int) -> list[tuple]:
     return events
 
 
-def run(
-    events: list[tuple], form: str, kind: str, off: frozenset[str] = frozenset()
-) -> tuple[int, str, World] | None:
-    w = World(form, kind, off)
+def run(events: list[tuple], kind: str, off: frozenset[str] = frozenset()) -> tuple[int, str, World] | None:
+    w = World(kind, off)
     i = 0
     try:
         for i, ev in enumerate(events):

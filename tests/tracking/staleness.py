@@ -1,24 +1,20 @@
-"""Staleness kept exact (§6) in the decided form: one witness due key per input
-(handoffs/SOLE-4/amendment-staleness.md in the Captain drive), with this
-model's additions. P14's exact owed counts per piece were checked against it
-and rejected; they are in the history of solera#15 and in
-handoffs/SOLE-7/verdict.md.
+"""One consumer input, checks over items, over random histories, checked after
+every step against brute force: what the consumer really holds, the keys it
+owes and the keys that are due. Staleness is asked of the planner (STA-3: a
+default run would load something), so there is nothing kept to go wrong
+between two asks.
 
-The witness runs over random histories of one consumer input, checks on
-items, and is checked after every step against brute force: what the
-consumer really holds, the keys it owes and the keys that are due. A history
-mixes upstream commits that revert, an upstream full run in the design's form
-(a clear, then "upstream complete"), batches planned and committed later,
-keys loaded at another version, failing keys that are owed but not due, retries
-that come due by time or by force, pattern, context and definition changes,
-key-list runs, an ordinary consumer's full run (its first batch resets progress
-to empty), progress reset to held, lost notifications and restarts.
+A history mixes upstream commits that revert, an upstream full run in the
+design's form (a clear, then "upstream complete"), batches planned and
+committed later, keys loaded at another version, failing keys that are owed
+but not due, retries that come due, pattern, context and definition changes,
+key-list runs, an ordinary consumer's full run (its first batch resets
+progress to empty), progress reset to held, and restarts.
 """
 
 from __future__ import annotations
 
 import random
-from collections import Counter
 from dataclasses import dataclass, replace
 
 from .core import ABSENT, EMPTY, HELD, HELD_PIECE, NEG, POS, Cond, Log, Progress, within
@@ -26,28 +22,8 @@ from .core import ABSENT, EMPTY, HELD, HELD_PIECE, NEG, POS, Cond, Log, Progress
 KEYS = ("k1", "k2", "k3", "k4", "k5", "x1")
 PATTERNS = (None, frozenset({"k1", "k2", "k3", "k4", "k5"}), frozenset({"k2", "k4", "x1"}))
 
-# The rules, by the names a calibration switches off. The last four are this
-# model's additions to the amendment (see docs/verification.md).
-RULES = {
-    "witness": (
-        "rule1",
-        "rule2",
-        "rule3_recheck",
-        "rule3_range",
-        "rule4",
-        "rule5",
-        "rule7",
-        "rule8",
-        "reset_probe",
-        "held_probe",
-        "catch_up_first",
-        "rearm",
-        "hold_back",
-    ),
-}
-ADDED = {
-    "witness": ("reset_probe", "held_probe", "catch_up_first", "rearm", "hold_back"),
-}
+# The rules, by the names a calibration switches off.
+RULES = ("hold_back",)
 
 
 @dataclass
@@ -72,9 +48,7 @@ class Batch:
 class World:
     """One consumer input and the truth about it."""
 
-    def __init__(self, form: str, off: frozenset[str] = frozenset()) -> None:
-        if form not in RULES:
-            raise ValueError(f"unknown form {form!r}: the model keeps {list(RULES)}")
+    def __init__(self, off: frozenset[str] = frozenset()) -> None:
         self.off = off
         self.up = Log()
         self.cond = Cond(PATTERNS[0])
@@ -88,10 +62,9 @@ class World:
         self.cursor: str | None = None  # the run's progress key; None when no run is going
         self.incomplete = False  # items is mid full run, in the design's form (a clear)
         self.mid = {0: False}  # per items commit: whether items was mid full run at it
-        self.violation: str | None = None  # an invariant a form breaks inside a rule
+        self.violation: str | None = None  # an invariant broken inside an event
         self.step = 0
         self.trace: list[str] = []
-        self.form = Witness(self)
 
     def on(self, rule: str) -> bool:
         return rule not in self.off
@@ -111,31 +84,26 @@ class World:
         self.step += 1
         getattr(self, "ev_" + ev[0])(*ev[1:])
 
-    def ev_up(self, changes: tuple, lost: bool) -> None:
+    def ev_up(self, changes: tuple) -> None:
         if any(self.up.states[-1].get(k) != v for k, v in changes):
             self.up.commit(dict(changes))
             self.mid[self.up.head] = self.incomplete
-            self.trace.append(
-                f"items c{self.up.head}: {_entries(self.up.entries[-1])}" + (" (lost)" if lost else "")
-            )
+            self.trace.append(f"items c{self.up.head}: {_entries(self.up.entries[-1])}")
             self.reverted()
-            self.form.on_commit(lost)
 
-    def ev_clear(self, changes: tuple, lost: bool) -> None:
+    def ev_clear(self, changes: tuple) -> None:
         if not self.incomplete:
             self.up.commit(dict(changes), clear=True)
             self.incomplete = True
             self.mid[self.up.head] = True
             self.trace.append(f"items c{self.up.head}: clear; {_entries(self.up.entries[-1])}")
             self.reverted()
-            self.form.on_commit(lost)
 
     def ev_complete(self) -> None:
         if self.incomplete:
             self.incomplete = False
             self.mid[self.up.head] = False
             self.trace.append("items completes its full run")
-            self.form.on_complete()
 
     def reverted(self) -> None:
         """A failing key's outcome goes once the key is no longer owed: upstream
@@ -176,7 +144,6 @@ class World:
         if b.cond.defn != self.cond.defn:
             self.trace.append("checks' commit is refused: its definition changed")
             return
-        snap = self.form.before(b)
         before = {} if b.reset else dict(self.holds)
         if b.reset:
             self.holds, self.outcomes, self.failed = {}, {}, {}
@@ -221,10 +188,7 @@ class World:
             + (f"; {failed} fail" if failed else "")
             + (f"; {moved_} loaded at the head" if moved_ else "")
         )
-        self.form.after(b, snap)
         self.prog.merge(self.cursor)
-        self.form.remap()
-        self.form.save()
 
     def ev_cancel(self) -> None:
         if self.pending or self.cursor:
@@ -233,48 +197,38 @@ class World:
 
     def ev_pat(self, i: int) -> None:
         if self.cond.pat != PATTERNS[i]:
-            self.form.first()
             self.cond = replace(self.cond, pat=PATTERNS[i])
             self.trace.append(f"checks' patterns become {sorted(PATTERNS[i]) if PATTERNS[i] else 'all'}")
             self.reverted()
-            self.form.on_conditions()
 
     def ev_ctx(self) -> None:
-        self.form.first()
         self.cond = replace(self.cond, ctx=self.cond.ctx + 1)
         self.trace.append(f"factor moves to w{self.cond.ctx + 1}")
         self.reverted()
-        self.form.on_conditions()
 
     def ev_defn(self) -> None:
-        self.form.first()
         self.cond = replace(self.cond, defn=(self.cond.defn[0] + 1,))
         self.trace.append(f"checks' definition becomes d{self.cond.defn[0]}")
         self.reverted()
-        self.form.on_conditions()
 
     def ev_held(self) -> None:
-        self.form.first()
         self.prog.reset(HELD_PIECE)
         self.holds = {k: HELD for k in self.holds}
         self.outcomes, self.failed, self.pending, self.cursor = {}, {}, None, None
         self.covered, self.listed = [(NEG, POS)], set()
         self.trace.append("checks' progress becomes held (it cannot be trusted)")
-        self.form.on_reset()
 
-    def ev_retry(self, k: str, timer: bool) -> None:
+    def ev_retry(self, k: str) -> None:
         f = self.outcomes.get(k)
         if f is not None and not f.retry:
             f.retry = True
             if k in self.failed:
                 self.failed[k].retry = True
-            self.trace.append(f"{k}'s retry comes due" + (" (backoff over)" if timer else " (forced)"))
-            self.form.on_retry(k, timer)
+            self.trace.append(f"{k}'s retry comes due")
 
     def ev_restart(self) -> None:
         self.pending = None
         self.trace.append("the engine restarts")
-        self.form.on_restart()
 
     # -- the truth -------------------------------------------------------------
     def brute(self) -> tuple[set[str], set[str]]:
@@ -292,6 +246,19 @@ class World:
             if self.cond.takes(k)
         )
 
+    def stale(self) -> bool:
+        """STA-3: a default run would load something. The planner, asked for one key."""
+        return bool(self.prog.plan(self.up.head, NEG, 1, self.cond, self.due)[0])
+
+    def complete(self) -> bool:
+        """D177 from progress: no range with nothing processed holds an upstream key."""
+        return not any(
+            k not in self.prog.points and self.cond.takes(k)
+            for p in self.prog.pieces
+            if p[2] == EMPTY
+            for k in self.up.scan(self.up.head, p[0], p[1])
+        )
+
     def check(self) -> str | None:
         if self.violation:
             return self.violation
@@ -301,160 +268,12 @@ class World:
         owed, due = self.brute()
         if self.prog.candidates(self.up.head, NEG, self.cond) != sorted(owed):
             return f"counted on request: {self.prog.candidates(self.up.head, NEG, self.cond)}, owed {sorted(owed)}"
-        answer = self.form.answer()
-        if self.violation:
-            return self.violation
         if self.incomplete:
-            return None if answer == ("held",) else f"items is mid full run, but checks reads {answer}"
-        if answer[0] != ("stale" if due else "fresh"):
-            return f"checks reads {answer[0]}; due: {sorted(due)}"
-        if answer[0] == "stale" and answer[1] is not None and answer[1] not in due:
-            return f"the witness {answer[1]} is not due; due: {sorted(due)}"
-        if self.form.complete() != self.brute_complete():
-            return f"complete reads {self.form.complete()}, brute force {self.brute_complete()}"
-        return self.form.check()
-
-
-class Witness:
-    """The amendment: per input, fresh(X) or stale(w, X), where w is a due key."""
-
-    def __init__(self, w: World) -> None:
-        self.w = w
-        self.state: tuple = ("fresh",)
-        self.X = 0
-        self.stats: Counter = Counter()
-        self.save()
-
-    def save(self) -> None:
-        """The state is persisted with every event of the consumer; what upstream
-        notifications and timers change in between is not (rule 7 restores it)."""
-        self.saved = (self.state, self.X)
-
-    def stale(self, k: str) -> None:
-        self.state = ("stale", k)
-
-    def probe(self, lo: str = NEG, hi: str = POS, keys: list[str] | None = None) -> None:
-        """Rule 6: the planner with a limit of one key, over a range or a key list."""
-        w = self.w
-        self.stats["probes"] += 1
-        if w.incomplete and w.on("rule8"):
-            self.state = ("held",)
-            return
-        cands = [k for k in (keys or w.prog.candidates(w.up.head, lo, w.cond)) if within(k, lo, hi)]
-        found = next((k for k in cands if w.due(k)), None)
-        self.stats["probe_keys"] += cands.index(found) + 1 if found else len(cands)
-        self.state = ("stale", found) if found else ("fresh",)
-        if (lo, hi, keys) == (NEG, POS, None):
-            self.X = w.up.head
-
-    def catch_up(self, c: int) -> None:
-        """Rules 1 and 2 for every upstream commit after X, in order."""
-        w = self.w
-        while self.X < c:
-            self.X += 1
-            x, entries = self.X, w.up.entries[self.X]
-            if x in w.up.clears and w.on("rule8"):
-                self.state = ("held",)
-            elif self.state[0] == "fresh" and w.on("rule1"):
-                self.rule1(entries, x)
-            elif self.state[0] == "stale" and self.state[1] in entries and w.on("rule2"):
-                self.stats["rechecks"] += 1
-                if not w.due_at(self.state[1], x):
-                    self.probe()
-                    return
-
-    def rule1(self, entries: dict, x: int) -> None:
-        w = self.w
-        for k in entries:
-            self.stats["entries"] += 1
-            if k in w.prog.points:
-                if w.due_at(k, x):
-                    self.stale(k)
-                    return
-            elif w.cond.takes(k):
-                if not w.due_at(k, x):
-                    w.violation = f"rule 1 takes {k} at c{x} as due without a lookup, and it is not"
-                self.stale(k)
-                return
-        self.state = ("fresh",)
-
-    def first(self) -> None:
-        if self.w.on("catch_up_first"):
-            self.catch_up(self.w.up.head)
-
-    def on_commit(self, lost: bool) -> None:
-        if not lost:
-            self.catch_up(self.w.up.head)
-
-    def on_complete(self) -> None:
-        self.first()
-        if self.w.on("rule8"):
-            self.probe()
-        self.save()
-
-    def on_conditions(self) -> None:
-        if self.w.on("rule4"):
-            self.probe()
-        self.save()
-
-    def on_reset(self) -> None:
-        if self.w.on("held_probe"):
-            self.probe()
-        self.save()
-
-    def before(self, b: Batch):
-        self.first()
-
-    def after(self, b: Batch, snap) -> None:
-        w = self.w
-        if self.state[0] == "held":
-            pass
-        elif b.reset and w.on("reset_probe"):
-            self.probe()
-        elif self.state[0] == "stale":
-            self.stats["rechecks"] += 1
-            if w.on("rule3_recheck") and not w.due(self.state[1]):
-                self.probe()
-        elif w.on("rule3_range"):
-            self.probe(keys=b.taken) if b.kind == "keys" else self.probe(b.lo, b.hi)
-
-    def remap(self) -> None:
-        pass
-
-    def on_retry(self, k: str, timer: bool) -> None:
-        if not timer:
-            self.first()
-        if self.w.on("rule5") and self.state[0] == "fresh" and self.w.due(k):
-            self.stale(k)
-        if not timer:
-            self.save()
-
-    def on_restart(self) -> None:
-        self.state, self.X = self.saved
-        if self.w.on("rearm"):
-            for k, f in self.w.outcomes.items():
-                if f.retry:
-                    self.on_retry(k, timer=True)
-
-    def answer(self) -> tuple:
-        kept = self.state, self.X, Counter(self.stats)
-        if self.w.on("rule7"):
-            self.catch_up(self.w.up.head)
-        answer = self.state
-        self.state, self.X, self.stats = kept
-        return answer if answer[0] != "stale" else ("stale", answer[1])
-
-    def complete(self) -> bool:
-        """D177 by witness: does any nothing-processed range hold an upstream key?"""
-        w = self.w
-        return not any(
-            k not in w.prog.points and w.cond.takes(k)
-            for p in w.prog.pieces
-            if p[2] == EMPTY
-            for k in w.up.scan(w.up.head, p[0], p[1])
-        )
-
-    def check(self) -> str | None:
+            return None  # held: nothing is due while items is mid full run
+        if self.stale() != bool(due):
+            return f"checks reads {'stale' if self.stale() else 'fresh'}; due: {sorted(due)}"
+        if self.complete() != self.brute_complete():
+            return f"complete reads {self.complete()}, brute force {self.brute_complete()}"
         return None
 
 
@@ -488,7 +307,7 @@ def history(rnd: random.Random, steps: int) -> list[tuple]:
             changes = tuple(
                 (k, rnd.choice((ABSENT, 1, 2, 3))) for k in sorted(rnd.sample(KEYS, rnd.randint(1, 3)))
             )
-            events.append((kind, changes, rnd.random() < 0.2))
+            events.append((kind, changes))
         elif kind in ("plan", "full"):
             events.append((kind, rnd.randint(1, 3)))
         elif kind == "commit":
@@ -499,15 +318,15 @@ def history(rnd: random.Random, steps: int) -> list[tuple]:
         elif kind == "pat":
             events.append((kind, rnd.randrange(len(PATTERNS))))
         elif kind == "retry":
-            events.append((kind, rnd.choice(KEYS), rnd.random() < 0.5))
+            events.append((kind, rnd.choice(KEYS)))
         else:
             events.append((kind,))
     return events
 
 
-def run(events: list[tuple], form: str, off: frozenset[str] = frozenset()) -> tuple[int, str, World] | None:
+def run(events: list[tuple], off: frozenset[str] = frozenset()) -> tuple[int, str, World] | None:
     """Apply a history, checking after every step: (step, violation, world), or None."""
-    w = World(form, off)
+    w = World(off)
     for i, ev in enumerate(events):
         w.apply(ev)
         bad = w.check()
