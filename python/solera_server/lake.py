@@ -316,11 +316,13 @@ class Lake:
 
     async def _write(self, table: str, rows: list[list]) -> tuple[dict | None, list[tuple]]:
         """Write `rows` as one file, less any row that cannot be encoded: the
-        file (None if no row can be), and the rows left out, `(values,
+        file (None if no row is left), and the rows left out, `(values,
         error)`. A failure to store the file raises: the flush is void, and
         every row stays buffered."""
 
         path, skipped = f"{self.prefix}/{table}/{ulid(self.clock())}.parquet", []
+        if not rows:  # buffered rows that stand for none (`expand`): a file would have no key range
+            return None, skipped
         try:
             data, stats = await asyncio.to_thread(self._encode, table, rows)
         except MACHINE_ERRORS:

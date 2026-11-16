@@ -383,3 +383,21 @@ async def test_a_failure_to_store_or_to_use_the_disk_keeps_every_row(tmp_path, m
     monkeypatch.setattr(lake, "_encode", encode)
     await lake.flush(force=True)
     assert await lake.query(rows, ("events",)) == [("a", 1)] and len(lake.skipped) == 1
+
+
+async def test_buffered_rows_that_stand_for_none_write_no_file(tmp_path):
+    """A buffered row may stand for no row at all (`expand`: a per-key
+    attempt whose keys all succeeded logs none). Such a flush writes no
+    file: one of no rows has no key range, and a query by key raised on it
+    until a merge rewrote it."""
+
+    store = Store(tmp_path)
+
+    async def nothing(values):
+        return []
+
+    lake = Lake(store, SCHEMA, lambda: store.lake, name="Log", expand={"events": nothing})
+    store.lake.append("events", {"run": "r1", "at": 1.0, "n": 1})
+    await lake.flush(force=True)
+    assert not store.lake.files and not store.lake.rows["events"]
+    assert await lake.query(rows, ("events",), key="r1") == []
