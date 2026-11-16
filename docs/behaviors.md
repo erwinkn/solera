@@ -474,7 +474,9 @@ waiting for a slot like keys in flight.
 input changes. `Failed` (any unclassified error): the same, plus one try
 per new deploy. `Transient`: retried on backoff (1 min doubling to 6 h,
 `retry_after` honoured) until `retry_for` (24 h), then failed. `Abort`:
-the whole attempt fails, nothing commits. If a failing key's input goes
+the whole attempt fails, nothing commits. A key whose rows its table
+refuses (a value of the wrong type, a broken constraint) is `Failed`, with
+the table's message; the other keys of its batch are written. If a failing key's input goes
 back to the version the partition held before the failure, the failure is
 moot: its outcome goes, and it is not retried.
 
