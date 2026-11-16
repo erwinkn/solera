@@ -273,13 +273,20 @@ class Lake:
                 return
         self.state.record({"type": f"{self.name}Flushed", "files": files, "upto": upto})
         for table, values, error in skipped:
-            row = {c: _shown(v) for c, v in zip(self.schema[table].columns, values, strict=True)}
-            log.error("%s: a %s row cannot be encoded, skipped: %s: %s", self.prefix, table, error, row)
-            self.skipped.append({"table": table, "row": row, "error": str(error), "at": now})
-        del self.skipped[:-SKIPPED_KEPT]
+            self.skip(table, dict(zip(self.schema[table].columns, values, strict=True)), error)
         for table, rows in volatile.items():
             del self.volatile[table][: len(rows)]
         self._expanded = {k: v for k, v in self._expanded.items() if k[1] > upto.get(k[0], 0)}
+
+    def skip(self, table: str, row: dict, error: Exception) -> None:
+        """Report a row left out of `table`, so the others are not held
+        back: logged at error level and kept in `skipped`, its values cut
+        to 200 characters."""
+
+        shown = {c: _shown(v) for c, v in row.items()}
+        log.error("%s: a %s row is skipped: %s: %s", self.prefix, table, error, shown)
+        self.skipped.append({"table": table, "row": shown, "error": str(error), "at": self.clock()})
+        del self.skipped[:-SKIPPED_KEPT]
 
     async def _expand(self, tables) -> None:
         """Read what the buffered rows of `tables` stand for (`expand`), each

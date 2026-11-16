@@ -33,6 +33,8 @@ import json
 import math
 from dataclasses import dataclass, field
 
+from solera.lifecycle import Malformed
+
 from .lake import Lake, Table
 
 TERMINAL_RUN = frozenset({"succeeded", "failed", "canceled"})
@@ -840,19 +842,23 @@ class History:
         row = dict(zip(names, values, strict=True))
         if row["key"] is not None:
             return [values]
-        result = await self.state.attempt_result(row["run"], row["attempt"]) or {}
-        stored = json.loads(row["outcome"]) if row["outcome"] else {}
         stamp = {k: row[k] for k in ("run", "attempt", "asset", "partition", "at")}
+        try:
+            result = await self.state.attempt_result(row["run"], row["attempt"]) or {}
+        except Malformed as error:  # a control file this version cannot read: it never will
+            self.lake.skip("key_outcomes", stamp, error)
+            return []
+        stored = json.loads(row["outcome"]) if row["outcome"] else {}
         out = []
-        for found in result.get("key_outcomes") or ():
-            if found["outcome"] in (
-                "ok",
-                "removed",
-                "unmatched",
-            ):  # failures are logged, not ok calls (HIS-6)
+        for entry in result.get("key_outcomes") or ():
+            try:  # failures are logged, not ok calls (HIS-6)
+                if entry["outcome"] in ("ok", "removed", "unmatched"):
+                    continue
+                found = {**entry, **stamp}
+                found["outcome"] = stored.get(found["key"]) or MADE.get(found["outcome"], found["outcome"])
+            except Exception as error:  # a malformed entry, from the worker: the others are logged
+                self.lake.skip("key_outcomes", {**stamp, "entry": entry}, error)
                 continue
-            found = {**found, **stamp}
-            found["outcome"] = stored.get(found["key"]) or MADE.get(found["outcome"], found["outcome"])
             # The column is a number: a key an asset wrote has one (its commit's); a source's key
             # served at a text version (an etag, a timestamp) has none.
             if not isinstance(found.get("generation"), int):

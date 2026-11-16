@@ -252,7 +252,8 @@ def create_app(
             # a batch loaded, from a table, a version or an absence nothing explains: it held the
             # key back, which stays owed until its producer writes it again
             "anomalies": [found for keys in runtime.anomalies.values() for found in keys.values()],
-            # history rows a flush could not encode, so left out (the latest 100): the rest were written
+            # history rows left out (the latest 100), the rest written: one a flush could not encode,
+            # or a worker's malformed key outcome
             "skipped_history_rows": runtime.history.lake.skipped,
             # cleanup whose task ran out of tries: see and clear with `solera cleanups`
             "stuck_cleanups": [
