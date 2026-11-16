@@ -9,8 +9,8 @@ covers, what it found and what it leaves out.
 | Module | What it is |
 |---|---|
 | `core.py` | The output log (entries with both versions, clears, `diff`/`scan`/`get` from entries) and progress (pieces, points, decoding, the planner, the batch commit rule) |
-| `staleness.py` | One consumer input (checks over items), its staleness kept by one witness due key (`witness`) |
-| `fullrun.py` | The cast (feed and items upstream; copy, tally, archive, report, checks); a full run clears at its first batch and the gate holds readers (`clear`), on file or table stores |
+| `staleness.py` | One consumer input (checks over items): what it holds, owes and is due, and staleness asked of the planner |
+| `fullrun.py` | The cast (feed and items upstream; copy, tally, archive, report, checks); a full run clears at its first batch and the gate holds readers, on file or table stores |
 | `histories.py` | One shrunk history per rule: passes with every rule on, fails with that rule off |
 | `oracle.py` | The stable interface for the build: replay a history, ask what is held, owed, due, and planned next |
 | `__main__.py` | Sweeps, ablations, shrinking and work counts from the command line |
@@ -22,9 +22,9 @@ uv run pytest tests/tracking -q                    # CI: 200 histories per store
 uv run pytest tests/tracking -q --slow             # 5,000 histories per store
 uv run python -m tests.tracking staleness          # 3,000 histories
 uv run python -m tests.tracking fullrun --kind table
-uv run python -m tests.tracking staleness --off rule3_range --shrink   # a minimal failing history
+uv run python -m tests.tracking fullrun --off gate --shrink   # a minimal failing history
 uv run python -m tests.tracking fullrun --ablate   # each rule switched off in turn
-uv run python -m tests.tracking staleness --stats  # the work the witness does
+uv run python -m tests.tracking fullrun --stats    # what the full runs did over the sweep
 ```
 
 ## The oracle
@@ -42,7 +42,7 @@ oracle.next_plan(w, "copy")   # (["k2"], "\uffff"): the next batch takes k2 and 
 oracle.held(w, "archive")     # True: copy has not processed k2 yet (D177), so the gate holds archive
 ```
 
-`replay_fullrun` uses the decided full-run form (`form="clear"`). While the gate
+While the gate
 holds a consumer, `due` is empty and `next_plan` takes nothing; with a full
 run due, `owed` and `due` name every key upstream holds, as the full run's
 first batch takes them.
@@ -65,15 +65,14 @@ A history is a list of plain tuples. An event that does not apply (a commit
 with nothing planned, a plan while one is in flight) is skipped, so any
 sublist of a history is a history.
 
-**Staleness** (`staleness.history`): `("up", ((key, version or None), ...), lost)` an
-items commit, its notification lost or not; `("clear", changes, lost)` items'
-full run begins in the design's form; `("complete",)` it ends;
+**Staleness** (`staleness.history`): `("up", ((key, version or None), ...))` an
+items commit; `("clear", changes)` items' full run begins; `("complete",)` it ends;
 `("plan", n)`, `("full", n)` (a full run's first batch, which resets progress),
 `("keys", keys)`; `("commit", failing keys, keys loaded at the head)` (a key
 loaded at the head is held back if items is mid full run or cleared since the plan);
 `("cancel",)`; `("pat", i)`, `("ctx",)`, `("defn",)` change the conditions;
-`("held",)` progress can no longer be trusted; `("retry", key, by_timer)`;
-`("restart",)`.
+`("held",)` progress can no longer be trusted; `("retry", key)` its retry
+comes due; `("restart",)`.
 
 **Full run** (`fullrun.history`): `("items" | "feed", ((key, present), ...))`;
 `("plan" | "step", asset, n)` (a step plans and commits at once);

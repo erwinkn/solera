@@ -2030,15 +2030,15 @@ and batches that start at a piece boundary (asserted).
 
 - **Staleness** (`staleness.py`): `checks` over `items`, through upstream
   commits that revert, an upstream full run, batches planned and
-  committed later, failing keys owed but not due, retries by timer and by
-  force, pattern, context and definition changes, key-list runs, a full
-  run's resetting first batch, a reset to `held`, lost notifications and
-  restarts. After every step: progress decodes to what `checks` really
-  holds; the planner's candidates equal the brute-force owed set; the
-  answer is "held" exactly while `items` is mid full run, else stale
-  exactly when some key is due; the witness is due; completeness is
-  exact; rule 1 never takes a key that is not due. CI also checks every
-  history of up to four events (about 280,000).
+  committed later, failing keys owed but not due, retries that come due,
+  pattern, context and definition changes, key-list runs, a full
+  run's resetting first batch, a reset to `held`, and restarts. After
+  every step: progress decodes to what `checks` really holds; the
+  planner's candidates equal the brute-force owed set; outside an
+  upstream full run, the planner asked for one key takes one exactly
+  when some key is due; completeness is exact. CI also checks every
+  history of up to four events (about 82,000). The witness of §6 was
+  modeled here too, and left the model when it left the core.
 - **Full runs** (`fullrun.py`): `items` and `feed` drive `copy` (an
   ordinary keyed copy whose definitions keep, drop or rename keys) and
   `tally` (a count per group kept through `ctx.load()`); `archive` reads
@@ -2089,10 +2089,10 @@ and batches that start at a piece boundary (asserted).
 **Every rule is needed.** Each rule is named, and `histories.py` holds one
 shrunk history per rule that passes with every rule on and fails with
 that rule off; CI runs them all. The rules the model had to add to the
-design are written into §6 and §10: for the witness, catching up first, a
-reset that probes the whole input, a reset to `held` that probes, re-arming
-due retries at a restart, and the hold-back; for full runs, the
-hold-back.
+design are written into §6 and §10: the hold-back, for staleness and for
+full runs. (The witness needed four more, gone with it: catching up
+first, a reset that probes the whole input, a reset to `held` that
+probes, and re-arming due retries at a restart.)
 
 **What it does not check yet:** stores that write in place with late and
 dead writers (§8), cleanup against the cut (§13), lineage and digests

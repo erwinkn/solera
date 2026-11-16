@@ -4,7 +4,7 @@ stable for the build units that test against them; see README.md.
 
     from tests.tracking import oracle
 
-    w = oracle.replay_staleness([("up", (("k1", 1),), False), ("plan", 2)])
+    w = oracle.replay_staleness([("up", (("k1", 1),)), ("plan", 2)])
     oracle.holds(w)        # {} : checks holds nothing yet
     oracle.due(w)          # ["k1"]
     oracle.next_plan(w)    # (["k1"], POS): the next batch takes k1, its range runs to +inf
@@ -37,10 +37,10 @@ def _check_keys(events: list[tuple], keys: tuple[str, ...]) -> None:
         raise ValueError(f"keys {sorted(outside)} are outside the model's key space {list(keys)}")
 
 
-def replay_staleness(events: list[tuple], form: str = "witness") -> staleness.World:
+def replay_staleness(events: list[tuple]) -> staleness.World:
     """One consumer input (checks over items) after the history."""
     _check_keys(events, staleness.KEYS)
-    w = staleness.World(form)
+    w = staleness.World()
     for i, ev in enumerate(events):
         w.apply(ev)
         if bad := w.check():
@@ -48,10 +48,10 @@ def replay_staleness(events: list[tuple], form: str = "witness") -> staleness.Wo
     return w
 
 
-def replay_fullrun(events: list[tuple], form: str = "clear", kind: str = "file") -> fullrun.World:
+def replay_fullrun(events: list[tuple], kind: str = "file") -> fullrun.World:
     """The cast (copy, tally, archive, report, checks) after the history, unsettled."""
     _check_keys(events, fullrun.KEYS)
-    w = fullrun.World(form, kind)
+    w = fullrun.World(kind)
     for i, ev in enumerate(events):
         try:
             w.apply(ev)

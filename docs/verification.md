@@ -566,7 +566,7 @@ so none falls between them:
 | `ObservedSet.tla` | the observed set (D126, D133) and its observation record: decode, candidates and classify-once, batches reclassified from what was served, points, ranges at each batch's head and their fold, the base with its before-image, rebases, every run kind (default runs in batches, `keys=`, per-key cancels, start-overs, dropped runs), pattern, context and definition changes, upstream resets, retention cuts, a batch in flight between dispatch and commit | what an attempt is to `Execution.tla`; the key index to its tests (`key-index-design.md` § What is checked) |
 | `Attempt.tla` | the attempt control file: who owns an attempt, the gate, the sealed result or the engine's end; duplicates, zombies, retention; nobody learns of an attempt before its launch is durable (F26) | what an attempt computes to `Execution.tla` |
 | `JournalObject.tla` | the journal: fencing, appends, checkpoints and their cleanup, lost answers, failed requests | what the events mean to the others |
-| `tests/tracking` | the tracking redesign before it is built: the log of entries, progress as pieces and points, the planner, the staleness witness, full runs as a clear plus the gate, the amended P8, tables with late and dead writers, the cut, exact cleanup, lineage | today's engine to the specs above; several levels rebuilding at once, per-reason witnesses: not yet |
+| `tests/tracking` | the tracking redesign before it is built: the log of entries, progress as pieces and points, the planner, staleness asked of the planner, full runs as a clear plus the gate, the amended P8, tables with late and dead writers, the cut, exact cleanup, lineage | today's engine to the specs above; several levels rebuilding at once, staleness reasons: not yet |
 
 ## Formal model: execution semantics (`spec/tla/Execution.tla`)
 
@@ -1251,10 +1251,11 @@ attempt.
 it is built.* A brute-force model in Python, not of the engine. It settled the
 design's two open choices by model check (`handoffs/SOLE-7/verdict.md` in the
 Captain drive, `decisions.md` of 2026-11-10), and the new core's units test
-against it as an oracle (`tests/tracking/README.md`). It keeps only the decided
-forms: a full run is a clear plus the gate, and staleness is one witness due key
-per input. The rejected forms, P14's exact counts and a rebuild in place behind
-a floor, are in the history of solera#15. It replaces the design's own model,
+against it as an oracle (`tests/tracking/README.md`). It keeps only what is
+built: a full run is a clear plus the gate, and staleness is asked of the
+planner (STA-3). What it checked and is gone is in the repository's history:
+one witness due key per input (built, then removed with the core's), P14's
+exact counts, and a rebuild in place behind a floor. It replaces the design's own model,
 which lived outside the repository (`docs/handoff/tracking-model/model.py` on
 `handoff/2026-11-09`); everything that model checked is checked here, apart from P14's
 exact counts, which were rejected.
@@ -1285,19 +1286,18 @@ same invariant.
 **Staleness** (`staleness.py`): checks reads items. Histories mix upstream
 commits that revert, an upstream full run in the design's form (a clear, then
 complete), batches planned and committed later, failing keys owed but not
-due, retries due by timer or by force, pattern, context and definition
+due, retries that come due, pattern, context and definition
 changes, key-list runs, a full run's resetting first batch, progress reset to
-`held`, lost notifications and restarts. The witness keeps the amendment's
-rules 1 to 8. After every step: progress decodes to what checks really holds;
-the planner's candidates equal the brute-force owed set (the count on
-request); the answer is `held` exactly while items is mid full run, else
-`stale` exactly when some key is due; the witness is due; completeness equals
+`held`, and restarts. After every step: progress decodes to what checks really
+holds; the planner's candidates equal the brute-force owed set (the count on
+request); outside an upstream full run, the planner asked for one key takes
+one exactly when some key is due (stale, STA-3); completeness equals
 what was processed since the last reset (ranges and key lists, recorded apart
-from progress); rule 1 never takes a key that is not due. Due keys come from a
+from progress). Due keys come from a
 record of failures kept apart from the engine's outcomes: a failing key's
 outcome goes once upstream returns to what checks holds (§11, KEY-3), and its
 point stays. Besides 200 random histories, CI checks every history of up to
-four events over a 35-event alphabet (about 280,000).
+four events over a 29-event alphabet (about 82,000).
 
 **Full runs** (`fullrun.py`): items and feed drive copy (an ordinary keyed
 copy with feed as a second input, under definitions that keep, drop or rename
@@ -1361,14 +1361,11 @@ to load, and once quiet the objects left are exactly the log's. Records leave hi
 **Calibration.** Every rule is named (`RULES` in each module) and has a
 history in `histories.py` that passes with every rule on and fails with that
 rule off (`test_each_rule_is_needed`). Rules this model had to add to the
-design and the amendments are switched off by `ADDED`; each is a finding:
+design and the amendments (`ADDED` in `fullrun.py`, and staleness's one rule)
+are each a finding:
 
 | Model | Rule added | Without it |
 |---|---|---|
-| staleness | `reset_probe`: a batch that resets progress (a full run's first batch) probes the whole input | rule 3 probes only the batch's range and reads fresh while the rest is owed |
-| staleness | `held_probe`: progress reset to `held` probes, as rule 4 | the input reads fresh with every held key owed |
-| staleness | `catch_up_first`: every rule, and every change of conditions or reset, begins with rule 7's comparison | after a lost notification, rule 1 applies an old commit to newer progress or newer conditions and names a key that is not due |
-| staleness | `rearm`: a restart applies rule 5 to every retry already due | a retry whose timer fired before the restart is never noticed |
 | staleness | `hold_back`: a batch holds back a key it loaded at another commit than planned while items is mid full run, or if a clear came since it planned | checks processes a removal the clear made and adds the key back when items completes, a state items had only mid full run (the check records which commits fell inside one). Only the mid-full-run half bites here: this model loads at the instant of the commit, so after the full run completes it loads a finished state; the full-run model's `load` event tests the clear-since-plan half |
 | full runs | `hold_back`: a reader's batch holds back what it loaded at another version than planned while its upstream is incomplete, or if a clear came since it planned | on a table the gate does not cover a batch already in flight, nor one that loaded mid rebuild and commits after: report loads a half-built count, archive processes removals the clear made. With late and dead writers the same rule is recommendation 4 |
 | full runs | `repair_removals`: the repair also redoes the keys the dead attempts' specs named, not only the rows it finds by version | a dead attempt's delete leaves no row to list: the log keeps a key the table lost |
@@ -1394,7 +1391,7 @@ overwritten, not repaired.
 
 **Not modeled yet:** several upstream levels rebuilding at once, lineage over a
 `held` replaced slice (§12, review F8: the full-run model has no held pieces
-and no pattern changes, and the staleness model keeps no records), one witness per reason (STA-2), the propagation of
+and no pattern changes, and the staleness model keeps no records), staleness reasons (STA-2), the propagation of
 "upstream stale" down the graph, and the cost of any of it at scale.
 
 ## Trace validation: simulation runs against the specs

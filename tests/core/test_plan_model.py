@@ -97,7 +97,7 @@ def model_owed(w) -> list[tuple[str, str]]:
 
 
 def replay(events: list[tuple], root) -> int:
-    w = staleness.World("witness")
+    w = staleness.World()
     core = Core(root)
     checked = 0
     for i, ev in enumerate(events):
@@ -203,14 +203,14 @@ def test_the_core_answers_as_the_model_over_random_histories(tmp_path, seed):
 def test_the_design_worked_example_tally(tmp_path):
     """§5's worked example: run 1 at c1 and c2, run 2's first batch at c4."""
     events = [
-        ("up", (("k1", 1), ("k2", 1), ("k3", 1)), False),
+        ("up", (("k1", 1), ("k2", 1), ("k3", 1))),
         ("plan", 2),
         ("commit", (), ()),
-        ("up", (("k2", 2), ("k4", 2)), False),
+        ("up", (("k2", 2), ("k4", 2))),
         ("plan", 2),
         ("commit", (), ()),
-        ("up", (("k3", ABSENT), ("k5", 3)), False),
-        ("up", (("k1", 4),), False),
+        ("up", (("k3", ABSENT), ("k5", 3))),
+        ("up", (("k1", 4),)),
         ("cancel",),
         ("plan", 2),
         ("commit", (), ()),
@@ -220,11 +220,11 @@ def test_the_design_worked_example_tally(tmp_path):
 
 def test_a_held_edge_owes_every_key_its_own_output_holds(tmp_path):
     events = [
-        ("up", (("k1", 1), ("k2", 1)), False),
+        ("up", (("k1", 1), ("k2", 1))),
         ("plan", 3),
         ("commit", (), ()),
         ("held",),
-        ("up", (("k3", 2),), False),
+        ("up", (("k3", 2),)),
         ("plan", 3),
         ("commit", (), ("k3",)),
     ]
@@ -238,7 +238,7 @@ def test_a_failed_removal_owes_nothing_once_the_patterns_take_its_key_again(tmp_
     point's version at the head must come from the index, not from what the
     batch recorded under patterns that did not take k1."""
     events = [
-        ("up", (("k1", 1), ("k2", 1)), False),
+        ("up", (("k1", 1), ("k2", 1))),
         ("plan", 5),
         ("commit", (), ()),
         ("pat", 2),
