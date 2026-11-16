@@ -501,11 +501,6 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
                 event["retry_for"] = float(retry_for)
         if commit is not None:
             event["commit"] = commit
-        elif task["asset"] in self.manifest["assets"]:
-            # What it wrote is cleaned up once a worker that outlives it can no longer add to
-            # it: the asset's timeout and cancel grace after its end (the sweep, §9.8).
-            info = self.manifest["assets"][task["asset"]]
-            event["late_writes"] = float(info.get("timeout") or 3600) + self.cancel_grace
         if more:
             event["more"] = True
         if restart:  # its asset read a dead write to its own output: its next attempt runs in full
