@@ -308,8 +308,8 @@ impl Cleaned {
 /// anew at commit 1 (a cleanup step or merge of the old life is refused in
 /// the new one: steps name the output's life, merges their layers'
 /// paths). The engine deletes its layer files and objects. Refused while an
-/// edge reads it or a watch names it as its own output, and for the record
-/// outputs of a per-key edge in the state (they go with the edge).
+/// edge reads it, and for the record outputs of a per-key edge in the
+/// state (they go with the edge).
 #[derive(Clone, Debug, PartialEq)]
 pub struct Retire {
     pub output: Id,
@@ -333,17 +333,6 @@ impl Retire {
         if let Some((e, _)) = t.edges.iter().find(|(_, e)| e.input == self.output) {
             return invalid(format!(
                 "{} is still read by edge {}",
-                name(&self.output),
-                name(e)
-            ));
-        }
-        if let Some((e, _)) = t.stale.inputs.iter().find(|(_, i)| {
-            i.watch
-                .as_ref()
-                .is_some_and(|w| w.own.as_deref() == Some(&self.output[..]))
-        }) {
-            return invalid(format!(
-                "{} is still the own output edge {}'s watch reads",
                 name(&self.output),
                 name(e)
             ));

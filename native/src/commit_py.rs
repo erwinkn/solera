@@ -5,7 +5,6 @@
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList};
-use solera_index::Version;
 use solera_tracking as tr;
 use solera_tracking::commit::{self, Change, Changes, Mode, Reader, Spec};
 use solera_tracking::plan::Indexes;
@@ -18,7 +17,6 @@ use crate::tracking_py::err;
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_commit<'py>(
     py: Python<'py>,
-    state: &std::sync::RwLock<tr::Tracking>,
     out: tr::Output,
     ixs: &dyn Indexes,
     output: &[u8],
@@ -53,20 +51,10 @@ pub(crate) fn build_commit<'py>(
         collect,
     };
     let id: tr::Id = output.into();
-    let mut notice = tr::stale::Notice::new(
-        &state.read().unwrap(),
-        output,
-        out.head + 1,
-        spec.mode == Mode::Clear,
-        time_ms,
-    );
     let built = guard(|| {
         py.detach(|| {
             let mut src = Reader::new(changes)?;
-            let mut each = |k: &[u8], v: Version<'_>| notice.push(k, v);
-            rt().block_on(commit::build_each(
-                ixs, &id, &out, spec, &mut src, &mut each,
-            ))
+            rt().block_on(commit::build(ixs, &id, &out, spec, &mut src))
         })
         .map_err(err)
     })?;
@@ -74,9 +62,7 @@ pub(crate) fn build_commit<'py>(
         return Ok(None);
     };
     let d = PyDict::new(py);
-    let mut parts = vec![tr::Part::OutputCommit(b.part.clone())];
-    parts.extend(notice.finish());
-    let ev = tr::Event::of(parts).encode();
+    let ev = tr::Event::of(vec![tr::Part::OutputCommit(b.part.clone())]).encode();
     d.set_item("event", PyBytes::new(py, &ev))?;
     d.set_item("commit", b.part.layer.hi)?;
     d.set_item("layer", layer_out(py, &b.part.layer)?)?;

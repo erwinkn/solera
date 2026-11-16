@@ -10,8 +10,8 @@
 //!
 //! Tags are allocated by unit, so units add parts without touching each
 //! other's: 0x01-0x1f progress and planner (B3), 0x20-0x2f output and
-//! source commits (B4), 0x30-0x3f key outcomes (B6), 0x40-0x4f staleness
-//! (B7), 0x50-0x5f retention (B9).
+//! source commits (B4), 0x30-0x3f key outcomes (B6), 0x50-0x5f retention
+//! (B9).
 //!
 //! [`crate::Tracking::apply`] decodes every part, checks every part against
 //! the state as it was before the event, and only then applies them in order,
@@ -29,7 +29,6 @@ use crate::error::{format, Result};
 use crate::outcomes;
 use crate::progress;
 use crate::retain;
-use crate::stale;
 use std::borrow::Cow;
 
 /// A thing one part of an event changes, as (kind, id).
@@ -82,10 +81,6 @@ pub enum Part {
     /// B6: a full run of a per-key asset asked for by hand raises its input's rebuild counter.
     Rebuild(outcomes::Rebuild),
     Forced(outcomes::Forced),
-    /// B7: an edge's conditions now.
-    Watch(stale::SetWatch),
-    /// B7: what a refresh or a notice found for an edge.
-    Witness(stale::Witness),
     /// B9: a merge replaces adjacent layers of an output.
     Merged(retain::Merged),
     /// B9: an output's cleanup cursor starts.
@@ -144,8 +139,6 @@ impl Part {
             Part::PassStart(p) => vec![on("outcomes", &p.edge)],
             Part::Rebuild(p) => vec![on("outcomes", &p.edge)],
             Part::Forced(p) => vec![on("outcomes", &p.edge)],
-            Part::Watch(p) => vec![on("edge", &p.edge)],
-            Part::Witness(p) => vec![on("witness", &p.edge)],
             Part::Merged(p) => vec![on("output", &p.output)],
             Part::Track(p) => vec![on("cursor", &p.output)],
             Part::Cleaned(p) => vec![on("cursor", &p.output)],
@@ -168,8 +161,6 @@ impl Part {
             Part::PassStart(_) => outcomes::TAG_PASS_START,
             Part::Rebuild(_) => outcomes::TAG_REBUILD,
             Part::Forced(_) => outcomes::TAG_FORCED,
-            Part::Watch(_) => stale::TAG_WATCH,
-            Part::Witness(_) => stale::TAG_WITNESS,
             Part::Merged(_) => retain::TAG_MERGED,
             Part::Track(_) => retain::TAG_TRACK,
             Part::Cleaned(_) => retain::TAG_CLEANED,
@@ -192,8 +183,6 @@ impl Part {
             Part::PassStart(p) => p.encode(e),
             Part::Rebuild(p) => p.encode(e),
             Part::Forced(p) => p.encode(e),
-            Part::Watch(p) => p.encode(e),
-            Part::Witness(p) => p.encode(e),
             Part::Merged(p) => p.encode(e),
             Part::Track(p) => p.encode(e),
             Part::Cleaned(p) => p.encode(e),
@@ -216,8 +205,6 @@ impl Part {
             outcomes::TAG_PASS_START => Part::PassStart(outcomes::PassStart::decode(d)?),
             outcomes::TAG_REBUILD => Part::Rebuild(outcomes::Rebuild::decode(d)?),
             outcomes::TAG_FORCED => Part::Forced(outcomes::Forced::decode(d)?),
-            stale::TAG_WATCH => Part::Watch(stale::SetWatch::decode(d)?),
-            stale::TAG_WITNESS => Part::Witness(stale::Witness::decode(d)?),
             retain::TAG_MERGED => Part::Merged(retain::Merged::decode(d)?),
             retain::TAG_TRACK => Part::Track(retain::Track::decode(d)?),
             retain::TAG_CLEANED => Part::Cleaned(retain::Cleaned::decode(d)?),

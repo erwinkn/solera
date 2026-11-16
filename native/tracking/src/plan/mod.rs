@@ -329,22 +329,6 @@ impl View {
         read_digest(keyed, false, range)
     }
 
-    /// B6: the first input's failure records of `keys` and the conditions
-    /// they name, or None when the edge has no records.
-    pub async fn failure_records(
-        &self,
-        ixs: &dyn Indexes,
-        keys: &[&[u8]],
-    ) -> Result<Option<(BTreeMap<Key, crate::outcomes::Record>, Arc<Conds>)>> {
-        let Some(f) = self.inputs.first().and_then(|v| v.failures.as_ref()) else {
-            return Ok(None);
-        };
-        Ok(Some((
-            records(ixs, &f.output, &f.out, keys).await?,
-            f.conds.clone(),
-        )))
-    }
-
     /// The own output of input `input` as this view read it, where it did.
     pub(crate) fn own(&self, input: usize) -> Option<Own> {
         self.inputs[input].own.as_ref().map(|o| Own {
@@ -352,11 +336,6 @@ impl View {
             head: o.2,
             life: o.3,
         })
-    }
-
-    /// B6: whether the first input has failure records.
-    pub fn has_failures(&self) -> bool {
-        self.inputs.first().is_some_and(|v| v.failures.is_some())
     }
 }
 
@@ -514,16 +493,9 @@ impl<'a> Src<'a> {
     }
 }
 
-/// A callback shown each owed key a walk counts: the key, what the consumer
-/// held, and the version to hold.
-pub type Each<'a> = &'a mut (dyn FnMut(&[u8], &Holding, &Ver) + Send);
-
 /// What a walk found.
-struct Found<'a> {
+struct Found {
     keep: bool,
-    /// Sees every owed key the walk counts, kept or not: the key, what the
-    /// consumer held, and the version to hold.
-    each: Option<Each<'a>>,
     limit: usize,
     keys: Vec<Cand>,
     held_back: Vec<HeldBack>,
@@ -553,11 +525,10 @@ struct Pend {
     wanted: Holding,
 }
 
-impl Found<'_> {
+impl Found {
     fn new(limit: usize, keep: bool) -> Self {
         Found {
             keep,
-            each: None,
             limit,
             keys: vec![],
             held_back: vec![],
@@ -593,7 +564,7 @@ struct Walker<'a> {
 }
 
 impl Walker<'_> {
-    async fn walk(&self, after: Option<&Key>, out: &mut Found<'_>) -> Result<()> {
+    async fn walk(&self, after: Option<&Key>, out: &mut Found) -> Result<()> {
         let r = KeyRange {
             lo: after.cloned(),
             hi: None,
@@ -607,7 +578,7 @@ impl Walker<'_> {
         Ok(())
     }
 
-    async fn piece(&self, r: &KeyRange, value: &Value, out: &mut Found<'_>) -> Result<()> {
+    async fn piece(&self, r: &KeyRange, value: &Value, out: &mut Found) -> Result<()> {
         let page = (out.limit - out.n).saturating_add(1) as u64;
         let now_pat = self.now.patterns.index_pattern();
         let mut srcs: Vec<Src<'_>> = Vec::new();
@@ -791,7 +762,7 @@ impl Walker<'_> {
     /// A key a record may speak for waits for the records: an owed key (the
     /// record says what the consumer holds) and a point (a record beside a
     /// point that holds what is wanted is moot).
-    fn take(&self, key: Key, held: Holding, version: Ver, point: bool, out: &mut Found<'_>) {
+    fn take(&self, key: Key, held: Holding, version: Ver, point: bool, out: &mut Found) {
         let wanted = Holding::of(version.as_version(), self.now, &key);
         let version = if matches!(wanted, Holding::Absent) {
             Ver::Absent
@@ -815,7 +786,7 @@ impl Walker<'_> {
     /// (it holds what upstream has now) is not owed, and its record goes
     /// at the commit; a failing key tried at what upstream has now waits
     /// for its retry: owed, not due. A canceled key does not wait (KEY-9).
-    async fn flush(&self, out: &mut Found<'_>) -> Result<()> {
+    async fn flush(&self, out: &mut Found) -> Result<()> {
         let Some((ixs, f)) = self.fails else {
             return Ok(());
         };
@@ -857,7 +828,7 @@ impl Walker<'_> {
         Ok(())
     }
 
-    fn decide(&self, key: Key, held: Holding, version: Ver, wanted: Holding, out: &mut Found<'_>) {
+    fn decide(&self, key: Key, held: Holding, version: Ver, wanted: Holding, out: &mut Found) {
         let class = if owed(&held, &wanted) {
             let class = Class::of(&held, &wanted);
             if self.hold.held_back(self.input, &key) {
@@ -877,9 +848,6 @@ impl Walker<'_> {
         };
         out.n += 1;
         out.counts[class as usize - 1] += 1;
-        if let Some(each) = out.each.as_mut() {
-            each(&key, &held, &version);
-        }
         if out.keep {
             out.keys.push(Cand {
                 key,
@@ -1158,7 +1126,7 @@ async fn listed_keys(w: &Walker<'_>, keys: &[Key]) -> Result<(Vec<Cand>, BTreeMa
 }
 
 /// Owed keys of one edge after `after`, at most `limit`, and where the next page
-/// starts: what staleness probes and the console pages through.
+/// starts: what the console pages through.
 pub async fn owed_keys(
     view: &View,
     req: &InputRequest,
@@ -1166,25 +1134,11 @@ pub async fn owed_keys(
     after: Option<&Key>,
     limit: usize,
 ) -> Result<(Vec<Cand>, Option<Key>)> {
-    owed_keys_due(view, req, ixs, &NoHold, after, limit).await
-}
-
-/// `owed_keys` without the keys `hold` keeps back: the keys due now.
-pub async fn owed_keys_due(
-    view: &View,
-    req: &InputRequest,
-    ixs: &dyn Indexes,
-    hold: &dyn Hold,
-    after: Option<&Key>,
-    limit: usize,
-) -> Result<(Vec<Cand>, Option<Key>)> {
     if limit == 0 {
         return invalid("a page of owed keys holds at least one key");
     }
     let mut found = Found::new(limit.saturating_add(1), true);
-    walker(view, req, ixs, hold)?
-        .walk(after, &mut found)
-        .await?;
+    walker(view, req, ixs)?.walk(after, &mut found).await?;
     let mut keys = found.keys;
     let next = (keys.len() > limit).then(|| {
         keys.truncate(limit);
@@ -1198,39 +1152,19 @@ pub async fn owed_keys_due(
 /// not meet, because their input has not changed since they failed, are
 /// counted from the edge's tally of records.
 pub async fn owed_count(view: &View, req: &InputRequest, ixs: &dyn Indexes) -> Result<[u64; 4]> {
-    let (due, waiting) = owed_count_each(view, req, ixs, &NoHold, &mut |_, _, _| {}).await?;
-    Ok(std::array::from_fn(|i| due[i] + waiting[i]))
-}
-
-/// `owed_count` in two parts: the keys due now, which `owed_keys_due`
-/// lists and `each` is shown, and the keys not due (failing keys waiting
-/// for their retry, and keys `hold` keeps back).
-pub async fn owed_count_each(
-    view: &View,
-    req: &InputRequest,
-    ixs: &dyn Indexes,
-    hold: &dyn Hold,
-    each: Each<'_>,
-) -> Result<([u64; 4], [u64; 4])> {
     let mut found = Found::new(usize::MAX, false);
     found.waiting = true;
-    found.each = Some(each);
-    let w = walker(view, req, ixs, hold)?;
+    let w = walker(view, req, ixs)?;
     w.walk(None, &mut found).await?;
     if let Some((_, f)) = w.fails {
         for i in 0..3 {
             found.waits[i] += f.classes[i].saturating_sub(found.visited[i]);
         }
     }
-    Ok((found.counts, found.waits))
+    Ok(std::array::from_fn(|i| found.counts[i] + found.waits[i]))
 }
 
-fn walker<'a>(
-    view: &'a View,
-    req: &'a InputRequest,
-    ixs: &'a dyn Indexes,
-    hold: &'a dyn Hold,
-) -> Result<Walker<'a>> {
+fn walker<'a>(view: &'a View, req: &'a InputRequest, ixs: &'a dyn Indexes) -> Result<Walker<'a>> {
     let Some(v) = view.inputs.first() else {
         return invalid("the view holds no keyed edge");
     };
@@ -1248,7 +1182,7 @@ fn walker<'a>(
         own,
         all: false,
         input: 0,
-        hold,
+        hold: &NoHold,
         fails: v.failures.as_ref().map(|f| (ixs, f)),
     })
 }
