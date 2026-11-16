@@ -140,6 +140,17 @@ def _at(cur, handle: dict) -> str:
     return handle.get("table") or _qname(handle.get("schema", "public"), handle["name"])
 
 
+def _hidden(table: str, role: str, act: str) -> StoreError:
+    """The refusal of a table whose row security applies to our role: a
+    delete removes only the rows the role sees, and the hidden ones stay."""
+
+    return StoreError(
+        f"{table}: row security applies to role {role}, so {act} would delete only the rows it "
+        "can see. Connect as a role that bypasses it: the table's owner, if the table does not "
+        "FORCE ROW LEVEL SECURITY, or a role with BYPASSRLS"
+    )
+
+
 def _assigned_commit(context: WriteContext, prior: Ref | None) -> int:
     if context.commit_number is not None:
         return context.commit_number
@@ -480,11 +491,7 @@ class PostgresStore:
                 domain.execute(f"SAVEPOINT {SAVEPOINT}")
             taken, found = (check.fetchone() if fenced else None), state.fetchone()
         if found["hidden_from"] is not None:
-            raise StoreError(
-                f"{table}: row security applies to role {found['hidden_from']}, so a write would "
-                "delete only the rows it can see. Connect as a role that bypasses it: the table's "
-                "owner, if the table does not FORCE ROW LEVEL SECURITY, or a role with BYPASSRLS"
-            )
+            raise _hidden(table, found["hidden_from"], "a write")
         return (self._checked(taken, context) if fenced else None), found
 
     def _state_params(self, table: str, partition: str = "") -> dict:
@@ -551,7 +558,14 @@ class PostgresStore:
                     (table, partition) if alone else (table,),
                 )
             }
-            present = cur.execute("SELECT to_regclass(%s) IS NOT NULL AS ok", (table,)).fetchone()["ok"]
+            # Whether the table is there, and whether its row security hides rows from our role:
+            # a DELETE would then leave them (`_begin`). A DROP TABLE takes them all regardless.
+            found = cur.execute(
+                "SELECT r IS NOT NULL AS ok, CASE WHEN row_security_active(r) THEN current_user::text "
+                "END AS hidden_from FROM (SELECT to_regclass(%s) AS r) AS t",
+                (table,),
+            ).fetchone()
+            present = found["ok"]
 
             def due(part) -> bool:
                 g = written.get(part)
@@ -566,6 +580,8 @@ class PostgresStore:
                 self._drop_builds(cur, table)
                 self._forget(cur, table, list(written))
             else:
+                if taken and found["hidden_from"] is not None:  # rolls back the version row placed
+                    raise _hidden(table, found["hidden_from"], "a cleanup")
                 for part in taken:
                     where = {column: part} if column else {}
                     sql, params = self._where_sql(where), [where[k] for k in sorted(where)]

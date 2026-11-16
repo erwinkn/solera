@@ -1765,6 +1765,39 @@ async def test_a_write_is_refused_when_row_security_applies_to_its_role(store, o
     assert outside(store, out) == {"a": "1", "b": "1"} and registry(store, out) == (1, 1)
 
 
+async def test_a_partitions_cleanup_is_refused_when_row_security_applies_to_its_role(store, owner):
+    """A cleanup of partition x would delete a and leave b, which the role
+    does not see. It is refused, and changes nothing: neither x's rows nor
+    its version row."""
+
+    plain, role = owner
+    out = keyed_output(partition_column="site", columns={"site": "text", "id": "text", "v": "text"})
+    await store.store(rows(a="1", b="1"), None, at(out, 1, partition="x"))
+    await store.store(rows(c="1"), None, at(out, 2, partition="y"))
+    table, _, _ = store._table(out)
+    sql(f"ALTER TABLE {table} ENABLE ROW LEVEL SECURITY, FORCE ROW LEVEL SECURITY")
+    sql(f"CREATE POLICY hide_b ON {table} USING (id <> 'b')")
+    with pytest.raises(StoreError, match=f"row security applies to role {role}, so a cleanup"):
+        await plain.cleanup(out, partition="x")
+    assert outside(store, out) == {"a": "1", "b": "1", "c": "1"}
+    assert registry(store, out, "x") == (1, 1)
+
+
+async def test_a_keys_cleanup_is_refused_when_row_security_applies_to_its_role(store, owner):
+    """A cleanup of key a would delete none of a's rows, which the role does
+    not see, and say nothing. It is refused instead."""
+
+    plain, role = owner
+    out = keyed_output(incremental=True)
+    await store.store(rows(a="1", b="1"), None, at(out, 1))
+    table, _, _ = store._table(out)
+    sql(f"ALTER TABLE {table} ENABLE ROW LEVEL SECURITY, FORCE ROW LEVEL SECURITY")
+    sql(f"CREATE POLICY hide_a ON {table} USING (id <> 'a')")
+    with pytest.raises(StoreError, match=f"row security applies to role {role}, so a cleanup"):
+        await plain.cleanup(out, partition="", key="a")
+    assert outside(store, out) == {"a": "1", "b": "1"} and registry(store, out) == (1, 1)
+
+
 async def test_a_write_is_not_refused_when_row_security_does_not_apply_to_its_role(store, owner):
     """Row security enabled but not forced does not apply to the table's
     owner: with no policy it would hide every row from anyone else."""

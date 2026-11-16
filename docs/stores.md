@@ -710,10 +710,14 @@ A build left behind (its switch failed, or the run was canceled) is
 continued by the same full run's next write, made again by a new full
 run's first write, and dropped by any other write to the partition. The
 table's triggers and rules fire at the switch, on one delete and one
-insert of the partition, as for a full run written in place. A write is
-refused when row security applies to the store's role, since a delete
-would remove only the rows that role sees: connect as the table's owner
-without `FORCE ROW LEVEL SECURITY`, or as a role with `BYPASSRLS`.
+insert of the partition, as for a full run written in place. A write, and
+a cleanup that deletes a partition's or a key's rows, is refused when row
+security applies to the store's role, since a delete would remove only
+the rows that role sees: connect as the table's owner without
+`FORCE ROW LEVEL SECURITY`, or as a role with `BYPASSRLS`. A cleanup that
+drops the whole table is not refused: `DROP TABLE` takes every row. A
+migration is not refused either: the store itself only drops builds, and
+its payload is yours, which may be the one that turns row security off.
 
 A migration holds the table's write domain exclusively: it waits for
 every partition's open write transaction and holds off new ones until it
