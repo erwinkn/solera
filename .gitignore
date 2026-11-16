@@ -8,6 +8,7 @@ dist/
 .env
 node_modules/
 apps/console/test-results/
+apps/console/.ui-notes.jsonl
 native/target/
 native/index/target/
 bench/change-index/target/

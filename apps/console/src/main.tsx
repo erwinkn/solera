@@ -28,11 +28,9 @@ const queryClient = new QueryClient({
 
 const router = makeRouter(queryClient);
 
-// Agentation (UI feedback for agents) in development only: `import.meta.env.DEV`
-// is false in a build, so the import and the component are dropped from the bundle.
-const Agentation = import.meta.env.DEV
-  ? lazy(() => import("agentation").then((m) => ({ default: m.Agentation })))
-  : null;
+// UI notes (src/dev/notes.tsx) in development only: `import.meta.env.DEV` is
+// false in a build, so the import and the component are dropped from the bundle.
+const Notes = import.meta.env.DEV ? lazy(() => import("@/dev/notes")) : null;
 listenForPalette();
 
 createRoot(document.getElementById("root")!).render(
@@ -40,9 +38,9 @@ createRoot(document.getElementById("root")!).render(
     <QueryClientProvider client={queryClient}>
       <RouterProvider router={router} />
     </QueryClientProvider>
-    {Agentation && (
+    {Notes && (
       <Suspense fallback={null}>
-        <Agentation appName="Solera console" />
+        <Notes />
       </Suspense>
     )}
   </StrictMode>,

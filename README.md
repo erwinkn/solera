@@ -359,6 +359,24 @@ whole, incremental and per-key inputs, placements, triggers, and the Postgres st
 are documented in [docs/architecture.md](docs/architecture.md);
 `python/solera_server/demo.py` exercises all of them.
 
+## Working on the console
+
+```bash
+uv run solera serve --insecure                               # the API, on :8000
+pnpm install --frozen-lockfile && pnpm -C apps/console dev   # the console with hot reload, on :5173
+pnpm -C apps/console build                                   # rebuild the bundle committed under solera_server/web
+```
+
+`SOLERA_SERVER_URL` points the dev server at an API elsewhere.
+
+The dev server also takes notes on the UI. A toolbar sits in the bottom right
+corner: start feedback mode, click an element (or select text, or drag over an
+area) and write what should change. Each note is appended to
+`apps/console/.ui-notes.jsonl` with its page, the element's selector, its React
+components and its source file, as one JSON object per line (`add`, `update`,
+`delete` and `clear` events; replaying them by note id gives the notes as they
+stand). The file is not committed, and none of this is in the built bundle.
+
 ## Tests
 
 ```bash
