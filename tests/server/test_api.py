@@ -101,6 +101,18 @@ async def test_health_and_diagnostics(client, base):
     assert diag["state"].startswith("file://")
 
 
+async def test_health_is_degraded_not_down_while_something_in_the_background_fails(engine, client):
+    """A failing automation is no reason to restart: health stays 200, says
+    degraded, and keeps the error, which diagnostics shows, to itself."""
+
+    engine.failing["automation nightly"] = "boom: secret-bucket refused"
+    health = await client.get("/healthz")
+    assert health.status_code == 200 and health.json() == {"status": "degraded", "backend": "object-store"}
+    assert "secret-bucket" in (await client.get("/api/diagnostics")).json()["last_error"]
+    engine.failing.clear()
+    assert (await client.get("/healthz")).json()["status"] == "ok"
+
+
 async def test_a_history_row_that_cannot_be_written_shows_in_diagnostics(engine, client):
     """A run's timeline row with text where the table holds a number: the
     flush writes the run's other rows and raises an alarm naming the bad one."""
