@@ -172,6 +172,50 @@ def server(project_file, state_url, monkeypatch):
     thread.join(timeout=10)
 
 
+KEYS_SRC = """
+from pathlib import Path
+
+from solera import Rejected
+from solera.sdk import Incremental, Output, Project, asset
+
+CALLS = Path(__file__).with_name("calls.txt")
+
+@asset(outputs=Output("items", key="id"))
+def items():
+    return [{"id": "a"}, {"id": "b"}]
+
+@asset(inputs={"item": Incremental("items", each=True)}, outputs=Output("checks", key="id"))
+def checks(ctx, item: list):
+    with CALLS.open("a") as f:
+        f.write(ctx.key + "\\n")
+    if ctx.key == "b":
+        raise Rejected("bad")
+    return [{"ok": True}]
+
+project = Project(assets=[items, checks], name="keysdemo")
+"""
+
+
+def test_local_keys_retry_calls_the_failing_keys_once_more(tmp_path, state_url, capsys, monkeypatch):
+    """`solera keys retry checks --rejected` (KEY-7) calls the rejected key
+    once more, in a run it waits for; `--failed` finds none to call."""
+
+    monkeypatch.delenv("SOLERA_SERVER_URL", raising=False)
+    path = tmp_path / "keysdemo.py"
+    path.write_text(KEYS_SRC)
+    calls = tmp_path / "calls.txt"
+    base = ("--state-url", state_url)
+    cli(monkeypatch, capsys, *base, "run", "--project", str(path), "--upstream", "checks")
+    assert sorted(calls.read_text().split()) == ["a", "b"]
+
+    none = cli(monkeypatch, capsys, *base, "keys", "retry", "checks")
+    assert (none["classes"], none["partitions"], none["runs"]) == (["failed"], [], [])
+    retried = cli(monkeypatch, capsys, *base, "keys", "retry", "checks", "--rejected")
+    assert (retried["classes"], retried["partitions"]) == (["rejected"], [""])
+    assert [r["status"] for r in retried["runs"]] == ["succeeded"]
+    assert sorted(calls.read_text().split()) == ["a", "b", "b"]
+
+
 def test_remote_run_and_reads(server, project_file, capsys, monkeypatch):
     """With SOLERA_SERVER_URL set, commands hit the API (§8 run vocabulary)."""
 

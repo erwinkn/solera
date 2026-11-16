@@ -32,6 +32,7 @@ from zoneinfo import ZoneInfo
 from croniter import croniter
 from obstore.exceptions import AlreadyExistsError
 from solera import lifecycle
+from solera._native import Tracking
 from solera.ids import ulid, ulid_time
 from solera.keys.io import ObjectIO
 from solera.keys.layers import (
@@ -340,7 +341,7 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
         await self.history.stop()
 
     async def tick(self):
-        """One evaluation pass: adoption, dispatch, automations, archiving."""
+        """One evaluation pass: adoption, dispatch, automations, retries, archiving."""
 
         self._adopt()
         await self._cover_tick()
@@ -350,6 +351,7 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
         self._dispatch_due()
         self._sensor_sweep()
         self._automation_tick()
+        await core_outcomes.retry_clock(self)
         self._archive_due()
 
     async def run_until(self, run_id: str, timeout: float = 120.0):
@@ -1882,6 +1884,32 @@ class Engine(Attempts, Observing, Sensors, Staleness, Views):
             tags=run.get("tags"),
             retry_of=run_id,
         )
+
+    async def retry_keys(self, asset: str, classes, partition: str | None = None, by: str | None = None):
+        """`solera keys retry` (KEY-7): a per-key asset's failing keys of
+        `classes` (stored outcomes, or `all`) called once more each, in every
+        partition holding one or in `partition` alone: the request is recorded
+        on each partition's edge, and a run of them starts at once. Returns
+        the classes, the partitions and the runs started."""
+
+        if self._each_input(asset) is None:
+            raise ValueError(f"{asset} has no per-key input: it keeps no failing keys")
+        classes = sorted(set(core_outcomes.STORED) if "all" in classes else set(classes))
+        unknown = set(classes) - set(core_outcomes.STORED)
+        if unknown or not classes:
+            raise ValueError(f"unknown key classes: {sorted(unknown) or classes}")
+        events, partitions = [], []
+        for _, s, edge in self._each_edges(asset):
+            held = [c for c, n in self.m.core.outcome_counts(edge).items() if c in classes and n]
+            if partition in (None, s) and held:
+                events.append(self.m.core.event_force(edge, held))
+                partitions.append(s)
+        runs = []
+        if events:
+            self.core.record(Tracking.join(events))
+            run = await self.submit([asset], partitions, skip_active=True, by=by)
+            runs = [run] if run is not None else []
+        return {"asset": asset, "classes": classes, "partitions": partitions, "runs": runs}
 
     # -- finished runs -------------------------------------------------------------------
 

@@ -203,6 +203,14 @@ def _main():
     stale.add_argument("asset")
     stale.add_argument("partition", nargs="?", default="", help="Its partition; none when unpartitioned")
 
+    keys = commands.add_parser("keys", help="A per-key asset's failing keys (KEY-7)", parents=[common])
+    keys_sub = keys.add_subparsers(dest="keys_command", required=True)
+    keys_retry = keys_sub.add_parser("retry", help="Call a per-key asset's failing keys once more, now")
+    keys_retry.add_argument("asset")
+    keys_retry.add_argument("--partition", default=None, help="One partition only")
+    for name in ("failed", "rejected", "retrying", "canceled", "timed-out", "all"):
+        keys_retry.add_argument(f"--{name}", action="store_true")
+
     run_show = commands.add_parser("run-show", help="Show a run's tasks and attempts", parents=[common])
     run_show.add_argument("run_id")
 
@@ -462,6 +470,13 @@ def _prune_payload(args):
     return {"before": before, "asset": args.asset, "keep": args.keep, "dry_run": args.dry_run}
 
 
+def _key_classes(args) -> list[str]:
+    """`solera keys retry --failed --rejected …`; `--failed` when none is given."""
+
+    names = ("failed", "rejected", "retrying", "canceled", "timed_out", "all")
+    return [n for n in names if getattr(args, n)] or ["failed"]
+
+
 def _commit_payload(args):
     keys = json.loads(args.keys) if args.keys else None
     upsert = json.loads(args.upsert) if args.upsert else None
@@ -516,6 +531,11 @@ async def _remote(args, parser):
                 return response.json()
 
             print(json.dumps(await _stale_pages(page), indent=2))
+        elif args.command == "keys":
+            body = {"classes": _key_classes(args), "partition": args.partition, "by": "cli"}
+            response = await client.post(f"{base}/assets/{args.asset}/keys:retry", json=body)
+            response.raise_for_status()
+            print(json.dumps(response.json(), indent=2))
         elif args.command == "runs" and args.runs_command == "delete":
             response = await client.delete(f"{base}/runs/{args.run_id}")
             response.raise_for_status()
@@ -595,6 +615,12 @@ async def _local(args, parser):
                 else runtime.partition_cleanups(args.output, args.partition)
             )
             print(json.dumps(view, indent=2))
+        elif args.command == "keys":
+            found = await runtime.retry_keys(args.asset, _key_classes(args), args.partition, "cli")
+            found["runs"] = [
+                (await runtime.run_until(r["id"]))["request"] for r in found["runs"]
+            ]  # as they end
+            print(json.dumps(found, indent=2))
         elif args.command == "runs" and args.runs_command == "delete":
             await runtime.delete_run(args.run_id)
             print(json.dumps({"deleted": [args.run_id]}, indent=2))

@@ -66,6 +66,41 @@ pub async fn next_due(ixs: &dyn Indexes, edge: &[u8], due: &Output) -> Result<Op
     Ok(Some(due_at(page.run.key(0))?.0))
 }
 
+/// The keys due by the edge's clock at `now`, in key order: the
+/// `PASS_KEYS` earliest due, at most.
+pub async fn due_by_clock(
+    ixs: &dyn Indexes,
+    edge: &[u8],
+    due: &Output,
+    now: u64,
+) -> Result<Vec<Key>> {
+    let did = output_id(DUE, edge);
+    let mut keys: Vec<Key> = Vec::new();
+    let mut after: Option<Vec<u8>> = None;
+    'pages: while due.live > 0 && keys.len() < PASS_KEYS {
+        let q = Query {
+            after: after.take(),
+            limit: Some(PAGE),
+            ..Default::default()
+        };
+        let page = ixs.index(&did)?.scan(&due.layers, due.head, &q).await?;
+        for i in 0..page.run.len() {
+            let (t, k) = due_at(page.run.key(i))?;
+            if t > now || keys.len() == PASS_KEYS {
+                break 'pages;
+            }
+            keys.push(k.into());
+        }
+        match page.next {
+            Some(n) => after = Some(n),
+            None => break,
+        }
+    }
+    keys.sort_unstable();
+    keys.dedup();
+    Ok(keys)
+}
+
 /// Whether a deploy or a forced request has made a class of records
 /// eligible since the last pass.
 pub fn by_counters(v: &View, c: &Counters) -> bool {
@@ -97,33 +132,10 @@ pub async fn start(
     if by_counters(v, &counters) {
         return Ok(Some(vec![start]));
     }
-    let did = output_id(DUE, &v.edge);
-    let mut keys: Vec<Key> = Vec::new();
-    let mut after: Option<Vec<u8>> = None;
-    'pages: while v.due.live > 0 && keys.len() < PASS_KEYS {
-        let q = Query {
-            after: after.take(),
-            limit: Some(PAGE),
-            ..Default::default()
-        };
-        let page = ixs.index(&did)?.scan(&v.due.layers, v.due.head, &q).await?;
-        for i in 0..page.run.len() {
-            let (t, k) = due_at(page.run.key(i))?;
-            if t > now || keys.len() == PASS_KEYS {
-                break 'pages;
-            }
-            keys.push(k.into());
-        }
-        match page.next {
-            Some(n) => after = Some(n),
-            None => break,
-        }
-    }
+    let keys = due_by_clock(ixs, &v.edge, &v.due, now).await?;
     if keys.is_empty() {
         return Ok(None);
     }
-    keys.sort_unstable();
-    keys.dedup();
     let mut ch = Changes::new();
     for k in &keys {
         ch.push(k, Change::Upsert(Some(b"")))?;
