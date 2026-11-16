@@ -265,3 +265,77 @@ async def test_the_first_slice_follows_the_file_cache(solera, slice_):
     assert parsed == ["f5"]
     assert await solera.outcomes("sga_alumina_density", "rejected", "failed") == {}
     assert (bad, "f5", "s5", 3.6) in table()
+
+
+async def test_a_sheet_whose_rows_the_table_refuses_fails_alone(solera, slice_):
+    """The table knows more than the parser: its densities are floats, and
+    positive (a CHECK added by hand). A sheet whose rows it refuses is a
+    failing key with Postgres's message, parsed once; the other sheets of
+    its batch commit, and later sheets are not held up by it. Fixed, its
+    rows arrive and its failure goes."""
+
+    project, query, sheets, parsed = slice_
+    project.default_store = FileStore(solera.root / "data")
+    await solera.deploy(project)
+    folder = "Alumina Density/2026"
+    a, b, c, d = (f"{folder}/Alumina Density Data Sheet {x}.xlsx" for x in "ABCD")
+
+    def table() -> list[tuple]:
+        rows = query("SELECT path, sample, density FROM sga_solera.sga_alumina_density ORDER BY path")
+        return [(r["path"], r["sample"], r["density"]) for r in rows]
+
+    async def failing() -> dict:
+        found = await solera.outcomes("sga_alumina_density", "rejected", "failed")
+        return {k: (r["outcome"], r["message"]) for k, r in found.items()}
+
+    query(f"INSERT INTO sharepoint.analytical_data_folders VALUES ('d1', '{folder}')")
+    put(query, sheets, "f1", "d1", "Alumina Density Data Sheet A.xlsx", "2026-11-01T10:00:00Z",
+        [{"sample": "s1", "density": 3.9}])  # fmt: skip
+    await synced(solera)
+    query("ALTER TABLE sga_solera.sga_alumina_density ADD CHECK (density > 0)")
+
+    # B has text where the table wants a float: B fails, C commits, and nothing is parsed twice.
+    parsed.clear()
+    put(query, sheets, "f2", "d1", "Alumina Density Data Sheet B.xlsx", "2026-11-02T10:00:00Z",
+        [{"sample": "s2", "density": "n/a"}])  # fmt: skip
+    put(query, sheets, "f3", "d1", "Alumina Density Data Sheet C.xlsx", "2026-11-02T10:00:00Z",
+        [{"sample": "s3", "density": 3.3}])  # fmt: skip
+    await solera.sensors(1)
+    [[attempt]] = (await solera.run("sga_alumina_density"))["attempts"].values()
+    assert attempt["keys"] == {"ok": 1, "failed": 1}
+    assert sorted(parsed) == ["f2", "f3"]
+    assert table() == [(a, "s1", 3.9), (c, "s3", 3.3)]
+    [(outcome, message)] = (await failing()).values()
+    assert outcome == "failed" and message.startswith(
+        'InvalidTextRepresentation: invalid input syntax for type double precision: "n/a"'
+    )
+    [logged] = await solera.key_log("sga_alumina_density", outcome="failed")
+    assert (logged["key"], logged["error"]) == (b, message)
+
+    # B is edited and still refused, now by the CHECK: a batch of it alone, every key refused.
+    parsed.clear()
+    put(query, sheets, "f2", "d1", "Alumina Density Data Sheet B.xlsx", "2026-11-03T10:00:00Z",
+        [{"sample": "s2", "density": -1.0}])  # fmt: skip
+    await synced(solera)
+    assert parsed == ["f2"]
+    assert table() == [(a, "s1", 3.9), (c, "s3", 3.3)]
+    [(outcome, message)] = (await failing()).values()
+    assert outcome == "failed" and message.startswith("CheckViolation: new row for relation")
+
+    # A new sheet is not held up: it alone is parsed.
+    parsed.clear()
+    put(query, sheets, "f4", "d1", "Alumina Density Data Sheet D.xlsx", "2026-11-04T10:00:00Z",
+        [{"sample": "s4", "density": 3.4}])  # fmt: skip
+    await synced(solera)
+    assert parsed == ["f4"]
+    assert table() == [(a, "s1", 3.9), (c, "s3", 3.3), (d, "s4", 3.4)]
+    assert list(await failing()) == [b]
+
+    # B is fixed: its rows arrive, and its failure goes.
+    parsed.clear()
+    put(query, sheets, "f2", "d1", "Alumina Density Data Sheet B.xlsx", "2026-11-05T10:00:00Z",
+        [{"sample": "s2", "density": 3.2}])  # fmt: skip
+    await synced(solera)
+    assert parsed == ["f2"]
+    assert table() == [(a, "s1", 3.9), (b, "s2", 3.2), (c, "s3", 3.3), (d, "s4", 3.4)]
+    assert await failing() == {}

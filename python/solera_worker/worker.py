@@ -560,9 +560,14 @@ async def _store_outputs(
     worker_id=None,
     channel=None,
     final=True,
+    each=None,
 ):
     """Store each returned output (§4, §6, §8, §9). `final`: the batch is the
     last of its run as far as the worker knows (it held no key back).
+    `each`: a per-key batch (`batch.each`). Of one output, its store may
+    refuse some keys' rows and write the others (`WriteContext.each`): those
+    keys become failing keys (`batch.refuse`). Of several, a refusal fails
+    the batch: no store writes them all or none.
 
     Each keyed write is read once; a write that changes nothing (an empty
     patch, a set listed again) is not stored at all and keeps the head. Then
@@ -661,7 +666,11 @@ async def _store_outputs(
             if "core" in o.info:
                 entries[name].update(await core.changes(objects, spec, name, o))
             continue
+        if each is not None and len(decls) == 1:
+            context = dataclasses.replace(context, each=True)
         written = await writes.call(store.store(o.write or o.value, o.prior, context))
+        if written.refused:
+            await core.refuse(each, o, written.refused)
         entry = {}
         if "core" in o.info:
             entry.update(await core.changes(objects, spec, name, o))
@@ -1182,6 +1191,7 @@ async def _execute(
             worker_id,
             shipper.channel,
             final=not any(isinstance(d, dict) and d.get("held") for d in delivered.values()),
+            each=each,
         )
         for name, values in metadata.items():
             if values and "ref" in outputs.get(name, {}):

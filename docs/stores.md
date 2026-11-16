@@ -72,6 +72,7 @@ class Reader(Protocol):                                        # what `reads()` 
 | `attempt` | the writing attempt's id |
 | `generation` | a number the engine assigns each attempt on a partition, larger for every later attempt; `None` outside an attempt |
 | `worker_id` | which process runs the attempt: an attempt started twice has one generation and two workers, and only the one that owns it may write |
+| `each` | a per-key asset's batch of one output: each key's rows are its own call's, so the store may leave out a key the table refuses (`Written.refused`) |
 
 **`store(write, prior, context) -> Written(ref)`** applies a write and
 returns a ref to the new content; the worker stamps the ref with the
@@ -246,6 +247,32 @@ is every key the partition holds after it, and `whole` is set.
 partition holds a@3 b@3 c@3; attempt 7 writes:
 Patch([a, d], remove=[b])  → Changed(wrote=[[a, d]], removed=[[b]])          a@7 c@3 d@7
 [a, d] (a replacement)     → Changed(wrote=[[a, d]], whole=True)            a@7 d@7
+```
+
+**A per-key batch's write may leave out the keys the table refuses.**
+A per-key asset of one output (`WriteContext.each`) writes each key's
+rows from that key's own call, so one key's bad rows need not cost the
+others. `Written.refused` maps each key whose rows the store left out to
+the table's message, empty by default: a store that reports none behaves
+as before. The store wrote nothing of those keys, so each keeps what it
+had; the worker records each as a failing key of class `failed`
+(KEY-3), with that message, and leaves it out of the changes the engine
+commits, the batch's counts and its history rows. PostgresStore writes
+such a batch under a savepoint sent in its first round trip. If the
+rows break the table (SQLSTATE class 22, a value it cannot take: text in
+a float column, a NUL byte; or 23, a constraint: a CHECK, a duplicate
+primary key), it rolls back to the savepoint and writes the batch again a
+key at a time, each under a savepoint of its own, leaving out the keys
+refused. Any other error (a lost connection, a lock timeout, a
+serialization failure, a denied permission, the version check) fails the
+whole write as before. A per-key asset of several outputs cannot write
+all of a key's outputs or none across stores: a refusal still fails its
+batch. Outside a per-key batch there is no key to blame: a class 22 or
+23 error fails the write with a `WriteError`, which is not retried.
+
+```
+partition holds a@3 b@3 c@3, n > 0; per-key attempt 7 writes:
+Patch({a: [n=1], b: [n=-1], c: [n=1]})  → refused={b: "CheckViolation: …"}       a@7 b@3 c@7
 ```
 
 **A write arrives unresolved.** Today the worker compares a keyed write
@@ -646,7 +673,9 @@ after a dead attempt locks it out even when it writes nothing. Every write
 transaction sends three statements in one round trip before anything
 else: the table's write domain (a shared advisory lock), the version
 check (the upsert above, which locks the row and returns nothing when the
-attempt is refused), and the catalog lookup, read under the check's lock.
+attempt is refused), and the catalog lookup, read under the check's lock;
+a per-key batch's write sends a fourth, its savepoint (see "A per-key
+batch's write may leave out the keys the table refuses").
 It changes the catalog only where that lookup says something is missing:
 `CREATE … IF NOT EXISTS` takes its lock even when the object exists, and
 would queue behind another partition's open write. Every transaction of

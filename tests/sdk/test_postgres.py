@@ -3,6 +3,7 @@ Sql writes, and the version check that locks out late and dead writers
 (D196). Skips unless SOLERA_TEST_DATABASE_URL points at a scratch database."""
 
 import asyncio
+import dataclasses
 import os
 import tempfile
 import threading
@@ -1413,7 +1414,7 @@ def trips_of(trace) -> list[list[str]]:
 async def test_the_version_check_is_one_statement_in_the_writes_first_round_trip(store, monkeypatch):
     """The check is one statement per write transaction, sent in one pipeline
     with the write domain's lock and the catalog lookup, so it adds no round
-    trip to the write."""
+    trip to the write. A per-key batch's savepoint goes in the same pipeline."""
 
     out = keyed_output(incremental=True)
     first = await store.store(rows(a="1", b="1"), None, at(out, 1))
@@ -1428,6 +1429,129 @@ async def test_the_version_check_is_one_statement_in_the_writes_first_round_trip
     assert len(first_trip) == 3 and "pg_advisory_xact_lock_shared" in first_trip[0]
     assert "solera_versions" in first_trip[1]  # the third is the catalog lookup (_STATE), on lines of its own
     assert len(trips) <= 6  # BEGIN, that pipeline, the DELETE, the COPY, the key check, COMMIT
+    traces.clear()
+    await store.store(Patch(rows(b="4")), ref, dataclasses.replace(at(out, 4), each=True))
+    trips = trips_of(traces[0])
+    first_trip = next(trip for trip in trips if any("solera_versions" in s for s in trip))
+    assert len(first_trip) == 4 and "SAVEPOINT solera_write" in first_trip[3]
+    assert len(trips) <= 6
+
+
+# -- a per-key batch writes the keys the table takes, and reports the others --------------
+
+REFUSED = {  # b's rows, each refused by the table, and the class of what it says
+    "wrong type": ([{"id": "b", "sample": "s1", "n": "n/a"}], "InvalidTextRepresentation"),
+    "check": ([{"id": "b", "sample": "s1", "n": -1.0}], "CheckViolation"),
+    "duplicate primary key": (
+        [{"id": "b", "sample": "s1", "n": 2.0}, {"id": "b", "sample": "s1", "n": 3.0}],
+        "UniqueViolation",
+    ),
+    "nul byte": ([{"id": "b", "sample": "s\x00", "n": 2.0}], "DataError"),  # refused by psycopg itself
+}
+
+
+def sheets() -> Output:
+    """Each key a sheet of samples, `n` positive (a CHECK the test adds)."""
+
+    return keyed_output(
+        incremental=True, columns={"id": "text", "sample": "text", "n": "float"}, primary_key=["id", "sample"]
+    )
+
+
+def samples(**n) -> list[dict]:
+    return [{"id": k, "sample": "s1", "n": v} for k, v in n.items()]
+
+
+def each(context: WriteContext) -> WriteContext:
+    """A per-key batch's write: one output, each key its own call's."""
+
+    return dataclasses.replace(context, each=True)
+
+
+def held(store, out) -> dict:
+    """Each key's rows as the table holds them: (sample, n, version)."""
+
+    table, _, _ = store._table(out)
+    found = {}
+    for key, sample, n, version in sql(f"SELECT id, sample, n, _version FROM {table} ORDER BY id, sample"):
+        found.setdefault(key, []).append((sample, n, version))
+    return found
+
+
+@pytest.mark.parametrize("case", sorted(REFUSED))
+async def test_a_per_key_batch_writes_the_keys_the_table_takes(store, case):
+    """a, b and c hold a sample each. A per-key batch writes all three, and
+    the table refuses b's rows: a and c are written, b keeps its old row,
+    and the write reports b with the table's message. The partition's
+    version moves once, to the batch's."""
+
+    out = sheets()
+    first = await store.store(samples(a=1.0, b=1.0, c=1.0), None, at(out, 1))
+    table, _, _ = store._table(out)
+    sql(f"ALTER TABLE {table} ADD CHECK (n > 0)")
+    bad, says = REFUSED[case]
+    write = Patch([*samples(a=2.0), *bad, *samples(c=2.0)])
+    written = await store.store(write, first.ref, each(at(out, 2)))
+    assert list(written.refused) == ["b"] and written.refused["b"].startswith(f"{says}: ")
+    assert held(store, out) == {"a": [("s1", 2.0, 2)], "b": [("s1", 1.0, 1)], "c": [("s1", 2.0, 2)]}
+    assert registry(store, out) == (2, 2)
+
+
+@pytest.mark.parametrize("case", sorted(REFUSED))
+async def test_a_write_that_is_not_per_key_fails_whole_on_rows_the_table_refuses(store, case):
+    """The same write of an ordinary keyed output: no key to blame, so it
+    fails as a `WriteError`, which is not retried, and writes nothing."""
+
+    out = sheets()
+    first = await store.store(samples(a=1.0, b=1.0, c=1.0), None, at(out, 1))
+    table, _, _ = store._table(out)
+    sql(f"ALTER TABLE {table} ADD CHECK (n > 0)")
+    bad, says = REFUSED[case]
+    with pytest.raises(WriteError, match=out.name) as failed:
+        await store.store(Patch([*samples(a=2.0), *bad, *samples(c=2.0)]), first.ref, at(out, 2))
+    assert type(failed.value.__cause__).__name__ == says
+    assert held(store, out) == {k: [("s1", 1.0, 1)] for k in "abc"}
+    assert registry(store, out) == (1, 1)
+
+
+async def test_a_full_run_built_beside_the_table_leaves_out_the_keys_it_refuses(store):
+    """A full run of a per-key batch in two batches, each with a key the
+    table refuses: the others go to the build, and the last batch switches
+    it in. A refused key has no rows in the run, like a key whose call
+    raised: the run starts the content over."""
+
+    out = sheets()
+    old = await store.store(samples(a=1.0, b=1.0, c=1.0), None, at(out, 1))
+    table, _, _ = store._table(out)
+    sql(f"ALTER TABLE {table} ADD CHECK (n > 0)")
+    one = await store.store(Patch(samples(a=2.0, b=-1.0)), old.ref, each(batch(out, 2, first=True)))
+    assert list(one.refused) == ["b"] and "build" in one.ref.handle
+    assert held(store, out) == {k: [("s1", 1.0, 1)] for k in "abc"}, "outsiders keep the old rows"
+    two = await store.store(Patch(samples(c=3.0, d="n/a")), one.ref, each(batch(out, 3, last=True)))
+    assert list(two.refused) == ["d"] and "build" not in two.ref.handle
+    assert held(store, out) == {"a": [("s1", 2.0, 2)], "c": [("s1", 3.0, 3)]}
+    assert builds_of(store, out) == []
+
+
+async def test_a_per_key_batch_still_fails_whole_on_an_error_that_is_not_its_rows(store):
+    """b's insert fails for a reason that is not its rows': a lock it could
+    not take (SQLSTATE 55P03, raised here by a trigger). No key is to blame:
+    the write fails whole and changes nothing."""
+
+    import psycopg
+
+    out = sheets()
+    first = await store.store(samples(a=1.0, b=1.0, c=1.0), None, at(out, 1))
+    table, _, _ = store._table(out)
+    name = table.split(".")[1].strip('"')
+    sql(f"""CREATE FUNCTION {name}_busy() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN IF NEW.id = 'b' THEN RAISE EXCEPTION 'busy' USING ERRCODE = 'lock_not_available'; END IF;
+        RETURN NEW; END $$""")  # fmt: skip
+    sql(f"CREATE TRIGGER busy BEFORE INSERT ON {table} FOR EACH ROW EXECUTE FUNCTION {name}_busy()")
+    with pytest.raises(psycopg.errors.LockNotAvailable):
+        await store.store(Patch(samples(a=2.0, b=2.0, c=2.0)), first.ref, each(at(out, 2)))
+    assert held(store, out) == {k: [("s1", 1.0, 1)] for k in "abc"}
+    assert registry(store, out) == (1, 1)
 
 
 # -- a full run in several batches builds beside the table, and switches once (STO-8) ------

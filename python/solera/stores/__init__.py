@@ -9,7 +9,7 @@ import os
 import pickle
 import typing
 from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Protocol, runtime_checkable
 from urllib.parse import quote
 
@@ -132,6 +132,9 @@ class WriteContext:
     # read in place keeps the old rows for them until the last batch, then swaps them at once.
     building: bool = False
     final: bool = True
+    # A per-key asset's batch of one output: each key's rows are its own call's, so a store may
+    # leave out a key whose rows the table refuses and write the others (`Written.refused`).
+    each: bool = False
 
 
 Version = int | str
@@ -166,11 +169,18 @@ class Written:
 
     `changed` is the new contract's answer, beside it: what a keyed write
     changed (`Changed`), for every keyed write the store takes as given
-    (`KeyedWrite.changed`); None for an unkeyed output."""
+    (`KeyedWrite.changed`); None for an unkeyed output.
+
+    `refused`: the keys of a per-key batch (`WriteContext.each`) whose rows
+    the table refused, each with the table's message. The store wrote
+    nothing of them and they keep what they had; `changed` may still name
+    them, and the worker leaves them out. A store that refuses none
+    leaves it empty."""
 
     ref: Ref
     keys: Iterable | None = None
     changed: Changed | None = None
+    refused: Mapping[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)

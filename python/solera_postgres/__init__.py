@@ -59,6 +59,7 @@ COMMIT_COLUMN = "_commit"
 SEQ_COLUMN = "_seq"
 VERSION_COLUMN = "_version"  # every row's version: the generation of the attempt that wrote it
 KEY_CHUNK = 100_000  # keys per chunk `keys` reads
+SAVEPOINT = "solera_write"  # a per-key batch's write, after its first round trip (`_store`)
 
 
 class _Spool:
@@ -458,7 +459,9 @@ class PostgresStore:
         (`_STATE`), read after the check's lock is held, never before: a
         lookup made before a wait does not see what the transaction it
         waited for did (probes P3, P4, R10, R11). The three statements go
-        in one pipeline.
+        in one pipeline, and a per-key batch's write (`context.each`) adds
+        a fourth, the savepoint a write the table refuses rolls back to
+        (`_store`).
 
         A table whose row security applies to our role is refused: a
         delete would remove only the rows the role sees, and the hidden
@@ -473,6 +476,8 @@ class PostgresStore:
             if fenced:
                 check.execute(*self._check_sql(table, context, write))
             state.execute(_STATE, self._state_params(table, context.partition if context else ""))
+            if write and context is not None and context.each:
+                domain.execute(f"SAVEPOINT {SAVEPOINT}")
             taken, found = (check.fetchone() if fenced else None), state.fetchone()
         if found["hidden_from"] is not None:
             raise StoreError(
@@ -633,62 +638,86 @@ class PostgresStore:
     async def store(self, write, prior: Ref | None, context: WriteContext) -> Written:
         """The write, in one transaction on a thread of its own: the worker's
         event loop goes on meanwhile. Canceled, the transaction still ends as
-        it would have — under its fence, and counted as `writing` until then."""
+        it would have — under its fence, and counted as `writing` until then.
+
+        Rows the table refuses (SQLSTATE class 22, a value it cannot take, or
+        23, a constraint they break) fail the write with a `WriteError`: no
+        try of the same rows would do better. A per-key batch's write
+        (`context.each`) instead writes the keys the table takes and reports
+        the others (`Written.refused`)."""
 
         import psycopg
 
         try:
             return await asyncio.to_thread(self._store, write, prior, context)
-        except psycopg.IntegrityError as e:  # the data breaks the table's constraints (`primary_key`)
+        except (psycopg.DataError, psycopg.IntegrityError) as e:
             raise WriteError(f"{context.output.name}: {e}") from e
 
     def _store(self, write, prior: Ref | None, context: WriteContext) -> Written:
-        output = context.output
-        table, _, _ = self._table(output, prior)  # where it is, even when a full run starts it over
+        """One transaction. A per-key batch's runs under a savepoint taken in
+        its first round trip (`_begin`): refused, it rolls back to it and is
+        written again key by key, each key under a savepoint of its own, the
+        keys the table refuses left out."""
+
+        import psycopg
+
+        table, _, _ = self._table(context.output, prior)  # where it is, even when a full run starts it over
         if context.reset:
             prior = None  # a full run keeps nothing of the content
         with self._connect() as conn, conn.cursor() as cur:
             _, state = self._begin(conn, table, context)
-            partition_col = output.config.get("partition_column")
-            slice_where = {partition_col: context.partition} if partition_col else {}
-            build = self._aim(cur, output, table, context, state, slice_where)
-            state = {**state, "build": build}  # where the write's rows go (`_ensure`)
+            try:
+                return self._write(cur, write, prior, context, table, state)
+            except (psycopg.DataError, psycopg.IntegrityError):
+                if not context.each:
+                    raise
+                cur.execute(f"ROLLBACK TO SAVEPOINT {SAVEPOINT}")
+            return self._write(cur, write, prior, context, table, state, apart=True)
 
-            commit_number = _assigned_commit(context, prior) if output.incremental else None
-            keys = changed = None
-            made = True
-            if isinstance(write, Sql):
-                target = self._apply_sql(cur, output, write, context, table, state, slice_where)
-                if output.key:  # the keys it wrote, read in its own transaction: no later write's
-                    keys = self._held(cur, target, output.key, slice_where)
-                    changed = Changed(keys, whole=True)
-            elif output.key is not None:
-                if isinstance(write, Patch) and not output.incremental:
-                    raise WriteError(f"{output.name}: Patch requires an incremental output")
-                write = KeyedWrite.of(self, write, output, prior)
-                changed = write.changed()
-                # Nothing to write, and no table: none to make (a remove finds no row).
-                made = bool(
-                    state["present"]
-                    or (write.reset and output.config.get("columns"))
-                    or write.upserts
-                    or len(write.prepared.rows)
-                )
-                if made:
-                    self._apply_keyed(cur, output, write, context, table, state, slice_where)
-            elif isinstance(write, Patch):
-                made = self._apply_commit(
-                    cur, output, write, context, table, state, slice_where, prior, commit_number
-                )
-            else:
-                if output.incremental:
-                    raise WriteError(
-                        f"{output.name}: an unkeyed incremental output only accepts Patch writes"
-                    )
-                self._apply_replace(cur, output, write, context, table, state, slice_where)
-            if build is not None and context.final:  # the run's last write: outsiders get its rows now
-                self._publish(cur, table, build, slice_where)
-                build = None
+    def _write(self, cur, write, prior, context, table, state, apart: bool = False) -> Written:
+        """The write's statements, after its first round trip: `apart`, a
+        per-key batch's keys one at a time (`_apply_keyed`)."""
+
+        output = context.output
+        partition_col = output.config.get("partition_column")
+        slice_where = {partition_col: context.partition} if partition_col else {}
+        build = self._aim(cur, output, table, context, state, slice_where)
+        state = {**state, "build": build}  # where the write's rows go (`_ensure`)
+
+        commit_number = _assigned_commit(context, prior) if output.incremental else None
+        keys = changed = None
+        refused = {}
+        made = True
+        if isinstance(write, Sql):
+            target = self._apply_sql(cur, output, write, context, table, state, slice_where)
+            if output.key:  # the keys it wrote, read in its own transaction: no later write's
+                keys = self._held(cur, target, output.key, slice_where)
+                changed = Changed(keys, whole=True)
+        elif output.key is not None:
+            if isinstance(write, Patch) and not output.incremental:
+                raise WriteError(f"{output.name}: Patch requires an incremental output")
+            write = KeyedWrite.of(self, write, output, prior)
+            changed = write.changed()
+            # Nothing to write, and no table: none to make (a remove finds no row).
+            made = bool(
+                state["present"]
+                or (write.reset and output.config.get("columns"))
+                or write.upserts
+                or len(write.prepared.rows)
+            )
+            if made:
+                refused = self._apply_keyed(cur, output, write, context, table, state, slice_where, apart)
+        elif isinstance(write, Patch):
+            made = self._apply_commit(
+                cur, output, write, context, table, state, slice_where, prior, commit_number
+            )
+        else:
+            if output.incremental:
+                raise WriteError(f"{output.name}: an unkeyed incremental output only accepts Patch writes")
+            self._apply_replace(cur, output, write, context, table, state, slice_where)
+        if build is not None and context.final:  # the run's last write: outsiders get its rows now
+            self._publish(cur, table, build, slice_where)
+            build = None
         if not made:
             return Written(prior if output.key is None else None, changed=changed)
         commit_mode = output.key is None and output.incremental
@@ -704,6 +733,7 @@ class PostgresStore:
             TableRef(output=output.name, store="", handle=handle, partition=context.partition),
             keys,
             changed,
+            refused,
         )
 
     def _aim(self, cur, output, table, context, state, slice_where) -> str | None:
@@ -834,14 +864,22 @@ class PostgresStore:
         )
         return True
 
-    def _apply_keyed(self, cur, output, write: KeyedWrite, context, table, state, slice_where) -> None:
+    def _apply_keyed(
+        self, cur, output, write: KeyedWrite, context, table, state, slice_where, apart=False
+    ) -> dict[str, str]:
         """Every key is the group of rows that carry it. A whole write is the
         partition's content: cleared, then written; otherwise only the keys it
         writes change — their rows replaced by their groups, a page at a
         time — and its removes go, every other row untouched. A write of
         nothing still runs its version check: the first attempt after one
         that ended without a commit writes, even nothing, so the late writer
-        is locked out (D196, rule 3; docs/versions.md §5)."""
+        is locked out (D196, rule 3; docs/versions.md §5).
+
+        `apart`: a key at a time, each under a savepoint, and a key whose
+        rows the table refuses is rolled back to it and left out. Returns
+        those keys, each with the table's message."""
+
+        import psycopg
 
         target = self._ensure(
             cur, output, table, state, lambda: write.prepared.take(None), kinds=write.prepared.kinds
@@ -849,13 +887,24 @@ class PostgresStore:
         stamps = self._stamps(output, context)
         if write.reset:
             self._delete_slice(cur, target, slice_where)
+        refused = {}
         for chunk in write.iter_chunks():
-            if not write.reset:
-                self._delete_keys(cur, output, target, slice_where, chunk.keys)
-            self._insert(cur, output, target, chunk.rows, stamps)
-            self._check_keys(cur, output, target, slice_where, chunk.keys)
+            for keys, rows in [([k], g) for k, g in chunk.groups()] if apart else [(chunk.keys, chunk.rows)]:
+                if apart:
+                    cur.execute("SAVEPOINT solera_key")
+                try:
+                    if not write.reset:
+                        self._delete_keys(cur, output, target, slice_where, keys)
+                    self._insert(cur, output, target, rows, stamps)
+                    self._check_keys(cur, output, target, slice_where, keys)
+                except (psycopg.DataError, psycopg.IntegrityError) as error:
+                    if not apart:
+                        raise
+                    cur.execute("ROLLBACK TO SAVEPOINT solera_key")
+                    refused[keys[0]] = f"{type(error).__name__}: {error}"
         if write.removes and not write.reset:
             self._delete_keys(cur, output, target, slice_where, sorted(write.removes))
+        return refused
 
     def _check_keys(self, cur, output, table, slice_where, keys: list[str]) -> None:
         """Every key written is stored as itself: the key column's text of its
