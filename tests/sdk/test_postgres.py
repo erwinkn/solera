@@ -890,6 +890,42 @@ async def test_a_dataframe_s_table_is_typed_by_its_dtypes_and_logged(store, capl
     assert await store.load(written.ref, list[dict], None) == [{"id": "c", "x": 1.5, "n": 3}]
 
 
+async def test_a_dataframe_s_arrow_dates_and_durations_are_stored(store):
+    """An Arrow-backed date column (`date32[day][pyarrow]`) has the kind of
+    a timestamp in pandas and no time of day: it is stored as a date, a
+    duration as an interval, a missing value of either as NULL."""
+
+    import datetime as dt
+
+    import pandas as pd
+    import pyarrow as pa
+
+    out = output(key="id")
+    frame = pd.DataFrame(
+        {
+            "id": ["a", "b"],
+            "day": pd.array([dt.date(2026, 11, 5), None], dtype=pd.ArrowDtype(pa.date32())),
+            "took": pd.array(
+                [dt.timedelta(hours=45, minutes=50, seconds=10), None], dtype=pd.ArrowDtype(pa.duration("us"))
+            ),
+            "at": pd.array(
+                [dt.datetime(2026, 11, 5, 17, 34, 59), None], dtype=pd.ArrowDtype(pa.timestamp("us"))
+            ),
+        }
+    )
+    written = await store.store(frame, None, context(out))
+    rows = sorted(await store.load(written.ref, list[dict], None), key=lambda r: r["id"])
+    assert rows == [
+        {
+            "id": "a",
+            "day": dt.date(2026, 11, 5),
+            "took": dt.timedelta(hours=45, minutes=50, seconds=10),
+            "at": dt.datetime(2026, 11, 5, 17, 34, 59),
+        },
+        {"id": "b", "day": None, "took": None, "at": None},
+    ]
+
+
 async def test_a_key_is_stored_as_itself(store):
     """docs/versions.md §4: a column may change a value — round a decimal,
     narrow a real, cut a timestamp's precision — and the store takes it as

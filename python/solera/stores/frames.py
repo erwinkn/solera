@@ -238,9 +238,17 @@ def _frame(frame: Any, name: str) -> tuple[list[str], list[list]]:
 def _column_values(series: Any, missing: Any) -> list:
     """A column's values as Python objects. Timestamps with no nanoseconds
     become `datetime`s, the same instants as pandas' `Timestamp`s, made
-    and read faster."""
+    and read faster. An Arrow-backed date (`date32[day][pyarrow]`) has a
+    timestamp's kind and no time of day: its values are dates as they are."""
 
-    if series.dtype.kind == "M" and not (series.dt.nanosecond.to_numpy()[~missing] != 0).any():
+    arrow = getattr(series.dtype, "pyarrow_dtype", None)
+    if arrow is not None:
+        import pyarrow as pa
+
+        timestamps = pa.types.is_timestamp(arrow)
+    else:
+        timestamps = series.dtype.kind == "M"
+    if timestamps and not (series.dt.nanosecond.to_numpy()[~missing] != 0).any():
         import warnings
 
         with warnings.catch_warnings():
