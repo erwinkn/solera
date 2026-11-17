@@ -1,0 +1,99 @@
+name: release
+
+# Builds the wheels Solera is installed from, and publishes them to PyPI when
+# a version tag is pushed. The extension is built for the stable ABI
+# (abi3-py312), so one wheel per platform serves every Python from 3.12 on.
+#
+# A pull request that touches the packaging builds the wheels and tries them,
+# without publishing. So does a run started by hand.
+
+on:
+  push:
+    tags: ['v*']
+  pull_request:
+    paths:
+      - '.github/workflows/release.yml'
+      - 'pyproject.toml'
+      - 'native/Cargo.toml'
+      - 'native/Cargo.lock'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  wheels:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, target: x86_64 }
+          - { os: ubuntu-24.04-arm, target: aarch64 }
+          - { os: macos-latest, target: aarch64 }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          manylinux: auto
+          args: --release --out dist
+      - uses: astral-sh/setup-uv@v6
+      # The wheel as a consumer gets it: installed with its extras on the
+      # newest Python, away from the checkout, with no Rust or Node in reach.
+      - name: Try the wheel
+        run: |
+          uv venv --python 3.14 "$RUNNER_TEMP/try"
+          uv pip install --python "$RUNNER_TEMP/try/bin/python" "solera[server,postgres] @ file://$PWD/$(ls dist/*.whl)"
+          cd "$RUNNER_TEMP"
+          try/bin/python - <<'EOF'
+          from importlib.resources import files
+
+          import solera._native  # the Rust extension
+          import solera_postgres, solera_server.api, solera_worker  # noqa: F401, E401
+
+          assert (files("solera_server") / "web" / "index.html").is_file(), "the console bundle is missing"
+          EOF
+          try/bin/solera --help > /dev/null
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-${{ matrix.os }}-${{ matrix.target }}
+          path: dist/*.whl
+          if-no-files-found: error
+
+  sdist:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --out dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  publish:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [wheels, sdist]
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write # PyPI trusted publishing: no token is stored
+    steps:
+      - uses: actions/checkout@v4
+      - name: The tag is the version in pyproject.toml
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' pyproject.toml | head -1)
+          test "v$version" = "$GITHUB_REF_NAME" || { echo "tag $GITHUB_REF_NAME, pyproject.toml $version"; exit 1; }
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: pypa/gh-action-pypi-publish@release/v1
