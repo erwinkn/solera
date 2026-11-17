@@ -1764,7 +1764,7 @@ dependencies = [
 
 [[package]]
 name = "solera-index"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bytes",
  "futures",
@@ -1779,7 +1779,7 @@ dependencies = [
 
 [[package]]
 name = "solera-native"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -1797,7 +1797,7 @@ dependencies = [
 
 [[package]]
 name = "solera-tracking"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "libc",
  "object_store",
