@@ -1959,3 +1959,34 @@ async def test_a_source_reads_its_schemas_table_of_its_name_or_the_table_it_name
         named = Source("anything", store="postgres", table=table)
         assert [r["id"] for r in (await store.serve(named, None, ctx)).value] == ["c"]
     assert not store.can_serve(Source(name, store="postgres", key="id", schema=schema))
+
+
+# -- a source's rows arrive as the type the parameter asks for ---------------------------------
+
+
+async def test_an_unkeyed_source_arrives_as_the_type_asked_and_a_keyed_one_as_before(store, source_tables):
+    """The worker's read of a table source (`SourceLoader`): unkeyed and
+    whole, as a DataFrame, an Arrow table or rows, as a store's own output
+    loads; keyed, by key, as rows or each key's group, as before."""
+
+    pd = pytest.importorskip("pandas")
+    pa = pytest.importorskip("pyarrow")
+    from solera.sdk import Ref, Source
+    from solera_worker.sources import SourceLoader
+
+    name, schema = source_tables
+    ref = Ref(name, "postgres", {}, "")
+    whole = SourceLoader(Source(name, store="postgres", schema=schema, version_column="at"), store)
+    expected = [{"id": "a", "v": 1, "at": 10}, {"id": "b", "v": 2, "at": 20}]
+    frame = await whole.load(ref, pd.DataFrame, None)
+    assert isinstance(frame, pd.DataFrame) and frame.sort_values("id").to_dict("records") == expected
+    table = await whole.load(ref, pa.Table, None)
+    assert isinstance(table, pa.Table) and sorted(table.to_pylist(), key=lambda r: r["id"]) == expected
+    for t in (list[dict], list, None):
+        assert sorted(await whole.load(ref, t, None), key=lambda r: r["id"]) == expected
+
+    keyed = SourceLoader(Source(name, store="postgres", key="id", schema=schema, version_column="at"), store)
+    assert await keyed.load(ref, list[dict], Keys({"b": 1, "z": 1})) == [expected[1]]
+    groups = await keyed.load(ref, dict[str, pd.DataFrame], Keys({"a": 1, "b": 1}))
+    assert {k: g.to_dict("records") for k, g in groups.items()} == {"a": [expected[0]], "b": [expected[1]]}
+    assert dict(keyed.served.items()) == {"a": "10", "b": "20", "z": None}

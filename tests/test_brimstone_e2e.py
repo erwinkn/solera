@@ -235,3 +235,42 @@ async def test_first_migrations_of_many_partitions_at_once_do_not_collide(own_da
         return await PostgresStore(own_database).migrate(out, [migration], context)
 
     assert await asyncio.gather(*(migrate(n) for n in range(8))) == [["0001_note"]] * 8
+
+
+async def test_the_lab_tables_reach_psa_mean_data_as_dataframes(solera, brimstone):
+    """`psa_mean_data` reads two tables monolith keeps, declared by schema and
+    name (`Source("psa_samples", store="postgres", schema="datasmart")`),
+    each as the DataFrame its parameter asks for, and writes its own."""
+
+    import os
+
+    import pandas as pd
+    import psycopg
+
+    project, *_, query = brimstone
+    with psycopg.connect(os.environ["DATABASE_URL"], autocommit=True) as conn:
+        conn.execute("CREATE SCHEMA datasmart")
+        conn.execute('CREATE TABLE datasmart.psa_samples (sample_id text, "CaO_wt%" double precision)')
+        conn.execute("INSERT INTO datasmart.psa_samples VALUES ('s1', 12.5), ('s2', 7.0)")
+        conn.execute(
+            "CREATE TABLE datasmart.psa_data (sample_id text, diameter double precision, q double precision)"
+        )
+        conn.execute("INSERT INTO datasmart.psa_data VALUES ('s1', 1.0, 0.25), ('s2', 1.0, 0.75)")
+    got = {}
+
+    def compute(samples, data):
+        got.update(samples=samples, data=data)
+        merged = samples.merge(data, on="sample_id")
+        return merged.assign(undersize=merged["CaO_wt%"], undersize_cleaned=None, q_cleaned=None)[
+            ["sample_id", "diameter", "undersize", "q", "undersize_cleaned", "q_cleaned"]
+        ]
+
+    sys.modules["brimstone"].compute_psa_mean_data = compute
+    await solera.deploy(project)
+    for name in ("psa_samples", "psa_data"):
+        await solera.commit_source(name, version="v1")
+    await solera.run("psa_mean_data")
+    assert all(isinstance(frame, pd.DataFrame) for frame in got.values())
+    assert sorted(got["samples"]["CaO_wt%"]) == [7.0, 12.5]
+    rows = query("SELECT sample_id, undersize, q FROM analytical.psa_mean_data ORDER BY sample_id")
+    assert [(r["sample_id"], r["undersize"], r["q"]) for r in rows] == [("s1", 12.5, 0.25), ("s2", 7.0, 0.75)]

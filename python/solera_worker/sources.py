@@ -3,11 +3,13 @@ loaded"): its function (`@source`), or its store's `serve`. Either says, of
 every key it serves, the version it served it at; a key it leaves out was
 observed absent. A keyed answer is a dict of `Loaded` rows, or one Arrow
 table: of it, only the key and version columns are read here, and its rows
-become what the asset asked for in `solera.stores.frames`."""
+become what the asset asked for in `solera.stores.frames`. So do an unkeyed
+answer's rows or Arrow table: a loader is never told the type asked for."""
 
 from __future__ import annotations
 
 import inspect
+import typing
 from collections.abc import Mapping
 
 from solera._native import Served
@@ -46,7 +48,14 @@ class SourceLoader:
         if inspect.isawaitable(answer):
             answer = await answer
         if self.source.key is None:
-            return answer.value if isinstance(answer, Loaded) else answer
+            value = answer.value if isinstance(answer, Loaded) else answer
+            # Rows or an Arrow table become what the parameter asks, as a keyed answer's
+            # do; any other value (bytes, a DataFrame the loader built) is handed over as it is.
+            if (isinstance(value, list) or frames.is_table(value)) and (
+                frames.is_frame_type(t) or frames.is_table_type(t) or list in (t, typing.get_origin(t))
+            ):
+                return frames.materialize(value, t)
+            return value
         inner = by_key_type(t)
         if isinstance(answer, Loaded) and frames.is_table(answer.value) and isinstance(answer.version, str):
             try:  # one Arrow table: only its key and version columns are read here

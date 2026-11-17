@@ -514,6 +514,11 @@ its version fails the load. An unkeyed one returns the value, or
 `Loaded(value, version=…)`: the version is optional there, with one caveat —
 an edit reverted between the commit and the read can leave a consumer one
 revision ahead until the next change.
+Unkeyed rows (a list of dicts) or an Arrow table reach the consumer as its
+parameter asks — a DataFrame, a `pa.Table`, a list of rows — as an output a
+store wrote loads; any other value (bytes, a DataFrame the function built)
+is handed over as it is. The worker converts, once, for every loader: a
+function and a store's `serve` are never told the type asked for.
 
 **As one Arrow table.** A keyed function may instead return one
 `Loaded(table, version=column)`: a pyarrow `Table` holding the source's key
