@@ -23,6 +23,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from solera.sdk import KEYS, Output, Ref, TableRef
+from solera.sdk import _ident as _quoted
 from solera.stores import (
     MISSING,
     Changed,
@@ -159,13 +160,32 @@ def _assigned_commit(context: WriteContext, prior: Ref | None) -> int:
 
 
 def _ident(name: str) -> str:
-    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", str(name)):
-        raise StoreError(f"Unsafe identifier: {name!r}")
-    return f'"{name}"'
+    """A column's (index's, role's) name, quoted: any name Postgres holds,
+    with no `%` in the text (`solera.sdk._ident`). A name it refuses fails
+    the write as a `StoreError`: no try would do better."""
+
+    try:
+        return _quoted(name)
+    except ValueError as e:
+        raise StoreError(str(e)) from None
 
 
 def _qname(schema: str, table: str) -> str:
-    return f"{_ident(schema)}.{_ident(table)}"
+    """A table's name, `"schema"."table"`. Both parts stay plain names
+    (letters, digits, `_`): the name is also a value — the versions table's
+    `rel`, an argument to `to_regclass`, what `_split` parses back."""
+
+    for part in (schema, table):
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", str(part)):
+            raise StoreError(f"Unsafe identifier: {part!r}")
+    return f'"{schema}"."{table}"'
+
+
+def _index_name(*parts: str) -> str:
+    """An index's name: its parts joined by `_`, cut to the 63 bytes Postgres
+    keeps, never inside a character."""
+
+    return "_".join(parts).encode()[:63].decode(errors="ignore")
 
 
 def _split(qualified: str) -> tuple[str, str]:
@@ -372,12 +392,12 @@ class PostgresStore:
         text, which reads and patches name (`key::text = ANY(...)`)."""
 
         wanted = {
-            (table_name + "_" + "_".join(index))[:63]: ", ".join(_ident(c) for c in index)
+            _index_name(table_name, *index): ", ".join(_ident(c) for c in index)
             for index in self._indexes(output)
         }
         kind = state["columns"].get(output.key) if output.key is not None else None
         if kind is not None and kind not in ("text", "character varying", "character"):
-            wanted[f"{table_name}_{output.key}_text"[:63]] = f"({_ident(output.key)}::text)"
+            wanted[_index_name(table_name, output.key, "text")] = f"({_ident(output.key)}::text)"
         return wanted
 
     def _check_drift(self, output: Output, table: str, state: dict, declared: dict, pk: list) -> None:
@@ -1075,14 +1095,14 @@ class PostgresStore:
         only = ""
         if among is not None:
             only, params = f" AND {key}::text = ANY(%s)", [*params, sorted(among)]
-        query = (
-            f"SELECT DISTINCT {key}::text, convert_to({key}::text, 'UTF8') FROM {{}} "
-            f"WHERE {self._where_sql(where)}{only} ORDER BY 2"
-        )
         with self._connect() as conn, conn.cursor() as found:
             table = _at(found, ref.handle or {})
+        query = (
+            f"SELECT DISTINCT {key}::text, convert_to({key}::text, 'UTF8') FROM {table} "
+            f"WHERE {self._where_sql(where)}{only} ORDER BY 2"
+        )
         with self._connect() as conn, conn.cursor(name="solera_keys", row_factory=tuple_row) as cur:
-            cur.execute(query.format(table), params)
+            cur.execute(query, params)
             while chunk := cur.fetchmany(KEY_CHUNK):
                 yield [k for k, _ in chunk]
 
@@ -1181,32 +1201,32 @@ class PostgresStore:
     # -- reads ----------------------------------------------------------------
 
     def can_serve(self, source) -> bool:
-        """A source this store can read: a `table`, and for a keyed one the
+        """A source this store can read: any table, and for a keyed one the
         `version_column` that says each row's version."""
 
-        return bool(source.handle.get("table")) and (
-            source.key is None or bool(source.handle.get("version_column"))
-        )
+        return source.key is None or bool(source.handle.get("version_column"))
 
     async def serve(self, source, keys, ctx):
         """A source read from a table this store does not write: `Source("orders",
-        store="pg", key="id", table="public.orders", version_column="updated_at")`
-        (docs/stores.md, "Sources: how data is loaded"); the table may name
-        `{partition}`. Keyed, each asked key's row at the version its
-        `version_column` holds, read in one snapshot; unkeyed, every row, at
-        the column's greatest value (none without the column)."""
+        store="pg", key="id", schema="sales", version_column="updated_at")`
+        (docs/stores.md, "Sources: how data is loaded"). The table is found as
+        an output's is: `schema` (default `public`) and the source's name, or
+        `table`, which may be qualified and may name `{partition}`. Keyed,
+        each asked key's row at the version its `version_column` holds, read
+        in one snapshot; unkeyed, every row, at the column's greatest value
+        (none without the column)."""
 
         return await asyncio.to_thread(self._serve, source, keys, ctx)
 
     def _serve(self, source, keys, ctx):
         from solera.sdk import Loaded
 
-        named = str(source.handle["table"]).format(partition=ctx.partition)
+        named = str(source.handle.get("table", source.name)).format(partition=ctx.partition)
         if named.startswith('"'):  # quoted already: "schema"."table"
             table = _qname(*_split(named))
         else:
             schema, _, name = named.rpartition(".")
-            table = _qname(schema or "public", name)
+            table = _qname(schema or source.handle.get("schema", "public"), name)
         version, clauses, params = source.handle.get("version_column"), [], []
         for column, value in (source.handle.get("where") or {}).items():  # a fixed filter on the table
             clauses.append(f"{_ident(column)} = %s")

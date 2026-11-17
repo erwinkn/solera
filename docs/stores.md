@@ -514,6 +514,11 @@ its version fails the load. An unkeyed one returns the value, or
 `Loaded(value, version=…)`: the version is optional there, with one caveat —
 an edit reverted between the commit and the read can leave a consumer one
 revision ahead until the next change.
+Unkeyed rows (a list of dicts) or an Arrow table reach the consumer as its
+parameter asks — a DataFrame, a `pa.Table`, a list of rows — as an output a
+store wrote loads; any other value (bytes, a DataFrame the function built)
+is handed over as it is. The worker converts, once, for every loader: a
+function and a store's `serve` are never told the type asked for.
 
 **As one Arrow table.** A keyed function may instead return one
 `Loaded(table, version=column)`: a pyarrow `Table` holding the source's key
@@ -562,7 +567,8 @@ async def orders(keys, ctx):
 ```python
 Source("docs", key="name", path="incoming/{partition}/")         # FileStore, S3Store
 Source("docs", key="name", path="incoming/", hash=True)
-Source("orders", store="pg", key="id", table="public.orders", version_column="updated_at")
+Source("orders", store="pg", key="id", schema="sales", version_column="updated_at")
+Source("orders", store="pg", key="id", table="sales.orders_{partition}", version_column="updated_at")
 ```
 
 - **FileStore and S3Store** read objects under the source's `path` (it
@@ -575,8 +581,10 @@ Source("orders", store="pg", key="id", table="public.orders", version_column="up
   place, goes unseen. `hash=True` versions by a hash of the content
   instead — exact, but every object is read in full. An object that is not
   there was observed absent.
-- **PostgresStore** reads a `table` it does not write (it may name
-  `{partition}`): keyed, each asked key's row, at the version its
+- **PostgresStore** reads a table it does not write, found as an output's
+  is: `<schema>.<the source's name>`, `schema` defaulting to `public`; or
+  the `table` named, which may be qualified (else in `schema`) and may name
+  `{partition}`. Keyed, each asked key's row, at the version its
   `version_column` holds; unkeyed, every row, at that column's greatest
   value. A keyed table source without `version_column` is refused.
 
@@ -628,6 +636,12 @@ migrations to change them): a table a write creates from inferred types
 holds what that first write happened to show. PostgresStore infers them
 when undeclared — from a DataFrame's schema, else from every value not
 null — refuses a column it cannot type, and logs what it inferred. A
+column may have any name Postgres holds (`p/p0`, `CaO_wt%`, `a "quoted"
+name`, `sélection`) and keeps it: every column name is quoted, and a `%` is
+written `U&"CaO_wt\0025"`, so no statement's text holds one for psycopg to
+take as a placeholder. Refused, naming the column: an empty name, a NUL,
+and a name over 63 bytes in UTF-8, which Postgres would cut short. A
+table's schema and name stay letters, digits and `_`. A
 migration's payload is the store's own business (PostgresStore: SQL
 text, or a callable taking a cursor): `migrate` refuses one it cannot run.
 

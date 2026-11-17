@@ -890,6 +890,42 @@ async def test_a_dataframe_s_table_is_typed_by_its_dtypes_and_logged(store, capl
     assert await store.load(written.ref, list[dict], None) == [{"id": "c", "x": 1.5, "n": 3}]
 
 
+async def test_a_dataframe_s_arrow_dates_and_durations_are_stored(store):
+    """An Arrow-backed date column (`date32[day][pyarrow]`) has the kind of
+    a timestamp in pandas and no time of day: it is stored as a date, a
+    duration as an interval, a missing value of either as NULL."""
+
+    import datetime as dt
+
+    import pandas as pd
+    import pyarrow as pa
+
+    out = output(key="id")
+    frame = pd.DataFrame(
+        {
+            "id": ["a", "b"],
+            "day": pd.array([dt.date(2026, 11, 5), None], dtype=pd.ArrowDtype(pa.date32())),
+            "took": pd.array(
+                [dt.timedelta(hours=45, minutes=50, seconds=10), None], dtype=pd.ArrowDtype(pa.duration("us"))
+            ),
+            "at": pd.array(
+                [dt.datetime(2026, 11, 5, 17, 34, 59), None], dtype=pd.ArrowDtype(pa.timestamp("us"))
+            ),
+        }
+    )
+    written = await store.store(frame, None, context(out))
+    rows = sorted(await store.load(written.ref, list[dict], None), key=lambda r: r["id"])
+    assert rows == [
+        {
+            "id": "a",
+            "day": dt.date(2026, 11, 5),
+            "took": dt.timedelta(hours=45, minutes=50, seconds=10),
+            "at": dt.datetime(2026, 11, 5, 17, 34, 59),
+        },
+        {"id": "b", "day": None, "took": None, "at": None},
+    ]
+
+
 async def test_a_key_is_stored_as_itself(store):
     """docs/versions.md §4: a column may change a value — round a decimal,
     narrow a real, cut a timestamp's precision — and the store takes it as
@@ -1810,3 +1846,183 @@ async def test_a_write_is_not_refused_when_row_security_does_not_apply_to_its_ro
     written = await plain.store(Patch(rows(b="2")), first.ref, at(out, 2))
     assert outside(store, out) == {"a": "1", "b": "2"} == await solera(plain, written.ref)
     assert registry(store, out) == (2, 2)
+
+
+# -- a column may be named anything Postgres can hold --------------------------------------
+
+# Names from the first project's tables: a `%` (psycopg's placeholder), a `"`, brackets, a
+# slash, a space, a capital (quoted, so kept), a letter outside ASCII.
+ODD = ["p/p0", "as(bet)", "No", "CaO_wt%", 'a "quoted" name', "sélection", "with space"]
+
+
+def odd_rows(*keys: str, n: float = 1.0) -> list[dict]:
+    """A row per key, every column named as in `ODD`; the key in `CaO_wt%`."""
+
+    return [
+        {
+            "p/p0": n,
+            "as(bet)": f"bet {k}",
+            "No": i,
+            "CaO_wt%": k,
+            'a "quoted" name': 'say "hi"',
+            "sélection": "é",
+            "with space": "50%",
+        }
+        for i, k in enumerate(keys)
+    ]
+
+
+async def test_an_unkeyed_output_takes_any_column_name_postgres_holds(store):
+    """Written from a DataFrame, then from rows, which replace them; read back
+    as a DataFrame, an Arrow table and rows, each column by its own name."""
+
+    pd = pytest.importorskip("pandas")
+    pa = pytest.importorskip("pyarrow")
+    out = output()
+    first = await store.store(pd.DataFrame(odd_rows("a", "b")), None, at(out, 1))
+    assert await store.load(first.ref, list[dict], None) == odd_rows("a", "b")
+    second = await store.store(odd_rows("c", n=2.0), first.ref, at(out, 2))
+    assert await store.load(second.ref, list[dict], None) == odd_rows("c", n=2.0)
+    frame = await store.load(second.ref, pd.DataFrame, None)
+    assert list(frame.columns) == ODD and frame.to_dict("records") == odd_rows("c", n=2.0)
+    table = await store.load(second.ref, pa.Table, None)
+    assert table.column_names == ODD and table.to_pylist() == odd_rows("c", n=2.0)
+
+
+async def test_a_keyed_output_takes_any_column_name_postgres_holds(store):
+    """Every place a keyed write names a column: the key, a declared column,
+    the primary key, an index, the partition column, the keys read back. A
+    second write updates one key and removes another; a per-key batch whose
+    one key the table refuses (`No` is a bigint) writes the other."""
+
+    pd = pytest.importorskip("pandas")
+    out = keyed_output(
+        key="CaO_wt%",
+        incremental=True,
+        columns={"CaO_wt%": "text", "No": "bigint"},
+        primary_key=["CaO_wt%", "No"],
+        indexes=[["p/p0", "as(bet)"]],
+        partition_column="part %s",
+    )
+    first = await store.store(pd.DataFrame(odd_rows("a", "b", "c")), None, at(out, 1, partition="P%"))
+    second = await store.store(
+        Patch(odd_rows("a", n=2.0), remove=["b"]), first.ref, at(out, 2, partition="P%")
+    )
+    stamped = {"part %s": "P%"}
+    loaded = sorted(await store.load(second.ref, list[dict], None), key=lambda r: r["CaO_wt%"])
+    assert loaded == [{**odd_rows("a", n=2.0)[0], **stamped}, {**odd_rows("a", "b", "c")[2], **stamped}]
+    frame = await store.load(second.ref, pd.DataFrame, Keys({"c": 1}))
+    assert frame.to_dict("records") == [{**odd_rows("a", "b", "c")[2], **stamped}]
+    assert [k for chunk in store.keys(second.ref) for k in chunk] == ["a", "c"]
+
+    refused = [*odd_rows("a", n=3.0), {**odd_rows("c")[0], "CaO_wt%": "c", "No": "n/a"}]
+    third = await store.store(Patch(refused), second.ref, each(at(out, 3, partition="P%")))
+    assert list(third.refused) == ["c"] and third.refused["c"].startswith("InvalidTextRepresentation: ")
+    loaded = {r["CaO_wt%"]: r["p/p0"] for r in await store.load(third.ref, list[dict], None)}
+    assert loaded == {"a": 3.0, "c": 1.0}
+
+
+async def test_arrow_and_sql_writes_take_any_column_name_postgres_holds(store):
+    """A table made from an Arrow table's schema, and one a `Sql` query
+    makes from its columns, in place and through COPY (`sql_read_only`)."""
+
+    pa = pytest.importorskip("pyarrow")
+    from solera_postgres import PostgresStore
+
+    written = await store.store(pa.Table.from_pylist(odd_rows("a", "b")), None, at(output(), 1))
+    assert await store.load(written.ref, list[dict], None) == odd_rows("a", "b")
+    for each_store in (store, PostgresStore(DSN, sql_read_only=True)):
+        query = Sql(f'SELECT "CaO_wt%", U&"as\\0028bet)" AS "%s%%", \'%s\' AS "No" FROM {written.ref.table}')
+        made = await each_store.store(query, None, at(keyed_output(key="CaO_wt%"), 1))
+        assert [k for chunk in made.keys for k in chunk] == ["a", "b"]
+        loaded = await each_store.load(made.ref, list[dict], None)
+        assert sorted(loaded, key=lambda r: r["CaO_wt%"]) == [
+            {"CaO_wt%": k, "%s%%": f"bet {k}", "No": "%s"} for k in ("a", "b")
+        ]
+
+
+@pytest.mark.parametrize(
+    "name, says",
+    [("", "is empty"), ("a\0b", "holds a NUL"), ("é" * 32, "is 64 bytes in UTF-8")],
+)
+async def test_a_column_name_postgres_cannot_hold_is_refused(store, name, says):
+    """Postgres holds no empty name nor a NUL, and cuts a name past 63 bytes
+    short, so two columns could collide: such a column fails the write and
+    is named in what it says. 63 bytes is fine."""
+
+    with pytest.raises(StoreError, match=says) as refused:
+        await store.store([{"id": "a", name: 1}], None, at(output(), 1))
+    assert repr(name) in str(refused.value)
+    longest = "é" * 31 + "x"
+    written = await store.store([{longest: 1}], None, at(output(), 1))
+    assert await store.load(written.ref, list[dict], None) == [{longest: 1}]
+
+
+# -- a source's table: `schema=` and its name, or `table=` ------------------------------------
+
+
+@pytest.fixture
+def source_tables():
+    """`<schema>.samples_<id>` and `public.samples_<id>_p1`, each with its rows."""
+
+    name, schema = f"samples_{uuid.uuid4().hex[:8]}", f"s_{uuid.uuid4().hex[:8]}"
+    sql(f"CREATE SCHEMA {schema}")
+    sql(f"CREATE TABLE {schema}.{name} (id text, v int, at bigint)")
+    sql(f"INSERT INTO {schema}.{name} VALUES ('a', 1, 10), ('b', 2, 20)")
+    sql(f"CREATE TABLE public.{name}_p1 (id text, v int, at bigint)")
+    sql(f"INSERT INTO public.{name}_p1 VALUES ('c', 3, 30)")
+    yield name, schema
+    sql(f"DROP SCHEMA {schema} CASCADE")
+    sql(f"DROP TABLE public.{name}_p1")
+
+
+async def test_a_source_reads_its_schemas_table_of_its_name_or_the_table_it_names(store, source_tables):
+    """`Source(name, schema=…)` reads `<schema>.<name>`, as an output's table
+    is found; `table=` names it, qualified or not, `{partition}` and all."""
+
+    from solera.sdk import Source
+    from solera_worker.sources import SourceContext
+
+    name, schema = source_tables
+    ctx = SourceContext(name, "p1")
+    by_name = Source(name, store="postgres", schema=schema, version_column="at")
+    assert store.can_serve(by_name)
+    served = await store.serve(by_name, None, ctx)
+    assert sorted(r["id"] for r in served.value) == ["a", "b"] and served.version == "20"
+    keyed = Source(name, store="postgres", key="id", schema=schema, version_column="at")
+    assert {k: v.version for k, v in (await store.serve(keyed, ["b"], ctx)).items()} == {"b": "20"}
+    for table in (f"{name}_{{partition}}", f"public.{name}_{{partition}}"):
+        named = Source("anything", store="postgres", table=table)
+        assert [r["id"] for r in (await store.serve(named, None, ctx)).value] == ["c"]
+    assert not store.can_serve(Source(name, store="postgres", key="id", schema=schema))
+
+
+# -- a source's rows arrive as the type the parameter asks for ---------------------------------
+
+
+async def test_an_unkeyed_source_arrives_as_the_type_asked_and_a_keyed_one_as_before(store, source_tables):
+    """The worker's read of a table source (`SourceLoader`): unkeyed and
+    whole, as a DataFrame, an Arrow table or rows, as a store's own output
+    loads; keyed, by key, as rows or each key's group, as before."""
+
+    pd = pytest.importorskip("pandas")
+    pa = pytest.importorskip("pyarrow")
+    from solera.sdk import Ref, Source
+    from solera_worker.sources import SourceLoader
+
+    name, schema = source_tables
+    ref = Ref(name, "postgres", {}, "")
+    whole = SourceLoader(Source(name, store="postgres", schema=schema, version_column="at"), store)
+    expected = [{"id": "a", "v": 1, "at": 10}, {"id": "b", "v": 2, "at": 20}]
+    frame = await whole.load(ref, pd.DataFrame, None)
+    assert isinstance(frame, pd.DataFrame) and frame.sort_values("id").to_dict("records") == expected
+    table = await whole.load(ref, pa.Table, None)
+    assert isinstance(table, pa.Table) and sorted(table.to_pylist(), key=lambda r: r["id"]) == expected
+    for t in (list[dict], list, None):
+        assert sorted(await whole.load(ref, t, None), key=lambda r: r["id"]) == expected
+
+    keyed = SourceLoader(Source(name, store="postgres", key="id", schema=schema, version_column="at"), store)
+    assert await keyed.load(ref, list[dict], Keys({"b": 1, "z": 1})) == [expected[1]]
+    groups = await keyed.load(ref, dict[str, pd.DataFrame], Keys({"a": 1, "b": 1}))
+    assert {k: g.to_dict("records") for k, g in groups.items()} == {"a": [expected[0]], "b": [expected[1]]}
+    assert dict(keyed.served.items()) == {"a": "10", "b": "20", "z": None}
