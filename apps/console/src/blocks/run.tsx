@@ -4,7 +4,7 @@ import { Link, useLocation } from "wouter"
 import { useAttemptLogs, useAttemptResult, useDeleteRun, useRunCommand, useRunEvents } from "../api/queries"
 import { PHASES, type Attempt, type RunDetail, type RunRequest, type Task } from "../api/types"
 import { bytes, clock, duration, list, partitionLabel, plural, shortId, when } from "../model/format"
-import { attemptStatus, heldReason, isLive, keyStatus, origin, runStatus, taskStatus, TERMINAL_TASK } from "../model/status"
+import { attemptStatus, heldReason, isLive, keyStatus, origin, taskStatus, TERMINAL_TASK } from "../model/status"
 import { parseRowId, type Picked } from "../timeline/run"
 import { Button, Disclosure, Segmented } from "../ui/controls"
 import { confirm, report } from "../ui/overlays"
@@ -71,7 +71,6 @@ export function RunActions({ run, size = "m" }: { run: RunRequest; size?: "s" | 
       {!live && (run.status === "failed" || run.status === "canceled") && (
         <Button
           size={size}
-          variant="primary"
           icon={<RotateCcw size={14} />}
           onClick={async () => {
             const next = await report(command.mutateAsync({ id: run.id, command: "retry" }), "A new run retries what did not finish")
@@ -89,7 +88,7 @@ export function RunActions({ run, size = "m" }: { run: RunRequest; size?: "s" | 
       {!live && (
         <Button
           size={size}
-          variant="quiet"
+          variant="danger"
           icon={<Trash2 size={14} />}
           onClick={async () => {
             if (!(await confirm({ title: "Delete this run?", description: "Its history and logs go for good. What it built stays.", confirmLabel: "Delete", danger: true }))) return
@@ -109,11 +108,10 @@ export function RunFacts({ run }: { run: RunRequest }) {
   return (
     <Facts
       rows={[
-        ["Status", <StatusPill status={runStatus(run.paused ? "paused" : run.status)} />],
-        ["Started", origin({ origin: "", automation: run.automation ?? null, by: run.by ?? null, retry_of: null, source: run.source ?? null })],
-        ["Retry of", run.retry_of ? <Link href={`/runs/${run.retry_of}`} className="mono link">{shortId(run.retry_of)}</Link> : null],
-        ["When", when(run.created_at, now)],
-        ["Took", isLive(run) ? null : duration(run.updated_at - run.created_at)],
+        ["Started by", origin({ origin: "", automation: run.automation ?? null, by: run.by ?? null, retry_of: null, source: run.source ?? null })],
+        ["Retry of", run.retry_of ? <Link href={`/runs/${run.retry_of}`} className="ref">{shortId(run.retry_of)}</Link> : null],
+        ["Started", when(run.created_at, now)],
+        ["Duration", isLive(run) ? null : duration(run.updated_at - run.created_at)],
         ["Assets", run.source ? null : <span className="row wrap">{run.targets.map((t) => <AssetLink key={t} name={t} />)}</span>],
         ["Partitions", typeof partitions === "string" ? partitions : partitions.length ? list(partitions, 6) : null],
         ["Mode", run.mode === "full" ? "Full: every key again" : run.mode === "commit" ? null : "Incremental: only what changed"],
@@ -121,7 +119,7 @@ export function RunFacts({ run }: { run: RunRequest }) {
         ["Removed keys", run.deleted?.length ? list(run.deleted, 8) : null],
         ["Version", run.version ?? null],
         ["Tags", Object.keys(run.tags ?? {}).length ? Object.entries(run.tags!).map(([k, v]) => `${k}=${v}`).join(", ") : null],
-        ["Run id", <span className="mono">{run.id}</span>],
+        ["Run", <span className="mono">{run.id}</span>],
       ]}
     />
   )
@@ -138,18 +136,31 @@ export function RunInspector({ detail, picked }: { detail: RunDetail; picked: st
   return <TaskPanel key={picked} detail={detail} task={task} at={at} />
 }
 
+/** Errors of a run's tasks, one line each: what failed, then why. */
+function Errors({ tasks, named }: { tasks: Task[]; named: (task: Task) => string }) {
+  if (!tasks.length) return null
+  return (
+    <div>
+      <h3 className="subhead">Errors</h3>
+      <ul className="errors">
+        {tasks.map((task) => (
+          <li key={task.id}>
+            <span className="name">{named(task)}</span>
+            <span className="error-text">{task.error}</span>
+          </li>
+        ))}
+      </ul>
+    </div>
+  )
+}
+
 function RunOverview({ detail }: { detail: RunDetail }) {
   const failed = detail.tasks.filter((t) => t.error)
   return (
-    <div className="stack">
+    <div className="stack inspector">
       <RunFacts run={detail.request} />
-      {failed.slice(0, 5).map((task) => (
-        <Notice key={task.id} tone="failed">
-          <strong className="mono">{task.asset} {partitionLabel(task.partition)}</strong>
-          <div className="error-text">{task.error}</div>
-        </Notice>
-      ))}
-      {detail.tasks.length > 0 && <p className="muted">Pick a step on the chart to see its attempts and logs.</p>}
+      <Errors tasks={failed.slice(0, 8)} named={(task) => `${task.asset} ${partitionLabel(task.partition)}`.trim()} />
+      {detail.tasks.length > 0 && <p className="faint">Select a step on the timeline to see its attempts and logs.</p>}
     </div>
   )
 }
@@ -159,8 +170,8 @@ function GroupPanel({ detail, asset }: { detail: RunDetail; asset: string }) {
   const by = new Map<string, number>()
   for (const task of tasks) by.set(task.status, (by.get(task.status) ?? 0) + 1)
   return (
-    <div className="stack">
-      <h3 className="inspector-title mono">{asset}</h3>
+    <div className="stack inspector">
+      <h3 className="inspector-title">{asset}</h3>
       <Facts
         rows={[
           ["Partitions in this run", String(tasks.length)],
@@ -168,12 +179,7 @@ function GroupPanel({ detail, asset }: { detail: RunDetail; asset: string }) {
           ["Asset", <AssetLink name={asset} />],
         ]}
       />
-      {tasks.filter((t) => t.error).slice(0, 8).map((task) => (
-        <Notice key={task.id} tone="failed">
-          <strong className="mono">{partitionLabel(task.partition)}</strong>
-          <div className="error-text">{task.error}</div>
-        </Notice>
-      ))}
+      <Errors tasks={tasks.filter((t) => t.error).slice(0, 8)} named={(task) => partitionLabel(task.partition) || asset} />
     </div>
   )
 }
@@ -187,19 +193,17 @@ function TaskPanel({ detail, task, at }: { detail: RunDetail; task: Task; at: Ex
   const live = !TERMINAL_TASK.has(task.status)
   const held = task.status === "queued" ? heldReason(task.held) : task.status === "claimable" ? "No worker has taken it yet. A worker of its pool must be running." : null
   return (
-    <div className="stack">
-      <div>
-        <h3 className="inspector-title mono">
+    <div className="stack inspector">
+      <div className="row wrap">
+        <h3 className="inspector-title">
           {task.asset}
-          {task.partition && <span className="muted"> {partitionLabel(task.partition)}</span>}
+          {task.partition && <span className="mono muted"> {partitionLabel(task.partition)}</span>}
         </h3>
-        <div className="row wrap">
-          <StatusPill status={status} />
-          <span className="faint">·</span>
-          <Link href={`/assets/${encodeURIComponent(task.asset)}`} className="link">
-            Open the asset
-          </Link>
-        </div>
+        <StatusPill status={status} />
+        <span className="grow" />
+        <Link href={`/assets/${encodeURIComponent(task.asset)}`} className="link muted">
+          Open the asset
+        </Link>
       </div>
       {held && <Notice tone="waiting">{held}</Notice>}
       {task.error && (
@@ -236,10 +240,10 @@ function AttemptPanel({ run, task, attempt, count, live }: { run: string; task: 
       )}
       <Facts
         rows={[
-          ["Outcome", <StatusPill status={attemptStatus(attempt)} />],
-          ["Began", attempt.started_at ? when(attempt.started_at, now) : null],
-          ["Took", attempt.started_at && attempt.finished_at ? duration(attempt.finished_at - attempt.started_at) : null],
-          ["Waited before", task.wait > 0.05 ? duration(task.wait) : null],
+          ["Outcome", count > 1 ? <StatusPill status={attemptStatus(attempt)} /> : null],
+          ["Started", attempt.started_at ? when(attempt.started_at, now) : null],
+          ["Duration", attempt.started_at && attempt.finished_at ? duration(attempt.finished_at - attempt.started_at) : null],
+          ["Waited", task.wait > 0.05 ? duration(task.wait) : null],
           ["Tries", count > 1 || live ? `${count} of ${task.max_attempts} allowed` : null],
           ["Batch", attempt.batch && attempt.batch.count > 1 ? `${attempt.batch.index + 1} of ${Math.max(attempt.batch.count, attempt.batch.index + 1)}` : null],
           ["Keys in the batch", attempt.batch ? [attempt.batch.added && `${attempt.batch.added} added`, attempt.batch.updated && `${attempt.batch.updated} updated`, attempt.batch.removed && `${attempt.batch.removed} removed`, attempt.batch.unchanged && `${attempt.batch.unchanged} unchanged`].filter(Boolean).join(", ") : null],
@@ -273,16 +277,19 @@ export function PhaseBar({ attempt }: { attempt: Attempt }) {
   if (!total) return null
   return (
     <div className="phases">
-      <div className="label">Where the time went</div>
+      <h3 className="subhead">Where the time went</h3>
       <div className="phase-bar" role="img" aria-label={phases.map((p) => `${PHASE_WORDS[p.name]} ${duration(p.seconds)}`).join(", ")}>
         {phases.map((p, i) => (
-          <span key={p.name} style={{ flexGrow: p.seconds, opacity: 0.3 + (0.7 * (i + 1)) / phases.length }} title={`${PHASE_WORDS[p.name]}: ${duration(p.seconds)}`} />
+          <span key={p.name} style={{ width: `${(p.seconds / total) * 100}%`, opacity: 0.35 + (0.65 * (i + 1)) / phases.length }} />
         ))}
       </div>
       <ul className="phase-list">
         {phases.map((p) => (
           <li key={p.name}>
-            <span className="muted">{PHASE_WORDS[p.name]}</span>
+            <span className="muted">
+              <i className="phase-key" style={{ opacity: 0.35 + (0.65 * (phases.indexOf(p) + 1)) / phases.length }} />
+              {PHASE_WORDS[p.name]}
+            </span>
             <span className="num">{duration(p.seconds)}</span>
           </li>
         ))}
@@ -300,7 +307,7 @@ function Logs({ run, attempt, live }: { run: string; attempt: string; live: bool
   }, [count, live])
   return (
     <div>
-      <div className="label">Logs</div>
+      <h3 className="subhead">Logs</h3>
       {logs.isLoading ? (
         <Loading />
       ) : !count ? (
@@ -324,8 +331,8 @@ function KeyCall({ run, attempt, name, asset }: { run: string; attempt: string; 
   const result = useAttemptResult(run, attempt)
   const call = result.data?.key_outcomes?.find((k) => k.key === name)
   return (
-    <div className="stack key-call">
-      <div className="label">This key in this batch</div>
+    <div className="stack well">
+      <h3 className="subhead">This key in this batch</h3>
       <Facts
         rows={[
           ["Key", <span className="mono">{name}</span>],

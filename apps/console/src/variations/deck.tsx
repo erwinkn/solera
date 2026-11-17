@@ -4,10 +4,12 @@ import { Link, useLocation } from "wouter"
 import { useDiagnostics, useHealth, useManifest, useRun, useRunFacets, useStatuses } from "../api/queries"
 import type { RunDetail } from "../api/types"
 import { AssetActions, AssetsFeed, AssetsTable, AssetState, CommitsTable, Definition, firstLine, KeysPanel, PartitionGrid } from "../blocks/assets"
-import { Empty, Failure, Loading, StatusPill, useParam } from "../blocks/atoms"
+import { Dot, Empty, Failure, Loading, StatusPill, useParam } from "../blocks/atoms"
 import { AutomationsTable, SensorFacts, SensorsTable, TicksTable } from "../blocks/automations"
-import { AssetTimeline, ProjectTimeline, RunTimeline, TroubleFilter, useRunView, WindowPicker } from "../blocks/charts"
+import { PartitionActivity, StripLegend, WindowPicker } from "../blocks/activity"
+import { RunTimeline, TroubleFilter, useRunView } from "../blocks/charts"
 import { Attention, CleanupsPanel, EngineFacts, ExecutorsTable, healthStatus, PruneRuns, Upcoming, useAttention, useUpcoming } from "../blocks/engine"
+import { AssetActivity, Summary } from "../blocks/home"
 import { KeyLookup } from "../blocks/keys"
 import { LookMenu, LookSettings } from "../blocks/look"
 import { RunActions, RunInspector, runSentence, runTitle } from "../blocks/run"
@@ -17,7 +19,7 @@ import { count, plural, until } from "../model/format"
 import { assetStatus, runStatus } from "../model/status"
 import { IconButton, Tabs, TextField } from "../ui/controls"
 import { Sheet } from "../ui/overlays"
-import { AssetPeek, isCurrent, PLACES, SearchButton, StartRunButton, type Layout } from "./shared"
+import { isCurrent, Logo, PLACES, SearchButton, StartRunButton, type Layout } from "./shared"
 
 /* Control room: everything on one screen, dense. A strip of places on top, a
  * list on the left, the stage in the middle, and what is picked on the
@@ -39,8 +41,9 @@ function Shell({ children }: { children: ReactNode }) {
     <div className="dk">
       <header className="dk-top">
         <Link href="/" className="dk-brand">
-          <span className="display">Solera</span>
-          <span className="mono muted">{diagnostics.data?.project}</span>
+          <Logo size={16} />
+          <span className="brand">Solera</span>
+          <span className="muted">{diagnostics.data?.project}</span>
         </Link>
         <nav className="dk-nav" aria-label="Places">
           {PLACES.map((place) => (
@@ -51,7 +54,7 @@ function Shell({ children }: { children: ReactNode }) {
         </nav>
         <span className="grow" />
         <SearchButton compact />
-        <LookMenu label="" />
+        <LookMenu />
         <StartRunButton size="s" />
       </header>
       {children}
@@ -126,36 +129,35 @@ function Panes({ list, listTitle = "Browse", stage, bar, side, sideTitle = "Deta
   )
 }
 
-const Title = ({ children, mono }: { children: ReactNode; mono?: boolean }) => <h1 className={`dk-title truncate ${mono ? "mono" : ""}`}>{children}</h1>
+const Title = ({ children }: { children: ReactNode }) => <h1 className="dk-title truncate">{children}</h1>
 
 function Home() {
   const [window, setWindow] = useParam("window", "900")
-  const [picked, setPicked] = useState<string | null>(null)
   return (
     <Panes
       listTitle="Assets"
       list={<AssetsFeed />}
       bar={
         <>
-          <Title>What ran, and what runs next</Title>
+          <Title>Overview</Title>
           <span className="grow" />
-          <WindowPicker value={Number(window)} onChange={(s) => setWindow(String(s))} />
+          <span className="dk-hide-narrow"><StripLegend /></span>
+          <WindowPicker value={Number(window)} onChange={(seconds) => setWindow(String(seconds))} />
         </>
       }
-      stage={<ProjectTimeline window={Number(window)} selected={picked} onSelect={setPicked} maxHeight="100%" />}
-      sideTitle={picked ? "Picked" : "Needs attention"}
+      stage={
+        <>
+          <Summary />
+          <AssetActivity window={Number(window)} />
+        </>
+      }
+      sideTitle="Needs attention"
       side={
-        picked ? (
-          <AssetPeek id={picked} />
-        ) : (
-          <div className="stack">
-            <Attention />
-            <div>
-              <div className="label">Coming next</div>
-              <Upcoming limit={8} />
-            </div>
-          </div>
-        )
+        <>
+          <Attention />
+          <div className="dk-pane-title label">Coming next</div>
+          <Upcoming limit={8} />
+        </>
       }
     />
   )
@@ -178,8 +180,8 @@ function Facets({ filters }: { filters: ReturnType<typeof useRunsFilter> }) {
             {(facets.data![name] ?? []).map((facet) => (
               <li key={facet.value}>
                 <button className="feed-item" aria-pressed={(filters.filter[name] ?? []).includes(facet.value)} onClick={() => toggle(name, facet.value)}>
-                  {name === "status" ? <span className="dot" data-tone={runStatus(facet.value).tone} /> : null}
-                  <span className={`grow truncate ${name === "asset" ? "mono feed-name" : ""}`}>{name === "status" ? runStatus(facet.value).label : facet.value}</span>
+                  {name === "status" ? <Dot tone={runStatus(facet.value).tone} /> : null}
+                  <span className="grow truncate">{name === "status" ? runStatus(facet.value).label : facet.value}</span>
                   <span className="faint num">{count(facet.count)}</span>
                 </button>
               </li>
@@ -234,7 +236,7 @@ function RunPanes({ detail }: { detail: RunDetail }) {
       list={<RunsFeed filter={{}} selected={run.id} />}
       bar={
         <>
-          <Title mono>{runTitle(run)}</Title>
+          <Title>{runTitle(run)}</Title>
           <StatusPill status={runStatus(run.paused ? "paused" : run.status)} />
           <span className="muted truncate dk-hide-narrow">{runSentence(run, view)}</span>
           <span className="grow" />
@@ -288,7 +290,7 @@ function Asset({ name }: { name: string }) {
       list={<AssetsFeed selected={name} />}
       bar={
         <>
-          <Title mono>{name}</Title>
+          <Title>{name}</Title>
           <span className="muted truncate dk-hide-narrow">{firstLine(spec?.doc)}</span>
           <span className="grow" />
           <WindowPicker value={Number(window)} onChange={(s) => setWindow(String(s))} />
@@ -305,7 +307,7 @@ function Asset({ name }: { name: string }) {
             <div className="dk-pad">
               <AssetState name={name} />
             </div>
-            <AssetTimeline asset={name} window={Number(window)} maxHeight="44dvh" />
+            <PartitionActivity asset={name} window={Number(window)} />
             {status?.partitioned && (
               <div className="dk-pad">
                 <div className="label">Partitions</div>
@@ -341,7 +343,7 @@ function Source({ name }: { name: string }) {
       list={<AssetsFeed selected={name} />}
       bar={
         <>
-          <Title mono>{name}</Title>
+          <Title>{name}</Title>
           <span className="muted">Source</span>
         </>
       }
@@ -382,7 +384,7 @@ function Automations() {
 }
 
 function Sensor({ name }: { name: string }) {
-  return <Panes bar={<><Title mono>{name}</Title><span className="muted">Sensor</span></>} stage={<TicksTable name={name} />} sideTitle="About this sensor" side={<SensorFacts name={name} />} />
+  return <Panes bar={<><Title>{name}</Title><span className="muted">Sensor</span></>} stage={<TicksTable name={name} />} sideTitle="About this sensor" side={<SensorFacts name={name} />} />
 }
 
 function Engine() {
@@ -406,7 +408,7 @@ function Engine() {
   )
 }
 
-const Keys = () => <Panes bar={<Title>Find a key</Title>} stage={<div className="dk-pad"><KeyLookup /></div>} />
+const Keys = () => <Panes bar={<Title>Find a key</Title>} stage={<KeyLookup />} />
 const Settings = () => <Panes bar={<Title>Settings</Title>} stage={<div className="dk-pad dk-narrow"><LookSettings /></div>} />
 const NotFound = () => (
   <Panes

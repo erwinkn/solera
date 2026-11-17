@@ -39,7 +39,7 @@ function Gate() {
   return (
     <main className="gate">
       <div className="gate-card">
-        <h1 className="display gate-title">Solera</h1>
+        <h1 className="gate-title">Solera</h1>
         {diagnostics.isError ? (
           <>
             <p>The console cannot reach the server.</p>
@@ -68,7 +68,7 @@ function TokenPrompt() {
   return (
     <main className="gate">
       <form className="gate-card" onSubmit={submit}>
-        <h1 className="display gate-title">Solera</h1>
+        <h1 className="gate-title">Solera</h1>
         <p>This server asks for a token. It is the value of SOLERA_API_TOKEN where the server runs.</p>
         <TextField
           label="API token"

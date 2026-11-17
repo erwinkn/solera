@@ -109,7 +109,7 @@ export function Modal({ open, onOpenChange, title, description, children, footer
             {description && <DialogDescription className="muted">{description}</DialogDescription>}
           </div>
           <DialogClose className="btn" data-variant="quiet" data-icon-only="" aria-label="Close">
-            <X size={16} />
+            <X size={15} />
           </DialogClose>
         </header>
         <div className="dialog-body">{children}</div>
@@ -128,7 +128,7 @@ export function Sheet({ open, onOpenChange, title, side, children }: { open: boo
         <header className="dialog-head">
           <DrawerTitle className="dialog-title grow">{title}</DrawerTitle>
           <DrawerClose className="btn" data-variant="quiet" data-icon-only="" aria-label="Close">
-            <X size={16} />
+            <X size={15} />
           </DrawerClose>
         </header>
         <div className="sheet-body">{children}</div>
@@ -225,7 +225,7 @@ export function Palette({ open, onOpenChange, commands }: { open: boolean; onOpe
             {groups.map((group) => (
               <Fragment key={group}>
                 <CommandGroup>
-                  <CommandGroupLabel className="label palette-group">{group}</CommandGroupLabel>
+                  <CommandGroupLabel className="menu-label">{group}</CommandGroupLabel>
                   {commands
                     .filter((c) => c.group === group)
                     .map((c) => (

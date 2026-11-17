@@ -1,11 +1,11 @@
 import { Search } from "lucide-react"
 import { useState } from "react"
 import { Link, useLocation } from "wouter"
-import { useRunFacets, useRunHistogram, useRuns, type RunsFilter } from "../api/queries"
-import type { RunRow } from "../api/types"
-import { clock, clockShort, count, duration, list, partitionLabel, plural } from "../model/format"
-import { origin, runStatus, type Tone } from "../model/status"
-import { Button, TextField } from "../ui/controls"
+import { useManifest, useRunFacets, useRunHistogram, useRuns, type RunsFilter } from "../api/queries"
+import type { Manifest, RunRow } from "../api/types"
+import { clock, clockShort, count, duration, list, partitionLabel, per, plural, when } from "../model/format"
+import { runStatus, triggerText, type Tone } from "../model/status"
+import { Button, TextField, useChartTip } from "../ui/controls"
 import { PickMany } from "../ui/overlays"
 import { Ago, Dot, Empty, Failure, Loading, StatusPill, useParam } from "./atoms"
 
@@ -15,6 +15,16 @@ import { Ago, Dot, Empty, Failure, Loading, StatusPill, useParam } from "./atoms
 export function runWhat(run: RunRow): string {
   if (run.source) return `Commit to ${run.source}`
   return list(run.targets, 2)
+}
+
+/** What started a run, in a few words: the trigger of its automation, or who asked. */
+export function runTrigger(run: RunRow, manifest: Manifest | undefined): string {
+  if (run.source) return `Commit${run.by ? ` by ${run.by}` : ""}`
+  if (run.retry_of) return "Retry"
+  const automation = run.automation ? manifest?.automations[run.automation] : undefined
+  if (automation) return triggerText(automation.trigger).replace(/ \(.*\)$/, "")
+  if (run.automation) return run.automation
+  return run.by && run.by !== "api" ? `Manual, from the ${run.by}` : "Manual"
 }
 
 export function runWhere(run: RunRow): string {
@@ -68,37 +78,64 @@ export function RunsFilters({ filter, set }: ReturnType<typeof useRunsFilter>) {
 }
 
 const BAR_TONES: [string, Tone][] = [["failed", "failed"], ["canceled", "idle"], ["running", "running"], ["queued", "waiting"], ["succeeded", "ok"], ["skipped", "idle"]]
+const MIN_BARS = 60
 
-/** Runs per minute over the last hour, failures on top. */
-export function RunHistogram({ filter, height = 56 }: { filter: RunsFilter; height?: number }) {
+/** Runs over time, failures on top. The axis is linear: a bucket where nothing ran keeps its place. */
+export function RunHistogram({ filter, height = 40 }: { filter: RunsFilter; height?: number }) {
   const histogram = useRunHistogram(filter)
-  const bars = histogram.data?.bars ?? []
-  const max = Math.max(1, ...bars.map((bar) => Object.values(bar.counts).reduce((a, b) => a + b, 0)))
-  if (!bars.length) return <div className="histogram" style={{ height }} />
+  const { over, out, tip } = useChartTip()
+  const data = histogram.data
+  if (!data?.bars.length) return <div className="histogram" style={{ height }} />
+  const { bucket } = data
+  const end = Math.ceil(data.until / bucket) * bucket
+  const n = Math.min(240, Math.max(MIN_BARS, Math.ceil((end - data.since) / bucket)))
+  const start = end - n * bucket
+  const by = new Map(data.bars.map((bar) => [Math.round((bar.t - start) / bucket), bar.counts]))
+  const total = (counts: Record<string, number> | undefined) => Object.values(counts ?? {}).reduce((a, b) => a + b, 0)
+  const max = Math.max(1, ...data.bars.map((bar) => total(bar.counts)))
+  const time = (at: number) => (end - start > 86400 ? when(at, end) : clockShort(at))
   return (
     <figure className="histogram-figure">
-      <div className="histogram" style={{ height }} role="img" aria-label={`Runs over time: ${bars.length} bars, up to ${max} runs each`}>
-        {bars.map((bar) => {
-          const total = Object.values(bar.counts).reduce((a, b) => a + b, 0)
+      <div className="histogram" style={{ height }} role="img" aria-label={`Runs over time, up to ${max} per ${per(bucket)}`} onMouseLeave={out}>
+        {Array.from({ length: n }, (_, i) => {
+          const counts = by.get(i)
           return (
-            <div key={bar.t} className="histogram-bar" title={`${clockShort(bar.t)}: ${Object.entries(bar.counts).map(([k, v]) => `${v} ${runStatus(k).label.toLowerCase()}`).join(", ")}`} style={{ height: `${(total / max) * 100}%` }}>
-              {BAR_TONES.map(([status, tone]) => (bar.counts[status] ? <span key={status} data-tone={tone} data-status={status} style={{ flexGrow: bar.counts[status] }} /> : null))}
+            <div
+              key={i}
+              className="histogram-slot"
+              onMouseEnter={(event) =>
+                over(
+                  event.currentTarget,
+                  <>
+                    <span className="chart-tip-time">{time(start + i * bucket)}</span>
+                    {counts ? Object.entries(counts).map(([status, k]) => `${count(k)} ${runStatus(status).label.toLowerCase()}`).join(", ") : "No runs"}
+                  </>,
+                )
+              }
+            >
+              {counts && (
+                <div className="histogram-bar" style={{ height: `${(total(counts) / max) * 100}%` }}>
+                  {BAR_TONES.map(([status, tone]) => (counts[status] ? <span key={status} data-tone={tone} data-status={status} style={{ flexGrow: counts[status] }} /> : null))}
+                </div>
+              )}
             </div>
           )
         })}
+        {tip}
       </div>
-      <figcaption className="histogram-axis faint num">
-        <span>{clockShort(bars[0]!.t)}</span>
-        <span>runs, one bar for each {duration(histogram.data!.bucket).replace(/ 00s$/, "").replace(/^1m$/, "minute")}</span>
-        <span>{clockShort(bars[bars.length - 1]!.t)}</span>
+      <figcaption className="histogram-axis faint">
+        <span>{time(start)}</span>
+        <span>Runs per {per(bucket)}</span>
+        <span>now</span>
       </figcaption>
     </figure>
   )
 }
 
-export function RunsTable({ filter, limit = 50, dense }: { filter: RunsFilter; limit?: number; dense?: boolean }) {
+export function RunsTable({ filter, limit = 50, dense, brief }: { filter: RunsFilter; limit?: number; dense?: boolean; /** No footer: the newest few, for a page that links to the rest. */ brief?: boolean }) {
   const [more, setMore] = useState(0)
   const runs = useRuns(filter, limit + more)
+  const manifest = useManifest()
   const [, navigate] = useLocation()
   const now = Date.now() / 1000
   if (runs.error) return <Failure error={runs.error} />
@@ -110,41 +147,45 @@ export function RunsTable({ filter, limit = 50, dense }: { filter: RunsFilter; l
         <table className="table">
           <thead>
             <tr>
-              <th>Status</th>
-              <th>What</th>
-              {!dense && <th>Partitions</th>}
-              <th>Started by</th>
-              <th className="end">Tasks</th>
-              <th className="end">Took</th>
-              <th className="end">When</th>
+              <th className="fit">Status</th>
+              <th>Run</th>
+              {!dense && <th className="optional">Partitions</th>}
+              <th className="optional">Trigger</th>
+              <th className="end optional">Tasks</th>
+              <th className="end">Duration</th>
+              <th className="end">Started</th>
             </tr>
           </thead>
           <tbody>
             {runs.data.runs.map((run) => (
               <tr key={run.id} data-link="" onClick={() => navigate(`/runs/${run.id}`)}>
-                <td><StatusPill status={runStatus(run.status)} /></td>
-                <td>
-                  <Link href={`/runs/${run.id}`} className="mono" onClick={(event) => event.stopPropagation()}>
-                    <strong>{runWhat(run)}</strong>
-                  </Link>
-                  {run.error && <div className="error-text truncate run-error">{run.error}</div>}
+                <td className="fit"><StatusPill status={runStatus(run.status)} /></td>
+                <td className="wide">
+                  <div className="row">
+                    <Link href={`/runs/${run.id}`} className="name truncate" onClick={(event) => event.stopPropagation()}>
+                      {runWhat(run)}
+                    </Link>
+                    {run.error && <span className="error-text truncate run-error">{run.error}</span>}
+                  </div>
                 </td>
-                {!dense && <td className="muted mono">{runWhere(run)}</td>}
-                <td className="muted">{origin(run).replace("Automation ", "")}</td>
-                <td className="end num">{run.failed_count ? <span className="tone" data-tone="failed">{run.failed_count} failed of {run.task_count}</span> : run.task_count || "–"}</td>
-                <td className="end num">{run.finished_at ? duration(run.finished_at - run.created_at) : "–"}</td>
+                {!dense && <td className="muted mono optional">{runWhere(run)}</td>}
+                <td className="muted optional">{runTrigger(run, manifest.data)}</td>
+                <td className="end num optional">{run.failed_count ? <span className="tone" data-tone="failed">{run.failed_count} of {run.task_count} failed</span> : run.task_count || <span className="faint">–</span>}</td>
+                <td className="end num">{run.finished_at ? duration(run.finished_at - run.created_at) : <span className="faint">–</span>}</td>
                 <td className="end muted"><Ago at={run.created_at} now={now} /></td>
               </tr>
             ))}
           </tbody>
         </table>
       </div>
-      <div className="row table-foot">
-        <span className="muted grow">
-          Showing {count(runs.data.runs.length)} of {count(runs.data.total)}
-        </span>
-        {runs.data.next && <Button size="s" onClick={() => setMore(more + 100)}>Show more</Button>}
-      </div>
+      {!brief && (
+        <div className="row table-foot">
+          <span className="muted grow">
+            {count(runs.data.runs.length)} of {count(runs.data.total)} runs
+          </span>
+          {runs.data.next && <Button size="s" onClick={() => setMore(more + 100)}>Show more</Button>}
+        </div>
+      )}
     </>
   )
 }
@@ -162,7 +203,7 @@ export function RunsFeed({ filter, selected, limit = 60 }: { filter: RunsFilter;
           <Link href={`/runs/${run.id}`} className="feed-item" aria-current={run.id === selected ? "page" : undefined}>
             <Dot tone={runStatus(run.status).tone} />
             <span className="grow truncate">
-              <span className="mono feed-name">{runWhat(run)}</span>
+              <span className="name">{runWhat(run)}</span>
               <span className="muted"> {runWhere(run)}</span>
             </span>
             <span className="faint num">{clock(run.created_at)}</span>

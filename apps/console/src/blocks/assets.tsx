@@ -4,10 +4,12 @@ import { Link, useLocation } from "wouter"
 import { useAsset, useAutomationCommand, useCommits, useManifest, useOutcomes, usePartitions, useRetryKeys, useStaleKeys, useStatuses } from "../api/queries"
 import type { AssetSpec, AssetStatus, Automation, Manifest, PartitionRow, Reason } from "../api/types"
 import { count, duration, partitionLabel, plural, until } from "../model/format"
+import { projectGraph } from "../model/graph"
 import { assetStatus, FAILING_KEYS, keyStatus, partitionStatus, triggerText, type Tone } from "../model/status"
 import { Button, TextField, Tip, Toggle } from "../ui/controls"
+import { MarkIcon } from "../ui/status"
 import { ActionMenu, PickMany, report } from "../ui/overlays"
-import { Ago, AssetLink, Dot, Empty, Facts, Failure, Loading, Notice, RunLink, StatusPill } from "./atoms"
+import { Ago, AssetLink, Dot, Empty, Facts, Failure, Loading, Notice, RunLink, SourceLink, StatusPill } from "./atoms"
 import { openStartRun } from "./start-run"
 
 /* Assets: the list, and the parts of one asset's page. */
@@ -60,10 +62,11 @@ export function AssetsTable({ filter, selected, dense }: { filter?: string; sele
         <thead>
           <tr>
             <th>Asset</th>
+            {!dense && <th>Description</th>}
             <th>Status</th>
-            {!dense && <th>Partitions built</th>}
-            {!dense && <th>Runs</th>}
-            <th className="end">Last ran</th>
+            {!dense && <th>Partitions up to date</th>}
+            {!dense && <th>Starts</th>}
+            <th className="end">Last run</th>
           </tr>
         </thead>
         <tbody>
@@ -72,21 +75,63 @@ export function AssetsTable({ filter, selected, dense }: { filter?: string; sele
             const status = statuses.data?.assets[name]
             const state = assetStatus(status)
             const keys = failingKeys(status)
+            const note = keys && state.tone === "ok" ? `${plural(keys, "key")} failing` : state.tone !== "ok" ? state.short : ""
             return (
               <tr key={name} data-link="" data-selected={name === selected ? "" : undefined} onClick={() => navigate(`/assets/${encodeURIComponent(name)}`)}>
-                <td>
-                  <Link href={`/assets/${encodeURIComponent(name)}`} className="mono" onClick={(event) => event.stopPropagation()}>
-                    <strong>{name}</strong>
+                <td className="fit">
+                  <Link href={`/assets/${encodeURIComponent(name)}`} className="name" onClick={(event) => event.stopPropagation()}>
+                    {name}
                   </Link>
-                  {!dense && <div className="muted truncate asset-doc">{firstLine(spec.doc)}</div>}
                 </td>
-                <td>
-                  <StatusPill status={state} />
-                  {(state.tone !== "ok" || keys > 0) && <div className="muted">{keys && state.tone === "ok" ? `${plural(keys, "key")} failing` : state.detail}</div>}
+                {!dense && <td className="wide"><div className="muted truncate">{firstLine(spec.doc)}</div></td>}
+                <td className="fit">
+                  <span className="row">
+                    <StatusPill status={state} />
+                    {note && note !== state.label.toLowerCase() && <span className="muted">{note}</span>}
+                  </span>
                 </td>
-                {!dense && <td>{status?.partitioned ? <PartitionMeter status={status} /> : <span className="faint">No partitions</span>}</td>}
-                {!dense && <td className="muted">{automationText(spec, manifest.data!)}</td>}
-                <td className="end muted">{status?.last ? <Ago at={status.last.at} now={now} /> : <span className="faint">never</span>}</td>
+                {!dense && <td className="fit">{status?.partitioned ? <PartitionMeter status={status} /> : <span className="faint">Not partitioned</span>}</td>}
+                {!dense && <td className="muted fit">{automationText(spec, manifest.data!)}</td>}
+                <td className="end muted fit">{status?.last ? <Ago at={status.last.at} now={now} /> : <span className="faint">never</span>}</td>
+              </tr>
+            )
+          })}
+        </tbody>
+      </table>
+    </div>
+  )
+}
+
+/** The sources assets read, and who reads each. */
+export function SourcesTable() {
+  const manifest = useManifest()
+  const [, navigate] = useLocation()
+  if (!manifest.data) return <Loading />
+  const names = Object.keys(manifest.data.sources)
+  if (!names.length) return <Empty title="The project reads no source" />
+  const edges = projectGraph(manifest.data).edges
+  return (
+    <div className="table-scroll">
+      <table className="table">
+        <thead>
+          <tr>
+            <th>Source</th>
+            <th>Kind</th>
+            <th>Read by</th>
+          </tr>
+        </thead>
+        <tbody>
+          {names.map((name) => {
+            const readers = edges.filter((edge) => edge.from === name).map((edge) => edge.to)
+            return (
+              <tr key={name} data-link="" onClick={() => navigate(`/sources/${encodeURIComponent(name)}`)}>
+                <td className="fit">
+                  <Link href={`/sources/${encodeURIComponent(name)}`} className="name" onClick={(event) => event.stopPropagation()}>
+                    {name}
+                  </Link>
+                </td>
+                <td className="muted fit">{manifest.data!.sources[name]!.key ? "A set of keys" : "One version"}</td>
+                <td className="muted">{readers.length ? readers.join(", ") : "Nothing"}</td>
               </tr>
             )
           })}
@@ -101,13 +146,14 @@ const METER: [keyof AssetStatus["partitions"], Tone][] = [["materialized", "ok"]
 export function PartitionMeter({ status }: { status: AssetStatus }) {
   const p = status.partitions
   return (
-    <div className="row">
-      <div className="meter grow" role="img" aria-label={`${p.materialized} of ${p.total} partitions built`}>
-        {METER.map(([name, tone]) => (p[name] ? <span key={name} data-tone={tone} style={{ flexGrow: p[name], opacity: name === "missing" ? 0.35 : 1 }} /> : null))}
-      </div>
-      <span className="num muted">
-        {count(p.materialized)} / {count(p.total)}
+    <div className="row partition-meter">
+      <span className="num">
+        {count(p.materialized)} of {count(p.total)}
       </span>
+      <div className="meter" role="img" aria-label={`${p.materialized} of ${p.total} partitions up to date`}>
+        {METER.map(([name, tone]) => (p[name] && name !== "missing" ? <span key={name} data-tone={tone} style={{ flexGrow: p[name] }} /> : null))}
+        {p.missing > 0 && <span className="meter-rest" style={{ flexGrow: p.missing }} />}
+      </div>
     </div>
   )
 }
@@ -125,7 +171,7 @@ export function AssetsFeed({ selected }: { selected?: string }) {
           <li key={name}>
             <Link href={`/assets/${encodeURIComponent(name)}`} className="feed-item" aria-current={name === selected ? "page" : undefined}>
               <Dot tone={state.tone} />
-              <span className="mono feed-name grow truncate">{name}</span>
+              <span className="grow truncate">{name}</span>
               {state.tone !== "ok" && <span className="faint">{state.label}</span>}
             </Link>
           </li>
@@ -134,8 +180,8 @@ export function AssetsFeed({ selected }: { selected?: string }) {
       {Object.keys(manifest.data.sources).map((name) => (
         <li key={name}>
           <Link href={`/sources/${encodeURIComponent(name)}`} className="feed-item" aria-current={name === selected ? "page" : undefined}>
-            <span className="feed-source" aria-hidden="true" />
-            <span className="mono feed-name grow truncate">{name}</span>
+            <MarkIcon mark="source" />
+            <span className="grow truncate">{name}</span>
             <span className="faint">source</span>
           </Link>
         </li>
@@ -168,21 +214,33 @@ export function AssetActions({ name, size = "m" }: { name: string; size?: "s" | 
           ]}
         />
       )}
-      <Button size={size} variant="primary" icon={<Play size={14} />} onClick={() => openStartRun({ targets: [name] })}>
+      <Button size={size} icon={<Play size={14} />} onClick={() => openStartRun({ targets: [name] })}>
         Run
       </Button>
     </div>
   )
 }
 
-/** What state the asset is in and why, in words. */
-export function AssetState({ name }: { name: string }) {
+/** What state the asset is in and why, in words. `bare` leaves out the status itself, for a page whose header already shows it: then only what needs saying is said. */
+export function AssetState({ name, bare }: { name: string; bare?: boolean }) {
   const statuses = useStatuses()
   const status = statuses.data?.assets[name]
   const stale = useStaleKeys(name, "", Boolean(status && !status.partitioned && status.stale))
   const state = assetStatus(status)
   const keys = Object.entries(status?.stored_counts ?? {}).filter(([, n]) => n > 0)
   const now = Date.now() / 1000
+  const notices = (
+    <>
+      {stale.data?.reasons.length ? <Notice tone="stale">{stale.data.reasons.map(reasonText).join(". ")}.</Notice> : null}
+      {keys.length > 0 && (
+        <Notice tone="stale">
+          {keys.map(([outcome, n]) => `${plural(n, "key")} ${keyStatus(outcome).label.toLowerCase()}`).join(", ")}. Each keeps its last good output until it succeeds.
+        </Notice>
+      )}
+      {status?.repairs ? <Notice tone="stale">{plural(status.repairs, "partition")} of its outputs wait for a repair after a writer died.</Notice> : null}
+    </>
+  )
+  if (bare) return stale.data?.reasons.length || keys.length || status?.repairs ? <div className="stack notices">{notices}</div> : null
   return (
     <div className="stack">
       <div className="row wrap asset-state">
@@ -194,13 +252,7 @@ export function AssetState({ name }: { name: string }) {
           </span>
         )}
       </div>
-      {stale.data?.reasons.length ? <Notice tone="stale">{stale.data.reasons.map(reasonText).join(". ")}.</Notice> : null}
-      {keys.length > 0 && (
-        <Notice tone="stale">
-          {keys.map(([outcome, n]) => `${plural(n, "key")} ${keyStatus(outcome).label.toLowerCase()}`).join(", ")}. Each keeps its last good output until it succeeds.
-        </Notice>
-      )}
-      {status?.repairs ? <Notice tone="stale">{plural(status.repairs, "partition")} of its outputs wait for a repair after a writer died.</Notice> : null}
+      {notices}
     </div>
   )
 }
@@ -218,8 +270,8 @@ export function PartitionGrid({ name }: { name: string }) {
     <div className="stack">
       <div className="row wrap">
         {[...counts.entries()].map(([status, n]) => (
-          <span key={status} className="pill" data-quiet="">
-            <span className="dot" data-tone={partitionStatus(status).tone} />
+          <span key={status} className="status" data-quiet="">
+            <Dot tone={partitionStatus(status).tone} />
             {count(n)} {partitionStatus(status).label.toLowerCase()}
           </span>
         ))}
@@ -232,9 +284,9 @@ export function PartitionGrid({ name }: { name: string }) {
         ))}
       </div>
       {open && (
-        <div className="panel panel-body stack">
+        <div className="well stack">
           <div className="row wrap">
-            <strong className="mono">{partitionLabel(open.partition)}</strong>
+            <span className="mono">{partitionLabel(open.partition)}</span>
             <StatusPill status={partitionStatus(open.status)} />
             <span className="grow" />
             <Button size="s" icon={<Play size={13} />} onClick={() => openStartRun({ targets: [name], partitions: open.partition })}>
@@ -261,8 +313,8 @@ export function KeysPanel({ name }: { name: string }) {
   const [, navigate] = useLocation()
   const now = keys.data?.now ?? Date.now() / 1000
   return (
-    <div className="stack">
-      <div className="row wrap filters">
+    <>
+      <div className="toolbar">
         <form
           className="search"
           onSubmit={(event) => {
@@ -304,7 +356,7 @@ export function KeysPanel({ name }: { name: string }) {
               {keys.data.keys.map((key) => (
                 <tr key={`${key.partition}/${key.key}`} data-link="" onClick={() => navigate(`/keys?asset=${encodeURIComponent(name)}&key=${encodeURIComponent(key.key)}`)}>
                   <td className="mono">
-                    <Link href={`/keys?asset=${encodeURIComponent(name)}&key=${encodeURIComponent(key.key)}`} onClick={(event) => event.stopPropagation()}>
+                    <Link href={`/keys?asset=${encodeURIComponent(name)}&key=${encodeURIComponent(key.key)}`} className="ref-plain" onClick={(event) => event.stopPropagation()}>
                       {key.key}
                     </Link>
                   </td>
@@ -322,8 +374,8 @@ export function KeysPanel({ name }: { name: string }) {
           </table>
         </div>
       )}
-      {keys.data?.next && <p className="muted">Showing the first {keys.data.keys.length}. Narrow it down with the outcome filter, or find a key by name.</p>}
-    </div>
+      {keys.data?.next && <p className="table-foot muted">Showing the first {keys.data.keys.length}. Narrow it down with the outcome filter, or find a key by name.</p>}
+    </>
   )
 }
 
@@ -352,7 +404,7 @@ export function CommitsTable({ name }: { name: string }) {
           {commits.data.commits.map((commit) => (
             <tr key={`${commit.output}/${commit.partition}/${commit.at}/${commit.attempt}`}>
               <td className="muted"><Ago at={commit.at} now={now} /></td>
-              <td className="mono">{commit.output}</td>
+              <td>{commit.output}</td>
               <td className="mono muted">{partitionLabel(commit.partition)}</td>
               <td className="num muted">{commit.batch ? `${commit.batch.index + 1} of ${Math.max(commit.batch.count, commit.batch.index + 1)}` : "–"}</td>
               <td className="end num">{commit.added ?? "–"}</td>
@@ -398,8 +450,8 @@ export function Definition({ name }: { name: string }) {
               <ul className="plain-list">
                 {Object.entries(spec.inputs).map(([param, input]) => (
                   <li key={param}>
-                    {owner(input.output) ? <AssetLink name={owner(input.output)!} /> : <Link href={`/sources/${encodeURIComponent(input.output)}`} className="mono link">{input.output}</Link>}
-                    {owner(input.output) && owner(input.output) !== input.output && <span className="mono muted"> {input.output}</span>}
+                    {owner(input.output) ? <AssetLink name={owner(input.output)!} /> : <SourceLink name={input.output} />}
+                    {owner(input.output) && owner(input.output) !== input.output && <span className="muted"> {input.output}</span>}
                     <span className="muted">
                       {input.each ? `, one call per changed key, ${input.each.concurrency} at once` : input.kind === "incremental" ? ", only what changed" : ", whole"}
                       {input.batch_size ? `, ${count(input.batch_size)} keys a batch` : ""}
@@ -408,7 +460,7 @@ export function Definition({ name }: { name: string }) {
                 ))}
                 {spec.deps.map((dep) => (
                   <li key={dep}>
-                    <Link href={`/sources/${encodeURIComponent(dep)}`} className="mono link">{dep}</Link>
+                    <SourceLink name={dep} />
                     <span className="muted">, watched for changes, not loaded</span>
                   </li>
                 ))}
@@ -423,7 +475,7 @@ export function Definition({ name }: { name: string }) {
               <ul className="plain-list">
                 {spec.outputs.map((output) => (
                   <li key={output.name}>
-                    <span className="mono">{output.name}</span>
+                    <span className="name">{output.name}</span>
                     <span className="muted">
                       {" "}to the {output.store} store{output.key ? `, one row per ${output.key}` : ""}
                     </span>
@@ -443,7 +495,7 @@ export function Definition({ name }: { name: string }) {
         ]}
       />
       <div>
-        <div className="label">What starts it</div>
+        <h3 className="subhead">Automations</h3>
         {detail.data?.automations.length ? (
           <ul className="plain-list automations-inline">
             {detail.data.automations.map((automation) => (

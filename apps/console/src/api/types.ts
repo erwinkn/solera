@@ -239,22 +239,6 @@ export type RunEvent = {
   rows: number | null
 }
 
-export type TaskRow = {
-  id: string
-  run: string
-  asset: string
-  partition: string
-  status: string
-  created_at: number
-  started_at: number | null
-  finished_at: number | null
-  attempts: number
-  wait: number | null
-  duration: number | null
-  error: string | null
-  executor: string | null
-}
-
 export type KeyCall = { key: string; outcome: string; duration: number | null; error: string | null; generation?: number }
 export type AttemptResult = { status: string; key_outcomes?: KeyCall[]; keys?: Record<string, number> }
 
@@ -329,4 +313,9 @@ export type Diagnostics = {
 export type Cleanup = { output: string; partition?: string; pending?: number; stuck?: unknown[] | string; id?: string; store?: string; due?: number }
 
 export type Facets = Record<string, { value: string; count: number }[]>
+/** `since` is null, and `bars` empty, when no run matches. */
 export type Histogram = { bucket: number; since: number; until: number; bars: { t: number; counts: Record<string, number> }[] }
+
+/** One cell of a task histogram: bucket `i` starts at `since + i * bucket`. */
+export type HistogramCell = { i: number; counts: Record<string, number>; runs: number; /** One of its runs: one that did not succeed if any. */ run: string }
+export type TaskHistogram = { since: number; until: number; bucket: number; by: "asset" | "partition"; series: Record<string, HistogramCell[]> }

@@ -1,13 +1,13 @@
 import { useSyncExternalStore } from "react"
-import { BUILT_IN, DEFAULT_THEME } from "./themes"
+import { BUILT_IN, defaultTheme } from "./themes"
 import { TOKEN_NAMES, type CustomTheme, type Theme } from "./tokens"
 
 /* What the browser remembers about how the console looks: the layout, the
  * theme, and the themes this person made. One localStorage entry. */
 
 export const VARIATIONS = [
-  { id: "workbench", name: "Workbench", note: "Sidebar and panels. A page for each thing" },
-  { id: "deck", name: "Control room", note: "Dense. The timeline first, details in a side pane" },
+  { id: "workbench", name: "Workbench", note: "Sidebar and pages. A page for each thing" },
+  { id: "deck", name: "Control room", note: "Dense. Three panes on one screen" },
   { id: "briefing", name: "Briefing", note: "One column that reads like a status report" },
 ] as const
 export type VariationId = (typeof VARIATIONS)[number]["id"]
@@ -16,7 +16,7 @@ export type Look = { variation: VariationId; theme: string; custom: CustomTheme[
 
 const KEY = "solera.console.look"
 const PAINT = "solera.console.paint"
-const INITIAL: Look = { variation: "workbench", theme: DEFAULT_THEME.id, custom: [] }
+const INITIAL: Look = { variation: "workbench", theme: defaultTheme().id, custom: [] }
 
 function read(): Look {
   try {
@@ -59,7 +59,7 @@ export function useLook(): Look {
 
 /** A custom theme over the built-in one it extends. */
 export function resolve(custom: CustomTheme): Theme {
-  const base = BUILT_IN.find((t) => t.id === custom.extends) ?? DEFAULT_THEME
+  const base = BUILT_IN.find((t) => t.id === custom.extends) ?? defaultTheme()
   return { id: custom.id, name: custom.name, note: `Yours, from ${base.name}`, tokens: { ...base.tokens, ...custom.tokens } }
 }
 
@@ -68,7 +68,7 @@ export function themes(of: Look = look): Theme[] {
 }
 
 export function currentTheme(of: Look = look): Theme {
-  return themes(of).find((t) => t.id === of.theme) ?? DEFAULT_THEME
+  return themes(of).find((t) => t.id === of.theme) ?? defaultTheme()
 }
 
 /** Put a theme's tokens on the page. Nothing reloads: every component reads

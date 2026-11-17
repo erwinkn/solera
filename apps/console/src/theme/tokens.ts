@@ -6,16 +6,16 @@
 export const TOKENS = {
   scheme: "light or dark: tells the browser how to draw its own controls and scrollbars",
 
-  "color-bg": "the page behind everything",
-  "color-surface": "panels, tables and the timeline",
+  "color-bg": "the page",
+  "color-surface": "the sidebar, bars and anything set a step apart from the page",
   "color-raised": "menus, dialogs and anything that floats",
   "color-sunken": "wells: code, logs, inputs, the track behind a bar",
-  "color-border": "hairlines between rows and around panels",
+  "color-border": "hairlines between rows and sections",
   "color-border-strong": "the edge of a control, and hairlines that must be seen",
   "color-text": "body text",
-  "color-text-muted": "secondary text and labels",
+  "color-text-muted": "secondary text and column headers",
   "color-text-faint": "hints, placeholders, what has not happened yet",
-  "color-accent": "primary buttons, the selected item, links",
+  "color-accent": "primary buttons, the selected tab, checked boxes",
   "color-accent-contrast": "text on the accent",
   "color-focus": "the keyboard focus ring",
   "color-overlay": "the dim behind a dialog",
@@ -27,34 +27,30 @@ export const TOKENS = {
   "color-idle": "never built, skipped, canceled",
 
   "font-sans": "the interface",
-  "font-mono": "names, ids, numbers in columns, logs",
-  "font-display": "page titles and big numbers",
+  "font-mono": "ids, keys, values and logs",
   "font-size": "the base size; every other size is a ratio of it",
   "font-weight": "body weight",
-  "font-weight-strong": "emphasis and headings in the interface font",
-  "font-weight-display": "weight of the display font",
-  "font-tracking-display": "letter spacing of the display font",
+  "font-weight-strong": "titles and emphasis",
   "line-height": "body line height, unitless",
 
   "radius-s": "bars, chips, checkboxes",
   "radius-m": "buttons, inputs, menu items",
-  "radius-l": "panels, dialogs",
+  "radius-l": "dialogs",
 
   space: "the spacing unit; every gap and padding is a multiple of it",
   density: "a multiplier on row heights and control sizes: below 1 is tighter",
   "border-width": "hairline thickness",
 
-  "shadow-raised": "panels that sit above the page",
   "shadow-overlay": "menus and dialogs",
 
   "motion-fast": "hover, press, small state changes",
-  "motion-slow": "panels opening, bars growing",
+  "motion-slow": "dialogs and panels opening",
   "motion-ease": "the easing curve of both",
 
-  "chart-bar": "a finished bar on the timeline",
+  "chart-bar": "finished work on a chart: a bar of the timeline, a cell of an activity strip",
   "chart-bar-radius": "corner radius of a bar",
   "chart-bar-height": "bar height as a fraction of its row, 0 to 1",
-  "chart-grid": "the timeline's vertical grid lines",
+  "chart-grid": "a chart's grid lines, and the cells of a strip where nothing ran",
 } as const
 
 export type TokenName = keyof typeof TOKENS

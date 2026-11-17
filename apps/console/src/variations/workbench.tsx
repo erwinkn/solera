@@ -1,37 +1,61 @@
-import { Menu as MenuIcon } from "lucide-react"
+import { Menu as MenuIcon, X } from "lucide-react"
 import { useState, type ReactNode } from "react"
 import { Link, useLocation } from "wouter"
-import { useDiagnostics, useHealth, useManifest, useRun, useRuns, useStatuses } from "../api/queries"
-import { AssetActions, AssetsTable, AssetState, CommitsTable, Definition, firstLine, KeysPanel, PartitionGrid } from "../blocks/assets"
+import { useDiagnostics, useHealth, useManifest, useRun, useStatuses } from "../api/queries"
+import type { RunDetail } from "../api/types"
+import { PartitionActivity, StripLegend, WindowPicker } from "../blocks/activity"
+import { AssetActions, AssetsTable, AssetState, CommitsTable, Definition, firstLine, KeysPanel, PartitionGrid, SourcesTable } from "../blocks/assets"
 import { Empty, Failure, Loading, Panel, StatusPill, useParam } from "../blocks/atoms"
 import { AutomationsTable, SensorFacts, SensorsTable, TicksTable } from "../blocks/automations"
-import { AssetTimeline, ProjectTimeline, RunTimeline, TroubleFilter, useRunView, WindowPicker } from "../blocks/charts"
-import { Attention, CleanupsPanel, EngineFacts, ExecutorsTable, healthStatus, PruneRuns, Upcoming, useUpcoming } from "../blocks/engine"
+import { RunTimeline, TroubleFilter, useRunView } from "../blocks/charts"
+import { Attention, CleanupsPanel, EngineFacts, ExecutorsTable, healthStatus, PruneRuns, useAttention } from "../blocks/engine"
+import { AssetActivity, Summary } from "../blocks/home"
 import { KeyLookup } from "../blocks/keys"
 import { LookMenu, LookSettings } from "../blocks/look"
 import { RunActions, RunInspector, runSentence, runTitle } from "../blocks/run"
 import { RunHistogram, RunsFilters, RunsTable, useRunsFilter } from "../blocks/runs"
 import { SourceCommitForm, SourceCommits, SourceFacts, SourceKeys } from "../blocks/source"
-import type { RunDetail } from "../api/types"
-import { count, until } from "../model/format"
+import { shortId } from "../model/format"
 import { assetStatus, runStatus } from "../model/status"
 import { IconButton, Tabs, TextField } from "../ui/controls"
 import { Sheet } from "../ui/overlays"
-import { AssetPeek, isCurrent, PLACES, SearchButton, StartRunButton, type Layout } from "./shared"
+import { isCurrent, Logo, PLACES, SearchButton, StartRunButton, type Layout } from "./shared"
 
-/* Workbench: a sidebar of places, and a page for each thing. Panels with
- * titles, tabs on the bigger pages, room to read. The familiar take. */
+/* Workbench: a sidebar of places and a page for each thing. Every page has
+ * the same bones: where you are, a title with its state and actions, then
+ * sections that run edge to edge, parted by hairlines. */
 
 function Nav({ onGo }: { onGo?: () => void }) {
   const [path] = useLocation()
   return (
     <nav className="wb-nav" aria-label="Places">
-      {PLACES.map((place) => (
-        <Link key={place.href} href={place.href} className="wb-nav-item" aria-current={isCurrent(place.href, path) ? "page" : undefined} onClick={onGo}>
-          <place.icon size={16} aria-hidden="true" />
-          {place.label}
-        </Link>
+      {(["project", "system"] as const).map((group) => (
+        <div key={group} className="wb-nav-group">
+          {PLACES.filter((place) => place.group === group).map((place) => (
+            <Link key={place.href} href={place.href} className="wb-nav-item" aria-current={isCurrent(place.href, path) ? "page" : undefined} onClick={onGo}>
+              <place.icon size={15} aria-hidden="true" />
+              {place.label}
+            </Link>
+          ))}
+        </div>
       ))}
+    </nav>
+  )
+}
+
+/** Where a path is: its place, and under it the one thing the page is about.
+ * A place's own page has no other title, so there the place is the heading. */
+function Crumbs() {
+  const [path] = useLocation()
+  const place = PLACES.find((p) => isCurrent(p.href, path))
+  const [, section, id] = path.split("/")
+  if (!place) return <nav className="wb-crumbs" aria-label="Where you are" />
+  if (!id) return <h1 className="wb-crumbs wb-place">{place.label}</h1>
+  return (
+    <nav className="wb-crumbs truncate" aria-label="Where you are">
+      <Link href={place.href}>{place.label}</Link>
+      <span className="faint" aria-hidden="true">/</span>
+      <span aria-current="page" className={section === "runs" ? "mono truncate" : "truncate"}>{section === "runs" ? shortId(id) : decodeURIComponent(id)}</span>
     </nav>
   )
 }
@@ -40,108 +64,97 @@ function Shell({ children }: { children: ReactNode }) {
   const diagnostics = useDiagnostics()
   const health = useHealth()
   const [menu, setMenu] = useState(false)
-  const brand = (
-    <Link href="/" className="wb-brand">
-      <span className="display">Solera</span>
-      <span className="mono muted">{diagnostics.data?.project}</span>
-    </Link>
+  const side = (onGo?: () => void) => (
+    <>
+      <Link href="/" className="wb-brand" onClick={onGo}>
+        <Logo />
+        <span className="wb-brand-name">Solera</span>
+        <span className="muted truncate">{diagnostics.data?.project}</span>
+      </Link>
+      <SearchButton />
+      <Nav onGo={onGo} />
+      <div className="wb-side-foot">
+        <Link href="/engine" className="wb-health" onClick={onGo}>
+          <StatusPill status={healthStatus(health.data)} quiet />
+        </Link>
+        <span className="grow" />
+        <LookMenu />
+      </div>
+    </>
   )
   return (
     <div className="wb">
-      <aside className="wb-side">
-        {brand}
-        <Nav />
-        <div className="wb-side-foot">
-          <Link href="/engine" className="wb-health">
-            <StatusPill status={healthStatus(health.data)} />
-          </Link>
-        </div>
-      </aside>
+      <aside className="wb-side">{side()}</aside>
       <div className="wb-main">
         <header className="wb-top">
           <span className="wb-menu">
             <IconButton label="Open the menu" onClick={() => setMenu(true)}>
-              <MenuIcon size={17} />
+              <MenuIcon size={16} />
             </IconButton>
           </span>
-          <SearchButton />
+          <Crumbs />
           <span className="grow" />
-          <LookMenu />
           <StartRunButton />
         </header>
         <main className="wb-page">{children}</main>
       </div>
-      <Sheet open={menu} onOpenChange={setMenu} title="Solera" side="left">
-        <Nav onGo={() => setMenu(false)} />
+      <Sheet open={menu} onOpenChange={setMenu} title="Menu" side="left">
+        <div className="wb-side wb-side-sheet">{side(() => setMenu(false))}</div>
       </Sheet>
     </div>
   )
 }
 
-function Page({ title, mono, subtitle, actions, children }: { title: ReactNode; mono?: boolean; subtitle?: ReactNode; actions?: ReactNode; children: ReactNode }) {
+type PageProps = { title?: ReactNode; badge?: ReactNode; meta?: ReactNode; actions?: ReactNode; children: ReactNode }
+
+/** A page under the top bar. With a `title` it is about one thing and opens with a header: the name, its state, what can be done to it. */
+function Page({ title, badge, meta, actions, children }: PageProps) {
   return (
     <>
-      <header className="wb-head">
-        <div className="grow">
-          <h1 className={mono ? "wb-title mono" : "wb-title display"}>{title}</h1>
-          {subtitle && <p className="muted wb-subtitle">{subtitle}</p>}
-        </div>
-        {actions}
-      </header>
-      <div className="stack wb-body">{children}</div>
+      {title && (
+        <header className="wb-head">
+          <div className="wb-head-text">
+            <div className="row wrap">
+              <h1 className="wb-title">{title}</h1>
+              {badge}
+            </div>
+            {meta && <p className="muted wb-meta">{meta}</p>}
+          </div>
+          {actions}
+        </header>
+      )}
+      <div className="wb-body" data-headed={title ? "" : undefined}>
+        {children}
+      </div>
     </>
   )
 }
 
-function Stat({ label, value, note, tone, href }: { label: string; value: ReactNode; note?: ReactNode; tone?: string; href: string }) {
-  return (
-    <Link href={href} className="panel stat" data-tone={tone}>
-      <span className="label">{label}</span>
-      <span className="stat-value display">{value}</span>
-      <span className="muted truncate">{note}</span>
-    </Link>
-  )
-}
-
 function Home() {
-  const diagnostics = useDiagnostics()
-  const statuses = useStatuses()
-  const health = useHealth()
-  const failed = useRuns({ status: ["failed"], since: Math.floor(Date.now() / 3600000) * 3600 - 3600 }, 1, 10000)
-  const next = useUpcoming()[0]
+  const { concerns } = useAttention()
   const [window, setWindow] = useParam("window", "900")
-  const [picked, setPicked] = useState<string | null>(null)
-  const all = Object.values(statuses.data?.assets ?? {})
-  const fine = all.filter((s) => assetStatus(s).tone === "ok").length
-  const now = Date.now() / 1000
   return (
-    <Page title={diagnostics.data?.project ?? "Project"} mono subtitle={`The engine is ${healthStatus(health.data).label.toLowerCase()}, on deploy ${diagnostics.data?.deploy_number ?? "–"}.`}>
-      <div className="stats">
-        <Stat label="Assets up to date" value={<>{fine}<span className="stat-of"> of {all.length}</span></>} note={fine === all.length ? "Nothing is stale or failing" : `${all.length - fine} need a look`} tone={fine === all.length ? "ok" : "stale"} href="/assets" />
-        <Stat label="Running now" value={diagnostics.data?.active_runs ?? "–"} note={`${diagnostics.data?.inflight ?? 0} attempts in flight`} tone="running" href="/runs?status=running,queued" />
-        <Stat label="Failed in the last hour" value={failed.data ? count(failed.data.total) : "–"} note={failed.data?.runs[0]?.error ?? "No run failed"} tone={failed.data?.total ? "failed" : "ok"} href="/runs?status=failed" />
-        <Stat label="Next to start" value={next ? until(next.at, now).replace("in ", "") : "–"} note={next ? next.targets.join(", ") : "Nothing is scheduled"} href="/automations" />
-      </div>
-      <div className="wb-split">
-        <Panel title="What ran, and what runs next" actions={<WindowPicker value={Number(window)} onChange={(s) => setWindow(String(s))} />} flush>
-          <ProjectTimeline window={Number(window)} selected={picked} onSelect={setPicked} maxHeight="62dvh" />
-          {picked && (
-            <div className="panel-body wb-peek">
-              <AssetPeek id={picked} />
-            </div>
-          )}
+    <Page>
+      <Summary />
+      {concerns.length > 0 && (
+        <Panel title="Needs attention" count={concerns.length} flush>
+          <Attention limit={6} />
         </Panel>
-        <div className="stack">
-          <Panel title="Needs attention">
-            <Attention limit={8} />
-          </Panel>
-          <Panel title="Coming next">
-            <Upcoming />
-          </Panel>
-        </div>
-      </div>
-      <Panel title="Latest runs" actions={<Link href="/runs" className="link muted">All runs</Link>} flush>
-        <RunsTable filter={{}} limit={8} />
+      )}
+      <Panel
+        title="Assets"
+        actions={
+          <>
+            <StripLegend />
+            <WindowPicker value={Number(window)} onChange={(seconds) => setWindow(String(seconds))} />
+          </>
+        }
+        flush
+      >
+        <AssetActivity window={Number(window)} />
+      </Panel>
+      <Panel title="Recent runs" actions={<Link href="/runs" className="link muted">All runs</Link>} flush>
+        <RunsTable filter={{}} limit={6} brief />
       </Panel>
     </Page>
   )
@@ -150,14 +163,14 @@ function Home() {
 function Runs() {
   const filters = useRunsFilter()
   return (
-    <Page title="Runs" subtitle="Every request to bring assets up to date, newest first." actions={<StartRunButton />}>
-      <RunsFilters {...filters} />
-      <Panel flush>
-        <div className="panel-body">
-          <RunHistogram filter={filters.filter} />
-        </div>
-        <RunsTable filter={filters.filter} />
-      </Panel>
+    <Page>
+      <div className="toolbar">
+        <RunsFilters {...filters} />
+      </div>
+      <div className="wb-chart">
+        <RunHistogram filter={filters.filter} />
+      </div>
+      <RunsTable filter={filters.filter} />
     </Page>
   )
 }
@@ -174,28 +187,29 @@ function RunPage({ detail }: { detail: RunDetail }) {
   const [picked, setPicked] = useParam("at")
   const run = detail.request
   return (
-    <Page
-      mono
-      title={runTitle(run)}
-      subtitle={
-        <span className="row wrap">
-          <StatusPill status={runStatus(run.paused ? "paused" : run.status)} />
-          <span>{runSentence(run, view)}</span>
-        </span>
-      }
-      actions={<RunActions run={run} />}
-    >
-      <div className="wb-split" data-wide="">
+    <Page title={runTitle(run)} badge={<StatusPill status={runStatus(run.paused ? "paused" : run.status)} />} meta={runSentence(run, view)} actions={<RunActions run={run} />}>
+      <div className="wb-split">
         <Panel title="Timeline" actions={<TroubleFilter view={view} />} flush>
           {detail.tasks.length ? (
-            <RunTimeline view={view} selected={picked || null} onSelect={setPicked} maxHeight="70dvh" />
+            <RunTimeline view={view} selected={picked || null} onSelect={setPicked} maxHeight="var(--tl-max, 70dvh)" />
           ) : (
             <Empty title="This run has no tasks">{run.source ? "A commit to a source is recorded as a run so that it shows in history." : "Nothing was owed."}</Empty>
           )}
         </Panel>
-        <Panel title={picked ? "Picked step" : "About this run"}>
-          <RunInspector detail={detail} picked={picked || null} />
-        </Panel>
+        <aside className="wb-aside" aria-label="Details">
+          <Panel
+            title={picked ? "Step" : "Run"}
+            actions={
+              picked && (
+                <IconButton label="Back to the run" size="s" onClick={() => setPicked(null)}>
+                  <X size={14} />
+                </IconButton>
+              )
+            }
+          >
+            <RunInspector detail={detail} picked={picked || null} />
+          </Panel>
+        </aside>
       </div>
     </Page>
   )
@@ -205,26 +219,15 @@ function Assets() {
   const [filter, setFilter] = useState("")
   const manifest = useManifest()
   return (
-    <Page title="Assets" subtitle="Everything the project builds, and the sources it reads.">
-      <div className="filters row">
+    <Page>
+      <div className="toolbar">
         <div className="search">
           <TextField label="Filter assets" hideLabel placeholder="Filter by name" value={filter} onChange={setFilter} />
         </div>
       </div>
-      <Panel flush>
-        <AssetsTable filter={filter} />
-      </Panel>
-      <Panel title="Sources">
-        <ul className="plain-list">
-          {Object.keys(manifest.data?.sources ?? {}).map((name) => (
-            <li key={name} className="row">
-              <Link href={`/sources/${encodeURIComponent(name)}`} className="mono link">
-                <strong>{name}</strong>
-              </Link>
-              <span className="muted">Data that lives outside. Commit to it to say it changed.</span>
-            </li>
-          ))}
-        </ul>
+      <AssetsTable filter={filter} />
+      <Panel title="Sources" count={Object.keys(manifest.data?.sources ?? {}).length} flush>
+        <SourcesTable />
       </Panel>
     </Page>
   )
@@ -235,26 +238,26 @@ function Asset({ name }: { name: string }) {
   const statuses = useStatuses()
   const [tab, setTab] = useParam("tab", "overview")
   const [window, setWindow] = useParam("window", "900")
-  if (!manifest.data) return <Page title={name} mono><Loading /></Page>
+  if (!manifest.data) return <Page title={name}><Loading /></Page>
   const spec = manifest.data.assets[name]
-  if (!spec) return <Page title={name} mono><Empty title="No asset has that name" /></Page>
+  if (!spec) return <Page title={name}><Empty title="No asset has that name" /></Page>
   const status = statuses.data?.assets[name]
   const perKey = status?.stored_counts !== null && status?.stored_counts !== undefined
   const overview = (
-    <div className="stack">
-      <AssetState name={name} />
-      <Panel title="Lately" actions={<WindowPicker value={Number(window)} onChange={(s) => setWindow(String(s))} />} flush>
-        <AssetTimeline asset={name} window={Number(window)} maxHeight="46dvh" />
+    <>
+      <AssetState name={name} bare />
+      <Panel title="Activity" actions={<><StripLegend /><WindowPicker value={Number(window)} onChange={(seconds) => setWindow(String(seconds))} /></>} flush>
+        <PartitionActivity asset={name} window={Number(window)} />
       </Panel>
       {status?.partitioned && (
-        <Panel title="Partitions">
+        <Panel title="Partitions" count={status.partitions.total}>
           <PartitionGrid name={name} />
         </Panel>
       )}
-    </div>
+    </>
   )
   return (
-    <Page title={name} mono subtitle={firstLine(spec.doc)} actions={<AssetActions name={name} />}>
+    <Page title={name} badge={<StatusPill status={assetStatus(status)} />} meta={firstLine(spec.doc)} actions={<AssetActions name={name} />}>
       <Tabs
         label="Sections of this asset"
         value={tab}
@@ -262,8 +265,8 @@ function Asset({ name }: { name: string }) {
         tabs={[
           { value: "overview", label: "Overview", content: overview },
           ...(perKey ? [{ value: "keys", label: "Keys", content: <KeysPanel name={name} /> }] : []),
-          { value: "history", label: "What it wrote", content: <Panel flush><CommitsTable name={name} /></Panel> },
-          { value: "definition", label: "How it is declared", content: <Panel><Definition name={name} /></Panel> },
+          { value: "history", label: "History", content: <CommitsTable name={name} /> },
+          { value: "definition", label: "Definition", content: <div className="panel-body wb-lead wb-prose"><Definition name={name} /></div> },
         ]}
       />
     </Page>
@@ -272,22 +275,24 @@ function Asset({ name }: { name: string }) {
 
 function Source({ name }: { name: string }) {
   return (
-    <Page title={name} mono subtitle="A source: data that lives outside the project.">
-      <div className="wb-split" data-even="">
-        <Panel title="About">
-          <SourceFacts name={name} />
-        </Panel>
-        <Panel title="Say it changed">
-          <SourceCommitForm name={name} />
-        </Panel>
-      </div>
-      <div className="wb-split" data-even="">
-        <Panel title="Keys it holds">
-          <SourceKeys name={name} />
-        </Panel>
-        <Panel title="Recent commits">
-          <SourceCommits name={name} />
-        </Panel>
+    <Page title={name} meta="A source: data that lives outside the project. The engine knows it at versions.">
+      <div className="wb-split">
+        <div>
+          <Panel title="About">
+            <SourceFacts name={name} />
+          </Panel>
+          <Panel title="Keys">
+            <SourceKeys name={name} />
+          </Panel>
+          <Panel title="Recent commits">
+            <SourceCommits name={name} />
+          </Panel>
+        </div>
+        <aside className="wb-aside" aria-label="Commit a change">
+          <Panel title="Commit a change">
+            <SourceCommitForm name={name} />
+          </Panel>
+        </aside>
       </div>
     </Page>
   )
@@ -295,7 +300,7 @@ function Source({ name }: { name: string }) {
 
 function Automations() {
   return (
-    <Page title="Automations" subtitle="What starts runs without anyone asking.">
+    <Page>
       <Panel title="Automations" flush>
         <AutomationsTable />
       </Panel>
@@ -308,11 +313,11 @@ function Automations() {
 
 function Sensor({ name }: { name: string }) {
   return (
-    <Page title={name} mono subtitle="A sensor: a check that runs every few seconds and may commit to a source.">
+    <Page title={name} meta="A sensor: a check that runs every few seconds and may commit to a source.">
       <Panel title="About">
         <SensorFacts name={name} />
       </Panel>
-      <Panel title="Its checks" flush>
+      <Panel title="Checks" flush>
         <TicksTable name={name} />
       </Panel>
     </Page>
@@ -321,11 +326,11 @@ function Sensor({ name }: { name: string }) {
 
 function Engine() {
   return (
-    <Page title="Engine" subtitle="The server that plans runs, and the places attempts run.">
+    <Page>
       <Panel title="State">
         <EngineFacts />
       </Panel>
-      <Panel title="Executors and workers" flush>
+      <Panel title="Executors" flush>
         <ExecutorsTable />
       </Panel>
       <Panel title="Cleanups" flush>
@@ -339,15 +344,13 @@ function Engine() {
 }
 
 const Keys = () => (
-  <Page title="Find a key" subtitle="What happened to one file, upload or row.">
-    <Panel>
-      <KeyLookup />
-    </Panel>
+  <Page>
+    <KeyLookup />
   </Page>
 )
 
 const Settings = () => (
-  <Page title="Settings" subtitle="How the console looks. Kept in this browser.">
+  <Page>
     <LookSettings />
   </Page>
 )

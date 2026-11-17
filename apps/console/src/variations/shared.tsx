@@ -4,25 +4,24 @@ import { useSyncExternalStore, type ComponentType, type ReactNode } from "react"
 import { useLocation } from "wouter"
 import { useManifest, useRuns } from "../api/queries"
 import { shortId } from "../model/format"
-import { AssetActions, AssetState, firstLine } from "../blocks/assets"
+import { firstLine } from "../blocks/assets"
 import { runWhat } from "../blocks/runs"
 import { openStartRun } from "../blocks/start-run"
 import { setLook, themes, useLook, VARIATIONS } from "../theme/store"
 import { Button } from "../ui/controls"
 import { Palette, type Command_ } from "../ui/overlays"
-import { Link } from "wouter"
 
 /* What the three layouts share: the list of places, the command palette, and
  * the contract each layout fills in. */
 
 export const PLACES = [
-  { href: "/", label: "Overview", icon: LayoutDashboard },
-  { href: "/runs", label: "Runs", icon: Activity },
-  { href: "/assets", label: "Assets", icon: Boxes },
-  { href: "/automations", label: "Automations", icon: Zap },
-  { href: "/keys", label: "Find a key", icon: KeyRound },
-  { href: "/engine", label: "Engine", icon: Server },
-  { href: "/settings", label: "Settings", icon: Cog },
+  { href: "/", label: "Overview", icon: LayoutDashboard, group: "project" },
+  { href: "/runs", label: "Runs", icon: Activity, group: "project" },
+  { href: "/assets", label: "Assets", icon: Boxes, group: "project" },
+  { href: "/automations", label: "Automations", icon: Zap, group: "project" },
+  { href: "/keys", label: "Find a key", icon: KeyRound, group: "project" },
+  { href: "/engine", label: "Engine", icon: Server, group: "system" },
+  { href: "/settings", label: "Settings", icon: Cog, group: "system" },
 ] as const
 
 /** True for the place a path belongs to: /runs/abc is under Runs, /sources/x under Assets. */
@@ -91,7 +90,7 @@ export function SearchButton({ compact }: { compact?: boolean }) {
   return (
     <button className="search-button" onClick={() => openPalette()} aria-label="Search and commands">
       <Search size={14} aria-hidden="true" />
-      {!compact && <span className="grow">Search or jump to</span>}
+      {!compact && <span className="grow">Search</span>}
       <kbd className="kbd">⌘K</kbd>
     </button>
   )
@@ -99,41 +98,19 @@ export function SearchButton({ compact }: { compact?: boolean }) {
 
 export function StartRunButton({ size = "m" }: { size?: "s" | "m" }) {
   return (
-    <Button variant="primary" size={size} icon={<Play size={14} />} onClick={() => openStartRun()}>
+    <Button variant="primary" size={size} icon={<Play size={13} />} onClick={() => openStartRun()}>
       Start a run
     </Button>
   )
 }
 
-/** A quick look at one asset, where a layout shows what is picked on the project chart. */
-export function AssetPeek({ id }: { id: string }) {
-  const manifest = useManifest()
-  const name = id.startsWith("part:") ? id.slice(5).split("|")[0]! : id
-  const partition = id.startsWith("part:") ? id.slice(5).split("|").slice(1).join("|") : null
-  if (manifest.data?.sources[name])
-    return (
-      <div className="stack">
-        <h3 className="inspector-title mono">{name}</h3>
-        <p className="muted">A source: data that lives outside, which the engine knows at versions.</p>
-        <Link href={`/sources/${encodeURIComponent(name)}`} className="link">Open the source</Link>
-      </div>
-    )
-  const spec = manifest.data?.assets[name]
-  if (!spec) return null
+/** The mark of the console: staggered bars, as on a timeline. */
+export function Logo({ size = 18 }: { size?: number }) {
   return (
-    <div className="stack">
-      <div>
-        <h3 className="inspector-title mono">
-          {name}
-          {partition && <span className="muted"> {partition}</span>}
-        </h3>
-        <p className="muted">{firstLine(spec.doc)}</p>
-      </div>
-      <AssetState name={name} />
-      <div className="row wrap">
-        <AssetActions name={name} size="s" />
-        <Link href={`/assets/${encodeURIComponent(name)}`} className="link">Open the asset</Link>
-      </div>
-    </div>
+    <svg className="logo" width={size} height={size} viewBox="0 0 18 18" aria-hidden="true">
+      <rect x="2" y="3.5" width="8" height="2.6" rx="1.3" />
+      <rect x="6" y="7.7" width="10" height="2.6" rx="1.3" />
+      <rect x="3" y="11.9" width="7" height="2.6" rx="1.3" />
+    </svg>
   )
 }

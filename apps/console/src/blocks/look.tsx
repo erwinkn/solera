@@ -14,7 +14,7 @@ import { Notice, Panel } from "./atoms"
  * remembered in the browser and change at once, without a reload. */
 
 /** The quick switch every layout carries, so the nine combinations are two clicks apart. */
-export function LookMenu({ label = "Look" }: { label?: string }) {
+export function LookMenu({ label = "" }: { label?: string }) {
   const look = useLook()
   const [, navigate] = useLocation()
   return (
@@ -22,7 +22,7 @@ export function LookMenu({ label = "Look" }: { label?: string }) {
       <MenuTrigger render={<Button variant="quiet" icon={<PaletteIcon size={15} />} aria-label="Change the layout or the theme" />}>{label}</MenuTrigger>
       <MenuContent className="popup menu look-menu" align="end" sideOffset={6}>
         <MenuGroup>
-          <MenuGroupLabel className="label palette-group">Layout</MenuGroupLabel>
+          <MenuGroupLabel className="menu-label">Layout</MenuGroupLabel>
           <MenuRadioGroup value={look.variation} onValueChange={(value) => setLook({ variation: value as VariationId })}>
             {VARIATIONS.map((v) => (
               <MenuRadioItem key={v.id} value={v.id} className="menu-item" closeOnSelect={false}>
@@ -39,7 +39,7 @@ export function LookMenu({ label = "Look" }: { label?: string }) {
         </MenuGroup>
         <MenuSeparator className="menu-separator" />
         <MenuGroup>
-          <MenuGroupLabel className="label palette-group">Theme</MenuGroupLabel>
+          <MenuGroupLabel className="menu-label">Theme</MenuGroupLabel>
           <MenuRadioGroup value={currentTheme(look).id} onValueChange={(value) => setLook({ theme: value })}>
             {themes(look).map((theme) => (
               <MenuRadioItem key={theme.id} value={theme.id} className="menu-item" closeOnSelect={false}>
@@ -57,7 +57,7 @@ export function LookMenu({ label = "Look" }: { label?: string }) {
         </MenuGroup>
         <MenuSeparator className="menu-separator" />
         <MenuItem className="menu-item" onSelect={() => navigate("/settings")}>
-          Make your own theme
+          Make a theme
         </MenuItem>
       </MenuContent>
     </Menu>
@@ -84,24 +84,24 @@ export function LookSettings() {
   return (
     <div className="stack settings">
       <Panel title="Layout">
-        <p className="muted settings-lead">Three takes on the same console. They show the same data and differ in how pages are put together.</p>
+        <p className="muted settings-lead">Three arrangements of the same console. They show the same data and differ in how pages are put together.</p>
         <div className="choices" role="radiogroup" aria-label="Layout">
           {VARIATIONS.map((v) => (
             <button key={v.id} role="radio" aria-checked={look.variation === v.id} className="choice" onClick={() => setLook({ variation: v.id })}>
               <Sketch variation={v.id} />
-              <strong>{v.name}</strong>
+              <span className="name">{v.name}</span>
               <span className="muted">{v.note}</span>
             </button>
           ))}
         </div>
       </Panel>
       <Panel title="Theme">
-        <p className="muted settings-lead">Colours, type, corners, spacing and motion. Any theme works with any layout.</p>
+        <p className="muted settings-lead">Colours, type, corners, spacing and motion. A theme works with every layout.</p>
         <div className="choices" role="radiogroup" aria-label="Theme">
           {themes(look).map((theme) => (
             <button key={theme.id} role="radio" aria-checked={active.id === theme.id} className="choice" onClick={() => setLook({ theme: theme.id })}>
               <Swatch theme={theme} />
-              <strong>{theme.name}</strong>
+              <span className="name">{theme.name}</span>
               <span className="muted">{theme.note}</span>
             </button>
           ))}
@@ -175,7 +175,7 @@ function CustomThemes() {
           {look.custom.map((theme) => (
             <li key={theme.id} className="row">
               <Swatch theme={resolve(theme)} />
-              <strong className="grow">{theme.name}</strong>
+              <span className="name grow">{theme.name}</span>
               <span className="muted">{Object.keys(theme.tokens).length} tokens changed</span>
               <Button size="s" onClick={() => setEditing(theme.id)}>
                 Edit

@@ -1,4 +1,4 @@
-import { Eraser, Trash2 } from "lucide-react"
+import { ChevronRight, Eraser, Trash2 } from "lucide-react"
 import { useState, type ReactNode } from "react"
 import { Link } from "wouter"
 import { useAutomations, useClearCleanups, useCleanups, useDiagnostics, useExecutors, useHealth, useManifest, usePruneRuns, useSensors, useStatuses, useWorkers, type Health } from "../api/queries"
@@ -6,7 +6,7 @@ import { partitionLabel, plural, until, when } from "../model/format"
 import { assetStatus, triggerText, type Status, type Tone } from "../model/status"
 import { Button } from "../ui/controls"
 import { confirm, Pick, report, toast } from "../ui/overlays"
-import { Ago, AssetLink, Empty, Facts, Loading, Notice, StatusPill } from "./atoms"
+import { Ago, AssetLink, Dot, Empty, Facts, Loading, StatusPill } from "./atoms"
 import { failingKeys } from "./assets"
 
 /* The engine itself: is it healthy, where do attempts run, and what needs a
@@ -43,7 +43,7 @@ export function useAttention(): { concerns: Concern[]; ready: boolean } {
   if (diagnostics.data?.last_error) out.push({ id: "error", tone: "stale", text: `The engine reports a problem in the background: ${diagnostics.data.last_error}`, href: "/engine" })
   for (const [name, status] of Object.entries(statuses.data?.assets ?? {})) {
     const s = assetStatus(status)
-    const asset = <strong className="mono">{name}</strong>
+    const asset = <span className="name">{name}</span>
     const href = `/assets/${encodeURIComponent(name)}`
     if (s.tone === "failed") out.push({ id: `failed:${name}`, tone: "failed", text: <>{asset} failed. {s.detail}.</>, href })
     else if (status.stale) out.push({ id: `stale:${name}`, tone: "stale", text: <>{asset} is stale. {s.detail}.</>, href })
@@ -54,34 +54,36 @@ export function useAttention(): { concerns: Concern[]; ready: boolean } {
   for (const executor of executors.data?.executors ?? []) {
     if (executor.kind !== "Pool" || !executor.in_flight) continue
     const polling = (workers.data?.workers ?? []).some((w) => w.pools.includes(executor.name))
-    if (!polling) out.push({ id: `pool:${executor.name}`, tone: "waiting", text: <>{plural(executor.in_flight, "task")} {executor.in_flight === 1 ? "waits" : "wait"} for a worker on the pool <strong className="mono">{executor.name}</strong>, and none is running.</>, href: "/engine" })
+    if (!polling) out.push({ id: `pool:${executor.name}`, tone: "waiting", text: <>{plural(executor.in_flight, "task")} {executor.in_flight === 1 ? "waits" : "wait"} for a worker on the pool <span className="name">{executor.name}</span>, and none is running.</>, href: "/engine" })
   }
   const stuck = diagnostics.data?.stuck_cleanups.length ?? 0
   if (stuck) out.push({ id: "cleanups", tone: "stale", text: `${plural(stuck, "cleanup")} gave up and ${stuck === 1 ? "needs" : "need"} clearing.`, href: "/engine" })
   for (const partial of diagnostics.data?.incomplete_full_runs ?? [])
-    out.push({ id: `partial:${partial.output}:${partial.partition}`, tone: "stale", text: <><strong className="mono">{partial.asset}</strong> {partitionLabel(partial.partition)} was left in the middle of a full run. Its readers wait until it runs again.</>, href: `/assets/${encodeURIComponent(partial.asset)}` })
+    out.push({ id: `partial:${partial.output}:${partial.partition}`, tone: "stale", text: <><span className="name">{partial.asset}</span> {partitionLabel(partial.partition)} was left in the middle of a full run. Its readers wait until it runs again.</>, href: `/assets/${encodeURIComponent(partial.asset)}` })
   if (manifest.data?.errors.length) out.push({ id: "manifest", tone: "failed", text: `The project has ${plural(manifest.data.errors.length, "error")} in its definition.`, href: "/engine" })
   const rank = { failed: 0, stale: 1, waiting: 2, running: 3, idle: 4, ok: 5 }
   out.sort((a, b) => rank[a.tone] - rank[b.tone])
   return { concerns: out, ready: Boolean(statuses.data && diagnostics.data) }
 }
 
+/** What needs attention, worst first, each a link to where it can be dealt with. */
 export function Attention({ limit }: { limit?: number }) {
   const { concerns, ready } = useAttention()
   if (!ready) return <Loading />
-  if (!concerns.length) return <Notice tone="ok">Everything is up to date and nothing is waiting on you.</Notice>
+  if (!concerns.length) return <p className="lines-empty muted">Everything is up to date and nothing is waiting on you.</p>
   const shown = limit ? concerns.slice(0, limit) : concerns
   return (
-    <ul className="concerns">
+    <ul className="lines">
       {shown.map((concern) => (
         <li key={concern.id}>
-          <Link href={concern.href} className="concern" data-tone={concern.tone}>
-            <span className="dot" data-tone={concern.tone} />
+          <Link href={concern.href} className="line">
+            <Dot tone={concern.tone} />
             <span className="grow">{concern.text}</span>
+            <ChevronRight size={14} className="faint" aria-hidden="true" />
           </Link>
         </li>
       ))}
-      {shown.length < concerns.length && <li className="muted">and {concerns.length - shown.length} more</li>}
+      {shown.length < concerns.length && <li className="line muted">and {concerns.length - shown.length} more</li>}
     </ul>
   )
 }
@@ -106,13 +108,15 @@ export function Upcoming({ limit = 6 }: { limit?: number }) {
   const now = Date.now() / 1000
   if (!next.length) return <Empty title="Nothing is scheduled">Automations that wait for a change start when it happens.</Empty>
   return (
-    <ul className="upcoming">
+    <ul className="lines">
       {next.slice(0, limit).map((item) => (
-        <li key={item.name} className="row">
-          <span className="num upcoming-when">{until(item.at, now)}</span>
-          <span className="grow truncate">
-            <span className="mono">{item.targets.join(", ")}</span> <span className="muted">{item.what.toLowerCase()}</span>
-          </span>
+        <li key={item.name}>
+          <Link href={item.href} className="line">
+            <span className="num upcoming-when">{until(item.at, now)}</span>
+            <span className="grow truncate">
+              <span className="name">{item.targets.join(", ")}</span> <span className="muted">{item.what.toLowerCase()}</span>
+            </span>
+          </Link>
         </li>
       ))}
     </ul>
@@ -170,7 +174,7 @@ export function ExecutorsTable() {
             const pool = executor.kind === "Pool"
             return (
               <tr key={executor.name}>
-                <td className="mono"><strong>{executor.name}</strong></td>
+                <td className="name">{executor.name}</td>
                 <td className="muted">{pool ? "Pool: workers come and take work" : executor.kind === "Local" ? "Local: processes on the server" : executor.kind}</td>
                 <td className="end num">{executor.in_flight}</td>
                 <td className="end num muted">{executor.max_concurrent ?? "None"}</td>
@@ -227,7 +231,7 @@ export function CleanupsPanel() {
             const stuck = Array.isArray(row.stuck) ? row.stuck.length : row.stuck ? 1 : 0
             return (
               <tr key={`${row.output}/${row.partition ?? row.id}/${i}`}>
-                <td className="mono"><AssetLink name={row.output} /></td>
+                <td><AssetLink name={row.output} /></td>
                 <td className="mono muted">{partitionLabel(row.partition ?? "")}</td>
                 <td>
                   {stuck ? <span className="tone" data-tone="failed">{plural(stuck, "cleanup")} gave up</span> : row.due ? `Old data goes ${when(row.due, now)}` : `${row.pending ?? 0} waiting`}

@@ -1,5 +1,6 @@
 import { keepPreviousData, queryOptions, useMutation, useQueries, useQuery, useQueryClient, type QueryKey } from "@tanstack/react-query"
 import { createContext, useContext } from "react"
+import { CELLS, grid } from "../model/activity"
 import { get, post, query, request } from "./client"
 import type {
   AssetDetail,
@@ -24,6 +25,7 @@ import type {
   Sensor,
   SensorWorker,
   StaleKeys,
+  TaskHistogram,
   Tick,
   Worker,
   Head,
@@ -93,6 +95,18 @@ export const useRunFacets = (filter: RunsFilter = {}) => useLive<Facets>(["facet
 export const useRunHistogram = (filter: RunsFilter = {}, bars = 60) =>
   useLive<Histogram>(["histogram", filter, bars], `/runs:histogram${query({ ...filter, bars })}`, SLOW)
 
+/** Tasks in cells of time over the last `windowSeconds`, a series per asset, or per partition of `asset`. */
+export function useTaskHistogram(windowSeconds: number, asset?: string) {
+  const base = useBase()
+  return useQuery({
+    queryKey: [base, "task-histogram", windowSeconds, asset ?? null],
+    queryFn: ({ signal }) => get<TaskHistogram>(`${base}/tasks:histogram${query({ ...grid(windowSeconds, Date.now() / 1000), asset })}`, signal),
+    // a cell is worth redrawing a few times while it fills, not more
+    refetchInterval: Math.min(15000, Math.max(3000, (windowSeconds / CELLS) * 250)),
+    placeholderData: keepPreviousData,
+  })
+}
+
 const SETTLED = ["succeeded", "failed", "canceled", "skipped", "blocked"]
 /** Nothing more will change: the run ended and so did each of its tasks. A canceled run ends before the tasks it was running do. */
 const isSettled = (detail: RunDetail) => SETTLED.includes(detail.request.status) && detail.tasks.every((task) => SETTLED.includes(task.status))
@@ -110,27 +124,6 @@ export function useRun(id: string) {
   const base = useBase()
   return useQuery({ ...runQuery(base, id, 1000), placeholderData: keepPreviousData })
 }
-
-export type LiveTask = { status: string; since: number | null }
-
-/** What each task in progress is doing right now, by task id. The list of
- * tasks cannot tell a task that runs from one that waits for a worker, and
- * does not know when its attempt began; the runs in progress do. Reads the
- * newest `MAX_LIVE_RUNS` of them. */
-export function useLiveTasks(): Map<string, LiveTask> {
-  const base = useBase()
-  const active = useRuns({ status: ["running", "queued"] }, MAX_LIVE_RUNS, 2000)
-  const details = useQueries({ queries: (active.data?.runs ?? []).map((run) => runQuery(base, run.id, 2000)) })
-  const out = new Map<string, LiveTask>()
-  for (const detail of details)
-    for (const task of detail.data?.tasks ?? []) {
-      const attempts = detail.data!.attempts[task.id] ?? []
-      const last = attempts[attempts.length - 1]
-      out.set(task.id, { status: task.status, since: last && !last.finished_at ? last.started_at : null })
-    }
-  return out
-}
-const MAX_LIVE_RUNS = 40
 
 export function useRunEvents(id: string, enabled: boolean, live: boolean) {
   return useLive<RunEvent[]>(["events", id], enabled ? `/runs/${seg(id)}/events` : null, live ? 2000 : false)

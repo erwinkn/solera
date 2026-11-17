@@ -5,8 +5,10 @@ import type { RunDetail } from "../api/types"
 import { AssetActions, AssetState, CommitsTable, Definition, failingKeys, firstLine, KeysPanel, PartitionGrid } from "../blocks/assets"
 import { Dot, Empty, Failure, Loading, StatusPill, useParam } from "../blocks/atoms"
 import { AutomationsTable, SensorFacts, SensorsTable, TicksTable } from "../blocks/automations"
-import { AssetTimeline, ProjectTimeline, RunTimeline, TroubleFilter, useRunView, WindowPicker } from "../blocks/charts"
+import { PartitionActivity, WindowPicker } from "../blocks/activity"
+import { RunTimeline, TroubleFilter, useRunView } from "../blocks/charts"
 import { Attention, CleanupsPanel, EngineFacts, ExecutorsTable, healthStatus, PruneRuns, Upcoming, useAttention } from "../blocks/engine"
+import { AssetActivity } from "../blocks/home"
 import { KeyLookup } from "../blocks/keys"
 import { LookMenu, LookSettings } from "../blocks/look"
 import { RunActions, RunInspector, runSentence, runTitle } from "../blocks/run"
@@ -15,7 +17,8 @@ import { SourceCommitForm, SourceCommits, SourceFacts, SourceKeys } from "../blo
 import { clock, count, duration, longDate, plural } from "../model/format"
 import { assetStatus, origin, runStatus } from "../model/status"
 import { parseRowId } from "../timeline/run"
-import { AssetPeek, isCurrent, PLACES, SearchButton, StartRunButton, type Layout } from "./shared"
+import { MarkIcon } from "../ui/status"
+import { isCurrent, PLACES, SearchButton, StartRunButton, type Layout } from "./shared"
 
 /* Briefing: one column that reads top to bottom like a status report. A
  * headline says how things are, sentences say why, and the charts sit in the
@@ -27,8 +30,8 @@ function Shell({ children }: { children: ReactNode }) {
   return (
     <div className="br">
       <header className="br-top">
-        <Link href="/" className="br-brand display">
-          Solera <span className="mono muted">{diagnostics.data?.project}</span>
+        <Link href="/" className="br-brand">
+          <span className="brand">Solera</span> <span className="muted">{diagnostics.data?.project}</span>
         </Link>
         <nav className="br-nav" aria-label="Places">
           {PLACES.map((place) => (
@@ -39,7 +42,7 @@ function Shell({ children }: { children: ReactNode }) {
         </nav>
         <span className="grow" />
         <SearchButton compact />
-        <LookMenu label="" />
+        <LookMenu />
         <StartRunButton size="s" />
       </header>
       <main className="br-page">{children}</main>
@@ -47,12 +50,12 @@ function Shell({ children }: { children: ReactNode }) {
   )
 }
 
-function Article({ kicker, title, mono, lead, actions, children }: { kicker?: ReactNode; title: ReactNode; mono?: boolean; lead?: ReactNode; actions?: ReactNode; children: ReactNode }) {
+function Article({ kicker, title, lead, actions, children }: { kicker?: ReactNode; title: ReactNode; lead?: ReactNode; actions?: ReactNode; children: ReactNode }) {
   return (
     <article className="br-article">
       <header className="br-head">
         {kicker && <div className="br-kicker label">{kicker}</div>}
-        <h1 className={`br-title ${mono ? "mono" : "display"}`}>{title}</h1>
+        <h1 className="br-title">{title}</h1>
         {lead && <div className="br-lead">{lead}</div>}
         {actions && <div className="br-actions">{actions}</div>}
       </header>
@@ -65,7 +68,7 @@ function Section({ title, aside, wide, children }: { title: string; aside?: Reac
   return (
     <section className="br-section" data-wide={wide ? "" : undefined}>
       <div className="br-section-head">
-        <h2 className="display">{title}</h2>
+        <h2>{title}</h2>
         <span className="grow" />
         {aside}
       </div>
@@ -81,7 +84,6 @@ function Home() {
   const facets = useRunFacets({})
   const { concerns, ready } = useAttention()
   const [window, setWindow] = useParam("window", "900")
-  const [picked, setPicked] = useState<string | null>(null)
   const now = Date.now() / 1000
   const all = Object.values(statuses.data?.assets ?? {})
   const fine = all.filter((s) => assetStatus(s).tone === "ok").length
@@ -104,15 +106,10 @@ function Home() {
           <Attention />
         </Section>
       )}
-      <Section title="What ran, and what runs next" wide aside={<WindowPicker value={Number(window)} onChange={(s) => setWindow(String(s))} />}>
+      <Section title="Assets" wide aside={<WindowPicker value={Number(window)} onChange={(seconds) => setWindow(String(seconds))} />}>
         <div className="br-chart">
-          <ProjectTimeline window={Number(window)} selected={picked} onSelect={setPicked} maxHeight="64dvh" />
+          <AssetActivity window={Number(window)} />
         </div>
-        {picked && (
-          <div className="br-picked">
-            <AssetPeek id={picked} />
-          </div>
-        )}
       </Section>
       <Section title="Coming next">
         <Upcoming limit={6} />
@@ -143,7 +140,7 @@ function RunsLog({ filter }: { filter: ReturnType<typeof useRunsFilter>["filter"
               <span className="num faint">{clock(run.created_at)}</span>
               <Dot tone={runStatus(run.status).tone} />
               <span className="grow">
-                <strong className="mono">{runWhat(run)}</strong> <span className="mono muted">{runWhere(run)}</span>{" "}
+                <span className="name">{runWhat(run)}</span> <span className="mono muted">{runWhere(run)}</span>{" "}
                 <span className="muted">
                   {runStatus(run.status).label.toLowerCase()}
                   {run.finished_at ? ` in ${duration(run.finished_at - run.created_at)}` : ""}, {origin(run).toLowerCase()}
@@ -194,7 +191,6 @@ function RunArticle({ detail }: { detail: RunDetail }) {
     <Article
       kicker={<Link href="/runs" className="link">Runs</Link>}
       title={runTitle(run)}
-      mono
       lead={
         <p>
           <StatusPill status={runStatus(run.paused ? "paused" : run.status)} /> {runSentence(run, view)}
@@ -233,7 +229,7 @@ function Assets() {
         <Link href={`/assets/${encodeURIComponent(name)}`} className="br-log-line">
           <Dot tone={s.tone} />
           <span className="grow">
-            <strong className="mono">{name}</strong>{" "}
+            <span className="name">{name}</span>{" "}
             <span className="muted">
               {s.tone === "ok" ? firstLine(manifest.data!.assets[name]!.doc) : `${s.label}. ${s.detail}.`}
               {keys > 0 && s.tone === "ok" ? ` ${plural(keys, "key")} did not go through.` : ""}
@@ -258,9 +254,9 @@ function Assets() {
           {Object.keys(manifest.data.sources).map((name) => (
             <li key={name}>
               <Link href={`/sources/${encodeURIComponent(name)}`} className="br-log-line">
-                <span className="feed-source" />
+                <MarkIcon mark="source" />
                 <span className="grow">
-                  <strong className="mono">{name}</strong> <span className="muted">Data that lives outside the project.</span>
+                  <span className="name">{name}</span> <span className="muted">Data that lives outside the project.</span>
                 </span>
               </Link>
             </li>
@@ -275,16 +271,16 @@ function Asset({ name }: { name: string }) {
   const manifest = useManifest()
   const statuses = useStatuses()
   const [window, setWindow] = useParam("window", "900")
-  if (!manifest.data) return <Article title={name} mono><Loading /></Article>
+  if (!manifest.data) return <Article title={name}><Loading /></Article>
   const spec = manifest.data.assets[name]
-  if (!spec) return <Article title={name} mono><Empty title="No asset has that name" /></Article>
+  if (!spec) return <Article title={name}><Empty title="No asset has that name" /></Article>
   const status = statuses.data?.assets[name]
   const perKey = status?.stored_counts !== null && status?.stored_counts !== undefined
   return (
-    <Article kicker={<Link href="/assets" className="link">Assets</Link>} title={name} mono lead={<AssetState name={name} />} actions={<AssetActions name={name} />}>
+    <Article kicker={<Link href="/assets" className="link">Assets</Link>} title={name} lead={<AssetState name={name} />} actions={<AssetActions name={name} />}>
       <Section title="Lately" wide aside={<WindowPicker value={Number(window)} onChange={(s) => setWindow(String(s))} />}>
         <div className="br-chart">
-          <AssetTimeline asset={name} window={Number(window)} maxHeight="44dvh" />
+          <PartitionActivity asset={name} window={Number(window)} />
         </div>
       </Section>
       {status?.partitioned && (
@@ -309,7 +305,7 @@ function Asset({ name }: { name: string }) {
 
 function Source({ name }: { name: string }) {
   return (
-    <Article kicker={<Link href="/assets" className="link">Assets</Link>} title={name} mono lead={<p>A source: data that lives outside the project. The engine knows it at versions.</p>}>
+    <Article kicker={<Link href="/assets" className="link">Assets</Link>} title={name} lead={<p>A source: data that lives outside the project. The engine knows it at versions.</p>}>
       <Section title="About">
         <SourceFacts name={name} />
       </Section>
@@ -341,7 +337,7 @@ const Automations = () => (
 )
 
 const Sensor = ({ name }: { name: string }) => (
-  <Article kicker={<Link href="/automations" className="link">Automations</Link>} title={name} mono lead={<p>A sensor: a check that runs every few seconds and may commit to a source.</p>}>
+  <Article kicker={<Link href="/automations" className="link">Automations</Link>} title={name} lead={<p>A sensor: a check that runs every few seconds and may commit to a source.</p>}>
     <Section title="About">
       <SensorFacts name={name} />
     </Section>

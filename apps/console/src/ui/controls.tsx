@@ -9,7 +9,7 @@ import { Tabs as SdkTabs, TabsIndicator, TabsList, TabsPanel, TabsTab } from "@u
 import { Textarea } from "@ui-sdk/react/textarea"
 import { Tooltip, TooltipContent, TooltipTrigger } from "@ui-sdk/react/tooltip"
 import { Check, ChevronRight } from "lucide-react"
-import type { ComponentProps, ReactElement, ReactNode } from "react"
+import { useState, type ComponentProps, type CSSProperties, type ReactElement, type ReactNode } from "react"
 
 /* The console's controls. Behaviour (keyboard, focus, ARIA) comes from the
  * UI SDK's parts; the look comes from ui.css, which reads only theme tokens. */
@@ -43,6 +43,25 @@ export function Tip({ text, children, side = "top" }: { text: ReactNode; childre
       </TooltipContent>
     </Tooltip>
   )
+}
+
+/** One hint shared by the many small marks of a chart, where a tooltip for
+ * each would be hundreds of them. Call `over` as the pointer enters a mark and
+ * `out` as it leaves the chart, and render `tip` anywhere inside it. */
+export function useChartTip() {
+  const [shown, setShown] = useState<{ content: ReactNode; style: CSSProperties } | null>(null)
+  return {
+    over: (mark: Element, content: ReactNode) => {
+      const box = mark.getBoundingClientRect()
+      setShown({ content, style: { left: box.left + box.width / 2, top: box.top } })
+    },
+    out: () => setShown(null),
+    tip: shown && (
+      <div className="tip chart-tip" style={shown.style}>
+        {shown.content}
+      </div>
+    ),
+  }
 }
 
 export function IconButton({ label, children, ...props }: Omit<ButtonProps, "children" | "icon"> & { label: string; children: ReactNode }) {

@@ -1,9 +1,9 @@
 import { expect, test, type Page } from "@playwright/test"
 
 /* A small suite over the real thing: the bundle the server serves, against a
- * server running the demo project. It checks that the console loads, that
- * every place opens, that a run can be started and read on its timeline,
- * and that the layout and the theme switch and stick. */
+ * server running the demo project. It checks that the overview says how the
+ * project is doing, that every place opens, that a run can be started and
+ * read on its timeline, and that the layout and the theme switch and stick. */
 
 const problems: string[] = []
 
@@ -32,12 +32,23 @@ async function setLook(page: Page, layout: string, theme: string) {
   }
 }
 
-test("the overview shows the project and its timeline", async ({ page }) => {
-  await page.goto("/")
-  await expect(page.getByRole("heading", { level: 1 })).toHaveText("demo")
-  // every asset of the plan has a row before it has run
-  for (const asset of ["sites", "site_feed", "file_checks", "weekly_digest"]) await expect(chart(page).getByRole("row", { name: new RegExp(`^${asset}\\b`) })).toBeVisible()
-  await expect(chart(page).getByRole("columnheader", { name: "Timeline" })).toBeVisible()
+test("the overview says how every asset is doing and what it did lately", async ({ page }) => {
+  await page.goto("/?window=86400")
+  await expect(page.getByRole("heading", { level: 1 })).toHaveText("Overview")
+  await expect(page.getByText(/\d+ of \d+ up to date/)).toBeVisible()
+  // every asset has a row before it has run; sources, which do not run, have none
+  for (const asset of ["sites", "site_feed", "file_checks", "weekly_digest"]) await expect(page.getByRole("row", { name: new RegExp(`^${asset}\\b`) })).toBeVisible()
+  await expect(page.getByRole("row", { name: /^uploads\b/ })).toHaveCount(0)
+
+  // the job that runs on each deploy has run: its strip has a cell that says so and leads to the run
+  const strip = page.getByRole("img", { name: /^deploy_notice: \d+ runs?, 0 failed/ })
+  await expect(strip).toBeVisible({ timeout: 30_000 })
+  const cell = strip.locator("a").last()
+  await cell.hover()
+  await expect(page.getByText(/\d+ runs? · \d+ tasks? succeeded/)).toBeVisible()
+  await cell.click()
+  await expect(page).toHaveURL(/\/runs\/[0-9A-Z]{26}$/)
+  await expect(page.getByRole("heading", { level: 1 })).toHaveText("deploy_notice")
 })
 
 test("every place opens, by its link and by its address", async ({ page }) => {
@@ -57,8 +68,9 @@ test("every place opens, by its link and by its address", async ({ page }) => {
   // an address the server does not know is the console's to route, dots included
   await page.goto("/sensors/upload_drop")
   await expect(page.getByRole("heading", { level: 1 })).toHaveText("upload_drop")
+  await expect(page.getByRole("navigation", { name: "Where you are" }).getByRole("link", { name: "Automations" })).toBeVisible()
   await page.goto("/assets/file_checks?tab=definition")
-  await expect(page.getByRole("tab", { name: "How it is declared" })).toHaveAttribute("aria-selected", "true")
+  await expect(page.getByRole("tab", { name: "Definition" })).toHaveAttribute("aria-selected", "true")
   await expect(page.getByText("one call per changed key")).toBeVisible()
   await page.goto("/no/such/place")
   await expect(page.getByText("This address leads nowhere")).toBeVisible()
@@ -86,53 +98,61 @@ test("a run can be started, and read on its timeline", async ({ page }) => {
 
   // and the run is in the list
   await page.getByRole("navigation", { name: "Places" }).getByRole("link", { name: "Runs" }).click()
-  await expect(page.getByRole("row", { name: /deploy_notice.*Started by console/ }).first()).toBeVisible()
+  await expect(page.getByRole("row", { name: /deploy_notice.*Manual, from the console/ }).first()).toBeVisible()
 })
 
-test("the timeline works from the keyboard", async ({ page }) => {
-  await page.goto("/")
-  const row = chart(page).getByRole("row", { name: /^sites\b/ })
-  await expect(row).toBeVisible()
-  await row.focus()
+test("the timeline works from the keyboard", async ({ page, request }) => {
+  const started = await request.post("/api/projects/demo/runs", { data: { targets: ["sites", "deploy_notice"], partitions: "latest", mode: "incremental", upstream: false, by: "test" } })
+  const run = await started.json()
+  await page.goto(`/runs/${run.id}`)
+  const rows = chart(page).getByRole("row")
+  const first = rows.nth(1) // after the header row
+  await expect(first).toBeVisible()
+  await first.focus()
   await page.keyboard.press("Enter")
-  await expect(row).toHaveAttribute("aria-selected", "true")
+  await expect(first).toHaveAttribute("aria-selected", "true")
   await expect(page.getByRole("link", { name: "Open the asset" })).toBeVisible()
   await page.keyboard.press("ArrowDown")
-  await expect(chart(page).getByRole("row", { name: /^site_feed\b/ })).toBeFocused()
+  await expect(rows.nth(2)).toBeFocused()
 })
 
 test("the layout and the theme switch at once and are remembered", async ({ page }) => {
   await page.goto("/")
   const html = page.locator("html")
   await expect(html).toHaveAttribute("data-variation", "workbench")
-  const paper = await html.evaluate((element) => getComputedStyle(element).backgroundColor)
+  // nothing chosen yet: the theme follows the system, which is light in this browser
+  await expect(html).toHaveAttribute("data-theme", "light")
+  const white = await html.evaluate((element) => getComputedStyle(element).backgroundColor)
 
-  await setLook(page, "Control room", "Oloroso")
+  await setLook(page, "Control room", "Dark")
   await expect(html).toHaveAttribute("data-variation", "deck")
-  await expect(html).toHaveAttribute("data-theme", "oloroso")
+  await expect(html).toHaveAttribute("data-theme", "dark")
   await expect(page.getByRole("complementary", { name: "Assets" })).toBeVisible() // the list pane only this layout has
-  expect(await html.evaluate((element) => getComputedStyle(element).backgroundColor)).not.toBe(paper)
+  expect(await html.evaluate((element) => getComputedStyle(element).backgroundColor)).not.toBe(white)
 
   await page.reload()
   await expect(html).toHaveAttribute("data-variation", "deck")
-  await expect(html).toHaveAttribute("data-theme", "oloroso")
-  await expect(chart(page).getByRole("row", { name: /^sites\b/ })).toBeVisible()
+  await expect(html).toHaveAttribute("data-theme", "dark")
+  await expect(page.getByRole("row", { name: /^sites\b/ })).toBeVisible()
 
-  await setLook(page, "Briefing", "Tinta")
+  await setLook(page, "Briefing", "Dimmed")
   await expect(html).toHaveAttribute("data-variation", "briefing")
-  await expect(page.getByRole("heading", { name: "What ran, and what runs next" })).toBeVisible()
-  expect(await page.locator("body").evaluate((element) => getComputedStyle(element).fontFamily)).toContain("JetBrains Mono")
+  await expect(html).toHaveAttribute("data-theme", "dimmed")
+  await expect(page.getByRole("heading", { name: "Assets", level: 2 })).toBeVisible()
+  // one typeface for the interface in every theme, served by the console itself
+  expect(await page.locator("body").evaluate((element) => getComputedStyle(element).fontFamily)).toContain("Inter Variable")
+  expect(await page.evaluate(() => document.fonts.check('13px "Inter Variable"'))).toBe(true)
 })
 
 test("a custom theme is checked, applied and kept", async ({ page }) => {
   await page.goto("/settings")
   await page.getByRole("button", { name: "New theme" }).click()
   const editor = page.getByRole("textbox", { name: "Theme as JSON" })
-  await editor.fill('{"name": "Probe", "extends": "fino", "tokens": {"no-such-token": "1"}}')
+  await editor.fill('{"name": "Probe", "extends": "light", "tokens": {"no-such-token": "1"}}')
   await expect(page.getByText("No such token")).toBeVisible()
   await expect(page.getByRole("button", { name: "Save theme" })).toBeDisabled()
 
-  await editor.fill('{"name": "Probe", "extends": "fino", "tokens": {"color-bg": "rgb(1, 2, 3)"}}')
+  await editor.fill('{"name": "Probe", "extends": "light", "tokens": {"color-bg": "rgb(1, 2, 3)"}}')
   await page.getByRole("button", { name: "Save theme" }).click()
   await expect(page.locator("html")).toHaveCSS("background-color", "rgb(1, 2, 3)")
   await page.reload()

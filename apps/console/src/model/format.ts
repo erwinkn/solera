@@ -12,12 +12,10 @@ export function duration(seconds: number | null | undefined): string {
   return `${Math.floor(s / 86400)}d ${Math.round((s % 86400) / 3600)}h`
 }
 
-/** A span in coarse words: "12 seconds", "3 minutes". */
+/** A span in one coarse unit: "12s", "3m", "5h", "2d". */
 function span(seconds: number): string {
   const s = Math.abs(seconds)
-  const [n, unit] =
-    s < 60 ? [Math.round(s), "second"] : s < 3600 ? [Math.round(s / 60), "minute"] : s < 86400 ? [Math.round(s / 3600), "hour"] : [Math.round(s / 86400), "day"]
-  return `${n} ${unit}${n === 1 ? "" : "s"}`
+  return s < 60 ? `${Math.floor(s)}s` : s < 3600 ? `${Math.floor(s / 60)}m` : s < 86400 ? `${Math.floor(s / 3600)}h` : `${Math.floor(s / 86400)}d`
 }
 
 export function ago(at: number | null | undefined, now: number): string {
@@ -30,6 +28,12 @@ export function until(at: number | null | undefined, now: number): string {
   if (at === null || at === undefined) return "–"
   const s = at - now
   return s < 1 ? "now" : `in ${span(s)}`
+}
+
+/** A length of time as the unit of a rate: "minute", "5 minutes", "3 hours". */
+export function per(seconds: number): string {
+  const [n, unit] = seconds < 3600 ? [seconds / 60, "minute"] : seconds < 86400 ? [seconds / 3600, "hour"] : [seconds / 86400, "day"]
+  return n === 1 ? unit : `${n} ${unit}s`
 }
 
 const TIME = new Intl.DateTimeFormat(undefined, { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false })

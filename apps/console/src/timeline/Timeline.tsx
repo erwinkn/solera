@@ -14,8 +14,9 @@ import { ChevronRight } from "lucide-react"
 import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react"
 import { Link } from "wouter"
 import { duration as formatDuration } from "../model/format"
+import { MarkIcon, MarkShape, type Mark } from "../ui/status"
 import { mergeBars, ticks } from "./scale"
-import type { Mark, RailSpec, Row } from "./types"
+import type { RailSpec, Row } from "./types"
 
 /* The timeline graph: the plan on the left (every step, joined by the rail of
  * what reads what), what happened on the right (bars on one time axis), and a
@@ -80,12 +81,12 @@ export function Timeline({ label, rows, range, now, origin, rail, selected, onSe
   const scroller = useRef<HTMLDivElement>(null)
   const probe = useRef<HTMLDivElement>(null)
   const chart = useRef<HTMLDivElement>(null)
-  const [rowHeight, setRowHeight] = useState(32)
+  const [rowHeight, setRowHeight] = useState(28)
   const [chartWidth, setChartWidth] = useState(600)
   const [view, setView] = useState({ top: 0, height: 800 })
   useLayoutEffect(() => {
     const measure = () => {
-      if (probe.current) setRowHeight(probe.current.getBoundingClientRect().height || 32)
+      if (probe.current) setRowHeight(probe.current.getBoundingClientRect().height || 28)
       if (chart.current) setChartWidth(chart.current.getBoundingClientRect().width || 600)
       if (scroller.current) setView({ top: scroller.current.scrollTop, height: scroller.current.clientHeight })
     }
@@ -218,8 +219,8 @@ const TimelineRow = memo(function TimelineRow({ row, level, rowIndex, rail, top,
           <span className="tl-toggle" />
         )}
         {(!rail || level > 1) && <MarkIcon mark={row.mark} />}
-        <span className="tl-label">{row.name}</span>
-        {row.tag && <span className="chip" data-tone="stale">{row.tag}</span>}
+        <span className={row.code ? "tl-label mono" : "tl-label"}>{row.name}</span>
+        {row.tag && <span className="chip">{row.tag}</span>}
         {row.note && <span className="tl-note truncate">{row.note}</span>}
       </WaterfallRowHeader>
       <WaterfallCell className="tl-progress num">{row.progress ?? <span className="faint">–</span>}</WaterfallCell>
@@ -232,10 +233,6 @@ const TimelineRow = memo(function TimelineRow({ row, level, rowIndex, rail, top,
           const title = bar.count > 1 ? `${bar.count} tasks` : bar.title
           const props = { className: "tl-bar", "data-kind": bar.kind, "data-tone": bar.tone, "data-open": bar.end === null ? "" : undefined, "data-loud": bar.loud ? "" : undefined, style, title }
           return bar.href ? <Link key={bar.key} href={bar.href} tabIndex={-1} aria-label={title} {...props} /> : <span key={bar.key} {...props} />
-        })}
-        {row.planned?.map((plan) => {
-          const where = left(plan.at)
-          return where >= 0 && where <= 100 ? <span key={plan.at} className="tl-planned" style={{ left: `${where}%` }} title={plan.title} /> : null
         })}
       </WaterfallBar>
       {/* A plain grid cell: the Waterfall keys its cell part by row, so a second one in a row warns. Its arrow keys still reach this one, since they walk the row's gridcells. */}
@@ -280,53 +277,12 @@ function RailCell({ rail, id, top, height, mark }: { rail: RailSpec; id: string 
         <g className="tl-rail-lines">{lines}</g>
         {id !== null && (
           <g transform={`translate(${x(own.lane) - 7} ${mid - 7})`}>
+            <circle className="tl-mark-plate" cx={7} cy={7} r={6} />
             <MarkShape mark={mark} />
           </g>
         )}
       </svg>
     </span>
-  )
-}
-
-export function MarkIcon({ mark }: { mark: Mark }) {
-  return (
-    <svg className="tl-mark-icon" width={14} height={14} aria-hidden="true">
-      <MarkShape mark={mark} />
-    </svg>
-  )
-}
-
-/** A 14×14 marker. Solid: finished. Ring: running. Outline: not started. */
-function MarkShape({ mark }: { mark: Mark }) {
-  if (mark === "none") return null
-  return (
-    <g className="tl-mark" data-mark={mark}>
-      <circle className="tl-mark-plate" cx={7} cy={7} r={6.5} />
-      {mark === "source" ? (
-        <rect x={3.4} y={3.4} width={7.2} height={7.2} transform="rotate(45 7 7)" className="tl-mark-outline" />
-      ) : mark === "running" ? (
-        <circle cx={7} cy={7} r={4.2} className="tl-mark-ring" pathLength={100} />
-      ) : mark === "done" || mark === "failed" ? (
-        <circle cx={7} cy={7} r={4} className="tl-mark-solid" />
-      ) : mark === "stale" ? (
-        <>
-          <circle cx={7} cy={7} r={3.6} className="tl-mark-outline" />
-          <path d="M7 3.4a3.6 3.6 0 0 0 0 7.2z" className="tl-mark-solid" />
-        </>
-      ) : mark === "waiting" ? (
-        <>
-          <circle cx={7} cy={7} r={3.6} className="tl-mark-outline" />
-          <circle cx={7} cy={7} r={1.3} className="tl-mark-solid" />
-        </>
-      ) : mark === "skipped" ? (
-        <>
-          <circle cx={7} cy={7} r={3.6} className="tl-mark-outline" />
-          <path d="M4.6 9.4l4.8-4.8" className="tl-mark-outline" />
-        </>
-      ) : (
-        <circle cx={7} cy={7} r={3.6} className="tl-mark-outline" />
-      )}
-    </g>
   )
 }
 

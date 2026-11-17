@@ -5,7 +5,7 @@ import { duration, partitionLabel } from "../model/format"
 import { keyStatus } from "../model/status"
 import { Button, TextField } from "../ui/controls"
 import { Pick } from "../ui/overlays"
-import { Ago, AssetLink, Empty, Facts, Failure, Loading, Notice, RunLink, StatusPill, useParam } from "./atoms"
+import { Ago, AssetLink, Empty, Facts, Failure, Loading, Notice, Panel, RunLink, StatusPill, useParam } from "./atoms"
 
 /* "What happened to this one file?" Pick a per-key asset and a key: its
  * outcome now, and each time a run failed on it. */
@@ -26,9 +26,9 @@ export function KeyLookup() {
   if (!manifest.data) return <Loading />
   if (!assets.length) return <Empty title="No asset works key by key">An asset called once per key keeps an outcome for each. This project has none.</Empty>
   return (
-    <div className="stack">
+    <>
       <form
-        className="row wrap filters"
+        className="toolbar"
         onSubmit={(event) => {
           event.preventDefault()
           setKey(draft.trim() || null)
@@ -43,8 +43,8 @@ export function KeyLookup() {
           Look it up
         </Button>
       </form>
-      {key ? <KeyStory asset={chosen} name={key} /> : <p className="muted">A key is one item an asset works on by itself: one file, one upload, one row.</p>}
-    </div>
+      {key ? <KeyStory asset={chosen} name={key} /> : <p className="panel-body muted">A key is one item an asset works on by itself: one file, one upload, one row.</p>}
+    </>
   )
 }
 
@@ -56,44 +56,45 @@ function KeyStory({ asset, name }: { asset: string; name: string }) {
   if (!now_.data) return <Loading />
   const rows = now_.data.keys
   return (
-    <div className="stack">
-      {!rows.length ? (
-        <Notice tone="idle">
-          <AssetLink name={asset} /> has no record of <strong className="mono">{name}</strong>. Either the asset it reads never had this key, or it was removed before it was ever processed.
-        </Notice>
-      ) : (
-        rows.map((row) => {
-          const status = keyStatus(row.outcome)
-          return (
-            <div key={row.partition} className="panel panel-body stack">
-              <div className="row wrap">
-                <strong className="mono">{row.key}</strong>
-                {row.partition && <span className="mono muted">{partitionLabel(row.partition)}</span>}
-                <StatusPill status={status} />
-                {row.owed && <span className="chip" data-tone="stale">{row.outcome === "ok" ? "changed since, due again" : "still due"}</span>}
+    <>
+      <div className="panel-body stack key-story">
+        {!rows.length ? (
+          <Notice tone="idle">
+            <AssetLink name={asset} /> has no record of <span className="mono">{name}</span>. Either the asset it reads never had this key, or it was removed before it was ever processed.
+          </Notice>
+        ) : (
+          rows.map((row) => {
+            const status = keyStatus(row.outcome)
+            return (
+              <div key={row.partition} className="stack">
+                <div className="row wrap">
+                  <span className="mono">{row.key}</span>
+                  {row.partition && <span className="mono muted">{partitionLabel(row.partition)}</span>}
+                  <StatusPill status={status} />
+                  {row.owed && <span className="chip" data-tone="stale">{row.outcome === "ok" ? "changed since, due again" : "still due"}</span>}
+                </div>
+                {row.message && <div className="error-text">{row.message}</div>}
+                <Facts
+                  rows={[
+                    ["What it means", sentence(row.outcome, row.owed)],
+                    ["Tries so far", row.tries ? String(row.tries) : null],
+                    ["Failing since", row.since ? <Ago at={row.since} now={now} /> : null],
+                    ["Next try", row.next_at ? <Ago at={row.next_at} now={now} /> : null],
+                    ["Processed at version", row.version !== null && row.version !== undefined ? <span className="mono">{String(row.version)}</span> : null],
+                  ]}
+                />
               </div>
-              {row.message && <div className="error-text">{row.message}</div>}
-              <Facts
-                rows={[
-                  ["In plain words", sentence(row.outcome, row.owed)],
-                  ["Tries so far", row.tries ? String(row.tries) : null],
-                  ["Failing since", row.since ? <Ago at={row.since} now={now} /> : null],
-                  ["Next try", row.next_at ? <Ago at={row.next_at} now={now} /> : null],
-                  ["Processed at version", row.version !== null && row.version !== undefined ? <span className="mono">{String(row.version)}</span> : null],
-                ]}
-              />
-            </div>
-          )
-        })
-      )}
-      <div>
-        <div className="label">Each time a run failed on it</div>
+            )
+          })
+        )}
+      </div>
+      <Panel title="Failures in history" flush>
         {history.error ? (
           <Failure error={history.error} />
         ) : !history.data ? (
           <Loading />
         ) : !history.data.outcomes.length ? (
-          <p className="muted">No run in history failed on this key. Calls that went fine are not listed one by one.</p>
+          <p className="panel-body muted">No run in history failed on this key. Calls that went fine are not listed one by one.</p>
         ) : (
           <div className="table-scroll">
             <table className="table">
@@ -122,8 +123,8 @@ function KeyStory({ asset, name }: { asset: string; name: string }) {
             </table>
           </div>
         )}
-      </div>
-    </div>
+      </Panel>
+    </>
   )
 }
 

@@ -3,35 +3,42 @@ import type { ReactNode } from "react"
 import { Link, useLocation, useSearch } from "wouter"
 import { ago, shortId, when } from "../model/format"
 import type { Status, Tone } from "../model/status"
+import { MarkIcon, TONE_MARK } from "../ui/status"
 
 /* Small pieces every page uses. */
 
 export function StatusPill({ status, quiet }: { status: Status; quiet?: boolean }) {
   return (
-    <span className="pill" data-quiet={quiet ? "" : undefined}>
-      <span className="dot" data-tone={status.tone} />
+    <span className="status" data-quiet={quiet ? "" : undefined}>
+      <MarkIcon mark={TONE_MARK[status.tone]} />
       {status.label}
     </span>
   )
 }
 
 export function Dot({ tone }: { tone: Tone }) {
-  return <span className="dot" data-tone={tone} />
+  return <MarkIcon mark={TONE_MARK[tone]} />
 }
 
 export const AssetLink = ({ name }: { name: string }) => (
-  <Link href={`/assets/${encodeURIComponent(name)}`} className="mono link">
+  <Link href={`/assets/${encodeURIComponent(name)}`} className="name">
+    {name}
+  </Link>
+)
+
+export const SourceLink = ({ name }: { name: string }) => (
+  <Link href={`/sources/${encodeURIComponent(name)}`} className="name">
     {name}
   </Link>
 )
 
 export const RunLink = ({ id, at }: { id: string; at?: string }) => (
-  <Link href={`/runs/${id}${at ? `?at=${encodeURIComponent(at)}` : ""}`} className="mono link">
+  <Link href={`/runs/${id}${at ? `?at=${encodeURIComponent(at)}` : ""}`} className="ref">
     {shortId(id)}
   </Link>
 )
 
-/** A moment, as "3 minutes ago", with the exact time on hover. */
+/** A moment, as "3m ago", with the exact time on hover. */
 export function Ago({ at, now }: { at: number | null | undefined; now: number }) {
   if (at === null || at === undefined) return <span className="faint">never</span>
   return (
@@ -61,12 +68,17 @@ export function Empty({ title, children }: { title: string; children?: ReactNode
   )
 }
 
-export function Panel({ title, actions, children, flush, className }: { title?: ReactNode; actions?: ReactNode; children: ReactNode; flush?: boolean; className?: string }) {
+/** A section of a page: a title with what goes beside it, then the content. `flush` content runs edge to edge, as a table does. */
+export function Panel({ title, count, actions, children, flush, className }: { title?: ReactNode; count?: ReactNode; actions?: ReactNode; children: ReactNode; flush?: boolean; className?: string }) {
   return (
     <section className={`panel ${className ?? ""}`}>
       {(title || actions) && (
         <header className="panel-head">
-          <h2 className="panel-title grow truncate">{title}</h2>
+          <h2 className="panel-title truncate">
+            {title}
+            {count !== undefined && count !== null && <span className="panel-count num">{count}</span>}
+          </h2>
+          <span className="grow" />
           {actions}
         </header>
       )}
@@ -91,11 +103,15 @@ export function Facts({ rows }: { rows: [string, ReactNode][] }) {
 }
 
 export function Loading({ what = "Loading" }: { what?: string }) {
-  return <div className="empty">{what}…</div>
+  return <div className="empty faint">{what}…</div>
 }
 
 export function Failure({ error }: { error: unknown }) {
-  return <Notice tone="failed">{(error as Error)?.message ?? "Something went wrong."}</Notice>
+  return (
+    <div className="failure">
+      <Notice tone="failed">{(error as Error)?.message ?? "Something went wrong."}</Notice>
+    </div>
+  )
 }
 
 /** One value kept in the address bar, so a view can be linked to and survives a reload. */

@@ -3,9 +3,9 @@ import { Link } from "wouter"
 import { useAutomationCommand, useAutomations, useSensors, useTicks } from "../api/queries"
 import { duration, until } from "../model/format"
 import { triggerText } from "../model/status"
-import { Button } from "../ui/controls"
+import { IconButton } from "../ui/controls"
 import { report } from "../ui/overlays"
-import { Ago, AssetLink, Empty, Facts, Failure, Loading, RunLink, StatusPill } from "./atoms"
+import { Ago, AssetLink, Empty, Facts, Failure, Loading, RunLink, SourceLink, StatusPill } from "./atoms"
 import { AutomationToggle } from "./assets"
 
 /* What starts runs by itself: automations and sensors. */
@@ -23,37 +23,39 @@ export function AutomationsTable({ dense }: { dense?: boolean }) {
       <table className="table">
         <thead>
           <tr>
-            <th>On</th>
-            <th>Brings up to date</th>
-            <th>When</th>
+            <th className="fit">On</th>
+            <th>Asset</th>
+            <th>Trigger</th>
+            {!dense && <th>Name</th>}
             {!dense && <th>Last started</th>}
-            <th className="end">Next</th>
-            <th className="end" />
+            <th className="end">Next start</th>
+            <th className="end fit" />
           </tr>
         </thead>
         <tbody>
           {rows.map((automation) => (
             <tr key={automation.name} data-off={automation.enabled ? undefined : ""}>
-              <td><AutomationToggle automation={automation} /></td>
+              <td className="fit"><AutomationToggle automation={automation} /></td>
               <td>
                 <span className="row wrap">{automation.targets.map((t) => <AssetLink key={t} name={t} />)}</span>
-                {!dense && <div className="mono faint">{automation.name}</div>}
               </td>
               <td>
-                {triggerText(automation.trigger)}
-                {automation.watched.length > 0 && <span className="muted mono"> {automation.watched.join(", ")}</span>}
+                {triggerText(automation.trigger).replace(/ \(.*\)$/, "")}
+                {automation.trigger.kind === "cron" && <span className="mono muted"> {automation.trigger.expression}</span>}
+                {automation.watched.length > 0 && <span className="muted"> {automation.watched.join(", ")}</span>}
               </td>
+              {!dense && <td className="mono faint">{automation.name}</td>}
               {!dense && (
                 <td className="muted">
-                  {automation.last_fired ? <Ago at={automation.last_fired} now={now} /> : "never"}
-                  {automation.last_run && <> · <RunLink id={automation.last_run} /></>}
+                  {automation.last_fired ? <Ago at={automation.last_fired} now={now} /> : <span className="faint">never</span>}
+                  {automation.last_run && <> <RunLink id={automation.last_run} /></>}
                 </td>
               )}
-              <td className="end num">{!automation.enabled ? <span className="faint">off</span> : automation.next_at ? until(automation.next_at, now) : <span className="faint">on change</span>}</td>
-              <td className="end">
-                <Button size="s" icon={<Play size={13} />} onClick={() => report(command.mutateAsync({ name: automation.name, command: "run-now" }), `${automation.name} started a run`)}>
-                  Run now
-                </Button>
+              <td className="end num">{!automation.enabled ? <span className="faint">off</span> : automation.next_at ? until(automation.next_at, now) : <span className="faint">{automation.trigger.kind === "ondeploy" ? "on deploy" : "on change"}</span>}</td>
+              <td className="end fit">
+                <IconButton label={`Run ${automation.name} now`} size="s" onClick={() => report(command.mutateAsync({ name: automation.name, command: "run-now" }), `${automation.name} started a run`)}>
+                  <Play size={13} />
+                </IconButton>
               </td>
             </tr>
           ))}
@@ -65,6 +67,7 @@ export function AutomationsTable({ dense }: { dense?: boolean }) {
 
 export function SensorsTable() {
   const sensors = useSensors()
+  const now = Date.now() / 1000
   if (sensors.error) return <Failure error={sensors.error} />
   if (!sensors.data) return <Loading />
   if (!sensors.data.sensors.length) return <Empty title="No sensor">A sensor checks something outside every few seconds and commits what it finds to a source.</Empty>
@@ -83,21 +86,19 @@ export function SensorsTable() {
           {sensors.data.sensors.map((sensor) => (
             <tr key={sensor.name}>
               <td>
-                <Link href={`/sensors/${encodeURIComponent(sensor.name)}`} className="mono link">
-                  <strong>{sensor.name}</strong>
+                <Link href={`/sensors/${encodeURIComponent(sensor.name)}`} className="name">
+                  {sensor.name}
                 </Link>
               </td>
               <td>Every {duration(sensor.every)}</td>
               <td>
                 <span className="row wrap">
                   {sensor.commits.map((source) => (
-                    <Link key={source} href={`/sources/${encodeURIComponent(source)}`} className="mono link">
-                      {source}
-                    </Link>
+                    <SourceLink key={source} name={source} />
                   ))}
                 </span>
               </td>
-              <td className="end num">{sensor.ticking ? "checking now" : sensor.due_in !== null ? `in ${duration(Math.max(0, sensor.due_in))}` : "–"}</td>
+              <td className="end num">{sensor.ticking ? "checking now" : sensor.due_in !== null ? until(now + sensor.due_in, now) : "–"}</td>
             </tr>
           ))}
         </tbody>
@@ -117,6 +118,7 @@ const TICK = {
 export function SensorFacts({ name }: { name: string }) {
   const sensors = useSensors()
   const sensor = sensors.data?.sensors.find((s) => s.name === name)
+  const now = Date.now() / 1000
   if (!sensors.data) return <Loading />
   if (!sensor) return <Empty title="No sensor has that name" />
   return (
@@ -125,8 +127,8 @@ export function SensorFacts({ name }: { name: string }) {
       <Facts
         rows={[
           ["Checks", `Every ${duration(sensor.every)}, with ${duration(sensor.timeout)} to answer`],
-          ["Commits to", <span className="row wrap">{sensor.commits.map((s) => <Link key={s} href={`/sources/${encodeURIComponent(s)}`} className="mono link">{s}</Link>)}</span>],
-          ["Next check", sensor.ticking ? "Checking now" : sensor.due_in !== null ? `in ${duration(Math.max(0, sensor.due_in))}` : null],
+          ["Commits to", <span className="row wrap">{sensor.commits.map((s) => <SourceLink key={s} name={s} />)}</span>],
+          ["Next check", sensor.ticking ? "Checking now" : sensor.due_in !== null ? until(now + sensor.due_in, now) : null],
           ["Remembers", sensor.cursor !== null && sensor.cursor !== undefined ? <span className="mono">{JSON.stringify(sensor.cursor)}</span> : "Nothing yet"],
         ]}
       />

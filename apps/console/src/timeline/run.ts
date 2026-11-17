@@ -3,7 +3,8 @@ import { duration, partitionLabel, plural } from "../model/format"
 import { layoutRail, projectGraph, topological } from "../model/graph"
 import { heldReason, isLive, keyStatus, taskStatus, TERMINAL_TASK, type Tone } from "../model/status"
 import { roomyEnd } from "./scale"
-import type { Bar, Mark, RailSpec, RailState, Row } from "./types"
+import type { Mark } from "../ui/status"
+import type { Bar, RailSpec, RailState, Row } from "./types"
 
 /* A run as a chart. The plan is its tasks, grouped by asset and joined by what
  * reads what; the outcome is each task's attempts on the time axis. Batches
@@ -117,6 +118,7 @@ function keyRows(task: Task, attempt: Attempt, result: AttemptResult | undefined
       mark: status.tone === "ok" ? "done" : status.tone === "failed" ? "failed" : status.tone === "stale" ? "stale" : "skipped",
       tone: status.tone === "failed" ? "failed" : undefined,
       name: call.key,
+      code: true,
       note: call.error ?? undefined,
       tag: call === slowest ? "slowest" : undefined,
       progress: status.label,
