@@ -1372,13 +1372,9 @@ async fn history(seed: u64, ix: &ChangeIndex) -> [usize; 7] {
             }
             12 => {
                 w.catch_up(ix).await;
-                let to = w.t.rebuild(EDGE.as_bytes()) + 1;
-                let life = w.t.per_key[EDGE.as_bytes()].life;
-                w.apply(vec![Part::Rebuild(Rebuild {
-                    edge: key(EDGE),
-                    to,
-                    life,
-                })]);
+                let part = w.t.raise_rebuild(EDGE.as_bytes()).unwrap();
+                let to = part.to;
+                w.apply(vec![Part::Rebuild(part)]);
                 w.now = Arc::new(Conditions {
                     rebuild: to,
                     ..(*w.now).clone()

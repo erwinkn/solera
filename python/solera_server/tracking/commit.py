@@ -265,13 +265,14 @@ def per_key(core: Core, task: dict, attempt: str, prepared: dict, keyed: list, f
         return None
     param, plan = found
     base = {"context": prepared.get("context"), "definition": prepared.get("definition") or ""}
+    edge = edge_id(task["asset"], task["partition"], param)
     return {
-        "edge": edge_id(task["asset"], task["partition"], param),
+        "edge": edge,
         "asset": task["asset"],
         "by": attempt,
         "input": plan["core"],
         "reported": [tuple(row) for row in failed.get(param) or ()],
-        "conditions": conditions(inputs[param], base),
+        "conditions": conditions(core, edge, inputs[param], base),
     }
 
 
