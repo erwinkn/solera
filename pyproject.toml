@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "solera"
-version = "0.0.1"
+version = "0.1.0"
 description = "Asset-first orchestration on object storage: SDK, worker, and control plane"
 readme = "README.md"
 requires-python = ">=3.12"
