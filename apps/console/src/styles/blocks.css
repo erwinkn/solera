@@ -21,7 +21,8 @@
   .key-story { gap: calc(var(--u) * 5); }
   .key-story > .stack { gap: calc(var(--u) * 2); }
   .table-foot { min-height: calc(var(--row) + var(--u) * 2); padding: var(--u) var(--gutter); border-top: var(--hairline); font-size: var(--text-s); }
-  .run-error { flex: 1 1 0; }
+  .tip:has(.tip-error) { max-width: min(560px, 90vw); }
+  .tip-error { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 8; overflow: hidden; font-family: var(--font-mono); white-space: pre-wrap; overflow-wrap: anywhere; }
   .partition-meter { justify-content: space-between; gap: calc(var(--u) * 3); min-width: calc(var(--u) * 38); }
   .partition-meter .meter { flex: 0 0 calc(var(--u) * 18); }
   .meter-rest { opacity: 0; }
