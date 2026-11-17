@@ -1,86 +1,51 @@
-import { Ban, CheckCircle2, CircleDashed, Clock3, LoaderCircle, TriangleAlert, XCircle } from "lucide-react";
-import { cn } from "@/lib/cn";
-import { label, tone, toneSoft, toneSolid, toneText, type Tone } from "@/lib/status";
+import type { Tone } from "../model/status"
 
-const ICONS = {
-  ok: CheckCircle2,
-  run: LoaderCircle,
-  wait: Clock3,
-  warn: TriangleAlert,
-  fail: XCircle,
-  idle: CircleDashed,
-} as const;
+/* The one mark the console puts beside anything that has a state: a row of a
+ * table, a step of the timeline, a line of a list. Its shape says as much as
+ * its colour, so it reads without colour too. */
 
-export function StatusIcon({
-  status,
-  tone: t,
-  className,
-}: {
-  status?: string | null;
-  tone?: Tone;
-  className?: string;
-}) {
-  const resolved = t ?? tone(status);
-  const Icon = status === "canceled" ? Ban : ICONS[resolved];
+/** Solid: finished. Ring: running. Outline: not started. */
+export type Mark = "done" | "running" | "failed" | "todo" | "waiting" | "skipped" | "stale" | "source" | "none"
+
+export const TONE_MARK: Record<Tone, Mark> = { ok: "done", running: "running", failed: "failed", stale: "stale", waiting: "waiting", idle: "todo" }
+
+export function MarkIcon({ mark }: { mark: Mark }) {
   return (
-    <Icon
-      aria-hidden
-      className={cn(
-        "size-3.5 shrink-0",
-        toneText[resolved],
-        resolved === "run" && "animate-spin [animation-duration:1.6s]",
-        className,
-      )}
-    />
-  );
+    <svg className="mark-icon" width={14} height={14} aria-hidden="true">
+      <MarkShape mark={mark} />
+    </svg>
+  )
 }
 
-/** A status as icon + word on a soft fill. Never color alone. */
-export function StatusBadge({
-  status,
-  text,
-  className,
-}: {
-  status: string | null | undefined;
-  text?: string;
-  className?: string;
-}) {
-  const t = tone(status);
+/** The mark alone, 14 by 14, for drawing inside another SVG. */
+export function MarkShape({ mark }: { mark: Mark }) {
+  if (mark === "none") return null
   return (
-    <span
-      className={cn(
-        "inline-flex h-5 items-center gap-1 rounded-full pr-2 pl-1.5 font-sans text-xs font-medium whitespace-nowrap normal-case",
-        toneSoft[t],
-        className,
+    <g className="mark" data-mark={mark}>
+      {mark === "source" ? (
+        <rect x={4} y={4} width={6} height={6} transform="rotate(45 7 7)" className="mark-outline" />
+      ) : mark === "running" ? (
+        <circle cx={7} cy={7} r={3.6} className="mark-ring" pathLength={100} />
+      ) : mark === "done" || mark === "failed" ? (
+        <circle cx={7} cy={7} r={3.5} className="mark-solid" />
+      ) : mark === "stale" ? (
+        <>
+          <circle cx={7} cy={7} r={3.1} className="mark-outline" />
+          <path d="M7 3.9a3.1 3.1 0 0 0 0 6.2z" className="mark-solid" />
+        </>
+      ) : mark === "waiting" ? (
+        <>
+          <circle cx={7} cy={7} r={3.1} className="mark-outline" />
+          <circle cx={7} cy={7} r={1.1} className="mark-solid" />
+        </>
+      ) : mark === "skipped" ? (
+        <>
+          <circle cx={7} cy={7} r={3.1} className="mark-outline" />
+          <path d="M5 9l4-4" className="mark-outline" />
+        </>
+      ) : (
+        <circle cx={7} cy={7} r={3.1} className="mark-outline" />
       )}
-    >
-      <StatusIcon status={status} tone={t} className="size-3" />
-      {text ?? label(status)}
-    </span>
-  );
-}
-
-export function StatusDot({
-  tone: t,
-  pulse,
-  className,
-  title,
-}: {
-  tone: Tone;
-  pulse?: boolean;
-  className?: string;
-  title?: string;
-}) {
-  return (
-    <span
-      title={title}
-      aria-hidden={title ? undefined : true}
-      className={cn(
-        "inline-block size-2 shrink-0 rounded-full",
-        toneSolid[t],
-        pulse && "live-glow animate-[pulse-dot_1.6s_ease-in-out_infinite]",
-        className,
-      )}
-    />
-  );
+    </g>
+  )
 }

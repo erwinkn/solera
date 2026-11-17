@@ -25,8 +25,11 @@ One distribution, `solera`, built with maturin: four Python packages under
   subprocesses and pool workers.
 - `native` — the Rust crate built into `solera._native`: the key index's
   per-key work (encoding, decoding, sorting, merging).
-- `apps/console` — the web console: React, TanStack Router and Query, Base UI,
-  and two themes over one set of design tokens (`apps/console/DESIGN.md`).
+- `apps/console` — the web console: React and Vite, TanStack Query for data,
+  wouter for routes, and Vercel's UI SDK (`@ui-sdk/react`) for the behaviour
+  of menus, dialogs, selects and the timeline's grid. It ships three
+  themes; a theme is a set of tokens, and
+  [`apps/console/THEMES.md`](apps/console/THEMES.md) says how to write one.
   The built bundle is committed, so running the server needs no Node.
 - `python/solera_server/demo.py` — the self-contained demo project
   (`uv run solera serve --insecure` loads it by default).
@@ -382,9 +385,20 @@ S3-compatible server — never an in-memory stand-in, so conditional puts
 and listings stay exercised. Postgres and S3 tests skip unless their
 variable is set.
 
-CI runs the Python suite, the Playwright suite on desktop and mobile, and a
-wheel-contents check. `uv.lock` and `pnpm-lock.yaml` are committed; installs
-are locked.
+CI runs the Rust and Python suites. The console's Playwright suite runs
+locally: it starts a server on the demo project itself, or uses the one named
+by `SOLERA_CONSOLE_URL`. `uv.lock` and `pnpm-lock.yaml` are committed;
+installs are locked.
+
+To work on the console, run a server (`uv run solera serve --insecure`, port
+8000) and the dev server beside it:
+
+```bash
+pnpm install --frozen-lockfile
+SOLERA_URL=http://127.0.0.1:8000 pnpm -C apps/console dev   # http://127.0.0.1:5193, proxies /api to the server
+pnpm -C apps/console check                                  # types, and that no component sets a value a theme owns
+pnpm -C apps/console build                                  # writes python/solera_server/web: commit it with the change
+```
 
 ## Boundaries
 

@@ -789,6 +789,9 @@ def run_where(f: RunFilter, manifest: dict, skip: str | None = None) -> tuple[st
 BUCKETS = (60, 300, 900, 3600, 3 * 3600, 6 * 3600, 12 * 3600, 86400, 7 * 86400, 30 * 86400)
 
 
+MAX_BUCKETS = 500  # of a task histogram: a console draws a few dozen
+
+
 def bucket_for(span: float, target: int = 60) -> int:
     """The smallest bucket that fits `span` seconds into `target` bars."""
 
@@ -1065,6 +1068,45 @@ class History:
             }
 
         return await self.query(work, ("runs",), since=f.since, until=f.until)
+
+    async def task_histogram(
+        self, *, since: float, bucket: float, until: float | None = None, asset: str | None = None
+    ) -> dict:
+        """Tasks per time bucket and status, one series per asset or, given
+        `asset`, per partition of it. A task counts in the bucket its run was
+        made in; bucket `i` starts at `since + i * bucket`. A cell also says
+        how many runs its tasks belong to and names one: a run with a task
+        that did not succeed if there is one, else the newest."""
+
+        end = until if until is not None else self.clock()
+        if (end - since) / bucket > MAX_BUCKETS:
+            raise ValueError(f"more than {MAX_BUCKETS} buckets: widen `bucket` or narrow the window")
+        by = "asset" if asset is None else "partition"
+        clauses, params = ["created_at >= ?"], [since]
+        for clause, value in (("created_at < ?", until), ("asset = ?", asset)):
+            if value is not None:
+                clauses.append(clause)
+                params.append(value)
+        cell = f"SELECT {by}, CAST(floor((created_at - ?) / ?) AS INTEGER) AS i"
+        where = " AND ".join(clauses)
+
+        def work(con):
+            series: dict[str, dict[int, dict]] = {}
+            for name, i, runs, run in con.execute(
+                f"{cell}, count(DISTINCT run), coalesce(max(run) FILTER "
+                f"(WHERE list_contains(?::VARCHAR[], status)), max(run)) FROM tasks WHERE {where} GROUP BY 1, 2",
+                [since, bucket, sorted(BAD_TASK), *params],
+            ).fetchall():
+                series.setdefault(name, {})[i] = {"i": i, "counts": {}, "runs": runs, "run": run}
+            for name, i, status, n in con.execute(
+                f"{cell}, status, count(*) FROM tasks WHERE {where} GROUP BY 1, 2, 3",
+                [since, bucket, *params],
+            ).fetchall():
+                series[name][i]["counts"][status] = n
+            return {name: [cells[i] for i in sorted(cells)] for name, cells in sorted(series.items())}
+
+        found = await self.query(work, ("tasks",), since=since, until=until)
+        return {"since": since, "until": end, "bucket": bucket, "by": by, "series": found}
 
     async def tasks(
         self,

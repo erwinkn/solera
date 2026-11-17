@@ -1,68 +1,93 @@
-import { lock, session } from "@/lib/session";
+import { useSyncExternalStore } from "react"
+
+/* One fetch wrapper for the whole console. It adds the token, turns an error
+ * body into a message, and raises the token prompt when the server says 401. */
+
+const TOKEN = "solera.console.token"
 
 export class ApiError extends Error {
   constructor(
     readonly status: number,
     message: string,
   ) {
-    super(message);
-    this.name = "ApiError";
+    super(message)
   }
 }
 
-type Query = Record<string, string | number | boolean | null | undefined | (string | number)[]>;
-
-/** `/api…` with the query string built from `query`, dropping empty values. */
-export function url(path: string, query?: Query): string {
-  const params = new URLSearchParams();
-  for (const [name, value] of Object.entries(query ?? {})) {
-    for (const v of Array.isArray(value) ? value : [value]) {
-      if (v !== undefined && v !== null && v !== "") params.append(name, String(v));
-    }
-  }
-  const qs = params.toString();
-  return `/api${path}${qs ? `?${qs}` : ""}`;
+let needsToken = false
+const listeners = new Set<() => void>()
+function setNeedsToken(value: boolean) {
+  if (needsToken === value) return
+  needsToken = value
+  for (const listener of listeners) listener()
 }
 
-interface Options {
-  method?: "GET" | "POST" | "DELETE";
-  body?: unknown;
-  query?: Query;
-  signal?: AbortSignal;
-  headers?: Record<string, string>;
-}
-
-async function send(path: string, { method, body, query, signal, headers }: Options): Promise<Response> {
-  const token = session.get().token;
-  const response = await fetch(url(path, query), {
-    method: method ?? (body === undefined ? "GET" : "POST"),
-    signal,
-    headers: {
-      ...(token ? { Authorization: `Bearer ${token}` } : {}),
-      ...(body === undefined ? {} : { "Content-Type": "application/json" }),
-      ...headers,
+/** True while the server wants a token the console does not have (or has wrong). */
+export function useNeedsToken(): boolean {
+  return useSyncExternalStore(
+    (listener) => {
+      listeners.add(listener)
+      return () => listeners.delete(listener)
     },
-    body: body === undefined ? undefined : JSON.stringify(body),
-  });
-  if (response.ok) return response;
-  if (response.status === 401) lock();
-  const data: unknown = await response.json().catch(() => null);
-  const detail = data && typeof data === "object" && "detail" in data ? data.detail : null;
-  throw new ApiError(
-    response.status,
-    typeof detail === "string"
-      ? detail
-      : detail
-        ? JSON.stringify(detail)
-        : `${response.status} ${response.statusText}`,
-  );
+    () => needsToken,
+  )
 }
 
-export async function api<T>(path: string, options: Options = {}): Promise<T> {
-  const response = await send(path, options);
-  return (response.status === 204 ? null : await response.json()) as T;
+export function hasToken(): boolean {
+  return sessionStorage.getItem(TOKEN) !== null
 }
 
-export async function apiText(path: string, options: Options = {}): Promise<string> {
-  return (await send(path, options)).text();
+/** Keep the token for this browser session and let the waiting requests retry. */
+export function saveToken(token: string) {
+  sessionStorage.setItem(TOKEN, token)
+  setNeedsToken(false)
+}
+
+export function forgetToken() {
+  sessionStorage.removeItem(TOKEN)
+}
+
+export async function request(path: string, init: RequestInit = {}): Promise<Response> {
+  const token = sessionStorage.getItem(TOKEN)
+  const headers = new Headers(init.headers)
+  if (token) headers.set("Authorization", `Bearer ${token}`)
+  if (init.body) headers.set("Content-Type", "application/json")
+  const response = await fetch(path, { ...init, headers })
+  if (response.status === 401) {
+    setNeedsToken(true)
+    throw new ApiError(401, "Authentication required")
+  }
+  if (!response.ok) {
+    let message = `${response.status} ${response.statusText}`
+    try {
+      const body = await response.json()
+      if (typeof body.detail === "string") message = body.detail
+      else if (Array.isArray(body.detail)) message = body.detail.map((d: { msg?: string }) => d.msg).join("; ")
+    } catch {
+      // not JSON: the status line will do
+    }
+    throw new ApiError(response.status, message)
+  }
+  return response
+}
+
+export async function get<T>(path: string, signal?: AbortSignal): Promise<T> {
+  return (await request(path, { signal })).json()
+}
+
+export async function post<T>(path: string, body?: unknown): Promise<T> {
+  const response = await request(path, { method: "POST", body: body === undefined ? undefined : JSON.stringify(body) })
+  return response.status === 204 ? (undefined as T) : response.json()
+}
+
+/** A query string from the fields that are set; arrays repeat the field. */
+export function query(fields: Record<string, string | number | boolean | null | undefined | string[]>): string {
+  const params = new URLSearchParams()
+  for (const [name, value] of Object.entries(fields)) {
+    if (value === null || value === undefined || value === "") continue
+    if (Array.isArray(value)) for (const v of value) params.append(name, v)
+    else params.set(name, String(value))
+  }
+  const text = params.toString()
+  return text ? `?${text}` : ""
 }

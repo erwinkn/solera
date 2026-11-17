@@ -1,263 +1,173 @@
-import { expect, test, type Page } from "@playwright/test";
+import { expect, test, type Page } from "@playwright/test"
 
-// The console's main flows against the demo project (python/solera_server/demo.py),
-// on desktop and mobile: connect, navigate, theme, materialize and inspect a
-// run, cancel, keys and explain, automations, sources, health.
+/* A small suite over the real thing: the bundle the server serves, against a
+ * server running the demo project. It checks that the overview says how the
+ * project is doing, that every place opens, that a run can be started and
+ * read on its timeline, and that the theme switches and sticks. */
 
-const TOKEN = "test-browser-token";
+const problems: string[] = []
 
-async function connect(page: Page, path = "/") {
-  await page.goto(path);
-  await page.getByLabel("API token", { exact: true }).fill(TOKEN);
-  await page.getByRole("button", { name: "Connect", exact: true }).click();
+test.beforeEach(async ({ page }) => {
+  problems.length = 0
+  page.on("pageerror", (error) => problems.push(error.message))
+  // the server's content security policy reports a breach as a console error
+  page.on("console", (message) => {
+    if (message.type() === "error" && /Content Security Policy|Refused to/.test(message.text())) problems.push(message.text())
+  })
+})
+
+test.afterEach(() => {
+  expect(problems, "no script error and no content security policy breach").toEqual([])
+})
+
+const chart = (page: Page) => page.getByRole("treegrid")
+
+/** Pick a theme from the menu beside the health status. */
+async function setTheme(page: Page, theme: string) {
+  await page.getByRole("button", { name: "Change the theme" }).click()
+  await page.getByRole("menuitemradio", { name: new RegExp(`^${theme}`) }).click()
+  await page.keyboard.press("Escape")
 }
 
-const mobile = (page: Page) => (page.viewportSize()?.width ?? 1440) < 1024;
+test("the overview says how every asset is doing and what it did lately", async ({ page }) => {
+  await page.goto("/?window=86400")
+  await expect(page.getByRole("heading", { level: 1 })).toHaveText("Overview")
+  await expect(page.getByText(/\d+ of \d+ up to date/)).toBeVisible()
+  // every asset has a row before it has run; sources, which do not run, have none
+  for (const asset of ["sites", "site_feed", "file_checks", "weekly_digest"]) await expect(page.getByRole("row", { name: new RegExp(`^${asset}\\b`) })).toBeVisible()
+  await expect(page.getByRole("row", { name: /^uploads\b/ })).toHaveCount(0)
 
-/** Follow a main-navigation link; on a phone it lives behind the menu button. */
-async function nav(page: Page, name: string) {
-  if (mobile(page)) await page.getByRole("button", { name: "Open navigation" }).click();
-  await page
-    .getByRole("navigation", { name: "Main" })
-    .getByRole("link", { name, exact: false })
-    .first()
-    .click();
-}
+  // the job that runs on each deploy has run: its strip has a cell that says so and leads to the run
+  const strip = page.getByRole("img", { name: /^deploy_notice: \d+ runs?, 0 failed/ })
+  await expect(strip).toBeVisible({ timeout: 30_000 })
+  const cell = strip.locator("a").last()
+  await cell.hover()
+  await expect(page.getByText(/\d+ runs? · \d+ tasks? succeeded/)).toBeVisible()
+  await cell.click()
+  await expect(page).toHaveURL(/\/runs\/[0-9A-Z]{26}$/)
+  await expect(page.getByRole("heading", { level: 1 })).toHaveText("deploy_notice")
+})
 
-test("asks for a token, then shows the overview", async ({ page }) => {
-  await page.goto("/");
-  await expect(page.getByRole("heading", { name: "Connect to Solera" })).toBeVisible();
-  await page.getByLabel("API token", { exact: true }).fill("wrong");
-  await page.getByRole("button", { name: "Connect", exact: true }).click();
-  await expect(page.getByText("That token was refused")).toBeVisible();
-  await page.getByLabel("API token", { exact: true }).fill(TOKEN);
-  await page.getByRole("button", { name: "Connect", exact: true }).click();
-  await expect(page.getByRole("heading", { name: "Overview", level: 1 })).toBeVisible();
-  await expect(page.getByText("Running now").first()).toBeVisible();
-  await expect(page.getByRole("heading", { name: "Up next" })).toBeVisible();
-});
-
-test("every page loads from the navigation", async ({ page }) => {
-  const errors: string[] = [];
-  page.on("pageerror", (e) => errors.push(e.message));
-  await connect(page);
+test("every place opens, by its link and by its address", async ({ page }) => {
+  await page.goto("/")
+  const places = page.getByRole("navigation", { name: "Places" })
   for (const [link, heading] of [
-    ["Assets", "Assets"],
     ["Runs", "Runs"],
+    ["Assets", "Assets"],
     ["Automations", "Automations"],
-    ["Sensors", "Sensors"],
-    ["Sources", "Sources"],
-    ["Executors", "Executors"],
-    ["Health", "Health"],
-    ["Overview", "Overview"],
+    ["Find a key", "Find a key"],
+    ["Engine", "Engine"],
+    ["Settings", "Settings"],
   ] as const) {
-    await nav(page, link);
-    await expect(page.getByRole("heading", { name: heading, level: 1 })).toBeVisible();
+    await places.getByRole("link", { name: link }).click()
+    await expect(page.getByRole("heading", { level: 1 })).toHaveText(heading)
   }
-  expect(errors).toEqual([]);
-});
+  // an address the server does not know is the console's to route, dots included
+  await page.goto("/sensors/upload_drop")
+  await expect(page.getByRole("heading", { level: 1 })).toHaveText("upload_drop")
+  await expect(page.getByRole("navigation", { name: "Where you are" }).getByRole("link", { name: "Automations" })).toBeVisible()
+  await page.goto("/assets/file_checks?tab=definition")
+  await expect(page.getByRole("tab", { name: "Definition" })).toHaveAttribute("aria-selected", "true")
+  await expect(page.getByText("one call per changed key")).toBeVisible()
+  await page.goto("/no/such/place")
+  await expect(page.getByText("No page at this address")).toBeVisible()
+})
 
-test("the theme switches by tokens alone and persists", async ({ page }) => {
-  await connect(page);
-  await expect(page.getByRole("heading", { name: "Overview", level: 1 })).toBeVisible();
-  const look = () =>
-    page.evaluate(() => {
-      const card = document.querySelector("main section") as HTMLElement;
-      const style = getComputedStyle(card);
-      return [getComputedStyle(document.body).backgroundColor, style.borderRadius, style.boxShadow].join(
-        " | ",
-      );
-    });
-  const open = async () => {
-    if (mobile(page)) await page.getByRole("button", { name: "Open navigation" }).click();
-  };
-  const seen = new Set([await look()]);
-  for (const theme of ["cellar", "instrument", "observatory"]) {
-    await open();
-    await page.getByRole("combobox", { name: "Theme" }).selectOption(theme);
-    await expect(page.locator("html")).toHaveAttribute("data-theme", theme);
-    if (mobile(page)) await page.keyboard.press("Escape");
-    seen.add(await look());
-  }
-  expect(seen.size).toBe(4); // four looks, one component tree
-  await page.reload();
-  await expect(page.locator("html")).toHaveAttribute("data-theme", "observatory");
-  await open();
-  await page.getByRole("combobox", { name: "Theme" }).selectOption("normal");
-  await expect(page.locator("html")).toHaveAttribute("data-theme", "normal");
-});
+test("a run can be started, and read on its timeline", async ({ page }) => {
+  await page.goto("/")
+  await page.getByRole("button", { name: "Start a run" }).first().click()
+  const dialog = page.getByRole("dialog", { name: "Start a run" })
+  await dialog.getByRole("combobox", { name: "Assets to run" }).click()
+  await page.getByRole("option", { name: "deploy_notice" }).click()
+  await page.keyboard.press("Escape")
+  // a job has no partitions and reads nothing incrementally: neither choice is offered
+  await expect(dialog.getByLabel("Which partitions")).toHaveCount(0)
+  await expect(dialog.getByLabel("Mode")).toHaveCount(0)
+  await dialog.getByRole("button", { name: "Start", exact: true }).click()
 
-/** The API as the console calls it, with the test's token. */
-const api = (path: string) => `/api/projects/demo${path}`;
-const auth = { Authorization: `Bearer ${TOKEN}` };
+  await expect(page).toHaveURL(/\/runs\/[0-9A-Z]{26}$/)
+  await expect(page.getByRole("heading", { level: 1 })).toHaveText("deploy_notice")
+  await expect(page.getByText("1 of 1 task done")).toBeVisible({ timeout: 30_000 })
 
-/**
- * Pause an asset's automations and wait until none of its runs is live, so a
- * run submitted now has its partitions to itself instead of finding them
- * already running and planning nothing. Returns what to re-enable.
- */
-async function quiesce(page: Page, asset: string): Promise<() => Promise<void>> {
-  const { automations } = (await (await page.request.get(api("/automations"), { headers: auth })).json()) as {
-    automations: { name: string; targets: string[]; enabled: boolean }[];
-  };
-  const paused = automations.filter((a) => a.enabled && a.targets.includes(asset)).map((a) => a.name);
-  for (const name of paused) await page.request.post(api(`/automations/${name}/disable`), { headers: auth });
-  await expect
-    .poll(
-      async () =>
-        (
-          (await (
-            await page.request.get(api(`/runs?asset=${asset}&status=running&status=queued&limit=1`), {
-              headers: auth,
-            })
-          ).json()) as { total: number }
-        ).total,
-      { timeout: 45_000 },
-    )
-    .toBe(0);
-  return async () => {
-    for (const name of paused) await page.request.post(api(`/automations/${name}/enable`), { headers: auth });
-  };
-}
+  // picking the step shows what it did
+  const step = chart(page).getByRole("row", { name: /^deploy_notice/ })
+  await step.click()
+  await expect(page).toHaveURL(/at=task/)
+  await expect(page.getByText("Where the time went")).toBeVisible()
+  await expect(page.getByText("project deployed")).toBeVisible()
 
-/** site_feed's partitions are sites' keys: on a fresh namespace, make sure there are some. */
-async function sitesExist(page: Page) {
-  const count = async () => {
-    const response = await page.request.get(api("/partitions/site_feed"), { headers: auth });
-    return response.ok() ? ((await response.json()) as { partitions: unknown[] }).partitions.length : 0;
-  };
-  if ((await count()) > 0) return;
-  await page.request.post(api("/runs"), { headers: auth, data: { targets: ["sites"], by: "test" } });
-  await expect.poll(count, { timeout: 45_000 }).toBeGreaterThan(0);
-}
+  // and the run is in the list
+  await page.getByRole("navigation", { name: "Places" }).getByRole("link", { name: "Runs" }).click()
+  await expect(page.getByRole("row", { name: /deploy_notice.*Manual, from the console/ }).first()).toBeVisible()
+})
 
-test("materialize an asset and follow its run to the logs", async ({ page }) => {
-  await sitesExist(page);
-  // site_feed runs every 10 seconds on its own: hold that off, or our run finds its partitions running.
-  const resume = await quiesce(page, "site_feed");
-  try {
-    await materialize(page);
-  } finally {
-    await resume();
-  }
-});
+test("starting a run offers the choices that apply to the assets picked", async ({ page }) => {
+  await page.goto("/assets/file_checks")
+  await page.getByRole("button", { name: "Run", exact: true }).click() // the asset's own button, with the asset filled in
+  const dialog = page.getByRole("dialog", { name: "Start a run" })
+  await expect(dialog.getByRole("combobox", { name: "Assets to run" })).toContainText("file_checks")
+  // partitioned by site, and it reads its files incrementally
+  const which = dialog.getByLabel("Which partitions")
+  for (const choice of ["Stale", "All", "Selected"]) await expect(which.getByText(choice, { exact: true })).toBeVisible()
+  await which.getByText("All", { exact: true }).click()
+  await expect(dialog.getByText(/^\d+ partitions?$/)).toBeVisible()
+  const mode = dialog.getByLabel("Mode")
+  await expect(mode.getByText("Incremental", { exact: true })).toBeVisible()
+  await expect(mode.getByText("Full run", { exact: true })).toBeVisible()
+  await expect(dialog.getByText("Run dependencies first")).toBeVisible()
+  await dialog.getByRole("button", { name: "Cancel" }).click()
+  await expect(dialog).toHaveCount(0)
+})
 
-async function materialize(page: Page) {
-  await connect(page, "/assets/site_feed");
-  await expect(page.getByRole("heading", { name: "site_feed", level: 1 })).toBeVisible();
-  await page.getByRole("button", { name: "Run", exact: true }).click();
-  const dialog = page.getByRole("dialog", { name: "Run" });
-  await expect(dialog.getByRole("checkbox", { name: "site_feed" })).toBeChecked();
-  await dialog.getByRole("radio", { name: "All" }).click();
-  // Full: materializes every partition again, so the run has tasks even if site_feed is current.
-  await dialog.getByRole("radio", { name: "Full" }).click();
-  await dialog.getByRole("button", { name: "Start the run" }).click();
-  await expect(page).toHaveURL(/\/runs\/[0-9A-Z]{26}/);
-  await expect(page.getByRole("heading", { name: "site_feed", level: 1 })).toBeVisible();
-  await expect(page.getByRole("heading", { name: "Timeline" })).toBeVisible();
-  await expect(page.getByText("succeeded").first()).toBeVisible({ timeout: 45_000 });
-  await expect(page.getByRole("log")).toContainText("polled");
-  await page.getByRole("tab", { name: "Spec" }).click();
-  await expect(page.getByRole("tab", { name: "Spec" })).toHaveAttribute("aria-selected", "true");
-  await expect(page).toHaveURL(/tab=spec/);
-  await page.getByRole("tab", { name: "Events" }).click();
-  await expect(page.getByText("committed").first()).toBeVisible();
-}
+test("the timeline works from the keyboard", async ({ page, request }) => {
+  const started = await request.post("/api/projects/demo/runs", { data: { targets: ["sites", "deploy_notice"], partitions: "latest", mode: "incremental", upstream: false, by: "test" } })
+  const run = await started.json()
+  await page.goto(`/runs/${run.id}`)
+  const rows = chart(page).getByRole("row")
+  const first = rows.nth(1) // after the header row
+  await expect(first).toBeVisible()
+  await first.focus()
+  await page.keyboard.press("Enter")
+  await expect(first).toHaveAttribute("aria-selected", "true")
+  await expect(page.getByRole("link", { name: "Open the asset" })).toBeVisible()
+  await page.keyboard.press("ArrowDown")
+  await expect(rows.nth(2)).toBeFocused()
+})
 
-test("commit to a source, then cancel the run waiting for a pool worker", async ({ page }, info) => {
-  const upload = `e2e-${info.project.name}`; // the projects share one server
-  await connect(page, "/sources/uploads");
-  await expect(page.getByRole("heading", { name: "uploads", level: 1 })).toBeVisible();
-  await page.getByPlaceholder(/u-1/).fill(upload);
-  await page.getByRole("button", { name: "Commit", exact: true }).click();
-  await expect(page.getByRole("cell", { name: upload })).toBeVisible();
+test("the theme switches at once and is remembered", async ({ page }) => {
+  await page.goto("/")
+  const html = page.locator("html")
+  // nothing chosen yet: the theme follows the system, which is light in this browser
+  await expect(html).toHaveAttribute("data-theme", "light")
+  const white = await html.evaluate((element) => getComputedStyle(element).backgroundColor)
 
-  // manual_ingest runs on Pool("ingest"): with no worker, its attempt waits.
-  await page.goto("/assets/manual_ingest");
-  await page.getByRole("button", { name: "Run", exact: true }).click();
-  const dialog = page.getByRole("dialog", { name: "Run" });
-  await dialog.getByRole("radio", { name: "Pick…" }).click();
-  await dialog.getByLabel("Partition keys").fill(upload);
-  await dialog.getByRole("button", { name: "Start the run" }).click();
-  await expect(page).toHaveURL(/\/runs\//);
-  await page.getByRole("button", { name: "Cancel run" }).click();
-  await page.getByRole("alertdialog").getByRole("button", { name: "Cancel run" }).click();
-  await expect(page.getByText("canceled").first()).toBeVisible({ timeout: 45_000 });
-  // A finished run never changes: retrying it is a new run that names it.
-  const canceled = page.url();
-  await page.getByRole("button", { name: "Retry", exact: true }).click();
-  await expect(page).not.toHaveURL(canceled);
-  await expect(page.getByText("Retries", { exact: true })).toBeVisible();
-});
+  await setTheme(page, "Dark")
+  await expect(html).toHaveAttribute("data-theme", "dark")
+  expect(await html.evaluate((element) => getComputedStyle(element).backgroundColor)).not.toBe(white)
 
-test("runs filter through the address bar", async ({ page }) => {
-  await connect(page, "/runs");
-  await expect(page.getByRole("heading", { name: "Runs", level: 1 })).toBeVisible();
-  await page
-    .getByRole("group", { name: "Status" })
-    .getByRole("button", { name: /succeeded/ })
-    .click();
-  await expect(page).toHaveURL(/status=succeeded/);
-  await expect(page.locator("tbody tr").first()).toContainText("succeeded");
-  await page.getByRole("radio", { name: "1h" }).click();
-  await expect(page).toHaveURL(/range=1h/);
-  await page.reload();
-  await expect(page.getByRole("button", { name: /succeeded/ })).toHaveAttribute("aria-pressed", "true");
-});
+  await page.reload()
+  await expect(html).toHaveAttribute("data-theme", "dark")
+  await expect(page.getByRole("row", { name: /^sites\b/ })).toBeVisible()
 
-test("assets graph, keys and explain", async ({ page }) => {
-  await connect(page, "/assets");
-  await page
-    .getByRole("link", { name: /file_checks/ })
-    .first()
-    .click();
-  await expect(page.getByRole("heading", { name: "file_checks", level: 1 })).toBeVisible();
-  await page.getByRole("navigation", { name: "Asset sections" }).getByRole("link", { name: /Keys/ }).click();
-  await expect(page.getByRole("heading", { name: "Key outcomes" })).toBeVisible();
-  // alpha-file-2 is excluded by the input's "drafts" pattern: explain says so.
-  await page.getByLabel("Key to explain").fill("alpha-file-2");
-  await page.getByRole("button", { name: "Explain" }).click();
-  await expect(page.getByText(/Excluded by the input's pattern/)).toBeVisible({ timeout: 45_000 });
-  await page
-    .getByRole("navigation", { name: "Asset sections" })
-    .getByRole("link", { name: "Inputs" })
-    .click();
-  await expect(page.getByText("each=True").first()).toBeVisible();
-  await page.goto("/assets?view=list");
-  await expect(page.getByRole("link", { name: /file_index/ })).toBeVisible();
-});
+  await setTheme(page, "Dimmed")
+  await expect(html).toHaveAttribute("data-theme", "dimmed")
+  // one typeface for the interface in every theme, served by the console itself
+  expect(await page.locator("body").evaluate((element) => getComputedStyle(element).fontFamily)).toContain("Inter Variable")
+  expect(await page.evaluate(() => document.fonts.check('13px "Inter Variable"'))).toBe(true)
+})
 
-test("automations toggle and health", async ({ page }) => {
-  await connect(page, "/automations");
-  const toggle = page.getByRole("switch", { name: /refresh-index/ });
-  await expect(toggle).toBeChecked();
-  await toggle.click();
-  await expect(page.getByRole("switch", { name: /Enable refresh-index/ })).not.toBeChecked();
-  await page.reload();
-  await page.getByRole("switch", { name: /Enable refresh-index/ }).click();
-  await expect(page.getByRole("switch", { name: /Disable refresh-index/ })).toBeChecked();
+test("a custom theme is checked, applied and kept", async ({ page }) => {
+  await page.goto("/settings")
+  await page.getByRole("button", { name: "New theme" }).click()
+  const editor = page.getByRole("textbox", { name: "Theme as JSON" })
+  await editor.fill('{"name": "Probe", "extends": "light", "tokens": {"no-such-token": "1"}}')
+  await expect(page.getByText("No such token")).toBeVisible()
+  await expect(page.getByRole("button", { name: "Save theme" })).toBeDisabled()
 
-  await page.goto("/health");
-  await expect(page.getByRole("heading", { name: "Repairs owed" })).toBeVisible();
-  await expect(page.getByRole("heading", { name: "Cleanups" })).toBeVisible();
-  await expect(page.getByText("browser", { exact: true })).toBeVisible();
-});
-
-test("jump anywhere from the keyboard", async ({ page }) => {
-  test.skip(mobile(page), "a keyboard shortcut");
-  await connect(page);
-  await expect(page.getByRole("heading", { name: "Overview", level: 1 })).toBeVisible();
-  await page.keyboard.press("Control+k");
-  const input = page.getByRole("combobox", { name: "Jump to" });
-  await input.fill("file_ch");
-  await expect(page.getByRole("option", { name: /file_checks/ }).first()).toHaveAttribute(
-    "aria-selected",
-    "true",
-  );
-  await input.press("Enter");
-  await expect(page.getByRole("heading", { name: "file_checks", level: 1 })).toBeVisible();
-  // A run id goes straight to the run.
-  await page.keyboard.press("Control+k");
-  await page.getByRole("combobox", { name: "Jump to" }).fill("01M3Y6KRZKEDY3BR0EN6J58M9T");
-  await expect(page.getByRole("option", { name: /run/ })).toBeVisible();
-});
+  await editor.fill('{"name": "Probe", "extends": "light", "tokens": {"color-bg": "rgb(1, 2, 3)"}}')
+  await page.getByRole("button", { name: "Save theme" }).click()
+  await expect(page.locator("html")).toHaveCSS("background-color", "rgb(1, 2, 3)")
+  await page.reload()
+  await expect(page.locator("html")).toHaveCSS("background-color", "rgb(1, 2, 3)")
+  await expect(page.getByRole("radio", { name: /^Probe/ })).toHaveAttribute("aria-checked", "true")
+})

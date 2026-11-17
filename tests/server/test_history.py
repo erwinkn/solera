@@ -140,6 +140,19 @@ async def test_runs_filter_facets_and_pages(state, clock):
     assert sum(sum(b["counts"].values()) for b in histogram["bars"]) == 3
     assert bucket_for(3600) == 60 and bucket_for(30 * 86400) == 43200
 
+    # Tasks in buckets counted from `since`, a series per asset: the cell names the run that failed.
+    start = ok["created_at"] - 1
+    cells = await engine.history.task_histogram(since=start, bucket=3600)
+    assert cells["by"] == "asset" and cells["bucket"] == 3600
+    assert cells["series"]["orders"] == [{"i": 0, "counts": {"succeeded": 2}, "runs": 2, "run": third["id"]}]
+    [cell] = cells["series"]["revenue"]
+    assert cell["counts"] == {"failed": 1} and cell["run"] == bad["id"]
+    by_partition = await engine.history.task_histogram(since=start, bucket=3600, asset="orders")
+    assert by_partition["by"] == "partition" and list(by_partition["series"]) == [""]
+    assert (await engine.history.task_histogram(since=start, until=start + 0.5, bucket=1))["series"] == {}
+    with pytest.raises(ValueError):
+        await engine.history.task_histogram(since=start - 86400, bucket=1)
+
     # Numbered pages pin the newest run of the first page: a run arriving
     # meanwhile doesn't shift the second page.
     await run(engine, clock, ["orders"])

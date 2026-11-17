@@ -1,0 +1,75 @@
+/* The frame: the sidebar, the bar on top, and the bones every page shares. */
+
+@layer layout {
+  .wb { --wb-top: calc(var(--control) + var(--u) * 4); display: grid; grid-template-columns: 216px minmax(0, 1fr); min-height: 100dvh; }
+  .wb-side { position: sticky; top: 0; height: 100dvh; display: flex; flex-direction: column; gap: calc(var(--u) * 3); padding: calc(var(--u) * 2) calc(var(--u) * 2.5) calc(var(--u) * 2.5); border-right: var(--hairline); background: var(--color-surface); }
+  .wb-brand { display: flex; align-items: center; gap: calc(var(--u) * 2); height: var(--control); padding: 0 calc(var(--u) * 1.5); min-width: 0; }
+  .wb-brand-name { font-weight: var(--font-weight-strong); }
+  .wb-nav { flex: 1; display: flex; flex-direction: column; gap: calc(var(--u) * 4); min-height: 0; overflow-y: auto; }
+  .wb-nav-group { display: flex; flex-direction: column; gap: 1px; }
+  .wb-nav-item { display: flex; align-items: center; gap: calc(var(--u) * 2.5); height: var(--control); padding: 0 calc(var(--u) * 2); border-radius: var(--radius-m); color: var(--color-text-muted); transition: background var(--quick), color var(--quick); }
+  .wb-nav-item > svg { color: var(--color-text-faint); transition: color var(--quick); }
+  .wb-nav-item:hover { background: var(--hover); color: var(--color-text); }
+  .wb-nav-item[aria-current="page"] { background: var(--press); color: var(--color-text); font-weight: var(--medium); }
+  .wb-nav-item[aria-current="page"] > svg, .wb-nav-item:hover > svg { color: var(--color-text); }
+  .wb-side-foot { display: flex; align-items: center; padding-inline-start: calc(var(--u) * 2); min-height: var(--control); }
+  .wb-side-sheet { position: static; height: auto; min-height: 100%; padding: 0; border: 0; background: transparent; }
+
+  .wb-main { display: flex; flex-direction: column; min-width: 0; }
+  .wb-top { position: sticky; top: 0; z-index: 10; display: flex; align-items: center; gap: calc(var(--u) * 2); height: var(--wb-top); padding-inline: var(--gutter) calc(var(--u) * 4); background: var(--color-bg); border-bottom: var(--hairline); }
+  .wb-menu { display: none; margin-inline-start: calc(var(--u) * -1.5); }
+  .wb-crumbs { display: flex; align-items: center; gap: calc(var(--u) * 2); color: var(--color-text-muted); min-width: 0; }
+  .wb-place { color: var(--color-text); font-weight: var(--font-weight-strong); }
+  .wb-crumbs a:hover { color: var(--color-text); }
+  .wb-crumbs [aria-current] { color: var(--color-text); }
+  .wb-page { display: flex; flex-direction: column; flex: 1; min-width: 0; padding-bottom: calc(var(--u) * 12); }
+  .wb-head { display: flex; align-items: flex-start; flex-wrap: wrap; gap: calc(var(--u) * 3) calc(var(--u) * 4); padding: calc(var(--u) * 5) var(--gutter) calc(var(--u) * 4); }
+  .wb-head-text { flex: 1 1 320px; min-width: 0; }
+  .wb-head-text > .row { gap: calc(var(--u) * 1) calc(var(--u) * 3); }
+  .wb-title { font-size: var(--text-xl); letter-spacing: -0.012em; overflow-wrap: anywhere; }
+  .wb-meta { margin-top: calc(var(--u) * 0.5); max-width: 96ch; }
+  .wb-body { display: flex; flex-direction: column; flex: 1; min-width: 0; }
+  .wb-body[data-headed]:not(:has(> .tabs:first-child)) { border-top: var(--hairline); }
+  .wb-body > .summary { padding-top: calc(var(--u) * 4); }
+  .wb-body > .notices { padding: calc(var(--u) * 3) var(--gutter); }
+  .wb-page:has(.wb-split) { padding-bottom: 0; }
+  .wb-lead { padding-top: calc(var(--u) * 4); }
+  .wb-prose { max-width: 880px; }
+  .wb-chart { padding: 0 var(--gutter) calc(var(--u) * 3); }
+  .wb-body > .panel:last-child:has(> .panel-body) { flex: 1; }
+
+  /* a page beside its details: the timeline and what is picked on it */
+  .wb-split { --tl-max: calc(100dvh - var(--wb-top) - var(--u) * 46); flex: 1; display: grid; grid-template-columns: minmax(0, 1fr) clamp(320px, 30%, 420px); align-items: stretch; min-width: 0; }
+  .wb-aside { border-left: var(--hairline); min-width: 0; }
+  .wb-aside > .panel { position: sticky; top: var(--wb-top); max-height: calc(100dvh - var(--wb-top)); overflow-y: auto; scrollbar-width: thin; }
+
+  @media (max-width: 1180px) {
+    .strip-col { width: 252px; }
+    .strip-legend { display: none; }
+  }
+  @media (max-width: 1000px) {
+    .wb-split { --tl-max: 60dvh; grid-template-columns: minmax(0, 1fr); }
+    .wb-aside { border-left: 0; border-top: var(--hairline); }
+    .wb-aside > .panel { position: static; max-height: none; }
+  }
+  @media (max-width: 760px) {
+    .wb { --gutter: calc(var(--u) * 4); grid-template-columns: minmax(0, 1fr); }
+    .wb > .wb-side { display: none; }
+    .wb-menu { display: block; }
+    .wb-top { padding-inline-end: calc(var(--u) * 3); }
+    .wb-head { padding-top: calc(var(--u) * 4); }
+    .table .optional, .activity td:first-child .muted { display: none; }
+    .strip-col { width: 132px; min-width: 132px; }
+    .strip { grid-template-columns: repeat(60, 1.2px); justify-content: space-between; gap: 0; }
+    .strip-axis span:not(.strip-axis-now):nth-child(even) { display: none; }
+  }
+
+  /* -- the timeline and fact lists on small screens ------------------------- */
+  @media (max-width: 760px) {
+    .tl { --tl-name: 200px; --tl-progress: calc(var(--text) * 7); }
+    .tl-grid { min-width: 540px; }
+    .tl-note { display: none; }
+    .facts { grid-template-columns: minmax(0, 1fr); gap: 0; }
+    .facts dd { margin-bottom: calc(var(--u) * 2); }
+  }
+}

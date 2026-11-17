@@ -1,36 +1,32 @@
-import { defineConfig, devices } from "@playwright/test";
+import { mkdtempSync } from "node:fs"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
+import { fileURLToPath } from "node:url"
+import { defineConfig } from "@playwright/test"
 
-// The console against a real server running the demo project, on desktop and
-// mobile. The server is built and started once; tests share its state.
-const port = 8013;
+/* The tests drive the built bundle as the Python server serves it, so the
+ * /static/ base, the deep links and the content security policy are all in
+ * play. With SOLERA_CONSOLE_URL set they use that server; without it they
+ * start one on the demo project, with its state in a fresh temporary folder. */
+
+const external = process.env.SOLERA_CONSOLE_URL
+const port = 8799
+const repository = fileURLToPath(new URL("../..", import.meta.url))
 
 export default defineConfig({
-  testDir: "./tests",
-  testMatch: "*.spec.ts",
-  timeout: 90_000,
+  testDir: "tests",
+  timeout: 45_000,
+  fullyParallel: false,
   workers: 1,
-  retries: process.env.CI ? 1 : 0,
-  expect: { timeout: 15_000 },
-  use: {
-    baseURL: `http://127.0.0.1:${port}`,
-    screenshot: "only-on-failure",
-    trace: "retain-on-failure",
-  },
-  projects: [
-    { name: "desktop", use: { ...devices["Desktop Chrome"], viewport: { width: 1440, height: 900 } } },
-    { name: "mobile", use: { ...devices["iPhone 13"], defaultBrowserType: "chromium" } },
-  ],
-  webServer: {
-    command: `pnpm run build && cd ../.. && uv run solera serve --port ${port}`,
-    url: `http://127.0.0.1:${port}/healthz`,
-    timeout: 180_000,
-    reuseExistingServer: !process.env.CI,
-    env: {
-      SOLERA_API_TOKEN: "test-browser-token",
-      SOLERA_STATE_URL: `file:///tmp/solera-browser-test-${Date.now()}`,
-      SOLERA_NAMESPACE: "browser",
-      // A dirty work tree changes the git build identity under a running server.
-      SOLERA_BUILD: "browser-test",
-    },
-  },
-});
+  reporter: "list",
+  use: { baseURL: external ?? `http://127.0.0.1:${port}`, viewport: { width: 1360, height: 860 } },
+  webServer: external
+    ? undefined
+    : {
+        command: `uv run --project "${repository}" solera serve --insecure --no-reload --port ${port}`,
+        cwd: mkdtempSync(join(tmpdir(), "solera-console-")),
+        url: `http://127.0.0.1:${port}/healthz`,
+        timeout: 180_000,
+        reuseExistingServer: false,
+      },
+})
