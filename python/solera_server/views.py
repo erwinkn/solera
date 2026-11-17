@@ -9,9 +9,10 @@ import json
 from collections import Counter
 
 import orjson
+from solera.patterns import Matcher
 
 from . import planning
-from .model import BAD_OUTCOME
+from .model import BAD_OUTCOME, edge_id, output_id
 from .tracking import outcomes as core_outcomes
 
 
@@ -226,7 +227,119 @@ class Views:
 
     # -- inputs (§6; per-key-processing.md §11) -----------------------------------------------
 
-    # -- explain (per-key-processing.md §10) -------------------------------------------------
+    # -- explain (KEY-11) ----------------------------------------------------------------------
+
+    async def explain(self, asset: str, key: str, partition: str = "", input: str | None = None) -> dict:
+        """Why `key` is, or is not, in an asset's output (KEY-11), through one
+        keyed Incremental input: `input`, else its per-key input, else its
+        one keyed Incremental input. Derived when asked, from the core and
+        the manifest; nothing is kept for it. The verdict is the first of
+        these that holds:
+
+        - `not_matched`: no `include` pattern of the input takes it;
+        - `excluded`: an `exclude` pattern does (`patterns.excluded_by` names it);
+        - `failing`: a stored outcome holds it (`outcome`, its row as
+          `/outcomes` serves it);
+        - `removed`: upstream lacks it, and something shows it was there:
+          the partition delivered it, an output still holds it (its removal
+          may be undelivered), or upstream's retained history has it;
+        - `absent`: upstream lacks it, and nothing shows it ever had it;
+        - `ok`: the input owes nothing for it;
+        - `pending`: upstream holds a version of it the partition has not
+          processed.
+
+        `last` is what the partition last delivered of it, `{outcome,
+        generation}`: its failure, a removal, or an `ok` at the version it
+        holds; `last_ok` the version its last ok call processed. Both are read
+        from the edge's progress (`Tracking.delivered`), which keeps no
+        history: a key never processed has neither."""
+
+        info = self.manifest["assets"][asset]
+        keyed = [
+            p
+            for p, e in info["inputs"].items()
+            if e["kind"] == "incremental" and self.manifest["outputs"][e["output"]].get("key") is not None
+        ]
+        each = self._each_input(asset)
+        if input is None:
+            if each is None and len(keyed) != 1:
+                raise ValueError(
+                    f"{asset} has {len(keyed) or 'no'} keyed Incremental inputs: name one with input="
+                )
+            input = each[0] if each is not None else keyed[0]
+        if input not in keyed:
+            raise ValueError(f"{asset} has no keyed Incremental input {input!r}")
+        planner = self.planner()
+        if partition not in planner.partitions(asset, [partition]):  # checked, never enumerated
+            raise KeyError(f"{asset}/{partition}")
+        found = next(i for i in planner.inputs(asset, partition) if i.param == input)
+        names = [o["name"] for o in info["outputs"] if o.get("key") is not None]
+
+        async def version(output: str, part: str):
+            """The version `output@part` holds `key` at; None if none."""
+
+            head = self.m.core_output(output, part)
+            if head is None or not head["head"]:
+                return None
+            self.core.attach(output_id(output, part))
+            rows, _ = await self.core.run(self.core.index.get, head["layers"], head["head"], [key])
+            return rows[0][2] if rows else None
+
+        upstream = await version(found.output, found.partition)
+        held = {name: await version(name, partition) for name in names}
+        # Its latest outcome and whether it is owed, as `/outcomes` serves them; with no edge
+        # yet, the partition has read nothing: what upstream holds is owed.
+        rows = await core_outcomes.latest(self, asset, partition, input, keys=[key])
+        row = next(iter(rows[0]), None) if rows is not None else None
+        owed = upstream is not None if rows is None else row is not None and row["owed"]
+        outcome = row if row is not None and row["outcome"] in core_outcomes.STORED else None
+        # What the partition last delivered of it, and the version it last processed ok.
+        edge = edge_id(asset, partition, input)
+        delivered = await self.core.run(self.core.tracking.delivered, edge, key)
+        last = last_ok = None
+        if delivered is not None:
+            last_ok = {"outcome": "ok", "generation": delivered[1]}
+            last = last_ok if delivered[0] == "ok" else {"outcome": "removed", "generation": None}
+        if outcome is not None:  # its failure, over what the partition still holds
+            last = {"outcome": outcome["outcome"], "generation": outcome["tried"]}
+            last_ok = None if outcome["held"] is None else {"outcome": "ok", "generation": outcome["held"]}
+        matcher = Matcher(found.spec.get("patterns"))
+        included, excluded_by = matcher.included(key), matcher.excluded_by(key)
+        if not included:
+            verdict = "not_matched"
+        elif excluded_by is not None:
+            verdict = "excluded"
+        elif outcome is not None:
+            verdict = "failing"
+        elif upstream is None:
+            had = last is not None or any(v is not None for v in held.values())
+            head = self.m.core_output(found.output, found.partition)
+            if not had and head is not None and head["head"]:  # upstream's retained history of it
+                changes, _ = await self.core.run(self.core.index.history, head["layers"], keys=[key], limit=1)
+                had = bool(changes)
+            verdict = "removed" if had else "absent"
+        else:
+            verdict = "pending" if owed else "ok"
+        return {
+            "asset": asset,
+            "partition": partition,
+            "key": key,
+            "input": input,
+            "upstream": found.output,
+            "upstream_partition": found.partition,
+            "upstream_generation": upstream,
+            "outputs": {name: {"present": v is not None, "generation": v} for name, v in held.items()},
+            "patterns": {
+                "spec": found.spec.get("patterns"),
+                "included": included,
+                "excluded_by": excluded_by,
+                "pending": None,  # a change of patterns applies at once: none is ever pending
+            },
+            "outcome": outcome,
+            "last": last,
+            "last_ok": last_ok,
+            "verdict": verdict,
+        }
 
     # -- what an operator may clear (docs/lifecycle.md §9.6, §9.8) -----------------------------------------
 

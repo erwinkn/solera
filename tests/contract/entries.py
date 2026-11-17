@@ -26,23 +26,6 @@ PENDING: dict[str, str] = {
 # skips on its own; these are the ones that would fail instead, or assert something a
 # refused run never reaches.
 LATER: dict[str, str] = {
-    **dict.fromkeys(
-        [
-            "test_key_2_a_cancel_interrupts_keys_still_waiting_for_a_slot",
-            "test_key_9_a_user_cancel_commits_finished_keys_and_leaves_the_rest_owed",
-            "test_key_9_a_timeout_counts_a_try_comes_due_after_backoff_and_fails_past_retries",
-            "test_key_9_a_user_cancel_during_a_timeout_drain_makes_its_keys_canceled",
-        ],
-        "B6: a canceled per-key batch does not commit its finished keys yet",
-    ),
-    **dict.fromkeys(
-        [
-            "test_key_11_explain_says_why_a_key_is_or_is_not_there",
-            "test_key_11_explain_a_key_restored_after_its_removal_is_pending",
-            "test_sta_5_a_domain_too_big_to_list_still_rolls_up",
-        ],
-        "B6 step 4: no route explains a key yet",
-    ),
     **dict.fromkeys(["CLN", "RST-8", "PAR-6", "ENG-13", "ENG-14"], "B9: retention and upkeep"),
     **dict.fromkeys(["HIS-3", "HIS-5", "HIS-7", "HIS-8"], "B10: lineage"),
 }

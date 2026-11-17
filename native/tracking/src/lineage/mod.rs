@@ -19,7 +19,7 @@ use solera_index::{LayerRef, Query};
 use crate::codec::Ver;
 use crate::error::{invalid, Result};
 use crate::plan::{digest, Cand, Hold, Indexes, Mode, Replay, PLANNER_VERSION};
-use crate::progress::{Class, Holding, Key, Keyed, Reason, Value};
+use crate::progress::{Class, Holding, Key, Keyed, Point, Reason, Value};
 use crate::record::Record;
 use crate::state::{Id, Tracking};
 
@@ -430,6 +430,59 @@ pub async fn history(
     })
     .await?;
     Ok(out)
+}
+
+/// What a consumer last delivered of one key, read from its edge's progress
+/// (KEY-11's explain).
+#[derive(Clone, Debug, PartialEq)]
+pub enum Delivered {
+    /// Nothing it can tell of: it never held the key, holds it at no known
+    /// version, or holds nothing at a key list's point, which keeps no
+    /// commit to look back from.
+    Nothing,
+    /// It holds the key at this version: its last ok call's.
+    Holds(Ver),
+    /// Its last batch over the key delivered a removal of it, which it held
+    /// at this version.
+    Removed(Ver),
+}
+
+/// What a consumer last delivered of `key`, from its progress there (its
+/// `point`, else its piece's `value`) over the input at `layers`: the
+/// version it holds, or, holding none, the version the removal it
+/// delivered replaced, where the key's newest change upstream at or before
+/// the commit its piece is at is a removal. A key upstream added and
+/// removed between two of its batches reads as removed too.
+pub async fn delivered(
+    point: Option<&Point>,
+    value: &Value,
+    ix: &solera_index::ChangeIndex,
+    layers: &[LayerRef],
+    key: &[u8],
+) -> Result<Delivered> {
+    if let Some(p) = point {
+        return Ok(match &p.holding {
+            Holding::Version(v, _) => Delivered::Holds(v.clone()),
+            _ => Delivered::Nothing,
+        });
+    }
+    let Value::At(c, conds) = value else {
+        return Ok(Delivered::Nothing);
+    };
+    if !conds.patterns.takes(key) {
+        return Ok(Delivered::Nothing);
+    }
+    let h = history(ix, layers, key).await?;
+    let newest = match h.changes.iter().find(|(at, ..)| at <= c) {
+        Some((_, v, replaced)) => (v.clone(), replaced.clone()),
+        None if *c >= h.floor => (h.at_floor.unwrap_or_default(), Ver::Absent),
+        None => (Ver::Absent, Ver::Absent),
+    };
+    Ok(match newest {
+        (v, _) if !v.is_absent() => Delivered::Holds(v),
+        (_, replaced) if !replaced.is_absent() => Delivered::Removed(replaced),
+        _ => Delivered::Nothing,
+    })
 }
 
 /// Flow metrics (§12) over one window of time, from the counts each batch

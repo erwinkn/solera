@@ -837,6 +837,17 @@ impl Tracking {
         self.per_key.get(edge).map_or(0, |k| k.rebuild)
     }
 
+    /// The part that raises the edge's rebuild counter: a full run of its
+    /// per-key asset asked for by hand (KEY-13).
+    pub fn raise_rebuild(&self, edge: &[u8]) -> Result<Rebuild> {
+        keyed(self, edge)?;
+        Ok(Rebuild {
+            edge: edge.into(),
+            to: self.rebuild(edge) + 1,
+            life: self.per_key.get(edge).map_or(0, |k| k.life),
+        })
+    }
+
     pub(crate) fn next_life(&mut self) -> u64 {
         self.lives += 1;
         self.lives

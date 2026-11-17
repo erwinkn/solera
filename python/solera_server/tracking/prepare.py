@@ -24,19 +24,18 @@ from . import WALK, Core, Generation, Redeployed, canonical, outcomes, output_pi
 from .commit import HeldBack
 from .full import dynamic_sets, held
 
-NOT_YET = "on the new tracking core yet"  # what a refusal of something a later unit builds says
 
-
-def conditions(spec: dict, base: dict) -> dict:
+def conditions(core: Core, edge: bytes, spec: dict, base: dict) -> dict:
     """What a keyed input's keys are processed under (§9): its patterns (of
     its manifest `spec`), the context (the heads of the whole and dep
-    inputs), the definition, and its rebuild counter (a per-key asset's, B6)."""
+    inputs), the definition, and its edge's rebuild counter, which a full
+    run of a per-key asset asked for by hand raises (KEY-13)."""
 
     return {
         "patterns": spec.get("patterns"),
         "context": canonical(base["context"]),
         "definition": base["definition"].encode(),
-        "rebuild": 0,
+        "rebuild": core.tracking.rebuild(edge),
     }
 
 
@@ -110,11 +109,8 @@ async def _prepare(core: Core, task: dict, run: dict, attempt: str | None) -> di
     per_key = next((i for i in keyed if i.spec.get("each") is not None), None)
     if per_key is not None:
         # A per-key asset starts nothing over (D194): each key keeps its rows until its own
-        # call replaces them, and a new definition makes every key owed through the conditions.
-        if run["mode"] == "full":
-            from ..engine import NonRetryable
-
-            raise NonRetryable(f"a full run of a per-key asset asked for by hand does not run {NOT_YET}")
+        # call replaces them. A new definition makes every key owed through the conditions,
+        # and so does a full run asked for by hand, which raises the rebuild counter (below).
         full = base["full"] = False
     elif again:
         full = base["full"] = True
@@ -126,9 +122,8 @@ async def _prepare(core: Core, task: dict, run: dict, attempt: str | None) -> di
         core.attach(*(output_id(i.output, i.partition) for i in keyed))
         own = None
         if per_key is not None:
-            core.attach(
-                *Tracking.outcome_outputs(edges[per_key.param])
-            )  # the plan reads its failing keys' records
+            edge = edges[per_key.param]
+            core.attach(*Tracking.outcome_outputs(edge))  # the plan reads its failing keys' records
             # What the partition holds is its own output's keys: where its edge cannot say
             # (an upstream's new life), a key it holds that upstream lacks is removed.
             name = engine.manifest["assets"][task["asset"]]["outputs"][0]["name"]
@@ -136,9 +131,11 @@ async def _prepare(core: Core, task: dict, run: dict, attempt: str | None) -> di
                 own = output_id(name, task["partition"])
                 core.attach(own)
             if again and own is not None:
-                core.record(Tracking.event_reset(edges[per_key.param], True))
+                core.record(Tracking.event_reset(edge, True))
+            if run["mode"] == "full" and not task.get("progress"):  # its first batch (KEY-13)
+                core.record(core.tracking.event_rebuild(edge))
             # Its failures gone moot since it last looked go first: the plan reads the records.
-            await outcomes.catch_up(core, edges[per_key.param], conditions(per_key.spec, base), task["asset"])
+            await outcomes.catch_up(core, edge, conditions(core, edge, per_key.spec, base), task["asset"])
         after = (mine or {}).get("key")
         index = 0 if mine is None else int(mine["batch"]) + 1
         mode, named = run_mode(run, keyed)
@@ -165,7 +162,7 @@ async def _prepare(core: Core, task: dict, run: dict, attempt: str | None) -> di
             "inputs": [
                 {
                     "edge": edges[i.param],
-                    "conditions": conditions(i.spec, base),
+                    "conditions": conditions(core, edges[i.param], i.spec, base),
                     **({"own": own} if i is per_key and own is not None else {}),
                 }
                 for i in keyed
@@ -226,7 +223,8 @@ async def _prepare(core: Core, task: dict, run: dict, attempt: str | None) -> di
             final = done
             own = final
             if not final and len(keyed) > 1 and mode == "incremental" and not retry:
-                own = not await _more(core, input, edges[input.param], conditions(input.spec, base), hi, full)
+                edge = edges[input.param]
+                own = not await _more(core, input, edge, conditions(core, edge, input.spec, base), hi, full)
             upstream = core.m.core_output(input.output, input.partition)
             size = int(input.spec["batch_size"])
             live = (upstream or {}).get("live", 0)

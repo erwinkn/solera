@@ -348,6 +348,17 @@ def create_app(
             name, partition, key=key, outcomes=outcomes, after=after, limit=limit
         )
 
+    @app.get("/api/projects/{p}/assets/{name}/explain")
+    async def asset_explain(
+        p: str, name: str, request: Request, key: str, partition: str = "", input: str | None = None
+    ):
+        """Why `key` is, or is not, in the asset's output (KEY-11): `ok`,
+        `failing`, `excluded`, `not_matched`, `pending`, `removed` or
+        `absent`, with the evidence."""
+
+        runtime = await asset_engine(request, p, name)
+        return await runtime.explain(name, key, partition, input)
+
     @app.get("/api/projects/{p}/assets/{name}/outcomes/history")
     async def asset_outcome_history(
         p: str,

@@ -465,15 +465,16 @@ impl ChangeIndex {
 
     /// Every retained entry of each key: rows `(key, [(commit, new, replaced), …])`,
     /// newest first; with `commits=(lo, hi)`, only those commits' entries,
-    /// reading only the layers that overlap them. A base's entries at or below
-    /// its floor are the state there.
+    /// reading only the layers that overlap them; with `keys` (sorted), only
+    /// those keys'. A base's entries at or below its floor are the state there.
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (layers, *, commits=None, lo=None, hi=None, after=None, limit=None, include=None, exclude=None))]
+    #[pyo3(signature = (layers, *, commits=None, keys=None, lo=None, hi=None, after=None, limit=None, include=None, exclude=None))]
     fn history<'py>(
         &self,
         py: Python<'py>,
         layers: &Bound<'py, PyAny>,
         commits: Option<(u64, u64)>,
+        keys: Option<Vec<String>>,
         lo: Option<String>,
         hi: Option<String>,
         after: Option<String>,
@@ -486,7 +487,19 @@ impl ChangeIndex {
             let q = query(lo, hi, after, limit, include, exclude)?;
             let (a, b) = commits.unwrap_or((0, u64::MAX));
             let p = py
-                .detach(|| rt().block_on(self.ix.window(&ls, a..=b, &q)))
+                .detach(|| {
+                    rt().block_on(async {
+                        let Some(keys) = &keys else {
+                            return self.ix.window(&ls, a..=b, &q).await;
+                        };
+                        let mut run = Run::new();
+                        let next = self
+                            .ix
+                            .window_keys_with(&ls, a..=b, keys, &q, |g| run.push_key_from(g, 0))
+                            .await?;
+                        Ok(ix::Page { run, next })
+                    })
+                })
                 .map_err(err)?;
             let r = &p.run;
             let rows = PyList::empty(py);
