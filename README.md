@@ -27,8 +27,8 @@ One distribution, `solera`, built with maturin: four Python packages under
   per-key work (encoding, decoding, sorting, merging).
 - `apps/console` — the web console: React and Vite, TanStack Query for data,
   wouter for routes, and Vercel's UI SDK (`@ui-sdk/react`) for the behaviour
-  of menus, dialogs, selects and the timeline's grid. It ships three layouts
-  and three themes; a theme is a set of tokens, and
+  of menus, dialogs, selects and the timeline's grid. It ships three
+  themes; a theme is a set of tokens, and
   [`apps/console/THEMES.md`](apps/console/THEMES.md) says how to write one.
   The built bundle is committed, so running the server needs no Node.
 - `python/solera_server/demo.py` — the self-contained demo project

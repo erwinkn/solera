@@ -3,7 +3,7 @@ import { expect, test, type Page } from "@playwright/test"
 /* A small suite over the real thing: the bundle the server serves, against a
  * server running the demo project. It checks that the overview says how the
  * project is doing, that every place opens, that a run can be started and
- * read on its timeline, and that the layout and the theme switch and stick. */
+ * read on its timeline, and that the theme switches and sticks. */
 
 const problems: string[] = []
 
@@ -22,14 +22,11 @@ test.afterEach(() => {
 
 const chart = (page: Page) => page.getByRole("treegrid")
 
-/** Pick a layout and a theme from the menu every layout carries. Changing the
- * layout redraws the frame, menu included, so each choice opens it afresh. */
-async function setLook(page: Page, layout: string, theme: string) {
-  for (const choice of [theme, layout]) {
-    await page.getByRole("button", { name: "Change the layout or the theme" }).click()
-    await page.getByRole("menuitemradio", { name: new RegExp(`^${choice}`) }).click()
-    await page.keyboard.press("Escape")
-  }
+/** Pick a theme from the menu beside the health status. */
+async function setTheme(page: Page, theme: string) {
+  await page.getByRole("button", { name: "Change the theme" }).click()
+  await page.getByRole("menuitemradio", { name: new RegExp(`^${theme}`) }).click()
+  await page.keyboard.press("Escape")
 }
 
 test("the overview says how every asset is doing and what it did lately", async ({ page }) => {
@@ -73,7 +70,7 @@ test("every place opens, by its link and by its address", async ({ page }) => {
   await expect(page.getByRole("tab", { name: "Definition" })).toHaveAttribute("aria-selected", "true")
   await expect(page.getByText("one call per changed key")).toBeVisible()
   await page.goto("/no/such/place")
-  await expect(page.getByText("This address leads nowhere")).toBeVisible()
+  await expect(page.getByText("No page at this address")).toBeVisible()
 })
 
 test("a run can be started, and read on its timeline", async ({ page }) => {
@@ -83,7 +80,10 @@ test("a run can be started, and read on its timeline", async ({ page }) => {
   await dialog.getByRole("combobox", { name: "Assets to run" }).click()
   await page.getByRole("option", { name: "deploy_notice" }).click()
   await page.keyboard.press("Escape")
-  await dialog.getByRole("button", { name: "Start the run" }).click()
+  // a job has no partitions and reads nothing incrementally: neither choice is offered
+  await expect(dialog.getByLabel("Which partitions")).toHaveCount(0)
+  await expect(dialog.getByLabel("Mode")).toHaveCount(0)
+  await dialog.getByRole("button", { name: "Start", exact: true }).click()
 
   await expect(page).toHaveURL(/\/runs\/[0-9A-Z]{26}$/)
   await expect(page.getByRole("heading", { level: 1 })).toHaveText("deploy_notice")
@@ -101,6 +101,24 @@ test("a run can be started, and read on its timeline", async ({ page }) => {
   await expect(page.getByRole("row", { name: /deploy_notice.*Manual, from the console/ }).first()).toBeVisible()
 })
 
+test("starting a run offers the choices that apply to the assets picked", async ({ page }) => {
+  await page.goto("/assets/file_checks")
+  await page.getByRole("button", { name: "Run", exact: true }).click() // the asset's own button, with the asset filled in
+  const dialog = page.getByRole("dialog", { name: "Start a run" })
+  await expect(dialog.getByRole("combobox", { name: "Assets to run" })).toContainText("file_checks")
+  // partitioned by site, and it reads its files incrementally
+  const which = dialog.getByLabel("Which partitions")
+  for (const choice of ["Stale", "All", "Selected"]) await expect(which.getByText(choice, { exact: true })).toBeVisible()
+  await which.getByText("All", { exact: true }).click()
+  await expect(dialog.getByText(/^\d+ partitions?$/)).toBeVisible()
+  const mode = dialog.getByLabel("Mode")
+  await expect(mode.getByText("Incremental", { exact: true })).toBeVisible()
+  await expect(mode.getByText("Full run", { exact: true })).toBeVisible()
+  await expect(dialog.getByText("Run dependencies first")).toBeVisible()
+  await dialog.getByRole("button", { name: "Cancel" }).click()
+  await expect(dialog).toHaveCount(0)
+})
+
 test("the timeline works from the keyboard", async ({ page, request }) => {
   const started = await request.post("/api/projects/demo/runs", { data: { targets: ["sites", "deploy_notice"], partitions: "latest", mode: "incremental", upstream: false, by: "test" } })
   const run = await started.json()
@@ -116,29 +134,23 @@ test("the timeline works from the keyboard", async ({ page, request }) => {
   await expect(rows.nth(2)).toBeFocused()
 })
 
-test("the layout and the theme switch at once and are remembered", async ({ page }) => {
+test("the theme switches at once and is remembered", async ({ page }) => {
   await page.goto("/")
   const html = page.locator("html")
-  await expect(html).toHaveAttribute("data-variation", "workbench")
   // nothing chosen yet: the theme follows the system, which is light in this browser
   await expect(html).toHaveAttribute("data-theme", "light")
   const white = await html.evaluate((element) => getComputedStyle(element).backgroundColor)
 
-  await setLook(page, "Control room", "Dark")
-  await expect(html).toHaveAttribute("data-variation", "deck")
+  await setTheme(page, "Dark")
   await expect(html).toHaveAttribute("data-theme", "dark")
-  await expect(page.getByRole("complementary", { name: "Assets" })).toBeVisible() // the list pane only this layout has
   expect(await html.evaluate((element) => getComputedStyle(element).backgroundColor)).not.toBe(white)
 
   await page.reload()
-  await expect(html).toHaveAttribute("data-variation", "deck")
   await expect(html).toHaveAttribute("data-theme", "dark")
   await expect(page.getByRole("row", { name: /^sites\b/ })).toBeVisible()
 
-  await setLook(page, "Briefing", "Dimmed")
-  await expect(html).toHaveAttribute("data-variation", "briefing")
+  await setTheme(page, "Dimmed")
   await expect(html).toHaveAttribute("data-theme", "dimmed")
-  await expect(page.getByRole("heading", { name: "Assets", level: 2 })).toBeVisible()
   // one typeface for the interface in every theme, served by the console itself
   expect(await page.locator("body").evaluate((element) => getComputedStyle(element).fontFamily)).toContain("Inter Variable")
   expect(await page.evaluate(() => document.fonts.check('13px "Inter Variable"'))).toBe(true)

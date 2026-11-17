@@ -8,7 +8,7 @@ import { Strip, StripAxis, StripTotal } from "./activity"
 import { Ago, Dot, Failure, Loading, StatusPill } from "./atoms"
 import { healthStatus, useUpcoming } from "./engine"
 
-/* The overview, the same in every layout. It answers three questions in the
+/* The overview. It answers three questions in the
  * order someone arriving asks them: is everything up to date, what is wrong,
  * and what is running or about to. */
 

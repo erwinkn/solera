@@ -7,7 +7,6 @@ import { count, duration, partitionLabel, plural, until } from "../model/format"
 import { projectGraph } from "../model/graph"
 import { assetStatus, FAILING_KEYS, keyStatus, partitionStatus, triggerText, type Tone } from "../model/status"
 import { Button, TextField, Tip, Toggle } from "../ui/controls"
-import { MarkIcon } from "../ui/status"
 import { ActionMenu, PickMany, report } from "../ui/overlays"
 import { Ago, AssetLink, Dot, Empty, Facts, Failure, Loading, Notice, RunLink, SourceLink, StatusPill } from "./atoms"
 import { openStartRun } from "./start-run"
@@ -155,38 +154,6 @@ export function PartitionMeter({ status }: { status: AssetStatus }) {
         {p.missing > 0 && <span className="meter-rest" style={{ flexGrow: p.missing }} />}
       </div>
     </div>
-  )
-}
-
-/** A narrow list of assets with their status, for a side pane. */
-export function AssetsFeed({ selected }: { selected?: string }) {
-  const manifest = useManifest()
-  const statuses = useStatuses()
-  if (!manifest.data) return <Loading />
-  return (
-    <ul className="feed">
-      {Object.keys(manifest.data.assets).map((name) => {
-        const state = assetStatus(statuses.data?.assets[name])
-        return (
-          <li key={name}>
-            <Link href={`/assets/${encodeURIComponent(name)}`} className="feed-item" aria-current={name === selected ? "page" : undefined}>
-              <Dot tone={state.tone} />
-              <span className="grow truncate">{name}</span>
-              {state.tone !== "ok" && <span className="faint">{state.label}</span>}
-            </Link>
-          </li>
-        )
-      })}
-      {Object.keys(manifest.data.sources).map((name) => (
-        <li key={name}>
-          <Link href={`/sources/${encodeURIComponent(name)}`} className="feed-item" aria-current={name === selected ? "page" : undefined}>
-            <MarkIcon mark="source" />
-            <span className="grow truncate">{name}</span>
-            <span className="faint">source</span>
-          </Link>
-        </li>
-      ))}
-    </ul>
   )
 }
 
@@ -338,7 +305,7 @@ export function KeysPanel({ name }: { name: string }) {
       ) : !keys.data ? (
         <Loading what="Loading keys" />
       ) : !keys.data.keys.length ? (
-        <Empty title={outcomes.some((o) => o === "ok") ? "No key matches" : "No key needs attention"}>Every key this asset was given went through.</Empty>
+        <Empty title={outcomes.some((o) => o === "ok") ? "No key matches" : "No key needs attention"} />
       ) : (
         <div className="table-scroll">
           <table className="table">
@@ -374,7 +341,7 @@ export function KeysPanel({ name }: { name: string }) {
           </table>
         </div>
       )}
-      {keys.data?.next && <p className="table-foot muted">Showing the first {keys.data.keys.length}. Narrow it down with the outcome filter, or find a key by name.</p>}
+      {keys.data?.next && <p className="table-foot muted">Showing the first {keys.data.keys.length} keys.</p>}
     </>
   )
 }
@@ -384,7 +351,7 @@ export function CommitsTable({ name }: { name: string }) {
   const now = Date.now() / 1000
   if (commits.error) return <Failure error={commits.error} />
   if (!commits.data) return <Loading what="Loading history" />
-  if (!commits.data.commits.length) return <Empty title="Nothing written yet">Each time a run writes this asset, the write is listed here.</Empty>
+  if (!commits.data.commits.length) return <Empty title="Nothing written yet" />
   return (
     <div className="table-scroll">
       <table className="table">
@@ -509,7 +476,7 @@ export function Definition({ name }: { name: string }) {
             ))}
           </ul>
         ) : (
-          <p className="muted">Nothing starts it on its own. Run it by hand.</p>
+          <p className="muted">No automation starts it.</p>
         )}
       </div>
     </div>

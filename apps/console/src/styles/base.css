@@ -8,13 +8,9 @@
 @import "./fonts.css";
 
 :root {
-  /* a variation scales the theme's density and type; see the layout files */
-  --vary-density: 1;
-  --vary-type: 1;
-
   --u: var(--space);
-  --d: calc(var(--density) * var(--vary-density));
-  --text: calc(var(--font-size) * var(--vary-type));
+  --d: var(--density);
+  --text: var(--font-size);
   --text-xs: calc(var(--text) * 0.846);
   --text-s: calc(var(--text) * 0.923);
   --text-l: calc(var(--text) * 1.077);
@@ -25,7 +21,7 @@
   --row: calc(32px * var(--d));
   --control: calc(28px * var(--d));
   --control-s: calc(22px * var(--d));
-  /* how far content sits from the edge of its pane: a layout sets it */
+  /* how far content sits from the edge of its pane */
   --gutter: calc(var(--u) * 6);
   --hairline: var(--border-width) solid var(--color-border);
   --edge: var(--border-width) solid var(--color-border-strong);

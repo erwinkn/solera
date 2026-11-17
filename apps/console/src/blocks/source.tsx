@@ -50,10 +50,10 @@ export function SourceCommitForm({ name }: { name: string }) {
     try {
       const result = (await commit.mutateAsync(keyed ? { source: name, upsert: split(upsert), remove: split(remove) } : { source: name, version: version.trim() })) as { changed: boolean; run?: string }
       if (!result.changed) {
-        toast("Nothing changed", { description: "The source already was as you described it." })
+        toast("Nothing changed")
         return
       }
-      toast.success(`Committed to ${name}`, { description: "Assets that read it and run on change will start." })
+      toast.success(`Committed to ${name}`)
       setUpsert("")
       setRemove("")
       setVersion("")
@@ -70,14 +70,13 @@ export function SourceCommitForm({ name }: { name: string }) {
         if (ready) void submit()
       }}
     >
-      <p className="muted">Tell the engine this source changed. No data moves: assets that read it see the change and load it themselves.</p>
       {keyed ? (
         <>
-          <TextField label="Keys added or changed" value={upsert} onChange={setUpsert} rows={3} mono placeholder="one key per line" description="Each one counts as changed, and is loaded again by whatever reads it." />
+          <TextField label="Keys added or changed" value={upsert} onChange={setUpsert} rows={3} mono placeholder="one key per line" />
           <TextField label="Keys removed" value={remove} onChange={setRemove} rows={2} mono placeholder="one key per line" />
         </>
       ) : (
-        <TextField label="New version" value={version} onChange={setVersion} mono placeholder="for example 2026-11-17" description="Any text that differs from the current version. The same version again changes nothing." />
+        <TextField label="New version" value={version} onChange={setVersion} mono placeholder="for example 2026-11-17" description="The same version again changes nothing." />
       )}
       <div className="row">
         <Button type="submit" variant="primary" disabled={!ready}>

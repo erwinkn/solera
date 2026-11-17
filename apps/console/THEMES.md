@@ -10,7 +10,7 @@ The console ships three themes, in `src/theme/themes.ts`. They are the themes of
 
 Until someone picks a theme, the console follows the system: Dark, or Light when the system is light.
 
-Layout is a separate choice. Any theme works with any of the three layouts (Workbench, Control room, Briefing), and both switch in the running app from the palette button beside the health status, or from Settings. The browser remembers them.
+The theme switches in the running app from the palette button beside the health status, or from Settings. The browser remembers it.
 
 ## Make your own
 
@@ -37,7 +37,7 @@ The page repaints as you type, so you see the theme before you save it. The edit
 
 Saved themes live in this browser's storage, under the key `solera.console.look`. Nothing is sent to the server. To ship a theme to everyone, add it to `BUILT_IN` in `src/theme/themes.ts` and rebuild.
 
-Two limits to know about. The server's content security policy allows fonts from the console's own files only, so `font-*` tokens can name the two bundled families (`Inter Variable`, `JetBrains Mono Variable`) or a font installed on the reader's machine. And a theme cannot reach a layout: where things sit is the layout's business.
+Two limits to know about. The server's content security policy allows fonts from the console's own files only, so `font-*` tokens can name the two bundled families (`Inter Variable`, `JetBrains Mono Variable`) or a font installed on the reader's machine. And a theme cannot move things: where they sit is not a token.
 
 ## The tokens
 

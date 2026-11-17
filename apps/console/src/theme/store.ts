@@ -2,28 +2,20 @@ import { useSyncExternalStore } from "react"
 import { BUILT_IN, defaultTheme } from "./themes"
 import { TOKEN_NAMES, type CustomTheme, type Theme } from "./tokens"
 
-/* What the browser remembers about how the console looks: the layout, the
+/* What the browser remembers about how the console looks: the
  * theme, and the themes this person made. One localStorage entry. */
 
-export const VARIATIONS = [
-  { id: "workbench", name: "Workbench", note: "Sidebar and pages. A page for each thing" },
-  { id: "deck", name: "Control room", note: "Dense. Three panes on one screen" },
-  { id: "briefing", name: "Briefing", note: "One column that reads like a status report" },
-] as const
-export type VariationId = (typeof VARIATIONS)[number]["id"]
-
-export type Look = { variation: VariationId; theme: string; custom: CustomTheme[] }
+export type Look = { theme: string; custom: CustomTheme[] }
 
 const KEY = "solera.console.look"
 const PAINT = "solera.console.paint"
-const INITIAL: Look = { variation: "workbench", theme: defaultTheme().id, custom: [] }
+const INITIAL: Look = { theme: defaultTheme().id, custom: [] }
 
 function read(): Look {
   try {
     const saved = JSON.parse(localStorage.getItem(KEY) ?? "null")
     if (saved && typeof saved === "object")
       return {
-        variation: VARIATIONS.some((v) => v.id === saved.variation) ? saved.variation : INITIAL.variation,
         theme: typeof saved.theme === "string" ? saved.theme : INITIAL.theme,
         custom: Array.isArray(saved.custom) ? saved.custom : [],
       }
@@ -78,7 +70,6 @@ export function paint(preview?: Theme) {
   const root = document.documentElement
   for (const name of TOKEN_NAMES) root.style.setProperty(`--${name}`, theme.tokens[name])
   root.style.setProperty("color-scheme", theme.tokens.scheme)
-  root.dataset.variation = look.variation
   root.dataset.theme = theme.id
   if (!preview)
     try {

@@ -1,4 +1,4 @@
-/* Blocks: the pieces pages are made of, the same in every layout. */
+/* Blocks: the pieces pages are made of. */
 
 @layer blocks {
   .gate { min-height: 100dvh; display: grid; place-items: center; padding: calc(var(--u) * 6); }
@@ -10,7 +10,6 @@
   .ref { font-family: var(--font-mono); font-size: 0.923em; color: var(--color-text-muted); }
   a.ref:hover { color: var(--color-text); text-decoration: underline; text-underline-offset: 0.22em; }
   a.status:hover { text-decoration: underline; text-underline-offset: 0.22em; }
-  .brand { font-weight: var(--font-weight-strong); }
   .logo { fill: var(--color-text); }
 
   .subhead { font-size: var(--text-s); font-weight: var(--font-weight); color: var(--color-text-muted); margin-bottom: calc(var(--u) * 2); }
@@ -52,7 +51,6 @@
   a.line:hover { background: var(--hover); }
   a.line:focus-visible { outline-offset: -2px; }
   .lines-empty { padding: calc(var(--u) * 3) var(--gutter); }
-  .upcoming-when { flex: none; width: calc(var(--u) * 14); color: var(--color-text-muted); }
 
   /* activity strips */
   .strip-col { width: 372px; min-width: 252px; }
@@ -109,10 +107,6 @@
 
   /* feeds: narrow lists of links, for a side pane */
   .feed { display: flex; flex-direction: column; }
-  .feed-item { display: flex; align-items: center; gap: calc(var(--u) * 2); width: 100%; min-height: calc(var(--row) - 4px); padding: 0 var(--gutter); font-size: var(--text); border-radius: 0; transition: background var(--quick); }
-  .feed-item:hover { background: var(--hover); }
-  .feed-item[aria-current="page"], .feed-item[aria-pressed="true"] { background: var(--selected); }
-  .feed-item:focus-visible { outline-offset: -2px; }
 
   /* partitions as cells */
   .cells { display: flex; flex-wrap: wrap; gap: 2px; }
@@ -128,13 +122,9 @@
   .choice { display: flex; flex-direction: column; gap: calc(var(--u) * 0.5); padding: calc(var(--u) * 3); border: var(--hairline); border-radius: var(--radius-m); transition: border-color var(--quick), background var(--quick); }
   .choice:hover { border-color: var(--color-border-strong); }
   .choice[aria-checked="true"] { border-color: var(--color-text); box-shadow: inset 0 0 0 var(--border-width) var(--color-text); }
-  .choice .swatch, .choice .sketch { margin-bottom: calc(var(--u) * 2); }
+  .choice .swatch { margin-bottom: calc(var(--u) * 2); }
   .swatch { display: inline-flex; align-items: center; gap: 3px; padding: 4px 5px; border: 1px solid; flex: none; width: fit-content; }
   .swatch span { width: 7px; height: 7px; border-radius: 50%; }
-  .sketch { width: 80px; height: 46px; }
-  .sketch-frame { fill: var(--color-bg); stroke: var(--color-border-strong); }
-  .sketch-fill { fill: var(--color-border); }
-  .sketch-ink { fill: var(--color-text-faint); }
   .custom-list { margin-bottom: calc(var(--u) * 2); }
   .theme-editor textarea { min-height: 260px; }
   .token-list { display: grid; grid-template-columns: max-content 1fr; gap: var(--u) calc(var(--u) * 4); font-size: var(--text-s); }

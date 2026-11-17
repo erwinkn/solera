@@ -4,40 +4,23 @@ import { useEffect, useRef, useState } from "react"
 import { useLocation } from "wouter"
 import { forgetToken, hasToken } from "../api/client"
 import { BUILT_IN, starterTheme } from "../theme/themes"
-import { currentTheme, paint, resolve, setLook, themes, useLook, VARIATIONS, type VariationId } from "../theme/store"
+import { currentTheme, paint, resolve, setLook, themes, useLook } from "../theme/store"
 import { parseCustomTheme, TOKENS, TOKEN_NAMES, type CustomTheme, type Problem, type Theme } from "../theme/tokens"
 import { Button, Disclosure, TextField } from "../ui/controls"
 import { confirm, toast } from "../ui/overlays"
 import { Notice, Panel } from "./atoms"
 
-/* How the console looks: which of the three layouts, and which theme. Both are
- * remembered in the browser and change at once, without a reload. */
+/* How the console looks: which theme. It is remembered in the browser and
+ * changes at once, without a reload. */
 
-/** The quick switch every layout carries, so the nine combinations are two clicks apart. */
-export function LookMenu({ label = "" }: { label?: string }) {
+/** The quick switch beside the health status. */
+export function LookMenu() {
   const look = useLook()
   const [, navigate] = useLocation()
   return (
     <Menu>
-      <MenuTrigger render={<Button variant="quiet" icon={<PaletteIcon size={15} />} aria-label="Change the layout or the theme" />}>{label}</MenuTrigger>
+      <MenuTrigger render={<Button variant="quiet" icon={<PaletteIcon size={15} />} aria-label="Change the theme" />} />
       <MenuContent className="popup menu look-menu" align="end" sideOffset={6}>
-        <MenuGroup>
-          <MenuGroupLabel className="menu-label">Layout</MenuGroupLabel>
-          <MenuRadioGroup value={look.variation} onValueChange={(value) => setLook({ variation: value as VariationId })}>
-            {VARIATIONS.map((v) => (
-              <MenuRadioItem key={v.id} value={v.id} className="menu-item" closeOnSelect={false}>
-                <span className="grow">
-                  {v.name}
-                  <span className="menu-note">{v.note}</span>
-                </span>
-                <MenuItemIndicator className="menu-check">
-                  <Check size={14} />
-                </MenuItemIndicator>
-              </MenuRadioItem>
-            ))}
-          </MenuRadioGroup>
-        </MenuGroup>
-        <MenuSeparator className="menu-separator" />
         <MenuGroup>
           <MenuGroupLabel className="menu-label">Theme</MenuGroupLabel>
           <MenuRadioGroup value={currentTheme(look).id} onValueChange={(value) => setLook({ theme: value })}>
@@ -83,20 +66,7 @@ export function LookSettings() {
   const active = currentTheme(look)
   return (
     <div className="stack settings">
-      <Panel title="Layout">
-        <p className="muted settings-lead">Three arrangements of the same console. They show the same data and differ in how pages are put together.</p>
-        <div className="choices" role="radiogroup" aria-label="Layout">
-          {VARIATIONS.map((v) => (
-            <button key={v.id} role="radio" aria-checked={look.variation === v.id} className="choice" onClick={() => setLook({ variation: v.id })}>
-              <Sketch variation={v.id} />
-              <span className="name">{v.name}</span>
-              <span className="muted">{v.note}</span>
-            </button>
-          ))}
-        </div>
-      </Panel>
       <Panel title="Theme">
-        <p className="muted settings-lead">Colours, type, corners, spacing and motion. A theme works with every layout.</p>
         <div className="choices" role="radiogroup" aria-label="Theme">
           {themes(look).map((theme) => (
             <button key={theme.id} role="radio" aria-checked={active.id === theme.id} className="choice" onClick={() => setLook({ theme: theme.id })}>
@@ -110,45 +80,6 @@ export function LookSettings() {
       <CustomThemes />
       <SessionPanel />
     </div>
-  )
-}
-
-/** A tiny drawing of each layout's bones. */
-function Sketch({ variation }: { variation: VariationId }) {
-  return (
-    <svg className="sketch" viewBox="0 0 96 56" aria-hidden="true">
-      <rect x="0.5" y="0.5" width="95" height="55" rx="3" className="sketch-frame" />
-      {variation === "workbench" && (
-        <>
-          <rect x="0.5" y="0.5" width="20" height="55" className="sketch-fill" />
-          <rect x="27" y="8" width="62" height="6" className="sketch-ink" />
-          <rect x="27" y="20" width="62" height="14" className="sketch-fill" />
-          <rect x="27" y="38" width="29" height="11" className="sketch-fill" />
-          <rect x="60" y="38" width="29" height="11" className="sketch-fill" />
-        </>
-      )}
-      {variation === "deck" && (
-        <>
-          <rect x="0.5" y="0.5" width="95" height="8" className="sketch-fill" />
-          <rect x="0.5" y="8.5" width="18" height="41" className="sketch-fill" />
-          <rect x="70" y="8.5" width="25.5" height="41" className="sketch-fill" />
-          <rect x="22" y="13" width="44" height="3" className="sketch-ink" />
-          <rect x="22" y="20" width="30" height="3" className="sketch-ink" />
-          <rect x="30" y="27" width="34" height="3" className="sketch-ink" />
-          <rect x="26" y="34" width="20" height="3" className="sketch-ink" />
-          <rect x="0.5" y="49.5" width="95" height="6" className="sketch-fill" />
-        </>
-      )}
-      {variation === "briefing" && (
-        <>
-          <rect x="26" y="8" width="30" height="7" className="sketch-ink" />
-          <rect x="26" y="20" width="44" height="2.5" className="sketch-fill" />
-          <rect x="26" y="25" width="38" height="2.5" className="sketch-fill" />
-          <rect x="14" y="32" width="68" height="12" className="sketch-fill" />
-          <rect x="26" y="48" width="40" height="2.5" className="sketch-fill" />
-        </>
-      )}
-    </svg>
   )
 }
 
@@ -168,7 +99,7 @@ function CustomThemes() {
       }
     >
       <p className="muted settings-lead">
-        A theme is a short piece of JSON: a name, the built-in theme it starts from, and the tokens it changes. It is kept in this browser. THEMES.md in the console's folder lists every token.
+        Kept in this browser. THEMES.md in the console's folder lists every token.
       </p>
       {look.custom.length > 0 && editing === null && (
         <ul className="plain-list custom-list">
@@ -240,7 +171,7 @@ function ThemeEditor({ existing, close }: { existing?: CustomTheme; close: () =>
 
   return (
     <div className="stack theme-editor">
-      <TextField label="Theme as JSON" value={text} onChange={setText} rows={14} mono description="The page shows your theme as you type. Nothing is saved until you press Save." />
+      <TextField label="Theme as JSON" value={text} onChange={setText} rows={14} mono description="Previewed as you type." />
       {problems.length > 0 && (
         <Notice tone="failed">
           <ul className="plain-list">

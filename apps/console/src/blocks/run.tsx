@@ -160,7 +160,7 @@ function RunOverview({ detail }: { detail: RunDetail }) {
     <div className="stack inspector">
       <RunFacts run={detail.request} />
       <Errors tasks={failed.slice(0, 8)} named={(task) => `${task.asset} ${partitionLabel(task.partition)}`.trim()} />
-      {detail.tasks.length > 0 && <p className="faint">Select a step on the timeline to see its attempts and logs.</p>}
+      {detail.tasks.length > 0 && <p className="faint">Select a step to see its attempts and logs.</p>}
     </div>
   )
 }
@@ -221,7 +221,7 @@ function TaskPanel({ detail, task, at }: { detail: RunDetail; task: Task; at: Ex
         />
       )}
       {attempt ? <AttemptPanel run={task.run} task={task} attempt={attempt} count={attempts.length} live={live} /> : <p className="muted">It has not started yet.</p>}
-      <Disclosure summary="Everything that happened to this task">
+      <Disclosure summary="Events">
         <Events run={task.run} task={task.id} live={isLive(detail.request)} />
       </Disclosure>
     </div>

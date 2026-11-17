@@ -17,7 +17,7 @@ export function AutomationsTable({ dense }: { dense?: boolean }) {
   if (automations.error) return <Failure error={automations.error} />
   if (!automations.data) return <Loading what="Loading automations" />
   const rows = [...automations.data.automations].sort((a, b) => (a.next_at ?? Infinity) - (b.next_at ?? Infinity) || a.name.localeCompare(b.name))
-  if (!rows.length) return <Empty title="No automation">Declare one on an asset to have it run by itself.</Empty>
+  if (!rows.length) return <Empty title="No automation" />
   return (
     <div className="table-scroll">
       <table className="table">
@@ -70,7 +70,7 @@ export function SensorsTable() {
   const now = Date.now() / 1000
   if (sensors.error) return <Failure error={sensors.error} />
   if (!sensors.data) return <Loading />
-  if (!sensors.data.sensors.length) return <Empty title="No sensor">A sensor checks something outside every few seconds and commits what it finds to a source.</Empty>
+  if (!sensors.data.sensors.length) return <Empty title="No sensor" />
   return (
     <div className="table-scroll">
       <table className="table">

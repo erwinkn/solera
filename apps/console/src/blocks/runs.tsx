@@ -3,11 +3,11 @@ import { useState } from "react"
 import { Link, useLocation } from "wouter"
 import { useManifest, useRunFacets, useRunHistogram, useRuns, type RunsFilter } from "../api/queries"
 import type { Manifest, RunRow } from "../api/types"
-import { clock, clockShort, count, duration, list, partitionLabel, per, plural, when } from "../model/format"
+import { clockShort, count, duration, list, partitionLabel, per, plural, when } from "../model/format"
 import { runStatus, triggerText, type Tone } from "../model/status"
 import { Button, TextField, useChartTip } from "../ui/controls"
 import { PickMany } from "../ui/overlays"
-import { Ago, Dot, Empty, Failure, Loading, StatusPill, useParam } from "./atoms"
+import { Ago, Empty, Failure, Loading, StatusPill, useParam } from "./atoms"
 
 /* Lists of runs: a table for a page, a narrow feed for a side pane, and the
  * filters and histogram that go with either. */
@@ -140,7 +140,7 @@ export function RunsTable({ filter, limit = 50, dense, brief }: { filter: RunsFi
   const now = Date.now() / 1000
   if (runs.error) return <Failure error={runs.error} />
   if (!runs.data) return <Loading what="Loading runs" />
-  if (!runs.data.runs.length) return <Empty title="No runs match">Change the filters, or start a run.</Empty>
+  if (!runs.data.runs.length) return <Empty title="No runs match" />
   return (
     <>
       <div className="table-scroll">
@@ -190,26 +190,3 @@ export function RunsTable({ filter, limit = 50, dense, brief }: { filter: RunsFi
   )
 }
 
-/** A narrow list of runs, newest first, for a side pane. */
-export function RunsFeed({ filter, selected, limit = 60 }: { filter: RunsFilter; selected?: string; limit?: number }) {
-  const runs = useRuns(filter, limit)
-  if (runs.error) return <Failure error={runs.error} />
-  if (!runs.data) return <Loading />
-  if (!runs.data.runs.length) return <Empty title="No runs" />
-  return (
-    <ul className="feed">
-      {runs.data.runs.map((run) => (
-        <li key={run.id}>
-          <Link href={`/runs/${run.id}`} className="feed-item" aria-current={run.id === selected ? "page" : undefined}>
-            <Dot tone={runStatus(run.status).tone} />
-            <span className="grow truncate">
-              <span className="name">{runWhat(run)}</span>
-              <span className="muted"> {runWhere(run)}</span>
-            </span>
-            <span className="faint num">{clock(run.created_at)}</span>
-          </Link>
-        </li>
-      ))}
-    </ul>
-  )
-}

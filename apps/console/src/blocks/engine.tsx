@@ -2,7 +2,7 @@ import { ChevronRight, Eraser, Trash2 } from "lucide-react"
 import { useState, type ReactNode } from "react"
 import { Link } from "wouter"
 import { useAutomations, useClearCleanups, useCleanups, useDiagnostics, useExecutors, useHealth, useManifest, usePruneRuns, useSensors, useStatuses, useWorkers, type Health } from "../api/queries"
-import { partitionLabel, plural, until, when } from "../model/format"
+import { partitionLabel, plural, when } from "../model/format"
 import { assetStatus, triggerText, type Status, type Tone } from "../model/status"
 import { Button } from "../ui/controls"
 import { confirm, Pick, report, toast } from "../ui/overlays"
@@ -70,7 +70,7 @@ export function useAttention(): { concerns: Concern[]; ready: boolean } {
 export function Attention({ limit }: { limit?: number }) {
   const { concerns, ready } = useAttention()
   if (!ready) return <Loading />
-  if (!concerns.length) return <p className="lines-empty muted">Everything is up to date and nothing is waiting on you.</p>
+  if (!concerns.length) return <p className="lines-empty muted">Nothing needs attention.</p>
   const shown = limit ? concerns.slice(0, limit) : concerns
   return (
     <ul className="lines">
@@ -101,26 +101,6 @@ export function useUpcoming(): Next[] {
   for (const s of sensors.data?.sensors ?? [])
     if (s.due_in !== null) out.push({ at: now + s.due_in, name: s.name, what: `Sensor, every ${s.every}s`, href: `/sensors/${encodeURIComponent(s.name)}`, targets: s.commits })
   return out.sort((a, b) => a.at - b.at)
-}
-
-export function Upcoming({ limit = 6 }: { limit?: number }) {
-  const next = useUpcoming()
-  const now = Date.now() / 1000
-  if (!next.length) return <Empty title="Nothing is scheduled">Automations that wait for a change start when it happens.</Empty>
-  return (
-    <ul className="lines">
-      {next.slice(0, limit).map((item) => (
-        <li key={item.name}>
-          <Link href={item.href} className="line">
-            <span className="num upcoming-when">{until(item.at, now)}</span>
-            <span className="grow truncate">
-              <span className="name">{item.targets.join(", ")}</span> <span className="muted">{item.what.toLowerCase()}</span>
-            </span>
-          </Link>
-        </li>
-      ))}
-    </ul>
-  )
 }
 
 export function EngineFacts() {
@@ -214,7 +194,7 @@ export function CleanupsPanel() {
   const now = Date.now() / 1000
   if (!cleanups.data) return <Loading />
   const rows = cleanups.data.cleanups
-  if (!rows.length) return <Empty title="No cleanup is stuck or waiting">Old versions of outputs are removed in the background.</Empty>
+  if (!rows.length) return <Empty title="No cleanup is stuck or waiting" />
   return (
     <div className="table-scroll">
       <table className="table">
@@ -290,7 +270,6 @@ export function PruneRuns() {
       <Button size="s" variant="danger" icon={<Trash2 size={13} />} onClick={run}>
         Delete old runs
       </Button>
-      <span className="muted">Runs also expire by themselves, as the project's retention says.</span>
     </div>
   )
 }

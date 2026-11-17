@@ -19,9 +19,9 @@ import { shortId } from "../model/format"
 import { assetStatus, runStatus } from "../model/status"
 import { IconButton, Tabs, TextField } from "../ui/controls"
 import { Sheet } from "../ui/overlays"
-import { isCurrent, Logo, PLACES, SearchButton, StartRunButton, type Layout } from "./shared"
+import { isCurrent, Logo, PLACES, SearchButton, StartRunButton } from "./chrome"
 
-/* Workbench: a sidebar of places and a page for each thing. Every page has
+/* The console's frame and pages: a sidebar of places and a page for each thing. Every page has
  * the same bones: where you are, a title with its state and actions, then
  * sections that run edge to edge, parted by hairlines. */
 
@@ -275,7 +275,7 @@ function Asset({ name }: { name: string }) {
 
 function Source({ name }: { name: string }) {
   return (
-    <Page title={name} meta="A source: data that lives outside the project. The engine knows it at versions.">
+    <Page title={name}>
       <div className="wb-split">
         <div>
           <Panel title="About">
@@ -313,7 +313,7 @@ function Automations() {
 
 function Sensor({ name }: { name: string }) {
   return (
-    <Page title={name} meta="A sensor: a check that runs every few seconds and may commit to a source.">
+    <Page title={name}>
       <Panel title="About">
         <SensorFacts name={name} />
       </Panel>
@@ -356,11 +356,11 @@ const Settings = () => (
 )
 
 const NotFound = () => (
-  <Page title="Nothing here">
-    <Empty title="This address leads nowhere">
+  <Page title="Not found">
+    <Empty title="No page at this address">
       <Link href="/" className="link">Back to the overview</Link>
     </Empty>
   </Page>
 )
 
-export const workbench: Layout = { Shell, Home, Runs, Run, Assets, Asset, Source, Automations, Sensor, Engine, Keys, Settings, NotFound }
+export { Shell, Home, Runs, Run, Assets, Asset, Source, Automations, Sensor, Engine, Keys, Settings, NotFound }

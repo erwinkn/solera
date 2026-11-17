@@ -24,7 +24,7 @@ export function KeyLookup() {
   const assets = perKeyAssets(manifest.data)
   const chosen = asset || assets[0] || ""
   if (!manifest.data) return <Loading />
-  if (!assets.length) return <Empty title="No asset works key by key">An asset called once per key keeps an outcome for each. This project has none.</Empty>
+  if (!assets.length) return <Empty title="No asset works key by key" />
   return (
     <>
       <form
@@ -43,7 +43,7 @@ export function KeyLookup() {
           Look it up
         </Button>
       </form>
-      {key ? <KeyStory asset={chosen} name={key} /> : <p className="panel-body muted">A key is one item an asset works on by itself: one file, one upload, one row.</p>}
+      {key && <KeyStory asset={chosen} name={key} />}
     </>
   )
 }
@@ -94,7 +94,7 @@ function KeyStory({ asset, name }: { asset: string; name: string }) {
         ) : !history.data ? (
           <Loading />
         ) : !history.data.outcomes.length ? (
-          <p className="panel-body muted">No run in history failed on this key. Calls that went fine are not listed one by one.</p>
+          <p className="panel-body muted">No failed call in history. Successful calls are not listed.</p>
         ) : (
           <div className="table-scroll">
             <table className="table">

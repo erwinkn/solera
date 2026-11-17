@@ -233,6 +233,15 @@ export function useAction<Input, Output = unknown>(path: (input: Input) => strin
   })
 }
 
+/** The stale partitions of `assets`, asked at the moment a run is started. */
+export function useStalePartitions() {
+  const base = useBase()
+  return async (assets: string[]): Promise<string[]> => {
+    const lists = await Promise.all(assets.map((name) => get<{ partitions: PartitionRow[] }>(`${base}/partitions/${seg(name)}`)))
+    return [...new Set(lists.flatMap((list) => list.partitions.filter((row) => row.status === "stale").map((row) => row.partition)))]
+  }
+}
+
 export const useStartRun = () => useAction<RunInput, RunRequest | { status: "skipped-active" }>(() => "/runs", (input) => input)
 export const useRunCommand = () => useAction<{ id: string; command: "cancel" | "retry" | "pause" | "resume" }, RunRequest>((i) => `/runs/${seg(i.id)}/${i.command}`)
 export const useDeleteRun = () => useAction<string>((id) => `/runs/${seg(id)}`, undefined, "DELETE")

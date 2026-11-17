@@ -1,13 +1,13 @@
 import { useShortcut } from "@ui-sdk/react/shortcuts"
 import { Activity, Boxes, Cog, KeyRound, LayoutDashboard, Play, Search, Server, Zap } from "lucide-react"
-import { useSyncExternalStore, type ComponentType, type ReactNode } from "react"
+import { useSyncExternalStore } from "react"
 import { useLocation } from "wouter"
 import { useManifest, useRuns } from "../api/queries"
 import { shortId } from "../model/format"
 import { firstLine } from "../blocks/assets"
 import { runWhat } from "../blocks/runs"
 import { openStartRun } from "../blocks/start-run"
-import { setLook, themes, useLook, VARIATIONS } from "../theme/store"
+import { setLook, themes, useLook } from "../theme/store"
 import { Button } from "../ui/controls"
 import { Palette, type Command_ } from "../ui/overlays"
 
@@ -30,23 +30,6 @@ export function isCurrent(place: string, path: string): boolean {
   if (place === "/assets") return path.startsWith("/assets") || path.startsWith("/sources")
   if (place === "/automations") return path.startsWith("/automations") || path.startsWith("/sensors")
   return path.startsWith(place)
-}
-
-/** A layout: its frame, and how it composes each page. */
-export type Layout = {
-  Shell: ComponentType<{ children: ReactNode }>
-  Home: ComponentType
-  Runs: ComponentType
-  Run: ComponentType<{ id: string }>
-  Assets: ComponentType
-  Asset: ComponentType<{ name: string }>
-  Source: ComponentType<{ name: string }>
-  Automations: ComponentType
-  Sensor: ComponentType<{ name: string }>
-  Engine: ComponentType
-  Keys: ComponentType
-  Settings: ComponentType
-  NotFound: ComponentType
 }
 
 let paletteOpen = false
@@ -80,25 +63,24 @@ function PaletteBody() {
     ...Object.keys(manifest.data?.sources ?? {}).map((name): Command_ => ({ value: `source:${name}`, group: "Sources", label: name, keywords: ["source", "commit"], run: () => navigate(`/sources/${encodeURIComponent(name)}`) })),
     ...Object.keys(manifest.data?.sensors ?? {}).map((name): Command_ => ({ value: `sensor:${name}`, group: "Sensors", label: name, keywords: ["sensor"], run: () => navigate(`/sensors/${encodeURIComponent(name)}`) })),
     ...(runs.data?.runs ?? []).map((run): Command_ => ({ value: `run:${run.id}`, group: "Recent runs", label: runWhat(run), note: `${run.status} · ${shortId(run.id)}`, keywords: ["run", run.id], run: () => navigate(`/runs/${run.id}`) })),
-    ...VARIATIONS.filter((v) => v.id !== look.variation).map((v): Command_ => ({ value: `layout:${v.id}`, group: "Look", label: `Layout: ${v.name}`, note: v.note, keywords: ["layout", "variation"], run: () => setLook({ variation: v.id }) })),
     ...themes(look).filter((t) => t.id !== look.theme).map((t): Command_ => ({ value: `theme:${t.id}`, group: "Look", label: `Theme: ${t.name}`, note: t.note, keywords: ["theme"], run: () => setLook({ theme: t.id }) })),
   ]
   return <Palette open onOpenChange={openPalette} commands={commands} />
 }
 
-export function SearchButton({ compact }: { compact?: boolean }) {
+export function SearchButton() {
   return (
     <button className="search-button" onClick={() => openPalette()} aria-label="Search and commands">
       <Search size={14} aria-hidden="true" />
-      {!compact && <span className="grow">Search</span>}
+      <span className="grow">Search</span>
       <kbd className="kbd">⌘K</kbd>
     </button>
   )
 }
 
-export function StartRunButton({ size = "m" }: { size?: "s" | "m" }) {
+export function StartRunButton() {
   return (
-    <Button variant="primary" size={size} icon={<Play size={13} />} onClick={() => openStartRun()}>
+    <Button variant="primary" icon={<Play size={13} />} onClick={() => openStartRun()}>
       Start a run
     </Button>
   )

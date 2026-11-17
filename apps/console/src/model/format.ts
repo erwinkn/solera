@@ -39,12 +39,9 @@ export function per(seconds: number): string {
 const TIME = new Intl.DateTimeFormat(undefined, { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false })
 const SHORT = new Intl.DateTimeFormat(undefined, { hour: "2-digit", minute: "2-digit", hour12: false })
 const DAY = new Intl.DateTimeFormat(undefined, { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit", hour12: false })
-const LONG = new Intl.DateTimeFormat(undefined, { weekday: "long", day: "numeric", month: "long", hour: "2-digit", minute: "2-digit", hour12: false })
 
 export const clock = (at: number) => TIME.format(at * 1000)
 export const clockShort = (at: number) => SHORT.format(at * 1000)
-export const longDate = (at: number) => LONG.format(at * 1000)
-
 /** The time alone today, the date with it on any other day. */
 export function when(at: number | null | undefined, now: number): string {
   if (at === null || at === undefined) return "–"
