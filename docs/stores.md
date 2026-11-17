@@ -562,7 +562,8 @@ async def orders(keys, ctx):
 ```python
 Source("docs", key="name", path="incoming/{partition}/")         # FileStore, S3Store
 Source("docs", key="name", path="incoming/", hash=True)
-Source("orders", store="pg", key="id", table="public.orders", version_column="updated_at")
+Source("orders", store="pg", key="id", schema="sales", version_column="updated_at")
+Source("orders", store="pg", key="id", table="sales.orders_{partition}", version_column="updated_at")
 ```
 
 - **FileStore and S3Store** read objects under the source's `path` (it
@@ -575,8 +576,10 @@ Source("orders", store="pg", key="id", table="public.orders", version_column="up
   place, goes unseen. `hash=True` versions by a hash of the content
   instead — exact, but every object is read in full. An object that is not
   there was observed absent.
-- **PostgresStore** reads a `table` it does not write (it may name
-  `{partition}`): keyed, each asked key's row, at the version its
+- **PostgresStore** reads a table it does not write, found as an output's
+  is: `<schema>.<the source's name>`, `schema` defaulting to `public`; or
+  the `table` named, which may be qualified (else in `schema`) and may name
+  `{partition}`. Keyed, each asked key's row, at the version its
   `version_column` holds; unkeyed, every row, at that column's greatest
   value. A keyed table source without `version_column` is refused.
 

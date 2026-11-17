@@ -1201,32 +1201,32 @@ class PostgresStore:
     # -- reads ----------------------------------------------------------------
 
     def can_serve(self, source) -> bool:
-        """A source this store can read: a `table`, and for a keyed one the
+        """A source this store can read: any table, and for a keyed one the
         `version_column` that says each row's version."""
 
-        return bool(source.handle.get("table")) and (
-            source.key is None or bool(source.handle.get("version_column"))
-        )
+        return source.key is None or bool(source.handle.get("version_column"))
 
     async def serve(self, source, keys, ctx):
         """A source read from a table this store does not write: `Source("orders",
-        store="pg", key="id", table="public.orders", version_column="updated_at")`
-        (docs/stores.md, "Sources: how data is loaded"); the table may name
-        `{partition}`. Keyed, each asked key's row at the version its
-        `version_column` holds, read in one snapshot; unkeyed, every row, at
-        the column's greatest value (none without the column)."""
+        store="pg", key="id", schema="sales", version_column="updated_at")`
+        (docs/stores.md, "Sources: how data is loaded"). The table is found as
+        an output's is: `schema` (default `public`) and the source's name, or
+        `table`, which may be qualified and may name `{partition}`. Keyed,
+        each asked key's row at the version its `version_column` holds, read
+        in one snapshot; unkeyed, every row, at the column's greatest value
+        (none without the column)."""
 
         return await asyncio.to_thread(self._serve, source, keys, ctx)
 
     def _serve(self, source, keys, ctx):
         from solera.sdk import Loaded
 
-        named = str(source.handle["table"]).format(partition=ctx.partition)
+        named = str(source.handle.get("table", source.name)).format(partition=ctx.partition)
         if named.startswith('"'):  # quoted already: "schema"."table"
             table = _qname(*_split(named))
         else:
             schema, _, name = named.rpartition(".")
-            table = _qname(schema or "public", name)
+            table = _qname(schema or source.handle.get("schema", "public"), name)
         version, clauses, params = source.handle.get("version_column"), [], []
         for column, value in (source.handle.get("where") or {}).items():  # a fixed filter on the table
             clauses.append(f"{_ident(column)} = %s")

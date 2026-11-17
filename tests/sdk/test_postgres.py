@@ -1920,3 +1920,42 @@ async def test_a_column_name_postgres_cannot_hold_is_refused(store, name, says):
     longest = "é" * 31 + "x"
     written = await store.store([{longest: 1}], None, at(output(), 1))
     assert await store.load(written.ref, list[dict], None) == [{longest: 1}]
+
+
+# -- a source's table: `schema=` and its name, or `table=` ------------------------------------
+
+
+@pytest.fixture
+def source_tables():
+    """`<schema>.samples_<id>` and `public.samples_<id>_p1`, each with its rows."""
+
+    name, schema = f"samples_{uuid.uuid4().hex[:8]}", f"s_{uuid.uuid4().hex[:8]}"
+    sql(f"CREATE SCHEMA {schema}")
+    sql(f"CREATE TABLE {schema}.{name} (id text, v int, at bigint)")
+    sql(f"INSERT INTO {schema}.{name} VALUES ('a', 1, 10), ('b', 2, 20)")
+    sql(f"CREATE TABLE public.{name}_p1 (id text, v int, at bigint)")
+    sql(f"INSERT INTO public.{name}_p1 VALUES ('c', 3, 30)")
+    yield name, schema
+    sql(f"DROP SCHEMA {schema} CASCADE")
+    sql(f"DROP TABLE public.{name}_p1")
+
+
+async def test_a_source_reads_its_schemas_table_of_its_name_or_the_table_it_names(store, source_tables):
+    """`Source(name, schema=…)` reads `<schema>.<name>`, as an output's table
+    is found; `table=` names it, qualified or not, `{partition}` and all."""
+
+    from solera.sdk import Source
+    from solera_worker.sources import SourceContext
+
+    name, schema = source_tables
+    ctx = SourceContext(name, "p1")
+    by_name = Source(name, store="postgres", schema=schema, version_column="at")
+    assert store.can_serve(by_name)
+    served = await store.serve(by_name, None, ctx)
+    assert sorted(r["id"] for r in served.value) == ["a", "b"] and served.version == "20"
+    keyed = Source(name, store="postgres", key="id", schema=schema, version_column="at")
+    assert {k: v.version for k, v in (await store.serve(keyed, ["b"], ctx)).items()} == {"b": "20"}
+    for table in (f"{name}_{{partition}}", f"public.{name}_{{partition}}"):
+        named = Source("anything", store="postgres", table=table)
+        assert [r["id"] for r in (await store.serve(named, None, ctx)).value] == ["c"]
+    assert not store.can_serve(Source(name, store="postgres", key="id", schema=schema))
