@@ -8,9 +8,19 @@ The console ships three themes, in `src/theme/themes.ts`. They are the themes of
 - **Light** (`light`): the same on white.
 - **Dimmed** (`dimmed`): dark but lower in contrast and tinted blue-grey, with a blue accent.
 
-Until someone picks a theme, the console follows the system: Dark, or Light when the system is light.
+Beside the themes there is one more choice, **System**: Light when the operating system asks for light, Dark otherwise, switching as the system does. It is what a browser gets until someone picks a theme.
 
-The theme switches in the running app from the palette button beside the health status, or from Settings. The browser remembers it.
+The choice is made in the running app from the palette button beside the health status, or from Settings. The browser remembers it.
+
+## What the built-in themes keep
+
+`pnpm check` holds the three themes to these (`scripts/check-themes.mjs`), measured as WCAG contrast against `color-bg`:
+
+- Text and anything that can colour text reach 4.5:1: the three text colours and the six status colours. `color-text-faint` reaches it on `color-surface` too. The three levels of text stay apart by a factor of 1.25 in contrast.
+- `chart-bar` reaches 3:1 against the page and against `chart-grid`, so a cell where something ran stands off a cell where nothing did.
+- Surfaces step one way: `color-surface` is the page moved a step toward the text colour, `color-sunken` a step further, and `color-raised` is the lightest of the four.
+
+A theme of your own is not checked. These are worth keeping in it.
 
 ## Make your own
 
@@ -54,7 +64,7 @@ Every size in the console is a multiple of three of them: `font-size` (every tex
 | `color-border-strong` | The edge of a control, and hairlines that must be seen | `#2f2f34` |
 | `color-text` | Body text | `#ececee` |
 | `color-text-muted` | Secondary text and column headers | `#9c9ca5` |
-| `color-text-faint` | Hints, placeholders, what has not happened yet | `#66666f` |
+| `color-text-faint` | Hints, placeholders, what has not happened yet | `#80808a` |
 | `color-accent` | Primary buttons, the selected tab, checked boxes | `#ececee` |
 | `color-accent-contrast` | Text on the accent | `#0b0b0c` |
 | `color-focus` | The keyboard focus ring | `#5b9cf8` |
@@ -64,7 +74,7 @@ Every size in the console is a multiple of three of them: `font-size` (every tex
 | `color-failed` | Failed, rejected | `#ef5a5a` |
 | `color-stale` | Stale, retrying, needs attention soon | `#dda032` |
 | `color-waiting` | Queued or held back | `#8f8f99` |
-| `color-idle` | Never built, skipped, canceled | `#5c5c65` |
+| `color-idle` | Never built, skipped, canceled | `#7a7a84` |
 | `font-sans` | The interface | `"Inter Variable", ui-sans-serif, system-ui, sans-serif` |
 | `font-mono` | Ids, keys, values and logs | `"JetBrains Mono Variable", ui-monospace, "SF Mono", Menlo, monospace` |
 | `font-size` | The base size; every other size is a ratio of it | `13px` |

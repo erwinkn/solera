@@ -4,7 +4,7 @@ import { useEffect, useRef, useState } from "react"
 import { useLocation } from "wouter"
 import { forgetToken, hasToken } from "../api/client"
 import { BUILT_IN, starterTheme } from "../theme/themes"
-import { currentTheme, paint, resolve, setLook, themes, useLook } from "../theme/store"
+import { choices, chosen, currentTheme, paint, resolve, setLook, useLook } from "../theme/store"
 import { parseCustomTheme, TOKENS, TOKEN_NAMES, type CustomTheme, type Problem, type Theme } from "../theme/tokens"
 import { Button, Disclosure, TextField } from "../ui/controls"
 import { confirm, toast } from "../ui/overlays"
@@ -23,13 +23,13 @@ export function LookMenu() {
       <MenuContent className="popup menu look-menu" align="end" sideOffset={6}>
         <MenuGroup>
           <MenuGroupLabel className="menu-label">Theme</MenuGroupLabel>
-          <MenuRadioGroup value={currentTheme(look).id} onValueChange={(value) => setLook({ theme: value })}>
-            {themes(look).map((theme) => (
-              <MenuRadioItem key={theme.id} value={theme.id} className="menu-item" closeOnSelect={false}>
-                <Swatch theme={theme} />
+          <MenuRadioGroup value={chosen(look)} onValueChange={(value) => setLook({ theme: value })}>
+            {choices(look).map((choice) => (
+              <MenuRadioItem key={choice.id} value={choice.id} className="menu-item" closeOnSelect={false}>
+                <Swatch themes={choice.shows} />
                 <span className="grow">
-                  {theme.name}
-                  <span className="menu-note">{theme.note}</span>
+                  {choice.name}
+                  <span className="menu-note">{choice.note}</span>
                 </span>
                 <MenuItemIndicator className="menu-check">
                   <Check size={14} />
@@ -47,32 +47,39 @@ export function LookMenu() {
   )
 }
 
-/** A theme at a glance. The swatch shows another theme's colours, so it is the
- * one place values are set inline rather than read from the page's tokens. */
-function Swatch({ theme }: { theme: Theme }) {
-  const t = theme.tokens
+const SWATCH = ["color-text", "color-ok", "color-running", "color-failed"] as const
+
+/** A theme at a glance, or two side by side for System. The swatch shows another
+ * theme's colours, so it is the one place values are set inline rather than
+ * read from the page's tokens. */
+function Swatch({ themes }: { themes: readonly Theme[] }) {
+  const first = themes[0]!.tokens
+  const half = SWATCH.length / themes.length
   return (
-    <span className="swatch" aria-hidden="true" style={{ background: t["color-bg"], borderColor: t["color-border-strong"], borderRadius: t["radius-m"] }}>
-      <span style={{ background: t["color-text"] }} />
-      <span style={{ background: t["color-ok"] }} />
-      <span style={{ background: t["color-running"] }} />
-      <span style={{ background: t["color-failed"] }} />
+    <span
+      className="swatch"
+      aria-hidden="true"
+      style={{ background: `linear-gradient(90deg, ${themes.map((theme, i) => `${theme.tokens["color-bg"]} ${(i * 100) / themes.length}% ${((i + 1) * 100) / themes.length}%`).join(", ")})`, borderColor: first["color-border-strong"], borderRadius: first["radius-m"] }}
+    >
+      {SWATCH.map((token, i) => (
+        <span key={token} style={{ background: themes[Math.floor(i / half)]!.tokens[token] }} />
+      ))}
     </span>
   )
 }
 
 export function LookSettings() {
   const look = useLook()
-  const active = currentTheme(look)
+  const active = chosen(look)
   return (
     <div className="stack settings">
       <Panel title="Theme">
         <div className="choices" role="radiogroup" aria-label="Theme">
-          {themes(look).map((theme) => (
-            <button key={theme.id} role="radio" aria-checked={active.id === theme.id} className="choice" onClick={() => setLook({ theme: theme.id })}>
-              <Swatch theme={theme} />
-              <span className="name">{theme.name}</span>
-              <span className="muted">{theme.note}</span>
+          {choices(look).map((choice) => (
+            <button key={choice.id} role="radio" aria-checked={active === choice.id} className="choice" onClick={() => setLook({ theme: choice.id })}>
+              <Swatch themes={choice.shows} />
+              <span className="name">{choice.name}</span>
+              <span className="muted">{choice.note}</span>
             </button>
           ))}
         </div>
@@ -105,7 +112,7 @@ function CustomThemes() {
         <ul className="plain-list custom-list">
           {look.custom.map((theme) => (
             <li key={theme.id} className="row">
-              <Swatch theme={resolve(theme)} />
+              <Swatch themes={[resolve(theme)]} />
               <span className="name grow">{theme.name}</span>
               <span className="muted">{Object.keys(theme.tokens).length} tokens changed</span>
               <Button size="s" onClick={() => setEditing(theme.id)}>

@@ -256,7 +256,7 @@ export function PartitionGrid({ name }: { name: string }) {
             <span className="mono">{partitionLabel(open.partition)}</span>
             <StatusPill status={partitionStatus(open.status)} />
             <span className="grow" />
-            <Button size="s" icon={<Play size={13} />} onClick={() => openStartRun({ targets: [name], partitions: open.partition })}>
+            <Button size="s" icon={<Play size={13} />} onClick={() => openStartRun({ targets: [name], partitions: [open.partition] })}>
               Run this partition
             </Button>
           </div>

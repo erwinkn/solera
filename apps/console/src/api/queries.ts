@@ -81,8 +81,28 @@ export function useStatuses() {
 
 export const useAsset = (name: string) => useLive<AssetDetail>(["asset", name], `/assets/${seg(name)}`)
 
+const partitionsQuery = (base: string, name: string) =>
+  queryOptions({
+    queryKey: [base, "partitions", name],
+    queryFn: ({ signal }) => get<{ asset: string; partitions: PartitionRow[] }>(`${base}/partitions/${seg(name)}`, signal),
+    refetchInterval: SLOW,
+    placeholderData: keepPreviousData,
+  })
+
 export function usePartitions(name: string, enabled: boolean) {
-  return useLive<{ asset: string; partitions: PartitionRow[] }>(["partitions", name], enabled ? `/partitions/${seg(name)}` : null)
+  return useQuery({ ...partitionsQuery(useBase(), name), enabled })
+}
+
+/** The partitions of each of `names`, in their order: `lists` once every one has arrived. */
+export function usePartitionLists(names: string[]) {
+  const base = useBase()
+  return useQueries({
+    queries: names.map((name) => partitionsQuery(base, name)),
+    combine: (results) => ({
+      lists: results.every((result) => result.data) ? results.map((result) => result.data!.partitions) : undefined,
+      error: results.find((result) => result.error)?.error ?? null,
+    }),
+  })
 }
 
 export type RunsFilter = { status?: string[]; asset?: string[]; origin?: string[]; automation?: string[]; q?: string; since?: number }
