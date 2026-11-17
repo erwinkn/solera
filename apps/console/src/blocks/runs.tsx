@@ -5,12 +5,13 @@ import { useManifest, useRunFacets, useRunHistogram, useRuns, type RunsFilter } 
 import type { Manifest, RunRow } from "../api/types"
 import { clockShort, count, duration, list, partitionLabel, per, plural, when } from "../model/format"
 import { runStatus, triggerText, type Tone } from "../model/status"
-import { Button, TextField, useChartTip } from "../ui/controls"
+import { Button, TextField, Tip, useChartTip } from "../ui/controls"
 import { PickMany } from "../ui/overlays"
 import { Ago, Empty, Failure, Loading, StatusPill, useParam } from "./atoms"
 
 /* Lists of runs: a table for a page, a narrow feed for a side pane, and the
- * filters and histogram that go with either. */
+ * filters and histogram that go with either. A row says that a run failed;
+ * why is on the run's page, and in a hint on the row's status. */
 
 export function runWhat(run: RunRow): string {
   if (run.source) return `Commit to ${run.source}`
@@ -159,14 +160,19 @@ export function RunsTable({ filter, limit = 50, dense, brief }: { filter: RunsFi
           <tbody>
             {runs.data.runs.map((run) => (
               <tr key={run.id} data-link="" onClick={() => navigate(`/runs/${run.id}`)}>
-                <td className="fit"><StatusPill status={runStatus(run.status)} /></td>
+                <td className="fit">
+                  {run.error ? (
+                    <Tip text={<span className="tip-error">{run.error}</span>} side="bottom" align="start">
+                      <span><StatusPill status={runStatus(run.status)} /></span>
+                    </Tip>
+                  ) : (
+                    <StatusPill status={runStatus(run.status)} />
+                  )}
+                </td>
                 <td className="wide">
-                  <div className="row">
-                    <Link href={`/runs/${run.id}`} className="name truncate" onClick={(event) => event.stopPropagation()}>
-                      {runWhat(run)}
-                    </Link>
-                    {run.error && <span className="error-text truncate run-error">{run.error}</span>}
-                  </div>
+                  <Link href={`/runs/${run.id}`} className="name truncate" onClick={(event) => event.stopPropagation()}>
+                    {runWhat(run)}
+                  </Link>
                 </td>
                 {!dense && <td className="muted mono optional">{runWhere(run)}</td>}
                 <td className="muted optional">{runTrigger(run, manifest.data)}</td>

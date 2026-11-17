@@ -34,11 +34,11 @@ export function Button({ variant = "default", size = "m", icon, children, classN
 }
 
 /** A hint on hover and focus. It names an icon-only trigger and describes any other. */
-export function Tip({ text, children, side = "top" }: { text: ReactNode; children: Slot; side?: "top" | "bottom" | "left" | "right" }) {
+export function Tip({ text, children, side = "top", align = "center" }: { text: ReactNode; children: Slot; side?: "top" | "bottom" | "left" | "right"; align?: "start" | "center" | "end" }) {
   return (
     <Tooltip delay={350}>
       <TooltipTrigger render={children} />
-      <TooltipContent className="tip" side={side} sideOffset={6}>
+      <TooltipContent className="tip" side={side} align={align} sideOffset={6}>
         {text}
       </TooltipContent>
     </Tooltip>
