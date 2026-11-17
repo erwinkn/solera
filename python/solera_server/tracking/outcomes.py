@@ -278,15 +278,16 @@ async def latest(
     own = m.core_output(name, partition)
     core.attach(output_id(input.output, input.partition), own_id, *Tracking.outcome_outputs(edge))
     stored_only = bool(outcomes) and set(outcomes) <= set(STORED)
+    now = (engine.clock(), m.deploy_number)  # whether a retry would take a failing key now
     if keys is not None:
         candidates, next_ = sorted(set(keys)), None
     elif stored_only:
         rows, next_ = await core.run(
-            core.tracking.outcome_records, edge, after=after, limit=limit, outcomes=list(outcomes)
+            core.tracking.outcome_records, edge, *now, after=after, limit=limit, outcomes=list(outcomes)
         )
         candidates = [key for key, _ in rows]
     else:
-        candidates, next_ = await _page(core, edge, upstream, own, after, limit)
+        candidates, next_ = await _page(core, edge, upstream, own, now, after, limit)
     if not candidates:
         return [], next_
     present, planned = set(), {}
@@ -309,7 +310,7 @@ async def latest(
         summary = await core.run(core.tracking.plan, request)
         for key, cls, version in zip(*Tracking.plan_keys(summary["plan"], 0), strict=True):
             planned[key] = (cls, version)
-    records = dict((await core.run(core.tracking.outcome_records, edge, keys=candidates))[0])
+    records = dict((await core.run(core.tracking.outcome_records, edge, *now, keys=candidates))[0])
     taken = Matcher(input.spec.get("patterns"))
     rows = []
     for key in candidates:
@@ -334,7 +335,9 @@ async def latest(
     return rows, next_
 
 
-async def _page(core: Core, edge: bytes, upstream: dict | None, own: dict | None, after, limit: int):
+async def _page(
+    core: Core, edge: bytes, upstream: dict | None, own: dict | None, now: tuple, after, limit: int
+):
     """The next `limit` keys after `after` that upstream has, the partition
     holds, or a record of the edge keeps, and where the page after starts."""
 
@@ -345,7 +348,7 @@ async def _page(core: Core, edge: bytes, upstream: dict | None, own: dict | None
                 core.index.scan, found["layers"], found["head"], after=after, limit=limit
             )
             sources.append(([row[0] for row in rows], more))
-    rows, more = await core.run(core.tracking.outcome_records, edge, after=after, limit=limit)
+    rows, more = await core.run(core.tracking.outcome_records, edge, *now, after=after, limit=limit)
     sources.append(([key for key, _ in rows], more))
     # A source with more keys is read up to its last: past it, another key of its may come first.
     bound = min((keys[-1] for keys, more in sources if more is not None and keys), default=None)

@@ -23,7 +23,7 @@ use solera_index::{
 use solera_tracking::codec::Ver;
 use solera_tracking::commit::Declare;
 use solera_tracking::event::{Event, Part};
-use solera_tracking::lineage::{self, Answer, Received};
+use solera_tracking::lineage::{self, Answer, Delivered, Received};
 use solera_tracking::plan::{self, Hold, InputRequest, Mode, OneIndex, Request};
 use solera_tracking::progress::{BatchProgress, EdgeClose, EdgeRename};
 use solera_tracking::progress::{
@@ -1521,6 +1521,20 @@ async fn check(ix: &ChangeIndex, t: &Tracking, inputs: &[Input], own: &Log, univ
                 "progress decodes {} to what the consumer holds: {got:?} != {want:?}",
                 String::from_utf8_lossy(k)
             );
+            // What explain says it last delivered: the version it holds, if any.
+            let keyed = t.edges[&inp.edge].progress.keyed().unwrap();
+            let delivered =
+                lineage::delivered(keyed.point(k), keyed.value_of(k), ix, &inp.log.layers, k)
+                    .await
+                    .unwrap();
+            match want {
+                Holding::Version(v, _) => assert_eq!(delivered, Delivered::Holds(v)),
+                _ => assert!(
+                    !matches!(delivered, Delivered::Holds(_)),
+                    "{} is held at no version: {delivered:?}",
+                    String::from_utf8_lossy(k)
+                ),
+            }
         }
     }
     assert_eq!(

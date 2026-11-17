@@ -62,6 +62,12 @@ class World:
     def catch_up(self):
         return self.t.outcome_catch_up(b"e", {}, **self.clock())
 
+    def records(self, now: float = 1000.0, **page):
+        """The edge's records, each saying whether a retry at `now`, under
+        the deploy the batches ran under, takes it."""
+
+        return self.t.outcome_records(b"e", now, 1, **page)
+
 
 def test_a_failing_key_keeps_a_record_in_its_batchs_own_event_and_waits_for_its_input(tmp_path):
     w = World(tmp_path)
@@ -77,7 +83,7 @@ def test_a_failing_key_keeps_a_record_in_its_batchs_own_event_and_waits_for_its_
         "canceled": 0,
         "timed_out": 0,
     }
-    rows, after = w.t.outcome_records(b"e")
+    rows, after = w.records()
     assert after is None and [k for k, _ in rows] == ["a"]
     record = rows[0][1]
     assert (record["outcome"], record["tries"], record["message"], record["tried"]) == (
@@ -87,12 +93,15 @@ def test_a_failing_key_keeps_a_record_in_its_batchs_own_event_and_waits_for_its_
         2,
     )
     assert record["next_at"] is None and record["until"] is None
+    # It still holds the 1 it processed, and only a new deploy or a retry by hand retries it.
+    assert (record["held"], record["eligible"]) == (1, False)
+    assert w.t.outcome_records(b"e", 1000.0, 2)[0][0][1]["eligible"]
     # Its input has not changed since it failed: nothing is owed, b is done.
     assert w.t.owed(b"e", {})[0] == []
-    assert w.t.outcome_records(b"e", keys=["b", "a"])[0] == rows
-    assert w.t.outcome_records(b"e", outcomes=["rejected"]) == ([], None)
+    assert w.records(keys=["b", "a"])[0] == rows
+    assert w.records(outcomes=["rejected"]) == ([], None)
     with pytest.raises(ValueError, match="no stored outcome"):
-        w.t.outcome_records(b"e", outcomes=["ok"])
+        w.records(outcomes=["ok"])
 
 
 def test_progress_ops_says_what_each_reported_key_became(tmp_path):
@@ -110,11 +119,12 @@ def test_progress_ops_says_what_each_reported_key_became(tmp_path):
         now=1000.0,
     )
     assert stored == {"a": "retrying", "b": "failed", "c": "rejected"}
-    rows = dict(w.t.outcome_records(b"e")[0])
+    rows = dict(w.records()[0])
     assert (rows["a"]["next_at"], rows["a"]["until"]) == (1030, 4600)
-    assert len(w.t.outcome_records(b"e", limit=2)[0]) == 2
-    assert w.t.outcome_records(b"e", limit=2)[1] == "b"
-    assert [k for k, _ in w.t.outcome_records(b"e", after="b")[0]] == ["c"]
+    assert not rows["a"]["eligible"] and dict(w.records(1030.0)[0])["a"]["eligible"]
+    assert len(w.records(limit=2)[0]) == 2
+    assert w.records(limit=2)[1] == "b"
+    assert [k for k, _ in w.records(after="b")[0]] == ["c"]
 
 
 def test_a_failure_whose_input_goes_back_is_dropped_by_the_catch_up(tmp_path):
@@ -133,7 +143,7 @@ def test_a_failure_whose_input_goes_back_is_dropped_by_the_catch_up(tmp_path):
     with pytest.raises(OutcomesMovedError, match="catch up first"):
         w.t.progress_ops(plan, [([], [])], outcomes=outcomes)
     w.t.apply(w.catch_up())
-    assert w.t.outcome_records(b"e") == ([], None)
+    assert w.records() == ([], None)
     assert not any(w.t.outcome_counts(b"e").values())
     assert w.t.owed(b"e", {})[0] == []
 
@@ -146,7 +156,7 @@ def test_a_key_that_never_succeeded_and_is_removed_upstream_owes_nothing(tmp_pat
     w.run([("a", "failed", "ValueError: x", None, None)])
     w.commit(a=None)
     w.t.apply(w.catch_up())
-    assert w.t.outcome_records(b"e") == ([], None)
+    assert w.records() == ([], None)
     assert w.t.owed(b"e", {})[0] == []
 
 

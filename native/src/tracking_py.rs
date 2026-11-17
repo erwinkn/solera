@@ -866,6 +866,75 @@ impl Tracking {
         Ok(PyBytes::new(py, &one_event(Part::Forced(forced))))
     }
 
+    /// B6: the event that raises per-key `edge`'s rebuild counter, part of its
+    /// conditions: a full run asked for by hand makes every key owed (KEY-13).
+    fn event_rebuild<'py>(&self, py: Python<'py>, edge: Vec<u8>) -> PyResult<Bound<'py, PyBytes>> {
+        let part = self
+            .state
+            .read()
+            .unwrap()
+            .raise_rebuild(&edge)
+            .map_err(err)?;
+        Ok(PyBytes::new(py, &one_event(Part::Rebuild(part))))
+    }
+
+    /// B6: what keyed `edge` last delivered of `key` (KEY-11): `("ok",
+    /// version)` for the version it holds, `("removed", version)` for a
+    /// removal it delivered of the version it held, or None.
+    fn delivered<'py>(
+        &self,
+        py: Python<'py>,
+        edge: Vec<u8>,
+        key: String,
+    ) -> PyResult<Option<Bound<'py, PyTuple>>> {
+        guard(|| {
+            let (point, value, input, layers) = {
+                let state = self.state.read().unwrap();
+                let Some(e) = state.edges.get(edge.as_slice()) else {
+                    return Ok(None);
+                };
+                let Some(k) = e.progress.keyed() else {
+                    return Ok(None);
+                };
+                let layers = state
+                    .outputs
+                    .get(&e.input)
+                    .map_or(vec![], |o| o.layers.clone());
+                let k_ = key.as_bytes();
+                (
+                    k.point(k_).cloned(),
+                    k.value_of(k_).clone(),
+                    e.input.clone(),
+                    layers,
+                )
+            };
+            let ixs = self.indexes.read().unwrap().clone();
+            let found = py
+                .detach(|| {
+                    rt().block_on(async {
+                        let ix = tr::plan::Indexes::index(ixs.as_ref(), &input)?;
+                        tr::lineage::delivered(point.as_ref(), &value, ix, &layers, key.as_bytes())
+                            .await
+                    })
+                })
+                .map_err(err)?;
+            Ok(match found {
+                tr::lineage::Delivered::Nothing => None,
+                tr::lineage::Delivered::Holds(v) => Some(("ok", version(py, v.as_version())?)),
+                tr::lineage::Delivered::Removed(v) => {
+                    Some(("removed", version(py, v.as_version())?))
+                }
+            }
+            .map(|t| t.into_pyobject(py))
+            .transpose()?)
+        })
+    }
+
+    /// B6: per-key `edge`'s rebuild counter (0 until a full run is asked for by hand).
+    fn rebuild(&self, edge: &[u8]) -> u64 {
+        self.state.read().unwrap().rebuild(edge)
+    }
+
     /// One keyed input's keys, classes and versions, from a plan's bytes.
     #[staticmethod]
     fn plan_keys<'py>(py: Python<'py>, plan: &[u8], input: usize) -> PyResult<Bound<'py, PyTuple>> {
@@ -1277,15 +1346,20 @@ impl Tracking {
 
     /// B6: a per-key edge's stored outcomes, one row per failing key in key
     /// order: `(key, {outcome, tries, deploy, forced, since, last, next_at,
-    /// until, message, tried})`, `tried` the version it last failed on,
-    /// `next_at` and `until` None where they do not apply. `keys`: those
-    /// keys' rows; else a page after `after`, of the outcomes named in
+    /// until, message, tried, held, eligible})`, `tried` the version it last
+    /// failed on, `held` the version the partition still holds (None for
+    /// none), `next_at` and `until` None where they do not apply, `eligible`
+    /// whether a retry at `now` under deploy number `deploy` takes it. `keys`:
+    /// those keys' rows; else a page after `after`, of the outcomes named in
     /// `outcomes` if any, and where the next page starts.
-    #[pyo3(signature = (edge, *, keys=None, after=None, limit=1000, outcomes=None))]
+    #[pyo3(signature = (edge, now, deploy, *, keys=None, after=None, limit=1000, outcomes=None))]
+    #[allow(clippy::too_many_arguments)]
     fn outcome_records<'py>(
         &self,
         py: Python<'py>,
         edge: Vec<u8>,
+        now: f64,
+        deploy: u64,
         keys: Option<Vec<String>>,
         after: Option<String>,
         limit: usize,
@@ -1302,14 +1376,11 @@ impl Tracking {
                 ),
             };
             let fid = tr::outcomes::output_id(tr::outcomes::FAILURES, &edge);
-            let out = self
-                .state
-                .read()
-                .unwrap()
-                .outputs
-                .get(&fid)
-                .cloned()
-                .unwrap_or_default();
+            let (out, counters) = {
+                let state = self.state.read().unwrap();
+                let out = state.outputs.get(&fid).cloned().unwrap_or_default();
+                (out, state.counters(&edge, deploy))
+            };
             let ixs = self.indexes.read().unwrap().clone();
             let wanted = |r: &tr::outcomes::Record| {
                 codes.as_ref().is_none_or(|c| c.contains(&r.stored.outcome))
@@ -1367,7 +1438,12 @@ impl Tracking {
                 .map_err(err)?;
             let list = PyList::empty(py);
             for (k, r) in &rows {
-                list.append((key(py, k), record_dict(py, r)?))?;
+                let d = record_dict(py, r)?;
+                d.set_item(
+                    "eligible",
+                    tr::outcomes::transition::eligible(&r.stored, now, &counters),
+                )?;
+                list.append((key(py, k), d))?;
             }
             (list, next.as_deref().map(|k| key(py, k))).into_pyobject(py)
         })
@@ -1441,6 +1517,11 @@ fn record_dict<'py>(py: Python<'py>, r: &tr::outcomes::Record) -> PyResult<Bound
     d.set_item("until", (s.until > 0).then_some(s.until))?;
     d.set_item("message", String::from_utf8_lossy(&s.message))?;
     d.set_item("tried", version(py, r.on.as_version())?)?;
+    let held = match &r.held {
+        tr::outcomes::Held::Version(v, _) => Some(version(py, v.as_version())?),
+        _ => None,
+    };
+    d.set_item("held", held)?;
     Ok(d)
 }
 

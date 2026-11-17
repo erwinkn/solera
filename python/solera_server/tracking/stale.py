@@ -58,7 +58,7 @@ def conditions_now(core: Core, asset: str, partition: str, input, planner, input
 
     definition = core.m.partition(asset, partition).get("definition") or ""
     base = {"context": core.engine._context(planner, inputs), "definition": definition}
-    return conditions(input.spec, base)
+    return conditions(core, edge_id(asset, partition, input.param), input.spec, base)
 
 
 async def owed_keys(

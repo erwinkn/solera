@@ -718,7 +718,8 @@ async def test_key_11_explain_says_why_a_key_is_or_is_not_there(solera):
     assert pending["verdict"] == "pending"
     assert pending["last_ok"]["generation"] != pending["upstream_generation"]
     assert (await solera.explain("parse", "new.csv"))["verdict"] == "pending"
-    assert (await solera.explain("parse", "bug.csv"))["verdict"] == "failing"  # its record outlives the key
+    gone = await solera.explain("parse", "bug.csv")  # never ok: its outcome went with it (KEY-12)
+    assert gone["verdict"] == "removed"
     await solera.run("parse")
     assert (await solera.explain("parse", "bug.csv"))["verdict"] == "removed"
     assert (await solera.explain("parse", "a.csv"))["verdict"] == "ok"

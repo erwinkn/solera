@@ -28,6 +28,7 @@ with its commit, and the layer says only that the commit is.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import functools
 import inspect
 import json
@@ -214,7 +215,7 @@ async def repair(o, context) -> None:
 # -- per-key assets --------------------------------------------------------------------
 
 
-async def each(asset, project, ctx, args: dict, param: str, batch: dict, timeline):
+async def each(asset, project, ctx, args: dict, param: str, batch: dict, timeline, drain: asyncio.Event):
     """A per-key asset's batch (docs/per-key-processing.md §5): the asset is
     called once for each key of `batch["loaded"]` (key -> its upstream
     value), `batch["concurrency"]` at a time, with `ctx.key` and
@@ -229,7 +230,13 @@ async def each(asset, project, ctx, args: dict, param: str, batch: dict, timelin
     (`batch["outcomes"]`, `[key, kind, message, retry_after, retry_for]` in
     key order), which records it on the core. One bad key never blocks the
     others. `Abort` alone fails the whole attempt: no key starts after it,
-    and it is raised once the calls in flight end."""
+    and it is raised once the calls in flight end.
+
+    A cancel sets `drain` (KEY-9): no key starts after it and the calls in
+    flight stop. The keys in flight and those never started are
+    `batch["interrupted"]` (key -> seconds it ran): they write nothing and
+    stay owed, while the finished keys are stored and commit. What they
+    become is the cancel's to say (`interrupt`). Not drained, it is None."""
 
     loaded, versions = batch["loaded"], batch["versions"]
     decls = {o.name or asset.name: o for o in asset.outputs}
@@ -298,14 +305,24 @@ async def each(asset, project, ctx, args: dict, param: str, batch: dict, timelin
             await call(key)
 
     timeline.add("computing")
+    calls, stop = asyncio.gather(*(worker() for _ in range(at_once))), asyncio.ensure_future(drain.wait())
     try:
-        await asyncio.gather(*(worker() for _ in range(at_once)))
+        await asyncio.wait([calls, stop], return_when=asyncio.FIRST_COMPLETED)
     finally:
+        stop.cancel()
+        calls.cancel()  # drained: the calls in flight stop, as the keys never started do (KEY-2)
+        with contextlib.suppress(asyncio.CancelledError):
+            await calls
         if pool is not None:
             pool.shutdown(wait=False, cancel_futures=True)
     timeline.add("computed")
     if abort:
         raise abort[0]
+    batch["interrupted"] = (
+        {key: durations.get(key, 0.0) for key in loaded if key not in outputs and key not in failed}
+        if drain.is_set()
+        else None
+    )
     groups = {name: {} for name in decls}
     removes = {name: set(batch["removed"]) for name in decls}
     for key, values in outputs.items():
@@ -343,6 +360,30 @@ async def each(asset, project, ctx, args: dict, param: str, batch: dict, timelin
             if groups[name] or (removes[name] and name in batch["exists"])
         }
     )
+
+
+def interrupt(batch: dict, kind: str) -> None:
+    """The keys a drained batch left (`batch["interrupted"]`) become `kind`:
+    `canceled` under a user's cancel, `timed_out` under a timeout (KEY-9).
+    Decided once the finished keys are stored, from the cancel the attempt
+    then ends under, so a user's cancel during a timeout's drain wins."""
+
+    interrupted = batch["interrupted"]
+    if not interrupted:
+        return
+    batch["outcomes"] += [[key, kind, "", None, None] for key in interrupted]
+    batch["outcomes"].sort(key=lambda row: row[0])
+    batch["keys"][kind] = len(interrupted)
+    batch["rows"] += [
+        {
+            "key": key,
+            "generation": batch["versions"].get(key),
+            "outcome": kind,
+            "error": None,
+            "duration": round(t, 6),
+        }
+        for key, t in sorted(interrupted.items())
+    ]
 
 
 async def refuse(batch: dict, o, refused: Mapping[str, str]) -> None:

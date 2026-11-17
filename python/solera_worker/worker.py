@@ -936,12 +936,15 @@ async def run_attempt(
             await _await_owner(objects, run, attempt, loser_poll, channel, worker_id)
         return 0
     loop = asyncio.get_running_loop()
-    control = {"cancel": None, "writing": False, "stopped": False, "forced": False}
+    # `drain`: set while a per-key batch's keys run, which a requested cancel drains (KEY-9).
+    control = {"cancel": None, "writing": False, "stopped": False, "forced": False, "drain": None}
 
     def on_cancel(record: Cancel):
         control["cancel"] = record
         if record.phase == "forced":
             on_ended()
+        elif control["drain"] is not None:
+            loop.call_soon_threadsafe(control["drain"].set)
         elif not control["writing"] and not control["stopped"]:
             control["stopped"] = True  # requested: stop computing; a writer drains instead
             loop.call_soon_threadsafe(execution.cancel)
@@ -1170,7 +1173,10 @@ async def _execute(
             if each is not None:  # a per-key asset: one call per key
                 each["exists"] = {n for n, info in (spec.get("outputs") or {}).items() if info.get("before")}
                 each["loaded"] = args.pop(each["param"])  # each key's value: one call each
-                value = await core.each(asset, project, ctx, args, each["param"], each, timeline)
+                control["drain"] = asyncio.Event()
+                value = await core.each(
+                    asset, project, ctx, args, each["param"], each, timeline, control["drain"]
+                )
             else:
                 timeline.add("computing")
                 value = asset.fn(**args)
@@ -1197,6 +1203,12 @@ async def _execute(
             if values and "ref" in outputs.get(name, {}):
                 outputs[name]["metadata"] = values
         result = {"status": "succeeded", "outputs": outputs, "delivered": delivered}
+        if each is not None and each["interrupted"] is not None:
+            # Canceled while its keys ran: the finished ones are stored, and commit; the rest
+            # are what the cancel it ends under says, the one its result is sealed with.
+            cancel = control["cancel"]
+            core.interrupt(each, "timed_out" if cancel.reason == "timeout" else "canceled")
+            result.update(status="canceled", cancel=cancel.to_json())
         if each is not None:  # a per-key attempt's keys, by outcome
             result["keys"] = {name: n for name, n in each["keys"].items() if n}
             result["key_outcomes"] = each["rows"]

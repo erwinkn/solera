@@ -595,9 +595,9 @@ class Attempts:
             )
             return
         status = result.get("status")
-        if status == "canceled" and "outcomes" in result:
-            # A drained Each batch (docs/lifecycle.md §7): what finished commits, as one
-            # decision with its interrupted keys and what it observed.
+        if status == "canceled" and "outputs" in result:
+            # A drained per-key batch (KEY-9): what finished commits, with the keys the cancel
+            # interrupted as its failing keys, which stay owed.
             reason = (result.get("cancel") or {}).get("reason") or "user"
             user = reason == "user"
             try:
