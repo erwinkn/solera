@@ -628,6 +628,12 @@ migrations to change them): a table a write creates from inferred types
 holds what that first write happened to show. PostgresStore infers them
 when undeclared — from a DataFrame's schema, else from every value not
 null — refuses a column it cannot type, and logs what it inferred. A
+column may have any name Postgres holds (`p/p0`, `CaO_wt%`, `a "quoted"
+name`, `sélection`) and keeps it: every column name is quoted, and a `%` is
+written `U&"CaO_wt\0025"`, so no statement's text holds one for psycopg to
+take as a placeholder. Refused, naming the column: an empty name, a NUL,
+and a name over 63 bytes in UTF-8, which Postgres would cut short. A
+table's schema and name stay letters, digits and `_`. A
 migration's payload is the store's own business (PostgresStore: SQL
 text, or a callable taking a cursor): `migrate` refuses one it cannot run.
 

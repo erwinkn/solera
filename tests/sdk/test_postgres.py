@@ -1810,3 +1810,113 @@ async def test_a_write_is_not_refused_when_row_security_does_not_apply_to_its_ro
     written = await plain.store(Patch(rows(b="2")), first.ref, at(out, 2))
     assert outside(store, out) == {"a": "1", "b": "2"} == await solera(plain, written.ref)
     assert registry(store, out) == (2, 2)
+
+
+# -- a column may be named anything Postgres can hold --------------------------------------
+
+# Names from the first project's tables: a `%` (psycopg's placeholder), a `"`, brackets, a
+# slash, a space, a capital (quoted, so kept), a letter outside ASCII.
+ODD = ["p/p0", "as(bet)", "No", "CaO_wt%", 'a "quoted" name', "sélection", "with space"]
+
+
+def odd_rows(*keys: str, n: float = 1.0) -> list[dict]:
+    """A row per key, every column named as in `ODD`; the key in `CaO_wt%`."""
+
+    return [
+        {
+            "p/p0": n,
+            "as(bet)": f"bet {k}",
+            "No": i,
+            "CaO_wt%": k,
+            'a "quoted" name': 'say "hi"',
+            "sélection": "é",
+            "with space": "50%",
+        }
+        for i, k in enumerate(keys)
+    ]
+
+
+async def test_an_unkeyed_output_takes_any_column_name_postgres_holds(store):
+    """Written from a DataFrame, then from rows, which replace them; read back
+    as a DataFrame, an Arrow table and rows, each column by its own name."""
+
+    pd = pytest.importorskip("pandas")
+    pa = pytest.importorskip("pyarrow")
+    out = output()
+    first = await store.store(pd.DataFrame(odd_rows("a", "b")), None, at(out, 1))
+    assert await store.load(first.ref, list[dict], None) == odd_rows("a", "b")
+    second = await store.store(odd_rows("c", n=2.0), first.ref, at(out, 2))
+    assert await store.load(second.ref, list[dict], None) == odd_rows("c", n=2.0)
+    frame = await store.load(second.ref, pd.DataFrame, None)
+    assert list(frame.columns) == ODD and frame.to_dict("records") == odd_rows("c", n=2.0)
+    table = await store.load(second.ref, pa.Table, None)
+    assert table.column_names == ODD and table.to_pylist() == odd_rows("c", n=2.0)
+
+
+async def test_a_keyed_output_takes_any_column_name_postgres_holds(store):
+    """Every place a keyed write names a column: the key, a declared column,
+    the primary key, an index, the partition column, the keys read back. A
+    second write updates one key and removes another; a per-key batch whose
+    one key the table refuses (`No` is a bigint) writes the other."""
+
+    pd = pytest.importorskip("pandas")
+    out = keyed_output(
+        key="CaO_wt%",
+        incremental=True,
+        columns={"CaO_wt%": "text", "No": "bigint"},
+        primary_key=["CaO_wt%", "No"],
+        indexes=[["p/p0", "as(bet)"]],
+        partition_column="part %s",
+    )
+    first = await store.store(pd.DataFrame(odd_rows("a", "b", "c")), None, at(out, 1, partition="P%"))
+    second = await store.store(
+        Patch(odd_rows("a", n=2.0), remove=["b"]), first.ref, at(out, 2, partition="P%")
+    )
+    stamped = {"part %s": "P%"}
+    loaded = sorted(await store.load(second.ref, list[dict], None), key=lambda r: r["CaO_wt%"])
+    assert loaded == [{**odd_rows("a", n=2.0)[0], **stamped}, {**odd_rows("a", "b", "c")[2], **stamped}]
+    frame = await store.load(second.ref, pd.DataFrame, Keys({"c": 1}))
+    assert frame.to_dict("records") == [{**odd_rows("a", "b", "c")[2], **stamped}]
+    assert [k for chunk in store.keys(second.ref) for k in chunk] == ["a", "c"]
+
+    refused = [*odd_rows("a", n=3.0), {**odd_rows("c")[0], "CaO_wt%": "c", "No": "n/a"}]
+    third = await store.store(Patch(refused), second.ref, each(at(out, 3, partition="P%")))
+    assert list(third.refused) == ["c"] and third.refused["c"].startswith("InvalidTextRepresentation: ")
+    loaded = {r["CaO_wt%"]: r["p/p0"] for r in await store.load(third.ref, list[dict], None)}
+    assert loaded == {"a": 3.0, "c": 1.0}
+
+
+async def test_arrow_and_sql_writes_take_any_column_name_postgres_holds(store):
+    """A table made from an Arrow table's schema, and one a `Sql` query
+    makes from its columns, in place and through COPY (`sql_read_only`)."""
+
+    pa = pytest.importorskip("pyarrow")
+    from solera_postgres import PostgresStore
+
+    written = await store.store(pa.Table.from_pylist(odd_rows("a", "b")), None, at(output(), 1))
+    assert await store.load(written.ref, list[dict], None) == odd_rows("a", "b")
+    for each_store in (store, PostgresStore(DSN, sql_read_only=True)):
+        query = Sql(f'SELECT "CaO_wt%", U&"as\\0028bet)" AS "%s%%", \'%s\' AS "No" FROM {written.ref.table}')
+        made = await each_store.store(query, None, at(keyed_output(key="CaO_wt%"), 1))
+        assert [k for chunk in made.keys for k in chunk] == ["a", "b"]
+        loaded = await each_store.load(made.ref, list[dict], None)
+        assert sorted(loaded, key=lambda r: r["CaO_wt%"]) == [
+            {"CaO_wt%": k, "%s%%": f"bet {k}", "No": "%s"} for k in ("a", "b")
+        ]
+
+
+@pytest.mark.parametrize(
+    "name, says",
+    [("", "is empty"), ("a\0b", "holds a NUL"), ("é" * 32, "is 64 bytes in UTF-8")],
+)
+async def test_a_column_name_postgres_cannot_hold_is_refused(store, name, says):
+    """Postgres holds no empty name nor a NUL, and cuts a name past 63 bytes
+    short, so two columns could collide: such a column fails the write and
+    is named in what it says. 63 bytes is fine."""
+
+    with pytest.raises(StoreError, match=says) as refused:
+        await store.store([{"id": "a", name: 1}], None, at(output(), 1))
+    assert repr(name) in str(refused.value)
+    longest = "é" * 31 + "x"
+    written = await store.store([{longest: 1}], None, at(output(), 1))
+    assert await store.load(written.ref, list[dict], None) == [{longest: 1}]

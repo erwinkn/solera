@@ -155,9 +155,28 @@ class TableRef(Ref):
 
 
 def _ident(name: str) -> str:
-    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", str(name)):
-        raise ValueError(f"Unsafe identifier: {name!r}")
-    return f'"{name}"'
+    """Any name Postgres holds, quoted, a `"` in it doubled. A `%` is written
+    `\\0025` in the Unicode form, `U&"CaO_wt\\0025"`, so no statement's text
+    holds one: a driver reads `%` as a placeholder in a statement it runs
+    with parameters, and not in one it runs without (psycopg; `COPY` too),
+    and this way no statement has to know which it is. Refused: what
+    Postgres cannot hold — an empty name, a NUL — and a name over 63 bytes
+    in UTF-8, which it would cut short, so two columns could become one."""
+
+    name = str(name)
+    if not name:
+        raise ValueError("a Postgres column cannot be named '': the name is empty")
+    if "\0" in name:
+        raise ValueError(f"a Postgres column cannot be named {name!r}: the name holds a NUL character")
+    if (size := len(name.encode())) > 63:
+        raise ValueError(
+            f"a Postgres column cannot be named {name!r}: the name is {size} bytes in UTF-8, and "
+            "Postgres keeps 63 (it would cut the name short, and two columns could then collide)"
+        )
+    quoted = name.replace('"', '""')
+    if "%" not in name:
+        return f'"{quoted}"'
+    return 'U&"' + quoted.replace("\\", "\\\\").replace("%", "\\0025") + '"'
 
 
 def _literal(value: Any) -> str:
