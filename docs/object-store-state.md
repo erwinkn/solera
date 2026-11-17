@@ -711,6 +711,7 @@ the commit as `key_count` and on a head's view.
 | value counts per filter field | `GET /runs:facets?…` → `{status: [{value, count}], asset, tag, trigger, automation, by, source}` | |
 | runs over time, per status | `GET /runs:histogram?…&bars=60` → `{bucket, since, until, bars: [{t, counts}]}` | |
 | finished tasks | `GET /tasks?asset=&status=&run=&since=&before=` | |
+| tasks over time, per asset and status (per partition, given `asset`) | `GET /tasks:histogram?since=&bucket=&until=&asset=` → `{since, until, bucket, by, series: {name: [{i, counts, runs, run}]}}`: bucket `i` starts at `since + i * bucket`; `run` is one of the cell's runs, one that did not succeed if any | |
 | p50/p95 duration and wait, failure counts, compute hours, per asset and per executor | `GET /stats?since=&asset=&partition=` | |
 | an asset's versions and their metadata | `GET /assets/{name}/history?output=&partition=&before=` | |
 | what a version was built from, or what was built from it | `GET /outputs/{name}/lineage?partition=&generation=&direction=upstream\|downstream&depth=5` | each edge's `from` is what was read: its `generation` and the writer's `run`, `attempt` and `at`. Flag: `uncommitted` (`{attempt, run}`: a write no attempt committed). `detail` keeps the pin (`pinned_generation`) for debugging |

@@ -120,6 +120,8 @@ def every_route(serve: Serve) -> int:
         get(f"{BASE}/{path}")
     for path in ("sensors", "automations", "executors", "workers"):
         get(f"{BASE}/{path}")
+    get(f"{BASE}/tasks:histogram", since=time.time() - 900, bucket=20)
+    get(f"{BASE}/tasks:histogram", since=time.time() - 900, bucket=20, asset=assets[0])
     for sensor in [s["name"] for s in get(f"{BASE}/sensors")["sensors"]]:
         get(f"{BASE}/sensors/{sensor}/ticks")
     for name in assets:

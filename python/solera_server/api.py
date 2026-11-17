@@ -496,6 +496,18 @@ def create_app(
             limit=limit,
         )
 
+    @app.get("/api/projects/{p}/tasks:histogram")
+    async def task_histogram(
+        p: str,
+        request: Request,
+        since: float,
+        bucket: float = Query(gt=0),
+        until: float | None = None,
+        asset: str | None = None,
+    ):
+        runtime = await project_engine(request, p)
+        return await runtime.history.task_histogram(since=since, until=until, bucket=bucket, asset=asset)
+
     @app.get("/api/projects/{p}/stats")
     async def stats(
         p: str,
